@@ -8,20 +8,26 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc as std;
 
+pub mod as_bin;
 pub mod blake2;
 pub mod bls12_381;
 pub mod bls12_381_const;
 pub mod bls12_381_utils;
 pub mod bn128;
+pub mod contract_interface;
+pub mod da_signers;
 pub mod hash;
 pub mod identity;
 pub mod interface;
+pub mod journal;
 #[cfg(any(feature = "c-kzg", feature = "kzg-rs"))]
 pub mod kzg_point_evaluation;
 pub mod modexp;
 pub mod secp256k1;
 pub mod secp256r1;
+pub mod stateful_precompiles;
 pub mod utilities;
+pub mod wa0gi_base;
 
 pub use interface::*;
 
@@ -62,6 +68,8 @@ use once_cell::race::OnceBox;
 use primitives::{hardfork::SpecId, Address, HashMap, HashSet};
 use std::{boxed::Box, vec::Vec};
 
+use crate::{da_signers::DA_SIGNERS_ADDRESS, wa0gi_base::WA0GI_BASE_ADDRESS};
+
 /// Calculate the linear cost of a precompile.
 pub fn calc_linear_cost_u32(len: usize, base: u64, word: u64) -> u64 {
     (len as u64).div_ceil(32) * word + base
@@ -70,8 +78,10 @@ pub fn calc_linear_cost_u32(len: usize, base: u64, word: u64) -> u64 {
 /// Precompiles contain map of precompile addresses to functions and HashSet of precompile addresses.
 #[derive(Clone, Default, Debug)]
 pub struct Precompiles {
-    /// Precompiles
-    inner: HashMap<Address, PrecompileFn>,
+    /// Stateless Precompiles
+    stateless: HashMap<Address, PrecompileFn>,
+    /// Stateful Precompiles
+    stateful: HashSet<Address>,
     /// Addresses of precompile
     addresses: HashSet<Address>,
 }
@@ -95,19 +105,25 @@ impl Precompiles {
         static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
         INSTANCE.get_or_init(|| {
             let mut precompiles = Precompiles::default();
-            precompiles.extend([
+            precompiles.extend_stateless([
                 secp256k1::ECRECOVER,
                 hash::SHA256,
                 hash::RIPEMD160,
                 identity::FUN,
             ]);
+            precompiles.extend_stateful([DA_SIGNERS_ADDRESS, WA0GI_BASE_ADDRESS]);
             Box::new(precompiles)
         })
     }
 
-    /// Returns inner HashMap of precompiles.
-    pub fn inner(&self) -> &HashMap<Address, PrecompileFn> {
-        &self.inner
+    /// Returns HashMap of stateless precompiles.
+    pub fn stateless(&self) -> &HashMap<Address, PrecompileFn> {
+        &self.stateless
+    }
+
+    /// Returns HashSet of stateful precompiles.
+    pub fn stateful(&self) -> &HashSet<Address> {
+        &self.stateful
     }
 
     /// Returns precompiles for Byzantium spec.
@@ -115,7 +131,7 @@ impl Precompiles {
         static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
         INSTANCE.get_or_init(|| {
             let mut precompiles = Self::homestead().clone();
-            precompiles.extend([
+            precompiles.extend_stateless([
                 // EIP-198: Big integer modular exponentiation.
                 modexp::BYZANTIUM,
                 // EIP-196: Precompiled contracts for addition and scalar multiplication on the elliptic curve alt_bn128.
@@ -133,7 +149,7 @@ impl Precompiles {
         static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
         INSTANCE.get_or_init(|| {
             let mut precompiles = Self::byzantium().clone();
-            precompiles.extend([
+            precompiles.extend_stateless([
                 // EIP-1108: Reduce alt_bn128 precompile gas costs.
                 bn128::add::ISTANBUL,
                 bn128::mul::ISTANBUL,
@@ -150,7 +166,7 @@ impl Precompiles {
         static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
         INSTANCE.get_or_init(|| {
             let mut precompiles = Self::istanbul().clone();
-            precompiles.extend([
+            precompiles.extend_stateless([
                 // EIP-2565: ModExp Gas Cost.
                 modexp::BERLIN,
             ]);
@@ -177,7 +193,7 @@ impl Precompiles {
             }
 
 
-            precompiles.extend([
+            precompiles.extend_stateless([
                 precompile,
             ]);
 
@@ -190,7 +206,7 @@ impl Precompiles {
         static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
         INSTANCE.get_or_init(|| {
             let mut precompiles = Self::cancun().clone();
-            precompiles.extend(bls12_381::precompiles());
+            precompiles.extend_stateless(bls12_381::precompiles());
             Box::new(precompiles)
         })
     }
@@ -200,7 +216,7 @@ impl Precompiles {
         static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
         INSTANCE.get_or_init(|| {
             let mut precompiles = Self::prague().clone();
-            precompiles.extend([modexp::OSAKA, secp256r1::P256VERIFY]);
+            precompiles.extend_stateless([modexp::OSAKA, secp256r1::P256VERIFY]);
             Box::new(precompiles)
         })
     }
@@ -213,41 +229,49 @@ impl Precompiles {
     /// Returns an iterator over the precompiles addresses.
     #[inline]
     pub fn addresses(&self) -> impl ExactSizeIterator<Item = &Address> {
-        self.inner.keys()
+        let combined: Vec<&Address> = self.stateless.keys().chain(self.stateful.iter()).collect();
+        combined.into_iter()
     }
 
     /// Consumes the type and returns all precompile addresses.
     #[inline]
     pub fn into_addresses(self) -> impl ExactSizeIterator<Item = Address> {
-        self.inner.into_keys()
+        let combined: Vec<Address> = self.stateless.into_keys().chain(self.stateful).collect();
+        combined.into_iter()
     }
 
     /// Is the given address a precompile.
     #[inline]
     pub fn contains(&self, address: &Address) -> bool {
-        self.inner.contains_key(address)
+        self.stateless.contains_key(address) || self.stateful.contains(address)
     }
 
     /// Returns the precompile for the given address.
     #[inline]
-    pub fn get(&self, address: &Address) -> Option<&PrecompileFn> {
-        self.inner.get(address)
+    pub fn get_stateless(&self, address: &Address) -> Option<&PrecompileFn> {
+        self.stateless.get(address)
+    }
+
+    /// Check if the given address is stateful precompile.
+    #[inline]
+    pub fn is_stateful(&self, address: &Address) -> bool {
+        self.stateful.contains(address)
     }
 
     /// Returns the precompile for the given address.
     #[inline]
-    pub fn get_mut(&mut self, address: &Address) -> Option<&mut PrecompileFn> {
-        self.inner.get_mut(address)
+    pub fn get_stateless_mut(&mut self, address: &Address) -> Option<&mut PrecompileFn> {
+        self.stateless.get_mut(address)
     }
 
     /// Is the precompiles list empty.
     pub fn is_empty(&self) -> bool {
-        self.inner.len() == 0
+        self.stateless.len() == 0 && self.stateful.is_empty()
     }
 
     /// Returns the number of precompiles.
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.stateless.len() + self.stateful.len()
     }
 
     /// Returns the precompiles addresses as a set.
@@ -255,48 +279,93 @@ impl Precompiles {
         &self.addresses
     }
 
-    /// Extends the precompiles with the given precompiles.
+    /// Extends the stateless precompiles with the given precompiles.
     ///
     /// Other precompiles with overwrite existing precompiles.
     #[inline]
-    pub fn extend(&mut self, other: impl IntoIterator<Item = PrecompileWithAddress>) {
+    pub fn extend_stateless(&mut self, other: impl IntoIterator<Item = PrecompileWithAddress>) {
         let items: Vec<PrecompileWithAddress> = other.into_iter().collect::<Vec<_>>();
         self.addresses.extend(items.iter().map(|p| *p.address()));
-        self.inner.extend(items.into_iter().map(|p| (p.0, p.1)));
+        self.stateless.extend(items.into_iter().map(|p| (p.0, p.1)));
+    }
+
+    /// Extends the stateless precompiles with the given precompiles.
+    ///
+    /// Other precompiles with overwrite existing precompiles.
+    pub fn extend_stateful(&mut self, other: impl IntoIterator<Item = Address>) {
+        let items: Vec<Address> = other.into_iter().collect::<Vec<_>>();
+        self.addresses.extend(items.iter());
+        self.stateful.extend(items);
     }
 
     /// Returns complement of `other` in `self`.
     ///
     /// Two entries are considered equal if the precompile addresses are equal.
     pub fn difference(&self, other: &Self) -> Self {
-        let Self { inner, .. } = self;
+        let Self {
+            stateless,
+            stateful,
+            ..
+        } = self;
 
-        let inner = inner
+        let stateless = stateless
             .iter()
-            .filter(|(a, _)| !other.inner.contains_key(*a))
+            .filter(|(a, _)| !other.stateless.contains_key(*a))
             .map(|(a, p)| (*a, *p))
             .collect::<HashMap<_, _>>();
 
-        let addresses = inner.keys().cloned().collect::<HashSet<_>>();
+        let stateful = stateful
+            .iter()
+            .filter(|a| !other.stateful.contains(*a))
+            .copied()
+            .collect::<HashSet<_>>();
 
-        Self { inner, addresses }
+        let addresses = stateless
+            .keys()
+            .cloned()
+            .chain(stateful.iter().cloned())
+            .collect::<HashSet<_>>();
+
+        Self {
+            stateless,
+            stateful,
+            addresses,
+        }
     }
 
     /// Returns intersection of `self` and `other`.
     ///
     /// Two entries are considered equal if the precompile addresses are equal.
     pub fn intersection(&self, other: &Self) -> Self {
-        let Self { inner, .. } = self;
+        let Self {
+            stateless,
+            stateful,
+            ..
+        } = self;
 
-        let inner = inner
+        let stateless = stateless
             .iter()
-            .filter(|(a, _)| other.inner.contains_key(*a))
+            .filter(|(a, _)| other.stateless.contains_key(*a))
             .map(|(a, p)| (*a, *p))
             .collect::<HashMap<_, _>>();
 
-        let addresses = inner.keys().cloned().collect::<HashSet<_>>();
+        let stateful = stateful
+            .iter()
+            .filter(|a| other.stateful.contains(*a))
+            .copied()
+            .collect::<HashSet<_>>();
 
-        Self { inner, addresses }
+        let addresses = stateless
+            .keys()
+            .cloned()
+            .chain(stateful.iter().cloned())
+            .collect::<HashSet<_>>();
+
+        Self {
+            stateless,
+            stateful,
+            addresses,
+        }
     }
 }
 
@@ -417,6 +486,6 @@ mod test {
     fn test_intersection_precompile_sets() {
         let intersection = Precompiles::homestead().intersection(Precompiles::byzantium());
 
-        assert_eq!(intersection.len(), 4)
+        assert_eq!(intersection.len(), 6)
     }
 }

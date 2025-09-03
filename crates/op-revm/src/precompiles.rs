@@ -60,7 +60,7 @@ pub fn fjord() -> &'static Precompiles {
     INSTANCE.get_or_init(|| {
         let mut precompiles = Precompiles::cancun().clone();
         // RIP-7212: secp256r1 P256verify
-        precompiles.extend([secp256r1::P256VERIFY]);
+        precompiles.extend_stateless([secp256r1::P256VERIFY]);
         Box::new(precompiles)
     })
 }
@@ -71,7 +71,7 @@ pub fn granite() -> &'static Precompiles {
     INSTANCE.get_or_init(|| {
         let mut precompiles = fjord().clone();
         // Restrict bn256Pairing input size
-        precompiles.extend([bn128_pair::GRANITE]);
+        precompiles.extend_stateless([bn128_pair::GRANITE]);
         Box::new(precompiles)
     })
 }
@@ -82,9 +82,9 @@ pub fn isthmus() -> &'static Precompiles {
     INSTANCE.get_or_init(|| {
         let mut precompiles = granite().clone();
         // Prague bls12 precompiles
-        precompiles.extend(precompile::bls12_381::precompiles());
+        precompiles.extend_stateless(precompile::bls12_381::precompiles());
         // Isthmus bls12 precompile modifications
-        precompiles.extend([
+        precompiles.extend_stateless([
             bls12_381::ISTHMUS_G1_MSM,
             bls12_381::ISTHMUS_G2_MSM,
             bls12_381::ISTHMUS_PAIRING,
