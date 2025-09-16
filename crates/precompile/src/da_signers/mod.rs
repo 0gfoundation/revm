@@ -1,5 +1,5 @@
 //! DA Signers precompiles
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
@@ -7,7 +7,7 @@ use ark_bn254::{G1Affine, G1Projective};
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::Zero;
 use context::{Block, Cfg, ContextTr, JournalTr, Transaction};
-use primitives::{address, hash_set::HashSet, keccak256, Address, Bytes, HashMap, Log, B256, U256};
+use primitives::{address, hash_set::HashSet, keccak256, Address, Bytes, Log, B256, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
 
@@ -83,16 +83,16 @@ pub fn run_da_signers_call<CTX: ContextTr>(
     is_static: bool,
     context: &mut CTX,
 ) -> PrecompileResult {
-    let selector: [u8; 4] = input_bytes
+    let selector: [u8; 4] = input_bytes[..4]
         .try_into()
         .map_err(|_e| PrecompileError::StatefulInvalidInput)?;
     // check gas cost and static restriction
     let gas_used = match selectors_map().get(&selector) {
-        Some(&(gas_cost, should_be_static)) => {
+        Some(&(gas_cost, can_be_static)) => {
             if gas_cost > gas_limit {
                 return Err(PrecompileError::OutOfGas);
             }
-            if is_static != should_be_static {
+            if is_static && !can_be_static {
                 return Err(PrecompileError::StaticRestrictionViolation);
             }
             gas_cost
@@ -203,11 +203,11 @@ fn run_epoch_number_call<CTX: ContextTr>(
 }
 
 fn quorum_count<CTX: ContextTr>(context: &mut CTX, epoch: u64) -> Result<U256, PrecompileError> {
-    Ok(U256::from_be_slice(&load_bytes(
-        context,
-        DA_SIGNERS_ADDRESS,
-        quorum_count_key(epoch),
-    )?))
+    Ok(context
+        .journal_mut()
+        .sload(DA_SIGNERS_ADDRESS, quorum_count_key(epoch).into())
+        .map_err(convert_db_err::<CTX::Db>)?
+        .data)
 }
 
 fn run_quorum_count_call<CTX: ContextTr>(
@@ -366,7 +366,7 @@ fn run_register_signer_call<CTX: ContextTr>(
         // save signer
         set_signer(context, args._signer.clone())?;
         // emit event
-        let log = Log {
+        context.journal_mut().log(Log {
             address: DA_SIGNERS_ADDRESS,
             data: NewSigner {
                 signer: args._signer.signer,
@@ -374,8 +374,15 @@ fn run_register_signer_call<CTX: ContextTr>(
                 pkG2: args._signer.pkG2,
             }
             .to_log_data(),
-        };
-        context.journal_mut().log(log);
+        });
+        context.journal_mut().log(Log {
+            address: DA_SIGNERS_ADDRESS,
+            data: SocketUpdated {
+                signer: args._signer.signer,
+                socket: args._signer.socket,
+            }
+            .to_log_data(),
+        });
 
         Ok(Bytes::from(registerSignerCall::abi_encode_returns(
             &registerSignerReturn {},
@@ -405,15 +412,14 @@ fn run_update_socket_call<CTX: ContextTr>(
         set_signer(context, signer)?;
         // emit log
 
-        let log = Log {
+        context.journal_mut().log(Log {
             address: DA_SIGNERS_ADDRESS,
             data: SocketUpdated {
                 signer: caller,
                 socket: args._socket,
             }
             .to_log_data(),
-        };
-        context.journal_mut().log(log);
+        });
 
         Ok(Bytes::from(updateSocketCall::abi_encode_returns(
             &updateSocketReturn {},
@@ -486,13 +492,13 @@ fn store_registration<CTX: ContextTr>(
         .sstore(DA_SIGNERS_ADDRESS, votes_key(epoch, signer).into(), votes)
         .map_err(convert_db_err::<CTX::Db>)?;
     // increment epoch registration count
-    let registration = epoch_registration(context, epoch)? + U256::from(1);
+    let registration = epoch_registration(context, epoch)?;
     context
         .journal_mut()
         .sstore(
             DA_SIGNERS_ADDRESS,
             epoch_registration_key(epoch).into(),
-            registration,
+            registration + U256::from(1),
         )
         .map_err(convert_db_err::<CTX::Db>)?;
     // save registered signer address
@@ -504,7 +510,7 @@ fn store_registration<CTX: ContextTr>(
             U256::from_be_slice(&left_pad_to_fixed_size(signer.as_slice().to_vec(), 32)),
         )
         .map_err(convert_db_err::<CTX::Db>)?;
-    todo!()
+    Ok(())
 }
 
 fn run_register_next_epoch_call<CTX: ContextTr>(
@@ -522,17 +528,18 @@ fn run_register_next_epoch_call<CTX: ContextTr>(
     // execute
     // get signer
     // staked value is checked in registry contract
-    if let Some(signer) = get_signer(context, caller)? {
+    if let Some(signer) = get_signer(context, args.signer)? {
         // validate signature
-        let epoch: u64 = epoch_number(context)?.try_into().unwrap();
-        let hash = epoch_registration_hash(signer.signer, epoch + 1, context.cfg().chain_id());
+        let mut epoch: u64 = epoch_number(context)?.try_into().unwrap();
+        epoch += 1;
+        let hash = epoch_registration_hash(signer.signer, epoch, context.cfg().chain_id());
         if !validate_signature(&signer, hash, args._signature.clone().into()) {
             return Err(PrecompileError::Other("invalid signature".to_string()));
         }
         store_registration(
             context,
             epoch,
-            caller,
+            args.signer,
             &serialize_g1(args._signature.clone().into()),
             args.votes,
         )?;
@@ -738,7 +745,7 @@ fn run_get_agg_pk_g1_call<CTX: ContextTr>(
         .try_into()
         .map_err(|_e| PrecompileError::StatefulInvalidInput)?;
     let quorum = get_quorum(context, epoch, quorum_id)?;
-    if quorum.len() / 7 + 8 != args._quorumBitmap.len() {
+    if quorum.len().div_ceil(8) != args._quorumBitmap.len() {
         return Err(PrecompileError::Other(
             "quorum bitmap length mismatch".to_string(),
         ));

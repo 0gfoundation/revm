@@ -1,9 +1,9 @@
 //! WA0GI Base precompiles
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 use alloy_sol_types::SolCall;
 use context::{ContextTr, JournalTr};
-use primitives::{address, Address, Bytes, HashMap, U256};
+use primitives::{address, Address, Bytes, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
 
@@ -56,16 +56,16 @@ pub fn run_wa0gi_base_call<CTX: ContextTr>(
     is_static: bool,
     context: &mut CTX,
 ) -> PrecompileResult {
-    let selector: [u8; 4] = input_bytes
+    let selector: [u8; 4] = input_bytes[..4]
         .try_into()
         .map_err(|_e| PrecompileError::StatefulInvalidInput)?;
     // check gas cost and static restriction
     let gas_used = match selectors_map().get(&selector) {
-        Some(&(gas_cost, should_be_static)) => {
+        Some(&(gas_cost, can_be_static)) => {
             if gas_cost > gas_limit {
                 return Err(PrecompileError::OutOfGas);
             }
-            if is_static != should_be_static {
+            if is_static && !can_be_static {
                 return Err(PrecompileError::StaticRestrictionViolation);
             }
             gas_cost

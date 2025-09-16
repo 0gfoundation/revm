@@ -99,7 +99,7 @@ impl From<IDASignersSignerDetail> for SignerDetail {
 
 impl From<G1Point> for G1Affine {
     fn from(value: G1Point) -> Self {
-        G1Affine::new(
+        G1Affine::new_unchecked(
             Fq::from_be_bytes_mod_order(&value.X.to_be_bytes_vec()),
             Fq::from_be_bytes_mod_order(&value.Y.to_be_bytes_vec()),
         )
@@ -108,7 +108,7 @@ impl From<G1Point> for G1Affine {
 
 impl From<G2Point> for G2Affine {
     fn from(value: G2Point) -> Self {
-        G2Affine::new(
+        G2Affine::new_unchecked(
             Fq2::new(
                 Fq::from_be_bytes_mod_order(&value.X[0].to_be_bytes_vec()),
                 Fq::from_be_bytes_mod_order(&value.X[1].to_be_bytes_vec()),

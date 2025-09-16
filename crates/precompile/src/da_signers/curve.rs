@@ -114,12 +114,14 @@ fn reverse_bytes(bytes: &mut [u8]) {
 /// serialize G1Affine to fixed bytes in big endian
 pub(super) fn serialize_g1(p: G1Affine) -> [u8; 64] {
     let mut buf = [0u8; 64];
-    let mut temp = Vec::with_capacity(64);
-    p.serialize_uncompressed(&mut temp).unwrap();
-
-    buf[0..32].copy_from_slice(&temp[0..32]);
+    let mut value: Vec<u8> = Vec::new();
+    p.x().unwrap().serialize_uncompressed(&mut value).unwrap();
+    buf[0..32].copy_from_slice(&value[0..32]);
     reverse_bytes(&mut buf[0..32]);
-    buf[32..64].copy_from_slice(&temp[32..64]);
+
+    value.clear();
+    p.y().unwrap().serialize_uncompressed(&mut value).unwrap();
+    buf[32..64].copy_from_slice(&value[0..32]);
     reverse_bytes(&mut buf[32..64]);
 
     buf
@@ -128,14 +130,42 @@ pub(super) fn serialize_g1(p: G1Affine) -> [u8; 64] {
 /// serialize G2Affine to fixed bytes in big endian
 pub(super) fn serialize_g2(p: G2Affine) -> [u8; 128] {
     let mut buf = [0u8; 128];
-    let mut temp = Vec::with_capacity(128);
-    p.serialize_uncompressed(&mut temp).unwrap();
+    let mut value: Vec<u8> = Vec::new();
+    p.x()
+        .unwrap()
+        .c0
+        .serialize_uncompressed(&mut value)
+        .unwrap();
+    buf[0..32].copy_from_slice(&value[0..32]);
+    reverse_bytes(&mut buf[0..32]);
+    value.clear();
 
-    for i in 0..4 {
-        let start = i * 32;
-        buf[start..start + 32].copy_from_slice(&temp[start..start + 32]);
-        reverse_bytes(&mut buf[start..start + 32]);
-    }
+    p.x()
+        .unwrap()
+        .c1
+        .serialize_uncompressed(&mut value)
+        .unwrap();
+    buf[32..64].copy_from_slice(&value[0..32]);
+    reverse_bytes(&mut buf[32..64]);
+    value.clear();
+
+    p.y()
+        .unwrap()
+        .c0
+        .serialize_uncompressed(&mut value)
+        .unwrap();
+    buf[64..96].copy_from_slice(&value[0..32]);
+    reverse_bytes(&mut buf[64..96]);
+    value.clear();
+
+    p.y()
+        .unwrap()
+        .c1
+        .serialize_uncompressed(&mut value)
+        .unwrap();
+    buf[96..128].copy_from_slice(&value[0..32]);
+    reverse_bytes(&mut buf[96..128]);
+    value.clear();
 
     buf
 }
@@ -151,4 +181,49 @@ pub(super) fn gamma(hash: G1Affine, signature: G1Affine, pk_g1: G1Affine, pk_g2:
     let msg_hash = keccak256(&to_hash);
 
     Fr::from_be_bytes_mod_order(msg_hash.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use ark_ff::QuadExtField;
+
+    use super::*;
+
+    #[test]
+    fn test_serialize_g1() {
+        let p = G1Affine::new_unchecked(
+            Fq::from_be_bytes_mod_order(
+                &U256::from_str_radix(
+                    "19300522510534054799330569506194579913800365625278702540049559191851317457335",
+                    10,
+                )
+                .unwrap()
+                .to_be_bytes_vec(),
+            ),
+            Fq::from_be_bytes_mod_order(
+                &U256::from_str_radix(
+                    "21506615804111993086024125047185347092253679892553376328557576951218017569466",
+                    10,
+                )
+                .unwrap()
+                .to_be_bytes_vec(),
+            ),
+        );
+        assert_eq!(hex::encode(serialize_g1(p)), "2aabb56813568e22856b1e090f5ee32dc951423b65f2d5bb80418436fcb5f1b72f8c502c35f9499fc98bd619620210e0d50a34c4e191e57e0d79519e843e8aba");
+    }
+
+    #[test]
+    fn test_serialize_g2() {
+        let p = G2Affine::new_unchecked(
+            QuadExtField::new(
+                Fq::from_be_bytes_mod_order(&U256::from_str_radix("20330596197210395241356549584419927603351085555088806176574690490794984008944", 10).unwrap().to_be_bytes_vec()),
+                Fq::from_be_bytes_mod_order(&U256::from_str_radix("15787159264193133731964071396477495274492189810403383639371877574524834519407", 10).unwrap().to_be_bytes_vec()),
+            ),
+            QuadExtField::new(
+                Fq::from_be_bytes_mod_order(&U256::from_str_radix("11029159417960220792740346453748230672677331804832155710703958796437158259101", 10).unwrap().to_be_bytes_vec()),
+                Fq::from_be_bytes_mod_order(&U256::from_str_radix("7266804587715537947859661776892396802219153443931392992660400968992197326887", 10).unwrap().to_be_bytes_vec()),
+            ),
+        );
+        assert_eq!(hex::encode(serialize_g2(p)), "2cf2b5ac9e4c3fde611b48355bf24ea1a7f33de84a3f75894c6cdd4601eaecf022e7372a723ecd283fd33b3d2c34b08232c7f91e41689da4741b055956fd996f186248738006a72254c98fda715603f5d16735c1339949e3c650cf292f16699d1010dd9ab9d9dac4cfc26cc26784738e1000d430b86fe34030e8737bc3ae3827");
+    }
 }
