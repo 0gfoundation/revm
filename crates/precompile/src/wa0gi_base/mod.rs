@@ -148,7 +148,7 @@ fn run_mint_call<CTX: ContextTr>(
     if supply.supply > supply.cap {
         return Err(PrecompileError::Other("insufficient mint cap".to_string()));
     }
-    // update supply
+    set_minter_supply(context, args.minter, supply)?;
     context
         .journal_mut()
         .balance_incr(WA0GI_ADDRESS, args.amount)
@@ -208,16 +208,16 @@ fn run_set_minter_cap_call<CTX: ContextTr>(
     let mut supply = get_minter_supply(context, args.minter)?;
     match supply.initialSupply.cmp(&args.initialSupply) {
         std::cmp::Ordering::Greater => {
-            // old > new -> add(diff)
+            // old > new -> sub(diff)
             supply.supply = supply
                 .supply
-                .saturating_add(supply.initialSupply - args.initialSupply);
+                .saturating_sub(supply.initialSupply - args.initialSupply);
         }
         std::cmp::Ordering::Less => {
-            // old < new -> sub(diff)
+            // old < new -> add(diff)
             supply.supply = supply
                 .supply
-                .saturating_sub(args.initialSupply - supply.initialSupply);
+                .saturating_add(args.initialSupply - supply.initialSupply);
         }
         std::cmp::Ordering::Equal => {}
     }

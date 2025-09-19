@@ -186,6 +186,7 @@ pub(super) fn gamma(hash: G1Affine, signature: G1Affine, pk_g1: G1Affine, pk_g2:
 #[cfg(test)]
 mod tests {
     use ark_ff::QuadExtField;
+    use primitives::hex;
 
     use super::*;
 

@@ -29,13 +29,6 @@ pub fn store_bytes<CTX: ContextTr>(
         key_input.extend_from_slice(&(i as u64).to_be_bytes());
         let storage_key = keccak256(key_input);
 
-        /*
-        println!(
-            "sstore in precompile: {:?} at {:?}",
-            hex::encode(chunk),
-            hex::encode(storage_key)
-        );
-        */
         context
             .journal_mut()
             .sstore(addr, storage_key.into(), U256::from_be_bytes(chunk))
