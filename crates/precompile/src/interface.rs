@@ -598,16 +598,27 @@ impl fmt::Display for PrecompileHalt {
 /// [`PrecompileHalt`] which is expressed through [`PrecompileStatus::Halt`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PrecompileError {
+    // reth-v2.8.1 migration: since revm 41 non-fatal errors live in PrecompileHalt; the original 0G stateful API returns these PrecompileError variants.
+    /// out of gas is the main error. Others are here just for completeness
+    OutOfGas,
+    /// The input does not match any function of given stateful precompile
+    StatefulInvalidInput,
+    /// Static restriction violation
+    StaticRestrictionViolation,
     /// Unrecoverable error that halts EVM execution.
     Fatal(String),
     /// Unrecoverable error that halts EVM execution.
     FatalAny(AnyError),
+    /// Catch-all variant for other errors
+    Other(String),
 }
 
 impl PrecompileError {
     /// Returns `true` if the error is `Fatal` or `FatalAny`.
     pub const fn is_fatal(&self) -> bool {
-        true
+        // reth-v2.8.1 migration: revm 43 returns `true` here because every PrecompileError is fatal there;
+        // with the 0G non-fatal variants above restored, only Fatal/FatalAny are fatal, as in the original.
+        matches!(self, Self::Fatal(_) | Self::FatalAny(_))
     }
 }
 
@@ -616,8 +627,14 @@ impl core::error::Error for PrecompileError {}
 impl fmt::Display for PrecompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OutOfGas => f.write_str("out of gas"),
+            Self::StatefulInvalidInput => {
+                f.write_str("input does not match any function of given stateful precompile")
+            }
+            Self::StaticRestrictionViolation => f.write_str("static restriction violation"),
             Self::Fatal(s) => write!(f, "fatal: {s}"),
             Self::FatalAny(s) => write!(f, "fatal: {s}"),
+            Self::Other(s) => f.write_str(s),
         }
     }
 }
