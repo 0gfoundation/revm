@@ -15,20 +15,26 @@ extern crate alloc as std;
     ),
     expect(unreachable_code)
 )]
+pub mod as_bin;
 pub mod blake2;
 pub mod bls12_381;
 pub mod bls12_381_const;
 pub mod bls12_381_utils;
 pub mod bn254;
+pub mod contract_interface;
+pub mod da_signers;
 pub mod hash;
 mod id;
 pub mod identity;
 pub mod interface;
+pub mod journal;
 pub mod kzg_point_evaluation;
 pub mod modexp;
 pub mod secp256k1;
 pub mod secp256r1;
+pub mod stateful_precompiles;
 pub mod utilities;
+pub mod wa0gi_base;
 
 pub use primitives;
 
@@ -72,7 +78,9 @@ use primitives::{
     hardfork::SpecId, short_address, Address, AddressMap, AddressSet, HashMap, OnceLock,
     SHORT_ADDRESS_CAP,
 };
-use std::boxed::Box;
+use std::{boxed::Box, vec::Vec};
+
+use crate::{da_signers::DA_SIGNERS_ADDRESS, wa0gi_base::WA0GI_BASE_ADDRESS};
 
 /// Calculate the linear cost of a precompile.
 #[inline]
@@ -89,9 +97,12 @@ pub const fn calc_linear_cost_u32(len: usize, base: u64, word: u64) -> u64 {
 /// Precompiles contain map of precompile addresses to functions and AddressSet of precompile addresses.
 #[derive(Clone, Debug)]
 pub struct Precompiles {
-    /// Precompiles
-    inner: AddressMap<Precompile>,
-    /// Addresses of precompiles.
+    // revm-41 migration: revm 41 uses AddressMap/AddressSet and boxed optimized access; the original 0G fields used HashMap/HashSet and Vec.
+    /// Stateless Precompiles
+    stateless: AddressMap<Precompile>,
+    /// Stateful Precompiles
+    stateful: AddressSet,
+    /// Addresses of precompile
     addresses: AddressSet,
     /// Optimized addresses filter.
     optimized_access: Box<[Option<Precompile>; SHORT_ADDRESS_CAP]>,
@@ -100,7 +111,8 @@ pub struct Precompiles {
 impl Default for Precompiles {
     fn default() -> Self {
         Self {
-            inner: HashMap::default(),
+            stateless: HashMap::default(),
+            stateful: AddressSet::default(),
             addresses: AddressSet::default(),
             optimized_access: Box::new([const { None }; SHORT_ADDRESS_CAP]),
         }
@@ -158,55 +170,69 @@ impl Precompiles {
         Self::new(PrecompileSpecId::NEXT)
     }
 
-    /// Returns inner HashMap of precompiles.
+    /// Returns HashMap of stateless precompiles.
     #[inline]
-    pub const fn inner(&self) -> &AddressMap<Precompile> {
-        &self.inner
+    pub const fn stateless(&self) -> &AddressMap<Precompile> {
+        &self.stateless
+    }
+
+    /// Returns HashSet of stateful precompiles.
+    #[inline]
+    pub const fn stateful(&self) -> &AddressSet {
+        &self.stateful
     }
 
     /// Returns an iterator over the precompiles addresses.
     #[inline]
     pub fn addresses(&self) -> impl ExactSizeIterator<Item = &Address> {
-        self.inner.keys()
+        let combined: Vec<&Address> = self.stateless.keys().chain(self.stateful.iter()).collect();
+        combined.into_iter()
     }
 
     /// Consumes the type and returns all precompile addresses.
     #[inline]
     pub fn into_addresses(self) -> impl ExactSizeIterator<Item = Address> {
-        self.inner.into_keys()
+        let combined: Vec<Address> = self.stateless.into_keys().chain(self.stateful).collect();
+        combined.into_iter()
     }
 
     /// Is the given address a precompile.
     #[inline]
     pub fn contains(&self, address: &Address) -> bool {
-        self.inner.contains_key(address)
+        self.stateless.contains_key(address) || self.stateful.contains(address)
     }
 
     /// Returns the precompile for the given address.
     #[inline]
-    pub fn get(&self, address: &Address) -> Option<&Precompile> {
+    pub fn get_stateless(&self, address: &Address) -> Option<&Precompile> {
         if let Some(short_address) = short_address(address) {
             return self.optimized_access[short_address].as_ref();
         }
-        self.inner.get(address)
+        self.stateless.get(address)
+    }
+
+    /// Check if the given address is stateful precompile.
+    #[inline]
+    pub fn is_stateful(&self, address: &Address) -> bool {
+        self.stateful.contains(address)
     }
 
     /// Returns the precompile for the given address.
     #[inline]
-    pub fn get_mut(&mut self, address: &Address) -> Option<&mut Precompile> {
-        self.inner.get_mut(address)
+    pub fn get_stateless_mut(&mut self, address: &Address) -> Option<&mut Precompile> {
+        self.stateless.get_mut(address)
     }
 
     /// Is the precompiles list empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.stateless.is_empty() && self.stateful.is_empty()
     }
 
     /// Returns the number of precompiles.
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.stateless.len() + self.stateful.len()
     }
 
     /// Returns the precompiles addresses as a set.
@@ -215,38 +241,60 @@ impl Precompiles {
         &self.addresses
     }
 
-    /// Extends the precompiles with the given precompiles.
+    /// Extends the stateless precompiles with the given precompiles.
     ///
     /// Other precompiles with overwrite existing precompiles.
-    pub fn extend(&mut self, other: impl IntoIterator<Item = Precompile>) {
+    pub fn extend_stateless(&mut self, other: impl IntoIterator<Item = Precompile>) {
+        // revm-41 migration: keep revm 41's boxed optimized-access loop; the original 0G method collected into a Vec before extending its HashMap.
         let iter = other.into_iter();
         let (lower, _) = iter.size_hint();
         self.addresses.reserve(lower);
-        self.inner.reserve(lower);
+        self.stateless.reserve(lower);
         for item in iter {
             let address = *item.address();
             if let Some(short_idx) = short_address(&address) {
                 self.optimized_access[short_idx] = Some(item.clone());
             }
             self.addresses.insert(address);
-            self.inner.insert(address, item);
+            self.stateless.insert(address, item);
         }
+    }
+
+    /// Extends the stateful precompiles with the given precompiles.
+    ///
+    /// Other precompiles with overwrite existing precompiles.
+    #[inline]
+    pub fn extend_stateful(&mut self, other: impl IntoIterator<Item = Address>) {
+        let items: Vec<Address> = other.into_iter().collect::<Vec<_>>();
+        self.addresses.extend(items.iter());
+        self.stateful.extend(items);
     }
 
     /// Returns complement of `other` in `self`.
     ///
     /// Two entries are considered equal if the precompile addresses are equal.
     pub fn difference(&self, other: &Self) -> Self {
-        let Self { inner, .. } = self;
+        let Self {
+            stateless,
+            stateful,
+            ..
+        } = self;
 
-        let inner = inner
+        let stateless = stateless
             .iter()
-            .filter(|(a, _)| !other.inner.contains_key(*a))
+            .filter(|(a, _)| !other.stateless.contains_key(*a))
             .map(|(a, p)| (*a, p.clone()))
             .collect::<AddressMap<_>>();
 
+        let stateful = stateful
+            .iter()
+            .filter(|a| !other.stateful.contains(*a))
+            .copied()
+            .collect::<AddressSet>();
+
         let mut precompiles = Self::default();
-        precompiles.extend(inner.into_iter().map(|p| p.1));
+        precompiles.extend_stateless(stateless.into_iter().map(|p| p.1));
+        precompiles.extend_stateful(stateful);
         precompiles
     }
 
@@ -254,16 +302,27 @@ impl Precompiles {
     ///
     /// Two entries are considered equal if the precompile addresses are equal.
     pub fn intersection(&self, other: &Self) -> Self {
-        let Self { inner, .. } = self;
+        let Self {
+            stateless,
+            stateful,
+            ..
+        } = self;
 
-        let inner = inner
+        let stateless = stateless
             .iter()
-            .filter(|(a, _)| other.inner.contains_key(*a))
+            .filter(|(a, _)| other.stateless.contains_key(*a))
             .map(|(a, p)| (*a, p.clone()))
             .collect::<AddressMap<_>>();
 
+        let stateful = stateful
+            .iter()
+            .filter(|a| other.stateful.contains(*a))
+            .copied()
+            .collect::<AddressSet>();
+
         let mut precompiles = Self::default();
-        precompiles.extend(inner.into_iter().map(|p| p.1));
+        precompiles.extend_stateless(stateless.into_iter().map(|p| p.1));
+        precompiles.extend_stateful(stateful);
         precompiles
     }
 }
@@ -274,18 +333,20 @@ fn init_precompiles(spec: PrecompileSpecId) -> Precompiles {
     let mut precompiles = Precompiles::default();
 
     // Homestead
-    precompiles.extend([
+    precompiles.extend_stateless([
         secp256k1::ECRECOVER,
         hash::SHA256,
         hash::RIPEMD160,
         identity::FUN,
     ]);
+    // revm-41 migration: revm 41 replaced per-fork constructors with init_precompiles; the original 0G registration was in homestead().
+    precompiles.extend_stateful([DA_SIGNERS_ADDRESS, WA0GI_BASE_ADDRESS]);
 
     if spec.is_enabled_in(BYZANTIUM) {
         // EIP-196: Precompiled contracts for addition and scalar multiplication on the elliptic curve alt_bn128.
         // EIP-197: Precompiled contracts for optimal ate pairing check on the elliptic curve alt_bn128.
         // EIP-198: Big integer modular exponentiation.
-        precompiles.extend([
+        precompiles.extend_stateless([
             modexp::BYZANTIUM,
             bn254::add::BYZANTIUM,
             bn254::mul::BYZANTIUM,
@@ -296,7 +357,7 @@ fn init_precompiles(spec: PrecompileSpecId) -> Precompiles {
     if spec.is_enabled_in(ISTANBUL) {
         // EIP-152: Add BLAKE2 compression function `F` precompile.
         // EIP-1108: Reduce alt_bn128 precompile gas costs.
-        precompiles.extend([
+        precompiles.extend_stateless([
             bn254::add::ISTANBUL,
             bn254::mul::ISTANBUL,
             bn254::pair::ISTANBUL,
@@ -306,23 +367,23 @@ fn init_precompiles(spec: PrecompileSpecId) -> Precompiles {
 
     if spec.is_enabled_in(BERLIN) {
         // EIP-2565: ModExp Gas Cost.
-        precompiles.extend([modexp::BERLIN]);
+        precompiles.extend_stateless([modexp::BERLIN]);
     }
 
     if spec.is_enabled_in(CANCUN) {
         // EIP-4844: Shard Blob Transactions.
-        precompiles.extend([kzg_point_evaluation::POINT_EVALUATION]);
+        precompiles.extend_stateless([kzg_point_evaluation::POINT_EVALUATION]);
     }
 
     if spec.is_enabled_in(PRAGUE) {
         // EIP-2537: Precompile for BLS12-381 curve operations.
-        precompiles.extend(bls12_381::precompiles());
+        precompiles.extend_stateless(bls12_381::precompiles());
     }
 
     if spec.is_enabled_in(OSAKA) {
         // EIP-7823: Set upper bounds for MODEXP.
         // EIP-7883: ModExp Gas Cost Increase.
-        precompiles.extend([modexp::OSAKA, secp256r1::P256VERIFY_OSAKA]);
+        precompiles.extend_stateless([modexp::OSAKA, secp256r1::P256VERIFY_OSAKA]);
     }
 
     precompiles
@@ -489,12 +550,12 @@ mod test {
         assert!(precompiles.optimized_access[9].is_some());
         assert!(precompiles.optimized_access[10].is_none());
 
-        precompiles.extend([Precompile::new(
+        precompiles.extend_stateless([Precompile::new(
             PrecompileId::Custom("test".into()),
             u64_to_address(100),
             temp_precompile,
         )]);
-        precompiles.extend([Precompile::new(
+        precompiles.extend_stateless([Precompile::new(
             PrecompileId::Custom("test".into()),
             u64_to_address(101),
             temp_precompile,
@@ -511,7 +572,7 @@ mod test {
         ));
 
         let output = precompiles
-            .get(&Address::left_padding_from(&[101]))
+            .get_stateless(&Address::left_padding_from(&[101]))
             .unwrap()
             .execute(&[], u64::MAX, 0)
             .unwrap();
@@ -531,6 +592,6 @@ mod test {
     fn test_intersection_precompile_sets() {
         let intersection = Precompiles::homestead().intersection(Precompiles::byzantium());
 
-        assert_eq!(intersection.len(), 4)
+        assert_eq!(intersection.len(), 6)
     }
 }

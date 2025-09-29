@@ -146,10 +146,11 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for EthPrecompiles {
         context: &mut CTX,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
-        let Some(precompile) = self.precompiles.get(&inputs.bytecode_address) else {
+        let Some(precompile) = self.precompiles.get_stateless(&inputs.bytecode_address) else {
             return Ok(None);
         };
 
+        // revm-41 migration: CallInput::as_bytes replaces the original SharedBuffer/Bytes match and owned Vec copy.
         let output = precompile
             .execute(
                 &inputs.input.as_bytes(context),

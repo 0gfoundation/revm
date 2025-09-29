@@ -416,6 +416,35 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         Ok(())
     }
 
+    /// Decreases the balance of the account.
+    ///
+    /// Mark account as touched.
+    #[inline]
+    pub fn balance_decr<DB: Database>(
+        &mut self,
+        db: &mut DB,
+        address: Address,
+        balance: U256,
+    ) -> Result<Option<TransferError>, DB::Error> {
+        // revm-41 migration: load_account now returns &Account; the original code mutated the returned account directly, so load first and then borrow it from state.
+        self.load_account(db, address)?;
+        let account = self.state.get_mut(&address).unwrap();
+        let old_balance = account.info.balance;
+        let Some(new_balance) = old_balance.checked_sub(balance) else {
+            return Ok(Some(TransferError::OutOfFunds));
+        };
+        account.info.balance = new_balance;
+
+        if !account.is_touched() {
+            account.mark_touch();
+            self.journal.push(ENTRY::account_touched(address));
+        }
+
+        self.journal
+            .push(ENTRY::balance_changed(address, old_balance));
+        Ok(None)
+    }
+
     /// Increments the nonce of the account.
     #[inline]
     #[deprecated]

@@ -116,8 +116,9 @@ fn encode_modexp_input(base: &[u8], exponent: &[u8], modulus: &[u8]) -> Vec<u8> 
 
 pub fn add_benches(group: &mut BenchmarkGroup<'_, criterion::measurement::WallTime>) {
     let precompiles = Precompiles::berlin();
+    // revm-41 migration: the original 0G split renamed Precompiles::get to get_stateless; this bench was added on the new base.
     let modexp = precompiles
-        .get(&u64_to_address(MODEXP_ADDRESS))
+        .get_stateless(&u64_to_address(MODEXP_ADDRESS))
         .expect("MODEXP precompile exists in Berlin");
 
     for case in modexp_cases() {

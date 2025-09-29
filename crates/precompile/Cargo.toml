@@ -20,7 +20,10 @@ workspace = true
 [dependencies]
 # revm
 primitives.workspace = true
+# revm-41 migration: revm 41 precompile code depends on context-interface; the original 0G change added context and bytecode here.
 context-interface.workspace = true
+context.workspace = true
+bytecode.workspace = true
 
 # modexp precompiles
 aurora-engine-modexp.workspace = true
@@ -68,6 +71,13 @@ aws-lc-rs = { workspace = true, optional = true }
 # utils
 cfg-if.workspace = true
 arrayref = "0.3.6"
+rmp-serde.workspace = true
+serde.workspace = true
+
+# alloy
+
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
