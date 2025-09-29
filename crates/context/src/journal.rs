@@ -256,6 +256,17 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
             .balance_incr(&mut self.database, address, balance)
     }
 
+    /// Increments the balance of the account.
+    #[inline]
+    fn balance_decr(
+        &mut self,
+        address: Address,
+        balance: U256,
+    ) -> Result<Option<TransferError>, <Self::Database as Database>::Error> {
+        self.inner
+            .balance_decr(&mut self.database, address, balance)
+    }
+
     /// Increments the nonce of the account.
     #[inline]
     #[expect(deprecated)]

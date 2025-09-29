@@ -21,6 +21,8 @@ workspace = true
 # revm
 primitives.workspace = true
 context-interface.workspace = true
+context.workspace = true
+bytecode.workspace = true
 
 # modexp precompiles
 aurora-engine-modexp.workspace = true
@@ -68,8 +70,15 @@ aws-lc-rs = { workspace = true, optional = true }
 # utils
 cfg-if.workspace = true
 arrayref = "0.3.6"
+rmp-serde.workspace = true
+serde.workspace = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 
 [dev-dependencies]
+database.workspace = true
 criterion.workspace = true
 rand = { workspace = true, features = ["std"] }
 ark-std = { workspace = true }
@@ -82,6 +91,8 @@ default = ["std", "secp256k1", "blst", "c-kzg", "portable"]
 std = [
 	"primitives/std",
 	"context-interface/std",
+	"context/std",
+	"bytecode/std",
 	"k256/std",
 	"ripemd/std",
 	"sha2/std",

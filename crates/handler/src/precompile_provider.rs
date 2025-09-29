@@ -3,6 +3,7 @@ use context::{Cfg, LocalContextTr};
 use context_interface::{ContextTr, JournalTr};
 use interpreter::{CallInputs, Gas, InstructionResult, InterpreterResult};
 use precompile::{PrecompileOutput, PrecompileSpecId, PrecompileStatus, Precompiles};
+use precompile::stateful_precompiles::run_stateful_precompile;
 use primitives::{hardfork::SpecId, Address, AddressSet, Bytes};
 use std::string::{String, ToString};
 
@@ -146,6 +147,25 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for EthPrecompiles {
         context: &mut CTX,
         inputs: &CallInputs,
     ) -> Result<Option<InterpreterResult>, String> {
+        if self.precompiles.is_stateful(&inputs.bytecode_address) {
+            let input = inputs.input.as_bytes(context).to_vec();
+            let output = run_stateful_precompile(
+                inputs.bytecode_address,
+                &input,
+                inputs.gas_limit,
+                inputs.reservoir,
+                inputs.caller,
+                inputs.call_value(),
+                inputs.is_static,
+                context,
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(Some(precompile_output_to_interpreter_result(
+                output,
+                inputs.gas_limit,
+            )));
+        }
+
         let Some(precompile) = self.precompiles.get(&inputs.bytecode_address) else {
             return Ok(None);
         };

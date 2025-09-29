@@ -16,19 +16,25 @@ extern crate alloc as std;
     expect(unreachable_code)
 )]
 pub mod blake2;
+pub mod as_bin;
 pub mod bls12_381;
 pub mod bls12_381_const;
 pub mod bls12_381_utils;
 pub mod bn254;
+pub mod contract_interface;
+pub mod da_signers;
 pub mod hash;
 mod id;
 pub mod identity;
 pub mod interface;
+pub mod journal;
 pub mod kzg_point_evaluation;
 pub mod modexp;
 pub mod secp256k1;
 pub mod secp256r1;
+pub mod stateful_precompiles;
 pub mod utilities;
+pub mod wa0gi_base;
 
 pub use primitives;
 
@@ -74,6 +80,8 @@ use primitives::{
 };
 use std::boxed::Box;
 
+use crate::{da_signers::DA_SIGNERS_ADDRESS, wa0gi_base::WA0GI_BASE_ADDRESS};
+
 /// Calculate the linear cost of a precompile.
 #[inline]
 pub const fn calc_linear_cost(len: usize, base: u64, word: u64) -> u64 {
@@ -91,6 +99,8 @@ pub const fn calc_linear_cost_u32(len: usize, base: u64, word: u64) -> u64 {
 pub struct Precompiles {
     /// Precompiles
     inner: AddressMap<Precompile>,
+    /// Addresses implemented by precompiles that access the EVM journal.
+    stateful: AddressSet,
     /// Addresses of precompiles.
     addresses: AddressSet,
     /// Optimized addresses filter.
@@ -101,6 +111,7 @@ impl Default for Precompiles {
     fn default() -> Self {
         Self {
             inner: HashMap::default(),
+            stateful: AddressSet::default(),
             addresses: AddressSet::default(),
             optimized_access: Box::new([const { None }; SHORT_ADDRESS_CAP]),
         }
@@ -179,7 +190,13 @@ impl Precompiles {
     /// Is the given address a precompile.
     #[inline]
     pub fn contains(&self, address: &Address) -> bool {
-        self.inner.contains_key(address)
+        self.inner.contains_key(address) || self.stateful.contains(address)
+    }
+
+    /// Returns whether the address is implemented by a stateful precompile.
+    #[inline]
+    pub fn is_stateful(&self, address: &Address) -> bool {
+        self.stateful.contains(address)
     }
 
     /// Returns the precompile for the given address.
@@ -206,7 +223,7 @@ impl Precompiles {
     /// Returns the number of precompiles.
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.len() + self.stateful.len()
     }
 
     /// Returns the precompiles addresses as a set.
@@ -233,20 +250,33 @@ impl Precompiles {
         }
     }
 
+    /// Extends this set with stateful precompile addresses.
+    pub fn extend_stateful(&mut self, other: impl IntoIterator<Item = Address>) {
+        for address in other {
+            self.addresses.insert(address);
+            self.stateful.insert(address);
+        }
+    }
+
     /// Returns complement of `other` in `self`.
     ///
     /// Two entries are considered equal if the precompile addresses are equal.
     pub fn difference(&self, other: &Self) -> Self {
-        let Self { inner, .. } = self;
+        let Self { inner, stateful, .. } = self;
 
         let inner = inner
             .iter()
             .filter(|(a, _)| !other.inner.contains_key(*a))
             .map(|(a, p)| (*a, p.clone()))
             .collect::<AddressMap<_>>();
+        let stateful = stateful
+            .iter()
+            .filter(|address| !other.stateful.contains(*address))
+            .copied();
 
         let mut precompiles = Self::default();
         precompiles.extend(inner.into_iter().map(|p| p.1));
+        precompiles.extend_stateful(stateful);
         precompiles
     }
 
@@ -254,16 +284,21 @@ impl Precompiles {
     ///
     /// Two entries are considered equal if the precompile addresses are equal.
     pub fn intersection(&self, other: &Self) -> Self {
-        let Self { inner, .. } = self;
+        let Self { inner, stateful, .. } = self;
 
         let inner = inner
             .iter()
             .filter(|(a, _)| other.inner.contains_key(*a))
             .map(|(a, p)| (*a, p.clone()))
             .collect::<AddressMap<_>>();
+        let stateful = stateful
+            .iter()
+            .filter(|address| other.stateful.contains(*address))
+            .copied();
 
         let mut precompiles = Self::default();
         precompiles.extend(inner.into_iter().map(|p| p.1));
+        precompiles.extend_stateful(stateful);
         precompiles
     }
 }
@@ -280,6 +315,7 @@ fn init_precompiles(spec: PrecompileSpecId) -> Precompiles {
         hash::RIPEMD160,
         identity::FUN,
     ]);
+    precompiles.extend_stateful([DA_SIGNERS_ADDRESS, WA0GI_BASE_ADDRESS]);
 
     if spec.is_enabled_in(BYZANTIUM) {
         // EIP-196: Precompiled contracts for addition and scalar multiplication on the elliptic curve alt_bn128.
@@ -531,6 +567,6 @@ mod test {
     fn test_intersection_precompile_sets() {
         let intersection = Precompiles::homestead().intersection(Precompiles::byzantium());
 
-        assert_eq!(intersection.len(), 4)
+        assert_eq!(intersection.len(), 6)
     }
 }

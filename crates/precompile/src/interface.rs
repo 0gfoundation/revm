@@ -535,6 +535,14 @@ impl fmt::Display for PrecompileHalt {
 /// [`PrecompileHalt`] which is expressed through [`PrecompileStatus::Halt`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PrecompileError {
+    /// Stateful precompile ran out of gas.
+    OutOfGas,
+    /// Stateful precompile input does not match a supported function.
+    StatefulInvalidInput,
+    /// Stateful precompile attempted to mutate state from a static call.
+    StaticRestrictionViolation,
+    /// Recoverable stateful precompile error.
+    Other(String),
     /// Unrecoverable error that halts EVM execution.
     Fatal(String),
     /// Unrecoverable error that halts EVM execution.
@@ -553,6 +561,12 @@ impl core::error::Error for PrecompileError {}
 impl fmt::Display for PrecompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OutOfGas => f.write_str("out of gas"),
+            Self::StatefulInvalidInput => {
+                f.write_str("input does not match any function of the stateful precompile")
+            }
+            Self::StaticRestrictionViolation => f.write_str("static restriction violation"),
+            Self::Other(s) => f.write_str(s),
             Self::Fatal(s) => write!(f, "fatal: {s}"),
             Self::FatalAny(s) => write!(f, "fatal: {s}"),
         }

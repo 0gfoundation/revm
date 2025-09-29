@@ -416,6 +416,23 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         Ok(())
     }
 
+    /// Decreases the balance of the account.
+    ///
+    /// Mark account as touched.
+    #[inline]
+    pub fn balance_decr<DB: Database>(
+        &mut self,
+        db: &mut DB,
+        address: Address,
+        balance: U256,
+    ) -> Result<Option<TransferError>, DB::Error> {
+        let mut account = self.load_account_mut(db, address)?.data;
+        if !account.decr_balance(balance) {
+            return Ok(Some(TransferError::OutOfFunds));
+        }
+        Ok(None)
+    }
+
     /// Increments the nonce of the account.
     #[inline]
     #[deprecated]
