@@ -98,7 +98,7 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for EthPrecompiles {
         _is_static: bool,
         gas_limit: u64,
     ) -> Result<Option<InterpreterResult>, String> {
-        let Some(precompile) = self.precompiles.get(address) else {
+        let Some(precompile) = self.precompiles.get_stateless(address) else {
             return Ok(None);
         };
 
@@ -108,20 +108,18 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for EthPrecompiles {
             output: Bytes::new(),
         };
 
-        let r;
         let input_bytes = match &inputs.input {
             CallInput::SharedBuffer(range) => {
                 if let Some(slice) = context.local().shared_memory_buffer_slice(range.clone()) {
-                    r = slice;
-                    r.as_ref()
+                    slice.to_vec()
                 } else {
-                    &[]
+                    vec![]
                 }
             }
-            CallInput::Bytes(bytes) => bytes.0.iter().as_slice(),
+            CallInput::Bytes(bytes) => bytes.0.to_vec(),
         };
 
-        match precompile.execute(input_bytes, gas_limit) {
+        match precompile.execute(&input_bytes, gas_limit) {
             Ok(output) => {
                 let underflow = result.gas.record_cost(output.gas_used);
                 assert!(underflow, "Gas underflow is not possible");

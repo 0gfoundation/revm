@@ -112,6 +112,13 @@ pub trait JournalTr {
         balance: U256,
     ) -> Result<(), <Self::Database as Database>::Error>;
 
+    /// Decrease the balance of the account.
+    fn balance_decr(
+        &mut self,
+        address: Address,
+        balance: U256,
+    ) -> Result<Option<TransferError>, <Self::Database as Database>::Error>;
+
     /// Increments the nonce of the account.
     fn nonce_bump_journal_entry(&mut self, address: Address);
 
