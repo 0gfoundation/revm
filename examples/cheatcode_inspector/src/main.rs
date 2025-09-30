@@ -272,7 +272,6 @@ impl JournalTr for Backend {
     fn discard_tx(&mut self) {
         self.journaled_state.discard_tx()
     }
-
     fn sload_skip_cold_load(
         &mut self,
         address: Address,
@@ -322,6 +321,14 @@ impl JournalTr for Backend {
     ) -> Result<StateLoad<Self::JournaledAccount<'_>>, Infallible> {
         self.journaled_state
             .load_account_mut_optional_code(address, load_code)
+    }
+
+    fn balance_decr(
+        &mut self,
+        address: Address,
+        balance: U256,
+    ) -> Result<Option<TransferError>, <Self::Database as Database>::Error> {
+        self.journaled_state.balance_decr(address, balance)
     }
 }
 
