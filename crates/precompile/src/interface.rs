@@ -230,6 +230,10 @@ pub enum PrecompileError {
     BlobMismatchedVersion,
     /// The proof verification failed
     BlobVerifyKzgProofFailed,
+    /// The input does not match any function of given stateful precompile
+    StatefulInvalidInput,
+    /// Static restriction violation
+    StaticRestrictionViolation,
     /// Fatal error with a custom error message
     Fatal(String),
     /// Catch-all variant for other errors
@@ -266,6 +270,10 @@ impl fmt::Display for PrecompileError {
             Self::BlobInvalidInputLength => "invalid blob input length",
             Self::BlobMismatchedVersion => "mismatched blob version",
             Self::BlobVerifyKzgProofFailed => "verifying blob kzg proof failed",
+            Self::StatefulInvalidInput => {
+                "input does not match any function of given stateful precompile"
+            }
+            Self::StaticRestrictionViolation => "static restriction violation",
             Self::Fatal(s) => s,
             Self::Other(s) => s,
         };

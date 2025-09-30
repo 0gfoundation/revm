@@ -20,6 +20,8 @@ workspace = true
 [dependencies]
 # revm
 primitives.workspace = true
+context.workspace = true
+bytecode.workspace = true
 
 # modexp precompiles
 aurora-engine-modexp.workspace = true
@@ -71,6 +73,13 @@ p256 = { workspace = true, features = ["ecdsa"] }
 # utils
 cfg-if.workspace = true
 arrayref = "0.3.6"
+rmp-serde.workspace = true
+serde.workspace = true
+
+# alloy
+
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
