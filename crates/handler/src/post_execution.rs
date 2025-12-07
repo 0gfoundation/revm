@@ -61,6 +61,16 @@ pub const fn eip7623_check_gas_floor(gas: &mut Gas, init_and_floor_gas: InitialA
 pub fn refund(gas_params: &GasParams, gas: &mut Gas, eip7702_refund: i64) {
     gas.record_refund(eip7702_refund);
     gas.set_final_refund(gas_params.max_refund_quotient());
+
+    // Apply 80% minimum gas usage threshold (same as geth's IsRestakingActive logic)
+    // Ensure transaction uses at least 80% of its gas limit
+    let min_gas_used = gas.limit() * 80 / 100;
+    if gas.used() < min_gas_used {
+        // Adjust remaining so that spent = minGasUsed, and clear refund
+        // This matches geth's approach: st.gasRemaining = st.initialGas - minGasUsed
+        gas.set_spent(min_gas_used);
+        gas.set_refund(0);
+    }
 }
 
 /// Reimburses the caller for unused gas.
