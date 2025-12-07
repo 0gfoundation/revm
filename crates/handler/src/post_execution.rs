@@ -67,6 +67,16 @@ pub fn refund(spec: SpecId, gas: &mut Gas, eip7702_refund: i64) {
     // If spec is set to london, it will decrease the maximum refund amount to 5th part of
     // gas spend. (Before london it was 2th part of gas spend)
     gas.set_final_refund(spec.is_enabled_in(SpecId::LONDON));
+
+    // Apply 80% minimum gas usage threshold (same as geth's IsRestakingActive logic)
+    // Ensure transaction uses at least 80% of its gas limit
+    let min_gas_used = gas.limit() * 80 / 100;
+    if gas.used() < min_gas_used {
+        // Adjust remaining so that spent = minGasUsed, and clear refund
+        // This matches geth's approach: st.gasRemaining = st.initialGas - minGasUsed
+        gas.set_spent(min_gas_used);
+        gas.set_refund(0);
+    }
 }
 
 /// Reimburses the caller for unused gas.
