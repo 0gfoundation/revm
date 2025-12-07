@@ -67,6 +67,57 @@ pub fn refund(spec: SpecId, gas: &mut Gas, eip7702_refund: i64) {
     // If spec is set to london, it will decrease the maximum refund amount to 5th part of
     // gas spend. (Before london it was 2th part of gas spend)
     gas.set_final_refund(spec.is_enabled_in(SpecId::LONDON));
+
+    // Apply 80% minimum gas usage threshold (same as geth's IsRestakingActive logic)
+    // Ensure transaction uses at least 80% of its gas limit
+    let min_gas_used = gas.limit() / 100 * 80 + gas.limit() % 100 * 80 / 100;
+    if gas.used() < min_gas_used {
+        // Adjust remaining so that spent = minGasUsed, and clear refund
+        // This matches geth's approach: st.gasRemaining = st.initialGas - minGasUsed
+        gas.set_spent(min_gas_used);
+        gas.set_refund(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refund_enforces_eighty_percent_minimum_gas_used() {
+        let mut gas = Gas::new(100_000);
+        assert!(gas.record_regular_cost(10_000));
+        gas.set_refund(2_000);
+
+        refund(SpecId::LONDON, &mut gas, 0);
+
+        assert_eq!(gas.total_gas_spent(), 80_000);
+        assert_eq!(gas.refunded(), 0);
+        assert_eq!(gas.used(), 80_000);
+    }
+
+    #[test]
+    fn refund_preserves_usage_above_eighty_percent() {
+        let mut gas = Gas::new(100_000);
+        assert!(gas.record_regular_cost(90_000));
+
+        refund(SpecId::LONDON, &mut gas, 0);
+
+        assert_eq!(gas.total_gas_spent(), 90_000);
+        assert_eq!(gas.used(), 90_000);
+    }
+
+    #[test]
+    fn refund_threshold_does_not_overflow_at_max_gas_limit() {
+        let mut gas = Gas::new(u64::MAX);
+
+        refund(SpecId::LONDON, &mut gas, 0);
+
+        assert_eq!(
+            gas.total_gas_spent(),
+            u64::MAX / 100 * 80 + u64::MAX % 100 * 80 / 100
+        );
+    }
 }
 
 /// Reimburses the caller for unused gas.
