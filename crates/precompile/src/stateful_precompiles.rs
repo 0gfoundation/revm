@@ -5,6 +5,7 @@ use primitives::{bytes, Address, U256};
 
 use crate::{
     da_signers::{run_da_signers_call, DA_SIGNERS_ADDRESS},
+    perp_dex::{run_perp_dex_call, PERP_DEX_ADDRESS},
     wa0gi_base::{run_wa0gi_base_call, WA0GI_BASE_ADDRESS},
     PrecompileError, PrecompileResult,
 };
@@ -44,6 +45,9 @@ pub fn run_stateful_precompile<CTX: ContextTr>(
         }
         WA0GI_BASE_ADDRESS => {
             run_wa0gi_base_call(input_bytes, gas_limit, caller, value, is_static, context)
+        }
+        PERP_DEX_ADDRESS => {
+            run_perp_dex_call(input_bytes, gas_limit, caller, value, is_static, context)
         }
         _ => Err(PrecompileError::Other(format!(
             "Stateful precompile {to:?} not found"

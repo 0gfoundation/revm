@@ -3950,6 +3950,7 @@ dependencies = [
  "rand 0.9.1",
  "revm-bytecode",
  "revm-context",
+ "revm-database",
  "revm-primitives",
  "ripemd",
  "rmp-serde",

@@ -25,6 +25,7 @@ pub mod kzg_point_evaluation;
 pub mod modexp;
 pub mod secp256k1;
 pub mod secp256r1;
+pub mod perp_dex;
 pub mod stateful_precompiles;
 pub mod utilities;
 pub mod wa0gi_base;
@@ -68,7 +69,11 @@ use primitives::{
 };
 use std::vec::Vec;
 
-use crate::{da_signers::DA_SIGNERS_ADDRESS, wa0gi_base::WA0GI_BASE_ADDRESS};
+use crate::{
+    da_signers::DA_SIGNERS_ADDRESS,
+    perp_dex::PERP_DEX_ADDRESS,
+    wa0gi_base::WA0GI_BASE_ADDRESS,
+};
 
 /// Calculate the linear cost of a precompile.
 pub fn calc_linear_cost_u32(len: usize, base: u64, word: u64) -> u64 {
@@ -127,7 +132,7 @@ impl Precompiles {
                 hash::RIPEMD160,
                 identity::FUN,
             ]);
-            precompiles.extend_stateful([DA_SIGNERS_ADDRESS, WA0GI_BASE_ADDRESS]);
+            precompiles.extend_stateful([DA_SIGNERS_ADDRESS, WA0GI_BASE_ADDRESS, PERP_DEX_ADDRESS]);
             precompiles
         })
     }
