@@ -1,43 +1,102 @@
 //! Storage key derivation for the PerpDEX precompile.
 //!
-//! All keys are `B256` values derived via `keccak256` so that every module
-//! can share a single address space (the `PERP_DEX_ADDRESS` storage) without
-//! collision.  The 4-byte prefix distinguishes key families.
+//! Every storage key is `B256 = keccak256(prefix ++ domain-fields)`.
+//! Fixed 4-byte ASCII prefixes prevent cross-domain collisions inside
+//! the single `PERP_DEX_ADDRESS` storage space.
 
 use primitives::{keccak256, Address, B256};
 
-// ── Key-family prefixes ─────────────────────────────────────────────────────
+// ── Key-family prefixes ───────────────────────────────────────────────────
+const PFX_ACCOUNT:      &[u8] = b"acct";
+const PFX_POSITION:     &[u8] = b"pos\x00";
+const PFX_BUY_ORDERS:   &[u8] = b"bord";   // per-user buy order entries
+const PFX_SELL_ORDERS:  &[u8] = b"sord";   // per-user sell order entries
+const PFX_ORDER:        &[u8] = b"ord\x00"; // full Order struct by order_id
+const PFX_USER_NONCE:   &[u8] = b"nonc";   // per-user nonce for order-id generation
+const PFX_MARKET:       &[u8] = b"mkt\x00";
+const PFX_MARK_PRICE:   &[u8] = b"mktp";
+const PFX_OPEN_INT:     &[u8] = b"oint";
+const PFX_BID_PRICES:   &[u8] = b"bidp";   // sorted Vec<u64> of active bid prices
+const PFX_ASK_PRICES:   &[u8] = b"askp";   // sorted Vec<u64> of active ask prices
+const PFX_BID_LEVEL:    &[u8] = b"bidl";   // FIFO queue of order IDs at a bid price
+const PFX_ASK_LEVEL:    &[u8] = b"askl";   // FIFO queue of order IDs at an ask price
 
-/// Prefix for user account storage keys.
-const PREFIX_ACCOUNT: &[u8] = b"acct";
+// ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
 
-// Future prefixes (add as modules are implemented):
-// const PREFIX_ORDER:    &[u8] = b"ord\x00";
-// const PREFIX_POSITION: &[u8] = b"pos\x00";
-// const PREFIX_MARKET:   &[u8] = b"mkt\x00";
-
-// ── Public key constructors ─────────────────────────────────────────────────
-
-/// Storage key for `user`'s `UserAccount` inside the DEX.
-///
-/// `keccak256(b"acct" ++ user_address)`
-pub fn account_key(user: Address) -> B256 {
-    keccak256([PREFIX_ACCOUNT, user.as_slice()].concat())
-}
-
-/// ERC-20 balance storage slot for `account` inside the `token` contract.
-///
-/// Standard OpenZeppelin ERC-20 keeps `mapping(address => uint256) _balances`
-/// at storage **slot 0**.  The key for a particular address is:
-///
-/// ```text
-/// keccak256(abi.encode(account, uint256(0)))
-///         = keccak256( account_padded_32 ++ slot_0_padded_32 )
-/// ```
+/// Standard OpenZeppelin ERC-20 `_balances[account]` storage slot.
+/// `keccak256(abi.encode(account, uint256(0)))` – slot 0 is the balances mapping.
 pub fn erc20_balance_slot(account: Address) -> B256 {
     let mut buf = [0u8; 64];
-    // address right-aligned in the first word (left-padded with zeros)
     buf[12..32].copy_from_slice(account.as_slice());
-    // second word = slot index 0 (already zero-initialised)
     keccak256(buf)
+}
+
+// ── Account ───────────────────────────────────────────────────────────────
+
+pub fn account_key(user: Address) -> B256 {
+    keccak256([PFX_ACCOUNT, user.as_slice()].concat())
+}
+
+// ── Perp position ─────────────────────────────────────────────────────────
+
+pub fn position_key(user: Address, market_id: u64) -> B256 {
+    keccak256([PFX_POSITION, user.as_slice(), &market_id.to_be_bytes()].concat())
+}
+
+/// Buy-order entries for a user in a market (Vec<OrderEntry>, sorted price DESC).
+pub fn user_buy_orders_key(user: Address, market_id: u64) -> B256 {
+    keccak256([PFX_BUY_ORDERS, user.as_slice(), &market_id.to_be_bytes()].concat())
+}
+
+/// Sell-order entries for a user in a market (Vec<OrderEntry>, sorted price ASC).
+pub fn user_sell_orders_key(user: Address, market_id: u64) -> B256 {
+    keccak256([PFX_SELL_ORDERS, user.as_slice(), &market_id.to_be_bytes()].concat())
+}
+
+// ── Orders ────────────────────────────────────────────────────────────────
+
+/// Full `Order` struct keyed by 32-byte order ID.
+pub fn order_key(order_id: &[u8; 32]) -> B256 {
+    keccak256([PFX_ORDER, order_id.as_slice()].concat())
+}
+
+/// Per-user nonce used to derive unique order IDs.
+pub fn user_nonce_key(user: Address) -> B256 {
+    keccak256([PFX_USER_NONCE, user.as_slice()].concat())
+}
+
+// ── Market ────────────────────────────────────────────────────────────────
+
+pub fn market_key(market_id: u64) -> B256 {
+    keccak256([PFX_MARKET, &market_id.to_be_bytes()].concat())
+}
+
+pub fn mark_price_key(market_id: u64) -> B256 {
+    keccak256([PFX_MARK_PRICE, &market_id.to_be_bytes()].concat())
+}
+
+pub fn open_interest_key(market_id: u64) -> B256 {
+    keccak256([PFX_OPEN_INT, &market_id.to_be_bytes()].concat())
+}
+
+// ── Order book ────────────────────────────────────────────────────────────
+
+/// Sorted list of all active **bid** prices for a market (Vec<u64>, price DESC).
+pub fn bid_prices_key(market_id: u64) -> B256 {
+    keccak256([PFX_BID_PRICES, &market_id.to_be_bytes()].concat())
+}
+
+/// Sorted list of all active **ask** prices for a market (Vec<u64>, price ASC).
+pub fn ask_prices_key(market_id: u64) -> B256 {
+    keccak256([PFX_ASK_PRICES, &market_id.to_be_bytes()].concat())
+}
+
+/// FIFO queue of order IDs at a specific bid price level.
+pub fn bid_level_key(market_id: u64, price: u64) -> B256 {
+    keccak256([PFX_BID_LEVEL, &market_id.to_be_bytes(), &price.to_be_bytes()].concat())
+}
+
+/// FIFO queue of order IDs at a specific ask price level.
+pub fn ask_level_key(market_id: u64, price: u64) -> B256 {
+    keccak256([PFX_ASK_LEVEL, &market_id.to_be_bytes(), &price.to_be_bytes()].concat())
 }

@@ -1,62 +1,79 @@
 //! Storage helpers for the PerpDEX precompile.
-//!
-//! Two layers:
-//!   1. `UserAccount` — msgpack-encoded blob stored at the precompile's own
-//!      address via the multi-slot `store_bytes` / `load_bytes` helpers.
-//!   2. ERC-20 balances — direct `sload` / `sstore` on the token contract's
-//!      storage, using the standard OpenZeppelin slot derivation.
 
 pub mod keys;
 
 use context::{ContextTr, JournalTr};
-use primitives::{Address, U256};
+use primitives::{Address, B256, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     journal::{load_bytes, store_bytes},
-    perp_dex::{errors::perp_err, types::UserAccount, PERP_DEX_ADDRESS},
+    perp_dex::{
+        errors::perp_err,
+        types::{Market, Order, OrderEntry, PerpPosition, UserAccount},
+        PERP_DEX_ADDRESS,
+    },
     stateful_precompiles::convert_db_err,
     PrecompileError,
 };
 
-use keys::{account_key, erc20_balance_slot};
+use keys::{
+    account_key, ask_level_key, ask_prices_key, bid_level_key, bid_prices_key, erc20_balance_slot,
+    mark_price_key, market_key, open_interest_key, order_key, position_key, user_buy_orders_key,
+    user_nonce_key, user_sell_orders_key,
+};
 
-// ── UserAccount ─────────────────────────────────────────────────────────────
+// ── Generic msgpack helpers ───────────────────────────────────────────────────
 
-/// Load the `UserAccount` for `user` from the DEX's own storage.
-/// Returns a zeroed default if the account has never been written.
+fn encode<T: Serialize>(val: &T) -> Result<Vec<u8>, PrecompileError> {
+    let mut buf = Vec::new();
+    val.serialize(&mut RMPSerializer::new(&mut buf).with_struct_map())
+        .map_err(|_| perp_err("msgpack encode error"))?;
+    Ok(buf)
+}
+
+fn decode<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<T, PrecompileError> {
+    let mut de = RMPDeserializer::new(buf);
+    Deserialize::deserialize(&mut de).map_err(|_| perp_err("msgpack decode error"))
+}
+
+fn load_blob<CTX: ContextTr>(context: &mut CTX, key: B256) -> Result<Vec<u8>, PrecompileError> {
+    load_bytes(context, PERP_DEX_ADDRESS, key)
+}
+
+fn store_blob<CTX: ContextTr>(
+    context: &mut CTX,
+    key: B256,
+    buf: &[u8],
+) -> Result<(), PrecompileError> {
+    store_bytes(context, PERP_DEX_ADDRESS, key, buf)
+}
+
+// ── UserAccount ───────────────────────────────────────────────────────────────
+
 pub fn load_account<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<UserAccount, PrecompileError> {
-    let buf = load_bytes(context, PERP_DEX_ADDRESS, account_key(user))?;
+    let buf = load_blob(context, account_key(user))?;
     if buf.is_empty() {
         return Ok(UserAccount::default());
     }
-    let mut de = RMPDeserializer::new(&buf[..]);
-    Deserialize::deserialize(&mut de).map_err(|_| perp_err("failed to decode UserAccount"))
+    decode(&buf)
 }
 
-/// Persist `account` for `user` into the DEX's own storage.
 pub fn save_account<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     account: UserAccount,
 ) -> Result<(), PrecompileError> {
-    let mut buf = Vec::new();
-    account
-        .serialize(&mut RMPSerializer::new(&mut buf).with_struct_map())
-        .map_err(|_| perp_err("failed to encode UserAccount"))?;
-    store_bytes(context, PERP_DEX_ADDRESS, account_key(user), &buf)
+    let buf = encode(&account)?;
+    store_blob(context, account_key(user), &buf)
 }
 
-// ── ERC-20 balance helpers ───────────────────────────────────────────────────
+// ── ERC-20 balance helpers ─────────────────────────────────────────────────────
 
-/// Read `account`'s balance inside the `token` ERC-20 contract.
-///
-/// Directly reads the token contract's storage rather than making an
-/// external call — only possible because this is a native precompile.
 pub fn load_erc20_balance<CTX: ContextTr>(
     context: &mut CTX,
     token: Address,
@@ -71,7 +88,6 @@ pub fn load_erc20_balance<CTX: ContextTr>(
     Ok(value)
 }
 
-/// Write `balance` into `account`'s slot inside the `token` ERC-20 contract.
 pub fn save_erc20_balance<CTX: ContextTr>(
     context: &mut CTX,
     token: Address,
@@ -84,4 +100,351 @@ pub fn save_erc20_balance<CTX: ContextTr>(
         .sstore(token, slot.into(), balance)
         .map_err(convert_db_err::<CTX::Db>)?;
     Ok(())
+}
+
+// ── PerpPosition ──────────────────────────────────────────────────────────────
+
+pub fn load_position<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+) -> Result<PerpPosition, PrecompileError> {
+    let buf = load_blob(context, position_key(user, market_id))?;
+    if buf.is_empty() {
+        return Ok(PerpPosition::default());
+    }
+    decode(&buf)
+}
+
+pub fn save_position<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    pos: &PerpPosition,
+) -> Result<(), PrecompileError> {
+    let buf = encode(pos)?;
+    store_blob(context, position_key(user, market_id), &buf)
+}
+
+// ── Order entry lists (per-user per-market) ───────────────────────────────────
+
+pub fn load_buy_orders<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+) -> Result<Vec<OrderEntry>, PrecompileError> {
+    let buf = load_blob(context, user_buy_orders_key(user, market_id))?;
+    if buf.is_empty() {
+        return Ok(vec![]);
+    }
+    decode(&buf)
+}
+
+pub fn save_buy_orders<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    entries: &[OrderEntry],
+) -> Result<(), PrecompileError> {
+    let buf = encode(&entries)?;
+    store_blob(context, user_buy_orders_key(user, market_id), &buf)
+}
+
+pub fn load_sell_orders<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+) -> Result<Vec<OrderEntry>, PrecompileError> {
+    let buf = load_blob(context, user_sell_orders_key(user, market_id))?;
+    if buf.is_empty() {
+        return Ok(vec![]);
+    }
+    decode(&buf)
+}
+
+pub fn save_sell_orders<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    entries: &[OrderEntry],
+) -> Result<(), PrecompileError> {
+    let buf = encode(&entries)?;
+    store_blob(context, user_sell_orders_key(user, market_id), &buf)
+}
+
+// ── Full Order struct ─────────────────────────────────────────────────────────
+
+pub fn load_order<CTX: ContextTr>(
+    context: &mut CTX,
+    order_id: &[u8; 32],
+) -> Result<Option<Order>, PrecompileError> {
+    let buf = load_blob(context, order_key(order_id))?;
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(decode(&buf)?))
+}
+
+pub fn save_order<CTX: ContextTr>(
+    context: &mut CTX,
+    order_id: &[u8; 32],
+    order: &Order,
+) -> Result<(), PrecompileError> {
+    let buf = encode(order)?;
+    store_blob(context, order_key(order_id), &buf)
+}
+
+// ── User nonce ────────────────────────────────────────────────────────────────
+
+pub fn load_user_nonce<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+) -> Result<u64, PrecompileError> {
+    let buf = load_blob(context, user_nonce_key(user))?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
+}
+
+pub fn save_user_nonce<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    nonce: u64,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&nonce)?;
+    store_blob(context, user_nonce_key(user), &buf)
+}
+
+// ── Market ────────────────────────────────────────────────────────────────────
+
+pub fn load_market<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<Option<Market>, PrecompileError> {
+    let buf = load_blob(context, market_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(decode(&buf)?))
+}
+
+pub fn save_market<CTX: ContextTr>(
+    context: &mut CTX,
+    market: &Market,
+) -> Result<(), PrecompileError> {
+    let buf = encode(market)?;
+    store_blob(context, market_key(market.market_id), &buf)
+}
+
+// ── Mark price ────────────────────────────────────────────────────────────────
+
+pub fn load_mark_price<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<u64, PrecompileError> {
+    let buf = load_blob(context, mark_price_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
+}
+
+pub fn save_mark_price<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&price)?;
+    store_blob(context, mark_price_key(market_id), &buf)
+}
+
+// ── Open interest ─────────────────────────────────────────────────────────────
+
+pub fn load_open_interest<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<u64, PrecompileError> {
+    let buf = load_blob(context, open_interest_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
+}
+
+pub fn save_open_interest<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    oi: u64,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&oi)?;
+    store_blob(context, open_interest_key(market_id), &buf)
+}
+
+// ── Order book: price level lists ─────────────────────────────────────────────
+
+/// Sorted bid prices DESC.
+pub fn load_bid_prices<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<Vec<u64>, PrecompileError> {
+    let buf = load_blob(context, bid_prices_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(vec![]);
+    }
+    decode(&buf)
+}
+
+pub fn save_bid_prices<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    prices: &[u64],
+) -> Result<(), PrecompileError> {
+    let buf = encode(&prices)?;
+    store_blob(context, bid_prices_key(market_id), &buf)
+}
+
+/// Sorted ask prices ASC.
+pub fn load_ask_prices<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<Vec<u64>, PrecompileError> {
+    let buf = load_blob(context, ask_prices_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(vec![]);
+    }
+    decode(&buf)
+}
+
+pub fn save_ask_prices<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    prices: &[u64],
+) -> Result<(), PrecompileError> {
+    let buf = encode(&prices)?;
+    store_blob(context, ask_prices_key(market_id), &buf)
+}
+
+// ── Order book: FIFO queue at a price level ───────────────────────────────────
+
+pub fn load_bid_level<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<Vec<[u8; 32]>, PrecompileError> {
+    let buf = load_blob(context, bid_level_key(market_id, price))?;
+    if buf.is_empty() {
+        return Ok(vec![]);
+    }
+    decode(&buf)
+}
+
+pub fn save_bid_level<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    queue: &[[u8; 32]],
+) -> Result<(), PrecompileError> {
+    let buf = encode(&queue)?;
+    store_blob(context, bid_level_key(market_id, price), &buf)
+}
+
+pub fn load_ask_level<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<Vec<[u8; 32]>, PrecompileError> {
+    let buf = load_blob(context, ask_level_key(market_id, price))?;
+    if buf.is_empty() {
+        return Ok(vec![]);
+    }
+    decode(&buf)
+}
+
+pub fn save_ask_level<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    queue: &[[u8; 32]],
+) -> Result<(), PrecompileError> {
+    let buf = encode(&queue)?;
+    store_blob(context, ask_level_key(market_id, price), &buf)
+}
+
+// ── Order book helpers ────────────────────────────────────────────────────────
+
+/// Insert `price` into the bid price list (kept sorted DESC) if not already present.
+pub fn insert_bid_price<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<(), PrecompileError> {
+    let mut prices = load_bid_prices(context, market_id)?;
+    if !prices.contains(&price) {
+        let idx = prices.partition_point(|&p| p > price);
+        prices.insert(idx, price);
+        save_bid_prices(context, market_id, &prices)?;
+    }
+    Ok(())
+}
+
+/// Insert `price` into the ask price list (kept sorted ASC) if not already present.
+pub fn insert_ask_price<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<(), PrecompileError> {
+    let mut prices = load_ask_prices(context, market_id)?;
+    if !prices.contains(&price) {
+        let idx = prices.partition_point(|&p| p < price);
+        prices.insert(idx, price);
+        save_ask_prices(context, market_id, &prices)?;
+    }
+    Ok(())
+}
+
+/// Remove `price` from the bid price list (call when level becomes empty).
+pub fn remove_bid_price<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<(), PrecompileError> {
+    let mut prices = load_bid_prices(context, market_id)?;
+    prices.retain(|&p| p != price);
+    save_bid_prices(context, market_id, &prices)
+}
+
+/// Remove `price` from the ask price list (call when level becomes empty).
+pub fn remove_ask_price<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<(), PrecompileError> {
+    let mut prices = load_ask_prices(context, market_id)?;
+    prices.retain(|&p| p != price);
+    save_ask_prices(context, market_id, &prices)
+}
+
+/// Append `order_id` to the FIFO queue at the given bid price level.
+pub fn push_bid_order<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    order_id: [u8; 32],
+) -> Result<(), PrecompileError> {
+    let mut queue = load_bid_level(context, market_id, price)?;
+    queue.push(order_id);
+    save_bid_level(context, market_id, price, &queue)
+}
+
+/// Append `order_id` to the FIFO queue at the given ask price level.
+pub fn push_ask_order<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    order_id: [u8; 32],
+) -> Result<(), PrecompileError> {
+    let mut queue = load_ask_level(context, market_id, price)?;
+    queue.push(order_id);
+    save_ask_level(context, market_id, price, &queue)
 }

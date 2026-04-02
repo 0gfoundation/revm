@@ -1,6 +1,67 @@
-//! Position types — placeholder for the trading engine (Step 2+).
-//!
-//! When position management is implemented, add:
-//!   - `PositionSide`  (Long / Short)
-//!   - `Position`      (size, entry price, margin, unrealised PnL, …)
-//!   - `MarketId`      (identifier for a trading pair)
+//! Position and market types for the PerpDEX precompile.
+use serde::{Deserialize, Serialize};
+
+// ── PerpPosition ──────────────────────────────────────────────────────────
+
+/// On-chain perpetual position for one user in one market.
+///
+/// All numeric fields use native integer types; msgpack serialises them
+/// efficiently without string encoding (unlike the U256 `AsBinStr` pattern).
+///
+/// Field naming mirrors the offchain `PerpPosition` in `balance/balance.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PerpPosition {
+    /// Net base-asset position: positive = long, negative = short.
+    #[serde(rename = "a")]
+    pub amount: i64,
+    /// Virtual quote balance.  Entry price = -v_quote_balance / amount.
+    #[serde(rename = "v")]
+    pub v_quote_balance: i64,
+    /// Margin (collateral) allocated to this position.
+    #[serde(rename = "m")]
+    pub margin: i64,
+    /// Total margin reserved for open orders (max of buy- and sell-side).
+    #[serde(rename = "mr")]
+    pub margin_reserved: u64,
+    /// Margin reserved for the buy side of open orders.
+    #[serde(rename = "br")]
+    pub buy_side_margin_reserved: u64,
+    /// Margin reserved for the sell side of open orders.
+    #[serde(rename = "sr")]
+    pub sell_side_margin_reserved: u64,
+    /// Current leverage setting (1–20).
+    #[serde(rename = "lv")]
+    pub leverage: u64,
+}
+
+impl Default for PerpPosition {
+    fn default() -> Self {
+        Self {
+            amount: 0,
+            v_quote_balance: 0,
+            margin: 0,
+            margin_reserved: 0,
+            buy_side_margin_reserved: 0,
+            sell_side_margin_reserved: 0,
+            leverage: 1,
+        }
+    }
+}
+
+// ── Market ────────────────────────────────────────────────────────────────
+
+/// Configuration for a single perpetual market, stored on-chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Market {
+    pub market_id: u64,
+    /// Decimal places for the base asset (e.g. 8 for BTC).
+    pub base_decimals: u32,
+    /// Minimum price increment (9-decimal fixed-point units).
+    pub tick_size: u64,
+    /// Minimum quantity increment (base-asset units).
+    pub step_size: u64,
+    /// Minimum order quantity.
+    pub min_quantity: u64,
+    /// Whether the market accepts new orders.
+    pub active: bool,
+}

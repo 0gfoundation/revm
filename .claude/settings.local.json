@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(python -c \"import pptx; print\\('pptx ok'\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python -m pip install python-pptx)",
+      "Bash(del \"c:\\\\Users\\\\Admin\\\\Documents\\\\GitHub\\\\Harry-Stormstout\\\\0gfoundation\\\\revm\\\\gen_slides.py\")"
     ]
   }
 }
