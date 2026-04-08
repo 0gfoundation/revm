@@ -1,14 +1,15 @@
 //! Deposit, withdraw, and inter-wallet transfer logic for the PerpDEX.
 
+use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
-use context::ContextTr;
-use primitives::{Address, Bytes, U256};
+use context::{ContextTr, JournalTr};
+use primitives::{Address, Bytes, Log, U256};
 
 use crate::{
     perp_dex::{
         errors::perp_err,
         interface::IPerpDex::{
-            depositCall, getAccountCall, getAccountReturn, transferFromPerpCall,
+            self, depositCall, getAccountCall, getAccountReturn, transferFromPerpCall,
             transferToPerpCall, withdrawCall,
         },
         storage::{self, load_erc20_balance, save_erc20_balance},
@@ -48,6 +49,11 @@ pub fn run_deposit<CTX: ContextTr>(
     account.usdc_balance = (prev + amount).into();
     storage::save_account(context, caller, account)?;
 
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::Deposit { user: caller, amount }.to_log_data(),
+    });
+
     Ok(Bytes::new())
 }
 
@@ -82,6 +88,11 @@ pub fn run_withdraw<CTX: ContextTr>(
     let user_usdc = load_erc20_balance(context, USDC_ADDRESS, caller)?;
     save_erc20_balance(context, USDC_ADDRESS, caller, user_usdc + amount)?;
 
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::Withdraw { user: caller, amount }.to_log_data(),
+    });
+
     Ok(Bytes::new())
 }
 
@@ -112,6 +123,11 @@ pub fn run_transfer_to_perp<CTX: ContextTr>(
         .ok_or_else(|| perp_err("transferToPerp: overflow"))?;
     storage::save_account(context, caller, account)?;
 
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::TransferToPerp { user: caller, amount }.to_log_data(),
+    });
+
     Ok(Bytes::new())
 }
 
@@ -137,6 +153,11 @@ pub fn run_transfer_from_perp<CTX: ContextTr>(
     let spot: U256 = account.usdc_balance.clone().into();
     account.usdc_balance = (spot + U256::from(amount)).into();
     storage::save_account(context, caller, account)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::TransferFromPerp { user: caller, amount }.to_log_data(),
+    });
 
     Ok(Bytes::new())
 }

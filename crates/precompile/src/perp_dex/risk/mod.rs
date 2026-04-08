@@ -1,19 +1,21 @@
 //! Risk management: markets, leverage, mark price, positions, liquidation.
 
+use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
-use context::ContextTr;
-use primitives::{Address, Bytes};
+use context::{ContextTr, JournalTr};
+use primitives::{Address, Bytes, FixedBytes, Log};
 
 use crate::{
     perp_dex::{
         errors::perp_err,
         interface::IPerpDex::{
-            addMarketCall, getMarkPriceCall, getPositionCall, getPositionReturn, liquidateCall,
-            setLeverageCall, setMarkPriceCall,
+            self, addMarketCall, getMarkPriceCall, getPositionCall, getPositionReturn,
+            liquidateCall, setLeverageCall, setMarkPriceCall,
         },
         math::is_above_maintenance_margin,
         storage,
         types::{Market, PerpPosition},
+        PERP_DEX_ADDRESS,
     },
     PrecompileError,
 };
@@ -23,6 +25,7 @@ use crate::{
 /// `addMarket(uint64 marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity)`
 pub fn run_add_market<CTX: ContextTr>(
     input_bytes: &[u8],
+    _caller: Address,
     context: &mut CTX,
 ) -> Result<Bytes, PrecompileError> {
     let args = addMarketCall::abi_decode_validate(input_bytes)
@@ -44,12 +47,26 @@ pub fn run_add_market<CTX: ContextTr>(
         active: true,
     };
     storage::save_market(context, &market)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::MarketAdded {
+            marketId: args.marketId,
+            baseDecimals: args.baseDecimals,
+            tickSize: args.tickSize,
+            stepSize: args.stepSize,
+            minQuantity: args.minQuantity,
+        }
+        .to_log_data(),
+    });
+
     Ok(Bytes::new())
 }
 
 /// `setMarkPrice(uint64 marketId, uint64 price)`
 pub fn run_set_mark_price<CTX: ContextTr>(
     input_bytes: &[u8],
+    caller: Address,
     context: &mut CTX,
 ) -> Result<Bytes, PrecompileError> {
     let args = setMarkPriceCall::abi_decode_validate(input_bytes)
@@ -58,6 +75,17 @@ pub fn run_set_mark_price<CTX: ContextTr>(
     storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("setMarkPrice: unknown market"))?;
     storage::save_mark_price(context, args.marketId, args.price)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::MarkPriceUpdated {
+            marketId: args.marketId,
+            price: args.price,
+            updater: caller,
+        }
+        .to_log_data(),
+    });
+
     Ok(Bytes::new())
 }
 
@@ -98,6 +126,17 @@ pub fn run_set_leverage<CTX: ContextTr>(
     }
     pos.leverage = args.leverage;
     storage::save_position(context, caller, args.marketId, &pos)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::LeverageChanged {
+            user: caller,
+            marketId: args.marketId,
+            leverage: args.leverage,
+        }
+        .to_log_data(),
+    });
+
     Ok(Bytes::new())
 }
 
@@ -155,7 +194,9 @@ pub fn run_liquidate<CTX: ContextTr>(
         return Err(perp_err("liquidate: position is above maintenance margin"));
     }
 
-    // Cancel all open orders for this user/market and return reserved margin.
+    let liq_amount = pos.amount;
+
+    // Cancel all open orders for this user/market (emits OrderCancelled events).
     cancel_all_orders_for_market(context, args.user, args.marketId, &market)?;
 
     // The remaining margin after zeroing the position goes to the liquidator
@@ -177,6 +218,33 @@ pub fn run_liquidate<CTX: ContextTr>(
             .saturating_add(reward);
         storage::save_account(context, caller, liq_account)?;
     }
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::Liquidation {
+            user: args.user,
+            marketId: args.marketId,
+            liquidator: caller,
+            amount: liq_amount,
+            reward,
+            markPrice: mark_price,
+        }
+        .to_log_data(),
+    });
+
+    // Emit zeroed position state.
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::PositionChanged {
+            user: args.user,
+            marketId: args.marketId,
+            amount: 0,
+            vQuoteBalance: 0,
+            margin: 0,
+            leverage: pos.leverage,
+        }
+        .to_log_data(),
+    });
 
     Ok(Bytes::new())
 }
@@ -207,6 +275,16 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
             storage::remove_bid_price(context, market_id, entry.price)?;
         }
         storage::save_bid_level(context, market_id, entry.price, &queue)?;
+
+        context.journal_mut().log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::OrderCancelled {
+                user,
+                orderId: FixedBytes(entry.order_id),
+                marketId: market_id,
+            }
+            .to_log_data(),
+        });
     }
     storage::save_buy_orders(context, user, market_id, &[])?;
 
@@ -223,6 +301,16 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
             storage::remove_ask_price(context, market_id, entry.price)?;
         }
         storage::save_ask_level(context, market_id, entry.price, &queue)?;
+
+        context.journal_mut().log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::OrderCancelled {
+                user,
+                orderId: FixedBytes(entry.order_id),
+                marketId: market_id,
+            }
+            .to_log_data(),
+        });
     }
     storage::save_sell_orders(context, user, market_id, &[])?;
 

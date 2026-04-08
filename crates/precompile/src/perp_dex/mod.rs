@@ -128,8 +128,8 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         s if s == transferFromPerpCall::SELECTOR => run_transfer_from_perp(input_bytes, caller, context)?,
         s if s == getAccountCall::SELECTOR       => run_get_account(input_bytes, context)?,
         // Market management
-        s if s == addMarketCall::SELECTOR        => run_add_market(input_bytes, context)?,
-        s if s == setMarkPriceCall::SELECTOR     => run_set_mark_price(input_bytes, context)?,
+        s if s == addMarketCall::SELECTOR        => run_add_market(input_bytes, caller, context)?,
+        s if s == setMarkPriceCall::SELECTOR     => run_set_mark_price(input_bytes, caller, context)?,
         s if s == getMarkPriceCall::SELECTOR     => run_get_mark_price(input_bytes, context)?,
         // Leverage
         s if s == setLeverageCall::SELECTOR      => run_set_leverage(input_bytes, caller, context)?,
