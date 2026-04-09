@@ -80,6 +80,12 @@ pub fn load_erc20_balance<CTX: ContextTr>(
     account: Address,
 ) -> Result<U256, PrecompileError> {
     let slot = erc20_balance_slot(account);
+    // Ensure the token address is loaded into journal state before sload.
+    // sload panics if the account is absent from the journal.
+    context
+        .journal_mut()
+        .warm_account(token)
+        .map_err(convert_db_err::<CTX::Db>)?;
     let value = context
         .journal_mut()
         .sload(token, slot.into())
@@ -95,6 +101,11 @@ pub fn save_erc20_balance<CTX: ContextTr>(
     balance: U256,
 ) -> Result<(), PrecompileError> {
     let slot = erc20_balance_slot(account);
+    // Ensure the token address is loaded into journal state before sstore.
+    context
+        .journal_mut()
+        .warm_account(token)
+        .map_err(convert_db_err::<CTX::Db>)?;
     context
         .journal_mut()
         .sstore(token, slot.into(), balance)

@@ -12,6 +12,11 @@ pub fn store_bytes<CTX: ContextTr>(
     key: B256,
     value: &[u8],
 ) -> Result<(), PrecompileError> {
+    // Ensure account is in journal state before sstore (sstore panics otherwise).
+    context
+        .journal_mut()
+        .warm_account(addr)
+        .map_err(convert_db_err::<CTX::Db>)?;
     // Compute the storage root key (keccak256(key)) as the base
     let length_key = keccak256(key);
     context
@@ -44,6 +49,11 @@ pub fn load_bytes<CTX: ContextTr>(
     addr: Address,
     key: B256,
 ) -> Result<Vec<u8>, PrecompileError> {
+    // Ensure account is in journal state before sload (sload panics otherwise).
+    context
+        .journal_mut()
+        .warm_account(addr)
+        .map_err(convert_db_err::<CTX::Db>)?;
     // Read length
     let length_key = keccak256(key);
     let length = context
