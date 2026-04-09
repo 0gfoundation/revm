@@ -409,6 +409,7 @@ fn settle_fill<CTX: ContextTr>(
             maker,
             price: fill_price,
             quantity: fill_qty,
+            takerSide: taker_side as u8,
         }
         .to_log_data(),
     });
