@@ -61,5 +61,19 @@ sol! {
         // ── Liquidation ───────────────────────────────────────────────────
         /// Liquidate an under-margined position (anyone can call).
         function liquidate(address user, uint64 marketId) external;
+
+        // ── Events ───────────────────────────────────────────────────────
+        event Deposit(address indexed user, uint256 amount);
+        event Withdraw(address indexed user, uint256 amount);
+        event TransferToPerp(address indexed user, uint64 amount);
+        event TransferFromPerp(address indexed user, uint64 amount);
+        event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType);
+        event OrderCancelled(address indexed user, bytes32 indexed orderId, uint64 indexed marketId);
+        event Trade(uint64 indexed marketId, bytes32 takerOrderId, bytes32 makerOrderId, address taker, address maker, uint64 price, uint64 quantity, uint8 takerSide);
+        event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage);
+        event LeverageChanged(address indexed user, uint64 indexed marketId, uint64 leverage);
+        event Liquidation(address indexed user, uint64 indexed marketId, address liquidator, int64 amount, uint64 reward, uint64 markPrice);
+        event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity);
+        event MarkPriceUpdated(uint64 indexed marketId, uint64 price, address updater);
     }
 }

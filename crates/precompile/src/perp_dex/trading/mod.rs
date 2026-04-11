@@ -1,16 +1,20 @@
 //! Trading engine: place/cancel/query orders with on-chain order-book matching.
 
+use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
-use context::ContextTr;
-use primitives::{keccak256, Address, Bytes, FixedBytes};
+use context::{ContextTr, JournalTr};
+use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 
 use crate::{
     perp_dex::{
         errors::perp_err,
-        interface::IPerpDex::{cancelOrderCall, getOrderCall, getOrderReturn, placeOrderCall},
+        interface::IPerpDex::{
+            self, cancelOrderCall, getOrderCall, getOrderReturn, placeOrderCall,
+        },
         math::{calc_buy_side_margin_reserved, calc_sell_side_margin_reserved, calc_value},
         storage,
         types::{Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce},
+        PERP_DEX_ADDRESS,
     },
     PrecompileError,
 };
@@ -86,6 +90,20 @@ pub fn run_place_order<CTX: ContextTr>(
     };
     storage::save_order(context, &order_id, &order)?;
 
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OrderPlaced {
+            user: caller,
+            marketId: args.marketId,
+            orderId: FixedBytes(order_id),
+            side: args.side,
+            price: args.price,
+            quantity: args.quantity,
+            orderType: args.orderType,
+        }
+        .to_log_data(),
+    });
+
     // Execute matching.
     let remaining = match_order(
         context,
@@ -153,6 +171,16 @@ pub fn run_cancel_order<CTX: ContextTr>(
 
     order.status = OrderStatus::Cancelled;
     storage::save_order(context, &order_id, &order)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OrderCancelled {
+            user: caller,
+            orderId: args.orderId,
+            marketId: market_id,
+        }
+        .to_log_data(),
+    });
 
     Ok(Bytes::new())
 }
@@ -228,7 +256,7 @@ fn match_order<CTX: ContextTr>(
                     let fill_qty = remaining.min(available);
 
                     // Settle fill for both sides.
-                    settle_fill(context, taker_addr, Address::from(maker_order.owner), market_id, ask_price, fill_qty, Side::Buy, market)?;
+                    settle_fill(context, taker_addr, Address::from(maker_order.owner), taker_order_id, &maker_id, market_id, ask_price, fill_qty, Side::Buy, market)?;
 
                     // Update maker order.
                     let mut updated_maker = storage::load_order(context, &maker_id)?.unwrap();
@@ -293,7 +321,7 @@ fn match_order<CTX: ContextTr>(
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
-                    settle_fill(context, taker_addr, Address::from(maker_order.owner), market_id, bid_price, fill_qty, Side::Sell, market)?;
+                    settle_fill(context, taker_addr, Address::from(maker_order.owner), taker_order_id, &maker_id, market_id, bid_price, fill_qty, Side::Sell, market)?;
 
                     let mut updated_maker = storage::load_order(context, &maker_id)?.unwrap();
                     updated_maker.filled += fill_qty;
@@ -339,6 +367,8 @@ fn settle_fill<CTX: ContextTr>(
     context: &mut CTX,
     taker: Address,
     maker: Address,
+    taker_order_id: &[u8; 32],
+    maker_order_id: &[u8; 32],
     market_id: u64,
     fill_price: u64,
     fill_qty: u64,
@@ -348,23 +378,69 @@ fn settle_fill<CTX: ContextTr>(
     let fill_value = calc_value(fill_price, fill_qty, market.base_decimals);
 
     // Taker side.
-    {
+    let taker_pos = {
         let mut pos = storage::load_position(context, taker, market_id)?;
         let mut account = storage::load_account(context, taker)?;
         apply_fill_to_position(&mut pos, &mut account.perp_wallet_balance, fill_qty, fill_value, taker_side == Side::Buy);
         storage::save_position(context, taker, market_id, &pos)?;
         storage::save_account(context, taker, account)?;
-    }
+        pos
+    };
 
     // Maker side (opposite of taker).
-    {
+    let maker_pos = {
         let maker_side = taker_side.opposite();
         let mut pos = storage::load_position(context, maker, market_id)?;
         let mut account = storage::load_account(context, maker)?;
         apply_fill_to_position(&mut pos, &mut account.perp_wallet_balance, fill_qty, fill_value, maker_side == Side::Buy);
         storage::save_position(context, maker, market_id, &pos)?;
         storage::save_account(context, maker, account)?;
-    }
+        pos
+    };
+
+    // Emit Trade event.
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::Trade {
+            marketId: market_id,
+            takerOrderId: FixedBytes(*taker_order_id),
+            makerOrderId: FixedBytes(*maker_order_id),
+            taker,
+            maker,
+            price: fill_price,
+            quantity: fill_qty,
+            takerSide: taker_side as u8,
+        }
+        .to_log_data(),
+    });
+
+    // Emit PositionChanged for taker.
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::PositionChanged {
+            user: taker,
+            marketId: market_id,
+            amount: taker_pos.amount,
+            vQuoteBalance: taker_pos.v_quote_balance,
+            margin: taker_pos.margin,
+            leverage: taker_pos.leverage,
+        }
+        .to_log_data(),
+    });
+
+    // Emit PositionChanged for maker.
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::PositionChanged {
+            user: maker,
+            marketId: market_id,
+            amount: maker_pos.amount,
+            vQuoteBalance: maker_pos.v_quote_balance,
+            margin: maker_pos.margin,
+            leverage: maker_pos.leverage,
+        }
+        .to_log_data(),
+    });
 
     Ok(())
 }
