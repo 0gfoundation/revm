@@ -18,6 +18,9 @@ use crate::{
     PrecompileError,
 };
 
+// Note: TransferToPerp and TransferFromPerp do not emit events — they are
+// internal wallet movements with no corresponding REST API endpoint.
+
 /// `deposit(uint256 amount)` — pull USDC from caller → DEX, credit internal account.
 pub fn run_deposit<CTX: ContextTr>(
     input_bytes: &[u8],
@@ -122,12 +125,6 @@ pub fn run_transfer_to_perp<CTX: ContextTr>(
         .checked_add(amount)
         .ok_or_else(|| perp_err("transferToPerp: overflow"))?;
     storage::save_account(context, caller, account)?;
-
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::TransferToPerp { user: caller, amount }.to_log_data(),
-    });
-
     Ok(Bytes::new())
 }
 
@@ -153,12 +150,6 @@ pub fn run_transfer_from_perp<CTX: ContextTr>(
     let spot: U256 = account.usdc_balance.clone().into();
     account.usdc_balance = (spot + U256::from(amount)).into();
     storage::save_account(context, caller, account)?;
-
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::TransferFromPerp { user: caller, amount }.to_log_data(),
-    });
-
     Ok(Bytes::new())
 }
 

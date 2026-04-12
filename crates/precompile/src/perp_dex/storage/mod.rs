@@ -19,9 +19,9 @@ use crate::{
 };
 
 use keys::{
-    account_key, ask_level_key, ask_prices_key, bid_level_key, bid_prices_key, erc20_balance_slot,
-    mark_price_key, market_key, open_interest_key, order_key, position_key, user_buy_orders_key,
-    user_nonce_key, user_sell_orders_key,
+    account_key, ask_level_key, ask_prices_key, best_ask_key, best_bid_key, bid_level_key,
+    bid_prices_key, erc20_balance_slot, mark_price_key, market_key, open_interest_key, order_key,
+    position_key, trade_count_key, user_buy_orders_key, user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -203,6 +203,19 @@ pub fn save_order<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let buf = encode(order)?;
     store_blob(context, order_key(order_id), &buf)
+}
+
+// ── Global trade counter ──────────────────────────────────────────────────────
+
+/// Atomically increment and return the *current* trade ID for a market, then store the
+/// incremented value.  Returns 0 for the first trade in that market, 1 for the second, etc.
+/// Trade IDs are per-market so that indexers can use them directly as `fromId` cursors.
+pub fn next_trade_id<CTX: ContextTr>(context: &mut CTX, market_id: u64) -> Result<u64, PrecompileError> {
+    let buf = load_blob(context, trade_count_key(market_id))?;
+    let current: u64 = if buf.is_empty() { 0 } else { decode(&buf)? };
+    let next_buf = encode(&(current + 1))?;
+    store_blob(context, trade_count_key(market_id), &next_buf)?;
+    Ok(current)
 }
 
 // ── User nonce ────────────────────────────────────────────────────────────────
@@ -458,4 +471,71 @@ pub fn push_ask_order<CTX: ContextTr>(
     let mut queue = load_ask_level(context, market_id, price)?;
     queue.push(order_id);
     save_ask_level(context, market_id, price, &queue)
+}
+
+// ── Best bid / ask cache ──────────────────────────────────────────────────────
+// Stored as a single u64 per market.  0 means "no orders on that side".
+// Kept in sync with the sorted price lists so callers can avoid loading the
+// full list just for a PostOnly check or a quick spread query.
+
+pub fn load_best_bid<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<u64, PrecompileError> {
+    let buf = load_blob(context, best_bid_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
+}
+
+pub fn save_best_bid<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&price)?;
+    store_blob(context, best_bid_key(market_id), &buf)
+}
+
+pub fn load_best_ask<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<u64, PrecompileError> {
+    let buf = load_blob(context, best_ask_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
+}
+
+pub fn save_best_ask<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&price)?;
+    store_blob(context, best_ask_key(market_id), &buf)
+}
+
+/// Re-derive best_bid from the current bid price list (already in journal cache after matching).
+/// Call this after any operation that may have removed the top bid level.
+pub fn refresh_best_bid<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<(), PrecompileError> {
+    let prices = load_bid_prices(context, market_id)?;
+    let best = prices.first().copied().unwrap_or(0);
+    save_best_bid(context, market_id, best)
+}
+
+/// Re-derive best_ask from the current ask price list (already in journal cache after matching).
+/// Call this after any operation that may have removed the top ask level.
+pub fn refresh_best_ask<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<(), PrecompileError> {
+    let prices = load_ask_prices(context, market_id)?;
+    let best = prices.first().copied().unwrap_or(0);
+    save_best_ask(context, market_id, best)
 }
