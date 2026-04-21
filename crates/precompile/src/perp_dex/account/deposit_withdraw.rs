@@ -49,7 +49,11 @@ pub fn run_deposit<CTX: ContextTr>(
     // 3. Credit the caller's internal spot balance.
     let mut account = storage::load_account(context, caller)?;
     let prev: U256 = account.usdc_balance.clone().into();
-    account.usdc_balance = (prev + amount).into();
+    let new_balance = prev + amount;
+    if new_balance > U256::from(u64::MAX) {
+        return Err(perp_err("deposit: total balance would exceed u64::MAX"));
+    }
+    account.usdc_balance = new_balance.into();
     storage::save_account(context, caller, account)?;
 
     context.journal_mut().log(Log {
@@ -224,6 +228,16 @@ mod tests {
         let mut ctx = make_ctx(U256::from(1_000_000u64));
         let err = run_deposit(&depositCall { amount: U256::ZERO }.abi_encode(), ALICE, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("amount must be > 0"), "{err}");
+    }
+
+    #[test]
+    fn deposit_rejects_when_total_would_exceed_u64_max() {
+        // Two deposits of 2/3 * u64::MAX each: individually valid, cumulatively overflows.
+        let two_thirds = U256::from(u64::MAX / 3 * 2);
+        let mut ctx = make_ctx(U256::MAX);
+        run_deposit(&depositCall { amount: two_thirds }.abi_encode(), ALICE, &mut ctx).unwrap();
+        let err = run_deposit(&depositCall { amount: two_thirds }.abi_encode(), ALICE, &mut ctx).unwrap_err();
+        assert!(err.to_string().contains("exceed u64::MAX"), "{err}");
     }
 
     #[test]

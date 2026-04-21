@@ -7,7 +7,7 @@ use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 
 use crate::{
     perp_dex::{
-        errors::perp_err,
+        errors::{perp_err, perp_invariant_err},
         interface::IPerpDex::{
             self, cancelOrderCall, getOrderCall, getOrderReturn, placeOrderCall,
         },
@@ -46,12 +46,18 @@ pub fn run_place_order<CTX: ContextTr>(
     if args.quantity < market.min_quantity {
         return Err(perp_err("placeOrder: quantity below minimum"));
     }
+    if args.quantity > market.max_quantity {
+        return Err(perp_err("placeOrder: quantity exceeds maximum"));
+    }
     if market.step_size > 0 && args.quantity % market.step_size != 0 {
         return Err(perp_err("placeOrder: quantity not multiple of step_size"));
     }
     if order_type == OrderType::Limit {
         if args.price == 0 {
             return Err(perp_err("placeOrder: limit order price must be > 0"));
+        }
+        if args.price > market.max_price {
+            return Err(perp_err("placeOrder: price exceeds maximum"));
         }
         if market.tick_size > 0 && args.price % market.tick_size != 0 {
             return Err(perp_err("placeOrder: price not multiple of tick_size"));
@@ -89,21 +95,6 @@ pub fn run_place_order<CTX: ContextTr>(
     };
     storage::save_order(context, &order_id, &order)?;
 
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::OrderPlaced {
-            user: caller,
-            marketId: args.marketId,
-            orderId: FixedBytes(order_id),
-            side: args.side,
-            price: args.price,
-            quantity: args.quantity,
-            orderType: args.orderType,
-            tif: args.tif,
-        }
-        .to_log_data(),
-    });
-
     // Execute matching.
     let remaining = if skip_match {
         args.quantity
@@ -124,7 +115,7 @@ pub fn run_place_order<CTX: ContextTr>(
 
     // Rest remaining in book for GTC/PostOnly limit orders.
     if remaining > 0 && order_type == OrderType::Limit && matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly) {
-        rest_in_book(context, caller, &order_id, args.marketId, side, args.price, remaining, &market)?;
+        rest_in_book(context, caller, &order_id, args.marketId, side, args.price, remaining, tif, &market)?;
     } else if remaining == 0 {
         // Already fully filled — status updated inside match_order.
     } else {
@@ -255,7 +246,12 @@ fn match_order<CTX: ContextTr>(
 
                     let maker_order = match storage::load_order(context, &maker_id)? {
                         Some(o) if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) => o,
-                        _ => continue,
+                        Some(o) => return Err(perp_invariant_err(format!(
+                            "ask queue contains order {:?} with terminal status {:?}", maker_id, o.status
+                        ))),
+                        None => return Err(perp_invariant_err(format!(
+                            "ask queue references order {:?} not found in storage", maker_id
+                        ))),
                     };
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
@@ -264,7 +260,8 @@ fn match_order<CTX: ContextTr>(
                     settle_fill(context, taker_addr, Address::from(maker_order.owner), taker_order_id, &maker_id, market_id, ask_price, fill_qty, Side::Buy, market)?;
 
                     // Update maker order.
-                    let mut updated_maker = storage::load_order(context, &maker_id)?.unwrap();
+                    let mut updated_maker = storage::load_order(context, &maker_id)?
+                        .ok_or_else(|| perp_invariant_err(format!("maker order {:?} missing after settle_fill", maker_id)))?;
                     updated_maker.filled += fill_qty;
                     updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
                         OrderStatus::Filled
@@ -277,7 +274,8 @@ fn match_order<CTX: ContextTr>(
                     update_sell_entry_after_fill(context, Address::from(maker_order.owner), market_id, &maker_id, fill_qty, market)?;
 
                     // Update taker order.
-                    let mut taker_order = storage::load_order(context, taker_order_id)?.unwrap();
+                    let mut taker_order = storage::load_order(context, taker_order_id)?
+                        .ok_or_else(|| perp_invariant_err("taker order missing after settle_fill"))?;
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
                         OrderStatus::Filled
@@ -326,14 +324,20 @@ fn match_order<CTX: ContextTr>(
 
                     let maker_order = match storage::load_order(context, &maker_id)? {
                         Some(o) if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) => o,
-                        _ => continue,
+                        Some(o) => return Err(perp_invariant_err(format!(
+                            "bid queue contains order {:?} with terminal status {:?}", maker_id, o.status
+                        ))),
+                        None => return Err(perp_invariant_err(format!(
+                            "bid queue references order {:?} not found in storage", maker_id
+                        ))),
                     };
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
                     settle_fill(context, taker_addr, Address::from(maker_order.owner), taker_order_id, &maker_id, market_id, bid_price, fill_qty, Side::Sell, market)?;
 
-                    let mut updated_maker = storage::load_order(context, &maker_id)?.unwrap();
+                    let mut updated_maker = storage::load_order(context, &maker_id)?
+                        .ok_or_else(|| perp_invariant_err(format!("maker order {:?} missing after settle_fill", maker_id)))?;
                     updated_maker.filled += fill_qty;
                     updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
                         OrderStatus::Filled
@@ -344,7 +348,8 @@ fn match_order<CTX: ContextTr>(
 
                     update_buy_entry_after_fill(context, Address::from(maker_order.owner), market_id, &maker_id, fill_qty, market)?;
 
-                    let mut taker_order = storage::load_order(context, taker_order_id)?.unwrap();
+                    let mut taker_order = storage::load_order(context, taker_order_id)?
+                        .ok_or_else(|| perp_invariant_err("taker order missing after settle_fill"))?;
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
                         OrderStatus::Filled
@@ -556,6 +561,7 @@ fn rest_in_book<CTX: ContextTr>(
     side: Side,
     price: u64,
     qty: u64,
+    tif: TimeInForce,
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
@@ -576,6 +582,12 @@ fn rest_in_book<CTX: ContextTr>(
             // Under max-reservation, the wallet delta is the change in max(buy, sell).
             let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
             let new_max = new_buy_side_reserved.max(pos.sell_side_margin_reserved);
+            if new_buy_side_reserved < pos.buy_side_margin_reserved {
+                return Err(perp_invariant_err(format!(
+                    "buy-side reservation decreased after adding order: {} -> {}",
+                    pos.buy_side_margin_reserved, new_buy_side_reserved
+                )));
+            }
             let delta = new_max.saturating_sub(old_max);
 
             if account.perp_wallet_balance < delta {
@@ -610,6 +622,12 @@ fn rest_in_book<CTX: ContextTr>(
             // Under max-reservation, the wallet delta is the change in max(buy, sell).
             let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
             let new_max = pos.buy_side_margin_reserved.max(new_sell_side_reserved);
+            if new_sell_side_reserved < pos.sell_side_margin_reserved {
+                return Err(perp_invariant_err(format!(
+                    "sell-side reservation decreased after adding order: {} -> {}",
+                    pos.sell_side_margin_reserved, new_sell_side_reserved
+                )));
+            }
             let delta = new_max.saturating_sub(old_max);
 
             if account.perp_wallet_balance < delta {
@@ -634,6 +652,21 @@ fn rest_in_book<CTX: ContextTr>(
 
     storage::save_position(context, user, market_id, &pos)?;
     storage::save_account(context, user, account)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OrderRested {
+            user,
+            marketId: market_id,
+            orderId: FixedBytes(*order_id),
+            side: side as u8,
+            price,
+            quantity: qty,
+            tif: tif as u8,
+        }
+        .to_log_data(),
+    });
+
     Ok(())
 }
 
@@ -729,11 +762,16 @@ fn update_buy_entry_after_fill<CTX: ContextTr>(
     let mut account = storage::load_account(context, maker)?;
 
     let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
-    if let Some(e) = entries.iter_mut().find(|e| &e.order_id == order_id) {
-        e.amount = e.amount.saturating_sub(fill_qty);
-        if e.amount == 0 {
-            entries.retain(|e| &e.order_id != order_id);
+    match entries.iter_mut().find(|e| &e.order_id == order_id) {
+        Some(e) => {
+            e.amount = e.amount.saturating_sub(fill_qty);
+            if e.amount == 0 {
+                entries.retain(|e| &e.order_id != order_id);
+            }
         }
+        None => return Err(perp_invariant_err(format!(
+            "buy entry for order {:?} not found during fill update", order_id
+        ))),
     }
     let new_reserved = calc_buy_side_margin_reserved(&entries, pos.leverage.max(1), market.base_decimals, pos.amount);
     let new_max = new_reserved.max(pos.sell_side_margin_reserved);
@@ -762,11 +800,16 @@ fn update_sell_entry_after_fill<CTX: ContextTr>(
     let mut account = storage::load_account(context, maker)?;
 
     let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
-    if let Some(e) = entries.iter_mut().find(|e| &e.order_id == order_id) {
-        e.amount = e.amount.saturating_sub(fill_qty);
-        if e.amount == 0 {
-            entries.retain(|e| &e.order_id != order_id);
+    match entries.iter_mut().find(|e| &e.order_id == order_id) {
+        Some(e) => {
+            e.amount = e.amount.saturating_sub(fill_qty);
+            if e.amount == 0 {
+                entries.retain(|e| &e.order_id != order_id);
+            }
         }
+        None => return Err(perp_invariant_err(format!(
+            "sell entry for order {:?} not found during fill update", order_id
+        ))),
     }
     let new_reserved = calc_sell_side_margin_reserved(&entries, pos.leverage.max(1), market.base_decimals, pos.amount);
     let new_max = pos.buy_side_margin_reserved.max(new_reserved);
@@ -1020,6 +1063,8 @@ mod tests {
             tick_size:     TICK,
             step_size:     QTY,
             min_quantity:  QTY,
+            max_quantity:  QTY * 1_000,
+            max_price:     PRICE * 1_000,
             active:        true,
         }).unwrap();
         fund(ctx, ALICE, WALLET);
@@ -1077,6 +1122,30 @@ mod tests {
         }.abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("unknown market"), "{err}");
+    }
+
+    #[test]
+    fn rejects_quantity_above_maximum() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let input = placeOrderCall {
+            marketId: MARKET_ID, side: 0, price: PRICE, quantity: QTY * 1_001,
+            orderType: 0, tif: 0,
+        }.abi_encode();
+        let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"), "{err}");
+    }
+
+    #[test]
+    fn rejects_price_above_maximum() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let input = placeOrderCall {
+            marketId: MARKET_ID, side: 0, price: PRICE * 1_001, quantity: QTY,
+            orderType: 0, tif: 0,
+        }.abi_encode();
+        let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"), "{err}");
     }
 
     #[test]

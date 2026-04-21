@@ -17,7 +17,7 @@ sol! {
 
         // ── Market management (admin only) ─────────────────────────────────
         /// Register a new perpetual market.
-        function addMarket(uint64 marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity) external;
+        function addMarket(uint64 marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice) external;
         /// Update the mark price (used for margin and liquidation).
         function setMarkPrice(uint64 marketId, uint64 price) external;
         /// Read the current mark price for a market.
@@ -68,8 +68,10 @@ sol! {
         // Feeds: /income (TRANSFER type), balance history
         event Withdraw(address indexed user, uint256 amount);
 
-        // Feeds: /order, /openOrders, /allOrders (time, side, price, qty, tif)
-        event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif);
+        // Emitted when a limit order is placed into the order book (after any immediate fills).
+        // quantity = the resting quantity (original qty minus any fills that happened first).
+        // Feeds: /openOrders, /allOrders (status=NEW/PARTIALLY_FILLED depending on fills)
+        event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif);
         // Feeds: /openOrders (remove), /allOrders (status=CANCELED, updateTime)
         event OrderCancelled(address indexed user, bytes32 indexed orderId, uint64 indexed marketId);
 
@@ -86,7 +88,7 @@ sol! {
         event Liquidation(address indexed user, uint64 indexed marketId, address liquidator, int64 amount, uint64 reward, uint64 markPrice);
 
         // Feeds: market metadata bootstrap for indexer
-        event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity);
+        event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice);
         // Feeds: /premiumIndex (mark price history), /fundingRate (markPrice field)
         event MarkPriceUpdated(uint64 indexed marketId, uint64 price, address updater);
 

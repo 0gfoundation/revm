@@ -62,6 +62,10 @@ pub struct Market {
     pub step_size: u64,
     /// Minimum order quantity.
     pub min_quantity: u64,
+    /// Maximum order quantity (bounds calc_value to prevent u128 overflow).
+    pub max_quantity: u64,
+    /// Maximum order price (9-decimal fixed-point units).
+    pub max_price: u64,
     /// Whether the market accepts new orders.
     pub active: bool,
 }

@@ -8,7 +8,9 @@
       "Bash(python -m pip install python-pptx)",
       "Bash(del \"c:\\\\Users\\\\Admin\\\\Documents\\\\GitHub\\\\Harry-Stormstout\\\\0gfoundation\\\\revm\\\\gen_slides.py\")",
       "Bash(cargo build:*)",
-      "Bash(cargo nexttest:*)"
+      "Bash(cargo nexttest:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(node -e ':*)"
     ]
   }
 }

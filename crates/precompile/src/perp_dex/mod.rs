@@ -58,7 +58,7 @@ pub mod types;
 pub const PERP_DEX_ADDRESS: Address = address!("0000000000000000000000000000000000001003");
 
 /// USDC token address on this chain.
-pub const USDC_ADDRESS: Address = address!("06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4");
+pub const USDC_ADDRESS: Address = address!("0x5ddA922Df9244b87635144e59D26f5A6e9FD90c3");
 
 // ── Selector table ────────────────────────────────────────────────────────────
 

@@ -558,6 +558,6 @@ mod test {
     fn test_intersection_precompile_sets() {
         let intersection = Precompiles::homestead().intersection(Precompiles::byzantium());
 
-        assert_eq!(intersection.len(), 6)
+        assert_eq!(intersection.len(), 7)
     }
 }

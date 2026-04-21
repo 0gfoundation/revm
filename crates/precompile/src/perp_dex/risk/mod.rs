@@ -37,6 +37,18 @@ pub fn run_add_market<CTX: ContextTr>(
     if args.tickSize == 0 || args.stepSize == 0 || args.minQuantity == 0 {
         return Err(perp_err("addMarket: tick/step/min must be > 0"));
     }
+    if args.maxQuantity < args.minQuantity {
+        return Err(perp_err("addMarket: maxQuantity must be >= minQuantity"));
+    }
+    if args.maxQuantity % args.stepSize != 0 {
+        return Err(perp_err("addMarket: maxQuantity must be a multiple of stepSize"));
+    }
+    if args.maxPrice < args.tickSize {
+        return Err(perp_err("addMarket: maxPrice must be >= tickSize"));
+    }
+    if args.maxPrice % args.tickSize != 0 {
+        return Err(perp_err("addMarket: maxPrice must be a multiple of tickSize"));
+    }
 
     let market = Market {
         market_id: args.marketId,
@@ -44,6 +56,8 @@ pub fn run_add_market<CTX: ContextTr>(
         tick_size: args.tickSize,
         step_size: args.stepSize,
         min_quantity: args.minQuantity,
+        max_quantity: args.maxQuantity,
+        max_price: args.maxPrice,
         active: true,
     };
     storage::save_market(context, &market)?;
@@ -56,6 +70,8 @@ pub fn run_add_market<CTX: ContextTr>(
             tickSize: args.tickSize,
             stepSize: args.stepSize,
             minQuantity: args.minQuantity,
+            maxQuantity: args.maxQuantity,
+            maxPrice: args.maxPrice,
         }
         .to_log_data(),
     });
