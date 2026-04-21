@@ -30,13 +30,14 @@ use crate::{
             run_withdraw,
         },
         interface::IPerpDex::{
-            addMarketCall, cancelOrderCall, depositCall, getAccountCall, getMarkPriceCall,
-            getOrderCall, getPositionCall, liquidateCall, placeOrderCall, setLeverageCall,
-            setMarkPriceCall, transferFromPerpCall, transferToPerpCall, withdrawCall,
+            addMarketCall, cancelOrderCall, depositCall, getAccountCall, getAdminCall,
+            getMarkPriceCall, getOrderCall, getPositionCall, initAdminCall, liquidateCall,
+            placeOrderCall, setLeverageCall, setMarkPriceCall, transferAdminCall,
+            transferFromPerpCall, transferToPerpCall, withdrawCall,
         },
         risk::{
-            run_add_market, run_get_mark_price, run_get_position, run_liquidate, run_set_leverage,
-            run_set_mark_price,
+            run_add_market, run_get_admin, run_get_mark_price, run_get_position, run_init_admin,
+            run_liquidate, run_set_leverage, run_set_mark_price, run_transfer_admin,
         },
         trading::{run_cancel_order, run_get_order, run_place_order},
     },
@@ -58,7 +59,7 @@ pub mod types;
 pub const PERP_DEX_ADDRESS: Address = address!("0000000000000000000000000000000000001003");
 
 /// USDC token address on this chain.
-pub const USDC_ADDRESS: Address = address!("0x5ddA922Df9244b87635144e59D26f5A6e9FD90c3");
+pub const USDC_ADDRESS: Address = address!("5ddA922Df9244b87635144e59D26f5A6e9FD90c3");
 
 // ── Selector table ────────────────────────────────────────────────────────────
 
@@ -68,6 +69,10 @@ static SELECTORS: OnceLock<HashMap<[u8; 4], (u64, bool)>> = OnceLock::new();
 fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
     SELECTORS.get_or_init(|| {
         let mut m = HashMap::new();
+        // Admin
+        m.insert(initAdminCall::SELECTOR,        (30_000, false));
+        m.insert(transferAdminCall::SELECTOR,    (30_000, false));
+        m.insert(getAdminCall::SELECTOR,         (5_000,  true));
         // Account
         m.insert(depositCall::SELECTOR,          (50_000, false));
         m.insert(withdrawCall::SELECTOR,         (50_000, false));
@@ -121,6 +126,10 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
     };
 
     let output = match selector {
+        // Admin
+        s if s == initAdminCall::SELECTOR        => run_init_admin(input_bytes, context)?,
+        s if s == transferAdminCall::SELECTOR    => run_transfer_admin(input_bytes, caller, context)?,
+        s if s == getAdminCall::SELECTOR         => run_get_admin(input_bytes, context)?,
         // Account
         s if s == depositCall::SELECTOR          => run_deposit(input_bytes, caller, context)?,
         s if s == withdrawCall::SELECTOR         => run_withdraw(input_bytes, caller, context)?,

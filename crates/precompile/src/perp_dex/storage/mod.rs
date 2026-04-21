@@ -19,9 +19,10 @@ use crate::{
 };
 
 use keys::{
-    account_key, ask_level_key, ask_prices_key, best_ask_key, best_bid_key, bid_level_key,
-    bid_prices_key, erc20_balance_slot, mark_price_key, market_key, open_interest_key, order_key,
-    position_key, trade_count_key, user_buy_orders_key, user_nonce_key, user_sell_orders_key,
+    account_key, admin_key, ask_level_key, ask_prices_key, best_ask_key, best_bid_key,
+    bid_level_key, bid_prices_key, erc20_balance_slot, mark_price_key, market_key,
+    open_interest_key, order_key, position_key, trade_count_key, user_buy_orders_key,
+    user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -48,6 +49,25 @@ fn store_blob<CTX: ContextTr>(
     buf: &[u8],
 ) -> Result<(), PrecompileError> {
     store_bytes(context, PERP_DEX_ADDRESS, key, buf)
+}
+
+// ── Admin ─────────────────────────────────────────────────────────────────────
+
+/// Returns `Address::ZERO` when no admin has been initialised yet.
+pub fn load_admin<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
+    let buf = load_blob(context, admin_key())?;
+    if buf.is_empty() {
+        return Ok(Address::ZERO);
+    }
+    decode(&buf)
+}
+
+pub fn save_admin<CTX: ContextTr>(
+    context: &mut CTX,
+    admin: Address,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&admin)?;
+    store_blob(context, admin_key(), &buf)
 }
 
 // ── UserAccount ───────────────────────────────────────────────────────────────

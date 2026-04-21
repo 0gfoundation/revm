@@ -7,6 +7,7 @@
 use primitives::{keccak256, Address, B256};
 
 // ── Key-family prefixes ───────────────────────────────────────────────────
+const PFX_ADMIN:        &[u8] = b"admn";
 const PFX_ACCOUNT:      &[u8] = b"acct";
 const PFX_TRADE_COUNT:  &[u8] = b"tcnt"; // per-market sequential trade ID counter
 const PFX_POSITION:     &[u8] = b"pos\x00";
@@ -32,6 +33,13 @@ pub fn erc20_balance_slot(account: Address) -> B256 {
     let mut buf = [0u8; 64];
     buf[12..32].copy_from_slice(account.as_slice());
     keccak256(buf)
+}
+
+// ── Admin ─────────────────────────────────────────────────────────────────
+
+/// Single slot storing the admin address (20 bytes, zero = uninitialized).
+pub fn admin_key() -> B256 {
+    keccak256(PFX_ADMIN)
 }
 
 // ── Global counters ───────────────────────────────────────────────────────

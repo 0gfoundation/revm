@@ -9,8 +9,9 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         interface::IPerpDex::{
-            self, addMarketCall, getMarkPriceCall, getPositionCall, getPositionReturn,
-            liquidateCall, setLeverageCall, setMarkPriceCall,
+            self, addMarketCall, getAdminCall, getMarkPriceCall, getPositionCall,
+            getPositionReturn, initAdminCall, liquidateCall, setLeverageCall, setMarkPriceCall,
+            transferAdminCall,
         },
         math::is_above_maintenance_margin,
         storage,
@@ -20,16 +21,87 @@ use crate::{
     PrecompileError,
 };
 
+// ── Admin: ownership ──────────────────────────────────────────────────────────
+
+/// `initAdmin(address admin)` — one-time initialisation; fails if already set.
+pub fn run_init_admin<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = initAdminCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("initAdmin: invalid calldata"))?;
+
+    if args.admin == Address::ZERO {
+        return Err(perp_err("initAdmin: admin cannot be zero address"));
+    }
+    let current = storage::load_admin(context)?;
+    if current != Address::ZERO {
+        return Err(perp_err("initAdmin: admin already initialised"));
+    }
+    storage::save_admin(context, args.admin)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::AdminInitialized { admin: args.admin }.to_log_data(),
+    });
+    Ok(Bytes::new())
+}
+
+/// `transferAdmin(address newAdmin)` — only callable by current admin.
+pub fn run_transfer_admin<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = transferAdminCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("transferAdmin: invalid calldata"))?;
+
+    if args.newAdmin == Address::ZERO {
+        return Err(perp_err("transferAdmin: new admin cannot be zero address"));
+    }
+    let current = storage::load_admin(context)?;
+    if current == Address::ZERO {
+        return Err(perp_err("transferAdmin: admin not yet initialised"));
+    }
+    if caller != current {
+        return Err(perp_err("transferAdmin: caller is not admin"));
+    }
+    storage::save_admin(context, args.newAdmin)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::AdminTransferred {
+            previousAdmin: current,
+            newAdmin: args.newAdmin,
+        }
+        .to_log_data(),
+    });
+    Ok(Bytes::new())
+}
+
+/// `getAdmin() returns (address admin)`
+pub fn run_get_admin<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    getAdminCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getAdmin: invalid calldata"))?;
+    let admin = storage::load_admin(context)?;
+    Ok(Bytes::from(getAdminCall::abi_encode_returns(&admin)))
+}
+
 // ── Admin: market management ──────────────────────────────────────────────────
 
 /// `addMarket(uint64 marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity)`
 pub fn run_add_market<CTX: ContextTr>(
     input_bytes: &[u8],
-    _caller: Address,
+    caller: Address,
     context: &mut CTX,
 ) -> Result<Bytes, PrecompileError> {
     let args = addMarketCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("addMarket: invalid calldata"))?;
+
+    require_admin(caller, context)?;
 
     if storage::load_market(context, args.marketId)?.is_some() {
         return Err(perp_err("addMarket: market already exists"));
@@ -87,6 +159,8 @@ pub fn run_set_mark_price<CTX: ContextTr>(
 ) -> Result<Bytes, PrecompileError> {
     let args = setMarkPriceCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("setMarkPrice: invalid calldata"))?;
+
+    require_admin(caller, context)?;
 
     storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("setMarkPrice: unknown market"))?;
@@ -266,6 +340,17 @@ pub fn run_liquidate<CTX: ContextTr>(
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn require_admin<CTX: ContextTr>(caller: Address, context: &mut CTX) -> Result<(), PrecompileError> {
+    let admin = storage::load_admin(context)?;
+    if admin == Address::ZERO {
+        return Err(perp_err("not authorised: admin not initialised"));
+    }
+    if caller != admin {
+        return Err(perp_err("not authorised: caller is not admin"));
+    }
+    Ok(())
+}
 
 /// Cancel every open order for `user` in `market`, returning reserved margin
 /// back to their perp wallet.

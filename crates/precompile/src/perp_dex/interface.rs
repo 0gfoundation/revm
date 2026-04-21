@@ -3,6 +3,14 @@ use alloy_sol_types::sol;
 
 sol! {
     interface IPerpDex {
+        // ── Admin ─────────────────────────────────────────────────────────────
+        /// Initialise the admin address. Can only be called once (when no admin is set).
+        function initAdmin(address admin) external;
+        /// Transfer admin role to a new address. Only callable by current admin.
+        function transferAdmin(address newAdmin) external;
+        /// Query the current admin address. Returns zero if not yet initialised.
+        function getAdmin() external view returns (address admin);
+
         // ── Account ────────────────────────────────────────────────────────
         /// Deposit USDC into the user's spot balance inside the DEX.
         function deposit(uint256 amount) external;
@@ -63,6 +71,9 @@ sol! {
         function liquidate(address user, uint64 marketId) external;
 
         // ── Events ───────────────────────────────────────────────────────
+        event AdminInitialized(address indexed admin);
+        event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
+
         // Feeds: /income (TRANSFER type), balance history
         event Deposit(address indexed user, uint256 amount);
         // Feeds: /income (TRANSFER type), balance history
