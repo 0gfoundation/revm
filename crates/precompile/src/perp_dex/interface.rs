@@ -30,6 +30,16 @@ sol! {
         function setMarkPrice(uint64 marketId, uint64 price) external;
         /// Read the current mark price for a market.
         function getMarkPrice(uint64 marketId) external view returns (uint64 price);
+        /// Read the configuration of a registered market. Reverts if the market does not exist.
+        function getMarket(uint64 marketId) external view returns (
+            uint32 baseDecimals,
+            uint64 tickSize,
+            uint64 stepSize,
+            uint64 minQuantity,
+            uint64 maxQuantity,
+            uint64 maxPrice,
+            bool   active
+        );
 
         // ── Leverage ───────────────────────────────────────────────────────
         /// Set the leverage for the caller's position in a market.

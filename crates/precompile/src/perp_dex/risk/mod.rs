@@ -9,9 +9,9 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         interface::IPerpDex::{
-            self, addMarketCall, getAdminCall, getMarkPriceCall, getPositionCall,
-            getPositionReturn, initAdminCall, liquidateCall, setLeverageCall, setMarkPriceCall,
-            transferAdminCall,
+            self, addMarketCall, getAdminCall, getMarkPriceCall, getMarketCall, getMarketReturn,
+            getPositionCall, getPositionReturn, initAdminCall, liquidateCall, setLeverageCall,
+            setMarkPriceCall, transferAdminCall,
         },
         math::is_above_maintenance_margin,
         storage,
@@ -189,6 +189,28 @@ pub fn run_get_mark_price<CTX: ContextTr>(
 
     let price = storage::load_mark_price(context, args.marketId)?;
     Ok(Bytes::from(getMarkPriceCall::abi_encode_returns(&price)))
+}
+
+/// `getMarket(uint64 marketId) returns (uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active)`
+pub fn run_get_market<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = getMarketCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getMarket: invalid calldata"))?;
+
+    let market = storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("getMarket: unknown market"))?;
+
+    Ok(Bytes::from(getMarketCall::abi_encode_returns(&getMarketReturn {
+        baseDecimals: market.base_decimals,
+        tickSize: market.tick_size,
+        stepSize: market.step_size,
+        minQuantity: market.min_quantity,
+        maxQuantity: market.max_quantity,
+        maxPrice: market.max_price,
+        active: market.active,
+    })))
 }
 
 // ── Leverage ──────────────────────────────────────────────────────────────────

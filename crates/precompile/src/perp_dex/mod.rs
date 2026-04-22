@@ -31,13 +31,14 @@ use crate::{
         },
         interface::IPerpDex::{
             addMarketCall, cancelOrderCall, depositCall, getAccountCall, getAdminCall,
-            getMarkPriceCall, getOrderCall, getPositionCall, initAdminCall, liquidateCall,
-            placeOrderCall, setLeverageCall, setMarkPriceCall, transferAdminCall,
+            getMarkPriceCall, getMarketCall, getOrderCall, getPositionCall, initAdminCall,
+            liquidateCall, placeOrderCall, setLeverageCall, setMarkPriceCall, transferAdminCall,
             transferFromPerpCall, transferToPerpCall, withdrawCall,
         },
         risk::{
-            run_add_market, run_get_admin, run_get_mark_price, run_get_position, run_init_admin,
-            run_liquidate, run_set_leverage, run_set_mark_price, run_transfer_admin,
+            run_add_market, run_get_admin, run_get_mark_price, run_get_market, run_get_position,
+            run_init_admin, run_liquidate, run_set_leverage, run_set_mark_price,
+            run_transfer_admin,
         },
         trading::{run_cancel_order, run_get_order, run_place_order},
     },
@@ -83,6 +84,7 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(addMarketCall::SELECTOR,        (100_000, false));
         m.insert(setMarkPriceCall::SELECTOR,     (30_000,  false));
         m.insert(getMarkPriceCall::SELECTOR,     (5_000,   true));
+        m.insert(getMarketCall::SELECTOR,        (5_000,   true));
         // Leverage
         m.insert(setLeverageCall::SELECTOR,      (20_000, false));
         // Trading
@@ -140,6 +142,7 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         s if s == addMarketCall::SELECTOR        => run_add_market(input_bytes, caller, context)?,
         s if s == setMarkPriceCall::SELECTOR     => run_set_mark_price(input_bytes, caller, context)?,
         s if s == getMarkPriceCall::SELECTOR     => run_get_mark_price(input_bytes, context)?,
+        s if s == getMarketCall::SELECTOR        => run_get_market(input_bytes, context)?,
         // Leverage
         s if s == setLeverageCall::SELECTOR      => run_set_leverage(input_bytes, caller, context)?,
         // Trading
