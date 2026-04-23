@@ -89,6 +89,10 @@ sol! {
         // Feeds: /income (TRANSFER type), balance history
         event Withdraw(address indexed user, uint256 amount);
 
+        // Feeds: internal wallet movement history
+        event TransferToPerp(address indexed user, uint64 amount);
+        event TransferFromPerp(address indexed user, uint64 amount);
+
         // Emitted when a limit order is placed into the order book (after any immediate fills).
         // quantity = the resting quantity (original qty minus any fills that happened first).
         // Feeds: /openOrders, /allOrders (status=NEW/PARTIALLY_FILLED depending on fills)
