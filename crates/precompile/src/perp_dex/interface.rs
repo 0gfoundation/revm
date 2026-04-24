@@ -80,9 +80,46 @@ sol! {
         /// Liquidate an under-margined position (anyone can call).
         function liquidate(address user, uint64 marketId) external;
 
+        // ── API key management (ed25519 signed orders) ────────────────────
+        /// Register an ed25519 public key as the caller's API signing key.
+        function registerApiKey(bytes32 pubkey) external;
+        /// Remove the caller's API key, disabling signed-order submissions.
+        function revokeApiKey() external;
+        /// Query the registered API key for a user (zero bytes32 = not set).
+        function getApiKey(address user) external view returns (bytes32 pubkey);
+
+        // ── Signed order submission ───────────────────────────────────────
+        /// Place an order for `account`, authenticated by ed25519 signature.
+        /// Message: "perpdex_v1_order" || account(20) || marketId(8) || side(1)
+        ///          || price(8) || quantity(8) || orderType(1) || tif(1) || timestamp(8)
+        /// orderId = keccak256(signature) — replay protection via existing order storage.
+        function placeOrderSigned(
+            address account,
+            uint64 marketId,
+            uint8 side,
+            uint64 price,
+            uint64 quantity,
+            uint8 orderType,
+            uint8 tif,
+            uint64 timestamp,
+            bytes calldata signature
+        ) external returns (bytes32 orderId);
+
+        /// Cancel an order for `account`, authenticated by ed25519 signature.
+        /// Message: "perpdex_v1_cancel" || account(20) || orderId(32) || timestamp(8)
+        /// Replay protection is implicit: a cancelled order cannot be cancelled again.
+        function cancelOrderSigned(
+            address account,
+            bytes32 orderId,
+            uint64 timestamp,
+            bytes calldata signature
+        ) external;
+
         // ── Events ───────────────────────────────────────────────────────
         event AdminInitialized(address indexed admin);
         event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
+        event ApiKeyRegistered(address indexed user, bytes32 pubkey);
+        event ApiKeyRevoked(address indexed user);
 
         // Feeds: /income (TRANSFER type), balance history
         event Deposit(address indexed user, uint256 amount);

@@ -19,10 +19,10 @@ use crate::{
 };
 
 use keys::{
-    account_key, admin_key, ask_level_key, ask_prices_key, best_ask_key, best_bid_key,
-    bid_level_key, bid_prices_key, erc20_balance_slot, mark_price_key, market_key,
-    open_interest_key, order_key, position_key, trade_count_key, user_buy_orders_key,
-    user_nonce_key, user_sell_orders_key,
+    account_key, admin_key, api_key_key, ask_level_key, ask_prices_key,
+    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot,
+    mark_price_key, market_key, open_interest_key, order_key, position_key, trade_count_key,
+    user_buy_orders_key, user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -547,6 +547,37 @@ pub fn refresh_best_bid<CTX: ContextTr>(
     let prices = load_bid_prices(context, market_id)?;
     let best = prices.first().copied().unwrap_or(0);
     save_best_bid(context, market_id, best)
+}
+
+// ── API key (ed25519 signed orders) ──────────────────────────────────────────
+
+/// Returns `None` when no API key has been registered yet.
+pub fn load_api_key<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+) -> Result<Option<[u8; 32]>, PrecompileError> {
+    let buf = load_blob(context, api_key_key(user))?;
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let key: [u8; 32] = decode(&buf)?;
+    Ok(Some(key))
+}
+
+pub fn save_api_key<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    pubkey: [u8; 32],
+) -> Result<(), PrecompileError> {
+    let buf = encode(&pubkey)?;
+    store_blob(context, api_key_key(user), &buf)
+}
+
+pub fn delete_api_key<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+) -> Result<(), PrecompileError> {
+    store_blob(context, api_key_key(user), &[])
 }
 
 /// Re-derive best_ask from the current ask price list (already in journal cache after matching).

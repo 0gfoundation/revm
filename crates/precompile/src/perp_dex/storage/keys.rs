@@ -24,6 +24,7 @@ const PFX_BID_LEVEL:    &[u8] = b"bidl";   // FIFO queue of order IDs at a bid p
 const PFX_ASK_LEVEL:    &[u8] = b"askl";   // FIFO queue of order IDs at an ask price
 const PFX_BEST_BID:     &[u8] = b"bbd\x00"; // cached best bid price (0 = empty)
 const PFX_BEST_ASK:     &[u8] = b"bak\x00"; // cached best ask price (0 = empty)
+const PFX_API_KEY:      &[u8] = b"apik";    // per-user ed25519 public key (32 bytes)
 
 // ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
 
@@ -127,4 +128,11 @@ pub fn best_bid_key(market_id: u64) -> B256 {
 /// Cached best ask price for a market (0 = no asks).
 pub fn best_ask_key(market_id: u64) -> B256 {
     keccak256([PFX_BEST_ASK, &market_id.to_be_bytes()].concat())
+}
+
+// ── API key (ed25519 signed orders) ──────────────────────────────────────────
+
+/// ed25519 public key registered by a user for signed order submission.
+pub fn api_key_key(user: Address) -> B256 {
+    keccak256([PFX_API_KEY, user.as_slice()].concat())
 }

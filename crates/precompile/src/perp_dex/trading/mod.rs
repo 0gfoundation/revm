@@ -5,11 +5,14 @@ use alloy_sol_types::SolCall;
 use context::{ContextTr, JournalTr};
 use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 
+use ed25519_dalek::{Signature, VerifyingKey};
+
 use crate::{
     perp_dex::{
         errors::{perp_err, perp_invariant_err},
         interface::IPerpDex::{
-            self, cancelOrderCall, getOrderCall, getOrderReturn, placeOrderCall,
+            self, cancelOrderCall, cancelOrderSignedCall, getOrderCall, getOrderReturn,
+            placeOrderCall, placeOrderSignedCall,
         },
         math::{calc_buy_side_margin_reserved, calc_sell_side_margin_reserved, calc_value},
         storage,
@@ -30,64 +33,149 @@ pub fn run_place_order<CTX: ContextTr>(
     let args = placeOrderCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("placeOrder: invalid calldata"))?;
 
-    let market = storage::load_market(context, args.marketId)?
+    let order_id = next_order_id(context, caller)?;
+    place_order_core(caller, order_id, args.marketId, args.side, args.price, args.quantity, args.orderType, args.tif, context)?;
+    Ok(Bytes::from(placeOrderCall::abi_encode_returns(&FixedBytes(order_id))))
+}
+
+/// `placeOrderSigned(address account, ..., uint64 timestamp, bytes signature) returns (bytes32 orderId)`
+///
+/// orderId = keccak256(signature). Replay protection is implicit: a second submission of the
+/// same signature produces the same orderId, which already exists in storage → rejected.
+pub fn run_place_order_signed<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = placeOrderSignedCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("placeOrderSigned: invalid calldata"))?;
+
+    let pubkey = storage::load_api_key(context, args.account)?
+        .ok_or_else(|| perp_err("placeOrderSigned: no api key registered for account"))?;
+
+    // Canonical message (fixed-layout, 71 bytes):
+    //   "perpdex_v1_order"(16) || account(20) || marketId(8) || side(1)
+    //   || price(8) || quantity(8) || orderType(1) || tif(1) || timestamp(8)
+    let mut msg = [0u8; 71];
+    msg[..16].copy_from_slice(b"perpdex_v1_order");
+    msg[16..36].copy_from_slice(args.account.as_slice());
+    msg[36..44].copy_from_slice(&args.marketId.to_be_bytes());
+    msg[44] = args.side;
+    msg[45..53].copy_from_slice(&args.price.to_be_bytes());
+    msg[53..61].copy_from_slice(&args.quantity.to_be_bytes());
+    msg[61] = args.orderType;
+    msg[62] = args.tif;
+    msg[63..71].copy_from_slice(&args.timestamp.to_be_bytes());
+
+    verify_ed25519(&pubkey, &msg, &args.signature)
+        .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
+
+    // Derive orderId from signature — same sig → same id → duplicate check = replay guard.
+    let order_id: [u8; 32] = keccak256(args.signature.as_ref()).0;
+    if storage::load_order(context, &order_id)?.is_some() {
+        return Err(perp_err("placeOrderSigned: duplicate signature (already submitted)"));
+    }
+
+    place_order_core(args.account, order_id, args.marketId, args.side, args.price, args.quantity, args.orderType, args.tif, context)?;
+    Ok(Bytes::from(placeOrderSignedCall::abi_encode_returns(&FixedBytes(order_id))))
+}
+
+/// `cancelOrderSigned(address account, bytes32 orderId, uint64 timestamp, bytes signature)`
+///
+/// Replay protection is implicit: cancelling an already-cancelled order is rejected by
+/// cancel_order_core ("order not cancellable").
+pub fn run_cancel_order_signed<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = cancelOrderSignedCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("cancelOrderSigned: invalid calldata"))?;
+
+    let pubkey = storage::load_api_key(context, args.account)?
+        .ok_or_else(|| perp_err("cancelOrderSigned: no api key registered for account"))?;
+
+    // Canonical message (fixed-layout, 77 bytes):
+    //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || timestamp(8)
+    let mut msg = [0u8; 77];
+    msg[..17].copy_from_slice(b"perpdex_v1_cancel");
+    msg[17..37].copy_from_slice(args.account.as_slice());
+    msg[37..69].copy_from_slice(args.orderId.as_slice());
+    msg[69..77].copy_from_slice(&args.timestamp.to_be_bytes());
+
+    verify_ed25519(&pubkey, &msg, &args.signature)
+        .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;
+
+    cancel_order_core(args.account, args.orderId.0, context)
+}
+
+// ── Core order logic (shared by direct and signed paths) ─────────────────────
+
+/// Allocate the next order ID for `account` using the per-user nonce counter.
+fn next_order_id<CTX: ContextTr>(context: &mut CTX, account: Address) -> Result<[u8; 32], PrecompileError> {
+    let nonce = storage::load_user_nonce(context, account)?;
+    let mut buf = [0u8; 28];
+    buf[..20].copy_from_slice(account.as_slice());
+    buf[20..28].copy_from_slice(&nonce.to_be_bytes());
+    storage::save_user_nonce(context, account, nonce + 1)?;
+    Ok(keccak256(&buf).0)
+}
+
+fn place_order_core<CTX: ContextTr>(
+    account: Address,
+    order_id: [u8; 32],
+    market_id: u64,
+    side_u8: u8,
+    price: u64,
+    quantity: u64,
+    order_type_u8: u8,
+    tif_u8: u8,
+    context: &mut CTX,
+) -> Result<(), PrecompileError> {
+    let market = storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("placeOrder: unknown market"))?;
     if !market.active {
         return Err(perp_err("placeOrder: market not active"));
     }
 
-    let side = Side::from_u8(args.side)
+    let side = Side::from_u8(side_u8)
         .ok_or_else(|| perp_err("placeOrder: invalid side"))?;
-    let order_type = OrderType::from_u8(args.orderType)
+    let order_type = OrderType::from_u8(order_type_u8)
         .ok_or_else(|| perp_err("placeOrder: invalid orderType"))?;
-    let tif = TimeInForce::from_u8(args.tif)
+    let tif = TimeInForce::from_u8(tif_u8)
         .ok_or_else(|| perp_err("placeOrder: invalid tif"))?;
 
-    if args.quantity < market.min_quantity {
+    if quantity < market.min_quantity {
         return Err(perp_err("placeOrder: quantity below minimum"));
     }
-    if args.quantity > market.max_quantity {
+    if quantity > market.max_quantity {
         return Err(perp_err("placeOrder: quantity exceeds maximum"));
     }
-    if market.step_size > 0 && args.quantity % market.step_size != 0 {
+    if market.step_size > 0 && quantity % market.step_size != 0 {
         return Err(perp_err("placeOrder: quantity not multiple of step_size"));
     }
     if order_type == OrderType::Limit {
-        if args.price == 0 {
+        if price == 0 {
             return Err(perp_err("placeOrder: limit order price must be > 0"));
         }
-        if args.price > market.max_price {
+        if price > market.max_price {
             return Err(perp_err("placeOrder: price exceeds maximum"));
         }
-        if market.tick_size > 0 && args.price % market.tick_size != 0 {
+        if market.tick_size > 0 && price % market.tick_size != 0 {
             return Err(perp_err("placeOrder: price not multiple of tick_size"));
         }
     }
 
-    // Generate order_id = keccak256(caller || nonce)
-    let nonce = storage::load_user_nonce(context, caller)?;
-    let mut hash_input = [0u8; 28];
-    hash_input[..20].copy_from_slice(caller.as_slice());
-    hash_input[20..28].copy_from_slice(&nonce.to_be_bytes());
-    let order_id: [u8; 32] = keccak256(&hash_input).0;
-    storage::save_user_nonce(context, caller, nonce + 1)?;
-
-    // For FOK: check whether the book has enough liquidity before touching state.
     if tif == TimeInForce::Fok {
-        check_fok_feasibility(context, args.marketId, side, args.price, args.quantity, order_type)?;
+        check_fok_feasibility(context, market_id, side, price, quantity, order_type)?;
     }
 
-    // Determine whether matching can be skipped entirely.
-    // For PostOnly this also validates the order won't cross — reads best_ask/bid once.
-    let skip_match = should_skip_match(context, args.marketId, side, args.price, order_type, tif)?;
+    let skip_match = should_skip_match(context, market_id, side, price, order_type, tif)?;
 
-    // Save the order record.
     let order = Order {
-        owner: caller.0 .0,
-        market_id: args.marketId,
+        owner: account.0 .0,
+        market_id,
         side,
-        price: args.price,
-        quantity: args.quantity,
+        price,
+        quantity,
         filled: 0,
         order_type,
         tif,
@@ -95,29 +183,16 @@ pub fn run_place_order<CTX: ContextTr>(
     };
     storage::save_order(context, &order_id, &order)?;
 
-    // Execute matching.
     let remaining = if skip_match {
-        args.quantity
+        quantity
     } else {
-        match_order(
-            context,
-            caller,
-            &order_id,
-            args.marketId,
-            side,
-            args.price,
-            args.quantity,
-            order_type,
-            tif,
-            &market,
-        )?
+        match_order(context, account, &order_id, market_id, side, price, quantity, order_type, tif, &market)?
     };
 
-    // Rest remaining in book for GTC/PostOnly limit orders.
     if remaining > 0 && order_type == OrderType::Limit && matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly) {
-        rest_in_book(context, caller, &order_id, args.marketId, side, args.price, remaining, tif, &market)?;
+        rest_in_book(context, account, &order_id, market_id, side, price, remaining, tif, &market)?;
     } else if remaining == 0 {
-        // Already fully filled — status updated inside match_order.
+        // Already fully filled.
     } else {
         // IOC/FOK remainder: cancel.
         if let Some(mut o) = storage::load_order(context, &order_id)? {
@@ -126,24 +201,18 @@ pub fn run_place_order<CTX: ContextTr>(
         }
     }
 
-    let ret_id: FixedBytes<32> = FixedBytes(order_id);
-    Ok(Bytes::from(placeOrderCall::abi_encode_returns(&ret_id)))
+    Ok(())
 }
 
-/// `cancelOrder(bytes32 orderId)`
-pub fn run_cancel_order<CTX: ContextTr>(
-    input_bytes: &[u8],
-    caller: Address,
+fn cancel_order_core<CTX: ContextTr>(
+    account: Address,
+    order_id: [u8; 32],
     context: &mut CTX,
 ) -> Result<Bytes, PrecompileError> {
-    let args = cancelOrderCall::abi_decode_validate(input_bytes)
-        .map_err(|_| perp_err("cancelOrder: invalid calldata"))?;
-    let order_id: [u8; 32] = args.orderId.0;
-
     let mut order = storage::load_order(context, &order_id)?
         .ok_or_else(|| perp_err("cancelOrder: order not found"))?;
 
-    if order.owner != caller.0 .0 {
+    if order.owner != account.0 .0 {
         return Err(perp_err("cancelOrder: not owner"));
     }
     if !matches!(order.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
@@ -154,15 +223,11 @@ pub fn run_cancel_order<CTX: ContextTr>(
     let market_id = order.market_id;
     let price = order.price;
 
-    // Remove from order book queue.
     remove_from_book(context, market_id, order.side, price, &order_id)?;
 
-    // Remove from user order entry list, recalculate margin reserved.
     let market = storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("cancelOrder: unknown market"))?;
-    release_margin_for_cancelled_order(
-        context, caller, market_id, order.side, &order_id, remaining, &market,
-    )?;
+    release_margin_for_cancelled_order(context, account, market_id, order.side, &order_id, remaining, &market)?;
 
     order.status = OrderStatus::Cancelled;
     storage::save_order(context, &order_id, &order)?;
@@ -170,14 +235,25 @@ pub fn run_cancel_order<CTX: ContextTr>(
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderCancelled {
-            user: caller,
-            orderId: args.orderId,
+            user: account,
+            orderId: FixedBytes(order_id),
             marketId: market_id,
         }
         .to_log_data(),
     });
 
     Ok(Bytes::new())
+}
+
+/// `cancelOrder(bytes32 orderId)`
+pub fn run_cancel_order<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = cancelOrderCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("cancelOrder: invalid calldata"))?;
+    cancel_order_core(caller, args.orderId.0, context)
 }
 
 /// `getOrder(bytes32 orderId) returns (address owner, uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint64 filled, uint8 status)`
@@ -202,6 +278,23 @@ pub fn run_get_order<CTX: ContextTr>(
         filled: order.filled,
         status: order.status as u8,
     })))
+}
+
+// ── ed25519 helpers ───────────────────────────────────────────────────────────
+
+fn verify_ed25519(
+    pubkey_bytes: &[u8; 32],
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> Result<(), &'static str> {
+    let pubkey = VerifyingKey::from_bytes(pubkey_bytes)
+        .map_err(|_| "invalid ed25519 public key")?;
+    let sig_arr: &[u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| "signature must be 64 bytes")?;
+    let signature = Signature::from_bytes(sig_arr);
+    pubkey.verify_strict(message, &signature)
+        .map_err(|_| "signature verification failed")
 }
 
 // ── Matching engine ───────────────────────────────────────────────────────────

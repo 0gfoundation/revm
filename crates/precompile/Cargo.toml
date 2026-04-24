@@ -70,6 +70,9 @@ ark-bls12-381 = { workspace = true, features = ["curve"] }
 # p256verify precompile
 p256 = { workspace = true, features = ["ecdsa"] }
 
+# ed25519 signature verification for signed order submission
+ed25519-dalek.workspace = true
+
 # utils
 cfg-if.workspace = true
 arrayref = "0.3.6"
@@ -106,6 +109,7 @@ std = [
 	"ark-serialize/std",
 	"ark-std/std",
 	"p256/std",
+	"ed25519-dalek/std",
 	"rug?/std",
 ]
 hashbrown = ["primitives/hashbrown"]
