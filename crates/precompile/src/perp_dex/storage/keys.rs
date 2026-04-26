@@ -28,26 +28,17 @@ const PFX_API_KEY:      &[u8] = b"apik";    // per-user ed25519 public key (32 b
 
 // ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
 
-/// OpenZeppelin ERC-20 v5 `_balances[account]` storage slot.
+/// Standard OpenZeppelin ERC-20 `_balances[account]` storage slot.
 ///
-/// OZ v5 uses EIP-7201 namespaced storage; `_balances` lives inside
-/// `ERC20Storage` whose root slot is:
-///   keccak256("openzeppelin.storage.ERC20") − 1, rounded down to 256-boundary
-///   = 0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00
+/// Both OZ v4 and OZ v5 non-upgradeable ERC20 store `_balances` as the first
+/// state variable (slot 0).  EIP-7201 namespaced storage is only used by
+/// `ERC20Upgradeable.sol`, not by the standard `ERC20.sol`.
 ///
-/// `_balances` is the first field (offset 0), so it IS at that root slot.
-/// For a mapping at slot S, key K resolves to `keccak256(abi.encode(K, S))`.
+/// Slot = `keccak256(abi.encode(account, uint256(0)))`.
 pub fn erc20_balance_slot(account: Address) -> B256 {
-    // ERC20StorageLocation from OZ v5 ERC20.sol
-    const OZ_V5_ERC20_STORAGE: [u8; 32] = [
-        0x52, 0xc6, 0x32, 0x47, 0xe1, 0xf4, 0x7d, 0xb1,
-        0x9d, 0x5c, 0xe0, 0x46, 0x00, 0x30, 0xc4, 0x97,
-        0xf0, 0x67, 0xca, 0x4c, 0xeb, 0xf7, 0x1b, 0xa9,
-        0x8e, 0xea, 0xda, 0xbe, 0x20, 0xba, 0xce, 0x00,
-    ];
     let mut buf = [0u8; 64];
     buf[12..32].copy_from_slice(account.as_slice()); // left-pad address to 32 bytes
-    buf[32..64].copy_from_slice(&OZ_V5_ERC20_STORAGE); // mapping slot
+    // buf[32..64] stays zero → mapping at slot 0
     keccak256(buf)
 }
 
