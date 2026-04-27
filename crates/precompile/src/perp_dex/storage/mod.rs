@@ -130,6 +130,10 @@ pub fn save_erc20_balance<CTX: ContextTr>(
         .journal_mut()
         .sstore(token, slot.into(), balance)
         .map_err(convert_db_err::<CTX::Db>)?;
+    // Mark the token account as touched so its storage changes are included in
+    // the BundleState transition.  Without this, apply_account_state() skips
+    // untouched accounts and the sstore above is silently dropped from the DB commit.
+    context.journal_mut().touch_account(token);
     Ok(())
 }
 
