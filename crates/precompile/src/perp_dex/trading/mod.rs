@@ -183,6 +183,21 @@ fn place_order_core<CTX: ContextTr>(
     };
     storage::save_order(context, &order_id, &order)?;
 
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OrderPlaced {
+            user: account,
+            marketId: market_id,
+            orderId: FixedBytes(order_id),
+            side: side as u8,
+            price,
+            quantity,
+            orderType: order_type as u8,
+            tif: tif as u8,
+        }
+        .to_log_data(),
+    });
+
     let remaining = if skip_match {
         quantity
     } else {

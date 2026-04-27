@@ -130,9 +130,14 @@ sol! {
         event TransferToPerp(address indexed user, uint64 amount);
         event TransferFromPerp(address indexed user, uint64 amount);
 
-        // Emitted when a limit order is placed into the order book (after any immediate fills).
+        // Emitted once per accepted placeOrder / placeOrderSigned call, before any matching.
+        // Fires only when validation passes; a reverted tx emits nothing.
+        // Feeds: /allOrders (initial record), /openOrders (pending state)
+        event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif);
+
+        // Emitted when a limit order rests in the book (after any immediate fills).
         // quantity = the resting quantity (original qty minus any fills that happened first).
-        // Feeds: /openOrders, /allOrders (status=NEW/PARTIALLY_FILLED depending on fills)
+        // Feeds: /openOrders (confirm resting), /allOrders (status=NEW/PARTIALLY_FILLED)
         event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif);
         // Feeds: /openOrders (remove), /allOrders (status=CANCELED, updateTime)
         event OrderCancelled(address indexed user, bytes32 indexed orderId, uint64 indexed marketId);
