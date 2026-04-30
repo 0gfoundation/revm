@@ -34,8 +34,21 @@ pub fn run_place_order<CTX: ContextTr>(
         .map_err(|_| perp_err("placeOrder: invalid calldata"))?;
 
     let order_id = next_order_id(context, caller)?;
-    place_order_core(caller, order_id, args.marketId, args.side, args.price, args.quantity, args.orderType, args.tif, context)?;
-    Ok(Bytes::from(placeOrderCall::abi_encode_returns(&FixedBytes(order_id))))
+    place_order_core(
+        caller,
+        order_id,
+        args.marketId,
+        args.side,
+        args.price,
+        args.quantity,
+        args.orderType,
+        args.tif,
+        args.clientOrderId.0,
+        context,
+    )?;
+    Ok(Bytes::from(placeOrderCall::abi_encode_returns(
+        &FixedBytes(order_id),
+    )))
 }
 
 /// `placeOrderSigned(address account, ..., uint64 timestamp, bytes signature) returns (bytes32 orderId)`
@@ -52,10 +65,10 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     let pubkey = storage::load_api_key(context, args.account)?
         .ok_or_else(|| perp_err("placeOrderSigned: no api key registered for account"))?;
 
-    // Canonical message (fixed-layout, 71 bytes):
+    // Canonical message (fixed-layout, 87 bytes):
     //   "perpdex_v1_order"(16) || account(20) || marketId(8) || side(1)
-    //   || price(8) || quantity(8) || orderType(1) || tif(1) || timestamp(8)
-    let mut msg = [0u8; 71];
+    //   || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16) || timestamp(8)
+    let mut msg = [0u8; 87];
     msg[..16].copy_from_slice(b"perpdex_v1_order");
     msg[16..36].copy_from_slice(args.account.as_slice());
     msg[36..44].copy_from_slice(&args.marketId.to_be_bytes());
@@ -64,7 +77,8 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     msg[53..61].copy_from_slice(&args.quantity.to_be_bytes());
     msg[61] = args.orderType;
     msg[62] = args.tif;
-    msg[63..71].copy_from_slice(&args.timestamp.to_be_bytes());
+    msg[63..79].copy_from_slice(&args.clientOrderId.0);
+    msg[79..87].copy_from_slice(&args.timestamp.to_be_bytes());
 
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
@@ -72,11 +86,26 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     // Derive orderId from signature — same sig → same id → duplicate check = replay guard.
     let order_id: [u8; 32] = keccak256(args.signature.as_ref()).0;
     if storage::load_order(context, &order_id)?.is_some() {
-        return Err(perp_err("placeOrderSigned: duplicate signature (already submitted)"));
+        return Err(perp_err(
+            "placeOrderSigned: duplicate signature (already submitted)",
+        ));
     }
 
-    place_order_core(args.account, order_id, args.marketId, args.side, args.price, args.quantity, args.orderType, args.tif, context)?;
-    Ok(Bytes::from(placeOrderSignedCall::abi_encode_returns(&FixedBytes(order_id))))
+    place_order_core(
+        args.account,
+        order_id,
+        args.marketId,
+        args.side,
+        args.price,
+        args.quantity,
+        args.orderType,
+        args.tif,
+        args.clientOrderId.0,
+        context,
+    )?;
+    Ok(Bytes::from(placeOrderSignedCall::abi_encode_returns(
+        &FixedBytes(order_id),
+    )))
 }
 
 /// `cancelOrderSigned(address account, bytes32 orderId, uint64 timestamp, bytes signature)`
@@ -110,7 +139,10 @@ pub fn run_cancel_order_signed<CTX: ContextTr>(
 // ── Core order logic (shared by direct and signed paths) ─────────────────────
 
 /// Allocate the next order ID for `account` using the per-user nonce counter.
-fn next_order_id<CTX: ContextTr>(context: &mut CTX, account: Address) -> Result<[u8; 32], PrecompileError> {
+fn next_order_id<CTX: ContextTr>(
+    context: &mut CTX,
+    account: Address,
+) -> Result<[u8; 32], PrecompileError> {
     let nonce = storage::load_user_nonce(context, account)?;
     let mut buf = [0u8; 28];
     buf[..20].copy_from_slice(account.as_slice());
@@ -128,6 +160,7 @@ fn place_order_core<CTX: ContextTr>(
     quantity: u64,
     order_type_u8: u8,
     tif_u8: u8,
+    client_order_id: [u8; 16],
     context: &mut CTX,
 ) -> Result<(), PrecompileError> {
     let market = storage::load_market(context, market_id)?
@@ -136,12 +169,10 @@ fn place_order_core<CTX: ContextTr>(
         return Err(perp_err("placeOrder: market not active"));
     }
 
-    let side = Side::from_u8(side_u8)
-        .ok_or_else(|| perp_err("placeOrder: invalid side"))?;
+    let side = Side::from_u8(side_u8).ok_or_else(|| perp_err("placeOrder: invalid side"))?;
     let order_type = OrderType::from_u8(order_type_u8)
         .ok_or_else(|| perp_err("placeOrder: invalid orderType"))?;
-    let tif = TimeInForce::from_u8(tif_u8)
-        .ok_or_else(|| perp_err("placeOrder: invalid tif"))?;
+    let tif = TimeInForce::from_u8(tif_u8).ok_or_else(|| perp_err("placeOrder: invalid tif"))?;
 
     if quantity < market.min_quantity {
         return Err(perp_err("placeOrder: quantity below minimum"));
@@ -194,6 +225,7 @@ fn place_order_core<CTX: ContextTr>(
             quantity,
             orderType: order_type as u8,
             tif: tif as u8,
+            clientOrderId: FixedBytes(client_order_id),
         }
         .to_log_data(),
     });
@@ -201,11 +233,27 @@ fn place_order_core<CTX: ContextTr>(
     let remaining = if skip_match {
         quantity
     } else {
-        match_order(context, account, &order_id, market_id, side, price, quantity, order_type, tif, &market)?
+        match_order(
+            context, account, &order_id, market_id, side, price, quantity, order_type, tif, &market,
+        )?
     };
 
-    if remaining > 0 && order_type == OrderType::Limit && matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly) {
-        rest_in_book(context, account, &order_id, market_id, side, price, remaining, tif, &market)?;
+    if remaining > 0
+        && order_type == OrderType::Limit
+        && matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly)
+    {
+        rest_in_book(
+            context,
+            account,
+            &order_id,
+            market_id,
+            side,
+            price,
+            remaining,
+            tif,
+            client_order_id,
+            &market,
+        )?;
     } else if remaining == 0 {
         // Already fully filled.
     } else {
@@ -230,7 +278,10 @@ fn cancel_order_core<CTX: ContextTr>(
     if order.owner != account.0 .0 {
         return Err(perp_err("cancelOrder: not owner"));
     }
-    if !matches!(order.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
+    if !matches!(
+        order.status,
+        OrderStatus::Open | OrderStatus::PartiallyFilled
+    ) {
         return Err(perp_err("cancelOrder: order not cancellable"));
     }
 
@@ -242,7 +293,9 @@ fn cancel_order_core<CTX: ContextTr>(
 
     let market = storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("cancelOrder: unknown market"))?;
-    release_margin_for_cancelled_order(context, account, market_id, order.side, &order_id, remaining, &market)?;
+    release_margin_for_cancelled_order(
+        context, account, market_id, order.side, &order_id, remaining, &market,
+    )?;
 
     order.status = OrderStatus::Cancelled;
     storage::save_order(context, &order_id, &order)?;
@@ -284,15 +337,17 @@ pub fn run_get_order<CTX: ContextTr>(
         .ok_or_else(|| perp_err("getOrder: order not found"))?;
 
     let owner = Address::from(order.owner);
-    Ok(Bytes::from(getOrderCall::abi_encode_returns(&getOrderReturn {
-        owner,
-        marketId: order.market_id,
-        side: order.side as u8,
-        price: order.price,
-        quantity: order.quantity,
-        filled: order.filled,
-        status: order.status as u8,
-    })))
+    Ok(Bytes::from(getOrderCall::abi_encode_returns(
+        &getOrderReturn {
+            owner,
+            marketId: order.market_id,
+            side: order.side as u8,
+            price: order.price,
+            quantity: order.quantity,
+            filled: order.filled,
+            status: order.status as u8,
+        },
+    )))
 }
 
 // ── ed25519 helpers ───────────────────────────────────────────────────────────
@@ -302,13 +357,14 @@ fn verify_ed25519(
     message: &[u8],
     signature_bytes: &[u8],
 ) -> Result<(), &'static str> {
-    let pubkey = VerifyingKey::from_bytes(pubkey_bytes)
-        .map_err(|_| "invalid ed25519 public key")?;
+    let pubkey =
+        VerifyingKey::from_bytes(pubkey_bytes).map_err(|_| "invalid ed25519 public key")?;
     let sig_arr: &[u8; 64] = signature_bytes
         .try_into()
         .map_err(|_| "signature must be 64 bytes")?;
     let signature = Signature::from_bytes(sig_arr);
-    pubkey.verify_strict(message, &signature)
+    pubkey
+        .verify_strict(message, &signature)
         .map_err(|_| "signature verification failed")
 }
 
@@ -353,23 +409,52 @@ fn match_order<CTX: ContextTr>(
                     qi += 1;
 
                     let maker_order = match storage::load_order(context, &maker_id)? {
-                        Some(o) if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) => o,
-                        Some(o) => return Err(perp_invariant_err(format!(
-                            "ask queue contains order {:?} with terminal status {:?}", maker_id, o.status
-                        ))),
-                        None => return Err(perp_invariant_err(format!(
-                            "ask queue references order {:?} not found in storage", maker_id
-                        ))),
+                        Some(o)
+                            if matches!(
+                                o.status,
+                                OrderStatus::Open | OrderStatus::PartiallyFilled
+                            ) =>
+                        {
+                            o
+                        }
+                        Some(o) => {
+                            return Err(perp_invariant_err(format!(
+                                "ask queue contains order {:?} with terminal status {:?}",
+                                maker_id, o.status
+                            )))
+                        }
+                        None => {
+                            return Err(perp_invariant_err(format!(
+                                "ask queue references order {:?} not found in storage",
+                                maker_id
+                            )))
+                        }
                     };
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
                     // Settle fill for both sides.
-                    settle_fill(context, taker_addr, Address::from(maker_order.owner), taker_order_id, &maker_id, market_id, ask_price, fill_qty, Side::Buy, market)?;
+                    settle_fill(
+                        context,
+                        taker_addr,
+                        Address::from(maker_order.owner),
+                        taker_order_id,
+                        &maker_id,
+                        market_id,
+                        ask_price,
+                        fill_qty,
+                        Side::Buy,
+                        market,
+                    )?;
 
                     // Update maker order.
-                    let mut updated_maker = storage::load_order(context, &maker_id)?
-                        .ok_or_else(|| perp_invariant_err(format!("maker order {:?} missing after settle_fill", maker_id)))?;
+                    let mut updated_maker =
+                        storage::load_order(context, &maker_id)?.ok_or_else(|| {
+                            perp_invariant_err(format!(
+                                "maker order {:?} missing after settle_fill",
+                                maker_id
+                            ))
+                        })?;
                     updated_maker.filled += fill_qty;
                     updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
                         OrderStatus::Filled
@@ -379,11 +464,20 @@ fn match_order<CTX: ContextTr>(
                     storage::save_order(context, &maker_id, &updated_maker)?;
 
                     // Update maker's sell-order entry list.
-                    update_sell_entry_after_fill(context, Address::from(maker_order.owner), market_id, &maker_id, fill_qty, market)?;
+                    update_sell_entry_after_fill(
+                        context,
+                        Address::from(maker_order.owner),
+                        market_id,
+                        &maker_id,
+                        fill_qty,
+                        market,
+                    )?;
 
                     // Update taker order.
                     let mut taker_order = storage::load_order(context, taker_order_id)?
-                        .ok_or_else(|| perp_invariant_err("taker order missing after settle_fill"))?;
+                        .ok_or_else(|| {
+                            perp_invariant_err("taker order missing after settle_fill")
+                        })?;
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
                         OrderStatus::Filled
@@ -431,21 +525,50 @@ fn match_order<CTX: ContextTr>(
                     qi += 1;
 
                     let maker_order = match storage::load_order(context, &maker_id)? {
-                        Some(o) if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) => o,
-                        Some(o) => return Err(perp_invariant_err(format!(
-                            "bid queue contains order {:?} with terminal status {:?}", maker_id, o.status
-                        ))),
-                        None => return Err(perp_invariant_err(format!(
-                            "bid queue references order {:?} not found in storage", maker_id
-                        ))),
+                        Some(o)
+                            if matches!(
+                                o.status,
+                                OrderStatus::Open | OrderStatus::PartiallyFilled
+                            ) =>
+                        {
+                            o
+                        }
+                        Some(o) => {
+                            return Err(perp_invariant_err(format!(
+                                "bid queue contains order {:?} with terminal status {:?}",
+                                maker_id, o.status
+                            )))
+                        }
+                        None => {
+                            return Err(perp_invariant_err(format!(
+                                "bid queue references order {:?} not found in storage",
+                                maker_id
+                            )))
+                        }
                     };
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
-                    settle_fill(context, taker_addr, Address::from(maker_order.owner), taker_order_id, &maker_id, market_id, bid_price, fill_qty, Side::Sell, market)?;
+                    settle_fill(
+                        context,
+                        taker_addr,
+                        Address::from(maker_order.owner),
+                        taker_order_id,
+                        &maker_id,
+                        market_id,
+                        bid_price,
+                        fill_qty,
+                        Side::Sell,
+                        market,
+                    )?;
 
-                    let mut updated_maker = storage::load_order(context, &maker_id)?
-                        .ok_or_else(|| perp_invariant_err(format!("maker order {:?} missing after settle_fill", maker_id)))?;
+                    let mut updated_maker =
+                        storage::load_order(context, &maker_id)?.ok_or_else(|| {
+                            perp_invariant_err(format!(
+                                "maker order {:?} missing after settle_fill",
+                                maker_id
+                            ))
+                        })?;
                     updated_maker.filled += fill_qty;
                     updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
                         OrderStatus::Filled
@@ -454,10 +577,19 @@ fn match_order<CTX: ContextTr>(
                     };
                     storage::save_order(context, &maker_id, &updated_maker)?;
 
-                    update_buy_entry_after_fill(context, Address::from(maker_order.owner), market_id, &maker_id, fill_qty, market)?;
+                    update_buy_entry_after_fill(
+                        context,
+                        Address::from(maker_order.owner),
+                        market_id,
+                        &maker_id,
+                        fill_qty,
+                        market,
+                    )?;
 
                     let mut taker_order = storage::load_order(context, taker_order_id)?
-                        .ok_or_else(|| perp_invariant_err("taker order missing after settle_fill"))?;
+                        .ok_or_else(|| {
+                            perp_invariant_err("taker order missing after settle_fill")
+                        })?;
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
                         OrderStatus::Filled
@@ -502,17 +634,32 @@ fn settle_fill<CTX: ContextTr>(
     taker_side: Side, // the taker's side (Buy = taker bought, maker sold)
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
-    let fill_value = calc_value(fill_price, fill_qty, market.base_decimals);
+    let fill_value = calc_value(
+        fill_price,
+        fill_qty,
+        market.base_decimals,
+        market.price_decimals,
+    )?;
 
     // Taker side.
     let taker_pos = {
         let mut pos = storage::load_position(context, taker, market_id)?;
         let mut account = storage::load_account(context, taker)?;
-        let shortfall = apply_fill_to_position(&mut pos, &mut account.perp_wallet_balance, fill_qty, fill_value, taker_side == Side::Buy);
+        let shortfall = apply_fill_to_position(
+            &mut pos,
+            &mut account.perp_wallet_balance,
+            fill_qty,
+            fill_value,
+            taker_side == Side::Buy,
+        );
         storage::save_position(context, taker, market_id, &pos)?;
         storage::save_account(context, taker, account)?;
         if shortfall > 0 {
-            let cancel_side = if taker_side == Side::Buy { Side::Sell } else { Side::Buy };
+            let cancel_side = if taker_side == Side::Buy {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
             cancel_underfunded_side(context, taker, market_id, cancel_side, shortfall, market)?;
         }
         pos
@@ -523,11 +670,21 @@ fn settle_fill<CTX: ContextTr>(
         let maker_side = taker_side.opposite();
         let mut pos = storage::load_position(context, maker, market_id)?;
         let mut account = storage::load_account(context, maker)?;
-        let shortfall = apply_fill_to_position(&mut pos, &mut account.perp_wallet_balance, fill_qty, fill_value, maker_side == Side::Buy);
+        let shortfall = apply_fill_to_position(
+            &mut pos,
+            &mut account.perp_wallet_balance,
+            fill_qty,
+            fill_value,
+            maker_side == Side::Buy,
+        );
         storage::save_position(context, maker, market_id, &pos)?;
         storage::save_account(context, maker, account)?;
         if shortfall > 0 {
-            let cancel_side = if maker_side == Side::Buy { Side::Sell } else { Side::Buy };
+            let cancel_side = if maker_side == Side::Buy {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
             cancel_underfunded_side(context, maker, market_id, cancel_side, shortfall, market)?;
         }
         pos
@@ -612,7 +769,8 @@ fn apply_fill_to_position(
     if closing_qty > 0 {
         let pos_abs = pos.amount.unsigned_abs() as u128;
         let margin_release = (pos.margin.max(0) as u128 * closing_qty as u128 / pos_abs) as i64;
-        let vq_fraction = (pos.v_quote_balance as i128 * closing_qty as i128 / pos_abs as i128) as i64;
+        let vq_fraction =
+            (pos.v_quote_balance as i128 * closing_qty as i128 / pos_abs as i128) as i64;
         let close_quote_delta: i64 = if is_buy {
             -((fill_value as u128 * closing_qty as u128 / fill_qty as u128) as i64)
         } else {
@@ -631,7 +789,8 @@ fn apply_fill_to_position(
     // Only credit pos.margin with what was actually deducted; return any shortfall to the
     // caller so it can cancel opposite-side orders to recover the deficit.
     let shortfall = if opening_qty > 0 {
-        let open_value = (fill_value as u128 * opening_qty as u128 / fill_qty.max(1) as u128) as u64;
+        let open_value =
+            (fill_value as u128 * opening_qty as u128 / fill_qty.max(1) as u128) as u64;
         let initial_margin = open_value / leverage;
         let wallet_before = *wallet;
         *wallet = wallet.saturating_sub(initial_margin);
@@ -670,6 +829,7 @@ fn rest_in_book<CTX: ContextTr>(
     price: u64,
     qty: u64,
     tif: TimeInForce,
+    client_order_id: [u8; 16],
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
@@ -680,15 +840,28 @@ fn rest_in_book<CTX: ContextTr>(
             // Insert the new entry into the user's buy-order list (sorted price DESC).
             let mut entries = storage::load_buy_orders(context, user, market_id)?;
             let idx = entries.partition_point(|e| e.price > price);
-            entries.insert(idx, OrderEntry { order_id: *order_id, price, amount: qty });
+            entries.insert(
+                idx,
+                OrderEntry {
+                    order_id: *order_id,
+                    price,
+                    amount: qty,
+                },
+            );
 
             // Recompute how much buy-side margin this user now needs in total.
             let new_buy_side_reserved = calc_buy_side_margin_reserved(
-                &entries, pos.leverage.max(1), market.base_decimals, pos.amount,
-            );
+                &entries,
+                pos.leverage.max(1),
+                market.base_decimals,
+                market.price_decimals,
+                pos.amount,
+            )?;
 
             // Under max-reservation, the wallet delta is the change in max(buy, sell).
-            let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
+            let old_max = pos
+                .buy_side_margin_reserved
+                .max(pos.sell_side_margin_reserved);
             let new_max = new_buy_side_reserved.max(pos.sell_side_margin_reserved);
             if new_buy_side_reserved < pos.buy_side_margin_reserved {
                 return Err(perp_invariant_err(format!(
@@ -720,15 +893,28 @@ fn rest_in_book<CTX: ContextTr>(
             // Insert the new entry into the user's sell-order list (sorted price ASC).
             let mut entries = storage::load_sell_orders(context, user, market_id)?;
             let idx = entries.partition_point(|e| e.price < price);
-            entries.insert(idx, OrderEntry { order_id: *order_id, price, amount: qty });
+            entries.insert(
+                idx,
+                OrderEntry {
+                    order_id: *order_id,
+                    price,
+                    amount: qty,
+                },
+            );
 
             // Recompute how much sell-side margin this user now needs in total.
             let new_sell_side_reserved = calc_sell_side_margin_reserved(
-                &entries, pos.leverage.max(1), market.base_decimals, pos.amount,
-            );
+                &entries,
+                pos.leverage.max(1),
+                market.base_decimals,
+                market.price_decimals,
+                pos.amount,
+            )?;
 
             // Under max-reservation, the wallet delta is the change in max(buy, sell).
-            let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
+            let old_max = pos
+                .buy_side_margin_reserved
+                .max(pos.sell_side_margin_reserved);
             let new_max = pos.buy_side_margin_reserved.max(new_sell_side_reserved);
             if new_sell_side_reserved < pos.sell_side_margin_reserved {
                 return Err(perp_invariant_err(format!(
@@ -771,6 +957,7 @@ fn rest_in_book<CTX: ContextTr>(
             price,
             quantity: qty,
             tif: tif as u8,
+            clientOrderId: FixedBytes(client_order_id),
         }
         .to_log_data(),
     });
@@ -824,10 +1011,18 @@ fn release_margin_for_cancelled_order<CTX: ContextTr>(
 
     match side {
         Side::Buy => {
-            let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
+            let old_max = pos
+                .buy_side_margin_reserved
+                .max(pos.sell_side_margin_reserved);
             let mut entries = storage::load_buy_orders(context, user, market_id)?;
             entries.retain(|e| &e.order_id != order_id);
-            let new_reserved = calc_buy_side_margin_reserved(&entries, pos.leverage.max(1), market.base_decimals, pos.amount);
+            let new_reserved = calc_buy_side_margin_reserved(
+                &entries,
+                pos.leverage.max(1),
+                market.base_decimals,
+                market.price_decimals,
+                pos.amount,
+            )?;
             let new_max = new_reserved.max(pos.sell_side_margin_reserved);
             let freed = old_max.saturating_sub(new_max);
             account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(freed);
@@ -836,10 +1031,18 @@ fn release_margin_for_cancelled_order<CTX: ContextTr>(
             storage::save_buy_orders(context, user, market_id, &entries)?;
         }
         Side::Sell => {
-            let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
+            let old_max = pos
+                .buy_side_margin_reserved
+                .max(pos.sell_side_margin_reserved);
             let mut entries = storage::load_sell_orders(context, user, market_id)?;
             entries.retain(|e| &e.order_id != order_id);
-            let new_reserved = calc_sell_side_margin_reserved(&entries, pos.leverage.max(1), market.base_decimals, pos.amount);
+            let new_reserved = calc_sell_side_margin_reserved(
+                &entries,
+                pos.leverage.max(1),
+                market.base_decimals,
+                market.price_decimals,
+                pos.amount,
+            )?;
             let new_max = pos.buy_side_margin_reserved.max(new_reserved);
             let freed = old_max.saturating_sub(new_max);
             account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(freed);
@@ -869,7 +1072,9 @@ fn update_buy_entry_after_fill<CTX: ContextTr>(
     let mut pos = storage::load_position(context, maker, market_id)?;
     let mut account = storage::load_account(context, maker)?;
 
-    let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
+    let old_max = pos
+        .buy_side_margin_reserved
+        .max(pos.sell_side_margin_reserved);
     match entries.iter_mut().find(|e| &e.order_id == order_id) {
         Some(e) => {
             e.amount = e.amount.saturating_sub(fill_qty);
@@ -877,11 +1082,20 @@ fn update_buy_entry_after_fill<CTX: ContextTr>(
                 entries.retain(|e| &e.order_id != order_id);
             }
         }
-        None => return Err(perp_invariant_err(format!(
-            "buy entry for order {:?} not found during fill update", order_id
-        ))),
+        None => {
+            return Err(perp_invariant_err(format!(
+                "buy entry for order {:?} not found during fill update",
+                order_id
+            )))
+        }
     }
-    let new_reserved = calc_buy_side_margin_reserved(&entries, pos.leverage.max(1), market.base_decimals, pos.amount);
+    let new_reserved = calc_buy_side_margin_reserved(
+        &entries,
+        pos.leverage.max(1),
+        market.base_decimals,
+        market.price_decimals,
+        pos.amount,
+    )?;
     let new_max = new_reserved.max(pos.sell_side_margin_reserved);
     let freed = old_max.saturating_sub(new_max);
     account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(freed);
@@ -907,7 +1121,9 @@ fn update_sell_entry_after_fill<CTX: ContextTr>(
     let mut pos = storage::load_position(context, maker, market_id)?;
     let mut account = storage::load_account(context, maker)?;
 
-    let old_max = pos.buy_side_margin_reserved.max(pos.sell_side_margin_reserved);
+    let old_max = pos
+        .buy_side_margin_reserved
+        .max(pos.sell_side_margin_reserved);
     match entries.iter_mut().find(|e| &e.order_id == order_id) {
         Some(e) => {
             e.amount = e.amount.saturating_sub(fill_qty);
@@ -915,11 +1131,20 @@ fn update_sell_entry_after_fill<CTX: ContextTr>(
                 entries.retain(|e| &e.order_id != order_id);
             }
         }
-        None => return Err(perp_invariant_err(format!(
-            "sell entry for order {:?} not found during fill update", order_id
-        ))),
+        None => {
+            return Err(perp_invariant_err(format!(
+                "sell entry for order {:?} not found during fill update",
+                order_id
+            )))
+        }
     }
-    let new_reserved = calc_sell_side_margin_reserved(&entries, pos.leverage.max(1), market.base_decimals, pos.amount);
+    let new_reserved = calc_sell_side_margin_reserved(
+        &entries,
+        pos.leverage.max(1),
+        market.base_decimals,
+        market.price_decimals,
+        pos.amount,
+    )?;
     let new_max = pos.buy_side_margin_reserved.max(new_reserved);
     let freed = old_max.saturating_sub(new_max);
     account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(freed);
@@ -1082,16 +1307,26 @@ fn cancel_underfunded_side<CTX: ContextTr>(
         };
 
         let pos_before = storage::load_position(context, user, market_id)?;
-        let old_max = pos_before.buy_side_margin_reserved.max(pos_before.sell_side_margin_reserved);
+        let old_max = pos_before
+            .buy_side_margin_reserved
+            .max(pos_before.sell_side_margin_reserved);
 
         remove_from_book(context, market_id, cancel_side, order.price, &order_id)?;
         let remaining_qty = order.quantity - order.filled;
         release_margin_for_cancelled_order(
-            context, user, market_id, cancel_side, &order_id, remaining_qty, market,
+            context,
+            user,
+            market_id,
+            cancel_side,
+            &order_id,
+            remaining_qty,
+            market,
         )?;
 
         let pos_after = storage::load_position(context, user, market_id)?;
-        let new_max = pos_after.buy_side_margin_reserved.max(pos_after.sell_side_margin_reserved);
+        let new_max = pos_after
+            .buy_side_margin_reserved
+            .max(pos_after.sell_side_margin_reserved);
         let freed = old_max.saturating_sub(new_max);
         remaining = remaining.saturating_sub(freed);
 
@@ -1120,7 +1355,7 @@ mod tests {
     use alloy_sol_types::SolCall;
     use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
     use database::InMemoryDB;
-    use primitives::{address, hardfork::SpecId, Address, U256};
+    use primitives::{address, hardfork::SpecId, Address, FixedBytes, U256};
 
     use crate::perp_dex::{
         interface::IPerpDex::{cancelOrderCall, getOrderCall, placeOrderCall},
@@ -1132,17 +1367,17 @@ mod tests {
     // ── Constants ──────────────────────────────────────────────────────────────
 
     const ALICE: Address = address!("1111111111111111111111111111111111111111");
-    const BOB:   Address = address!("2222222222222222222222222222222222222222");
+    const BOB: Address = address!("2222222222222222222222222222222222222222");
     const CAROL: Address = address!("3333333333333333333333333333333333333333");
 
     const MARKET_ID: u64 = 1;
-    /// 1 tick = $1 in 9-decimal fixed-point (PRICE_ONE = 1e9).
+    /// 1 tick = $1 when the test market uses price_decimals = 9.
     const TICK: u64 = 1_000_000_000;
     /// Test price: $100.
     const PRICE: u64 = 100 * TICK;
     /// Test quantity: 0.01 BTC (base_decimals = 8, so 1 BTC = 1e8 units).
     const QTY: u64 = 1_000_000;
-    /// calc_value(PRICE, QTY, 8) = 1_000_000 (1 USDC in 6-decimal units).
+    /// calc_value(PRICE, QTY, 8, 9) = 1_000_000 (1 USDC in 6-decimal units).
     /// price * qty * 1e6 / (1e9 * 1e8) = 100e9 * 1e6 * 1e6 / 1e17 = 1e6.
     const FILL_VALUE: u64 = 1_000_000;
     /// Initial margin at leverage 1 = FILL_VALUE / 1.
@@ -1165,16 +1400,21 @@ mod tests {
 
     /// Register the default BTC-perp market and fund ALICE + BOB with WALLET.
     fn setup(ctx: &mut TestCtx) {
-        storage::save_market(ctx, &Market {
-            market_id:     MARKET_ID,
-            base_decimals: 8,
-            tick_size:     TICK,
-            step_size:     QTY,
-            min_quantity:  QTY,
-            max_quantity:  QTY * 1_000,
-            max_price:     PRICE * 1_000,
-            active:        true,
-        }).unwrap();
+        storage::save_market(
+            ctx,
+            &Market {
+                market_id: MARKET_ID,
+                base_decimals: 8,
+                price_decimals: 9,
+                tick_size: TICK,
+                step_size: QTY,
+                min_quantity: QTY,
+                max_quantity: QTY * 1_000,
+                max_price: PRICE * 1_000,
+                active: true,
+            },
+        )
+        .unwrap();
         fund(ctx, ALICE, WALLET);
         fund(ctx, BOB, WALLET);
     }
@@ -1187,7 +1427,9 @@ mod tests {
     }
 
     fn wallet(ctx: &mut TestCtx, user: Address) -> u64 {
-        storage::load_account(ctx, user).unwrap().perp_wallet_balance
+        storage::load_account(ctx, user)
+            .unwrap()
+            .perp_wallet_balance
     }
 
     fn pos(ctx: &mut TestCtx, user: Address) -> PerpPosition {
@@ -1198,11 +1440,11 @@ mod tests {
     fn place(
         ctx: &mut TestCtx,
         caller: Address,
-        side: u8,        // 0 = Buy,   1 = Sell
+        side: u8, // 0 = Buy,   1 = Sell
         price: u64,
         qty: u64,
-        order_type: u8,  // 0 = Limit, 1 = Market
-        tif: u8,         // 0 = GTC,   1 = IOC,  2 = FOK,  3 = PostOnly
+        order_type: u8, // 0 = Limit, 1 = Market
+        tif: u8,        // 0 = GTC,   1 = IOC,  2 = FOK,  3 = PostOnly
     ) -> [u8; 32] {
         let input = placeOrderCall {
             marketId: MARKET_ID,
@@ -1211,7 +1453,9 @@ mod tests {
             quantity: qty,
             orderType: order_type,
             tif,
-        }.abi_encode();
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let ret = run_place_order(&input, caller, ctx).unwrap();
         ret[..32].try_into().unwrap()
     }
@@ -1226,8 +1470,15 @@ mod tests {
     fn rejects_unknown_market() {
         let mut ctx = make_ctx();
         let input = placeOrderCall {
-            marketId: 99, side: 0, price: PRICE, quantity: QTY, orderType: 0, tif: 0,
-        }.abi_encode();
+            marketId: 99,
+            side: 0,
+            price: PRICE,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("unknown market"), "{err}");
     }
@@ -1237,9 +1488,15 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
         let input = placeOrderCall {
-            marketId: MARKET_ID, side: 0, price: PRICE, quantity: QTY * 1_001,
-            orderType: 0, tif: 0,
-        }.abi_encode();
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE,
+            quantity: QTY * 1_001,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum"), "{err}");
     }
@@ -1249,9 +1506,15 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
         let input = placeOrderCall {
-            marketId: MARKET_ID, side: 0, price: PRICE * 1_001, quantity: QTY,
-            orderType: 0, tif: 0,
-        }.abi_encode();
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE * 1_001,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum"), "{err}");
     }
@@ -1261,9 +1524,15 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
         let input = placeOrderCall {
-            marketId: MARKET_ID, side: 0, price: PRICE, quantity: QTY / 2,
-            orderType: 0, tif: 0,
-        }.abi_encode();
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE,
+            quantity: QTY / 2,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("below minimum"), "{err}");
     }
@@ -1273,9 +1542,15 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
         let input = placeOrderCall {
-            marketId: MARKET_ID, side: 0, price: PRICE, quantity: QTY + 1,
-            orderType: 0, tif: 0,
-        }.abi_encode();
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE,
+            quantity: QTY + 1,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("step_size"), "{err}");
     }
@@ -1285,11 +1560,20 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
         let input = placeOrderCall {
-            marketId: MARKET_ID, side: 0, price: 0, quantity: QTY,
-            orderType: 0, tif: 0,
-        }.abi_encode();
+            marketId: MARKET_ID,
+            side: 0,
+            price: 0,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
-        assert!(err.to_string().contains("limit order price must be > 0"), "{err}");
+        assert!(
+            err.to_string().contains("limit order price must be > 0"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1297,9 +1581,15 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
         let input = placeOrderCall {
-            marketId: MARKET_ID, side: 0, price: PRICE + 1, quantity: QTY,
-            orderType: 0, tif: 0,
-        }.abi_encode();
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE + 1,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("tick_size"), "{err}");
     }
@@ -1313,7 +1603,10 @@ mod tests {
 
         let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // GTC limit buy
         assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
-        assert_eq!(storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(), vec![PRICE]);
+        assert_eq!(
+            storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
+            vec![PRICE]
+        );
     }
 
     #[test]
@@ -1323,7 +1616,10 @@ mod tests {
 
         let id = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // GTC limit sell
         assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
-        assert_eq!(storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(), vec![PRICE]);
+        assert_eq!(
+            storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
+            vec![PRICE]
+        );
     }
 
     #[test]
@@ -1333,7 +1629,7 @@ mod tests {
 
         place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
-        // buy_side_margin_reserved = calc_value(PRICE, QTY, 8) / leverage(1) = FILL_VALUE
+        // buy_side_margin_reserved = calc_value(PRICE, QTY, 8, 9) / leverage(1) = FILL_VALUE
         assert_eq!(pos(&mut ctx, ALICE).buy_side_margin_reserved, INIT_MARGIN);
         assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN);
     }
@@ -1345,9 +1641,42 @@ mod tests {
 
         place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
 
-        // sell_side_margin_reserved = calc_value(PRICE, QTY, 8) / leverage(1) = FILL_VALUE
+        // sell_side_margin_reserved = calc_value(PRICE, QTY, 8, 9) / leverage(1) = FILL_VALUE
         assert_eq!(pos(&mut ctx, BOB).sell_side_margin_reserved, INIT_MARGIN);
         assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
+    }
+
+    #[test]
+    fn margin_uses_market_price_decimals() {
+        let mut ctx = make_ctx();
+        storage::save_market(
+            &mut ctx,
+            &Market {
+                market_id: MARKET_ID,
+                base_decimals: 8,
+                price_decimals: 2,
+                tick_size: 1,
+                step_size: 100_000_000,
+                min_quantity: 100_000_000,
+                max_quantity: 100_000_000,
+                max_price: 1_000_000,
+                active: true,
+            },
+        )
+        .unwrap();
+        fund(&mut ctx, ALICE, 200_000_000);
+
+        let price = 12_345; // $123.45 with price_decimals = 2.
+        let qty = 100_000_000; // 1 base unit with base_decimals = 8.
+        let expected_margin = 123_450_000; // $123.45 in 6-decimal quote units.
+
+        place(&mut ctx, ALICE, 0, price, qty, 0, 0);
+
+        assert_eq!(
+            pos(&mut ctx, ALICE).buy_side_margin_reserved,
+            expected_margin
+        );
+        assert_eq!(wallet(&mut ctx, ALICE), 200_000_000 - expected_margin);
     }
 
     #[test]
@@ -1366,12 +1695,14 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
 
-        let sell_id = place(&mut ctx, BOB,   1, PRICE, QTY, 0, 0); // resting ask
-        let buy_id  = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy
+        let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
+        let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy
 
-        assert_eq!(get_order(&mut ctx, buy_id).status,  OrderStatus::Filled);
+        assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
         assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
-        assert!(storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
+        assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1379,12 +1710,14 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
 
-        let buy_id  = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // resting bid
-        let sell_id = place(&mut ctx, BOB,   1, PRICE, QTY, 0, 0); // taker sell
+        let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // resting bid
+        let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // taker sell
 
-        assert_eq!(get_order(&mut ctx, buy_id).status,  OrderStatus::Filled);
+        assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
         assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
-        assert!(storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
+        assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1396,19 +1729,19 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
 
-        place(&mut ctx, BOB,   1, PRICE, QTY, 0, 0);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
         place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
         let alice = pos(&mut ctx, ALICE);
-        let bob   = pos(&mut ctx, BOB);
+        let bob = pos(&mut ctx, BOB);
 
-        assert_eq!(alice.amount,          QTY as i64);
+        assert_eq!(alice.amount, QTY as i64);
         assert_eq!(alice.v_quote_balance, -(FILL_VALUE as i64));
-        assert_eq!(alice.margin,          INIT_MARGIN as i64);
+        assert_eq!(alice.margin, INIT_MARGIN as i64);
 
-        assert_eq!(bob.amount,           -(QTY as i64));
-        assert_eq!(bob.v_quote_balance,   FILL_VALUE as i64);
-        assert_eq!(bob.margin,            INIT_MARGIN as i64);
+        assert_eq!(bob.amount, -(QTY as i64));
+        assert_eq!(bob.v_quote_balance, FILL_VALUE as i64);
+        assert_eq!(bob.margin, INIT_MARGIN as i64);
     }
 
     #[test]
@@ -1418,11 +1751,11 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
 
-        place(&mut ctx, BOB,   1, PRICE, QTY, 0, 0); // resting ask
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
         place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy
 
         assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN);
-        assert_eq!(wallet(&mut ctx, BOB),   WALLET - INIT_MARGIN);
+        assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
     }
 
     #[test]
@@ -1430,15 +1763,21 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
 
-        let sell_id = place(&mut ctx, BOB,   1, PRICE, QTY * 2, 0, 0);
-        let buy_id  = place(&mut ctx, ALICE, 0, PRICE, QTY,     0, 0);
+        let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY * 2, 0, 0);
+        let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
-        assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::PartiallyFilled);
+        assert_eq!(
+            get_order(&mut ctx, sell_id).status,
+            OrderStatus::PartiallyFilled
+        );
         assert_eq!(get_order(&mut ctx, sell_id).filled, QTY);
-        assert_eq!(get_order(&mut ctx, buy_id).status,  OrderStatus::Filled);
+        assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
 
         // Remaining sell still in ask book.
-        assert_eq!(storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(), vec![PRICE]);
+        assert_eq!(
+            storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
+            vec![PRICE]
+        );
     }
 
     #[test]
@@ -1448,13 +1787,13 @@ mod tests {
         fund(&mut ctx, CAROL, WALLET);
 
         // Bob and Carol both rest sells at the same price.
-        let bob_id   = place(&mut ctx, BOB,   1, PRICE, QTY, 0, 0);
+        let bob_id = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
         let carol_id = place(&mut ctx, CAROL, 1, PRICE, QTY, 0, 0);
 
         // Alice buys QTY — should hit Bob's order first (FIFO).
         place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
-        assert_eq!(get_order(&mut ctx, bob_id).status,   OrderStatus::Filled);
+        assert_eq!(get_order(&mut ctx, bob_id).status, OrderStatus::Filled);
         assert_eq!(get_order(&mut ctx, carol_id).status, OrderStatus::Open);
     }
 
@@ -1463,19 +1802,21 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
 
-        let low_price  = PRICE;
+        let low_price = PRICE;
         let high_price = PRICE + 10 * TICK;
 
-        let low_sell = place(&mut ctx, BOB, 1, low_price,  QTY, 0, 0);
+        let low_sell = place(&mut ctx, BOB, 1, low_price, QTY, 0, 0);
         let _hi_sell = place(&mut ctx, BOB, 1, high_price, QTY, 0, 0);
 
         // Market IOC buy — should hit the lowest ask.
         let mkt_buy = place(&mut ctx, ALICE, 0, 0, QTY, 1, 1); // orderType=Market, tif=IOC
 
         assert_eq!(get_order(&mut ctx, low_sell).status, OrderStatus::Filled);
-        assert_eq!(get_order(&mut ctx, mkt_buy).status,  OrderStatus::Filled);
+        assert_eq!(get_order(&mut ctx, mkt_buy).status, OrderStatus::Filled);
         // High-price level must still be present.
-        assert!(storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap().contains(&high_price));
+        assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
+            .unwrap()
+            .contains(&high_price));
     }
 
     // ── IOC ───────────────────────────────────────────────────────────────────
@@ -1515,11 +1856,20 @@ mod tests {
         place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // only QTY available
 
         let input = placeOrderCall {
-            marketId: MARKET_ID, side: 0, price: PRICE,
-            quantity: QTY * 2, orderType: 0, tif: 2, // FOK
-        }.abi_encode();
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE,
+            quantity: QTY * 2,
+            orderType: 0,
+            tif: 2, // FOK
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
-        assert!(err.to_string().contains("FOK order cannot be fully filled"), "{err}");
+        assert!(
+            err.to_string().contains("FOK order cannot be fully filled"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1528,10 +1878,10 @@ mod tests {
         setup(&mut ctx);
 
         // Bob places sell for 2×QTY; both wallets have enough for 2×INIT_MARGIN.
-        let sell_id = place(&mut ctx, BOB,   1, PRICE, QTY * 2, 0, 0);
-        let buy_id  = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 2); // FOK
+        let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY * 2, 0, 0);
+        let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 2); // FOK
 
-        assert_eq!(get_order(&mut ctx, buy_id).status,  OrderStatus::Filled);
+        assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
         assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
     }
 
@@ -1546,11 +1896,20 @@ mod tests {
 
         // PostOnly sell at PRICE would cross → rejected.
         let input = placeOrderCall {
-            marketId: MARKET_ID, side: 1, price: PRICE,
-            quantity: QTY, orderType: 0, tif: 3, // PostOnly
-        }.abi_encode();
+            marketId: MARKET_ID,
+            side: 1,
+            price: PRICE,
+            quantity: QTY,
+            orderType: 0,
+            tif: 3, // PostOnly
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
         let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
-        assert!(err.to_string().contains("PostOnly order would match"), "{err}");
+        assert!(
+            err.to_string().contains("PostOnly order would match"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1564,7 +1923,10 @@ mod tests {
         let ask_price = PRICE + TICK;
         let id = place(&mut ctx, ALICE, 1, ask_price, QTY, 0, 3); // PostOnly
         assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
-        assert_eq!(storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(), vec![ask_price]);
+        assert_eq!(
+            storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
+            vec![ask_price]
+        );
     }
 
     // ── Cancel ────────────────────────────────────────────────────────────────
@@ -1575,14 +1937,19 @@ mod tests {
         setup(&mut ctx);
 
         let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
-        assert!(wallet(&mut ctx, ALICE) < WALLET, "margin should be reserved");
+        assert!(
+            wallet(&mut ctx, ALICE) < WALLET,
+            "margin should be reserved"
+        );
 
         let input = cancelOrderCall { orderId: id.into() }.abi_encode();
         run_cancel_order(&input, ALICE, &mut ctx).unwrap();
 
         assert_eq!(wallet(&mut ctx, ALICE), WALLET, "margin should be returned");
         assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Cancelled);
-        assert!(storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
+        assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1601,10 +1968,13 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
 
-        let sell_id = place(&mut ctx, BOB,   1, PRICE, QTY, 0, 0);
+        let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
         place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // fills Bob's sell
 
-        let input = cancelOrderCall { orderId: sell_id.into() }.abi_encode();
+        let input = cancelOrderCall {
+            orderId: sell_id.into(),
+        }
+        .abi_encode();
         let err = run_cancel_order(&input, BOB, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("not cancellable"), "{err}");
     }
@@ -1614,7 +1984,10 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
 
-        let input = cancelOrderCall { orderId: [0xab_u8; 32].into() }.abi_encode();
+        let input = cancelOrderCall {
+            orderId: [0xab_u8; 32].into(),
+        }
+        .abi_encode();
         let err = run_cancel_order(&input, ALICE, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("order not found"), "{err}");
     }
@@ -1633,21 +2006,21 @@ mod tests {
 
         // ABI layout: 7 × 32-byte slots.
         // address is right-aligned: leading 12 zero bytes then 20 address bytes.
-        let owner     = Address::from_slice(&ret[12..32]);
+        let owner = Address::from_slice(&ret[12..32]);
         let market_id = U256::from_be_slice(&ret[32..64]).to::<u64>();
-        let side      = U256::from_be_slice(&ret[64..96]).to::<u8>();
-        let price     = U256::from_be_slice(&ret[96..128]).to::<u64>();
-        let qty       = U256::from_be_slice(&ret[128..160]).to::<u64>();
-        let filled    = U256::from_be_slice(&ret[160..192]).to::<u64>();
-        let status    = U256::from_be_slice(&ret[192..224]).to::<u8>();
+        let side = U256::from_be_slice(&ret[64..96]).to::<u8>();
+        let price = U256::from_be_slice(&ret[96..128]).to::<u64>();
+        let qty = U256::from_be_slice(&ret[128..160]).to::<u64>();
+        let filled = U256::from_be_slice(&ret[160..192]).to::<u64>();
+        let status = U256::from_be_slice(&ret[192..224]).to::<u8>();
 
-        assert_eq!(owner,     ALICE);
+        assert_eq!(owner, ALICE);
         assert_eq!(market_id, MARKET_ID);
-        assert_eq!(side,      0u8);    // Buy
-        assert_eq!(price,     PRICE);
-        assert_eq!(qty,       QTY);
-        assert_eq!(filled,    0u64);
-        assert_eq!(status,    0u8);    // Open
+        assert_eq!(side, 0u8); // Buy
+        assert_eq!(price, PRICE);
+        assert_eq!(qty, QTY);
+        assert_eq!(filled, 0u64);
+        assert_eq!(status, 0u8); // Open
     }
 
     #[test]
@@ -1655,9 +2028,11 @@ mod tests {
         let mut ctx = make_ctx();
         setup(&mut ctx);
 
-        let input = getOrderCall { orderId: [0u8; 32].into() }.abi_encode();
+        let input = getOrderCall {
+            orderId: [0u8; 32].into(),
+        }
+        .abi_encode();
         let err = run_get_order(&input, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("order not found"), "{err}");
     }
 }
-

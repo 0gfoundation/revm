@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Side {
-    Buy  = 0,
+    Buy = 0,
     Sell = 1,
 }
 
@@ -20,7 +20,7 @@ impl Side {
     }
     pub fn opposite(self) -> Self {
         match self {
-            Side::Buy  => Side::Sell,
+            Side::Buy => Side::Sell,
             Side::Sell => Side::Buy,
         }
     }
@@ -30,7 +30,7 @@ impl Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum OrderType {
-    Limit  = 0,
+    Limit = 0,
     Market = 1,
 }
 
@@ -48,11 +48,11 @@ impl OrderType {
 #[repr(u8)]
 pub enum TimeInForce {
     /// Good Till Cancel – resting order until manually cancelled.
-    Gtc      = 0,
+    Gtc = 0,
     /// Immediate or Cancel – fill what you can, cancel the rest.
-    Ioc      = 1,
+    Ioc = 1,
     /// Fill or Kill – fill entirely or cancel entirely.
-    Fok      = 2,
+    Fok = 2,
     /// Post-Only – reject if the order would immediately match.
     PostOnly = 3,
 }
@@ -72,10 +72,10 @@ impl TimeInForce {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum OrderStatus {
-    Open             = 0,
-    PartiallyFilled  = 1,
-    Filled           = 2,
-    Cancelled        = 3,
+    Open = 0,
+    PartiallyFilled = 1,
+    Filled = 2,
+    Cancelled = 3,
 }
 
 // ── Structs ───────────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ pub struct Order {
     pub owner: [u8; 20],
     pub market_id: u64,
     pub side: Side,
-    /// Price in 9-decimal fixed-point (PRICE_ONE = 1_000_000_000).
+    /// Price in the market's configured `price_decimals` fixed-point units.
     /// Set to 0 for market orders.
     pub price: u64,
     /// Original total quantity (base-asset units with `base_decimals`).

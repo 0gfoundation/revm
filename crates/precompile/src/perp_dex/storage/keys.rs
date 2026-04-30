@@ -7,24 +7,24 @@
 use primitives::{keccak256, Address, B256};
 
 // ── Key-family prefixes ───────────────────────────────────────────────────
-const PFX_ADMIN:        &[u8] = b"admn";
-const PFX_ACCOUNT:      &[u8] = b"acct";
-const PFX_TRADE_COUNT:  &[u8] = b"tcnt"; // per-market sequential trade ID counter
-const PFX_POSITION:     &[u8] = b"pos\x00";
-const PFX_BUY_ORDERS:   &[u8] = b"bord";   // per-user buy order entries
-const PFX_SELL_ORDERS:  &[u8] = b"sord";   // per-user sell order entries
-const PFX_ORDER:        &[u8] = b"ord\x00"; // full Order struct by order_id
-const PFX_USER_NONCE:   &[u8] = b"nonc";   // per-user nonce for order-id generation
-const PFX_MARKET:       &[u8] = b"mkt\x00";
-const PFX_MARK_PRICE:   &[u8] = b"mktp";
-const PFX_OPEN_INT:     &[u8] = b"oint";
-const PFX_BID_PRICES:   &[u8] = b"bidp";   // sorted Vec<u64> of active bid prices
-const PFX_ASK_PRICES:   &[u8] = b"askp";   // sorted Vec<u64> of active ask prices
-const PFX_BID_LEVEL:    &[u8] = b"bidl";   // FIFO queue of order IDs at a bid price
-const PFX_ASK_LEVEL:    &[u8] = b"askl";   // FIFO queue of order IDs at an ask price
-const PFX_BEST_BID:     &[u8] = b"bbd\x00"; // cached best bid price (0 = empty)
-const PFX_BEST_ASK:     &[u8] = b"bak\x00"; // cached best ask price (0 = empty)
-const PFX_API_KEY:      &[u8] = b"apik";    // per-user ed25519 public key (32 bytes)
+const PFX_ADMIN: &[u8] = b"admn";
+const PFX_ACCOUNT: &[u8] = b"acct";
+const PFX_TRADE_COUNT: &[u8] = b"tcnt"; // per-market sequential trade ID counter
+const PFX_POSITION: &[u8] = b"pos\x00";
+const PFX_BUY_ORDERS: &[u8] = b"bord"; // per-user buy order entries
+const PFX_SELL_ORDERS: &[u8] = b"sord"; // per-user sell order entries
+const PFX_ORDER: &[u8] = b"ord\x00"; // full Order struct by order_id
+const PFX_USER_NONCE: &[u8] = b"nonc"; // per-user nonce for order-id generation
+const PFX_MARKET: &[u8] = b"mkt\x00";
+const PFX_MARK_PRICE: &[u8] = b"mktp";
+const PFX_OPEN_INT: &[u8] = b"oint";
+const PFX_BID_PRICES: &[u8] = b"bidp"; // sorted Vec<u64> of active bid prices
+const PFX_ASK_PRICES: &[u8] = b"askp"; // sorted Vec<u64> of active ask prices
+const PFX_BID_LEVEL: &[u8] = b"bidl"; // FIFO queue of order IDs at a bid price
+const PFX_ASK_LEVEL: &[u8] = b"askl"; // FIFO queue of order IDs at an ask price
+const PFX_BEST_BID: &[u8] = b"bbd\x00"; // cached best bid price (0 = empty)
+const PFX_BEST_ASK: &[u8] = b"bak\x00"; // cached best ask price (0 = empty)
+const PFX_API_KEY: &[u8] = b"apik"; // per-user ed25519 public key (32 bytes)
 
 // ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
 
@@ -38,7 +38,7 @@ const PFX_API_KEY:      &[u8] = b"apik";    // per-user ed25519 public key (32 b
 pub fn erc20_balance_slot(account: Address) -> B256 {
     let mut buf = [0u8; 64];
     buf[12..32].copy_from_slice(account.as_slice()); // left-pad address to 32 bytes
-    // buf[32..64] stays zero → mapping at slot 0
+                                                     // buf[32..64] stays zero → mapping at slot 0
     keccak256(buf)
 }
 
@@ -118,12 +118,26 @@ pub fn ask_prices_key(market_id: u64) -> B256 {
 
 /// FIFO queue of order IDs at a specific bid price level.
 pub fn bid_level_key(market_id: u64, price: u64) -> B256 {
-    keccak256([PFX_BID_LEVEL, &market_id.to_be_bytes(), &price.to_be_bytes()].concat())
+    keccak256(
+        [
+            PFX_BID_LEVEL,
+            &market_id.to_be_bytes(),
+            &price.to_be_bytes(),
+        ]
+        .concat(),
+    )
 }
 
 /// FIFO queue of order IDs at a specific ask price level.
 pub fn ask_level_key(market_id: u64, price: u64) -> B256 {
-    keccak256([PFX_ASK_LEVEL, &market_id.to_be_bytes(), &price.to_be_bytes()].concat())
+    keccak256(
+        [
+            PFX_ASK_LEVEL,
+            &market_id.to_be_bytes(),
+            &price.to_be_bytes(),
+        ]
+        .concat(),
+    )
 }
 
 /// Cached best bid price for a market (0 = no bids).

@@ -9,8 +9,7 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         interface::IPerpDex::{self, getApiKeyCall, registerApiKeyCall, revokeApiKeyCall},
-        storage,
-        PERP_DEX_ADDRESS,
+        storage, PERP_DEX_ADDRESS,
     },
     PrecompileError,
 };
@@ -33,7 +32,11 @@ pub fn run_register_api_key<CTX: ContextTr>(
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
-        data: IPerpDex::ApiKeyRegistered { user: caller, pubkey: args.pubkey }.to_log_data(),
+        data: IPerpDex::ApiKeyRegistered {
+            user: caller,
+            pubkey: args.pubkey,
+        }
+        .to_log_data(),
     });
 
     Ok(Bytes::new())

@@ -34,12 +34,13 @@ use crate::{
             getAdminCall, getApiKeyCall, getMarkPriceCall, getMarketCall, getOrderCall,
             getPositionCall, initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall,
             registerApiKeyCall, revokeApiKeyCall, setLeverageCall, setMarkPriceCall,
-            transferAdminCall, transferFromPerpCall, transferToPerpCall, withdrawCall,
+            transferAdminCall, transferFromPerpCall, transferToPerpCall, updateMarketCall,
+            withdrawCall,
         },
         risk::{
             run_add_market, run_get_admin, run_get_mark_price, run_get_market, run_get_position,
             run_init_admin, run_liquidate, run_set_leverage, run_set_mark_price,
-            run_transfer_admin,
+            run_transfer_admin, run_update_market,
         },
         trading::{
             run_cancel_order, run_cancel_order_signed, run_get_order, run_place_order,
@@ -75,37 +76,38 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
     SELECTORS.get_or_init(|| {
         let mut m = HashMap::new();
         // Admin
-        m.insert(initAdminCall::SELECTOR,        (30_000, false));
-        m.insert(transferAdminCall::SELECTOR,    (30_000, false));
-        m.insert(getAdminCall::SELECTOR,         (5_000,  true));
+        m.insert(initAdminCall::SELECTOR, (30_000, false));
+        m.insert(transferAdminCall::SELECTOR, (30_000, false));
+        m.insert(getAdminCall::SELECTOR, (5_000, true));
         // Account
-        m.insert(depositCall::SELECTOR,          (50_000, false));
-        m.insert(withdrawCall::SELECTOR,         (50_000, false));
-        m.insert(transferToPerpCall::SELECTOR,   (20_000, false));
+        m.insert(depositCall::SELECTOR, (50_000, false));
+        m.insert(withdrawCall::SELECTOR, (50_000, false));
+        m.insert(transferToPerpCall::SELECTOR, (20_000, false));
         m.insert(transferFromPerpCall::SELECTOR, (20_000, false));
-        m.insert(getAccountCall::SELECTOR,       (5_000,  true));
+        m.insert(getAccountCall::SELECTOR, (5_000, true));
         // Market management (admin)
-        m.insert(addMarketCall::SELECTOR,        (100_000, false));
-        m.insert(setMarkPriceCall::SELECTOR,     (30_000,  false));
-        m.insert(getMarkPriceCall::SELECTOR,     (5_000,   true));
-        m.insert(getMarketCall::SELECTOR,        (5_000,   true));
+        m.insert(addMarketCall::SELECTOR, (100_000, false));
+        m.insert(updateMarketCall::SELECTOR, (50_000, false));
+        m.insert(setMarkPriceCall::SELECTOR, (30_000, false));
+        m.insert(getMarkPriceCall::SELECTOR, (5_000, true));
+        m.insert(getMarketCall::SELECTOR, (5_000, true));
         // Leverage
-        m.insert(setLeverageCall::SELECTOR,      (20_000, false));
+        m.insert(setLeverageCall::SELECTOR, (20_000, false));
         // Trading
-        m.insert(placeOrderCall::SELECTOR,       (200_000, false));
-        m.insert(cancelOrderCall::SELECTOR,      (80_000,  false));
-        m.insert(getOrderCall::SELECTOR,         (5_000,   true));
+        m.insert(placeOrderCall::SELECTOR, (200_000, false));
+        m.insert(cancelOrderCall::SELECTOR, (80_000, false));
+        m.insert(getOrderCall::SELECTOR, (5_000, true));
         // Positions
-        m.insert(getPositionCall::SELECTOR,      (5_000, true));
+        m.insert(getPositionCall::SELECTOR, (5_000, true));
         // Liquidation
-        m.insert(liquidateCall::SELECTOR,        (150_000, false));
+        m.insert(liquidateCall::SELECTOR, (150_000, false));
         // API key management
-        m.insert(registerApiKeyCall::SELECTOR,   (30_000, false));
-        m.insert(revokeApiKeyCall::SELECTOR,     (20_000, false));
-        m.insert(getApiKeyCall::SELECTOR,        (5_000,  true));
+        m.insert(registerApiKeyCall::SELECTOR, (30_000, false));
+        m.insert(revokeApiKeyCall::SELECTOR, (20_000, false));
+        m.insert(getApiKeyCall::SELECTOR, (5_000, true));
         // Signed order submission (relayer path)
-        m.insert(placeOrderSignedCall::SELECTOR,  (200_000, false));
-        m.insert(cancelOrderSignedCall::SELECTOR, (80_000,  false));
+        m.insert(placeOrderSignedCall::SELECTOR, (200_000, false));
+        m.insert(cancelOrderSignedCall::SELECTOR, (80_000, false));
         m
     })
 }
@@ -120,8 +122,8 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
 fn encode_revert_string(msg: &str) -> primitives::Bytes {
     const SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
     let msg_bytes = msg.as_bytes();
-    let msg_len   = msg_bytes.len();
-    let padded    = (msg_len + 31) / 32 * 32;
+    let msg_len = msg_bytes.len();
+    let padded = (msg_len + 31) / 32 * 32;
 
     let mut data = Vec::with_capacity(4 + 32 + 32 + padded);
     data.extend_from_slice(&SELECTOR);
@@ -172,36 +174,43 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
     // clean REVERT output so ethers.js can read `e.reason`.
     let result = match selector {
         // Admin
-        s if s == initAdminCall::SELECTOR        => run_init_admin(input_bytes, context),
-        s if s == transferAdminCall::SELECTOR    => run_transfer_admin(input_bytes, caller, context),
-        s if s == getAdminCall::SELECTOR         => run_get_admin(input_bytes, context),
+        s if s == initAdminCall::SELECTOR => run_init_admin(input_bytes, context),
+        s if s == transferAdminCall::SELECTOR => run_transfer_admin(input_bytes, caller, context),
+        s if s == getAdminCall::SELECTOR => run_get_admin(input_bytes, context),
         // Account
-        s if s == depositCall::SELECTOR          => run_deposit(input_bytes, caller, context),
-        s if s == withdrawCall::SELECTOR         => run_withdraw(input_bytes, caller, context),
-        s if s == transferToPerpCall::SELECTOR   => run_transfer_to_perp(input_bytes, caller, context),
-        s if s == transferFromPerpCall::SELECTOR => run_transfer_from_perp(input_bytes, caller, context),
-        s if s == getAccountCall::SELECTOR       => run_get_account(input_bytes, context),
+        s if s == depositCall::SELECTOR => run_deposit(input_bytes, caller, context),
+        s if s == withdrawCall::SELECTOR => run_withdraw(input_bytes, caller, context),
+        s if s == transferToPerpCall::SELECTOR => {
+            run_transfer_to_perp(input_bytes, caller, context)
+        }
+        s if s == transferFromPerpCall::SELECTOR => {
+            run_transfer_from_perp(input_bytes, caller, context)
+        }
+        s if s == getAccountCall::SELECTOR => run_get_account(input_bytes, context),
         // Market management
-        s if s == addMarketCall::SELECTOR        => run_add_market(input_bytes, caller, context),
-        s if s == setMarkPriceCall::SELECTOR     => run_set_mark_price(input_bytes, caller, context),
-        s if s == getMarkPriceCall::SELECTOR     => run_get_mark_price(input_bytes, context),
-        s if s == getMarketCall::SELECTOR        => run_get_market(input_bytes, context),
+        s if s == addMarketCall::SELECTOR => run_add_market(input_bytes, caller, context),
+        s if s == updateMarketCall::SELECTOR => run_update_market(input_bytes, caller, context),
+        s if s == setMarkPriceCall::SELECTOR => run_set_mark_price(input_bytes, caller, context),
+        s if s == getMarkPriceCall::SELECTOR => run_get_mark_price(input_bytes, context),
+        s if s == getMarketCall::SELECTOR => run_get_market(input_bytes, context),
         // Leverage
-        s if s == setLeverageCall::SELECTOR      => run_set_leverage(input_bytes, caller, context),
+        s if s == setLeverageCall::SELECTOR => run_set_leverage(input_bytes, caller, context),
         // Trading
-        s if s == placeOrderCall::SELECTOR       => run_place_order(input_bytes, caller, context),
-        s if s == cancelOrderCall::SELECTOR      => run_cancel_order(input_bytes, caller, context),
-        s if s == getOrderCall::SELECTOR         => run_get_order(input_bytes, context),
+        s if s == placeOrderCall::SELECTOR => run_place_order(input_bytes, caller, context),
+        s if s == cancelOrderCall::SELECTOR => run_cancel_order(input_bytes, caller, context),
+        s if s == getOrderCall::SELECTOR => run_get_order(input_bytes, context),
         // Positions
-        s if s == getPositionCall::SELECTOR      => run_get_position(input_bytes, context),
+        s if s == getPositionCall::SELECTOR => run_get_position(input_bytes, context),
         // Liquidation
-        s if s == liquidateCall::SELECTOR        => run_liquidate(input_bytes, caller, context),
+        s if s == liquidateCall::SELECTOR => run_liquidate(input_bytes, caller, context),
         // API key management
-        s if s == registerApiKeyCall::SELECTOR   => run_register_api_key(input_bytes, caller, context),
-        s if s == revokeApiKeyCall::SELECTOR     => run_revoke_api_key(input_bytes, caller, context),
-        s if s == getApiKeyCall::SELECTOR        => run_get_api_key(input_bytes, context),
+        s if s == registerApiKeyCall::SELECTOR => {
+            run_register_api_key(input_bytes, caller, context)
+        }
+        s if s == revokeApiKeyCall::SELECTOR => run_revoke_api_key(input_bytes, caller, context),
+        s if s == getApiKeyCall::SELECTOR => run_get_api_key(input_bytes, context),
         // Signed order submission (relayer path)
-        s if s == placeOrderSignedCall::SELECTOR  => run_place_order_signed(input_bytes, context),
+        s if s == placeOrderSignedCall::SELECTOR => run_place_order_signed(input_bytes, context),
         s if s == cancelOrderSignedCall::SELECTOR => run_cancel_order_signed(input_bytes, context),
         _ => return Err(PrecompileError::StatefulInvalidInput),
     };
@@ -212,6 +221,9 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         Err(PrecompileError::Fatal(e)) => Err(PrecompileError::Fatal(e)),
         // All other errors become a clean REVERT with an ABI-encoded reason
         // string, so ethers.js exposes `e.reason` to the caller.
-        Err(e) => Ok(PrecompileOutput::new_reverted(gas_used, encode_revert_string(&e.to_string()))),
+        Err(e) => Ok(PrecompileOutput::new_reverted(
+            gas_used,
+            encode_revert_string(&e.to_string()),
+        )),
     }
 }

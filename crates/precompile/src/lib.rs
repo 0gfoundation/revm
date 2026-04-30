@@ -23,9 +23,9 @@ pub mod interface;
 pub mod journal;
 pub mod kzg_point_evaluation;
 pub mod modexp;
+pub mod perp_dex;
 pub mod secp256k1;
 pub mod secp256r1;
-pub mod perp_dex;
 pub mod stateful_precompiles;
 pub mod utilities;
 pub mod wa0gi_base;
@@ -70,9 +70,7 @@ use primitives::{
 use std::vec::Vec;
 
 use crate::{
-    da_signers::DA_SIGNERS_ADDRESS,
-    perp_dex::PERP_DEX_ADDRESS,
-    wa0gi_base::WA0GI_BASE_ADDRESS,
+    da_signers::DA_SIGNERS_ADDRESS, perp_dex::PERP_DEX_ADDRESS, wa0gi_base::WA0GI_BASE_ADDRESS,
 };
 
 /// Calculate the linear cost of a precompile.

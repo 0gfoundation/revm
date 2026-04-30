@@ -25,7 +25,10 @@ sol! {
 
         // ── Market management (admin only) ─────────────────────────────────
         /// Register a new perpetual market.
-        function addMarket(uint64 marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice) external;
+        function addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice) external;
+        /// Update mutable market parameters (tick/step/quantity/price limits and active flag).
+        /// baseDecimals and priceDecimals cannot be changed after creation.
+        function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active) external;
         /// Update the mark price (used for margin and liquidation).
         function setMarkPrice(uint64 marketId, uint64 price) external;
         /// Read the current mark price for a market.
@@ -33,6 +36,7 @@ sol! {
         /// Read the configuration of a registered market. Reverts if the market does not exist.
         function getMarket(uint64 marketId) external view returns (
             uint32 baseDecimals,
+            uint32 priceDecimals,
             uint64 tickSize,
             uint64 stepSize,
             uint64 minQuantity,
@@ -51,8 +55,10 @@ sol! {
         /// side:      0 = Buy, 1 = Sell
         /// orderType: 0 = Limit, 1 = Market
         /// tif:       0 = GTC, 1 = IOC, 2 = FOK, 3 = PostOnly
+        /// clientOrderId: optional caller-assigned tracking ID; pass bytes16(0) if unused.
+        ///   Emitted in events but not stored or validated on-chain.
         /// Returns a unique order ID.
-        function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif) external returns (bytes32 orderId);
+        function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         function cancelOrder(bytes32 orderId) external;
         /// Query order details.
@@ -91,7 +97,7 @@ sol! {
         // ── Signed order submission ───────────────────────────────────────
         /// Place an order for `account`, authenticated by ed25519 signature.
         /// Message: "perpdex_v1_order" || account(20) || marketId(8) || side(1)
-        ///          || price(8) || quantity(8) || orderType(1) || tif(1) || timestamp(8)
+        ///          || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16) || timestamp(8)
         /// orderId = keccak256(signature) — replay protection via existing order storage.
         function placeOrderSigned(
             address account,
@@ -101,6 +107,7 @@ sol! {
             uint64 quantity,
             uint8 orderType,
             uint8 tif,
+            bytes16 clientOrderId,
             uint64 timestamp,
             bytes calldata signature
         ) external returns (bytes32 orderId);
@@ -133,12 +140,12 @@ sol! {
         // Emitted once per accepted placeOrder / placeOrderSigned call, before any matching.
         // Fires only when validation passes; a reverted tx emits nothing.
         // Feeds: /allOrders (initial record), /openOrders (pending state)
-        event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif);
+        event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId);
 
         // Emitted when a limit order rests in the book (after any immediate fills).
         // quantity = the resting quantity (original qty minus any fills that happened first).
         // Feeds: /openOrders (confirm resting), /allOrders (status=NEW/PARTIALLY_FILLED)
-        event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif);
+        event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif, bytes16 clientOrderId);
         // Feeds: /openOrders (remove), /allOrders (status=CANCELED, updateTime)
         event OrderCancelled(address indexed user, bytes32 indexed orderId, uint64 indexed marketId);
 
@@ -155,7 +162,9 @@ sol! {
         event Liquidation(address indexed user, uint64 indexed marketId, address liquidator, int64 amount, uint64 reward, uint64 markPrice);
 
         // Feeds: market metadata bootstrap for indexer
-        event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice);
+        event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice);
+        // Feeds: market metadata updates for indexer
+        event MarketUpdated(uint64 indexed marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active);
         // Feeds: /premiumIndex (mark price history), /fundingRate (markPrice field)
         event MarkPriceUpdated(uint64 indexed marketId, uint64 price, address updater);
 

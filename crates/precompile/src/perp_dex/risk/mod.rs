@@ -11,9 +11,9 @@ use crate::{
         interface::IPerpDex::{
             self, addMarketCall, getAdminCall, getMarkPriceCall, getMarketCall, getMarketReturn,
             getPositionCall, getPositionReturn, initAdminCall, liquidateCall, setLeverageCall,
-            setMarkPriceCall, transferAdminCall,
+            setMarkPriceCall, transferAdminCall, updateMarketCall,
         },
-        math::is_above_maintenance_margin,
+        math::{calc_value, is_above_maintenance_margin},
         storage,
         types::{Market, PerpPosition},
         PERP_DEX_ADDRESS,
@@ -92,7 +92,7 @@ pub fn run_get_admin<CTX: ContextTr>(
 
 // ── Admin: market management ──────────────────────────────────────────────────
 
-/// `addMarket(uint64 marketId, uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity)`
+/// `addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice)`
 pub fn run_add_market<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -106,6 +106,16 @@ pub fn run_add_market<CTX: ContextTr>(
     if storage::load_market(context, args.marketId)?.is_some() {
         return Err(perp_err("addMarket: market already exists"));
     }
+    if args.priceDecimals > 18 {
+        return Err(perp_err("addMarket: priceDecimals must be <= 18"));
+    }
+    validate_market_bounds(
+        "addMarket",
+        args.baseDecimals,
+        args.priceDecimals,
+        args.maxQuantity,
+        args.maxPrice,
+    )?;
     if args.tickSize == 0 || args.stepSize == 0 || args.minQuantity == 0 {
         return Err(perp_err("addMarket: tick/step/min must be > 0"));
     }
@@ -113,18 +123,23 @@ pub fn run_add_market<CTX: ContextTr>(
         return Err(perp_err("addMarket: maxQuantity must be >= minQuantity"));
     }
     if args.maxQuantity % args.stepSize != 0 {
-        return Err(perp_err("addMarket: maxQuantity must be a multiple of stepSize"));
+        return Err(perp_err(
+            "addMarket: maxQuantity must be a multiple of stepSize",
+        ));
     }
     if args.maxPrice < args.tickSize {
         return Err(perp_err("addMarket: maxPrice must be >= tickSize"));
     }
     if args.maxPrice % args.tickSize != 0 {
-        return Err(perp_err("addMarket: maxPrice must be a multiple of tickSize"));
+        return Err(perp_err(
+            "addMarket: maxPrice must be a multiple of tickSize",
+        ));
     }
 
     let market = Market {
         market_id: args.marketId,
         base_decimals: args.baseDecimals,
+        price_decimals: args.priceDecimals,
         tick_size: args.tickSize,
         step_size: args.stepSize,
         min_quantity: args.minQuantity,
@@ -139,11 +154,78 @@ pub fn run_add_market<CTX: ContextTr>(
         data: IPerpDex::MarketAdded {
             marketId: args.marketId,
             baseDecimals: args.baseDecimals,
+            priceDecimals: args.priceDecimals,
             tickSize: args.tickSize,
             stepSize: args.stepSize,
             minQuantity: args.minQuantity,
             maxQuantity: args.maxQuantity,
             maxPrice: args.maxPrice,
+        }
+        .to_log_data(),
+    });
+
+    Ok(Bytes::new())
+}
+
+/// `updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active)`
+pub fn run_update_market<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = updateMarketCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("updateMarket: invalid calldata"))?;
+
+    require_admin(caller, context)?;
+
+    let mut market = storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("updateMarket: unknown market"))?;
+
+    validate_market_bounds(
+        "updateMarket",
+        market.base_decimals,
+        market.price_decimals,
+        args.maxQuantity,
+        args.maxPrice,
+    )?;
+    if args.tickSize == 0 || args.stepSize == 0 || args.minQuantity == 0 {
+        return Err(perp_err("updateMarket: tick/step/min must be > 0"));
+    }
+    if args.maxQuantity < args.minQuantity {
+        return Err(perp_err("updateMarket: maxQuantity must be >= minQuantity"));
+    }
+    if args.maxQuantity % args.stepSize != 0 {
+        return Err(perp_err(
+            "updateMarket: maxQuantity must be a multiple of stepSize",
+        ));
+    }
+    if args.maxPrice < args.tickSize {
+        return Err(perp_err("updateMarket: maxPrice must be >= tickSize"));
+    }
+    if args.maxPrice % args.tickSize != 0 {
+        return Err(perp_err(
+            "updateMarket: maxPrice must be a multiple of tickSize",
+        ));
+    }
+
+    market.tick_size = args.tickSize;
+    market.step_size = args.stepSize;
+    market.min_quantity = args.minQuantity;
+    market.max_quantity = args.maxQuantity;
+    market.max_price = args.maxPrice;
+    market.active = args.active;
+    storage::save_market(context, &market)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::MarketUpdated {
+            marketId: args.marketId,
+            tickSize: args.tickSize,
+            stepSize: args.stepSize,
+            minQuantity: args.minQuantity,
+            maxQuantity: args.maxQuantity,
+            maxPrice: args.maxPrice,
+            active: args.active,
         }
         .to_log_data(),
     });
@@ -162,8 +244,14 @@ pub fn run_set_mark_price<CTX: ContextTr>(
 
     require_admin(caller, context)?;
 
-    storage::load_market(context, args.marketId)?
+    let market = storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("setMarkPrice: unknown market"))?;
+    if args.price > market.max_price {
+        return Err(perp_err("setMarkPrice: price exceeds maximum"));
+    }
+    if market.tick_size > 0 && args.price % market.tick_size != 0 {
+        return Err(perp_err("setMarkPrice: price not multiple of tick_size"));
+    }
     storage::save_mark_price(context, args.marketId, args.price)?;
 
     context.journal_mut().log(Log {
@@ -191,7 +279,7 @@ pub fn run_get_mark_price<CTX: ContextTr>(
     Ok(Bytes::from(getMarkPriceCall::abi_encode_returns(&price)))
 }
 
-/// `getMarket(uint64 marketId) returns (uint32 baseDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active)`
+/// `getMarket(uint64 marketId) returns (uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active)`
 pub fn run_get_market<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -202,15 +290,18 @@ pub fn run_get_market<CTX: ContextTr>(
     let market = storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("getMarket: unknown market"))?;
 
-    Ok(Bytes::from(getMarketCall::abi_encode_returns(&getMarketReturn {
-        baseDecimals: market.base_decimals,
-        tickSize: market.tick_size,
-        stepSize: market.step_size,
-        minQuantity: market.min_quantity,
-        maxQuantity: market.max_quantity,
-        maxPrice: market.max_price,
-        active: market.active,
-    })))
+    Ok(Bytes::from(getMarketCall::abi_encode_returns(
+        &getMarketReturn {
+            baseDecimals: market.base_decimals,
+            priceDecimals: market.price_decimals,
+            tickSize: market.tick_size,
+            stepSize: market.step_size,
+            minQuantity: market.min_quantity,
+            maxQuantity: market.max_quantity,
+            maxPrice: market.max_price,
+            active: market.active,
+        },
+    )))
 }
 
 // ── Leverage ──────────────────────────────────────────────────────────────────
@@ -234,7 +325,9 @@ pub fn run_set_leverage<CTX: ContextTr>(
 
     let mut pos = storage::load_position(context, caller, args.marketId)?;
     if pos.amount != 0 {
-        return Err(perp_err("setLeverage: cannot change leverage with open position"));
+        return Err(perp_err(
+            "setLeverage: cannot change leverage with open position",
+        ));
     }
     pos.leverage = args.leverage;
     storage::save_position(context, caller, args.marketId, &pos)?;
@@ -302,7 +395,8 @@ pub fn run_liquidate<CTX: ContextTr>(
         pos.v_quote_balance,
         pos.margin,
         market.base_decimals,
-    ) {
+        market.price_decimals,
+    )? {
         return Err(perp_err("liquidate: position is above maintenance margin"));
     }
 
@@ -325,9 +419,7 @@ pub fn run_liquidate<CTX: ContextTr>(
     // Credit liquidator.
     if reward > 0 && caller != args.user {
         let mut liq_account = storage::load_account(context, caller)?;
-        liq_account.perp_wallet_balance = liq_account
-            .perp_wallet_balance
-            .saturating_add(reward);
+        liq_account.perp_wallet_balance = liq_account.perp_wallet_balance.saturating_add(reward);
         storage::save_account(context, caller, liq_account)?;
     }
 
@@ -363,13 +455,48 @@ pub fn run_liquidate<CTX: ContextTr>(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-fn require_admin<CTX: ContextTr>(caller: Address, context: &mut CTX) -> Result<(), PrecompileError> {
+fn require_admin<CTX: ContextTr>(
+    caller: Address,
+    context: &mut CTX,
+) -> Result<(), PrecompileError> {
     let admin = storage::load_admin(context)?;
     if admin == Address::ZERO {
         return Err(perp_err("not authorised: admin not initialised"));
     }
     if caller != admin {
         return Err(perp_err("not authorised: caller is not admin"));
+    }
+    Ok(())
+}
+
+fn validate_market_bounds(
+    prefix: &str,
+    base_decimals: u32,
+    price_decimals: u32,
+    max_quantity: u64,
+    max_price: u64,
+) -> Result<(), PrecompileError> {
+    if base_decimals > 18 {
+        return Err(perp_err(format!("{prefix}: baseDecimals must be <= 18")));
+    }
+    if price_decimals > 18 {
+        return Err(perp_err(format!("{prefix}: priceDecimals must be <= 18")));
+    }
+    if max_quantity > i64::MAX as u64 {
+        return Err(perp_err(format!(
+            "{prefix}: maxQuantity must be <= i64::MAX"
+        )));
+    }
+    let max_value =
+        calc_value(max_price, max_quantity, base_decimals, price_decimals).map_err(|_| {
+            perp_err(format!(
+                "{prefix}: maxPrice * maxQuantity exceeds numeric limits"
+            ))
+        })?;
+    if max_value > i64::MAX as u64 {
+        return Err(perp_err(format!(
+            "{prefix}: max order value must be <= i64::MAX quote units"
+        )));
     }
     Ok(())
 }

@@ -19,10 +19,10 @@ use crate::{
 };
 
 use keys::{
-    account_key, admin_key, api_key_key, ask_level_key, ask_prices_key,
-    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot,
-    mark_price_key, market_key, open_interest_key, order_key, position_key, trade_count_key,
-    user_buy_orders_key, user_nonce_key, user_sell_orders_key,
+    account_key, admin_key, api_key_key, ask_level_key, ask_prices_key, best_ask_key, best_bid_key,
+    bid_level_key, bid_prices_key, erc20_balance_slot, mark_price_key, market_key,
+    open_interest_key, order_key, position_key, trade_count_key, user_buy_orders_key,
+    user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -234,7 +234,10 @@ pub fn save_order<CTX: ContextTr>(
 /// Atomically increment and return the *current* trade ID for a market, then store the
 /// incremented value.  Returns 0 for the first trade in that market, 1 for the second, etc.
 /// Trade IDs are per-market so that indexers can use them directly as `fromId` cursors.
-pub fn next_trade_id<CTX: ContextTr>(context: &mut CTX, market_id: u64) -> Result<u64, PrecompileError> {
+pub fn next_trade_id<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<u64, PrecompileError> {
     let buf = load_blob(context, trade_count_key(market_id))?;
     let current: u64 = if buf.is_empty() { 0 } else { decode(&buf)? };
     let next_buf = encode(&(current + 1))?;

@@ -56,7 +56,9 @@ pub struct Market {
     pub market_id: u64,
     /// Decimal places for the base asset (e.g. 8 for BTC).
     pub base_decimals: u32,
-    /// Minimum price increment (9-decimal fixed-point units).
+    /// Decimal places for price representation (e.g. 2 for BTC at $0.01 precision, 18 for meme coins).
+    pub price_decimals: u32,
+    /// Minimum price increment (price_decimals fixed-point units).
     pub tick_size: u64,
     /// Minimum quantity increment (base-asset units).
     pub step_size: u64,
@@ -64,7 +66,7 @@ pub struct Market {
     pub min_quantity: u64,
     /// Maximum order quantity (bounds calc_value to prevent u128 overflow).
     pub max_quantity: u64,
-    /// Maximum order price (9-decimal fixed-point units).
+    /// Maximum order price (price_decimals fixed-point units).
     pub max_price: u64,
     /// Whether the market accepts new orders.
     pub active: bool,
