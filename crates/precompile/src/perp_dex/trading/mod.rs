@@ -152,6 +152,149 @@ fn next_order_id<CTX: ContextTr>(
     Ok(keccak256(&buf).0)
 }
 
+/// Return whether the opposite side of the book can fully close `user`'s
+/// position, excluding the user's own orders that liquidation will cancel first.
+pub(crate) fn can_fully_liquidate_on_book<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    liquidation_side: Side,
+    quantity: u64,
+) -> Result<bool, PrecompileError> {
+    let mut available = 0u64;
+    match liquidation_side {
+        Side::Buy => {
+            for price in storage::load_ask_prices(context, market_id)? {
+                for order_id in storage::load_ask_level(context, market_id, price)? {
+                    let Some(order) = storage::load_order(context, &order_id)? else {
+                        return Err(perp_invariant_err(format!(
+                            "ask queue references order {:?} not found in storage",
+                            order_id
+                        )));
+                    };
+                    if order.owner == user.0 .0 {
+                        continue;
+                    }
+                    if !matches!(
+                        order.status,
+                        OrderStatus::Open | OrderStatus::PartiallyFilled
+                    ) {
+                        return Err(perp_invariant_err(format!(
+                            "ask queue contains order {:?} with terminal status {:?}",
+                            order_id, order.status
+                        )));
+                    }
+                    available = available.saturating_add(order.quantity - order.filled);
+                    if available >= quantity {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Side::Sell => {
+            for price in storage::load_bid_prices(context, market_id)? {
+                for order_id in storage::load_bid_level(context, market_id, price)? {
+                    let Some(order) = storage::load_order(context, &order_id)? else {
+                        return Err(perp_invariant_err(format!(
+                            "bid queue references order {:?} not found in storage",
+                            order_id
+                        )));
+                    };
+                    if order.owner == user.0 .0 {
+                        continue;
+                    }
+                    if !matches!(
+                        order.status,
+                        OrderStatus::Open | OrderStatus::PartiallyFilled
+                    ) {
+                        return Err(perp_invariant_err(format!(
+                            "bid queue contains order {:?} with terminal status {:?}",
+                            order_id, order.status
+                        )));
+                    }
+                    available = available.saturating_add(order.quantity - order.filled);
+                    if available >= quantity {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Execute the liquidation close as an internal market IOC order.
+///
+/// The caller must pre-check full book depth. This helper still rejects any
+/// unfilled remainder to keep the first version all-or-nothing.
+pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market: &crate::perp_dex::types::Market,
+    side: Side,
+    quantity: u64,
+) -> Result<[u8; 32], PrecompileError> {
+    let order_id = next_order_id(context, user)?;
+    let order = Order {
+        owner: user.0 .0,
+        market_id: market.market_id,
+        side,
+        price: 0,
+        quantity,
+        filled: 0,
+        order_type: OrderType::Market,
+        tif: TimeInForce::Ioc,
+        status: OrderStatus::Open,
+    };
+    storage::save_order(context, &order_id, &order)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OrderPlaced {
+            user,
+            marketId: market.market_id,
+            orderId: FixedBytes(order_id),
+            side: side as u8,
+            price: 0,
+            quantity,
+            orderType: OrderType::Market as u8,
+            tif: TimeInForce::Ioc as u8,
+            clientOrderId: FixedBytes::default(),
+        }
+        .to_log_data(),
+    });
+
+    let remaining = match_order(
+        context,
+        user,
+        &order_id,
+        market.market_id,
+        side,
+        0,
+        quantity,
+        OrderType::Market,
+        TimeInForce::Ioc,
+        market,
+    )?;
+    if remaining != 0 {
+        return Err(perp_err(
+            "liquidate: orderbook liquidity cannot fully close position",
+        ));
+    }
+
+    let mut pos = storage::load_position(context, user, market.market_id)?;
+    if pos.amount != 0 {
+        return Err(perp_invariant_err(
+            "liquidation market order did not close position",
+        ));
+    }
+    pos.v_quote_balance = 0;
+    pos.margin = 0;
+    storage::save_position(context, user, market.market_id, &pos)?;
+
+    Ok(order_id)
+}
+
 fn place_order_core<CTX: ContextTr>(
     account: Address,
     order_id: [u8; 32],
@@ -541,16 +684,6 @@ fn match_order<CTX: ContextTr>(
                     };
                     storage::save_order(context, &maker_id, &updated_maker)?;
 
-                    // Update maker's sell-order entry list.
-                    update_sell_entry_after_fill(
-                        context,
-                        Address::from(maker_order.owner),
-                        market_id,
-                        &maker_id,
-                        fill_qty,
-                        market,
-                    )?;
-
                     // Update taker order.
                     let mut taker_order = storage::load_order(context, taker_order_id)?
                         .ok_or_else(|| {
@@ -655,15 +788,6 @@ fn match_order<CTX: ContextTr>(
                     };
                     storage::save_order(context, &maker_id, &updated_maker)?;
 
-                    update_buy_entry_after_fill(
-                        context,
-                        Address::from(maker_order.owner),
-                        market_id,
-                        &maker_id,
-                        fill_qty,
-                        market,
-                    )?;
-
                     let mut taker_order = storage::load_order(context, taker_order_id)?
                         .ok_or_else(|| {
                             perp_invariant_err("taker order missing after settle_fill")
@@ -721,9 +845,12 @@ fn settle_fill<CTX: ContextTr>(
 
     // Taker side.
     let taker_pos = {
+        ensure_taker_wallet_can_cover_opening_margin(
+            context, taker, market_id, taker_side, fill_qty, fill_value, market,
+        )?;
         let mut pos = storage::load_position(context, taker, market_id)?;
         let mut account = storage::load_account(context, taker)?;
-        apply_fill_to_position(
+        apply_taker_fill_to_position(
             &mut pos,
             &mut account.perp_wallet_balance,
             fill_qty,
@@ -738,14 +865,25 @@ fn settle_fill<CTX: ContextTr>(
     // Maker side (opposite of taker).
     let maker_pos = {
         let maker_side = taker_side.opposite();
+        let released_margin = release_margin_for_maker_fill(
+            context,
+            maker,
+            market_id,
+            maker_side,
+            maker_order_id,
+            fill_qty,
+            market,
+        )?;
         let mut pos = storage::load_position(context, maker, market_id)?;
         let mut account = storage::load_account(context, maker)?;
-        apply_fill_to_position(
+        apply_maker_fill_to_position(
             &mut pos,
             &mut account.perp_wallet_balance,
             fill_qty,
             fill_value,
             maker_side == Side::Buy,
+            released_margin.margin_available,
+            released_margin.wallet_freed,
         )?;
         storage::save_position(context, maker, market_id, &pos)?;
         storage::save_account(context, maker, account)?;
@@ -801,11 +939,132 @@ fn settle_fill<CTX: ContextTr>(
     Ok(())
 }
 
-/// Update a single position and perp-wallet balance for one fill leg.
-///
-/// `is_buy`: true if this participant is buying (amount increases).
-///
-fn apply_fill_to_position(
+fn calc_opening_margin_for_fill(
+    pos: &crate::perp_dex::types::PerpPosition,
+    fill_qty: u64,
+    fill_value: u64,
+    is_buy: bool,
+) -> u64 {
+    let closing_qty = if is_buy && pos.amount < 0 {
+        fill_qty.min((-pos.amount) as u64)
+    } else if !is_buy && pos.amount > 0 {
+        fill_qty.min(pos.amount as u64)
+    } else {
+        0
+    };
+    let opening_qty = fill_qty - closing_qty;
+    if opening_qty == 0 {
+        return 0;
+    }
+
+    let leverage = pos.leverage.max(1);
+    let open_value = (fill_value as u128 * opening_qty as u128 / fill_qty.max(1) as u128) as u64;
+    open_value / leverage
+}
+
+fn ensure_taker_wallet_can_cover_opening_margin<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    side: Side,
+    fill_qty: u64,
+    fill_value: u64,
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    let pos = storage::load_position(context, user, market_id)?;
+    let required_margin =
+        calc_opening_margin_for_fill(&pos, fill_qty, fill_value, side == Side::Buy);
+    if required_margin == 0 {
+        return Ok(());
+    }
+
+    if storage::load_account(context, user)?.perp_wallet_balance >= required_margin {
+        return Ok(());
+    }
+
+    cancel_same_side_orders_until_wallet_covers(
+        context,
+        user,
+        market_id,
+        side,
+        required_margin,
+        market,
+    )?;
+
+    if storage::load_account(context, user)?.perp_wallet_balance < required_margin {
+        return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+    }
+    Ok(())
+}
+
+fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    side: Side,
+    required_margin: u64,
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    while storage::load_account(context, user)?.perp_wallet_balance < required_margin {
+        let order_id = match side {
+            Side::Buy => storage::load_buy_orders(context, user, market_id)?
+                .last()
+                .map(|e| e.order_id),
+            Side::Sell => storage::load_sell_orders(context, user, market_id)?
+                .last()
+                .map(|e| e.order_id),
+        };
+        let Some(order_id) = order_id else {
+            break;
+        };
+
+        let order = storage::load_order(context, &order_id)?.ok_or_else(|| {
+            perp_invariant_err(format!(
+                "open order entry {:?} missing during margin release",
+                order_id
+            ))
+        })?;
+        if !matches!(
+            order.status,
+            OrderStatus::Open | OrderStatus::PartiallyFilled
+        ) {
+            return Err(perp_invariant_err(format!(
+                "open order entry {:?} has terminal status {:?}",
+                order_id, order.status
+            )));
+        }
+
+        remove_from_book(context, market_id, side, order.price, &order_id)?;
+        let remaining_qty = order.quantity - order.filled;
+        release_margin_for_cancelled_order(
+            context,
+            user,
+            market_id,
+            side,
+            &order_id,
+            remaining_qty,
+            market,
+        )?;
+
+        let mut cancelled = order;
+        cancelled.status = OrderStatus::Cancelled;
+        storage::save_order(context, &order_id, &cancelled)?;
+
+        context.journal_mut().log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::OrderCancelled {
+                user,
+                orderId: FixedBytes(order_id),
+                marketId: market_id,
+            }
+            .to_log_data(),
+        });
+    }
+
+    Ok(())
+}
+
+fn apply_taker_fill_to_position(
     pos: &mut crate::perp_dex::types::PerpPosition,
     wallet: &mut u64,
     fill_qty: u64,
@@ -857,6 +1116,79 @@ fn apply_fill_to_position(
     }
 
     // Apply to position fields.
+    if is_buy {
+        pos.amount += fill_qty as i64;
+        pos.v_quote_balance -= fill_value as i64;
+    } else {
+        pos.amount -= fill_qty as i64;
+        pos.v_quote_balance += fill_value as i64;
+    }
+
+    Ok(())
+}
+
+fn apply_maker_fill_to_position(
+    pos: &mut crate::perp_dex::types::PerpPosition,
+    wallet: &mut u64,
+    fill_qty: u64,
+    fill_value: u64,
+    is_buy: bool,
+    margin_available: u64,
+    wallet_freed: u64,
+) -> Result<(), PrecompileError> {
+    let initial_margin = calc_opening_margin_for_fill(pos, fill_qty, fill_value, is_buy);
+
+    if initial_margin > 0 {
+        if margin_available < initial_margin {
+            return Err(perp_invariant_err(
+                "maker fill margin was not covered by reserved margin",
+            ));
+        }
+        if wallet_freed > initial_margin {
+            *wallet = wallet.saturating_add(wallet_freed - initial_margin);
+        }
+        pos.margin += initial_margin as i64;
+    } else {
+        *wallet = wallet.saturating_add(wallet_freed);
+    }
+
+    apply_position_delta(pos, wallet, fill_qty, fill_value, is_buy)
+}
+
+fn apply_position_delta(
+    pos: &mut crate::perp_dex::types::PerpPosition,
+    wallet: &mut u64,
+    fill_qty: u64,
+    fill_value: u64,
+    is_buy: bool,
+) -> Result<(), PrecompileError> {
+    let closing_qty: u64 = if is_buy && pos.amount < 0 {
+        fill_qty.min((-pos.amount) as u64)
+    } else if !is_buy && pos.amount > 0 {
+        fill_qty.min(pos.amount as u64)
+    } else {
+        0
+    };
+
+    if closing_qty > 0 {
+        let pos_abs = pos.amount.unsigned_abs() as u128;
+        let margin_release = (pos.margin.max(0) as u128 * closing_qty as u128 / pos_abs) as i64;
+        let vq_fraction =
+            (pos.v_quote_balance as i128 * closing_qty as i128 / pos_abs as i128) as i64;
+        let close_quote_delta: i64 = if is_buy {
+            -((fill_value as u128 * closing_qty as u128 / fill_qty as u128) as i64)
+        } else {
+            (fill_value as u128 * closing_qty as u128 / fill_qty as u128) as i64
+        };
+        let realised = margin_release + vq_fraction + close_quote_delta;
+        if realised > 0 {
+            *wallet = wallet.saturating_add(realised as u64);
+        } else if realised < 0 {
+            *wallet = wallet.saturating_sub((-realised) as u64);
+        }
+        pos.margin -= margin_release;
+    }
+
     if is_buy {
         pos.amount += fill_qty as i64;
         pos.v_quote_balance -= fill_value as i64;
@@ -1114,102 +1446,97 @@ fn release_margin_for_cancelled_order<CTX: ContextTr>(
 
 // ── Order entry updates after fill ───────────────────────────────────────────
 
-/// Update the maker's buy-order entry after it was filled (partial or full).
-fn update_buy_entry_after_fill<CTX: ContextTr>(
-    context: &mut CTX,
-    maker: Address,
-    market_id: u64,
-    order_id: &[u8; 32],
-    fill_qty: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
-    let mut entries = storage::load_buy_orders(context, maker, market_id)?;
-    let mut pos = storage::load_position(context, maker, market_id)?;
-    let mut account = storage::load_account(context, maker)?;
-
-    let old_max = pos
-        .buy_side_margin_reserved
-        .max(pos.sell_side_margin_reserved);
-    match entries.iter_mut().find(|e| &e.order_id == order_id) {
-        Some(e) => {
-            e.amount = e.amount.saturating_sub(fill_qty);
-            if e.amount == 0 {
-                entries.retain(|e| &e.order_id != order_id);
-            }
-        }
-        None => {
-            return Err(perp_invariant_err(format!(
-                "buy entry for order {:?} not found during fill update",
-                order_id
-            )))
-        }
-    }
-    let new_reserved = calc_buy_side_margin_reserved(
-        &entries,
-        pos.leverage.max(1),
-        market.base_decimals,
-        market.price_decimals,
-        pos.amount,
-    )?;
-    let new_max = new_reserved.max(pos.sell_side_margin_reserved);
-    let freed = old_max.saturating_sub(new_max);
-    account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(freed);
-    pos.buy_side_margin_reserved = new_reserved;
-    pos.margin_reserved = new_max;
-
-    storage::save_buy_orders(context, maker, market_id, &entries)?;
-    storage::save_position(context, maker, market_id, &pos)?;
-    storage::save_account(context, maker, account)?;
-    Ok(())
+struct MakerFillReleasedMargin {
+    margin_available: u64,
+    wallet_freed: u64,
 }
 
-/// Update the maker's sell-order entry after it was filled (partial or full).
-fn update_sell_entry_after_fill<CTX: ContextTr>(
+fn release_margin_for_maker_fill<CTX: ContextTr>(
     context: &mut CTX,
-    maker: Address,
+    user: Address,
     market_id: u64,
+    side: Side,
     order_id: &[u8; 32],
     fill_qty: u64,
     market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
-    let mut entries = storage::load_sell_orders(context, maker, market_id)?;
-    let mut pos = storage::load_position(context, maker, market_id)?;
-    let mut account = storage::load_account(context, maker)?;
-
+) -> Result<MakerFillReleasedMargin, PrecompileError> {
+    let mut pos = storage::load_position(context, user, market_id)?;
     let old_max = pos
         .buy_side_margin_reserved
         .max(pos.sell_side_margin_reserved);
-    match entries.iter_mut().find(|e| &e.order_id == order_id) {
-        Some(e) => {
-            e.amount = e.amount.saturating_sub(fill_qty);
-            if e.amount == 0 {
-                entries.retain(|e| &e.order_id != order_id);
-            }
-        }
-        None => {
-            return Err(perp_invariant_err(format!(
-                "sell entry for order {:?} not found during fill update",
-                order_id
-            )))
-        }
-    }
-    let new_reserved = calc_sell_side_margin_reserved(
-        &entries,
-        pos.leverage.max(1),
-        market.base_decimals,
-        market.price_decimals,
-        pos.amount,
-    )?;
-    let new_max = pos.buy_side_margin_reserved.max(new_reserved);
-    let freed = old_max.saturating_sub(new_max);
-    account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(freed);
-    pos.sell_side_margin_reserved = new_reserved;
-    pos.margin_reserved = new_max;
 
-    storage::save_sell_orders(context, maker, market_id, &entries)?;
-    storage::save_position(context, maker, market_id, &pos)?;
-    storage::save_account(context, maker, account)?;
-    Ok(())
+    let (new_max, margin_available) = match side {
+        Side::Buy => {
+            let old_side_reserved = pos.buy_side_margin_reserved;
+            let mut entries = storage::load_buy_orders(context, user, market_id)?;
+            match entries.iter_mut().find(|e| &e.order_id == order_id) {
+                Some(e) => {
+                    e.amount = e.amount.saturating_sub(fill_qty);
+                    if e.amount == 0 {
+                        entries.retain(|e| &e.order_id != order_id);
+                    }
+                }
+                None => {
+                    return Err(perp_invariant_err(format!(
+                        "buy entry for order {:?} not found during fill update",
+                        order_id
+                    )))
+                }
+            }
+            let new_reserved = calc_buy_side_margin_reserved(
+                &entries,
+                pos.leverage.max(1),
+                market.base_decimals,
+                market.price_decimals,
+                pos.amount,
+            )?;
+            pos.buy_side_margin_reserved = new_reserved;
+            storage::save_buy_orders(context, user, market_id, &entries)?;
+            (
+                new_reserved.max(pos.sell_side_margin_reserved),
+                old_side_reserved.saturating_sub(new_reserved),
+            )
+        }
+        Side::Sell => {
+            let old_side_reserved = pos.sell_side_margin_reserved;
+            let mut entries = storage::load_sell_orders(context, user, market_id)?;
+            match entries.iter_mut().find(|e| &e.order_id == order_id) {
+                Some(e) => {
+                    e.amount = e.amount.saturating_sub(fill_qty);
+                    if e.amount == 0 {
+                        entries.retain(|e| &e.order_id != order_id);
+                    }
+                }
+                None => {
+                    return Err(perp_invariant_err(format!(
+                        "sell entry for order {:?} not found during fill update",
+                        order_id
+                    )))
+                }
+            }
+            let new_reserved = calc_sell_side_margin_reserved(
+                &entries,
+                pos.leverage.max(1),
+                market.base_decimals,
+                market.price_decimals,
+                pos.amount,
+            )?;
+            pos.sell_side_margin_reserved = new_reserved;
+            storage::save_sell_orders(context, user, market_id, &entries)?;
+            (
+                pos.buy_side_margin_reserved.max(new_reserved),
+                old_side_reserved.saturating_sub(new_reserved),
+            )
+        }
+    };
+
+    let wallet_freed = old_max.saturating_sub(new_max);
+    pos.margin_reserved = new_max;
+    storage::save_position(context, user, market_id, &pos)?;
+    Ok(MakerFillReleasedMargin {
+        margin_available,
+        wallet_freed,
+    })
 }
 
 // ── FOK / PostOnly pre-checks ─────────────────────────────────────────────────
@@ -1759,6 +2086,30 @@ mod tests {
                 .contains("insufficient perp wallet for margin"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+
+        let high_buy_price = PRICE - TICK;
+        let low_buy_price = PRICE - 2 * TICK;
+        let high_buy = place(&mut ctx, ALICE, 0, high_buy_price, QTY, 0, 0);
+        let low_buy = place(&mut ctx, ALICE, 0, low_buy_price, QTY, 0, 0);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
+
+        let low_buy_margin = 980_000;
+        let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
+        alice.perp_wallet_balance = INIT_MARGIN - low_buy_margin;
+        storage::save_account(&mut ctx, ALICE, alice).unwrap();
+
+        let market_buy = place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);
+
+        assert_eq!(get_order(&mut ctx, market_buy).status, OrderStatus::Filled);
+        assert_eq!(get_order(&mut ctx, low_buy).status, OrderStatus::Cancelled);
+        assert_eq!(get_order(&mut ctx, high_buy).status, OrderStatus::Open);
+        assert_eq!(wallet(&mut ctx, ALICE), 0);
     }
 
     #[test]

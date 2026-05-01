@@ -94,6 +94,22 @@ pub fn is_above_maintenance_margin(
     Ok(position_value >= threshold)
 }
 
+/// Position equity at `mark_price`: isolated margin plus unrealized PnL.
+#[inline]
+pub fn calc_position_equity(
+    mark_price: u64,
+    amount: i64,
+    v_quote_balance: i64,
+    margin: i64,
+    base_decimals: u32,
+    price_decimals: u32,
+) -> Result<i64, PrecompileError> {
+    calc_value_i64(mark_price, amount, base_decimals, price_decimals)?
+        .checked_add(v_quote_balance)
+        .and_then(|v| v.checked_add(margin))
+        .ok_or_else(|| perp_err("math: position equity overflow"))
+}
+
 /// Proportionally scale `initial_margin` down by the unfilled portion.
 #[inline]
 pub fn calc_remaining_margin(

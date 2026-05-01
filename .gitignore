@@ -31,5 +31,4 @@ rustc-ice-*
 /test-fixtures
 
 # Local PerpDEX working notes
-/docs/perp_dex_context.md
-/docs/perp_dex_test_plan.md
+/docs/
