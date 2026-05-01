@@ -71,6 +71,24 @@ sol! {
             uint64  filled,
             uint8   status
         );
+        /// Query a user's open order entries in one market.
+        /// Buy orders are returned first, sorted by price descending; sell orders follow, sorted by price ascending.
+        function getOpenOrders(address user, uint64 marketId) external view returns (
+            bytes32[] orderIds,
+            uint8[]   sides,
+            uint64[]  prices,
+            uint64[]  remainingQuantities
+        );
+        /// Query one side's active price levels in matching priority order.
+        /// side: 0 = Buy returns bid prices descending; 1 = Sell returns ask prices ascending.
+        function getBookPrices(uint64 marketId, uint8 side) external view returns (
+            uint64[] prices
+        );
+        /// Query the FIFO order-id queue at one price level.
+        /// side: 0 = Buy reads the bid level; 1 = Sell reads the ask level.
+        function getBookLevel(uint64 marketId, uint8 side, uint64 price) external view returns (
+            bytes32[] orderIds
+        );
 
         // ── Positions ─────────────────────────────────────────────────────
         /// Query a user's perpetual position in a market.

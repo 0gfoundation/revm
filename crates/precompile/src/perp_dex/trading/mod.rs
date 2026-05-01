@@ -11,8 +11,9 @@ use crate::{
     perp_dex::{
         errors::{perp_err, perp_invariant_err},
         interface::IPerpDex::{
-            self, cancelOrderCall, cancelOrderSignedCall, getOrderCall, getOrderReturn,
-            placeOrderCall, placeOrderSignedCall,
+            self, cancelOrderCall, cancelOrderSignedCall, getBookLevelCall, getBookPricesCall,
+            getOpenOrdersCall, getOpenOrdersReturn, getOrderCall, getOrderReturn, placeOrderCall,
+            placeOrderSignedCall,
         },
         math::{calc_buy_side_margin_reserved, calc_sell_side_margin_reserved, calc_value},
         storage,
@@ -350,6 +351,83 @@ pub fn run_get_order<CTX: ContextTr>(
     )))
 }
 
+/// `getOpenOrders(address user, uint64 marketId) returns (bytes32[] orderIds, uint8[] sides, uint64[] prices, uint64[] remainingQuantities)`
+pub fn run_get_open_orders<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = getOpenOrdersCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getOpenOrders: invalid calldata"))?;
+
+    let buy_entries = storage::load_buy_orders(context, args.user, args.marketId)?;
+    let sell_entries = storage::load_sell_orders(context, args.user, args.marketId)?;
+    let total = buy_entries.len() + sell_entries.len();
+
+    let mut order_ids = Vec::with_capacity(total);
+    let mut sides = Vec::with_capacity(total);
+    let mut prices = Vec::with_capacity(total);
+    let mut remaining_quantities = Vec::with_capacity(total);
+
+    for entry in buy_entries {
+        order_ids.push(FixedBytes(entry.order_id));
+        sides.push(Side::Buy as u8);
+        prices.push(entry.price);
+        remaining_quantities.push(entry.amount);
+    }
+    for entry in sell_entries {
+        order_ids.push(FixedBytes(entry.order_id));
+        sides.push(Side::Sell as u8);
+        prices.push(entry.price);
+        remaining_quantities.push(entry.amount);
+    }
+
+    Ok(Bytes::from(getOpenOrdersCall::abi_encode_returns(
+        &getOpenOrdersReturn {
+            orderIds: order_ids,
+            sides,
+            prices,
+            remainingQuantities: remaining_quantities,
+        },
+    )))
+}
+
+/// `getBookPrices(uint64 marketId, uint8 side) returns (uint64[] prices)`
+pub fn run_get_book_prices<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = getBookPricesCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getBookPrices: invalid calldata"))?;
+
+    let side = Side::from_u8(args.side).ok_or_else(|| perp_err("getBookPrices: invalid side"))?;
+    let prices = match side {
+        Side::Buy => storage::load_bid_prices(context, args.marketId)?,
+        Side::Sell => storage::load_ask_prices(context, args.marketId)?,
+    };
+
+    Ok(Bytes::from(getBookPricesCall::abi_encode_returns(&prices)))
+}
+
+/// `getBookLevel(uint64 marketId, uint8 side, uint64 price) returns (bytes32[] orderIds)`
+pub fn run_get_book_level<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = getBookLevelCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getBookLevel: invalid calldata"))?;
+
+    let side = Side::from_u8(args.side).ok_or_else(|| perp_err("getBookLevel: invalid side"))?;
+    let queue = match side {
+        Side::Buy => storage::load_bid_level(context, args.marketId, args.price)?,
+        Side::Sell => storage::load_ask_level(context, args.marketId, args.price)?,
+    };
+    let order_ids = queue.into_iter().map(FixedBytes).collect();
+
+    Ok(Bytes::from(getBookLevelCall::abi_encode_returns(
+        &order_ids,
+    )))
+}
+
 // ── ed25519 helpers ───────────────────────────────────────────────────────────
 
 fn verify_ed25519(
@@ -645,23 +723,15 @@ fn settle_fill<CTX: ContextTr>(
     let taker_pos = {
         let mut pos = storage::load_position(context, taker, market_id)?;
         let mut account = storage::load_account(context, taker)?;
-        let shortfall = apply_fill_to_position(
+        apply_fill_to_position(
             &mut pos,
             &mut account.perp_wallet_balance,
             fill_qty,
             fill_value,
             taker_side == Side::Buy,
-        );
+        )?;
         storage::save_position(context, taker, market_id, &pos)?;
         storage::save_account(context, taker, account)?;
-        if shortfall > 0 {
-            let cancel_side = if taker_side == Side::Buy {
-                Side::Sell
-            } else {
-                Side::Buy
-            };
-            cancel_underfunded_side(context, taker, market_id, cancel_side, shortfall, market)?;
-        }
         pos
     };
 
@@ -670,23 +740,15 @@ fn settle_fill<CTX: ContextTr>(
         let maker_side = taker_side.opposite();
         let mut pos = storage::load_position(context, maker, market_id)?;
         let mut account = storage::load_account(context, maker)?;
-        let shortfall = apply_fill_to_position(
+        apply_fill_to_position(
             &mut pos,
             &mut account.perp_wallet_balance,
             fill_qty,
             fill_value,
             maker_side == Side::Buy,
-        );
+        )?;
         storage::save_position(context, maker, market_id, &pos)?;
         storage::save_account(context, maker, account)?;
-        if shortfall > 0 {
-            let cancel_side = if maker_side == Side::Buy {
-                Side::Sell
-            } else {
-                Side::Buy
-            };
-            cancel_underfunded_side(context, maker, market_id, cancel_side, shortfall, market)?;
-        }
         pos
     };
 
@@ -743,16 +805,13 @@ fn settle_fill<CTX: ContextTr>(
 ///
 /// `is_buy`: true if this participant is buying (amount increases).
 ///
-/// Returns the opening-margin **shortfall**: the amount of initial margin that could not be
-/// deducted because the wallet was insufficient.  Under the max-reservation scheme the caller
-/// must cancel enough orders on the opposite side to cover this shortfall.
 fn apply_fill_to_position(
     pos: &mut crate::perp_dex::types::PerpPosition,
     wallet: &mut u64,
     fill_qty: u64,
     fill_value: u64,
     is_buy: bool,
-) -> u64 {
+) -> Result<(), PrecompileError> {
     let leverage = pos.leverage.max(1);
 
     // How much of this fill is closing existing position vs opening new?
@@ -786,20 +845,16 @@ fn apply_fill_to_position(
     }
 
     // --- Opening portion: deduct initial margin from wallet ---
-    // Only credit pos.margin with what was actually deducted; return any shortfall to the
-    // caller so it can cancel opposite-side orders to recover the deficit.
-    let shortfall = if opening_qty > 0 {
+    if opening_qty > 0 {
         let open_value =
             (fill_value as u128 * opening_qty as u128 / fill_qty.max(1) as u128) as u64;
         let initial_margin = open_value / leverage;
-        let wallet_before = *wallet;
-        *wallet = wallet.saturating_sub(initial_margin);
-        let actually_deducted = wallet_before - *wallet; // min(wallet_before, initial_margin)
-        pos.margin += actually_deducted as i64;
-        initial_margin.saturating_sub(wallet_before) // > 0 only when wallet was insufficient
-    } else {
-        0
-    };
+        if *wallet < initial_margin {
+            return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+        }
+        *wallet -= initial_margin;
+        pos.margin += initial_margin as i64;
+    }
 
     // Apply to position fields.
     if is_buy {
@@ -810,7 +865,7 @@ fn apply_fill_to_position(
         pos.v_quote_balance += fill_value as i64;
     }
 
-    shortfall
+    Ok(())
 }
 
 // ── Resting in book ───────────────────────────────────────────────────────────
@@ -1266,87 +1321,6 @@ fn should_skip_match<CTX: ContextTr>(
     }
 }
 
-// ── Cancel underfunded orders ─────────────────────────────────────────────────
-
-/// Cancel orders on `cancel_side` (worst-priced first) until `shortfall` worth of reserved
-/// margin has been freed.  Called after a fill that consumed wallet that was implicitly backing
-/// the other side under the max-reservation scheme.
-fn cancel_underfunded_side<CTX: ContextTr>(
-    context: &mut CTX,
-    user: Address,
-    market_id: u64,
-    cancel_side: Side,
-    shortfall: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
-    let mut remaining = shortfall;
-    while remaining > 0 {
-        // Pick the worst-priced order to cancel first (furthest from current market).
-        // Buy entries are sorted price DESC → last = lowest price (worst buy).
-        // Sell entries are sorted price ASC  → last = highest price (worst sell).
-        let order_id = match cancel_side {
-            Side::Buy => {
-                let entries = storage::load_buy_orders(context, user, market_id)?;
-                match entries.last() {
-                    Some(e) => e.order_id,
-                    None => break,
-                }
-            }
-            Side::Sell => {
-                let entries = storage::load_sell_orders(context, user, market_id)?;
-                match entries.last() {
-                    Some(e) => e.order_id,
-                    None => break,
-                }
-            }
-        };
-
-        let order = match storage::load_order(context, &order_id)? {
-            Some(o) if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) => o,
-            _ => break,
-        };
-
-        let pos_before = storage::load_position(context, user, market_id)?;
-        let old_max = pos_before
-            .buy_side_margin_reserved
-            .max(pos_before.sell_side_margin_reserved);
-
-        remove_from_book(context, market_id, cancel_side, order.price, &order_id)?;
-        let remaining_qty = order.quantity - order.filled;
-        release_margin_for_cancelled_order(
-            context,
-            user,
-            market_id,
-            cancel_side,
-            &order_id,
-            remaining_qty,
-            market,
-        )?;
-
-        let pos_after = storage::load_position(context, user, market_id)?;
-        let new_max = pos_after
-            .buy_side_margin_reserved
-            .max(pos_after.sell_side_margin_reserved);
-        let freed = old_max.saturating_sub(new_max);
-        remaining = remaining.saturating_sub(freed);
-
-        if let Some(mut o) = storage::load_order(context, &order_id)? {
-            o.status = OrderStatus::Cancelled;
-            storage::save_order(context, &order_id, &o)?;
-        }
-        context.journal_mut().log(Log {
-            address: PERP_DEX_ADDRESS,
-            data: IPerpDex::OrderCancelled {
-                user,
-                orderId: FixedBytes(order_id),
-                marketId: market_id,
-            }
-            .to_log_data(),
-        });
-    }
-    Ok(())
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1759,6 +1733,35 @@ mod tests {
     }
 
     #[test]
+    fn fill_rejects_when_taker_wallet_cannot_cover_opening_margin() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
+
+        let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
+        alice.perp_wallet_balance = INIT_MARGIN - 1;
+        storage::save_account(&mut ctx, ALICE, alice).unwrap();
+
+        let input = placeOrderCall {
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
+        let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("insufficient perp wallet for margin"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn partial_fill_leaves_maker_partially_filled_in_book() {
         let mut ctx = make_ctx();
         setup(&mut ctx);
@@ -2034,5 +2037,86 @@ mod tests {
         .abi_encode();
         let err = run_get_order(&input, &mut ctx).unwrap_err();
         assert!(err.to_string().contains("order not found"), "{err}");
+    }
+
+    #[test]
+    fn get_open_orders_returns_user_order_entries() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+
+        let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+        let sell_price = PRICE + TICK;
+        let sell_id = place(&mut ctx, ALICE, 1, sell_price, QTY * 2, 0, 0);
+
+        let input = getOpenOrdersCall {
+            user: ALICE,
+            marketId: MARKET_ID,
+        }
+        .abi_encode();
+        let ret = run_get_open_orders(&input, &mut ctx).unwrap();
+        let decoded = getOpenOrdersCall::abi_decode_returns(&ret).unwrap();
+
+        assert_eq!(
+            decoded.orderIds,
+            vec![FixedBytes(buy_id), FixedBytes(sell_id)]
+        );
+        assert_eq!(decoded.sides, vec![Side::Buy as u8, Side::Sell as u8]);
+        assert_eq!(decoded.prices, vec![PRICE, sell_price]);
+        assert_eq!(decoded.remainingQuantities, vec![QTY, QTY * 2]);
+    }
+
+    #[test]
+    fn get_book_prices_returns_matching_priority_order() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+
+        let low_bid = PRICE - TICK;
+        let high_bid = PRICE;
+        let low_ask = PRICE + TICK;
+        let high_ask = PRICE + TICK * 2;
+
+        place(&mut ctx, ALICE, 0, low_bid, QTY, 0, 0);
+        place(&mut ctx, BOB, 0, high_bid, QTY, 0, 0);
+        place(&mut ctx, ALICE, 1, high_ask, QTY, 0, 0);
+        place(&mut ctx, BOB, 1, low_ask, QTY, 0, 0);
+
+        let bids_input = getBookPricesCall {
+            marketId: MARKET_ID,
+            side: Side::Buy as u8,
+        }
+        .abi_encode();
+        let bids_ret = run_get_book_prices(&bids_input, &mut ctx).unwrap();
+        let bids = getBookPricesCall::abi_decode_returns(&bids_ret).unwrap();
+
+        let asks_input = getBookPricesCall {
+            marketId: MARKET_ID,
+            side: Side::Sell as u8,
+        }
+        .abi_encode();
+        let asks_ret = run_get_book_prices(&asks_input, &mut ctx).unwrap();
+        let asks = getBookPricesCall::abi_decode_returns(&asks_ret).unwrap();
+
+        assert_eq!(bids, vec![high_bid, low_bid]);
+        assert_eq!(asks, vec![low_ask, high_ask]);
+    }
+
+    #[test]
+    fn get_book_level_returns_fifo_order_ids() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+
+        let first = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+        let second = place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0);
+
+        let input = getBookLevelCall {
+            marketId: MARKET_ID,
+            side: Side::Buy as u8,
+            price: PRICE,
+        }
+        .abi_encode();
+        let ret = run_get_book_level(&input, &mut ctx).unwrap();
+        let decoded = getBookLevelCall::abi_decode_returns(&ret).unwrap();
+
+        assert_eq!(decoded, vec![FixedBytes(first), FixedBytes(second)]);
     }
 }

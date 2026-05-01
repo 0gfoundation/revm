@@ -31,11 +31,11 @@ use crate::{
         },
         interface::IPerpDex::{
             addMarketCall, cancelOrderCall, cancelOrderSignedCall, depositCall, getAccountCall,
-            getAdminCall, getApiKeyCall, getMarkPriceCall, getMarketCall, getOrderCall,
-            getPositionCall, initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall,
-            registerApiKeyCall, revokeApiKeyCall, setLeverageCall, setMarkPriceCall,
-            transferAdminCall, transferFromPerpCall, transferToPerpCall, updateMarketCall,
-            withdrawCall,
+            getAdminCall, getApiKeyCall, getBookLevelCall, getBookPricesCall, getMarkPriceCall,
+            getMarketCall, getOpenOrdersCall, getOrderCall, getPositionCall, initAdminCall,
+            liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
+            revokeApiKeyCall, setLeverageCall, setMarkPriceCall, transferAdminCall,
+            transferFromPerpCall, transferToPerpCall, updateMarketCall, withdrawCall,
         },
         risk::{
             run_add_market, run_get_admin, run_get_mark_price, run_get_market, run_get_position,
@@ -43,8 +43,8 @@ use crate::{
             run_transfer_admin, run_update_market,
         },
         trading::{
-            run_cancel_order, run_cancel_order_signed, run_get_order, run_place_order,
-            run_place_order_signed,
+            run_cancel_order, run_cancel_order_signed, run_get_book_level, run_get_book_prices,
+            run_get_open_orders, run_get_order, run_place_order, run_place_order_signed,
         },
     },
     PrecompileError, PrecompileOutput, PrecompileResult,
@@ -97,6 +97,9 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(placeOrderCall::SELECTOR, (200_000, false));
         m.insert(cancelOrderCall::SELECTOR, (80_000, false));
         m.insert(getOrderCall::SELECTOR, (5_000, true));
+        m.insert(getOpenOrdersCall::SELECTOR, (20_000, true));
+        m.insert(getBookPricesCall::SELECTOR, (20_000, true));
+        m.insert(getBookLevelCall::SELECTOR, (20_000, true));
         // Positions
         m.insert(getPositionCall::SELECTOR, (5_000, true));
         // Liquidation
@@ -199,6 +202,9 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         s if s == placeOrderCall::SELECTOR => run_place_order(input_bytes, caller, context),
         s if s == cancelOrderCall::SELECTOR => run_cancel_order(input_bytes, caller, context),
         s if s == getOrderCall::SELECTOR => run_get_order(input_bytes, context),
+        s if s == getOpenOrdersCall::SELECTOR => run_get_open_orders(input_bytes, context),
+        s if s == getBookPricesCall::SELECTOR => run_get_book_prices(input_bytes, context),
+        s if s == getBookLevelCall::SELECTOR => run_get_book_level(input_bytes, context),
         // Positions
         s if s == getPositionCall::SELECTOR => run_get_position(input_bytes, context),
         // Liquidation
