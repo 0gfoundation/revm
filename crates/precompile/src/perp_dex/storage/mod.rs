@@ -556,6 +556,16 @@ pub fn refresh_best_bid<CTX: ContextTr>(
     save_best_bid(context, market_id, best)
 }
 
+/// Re-derive best_ask from the current ask price list (already in journal cache after matching).
+/// Call this after any operation that may have removed the top ask level.
+pub fn refresh_best_ask<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<(), PrecompileError> {
+    let prices = load_ask_prices(context, market_id)?;
+    let best = prices.first().copied().unwrap_or(0);
+    save_best_ask(context, market_id, best)
+}
 // ── API key (ed25519 signed orders) ──────────────────────────────────────────
 
 /// Returns `None` when no API key has been registered yet.
@@ -585,15 +595,4 @@ pub fn delete_api_key<CTX: ContextTr>(
     user: Address,
 ) -> Result<(), PrecompileError> {
     store_blob(context, api_key_key(user), &[])
-}
-
-/// Re-derive best_ask from the current ask price list (already in journal cache after matching).
-/// Call this after any operation that may have removed the top ask level.
-pub fn refresh_best_ask<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-) -> Result<(), PrecompileError> {
-    let prices = load_ask_prices(context, market_id)?;
-    let best = prices.first().copied().unwrap_or(0);
-    save_best_ask(context, market_id, best)
 }
