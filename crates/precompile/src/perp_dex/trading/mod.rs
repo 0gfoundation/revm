@@ -11,7 +11,7 @@ mod liquidation;
 mod settlement;
 
 pub(crate) use liquidation::{can_fully_liquidate_on_book, execute_liquidation_market_order};
-use settlement::settle_fill;
+use settlement::{settle_maker_fill, TakerSettlement};
 
 use crate::{
     perp_dex::{
@@ -21,13 +21,38 @@ use crate::{
             getOpenOrdersCall, getOpenOrdersReturn, getOrderCall, getOrderReturn, placeOrderCall,
             placeOrderSignedCall,
         },
-        math::{calc_buy_side_margin_reserved, calc_sell_side_margin_reserved},
+        math::{
+            calc_buy_side_reserved_notional, calc_sell_side_reserved_notional, calc_trading_fee,
+            calc_value,
+        },
         storage,
         types::{Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce},
         PERP_DEX_ADDRESS,
     },
     PrecompileError,
 };
+
+fn calc_maker_fee_for_order_qty<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    price: u64,
+    qty: u64,
+    market: &crate::perp_dex::types::Market,
+) -> Result<u64, PrecompileError> {
+    let notional = calc_value(price, qty, market.base_decimals, market.price_decimals)?;
+    let rates = storage::load_user_fee_rates(context, user)?;
+    calc_trading_fee(notional, rates.maker_fee_bps)
+}
+
+fn calc_maker_fee_for_order_qty_with_bps(
+    price: u64,
+    qty: u64,
+    maker_fee_bps: u64,
+    market: &crate::perp_dex::types::Market,
+) -> Result<u64, PrecompileError> {
+    let notional = calc_value(price, qty, market.base_decimals, market.price_decimals)?;
+    calc_trading_fee(notional, maker_fee_bps)
+}
 
 // ── Public entry-points ───────────────────────────────────────────────────────
 
@@ -61,7 +86,7 @@ pub fn run_place_order<CTX: ContextTr>(
 /// `placeOrderSigned(address account, ..., uint64 timestamp, bytes signature) returns (bytes32 orderId)`
 ///
 /// orderId = keccak256(signature). Replay protection is implicit: a second submission of the
-/// same signature produces the same orderId, which already exists in storage → rejected.
+/// same signature produces the same orderId, which already exists in storage, and is rejected.
 pub fn run_place_order_signed<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -90,7 +115,7 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
 
-    // Derive orderId from signature — same sig → same id → duplicate check = replay guard.
+    // Derive orderId from signature: same sig, same id, duplicate check is the replay guard.
     let order_id: [u8; 32] = keccak256(args.signature.as_ref()).0;
     if storage::load_order(context, &order_id)?.is_some() {
         return Err(perp_err(
@@ -290,6 +315,13 @@ pub(super) fn next_order_id<CTX: ContextTr>(
     Ok(keccak256(&buf).0)
 }
 
+struct ValidatedOrder {
+    market: crate::perp_dex::types::Market,
+    side: Side,
+    order_type: OrderType,
+    tif: TimeInForce,
+}
+
 fn place_order_core<CTX: ContextTr>(
     account: Address,
     order_id: [u8; 32],
@@ -302,6 +334,53 @@ fn place_order_core<CTX: ContextTr>(
     client_order_id: [u8; 16],
     context: &mut CTX,
 ) -> Result<(), PrecompileError> {
+    let validated = validate_place_order(
+        context,
+        market_id,
+        side_u8,
+        price,
+        quantity,
+        order_type_u8,
+        tif_u8,
+    )?;
+
+    persist_new_order(
+        context,
+        account,
+        &order_id,
+        market_id,
+        price,
+        quantity,
+        client_order_id,
+        &validated,
+    )?;
+
+    match validated.order_type {
+        OrderType::Limit => execute_limit_order(
+            context,
+            account,
+            order_id,
+            market_id,
+            price,
+            quantity,
+            client_order_id,
+            validated,
+        ),
+        OrderType::Market => execute_market_order(
+            context, account, order_id, market_id, price, quantity, validated,
+        ),
+    }
+}
+
+fn validate_place_order<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    side_u8: u8,
+    price: u64,
+    quantity: u64,
+    order_type_u8: u8,
+    tif_u8: u8,
+) -> Result<ValidatedOrder, PrecompileError> {
     let market = storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("placeOrder: unknown market"))?;
     if !market.active {
@@ -334,76 +413,241 @@ fn place_order_core<CTX: ContextTr>(
         }
     }
 
-    if tif == TimeInForce::Fok {
-        check_fok_feasibility(context, market_id, side, price, quantity, order_type)?;
-    }
+    Ok(ValidatedOrder {
+        market,
+        side,
+        order_type,
+        tif,
+    })
+}
 
-    let skip_match = should_skip_match(context, market_id, side, price, order_type, tif)?;
-
+fn persist_new_order<CTX: ContextTr>(
+    context: &mut CTX,
+    account: Address,
+    order_id: &[u8; 32],
+    market_id: u64,
+    price: u64,
+    quantity: u64,
+    client_order_id: [u8; 16],
+    order: &ValidatedOrder,
+) -> Result<(), PrecompileError> {
     let order = Order {
         owner: account.0 .0,
         market_id,
-        side,
+        side: order.side,
         price,
         quantity,
         filled: 0,
-        order_type,
-        tif,
+        order_type: order.order_type,
+        tif: order.tif,
         status: OrderStatus::Open,
     };
-    storage::save_order(context, &order_id, &order)?;
+    storage::save_order(context, order_id, &order)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderPlaced {
             user: account,
             marketId: market_id,
-            orderId: FixedBytes(order_id),
-            side: side as u8,
+            orderId: FixedBytes(*order_id),
+            side: order.side as u8,
             price,
             quantity,
-            orderType: order_type as u8,
-            tif: tif as u8,
+            orderType: order.order_type as u8,
+            tif: order.tif as u8,
             clientOrderId: FixedBytes(client_order_id),
         }
         .to_log_data(),
     });
 
-    let remaining = if skip_match {
-        quantity
-    } else {
-        match_order(
-            context, account, &order_id, market_id, side, price, quantity, order_type, tif, &market,
-        )?
-    };
+    Ok(())
+}
 
-    if remaining > 0
-        && order_type == OrderType::Limit
-        && matches!(tif, TimeInForce::Gtc | TimeInForce::PostOnly)
-    {
-        rest_in_book(
-            context,
-            account,
-            &order_id,
-            market_id,
-            side,
-            price,
-            remaining,
-            tif,
-            client_order_id,
-            &market,
-        )?;
-    } else if remaining == 0 {
-        // Already fully filled.
-    } else {
-        // IOC/FOK remainder: cancel.
-        if let Some(mut o) = storage::load_order(context, &order_id)? {
-            o.status = OrderStatus::Cancelled;
-            storage::save_order(context, &order_id, &o)?;
+fn execute_order_matching<CTX: ContextTr>(
+    context: &mut CTX,
+    account: Address,
+    order_id: &[u8; 32],
+    market_id: u64,
+    price: u64,
+    quantity: u64,
+    order: &ValidatedOrder,
+) -> Result<u64, PrecompileError> {
+    match_order(
+        context,
+        account,
+        order_id,
+        market_id,
+        order.side,
+        price,
+        quantity,
+        order.order_type,
+        order.tif,
+        &order.market,
+    )
+}
+
+fn cancel_unfilled_remainder<CTX: ContextTr>(
+    context: &mut CTX,
+    order_id: &[u8; 32],
+    remaining: u64,
+) -> Result<(), PrecompileError> {
+    if remaining == 0 {
+        return Ok(());
+    }
+
+    if let Some(mut o) = storage::load_order(context, order_id)? {
+        o.status = OrderStatus::Cancelled;
+        storage::save_order(context, order_id, &o)?;
+    }
+
+    Ok(())
+}
+
+fn ensure_fok_filled(remaining: u64) -> Result<(), PrecompileError> {
+    if remaining > 0 {
+        return Err(perp_err("placeOrder: FOK order cannot be fully filled"));
+    }
+
+    Ok(())
+}
+
+fn ensure_post_only_does_not_cross<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    side: Side,
+    price: u64,
+) -> Result<(), PrecompileError> {
+    match side {
+        Side::Buy => {
+            let best_ask = storage::load_best_ask(context, market_id)?;
+            if best_ask != 0 && best_ask <= price {
+                return Err(perp_err("placeOrder: PostOnly order would match"));
+            }
+        }
+        Side::Sell => {
+            let best_bid = storage::load_best_bid(context, market_id)?;
+            if best_bid != 0 && best_bid >= price {
+                return Err(perp_err("placeOrder: PostOnly order would match"));
+            }
         }
     }
 
     Ok(())
+}
+
+fn remove_order_entry(
+    entries: &mut Vec<OrderEntry>,
+    order_id: &[u8; 32],
+    side_label: &str,
+) -> Result<OrderEntry, PrecompileError> {
+    let idx = entries
+        .iter()
+        .position(|e| &e.order_id == order_id)
+        .ok_or_else(|| {
+            perp_invariant_err(format!(
+                "{side_label} entry for order {:?} not found during cancel",
+                order_id
+            ))
+        })?;
+    Ok(entries.remove(idx))
+}
+
+fn execute_limit_order<CTX: ContextTr>(
+    context: &mut CTX,
+    account: Address,
+    order_id: [u8; 32],
+    market_id: u64,
+    price: u64,
+    quantity: u64,
+    client_order_id: [u8; 16],
+    order: ValidatedOrder,
+) -> Result<(), PrecompileError> {
+    match order.tif {
+        TimeInForce::PostOnly => {
+            ensure_post_only_does_not_cross(context, market_id, order.side, price)?;
+            rest_in_book(
+                context,
+                account,
+                &order_id,
+                market_id,
+                order.side,
+                price,
+                quantity,
+                order.tif,
+                client_order_id,
+                &order.market,
+            )
+        }
+        TimeInForce::Gtc => {
+            let remaining = execute_order_matching(
+                context, account, &order_id, market_id, price, quantity, &order,
+            )?;
+            if remaining > 0 {
+                rest_in_book(
+                    context,
+                    account,
+                    &order_id,
+                    market_id,
+                    order.side,
+                    price,
+                    remaining,
+                    order.tif,
+                    client_order_id,
+                    &order.market,
+                )?;
+            }
+            Ok(())
+        }
+        TimeInForce::Ioc => {
+            let remaining = execute_order_matching(
+                context, account, &order_id, market_id, price, quantity, &order,
+            )?;
+            cancel_unfilled_remainder(context, &order_id, remaining)
+        }
+        TimeInForce::Fok => {
+            check_fok_feasibility(
+                context,
+                market_id,
+                order.side,
+                price,
+                quantity,
+                order.order_type,
+            )?;
+            let remaining = execute_order_matching(
+                context, account, &order_id, market_id, price, quantity, &order,
+            )?;
+            ensure_fok_filled(remaining)
+        }
+    }
+}
+
+fn execute_market_order<CTX: ContextTr>(
+    context: &mut CTX,
+    account: Address,
+    order_id: [u8; 32],
+    market_id: u64,
+    price: u64,
+    quantity: u64,
+    order: ValidatedOrder,
+) -> Result<(), PrecompileError> {
+    if order.tif == TimeInForce::Fok {
+        check_fok_feasibility(
+            context,
+            market_id,
+            order.side,
+            price,
+            quantity,
+            order.order_type,
+        )?;
+    }
+    let remaining = execute_order_matching(
+        context, account, &order_id, market_id, price, quantity, &order,
+    )?;
+    if order.tif == TimeInForce::Fok {
+        ensure_fok_filled(remaining)
+    } else {
+        cancel_unfilled_remainder(context, &order_id, remaining)
+    }
 }
 
 fn cancel_order_core<CTX: ContextTr>(
@@ -468,10 +712,11 @@ pub(super) fn match_order<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
 ) -> Result<u64, PrecompileError> {
     let mut remaining = quantity;
+    let mut taker_settlement = TakerSettlement::load(context, taker_addr, market_id)?;
 
     match side {
         Side::Buy => {
-            // Match against asks (sorted ASC — lowest ask first).
+            // Match against asks (sorted ASC: lowest ask first).
             let ask_prices = storage::load_ask_prices(context, market_id)?;
             let mut ask_levels_cleared = false;
             'outer: for ask_price in ask_prices {
@@ -517,8 +762,8 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
-                    // Settle fill for both sides.
-                    settle_fill(
+                    taker_settlement.record_fill(ask_price, fill_qty, Side::Buy, market)?;
+                    settle_maker_fill(
                         context,
                         taker_addr,
                         Address::from(maker_order.owner),
@@ -535,7 +780,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let mut updated_maker =
                         storage::load_order(context, &maker_id)?.ok_or_else(|| {
                             perp_invariant_err(format!(
-                                "maker order {:?} missing after settle_fill",
+                                "maker order {:?} missing after maker settlement",
                                 maker_id
                             ))
                         })?;
@@ -550,7 +795,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     // Update taker order.
                     let mut taker_order = storage::load_order(context, taker_order_id)?
                         .ok_or_else(|| {
-                            perp_invariant_err("taker order missing after settle_fill")
+                            perp_invariant_err("taker order missing after maker settlement")
                         })?;
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
@@ -577,7 +822,7 @@ pub(super) fn match_order<CTX: ContextTr>(
             }
         }
         Side::Sell => {
-            // Match against bids (sorted DESC — highest bid first).
+            // Match against bids (sorted DESC: highest bid first).
             let bid_prices = storage::load_bid_prices(context, market_id)?;
             let mut bid_levels_cleared = false;
             'outer: for bid_price in bid_prices {
@@ -623,7 +868,8 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
-                    settle_fill(
+                    taker_settlement.record_fill(bid_price, fill_qty, Side::Sell, market)?;
+                    settle_maker_fill(
                         context,
                         taker_addr,
                         Address::from(maker_order.owner),
@@ -639,7 +885,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let mut updated_maker =
                         storage::load_order(context, &maker_id)?.ok_or_else(|| {
                             perp_invariant_err(format!(
-                                "maker order {:?} missing after settle_fill",
+                                "maker order {:?} missing after maker settlement",
                                 maker_id
                             ))
                         })?;
@@ -653,7 +899,7 @@ pub(super) fn match_order<CTX: ContextTr>(
 
                     let mut taker_order = storage::load_order(context, taker_order_id)?
                         .ok_or_else(|| {
-                            perp_invariant_err("taker order missing after settle_fill")
+                            perp_invariant_err("taker order missing after maker settlement")
                         })?;
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
@@ -681,6 +927,7 @@ pub(super) fn match_order<CTX: ContextTr>(
         }
     }
 
+    taker_settlement.finalize(context, side, market)?;
     Ok(remaining)
 }
 
@@ -705,6 +952,7 @@ fn rest_in_book<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let mut account = storage::load_account(context, user)?;
+    let maker_fee_bps = storage::load_user_fee_rates(context, user)?.maker_fee_bps;
 
     match side {
         Side::Buy => {
@@ -717,36 +965,50 @@ fn rest_in_book<CTX: ContextTr>(
                     order_id: *order_id,
                     price,
                     amount: qty,
+                    maker_fee_bps,
                 },
             );
 
-            // Recompute how much buy-side margin this user now needs in total.
-            let new_buy_side_reserved = calc_buy_side_margin_reserved(
+            // Recompute buy-side notional, then derive margin once by leverage.
+            let new_buy_side_notional = calc_buy_side_reserved_notional(
                 &entries,
-                pos.leverage.max(1),
                 market.base_decimals,
                 market.price_decimals,
                 pos.amount,
             )?;
+            let new_buy_side_reserved = new_buy_side_notional / pos.leverage.max(1);
+            let order_fee_reserved =
+                calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
 
             // Under max-reservation, the wallet delta is the change in max(buy, sell).
             let old_max = pos
                 .buy_side_margin_reserved
                 .max(pos.sell_side_margin_reserved);
             let new_max = new_buy_side_reserved.max(pos.sell_side_margin_reserved);
-            if new_buy_side_reserved < pos.buy_side_margin_reserved {
+            if new_buy_side_notional < pos.buy_side_reserved_notional {
                 return Err(perp_invariant_err(format!(
-                    "buy-side reservation decreased after adding order: {} -> {}",
-                    pos.buy_side_margin_reserved, new_buy_side_reserved
+                    "buy-side reservation notional decreased after adding order: {} -> {}",
+                    pos.buy_side_reserved_notional, new_buy_side_notional
                 )));
             }
-            let delta = new_max.saturating_sub(old_max);
+            let margin_delta = new_max.saturating_sub(old_max);
+            let delta = margin_delta
+                .checked_add(order_fee_reserved)
+                .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
 
             if account.perp_wallet_balance < delta {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
             account.perp_wallet_balance -= delta;
+            pos.buy_side_reserved_notional = new_buy_side_notional;
             pos.buy_side_margin_reserved = new_buy_side_reserved;
+            pos.fee_reserved = pos
+                .fee_reserved
+                .checked_add(order_fee_reserved)
+                .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
+            pos.margin_reserved_notional = pos
+                .buy_side_reserved_notional
+                .max(pos.sell_side_reserved_notional);
             pos.margin_reserved = new_max;
 
             // Persist order book state.
@@ -770,36 +1032,50 @@ fn rest_in_book<CTX: ContextTr>(
                     order_id: *order_id,
                     price,
                     amount: qty,
+                    maker_fee_bps,
                 },
             );
 
-            // Recompute how much sell-side margin this user now needs in total.
-            let new_sell_side_reserved = calc_sell_side_margin_reserved(
+            // Recompute sell-side notional, then derive margin once by leverage.
+            let new_sell_side_notional = calc_sell_side_reserved_notional(
                 &entries,
-                pos.leverage.max(1),
                 market.base_decimals,
                 market.price_decimals,
                 pos.amount,
             )?;
+            let new_sell_side_reserved = new_sell_side_notional / pos.leverage.max(1);
+            let order_fee_reserved =
+                calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
 
             // Under max-reservation, the wallet delta is the change in max(buy, sell).
             let old_max = pos
                 .buy_side_margin_reserved
                 .max(pos.sell_side_margin_reserved);
             let new_max = pos.buy_side_margin_reserved.max(new_sell_side_reserved);
-            if new_sell_side_reserved < pos.sell_side_margin_reserved {
+            if new_sell_side_notional < pos.sell_side_reserved_notional {
                 return Err(perp_invariant_err(format!(
-                    "sell-side reservation decreased after adding order: {} -> {}",
-                    pos.sell_side_margin_reserved, new_sell_side_reserved
+                    "sell-side reservation notional decreased after adding order: {} -> {}",
+                    pos.sell_side_reserved_notional, new_sell_side_notional
                 )));
             }
-            let delta = new_max.saturating_sub(old_max);
+            let margin_delta = new_max.saturating_sub(old_max);
+            let delta = margin_delta
+                .checked_add(order_fee_reserved)
+                .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
 
             if account.perp_wallet_balance < delta {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
             account.perp_wallet_balance -= delta;
+            pos.sell_side_reserved_notional = new_sell_side_notional;
             pos.sell_side_margin_reserved = new_sell_side_reserved;
+            pos.fee_reserved = pos
+                .fee_reserved
+                .checked_add(order_fee_reserved)
+                .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
+            pos.margin_reserved_notional = pos
+                .buy_side_reserved_notional
+                .max(pos.sell_side_reserved_notional);
             pos.margin_reserved = new_max;
 
             // Persist order book state.
@@ -886,18 +1162,32 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 .buy_side_margin_reserved
                 .max(pos.sell_side_margin_reserved);
             let mut entries = storage::load_buy_orders(context, user, market_id)?;
-            entries.retain(|e| &e.order_id != order_id);
-            let new_reserved = calc_buy_side_margin_reserved(
+            let cancelled_entry = remove_order_entry(&mut entries, order_id, "buy")?;
+            let new_notional = calc_buy_side_reserved_notional(
                 &entries,
-                pos.leverage.max(1),
                 market.base_decimals,
                 market.price_decimals,
                 pos.amount,
             )?;
+            let new_reserved = new_notional / pos.leverage.max(1);
             let new_max = new_reserved.max(pos.sell_side_margin_reserved);
             let freed = old_max.saturating_sub(new_max);
-            account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(freed);
+            let fee_freed = calc_maker_fee_for_order_qty_with_bps(
+                cancelled_entry.price,
+                cancelled_entry.amount,
+                cancelled_entry.maker_fee_bps,
+                market,
+            )?;
+            account.perp_wallet_balance = account
+                .perp_wallet_balance
+                .saturating_add(freed)
+                .saturating_add(fee_freed);
+            pos.buy_side_reserved_notional = new_notional;
             pos.buy_side_margin_reserved = new_reserved;
+            pos.fee_reserved = pos.fee_reserved.saturating_sub(fee_freed);
+            pos.margin_reserved_notional = pos
+                .buy_side_reserved_notional
+                .max(pos.sell_side_reserved_notional);
             pos.margin_reserved = new_max;
             storage::save_buy_orders(context, user, market_id, &entries)?;
         }
@@ -906,18 +1196,32 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 .buy_side_margin_reserved
                 .max(pos.sell_side_margin_reserved);
             let mut entries = storage::load_sell_orders(context, user, market_id)?;
-            entries.retain(|e| &e.order_id != order_id);
-            let new_reserved = calc_sell_side_margin_reserved(
+            let cancelled_entry = remove_order_entry(&mut entries, order_id, "sell")?;
+            let new_notional = calc_sell_side_reserved_notional(
                 &entries,
-                pos.leverage.max(1),
                 market.base_decimals,
                 market.price_decimals,
                 pos.amount,
             )?;
+            let new_reserved = new_notional / pos.leverage.max(1);
             let new_max = pos.buy_side_margin_reserved.max(new_reserved);
             let freed = old_max.saturating_sub(new_max);
-            account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(freed);
+            let fee_freed = calc_maker_fee_for_order_qty_with_bps(
+                cancelled_entry.price,
+                cancelled_entry.amount,
+                cancelled_entry.maker_fee_bps,
+                market,
+            )?;
+            account.perp_wallet_balance = account
+                .perp_wallet_balance
+                .saturating_add(freed)
+                .saturating_add(fee_freed);
+            pos.sell_side_reserved_notional = new_notional;
             pos.sell_side_margin_reserved = new_reserved;
+            pos.fee_reserved = pos.fee_reserved.saturating_sub(fee_freed);
+            pos.margin_reserved_notional = pos
+                .buy_side_reserved_notional
+                .max(pos.sell_side_reserved_notional);
             pos.margin_reserved = new_max;
             storage::save_sell_orders(context, user, market_id, &entries)?;
         }
@@ -984,56 +1288,6 @@ fn check_fok_feasibility<CTX: ContextTr>(
         Err(perp_err("placeOrder: FOK order cannot be fully filled"))
     } else {
         Ok(())
-    }
-}
-
-/// Returns `true` if the order can skip the matching engine entirely.
-///
-/// For PostOnly this also serves as the validity check — returns an error if the order
-/// would immediately cross. Reads best_bid / best_ask at most once per call.
-fn should_skip_match<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    side: Side,
-    price: u64,
-    order_type: OrderType,
-    tif: TimeInForce,
-) -> Result<bool, PrecompileError> {
-    if order_type != OrderType::Limit {
-        return Ok(false);
-    }
-    match tif {
-        TimeInForce::PostOnly => {
-            match side {
-                Side::Buy => {
-                    let best_ask = storage::load_best_ask(context, market_id)?;
-                    if best_ask != 0 && best_ask <= price {
-                        return Err(perp_err("placeOrder: PostOnly order would match"));
-                    }
-                }
-                Side::Sell => {
-                    let best_bid = storage::load_best_bid(context, market_id)?;
-                    if best_bid != 0 && best_bid >= price {
-                        return Err(perp_err("placeOrder: PostOnly order would match"));
-                    }
-                }
-            }
-            Ok(true)
-        }
-        TimeInForce::Gtc => {
-            let no_match = match side {
-                Side::Buy => {
-                    let best_ask = storage::load_best_ask(context, market_id)?;
-                    best_ask == 0 || best_ask > price
-                }
-                Side::Sell => {
-                    let best_bid = storage::load_best_bid(context, market_id)?;
-                    best_bid == 0 || best_bid < price
-                }
-            };
-            Ok(no_match)
-        }
-        _ => Ok(false),
     }
 }
 

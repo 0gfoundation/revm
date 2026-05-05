@@ -110,4 +110,7 @@ pub struct OrderEntry {
     pub price: u64,
     /// Remaining (unfilled) amount tracked for margin purposes.
     pub amount: u64,
+    /// Maker fee rate snapshotted when the order started resting.
+    #[serde(rename = "MFB")]
+    pub maker_fee_bps: u64,
 }

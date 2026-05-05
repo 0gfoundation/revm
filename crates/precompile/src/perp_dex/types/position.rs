@@ -23,12 +23,24 @@ pub struct PerpPosition {
     /// Total margin reserved for open orders (max of buy- and sell-side).
     #[serde(rename = "mr")]
     pub margin_reserved: u64,
+    /// Total open-order notional used to derive `margin_reserved`.
+    #[serde(default, rename = "mrn")]
+    pub margin_reserved_notional: u64,
     /// Margin reserved for the buy side of open orders.
     #[serde(rename = "br")]
     pub buy_side_margin_reserved: u64,
+    /// Buy-side open-order notional before leverage division.
+    #[serde(default, rename = "brn")]
+    pub buy_side_reserved_notional: u64,
     /// Margin reserved for the sell side of open orders.
     #[serde(rename = "sr")]
     pub sell_side_margin_reserved: u64,
+    /// Sell-side open-order notional before leverage division.
+    #[serde(default, rename = "srn")]
+    pub sell_side_reserved_notional: u64,
+    /// Total maker fee reserved for open orders (buy side + sell side).
+    #[serde(rename = "fr")]
+    pub fee_reserved: u64,
     /// Current leverage setting (1–20).
     #[serde(rename = "lv")]
     pub leverage: u64,
@@ -41,8 +53,12 @@ impl Default for PerpPosition {
             v_quote_balance: 0,
             margin: 0,
             margin_reserved: 0,
+            margin_reserved_notional: 0,
             buy_side_margin_reserved: 0,
+            buy_side_reserved_notional: 0,
             sell_side_margin_reserved: 0,
+            sell_side_reserved_notional: 0,
+            fee_reserved: 0,
             leverage: 1,
         }
     }

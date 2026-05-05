@@ -26,21 +26,24 @@ use primitives::{address, Address, U256};
 use crate::{
     perp_dex::{
         account::{
-            run_deposit, run_get_account, run_get_api_key, run_register_api_key,
-            run_revoke_api_key, run_transfer_from_perp, run_transfer_to_perp, run_withdraw,
+            run_deposit, run_get_account, run_get_api_key, run_get_user_fee_rates,
+            run_register_api_key, run_revoke_api_key, run_set_user_fee_rates,
+            run_transfer_from_perp, run_transfer_to_perp, run_withdraw,
         },
         interface::IPerpDex::{
-            addMarketCall, cancelOrderCall, cancelOrderSignedCall, depositCall, getAccountCall,
-            getAdminCall, getApiKeyCall, getBookLevelCall, getBookPricesCall, getMarkPriceCall,
-            getMarketCall, getOpenOrdersCall, getOrderCall, getPositionCall, initAdminCall,
-            liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
-            revokeApiKeyCall, setLeverageCall, setMarkPriceCall, transferAdminCall,
+            addMarketCall, addPositionMarginCall, cancelOrderCall, cancelOrderSignedCall,
+            depositCall, getAccountCall, getAdminCall, getApiKeyCall, getBookLevelCall,
+            getBookPricesCall, getMarkPriceCall, getMarketCall, getOpenOrdersCall, getOrderCall,
+            getPositionCall, getUserFeeRatesCall, initAdminCall, liquidateCall, placeOrderCall,
+            placeOrderSignedCall, registerApiKeyCall, removePositionMarginCall, revokeApiKeyCall,
+            setLeverageCall, setMarkPriceCall, setUserFeeRatesCall, transferAdminCall,
             transferFromPerpCall, transferToPerpCall, updateMarketCall, withdrawCall,
         },
         risk::{
-            run_add_market, run_get_admin, run_get_mark_price, run_get_market, run_get_position,
-            run_init_admin, run_liquidate, run_set_leverage, run_set_mark_price,
-            run_transfer_admin, run_update_market,
+            run_add_market, run_add_position_margin, run_get_admin, run_get_mark_price,
+            run_get_market, run_get_position, run_init_admin, run_liquidate,
+            run_remove_position_margin, run_set_leverage, run_set_mark_price, run_transfer_admin,
+            run_update_market,
         },
         trading::{
             run_cancel_order, run_cancel_order_signed, run_get_book_level, run_get_book_prices,
@@ -85,6 +88,8 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(transferToPerpCall::SELECTOR, (20_000, false));
         m.insert(transferFromPerpCall::SELECTOR, (20_000, false));
         m.insert(getAccountCall::SELECTOR, (5_000, true));
+        m.insert(setUserFeeRatesCall::SELECTOR, (30_000, false));
+        m.insert(getUserFeeRatesCall::SELECTOR, (5_000, true));
         // Market management (admin)
         m.insert(addMarketCall::SELECTOR, (100_000, false));
         m.insert(updateMarketCall::SELECTOR, (50_000, false));
@@ -102,6 +107,8 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getBookLevelCall::SELECTOR, (20_000, true));
         // Positions
         m.insert(getPositionCall::SELECTOR, (5_000, true));
+        m.insert(addPositionMarginCall::SELECTOR, (30_000, false));
+        m.insert(removePositionMarginCall::SELECTOR, (30_000, false));
         // Liquidation
         m.insert(liquidateCall::SELECTOR, (150_000, false));
         // API key management
@@ -190,6 +197,10 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
             run_transfer_from_perp(input_bytes, caller, context)
         }
         s if s == getAccountCall::SELECTOR => run_get_account(input_bytes, context),
+        s if s == setUserFeeRatesCall::SELECTOR => {
+            run_set_user_fee_rates(input_bytes, caller, context)
+        }
+        s if s == getUserFeeRatesCall::SELECTOR => run_get_user_fee_rates(input_bytes, context),
         // Market management
         s if s == addMarketCall::SELECTOR => run_add_market(input_bytes, caller, context),
         s if s == updateMarketCall::SELECTOR => run_update_market(input_bytes, caller, context),
@@ -207,6 +218,12 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         s if s == getBookLevelCall::SELECTOR => run_get_book_level(input_bytes, context),
         // Positions
         s if s == getPositionCall::SELECTOR => run_get_position(input_bytes, context),
+        s if s == addPositionMarginCall::SELECTOR => {
+            run_add_position_margin(input_bytes, caller, context)
+        }
+        s if s == removePositionMarginCall::SELECTOR => {
+            run_remove_position_margin(input_bytes, caller, context)
+        }
         // Liquidation
         s if s == liquidateCall::SELECTOR => run_liquidate(input_bytes, caller, context),
         // API key management

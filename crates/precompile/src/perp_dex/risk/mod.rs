@@ -9,9 +9,10 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         interface::IPerpDex::{
-            self, addMarketCall, getAdminCall, getMarkPriceCall, getMarketCall, getMarketReturn,
-            getPositionCall, getPositionReturn, initAdminCall, liquidateCall, setLeverageCall,
-            setMarkPriceCall, transferAdminCall, updateMarketCall,
+            self, addMarketCall, addPositionMarginCall, getAdminCall, getMarkPriceCall,
+            getMarketCall, getMarketReturn, getPositionCall, getPositionReturn, initAdminCall,
+            liquidateCall, removePositionMarginCall, setLeverageCall, setMarkPriceCall,
+            transferAdminCall, updateMarketCall,
         },
         math::{calc_value, is_above_maintenance_margin},
         storage,
@@ -309,7 +310,9 @@ pub fn run_get_market<CTX: ContextTr>(
 
 /// `setLeverage(uint64 marketId, uint64 leverage)`
 ///
-/// Only allowed when the user has no open position in the market.
+/// Users with an open position may only increase leverage.
+/// Users without an open position may increase or decrease leverage, provided
+/// any open-order margin reserve increase can be funded from their perp wallet.
 pub fn run_set_leverage<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -325,11 +328,15 @@ pub fn run_set_leverage<CTX: ContextTr>(
         .ok_or_else(|| perp_err("setLeverage: unknown market"))?;
 
     let mut pos = storage::load_position(context, caller, args.marketId)?;
-    if pos.amount != 0 {
+    let old_leverage = pos.leverage.max(1);
+    let new_leverage = args.leverage;
+    if pos.amount != 0 && new_leverage < old_leverage {
         return Err(perp_err(
-            "setLeverage: cannot change leverage with open position",
+            "setLeverage: cannot reduce leverage with open position",
         ));
     }
+
+    rebalance_order_margin_for_leverage(context, caller, &mut pos, new_leverage)?;
     pos.leverage = args.leverage;
     storage::save_position(context, caller, args.marketId, &pos)?;
 
@@ -370,6 +377,100 @@ pub fn run_get_position<CTX: ContextTr>(
 
 // ── Liquidation ───────────────────────────────────────────────────────────────
 
+/// `addPositionMargin(uint64 marketId, uint64 amount)`
+pub fn run_add_position_margin<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = addPositionMarginCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("addPositionMargin: invalid calldata"))?;
+    if args.amount == 0 {
+        return Err(perp_err("addPositionMargin: amount must be > 0"));
+    }
+    if args.amount > i64::MAX as u64 {
+        return Err(perp_err("addPositionMargin: amount exceeds i64::MAX"));
+    }
+    storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("addPositionMargin: unknown market"))?;
+
+    let mut pos = storage::load_position(context, caller, args.marketId)?;
+    if pos.amount == 0 {
+        return Err(perp_err("addPositionMargin: no open position"));
+    }
+    let mut account = storage::load_account(context, caller)?;
+    if account.perp_wallet_balance < args.amount {
+        return Err(perp_err(
+            "addPositionMargin: insufficient perp wallet balance",
+        ));
+    }
+
+    account.perp_wallet_balance -= args.amount;
+    pos.margin = pos
+        .margin
+        .checked_add(args.amount as i64)
+        .ok_or_else(|| perp_err("addPositionMargin: margin overflow"))?;
+
+    storage::save_account(context, caller, account)?;
+    storage::save_position(context, caller, args.marketId, &pos)?;
+    emit_position_margin_adjusted(context, caller, args.marketId, args.amount as i64, &pos);
+    emit_position_changed(context, caller, args.marketId, &pos);
+    Ok(Bytes::new())
+}
+
+/// `removePositionMargin(uint64 marketId, uint64 amount)`
+pub fn run_remove_position_margin<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = removePositionMarginCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("removePositionMargin: invalid calldata"))?;
+    if args.amount == 0 {
+        return Err(perp_err("removePositionMargin: amount must be > 0"));
+    }
+    if args.amount > i64::MAX as u64 {
+        return Err(perp_err("removePositionMargin: amount exceeds i64::MAX"));
+    }
+    let market = storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("removePositionMargin: unknown market"))?;
+    let mark_price = storage::load_mark_price(context, args.marketId)?;
+
+    let mut pos = storage::load_position(context, caller, args.marketId)?;
+    if pos.amount == 0 {
+        return Err(perp_err("removePositionMargin: no open position"));
+    }
+    if pos.margin < args.amount as i64 {
+        return Err(perp_err(
+            "removePositionMargin: insufficient position margin",
+        ));
+    }
+    let new_margin = pos.margin - args.amount as i64;
+    let required_initial_margin = calc_value(
+        mark_price,
+        pos.amount.unsigned_abs(),
+        market.base_decimals,
+        market.price_decimals,
+    )? / pos.leverage.max(1);
+    if new_margin < required_initial_margin as i64 {
+        return Err(perp_err(
+            "removePositionMargin: resulting margin below initial margin requirement",
+        ));
+    }
+
+    let mut account = storage::load_account(context, caller)?;
+    account.perp_wallet_balance = account
+        .perp_wallet_balance
+        .checked_add(args.amount)
+        .ok_or_else(|| perp_err("removePositionMargin: wallet balance overflow"))?;
+    pos.margin = new_margin;
+
+    storage::save_account(context, caller, account)?;
+    storage::save_position(context, caller, args.marketId, &pos)?;
+    emit_position_margin_adjusted(context, caller, args.marketId, -(args.amount as i64), &pos);
+    emit_position_changed(context, caller, args.marketId, &pos);
+    Ok(Bytes::new())
+}
 /// `liquidate(address user, uint64 marketId)`
 ///
 /// Anyone can call this to liquidate an under-margined position.
@@ -449,6 +550,85 @@ pub fn run_liquidate<CTX: ContextTr>(
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    pos: &mut crate::perp_dex::types::PerpPosition,
+    new_leverage: u64,
+) -> Result<(), PrecompileError> {
+    let new_buy_reserved = pos.buy_side_reserved_notional / new_leverage;
+    let new_sell_reserved = pos.sell_side_reserved_notional / new_leverage;
+    let old_reserved = pos.margin_reserved;
+    let new_reserved = new_buy_reserved.max(new_sell_reserved);
+
+    if new_reserved > old_reserved {
+        let delta = new_reserved - old_reserved;
+        let mut account = storage::load_account(context, user)?;
+        if account.perp_wallet_balance < delta {
+            return Err(perp_err(
+                "setLeverage: insufficient perp wallet for order margin",
+            ));
+        }
+        account.perp_wallet_balance -= delta;
+        storage::save_account(context, user, account)?;
+    } else if old_reserved > new_reserved {
+        let delta = old_reserved - new_reserved;
+        let mut account = storage::load_account(context, user)?;
+        account.perp_wallet_balance = account
+            .perp_wallet_balance
+            .checked_add(delta)
+            .ok_or_else(|| perp_err("setLeverage: wallet balance overflow"))?;
+        storage::save_account(context, user, account)?;
+    }
+
+    pos.buy_side_margin_reserved = new_buy_reserved;
+    pos.sell_side_margin_reserved = new_sell_reserved;
+    pos.margin_reserved_notional = pos
+        .buy_side_reserved_notional
+        .max(pos.sell_side_reserved_notional);
+    pos.margin_reserved = new_reserved;
+    Ok(())
+}
+
+fn emit_position_changed<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    pos: &crate::perp_dex::types::PerpPosition,
+) {
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::PositionChanged {
+            user,
+            marketId: market_id,
+            amount: pos.amount,
+            vQuoteBalance: pos.v_quote_balance,
+            margin: pos.margin,
+            leverage: pos.leverage,
+        }
+        .to_log_data(),
+    });
+}
+
+fn emit_position_margin_adjusted<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    delta: i64,
+    pos: &crate::perp_dex::types::PerpPosition,
+) {
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::PositionMarginAdjusted {
+            user,
+            marketId: market_id,
+            delta,
+            margin: pos.margin,
+        }
+        .to_log_data(),
+    });
+}
 
 fn require_admin<CTX: ContextTr>(
     caller: Address,
@@ -559,20 +739,27 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     }
     storage::save_sell_orders(context, user, market_id, &[])?;
 
-    // Recalculate margin reserved (now 0 since all orders cancelled).
+    // Recalculate reserves (now 0 since all orders cancelled).
     let mut pos = storage::load_position(context, user, market_id)?;
-    let released_margin = pos.margin_reserved;
-    if released_margin > 0 {
+    let released = pos
+        .margin_reserved
+        .checked_add(pos.fee_reserved)
+        .ok_or_else(|| perp_err("cancelAllOrders: released reserve overflow"))?;
+    if released > 0 {
         let mut account = storage::load_account(context, user)?;
         account.perp_wallet_balance = account
             .perp_wallet_balance
-            .checked_add(released_margin)
+            .checked_add(released)
             .ok_or_else(|| perp_err("cancelAllOrders: wallet balance overflow"))?;
         storage::save_account(context, user, account)?;
     }
     pos.buy_side_margin_reserved = 0;
+    pos.buy_side_reserved_notional = 0;
     pos.sell_side_margin_reserved = 0;
+    pos.sell_side_reserved_notional = 0;
     pos.margin_reserved = 0;
+    pos.margin_reserved_notional = 0;
+    pos.fee_reserved = 0;
     storage::save_position(context, user, market_id, &pos)?;
 
     Ok(())

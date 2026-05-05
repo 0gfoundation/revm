@@ -11,7 +11,7 @@ use crate::{
     journal::{load_bytes, store_bytes},
     perp_dex::{
         errors::perp_err,
-        types::{Market, Order, OrderEntry, PerpPosition, UserAccount},
+        types::{Market, Order, OrderEntry, PerpPosition, UserAccount, UserFeeRates},
         PERP_DEX_ADDRESS,
     },
     stateful_precompiles::convert_db_err,
@@ -22,7 +22,7 @@ use keys::{
     account_key, admin_key, api_key_key, ask_level_key, ask_prices_key, best_ask_key, best_bid_key,
     bid_level_key, bid_prices_key, erc20_balance_slot, mark_price_key, market_key,
     open_interest_key, order_key, position_key, trade_count_key, user_buy_orders_key,
-    user_nonce_key, user_sell_orders_key,
+    user_fee_rates_key, user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -90,6 +90,26 @@ pub fn save_account<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let buf = encode(&account)?;
     store_blob(context, account_key(user), &buf)
+}
+
+pub fn load_user_fee_rates<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+) -> Result<UserFeeRates, PrecompileError> {
+    let buf = load_blob(context, user_fee_rates_key(user))?;
+    if buf.is_empty() {
+        return Ok(UserFeeRates::default());
+    }
+    decode(&buf)
+}
+
+pub fn save_user_fee_rates<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    rates: UserFeeRates,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&rates)?;
+    store_blob(context, user_fee_rates_key(user), &buf)
 }
 
 // ── ERC-20 balance helpers ─────────────────────────────────────────────────────

@@ -5,14 +5,18 @@ use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId};
 
 use crate::perp_dex::{
+    account::{run_get_user_fee_rates, run_set_user_fee_rates},
     interface::IPerpDex::{
-        depositCall, getAccountCall, transferFromPerpCall, transferToPerpCall, withdrawCall,
+        depositCall, getAccountCall, getUserFeeRatesCall, setUserFeeRatesCall,
+        transferFromPerpCall, transferToPerpCall, withdrawCall,
     },
+    storage,
     storage::keys::erc20_balance_slot,
     USDC_ADDRESS,
 };
 
 const ALICE: Address = address!("1111111111111111111111111111111111111111");
+const ADMIN: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
 type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
 
@@ -21,7 +25,7 @@ fn make_ctx(alice_usdc: U256) -> TestCtx {
     db.insert_account_storage(USDC_ADDRESS, erc20_balance_slot(ALICE).into(), alice_usdc)
         .unwrap();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
-    for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE] {
+    for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
     }
     ctx
@@ -33,6 +37,12 @@ fn decode_get_account(bytes: &Bytes) -> (U256, u64) {
     (usdc, perp)
 }
 
+fn decode_user_fee_rates(bytes: &Bytes) -> (u64, u64) {
+    let maker = U256::from_be_slice(&bytes[..32]).to::<u64>();
+    let taker = U256::from_be_slice(&bytes[32..64]).to::<u64>();
+    (maker, taker)
+}
+
 #[test]
 fn deposit_moves_usdc_to_internal_account() {
     let amount = U256::from(1_000_000u64);
@@ -41,6 +51,38 @@ fn deposit_moves_usdc_to_internal_account() {
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
     let (usdc, _perp) = decode_get_account(&ret);
     assert_eq!(usdc, amount);
+}
+
+#[test]
+fn get_user_fee_rates_defaults_to_zero() {
+    let mut ctx = make_ctx(U256::ZERO);
+
+    let ret = run_get_user_fee_rates(&getUserFeeRatesCall { user: ALICE }.abi_encode(), &mut ctx)
+        .unwrap();
+
+    assert_eq!(decode_user_fee_rates(&ret), (0, 0));
+}
+
+#[test]
+fn admin_can_set_user_fee_rates() {
+    let mut ctx = make_ctx(U256::ZERO);
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+
+    run_set_user_fee_rates(
+        &setUserFeeRatesCall {
+            user: ALICE,
+            makerFeeBps: 2,
+            takerFeeBps: 5,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+    let ret = run_get_user_fee_rates(&getUserFeeRatesCall { user: ALICE }.abi_encode(), &mut ctx)
+        .unwrap();
+
+    assert_eq!(decode_user_fee_rates(&ret), (2, 5));
 }
 
 #[test]

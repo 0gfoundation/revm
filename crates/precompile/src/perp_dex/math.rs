@@ -17,6 +17,8 @@ pub const CLAMP_LOWER_BOUND: i128 = -500_000;
 pub const INTEREST_RATE: i128 = 100_000;
 /// Maintenance margin = notional / 6, approximately 16.67%.
 pub const MAINTENANCE_MARGIN_DENOMINATOR: i128 = 6;
+/// Trading fee denominator. 1 basis point = 1 / 10_000.
+pub const FEE_BPS_DENOMINATOR: u64 = 10_000;
 
 #[inline]
 fn pow10_u128(exp: u32) -> Result<u128, PrecompileError> {
@@ -50,6 +52,16 @@ pub fn calc_value(
         .ok_or_else(|| perp_err("math: value denominator overflow"))?;
     let value = numerator / denominator;
     u64::try_from(value).map_err(|_| perp_err("math: value exceeds u64"))
+}
+
+/// Trading fee in quote units, rounded down.
+#[inline]
+pub fn calc_trading_fee(notional: u64, fee_bps: u64) -> Result<u64, PrecompileError> {
+    let fee = (notional as u128)
+        .checked_mul(fee_bps as u128)
+        .ok_or_else(|| perp_err("math: trading fee overflow"))?
+        / FEE_BPS_DENOMINATOR as u128;
+    u64::try_from(fee).map_err(|_| perp_err("math: trading fee exceeds u64"))
 }
 
 /// Signed version of `calc_value` for negative quantities.
@@ -224,12 +236,11 @@ pub fn calc_funding_fee(
     i64::try_from(fee).map_err(|_| perp_err("math: funding fee exceeds i64"))
 }
 
-/// Recalculate the buy-side margin reserve from the current buy-order list.
+/// Recalculate the buy-side opening notional from the current buy-order list.
 /// `buy_entries` must be sorted by price descending.
 /// `position_amount` is the current net position before this order list.
-pub fn calc_buy_side_margin_reserved(
+pub fn calc_buy_side_reserved_notional(
     buy_entries: &[OrderEntry],
-    leverage: u64,
     base_decimals: u32,
     price_decimals: u32,
     position_amount: i64,
@@ -241,7 +252,7 @@ pub fn calc_buy_side_margin_reserved(
             .checked_neg()
             .ok_or_else(|| perp_err("math: position amount overflow"))?
     };
-    let mut reserved = 0u64;
+    let mut reserved_notional = 0u64;
     for e in buy_entries {
         remaining = remaining
             .checked_sub(e.amount as i64)
@@ -251,21 +262,40 @@ pub fn calc_buy_side_margin_reserved(
                 .checked_neg()
                 .ok_or_else(|| perp_err("math: buy net open overflow"))?
                 as u64;
-            let margin = calc_value(e.price, net_open, base_decimals, price_decimals)? / leverage;
-            reserved = reserved
-                .checked_add(margin)
-                .ok_or_else(|| perp_err("math: buy margin reserve overflow"))?;
+            let notional = calc_value(e.price, net_open, base_decimals, price_decimals)?;
+            reserved_notional = reserved_notional
+                .checked_add(notional)
+                .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
             remaining = 0;
         }
     }
-    Ok(reserved)
+    Ok(reserved_notional)
 }
 
-/// Recalculate the sell-side margin reserve from the current sell-order list.
-/// `sell_entries` must be sorted by price ascending.
-pub fn calc_sell_side_margin_reserved(
-    sell_entries: &[OrderEntry],
+/// Recalculate the buy-side margin reserve from the current buy-order list.
+/// Rounding happens once after summing all opening notional.
+pub fn calc_buy_side_margin_reserved(
+    buy_entries: &[OrderEntry],
     leverage: u64,
+    base_decimals: u32,
+    price_decimals: u32,
+    position_amount: i64,
+) -> Result<u64, PrecompileError> {
+    if leverage == 0 {
+        return Err(perp_err("math: leverage cannot be zero"));
+    }
+    Ok(calc_buy_side_reserved_notional(
+        buy_entries,
+        base_decimals,
+        price_decimals,
+        position_amount,
+    )? / leverage)
+}
+
+/// Recalculate the sell-side opening notional from the current sell-order list.
+/// `sell_entries` must be sorted by price ascending.
+pub fn calc_sell_side_reserved_notional(
+    sell_entries: &[OrderEntry],
     base_decimals: u32,
     price_decimals: u32,
     position_amount: i64,
@@ -275,7 +305,7 @@ pub fn calc_sell_side_margin_reserved(
     } else {
         position_amount
     };
-    let mut reserved = 0u64;
+    let mut reserved_notional = 0u64;
     for e in sell_entries {
         remaining = remaining
             .checked_sub(e.amount as i64)
@@ -285,12 +315,32 @@ pub fn calc_sell_side_margin_reserved(
                 .checked_neg()
                 .ok_or_else(|| perp_err("math: sell net open overflow"))?
                 as u64;
-            let margin = calc_value(e.price, net_open, base_decimals, price_decimals)? / leverage;
-            reserved = reserved
-                .checked_add(margin)
-                .ok_or_else(|| perp_err("math: sell margin reserve overflow"))?;
+            let notional = calc_value(e.price, net_open, base_decimals, price_decimals)?;
+            reserved_notional = reserved_notional
+                .checked_add(notional)
+                .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
             remaining = 0;
         }
     }
-    Ok(reserved)
+    Ok(reserved_notional)
+}
+
+/// Recalculate the sell-side margin reserve from the current sell-order list.
+/// Rounding happens once after summing all opening notional.
+pub fn calc_sell_side_margin_reserved(
+    sell_entries: &[OrderEntry],
+    leverage: u64,
+    base_decimals: u32,
+    price_decimals: u32,
+    position_amount: i64,
+) -> Result<u64, PrecompileError> {
+    if leverage == 0 {
+        return Err(perp_err("math: leverage cannot be zero"));
+    }
+    Ok(calc_sell_side_reserved_notional(
+        sell_entries,
+        base_decimals,
+        price_decimals,
+        position_amount,
+    )? / leverage)
 }

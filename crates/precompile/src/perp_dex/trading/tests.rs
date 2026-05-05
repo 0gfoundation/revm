@@ -16,6 +16,7 @@ use crate::perp_dex::{
 const ALICE: Address = address!("1111111111111111111111111111111111111111");
 const BOB: Address = address!("2222222222222222222222222222222222222222");
 const CAROL: Address = address!("3333333333333333333333333333333333333333");
+const ADMIN: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
 const MARKET_ID: u64 = 1;
 /// 1 tick = $1 when the test market uses price_decimals = 9.
@@ -29,6 +30,8 @@ const QTY: u64 = 1_000_000;
 const FILL_VALUE: u64 = 1_000_000;
 /// Initial margin at leverage 1 = FILL_VALUE / 1.
 const INIT_MARGIN: u64 = FILL_VALUE;
+const TAKER_FEE: u64 = 0;
+const MAKER_FEE: u64 = 0;
 /// Starting perp wallet balance per user (10 USDC = 10_000_000 in 6-decimal units).
 const WALLET: u64 = 10_000_000;
 
@@ -39,7 +42,7 @@ type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>,
 fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
-    for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, BOB, CAROL] {
+    for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, BOB, CAROL, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
     }
     ctx
@@ -47,6 +50,7 @@ fn make_ctx() -> TestCtx {
 
 /// Register the default BTC-perp market and fund ALICE + BOB with WALLET.
 fn setup(ctx: &mut TestCtx) {
+    storage::save_admin(ctx, ADMIN).unwrap();
     storage::save_market(
         ctx,
         &Market {
@@ -278,7 +282,8 @@ fn resting_buy_reserves_margin_from_perp_wallet() {
 
     // buy_side_margin_reserved = calc_value(PRICE, QTY, 8, 9) / leverage(1) = FILL_VALUE
     assert_eq!(pos(&mut ctx, ALICE).buy_side_margin_reserved, INIT_MARGIN);
-    assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN);
+    assert_eq!(pos(&mut ctx, ALICE).fee_reserved, MAKER_FEE);
+    assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN - MAKER_FEE);
 }
 
 #[test]
@@ -290,7 +295,8 @@ fn resting_sell_reserves_margin_from_perp_wallet() {
 
     // sell_side_margin_reserved = calc_value(PRICE, QTY, 8, 9) / leverage(1) = FILL_VALUE
     assert_eq!(pos(&mut ctx, BOB).sell_side_margin_reserved, INIT_MARGIN);
-    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
+    assert_eq!(pos(&mut ctx, BOB).fee_reserved, MAKER_FEE);
+    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN - MAKER_FEE);
 }
 
 #[test]
@@ -323,7 +329,12 @@ fn margin_uses_market_price_decimals() {
         pos(&mut ctx, ALICE).buy_side_margin_reserved,
         expected_margin
     );
-    assert_eq!(wallet(&mut ctx, ALICE), 200_000_000 - expected_margin);
+    let expected_maker_fee = 0;
+    assert_eq!(pos(&mut ctx, ALICE).fee_reserved, expected_maker_fee);
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        200_000_000 - expected_margin - expected_maker_fee
+    );
 }
 
 #[test]
@@ -394,15 +405,36 @@ fn fill_opens_correct_long_and_short_positions() {
 #[test]
 fn fill_debits_init_margin_from_both_wallets() {
     // Maker reserves margin when resting; that reservation is released then
-    // re-spent as initial margin on fill.  Net effect: both sides lose INIT_MARGIN.
+    // re-spent as initial margin on fill. Fees are charged on top and credited
+    // to the admin fee recipient.
     let mut ctx = make_ctx();
     setup(&mut ctx);
 
     place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy
 
-    assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN);
-    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
+    assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN - TAKER_FEE);
+    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN - MAKER_FEE);
+    assert_eq!(wallet(&mut ctx, ADMIN), TAKER_FEE + MAKER_FEE);
+}
+
+#[test]
+fn maker_fill_consumes_reserved_fee_instead_of_position_margin() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask reserves margin + maker fee
+    let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
+    bob.perp_wallet_balance = 0;
+    storage::save_account(&mut ctx, BOB, bob).unwrap();
+
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy
+
+    let bob_pos = pos(&mut ctx, BOB);
+    assert_eq!(bob_pos.margin, INIT_MARGIN as i64);
+    assert_eq!(bob_pos.fee_reserved, 0);
+    assert_eq!(wallet(&mut ctx, BOB), 0);
+    assert_eq!(wallet(&mut ctx, ADMIN), TAKER_FEE + MAKER_FEE);
 }
 
 #[test]
@@ -435,6 +467,88 @@ fn fill_rejects_when_taker_wallet_cannot_cover_opening_margin() {
 }
 
 #[test]
+fn taker_reverse_uses_released_close_margin_before_opening_margin_check() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: -(QTY as i64),
+            v_quote_balance: FILL_VALUE as i64,
+            margin: INIT_MARGIN as i64,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+    let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
+    alice.perp_wallet_balance = 0;
+    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+
+    place(&mut ctx, BOB, 1, PRICE, QTY * 2, 0, 0); // resting ask
+    let market_buy = place(&mut ctx, ALICE, 0, 0, QTY * 2, 1, 1);
+
+    assert_eq!(get_order(&mut ctx, market_buy).status, OrderStatus::Filled);
+    assert_eq!(wallet(&mut ctx, ALICE), 0);
+    assert_eq!(
+        pos(&mut ctx, ALICE),
+        PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -(FILL_VALUE as i64),
+            margin: (INIT_MARGIN - TAKER_FEE * 2) as i64,
+            leverage: 1,
+            ..PerpPosition::default()
+        }
+    );
+}
+
+#[test]
+fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    fund(&mut ctx, CAROL, WALLET);
+
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: -(QTY as i64),
+            v_quote_balance: FILL_VALUE as i64,
+            margin: INIT_MARGIN as i64,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+    let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
+    alice.perp_wallet_balance = 0;
+    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+
+    let close_price = PRICE - 10 * TICK; // $90
+    let open_price = PRICE + 10 * TICK; // $110
+    let open_value = 1_100_000;
+    let taker_fee = 0;
+
+    place(&mut ctx, BOB, 1, close_price, QTY, 0, 0);
+    place(&mut ctx, CAROL, 1, open_price, QTY, 0, 0);
+    place(&mut ctx, ALICE, 0, 0, QTY * 2, 1, 1);
+
+    assert_eq!(
+        pos(&mut ctx, ALICE),
+        PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -(open_value as i64),
+            margin: (open_value - taker_fee) as i64,
+            leverage: 1,
+            ..PerpPosition::default()
+        }
+    );
+    assert_eq!(wallet(&mut ctx, ALICE), 0);
+}
+
+#[test]
 fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
@@ -447,7 +561,7 @@ fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
 
     let low_buy_margin = 980_000;
     let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
-    alice.perp_wallet_balance = INIT_MARGIN - low_buy_margin;
+    alice.perp_wallet_balance = INIT_MARGIN + TAKER_FEE - low_buy_margin;
     storage::save_account(&mut ctx, ALICE, alice).unwrap();
 
     let market_buy = place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);

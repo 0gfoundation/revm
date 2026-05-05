@@ -22,6 +22,10 @@ sol! {
         function transferFromPerp(uint64 amount) external;
         /// Query a user's full account balances.
         function getAccount(address user) external view returns (uint256 usdcBalance, uint64 perpWalletBalance);
+        /// Set per-user trading fee rates in basis points. Only callable by admin.
+        function setUserFeeRates(address user, uint64 makerFeeBps, uint64 takerFeeBps) external;
+        /// Query per-user trading fee rates in basis points. Unset users default to zero.
+        function getUserFeeRates(address user) external view returns (uint64 makerFeeBps, uint64 takerFeeBps);
 
         // ── Market management (admin only) ─────────────────────────────────
         /// Register a new perpetual market.
@@ -99,6 +103,10 @@ sol! {
             uint64 marginReserved,
             uint64 leverage
         );
+        /// Add isolated margin from the caller's perp wallet to an open position.
+        function addPositionMargin(uint64 marketId, uint64 amount) external;
+        /// Remove isolated margin from an open position back to the caller's perp wallet.
+        function removePositionMargin(uint64 marketId, uint64 amount) external;
 
         // ── Liquidation ───────────────────────────────────────────────────
         /// Liquidate an under-margined position (anyone can call).
@@ -154,6 +162,7 @@ sol! {
         // Feeds: internal wallet movement history
         event TransferToPerp(address indexed user, uint64 amount);
         event TransferFromPerp(address indexed user, uint64 amount);
+        event UserFeeRatesUpdated(address indexed user, uint64 makerFeeBps, uint64 takerFeeBps);
 
         // Emitted once per accepted placeOrder / placeOrderSigned call, before any matching.
         // Fires only when validation passes; a reverted tx emits nothing.
@@ -173,6 +182,8 @@ sol! {
 
         // Feeds: /positionRisk (history), /income (REALIZED_PNL — derived from vQuoteBalance delta)
         event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage);
+        // Feeds: isolated margin adjustment history. delta > 0 means add margin; delta < 0 means remove margin.
+        event PositionMarginAdjusted(address indexed user, uint64 indexed marketId, int64 delta, int64 margin);
         // Feeds: useful for debugging / audit; no direct REST endpoint
         event LeverageChanged(address indexed user, uint64 indexed marketId, uint64 leverage);
 
