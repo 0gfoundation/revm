@@ -36,15 +36,16 @@ use crate::{
             getBookLevelCall, getBookPricesCall, getMarkPriceCall, getMarketCall, getOpenOrdersCall,
             getOrderCall, getPositionCall, getUserFeeRatesCall, initAdminCall, liquidateCall,
             placeOrderCall, placeOrderSignedCall, registerApiKeyCall, removePositionMarginCall,
-            revokeApiKeyCall, setLeverageCall, setMarkPriceCall, setUserFeeRatesCall,
+            revokeApiKeyCall, setLeverageCall, setLeverageSignedCall, setMarkPriceCall,
+            setUserFeeRatesCall,
             transferAdminCall, transferFromPerpCall, transferToPerpCall, updateMarketCall,
             withdrawCall,
         },
         risk::{
             run_add_market, run_add_position_margin, run_get_admin, run_get_mark_price,
             run_get_market, run_get_position, run_init_admin, run_liquidate,
-            run_remove_position_margin, run_set_leverage, run_set_mark_price, run_transfer_admin,
-            run_update_market,
+            run_remove_position_margin, run_set_leverage, run_set_leverage_signed,
+            run_set_mark_price, run_transfer_admin, run_update_market,
         },
         trading::{
             run_cancel_order, run_cancel_order_signed, run_get_book_level, run_get_book_prices,
@@ -99,6 +100,7 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getMarketCall::SELECTOR, (5_000, true));
         // Leverage
         m.insert(setLeverageCall::SELECTOR, (20_000, false));
+        m.insert(setLeverageSignedCall::SELECTOR, (20_000, false));
         // Trading
         m.insert(placeOrderCall::SELECTOR, (200_000, false));
         m.insert(cancelOrderCall::SELECTOR, (80_000, false));
@@ -211,6 +213,9 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         s if s == getMarketCall::SELECTOR => run_get_market(input_bytes, context),
         // Leverage
         s if s == setLeverageCall::SELECTOR => run_set_leverage(input_bytes, caller, context),
+        s if s == setLeverageSignedCall::SELECTOR => {
+            run_set_leverage_signed(input_bytes, context)
+        }
         // Trading
         s if s == placeOrderCall::SELECTOR => run_place_order(input_bytes, caller, context),
         s if s == cancelOrderCall::SELECTOR => run_cancel_order(input_bytes, caller, context),

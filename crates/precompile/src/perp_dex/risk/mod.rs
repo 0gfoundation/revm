@@ -2,7 +2,8 @@
 
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
-use context::{ContextTr, JournalTr};
+use context::{Block as BlockTr, ContextTr, JournalTr};
+use ed25519_dalek::{Signature, VerifyingKey};
 use primitives::{Address, Bytes, FixedBytes, Log};
 
 use crate::{
@@ -11,13 +12,16 @@ use crate::{
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, getAdminCall, getMarkPriceCall,
             getMarketCall, getMarketReturn, getPositionCall, getPositionReturn, initAdminCall,
-            liquidateCall, removePositionMarginCall, setLeverageCall, setMarkPriceCall,
-            transferAdminCall, updateMarketCall,
+            liquidateCall, removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
+            setMarkPriceCall, transferAdminCall, updateMarketCall,
         },
         math::{calc_value, is_above_maintenance_margin},
         storage,
-        trading::{can_fully_liquidate_on_book, execute_liquidation_market_order},
-        types::{Market, Side},
+        trading::{
+            can_fully_liquidate_on_book, check_api_key_expiry, check_recv_window,
+            execute_liquidation_market_order, verify_ed25519,
+        },
+        types::{ApiKey, Market, Side},
         PERP_DEX_ADDRESS,
     },
     PrecompileError,
@@ -309,10 +313,6 @@ pub fn run_get_market<CTX: ContextTr>(
 // ── Leverage ──────────────────────────────────────────────────────────────────
 
 /// `setLeverage(uint64 marketId, uint64 leverage)`
-///
-/// Users with an open position may only increase leverage.
-/// Users without an open position may increase or decrease leverage, provided
-/// any open-order margin reserve increase can be funded from their perp wallet.
 pub fn run_set_leverage<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -320,32 +320,74 @@ pub fn run_set_leverage<CTX: ContextTr>(
 ) -> Result<Bytes, PrecompileError> {
     let args = setLeverageCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("setLeverage: invalid calldata"))?;
+    set_leverage_core(context, caller, args.marketId, args.leverage)
+}
 
-    if args.leverage == 0 || args.leverage > 20 {
+/// `setLeverageSigned(address account, uint64 marketId, uint64 leverage, uint64 timestamp, uint64 recvWindow, uint8 keyId, bytes signature)`
+pub fn run_set_leverage_signed<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = setLeverageSignedCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("setLeverageSigned: invalid calldata"))?;
+
+    let api_key = storage::load_api_key(context, args.account, args.keyId)?
+        .ok_or_else(|| perp_err("setLeverageSigned: no api key registered for account"))?;
+
+    check_recv_window(context, args.timestamp, args.recvWindow)
+        .map_err(|e| perp_err(&format!("setLeverageSigned: {e}")))?;
+
+    check_api_key_expiry(context, &api_key)
+        .map_err(|e| perp_err(&format!("setLeverageSigned: {e}")))?;
+
+    // Canonical message (fixed-layout, 72 bytes):
+    //   "perpdex_v1_leverage"(19) || account(20) || marketId(8) || leverage(8)
+    //   || timestamp(8) || recvWindow(8) || keyId(1)
+    let mut msg = [0u8; 72];
+    msg[..19].copy_from_slice(b"perpdex_v1_leverage");
+    msg[19..39].copy_from_slice(args.account.as_slice());
+    msg[39..47].copy_from_slice(&args.marketId.to_be_bytes());
+    msg[47..55].copy_from_slice(&args.leverage.to_be_bytes());
+    msg[55..63].copy_from_slice(&args.timestamp.to_be_bytes());
+    msg[63..71].copy_from_slice(&args.recvWindow.to_be_bytes());
+    msg[71] = args.keyId;
+
+    verify_ed25519(&api_key.pubkey, &msg, &args.signature)
+        .map_err(|e| perp_err(&format!("setLeverageSigned: {e}")))?;
+
+    set_leverage_core(context, args.account, args.marketId, args.leverage)
+}
+
+fn set_leverage_core<CTX: ContextTr>(
+    context: &mut CTX,
+    account: Address,
+    market_id: u64,
+    leverage: u64,
+) -> Result<Bytes, PrecompileError> {
+    if leverage == 0 || leverage > 20 {
         return Err(perp_err("setLeverage: leverage must be 1–20"));
     }
-    storage::load_market(context, args.marketId)?
+    storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("setLeverage: unknown market"))?;
 
-    let mut pos = storage::load_position(context, caller, args.marketId)?;
+    let mut pos = storage::load_position(context, account, market_id)?;
     let old_leverage = pos.leverage.max(1);
-    let new_leverage = args.leverage;
-    if pos.amount != 0 && new_leverage < old_leverage {
+    if pos.amount != 0 && leverage < old_leverage {
         return Err(perp_err(
             "setLeverage: cannot reduce leverage with open position",
         ));
     }
 
-    rebalance_order_margin_for_leverage(context, caller, &mut pos, new_leverage)?;
-    pos.leverage = args.leverage;
-    storage::save_position(context, caller, args.marketId, &pos)?;
+    rebalance_order_margin_for_leverage(context, account, &mut pos, leverage)?;
+    pos.leverage = leverage;
+    storage::save_position(context, account, market_id, &pos)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::LeverageChanged {
-            user: caller,
-            marketId: args.marketId,
-            leverage: args.leverage,
+            user: account,
+            marketId: market_id,
+            leverage,
         }
         .to_log_data(),
     });

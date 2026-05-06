@@ -309,7 +309,7 @@ pub fn run_get_book_level<CTX: ContextTr>(
 const MAX_RECV_WINDOW: u64 = 60; // seconds
 const CLOCK_SKEW_ALLOWANCE: u64 = 5; // seconds of future tolerance
 
-fn check_api_key_expiry<CTX: ContextTr>(
+pub(crate) fn check_api_key_expiry<CTX: ContextTr>(
     context: &mut CTX,
     key: &ApiKey,
 ) -> Result<(), &'static str> {
@@ -323,7 +323,7 @@ fn check_api_key_expiry<CTX: ContextTr>(
     Ok(())
 }
 
-fn check_recv_window<CTX: ContextTr>(
+pub(crate) fn check_recv_window<CTX: ContextTr>(
     context: &mut CTX,
     timestamp: u64,
     recv_window: u64,
@@ -342,7 +342,7 @@ fn check_recv_window<CTX: ContextTr>(
 
 // ── ed25519 helpers ───────────────────────────────────────────────────────────
 
-fn verify_ed25519(
+pub(crate) fn verify_ed25519(
     pubkey_bytes: &[u8; 32],
     message: &[u8],
     signature_bytes: &[u8],

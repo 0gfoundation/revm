@@ -51,8 +51,19 @@ sol! {
 
         // ── Leverage ───────────────────────────────────────────────────────
         /// Set the leverage for the caller's position in a market.
-        /// Can only be changed when there are no open positions.
         function setLeverage(uint64 marketId, uint64 leverage) external;
+        /// Set leverage for `account`, authenticated by ed25519 signature.
+        /// Message: "perpdex_v1_leverage"(19) || account(20) || marketId(8) || leverage(8)
+        ///          || timestamp(8) || recvWindow(8) || keyId(1)
+        function setLeverageSigned(
+            address account,
+            uint64 marketId,
+            uint64 leverage,
+            uint64 timestamp,
+            uint64 recvWindow,
+            uint8 keyId,
+            bytes calldata signature
+        ) external;
 
         // ── Trading ────────────────────────────────────────────────────────
         /// Place a limit or market order.
