@@ -5,6 +5,7 @@ use alloy_sol_types::SolCall;
 use context::{ContextTr, JournalTr};
 use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 
+use context::Block as BlockTr;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 mod liquidation;
@@ -97,10 +98,14 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     let pubkey = storage::load_api_key(context, args.account)?
         .ok_or_else(|| perp_err("placeOrderSigned: no api key registered for account"))?;
 
-    // Canonical message (fixed-layout, 87 bytes):
+    check_recv_window(context, args.timestamp, args.recvWindow)
+        .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
+
+    // Canonical message (fixed-layout, 95 bytes):
     //   "perpdex_v1_order"(16) || account(20) || marketId(8) || side(1)
-    //   || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16) || timestamp(8)
-    let mut msg = [0u8; 87];
+    //   || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16)
+    //   || timestamp(8) || recvWindow(8)
+    let mut msg = [0u8; 95];
     msg[..16].copy_from_slice(b"perpdex_v1_order");
     msg[16..36].copy_from_slice(args.account.as_slice());
     msg[36..44].copy_from_slice(&args.marketId.to_be_bytes());
@@ -111,6 +116,7 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     msg[62] = args.tif;
     msg[63..79].copy_from_slice(&args.clientOrderId.0);
     msg[79..87].copy_from_slice(&args.timestamp.to_be_bytes());
+    msg[87..95].copy_from_slice(&args.recvWindow.to_be_bytes());
 
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
@@ -154,13 +160,17 @@ pub fn run_cancel_order_signed<CTX: ContextTr>(
     let pubkey = storage::load_api_key(context, args.account)?
         .ok_or_else(|| perp_err("cancelOrderSigned: no api key registered for account"))?;
 
-    // Canonical message (fixed-layout, 77 bytes):
-    //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || timestamp(8)
-    let mut msg = [0u8; 77];
+    check_recv_window(context, args.timestamp, args.recvWindow)
+        .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;
+
+    // Canonical message (fixed-layout, 85 bytes):
+    //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || timestamp(8) || recvWindow(8)
+    let mut msg = [0u8; 85];
     msg[..17].copy_from_slice(b"perpdex_v1_cancel");
     msg[17..37].copy_from_slice(args.account.as_slice());
     msg[37..69].copy_from_slice(args.orderId.as_slice());
     msg[69..77].copy_from_slice(&args.timestamp.to_be_bytes());
+    msg[77..85].copy_from_slice(&args.recvWindow.to_be_bytes());
 
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;
@@ -280,6 +290,28 @@ pub fn run_get_book_level<CTX: ContextTr>(
     Ok(Bytes::from(getBookLevelCall::abi_encode_returns(
         &order_ids,
     )))
+}
+
+// ── Timestamp / recvWindow helpers ────────────────────────────────────────────
+
+const MAX_RECV_WINDOW: u64 = 60; // seconds
+const CLOCK_SKEW_ALLOWANCE: u64 = 5; // seconds of future tolerance
+
+fn check_recv_window<CTX: ContextTr>(
+    context: &mut CTX,
+    timestamp: u64,
+    recv_window: u64,
+) -> Result<(), &'static str> {
+    let block_ts: u64 = context.block().timestamp().saturating_to();
+    let window = recv_window.min(MAX_RECV_WINDOW);
+
+    if timestamp > block_ts + CLOCK_SKEW_ALLOWANCE {
+        return Err("timestamp is in the future");
+    }
+    if block_ts.saturating_sub(timestamp) > window {
+        return Err("timestamp expired (outside recvWindow)");
+    }
+    Ok(())
 }
 
 // ── ed25519 helpers ───────────────────────────────────────────────────────────
@@ -463,29 +495,6 @@ fn persist_new_order<CTX: ContextTr>(
     Ok(())
 }
 
-fn execute_order_matching<CTX: ContextTr>(
-    context: &mut CTX,
-    account: Address,
-    order_id: &[u8; 32],
-    market_id: u64,
-    price: u64,
-    quantity: u64,
-    order: &ValidatedOrder,
-) -> Result<u64, PrecompileError> {
-    match_order(
-        context,
-        account,
-        order_id,
-        market_id,
-        order.side,
-        price,
-        quantity,
-        order.order_type,
-        order.tif,
-        &order.market,
-    )
-}
-
 fn cancel_unfilled_remainder<CTX: ContextTr>(
     context: &mut CTX,
     order_id: &[u8; 32],
@@ -579,8 +588,17 @@ fn execute_limit_order<CTX: ContextTr>(
             )
         }
         TimeInForce::Gtc => {
-            let remaining = execute_order_matching(
-                context, account, &order_id, market_id, price, quantity, &order,
+            let remaining = match_order(
+                context,
+                account,
+                &order_id,
+                market_id,
+                order.side,
+                price,
+                quantity,
+                order.order_type,
+                order.tif,
+                &order.market,
             )?;
             if remaining > 0 {
                 rest_in_book(
@@ -599,8 +617,17 @@ fn execute_limit_order<CTX: ContextTr>(
             Ok(())
         }
         TimeInForce::Ioc => {
-            let remaining = execute_order_matching(
-                context, account, &order_id, market_id, price, quantity, &order,
+            let remaining = match_order(
+                context,
+                account,
+                &order_id,
+                market_id,
+                order.side,
+                price,
+                quantity,
+                order.order_type,
+                order.tif,
+                &order.market,
             )?;
             cancel_unfilled_remainder(context, &order_id, remaining)
         }
@@ -613,8 +640,17 @@ fn execute_limit_order<CTX: ContextTr>(
                 quantity,
                 order.order_type,
             )?;
-            let remaining = execute_order_matching(
-                context, account, &order_id, market_id, price, quantity, &order,
+            let remaining = match_order(
+                context,
+                account,
+                &order_id,
+                market_id,
+                order.side,
+                price,
+                quantity,
+                order.order_type,
+                order.tif,
+                &order.market,
             )?;
             ensure_fok_filled(remaining)
         }
@@ -640,8 +676,17 @@ fn execute_market_order<CTX: ContextTr>(
             order.order_type,
         )?;
     }
-    let remaining = execute_order_matching(
-        context, account, &order_id, market_id, price, quantity, &order,
+    let remaining = match_order(
+        context,
+        account,
+        &order_id,
+        market_id,
+        order.side,
+        price,
+        quantity,
+        order.order_type,
+        order.tif,
+        &order.market,
     )?;
     if order.tif == TimeInForce::Fok {
         ensure_fok_filled(remaining)

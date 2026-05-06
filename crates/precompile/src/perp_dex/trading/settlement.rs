@@ -35,10 +35,13 @@ pub(super) struct TakerSettlement {
     market_id: u64,
     pos: crate::perp_dex::types::PerpPosition,
     account: crate::perp_dex::types::UserAccount,
+    remaining_closing_qty: u64,
+    closing_qty: u64,
+    closing_value: u64,
+    opening_qty: u64,
+    opening_value: u64,
     opening_margin_required: u64,
     taker_fee_bps: u64,
-    fee: u64,
-    has_fill: bool,
 }
 
 impl TakerSettlement {
@@ -48,15 +51,19 @@ impl TakerSettlement {
         market_id: u64,
     ) -> Result<Self, PrecompileError> {
         let rates = storage::load_user_fee_rates(context, user)?;
+        let pos = storage::load_position(context, user, market_id)?;
         Ok(Self {
             user,
             market_id,
-            pos: storage::load_position(context, user, market_id)?,
+            remaining_closing_qty: pos.amount.unsigned_abs(),
+            pos,
             account: storage::load_account(context, user)?,
+            closing_qty: 0,
+            closing_value: 0,
+            opening_qty: 0,
+            opening_value: 0,
             opening_margin_required: 0,
             taker_fee_bps: rates.taker_fee_bps,
-            fee: 0,
-            has_fill: false,
         })
     }
 
@@ -67,20 +74,13 @@ impl TakerSettlement {
         taker_side: Side,
         market: &crate::perp_dex::types::Market,
     ) -> Result<(), PrecompileError> {
-        self.has_fill = true;
         let is_buy = taker_side == Side::Buy;
-        let fill_value = calc_value(
-            fill_price,
-            fill_qty,
-            market.base_decimals,
-            market.price_decimals,
-        )?;
-        self.fee = self
-            .fee
-            .checked_add(calc_trading_fee(fill_value, self.taker_fee_bps)?)
-            .ok_or_else(|| perp_err("placeOrder: taker fee overflow"))?;
-
-        let closing_qty = calc_closing_qty(&self.pos, fill_qty, is_buy);
+        let closing_qty = if (is_buy && self.pos.amount < 0) || (!is_buy && self.pos.amount > 0) {
+            fill_qty.min(self.remaining_closing_qty)
+        } else {
+            0
+        };
+        self.remaining_closing_qty = self.remaining_closing_qty.saturating_sub(closing_qty);
         let opening_qty = fill_qty - closing_qty;
         let closing_value = calc_value(
             fill_price,
@@ -95,28 +95,22 @@ impl TakerSettlement {
             market.price_decimals,
         )?;
 
-        apply_taker_closing_fill_to_position(
-            &mut self.pos,
-            &mut self.account.perp_wallet_balance,
-            closing_qty,
-            closing_value,
-            is_buy,
-        )?;
-
-        if opening_qty > 0 {
-            apply_taker_opening_fill_to_position(
-                &mut self.pos,
-                &mut self.account.perp_wallet_balance,
-                opening_qty,
-                opening_value,
-                is_buy,
-                false,
-            )?;
-            self.opening_margin_required = self
-                .opening_margin_required
-                .checked_add(opening_value / self.pos.leverage.max(1))
-                .ok_or_else(|| perp_err("placeOrder: opening margin overflow"))?;
-        }
+        self.closing_qty = self
+            .closing_qty
+            .checked_add(closing_qty)
+            .ok_or_else(|| perp_err("placeOrder: closing quantity overflow"))?;
+        self.closing_value = self
+            .closing_value
+            .checked_add(closing_value)
+            .ok_or_else(|| perp_err("placeOrder: closing value overflow"))?;
+        self.opening_qty = self
+            .opening_qty
+            .checked_add(opening_qty)
+            .ok_or_else(|| perp_err("placeOrder: opening quantity overflow"))?;
+        self.opening_value = self
+            .opening_value
+            .checked_add(opening_value)
+            .ok_or_else(|| perp_err("placeOrder: opening value overflow"))?;
 
         Ok(())
     }
@@ -127,8 +121,29 @@ impl TakerSettlement {
         taker_side: Side,
         market: &crate::perp_dex::types::Market,
     ) -> Result<(), PrecompileError> {
-        if !self.has_fill {
+        if self.closing_qty == 0 && self.opening_qty == 0 {
             return Ok(());
+        }
+
+        let is_buy = taker_side == Side::Buy;
+        apply_taker_closing_fill_to_position(
+            &mut self.pos,
+            &mut self.account.perp_wallet_balance,
+            self.closing_qty,
+            self.closing_value,
+            is_buy,
+        )?;
+
+        if self.opening_qty > 0 {
+            apply_taker_opening_fill_to_position(
+                &mut self.pos,
+                &mut self.account.perp_wallet_balance,
+                self.opening_qty,
+                self.opening_value,
+                is_buy,
+                false,
+            )?;
+            self.opening_margin_required = self.opening_value / self.pos.leverage.max(1);
         }
 
         storage::save_position(context, self.user, self.market_id, &self.pos)?;
@@ -150,14 +165,15 @@ impl TakerSettlement {
         }
         self.account.perp_wallet_balance -= self.opening_margin_required;
 
-        charge_trading_fee(
-            &mut self.pos,
-            &mut self.account.perp_wallet_balance,
-            self.fee,
-        )?;
+        let fee_notional = self
+            .closing_value
+            .checked_add(self.opening_value)
+            .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
+        let fee = calc_trading_fee(fee_notional, self.taker_fee_bps)?;
+        charge_trading_fee(&mut self.pos, &mut self.account.perp_wallet_balance, fee)?;
         storage::save_position(context, self.user, self.market_id, &self.pos)?;
         storage::save_account(context, self.user, self.account)?;
-        credit_fee_recipient(context, self.fee)?;
+        credit_fee_recipient(context, fee)?;
 
         context.journal_mut().log(Log {
             address: PERP_DEX_ADDRESS,
@@ -318,20 +334,6 @@ fn calc_opening_margin_for_fill(
     let leverage = pos.leverage.max(1);
     let open_value = (fill_value as u128 * opening_qty as u128 / fill_qty.max(1) as u128) as u64;
     open_value / leverage
-}
-
-fn calc_closing_qty(
-    pos: &crate::perp_dex::types::PerpPosition,
-    fill_qty: u64,
-    is_buy: bool,
-) -> u64 {
-    if is_buy && pos.amount < 0 {
-        fill_qty.min((-pos.amount) as u64)
-    } else if !is_buy && pos.amount > 0 {
-        fill_qty.min(pos.amount as u64)
-    } else {
-        0
-    }
 }
 
 fn ensure_taker_wallet_can_cover_margin<CTX: ContextTr>(

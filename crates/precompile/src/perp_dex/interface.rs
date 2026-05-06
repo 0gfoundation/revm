@@ -123,7 +123,9 @@ sol! {
         // ── Signed order submission ───────────────────────────────────────
         /// Place an order for `account`, authenticated by ed25519 signature.
         /// Message: "perpdex_v1_order" || account(20) || marketId(8) || side(1)
-        ///          || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16) || timestamp(8)
+        ///          || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16)
+        ///          || timestamp(8) || recvWindow(8)
+        /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         /// orderId = keccak256(signature) — replay protection via existing order storage.
         function placeOrderSigned(
             address account,
@@ -135,16 +137,19 @@ sol! {
             uint8 tif,
             bytes16 clientOrderId,
             uint64 timestamp,
+            uint64 recvWindow,
             bytes calldata signature
         ) external returns (bytes32 orderId);
 
         /// Cancel an order for `account`, authenticated by ed25519 signature.
-        /// Message: "perpdex_v1_cancel" || account(20) || orderId(32) || timestamp(8)
+        /// Message: "perpdex_v1_cancel" || account(20) || orderId(32) || timestamp(8) || recvWindow(8)
+        /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         /// Replay protection is implicit: a cancelled order cannot be cancelled again.
         function cancelOrderSigned(
             address account,
             bytes32 orderId,
             uint64 timestamp,
+            uint64 recvWindow,
             bytes calldata signature
         ) external;
 
