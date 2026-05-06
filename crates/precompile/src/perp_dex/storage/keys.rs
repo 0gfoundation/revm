@@ -25,7 +25,8 @@ const PFX_BID_LEVEL: &[u8] = b"bidl"; // FIFO queue of order IDs at a bid price
 const PFX_ASK_LEVEL: &[u8] = b"askl"; // FIFO queue of order IDs at an ask price
 const PFX_BEST_BID: &[u8] = b"bbd\x00"; // cached best bid price (0 = empty)
 const PFX_BEST_ASK: &[u8] = b"bak\x00"; // cached best ask price (0 = empty)
-const PFX_API_KEY: &[u8] = b"apik"; // per-user ed25519 public key (32 bytes)
+const PFX_API_KEY: &[u8] = b"apik"; // per-user per-slot ed25519 key
+const PFX_API_KEY_IDS: &[u8] = b"akid"; // per-user list of registered key_ids
 
 // ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
 
@@ -157,7 +158,12 @@ pub fn best_ask_key(market_id: u64) -> B256 {
 
 // ── API key (ed25519 signed orders) ──────────────────────────────────────────
 
-/// ed25519 public key registered by a user for signed order submission.
-pub fn api_key_key(user: Address) -> B256 {
-    keccak256([PFX_API_KEY, user.as_slice()].concat())
+/// ed25519 key for a specific (user, key_id) slot.
+pub fn api_key_key(user: Address, key_id: u8) -> B256 {
+    keccak256([PFX_API_KEY, user.as_slice(), &[key_id]].concat())
+}
+
+/// List of registered key_ids for a user (Vec<u8>).
+pub fn api_key_ids_key(user: Address) -> B256 {
+    keccak256([PFX_API_KEY_IDS, user.as_slice()].concat())
 }

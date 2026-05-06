@@ -8,7 +8,10 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 use crate::{
     perp_dex::{
         errors::perp_err,
-        interface::IPerpDex::{self, getApiKeyCall, getApiKeyReturn, registerApiKeyCall, revokeApiKeyCall},
+        interface::IPerpDex::{
+            self, getApiKeyCall, getApiKeyReturn, getApiKeysCall, getApiKeysReturn,
+            registerApiKeyCall, revokeApiKeyCall,
+        },
         storage,
         types::ApiKey,
         PERP_DEX_ADDRESS,
@@ -16,8 +19,7 @@ use crate::{
     PrecompileError,
 };
 
-/// `registerApiKey(bytes32 pubkey, uint64 expiry)` — store an ed25519 public key for the caller.
-/// `expiry` is a Unix-second timestamp; pass 0 for no expiry.
+/// `registerApiKey(uint8 keyId, bytes32 pubkey, uint64 expiry)`
 pub fn run_register_api_key<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -31,13 +33,15 @@ pub fn run_register_api_key<CTX: ContextTr>(
         return Err(perp_err("registerApiKey: pubkey cannot be zero"));
     }
 
-    storage::save_api_key(context, caller, ApiKey { pubkey, expiry: args.expiry })?;
+    storage::save_api_key(context, caller, args.keyId, ApiKey { pubkey, expiry: args.expiry })?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::ApiKeyRegistered {
             user: caller,
+            keyId: args.keyId,
             pubkey: args.pubkey,
+            expiry: args.expiry,
         }
         .to_log_data(),
     });
@@ -45,26 +49,26 @@ pub fn run_register_api_key<CTX: ContextTr>(
     Ok(Bytes::new())
 }
 
-/// `revokeApiKey()` — remove the caller's registered API key.
+/// `revokeApiKey(uint8 keyId)`
 pub fn run_revoke_api_key<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
     context: &mut CTX,
 ) -> Result<Bytes, PrecompileError> {
-    revokeApiKeyCall::abi_decode_validate(input_bytes)
+    let args = revokeApiKeyCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("revokeApiKey: invalid calldata"))?;
 
-    storage::delete_api_key(context, caller)?;
+    storage::delete_api_key(context, caller, args.keyId)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
-        data: IPerpDex::ApiKeyRevoked { user: caller }.to_log_data(),
+        data: IPerpDex::ApiKeyRevoked { user: caller, keyId: args.keyId }.to_log_data(),
     });
 
     Ok(Bytes::new())
 }
 
-/// `getApiKey(address user) returns (bytes32 pubkey, uint64 expiry)`
+/// `getApiKey(address user, uint8 keyId) returns (bytes32 pubkey, uint64 expiry)`
 pub fn run_get_api_key<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -72,11 +76,36 @@ pub fn run_get_api_key<CTX: ContextTr>(
     let args = getApiKeyCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getApiKey: invalid calldata"))?;
 
-    let (pubkey, expiry) = storage::load_api_key(context, args.user)?
+    let (pubkey, expiry) = storage::load_api_key(context, args.user, args.keyId)?
         .map(|k| (FixedBytes(k.pubkey), k.expiry))
         .unwrap_or_default();
 
     Ok(Bytes::from(getApiKeyCall::abi_encode_returns(
         &getApiKeyReturn { pubkey, expiry },
+    )))
+}
+
+/// `getApiKeys(address user) returns (uint8[] keyIds, bytes32[] pubkeys, uint64[] expiries)`
+pub fn run_get_api_keys<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = getApiKeysCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getApiKeys: invalid calldata"))?;
+
+    let ids = storage::load_api_key_ids(context, args.user)?;
+    let mut pubkeys = Vec::with_capacity(ids.len());
+    let mut expiries = Vec::with_capacity(ids.len());
+
+    for &id in &ids {
+        let (pk, exp) = storage::load_api_key(context, args.user, id)?
+            .map(|k| (FixedBytes(k.pubkey), k.expiry))
+            .unwrap_or_default();
+        pubkeys.push(pk);
+        expiries.push(exp);
+    }
+
+    Ok(Bytes::from(getApiKeysCall::abi_encode_returns(
+        &getApiKeysReturn { keyIds: ids, pubkeys, expiries },
     )))
 }

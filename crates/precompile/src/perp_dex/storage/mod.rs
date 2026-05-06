@@ -19,9 +19,9 @@ use crate::{
 };
 
 use keys::{
-    account_key, admin_key, api_key_key, ask_level_key, ask_prices_key, best_ask_key, best_bid_key,
-    bid_level_key, bid_prices_key, erc20_balance_slot, mark_price_key, market_key,
-    open_interest_key, order_key, position_key, trade_count_key, user_buy_orders_key,
+    account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
+    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot, mark_price_key,
+    market_key, open_interest_key, order_key, position_key, trade_count_key, user_buy_orders_key,
     user_fee_rates_key, user_nonce_key, user_sell_orders_key,
 };
 
@@ -588,12 +588,12 @@ pub fn refresh_best_ask<CTX: ContextTr>(
 }
 // ── API key (ed25519 signed orders) ──────────────────────────────────────────
 
-/// Returns `None` when no API key has been registered yet.
 pub fn load_api_key<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
+    key_id: u8,
 ) -> Result<Option<ApiKey>, PrecompileError> {
-    let buf = load_blob(context, api_key_key(user))?;
+    let buf = load_blob(context, api_key_key(user, key_id))?;
     if buf.is_empty() {
         return Ok(None);
     }
@@ -603,15 +603,48 @@ pub fn load_api_key<CTX: ContextTr>(
 pub fn save_api_key<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
+    key_id: u8,
     key: ApiKey,
 ) -> Result<(), PrecompileError> {
     let buf = encode(&key)?;
-    store_blob(context, api_key_key(user), &buf)
+    store_blob(context, api_key_key(user, key_id), &buf)?;
+    // Track this key_id in the user's id list (deduplicated).
+    let mut ids = load_api_key_ids(context, user)?;
+    if !ids.contains(&key_id) {
+        ids.push(key_id);
+        ids.sort_unstable();
+        save_api_key_ids(context, user, &ids)?;
+    }
+    Ok(())
 }
 
 pub fn delete_api_key<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
+    key_id: u8,
 ) -> Result<(), PrecompileError> {
-    store_blob(context, api_key_key(user), &[])
+    store_blob(context, api_key_key(user, key_id), &[])?;
+    let mut ids = load_api_key_ids(context, user)?;
+    ids.retain(|&id| id != key_id);
+    save_api_key_ids(context, user, &ids)
+}
+
+pub fn load_api_key_ids<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+) -> Result<Vec<u8>, PrecompileError> {
+    let buf = load_blob(context, api_key_ids_key(user))?;
+    if buf.is_empty() {
+        return Ok(vec![]);
+    }
+    decode(&buf)
+}
+
+fn save_api_key_ids<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    ids: &[u8],
+) -> Result<(), PrecompileError> {
+    let buf = encode(&ids)?;
+    store_blob(context, api_key_ids_key(user), &buf)
 }

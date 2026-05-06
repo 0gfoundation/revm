@@ -26,18 +26,19 @@ use primitives::{address, Address, U256};
 use crate::{
     perp_dex::{
         account::{
-            run_deposit, run_get_account, run_get_api_key, run_get_user_fee_rates,
-            run_register_api_key, run_revoke_api_key, run_set_user_fee_rates,
-            run_transfer_from_perp, run_transfer_to_perp, run_withdraw,
+            run_deposit, run_get_account, run_get_api_key, run_get_api_keys,
+            run_get_user_fee_rates, run_register_api_key, run_revoke_api_key,
+            run_set_user_fee_rates, run_transfer_from_perp, run_transfer_to_perp, run_withdraw,
         },
         interface::IPerpDex::{
             addMarketCall, addPositionMarginCall, cancelOrderCall, cancelOrderSignedCall,
-            depositCall, getAccountCall, getAdminCall, getApiKeyCall, getBookLevelCall,
-            getBookPricesCall, getMarkPriceCall, getMarketCall, getOpenOrdersCall, getOrderCall,
-            getPositionCall, getUserFeeRatesCall, initAdminCall, liquidateCall, placeOrderCall,
-            placeOrderSignedCall, registerApiKeyCall, removePositionMarginCall, revokeApiKeyCall,
-            setLeverageCall, setMarkPriceCall, setUserFeeRatesCall, transferAdminCall,
-            transferFromPerpCall, transferToPerpCall, updateMarketCall, withdrawCall,
+            depositCall, getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
+            getBookLevelCall, getBookPricesCall, getMarkPriceCall, getMarketCall, getOpenOrdersCall,
+            getOrderCall, getPositionCall, getUserFeeRatesCall, initAdminCall, liquidateCall,
+            placeOrderCall, placeOrderSignedCall, registerApiKeyCall, removePositionMarginCall,
+            revokeApiKeyCall, setLeverageCall, setMarkPriceCall, setUserFeeRatesCall,
+            transferAdminCall, transferFromPerpCall, transferToPerpCall, updateMarketCall,
+            withdrawCall,
         },
         risk::{
             run_add_market, run_add_position_margin, run_get_admin, run_get_mark_price,
@@ -115,6 +116,7 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(registerApiKeyCall::SELECTOR, (30_000, false));
         m.insert(revokeApiKeyCall::SELECTOR, (20_000, false));
         m.insert(getApiKeyCall::SELECTOR, (5_000, true));
+        m.insert(getApiKeysCall::SELECTOR, (10_000, true));
         // Signed order submission (relayer path)
         m.insert(placeOrderSignedCall::SELECTOR, (200_000, false));
         m.insert(cancelOrderSignedCall::SELECTOR, (80_000, false));
@@ -232,6 +234,7 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         }
         s if s == revokeApiKeyCall::SELECTOR => run_revoke_api_key(input_bytes, caller, context),
         s if s == getApiKeyCall::SELECTOR => run_get_api_key(input_bytes, context),
+        s if s == getApiKeysCall::SELECTOR => run_get_api_keys(input_bytes, context),
         // Signed order submission (relayer path)
         s if s == placeOrderSignedCall::SELECTOR => run_place_order_signed(input_bytes, context),
         s if s == cancelOrderSignedCall::SELECTOR => run_cancel_order_signed(input_bytes, context),

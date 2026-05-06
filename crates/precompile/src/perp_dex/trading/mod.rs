@@ -95,7 +95,7 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     let args = placeOrderSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("placeOrderSigned: invalid calldata"))?;
 
-    let api_key = storage::load_api_key(context, args.account)?
+    let api_key = storage::load_api_key(context, args.account, args.keyId)?
         .ok_or_else(|| perp_err("placeOrderSigned: no api key registered for account"))?;
 
     check_recv_window(context, args.timestamp, args.recvWindow)
@@ -106,11 +106,11 @@ pub fn run_place_order_signed<CTX: ContextTr>(
 
     let pubkey = api_key.pubkey;
 
-    // Canonical message (fixed-layout, 95 bytes):
+    // Canonical message (fixed-layout, 96 bytes):
     //   "perpdex_v1_order"(16) || account(20) || marketId(8) || side(1)
     //   || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16)
-    //   || timestamp(8) || recvWindow(8)
-    let mut msg = [0u8; 95];
+    //   || timestamp(8) || recvWindow(8) || keyId(1)
+    let mut msg = [0u8; 96];
     msg[..16].copy_from_slice(b"perpdex_v1_order");
     msg[16..36].copy_from_slice(args.account.as_slice());
     msg[36..44].copy_from_slice(&args.marketId.to_be_bytes());
@@ -122,6 +122,7 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     msg[63..79].copy_from_slice(&args.clientOrderId.0);
     msg[79..87].copy_from_slice(&args.timestamp.to_be_bytes());
     msg[87..95].copy_from_slice(&args.recvWindow.to_be_bytes());
+    msg[95] = args.keyId;
 
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
@@ -162,7 +163,7 @@ pub fn run_cancel_order_signed<CTX: ContextTr>(
     let args = cancelOrderSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("cancelOrderSigned: invalid calldata"))?;
 
-    let api_key = storage::load_api_key(context, args.account)?
+    let api_key = storage::load_api_key(context, args.account, args.keyId)?
         .ok_or_else(|| perp_err("cancelOrderSigned: no api key registered for account"))?;
 
     check_recv_window(context, args.timestamp, args.recvWindow)
@@ -173,14 +174,15 @@ pub fn run_cancel_order_signed<CTX: ContextTr>(
 
     let pubkey = api_key.pubkey;
 
-    // Canonical message (fixed-layout, 85 bytes):
-    //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || timestamp(8) || recvWindow(8)
-    let mut msg = [0u8; 85];
+    // Canonical message (fixed-layout, 86 bytes):
+    //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || timestamp(8) || recvWindow(8) || keyId(1)
+    let mut msg = [0u8; 86];
     msg[..17].copy_from_slice(b"perpdex_v1_cancel");
     msg[17..37].copy_from_slice(args.account.as_slice());
     msg[37..69].copy_from_slice(args.orderId.as_slice());
     msg[69..77].copy_from_slice(&args.timestamp.to_be_bytes());
     msg[77..85].copy_from_slice(&args.recvWindow.to_be_bytes());
+    msg[85] = args.keyId;
 
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;

@@ -113,21 +113,25 @@ sol! {
         function liquidate(address user, uint64 marketId) external;
 
         // ── API key management (ed25519 signed orders) ────────────────────
-        /// Register an ed25519 public key as the caller's API signing key.
+        /// Register an ed25519 public key in slot `keyId` for the caller.
         /// expiry: Unix-second timestamp after which the key is rejected. 0 = never expires.
-        function registerApiKey(bytes32 pubkey, uint64 expiry) external;
-        /// Remove the caller's API key, disabling signed-order submissions.
-        function revokeApiKey() external;
-        /// Query the registered API key for a user.
-        /// Returns zero pubkey and zero expiry when no key is registered.
-        function getApiKey(address user) external view returns (bytes32 pubkey, uint64 expiry);
+        /// Overwrites the slot if already occupied.
+        /// NOTE: keyId 255 is reserved for the official frontend UI.
+        function registerApiKey(uint8 keyId, bytes32 pubkey, uint64 expiry) external;
+        /// Remove the key in slot `keyId` for the caller.
+        function revokeApiKey(uint8 keyId) external;
+        /// Query one key slot for a user. Returns zero pubkey and zero expiry when not set.
+        function getApiKey(address user, uint8 keyId) external view returns (bytes32 pubkey, uint64 expiry);
+        /// Query all registered key slots for a user.
+        function getApiKeys(address user) external view returns (uint8[] keyIds, bytes32[] pubkeys, uint64[] expiries);
 
         // ── Signed order submission ───────────────────────────────────────
         /// Place an order for `account`, authenticated by ed25519 signature.
         /// Message: "perpdex_v1_order" || account(20) || marketId(8) || side(1)
         ///          || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16)
-        ///          || timestamp(8) || recvWindow(8)
+        ///          || timestamp(8) || recvWindow(8) || keyId(1)
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
+        /// keyId: which API key slot to verify against.
         /// orderId = keccak256(signature) — replay protection via existing order storage.
         function placeOrderSigned(
             address account,
@@ -140,26 +144,29 @@ sol! {
             bytes16 clientOrderId,
             uint64 timestamp,
             uint64 recvWindow,
+            uint8 keyId,
             bytes calldata signature
         ) external returns (bytes32 orderId);
 
         /// Cancel an order for `account`, authenticated by ed25519 signature.
-        /// Message: "perpdex_v1_cancel" || account(20) || orderId(32) || timestamp(8) || recvWindow(8)
+        /// Message: "perpdex_v1_cancel" || account(20) || orderId(32) || timestamp(8) || recvWindow(8) || keyId(1)
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
+        /// keyId: which API key slot to verify against.
         /// Replay protection is implicit: a cancelled order cannot be cancelled again.
         function cancelOrderSigned(
             address account,
             bytes32 orderId,
             uint64 timestamp,
             uint64 recvWindow,
+            uint8 keyId,
             bytes calldata signature
         ) external;
 
         // ── Events ───────────────────────────────────────────────────────
         event AdminInitialized(address indexed admin);
         event AdminTransferred(address indexed previousAdmin, address indexed newAdmin);
-        event ApiKeyRegistered(address indexed user, bytes32 pubkey);
-        event ApiKeyRevoked(address indexed user);
+        event ApiKeyRegistered(address indexed user, uint8 keyId, bytes32 pubkey, uint64 expiry);
+        event ApiKeyRevoked(address indexed user, uint8 keyId);
 
         // Feeds: /income (TRANSFER type), balance history
         event Deposit(address indexed user, uint256 amount);
