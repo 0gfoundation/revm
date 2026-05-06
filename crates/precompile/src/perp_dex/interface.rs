@@ -114,11 +114,13 @@ sol! {
 
         // ── API key management (ed25519 signed orders) ────────────────────
         /// Register an ed25519 public key as the caller's API signing key.
-        function registerApiKey(bytes32 pubkey) external;
+        /// expiry: Unix-second timestamp after which the key is rejected. 0 = never expires.
+        function registerApiKey(bytes32 pubkey, uint64 expiry) external;
         /// Remove the caller's API key, disabling signed-order submissions.
         function revokeApiKey() external;
-        /// Query the registered API key for a user (zero bytes32 = not set).
-        function getApiKey(address user) external view returns (bytes32 pubkey);
+        /// Query the registered API key for a user.
+        /// Returns zero pubkey and zero expiry when no key is registered.
+        function getApiKey(address user) external view returns (bytes32 pubkey, uint64 expiry);
 
         // ── Signed order submission ───────────────────────────────────────
         /// Place an order for `account`, authenticated by ed25519 signature.

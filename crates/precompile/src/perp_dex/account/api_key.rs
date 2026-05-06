@@ -8,13 +8,16 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 use crate::{
     perp_dex::{
         errors::perp_err,
-        interface::IPerpDex::{self, getApiKeyCall, registerApiKeyCall, revokeApiKeyCall},
-        storage, PERP_DEX_ADDRESS,
+        interface::IPerpDex::{self, getApiKeyCall, getApiKeyReturn, registerApiKeyCall, revokeApiKeyCall},
+        storage,
+        types::ApiKey,
+        PERP_DEX_ADDRESS,
     },
     PrecompileError,
 };
 
-/// `registerApiKey(bytes32 pubkey)` — store an ed25519 public key for the caller.
+/// `registerApiKey(bytes32 pubkey, uint64 expiry)` — store an ed25519 public key for the caller.
+/// `expiry` is a Unix-second timestamp; pass 0 for no expiry.
 pub fn run_register_api_key<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -28,7 +31,7 @@ pub fn run_register_api_key<CTX: ContextTr>(
         return Err(perp_err("registerApiKey: pubkey cannot be zero"));
     }
 
-    storage::save_api_key(context, caller, pubkey)?;
+    storage::save_api_key(context, caller, ApiKey { pubkey, expiry: args.expiry })?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
@@ -61,7 +64,7 @@ pub fn run_revoke_api_key<CTX: ContextTr>(
     Ok(Bytes::new())
 }
 
-/// `getApiKey(address user) returns (bytes32 pubkey)`
+/// `getApiKey(address user) returns (bytes32 pubkey, uint64 expiry)`
 pub fn run_get_api_key<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -69,9 +72,11 @@ pub fn run_get_api_key<CTX: ContextTr>(
     let args = getApiKeyCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getApiKey: invalid calldata"))?;
 
-    let pubkey: FixedBytes<32> = storage::load_api_key(context, args.user)?
-        .map(FixedBytes)
+    let (pubkey, expiry) = storage::load_api_key(context, args.user)?
+        .map(|k| (FixedBytes(k.pubkey), k.expiry))
         .unwrap_or_default();
 
-    Ok(Bytes::from(getApiKeyCall::abi_encode_returns(&pubkey)))
+    Ok(Bytes::from(getApiKeyCall::abi_encode_returns(
+        &getApiKeyReturn { pubkey, expiry },
+    )))
 }

@@ -11,7 +11,7 @@ use crate::{
     journal::{load_bytes, store_bytes},
     perp_dex::{
         errors::perp_err,
-        types::{Market, Order, OrderEntry, PerpPosition, UserAccount, UserFeeRates},
+        types::{ApiKey, Market, Order, OrderEntry, PerpPosition, UserAccount, UserFeeRates},
         PERP_DEX_ADDRESS,
     },
     stateful_precompiles::convert_db_err,
@@ -592,21 +592,20 @@ pub fn refresh_best_ask<CTX: ContextTr>(
 pub fn load_api_key<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
-) -> Result<Option<[u8; 32]>, PrecompileError> {
+) -> Result<Option<ApiKey>, PrecompileError> {
     let buf = load_blob(context, api_key_key(user))?;
     if buf.is_empty() {
         return Ok(None);
     }
-    let key: [u8; 32] = decode(&buf)?;
-    Ok(Some(key))
+    Ok(Some(decode(&buf)?))
 }
 
 pub fn save_api_key<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
-    pubkey: [u8; 32],
+    key: ApiKey,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&pubkey)?;
+    let buf = encode(&key)?;
     store_blob(context, api_key_key(user), &buf)
 }
 

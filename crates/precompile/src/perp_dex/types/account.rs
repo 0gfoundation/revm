@@ -29,3 +29,14 @@ impl Default for UserAccount {
         }
     }
 }
+
+/// Registered ed25519 API key for a user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApiKey {
+    /// Raw 32-byte ed25519 public key.
+    #[serde(rename = "K")]
+    pub pubkey: [u8; 32],
+    /// Unix-second expiry timestamp. `0` means the key never expires.
+    #[serde(rename = "E")]
+    pub expiry: u64,
+}

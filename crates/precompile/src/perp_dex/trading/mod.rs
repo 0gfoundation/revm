@@ -27,7 +27,7 @@ use crate::{
             calc_value,
         },
         storage,
-        types::{Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce},
+        types::{ApiKey, Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce},
         PERP_DEX_ADDRESS,
     },
     PrecompileError,
@@ -95,11 +95,16 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     let args = placeOrderSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("placeOrderSigned: invalid calldata"))?;
 
-    let pubkey = storage::load_api_key(context, args.account)?
+    let api_key = storage::load_api_key(context, args.account)?
         .ok_or_else(|| perp_err("placeOrderSigned: no api key registered for account"))?;
 
     check_recv_window(context, args.timestamp, args.recvWindow)
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
+
+    check_api_key_expiry(context, &api_key)
+        .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
+
+    let pubkey = api_key.pubkey;
 
     // Canonical message (fixed-layout, 95 bytes):
     //   "perpdex_v1_order"(16) || account(20) || marketId(8) || side(1)
@@ -157,11 +162,16 @@ pub fn run_cancel_order_signed<CTX: ContextTr>(
     let args = cancelOrderSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("cancelOrderSigned: invalid calldata"))?;
 
-    let pubkey = storage::load_api_key(context, args.account)?
+    let api_key = storage::load_api_key(context, args.account)?
         .ok_or_else(|| perp_err("cancelOrderSigned: no api key registered for account"))?;
 
     check_recv_window(context, args.timestamp, args.recvWindow)
         .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;
+
+    check_api_key_expiry(context, &api_key)
+        .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;
+
+    let pubkey = api_key.pubkey;
 
     // Canonical message (fixed-layout, 85 bytes):
     //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || timestamp(8) || recvWindow(8)
@@ -296,6 +306,20 @@ pub fn run_get_book_level<CTX: ContextTr>(
 
 const MAX_RECV_WINDOW: u64 = 60; // seconds
 const CLOCK_SKEW_ALLOWANCE: u64 = 5; // seconds of future tolerance
+
+fn check_api_key_expiry<CTX: ContextTr>(
+    context: &mut CTX,
+    key: &ApiKey,
+) -> Result<(), &'static str> {
+    if key.expiry == 0 {
+        return Ok(());
+    }
+    let block_ts: u64 = context.block().timestamp().saturating_to();
+    if block_ts >= key.expiry {
+        return Err("api key has expired");
+    }
+    Ok(())
+}
 
 fn check_recv_window<CTX: ContextTr>(
     context: &mut CTX,
