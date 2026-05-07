@@ -33,11 +33,11 @@ use crate::{
         interface::IPerpDex::{
             addMarketCall, addPositionMarginCall, cancelOrderCall, cancelOrderSignedCall,
             depositCall, getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
-            getBookLevelCall, getBookPricesCall, getMarkPriceCall, getMarketCall, getOpenOrdersCall,
-            getOrderCall, getPositionCall, getUserFeeRatesCall, initAdminCall, liquidateCall,
-            placeOrderCall, placeOrderSignedCall, registerApiKeyCall, removePositionMarginCall,
-            revokeApiKeyCall, setLeverageCall, setLeverageSignedCall, setMarkPriceCall,
-            setUserFeeRatesCall,
+            getBookLevelCall, getBookPricesCall, getMarkPriceCall, getMarketCall,
+            getMarketFeeTotalCall, getOpenOrdersCall, getOrderCall, getPositionCall,
+            getUserFeeRatesCall, initAdminCall, liquidateCall, placeOrderCall,
+            placeOrderSignedCall, registerApiKeyCall, removePositionMarginCall, revokeApiKeyCall,
+            setLeverageCall, setLeverageSignedCall, setMarkPriceCall, setUserFeeRatesCall,
             transferAdminCall, transferFromPerpCall, transferToPerpCall, updateMarketCall,
             withdrawCall,
         },
@@ -49,7 +49,8 @@ use crate::{
         },
         trading::{
             run_cancel_order, run_cancel_order_signed, run_get_book_level, run_get_book_prices,
-            run_get_open_orders, run_get_order, run_place_order, run_place_order_signed,
+            run_get_market_fee_total, run_get_open_orders, run_get_order, run_place_order,
+            run_place_order_signed,
         },
     },
     PrecompileError, PrecompileOutput, PrecompileResult,
@@ -92,6 +93,7 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getAccountCall::SELECTOR, (5_000, true));
         m.insert(setUserFeeRatesCall::SELECTOR, (30_000, false));
         m.insert(getUserFeeRatesCall::SELECTOR, (5_000, true));
+        m.insert(getMarketFeeTotalCall::SELECTOR, (5_000, true));
         // Market management (admin)
         m.insert(addMarketCall::SELECTOR, (100_000, false));
         m.insert(updateMarketCall::SELECTOR, (50_000, false));
@@ -205,6 +207,7 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
             run_set_user_fee_rates(input_bytes, caller, context)
         }
         s if s == getUserFeeRatesCall::SELECTOR => run_get_user_fee_rates(input_bytes, context),
+        s if s == getMarketFeeTotalCall::SELECTOR => run_get_market_fee_total(input_bytes, context),
         // Market management
         s if s == addMarketCall::SELECTOR => run_add_market(input_bytes, caller, context),
         s if s == updateMarketCall::SELECTOR => run_update_market(input_bytes, caller, context),
@@ -213,9 +216,7 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         s if s == getMarketCall::SELECTOR => run_get_market(input_bytes, context),
         // Leverage
         s if s == setLeverageCall::SELECTOR => run_set_leverage(input_bytes, caller, context),
-        s if s == setLeverageSignedCall::SELECTOR => {
-            run_set_leverage_signed(input_bytes, context)
-        }
+        s if s == setLeverageSignedCall::SELECTOR => run_set_leverage_signed(input_bytes, context),
         // Trading
         s if s == placeOrderCall::SELECTOR => run_place_order(input_bytes, caller, context),
         s if s == cancelOrderCall::SELECTOR => run_cancel_order(input_bytes, caller, context),

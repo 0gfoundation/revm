@@ -21,8 +21,8 @@ use crate::{
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
     best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot, mark_price_key,
-    market_key, open_interest_key, order_key, position_key, trade_count_key, user_buy_orders_key,
-    user_fee_rates_key, user_nonce_key, user_sell_orders_key,
+    market_fee_total_key, market_key, open_interest_key, order_key, position_key, trade_count_key,
+    user_buy_orders_key, user_fee_rates_key, user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -110,6 +110,32 @@ pub fn save_user_fee_rates<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let buf = encode(&rates)?;
     store_blob(context, user_fee_rates_key(user), &buf)
+}
+
+pub fn load_market_fee_total<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<u64, PrecompileError> {
+    let buf = load_blob(context, market_fee_total_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
+}
+
+pub fn add_market_fee_total<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    amount: u64,
+) -> Result<(), PrecompileError> {
+    if amount == 0 {
+        return Ok(());
+    }
+    let total = load_market_fee_total(context, market_id)?
+        .checked_add(amount)
+        .ok_or_else(|| perp_err("fee total overflow"))?;
+    let buf = encode(&total)?;
+    store_blob(context, market_fee_total_key(market_id), &buf)
 }
 
 // ── ERC-20 balance helpers ─────────────────────────────────────────────────────

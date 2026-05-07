@@ -26,6 +26,8 @@ sol! {
         function setUserFeeRates(address user, uint64 makerFeeBps, uint64 takerFeeBps) external;
         /// Query per-user trading fee rates in basis points. Unset users default to zero.
         function getUserFeeRates(address user) external view returns (uint64 makerFeeBps, uint64 takerFeeBps);
+        /// Query total trading fees collected for one market.
+        function getMarketFeeTotal(uint64 marketId) external view returns (uint64 totalFee);
 
         // ── Market management (admin only) ─────────────────────────────────
         /// Register a new perpetual market.

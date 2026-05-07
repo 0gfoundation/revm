@@ -10,6 +10,7 @@ use primitives::{keccak256, Address, B256};
 const PFX_ADMIN: &[u8] = b"admn";
 const PFX_ACCOUNT: &[u8] = b"acct";
 const PFX_USER_FEE: &[u8] = b"ufee";
+const PFX_MARKET_FEE_TOTAL: &[u8] = b"mfee"; // per-market collected trading fee total
 const PFX_TRADE_COUNT: &[u8] = b"tcnt"; // per-market sequential trade ID counter
 const PFX_POSITION: &[u8] = b"pos\x00";
 const PFX_BUY_ORDERS: &[u8] = b"bord"; // per-user buy order entries
@@ -66,6 +67,10 @@ pub fn account_key(user: Address) -> B256 {
 
 pub fn user_fee_rates_key(user: Address) -> B256 {
     keccak256([PFX_USER_FEE, user.as_slice()].concat())
+}
+
+pub fn market_fee_total_key(market_id: u64) -> B256 {
+    keccak256([PFX_MARKET_FEE_TOTAL, &market_id.to_be_bytes()].concat())
 }
 
 // ── Perp position ─────────────────────────────────────────────────────────
