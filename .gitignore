@@ -32,3 +32,6 @@ rustc-ice-*
 
 # Local PerpDEX working notes
 /docs/
+
+# Local deploy scripts
+/scripts/deploy-test.sh
