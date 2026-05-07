@@ -282,10 +282,25 @@ impl TakerSettlement {
 ///   drift, and
 /// - `opening_margin` covers any new position exposure.
 ///
-/// Algebraically `old_reserved == new_reserved + opening_margin`; integer
-/// division sub-additivity can produce a 1-unit excess which is returned to
-/// the wallet.  A maker's trading fee is pre-reserved and released from
-/// `pos.fee_reserved`, not charged from the wallet.
+/// `old_reserved` distributes across three destinations after the fill:
+///
+/// ```text
+/// old_reserved = opening_margin + new_reserved + net_release
+/// ```
+///
+/// - `opening_margin` → transitions from MR into `pos.margin`.  Always
+///   covered: `opening_margin ≤ fill_margin ≤ side_margin ≤ old_reserved`.
+/// - `new_reserved`   → stays locked in MR for remaining open orders.
+/// - `net_release`    → returned to wallet (≥ 0 in the common case).
+///
+/// When a fill **crosses the position sign** (long → short or vice versa),
+/// cross-side netting shifts and `new_reserved` can exceed
+/// `old_reserved − opening_margin` (deficit).  In that case the maker's open
+/// orders are auto-cancelled (dominant side first, LIFO) until MR fits within
+/// what was pre-paid — mirroring the taker's `ensure` logic.
+///
+/// A maker's trading fee is pre-reserved and released from `pos.fee_reserved`,
+/// not charged from the wallet.
 pub(super) fn settle_maker_fill<CTX: ContextTr>(
     context: &mut CTX,
     maker: Address,
@@ -329,27 +344,44 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     // cross-side netting depends on the updated position.
     let new_reserved =
         recompute_maker_order_reserve_after_fill(context, maker, market_id, &mut pos, market)?;
-    let required_reserved = new_reserved
-        .checked_add(opening_margin)
-        .ok_or_else(|| perp_err("placeOrder: maker reserved margin overflow"))?;
-    // Algebraically old_reserved == required_reserved always. Integer division
-    // is sub-additive — floor((B+C)/N) >= floor(B/N)+floor(C/N) — so
-    // old_reserved may exceed required_reserved by exactly 1. A deficit or a
-    // gap larger than 1 both indicate a bug in the margin accounting.
-    let dust = old_reserved.checked_sub(required_reserved).ok_or_else(|| {
-        perp_invariant_err(format!(
-            "maker reserved margin deficit: old={old_reserved} required={required_reserved}"
-        ))
-    })?;
-    if dust > 1 {
-        return Err(perp_invariant_err(format!(
-            "maker reserved margin excess too large: old={old_reserved} required={required_reserved} dust={dust}"
-        )));
-    }
+
     pos.fee_reserved = pos.fee_reserved.saturating_sub(maker_fee);
-    account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(dust);
-    storage::save_position(context, maker, market_id, &pos)?;
-    storage::save_account(context, maker, account)?;
+
+    // opening_margin ≤ old_reserved is guaranteed; this is how much of old_reserved
+    // is free to cover new_reserved after pos.margin is funded.
+    let max_sustainable_reserved = old_reserved.saturating_sub(opening_margin);
+
+    if new_reserved > max_sustainable_reserved {
+        // Deficit: position sign-flip shifted cross-side netting so remaining
+        // orders cost more MR than was pre-paid. Cancel maker orders (dominant
+        // side first, LIFO) to bring MR within budget, then reload.
+        storage::save_position(context, maker, market_id, &pos)?;
+        storage::save_account(context, maker, account)?;
+        cancel_maker_orders_until_mr_fits(
+            context,
+            maker,
+            market_id,
+            max_sustainable_reserved,
+            market,
+        )?;
+        pos = storage::load_position(context, maker, market_id)?;
+        account = storage::load_account(context, maker)?;
+        let net_release = old_reserved
+            .saturating_sub(pos.margin_reserved)
+            .saturating_sub(opening_margin);
+        account.perp_wallet_balance =
+            account.perp_wallet_balance.saturating_add(net_release);
+        storage::save_account(context, maker, account)?;
+    } else {
+        let net_release = old_reserved
+            .saturating_sub(new_reserved)
+            .saturating_sub(opening_margin);
+        account.perp_wallet_balance =
+            account.perp_wallet_balance.saturating_add(net_release);
+        storage::save_position(context, maker, market_id, &pos)?;
+        storage::save_account(context, maker, account)?;
+    }
+
     credit_fee_recipient(context, market_id, maker_fee)?;
 
     context.journal_mut().log(Log {
@@ -728,6 +760,52 @@ fn reduce_maker_order_entry_for_fill<CTX: ContextTr>(
             Ok(released)
         }
     }
+}
+
+/// Cancels the maker's open orders (dominant side first, LIFO) until
+/// `pos.margin_reserved ≤ max_reserved` or all orders are gone.
+///
+/// Called when a maker fill creates a deficit — the remaining orders require
+/// more MR than was pre-paid after funding the new position.  Cancelling
+/// orders frees MR and credits the wallet, restoring the conservation invariant
+/// without touching `pos.margin`.
+fn cancel_maker_orders_until_mr_fits<CTX: ContextTr>(
+    context: &mut CTX,
+    maker: Address,
+    market_id: u64,
+    max_reserved: u64,
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    loop {
+        let pos = storage::load_position(context, maker, market_id)?;
+        if pos.margin_reserved <= max_reserved {
+            break;
+        }
+        // Cancel from the dominant side first to reduce MR as fast as possible.
+        let prefer_buy = pos.buy_side_margin_reserved >= pos.sell_side_margin_reserved;
+        let buy_entries = storage::load_buy_orders(context, maker, market_id)?;
+        let sell_entries = storage::load_sell_orders(context, maker, market_id)?;
+        let order_id = if prefer_buy {
+            buy_entries
+                .last()
+                .map(|e| e.order_id)
+                .or_else(|| sell_entries.last().map(|e| e.order_id))
+        } else {
+            sell_entries
+                .last()
+                .map(|e| e.order_id)
+                .or_else(|| buy_entries.last().map(|e| e.order_id))
+        };
+        let Some(order_id) = order_id else { break };
+        let order = storage::load_order(context, &order_id)?.ok_or_else(|| {
+            perp_invariant_err(format!(
+                "maker order {:?} missing during deficit resolution",
+                order_id
+            ))
+        })?;
+        execute_order_cancellation(context, maker, market_id, order_id, order, market)?;
+    }
+    Ok(())
 }
 
 /// Recomputes the maker's order margin reservation from scratch after a fill.
