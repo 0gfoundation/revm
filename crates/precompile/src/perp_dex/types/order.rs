@@ -76,6 +76,10 @@ pub enum OrderStatus {
     PartiallyFilled = 1,
     Filled = 2,
     Cancelled = 3,
+    /// TIF-based system cancellation: IOC/FOK that could not be completely
+    /// filled.  Mirrors Binance's EXPIRED status — distinct from Cancelled
+    /// (user-initiated) so consumers can tell the two apart.
+    Expired = 4,
 }
 
 // ── Structs ───────────────────────────────────────────────────────────────

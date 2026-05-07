@@ -19,8 +19,8 @@ use crate::{
         errors::{perp_err, perp_invariant_err},
         interface::IPerpDex::{
             self, cancelOrderCall, cancelOrderSignedCall, getBookLevelCall, getBookPricesCall,
-            getOpenOrdersCall, getOpenOrdersReturn, getOrderCall, getOrderReturn, placeOrderCall,
-            placeOrderSignedCall,
+            getMarketFeeTotalCall, getOpenOrdersCall, getOpenOrdersReturn, getOrderCall,
+            getOrderReturn, placeOrderCall, placeOrderSignedCall,
         },
         math::{
             calc_buy_side_reserved_notional, calc_sell_side_reserved_notional, calc_trading_fee,
@@ -264,6 +264,19 @@ pub fn run_get_open_orders<CTX: ContextTr>(
             prices,
             remainingQuantities: remaining_quantities,
         },
+    )))
+}
+
+/// `getMarketFeeTotal(uint64 marketId) returns (uint64 totalFee)`
+pub fn run_get_market_fee_total<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = getMarketFeeTotalCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getMarketFeeTotal: invalid calldata"))?;
+    let total = storage::load_market_fee_total(context, args.marketId)?;
+    Ok(Bytes::from(getMarketFeeTotalCall::abi_encode_returns(
+        &total,
     )))
 }
 
@@ -531,7 +544,9 @@ fn cancel_unfilled_remainder<CTX: ContextTr>(
     }
 
     if let Some(mut o) = storage::load_order(context, order_id)? {
-        o.status = OrderStatus::Cancelled;
+        // Binance-style: TIF expiry (IOC/market not fully filled) → Expired,
+        // not Cancelled. Cancelled is reserved for user-initiated cancels.
+        o.status = OrderStatus::Expired;
         storage::save_order(context, order_id, &o)?;
     }
 
@@ -540,7 +555,11 @@ fn cancel_unfilled_remainder<CTX: ContextTr>(
 
 fn ensure_fok_filled(remaining: u64) -> Result<(), PrecompileError> {
     if remaining > 0 {
-        return Err(perp_err("placeOrder: FOK order cannot be fully filled"));
+        // feasibility check passed before match_order — if we still have remaining,
+        // the two functions disagree on what was matchable, which is a bug
+        return Err(perp_invariant_err(format!(
+            "FOK order has remaining={remaining} after feasibility check passed"
+        )));
     }
 
     Ok(())
@@ -739,31 +758,10 @@ fn cancel_order_core<CTX: ContextTr>(
         return Err(perp_err("cancelOrder: order not cancellable"));
     }
 
-    let remaining = order.quantity - order.filled;
     let market_id = order.market_id;
-    let price = order.price;
-
-    remove_from_book(context, market_id, order.side, price, &order_id)?;
-
     let market = storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("cancelOrder: unknown market"))?;
-    release_margin_for_cancelled_order(
-        context, account, market_id, order.side, &order_id, remaining, &market,
-    )?;
-
-    order.status = OrderStatus::Cancelled;
-    storage::save_order(context, &order_id, &order)?;
-
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::OrderCancelled {
-            user: account,
-            orderId: FixedBytes(order_id),
-            marketId: market_id,
-        }
-        .to_log_data(),
-    });
-
+    execute_order_cancellation(context, account, market_id, order_id, order, &market)?;
     Ok(Bytes::new())
 }
 
@@ -836,15 +834,26 @@ pub(super) fn match_order<CTX: ContextTr>(
                     taker_settlement.record_fill(ask_price, fill_qty, Side::Buy, market)?;
                     settle_maker_fill(
                         context,
-                        taker_addr,
                         Address::from(maker_order.owner),
-                        taker_order_id,
                         &maker_id,
                         market_id,
                         ask_price,
                         fill_qty,
                         Side::Buy,
                         market,
+                    )?;
+                    emit_trade(
+                        context,
+                        TradeEvent {
+                            market_id,
+                            taker_order_id,
+                            maker_order_id: &maker_id,
+                            taker: taker_addr,
+                            maker: Address::from(maker_order.owner),
+                            price: ask_price,
+                            quantity: fill_qty,
+                            taker_side: Side::Buy,
+                        },
                     )?;
 
                     // Update maker order.
@@ -942,15 +951,26 @@ pub(super) fn match_order<CTX: ContextTr>(
                     taker_settlement.record_fill(bid_price, fill_qty, Side::Sell, market)?;
                     settle_maker_fill(
                         context,
-                        taker_addr,
                         Address::from(maker_order.owner),
-                        taker_order_id,
                         &maker_id,
                         market_id,
                         bid_price,
                         fill_qty,
                         Side::Sell,
                         market,
+                    )?;
+                    emit_trade(
+                        context,
+                        TradeEvent {
+                            market_id,
+                            taker_order_id,
+                            maker_order_id: &maker_id,
+                            taker: taker_addr,
+                            maker: Address::from(maker_order.owner),
+                            price: bid_price,
+                            quantity: fill_qty,
+                            taker_side: Side::Sell,
+                        },
                     )?;
 
                     let mut updated_maker =
@@ -1000,6 +1020,40 @@ pub(super) fn match_order<CTX: ContextTr>(
 
     taker_settlement.finalize(context, side, market)?;
     Ok(remaining)
+}
+
+struct TradeEvent<'a> {
+    market_id: u64,
+    taker_order_id: &'a [u8; 32],
+    maker_order_id: &'a [u8; 32],
+    taker: Address,
+    maker: Address,
+    price: u64,
+    quantity: u64,
+    taker_side: Side,
+}
+
+fn emit_trade<CTX: ContextTr>(
+    context: &mut CTX,
+    trade: TradeEvent<'_>,
+) -> Result<(), PrecompileError> {
+    let trade_id = storage::next_trade_id(context, trade.market_id)?;
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::Trade {
+            marketId: trade.market_id,
+            tradeId: trade_id,
+            takerOrderId: FixedBytes(*trade.taker_order_id),
+            makerOrderId: FixedBytes(*trade.maker_order_id),
+            taker: trade.taker,
+            maker: trade.maker,
+            price: trade.price,
+            quantity: trade.quantity,
+            takerSide: trade.taker_side as u8,
+        }
+        .to_log_data(),
+    });
+    Ok(())
 }
 
 // ── Resting in book ───────────────────────────────────────────────────────────
@@ -1184,6 +1238,39 @@ fn rest_in_book<CTX: ContextTr>(
 }
 
 // ── Cancel helpers ─────────────────────────────────────────────────────────────
+
+/// Atomically executes all four steps of an order cancellation:
+/// remove from book → release reserved margin → mark Cancelled → emit log.
+///
+/// Both the explicit user-initiated cancel path and the auto-cancel-for-margin
+/// path in settlement use this function so the invariant "these steps always
+/// happen together" is enforced in one place.
+pub(super) fn execute_order_cancellation<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    order_id: [u8; 32],
+    mut order: Order,
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    let remaining = order.quantity - order.filled;
+    remove_from_book(context, market_id, order.side, order.price, &order_id)?;
+    release_margin_for_cancelled_order(
+        context, user, market_id, order.side, &order_id, remaining, market,
+    )?;
+    order.status = OrderStatus::Cancelled;
+    storage::save_order(context, &order_id, &order)?;
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OrderCancelled {
+            user,
+            orderId: FixedBytes(order_id),
+            marketId: market_id,
+        }
+        .to_log_data(),
+    });
+    Ok(())
+}
 
 pub(super) fn remove_from_book<CTX: ContextTr>(
     context: &mut CTX,

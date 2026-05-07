@@ -5,9 +5,9 @@ use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, Address, FixedBytes, U256};
 
 use crate::perp_dex::{
-    interface::IPerpDex::{cancelOrderCall, getOrderCall, placeOrderCall},
+    interface::IPerpDex::{cancelOrderCall, getMarketFeeTotalCall, getOrderCall, placeOrderCall},
     storage,
-    types::{Market, OrderStatus, PerpPosition},
+    types::{Market, OrderStatus, PerpPosition, UserFeeRates},
     PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
 
@@ -113,6 +113,18 @@ fn place(
 
 fn get_order(ctx: &mut TestCtx, id: [u8; 32]) -> crate::perp_dex::types::Order {
     storage::load_order(ctx, &id).unwrap().unwrap()
+}
+
+fn market_fee_total(ctx: &mut TestCtx) -> u64 {
+    let ret = run_get_market_fee_total(
+        &getMarketFeeTotalCall {
+            marketId: MARKET_ID,
+        }
+        .abi_encode(),
+        ctx,
+    )
+    .unwrap();
+    U256::from_be_slice(&ret[..32]).to::<u64>()
 }
 
 // ── Input validation ───────────────────────────────────────────────────────
@@ -438,6 +450,68 @@ fn maker_fill_consumes_reserved_fee_instead_of_position_margin() {
 }
 
 #[test]
+fn market_fee_total_tracks_collected_maker_and_taker_fees() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    storage::save_user_fee_rates(
+        &mut ctx,
+        ALICE,
+        UserFeeRates {
+            maker_fee_bps: 0,
+            taker_fee_bps: 100,
+        },
+    )
+    .unwrap();
+    storage::save_user_fee_rates(
+        &mut ctx,
+        BOB,
+        UserFeeRates {
+            maker_fee_bps: 200,
+            taker_fee_bps: 0,
+        },
+    )
+    .unwrap();
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    let expected_taker_fee = FILL_VALUE * 100 / 10_000;
+    let expected_maker_fee = FILL_VALUE * 200 / 10_000;
+    let expected_total = expected_taker_fee + expected_maker_fee;
+    assert_eq!(market_fee_total(&mut ctx), expected_total);
+    assert_eq!(wallet(&mut ctx, ADMIN), expected_total);
+}
+
+#[test]
+fn maker_fill_recomputes_remaining_order_margin_after_position_close() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+    assert_eq!(pos(&mut ctx, BOB).amount, -(QTY as i64));
+
+    let buy_id = place(&mut ctx, BOB, 0, PRICE, QTY * 2, 0, 0);
+    let bob = pos(&mut ctx, BOB);
+    assert_eq!(bob.buy_side_margin_reserved, INIT_MARGIN);
+    assert_eq!(wallet(&mut ctx, BOB), WALLET - (INIT_MARGIN * 2));
+
+    place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
+
+    let bob = pos(&mut ctx, BOB);
+    assert_eq!(bob.amount, 0);
+    assert_eq!(bob.margin, 0);
+    assert_eq!(bob.buy_side_margin_reserved, INIT_MARGIN);
+    assert_eq!(bob.margin_reserved, INIT_MARGIN);
+    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
+    assert_eq!(
+        get_order(&mut ctx, buy_id).status,
+        OrderStatus::PartiallyFilled
+    );
+}
+
+#[test]
 fn fill_rejects_when_taker_wallet_cannot_cover_opening_margin() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
@@ -642,7 +716,7 @@ fn ioc_with_no_liquidity_is_immediately_cancelled() {
 
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 1); // IOC, no asks
     let o = get_order(&mut ctx, id);
-    assert_eq!(o.status, OrderStatus::Cancelled);
+    assert_eq!(o.status, OrderStatus::Expired);
     assert_eq!(o.filled, 0);
 }
 
@@ -653,10 +727,10 @@ fn ioc_partial_fill_cancels_remainder() {
 
     place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // only QTY available
 
-    // IOC buy for 2×QTY: fills QTY, remainder cancelled.
+    // IOC buy for 2×QTY: fills QTY, remainder expired.
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 1);
     let o = get_order(&mut ctx, id);
-    assert_eq!(o.status, OrderStatus::Cancelled);
+    assert_eq!(o.status, OrderStatus::Expired);
     assert_eq!(o.filled, QTY);
 }
 
