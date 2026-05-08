@@ -126,6 +126,37 @@ sol! {
         /// Liquidate an under-margined position (anyone can call).
         function liquidate(address user, uint64 marketId) external;
 
+        // ── Oracle & mark price ───────────────────────────────────────────
+        /// Set the authorized oracle address. Only callable by admin.
+        /// The oracle is the only non-admin address allowed to call updateIndexPrice.
+        function setOracleAddress(address oracle) external;
+        /// Query the current oracle address (zero if not set).
+        function getOracleAddress() external view returns (address oracle);
+
+        /// Push a new index price and recompute the mark price using:
+        ///   Mark Price = Median(Price1, Price2, ContractPrice)
+        ///   Price1 = indexPrice * [1 + lastFundingRate * (timeUntilNext / fundingInterval)]
+        ///   Price2 = indexPrice + MovingAverage30s(midPrice - indexPrice)
+        ///   ContractPrice = last on-chain fill price (falls back to indexPrice if no trades yet)
+        ///
+        /// The 30-second moving average ring buffer is updated each call; each elapsed
+        /// second since the last call is filled with the current basis value.
+        ///
+        /// Callable by admin or the configured oracle address.
+        function updateIndexPrice(uint64 marketId, uint64 indexPrice, uint64 timestamp) external;
+
+        /// Query the latest oracle index price and its timestamp for a market.
+        function getIndexPrice(uint64 marketId) external view returns (uint64 indexPrice, uint64 lastTimestamp);
+
+        /// Set the funding configuration used by Price1 in the mark price formula.
+        /// Called by admin after each funding settlement epoch.
+        /// lastFundingRate: settled rate in 1e9 units (FUNDING_RATE_ONE = 1_000_000_000).
+        /// fundingInterval: seconds between epochs (e.g. 28800 for 8 h).
+        /// nextFundingTs:   Unix-second timestamp of the next epoch.
+        function setFundingState(uint64 marketId, int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs) external;
+        /// Query the current funding configuration for a market.
+        function getFundingState(uint64 marketId) external view returns (int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs);
+
         // ── API key management (ed25519 signed orders) ────────────────────
         /// Register an ed25519 public key in slot `keyId` for the caller.
         /// expiry: Unix-second timestamp after which the key is rejected. 0 = never expires.
@@ -229,5 +260,15 @@ sol! {
         // Feeds: /fundingRate (history), /income (FUNDING_FEE)
         // NOTE: defined but not yet emitted — will be wired when funding settlement is implemented.
         event FundingSettled(uint64 indexed marketId, address indexed user, int64 fundingRate, int64 amount, uint64 markPrice);
+
+        // Feeds: oracle address changes
+        event OracleAddressUpdated(address indexed previousOracle, address indexed newOracle);
+
+        // Feeds: /premiumIndex (index price history), /markPrice websocket
+        // price1/price2 are the two intermediate components; markPrice is the median result.
+        event IndexPriceUpdated(uint64 indexed marketId, uint64 indexPrice, uint64 markPrice, uint64 price1, uint64 price2, uint64 timestamp);
+
+        // Feeds: /fundingRate configuration updates
+        event FundingStateUpdated(uint64 indexed marketId, int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs);
     }
 }

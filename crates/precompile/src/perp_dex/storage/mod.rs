@@ -11,7 +11,10 @@ use crate::{
     journal::{load_bytes, store_bytes},
     perp_dex::{
         errors::perp_err,
-        types::{ApiKey, Market, Order, OrderEntry, PerpPosition, UserAccount, UserFeeRates},
+        types::{
+            ApiKey, FundingState, IndexPriceState, Market, Order, OrderEntry, PerpPosition,
+            PriceBasisWindow, UserAccount, UserFeeRates,
+        },
         PERP_DEX_ADDRESS,
     },
     stateful_precompiles::convert_db_err,
@@ -20,9 +23,11 @@ use crate::{
 
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
-    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot, mark_price_key,
-    market_fee_total_key, market_key, open_interest_key, order_key, position_key, trade_count_key,
-    user_buy_orders_key, user_fee_rates_key, user_nonce_key, user_sell_orders_key,
+    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot,
+    funding_state_key, index_price_state_key, last_traded_price_key, mark_price_key,
+    market_fee_total_key, market_key, open_interest_key, oracle_key, order_key,
+    position_key, price_basis_window_key, trade_count_key, user_buy_orders_key,
+    user_fee_rates_key, user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -673,4 +678,110 @@ fn save_api_key_ids<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let buf = encode(&ids)?;
     store_blob(context, api_key_ids_key(user), &buf)
+}
+
+// ── Oracle address ────────────────────────────────────────────────────────────
+
+pub fn load_oracle<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
+    let buf = load_blob(context, oracle_key())?;
+    if buf.is_empty() {
+        return Ok(Address::ZERO);
+    }
+    decode(&buf)
+}
+
+pub fn save_oracle<CTX: ContextTr>(
+    context: &mut CTX,
+    oracle: Address,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&oracle)?;
+    store_blob(context, oracle_key(), &buf)
+}
+
+// ── Index price state ─────────────────────────────────────────────────────────
+
+pub fn load_index_price_state<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<IndexPriceState, PrecompileError> {
+    let buf = load_blob(context, index_price_state_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(IndexPriceState::default());
+    }
+    decode(&buf)
+}
+
+pub fn save_index_price_state<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    state: &IndexPriceState,
+) -> Result<(), PrecompileError> {
+    let buf = encode(state)?;
+    store_blob(context, index_price_state_key(market_id), &buf)
+}
+
+// ── Price basis window (30s MA) ───────────────────────────────────────────────
+
+pub fn load_price_basis_window<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<PriceBasisWindow, PrecompileError> {
+    let buf = load_blob(context, price_basis_window_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(PriceBasisWindow::default());
+    }
+    decode(&buf)
+}
+
+pub fn save_price_basis_window<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    window: &PriceBasisWindow,
+) -> Result<(), PrecompileError> {
+    let buf = encode(window)?;
+    store_blob(context, price_basis_window_key(market_id), &buf)
+}
+
+// ── Last traded price (contract price) ───────────────────────────────────────
+
+pub fn load_last_traded_price<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<u64, PrecompileError> {
+    let buf = load_blob(context, last_traded_price_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
+}
+
+pub fn save_last_traded_price<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&price)?;
+    store_blob(context, last_traded_price_key(market_id), &buf)
+}
+
+// ── Funding state ─────────────────────────────────────────────────────────────
+
+pub fn load_funding_state<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<FundingState, PrecompileError> {
+    let buf = load_blob(context, funding_state_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(FundingState::default());
+    }
+    decode(&buf)
+}
+
+pub fn save_funding_state<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    state: &FundingState,
+) -> Result<(), PrecompileError> {
+    let buf = encode(state)?;
+    store_blob(context, funding_state_key(market_id), &buf)
 }

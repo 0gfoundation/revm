@@ -10,18 +10,20 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         interface::IPerpDex::{
-            self, addMarketCall, addPositionMarginCall, getAdminCall, getMarkPriceCall,
-            getMarketCall, getMarketReturn, getPositionCall, getPositionReturn, initAdminCall,
-            liquidateCall, removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
-            setMarkPriceCall, transferAdminCall, updateMarketCall,
+            self, addMarketCall, addPositionMarginCall, getAdminCall, getFundingStateCall,
+            getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn, getMarkPriceCall,
+            getMarketCall, getMarketReturn, getOracleAddressCall, getPositionCall, getPositionReturn,
+            initAdminCall, liquidateCall, removePositionMarginCall, setFundingStateCall,
+            setLeverageCall, setLeverageSignedCall, setMarkPriceCall, setOracleAddressCall,
+            transferAdminCall, updateIndexPriceCall, updateMarketCall,
         },
-        math::{calc_value, is_above_maintenance_margin},
+        math::{calc_value, is_above_maintenance_margin, FUNDING_RATE_ONE},
         storage,
         trading::{
             can_fully_liquidate_on_book, check_api_key_expiry, check_recv_window,
             execute_liquidation_market_order, verify_ed25519,
         },
-        types::{ApiKey, Market, Side},
+        types::{FundingState, IndexPriceState, Market, Side},
         PERP_DEX_ADDRESS,
     },
     PrecompileError,
@@ -806,6 +808,275 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     storage::save_position(context, user, market_id, &pos)?;
 
     Ok(())
+}
+
+// ── Oracle address ────────────────────────────────────────────────────────────
+
+/// `setOracleAddress(address oracle)` — admin only.
+pub fn run_set_oracle_address<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = setOracleAddressCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("setOracleAddress: invalid calldata"))?;
+
+    require_admin(caller, context)?;
+
+    let previous = storage::load_oracle(context)?;
+    storage::save_oracle(context, args.oracle)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OracleAddressUpdated {
+            previousOracle: previous,
+            newOracle: args.oracle,
+        }
+        .to_log_data(),
+    });
+    Ok(Bytes::new())
+}
+
+/// `getOracleAddress() returns (address oracle)`
+pub fn run_get_oracle_address<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    getOracleAddressCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getOracleAddress: invalid calldata"))?;
+    let oracle = storage::load_oracle(context)?;
+    Ok(Bytes::from(getOracleAddressCall::abi_encode_returns(&oracle)))
+}
+
+// ── Index price & mark price computation ──────────────────────────────────────
+
+/// `updateIndexPrice(uint64 marketId, uint64 indexPrice, uint64 timestamp)`
+///
+/// Callable by admin or the configured oracle address.
+///
+/// Steps:
+/// 1. Update the 30-second basis ring buffer with elapsed samples.
+/// 2. Save the new index price state.
+/// 3. Compute Price1, Price2, ContractPrice and take their median as mark price.
+/// 4. Snap mark price to tick_size and persist it.
+/// 5. Emit IndexPriceUpdated + MarkPriceUpdated.
+pub fn run_update_index_price<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = updateIndexPriceCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("updateIndexPrice: invalid calldata"))?;
+
+    require_admin_or_oracle(caller, context)?;
+
+    if args.indexPrice == 0 {
+        return Err(perp_err("updateIndexPrice: indexPrice must be > 0"));
+    }
+    let market = storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("updateIndexPrice: unknown market"))?;
+    if args.indexPrice > market.max_price {
+        return Err(perp_err("updateIndexPrice: indexPrice exceeds market maximum"));
+    }
+
+    // ── 1. Update basis ring buffer ───────────────────────────────────────────
+    let best_bid = storage::load_best_bid(context, args.marketId)?;
+    let best_ask = storage::load_best_ask(context, args.marketId)?;
+    let mid_price: u64 = match (best_bid, best_ask) {
+        (0, 0) => args.indexPrice,
+        (0, ask) => ask,
+        (bid, 0) => bid,
+        (bid, ask) => ((bid as u128 + ask as u128) / 2) as u64,
+    };
+    // basis can be negative when mid < index
+    let basis = mid_price as i64 - args.indexPrice as i64;
+
+    let mut window = storage::load_price_basis_window(context, args.marketId)?;
+    let new_samples = if window.last_sample_ts == 0 {
+        1 // seed on first call regardless of timestamp
+    } else {
+        args.timestamp
+            .saturating_sub(window.last_sample_ts)
+            .min(crate::perp_dex::types::PRICE_BASIS_WINDOW_SIZE as u64) as usize
+    };
+    for _ in 0..new_samples {
+        window.push_sample(basis);
+    }
+    window.last_sample_ts = args.timestamp;
+
+    // ── 2. Save index price state ─────────────────────────────────────────────
+    storage::save_index_price_state(
+        context,
+        args.marketId,
+        &IndexPriceState {
+            index_price: args.indexPrice,
+            timestamp: args.timestamp,
+        },
+    )?;
+
+    // ── 3. Compute mark price components ─────────────────────────────────────
+    let funding = storage::load_funding_state(context, args.marketId)?;
+    let price1 = compute_price1(args.indexPrice, &funding, args.timestamp);
+
+    let ma_basis = window.moving_average();
+    let price2 = (args.indexPrice as i64).saturating_add(ma_basis).max(1) as u64;
+
+    let last_traded = storage::load_last_traded_price(context, args.marketId)?;
+    let contract_price = if last_traded == 0 { args.indexPrice } else { last_traded };
+
+    let raw_mark = median_u64(price1, price2, contract_price);
+
+    // Snap to tick_size (floor), bounded by [tick_size, max_price].
+    let mark_price = if market.tick_size > 0 {
+        let snapped = (raw_mark / market.tick_size) * market.tick_size;
+        snapped.max(market.tick_size).min(market.max_price)
+    } else {
+        raw_mark.min(market.max_price).max(1)
+    };
+
+    // ── 4. Persist ───────────────────────────────────────────────────────────
+    storage::save_price_basis_window(context, args.marketId, &window)?;
+    storage::save_mark_price(context, args.marketId, mark_price)?;
+
+    // ── 5. Emit events ────────────────────────────────────────────────────────
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::IndexPriceUpdated {
+            marketId: args.marketId,
+            indexPrice: args.indexPrice,
+            markPrice: mark_price,
+            price1,
+            price2,
+            timestamp: args.timestamp,
+        }
+        .to_log_data(),
+    });
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::MarkPriceUpdated {
+            marketId: args.marketId,
+            price: mark_price,
+            updater: caller,
+        }
+        .to_log_data(),
+    });
+
+    Ok(Bytes::new())
+}
+
+/// `getIndexPrice(uint64 marketId) returns (uint64 indexPrice, uint64 lastTimestamp)`
+pub fn run_get_index_price<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = getIndexPriceCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getIndexPrice: invalid calldata"))?;
+    let state = storage::load_index_price_state(context, args.marketId)?;
+    Ok(Bytes::from(getIndexPriceCall::abi_encode_returns(
+        &getIndexPriceReturn {
+            indexPrice: state.index_price,
+            lastTimestamp: state.timestamp,
+        },
+    )))
+}
+
+// ── Funding state ─────────────────────────────────────────────────────────────
+
+/// `setFundingState(uint64 marketId, int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs)`
+pub fn run_set_funding_state<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = setFundingStateCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("setFundingState: invalid calldata"))?;
+
+    require_admin(caller, context)?;
+
+    storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("setFundingState: unknown market"))?;
+
+    let state = FundingState {
+        last_funding_rate: args.lastFundingRate,
+        funding_interval: args.fundingInterval,
+        next_funding_ts: args.nextFundingTs,
+    };
+    storage::save_funding_state(context, args.marketId, &state)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::FundingStateUpdated {
+            marketId: args.marketId,
+            lastFundingRate: args.lastFundingRate,
+            fundingInterval: args.fundingInterval,
+            nextFundingTs: args.nextFundingTs,
+        }
+        .to_log_data(),
+    });
+    Ok(Bytes::new())
+}
+
+/// `getFundingState(uint64 marketId) returns (int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs)`
+pub fn run_get_funding_state<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = getFundingStateCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getFundingState: invalid calldata"))?;
+    let state = storage::load_funding_state(context, args.marketId)?;
+    Ok(Bytes::from(getFundingStateCall::abi_encode_returns(
+        &getFundingStateReturn {
+            lastFundingRate: state.last_funding_rate,
+            fundingInterval: state.funding_interval,
+            nextFundingTs: state.next_funding_ts,
+        },
+    )))
+}
+
+// ── Oracle math helpers ───────────────────────────────────────────────────────
+
+/// Price1 = index × [1 + (last_funding_rate × time_until_next / funding_interval)]
+///
+/// Uses FUNDING_RATE_ONE (1e9) as the fixed-point base for the rate.
+/// Returns `index` unchanged if funding is not configured or the epoch has passed.
+fn compute_price1(index: u64, funding: &FundingState, now: u64) -> u64 {
+    if funding.funding_interval == 0 || funding.next_funding_ts == 0 {
+        return index;
+    }
+    let time_until = funding.next_funding_ts.saturating_sub(now);
+    if time_until == 0 {
+        return index;
+    }
+    // adjustment = rate × time_until / interval  (still in FUNDING_RATE_ONE units)
+    let adjustment = (funding.last_funding_rate as i128) * (time_until as i128)
+        / (funding.funding_interval as i128);
+    let total_factor = FUNDING_RATE_ONE as i128 + adjustment;
+    let price1 = ((index as i128) * total_factor / FUNDING_RATE_ONE as i128).max(1);
+    price1.min(u64::MAX as i128) as u64
+}
+
+fn median_u64(a: u64, b: u64, c: u64) -> u64 {
+    let mut arr = [a, b, c];
+    arr.sort_unstable();
+    arr[1]
+}
+
+fn require_admin_or_oracle<CTX: ContextTr>(
+    caller: Address,
+    context: &mut CTX,
+) -> Result<(), PrecompileError> {
+    let admin = storage::load_admin(context)?;
+    if admin == Address::ZERO {
+        return Err(perp_err("not authorised: admin not initialised"));
+    }
+    if caller == admin {
+        return Ok(());
+    }
+    let oracle = storage::load_oracle(context)?;
+    if oracle != Address::ZERO && caller == oracle {
+        return Ok(());
+    }
+    Err(perp_err("not authorised: caller is not admin or oracle"))
 }
 
 #[cfg(test)]

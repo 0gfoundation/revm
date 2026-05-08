@@ -1051,6 +1051,7 @@ fn emit_trade<CTX: ContextTr>(
     context: &mut CTX,
     trade: TradeEvent<'_>,
 ) -> Result<(), PrecompileError> {
+    storage::save_last_traded_price(context, trade.market_id, trade.price)?;
     let trade_id = storage::next_trade_id(context, trade.market_id)?;
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,

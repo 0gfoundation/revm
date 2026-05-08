@@ -28,6 +28,11 @@ const PFX_BEST_BID: &[u8] = b"bbd\x00"; // cached best bid price (0 = empty)
 const PFX_BEST_ASK: &[u8] = b"bak\x00"; // cached best ask price (0 = empty)
 const PFX_API_KEY: &[u8] = b"apik"; // per-user per-slot ed25519 key
 const PFX_API_KEY_IDS: &[u8] = b"akid"; // per-user list of registered key_ids
+const PFX_ORACLE: &[u8] = b"orcl"; // authorized oracle address
+const PFX_INDEX_PRICE: &[u8] = b"idxp"; // per-market IndexPriceState
+const PFX_BASIS_WINDOW: &[u8] = b"bswn"; // per-market PriceBasisWindow (30s MA)
+const PFX_LAST_TRADED: &[u8] = b"ltrd"; // per-market last traded price (contract price)
+const PFX_FUNDING_STATE: &[u8] = b"fund"; // per-market FundingState
 
 // ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
 
@@ -171,4 +176,31 @@ pub fn api_key_key(user: Address, key_id: u8) -> B256 {
 /// List of registered key_ids for a user (Vec<u8>).
 pub fn api_key_ids_key(user: Address) -> B256 {
     keccak256([PFX_API_KEY_IDS, user.as_slice()].concat())
+}
+
+// ── Oracle price feed ─────────────────────────────────────────────────────────
+
+/// Authorized oracle address (Address; zero = not set).
+pub fn oracle_key() -> B256 {
+    keccak256(PFX_ORACLE)
+}
+
+/// Per-market IndexPriceState (index_price + timestamp).
+pub fn index_price_state_key(market_id: u64) -> B256 {
+    keccak256([PFX_INDEX_PRICE, &market_id.to_be_bytes()].concat())
+}
+
+/// Per-market PriceBasisWindow (30-second MA basis ring buffer).
+pub fn price_basis_window_key(market_id: u64) -> B256 {
+    keccak256([PFX_BASIS_WINDOW, &market_id.to_be_bytes()].concat())
+}
+
+/// Per-market last traded price (the "contract price" input to mark price median).
+pub fn last_traded_price_key(market_id: u64) -> B256 {
+    keccak256([PFX_LAST_TRADED, &market_id.to_be_bytes()].concat())
+}
+
+/// Per-market FundingState (last rate, interval, next timestamp).
+pub fn funding_state_key(market_id: u64) -> B256 {
+    keccak256([PFX_FUNDING_STATE, &market_id.to_be_bytes()].concat())
 }
