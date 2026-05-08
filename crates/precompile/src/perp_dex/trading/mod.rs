@@ -832,7 +832,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let fill_qty = remaining.min(available);
 
                     taker_settlement.record_fill(ask_price, fill_qty, Side::Buy, market)?;
-                    settle_maker_fill(
+                    let maker_fee = settle_maker_fill(
                         context,
                         Address::from(maker_order.owner),
                         &maker_id,
@@ -842,6 +842,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                         Side::Buy,
                         market,
                     )?;
+                    let fill_notional =
+                        calc_value(ask_price, fill_qty, market.base_decimals, market.price_decimals)?;
+                    let taker_fee =
+                        calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
                     emit_trade(
                         context,
                         TradeEvent {
@@ -853,6 +857,8 @@ pub(super) fn match_order<CTX: ContextTr>(
                             price: ask_price,
                             quantity: fill_qty,
                             taker_side: Side::Buy,
+                            taker_fee,
+                            maker_fee,
                         },
                     )?;
 
@@ -949,7 +955,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let fill_qty = remaining.min(available);
 
                     taker_settlement.record_fill(bid_price, fill_qty, Side::Sell, market)?;
-                    settle_maker_fill(
+                    let maker_fee = settle_maker_fill(
                         context,
                         Address::from(maker_order.owner),
                         &maker_id,
@@ -959,6 +965,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                         Side::Sell,
                         market,
                     )?;
+                    let fill_notional =
+                        calc_value(bid_price, fill_qty, market.base_decimals, market.price_decimals)?;
+                    let taker_fee =
+                        calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
                     emit_trade(
                         context,
                         TradeEvent {
@@ -970,6 +980,8 @@ pub(super) fn match_order<CTX: ContextTr>(
                             price: bid_price,
                             quantity: fill_qty,
                             taker_side: Side::Sell,
+                            taker_fee,
+                            maker_fee,
                         },
                     )?;
 
@@ -1031,6 +1043,8 @@ struct TradeEvent<'a> {
     price: u64,
     quantity: u64,
     taker_side: Side,
+    taker_fee: u64,
+    maker_fee: u64,
 }
 
 fn emit_trade<CTX: ContextTr>(
@@ -1050,6 +1064,8 @@ fn emit_trade<CTX: ContextTr>(
             price: trade.price,
             quantity: trade.quantity,
             takerSide: trade.taker_side as u8,
+            takerFee: trade.taker_fee,
+            makerFee: trade.maker_fee,
         }
         .to_log_data(),
     });

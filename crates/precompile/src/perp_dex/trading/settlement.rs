@@ -86,6 +86,10 @@ impl TakerSettlement {
         })
     }
 
+    pub(super) fn taker_fee_bps(&self) -> u64 {
+        self.taker_fee_bps
+    }
+
     /// Accumulates one partial fill into the running closing/opening totals.
     ///
     /// The matcher may call this multiple times for a single taker order (one
@@ -310,7 +314,7 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     fill_qty: u64,
     taker_side: Side,
     market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
+) -> Result<u64, PrecompileError> {
     let maker_side = taker_side.opposite();
     let mut pos = storage::load_position(context, maker, market_id)?;
     let mut account = storage::load_account(context, maker)?;
@@ -397,7 +401,7 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
         .to_log_data(),
     });
 
-    Ok(())
+    Ok(maker_fee)
 }
 
 /// Deducts a trading fee from the wallet.

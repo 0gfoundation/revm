@@ -412,6 +412,7 @@ pub fn run_get_position<CTX: ContextTr>(
             vQuoteBalance: pos.v_quote_balance,
             margin: pos.margin,
             marginReserved: pos.margin_reserved,
+            feeReserved: pos.fee_reserved,
             leverage: pos.leverage,
         },
     )))

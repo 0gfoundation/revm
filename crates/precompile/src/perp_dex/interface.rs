@@ -114,6 +114,7 @@ sol! {
             int64  vQuoteBalance,
             int64  margin,
             uint64 marginReserved,
+            uint64 feeReserved,
             uint64 leverage
         );
         /// Add isolated margin from the caller's perp wallet to an open position.
@@ -205,7 +206,8 @@ sol! {
 
         // Feeds: /trades, /historicalTrades, /aggTrades, /klines, /ticker/24hr, /myTrades
         // tradeId: global sequential counter for fromId pagination and firstId/lastId in 24hr ticker
-        event Trade(uint64 indexed marketId, uint64 tradeId, bytes32 takerOrderId, bytes32 makerOrderId, address taker, address maker, uint64 price, uint64 quantity, uint8 takerSide);
+        // takerFee / makerFee: USDC micro-units (6-decimal) charged to each side for this fill
+        event Trade(uint64 indexed marketId, uint64 tradeId, bytes32 takerOrderId, bytes32 makerOrderId, address taker, address maker, uint64 price, uint64 quantity, uint8 takerSide, uint64 takerFee, uint64 makerFee);
 
         // Feeds: /positionRisk (history), /income (REALIZED_PNL — derived from vQuoteBalance delta)
         event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage);
