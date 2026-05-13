@@ -62,6 +62,7 @@ fn setup(ctx: &mut TestCtx) {
             min_quantity: QTY,
             max_quantity: QTY * 1_000,
             max_price: PRICE * 1_000,
+            price_update_interval: 15,
             active: true,
         },
     )
@@ -325,6 +326,7 @@ fn margin_uses_market_price_decimals() {
             min_quantity: 100_000_000,
             max_quantity: 100_000_000,
             max_price: 1_000_000,
+            price_update_interval: 15,
             active: true,
         },
     )
@@ -708,6 +710,26 @@ fn market_buy_matches_lowest_ask_first() {
 }
 
 // ── IOC ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn matching_saves_last_traded_price_after_final_fill_price() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    fund(&mut ctx, CAROL, WALLET);
+
+    let low_price = PRICE;
+    let high_price = PRICE + 10 * TICK;
+
+    place(&mut ctx, BOB, 1, low_price, QTY, 0, 0);
+    place(&mut ctx, CAROL, 1, high_price, QTY, 0, 0);
+
+    place(&mut ctx, ALICE, 0, high_price, QTY * 2, 0, 0);
+
+    assert_eq!(
+        storage::load_last_traded_price(&mut ctx, MARKET_ID).unwrap(),
+        high_price
+    );
+}
 
 #[test]
 fn ioc_with_no_liquidity_is_immediately_cancelled() {

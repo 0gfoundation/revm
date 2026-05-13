@@ -30,7 +30,8 @@ const PFX_API_KEY: &[u8] = b"apik"; // per-user per-slot ed25519 key
 const PFX_API_KEY_IDS: &[u8] = b"akid"; // per-user list of registered key_ids
 const PFX_ORACLE: &[u8] = b"orcl"; // authorized oracle address
 const PFX_INDEX_PRICE: &[u8] = b"idxp"; // per-market IndexPriceState
-const PFX_BASIS_WINDOW: &[u8] = b"bswn"; // per-market PriceBasisWindow (30s MA)
+const PFX_INDEX_HISTORY: &[u8] = b"idxh"; // per-market IndexPriceHistory
+const PFX_BASIS_WINDOW: &[u8] = b"bswn"; // per-market PriceBasisWindow (30s mid samples)
 const PFX_LAST_TRADED: &[u8] = b"ltrd"; // per-market last traded price (contract price)
 const PFX_FUNDING_STATE: &[u8] = b"fund"; // per-market FundingState
 
@@ -190,7 +191,12 @@ pub fn index_price_state_key(market_id: u64) -> B256 {
     keccak256([PFX_INDEX_PRICE, &market_id.to_be_bytes()].concat())
 }
 
-/// Per-market PriceBasisWindow (30-second MA basis ring buffer).
+/// Per-market recent index price checkpoints.
+pub fn index_price_history_key(market_id: u64) -> B256 {
+    keccak256([PFX_INDEX_HISTORY, &market_id.to_be_bytes()].concat())
+}
+
+/// Per-market PriceBasisWindow (30-second mid-price ring buffer).
 pub fn price_basis_window_key(market_id: u64) -> B256 {
     keccak256([PFX_BASIS_WINDOW, &market_id.to_be_bytes()].concat())
 }

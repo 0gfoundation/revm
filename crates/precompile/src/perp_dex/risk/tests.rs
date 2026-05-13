@@ -2,15 +2,15 @@ use super::*;
 use alloy_sol_types::SolCall;
 use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
-use primitives::{address, hardfork::SpecId};
+use primitives::{address, hardfork::SpecId, U256};
 
 use crate::perp_dex::{
     interface::IPerpDex::{
         addPositionMarginCall, liquidateCall, placeOrderCall, removePositionMarginCall,
-        setLeverageCall,
+        setLeverageCall, updateIndexPriceCall,
     },
     trading::run_place_order,
-    types::{PerpPosition, UserAccount},
+    types::{IndexPriceHistory, PerpPosition, PriceBasisWindow, UserAccount},
     USDC_ADDRESS,
 };
 
@@ -55,6 +55,7 @@ fn setup_market(ctx: &mut TestCtx) {
             min_quantity: 1,
             max_quantity: 1_000_000,
             max_price: 1_000_000,
+            price_update_interval: 15,
             active: true,
         },
     )
@@ -78,6 +79,241 @@ fn setup_market(ctx: &mut TestCtx) {
         },
     )
     .unwrap();
+}
+
+#[test]
+fn update_index_price_aligns_timestamp_to_market_interval() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let state = storage::load_index_price_state(&mut ctx, MARKET_ID).unwrap();
+    let window = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(state.index_price, ENTRY_PRICE);
+    assert_eq!(state.timestamp, 30);
+    assert_eq!(window.count, 0);
+    assert_eq!(window.last_sample_ts, 0);
+}
+
+#[test]
+fn update_index_price_discards_same_or_older_aligned_timestamp() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE + 100,
+            timestamp: 44,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let state = storage::load_index_price_state(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(state.index_price, ENTRY_PRICE);
+    assert_eq!(state.timestamp, 30);
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE + 200,
+            timestamp: 45,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let state = storage::load_index_price_state(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(state.index_price, ENTRY_PRICE + 200);
+    assert_eq!(state.timestamp, 45);
+}
+
+#[test]
+fn mid_window_closes_interval_with_current_index_price() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_index_price_state(
+        &mut ctx,
+        MARKET_ID,
+        &IndexPriceState {
+            index_price: ENTRY_PRICE,
+            timestamp: 0,
+        },
+    )
+    .unwrap();
+
+    storage::save_best_bid(&mut ctx, MARKET_ID, ENTRY_PRICE - 100).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, ENTRY_PRICE + 100).unwrap();
+
+    ctx.block.timestamp = U256::from(20);
+    record_mid_price_sample_for_best_quote_change(
+        &mut ctx,
+        MARKET_ID,
+        ENTRY_PRICE - 100,
+        ENTRY_PRICE + 100,
+    )
+    .unwrap();
+
+    storage::save_best_ask(&mut ctx, MARKET_ID, ENTRY_PRICE + 300).unwrap();
+    record_mid_price_sample_for_best_quote_change(
+        &mut ctx,
+        MARKET_ID,
+        ENTRY_PRICE - 100,
+        ENTRY_PRICE + 300,
+    )
+    .unwrap();
+
+    let window = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(window.count, 1);
+    assert_eq!(window.last_sample_ts, 20);
+    assert_eq!(window.mid_prices[0], ENTRY_PRICE);
+    assert_eq!(window.last_mid_price, ENTRY_PRICE);
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE + 10,
+            timestamp: 16,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let window = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
+    let state = storage::load_index_price_state(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(state.index_price, ENTRY_PRICE + 10);
+    assert_eq!(state.timestamp, 15);
+    assert_eq!(window.last_sample_ts, 20);
+    let history = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(window.moving_average_basis(&history, 15), 0);
+    assert_eq!(window.moving_average_basis(&history, 30), -10);
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE + 20,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let window = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
+    let state = storage::load_index_price_state(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(state.index_price, ENTRY_PRICE + 20);
+    assert_eq!(state.timestamp, 30);
+    assert_eq!(window.last_sample_ts, 20);
+    assert_eq!(window.count, 1);
+    let history = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(window.moving_average_basis(&history, 30), -10);
+}
+
+#[test]
+fn mid_window_uses_index_checkpoints_across_full_basis_window() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_index_price_state(
+        &mut ctx,
+        MARKET_ID,
+        &IndexPriceState {
+            index_price: ENTRY_PRICE,
+            timestamp: 0,
+        },
+    )
+    .unwrap();
+
+    storage::save_best_bid(&mut ctx, MARKET_ID, ENTRY_PRICE).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, ENTRY_PRICE + 200).unwrap();
+    ctx.block.timestamp = U256::from(1);
+    record_mid_price_sample_for_best_quote_change(
+        &mut ctx,
+        MARKET_ID,
+        ENTRY_PRICE,
+        ENTRY_PRICE + 200,
+    )
+    .unwrap();
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE + 10,
+            timestamp: 16,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE + 20,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let window = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
+    let history = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(history.checkpoints.len(), 3);
+    // [1,15): 100 basis for 14s; [15,30): 90 basis for 15s.
+    assert_eq!(window.moving_average_basis(&history, 30), 94);
+}
+
+#[test]
+fn mid_window_uses_ring_order_after_wrap() {
+    let mut window = PriceBasisWindow::default();
+    for timestamp in 1..=35 {
+        window.push_sample(timestamp, ENTRY_PRICE + timestamp);
+    }
+
+    let mut history = IndexPriceHistory::default();
+    history.push(
+        IndexPriceState {
+            index_price: ENTRY_PRICE,
+            timestamp: 0,
+        },
+        10,
+    );
+
+    // The 30-slot ring now holds timestamps 6..=35. For [5,35), timestamp 35 is
+    // right-exclusive, so the weighted basis covers 6..34 and averages to 20.
+    assert_eq!(window.moving_average_basis(&history, 35), 20);
 }
 
 fn liquidate(ctx: &mut TestCtx, user: Address) -> Result<Bytes, PrecompileError> {

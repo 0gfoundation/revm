@@ -26,6 +26,7 @@ use crate::{
             calc_buy_side_reserved_notional, calc_sell_side_reserved_notional, calc_trading_fee,
             calc_value,
         },
+        risk::record_mid_price_sample_for_best_quote_change,
         storage,
         types::{ApiKey, Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce},
         PERP_DEX_ADDRESS,
@@ -781,12 +782,14 @@ pub(super) fn match_order<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
 ) -> Result<u64, PrecompileError> {
     let mut remaining = quantity;
+    let mut last_trade_price = None;
     let mut taker_settlement = TakerSettlement::load(context, taker_addr, market_id)?;
 
     match side {
         Side::Buy => {
             // Match against asks (sorted ASC: lowest ask first).
             let ask_prices = storage::load_ask_prices(context, market_id)?;
+            let old_best_ask = ask_prices.first().copied().unwrap_or(0);
             let mut ask_levels_cleared = false;
             'outer: for ask_price in ask_prices {
                 // For limit buy: only match if ask_price <= our limit.
@@ -842,10 +845,15 @@ pub(super) fn match_order<CTX: ContextTr>(
                         Side::Buy,
                         market,
                     )?;
-                    let fill_notional =
-                        calc_value(ask_price, fill_qty, market.base_decimals, market.price_decimals)?;
+                    let fill_notional = calc_value(
+                        ask_price,
+                        fill_qty,
+                        market.base_decimals,
+                        market.price_decimals,
+                    )?;
                     let taker_fee =
                         calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
+                    last_trade_price = Some(ask_price);
                     emit_trade(
                         context,
                         TradeEvent {
@@ -904,12 +912,19 @@ pub(super) fn match_order<CTX: ContextTr>(
                 storage::save_ask_level(context, market_id, ask_price, &new_queue)?;
             }
             if ask_levels_cleared {
-                storage::refresh_best_ask(context, market_id)?;
+                let best_ask = storage::refresh_best_ask(context, market_id)?;
+                if best_ask != old_best_ask {
+                    let best_bid = storage::load_best_bid(context, market_id)?;
+                    record_mid_price_sample_for_best_quote_change(
+                        context, market_id, best_bid, best_ask,
+                    )?;
+                }
             }
         }
         Side::Sell => {
             // Match against bids (sorted DESC: highest bid first).
             let bid_prices = storage::load_bid_prices(context, market_id)?;
+            let old_best_bid = bid_prices.first().copied().unwrap_or(0);
             let mut bid_levels_cleared = false;
             'outer: for bid_price in bid_prices {
                 // For limit sell: only match if bid_price >= our limit.
@@ -965,10 +980,15 @@ pub(super) fn match_order<CTX: ContextTr>(
                         Side::Sell,
                         market,
                     )?;
-                    let fill_notional =
-                        calc_value(bid_price, fill_qty, market.base_decimals, market.price_decimals)?;
+                    let fill_notional = calc_value(
+                        bid_price,
+                        fill_qty,
+                        market.base_decimals,
+                        market.price_decimals,
+                    )?;
                     let taker_fee =
                         calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
+                    last_trade_price = Some(bid_price);
                     emit_trade(
                         context,
                         TradeEvent {
@@ -1025,12 +1045,21 @@ pub(super) fn match_order<CTX: ContextTr>(
                 storage::save_bid_level(context, market_id, bid_price, &new_queue)?;
             }
             if bid_levels_cleared {
-                storage::refresh_best_bid(context, market_id)?;
+                let best_bid = storage::refresh_best_bid(context, market_id)?;
+                if best_bid != old_best_bid {
+                    let best_ask = storage::load_best_ask(context, market_id)?;
+                    record_mid_price_sample_for_best_quote_change(
+                        context, market_id, best_bid, best_ask,
+                    )?;
+                }
             }
         }
     }
 
     taker_settlement.finalize(context, side, market)?;
+    if let Some(price) = last_trade_price {
+        storage::save_last_traded_price(context, market_id, price)?;
+    }
     Ok(remaining)
 }
 
@@ -1051,7 +1080,6 @@ fn emit_trade<CTX: ContextTr>(
     context: &mut CTX,
     trade: TradeEvent<'_>,
 ) -> Result<(), PrecompileError> {
-    storage::save_last_traded_price(context, trade.market_id, trade.price)?;
     let trade_id = storage::next_trade_id(context, trade.market_id)?;
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
@@ -1162,6 +1190,8 @@ fn rest_in_book<CTX: ContextTr>(
             let cur_best_bid = storage::load_best_bid(context, market_id)?;
             if cur_best_bid == 0 || price > cur_best_bid {
                 storage::save_best_bid(context, market_id, price)?;
+                let best_ask = storage::load_best_ask(context, market_id)?;
+                record_mid_price_sample_for_best_quote_change(context, market_id, price, best_ask)?;
             }
         }
         Side::Sell => {
@@ -1229,6 +1259,8 @@ fn rest_in_book<CTX: ContextTr>(
             let cur_best_ask = storage::load_best_ask(context, market_id)?;
             if cur_best_ask == 0 || price < cur_best_ask {
                 storage::save_best_ask(context, market_id, price)?;
+                let best_bid = storage::load_best_bid(context, market_id)?;
+                record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, price)?;
             }
         }
     }
@@ -1298,20 +1330,34 @@ pub(super) fn remove_from_book<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     match side {
         Side::Buy => {
+            let old_best_bid = storage::load_best_bid(context, market_id)?;
             let mut queue = storage::load_bid_level(context, market_id, price)?;
             queue.retain(|id| id != order_id);
             if queue.is_empty() {
                 storage::remove_bid_price(context, market_id, price)?;
-                storage::refresh_best_bid(context, market_id)?;
+                let best_bid = storage::refresh_best_bid(context, market_id)?;
+                if best_bid != old_best_bid {
+                    let best_ask = storage::load_best_ask(context, market_id)?;
+                    record_mid_price_sample_for_best_quote_change(
+                        context, market_id, best_bid, best_ask,
+                    )?;
+                }
             }
             storage::save_bid_level(context, market_id, price, &queue)?;
         }
         Side::Sell => {
+            let old_best_ask = storage::load_best_ask(context, market_id)?;
             let mut queue = storage::load_ask_level(context, market_id, price)?;
             queue.retain(|id| id != order_id);
             if queue.is_empty() {
                 storage::remove_ask_price(context, market_id, price)?;
-                storage::refresh_best_ask(context, market_id)?;
+                let best_ask = storage::refresh_best_ask(context, market_id)?;
+                if best_ask != old_best_ask {
+                    let best_bid = storage::load_best_bid(context, market_id)?;
+                    record_mid_price_sample_for_best_quote_change(
+                        context, market_id, best_bid, best_ask,
+                    )?;
+                }
             }
             storage::save_ask_level(context, market_id, price, &queue)?;
         }

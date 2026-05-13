@@ -12,10 +12,10 @@ use crate::{
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, getAdminCall, getFundingStateCall,
             getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn, getMarkPriceCall,
-            getMarketCall, getMarketReturn, getOracleAddressCall, getPositionCall, getPositionReturn,
-            initAdminCall, liquidateCall, removePositionMarginCall, setFundingStateCall,
-            setLeverageCall, setLeverageSignedCall, setMarkPriceCall, setOracleAddressCall,
-            transferAdminCall, updateIndexPriceCall, updateMarketCall,
+            getMarketCall, getMarketReturn, getOracleAddressCall, getPositionCall,
+            getPositionReturn, initAdminCall, liquidateCall, removePositionMarginCall,
+            setFundingStateCall, setLeverageCall, setLeverageSignedCall, setMarkPriceCall,
+            setOracleAddressCall, transferAdminCall, updateIndexPriceCall, updateMarketCall,
         },
         math::{calc_value, is_above_maintenance_margin, FUNDING_RATE_ONE},
         storage,
@@ -100,7 +100,7 @@ pub fn run_get_admin<CTX: ContextTr>(
 
 // ── Admin: market management ──────────────────────────────────────────────────
 
-/// `addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice)`
+/// `addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval)`
 pub fn run_add_market<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -126,6 +126,9 @@ pub fn run_add_market<CTX: ContextTr>(
     )?;
     if args.tickSize == 0 || args.stepSize == 0 || args.minQuantity == 0 {
         return Err(perp_err("addMarket: tick/step/min must be > 0"));
+    }
+    if args.priceUpdateInterval == 0 {
+        return Err(perp_err("addMarket: priceUpdateInterval must be > 0"));
     }
     if args.maxQuantity < args.minQuantity {
         return Err(perp_err("addMarket: maxQuantity must be >= minQuantity"));
@@ -153,6 +156,7 @@ pub fn run_add_market<CTX: ContextTr>(
         min_quantity: args.minQuantity,
         max_quantity: args.maxQuantity,
         max_price: args.maxPrice,
+        price_update_interval: args.priceUpdateInterval,
         active: true,
     };
     storage::save_market(context, &market)?;
@@ -168,6 +172,7 @@ pub fn run_add_market<CTX: ContextTr>(
             minQuantity: args.minQuantity,
             maxQuantity: args.maxQuantity,
             maxPrice: args.maxPrice,
+            priceUpdateInterval: args.priceUpdateInterval,
         }
         .to_log_data(),
     });
@@ -175,7 +180,7 @@ pub fn run_add_market<CTX: ContextTr>(
     Ok(Bytes::new())
 }
 
-/// `updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active)`
+/// `updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active)`
 pub fn run_update_market<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -199,6 +204,9 @@ pub fn run_update_market<CTX: ContextTr>(
     if args.tickSize == 0 || args.stepSize == 0 || args.minQuantity == 0 {
         return Err(perp_err("updateMarket: tick/step/min must be > 0"));
     }
+    if args.priceUpdateInterval == 0 {
+        return Err(perp_err("updateMarket: priceUpdateInterval must be > 0"));
+    }
     if args.maxQuantity < args.minQuantity {
         return Err(perp_err("updateMarket: maxQuantity must be >= minQuantity"));
     }
@@ -221,6 +229,7 @@ pub fn run_update_market<CTX: ContextTr>(
     market.min_quantity = args.minQuantity;
     market.max_quantity = args.maxQuantity;
     market.max_price = args.maxPrice;
+    market.price_update_interval = args.priceUpdateInterval;
     market.active = args.active;
     storage::save_market(context, &market)?;
 
@@ -233,6 +242,7 @@ pub fn run_update_market<CTX: ContextTr>(
             minQuantity: args.minQuantity,
             maxQuantity: args.maxQuantity,
             maxPrice: args.maxPrice,
+            priceUpdateInterval: args.priceUpdateInterval,
             active: args.active,
         }
         .to_log_data(),
@@ -287,7 +297,7 @@ pub fn run_get_mark_price<CTX: ContextTr>(
     Ok(Bytes::from(getMarkPriceCall::abi_encode_returns(&price)))
 }
 
-/// `getMarket(uint64 marketId) returns (uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active)`
+/// `getMarket(uint64 marketId) returns (uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active)`
 pub fn run_get_market<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -307,6 +317,7 @@ pub fn run_get_market<CTX: ContextTr>(
             minQuantity: market.min_quantity,
             maxQuantity: market.max_quantity,
             maxPrice: market.max_price,
+            priceUpdateInterval: market.price_update_interval,
             active: market.active,
         },
     )))
@@ -731,6 +742,9 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     use crate::perp_dex::types::OrderStatus;
 
+    let old_best_bid = storage::load_best_bid(context, market_id)?;
+    let old_best_ask = storage::load_best_ask(context, market_id)?;
+
     // --- Buy orders ---
     let buy_entries = storage::load_buy_orders(context, user, market_id)?;
     for entry in &buy_entries {
@@ -783,6 +797,11 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         });
     }
     storage::save_sell_orders(context, user, market_id, &[])?;
+    let best_bid = storage::refresh_best_bid(context, market_id)?;
+    let best_ask = storage::refresh_best_ask(context, market_id)?;
+    if best_bid != old_best_bid || best_ask != old_best_ask {
+        record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, best_ask)?;
+    }
 
     // Recalculate reserves (now 0 since all orders cancelled).
     let mut pos = storage::load_position(context, user, market_id)?;
@@ -845,7 +864,9 @@ pub fn run_get_oracle_address<CTX: ContextTr>(
     getOracleAddressCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getOracleAddress: invalid calldata"))?;
     let oracle = storage::load_oracle(context)?;
-    Ok(Bytes::from(getOracleAddressCall::abi_encode_returns(&oracle)))
+    Ok(Bytes::from(getOracleAddressCall::abi_encode_returns(
+        &oracle,
+    )))
 }
 
 // ── Index price & mark price computation ──────────────────────────────────────
@@ -855,9 +876,8 @@ pub fn run_get_oracle_address<CTX: ContextTr>(
 /// Callable by admin or the configured oracle address.
 ///
 /// Steps:
-/// 1. Update the 30-second basis ring buffer with elapsed samples.
+/// 1. Compute Price1, Price2, ContractPrice and take their median as mark price.
 /// 2. Save the new index price state.
-/// 3. Compute Price1, Price2, ContractPrice and take their median as mark price.
 /// 4. Snap mark price to tick_size and persist it.
 /// 5. Emit IndexPriceUpdated + MarkPriceUpdated.
 pub fn run_update_index_price<CTX: ContextTr>(
@@ -876,53 +896,37 @@ pub fn run_update_index_price<CTX: ContextTr>(
     let market = storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("updateIndexPrice: unknown market"))?;
     if args.indexPrice > market.max_price {
-        return Err(perp_err("updateIndexPrice: indexPrice exceeds market maximum"));
+        return Err(perp_err(
+            "updateIndexPrice: indexPrice exceeds market maximum",
+        ));
+    }
+    let effective_timestamp =
+        align_price_update_timestamp(args.timestamp, market.price_update_interval);
+    let current_index_state = storage::load_index_price_state(context, args.marketId)?;
+    if effective_timestamp <= current_index_state.timestamp {
+        return Ok(Bytes::new());
     }
 
-    // ── 1. Update basis ring buffer ───────────────────────────────────────────
-    let best_bid = storage::load_best_bid(context, args.marketId)?;
-    let best_ask = storage::load_best_ask(context, args.marketId)?;
-    let mid_price: u64 = match (best_bid, best_ask) {
-        (0, 0) => args.indexPrice,
-        (0, ask) => ask,
-        (bid, 0) => bid,
-        (bid, ask) => ((bid as u128 + ask as u128) / 2) as u64,
-    };
-    // basis can be negative when mid < index
-    let basis = mid_price as i64 - args.indexPrice as i64;
-
-    let mut window = storage::load_price_basis_window(context, args.marketId)?;
-    let new_samples = if window.last_sample_ts == 0 {
-        1 // seed on first call regardless of timestamp
-    } else {
-        args.timestamp
-            .saturating_sub(window.last_sample_ts)
-            .min(crate::perp_dex::types::PRICE_BASIS_WINDOW_SIZE as u64) as usize
-    };
-    for _ in 0..new_samples {
-        window.push_sample(basis);
-    }
-    window.last_sample_ts = args.timestamp;
-
-    // ── 2. Save index price state ─────────────────────────────────────────────
-    storage::save_index_price_state(
-        context,
-        args.marketId,
-        &IndexPriceState {
-            index_price: args.indexPrice,
-            timestamp: args.timestamp,
-        },
-    )?;
-
-    // ── 3. Compute mark price components ─────────────────────────────────────
+    // ── 1. Compute mark price components ─────────────────────────────────────
     let funding = storage::load_funding_state(context, args.marketId)?;
-    let price1 = compute_price1(args.indexPrice, &funding, args.timestamp);
+    // Price1: index adjusted by funding basis.
+    let price1 = compute_price1(args.indexPrice, &funding, effective_timestamp);
 
-    let ma_basis = window.moving_average();
+    // Price2: index adjusted by time-weighted top-of-book basis.
+    let window = storage::load_price_basis_window(context, args.marketId)?;
+    let max_index_checkpoints = max_index_price_checkpoints(market.price_update_interval);
+    let mut index_history = storage::load_index_price_history(context, args.marketId)?;
+    index_history.push(current_index_state, max_index_checkpoints);
+    let ma_basis = window.moving_average_basis(&index_history, effective_timestamp);
     let price2 = (args.indexPrice as i64).saturating_add(ma_basis).max(1) as u64;
 
+    // Contract price: latest traded price, falling back to index before any trade.
     let last_traded = storage::load_last_traded_price(context, args.marketId)?;
-    let contract_price = if last_traded == 0 { args.indexPrice } else { last_traded };
+    let contract_price = if last_traded == 0 {
+        args.indexPrice
+    } else {
+        last_traded
+    };
 
     let raw_mark = median_u64(price1, price2, contract_price);
 
@@ -935,6 +939,22 @@ pub fn run_update_index_price<CTX: ContextTr>(
     };
 
     // ── 4. Persist ───────────────────────────────────────────────────────────
+    storage::save_index_price_state(
+        context,
+        args.marketId,
+        &IndexPriceState {
+            index_price: args.indexPrice,
+            timestamp: effective_timestamp,
+        },
+    )?;
+    index_history.push(
+        IndexPriceState {
+            index_price: args.indexPrice,
+            timestamp: effective_timestamp,
+        },
+        max_index_checkpoints,
+    );
+    storage::save_index_price_history(context, args.marketId, &index_history)?;
     storage::save_price_basis_window(context, args.marketId, &window)?;
     storage::save_mark_price(context, args.marketId, mark_price)?;
 
@@ -947,7 +967,7 @@ pub fn run_update_index_price<CTX: ContextTr>(
             markPrice: mark_price,
             price1,
             price2,
-            timestamp: args.timestamp,
+            timestamp: effective_timestamp,
         }
         .to_log_data(),
     });
@@ -1059,6 +1079,36 @@ fn median_u64(a: u64, b: u64, c: u64) -> u64 {
     let mut arr = [a, b, c];
     arr.sort_unstable();
     arr[1]
+}
+
+fn align_price_update_timestamp(timestamp: u64, interval: u64) -> u64 {
+    timestamp - (timestamp % interval)
+}
+
+fn max_index_price_checkpoints(price_update_interval: u64) -> usize {
+    let interval = price_update_interval.max(1);
+    (crate::perp_dex::types::PRICE_BASIS_WINDOW_SIZE as u64)
+        .div_ceil(interval)
+        .saturating_add(2) as usize
+}
+
+pub(crate) fn record_mid_price_sample_for_best_quote_change<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    best_bid: u64,
+    best_ask: u64,
+) -> Result<(), PrecompileError> {
+    let mid_price = match (best_bid, best_ask) {
+        (0, 0) => return Ok(()),
+        (0, ask) => ask,
+        (bid, 0) => bid,
+        (bid, ask) => ((bid as u128 + ask as u128) / 2) as u64,
+    };
+    let timestamp: u64 = context.block().timestamp().saturating_to();
+
+    let mut window = storage::load_price_basis_window(context, market_id)?;
+    window.record_observation(timestamp, mid_price);
+    storage::save_price_basis_window(context, market_id, &window)
 }
 
 fn require_admin_or_oracle<CTX: ContextTr>(

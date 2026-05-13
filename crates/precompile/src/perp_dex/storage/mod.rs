@@ -12,8 +12,8 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         types::{
-            ApiKey, FundingState, IndexPriceState, Market, Order, OrderEntry, PerpPosition,
-            PriceBasisWindow, UserAccount, UserFeeRates,
+            ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, Order, OrderEntry,
+            PerpPosition, PriceBasisWindow, UserAccount, UserFeeRates,
         },
         PERP_DEX_ADDRESS,
     },
@@ -24,10 +24,10 @@ use crate::{
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
     best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot,
-    funding_state_key, index_price_state_key, last_traded_price_key, mark_price_key,
-    market_fee_total_key, market_key, open_interest_key, oracle_key, order_key,
-    position_key, price_basis_window_key, trade_count_key, user_buy_orders_key,
-    user_fee_rates_key, user_nonce_key, user_sell_orders_key,
+    funding_state_key, index_price_history_key, index_price_state_key, last_traded_price_key,
+    mark_price_key, market_fee_total_key, market_key, open_interest_key, oracle_key, order_key,
+    position_key, price_basis_window_key, trade_count_key, user_buy_orders_key, user_fee_rates_key,
+    user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -601,10 +601,11 @@ pub fn save_best_ask<CTX: ContextTr>(
 pub fn refresh_best_bid<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<u64, PrecompileError> {
     let prices = load_bid_prices(context, market_id)?;
     let best = prices.first().copied().unwrap_or(0);
-    save_best_bid(context, market_id, best)
+    save_best_bid(context, market_id, best)?;
+    Ok(best)
 }
 
 /// Re-derive best_ask from the current ask price list (already in journal cache after matching).
@@ -612,10 +613,11 @@ pub fn refresh_best_bid<CTX: ContextTr>(
 pub fn refresh_best_ask<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<u64, PrecompileError> {
     let prices = load_ask_prices(context, market_id)?;
     let best = prices.first().copied().unwrap_or(0);
-    save_best_ask(context, market_id, best)
+    save_best_ask(context, market_id, best)?;
+    Ok(best)
 }
 // ── API key (ed25519 signed orders) ──────────────────────────────────────────
 
@@ -720,7 +722,27 @@ pub fn save_index_price_state<CTX: ContextTr>(
     store_blob(context, index_price_state_key(market_id), &buf)
 }
 
-// ── Price basis window (30s MA) ───────────────────────────────────────────────
+// ── Price mid window (30s MA basis input) ─────────────────────────────────────
+
+pub fn load_index_price_history<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<IndexPriceHistory, PrecompileError> {
+    let buf = load_blob(context, index_price_history_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(IndexPriceHistory::default());
+    }
+    decode(&buf)
+}
+
+pub fn save_index_price_history<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    history: &IndexPriceHistory,
+) -> Result<(), PrecompileError> {
+    let buf = encode(history)?;
+    store_blob(context, index_price_history_key(market_id), &buf)
+}
 
 pub fn load_price_basis_window<CTX: ContextTr>(
     context: &mut CTX,
