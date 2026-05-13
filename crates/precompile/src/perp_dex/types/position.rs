@@ -84,6 +84,8 @@ pub struct Market {
     pub max_quantity: u64,
     /// Maximum order price (price_decimals fixed-point units).
     pub max_price: u64,
+    /// Oracle index price update cadence in seconds.
+    pub price_update_interval: u64,
     /// Whether the market accepts new orders.
     pub active: bool,
 }

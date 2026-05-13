@@ -31,10 +31,10 @@ sol! {
 
         // ── Market management (admin only) ─────────────────────────────────
         /// Register a new perpetual market.
-        function addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice) external;
+        function addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval) external;
         /// Update mutable market parameters (tick/step/quantity/price limits and active flag).
         /// baseDecimals and priceDecimals cannot be changed after creation.
-        function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active) external;
+        function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active) external;
         /// Update the mark price (used for margin and liquidation).
         function setMarkPrice(uint64 marketId, uint64 price) external;
         /// Read the current mark price for a market.
@@ -48,6 +48,7 @@ sol! {
             uint64 minQuantity,
             uint64 maxQuantity,
             uint64 maxPrice,
+            uint64 priceUpdateInterval,
             bool   active
         );
 
@@ -141,6 +142,8 @@ sol! {
         ///
         /// The 30-second moving average ring buffer is updated each call; each elapsed
         /// second since the last call is filled with the current basis value.
+        /// The input timestamp is floored to the market's priceUpdateInterval. If that
+        /// floored timestamp is not newer than the stored index timestamp, the update is ignored.
         ///
         /// Callable by admin or the configured oracle address.
         function updateIndexPrice(uint64 marketId, uint64 indexPrice, uint64 timestamp) external;
@@ -251,9 +254,9 @@ sol! {
         event Liquidation(address indexed user, uint64 indexed marketId, address liquidator, int64 amount, uint64 reward, uint64 markPrice);
 
         // Feeds: market metadata bootstrap for indexer
-        event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice);
+        event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval);
         // Feeds: market metadata updates for indexer
-        event MarketUpdated(uint64 indexed marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, bool active);
+        event MarketUpdated(uint64 indexed marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active);
         // Feeds: /premiumIndex (mark price history), /fundingRate (markPrice field)
         event MarkPriceUpdated(uint64 indexed marketId, uint64 price, address updater);
 
