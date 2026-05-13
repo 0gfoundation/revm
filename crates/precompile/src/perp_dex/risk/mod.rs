@@ -10,20 +10,21 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         interface::IPerpDex::{
-            self, addMarketCall, addPositionMarginCall, getAdminCall, getFundingStateCall,
-            getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn, getMarkPriceCall,
-            getMarketCall, getMarketReturn, getOracleAddressCall, getPositionCall,
-            getPositionReturn, initAdminCall, liquidateCall, removePositionMarginCall,
-            setFundingStateCall, setLeverageCall, setLeverageSignedCall, setMarkPriceCall,
-            setOracleAddressCall, transferAdminCall, updateIndexPriceCall, updateMarketCall,
+            self, addMarketCall, addPositionMarginCall, getAdminCall, getAveragePremiumIndexCall,
+            getAveragePremiumIndexReturn, getFundingStateCall, getFundingStateReturn,
+            getIndexPriceCall, getIndexPriceReturn, getMarkPriceCall, getMarketCall,
+            getMarketReturn, getOracleAddressCall, getPositionCall, getPositionReturn,
+            initAdminCall, liquidateCall, removePositionMarginCall, setLeverageCall,
+            setLeverageSignedCall, setMarkPriceCall, setOracleAddressCall, transferAdminCall,
+            updateIndexPriceCall, updateMarketCall,
         },
-        math::{calc_value, is_above_maintenance_margin, FUNDING_RATE_ONE},
+        math::{calc_funding_rate, calc_value, is_above_maintenance_margin, FUNDING_RATE_ONE},
         storage,
         trading::{
             can_fully_liquidate_on_book, check_api_key_expiry, check_recv_window,
             execute_liquidation_market_order, verify_ed25519,
         },
-        types::{FundingState, IndexPriceState, Market, Side},
+        types::{FundingState, IndexPriceState, Market, PremiumIndexAccumulator, Side},
         PERP_DEX_ADDRESS,
     },
     PrecompileError,
@@ -100,7 +101,7 @@ pub fn run_get_admin<CTX: ContextTr>(
 
 // ── Admin: market management ──────────────────────────────────────────────────
 
-/// `addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval)`
+/// `addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate)`
 pub fn run_add_market<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -158,6 +159,8 @@ pub fn run_add_market<CTX: ContextTr>(
         max_price: args.maxPrice,
         price_update_interval: args.priceUpdateInterval,
         active: true,
+        funding_interval: args.fundingInterval,
+        interest_rate: args.interestRate,
     };
     storage::save_market(context, &market)?;
 
@@ -173,6 +176,8 @@ pub fn run_add_market<CTX: ContextTr>(
             maxQuantity: args.maxQuantity,
             maxPrice: args.maxPrice,
             priceUpdateInterval: args.priceUpdateInterval,
+            fundingInterval: args.fundingInterval,
+            interestRate: args.interestRate,
         }
         .to_log_data(),
     });
@@ -180,7 +185,7 @@ pub fn run_add_market<CTX: ContextTr>(
     Ok(Bytes::new())
 }
 
-/// `updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active)`
+/// `updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate)`
 pub fn run_update_market<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -231,6 +236,8 @@ pub fn run_update_market<CTX: ContextTr>(
     market.max_price = args.maxPrice;
     market.price_update_interval = args.priceUpdateInterval;
     market.active = args.active;
+    market.funding_interval = args.fundingInterval;
+    market.interest_rate = args.interestRate;
     storage::save_market(context, &market)?;
 
     context.journal_mut().log(Log {
@@ -244,6 +251,8 @@ pub fn run_update_market<CTX: ContextTr>(
             maxPrice: args.maxPrice,
             priceUpdateInterval: args.priceUpdateInterval,
             active: args.active,
+            fundingInterval: args.fundingInterval,
+            interestRate: args.interestRate,
         }
         .to_log_data(),
     });
@@ -319,6 +328,8 @@ pub fn run_get_market<CTX: ContextTr>(
             maxPrice: market.max_price,
             priceUpdateInterval: market.price_update_interval,
             active: market.active,
+            fundingInterval: market.funding_interval,
+            interestRate: market.interest_rate,
         },
     )))
 }
@@ -908,9 +919,9 @@ pub fn run_update_index_price<CTX: ContextTr>(
     }
 
     // ── 1. Compute mark price components ─────────────────────────────────────
-    let funding = storage::load_funding_state(context, args.marketId)?;
+    let mut funding = storage::load_funding_state(context, args.marketId)?;
     // Price1: index adjusted by funding basis.
-    let price1 = compute_price1(args.indexPrice, &funding, effective_timestamp);
+    let price1 = compute_price1(args.indexPrice, &funding, &market, effective_timestamp);
 
     // Price2: index adjusted by time-weighted top-of-book basis.
     let window = storage::load_price_basis_window(context, args.marketId)?;
@@ -938,7 +949,7 @@ pub fn run_update_index_price<CTX: ContextTr>(
         raw_mark.min(market.max_price).max(1)
     };
 
-    // ── 4. Persist ───────────────────────────────────────────────────────────
+    // ── 4. Persist index price + mark price ──────────────────────────────────
     storage::save_index_price_state(
         context,
         args.marketId,
@@ -955,10 +966,53 @@ pub fn run_update_index_price<CTX: ContextTr>(
         max_index_checkpoints,
     );
     storage::save_index_price_history(context, args.marketId, &index_history)?;
-    storage::save_price_basis_window(context, args.marketId, &window)?;
     storage::save_mark_price(context, args.marketId, mark_price)?;
 
-    // ── 5. Emit events ────────────────────────────────────────────────────────
+    // ── 5. Accumulate premium index for funding rate calculation ──────────────
+    let mut computed_rate: Option<(i64, i64, u64)> = None; // (rate, avg_pi, sample_count)
+    if market.funding_interval > 0 {
+        let mut acc = storage::load_premium_accumulator(context, args.marketId)?;
+
+        // Initialize epoch on first oracle update.
+        if acc.epoch_start_ts == 0 {
+            acc.epoch_start_ts = effective_timestamp;
+            if funding.next_funding_ts == 0 {
+                funding.next_funding_ts = effective_timestamp + market.funding_interval;
+            }
+        }
+
+        // PI = (mark_price − index_price) × FUNDING_RATE_ONE / index_price
+        let pi = (mark_price as i64 - args.indexPrice as i64)
+            .saturating_mul(FUNDING_RATE_ONE)
+            .checked_div(args.indexPrice as i64)
+            .unwrap_or(0);
+        acc.push_sample(pi);
+
+        // Epoch boundary: compute and store new funding rate, reset accumulator.
+        if effective_timestamp >= funding.next_funding_ts {
+            let avg_pi = acc.average();
+            let rate = calc_funding_rate(avg_pi, market.interest_rate);
+            let sample_count = acc.sample_count;
+
+            funding.last_funding_rate = rate;
+            funding.next_funding_ts += market.funding_interval;
+            storage::save_funding_state(context, args.marketId, &funding)?;
+
+            acc = PremiumIndexAccumulator {
+                weighted_sum: 0,
+                sample_count: 0,
+                epoch_start_ts: funding.next_funding_ts - market.funding_interval,
+            };
+            computed_rate = Some((rate, avg_pi, sample_count));
+        } else if acc.epoch_start_ts > 0 || funding.next_funding_ts > 0 {
+            // Save updated next_funding_ts if it was just initialized.
+            storage::save_funding_state(context, args.marketId, &funding)?;
+        }
+
+        storage::save_premium_accumulator(context, args.marketId, &acc)?;
+    }
+
+    // ── 6. Emit events ────────────────────────────────────────────────────────
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::IndexPriceUpdated {
@@ -980,6 +1034,19 @@ pub fn run_update_index_price<CTX: ContextTr>(
         }
         .to_log_data(),
     });
+    if let Some((rate, avg_pi, sample_count)) = computed_rate {
+        context.journal_mut().log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::FundingRateComputed {
+                marketId: args.marketId,
+                fundingRate: rate,
+                avgPremiumIndex: avg_pi,
+                sampleCount: sample_count,
+                timestamp: effective_timestamp,
+            }
+            .to_log_data(),
+        });
+    }
 
     Ok(Bytes::new())
 }
@@ -1002,41 +1069,7 @@ pub fn run_get_index_price<CTX: ContextTr>(
 
 // ── Funding state ─────────────────────────────────────────────────────────────
 
-/// `setFundingState(uint64 marketId, int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs)`
-pub fn run_set_funding_state<CTX: ContextTr>(
-    input_bytes: &[u8],
-    caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
-    let args = setFundingStateCall::abi_decode_validate(input_bytes)
-        .map_err(|_| perp_err("setFundingState: invalid calldata"))?;
-
-    require_admin(caller, context)?;
-
-    storage::load_market(context, args.marketId)?
-        .ok_or_else(|| perp_err("setFundingState: unknown market"))?;
-
-    let state = FundingState {
-        last_funding_rate: args.lastFundingRate,
-        funding_interval: args.fundingInterval,
-        next_funding_ts: args.nextFundingTs,
-    };
-    storage::save_funding_state(context, args.marketId, &state)?;
-
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::FundingStateUpdated {
-            marketId: args.marketId,
-            lastFundingRate: args.lastFundingRate,
-            fundingInterval: args.fundingInterval,
-            nextFundingTs: args.nextFundingTs,
-        }
-        .to_log_data(),
-    });
-    Ok(Bytes::new())
-}
-
-/// `getFundingState(uint64 marketId) returns (int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs)`
+/// `getFundingState(uint64 marketId) returns (int64 lastFundingRate, uint64 nextFundingTs)`
 pub fn run_get_funding_state<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -1047,8 +1080,23 @@ pub fn run_get_funding_state<CTX: ContextTr>(
     Ok(Bytes::from(getFundingStateCall::abi_encode_returns(
         &getFundingStateReturn {
             lastFundingRate: state.last_funding_rate,
-            fundingInterval: state.funding_interval,
             nextFundingTs: state.next_funding_ts,
+        },
+    )))
+}
+
+/// `getAveragePremiumIndex(uint64 marketId) returns (int64 avgPremiumIndex, uint64 sampleCount)`
+pub fn run_get_average_premium_index<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = getAveragePremiumIndexCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getAveragePremiumIndex: invalid calldata"))?;
+    let acc = storage::load_premium_accumulator(context, args.marketId)?;
+    Ok(Bytes::from(getAveragePremiumIndexCall::abi_encode_returns(
+        &getAveragePremiumIndexReturn {
+            avgPremiumIndex: acc.average(),
+            sampleCount: acc.sample_count,
         },
     )))
 }
@@ -1057,10 +1105,10 @@ pub fn run_get_funding_state<CTX: ContextTr>(
 
 /// Price1 = index × [1 + (last_funding_rate × time_until_next / funding_interval)]
 ///
-/// Uses FUNDING_RATE_ONE (1e9) as the fixed-point base for the rate.
+/// Uses FUNDING_RATE_ONE (1e6) as the fixed-point base for the rate.
 /// Returns `index` unchanged if funding is not configured or the epoch has passed.
-fn compute_price1(index: u64, funding: &FundingState, now: u64) -> u64 {
-    if funding.funding_interval == 0 || funding.next_funding_ts == 0 {
+fn compute_price1(index: u64, funding: &FundingState, market: &Market, now: u64) -> u64 {
+    if market.funding_interval == 0 || funding.next_funding_ts == 0 {
         return index;
     }
     let time_until = funding.next_funding_ts.saturating_sub(now);
@@ -1069,7 +1117,7 @@ fn compute_price1(index: u64, funding: &FundingState, now: u64) -> u64 {
     }
     // adjustment = rate × time_until / interval  (still in FUNDING_RATE_ONE units)
     let adjustment = (funding.last_funding_rate as i128) * (time_until as i128)
-        / (funding.funding_interval as i128);
+        / (market.funding_interval as i128);
     let total_factor = FUNDING_RATE_ONE as i128 + adjustment;
     let price1 = ((index as i128) * total_factor / FUNDING_RATE_ONE as i128).max(1);
     price1.min(u64::MAX as i128) as u64

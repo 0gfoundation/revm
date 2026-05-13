@@ -13,7 +13,7 @@ use crate::{
         errors::perp_err,
         types::{
             ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, Order, OrderEntry,
-            PerpPosition, PriceBasisWindow, UserAccount, UserFeeRates,
+            PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount, UserFeeRates,
         },
         PERP_DEX_ADDRESS,
     },
@@ -26,8 +26,8 @@ use keys::{
     best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot,
     funding_state_key, index_price_history_key, index_price_state_key, last_traded_price_key,
     mark_price_key, market_fee_total_key, market_key, open_interest_key, oracle_key, order_key,
-    position_key, price_basis_window_key, trade_count_key, user_buy_orders_key, user_fee_rates_key,
-    user_nonce_key, user_sell_orders_key,
+    position_key, premium_accumulator_key, price_basis_window_key, trade_count_key,
+    user_buy_orders_key, user_fee_rates_key, user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -806,4 +806,26 @@ pub fn save_funding_state<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let buf = encode(state)?;
     store_blob(context, funding_state_key(market_id), &buf)
+}
+
+// ── Premium index accumulator ─────────────────────────────────────────────────
+
+pub fn load_premium_accumulator<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<PremiumIndexAccumulator, PrecompileError> {
+    let buf = load_blob(context, premium_accumulator_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(PremiumIndexAccumulator::default());
+    }
+    decode(&buf)
+}
+
+pub fn save_premium_accumulator<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    acc: &PremiumIndexAccumulator,
+) -> Result<(), PrecompileError> {
+    let buf = encode(acc)?;
+    store_blob(context, premium_accumulator_key(market_id), &buf)
 }

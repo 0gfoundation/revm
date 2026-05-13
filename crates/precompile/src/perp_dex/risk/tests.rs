@@ -57,6 +57,8 @@ fn setup_market(ctx: &mut TestCtx) {
             max_price: 1_000_000,
             price_update_interval: 15,
             active: true,
+            funding_interval: 0,
+            interest_rate: 0,
         },
     )
     .unwrap();
@@ -216,7 +218,7 @@ fn mid_window_closes_interval_with_current_index_price() {
     assert_eq!(window.last_sample_ts, 20);
     let history = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
     assert_eq!(window.moving_average_basis(&history, 15), 0);
-    assert_eq!(window.moving_average_basis(&history, 30), -10);
+    assert_eq!(window.moving_average_basis(&history, 30), -3);
 
     run_update_index_price(
         &updateIndexPriceCall {
@@ -237,7 +239,7 @@ fn mid_window_closes_interval_with_current_index_price() {
     assert_eq!(window.last_sample_ts, 20);
     assert_eq!(window.count, 1);
     let history = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
-    assert_eq!(window.moving_average_basis(&history, 30), -10);
+    assert_eq!(window.moving_average_basis(&history, 30), -3);
 }
 
 #[test]
@@ -291,8 +293,8 @@ fn mid_window_uses_index_checkpoints_across_full_basis_window() {
     let window = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
     let history = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
     assert_eq!(history.checkpoints.len(), 3);
-    // [1,15): 100 basis for 14s; [15,30): 90 basis for 15s.
-    assert_eq!(window.moving_average_basis(&history, 30), 94);
+    // [1,15): 100 basis for 14s; [15,30): 90 basis for 15s; [0,1): no mid = 0.
+    assert_eq!(window.moving_average_basis(&history, 30), 91);
 }
 
 #[test]
@@ -312,8 +314,8 @@ fn mid_window_uses_ring_order_after_wrap() {
     );
 
     // The 30-slot ring now holds timestamps 6..=35. For [5,35), timestamp 35 is
-    // right-exclusive, so the weighted basis covers 6..34 and averages to 20.
-    assert_eq!(window.moving_average_basis(&history, 35), 20);
+    // right-exclusive, so [5,6) has no retained mid sample and contributes 0.
+    assert_eq!(window.moving_average_basis(&history, 35), 19);
 }
 
 fn liquidate(ctx: &mut TestCtx, user: Address) -> Result<Bytes, PrecompileError> {

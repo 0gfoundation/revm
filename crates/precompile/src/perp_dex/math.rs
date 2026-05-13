@@ -9,12 +9,14 @@ use crate::{
 };
 
 pub const QUOTE_DECIMALS: u32 = 6;
-pub const FUNDING_RATE_ONE: i128 = 1_000_000_000;
-pub const MAX_FUNDING_RATE: i128 = 7_500_000;
-pub const MIN_FUNDING_RATE: i128 = -7_500_000;
-pub const CLAMP_UPPER_BOUND: i128 = 500_000;
-pub const CLAMP_LOWER_BOUND: i128 = -500_000;
-pub const INTEREST_RATE: i128 = 100_000;
+/// Fixed-point base for funding rates: 1_000_000 = 100%.  Minimum granularity: 0.0001%.
+pub const FUNDING_RATE_ONE: i64 = 1_000_000;
+pub const MAX_FUNDING_RATE: i64 = 7_500;   // +0.75%
+pub const MIN_FUNDING_RATE: i64 = -7_500;  // -0.75%
+pub const CLAMP_UPPER_BOUND: i64 = 500;    // +0.05%  (inner clamp for I−P)
+pub const CLAMP_LOWER_BOUND: i64 = -500;   // -0.05%
+/// Default interest rate per funding epoch: 0.01% = 100 in FUNDING_RATE_ONE units.
+pub const DEFAULT_INTEREST_RATE: i64 = 100;
 /// Maintenance margin = notional / 6, approximately 16.67%.
 pub const MAINTENANCE_MARGIN_DENOMINATOR: i128 = 6;
 /// Trading fee denominator. 1 basis point = 1 / 10_000.
@@ -209,12 +211,14 @@ pub fn calc_liquidation_price(
     i64::try_from(price).map_err(|_| perp_err("math: liquidation price exceeds i64"))
 }
 
-/// Compute the funding rate from the average premium index.
+/// Compute the funding rate using Binance's formula:
+///   F = P + clamp(interest_rate − P, CLAMP_LOWER_BOUND, CLAMP_UPPER_BOUND)
+///   F_final = clamp(F, MIN_FUNDING_RATE, MAX_FUNDING_RATE)
 #[inline]
-pub fn calc_funding_rate(average_premium_index: i64) -> i64 {
+pub fn calc_funding_rate(average_premium_index: i64, interest_rate: i64) -> i64 {
     let clamped =
-        (INTEREST_RATE - average_premium_index as i128).clamp(CLAMP_LOWER_BOUND, CLAMP_UPPER_BOUND);
-    ((average_premium_index as i128 + clamped).clamp(MIN_FUNDING_RATE, MAX_FUNDING_RATE)) as i64
+        (interest_rate - average_premium_index).clamp(CLAMP_LOWER_BOUND, CLAMP_UPPER_BOUND);
+    (average_premium_index + clamped).clamp(MIN_FUNDING_RATE, MAX_FUNDING_RATE)
 }
 
 /// Apply a funding-rate payment to a position.
@@ -232,7 +236,7 @@ pub fn calc_funding_fee(
     let fee = (funding_rate as i128)
         .checked_mul(v)
         .ok_or_else(|| perp_err("math: funding fee overflow"))?
-        / FUNDING_RATE_ONE;
+        / FUNDING_RATE_ONE as i128;
     i64::try_from(fee).map_err(|_| perp_err("math: funding fee exceeds i64"))
 }
 

@@ -33,21 +33,22 @@ use crate::{
         interface::IPerpDex::{
             addMarketCall, addPositionMarginCall, cancelOrderCall, cancelOrderSignedCall,
             depositCall, getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
-            getBookLevelCall, getBookPricesCall, getFundingStateCall, getIndexPriceCall,
-            getMarkPriceCall, getMarketCall, getMarketFeeTotalCall, getOpenOrdersCall,
-            getOrderCall, getOracleAddressCall, getPositionCall, getUserFeeRatesCall,
-            initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall,
-            registerApiKeyCall, removePositionMarginCall, revokeApiKeyCall, setFundingStateCall,
-            setLeverageCall, setLeverageSignedCall, setMarkPriceCall, setOracleAddressCall,
-            setUserFeeRatesCall, transferAdminCall, transferFromPerpCall, transferToPerpCall,
-            updateIndexPriceCall, updateMarketCall, withdrawCall,
+            getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
+            getIndexPriceCall, getMarkPriceCall, getMarketCall, getMarketFeeTotalCall,
+            getOpenOrdersCall, getOrderCall, getOracleAddressCall, getPositionCall,
+            getUserFeeRatesCall, initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall,
+            registerApiKeyCall, removePositionMarginCall, revokeApiKeyCall, setLeverageCall,
+            setLeverageSignedCall, setMarkPriceCall, setOracleAddressCall, setUserFeeRatesCall,
+            transferAdminCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
+            updateMarketCall, withdrawCall,
         },
         risk::{
-            run_add_market, run_add_position_margin, run_get_admin, run_get_funding_state,
-            run_get_index_price, run_get_mark_price, run_get_market, run_get_oracle_address,
-            run_get_position, run_init_admin, run_liquidate, run_remove_position_margin,
-            run_set_funding_state, run_set_leverage, run_set_leverage_signed, run_set_mark_price,
-            run_set_oracle_address, run_transfer_admin, run_update_index_price, run_update_market,
+            run_add_market, run_add_position_margin, run_get_admin, run_get_average_premium_index,
+            run_get_funding_state, run_get_index_price, run_get_mark_price, run_get_market,
+            run_get_oracle_address, run_get_position, run_init_admin, run_liquidate,
+            run_remove_position_margin, run_set_leverage, run_set_leverage_signed,
+            run_set_mark_price, run_set_oracle_address, run_transfer_admin, run_update_index_price,
+            run_update_market,
         },
         trading::{
             run_cancel_order, run_cancel_order_signed, run_get_book_level, run_get_book_prices,
@@ -131,8 +132,8 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getOracleAddressCall::SELECTOR, (5_000, true));
         m.insert(updateIndexPriceCall::SELECTOR, (50_000, false));
         m.insert(getIndexPriceCall::SELECTOR, (5_000, true));
-        m.insert(setFundingStateCall::SELECTOR, (30_000, false));
         m.insert(getFundingStateCall::SELECTOR, (5_000, true));
+        m.insert(getAveragePremiumIndexCall::SELECTOR, (5_000, true));
         m
     })
 }
@@ -262,10 +263,10 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
             run_update_index_price(input_bytes, caller, context)
         }
         s if s == getIndexPriceCall::SELECTOR => run_get_index_price(input_bytes, context),
-        s if s == setFundingStateCall::SELECTOR => {
-            run_set_funding_state(input_bytes, caller, context)
-        }
         s if s == getFundingStateCall::SELECTOR => run_get_funding_state(input_bytes, context),
+        s if s == getAveragePremiumIndexCall::SELECTOR => {
+            run_get_average_premium_index(input_bytes, context)
+        }
         _ => return Err(PrecompileError::StatefulInvalidInput),
     };
 

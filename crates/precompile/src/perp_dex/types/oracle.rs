@@ -75,7 +75,6 @@ impl PriceBasisWindow {
 
         let window_start_ts = end_ts.saturating_sub(PRICE_BASIS_WINDOW_SIZE as u64);
         let mut weighted_sum = 0i128;
-        let mut total_weight = 0u64;
 
         let mut cursor_ts = end_ts;
         let mut mid_offset = 0usize;
@@ -98,7 +97,6 @@ impl PriceBasisWindow {
             let weight = cursor_ts.saturating_sub(segment_start_ts);
             if weight > 0 {
                 weighted_sum += (mid_price as i128 - index_price as i128) * weight as i128;
-                total_weight = total_weight.saturating_add(weight);
             }
 
             cursor_ts = segment_start_ts;
@@ -114,10 +112,11 @@ impl PriceBasisWindow {
             }
         }
 
-        if total_weight == 0 {
+        let window_weight = end_ts.saturating_sub(window_start_ts);
+        if window_weight == 0 {
             0
         } else {
-            (weighted_sum / total_weight as i128) as i64
+            (weighted_sum / window_weight as i128) as i64
         }
     }
 
@@ -198,15 +197,45 @@ impl IndexPriceHistory {
     }
 }
 
-/// Per-market funding configuration, set by admin after each settlement epoch.
+/// Per-market funding state — auto-updated by updateIndexPrice at epoch boundaries.
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct FundingState {
-    /// Last settled funding rate in FUNDING_RATE_ONE units (1e9 = 100%).
+    /// Last computed funding rate in FUNDING_RATE_ONE units (1e6 = 100%).
     pub last_funding_rate: i64,
-    /// Seconds between funding epochs (e.g. 28 800 for 8 h).
-    pub funding_interval: u64,
-    /// Unix-second timestamp of the next funding settlement.
+    /// Unix-second timestamp of the next funding settlement (0 = not yet started).
     pub next_funding_ts: u64,
+}
+
+/// Per-market linearly-weighted premium index accumulator for funding rate calculation.
+///
+/// Funding rate = weighted average of premium index over the epoch, where the k-th
+/// sample (1-indexed from epoch start) has weight k.  Older samples get lower weight.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct PremiumIndexAccumulator {
+    /// Σ(k × PI_k) in FUNDING_RATE_ONE = 1_000_000 units.
+    pub weighted_sum: i64,
+    /// Number of samples pushed in the current epoch.
+    pub sample_count: u64,
+    /// Unix-second timestamp of the first sample in this epoch (0 = not started).
+    pub epoch_start_ts: u64,
+}
+
+impl PremiumIndexAccumulator {
+    /// Push one premium-index sample.  Weight = sample_count + 1 (1-indexed).
+    pub fn push_sample(&mut self, pi: i64) {
+        let weight = (self.sample_count + 1) as i64;
+        self.weighted_sum = self.weighted_sum.saturating_add(pi.saturating_mul(weight));
+        self.sample_count += 1;
+    }
+
+    /// Linearly-weighted average: Σ(k·PI_k) / Σk = weighted_sum / (n·(n+1)/2).
+    pub fn average(&self) -> i64 {
+        if self.sample_count == 0 {
+            return 0;
+        }
+        let total_weight = (self.sample_count * (self.sample_count + 1)) / 2;
+        self.weighted_sum / total_weight as i64
+    }
 }
 
 /// Per-market index price state written by the oracle.
@@ -215,3 +244,4 @@ pub struct IndexPriceState {
     pub index_price: u64,
     pub timestamp: u64,
 }
+

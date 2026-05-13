@@ -88,4 +88,10 @@ pub struct Market {
     pub price_update_interval: u64,
     /// Whether the market accepts new orders.
     pub active: bool,
+    /// Seconds between funding epochs (e.g. 28 800 for 8 h). 0 = funding disabled.
+    #[serde(default)]
+    pub funding_interval: u64,
+    /// Per-epoch interest rate in FUNDING_RATE_ONE units (1e6 = 100%). Default: 100 = 0.01%.
+    #[serde(default)]
+    pub interest_rate: i64,
 }

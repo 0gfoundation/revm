@@ -64,6 +64,8 @@ fn setup(ctx: &mut TestCtx) {
             max_price: PRICE * 1_000,
             price_update_interval: 15,
             active: true,
+            funding_interval: 0,
+            interest_rate: 0,
         },
     )
     .unwrap();
@@ -328,6 +330,8 @@ fn margin_uses_market_price_decimals() {
             max_price: 1_000_000,
             price_update_interval: 15,
             active: true,
+            funding_interval: 0,
+            interest_rate: 0,
         },
     )
     .unwrap();
