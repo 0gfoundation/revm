@@ -13,6 +13,7 @@ use crate::{
             transferToPerpCall, withdrawCall, TransferFromPerp, TransferToPerp,
         },
         storage::{self, load_erc20_balance, save_erc20_balance},
+        types::MAX_PERP_WALLET_BALANCE,
         PERP_DEX_ADDRESS, USDC_ADDRESS,
     },
     PrecompileError,
@@ -47,8 +48,8 @@ pub fn run_deposit<CTX: ContextTr>(
     let mut account = storage::load_account(context, caller)?;
     let prev: U256 = account.usdc_balance.clone().into();
     let new_balance = prev + amount;
-    if new_balance > U256::from(u64::MAX) {
-        return Err(perp_err("deposit: total balance would exceed u64::MAX"));
+    if new_balance > U256::from(MAX_PERP_WALLET_BALANCE) {
+        return Err(perp_err("deposit: total balance would exceed i64::MAX"));
     }
     account.usdc_balance = new_balance.into();
     storage::save_account(context, caller, account)?;
@@ -129,10 +130,7 @@ pub fn run_transfer_to_perp<CTX: ContextTr>(
         return Err(perp_err("transferToPerp: insufficient spot balance"));
     }
     account.usdc_balance = (spot - amount_u256).into();
-    account.perp_wallet_balance = account
-        .perp_wallet_balance
-        .checked_add(amount)
-        .ok_or_else(|| perp_err("transferToPerp: overflow"))?;
+    account.credit_perp(amount)?;
     storage::save_account(context, caller, account)?;
 
     context.journal_mut().log(Log {
@@ -162,12 +160,12 @@ pub fn run_transfer_from_perp<CTX: ContextTr>(
     }
 
     let mut account = storage::load_account(context, caller)?;
-    if account.perp_wallet_balance < amount {
+    if !account.has_available_perp(amount) {
         return Err(perp_err(
             "transferFromPerp: insufficient perp wallet balance",
         ));
     }
-    account.perp_wallet_balance -= amount;
+    account.debit_perp(amount)?;
     let spot: U256 = account.usdc_balance.clone().into();
     account.usdc_balance = (spot + U256::from(amount)).into();
     storage::save_account(context, caller, account)?;
@@ -193,8 +191,8 @@ pub fn run_get_account<CTX: ContextTr>(
         .map_err(|_| perp_err("getAccount: invalid calldata"))?;
 
     let account = storage::load_account(context, args.user)?;
-    let usdc_balance: U256 = account.usdc_balance.into();
-    let perp_wallet_balance = account.perp_wallet_balance;
+    let usdc_balance: U256 = account.usdc_balance.clone().into();
+    let perp_wallet_balance = account.visible_perp_wallet_balance();
 
     Ok(Bytes::from(getAccountCall::abi_encode_returns(
         &getAccountReturn {

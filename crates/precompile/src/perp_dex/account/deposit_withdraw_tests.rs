@@ -98,9 +98,9 @@ fn deposit_rejects_zero_amount() {
 }
 
 #[test]
-fn deposit_rejects_when_total_would_exceed_u64_max() {
-    // Two deposits of 2/3 * u64::MAX each: individually valid, cumulatively overflows.
-    let two_thirds = U256::from(u64::MAX / 3 * 2);
+fn deposit_rejects_when_total_would_exceed_i64_max() {
+    // Two deposits of 2/3 * i64::MAX each: individually valid, cumulatively overflows.
+    let two_thirds = U256::from(i64::MAX as u64 / 3 * 2);
     let mut ctx = make_ctx(U256::MAX);
     run_deposit(
         &depositCall { amount: two_thirds }.abi_encode(),
@@ -114,7 +114,7 @@ fn deposit_rejects_when_total_would_exceed_u64_max() {
         &mut ctx,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("exceed u64::MAX"), "{err}");
+    assert!(err.to_string().contains("exceed i64::MAX"), "{err}");
 }
 
 #[test]
@@ -214,5 +214,17 @@ fn get_account_returns_zero_for_new_user() {
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
     let (usdc, perp) = decode_get_account(&ret);
     assert_eq!(usdc, U256::ZERO);
+    assert_eq!(perp, 0);
+}
+
+#[test]
+fn get_account_clamps_negative_perp_wallet_to_zero() {
+    let mut ctx = make_ctx(U256::ZERO);
+    let mut account = storage::load_account(&mut ctx, ALICE).unwrap();
+    account.perp_wallet_balance = -1_000_000;
+    storage::save_account(&mut ctx, ALICE, account).unwrap();
+
+    let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
+    let (_usdc, perp) = decode_get_account(&ret);
     assert_eq!(perp, 0);
 }
