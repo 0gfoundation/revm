@@ -33,7 +33,15 @@ pub fn run_register_api_key<CTX: ContextTr>(
         return Err(perp_err("registerApiKey: pubkey cannot be zero"));
     }
 
-    storage::save_api_key(context, caller, args.keyId, ApiKey { pubkey, expiry: args.expiry })?;
+    storage::save_api_key(
+        context,
+        caller,
+        args.keyId,
+        ApiKey {
+            pubkey,
+            expiry: args.expiry,
+        },
+    )?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
@@ -62,7 +70,11 @@ pub fn run_revoke_api_key<CTX: ContextTr>(
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
-        data: IPerpDex::ApiKeyRevoked { user: caller, keyId: args.keyId }.to_log_data(),
+        data: IPerpDex::ApiKeyRevoked {
+            user: caller,
+            keyId: args.keyId,
+        }
+        .to_log_data(),
     });
 
     Ok(Bytes::new())
@@ -106,6 +118,10 @@ pub fn run_get_api_keys<CTX: ContextTr>(
     }
 
     Ok(Bytes::from(getApiKeysCall::abi_encode_returns(
-        &getApiKeysReturn { keyIds: ids, pubkeys, expiries },
+        &getApiKeysReturn {
+            keyIds: ids,
+            pubkeys,
+            expiries,
+        },
     )))
 }

@@ -1,6 +1,6 @@
 use alloy_primitives::IntoLogData;
 use context::{ContextTr, JournalTr};
-use primitives::{Address, FixedBytes, Log};
+use primitives::{Address, Log};
 
 use super::execute_order_cancellation;
 use crate::{
@@ -45,18 +45,14 @@ fn calc_maker_fee_for_order_qty_with_bps(
 pub(super) struct TakerSettlement {
     user: Address,
     market_id: u64,
-    pos: crate::perp_dex::types::PerpPosition,
-    account: crate::perp_dex::types::UserAccount,
-    /// Remaining closing capacity across fills in this match round.  Decremented
-    /// by each `record_fill` so that subsequent fills correctly see a reduced
-    /// closing window even though `pos.amount` is not updated until `finalize`.
-    remaining_closing_qty: u64,
-    closing_qty: u64,
-    closing_value: u64,
-    opening_qty: u64,
-    opening_value: u64,
-    opening_margin_required: u64,
+    fills: Vec<RecordedFill>,
     taker_fee_bps: u64,
+}
+
+struct RecordedFill {
+    price: u64,
+    quantity: u64,
+    taker_side: Side,
 }
 
 impl TakerSettlement {
@@ -70,18 +66,10 @@ impl TakerSettlement {
         market_id: u64,
     ) -> Result<Self, PrecompileError> {
         let rates = storage::load_user_fee_rates(context, user)?;
-        let pos = storage::load_position(context, user, market_id)?;
         Ok(Self {
             user,
             market_id,
-            remaining_closing_qty: pos.amount.unsigned_abs(),
-            pos,
-            account: storage::load_account(context, user)?,
-            closing_qty: 0,
-            closing_value: 0,
-            opening_qty: 0,
-            opening_value: 0,
-            opening_margin_required: 0,
+            fills: Vec::new(),
             taker_fee_bps: rates.taker_fee_bps,
         })
     }
@@ -114,49 +102,13 @@ impl TakerSettlement {
         fill_price: u64,
         fill_qty: u64,
         taker_side: Side,
-        market: &crate::perp_dex::types::Market,
+        _market: &crate::perp_dex::types::Market,
     ) -> Result<(), PrecompileError> {
-        let is_buy = taker_side == Side::Buy;
-        // A fill is closing only when it moves against the existing position.
-        // Cap at remaining_closing_qty, not pos.amount, because prior fills in
-        // this same match round have already consumed part of the position.
-        let closing_qty = if (is_buy && self.pos.amount < 0) || (!is_buy && self.pos.amount > 0) {
-            fill_qty.min(self.remaining_closing_qty)
-        } else {
-            0
-        };
-        self.remaining_closing_qty = self.remaining_closing_qty.saturating_sub(closing_qty);
-        let opening_qty = fill_qty - closing_qty;
-        let closing_value = calc_value(
-            fill_price,
-            closing_qty,
-            market.base_decimals,
-            market.price_decimals,
-        )?;
-        let opening_value = calc_value(
-            fill_price,
-            opening_qty,
-            market.base_decimals,
-            market.price_decimals,
-        )?;
-
-        self.closing_qty = self
-            .closing_qty
-            .checked_add(closing_qty)
-            .ok_or_else(|| perp_err("placeOrder: closing quantity overflow"))?;
-        self.closing_value = self
-            .closing_value
-            .checked_add(closing_value)
-            .ok_or_else(|| perp_err("placeOrder: closing value overflow"))?;
-        self.opening_qty = self
-            .opening_qty
-            .checked_add(opening_qty)
-            .ok_or_else(|| perp_err("placeOrder: opening quantity overflow"))?;
-        self.opening_value = self
-            .opening_value
-            .checked_add(opening_value)
-            .ok_or_else(|| perp_err("placeOrder: opening value overflow"))?;
-
+        self.fills.push(RecordedFill {
+            price: fill_price,
+            quantity: fill_qty,
+            taker_side,
+        });
         Ok(())
     }
 
@@ -180,23 +132,68 @@ impl TakerSettlement {
     ///    from the wallet; position margin is never touched for fee payment.
     /// 7. **Emit log** — single `PositionChanged` event for the full order.
     pub(super) fn finalize<CTX: ContextTr>(
-        mut self,
+        self,
         context: &mut CTX,
         taker_side: Side,
         market: &crate::perp_dex::types::Market,
     ) -> Result<(), PrecompileError> {
-        if self.closing_qty == 0 && self.opening_qty == 0 {
+        if self.fills.is_empty() {
             return Ok(());
         }
 
+        let mut pos = storage::load_position(context, self.user, self.market_id)?;
+        let mut account = storage::load_account(context, self.user)?;
+        let mut remaining_closing_qty = pos.amount.unsigned_abs();
+        let mut closing_qty = 0u64;
+        let mut closing_value = 0u64;
+        let mut opening_qty = 0u64;
+        let mut opening_value = 0u64;
         let is_buy = taker_side == Side::Buy;
-        self.opening_margin_required = apply_position_fill(
-            &mut self.pos,
-            &mut self.account.perp_wallet_balance,
-            self.closing_qty,
-            self.closing_value,
-            self.opening_qty,
-            self.opening_value,
+
+        for fill in &self.fills {
+            if fill.taker_side != taker_side {
+                return Err(perp_invariant_err("taker settlement mixed fill sides"));
+            }
+            let fill_closing_qty = if (is_buy && pos.amount < 0) || (!is_buy && pos.amount > 0) {
+                fill.quantity.min(remaining_closing_qty)
+            } else {
+                0
+            };
+            remaining_closing_qty = remaining_closing_qty.saturating_sub(fill_closing_qty);
+            let fill_opening_qty = fill.quantity - fill_closing_qty;
+            let fill_closing_value = calc_value(
+                fill.price,
+                fill_closing_qty,
+                market.base_decimals,
+                market.price_decimals,
+            )?;
+            let fill_opening_value = calc_value(
+                fill.price,
+                fill_opening_qty,
+                market.base_decimals,
+                market.price_decimals,
+            )?;
+            closing_qty = closing_qty
+                .checked_add(fill_closing_qty)
+                .ok_or_else(|| perp_err("placeOrder: closing quantity overflow"))?;
+            closing_value = closing_value
+                .checked_add(fill_closing_value)
+                .ok_or_else(|| perp_err("placeOrder: closing value overflow"))?;
+            opening_qty = opening_qty
+                .checked_add(fill_opening_qty)
+                .ok_or_else(|| perp_err("placeOrder: opening quantity overflow"))?;
+            opening_value = opening_value
+                .checked_add(fill_opening_value)
+                .ok_or_else(|| perp_err("placeOrder: opening value overflow"))?;
+        }
+
+        let opening_margin_required = apply_position_fill(
+            &mut pos,
+            &mut account.perp_wallet_balance,
+            closing_qty,
+            closing_value,
+            opening_qty,
+            opening_value,
             is_buy,
         )?;
 
@@ -204,27 +201,24 @@ impl TakerSettlement {
         // for the taker's remaining open orders reflects the new position size.
         // MR delta is reconciled with wallet via mr_credit/mr_extra below;
         // without this, W + M + MR is not conserved across the fill.
-        let old_mr = self.pos.margin_reserved;
+        let old_mr = pos.margin_reserved;
         recompute_maker_order_reserve_after_fill(
             context,
             self.user,
             self.market_id,
-            &mut self.pos,
+            &mut pos,
             market,
         )?;
-        let new_mr = self.pos.margin_reserved;
+        let new_mr = pos.margin_reserved;
         let mr_credit = old_mr.saturating_sub(new_mr); // MR decreased: freed margin back to wallet
         let mr_extra = new_mr.saturating_sub(old_mr); // MR increased: wallet must cover the gap
-        self.account.perp_wallet_balance =
-            self.account.perp_wallet_balance.saturating_add(mr_credit);
+        account.credit_perp(mr_credit)?;
 
-        let fee_notional = self
-            .closing_value
-            .checked_add(self.opening_value)
+        let fee_notional = closing_value
+            .checked_add(opening_value)
             .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
         let fee = calc_trading_fee(fee_notional, self.taker_fee_bps)?;
-        let total_required = self
-            .opening_margin_required
+        let total_required = opening_margin_required
             .checked_add(fee)
             .ok_or_else(|| perp_err("placeOrder: opening margin + fee overflow"))?
             .checked_add(mr_extra)
@@ -232,8 +226,8 @@ impl TakerSettlement {
 
         // Single save covers all position mutations (apply_position_fill +
         // recompute) and the PnL credit to wallet.
-        storage::save_position(context, self.user, self.market_id, &self.pos)?;
-        storage::save_account(context, self.user, self.account)?;
+        storage::save_position(context, self.user, self.market_id, &pos)?;
+        storage::save_account(context, self.user, account)?;
 
         ensure_taker_wallet_can_cover_margin(
             context,
@@ -248,9 +242,9 @@ impl TakerSettlement {
         // pos is already correct in storage — release_margin_for_cancelled_order
         // saves its own pos updates, and the log fields (amount/margin/v_quote)
         // are not touched by cancellations.
-        self.account = storage::load_account(context, self.user)?;
-        self.account.perp_wallet_balance -= total_required;
-        storage::save_account(context, self.user, self.account)?;
+        account = storage::load_account(context, self.user)?;
+        account.debit_perp(total_required)?;
+        storage::save_account(context, self.user, account)?;
         credit_fee_recipient(context, self.market_id, fee)?;
 
         context.journal_mut().log(Log {
@@ -258,10 +252,10 @@ impl TakerSettlement {
             data: IPerpDex::PositionChanged {
                 user: self.user,
                 marketId: self.market_id,
-                amount: self.pos.amount,
-                vQuoteBalance: self.pos.v_quote_balance,
-                margin: self.pos.margin,
-                leverage: self.pos.leverage,
+                amount: pos.amount,
+                vQuoteBalance: pos.v_quote_balance,
+                margin: pos.margin,
+                leverage: pos.leverage,
             }
             .to_log_data(),
         });
@@ -314,7 +308,7 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     fill_qty: u64,
     taker_side: Side,
     market: &crate::perp_dex::types::Market,
-) -> Result<u64, PrecompileError> {
+) -> Result<MakerFillResult, PrecompileError> {
     let maker_side = taker_side.opposite();
     let mut pos = storage::load_position(context, maker, market_id)?;
     let mut account = storage::load_account(context, maker)?;
@@ -357,31 +351,43 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
 
     if new_reserved > max_sustainable_reserved {
         // Deficit: position sign-flip shifted cross-side netting so remaining
-        // orders cost more MR than was pre-paid. Cancel maker orders (dominant
-        // side first, LIFO) to bring MR within budget, then reload.
+        // orders cost more MR than was pre-paid. Debit the full deficit first,
+        // allowing a temporary negative wallet; ordinary cancellations can then
+        // release MR against a fully funded reservation model.
+        let reserve_deficit = new_reserved - max_sustainable_reserved;
+        account.debit_perp(reserve_deficit)?;
+
         storage::save_position(context, maker, market_id, &pos)?;
         storage::save_account(context, maker, account)?;
-        cancel_maker_orders_until_mr_fits(
-            context,
-            maker,
-            market_id,
-            max_sustainable_reserved,
-            market,
-        )?;
-        pos = storage::load_position(context, maker, market_id)?;
-        account = storage::load_account(context, maker)?;
-        let net_release = old_reserved
-            .saturating_sub(pos.margin_reserved)
-            .saturating_sub(opening_margin);
-        account.perp_wallet_balance =
-            account.perp_wallet_balance.saturating_add(net_release);
-        storage::save_account(context, maker, account)?;
+
+        let expired_order_ids =
+            cancel_maker_orders_until_wallet_nonnegative(context, maker, market_id, market)?;
+        // TODO: If the maker wallet is still negative after all cancellable
+        // orders are gone, liquidation/bankruptcy handling should resolve it.
+        credit_fee_recipient(context, market_id, maker_fee)?;
+
+        context.journal_mut().log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::PositionChanged {
+                user: maker,
+                marketId: market_id,
+                amount: pos.amount,
+                vQuoteBalance: pos.v_quote_balance,
+                margin: pos.margin,
+                leverage: pos.leverage,
+            }
+            .to_log_data(),
+        });
+
+        return Ok(MakerFillResult {
+            maker_fee,
+            expired_order_ids,
+        });
     } else {
         let net_release = old_reserved
             .saturating_sub(new_reserved)
             .saturating_sub(opening_margin);
-        account.perp_wallet_balance =
-            account.perp_wallet_balance.saturating_add(net_release);
+        account.credit_perp(net_release)?;
         storage::save_position(context, maker, market_id, &pos)?;
         storage::save_account(context, maker, account)?;
     }
@@ -401,7 +407,15 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
         .to_log_data(),
     });
 
-    Ok(maker_fee)
+    Ok(MakerFillResult {
+        maker_fee,
+        expired_order_ids: Vec::new(),
+    })
+}
+
+pub(super) struct MakerFillResult {
+    pub maker_fee: u64,
+    pub expired_order_ids: Vec<[u8; 32]>,
 }
 
 /// Deducts a trading fee from the wallet.
@@ -422,10 +436,7 @@ fn credit_fee_recipient<CTX: ContextTr>(
         return Err(perp_err("placeOrder: fee recipient not initialised"));
     }
     let mut account = storage::load_account(context, admin)?;
-    account.perp_wallet_balance = account
-        .perp_wallet_balance
-        .checked_add(amount)
-        .ok_or_else(|| perp_err("placeOrder: fee recipient balance overflow"))?;
+    account.credit_perp(amount)?;
     storage::save_account(context, admin, account)
 }
 
@@ -501,7 +512,7 @@ fn ensure_taker_wallet_can_cover_margin<CTX: ContextTr>(
         return Ok(());
     }
 
-    if storage::load_account(context, user)?.perp_wallet_balance >= required_margin {
+    if storage::load_account(context, user)?.has_available_perp(required_margin) {
         return Ok(());
     }
 
@@ -514,7 +525,7 @@ fn ensure_taker_wallet_can_cover_margin<CTX: ContextTr>(
         market,
     )?;
 
-    if storage::load_account(context, user)?.perp_wallet_balance < required_margin {
+    if !storage::load_account(context, user)?.has_available_perp(required_margin) {
         return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
     }
     Ok(())
@@ -534,7 +545,7 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
     required_margin: u64,
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
-    while storage::load_account(context, user)?.perp_wallet_balance < required_margin {
+    while !storage::load_account(context, user)?.has_available_perp(required_margin) {
         let order_id = match side {
             Side::Buy => storage::load_buy_orders(context, user, market_id)?
                 .last()
@@ -563,7 +574,15 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
             )));
         }
 
-        execute_order_cancellation(context, user, market_id, order_id, order, market)?;
+        execute_order_cancellation(
+            context,
+            user,
+            market_id,
+            order_id,
+            order,
+            OrderStatus::Expired,
+            market,
+        )?;
     }
 
     Ok(())
@@ -609,7 +628,7 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
 /// responsible for deducting this from the wallet.
 fn apply_position_fill(
     pos: &mut crate::perp_dex::types::PerpPosition,
-    wallet: &mut u64,
+    wallet: &mut i64,
     closing_qty: u64,
     closing_value: u64,
     opening_qty: u64,
@@ -619,8 +638,7 @@ fn apply_position_fill(
     if closing_qty > 0 {
         let pos_abs = pos.amount.unsigned_abs() as u128;
         let remaining_qty = pos_abs - closing_qty as u128;
-        let remaining_margin =
-            (pos.margin.max(0) as u128 * remaining_qty / pos_abs) as i64;
+        let remaining_margin = (pos.margin.max(0) as u128 * remaining_qty / pos_abs) as i64;
         let margin_release = pos.margin.max(0) as i64 - remaining_margin;
         let remaining_vq =
             (pos.v_quote_balance as i128 * remaining_qty as i128 / pos_abs as i128) as i64;
@@ -632,11 +650,11 @@ fn apply_position_fill(
         };
         let realised = margin_release + vq_fraction + close_quote_delta;
         if realised > 0 {
-            *wallet = wallet.saturating_add(realised as u64);
+            *wallet = wallet.saturating_add(realised);
         } else if realised < 0 {
             // TODO: Route negative isolated equity through bankruptcy handling instead
             // of silently consuming wallet balance.
-            *wallet = wallet.saturating_sub((-realised) as u64);
+            *wallet = wallet.saturating_sub(-realised);
         }
         pos.margin -= margin_release;
 
@@ -773,19 +791,15 @@ fn reduce_maker_order_entry_for_fill<CTX: ContextTr>(
 /// more MR than was pre-paid after funding the new position.  Cancelling
 /// orders frees MR and credits the wallet, restoring the conservation invariant
 /// without touching `pos.margin`.
-fn cancel_maker_orders_until_mr_fits<CTX: ContextTr>(
+fn cancel_maker_orders_until_wallet_nonnegative<CTX: ContextTr>(
     context: &mut CTX,
     maker: Address,
     market_id: u64,
-    max_reserved: u64,
     market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
-    loop {
+) -> Result<Vec<[u8; 32]>, PrecompileError> {
+    let mut expired_order_ids = Vec::new();
+    while storage::load_account(context, maker)?.perp_wallet_balance < 0 {
         let pos = storage::load_position(context, maker, market_id)?;
-        if pos.margin_reserved <= max_reserved {
-            break;
-        }
-        // Cancel from the dominant side first to reduce MR as fast as possible.
         let prefer_buy = pos.buy_side_margin_reserved >= pos.sell_side_margin_reserved;
         let buy_entries = storage::load_buy_orders(context, maker, market_id)?;
         let sell_entries = storage::load_sell_orders(context, maker, market_id)?;
@@ -807,9 +821,18 @@ fn cancel_maker_orders_until_mr_fits<CTX: ContextTr>(
                 order_id
             ))
         })?;
-        execute_order_cancellation(context, maker, market_id, order_id, order, market)?;
+        execute_order_cancellation(
+            context,
+            maker,
+            market_id,
+            order_id,
+            order,
+            OrderStatus::Expired,
+            market,
+        )?;
+        expired_order_ids.push(order_id);
     }
-    Ok(())
+    Ok(expired_order_ids)
 }
 
 /// Recomputes the maker's order margin reservation from scratch after a fill.

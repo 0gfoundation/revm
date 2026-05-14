@@ -555,15 +555,11 @@ fn cancel_unfilled_remainder<CTX: ContextTr>(
 }
 
 fn ensure_fok_filled(remaining: u64) -> Result<(), PrecompileError> {
-    if remaining > 0 {
-        // feasibility check passed before match_order — if we still have remaining,
-        // the two functions disagree on what was matchable, which is a bug
-        return Err(perp_invariant_err(format!(
-            "FOK order has remaining={remaining} after feasibility check passed"
-        )));
+    if remaining == 0 {
+        Ok(())
+    } else {
+        Err(perp_err("placeOrder: FOK order cannot be fully filled"))
     }
-
-    Ok(())
 }
 
 fn ensure_post_only_does_not_cross<CTX: ContextTr>(
@@ -762,7 +758,15 @@ fn cancel_order_core<CTX: ContextTr>(
     let market_id = order.market_id;
     let market = storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("cancelOrder: unknown market"))?;
-    execute_order_cancellation(context, account, market_id, order_id, order, &market)?;
+    execute_order_cancellation(
+        context,
+        account,
+        market_id,
+        order_id,
+        order,
+        OrderStatus::Cancelled,
+        &market,
+    )?;
     Ok(Bytes::new())
 }
 
@@ -798,11 +802,21 @@ pub(super) fn match_order<CTX: ContextTr>(
                 }
                 let queue = storage::load_ask_level(context, market_id, ask_price)?;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
+                let mut expired_during_level: Vec<[u8; 32]> = Vec::new();
                 let mut qi = 0;
 
                 while qi < queue.len() {
                     if remaining == 0 {
-                        new_queue.extend_from_slice(&queue[qi..]);
+                        new_queue.extend(
+                            queue[qi..]
+                                .iter()
+                                .copied()
+                                .filter(|id| !expired_during_level.contains(id)),
+                        );
+                        if new_queue.is_empty() {
+                            storage::remove_ask_price(context, market_id, ask_price)?;
+                            ask_levels_cleared = true;
+                        }
                         storage::save_ask_level(context, market_id, ask_price, &new_queue)?;
                         break 'outer;
                     }
@@ -817,6 +831,12 @@ pub(super) fn match_order<CTX: ContextTr>(
                             ) =>
                         {
                             o
+                        }
+                        Some(o)
+                            if o.status == OrderStatus::Expired
+                                && expired_during_level.contains(&maker_id) =>
+                        {
+                            continue;
                         }
                         Some(o) => {
                             return Err(perp_invariant_err(format!(
@@ -835,7 +855,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let fill_qty = remaining.min(available);
 
                     taker_settlement.record_fill(ask_price, fill_qty, Side::Buy, market)?;
-                    let maker_fee = settle_maker_fill(
+                    let maker_fill = settle_maker_fill(
                         context,
                         Address::from(maker_order.owner),
                         &maker_id,
@@ -845,6 +865,8 @@ pub(super) fn match_order<CTX: ContextTr>(
                         Side::Buy,
                         market,
                     )?;
+                    expired_during_level.extend(maker_fill.expired_order_ids.iter().copied());
+                    new_queue.retain(|id| !expired_during_level.contains(id));
                     let fill_notional = calc_value(
                         ask_price,
                         fill_qty,
@@ -866,7 +888,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                             quantity: fill_qty,
                             taker_side: Side::Buy,
                             taker_fee,
-                            maker_fee,
+                            maker_fee: maker_fill.maker_fee,
                         },
                     )?;
 
@@ -878,9 +900,13 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 maker_id
                             ))
                         })?;
+                    let maker_expired_during_settlement = expired_during_level.contains(&maker_id)
+                        || updated_maker.status == OrderStatus::Expired;
                     updated_maker.filled += fill_qty;
                     updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
                         OrderStatus::Filled
+                    } else if maker_expired_during_settlement {
+                        OrderStatus::Expired
                     } else {
                         OrderStatus::PartiallyFilled
                     };
@@ -900,7 +926,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     storage::save_order(context, taker_order_id, &taker_order)?;
 
                     remaining -= fill_qty;
-                    if updated_maker.status != OrderStatus::Filled {
+                    if updated_maker.status == OrderStatus::PartiallyFilled {
                         new_queue.push(maker_id);
                     }
                 }
@@ -933,11 +959,21 @@ pub(super) fn match_order<CTX: ContextTr>(
                 }
                 let queue = storage::load_bid_level(context, market_id, bid_price)?;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
+                let mut expired_during_level: Vec<[u8; 32]> = Vec::new();
                 let mut qi = 0;
 
                 while qi < queue.len() {
                     if remaining == 0 {
-                        new_queue.extend_from_slice(&queue[qi..]);
+                        new_queue.extend(
+                            queue[qi..]
+                                .iter()
+                                .copied()
+                                .filter(|id| !expired_during_level.contains(id)),
+                        );
+                        if new_queue.is_empty() {
+                            storage::remove_bid_price(context, market_id, bid_price)?;
+                            bid_levels_cleared = true;
+                        }
                         storage::save_bid_level(context, market_id, bid_price, &new_queue)?;
                         break 'outer;
                     }
@@ -952,6 +988,12 @@ pub(super) fn match_order<CTX: ContextTr>(
                             ) =>
                         {
                             o
+                        }
+                        Some(o)
+                            if o.status == OrderStatus::Expired
+                                && expired_during_level.contains(&maker_id) =>
+                        {
+                            continue;
                         }
                         Some(o) => {
                             return Err(perp_invariant_err(format!(
@@ -970,7 +1012,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let fill_qty = remaining.min(available);
 
                     taker_settlement.record_fill(bid_price, fill_qty, Side::Sell, market)?;
-                    let maker_fee = settle_maker_fill(
+                    let maker_fill = settle_maker_fill(
                         context,
                         Address::from(maker_order.owner),
                         &maker_id,
@@ -980,6 +1022,8 @@ pub(super) fn match_order<CTX: ContextTr>(
                         Side::Sell,
                         market,
                     )?;
+                    expired_during_level.extend(maker_fill.expired_order_ids.iter().copied());
+                    new_queue.retain(|id| !expired_during_level.contains(id));
                     let fill_notional = calc_value(
                         bid_price,
                         fill_qty,
@@ -1001,7 +1045,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                             quantity: fill_qty,
                             taker_side: Side::Sell,
                             taker_fee,
-                            maker_fee,
+                            maker_fee: maker_fill.maker_fee,
                         },
                     )?;
 
@@ -1012,9 +1056,13 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 maker_id
                             ))
                         })?;
+                    let maker_expired_during_settlement = expired_during_level.contains(&maker_id)
+                        || updated_maker.status == OrderStatus::Expired;
                     updated_maker.filled += fill_qty;
                     updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
                         OrderStatus::Filled
+                    } else if maker_expired_during_settlement {
+                        OrderStatus::Expired
                     } else {
                         OrderStatus::PartiallyFilled
                     };
@@ -1033,7 +1081,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     storage::save_order(context, taker_order_id, &taker_order)?;
 
                     remaining -= fill_qty;
-                    if updated_maker.status != OrderStatus::Filled {
+                    if updated_maker.status == OrderStatus::PartiallyFilled {
                         new_queue.push(maker_id);
                     }
                 }
@@ -1166,10 +1214,10 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
 
-            if account.perp_wallet_balance < delta {
+            if !account.has_available_perp(delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
-            account.perp_wallet_balance -= delta;
+            account.debit_perp(delta)?;
             pos.buy_side_reserved_notional = new_buy_side_notional;
             pos.buy_side_margin_reserved = new_buy_side_reserved;
             pos.fee_reserved = pos
@@ -1235,10 +1283,10 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
 
-            if account.perp_wallet_balance < delta {
+            if !account.has_available_perp(delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
-            account.perp_wallet_balance -= delta;
+            account.debit_perp(delta)?;
             pos.sell_side_reserved_notional = new_sell_side_notional;
             pos.sell_side_margin_reserved = new_sell_side_reserved;
             pos.fee_reserved = pos
@@ -1300,6 +1348,7 @@ pub(super) fn execute_order_cancellation<CTX: ContextTr>(
     market_id: u64,
     order_id: [u8; 32],
     mut order: Order,
+    terminal_status: OrderStatus,
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
     let remaining = order.quantity - order.filled;
@@ -1307,7 +1356,7 @@ pub(super) fn execute_order_cancellation<CTX: ContextTr>(
     release_margin_for_cancelled_order(
         context, user, market_id, order.side, &order_id, remaining, market,
     )?;
-    order.status = OrderStatus::Cancelled;
+    order.status = terminal_status;
     storage::save_order(context, &order_id, &order)?;
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
@@ -1399,10 +1448,8 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 cancelled_entry.maker_fee_bps,
                 market,
             )?;
-            account.perp_wallet_balance = account
-                .perp_wallet_balance
-                .saturating_add(freed)
-                .saturating_add(fee_freed);
+            account.credit_perp(freed)?;
+            account.credit_perp(fee_freed)?;
             pos.buy_side_reserved_notional = new_notional;
             pos.buy_side_margin_reserved = new_reserved;
             pos.fee_reserved = pos.fee_reserved.saturating_sub(fee_freed);
@@ -1433,10 +1480,8 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 cancelled_entry.maker_fee_bps,
                 market,
             )?;
-            account.perp_wallet_balance = account
-                .perp_wallet_balance
-                .saturating_add(freed)
-                .saturating_add(fee_freed);
+            account.credit_perp(freed)?;
+            account.credit_perp(fee_freed)?;
             pos.sell_side_reserved_notional = new_notional;
             pos.sell_side_margin_reserved = new_reserved;
             pos.fee_reserved = pos.fee_reserved.saturating_sub(fee_freed);

@@ -252,7 +252,7 @@ impl JournalTr for Backend {
     fn discard_tx(&mut self) {
         self.journaled_state.discard_tx()
     }
-    
+
     fn balance_decr(
         &mut self,
         address: Address,

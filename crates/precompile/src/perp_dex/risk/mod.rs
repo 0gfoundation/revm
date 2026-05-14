@@ -466,13 +466,13 @@ pub fn run_add_position_margin<CTX: ContextTr>(
         return Err(perp_err("addPositionMargin: no open position"));
     }
     let mut account = storage::load_account(context, caller)?;
-    if account.perp_wallet_balance < args.amount {
+    if !account.has_available_perp(args.amount) {
         return Err(perp_err(
             "addPositionMargin: insufficient perp wallet balance",
         ));
     }
 
-    account.perp_wallet_balance -= args.amount;
+    account.debit_perp(args.amount)?;
     pos.margin = pos
         .margin
         .checked_add(args.amount as i64)
@@ -526,10 +526,7 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     }
 
     let mut account = storage::load_account(context, caller)?;
-    account.perp_wallet_balance = account
-        .perp_wallet_balance
-        .checked_add(args.amount)
-        .ok_or_else(|| perp_err("removePositionMargin: wallet balance overflow"))?;
+    account.credit_perp(args.amount)?;
     pos.margin = new_margin;
 
     storage::save_account(context, caller, account)?;
@@ -632,20 +629,17 @@ fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
     if new_reserved > old_reserved {
         let delta = new_reserved - old_reserved;
         let mut account = storage::load_account(context, user)?;
-        if account.perp_wallet_balance < delta {
+        if !account.has_available_perp(delta) {
             return Err(perp_err(
                 "setLeverage: insufficient perp wallet for order margin",
             ));
         }
-        account.perp_wallet_balance -= delta;
+        account.debit_perp(delta)?;
         storage::save_account(context, user, account)?;
     } else if old_reserved > new_reserved {
         let delta = old_reserved - new_reserved;
         let mut account = storage::load_account(context, user)?;
-        account.perp_wallet_balance = account
-            .perp_wallet_balance
-            .checked_add(delta)
-            .ok_or_else(|| perp_err("setLeverage: wallet balance overflow"))?;
+        account.credit_perp(delta)?;
         storage::save_account(context, user, account)?;
     }
 
@@ -822,10 +816,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         .ok_or_else(|| perp_err("cancelAllOrders: released reserve overflow"))?;
     if released > 0 {
         let mut account = storage::load_account(context, user)?;
-        account.perp_wallet_balance = account
-            .perp_wallet_balance
-            .checked_add(released)
-            .ok_or_else(|| perp_err("cancelAllOrders: wallet balance overflow"))?;
+        account.credit_perp(released)?;
         storage::save_account(context, user, account)?;
     }
     pos.buy_side_margin_reserved = 0;

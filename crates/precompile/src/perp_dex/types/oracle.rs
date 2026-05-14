@@ -244,4 +244,3 @@ pub struct IndexPriceState {
     pub index_price: u64,
     pub timestamp: u64,
 }
-

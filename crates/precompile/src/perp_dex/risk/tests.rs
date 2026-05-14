@@ -67,7 +67,7 @@ fn setup_market(ctx: &mut TestCtx) {
         ctx,
         ALICE,
         UserAccount {
-            perp_wallet_balance: USER_WALLET,
+            perp_wallet_balance: USER_WALLET as i64,
             ..UserAccount::default()
         },
     )
@@ -76,7 +76,7 @@ fn setup_market(ctx: &mut TestCtx) {
         ctx,
         MAKER,
         UserAccount {
-            perp_wallet_balance: MAKER_WALLET,
+            perp_wallet_balance: MAKER_WALLET as i64,
             ..UserAccount::default()
         },
     )
@@ -360,7 +360,7 @@ fn set_leverage(ctx: &mut TestCtx, leverage: u64) -> Result<Bytes, PrecompileErr
 fn wallet(ctx: &mut TestCtx, user: Address) -> u64 {
     storage::load_account(ctx, user)
         .unwrap()
-        .perp_wallet_balance
+        .visible_perp_wallet_balance()
 }
 
 fn position(ctx: &mut TestCtx, user: Address) -> PerpPosition {

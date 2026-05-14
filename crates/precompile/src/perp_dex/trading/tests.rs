@@ -76,14 +76,14 @@ fn setup(ctx: &mut TestCtx) {
 /// Directly credit a user's perp wallet (bypasses deposit/transfer flow).
 fn fund(ctx: &mut TestCtx, user: Address, amount: u64) {
     let mut acc = storage::load_account(ctx, user).unwrap();
-    acc.perp_wallet_balance += amount;
+    acc.credit_perp(amount).unwrap();
     storage::save_account(ctx, user, acc).unwrap();
 }
 
 fn wallet(ctx: &mut TestCtx, user: Address) -> u64 {
     storage::load_account(ctx, user)
         .unwrap()
-        .perp_wallet_balance
+        .visible_perp_wallet_balance()
 }
 
 fn pos(ctx: &mut TestCtx, user: Address) -> PerpPosition {
@@ -525,7 +525,7 @@ fn fill_rejects_when_taker_wallet_cannot_cover_opening_margin() {
     place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
 
     let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
-    alice.perp_wallet_balance = INIT_MARGIN - 1;
+    alice.perp_wallet_balance = (INIT_MARGIN - 1) as i64;
     storage::save_account(&mut ctx, ALICE, alice).unwrap();
 
     let input = placeOrderCall {
@@ -641,13 +641,13 @@ fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
 
     let low_buy_margin = 980_000;
     let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
-    alice.perp_wallet_balance = INIT_MARGIN + TAKER_FEE - low_buy_margin;
+    alice.perp_wallet_balance = (INIT_MARGIN + TAKER_FEE - low_buy_margin) as i64;
     storage::save_account(&mut ctx, ALICE, alice).unwrap();
 
     let market_buy = place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);
 
     assert_eq!(get_order(&mut ctx, market_buy).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, low_buy).status, OrderStatus::Cancelled);
+    assert_eq!(get_order(&mut ctx, low_buy).status, OrderStatus::Expired);
     assert_eq!(get_order(&mut ctx, high_buy).status, OrderStatus::Open);
     assert_eq!(wallet(&mut ctx, ALICE), 0);
 }
@@ -675,6 +675,42 @@ fn partial_fill_leaves_maker_partially_filled_in_book() {
 }
 
 #[test]
+fn maker_auto_expire_current_level_keeps_expired_status_and_clears_queue() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY * 2, 0, 0);
+    storage::save_position(
+        &mut ctx,
+        BOB,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -(FILL_VALUE as i64),
+            leverage: 1,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+    let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
+    bob.perp_wallet_balance = 0;
+    storage::save_account(&mut ctx, BOB, bob).unwrap();
+
+    let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    let maker = get_order(&mut ctx, sell_id);
+    assert_eq!(maker.status, OrderStatus::Expired);
+    assert_eq!(maker.filled, QTY);
+    assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
+    assert!(!storage::load_ask_prices(&mut ctx, MARKET_ID)
+        .unwrap()
+        .contains(&PRICE));
+    assert!(storage::load_ask_level(&mut ctx, MARKET_ID, PRICE)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn fifo_queue_fills_earlier_order_first() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
@@ -689,6 +725,94 @@ fn fifo_queue_fills_earlier_order_first() {
 
     assert_eq!(get_order(&mut ctx, bob_id).status, OrderStatus::Filled);
     assert_eq!(get_order(&mut ctx, carol_id).status, OrderStatus::Open);
+}
+
+#[test]
+fn self_trade_finalizes_taker_from_latest_maker_state() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    let sell_id = place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
+    let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
+    assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
+    assert_eq!(wallet(&mut ctx, ALICE), WALLET);
+    assert_eq!(
+        pos(&mut ctx, ALICE),
+        PerpPosition {
+            leverage: 1,
+            ..PerpPosition::default()
+        }
+    );
+}
+
+#[test]
+fn self_trade_taker_margin_expiry_does_not_cancel_current_taker_order() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    let old_buy_price = PRICE - 2 * TICK;
+    let old_buy = place(&mut ctx, ALICE, 0, old_buy_price, QTY, 0, 0);
+    let self_sell = place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
+    let bob_sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+
+    let old_buy_margin = 980_000;
+    let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
+    alice.perp_wallet_balance = (INIT_MARGIN - old_buy_margin) as i64;
+    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+
+    let taker_buy = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 0);
+
+    assert_eq!(get_order(&mut ctx, self_sell).status, OrderStatus::Filled);
+    assert_eq!(get_order(&mut ctx, bob_sell).status, OrderStatus::Filled);
+    assert_eq!(get_order(&mut ctx, taker_buy).status, OrderStatus::Filled);
+    assert_eq!(get_order(&mut ctx, old_buy).status, OrderStatus::Expired);
+    assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        pos(&mut ctx, ALICE),
+        PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -(FILL_VALUE as i64),
+            margin: INIT_MARGIN as i64,
+            leverage: 1,
+            ..PerpPosition::default()
+        }
+    );
+    assert_eq!(wallet(&mut ctx, ALICE), INIT_MARGIN - old_buy_margin);
+}
+
+#[test]
+fn taker_margin_expiry_records_mid_when_best_bid_is_cleared() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    fund(&mut ctx, CAROL, WALLET);
+
+    let old_buy_price = PRICE - 2 * TICK;
+    let old_buy = place(&mut ctx, ALICE, 0, old_buy_price, QTY, 0, 0);
+    let bob_sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    let carol_sell = place(&mut ctx, CAROL, 1, PRICE, QTY, 0, 0);
+
+    let old_buy_margin = 980_000;
+    let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
+    alice.perp_wallet_balance = (INIT_MARGIN - old_buy_margin) as i64;
+    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+
+    ctx.block.timestamp = U256::from(10);
+    let taker_buy = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    assert_eq!(get_order(&mut ctx, taker_buy).status, OrderStatus::Filled);
+    assert_eq!(get_order(&mut ctx, bob_sell).status, OrderStatus::Filled);
+    assert_eq!(get_order(&mut ctx, carol_sell).status, OrderStatus::Open);
+    assert_eq!(get_order(&mut ctx, old_buy).status, OrderStatus::Expired);
+    assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), 0);
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), PRICE);
+
+    let window = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(window.last_sample_ts, 10);
+    assert_eq!(window.last_mid_price, PRICE);
 }
 
 #[test]

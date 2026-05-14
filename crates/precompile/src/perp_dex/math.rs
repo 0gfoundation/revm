@@ -11,10 +11,10 @@ use crate::{
 pub const QUOTE_DECIMALS: u32 = 6;
 /// Fixed-point base for funding rates: 1_000_000 = 100%.  Minimum granularity: 0.0001%.
 pub const FUNDING_RATE_ONE: i64 = 1_000_000;
-pub const MAX_FUNDING_RATE: i64 = 7_500;   // +0.75%
-pub const MIN_FUNDING_RATE: i64 = -7_500;  // -0.75%
-pub const CLAMP_UPPER_BOUND: i64 = 500;    // +0.05%  (inner clamp for I−P)
-pub const CLAMP_LOWER_BOUND: i64 = -500;   // -0.05%
+pub const MAX_FUNDING_RATE: i64 = 7_500; // +0.75%
+pub const MIN_FUNDING_RATE: i64 = -7_500; // -0.75%
+pub const CLAMP_UPPER_BOUND: i64 = 500; // +0.05%  (inner clamp for I−P)
+pub const CLAMP_LOWER_BOUND: i64 = -500; // -0.05%
 /// Maintenance margin = notional / 6, approximately 16.67%.
 pub const MAINTENANCE_MARGIN_DENOMINATOR: i128 = 6;
 /// Trading fee denominator. 1 basis point = 1 / 10_000.
