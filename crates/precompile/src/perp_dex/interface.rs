@@ -155,9 +155,9 @@ sol! {
         /// Query the latest oracle index price and its timestamp for a market.
         function getIndexPrice(uint64 marketId) external view returns (uint64 indexPrice, uint64 lastTimestamp);
 
-        /// Query the current funding state for a market (last computed rate and next epoch time).
-        /// fundingInterval and interestRate are in getMarket.
-        function getFundingState(uint64 marketId) external view returns (int64 lastFundingRate, uint64 nextFundingTs);
+        /// Query the current funding state for a market.
+        /// interestRate is in getMarket.
+        function getFundingState(uint64 marketId) external view returns (int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs);
 
         // ── API key management (ed25519 signed orders) ────────────────────
         /// Register an ed25519 public key in slot `keyId` for the caller.

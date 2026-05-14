@@ -1069,7 +1069,7 @@ pub fn run_get_index_price<CTX: ContextTr>(
 
 // ── Funding state ─────────────────────────────────────────────────────────────
 
-/// `getFundingState(uint64 marketId) returns (int64 lastFundingRate, uint64 nextFundingTs)`
+/// `getFundingState(uint64 marketId) returns (int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs)`
 pub fn run_get_funding_state<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -1077,9 +1077,12 @@ pub fn run_get_funding_state<CTX: ContextTr>(
     let args = getFundingStateCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getFundingState: invalid calldata"))?;
     let state = storage::load_funding_state(context, args.marketId)?;
+    let market = storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("getFundingState: unknown market"))?;
     Ok(Bytes::from(getFundingStateCall::abi_encode_returns(
         &getFundingStateReturn {
             lastFundingRate: state.last_funding_rate,
+            fundingInterval: market.funding_interval,
             nextFundingTs: state.next_funding_ts,
         },
     )))
@@ -1130,6 +1133,9 @@ fn median_u64(a: u64, b: u64, c: u64) -> u64 {
 }
 
 fn align_price_update_timestamp(timestamp: u64, interval: u64) -> u64 {
+    if interval == 0 {
+        return timestamp;
+    }
     timestamp - (timestamp % interval)
 }
 
