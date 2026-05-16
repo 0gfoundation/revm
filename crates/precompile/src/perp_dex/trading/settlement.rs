@@ -9,7 +9,7 @@ use crate::{
         interface::IPerpDex,
         math::{
             calc_buy_side_reserved_notional, calc_sell_side_reserved_notional, calc_trading_fee,
-            calc_value,
+            calc_value, checked_u64_to_i64,
         },
         storage,
         types::{OrderStatus, Side},
@@ -638,17 +638,24 @@ fn apply_position_fill(
     if closing_qty > 0 {
         let pos_abs = pos.amount.unsigned_abs() as u128;
         let remaining_qty = pos_abs - closing_qty as u128;
-        let remaining_margin = (pos.margin.max(0) as u128 * remaining_qty / pos_abs) as i64;
-        let margin_release = pos.margin.max(0) as i64 - remaining_margin;
-        let remaining_vq =
-            (pos.v_quote_balance as i128 * remaining_qty as i128 / pos_abs as i128) as i64;
+        let remaining_margin =
+            i64::try_from(pos.margin.max(0) as u128 * remaining_qty / pos_abs)
+                .map_err(|_| perp_err("settlement: remaining margin exceeds i64::MAX"))?;
+        let margin_release = pos.margin.max(0) - remaining_margin;
+        let remaining_vq = pos.v_quote_balance as i128 * remaining_qty as i128 / pos_abs as i128;
+        let remaining_vq = i64::try_from(remaining_vq)
+            .map_err(|_| perp_err("settlement: remaining vQuote exceeds i64 range"))?;
         let vq_fraction = pos.v_quote_balance - remaining_vq;
+        let closing_value = checked_u64_to_i64(closing_value, "settlement: closing value")?;
         let close_quote_delta: i64 = if is_buy {
-            -(closing_value as i64)
+            -closing_value
         } else {
-            closing_value as i64
+            closing_value
         };
-        let realised = margin_release + vq_fraction + close_quote_delta;
+        let realised = margin_release
+            .checked_add(vq_fraction)
+            .and_then(|v| v.checked_add(close_quote_delta))
+            .ok_or_else(|| perp_err("settlement: realised PnL overflow"))?;
         if realised > 0 {
             *wallet = wallet.saturating_add(realised);
         } else if realised < 0 {
@@ -656,26 +663,58 @@ fn apply_position_fill(
             // of silently consuming wallet balance.
             *wallet = wallet.saturating_sub(-realised);
         }
-        pos.margin -= margin_release;
+        pos.margin = pos
+            .margin
+            .checked_sub(margin_release)
+            .ok_or_else(|| perp_err("settlement: margin overflow"))?;
 
         if is_buy {
-            pos.amount += closing_qty as i64;
+            let closing_qty = checked_u64_to_i64(closing_qty, "settlement: closing quantity")?;
+            pos.amount = pos
+                .amount
+                .checked_add(closing_qty)
+                .ok_or_else(|| perp_err("settlement: position amount overflow"))?;
         } else {
-            pos.amount -= closing_qty as i64;
+            let closing_qty = checked_u64_to_i64(closing_qty, "settlement: closing quantity")?;
+            pos.amount = pos
+                .amount
+                .checked_sub(closing_qty)
+                .ok_or_else(|| perp_err("settlement: position amount overflow"))?;
         }
-        pos.v_quote_balance -= vq_fraction;
+        pos.v_quote_balance = pos
+            .v_quote_balance
+            .checked_sub(vq_fraction)
+            .ok_or_else(|| perp_err("settlement: vQuote overflow"))?;
     }
 
     let opening_margin = if opening_qty > 0 {
         let initial_margin = opening_value / pos.leverage.max(1);
-        pos.margin += initial_margin as i64;
+        let initial_margin_i64 = checked_u64_to_i64(initial_margin, "settlement: initial margin")?;
+        let opening_qty_i64 = checked_u64_to_i64(opening_qty, "settlement: opening quantity")?;
+        let opening_value_i64 = checked_u64_to_i64(opening_value, "settlement: opening value")?;
+        pos.margin = pos
+            .margin
+            .checked_add(initial_margin_i64)
+            .ok_or_else(|| perp_err("settlement: margin overflow"))?;
 
         if is_buy {
-            pos.amount += opening_qty as i64;
-            pos.v_quote_balance -= opening_value as i64;
+            pos.amount = pos
+                .amount
+                .checked_add(opening_qty_i64)
+                .ok_or_else(|| perp_err("settlement: position amount overflow"))?;
+            pos.v_quote_balance = pos
+                .v_quote_balance
+                .checked_sub(opening_value_i64)
+                .ok_or_else(|| perp_err("settlement: vQuote overflow"))?;
         } else {
-            pos.amount -= opening_qty as i64;
-            pos.v_quote_balance += opening_value as i64;
+            pos.amount = pos
+                .amount
+                .checked_sub(opening_qty_i64)
+                .ok_or_else(|| perp_err("settlement: position amount overflow"))?;
+            pos.v_quote_balance = pos
+                .v_quote_balance
+                .checked_add(opening_value_i64)
+                .ok_or_else(|| perp_err("settlement: vQuote overflow"))?;
         }
         initial_margin
     } else {

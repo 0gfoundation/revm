@@ -34,6 +34,11 @@ fn pow10_i128(exp: u32) -> Result<i128, PrecompileError> {
         .ok_or_else(|| perp_err("math: decimal exponent overflow"))
 }
 
+#[inline]
+pub fn checked_u64_to_i64(value: u64, context: &str) -> Result<i64, PrecompileError> {
+    i64::try_from(value).map_err(|_| perp_err(format!("{context}: value exceeds i64::MAX")))
+}
+
 /// `price * quantity * 10^QUOTE_DECIMALS / (10^price_decimals * 10^base_decimals)` in quote units.
 #[inline]
 pub fn calc_value(
@@ -99,10 +104,12 @@ pub fn is_above_maintenance_margin(
         .checked_add(v_quote_balance)
         .and_then(|v| v.checked_add(margin))
         .ok_or_else(|| perp_err("math: maintenance margin value overflow"))?;
+    let threshold_denominator = i64::try_from(MAINTENANCE_MARGIN_DENOMINATOR)
+        .map_err(|_| perp_err("math: maintenance margin denominator exceeds i64"))?;
     let threshold = notional
         .checked_abs()
         .ok_or_else(|| perp_err("math: maintenance margin abs overflow"))?
-        / MAINTENANCE_MARGIN_DENOMINATOR as i64;
+        / threshold_denominator;
     Ok(position_value >= threshold)
 }
 
@@ -256,8 +263,9 @@ pub fn calc_buy_side_reserved_notional(
     };
     let mut reserved_notional = 0u64;
     for e in buy_entries {
+        let amount = checked_u64_to_i64(e.amount, "math: buy order amount")?;
         remaining = remaining
-            .checked_sub(e.amount as i64)
+            .checked_sub(amount)
             .ok_or_else(|| perp_err("math: buy remaining overflow"))?;
         if remaining <= 0 {
             let net_open = remaining
@@ -309,8 +317,9 @@ pub fn calc_sell_side_reserved_notional(
     };
     let mut reserved_notional = 0u64;
     for e in sell_entries {
+        let amount = checked_u64_to_i64(e.amount, "math: sell order amount")?;
         remaining = remaining
-            .checked_sub(e.amount as i64)
+            .checked_sub(amount)
             .ok_or_else(|| perp_err("math: sell remaining overflow"))?;
         if remaining <= 0 {
             let net_open = remaining

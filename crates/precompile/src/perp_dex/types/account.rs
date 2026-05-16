@@ -47,7 +47,10 @@ impl UserAccount {
 
     /// Returns whether the wallet can cover a user-initiated debit.
     pub fn has_available_perp(&self, amount: u64) -> bool {
-        amount <= MAX_PERP_WALLET_BALANCE && self.perp_wallet_balance >= amount as i64
+        match i64::try_from(amount) {
+            Ok(amount) => self.perp_wallet_balance >= amount,
+            Err(_) => false,
+        }
     }
 
     /// Adds positive perp wallet balance.
