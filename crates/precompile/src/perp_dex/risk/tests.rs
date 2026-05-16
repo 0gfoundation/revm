@@ -10,7 +10,9 @@ use crate::perp_dex::{
         setLeverageCall, updateIndexPriceCall,
     },
     trading::run_place_order,
-    types::{IndexPriceHistory, PerpPosition, PriceBasisWindow, UserAccount},
+    types::{
+        IndexPriceHistory, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount,
+    },
     USDC_ADDRESS,
 };
 
@@ -159,6 +161,60 @@ fn update_index_price_discards_same_or_older_aligned_timestamp() {
 }
 
 #[test]
+fn funding_epoch_jump_computes_once_and_advances_next_ts_to_future() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    market.funding_interval = 15;
+    storage::save_market(&mut ctx, &market).unwrap();
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 16,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+    let funding = storage::load_funding_state(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(funding.next_funding_ts, 30);
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 61,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let funding = storage::load_funding_state(&mut ctx, MARKET_ID).unwrap();
+    let acc = storage::load_premium_accumulator(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(funding.next_funding_ts, 75);
+    assert_eq!(acc.sample_count, 1);
+    assert_eq!(acc.epoch_start_ts, 60);
+    assert_eq!(acc.last_sample_ts, 60);
+}
+
+#[test]
+fn premium_accumulator_forward_fills_missing_slots_with_linear_weights() {
+    let mut acc = PremiumIndexAccumulator::default();
+    acc.start_epoch(15, 15, 100).unwrap();
+    acc.fill_slots_until(60, 15, Some(300)).unwrap();
+
+    // Slots: 15=100, 30=100, 45=100, 60=300.
+    // Weighted average = (1*100 + 2*100 + 3*100 + 4*300) / 10 = 180.
+    assert_eq!(acc.sample_count, 4);
+    assert_eq!(acc.average().unwrap(), 180);
+}
+
+#[test]
 fn mid_window_closes_interval_with_current_index_price() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
@@ -217,8 +273,8 @@ fn mid_window_closes_interval_with_current_index_price() {
     assert_eq!(state.timestamp, 15);
     assert_eq!(window.last_sample_ts, 20);
     let history = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
-    assert_eq!(window.moving_average_basis(&history, 15), 0);
-    assert_eq!(window.moving_average_basis(&history, 30), -3);
+    assert_eq!(window.moving_average_basis(&history, 15).unwrap(), 0);
+    assert_eq!(window.moving_average_basis(&history, 30).unwrap(), -3);
 
     run_update_index_price(
         &updateIndexPriceCall {
@@ -239,7 +295,7 @@ fn mid_window_closes_interval_with_current_index_price() {
     assert_eq!(window.last_sample_ts, 20);
     assert_eq!(window.count, 1);
     let history = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
-    assert_eq!(window.moving_average_basis(&history, 30), -3);
+    assert_eq!(window.moving_average_basis(&history, 30).unwrap(), -3);
 }
 
 #[test]
@@ -294,7 +350,7 @@ fn mid_window_uses_index_checkpoints_across_full_basis_window() {
     let history = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
     assert_eq!(history.checkpoints.len(), 3);
     // [1,15): 100 basis for 14s; [15,30): 90 basis for 15s; [0,1): no mid = 0.
-    assert_eq!(window.moving_average_basis(&history, 30), 91);
+    assert_eq!(window.moving_average_basis(&history, 30).unwrap(), 91);
 }
 
 #[test]
@@ -315,7 +371,7 @@ fn mid_window_uses_ring_order_after_wrap() {
 
     // The 30-slot ring now holds timestamps 6..=35. For [5,35), timestamp 35 is
     // right-exclusive, so [5,6) has no retained mid sample and contributes 0.
-    assert_eq!(window.moving_average_basis(&history, 35), 19);
+    assert_eq!(window.moving_average_basis(&history, 35).unwrap(), 19);
 }
 
 fn liquidate(ctx: &mut TestCtx, user: Address) -> Result<Bytes, PrecompileError> {
