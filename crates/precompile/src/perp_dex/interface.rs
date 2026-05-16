@@ -131,6 +131,20 @@ sol! {
         /// Liquidate an under-margined position (anyone can call).
         function liquidate(address user, uint64 marketId) external;
 
+        // ── Insurance Fund ────────────────────────────────────────────────
+        /// Deposit USDC from the caller's perp wallet into the global insurance fund. Admin only.
+        function depositInsuranceFund(uint64 amount) external;
+        /// Withdraw USDC from the insurance fund back to the admin's perp wallet. Admin only.
+        function withdrawInsuranceFund(uint64 amount) external;
+        /// Query the current insurance fund balance (USDC micro-units).
+        function getInsuranceFund() external view returns (uint64 balance);
+
+        // ── Liquidator address ────────────────────────────────────────────
+        /// Set the authorized liquidator address. Admin only.
+        function setLiquidatorAddress(address liquidator) external;
+        /// Query the current liquidator address (zero if not set).
+        function getLiquidatorAddress() external view returns (address liquidator);
+
         // ── Oracle & mark price ───────────────────────────────────────────
         /// Set the authorized oracle address. Only callable by admin.
         /// The oracle is the only non-admin address allowed to call updateIndexPrice.
@@ -262,6 +276,16 @@ sol! {
         // Feeds: /fundingRate (history), /income (FUNDING_FEE)
         // NOTE: defined but not yet emitted — will be wired when funding settlement is implemented.
         event FundingSettled(uint64 indexed marketId, address indexed user, int64 fundingRate, int64 amount, uint64 markPrice);
+
+        // Feeds: insurance fund balance history
+        // delta > 0 = deposit or liquidation surplus credited; delta < 0 = deficit absorbed.
+        event InsuranceFundChanged(int64 delta, uint64 newBalance);
+        // Emitted when the insurance fund cannot fully cover a deficit.
+        // badDebt = the uncovered amount absorbed by the protocol.
+        event InsuranceFundDepleted(uint64 indexed marketId, uint64 badDebt);
+
+        // Feeds: liquidator address changes
+        event LiquidatorAddressUpdated(address indexed previousLiquidator, address indexed newLiquidator);
 
         // Feeds: oracle address changes
         event OracleAddressUpdated(address indexed previousOracle, address indexed newOracle);

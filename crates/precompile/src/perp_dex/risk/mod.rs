@@ -10,13 +10,14 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         interface::IPerpDex::{
-            self, addMarketCall, addPositionMarginCall, getAdminCall, getAveragePremiumIndexCall,
-            getAveragePremiumIndexReturn, getFundingStateCall, getFundingStateReturn,
-            getIndexPriceCall, getIndexPriceReturn, getMarkPriceCall, getMarketCall,
-            getMarketReturn, getOracleAddressCall, getPositionCall, getPositionReturn,
-            initAdminCall, liquidateCall, removePositionMarginCall, setLeverageCall,
-            setLeverageSignedCall, setMarkPriceCall, setOracleAddressCall, transferAdminCall,
-            updateIndexPriceCall, updateMarketCall,
+            self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall,
+            getAdminCall, getAveragePremiumIndexCall, getAveragePremiumIndexReturn,
+            getFundingStateCall, getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn,
+            getInsuranceFundCall, getLiquidatorAddressCall, getMarkPriceCall, getMarketCall, getMarketReturn,
+            getOracleAddressCall, getPositionCall, getPositionReturn, initAdminCall,
+            liquidateCall, removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
+            setLiquidatorAddressCall, setMarkPriceCall, setOracleAddressCall, transferAdminCall,
+            updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
         },
         math::{
             calc_funding_rate, calc_value, checked_u64_to_i64, is_above_maintenance_margin,
@@ -862,6 +863,140 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     storage::save_position(context, user, market_id, &pos)?;
 
     Ok(())
+}
+
+// ── Insurance Fund ────────────────────────────────────────────────────────────
+
+/// `depositInsuranceFund(uint64 amount)` — admin only.
+/// Debits `amount` from the admin's perp wallet and credits it to the insurance fund.
+pub fn run_deposit_insurance_fund<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = depositInsuranceFundCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("depositInsuranceFund: invalid calldata"))?;
+
+    require_admin(caller, context)?;
+
+    if args.amount == 0 {
+        return Err(perp_err("depositInsuranceFund: amount must be > 0"));
+    }
+
+    let mut account = storage::load_account(context, caller)?;
+    if !account.has_available_perp(args.amount) {
+        return Err(perp_err("depositInsuranceFund: insufficient perp wallet balance"));
+    }
+    account.debit_perp(args.amount)?;
+    storage::save_account(context, caller, account)?;
+
+    let old_balance = storage::load_insurance_fund(context)?;
+    let new_balance = old_balance
+        .checked_add(args.amount)
+        .ok_or_else(|| perp_err("depositInsuranceFund: balance overflow"))?;
+    storage::save_insurance_fund(context, new_balance)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::InsuranceFundChanged {
+            delta: args.amount as i64,
+            newBalance: new_balance,
+        }
+        .to_log_data(),
+    });
+
+    Ok(Bytes::new())
+}
+
+/// `withdrawInsuranceFund(uint64 amount)` — admin only.
+/// Withdraws `amount` from the insurance fund back to the admin's perp wallet.
+pub fn run_withdraw_insurance_fund<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = withdrawInsuranceFundCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("withdrawInsuranceFund: invalid calldata"))?;
+
+    require_admin(caller, context)?;
+
+    if args.amount == 0 {
+        return Err(perp_err("withdrawInsuranceFund: amount must be > 0"));
+    }
+
+    let balance = storage::load_insurance_fund(context)?;
+    if args.amount > balance {
+        return Err(perp_err("withdrawInsuranceFund: amount exceeds fund balance"));
+    }
+    let new_balance = balance - args.amount;
+    storage::save_insurance_fund(context, new_balance)?;
+
+    let mut account = storage::load_account(context, caller)?;
+    account.credit_perp(args.amount)?;
+    storage::save_account(context, caller, account)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::InsuranceFundChanged {
+            delta: -(args.amount as i64),
+            newBalance: new_balance,
+        }
+        .to_log_data(),
+    });
+
+    Ok(Bytes::new())
+}
+
+/// `getInsuranceFund()` — returns the current insurance fund balance.
+pub fn run_get_insurance_fund<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    getInsuranceFundCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getInsuranceFund: invalid calldata"))?;
+    let balance = storage::load_insurance_fund(context)?;
+    Ok(Bytes::from(getInsuranceFundCall::abi_encode_returns(&balance)))
+}
+
+// ── Liquidator address ────────────────────────────────────────────────────────
+
+/// `setLiquidatorAddress(address liquidator)` — admin only.
+pub fn run_set_liquidator_address<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = setLiquidatorAddressCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("setLiquidatorAddress: invalid calldata"))?;
+
+    require_admin(caller, context)?;
+
+    let previous = storage::load_liquidator(context)?;
+    storage::save_liquidator(context, args.liquidator)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::LiquidatorAddressUpdated {
+            previousLiquidator: previous,
+            newLiquidator: args.liquidator,
+        }
+        .to_log_data(),
+    });
+
+    Ok(Bytes::new())
+}
+
+/// `getLiquidatorAddress()` — returns the current liquidator address.
+pub fn run_get_liquidator_address<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    getLiquidatorAddressCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getLiquidatorAddress: invalid calldata"))?;
+    let liquidator = storage::load_liquidator(context)?;
+    Ok(Bytes::from(getLiquidatorAddressCall::abi_encode_returns(
+        &liquidator,
+    )))
 }
 
 // ── Oracle address ────────────────────────────────────────────────────────────

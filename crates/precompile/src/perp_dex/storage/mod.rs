@@ -24,10 +24,11 @@ use crate::{
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
     best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot,
-    funding_state_key, index_price_history_key, index_price_state_key, last_traded_price_key,
-    mark_price_key, market_fee_total_key, market_key, open_interest_key, oracle_key, order_key,
-    position_key, premium_accumulator_key, price_basis_window_key, trade_count_key,
-    user_buy_orders_key, user_fee_rates_key, user_nonce_key, user_sell_orders_key,
+    funding_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
+    last_traded_price_key, liquidator_key, mark_price_key, market_fee_total_key, market_key,
+    open_interest_key, oracle_key, order_key, position_key, premium_accumulator_key,
+    price_basis_window_key, trade_count_key, user_buy_orders_key, user_fee_rates_key,
+    user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -806,6 +807,57 @@ pub fn save_funding_state<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let buf = encode(state)?;
     store_blob(context, funding_state_key(market_id), &buf)
+}
+
+// ── Insurance Fund ────────────────────────────────────────────────────────────
+
+pub fn load_insurance_fund<CTX: ContextTr>(context: &mut CTX) -> Result<u64, PrecompileError> {
+    let buf = load_blob(context, insurance_fund_key())?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
+}
+
+pub fn save_insurance_fund<CTX: ContextTr>(
+    context: &mut CTX,
+    balance: u64,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&balance)?;
+    store_blob(context, insurance_fund_key(), &buf)
+}
+
+/// Absorb up to `deficit` from the insurance fund.
+/// Returns `(absorbed, remaining_deficit)`.
+/// If the fund covers everything, `remaining_deficit` is 0.
+/// If the fund is insufficient, it is drained to zero and `remaining_deficit` > 0.
+pub fn absorb_from_insurance_fund<CTX: ContextTr>(
+    context: &mut CTX,
+    deficit: u64,
+) -> Result<(u64, u64), PrecompileError> {
+    let balance = load_insurance_fund(context)?;
+    let absorbed = deficit.min(balance);
+    let remaining = deficit - absorbed;
+    save_insurance_fund(context, balance - absorbed)?;
+    Ok((absorbed, remaining))
+}
+
+// ── Liquidator address ────────────────────────────────────────────────────────
+
+pub fn load_liquidator<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
+    let buf = load_blob(context, liquidator_key())?;
+    if buf.is_empty() {
+        return Ok(Address::ZERO);
+    }
+    decode(&buf)
+}
+
+pub fn save_liquidator<CTX: ContextTr>(
+    context: &mut CTX,
+    liquidator: Address,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&liquidator)?;
+    store_blob(context, liquidator_key(), &buf)
 }
 
 // ── Premium index accumulator ─────────────────────────────────────────────────

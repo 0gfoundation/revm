@@ -32,23 +32,27 @@ use crate::{
         },
         interface::IPerpDex::{
             addMarketCall, addPositionMarginCall, cancelOrderCall, cancelOrderSignedCall,
-            depositCall, getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
-            getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
-            getIndexPriceCall, getMarkPriceCall, getMarketCall, getMarketFeeTotalCall,
+            depositCall, depositInsuranceFundCall, getAccountCall, getAdminCall, getApiKeyCall,
+            getApiKeysCall, getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall,
+            getFundingStateCall, getIndexPriceCall, getInsuranceFundCall,
+            getLiquidatorAddressCall, getMarkPriceCall, getMarketCall, getMarketFeeTotalCall,
             getOpenOrdersCall, getOracleAddressCall, getOrderCall, getPositionCall,
             getUserFeeRatesCall, initAdminCall, liquidateCall, placeOrderCall,
             placeOrderSignedCall, registerApiKeyCall, removePositionMarginCall, revokeApiKeyCall,
-            setLeverageCall, setLeverageSignedCall, setMarkPriceCall, setOracleAddressCall,
-            setUserFeeRatesCall, transferAdminCall, transferFromPerpCall, transferToPerpCall,
-            updateIndexPriceCall, updateMarketCall, withdrawCall,
+            setLeverageCall, setLeverageSignedCall, setLiquidatorAddressCall, setMarkPriceCall,
+            setOracleAddressCall, setUserFeeRatesCall, transferAdminCall, transferFromPerpCall,
+            transferToPerpCall, updateIndexPriceCall, updateMarketCall, withdrawCall,
+            withdrawInsuranceFundCall,
         },
         risk::{
-            run_add_market, run_add_position_margin, run_get_admin, run_get_average_premium_index,
-            run_get_funding_state, run_get_index_price, run_get_mark_price, run_get_market,
-            run_get_oracle_address, run_get_position, run_init_admin, run_liquidate,
-            run_remove_position_margin, run_set_leverage, run_set_leverage_signed,
-            run_set_mark_price, run_set_oracle_address, run_transfer_admin, run_update_index_price,
-            run_update_market,
+            run_add_market, run_add_position_margin, run_deposit_insurance_fund, run_get_admin,
+            run_get_average_premium_index, run_get_funding_state, run_get_index_price,
+            run_get_insurance_fund, run_get_liquidator_address, run_get_mark_price,
+            run_get_market, run_get_oracle_address, run_get_position, run_init_admin,
+            run_liquidate, run_remove_position_margin, run_set_leverage, run_set_leverage_signed,
+            run_set_liquidator_address, run_set_mark_price, run_set_oracle_address,
+            run_transfer_admin, run_update_index_price, run_update_market,
+            run_withdraw_insurance_fund,
         },
         trading::{
             run_cancel_order, run_cancel_order_signed, run_get_book_level, run_get_book_prices,
@@ -127,6 +131,13 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // Signed order submission (relayer path)
         m.insert(placeOrderSignedCall::SELECTOR, (200_000, false));
         m.insert(cancelOrderSignedCall::SELECTOR, (80_000, false));
+        // Insurance Fund
+        m.insert(depositInsuranceFundCall::SELECTOR, (30_000, false));
+        m.insert(withdrawInsuranceFundCall::SELECTOR, (30_000, false));
+        m.insert(getInsuranceFundCall::SELECTOR, (5_000, true));
+        // Liquidator address
+        m.insert(setLiquidatorAddressCall::SELECTOR, (30_000, false));
+        m.insert(getLiquidatorAddressCall::SELECTOR, (5_000, true));
         // Oracle & mark price
         m.insert(setOracleAddressCall::SELECTOR, (30_000, false));
         m.insert(getOracleAddressCall::SELECTOR, (5_000, true));
@@ -254,6 +265,21 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         // Signed order submission (relayer path)
         s if s == placeOrderSignedCall::SELECTOR => run_place_order_signed(input_bytes, context),
         s if s == cancelOrderSignedCall::SELECTOR => run_cancel_order_signed(input_bytes, context),
+        // Insurance Fund
+        s if s == depositInsuranceFundCall::SELECTOR => {
+            run_deposit_insurance_fund(input_bytes, caller, context)
+        }
+        s if s == withdrawInsuranceFundCall::SELECTOR => {
+            run_withdraw_insurance_fund(input_bytes, caller, context)
+        }
+        s if s == getInsuranceFundCall::SELECTOR => run_get_insurance_fund(input_bytes, context),
+        // Liquidator address
+        s if s == setLiquidatorAddressCall::SELECTOR => {
+            run_set_liquidator_address(input_bytes, caller, context)
+        }
+        s if s == getLiquidatorAddressCall::SELECTOR => {
+            run_get_liquidator_address(input_bytes, context)
+        }
         // Oracle & mark price
         s if s == setOracleAddressCall::SELECTOR => {
             run_set_oracle_address(input_bytes, caller, context)

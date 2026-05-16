@@ -35,6 +35,8 @@ const PFX_BASIS_WINDOW: &[u8] = b"bswn"; // per-market PriceBasisWindow (30s mid
 const PFX_LAST_TRADED: &[u8] = b"ltrd"; // per-market last traded price (contract price)
 const PFX_FUNDING_STATE: &[u8] = b"fund"; // per-market FundingState
 const PFX_PREMIUM_ACCUMULATOR: &[u8] = b"pacc"; // per-market PremiumIndexAccumulator
+const PFX_INSURANCE_FUND: &[u8] = b"infd"; // global insurance fund balance
+const PFX_LIQUIDATOR: &[u8] = b"liqr"; // authorized liquidator address
 
 // ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
 
@@ -215,4 +217,16 @@ pub fn funding_state_key(market_id: u64) -> B256 {
 /// Per-market PremiumIndexAccumulator (linearly-weighted premium index for funding).
 pub fn premium_accumulator_key(market_id: u64) -> B256 {
     keccak256([PFX_PREMIUM_ACCUMULATOR, &market_id.to_be_bytes()].concat())
+}
+
+// ── Insurance Fund & Liquidator ───────────────────────────────────────────────
+
+/// Global insurance fund balance (u64, USDC micro-units).
+pub fn insurance_fund_key() -> B256 {
+    keccak256(PFX_INSURANCE_FUND)
+}
+
+/// Authorized liquidator address (Address; zero = not set, only admin can liquidate).
+pub fn liquidator_key() -> B256 {
+    keccak256(PFX_LIQUIDATOR)
 }
