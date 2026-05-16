@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::{perp_dex::errors::perp_err, PrecompileError};
+
 pub const PRICE_BASIS_WINDOW_SIZE: usize = 30;
 
 /// 30-second rolling top-of-book mid-price window for the Price 2 component.
@@ -65,12 +67,16 @@ impl PriceBasisWindow {
     }
 
     /// Time-weighted average `mid - index_at_time` over the latest basis window.
-    pub fn moving_average_basis(&self, index_history: &IndexPriceHistory, end_ts: u64) -> i64 {
+    pub fn moving_average_basis(
+        &self,
+        index_history: &IndexPriceHistory,
+        end_ts: u64,
+    ) -> Result<i64, PrecompileError> {
         if end_ts == 0 {
-            return 0;
+            return Ok(0);
         }
         if self.count == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let window_start_ts = end_ts.saturating_sub(PRICE_BASIS_WINDOW_SIZE as u64);
@@ -114,9 +120,10 @@ impl PriceBasisWindow {
 
         let window_weight = end_ts.saturating_sub(window_start_ts);
         if window_weight == 0 {
-            0
+            Ok(0)
         } else {
-            (weighted_sum / window_weight as i128) as i64
+            i64::try_from(weighted_sum / window_weight as i128)
+                .map_err(|_| perp_err("price basis window: moving average exceeds i64 range"))
         }
     }
 
@@ -213,28 +220,99 @@ pub struct FundingState {
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct PremiumIndexAccumulator {
     /// Σ(k × PI_k) in FUNDING_RATE_ONE = 1_000_000 units.
-    pub weighted_sum: i64,
+    pub weighted_sum: i128,
     /// Number of samples pushed in the current epoch.
     pub sample_count: u64,
     /// Unix-second timestamp of the first sample in this epoch (0 = not started).
     pub epoch_start_ts: u64,
+    /// Last known premium index used for forward-filling missing sample slots.
+    #[serde(default)]
+    pub last_pi: i64,
+    /// Timestamp of the latest filled sample slot.
+    #[serde(default)]
+    pub last_sample_ts: u64,
 }
 
 impl PremiumIndexAccumulator {
-    /// Push one premium-index sample.  Weight = sample_count + 1 (1-indexed).
-    pub fn push_sample(&mut self, pi: i64) {
-        let weight = (self.sample_count + 1) as i64;
-        self.weighted_sum = self.weighted_sum.saturating_add(pi.saturating_mul(weight));
-        self.sample_count += 1;
+    /// Push one premium-index slot. Weight = sample_count + 1 (1-indexed).
+    fn push_slot(&mut self, pi: i64) -> Result<(), PrecompileError> {
+        let next_count = self
+            .sample_count
+            .checked_add(1)
+            .ok_or_else(|| perp_err("premium accumulator: sample count overflow"))?;
+        let weighted = (pi as i128)
+            .checked_mul(next_count as i128)
+            .ok_or_else(|| perp_err("premium accumulator: weighted sample overflow"))?;
+        self.weighted_sum = self
+            .weighted_sum
+            .checked_add(weighted)
+            .ok_or_else(|| perp_err("premium accumulator: weighted sum overflow"))?;
+        self.sample_count = next_count;
+        Ok(())
+    }
+
+    /// Starts a fresh epoch with the observed premium index at `timestamp`.
+    pub fn start_epoch(
+        &mut self,
+        epoch_start_ts: u64,
+        timestamp: u64,
+        pi: i64,
+    ) -> Result<(), PrecompileError> {
+        self.weighted_sum = 0;
+        self.sample_count = 0;
+        self.epoch_start_ts = epoch_start_ts;
+        self.last_pi = pi;
+        self.last_sample_ts = timestamp;
+        self.push_slot(pi)
+    }
+
+    /// Fills sample slots through `end_ts`.
+    ///
+    /// Slots before `end_ts` use the latest known PI. If `endpoint_pi` is set
+    /// and `end_ts` lands exactly on a sample slot, the endpoint slot uses it.
+    pub fn fill_slots_until(
+        &mut self,
+        end_ts: u64,
+        sample_interval: u64,
+        endpoint_pi: Option<i64>,
+    ) -> Result<(), PrecompileError> {
+        if sample_interval == 0 || self.last_sample_ts == 0 || end_ts <= self.last_sample_ts {
+            return Ok(());
+        }
+        let mut slot_ts = self
+            .last_sample_ts
+            .checked_add(sample_interval)
+            .ok_or_else(|| perp_err("premium accumulator: sample timestamp overflow"))?;
+        while slot_ts <= end_ts {
+            let pi = if endpoint_pi.is_some() && slot_ts == end_ts {
+                endpoint_pi.unwrap_or(self.last_pi)
+            } else {
+                self.last_pi
+            };
+            self.push_slot(pi)?;
+            self.last_pi = pi;
+            self.last_sample_ts = slot_ts;
+            slot_ts = match slot_ts.checked_add(sample_interval) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+        Ok(())
     }
 
     /// Linearly-weighted average: Σ(k·PI_k) / Σk = weighted_sum / (n·(n+1)/2).
-    pub fn average(&self) -> i64 {
+    pub fn average(&self) -> Result<i64, PrecompileError> {
         if self.sample_count == 0 {
-            return 0;
+            return Ok(0);
         }
-        let total_weight = (self.sample_count * (self.sample_count + 1)) / 2;
-        self.weighted_sum / total_weight as i64
+        let total_weight = (self.sample_count as u128)
+            .checked_mul(self.sample_count.saturating_add(1) as u128)
+            .ok_or_else(|| perp_err("premium accumulator: total weight overflow"))?
+            / 2;
+        let total_weight = i64::try_from(total_weight)
+            .map_err(|_| perp_err("premium accumulator: total weight exceeds i64::MAX"))?;
+        i64::try_from(self.weighted_sum / total_weight as i128)
+            .map_err(|_| perp_err("premium accumulator: average exceeds i64 range"))
     }
 }
 

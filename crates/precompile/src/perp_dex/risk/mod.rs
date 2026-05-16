@@ -18,7 +18,10 @@ use crate::{
             setLeverageSignedCall, setMarkPriceCall, setOracleAddressCall, transferAdminCall,
             updateIndexPriceCall, updateMarketCall,
         },
-        math::{calc_funding_rate, calc_value, is_above_maintenance_margin, FUNDING_RATE_ONE},
+        math::{
+            calc_funding_rate, calc_value, checked_u64_to_i64, is_above_maintenance_margin,
+            FUNDING_RATE_ONE,
+        },
         storage,
         trading::{
             can_fully_liquidate_on_book, check_api_key_expiry, check_recv_window,
@@ -131,6 +134,7 @@ pub fn run_add_market<CTX: ContextTr>(
     if args.priceUpdateInterval == 0 {
         return Err(perp_err("addMarket: priceUpdateInterval must be > 0"));
     }
+    validate_funding_config("addMarket", args.priceUpdateInterval, args.fundingInterval)?;
     if args.maxQuantity < args.minQuantity {
         return Err(perp_err("addMarket: maxQuantity must be >= minQuantity"));
     }
@@ -212,6 +216,11 @@ pub fn run_update_market<CTX: ContextTr>(
     if args.priceUpdateInterval == 0 {
         return Err(perp_err("updateMarket: priceUpdateInterval must be > 0"));
     }
+    validate_funding_config(
+        "updateMarket",
+        args.priceUpdateInterval,
+        args.fundingInterval,
+    )?;
     if args.maxQuantity < args.minQuantity {
         return Err(perp_err("updateMarket: maxQuantity must be >= minQuantity"));
     }
@@ -455,9 +464,7 @@ pub fn run_add_position_margin<CTX: ContextTr>(
     if args.amount == 0 {
         return Err(perp_err("addPositionMargin: amount must be > 0"));
     }
-    if args.amount > i64::MAX as u64 {
-        return Err(perp_err("addPositionMargin: amount exceeds i64::MAX"));
-    }
+    let amount = checked_u64_to_i64(args.amount, "addPositionMargin: amount")?;
     storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("addPositionMargin: unknown market"))?;
 
@@ -475,12 +482,12 @@ pub fn run_add_position_margin<CTX: ContextTr>(
     account.debit_perp(args.amount)?;
     pos.margin = pos
         .margin
-        .checked_add(args.amount as i64)
+        .checked_add(amount)
         .ok_or_else(|| perp_err("addPositionMargin: margin overflow"))?;
 
     storage::save_account(context, caller, account)?;
     storage::save_position(context, caller, args.marketId, &pos)?;
-    emit_position_margin_adjusted(context, caller, args.marketId, args.amount as i64, &pos);
+    emit_position_margin_adjusted(context, caller, args.marketId, amount, &pos);
     emit_position_changed(context, caller, args.marketId, &pos);
     Ok(Bytes::new())
 }
@@ -496,9 +503,7 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     if args.amount == 0 {
         return Err(perp_err("removePositionMargin: amount must be > 0"));
     }
-    if args.amount > i64::MAX as u64 {
-        return Err(perp_err("removePositionMargin: amount exceeds i64::MAX"));
-    }
+    let amount = checked_u64_to_i64(args.amount, "removePositionMargin: amount")?;
     let market = storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("removePositionMargin: unknown market"))?;
     let mark_price = storage::load_mark_price(context, args.marketId)?;
@@ -507,19 +512,23 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     if pos.amount == 0 {
         return Err(perp_err("removePositionMargin: no open position"));
     }
-    if pos.margin < args.amount as i64 {
+    if pos.margin < amount {
         return Err(perp_err(
             "removePositionMargin: insufficient position margin",
         ));
     }
-    let new_margin = pos.margin - args.amount as i64;
+    let new_margin = pos.margin - amount;
     let required_initial_margin = calc_value(
         mark_price,
         pos.amount.unsigned_abs(),
         market.base_decimals,
         market.price_decimals,
     )? / pos.leverage.max(1);
-    if new_margin < required_initial_margin as i64 {
+    let required_initial_margin = checked_u64_to_i64(
+        required_initial_margin,
+        "removePositionMargin: initial margin",
+    )?;
+    if new_margin < required_initial_margin {
         return Err(perp_err(
             "removePositionMargin: resulting margin below initial margin requirement",
         ));
@@ -531,7 +540,7 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
 
     storage::save_account(context, caller, account)?;
     storage::save_position(context, caller, args.marketId, &pos)?;
-    emit_position_margin_adjusted(context, caller, args.marketId, -(args.amount as i64), &pos);
+    emit_position_margin_adjusted(context, caller, args.marketId, -amount, &pos);
     emit_position_changed(context, caller, args.marketId, &pos);
     Ok(Bytes::new())
 }
@@ -723,6 +732,9 @@ fn validate_market_bounds(
             "{prefix}: maxQuantity must be <= i64::MAX"
         )));
     }
+    if max_price > i64::MAX as u64 {
+        return Err(perp_err(format!("{prefix}: maxPrice must be <= i64::MAX")));
+    }
     let max_value =
         calc_value(max_price, max_quantity, base_decimals, price_decimals).map_err(|_| {
             perp_err(format!(
@@ -732,6 +744,27 @@ fn validate_market_bounds(
     if max_value > i64::MAX as u64 {
         return Err(perp_err(format!(
             "{prefix}: max order value must be <= i64::MAX quote units"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_funding_config(
+    prefix: &str,
+    price_update_interval: u64,
+    funding_interval: u64,
+) -> Result<(), PrecompileError> {
+    if funding_interval == 0 {
+        return Ok(());
+    }
+    if funding_interval < price_update_interval {
+        return Err(perp_err(format!(
+            "{prefix}: fundingInterval must be >= priceUpdateInterval"
+        )));
+    }
+    if funding_interval % price_update_interval != 0 {
+        return Err(perp_err(format!(
+            "{prefix}: fundingInterval must be a multiple of priceUpdateInterval"
         )));
     }
     Ok(())
@@ -919,8 +952,9 @@ pub fn run_update_index_price<CTX: ContextTr>(
     let max_index_checkpoints = max_index_price_checkpoints(market.price_update_interval);
     let mut index_history = storage::load_index_price_history(context, args.marketId)?;
     index_history.push(current_index_state, max_index_checkpoints);
-    let ma_basis = window.moving_average_basis(&index_history, effective_timestamp);
-    let price2 = (args.indexPrice as i64).saturating_add(ma_basis).max(1) as u64;
+    let ma_basis = window.moving_average_basis(&index_history, effective_timestamp)?;
+    let index_price_i64 = checked_u64_to_i64(args.indexPrice, "updateIndexPrice: indexPrice")?;
+    let price2 = index_price_i64.saturating_add(ma_basis).max(1) as u64;
 
     // Contract price: latest traded price, falling back to index before any trade.
     let last_traded = storage::load_last_traded_price(context, args.marketId)?;
@@ -964,38 +998,53 @@ pub fn run_update_index_price<CTX: ContextTr>(
     if market.funding_interval > 0 {
         let mut acc = storage::load_premium_accumulator(context, args.marketId)?;
 
-        // Initialize epoch on first oracle update.
+        // PI = (mark_price − index_price) × FUNDING_RATE_ONE / index_price
+        let pi = ((mark_price as i128 - args.indexPrice as i128)
+            .checked_mul(FUNDING_RATE_ONE as i128)
+            .ok_or_else(|| perp_err("updateIndexPrice: premium index overflow"))?
+            / args.indexPrice as i128)
+            .try_into()
+            .map_err(|_| perp_err("updateIndexPrice: premium index exceeds i64::MAX"))?;
+
+        // Initialize epoch on first oracle update. The first observed PI is the
+        // first theoretical sample slot for this funding epoch.
         if acc.epoch_start_ts == 0 {
-            acc.epoch_start_ts = effective_timestamp;
+            acc.start_epoch(effective_timestamp, effective_timestamp, pi)?;
             if funding.next_funding_ts == 0 {
-                funding.next_funding_ts = effective_timestamp + market.funding_interval;
+                funding.next_funding_ts = effective_timestamp
+                    .checked_add(market.funding_interval)
+                    .ok_or_else(|| perp_err("updateIndexPrice: next funding timestamp overflow"))?;
             }
         }
 
-        // PI = (mark_price − index_price) × FUNDING_RATE_ONE / index_price
-        let pi = (mark_price as i64 - args.indexPrice as i64)
-            .saturating_mul(FUNDING_RATE_ONE)
-            .checked_div(args.indexPrice as i64)
-            .unwrap_or(0);
-        acc.push_sample(pi);
-
         // Epoch boundary: compute and store new funding rate, reset accumulator.
         if effective_timestamp >= funding.next_funding_ts {
-            let avg_pi = acc.average();
+            let epoch_last_slot_ts = funding
+                .next_funding_ts
+                .saturating_sub(market.price_update_interval);
+            acc.fill_slots_until(epoch_last_slot_ts, market.price_update_interval, None)?;
+            let avg_pi = acc.average()?;
             let rate = calc_funding_rate(avg_pi, market.interest_rate);
             let sample_count = acc.sample_count;
 
             funding.last_funding_rate = rate;
-            funding.next_funding_ts += market.funding_interval;
+            while funding.next_funding_ts <= effective_timestamp {
+                funding.next_funding_ts = funding
+                    .next_funding_ts
+                    .checked_add(market.funding_interval)
+                    .ok_or_else(|| perp_err("updateIndexPrice: next funding timestamp overflow"))?;
+            }
             storage::save_funding_state(context, args.marketId, &funding)?;
 
-            acc = PremiumIndexAccumulator {
-                weighted_sum: 0,
-                sample_count: 0,
-                epoch_start_ts: funding.next_funding_ts - market.funding_interval,
-            };
+            acc = PremiumIndexAccumulator::default();
+            acc.start_epoch(
+                funding.next_funding_ts - market.funding_interval,
+                effective_timestamp,
+                pi,
+            )?;
             computed_rate = Some((rate, avg_pi, sample_count));
         } else if acc.epoch_start_ts > 0 || funding.next_funding_ts > 0 {
+            acc.fill_slots_until(effective_timestamp, market.price_update_interval, Some(pi))?;
             // Save updated next_funding_ts if it was just initialized.
             storage::save_funding_state(context, args.marketId, &funding)?;
         }
@@ -1086,10 +1135,12 @@ pub fn run_get_average_premium_index<CTX: ContextTr>(
 ) -> Result<Bytes, PrecompileError> {
     let args = getAveragePremiumIndexCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getAveragePremiumIndex: invalid calldata"))?;
+    storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("getAveragePremiumIndex: unknown market"))?;
     let acc = storage::load_premium_accumulator(context, args.marketId)?;
     Ok(Bytes::from(getAveragePremiumIndexCall::abi_encode_returns(
         &getAveragePremiumIndexReturn {
-            avgPremiumIndex: acc.average(),
+            avgPremiumIndex: acc.average()?,
             sampleCount: acc.sample_count,
         },
     )))
