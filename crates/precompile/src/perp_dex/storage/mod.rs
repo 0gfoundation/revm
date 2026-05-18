@@ -25,7 +25,7 @@ use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
     best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot,
     funding_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
-    last_traded_price_key, liquidator_key, mark_price_key, market_fee_total_key, market_key,
+    last_traded_price_key, mark_price_key, market_fee_total_key, market_key, market_manager_key,
     open_interest_key, oracle_key, order_key, position_key, premium_accumulator_key,
     price_basis_window_key, trade_count_key, user_buy_orders_key, user_fee_rates_key,
     user_nonce_key, user_sell_orders_key,
@@ -683,7 +683,7 @@ fn save_api_key_ids<CTX: ContextTr>(
     store_blob(context, api_key_ids_key(user), &buf)
 }
 
-// ── Oracle address ────────────────────────────────────────────────────────────
+// ── Role addresses ────────────────────────────────────────────────────────────
 
 pub fn load_oracle<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
     let buf = load_blob(context, oracle_key())?;
@@ -699,6 +699,22 @@ pub fn save_oracle<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let buf = encode(&oracle)?;
     store_blob(context, oracle_key(), &buf)
+}
+
+pub fn load_market_manager<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
+    let buf = load_blob(context, market_manager_key())?;
+    if buf.is_empty() {
+        return Ok(Address::ZERO);
+    }
+    decode(&buf)
+}
+
+pub fn save_market_manager<CTX: ContextTr>(
+    context: &mut CTX,
+    manager: Address,
+) -> Result<(), PrecompileError> {
+    let buf = encode(&manager)?;
+    store_blob(context, market_manager_key(), &buf)
 }
 
 // ── Index price state ─────────────────────────────────────────────────────────
@@ -840,24 +856,6 @@ pub fn absorb_from_insurance_fund<CTX: ContextTr>(
     let remaining = deficit - absorbed;
     save_insurance_fund(context, balance - absorbed)?;
     Ok((absorbed, remaining))
-}
-
-// ── Liquidator address ────────────────────────────────────────────────────────
-
-pub fn load_liquidator<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
-    let buf = load_blob(context, liquidator_key())?;
-    if buf.is_empty() {
-        return Ok(Address::ZERO);
-    }
-    decode(&buf)
-}
-
-pub fn save_liquidator<CTX: ContextTr>(
-    context: &mut CTX,
-    liquidator: Address,
-) -> Result<(), PrecompileError> {
-    let buf = encode(&liquidator)?;
-    store_blob(context, liquidator_key(), &buf)
 }
 
 // ── Premium index accumulator ─────────────────────────────────────────────────

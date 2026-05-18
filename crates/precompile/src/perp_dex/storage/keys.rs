@@ -28,7 +28,8 @@ const PFX_BEST_BID: &[u8] = b"bbd\x00"; // cached best bid price (0 = empty)
 const PFX_BEST_ASK: &[u8] = b"bak\x00"; // cached best ask price (0 = empty)
 const PFX_API_KEY: &[u8] = b"apik"; // per-user per-slot ed25519 key
 const PFX_API_KEY_IDS: &[u8] = b"akid"; // per-user list of registered key_ids
-const PFX_ORACLE: &[u8] = b"orcl"; // authorized oracle address
+const PFX_ORACLE: &[u8] = b"orcl"; // authorized oracle address (updateIndexPrice role)
+const PFX_MARKET_MANAGER: &[u8] = b"mkgr"; // authorized market manager address (addMarket/updateMarket role)
 const PFX_INDEX_PRICE: &[u8] = b"idxp"; // per-market IndexPriceState
 const PFX_INDEX_HISTORY: &[u8] = b"idxh"; // per-market IndexPriceHistory
 const PFX_BASIS_WINDOW: &[u8] = b"bswn"; // per-market PriceBasisWindow (30s mid samples)
@@ -36,7 +37,6 @@ const PFX_LAST_TRADED: &[u8] = b"ltrd"; // per-market last traded price (contrac
 const PFX_FUNDING_STATE: &[u8] = b"fund"; // per-market FundingState
 const PFX_PREMIUM_ACCUMULATOR: &[u8] = b"pacc"; // per-market PremiumIndexAccumulator
 const PFX_INSURANCE_FUND: &[u8] = b"infd"; // global insurance fund balance
-const PFX_LIQUIDATOR: &[u8] = b"liqr"; // authorized liquidator address
 
 // ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
 
@@ -189,6 +189,11 @@ pub fn oracle_key() -> B256 {
     keccak256(PFX_ORACLE)
 }
 
+/// Authorized market manager address (Address; zero = not set).
+pub fn market_manager_key() -> B256 {
+    keccak256(PFX_MARKET_MANAGER)
+}
+
 /// Per-market IndexPriceState (index_price + timestamp).
 pub fn index_price_state_key(market_id: u64) -> B256 {
     keccak256([PFX_INDEX_PRICE, &market_id.to_be_bytes()].concat())
@@ -219,14 +224,9 @@ pub fn premium_accumulator_key(market_id: u64) -> B256 {
     keccak256([PFX_PREMIUM_ACCUMULATOR, &market_id.to_be_bytes()].concat())
 }
 
-// ── Insurance Fund & Liquidator ───────────────────────────────────────────────
+// ── Insurance Fund ────────────────────────────────────────────────────────────
 
 /// Global insurance fund balance (u64, USDC micro-units).
 pub fn insurance_fund_key() -> B256 {
     keccak256(PFX_INSURANCE_FUND)
-}
-
-/// Authorized liquidator address (Address; zero = not set, only admin can liquidate).
-pub fn liquidator_key() -> B256 {
-    keccak256(PFX_LIQUIDATOR)
 }

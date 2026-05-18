@@ -35,8 +35,6 @@ sol! {
         /// Update mutable market parameters (tick/step/quantity/price limits, active flag, and funding config).
         /// baseDecimals and priceDecimals cannot be changed after creation.
         function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate) external;
-        /// Update the mark price (used for margin and liquidation).
-        function setMarkPrice(uint64 marketId, uint64 price) external;
         /// Read the current mark price for a market.
         function getMarkPrice(uint64 marketId) external view returns (uint64 price);
         /// Read the configuration of a registered market. Reverts if the market does not exist.
@@ -139,14 +137,15 @@ sol! {
         /// Query the current insurance fund balance (USDC micro-units).
         function getInsuranceFund() external view returns (uint64 balance);
 
-        // ── Liquidator address ────────────────────────────────────────────
-        /// Set the authorized liquidator address. Admin only.
-        function setLiquidatorAddress(address liquidator) external;
-        /// Query the current liquidator address (zero if not set).
-        function getLiquidatorAddress() external view returns (address liquidator);
-
         // ── Oracle & mark price ───────────────────────────────────────────
-        /// Set the authorized oracle address. Only callable by admin.
+        // ── Roles ─────────────────────────────────────────────────────────────
+        /// Set the market manager address. Admin only. Zero address revokes the role.
+        /// The market manager can call addMarket and updateMarket.
+        function setMarketManagerAddress(address manager) external;
+        /// Query the current market manager address (zero if not set).
+        function getMarketManagerAddress() external view returns (address manager);
+
+        /// Set the authorized oracle address. Admin only. Zero address revokes the role.
         /// The oracle is the only non-admin address allowed to call updateIndexPrice.
         function setOracleAddress(address oracle) external;
         /// Query the current oracle address (zero if not set).
@@ -284,10 +283,8 @@ sol! {
         // badDebt = the uncovered amount absorbed by the protocol.
         event InsuranceFundDepleted(uint64 indexed marketId, uint64 badDebt);
 
-        // Feeds: liquidator address changes
-        event LiquidatorAddressUpdated(address indexed previousLiquidator, address indexed newLiquidator);
-
-        // Feeds: oracle address changes
+        // Feeds: role address changes
+        event MarketManagerUpdated(address indexed previousManager, address indexed newManager);
         event OracleAddressUpdated(address indexed previousOracle, address indexed newOracle);
 
         // Feeds: /premiumIndex (index price history), /markPrice websocket
