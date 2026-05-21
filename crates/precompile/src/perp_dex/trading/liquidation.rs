@@ -7,94 +7,27 @@ use crate::{
     perp_dex::{
         errors::{perp_err, perp_invariant_err},
         interface::IPerpDex,
+        math::{calc_value, checked_u64_to_i64},
         storage,
         types::{Market, Order, OrderStatus, OrderType, Side, TimeInForce},
         PERP_DEX_ADDRESS,
     },
     PrecompileError,
 };
-/// Return whether the opposite side of the book can fully close `user`'s
-/// position, excluding the user's own orders that liquidation will cancel first.
-pub(crate) fn can_fully_liquidate_on_book<CTX: ContextTr>(
-    context: &mut CTX,
-    user: Address,
-    market_id: u64,
-    liquidation_side: Side,
-    quantity: u64,
-) -> Result<bool, PrecompileError> {
-    let mut available = 0u64;
-    match liquidation_side {
-        Side::Buy => {
-            for price in storage::load_ask_prices(context, market_id)? {
-                for order_id in storage::load_ask_level(context, market_id, price)? {
-                    let Some(order) = storage::load_order(context, &order_id)? else {
-                        return Err(perp_invariant_err(format!(
-                            "ask queue references order {:?} not found in storage",
-                            order_id
-                        )));
-                    };
-                    if order.owner == user.0 .0 {
-                        continue;
-                    }
-                    if !matches!(
-                        order.status,
-                        OrderStatus::Open | OrderStatus::PartiallyFilled
-                    ) {
-                        return Err(perp_invariant_err(format!(
-                            "ask queue contains order {:?} with terminal status {:?}",
-                            order_id, order.status
-                        )));
-                    }
-                    available = available.saturating_add(order.quantity - order.filled);
-                    if available >= quantity {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Side::Sell => {
-            for price in storage::load_bid_prices(context, market_id)? {
-                for order_id in storage::load_bid_level(context, market_id, price)? {
-                    let Some(order) = storage::load_order(context, &order_id)? else {
-                        return Err(perp_invariant_err(format!(
-                            "bid queue references order {:?} not found in storage",
-                            order_id
-                        )));
-                    };
-                    if order.owner == user.0 .0 {
-                        continue;
-                    }
-                    if !matches!(
-                        order.status,
-                        OrderStatus::Open | OrderStatus::PartiallyFilled
-                    ) {
-                        return Err(perp_invariant_err(format!(
-                            "bid queue contains order {:?} with terminal status {:?}",
-                            order_id, order.status
-                        )));
-                    }
-                    available = available.saturating_add(order.quantity - order.filled);
-                    if available >= quantity {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-    }
-    Ok(false)
-}
 
 /// Execute the liquidation close as an internal market IOC order.
 ///
-/// The caller must pre-check full book depth. This helper still rejects any
-/// unfilled remainder to keep the first version all-or-nothing.
+/// Runs the IOC against the book and returns the unfilled quantity. If the
+/// book absorbs the entire position (`remaining == 0`) the position storage is
+/// cleaned up here. If the book can only partially fill, the caller is
+/// responsible for settling the residual (see `settle_liquidation_residual_at_mark_price`).
 pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     market: &Market,
     side: Side,
     quantity: u64,
-) -> Result<[u8; 32], PrecompileError> {
+) -> Result<u64, PrecompileError> {
     let order_id = next_order_id(context, user)?;
     let order = Order {
         owner: user.0 .0,
@@ -137,21 +70,72 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         TimeInForce::Ioc,
         market,
     )?;
-    if remaining != 0 {
-        return Err(perp_err(
-            "liquidate: orderbook liquidity cannot fully close position",
-        ));
+
+    if remaining == 0 {
+        // Full fill: clean up any rounding residuals left in the position.
+        let mut pos = storage::load_position(context, user, market.market_id)?;
+        if pos.amount != 0 {
+            return Err(perp_invariant_err(
+                "liquidation market order: full fill but position not zero",
+            ));
+        }
+        pos.v_quote_balance = 0;
+        pos.margin = 0;
+        storage::save_position(context, user, market.market_id, &pos)?;
     }
 
+    Ok(remaining)
+}
+
+/// Closes the residual position (the part the orderbook could not absorb) at mark price.
+///
+/// Called when `execute_liquidation_market_order` returns `remaining > 0`. The position
+/// still holds the proportional `margin` and `v_quote_balance` for the residual. This
+/// function applies those to the wallet and zeroes the position.
+///
+/// The wallet may go negative if the loss exceeds the remaining margin; the caller is
+/// responsible for routing any deficit to the Insurance Fund.
+pub(crate) fn settle_liquidation_residual_at_mark_price<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market: &Market,
+    liquidation_side: Side,
+    mark_price: u64,
+) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market.market_id)?;
-    if pos.amount != 0 {
-        return Err(perp_invariant_err(
-            "liquidation market order did not close position",
-        ));
-    }
+    let mut account = storage::load_account(context, user)?;
+
+    let residual_value = calc_value(
+        mark_price,
+        pos.amount.unsigned_abs(),
+        market.base_decimals,
+        market.price_decimals,
+    )?;
+    let residual_value_i64 = checked_u64_to_i64(residual_value, "liquidation: residual value")?;
+
+    // Selling a long → receive quote (+); buying a short → pay quote (-).
+    let close_quote_delta = if liquidation_side == Side::Sell {
+        residual_value_i64
+    } else {
+        -residual_value_i64
+    };
+
+    // realized = margin_release + vq_fraction + close_quote_delta
+    // For a full residual close, all remaining margin and v_quote are consumed.
+    let realized = pos
+        .margin
+        .checked_add(pos.v_quote_balance)
+        .and_then(|v| v.checked_add(close_quote_delta))
+        .ok_or_else(|| perp_err("liquidation: residual PnL overflow"))?;
+
+    account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(realized);
+
+    pos.amount = 0;
     pos.v_quote_balance = 0;
     pos.margin = 0;
-    storage::save_position(context, user, market.market_id, &pos)?;
 
-    Ok(order_id)
+    storage::save_position(context, user, market.market_id, &pos)?;
+    storage::save_account(context, user, account)?;
+
+    Ok(())
 }

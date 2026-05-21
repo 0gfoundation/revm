@@ -94,4 +94,9 @@ pub struct Market {
     /// Per-epoch interest rate in FUNDING_RATE_ONE units (1e6 = 100%). Default: 100 = 0.01%.
     #[serde(default)]
     pub interest_rate: i64,
+    /// Liquidation clearance fee in basis points (1 bps = 0.01%).
+    /// Charged from remaining margin on solvent liquidations; credited to Insurance Fund.
+    /// 0 = no fee.
+    #[serde(default, rename = "lf")]
+    pub liquidation_fee_rate_bps: u32,
 }

@@ -25,8 +25,8 @@ use crate::{
         },
         storage,
         trading::{
-            can_fully_liquidate_on_book, check_api_key_expiry, check_recv_window,
-            execute_liquidation_market_order, verify_ed25519,
+            check_api_key_expiry, check_recv_window, execute_liquidation_market_order,
+            settle_liquidation_residual_at_mark_price, verify_ed25519,
         },
         types::{FundingState, IndexPriceState, Market, PremiumIndexAccumulator, Side},
         PERP_DEX_ADDRESS,
@@ -166,6 +166,7 @@ pub fn run_add_market<CTX: ContextTr>(
         active: true,
         funding_interval: args.fundingInterval,
         interest_rate: args.interestRate,
+        liquidation_fee_rate_bps: args.liquidationFeeRateBps,
     };
     storage::save_market(context, &market)?;
 
@@ -183,6 +184,7 @@ pub fn run_add_market<CTX: ContextTr>(
             priceUpdateInterval: args.priceUpdateInterval,
             fundingInterval: args.fundingInterval,
             interestRate: args.interestRate,
+            liquidationFeeRateBps: args.liquidationFeeRateBps,
         }
         .to_log_data(),
     });
@@ -248,6 +250,7 @@ pub fn run_update_market<CTX: ContextTr>(
     market.active = args.active;
     market.funding_interval = args.fundingInterval;
     market.interest_rate = args.interestRate;
+    market.liquidation_fee_rate_bps = args.liquidationFeeRateBps;
     storage::save_market(context, &market)?;
 
     context.journal_mut().log(Log {
@@ -263,6 +266,7 @@ pub fn run_update_market<CTX: ContextTr>(
             active: args.active,
             fundingInterval: args.fundingInterval,
             interestRate: args.interestRate,
+            liquidationFeeRateBps: args.liquidationFeeRateBps,
         }
         .to_log_data(),
     });
@@ -307,6 +311,7 @@ pub fn run_get_market<CTX: ContextTr>(
             active: market.active,
             fundingInterval: market.funding_interval,
             interestRate: market.interest_rate,
+            liquidationFeeRateBps: market.liquidation_fee_rate_bps,
         },
     )))
 }
@@ -515,7 +520,10 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
 /// `liquidate(address user, uint64 marketId)`
 ///
 /// Anyone can call this to liquidate an under-margined position.
-/// Liquidation closes the position through the order book as an internal market order.
+/// Closes through the orderbook first; any residual the book cannot absorb is
+/// settled directly at mark price. If solvent after close, a liquidation clearance
+/// fee (market.liquidation_fee_rate_bps of the pre-liquidation margin) is credited
+/// to the Insurance Fund. If bankrupt, the deficit is absorbed by the IF instead.
 pub fn run_liquidate<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -544,35 +552,90 @@ pub fn run_liquidate<CTX: ContextTr>(
     }
 
     let liq_amount = pos.amount;
-    let liquidation_side = if pos.amount > 0 {
-        Side::Sell
-    } else {
-        Side::Buy
-    };
+    let liquidation_side = if pos.amount > 0 { Side::Sell } else { Side::Buy };
     let liquidation_quantity = pos.amount.unsigned_abs();
-
-    if !can_fully_liquidate_on_book(
-        context,
-        args.user,
-        args.marketId,
-        liquidation_side,
-        liquidation_quantity,
-    )? {
-        return Err(perp_err(
-            "liquidate: orderbook liquidity cannot fully close position",
-        ));
-    }
+    let pre_liq_margin = pos.margin.max(0) as u64;
 
     // Cancel all open orders for this user/market (emits OrderCancelled events).
     cancel_all_orders_for_market(context, args.user, args.marketId, &market)?;
 
-    execute_liquidation_market_order(
+    // Try to close through the orderbook; settle any residual at mark price.
+    let remaining = execute_liquidation_market_order(
         context,
         args.user,
         &market,
         liquidation_side,
         liquidation_quantity,
     )?;
+    if remaining > 0 {
+        settle_liquidation_residual_at_mark_price(
+            context,
+            args.user,
+            &market,
+            liquidation_side,
+            mark_price,
+        )?;
+    }
+
+    // Solvent: deduct clearance fee from wallet and credit to Insurance Fund.
+    // Bankrupt: absorb deficit from Insurance Fund; excess becomes bad debt.
+    let mut account = storage::load_account(context, args.user)?;
+    let clearance_fee = if account.perp_wallet_balance >= 0 {
+        let fee = (pre_liq_margin as u128)
+            .saturating_mul(market.liquidation_fee_rate_bps as u128)
+            / 10_000;
+        let fee = (fee as u64).min(account.perp_wallet_balance as u64);
+        if fee > 0 {
+            account.debit_perp(fee)?;
+            storage::save_account(context, args.user, account)?;
+            let old_if = storage::load_insurance_fund(context)?;
+            let new_if = old_if
+                .checked_add(fee)
+                .ok_or_else(|| perp_err("liquidate: insurance fund overflow"))?;
+            storage::save_insurance_fund(context, new_if)?;
+            let fee_i64 = checked_u64_to_i64(fee, "liquidate: clearance fee delta")?;
+            context.journal_mut().log(Log {
+                address: PERP_DEX_ADDRESS,
+                data: IPerpDex::InsuranceFundChanged {
+                    delta: fee_i64,
+                    newBalance: new_if,
+                }
+                .to_log_data(),
+            });
+        }
+        fee
+    } else {
+        let deficit = (-account.perp_wallet_balance) as u64;
+        let (absorbed, bad_debt) = storage::absorb_from_insurance_fund(context, deficit)?;
+        let new_if = storage::load_insurance_fund(context)?;
+        account.credit_perp(absorbed)?;
+        if bad_debt > 0 {
+            account.perp_wallet_balance = 0;
+        }
+        storage::save_account(context, args.user, account)?;
+        if absorbed > 0 {
+            let absorbed_i64 = checked_u64_to_i64(absorbed, "liquidate: IF absorption delta")?;
+            context.journal_mut().log(Log {
+                address: PERP_DEX_ADDRESS,
+                data: IPerpDex::InsuranceFundChanged {
+                    delta: -absorbed_i64,
+                    newBalance: new_if,
+                }
+                .to_log_data(),
+            });
+        }
+        if bad_debt > 0 {
+            context.journal_mut().log(Log {
+                address: PERP_DEX_ADDRESS,
+                data: IPerpDex::InsuranceFundDepleted {
+                    marketId: args.marketId,
+                    badDebt: bad_debt,
+                }
+                .to_log_data(),
+            });
+        }
+        0
+    };
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
@@ -581,7 +644,7 @@ pub fn run_liquidate<CTX: ContextTr>(
             marketId: args.marketId,
             liquidator: caller,
             amount: liq_amount,
-            reward: 0,
+            reward: clearance_fee,
             markPrice: mark_price,
         }
         .to_log_data(),

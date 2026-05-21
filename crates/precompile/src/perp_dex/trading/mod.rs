@@ -11,7 +11,9 @@ use ed25519_dalek::{Signature, VerifyingKey};
 mod liquidation;
 mod settlement;
 
-pub(crate) use liquidation::{can_fully_liquidate_on_book, execute_liquidation_market_order};
+pub(crate) use liquidation::{
+    execute_liquidation_market_order, settle_liquidation_residual_at_mark_price,
+};
 use settlement::{settle_maker_fill, TakerSettlement};
 
 use crate::{
