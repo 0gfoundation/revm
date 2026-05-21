@@ -362,8 +362,7 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
 
         let expired_order_ids =
             cancel_maker_orders_until_wallet_nonnegative(context, maker, market_id, market)?;
-        // TODO: If the maker wallet is still negative after all cancellable
-        // orders are gone, liquidation/bankruptcy handling should resolve it.
+        resolve_maker_wallet_deficit(context, maker, market_id)?;
         credit_fee_recipient(context, market_id, maker_fee)?;
 
         context.journal_mut().log(Log {
@@ -392,6 +391,7 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
         storage::save_account(context, maker, account)?;
     }
 
+    resolve_maker_wallet_deficit(context, maker, market_id)?;
     credit_fee_recipient(context, market_id, maker_fee)?;
 
     context.journal_mut().log(Log {
@@ -659,8 +659,8 @@ fn apply_position_fill(
         if realised > 0 {
             *wallet = wallet.saturating_add(realised);
         } else if realised < 0 {
-            // TODO: Route negative isolated equity through bankruptcy handling instead
-            // of silently consuming wallet balance.
+            // Wallet absorbs the loss; if it goes negative the caller is responsible
+            // for routing the deficit to the Insurance Fund.
             *wallet = wallet.saturating_sub(-realised);
         }
         pos.margin = pos
@@ -872,6 +872,52 @@ fn cancel_maker_orders_until_wallet_nonnegative<CTX: ContextTr>(
         expired_order_ids.push(order_id);
     }
     Ok(expired_order_ids)
+}
+
+/// Absorbs any remaining wallet deficit from the Insurance Fund.
+///
+/// Called after all order-cancellation steps are exhausted. The IF covers as much
+/// of the shortfall as possible; anything beyond its capacity becomes bad debt
+/// (wallet clamped to 0, shortfall written off by the protocol).
+fn resolve_maker_wallet_deficit<CTX: ContextTr>(
+    context: &mut CTX,
+    maker: Address,
+    market_id: u64,
+) -> Result<(), PrecompileError> {
+    let mut account = storage::load_account(context, maker)?;
+    if account.perp_wallet_balance >= 0 {
+        return Ok(());
+    }
+    let deficit = (-account.perp_wallet_balance) as u64;
+    let (absorbed, remaining) = storage::absorb_from_insurance_fund(context, deficit)?;
+    let new_if_balance = storage::load_insurance_fund(context)?;
+    account.credit_perp(absorbed)?;
+    if remaining > 0 {
+        account.perp_wallet_balance = 0;
+    }
+    storage::save_account(context, maker, account)?;
+    if absorbed > 0 {
+        let absorbed_i64 = checked_u64_to_i64(absorbed, "settlement: IF absorption delta")?;
+        context.journal_mut().log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::InsuranceFundChanged {
+                delta: -absorbed_i64,
+                newBalance: new_if_balance,
+            }
+            .to_log_data(),
+        });
+    }
+    if remaining > 0 {
+        context.journal_mut().log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::InsuranceFundDepleted {
+                marketId: market_id,
+                badDebt: remaining,
+            }
+            .to_log_data(),
+        });
+    }
+    Ok(())
 }
 
 /// Recomputes the maker's order margin reservation from scratch after a fill.
