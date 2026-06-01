@@ -66,6 +66,7 @@ fn setup(ctx: &mut TestCtx) {
             active: true,
             funding_interval: 0,
             interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
         },
     )
     .unwrap();
@@ -332,6 +333,7 @@ fn margin_uses_market_price_decimals() {
             active: true,
             funding_interval: 0,
             interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
         },
     )
     .unwrap();
@@ -980,7 +982,11 @@ fn cancel_resting_order_releases_margin_and_clears_book() {
         "margin should be reserved"
     );
 
-    let input = cancelOrderCall { orderId: id.into() }.abi_encode();
+    let input = cancelOrderCall {
+        orderId: id.into(),
+        marketId: MARKET_ID,
+    }
+    .abi_encode();
     run_cancel_order(&input, ALICE, &mut ctx).unwrap();
 
     assert_eq!(wallet(&mut ctx, ALICE), WALLET, "margin should be returned");
@@ -996,7 +1002,11 @@ fn cancel_rejects_non_owner() {
     setup(&mut ctx);
 
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
-    let input = cancelOrderCall { orderId: id.into() }.abi_encode();
+    let input = cancelOrderCall {
+        orderId: id.into(),
+        marketId: MARKET_ID,
+    }
+    .abi_encode();
     let err = run_cancel_order(&input, BOB, &mut ctx).unwrap_err();
     assert!(err.to_string().contains("not owner"), "{err}");
 }
@@ -1011,6 +1021,7 @@ fn cancel_rejects_already_filled_order() {
 
     let input = cancelOrderCall {
         orderId: sell_id.into(),
+        marketId: MARKET_ID,
     }
     .abi_encode();
     let err = run_cancel_order(&input, BOB, &mut ctx).unwrap_err();
@@ -1024,6 +1035,7 @@ fn cancel_rejects_nonexistent_order() {
 
     let input = cancelOrderCall {
         orderId: [0xab_u8; 32].into(),
+        marketId: MARKET_ID,
     }
     .abi_encode();
     let err = run_cancel_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -1039,7 +1051,11 @@ fn get_order_returns_all_correct_fields() {
 
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
-    let input = getOrderCall { orderId: id.into() }.abi_encode();
+    let input = getOrderCall {
+        orderId: id.into(),
+        marketId: MARKET_ID,
+    }
+    .abi_encode();
     let ret = run_get_order(&input, &mut ctx).unwrap();
 
     // ABI layout: 7 × 32-byte slots.
@@ -1068,6 +1084,7 @@ fn get_order_rejects_nonexistent_order() {
 
     let input = getOrderCall {
         orderId: [0u8; 32].into(),
+        marketId: MARKET_ID,
     }
     .abi_encode();
     let err = run_get_order(&input, &mut ctx).unwrap_err();

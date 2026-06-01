@@ -81,9 +81,11 @@ sol! {
         /// Returns a unique order ID.
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
-        function cancelOrder(bytes32 orderId) external;
+        /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
+        function cancelOrder(bytes32 orderId, uint64 marketId) external;
         /// Query order details.
-        function getOrder(bytes32 orderId) external view returns (
+        /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
+        function getOrder(bytes32 orderId, uint64 marketId) external view returns (
             address owner,
             uint64  marketId,
             uint8   side,
@@ -210,13 +212,15 @@ sol! {
         ) external returns (bytes32 orderId);
 
         /// Cancel an order for `account`, authenticated by ed25519 signature.
-        /// Message: "perpdex_v1_cancel" || account(20) || orderId(32) || timestamp(8) || recvWindow(8) || keyId(1)
+        /// Message: "perpdex_v1_cancel"(17) || account(20) || orderId(32) || marketId(8) || timestamp(8) || recvWindow(8) || keyId(1)
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         /// keyId: which API key slot to verify against.
+        /// marketId is part of the signed message for ABI compatibility but ignored by the cancel logic.
         /// Replay protection is implicit: a cancelled order cannot be cancelled again.
         function cancelOrderSigned(
             address account,
             bytes32 orderId,
+            uint64 marketId,
             uint64 timestamp,
             uint64 recvWindow,
             uint8 keyId,

@@ -177,15 +177,17 @@ pub fn run_cancel_order_signed<CTX: ContextTr>(
 
     let pubkey = api_key.pubkey;
 
-    // Canonical message (fixed-layout, 86 bytes):
-    //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || timestamp(8) || recvWindow(8) || keyId(1)
-    let mut msg = [0u8; 86];
+    // Canonical message (fixed-layout, 94 bytes):
+    //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || marketId(8) || timestamp(8) || recvWindow(8) || keyId(1)
+    // marketId is part of the signed message for ABI compatibility but otherwise ignored.
+    let mut msg = [0u8; 94];
     msg[..17].copy_from_slice(b"perpdex_v1_cancel");
     msg[17..37].copy_from_slice(args.account.as_slice());
     msg[37..69].copy_from_slice(args.orderId.as_slice());
-    msg[69..77].copy_from_slice(&args.timestamp.to_be_bytes());
-    msg[77..85].copy_from_slice(&args.recvWindow.to_be_bytes());
-    msg[85] = args.keyId;
+    msg[69..77].copy_from_slice(&args.marketId.to_be_bytes());
+    msg[77..85].copy_from_slice(&args.timestamp.to_be_bytes());
+    msg[85..93].copy_from_slice(&args.recvWindow.to_be_bytes());
+    msg[93] = args.keyId;
 
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;
@@ -193,7 +195,10 @@ pub fn run_cancel_order_signed<CTX: ContextTr>(
     cancel_order_core(args.account, args.orderId.0, context)
 }
 
-/// `cancelOrder(bytes32 orderId)`
+/// `cancelOrder(bytes32 orderId, uint64 marketId)`
+///
+/// `marketId` is accepted for ABI compatibility but ignored — the order is
+/// looked up globally by `orderId`.
 pub fn run_cancel_order<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -204,7 +209,10 @@ pub fn run_cancel_order<CTX: ContextTr>(
     cancel_order_core(caller, args.orderId.0, context)
 }
 
-/// `getOrder(bytes32 orderId) returns (address owner, uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint64 filled, uint8 status)`
+/// `getOrder(bytes32 orderId, uint64 marketId) returns (address owner, uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint64 filled, uint8 status)`
+///
+/// The input `marketId` is accepted for ABI compatibility but ignored — the
+/// order is looked up globally by `orderId`.
 pub fn run_get_order<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
