@@ -61,6 +61,7 @@ fn setup_market(ctx: &mut TestCtx) {
             active: true,
             funding_interval: 0,
             interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
         },
     )
     .unwrap();
@@ -666,19 +667,21 @@ fn liquidate_short_buys_full_position_from_asks() {
 }
 
 #[test]
-fn liquidate_rejects_when_orderbook_cannot_fully_close() {
+fn liquidate_settles_residual_at_mark_when_orderbook_cannot_fully_close() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
     storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
+    // Book only provides QTY-1 of closing liquidity.
     place_maker_order(&mut ctx, Side::Buy as u8, LONG_LIQ_PRICE, (QTY as u64) - 1);
 
-    let err = liquidate(&mut ctx, ALICE).unwrap_err();
-    assert!(err.to_string().contains("cannot fully close position"));
+    // New behaviour: close what the book can absorb, then settle the 1-unit
+    // residual directly at mark price. The position is fully closed, not rejected.
+    liquidate(&mut ctx, ALICE).unwrap();
 
     let alice = position(&mut ctx, ALICE);
-    assert_eq!(alice.amount, QTY);
-    assert_eq!(alice.v_quote_balance, -ENTRY_VALUE);
+    assert_eq!(alice.amount, 0, "position fully closed via book + residual-at-mark");
+    assert_eq!(alice.v_quote_balance, 0);
 }
 
 #[test]
