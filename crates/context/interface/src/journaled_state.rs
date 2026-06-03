@@ -3,10 +3,19 @@ use crate::context::{SStoreResult, SelfDestructResult};
 use core::ops::{Deref, DerefMut};
 use database_interface::Database;
 use primitives::{
-    hardfork::SpecId, Address, Bytes, HashSet, Log, StorageKey, StorageValue, B256, U256,
+    hardfork::SpecId, Address, Bytes, HashMap, HashSet, Log, StorageKey, StorageValue, B256, U256,
 };
 use state::{Account, Bytecode};
 use std::vec::Vec;
+
+/// Net off-trie PerpDEX writes produced during execution, keyed by domain key.
+///
+/// This is the channel by which the in-memory orderbook ("PerpState") leaves the EVM:
+/// it is drained via [`JournalTr::take_perp_delta`] and is deliberately NOT folded into
+/// the [`JournalTr::State`] returned by [`JournalTr::finalize`], so perp data never enters
+/// the state trie. An empty value means the key is absent/deleted. Carries no pre-images
+/// (single-node, no-reorg scope). See `docs/perpstate-journal集成方案.md`.
+pub type PerpDelta = HashMap<B256, Vec<u8>>;
 
 /// Trait that contains database and journal of all changes that were made to the state.
 pub trait JournalTr {
@@ -222,6 +231,33 @@ pub trait JournalTr {
     /// any already committed changes and it is safe to call it multiple times.
     fn discard_tx(&mut self);
 
+    /// Reads an off-trie PerpDEX blob by domain key (off-trie "PerpState").
+    ///
+    /// Returns the in-block overlay value if the key was written during this block, otherwise
+    /// falls through to the committed off-trie store. The default implementation returns empty
+    /// (no perp store is wired). See `docs/perpstate-journal集成方案.md` §4.4.
+    fn perp_load(&mut self, key: B256) -> Result<Vec<u8>, <Self::Database as Database>::Error> {
+        let _ = key;
+        Ok(Vec::new())
+    }
+
+    /// Writes an off-trie PerpDEX blob, journaled so it reverts in lock-step with the surrounding
+    /// checkpoint / `discard_tx`. An empty value marks the key absent. The default implementation
+    /// is a no-op.
+    fn perp_store(&mut self, key: B256, value: Vec<u8>) {
+        let _ = (key, value);
+    }
+
+    /// Drains and returns the block's net off-trie PerpDEX writes ([`PerpDelta`]).
+    ///
+    /// Called by the block executor while the EVM/journal is still alive (before it is consumed),
+    /// so the orderbook delta can be applied to the committed off-trie store. NOT part of
+    /// [`JournalTr::finalize`]'s output (perp stays off the state trie). The default implementation
+    /// returns an empty delta.
+    fn take_perp_delta(&mut self) -> PerpDelta {
+        PerpDelta::default()
+    }
+
     /// Clear current journal resetting it to initial state and return changes state.
     fn finalize(&mut self) -> Self::State;
 }
@@ -245,6 +281,9 @@ pub struct JournalCheckpoint {
     pub log_i: usize,
     /// Checkpoint to where on revert we will go back to and revert other journal entries.
     pub journal_i: usize,
+    /// Checkpoint into the off-trie PerpDEX undo log; on revert, perp overlay writes made
+    /// after this index are undone in lock-step with the EVM journal entries.
+    pub perp_journal_i: usize,
 }
 
 /// State load information that contains the data and if the account or storage is cold loaded

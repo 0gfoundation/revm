@@ -12,7 +12,7 @@ pub use inner::JournalInner;
 use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
-    journaled_state::{AccountLoad, JournalCheckpoint, JournalTr, TransferError},
+    journaled_state::{AccountLoad, JournalCheckpoint, JournalTr, PerpDelta, TransferError},
 };
 use core::ops::{Deref, DerefMut};
 use database_interface::Database;
@@ -302,9 +302,108 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
         self.inner.discard_tx();
     }
 
+    #[inline]
+    fn perp_load(&mut self, key: B256) -> Result<Vec<u8>, <Self::Database as Database>::Error> {
+        // Overlay first: a key written earlier in this block.
+        if let Some(value) = self.inner.perp_get_overlay(key) {
+            return Ok(value.to_vec());
+        }
+        // Cold miss: fall through to the committed off-trie perp store via the database —
+        // exactly as `sload` falls through to `Database::storage` for trie slots.
+        //
+        // `Database::perp_storage` defaults to empty, so a chain executing from genesis
+        // in-process still behaves correctly. The embedder (e.g. reth) MUST override
+        // `Database::perp_storage` on its execution DB to read the committed `canonical_perp`
+        // store, otherwise cross-block perp reads return empty. See
+        // `docs/perpstate-journal集成方案.md` §4.4 (cold-read pass-through).
+        self.database.perp_storage(key)
+    }
+
+    #[inline]
+    fn perp_store(&mut self, key: B256, value: Vec<u8>) {
+        self.inner.perp_store(key, value);
+    }
+
+    #[inline]
+    fn take_perp_delta(&mut self) -> PerpDelta {
+        self.inner.take_perp_delta()
+    }
+
     /// Clear current journal resetting it to initial state and return changes state.
     #[inline]
     fn finalize(&mut self) -> Self::State {
         self.inner.finalize()
+    }
+}
+
+#[cfg(test)]
+mod perp_passthrough_tests {
+    use super::Journal;
+    use bytecode::Bytecode;
+    use context_interface::JournalTr;
+    use database_interface::Database;
+    use primitives::{Address, HashMap, StorageKey, StorageValue, B256};
+    use state::AccountInfo;
+    use std::vec::Vec;
+
+    /// Minimal DB whose `perp_storage` is backed by a map — stands in for reth's committed
+    /// off-trie `canonical_perp` store, letting us test the cold-read pass-through without reth.
+    #[derive(Default)]
+    struct PerpBackedDb {
+        perp: HashMap<B256, Vec<u8>>,
+    }
+
+    impl Database for PerpBackedDb {
+        type Error = core::convert::Infallible;
+        fn basic(&mut self, _: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+        fn code_by_hash(&mut self, _: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+        fn storage(&mut self, _: Address, _: StorageKey) -> Result<StorageValue, Self::Error> {
+            Ok(StorageValue::ZERO)
+        }
+        fn block_hash(&mut self, _: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+        fn perp_storage(&mut self, key: B256) -> Result<Vec<u8>, Self::Error> {
+            Ok(self.perp.get(&key).cloned().unwrap_or_default())
+        }
+    }
+
+    fn k(n: u8) -> B256 {
+        B256::repeat_byte(n)
+    }
+
+    #[test]
+    fn cold_perp_read_falls_through_to_committed_store() {
+        let mut db = PerpBackedDb::default();
+        db.perp.insert(k(1), vec![7, 8, 9]); // committed by a prior block
+        let mut j: Journal<PerpBackedDb> = Journal::new(db);
+
+        // Empty overlay (fresh per-block journal) → cold read reaches the committed store.
+        // This is exactly what the inline Phase-1 stub could NOT do (it returned empty).
+        assert_eq!(j.perp_load(k(1)).unwrap(), vec![7, 8, 9]);
+        // A genuinely absent key returns empty (the default).
+        assert_eq!(j.perp_load(k(2)).unwrap(), Vec::<u8>::new());
+        // An in-block write shadows the committed value (overlay wins).
+        j.perp_store(k(1), vec![1]);
+        assert_eq!(j.perp_load(k(1)).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn revert_of_overlay_write_re_exposes_committed_value() {
+        let mut db = PerpBackedDb::default();
+        db.perp.insert(k(1), vec![7]); // committed value
+        let mut j: Journal<PerpBackedDb> = Journal::new(db);
+
+        let cp = j.checkpoint();
+        j.perp_store(k(1), vec![99]); // overlay shadows committed
+        assert_eq!(j.perp_load(k(1)).unwrap(), vec![99]);
+
+        j.checkpoint_revert(cp); // overlay write removed (prev == None)
+        // Overlay miss again → falls through to the committed store, NOT to empty.
+        assert_eq!(j.perp_load(k(1)).unwrap(), vec![7]);
     }
 }

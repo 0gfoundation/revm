@@ -5,7 +5,7 @@ use super::JournalEntryTr;
 use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
-    journaled_state::{AccountLoad, JournalCheckpoint, TransferError},
+    journaled_state::{AccountLoad, JournalCheckpoint, PerpDelta, TransferError},
 };
 use core::mem;
 use database_interface::Database;
@@ -16,6 +16,76 @@ use primitives::{
 };
 use state::{Account, EvmState, EvmStorageSlot, TransientStorage};
 use std::vec::Vec;
+
+/// Off-trie PerpDEX section of the journal (the in-memory orderbook overlay, "PerpState").
+///
+/// This is a second instance of revm's own state/journal model, applied to the PerpDEX
+/// orderbook so it gets the SAME checkpoint / revert / commit lifecycle as [`EvmState`] —
+/// but it is deliberately never folded into the [`EvmState`] returned by
+/// [`JournalInner::finalize`], so it stays out of the state trie. `working` holds ONLY the
+/// keys written during the current block (reads pass through to the committed store without
+/// caching); `undo` is the per-transaction reversible log. See
+/// `docs/perpstate-journal集成方案.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PerpSection {
+    /// In-block write overlay (domain key -> blob). Empty value means the key is absent/deleted.
+    working: HashMap<B256, Vec<u8>>,
+    /// Reversible undo log for `working`, mirroring the EVM journal `Vec<ENTRY>`.
+    undo: Vec<PerpUndo>,
+}
+
+/// A single reversible PerpDEX overlay write: restores `prev` on revert
+/// (`None` = the key was absent in `working`, so revert removes it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+struct PerpUndo {
+    key: B256,
+    prev: Option<Vec<u8>>,
+}
+
+impl PerpSection {
+    /// Reads the overlay for `key` (in-block writes only); `None` = not written this block.
+    #[inline]
+    fn get(&self, key: B256) -> Option<&[u8]> {
+        self.working.get(&key).map(Vec::as_slice)
+    }
+
+    /// Writes `value` to the overlay, recording the prior overlay value for revert.
+    #[inline]
+    fn store(&mut self, key: B256, value: Vec<u8>) {
+        self.undo.push(PerpUndo {
+            key,
+            prev: self.working.get(&key).cloned(),
+        });
+        self.working.insert(key, value);
+    }
+
+    /// Reverts overlay writes recorded at or after undo index `i`, in reverse order.
+    fn undo_to(&mut self, i: usize) {
+        if i >= self.undo.len() {
+            return;
+        }
+        for entry in self.undo.drain(i..).rev() {
+            match entry.prev {
+                Some(prev) => {
+                    self.working.insert(entry.key, prev);
+                }
+                None => {
+                    self.working.remove(&entry.key);
+                }
+            }
+        }
+    }
+
+    /// Drains the net in-block writes as a [`PerpDelta`] and clears the undo log.
+    #[inline]
+    fn take_delta(&mut self) -> PerpDelta {
+        self.undo.clear();
+        mem::take(&mut self.working)
+    }
+}
+
 /// Inner journal state that contains journal and state changes.
 ///
 /// Spec Id is a essential information for the Journal.
@@ -55,6 +125,9 @@ pub struct JournalInner<ENTRY> {
     pub spec: SpecId,
     /// Warm addresses containing both coinbase and current precompiles.
     pub warm_addresses: WarmAddresses,
+    /// Off-trie PerpDEX overlay + undo log. Journaled like the rest of the state, but never
+    /// folded into the [`EvmState`] returned by [`Self::finalize`], so it stays off the trie.
+    pub perp: PerpSection,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -78,6 +151,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             depth: 0,
             spec: SpecId::default(),
             warm_addresses: WarmAddresses::new(),
+            perp: PerpSection::default(),
         }
     }
 
@@ -85,6 +159,31 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn take_logs(&mut self) -> Vec<Log> {
         mem::take(&mut self.logs)
+    }
+
+    /// Reads the off-trie PerpDEX overlay for `key`; `None` = not written in this block
+    /// (the caller falls through to the committed store, see `JournalTr::perp_load`).
+    #[inline]
+    pub fn perp_get_overlay(&self, key: B256) -> Option<&[u8]> {
+        self.perp.get(key)
+    }
+
+    /// Writes an off-trie PerpDEX blob to the overlay, journaled for revert.
+    #[inline]
+    pub fn perp_store(&mut self, key: B256, value: Vec<u8>) {
+        self.perp.store(key, value);
+    }
+
+    /// Reverts off-trie PerpDEX overlay writes back to the given undo index.
+    #[inline]
+    pub fn perp_undo_to(&mut self, perp_journal_i: usize) {
+        self.perp.undo_to(perp_journal_i);
+    }
+
+    /// Drains the block's net off-trie PerpDEX writes ([`PerpDelta`]) and clears the undo log.
+    #[inline]
+    pub fn take_perp_delta(&mut self) -> PerpDelta {
+        self.perp.take_delta()
     }
 
     /// Prepare for next transaction, by committing the current journal to history, incrementing the transaction id
@@ -106,6 +205,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             spec,
             warm_addresses,
+            perp,
         } = self;
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
@@ -115,6 +215,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // Do nothing with journal history so we can skip cloning present journal.
         journal.clear();
+
+        // Keep the perp overlay (later txs in this block must see this tx's writes, exactly
+        // like `state` above); only the tx-scoped undo log is spent.
+        perp.undo.clear();
 
         // Clear coinbase address warming for next tx
         warm_addresses.clear_coinbase();
@@ -135,12 +239,16 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             spec,
             warm_addresses,
+            perp,
         } = self;
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
         journal.drain(..).rev().for_each(|entry| {
             entry.revert(state, None, is_spurious_dragon_enabled);
         });
+        // Revert this transaction's perp overlay writes too (mirrors the journal revert above),
+        // so a discarded tx leaves no perp residue.
+        perp.undo_to(0);
         transient_storage.clear();
         *depth = 0;
         logs.clear();
@@ -167,6 +275,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             spec,
             warm_addresses,
+            perp,
         } = self;
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
@@ -176,6 +285,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let state = mem::take(state);
         logs.clear();
         transient_storage.clear();
+
+        // Reset the perp overlay too. Perp data leaves the journal via `take_perp_delta`,
+        // never folded into the returned `EvmState` — so it never enters the state trie.
+        perp.working.clear();
+        perp.undo.clear();
 
         // clear journal and journal history.
         journal.clear();
@@ -472,6 +586,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let checkpoint = JournalCheckpoint {
             log_i: self.logs.len(),
             journal_i: self.journal.len(),
+            perp_journal_i: self.perp.undo.len(),
         };
         self.depth += 1;
         checkpoint
@@ -501,6 +616,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                     entry.revert(state, Some(transient_storage), is_spurious_dragon_enabled);
                 });
         }
+
+        // Revert off-trie PerpDEX overlay writes made after the checkpoint, in lock-step with
+        // the EVM journal entries above.
+        self.perp.undo_to(checkpoint.perp_journal_i);
     }
 
     /// Performs selfdestruct action.
@@ -883,4 +1002,200 @@ pub fn sload_with_account<DB: Database, ENTRY: JournalEntryTr>(
     }
 
     Ok(StateLoad::new(value, is_cold))
+}
+
+#[cfg(test)]
+mod perp_tests {
+    use super::JournalInner;
+    use crate::journal::JournalEntry;
+    use primitives::B256;
+
+    fn new_inner() -> JournalInner<JournalEntry> {
+        JournalInner::new()
+    }
+
+    fn k(n: u8) -> B256 {
+        B256::repeat_byte(n)
+    }
+
+    #[test]
+    fn checkpoint_revert_restores_prior_perp_write() {
+        let mut j = new_inner();
+        // tx1 writes a baseline value, committed at the tx boundary.
+        j.perp_store(k(1), vec![1, 2, 3]);
+        j.commit_tx();
+
+        // A sub-call overwrites the key, then reverts.
+        let cp = j.checkpoint();
+        j.perp_store(k(1), vec![9, 9]);
+        assert_eq!(j.perp_get_overlay(k(1)), Some(&[9u8, 9][..]));
+        j.checkpoint_revert(cp);
+
+        // The committed baseline is restored, and depth is balanced.
+        assert_eq!(j.perp_get_overlay(k(1)), Some(&[1u8, 2, 3][..]));
+        assert_eq!(j.depth, 0);
+    }
+
+    #[test]
+    fn checkpoint_revert_removes_newly_written_key() {
+        let mut j = new_inner();
+        let cp = j.checkpoint();
+        j.perp_store(k(2), vec![5]);
+        assert_eq!(j.perp_get_overlay(k(2)), Some(&[5u8][..]));
+        j.checkpoint_revert(cp);
+        // The key was absent before the checkpoint, so revert removes it from the overlay
+        // (a later read falls through to the committed store).
+        assert_eq!(j.perp_get_overlay(k(2)), None);
+        assert!(j.perp.working.is_empty());
+        assert!(j.perp.undo.is_empty());
+    }
+
+    #[test]
+    fn discard_tx_wipes_perp_writes() {
+        let mut j = new_inner();
+        j.perp_store(k(1), vec![1]);
+        j.perp_store(k(2), vec![2]);
+        j.discard_tx();
+        // A discarded transaction leaves no perp residue.
+        assert_eq!(j.perp_get_overlay(k(1)), None);
+        assert_eq!(j.perp_get_overlay(k(2)), None);
+        assert!(j.perp.undo.is_empty());
+    }
+
+    #[test]
+    fn discard_tx_preserves_prior_committed_baseline() {
+        let mut j = new_inner();
+        // tx1 writes a baseline value and commits at the tx boundary (working kept, undo cleared).
+        j.perp_store(k(1), vec![1]);
+        j.commit_tx();
+        // tx2 writes another key, then is discarded.
+        j.perp_store(k(2), vec![2]);
+        j.discard_tx();
+        // discard_tx (undo_to(0)) must revert ONLY tx2's writes, never tx1's committed baseline —
+        // this distinguishes the correct undo-log replay from a naive working.clear().
+        assert_eq!(j.perp_get_overlay(k(1)), Some(&[1u8][..]));
+        assert_eq!(j.perp_get_overlay(k(2)), None);
+    }
+
+    #[test]
+    fn commit_tx_preserves_working_and_clears_undo() {
+        let mut j = new_inner();
+        j.perp_store(k(1), vec![1]);
+        j.commit_tx();
+        // Working survives across the tx boundary (intra-block visibility); the undo is spent.
+        assert_eq!(j.perp_get_overlay(k(1)), Some(&[1u8][..]));
+        assert!(j.perp.undo.is_empty());
+    }
+
+    #[test]
+    fn take_perp_delta_returns_net_writes_and_drains() {
+        let mut j = new_inner();
+        j.perp_store(k(1), vec![1]);
+        j.perp_store(k(1), vec![2]); // last write wins
+        j.perp_store(k(3), vec![]); // empty value = delete marker
+        let delta = j.take_perp_delta();
+        assert_eq!(delta.get(&k(1)), Some(&vec![2u8]));
+        assert_eq!(delta.get(&k(3)), Some(&Vec::<u8>::new()));
+        assert_eq!(delta.len(), 2);
+        assert!(j.perp.working.is_empty());
+        assert!(j.perp.undo.is_empty());
+    }
+
+    #[test]
+    fn finalize_excludes_perp_and_resets_it() {
+        let mut j = new_inner();
+        j.perp_store(k(1), vec![7]);
+        let state = j.finalize();
+        // Perp data is NOT folded into the returned EvmState (it stays off the trie).
+        assert!(state.is_empty());
+        assert!(j.perp.working.is_empty());
+        assert!(j.perp.undo.is_empty());
+    }
+
+    #[test]
+    fn nested_checkpoint_revert_only_undoes_inner_scope() {
+        let mut j = new_inner();
+        let outer = j.checkpoint();
+        j.perp_store(k(1), vec![10]);
+        let inner = j.checkpoint();
+        j.perp_store(k(2), vec![20]);
+
+        // Revert the inner scope: k(2) gone, k(1) survives.
+        j.checkpoint_revert(inner);
+        assert_eq!(j.perp_get_overlay(k(1)), Some(&[10u8][..]));
+        assert_eq!(j.perp_get_overlay(k(2)), None);
+
+        // Revert the outer scope: both gone, depth balanced.
+        j.checkpoint_revert(outer);
+        assert_eq!(j.perp_get_overlay(k(1)), None);
+        assert_eq!(j.depth, 0);
+    }
+
+    /// Property test: under an arbitrary, deterministically-generated sequence of
+    /// store / checkpoint / checkpoint_commit / checkpoint_revert operations (with nesting),
+    /// the perp overlay must always equal an independent reference model of the same writes.
+    /// This stresses the undo log far beyond the hand-written cases above. Dependency-free
+    /// (xorshift PRNG, fixed seed → reproducible).
+    #[test]
+    fn fuzz_overlay_matches_reference_model_under_nested_checkpoints() {
+        use std::collections::HashMap as RefMap;
+
+        let mut j = new_inner();
+        // Reference overlay model, mirroring perp.working.
+        let mut model: RefMap<B256, Vec<u8>> = RefMap::new();
+        // Stack of (checkpoint token, model snapshot) for nested scopes.
+        let mut snaps: Vec<(_, RefMap<B256, Vec<u8>>)> = Vec::new();
+
+        // Deterministic xorshift64 PRNG.
+        let mut s: u64 = 0x9E3779B97F4A7C15;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+
+        let probe: Vec<B256> = (0..6u8).map(k).collect();
+
+        for _ in 0..3000 {
+            match rng() % 5 {
+                // store (weighted 2/5)
+                0 | 1 => {
+                    let key = k((rng() % 6) as u8);
+                    let len = (rng() % 4) as usize;
+                    let val = vec![(rng() % 251) as u8; len];
+                    j.perp_store(key, val.clone());
+                    model.insert(key, val);
+                }
+                // checkpoint
+                2 => {
+                    let cp = j.checkpoint();
+                    snaps.push((cp, model.clone()));
+                }
+                // checkpoint_commit: keep changes, drop the snapshot
+                3 => {
+                    if !snaps.is_empty() {
+                        j.checkpoint_commit();
+                        snaps.pop();
+                    }
+                }
+                // checkpoint_revert: restore to the snapshot
+                _ => {
+                    if let Some((cp, snap)) = snaps.pop() {
+                        j.checkpoint_revert(cp);
+                        model = snap;
+                    }
+                }
+            }
+
+            // Invariant: overlay == reference model for all probe keys.
+            for key in &probe {
+                assert_eq!(
+                    j.perp_get_overlay(*key),
+                    model.get(key).map(Vec::as_slice),
+                    "overlay diverged from reference model at key {key:?}"
+                );
+            }
+        }
+    }
 }
