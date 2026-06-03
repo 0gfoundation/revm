@@ -311,6 +311,11 @@ impl<ExtDB: DatabaseRef> Database for CacheDB<ExtDB> {
             }
         }
     }
+
+    fn perp_storage(&mut self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        // Perp is off-trie and not cached here; pass through to the underlying DatabaseRef.
+        self.db.perp_storage_ref(key)
+    }
 }
 
 impl<ExtDB: DatabaseRef> DatabaseRef for CacheDB<ExtDB> {
@@ -358,6 +363,10 @@ impl<ExtDB: DatabaseRef> DatabaseRef for CacheDB<ExtDB> {
             Some(entry) => Ok(*entry),
             None => self.db.block_hash_ref(number),
         }
+    }
+
+    fn perp_storage_ref(&self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        self.db.perp_storage_ref(key)
     }
 }
 

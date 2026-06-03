@@ -4,6 +4,7 @@ use crate::{Database, DatabaseCommit, DatabaseRef};
 use either::Either;
 use primitives::{Address, HashMap, StorageKey, StorageValue, B256};
 use state::{Account, AccountInfo, Bytecode};
+use std::vec::Vec;
 
 impl<L, R> Database for Either<L, R>
 where
@@ -41,6 +42,13 @@ where
         match self {
             Self::Left(db) => db.block_hash(number),
             Self::Right(db) => db.block_hash(number),
+        }
+    }
+
+    fn perp_storage(&mut self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        match self {
+            Self::Left(db) => db.perp_storage(key),
+            Self::Right(db) => db.perp_storage(key),
         }
     }
 }
@@ -94,6 +102,13 @@ where
         match self {
             Self::Left(db) => db.block_hash_ref(number),
             Self::Right(db) => db.block_hash_ref(number),
+        }
+    }
+
+    fn perp_storage_ref(&self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        match self {
+            Self::Left(db) => db.perp_storage_ref(key),
+            Self::Right(db) => db.perp_storage_ref(key),
         }
     }
 }

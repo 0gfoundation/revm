@@ -307,6 +307,12 @@ impl<DB: Database> Database for State<DB> {
             }
         }
     }
+
+    fn perp_storage(&mut self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        // Perp is off-trie and is NOT held in State's account cache/bundle;
+        // pass straight through to the underlying database.
+        self.database.perp_storage(key)
+    }
 }
 
 impl<DB: Database> DatabaseCommit for State<DB> {
@@ -378,6 +384,10 @@ impl<DB: DatabaseRef> DatabaseRef for State<DB> {
         }
         // If not found, load it from database
         self.database.block_hash_ref(number)
+    }
+
+    fn perp_storage_ref(&self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        self.database.perp_storage_ref(key)
     }
 }
 

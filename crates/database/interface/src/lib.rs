@@ -12,6 +12,7 @@ use core::error::Error;
 use primitives::{address, Address, HashMap, StorageKey, StorageValue, B256, U256};
 use state::{Account, AccountInfo, Bytecode};
 use std::string::String;
+use std::vec::Vec;
 
 /// Address with all `0xff..ff` in it. Used for testing.
 pub const FFADDRESS: Address = address!("0xffffffffffffffffffffffffffffffffffffffff");
@@ -63,6 +64,18 @@ pub trait Database {
 
     /// Gets block hash by block number.
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error>;
+
+    /// Reads an off-trie PerpDEX blob by key (the committed "PerpState" store).
+    ///
+    /// This is the cold-read pass-through for the journal's perp section: when a perp key is not
+    /// in the in-block overlay, the journal calls this to read the committed off-trie orderbook,
+    /// exactly as `storage` falls through to the trie for EVM slots. The default returns empty
+    /// (no perp store wired) — embedders that hold a committed perp store (e.g. reth's
+    /// `canonical_perp`) MUST override this, otherwise cross-block perp reads return empty.
+    fn perp_storage(&mut self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        let _ = key;
+        Ok(Vec::new())
+    }
 }
 
 /// EVM database commit interface.
@@ -95,6 +108,13 @@ pub trait DatabaseRef {
 
     /// Gets block hash by block number.
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error>;
+
+    /// Reads an off-trie PerpDEX blob by key. The `&self` counterpart of
+    /// [`Database::perp_storage`]. Default returns empty.
+    fn perp_storage_ref(&self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        let _ = key;
+        Ok(Vec::new())
+    }
 }
 
 /// Wraps a [`DatabaseRef`] to provide a [`Database`] implementation.
@@ -134,6 +154,11 @@ impl<T: DatabaseRef> Database for WrapDatabaseRef<T> {
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
         self.0.block_hash_ref(number)
     }
+
+    #[inline]
+    fn perp_storage(&mut self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        self.0.perp_storage_ref(key)
+    }
 }
 
 impl<T: DatabaseRef + DatabaseCommit> DatabaseCommit for WrapDatabaseRef<T> {
@@ -168,5 +193,10 @@ impl<T: DatabaseRef> DatabaseRef for WrapDatabaseRef<T> {
     #[inline]
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         self.0.block_hash_ref(number)
+    }
+
+    #[inline]
+    fn perp_storage_ref(&self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        self.0.perp_storage_ref(key)
     }
 }
