@@ -1,8 +1,10 @@
 //! Storage key derivation for the PerpDEX precompile.
 //!
 //! Every storage key is `B256 = keccak256(prefix ++ domain-fields)`.
-//! Fixed 4-byte ASCII prefixes prevent cross-domain collisions inside
-//! the single `PERP_DEX_ADDRESS` storage space.
+//! Fixed 4-byte ASCII prefixes prevent cross-domain collisions within the
+//! off-trie PerpDEX key space (the journal's perp section). These keys used to
+//! address slots under `PERP_DEX_ADDRESS` in the state trie; perp blobs now live
+//! off-trie, but the key derivation is unchanged.
 
 use primitives::{keccak256, Address, B256};
 

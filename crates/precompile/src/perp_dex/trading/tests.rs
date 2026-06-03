@@ -1171,3 +1171,48 @@ fn get_book_level_returns_fifo_order_ids() {
 
     assert_eq!(decoded, vec![FixedBytes(first), FixedBytes(second)]);
 }
+
+// ── Off-trie PerpState (journal perp section) integration ────────────────────
+
+#[test]
+fn perp_data_stays_off_trie_not_in_evm_state() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    // A resting buy order writes order, book level, best-bid, etc. — all perp blobs.
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    // Perp writes are captured in the off-trie delta...
+    let delta = ctx.journal_mut().take_perp_delta();
+    assert!(!delta.is_empty(), "perp writes must land in the off-trie delta");
+
+    // ...while the trie-bound EvmState carries NO storage slots under PERP_DEX_ADDRESS
+    // (the orderbook no longer lives in the state trie).
+    let state = ctx.journal_mut().finalize();
+    let perp_trie_slots = state
+        .get(&PERP_DEX_ADDRESS)
+        .map(|acc| acc.storage.len())
+        .unwrap_or(0);
+    assert_eq!(perp_trie_slots, 0, "perp data must not be in the state trie");
+}
+
+#[test]
+fn reverted_subcall_leaves_no_perp_residue() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    // Snapshot before the (to-be-reverted) sub-call.
+    let cp = ctx.journal_mut().checkpoint();
+    let order_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+    assert!(
+        storage::load_order(&mut ctx, &order_id).unwrap().is_some(),
+        "order should exist after placing"
+    );
+
+    // Revert the sub-call: the placed order must vanish — the perp overlay reverts in
+    // lock-step with the EVM journal.
+    ctx.journal_mut().checkpoint_revert(cp);
+    assert!(
+        storage::load_order(&mut ctx, &order_id).unwrap().is_none(),
+        "reverted sub-call must leave no perp residue"
+    );
+}

@@ -228,3 +228,37 @@ fn get_account_clamps_negative_perp_wallet_to_zero() {
     let (_usdc, perp) = decode_get_account(&ret);
     assert_eq!(perp, 0);
 }
+
+/// A deposit writes the USDC ERC-20 balance (on-trie, EVM journal) AND the internal perp
+/// account (off-trie, perp section). Reverting the surrounding checkpoint must roll BOTH
+/// back in lock-step — the one place the EVM journal and the perp undo log must agree.
+#[test]
+fn deposit_revert_rolls_back_both_on_trie_and_off_trie() {
+    let amount = U256::from(1_000_000u64);
+    let mut ctx = make_ctx(amount); // ALICE holds `amount` USDC (ERC-20, on-trie)
+
+    let cp = ctx.journal_mut().checkpoint();
+    run_deposit(&depositCall { amount }.abi_encode(), ALICE, &mut ctx).unwrap();
+
+    // After deposit: internal perp account credited (off-trie), ERC-20 balance drained (on-trie).
+    let (usdc_internal, _) =
+        decode_get_account(&run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap());
+    assert_eq!(usdc_internal, amount);
+    assert_eq!(
+        storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, ALICE).unwrap(),
+        U256::ZERO
+    );
+
+    // Revert the whole call under one checkpoint.
+    ctx.journal_mut().checkpoint_revert(cp);
+
+    // Both stores roll back together.
+    let (usdc_internal_after, _) =
+        decode_get_account(&run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap());
+    assert_eq!(usdc_internal_after, U256::ZERO, "off-trie internal balance must revert");
+    assert_eq!(
+        storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, ALICE).unwrap(),
+        amount,
+        "on-trie ERC-20 balance must revert"
+    );
+}

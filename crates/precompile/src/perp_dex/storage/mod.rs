@@ -8,14 +8,12 @@ use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    journal::{load_bytes, store_bytes},
     perp_dex::{
         errors::perp_err,
         types::{
             ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, Order, OrderEntry,
             PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount, UserFeeRates,
         },
-        PERP_DEX_ADDRESS,
     },
     stateful_precompiles::convert_db_err,
     PrecompileError,
@@ -45,16 +43,30 @@ fn decode<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<T, PrecompileError
     Deserialize::deserialize(&mut de).map_err(|_| perp_err("msgpack decode error"))
 }
 
+/// Reads an off-trie PerpDEX blob ("PerpState").
+///
+/// Returns the in-block overlay value if the key was written during this block, otherwise the
+/// committed off-trie store. This replaces the previous chunked `sstore`/`sload` blob, which
+/// lived in the state trie under `PERP_DEX_ADDRESS`; perp data now rides the journal's perp
+/// section instead, so it gets the same revert lifecycle but never enters the state root.
+/// See `docs/perpstate-journal集成方案.md` §4.2.
 fn load_blob<CTX: ContextTr>(context: &mut CTX, key: B256) -> Result<Vec<u8>, PrecompileError> {
-    load_bytes(context, PERP_DEX_ADDRESS, key)
+    context
+        .journal_mut()
+        .perp_load(key)
+        .map_err(convert_db_err::<CTX::Db>)
 }
 
+/// Writes an off-trie PerpDEX blob. An empty `buf` marks the key absent. The write is journaled
+/// in the perp section (reverts in lock-step with the surrounding checkpoint / `discard_tx`) and
+/// is never folded into the trie-bound `EvmState`.
 fn store_blob<CTX: ContextTr>(
     context: &mut CTX,
     key: B256,
     buf: &[u8],
 ) -> Result<(), PrecompileError> {
-    store_bytes(context, PERP_DEX_ADDRESS, key, buf)
+    context.journal_mut().perp_store(key, buf.to_vec());
+    Ok(())
 }
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
