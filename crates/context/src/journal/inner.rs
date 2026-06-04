@@ -286,9 +286,16 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         logs.clear();
         transient_storage.clear();
 
-        // Reset the perp overlay too. Perp data leaves the journal via `take_perp_delta`,
-        // never folded into the returned `EvmState` — so it never enters the state trie.
-        perp.working.clear();
+        // Perp data leaves the journal via `take_perp_delta`, never folded into the returned
+        // `EvmState`, so it never enters the state trie.
+        //
+        // Crucially, do NOT clear `perp.working` here. `finalize` runs once PER TRANSACTION in
+        // block execution — alloy-evm's block executor calls `transact` (= `transact_one` +
+        // `finalize`) for every tx — whereas the perp overlay is BLOCK-scoped: it must accumulate
+        // across the block's transactions until the end-of-block `take_perp_delta` harvest drains
+        // it into the canonical off-trie store. Clearing it here dropped every committed tx's perp
+        // write before it could be harvested (canonical_perp stayed empty forever). Only the
+        // tx-scoped undo log is reset, mirroring `commit_tx`, which already keeps `working`.
         perp.undo.clear();
 
         // clear journal and journal history.
@@ -1102,14 +1109,39 @@ mod perp_tests {
     }
 
     #[test]
-    fn finalize_excludes_perp_and_resets_it() {
+    fn finalize_excludes_perp_from_state_but_preserves_block_overlay() {
         let mut j = new_inner();
         j.perp_store(k(1), vec![7]);
         let state = j.finalize();
-        // Perp data is NOT folded into the returned EvmState (it stays off the trie).
+        // Perp data is NOT folded into the returned EvmState (it stays off the trie)...
         assert!(state.is_empty());
-        assert!(j.perp.working.is_empty());
+        // ...but `finalize` runs PER TX in block execution, so it must NOT wipe the block-scoped
+        // overlay; the write survives for the end-of-block `take_perp_delta` harvest.
+        assert_eq!(j.perp.get(k(1)), Some(&[7u8][..]));
+        // The tx-scoped undo log is still reset.
         assert!(j.perp.undo.is_empty());
+    }
+
+    /// Regression for the canonical_perp persistence bug: the block executor runs
+    /// `transact` (= `transact_one` + `finalize`) per tx, so perp writes must accumulate across
+    /// per-tx `finalize` calls and be harvested by the block-end `take_perp_delta` — otherwise a
+    /// committed `initAdmin` write is dropped and every later reader sees an empty store.
+    #[test]
+    fn perp_writes_survive_per_tx_finalize_until_block_harvest() {
+        let mut j = new_inner();
+        // tx 1: write admin, then finalize (as `transact` does after the handler's commit_tx).
+        j.perp_store(k(1), vec![0xAA]);
+        let _ = j.finalize();
+        // tx 2: write a market, then finalize.
+        j.perp_store(k(2), vec![0xBB]);
+        let _ = j.finalize();
+        // End of block: harvest. Both committed writes must be present.
+        let delta = j.take_perp_delta();
+        assert_eq!(delta.get(&k(1)), Some(&vec![0xAAu8]));
+        assert_eq!(delta.get(&k(2)), Some(&vec![0xBBu8]));
+        assert_eq!(delta.len(), 2);
+        // Drained after harvest.
+        assert!(j.perp.working.is_empty());
     }
 
     #[test]
