@@ -39,6 +39,7 @@ const PFX_LAST_TRADED: &[u8] = b"ltrd"; // per-market last traded price (contrac
 const PFX_FUNDING_STATE: &[u8] = b"fund"; // per-market FundingState
 const PFX_PREMIUM_ACCUMULATOR: &[u8] = b"pacc"; // per-market PremiumIndexAccumulator
 const PFX_INSURANCE_FUND: &[u8] = b"infd"; // global insurance fund balance
+const PFX_COMMITMENT: &[u8] = b"cmit"; // global on-trie commitment over the off-trie perp write-stream
 
 // ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
 
@@ -54,6 +55,14 @@ pub fn erc20_balance_slot(account: Address) -> B256 {
     buf[12..32].copy_from_slice(account.as_slice()); // left-pad address to 32 bytes
                                                      // buf[32..64] stays zero → mapping at slot 0
     keccak256(buf)
+}
+
+/// Global on-trie storage slot under 0x1003 holding the chained keccak commitment over the
+/// off-trie PerpState write-stream. It is anchored ON the state trie (a normal account-storage
+/// slot, distinct from the off-trie B256 domain keys and from the erc20 balance slots) so that
+/// any perp-write divergence surfaces in the state root and is detected by consensus.
+pub fn commitment_slot() -> B256 {
+    keccak256(PFX_COMMITMENT)
 }
 
 // ── Admin ─────────────────────────────────────────────────────────────────
