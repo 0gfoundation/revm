@@ -3,10 +3,11 @@
 pub mod keys;
 
 use context::{ContextTr, JournalTr};
-use primitives::{Address, B256, U256};
+use primitives::{keccak256, Address, B256, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
 
+use crate::perp_dex::PERP_DEX_ADDRESS;
 use crate::{
     perp_dex::{
         errors::perp_err,
@@ -21,7 +22,7 @@ use crate::{
 
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
-    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, erc20_balance_slot,
+    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, commitment_slot, erc20_balance_slot,
     funding_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
     last_traded_price_key, mark_price_key, market_fee_total_key, market_key, market_manager_key,
     open_interest_key, oracle_key, order_key, position_key, premium_accumulator_key,
@@ -66,6 +67,38 @@ fn store_blob<CTX: ContextTr>(
     buf: &[u8],
 ) -> Result<(), PrecompileError> {
     context.journal_mut().perp_store(key, buf.to_vec());
+
+    // Global chained commitment over the off-trie perp write-stream, anchored ON-trie under
+    // 0x1003 so divergence surfaces in the state root (consensus-detectable). Folds EVERY write
+    // (incl. empty-buf deletes) in execution order: C = keccak256(C ‖ key ‖ buf). This is a
+    // normal on-trie sstore (journaled → reverts with the tx); the bulk blob stays off-trie.
+    let slot = commitment_slot();
+    // Ensure 0x1003 is loaded into journal state before sload (sload panics on an absent
+    // account). 0x1003 is the precompile's own call target so it is normally pre-loaded, but
+    // warm it explicitly to mirror the erc20 path and stay robust.
+    context
+        .journal_mut()
+        .warm_account(PERP_DEX_ADDRESS)
+        .map_err(convert_db_err::<CTX::Db>)?;
+    let c_old = context
+        .journal_mut()
+        .sload(PERP_DEX_ADDRESS, slot.into())
+        .map_err(convert_db_err::<CTX::Db>)?
+        .data;
+    let mut preimage = Vec::with_capacity(64 + buf.len());
+    preimage.extend_from_slice(&c_old.to_be_bytes::<32>());
+    preimage.extend_from_slice(key.as_slice());
+    preimage.extend_from_slice(buf);
+    let c_new = keccak256(&preimage);
+    context
+        .journal_mut()
+        .sstore(PERP_DEX_ADDRESS, slot.into(), c_new.into())
+        .map_err(convert_db_err::<CTX::Db>)?;
+    // Mark 0x1003 as touched so its commitment-slot change is included in the BundleState
+    // transition. Without this, apply_account_state() skips untouched accounts and the sstore is
+    // silently dropped from the DB commit — and a normal perp tx does NOT otherwise touch
+    // 0x1003's on-trie storage (its perp writes are off-trie). Mirrors save_erc20_balance.
+    context.journal_mut().touch_account(PERP_DEX_ADDRESS);
     Ok(())
 }
 
@@ -890,4 +923,67 @@ pub fn save_premium_accumulator<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let buf = encode(acc)?;
     store_blob(context, premium_accumulator_key(market_id), &buf)
+}
+
+#[cfg(test)]
+mod commitment_tests {
+    use super::*;
+    use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
+    use database::InMemoryDB;
+    use primitives::hardfork::SpecId;
+
+    type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
+
+    /// Mirror of `perp_dex::trading::tests::make_ctx`: build a journal-backed context and warm the
+    /// PERP_DEX account so the on-trie commitment sload/sstore have an account to operate on.
+    fn new_test_ctx() -> TestCtx {
+        let db = InMemoryDB::default();
+        let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
+        JournalTr::load_account(ctx.journal_mut(), PERP_DEX_ADDRESS).unwrap();
+        ctx
+    }
+
+    fn read_commitment<CTX: ContextTr>(ctx: &mut CTX) -> U256 {
+        ctx.journal_mut()
+            .sload(PERP_DEX_ADDRESS, commitment_slot().into())
+            .unwrap()
+            .data
+    }
+
+    fn expect_chain(prev: U256, key: B256, blob: &[u8]) -> U256 {
+        let mut p = Vec::new();
+        p.extend_from_slice(&prev.to_be_bytes::<32>());
+        p.extend_from_slice(key.as_slice());
+        p.extend_from_slice(blob);
+        U256::from_be_bytes(keccak256(&p).0)
+    }
+
+    #[test]
+    fn commitment_chains_over_writes() {
+        let mut ctx = new_test_ctx();
+        assert_eq!(read_commitment(&mut ctx), U256::ZERO); // genesis init = 0
+
+        let (k1, b1) = (B256::with_last_byte(1), vec![0xAAu8]);
+        let (k2, b2) = (B256::with_last_byte(2), vec![0xBBu8, 0xCC]);
+        store_blob(&mut ctx, k1, &b1).unwrap();
+        let c1 = expect_chain(U256::ZERO, k1, &b1);
+        assert_eq!(read_commitment(&mut ctx), c1);
+        store_blob(&mut ctx, k2, &b2).unwrap();
+        let c2 = expect_chain(c1, k2, &b2);
+        assert_eq!(read_commitment(&mut ctx), c2);
+        assert_ne!(c2, c1);
+    }
+
+    #[test]
+    fn commitment_rolls_back_on_revert() {
+        let mut ctx = new_test_ctx();
+        store_blob(&mut ctx, B256::with_last_byte(1), &[0xAA]).unwrap();
+        let before = read_commitment(&mut ctx);
+
+        let cp = ctx.journal_mut().checkpoint();
+        store_blob(&mut ctx, B256::with_last_byte(2), &[0xBB]).unwrap();
+        assert_ne!(read_commitment(&mut ctx), before);
+        ctx.journal_mut().checkpoint_revert(cp);
+        assert_eq!(read_commitment(&mut ctx), before); // reverted write's commitment update rolled back
+    }
 }
