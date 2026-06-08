@@ -480,6 +480,9 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     let market = storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("removePositionMargin: unknown market"))?;
     let mark_price = storage::load_mark_price(context, args.marketId)?;
+    if mark_price == 0 {
+        return Err(perp_err("removePositionMargin: mark price unavailable"));
+    }
 
     let mut pos = storage::load_position(context, caller, args.marketId)?;
     if pos.amount == 0 {
@@ -504,6 +507,23 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     if new_margin < required_initial_margin {
         return Err(perp_err(
             "removePositionMargin: resulting margin below initial margin requirement",
+        ));
+    }
+    // Reject if removing this margin would push the position to/under the
+    // maintenance-margin threshold (i.e. make it immediately liquidatable).
+    // Unlike the initial-margin check above, this accounts for unrealized PnL
+    // (`v_quote_balance`), so collateral cannot be stripped from a position
+    // that is sliding underwater.
+    if !is_above_maintenance_margin(
+        mark_price,
+        pos.amount,
+        pos.v_quote_balance,
+        new_margin,
+        market.base_decimals,
+        market.price_decimals,
+    )? {
+        return Err(perp_err(
+            "removePositionMargin: resulting position below maintenance margin",
         ));
     }
 
@@ -535,6 +555,13 @@ pub fn run_liquidate<CTX: ContextTr>(
     let market = storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("liquidate: unknown market"))?;
     let mark_price = storage::load_mark_price(context, args.marketId)?;
+    if mark_price == 0 {
+        // A market that never received an oracle price would make the
+        // maintenance-margin gate degenerate (notional and threshold both 0),
+        // so solvency would be judged on the sign of `v_quote + margin` alone.
+        // Refuse to liquidate without a real mark price.
+        return Err(perp_err("liquidate: mark price unavailable"));
+    }
     let pos = storage::load_position(context, args.user, args.marketId)?;
 
     if pos.amount == 0 {

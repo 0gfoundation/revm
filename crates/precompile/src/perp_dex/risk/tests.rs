@@ -610,6 +610,55 @@ fn remove_position_margin_rejects_below_initial_margin_requirement() {
 }
 
 #[test]
+fn remove_position_margin_rejects_when_result_below_maintenance() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // Long 10 @ $100, margin $200, leverage 5.
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    // Mark drops to $90 → position carries a $100 unrealized loss.
+    storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
+
+    // Removing $20 passes the (PnL-blind) initial-margin check — new margin
+    // $180 == notional($900)/leverage(5) — but leaves equity at
+    // 900 − 1000 + 180 = $80, below the maintenance threshold $900/6 = $150.
+    // The PnL-aware maintenance check must reject it.
+    let err = remove_position_margin(&mut ctx, 20_000_000).unwrap_err();
+    assert!(
+        err.to_string().contains("below maintenance margin"),
+        "{err}"
+    );
+    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET);
+    assert_eq!(position(&mut ctx, ALICE).margin, MARGIN);
+}
+
+#[test]
+fn remove_position_margin_rejects_when_mark_price_unset() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    // Market with no oracle price yet: mark price 0 must not be usable.
+    storage::save_mark_price(&mut ctx, MARKET_ID, 0).unwrap();
+
+    let err = remove_position_margin(&mut ctx, 10_000_000).unwrap_err();
+    assert!(err.to_string().contains("mark price unavailable"), "{err}");
+    assert_eq!(position(&mut ctx, ALICE).margin, MARGIN);
+}
+
+#[test]
+fn liquidate_rejects_when_mark_price_unset() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    // Without a mark price the maintenance gate degenerates and would wrongly
+    // treat a healthy position as bankrupt; liquidation must refuse instead.
+    storage::save_mark_price(&mut ctx, MARKET_ID, 0).unwrap();
+
+    let err = liquidate(&mut ctx, ALICE).unwrap_err();
+    assert!(err.to_string().contains("mark price unavailable"), "{err}");
+    assert_eq!(position(&mut ctx, ALICE).amount, QTY);
+}
+
+#[test]
 fn liquidate_long_sells_full_position_into_bids() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);

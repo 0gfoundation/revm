@@ -1185,14 +1185,22 @@ fn perp_data_stays_off_trie_not_in_evm_state() {
     let delta = ctx.journal_mut().take_perp_delta();
     assert!(!delta.is_empty(), "perp writes must land in the off-trie delta");
 
-    // ...while the trie-bound EvmState carries NO storage slots under PERP_DEX_ADDRESS
-    // (the orderbook no longer lives in the state trie).
+    // ...while the trie-bound EvmState carries only the single chained
+    // commitment anchor under 0x1003 (keccak256("cmit"), commit a7b0699d). The
+    // bulk perp data (orders, book levels, best-bid, …) lives off-trie and
+    // never enters the state root.
     let state = ctx.journal_mut().finalize();
-    let perp_trie_slots = state
-        .get(&PERP_DEX_ADDRESS)
-        .map(|acc| acc.storage.len())
-        .unwrap_or(0);
-    assert_eq!(perp_trie_slots, 0, "perp data must not be in the state trie");
+    let perp_storage = state.get(&PERP_DEX_ADDRESS).map(|acc| &acc.storage);
+    let slot_count = perp_storage.map(|s| s.len()).unwrap_or(0);
+    assert_eq!(
+        slot_count, 1,
+        "only the on-trie commitment anchor may live in the state trie"
+    );
+    let commitment = U256::from_be_bytes(storage::keys::commitment_slot().0);
+    assert!(
+        perp_storage.unwrap().contains_key(&commitment),
+        "the sole on-trie perp slot must be the commitment anchor"
+    );
 }
 
 #[test]
