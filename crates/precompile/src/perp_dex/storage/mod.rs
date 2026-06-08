@@ -987,3 +987,121 @@ mod commitment_tests {
         assert_eq!(read_commitment(&mut ctx), before); // reverted write's commitment update rolled back
     }
 }
+
+/// Forward-compatibility: blobs written under an older schema (missing a field
+/// that was later appended) must still decode, defaulting the absent field —
+/// not hard-fail with "msgpack decode error". This pins the `#[serde(default)]`
+/// on later-added fields in `types/` so it cannot be silently dropped.
+#[cfg(test)]
+mod forward_compat_tests {
+    use super::*;
+    use crate::perp_dex::types::{Market, OrderEntry, PerpPosition};
+    use serde::Serialize;
+
+    #[test]
+    fn legacy_position_blob_without_fee_reserved_decodes() {
+        // PerpPosition as it existed before the "fr" (fee_reserved) field.
+        #[derive(Serialize)]
+        struct LegacyPerpPosition {
+            #[serde(rename = "a")]
+            amount: i64,
+            #[serde(rename = "v")]
+            v_quote_balance: i64,
+            #[serde(rename = "m")]
+            margin: i64,
+            #[serde(rename = "mr")]
+            margin_reserved: u64,
+            #[serde(rename = "mrn")]
+            margin_reserved_notional: u64,
+            #[serde(rename = "br")]
+            buy_side_margin_reserved: u64,
+            #[serde(rename = "brn")]
+            buy_side_reserved_notional: u64,
+            #[serde(rename = "sr")]
+            sell_side_margin_reserved: u64,
+            #[serde(rename = "srn")]
+            sell_side_reserved_notional: u64,
+            // no "fr" / fee_reserved
+            #[serde(rename = "lv")]
+            leverage: u64,
+        }
+
+        let buf = encode(&LegacyPerpPosition {
+            amount: 5,
+            v_quote_balance: -100,
+            margin: 20,
+            margin_reserved: 1,
+            margin_reserved_notional: 2,
+            buy_side_margin_reserved: 3,
+            buy_side_reserved_notional: 4,
+            sell_side_margin_reserved: 5,
+            sell_side_reserved_notional: 6,
+            leverage: 7,
+        })
+        .unwrap();
+
+        let pos: PerpPosition = decode(&buf).unwrap();
+        assert_eq!(pos.amount, 5);
+        assert_eq!(pos.leverage, 7);
+        assert_eq!(pos.fee_reserved, 0, "missing fee_reserved must default to 0");
+    }
+
+    #[test]
+    fn legacy_order_entry_without_maker_fee_bps_decodes() {
+        // OrderEntry as it existed before the "MFB" (maker_fee_bps) field.
+        #[derive(Serialize)]
+        struct LegacyOrderEntry {
+            order_id: [u8; 32],
+            price: u64,
+            amount: u64,
+            // no "MFB" / maker_fee_bps
+        }
+
+        let buf = encode(&LegacyOrderEntry {
+            order_id: [1u8; 32],
+            price: 100,
+            amount: 9,
+        })
+        .unwrap();
+
+        let entry: OrderEntry = decode(&buf).unwrap();
+        assert_eq!(entry.price, 100);
+        assert_eq!(entry.amount, 9);
+        assert_eq!(
+            entry.maker_fee_bps, 0,
+            "missing maker_fee_bps must default to 0"
+        );
+    }
+
+    #[test]
+    fn legacy_market_blob_without_added_fields_decodes() {
+        // Market with only its original (no-default) fields; everything added
+        // later (price_decimals, max_*, price_update_interval, funding, …) absent.
+        #[derive(Serialize)]
+        struct LegacyMarket {
+            market_id: u64,
+            base_decimals: u32,
+            tick_size: u64,
+            step_size: u64,
+            min_quantity: u64,
+            active: bool,
+        }
+
+        let buf = encode(&LegacyMarket {
+            market_id: 1,
+            base_decimals: 8,
+            tick_size: 1,
+            step_size: 1,
+            min_quantity: 1,
+            active: true,
+        })
+        .unwrap();
+
+        let market: Market = decode(&buf).unwrap();
+        assert_eq!(market.market_id, 1);
+        assert_eq!(market.base_decimals, 8);
+        assert_eq!(market.price_decimals, 0);
+        assert_eq!(market.max_price, 0);
+        assert_eq!(market.price_update_interval, 0);
+    }
+}

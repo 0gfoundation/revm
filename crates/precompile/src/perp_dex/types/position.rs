@@ -39,11 +39,16 @@ pub struct PerpPosition {
     #[serde(default, rename = "srn")]
     pub sell_side_reserved_notional: u64,
     /// Total maker fee reserved for open orders (buy side + sell side).
-    #[serde(rename = "fr")]
+    #[serde(default, rename = "fr")]
     pub fee_reserved: u64,
     /// Current leverage setting (1–20).
     #[serde(rename = "lv")]
     pub leverage: u64,
+    /// Cumulative funding index at this position's last funding settlement.
+    /// Funding owed = `amount × (market cumulative_funding_index − this)`,
+    /// settled lazily on every position-touching op. See the `funding` module.
+    #[serde(default, rename = "fi")]
+    pub last_funding_index: i128,
 }
 
 impl Default for PerpPosition {
@@ -60,6 +65,7 @@ impl Default for PerpPosition {
             sell_side_reserved_notional: 0,
             fee_reserved: 0,
             leverage: 1,
+            last_funding_index: 0,
         }
     }
 }
@@ -73,6 +79,7 @@ pub struct Market {
     /// Decimal places for the base asset (e.g. 8 for BTC).
     pub base_decimals: u32,
     /// Decimal places for price representation (e.g. 2 for BTC at $0.01 precision, 18 for meme coins).
+    #[serde(default)]
     pub price_decimals: u32,
     /// Minimum price increment (price_decimals fixed-point units).
     pub tick_size: u64,
@@ -81,10 +88,13 @@ pub struct Market {
     /// Minimum order quantity.
     pub min_quantity: u64,
     /// Maximum order quantity (bounds calc_value to prevent u128 overflow).
+    #[serde(default)]
     pub max_quantity: u64,
     /// Maximum order price (price_decimals fixed-point units).
+    #[serde(default)]
     pub max_price: u64,
     /// Oracle index price update cadence in seconds.
+    #[serde(default)]
     pub price_update_interval: u64,
     /// Whether the market accepts new orders.
     pub active: bool,

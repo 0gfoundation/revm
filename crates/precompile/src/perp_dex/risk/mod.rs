@@ -9,6 +9,7 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 use crate::{
     perp_dex::{
         errors::perp_err,
+        funding::settle_position_funding,
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall,
             getAdminCall, getAveragePremiumIndexCall, getAveragePremiumIndexReturn,
@@ -438,7 +439,7 @@ pub fn run_add_position_margin<CTX: ContextTr>(
         return Err(perp_err("addPositionMargin: amount must be > 0"));
     }
     let amount = checked_u64_to_i64(args.amount, "addPositionMargin: amount")?;
-    storage::load_market(context, args.marketId)?
+    let market = storage::load_market(context, args.marketId)?
         .ok_or_else(|| perp_err("addPositionMargin: unknown market"))?;
 
     let mut pos = storage::load_position(context, caller, args.marketId)?;
@@ -446,6 +447,8 @@ pub fn run_add_position_margin<CTX: ContextTr>(
         return Err(perp_err("addPositionMargin: no open position"));
     }
     let mut account = storage::load_account(context, caller)?;
+    // Settle accrued funding before touching the position.
+    settle_position_funding(context, caller, &market, &mut pos, &mut account.perp_wallet_balance)?;
     if !account.has_available_perp(args.amount) {
         return Err(perp_err(
             "addPositionMargin: insufficient perp wallet balance",
@@ -488,6 +491,9 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     if pos.amount == 0 {
         return Err(perp_err("removePositionMargin: no open position"));
     }
+    let mut account = storage::load_account(context, caller)?;
+    // Settle accrued funding first so the checks below see post-funding margin.
+    settle_position_funding(context, caller, &market, &mut pos, &mut account.perp_wallet_balance)?;
     if pos.margin < amount {
         return Err(perp_err(
             "removePositionMargin: insufficient position margin",
@@ -527,7 +533,6 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
         ));
     }
 
-    let mut account = storage::load_account(context, caller)?;
     account.credit_perp(args.amount)?;
     pos.margin = new_margin;
 
@@ -562,11 +567,25 @@ pub fn run_liquidate<CTX: ContextTr>(
         // Refuse to liquidate without a real mark price.
         return Err(perp_err("liquidate: mark price unavailable"));
     }
-    let pos = storage::load_position(context, args.user, args.marketId)?;
+    let mut pos = storage::load_position(context, args.user, args.marketId)?;
 
     if pos.amount == 0 {
         return Err(perp_err("liquidate: no open position"));
     }
+    // Settle accrued funding on the liquidated position first, so the charge
+    // counts toward insolvency and is realised before the position is closed.
+    {
+        let mut account = storage::load_account(context, args.user)?;
+        settle_position_funding(
+            context,
+            args.user,
+            &market,
+            &mut pos,
+            &mut account.perp_wallet_balance,
+        )?;
+        storage::save_account(context, args.user, account)?;
+    }
+    storage::save_position(context, args.user, args.marketId, &pos)?;
     if is_above_maintenance_margin(
         mark_price,
         pos.amount,
@@ -1221,6 +1240,15 @@ pub fn run_update_index_price<CTX: ContextTr>(
             let sample_count = acc.sample_count;
 
             funding.last_funding_rate = rate;
+            // Fold this epoch's funding into the cumulative index so positions
+            // can settle lazily against the delta since their last touch.
+            let index_step = (mark_price as i128)
+                .checked_mul(rate as i128)
+                .ok_or_else(|| perp_err("updateIndexPrice: funding index step overflow"))?;
+            funding.cumulative_funding_index = funding
+                .cumulative_funding_index
+                .checked_add(index_step)
+                .ok_or_else(|| perp_err("updateIndexPrice: funding index overflow"))?;
             while funding.next_funding_ts <= effective_timestamp {
                 funding.next_funding_ts = funding
                     .next_funding_ts

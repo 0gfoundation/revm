@@ -64,6 +64,7 @@ use crate::{
 
 pub mod account;
 pub mod errors;
+pub mod funding;
 pub mod interface;
 pub mod math;
 pub mod risk;

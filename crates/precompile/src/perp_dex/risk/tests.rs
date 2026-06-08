@@ -9,9 +9,11 @@ use crate::perp_dex::{
         addPositionMarginCall, liquidateCall, placeOrderCall, removePositionMarginCall,
         setLeverageCall, updateIndexPriceCall,
     },
+    funding::settle_position_funding,
     trading::run_place_order,
     types::{
-        IndexPriceHistory, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount,
+        FundingState, IndexPriceHistory, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
+        UserAccount,
     },
     USDC_ADDRESS,
 };
@@ -201,6 +203,168 @@ fn funding_epoch_jump_computes_once_and_advances_next_ts_to_future() {
     assert_eq!(acc.sample_count, 1);
     assert_eq!(acc.epoch_start_ts, 60);
     assert_eq!(acc.last_sample_ts, 60);
+}
+
+#[test]
+fn funding_index_accumulates_mark_times_rate_at_epoch_boundary() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    market.funding_interval = 15;
+    market.interest_rate = 100; // non-zero so the computed rate != 0 even when mark == index
+    storage::save_market(&mut ctx, &market).unwrap();
+
+    // First update starts the epoch; no rate computed yet, index untouched.
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 16,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(
+        storage::load_funding_state(&mut ctx, MARKET_ID)
+            .unwrap()
+            .cumulative_funding_index,
+        0
+    );
+
+    // Second update crosses the funding boundary → one rate computed → the
+    // index folds `mark_price * rate` exactly once.
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 61,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let funding = storage::load_funding_state(&mut ctx, MARKET_ID).unwrap();
+    let mark = storage::load_mark_price(&mut ctx, MARKET_ID).unwrap();
+    assert_ne!(
+        funding.last_funding_rate, 0,
+        "precondition: rate must be non-zero to exercise accumulation"
+    );
+    assert_eq!(
+        funding.cumulative_funding_index,
+        mark as i128 * funding.last_funding_rate as i128
+    );
+}
+
+fn set_funding_index(ctx: &mut TestCtx, index: i128) {
+    storage::save_funding_state(
+        ctx,
+        MARKET_ID,
+        &FundingState {
+            last_funding_rate: 100,
+            next_funding_ts: 0,
+            cumulative_funding_index: index,
+        },
+    )
+    .unwrap();
+}
+
+fn settle_alice_funding(ctx: &mut TestCtx) -> (PerpPosition, UserAccount) {
+    let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+    let mut pos = storage::load_position(ctx, ALICE, MARKET_ID).unwrap();
+    let mut account = storage::load_account(ctx, ALICE).unwrap();
+    settle_position_funding(ctx, ALICE, &market, &mut pos, &mut account.perp_wallet_balance).unwrap();
+    (pos, account)
+}
+
+#[test]
+fn settle_funding_long_pays_from_wallet() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx); // ALICE wallet = USER_WALLET = 50_000_000
+    set_funding_index(&mut ctx, 75_000_000); // charge for QTY long = 7_500_000
+    save_position(&mut ctx, QTY, -ENTRY_VALUE); // anchor defaults to 0
+
+    let (pos, account) = settle_alice_funding(&mut ctx);
+
+    assert_eq!(account.perp_wallet_balance, USER_WALLET as i64 - 7_500_000);
+    assert_eq!(pos.margin, MARGIN, "wallet covered the charge; margin untouched");
+    assert_eq!(pos.last_funding_index, 75_000_000, "re-anchored to index");
+}
+
+#[test]
+fn settle_funding_short_receives_into_wallet() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_funding_index(&mut ctx, 75_000_000);
+    save_position(&mut ctx, -QTY, ENTRY_VALUE); // short receives when rate > 0
+
+    let (pos, account) = settle_alice_funding(&mut ctx);
+
+    assert_eq!(account.perp_wallet_balance, USER_WALLET as i64 + 7_500_000);
+    assert_eq!(pos.margin, MARGIN);
+}
+
+#[test]
+fn settle_funding_charge_waterfalls_wallet_then_margin() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_funding_index(&mut ctx, 600_000_000); // charge = 60_000_000 > wallet 50M
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+
+    let (pos, account) = settle_alice_funding(&mut ctx);
+
+    assert_eq!(account.perp_wallet_balance, 0, "wallet drained to 0 first");
+    assert_eq!(pos.margin, MARGIN - 10_000_000, "remainder taken from margin");
+}
+
+#[test]
+fn settle_funding_charge_beyond_margin_absorbs_from_insurance_fund() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
+    set_funding_index(&mut ctx, 3_000_000_000); // charge = 300M > wallet 50M + margin 200M
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+
+    let (pos, account) = settle_alice_funding(&mut ctx);
+
+    assert_eq!(account.perp_wallet_balance, 0);
+    assert_eq!(pos.margin, 0);
+    // 50M shortfall absorbed from the 80M insurance fund → 30M left.
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 30_000_000);
+}
+
+#[test]
+fn settle_funding_emits_funding_settled_event() {
+    use alloy_sol_types::SolEvent;
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_funding_index(&mut ctx, 75_000_000);
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+
+    let _ = settle_alice_funding(&mut ctx);
+
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    let topic = crate::perp_dex::interface::IPerpDex::FundingSettled::SIGNATURE_HASH;
+    assert!(
+        logs.iter().any(|l| l.data.topics().first() == Some(&topic)),
+        "a FundingSettled event must be emitted on a non-zero funding settlement"
+    );
+}
+
+#[test]
+fn settle_funding_noop_for_flat_position_but_reanchors() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_funding_index(&mut ctx, 75_000_000);
+    save_position(&mut ctx, 0, 0); // flat → no funding owed
+
+    let (pos, account) = settle_alice_funding(&mut ctx);
+
+    assert_eq!(account.perp_wallet_balance, USER_WALLET as i64, "no charge on a flat position");
+    assert_eq!(pos.last_funding_index, 75_000_000, "still re-anchored");
 }
 
 #[test]
@@ -656,6 +820,68 @@ fn liquidate_rejects_when_mark_price_unset() {
     let err = liquidate(&mut ctx, ALICE).unwrap_err();
     assert!(err.to_string().contains("mark price unavailable"), "{err}");
     assert_eq!(position(&mut ctx, ALICE).amount, QTY);
+}
+
+#[test]
+fn remove_position_margin_settles_pending_funding_first() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_funding_index(&mut ctx, 75_000_000); // charge 7.5M for a QTY long
+    // Long with excess margin so a 50M removal is allowed after funding.
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY,
+            v_quote_balance: -ENTRY_VALUE,
+            margin: 400_000_000,
+            leverage: 5,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+
+    remove_position_margin(&mut ctx, 50_000_000).unwrap();
+
+    let pos = position(&mut ctx, ALICE);
+    // Funding (7.5M) charged from wallet first, then 50M margin returned to wallet.
+    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET - 7_500_000 + 50_000_000);
+    assert_eq!(pos.margin, 350_000_000);
+    assert_eq!(pos.last_funding_index, 75_000_000);
+}
+
+#[test]
+fn add_position_margin_settles_pending_funding_first() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_funding_index(&mut ctx, 75_000_000); // charge 7.5M for a QTY long
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+
+    add_position_margin(&mut ctx, 10_000_000).unwrap();
+
+    let pos = position(&mut ctx, ALICE);
+    // 7.5M funding charged from wallet, then 10M moved wallet → margin.
+    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET - 7_500_000 - 10_000_000);
+    assert_eq!(pos.margin, MARGIN + 10_000_000);
+    assert_eq!(pos.last_funding_index, 75_000_000);
+}
+
+#[test]
+fn liquidate_settles_funding_into_insolvency() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // Healthy long at mark $100 (equity 200M > maintenance 166.7M), but a large
+    // pending funding charge wipes margin and pushes it under maintenance.
+    set_funding_index(&mut ctx, 1_200_000_000); // charge = 120M > wallet 50M
+    save_position(&mut ctx, QTY, -ENTRY_VALUE); // wallet 50M, margin 200M
+    place_maker_order(&mut ctx, Side::Buy as u8, ENTRY_PRICE, QTY as u64);
+
+    // Without funding settlement this position is above maintenance and would
+    // be rejected; funding must be applied first so liquidation proceeds.
+    liquidate(&mut ctx, ALICE).unwrap();
+
+    assert_eq!(position(&mut ctx, ALICE).amount, 0, "position fully liquidated");
 }
 
 #[test]

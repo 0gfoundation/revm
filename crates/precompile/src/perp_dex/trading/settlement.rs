@@ -143,6 +143,14 @@ impl TakerSettlement {
 
         let mut pos = storage::load_position(context, self.user, self.market_id)?;
         let mut account = storage::load_account(context, self.user)?;
+        // Settle accrued funding on the pre-fill position before its size changes.
+        crate::perp_dex::funding::settle_position_funding(
+            context,
+            self.user,
+            market,
+            &mut pos,
+            &mut account.perp_wallet_balance,
+        )?;
         let mut remaining_closing_qty = pos.amount.unsigned_abs();
         let mut closing_qty = 0u64;
         let mut closing_value = 0u64;
@@ -312,6 +320,14 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     let maker_side = taker_side.opposite();
     let mut pos = storage::load_position(context, maker, market_id)?;
     let mut account = storage::load_account(context, maker)?;
+    // Settle accrued funding on the maker's pre-fill position before its size changes.
+    crate::perp_dex::funding::settle_position_funding(
+        context,
+        maker,
+        market,
+        &mut pos,
+        &mut account.perp_wallet_balance,
+    )?;
     // Snapshot before mutations — used to verify and release the pre-fill reservation.
     let old_reserved = pos
         .buy_side_margin_reserved

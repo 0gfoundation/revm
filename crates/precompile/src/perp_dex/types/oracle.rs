@@ -12,7 +12,9 @@ pub const PRICE_BASIS_WINDOW_SIZE: usize = 30;
 /// Price2 derives basis when an oracle checkpoint closes an interval.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PriceBasisWindow {
+    #[serde(default)]
     pub timestamps: [u64; PRICE_BASIS_WINDOW_SIZE],
+    #[serde(default)]
     pub mid_prices: [u64; PRICE_BASIS_WINDOW_SIZE],
     pub write_idx: u8,
     pub count: u8,
@@ -211,6 +213,11 @@ pub struct FundingState {
     pub last_funding_rate: i64,
     /// Unix-second timestamp of the next funding settlement (0 = not yet started).
     pub next_funding_ts: u64,
+    /// Cumulative funding index: Σ over epoch boundaries of `mark_price * rate`.
+    /// Positions settle funding lazily against `index − position.last_funding_index`
+    /// (see `calc_funding_payment`). Starts at 0 at genesis.
+    #[serde(default)]
+    pub cumulative_funding_index: i128,
 }
 
 /// Per-market linearly-weighted premium index accumulator for funding rate calculation.

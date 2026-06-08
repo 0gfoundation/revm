@@ -7,7 +7,7 @@ use primitives::{address, hardfork::SpecId, Address, FixedBytes, U256};
 use crate::perp_dex::{
     interface::IPerpDex::{cancelOrderCall, getMarketFeeTotalCall, getOrderCall, placeOrderCall},
     storage,
-    types::{Market, OrderStatus, PerpPosition, UserFeeRates},
+    types::{FundingState, Market, OrderStatus, PerpPosition, UserFeeRates},
     PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
 
@@ -1222,5 +1222,56 @@ fn reverted_subcall_leaves_no_perp_residue() {
     assert!(
         storage::load_order(&mut ctx, &order_id).unwrap().is_none(),
         "reverted sub-call must leave no perp residue"
+    );
+}
+
+#[test]
+fn fill_settles_funding_for_taker_and_maker() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    // ALICE already holds a long with a stale funding anchor (index 0).
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -(FILL_VALUE as i64),
+            margin: FILL_VALUE as i64,
+            leverage: 1,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+
+    // Accrue funding (large index so the taker charge is non-trivial).
+    let cfi: i128 = 10_000_000_000_000_000;
+    storage::save_funding_state(
+        &mut ctx,
+        MARKET_ID,
+        &FundingState {
+            last_funding_rate: 100,
+            next_funding_ts: 0,
+            cumulative_funding_index: cfi,
+        },
+    )
+    .unwrap();
+
+    // BOB rests a sell (fresh maker); ALICE takes it (taker, adds to her long).
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    // Both positions were touched by the fill, so both must have settled funding
+    // and re-anchored to the current cumulative index.
+    assert_eq!(
+        pos(&mut ctx, ALICE).last_funding_index,
+        cfi,
+        "taker funding settled on its pre-fill position"
+    );
+    assert_eq!(
+        pos(&mut ctx, BOB).last_funding_index,
+        cfi,
+        "maker funding settled (fresh position anchored to current index)"
     );
 }

@@ -226,23 +226,39 @@ pub fn calc_funding_rate(average_premium_index: i64, interest_rate: i64) -> i64 
     (average_premium_index + clamped).clamp(MIN_FUNDING_RATE, MAX_FUNDING_RATE)
 }
 
-/// Apply a funding-rate payment to a position.
+/// Funding payment (signed, quote units) accrued by a position between two
+/// cumulative-funding-index checkpoints.
+///
+/// `index_delta = cumulative_funding_index_now - position.last_funding_index`,
+/// where the per-market index accumulates `mark_price * funding_rate` at each
+/// epoch boundary. The result is what should be ADDED to the wallet: positive =
+/// credit (the position receives funding), negative = charge (it pays).
+///
+/// ```text
+/// payment = -(amount * index_delta * 10^QUOTE_DECIMALS)
+///           / (10^price_decimals * 10^base_decimals * FUNDING_RATE_ONE)
+/// ```
+///
+/// A long (`amount > 0`) pays when the rate is positive (longs pay shorts); the
+/// scaling matches `calc_value` so the payment is in 6-decimal quote units like
+/// every other balance in the engine.
 #[inline]
-pub fn calc_funding_fee(
-    funding_rate: i64,
+pub fn calc_funding_payment(
     amount: i64,
-    mark_price: u64,
+    index_delta: i128,
+    base_decimals: u32,
     price_decimals: u32,
 ) -> Result<i64, PrecompileError> {
-    let v = -((amount as i128)
-        .checked_mul(mark_price as i128)
-        .ok_or_else(|| perp_err("math: funding value overflow"))?
-        / pow10_i128(price_decimals)?);
-    let fee = (funding_rate as i128)
-        .checked_mul(v)
-        .ok_or_else(|| perp_err("math: funding fee overflow"))?
-        / FUNDING_RATE_ONE as i128;
-    i64::try_from(fee).map_err(|_| perp_err("math: funding fee exceeds i64"))
+    let numerator = (amount as i128)
+        .checked_mul(index_delta)
+        .and_then(|v| v.checked_mul(pow10_i128(QUOTE_DECIMALS).ok()?))
+        .ok_or_else(|| perp_err("math: funding payment numerator overflow"))?;
+    let denominator = pow10_i128(price_decimals)?
+        .checked_mul(pow10_i128(base_decimals)?)
+        .and_then(|v| v.checked_mul(FUNDING_RATE_ONE as i128))
+        .ok_or_else(|| perp_err("math: funding payment denominator overflow"))?;
+    let payment = -(numerator / denominator);
+    i64::try_from(payment).map_err(|_| perp_err("math: funding payment exceeds i64"))
 }
 
 /// Recalculate the buy-side opening notional from the current buy-order list.
@@ -354,4 +370,55 @@ pub fn calc_sell_side_margin_reserved(
         price_decimals,
         position_amount,
     )? / leverage)
+}
+
+#[cfg(test)]
+mod funding_payment_tests {
+    use super::*;
+
+    // amount=10 (base_decimals=0), mark=$100 (10000 @ price_decimals=2),
+    // one epoch at rate 7500 (0.75%): index_delta = mark*rate = 75_000_000.
+    // notional = $1000 = 1e9 quote units; funding = 1e9 * 0.0075 = 7_500_000.
+    const DELTA_ONE_EPOCH: i128 = 10_000 * 7_500; // 75_000_000
+
+    #[test]
+    fn long_pays_funding_when_rate_positive() {
+        // Long (amount > 0) pays → negative (debit).
+        assert_eq!(
+            calc_funding_payment(10, DELTA_ONE_EPOCH, 0, 2).unwrap(),
+            -7_500_000
+        );
+    }
+
+    #[test]
+    fn short_receives_funding_when_rate_positive() {
+        // Short (amount < 0) receives → positive (credit).
+        assert_eq!(
+            calc_funding_payment(-10, DELTA_ONE_EPOCH, 0, 2).unwrap(),
+            7_500_000
+        );
+    }
+
+    #[test]
+    fn zero_position_pays_nothing() {
+        assert_eq!(calc_funding_payment(0, DELTA_ONE_EPOCH, 0, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn accrual_scales_linearly_across_epochs() {
+        // Two epochs of accrued index → twice the payment.
+        assert_eq!(
+            calc_funding_payment(10, DELTA_ONE_EPOCH * 2, 0, 2).unwrap(),
+            -15_000_000
+        );
+    }
+
+    #[test]
+    fn long_receives_when_rate_negative() {
+        // Negative funding rate flips the direction: long receives.
+        assert_eq!(
+            calc_funding_payment(10, -DELTA_ONE_EPOCH, 0, 2).unwrap(),
+            7_500_000
+        );
+    }
 }
