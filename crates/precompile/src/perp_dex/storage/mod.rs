@@ -3,7 +3,7 @@
 pub mod keys;
 
 use context::{ContextTr, JournalTr};
-use primitives::{keccak256, Address, B256, U256};
+use primitives::{Address, B256, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
 
@@ -85,11 +85,13 @@ fn store_blob<CTX: ContextTr>(
         .sload(PERP_DEX_ADDRESS, slot.into())
         .map_err(convert_db_err::<CTX::Db>)?
         .data;
-    let mut preimage = Vec::with_capacity(64 + buf.len());
-    preimage.extend_from_slice(&c_old.to_be_bytes::<32>());
-    preimage.extend_from_slice(key.as_slice());
-    preimage.extend_from_slice(buf);
-    let c_new = keccak256(&preimage);
+    // Streaming keccak over (C ‖ key ‖ buf) — digest identical to hashing the
+    // concatenation, without allocating a 64+len preimage buffer per store.
+    let mut hasher = alloy_primitives::Keccak256::new();
+    hasher.update(c_old.to_be_bytes::<32>());
+    hasher.update(key.as_slice());
+    hasher.update(buf);
+    let c_new = hasher.finalize();
     context
         .journal_mut()
         .sstore(PERP_DEX_ADDRESS, slot.into(), c_new.into())
@@ -930,7 +932,7 @@ mod commitment_tests {
     use super::*;
     use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
     use database::InMemoryDB;
-    use primitives::hardfork::SpecId;
+    use primitives::{hardfork::SpecId, keccak256};
 
     type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
 

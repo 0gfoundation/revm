@@ -6,9 +6,13 @@
 //! address slots under `PERP_DEX_ADDRESS` in the state trie; perp blobs now live
 //! off-trie, but the key derivation is unchanged.
 
-use primitives::{keccak256, Address, B256};
+use primitives::{b256, keccak256, Address, B256};
 
 // ── Key-family prefixes ───────────────────────────────────────────────────
+// The five parameterless prefixes (admn/orcl/mkgr/infd/cmit) are folded into
+// precomputed `*_KEY` constants below; the prefix consts are kept so the
+// `const_key_tests` pin can re-derive and compare.
+#[cfg_attr(not(test), allow(dead_code))]
 const PFX_ADMIN: &[u8] = b"admn";
 const PFX_ACCOUNT: &[u8] = b"acct";
 const PFX_USER_FEE: &[u8] = b"ufee";
@@ -30,7 +34,9 @@ const PFX_BEST_BID: &[u8] = b"bbd\x00"; // cached best bid price (0 = empty)
 const PFX_BEST_ASK: &[u8] = b"bak\x00"; // cached best ask price (0 = empty)
 const PFX_API_KEY: &[u8] = b"apik"; // per-user per-slot ed25519 key
 const PFX_API_KEY_IDS: &[u8] = b"akid"; // per-user list of registered key_ids
+#[cfg_attr(not(test), allow(dead_code))]
 const PFX_ORACLE: &[u8] = b"orcl"; // authorized oracle address (updateIndexPrice role)
+#[cfg_attr(not(test), allow(dead_code))]
 const PFX_MARKET_MANAGER: &[u8] = b"mkgr"; // authorized market manager address (addMarket/updateMarket role)
 const PFX_INDEX_PRICE: &[u8] = b"idxp"; // per-market IndexPriceState
 const PFX_INDEX_HISTORY: &[u8] = b"idxh"; // per-market IndexPriceHistory
@@ -38,7 +44,9 @@ const PFX_BASIS_WINDOW: &[u8] = b"bswn"; // per-market PriceBasisWindow (30s mid
 const PFX_LAST_TRADED: &[u8] = b"ltrd"; // per-market last traded price (contract price)
 const PFX_FUNDING_STATE: &[u8] = b"fund"; // per-market FundingState
 const PFX_PREMIUM_ACCUMULATOR: &[u8] = b"pacc"; // per-market PremiumIndexAccumulator
+#[cfg_attr(not(test), allow(dead_code))]
 const PFX_INSURANCE_FUND: &[u8] = b"infd"; // global insurance fund balance
+#[cfg_attr(not(test), allow(dead_code))]
 const PFX_COMMITMENT: &[u8] = b"cmit"; // global on-trie commitment over the off-trie perp write-stream
 
 // ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
@@ -61,15 +69,30 @@ pub fn erc20_balance_slot(account: Address) -> B256 {
 /// off-trie PerpState write-stream. It is anchored ON the state trie (a normal account-storage
 /// slot, distinct from the off-trie B256 domain keys and from the erc20 balance slots) so that
 /// any perp-write divergence surfaces in the state root and is detected by consensus.
+///
+/// Precomputed `keccak256(b"cmit")` — this is hashed on every `store_blob` fold, so it must
+/// not be recomputed per call. Pinned against the live derivation in `const_key_tests`.
+pub const COMMITMENT_SLOT: B256 =
+    b256!("0x5315529dd419e7000541b58e86740e824fd9f29774b5ca4423b92157a3c38b37");
+
+/// See [`COMMITMENT_SLOT`].
+#[inline]
 pub fn commitment_slot() -> B256 {
-    keccak256(PFX_COMMITMENT)
+    COMMITMENT_SLOT
 }
 
 // ── Admin ─────────────────────────────────────────────────────────────────
 
 /// Single slot storing the admin address (20 bytes, zero = uninitialized).
+///
+/// Precomputed `keccak256(b"admn")`, pinned in `const_key_tests`.
+pub const ADMIN_KEY: B256 =
+    b256!("0x0cd72d51fc618f526ac2c21501d7abd9edf6395566bb827168c6d03aa2596b61");
+
+/// See [`ADMIN_KEY`].
+#[inline]
 pub fn admin_key() -> B256 {
-    keccak256(PFX_ADMIN)
+    ADMIN_KEY
 }
 
 // ── Global counters ───────────────────────────────────────────────────────
@@ -196,13 +219,27 @@ pub fn api_key_ids_key(user: Address) -> B256 {
 // ── Oracle price feed ─────────────────────────────────────────────────────────
 
 /// Authorized oracle address (Address; zero = not set).
+///
+/// Precomputed `keccak256(b"orcl")`, pinned in `const_key_tests`.
+pub const ORACLE_KEY: B256 =
+    b256!("0xd411ab2cb54ccbef75296e12fdcf4fa6caf9f2b8da09908875765e8ae2c02c24");
+
+/// See [`ORACLE_KEY`].
+#[inline]
 pub fn oracle_key() -> B256 {
-    keccak256(PFX_ORACLE)
+    ORACLE_KEY
 }
 
 /// Authorized market manager address (Address; zero = not set).
+///
+/// Precomputed `keccak256(b"mkgr")`, pinned in `const_key_tests`.
+pub const MARKET_MANAGER_KEY: B256 =
+    b256!("0xe2693bd7dc3c7bbb81d1b8591a1f844a3a1f4be6bde409c947fffc86c87163bd");
+
+/// See [`MARKET_MANAGER_KEY`].
+#[inline]
 pub fn market_manager_key() -> B256 {
-    keccak256(PFX_MARKET_MANAGER)
+    MARKET_MANAGER_KEY
 }
 
 /// Per-market IndexPriceState (index_price + timestamp).
@@ -238,6 +275,31 @@ pub fn premium_accumulator_key(market_id: u64) -> B256 {
 // ── Insurance Fund ────────────────────────────────────────────────────────────
 
 /// Global insurance fund balance (u64, USDC micro-units).
+///
+/// Precomputed `keccak256(b"infd")`, pinned in `const_key_tests`.
+pub const INSURANCE_FUND_KEY: B256 =
+    b256!("0x292dee8007df30a0d76dd66c314b3df92655b9311e95dcbf55734d3b9f3ea8e7");
+
+/// See [`INSURANCE_FUND_KEY`].
+#[inline]
 pub fn insurance_fund_key() -> B256 {
-    keccak256(PFX_INSURANCE_FUND)
+    INSURANCE_FUND_KEY
+}
+
+#[cfg(test)]
+mod const_key_tests {
+    use super::*;
+
+    /// Pins every precomputed key constant against its live keccak derivation.
+    /// A mistyped constant here would silently move a storage key (and, for
+    /// `COMMITMENT_SLOT`, the consensus-visible anchor slot under 0x1003) —
+    /// the golden commitment test guards the same thing end-to-end.
+    #[test]
+    fn precomputed_constants_match_derivation() {
+        assert_eq!(COMMITMENT_SLOT, keccak256(PFX_COMMITMENT), "cmit");
+        assert_eq!(ADMIN_KEY, keccak256(PFX_ADMIN), "admn");
+        assert_eq!(ORACLE_KEY, keccak256(PFX_ORACLE), "orcl");
+        assert_eq!(MARKET_MANAGER_KEY, keccak256(PFX_MARKET_MANAGER), "mkgr");
+        assert_eq!(INSURANCE_FUND_KEY, keccak256(PFX_INSURANCE_FUND), "infd");
+    }
 }
