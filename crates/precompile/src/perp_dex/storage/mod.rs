@@ -988,6 +988,140 @@ mod commitment_tests {
     }
 }
 
+#[cfg(test)]
+mod size_probe_tests {
+    use super::*;
+    use crate::perp_dex::types::{
+        OrderStatus, OrderType, Side, TimeInForce, PRICE_BASIS_WINDOW_SIZE,
+    };
+
+    #[test]
+    fn probe_encoded_sizes() {
+        // Order — realistic BTC-ish values
+        let order = Order {
+            owner: [0xAB; 20],
+            market_id: 1,
+            side: Side::Buy,
+            price: 65_432_10,        // 7 digits
+            quantity: 150_000_000,   // 1.5 BTC @ 8 decimals
+            filled: 50_000_000,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            status: OrderStatus::PartiallyFilled,
+        };
+        let buf = encode(&order).unwrap();
+        println!("Order: {} bytes; hex={}", buf.len(), primitives::hex::encode(&buf));
+
+        let entry = OrderEntry {
+            order_id: [0xCD; 32],
+            price: 65_432_10,
+            amount: 150_000_000,
+            maker_fee_bps: 2,
+        };
+        println!("OrderEntry x1 (in vec): {} bytes", encode(&vec![entry]).unwrap().len());
+        println!("OrderEntry x5: {} bytes", encode(&vec![entry; 5]).unwrap().len());
+        println!("OrderEntry x20: {} bytes", encode(&vec![entry; 20]).unwrap().len());
+        println!("OrderEntry single hex={}", primitives::hex::encode(encode(&entry).unwrap()));
+
+        let prices: Vec<u64> = (0..1u64).map(|i| 65_000_00 + i * 10).collect();
+        println!("bid_prices x1: {} bytes", encode(&prices).unwrap().len());
+        let prices: Vec<u64> = (0..10u64).map(|i| 65_000_00 + i * 10).collect();
+        println!("bid_prices x10: {} bytes", encode(&prices).unwrap().len());
+        let prices: Vec<u64> = (0..100u64).map(|i| 65_000_00 + i * 10).collect();
+        println!("bid_prices x100: {} bytes", encode(&prices).unwrap().len());
+
+        let q: Vec<[u8; 32]> = vec![[0xEF; 32]; 1];
+        println!("level queue x1: {} bytes", encode(&q).unwrap().len());
+        let q: Vec<[u8; 32]> = vec![[0xEF; 32]; 5];
+        println!("level queue x5: {} bytes", encode(&q).unwrap().len());
+        println!("level queue single elem hex={}", primitives::hex::encode(encode(&[0xEFu8; 32]).unwrap()));
+
+        let pos = PerpPosition {
+            amount: 150_000_000,
+            v_quote_balance: -98_148_315,
+            margin: 9_814_831,
+            margin_reserved: 5_000_000,
+            margin_reserved_notional: 50_000_000,
+            buy_side_margin_reserved: 5_000_000,
+            buy_side_reserved_notional: 50_000_000,
+            sell_side_margin_reserved: 1_000_000,
+            sell_side_reserved_notional: 10_000_000,
+            fee_reserved: 10_000,
+            leverage: 10,
+            last_funding_index: 123_456_789_012_345i128,
+        };
+        let buf = encode(&pos).unwrap();
+        println!("PerpPosition: {} bytes; hex={}", buf.len(), primitives::hex::encode(&buf));
+        println!("PerpPosition default: {} bytes", encode(&PerpPosition::default()).unwrap().len());
+
+        let acct = UserAccount {
+            usdc_balance: "123456789000000000000".into(), // 21-digit decimal string
+            perp_wallet_balance: 1_234_567_890,
+        };
+        let buf = encode(&acct).unwrap();
+        println!("UserAccount: {} bytes; hex={}", buf.len(), primitives::hex::encode(&buf));
+
+        let market = Market {
+            market_id: 1,
+            base_decimals: 8,
+            price_decimals: 2,
+            tick_size: 10,
+            step_size: 1000,
+            min_quantity: 1000,
+            max_quantity: 10_000_000_000,
+            max_price: 100_000_000,
+            price_update_interval: 1,
+            active: true,
+            funding_interval: 28_800,
+            interest_rate: 100,
+            liquidation_fee_rate_bps: 50,
+        };
+        let buf = encode(&market).unwrap();
+        println!("Market: {} bytes", buf.len());
+
+        let fs = FundingState {
+            last_funding_rate: 125,
+            next_funding_ts: 1_750_000_000,
+            cumulative_funding_index: 9_876_543_210_123i128,
+        };
+        println!("FundingState: {} bytes", encode(&fs).unwrap().len());
+
+        let acc = PremiumIndexAccumulator {
+            weighted_sum: 123_456_789_012i128,
+            sample_count: 28_000,
+            epoch_start_ts: 1_750_000_000,
+            last_pi: -1234,
+            last_sample_ts: 1_750_000_123,
+        };
+        println!("PremiumIndexAccumulator: {} bytes", encode(&acc).unwrap().len());
+
+        let mut window = PriceBasisWindow::default();
+        for i in 0..PRICE_BASIS_WINDOW_SIZE as u64 {
+            window.record_observation(1_750_000_000 + i, 65_000_00 + i);
+        }
+        println!("PriceBasisWindow full: {} bytes", encode(&window).unwrap().len());
+        println!("PriceBasisWindow empty: {} bytes", encode(&PriceBasisWindow::default()).unwrap().len());
+
+        let mut hist = IndexPriceHistory::default();
+        for i in 0..32u64 {
+            hist.push(
+                IndexPriceState { index_price: 65_000_00 + i, timestamp: 1_750_000_000 + i },
+                32,
+            );
+        }
+        println!("IndexPriceHistory x32: {} bytes", encode(&hist).unwrap().len());
+
+        println!("UserFeeRates: {} bytes", encode(&UserFeeRates { maker_fee_bps: 2, taker_fee_bps: 5 }).unwrap().len());
+        println!("u64 scalar (mark price 6_543_210): {} bytes", encode(&6_543_210u64).unwrap().len());
+        println!("u64 scalar small (nonce 7): {} bytes", encode(&7u64).unwrap().len());
+        println!("Address: {} bytes", encode(&Address::ZERO).unwrap().len());
+        println!(
+            "ApiKey: {} bytes",
+            encode(&ApiKey { pubkey: [9; 32], expiry: 1_750_000_000 }).unwrap().len()
+        );
+    }
+}
+
 /// Forward-compatibility: blobs written under an older schema (missing a field
 /// that was later appended) must still decode, defaulting the absent field —
 /// not hard-fail with "msgpack decode error". This pins the `#[serde(default)]`
