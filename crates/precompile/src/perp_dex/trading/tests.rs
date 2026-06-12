@@ -1630,3 +1630,1167 @@ fn fill_settles_funding_for_taker_and_maker() {
         "maker funding settled (fresh position anchored to current index)"
     );
 }
+
+// ── Golden commitment characterization (P0 guard rail) ─────────────────────
+//
+// Pins the final value of the on-trie commitment slot (keccak256(b"cmit") under
+// 0x1003) over a rich, fully deterministic end-to-end scenario driven through
+// `run_perp_dex_call`. See docs/perpdex-commitment优化执行计划.md (P0):
+//
+//   * SAFE refactors (P1 constant keys + streaming-keccak fold, P2 per-call
+//     fold accumulator, P3 asm-keccak) MUST keep `GOLDEN_COMMITMENT`
+//     bit-identical — the fold sequence C = keccak256(C ‖ key ‖ blob) over the
+//     perp write-stream may not change in content or order.
+//   * CHAIN changes (P4 call-level framing / hash swap, #17/#18/#20) change the
+//     value by design: re-pin by running `commitment_golden_scenario`, copying
+//     the printed `golden commitment =` value, and recording the re-pin in the
+//     commit message + the plan doc. Each CHAIN commit re-pins separately.
+//
+// The business-state snapshot is the second line of defense: it survives a
+// hash-function change, so a CHAIN re-pin is only legitimate when the snapshot
+// still matches.
+//
+// Store paths intentionally NOT covered by this scenario (kept out for size /
+// determinism; changes touching only these will not move the golden value):
+//   * bankrupt liquidation: absorb_from_insurance_fund / InsuranceFundDepleted
+//     / bad-debt write-off (solvent path with clearance fee IS covered)
+//   * funding-charge waterfall into position margin / insurance fund (the
+//     scenario's funding charge is covered by the wallet)
+//   * margin-shortfall auto-cancel cascades: taker-side
+//     cancel_same_side_orders_until_wallet_covers and maker-side
+//     cancel_maker_orders_until_wallet_nonnegative (maker auto-expire), incl.
+//     the matcher early-exit sub-variant where the surviving queue tail was
+//     entirely expired-during-level (trading/mod.rs:827/:984) — all require a
+//     maker-deficit cascade that would dominate the scenario
+//   * FOK / PostOnly success-on-match permutations beyond the covered ones
+//     (FOK infeasible revert, PostOnly crossing revert, PostOnly rest)
+//   * open_interest (save_open_interest has no production caller today)
+//   * multi-market state (single market id 1)
+//
+// Previously-listed gaps now COVERED by scenario extensions (2026-06-12):
+// sell-side cancelOrder of a resting ask; liquidate cancel-all sell-side loop;
+// matcher early-exit with surviving queue tail (both book sides); setLeverage
+// resting-order margin rebalance (debit + credit) incl. setLeverageSigned;
+// transferAdmin; user-facing Market orders (filled + expired remainder);
+// liquidation residual settle at mark price; getBookPrices / getBookLevel.
+mod golden {
+    use super::*;
+    use crate::perp_dex::{
+        interface::IPerpDex::{
+            addMarketCall, addPositionMarginCall, cancelOrderSignedCall, depositCall,
+            depositInsuranceFundCall, getAccountCall, getApiKeysCall, getAveragePremiumIndexCall,
+            getBookLevelCall, getBookPricesCall, getFundingStateCall, getIndexPriceCall,
+            getInsuranceFundCall, getMarkPriceCall, getOpenOrdersCall, getPositionCall,
+            initAdminCall, liquidateCall, placeOrderSignedCall, registerApiKeyCall,
+            removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
+            setMarketManagerAddressCall, setOracleAddressCall, setUserFeeRatesCall,
+            transferAdminCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
+            updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
+        },
+        run_perp_dex_call,
+        storage::keys as storage_keys,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+    use primitives::{b256, keccak256, Bytes, B256};
+
+    const ORACLE: Address = address!("4444444444444444444444444444444444444444");
+    const MANAGER: Address = address!("5555555555555555555555555555555555555555");
+    /// Fresh admin the scenario hands control to at the very end (transferAdmin).
+    const NEW_ADMIN: Address = address!("6666666666666666666666666666666666666666");
+
+    /// Pinned final commitment-slot value of `run_golden_scenario`.
+    /// Capture/re-pin procedure: run `commitment_golden_scenario` and copy the
+    /// `golden commitment =` line it prints (also shown in the assert diff).
+    /// Last re-pin 2026-06-12: scenario extended (sell-side cancel, both
+    /// matcher early-exits, market orders, FOK/PostOnly, leverage rebalance,
+    /// setLeverageSigned, residual mark-price settle, transferAdmin, book
+    /// views) — snapshot re-derived by hand and matched before re-pinning.
+    const GOLDEN_COMMITMENT: B256 =
+        b256!("0x2d5fa59ef95d08950128981014181733fba336589e92c4a04c2b849459de75fa");
+
+    /// Business end-state read back through view calls after the scenario.
+    /// Pins semantics independently of the commitment hash construction.
+    #[derive(Debug, PartialEq, Eq)]
+    struct BusinessSnapshot {
+        /// (amount, vQuoteBalance, margin)
+        alice_position: (i64, i64, i64),
+        bob_position: (i64, i64, i64),
+        carol_position: (i64, i64, i64),
+        /// (spot usdc balance, perp wallet balance)
+        alice_account: (U256, u64),
+        bob_account: (U256, u64),
+        carol_account: (U256, u64),
+        bob_erc20: U256,
+        /// Trading-fee sink (taker+maker fees credit the admin's perp wallet).
+        admin_perp_wallet: u64,
+        insurance_fund: u64,
+        market_fee_total: u64,
+        mark_price: u64,
+        /// (lastFundingRate, nextFundingTs)
+        funding: (i64, u64),
+        signed_buy_status: u8,
+        gtc_cancelled_status: u8,
+        ioc_status: u8,
+        /// Market-order remainder against an empty book (market path → Expired).
+        mkt_expired_status: u8,
+        /// PostOnly ask that rested, then was cancelled (sell-side cancel paths).
+        po_ask_cancelled_status: u8,
+        /// ALICE's resting bid cancelled by liquidate()'s cancel-all (buy side).
+        liq_cancelled_bid_status: u8,
+        /// ALICE's resting ask cancelled by liquidate()'s cancel-all (sell side).
+        liq_cancelled_ask_status: u8,
+        bob_bid_status: u8,
+        /// BOB's same-price tail bid surviving the sell-side matcher early-exit.
+        bob_tail_bid_status: u8,
+        carol_close_status: u8,
+    }
+
+    fn expected_snapshot() -> BusinessSnapshot {
+        BusinessSnapshot {
+            // ALICE fully closed by the liquidation round-trip; BOB flat after
+            // CAROL's taker sell closes his last short QTY.
+            alice_position: (0, 0, 0),
+            bob_position: (0, 0, 0),
+            // CAROL short QTY @ $80 at default leverage 1 (full-notional margin).
+            carol_position: (-1_000_000, 800_000, 800_000),
+            // ALICE perp = 1e9 − 806_000 fill margin − 2_015 taker fees
+            //   − 500_000 addMargin + 250_000 removeMargin − 400 funding
+            //   + 169_500 book-leg close (margin release 792_000 + PnL −622_500)
+            //   + 56_500 residual mark-price settle (margin 264_000 + PnL
+            //   −207_500) − 1_200 close taker fee − 5_280 clearance fee.
+            alice_account: (U256::from(500_000_000u64), 999_161_105),
+            // BOB perp = 1e9 + 830_000 short PnL (622_500 on the 3-QTY
+            //   liquidation leg + 207_500 on the QTY closed via CAROL) + 400
+            //   funding credit − 1_446 maker fees − 400_160 still reserved for
+            //   the resting tail bid (400_000 MR + 160 fee)
+            //   − 500_000_000 transferFromPerp.
+            bob_account: (U256::from(500_000_000u64), 500_428_794),
+            // CAROL perp = 5_000_000 funded − 800_000 short opening margin.
+            carol_account: (U256::from(5_000_000u64), 4_200_000),
+            // 2e9 seed − 1.5e9 deposit + 0.5e9 withdraw.
+            bob_erc20: U256::from(1_000_000_000u64),
+            // 100M funding − 50M IF deposit + 1M IF withdraw + 4_661 fees.
+            admin_perp_wallet: 51_004_661,
+            // 50M deposit − 1M withdraw + 5_280 clearance fee
+            //   (50 bps of ALICE's 1_056_000 pre-liquidation margin).
+            insurance_fund: 49_005_280,
+            // ALICE takers 2_015 + close taker 1_200 + BOB maker 806 + 480
+            //   + 160 (CAROL's taker fee is 0 bps: default fee rates).
+            market_fee_total: 4_661,
+            mark_price: 80_000_000_000, // $80 post-crash
+            funding: (100, 7_215),      // rate = interest-rate clamp; next epoch ts
+            signed_buy_status: OrderStatus::Cancelled as u8,
+            gtc_cancelled_status: OrderStatus::Cancelled as u8,
+            ioc_status: OrderStatus::Expired as u8,
+            mkt_expired_status: OrderStatus::Expired as u8,
+            po_ask_cancelled_status: OrderStatus::Cancelled as u8,
+            liq_cancelled_bid_status: OrderStatus::Cancelled as u8,
+            liq_cancelled_ask_status: OrderStatus::Cancelled as u8,
+            bob_bid_status: OrderStatus::Filled as u8,
+            bob_tail_bid_status: OrderStatus::Open as u8,
+            carol_close_status: OrderStatus::Filled as u8,
+        }
+    }
+
+    // ── Context & call plumbing ────────────────────────────────────────────
+
+    /// Consensus-visible commitment anchor slot under 0x1003, derived locally
+    /// (`keccak256(b"cmit")`) and NOT via `storage::keys::commitment_slot()`,
+    /// so a refactor that consistently changes the production slot derivation
+    /// (e.g. a typo'd precomputed constant) cannot pass self-consistently:
+    /// the explicit slot-pin assert at the top of `run_golden_scenario` fails
+    /// with a clear message instead.
+    fn golden_commitment_slot() -> B256 {
+        keccak256(b"cmit")
+    }
+
+    /// Standard OZ ERC-20 `_balances[user]` slot (mapping at slot 0), derived
+    /// locally for the same anti-tautology reason as `golden_commitment_slot`.
+    fn golden_erc20_balance_slot(user: Address) -> B256 {
+        let mut buf = [0u8; 64];
+        buf[12..32].copy_from_slice(user.as_slice());
+        keccak256(buf)
+    }
+
+    /// Fresh context with ERC-20 USDC seeded for ALICE / BOB / CAROL / ADMIN so
+    /// the full deposit → transferToPerp pipeline can run through the entry point.
+    fn golden_ctx() -> TestCtx {
+        let mut db = InMemoryDB::default();
+        for (user, amount) in [
+            (ALICE, 2_000_000_000u64), // $2,000
+            (BOB, 2_000_000_000),
+            (CAROL, 10_000_000), // $10 — only used for the post-liquidation step
+            (ADMIN, 500_000_000), // $500
+        ] {
+            db.insert_account_storage(
+                USDC_ADDRESS,
+                golden_erc20_balance_slot(user).into(),
+                U256::from(amount),
+            )
+            .unwrap();
+        }
+        let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
+        for addr in [
+            USDC_ADDRESS,
+            PERP_DEX_ADDRESS,
+            ALICE,
+            BOB,
+            CAROL,
+            ADMIN,
+            ORACLE,
+            MANAGER,
+            NEW_ADMIN,
+        ] {
+            JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
+        }
+        // Fixed block timestamp for full determinism (signed-order recvWindow
+        // checks and mid-price samples both read it).
+        ctx.block.timestamp = U256::from(1);
+        ctx
+    }
+
+    fn read_commitment(ctx: &mut TestCtx) -> U256 {
+        ctx.journal_mut()
+            .sload(PERP_DEX_ADDRESS, golden_commitment_slot().into())
+            .unwrap()
+            .data
+    }
+
+    fn decode_revert(bytes: &[u8]) -> String {
+        if bytes.len() >= 68 && bytes[..4] == [0x08, 0xc3, 0x79, 0xa0] {
+            let len = U256::from_be_slice(&bytes[36..68]).to::<usize>();
+            String::from_utf8_lossy(&bytes[68..68 + len]).into_owned()
+        } else {
+            format!("0x{}", primitives::hex::encode(bytes))
+        }
+    }
+
+    /// Mutating call through the full entry point; panics with the decoded
+    /// revert reason on failure.
+    fn dex_call(ctx: &mut TestCtx, caller: Address, input: &[u8]) -> Bytes {
+        let out = run_perp_dex_call(input, 10_000_000, caller, U256::ZERO, false, ctx)
+            .expect("perp dex call must not hard-fail");
+        assert!(
+            !out.reverted,
+            "dex call reverted: {}",
+            decode_revert(&out.bytes)
+        );
+        out.bytes
+    }
+
+    /// A call whose revert is the point. Mirrors the EVM frame: the call runs
+    /// under a checkpoint that is rolled back on revert, and the commitment
+    /// must come out unchanged.
+    fn dex_call_expect_revert(ctx: &mut TestCtx, caller: Address, input: &[u8], expect: &str) {
+        let c_before = read_commitment(ctx);
+        let cp = ctx.journal_mut().checkpoint();
+        let out = run_perp_dex_call(input, 10_000_000, caller, U256::ZERO, false, ctx)
+            .expect("perp dex call must not hard-fail");
+        assert!(
+            out.reverted,
+            "expected revert containing {expect:?}, call succeeded"
+        );
+        let reason = decode_revert(&out.bytes);
+        assert!(
+            reason.contains(expect),
+            "revert reason {reason:?} does not contain {expect:?}"
+        );
+        ctx.journal_mut().checkpoint_revert(cp);
+        assert_eq!(
+            read_commitment(ctx),
+            c_before,
+            "reverted call must leave the commitment unchanged"
+        );
+    }
+
+    /// Static (view) call through the entry point.
+    fn dex_view(ctx: &mut TestCtx, input: &[u8]) -> Bytes {
+        let out = run_perp_dex_call(input, 10_000_000, CAROL, U256::ZERO, true, ctx)
+            .expect("view call must not hard-fail");
+        assert!(
+            !out.reverted,
+            "view call reverted: {}",
+            decode_revert(&out.bytes)
+        );
+        out.bytes
+    }
+
+    fn g_place(
+        ctx: &mut TestCtx,
+        caller: Address,
+        side: u8,
+        price: u64,
+        qty: u64,
+        order_type: u8,
+        tif: u8,
+    ) -> [u8; 32] {
+        let input = placeOrderCall {
+            marketId: MARKET_ID,
+            side,
+            price,
+            quantity: qty,
+            orderType: order_type,
+            tif,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
+        let ret = dex_call(ctx, caller, &input);
+        ret[..32].try_into().unwrap()
+    }
+
+    fn order_status(ctx: &mut TestCtx, id: [u8; 32]) -> u8 {
+        let ret = dex_view(
+            ctx,
+            &getOrderCall {
+                orderId: id.into(),
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        );
+        getOrderCall::abi_decode_returns(&ret).unwrap().status
+    }
+
+    // ── ed25519 signed-call calldata (fixed key seed, fixed timestamps) ────
+
+    const SIGNED_TS: u64 = 1; // == block timestamp
+    const SIGNED_RECV: u64 = 60;
+
+    fn signed_place_input(
+        sk: &SigningKey,
+        side: u8,
+        price: u64,
+        qty: u64,
+        order_type: u8,
+        tif: u8,
+        client_id: [u8; 16],
+    ) -> Vec<u8> {
+        // Canonical 96-byte message, layout from run_place_order_signed.
+        let mut msg = [0u8; 96];
+        msg[..16].copy_from_slice(b"perpdex_v1_order");
+        msg[16..36].copy_from_slice(ALICE.as_slice());
+        msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
+        msg[44] = side;
+        msg[45..53].copy_from_slice(&price.to_be_bytes());
+        msg[53..61].copy_from_slice(&qty.to_be_bytes());
+        msg[61] = order_type;
+        msg[62] = tif;
+        msg[63..79].copy_from_slice(&client_id);
+        msg[79..87].copy_from_slice(&SIGNED_TS.to_be_bytes());
+        msg[87..95].copy_from_slice(&SIGNED_RECV.to_be_bytes());
+        msg[95] = 0; // keyId
+        let sig = sk.sign(&msg);
+        placeOrderSignedCall {
+            account: ALICE,
+            marketId: MARKET_ID,
+            side,
+            price,
+            quantity: qty,
+            orderType: order_type,
+            tif,
+            clientOrderId: FixedBytes(client_id),
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sig.to_bytes().to_vec().into(),
+        }
+        .abi_encode()
+    }
+
+    fn signed_cancel_input(sk: &SigningKey, order_id: [u8; 32]) -> Vec<u8> {
+        // Canonical 94-byte message, layout from run_cancel_order_signed.
+        let mut msg = [0u8; 94];
+        msg[..17].copy_from_slice(b"perpdex_v1_cancel");
+        msg[17..37].copy_from_slice(ALICE.as_slice());
+        msg[37..69].copy_from_slice(&order_id);
+        msg[69..77].copy_from_slice(&MARKET_ID.to_be_bytes());
+        msg[77..85].copy_from_slice(&SIGNED_TS.to_be_bytes());
+        msg[85..93].copy_from_slice(&SIGNED_RECV.to_be_bytes());
+        msg[93] = 0; // keyId
+        let sig = sk.sign(&msg);
+        cancelOrderSignedCall {
+            account: ALICE,
+            orderId: order_id.into(),
+            marketId: MARKET_ID,
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sig.to_bytes().to_vec().into(),
+        }
+        .abi_encode()
+    }
+
+    fn signed_leverage_input(sk: &SigningKey, leverage: u64) -> Vec<u8> {
+        // Canonical 72-byte message, layout from run_set_leverage_signed.
+        let mut msg = [0u8; 72];
+        msg[..19].copy_from_slice(b"perpdex_v1_leverage");
+        msg[19..39].copy_from_slice(ALICE.as_slice());
+        msg[39..47].copy_from_slice(&MARKET_ID.to_be_bytes());
+        msg[47..55].copy_from_slice(&leverage.to_be_bytes());
+        msg[55..63].copy_from_slice(&SIGNED_TS.to_be_bytes());
+        msg[63..71].copy_from_slice(&SIGNED_RECV.to_be_bytes());
+        msg[71] = 0; // keyId
+        let sig = sk.sign(&msg);
+        setLeverageSignedCall {
+            account: ALICE,
+            marketId: MARKET_ID,
+            leverage,
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sig.to_bytes().to_vec().into(),
+        }
+        .abi_encode()
+    }
+
+    // ── The scenario ───────────────────────────────────────────────────────
+
+    /// Plays the fixed script on a fresh context and returns the final
+    /// commitment-slot value plus the business end-state.
+    fn run_golden_scenario() -> (B256, BusinessSnapshot) {
+        // Pin the consensus-visible slot LOCATIONS against the production
+        // derivations: if either derivation ever changes, fail loudly here
+        // rather than tautologically reading/writing a silently moved slot.
+        assert_eq!(
+            golden_commitment_slot(),
+            storage_keys::commitment_slot(),
+            "commitment anchor slot moved"
+        );
+        assert_eq!(
+            golden_erc20_balance_slot(ALICE),
+            storage_keys::erc20_balance_slot(ALICE),
+            "erc20 balance slot derivation moved"
+        );
+
+        let mut ctx = golden_ctx();
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+
+        // Phase 0 — roles (admin / oracle / market-manager blobs).
+        dex_call(&mut ctx, ADMIN, &initAdminCall { admin: ADMIN }.abi_encode());
+        dex_call_expect_revert(
+            &mut ctx,
+            ALICE,
+            &initAdminCall { admin: ALICE }.abi_encode(),
+            "already initialised",
+        );
+        dex_call(
+            &mut ctx,
+            ADMIN,
+            &setOracleAddressCall { oracle: ORACLE }.abi_encode(),
+        );
+        dex_call(
+            &mut ctx,
+            ADMIN,
+            &setMarketManagerAddressCall { manager: MANAGER }.abi_encode(),
+        );
+
+        // Phase 1 — market via the manager role, then an admin updateMarket.
+        dex_call(
+            &mut ctx,
+            MANAGER,
+            &addMarketCall {
+                marketId: MARKET_ID,
+                baseDecimals: 8,
+                priceDecimals: 9,
+                tickSize: TICK,
+                stepSize: QTY,
+                minQuantity: QTY,
+                maxQuantity: QTY * 1_000,
+                maxPrice: PRICE * 10,
+                priceUpdateInterval: 15,
+                fundingInterval: 3_600,
+                interestRate: 100,
+                liquidationFeeRateBps: 50,
+            }
+            .abi_encode(),
+        );
+        dex_call(
+            &mut ctx,
+            ADMIN,
+            &updateMarketCall {
+                marketId: MARKET_ID,
+                tickSize: TICK,
+                stepSize: QTY,
+                minQuantity: QTY,
+                maxQuantity: QTY * 2_000,
+                maxPrice: PRICE * 10,
+                priceUpdateInterval: 15,
+                active: true,
+                fundingInterval: 3_600,
+                interestRate: 100,
+                liquidationFeeRateBps: 50,
+            }
+            .abi_encode(),
+        );
+
+        // Nonzero maker+taker fees for both traders (fee-sink paths need them).
+        for user in [ALICE, BOB] {
+            dex_call(
+                &mut ctx,
+                ADMIN,
+                &setUserFeeRatesCall {
+                    user,
+                    makerFeeBps: 2,
+                    takerFeeBps: 5,
+                }
+                .abi_encode(),
+            );
+        }
+        dex_call_expect_revert(
+            &mut ctx,
+            BOB,
+            &setUserFeeRatesCall {
+                user: BOB,
+                makerFeeBps: 0,
+                takerFeeBps: 0,
+            }
+            .abi_encode(),
+            "not admin",
+        );
+
+        // Phase 2 — oracle bootstrap: mark price must exist before trading.
+        dex_call(
+            &mut ctx,
+            ORACLE,
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: PRICE,
+                timestamp: 15,
+            }
+            .abi_encode(),
+        );
+
+        // Phase 3 — fund accounts: ERC-20 → spot (deposit) → perp wallet.
+        for user in [ALICE, BOB] {
+            dex_call(
+                &mut ctx,
+                user,
+                &depositCall {
+                    amount: U256::from(1_500_000_000u64),
+                }
+                .abi_encode(),
+            );
+            dex_call(
+                &mut ctx,
+                user,
+                &transferToPerpCall {
+                    amount: 1_000_000_000,
+                }
+                .abi_encode(),
+            );
+        }
+        dex_call(
+            &mut ctx,
+            ADMIN,
+            &depositCall {
+                amount: U256::from(200_000_000u64),
+            }
+            .abi_encode(),
+        );
+        dex_call(
+            &mut ctx,
+            ADMIN,
+            &transferToPerpCall {
+                amount: 100_000_000,
+            }
+            .abi_encode(),
+        );
+
+        // Phase 4 — leverage.
+        dex_call(
+            &mut ctx,
+            ALICE,
+            &setLeverageCall {
+                marketId: MARKET_ID,
+                leverage: 5,
+            }
+            .abi_encode(),
+        );
+        dex_call(
+            &mut ctx,
+            BOB,
+            &setLeverageCall {
+                marketId: MARKET_ID,
+                leverage: 2,
+            }
+            .abi_encode(),
+        );
+
+        // Phase 5 — signed path: register fixed-seed key, signed resting buy
+        // (relayed by CAROL — caller is irrelevant on the signed path).
+        dex_call(
+            &mut ctx,
+            ALICE,
+            &registerApiKeyCall {
+                keyId: 0,
+                pubkey: FixedBytes(sk.verifying_key().to_bytes()),
+                expiry: 0,
+            }
+            .abi_encode(),
+        );
+        let signed_buy: [u8; 32] = {
+            let input = signed_place_input(&sk, 0, PRICE - 5 * TICK, QTY, 0, 0, [0xA1; 16]);
+            let ret = dex_call(&mut ctx, CAROL, &input);
+            ret[..32].try_into().unwrap()
+        };
+
+        // While the signed buy rests and the position is still flat, retune
+        // leverage both ways so rebalance_order_margin_for_leverage runs its
+        // debit branch (5→4 grows the resting-order reserve; relayed by CAROL
+        // through the signed path) and its credit branch (4→5 shrinks it back).
+        dex_call(&mut ctx, CAROL, &signed_leverage_input(&sk, 4));
+        dex_call(
+            &mut ctx,
+            ALICE,
+            &setLeverageCall {
+                marketId: MARKET_ID,
+                leverage: 5,
+            }
+            .abi_encode(),
+        );
+
+        // View stretch #1 — pure reads must not fold the commitment.
+        let c_views = read_commitment(&mut ctx);
+        dex_view(&mut ctx, &getMarkPriceCall { marketId: MARKET_ID }.abi_encode());
+        dex_view(&mut ctx, &getAccountCall { user: ALICE }.abi_encode());
+        dex_view(
+            &mut ctx,
+            &getOpenOrdersCall {
+                user: ALICE,
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        );
+        dex_view(&mut ctx, &getApiKeysCall { user: ALICE }.abi_encode());
+        dex_view(&mut ctx, &getIndexPriceCall { marketId: MARKET_ID }.abi_encode());
+        assert_eq!(
+            read_commitment(&mut ctx),
+            c_views,
+            "view calls must not fold the commitment"
+        );
+
+        // Phase 6 — direct trading.
+        // BOB makes three ask levels, with TWO same-price orders at L1; ALICE
+        // takes L1's head with a user-facing MARKET order (the same-price tail
+        // must survive via the buy-side matcher early-exit), then sweeps the
+        // rest (level clearing + price-list rewrite + best-ask refresh).
+        let bob_l1a = g_place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let bob_l1b = g_place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let _bob_l2 = g_place(&mut ctx, BOB, 1, PRICE + TICK, QTY, 0, 0);
+        let _bob_l3 = g_place(&mut ctx, BOB, 1, PRICE + 2 * TICK, QTY, 0, 0);
+
+        // Book views while three ask levels exist — must not fold either.
+        let c_book_views = read_commitment(&mut ctx);
+        let asks = getBookPricesCall::abi_decode_returns(&dex_view(
+            &mut ctx,
+            &getBookPricesCall {
+                marketId: MARKET_ID,
+                side: 1,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        assert_eq!(asks, vec![PRICE, PRICE + TICK, PRICE + 2 * TICK]);
+        let bids = getBookPricesCall::abi_decode_returns(&dex_view(
+            &mut ctx,
+            &getBookPricesCall {
+                marketId: MARKET_ID,
+                side: 0,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        assert_eq!(bids, vec![PRICE - 5 * TICK], "signed buy must be resting");
+        let l1_queue = getBookLevelCall::abi_decode_returns(&dex_view(
+            &mut ctx,
+            &getBookLevelCall {
+                marketId: MARKET_ID,
+                side: 1,
+                price: PRICE,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        assert_eq!(l1_queue, vec![FixedBytes(bob_l1a), FixedBytes(bob_l1b)]);
+        assert_eq!(
+            read_commitment(&mut ctx),
+            c_book_views,
+            "book views must not fold the commitment"
+        );
+
+        // FOK that cannot fully fill (book depth is 4×QTY up to $102) and a
+        // PostOnly that would cross — both revert under a rolled-back
+        // checkpoint and must leave the commitment untouched.
+        dex_call_expect_revert(
+            &mut ctx,
+            ALICE,
+            &placeOrderCall {
+                marketId: MARKET_ID,
+                side: 0,
+                price: PRICE + 2 * TICK,
+                quantity: 5 * QTY,
+                orderType: 0,
+                tif: 2, // FOK
+                clientOrderId: FixedBytes::default(),
+            }
+            .abi_encode(),
+            "FOK order cannot be fully filled",
+        );
+        dex_call_expect_revert(
+            &mut ctx,
+            ALICE,
+            &placeOrderCall {
+                marketId: MARKET_ID,
+                side: 0,
+                price: PRICE,
+                quantity: QTY,
+                orderType: 0,
+                tif: 3, // PostOnly
+                clientOrderId: FixedBytes::default(),
+            }
+            .abi_encode(),
+            "PostOnly order would match",
+        );
+
+        // Market taker (orderType = 1, price ignored): fills exactly L1's
+        // head; the tail survives through the early-exit save_ask_level.
+        let _alice_taker1 = g_place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);
+        assert_eq!(
+            order_status(&mut ctx, bob_l1a),
+            OrderStatus::Filled as u8,
+            "L1 head maker must be filled"
+        );
+        assert_eq!(
+            order_status(&mut ctx, bob_l1b),
+            OrderStatus::Open as u8,
+            "L1 tail maker must survive the buy-side early-exit"
+        );
+        let _alice_sweep = g_place(&mut ctx, ALICE, 0, PRICE + 2 * TICK, 3 * QTY, 0, 0);
+
+        // Market order against the now-empty ask book: the full remainder
+        // expires on the market path (execute_market_order →
+        // cancel_unfilled_remainder), with no book or balance writes.
+        let mkt = g_place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);
+
+        // PostOnly ask rests away from the market, then the only sell-side
+        // user cancel (remove_ask_price + refresh_best_ask + save_ask_level +
+        // save_sell_orders + sell-side margin release).
+        let po_ask = g_place(&mut ctx, BOB, 1, PRICE + 10 * TICK, QTY, 0, 3);
+        dex_call(
+            &mut ctx,
+            BOB,
+            &cancelOrderCall {
+                orderId: po_ask.into(),
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        );
+
+        // GTC that rests, then explicit cancel; cancelling again must revert.
+        let gtc = g_place(&mut ctx, ALICE, 0, PRICE - 10 * TICK, QTY, 0, 0);
+        dex_call(
+            &mut ctx,
+            ALICE,
+            &cancelOrderCall {
+                orderId: gtc.into(),
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        );
+        dex_call_expect_revert(
+            &mut ctx,
+            ALICE,
+            &cancelOrderCall {
+                orderId: gtc.into(),
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+            "not cancellable",
+        );
+
+        // IOC with no crossing liquidity → Expired.
+        let ioc = g_place(&mut ctx, ALICE, 1, PRICE + 50 * TICK, QTY, 0, 1);
+
+        // Signed cancel of the signed resting buy.
+        dex_call(&mut ctx, CAROL, &signed_cancel_input(&sk, signed_buy));
+
+        // Phase 7 — isolated margin ops.
+        dex_call(
+            &mut ctx,
+            ALICE,
+            &addPositionMarginCall {
+                marketId: MARKET_ID,
+                amount: 500_000,
+            }
+            .abi_encode(),
+        );
+
+        // Phase 8 — funding: one mid-epoch sample, then cross the epoch
+        // boundary (FundingRateComputed + cumulative-index step).
+        dex_call(
+            &mut ctx,
+            ORACLE,
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: PRICE,
+                timestamp: 30,
+            }
+            .abi_encode(),
+        );
+        dex_call(
+            &mut ctx,
+            ORACLE,
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: PRICE,
+                timestamp: 3_615,
+            }
+            .abi_encode(),
+        );
+        // Stale oracle update (same aligned timestamp): accepted but ignored —
+        // it must not write, hence not fold.
+        let c_stale = read_commitment(&mut ctx);
+        dex_call(
+            &mut ctx,
+            ORACLE,
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: PRICE + TICK,
+                timestamp: 3_616,
+            }
+            .abi_encode(),
+        );
+        assert_eq!(
+            read_commitment(&mut ctx),
+            c_stale,
+            "ignored stale oracle update must not fold"
+        );
+
+        // Margin op AFTER the epoch boundary → settle_position_funding runs
+        // with a nonzero index delta (lazy funding settlement on ALICE's long).
+        dex_call(
+            &mut ctx,
+            ALICE,
+            &removePositionMarginCall {
+                marketId: MARKET_ID,
+                amount: 250_000,
+            }
+            .abi_encode(),
+        );
+
+        // Phase 9 — insurance fund, crash, liquidation.
+        dex_call(
+            &mut ctx,
+            ADMIN,
+            &depositInsuranceFundCall { amount: 50_000_000 }.abi_encode(),
+        );
+        dex_call(
+            &mut ctx,
+            ADMIN,
+            &withdrawInsuranceFundCall { amount: 1_000_000 }.abi_encode(),
+        );
+        dex_call_expect_revert(
+            &mut ctx,
+            BOB,
+            &withdrawInsuranceFundCall { amount: 1 }.abi_encode(),
+            "not admin",
+        );
+
+        // ALICE leaves a resting bid AND a resting ask so liquidate()'s
+        // cancel-all clears both book sides. The ask is fully offset by her
+        // 4×QTY long, so it reserves no margin — only the maker fee.
+        let alice_resting_bid = g_place(&mut ctx, ALICE, 0, PRICE - 30 * TICK, QTY, 0, 0);
+        let alice_resting_ask = g_place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
+
+        // Crash: index $100 → $80; ALICE's 5x long drops under maintenance.
+        dex_call(
+            &mut ctx,
+            ORACLE,
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: PRICE - 20 * TICK,
+                timestamp: 3_630,
+            }
+            .abi_encode(),
+        );
+
+        // BOB quotes only 3×QTY of closing liquidity, so the liquidation
+        // closes 3×QTY through the book and settles the residual QTY at mark
+        // price; CAROL (anyone) liquidates.
+        let bob_bid = g_place(&mut ctx, BOB, 0, PRICE - 20 * TICK, 3 * QTY, 0, 0);
+        dex_call(
+            &mut ctx,
+            CAROL,
+            &liquidateCall {
+                user: ALICE,
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        );
+
+        // Phase 9b — CAROL funds up; BOB quotes two same-price bids and CAROL's
+        // taker sell consumes exactly the head (closing BOB's residual short),
+        // so the tail survives via the SELL-side matcher early-exit.
+        dex_call(
+            &mut ctx,
+            CAROL,
+            &depositCall {
+                amount: U256::from(10_000_000u64),
+            }
+            .abi_encode(),
+        );
+        dex_call(
+            &mut ctx,
+            CAROL,
+            &transferToPerpCall { amount: 5_000_000 }.abi_encode(),
+        );
+        let bob_head_bid = g_place(&mut ctx, BOB, 0, PRICE - 20 * TICK, QTY, 0, 0);
+        let bob_tail_bid = g_place(&mut ctx, BOB, 0, PRICE - 20 * TICK, QTY, 0, 0);
+        let carol_close = g_place(&mut ctx, CAROL, 1, PRICE - 20 * TICK, QTY, 0, 0);
+        assert_eq!(
+            order_status(&mut ctx, bob_head_bid),
+            OrderStatus::Filled as u8,
+            "head bid must be filled by CAROL's taker sell"
+        );
+        let tail_queue = getBookLevelCall::abi_decode_returns(&dex_view(
+            &mut ctx,
+            &getBookLevelCall {
+                marketId: MARKET_ID,
+                side: 0,
+                price: PRICE - 20 * TICK,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        assert_eq!(
+            tail_queue,
+            vec![FixedBytes(bob_tail_bid)],
+            "tail bid must survive the sell-side early-exit"
+        );
+
+        // Phase 10 — solvent exit + api-key delete (empty-blob fold).
+        dex_call(
+            &mut ctx,
+            BOB,
+            &transferFromPerpCall {
+                amount: 500_000_000,
+            }
+            .abi_encode(),
+        );
+        dex_call(
+            &mut ctx,
+            BOB,
+            &withdrawCall {
+                amount: U256::from(500_000_000u64),
+            }
+            .abi_encode(),
+        );
+        dex_call(&mut ctx, ALICE, &revokeApiKeyCall { keyId: 0 }.abi_encode());
+
+        // Hand over admin last, after all fee-sink activity (the snapshot reads
+        // ADMIN's account explicitly, so the handover does not disturb it).
+        // Auth + zero-address gates first, under rolled-back checkpoints.
+        dex_call_expect_revert(
+            &mut ctx,
+            ADMIN,
+            &transferAdminCall {
+                newAdmin: Address::ZERO,
+            }
+            .abi_encode(),
+            "cannot be zero address",
+        );
+        dex_call_expect_revert(
+            &mut ctx,
+            BOB,
+            &transferAdminCall { newAdmin: BOB }.abi_encode(),
+            "caller is not admin",
+        );
+        dex_call(
+            &mut ctx,
+            ADMIN,
+            &transferAdminCall {
+                newAdmin: NEW_ADMIN,
+            }
+            .abi_encode(),
+        );
+
+        // View stretch #2 — final reads must not fold either.
+        let c_final_views = read_commitment(&mut ctx);
+        dex_view(
+            &mut ctx,
+            &getAveragePremiumIndexCall {
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        );
+        let snapshot = take_snapshot(
+            &mut ctx,
+            &ScenarioOrderIds {
+                signed_buy,
+                gtc,
+                ioc,
+                mkt,
+                po_ask,
+                alice_resting_bid,
+                alice_resting_ask,
+                bob_bid,
+                bob_tail_bid,
+                carol_close,
+            },
+        );
+        let commitment = read_commitment(&mut ctx);
+        assert_eq!(
+            commitment, c_final_views,
+            "snapshot views must not fold the commitment"
+        );
+
+        (B256::from(commitment.to_be_bytes::<32>()), snapshot)
+    }
+
+    /// Order IDs collected while the scenario runs, queried by the snapshot.
+    struct ScenarioOrderIds {
+        signed_buy: [u8; 32],
+        gtc: [u8; 32],
+        ioc: [u8; 32],
+        mkt: [u8; 32],
+        po_ask: [u8; 32],
+        alice_resting_bid: [u8; 32],
+        alice_resting_ask: [u8; 32],
+        bob_bid: [u8; 32],
+        bob_tail_bid: [u8; 32],
+        carol_close: [u8; 32],
+    }
+
+    fn take_snapshot(ctx: &mut TestCtx, ids: &ScenarioOrderIds) -> BusinessSnapshot {
+        let alice_pos = getPositionCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getPositionCall {
+                user: ALICE,
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        let bob_pos = getPositionCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getPositionCall {
+                user: BOB,
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        let carol_pos = getPositionCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getPositionCall {
+                user: CAROL,
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        let alice_acct = getAccountCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getAccountCall { user: ALICE }.abi_encode(),
+        ))
+        .unwrap();
+        let bob_acct = getAccountCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getAccountCall { user: BOB }.abi_encode(),
+        ))
+        .unwrap();
+        let carol_acct = getAccountCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getAccountCall { user: CAROL }.abi_encode(),
+        ))
+        .unwrap();
+        let admin_acct = getAccountCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getAccountCall { user: ADMIN }.abi_encode(),
+        ))
+        .unwrap();
+        let insurance_fund =
+            getInsuranceFundCall::abi_decode_returns(&dex_view(
+                ctx,
+                &getInsuranceFundCall {}.abi_encode(),
+            ))
+            .unwrap();
+        let market_fee_total = getMarketFeeTotalCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getMarketFeeTotalCall {
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        let mark_price = getMarkPriceCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getMarkPriceCall {
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        let funding = getFundingStateCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getFundingStateCall {
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        ))
+        .unwrap();
+        let bob_erc20 = storage::load_erc20_balance(ctx, USDC_ADDRESS, BOB).unwrap();
+
+        BusinessSnapshot {
+            alice_position: (alice_pos.amount, alice_pos.vQuoteBalance, alice_pos.margin),
+            bob_position: (bob_pos.amount, bob_pos.vQuoteBalance, bob_pos.margin),
+            carol_position: (carol_pos.amount, carol_pos.vQuoteBalance, carol_pos.margin),
+            alice_account: (alice_acct.usdcBalance, alice_acct.perpWalletBalance),
+            bob_account: (bob_acct.usdcBalance, bob_acct.perpWalletBalance),
+            carol_account: (carol_acct.usdcBalance, carol_acct.perpWalletBalance),
+            bob_erc20,
+            admin_perp_wallet: admin_acct.perpWalletBalance,
+            insurance_fund,
+            market_fee_total,
+            mark_price,
+            funding: (funding.lastFundingRate, funding.nextFundingTs),
+            signed_buy_status: order_status(ctx, ids.signed_buy),
+            gtc_cancelled_status: order_status(ctx, ids.gtc),
+            ioc_status: order_status(ctx, ids.ioc),
+            mkt_expired_status: order_status(ctx, ids.mkt),
+            po_ask_cancelled_status: order_status(ctx, ids.po_ask),
+            liq_cancelled_bid_status: order_status(ctx, ids.alice_resting_bid),
+            liq_cancelled_ask_status: order_status(ctx, ids.alice_resting_ask),
+            bob_bid_status: order_status(ctx, ids.bob_bid),
+            bob_tail_bid_status: order_status(ctx, ids.bob_tail_bid),
+            carol_close_status: order_status(ctx, ids.carol_close),
+        }
+    }
+
+    // ── The guards ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn commitment_golden_scenario() {
+        let (commitment, snapshot) = run_golden_scenario();
+        // Printed for the (re-)pin procedure — visible with --nocapture or on failure.
+        println!("golden commitment = {commitment}");
+        println!("golden snapshot = {snapshot:#?}");
+        assert_eq!(
+            commitment, GOLDEN_COMMITMENT,
+            "perp write-stream commitment drifted: SAFE refactors must keep it \
+             bit-identical; only CHAIN changes may re-pin (see module docs)"
+        );
+        assert_eq!(
+            snapshot,
+            expected_snapshot(),
+            "business end-state drifted — semantics changed, not just the hash"
+        );
+    }
+
+    #[test]
+    fn commitment_golden_deterministic() {
+        let first = run_golden_scenario();
+        let second = run_golden_scenario();
+        assert_eq!(first.0, second.0, "commitment must be deterministic");
+        assert_eq!(first.1, second.1, "business end-state must be deterministic");
+    }
+}
