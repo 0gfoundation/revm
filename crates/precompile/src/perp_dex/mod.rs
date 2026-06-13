@@ -20,7 +20,7 @@
 use std::{collections::HashMap, sync::OnceLock};
 
 use alloy_sol_types::SolCall;
-use context::ContextTr;
+use context::{ContextTr, JournalTr};
 use primitives::{address, Address, U256};
 
 use crate::{
@@ -188,6 +188,16 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
     is_static: bool,
     context: &mut CTX,
 ) -> PrecompileResult {
+    // P2 invariant: the per-call commitment fold accumulator must be empty on entry — every prior
+    // call flushed (Ok) or discarded (revert/fatal) it, and the EVM frame restores it to None on a
+    // reverted call. The pre-dispatch early returns below (bad selector / out-of-gas / static
+    // violation) skip flush/discard, which is sound ONLY because nothing has folded yet; this
+    // assert keeps that invariant self-enforcing against future refactors.
+    debug_assert!(
+        context.journal_mut().perp_fold_get().is_none(),
+        "perp commitment fold accumulator leaked from a previous call"
+    );
+
     let selector: [u8; 4] = input_bytes
         .get(..4)
         .and_then(|s| s.try_into().ok())
@@ -294,10 +304,13 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         _ => return Err(PrecompileError::StatefulInvalidInput),
     };
 
-    // Per-call commitment fold (P2): on success, sstore the single accumulated value once; on
-    // revert/fatal, discard it. The frame's checkpoint_revert undoes the perp overlay writes and
-    // the anchor slot was never written this call, so it stays at its pre-call value — net
-    // behavior is identical to the former per-store fold (which sstored N times then reverted).
+    // Per-call commitment fold (P2): on success, sstore the single accumulated value once. On
+    // revert/fatal, discard the accumulator (clear it to None). The anchor slot was never written
+    // this call (flush did not run), so it already sits at its pre-call value — net-identical to
+    // the former per-store fold which sstored N times then had them reverted. In the normal EVM
+    // path the surrounding frame's checkpoint_revert also undoes the perp overlay writes and
+    // restores the (None) fold snapshot; the discard here is what guarantees no stale fold leaks
+    // into the next call for the non-frame-reverting Err path and for direct-driver tests.
     let result = match result {
         Ok(bytes) => storage::flush_commitment(context).map(|()| bytes),
         other => {

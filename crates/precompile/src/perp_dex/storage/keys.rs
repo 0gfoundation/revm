@@ -72,6 +72,10 @@ pub fn erc20_balance_slot(account: Address) -> B256 {
 ///
 /// Precomputed `keccak256(b"cmit")` — this is hashed on every `store_blob` fold, so it must
 /// not be recomputed per call. Pinned against the live derivation in `const_key_tests`.
+///
+/// Invariant: this slot is written ONLY by `storage::flush_commitment` (the per-call fold flush).
+/// The per-call accumulator seeds itself from a single `sload` of this slot, so any future code
+/// that needs to change the commitment must go through the accumulator, never a raw `sstore` here.
 pub const COMMITMENT_SLOT: B256 =
     b256!("0x5315529dd419e7000541b58e86740e824fd9f29774b5ca4423b92157a3c38b37");
 

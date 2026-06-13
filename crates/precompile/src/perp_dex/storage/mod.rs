@@ -1071,6 +1071,34 @@ mod commitment_tests {
         ctx.journal_mut().checkpoint_revert(cp);
         assert_eq!(read_commitment(&mut ctx), before); // reverted write's commitment update rolled back
     }
+
+    /// Exercises the `JournalCheckpoint` fold-accumulator snapshot/restore with a NON-empty
+    /// accumulator at the checkpoint — the path the inner fuzz test (which drives `perp_store`
+    /// directly, leaving the fold `None`) never reaches. A checkpoint is taken mid-call after one
+    /// store, a second store is made and then reverted, and a third store proceeds; the flushed
+    /// commitment must equal the per-store chain over only the surviving writes (w0, w2).
+    #[test]
+    fn fold_snapshot_restores_under_mid_call_checkpoint_revert() {
+        let (k0, b0) = (B256::with_last_byte(0xA0), vec![0x01u8, 0x02]);
+        let (k1, b1) = (B256::with_last_byte(0xA1), vec![0x03u8]); // reverted
+        let (k2, b2) = (B256::with_last_byte(0xA2), vec![0x04u8, 0x05, 0x06]);
+
+        let mut ctx = new_test_ctx();
+        store_blob(&mut ctx, k0, &b0).unwrap();
+        // Checkpoint with a NON-None accumulator (k0 folded but not yet flushed).
+        let cp = ctx.journal_mut().checkpoint();
+        store_blob(&mut ctx, k1, &b1).unwrap();
+        // Revert: drops the k1 overlay write and restores the accumulator to its post-k0 value.
+        ctx.journal_mut().checkpoint_revert(cp);
+        // The next store must fold from the RESTORED accumulator, not re-seed or include k1.
+        store_blob(&mut ctx, k2, &b2).unwrap();
+        flush_commitment(&mut ctx).unwrap();
+
+        let expected = expect_chain(expect_chain(U256::ZERO, k0, &b0), k2, &b2);
+        assert_eq!(read_commitment(&mut ctx), expected);
+        // The reverted blob must be gone from the overlay, in lock-step with the fold.
+        assert!(load_blob(&mut ctx, k1).unwrap().is_empty(), "reverted write must leave no overlay residue");
+    }
 }
 
 #[cfg(test)]
