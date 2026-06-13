@@ -128,12 +128,13 @@ pub struct JournalInner<ENTRY> {
     /// Off-trie PerpDEX overlay + undo log. Journaled like the rest of the state, but never
     /// folded into the [`EvmState`] returned by [`Self::finalize`], so it stays off the trie.
     pub perp: PerpSection,
-    /// Per-call PerpDEX commitment fold accumulator. Holds the running chained commitment `C`
-    /// during a single precompile call so the on-trie anchor slot is sstored ONCE at call exit
-    /// instead of on every off-trie write. Always `None` at call/tx boundaries (flushed or
-    /// discarded at call exit); snapshotted into [`JournalCheckpoint`] and restored on revert.
-    /// Never folded into [`EvmState`].
-    pub perp_commitment_fold: Option<U256>,
+    /// Per-call PerpDEX commitment log. Each off-trie write appends its framed bytes
+    /// (`key ‖ len ‖ value`); the whole log is hashed ONCE at call exit
+    /// (`C_new = H(C_prev ‖ ver ‖ log)`) and sstored to the on-trie anchor, instead of sload+sstore
+    /// per write. Always empty at call/tx boundaries (flushed or discarded at call exit); its
+    /// length is snapshotted into [`JournalCheckpoint`] and truncated back on revert. Never folded
+    /// into [`EvmState`].
+    pub perp_commitment_log: Vec<u8>,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -158,7 +159,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             spec: SpecId::default(),
             warm_addresses: WarmAddresses::new(),
             perp: PerpSection::default(),
-            perp_commitment_fold: None,
+            perp_commitment_log: Vec::new(),
         }
     }
 
@@ -193,22 +194,22 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         self.perp.take_delta()
     }
 
-    /// Reads the per-call PerpDEX commitment fold accumulator (`None` = not seeded this call).
+    /// Appends framed bytes for one off-trie write to the per-call PerpDEX commitment log.
     #[inline]
-    pub fn perp_fold_get(&self) -> Option<U256> {
-        self.perp_commitment_fold
+    pub fn perp_fold_append(&mut self, bytes: &[u8]) {
+        self.perp_commitment_log.extend_from_slice(bytes);
     }
 
-    /// Sets the per-call PerpDEX commitment fold accumulator.
+    /// Takes (clears) the per-call PerpDEX commitment log for the call-exit hash.
     #[inline]
-    pub fn perp_fold_set(&mut self, c: U256) {
-        self.perp_commitment_fold = Some(c);
+    pub fn perp_fold_take_log(&mut self) -> Vec<u8> {
+        mem::take(&mut self.perp_commitment_log)
     }
 
-    /// Takes (clears) the per-call PerpDEX commitment fold accumulator.
+    /// Current length of the per-call PerpDEX commitment log.
     #[inline]
-    pub fn perp_fold_take(&mut self) -> Option<U256> {
-        self.perp_commitment_fold.take()
+    pub fn perp_fold_log_len(&self) -> usize {
+        self.perp_commitment_log.len()
     }
 
     /// Prepare for next transaction, by committing the current journal to history, incrementing the transaction id
@@ -231,7 +232,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             spec,
             warm_addresses,
             perp,
-            perp_commitment_fold,
+            perp_commitment_log,
         } = self;
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
@@ -246,9 +247,9 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // like `state` above); only the tx-scoped undo log is spent.
         perp.undo.clear();
 
-        // The commitment fold accumulator is call-scoped (flushed/discarded at each precompile
-        // call exit), so it must be empty at this tx boundary; reset defensively against any leak.
-        *perp_commitment_fold = None;
+        // The commitment log is call-scoped (hashed/discarded at each precompile call exit), so it
+        // must be empty at this tx boundary; reset defensively against any leak.
+        perp_commitment_log.clear();
 
         // Clear coinbase address warming for next tx
         warm_addresses.clear_coinbase();
@@ -270,7 +271,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             spec,
             warm_addresses,
             perp,
-            perp_commitment_fold,
+            perp_commitment_log,
         } = self;
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
@@ -280,8 +281,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // Revert this transaction's perp overlay writes too (mirrors the journal revert above),
         // so a discarded tx leaves no perp residue.
         perp.undo_to(0);
-        // Call-scoped accumulator must be empty at this tx boundary; reset defensively.
-        *perp_commitment_fold = None;
+        // Call-scoped commitment log must be empty at this tx boundary; reset defensively.
+        perp_commitment_log.clear();
         transient_storage.clear();
         *depth = 0;
         logs.clear();
@@ -309,7 +310,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             spec,
             warm_addresses,
             perp,
-            perp_commitment_fold,
+            perp_commitment_log,
         } = self;
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
@@ -331,8 +332,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // write before it could be harvested (canonical_perp stayed empty forever). Only the
         // tx-scoped undo log is reset, mirroring `commit_tx`, which already keeps `working`.
         perp.undo.clear();
-        // Call-scoped accumulator must be empty at this tx boundary; reset defensively.
-        *perp_commitment_fold = None;
+        // Call-scoped commitment log must be empty at this tx boundary; reset defensively.
+        perp_commitment_log.clear();
 
         // clear journal and journal history.
         journal.clear();
@@ -630,7 +631,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             log_i: self.logs.len(),
             journal_i: self.journal.len(),
             perp_journal_i: self.perp.undo.len(),
-            perp_commitment_fold: self.perp_commitment_fold,
+            perp_commitment_log_len: self.perp_commitment_log.len(),
         };
         self.depth += 1;
         checkpoint
@@ -665,9 +666,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // the EVM journal entries above.
         self.perp.undo_to(checkpoint.perp_journal_i);
 
-        // Restore the per-call commitment fold accumulator to its value at the checkpoint, so a
-        // mid-call checkpoint/revert keeps the running fold consistent with the reverted overlay.
-        self.perp_commitment_fold = checkpoint.perp_commitment_fold;
+        // Truncate the per-call commitment log back to its checkpoint length, dropping the framed
+        // writes appended after the checkpoint so the call-exit hash stays consistent with the
+        // reverted overlay. The log is append-only within a call, so a length truncate suffices.
+        self.perp_commitment_log.truncate(checkpoint.perp_commitment_log_len);
     }
 
     /// Performs selfdestruct action.

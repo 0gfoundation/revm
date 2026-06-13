@@ -188,14 +188,14 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
     is_static: bool,
     context: &mut CTX,
 ) -> PrecompileResult {
-    // P2 invariant: the per-call commitment fold accumulator must be empty on entry — every prior
-    // call flushed (Ok) or discarded (revert/fatal) it, and the EVM frame restores it to None on a
-    // reverted call. The pre-dispatch early returns below (bad selector / out-of-gas / static
-    // violation) skip flush/discard, which is sound ONLY because nothing has folded yet; this
-    // assert keeps that invariant self-enforcing against future refactors.
+    // Invariant: the per-call commitment log must be empty on entry — every prior call hashed
+    // (Ok) or discarded (revert/fatal) it, and the EVM frame truncates it on a reverted call. The
+    // pre-dispatch early returns below (bad selector / out-of-gas / static violation) skip
+    // flush/discard, which is sound ONLY because nothing has been appended yet; this assert keeps
+    // that invariant self-enforcing against future refactors.
     debug_assert!(
-        context.journal_mut().perp_fold_get().is_none(),
-        "perp commitment fold accumulator leaked from a previous call"
+        context.journal_mut().perp_fold_log_len() == 0,
+        "perp commitment log leaked from a previous call"
     );
 
     let selector: [u8; 4] = input_bytes

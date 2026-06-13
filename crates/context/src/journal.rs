@@ -330,18 +330,18 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
-    fn perp_fold_get(&mut self) -> Option<U256> {
-        self.inner.perp_fold_get()
+    fn perp_fold_append(&mut self, bytes: &[u8]) {
+        self.inner.perp_fold_append(bytes);
     }
 
     #[inline]
-    fn perp_fold_set(&mut self, c: U256) {
-        self.inner.perp_fold_set(c);
+    fn perp_fold_take_log(&mut self) -> Vec<u8> {
+        self.inner.perp_fold_take_log()
     }
 
     #[inline]
-    fn perp_fold_take(&mut self) -> Option<U256> {
-        self.inner.perp_fold_take()
+    fn perp_fold_log_len(&mut self) -> usize {
+        self.inner.perp_fold_log_len()
     }
 
     /// Clear current journal resetting it to initial state and return changes state.

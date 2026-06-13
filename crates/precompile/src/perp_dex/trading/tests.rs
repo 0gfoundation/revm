@@ -1704,12 +1704,14 @@ mod golden {
     /// Pinned final commitment-slot value of `run_golden_scenario`.
     /// Capture/re-pin procedure: run `commitment_golden_scenario` and copy the
     /// `golden commitment =` line it prints (also shown in the assert diff).
-    /// Last re-pin 2026-06-12: scenario extended (sell-side cancel, both
-    /// matcher early-exits, market orders, FOK/PostOnly, leverage rebalance,
-    /// setLeverageSigned, residual mark-price settle, transferAdmin, book
-    /// views) — snapshot re-derived by hand and matched before re-pinning.
+    /// Last re-pin 2026-06-14 (P4/16b): commitment construction changed from a
+    /// per-store chained keccak to a single keccak over a per-call length-framed
+    /// log — CHAIN change, value re-pinned. The business SNAPSHOT below is
+    /// unchanged from the 16b switch (pure commitment-hashing change), which is
+    /// the correctness guard that survives across hash re-pins.
+    /// (Prior re-pins: 2026-06-12 scenario-extension 0x2d5fa5…; original P0.)
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x2d5fa59ef95d08950128981014181733fba336589e92c4a04c2b849459de75fa");
+        b256!("0x69e6996937a0d302367373f7977f8fc4f08ba57e0d52e5fdbb5f7d5383079eee");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

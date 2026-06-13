@@ -68,61 +68,57 @@ fn store_blob<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     context.journal_mut().perp_store(key, buf.to_vec());
 
-    // Global chained commitment over the off-trie perp write-stream, anchored ON-trie under
-    // 0x1003 so divergence surfaces in the state root (consensus-detectable). Folds EVERY write
-    // (incl. empty-buf deletes) in execution order: C = keccak256(C ‖ key ‖ buf).
-    //
-    // The fold is accumulated in a per-call in-memory accumulator and sstored ONCE at call exit
-    // (`flush_commitment`), instead of sload+sstore on every write. The fold *sequence* is
-    // byte-identical to the per-store chain, so the slot's final value (hence the state root) is
-    // unchanged — only the number of intermediate (unobservable) sstores drops from N to 1.
-    let c_old = match context.journal_mut().perp_fold_get() {
-        Some(c) => c,
-        None => {
-            // First store of this call: seed from the committed on-trie running value. Warm
-            // 0x1003 so the sload (and the later flush sstore) have an account to operate on —
-            // 0x1003 is the precompile's own call target so it is normally pre-loaded, but warm it
-            // explicitly to mirror the erc20 path and stay robust.
-            context
-                .journal_mut()
-                .warm_account(PERP_DEX_ADDRESS)
-                .map_err(convert_db_err::<CTX::Db>)?;
-            context
-                .journal_mut()
-                .sload(PERP_DEX_ADDRESS, commitment_slot().into())
-                .map_err(convert_db_err::<CTX::Db>)?
-                .data
-        }
-    };
-    // Streaming keccak over (C ‖ key ‖ buf) — digest identical to hashing the concatenation,
-    // without allocating a 64+len preimage buffer per store.
-    let mut hasher = alloy_primitives::Keccak256::new();
-    hasher.update(c_old.to_be_bytes::<32>());
-    hasher.update(key.as_slice());
-    hasher.update(buf);
-    let c_new = U256::from_be_bytes(hasher.finalize().0);
-    context.journal_mut().perp_fold_set(c_new);
+    // Global commitment over the off-trie perp write-stream, anchored ON-trie under 0x1003 so
+    // divergence surfaces in the state root (consensus-detectable). Every write (incl. empty-buf
+    // deletes) is appended to a per-call in-memory LOG, framed `key(32) ‖ len(u32 BE) ‖ value`,
+    // and the whole log is hashed ONCE at call exit (`flush_commitment`):
+    //   C_new = keccak256(C_prev ‖ COMMITMENT_VERSION ‖ log)
+    // (P4/16b). This replaces the former per-store chained fold — one hash over a length-framed
+    // log instead of N chained keccaks + N sstores. It CHANGES the 0x1003 commitment value vs the
+    // chained scheme, so it requires a fresh chain (devnet wipe); the length prefix keeps the log
+    // injective over variable-length blobs.
+    let mut framed = Vec::with_capacity(32 + 4 + buf.len());
+    framed.extend_from_slice(key.as_slice());
+    framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
+    framed.extend_from_slice(buf);
+    context.journal_mut().perp_fold_append(&framed);
     Ok(())
 }
 
-/// Flushes the per-call commitment fold accumulator to the on-trie anchor slot under 0x1003.
+/// Version byte mixed into the per-call commitment hash, so the framed-log construction can evolve
+/// (e.g. a future block-level fold) while staying distinguishable.
+const COMMITMENT_VERSION: u8 = 1;
+
+/// Hashes the per-call commitment log into the on-trie anchor slot under 0x1003.
 ///
-/// Called once at the end of every successful `run_perp_dex_call`; a no-op if the call performed
-/// no `store_blob`. The sstore is journaled, so it reverts with the surrounding frame exactly like
-/// the former per-store sstore. The `touch_account` is required so the slot change is included in
-/// the BundleState transition (a normal perp tx does not otherwise touch 0x1003's on-trie storage,
-/// since its bulk writes are off-trie); mirrors `save_erc20_balance`.
+/// Called once at the end of every successful `run_perp_dex_call`; a no-op if the call performed no
+/// `store_blob` (empty log). Reads the running commitment `C_prev` from the slot, computes
+/// `C_new = keccak256(C_prev ‖ COMMITMENT_VERSION ‖ log)`, and sstores it. The sstore is journaled,
+/// so it reverts with the surrounding frame. `touch_account` is required so the slot change is
+/// included in the BundleState transition (a normal perp tx does not otherwise touch 0x1003's
+/// on-trie storage — its bulk writes are off-trie); mirrors `save_erc20_balance`.
 ///
 /// Tests that drive `store_blob` / `run_*` directly (bypassing the dispatch) must call this to make
-/// the folded commitment observable on the slot.
+/// the commitment observable on the slot.
 pub(crate) fn flush_commitment<CTX: ContextTr>(context: &mut CTX) -> Result<(), PrecompileError> {
-    let Some(c_new) = context.journal_mut().perp_fold_take() else {
+    let log = context.journal_mut().perp_fold_take_log();
+    if log.is_empty() {
         return Ok(());
-    };
+    }
     context
         .journal_mut()
         .warm_account(PERP_DEX_ADDRESS)
         .map_err(convert_db_err::<CTX::Db>)?;
+    let c_prev = context
+        .journal_mut()
+        .sload(PERP_DEX_ADDRESS, commitment_slot().into())
+        .map_err(convert_db_err::<CTX::Db>)?
+        .data;
+    let mut hasher = alloy_primitives::Keccak256::new();
+    hasher.update(c_prev.to_be_bytes::<32>());
+    hasher.update([COMMITMENT_VERSION]);
+    hasher.update(&log);
+    let c_new = U256::from_be_bytes(hasher.finalize().0);
     context
         .journal_mut()
         .sstore(PERP_DEX_ADDRESS, commitment_slot().into(), c_new)
@@ -131,14 +127,13 @@ pub(crate) fn flush_commitment<CTX: ContextTr>(context: &mut CTX) -> Result<(), 
     Ok(())
 }
 
-/// Discards the per-call commitment fold accumulator without writing it (revert / fatal path).
+/// Discards the per-call commitment log without hashing it (revert / fatal path).
 ///
 /// The surrounding frame's `checkpoint_revert` undoes the perp overlay writes, and the anchor slot
-/// was never written this call, so it stays at its pre-call value — net-identical to reverting the
-/// former N per-store sstores. Taking the accumulator here also prevents it leaking into the next
-/// call in the same transaction.
+/// was never written this call, so it stays at its pre-call value. Clearing the log here also
+/// prevents it leaking into the next call in the same transaction.
 pub(crate) fn discard_commitment_fold<CTX: ContextTr>(context: &mut CTX) {
-    let _ = context.journal_mut().perp_fold_take();
+    let _ = context.journal_mut().perp_fold_take_log();
 }
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
@@ -989,64 +984,61 @@ mod commitment_tests {
             .data
     }
 
-    fn expect_chain(prev: U256, key: B256, blob: &[u8]) -> U256 {
+    /// Reference model of one call's commitment hash (P4/16b):
+    /// `C_new = keccak256(C_prev ‖ COMMITMENT_VERSION ‖ Σ(key(32) ‖ len(u32 BE) ‖ value))`,
+    /// the writes in execution order.
+    fn expect_framed(prev: U256, writes: &[(B256, &[u8])]) -> U256 {
         let mut p = Vec::new();
         p.extend_from_slice(&prev.to_be_bytes::<32>());
-        p.extend_from_slice(key.as_slice());
-        p.extend_from_slice(blob);
+        p.push(COMMITMENT_VERSION);
+        for (key, blob) in writes {
+            p.extend_from_slice(key.as_slice());
+            p.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+            p.extend_from_slice(blob);
+        }
         U256::from_be_bytes(keccak256(&p).0)
     }
 
     #[test]
-    fn commitment_chains_over_writes() {
+    fn commitment_framed_log_over_writes() {
         let mut ctx = new_test_ctx();
         assert_eq!(read_commitment(&mut ctx), U256::ZERO); // genesis init = 0
 
-        // P2: the fold is accumulated in-memory and only sstored at `flush_commitment` (call
-        // exit). Flush after each store so the slot is observable at per-store granularity.
+        // Each store+flush is one call hashing a 1-write log against the running C_prev.
         let (k1, b1) = (B256::with_last_byte(1), vec![0xAAu8]);
         let (k2, b2) = (B256::with_last_byte(2), vec![0xBBu8, 0xCC]);
         store_blob(&mut ctx, k1, &b1).unwrap();
         flush_commitment(&mut ctx).unwrap();
-        let c1 = expect_chain(U256::ZERO, k1, &b1);
+        let c1 = expect_framed(U256::ZERO, &[(k1, &b1)]);
         assert_eq!(read_commitment(&mut ctx), c1);
         store_blob(&mut ctx, k2, &b2).unwrap();
         flush_commitment(&mut ctx).unwrap();
-        let c2 = expect_chain(c1, k2, &b2);
+        let c2 = expect_framed(c1, &[(k2, &b2)]);
         assert_eq!(read_commitment(&mut ctx), c2);
         assert_ne!(c2, c1);
     }
 
-    /// The per-call accumulator must fold to the SAME value whether flushed after every store
-    /// (N sstores) or once after all stores (1 sstore) — this is the byte-identity that makes P2
-    /// SAFE. Also checks the slot only advances on flush, not on store.
+    /// A whole call's writes are accumulated into one log and hashed ONCE at flush; the slot must
+    /// not move until the flush. With 16b (no coalescing) the log preserves execution order,
+    /// including a key written twice.
     #[test]
-    fn commitment_accumulates_per_call_then_flushes_once() {
+    fn commitment_single_call_hashes_log_once() {
         let writes: [(B256, Vec<u8>); 3] = [
             (B256::with_last_byte(1), vec![0xAA]),
             (B256::with_last_byte(2), vec![0xBB, 0xCC]),
-            (B256::with_last_byte(1), vec![0xDD]), // same key written twice in one call
+            (B256::with_last_byte(1), vec![0xDD]), // same key twice in one call
         ];
-
-        // Reference: flush after each store.
-        let mut ref_ctx = new_test_ctx();
-        for (k, b) in &writes {
-            store_blob(&mut ref_ctx, *k, b).unwrap();
-            flush_commitment(&mut ref_ctx).unwrap();
-        }
-        let expected = read_commitment(&mut ref_ctx);
-
-        // Per-call: all stores, then a single flush. The slot must NOT move until the flush.
         let mut ctx = new_test_ctx();
         for (k, b) in &writes {
             store_blob(&mut ctx, *k, b).unwrap();
             assert_eq!(read_commitment(&mut ctx), U256::ZERO, "slot must not move before flush");
         }
         flush_commitment(&mut ctx).unwrap();
-        assert_eq!(read_commitment(&mut ctx), expected, "single flush == per-store flushes");
+        let refs: Vec<(B256, &[u8])> = writes.iter().map(|(k, b)| (*k, b.as_slice())).collect();
+        assert_eq!(read_commitment(&mut ctx), expect_framed(U256::ZERO, &refs));
     }
 
-    /// `flush_commitment` is a no-op when the call performed no `store_blob`.
+    /// `flush_commitment` is a no-op when the call performed no `store_blob` (empty log).
     #[test]
     fn flush_is_noop_without_stores() {
         let mut ctx = new_test_ctx();
@@ -1061,9 +1053,8 @@ mod commitment_tests {
         flush_commitment(&mut ctx).unwrap();
         let before = read_commitment(&mut ctx);
 
-        // The flush sstore is journaled, so a checkpoint_revert after it rolls the slot back —
-        // exactly as the former per-store sstore did. The checkpoint also snapshots the (here
-        // empty) fold accumulator and restores it on revert.
+        // The flush sstore is journaled, so a checkpoint_revert after it rolls the slot back. The
+        // checkpoint also snapshots the (here empty) commitment-log length and truncates on revert.
         let cp = ctx.journal_mut().checkpoint();
         store_blob(&mut ctx, B256::with_last_byte(2), &[0xBB]).unwrap();
         flush_commitment(&mut ctx).unwrap();
@@ -1072,31 +1063,31 @@ mod commitment_tests {
         assert_eq!(read_commitment(&mut ctx), before); // reverted write's commitment update rolled back
     }
 
-    /// Exercises the `JournalCheckpoint` fold-accumulator snapshot/restore with a NON-empty
-    /// accumulator at the checkpoint — the path the inner fuzz test (which drives `perp_store`
-    /// directly, leaving the fold `None`) never reaches. A checkpoint is taken mid-call after one
-    /// store, a second store is made and then reverted, and a third store proceeds; the flushed
-    /// commitment must equal the per-store chain over only the surviving writes (w0, w2).
+    /// Exercises the `JournalCheckpoint` commitment-log truncation with a NON-empty log at the
+    /// checkpoint — the path the inner fuzz test (which drives `perp_store` directly, never
+    /// appending to the log) never reaches. A checkpoint is taken mid-call after one store, a
+    /// second store is made and reverted, then a third store proceeds; the flushed commitment must
+    /// equal the framed log over only the surviving writes (w0, w2) in order.
     #[test]
-    fn fold_snapshot_restores_under_mid_call_checkpoint_revert() {
+    fn log_truncates_under_mid_call_checkpoint_revert() {
         let (k0, b0) = (B256::with_last_byte(0xA0), vec![0x01u8, 0x02]);
         let (k1, b1) = (B256::with_last_byte(0xA1), vec![0x03u8]); // reverted
         let (k2, b2) = (B256::with_last_byte(0xA2), vec![0x04u8, 0x05, 0x06]);
 
         let mut ctx = new_test_ctx();
         store_blob(&mut ctx, k0, &b0).unwrap();
-        // Checkpoint with a NON-None accumulator (k0 folded but not yet flushed).
+        // Checkpoint with a NON-empty log (k0 appended but not yet hashed).
         let cp = ctx.journal_mut().checkpoint();
         store_blob(&mut ctx, k1, &b1).unwrap();
-        // Revert: drops the k1 overlay write and restores the accumulator to its post-k0 value.
+        // Revert: drops the k1 overlay write and truncates the log back to its post-k0 length.
         ctx.journal_mut().checkpoint_revert(cp);
-        // The next store must fold from the RESTORED accumulator, not re-seed or include k1.
+        // The next store appends to the TRUNCATED log, so k1 is absent from the final hash.
         store_blob(&mut ctx, k2, &b2).unwrap();
         flush_commitment(&mut ctx).unwrap();
 
-        let expected = expect_chain(expect_chain(U256::ZERO, k0, &b0), k2, &b2);
+        let expected = expect_framed(U256::ZERO, &[(k0, &b0), (k2, &b2)]);
         assert_eq!(read_commitment(&mut ctx), expected);
-        // The reverted blob must be gone from the overlay, in lock-step with the fold.
+        // The reverted blob must be gone from the overlay, in lock-step with the log truncation.
         assert!(load_blob(&mut ctx, k1).unwrap().is_empty(), "reverted write must leave no overlay residue");
     }
 }
