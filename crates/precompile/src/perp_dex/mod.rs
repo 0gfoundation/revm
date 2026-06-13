@@ -294,6 +294,18 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         _ => return Err(PrecompileError::StatefulInvalidInput),
     };
 
+    // Per-call commitment fold (P2): on success, sstore the single accumulated value once; on
+    // revert/fatal, discard it. The frame's checkpoint_revert undoes the perp overlay writes and
+    // the anchor slot was never written this call, so it stays at its pre-call value — net
+    // behavior is identical to the former per-store fold (which sstored N times then reverted).
+    let result = match result {
+        Ok(bytes) => storage::flush_commitment(context).map(|()| bytes),
+        other => {
+            storage::discard_commitment_fold(context);
+            other
+        }
+    };
+
     match result {
         Ok(bytes) => Ok(PrecompileOutput::new(gas_used, bytes)),
         // Fatal errors propagate as-is (storage / system bugs).

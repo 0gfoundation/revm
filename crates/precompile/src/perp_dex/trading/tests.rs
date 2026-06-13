@@ -1180,6 +1180,9 @@ fn perp_data_stays_off_trie_not_in_evm_state() {
     setup(&mut ctx);
     // A resting buy order writes order, book level, best-bid, etc. — all perp blobs.
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+    // `place` drives `run_place_order` directly (no dispatch), so the per-call commitment fold is
+    // still in the accumulator — flush it to the on-trie slot, as `run_perp_dex_call` would.
+    storage::flush_commitment(&mut ctx).unwrap();
 
     // Perp writes are captured in the off-trie delta...
     let delta = ctx.journal_mut().take_perp_delta();

@@ -329,6 +329,21 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
         self.inner.take_perp_delta()
     }
 
+    #[inline]
+    fn perp_fold_get(&mut self) -> Option<U256> {
+        self.inner.perp_fold_get()
+    }
+
+    #[inline]
+    fn perp_fold_set(&mut self, c: U256) {
+        self.inner.perp_fold_set(c);
+    }
+
+    #[inline]
+    fn perp_fold_take(&mut self) -> Option<U256> {
+        self.inner.perp_fold_take()
+    }
+
     /// Clear current journal resetting it to initial state and return changes state.
     #[inline]
     fn finalize(&mut self) -> Self::State {

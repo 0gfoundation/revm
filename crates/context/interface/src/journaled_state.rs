@@ -258,6 +258,26 @@ pub trait JournalTr {
         PerpDelta::default()
     }
 
+    /// Returns the in-flight per-call PerpDEX commitment fold accumulator.
+    ///
+    /// `None` until the first off-trie write of the current precompile call seeds it (from the
+    /// committed on-trie running value). The precompile folds each write into this accumulator and
+    /// sstores it once at call exit, instead of sload+sstore per write. The default returns `None`
+    /// (no perp wired). See the PerpDEX precompile's `store_blob` / `flush_commitment`.
+    fn perp_fold_get(&mut self) -> Option<U256> {
+        None
+    }
+
+    /// Sets the per-call PerpDEX commitment fold accumulator. Default: no-op.
+    fn perp_fold_set(&mut self, c: U256) {
+        let _ = c;
+    }
+
+    /// Takes (clears) the per-call PerpDEX commitment fold accumulator. Default: `None`.
+    fn perp_fold_take(&mut self) -> Option<U256> {
+        None
+    }
+
     /// Clear current journal resetting it to initial state and return changes state.
     fn finalize(&mut self) -> Self::State;
 }
@@ -284,6 +304,10 @@ pub struct JournalCheckpoint {
     /// Checkpoint into the off-trie PerpDEX undo log; on revert, perp overlay writes made
     /// after this index are undone in lock-step with the EVM journal entries.
     pub perp_journal_i: usize,
+    /// Snapshot of the per-call PerpDEX commitment fold accumulator at this checkpoint. Restored
+    /// on revert so a mid-call checkpoint/revert keeps the fold in lock-step with the perp overlay
+    /// (the fold is otherwise sstored only at call exit, not per write).
+    pub perp_commitment_fold: Option<U256>,
 }
 
 /// State load information that contains the data and if the account or storage is cold loaded
