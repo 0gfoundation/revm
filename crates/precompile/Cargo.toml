@@ -78,6 +78,9 @@ cfg-if.workspace = true
 arrayref = "0.3.6"
 rmp-serde.workspace = true
 serde.workspace = true
+# BLAKE3 for the PerpDEX off-trie commitment hash (faster than keccak; the slot is an internal
+# anchor so the hash function is a free choice).
+blake3.workspace = true
 
 # alloy
 
@@ -111,6 +114,7 @@ std = [
 	"p256/std",
 	"ed25519-dalek/std",
 	"rug?/std",
+	"blake3/std",
 ]
 hashbrown = ["primitives/hashbrown"]
 asm-keccak = ["primitives/asm-keccak"]

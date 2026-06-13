@@ -93,10 +93,14 @@ const COMMITMENT_VERSION: u8 = 1;
 ///
 /// Called once at the end of every successful `run_perp_dex_call`; a no-op if the call performed no
 /// `store_blob` (empty log). Reads the running commitment `C_prev` from the slot, computes
-/// `C_new = keccak256(C_prev ‖ COMMITMENT_VERSION ‖ log)`, and sstores it. The sstore is journaled,
-/// so it reverts with the surrounding frame. `touch_account` is required so the slot change is
+/// `C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ log)`, and sstores it. The sstore is journaled, so
+/// it reverts with the surrounding frame. `touch_account` is required so the slot change is
 /// included in the BundleState transition (a normal perp tx does not otherwise touch 0x1003's
 /// on-trie storage — its bulk writes are off-trie); mirrors `save_erc20_balance`.
+///
+/// BLAKE3 (P4/#24) rather than keccak: the slot is an internal consensus anchor (no EVM SHA3
+/// opcode, no contract reads it — only the next call's `C_prev` seed), so the hash function is a
+/// free choice; BLAKE3 is faster, especially over the longer framed log. 32-byte digest → U256.
 ///
 /// Tests that drive `store_blob` / `run_*` directly (bypassing the dispatch) must call this to make
 /// the commitment observable on the slot.
@@ -114,11 +118,11 @@ pub(crate) fn flush_commitment<CTX: ContextTr>(context: &mut CTX) -> Result<(), 
         .sload(PERP_DEX_ADDRESS, commitment_slot().into())
         .map_err(convert_db_err::<CTX::Db>)?
         .data;
-    let mut hasher = alloy_primitives::Keccak256::new();
-    hasher.update(c_prev.to_be_bytes::<32>());
-    hasher.update([COMMITMENT_VERSION]);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&c_prev.to_be_bytes::<32>());
+    hasher.update(&[COMMITMENT_VERSION]);
     hasher.update(&log);
-    let c_new = U256::from_be_bytes(hasher.finalize().0);
+    let c_new = U256::from_be_bytes(*hasher.finalize().as_bytes());
     context
         .journal_mut()
         .sstore(PERP_DEX_ADDRESS, commitment_slot().into(), c_new)
@@ -964,7 +968,7 @@ mod commitment_tests {
     use super::*;
     use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
     use database::InMemoryDB;
-    use primitives::{hardfork::SpecId, keccak256};
+    use primitives::hardfork::SpecId;
 
     type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
 
@@ -984,8 +988,8 @@ mod commitment_tests {
             .data
     }
 
-    /// Reference model of one call's commitment hash (P4/16b):
-    /// `C_new = keccak256(C_prev ‖ COMMITMENT_VERSION ‖ Σ(key(32) ‖ len(u32 BE) ‖ value))`,
+    /// Reference model of one call's commitment hash (P4/16b + #24):
+    /// `C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ Σ(key(32) ‖ len(u32 BE) ‖ value))`,
     /// the writes in execution order.
     fn expect_framed(prev: U256, writes: &[(B256, &[u8])]) -> U256 {
         let mut p = Vec::new();
@@ -996,7 +1000,7 @@ mod commitment_tests {
             p.extend_from_slice(&(blob.len() as u32).to_be_bytes());
             p.extend_from_slice(blob);
         }
-        U256::from_be_bytes(keccak256(&p).0)
+        U256::from_be_bytes(*blake3::hash(&p).as_bytes())
     }
 
     #[test]

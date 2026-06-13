@@ -1581,6 +1581,33 @@ mod perf {
             report(&format!("keccak256 over {size} B"), t0.elapsed(), iters);
         }
     }
+
+    /// Micro: BLAKE3 vs keccak256 at the same sizes, to justify #24 (the commitment
+    /// hash swap). The commitment now hashes a per-call framed log (C_prev 32B +
+    /// 1 ver byte + Σ framed writes), so the relevant sizes are the larger ones.
+    #[test]
+    #[ignore = "perf measurement: cargo test --release perf_ -- --ignored --nocapture"]
+    fn perf_blake3_by_size() {
+        use std::hint::black_box;
+        for &(size, iters) in &[
+            (32usize, 2_000_000u64),
+            (71, 2_000_000),
+            (136, 2_000_000),
+            (219, 1_000_000),
+            (584, 1_000_000),
+            (4096, 200_000),
+        ] {
+            let buf = vec![0xA5u8; size];
+            for _ in 0..10_000 {
+                black_box(blake3::hash(black_box(&buf[..])));
+            }
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                black_box(blake3::hash(black_box(&buf[..])));
+            }
+            report(&format!("blake3 over {size} B"), t0.elapsed(), iters);
+        }
+    }
 }
 
 #[test]
@@ -1704,14 +1731,14 @@ mod golden {
     /// Pinned final commitment-slot value of `run_golden_scenario`.
     /// Capture/re-pin procedure: run `commitment_golden_scenario` and copy the
     /// `golden commitment =` line it prints (also shown in the assert diff).
-    /// Last re-pin 2026-06-14 (P4/16b): commitment construction changed from a
-    /// per-store chained keccak to a single keccak over a per-call length-framed
-    /// log — CHAIN change, value re-pinned. The business SNAPSHOT below is
-    /// unchanged from the 16b switch (pure commitment-hashing change), which is
-    /// the correctness guard that survives across hash re-pins.
-    /// (Prior re-pins: 2026-06-12 scenario-extension 0x2d5fa5…; original P0.)
+    /// Last re-pin 2026-06-14 (P4/#24): commitment hash function swapped
+    /// keccak256 → BLAKE3 — CHAIN change, value re-pinned. The business SNAPSHOT
+    /// below is unchanged (pure hash-function swap), the guard that survives
+    /// across hash re-pins.
+    /// (Prior re-pins: 2026-06-14 P4/16b framed-log keccak 0x69e699…; 2026-06-12
+    /// scenario-extension 0x2d5fa5…; original P0.)
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x69e6996937a0d302367373f7977f8fc4f08ba57e0d52e5fdbb5f7d5383079eee");
+        b256!("0x99563892cfca7acac1aada06faaf86efb8905c1fce3f7d50d4f447452c0ae25b");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
