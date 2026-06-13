@@ -3,7 +3,7 @@
 pub mod keys;
 
 use context::{ContextTr, JournalTr};
-use primitives::{Address, B256, U256};
+use primitives::{Address, HashMap, B256, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
 
@@ -85,22 +85,31 @@ fn store_blob<CTX: ContextTr>(
     Ok(())
 }
 
-/// Version byte mixed into the per-call commitment hash, so the framed-log construction can evolve
+/// Version byte mixed into the per-call commitment hash, so the framed construction can evolve
 /// (e.g. a future block-level fold) while staying distinguishable.
-const COMMITMENT_VERSION: u8 = 1;
+/// v1 = 16b execution-order framed log; v2 = #18 coalesced net delta (last-value-per-key, sorted).
+const COMMITMENT_VERSION: u8 = 2;
 
 /// Hashes the per-call commitment log into the on-trie anchor slot under 0x1003.
 ///
 /// Called once at the end of every successful `run_perp_dex_call`; a no-op if the call performed no
 /// `store_blob` (empty log). Reads the running commitment `C_prev` from the slot, computes
-/// `C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ log)`, and sstores it. The sstore is journaled, so
-/// it reverts with the surrounding frame. `touch_account` is required so the slot change is
-/// included in the BundleState transition (a normal perp tx does not otherwise touch 0x1003's
-/// on-trie storage — its bulk writes are off-trie); mirrors `save_erc20_balance`.
+/// `C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ Σ_sorted(key ‖ len ‖ value))`, and sstores it. The
+/// sstore is journaled, so it reverts with the surrounding frame. `touch_account` is required so
+/// the slot change is included in the BundleState transition (a normal perp tx does not otherwise
+/// touch 0x1003's on-trie storage — its bulk writes are off-trie); mirrors `save_erc20_balance`.
+///
+/// The raw per-call log records every write in execution order (possibly with duplicate keys);
+/// here it is COALESCED to the net delta — last value per key, emitted in ascending key order
+/// (#18). This commits the call's net STATE CHANGE rather than its write *sequence*: two executions
+/// reaching the same net delta produce the same commitment (which is the property that matters for
+/// state-divergence detection), and a key written N times in a call is hashed once. Coalescing +
+/// key-sorting is deterministic across nodes (keys are a total order; HashMap is only an
+/// intermediate, never iterated for the hash).
 ///
 /// BLAKE3 (P4/#24) rather than keccak: the slot is an internal consensus anchor (no EVM SHA3
 /// opcode, no contract reads it — only the next call's `C_prev` seed), so the hash function is a
-/// free choice; BLAKE3 is faster, especially over the longer framed log. 32-byte digest → U256.
+/// free choice; BLAKE3 is faster, especially over the longer log. 32-byte digest → U256.
 ///
 /// Tests that drive `store_blob` / `run_*` directly (bypassing the dispatch) must call this to make
 /// the commitment observable on the slot.
@@ -118,10 +127,33 @@ pub(crate) fn flush_commitment<CTX: ContextTr>(context: &mut CTX) -> Result<(), 
         .sload(PERP_DEX_ADDRESS, commitment_slot().into())
         .map_err(convert_db_err::<CTX::Db>)?
         .data;
+
+    // Coalesce the framed log (key(32) ‖ len(u32 BE) ‖ value, per write) to the net delta:
+    // last value wins per key. The log is internally produced, so the framing is exact.
+    let mut net: HashMap<B256, &[u8]> = HashMap::default();
+    let mut i = 0usize;
+    while i < log.len() {
+        let key = B256::from_slice(&log[i..i + 32]);
+        i += 32;
+        let len = u32::from_be_bytes(log[i..i + 4].try_into().unwrap()) as usize;
+        i += 4;
+        let value = &log[i..i + len];
+        i += len;
+        net.insert(key, value);
+    }
+    // Emit in ascending key order for cross-node determinism (HashMap iteration is not ordered).
+    let mut net_keys: Vec<B256> = net.keys().copied().collect();
+    net_keys.sort_unstable();
+
     let mut hasher = blake3::Hasher::new();
     hasher.update(&c_prev.to_be_bytes::<32>());
     hasher.update(&[COMMITMENT_VERSION]);
-    hasher.update(&log);
+    for key in &net_keys {
+        let value = net[key];
+        hasher.update(key.as_slice());
+        hasher.update(&(value.len() as u32).to_be_bytes());
+        hasher.update(value);
+    }
     let c_new = U256::from_be_bytes(*hasher.finalize().as_bytes());
     context
         .journal_mut()
@@ -988,14 +1020,20 @@ mod commitment_tests {
             .data
     }
 
-    /// Reference model of one call's commitment hash (P4/16b + #24):
-    /// `C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ Σ(key(32) ‖ len(u32 BE) ‖ value))`,
-    /// the writes in execution order.
+    /// Independent reference model of one call's commitment hash (P4/16b + #24 + #18):
+    /// `C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ Σ_sorted(key(32) ‖ len(u32 BE) ‖ value))`,
+    /// the writes COALESCED to the net delta (last value per key) and emitted in ascending key
+    /// order. Uses a BTreeMap (sorted, last-insert-wins) — a different implementation than the
+    /// production HashMap+sort, so agreement is a genuine cross-check, not a tautology.
     fn expect_framed(prev: U256, writes: &[(B256, &[u8])]) -> U256 {
+        let mut net: std::collections::BTreeMap<B256, &[u8]> = std::collections::BTreeMap::new();
+        for (key, blob) in writes {
+            net.insert(*key, blob);
+        }
         let mut p = Vec::new();
         p.extend_from_slice(&prev.to_be_bytes::<32>());
         p.push(COMMITMENT_VERSION);
-        for (key, blob) in writes {
+        for (key, blob) in &net {
             p.extend_from_slice(key.as_slice());
             p.extend_from_slice(&(blob.len() as u32).to_be_bytes());
             p.extend_from_slice(blob);
@@ -1023,14 +1061,14 @@ mod commitment_tests {
     }
 
     /// A whole call's writes are accumulated into one log and hashed ONCE at flush; the slot must
-    /// not move until the flush. With 16b (no coalescing) the log preserves execution order,
-    /// including a key written twice.
+    /// not move until the flush. With #18 the log is coalesced to the net delta — a key written
+    /// twice in the call contributes only its FINAL value, and the order is by key, not execution.
     #[test]
-    fn commitment_single_call_hashes_log_once() {
+    fn commitment_single_call_coalesces_and_hashes_once() {
         let writes: [(B256, Vec<u8>); 3] = [
             (B256::with_last_byte(1), vec![0xAA]),
             (B256::with_last_byte(2), vec![0xBB, 0xCC]),
-            (B256::with_last_byte(1), vec![0xDD]), // same key twice in one call
+            (B256::with_last_byte(1), vec![0xDD]), // same key twice → only 0xDD survives in the net
         ];
         let mut ctx = new_test_ctx();
         for (k, b) in &writes {
@@ -1040,6 +1078,23 @@ mod commitment_tests {
         flush_commitment(&mut ctx).unwrap();
         let refs: Vec<(B256, &[u8])> = writes.iter().map(|(k, b)| (*k, b.as_slice())).collect();
         assert_eq!(read_commitment(&mut ctx), expect_framed(U256::ZERO, &refs));
+
+        // Coalescing is real: writing only the FINAL value of the duplicated key (a different
+        // execution that reaches the same net delta) yields the SAME commitment.
+        let net_only: [(B256, Vec<u8>); 2] = [
+            (B256::with_last_byte(2), vec![0xBB, 0xCC]),
+            (B256::with_last_byte(1), vec![0xDD]),
+        ];
+        let mut ctx2 = new_test_ctx();
+        for (k, b) in &net_only {
+            store_blob(&mut ctx2, *k, b).unwrap();
+        }
+        flush_commitment(&mut ctx2).unwrap();
+        assert_eq!(
+            read_commitment(&mut ctx2),
+            read_commitment(&mut ctx),
+            "same net delta (regardless of write count/order) => same commitment"
+        );
     }
 
     /// `flush_commitment` is a no-op when the call performed no `store_blob` (empty log).

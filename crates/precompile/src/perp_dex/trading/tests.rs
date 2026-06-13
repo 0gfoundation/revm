@@ -1731,14 +1731,15 @@ mod golden {
     /// Pinned final commitment-slot value of `run_golden_scenario`.
     /// Capture/re-pin procedure: run `commitment_golden_scenario` and copy the
     /// `golden commitment =` line it prints (also shown in the assert diff).
-    /// Last re-pin 2026-06-14 (P4/#24): commitment hash function swapped
-    /// keccak256 → BLAKE3 — CHAIN change, value re-pinned. The business SNAPSHOT
-    /// below is unchanged (pure hash-function swap), the guard that survives
-    /// across hash re-pins.
-    /// (Prior re-pins: 2026-06-14 P4/16b framed-log keccak 0x69e699…; 2026-06-12
-    /// scenario-extension 0x2d5fa5…; original P0.)
+    /// Last re-pin 2026-06-14 (P4/#18): commitment log COALESCED to the net delta
+    /// (last value per key, key-sorted) and version byte bumped to 2 — CHAIN
+    /// change, value re-pinned. The business SNAPSHOT below is unchanged (the net
+    /// delta is the same state; only duplicate-write folding changed), the guard
+    /// that survives across re-pins.
+    /// (Prior re-pins: 2026-06-14 P4/#24 BLAKE3 0x995638…; P4/16b framed keccak
+    /// 0x69e699…; 2026-06-12 scenario-extension 0x2d5fa5…; original P0.)
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x99563892cfca7acac1aada06faaf86efb8905c1fce3f7d50d4f447452c0ae25b");
+        b256!("0x58835a1572e096cd47a1aa132e5292a310c93bfa36e2cfac5f5a0e023925760e");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
