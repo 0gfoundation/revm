@@ -1283,7 +1283,7 @@ mod size_probe_tests {
 
         let mut window = PriceBasisWindow::default();
         for i in 0..PRICE_BASIS_WINDOW_SIZE as u64 {
-            window.record_observation(1_750_000_000 + i, 65_000_00 + i);
+            let _ = window.record_observation(1_750_000_000 + i, 65_000_00 + i);
         }
         println!("PriceBasisWindow full: {} bytes", encode(&window).unwrap().len());
         println!("PriceBasisWindow empty: {} bytes", encode(&PriceBasisWindow::default()).unwrap().len());

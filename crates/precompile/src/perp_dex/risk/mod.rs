@@ -1424,8 +1424,13 @@ pub(crate) fn record_mid_price_sample_for_best_quote_change<CTX: ContextTr>(
     let timestamp: u64 = context.block().timestamp().saturating_to();
 
     let mut window = storage::load_price_basis_window(context, market_id)?;
-    window.record_observation(timestamp, mid_price);
-    storage::save_price_basis_window(context, market_id, &window)
+    // Skip the (large) re-store when the observation changed nothing — i.e. every best-quote
+    // change after the first within a block (same block timestamp). Avoids appending an unchanged
+    // ~hundreds-of-bytes blob to the per-call commitment log and churning the overlay (P4/#17).
+    if window.record_observation(timestamp, mid_price) {
+        storage::save_price_basis_window(context, market_id, &window)?;
+    }
+    Ok(())
 }
 
 fn require_admin_or_oracle<CTX: ContextTr>(

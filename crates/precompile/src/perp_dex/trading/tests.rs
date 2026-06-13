@@ -1731,14 +1731,15 @@ mod golden {
     /// Pinned final commitment-slot value of `run_golden_scenario`.
     /// Capture/re-pin procedure: run `commitment_golden_scenario` and copy the
     /// `golden commitment =` line it prints (also shown in the assert diff).
-    /// Last re-pin 2026-06-14 (P4/#20 bin+enum): fixed byte-arrays encode as
-    /// msgpack bin (serde_bytes), order-id queues as raw-packed 32-byte ids, and
-    /// Side/OrderType/TimeInForce/OrderStatus as u8 (serde_repr) — CHAIN change,
-    /// value re-pinned. Business SNAPSHOT unchanged (same decoded structs).
-    /// (Prior re-pins: P4/#20-positional 0xcdeac1…; P4/#18 coalesce 0x58835a…;
-    /// P4/#24 BLAKE3 0x995638…; P4/16b framed keccak 0x69e699…; ext 0x2d5fa5…; P0.)
+    /// Last re-pin 2026-06-14 (P4/#17 no-op skip): PriceBasisWindow re-store is
+    /// skipped when the observation changed nothing (same-block timestamp) — CHAIN
+    /// change (the skipped write leaves the commitment log), value re-pinned. The
+    /// window value is identical whether stored or skipped, so business SNAPSHOT
+    /// is unchanged.
+    /// (Prior re-pins: P4/#20 bin+enum 0x8a0b7f…; #20-positional 0xcdeac1…; #18
+    /// 0x58835a…; #24 0x995638…; 16b 0x69e699…; ext 0x2d5fa5…; P0.)
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x8a0b7fbb51317539668180eda586c839aab338beb46a4ae5ec5bde2e4c39ec7d");
+        b256!("0x3c80c530439970bd37d4bef6bcfd22411740241981764031154765a558bf9f47");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

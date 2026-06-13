@@ -50,22 +50,27 @@ impl PriceBasisWindow {
         }
     }
 
-    /// Records a top-of-book mid-price observation for `timestamp`.
-    pub fn record_observation(&mut self, timestamp: u64, mid_price: u64) {
+    /// Records a top-of-book mid-price observation for `timestamp`. Returns `true` if the window
+    /// was mutated, `false` if the observation was ignored (a same-or-older timestamp, which is
+    /// every quote change after the first within a block, since the block timestamp is constant) —
+    /// so the caller can skip re-storing an unchanged ~hundreds-of-bytes blob (P4/#17).
+    #[must_use]
+    pub fn record_observation(&mut self, timestamp: u64, mid_price: u64) -> bool {
         if self.count == 0 {
             self.push_sample(timestamp, mid_price);
             self.last_sample_ts = timestamp;
             self.last_mid_price = mid_price;
-            return;
+            return true;
         }
 
         if timestamp <= self.last_sample_ts {
-            return;
+            return false;
         }
 
         self.push_sample(timestamp, mid_price);
         self.last_sample_ts = timestamp;
         self.last_mid_price = mid_price;
+        true
     }
 
     /// Time-weighted average `mid - index_at_time` over the latest basis window.
