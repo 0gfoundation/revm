@@ -79,8 +79,9 @@ impl UserAccount {
 /// Registered ed25519 API key for a user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiKey {
-    /// Raw 32-byte ed25519 public key.
-    #[serde(rename = "K")]
+    /// Raw 32-byte ed25519 public key. `serde_bytes` → msgpack bin instead of a 32-integer array
+    /// (P4/#20). (The `rename` is now inert under positional encoding but kept harmlessly.)
+    #[serde(rename = "K", with = "serde_bytes")]
     pub pubkey: [u8; 32],
     /// Unix-second expiry timestamp. `0` means the key never expires.
     #[serde(rename = "E")]

@@ -1731,14 +1731,14 @@ mod golden {
     /// Pinned final commitment-slot value of `run_golden_scenario`.
     /// Capture/re-pin procedure: run `commitment_golden_scenario` and copy the
     /// `golden commitment =` line it prints (also shown in the assert diff).
-    /// Last re-pin 2026-06-14 (P4/#20 positional): blob encoding switched to
-    /// positional msgpack (struct field names dropped) — CHAIN change, value
-    /// re-pinned. The business SNAPSHOT below is unchanged (blobs decode to the
-    /// same structs), the guard that survives across re-pins.
-    /// (Prior re-pins: 2026-06-14 P4/#18 coalesce 0x58835a…; P4/#24 BLAKE3
-    /// 0x995638…; P4/16b framed keccak 0x69e699…; 2026-06-12 ext 0x2d5fa5…; P0.)
+    /// Last re-pin 2026-06-14 (P4/#20 bin+enum): fixed byte-arrays encode as
+    /// msgpack bin (serde_bytes), order-id queues as raw-packed 32-byte ids, and
+    /// Side/OrderType/TimeInForce/OrderStatus as u8 (serde_repr) — CHAIN change,
+    /// value re-pinned. Business SNAPSHOT unchanged (same decoded structs).
+    /// (Prior re-pins: P4/#20-positional 0xcdeac1…; P4/#18 coalesce 0x58835a…;
+    /// P4/#24 BLAKE3 0x995638…; P4/16b framed keccak 0x69e699…; ext 0x2d5fa5…; P0.)
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xcdeac19a48fa920a118fed3a64136db053cf090f57edb2ace298dfd20758d26b");
+        b256!("0x8a0b7fbb51317539668180eda586c839aab338beb46a4ae5ec5bde2e4c39ec7d");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

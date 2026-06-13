@@ -1,9 +1,12 @@
 //! Order types for the PerpDEX precompile.
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
 // ── Enums ─────────────────────────────────────────────────────────────────
+// Enums serialize as their `u8` discriminant (serde_repr) rather than the variant NAME string
+// (P4/#20) — e.g. OrderStatus "PartiallyFilled" 16 B → 1 B in every Order blob.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum Side {
     Buy = 0,
@@ -27,7 +30,7 @@ impl Side {
 }
 
 /// Only Limit and Market are implemented; other types are reserved for future use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum OrderType {
     Limit = 0,
@@ -44,7 +47,7 @@ impl OrderType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum TimeInForce {
     /// Good Till Cancel – resting order until manually cancelled.
@@ -69,7 +72,7 @@ impl TimeInForce {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum OrderStatus {
     Open = 0,
@@ -87,7 +90,9 @@ pub enum OrderStatus {
 /// Full on-chain order record, stored keyed by `order_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Order {
-    /// Owner address (20 bytes).
+    /// Owner address (20 bytes). `serde_bytes` → msgpack bin (1 byte/byte) instead of an array of
+    /// 20 integers (~2 bytes/byte) (P4/#20).
+    #[serde(with = "serde_bytes")]
     pub owner: [u8; 20],
     pub market_id: u64,
     pub side: Side,
@@ -109,7 +114,8 @@ pub struct Order {
 /// Buy entries are sorted by price DESC; sell entries by price ASC.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct OrderEntry {
-    /// 32-byte order ID.
+    /// 32-byte order ID. `serde_bytes` → msgpack bin instead of a 32-integer array (P4/#20).
+    #[serde(with = "serde_bytes")]
     pub order_id: [u8; 32],
     pub price: u64,
     /// Remaining (unfilled) amount tracked for margin purposes.

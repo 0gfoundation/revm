@@ -550,16 +550,39 @@ pub fn save_ask_prices<CTX: ContextTr>(
 
 // ── Order book: FIFO queue at a price level ───────────────────────────────────
 
+/// Packs an order-id FIFO queue as raw concatenated 32-byte ids — the most compact form for a
+/// homogeneous fixed-size-id list, with zero msgpack overhead (P4/#20). An empty queue packs to an
+/// empty buf (which `store_blob` treats as a delete; `load_*_level` reads it back as `vec![]`).
+fn pack_order_ids(queue: &[[u8; 32]]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(queue.len() * 32);
+    for id in queue {
+        buf.extend_from_slice(id);
+    }
+    buf
+}
+
+/// Inverse of [`pack_order_ids`]: chunks a raw blob into 32-byte ids.
+fn unpack_order_ids(buf: &[u8]) -> Result<Vec<[u8; 32]>, PrecompileError> {
+    if buf.len() % 32 != 0 {
+        return Err(perp_err("corrupt order-id queue blob"));
+    }
+    Ok(buf
+        .chunks_exact(32)
+        .map(|chunk| {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(chunk);
+            id
+        })
+        .collect())
+}
+
 pub fn load_bid_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
     let buf = load_blob(context, bid_level_key(market_id, price))?;
-    if buf.is_empty() {
-        return Ok(vec![]);
-    }
-    decode(&buf)
+    unpack_order_ids(&buf)
 }
 
 pub fn save_bid_level<CTX: ContextTr>(
@@ -568,8 +591,7 @@ pub fn save_bid_level<CTX: ContextTr>(
     price: u64,
     queue: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&queue)?;
-    store_blob(context, bid_level_key(market_id, price), &buf)
+    store_blob(context, bid_level_key(market_id, price), &pack_order_ids(queue))
 }
 
 pub fn load_ask_level<CTX: ContextTr>(
@@ -578,10 +600,7 @@ pub fn load_ask_level<CTX: ContextTr>(
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
     let buf = load_blob(context, ask_level_key(market_id, price))?;
-    if buf.is_empty() {
-        return Ok(vec![]);
-    }
-    decode(&buf)
+    unpack_order_ids(&buf)
 }
 
 pub fn save_ask_level<CTX: ContextTr>(
@@ -590,8 +609,7 @@ pub fn save_ask_level<CTX: ContextTr>(
     price: u64,
     queue: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&queue)?;
-    store_blob(context, ask_level_key(market_id, price), &buf)
+    store_blob(context, ask_level_key(market_id, price), &pack_order_ids(queue))
 }
 
 // ── Order book helpers ────────────────────────────────────────────────────────

@@ -81,6 +81,9 @@ serde.workspace = true
 # BLAKE3 for the PerpDEX off-trie commitment hash (faster than keccak; the slot is an internal
 # anchor so the hash function is a free choice).
 blake3.workspace = true
+# Compact PerpDEX blob encoding: integer-repr enums + msgpack-bin fixed byte arrays.
+serde_repr.workspace = true
+serde_bytes.workspace = true
 
 # alloy
 
