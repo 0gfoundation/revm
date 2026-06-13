@@ -10,7 +10,7 @@ pub const PRICE_BASIS_WINDOW_SIZE: usize = 30;
 ///
 /// Each sample stores a mid-price change point and its Unix-second timestamp.
 /// Price2 derives basis when an oracle checkpoint closes an interval.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PriceBasisWindow {
     #[serde(default)]
     pub timestamps: [u64; PRICE_BASIS_WINDOW_SIZE],
@@ -212,7 +212,7 @@ impl IndexPriceHistory {
 }
 
 /// Per-market funding state — auto-updated by updateIndexPrice at epoch boundaries.
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
 pub struct FundingState {
     /// Last computed funding rate in FUNDING_RATE_ONE units (1e6 = 100%).
     pub last_funding_rate: i64,
@@ -229,7 +229,7 @@ pub struct FundingState {
 ///
 /// Funding rate = weighted average of premium index over the epoch, where the k-th
 /// sample (1-indexed from epoch start) has weight k.  Older samples get lower weight.
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
 pub struct PremiumIndexAccumulator {
     /// Σ(k × PI_k) in FUNDING_RATE_ONE = 1_000_000 units.
     pub weighted_sum: i128,

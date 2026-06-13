@@ -75,13 +75,16 @@ fn store_blob<CTX: ContextTr>(
 
     // Global commitment over the off-trie perp write-stream, anchored ON-trie under 0x1003 so
     // divergence surfaces in the state root (consensus-detectable). Every write (incl. empty-buf
-    // deletes) is appended to a per-call in-memory LOG, framed `key(32) ‖ len(u32 BE) ‖ value`,
-    // and the whole log is hashed ONCE at call exit (`flush_commitment`):
-    //   C_new = keccak256(C_prev ‖ COMMITMENT_VERSION ‖ log)
-    // (P4/16b). This replaces the former per-store chained fold — one hash over a length-framed
-    // log instead of N chained keccaks + N sstores. It CHANGES the 0x1003 commitment value vs the
-    // chained scheme, so it requires a fresh chain (devnet wipe); the length prefix keeps the log
-    // injective over variable-length blobs.
+    // deletes) is appended to a per-call in-memory LOG, framed `key(32) ‖ len(u32 BE) ‖ value`.
+    // At call exit `flush_commitment` COALESCES the log to the net delta (last value per key,
+    // ascending key order) and hashes it ONCE (see that fn for the exact formula):
+    //   C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ Σ_sorted(key ‖ len ‖ value))
+    // (P4: 16b single hash + #18 coalesce + #24 BLAKE3). Replaces the former per-store chained
+    // keccak (one fold + sstore per write). CHANGES the 0x1003 commitment value, so it requires a
+    // fresh chain (devnet wipe). The length prefix keeps the framing injective over variable-length
+    // blobs — its u32 width bounds a single blob to <4 GiB, which the per-store gas budget enforces
+    // far below; assert it so a future unbounded blob fails loudly instead of truncating the frame.
+    debug_assert!(buf.len() <= u32::MAX as usize, "perp blob exceeds u32 commitment frame length");
     let mut framed = Vec::with_capacity(32 + 4 + buf.len());
     framed.extend_from_slice(key.as_slice());
     framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
@@ -1305,5 +1308,182 @@ mod size_probe_tests {
             "ApiKey: {} bytes",
             encode(&ApiKey { pubkey: [9; 32], expiry: 1_750_000_000 }).unwrap().len()
         );
+    }
+}
+
+/// Permanent guard for the P4/#20 blob encoding (positional msgpack + serde_bytes byte-arrays +
+/// serde_repr integer enums + raw-packed order-id queues). The golden commitment test only detects
+/// DRIFT (any byte change re-pins it); these `decode(encode(v)) == v` checks catch a SELF-CONSISTENT
+/// mis-round-trip on a field the golden scenario never stresses — negative i128s, bytes > 0x7F in
+/// fixed arrays, every enum discriminant, defaulted middle fields at extremes. Value-equality is
+/// required: for positional encoding `encode∘decode` is a byte-identity, so a byte round-trip would
+/// be vacuously true.
+#[cfg(test)]
+mod encoding_roundtrip_tests {
+    use super::*;
+    use crate::perp_dex::types::{OrderStatus, OrderType, Side, TimeInForce};
+
+    fn rt<T>(label: &str, v: T)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + core::fmt::Debug,
+    {
+        let buf = encode(&v).unwrap();
+        let back: T = decode(&buf).unwrap();
+        assert_eq!(v, back, "round-trip mismatch for {label}");
+    }
+
+    #[test]
+    fn order_every_enum_combo_and_high_byte_owner() {
+        for side in [Side::Buy, Side::Sell] {
+            for ot in [OrderType::Limit, OrderType::Market] {
+                for tif in [
+                    TimeInForce::Gtc,
+                    TimeInForce::Ioc,
+                    TimeInForce::Fok,
+                    TimeInForce::PostOnly,
+                ] {
+                    for status in [
+                        OrderStatus::Open,
+                        OrderStatus::PartiallyFilled,
+                        OrderStatus::Filled,
+                        OrderStatus::Cancelled,
+                        OrderStatus::Expired,
+                    ] {
+                        // owner spans the full byte domain incl. > 0x7F.
+                        let mut owner = [0u8; 20];
+                        for (i, b) in owner.iter_mut().enumerate() {
+                            *b = (0x80 + i as u8) ^ 0xA5;
+                        }
+                        rt(
+                            "Order",
+                            Order {
+                                owner,
+                                market_id: u64::MAX,
+                                side,
+                                price: u64::MAX,
+                                quantity: u64::MAX - 1,
+                                filled: 1,
+                                order_type: ot,
+                                tif,
+                                status,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn order_entry_and_api_key_high_byte_arrays() {
+        let id: [u8; 32] = core::array::from_fn(|i| (0xFF - i as u8) ^ 0x3C);
+        rt(
+            "OrderEntry",
+            OrderEntry { order_id: id, price: u64::MAX, amount: u64::MAX, maker_fee_bps: 12_345 },
+        );
+        rt("ApiKey", ApiKey { pubkey: id, expiry: u64::MAX });
+        rt("ApiKey-never-expires", ApiKey { pubkey: [0xFF; 32], expiry: 0 });
+    }
+
+    #[test]
+    fn perp_position_signed_extremes() {
+        rt(
+            "PerpPosition",
+            PerpPosition {
+                amount: i64::MIN,
+                v_quote_balance: i64::MAX,
+                margin: -1,
+                margin_reserved: u64::MAX,
+                margin_reserved_notional: u64::MAX,
+                buy_side_margin_reserved: 0,
+                buy_side_reserved_notional: u64::MAX,
+                sell_side_margin_reserved: 7,
+                sell_side_reserved_notional: 0,
+                fee_reserved: u64::MAX,
+                leverage: 20,
+                last_funding_index: i128::MIN,
+            },
+        );
+        rt(
+            "PerpPosition-pos-i128",
+            PerpPosition { last_funding_index: i128::MAX, ..PerpPosition::default() },
+        );
+    }
+
+    #[test]
+    fn market_all_fields_incl_defaulted() {
+        rt(
+            "Market",
+            Market {
+                market_id: u64::MAX,
+                base_decimals: u32::MAX,
+                price_decimals: 18,
+                tick_size: u64::MAX,
+                step_size: 1,
+                min_quantity: 1,
+                max_quantity: u64::MAX,
+                max_price: u64::MAX,
+                price_update_interval: 15,
+                active: true,
+                funding_interval: 3600,
+                interest_rate: i64::MIN,
+                liquidation_fee_rate_bps: u32::MAX,
+            },
+        );
+    }
+
+    #[test]
+    fn funding_and_premium_signed_i128() {
+        rt(
+            "FundingState",
+            FundingState {
+                last_funding_rate: i64::MIN,
+                next_funding_ts: u64::MAX,
+                cumulative_funding_index: i128::MIN,
+            },
+        );
+        rt(
+            "PremiumIndexAccumulator",
+            PremiumIndexAccumulator {
+                weighted_sum: i128::MIN,
+                sample_count: u64::MAX,
+                epoch_start_ts: 1,
+                last_pi: i64::MIN,
+                last_sample_ts: u64::MAX,
+            },
+        );
+    }
+
+    #[test]
+    fn enum_out_of_range_discriminant_errors_cleanly() {
+        // Each enum round-trips its real discriminants...
+        for s in [OrderStatus::Open, OrderStatus::Filled, OrderStatus::Expired] {
+            let buf = encode(&s).unwrap();
+            assert_eq!(decode::<OrderStatus>(&buf).unwrap(), s);
+        }
+        // ...and an out-of-range discriminant decodes to a clean Err, never UB/panic.
+        // 99 encodes as a 1-byte msgpack positive fixint (0x63); no OrderStatus variant == 99.
+        assert!(
+            decode::<OrderStatus>(&[0x63]).is_err(),
+            "out-of-range enum discriminant must error, not panic/UB"
+        );
+        assert!(decode::<Side>(&[0x05]).is_err());
+    }
+
+    #[test]
+    fn order_id_queue_pack_unpack_roundtrip_and_rejects_misaligned() {
+        for q in [
+            vec![],
+            vec![[0xFFu8; 32]],
+            vec![[0x00u8; 32], [0x80u8; 32], core::array::from_fn(|i| i as u8)],
+        ] {
+            let packed = pack_order_ids(&q);
+            assert_eq!(packed.len(), q.len() * 32);
+            assert_eq!(unpack_order_ids(&packed).unwrap(), q, "pack/unpack must round-trip");
+        }
+        // A blob whose length is not a multiple of 32 is rejected, never silently truncated.
+        for bad_len in [1usize, 31, 33, 63] {
+            assert!(unpack_order_ids(&vec![0xABu8; bad_len]).is_err(), "len {bad_len} must error");
+        }
     }
 }
