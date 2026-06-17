@@ -25,8 +25,8 @@ use crate::{
             getOrderReturn, placeOrderCall, placeOrderSignedCall,
         },
         math::{
-            calc_buy_side_reserved_notional, calc_sell_side_reserved_notional, calc_trading_fee,
-            calc_value,
+            calc_buy_side_reserved_notional, calc_maker_fee_for_order_qty_with_bps,
+            calc_sell_side_reserved_notional, calc_trading_fee, calc_value,
         },
         risk::record_mid_price_sample_for_best_quote_change,
         storage,
@@ -36,6 +36,9 @@ use crate::{
     PrecompileError,
 };
 
+/// Maker fee using the user's *current* fee rate (placement path). Cancel/fill
+/// paths instead use the rate snapshotted on the order entry, via
+/// `math::calc_maker_fee_for_order_qty_with_bps`.
 fn calc_maker_fee_for_order_qty<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
@@ -43,19 +46,8 @@ fn calc_maker_fee_for_order_qty<CTX: ContextTr>(
     qty: u64,
     market: &crate::perp_dex::types::Market,
 ) -> Result<u64, PrecompileError> {
-    let notional = calc_value(price, qty, market.base_decimals, market.price_decimals)?;
     let rates = storage::load_user_fee_rates(context, user)?;
-    calc_trading_fee(notional, rates.maker_fee_bps)
-}
-
-fn calc_maker_fee_for_order_qty_with_bps(
-    price: u64,
-    qty: u64,
-    maker_fee_bps: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<u64, PrecompileError> {
-    let notional = calc_value(price, qty, market.base_decimals, market.price_decimals)?;
-    calc_trading_fee(notional, maker_fee_bps)
+    calc_maker_fee_for_order_qty_with_bps(price, qty, rates.maker_fee_bps, market)
 }
 
 // ── Public entry-points ───────────────────────────────────────────────────────
@@ -1197,28 +1189,33 @@ fn rest_in_book<CTX: ContextTr>(
                 },
             );
 
-            // Recompute buy-side notional, then derive margin once by leverage.
+            // Recompute buy-side notional; the six reservation fields are written
+            // by the single set_reservations source of truth below.
             let new_buy_side_notional = calc_buy_side_reserved_notional(
                 &entries,
                 market.base_decimals,
                 market.price_decimals,
                 pos.amount,
             )?;
-            let new_buy_side_reserved = new_buy_side_notional / pos.leverage.max(1);
             let order_fee_reserved =
                 calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
-
-            // Under max-reservation, the wallet delta is the change in max(buy, sell).
-            let old_max = pos
-                .buy_side_margin_reserved
-                .max(pos.sell_side_margin_reserved);
-            let new_max = new_buy_side_reserved.max(pos.sell_side_margin_reserved);
+            // Adding an order can only grow the buy-side notional (checked before
+            // set_reservations overwrites the stored value).
             if new_buy_side_notional < pos.buy_side_reserved_notional {
                 return Err(perp_invariant_err(format!(
                     "buy-side reservation notional decreased after adding order: {} -> {}",
                     pos.buy_side_reserved_notional, new_buy_side_notional
                 )));
             }
+
+            // Under max-reservation, the wallet delta is the change in max(buy, sell).
+            let old_max = pos
+                .buy_side_margin_reserved
+                .max(pos.sell_side_margin_reserved);
+            let sell_notional = pos.sell_side_reserved_notional;
+            let leverage = pos.leverage;
+            pos.set_reservations(new_buy_side_notional, sell_notional, leverage);
+            let new_max = pos.margin_reserved;
             let margin_delta = new_max.saturating_sub(old_max);
             let delta = margin_delta
                 .checked_add(order_fee_reserved)
@@ -1228,16 +1225,10 @@ fn rest_in_book<CTX: ContextTr>(
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
             account.debit_perp(delta)?;
-            pos.buy_side_reserved_notional = new_buy_side_notional;
-            pos.buy_side_margin_reserved = new_buy_side_reserved;
             pos.fee_reserved = pos
                 .fee_reserved
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
-            pos.margin_reserved_notional = pos
-                .buy_side_reserved_notional
-                .max(pos.sell_side_reserved_notional);
-            pos.margin_reserved = new_max;
 
             // Persist order book state.
             storage::save_buy_orders(context, user, market_id, &entries)?;
@@ -1266,28 +1257,33 @@ fn rest_in_book<CTX: ContextTr>(
                 },
             );
 
-            // Recompute sell-side notional, then derive margin once by leverage.
+            // Recompute sell-side notional; the six reservation fields are written
+            // by the single set_reservations source of truth below.
             let new_sell_side_notional = calc_sell_side_reserved_notional(
                 &entries,
                 market.base_decimals,
                 market.price_decimals,
                 pos.amount,
             )?;
-            let new_sell_side_reserved = new_sell_side_notional / pos.leverage.max(1);
             let order_fee_reserved =
                 calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
-
-            // Under max-reservation, the wallet delta is the change in max(buy, sell).
-            let old_max = pos
-                .buy_side_margin_reserved
-                .max(pos.sell_side_margin_reserved);
-            let new_max = pos.buy_side_margin_reserved.max(new_sell_side_reserved);
+            // Adding an order can only grow the sell-side notional (checked before
+            // set_reservations overwrites the stored value).
             if new_sell_side_notional < pos.sell_side_reserved_notional {
                 return Err(perp_invariant_err(format!(
                     "sell-side reservation notional decreased after adding order: {} -> {}",
                     pos.sell_side_reserved_notional, new_sell_side_notional
                 )));
             }
+
+            // Under max-reservation, the wallet delta is the change in max(buy, sell).
+            let old_max = pos
+                .buy_side_margin_reserved
+                .max(pos.sell_side_margin_reserved);
+            let buy_notional = pos.buy_side_reserved_notional;
+            let leverage = pos.leverage;
+            pos.set_reservations(buy_notional, new_sell_side_notional, leverage);
+            let new_max = pos.margin_reserved;
             let margin_delta = new_max.saturating_sub(old_max);
             let delta = margin_delta
                 .checked_add(order_fee_reserved)
@@ -1297,16 +1293,10 @@ fn rest_in_book<CTX: ContextTr>(
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
             account.debit_perp(delta)?;
-            pos.sell_side_reserved_notional = new_sell_side_notional;
-            pos.sell_side_margin_reserved = new_sell_side_reserved;
             pos.fee_reserved = pos
                 .fee_reserved
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
-            pos.margin_reserved_notional = pos
-                .buy_side_reserved_notional
-                .max(pos.sell_side_reserved_notional);
-            pos.margin_reserved = new_max;
 
             // Persist order book state.
             storage::save_sell_orders(context, user, market_id, &entries)?;
@@ -1361,11 +1351,8 @@ pub(super) fn execute_order_cancellation<CTX: ContextTr>(
     terminal_status: OrderStatus,
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
-    let remaining = order.quantity - order.filled;
     remove_from_book(context, market_id, order.side, order.price, &order_id)?;
-    release_margin_for_cancelled_order(
-        context, user, market_id, order.side, &order_id, remaining, market,
-    )?;
+    release_margin_for_cancelled_order(context, user, market_id, order.side, &order_id, market)?;
     order.status = terminal_status;
     storage::save_order(context, &order_id, &order)?;
     context.journal_mut().log(Log {
@@ -1430,7 +1417,6 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     market_id: u64,
     side: Side,
     order_id: &[u8; 32],
-    _remaining_qty: u64,
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
@@ -1442,6 +1428,10 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 .buy_side_margin_reserved
                 .max(pos.sell_side_margin_reserved);
             let mut entries = storage::load_buy_orders(context, user, market_id)?;
+            // The book entry's `amount` is the authoritative remaining quantity
+            // (kept current by reduce_maker_order_entry_for_fill); the order's
+            // `filled` can lag it during the same matching round, so the release
+            // is sized from the entry, not from order.quantity - order.filled.
             let cancelled_entry = remove_order_entry(&mut entries, order_id, "buy")?;
             let new_notional = calc_buy_side_reserved_notional(
                 &entries,
@@ -1449,8 +1439,10 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 market.price_decimals,
                 pos.amount,
             )?;
-            let new_reserved = new_notional / pos.leverage.max(1);
-            let new_max = new_reserved.max(pos.sell_side_margin_reserved);
+            let sell_notional = pos.sell_side_reserved_notional;
+            let leverage = pos.leverage;
+            pos.set_reservations(new_notional, sell_notional, leverage);
+            let new_max = pos.margin_reserved;
             let freed = old_max.saturating_sub(new_max);
             let fee_freed = calc_maker_fee_for_order_qty_with_bps(
                 cancelled_entry.price,
@@ -1460,13 +1452,13 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
             )?;
             account.credit_perp(freed)?;
             account.credit_perp(fee_freed)?;
-            pos.buy_side_reserved_notional = new_notional;
-            pos.buy_side_margin_reserved = new_reserved;
-            pos.fee_reserved = pos.fee_reserved.saturating_sub(fee_freed);
-            pos.margin_reserved_notional = pos
-                .buy_side_reserved_notional
-                .max(pos.sell_side_reserved_notional);
-            pos.margin_reserved = new_max;
+            // Surface drift instead of masking it (was saturating_sub).
+            let prev_fee = pos.fee_reserved;
+            pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
+                perp_invariant_err(format!(
+                    "fee_reserved {prev_fee} < fee to release {fee_freed}"
+                ))
+            })?;
             storage::save_buy_orders(context, user, market_id, &entries)?;
         }
         Side::Sell => {
@@ -1474,6 +1466,10 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 .buy_side_margin_reserved
                 .max(pos.sell_side_margin_reserved);
             let mut entries = storage::load_sell_orders(context, user, market_id)?;
+            // The book entry's `amount` is the authoritative remaining quantity
+            // (kept current by reduce_maker_order_entry_for_fill); the order's
+            // `filled` can lag it during the same matching round, so the release
+            // is sized from the entry, not from order.quantity - order.filled.
             let cancelled_entry = remove_order_entry(&mut entries, order_id, "sell")?;
             let new_notional = calc_sell_side_reserved_notional(
                 &entries,
@@ -1481,8 +1477,10 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 market.price_decimals,
                 pos.amount,
             )?;
-            let new_reserved = new_notional / pos.leverage.max(1);
-            let new_max = pos.buy_side_margin_reserved.max(new_reserved);
+            let buy_notional = pos.buy_side_reserved_notional;
+            let leverage = pos.leverage;
+            pos.set_reservations(buy_notional, new_notional, leverage);
+            let new_max = pos.margin_reserved;
             let freed = old_max.saturating_sub(new_max);
             let fee_freed = calc_maker_fee_for_order_qty_with_bps(
                 cancelled_entry.price,
@@ -1492,13 +1490,13 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
             )?;
             account.credit_perp(freed)?;
             account.credit_perp(fee_freed)?;
-            pos.sell_side_reserved_notional = new_notional;
-            pos.sell_side_margin_reserved = new_reserved;
-            pos.fee_reserved = pos.fee_reserved.saturating_sub(fee_freed);
-            pos.margin_reserved_notional = pos
-                .buy_side_reserved_notional
-                .max(pos.sell_side_reserved_notional);
-            pos.margin_reserved = new_max;
+            // Surface drift instead of masking it (was saturating_sub).
+            let prev_fee = pos.fee_reserved;
+            pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
+                perp_invariant_err(format!(
+                    "fee_reserved {prev_fee} < fee to release {fee_freed}"
+                ))
+            })?;
             storage::save_sell_orders(context, user, market_id, &entries)?;
         }
     }

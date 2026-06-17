@@ -707,10 +707,14 @@ fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
     pos: &mut crate::perp_dex::types::PerpPosition,
     new_leverage: u64,
 ) -> Result<(), PrecompileError> {
-    let new_buy_reserved = pos.buy_side_reserved_notional / new_leverage;
-    let new_sell_reserved = pos.sell_side_reserved_notional / new_leverage;
+    // Re-derive the reservation from the unchanged per-side notionals at the new
+    // leverage via the single source of truth, then reconcile the wallet by the
+    // change in the max-of-side reservation.
     let old_reserved = pos.margin_reserved;
-    let new_reserved = new_buy_reserved.max(new_sell_reserved);
+    let buy_notional = pos.buy_side_reserved_notional;
+    let sell_notional = pos.sell_side_reserved_notional;
+    pos.set_reservations(buy_notional, sell_notional, new_leverage);
+    let new_reserved = pos.margin_reserved;
 
     if new_reserved > old_reserved {
         let delta = new_reserved - old_reserved;
@@ -728,13 +732,6 @@ fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
         account.credit_perp(delta)?;
         storage::save_account(context, user, account)?;
     }
-
-    pos.buy_side_margin_reserved = new_buy_reserved;
-    pos.sell_side_margin_reserved = new_sell_reserved;
-    pos.margin_reserved_notional = pos
-        .buy_side_reserved_notional
-        .max(pos.sell_side_reserved_notional);
-    pos.margin_reserved = new_reserved;
     Ok(())
 }
 
@@ -929,12 +926,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         account.credit_perp(released)?;
         storage::save_account(context, user, account)?;
     }
-    pos.buy_side_margin_reserved = 0;
-    pos.buy_side_reserved_notional = 0;
-    pos.sell_side_margin_reserved = 0;
-    pos.sell_side_reserved_notional = 0;
-    pos.margin_reserved = 0;
-    pos.margin_reserved_notional = 0;
+    pos.set_reservations(0, 0, pos.leverage);
     pos.fee_reserved = 0;
     storage::save_position(context, user, market_id, &pos)?;
 

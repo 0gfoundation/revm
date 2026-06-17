@@ -4,7 +4,10 @@
 //! Quote amounts use 6-decimal fixed-point (`QUOTE_DECIMALS = 6`).
 
 use crate::{
-    perp_dex::{errors::perp_err, types::OrderEntry},
+    perp_dex::{
+        errors::perp_err,
+        types::{Market, OrderEntry},
+    },
     PrecompileError,
 };
 
@@ -67,6 +70,21 @@ pub fn calc_trading_fee(notional: u64, fee_bps: u64) -> Result<u64, PrecompileEr
         .ok_or_else(|| perp_err("math: trading fee overflow"))?
         / FEE_BPS_DENOMINATOR as u128;
     u64::try_from(fee).map_err(|_| perp_err("math: trading fee exceeds u64"))
+}
+
+/// Maker fee (quote units) for `qty` of an order resting at `price`, using a
+/// pre-snapshotted `maker_fee_bps`. Single source of truth shared by the
+/// placement, fill-release, and cancel-release paths so the reserve↔release
+/// fee math cannot drift between them.
+#[inline]
+pub fn calc_maker_fee_for_order_qty_with_bps(
+    price: u64,
+    qty: u64,
+    maker_fee_bps: u64,
+    market: &Market,
+) -> Result<u64, PrecompileError> {
+    let notional = calc_value(price, qty, market.base_decimals, market.price_decimals)?;
+    calc_trading_fee(notional, maker_fee_bps)
 }
 
 /// Signed version of `calc_value` for negative quantities.
@@ -298,26 +316,6 @@ pub fn calc_buy_side_reserved_notional(
     Ok(reserved_notional)
 }
 
-/// Recalculate the buy-side margin reserve from the current buy-order list.
-/// Rounding happens once after summing all opening notional.
-pub fn calc_buy_side_margin_reserved(
-    buy_entries: &[OrderEntry],
-    leverage: u64,
-    base_decimals: u32,
-    price_decimals: u32,
-    position_amount: i64,
-) -> Result<u64, PrecompileError> {
-    if leverage == 0 {
-        return Err(perp_err("math: leverage cannot be zero"));
-    }
-    Ok(calc_buy_side_reserved_notional(
-        buy_entries,
-        base_decimals,
-        price_decimals,
-        position_amount,
-    )? / leverage)
-}
-
 /// Recalculate the sell-side opening notional from the current sell-order list.
 /// `sell_entries` must be sorted by price ascending.
 pub fn calc_sell_side_reserved_notional(
@@ -350,26 +348,6 @@ pub fn calc_sell_side_reserved_notional(
         }
     }
     Ok(reserved_notional)
-}
-
-/// Recalculate the sell-side margin reserve from the current sell-order list.
-/// Rounding happens once after summing all opening notional.
-pub fn calc_sell_side_margin_reserved(
-    sell_entries: &[OrderEntry],
-    leverage: u64,
-    base_decimals: u32,
-    price_decimals: u32,
-    position_amount: i64,
-) -> Result<u64, PrecompileError> {
-    if leverage == 0 {
-        return Err(perp_err("math: leverage cannot be zero"));
-    }
-    Ok(calc_sell_side_reserved_notional(
-        sell_entries,
-        base_decimals,
-        price_decimals,
-        position_amount,
-    )? / leverage)
 }
 
 #[cfg(test)]

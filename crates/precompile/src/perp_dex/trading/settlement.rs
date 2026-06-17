@@ -8,8 +8,8 @@ use crate::{
         errors::{perp_err, perp_invariant_err},
         interface::IPerpDex,
         math::{
-            calc_buy_side_reserved_notional, calc_sell_side_reserved_notional, calc_trading_fee,
-            calc_value, checked_u64_to_i64,
+            calc_buy_side_reserved_notional, calc_maker_fee_for_order_qty_with_bps,
+            calc_sell_side_reserved_notional, calc_trading_fee, calc_value, checked_u64_to_i64,
         },
         storage,
         types::{OrderStatus, Side},
@@ -17,19 +17,6 @@ use crate::{
     },
     PrecompileError,
 };
-
-/// Fee pre-reserved for a maker order is stored per-unit; this helper
-/// re-derives the total fee for a given remaining quantity so the delta
-/// (old − new) can be released on each partial fill.
-fn calc_maker_fee_for_order_qty_with_bps(
-    price: u64,
-    qty: u64,
-    maker_fee_bps: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<u64, PrecompileError> {
-    let notional = calc_value(price, qty, market.base_decimals, market.price_decimals)?;
-    calc_trading_fee(notional, maker_fee_bps)
-}
 
 // ── Position settlement ───────────────────────────────────────────────────────
 
@@ -967,15 +954,6 @@ fn recompute_maker_order_reserve_after_fill<CTX: ContextTr>(
         market.price_decimals,
         pos.amount,
     )?;
-    pos.buy_side_reserved_notional = buy_notional;
-    pos.sell_side_reserved_notional = sell_notional;
-    pos.buy_side_margin_reserved = buy_notional / pos.leverage.max(1);
-    pos.sell_side_margin_reserved = sell_notional / pos.leverage.max(1);
-    pos.margin_reserved_notional = pos
-        .buy_side_reserved_notional
-        .max(pos.sell_side_reserved_notional);
-    pos.margin_reserved = pos
-        .buy_side_margin_reserved
-        .max(pos.sell_side_margin_reserved);
+    pos.set_reservations(buy_notional, sell_notional, pos.leverage);
     Ok(pos.margin_reserved)
 }

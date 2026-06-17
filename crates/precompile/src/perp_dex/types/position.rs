@@ -51,6 +51,29 @@ pub struct PerpPosition {
     pub last_funding_index: i128,
 }
 
+impl PerpPosition {
+    /// Single source of truth for the six per-side margin-reservation fields.
+    ///
+    /// Given each side's open-order notional and the position leverage, writes
+    /// all six fields coherently: each side's `*_margin_reserved =
+    /// notional / leverage` (leverage floored at 1), and the position-level
+    /// `margin_reserved` / `margin_reserved_notional` = the max across the two
+    /// sides — hedged orders share collateral, so only the larger side needs
+    /// margin. Callers compute the wallet delta from the change in
+    /// `margin_reserved` around this call, and own `fee_reserved` separately.
+    pub(crate) fn set_reservations(&mut self, buy_notional: u64, sell_notional: u64, leverage: u64) {
+        let lev = leverage.max(1);
+        self.buy_side_reserved_notional = buy_notional;
+        self.sell_side_reserved_notional = sell_notional;
+        self.buy_side_margin_reserved = buy_notional / lev;
+        self.sell_side_margin_reserved = sell_notional / lev;
+        self.margin_reserved_notional = buy_notional.max(sell_notional);
+        self.margin_reserved = self
+            .buy_side_margin_reserved
+            .max(self.sell_side_margin_reserved);
+    }
+}
+
 impl Default for PerpPosition {
     fn default() -> Self {
         Self {
@@ -109,4 +132,40 @@ pub struct Market {
     /// 0 = no fee.
     #[serde(default, rename = "lf")]
     pub liquidation_fee_rate_bps: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_reservations_writes_all_six_fields_with_max_of_side() {
+        let mut p = PerpPosition::default();
+        p.set_reservations(1000, 400, 5);
+        assert_eq!(p.buy_side_reserved_notional, 1000);
+        assert_eq!(p.sell_side_reserved_notional, 400);
+        assert_eq!(p.buy_side_margin_reserved, 200); // 1000 / 5
+        assert_eq!(p.sell_side_margin_reserved, 80); // 400 / 5
+        assert_eq!(p.margin_reserved_notional, 1000); // max(1000, 400)
+        assert_eq!(p.margin_reserved, 200); // max(200, 80)
+    }
+
+    #[test]
+    fn set_reservations_floors_zero_leverage_to_one() {
+        let mut p = PerpPosition::default();
+        p.set_reservations(1000, 0, 0);
+        assert_eq!(p.buy_side_margin_reserved, 1000); // 1000 / max(0, 1)
+        assert_eq!(p.margin_reserved, 1000);
+    }
+
+    #[test]
+    fn set_reservations_zeroes_all_fields_on_zero_notional() {
+        let mut p = PerpPosition::default();
+        p.set_reservations(500, 500, 5);
+        p.set_reservations(0, 0, 5);
+        assert_eq!(p.buy_side_reserved_notional, 0);
+        assert_eq!(p.sell_side_reserved_notional, 0);
+        assert_eq!(p.margin_reserved, 0);
+        assert_eq!(p.margin_reserved_notional, 0);
+    }
 }
