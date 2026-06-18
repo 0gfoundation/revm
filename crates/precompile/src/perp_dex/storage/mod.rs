@@ -150,6 +150,11 @@ fn load_blob<CTX: ContextTr>(context: &mut CTX, key: B256) -> Result<Vec<u8>, Pr
 /// Writes an off-trie PerpDEX blob. An empty `buf` marks the key absent. The write is journaled
 /// in the perp section (reverts in lock-step with the surrounding checkpoint / `discard_tx`) and
 /// is never folded into the trie-bound `EvmState`.
+///
+/// #16d: the on-trie commitment is NO LONGER updated per write. It is folded ONCE at block end from
+/// the net delta by [`finalize_block_commitment`] (which the block executor calls after
+/// `take_perp_delta`), so a key written N times across the block is hashed once. This replaces the
+/// former per-call `flush_commitment` over a per-write framed log.
 fn store_blob<CTX: ContextTr>(
     context: &mut CTX,
     key: B256,
@@ -158,118 +163,12 @@ fn store_blob<CTX: ContextTr>(
     #[cfg(test)]
     bench_counter::record_write(key, buf.len());
     context.journal_mut().perp_store(key, buf.to_vec());
-
-    // Global commitment over the off-trie perp write-stream, anchored ON-trie under 0x1003 so
-    // divergence surfaces in the state root (consensus-detectable). Every write (incl. empty-buf
-    // deletes) is appended to a per-call in-memory LOG, framed `key(32) ‖ len(u32 BE) ‖ value`.
-    // At call exit `flush_commitment` COALESCES the log to the net delta (last value per key,
-    // ascending key order) and hashes it ONCE (see that fn for the exact formula):
-    //   C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ Σ_sorted(key ‖ len ‖ value))
-    // (P4: 16b single hash + #18 coalesce + #24 BLAKE3). Replaces the former per-store chained
-    // keccak (one fold + sstore per write). CHANGES the 0x1003 commitment value, so it requires a
-    // fresh chain (devnet wipe). The length prefix keeps the framing injective over variable-length
-    // blobs — its u32 width bounds a single blob to <4 GiB, which the per-store gas budget enforces
-    // far below; assert it so a future unbounded blob fails loudly instead of truncating the frame.
-    debug_assert!(buf.len() <= u32::MAX as usize, "perp blob exceeds u32 commitment frame length");
-    let mut framed = Vec::with_capacity(32 + 4 + buf.len());
-    framed.extend_from_slice(key.as_slice());
-    framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
-    framed.extend_from_slice(buf);
-    context.journal_mut().perp_fold_append(&framed);
     Ok(())
 }
 
-/// Version byte mixed into the per-call commitment hash, so the framed construction can evolve
-/// (e.g. a future block-level fold) while staying distinguishable.
-/// v1 = 16b execution-order framed log; v2 = #18 coalesced net delta (last-value-per-key, sorted).
-const COMMITMENT_VERSION: u8 = 2;
-
-/// Hashes the per-call commitment log into the on-trie anchor slot under 0x1003.
-///
-/// Called once at the end of every successful `run_perp_dex_call`; a no-op if the call performed no
-/// `store_blob` (empty log). Reads the running commitment `C_prev` from the slot, computes
-/// `C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ Σ_sorted(key ‖ len ‖ value))`, and sstores it. The
-/// sstore is journaled, so it reverts with the surrounding frame. `touch_account` is required so
-/// the slot change is included in the BundleState transition (a normal perp tx does not otherwise
-/// touch 0x1003's on-trie storage — its bulk writes are off-trie); mirrors `save_erc20_balance`.
-///
-/// The raw per-call log records every write in execution order (possibly with duplicate keys);
-/// here it is COALESCED to the net delta — last value per key, emitted in ascending key order
-/// (#18). This commits the call's net STATE CHANGE rather than its write *sequence*: two executions
-/// reaching the same net delta produce the same commitment (which is the property that matters for
-/// state-divergence detection), and a key written N times in a call is hashed once. Coalescing +
-/// key-sorting is deterministic across nodes (keys are a total order; HashMap is only an
-/// intermediate, never iterated for the hash).
-///
-/// BLAKE3 (P4/#24) rather than keccak: the slot is an internal consensus anchor (no EVM SHA3
-/// opcode, no contract reads it — only the next call's `C_prev` seed), so the hash function is a
-/// free choice; BLAKE3 is faster, especially over the longer log. 32-byte digest → U256.
-///
-/// Tests that drive `store_blob` / `run_*` directly (bypassing the dispatch) must call this to make
-/// the commitment observable on the slot.
-pub(crate) fn flush_commitment<CTX: ContextTr>(context: &mut CTX) -> Result<(), PrecompileError> {
-    let log = context.journal_mut().perp_fold_take_log();
-    if log.is_empty() {
-        return Ok(());
-    }
-    context
-        .journal_mut()
-        .warm_account(PERP_DEX_ADDRESS)
-        .map_err(convert_db_err::<CTX::Db>)?;
-    let c_prev = context
-        .journal_mut()
-        .sload(PERP_DEX_ADDRESS, commitment_slot().into())
-        .map_err(convert_db_err::<CTX::Db>)?
-        .data;
-
-    // Coalesce the framed log (key(32) ‖ len(u32 BE) ‖ value, per write) to the net delta:
-    // last value wins per key. The log is internally produced, so the framing is exact.
-    let mut net: HashMap<B256, &[u8]> = HashMap::default();
-    let mut i = 0usize;
-    while i < log.len() {
-        let key = B256::from_slice(&log[i..i + 32]);
-        i += 32;
-        let len = u32::from_be_bytes(log[i..i + 4].try_into().unwrap()) as usize;
-        i += 4;
-        let value = &log[i..i + len];
-        i += len;
-        net.insert(key, value);
-    }
-    // Emit in ascending key order for cross-node determinism (HashMap iteration is not ordered).
-    let mut net_keys: Vec<B256> = net.keys().copied().collect();
-    net_keys.sort_unstable();
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&c_prev.to_be_bytes::<32>());
-    hasher.update(&[COMMITMENT_VERSION]);
-    for key in &net_keys {
-        let value = net[key];
-        hasher.update(key.as_slice());
-        hasher.update(&(value.len() as u32).to_be_bytes());
-        hasher.update(value);
-    }
-    let c_new = U256::from_be_bytes(*hasher.finalize().as_bytes());
-    context
-        .journal_mut()
-        .sstore(PERP_DEX_ADDRESS, commitment_slot().into(), c_new)
-        .map_err(convert_db_err::<CTX::Db>)?;
-    context.journal_mut().touch_account(PERP_DEX_ADDRESS);
-    Ok(())
-}
-
-/// Discards the per-call commitment log without hashing it (revert / fatal path).
-///
-/// The surrounding frame's `checkpoint_revert` undoes the perp overlay writes, and the anchor slot
-/// was never written this call, so it stays at its pre-call value. Clearing the log here also
-/// prevents it leaking into the next call in the same transaction.
-pub(crate) fn discard_commitment_fold<CTX: ContextTr>(context: &mut CTX) {
-    let _ = context.journal_mut().perp_fold_take_log();
-}
-
-/// Version byte for the per-BLOCK commitment (catalog #16d), kept distinct from the per-call v2
-/// (`COMMITMENT_VERSION`) so the two framings never alias during the transition. While #16d is
-/// being wired across repos the per-call `flush_commitment` (v2) stays active; the block-end path
-/// (v3) replaces it only once the executor hook calls `finalize_block_commitment`.
+/// Version byte mixed into the per-block commitment hash (catalog #16d). Bumped to 3 at the
+/// switch from the per-call chained v2 (retired) to the per-block net-delta fold, so the two
+/// framings never alias across the consensus transition (a devnet wipe accompanies the bump).
 const BLOCK_COMMITMENT_VERSION: u8 = 3;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
@@ -1156,135 +1055,11 @@ mod commitment_tests {
             .data
     }
 
-    /// Independent reference model of one call's commitment hash (P4/16b + #24 + #18):
-    /// `C_new = blake3(C_prev ‖ COMMITMENT_VERSION ‖ Σ_sorted(key(32) ‖ len(u32 BE) ‖ value))`,
-    /// the writes COALESCED to the net delta (last value per key) and emitted in ascending key
-    /// order. Uses a BTreeMap (sorted, last-insert-wins) — a different implementation than the
-    /// production HashMap+sort, so agreement is a genuine cross-check, not a tautology.
-    fn expect_framed(prev: U256, writes: &[(B256, &[u8])]) -> U256 {
-        let mut net: std::collections::BTreeMap<B256, &[u8]> = std::collections::BTreeMap::new();
-        for (key, blob) in writes {
-            net.insert(*key, blob);
-        }
-        let mut p = Vec::new();
-        p.extend_from_slice(&prev.to_be_bytes::<32>());
-        p.push(COMMITMENT_VERSION);
-        for (key, blob) in &net {
-            p.extend_from_slice(key.as_slice());
-            p.extend_from_slice(&(blob.len() as u32).to_be_bytes());
-            p.extend_from_slice(blob);
-        }
-        U256::from_be_bytes(*blake3::hash(&p).as_bytes())
-    }
 
-    #[test]
-    fn commitment_framed_log_over_writes() {
-        let mut ctx = new_test_ctx();
-        assert_eq!(read_commitment(&mut ctx), U256::ZERO); // genesis init = 0
 
-        // Each store+flush is one call hashing a 1-write log against the running C_prev.
-        let (k1, b1) = (B256::with_last_byte(1), vec![0xAAu8]);
-        let (k2, b2) = (B256::with_last_byte(2), vec![0xBBu8, 0xCC]);
-        store_blob(&mut ctx, k1, &b1).unwrap();
-        flush_commitment(&mut ctx).unwrap();
-        let c1 = expect_framed(U256::ZERO, &[(k1, &b1)]);
-        assert_eq!(read_commitment(&mut ctx), c1);
-        store_blob(&mut ctx, k2, &b2).unwrap();
-        flush_commitment(&mut ctx).unwrap();
-        let c2 = expect_framed(c1, &[(k2, &b2)]);
-        assert_eq!(read_commitment(&mut ctx), c2);
-        assert_ne!(c2, c1);
-    }
 
-    /// A whole call's writes are accumulated into one log and hashed ONCE at flush; the slot must
-    /// not move until the flush. With #18 the log is coalesced to the net delta — a key written
-    /// twice in the call contributes only its FINAL value, and the order is by key, not execution.
-    #[test]
-    fn commitment_single_call_coalesces_and_hashes_once() {
-        let writes: [(B256, Vec<u8>); 3] = [
-            (B256::with_last_byte(1), vec![0xAA]),
-            (B256::with_last_byte(2), vec![0xBB, 0xCC]),
-            (B256::with_last_byte(1), vec![0xDD]), // same key twice → only 0xDD survives in the net
-        ];
-        let mut ctx = new_test_ctx();
-        for (k, b) in &writes {
-            store_blob(&mut ctx, *k, b).unwrap();
-            assert_eq!(read_commitment(&mut ctx), U256::ZERO, "slot must not move before flush");
-        }
-        flush_commitment(&mut ctx).unwrap();
-        let refs: Vec<(B256, &[u8])> = writes.iter().map(|(k, b)| (*k, b.as_slice())).collect();
-        assert_eq!(read_commitment(&mut ctx), expect_framed(U256::ZERO, &refs));
 
-        // Coalescing is real: writing only the FINAL value of the duplicated key (a different
-        // execution that reaches the same net delta) yields the SAME commitment.
-        let net_only: [(B256, Vec<u8>); 2] = [
-            (B256::with_last_byte(2), vec![0xBB, 0xCC]),
-            (B256::with_last_byte(1), vec![0xDD]),
-        ];
-        let mut ctx2 = new_test_ctx();
-        for (k, b) in &net_only {
-            store_blob(&mut ctx2, *k, b).unwrap();
-        }
-        flush_commitment(&mut ctx2).unwrap();
-        assert_eq!(
-            read_commitment(&mut ctx2),
-            read_commitment(&mut ctx),
-            "same net delta (regardless of write count/order) => same commitment"
-        );
-    }
 
-    /// `flush_commitment` is a no-op when the call performed no `store_blob` (empty log).
-    #[test]
-    fn flush_is_noop_without_stores() {
-        let mut ctx = new_test_ctx();
-        flush_commitment(&mut ctx).unwrap();
-        assert_eq!(read_commitment(&mut ctx), U256::ZERO);
-    }
-
-    #[test]
-    fn commitment_rolls_back_on_revert() {
-        let mut ctx = new_test_ctx();
-        store_blob(&mut ctx, B256::with_last_byte(1), &[0xAA]).unwrap();
-        flush_commitment(&mut ctx).unwrap();
-        let before = read_commitment(&mut ctx);
-
-        // The flush sstore is journaled, so a checkpoint_revert after it rolls the slot back. The
-        // checkpoint also snapshots the (here empty) commitment-log length and truncates on revert.
-        let cp = ctx.journal_mut().checkpoint();
-        store_blob(&mut ctx, B256::with_last_byte(2), &[0xBB]).unwrap();
-        flush_commitment(&mut ctx).unwrap();
-        assert_ne!(read_commitment(&mut ctx), before);
-        ctx.journal_mut().checkpoint_revert(cp);
-        assert_eq!(read_commitment(&mut ctx), before); // reverted write's commitment update rolled back
-    }
-
-    /// Exercises the `JournalCheckpoint` commitment-log truncation with a NON-empty log at the
-    /// checkpoint — the path the inner fuzz test (which drives `perp_store` directly, never
-    /// appending to the log) never reaches. A checkpoint is taken mid-call after one store, a
-    /// second store is made and reverted, then a third store proceeds; the flushed commitment must
-    /// equal the framed log over only the surviving writes (w0, w2) in order.
-    #[test]
-    fn log_truncates_under_mid_call_checkpoint_revert() {
-        let (k0, b0) = (B256::with_last_byte(0xA0), vec![0x01u8, 0x02]);
-        let (k1, b1) = (B256::with_last_byte(0xA1), vec![0x03u8]); // reverted
-        let (k2, b2) = (B256::with_last_byte(0xA2), vec![0x04u8, 0x05, 0x06]);
-
-        let mut ctx = new_test_ctx();
-        store_blob(&mut ctx, k0, &b0).unwrap();
-        // Checkpoint with a NON-empty log (k0 appended but not yet hashed).
-        let cp = ctx.journal_mut().checkpoint();
-        store_blob(&mut ctx, k1, &b1).unwrap();
-        // Revert: drops the k1 overlay write and truncates the log back to its post-k0 length.
-        ctx.journal_mut().checkpoint_revert(cp);
-        // The next store appends to the TRUNCATED log, so k1 is absent from the final hash.
-        store_blob(&mut ctx, k2, &b2).unwrap();
-        flush_commitment(&mut ctx).unwrap();
-
-        let expected = expect_framed(U256::ZERO, &[(k0, &b0), (k2, &b2)]);
-        assert_eq!(read_commitment(&mut ctx), expected);
-        // The reverted blob must be gone from the overlay, in lock-step with the log truncation.
-        assert!(load_blob(&mut ctx, k1).unwrap().is_empty(), "reverted write must leave no overlay residue");
-    }
 
     /// #16d: `compute_block_commitment` hashes the block NET delta once. Cross-checked against an
     /// independent BTreeMap reference (sorted, v3 framing) — a different impl than production's
@@ -1325,13 +1100,28 @@ mod commitment_tests {
         let mut ctx2 = new_test_ctx();
         finalize_block_commitment(&mut ctx2, &HashMap::default()).unwrap();
         assert_eq!(read_commitment(&mut ctx2), U256::ZERO);
+    }
 
-        // Distinct from the per-call v2 framing over the same writes (version byte differs).
-        assert_ne!(
-            compute_block_commitment(U256::ZERO, &delta),
-            expect_framed(U256::ZERO, &[(k1, &[0xAAu8]), (k2, &[0xBBu8, 0xCC]), (k3, &[])]),
-            "v3 block framing must differ from v2 per-call framing"
-        );
+    /// #16d end-to-end: `store_blob` writes accumulate in the overlay; the on-trie slot stays
+    /// untouched until the block-end finalize folds the net delta ONCE (mirroring the executor:
+    /// `take_perp_delta` → `finalize_block_commitment`). A key overwritten in-block contributes
+    /// only its final value.
+    #[test]
+    fn block_commitment_from_overlay_writes() {
+        let mut ctx = new_test_ctx();
+        let (k1, b1) = (B256::with_last_byte(0x11), vec![0x01u8, 0x02]);
+        let (k2, b2) = (B256::with_last_byte(0x22), vec![0x03u8]);
+        store_blob(&mut ctx, k1, &b1).unwrap();
+        store_blob(&mut ctx, k2, &b2).unwrap();
+        store_blob(&mut ctx, k1, &[0x09]).unwrap(); // overwrite k1; net delta keeps the last value
+        // No per-call flush: the on-trie slot stays at genesis until block end.
+        assert_eq!(read_commitment(&mut ctx), U256::ZERO, "slot must not move until block end");
+
+        let delta = ctx.journal_mut().take_perp_delta();
+        let expected = compute_block_commitment(U256::ZERO, &delta);
+        finalize_block_commitment(&mut ctx, &delta).unwrap();
+        assert_eq!(read_commitment(&mut ctx), expected);
+        assert_ne!(expected, U256::ZERO);
     }
 }
 

@@ -1286,13 +1286,13 @@ fn perp_data_stays_off_trie_not_in_evm_state() {
     setup(&mut ctx);
     // A resting buy order writes order, book level, best-bid, etc. — all perp blobs.
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
-    // `place` drives `run_place_order` directly (no dispatch), so the per-call commitment fold is
-    // still in the accumulator — flush it to the on-trie slot, as `run_perp_dex_call` would.
-    storage::flush_commitment(&mut ctx).unwrap();
 
     // Perp writes are captured in the off-trie delta...
     let delta = ctx.journal_mut().take_perp_delta();
     assert!(!delta.is_empty(), "perp writes must land in the off-trie delta");
+    // `place` drives `run_place_order` directly (no dispatch). #16d: the commitment is folded ONCE
+    // at block end — finalize the harvested net delta onto the 0x1003 slot, as the executor would.
+    storage::finalize_block_commitment(&mut ctx, &delta).unwrap();
 
     // ...while the trie-bound EvmState carries only the single chained
     // commitment anchor under 0x1003 (keccak256("cmit"), commit a7b0699d). The
@@ -2010,8 +2010,12 @@ mod golden {
     /// is unchanged.
     /// (Prior re-pins: P4/#20 bin+enum 0x8a0b7f…; #20-positional 0xcdeac1…; #18
     /// 0x58835a…; #24 0x995638…; 16b 0x69e699…; ext 0x2d5fa5…; P0.)
+    /// #16d (per-block commitment, v3): folded ONCE at block end from the net delta
+    /// (`take_perp_delta` → `finalize_block_commitment`), replacing the per-call v2 flush.
+    /// BusinessSnapshot is UNCHANGED (pure commitment-representation change). Prior v2 value
+    /// 0x3c80c530439970bd37d4bef6bcfd22411740241981764031154765a558bf9f47.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x3c80c530439970bd37d4bef6bcfd22411740241981764031154765a558bf9f47");
+        b256!("0x24d9197680681d1b627f13e28ba971a3e1bf2589a979141ae48989efc797e7e6");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -2918,8 +2922,8 @@ mod golden {
             .abi_encode(),
         );
 
-        // View stretch #2 — final reads must not fold either.
-        let c_final_views = read_commitment(&mut ctx);
+        // View stretch #2 — pure reads (under #16d the slot is untouched until the block-end
+        // finalize below, so it stays at genesis throughout the scenario).
         dex_view(
             &mut ctx,
             &getAveragePremiumIndexCall {
@@ -2942,11 +2946,12 @@ mod golden {
                 carol_close,
             },
         );
+        // #16d: the commitment is folded ONCE at block end. The snapshot above was read while the
+        // overlay was intact; now harvest the net delta and finalize it onto 0x1003, exactly as the
+        // block executor does (take_perp_delta → finalize_block_commitment) before the state root.
+        let delta = ctx.journal_mut().take_perp_delta();
+        storage::finalize_block_commitment(&mut ctx, &delta).unwrap();
         let commitment = read_commitment(&mut ctx);
-        assert_eq!(
-            commitment, c_final_views,
-            "snapshot views must not fold the commitment"
-        );
 
         (B256::from(commitment.to_be_bytes::<32>()), snapshot)
     }

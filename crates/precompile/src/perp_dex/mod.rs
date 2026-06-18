@@ -188,16 +188,8 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
     is_static: bool,
     context: &mut CTX,
 ) -> PrecompileResult {
-    // Invariant: the per-call commitment log must be empty on entry — every prior call hashed
-    // (Ok) or discarded (revert/fatal) it, and the EVM frame truncates it on a reverted call. The
-    // pre-dispatch early returns below (bad selector / out-of-gas / static violation) skip
-    // flush/discard, which is sound ONLY because nothing has been appended yet; this assert keeps
-    // that invariant self-enforcing against future refactors.
-    debug_assert!(
-        context.journal_mut().perp_fold_log_len() == 0,
-        "perp commitment log leaked from a previous call"
-    );
-
+    // #16d: the perp commitment is folded ONCE at block end (`finalize_block_commitment` from the
+    // block executor), not per call — so there is no per-call commitment work in this entry point.
     let selector: [u8; 4] = input_bytes
         .get(..4)
         .and_then(|s| s.try_into().ok())
@@ -302,21 +294,6 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
             run_get_average_premium_index(input_bytes, context)
         }
         _ => return Err(PrecompileError::StatefulInvalidInput),
-    };
-
-    // Per-call commitment fold (P2): on success, sstore the single accumulated value once. On
-    // revert/fatal, discard the accumulator (clear it to None). The anchor slot was never written
-    // this call (flush did not run), so it already sits at its pre-call value — net-identical to
-    // the former per-store fold which sstored N times then had them reverted. In the normal EVM
-    // path the surrounding frame's checkpoint_revert also undoes the perp overlay writes and
-    // restores the (None) fold snapshot; the discard here is what guarantees no stale fold leaks
-    // into the next call for the non-frame-reverting Err path and for direct-driver tests.
-    let result = match result {
-        Ok(bytes) => storage::flush_commitment(context).map(|()| bytes),
-        other => {
-            storage::discard_commitment_fold(context);
-            other
-        }
     };
 
     match result {
