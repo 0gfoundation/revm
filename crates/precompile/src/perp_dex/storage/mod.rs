@@ -268,21 +268,56 @@ pub(crate) fn discard_commitment_fold<CTX: ContextTr>(context: &mut CTX) {
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
+/// Cached typed read of an off-trie blob (catalog #14). Returns the block-cached deserialized
+/// value if present, else loads + msgpack-decodes the blob and caches it. `Ok(None)` if the blob
+/// is absent (empty); the caller applies its own default / `Option` semantics (absence is not
+/// cached). The cache lives in the journal's block-scoped, revert-cleared `PerpSection`, so this
+/// collapses repeated reads of a hot blob within a block to a single decode.
+fn load_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256) -> Result<Option<T>, PrecompileError>
+where
+    T: Clone + 'static + for<'de> Deserialize<'de>,
+{
+    if let Some(any) = context.journal_mut().perp_cache_get(key) {
+        if let Some(v) = any.downcast_ref::<T>() {
+            return Ok(Some(v.clone()));
+        }
+    }
+    let buf = load_blob(context, key)?;
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let val: T = decode(&buf)?;
+    context
+        .journal_mut()
+        .perp_cache_put(key, std::boxed::Box::new(val.clone()));
+    Ok(Some(val))
+}
+
+/// Cached typed write of an off-trie blob: serializes + stores it (the commitment byte-stream is
+/// unchanged — SAFE) and writes the value THROUGH to the deser cache so later reads this block
+/// skip the decode. (`store_blob` already invalidated the key; this re-establishes it.)
+fn save_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256, val: &T) -> Result<(), PrecompileError>
+where
+    T: Clone + 'static + Serialize,
+{
+    let buf = encode(val)?;
+    store_blob(context, key, &buf)?;
+    context
+        .journal_mut()
+        .perp_cache_put(key, std::boxed::Box::new(val.clone()));
+    Ok(())
+}
+
 /// Returns `Address::ZERO` when no admin has been initialised yet.
 pub fn load_admin<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
-    let buf = load_blob(context, admin_key())?;
-    if buf.is_empty() {
-        return Ok(Address::ZERO);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, Address>(context, admin_key())?.unwrap_or(Address::ZERO))
 }
 
 pub fn save_admin<CTX: ContextTr>(
     context: &mut CTX,
     admin: Address,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&admin)?;
-    store_blob(context, admin_key(), &buf)
+    save_cached(context, admin_key(), &admin)
 }
 
 // ── UserAccount ───────────────────────────────────────────────────────────────
@@ -291,11 +326,7 @@ pub fn load_account<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<UserAccount, PrecompileError> {
-    let buf = load_blob(context, account_key(user))?;
-    if buf.is_empty() {
-        return Ok(UserAccount::default());
-    }
-    decode(&buf)
+    Ok(load_cached::<_, UserAccount>(context, account_key(user))?.unwrap_or_default())
 }
 
 pub fn save_account<CTX: ContextTr>(
@@ -303,19 +334,14 @@ pub fn save_account<CTX: ContextTr>(
     user: Address,
     account: UserAccount,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&account)?;
-    store_blob(context, account_key(user), &buf)
+    save_cached(context, account_key(user), &account)
 }
 
 pub fn load_user_fee_rates<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<UserFeeRates, PrecompileError> {
-    let buf = load_blob(context, user_fee_rates_key(user))?;
-    if buf.is_empty() {
-        return Ok(UserFeeRates::default());
-    }
-    decode(&buf)
+    Ok(load_cached::<_, UserFeeRates>(context, user_fee_rates_key(user))?.unwrap_or_default())
 }
 
 pub fn save_user_fee_rates<CTX: ContextTr>(
@@ -323,19 +349,14 @@ pub fn save_user_fee_rates<CTX: ContextTr>(
     user: Address,
     rates: UserFeeRates,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&rates)?;
-    store_blob(context, user_fee_rates_key(user), &buf)
+    save_cached(context, user_fee_rates_key(user), &rates)
 }
 
 pub fn load_market_fee_total<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let buf = load_blob(context, market_fee_total_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, u64>(context, market_fee_total_key(market_id))?.unwrap_or(0))
 }
 
 pub fn add_market_fee_total<CTX: ContextTr>(
@@ -405,11 +426,7 @@ pub fn load_position<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<PerpPosition, PrecompileError> {
-    let buf = load_blob(context, position_key(user, market_id))?;
-    if buf.is_empty() {
-        return Ok(PerpPosition::default());
-    }
-    decode(&buf)
+    Ok(load_cached::<_, PerpPosition>(context, position_key(user, market_id))?.unwrap_or_default())
 }
 
 pub fn save_position<CTX: ContextTr>(
@@ -418,8 +435,7 @@ pub fn save_position<CTX: ContextTr>(
     market_id: u64,
     pos: &PerpPosition,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(pos)?;
-    store_blob(context, position_key(user, market_id), &buf)
+    save_cached(context, position_key(user, market_id), pos)
 }
 
 // ── Order entry lists (per-user per-market) ───────────────────────────────────
@@ -429,11 +445,8 @@ pub fn load_buy_orders<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<Vec<OrderEntry>, PrecompileError> {
-    let buf = load_blob(context, user_buy_orders_key(user, market_id))?;
-    if buf.is_empty() {
-        return Ok(vec![]);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?
+        .unwrap_or_default())
 }
 
 pub fn save_buy_orders<CTX: ContextTr>(
@@ -442,8 +455,9 @@ pub fn save_buy_orders<CTX: ContextTr>(
     market_id: u64,
     entries: &[OrderEntry],
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&entries)?;
-    store_blob(context, user_buy_orders_key(user, market_id), &buf)
+    // Cache the owned Vec; msgpack-encoding a `&[T]` and a `&Vec<T>` is byte-identical (both a
+    // sequence), so the commitment stream is unchanged.
+    save_cached(context, user_buy_orders_key(user, market_id), &entries.to_vec())
 }
 
 pub fn load_sell_orders<CTX: ContextTr>(
@@ -451,11 +465,8 @@ pub fn load_sell_orders<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<Vec<OrderEntry>, PrecompileError> {
-    let buf = load_blob(context, user_sell_orders_key(user, market_id))?;
-    if buf.is_empty() {
-        return Ok(vec![]);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?
+        .unwrap_or_default())
 }
 
 pub fn save_sell_orders<CTX: ContextTr>(
@@ -464,8 +475,7 @@ pub fn save_sell_orders<CTX: ContextTr>(
     market_id: u64,
     entries: &[OrderEntry],
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&entries)?;
-    store_blob(context, user_sell_orders_key(user, market_id), &buf)
+    save_cached(context, user_sell_orders_key(user, market_id), &entries.to_vec())
 }
 
 // ── Full Order struct ─────────────────────────────────────────────────────────
@@ -474,11 +484,7 @@ pub fn load_order<CTX: ContextTr>(
     context: &mut CTX,
     order_id: &[u8; 32],
 ) -> Result<Option<Order>, PrecompileError> {
-    let buf = load_blob(context, order_key(order_id))?;
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(decode(&buf)?))
+    load_cached::<_, Order>(context, order_key(order_id))
 }
 
 pub fn save_order<CTX: ContextTr>(
@@ -486,8 +492,7 @@ pub fn save_order<CTX: ContextTr>(
     order_id: &[u8; 32],
     order: &Order,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(order)?;
-    store_blob(context, order_key(order_id), &buf)
+    save_cached(context, order_key(order_id), order)
 }
 
 // ── Global trade counter ──────────────────────────────────────────────────────
@@ -499,10 +504,8 @@ pub fn next_trade_id<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let buf = load_blob(context, trade_count_key(market_id))?;
-    let current: u64 = if buf.is_empty() { 0 } else { decode(&buf)? };
-    let next_buf = encode(&(current + 1))?;
-    store_blob(context, trade_count_key(market_id), &next_buf)?;
+    let current: u64 = load_cached::<_, u64>(context, trade_count_key(market_id))?.unwrap_or(0);
+    save_cached(context, trade_count_key(market_id), &(current + 1))?;
     Ok(current)
 }
 
@@ -512,11 +515,7 @@ pub fn load_user_nonce<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<u64, PrecompileError> {
-    let buf = load_blob(context, user_nonce_key(user))?;
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, u64>(context, user_nonce_key(user))?.unwrap_or(0))
 }
 
 pub fn save_user_nonce<CTX: ContextTr>(
@@ -524,8 +523,7 @@ pub fn save_user_nonce<CTX: ContextTr>(
     user: Address,
     nonce: u64,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&nonce)?;
-    store_blob(context, user_nonce_key(user), &buf)
+    save_cached(context, user_nonce_key(user), &nonce)
 }
 
 // ── Market ────────────────────────────────────────────────────────────────────
@@ -534,19 +532,14 @@ pub fn load_market<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<Option<Market>, PrecompileError> {
-    let buf = load_blob(context, market_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(decode(&buf)?))
+    load_cached::<_, Market>(context, market_key(market_id))
 }
 
 pub fn save_market<CTX: ContextTr>(
     context: &mut CTX,
     market: &Market,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(market)?;
-    store_blob(context, market_key(market.market_id), &buf)
+    save_cached(context, market_key(market.market_id), market)
 }
 
 // ── Mark price ────────────────────────────────────────────────────────────────
@@ -555,11 +548,7 @@ pub fn load_mark_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let buf = load_blob(context, mark_price_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, u64>(context, mark_price_key(market_id))?.unwrap_or(0))
 }
 
 pub fn save_mark_price<CTX: ContextTr>(
@@ -567,8 +556,7 @@ pub fn save_mark_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&price)?;
-    store_blob(context, mark_price_key(market_id), &buf)
+    save_cached(context, mark_price_key(market_id), &price)
 }
 
 // ── Open interest ─────────────────────────────────────────────────────────────
@@ -577,11 +565,7 @@ pub fn load_open_interest<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let buf = load_blob(context, open_interest_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, u64>(context, open_interest_key(market_id))?.unwrap_or(0))
 }
 
 pub fn save_open_interest<CTX: ContextTr>(
@@ -589,8 +573,7 @@ pub fn save_open_interest<CTX: ContextTr>(
     market_id: u64,
     oi: u64,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&oi)?;
-    store_blob(context, open_interest_key(market_id), &buf)
+    save_cached(context, open_interest_key(market_id), &oi)
 }
 
 // ── Order book: price level lists ─────────────────────────────────────────────
@@ -600,11 +583,7 @@ pub fn load_bid_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<Vec<u64>, PrecompileError> {
-    let buf = load_blob(context, bid_prices_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(vec![]);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, Vec<u64>>(context, bid_prices_key(market_id))?.unwrap_or_default())
 }
 
 pub fn save_bid_prices<CTX: ContextTr>(
@@ -612,8 +591,7 @@ pub fn save_bid_prices<CTX: ContextTr>(
     market_id: u64,
     prices: &[u64],
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&prices)?;
-    store_blob(context, bid_prices_key(market_id), &buf)
+    save_cached(context, bid_prices_key(market_id), &prices.to_vec())
 }
 
 /// Sorted ask prices ASC.
@@ -621,11 +599,7 @@ pub fn load_ask_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<Vec<u64>, PrecompileError> {
-    let buf = load_blob(context, ask_prices_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(vec![]);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, Vec<u64>>(context, ask_prices_key(market_id))?.unwrap_or_default())
 }
 
 pub fn save_ask_prices<CTX: ContextTr>(
@@ -633,8 +607,7 @@ pub fn save_ask_prices<CTX: ContextTr>(
     market_id: u64,
     prices: &[u64],
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&prices)?;
-    store_blob(context, ask_prices_key(market_id), &buf)
+    save_cached(context, ask_prices_key(market_id), &prices.to_vec())
 }
 
 // ── Order book: FIFO queue at a price level ───────────────────────────────────
@@ -788,11 +761,7 @@ pub fn load_best_bid<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let buf = load_blob(context, best_bid_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, u64>(context, best_bid_key(market_id))?.unwrap_or(0))
 }
 
 pub fn save_best_bid<CTX: ContextTr>(
@@ -800,19 +769,14 @@ pub fn save_best_bid<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&price)?;
-    store_blob(context, best_bid_key(market_id), &buf)
+    save_cached(context, best_bid_key(market_id), &price)
 }
 
 pub fn load_best_ask<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let buf = load_blob(context, best_ask_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    decode(&buf)
+    Ok(load_cached::<_, u64>(context, best_ask_key(market_id))?.unwrap_or(0))
 }
 
 pub fn save_best_ask<CTX: ContextTr>(
@@ -820,8 +784,7 @@ pub fn save_best_ask<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&price)?;
-    store_blob(context, best_ask_key(market_id), &buf)
+    save_cached(context, best_ask_key(market_id), &price)
 }
 
 /// Re-derive best_bid from the current bid price list (already in journal cache after matching).
