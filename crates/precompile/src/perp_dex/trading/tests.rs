@@ -91,6 +91,13 @@ fn pos(ctx: &mut TestCtx, user: Address) -> PerpPosition {
     storage::load_position(ctx, user, MARKET_ID).unwrap()
 }
 
+/// Deterministic distinct test user address from a small index (avoids ALICE/BOB/CAROL/ADMIN).
+fn user_addr(i: u64) -> Address {
+    let mut b = [0u8; 20];
+    b[12..20].copy_from_slice(&i.to_be_bytes());
+    Address::from(b)
+}
+
 /// Place an order and return its 32-byte order ID.
 fn place(
     ctx: &mut TestCtx,
@@ -1494,6 +1501,172 @@ mod perf {
             t_makers + t_taker,
             iters,
         );
+    }
+
+    // ── Block-level benches ────────────────────────────────────────────────
+    //
+    // The perf_* benches above each run ONE op against a fresh/steady-state book, so the off-trie
+    // overlay never accumulates and the SAME blob is never re-touched across txns — which makes the
+    // serialization redundancy a per-block deser cache (#14) / block-end serialization (#16d) would
+    // remove INVISIBLE. These run a whole "block" of txns against ONE ctx (overlay accumulates, hot
+    // blobs are re-touched), and instrument the load_blob/store_blob choke (`bench_counter`) to
+    // report ser/deser call-counts vs DISTINCT keys — the exact redundancy #14/#16d collapse.
+    //
+    // Like the other perf_* benches these call the inner `run_*` handlers directly (not
+    // `run_perp_dex_call`), so the per-call commitment flush (BLAKE3) is excluded — consistent with
+    // the existing baseline; this bench is about ser/deser VOLUME, not the commitment hash.
+
+    fn report_block(
+        label: &str,
+        elapsed: Duration,
+        calls: u64,
+        st: &crate::perp_dex::storage::bench_counter::Stats,
+    ) {
+        let rk = st.read_keys.len() as u64;
+        let wk = st.write_keys.len() as u64;
+        let wtk = st.write_txn_keys.len() as u64;
+        let pct = |saved: u64, total: u64| {
+            if total == 0 {
+                0.0
+            } else {
+                100.0 * saved as f64 / total as f64
+            }
+        };
+        println!(
+            "PERF BLOCK {label}: {calls} handler calls, {elapsed:?} ({:.2} us/call)",
+            elapsed.as_nanos() as f64 / 1000.0 / calls.max(1) as f64
+        );
+        println!(
+            "  load_blob (deser): {} calls, {} KiB, {rk} distinct keys",
+            st.read_calls,
+            st.read_bytes / 1024
+        );
+        println!(
+            "    -> per-block deser cache (#14): {rk} deser vs {} = -{} ({:.0}% fewer)",
+            st.read_calls,
+            st.read_calls.saturating_sub(rk),
+            pct(st.read_calls.saturating_sub(rk), st.read_calls)
+        );
+        println!(
+            "  store_blob (ser): {} calls, {} KiB, {wk} distinct keys",
+            st.write_calls,
+            st.write_bytes / 1024
+        );
+        println!(
+            "    -> per-call cache (#14):   {wtk} ser vs {} = -{} ({:.0}% fewer)",
+            st.write_calls,
+            st.write_calls.saturating_sub(wtk),
+            pct(st.write_calls.saturating_sub(wtk), st.write_calls)
+        );
+        println!(
+            "    -> block-end ser (#16d):   {wk} ser vs {} = -{} ({:.0}% fewer)",
+            st.write_calls,
+            st.write_calls.saturating_sub(wk),
+            pct(st.write_calls.saturating_sub(wk), st.write_calls)
+        );
+    }
+
+    /// Resting-only block: a few makers post GTC limit buys across an 8-level band, round after
+    /// round, against ONE ctx. No asks ever exist, so every buy rests (no matches). Maximises reuse
+    /// of: market config (read every order), best_bid + bid_prices list, the 8 level queues, and
+    /// each maker's account/position/nonce. The growing level queues also show the re-serialization
+    /// cost (#14/#16d serialize each final queue once instead of once per push).
+    #[test]
+    #[ignore = "block-level perf; run with --release --ignored --nocapture"]
+    fn perf_block_rest_heavy() {
+        use crate::perp_dex::storage::bench_counter as bc;
+        const N_MAKERS: u64 = 4;
+        const N_LEVELS: u64 = 8;
+        const ROUNDS: u64 = 500; // N_MAKERS * ROUNDS = 2000 resting placements
+
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let makers: Vec<Address> = (1..=N_MAKERS).map(user_addr).collect();
+        for &m in &makers {
+            JournalTr::load_account(ctx.journal_mut(), m).unwrap();
+            fund(&mut ctx, m, BIG);
+        }
+
+        bc::reset();
+        bc::enable();
+        let t0 = Instant::now();
+        let mut calls = 0u64;
+        for r in 0..ROUNDS {
+            for (mi, &m) in makers.iter().enumerate() {
+                let lvl = (r + mi as u64) % N_LEVELS;
+                let price = PRICE - (lvl + 1) * TICK; // strictly below PRICE; no asks => always rests
+                bc::next_txn();
+                let _ = place(&mut ctx, m, 0, price, QTY, 0, 0); // buy / limit / GTC
+                calls += 1;
+            }
+        }
+        let elapsed = t0.elapsed();
+        bc::disable();
+        report_block("rest-heavy (resting limits only)", elapsed, calls, &bc::snapshot());
+    }
+
+    /// Mixed block: resting bids + periodic IOC taker sweeps (cross the top 2 levels) + periodic
+    /// cancels of guaranteed-still-open deep bids. Exercises the rest, match, and cancel paths
+    /// against ONE ctx so maker accounts/positions, level queues and best_bid are re-touched by all
+    /// three paths.
+    #[test]
+    #[ignore = "block-level perf; run with --release --ignored --nocapture"]
+    fn perf_block_mixed() {
+        use crate::perp_dex::storage::bench_counter as bc;
+        const N_MAKERS: u64 = 4;
+        const N_LEVELS: u64 = 8;
+        const ROUNDS: u64 = 600;
+        const SWEEP_EVERY: u64 = 20;
+
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let makers: Vec<Address> = (1..=N_MAKERS).map(user_addr).collect();
+        for &m in &makers {
+            JournalTr::load_account(ctx.journal_mut(), m).unwrap();
+            fund(&mut ctx, m, BIG);
+        }
+        let taker = ALICE;
+        fund(&mut ctx, taker, BIG);
+
+        // Deep bids (level >= 2, price <= PRICE-3*TICK) are never crossed by a sweep at PRICE-2*TICK,
+        // so they stay open and are safe to cancel deterministically.
+        let mut deep: Vec<([u8; 32], Address)> = Vec::new();
+        bc::reset();
+        bc::enable();
+        let t0 = Instant::now();
+        let mut calls = 0u64;
+        for r in 0..ROUNDS {
+            for (mi, &m) in makers.iter().enumerate() {
+                let lvl = (r + mi as u64) % N_LEVELS;
+                let price = PRICE - (lvl + 1) * TICK;
+                bc::next_txn();
+                let id = place(&mut ctx, m, 0, price, QTY, 0, 0);
+                calls += 1;
+                if lvl >= 2 {
+                    deep.push((id, m));
+                }
+            }
+            if r % SWEEP_EVERY == SWEEP_EVERY - 1 {
+                // IOC sell crossing only the top ~2 bid levels; unfilled remainder expires (no ask rests).
+                bc::next_txn();
+                let _ = place(&mut ctx, taker, 1, PRICE - 2 * TICK, QTY * 3, 0, 1); // sell / limit / IOC
+                calls += 1;
+            }
+            if deep.len() > 32 {
+                let (id, owner) = deep.remove(0);
+                let cancel = cancelOrderCall {
+                    orderId: id.into(),
+                    marketId: MARKET_ID,
+                }
+                .abi_encode();
+                bc::next_txn();
+                run_cancel_order(&cancel, owner, &mut ctx).unwrap();
+                calls += 1;
+            }
+        }
+        let elapsed = t0.elapsed();
+        bc::disable();
+        report_block("mixed (rests + sweeps + cancels)", elapsed, calls, &bc::snapshot());
     }
 
     /// (e): placeOrderSigned taker, single fill — ed25519 verify path.

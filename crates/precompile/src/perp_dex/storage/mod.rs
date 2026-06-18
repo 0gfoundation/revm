@@ -49,6 +49,87 @@ fn decode<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<T, PrecompileError
     Deserialize::deserialize(&mut de).map_err(|_| perp_err("msgpack decode error"))
 }
 
+/// Test-only instrumentation wrapped around the single off-trie blob read/write choke
+/// (`load_blob`/`store_blob`). Quantifies the ser/deser VOLUME of a run and the redundancy that a
+/// per-block deserialized-struct cache (catalog #14) or block-end serialization (#16d) would
+/// collapse — measurable WITHOUT implementing either. Disabled by default (only the block-level
+/// perf bench `enable()`s it around the timed block) and compiled out of production via
+/// `cfg(test)`, so it adds ZERO hot-path cost on chain. Single-threaded use only (perf bench runs
+/// `--test-threads=1`); state is thread-local.
+#[cfg(test)]
+pub(crate) mod bench_counter {
+    use super::B256;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+
+    #[derive(Default, Clone)]
+    pub(crate) struct Stats {
+        /// `load_blob` calls (each is one potential deser; empty/absent reads decode to a default).
+        pub read_calls: u64,
+        pub read_bytes: u64,
+        /// Distinct keys read — a per-block deser cache (#14) collapses `read_calls` → this.
+        pub read_keys: HashSet<B256>,
+        /// `store_blob` calls (each is one serialize by the typed `save_*` helper).
+        pub write_calls: u64,
+        pub write_bytes: u64,
+        /// Distinct keys written — block-end serialization (#16d) collapses `write_calls` → this.
+        pub write_keys: HashSet<B256>,
+        /// Distinct (txn, key) pairs — a per-call cache (#14) collapses `write_calls` → this
+        /// (still one serialize per written key per txn, for that txn's commitment fold).
+        pub write_txn_keys: HashSet<(u32, B256)>,
+    }
+
+    thread_local! {
+        static STATS: RefCell<Stats> = RefCell::new(Stats::default());
+        static TXN: Cell<u32> = const { Cell::new(0) };
+        static ON: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn reset() {
+        STATS.with(|s| *s.borrow_mut() = Stats::default());
+        TXN.with(|t| t.set(0));
+    }
+    pub(crate) fn enable() {
+        ON.with(|o| o.set(true));
+    }
+    pub(crate) fn disable() {
+        ON.with(|o| o.set(false));
+    }
+    /// Marks the start of a new logical transaction (handler call) for per-call write attribution.
+    pub(crate) fn next_txn() {
+        TXN.with(|t| t.set(t.get().wrapping_add(1)));
+    }
+    pub(crate) fn snapshot() -> Stats {
+        STATS.with(|s| s.borrow().clone())
+    }
+
+    pub(crate) fn record_read(key: B256, bytes: usize) {
+        if !ON.with(Cell::get) {
+            return;
+        }
+        STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            s.read_calls += 1;
+            s.read_bytes += bytes as u64;
+            s.read_keys.insert(key);
+        });
+    }
+
+    pub(crate) fn record_write(key: B256, bytes: usize) {
+        if !ON.with(Cell::get) {
+            return;
+        }
+        let txn = TXN.with(Cell::get);
+        STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            s.write_calls += 1;
+            s.write_bytes += bytes as u64;
+            s.write_keys.insert(key);
+            s.write_txn_keys.insert((txn, key));
+        });
+    }
+}
+
 /// Reads an off-trie PerpDEX blob ("PerpState").
 ///
 /// Returns the in-block overlay value if the key was written during this block, otherwise the
@@ -57,10 +138,13 @@ fn decode<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<T, PrecompileError
 /// section instead, so it gets the same revert lifecycle but never enters the state root.
 /// See `docs/perpstate-journal集成方案.md` §4.2.
 fn load_blob<CTX: ContextTr>(context: &mut CTX, key: B256) -> Result<Vec<u8>, PrecompileError> {
-    context
+    let buf = context
         .journal_mut()
         .perp_load(key)
-        .map_err(convert_db_err::<CTX::Db>)
+        .map_err(convert_db_err::<CTX::Db>)?;
+    #[cfg(test)]
+    bench_counter::record_read(key, buf.len());
+    Ok(buf)
 }
 
 /// Writes an off-trie PerpDEX blob. An empty `buf` marks the key absent. The write is journaled
@@ -71,6 +155,8 @@ fn store_blob<CTX: ContextTr>(
     key: B256,
     buf: &[u8],
 ) -> Result<(), PrecompileError> {
+    #[cfg(test)]
+    bench_counter::record_write(key, buf.len());
     context.journal_mut().perp_store(key, buf.to_vec());
 
     // Global commitment over the off-trie perp write-stream, anchored ON-trie under 0x1003 so
