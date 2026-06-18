@@ -25,8 +25,8 @@ use crate::{
             getOrderReturn, placeOrderCall, placeOrderSignedCall,
         },
         math::{
-            calc_buy_side_reserved_notional, calc_maker_fee_for_order_qty_with_bps,
-            calc_sell_side_reserved_notional, calc_trading_fee, calc_value,
+            calc_maker_fee_for_order_qty_with_bps, calc_reservation_notionals, calc_trading_fee,
+            calc_value,
         },
         risk::record_mid_price_sample_for_best_quote_change,
         storage,
@@ -1189,10 +1189,13 @@ fn rest_in_book<CTX: ContextTr>(
                 },
             );
 
-            // Recompute buy-side notional; the six reservation fields are written
-            // by the single set_reservations source of truth below.
-            let new_buy_side_notional = calc_buy_side_reserved_notional(
+            // Recompute the flip-aware reservation from both sides of the book;
+            // the reservation fields are written by the single set_reservations
+            // source of truth below.
+            let sell_entries = storage::load_sell_orders(context, user, market_id)?;
+            let (new_buy_side_notional, sell_notional, c_notional) = calc_reservation_notionals(
                 &entries,
+                &sell_entries,
                 market.base_decimals,
                 market.price_decimals,
                 pos.amount,
@@ -1208,15 +1211,14 @@ fn rest_in_book<CTX: ContextTr>(
                 )));
             }
 
-            // Under max-reservation, the wallet delta is the change in max(buy, sell).
-            let old_max = pos
-                .buy_side_margin_reserved
-                .max(pos.sell_side_margin_reserved);
-            let sell_notional = pos.sell_side_reserved_notional;
+            // Wallet delta is the change in the flip-aware reservation
+            // (pos.margin_reserved), NOT the per-side max — the per-side fields
+            // lag margin_reserved under the flip-aware model.
+            let old_reserved = pos.margin_reserved;
             let leverage = pos.leverage;
-            pos.set_reservations(new_buy_side_notional, sell_notional, leverage);
-            let new_max = pos.margin_reserved;
-            let margin_delta = new_max.saturating_sub(old_max);
+            pos.set_reservations(new_buy_side_notional, sell_notional, c_notional, leverage);
+            let new_reserved = pos.margin_reserved;
+            let margin_delta = new_reserved.saturating_sub(old_reserved);
             let delta = margin_delta
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
@@ -1257,9 +1259,12 @@ fn rest_in_book<CTX: ContextTr>(
                 },
             );
 
-            // Recompute sell-side notional; the six reservation fields are written
-            // by the single set_reservations source of truth below.
-            let new_sell_side_notional = calc_sell_side_reserved_notional(
+            // Recompute the flip-aware reservation from both sides of the book;
+            // the reservation fields are written by the single set_reservations
+            // source of truth below.
+            let buy_entries = storage::load_buy_orders(context, user, market_id)?;
+            let (buy_notional, new_sell_side_notional, c_notional) = calc_reservation_notionals(
+                &buy_entries,
                 &entries,
                 market.base_decimals,
                 market.price_decimals,
@@ -1276,15 +1281,14 @@ fn rest_in_book<CTX: ContextTr>(
                 )));
             }
 
-            // Under max-reservation, the wallet delta is the change in max(buy, sell).
-            let old_max = pos
-                .buy_side_margin_reserved
-                .max(pos.sell_side_margin_reserved);
-            let buy_notional = pos.buy_side_reserved_notional;
+            // Wallet delta is the change in the flip-aware reservation
+            // (pos.margin_reserved), NOT the per-side max — the per-side fields
+            // lag margin_reserved under the flip-aware model.
+            let old_reserved = pos.margin_reserved;
             let leverage = pos.leverage;
-            pos.set_reservations(buy_notional, new_sell_side_notional, leverage);
-            let new_max = pos.margin_reserved;
-            let margin_delta = new_max.saturating_sub(old_max);
+            pos.set_reservations(buy_notional, new_sell_side_notional, c_notional, leverage);
+            let new_reserved = pos.margin_reserved;
+            let margin_delta = new_reserved.saturating_sub(old_reserved);
             let delta = margin_delta
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
@@ -1424,26 +1428,27 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
 
     match side {
         Side::Buy => {
-            let old_max = pos
-                .buy_side_margin_reserved
-                .max(pos.sell_side_margin_reserved);
+            // Flip-aware reservation snapshot before removal (pos.margin_reserved,
+            // not the per-side max — the per-side fields lag it under the model).
+            let old_reserved = pos.margin_reserved;
             let mut entries = storage::load_buy_orders(context, user, market_id)?;
             // The book entry's `amount` is the authoritative remaining quantity
             // (kept current by reduce_maker_order_entry_for_fill); the order's
             // `filled` can lag it during the same matching round, so the release
             // is sized from the entry, not from order.quantity - order.filled.
             let cancelled_entry = remove_order_entry(&mut entries, order_id, "buy")?;
-            let new_notional = calc_buy_side_reserved_notional(
+            let sell_entries = storage::load_sell_orders(context, user, market_id)?;
+            let (new_notional, sell_notional, c_notional) = calc_reservation_notionals(
                 &entries,
+                &sell_entries,
                 market.base_decimals,
                 market.price_decimals,
                 pos.amount,
             )?;
-            let sell_notional = pos.sell_side_reserved_notional;
             let leverage = pos.leverage;
-            pos.set_reservations(new_notional, sell_notional, leverage);
-            let new_max = pos.margin_reserved;
-            let freed = old_max.saturating_sub(new_max);
+            pos.set_reservations(new_notional, sell_notional, c_notional, leverage);
+            let new_reserved = pos.margin_reserved;
+            let freed = old_reserved.saturating_sub(new_reserved);
             let fee_freed = calc_maker_fee_for_order_qty_with_bps(
                 cancelled_entry.price,
                 cancelled_entry.amount,
@@ -1462,26 +1467,27 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
             storage::save_buy_orders(context, user, market_id, &entries)?;
         }
         Side::Sell => {
-            let old_max = pos
-                .buy_side_margin_reserved
-                .max(pos.sell_side_margin_reserved);
+            // Flip-aware reservation snapshot before removal (pos.margin_reserved,
+            // not the per-side max — the per-side fields lag it under the model).
+            let old_reserved = pos.margin_reserved;
             let mut entries = storage::load_sell_orders(context, user, market_id)?;
             // The book entry's `amount` is the authoritative remaining quantity
             // (kept current by reduce_maker_order_entry_for_fill); the order's
             // `filled` can lag it during the same matching round, so the release
             // is sized from the entry, not from order.quantity - order.filled.
             let cancelled_entry = remove_order_entry(&mut entries, order_id, "sell")?;
-            let new_notional = calc_sell_side_reserved_notional(
+            let buy_entries = storage::load_buy_orders(context, user, market_id)?;
+            let (buy_notional, new_notional, c_notional) = calc_reservation_notionals(
+                &buy_entries,
                 &entries,
                 market.base_decimals,
                 market.price_decimals,
                 pos.amount,
             )?;
-            let buy_notional = pos.buy_side_reserved_notional;
             let leverage = pos.leverage;
-            pos.set_reservations(buy_notional, new_notional, leverage);
-            let new_max = pos.margin_reserved;
-            let freed = old_max.saturating_sub(new_max);
+            pos.set_reservations(buy_notional, new_notional, c_notional, leverage);
+            let new_reserved = pos.margin_reserved;
+            let freed = old_reserved.saturating_sub(new_reserved);
             let fee_freed = calc_maker_fee_for_order_qty_with_bps(
                 cancelled_entry.price,
                 cancelled_entry.amount,

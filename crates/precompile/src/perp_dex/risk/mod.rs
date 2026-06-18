@@ -707,13 +707,17 @@ fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
     pos: &mut crate::perp_dex::types::PerpPosition,
     new_leverage: u64,
 ) -> Result<(), PrecompileError> {
-    // Re-derive the reservation from the unchanged per-side notionals at the new
+    // Re-derive the reservation from the unchanged stored notionals at the new
     // leverage via the single source of truth, then reconcile the wallet by the
-    // change in the max-of-side reservation.
+    // change in the flip-aware reservation. The notionals (per-side B/S and the
+    // flip-aware c_notional held in margin_reserved_notional) are
+    // leverage-independent — setLeverage changes neither the position nor the
+    // book — so only the /leverage divisor changes and no book reload is needed.
     let old_reserved = pos.margin_reserved;
     let buy_notional = pos.buy_side_reserved_notional;
     let sell_notional = pos.sell_side_reserved_notional;
-    pos.set_reservations(buy_notional, sell_notional, new_leverage);
+    let c_notional = pos.margin_reserved_notional;
+    pos.set_reservations(buy_notional, sell_notional, c_notional, new_leverage);
     let new_reserved = pos.margin_reserved;
 
     if new_reserved > old_reserved {
@@ -926,7 +930,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         account.credit_perp(released)?;
         storage::save_account(context, user, account)?;
     }
-    pos.set_reservations(0, 0, pos.leverage);
+    pos.set_reservations(0, 0, 0, pos.leverage);
     pos.fee_reserved = 0;
     storage::save_position(context, user, market_id, &pos)?;
 

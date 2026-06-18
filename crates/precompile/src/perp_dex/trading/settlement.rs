@@ -8,8 +8,8 @@ use crate::{
         errors::{perp_err, perp_invariant_err},
         interface::IPerpDex,
         math::{
-            calc_buy_side_reserved_notional, calc_maker_fee_for_order_qty_with_bps,
-            calc_sell_side_reserved_notional, calc_trading_fee, calc_value, checked_u64_to_i64,
+            calc_maker_fee_for_order_qty_with_bps, calc_reservation_notionals, calc_trading_fee,
+            calc_value, checked_u64_to_i64,
         },
         storage,
         types::{OrderStatus, Side},
@@ -315,10 +315,12 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
         &mut pos,
         &mut account.perp_wallet_balance,
     )?;
-    // Snapshot before mutations — used to verify and release the pre-fill reservation.
-    let old_reserved = pos
-        .buy_side_margin_reserved
-        .max(pos.sell_side_margin_reserved);
+    // Snapshot before mutations — used to verify and release the pre-fill
+    // reservation. MUST be the flip-aware reservation (pos.margin_reserved), the
+    // same quantity new_reserved is recomputed as below: comparing a flip-aware
+    // new_reserved against a max-of-side old_reserved would mismatch the two ends
+    // of the deficit test and make it fire spuriously.
+    let old_reserved = pos.margin_reserved;
 
     let maker_fee = reduce_maker_order_entry_for_fill(
         context,
@@ -929,10 +931,13 @@ fn resolve_maker_wallet_deficit<CTX: ContextTr>(
 /// rounding error across many partial fills.  The result is written back into
 /// `pos` and also returned as `pos.margin_reserved`.
 ///
-/// Cross-side netting: `margin_reserved` is `max(buy_side, sell_side)` because
-/// a long position offsets sell-order exposure (and vice versa), so only the
-/// larger side requires margin.  This must be called **after**
-/// [`apply_position_fill`] so that `pos.amount` already reflects the new size.
+/// Cross-side netting: `margin_reserved` is the flip-aware worst-case
+/// `max(S + B', B + S')` (see [`calc_reservation_notionals`]) — a long position
+/// offsets sell-order exposure (and vice versa), but a fill that flips the
+/// position re-prices the opposite side's opening leg, so the reservation must
+/// cover the peak across that flip, not merely the larger side today. This must
+/// be called **after** [`apply_position_fill`] so that `pos.amount` already
+/// reflects the new size.
 fn recompute_maker_order_reserve_after_fill<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
@@ -942,18 +947,13 @@ fn recompute_maker_order_reserve_after_fill<CTX: ContextTr>(
 ) -> Result<u64, PrecompileError> {
     let buy_entries = storage::load_buy_orders(context, user, market_id)?;
     let sell_entries = storage::load_sell_orders(context, user, market_id)?;
-    let buy_notional = calc_buy_side_reserved_notional(
+    let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
         &buy_entries,
-        market.base_decimals,
-        market.price_decimals,
-        pos.amount,
-    )?;
-    let sell_notional = calc_sell_side_reserved_notional(
         &sell_entries,
         market.base_decimals,
         market.price_decimals,
         pos.amount,
     )?;
-    pos.set_reservations(buy_notional, sell_notional, pos.leverage);
+    pos.set_reservations(buy_notional, sell_notional, c_notional, pos.leverage);
     Ok(pos.margin_reserved)
 }

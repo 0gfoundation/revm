@@ -713,6 +713,105 @@ fn maker_auto_expire_current_level_keeps_expired_status_and_clears_queue() {
 }
 
 #[test]
+fn cross_side_flip_no_longer_triggers_maker_reserve_deficit_under_flip_aware_reservation() {
+    // Regression for the flip-aware reservation (formula C = max(S + B', B + S')).
+    //
+    // This is the brute-force MINIMUM deficit scenario under the OLD max-of-side
+    // reservation (lev=1, pos +1 -> -1, buys=[(2,1),(2,2)], sells=[(3,1),(3,2)],
+    // fill the qty-2 sell at price 3). Under max-of-side the maker reserved only
+    // 6e6 up front and the cross-side flip fill fired the reserve-deficit branch
+    // (debiting 1e6 mid-fill). Under C the maker reserves the flip-aware worst
+    // case (8e6) UP FRONT, so the same flip fill creates NO deficit — the branch
+    // does not fire and no resting order is auto-cancelled.
+    //   Plo = $200 (buy level, below market)
+    //   Pm  = $250 (Alice opens long here against Bob)
+    //   Phi = $300 (sell level, above market)  -> own book uncrossed (200<300)
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    // Bob (taker) funded generously. Alice now needs MORE up-front margin than
+    // under max-of-side (C reserves the full flip exposure), so fund her beyond
+    // the old single WALLET: total = 2 * WALLET = 20e6.
+    fund(&mut ctx, BOB, WALLET * 100);
+    fund(&mut ctx, ALICE, WALLET);
+
+    let plo = 200 * TICK;
+    let pm = 250 * TICK;
+    let phi = 300 * TICK;
+
+    // (1) Alice opens a long of 1*QTY at Pm by lifting Bob's resting ask.
+    let _bob_open = place(&mut ctx, BOB, 1, pm, QTY, 0, 0); // Bob sells (maker)
+    let alice_open = place(&mut ctx, ALICE, 0, pm, QTY, 0, 0); // Alice buys (taker)
+    assert_eq!(get_order(&mut ctx, alice_open).status, OrderStatus::Filled);
+    assert_eq!(pos(&mut ctx, ALICE).amount, QTY as i64, "Alice long +1");
+
+    // (2) Alice rests buys at Plo (below market, no cross): qty 1 then qty 2.
+    let alice_buy1 = place(&mut ctx, ALICE, 0, plo, QTY, 0, 0);
+    let alice_buy2 = place(&mut ctx, ALICE, 0, plo, QTY * 2, 0, 0);
+    // (3) Alice rests sells at Phi (above market, no cross): qty 2 FIRST (FIFO
+    //     fills it), then qty 1.
+    let alice_sell2 = place(&mut ctx, ALICE, 1, phi, QTY * 2, 0, 0);
+    let alice_sell1 = place(&mut ctx, ALICE, 1, phi, QTY, 0, 0);
+
+    // own book is uncrossed: best bid Plo < best ask Phi
+    assert!(plo < phi);
+    for id in [alice_buy1, alice_buy2, alice_sell2, alice_sell1] {
+        assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
+    }
+
+    let pos_before = pos(&mut ctx, ALICE);
+    assert_eq!(pos_before.amount, QTY as i64);
+    // Per-side opening notionals net to 6e6 each, so OLD max-of-side would
+    // reserve only 6e6. The FLIP-AWARE reservation is strictly higher: if all 3
+    // sell-lots fill, the position goes to -2 and the resting buys re-open more
+    // notional, so C = max(S + B', B + S')
+    //   = max(6e6 + B'(p=-2)=2e6 , 6e6 + S'(p=+4)=0) = 8e6.
+    assert_eq!(pos_before.buy_side_reserved_notional, 6_000_000);
+    assert_eq!(pos_before.sell_side_reserved_notional, 6_000_000);
+    assert_eq!(
+        pos_before.margin_reserved, 8_000_000,
+        "flip-aware reservation (C) collected up front; max-of-side would be 6e6"
+    );
+    // 20e6 funded - 2.5e6 opening margin - 8e6 flip-aware reservation = 9.5e6.
+    assert_eq!(wallet(&mut ctx, ALICE), 9_500_000);
+
+    // (4) Bob (a DIFFERENT taker) buys 2*QTY at Phi, lifting Alice's qty-2 ask.
+    //     This closes 1*QTY of Alice's long and opens 1*QTY short => FLIP to -1.
+    let bob_take = place(&mut ctx, BOB, 0, phi, QTY * 2, 0, 0);
+    assert_eq!(get_order(&mut ctx, bob_take).status, OrderStatus::Filled);
+
+    // The qty-2 ask that Bob lifted is filled.
+    assert_eq!(get_order(&mut ctx, alice_sell2).status, OrderStatus::Filled);
+
+    // Position flipped sign: +1 long -> -1 short.
+    let pos_after = pos(&mut ctx, ALICE);
+    assert_eq!(pos_after.amount, -(QTY as i64), "sign flip +1 -> -1");
+    assert_eq!(pos_after.buy_side_reserved_notional, 4_000_000);
+    assert_eq!(pos_after.sell_side_reserved_notional, 3_000_000);
+    // Post-fill flip-aware reservation: C = max(S + B', B + S')
+    //   = max(3e6 + B'(p=-2)=2e6 , 4e6 + S'(p=+2)=0) = 5e6.
+    assert_eq!(pos_after.margin_reserved, 5_000_000);
+
+    // NO DEFICIT (the whole point of formula C):
+    //   old_reserved(C)=8e6, opening_margin=3e6 => max_sustainable=8e6-3e6=5e6;
+    //   new_reserved(C)=5e6 is NOT > 5e6 (it sits exactly on the tight boundary),
+    //   so the ELSE branch runs: net_release = sat(8e6 - 5e6 - 3e6) = 0, with no
+    //   deficit debit. The wallet receives only the +3e6 closing cashflow
+    //   (2.5e6 margin returned + 0.5e6 realised PnL on the long opened @ $250
+    //   and closed @ $300):  9.5e6 + 3e6 = 12.5e6.
+    // (Under the OLD max-of-side path the deficit branch debited 1e6, leaving a
+    //  balance 1e6 lower; C eliminates that debit.)
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        12_500_000,
+        "no deficit debit under flip-aware reservation (max-of-side would be 1e6 lower)"
+    );
+    // The deficit branch never fired, so every other resting order is untouched.
+    assert_eq!(get_order(&mut ctx, alice_sell1).status, OrderStatus::Open);
+    assert_eq!(get_order(&mut ctx, alice_buy1).status, OrderStatus::Open);
+    assert_eq!(get_order(&mut ctx, alice_buy2).status, OrderStatus::Open);
+}
+
+#[test]
 fn fifo_queue_fills_earlier_order_first() {
     let mut ctx = make_ctx();
     setup(&mut ctx);

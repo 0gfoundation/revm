@@ -350,6 +350,145 @@ pub fn calc_sell_side_reserved_notional(
     Ok(reserved_notional)
 }
 
+/// Flip-aware worst-case reservation notional for a user's resting book.
+///
+/// Returns `(buy_notional B, sell_notional S, c_notional)` where:
+/// - `B = calc_buy_side_reserved_notional(buys, p)` — buy-side opening notional
+///   at the current position `p`,
+/// - `S = calc_sell_side_reserved_notional(sells, p)` — sell-side likewise,
+/// - `c_notional = max(S + B', B + S')` — the peak capital the position can
+///   require across a full sign-flip in either direction:
+///   - `B' = B(p − total_sell_qty)`: if every sell fills first the position
+///     goes maximally short, so the surviving buys re-open more notional,
+///   - `S' = S(p + total_buy_qty)`: symmetric for the long extreme.
+///
+/// `max-of-side = max(B, S)` under-reserves because it ignores that a fill on
+/// one side flips the position and re-prices the *other* side's opening leg;
+/// `c_notional` is the tight peak (verified exact: it equals the reachable
+/// maximum of [realized-position margin + remaining-order reservation] given
+/// the engine's price-priority fill order — buys filled DESC, sells ASC — which
+/// is a load-bearing precondition). It dominates `max-of-side`
+/// (`c_notional ≥ max(B, S)` since `B', S' ≥ 0`), so reservations only grow.
+///
+/// The combined leg is summed in `u128` and floored once on division by
+/// leverage in `set_reservations` (single floor, not a sum of per-leg floors),
+/// which is the strictly-safer rounding.
+pub fn calc_reservation_notionals(
+    buy_entries: &[OrderEntry],
+    sell_entries: &[OrderEntry],
+    base_decimals: u32,
+    price_decimals: u32,
+    position_amount: i64,
+) -> Result<(u64, u64, u64), PrecompileError> {
+    let buy_notional =
+        calc_buy_side_reserved_notional(buy_entries, base_decimals, price_decimals, position_amount)?;
+    let sell_notional = calc_sell_side_reserved_notional(
+        sell_entries,
+        base_decimals,
+        price_decimals,
+        position_amount,
+    )?;
+
+    let total_buy_qty = total_entry_amount(buy_entries, "math: total buy order amount")?;
+    let total_sell_qty = total_entry_amount(sell_entries, "math: total sell order amount")?;
+
+    // Position after every sell fills → most short; surviving buys re-open from there.
+    let position_after_sells = position_amount
+        .checked_sub(total_sell_qty)
+        .ok_or_else(|| perp_err("math: flip-short position overflow"))?;
+    let buy_flip_notional = calc_buy_side_reserved_notional(
+        buy_entries,
+        base_decimals,
+        price_decimals,
+        position_after_sells,
+    )?;
+
+    // Position after every buy fills → most long; surviving sells re-open from there.
+    let position_after_buys = position_amount
+        .checked_add(total_buy_qty)
+        .ok_or_else(|| perp_err("math: flip-long position overflow"))?;
+    let sell_flip_notional = calc_sell_side_reserved_notional(
+        sell_entries,
+        base_decimals,
+        price_decimals,
+        position_after_buys,
+    )?;
+
+    let leg_short = (sell_notional as u128)
+        .checked_add(buy_flip_notional as u128)
+        .ok_or_else(|| perp_err("math: flip-short leg overflow"))?;
+    let leg_long = (buy_notional as u128)
+        .checked_add(sell_flip_notional as u128)
+        .ok_or_else(|| perp_err("math: flip-long leg overflow"))?;
+    let c_notional = u64::try_from(leg_short.max(leg_long))
+        .map_err(|_| perp_err("math: flip-aware reservation notional exceeds u64"))?;
+
+    Ok((buy_notional, sell_notional, c_notional))
+}
+
+/// Sum of all order-entry amounts as an `i64` (checked).
+fn total_entry_amount(entries: &[OrderEntry], ctx: &str) -> Result<i64, PrecompileError> {
+    let mut total = 0u64;
+    for e in entries {
+        total = total.checked_add(e.amount).ok_or_else(|| perp_err(ctx))?;
+    }
+    checked_u64_to_i64(total, ctx)
+}
+
+#[cfg(test)]
+mod reservation_notional_tests {
+    use super::*;
+
+    fn entry(price: u64, amount: u64) -> OrderEntry {
+        OrderEntry {
+            order_id: [0u8; 32],
+            price,
+            amount,
+            maker_fee_bps: 0,
+        }
+    }
+
+    #[test]
+    fn flip_aware_c_matches_worked_example() {
+        // buys = [(price 3, qty 2), (price 2, qty 1)] (DESC), sells = [(4, 1)],
+        // position = -1, base_decimals = price_decimals = 0 (values scale by
+        // QUOTE_DECIMALS = 1e6). Hand-derived:
+        //   B = B(-1)      = 3 + 2 = 5      (both buys re-open from short 1)
+        //   S = S(-1)      = 4              (sell opens short)
+        //   B' = B(-2)     = 2     (after the lone sell fills → short 2)
+        //   S' = S(+2)     = 0     (after all 3 buys fill → long 2; sell only closes)
+        //   C = max(S + B', B + S') = max(4 + 2, 5 + 0) = 6.
+        let buys = [entry(3, 2), entry(2, 1)];
+        let sells = [entry(4, 1)];
+        let (b, s, c) = calc_reservation_notionals(&buys, &sells, 0, 0, -1).unwrap();
+        assert_eq!(b, 5_000_000);
+        assert_eq!(s, 4_000_000);
+        assert_eq!(c, 6_000_000);
+        // C strictly exceeds the old max-of-side (5e6): it covers the flip.
+        assert!(c > b.max(s));
+    }
+
+    #[test]
+    fn flip_aware_c_equals_max_of_side_for_one_sided_book() {
+        // A one-sided (buy-only) book cannot flip the position the other way,
+        // so the flip-aware C collapses to the plain buy-side notional.
+        let buys = [entry(10, 3)];
+        let (b, s, c) = calc_reservation_notionals(&buys, &[], 0, 0, 0).unwrap();
+        assert_eq!(s, 0);
+        assert_eq!(c, b);
+        assert_eq!(c, b.max(s));
+    }
+
+    #[test]
+    fn flip_aware_c_is_symmetric_for_one_sided_sell_book() {
+        // Symmetric to the buy-only case: sell-only book → C == sell notional.
+        let sells = [entry(7, 4)];
+        let (b, s, c) = calc_reservation_notionals(&[], &sells, 0, 0, 0).unwrap();
+        assert_eq!(b, 0);
+        assert_eq!(c, s);
+    }
+}
+
 #[cfg(test)]
 mod funding_payment_tests {
     use super::*;

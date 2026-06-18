@@ -52,25 +52,41 @@ pub struct PerpPosition {
 }
 
 impl PerpPosition {
-    /// Single source of truth for the six per-side margin-reservation fields.
+    /// Single source of truth for the margin-reservation fields.
     ///
-    /// Given each side's open-order notional and the position leverage, writes
-    /// all six fields coherently: each side's `*_margin_reserved =
-    /// notional / leverage` (leverage floored at 1), and the position-level
-    /// `margin_reserved` / `margin_reserved_notional` = the max across the two
-    /// sides — hedged orders share collateral, so only the larger side needs
-    /// margin. Callers compute the wallet delta from the change in
-    /// `margin_reserved` around this call, and own `fee_reserved` separately.
-    pub(crate) fn set_reservations(&mut self, buy_notional: u64, sell_notional: u64, leverage: u64) {
+    /// `buy_notional` / `sell_notional` are each side's open-order opening
+    /// notional at the current position; `c_notional` is the **flip-aware**
+    /// worst-case reservation notional `max(S + B', B + S')` produced by
+    /// [`crate::perp_dex::math::calc_reservation_notionals`], which accounts for
+    /// a position sign-flip when one side of the book fully fills. Writes:
+    /// - per-side `*_reserved_notional` = each side's notional (informational),
+    /// - per-side `*_margin_reserved`   = notional / leverage (informational;
+    ///   used only as a cancel-ordering heuristic),
+    /// - `margin_reserved_notional`     = `c_notional`,
+    /// - `margin_reserved`              = `c_notional / leverage` — the capital
+    ///   actually locked. A single floor of the combined leg (not a sum of
+    ///   per-leg floors), so it never under-reserves; and `c_notional ≥
+    ///   max(buy_notional, sell_notional)`, so it is always ≥ the old
+    ///   max-of-side reservation.
+    ///
+    /// Leverage is floored at 1. Callers compute the wallet delta from the
+    /// change in `margin_reserved` around this call (NOT from the per-side
+    /// fields — those lag `margin_reserved` under the flip-aware model) and own
+    /// `fee_reserved` separately.
+    pub(crate) fn set_reservations(
+        &mut self,
+        buy_notional: u64,
+        sell_notional: u64,
+        c_notional: u64,
+        leverage: u64,
+    ) {
         let lev = leverage.max(1);
         self.buy_side_reserved_notional = buy_notional;
         self.sell_side_reserved_notional = sell_notional;
         self.buy_side_margin_reserved = buy_notional / lev;
         self.sell_side_margin_reserved = sell_notional / lev;
-        self.margin_reserved_notional = buy_notional.max(sell_notional);
-        self.margin_reserved = self
-            .buy_side_margin_reserved
-            .max(self.sell_side_margin_reserved);
+        self.margin_reserved_notional = c_notional;
+        self.margin_reserved = c_notional / lev;
     }
 }
 
@@ -139,30 +155,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn set_reservations_writes_all_six_fields_with_max_of_side() {
+    fn set_reservations_writes_fields_from_flip_aware_notional() {
         let mut p = PerpPosition::default();
-        p.set_reservations(1000, 400, 5);
+        // c_notional (1500) is the flip-aware reservation; per-side fields stay
+        // informational (each = side_notional / leverage).
+        p.set_reservations(1000, 400, 1500, 5);
         assert_eq!(p.buy_side_reserved_notional, 1000);
         assert_eq!(p.sell_side_reserved_notional, 400);
-        assert_eq!(p.buy_side_margin_reserved, 200); // 1000 / 5
-        assert_eq!(p.sell_side_margin_reserved, 80); // 400 / 5
-        assert_eq!(p.margin_reserved_notional, 1000); // max(1000, 400)
-        assert_eq!(p.margin_reserved, 200); // max(200, 80)
+        assert_eq!(p.buy_side_margin_reserved, 200); // 1000 / 5 (informational)
+        assert_eq!(p.sell_side_margin_reserved, 80); // 400 / 5  (informational)
+        assert_eq!(p.margin_reserved_notional, 1500); // the flip-aware notional
+        assert_eq!(p.margin_reserved, 300); // 1500 / 5, single floor of the combined leg
     }
 
     #[test]
     fn set_reservations_floors_zero_leverage_to_one() {
         let mut p = PerpPosition::default();
-        p.set_reservations(1000, 0, 0);
+        p.set_reservations(1000, 0, 1000, 0);
         assert_eq!(p.buy_side_margin_reserved, 1000); // 1000 / max(0, 1)
-        assert_eq!(p.margin_reserved, 1000);
+        assert_eq!(p.margin_reserved, 1000); // c_notional / max(0, 1)
     }
 
     #[test]
     fn set_reservations_zeroes_all_fields_on_zero_notional() {
         let mut p = PerpPosition::default();
-        p.set_reservations(500, 500, 5);
-        p.set_reservations(0, 0, 5);
+        p.set_reservations(500, 500, 800, 5);
+        p.set_reservations(0, 0, 0, 5);
         assert_eq!(p.buy_side_reserved_notional, 0);
         assert_eq!(p.sell_side_reserved_notional, 0);
         assert_eq!(p.margin_reserved, 0);
