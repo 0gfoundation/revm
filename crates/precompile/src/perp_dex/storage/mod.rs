@@ -266,6 +266,67 @@ pub(crate) fn discard_commitment_fold<CTX: ContextTr>(context: &mut CTX) {
     let _ = context.journal_mut().perp_fold_take_log();
 }
 
+/// Version byte for the per-BLOCK commitment (catalog #16d), kept distinct from the per-call v2
+/// (`COMMITMENT_VERSION`) so the two framings never alias during the transition. While #16d is
+/// being wired across repos the per-call `flush_commitment` (v2) stays active; the block-end path
+/// (v3) replaces it only once the executor hook calls `finalize_block_commitment`.
+const BLOCK_COMMITMENT_VERSION: u8 = 3;
+
+/// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
+///
+/// `C_block = blake3(C_prev ‖ BLOCK_COMMITMENT_VERSION ‖ Σ_sorted(key(32) ‖ len(u32 BE) ‖ value))`,
+/// keys ascending. `delta` is the net block writes from [`JournalTr::take_perp_delta`] (already one
+/// value per key, post-revert), so no coalescing is needed — only deterministic key-sorting (keys
+/// are a total order; the HashMap is never iterated for the hash). An empty value is a deleted key,
+/// framed with len 0 (same convention as the per-call path). Pure: the caller reads `C_prev` and
+/// sstores the result. This commits the block's net STATE CHANGE; chained onto the previous block's
+/// `C` it forms a block-granular running commitment, the off-trie analogue of the state root.
+pub fn compute_block_commitment(prev: U256, delta: &HashMap<B256, Vec<u8>>) -> U256 {
+    let mut keys: Vec<&B256> = delta.keys().collect();
+    keys.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&prev.to_be_bytes::<32>());
+    hasher.update(&[BLOCK_COMMITMENT_VERSION]);
+    for key in keys {
+        let value = &delta[key];
+        hasher.update(key.as_slice());
+        hasher.update(&(value.len() as u32).to_be_bytes());
+        hasher.update(value);
+    }
+    U256::from_be_bytes(*hasher.finalize().as_bytes())
+}
+
+/// Block-end hook (catalog #16d): folds the block's net perp delta into the on-trie 0x1003 anchor
+/// ONCE, replacing the per-call [`flush_commitment`]. The block executor calls this after
+/// [`JournalTr::take_perp_delta`], while the journal is still alive (before the state root is
+/// computed), so the sstore lands in the BundleState transition. No-op on an empty delta.
+/// `warm_account` + `touch_account` mirror `flush_commitment` / `save_erc20_balance` so the slot
+/// change is not dropped from the commit. Journaled like any sstore (reverts with the frame).
+pub fn finalize_block_commitment<CTX: ContextTr>(
+    context: &mut CTX,
+    delta: &HashMap<B256, Vec<u8>>,
+) -> Result<(), PrecompileError> {
+    if delta.is_empty() {
+        return Ok(());
+    }
+    context
+        .journal_mut()
+        .warm_account(PERP_DEX_ADDRESS)
+        .map_err(convert_db_err::<CTX::Db>)?;
+    let c_prev = context
+        .journal_mut()
+        .sload(PERP_DEX_ADDRESS, commitment_slot().into())
+        .map_err(convert_db_err::<CTX::Db>)?
+        .data;
+    let c_new = compute_block_commitment(c_prev, delta);
+    context
+        .journal_mut()
+        .sstore(PERP_DEX_ADDRESS, commitment_slot().into(), c_new)
+        .map_err(convert_db_err::<CTX::Db>)?;
+    context.journal_mut().touch_account(PERP_DEX_ADDRESS);
+    Ok(())
+}
+
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
 /// Cached typed read of an off-trie blob (catalog #14). Returns the block-cached deserialized
@@ -1223,6 +1284,54 @@ mod commitment_tests {
         assert_eq!(read_commitment(&mut ctx), expected);
         // The reverted blob must be gone from the overlay, in lock-step with the log truncation.
         assert!(load_blob(&mut ctx, k1).unwrap().is_empty(), "reverted write must leave no overlay residue");
+    }
+
+    /// #16d: `compute_block_commitment` hashes the block NET delta once. Cross-checked against an
+    /// independent BTreeMap reference (sorted, v3 framing) — a different impl than production's
+    /// HashMap+sort, so agreement is a genuine check. Includes a deleted key (empty value, len 0).
+    /// `finalize_block_commitment` writes the result to the 0x1003 slot; an empty delta is a no-op.
+    #[test]
+    fn block_commitment_over_net_delta() {
+        let (k1, b1) = (B256::with_last_byte(1), vec![0xAAu8]);
+        let (k2, b2) = (B256::with_last_byte(2), vec![0xBBu8, 0xCC]);
+        let (k3, b3) = (B256::with_last_byte(3), Vec::<u8>::new()); // deleted key, framed len 0
+        let mut delta: HashMap<B256, Vec<u8>> = HashMap::default();
+        delta.insert(k1, b1.clone());
+        delta.insert(k2, b2.clone());
+        delta.insert(k3, b3.clone());
+
+        // Independent reference: BTreeMap (sorted), v3 framing.
+        let mut sorted: std::collections::BTreeMap<B256, Vec<u8>> = std::collections::BTreeMap::new();
+        sorted.insert(k1, b1);
+        sorted.insert(k2, b2);
+        sorted.insert(k3, b3);
+        let mut p = Vec::new();
+        p.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+        p.push(BLOCK_COMMITMENT_VERSION);
+        for (k, v) in &sorted {
+            p.extend_from_slice(k.as_slice());
+            p.extend_from_slice(&(v.len() as u32).to_be_bytes());
+            p.extend_from_slice(v);
+        }
+        let expected = U256::from_be_bytes(*blake3::hash(&p).as_bytes());
+        assert_eq!(compute_block_commitment(U256::ZERO, &delta), expected);
+
+        // finalize_block_commitment writes it to the on-trie slot.
+        let mut ctx = new_test_ctx();
+        finalize_block_commitment(&mut ctx, &delta).unwrap();
+        assert_eq!(read_commitment(&mut ctx), expected);
+
+        // Empty delta is a no-op (slot stays at genesis 0).
+        let mut ctx2 = new_test_ctx();
+        finalize_block_commitment(&mut ctx2, &HashMap::default()).unwrap();
+        assert_eq!(read_commitment(&mut ctx2), U256::ZERO);
+
+        // Distinct from the per-call v2 framing over the same writes (version byte differs).
+        assert_ne!(
+            compute_block_commitment(U256::ZERO, &delta),
+            expect_framed(U256::ZERO, &[(k1, &[0xAAu8]), (k2, &[0xBBu8, 0xCC]), (k3, &[])]),
+            "v3 block framing must differ from v2 per-call framing"
+        );
     }
 }
 
