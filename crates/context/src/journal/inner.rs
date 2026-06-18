@@ -33,6 +33,15 @@ pub struct PerpSection {
     working: HashMap<B256, Vec<u8>>,
     /// Reversible undo log for `working`, mirroring the EVM journal `Vec<ENTRY>`.
     undo: Vec<PerpUndo>,
+    /// Block-scoped cache of DESERIALIZED blobs (catalog #14): a pure accelerator over `working`
+    /// + cold reads, type-erased so this crate need not know the precompile's blob types. The
+    /// precompile's cached load/save helpers populate it; it is invalidated per-key on `store`,
+    /// cleared on any revert (`undo_to`) and at the block boundary (`take_delta`), and kept across
+    /// txns within a block (like `working`). Transparent to this struct's derives — clones empty,
+    /// ignored by equality, skipped by serde — since it is always reconstructible and carries no
+    /// semantic state.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    cache: PerpCache,
 }
 
 /// A single reversible PerpDEX overlay write: restores `prev` on revert
@@ -42,6 +51,51 @@ pub struct PerpSection {
 struct PerpUndo {
     key: B256,
     prev: Option<Vec<u8>>,
+}
+
+/// Type-erased, block-scoped cache of deserialized off-trie blobs (see [`PerpSection::cache`]).
+/// A pure accelerator carrying no semantic state, so it is transparent to [`PerpSection`]'s
+/// derives: a clone starts empty (re-warms lazily), equality ignores it, and serde skips it.
+#[derive(Default)]
+struct PerpCache(HashMap<B256, std::boxed::Box<dyn core::any::Any>>);
+
+impl Clone for PerpCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl core::fmt::Debug for PerpCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "PerpCache({} entries)", self.0.len())
+    }
+}
+
+impl PartialEq for PerpCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PerpCache {}
+
+impl PerpCache {
+    #[inline]
+    fn get(&self, key: B256) -> Option<&dyn core::any::Any> {
+        self.0.get(&key).map(|b| b.as_ref())
+    }
+    #[inline]
+    fn put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+        self.0.insert(key, value);
+    }
+    #[inline]
+    fn remove(&mut self, key: B256) {
+        self.0.remove(&key);
+    }
+    #[inline]
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 impl PerpSection {
@@ -59,6 +113,9 @@ impl PerpSection {
             prev: self.working.get(&key).cloned(),
         });
         self.working.insert(key, value);
+        // Invalidate the deser cache for this key. The precompile's cached save re-populates it
+        // (write-through); a direct delete (empty value, no re-populate) leaves it absent.
+        self.cache.remove(key);
     }
 
     /// Reverts overlay writes recorded at or after undo index `i`, in reverse order.
@@ -66,6 +123,9 @@ impl PerpSection {
         if i >= self.undo.len() {
             return;
         }
+        // A revert restores prior overlay values, so any deser-cache entry may now be stale; drop
+        // the whole cache (it re-warms lazily). Coarse but always correct.
+        self.cache.clear();
         for entry in self.undo.drain(i..).rev() {
             match entry.prev {
                 Some(prev) => {
@@ -82,7 +142,22 @@ impl PerpSection {
     #[inline]
     fn take_delta(&mut self) -> PerpDelta {
         self.undo.clear();
+        // Block boundary: the next block must not see this block's cached structs (the committed
+        // store changes between blocks via the delta merge).
+        self.cache.clear();
         mem::take(&mut self.working)
+    }
+
+    /// Reads the block-scoped deserialized-blob cache (type-erased). See [`PerpSection::cache`].
+    #[inline]
+    fn cache_get(&self, key: B256) -> Option<&dyn core::any::Any> {
+        self.cache.get(key)
+    }
+
+    /// Inserts into the block-scoped deserialized-blob cache.
+    #[inline]
+    fn cache_put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+        self.cache.put(key, value);
     }
 }
 
@@ -180,6 +255,18 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn perp_store(&mut self, key: B256, value: Vec<u8>) {
         self.perp.store(key, value);
+    }
+
+    /// Reads the block-scoped deserialized PerpDEX blob cache (catalog #14; type-erased).
+    #[inline]
+    pub fn perp_cache_get(&self, key: B256) -> Option<&dyn core::any::Any> {
+        self.perp.cache_get(key)
+    }
+
+    /// Inserts a deserialized PerpDEX blob into the block-scoped read cache.
+    #[inline]
+    pub fn perp_cache_put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+        self.perp.cache_put(key, value);
     }
 
     /// Reverts off-trie PerpDEX overlay writes back to the given undo index.

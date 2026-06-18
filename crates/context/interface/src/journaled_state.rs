@@ -248,6 +248,21 @@ pub trait JournalTr {
         let _ = (key, value);
     }
 
+    /// Reads the block-scoped deserialized off-trie blob cache (catalog #14): a per-block
+    /// accelerator that lets the precompile skip re-deserializing a blob it already decoded this
+    /// block. Type-erased (this crate does not know the blob types); the caller downcasts and
+    /// clones. The default backend keeps no cache and returns `None`.
+    fn perp_cache_get(&mut self, key: B256) -> Option<&dyn core::any::Any> {
+        let _ = key;
+        None
+    }
+
+    /// Inserts a deserialized off-trie blob into the block-scoped read cache (no-op by default).
+    /// Automatically invalidated on the next [`JournalTr::perp_store`] of the same key.
+    fn perp_cache_put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+        let _ = (key, value);
+    }
+
     /// Drains and returns the block's net off-trie PerpDEX writes ([`PerpDelta`]).
     ///
     /// Called by the block executor while the EVM/journal is still alive (before it is consumed),

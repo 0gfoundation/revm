@@ -325,6 +325,16 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn perp_cache_get(&mut self, key: B256) -> Option<&dyn core::any::Any> {
+        self.inner.perp_cache_get(key)
+    }
+
+    #[inline]
+    fn perp_cache_put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+        self.inner.perp_cache_put(key, value);
+    }
+
+    #[inline]
     fn take_perp_delta(&mut self) -> PerpDelta {
         self.inner.take_perp_delta()
     }
