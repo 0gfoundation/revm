@@ -237,11 +237,19 @@ fn load_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256) -> Result<Option
 where
     T: Clone + 'static + for<'de> Deserialize<'de>,
 {
+    // Fast path: a deferred struct written this block — downcast + clone, no deserialization.
+    if let Some(any) = context.journal_mut().perp_get_struct(key) {
+        if let Some(v) = any.downcast_ref::<T>() {
+            return Ok(Some(v.clone()));
+        }
+    }
+    // Cold-read deser cache (#14), for keys only READ this block (not in the write overlay).
     if let Some(any) = context.journal_mut().perp_cache_get(key) {
         if let Some(v) = any.downcast_ref::<T>() {
             return Ok(Some(v.clone()));
         }
     }
+    // Cold read: committed off-trie store (or an overlay Bytes entry) → decode once → cache.
     let buf = load_blob(context, key)?;
     if buf.is_empty() {
         return Ok(None);
@@ -253,18 +261,40 @@ where
     Ok(Some(val))
 }
 
-/// Cached typed write of an off-trie blob: serializes + stores it (the commitment byte-stream is
-/// unchanged — SAFE) and writes the value THROUGH to the deser cache so later reads this block
-/// skip the decode. (`store_blob` already invalidated the key; this re-establishes it.)
+/// Serializes a type-erased off-trie blob to its canonical bytes — the #16d block-end serializer,
+/// monomorphized per blob type `T` and stored as a fn-ptr in the journal overlay. Produces bytes
+/// IDENTICAL to a direct `encode`, so deferring serialization to block end leaves the commitment
+/// byte-stream (and the on-trie anchor) unchanged. A type mismatch / encode failure is a bug.
+fn ser_blob<T: Serialize + 'static>(v: &dyn core::any::Any) -> Vec<u8> {
+    let val = v
+        .downcast_ref::<T>()
+        .expect("perp ser_blob: overlay value type mismatch (bug)");
+    encode(val).expect("perp ser_blob: blob encode failed (bug)")
+}
+
+/// Clones a type-erased off-trie blob into a fresh box (keeps the journal overlay `Clone`).
+fn clone_blob<T: Clone + 'static>(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
+    let val = v
+        .downcast_ref::<T>()
+        .expect("perp clone_blob: overlay value type mismatch (bug)");
+    std::boxed::Box::new(val.clone())
+}
+
+/// Cached typed write of an off-trie blob (#16d Phase 2): DEFERS serialization. Stores the
+/// deserialized struct plus its monomorphized `ser`/`clone` fns in the journal overlay; the
+/// block-end `take_perp_delta` lowers it to canonical bytes ONCE (so a key written N times this
+/// block is serialized once, not N times). No per-write `encode`, and the struct overlay doubles as
+/// the in-block read cache — `store_struct` invalidates the #14 cold-read cache for this key.
 fn save_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256, val: &T) -> Result<(), PrecompileError>
 where
     T: Clone + 'static + Serialize,
 {
-    let buf = encode(val)?;
-    store_blob(context, key, &buf)?;
-    context
-        .journal_mut()
-        .perp_cache_put(key, std::boxed::Box::new(val.clone()));
+    context.journal_mut().perp_store_struct(
+        key,
+        std::boxed::Box::new(val.clone()),
+        ser_blob::<T>,
+        clone_blob::<T>,
+    );
     Ok(())
 }
 
