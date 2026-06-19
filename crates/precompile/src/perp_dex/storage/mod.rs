@@ -77,6 +77,13 @@ pub(crate) mod bench_counter {
         /// Distinct (txn, key) pairs — a per-call cache (#14) collapses `write_calls` → this
         /// (still one serialize per written key per txn, for that txn's commitment fold).
         pub write_txn_keys: HashSet<(u32, B256)>,
+        /// #16d block-end serializations: `ser_blob` calls during `take_perp_delta` — one per
+        /// distinct struct key for the whole block. With deferral active these REPLACE the typed
+        /// helpers' per-write `store_blob` serializations (which no longer hit the byte choke), so
+        /// `write_calls` drops to the raw byte-path writers (level queues) and serialization is
+        /// `block_end_ser_calls`.
+        pub block_end_ser_calls: u64,
+        pub block_end_ser_bytes: u64,
     }
 
     thread_local! {
@@ -126,6 +133,18 @@ pub(crate) mod bench_counter {
             s.write_bytes += bytes as u64;
             s.write_keys.insert(key);
             s.write_txn_keys.insert((txn, key));
+        });
+    }
+
+    /// Records one block-end serialization (`ser_blob` in `take_perp_delta`).
+    pub(crate) fn record_block_end_ser(bytes: usize) {
+        if !ON.with(Cell::get) {
+            return;
+        }
+        STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            s.block_end_ser_calls += 1;
+            s.block_end_ser_bytes += bytes as u64;
         });
     }
 }
@@ -269,7 +288,10 @@ fn ser_blob<T: Serialize + 'static>(v: &dyn core::any::Any) -> Vec<u8> {
     let val = v
         .downcast_ref::<T>()
         .expect("perp ser_blob: overlay value type mismatch (bug)");
-    encode(val).expect("perp ser_blob: blob encode failed (bug)")
+    let buf = encode(val).expect("perp ser_blob: blob encode failed (bug)");
+    #[cfg(test)]
+    bench_counter::record_block_end_ser(buf.len());
+    buf
 }
 
 /// Clones a type-erased off-trie blob into a fresh box (keeps the journal overlay `Clone`).

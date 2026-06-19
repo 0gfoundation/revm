@@ -1522,47 +1522,30 @@ mod perf {
         calls: u64,
         st: &crate::perp_dex::storage::bench_counter::Stats,
     ) {
-        let rk = st.read_keys.len() as u64;
-        let wk = st.write_keys.len() as u64;
-        let wtk = st.write_txn_keys.len() as u64;
-        let pct = |saved: u64, total: u64| {
-            if total == 0 {
-                0.0
-            } else {
-                100.0 * saved as f64 / total as f64
-            }
-        };
+        // Post-#14 + #16d the typed msgpack helpers no longer hit the byte choke: reads go through
+        // the struct overlay (perp_get_struct, no decode) and writes are deferred (perp_store_struct,
+        // no per-write encode). So load_blob/store_blob below are the RESIDUAL byte-path traffic
+        // (raw-packed level queues + cold reads), and msgpack serialization now happens once per key
+        // at block end (block_end_ser). Compare against the pre-#16d committed bench, where
+        // store_blob carried ~all writes and per-write serialization.
         println!(
             "PERF BLOCK {label}: {calls} handler calls, {elapsed:?} ({:.2} us/call)",
             elapsed.as_nanos() as f64 / 1000.0 / calls.max(1) as f64
         );
         println!(
-            "  load_blob (deser): {} calls, {} KiB, {rk} distinct keys",
+            "  load_blob  (residual byte/cold reads): {} calls, {} KiB",
             st.read_calls,
             st.read_bytes / 1024
         );
         println!(
-            "    -> per-block deser cache (#14): {rk} deser vs {} = -{} ({:.0}% fewer)",
-            st.read_calls,
-            st.read_calls.saturating_sub(rk),
-            pct(st.read_calls.saturating_sub(rk), st.read_calls)
-        );
-        println!(
-            "  store_blob (ser): {} calls, {} KiB, {wk} distinct keys",
+            "  store_blob (residual byte-path writes): {} calls, {} KiB",
             st.write_calls,
             st.write_bytes / 1024
         );
         println!(
-            "    -> per-call cache (#14):   {wtk} ser vs {} = -{} ({:.0}% fewer)",
-            st.write_calls,
-            st.write_calls.saturating_sub(wtk),
-            pct(st.write_calls.saturating_sub(wtk), st.write_calls)
-        );
-        println!(
-            "    -> block-end ser (#16d):   {wk} ser vs {} = -{} ({:.0}% fewer)",
-            st.write_calls,
-            st.write_calls.saturating_sub(wk),
-            pct(st.write_calls.saturating_sub(wk), st.write_calls)
+            "  block-end serialize (#16d, once per key): {} calls, {} KiB",
+            st.block_end_ser_calls,
+            st.block_end_ser_bytes / 1024
         );
     }
 
@@ -1600,6 +1583,8 @@ mod perf {
                 calls += 1;
             }
         }
+        // #16d block-end harvest: serialize each struct key ONCE (counted as block_end_ser).
+        let _ = ctx.journal_mut().take_perp_delta();
         let elapsed = t0.elapsed();
         bc::disable();
         report_block("rest-heavy (resting limits only)", elapsed, calls, &bc::snapshot());
@@ -1664,6 +1649,8 @@ mod perf {
                 calls += 1;
             }
         }
+        // #16d block-end harvest: serialize each struct key ONCE (counted as block_end_ser).
+        let _ = ctx.journal_mut().take_perp_delta();
         let elapsed = t0.elapsed();
         bc::disable();
         report_block("mixed (rests + sweeps + cancels)", elapsed, calls, &bc::snapshot());
