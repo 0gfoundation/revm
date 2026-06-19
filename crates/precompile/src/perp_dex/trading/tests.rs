@@ -1656,6 +1656,95 @@ mod perf {
         report_block("mixed (rests + sweeps + cancels)", elapsed, calls, &bc::snapshot());
     }
 
+    /// BBO-churn block: frequent place+cancel at exactly the best-bid and best-ask prices, NO matches,
+    /// only TWO price levels ever touched (the case the user asked to measure). Runs the IDENTICAL
+    /// workload twice against fresh ctxs — once with per-call ser/deser (`force_percall`, pre-#14/#16d)
+    /// and once deferred (#14 read cache + #16d block-end write serialization) — and reports the
+    /// execution-time SAVING (per-call wall-time − deferred wall-time).
+    ///
+    /// What deferral collapses here: the per-user account / position / nonce / best-bid+ask blobs are
+    /// re-written on every place AND cancel (huge reuse → one ser/deser per key for the whole block);
+    /// each order entry is written ~twice (place + cancel) → 2→1. What it does NOT touch: the per-price
+    /// FIFO level queues are the raw-byte path (`store_blob`, not msgpack `save_cached`), so they
+    /// serialize per-op in BOTH passes and cancel out of the delta = the residual deferral can't remove
+    /// for this workload (catalog #21). The commitment is asserted identical across passes = byte-identity.
+    #[test]
+    #[ignore = "block-level perf; run with --release --ignored --nocapture"]
+    fn perf_block_bbo_churn() {
+        use crate::perp_dex::storage::bench_counter as bc;
+        const ROUNDS: u64 = 2000; // each round = place+cancel @ bid AND place+cancel @ ask (4 calls)
+
+        let bid_px = PRICE - TICK; // best bid
+        let ask_px = PRICE + TICK; // best ask (bid_px < ask_px => orders never cross => no matches)
+
+        // One block of identical work; returns (wall-time, counter snapshot, block commitment).
+        let run_block = |force_percall: bool| -> (Duration, bc::Stats, U256) {
+            let mut ctx = make_ctx();
+            // Set the mode BEFORE any write so the whole overlay is one representation (bytes vs
+            // struct) — otherwise the first churn read of a setup-written key pays a serialize-on-read.
+            bc::set_force_percall(force_percall);
+            setup(&mut ctx);
+            let m = user_addr(1);
+            JournalTr::load_account(ctx.journal_mut(), m).unwrap();
+            fund(&mut ctx, m, BIG);
+            // Resting bid + ask define a stable BBO that the churn never crosses; they stay open.
+            let _rest_bid = place(&mut ctx, m, 0, bid_px, QTY, 0, 0); // buy  GTC @ bid
+            let _rest_ask = place(&mut ctx, m, 1, ask_px, QTY, 0, 0); // sell GTC @ ask (no bid >= ask => rests)
+
+            bc::reset();
+            bc::enable();
+            let t0 = Instant::now();
+            for _ in 0..ROUNDS {
+                bc::next_txn();
+                let b = place(&mut ctx, m, 0, bid_px, QTY, 0, 0); // rests at best bid (no ask <= bid)
+                bc::next_txn();
+                let cb = cancelOrderCall { orderId: b.into(), marketId: MARKET_ID }.abi_encode();
+                run_cancel_order(&cb, m, &mut ctx).unwrap();
+                bc::next_txn();
+                let a = place(&mut ctx, m, 1, ask_px, QTY, 0, 0); // rests at best ask (no bid >= ask)
+                bc::next_txn();
+                let ca = cancelOrderCall { orderId: a.into(), marketId: MARKET_ID }.abi_encode();
+                run_cancel_order(&ca, m, &mut ctx).unwrap();
+            }
+            // Block-end harvest INSIDE the timed region: deferred mode serializes each struct key once
+            // here (block_end_ser); per-call mode drains already-serialized bytes (no ser).
+            let delta = ctx.journal_mut().take_perp_delta();
+            let elapsed = t0.elapsed();
+            bc::disable();
+            bc::set_force_percall(false);
+            let commit = storage::compute_block_commitment(U256::ZERO, &delta);
+            (elapsed, bc::snapshot(), commit)
+        };
+
+        let calls = ROUNDS * 4;
+        let (t_off, s_off, c_off) = run_block(true);
+        let (t_on, s_on, c_on) = run_block(false);
+
+        // #16d invariant: deferral must not change the net delta → same on-trie commitment.
+        assert_eq!(
+            c_off, c_on,
+            "force_percall changed the block commitment — deferral must be byte-identical"
+        );
+
+        let us = |d: Duration| d.as_nanos() as f64 / 1000.0 / calls as f64;
+        println!(
+            "PERF BLOCK bbo-churn (place+cancel @ best bid/ask, no match, 2 levels): {calls} calls / {ROUNDS} rounds"
+        );
+        println!("  PER-CALL  ser/deser (pre-#14/#16d): {t_off:?} ({:.3} us/call)", us(t_off));
+        println!(
+            "    reads {} calls / {} KiB | writes {} calls / {} KiB | block-end ser {} calls",
+            s_off.read_calls, s_off.read_bytes / 1024, s_off.write_calls, s_off.write_bytes / 1024, s_off.block_end_ser_calls
+        );
+        println!("  DEFERRED  ser/deser (#14+#16d):     {t_on:?} ({:.3} us/call)", us(t_on));
+        println!(
+            "    residual byte reads {} calls / {} KiB | residual byte writes {} calls / {} KiB | block-end ser {} calls / {} KiB",
+            s_on.read_calls, s_on.read_bytes / 1024, s_on.write_calls, s_on.write_bytes / 1024, s_on.block_end_ser_calls, s_on.block_end_ser_bytes / 1024
+        );
+        let saved = t_off.saturating_sub(t_on);
+        let pct = saved.as_nanos() as f64 / (t_off.as_nanos().max(1)) as f64 * 100.0;
+        println!("  SAVED by deferring ser+deser to block end: {saved:?} ({pct:.1}% of per-call execution time)");
+    }
+
     /// (e): placeOrderSigned taker, single fill — ed25519 verify path.
     /// Signatures are pre-generated OUTSIDE the timed loop so only the
     /// precompile-side cost (decode, api-key load, recvWindow, verify_strict,

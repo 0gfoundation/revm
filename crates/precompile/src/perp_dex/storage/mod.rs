@@ -90,6 +90,7 @@ pub(crate) mod bench_counter {
         static STATS: RefCell<Stats> = RefCell::new(Stats::default());
         static TXN: Cell<u32> = const { Cell::new(0) };
         static ON: Cell<bool> = const { Cell::new(false) };
+        static FORCE_PERCALL: Cell<bool> = const { Cell::new(false) };
     }
 
     pub(crate) fn reset() {
@@ -101,6 +102,16 @@ pub(crate) mod bench_counter {
     }
     pub(crate) fn disable() {
         ON.with(|o| o.set(false));
+    }
+    /// When set, `save_cached`/`load_cached` bypass the #16d struct overlay + #14 read cache and
+    /// serialize on every write / deserialize on every read (the pre-#14/#16d behavior). Lets one
+    /// bench measure per-call vs deferred ser/deser on an identical workload. Independent of
+    /// `enable()` (it changes BEHAVIOR, not counting); set explicitly per pass, not cleared by `reset`.
+    pub(crate) fn set_force_percall(v: bool) {
+        FORCE_PERCALL.with(|c| c.set(v));
+    }
+    pub(crate) fn force_percall() -> bool {
+        FORCE_PERCALL.with(Cell::get)
     }
     /// Marks the start of a new logical transaction (handler call) for per-call write attribution.
     pub(crate) fn next_txn() {
@@ -262,6 +273,16 @@ fn load_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256) -> Result<Option
 where
     T: Clone + 'static + for<'de> Deserialize<'de>,
 {
+    // Bench-only A/B lever (#14/#16d measurement): deserialize on every read with no cache,
+    // reproducing pre-#14 behavior so a bench can diff per-call vs cached deser cost.
+    #[cfg(test)]
+    if bench_counter::force_percall() {
+        let buf = load_blob(context, key)?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(decode(&buf)?));
+    }
     // Fast path: a deferred struct written this block — downcast + clone, no deserialization.
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
         if let Some(v) = any.downcast_ref::<T>() {
@@ -317,6 +338,13 @@ fn save_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256, val: &T) -> Resu
 where
     T: Clone + 'static + Serialize,
 {
+    // Bench-only A/B lever (#16d measurement): serialize on every write into the byte overlay,
+    // reproducing pre-#16d behavior so a bench can diff per-call vs deferred ser cost.
+    #[cfg(test)]
+    if bench_counter::force_percall() {
+        let buf = encode(val)?;
+        return store_blob(context, key, &buf);
+    }
     context.journal_mut().perp_store_struct(
         key,
         std::boxed::Box::new(val.clone()),
