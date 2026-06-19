@@ -31,8 +31,10 @@ use std::vec::Vec;
 // `PerpEntry` stays Clone via a per-entry clone fn-pointer.
 #[derive(Debug, Clone, Default)]
 pub struct PerpSection {
-    /// In-block write overlay (domain key -> blob). Empty value means the key is absent/deleted.
-    working: HashMap<B256, Vec<u8>>,
+    /// In-block write overlay. Each value is a [`PerpEntry`]: a deferred deserialized blob
+    /// (`Struct`, serialized once at block end) or raw bytes (`Bytes`, e.g. via `store_blob`).
+    /// `Bytes(empty)` means the key is absent/deleted.
+    working: HashMap<B256, PerpEntry>,
     /// Reversible undo log for `working`, mirroring the EVM journal `Vec<ENTRY>`.
     undo: Vec<PerpUndo>,
     /// Block-scoped cache of DESERIALIZED blobs (catalog #14): a pure accelerator over `working`
@@ -46,11 +48,69 @@ pub struct PerpSection {
 }
 
 /// A single reversible PerpDEX overlay write: restores `prev` on revert
-/// (`None` = the key was absent in `working`, so revert removes it).
+/// (`None` = the key was absent in `working`, so revert removes it). `prev` is the entry moved out
+/// by `HashMap::insert` at write time, so no clone is needed for the undo log.
 #[derive(Debug, Clone)]
 struct PerpUndo {
     key: B256,
-    prev: Option<Vec<u8>>,
+    prev: Option<PerpEntry>,
+}
+
+/// One off-trie overlay value (#16d Phase 2). A typed `save_*` write stores the DESERIALIZED blob
+/// (`Struct`) and defers serialization to block end; a raw byte write (`store_blob`, e.g. level
+/// queues) stores `Bytes`. Both lower to the canonical off-trie bytes via `into_bytes`/`to_bytes`;
+/// `Bytes(empty)` is the deleted-key convention. The `ser`/`clone` fn pointers are monomorphized in
+/// the precompile (carrying the blob type + msgpack codec), so this crate stays format-agnostic and
+/// the entry is `Clone` without cloning through `dyn Any`.
+enum PerpEntry {
+    Struct {
+        val: std::boxed::Box<dyn core::any::Any>,
+        ser: fn(&dyn core::any::Any) -> Vec<u8>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+    },
+    Bytes(Vec<u8>),
+}
+
+impl Clone for PerpEntry {
+    fn clone(&self) -> Self {
+        match self {
+            PerpEntry::Struct { val, ser, clone } => PerpEntry::Struct {
+                val: clone(val.as_ref()),
+                ser: *ser,
+                clone: *clone,
+            },
+            PerpEntry::Bytes(b) => PerpEntry::Bytes(b.clone()),
+        }
+    }
+}
+
+impl core::fmt::Debug for PerpEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PerpEntry::Struct { .. } => f.write_str("PerpEntry::Struct(..)"),
+            PerpEntry::Bytes(b) => write!(f, "PerpEntry::Bytes({} bytes)", b.len()),
+        }
+    }
+}
+
+impl PerpEntry {
+    /// Lowers to the canonical off-trie bytes, consuming the entry (block-end drain).
+    #[inline]
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            PerpEntry::Struct { val, ser, .. } => ser(val.as_ref()),
+            PerpEntry::Bytes(b) => b,
+        }
+    }
+
+    /// Lowers to the canonical off-trie bytes by reference (byte-interface read path).
+    #[inline]
+    fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            PerpEntry::Struct { val, ser, .. } => ser(val.as_ref()),
+            PerpEntry::Bytes(b) => b.clone(),
+        }
+    }
 }
 
 /// Type-erased, block-scoped cache of deserialized off-trie blobs (see [`PerpSection::cache`]).
@@ -91,22 +151,46 @@ impl PerpCache {
 }
 
 impl PerpSection {
-    /// Reads the overlay for `key` (in-block writes only); `None` = not written this block.
+    /// Reads the overlay for `key` as canonical bytes (in-block writes only); `None` = not written.
+    /// A deferred `Struct` is serialized on demand — rare via this path (the typed read uses
+    /// `get_struct`); byte-path keys (level queues) are the common case and just clone.
     #[inline]
-    fn get(&self, key: B256) -> Option<&[u8]> {
-        self.working.get(&key).map(Vec::as_slice)
+    fn get_bytes(&self, key: B256) -> Option<Vec<u8>> {
+        self.working.get(&key).map(PerpEntry::to_bytes)
     }
 
-    /// Writes `value` to the overlay, recording the prior overlay value for revert.
+    /// Reads a deferred `Struct` overlay value (type-erased) for the typed fast-path read; `None`
+    /// if the key is absent or was written as raw `Bytes`.
     #[inline]
-    fn store(&mut self, key: B256, value: Vec<u8>) {
-        self.undo.push(PerpUndo {
-            key,
-            prev: self.working.get(&key).cloned(),
-        });
-        self.working.insert(key, value);
-        // Invalidate the deser cache for this key. The precompile's cached save re-populates it
-        // (write-through); a direct delete (empty value, no re-populate) leaves it absent.
+    fn get_struct(&self, key: B256) -> Option<&dyn core::any::Any> {
+        match self.working.get(&key) {
+            Some(PerpEntry::Struct { val, .. }) => Some(val.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Writes raw `Bytes` (byte-path writers, e.g. `store_blob`), recording the prior entry (moved
+    /// out by `insert`) for revert.
+    #[inline]
+    fn store_bytes(&mut self, key: B256, value: Vec<u8>) {
+        let prev = self.working.insert(key, PerpEntry::Bytes(value));
+        self.undo.push(PerpUndo { key, prev });
+        // Invalidate the deser cache; a typed cached save re-populates it (write-through).
+        self.cache.remove(key);
+    }
+
+    /// Writes a deferred `Struct` (typed writers): no serialization now — lowered to bytes once at
+    /// `take_delta`. Records the prior entry for revert.
+    #[inline]
+    fn store_struct(
+        &mut self,
+        key: B256,
+        val: std::boxed::Box<dyn core::any::Any>,
+        ser: fn(&dyn core::any::Any) -> Vec<u8>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+    ) {
+        let prev = self.working.insert(key, PerpEntry::Struct { val, ser, clone });
+        self.undo.push(PerpUndo { key, prev });
         self.cache.remove(key);
     }
 
@@ -130,7 +214,8 @@ impl PerpSection {
         }
     }
 
-    /// Drains the net in-block writes as a [`PerpDelta`] and clears the undo log.
+    /// Drains the net in-block writes as a [`PerpDelta`], serializing each entry to canonical bytes
+    /// ONCE here — deferred `Struct` writes are serialized at this block boundary (#16d). Clears undo.
     #[inline]
     fn take_delta(&mut self) -> PerpDelta {
         self.undo.clear();
@@ -138,6 +223,9 @@ impl PerpSection {
         // store changes between blocks via the delta merge).
         self.cache.clear();
         mem::take(&mut self.working)
+            .into_iter()
+            .map(|(k, e)| (k, e.into_bytes()))
+            .collect()
     }
 
     /// Reads the block-scoped deserialized-blob cache (type-erased). See [`PerpSection::cache`].
@@ -238,14 +326,34 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// Reads the off-trie PerpDEX overlay for `key`; `None` = not written in this block
     /// (the caller falls through to the committed store, see `JournalTr::perp_load`).
     #[inline]
-    pub fn perp_get_overlay(&self, key: B256) -> Option<&[u8]> {
-        self.perp.get(key)
+    pub fn perp_get_overlay(&self, key: B256) -> Option<Vec<u8>> {
+        self.perp.get_bytes(key)
     }
 
-    /// Writes an off-trie PerpDEX blob to the overlay, journaled for revert.
+    /// Writes an off-trie PerpDEX blob (raw bytes) to the overlay, journaled for revert.
     #[inline]
     pub fn perp_store(&mut self, key: B256, value: Vec<u8>) {
-        self.perp.store(key, value);
+        self.perp.store_bytes(key, value);
+    }
+
+    /// Writes a deferred deserialized blob (#16d Phase 2): serialization is deferred to the
+    /// block-end `take_perp_delta`. `ser`/`clone` are monomorphized in the precompile, so this
+    /// crate stays format-agnostic.
+    #[inline]
+    pub fn perp_store_struct(
+        &mut self,
+        key: B256,
+        val: std::boxed::Box<dyn core::any::Any>,
+        ser: fn(&dyn core::any::Any) -> Vec<u8>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+    ) {
+        self.perp.store_struct(key, val, ser, clone);
+    }
+
+    /// Reads a deferred `Struct` overlay value (type-erased) for the typed fast-path read.
+    #[inline]
+    pub fn perp_get_struct(&self, key: B256) -> Option<&dyn core::any::Any> {
+        self.perp.get_struct(key)
     }
 
     /// Reads the block-scoped deserialized PerpDEX blob cache (catalog #14; type-erased).
@@ -1156,11 +1264,11 @@ mod perp_tests {
         // A sub-call overwrites the key, then reverts.
         let cp = j.checkpoint();
         j.perp_store(k(1), vec![9, 9]);
-        assert_eq!(j.perp_get_overlay(k(1)), Some(&[9u8, 9][..]));
+        assert_eq!(j.perp_get_overlay(k(1)), Some(vec![9u8, 9]));
         j.checkpoint_revert(cp);
 
         // The committed baseline is restored, and depth is balanced.
-        assert_eq!(j.perp_get_overlay(k(1)), Some(&[1u8, 2, 3][..]));
+        assert_eq!(j.perp_get_overlay(k(1)), Some(vec![1u8, 2, 3]));
         assert_eq!(j.depth, 0);
     }
 
@@ -1169,7 +1277,7 @@ mod perp_tests {
         let mut j = new_inner();
         let cp = j.checkpoint();
         j.perp_store(k(2), vec![5]);
-        assert_eq!(j.perp_get_overlay(k(2)), Some(&[5u8][..]));
+        assert_eq!(j.perp_get_overlay(k(2)), Some(vec![5u8]));
         j.checkpoint_revert(cp);
         // The key was absent before the checkpoint, so revert removes it from the overlay
         // (a later read falls through to the committed store).
@@ -1201,7 +1309,7 @@ mod perp_tests {
         j.discard_tx();
         // discard_tx (undo_to(0)) must revert ONLY tx2's writes, never tx1's committed baseline —
         // this distinguishes the correct undo-log replay from a naive working.clear().
-        assert_eq!(j.perp_get_overlay(k(1)), Some(&[1u8][..]));
+        assert_eq!(j.perp_get_overlay(k(1)), Some(vec![1u8]));
         assert_eq!(j.perp_get_overlay(k(2)), None);
     }
 
@@ -1211,7 +1319,7 @@ mod perp_tests {
         j.perp_store(k(1), vec![1]);
         j.commit_tx();
         // Working survives across the tx boundary (intra-block visibility); the undo is spent.
-        assert_eq!(j.perp_get_overlay(k(1)), Some(&[1u8][..]));
+        assert_eq!(j.perp_get_overlay(k(1)), Some(vec![1u8]));
         assert!(j.perp.undo.is_empty());
     }
 
@@ -1229,6 +1337,43 @@ mod perp_tests {
         assert!(j.perp.undo.is_empty());
     }
 
+    // #16d Phase 2 — deferred-struct overlay path.
+    fn ser_u32(v: &dyn core::any::Any) -> Vec<u8> {
+        v.downcast_ref::<u32>().unwrap().to_le_bytes().to_vec()
+    }
+    fn clone_u32(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
+        std::boxed::Box::new(*v.downcast_ref::<u32>().unwrap())
+    }
+
+    #[test]
+    fn perp_store_struct_defers_serialization() {
+        let mut j = new_inner();
+        j.perp_store_struct(k(1), std::boxed::Box::new(7u32), ser_u32, clone_u32);
+
+        // Typed fast-path read returns the struct (no serialization).
+        assert_eq!(j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&7u32));
+        // Byte-interface read serializes on demand (same bytes the delta will carry).
+        assert_eq!(j.perp_get_overlay(k(1)), Some(7u32.to_le_bytes().to_vec()));
+        // Clone (the JournalInner Clone path) preserves the deferred struct via the clone fn-ptr.
+        let j2 = j.clone();
+        assert_eq!(j2.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&7u32));
+        // Block-end drain serializes ONCE.
+        let delta = j.take_perp_delta();
+        assert_eq!(delta.get(&k(1)), Some(&7u32.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn perp_store_struct_reverts() {
+        let mut j = new_inner();
+        let cp = j.checkpoint();
+        j.perp_store_struct(k(1), std::boxed::Box::new(42u32), ser_u32, clone_u32);
+        assert!(j.perp_get_struct(k(1)).is_some());
+        j.checkpoint_revert(cp);
+        // The struct write is move-undone in lock-step with the byte path.
+        assert!(j.perp_get_struct(k(1)).is_none());
+        assert_eq!(j.perp_get_overlay(k(1)), None);
+    }
+
     #[test]
     fn finalize_excludes_perp_from_state_but_preserves_block_overlay() {
         let mut j = new_inner();
@@ -1238,7 +1383,7 @@ mod perp_tests {
         assert!(state.is_empty());
         // ...but `finalize` runs PER TX in block execution, so it must NOT wipe the block-scoped
         // overlay; the write survives for the end-of-block `take_perp_delta` harvest.
-        assert_eq!(j.perp.get(k(1)), Some(&[7u8][..]));
+        assert_eq!(j.perp.get_bytes(k(1)), Some(vec![7u8]));
         // The tx-scoped undo log is still reset.
         assert!(j.perp.undo.is_empty());
     }
@@ -1275,7 +1420,7 @@ mod perp_tests {
 
         // Revert the inner scope: k(2) gone, k(1) survives.
         j.checkpoint_revert(inner);
-        assert_eq!(j.perp_get_overlay(k(1)), Some(&[10u8][..]));
+        assert_eq!(j.perp_get_overlay(k(1)), Some(vec![10u8]));
         assert_eq!(j.perp_get_overlay(k(2)), None);
 
         // Revert the outer scope: both gone, depth balanced.
@@ -1345,7 +1490,7 @@ mod perp_tests {
             for key in &probe {
                 assert_eq!(
                     j.perp_get_overlay(*key),
-                    model.get(key).map(Vec::as_slice),
+                    model.get(key).cloned(),
                     "overlay diverged from reference model at key {key:?}"
                 );
             }

@@ -248,6 +248,28 @@ pub trait JournalTr {
         let _ = (key, value);
     }
 
+    /// Writes a deferred deserialized off-trie blob (#16d Phase 2): the value is kept type-erased
+    /// and serialized to bytes ONCE at block end (`take_perp_delta`) via `ser`, instead of on every
+    /// write. `clone` keeps the overlay `Clone`. Both fns are monomorphized by the caller (the
+    /// precompile), so this crate needs no blob types or codec. Default backend is a no-op.
+    fn perp_store_struct(
+        &mut self,
+        key: B256,
+        val: std::boxed::Box<dyn core::any::Any>,
+        ser: fn(&dyn core::any::Any) -> Vec<u8>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+    ) {
+        let _ = (key, val, ser, clone);
+    }
+
+    /// Reads a deferred `Struct` off-trie overlay value (type-erased) written this block; `None` if
+    /// absent or written as raw bytes. The caller downcasts + clones (skipping deserialization).
+    /// Default backend keeps no overlay and returns `None`.
+    fn perp_get_struct(&mut self, key: B256) -> Option<&dyn core::any::Any> {
+        let _ = key;
+        None
+    }
+
     /// Reads the block-scoped deserialized off-trie blob cache (catalog #14): a per-block
     /// accelerator that lets the precompile skip re-deserializing a blob it already decoded this
     /// block. Type-erased (this crate does not know the blob types); the caller downcasts and

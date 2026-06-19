@@ -307,7 +307,7 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     fn perp_load(&mut self, key: B256) -> Result<Vec<u8>, <Self::Database as Database>::Error> {
         // Overlay first: a key written earlier in this block.
         if let Some(value) = self.inner.perp_get_overlay(key) {
-            return Ok(value.to_vec());
+            return Ok(value);
         }
         // Cold miss: fall through to the committed off-trie perp store via the database —
         // exactly as `sload` falls through to `Database::storage` for trie slots.
@@ -323,6 +323,22 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     #[inline]
     fn perp_store(&mut self, key: B256, value: Vec<u8>) {
         self.inner.perp_store(key, value);
+    }
+
+    #[inline]
+    fn perp_store_struct(
+        &mut self,
+        key: B256,
+        val: std::boxed::Box<dyn core::any::Any>,
+        ser: fn(&dyn core::any::Any) -> Vec<u8>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+    ) {
+        self.inner.perp_store_struct(key, val, ser, clone);
+    }
+
+    #[inline]
+    fn perp_get_struct(&mut self, key: B256) -> Option<&dyn core::any::Any> {
+        self.inner.perp_get_struct(key)
     }
 
     #[inline]
