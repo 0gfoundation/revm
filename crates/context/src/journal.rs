@@ -25,8 +25,9 @@ use std::vec::Vec;
 /// On each additional call, the depth of the journaled state is increased (`depth`) and a new journal is added.
 ///
 /// The journal contains every state change that happens within that call, making it possible to revert changes made in a specific call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// #16d Phase 2: PartialEq/Eq/serde dropped (unused on the journal) so the off-trie overlay can
+// hold deserialized blobs; Clone/Debug kept (required by Context's derive_where).
+#[derive(Debug, Clone)]
 pub struct Journal<DB, ENTRY = JournalEntry>
 where
     ENTRY: JournalEntryTr,

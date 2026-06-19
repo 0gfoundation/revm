@@ -26,8 +26,10 @@ use std::vec::Vec;
 /// keys written during the current block (reads pass through to the committed store without
 /// caching); `undo` is the per-transaction reversible log. See
 /// `docs/perpstate-journal集成方案.md`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// #16d Phase 2: drops PartialEq/Eq/serde (all unused on the journal types — verified zero usage)
+// so `working` can hold deserialized blobs (`Box<dyn Any>`, neither Eq nor serde). Clone is kept;
+// `PerpEntry` stays Clone via a per-entry clone fn-pointer.
+#[derive(Debug, Clone, Default)]
 pub struct PerpSection {
     /// In-block write overlay (domain key -> blob). Empty value means the key is absent/deleted.
     working: HashMap<B256, Vec<u8>>,
@@ -40,14 +42,12 @@ pub struct PerpSection {
     /// txns within a block (like `working`). Transparent to this struct's derives — clones empty,
     /// ignored by equality, skipped by serde — since it is always reconstructible and carries no
     /// semantic state.
-    #[cfg_attr(feature = "serde", serde(skip))]
     cache: PerpCache,
 }
 
 /// A single reversible PerpDEX overlay write: restores `prev` on revert
 /// (`None` = the key was absent in `working`, so revert removes it).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
 struct PerpUndo {
     key: B256,
     prev: Option<Vec<u8>>,
@@ -70,14 +70,6 @@ impl core::fmt::Debug for PerpCache {
         write!(f, "PerpCache({} entries)", self.0.len())
     }
 }
-
-impl PartialEq for PerpCache {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for PerpCache {}
 
 impl PerpCache {
     #[inline]
@@ -164,8 +156,7 @@ impl PerpSection {
 /// Inner journal state that contains journal and state changes.
 ///
 /// Spec Id is a essential information for the Journal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
 pub struct JournalInner<ENTRY> {
     /// The current state
     pub state: EvmState,
