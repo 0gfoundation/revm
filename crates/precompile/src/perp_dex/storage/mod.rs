@@ -216,10 +216,16 @@ pub fn compute_block_commitment(prev: U256, delta: &HashMap<B256, Vec<u8>>) -> U
 
 /// Block-end hook (catalog #16d): folds the block's net perp delta into the on-trie 0x1003 anchor
 /// ONCE, replacing the per-call [`flush_commitment`]. The block executor calls this after
-/// [`JournalTr::take_perp_delta`], while the journal is still alive (before the state root is
-/// computed), so the sstore lands in the BundleState transition. No-op on an empty delta.
-/// `warm_account` + `touch_account` mirror `flush_commitment` / `save_erc20_balance` so the slot
-/// change is not dropped from the commit. Journaled like any sstore (reverts with the frame).
+/// [`JournalTr::take_perp_delta`], while the journal is still alive. No-op on an empty delta.
+/// `warm_account` + `touch_account` mirror `flush_commitment` / `save_erc20_balance`.
+///
+/// This writes a journaled `sstore` into the journal overlay ONLY — it does NOT itself reach the
+/// `State`/bundle. Because the block executor's `finish`/`into_db` merely extract
+/// `journaled_state.database` (dropping the overlay), the caller MUST drain the journal afterwards
+/// (`JournalTr::finalize`) and commit the returned changeset into its `State` DB so the slot change
+/// becomes a bundle transition. The alloy-evm `Evm::finalize_perp_commitment` wrapper does exactly
+/// that. (Pre-#16d this ran inside a tx, so the enclosing `transact`+commit carried it; the
+/// block-end call site has no such enclosing commit.) Journaled like any sstore.
 pub fn finalize_block_commitment<CTX: ContextTr>(
     context: &mut CTX,
     delta: &HashMap<B256, Vec<u8>>,
