@@ -1455,8 +1455,12 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 cancelled_entry.maker_fee_bps,
                 market,
             )?;
-            account.credit_perp(freed)?;
-            account.credit_perp(fee_freed)?;
+            // Return released margin + fee reservation in one credit (mirrors the
+            // combined debit on the placement path).
+            let total_freed = freed
+                .checked_add(fee_freed)
+                .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
+            account.credit_perp(total_freed)?;
             // Surface drift instead of masking it (was saturating_sub).
             let prev_fee = pos.fee_reserved;
             pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
@@ -1494,8 +1498,12 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                 cancelled_entry.maker_fee_bps,
                 market,
             )?;
-            account.credit_perp(freed)?;
-            account.credit_perp(fee_freed)?;
+            // Return released margin + fee reservation in one credit (mirrors the
+            // combined debit on the placement path).
+            let total_freed = freed
+                .checked_add(fee_freed)
+                .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
+            account.credit_perp(total_freed)?;
             // Surface drift instead of masking it (was saturating_sub).
             let prev_fee = pos.fee_reserved;
             pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
