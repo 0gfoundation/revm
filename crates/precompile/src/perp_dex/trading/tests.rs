@@ -1103,6 +1103,140 @@ fn cancel_resting_order_releases_margin_and_clears_book() {
 }
 
 #[test]
+fn cancel_non_top_bid_keeps_best_bid() {
+    // Cancelling a strictly-interior bid level (price < best_bid) must NOT move
+    // best_bid. On the explicit cancel path (Current cache) remove_from_book skips
+    // the refresh here; the cached best must remain the untouched top level.
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    let p_lo = PRICE;
+    let p_hi = PRICE + TICK;
+
+    let lo = place(&mut ctx, ALICE, 0, p_lo, QTY, 0, 0);
+    let hi = place(&mut ctx, ALICE, 0, p_hi, QTY, 0, 0);
+    assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_hi);
+
+    let input = cancelOrderCall {
+        orderId: lo.into(),
+        marketId: MARKET_ID,
+    }
+    .abi_encode();
+    run_cancel_order(&input, ALICE, &mut ctx).unwrap();
+
+    // best_bid unchanged (top level survived), interior level gone, top still open.
+    assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_hi);
+    assert_eq!(
+        storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
+        vec![p_hi]
+    );
+    assert_eq!(get_order(&mut ctx, lo).status, OrderStatus::Cancelled);
+    assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Open);
+}
+
+#[test]
+fn cancel_top_bid_refreshes_best_bid() {
+    // Cancelling the top bid level (price == best_bid) MUST refresh best_bid down
+    // to the next surviving level.
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    let p_lo = PRICE;
+    let p_hi = PRICE + TICK;
+
+    let _lo = place(&mut ctx, ALICE, 0, p_lo, QTY, 0, 0);
+    let hi = place(&mut ctx, ALICE, 0, p_hi, QTY, 0, 0);
+    assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_hi);
+
+    let input = cancelOrderCall {
+        orderId: hi.into(),
+        marketId: MARKET_ID,
+    }
+    .abi_encode();
+    run_cancel_order(&input, ALICE, &mut ctx).unwrap();
+
+    assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_lo);
+    assert_eq!(
+        storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
+        vec![p_lo]
+    );
+}
+
+#[test]
+fn cancel_non_top_ask_keeps_best_ask() {
+    // Ask orientation is mirrored: asks sort ASC so best_ask is the LOWEST. A
+    // non-top ask has price > best_ask; cancelling it must NOT move best_ask.
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    let p_lo = PRICE; // best ask (lowest)
+    let p_hi = PRICE + TICK; // interior (higher) ask
+
+    let _lo = place(&mut ctx, ALICE, 1, p_lo, QTY, 0, 0);
+    let hi = place(&mut ctx, ALICE, 1, p_hi, QTY, 0, 0);
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), p_lo);
+
+    let input = cancelOrderCall {
+        orderId: hi.into(),
+        marketId: MARKET_ID,
+    }
+    .abi_encode();
+    run_cancel_order(&input, ALICE, &mut ctx).unwrap();
+
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), p_lo);
+    assert_eq!(
+        storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
+        vec![p_lo]
+    );
+    assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Cancelled);
+}
+
+#[test]
+fn cancel_top_ask_refreshes_best_ask() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    let p_lo = PRICE;
+    let p_hi = PRICE + TICK;
+
+    let lo = place(&mut ctx, ALICE, 1, p_lo, QTY, 0, 0);
+    let _hi = place(&mut ctx, ALICE, 1, p_hi, QTY, 0, 0);
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), p_lo);
+
+    let input = cancelOrderCall {
+        orderId: lo.into(),
+        marketId: MARKET_ID,
+    }
+    .abi_encode();
+    run_cancel_order(&input, ALICE, &mut ctx).unwrap();
+
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), p_hi);
+}
+
+#[test]
+fn remove_from_book_current_rejects_bid_above_cached_best() {
+    // Defensive tripwire: with the cache tagged Current, a removed bid level above
+    // the cached best_bid means the cache was actually stale — an invariant
+    // violation, not a normal cancel. Guards against a future caller mis-tagging a
+    // stale cache as Current (which would silently corrupt the BBO via a wrong skip).
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+    // Force the cache stale-low (below the resting bid at PRICE).
+    storage::save_best_bid(&mut ctx, MARKET_ID, PRICE - TICK).unwrap();
+
+    let err = super::remove_from_book(
+        &mut ctx,
+        MARKET_ID,
+        crate::perp_dex::types::Side::Buy,
+        PRICE,
+        &id,
+        super::BboCache::Current,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("above cached best_bid"),
+        "expected invariant error, got: {err}"
+    );
+}
+
+#[test]
 fn cancel_rejects_non_owner() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
@@ -1289,7 +1423,10 @@ fn perp_data_stays_off_trie_not_in_evm_state() {
 
     // Perp writes are captured in the off-trie delta...
     let delta = ctx.journal_mut().take_perp_delta();
-    assert!(!delta.is_empty(), "perp writes must land in the off-trie delta");
+    assert!(
+        !delta.is_empty(),
+        "perp writes must land in the off-trie delta"
+    );
     // `place` drives `run_place_order` directly (no dispatch). #16d: the commitment is folded ONCE
     // at block end — finalize the harvested net delta onto the 0x1003 slot, as the executor would.
     storage::finalize_block_commitment(&mut ctx, &delta).unwrap();
@@ -1415,11 +1552,7 @@ mod perf {
         }
         let p = report("placeOrder rest (limit GTC, no match)", t_place, iters);
         let c = report("cancelOrder (resting order)", t_cancel, iters);
-        report(
-            "place+cancel pair avg",
-            t_place + t_cancel,
-            iters * 2,
-        );
+        report("place+cancel pair avg", t_place + t_cancel, iters * 2);
         println!("PERF note: place {p:.0} ns + cancel {c:.0} ns per round-trip");
     }
 
@@ -1587,7 +1720,12 @@ mod perf {
         let _ = ctx.journal_mut().take_perp_delta();
         let elapsed = t0.elapsed();
         bc::disable();
-        report_block("rest-heavy (resting limits only)", elapsed, calls, &bc::snapshot());
+        report_block(
+            "rest-heavy (resting limits only)",
+            elapsed,
+            calls,
+            &bc::snapshot(),
+        );
     }
 
     /// Mixed block: resting bids + periodic IOC taker sweeps (cross the top 2 levels) + periodic
@@ -1653,7 +1791,12 @@ mod perf {
         let _ = ctx.journal_mut().take_perp_delta();
         let elapsed = t0.elapsed();
         bc::disable();
-        report_block("mixed (rests + sweeps + cancels)", elapsed, calls, &bc::snapshot());
+        report_block(
+            "mixed (rests + sweeps + cancels)",
+            elapsed,
+            calls,
+            &bc::snapshot(),
+        );
     }
 
     /// BBO-churn block: frequent place+cancel at exactly the best-bid and best-ask prices, NO matches,
@@ -1698,12 +1841,20 @@ mod perf {
                 bc::next_txn();
                 let b = place(&mut ctx, m, 0, bid_px, QTY, 0, 0); // rests at best bid (no ask <= bid)
                 bc::next_txn();
-                let cb = cancelOrderCall { orderId: b.into(), marketId: MARKET_ID }.abi_encode();
+                let cb = cancelOrderCall {
+                    orderId: b.into(),
+                    marketId: MARKET_ID,
+                }
+                .abi_encode();
                 run_cancel_order(&cb, m, &mut ctx).unwrap();
                 bc::next_txn();
                 let a = place(&mut ctx, m, 1, ask_px, QTY, 0, 0); // rests at best ask (no bid >= ask)
                 bc::next_txn();
-                let ca = cancelOrderCall { orderId: a.into(), marketId: MARKET_ID }.abi_encode();
+                let ca = cancelOrderCall {
+                    orderId: a.into(),
+                    marketId: MARKET_ID,
+                }
+                .abi_encode();
                 run_cancel_order(&ca, m, &mut ctx).unwrap();
             }
             // Block-end harvest INSIDE the timed region: deferred mode serializes each struct key once
@@ -1730,12 +1881,22 @@ mod perf {
         println!(
             "PERF BLOCK bbo-churn (place+cancel @ best bid/ask, no match, 2 levels): {calls} calls / {ROUNDS} rounds"
         );
-        println!("  PER-CALL  ser/deser (pre-#14/#16d): {t_off:?} ({:.3} us/call)", us(t_off));
+        println!(
+            "  PER-CALL  ser/deser (pre-#14/#16d): {t_off:?} ({:.3} us/call)",
+            us(t_off)
+        );
         println!(
             "    reads {} calls / {} KiB | writes {} calls / {} KiB | block-end ser {} calls",
-            s_off.read_calls, s_off.read_bytes / 1024, s_off.write_calls, s_off.write_bytes / 1024, s_off.block_end_ser_calls
+            s_off.read_calls,
+            s_off.read_bytes / 1024,
+            s_off.write_calls,
+            s_off.write_bytes / 1024,
+            s_off.block_end_ser_calls
         );
-        println!("  DEFERRED  ser/deser (#14+#16d):     {t_on:?} ({:.3} us/call)", us(t_on));
+        println!(
+            "  DEFERRED  ser/deser (#14+#16d):     {t_on:?} ({:.3} us/call)",
+            us(t_on)
+        );
         println!(
             "    residual byte reads {} calls / {} KiB | residual byte writes {} calls / {} KiB | block-end ser {} calls / {} KiB",
             s_on.read_calls, s_on.read_bytes / 1024, s_on.write_calls, s_on.write_bytes / 1024, s_on.block_end_ser_calls, s_on.block_end_ser_bytes / 1024
@@ -2204,7 +2365,7 @@ mod golden {
         for (user, amount) in [
             (ALICE, 2_000_000_000u64), // $2,000
             (BOB, 2_000_000_000),
-            (CAROL, 10_000_000), // $10 — only used for the post-liquidation step
+            (CAROL, 10_000_000),  // $10 — only used for the post-liquidation step
             (ADMIN, 500_000_000), // $500
         ] {
             db.insert_account_storage(
@@ -2450,7 +2611,11 @@ mod golden {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
 
         // Phase 0 — roles (admin / oracle / market-manager blobs).
-        dex_call(&mut ctx, ADMIN, &initAdminCall { admin: ADMIN }.abi_encode());
+        dex_call(
+            &mut ctx,
+            ADMIN,
+            &initAdminCall { admin: ADMIN }.abi_encode(),
+        );
         dex_call_expect_revert(
             &mut ctx,
             ALICE,
@@ -2635,7 +2800,13 @@ mod golden {
 
         // View stretch #1 — pure reads must not fold the commitment.
         let c_views = read_commitment(&mut ctx);
-        dex_view(&mut ctx, &getMarkPriceCall { marketId: MARKET_ID }.abi_encode());
+        dex_view(
+            &mut ctx,
+            &getMarkPriceCall {
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        );
         dex_view(&mut ctx, &getAccountCall { user: ALICE }.abi_encode());
         dex_view(
             &mut ctx,
@@ -2646,7 +2817,13 @@ mod golden {
             .abi_encode(),
         );
         dex_view(&mut ctx, &getApiKeysCall { user: ALICE }.abi_encode());
-        dex_view(&mut ctx, &getIndexPriceCall { marketId: MARKET_ID }.abi_encode());
+        dex_view(
+            &mut ctx,
+            &getIndexPriceCall {
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+        );
         assert_eq!(
             read_commitment(&mut ctx),
             c_views,
@@ -3094,12 +3271,11 @@ mod golden {
             &getAccountCall { user: ADMIN }.abi_encode(),
         ))
         .unwrap();
-        let insurance_fund =
-            getInsuranceFundCall::abi_decode_returns(&dex_view(
-                ctx,
-                &getInsuranceFundCall {}.abi_encode(),
-            ))
-            .unwrap();
+        let insurance_fund = getInsuranceFundCall::abi_decode_returns(&dex_view(
+            ctx,
+            &getInsuranceFundCall {}.abi_encode(),
+        ))
+        .unwrap();
         let market_fee_total = getMarketFeeTotalCall::abi_decode_returns(&dex_view(
             ctx,
             &getMarketFeeTotalCall {
@@ -3177,6 +3353,9 @@ mod golden {
         let first = run_golden_scenario();
         let second = run_golden_scenario();
         assert_eq!(first.0, second.0, "commitment must be deterministic");
-        assert_eq!(first.1, second.1, "business end-state must be deterministic");
+        assert_eq!(
+            first.1, second.1,
+            "business end-state must be deterministic"
+        );
     }
 }

@@ -587,6 +587,8 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
             order,
             OrderStatus::Expired,
             market,
+            // Runs mid-matching (taker margin-cover): the BBO cache lags the book.
+            super::BboCache::Stale,
         )?;
     }
 
@@ -873,6 +875,9 @@ fn cancel_maker_orders_until_wallet_nonnegative<CTX: ContextTr>(
             order,
             OrderStatus::Expired,
             market,
+            // Runs inside match_order's sweep (maker auto-cancel-for-deficit): the
+            // BBO cache is deliberately stale until the post-sweep refresh.
+            super::BboCache::Stale,
         )?;
         expired_order_ids.push(order_id);
     }
