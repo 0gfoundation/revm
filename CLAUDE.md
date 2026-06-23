@@ -10,6 +10,19 @@ REVM is a highly efficient Rust implementation of the Ethereum Virtual Machine (
 
 The project is used by major Ethereum infrastructure including Reth, Foundry, Hardhat, Optimism, Scroll, and many zkVMs.
 
+## 0G PerpDEX Development Posture (READ FIRST)
+
+This is the **0gfoundation fork** of revm. It hosts the **PerpDEX precompile** (`crates/precompile/src/perp_dex/`, address `0x…1003`) and its **off-trie PerpState + chained block commitment**, consumed by the 0G chain (0g-reth).
+
+**The PerpDEX / off-trie-state / commitment layer is PRE-PRODUCTION. There is no mainnet, no users, no historical data, and the chain is wiped and restarted at will.** Therefore, for changes scoped to the PerpDEX precompile, its off-trie state, its serialization, and its block commitment:
+
+- **Do NOT weigh forward/backward compatibility, migrations, or "this changes consensus state" as a blocker.** A devnet wipe accompanies any such change. Decide PURELY on implementation ROI (does the win justify the code/complexity?), NOT on SAFE-vs-CHAIN.
+- A change to the **commitment scheme/serialization** (the hashing format itself, e.g. the per-call→per-block transition) is a routine step: bump `BLOCK_COMMITMENT_VERSION`, re-pin the golden commitment test, wipe. It is cheap.
+- A change to **execution rules** that alters the per-block write-set or state (e.g. skipping a redundant store, a new margin formula like the flip-aware reservation) only needs the golden commitment test re-pinned (run `commitment_golden_scenario`, copy the printed value). The `BusinessSnapshot` in that test pins business semantics independently — keep it unchanged unless the business behavior is *intended* to change.
+- **TRIPWIRE:** if you ever find yourself recommending "leave it / don't optimize" *because* a change "would alter the commitment / require a version bump / break compat" — STOP. That reasoning is invalid here. Re-decide on ROI alone. (The only thing that still matters: correctness, determinism across nodes running the SAME code, and EVM semantics for genuine Ethereum behavior.)
+
+This window closes at mainnet; until then, optimize aggressively.
+
 ## Build and Development Commands
 
 ### Essential Commands
