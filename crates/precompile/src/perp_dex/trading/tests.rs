@@ -1210,24 +1210,24 @@ fn cancel_top_ask_refreshes_best_ask() {
 }
 
 #[test]
-fn remove_from_book_current_rejects_bid_above_cached_best() {
-    // Defensive tripwire: with the cache tagged Current, a removed bid level above
-    // the cached best_bid means the cache was actually stale — an invariant
-    // violation, not a normal cancel. Guards against a future caller mis-tagging a
-    // stale cache as Current (which would silently corrupt the BBO via a wrong skip).
+fn remove_from_book_after_cancel_rejects_bid_above_cached_best() {
+    // Defensive tripwire: on the cancel path (cache assumed live), a removed bid
+    // level above the cached best_bid means the cache was actually stale — an
+    // invariant violation, not a normal cancel. Guards against a future caller
+    // routing a stale cache through remove_from_book_after_cancel (which would
+    // silently corrupt the BBO via a wrong skip).
     let mut ctx = make_ctx();
     setup(&mut ctx);
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
     // Force the cache stale-low (below the resting bid at PRICE).
     storage::save_best_bid(&mut ctx, MARKET_ID, PRICE - TICK).unwrap();
 
-    let err = super::remove_from_book(
+    let err = super::remove_from_book_after_cancel(
         &mut ctx,
         MARKET_ID,
         crate::perp_dex::types::Side::Buy,
         PRICE,
         &id,
-        super::BboCache::Current,
     )
     .unwrap_err();
     assert!(

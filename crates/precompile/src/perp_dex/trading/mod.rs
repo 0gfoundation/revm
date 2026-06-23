@@ -769,7 +769,7 @@ fn cancel_order_core<CTX: ContextTr>(
         OrderStatus::Cancelled,
         &market,
         // Explicit cancel: no matching ran in this call, so the BBO cache is live.
-        BboCache::Current,
+        remove_from_book_after_cancel,
     )?;
     Ok(Bytes::new())
 }
@@ -1349,12 +1349,12 @@ fn rest_in_book<CTX: ContextTr>(
 /// path in settlement use this function so the invariant "these steps always
 /// happen together" is enforced in one place.
 ///
-/// `bbo` tells `remove_from_book` whether the best_bid/best_ask cache is current:
-/// the explicit cancel path passes [`BboCache::Current`] (no matching ran before
-/// it, so the cache is live) to enable the non-top-removal refresh skip; the
-/// settlement auto-cancel paths pass [`BboCache::Stale`] because they run
-/// mid-matching where the cache lags the book.
-pub(super) fn execute_order_cancellation<CTX: ContextTr>(
+/// `remove` is the book-removal step to run first — the caller passes the variant
+/// matching its BBO-cache freshness: [`remove_from_book_after_cancel`] from the
+/// explicit cancel path (cache live → may skip the BBO refresh), or
+/// [`remove_from_book_during_match`] from the settlement auto-cancel paths (cache
+/// stale mid-matching → must always refresh).
+pub(super) fn execute_order_cancellation<CTX: ContextTr, F>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
@@ -1362,9 +1362,12 @@ pub(super) fn execute_order_cancellation<CTX: ContextTr>(
     mut order: Order,
     terminal_status: OrderStatus,
     market: &crate::perp_dex::types::Market,
-    bbo: BboCache,
-) -> Result<(), PrecompileError> {
-    remove_from_book(context, market_id, order.side, order.price, &order_id, bbo)?;
+    remove: F,
+) -> Result<(), PrecompileError>
+where
+    F: FnOnce(&mut CTX, u64, Side, u64, &[u8; 32]) -> Result<(), PrecompileError>,
+{
+    remove(context, market_id, order.side, order.price, &order_id)?;
     release_margin_for_cancelled_order(context, user, market_id, order.side, &order_id, market)?;
     order.status = terminal_status;
     storage::save_order(context, &order_id, &order)?;
@@ -1380,113 +1383,141 @@ pub(super) fn execute_order_cancellation<CTX: ContextTr>(
     Ok(())
 }
 
-/// Whether the caller guarantees the best_bid/best_ask cache is consistent with
-/// the order book at the moment `remove_from_book` runs.
+/// Detach `order_id` from its price level: drop it from the level's FIFO queue and,
+/// if that empties the level, remove the price from the side's price list. Updates
+/// the level queue + price list but does NOT touch the best_bid/best_ask cache.
 ///
-/// - `Current`: the cache reflects the live book (true at a fresh precompile-call
-///   boundary, e.g. the explicit cancelOrder path, which does no matching before
-///   the remove). `remove_from_book` may then SKIP the BBO refresh when a
-///   strictly-interior level empties — the best provably cannot move, so the
-///   refresh (price-list reload + recompute + cache re-store + best_*_key
-///   commitment membership + the mid-price sample) is pure waste.
-/// - `Stale`: the cache may lag the book (true mid-matching: the maker
-///   auto-cancel-for-deficit path runs inside match_order's sweep, which defers
-///   its single refresh to after the sweep). The price-vs-cache comparison cannot
-///   be trusted, so `remove_from_book` MUST always recompute the best from the
-///   price list to keep the cached BBO value correct.
-///
-/// Note this is a CORRECTNESS distinction (the `Stale` path needs the recompute to
-/// produce the right BBO value, not merely for consensus determinism). It is also
-/// why the optimization is confined to the cancel path rather than applied blindly.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum BboCache {
-    Current,
-    Stale,
-}
-
-pub(super) fn remove_from_book<CTX: ContextTr>(
+/// Returns `(level_emptied, old_best)` where `old_best` is the side's cached best
+/// captured BEFORE any mutation (so callers can decide how to refresh it).
+fn detach_order_from_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     side: Side,
     price: u64,
     order_id: &[u8; 32],
-    bbo: BboCache,
+) -> Result<(bool, u64), PrecompileError> {
+    let (old_best, emptied) = match side {
+        Side::Buy => {
+            let old_best = storage::load_best_bid(context, market_id)?;
+            let mut queue = storage::load_bid_level(context, market_id, price)?;
+            queue.retain(|id| id != order_id);
+            let emptied = queue.is_empty();
+            if emptied {
+                storage::remove_bid_price(context, market_id, price)?;
+            }
+            storage::save_bid_level(context, market_id, price, &queue)?;
+            (old_best, emptied)
+        }
+        Side::Sell => {
+            let old_best = storage::load_best_ask(context, market_id)?;
+            let mut queue = storage::load_ask_level(context, market_id, price)?;
+            queue.retain(|id| id != order_id);
+            let emptied = queue.is_empty();
+            if emptied {
+                storage::remove_ask_price(context, market_id, price)?;
+            }
+            storage::save_ask_level(context, market_id, price, &queue)?;
+            (old_best, emptied)
+        }
+    };
+    Ok((emptied, old_best))
+}
+
+/// Recompute the side's best from its (already-mutated) price list and, if it moved
+/// off `old_best`, record a mid-price sample. Shared by both removal entry points.
+fn refresh_best_and_sample<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    side: Side,
+    old_best: u64,
 ) -> Result<(), PrecompileError> {
     match side {
         Side::Buy => {
-            let old_best_bid = storage::load_best_bid(context, market_id)?;
-            let mut queue = storage::load_bid_level(context, market_id, price)?;
-            queue.retain(|id| id != order_id);
-            if queue.is_empty() {
-                storage::remove_bid_price(context, market_id, price)?;
-                // The best bid only moves when the TOP (highest) bid level empties.
-                // With a Current cache we can prove that from `price` vs the cache
-                // and skip the refresh otherwise. Bids sort DESC, so best_bid is the
-                // highest: a resting bid is always <= best_bid, hence
-                //   price == best_bid → top emptied  → refresh (best moves down/to 0)
-                //   price <  best_bid → interior      → skip (best unchanged)
-                //   price >  best_bid → impossible     → invariant violation
-                // With a Stale cache the comparison is untrustworthy → always
-                // refresh (this also keeps the cached BBO value correct mid-sweep).
-                let refresh = match bbo {
-                    BboCache::Stale => true,
-                    BboCache::Current => {
-                        if price > old_best_bid {
-                            return Err(perp_invariant_err(format!(
-                                "cancel: bid level {price} above cached best_bid \
-                                 {old_best_bid} (stale BBO cache tagged Current?)"
-                            )));
-                        }
-                        price == old_best_bid
-                    }
-                };
-                if refresh {
-                    let best_bid = storage::refresh_best_bid(context, market_id)?;
-                    if best_bid != old_best_bid {
-                        let best_ask = storage::load_best_ask(context, market_id)?;
-                        record_mid_price_sample_for_best_quote_change(
-                            context, market_id, best_bid, best_ask,
-                        )?;
-                    }
-                }
+            let best_bid = storage::refresh_best_bid(context, market_id)?;
+            if best_bid != old_best {
+                let best_ask = storage::load_best_ask(context, market_id)?;
+                record_mid_price_sample_for_best_quote_change(
+                    context, market_id, best_bid, best_ask,
+                )?;
             }
-            storage::save_bid_level(context, market_id, price, &queue)?;
         }
         Side::Sell => {
-            let old_best_ask = storage::load_best_ask(context, market_id)?;
-            let mut queue = storage::load_ask_level(context, market_id, price)?;
-            queue.retain(|id| id != order_id);
-            if queue.is_empty() {
-                storage::remove_ask_price(context, market_id, price)?;
-                // Mirror of the Buy arm. Asks sort ASC, so best_ask is the LOWEST:
-                // a resting ask is always >= best_ask, hence the orientation flips —
-                //   price == best_ask → top emptied → refresh
-                //   price >  best_ask → interior     → skip
-                //   price <  best_ask (or cache 0)   → impossible → invariant violation
-                let refresh = match bbo {
-                    BboCache::Stale => true,
-                    BboCache::Current => {
-                        if old_best_ask == 0 || price < old_best_ask {
-                            return Err(perp_invariant_err(format!(
-                                "cancel: ask level {price} below cached best_ask \
-                                 {old_best_ask} (stale BBO cache tagged Current?)"
-                            )));
-                        }
-                        price == old_best_ask
-                    }
-                };
-                if refresh {
-                    let best_ask = storage::refresh_best_ask(context, market_id)?;
-                    if best_ask != old_best_ask {
-                        let best_bid = storage::load_best_bid(context, market_id)?;
-                        record_mid_price_sample_for_best_quote_change(
-                            context, market_id, best_bid, best_ask,
-                        )?;
-                    }
-                }
+            let best_ask = storage::refresh_best_ask(context, market_id)?;
+            if best_ask != old_best {
+                let best_bid = storage::load_best_bid(context, market_id)?;
+                record_mid_price_sample_for_best_quote_change(
+                    context, market_id, best_bid, best_ask,
+                )?;
             }
-            storage::save_ask_level(context, market_id, price, &queue)?;
         }
+    }
+    Ok(())
+}
+
+/// Remove an order from the book on the **explicit cancel path**, where the
+/// best_bid/best_ask cache is live (no matching ran earlier in this call).
+///
+/// The best only moves when the TOP level empties, which — with a current cache —
+/// is provable from `price` vs the cached best, so an interior removal skips the
+/// refresh entirely (price-list reload + recompute + cache re-store + best_*_key
+/// commitment membership + mid-price sample are all pure waste there). Orientation
+/// is side-aware (bids sort DESC, asks ASC):
+///   - Buy:  price == best_bid → refresh; price <  best_bid → skip; price >  best_bid → invariant
+///   - Sell: price == best_ask → refresh; price >  best_ask → skip; price <  best_ask → invariant
+/// A removal "beyond" the cached best is impossible with a live cache, so it trips
+/// an invariant error (guards against a stale cache reaching this path).
+pub(super) fn remove_from_book_after_cancel<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    side: Side,
+    price: u64,
+    order_id: &[u8; 32],
+) -> Result<(), PrecompileError> {
+    let (emptied, old_best) = detach_order_from_level(context, market_id, side, price, order_id)?;
+    if !emptied {
+        return Ok(());
+    }
+    let top_emptied = match side {
+        Side::Buy => {
+            if price > old_best {
+                return Err(perp_invariant_err(format!(
+                    "cancel: bid level {price} above cached best_bid {old_best} \
+                     (stale BBO cache on the cancel path?)"
+                )));
+            }
+            price == old_best
+        }
+        Side::Sell => {
+            if old_best == 0 || price < old_best {
+                return Err(perp_invariant_err(format!(
+                    "cancel: ask level {price} below cached best_ask {old_best} \
+                     (stale BBO cache on the cancel path?)"
+                )));
+            }
+            price == old_best
+        }
+    };
+    if top_emptied {
+        refresh_best_and_sample(context, market_id, side, old_best)?;
+    }
+    Ok(())
+}
+
+/// Remove an order from the book on the **mid-matching auto-cancel path** (maker
+/// deficit / taker margin-cover inside match_order's sweep), where the
+/// best_bid/best_ask cache is deliberately stale — match_order defers its single
+/// refresh to after the sweep. The price-vs-cache test is untrustworthy here, so
+/// always recompute the best from the price list to keep the cached value correct.
+pub(super) fn remove_from_book_during_match<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    side: Side,
+    price: u64,
+    order_id: &[u8; 32],
+) -> Result<(), PrecompileError> {
+    let (emptied, old_best) = detach_order_from_level(context, market_id, side, price, order_id)?;
+    if emptied {
+        refresh_best_and_sample(context, market_id, side, old_best)?;
     }
     Ok(())
 }
