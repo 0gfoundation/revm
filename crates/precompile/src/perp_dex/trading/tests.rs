@@ -684,7 +684,11 @@ fn partial_fill_leaves_maker_partially_filled_in_book() {
 }
 
 #[test]
-fn maker_auto_expire_current_level_keeps_expired_status_and_clears_queue() {
+fn maker_fill_does_not_auto_expire_remaining_order_under_isolated_margin() {
+    // Under isolated margin a maker fill NEVER auto-cancels the maker's other/remaining
+    // orders — the old reserve-deficit auto-expire path is gone. BOB's partially-filled
+    // sell stays resting as PartiallyFilled even with a zero wallet (the close here is
+    // break-even: BOB closes his long at its entry price, so no bad debt is produced).
     let mut ctx = make_ctx();
     setup(&mut ctx);
 
@@ -708,15 +712,63 @@ fn maker_auto_expire_current_level_keeps_expired_status_and_clears_queue() {
     let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
     let maker = get_order(&mut ctx, sell_id);
-    assert_eq!(maker.status, OrderStatus::Expired);
+    assert_eq!(maker.status, OrderStatus::PartiallyFilled);
     assert_eq!(maker.filled, QTY);
     assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
-    assert!(!storage::load_ask_prices(&mut ctx, MARKET_ID)
+    // The remaining QTY of the maker's sell is NOT auto-expired — it stays resting.
+    assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
         .unwrap()
         .contains(&PRICE));
-    assert!(storage::load_ask_level(&mut ctx, MARKET_ID, PRICE)
+    assert!(!storage::load_ask_level(&mut ctx, MARKET_ID, PRICE)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn underwater_maker_close_routes_bad_debt_to_insurance_fund_not_wallet() {
+    // Isolated margin end-to-end: an underwater position closed via a maker fill sends
+    // its bad debt (loss beyond the position's margin) straight to the Insurance Fund;
+    // the maker's wallet is never debited.
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    storage::save_insurance_fund(&mut ctx, 10_000_000).unwrap();
+
+    // BOB: long QTY entered at 2*PRICE (v_quote = -2*FILL_VALUE) with only 500_000
+    // margin — deeply underwater at the current PRICE.
+    storage::save_position(
+        &mut ctx,
+        BOB,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -((FILL_VALUE * 2) as i64),
+            margin: 500_000,
+            leverage: 1,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+
+    // BOB rests a sell of QTY at PRICE (pure close → reserves nothing); ALICE buys it,
+    // closing BOB's long at PRICE — a loss of 1e6 against a 500k margin.
+    let _sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    let buy = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+    assert_eq!(get_order(&mut ctx, buy).status, OrderStatus::Filled);
+
+    // realised = margin_release(500k) + vq(-2e6) + close(+1e6) = -500k → bad debt 500k.
+    let bob = pos(&mut ctx, BOB);
+    assert_eq!(bob.amount, 0, "BOB flat");
+    assert_eq!(bob.margin, 0, "position margin fully consumed by the loss");
+    assert_eq!(
+        wallet(&mut ctx, BOB),
+        WALLET,
+        "isolated margin: the loss never debited BOB's wallet"
+    );
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        10_000_000 - 500_000,
+        "the 500k bad debt was absorbed by the Insurance Fund"
+    );
 }
 
 #[test]

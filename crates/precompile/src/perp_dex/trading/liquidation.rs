@@ -93,8 +93,9 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
 /// still holds the proportional `margin` and `v_quote_balance` for the residual. This
 /// function applies those to the wallet and zeroes the position.
 ///
-/// The wallet may go negative if the loss exceeds the remaining margin; the caller is
-/// responsible for routing any deficit to the Insurance Fund.
+/// Isolated margin: the loss is contained to the position's margin; any shortfall
+/// beyond it is bad debt routed directly to the Insurance Fund here. The wallet is
+/// never debited by the residual loss (only credited if the residual is solvent).
 pub(crate) fn settle_liquidation_residual_at_mark_price<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
@@ -128,7 +129,15 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<CTX: ContextTr>(
         .and_then(|v| v.checked_add(close_quote_delta))
         .ok_or_else(|| perp_err("liquidation: residual PnL overflow"))?;
 
-    account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(realized);
+    // Isolated margin: a profitable/solvent residual returns equity to the wallet; an
+    // insolvent residual (loss exceeds the position's remaining margin) does NOT debit
+    // the wallet — the shortfall is bad debt routed directly to the Insurance Fund.
+    let bad_debt = if realized >= 0 {
+        account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(realized);
+        0u64
+    } else {
+        realized.unsigned_abs()
+    };
 
     pos.amount = 0;
     pos.v_quote_balance = 0;
@@ -136,6 +145,8 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<CTX: ContextTr>(
 
     storage::save_position(context, user, market.market_id, &pos)?;
     storage::save_account(context, user, account)?;
+
+    super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
 
     Ok(())
 }

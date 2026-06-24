@@ -623,14 +623,17 @@ pub fn run_liquidate<CTX: ContextTr>(
         )?;
     }
 
-    // Solvent: deduct clearance fee from wallet and credit to Insurance Fund.
-    // Bankrupt: absorb deficit from Insurance Fund; excess becomes bad debt.
+    // Isolated margin: the position's loss (book leg + residual) was already contained
+    // to its margin and any bad debt routed directly to the Insurance Fund by the close
+    // paths (apply_position_fill / settle_liquidation_residual), so the wallet is never
+    // negative here. Charge the clearance fee from the liquidated user's remaining
+    // wallet (capped at the balance) and credit it to the Insurance Fund.
     let mut account = storage::load_account(context, args.user)?;
-    let clearance_fee = if account.perp_wallet_balance >= 0 {
+    let clearance_fee = {
         let fee = (pre_liq_margin as u128)
             .saturating_mul(market.liquidation_fee_rate_bps as u128)
             / 10_000;
-        let fee = (fee as u64).min(account.perp_wallet_balance as u64);
+        let fee = (fee as u64).min(account.perp_wallet_balance.max(0) as u64);
         if fee > 0 {
             account.debit_perp(fee)?;
             storage::save_account(context, args.user, account)?;
@@ -650,37 +653,6 @@ pub fn run_liquidate<CTX: ContextTr>(
             });
         }
         fee
-    } else {
-        let deficit = (-account.perp_wallet_balance) as u64;
-        let (absorbed, bad_debt) = storage::absorb_from_insurance_fund(context, deficit)?;
-        let new_if = storage::load_insurance_fund(context)?;
-        account.credit_perp(absorbed)?;
-        if bad_debt > 0 {
-            account.perp_wallet_balance = 0;
-        }
-        storage::save_account(context, args.user, account)?;
-        if absorbed > 0 {
-            let absorbed_i64 = checked_u64_to_i64(absorbed, "liquidate: IF absorption delta")?;
-            context.journal_mut().log(Log {
-                address: PERP_DEX_ADDRESS,
-                data: IPerpDex::InsuranceFundChanged {
-                    delta: -absorbed_i64,
-                    newBalance: new_if,
-                }
-                .to_log_data(),
-            });
-        }
-        if bad_debt > 0 {
-            context.journal_mut().log(Log {
-                address: PERP_DEX_ADDRESS,
-                data: IPerpDex::InsuranceFundDepleted {
-                    marketId: args.marketId,
-                    badDebt: bad_debt,
-                }
-                .to_log_data(),
-            });
-        }
-        0
     };
 
     context.journal_mut().log(Log {
