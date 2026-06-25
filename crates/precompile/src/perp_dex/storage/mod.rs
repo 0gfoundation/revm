@@ -524,6 +524,48 @@ pub fn save_sell_orders<CTX: ContextTr>(
     save_cached(context, user_sell_orders_key(user, market_id), &entries.to_vec())
 }
 
+/// In-place mutate the user's buy-order list (#21 靶子2): if it's already in the overlay, run `f`
+/// on the live `&mut Vec` (one undo snapshot, no load/store clone round-trip); otherwise load it
+/// (cache/cold) → run `f` → store as a deferred struct. `f`'s return value passes through (e.g. the
+/// recomputed reservation, computed inside the borrow so it sees the post-mutation list). The result
+/// is byte-identical to load→modify→`save_buy_orders` since the block-end ser fn is the same msgpack.
+pub fn mutate_buy_orders<CTX: ContextTr, R>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    f: impl FnOnce(&mut Vec<OrderEntry>) -> R,
+) -> Result<R, PrecompileError> {
+    let key = user_buy_orders_key(user, market_id);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(entries) = any.downcast_mut::<Vec<OrderEntry>>() {
+            return Ok(f(entries));
+        }
+    }
+    let mut entries: Vec<OrderEntry> = load_cached(context, key)?.unwrap_or_default();
+    let r = f(&mut entries);
+    save_cached(context, key, &entries)?;
+    Ok(r)
+}
+
+/// In-place mutate the user's sell-order list (#21 靶子2). See [`mutate_buy_orders`].
+pub fn mutate_sell_orders<CTX: ContextTr, R>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    f: impl FnOnce(&mut Vec<OrderEntry>) -> R,
+) -> Result<R, PrecompileError> {
+    let key = user_sell_orders_key(user, market_id);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(entries) = any.downcast_mut::<Vec<OrderEntry>>() {
+            return Ok(f(entries));
+        }
+    }
+    let mut entries: Vec<OrderEntry> = load_cached(context, key)?.unwrap_or_default();
+    let r = f(&mut entries);
+    save_cached(context, key, &entries)?;
+    Ok(r)
+}
+
 // ── Full Order struct ─────────────────────────────────────────────────────────
 
 pub fn load_order<CTX: ContextTr>(

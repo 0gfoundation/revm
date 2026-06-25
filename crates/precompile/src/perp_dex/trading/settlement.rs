@@ -757,84 +757,85 @@ fn reduce_maker_order_entry_for_fill<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
 ) -> Result<u64, PrecompileError> {
     match side {
-        Side::Buy => {
-            let mut entries = storage::load_buy_orders(context, user, market_id)?;
-            let released = match entries.iter_mut().find(|e| &e.order_id == order_id) {
-                Some(e) => {
-                    if e.amount < fill_qty {
-                        return Err(perp_invariant_err(format!(
-                            "buy entry for order {:?} has insufficient amount during fill update",
-                            order_id
-                        )));
+        // #21 靶子2: update the maker entry's remaining amount IN PLACE (no load/store clone).
+        Side::Buy => storage::mutate_buy_orders(
+            context,
+            user,
+            market_id,
+            |entries| -> Result<u64, PrecompileError> {
+                match entries.iter_mut().find(|e| &e.order_id == order_id) {
+                    Some(e) => {
+                        if e.amount < fill_qty {
+                            return Err(perp_invariant_err(format!(
+                                "buy entry for order {:?} has insufficient amount during fill update",
+                                order_id
+                            )));
+                        }
+                        let old_order_fee = calc_maker_fee_for_order_qty_with_bps(
+                            e.price,
+                            e.amount,
+                            e.maker_fee_bps,
+                            market,
+                        )?;
+                        e.amount = e.amount.saturating_sub(fill_qty);
+                        let new_order_fee = calc_maker_fee_for_order_qty_with_bps(
+                            e.price,
+                            e.amount,
+                            e.maker_fee_bps,
+                            market,
+                        )?;
+                        let fee_released = old_order_fee.saturating_sub(new_order_fee);
+                        if e.amount == 0 {
+                            entries.retain(|e| &e.order_id != order_id);
+                        }
+                        Ok(fee_released)
                     }
-                    let old_order_fee = calc_maker_fee_for_order_qty_with_bps(
-                        e.price,
-                        e.amount,
-                        e.maker_fee_bps,
-                        market,
-                    )?;
-                    e.amount = e.amount.saturating_sub(fill_qty);
-                    let new_order_fee = calc_maker_fee_for_order_qty_with_bps(
-                        e.price,
-                        e.amount,
-                        e.maker_fee_bps,
-                        market,
-                    )?;
-                    let fee_released = old_order_fee.saturating_sub(new_order_fee);
-                    if e.amount == 0 {
-                        entries.retain(|e| &e.order_id != order_id);
-                    }
-                    fee_released
-                }
-                None => {
-                    return Err(perp_invariant_err(format!(
+                    None => Err(perp_invariant_err(format!(
                         "buy entry for order {:?} not found during fill update",
                         order_id
-                    )))
+                    ))),
                 }
-            };
-            storage::save_buy_orders(context, user, market_id, &entries)?;
-            Ok(released)
-        }
-        Side::Sell => {
-            let mut entries = storage::load_sell_orders(context, user, market_id)?;
-            let released = match entries.iter_mut().find(|e| &e.order_id == order_id) {
-                Some(e) => {
-                    if e.amount < fill_qty {
-                        return Err(perp_invariant_err(format!(
-                            "sell entry for order {:?} has insufficient amount during fill update",
-                            order_id
-                        )));
+            },
+        )?,
+        Side::Sell => storage::mutate_sell_orders(
+            context,
+            user,
+            market_id,
+            |entries| -> Result<u64, PrecompileError> {
+                match entries.iter_mut().find(|e| &e.order_id == order_id) {
+                    Some(e) => {
+                        if e.amount < fill_qty {
+                            return Err(perp_invariant_err(format!(
+                                "sell entry for order {:?} has insufficient amount during fill update",
+                                order_id
+                            )));
+                        }
+                        let old_order_fee = calc_maker_fee_for_order_qty_with_bps(
+                            e.price,
+                            e.amount,
+                            e.maker_fee_bps,
+                            market,
+                        )?;
+                        e.amount = e.amount.saturating_sub(fill_qty);
+                        let new_order_fee = calc_maker_fee_for_order_qty_with_bps(
+                            e.price,
+                            e.amount,
+                            e.maker_fee_bps,
+                            market,
+                        )?;
+                        let fee_released = old_order_fee.saturating_sub(new_order_fee);
+                        if e.amount == 0 {
+                            entries.retain(|e| &e.order_id != order_id);
+                        }
+                        Ok(fee_released)
                     }
-                    let old_order_fee = calc_maker_fee_for_order_qty_with_bps(
-                        e.price,
-                        e.amount,
-                        e.maker_fee_bps,
-                        market,
-                    )?;
-                    e.amount = e.amount.saturating_sub(fill_qty);
-                    let new_order_fee = calc_maker_fee_for_order_qty_with_bps(
-                        e.price,
-                        e.amount,
-                        e.maker_fee_bps,
-                        market,
-                    )?;
-                    let fee_released = old_order_fee.saturating_sub(new_order_fee);
-                    if e.amount == 0 {
-                        entries.retain(|e| &e.order_id != order_id);
-                    }
-                    fee_released
-                }
-                None => {
-                    return Err(perp_invariant_err(format!(
+                    None => Err(perp_invariant_err(format!(
                         "sell entry for order {:?} not found during fill update",
                         order_id
-                    )))
+                    ))),
                 }
-            };
-            storage::save_sell_orders(context, user, market_id, &entries)?;
-            Ok(released)
-        }
+            },
+        )?,
     }
 }
 

@@ -1178,30 +1178,24 @@ fn rest_in_book<CTX: ContextTr>(
 
     match side {
         Side::Buy => {
-            // Insert the new entry into the user's buy-order list (sorted price DESC).
-            let mut entries = storage::load_buy_orders(context, user, market_id)?;
-            let idx = entries.partition_point(|e| e.price > price);
-            entries.insert(
-                idx,
-                OrderEntry {
-                    order_id: *order_id,
-                    price,
-                    amount: qty,
-                    maker_fee_bps,
-                },
-            );
-
-            // Recompute the flip-aware reservation from both sides of the book;
-            // the reservation fields are written by the single set_reservations
-            // source of truth below.
+            // #21 靶子2: insert into the user's buy-order list (sorted price DESC) IN PLACE and
+            // recompute the flip-aware reservation inside the borrow — no load/store clone of the
+            // list. The other side is loaded owned (the two-sided calc needs both).
             let sell_entries = storage::load_sell_orders(context, user, market_id)?;
-            let (new_buy_side_notional, sell_notional, c_notional) = calc_reservation_notionals(
-                &entries,
-                &sell_entries,
-                market.base_decimals,
-                market.price_decimals,
-                pos.amount,
-            )?;
+            let new_entry = OrderEntry {
+                order_id: *order_id,
+                price,
+                amount: qty,
+                maker_fee_bps,
+            };
+            let pos_amount = pos.amount;
+            let (bd, pd) = (market.base_decimals, market.price_decimals);
+            let (new_buy_side_notional, sell_notional, c_notional) =
+                storage::mutate_buy_orders(context, user, market_id, |entries| {
+                    let idx = entries.partition_point(|e| e.price > price);
+                    entries.insert(idx, new_entry);
+                    calc_reservation_notionals(entries, &sell_entries, bd, pd, pos_amount)
+                })??;
             let order_fee_reserved =
                 calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
             // Adding an order can only grow the buy-side notional (checked before
@@ -1234,8 +1228,8 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
-            // Persist order book state.
-            storage::save_buy_orders(context, user, market_id, &entries)?;
+            // Persist order book state. (#21: the buy-order list was mutated in place above — no
+            // save_buy_orders here.)
             storage::insert_bid_price(context, market_id, price)?;
             storage::push_bid_order(context, market_id, price, *order_id)?;
 
@@ -1248,30 +1242,23 @@ fn rest_in_book<CTX: ContextTr>(
             }
         }
         Side::Sell => {
-            // Insert the new entry into the user's sell-order list (sorted price ASC).
-            let mut entries = storage::load_sell_orders(context, user, market_id)?;
-            let idx = entries.partition_point(|e| e.price < price);
-            entries.insert(
-                idx,
-                OrderEntry {
-                    order_id: *order_id,
-                    price,
-                    amount: qty,
-                    maker_fee_bps,
-                },
-            );
-
-            // Recompute the flip-aware reservation from both sides of the book;
-            // the reservation fields are written by the single set_reservations
-            // source of truth below.
+            // #21 靶子2: insert into the user's sell-order list (sorted price ASC) IN PLACE and
+            // recompute the flip-aware reservation inside the borrow — no load/store clone.
             let buy_entries = storage::load_buy_orders(context, user, market_id)?;
-            let (buy_notional, new_sell_side_notional, c_notional) = calc_reservation_notionals(
-                &buy_entries,
-                &entries,
-                market.base_decimals,
-                market.price_decimals,
-                pos.amount,
-            )?;
+            let new_entry = OrderEntry {
+                order_id: *order_id,
+                price,
+                amount: qty,
+                maker_fee_bps,
+            };
+            let pos_amount = pos.amount;
+            let (bd, pd) = (market.base_decimals, market.price_decimals);
+            let (buy_notional, new_sell_side_notional, c_notional) =
+                storage::mutate_sell_orders(context, user, market_id, |entries| {
+                    let idx = entries.partition_point(|e| e.price < price);
+                    entries.insert(idx, new_entry);
+                    calc_reservation_notionals(&buy_entries, entries, bd, pd, pos_amount)
+                })??;
             let order_fee_reserved =
                 calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
             // Adding an order can only grow the sell-side notional (checked before
@@ -1304,8 +1291,7 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
-            // Persist order book state.
-            storage::save_sell_orders(context, user, market_id, &entries)?;
+            // Persist order book state. (#21: the sell-order list was mutated in place above.)
             storage::insert_ask_price(context, market_id, price)?;
             storage::push_ask_order(context, market_id, price, *order_id)?;
 
@@ -1538,20 +1524,25 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
             // Flip-aware reservation snapshot before removal (pos.margin_reserved,
             // not the per-side max — the per-side fields lag it under the model).
             let old_reserved = pos.margin_reserved;
-            let mut entries = storage::load_buy_orders(context, user, market_id)?;
             // The book entry's `amount` is the authoritative remaining quantity
             // (kept current by reduce_maker_order_entry_for_fill); the order's
             // `filled` can lag it during the same matching round, so the release
             // is sized from the entry, not from order.quantity - order.filled.
-            let cancelled_entry = remove_order_entry(&mut entries, order_id, "buy")?;
+            // #21 靶子2: remove + recompute IN PLACE (no load/store clone of the list).
             let sell_entries = storage::load_sell_orders(context, user, market_id)?;
-            let (new_notional, sell_notional, c_notional) = calc_reservation_notionals(
-                &entries,
-                &sell_entries,
-                market.base_decimals,
-                market.price_decimals,
-                pos.amount,
-            )?;
+            let pos_amount = pos.amount;
+            let (bd, pd) = (market.base_decimals, market.price_decimals);
+            let (cancelled_entry, (new_notional, sell_notional, c_notional)) = storage::mutate_buy_orders(
+                context,
+                user,
+                market_id,
+                |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
+                    let cancelled = remove_order_entry(entries, order_id, "buy")?;
+                    let notionals =
+                        calc_reservation_notionals(entries, &sell_entries, bd, pd, pos_amount)?;
+                    Ok((cancelled, notionals))
+                },
+            )??;
             let leverage = pos.leverage;
             pos.set_reservations(new_notional, sell_notional, c_notional, leverage);
             let new_reserved = pos.margin_reserved;
@@ -1575,26 +1566,27 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                     "fee_reserved {prev_fee} < fee to release {fee_freed}"
                 ))
             })?;
-            storage::save_buy_orders(context, user, market_id, &entries)?;
+            // #21: buy-order list mutated in place above — no save here.
         }
         Side::Sell => {
             // Flip-aware reservation snapshot before removal (pos.margin_reserved,
             // not the per-side max — the per-side fields lag it under the model).
             let old_reserved = pos.margin_reserved;
-            let mut entries = storage::load_sell_orders(context, user, market_id)?;
-            // The book entry's `amount` is the authoritative remaining quantity
-            // (kept current by reduce_maker_order_entry_for_fill); the order's
-            // `filled` can lag it during the same matching round, so the release
-            // is sized from the entry, not from order.quantity - order.filled.
-            let cancelled_entry = remove_order_entry(&mut entries, order_id, "sell")?;
+            // #21 靶子2: remove + recompute IN PLACE (no load/store clone of the list).
             let buy_entries = storage::load_buy_orders(context, user, market_id)?;
-            let (buy_notional, new_notional, c_notional) = calc_reservation_notionals(
-                &buy_entries,
-                &entries,
-                market.base_decimals,
-                market.price_decimals,
-                pos.amount,
-            )?;
+            let pos_amount = pos.amount;
+            let (bd, pd) = (market.base_decimals, market.price_decimals);
+            let (cancelled_entry, (buy_notional, new_notional, c_notional)) = storage::mutate_sell_orders(
+                context,
+                user,
+                market_id,
+                |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
+                    let cancelled = remove_order_entry(entries, order_id, "sell")?;
+                    let notionals =
+                        calc_reservation_notionals(&buy_entries, entries, bd, pd, pos_amount)?;
+                    Ok((cancelled, notionals))
+                },
+            )??;
             let leverage = pos.leverage;
             pos.set_reservations(buy_notional, new_notional, c_notional, leverage);
             let new_reserved = pos.margin_reserved;
@@ -1618,7 +1610,7 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
                     "fee_reserved {prev_fee} < fee to release {fee_freed}"
                 ))
             })?;
-            storage::save_sell_orders(context, user, market_id, &entries)?;
+            // #21: sell-order list mutated in place above — no save here.
         }
     }
 
