@@ -684,22 +684,58 @@ fn unpack_order_ids(buf: &[u8]) -> Result<Vec<[u8; 32]>, PrecompileError> {
         .collect())
 }
 
+/// Block-end serializer for a level FIFO held as a deferred `Struct` (#21): produces the SAME raw
+/// packed bytes as the old `store_blob(pack_order_ids(..))` path, so the off-trie blob (and the
+/// commitment) is byte-identical — only the serialization timing moves to block end.
+fn ser_level(v: &dyn core::any::Any) -> Vec<u8> {
+    pack_order_ids(
+        v.downcast_ref::<Vec<[u8; 32]>>()
+            .expect("perp ser_level: level-queue type mismatch (bug)"),
+    )
+}
+
+/// Clones a deferred level-FIFO `Struct` (keeps the journal overlay `Clone`).
+fn clone_level(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
+    std::boxed::Box::new(
+        v.downcast_ref::<Vec<[u8; 32]>>()
+            .expect("perp clone_level: level-queue type mismatch (bug)")
+            .clone(),
+    )
+}
+
+/// Reads a bid level FIFO. #21: the queue lives in the overlay as a deferred `Struct`
+/// (`Vec<[u8;32]>`) — read it directly (clone the live Vec, no serialize→unpack round-trip);
+/// otherwise fall back to the committed byte store (cold read + unpack).
 pub fn load_bid_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    let buf = load_blob(context, bid_level_key(market_id, price))?;
+    let key = bid_level_key(market_id, price);
+    if let Some(any) = context.journal_mut().perp_get_struct(key) {
+        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
+            return Ok(q.clone());
+        }
+    }
+    let buf = load_blob(context, key)?;
     unpack_order_ids(&buf)
 }
 
+/// Writes a bid level FIFO. #21: stores the `Vec` as a deferred `Struct` (packed ONCE at block end
+/// by [`ser_level`]) instead of re-packing the whole blob per op — byte-identical final bytes.
 pub fn save_bid_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
     queue: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    store_blob(context, bid_level_key(market_id, price), &pack_order_ids(queue))
+    context.journal_mut().perp_store_struct(
+        bid_level_key(market_id, price),
+        std::boxed::Box::new(queue.to_vec()),
+        ser_level,
+        clone_level,
+    );
+    Ok(())
 }
 
 pub fn load_ask_level<CTX: ContextTr>(
@@ -707,7 +743,13 @@ pub fn load_ask_level<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    let buf = load_blob(context, ask_level_key(market_id, price))?;
+    let key = ask_level_key(market_id, price);
+    if let Some(any) = context.journal_mut().perp_get_struct(key) {
+        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
+            return Ok(q.clone());
+        }
+    }
+    let buf = load_blob(context, key)?;
     unpack_order_ids(&buf)
 }
 
@@ -717,7 +759,13 @@ pub fn save_ask_level<CTX: ContextTr>(
     price: u64,
     queue: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    store_blob(context, ask_level_key(market_id, price), &pack_order_ids(queue))
+    context.journal_mut().perp_store_struct(
+        ask_level_key(market_id, price),
+        std::boxed::Box::new(queue.to_vec()),
+        ser_level,
+        clone_level,
+    );
+    Ok(())
 }
 
 // ── Order book helpers ────────────────────────────────────────────────────────
@@ -774,25 +822,41 @@ pub fn remove_ask_price<CTX: ContextTr>(
     save_ask_prices(context, market_id, &prices)
 }
 
-/// Append `order_id` to the FIFO queue at the given bid price level.
+/// Append `order_id` to the FIFO queue at the given bid price level. #21: if the level is already
+/// in the overlay, append IN PLACE (one undo snapshot, no load/store clone round-trip); otherwise
+/// materialize it once (committed bytes / absent) and store as a deferred `Struct`.
 pub fn push_bid_order<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
+    let key = bid_level_key(market_id, price);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
+            q.push(order_id);
+            return Ok(());
+        }
+    }
     let mut queue = load_bid_level(context, market_id, price)?;
     queue.push(order_id);
     save_bid_level(context, market_id, price, &queue)
 }
 
-/// Append `order_id` to the FIFO queue at the given ask price level.
+/// Append `order_id` to the FIFO queue at the given ask price level. See [`push_bid_order`].
 pub fn push_ask_order<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
+    let key = ask_level_key(market_id, price);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
+            q.push(order_id);
+            return Ok(());
+        }
+    }
     let mut queue = load_ask_level(context, market_id, price)?;
     queue.push(order_id);
     save_ask_level(context, market_id, price, &queue)
