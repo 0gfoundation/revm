@@ -342,6 +342,11 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
+        self.inner.perp_get_struct_mut(key)
+    }
+
+    #[inline]
     fn perp_cache_get(&mut self, key: B256) -> Option<&dyn core::any::Any> {
         self.inner.perp_cache_get(key)
     }

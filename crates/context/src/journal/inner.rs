@@ -169,6 +169,37 @@ impl PerpSection {
         }
     }
 
+    /// Mutable handle into a deferred `Struct` overlay value for IN-PLACE mutation (catalog #21):
+    /// snapshots the current value into the undo log ONCE (so a mid-tx revert restores it), then
+    /// returns `&mut dyn Any` for the caller to downcast + mutate the live struct directly — avoiding
+    /// the load(clone)→modify→store(clone) round-trip. `None` if the key is absent or was written as
+    /// raw `Bytes` (the caller falls back to load + `store_struct`). Each call records one undo
+    /// snapshot (a clone), so callers fetch the handle ONCE per logical mutation, not in a loop.
+    #[inline]
+    fn get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
+        // Snapshot the pre-mutation value for revert (clone via the entry's clone fn-ptr). The
+        // immutable borrow ends with `snapshot`; only `Struct` entries can be mutated in place.
+        let snapshot = match self.working.get(&key) {
+            Some(PerpEntry::Struct { val, ser, clone }) => PerpEntry::Struct {
+                val: clone(val.as_ref()),
+                ser: *ser,
+                clone: *clone,
+            },
+            _ => return None,
+        };
+        self.undo.push(PerpUndo {
+            key,
+            prev: Some(snapshot),
+        });
+        // The struct is about to change in place; drop any stale deser-cache entry (mirrors `store_*`).
+        self.cache.remove(key);
+        match self.working.get_mut(&key) {
+            Some(PerpEntry::Struct { val, .. }) => Some(val.as_mut()),
+            // Unreachable: matched `Struct` above and `working` was not touched since.
+            _ => None,
+        }
+    }
+
     /// Writes raw `Bytes` (byte-path writers, e.g. `store_blob`), recording the prior entry (moved
     /// out by `insert`) for revert.
     #[inline]
@@ -354,6 +385,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn perp_get_struct(&self, key: B256) -> Option<&dyn core::any::Any> {
         self.perp.get_struct(key)
+    }
+
+    /// Mutable handle into a deferred `Struct` overlay value for in-place mutation (catalog #21);
+    /// snapshots the prior value for revert. `None` if absent or stored as raw bytes.
+    #[inline]
+    pub fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
+        self.perp.get_struct_mut(key)
     }
 
     /// Reads the block-scoped deserialized PerpDEX blob cache (catalog #14; type-erased).
@@ -1372,6 +1410,30 @@ mod perp_tests {
         // The struct write is move-undone in lock-step with the byte path.
         assert!(j.perp_get_struct(k(1)).is_none());
         assert_eq!(j.perp_get_overlay(k(1)), None);
+    }
+
+    #[test]
+    fn perp_get_struct_mut_mutates_in_place_and_reverts() {
+        let mut j = new_inner();
+        // Seed a struct committed BEFORE the checkpoint (the revert baseline).
+        j.perp_store_struct(k(1), std::boxed::Box::new(10u32), ser_u32, clone_u32);
+        j.commit_tx(); // working keeps the struct; undo spent.
+
+        let cp = j.checkpoint();
+        // In-place mutation via the &mut handle — no load/store round-trip, one undo snapshot.
+        *j.perp_get_struct_mut(k(1)).unwrap().downcast_mut::<u32>().unwrap() = 99;
+        assert_eq!(j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&99u32));
+        // Block-end serialization would carry the mutated value.
+        assert_eq!(j.perp_get_overlay(k(1)), Some(99u32.to_le_bytes().to_vec()));
+
+        // Revert restores the pre-mutation value (snapshot-on-mutate undo).
+        j.checkpoint_revert(cp);
+        assert_eq!(j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&10u32));
+
+        // Absent and raw-`Bytes` keys cannot be mutated in place.
+        assert!(j.perp_get_struct_mut(k(2)).is_none());
+        j.perp_store(k(3), vec![1, 2, 3]);
+        assert!(j.perp_get_struct_mut(k(3)).is_none());
     }
 
     #[test]

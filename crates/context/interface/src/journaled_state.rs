@@ -270,6 +270,15 @@ pub trait JournalTr {
         None
     }
 
+    /// Mutable handle into a deferred `Struct` off-trie overlay value for IN-PLACE mutation
+    /// (catalog #21): the caller downcasts to `&mut T` and mutates the live struct, avoiding the
+    /// load(clone)→modify→store(clone) round-trip. The backend snapshots the prior value into its
+    /// revert log first. `None` if absent or written as raw bytes. Default backend returns `None`.
+    fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
+        let _ = key;
+        None
+    }
+
     /// Reads the block-scoped deserialized off-trie blob cache (catalog #14): a per-block
     /// accelerator that lets the precompile skip re-deserializing a blob it already decoded this
     /// block. Type-erased (this crate does not know the blob types); the caller downcasts and
