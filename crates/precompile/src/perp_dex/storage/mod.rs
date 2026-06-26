@@ -745,22 +745,48 @@ fn clone_level(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
     )
 }
 
-/// Reads a bid level FIFO. #21: the queue lives in the overlay as a deferred `Struct`
-/// (`Vec<[u8;32]>`) — read it directly (clone the live Vec, no serialize→unpack round-trip);
-/// otherwise fall back to the committed byte store (cold read + unpack).
-pub fn load_bid_level<CTX: ContextTr>(
+/// Reads a level FIFO queue. #21: if the queue is in the overlay as a deferred `Struct`
+/// (`Vec<[u8;32]>`), clone it directly (no serialize→unpack round-trip). Otherwise consult the
+/// #14 cold-read cache, then fall back to the committed byte store (cold read + unpack) and cache
+/// the unpacked queue.
+///
+/// Caching the read collapses repeated reads of a level only READ (not yet written) this block —
+/// e.g. the FOK feasibility pre-scan followed by the match pass re-reading the same levels — from
+/// a re-fetch + re-unpack down to a clone. Safe: the write-overlay (`perp_get_struct`) is checked
+/// FIRST and shadows this entry; `store` invalidates the cache per-key; a revert clears the whole
+/// cache; and the cache is excluded from the block delta, so it can never affect the commitment.
+fn load_level_cached<CTX: ContextTr>(
     context: &mut CTX,
-    market_id: u64,
-    price: u64,
+    key: B256,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    let key = bid_level_key(market_id, price);
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
         if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
             return Ok(q.clone());
         }
     }
+    if let Some(any) = context.journal_mut().perp_cache_get(key) {
+        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
+            return Ok(q.clone());
+        }
+    }
     let buf = load_blob(context, key)?;
-    unpack_order_ids(&buf)
+    if buf.is_empty() {
+        return Ok(Vec::new());
+    }
+    let queue = unpack_order_ids(&buf)?;
+    context
+        .journal_mut()
+        .perp_cache_put(key, std::boxed::Box::new(queue.clone()));
+    Ok(queue)
+}
+
+/// Reads a bid level FIFO.
+pub fn load_bid_level<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<Vec<[u8; 32]>, PrecompileError> {
+    load_level_cached(context, bid_level_key(market_id, price))
 }
 
 /// Writes a bid level FIFO. #21: stores the `Vec` as a deferred `Struct` (packed ONCE at block end
@@ -780,19 +806,13 @@ pub fn save_bid_level<CTX: ContextTr>(
     Ok(())
 }
 
+/// Reads an ask level FIFO.
 pub fn load_ask_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    let key = ask_level_key(market_id, price);
-    if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
-            return Ok(q.clone());
-        }
-    }
-    let buf = load_blob(context, key)?;
-    unpack_order_ids(&buf)
+    load_level_cached(context, ask_level_key(market_id, price))
 }
 
 pub fn save_ask_level<CTX: ContextTr>(
