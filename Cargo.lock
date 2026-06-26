@@ -3866,6 +3866,7 @@ version = "9.1.0"
 dependencies = [
  "bitvec",
  "cfg-if",
+ "dashmap",
  "derive-where",
  "revm-bytecode",
  "revm-context-interface",

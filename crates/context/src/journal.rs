@@ -4,6 +4,9 @@
 //! and inner submodule contains [`JournalInner`] struct that contains state.
 pub mod entry;
 pub mod inner;
+/// Concurrent off-trie PerpDEX overlay substrate for parallel block execution (#21 spike).
+#[cfg(feature = "perp-parallel")]
+pub mod shared_perp;
 pub mod warm_addresses;
 
 pub use entry::{JournalEntry, JournalEntryTr};

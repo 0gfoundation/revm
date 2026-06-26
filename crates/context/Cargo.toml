@@ -32,6 +32,8 @@ bitvec.workspace = true
 
 # Optional
 serde = { workspace = true, features = ["derive", "rc"], optional = true }
+# Concurrent overlay map for the off-by-default parallel PerpDEX substrate (#21 spike).
+dashmap = { version = "6", optional = true }
 
 [dev-dependencies]
 database.workspace = true
@@ -81,4 +83,4 @@ optional_fee_charge = []
 # 0G PerpDEX parallel execution (catalog #21 spike, branch perpdex-parallel). Off by default.
 # Gates the off-trie `SharedPerpBook` concurrent substrate + per-txn write-set rollback that
 # the parallel block driver builds on. When off, the serial PerpSection path is byte-identical.
-perp-parallel = []
+perp-parallel = ["dep:dashmap"]
