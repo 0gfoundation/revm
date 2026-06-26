@@ -350,6 +350,116 @@ pub fn calc_sell_side_reserved_notional(
     Ok(reserved_notional)
 }
 
+/// One step of the cover→open scan, shared by the single and dual notional fns: subtract this
+/// order's `amount` from the remaining-to-cover, returning the amount of THIS order that opens
+/// (0 while still covering; the overflow at the boundary; the full amount once past). Matches the
+/// per-entry logic in [`calc_buy_side_reserved_notional`] exactly.
+#[inline]
+fn open_amount(remaining: &mut i64, amount: i64) -> Result<i64, PrecompileError> {
+    *remaining = remaining
+        .checked_sub(amount)
+        .ok_or_else(|| perp_err("math: cover remaining overflow"))?;
+    if *remaining <= 0 {
+        let open = remaining
+            .checked_neg()
+            .ok_or_else(|| perp_err("math: net open overflow"))?;
+        *remaining = 0;
+        Ok(open)
+    } else {
+        Ok(0)
+    }
+}
+
+/// Buy-side opening notional at TWO positions in a single DESC pass (#21 靶子3): returns
+/// `(B(position_a), B(position_b), total_buy_qty)`. Each value is byte-identical to a separate
+/// [`calc_buy_side_reserved_notional`] call — but when an order opens the SAME amount for both
+/// covers (the common deep-open case), `calc_value` is computed once and added to both, halving the
+/// expensive notional math vs two scans. The total order qty is summed in the same pass (free),
+/// removing a separate sum pass.
+pub fn calc_buy_side_dual(
+    buy_entries: &[OrderEntry],
+    base_decimals: u32,
+    price_decimals: u32,
+    position_a: i64,
+    position_b: i64,
+) -> Result<(u64, u64, i64), PrecompileError> {
+    let mut rem_a = if position_a >= 0 {
+        0i64
+    } else {
+        position_a.checked_neg().ok_or_else(|| perp_err("math: position amount overflow"))?
+    };
+    let mut rem_b = if position_b >= 0 {
+        0i64
+    } else {
+        position_b.checked_neg().ok_or_else(|| perp_err("math: position amount overflow"))?
+    };
+    let mut res_a = 0u64;
+    let mut res_b = 0u64;
+    let mut total = 0u64;
+    for e in buy_entries {
+        total = total.checked_add(e.amount).ok_or_else(|| perp_err("math: total buy order amount"))?;
+        let amount = checked_u64_to_i64(e.amount, "math: buy order amount")?;
+        let open_a = open_amount(&mut rem_a, amount)?;
+        let open_b = open_amount(&mut rem_b, amount)?;
+        if open_a == open_b {
+            if open_a > 0 {
+                let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
+                res_a = res_a.checked_add(v).ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
+                res_b = res_b.checked_add(v).ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
+            }
+        } else {
+            if open_a > 0 {
+                let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
+                res_a = res_a.checked_add(v).ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
+            }
+            if open_b > 0 {
+                let v = calc_value(e.price, open_b as u64, base_decimals, price_decimals)?;
+                res_b = res_b.checked_add(v).ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
+            }
+        }
+    }
+    Ok((res_a, res_b, checked_u64_to_i64(total, "math: total buy order amount")?))
+}
+
+/// Sell-side opening notional at TWO positions in a single ASC pass (#21 靶子3); see
+/// [`calc_buy_side_dual`]. Returns `(S(position_a), S(position_b), total_sell_qty)`.
+pub fn calc_sell_side_dual(
+    sell_entries: &[OrderEntry],
+    base_decimals: u32,
+    price_decimals: u32,
+    position_a: i64,
+    position_b: i64,
+) -> Result<(u64, u64, i64), PrecompileError> {
+    let mut rem_a = if position_a <= 0 { 0i64 } else { position_a };
+    let mut rem_b = if position_b <= 0 { 0i64 } else { position_b };
+    let mut res_a = 0u64;
+    let mut res_b = 0u64;
+    let mut total = 0u64;
+    for e in sell_entries {
+        total = total.checked_add(e.amount).ok_or_else(|| perp_err("math: total sell order amount"))?;
+        let amount = checked_u64_to_i64(e.amount, "math: sell order amount")?;
+        let open_a = open_amount(&mut rem_a, amount)?;
+        let open_b = open_amount(&mut rem_b, amount)?;
+        if open_a == open_b {
+            if open_a > 0 {
+                let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
+                res_a = res_a.checked_add(v).ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
+                res_b = res_b.checked_add(v).ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
+            }
+        } else {
+            if open_a > 0 {
+                let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
+                res_a = res_a.checked_add(v).ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
+            }
+            if open_b > 0 {
+                let v = calc_value(e.price, open_b as u64, base_decimals, price_decimals)?;
+                res_b = res_b.checked_add(v).ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
+            }
+        }
+    }
+    Ok((res_a, res_b, checked_u64_to_i64(total, "math: total sell order amount")?))
+}
+
 /// Flip-aware worst-case reservation notional for a user's resting book.
 ///
 /// Returns `(buy_notional B, sell_notional S, c_notional)` where:
@@ -380,26 +490,21 @@ pub fn calc_reservation_notionals(
     price_decimals: u32,
     position_amount: i64,
 ) -> Result<(u64, u64, u64), PrecompileError> {
-    let buy_notional =
-        calc_buy_side_reserved_notional(buy_entries, base_decimals, price_decimals, position_amount)?;
-    let sell_notional = calc_sell_side_reserved_notional(
-        sell_entries,
-        base_decimals,
-        price_decimals,
-        position_amount,
-    )?;
-
-    let total_buy_qty = total_entry_amount(buy_entries, "math: total buy order amount")?;
+    // #21 靶子3: compute all four opening notionals in THREE passes instead of six. The buy leg
+    // needs the post-all-sells position (max-short), so total_sell_qty comes first (one cheap sum
+    // pass); the buy dual then yields B + B' AND total_buy_qty in one pass; the sell dual yields
+    // S + S' (it needs the post-all-buys position from total_buy_qty). Each value is byte-identical
+    // to the old separate calc_*_reserved_notional calls (gated by the dual_matches_separate test).
     let total_sell_qty = total_entry_amount(sell_entries, "math: total sell order amount")?;
-
     // Position after every sell fills → most short; surviving buys re-open from there.
     let position_after_sells = position_amount
         .checked_sub(total_sell_qty)
         .ok_or_else(|| perp_err("math: flip-short position overflow"))?;
-    let buy_flip_notional = calc_buy_side_reserved_notional(
+    let (buy_notional, buy_flip_notional, total_buy_qty) = calc_buy_side_dual(
         buy_entries,
         base_decimals,
         price_decimals,
+        position_amount,
         position_after_sells,
     )?;
 
@@ -407,10 +512,11 @@ pub fn calc_reservation_notionals(
     let position_after_buys = position_amount
         .checked_add(total_buy_qty)
         .ok_or_else(|| perp_err("math: flip-long position overflow"))?;
-    let sell_flip_notional = calc_sell_side_reserved_notional(
+    let (sell_notional, sell_flip_notional, _) = calc_sell_side_dual(
         sell_entries,
         base_decimals,
         price_decimals,
+        position_amount,
         position_after_buys,
     )?;
 
@@ -445,6 +551,51 @@ mod reservation_notional_tests {
             price,
             amount,
             maker_fee_bps: 0,
+        }
+    }
+
+    // Deterministic xorshift PRNG (no std rng in the precompile crate).
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// #21 靶子3 GATE: the dual-cover scans must be byte-identical to two separate single-cover
+    /// scans (so `calc_reservation_notionals` stays byte-identical → commitment unchanged). Fuzzed
+    /// over random two-sided books + positions, using the SAME (position, position-after-flip)
+    /// covers `calc_reservation_notionals` feeds them.
+    #[test]
+    fn dual_matches_separate_scans() {
+        let mut s: u64 = 0x9e3779b97f4a7c15;
+        let bd = 4u32;
+        let pd = 2u32;
+        for _ in 0..5000 {
+            let nb = (next(&mut s) % 6) as usize;
+            let ns = (next(&mut s) % 6) as usize;
+            let mut buys: Vec<OrderEntry> =
+                (0..nb).map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1)).collect();
+            buys.sort_by(|a, b| b.price.cmp(&a.price)); // DESC
+            let mut sells: Vec<OrderEntry> =
+                (0..ns).map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1)).collect();
+            sells.sort_by(|a, b| a.price.cmp(&b.price)); // ASC
+            let p = (next(&mut s) % 400) as i64 - 200;
+
+            let total_buy: i64 = buys.iter().map(|e| e.amount as i64).sum();
+            let total_sell: i64 = sells.iter().map(|e| e.amount as i64).sum();
+            let pos_after_sells = p - total_sell;
+            let pos_after_buys = p + total_buy;
+
+            let (ba, bb, tb) = calc_buy_side_dual(&buys, bd, pd, p, pos_after_sells).unwrap();
+            assert_eq!(ba, calc_buy_side_reserved_notional(&buys, bd, pd, p).unwrap());
+            assert_eq!(bb, calc_buy_side_reserved_notional(&buys, bd, pd, pos_after_sells).unwrap());
+            assert_eq!(tb, total_buy);
+
+            let (sa, sb, ts) = calc_sell_side_dual(&sells, bd, pd, p, pos_after_buys).unwrap();
+            assert_eq!(sa, calc_sell_side_reserved_notional(&sells, bd, pd, p).unwrap());
+            assert_eq!(sb, calc_sell_side_reserved_notional(&sells, bd, pd, pos_after_buys).unwrap());
+            assert_eq!(ts, total_sell);
         }
     }
 
