@@ -77,3 +77,8 @@ optional_eip3607 = []
 optional_no_base_fee = []
 optional_priority_fee_check = []
 optional_fee_charge = []
+
+# 0G PerpDEX parallel execution (catalog #21 spike, branch perpdex-parallel). Off by default.
+# Gates the off-trie `SharedPerpBook` concurrent substrate + per-txn write-set rollback that
+# the parallel block driver builds on. When off, the serial PerpSection path is byte-identical.
+perp-parallel = []

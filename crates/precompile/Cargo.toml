@@ -149,6 +149,11 @@ bn = ["dep:bn"]
 # It is faster library but licences as GPL code, if enabled please make sure to follow the license.
 gmp = ["dep:rug"]
 
+# 0G PerpDEX parallel execution (catalog #21 spike, branch perpdex-parallel). Off by default.
+# Gates the parallel routing of perp_dex reads/writes through the `SharedPerpBook` substrate.
+# Propagates to the context crate where the substrate lives.
+perp-parallel = ["context/perp-parallel"]
+
 [[bench]]
 name = "bench"
 path = "bench/main.rs"
