@@ -385,6 +385,67 @@ where
     })
 }
 
+/// Barrier step (end of a parallel batch / step-3d phase boundary): restore deterministic FIFO
+/// time-priority. During the batch, this block's inserts were appended to each level in racy
+/// arrival order; here — serially, after all inserts have landed and BEFORE any match reads a level
+/// — we re-sort each touched level's THIS-BLOCK entries by `ticket` (= block-local txn_id order),
+/// leaving prior-block entries (already consensus-frozen) in place at the front. The `ticket` is a
+/// transient sort key; the committed FIFO stays `Vec<order_id>` (no format change). Idempotent:
+/// levels already in order are skipped.
+pub fn finalize_place_batch_ordering<CTX, F>(
+    book: &Arc<SharedPerpBook>,
+    items: &[PlaceWork],
+    results: &[Result<PlaceOutcome, PrecompileError>],
+    make_ctx: F,
+) -> Result<(), PrecompileError>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX,
+{
+    use std::collections::HashMap;
+    // (side, market, price) -> { order_id -> ticket } for this block's executed (rested) places.
+    let mut levels: HashMap<(u8, u64, u64), HashMap<[u8; 32], u64>> = HashMap::new();
+    for (item, res) in items.iter().zip(results) {
+        if matches!(res, Ok(PlaceOutcome::Executed)) {
+            levels
+                .entry((item.side, item.market_id, item.price))
+                .or_default()
+                .insert(item.order_id, item.ticket);
+        }
+    }
+    if levels.is_empty() {
+        return Ok(());
+    }
+    let mut ctx = make_ctx(book.clone());
+    for ((side, market, price), tickets) in levels {
+        let fifo = if side == 0 {
+            storage::load_bid_level(&mut ctx, market, price)?
+        } else {
+            storage::load_ask_level(&mut ctx, market, price)?
+        };
+        // Split: prior-block entries (keep order) ++ this-block entries (re-sort by ticket).
+        let mut prior: Vec<[u8; 32]> = Vec::new();
+        let mut this_block: Vec<[u8; 32]> = Vec::new();
+        for oid in &fifo {
+            if tickets.contains_key(oid) {
+                this_block.push(*oid);
+            } else {
+                prior.push(*oid);
+            }
+        }
+        this_block.sort_by_key(|oid| tickets[oid]);
+        prior.extend(this_block);
+        if prior != fifo {
+            if side == 0 {
+                storage::save_bid_level(&mut ctx, market, price, &prior)?;
+            } else {
+                storage::save_ask_level(&mut ctx, market, price, &prior)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod driver_tests {
     use crate::perp_dex::types::Market;
@@ -484,17 +545,27 @@ mod driver_tests {
         }
     }
 
-    /// THE step-3c gate: a batch of non-crossing places run in parallel produces a book delta
-    /// byte-identical to running the same ops serially in txn_id order. Mixes movers (A@100, A@101),
-    /// a non-mover (B@99), same-account ordering (A's two orders, rank 0 then 1), and two accounts.
+    fn make_slot(bk: Arc<SharedPerpBook>) -> TestCtx {
+        let mut c: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        c.journal_mut().set_perp_shared(bk);
+        c
+    }
+
+    /// THE step-3c gate: a batch of non-crossing places run in parallel + the barrier-sort produces
+    /// a book delta byte-identical to the same ops run serially in txn_id order. Crucially includes
+    /// TWO non-movers at the SAME non-best price (B@99, C@99): their FIFO append order is racy in the
+    /// parallel phase and is corrected to ticket (txn_id) order by `finalize_place_batch_ordering`.
+    /// Also: a mover (A@100), same-account ordering (a's two orders A@100 rank 0, C@99 rank 1), and
+    /// three makers.
     #[test]
     fn parallel_place_batch_matches_serial_delta() {
         let a = user_addr(1);
         let b = user_addr(2);
+        // A@100 (a, mover), B@99 (b), C@99 (a's 2nd) — B and C share level 99.
         let items = vec![
             mk_work(a, [1u8; 32], 100 * TICK, 0, 0),
             mk_work(b, [2u8; 32], 99 * TICK, 0, 1),
-            mk_work(a, [3u8; 32], 101 * TICK, 1, 2),
+            mk_work(a, [3u8; 32], 99 * TICK, 1, 2),
         ];
 
         // Serial reference: place_order_core in txn_id (ticket) order against a PerpSection ctx.
@@ -517,24 +588,16 @@ mod driver_tests {
         }
         let serial_delta = serial.journal_mut().take_perp_delta();
 
-        // Parallel: same ops via the batch runner against one shared book.
+        // Parallel: same ops via the batch runner against one shared book, then the barrier-sort.
         let book = Arc::new(SharedPerpBook::new());
-        {
-            let mut seed_ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
-            seed_ctx.journal_mut().set_perp_shared(book.clone());
-            seed(&mut seed_ctx, &[a, b]);
-        }
+        seed(&mut make_slot(book.clone()), &[a, b]);
         let gate = AccountGate::new();
         let bbo = BboTicketLock::new();
-        let make = |bk: Arc<SharedPerpBook>| -> TestCtx {
-            let mut c: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
-            c.journal_mut().set_perp_shared(bk);
-            c
-        };
-        let results = run_place_batch(&book, &gate, &bbo, &items, make);
+        let results = run_place_batch(&book, &gate, &bbo, &items, make_slot);
         for r in &results {
             assert_eq!(*r.as_ref().unwrap(), PlaceOutcome::Executed);
         }
+        finalize_place_batch_ordering(&book, &items, &results, make_slot).unwrap();
         let parallel_delta = book.take_delta();
 
         assert_eq!(serial_delta, parallel_delta);
