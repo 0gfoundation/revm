@@ -25,8 +25,11 @@ use crate::perp_dex::types::order::{OrderType, Side, TimeInForce};
 use crate::perp_dex::{storage, trading::place_order_core};
 use crate::PrecompileError;
 use context::journal::perp_sched::{AccountGate, BboTicketLock};
+use context::journal::shared_perp::SharedPerpBook;
 use context::{ContextTr, JournalTr};
 use primitives::Address;
+use std::sync::Arc;
+use std::thread;
 
 /// How the gated phase must treat one place/cancel under the BBO ticket. See module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,8 +352,42 @@ pub fn parallel_place<CTX: ContextTr>(
     }
 }
 
+/// Run a batch of parallel-eligible places concurrently against ONE shared book, gated by the
+/// `AccountGate` (per maker) and `BboTicketLock` (per-market BBO). Each worker builds a FRESH slot
+/// context thread-locally via `make_ctx` (so the journal never crosses a thread → no `Send` bound on
+/// the journal), then runs [`parallel_place`]. Results are returned in `items` order. `make_ctx`
+/// must return a context whose journal already routes to `book` (i.e. `set_perp_shared(book)` done);
+/// the book must already hold the block's prior state (the driver/test seeds it).
+pub fn run_place_batch<CTX, F>(
+    book: &Arc<SharedPerpBook>,
+    account_gate: &AccountGate,
+    bbo: &BboTicketLock,
+    items: &[PlaceWork],
+    make_ctx: F,
+) -> Vec<Result<PlaceOutcome, PrecompileError>>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX + Sync,
+{
+    let make_ctx = &make_ctx;
+    thread::scope(|s| {
+        let handles: Vec<_> = items
+            .iter()
+            .map(|item| {
+                let book = book.clone();
+                s.spawn(move || {
+                    let mut ctx = make_ctx(book);
+                    parallel_place(&mut ctx, account_gate, bbo, item)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 #[cfg(test)]
 mod driver_tests {
+    use crate::perp_dex::types::Market;
     use super::*;
     use context::journal::shared_perp::SharedPerpBook;
     use context::{BlockEnv, CfgEnv, Context, Journal, TxEnv};
@@ -387,5 +424,119 @@ mod driver_tests {
         let out = parallel_place(&mut ctx, &gate, &bbo, &work).unwrap();
         assert_eq!(out, PlaceOutcome::Downgrade);
         assert!(book.take_delta().is_empty(), "a downgrade must write nothing to the book");
+    }
+
+    const TICK: u64 = 1_000_000_000;
+    const QTY: u64 = 1_000_000;
+    const WALLET: u64 = 1_000_000_000;
+    const MID: u64 = 1;
+
+    fn user_addr(i: u64) -> Address {
+        let mut b = [0u8; 20];
+        b[12..20].copy_from_slice(&i.to_be_bytes());
+        Address::from(b)
+    }
+
+    fn test_market() -> Market {
+        Market {
+            market_id: MID,
+            base_decimals: 8,
+            price_decimals: 9,
+            tick_size: TICK,
+            step_size: QTY,
+            min_quantity: QTY,
+            max_quantity: QTY * 1_000,
+            max_price: 100_000 * TICK,
+            price_update_interval: 15,
+            active: true,
+            funding_interval: 0,
+            interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
+        }
+    }
+
+    fn fund<CTX: ContextTr>(ctx: &mut CTX, user: Address, amt: u64) {
+        let mut acc = storage::load_account(ctx, user).unwrap();
+        acc.credit_perp(amt).unwrap();
+        storage::save_account(ctx, user, acc).unwrap();
+    }
+
+    fn seed<CTX: ContextTr>(ctx: &mut CTX, users: &[Address]) {
+        storage::save_market(ctx, &test_market()).unwrap();
+        for &u in users {
+            fund(ctx, u, WALLET);
+        }
+    }
+
+    fn mk_work(maker: Address, order_id: [u8; 32], price: u64, rank: u64, ticket: u64) -> PlaceWork {
+        PlaceWork {
+            maker,
+            order_id,
+            market_id: MID,
+            side: 0, // Buy
+            price,
+            qty: QTY,
+            order_type: 0, // Limit
+            tif: 0,        // GTC
+            client_order_id: [0u8; 16],
+            rank,
+            ticket,
+        }
+    }
+
+    /// THE step-3c gate: a batch of non-crossing places run in parallel produces a book delta
+    /// byte-identical to running the same ops serially in txn_id order. Mixes movers (A@100, A@101),
+    /// a non-mover (B@99), same-account ordering (A's two orders, rank 0 then 1), and two accounts.
+    #[test]
+    fn parallel_place_batch_matches_serial_delta() {
+        let a = user_addr(1);
+        let b = user_addr(2);
+        let items = vec![
+            mk_work(a, [1u8; 32], 100 * TICK, 0, 0),
+            mk_work(b, [2u8; 32], 99 * TICK, 0, 1),
+            mk_work(a, [3u8; 32], 101 * TICK, 1, 2),
+        ];
+
+        // Serial reference: place_order_core in txn_id (ticket) order against a PerpSection ctx.
+        let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut serial, &[a, b]);
+        for it in &items {
+            place_order_core(
+                it.maker,
+                it.order_id,
+                it.market_id,
+                it.side,
+                it.price,
+                it.qty,
+                it.order_type,
+                it.tif,
+                it.client_order_id,
+                &mut serial,
+            )
+            .unwrap();
+        }
+        let serial_delta = serial.journal_mut().take_perp_delta();
+
+        // Parallel: same ops via the batch runner against one shared book.
+        let book = Arc::new(SharedPerpBook::new());
+        {
+            let mut seed_ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+            seed_ctx.journal_mut().set_perp_shared(book.clone());
+            seed(&mut seed_ctx, &[a, b]);
+        }
+        let gate = AccountGate::new();
+        let bbo = BboTicketLock::new();
+        let make = |bk: Arc<SharedPerpBook>| -> TestCtx {
+            let mut c: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+            c.journal_mut().set_perp_shared(bk);
+            c
+        };
+        let results = run_place_batch(&book, &gate, &bbo, &items, make);
+        for r in &results {
+            assert_eq!(*r.as_ref().unwrap(), PlaceOutcome::Executed);
+        }
+        let parallel_delta = book.take_delta();
+
+        assert_eq!(serial_delta, parallel_delta);
     }
 }
