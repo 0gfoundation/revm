@@ -2247,12 +2247,11 @@ fn fill_settles_funding_for_taker_and_maker() {
 //     / bad-debt write-off (solvent path with clearance fee IS covered)
 //   * funding-charge waterfall into position margin / insurance fund (the
 //     scenario's funding charge is covered by the wallet)
-//   * margin-shortfall auto-cancel cascades: taker-side
-//     cancel_same_side_orders_until_wallet_covers and maker-side
-//     cancel_maker_orders_until_wallet_nonnegative (maker auto-expire), incl.
-//     the matcher early-exit sub-variant where the surviving queue tail was
-//     entirely expired-during-level (trading/mod.rs:827/:984) — all require a
-//     maker-deficit cascade that would dominate the scenario
+//   * margin-shortfall auto-cancel cascade: taker-side
+//     cancel_same_side_orders_until_wallet_covers — requires a taker
+//     margin-cover cascade that would dominate the scenario
+//     (maker-side auto-expire was removed with isolated-margin bad-debt
+//     routing, so there is no maker expired-during-level path any more)
 //   * FOK / PostOnly success-on-match permutations beyond the covered ones
 //     (FOK infeasible revert, PostOnly crossing revert, PostOnly rest)
 //   * open_interest (save_open_interest has no production caller today)

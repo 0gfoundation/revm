@@ -308,7 +308,7 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     fill_qty: u64,
     taker_side: Side,
     market: &crate::perp_dex::types::Market,
-) -> Result<MakerFillResult, PrecompileError> {
+) -> Result<u64, PrecompileError> {
     let maker_side = taker_side.opposite();
     let mut pos = storage::load_position(context, maker, market_id)?;
     let mut account = storage::load_account(context, maker)?;
@@ -398,16 +398,8 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     });
 
     // No order is auto-cancelled on a maker fill any more (isolated margin), so the
-    // result never carries expired order ids.
-    Ok(MakerFillResult {
-        maker_fee,
-        expired_order_ids: Vec::new(),
-    })
-}
-
-pub(super) struct MakerFillResult {
-    pub maker_fee: u64,
-    pub expired_order_ids: Vec<[u8; 32]>,
+    // maker fill returns only the maker fee — no expired-order bookkeeping.
+    Ok(maker_fee)
 }
 
 /// Deducts a trading fee from the wallet.

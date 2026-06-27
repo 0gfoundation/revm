@@ -806,17 +806,11 @@ pub(super) fn match_order<CTX: ContextTr>(
                 }
                 let queue = storage::load_ask_level(context, market_id, ask_price)?;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
-                let mut expired_during_level: Vec<[u8; 32]> = Vec::new();
                 let mut qi = 0;
 
                 while qi < queue.len() {
                     if remaining == 0 {
-                        new_queue.extend(
-                            queue[qi..]
-                                .iter()
-                                .copied()
-                                .filter(|id| !expired_during_level.contains(id)),
-                        );
+                        new_queue.extend(queue[qi..].iter().copied());
                         if new_queue.is_empty() {
                             storage::remove_ask_price(context, market_id, ask_price)?;
                             ask_levels_cleared = true;
@@ -836,12 +830,6 @@ pub(super) fn match_order<CTX: ContextTr>(
                         {
                             o
                         }
-                        Some(o)
-                            if o.status == OrderStatus::Expired
-                                && expired_during_level.contains(&maker_id) =>
-                        {
-                            continue;
-                        }
                         Some(o) => {
                             return Err(perp_invariant_err(format!(
                                 "ask queue contains order {:?} with terminal status {:?}",
@@ -859,7 +847,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let fill_qty = remaining.min(available);
 
                     taker_settlement.record_fill(ask_price, fill_qty, Side::Buy, market)?;
-                    let maker_fill = settle_maker_fill(
+                    let maker_fee = settle_maker_fill(
                         context,
                         Address::from(maker_order.owner),
                         &maker_id,
@@ -869,8 +857,6 @@ pub(super) fn match_order<CTX: ContextTr>(
                         Side::Buy,
                         market,
                     )?;
-                    expired_during_level.extend(maker_fill.expired_order_ids.iter().copied());
-                    new_queue.retain(|id| !expired_during_level.contains(id));
                     let fill_notional = calc_value(
                         ask_price,
                         fill_qty,
@@ -892,7 +878,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                             quantity: fill_qty,
                             taker_side: Side::Buy,
                             taker_fee,
-                            maker_fee: maker_fill.maker_fee,
+                            maker_fee,
                         },
                     )?;
 
@@ -904,13 +890,9 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 maker_id
                             ))
                         })?;
-                    let maker_expired_during_settlement = expired_during_level.contains(&maker_id)
-                        || updated_maker.status == OrderStatus::Expired;
                     updated_maker.filled += fill_qty;
                     updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
                         OrderStatus::Filled
-                    } else if maker_expired_during_settlement {
-                        OrderStatus::Expired
                     } else {
                         OrderStatus::PartiallyFilled
                     };
@@ -963,17 +945,11 @@ pub(super) fn match_order<CTX: ContextTr>(
                 }
                 let queue = storage::load_bid_level(context, market_id, bid_price)?;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
-                let mut expired_during_level: Vec<[u8; 32]> = Vec::new();
                 let mut qi = 0;
 
                 while qi < queue.len() {
                     if remaining == 0 {
-                        new_queue.extend(
-                            queue[qi..]
-                                .iter()
-                                .copied()
-                                .filter(|id| !expired_during_level.contains(id)),
-                        );
+                        new_queue.extend(queue[qi..].iter().copied());
                         if new_queue.is_empty() {
                             storage::remove_bid_price(context, market_id, bid_price)?;
                             bid_levels_cleared = true;
@@ -993,12 +969,6 @@ pub(super) fn match_order<CTX: ContextTr>(
                         {
                             o
                         }
-                        Some(o)
-                            if o.status == OrderStatus::Expired
-                                && expired_during_level.contains(&maker_id) =>
-                        {
-                            continue;
-                        }
                         Some(o) => {
                             return Err(perp_invariant_err(format!(
                                 "bid queue contains order {:?} with terminal status {:?}",
@@ -1016,7 +986,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let fill_qty = remaining.min(available);
 
                     taker_settlement.record_fill(bid_price, fill_qty, Side::Sell, market)?;
-                    let maker_fill = settle_maker_fill(
+                    let maker_fee = settle_maker_fill(
                         context,
                         Address::from(maker_order.owner),
                         &maker_id,
@@ -1026,8 +996,6 @@ pub(super) fn match_order<CTX: ContextTr>(
                         Side::Sell,
                         market,
                     )?;
-                    expired_during_level.extend(maker_fill.expired_order_ids.iter().copied());
-                    new_queue.retain(|id| !expired_during_level.contains(id));
                     let fill_notional = calc_value(
                         bid_price,
                         fill_qty,
@@ -1049,7 +1017,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                             quantity: fill_qty,
                             taker_side: Side::Sell,
                             taker_fee,
-                            maker_fee: maker_fill.maker_fee,
+                            maker_fee,
                         },
                     )?;
 
@@ -1060,13 +1028,9 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 maker_id
                             ))
                         })?;
-                    let maker_expired_during_settlement = expired_during_level.contains(&maker_id)
-                        || updated_maker.status == OrderStatus::Expired;
                     updated_maker.filled += fill_qty;
                     updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
                         OrderStatus::Filled
-                    } else if maker_expired_during_settlement {
-                        OrderStatus::Expired
                     } else {
                         OrderStatus::PartiallyFilled
                     };
