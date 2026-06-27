@@ -76,12 +76,36 @@ impl core::fmt::Debug for SharedPerpEntry {
     }
 }
 
+impl Clone for SharedPerpEntry {
+    fn clone(&self) -> Self {
+        self.snapshot()
+    }
+}
+
 /// Per-transaction, move-based undo log against a [`SharedPerpBook`]. Records the prior entry for
 /// each key the transaction touched (`None` = key was absent), reverse-replayed on revert. One per
 /// execution slot, so reverts never disturb concurrent slots.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PerpWriteSet {
     undo: Vec<(B256, Option<SharedPerpEntry>)>,
+}
+
+impl PerpWriteSet {
+    /// Number of writes recorded so far (= a slot's perp checkpoint index).
+    pub fn len(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Whether no writes are recorded.
+    pub fn is_empty(&self) -> bool {
+        self.undo.is_empty()
+    }
+
+    /// Drops the recorded undo log: a committed transaction keeps its book writes; only the per-tx
+    /// reversible log is spent (mirrors `PerpSection.undo.clear()` at the tx boundary).
+    pub fn clear(&mut self) {
+        self.undo.clear();
+    }
 }
 
 /// Concurrent off-trie PerpDEX overlay shared across execution slots. See module docs.
@@ -164,6 +188,26 @@ impl SharedPerpBook {
     /// means the key was absent before the write, so revert removes it.
     pub fn undo(&self, ws: PerpWriteSet) {
         for (key, prev) in ws.undo.into_iter().rev() {
+            match prev {
+                Some(entry) => {
+                    self.working.insert(key, entry);
+                }
+                None => {
+                    self.working.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Reverts only the writes recorded at or after index `to`, in reverse order, truncating `ws`
+    /// back to `to`. This is the EVM checkpoint-revert path: a slot journal rolls back the writes
+    /// made since its checkpoint, leaving earlier writes (and other slots) untouched. The caller must
+    /// hold the locks covering these keys (so no concurrent slot observes the partial rollback).
+    pub fn undo_to(&self, ws: &mut PerpWriteSet, to: usize) {
+        if to >= ws.undo.len() {
+            return;
+        }
+        for (key, prev) in ws.undo.drain(to..).rev() {
             match prev {
                 Some(entry) => {
                     self.working.insert(key, entry);
@@ -274,7 +318,7 @@ mod tests {
         j.perp_store(k(1), vec![0xAA]);
         j.perp_store(k(1), vec![0xBB]); // overwrite -> last write wins
         j.perp_store_struct(k(2), Box::new(5u32), ser_u32, clone_u32_serial);
-        *j.perp_get_struct_mut(k(2)).unwrap().downcast_mut::<u32>().unwrap() = 7; // in-place
+        j.perp_with_struct_mut::<u32, ()>(k(2), |v| *v = 7); // in-place
         j.perp_store(k(3), vec![1, 2, 3]);
         let serial_delta = j.take_perp_delta();
 
@@ -293,5 +337,24 @@ mod tests {
         assert_eq!(shared_delta.get(&k(1)), Some(&vec![0xBBu8]));
         assert_eq!(shared_delta.get(&k(2)), Some(&7u32.to_le_bytes().to_vec()));
         assert_eq!(shared_delta.get(&k(3)), Some(&vec![1u8, 2, 3]));
+    }
+
+    /// `undo_to(i)` reverts only writes at/after `i` (the checkpoint-revert path), truncating the
+    /// write-set; earlier writes survive.
+    #[test]
+    fn undo_to_reverts_only_writes_after_index() {
+        let book = SharedPerpBook::new();
+        let mut ws = PerpWriteSet::default();
+        book.store_bytes(k(1), vec![1], &mut ws); // idx 0 (kept)
+        let cp = ws.len();
+        book.store_bytes(k(2), vec![2], &mut ws); // idx 1 (reverted)
+        book.store_bytes(k(1), vec![9], &mut ws); // idx 2 (reverted -> k1 back to [1])
+        assert_eq!(ws.len(), 3);
+
+        book.undo_to(&mut ws, cp);
+
+        assert_eq!(book.get_bytes(k(1)), Some(vec![1]));
+        assert_eq!(book.get_bytes(k(2)), None);
+        assert_eq!(ws.len(), cp);
     }
 }

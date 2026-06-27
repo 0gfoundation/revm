@@ -320,6 +320,16 @@ pub struct JournalInner<ENTRY> {
     /// length is snapshotted into [`JournalCheckpoint`] and truncated back on revert. Never folded
     /// into [`EvmState`].
     pub perp_commitment_log: Vec<u8>,
+    /// Parallel-execution routing (catalog #21, off by default). When `Some`, all off-trie perp
+    /// reads/writes route to the shared concurrent book instead of `perp`, and `perp_writeset` is
+    /// this slot's reversible log; the serial `perp` PerpSection stays EMPTY in this mode. Deferred
+    /// `Struct` writes are eager-serialized to bytes here (byte-identical final delta; the in-place
+    /// struct fast path is serial-only for now). See [`crate::journal::shared_perp`].
+    #[cfg(feature = "perp-parallel")]
+    pub perp_shared: Option<std::sync::Arc<crate::journal::shared_perp::SharedPerpBook>>,
+    /// This slot's per-transaction write-set against `perp_shared`; empty/unused when `None`.
+    #[cfg(feature = "perp-parallel")]
+    perp_writeset: crate::journal::shared_perp::PerpWriteSet,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -345,7 +355,32 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses: WarmAddresses::new(),
             perp: PerpSection::default(),
             perp_commitment_log: Vec::new(),
+            #[cfg(feature = "perp-parallel")]
+            perp_shared: None,
+            #[cfg(feature = "perp-parallel")]
+            perp_writeset: crate::journal::shared_perp::PerpWriteSet::default(),
         }
+    }
+
+    /// Routes this journal's off-trie perp ops to the shared concurrent book (parallel execution).
+    /// Single-block-scoped: the driver sets this on a fresh per-slot journal each block.
+    #[cfg(feature = "perp-parallel")]
+    pub fn set_perp_shared(
+        &mut self,
+        book: std::sync::Arc<crate::journal::shared_perp::SharedPerpBook>,
+    ) {
+        self.perp_shared = Some(book);
+    }
+
+    /// The perp checkpoint index: the shared write-set length in parallel mode, else the serial
+    /// PerpSection undo length.
+    #[inline]
+    fn perp_checkpoint_index(&self) -> usize {
+        #[cfg(feature = "perp-parallel")]
+        if self.perp_shared.is_some() {
+            return self.perp_writeset.len();
+        }
+        self.perp.undo.len()
     }
 
     /// Returns the logs
@@ -358,12 +393,21 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// (the caller falls through to the committed store, see `JournalTr::perp_load`).
     #[inline]
     pub fn perp_get_overlay(&self, key: B256) -> Option<Vec<u8>> {
+        #[cfg(feature = "perp-parallel")]
+        if let Some(book) = &self.perp_shared {
+            return book.get_bytes(key);
+        }
         self.perp.get_bytes(key)
     }
 
     /// Writes an off-trie PerpDEX blob (raw bytes) to the overlay, journaled for revert.
     #[inline]
     pub fn perp_store(&mut self, key: B256, value: Vec<u8>) {
+        #[cfg(feature = "perp-parallel")]
+        if let Some(book) = self.perp_shared.clone() {
+            book.store_bytes(key, value, &mut self.perp_writeset);
+            return;
+        }
         self.perp.store_bytes(key, value);
     }
 
@@ -378,6 +422,14 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         ser: fn(&dyn core::any::Any) -> Vec<u8>,
         clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
     ) {
+        #[cfg(feature = "perp-parallel")]
+        if let Some(book) = self.perp_shared.clone() {
+            // Parallel mode: eager-serialize to bytes (no deferred `Struct` in the shared book). The
+            // final block-delta bytes are identical to the serial deferred path (same `ser`); the
+            // in-place struct fast path is serial-only for now. `clone` is unused here.
+            book.store_bytes(key, ser(val.as_ref()), &mut self.perp_writeset);
+            return;
+        }
         self.perp.store_struct(key, val, ser, clone);
     }
 
@@ -422,24 +474,45 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// Reads the block-scoped deserialized PerpDEX blob cache (catalog #14; type-erased).
     #[inline]
     pub fn perp_cache_get(&self, key: B256) -> Option<&dyn core::any::Any> {
+        // Parallel mode keeps no per-slot deser cache (the shared book holds bytes; serial
+        // PerpSection is empty), so a stale cache cannot shadow a shared write.
+        #[cfg(feature = "perp-parallel")]
+        if self.perp_shared.is_some() {
+            return None;
+        }
         self.perp.cache_get(key)
     }
 
     /// Inserts a deserialized PerpDEX blob into the block-scoped read cache.
     #[inline]
     pub fn perp_cache_put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+        #[cfg(feature = "perp-parallel")]
+        if self.perp_shared.is_some() {
+            return;
+        }
         self.perp.cache_put(key, value);
     }
 
     /// Reverts off-trie PerpDEX overlay writes back to the given undo index.
     #[inline]
     pub fn perp_undo_to(&mut self, perp_journal_i: usize) {
+        #[cfg(feature = "perp-parallel")]
+        if let Some(book) = self.perp_shared.clone() {
+            book.undo_to(&mut self.perp_writeset, perp_journal_i);
+            return;
+        }
         self.perp.undo_to(perp_journal_i);
     }
 
     /// Drains the block's net off-trie PerpDEX writes ([`PerpDelta`]) and clears the undo log.
     #[inline]
     pub fn take_perp_delta(&mut self) -> PerpDelta {
+        // Parallel mode: the driver drains the shared book ONCE at block end; a slot journal must
+        // not (the book is shared across slots).
+        #[cfg(feature = "perp-parallel")]
+        if self.perp_shared.is_some() {
+            return PerpDelta::default();
+        }
         self.perp.take_delta()
     }
 
@@ -482,6 +555,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             perp,
             perp_commitment_log,
+            #[cfg(feature = "perp-parallel")]
+            perp_shared,
+            #[cfg(feature = "perp-parallel")]
+            perp_writeset,
         } = self;
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
@@ -495,6 +572,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // Keep the perp overlay (later txs in this block must see this tx's writes, exactly
         // like `state` above); only the tx-scoped undo log is spent.
         perp.undo.clear();
+        // Parallel mode: the shared book is block-scoped (kept across txs); only this slot's per-tx
+        // write-set is spent. `perp_shared` itself is untouched.
+        #[cfg(feature = "perp-parallel")]
+        {
+            let _ = &perp_shared;
+            perp_writeset.clear();
+        }
 
         // The commitment log is call-scoped (hashed/discarded at each precompile call exit), so it
         // must be empty at this tx boundary; reset defensively against any leak.
@@ -521,6 +605,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             perp,
             perp_commitment_log,
+            #[cfg(feature = "perp-parallel")]
+            perp_shared,
+            #[cfg(feature = "perp-parallel")]
+            perp_writeset,
         } = self;
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
@@ -530,6 +618,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // Revert this transaction's perp overlay writes too (mirrors the journal revert above),
         // so a discarded tx leaves no perp residue.
         perp.undo_to(0);
+        // Parallel mode: roll back ALL of this tx's writes to the shared book (whole-tx discard).
+        #[cfg(feature = "perp-parallel")]
+        if let Some(book) = perp_shared {
+            book.undo_to(perp_writeset, 0);
+        }
         // Call-scoped commitment log must be empty at this tx boundary; reset defensively.
         perp_commitment_log.clear();
         transient_storage.clear();
@@ -560,6 +653,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             perp,
             perp_commitment_log,
+            #[cfg(feature = "perp-parallel")]
+            perp_shared,
+            #[cfg(feature = "perp-parallel")]
+            perp_writeset,
         } = self;
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
@@ -581,6 +678,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // write before it could be harvested (canonical_perp stayed empty forever). Only the
         // tx-scoped undo log is reset, mirroring `commit_tx`, which already keeps `working`.
         perp.undo.clear();
+        // Parallel mode: keep the block-scoped shared book; spend only this slot's per-tx write-set.
+        #[cfg(feature = "perp-parallel")]
+        {
+            let _ = &perp_shared;
+            perp_writeset.clear();
+        }
         // Call-scoped commitment log must be empty at this tx boundary; reset defensively.
         perp_commitment_log.clear();
 
@@ -879,7 +982,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let checkpoint = JournalCheckpoint {
             log_i: self.logs.len(),
             journal_i: self.journal.len(),
-            perp_journal_i: self.perp.undo.len(),
+            perp_journal_i: self.perp_checkpoint_index(),
             perp_commitment_log_len: self.perp_commitment_log.len(),
         };
         self.depth += 1;
@@ -912,8 +1015,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         }
 
         // Revert off-trie PerpDEX overlay writes made after the checkpoint, in lock-step with
-        // the EVM journal entries above.
-        self.perp.undo_to(checkpoint.perp_journal_i);
+        // the EVM journal entries above (routes to the shared book in parallel mode).
+        self.perp_undo_to(checkpoint.perp_journal_i);
 
         // Truncate the per-call commitment log back to its checkpoint length, dropping the framed
         // writes appended after the checkpoint so the call-exit hash stays consistent with the
@@ -1460,6 +1563,64 @@ mod perp_tests {
         assert!(!j.perp_contains_struct(k(2)));
         j.perp_store(k(3), vec![1, 2, 3]);
         assert!(!j.perp_contains_struct(k(3)));
+    }
+
+    /// Step 3b: with a shared book set, all off-trie writes route to it (struct writes eager-
+    /// serialized) and the block delta is byte-identical to the serial PerpSection path.
+    #[cfg(feature = "perp-parallel")]
+    #[test]
+    fn perp_shared_routes_to_book_and_matches_serial() {
+        use crate::journal::shared_perp::SharedPerpBook;
+        use std::sync::Arc;
+
+        // Serial journal: writes accumulate in PerpSection, drained by take_perp_delta.
+        let mut serial = new_inner();
+        serial.perp_store(k(1), vec![0xAA]);
+        serial.perp_store_struct(k(2), std::boxed::Box::new(5u32), ser_u32, clone_u32);
+        serial.perp_store(k(1), vec![0xBB]); // overwrite -> last write wins
+        let serial_delta = serial.take_perp_delta();
+
+        // Shared journal: identical ops route to the shared book.
+        let book = Arc::new(SharedPerpBook::new());
+        let mut shared = new_inner();
+        shared.set_perp_shared(book.clone());
+        shared.perp_store(k(1), vec![0xAA]);
+        shared.perp_store_struct(k(2), std::boxed::Box::new(5u32), ser_u32, clone_u32);
+        shared.perp_store(k(1), vec![0xBB]);
+        // The slot journal's take_perp_delta is empty (the driver drains the book); the book has it.
+        assert!(shared.take_perp_delta().is_empty());
+        let shared_delta = book.take_delta();
+
+        assert_eq!(serial_delta, shared_delta);
+        assert_eq!(shared_delta.get(&k(1)), Some(&vec![0xBBu8]));
+        assert_eq!(shared_delta.get(&k(2)), Some(&5u32.to_le_bytes().to_vec()));
+    }
+
+    /// Step 3b: an EVM checkpoint-revert against a shared-book journal rolls back exactly this
+    /// transaction's post-checkpoint writes (via the write-set), leaving the committed baseline.
+    #[cfg(feature = "perp-parallel")]
+    #[test]
+    fn perp_shared_checkpoint_revert_rolls_back_book() {
+        use crate::journal::shared_perp::SharedPerpBook;
+        use std::sync::Arc;
+
+        let book = Arc::new(SharedPerpBook::new());
+        let mut j = new_inner();
+        j.set_perp_shared(book.clone());
+        // Baseline committed before the checkpoint.
+        j.perp_store(k(1), vec![1]);
+        j.commit_tx(); // book keeps k1; this slot's write-set is spent.
+
+        let cp = j.checkpoint();
+        j.perp_store(k(1), vec![9]); // overwrite after checkpoint
+        j.perp_store(k(2), vec![2]); // new key after checkpoint
+        assert_eq!(book.get_bytes(k(1)), Some(vec![9]));
+        assert_eq!(book.get_bytes(k(2)), Some(vec![2]));
+
+        j.checkpoint_revert(cp);
+        // Post-checkpoint writes rolled back; the pre-checkpoint baseline survives.
+        assert_eq!(book.get_bytes(k(1)), Some(vec![1]));
+        assert_eq!(book.get_bytes(k(2)), None);
     }
 
     #[test]
