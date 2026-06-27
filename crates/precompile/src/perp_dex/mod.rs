@@ -67,6 +67,9 @@ pub mod errors;
 pub mod funding;
 pub mod interface;
 pub mod math;
+/// Parallel place/cancel execution decision logic (catalog #21 spike, step 3c).
+#[cfg(feature = "perp-parallel")]
+pub mod parallel;
 pub mod risk;
 pub mod storage;
 pub mod trading;

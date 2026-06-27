@@ -83,4 +83,7 @@ optional_fee_charge = []
 # 0G PerpDEX parallel execution (catalog #21 spike, branch perpdex-parallel). Off by default.
 # Gates the off-trie `SharedPerpBook` concurrent substrate + per-txn write-set rollback that
 # the parallel block driver builds on. When off, the serial PerpSection path is byte-identical.
-perp-parallel = ["dep:dashmap"]
+# Parallel execution is inherently std (OS threads + Mutex/Condvar + dashmap), so the feature
+# implies `std` — otherwise enabling it via a no_std-by-default dependent (e.g. revm-precompile)
+# fails to resolve `std::sync::*`.
+perp-parallel = ["dep:dashmap", "std"]
