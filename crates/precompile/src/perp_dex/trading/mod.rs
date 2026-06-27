@@ -396,7 +396,7 @@ struct ValidatedOrder {
     tif: TimeInForce,
 }
 
-fn place_order_core<CTX: ContextTr>(
+pub(crate) fn place_order_core<CTX: ContextTr>(
     account: Address,
     order_id: [u8; 32],
     market_id: u64,

@@ -22,6 +22,11 @@
 //! `best == 0` is the "no order on this side" sentinel (an empty book side).
 
 use crate::perp_dex::types::order::{OrderType, Side, TimeInForce};
+use crate::perp_dex::{storage, trading::place_order_core};
+use crate::PrecompileError;
+use context::journal::perp_sched::{AccountGate, BboTicketLock};
+use context::{ContextTr, JournalTr};
+use primitives::Address;
 
 /// How the gated phase must treat one place/cancel under the BBO ticket. See module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,5 +231,161 @@ mod tests {
             classify_cancel(Side::Sell, 110, 100, 110, true),
             LockPlan::DowngradeToBarrier
         );
+    }
+}
+
+// ── Driver: single-work-item place lock-body (step 3c part 2) ─────────────────
+
+/// One parallel-eligible place to run in a slot. The ed25519 verify + decode is hoisted upstream
+/// (the dominant cost, parallel before the gates); this is the gated mutation. `rank`/`ticket` are
+/// assigned by the batch in txn_id order.
+#[derive(Debug, Clone)]
+pub struct PlaceWork {
+    pub maker: Address,
+    pub order_id: [u8; 32],
+    pub market_id: u64,
+    pub side: u8,
+    pub price: u64,
+    pub qty: u64,
+    pub order_type: u8,
+    pub tif: u8,
+    pub client_order_id: [u8; 16],
+    /// This maker's block-order rank (AccountGate, rule 6).
+    pub rank: u64,
+    /// This op's BBO ticket (txn_id order within the batch; rules 2+3).
+    pub ticket: u64,
+}
+
+/// Outcome of a slot's place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceOutcome {
+    /// Rested (or no-op) and committed to the book.
+    Executed,
+    /// The body rejected (PostOnly cross, insufficient margin, …); this slot's book writes were
+    /// rolled back. Still a processed tx (gas charged upstream).
+    Reverted,
+    /// Must run on the serial barrier (step 3d): crossing matching-limit / IOC / FOK / Market.
+    Downgrade,
+}
+
+/// Run `place_order_core` under the maker's account turn, inside a journal checkpoint so a
+/// (non-fatal) rejection rolls back this slot's off-trie writes via the write-set (step 3b).
+fn gated_execute<CTX: ContextTr>(
+    ctx: &mut CTX,
+    account_gate: &AccountGate,
+    work: &PlaceWork,
+) -> Result<PlaceOutcome, PrecompileError> {
+    account_gate.run(work.maker, work.rank, || {
+        let cp = ctx.journal_mut().checkpoint();
+        match place_order_core(
+            work.maker,
+            work.order_id,
+            work.market_id,
+            work.side,
+            work.price,
+            work.qty,
+            work.order_type,
+            work.tif,
+            work.client_order_id,
+            ctx,
+        ) {
+            Ok(()) => {
+                ctx.journal_mut().checkpoint_commit();
+                Ok(PlaceOutcome::Executed)
+            }
+            // TODO(3d): distinguish PrecompileError::Fatal (propagate) from a user/validation
+            // revert. The parallel place/cancel set never hits Fatal, so for now any error reverts.
+            Err(_e) => {
+                ctx.journal_mut().checkpoint_revert(cp);
+                Ok(PlaceOutcome::Reverted)
+            }
+        }
+    })
+}
+
+/// Execute one parallel place (the lock-body). Classify under the BBO ticket; a mover / PostOnly
+/// cross executes under the held ticket (the account rank is waited at the place — Q3), a non-mover
+/// releases the ticket then executes under the account gate (rule 4.iii), a crossing matcher / taker
+/// is marked `Downgrade` for the serial barrier (step 3d does the re-run).
+pub fn parallel_place<CTX: ContextTr>(
+    ctx: &mut CTX,
+    account_gate: &AccountGate,
+    bbo: &BboTicketLock,
+    work: &PlaceWork,
+) -> Result<PlaceOutcome, PrecompileError> {
+    enum UnderTicket {
+        Done(Result<PlaceOutcome, PrecompileError>),
+        Release,
+        Downgrade,
+    }
+    let under = bbo.run(work.ticket, || -> Result<UnderTicket, PrecompileError> {
+        let plan = match (
+            Side::from_u8(work.side),
+            OrderType::from_u8(work.order_type),
+            TimeInForce::from_u8(work.tif),
+        ) {
+            (Some(side), Some(order_type), Some(tif)) => {
+                let best_bid = storage::load_best_bid(ctx, work.market_id)?;
+                let best_ask = storage::load_best_ask(ctx, work.market_id)?;
+                classify_place(side, order_type, tif, work.price, best_bid, best_ask)
+            }
+            // Unparseable order fields → let the body reject it under the ticket.
+            _ => LockPlan::RejectInBody,
+        };
+        match plan {
+            LockPlan::DowngradeToBarrier => Ok(UnderTicket::Downgrade),
+            LockPlan::HoldTicket | LockPlan::RejectInBody => {
+                Ok(UnderTicket::Done(gated_execute(ctx, account_gate, work)))
+            }
+            LockPlan::ReleaseTicket => Ok(UnderTicket::Release),
+        }
+    })?;
+    match under {
+        UnderTicket::Done(r) => r,
+        UnderTicket::Downgrade => Ok(PlaceOutcome::Downgrade),
+        // Ticket released; rest under the account gate (the per-level lock is the book's DashMap
+        // entry, taken inside the push/mutate helpers).
+        UnderTicket::Release => gated_execute(ctx, account_gate, work),
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use context::journal::shared_perp::SharedPerpBook;
+    use context::{BlockEnv, CfgEnv, Context, Journal, TxEnv};
+    use database::InMemoryDB;
+    use primitives::{address, hardfork::SpecId};
+    use std::sync::Arc;
+
+    type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
+
+    /// A taker TIF (IOC) is downgraded to the barrier without touching the book — and without
+    /// needing a seeded market/account (classify decides before the body runs).
+    #[test]
+    fn parallel_place_taker_tif_downgrades_without_book_writes() {
+        let book = Arc::new(SharedPerpBook::new());
+        let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        ctx.journal_mut().set_perp_shared(book.clone());
+        let gate = AccountGate::new();
+        let bbo = BboTicketLock::new();
+
+        let work = PlaceWork {
+            maker: address!("1111111111111111111111111111111111111111"),
+            order_id: [1u8; 32],
+            market_id: 1,
+            side: 0,            // Buy
+            price: 100,
+            qty: 1,
+            order_type: 0,      // Limit
+            tif: 1,             // IOC → taker → downgrade
+            client_order_id: [0u8; 16],
+            rank: 0,
+            ticket: 0,
+        };
+
+        let out = parallel_place(&mut ctx, &gate, &bbo, &work).unwrap();
+        assert_eq!(out, PlaceOutcome::Downgrade);
+        assert!(book.take_delta().is_empty(), "a downgrade must write nothing to the book");
     }
 }
