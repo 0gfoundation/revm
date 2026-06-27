@@ -262,21 +262,39 @@ pub trait JournalTr {
         let _ = (key, val, ser, clone);
     }
 
-    /// Reads a deferred `Struct` off-trie overlay value (type-erased) written this block; `None` if
-    /// absent or written as raw bytes. The caller downcasts + clones (skipping deserialization).
-    /// Default backend keeps no overlay and returns `None`.
-    fn perp_get_struct(&mut self, key: B256) -> Option<&dyn core::any::Any> {
+    /// Whether `key` holds a deferred `Struct` overlay value written this block (the precompile's
+    /// in-place fast path). Gate [`Self::perp_with_struct_mut`] on this. Default backend: `false`.
+    fn perp_contains_struct(&mut self, key: B256) -> bool {
         let _ = key;
+        false
+    }
+
+    /// Runs `f` against the deferred `Struct` overlay value at `key`, downcast to `&T` — the typed
+    /// read fast path (the caller clones inside `f`, skipping deserialization). `None` if absent,
+    /// written as raw bytes, or not a `T`. Closure form (not a returned `&T`) so a concurrent backend
+    /// can hold its shard guard only for the duration of `f`. Default backend returns `None`.
+    fn perp_with_struct<T: core::any::Any, R>(
+        &mut self,
+        key: B256,
+        f: impl FnOnce(&T) -> R,
+    ) -> Option<R> {
+        let _ = (key, f);
         None
     }
 
-    /// Mutable handle into a deferred `Struct` off-trie overlay value for IN-PLACE mutation
-    /// (catalog #21): the caller downcasts to `&mut T` and mutates the live struct, avoiding the
-    /// load(clone)→modify→store(clone) round-trip. The backend snapshots the prior value into its
-    /// revert log first. `None` if absent or written as raw bytes. Default backend returns `None`.
-    fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
-        let _ = key;
-        None
+    /// Runs `f` against the deferred `Struct` overlay value at `key`, downcast to `&mut T`, for
+    /// IN-PLACE mutation (catalog #21) — the backend snapshots the prior value into its revert log
+    /// first. MUST only be called when [`Self::perp_contains_struct`] returned `true` for `key`, so
+    /// `f` always runs and a caller's `FnOnce` is never dropped unused on a miss (letting the caller
+    /// reuse it on the load-then-store fall-through). Closure form so a concurrent backend holds its
+    /// shard guard only across `f`. Default backend: unreachable (it has no struct overlay).
+    fn perp_with_struct_mut<T: core::any::Any, R>(
+        &mut self,
+        key: B256,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        let _ = (key, f);
+        unreachable!("perp_with_struct_mut requires perp_contains_struct(key) == true")
     }
 
     /// Reads the block-scoped deserialized off-trie blob cache (catalog #14): a per-block

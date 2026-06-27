@@ -381,17 +381,42 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         self.perp.store_struct(key, val, ser, clone);
     }
 
-    /// Reads a deferred `Struct` overlay value (type-erased) for the typed fast-path read.
+    /// Whether `key` holds a deferred `Struct` overlay value (the in-place fast-path gate).
     #[inline]
-    pub fn perp_get_struct(&self, key: B256) -> Option<&dyn core::any::Any> {
-        self.perp.get_struct(key)
+    pub fn perp_contains_struct(&self, key: B256) -> bool {
+        self.perp.get_struct(key).is_some()
     }
 
-    /// Mutable handle into a deferred `Struct` overlay value for in-place mutation (catalog #21);
-    /// snapshots the prior value for revert. `None` if absent or stored as raw bytes.
+    /// Runs `f` against the deferred `Struct` overlay value at `key` downcast to `&T`; `None` if
+    /// absent, stored as raw bytes, or not a `T`.
     #[inline]
-    pub fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
-        self.perp.get_struct_mut(key)
+    pub fn perp_with_struct<T: core::any::Any, R>(
+        &self,
+        key: B256,
+        f: impl FnOnce(&T) -> R,
+    ) -> Option<R> {
+        self.perp
+            .get_struct(key)
+            .and_then(|any| any.downcast_ref::<T>())
+            .map(f)
+    }
+
+    /// Runs `f` against the deferred `Struct` overlay value at `key` downcast to `&mut T` for in-place
+    /// mutation (catalog #21); snapshots the prior value for revert first. Caller MUST gate on
+    /// [`Self::perp_contains_struct`] (so `f` always runs).
+    #[inline]
+    pub fn perp_with_struct_mut<T: core::any::Any, R>(
+        &mut self,
+        key: B256,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        let any = self
+            .perp
+            .get_struct_mut(key)
+            .expect("perp_with_struct_mut: key absent (call perp_contains_struct first)");
+        f(any
+            .downcast_mut::<T>()
+            .expect("perp_with_struct_mut: overlay value type mismatch (bug)"))
     }
 
     /// Reads the block-scoped deserialized PerpDEX blob cache (catalog #14; type-erased).
@@ -1389,12 +1414,12 @@ mod perp_tests {
         j.perp_store_struct(k(1), std::boxed::Box::new(7u32), ser_u32, clone_u32);
 
         // Typed fast-path read returns the struct (no serialization).
-        assert_eq!(j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&7u32));
+        assert_eq!(j.perp_with_struct::<u32, u32>(k(1), |v| *v), Some(7u32));
         // Byte-interface read serializes on demand (same bytes the delta will carry).
         assert_eq!(j.perp_get_overlay(k(1)), Some(7u32.to_le_bytes().to_vec()));
         // Clone (the JournalInner Clone path) preserves the deferred struct via the clone fn-ptr.
         let j2 = j.clone();
-        assert_eq!(j2.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&7u32));
+        assert_eq!(j2.perp_with_struct::<u32, u32>(k(1), |v| *v), Some(7u32));
         // Block-end drain serializes ONCE.
         let delta = j.take_perp_delta();
         assert_eq!(delta.get(&k(1)), Some(&7u32.to_le_bytes().to_vec()));
@@ -1405,10 +1430,10 @@ mod perp_tests {
         let mut j = new_inner();
         let cp = j.checkpoint();
         j.perp_store_struct(k(1), std::boxed::Box::new(42u32), ser_u32, clone_u32);
-        assert!(j.perp_get_struct(k(1)).is_some());
+        assert!(j.perp_contains_struct(k(1)));
         j.checkpoint_revert(cp);
         // The struct write is move-undone in lock-step with the byte path.
-        assert!(j.perp_get_struct(k(1)).is_none());
+        assert!(!j.perp_contains_struct(k(1)));
         assert_eq!(j.perp_get_overlay(k(1)), None);
     }
 
@@ -1420,20 +1445,21 @@ mod perp_tests {
         j.commit_tx(); // working keeps the struct; undo spent.
 
         let cp = j.checkpoint();
-        // In-place mutation via the &mut handle — no load/store round-trip, one undo snapshot.
-        *j.perp_get_struct_mut(k(1)).unwrap().downcast_mut::<u32>().unwrap() = 99;
-        assert_eq!(j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&99u32));
+        // In-place mutation via the closure handle — no load/store round-trip, one undo snapshot.
+        assert!(j.perp_contains_struct(k(1)));
+        j.perp_with_struct_mut::<u32, ()>(k(1), |v| *v = 99);
+        assert_eq!(j.perp_with_struct::<u32, u32>(k(1), |v| *v), Some(99u32));
         // Block-end serialization would carry the mutated value.
         assert_eq!(j.perp_get_overlay(k(1)), Some(99u32.to_le_bytes().to_vec()));
 
         // Revert restores the pre-mutation value (snapshot-on-mutate undo).
         j.checkpoint_revert(cp);
-        assert_eq!(j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&10u32));
+        assert_eq!(j.perp_with_struct::<u32, u32>(k(1), |v| *v), Some(10u32));
 
-        // Absent and raw-`Bytes` keys cannot be mutated in place.
-        assert!(j.perp_get_struct_mut(k(2)).is_none());
+        // Absent and raw-`Bytes` keys are not present as a deferred struct.
+        assert!(!j.perp_contains_struct(k(2)));
         j.perp_store(k(3), vec![1, 2, 3]);
-        assert!(j.perp_get_struct_mut(k(3)).is_none());
+        assert!(!j.perp_contains_struct(k(3)));
     }
 
     #[test]

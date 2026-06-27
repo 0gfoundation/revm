@@ -283,11 +283,9 @@ where
         }
         return Ok(Some(decode(&buf)?));
     }
-    // Fast path: a deferred struct written this block — downcast + clone, no deserialization.
-    if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(v) = any.downcast_ref::<T>() {
-            return Ok(Some(v.clone()));
-        }
+    // Fast path: a deferred struct written this block — clone in place, no deserialization.
+    if let Some(v) = context.journal_mut().perp_with_struct::<T, T>(key, |v| v.clone()) {
+        return Ok(Some(v));
     }
     // Cold-read deser cache (#14), for keys only READ this block (not in the write overlay).
     if let Some(any) = context.journal_mut().perp_cache_get(key) {
@@ -536,10 +534,10 @@ pub fn mutate_buy_orders<CTX: ContextTr, R>(
     f: impl FnOnce(&mut Vec<OrderEntry>) -> R,
 ) -> Result<R, PrecompileError> {
     let key = user_buy_orders_key(user, market_id);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(entries) = any.downcast_mut::<Vec<OrderEntry>>() {
-            return Ok(f(entries));
-        }
+    if context.journal_mut().perp_contains_struct(key) {
+        return Ok(context
+            .journal_mut()
+            .perp_with_struct_mut::<Vec<OrderEntry>, R>(key, f));
     }
     let mut entries: Vec<OrderEntry> = load_cached(context, key)?.unwrap_or_default();
     let r = f(&mut entries);
@@ -555,10 +553,10 @@ pub fn mutate_sell_orders<CTX: ContextTr, R>(
     f: impl FnOnce(&mut Vec<OrderEntry>) -> R,
 ) -> Result<R, PrecompileError> {
     let key = user_sell_orders_key(user, market_id);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(entries) = any.downcast_mut::<Vec<OrderEntry>>() {
-            return Ok(f(entries));
-        }
+    if context.journal_mut().perp_contains_struct(key) {
+        return Ok(context
+            .journal_mut()
+            .perp_with_struct_mut::<Vec<OrderEntry>, R>(key, f));
     }
     let mut entries: Vec<OrderEntry> = load_cached(context, key)?.unwrap_or_default();
     let r = f(&mut entries);
@@ -759,10 +757,11 @@ fn load_level_cached<CTX: ContextTr>(
     context: &mut CTX,
     key: B256,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
-            return Ok(q.clone());
-        }
+    if let Some(q) = context
+        .journal_mut()
+        .perp_with_struct::<Vec<[u8; 32]>, _>(key, |q| q.clone())
+    {
+        return Ok(q);
     }
     if let Some(any) = context.journal_mut().perp_cache_get(key) {
         if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
@@ -894,11 +893,11 @@ pub fn push_bid_order<CTX: ContextTr>(
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
     let key = bid_level_key(market_id, price);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            q.push(order_id);
-            return Ok(());
-        }
+    if context.journal_mut().perp_contains_struct(key) {
+        context
+            .journal_mut()
+            .perp_with_struct_mut::<Vec<[u8; 32]>, ()>(key, |q| q.push(order_id));
+        return Ok(());
     }
     let mut queue = load_bid_level(context, market_id, price)?;
     queue.push(order_id);
@@ -913,11 +912,11 @@ pub fn push_ask_order<CTX: ContextTr>(
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
     let key = ask_level_key(market_id, price);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            q.push(order_id);
-            return Ok(());
-        }
+    if context.journal_mut().perp_contains_struct(key) {
+        context
+            .journal_mut()
+            .perp_with_struct_mut::<Vec<[u8; 32]>, ()>(key, |q| q.push(order_id));
+        return Ok(());
     }
     let mut queue = load_ask_level(context, market_id, price)?;
     queue.push(order_id);
