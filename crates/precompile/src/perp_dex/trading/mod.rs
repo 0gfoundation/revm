@@ -744,7 +744,7 @@ fn cancel_order_core<CTX: ContextTr>(
     order_id: [u8; 32],
     context: &mut CTX,
 ) -> Result<Bytes, PrecompileError> {
-    let mut order = storage::load_order(context, &order_id)?
+    let order = storage::load_order(context, &order_id)?
         .ok_or_else(|| perp_err("cancelOrder: order not found"))?;
 
     if order.owner != account.0 .0 {
