@@ -7,6 +7,9 @@ pub mod inner;
 /// Concurrent off-trie PerpDEX overlay substrate for parallel block execution (#21 spike).
 #[cfg(feature = "perp-parallel")]
 pub mod shared_perp;
+/// Scheduler synchronization primitives (account gate, BBO ticket lock) for parallel execution.
+#[cfg(feature = "perp-parallel")]
+pub mod perp_sched;
 pub mod warm_addresses;
 
 pub use entry::{JournalEntry, JournalEntryTr};
