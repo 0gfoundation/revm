@@ -792,6 +792,12 @@ pub(super) fn match_order<CTX: ContextTr>(
     let mut remaining = quantity;
     let mut last_trade_price = None;
     let mut taker_settlement = TakerSettlement::load(context, taker_addr, market_id)?;
+    // The taker order is mutated once per fill and saved ONCE after the loop. Nothing reads
+    // it mid-match: settle_maker_fill touches only the maker; finalize touches the taker's
+    // position/account, not this Order; and the taker order is not rested in the book until
+    // after match_order returns, so it can never be a maker in the queue it sweeps.
+    let mut taker_order = storage::load_order(context, taker_order_id)?
+        .ok_or_else(|| perp_invariant_err("taker order missing during match"))?;
 
     match side {
         Side::Buy => {
@@ -821,7 +827,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let maker_id = queue[qi];
                     qi += 1;
 
-                    let maker_order = match storage::load_order(context, &maker_id)? {
+                    let mut maker_order = match storage::load_order(context, &maker_id)? {
                         Some(o)
                             if matches!(
                                 o.status,
@@ -882,37 +888,26 @@ pub(super) fn match_order<CTX: ContextTr>(
                         },
                     )?;
 
-                    // Update maker order.
-                    let mut updated_maker =
-                        storage::load_order(context, &maker_id)?.ok_or_else(|| {
-                            perp_invariant_err(format!(
-                                "maker order {:?} missing after maker settlement",
-                                maker_id
-                            ))
-                        })?;
-                    updated_maker.filled += fill_qty;
-                    updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
+                    // Update the maker order in place — settle_maker_fill does not touch the
+                    // maker Order struct, so the value loaded above is still current.
+                    maker_order.filled += fill_qty;
+                    maker_order.status = if maker_order.filled >= maker_order.quantity {
                         OrderStatus::Filled
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    storage::save_order(context, &maker_id, &updated_maker)?;
+                    storage::save_order(context, &maker_id, &maker_order)?;
 
-                    // Update taker order.
-                    let mut taker_order = storage::load_order(context, taker_order_id)?
-                        .ok_or_else(|| {
-                            perp_invariant_err("taker order missing after maker settlement")
-                        })?;
+                    // Accumulate into the hoisted taker order (saved once after the loop).
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
                         OrderStatus::Filled
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    storage::save_order(context, taker_order_id, &taker_order)?;
 
                     remaining -= fill_qty;
-                    if updated_maker.status == OrderStatus::PartiallyFilled {
+                    if maker_order.status == OrderStatus::PartiallyFilled {
                         new_queue.push(maker_id);
                     }
                 }
@@ -960,7 +955,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let maker_id = queue[qi];
                     qi += 1;
 
-                    let maker_order = match storage::load_order(context, &maker_id)? {
+                    let mut maker_order = match storage::load_order(context, &maker_id)? {
                         Some(o)
                             if matches!(
                                 o.status,
@@ -1021,35 +1016,23 @@ pub(super) fn match_order<CTX: ContextTr>(
                         },
                     )?;
 
-                    let mut updated_maker =
-                        storage::load_order(context, &maker_id)?.ok_or_else(|| {
-                            perp_invariant_err(format!(
-                                "maker order {:?} missing after maker settlement",
-                                maker_id
-                            ))
-                        })?;
-                    updated_maker.filled += fill_qty;
-                    updated_maker.status = if updated_maker.filled >= updated_maker.quantity {
+                    maker_order.filled += fill_qty;
+                    maker_order.status = if maker_order.filled >= maker_order.quantity {
                         OrderStatus::Filled
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    storage::save_order(context, &maker_id, &updated_maker)?;
+                    storage::save_order(context, &maker_id, &maker_order)?;
 
-                    let mut taker_order = storage::load_order(context, taker_order_id)?
-                        .ok_or_else(|| {
-                            perp_invariant_err("taker order missing after maker settlement")
-                        })?;
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
                         OrderStatus::Filled
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    storage::save_order(context, taker_order_id, &taker_order)?;
 
                     remaining -= fill_qty;
-                    if updated_maker.status == OrderStatus::PartiallyFilled {
+                    if maker_order.status == OrderStatus::PartiallyFilled {
                         new_queue.push(maker_id);
                     }
                 }
@@ -1072,6 +1055,11 @@ pub(super) fn match_order<CTX: ContextTr>(
         }
     }
 
+    // Persist the taker order once with its accumulated fill (saved here, not per fill,
+    // since nothing reads it during the match). Skipped when nothing matched.
+    if remaining < quantity {
+        storage::save_order(context, taker_order_id, &taker_order)?;
+    }
     taker_settlement.finalize(context, side, market)?;
     if let Some(price) = last_trade_price {
         storage::save_last_traded_price(context, market_id, price)?;
