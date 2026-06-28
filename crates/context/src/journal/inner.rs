@@ -379,6 +379,20 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         self.perp_shared = Some(book);
     }
 
+    /// Whether off-trie perp ops route to the shared concurrent book (parallel block execution).
+    /// Mirrors [`context_interface::JournalTr::perp_is_parallel`]; `false` without the feature.
+    #[inline]
+    pub fn perp_is_parallel(&self) -> bool {
+        #[cfg(feature = "perp-parallel")]
+        {
+            self.perp_shared.is_some()
+        }
+        #[cfg(not(feature = "perp-parallel"))]
+        {
+            false
+        }
+    }
+
     /// The perp checkpoint index: the shared write-set length in parallel mode, else the serial
     /// PerpSection undo length.
     #[inline]

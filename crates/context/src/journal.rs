@@ -343,6 +343,11 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn perp_is_parallel(&self) -> bool {
+        self.inner.perp_is_parallel()
+    }
+
+    #[inline]
     fn perp_contains_struct(&mut self, key: B256) -> bool {
         self.inner.perp_contains_struct(key)
     }

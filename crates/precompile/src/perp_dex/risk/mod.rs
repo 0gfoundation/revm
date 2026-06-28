@@ -1377,12 +1377,44 @@ fn max_index_price_checkpoints(price_update_interval: u64) -> usize {
         .saturating_add(2) as usize
 }
 
+/// Block-end mid sample for the PARALLEL driver barrier (catalog #21 spike, D3-b). Reads the SETTLED
+/// best quote and records ONE order-INDEPENDENT observation, replacing the in-body order-dependent
+/// "first best-change of the block" sampling that the parallel path skips ([`ContextTr`] journal in
+/// parallel mode). The final best is byte-identical across nodes (it is the book's settled state), so
+/// this sample is deterministic. (Aligning the SERIAL path to this same block-end rule + re-pinning
+/// the golden is bundled into the reth-seam step, when the parallel driver goes live.)
+pub(crate) fn finalize_block_mid_sample<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<(), PrecompileError> {
+    let best_bid = storage::load_best_bid(context, market_id)?;
+    let best_ask = storage::load_best_ask(context, market_id)?;
+    let mid_price = match (best_bid, best_ask) {
+        (0, 0) => return Ok(()),
+        (0, ask) => ask,
+        (bid, 0) => bid,
+        (bid, ask) => ((bid as u128 + ask as u128) / 2) as u64,
+    };
+    let timestamp: u64 = context.block().timestamp().saturating_to();
+    let mut window = storage::load_price_basis_window(context, market_id)?;
+    if window.record_observation(timestamp, mid_price) {
+        storage::save_price_basis_window(context, market_id, &window)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn record_mid_price_sample_for_best_quote_change<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     best_bid: u64,
     best_ask: u64,
 ) -> Result<(), PrecompileError> {
+    // Parallel block execution: this in-body, order-DEPENDENT "first best-change of the block" sample
+    // would race across slots and diverge from serial. Skip it; the parallel driver's barrier records
+    // an order-INDEPENDENT block-end mid (catalog #21 spike, D3-b). Serial path is unaffected.
+    if context.journal().perp_is_parallel() {
+        return Ok(());
+    }
     let mid_price = match (best_bid, best_ask) {
         (0, 0) => return Ok(()),
         (0, ask) => ask,

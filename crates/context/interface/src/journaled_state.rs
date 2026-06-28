@@ -248,6 +248,14 @@ pub trait JournalTr {
         let _ = (key, value);
     }
 
+    /// Whether this journal is routing off-trie perp ops to a concurrent shared book (parallel block
+    /// execution). The precompile uses this to skip the in-body, order-DEPENDENT mid-price sampling
+    /// (which would race across slots / diverge from serial) and instead let the parallel driver's
+    /// barrier record an order-INDEPENDENT block-end sample. Default backend (serial): `false`.
+    fn perp_is_parallel(&self) -> bool {
+        false
+    }
+
     /// Writes a deferred deserialized off-trie blob (#16d Phase 2): the value is kept type-erased
     /// and serialized to bytes ONCE at block end (`take_perp_delta`) via `ser`, instead of on every
     /// write. `clone` keeps the overlay `Clone`. Both fns are monomorphized by the caller (the

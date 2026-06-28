@@ -306,8 +306,19 @@ pub fn parallel_place<CTX: ContextTr>(
     account_gate: &AccountGate,
     book_lock: &BookSideLock,
     bbo: &BboTicketLock,
+    price_completion: &PriceCompletion,
     work: &PlaceWork,
 ) -> Result<PlaceOutcome, PrecompileError> {
+    // Publish this place's completion at its (limit) price on EVERY exit, so a higher-txn_id at-best
+    // cancel of a same-block order at this price (mixed batch, step 3d) sees the rest before deciding
+    // emptiness. Fires on Ok / `?` / panic, mirroring the cancel path. A place's price is always
+    // `work.price` regardless of outcome (rested / reverted / downgraded).
+    let _mark_done = MarkDoneOnDrop {
+        price_completion,
+        market: work.market_id,
+        price: work.price,
+        ticket: work.ticket,
+    };
     enum UnderTicket {
         Done(Result<PlaceOutcome, PrecompileError>),
         Release,
@@ -366,7 +377,10 @@ where
     CTX: ContextTr,
     F: Fn(Arc<SharedPerpBook>) -> CTX + Sync,
 {
-    let make_ctx = &make_ctx;
+    // Place-only batch: no at-best cancel waits on these, but places still mark_done (harmlessly) so
+    // the same primitive serves the unified mixed batch (step 3d) unchanged.
+    let price_completion = PriceCompletion::new();
+    let (make_ctx, price_completion) = (&make_ctx, &price_completion);
     thread::scope(|s| {
         let handles: Vec<_> = items
             .iter()
@@ -374,7 +388,7 @@ where
                 let book = book.clone();
                 s.spawn(move || {
                     let mut ctx = make_ctx(book);
-                    parallel_place(&mut ctx, account_gate, book_lock, bbo, item)
+                    parallel_place(&mut ctx, account_gate, book_lock, bbo, price_completion, item)
                 })
             })
             .collect();
@@ -721,6 +735,186 @@ where
     })
 }
 
+// ── Driver: unified parallel block (step 3d) ──────────────────────────────────
+
+/// One perp op in a block, in txn_id order. `Place`/`Cancel` carry their pre-assigned `ticket`
+/// (= block-local txn_id, dense 0..n) and per-maker `rank`. The driver fans them out to the parallel
+/// phase; any op that downgrades is re-run on the serial barrier (step 3d-3).
+#[derive(Debug, Clone)]
+pub enum PerpOp {
+    Place(PlaceWork),
+    Cancel(CancelWork),
+}
+
+/// Per-op result, returned in txn_id order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpResult {
+    Place(PlaceOutcome),
+    Cancel(CancelOutcome),
+}
+
+/// One op prepared by the serial pre-scan: a place (unchanged) or a cancel with its resolved
+/// `(market, side, price)` + the lower-ticket SAME-(market, price) ticket set it must wait for.
+enum PreparedOp {
+    Place(PlaceWork),
+    Cancel(CancelPlanItem),
+}
+
+/// Serial pre-scan over the WHOLE block (places + cancels): resolve each op's `(market, side, price)`
+/// and, for each cancel, the tickets of all lower-txn_id ops (place OR cancel) at the SAME
+/// `(market, price)` — the set the at-best cancel waits for so the level membership is settled before
+/// it decides emptiness. (In a non-crossing book a price belongs to exactly one side, so the
+/// `(market, price)` key — which PriceCompletion is also keyed on — implies the side.)
+fn plan_block<CTX, F>(book: &Arc<SharedPerpBook>, ops: &[PerpOp], make_ctx: &F) -> Vec<PreparedOp>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX,
+{
+    let mut ctx = make_ctx(book.clone());
+    // Same-block place linkage: a cancel of an order PLACED earlier this block can't resolve from the
+    // book (the pre-scan runs before the parallel phase rests it), so link it to the place op's
+    // (market, side, price) by order_id. order_ids are unique, so a cancel resolves from the book
+    // (prior-block order) OR this map (same-block place), never both.
+    let mut placed: std::collections::HashMap<[u8; 32], (u64, u8, u64)> =
+        std::collections::HashMap::new();
+    for op in ops {
+        if let PerpOp::Place(w) = op {
+            placed.insert(w.order_id, (w.market_id, w.side, w.price));
+        }
+    }
+    // (market, side, price) per op; None = a cancel whose order is neither in the book nor placed
+    // this block.
+    let resolved: Vec<Option<(u64, u8, u64)>> = ops
+        .iter()
+        .map(|op| match op {
+            PerpOp::Place(w) => Some((w.market_id, w.side, w.price)),
+            PerpOp::Cancel(w) => storage::load_order(&mut ctx, &w.order_id)
+                .ok()
+                .flatten()
+                .map(|o| (o.market_id, o.side as u8, o.price))
+                .or_else(|| placed.get(&w.order_id).copied()),
+        })
+        .collect();
+
+    let ticket = |op: &PerpOp| match op {
+        PerpOp::Place(w) => w.ticket,
+        PerpOp::Cancel(w) => w.ticket,
+    };
+
+    ops.iter()
+        .enumerate()
+        .map(|(i, op)| match op {
+            PerpOp::Place(w) => PreparedOp::Place(w.clone()),
+            PerpOp::Cancel(w) => {
+                let required = match resolved[i] {
+                    Some((m, _s, p)) => ops
+                        .iter()
+                        .zip(&resolved)
+                        .filter(|(o2, r2)| {
+                            ticket(o2) < w.ticket
+                                && matches!(r2, Some((m2, _, p2)) if *m2 == m && *p2 == p)
+                        })
+                        .map(|(o2, _)| ticket(o2))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                PreparedOp::Cancel(CancelPlanItem {
+                    work: w.clone(),
+                    resolved: resolved[i],
+                    required,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Execute a block's perp ops with place/cancel running concurrently, producing the SAME net book
+/// delta + per-op results as serial txn_id-order execution (step 3d). Three phases:
+///   1. serial pre-scan ([`plan_block`]): resolve + schedule (ticket/rank are caller-assigned);
+///   2. parallel: one shared `AccountGate` + `BookSideLock` + `BboTicketLock` + `PriceCompletion`,
+///      a worker per op (fresh thread-local slot ctx via `make_ctx`);
+///   3. serial barrier: FIFO finalize ([`finalize_place_batch_ordering`]) + block-end order-
+///      independent mid sample (D3-b). (Downgrade re-run + taker contagion land in step 3d-3.)
+/// `ops` must be in txn_id order with dense tickets `0..ops.len()`. Returns results in that order.
+pub fn transact_block_parallel<CTX, F>(
+    book: &Arc<SharedPerpBook>,
+    ops: &[PerpOp],
+    make_ctx: F,
+) -> Result<Vec<OpResult>, PrecompileError>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX + Sync,
+{
+    let prepared = plan_block(book, ops, &make_ctx);
+    let account_gate = AccountGate::new();
+    let book_lock = BookSideLock::new();
+    let bbo = BboTicketLock::new();
+    let price_completion = PriceCompletion::new();
+
+    // Phase 2: parallel. Each worker builds its own slot ctx (journal never crosses a thread).
+    let results: Vec<OpResult> = {
+        let (make_ctx, ag, bl, bbo, pc, prepared) = (
+            &make_ctx,
+            &account_gate,
+            &book_lock,
+            &bbo,
+            &price_completion,
+            &prepared,
+        );
+        thread::scope(|s| {
+            let handles: Vec<_> = prepared
+                .iter()
+                .map(|p| {
+                    let book = book.clone();
+                    s.spawn(move || -> Result<OpResult, PrecompileError> {
+                        let mut ctx = make_ctx(book);
+                        match p {
+                            PreparedOp::Place(w) => {
+                                parallel_place(&mut ctx, ag, bl, bbo, pc, w).map(OpResult::Place)
+                            }
+                            PreparedOp::Cancel(plan) => {
+                                parallel_cancel(&mut ctx, ag, bl, bbo, pc, plan).map(OpResult::Cancel)
+                            }
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Result<Vec<_>, _>>()
+        })?
+    };
+
+    // Phase 3 barrier. FIFO time-priority over this block's Executed places.
+    let mut place_items: Vec<PlaceWork> = Vec::new();
+    let mut place_results: Vec<Result<PlaceOutcome, PrecompileError>> = Vec::new();
+    for (op, r) in ops.iter().zip(&results) {
+        if let (PerpOp::Place(w), OpResult::Place(o)) = (op, r) {
+            place_items.push(w.clone());
+            place_results.push(Ok(*o));
+        }
+    }
+    finalize_place_batch_ordering(book, &place_items, &place_results, &make_ctx)?;
+
+    // Block-end order-independent mid sample (D3-b) for every market the block touched.
+    let mut markets: Vec<u64> = prepared
+        .iter()
+        .filter_map(|p| match p {
+            PreparedOp::Place(w) => Some(w.market_id),
+            PreparedOp::Cancel(c) => c.resolved.map(|(m, _, _)| m),
+        })
+        .collect();
+    markets.sort_unstable();
+    markets.dedup();
+    let mut barrier_ctx = make_ctx(book.clone());
+    for m in markets {
+        crate::perp_dex::risk::finalize_block_mid_sample(&mut barrier_ctx, m)?;
+    }
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod driver_tests {
     use crate::perp_dex::types::Market;
@@ -743,6 +937,7 @@ mod driver_tests {
         let gate = AccountGate::new();
         let book_lock = BookSideLock::new();
         let bbo = BboTicketLock::new();
+        let pc = PriceCompletion::new();
 
         let work = PlaceWork {
             maker: address!("1111111111111111111111111111111111111111"),
@@ -758,7 +953,7 @@ mod driver_tests {
             ticket: 0,
         };
 
-        let out = parallel_place(&mut ctx, &gate, &book_lock, &bbo, &work).unwrap();
+        let out = parallel_place(&mut ctx, &gate, &book_lock, &bbo, &pc, &work).unwrap();
         assert_eq!(out, PlaceOutcome::Downgrade);
         assert!(book.take_delta().is_empty(), "a downgrade must write nothing to the book");
     }
@@ -920,7 +1115,15 @@ mod driver_tests {
         finalize_place_batch_ordering(&book, &items, &results, make_slot).unwrap();
         let parallel_delta = book.take_delta();
 
-        assert_eq!(serial_delta, parallel_delta);
+        // Batch-level gate: compare the BOOK delta. price_basis_window is a BLOCK-end artifact — the
+        // parallel batch skips the in-body (order-dependent) sample (perp_is_parallel) and a bare
+        // batch runner does no block-end sample, so it is absent here while the serial ref still wrote
+        // it in-body. The order-independent block-end sample is covered by the block-driver test.
+        let (mut s, mut p) = (serial_delta, parallel_delta);
+        let wkey = storage::keys::price_basis_window_key(MID);
+        s.remove(&wkey);
+        p.remove(&wkey);
+        assert_eq!(s, p);
     }
 
     // ── cancel driver ─────────────────────────────────────────────────────────────
@@ -996,7 +1199,13 @@ mod driver_tests {
         }
         let parallel_delta = book.take_delta();
 
-        assert_eq!(serial_delta, parallel_delta);
+        // See the place batch test: price_basis_window is a block-end artifact, carved out of this
+        // batch-level comparison (covered by the block-driver test).
+        let (mut s, mut p) = (serial_delta, parallel_delta);
+        let wkey = storage::keys::price_basis_window_key(MID);
+        s.remove(&wkey);
+        p.remove(&wkey);
+        assert_eq!(s, p);
     }
 
     /// An at-best cancel that is the SOLE order at the best level → removing it would move the BBO →
@@ -1035,6 +1244,72 @@ mod driver_tests {
             ref_delta, subject_delta,
             "a downgraded cancel must not write to the book in the parallel phase"
         );
+    }
+
+    // ── unified block driver (step 3d) ────────────────────────────────────────────
+
+    /// Run one block op via its normal SERIAL entrypoint (the differential reference).
+    fn run_serial_op<CTX: ContextTr>(ctx: &mut CTX, op: &PerpOp) {
+        match op {
+            PerpOp::Place(w) => {
+                place_order_core(
+                    w.maker, w.order_id, w.market_id, w.side, w.price, w.qty, w.order_type, w.tif,
+                    w.client_order_id, ctx,
+                )
+                .unwrap();
+            }
+            PerpOp::Cancel(w) => {
+                cancel_order_core(w.canceller, w.order_id, ctx).unwrap();
+            }
+        }
+    }
+
+    /// THE step-3d gate: a MIXED block (places + a cancel of a SAME-BLOCK-placed order) run through
+    /// `transact_block_parallel` produces a book delta byte-identical to the same ops run serially in
+    /// txn_id order — INCLUDING price_basis_window. Exercises the unified ticket domain, the shared
+    /// PriceCompletion across place+cancel (the at-best cancel of X waits for the lower-ticket places
+    /// at price 100 — incl. X's own place, resolved via same-block linkage), and the block-end mid
+    /// sample. Scenario has exactly ONE best-change (X sets best_bid 0→100; no asks; later ops don't
+    /// move best), so serial's in-body first-change mid (=100) equals the parallel barrier's block-end
+    /// final mid (=100) → the window matches byte-for-byte with no carve-out.
+    #[test]
+    fn transact_block_parallel_matches_serial_delta() {
+        let a = user_addr(1);
+        let b = user_addr(2);
+        let c = user_addr(3);
+        let (x, y, z) = (oid(10), oid(11), oid(12));
+
+        // ops in txn_id order; ticket = index, rank = per-maker count.
+        // 0: a places X@100 (mover → best_bid 100)
+        // 1: b places Y@99  (non-mover, below best)
+        // 2: c places Z@100 (non-mover, joins level 100)
+        // 3: a cancels X     (at-best 100; Z remains → non-emptying → parallel remove)
+        let ops = vec![
+            PerpOp::Place(mk_work(a, x, 100 * TICK, 0, 0)),
+            PerpOp::Place(mk_work(b, y, 99 * TICK, 0, 1)),
+            PerpOp::Place(mk_work(c, z, 100 * TICK, 0, 2)),
+            PerpOp::Cancel(mk_cancel(a, x, 1, 3)),
+        ];
+
+        // Serial reference.
+        let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut serial, &[a, b, c]);
+        for op in &ops {
+            run_serial_op(&mut serial, op);
+        }
+        let serial_delta = serial.journal_mut().take_perp_delta();
+
+        // Parallel block driver.
+        let book = Arc::new(SharedPerpBook::new());
+        seed(&mut make_slot(book.clone()), &[a, b, c]);
+        let results = transact_block_parallel(&book, &ops, make_slot).unwrap();
+        let parallel_delta = book.take_delta();
+
+        assert_eq!(results[0], OpResult::Place(PlaceOutcome::Executed));
+        assert_eq!(results[1], OpResult::Place(PlaceOutcome::Executed));
+        assert_eq!(results[2], OpResult::Place(PlaceOutcome::Executed));
+        assert_eq!(results[3], OpResult::Cancel(CancelOutcome::Executed));
+        assert_eq!(serial_delta, parallel_delta);
     }
 
     /// Regression for the BBO-serve-cursor wedge: a cancel of an UNLOADABLE order (resolved == None)
