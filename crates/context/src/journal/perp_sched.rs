@@ -232,12 +232,21 @@ impl PriceCompletion {
     }
 }
 
-/// Per-(market, side) mutual-exclusion lock guarding ALL book mutations on one side of one market's
-/// order book — the level FIFO queues AND the side's price list. Both are cross-maker shared and are
-/// mutated via a load → modify → store sequence that is NOT atomic against the concurrent
-/// [`super::shared_perp::SharedPerpBook`] (load returns an owned `Vec`, the store happens later), so
-/// two parallel ops touching the same side can lose an append/removal. Every parallel place/cancel
-/// runs its book-mutating body under this lock for its order's side.
+/// Per-(market, side) mutual-exclusion lock guarding the cross-maker SIDE structures of one market's
+/// order book: that side's level FIFO queues AND its price list. Both are mutated via a load → modify
+/// → store sequence that is NOT atomic against the concurrent [`super::shared_perp::SharedPerpBook`]
+/// (load returns an owned `Vec`, the store happens later), so two parallel ops touching the same side
+/// can lose an append/removal. Every parallel place/cancel runs its book-mutating body under this
+/// lock for its order's side.
+///
+/// SCOPE — what this does NOT cover: the per-MARKET `best_bid`/`best_ask` cache, the mid-price
+/// samples, and the `price_basis_window` are NOT guarded here (a Buy op holds the Buy lock, a Sell op
+/// the Sell lock — different mutexes — yet a mover reads the opposite best and read-modify-stores the
+/// shared per-market window). Those per-market keys are instead serialized by the **BBO ticket**:
+/// only movers write them and a mover runs its whole body while holding its BBO ticket (which is
+/// per-market and strictly exclusive). TRIPWIRE: any future path that writes best/window MUST run
+/// inside `bbo.run`; moving that out of the held-ticket region would reintroduce a lost-update race
+/// that this lock does NOT catch.
 ///
 /// It is the INNERMOST lock in the discipline (BBO ticket → AccountGate → BookSideLock): a leaf that
 /// never blocks on anything while held, so it cannot participate in a deadlock cycle regardless of

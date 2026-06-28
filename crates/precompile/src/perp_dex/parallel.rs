@@ -524,6 +524,25 @@ fn gated_cancel<CTX: ContextTr>(
     })
 }
 
+/// RAII guard that publishes a cancel's completion at its price on EVERY exit — `Ok`, an early `?`
+/// return (storage error / a future `Fatal`), or a panic. A best-price cancel's [`PriceCompletion`]
+/// wait only resolves once each lower-txn_id op at its price is marked done; if a marker could skip
+/// `mark_done` on an error path the waiter would hang forever (block-wide), so this mirrors the
+/// advance-on-drop discipline of `AccountGate`/`BboTicketLock`.
+struct MarkDoneOnDrop<'a> {
+    price_completion: &'a PriceCompletion,
+    market: u64,
+    price: u64,
+    ticket: u64,
+}
+
+impl Drop for MarkDoneOnDrop<'_> {
+    fn drop(&mut self) {
+        self.price_completion
+            .mark_done(self.market, self.price, self.ticket);
+    }
+}
+
 /// Execute one parallel cancel. Reads the best under the BBO ticket to classify at-best vs below-best
 /// ([`cancel_at_best`]); a below-best cancel removes in parallel; an at-best cancel first waits for
 /// all lower-txn_id ops at its price ([`PriceCompletion::wait_for`]) so the level membership is
@@ -541,8 +560,11 @@ fn parallel_cancel<CTX: ContextTr>(
     let (market, side_u8, price) = match plan.resolved {
         Some(t) => t,
         // Order not loadable → the body reverts (missing order) without touching any level, so it
-        // needs no book lock, no BBO ticket, no price-completion bookkeeping.
+        // needs no book lock and no price-completion bookkeeping (no waiter can name a None op's
+        // ticket — `plan_cancel_batch` only adds Some-resolved tickets to a `required` set). It MUST
+        // still consume its BBO ticket, or the serve cursor wedges and every higher ticket hangs.
         None => {
+            bbo.run(plan.work.ticket, || ());
             return account_gate.run(plan.work.canceller, plan.work.rank, || {
                 let cp = ctx.journal_mut().checkpoint();
                 match cancel_order_core(plan.work.canceller, plan.work.order_id, ctx) {
@@ -559,6 +581,15 @@ fn parallel_cancel<CTX: ContextTr>(
         }
     };
     let side = Side::from_u8(side_u8).expect("pre-scan resolved a valid side");
+
+    // Publish this op's completion at its price on EVERY exit (incl. the `?` paths below), so higher
+    // same-price cancels' waits always resolve. Fires on drop AFTER the body's book write has landed.
+    let _mark_done = MarkDoneOnDrop {
+        price_completion,
+        market,
+        price,
+        ticket: plan.work.ticket,
+    };
 
     // 1. Classify under the BBO ticket (best read serialized in txn_id order).
     let at_best = bbo.run(plan.work.ticket, || -> Result<bool, PrecompileError> {
@@ -602,10 +633,7 @@ fn parallel_cancel<CTX: ContextTr>(
         })?
     };
 
-    // Publish this op's completion at its price so higher same-price cancels' waits resolve. Marked
-    // for EVERY outcome (executed / reverted / downgraded): in each case this op is "done" w.r.t. the
-    // level membership a waiter cares about.
-    price_completion.mark_done(market, price, plan.work.ticket);
+    // `_mark_done` fires here on drop (or earlier on any `?`/panic), publishing this op at its price.
     Ok(outcome)
 }
 
@@ -1007,5 +1035,49 @@ mod driver_tests {
             ref_delta, subject_delta,
             "a downgraded cancel must not write to the book in the parallel phase"
         );
+    }
+
+    /// Regression for the BBO-serve-cursor wedge: a cancel of an UNLOADABLE order (resolved == None)
+    /// at a LOWER ticket must still consume its BBO ticket, or a higher-ticket cancel's `bbo.run`
+    /// blocks forever and the whole batch hangs. Run under a watchdog so a regression fails loudly
+    /// (timeout) instead of hanging the test binary.
+    #[test]
+    fn parallel_cancel_unloadable_lower_ticket_does_not_wedge_bbo() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let a = user_addr(1);
+            let b = user_addr(2);
+            let c = user_addr(3);
+            let w = oid(13);
+            let bogus = oid(99); // never placed → resolved == None
+
+            let book = Arc::new(SharedPerpBook::new());
+            {
+                let mut s = make_slot(book.clone());
+                seed(&mut s, &[a, b, c]);
+                rest(&mut s, c, oid(12), 100 * TICK); // best bid 100 (NOT cancelled)
+                rest(&mut s, b, w, 99 * TICK); // below best
+            }
+            let cancels = vec![
+                mk_cancel(a, bogus, 0, 0), // unloadable → None, ticket 0 (MUST pass the ticket)
+                mk_cancel(b, w, 0, 1),     // real below-best cancel, ticket 1
+            ];
+            let gate = AccountGate::new();
+            let book_lock = BookSideLock::new();
+            let bbo = BboTicketLock::new();
+            let results = run_cancel_batch(&book, &gate, &book_lock, &bbo, &cancels, make_slot);
+            let _ = tx.send(results);
+        });
+
+        let results = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "parallel_cancel wedged the BBO serve cursor (deadlock): a None-resolved lower ticket \
+             did not pass its BBO ticket",
+        );
+        worker.join().unwrap();
+        assert_eq!(results[0].as_ref().unwrap(), &CancelOutcome::Reverted); // bogus order
+        assert_eq!(results[1].as_ref().unwrap(), &CancelOutcome::Executed); // real below-best
     }
 }
