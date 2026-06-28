@@ -740,18 +740,24 @@ fn parallel_cancel<CTX: ContextTr>(
             let present = level.iter().any(|id| id == &plan.work.order_id);
             let others_remain = level.iter().any(|id| id != &plan.work.order_id);
             if present && !others_remain {
-                // Sole order at the best level → removing it MOVES the BBO. Treat like a taker: set
-                // the contagion floor (forces every higher-txn_id op to the barrier, so the same
-                // maker's later margin-touching ops run AFTER this cancel's deferred margin release)
-                // and downgrade. The serial barrier re-runs the removal in txn_id order.
-                // TODO(perf, pre-multi-market): a NON-OWNER cancel of someone's sole-best order is
-                // present+sole here but reverts at the barrier (owner check) — it still sets the floor,
-                // needlessly forcing the tail serial (a griefer cliff; correctness-neutral). plan_block
-                // already loads the order; capture owner and only set the floor when owner==canceller
-                // (else RunParallel → reverts in parallel, touching nothing). Throughput-only; matters
-                // most once min_downgrade is per-market.
-                min_downgrade.fetch_min(plan.work.ticket, Ordering::SeqCst);
-                Ok(TicketDecision::Downgrade)
+                // Sole order at the best level → removing it MOVES the BBO. But only an OWNER's cancel
+                // actually removes it: a non-owner cancel reverts ("not owner") at the body, touching
+                // nothing. So only an owner-cancel is treated like a taker — set the contagion floor
+                // (forces every higher-txn_id op to the barrier, so the same maker's later
+                // margin-touching ops run AFTER this cancel's deferred margin release) and downgrade;
+                // the serial barrier re-runs the removal in txn_id order. A NON-owner sole-best cancel
+                // does NOT set the floor (else a griefer cancelling someone's sole-best order would
+                // needlessly force the whole tail serial); it runs in parallel and reverts harmlessly,
+                // byte-identical to serial. (3d-7 fix — owner read locally, no pre-scan plumbing.)
+                let is_owner = storage::load_order(ctx, &plan.work.order_id)?
+                    .map(|o| o.owner == plan.work.canceller.0 .0)
+                    .unwrap_or(false);
+                if is_owner {
+                    min_downgrade.fetch_min(plan.work.ticket, Ordering::SeqCst);
+                    Ok(TicketDecision::Downgrade)
+                } else {
+                    Ok(TicketDecision::RunParallel)
+                }
             } else {
                 // Others remain (or the order is already gone) → BBO unchanged → remove in parallel.
                 Ok(TicketDecision::RunParallel)
@@ -1401,6 +1407,44 @@ mod driver_tests {
             classify_perp_tx(&[0x01, 0x02], a, &mut ctx).unwrap(),
             PerpTxClass::NotTrading
         ));
+    }
+
+    /// 3d-7 fix: a NON-OWNER cancel of someone's sole-best order. It reverts ("not owner") touching
+    /// nothing, so it runs in parallel and must NOT set the contagion floor (a griefer cancelling
+    /// another account's sole-best order would otherwise force the whole tail serial). Exercises the
+    /// owner-check branch; the cancel is Reverted and the delta stays byte-identical to serial.
+    #[test]
+    fn transact_block_parallel_non_owner_sole_best_cancel_matches_serial() {
+        let a = user_addr(1); // owner of the sole-best ask
+        let b = user_addr(2); // griefer: cancels a's order (not the owner)
+        let sa = oid(90);
+        let ops = vec![
+            mk_place(a, sa, 1, 100 * TICK, 0, 0, 0), // SELL@100, sole best ask
+            PerpOp::Cancel(mk_cancel(b, sa, 0, 1)),  // b cancels a's order → not owner → reverts
+        ];
+
+        let wkey = storage::keys::price_basis_window_key(MID);
+        // Serial reference: the non-owner cancel reverts (no delta) and run_serial_op unwraps, so
+        // reference the resting place only (the parallel path applies + rolls back to the same state).
+        let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut serial, &[a, b]);
+        run_serial_op(&mut serial, &ops[0]);
+        let mut serial_delta = serial.journal_mut().take_perp_delta();
+        serial_delta.remove(&wkey);
+
+        let book = Arc::new(SharedPerpBook::new());
+        seed(&mut make_slot(book.clone()), &[a, b]);
+        let results = transact_block_parallel(test_pool(), &book, &ops, make_slot).unwrap();
+        let mut parallel_delta = book.take_delta();
+        parallel_delta.remove(&wkey);
+
+        assert_eq!(results[0], OpResult::Place(PlaceOutcome::Executed));
+        assert_eq!(
+            results[1],
+            OpResult::Cancel(CancelOutcome::Reverted),
+            "a non-owner cancel must revert"
+        );
+        assert_eq!(serial_delta, parallel_delta);
     }
 
     /// A taker TIF (IOC) is downgraded to the barrier without touching the book — and without
