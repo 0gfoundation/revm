@@ -27,6 +27,7 @@ use crate::perp_dex::{
     trading::{cancel_order_core, place_order_core},
 };
 use crate::PrecompileError;
+use context::journal::perp_pool::PerpPool;
 use context::journal::perp_sched::{AccountGate, BboTicketLock, BookSideLock, PriceCompletion};
 use context::journal::shared_perp::SharedPerpBook;
 use context::journaled_state::JournalCheckpoint;
@@ -870,6 +871,7 @@ pub enum OpResult {
 
 /// One op prepared by the serial pre-scan: a place (unchanged) or a cancel with its resolved
 /// `(market, side, price)` + the lower-ticket SAME-(market, price) ticket set it must wait for.
+#[derive(Debug, Clone)]
 enum PreparedOp {
     Place(PlaceWork),
     Cancel(CancelPlanItem),
@@ -989,61 +991,59 @@ fn normalize_schedule(ops: &[PerpOp]) -> Vec<PerpOp> {
 /// `ops` must be in txn_id order; the driver assigns dense tickets + per-maker ranks itself
 /// ([`normalize_schedule`]). Returns results in that order.
 pub fn transact_block_parallel<CTX, F>(
+    pool: &PerpPool,
     book: &Arc<SharedPerpBook>,
     ops: &[PerpOp],
     make_ctx: F,
 ) -> Result<Vec<OpResult>, PrecompileError>
 where
     CTX: ContextTr,
-    F: Fn(Arc<SharedPerpBook>) -> CTX + Sync,
+    F: Fn(Arc<SharedPerpBook>) -> CTX + Clone + Send + 'static,
 {
     // Driver-owned scheduling — ticket = txn_id index, rank = per-maker count (monotone in ticket).
     let ops = normalize_schedule(ops);
     let prepared = plan_block(book, &ops, &make_ctx);
-    let account_gate = AccountGate::new();
-    let book_lock = BookSideLock::new();
-    let bbo = BboTicketLock::new();
-    let price_completion = PriceCompletion::new();
+    let account_gate = Arc::new(AccountGate::new());
+    let book_lock = Arc::new(BookSideLock::new());
+    let bbo = Arc::new(BboTicketLock::new());
+    let price_completion = Arc::new(PriceCompletion::new());
     // Taker-contagion floor: the lowest ticket among taker downgrades; any op above it is forced to
     // the barrier so the deferred-taker tail re-runs serial-equivalently (see parallel_place).
-    let min_downgrade = AtomicU64::new(u64::MAX);
+    let min_downgrade = Arc::new(AtomicU64::new(u64::MAX));
 
-    // Phase 2: parallel. Each worker builds its own slot ctx (journal never crosses a thread).
+    // Phase 2: parallel on the persistent FIFO pool. Each job builds its own slot ctx (the journal
+    // never crosses a thread); the gates/book are shared via Arc and `make_ctx` is cloned per job, so
+    // each job is 'static (the pool needs no scoped-lifetime unsafe). The pool's strict FIFO + the
+    // scheme's wait-edges-point-lower invariant keep it deadlock-free (see PerpPool docs).
     let mut results: Vec<OpResult> = {
-        let (make_ctx, ag, bl, bbo, pc, md, prepared) = (
-            &make_ctx,
-            &account_gate,
-            &book_lock,
-            &bbo,
-            &price_completion,
-            &min_downgrade,
-            &prepared,
-        );
-        thread::scope(|s| {
-            let handles: Vec<_> = prepared
-                .iter()
-                .map(|p| {
-                    let book = book.clone();
-                    s.spawn(move || -> Result<OpResult, PrecompileError> {
-                        let mut ctx = make_ctx(book);
-                        match p {
-                            PreparedOp::Place(w) => {
-                                parallel_place(&mut ctx, ag, bl, bbo, pc, md, w)
-                                    .map(OpResult::Place)
-                            }
-                            PreparedOp::Cancel(plan) => {
-                                parallel_cancel(&mut ctx, ag, bl, bbo, pc, md, plan)
-                                    .map(OpResult::Cancel)
-                            }
+        let tasks: Vec<_> = prepared
+            .iter()
+            .map(|p| {
+                let p = p.clone();
+                let book = book.clone();
+                let make_ctx = make_ctx.clone();
+                let ag = account_gate.clone();
+                let bl = book_lock.clone();
+                let bbo = bbo.clone();
+                let pc = price_completion.clone();
+                let md = min_downgrade.clone();
+                move || -> Result<OpResult, PrecompileError> {
+                    let mut ctx = make_ctx(book);
+                    match &p {
+                        PreparedOp::Place(w) => {
+                            parallel_place(&mut ctx, &ag, &bl, &bbo, &pc, &md, w).map(OpResult::Place)
                         }
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect::<Result<Vec<_>, _>>()
-        })?
+                        PreparedOp::Cancel(plan) => {
+                            parallel_cancel(&mut ctx, &ag, &bl, &bbo, &pc, &md, plan)
+                                .map(OpResult::Cancel)
+                        }
+                    }
+                }
+            })
+            .collect();
+        pool.run_batch(tasks)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     // Phase 3a barrier: FIFO time-priority over this block's PARALLEL-phase Executed rests, BEFORE
@@ -1136,6 +1136,13 @@ mod driver_tests {
     use std::sync::Arc;
 
     type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
+
+    /// A single persistent FIFO pool shared by every driver test — exactly how the node will reuse one
+    /// pool across blocks. 8 workers exposes the place/cancel races the differential tests probe for.
+    fn test_pool() -> &'static PerpPool {
+        static POOL: std::sync::OnceLock<PerpPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| PerpPool::new(8))
+    }
 
     /// A taker TIF (IOC) is downgraded to the barrier without touching the book — and without
     /// needing a seeded market/account (classify decides before the body runs).
@@ -1527,7 +1534,7 @@ mod driver_tests {
         // Parallel block driver.
         let book = Arc::new(SharedPerpBook::new());
         seed(&mut make_slot(book.clone()), &[a, b, c]);
-        let results = transact_block_parallel(&book, &ops, make_slot).unwrap();
+        let results = transact_block_parallel(test_pool(), &book, &ops, make_slot).unwrap();
         let parallel_delta = book.take_delta();
 
         assert_eq!(results[0], OpResult::Place(PlaceOutcome::Executed));
@@ -1627,7 +1634,7 @@ mod driver_tests {
         // Parallel block driver.
         let book = Arc::new(SharedPerpBook::new());
         seed(&mut make_slot(book.clone()), &[a, b, c]);
-        let results = transact_block_parallel(&book, &ops, make_slot).unwrap();
+        let results = transact_block_parallel(test_pool(), &book, &ops, make_slot).unwrap();
         let parallel_delta = book.take_delta();
 
         // The barrier must resolve every downgrade (none left as Downgrade).
@@ -1698,7 +1705,7 @@ mod driver_tests {
         for _round in 0..40 {
             let book = Arc::new(SharedPerpBook::new());
             seed(&mut make_slot(book.clone()), &all_users);
-            let results = transact_block_parallel(&book, &ops, make_slot).unwrap();
+            let results = transact_block_parallel(test_pool(), &book, &ops, make_slot).unwrap();
             for r in &results {
                 assert!(
                     !matches!(
@@ -1814,7 +1821,7 @@ mod driver_tests {
             fund(&mut s, m, funding);
             rest(&mut s, m, o_id, 100 * TICK);
         }
-        let results = transact_block_parallel(&book, &ops, make_slot).unwrap();
+        let results = transact_block_parallel(test_pool(), &book, &ops, make_slot).unwrap();
         let parallel_delta = book.take_delta();
 
         // Both run at the barrier in txn_id order: cancel O then place P, both Executed.
@@ -1866,7 +1873,7 @@ mod driver_tests {
 
             let book = Arc::new(SharedPerpBook::new());
             seed(&mut make_slot(book.clone()), &[m]);
-            let results = transact_block_parallel(&book, &ops, make_slot).unwrap();
+            let results = transact_block_parallel(test_pool(), &book, &ops, make_slot).unwrap();
             let parallel_delta = book.take_delta();
             let _ = tx.send((results, serial_delta, parallel_delta));
         });
