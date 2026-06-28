@@ -1383,6 +1383,7 @@ fn max_index_price_checkpoints(price_update_interval: u64) -> usize {
 /// parallel mode). The final best is byte-identical across nodes (it is the book's settled state), so
 /// this sample is deterministic. (Aligning the SERIAL path to this same block-end rule + re-pinning
 /// the golden is bundled into the reth-seam step, when the parallel driver goes live.)
+#[cfg(feature = "perp-parallel")]
 pub(crate) fn finalize_block_mid_sample<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,

@@ -29,6 +29,7 @@ use crate::perp_dex::{
 use crate::PrecompileError;
 use context::journal::perp_sched::{AccountGate, BboTicketLock, BookSideLock, PriceCompletion};
 use context::journal::shared_perp::SharedPerpBook;
+use context::journaled_state::JournalCheckpoint;
 use context::{ContextTr, JournalTr};
 use primitives::Address;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -150,17 +151,38 @@ mod tests {
     fn gtc_sell_mirrors_buy() {
         // sell at 105 > best_bid 100 → non-cross; 105 < best_ask 110 → moves best_ask → hold.
         assert_eq!(
-            classify_place(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 105, 100, 110),
+            classify_place(
+                Side::Sell,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                105,
+                100,
+                110
+            ),
             LockPlan::HoldTicket
         );
         // sell at 120 > best_ask 110 → non-cross, doesn't move best_ask → release.
         assert_eq!(
-            classify_place(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 120, 100, 110),
+            classify_place(
+                Side::Sell,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                120,
+                100,
+                110
+            ),
             LockPlan::ReleaseTicket
         );
         // sell at 100 <= best_bid 100 → crosses → downgrade.
         assert_eq!(
-            classify_place(Side::Sell, OrderType::Limit, TimeInForce::Gtc, 100, 100, 110),
+            classify_place(
+                Side::Sell,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                100,
+                100,
+                110
+            ),
             LockPlan::DowngradeToBarrier
         );
     }
@@ -170,12 +192,26 @@ mod tests {
     fn postonly_cross_rejects_not_downgrades() {
         // PostOnly buy at 110 >= best_ask 110 → crosses → REJECT (body reverts), not downgrade.
         assert_eq!(
-            classify_place(Side::Buy, OrderType::Limit, TimeInForce::PostOnly, 110, 100, 110),
+            classify_place(
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::PostOnly,
+                110,
+                100,
+                110
+            ),
             LockPlan::RejectInBody
         );
         // PostOnly buy at 105 < 110 → non-cross, moves best_bid → hold.
         assert_eq!(
-            classify_place(Side::Buy, OrderType::Limit, TimeInForce::PostOnly, 105, 100, 110),
+            classify_place(
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::PostOnly,
+                105,
+                100,
+                110
+            ),
             LockPlan::HoldTicket
         );
     }
@@ -258,6 +294,37 @@ pub enum PlaceOutcome {
     Downgrade,
 }
 
+/// Whether a perp body committed or was reverted (under the serial error policy).
+enum BodyDisposition {
+    Committed,
+    Reverted,
+}
+
+/// Apply the serial perp_dex error policy to a body Result run inside `cp`: commit on `Ok`; on error
+/// revert this slot's writes and either PROPAGATE a `Fatal` (storage/system bug → abort the whole
+/// block) or report a per-tx `Reverted` (any other error, incl. `[INVARIANT]`). Mirrors the serial
+/// dispatch in `perp_dex::mod`, so a parallel block aborts byte-identically to a serial one.
+fn dispose_body<CTX: ContextTr, T>(
+    ctx: &mut CTX,
+    cp: JournalCheckpoint,
+    r: Result<T, PrecompileError>,
+) -> Result<BodyDisposition, PrecompileError> {
+    match r {
+        Ok(_) => {
+            ctx.journal_mut().checkpoint_commit();
+            Ok(BodyDisposition::Committed)
+        }
+        Err(e) => {
+            ctx.journal_mut().checkpoint_revert(cp);
+            if matches!(e, PrecompileError::Fatal(_)) {
+                Err(e)
+            } else {
+                Ok(BodyDisposition::Reverted)
+            }
+        }
+    }
+}
+
 /// Run `place_order_core` under the maker's account turn AND the book-side lock for the order's side,
 /// inside a journal checkpoint so a (non-fatal) rejection rolls back this slot's off-trie writes via
 /// the write-set (step 3b). Lock order: AccountGate (per maker) → BookSideLock (per market+side);
@@ -271,7 +338,7 @@ fn gated_execute<CTX: ContextTr>(
     account_gate.run(work.maker, work.rank, || {
         book_lock.run(work.market_id, work.side, || {
             let cp = ctx.journal_mut().checkpoint();
-            match place_order_core(
+            let r = place_order_core(
                 work.maker,
                 work.order_id,
                 work.market_id,
@@ -282,18 +349,11 @@ fn gated_execute<CTX: ContextTr>(
                 work.tif,
                 work.client_order_id,
                 ctx,
-            ) {
-                Ok(()) => {
-                    ctx.journal_mut().checkpoint_commit();
-                    Ok(PlaceOutcome::Executed)
-                }
-                // TODO(3d): distinguish PrecompileError::Fatal (propagate) from a user/validation
-                // revert. The parallel place/cancel set never hits Fatal, so for now any error reverts.
-                Err(_e) => {
-                    ctx.journal_mut().checkpoint_revert(cp);
-                    Ok(PlaceOutcome::Reverted)
-                }
-            }
+            );
+            Ok(match dispose_body(ctx, cp, r)? {
+                BodyDisposition::Committed => PlaceOutcome::Executed,
+                BodyDisposition::Reverted => PlaceOutcome::Reverted,
+            })
         })
     })
 }
@@ -326,45 +386,43 @@ pub fn parallel_place<CTX: ContextTr>(
         Release,
         Downgrade,
     }
-    let under = bbo.run(work.ticket, || -> Result<UnderTicket, PrecompileError> {
-        let mut plan = match (
-            Side::from_u8(work.side),
-            OrderType::from_u8(work.order_type),
-            TimeInForce::from_u8(work.tif),
-        ) {
-            (Some(side), Some(order_type), Some(tif)) => {
-                let best_bid = storage::load_best_bid(ctx, work.market_id)?;
-                let best_ask = storage::load_best_ask(ctx, work.market_id)?;
-                classify_place(side, order_type, tif, work.price, best_bid, best_ask)
+    let under =
+        bbo.run(work.ticket, || -> Result<UnderTicket, PrecompileError> {
+            let mut plan = match (
+                Side::from_u8(work.side),
+                OrderType::from_u8(work.order_type),
+                TimeInForce::from_u8(work.tif),
+            ) {
+                (Some(side), Some(order_type), Some(tif)) => {
+                    let best_bid = storage::load_best_bid(ctx, work.market_id)?;
+                    let best_ask = storage::load_best_ask(ctx, work.market_id)?;
+                    classify_place(side, order_type, tif, work.price, best_bid, best_ask)
+                }
+                // Unparseable order fields → let the body reject it under the ticket.
+                _ => LockPlan::RejectInBody,
+            };
+            // Taker contagion: a lower-txn_id taker downgrade in this market forces THIS op to the barrier
+            // too (a barrier taker re-running against the post-parallel book must not match liquidity that
+            // higher-txn_id parallel rests added — in serial those don't exist yet). Classification runs
+            // under the BBO ticket (txn_id order), so the first taker's ticket is the deterministic floor.
+            if min_downgrade.load(Ordering::SeqCst) < work.ticket {
+                plan = LockPlan::DowngradeToBarrier;
             }
-            // Unparseable order fields → let the body reject it under the ticket.
-            _ => LockPlan::RejectInBody,
-        };
-        // Taker contagion: a lower-txn_id taker downgrade in this market forces THIS op to the barrier
-        // too (a barrier taker re-running against the post-parallel book must not match liquidity that
-        // higher-txn_id parallel rests added — in serial those don't exist yet). Classification runs
-        // under the BBO ticket (txn_id order), so the first taker's ticket is the deterministic floor.
-        if min_downgrade.load(Ordering::SeqCst) < work.ticket {
-            plan = LockPlan::DowngradeToBarrier;
-        }
-        // A taker downgrade (crossing / Market / IOC / FOK — NOT a PostOnly self-reject) lowers the
-        // floor for higher tickets. fetch_min is a no-op for a forced (higher-ticket) downgrade.
-        if matches!(plan, LockPlan::DowngradeToBarrier) {
-            min_downgrade.fetch_min(work.ticket, Ordering::SeqCst);
-        }
-        match plan {
-            LockPlan::DowngradeToBarrier => Ok(UnderTicket::Downgrade),
-            // A mover (or a PostOnly-cross self-reject) executes while still holding the BBO ticket so
-            // its best-update is serialized; the body itself takes the book-side lock.
-            LockPlan::HoldTicket | LockPlan::RejectInBody => Ok(UnderTicket::Done(gated_execute(
-                ctx,
-                account_gate,
-                book_lock,
-                work,
-            ))),
-            LockPlan::ReleaseTicket => Ok(UnderTicket::Release),
-        }
-    })?;
+            // A taker downgrade (crossing / Market / IOC / FOK — NOT a PostOnly self-reject) lowers the
+            // floor for higher tickets. fetch_min is a no-op for a forced (higher-ticket) downgrade.
+            if matches!(plan, LockPlan::DowngradeToBarrier) {
+                min_downgrade.fetch_min(work.ticket, Ordering::SeqCst);
+            }
+            match plan {
+                LockPlan::DowngradeToBarrier => Ok(UnderTicket::Downgrade),
+                // A mover (or a PostOnly-cross self-reject) executes while still holding the BBO ticket so
+                // its best-update is serialized; the body itself takes the book-side lock.
+                LockPlan::HoldTicket | LockPlan::RejectInBody => Ok(UnderTicket::Done(
+                    gated_execute(ctx, account_gate, book_lock, work),
+                )),
+                LockPlan::ReleaseTicket => Ok(UnderTicket::Release),
+            }
+        })?;
     match under {
         UnderTicket::Done(r) => r,
         UnderTicket::Downgrade => Ok(PlaceOutcome::Downgrade),
@@ -548,17 +606,11 @@ fn gated_cancel<CTX: ContextTr>(
     account_gate.run(work.canceller, work.rank, || {
         book_lock.run(market, side, || {
             let cp = ctx.journal_mut().checkpoint();
-            match cancel_order_core(work.canceller, work.order_id, ctx) {
-                Ok(_) => {
-                    ctx.journal_mut().checkpoint_commit();
-                    Ok(CancelOutcome::Executed)
-                }
-                // TODO(3d): distinguish PrecompileError::Fatal (propagate) from a user revert.
-                Err(_e) => {
-                    ctx.journal_mut().checkpoint_revert(cp);
-                    Ok(CancelOutcome::Reverted)
-                }
-            }
+            let r = cancel_order_core(work.canceller, work.order_id, ctx);
+            Ok(match dispose_body(ctx, cp, r)? {
+                BodyDisposition::Committed => CancelOutcome::Executed,
+                BodyDisposition::Reverted => CancelOutcome::Reverted,
+            })
         })
     })
 }
@@ -607,16 +659,11 @@ fn parallel_cancel<CTX: ContextTr>(
             bbo.run(plan.work.ticket, || ());
             return account_gate.run(plan.work.canceller, plan.work.rank, || {
                 let cp = ctx.journal_mut().checkpoint();
-                match cancel_order_core(plan.work.canceller, plan.work.order_id, ctx) {
-                    Ok(_) => {
-                        ctx.journal_mut().checkpoint_commit();
-                        Ok(CancelOutcome::Executed)
-                    }
-                    Err(_e) => {
-                        ctx.journal_mut().checkpoint_revert(cp);
-                        Ok(CancelOutcome::Reverted)
-                    }
-                }
+                let r = cancel_order_core(plan.work.canceller, plan.work.order_id, ctx);
+                Ok(match dispose_body(ctx, cp, r)? {
+                    BodyDisposition::Committed => CancelOutcome::Executed,
+                    BodyDisposition::Reverted => CancelOutcome::Reverted,
+                })
             });
         }
     };
@@ -641,18 +688,21 @@ fn parallel_cancel<CTX: ContextTr>(
         AtBest,
         BelowBest,
     }
-    let decision = bbo.run(plan.work.ticket, || -> Result<TicketDecision, PrecompileError> {
-        if min_downgrade.load(Ordering::SeqCst) < plan.work.ticket {
-            return Ok(TicketDecision::Forced);
-        }
-        let best_bid = storage::load_best_bid(ctx, market)?;
-        let best_ask = storage::load_best_ask(ctx, market)?;
-        Ok(if cancel_at_best(side, price, best_bid, best_ask) {
-            TicketDecision::AtBest
-        } else {
-            TicketDecision::BelowBest
-        })
-    })?;
+    let decision = bbo.run(
+        plan.work.ticket,
+        || -> Result<TicketDecision, PrecompileError> {
+            if min_downgrade.load(Ordering::SeqCst) < plan.work.ticket {
+                return Ok(TicketDecision::Forced);
+            }
+            let best_bid = storage::load_best_bid(ctx, market)?;
+            let best_ask = storage::load_best_ask(ctx, market)?;
+            Ok(if cancel_at_best(side, price, best_bid, best_ask) {
+                TicketDecision::AtBest
+            } else {
+                TicketDecision::BelowBest
+            })
+        },
+    )?;
 
     let outcome = match decision {
         // Forced to the barrier by a lower-txn_id taker — leave the book untouched; the serial re-run
@@ -663,35 +713,34 @@ fn parallel_cancel<CTX: ContextTr>(
             gated_cancel(ctx, account_gate, book_lock, &plan.work, market, side_u8)?
         }
         TicketDecision::AtBest => {
-        // At best → wait for all lower-txn_id ops at this price so the level membership is settled.
-        price_completion.wait_for(market, price, &plan.required);
-        account_gate.run(plan.work.canceller, plan.work.rank, || {
-            book_lock.run(market, side_u8, || -> Result<CancelOutcome, PrecompileError> {
-                let level = load_level(ctx, market, side, price)?;
-                let present = level.iter().any(|id| id == &plan.work.order_id);
-                let others_remain = level.iter().any(|id| id != &plan.work.order_id);
-                if present && !others_remain {
-                    // Sole order at the best level → removing it moves the BBO → defer to barrier.
-                    // Leave the book untouched (the serial re-run owns this op).
-                    Ok(CancelOutcome::Downgrade)
-                } else {
-                    // Others remain (BBO unchanged) or the order is already gone (→ body reverts):
-                    // run the body. With others remaining, `remove_from_book_after_cancel` detaches
-                    // without emptying → no best refresh → safe in parallel.
-                    let cp = ctx.journal_mut().checkpoint();
-                    match cancel_order_core(plan.work.canceller, plan.work.order_id, ctx) {
-                        Ok(_) => {
-                            ctx.journal_mut().checkpoint_commit();
-                            Ok(CancelOutcome::Executed)
+            // At best → wait for all lower-txn_id ops at this price so the level membership is settled.
+            price_completion.wait_for(market, price, &plan.required);
+            account_gate.run(plan.work.canceller, plan.work.rank, || {
+                book_lock.run(
+                    market,
+                    side_u8,
+                    || -> Result<CancelOutcome, PrecompileError> {
+                        let level = load_level(ctx, market, side, price)?;
+                        let present = level.iter().any(|id| id == &plan.work.order_id);
+                        let others_remain = level.iter().any(|id| id != &plan.work.order_id);
+                        if present && !others_remain {
+                            // Sole order at the best level → removing it moves the BBO → defer to barrier.
+                            // Leave the book untouched (the serial re-run owns this op).
+                            Ok(CancelOutcome::Downgrade)
+                        } else {
+                            // Others remain (BBO unchanged) or the order is already gone (→ body reverts):
+                            // run the body. With others remaining, `remove_from_book_after_cancel` detaches
+                            // without emptying → no best refresh → safe in parallel.
+                            let cp = ctx.journal_mut().checkpoint();
+                            let r = cancel_order_core(plan.work.canceller, plan.work.order_id, ctx);
+                            Ok(match dispose_body(ctx, cp, r)? {
+                                BodyDisposition::Committed => CancelOutcome::Executed,
+                                BodyDisposition::Reverted => CancelOutcome::Reverted,
+                            })
                         }
-                        Err(_e) => {
-                            ctx.journal_mut().checkpoint_revert(cp);
-                            Ok(CancelOutcome::Reverted)
-                        }
-                    }
-                }
-            })
-        })?
+                    },
+                )
+            })?
         }
     };
 
@@ -933,7 +982,8 @@ where
                         let mut ctx = make_ctx(book);
                         match p {
                             PreparedOp::Place(w) => {
-                                parallel_place(&mut ctx, ag, bl, bbo, pc, md, w).map(OpResult::Place)
+                                parallel_place(&mut ctx, ag, bl, bbo, pc, md, w)
+                                    .map(OpResult::Place)
                             }
                             PreparedOp::Cancel(plan) => {
                                 parallel_cancel(&mut ctx, ag, bl, bbo, pc, md, plan)
@@ -961,32 +1011,30 @@ where
             match (op, &*r) {
                 (PerpOp::Place(w), OpResult::Place(PlaceOutcome::Downgrade)) => {
                     let cp = barrier_ctx.journal_mut().checkpoint();
-                    match place_order_core(
-                        w.maker, w.order_id, w.market_id, w.side, w.price, w.qty, w.order_type,
-                        w.tif, w.client_order_id, &mut barrier_ctx,
-                    ) {
-                        Ok(()) => {
-                            barrier_ctx.journal_mut().checkpoint_commit();
-                            *r = OpResult::Place(PlaceOutcome::Executed);
-                        }
-                        Err(_e) => {
-                            barrier_ctx.journal_mut().checkpoint_revert(cp);
-                            *r = OpResult::Place(PlaceOutcome::Reverted);
-                        }
-                    }
+                    let res = place_order_core(
+                        w.maker,
+                        w.order_id,
+                        w.market_id,
+                        w.side,
+                        w.price,
+                        w.qty,
+                        w.order_type,
+                        w.tif,
+                        w.client_order_id,
+                        &mut barrier_ctx,
+                    );
+                    *r = OpResult::Place(match dispose_body(&mut barrier_ctx, cp, res)? {
+                        BodyDisposition::Committed => PlaceOutcome::Executed,
+                        BodyDisposition::Reverted => PlaceOutcome::Reverted,
+                    });
                 }
                 (PerpOp::Cancel(w), OpResult::Cancel(CancelOutcome::Downgrade)) => {
                     let cp = barrier_ctx.journal_mut().checkpoint();
-                    match cancel_order_core(w.canceller, w.order_id, &mut barrier_ctx) {
-                        Ok(_) => {
-                            barrier_ctx.journal_mut().checkpoint_commit();
-                            *r = OpResult::Cancel(CancelOutcome::Executed);
-                        }
-                        Err(_e) => {
-                            barrier_ctx.journal_mut().checkpoint_revert(cp);
-                            *r = OpResult::Cancel(CancelOutcome::Reverted);
-                        }
-                    }
+                    let res = cancel_order_core(w.canceller, w.order_id, &mut barrier_ctx);
+                    *r = OpResult::Cancel(match dispose_body(&mut barrier_ctx, cp, res)? {
+                        BodyDisposition::Committed => CancelOutcome::Executed,
+                        BodyDisposition::Reverted => CancelOutcome::Reverted,
+                    });
                 }
                 _ => {}
             }
@@ -1024,8 +1072,8 @@ where
 
 #[cfg(test)]
 mod driver_tests {
-    use crate::perp_dex::types::Market;
     use super::*;
+    use crate::perp_dex::types::Market;
     use context::journal::shared_perp::SharedPerpBook;
     use context::{BlockEnv, CfgEnv, Context, Journal, TxEnv};
     use database::InMemoryDB;
@@ -1051,11 +1099,11 @@ mod driver_tests {
             maker: address!("1111111111111111111111111111111111111111"),
             order_id: [1u8; 32],
             market_id: 1,
-            side: 0,            // Buy
+            side: 0, // Buy
             price: 100,
             qty: 1,
-            order_type: 0,      // Limit
-            tif: 1,             // IOC → taker → downgrade
+            order_type: 0, // Limit
+            tif: 1,        // IOC → taker → downgrade
             client_order_id: [0u8; 16],
             rank: 0,
             ticket: 0,
@@ -1063,7 +1111,10 @@ mod driver_tests {
 
         let out = parallel_place(&mut ctx, &gate, &book_lock, &bbo, &pc, &md, &work).unwrap();
         assert_eq!(out, PlaceOutcome::Downgrade);
-        assert!(book.take_delta().is_empty(), "a downgrade must write nothing to the book");
+        assert!(
+            book.take_delta().is_empty(),
+            "a downgrade must write nothing to the book"
+        );
     }
 
     const TICK: u64 = 1_000_000_000;
@@ -1108,7 +1159,13 @@ mod driver_tests {
         }
     }
 
-    fn mk_work(maker: Address, order_id: [u8; 32], price: u64, rank: u64, ticket: u64) -> PlaceWork {
+    fn mk_work(
+        maker: Address,
+        order_id: [u8; 32],
+        price: u64,
+        rank: u64,
+        ticket: u64,
+    ) -> PlaceWork {
         PlaceWork {
             maker,
             order_id,
@@ -1244,10 +1301,7 @@ mod driver_tests {
 
     /// Rest a GTC buy limit at `price` (setup helper for the cancel tests).
     fn rest<CTX: ContextTr>(ctx: &mut CTX, maker: Address, order_id: [u8; 32], price: u64) {
-        place_order_core(
-            maker, order_id, MID, 0, price, QTY, 0, 0, [0u8; 16], ctx,
-        )
-        .unwrap();
+        place_order_core(maker, order_id, MID, 0, price, QTY, 0, 0, [0u8; 16], ctx).unwrap();
     }
 
     fn mk_cancel(canceller: Address, order_id: [u8; 32], rank: u64, ticket: u64) -> CancelWork {
@@ -1361,8 +1415,16 @@ mod driver_tests {
         match op {
             PerpOp::Place(w) => {
                 place_order_core(
-                    w.maker, w.order_id, w.market_id, w.side, w.price, w.qty, w.order_type, w.tif,
-                    w.client_order_id, ctx,
+                    w.maker,
+                    w.order_id,
+                    w.market_id,
+                    w.side,
+                    w.price,
+                    w.qty,
+                    w.order_type,
+                    w.tif,
+                    w.client_order_id,
+                    ctx,
                 )
                 .unwrap();
             }
@@ -1420,6 +1482,42 @@ mod driver_tests {
         assert_eq!(serial_delta, parallel_delta);
     }
 
+    /// The serial error policy mirrored by the parallel path: Ok→Committed, a `Fatal` PROPAGATES
+    /// (block abort), any other error → per-tx `Reverted`. (Real DB Fatals can't be triggered against
+    /// InMemoryDB, so the policy is exercised here directly; the driver propagates it via `?`.)
+    #[test]
+    fn dispose_body_propagates_fatal_reverts_other() {
+        let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+
+        let cp = ctx.journal_mut().checkpoint();
+        assert!(matches!(
+            dispose_body(&mut ctx, cp, Ok::<(), PrecompileError>(())).unwrap(),
+            BodyDisposition::Committed
+        ));
+
+        let cp = ctx.journal_mut().checkpoint();
+        assert!(matches!(
+            dispose_body(
+                &mut ctx,
+                cp,
+                Err::<(), _>(PrecompileError::Other("user revert".into()))
+            )
+            .unwrap(),
+            BodyDisposition::Reverted
+        ));
+
+        let cp = ctx.journal_mut().checkpoint();
+        assert!(
+            dispose_body(
+                &mut ctx,
+                cp,
+                Err::<(), _>(PrecompileError::Fatal("storage bug".into()))
+            )
+            .is_err(),
+            "a Fatal must propagate (block abort), not become a revert"
+        );
+    }
+
     fn mk_place(
         maker: Address,
         order_id: [u8; 32],
@@ -1458,8 +1556,8 @@ mod driver_tests {
         let c = user_addr(3);
         let (s, t, s2) = (oid(20), oid(21), oid(22));
         let ops = vec![
-            mk_place(a, s, 1, 100 * TICK, 0, 0, 0),  // sell S@100 (ask mover, parallel)
-            mk_place(b, t, 0, 100 * TICK, 0, 0, 1),  // buy taker T@100 (crosses → downgrade, floor=1)
+            mk_place(a, s, 1, 100 * TICK, 0, 0, 0), // sell S@100 (ask mover, parallel)
+            mk_place(b, t, 0, 100 * TICK, 0, 0, 1), // buy taker T@100 (crosses → downgrade, floor=1)
             mk_place(c, s2, 1, 100 * TICK, 0, 0, 2), // sell S2@100 (forced to barrier by contagion)
         ];
 
