@@ -22,9 +22,12 @@
 //! `best == 0` is the "no order on this side" sentinel (an empty book side).
 
 use crate::perp_dex::types::order::{OrderType, Side, TimeInForce};
-use crate::perp_dex::{storage, trading::place_order_core};
+use crate::perp_dex::{
+    storage,
+    trading::{cancel_order_core, place_order_core},
+};
 use crate::PrecompileError;
-use context::journal::perp_sched::{AccountGate, BboTicketLock, BookSideLock};
+use context::journal::perp_sched::{AccountGate, BboTicketLock, BookSideLock, PriceCompletion};
 use context::journal::shared_perp::SharedPerpBook;
 use context::{ContextTr, JournalTr};
 use primitives::Address;
@@ -88,26 +91,25 @@ pub fn classify_place(
     }
 }
 
-/// Decide how to handle a cancel given the current BBO and whether removing this order empties its
-/// price level. `empties_level` is computed by the driver (the level FIFO holds only this order).
-pub fn classify_cancel(
-    side: Side,
-    price: u64,
-    best_bid: u64,
-    best_ask: u64,
-    empties_level: bool,
-) -> LockPlan {
-    // The BBO moves only if the cancelled order is AT the best on its side AND removing it empties
-    // that level (no other orders remain). Then the new best must be found by scanning the book,
-    // which is only correct once all lower-txn_id inserts have landed → serial barrier (3d).
-    let at_best = match side {
+/// Whether a cancel sits AT the best on its own side. Pure; the driver supplies the BBO it read
+/// under the ticket. A resting order's price is always at-or-inside the side's best (bids: best_bid
+/// is the MAX bid ≥ any bid price; asks: best_ask is the MIN ask ≤ any ask price), so the only two
+/// cases are "at best" (`==`) and "below/worse than best".
+///
+/// - **below best** → removing it cannot move the BBO → remove in parallel (ReleaseTicket-style).
+/// - **at best** → removing it MIGHT move the BBO (only if it is the level's last order). That can't
+///   be decided from the cached BBO alone: it needs the level membership AS OF all lower-txn_id ops
+///   at this price. So the driver waits ([`PriceCompletion::wait_for`]) for those, then re-reads the
+///   level under the book-side lock: if others remain → remove in parallel; if it is the sole order
+///   → the BBO moves → defer to the serial barrier (3d).
+///
+/// During the parallel phase the best is monotone (only movers — which IMPROVE it — and downgraded
+/// best-worseners run), so a below-best cancel can never become at-best, and an at-best cancel can
+/// only drift below best (handled identically: it just won't empty the *current* best level).
+pub fn cancel_at_best(side: Side, price: u64, best_bid: u64, best_ask: u64) -> bool {
+    match side {
         Side::Buy => price == best_bid,
         Side::Sell => price == best_ask,
-    };
-    if at_best && empties_level {
-        LockPlan::DowngradeToBarrier
-    } else {
-        LockPlan::ReleaseTicket
     }
 }
 
@@ -207,33 +209,17 @@ mod tests {
         );
     }
 
-    // ── cancel ──────────────────────────────────────────────────────────────────
+    // ── cancel: at-best vs below-best ─────────────────────────────────────────────
     #[test]
-    fn cancel_emptying_best_level_downgrades() {
-        // buy order at best_bid 100, removing it empties the level → BBO moves → barrier.
-        assert_eq!(
-            classify_cancel(Side::Buy, 100, 100, 110, true),
-            LockPlan::DowngradeToBarrier
-        );
-    }
-
-    #[test]
-    fn cancel_not_moving_best_releases() {
-        // at best but level not emptied (others remain) → BBO unchanged → parallel.
-        assert_eq!(
-            classify_cancel(Side::Buy, 100, 100, 110, false),
-            LockPlan::ReleaseTicket
-        );
-        // below best, even if it empties that (non-best) level → BBO unchanged → parallel.
-        assert_eq!(
-            classify_cancel(Side::Buy, 90, 100, 110, true),
-            LockPlan::ReleaseTicket
-        );
-        // sell at best_ask, empties → barrier.
-        assert_eq!(
-            classify_cancel(Side::Sell, 110, 100, 110, true),
-            LockPlan::DowngradeToBarrier
-        );
+    fn cancel_at_best_detects_top_of_book() {
+        // Buy at best_bid → at best (might move BBO → driver waits + checks emptiness).
+        assert!(cancel_at_best(Side::Buy, 100, 100, 110));
+        // Buy below best_bid → cannot move BBO → parallel.
+        assert!(!cancel_at_best(Side::Buy, 90, 100, 110));
+        // Sell at best_ask → at best.
+        assert!(cancel_at_best(Side::Sell, 110, 100, 110));
+        // Sell worse than best_ask → below best → parallel.
+        assert!(!cancel_at_best(Side::Sell, 120, 100, 110));
     }
 }
 
@@ -457,6 +443,256 @@ where
     Ok(())
 }
 
+// ── Driver: parallel cancel (step 3c part 4) ──────────────────────────────────
+
+/// One cancel to run in a slot. The ed25519 verify + decode is hoisted upstream; this is the gated
+/// mutation. The order's market/side/price are NOT known until it is loaded, so they are resolved by
+/// the pre-scan ([`plan_cancel_batch`]). `rank`/`ticket` are assigned by the batch in txn_id order.
+#[derive(Debug, Clone)]
+pub struct CancelWork {
+    pub canceller: Address,
+    pub order_id: [u8; 32],
+    /// This canceller's block-order rank (AccountGate, rule 6).
+    pub rank: u64,
+    /// This op's BBO ticket (txn_id order within the batch; rules 2+3).
+    pub ticket: u64,
+}
+
+/// Outcome of a slot's cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// Removed from the book (and committed).
+    Executed,
+    /// The body rejected (not owner / not cancellable / order missing); this slot's writes rolled
+    /// back. Still a processed tx (gas charged upstream).
+    Reverted,
+    /// At the best level AND the sole order there → removing it moves the BBO, which needs a book
+    /// scan after all lower-txn_id ops land → deferred to the serial barrier (step 3d). Not applied
+    /// in the parallel phase.
+    Downgrade,
+}
+
+/// Resolved + scheduled cancel produced by the pre-scan: the order's `(market, side, price)` plus the
+/// tickets of all lower-txn_id ops at the SAME `(market, price)` this cancel must wait for before it
+/// can decide emptiness. `resolved == None` means the order was not loadable (→ the body will revert).
+#[derive(Debug, Clone)]
+struct CancelPlanItem {
+    work: CancelWork,
+    resolved: Option<(u64, u8, u64)>,
+    required: Vec<u64>,
+}
+
+fn load_level<CTX: ContextTr>(
+    ctx: &mut CTX,
+    market: u64,
+    side: Side,
+    price: u64,
+) -> Result<Vec<[u8; 32]>, PrecompileError> {
+    match side {
+        Side::Buy => storage::load_bid_level(ctx, market, price),
+        Side::Sell => storage::load_ask_level(ctx, market, price),
+    }
+}
+
+/// Run `cancel_order_core` under the canceller's account turn + the order side's book lock, inside a
+/// journal checkpoint so a (non-fatal) rejection rolls back this slot's off-trie writes. `market`/
+/// `side` scope the book lock; pass the resolved side (or, for an unloadable order, skip the book
+/// lock since the body cannot reach a level — it reverts on the missing-order load).
+fn gated_cancel<CTX: ContextTr>(
+    ctx: &mut CTX,
+    account_gate: &AccountGate,
+    book_lock: &BookSideLock,
+    work: &CancelWork,
+    market: u64,
+    side: u8,
+) -> Result<CancelOutcome, PrecompileError> {
+    account_gate.run(work.canceller, work.rank, || {
+        book_lock.run(market, side, || {
+            let cp = ctx.journal_mut().checkpoint();
+            match cancel_order_core(work.canceller, work.order_id, ctx) {
+                Ok(_) => {
+                    ctx.journal_mut().checkpoint_commit();
+                    Ok(CancelOutcome::Executed)
+                }
+                // TODO(3d): distinguish PrecompileError::Fatal (propagate) from a user revert.
+                Err(_e) => {
+                    ctx.journal_mut().checkpoint_revert(cp);
+                    Ok(CancelOutcome::Reverted)
+                }
+            }
+        })
+    })
+}
+
+/// Execute one parallel cancel. Reads the best under the BBO ticket to classify at-best vs below-best
+/// ([`cancel_at_best`]); a below-best cancel removes in parallel; an at-best cancel first waits for
+/// all lower-txn_id ops at its price ([`PriceCompletion::wait_for`]) so the level membership is
+/// settled, then under the book-side lock decides: sole order → `Downgrade` (the BBO moves; the
+/// serial barrier re-runs it), others remain → remove in parallel. Every op marks its price done so
+/// higher same-price cancels can proceed.
+fn parallel_cancel<CTX: ContextTr>(
+    ctx: &mut CTX,
+    account_gate: &AccountGate,
+    book_lock: &BookSideLock,
+    bbo: &BboTicketLock,
+    price_completion: &PriceCompletion,
+    plan: &CancelPlanItem,
+) -> Result<CancelOutcome, PrecompileError> {
+    let (market, side_u8, price) = match plan.resolved {
+        Some(t) => t,
+        // Order not loadable → the body reverts (missing order) without touching any level, so it
+        // needs no book lock, no BBO ticket, no price-completion bookkeeping.
+        None => {
+            return account_gate.run(plan.work.canceller, plan.work.rank, || {
+                let cp = ctx.journal_mut().checkpoint();
+                match cancel_order_core(plan.work.canceller, plan.work.order_id, ctx) {
+                    Ok(_) => {
+                        ctx.journal_mut().checkpoint_commit();
+                        Ok(CancelOutcome::Executed)
+                    }
+                    Err(_e) => {
+                        ctx.journal_mut().checkpoint_revert(cp);
+                        Ok(CancelOutcome::Reverted)
+                    }
+                }
+            });
+        }
+    };
+    let side = Side::from_u8(side_u8).expect("pre-scan resolved a valid side");
+
+    // 1. Classify under the BBO ticket (best read serialized in txn_id order).
+    let at_best = bbo.run(plan.work.ticket, || -> Result<bool, PrecompileError> {
+        let best_bid = storage::load_best_bid(ctx, market)?;
+        let best_ask = storage::load_best_ask(ctx, market)?;
+        Ok(cancel_at_best(side, price, best_bid, best_ask))
+    })?;
+
+    let outcome = if !at_best {
+        // Below best → cannot move the BBO → remove in parallel.
+        gated_cancel(ctx, account_gate, book_lock, &plan.work, market, side_u8)?
+    } else {
+        // At best → wait for all lower-txn_id ops at this price so the level membership is settled.
+        price_completion.wait_for(market, price, &plan.required);
+        account_gate.run(plan.work.canceller, plan.work.rank, || {
+            book_lock.run(market, side_u8, || -> Result<CancelOutcome, PrecompileError> {
+                let level = load_level(ctx, market, side, price)?;
+                let present = level.iter().any(|id| id == &plan.work.order_id);
+                let others_remain = level.iter().any(|id| id != &plan.work.order_id);
+                if present && !others_remain {
+                    // Sole order at the best level → removing it moves the BBO → defer to barrier.
+                    // Leave the book untouched (the serial re-run owns this op).
+                    Ok(CancelOutcome::Downgrade)
+                } else {
+                    // Others remain (BBO unchanged) or the order is already gone (→ body reverts):
+                    // run the body. With others remaining, `remove_from_book_after_cancel` detaches
+                    // without emptying → no best refresh → safe in parallel.
+                    let cp = ctx.journal_mut().checkpoint();
+                    match cancel_order_core(plan.work.canceller, plan.work.order_id, ctx) {
+                        Ok(_) => {
+                            ctx.journal_mut().checkpoint_commit();
+                            Ok(CancelOutcome::Executed)
+                        }
+                        Err(_e) => {
+                            ctx.journal_mut().checkpoint_revert(cp);
+                            Ok(CancelOutcome::Reverted)
+                        }
+                    }
+                }
+            })
+        })?
+    };
+
+    // Publish this op's completion at its price so higher same-price cancels' waits resolve. Marked
+    // for EVERY outcome (executed / reverted / downgraded): in each case this op is "done" w.r.t. the
+    // level membership a waiter cares about.
+    price_completion.mark_done(market, price, plan.work.ticket);
+    Ok(outcome)
+}
+
+/// Pre-scan (serial, before the parallel phase): resolve each cancel's order to `(market, side,
+/// price)` and compute, for each, the tickets of all lower-txn_id ops at the SAME `(market, price)`.
+/// An at-best cancel waits for that set so the level membership reflects every lower-txn_id removal
+/// before it decides emptiness — the serial-equivalent view.
+fn plan_cancel_batch<CTX, F>(
+    book: &Arc<SharedPerpBook>,
+    items: &[CancelWork],
+    make_ctx: &F,
+) -> Vec<CancelPlanItem>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX,
+{
+    let mut ctx = make_ctx(book.clone());
+    let resolved: Vec<Option<(u64, u8, u64)>> = items
+        .iter()
+        .map(|w| {
+            storage::load_order(&mut ctx, &w.order_id)
+                .ok()
+                .flatten()
+                .map(|o| (o.market_id, o.side as u8, o.price))
+        })
+        .collect();
+
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let required = match resolved[i] {
+                Some((m, _s, p)) => items
+                    .iter()
+                    .zip(&resolved)
+                    .filter(|(w2, r2)| {
+                        w2.ticket < w.ticket
+                            && matches!(r2, Some((m2, _, p2)) if *m2 == m && *p2 == p)
+                    })
+                    .map(|(w2, _)| w2.ticket)
+                    .collect(),
+                None => Vec::new(),
+            };
+            CancelPlanItem {
+                work: w.clone(),
+                resolved: resolved[i],
+                required,
+            }
+        })
+        .collect()
+}
+
+/// Run a batch of cancels concurrently against ONE shared book, gated by the `AccountGate` (per
+/// canceller), `BookSideLock` (per market+side), and `BboTicketLock` (per-market BBO), with a
+/// per-block [`PriceCompletion`] tracking the at-best-cancel waits. Each worker builds a FRESH slot
+/// context via `make_ctx` (so the journal never crosses a thread). Results are returned in `items`
+/// order. Like the place batch, `make_ctx` must route the journal to `book`.
+pub fn run_cancel_batch<CTX, F>(
+    book: &Arc<SharedPerpBook>,
+    account_gate: &AccountGate,
+    book_lock: &BookSideLock,
+    bbo: &BboTicketLock,
+    items: &[CancelWork],
+    make_ctx: F,
+) -> Vec<Result<CancelOutcome, PrecompileError>>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX + Sync,
+{
+    let plans = plan_cancel_batch(book, items, &make_ctx);
+    let price_completion = PriceCompletion::new();
+    let (make_ctx, plans, price_completion) = (&make_ctx, &plans, &price_completion);
+    thread::scope(|s| {
+        let handles: Vec<_> = plans
+            .iter()
+            .map(|plan| {
+                let book = book.clone();
+                s.spawn(move || {
+                    let mut ctx = make_ctx(book);
+                    parallel_cancel(&mut ctx, account_gate, book_lock, bbo, price_completion, plan)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 #[cfg(test)]
 mod driver_tests {
     use crate::perp_dex::types::Market;
@@ -657,5 +893,119 @@ mod driver_tests {
         let parallel_delta = book.take_delta();
 
         assert_eq!(serial_delta, parallel_delta);
+    }
+
+    // ── cancel driver ─────────────────────────────────────────────────────────────
+
+    fn oid(n: u8) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        b
+    }
+
+    /// Rest a GTC buy limit at `price` (setup helper for the cancel tests).
+    fn rest<CTX: ContextTr>(ctx: &mut CTX, maker: Address, order_id: [u8; 32], price: u64) {
+        place_order_core(
+            maker, order_id, MID, 0, price, QTY, 0, 0, [0u8; 16], ctx,
+        )
+        .unwrap();
+    }
+
+    fn mk_cancel(canceller: Address, order_id: [u8; 32], rank: u64, ticket: u64) -> CancelWork {
+        CancelWork {
+            canceller,
+            order_id,
+            rank,
+            ticket,
+        }
+    }
+
+    /// THE cancel step-3c gate: a batch of parallel-eligible cancels (a below-best cancel that empties
+    /// a non-best level + two at-best cancels that do NOT empty the best level) run in parallel
+    /// produces a book delta byte-identical to the same cancels run serially in txn_id order.
+    /// Book: best bid level 100 = [X(a), Y(b), Z(c)], level 99 = [W(a)]. Cancel X, Y, W (Z stays).
+    /// X is at-best non-emptying; Y is at-best non-emptying (required = {X}); W is below-best.
+    #[test]
+    fn parallel_cancel_batch_matches_serial_delta() {
+        let a = user_addr(1);
+        let b = user_addr(2);
+        let c = user_addr(3);
+        let (x, y, z, w) = (oid(10), oid(11), oid(12), oid(13));
+
+        // Serial reference: setup places + cancels in one overlay, one net delta.
+        let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut serial, &[a, b, c]);
+        rest(&mut serial, a, x, 100 * TICK);
+        rest(&mut serial, b, y, 100 * TICK);
+        rest(&mut serial, c, z, 100 * TICK);
+        rest(&mut serial, a, w, 99 * TICK);
+        cancel_order_core(a, x, &mut serial).unwrap();
+        cancel_order_core(b, y, &mut serial).unwrap();
+        cancel_order_core(a, w, &mut serial).unwrap();
+        let serial_delta = serial.journal_mut().take_perp_delta();
+
+        // Parallel: identical setup placed serially into the shared book, then the cancels in a batch.
+        let book = Arc::new(SharedPerpBook::new());
+        {
+            let mut s = make_slot(book.clone());
+            seed(&mut s, &[a, b, c]);
+            rest(&mut s, a, x, 100 * TICK);
+            rest(&mut s, b, y, 100 * TICK);
+            rest(&mut s, c, z, 100 * TICK);
+            rest(&mut s, a, w, 99 * TICK);
+        }
+        let cancels = vec![
+            mk_cancel(a, x, 0, 0),
+            mk_cancel(b, y, 0, 1),
+            mk_cancel(a, w, 1, 2),
+        ];
+        let gate = AccountGate::new();
+        let book_lock = BookSideLock::new();
+        let bbo = BboTicketLock::new();
+        let results = run_cancel_batch(&book, &gate, &book_lock, &bbo, &cancels, make_slot);
+        for r in &results {
+            assert_eq!(*r.as_ref().unwrap(), CancelOutcome::Executed);
+        }
+        let parallel_delta = book.take_delta();
+
+        assert_eq!(serial_delta, parallel_delta);
+    }
+
+    /// An at-best cancel that is the SOLE order at the best level → removing it would move the BBO →
+    /// `Downgrade` (deferred to the serial barrier), writing NOTHING in the parallel phase. Proven by
+    /// comparing the book delta with vs without the cancel batch: identical → the cancel wrote nothing.
+    #[test]
+    fn parallel_cancel_sole_best_order_downgrades() {
+        let a = user_addr(1);
+        let x = oid(10);
+
+        // Reference book: setup place only.
+        let ref_book = Arc::new(SharedPerpBook::new());
+        {
+            let mut s = make_slot(ref_book.clone());
+            seed(&mut s, &[a]);
+            rest(&mut s, a, x, 100 * TICK);
+        }
+        let ref_delta = ref_book.take_delta();
+
+        // Subject book: same setup, then a cancel batch that must downgrade (X is the sole best order).
+        let book = Arc::new(SharedPerpBook::new());
+        {
+            let mut s = make_slot(book.clone());
+            seed(&mut s, &[a]);
+            rest(&mut s, a, x, 100 * TICK);
+        }
+        let cancels = vec![mk_cancel(a, x, 0, 0)];
+        let gate = AccountGate::new();
+        let book_lock = BookSideLock::new();
+        let bbo = BboTicketLock::new();
+        let results = run_cancel_batch(&book, &gate, &book_lock, &bbo, &cancels, make_slot);
+        assert_eq!(results[0].as_ref().unwrap(), &CancelOutcome::Downgrade);
+
+        let subject_delta = book.take_delta();
+        assert_eq!(
+            ref_delta, subject_delta,
+            "a downgraded cancel must not write to the book in the parallel phase"
+        );
     }
 }

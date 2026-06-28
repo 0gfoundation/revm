@@ -739,7 +739,7 @@ fn execute_market_order<CTX: ContextTr>(
     }
 }
 
-fn cancel_order_core<CTX: ContextTr>(
+pub(crate) fn cancel_order_core<CTX: ContextTr>(
     account: Address,
     order_id: [u8; 32],
     context: &mut CTX,
