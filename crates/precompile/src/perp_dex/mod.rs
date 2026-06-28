@@ -21,7 +21,7 @@ use std::{collections::HashMap, sync::OnceLock};
 
 use alloy_sol_types::SolCall;
 use context::{ContextTr, JournalTr};
-use primitives::{address, Address, U256};
+use primitives::{address, Address, Bytes, U256};
 
 use crate::{
     perp_dex::{
@@ -210,6 +210,33 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         }
         None => return Err(PrecompileError::StatefulInvalidInput),
     };
+
+    // Canonical parallel execution (catalog #21 spike, step 4b): the four TRADING selectors are
+    // verified + matched in the parallel pre-phase, which writes the final off-trie state. During the
+    // serial EVM pass the journal is in REPLAY mode, so here we hand back the pre-computed result
+    // (status + return bytes) for this trading call instead of re-verifying / re-matching / re-writing.
+    // Gas is flat per selector and already charged above. Every other perp selector (deposit, market
+    // admin, queries, liquidation, …) runs normally below. Without the feature `perp_is_replay()` is a
+    // const `false`, so this is inert on the serial path.
+    let is_trading_selector = selector == placeOrderCall::SELECTOR
+        || selector == cancelOrderCall::SELECTOR
+        || selector == placeOrderSignedCall::SELECTOR
+        || selector == cancelOrderSignedCall::SELECTOR;
+    if is_trading_selector && context.journal().perp_is_replay() {
+        return match context.journal_mut().perp_replay_next() {
+            Some(r) if r.reverted => {
+                Ok(PrecompileOutput::new_reverted(gas_used, Bytes::from(r.output)))
+            }
+            Some(r) => Ok(PrecompileOutput::new(gas_used, Bytes::from(r.output))),
+            // Exhausted: a trading call the pre-phase did not classify — e.g. an internal contract
+            // call to 0x…1003 (the scheme assumes top-level perp txs only). Fail-stop rather than
+            // silently mis-replaying a later op's result, which would diverge the block.
+            None => Err(PrecompileError::Fatal(
+                "perp replay: trading call with no pre-computed result (internal 0x1003 call?)"
+                    .to_string(),
+            )),
+        };
+    }
 
     // Dispatch — note: no `?` here; errors are caught below and converted to
     // clean REVERT output so ethers.js can read `e.reason`.

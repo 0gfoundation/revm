@@ -2513,6 +2513,36 @@ mod golden {
         out.bytes
     }
 
+    /// Step 4b replay mode at the entry point: with the journal in replay mode a trading selector
+    /// returns the pre-computed result VERBATIM without decoding / verifying / matching — proven by a
+    /// bare 4-byte selector (no args), which the normal path rejects as undecodable but replay still
+    /// answers from the queue. An exhausted cursor fail-stops (Fatal) rather than mis-replaying.
+    #[cfg(feature = "perp-parallel")]
+    #[test]
+    fn replay_mode_returns_precomputed_result_and_failstops_on_exhaustion() {
+        use context::journaled_state::PerpReplayResult;
+        let mut ctx = golden_ctx();
+        let input = placeOrderSignedCall::SELECTOR.to_vec();
+
+        // Non-replay: a bare selector cannot decode → clean revert (the verify/match path ran).
+        let out = run_perp_dex_call(&input, 10_000_000, ALICE, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(out.reverted, "non-replay bare selector should revert (undecodable args)");
+
+        // Replay mode: hand back the pre-computed bytes verbatim — no decode/verify/match.
+        ctx.journal_mut().set_perp_replay(std::vec![PerpReplayResult {
+            reverted: false,
+            output: std::vec![0xAB; 32],
+        }]);
+        let out = run_perp_dex_call(&input, 10_000_000, ALICE, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(!out.reverted);
+        assert_eq!(out.bytes.as_ref(), [0xAB; 32].as_slice());
+
+        // Cursor exhausted → fail-stop (an unclassified trading call), not a silent mis-replay.
+        let err =
+            run_perp_dex_call(&input, 10_000_000, ALICE, U256::ZERO, false, &mut ctx).unwrap_err();
+        assert!(matches!(err, crate::PrecompileError::Fatal(_)));
+    }
+
     fn g_place(
         ctx: &mut TestCtx,
         caller: Address,
