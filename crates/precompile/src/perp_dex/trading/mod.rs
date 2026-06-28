@@ -50,43 +50,68 @@ fn calc_maker_fee_for_order_qty<CTX: ContextTr>(
     calc_maker_fee_for_order_qty_with_bps(price, qty, rates.maker_fee_bps, market)
 }
 
-// ── Public entry-points ───────────────────────────────────────────────────────
+// ── Decode + verify helpers ─────────────────────────────────────────────────────
+//
+// SINGLE SOURCE for the consensus-critical decode/authenticate of a trading call. The serial
+// precompile handlers below AND the parallel `classify_perp_tx` pre-phase (step 4b) both go through
+// these, so the verify logic (ed25519, recv-window, key expiry, order-id derivation, duplicate guard)
+// cannot drift between the two execution paths.
 
-/// `placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif) returns (bytes32 orderId)`
-pub fn run_place_order<CTX: ContextTr>(
+/// Decoded + (for signed) authenticated fields of a place, ready for [`place_order_core`]. `order_id`
+/// is the final id: `keccak256(signature)` for the signed path, the next sequential id for direct.
+pub(crate) struct PlaceParams {
+    pub maker: Address,
+    pub order_id: [u8; 32],
+    pub market_id: u64,
+    pub side: u8,
+    pub price: u64,
+    pub qty: u64,
+    pub order_type: u8,
+    pub tif: u8,
+    pub client_order_id: [u8; 16],
+}
+
+/// Decoded + (for signed) authenticated fields of a cancel (`marketId` is ignored — the order is
+/// looked up globally by id).
+pub(crate) struct CancelParams {
+    pub canceller: Address,
+    pub order_id: [u8; 32],
+}
+
+/// ABI-encode a place's `(bytes32 orderId)` return. The direct and signed selectors return the same
+/// single-`bytes32` tuple, so one encoder serves both handlers AND the replay pre-phase.
+pub(crate) fn encode_place_order_id(order_id: [u8; 32]) -> Bytes {
+    Bytes::from(placeOrderCall::abi_encode_returns(&FixedBytes(order_id)))
+}
+
+/// Decode a direct `placeOrder` and assign its sequential `order_id` (advances the per-caller counter).
+pub(crate) fn decode_place_order<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
     context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+) -> Result<PlaceParams, PrecompileError> {
     let args = placeOrderCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("placeOrder: invalid calldata"))?;
-
     let order_id = next_order_id(context, caller)?;
-    place_order_core(
-        caller,
+    Ok(PlaceParams {
+        maker: caller,
         order_id,
-        args.marketId,
-        args.side,
-        args.price,
-        args.quantity,
-        args.orderType,
-        args.tif,
-        args.clientOrderId.0,
-        context,
-    )?;
-    Ok(Bytes::from(placeOrderCall::abi_encode_returns(
-        &FixedBytes(order_id),
-    )))
+        market_id: args.marketId,
+        side: args.side,
+        price: args.price,
+        qty: args.quantity,
+        order_type: args.orderType,
+        tif: args.tif,
+        client_order_id: args.clientOrderId.0,
+    })
 }
 
-/// `placeOrderSigned(address account, ..., uint64 timestamp, bytes signature) returns (bytes32 orderId)`
-///
-/// orderId = keccak256(signature). Replay protection is implicit: a second submission of the
-/// same signature produces the same orderId, which already exists in storage, and is rejected.
-pub fn run_place_order_signed<CTX: ContextTr>(
+/// Decode + authenticate a `placeOrderSigned` (ed25519 over the canonical 96-byte message), deriving
+/// `order_id = keccak256(signature)` and rejecting a duplicate (already-submitted) signature.
+pub(crate) fn verify_place_order_signed<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+) -> Result<PlaceParams, PrecompileError> {
     let args = placeOrderSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("placeOrderSigned: invalid calldata"))?;
 
@@ -129,32 +154,37 @@ pub fn run_place_order_signed<CTX: ContextTr>(
             "placeOrderSigned: duplicate signature (already submitted)",
         ));
     }
-
-    place_order_core(
-        args.account,
+    Ok(PlaceParams {
+        maker: args.account,
         order_id,
-        args.marketId,
-        args.side,
-        args.price,
-        args.quantity,
-        args.orderType,
-        args.tif,
-        args.clientOrderId.0,
-        context,
-    )?;
-    Ok(Bytes::from(placeOrderSignedCall::abi_encode_returns(
-        &FixedBytes(order_id),
-    )))
+        market_id: args.marketId,
+        side: args.side,
+        price: args.price,
+        qty: args.quantity,
+        order_type: args.orderType,
+        tif: args.tif,
+        client_order_id: args.clientOrderId.0,
+    })
 }
 
-/// `cancelOrderSigned(address account, bytes32 orderId, uint64 timestamp, bytes signature)`
-///
-/// Replay protection is implicit: cancelling an already-cancelled order is rejected by
-/// cancel_order_core ("order not cancellable").
-pub fn run_cancel_order_signed<CTX: ContextTr>(
+/// Decode a direct `cancelOrder` (canceller = caller).
+pub(crate) fn decode_cancel_order(
+    input_bytes: &[u8],
+    caller: Address,
+) -> Result<CancelParams, PrecompileError> {
+    let args = cancelOrderCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("cancelOrder: invalid calldata"))?;
+    Ok(CancelParams {
+        canceller: caller,
+        order_id: args.orderId.0,
+    })
+}
+
+/// Decode + authenticate a `cancelOrderSigned` (ed25519 over the canonical 94-byte cancel message).
+pub(crate) fn verify_cancel_order_signed<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+) -> Result<CancelParams, PrecompileError> {
     let args = cancelOrderSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("cancelOrderSigned: invalid calldata"))?;
 
@@ -184,7 +214,70 @@ pub fn run_cancel_order_signed<CTX: ContextTr>(
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;
 
-    cancel_order_core(args.account, args.orderId.0, context)
+    Ok(CancelParams {
+        canceller: args.account,
+        order_id: args.orderId.0,
+    })
+}
+
+// ── Public entry-points ───────────────────────────────────────────────────────
+
+/// `placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif) returns (bytes32 orderId)`
+pub fn run_place_order<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let p = decode_place_order(input_bytes, caller, context)?;
+    place_order_core(
+        p.maker,
+        p.order_id,
+        p.market_id,
+        p.side,
+        p.price,
+        p.qty,
+        p.order_type,
+        p.tif,
+        p.client_order_id,
+        context,
+    )?;
+    Ok(encode_place_order_id(p.order_id))
+}
+
+/// `placeOrderSigned(address account, ..., uint64 timestamp, bytes signature) returns (bytes32 orderId)`
+///
+/// orderId = keccak256(signature). Replay protection is implicit: a second submission of the
+/// same signature produces the same orderId, which already exists in storage, and is rejected.
+pub fn run_place_order_signed<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let p = verify_place_order_signed(input_bytes, context)?;
+    place_order_core(
+        p.maker,
+        p.order_id,
+        p.market_id,
+        p.side,
+        p.price,
+        p.qty,
+        p.order_type,
+        p.tif,
+        p.client_order_id,
+        context,
+    )?;
+    Ok(encode_place_order_id(p.order_id))
+}
+
+/// `cancelOrderSigned(address account, bytes32 orderId, uint64 timestamp, bytes signature)`
+///
+/// Replay protection is implicit: cancelling an already-cancelled order is rejected by
+/// cancel_order_core ("order not cancellable").
+pub fn run_cancel_order_signed<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let c = verify_cancel_order_signed(input_bytes, context)?;
+    cancel_order_core(c.canceller, c.order_id, context)
 }
 
 /// `cancelOrder(bytes32 orderId, uint64 marketId)`
@@ -196,9 +289,8 @@ pub fn run_cancel_order<CTX: ContextTr>(
     caller: Address,
     context: &mut CTX,
 ) -> Result<Bytes, PrecompileError> {
-    let args = cancelOrderCall::abi_decode_validate(input_bytes)
-        .map_err(|_| perp_err("cancelOrder: invalid calldata"))?;
-    cancel_order_core(caller, args.orderId.0, context)
+    let c = decode_cancel_order(input_bytes, caller)?;
+    cancel_order_core(c.canceller, c.order_id, context)
 }
 
 /// `getOrder(bytes32 orderId, uint64 marketId) returns (address owner, uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint64 filled, uint8 status)`
