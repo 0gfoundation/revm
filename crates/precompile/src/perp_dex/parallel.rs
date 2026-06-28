@@ -641,12 +641,15 @@ impl Drop for MarkDoneOnDrop<'_> {
     }
 }
 
-/// Execute one parallel cancel. Reads the best under the BBO ticket to classify at-best vs below-best
-/// ([`cancel_at_best`]); a below-best cancel removes in parallel; an at-best cancel first waits for
-/// all lower-txn_id ops at its price ([`PriceCompletion::wait_for`]) so the level membership is
-/// settled, then under the book-side lock decides: sole order → `Downgrade` (the BBO moves; the
-/// serial barrier re-runs it), others remain → remove in parallel. Every op marks its price done so
-/// higher same-price cancels can proceed.
+/// Execute one parallel cancel. Classifies (and, for at-best, decides emptiness) WHILE HOLDING the
+/// BBO ticket: below-best → remove in parallel; at-best → wait for all lower-txn_id same-price ops
+/// ([`PriceCompletion::wait_for`]) so the level is settled, then if removing it would EMPTY the best
+/// level (→ moves the BBO) it sets the contagion floor like a taker and downgrades to the serial
+/// barrier, else it releases the ticket and removes in parallel. Holding the ticket through the
+/// decision guarantees the floor (when set) is seen by every higher-txn_id op, so the deferred tail —
+/// including the same maker's later margin-touching ops — re-runs serial-equivalently at the barrier
+/// (no same-maker op observes the cancel's not-yet-released margin). Every op marks its price done so
+/// higher same-price cancels' waits resolve.
 fn parallel_cancel<CTX: ContextTr>(
     ctx: &mut CTX,
     account_gate: &AccountGate,
@@ -685,73 +688,61 @@ fn parallel_cancel<CTX: ContextTr>(
         ticket: plan.work.ticket,
     };
 
-    // 1. Classify under the BBO ticket (best read serialized in txn_id order). A lower-txn_id taker
-    //    downgrade in this market forces this cancel to the barrier too (taker contagion): in serial
-    //    it would run AFTER the taker, so it must not remove its order before the deferred taker (which
-    //    re-runs at the barrier) gets to see it. Best-emptying cancels do NOT set the floor themselves
-    //    (the barrier's best-recompute reconciles a deferred best-worsening cancel).
+    // 1. Classify + (for at-best) decide emptiness, all WHILE HOLDING the BBO ticket. Holding it
+    //    means no higher-txn_id op classifies until this decision is made, so when an emptying cancel
+    //    sets the contagion floor, every higher op is guaranteed to see it (→ forced to the barrier).
+    //    The taker-contagion floor check comes first; then below-best (parallel) vs at-best. For
+    //    at-best we wait for all lower-txn_id same-price ops to settle the level (a lower-txn_id
+    //    downgrade would have set the floor and forced THIS op above, so reaching here means every
+    //    lower same-price op executed — its effect is applied, not deferred), then check emptiness.
     enum TicketDecision {
-        Forced,
-        AtBest,
-        BelowBest,
+        Downgrade,
+        RunParallel,
     }
     let decision = bbo.run(
         plan.work.ticket,
         || -> Result<TicketDecision, PrecompileError> {
+            // Forced by a lower-txn_id taker / emptying cancel (every downgrade sets the floor).
             if min_downgrade.load(Ordering::SeqCst) < plan.work.ticket {
-                return Ok(TicketDecision::Forced);
+                return Ok(TicketDecision::Downgrade);
             }
             let best_bid = storage::load_best_bid(ctx, market)?;
             let best_ask = storage::load_best_ask(ctx, market)?;
-            Ok(if cancel_at_best(side, price, best_bid, best_ask) {
-                TicketDecision::AtBest
+            if !cancel_at_best(side, price, best_bid, best_ask) {
+                // Below best → cannot move the BBO → remove in parallel.
+                return Ok(TicketDecision::RunParallel);
+            }
+            // At best: still holding the ticket, wait for lower-txn_id same-price ops, then decide.
+            price_completion.wait_for(market, price, &plan.required);
+            let level = book_lock.run(market, side_u8, || load_level(ctx, market, side, price))?;
+            let present = level.iter().any(|id| id == &plan.work.order_id);
+            let others_remain = level.iter().any(|id| id != &plan.work.order_id);
+            if present && !others_remain {
+                // Sole order at the best level → removing it MOVES the BBO. Treat like a taker: set
+                // the contagion floor (forces every higher-txn_id op to the barrier, so the same
+                // maker's later margin-touching ops run AFTER this cancel's deferred margin release)
+                // and downgrade. The serial barrier re-runs the removal in txn_id order.
+                min_downgrade.fetch_min(plan.work.ticket, Ordering::SeqCst);
+                Ok(TicketDecision::Downgrade)
             } else {
-                TicketDecision::BelowBest
-            })
+                // Others remain (or the order is already gone) → BBO unchanged → remove in parallel.
+                Ok(TicketDecision::RunParallel)
+            }
         },
     )?;
 
     let outcome = match decision {
-        // Forced to the barrier by a lower-txn_id taker — leave the book untouched; the serial re-run
-        // owns this op (in txn_id order, after that taker). Still CONSUME the account rank (empty
-        // body) so a higher-rank same-account parallel op can't hang on the AccountGate.
-        TicketDecision::Forced => {
+        // Forced or emptying → deferred to the barrier; leave the book untouched. Still CONSUME the
+        // account rank (empty body) for the dense consume-once contract.
+        TicketDecision::Downgrade => {
             account_gate.run(plan.work.canceller, plan.work.rank, || ());
             CancelOutcome::Downgrade
         }
-        // Below best → cannot move the BBO → remove in parallel.
-        TicketDecision::BelowBest => {
+        // Below best, or at-best non-emptying → ticket released; remove under the account gate +
+        // book-side lock, in parallel. `remove_from_book_after_cancel` detaches without emptying the
+        // top level → no best refresh → safe.
+        TicketDecision::RunParallel => {
             gated_cancel(ctx, account_gate, book_lock, &plan.work, market, side_u8)?
-        }
-        TicketDecision::AtBest => {
-            // At best → wait for all lower-txn_id ops at this price so the level membership is settled.
-            price_completion.wait_for(market, price, &plan.required);
-            account_gate.run(plan.work.canceller, plan.work.rank, || {
-                book_lock.run(
-                    market,
-                    side_u8,
-                    || -> Result<CancelOutcome, PrecompileError> {
-                        let level = load_level(ctx, market, side, price)?;
-                        let present = level.iter().any(|id| id == &plan.work.order_id);
-                        let others_remain = level.iter().any(|id| id != &plan.work.order_id);
-                        if present && !others_remain {
-                            // Sole order at the best level → removing it moves the BBO → defer to barrier.
-                            // Leave the book untouched (the serial re-run owns this op).
-                            Ok(CancelOutcome::Downgrade)
-                        } else {
-                            // Others remain (BBO unchanged) or the order is already gone (→ body reverts):
-                            // run the body. With others remaining, `remove_from_book_after_cancel` detaches
-                            // without emptying → no best refresh → safe in parallel.
-                            let cp = ctx.journal_mut().checkpoint();
-                            let r = cancel_order_core(plan.work.canceller, plan.work.order_id, ctx);
-                            Ok(match dispose_body(ctx, cp, r)? {
-                                BodyDisposition::Committed => CancelOutcome::Executed,
-                                BodyDisposition::Reverted => CancelOutcome::Reverted,
-                            })
-                        }
-                    },
-                )
-            })?
         }
     };
 
@@ -1725,5 +1716,66 @@ mod driver_tests {
         worker.join().unwrap();
         assert_eq!(results[0].as_ref().unwrap(), &CancelOutcome::Reverted); // bogus order
         assert_eq!(results[1].as_ref().unwrap(), &CancelOutcome::Executed); // real below-best
+    }
+
+    /// Regression for the same-maker deferred-margin divergence (design C): one maker M, equity tuned
+    /// so it can fund ONE order but not two. Block = M cancels its sole best order O (emptying →
+    /// moves the BBO) + M places P. In serial, the cancel releases O's margin first, so P fits. WITHOUT
+    /// the fix the emptying cancel does not set the contagion floor, so P runs in the parallel phase
+    /// while O's margin is still reserved → P reverts (insufficient margin) → diverges. WITH design C
+    /// the emptying cancel sets the floor → P is forced to the barrier → runs AFTER the cancel
+    /// releases O's margin → P fits → parallel == serial. The window coincides (final mid == setup
+    /// mid == 100), so this compares the FULL delta.
+    #[test]
+    fn transact_block_parallel_same_maker_emptying_cancel_then_place_matches_serial() {
+        let m = user_addr(1);
+        let (o_id, p_id) = (oid(40), oid(41));
+
+        // Calibrate: d_o = wallet drop placing O (sole buy@100); d_p = wallet drop placing P (2nd buy).
+        let (d_o, d_p) = {
+            let mut c: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+            storage::save_market(&mut c, &test_market()).unwrap();
+            fund(&mut c, m, WALLET);
+            let w0 = storage::load_account(&mut c, m).unwrap().perp_wallet_balance;
+            rest(&mut c, m, o_id, 100 * TICK);
+            let w1 = storage::load_account(&mut c, m).unwrap().perp_wallet_balance;
+            rest(&mut c, m, p_id, 100 * TICK);
+            let w2 = storage::load_account(&mut c, m).unwrap().perp_wallet_balance;
+            ((w0 - w1) as u64, (w1 - w2) as u64)
+        };
+        // O alone fits; O + P does not (so a phase-2 P, with O's margin still held, reverts).
+        let funding = d_o + d_p - 1;
+
+        // ops: cancel O (rank 0, ticket 0, emptying) then place P (rank 1, ticket 1, buy@100).
+        let ops = vec![
+            PerpOp::Cancel(mk_cancel(m, o_id, 0, 0)),
+            mk_place(m, p_id, 0, 100 * TICK, 0, 1, 1),
+        ];
+
+        // Serial reference: fund + set up O resting, then run the block in txn_id order.
+        let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        storage::save_market(&mut serial, &test_market()).unwrap();
+        fund(&mut serial, m, funding);
+        rest(&mut serial, m, o_id, 100 * TICK);
+        for op in &ops {
+            run_serial_op(&mut serial, op);
+        }
+        let serial_delta = serial.journal_mut().take_perp_delta();
+
+        // Parallel: identical setup in the shared book, then the block driver.
+        let book = Arc::new(SharedPerpBook::new());
+        {
+            let mut s = make_slot(book.clone());
+            storage::save_market(&mut s, &test_market()).unwrap();
+            fund(&mut s, m, funding);
+            rest(&mut s, m, o_id, 100 * TICK);
+        }
+        let results = transact_block_parallel(&book, &ops, make_slot).unwrap();
+        let parallel_delta = book.take_delta();
+
+        // Both run at the barrier in txn_id order: cancel O then place P, both Executed.
+        assert_eq!(results[0], OpResult::Cancel(CancelOutcome::Executed));
+        assert_eq!(results[1], OpResult::Place(PlaceOutcome::Executed));
+        assert_eq!(serial_delta, parallel_delta);
     }
 }
