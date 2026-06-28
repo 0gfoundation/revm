@@ -21,7 +21,9 @@ pub use inner::JournalInner;
 use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
-    journaled_state::{AccountLoad, JournalCheckpoint, JournalTr, PerpDelta, TransferError},
+    journaled_state::{
+        AccountLoad, JournalCheckpoint, JournalTr, PerpDelta, PerpReplayResult, TransferError,
+    },
 };
 use core::ops::{Deref, DerefMut};
 use database_interface::Database;
@@ -351,6 +353,16 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn perp_is_replay(&self) -> bool {
+        self.inner.perp_is_replay()
+    }
+
+    #[inline]
+    fn perp_replay_next(&mut self) -> Option<PerpReplayResult> {
+        self.inner.perp_replay_next()
+    }
+
+    #[inline]
     fn perp_contains_struct(&mut self, key: B256) -> bool {
         self.inner.perp_contains_struct(key)
     }
@@ -479,5 +491,37 @@ mod perp_passthrough_tests {
         j.checkpoint_revert(cp); // overlay write removed (prev == None)
         // Overlay miss again → falls through to the committed store, NOT to empty.
         assert_eq!(j.perp_load(k(1)).unwrap(), vec![7]);
+    }
+
+    /// Replay mode (step 4b): a fresh journal is not in replay mode; after `set_perp_replay` the
+    /// precompile pops the pre-computed results in block order via a cursor, then exhausts to `None`
+    /// (which the precompile turns into a fail-stop). Exhausted is still "in replay mode" — distinct
+    /// from never-set, so the precompile can tell an unclassified trading call from the serial path.
+    #[cfg(feature = "perp-parallel")]
+    #[test]
+    fn replay_mode_pops_results_in_block_order_then_exhausts() {
+        use context_interface::journaled_state::PerpReplayResult;
+        let mut j: Journal<PerpBackedDb> = Journal::new(PerpBackedDb::default());
+
+        assert!(!j.perp_is_replay());
+        assert_eq!(j.perp_replay_next(), None);
+
+        j.set_perp_replay(std::vec![
+            PerpReplayResult { reverted: false, output: std::vec![1, 2, 3] },
+            PerpReplayResult { reverted: true, output: std::vec![4] },
+        ]);
+        assert!(j.perp_is_replay());
+
+        assert_eq!(
+            j.perp_replay_next(),
+            Some(PerpReplayResult { reverted: false, output: std::vec![1, 2, 3] })
+        );
+        assert_eq!(
+            j.perp_replay_next(),
+            Some(PerpReplayResult { reverted: true, output: std::vec![4] })
+        );
+        // Exhausted → None (precompile fail-stops), but still in replay mode.
+        assert_eq!(j.perp_replay_next(), None);
+        assert!(j.perp_is_replay());
     }
 }

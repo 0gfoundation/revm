@@ -5,7 +5,9 @@ use super::JournalEntryTr;
 use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
-    journaled_state::{AccountLoad, JournalCheckpoint, PerpDelta, TransferError},
+    journaled_state::{
+        AccountLoad, JournalCheckpoint, PerpDelta, PerpReplayResult, TransferError,
+    },
 };
 use core::mem;
 use database_interface::Database;
@@ -337,6 +339,17 @@ pub struct JournalInner<ENTRY> {
     /// unification is a 3c task.)
     #[cfg(feature = "perp-parallel")]
     perp_writeset: crate::journal::shared_perp::PerpWriteSet,
+    /// Pre-computed trading-call results replayed during the serial EVM pass under canonical parallel
+    /// execution (step 4b). `Some` ⟹ REPLAY mode: the `0x…1003` precompile pops one per trading
+    /// selector in block order (via `perp_replay_cursor`) and returns it instead of re-verifying /
+    /// re-matching / re-writing (the parallel pre-phase already ran every op + wrote the shared book).
+    /// Single-block-scoped; the executor sets it on a fresh journal each block.
+    #[cfg(feature = "perp-parallel")]
+    perp_replay: Option<std::vec::Vec<PerpReplayResult>>,
+    /// Cursor into `perp_replay`: the next result to hand back. Advances once per trading-selector
+    /// call; exhaustion (cursor == len) is a fail-stop in the precompile (an unclassified trading call).
+    #[cfg(feature = "perp-parallel")]
+    perp_replay_cursor: usize,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -366,6 +379,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             perp_shared: None,
             #[cfg(feature = "perp-parallel")]
             perp_writeset: crate::journal::shared_perp::PerpWriteSet::default(),
+            #[cfg(feature = "perp-parallel")]
+            perp_replay: None,
+            #[cfg(feature = "perp-parallel")]
+            perp_replay_cursor: 0,
         }
     }
 
@@ -390,6 +407,47 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         #[cfg(not(feature = "perp-parallel"))]
         {
             false
+        }
+    }
+
+    /// Loads the pre-computed trading-call results for REPLAY mode (canonical parallel execution,
+    /// step 4b): during the serial EVM pass the `0x…1003` precompile returns these in block order
+    /// instead of re-matching. Single-block-scoped; set on a fresh journal each block, cursor at 0.
+    #[cfg(feature = "perp-parallel")]
+    pub fn set_perp_replay(&mut self, results: std::vec::Vec<PerpReplayResult>) {
+        self.perp_replay = Some(results);
+        self.perp_replay_cursor = 0;
+    }
+
+    /// Whether this journal is in replay mode. Mirrors [`context_interface::JournalTr::perp_is_replay`];
+    /// `false` without the feature.
+    #[inline]
+    pub fn perp_is_replay(&self) -> bool {
+        #[cfg(feature = "perp-parallel")]
+        {
+            self.perp_replay.is_some()
+        }
+        #[cfg(not(feature = "perp-parallel"))]
+        {
+            false
+        }
+    }
+
+    /// Pops the next replay result (block order). `None` when exhausted (cursor == len) → the
+    /// precompile fail-stops. Mirrors [`context_interface::JournalTr::perp_replay_next`]; always
+    /// `None` without the feature.
+    #[inline]
+    pub fn perp_replay_next(&mut self) -> Option<PerpReplayResult> {
+        #[cfg(feature = "perp-parallel")]
+        {
+            let results = self.perp_replay.as_ref()?;
+            let r = results.get(self.perp_replay_cursor)?.clone();
+            self.perp_replay_cursor += 1;
+            Some(r)
+        }
+        #[cfg(not(feature = "perp-parallel"))]
+        {
+            None
         }
     }
 
@@ -591,6 +649,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             perp_shared,
             #[cfg(feature = "perp-parallel")]
             perp_writeset,
+            // Replay (step 4b) is BLOCK-scoped: the cursor advances per trading-selector CALL, not
+            // per tx, so a tx boundary keeps both untouched.
+            #[cfg(feature = "perp-parallel")]
+            perp_replay: _,
+            #[cfg(feature = "perp-parallel")]
+            perp_replay_cursor: _,
         } = self;
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
@@ -641,6 +705,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             perp_shared,
             #[cfg(feature = "perp-parallel")]
             perp_writeset,
+            // Block-scoped (see commit_tx): a discarded tx does not roll back the replay cursor —
+            // it tracks precompile calls in block order, not tx commit/discard.
+            #[cfg(feature = "perp-parallel")]
+            perp_replay: _,
+            #[cfg(feature = "perp-parallel")]
+            perp_replay_cursor: _,
         } = self;
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
@@ -689,7 +759,18 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             perp_shared,
             #[cfg(feature = "perp-parallel")]
             perp_writeset,
+            // finalize resets the journal to initial state for reuse → clear replay so the next block
+            // (which re-sets it, or runs serial) does not inherit a stale queue/cursor.
+            #[cfg(feature = "perp-parallel")]
+            perp_replay,
+            #[cfg(feature = "perp-parallel")]
+            perp_replay_cursor,
         } = self;
+        #[cfg(feature = "perp-parallel")]
+        {
+            *perp_replay = None;
+            *perp_replay_cursor = 0;
+        }
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
         // Clear coinbase address warming for next tx

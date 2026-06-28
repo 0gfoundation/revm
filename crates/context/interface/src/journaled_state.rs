@@ -17,6 +17,22 @@ use std::vec::Vec;
 /// (single-node, no-reorg scope). See `docs/perpstate-journal集成方案.md`.
 pub type PerpDelta = HashMap<B256, Vec<u8>>;
 
+/// One pre-computed PerpDEX trading-call result, replayed by the precompile during the serial EVM
+/// pass under canonical parallel execution (catalog #21 spike, step 4b).
+///
+/// The parallel pre-phase already ran every trading op against the shared book, so during the serial
+/// EVM loop the `0x…1003` precompile returns this verbatim (gas is flat per selector) instead of
+/// re-verifying / re-matching / re-writing. `output` is the precompile return bytes (the ABI-encoded
+/// orderId for a successful place, the revert reason for a revert); `reverted` is the call status.
+/// Only `reverted` is consensus-relevant — the return data is not folded into the receipts root.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PerpReplayResult {
+    /// Whether the original trading call reverted (drives the receipt status).
+    pub reverted: bool,
+    /// The precompile return bytes to hand back (ABI orderId / revert reason).
+    pub output: Vec<u8>,
+}
+
 /// Trait that contains database and journal of all changes that were made to the state.
 pub trait JournalTr {
     /// Database type that is used in the journal.
@@ -254,6 +270,24 @@ pub trait JournalTr {
     /// barrier record an order-INDEPENDENT block-end sample. Default backend (serial): `false`.
     fn perp_is_parallel(&self) -> bool {
         false
+    }
+
+    /// Whether this journal is in REPLAY mode (canonical parallel execution, step 4b): the parallel
+    /// pre-phase already ran every trading op, so during the serial EVM loop the `0x…1003` precompile
+    /// returns the pre-computed results in block order instead of re-verifying / re-matching. The
+    /// precompile checks this before dispatching a trading selector. Default backend (serial): `false`.
+    fn perp_is_replay(&self) -> bool {
+        false
+    }
+
+    /// Pop the next pre-computed trading-call result (replay mode, block order). The precompile calls
+    /// this once per trading-selector call; because the pre-phase produced results in block order and
+    /// the serial loop hits trading calls in the same order, a simple cursor aligns them. `None` means
+    /// the queue is EXHAUSTED — the precompile fail-stops (a trading call the pre-phase did not see,
+    /// e.g. an internal contract call to `0x…1003`; the scheme assumes top-level perp txs only).
+    /// Default: `None`.
+    fn perp_replay_next(&mut self) -> Option<PerpReplayResult> {
+        None
     }
 
     /// Writes a deferred deserialized off-trie blob (#16d Phase 2): the value is kept type-erased
