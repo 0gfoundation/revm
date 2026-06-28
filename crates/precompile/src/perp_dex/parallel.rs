@@ -21,12 +21,20 @@
 //!
 //! `best == 0` is the "no order on this side" sentinel (an empty book side).
 
+use crate::perp_dex::interface::IPerpDex::{
+    cancelOrderCall, cancelOrderSignedCall, placeOrderCall, placeOrderSignedCall,
+};
 use crate::perp_dex::types::order::{OrderType, Side, TimeInForce};
 use crate::perp_dex::{
-    storage,
-    trading::{cancel_order_core, place_order_core},
+    encode_revert_string, storage,
+    trading::{
+        cancel_order_core, decode_cancel_order, decode_place_order, encode_place_order_id,
+        place_order_core, verify_cancel_order_signed, verify_place_order_signed, CancelParams,
+        PlaceParams,
+    },
 };
 use crate::PrecompileError;
+use alloy_sol_types::SolCall;
 use context::journal::perp_pool::PerpPool;
 use context::journal::perp_sched::{AccountGate, BboTicketLock, BookSideLock, PriceCompletion};
 use context::journal::shared_perp::SharedPerpBook;
@@ -882,6 +890,111 @@ pub enum OpResult {
     Cancel(CancelOutcome),
 }
 
+/// How the step-4b parallel pre-phase treats one perp transaction's calldata. The node calls
+/// [`classify_perp_tx`] SERIALLY in block order for each top-level `0x…1003` call.
+#[derive(Debug, Clone)]
+pub enum PerpTxClass {
+    /// A trading op to match in the parallel phase. `success_output` is the precompile return bytes to
+    /// replay if the driver Executes it (the ABI-encoded orderId for a place; empty for a cancel — a
+    /// driver Revert is replayed as a revert with a generic reason, which is not consensus-relevant).
+    Trade { op: PerpOp, success_output: Vec<u8> },
+    /// Decode/verify REJECTED this trading call before matching (bad calldata / sig / key / recv-window
+    /// / duplicate). It never enters the driver; phase B replays this revert. `output` = the ABI revert.
+    Reject { output: Vec<u8> },
+    /// Not one of the four trading selectors (a non-trading perp call, or undecodable) → runs normally
+    /// in the serial EVM pass; no replay entry, not counted by the replay cursor.
+    NotTrading,
+}
+
+/// Classify a perp transaction for canonical parallel execution (step 4b): decode + (for signed)
+/// authenticate via the SINGLE-SOURCE [`crate::perp_dex::trading`] helpers (so verify cannot drift from
+/// the serial precompile path), then build a [`PerpOp`] for the driver — WITHOUT matching. Runs
+/// SERIALLY per tx (verify is intentionally not parallelized here). A non-fatal decode/verify error
+/// becomes [`PerpTxClass::Reject`] (the serial EVM pass replays it as a revert); a `Fatal`
+/// (storage/system) propagates to abort the block. `context` is a perp-cold-read context — for a direct
+/// `placeOrder` it also advances the sequential order-id counter (written to the shared book).
+pub fn classify_perp_tx<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<PerpTxClass, PrecompileError> {
+    let Some(selector) = input_bytes
+        .get(..4)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+    else {
+        return Ok(PerpTxClass::NotTrading);
+    };
+
+    // A non-fatal decode/verify error → Reject (replayed as a revert); a Fatal propagates.
+    let to_reject = |e: PrecompileError| -> Result<PerpTxClass, PrecompileError> {
+        match e {
+            PrecompileError::Fatal(f) => Err(PrecompileError::Fatal(f)),
+            other => Ok(PerpTxClass::Reject {
+                output: encode_revert_string(&other.to_string()).to_vec(),
+            }),
+        }
+    };
+
+    if selector == placeOrderCall::SELECTOR {
+        match decode_place_order(input_bytes, caller, context) {
+            Ok(p) => Ok(place_trade(p)),
+            Err(e) => to_reject(e),
+        }
+    } else if selector == placeOrderSignedCall::SELECTOR {
+        match verify_place_order_signed(input_bytes, context) {
+            Ok(p) => Ok(place_trade(p)),
+            Err(e) => to_reject(e),
+        }
+    } else if selector == cancelOrderCall::SELECTOR {
+        match decode_cancel_order(input_bytes, caller) {
+            Ok(c) => Ok(cancel_trade(c)),
+            Err(e) => to_reject(e),
+        }
+    } else if selector == cancelOrderSignedCall::SELECTOR {
+        match verify_cancel_order_signed(input_bytes, context) {
+            Ok(c) => Ok(cancel_trade(c)),
+            Err(e) => to_reject(e),
+        }
+    } else {
+        Ok(PerpTxClass::NotTrading)
+    }
+}
+
+/// Build a `Trade` for a verified place. `rank`/`ticket` are placeholders — the driver assigns them
+/// in [`normalize_schedule`].
+fn place_trade(p: PlaceParams) -> PerpTxClass {
+    PerpTxClass::Trade {
+        success_output: encode_place_order_id(p.order_id).to_vec(),
+        op: PerpOp::Place(PlaceWork {
+            maker: p.maker,
+            order_id: p.order_id,
+            market_id: p.market_id,
+            side: p.side,
+            price: p.price,
+            qty: p.qty,
+            order_type: p.order_type,
+            tif: p.tif,
+            client_order_id: p.client_order_id,
+            rank: 0,
+            ticket: 0,
+        }),
+    }
+}
+
+/// Build a `Trade` for a verified cancel. `cancel_order_core` returns empty bytes on success, so the
+/// replayed success output is empty.
+fn cancel_trade(c: CancelParams) -> PerpTxClass {
+    PerpTxClass::Trade {
+        success_output: Vec::new(),
+        op: PerpOp::Cancel(CancelWork {
+            canceller: c.canceller,
+            order_id: c.order_id,
+            rank: 0,
+            ticket: 0,
+        }),
+    }
+}
+
 /// One op prepared by the serial pre-scan: a place (unchanged) or a cancel with its resolved
 /// `(market, side, price)` + the lower-ticket SAME-(market, price) ticket set it must wait for.
 #[derive(Debug, Clone)]
@@ -1211,6 +1324,83 @@ mod driver_tests {
     fn test_pool() -> &'static PerpPool {
         static POOL: std::sync::OnceLock<PerpPool> = std::sync::OnceLock::new();
         POOL.get_or_init(|| PerpPool::new(8))
+    }
+
+    /// classify_perp_tx dispatch (step 4b pre-phase): a direct place/cancel → Trade with the right
+    /// PerpOp (maker/canceller = caller, fields preserved, place replays the orderId / cancel replays
+    /// empty); a trading selector with bad args → Reject; a non-trading / too-short input → NotTrading.
+    /// (The signed verify_* paths reuse the same helpers exercised by the golden scenario.)
+    #[test]
+    fn classify_perp_tx_dispatches_place_cancel_reject_and_nontrading() {
+        use crate::perp_dex::interface::IPerpDex::{cancelOrderCall, placeOrderCall};
+        use alloy_sol_types::SolCall;
+        use primitives::FixedBytes;
+
+        let a = user_addr(1);
+        let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut ctx, &[a]);
+
+        // Direct placeOrder → Trade(Place), maker = caller, fields preserved, non-empty success output.
+        let place_input = placeOrderCall {
+            marketId: MID,
+            side: 0,
+            price: 100 * TICK,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes([0u8; 16]),
+        }
+        .abi_encode();
+        match classify_perp_tx(&place_input, a, &mut ctx).unwrap() {
+            PerpTxClass::Trade {
+                op: PerpOp::Place(w),
+                success_output,
+            } => {
+                assert_eq!(w.maker, a);
+                assert_eq!(w.market_id, MID);
+                assert_eq!(w.side, 0);
+                assert_eq!(w.price, 100 * TICK);
+                assert_eq!(w.qty, QTY);
+                assert!(!success_output.is_empty(), "place replays the orderId");
+            }
+            other => panic!("expected Trade(Place), got {other:?}"),
+        }
+
+        // Direct cancelOrder → Trade(Cancel), canceller = caller, empty success output.
+        let cancel_input = cancelOrderCall {
+            orderId: FixedBytes(oid(7)),
+            marketId: MID,
+        }
+        .abi_encode();
+        match classify_perp_tx(&cancel_input, a, &mut ctx).unwrap() {
+            PerpTxClass::Trade {
+                op: PerpOp::Cancel(c),
+                success_output,
+            } => {
+                assert_eq!(c.canceller, a);
+                assert_eq!(c.order_id, oid(7));
+                assert!(success_output.is_empty(), "cancel replays empty");
+            }
+            other => panic!("expected Trade(Cancel), got {other:?}"),
+        }
+
+        // A trading selector with garbage args → Reject (replayed as a revert).
+        let mut bad = placeOrderCall::SELECTOR.to_vec();
+        bad.extend_from_slice(&[0u8; 8]);
+        assert!(matches!(
+            classify_perp_tx(&bad, a, &mut ctx).unwrap(),
+            PerpTxClass::Reject { .. }
+        ));
+
+        // A non-trading 4-byte selector and a too-short input → NotTrading (serial pass handles them).
+        assert!(matches!(
+            classify_perp_tx(&[0xAA, 0xBB, 0xCC, 0xDD], a, &mut ctx).unwrap(),
+            PerpTxClass::NotTrading
+        ));
+        assert!(matches!(
+            classify_perp_tx(&[0x01, 0x02], a, &mut ctx).unwrap(),
+            PerpTxClass::NotTrading
+        ));
     }
 
     /// A taker TIF (IOC) is downgraded to the barrier without touching the book — and without

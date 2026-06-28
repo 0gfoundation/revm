@@ -158,7 +158,7 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
 ///
 /// Layout: selector(4) | offset(32) | length(32) | data(padded to 32)
 /// selector = keccak256("Error(string)")[0..4] = 0x08c379a0
-fn encode_revert_string(msg: &str) -> primitives::Bytes {
+pub(crate) fn encode_revert_string(msg: &str) -> primitives::Bytes {
     const SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
     let msg_bytes = msg.as_bytes();
     let msg_len = msg_bytes.len();
