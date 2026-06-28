@@ -24,7 +24,7 @@
 use crate::perp_dex::types::order::{OrderType, Side, TimeInForce};
 use crate::perp_dex::{storage, trading::place_order_core};
 use crate::PrecompileError;
-use context::journal::perp_sched::{AccountGate, BboTicketLock};
+use context::journal::perp_sched::{AccountGate, BboTicketLock, BookSideLock};
 use context::journal::shared_perp::SharedPerpBook;
 use context::{ContextTr, JournalTr};
 use primitives::Address;
@@ -271,38 +271,43 @@ pub enum PlaceOutcome {
     Downgrade,
 }
 
-/// Run `place_order_core` under the maker's account turn, inside a journal checkpoint so a
-/// (non-fatal) rejection rolls back this slot's off-trie writes via the write-set (step 3b).
+/// Run `place_order_core` under the maker's account turn AND the book-side lock for the order's side,
+/// inside a journal checkpoint so a (non-fatal) rejection rolls back this slot's off-trie writes via
+/// the write-set (step 3b). Lock order: AccountGate (per maker) → BookSideLock (per market+side);
+/// the body's level FIFO + price-list mutations on `work.side` are atomic against concurrent slots.
 fn gated_execute<CTX: ContextTr>(
     ctx: &mut CTX,
     account_gate: &AccountGate,
+    book_lock: &BookSideLock,
     work: &PlaceWork,
 ) -> Result<PlaceOutcome, PrecompileError> {
     account_gate.run(work.maker, work.rank, || {
-        let cp = ctx.journal_mut().checkpoint();
-        match place_order_core(
-            work.maker,
-            work.order_id,
-            work.market_id,
-            work.side,
-            work.price,
-            work.qty,
-            work.order_type,
-            work.tif,
-            work.client_order_id,
-            ctx,
-        ) {
-            Ok(()) => {
-                ctx.journal_mut().checkpoint_commit();
-                Ok(PlaceOutcome::Executed)
+        book_lock.run(work.market_id, work.side, || {
+            let cp = ctx.journal_mut().checkpoint();
+            match place_order_core(
+                work.maker,
+                work.order_id,
+                work.market_id,
+                work.side,
+                work.price,
+                work.qty,
+                work.order_type,
+                work.tif,
+                work.client_order_id,
+                ctx,
+            ) {
+                Ok(()) => {
+                    ctx.journal_mut().checkpoint_commit();
+                    Ok(PlaceOutcome::Executed)
+                }
+                // TODO(3d): distinguish PrecompileError::Fatal (propagate) from a user/validation
+                // revert. The parallel place/cancel set never hits Fatal, so for now any error reverts.
+                Err(_e) => {
+                    ctx.journal_mut().checkpoint_revert(cp);
+                    Ok(PlaceOutcome::Reverted)
+                }
             }
-            // TODO(3d): distinguish PrecompileError::Fatal (propagate) from a user/validation
-            // revert. The parallel place/cancel set never hits Fatal, so for now any error reverts.
-            Err(_e) => {
-                ctx.journal_mut().checkpoint_revert(cp);
-                Ok(PlaceOutcome::Reverted)
-            }
-        }
+        })
     })
 }
 
@@ -313,6 +318,7 @@ fn gated_execute<CTX: ContextTr>(
 pub fn parallel_place<CTX: ContextTr>(
     ctx: &mut CTX,
     account_gate: &AccountGate,
+    book_lock: &BookSideLock,
     bbo: &BboTicketLock,
     work: &PlaceWork,
 ) -> Result<PlaceOutcome, PrecompileError> {
@@ -337,18 +343,22 @@ pub fn parallel_place<CTX: ContextTr>(
         };
         match plan {
             LockPlan::DowngradeToBarrier => Ok(UnderTicket::Downgrade),
-            LockPlan::HoldTicket | LockPlan::RejectInBody => {
-                Ok(UnderTicket::Done(gated_execute(ctx, account_gate, work)))
-            }
+            // A mover (or a PostOnly-cross self-reject) executes while still holding the BBO ticket so
+            // its best-update is serialized; the body itself takes the book-side lock.
+            LockPlan::HoldTicket | LockPlan::RejectInBody => Ok(UnderTicket::Done(gated_execute(
+                ctx,
+                account_gate,
+                book_lock,
+                work,
+            ))),
             LockPlan::ReleaseTicket => Ok(UnderTicket::Release),
         }
     })?;
     match under {
         UnderTicket::Done(r) => r,
         UnderTicket::Downgrade => Ok(PlaceOutcome::Downgrade),
-        // Ticket released; rest under the account gate (the per-level lock is the book's DashMap
-        // entry, taken inside the push/mutate helpers).
-        UnderTicket::Release => gated_execute(ctx, account_gate, work),
+        // Ticket released (non-mover); rest under the account gate + book-side lock, in parallel.
+        UnderTicket::Release => gated_execute(ctx, account_gate, book_lock, work),
     }
 }
 
@@ -361,6 +371,7 @@ pub fn parallel_place<CTX: ContextTr>(
 pub fn run_place_batch<CTX, F>(
     book: &Arc<SharedPerpBook>,
     account_gate: &AccountGate,
+    book_lock: &BookSideLock,
     bbo: &BboTicketLock,
     items: &[PlaceWork],
     make_ctx: F,
@@ -377,7 +388,7 @@ where
                 let book = book.clone();
                 s.spawn(move || {
                     let mut ctx = make_ctx(book);
-                    parallel_place(&mut ctx, account_gate, bbo, item)
+                    parallel_place(&mut ctx, account_gate, book_lock, bbo, item)
                 })
             })
             .collect();
@@ -466,6 +477,7 @@ mod driver_tests {
         let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
         ctx.journal_mut().set_perp_shared(book.clone());
         let gate = AccountGate::new();
+        let book_lock = BookSideLock::new();
         let bbo = BboTicketLock::new();
 
         let work = PlaceWork {
@@ -482,7 +494,7 @@ mod driver_tests {
             ticket: 0,
         };
 
-        let out = parallel_place(&mut ctx, &gate, &bbo, &work).unwrap();
+        let out = parallel_place(&mut ctx, &gate, &book_lock, &bbo, &work).unwrap();
         assert_eq!(out, PlaceOutcome::Downgrade);
         assert!(book.take_delta().is_empty(), "a downgrade must write nothing to the book");
     }
@@ -551,6 +563,49 @@ mod driver_tests {
         c
     }
 
+    /// Concurrency stress: N non-mover places at the SAME price from N DISTINCT accounts (so the
+    /// AccountGate does NOT serialize them) must all land in the level FIFO — no lost append. A
+    /// mover at ticket 0 establishes the best so the rest are non-movers (ReleaseTicket → run
+    /// outside the BBO ticket). Repeated to shake out the load-modify-store race on the level blob.
+    #[test]
+    fn parallel_place_same_level_distinct_accounts_no_lost_append() {
+        const N: u64 = 8;
+        for _round in 0..40 {
+            let mover = user_addr(100);
+            let makers: Vec<Address> = (1..=N).map(user_addr).collect();
+
+            let mut items = vec![mk_work(mover, [200u8; 32], 100 * TICK, 0, 0)];
+            for (i, &m) in makers.iter().enumerate() {
+                let mut oid = [0u8; 32];
+                oid[0] = (i + 1) as u8;
+                // All at 99 (< best 100) → non-movers; rank 0 for each (distinct accounts).
+                items.push(mk_work(m, oid, 99 * TICK, 0, (i + 1) as u64));
+            }
+
+            let book = Arc::new(SharedPerpBook::new());
+            let mut seed_users = vec![mover];
+            seed_users.extend(makers.iter().copied());
+            seed(&mut make_slot(book.clone()), &seed_users);
+            let gate = AccountGate::new();
+            let book_lock = BookSideLock::new();
+            let bbo = BboTicketLock::new();
+            let results = run_place_batch(&book, &gate, &book_lock, &bbo, &items, make_slot);
+            for r in &results {
+                assert_eq!(*r.as_ref().unwrap(), PlaceOutcome::Executed);
+            }
+
+            let mut ctx = make_slot(book.clone());
+            let level = storage::load_bid_level(&mut ctx, MID, 99 * TICK).unwrap();
+            assert_eq!(
+                level.len() as u64,
+                N,
+                "lost append: level 99 has {} of {} orders (round {_round})",
+                level.len(),
+                N
+            );
+        }
+    }
+
     /// THE step-3c gate: a batch of non-crossing places run in parallel + the barrier-sort produces
     /// a book delta byte-identical to the same ops run serially in txn_id order. Crucially includes
     /// TWO non-movers at the SAME non-best price (B@99, C@99): their FIFO append order is racy in the
@@ -592,8 +647,9 @@ mod driver_tests {
         let book = Arc::new(SharedPerpBook::new());
         seed(&mut make_slot(book.clone()), &[a, b]);
         let gate = AccountGate::new();
+        let book_lock = BookSideLock::new();
         let bbo = BboTicketLock::new();
-        let results = run_place_batch(&book, &gate, &bbo, &items, make_slot);
+        let results = run_place_batch(&book, &gate, &book_lock, &bbo, &items, make_slot);
         for r in &results {
             assert_eq!(*r.as_ref().unwrap(), PlaceOutcome::Executed);
         }

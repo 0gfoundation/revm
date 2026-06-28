@@ -232,6 +232,42 @@ impl PriceCompletion {
     }
 }
 
+/// Per-(market, side) mutual-exclusion lock guarding ALL book mutations on one side of one market's
+/// order book — the level FIFO queues AND the side's price list. Both are cross-maker shared and are
+/// mutated via a load → modify → store sequence that is NOT atomic against the concurrent
+/// [`super::shared_perp::SharedPerpBook`] (load returns an owned `Vec`, the store happens later), so
+/// two parallel ops touching the same side can lose an append/removal. Every parallel place/cancel
+/// runs its book-mutating body under this lock for its order's side.
+///
+/// It is the INNERMOST lock in the discipline (BBO ticket → AccountGate → BookSideLock): a leaf that
+/// never blocks on anything while held, so it cannot participate in a deadlock cycle regardless of
+/// the order in which slots reach it. Poison-tolerant (a panicked holder leaves the side usable).
+#[derive(Debug, Default)]
+pub struct BookSideLock {
+    sides: DashMap<(u64, u8), Arc<Mutex<()>>>,
+}
+
+impl BookSideLock {
+    /// Creates an empty (single-block-scoped) per-side lock table.
+    pub fn new() -> Self {
+        Self {
+            sides: DashMap::new(),
+        }
+    }
+
+    fn side_lock(&self, market: u64, side: u8) -> Arc<Mutex<()>> {
+        self.sides.entry((market, side)).or_default().clone()
+    }
+
+    /// Runs `f` while holding the `(market, side)` book lock. Poison-tolerant: a previously poisoned
+    /// side is recovered rather than propagating the panic.
+    pub fn run<R>(&self, market: u64, side: u8, f: impl FnOnce() -> R) -> R {
+        let lock = self.side_lock(market, side);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        f()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +555,47 @@ mod tests {
             proceeded.load(Ordering::SeqCst),
             "wait_for never returned after all required txns were done"
         );
+    }
+
+    /// The book-side lock serializes a non-atomic read-modify-write on the SAME (market, side): N
+    /// threads each load → +1 → store a shared cell under the lock; all N increments must land (no
+    /// lost update). Two distinct sides use distinct locks (so they never block each other), which we
+    /// exercise by hammering both sides concurrently and checking each side's total independently.
+    #[test]
+    fn book_side_lock_serializes_same_side_read_modify_write() {
+        const N: usize = 16;
+        for _round in 0..20 {
+            let lock = BookSideLock::new();
+            // SAFETY: every access to a cell is performed under that side's book lock, so the
+            // read-modify-write below is exclusive per side.
+            struct Cell(UnsafeCell<usize>);
+            unsafe impl Sync for Cell {}
+            let bid = Cell(UnsafeCell::new(0));
+            let ask = Cell(UnsafeCell::new(0));
+            let start = Barrier::new(N * 2);
+            std::thread::scope(|s| {
+                let (lock, bid, ask, start) = (&lock, &bid, &ask, &start);
+                for _ in 0..N {
+                    s.spawn(move || {
+                        start.wait();
+                        lock.run(7, 0, || {
+                            let c = bid.0.get();
+                            let v = unsafe { *c };
+                            unsafe { *c = v + 1 };
+                        });
+                    });
+                    s.spawn(move || {
+                        start.wait();
+                        lock.run(7, 1, || {
+                            let c = ask.0.get();
+                            let v = unsafe { *c };
+                            unsafe { *c = v + 1 };
+                        });
+                    });
+                }
+            });
+            assert_eq!(unsafe { *bid.0.get() }, N, "lost update on bid side");
+            assert_eq!(unsafe { *ask.0.get() }, N, "lost update on ask side");
+        }
     }
 }
