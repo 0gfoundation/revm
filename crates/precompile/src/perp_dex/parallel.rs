@@ -667,7 +667,20 @@ fn parallel_cancel<CTX: ContextTr>(
         // ticket — `plan_cancel_batch` only adds Some-resolved tickets to a `required` set). It MUST
         // still consume its BBO ticket, or the serve cursor wedges and every higher ticket hangs.
         None => {
-            bbo.run(plan.work.ticket, || ());
+            // Honor the contagion floor here too: if a lower-txn_id op downgraded, this op is ABOVE
+            // the floor and must defer as well. Without this it is the ONLY path that can `Executed`/
+            // `Reverted` above the floor, breaking the driver's contiguous-downgrade-suffix invariant
+            // (a debug_assert trip + a needless re-dispatch). Read the floor UNDER the BBO ticket so a
+            // lower ticket's floor is visible; on a downgrade CONSUME the account rank (empty body)
+            // like every other deferral. Value-neutral — a None cancel is a no-op revert whether it
+            // runs here or re-runs at the barrier — but the driver relies on the invariant.
+            let forced = bbo.run(plan.work.ticket, || {
+                min_downgrade.load(Ordering::SeqCst) < plan.work.ticket
+            });
+            if forced {
+                account_gate.run(plan.work.canceller, plan.work.rank, || ());
+                return Ok(CancelOutcome::Downgrade);
+            }
             return account_gate.run(plan.work.canceller, plan.work.rank, || {
                 let cp = ctx.journal_mut().checkpoint();
                 let r = cancel_order_core(plan.work.canceller, plan.work.order_id, ctx);
@@ -1772,6 +1785,58 @@ mod driver_tests {
                 .all(|r| matches!(r, OpResult::Place(PlaceOutcome::Executed))),
             "both takers should fill and every rest should land: {results:?}"
         );
+        assert_eq!(serial_delta, parallel_delta);
+    }
+
+    /// Regression for the adversarial-review MEDIUM finding: an UNRESOLVED cancel (order neither in the
+    /// book nor placed this block → resolved = None) sitting ABOVE a contagion floor. The `None` branch
+    /// of parallel_cancel was the ONLY op path that skipped the floor check, so it would return
+    /// Executed/Reverted above the floor — breaking the driver's contiguous-downgrade-suffix invariant
+    /// (a debug_assert trip in this build; a needless re-dispatch in release). With the fix it downgrades
+    /// like every other above-floor op. A None cancel is a no-op revert either way, so the delta stays
+    /// byte-identical to serial. (The taker's best-change → the known D3-b mid difference; carve it out.)
+    #[test]
+    fn transact_block_parallel_unresolved_cancel_above_floor_matches_serial() {
+        let a = user_addr(1);
+        let b = user_addr(2);
+        let c = user_addr(3);
+        let ghost = oid(81); // never placed → the cancel resolves to None
+        let ops = vec![
+            mk_place(a, oid(80), 1, 100 * TICK, 0, 0, 0), // SELL@100 ask mover (parallel, seg 1)
+            mk_place(b, oid(82), 0, 100 * TICK, 0, 0, 1), // BUY@100 taker (crosses → floor=1)
+            PerpOp::Cancel(mk_cancel(c, ghost, 0, 2)),    // cancel a non-existent order (None, above floor)
+        ];
+
+        let wkey = storage::keys::price_basis_window_key(MID);
+        // Serial reference: the ghost cancel reverts (order not found) → contributes NO delta, and
+        // run_serial_op unwraps (can't take a reverting op), so the faithful reference is the first two
+        // ops (the revert is a no-op the parallel path applies and rolls back to the same state).
+        let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut serial, &[a, b, c]);
+        for op in &ops[..2] {
+            run_serial_op(&mut serial, op);
+        }
+        let mut serial_delta = serial.journal_mut().take_perp_delta();
+        serial_delta.remove(&wkey);
+
+        let book = Arc::new(SharedPerpBook::new());
+        seed(&mut make_slot(book.clone()), &[a, b, c]);
+        let results = transact_block_parallel(test_pool(), &book, &ops, make_slot).unwrap();
+        let mut parallel_delta = book.take_delta();
+        parallel_delta.remove(&wkey);
+
+        // The unresolved cancel reverts (order not found) — not lost, not errored, not left Downgrade.
+        assert_eq!(results[2], OpResult::Cancel(CancelOutcome::Reverted));
+        for r in &results {
+            assert!(
+                !matches!(
+                    r,
+                    OpResult::Place(PlaceOutcome::Downgrade)
+                        | OpResult::Cancel(CancelOutcome::Downgrade)
+                ),
+                "every downgrade must be resolved by a segment's serial floor, got {r:?}"
+            );
+        }
         assert_eq!(serial_delta, parallel_delta);
     }
 
