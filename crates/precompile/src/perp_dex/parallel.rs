@@ -981,15 +981,31 @@ fn normalize_schedule(ops: &[PerpOp]) -> Vec<PerpOp> {
 }
 
 /// Execute a block's perp ops with place/cancel running concurrently, producing the SAME net book
-/// delta + per-op results as serial txn_id-order execution (step 3d). Three phases:
-///   1. serial pre-scan ([`plan_block`]): resolve + the PriceCompletion required sets;
-///   2. parallel: one shared `AccountGate` + `BookSideLock` + `BboTicketLock` + `PriceCompletion`
-///      + taker-contagion floor, a worker per op (fresh thread-local slot ctx via `make_ctx`);
-///   3. serial barrier: re-run every downgraded op in txn_id order against the post-parallel book
-///      ([`place_order_core`] / [`cancel_order_core`]) → FIFO finalize ([`finalize_place_batch_ordering`])
-///      → block-end order-independent mid sample (D3-b).
-/// `ops` must be in txn_id order; the driver assigns dense tickets + per-maker ranks itself
-/// ([`normalize_schedule`]). Returns results in that order.
+/// delta + per-op results as serial txn_id-order execution (step 3d + step-4 segmentation).
+///
+/// **Segmented parallelism.** The block is processed as a sequence of segments; each segment is
+///   1. a parallel batch on the persistent FIFO `pool` over the remaining ops, under FRESH
+///      per-segment gates (`AccountGate` + `BookSideLock` + `BboTicketLock` + `PriceCompletion` + a
+///      taker-contagion floor), the ops re-normalized to dense segment-local tickets + per-maker ranks
+///      ([`normalize_schedule`]) and pre-scanned ([`plan_block`]);
+///   2. a FIFO finalize of that segment's parallel rests ([`finalize_place_batch_ordering`]);
+///   3. the FIRST op that downgraded — the contagion floor (taker / crossing limit / emptying cancel
+///      that forces serialization) — re-run SERIALLY in place against the now-FIFO-sorted book
+///      ([`run_barrier_op`]).
+/// The strictly-higher tail (all forced to `Downgrade` by contagion, so never executed) is then
+/// re-dispatched as the next segment — it RE-PARALLELIZES against the post-serial-op book instead of
+/// collapsing onto one end-of-block barrier as in the pre-segmentation driver. A block-end
+/// order-independent mid sample (D3-b) runs once over every market touched.
+///
+/// **Serial-equivalence.** The floor op runs against exactly `[all lower ops applied]` (the segment
+/// executed them first) — identical to serial — and the re-dispatched tail then sees `[floor applied]`
+/// too. Per-segment gates are mandatory: the downgraded tail already consumed the previous segment's
+/// tickets/ranks, so reusing those gates would double-consume (fail-stop). Segment-local tickets stay
+/// globally FIFO-correct because [`finalize_place_batch_ordering`] preserves prior level order and only
+/// appends THIS segment's rests, and segments run in block order.
+///
+/// `ops` must be in txn_id order. Returns results in that order. `pool` is reused across segments (and,
+/// by the caller, across blocks).
 pub fn transact_block_parallel<CTX, F>(
     pool: &PerpPool,
     book: &Arc<SharedPerpBook>,
@@ -1000,129 +1016,169 @@ where
     CTX: ContextTr,
     F: Fn(Arc<SharedPerpBook>) -> CTX + Clone + Send + 'static,
 {
-    // Driver-owned scheduling — ticket = txn_id index, rank = per-maker count (monotone in ticket).
-    let ops = normalize_schedule(ops);
-    let prepared = plan_block(book, &ops, &make_ctx);
-    let account_gate = Arc::new(AccountGate::new());
-    let book_lock = Arc::new(BookSideLock::new());
-    let bbo = Arc::new(BboTicketLock::new());
-    let price_completion = Arc::new(PriceCompletion::new());
-    // Taker-contagion floor: the lowest ticket among taker downgrades; any op above it is forced to
-    // the barrier so the deferred-taker tail re-runs serial-equivalently (see parallel_place).
-    let min_downgrade = Arc::new(AtomicU64::new(u64::MAX));
+    let mut final_results: Vec<OpResult> = Vec::with_capacity(ops.len());
+    let mut markets_touched = std::collections::BTreeSet::new();
+    let mut start = 0usize;
 
-    // Phase 2: parallel on the persistent FIFO pool. Each job builds its own slot ctx (the journal
-    // never crosses a thread); the gates/book are shared via Arc and `make_ctx` is cloned per job, so
-    // each job is 'static (the pool needs no scoped-lifetime unsafe). The pool's strict FIFO + the
-    // scheme's wait-edges-point-lower invariant keep it deadlock-free (see PerpPool docs).
-    let mut results: Vec<OpResult> = {
-        let tasks: Vec<_> = prepared
-            .iter()
-            .map(|p| {
-                let p = p.clone();
-                let book = book.clone();
-                let make_ctx = make_ctx.clone();
-                let ag = account_gate.clone();
-                let bl = book_lock.clone();
-                let bbo = bbo.clone();
-                let pc = price_completion.clone();
-                let md = min_downgrade.clone();
-                move || -> Result<OpResult, PrecompileError> {
-                    let mut ctx = make_ctx(book);
-                    match &p {
-                        PreparedOp::Place(w) => {
-                            parallel_place(&mut ctx, &ag, &bl, &bbo, &pc, &md, w).map(OpResult::Place)
-                        }
-                        PreparedOp::Cancel(plan) => {
-                            parallel_cancel(&mut ctx, &ag, &bl, &bbo, &pc, &md, plan)
-                                .map(OpResult::Cancel)
-                        }
+    while start < ops.len() {
+        // Re-normalize THIS segment → dense segment-local tickets + per-maker ranks (a fresh gate
+        // domain each segment), then pre-scan it.
+        let seg_ops = normalize_schedule(&ops[start..]);
+        let prepared = plan_block(book, &seg_ops, &make_ctx);
+        for p in &prepared {
+            match p {
+                PreparedOp::Place(w) => {
+                    markets_touched.insert(w.market_id);
+                }
+                PreparedOp::Cancel(c) => {
+                    if let Some((m, _, _)) = c.resolved {
+                        markets_touched.insert(m);
                     }
                 }
-            })
-            .collect();
-        pool.run_batch(tasks)
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
-    };
-
-    // Phase 3a barrier: FIFO time-priority over this block's PARALLEL-phase Executed rests, BEFORE
-    // the barrier match reads any level. A barrier taker (3b) consumes makers from the FRONT of a
-    // level, so the level MUST be in ticket order first — parallel same-price rests append in racy
-    // lock-arrival order. (Downgraded places are still `Downgrade` here, so they are excluded; their
-    // barrier-rested remainders are appended in ticket order during 3b and have ticket ≥ the
-    // contagion floor > any parallel rest at that price, so they land after the sorted parallel rests
-    // in correct relative order — no second sort needed.)
-    {
-        let mut place_items: Vec<PlaceWork> = Vec::new();
-        let mut place_results: Vec<Result<PlaceOutcome, PrecompileError>> = Vec::new();
-        for (op, r) in ops.iter().zip(&results) {
-            if let (PerpOp::Place(w), OpResult::Place(o)) = (op, r) {
-                place_items.push(w.clone());
-                place_results.push(Ok(*o));
             }
         }
-        finalize_place_batch_ordering(book, &place_items, &place_results, &make_ctx)?;
-    }
 
-    // Phase 3b barrier: re-run every downgraded op SERIALLY in txn_id order against the post-parallel,
-    // now-FIFO-sorted book (one shared-backed ctx). A downgraded place re-runs the full matching body
-    // (matching the correctly-ordered levels); a downgraded cancel its removal. Running them after the
-    // parallel phase, in ticket order, with the contagion tail forced here too, is serial-equivalent.
-    // (perp_is_parallel stays true on this ctx → in-body sampling skipped; the block-end sample below
-    // records the deterministic final mid.)
-    {
-        let mut barrier_ctx = make_ctx(book.clone());
-        for (op, r) in ops.iter().zip(results.iter_mut()) {
-            match (op, &*r) {
-                (PerpOp::Place(w), OpResult::Place(PlaceOutcome::Downgrade)) => {
-                    let cp = barrier_ctx.journal_mut().checkpoint();
-                    let res = place_order_core(
-                        w.maker,
-                        w.order_id,
-                        w.market_id,
-                        w.side,
-                        w.price,
-                        w.qty,
-                        w.order_type,
-                        w.tif,
-                        w.client_order_id,
-                        &mut barrier_ctx,
-                    );
-                    *r = OpResult::Place(match dispose_body(&mut barrier_ctx, cp, res)? {
-                        BodyDisposition::Committed => PlaceOutcome::Executed,
-                        BodyDisposition::Reverted => PlaceOutcome::Reverted,
-                    });
+        // Fresh per-segment gates + contagion floor.
+        let account_gate = Arc::new(AccountGate::new());
+        let book_lock = Arc::new(BookSideLock::new());
+        let bbo = Arc::new(BboTicketLock::new());
+        let price_completion = Arc::new(PriceCompletion::new());
+        let min_downgrade = Arc::new(AtomicU64::new(u64::MAX));
+
+        // Phase 2: parallel batch on the persistent FIFO pool (deadlock-free: strict FIFO + the
+        // scheme's wait-edges-point-lower invariant — see PerpPool docs). Jobs are 'static (Arc'd
+        // gates/book + cloned make_ctx); each builds its own thread-local slot ctx.
+        let seg_results: Vec<OpResult> = {
+            let tasks: Vec<_> = prepared
+                .iter()
+                .map(|p| {
+                    let p = p.clone();
+                    let book = book.clone();
+                    let make_ctx = make_ctx.clone();
+                    let ag = account_gate.clone();
+                    let bl = book_lock.clone();
+                    let bbo = bbo.clone();
+                    let pc = price_completion.clone();
+                    let md = min_downgrade.clone();
+                    move || -> Result<OpResult, PrecompileError> {
+                        let mut ctx = make_ctx(book);
+                        match &p {
+                            PreparedOp::Place(w) => {
+                                parallel_place(&mut ctx, &ag, &bl, &bbo, &pc, &md, w)
+                                    .map(OpResult::Place)
+                            }
+                            PreparedOp::Cancel(plan) => {
+                                parallel_cancel(&mut ctx, &ag, &bl, &bbo, &pc, &md, plan)
+                                    .map(OpResult::Cancel)
+                            }
+                        }
+                    }
+                })
+                .collect();
+            pool.run_batch(tasks)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        // Phase 3a: FIFO-sort THIS segment's parallel rests before any serial op reads a level. Keeps
+        // prior level order + appends this segment's rests sorted by (segment-local = global-within-
+        // segment) ticket, so the level stays globally FIFO across segments.
+        {
+            let mut place_items: Vec<PlaceWork> = Vec::new();
+            let mut place_results: Vec<Result<PlaceOutcome, PrecompileError>> = Vec::new();
+            for (op, r) in seg_ops.iter().zip(&seg_results) {
+                if let (PerpOp::Place(w), OpResult::Place(o)) = (op, r) {
+                    place_items.push(w.clone());
+                    place_results.push(Ok(*o));
                 }
-                (PerpOp::Cancel(w), OpResult::Cancel(CancelOutcome::Downgrade)) => {
-                    let cp = barrier_ctx.journal_mut().checkpoint();
-                    let res = cancel_order_core(w.canceller, w.order_id, &mut barrier_ctx);
-                    *r = OpResult::Cancel(match dispose_body(&mut barrier_ctx, cp, res)? {
-                        BodyDisposition::Committed => CancelOutcome::Executed,
-                        BodyDisposition::Reverted => CancelOutcome::Reverted,
-                    });
-                }
-                _ => {}
             }
+            finalize_place_batch_ordering(book, &place_items, &place_results, &make_ctx)?;
         }
+
+        // The contagion floor downgrades a CONTIGUOUS suffix (every op classifies under the BBO ticket
+        // after the floor was set, so it sees the floor and downgrades); everything before it executed.
+        let first_dg = seg_results.iter().position(|r| {
+            matches!(
+                r,
+                OpResult::Place(PlaceOutcome::Downgrade) | OpResult::Cancel(CancelOutcome::Downgrade)
+            )
+        });
+
+        let Some(dg) = first_dg else {
+            // No serial op this segment → the whole remaining tail executed in parallel. Done.
+            final_results.extend(seg_results);
+            break;
+        };
+        debug_assert!(
+            seg_results[dg..].iter().all(|r| matches!(
+                r,
+                OpResult::Place(PlaceOutcome::Downgrade) | OpResult::Cancel(CancelOutcome::Downgrade)
+            )),
+            "the contagion floor must downgrade a contiguous suffix"
+        );
+
+        // Record the parallel-executed prefix, then run the floor op SERIALLY in place against the
+        // FIFO-sorted book.
+        final_results.extend(seg_results[..dg].iter().copied());
+        final_results.push(run_barrier_op(&seg_ops[dg], book, &make_ctx)?);
+
+        // Re-dispatch the strictly-higher tail (all downgraded → never executed → safe to re-run).
+        start += dg + 1;
     }
 
     // Block-end order-independent mid sample (D3-b) for every market the block touched.
-    let mut markets: Vec<u64> = prepared
-        .iter()
-        .filter_map(|p| match p {
-            PreparedOp::Place(w) => Some(w.market_id),
-            PreparedOp::Cancel(c) => c.resolved.map(|(m, _, _)| m),
-        })
-        .collect();
-    markets.sort_unstable();
-    markets.dedup();
     let mut barrier_ctx = make_ctx(book.clone());
-    for m in markets {
+    for m in markets_touched {
         crate::perp_dex::risk::finalize_block_mid_sample(&mut barrier_ctx, m)?;
     }
 
-    Ok(results)
+    Ok(final_results)
+}
+
+/// Run one downgraded op (a segment's contagion floor) SERIALLY against the shared book on a FRESH ctx
+/// — full matching body for a place, removal for a cancel — disposed via [`dispose_body`] (commit on
+/// Ok, propagate Fatal). A fresh ctx per call sidesteps any cross-segment read-cache staleness. The
+/// ctx's `perp_is_parallel` stays true so in-body mid sampling is skipped; the driver's block-end
+/// sample records the deterministic final mid.
+fn run_barrier_op<CTX, F>(
+    op: &PerpOp,
+    book: &Arc<SharedPerpBook>,
+    make_ctx: &F,
+) -> Result<OpResult, PrecompileError>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX,
+{
+    let mut ctx = make_ctx(book.clone());
+    match op {
+        PerpOp::Place(w) => {
+            let cp = ctx.journal_mut().checkpoint();
+            let res = place_order_core(
+                w.maker,
+                w.order_id,
+                w.market_id,
+                w.side,
+                w.price,
+                w.qty,
+                w.order_type,
+                w.tif,
+                w.client_order_id,
+                &mut ctx,
+            );
+            Ok(OpResult::Place(match dispose_body(&mut ctx, cp, res)? {
+                BodyDisposition::Committed => PlaceOutcome::Executed,
+                BodyDisposition::Reverted => PlaceOutcome::Reverted,
+            }))
+        }
+        PerpOp::Cancel(w) => {
+            let cp = ctx.journal_mut().checkpoint();
+            let res = cancel_order_core(w.canceller, w.order_id, &mut ctx);
+            Ok(OpResult::Cancel(match dispose_body(&mut ctx, cp, res)? {
+                BodyDisposition::Committed => CancelOutcome::Executed,
+                BodyDisposition::Reverted => CancelOutcome::Reverted,
+            }))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1648,6 +1704,74 @@ mod driver_tests {
                 "barrier must re-run all downgrades, got {r:?}"
             );
         }
+        assert_eq!(serial_delta, parallel_delta);
+    }
+
+    /// DEEP segmentation (the step-4 re-dispatch loop): a block with MULTIPLE interspersed takers, so
+    /// the driver runs ≥3 segments and the post-taker tail RE-PARALLELIZES instead of collapsing onto
+    /// one end-of-block barrier. Each taker downgrades + sets its segment's contagion floor; the floor
+    /// runs serially in place against the FIFO-sorted book, then the strictly-higher tail re-dispatches
+    /// against the post-taker book. Must stay byte-identical to serial across every segment boundary.
+    ///
+    /// Layout (all market BTC, qty QTY so the crossing limits fully fill — no taker remainder rests):
+    ///   seg 1: t0 a SELL@100 (ask mover, parallel) · t1 b BUY@100 (crosses → floor; t2.. contagion)
+    ///   seg 2: t2 c SELL@100 (mover again — a's ask was consumed; re-parallelized) · t3 d BUY@100 (floor)
+    ///   seg 3: t4 e SELL@100 (mover) · t5 f SELL@101 (non-mover) — no taker → loop ends
+    /// (Multiple best-changes → the known D3-b in-body-vs-block-end mid difference; carve the window
+    /// out, the correctness lives in the position / order / level / counterparty keys.)
+    #[test]
+    fn transact_block_parallel_deep_segmentation_matches_serial() {
+        let (a, b, c, d, e, f) = (
+            user_addr(1),
+            user_addr(2),
+            user_addr(3),
+            user_addr(4),
+            user_addr(5),
+            user_addr(6),
+        );
+        let ops = vec![
+            mk_place(a, oid(70), 1, 100 * TICK, 0, 0, 0), // SELL@100 ask mover (parallel, seg 1)
+            mk_place(b, oid(71), 0, 100 * TICK, 0, 0, 1), // BUY@100 taker (crosses → floor seg 1)
+            mk_place(c, oid(72), 1, 100 * TICK, 0, 0, 2), // SELL@100 mover again (re-parallelized, seg 2)
+            mk_place(d, oid(73), 0, 100 * TICK, 0, 0, 3), // BUY@100 taker (crosses → floor seg 2)
+            mk_place(e, oid(74), 1, 100 * TICK, 0, 0, 4), // SELL@100 mover (re-parallelized, seg 3)
+            mk_place(f, oid(75), 1, 101 * TICK, 0, 0, 5), // SELL@101 non-mover (parallel, seg 3)
+        ];
+        let users = [a, b, c, d, e, f];
+
+        // Serial reference.
+        let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut serial, &users);
+        for op in &ops {
+            run_serial_op(&mut serial, op);
+        }
+        let wkey = storage::keys::price_basis_window_key(MID);
+        let mut serial_delta = serial.journal_mut().take_perp_delta();
+        serial_delta.remove(&wkey);
+
+        // Parallel block driver — exercises 3 segments + 2 serial floor ops.
+        let book = Arc::new(SharedPerpBook::new());
+        seed(&mut make_slot(book.clone()), &users);
+        let results = transact_block_parallel(test_pool(), &book, &ops, make_slot).unwrap();
+        let mut parallel_delta = book.take_delta();
+        parallel_delta.remove(&wkey);
+
+        for r in &results {
+            assert!(
+                !matches!(
+                    r,
+                    OpResult::Place(PlaceOutcome::Downgrade)
+                        | OpResult::Cancel(CancelOutcome::Downgrade)
+                ),
+                "every downgrade must be resolved by a segment's serial floor, got {r:?}"
+            );
+        }
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, OpResult::Place(PlaceOutcome::Executed))),
+            "both takers should fill and every rest should land: {results:?}"
+        );
         assert_eq!(serial_delta, parallel_delta);
     }
 
