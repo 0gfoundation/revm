@@ -96,9 +96,11 @@ impl PerpPool {
                     .spawn(move || {
                         // A panicking job must not poison the queue mutex for the rest of the batch;
                         // `run_batch`'s completion counter would then never reach `n` and the driver
-                        // would hang. We can't catch_unwind a `FnOnce` without `UnwindSafe`, so jobs
-                        // themselves are responsible for not panicking (they translate errors into
-                        // their result type). The worker loop just pulls and runs.
+                        // would hang. So `run_batch` wraps each task in `catch_unwind` BEFORE the
+                        // counter bump — a panicking task is caught, stored as an `Err`, and the
+                        // counter still advances (no hang); `run_batch` re-raises it on the caller's
+                        // thread (matching the old thread::scope `join().unwrap()` propagation). The
+                        // wrapper itself never panics, so the worker loop just pulls and runs.
                         while let Some(job) = queue.pop() {
                             job();
                         }
@@ -124,8 +126,10 @@ impl PerpPool {
             return Vec::new();
         }
 
-        // Per-task result slots + a completion counter. All `Arc`, so the `'static` jobs can own clones.
-        let slots: Arc<Vec<Mutex<Option<R>>>> =
+        // Per-task result slots (`thread::Result` so a panicking task is captured, not lost) + a
+        // completion counter. All `Arc`, so the `'static` jobs can own clones.
+        #[allow(clippy::type_complexity)]
+        let slots: Arc<Vec<Mutex<Option<std::thread::Result<R>>>>> =
             Arc::new((0..n).map(|_| Mutex::new(None)).collect());
         let done: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0usize), Condvar::new()));
 
@@ -136,7 +140,10 @@ impl PerpPool {
                 let slots = slots.clone();
                 let done = done.clone();
                 q.push_back(Box::new(move || {
-                    let r = task();
+                    // Catch a panicking task so the counter still advances (else the drain hangs).
+                    // `AssertUnwindSafe`: on panic we propagate and stop using the captured state, so
+                    // there is no observable broken invariant to leak across the boundary.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
                     *slots[i].lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
                     let (count, cv) = &*done;
                     let mut c = count.lock().unwrap_or_else(|p| p.into_inner());
@@ -161,16 +168,29 @@ impl PerpPool {
 
         // Collect results in submission order. Read through the `Arc` (do not `try_unwrap`: the last
         // job's closure may still be unwinding its stack — and thus holding its `slots` clone — in the
-        // instant after it bumped the counter to `n`).
-        slots
-            .iter()
-            .map(|slot| {
-                slot.lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take()
-                    .expect("a pool job did not record its result")
-            })
-            .collect()
+        // instant after it bumped the counter to `n`). All jobs have finished, so re-raise the first
+        // captured panic on this (the caller's) thread — same propagation as the old join().unwrap().
+        let mut out = Vec::with_capacity(n);
+        let mut panic: Option<Box<dyn std::any::Any + Send>> = None;
+        for slot in slots.iter() {
+            match slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+                .expect("a pool job did not record its result")
+            {
+                Ok(r) => out.push(r),
+                Err(p) => {
+                    if panic.is_none() {
+                        panic = Some(p);
+                    }
+                }
+            }
+        }
+        if let Some(p) = panic {
+            std::panic::resume_unwind(p);
+        }
+        out
     }
 }
 
@@ -331,6 +351,42 @@ mod tests {
                 })
                 .collect();
             assert_eq!(pool.run_batch(tasks).len(), W);
+        });
+    }
+
+    /// A panicking task must NOT wedge the drain. It is caught, the counter still advances, the other
+    /// jobs in the batch complete, and run_batch re-raises the panic on the caller's thread (same
+    /// propagation as the old thread::scope `join().unwrap()`).
+    #[test]
+    fn panicking_job_repanics_and_does_not_hang() {
+        let pool = PerpPool::new(2);
+        within(10, move || {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let tasks: Vec<Box<dyn FnOnce() -> usize + Send>> = vec![
+                {
+                    let r = ran.clone();
+                    Box::new(move || {
+                        r.fetch_add(1, Ordering::SeqCst);
+                        0
+                    })
+                },
+                Box::new(|| -> usize { panic!("boom (expected by panicking_job test)") }),
+                {
+                    let r = ran.clone();
+                    Box::new(move || {
+                        r.fetch_add(1, Ordering::SeqCst);
+                        2
+                    })
+                },
+            ];
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.run_batch(tasks)));
+            assert!(result.is_err(), "run_batch must re-raise the job's panic");
+            assert_eq!(
+                ran.load(Ordering::SeqCst),
+                2,
+                "the two non-panicking jobs must still complete"
+            );
         });
     }
 }
