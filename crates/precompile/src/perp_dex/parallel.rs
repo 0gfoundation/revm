@@ -425,7 +425,14 @@ pub fn parallel_place<CTX: ContextTr>(
         })?;
     match under {
         UnderTicket::Done(r) => r,
-        UnderTicket::Downgrade => Ok(PlaceOutcome::Downgrade),
+        UnderTicket::Downgrade => {
+            // Deferred to the barrier, but still CONSUME this maker's account rank (empty body) — a
+            // higher-rank same-account parallel op waits on the AccountGate and would hang otherwise.
+            // The actual effect runs at the serial barrier (in txn_id order). Mirrors the BBO-ticket
+            // pass-through for None-resolved cancels.
+            account_gate.run(work.maker, work.rank, || ());
+            Ok(PlaceOutcome::Downgrade)
+        }
         // Ticket released (non-mover); rest under the account gate + book-side lock, in parallel.
         UnderTicket::Release => gated_execute(ctx, account_gate, book_lock, work),
     }
@@ -706,8 +713,12 @@ fn parallel_cancel<CTX: ContextTr>(
 
     let outcome = match decision {
         // Forced to the barrier by a lower-txn_id taker — leave the book untouched; the serial re-run
-        // owns this op (in txn_id order, after that taker).
-        TicketDecision::Forced => CancelOutcome::Downgrade,
+        // owns this op (in txn_id order, after that taker). Still CONSUME the account rank (empty
+        // body) so a higher-rank same-account parallel op can't hang on the AccountGate.
+        TicketDecision::Forced => {
+            account_gate.run(plan.work.canceller, plan.work.rank, || ());
+            CancelOutcome::Downgrade
+        }
         // Below best → cannot move the BBO → remove in parallel.
         TicketDecision::BelowBest => {
             gated_cancel(ctx, account_gate, book_lock, &plan.work, market, side_u8)?
@@ -1000,11 +1011,31 @@ where
         })?
     };
 
-    // Phase 3a barrier: re-run every downgraded op SERIALLY in txn_id order against the post-parallel
-    // book (one shared-backed ctx). A downgraded place re-runs the full matching body; a downgraded
-    // cancel its removal. Running them after the parallel phase, in ticket order, with the contagion
-    // tail forced here too, is serial-equivalent. (perp_is_parallel stays true on this ctx → in-body
-    // sampling skipped; the block-end sample below records the deterministic final mid.)
+    // Phase 3a barrier: FIFO time-priority over this block's PARALLEL-phase Executed rests, BEFORE
+    // the barrier match reads any level. A barrier taker (3b) consumes makers from the FRONT of a
+    // level, so the level MUST be in ticket order first — parallel same-price rests append in racy
+    // lock-arrival order. (Downgraded places are still `Downgrade` here, so they are excluded; their
+    // barrier-rested remainders are appended in ticket order during 3b and have ticket ≥ the
+    // contagion floor > any parallel rest at that price, so they land after the sorted parallel rests
+    // in correct relative order — no second sort needed.)
+    {
+        let mut place_items: Vec<PlaceWork> = Vec::new();
+        let mut place_results: Vec<Result<PlaceOutcome, PrecompileError>> = Vec::new();
+        for (op, r) in ops.iter().zip(&results) {
+            if let (PerpOp::Place(w), OpResult::Place(o)) = (op, r) {
+                place_items.push(w.clone());
+                place_results.push(Ok(*o));
+            }
+        }
+        finalize_place_batch_ordering(book, &place_items, &place_results, &make_ctx)?;
+    }
+
+    // Phase 3b barrier: re-run every downgraded op SERIALLY in txn_id order against the post-parallel,
+    // now-FIFO-sorted book (one shared-backed ctx). A downgraded place re-runs the full matching body
+    // (matching the correctly-ordered levels); a downgraded cancel its removal. Running them after the
+    // parallel phase, in ticket order, with the contagion tail forced here too, is serial-equivalent.
+    // (perp_is_parallel stays true on this ctx → in-body sampling skipped; the block-end sample below
+    // records the deterministic final mid.)
     {
         let mut barrier_ctx = make_ctx(book.clone());
         for (op, r) in ops.iter().zip(results.iter_mut()) {
@@ -1040,17 +1071,6 @@ where
             }
         }
     }
-
-    // Phase 3b barrier. FIFO time-priority over this block's Executed places (incl. barrier-rested).
-    let mut place_items: Vec<PlaceWork> = Vec::new();
-    let mut place_results: Vec<Result<PlaceOutcome, PrecompileError>> = Vec::new();
-    for (op, r) in ops.iter().zip(&results) {
-        if let (PerpOp::Place(w), OpResult::Place(o)) = (op, r) {
-            place_items.push(w.clone());
-            place_results.push(Ok(*o));
-        }
-    }
-    finalize_place_batch_ordering(book, &place_items, &place_results, &make_ctx)?;
 
     // Block-end order-independent mid sample (D3-b) for every market the block touched.
     let mut markets: Vec<u64> = prepared
@@ -1587,6 +1607,80 @@ mod driver_tests {
             );
         }
         assert_eq!(serial_delta, parallel_delta);
+    }
+
+    /// Regression for the price-time-priority bug: TWO distinct-account makers rest at the SAME
+    /// NON-BEST price in the parallel phase (both non-movers → genuinely racy append order; a mover
+    /// would rest deterministically under the BBO ticket), then a downgraded taker at the LAST ticket
+    /// consumes that level at the barrier. The taker must fill the LOWER-ticket maker (FIFO), so the
+    /// level MUST be ticket-sorted BEFORE the barrier match (phase 3a finalize precedes phase 3b
+    /// match). Looped to shake out the racy append; without the fix the taker sometimes fills the
+    /// wrong maker → a divergent counterparty/position delta.
+    #[test]
+    fn transact_block_parallel_taker_matches_fifo_not_racy_order() {
+        const N: u64 = 8;
+        let x = user_addr(20); // ask@99 mover (rests deterministically under the ticket)
+        let d = user_addr(21); // buy taker, qty 2 → clears 99 then the FRONT maker at 100
+        let makers: Vec<Address> = (1..=N).map(user_addr).collect(); // ask@100 non-movers (race)
+
+        // t0 SELL x@99 (mover); t1..tN SELL makers@100 (non-movers, racy append among the N);
+        // t(N+1) BUY taker d@100 qty2 (crosses → downgrade; consumes 99 then the FIFO-FRONT 100 maker).
+        let mut ops = vec![mk_place(x, oid(50), 1, 99 * TICK, 0, 0, 0)];
+        for (i, &m) in makers.iter().enumerate() {
+            let mut o = [0u8; 32];
+            o[0] = 60 + i as u8;
+            ops.push(mk_place(m, o, 1, 100 * TICK, 0, 0, (i + 1) as u64));
+        }
+        ops.push(PerpOp::Place(PlaceWork {
+            maker: d,
+            order_id: oid(90),
+            market_id: MID,
+            side: 0, // Buy
+            price: 100 * TICK,
+            qty: 2 * QTY,
+            order_type: 0,
+            tif: 0,
+            client_order_id: [0u8; 16],
+            rank: 0,
+            ticket: N + 1,
+        }));
+        let mut all_users = vec![x, d];
+        all_users.extend(makers.iter().copied());
+
+        // This scenario has multiple best-changes (99 then taker→100), so serial's in-body
+        // first-change mid (99) differs from the parallel block-end mid (100) — the known D3-b
+        // difference. Carve the window out; the FIFO-maker correctness lives in the position / order /
+        // level keys.
+        let wkey = storage::keys::price_basis_window_key(MID);
+        let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut serial, &all_users);
+        for op in &ops {
+            run_serial_op(&mut serial, op);
+        }
+        let mut serial_delta = serial.journal_mut().take_perp_delta();
+        serial_delta.remove(&wkey);
+
+        for _round in 0..40 {
+            let book = Arc::new(SharedPerpBook::new());
+            seed(&mut make_slot(book.clone()), &all_users);
+            let results = transact_block_parallel(&book, &ops, make_slot).unwrap();
+            for r in &results {
+                assert!(
+                    !matches!(
+                        r,
+                        OpResult::Place(PlaceOutcome::Downgrade)
+                            | OpResult::Cancel(CancelOutcome::Downgrade)
+                    ),
+                    "barrier must re-run all downgrades"
+                );
+            }
+            let mut parallel_delta = book.take_delta();
+            parallel_delta.remove(&wkey);
+            assert_eq!(
+                serial_delta, parallel_delta,
+                "taker filled the wrong maker (level not FIFO-sorted before the barrier match), round {_round}"
+            );
+        }
     }
 
     /// Regression for the BBO-serve-cursor wedge: a cancel of an UNLOADABLE order (resolved == None)
