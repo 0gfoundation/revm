@@ -10,6 +10,9 @@ pub mod shared_perp;
 /// Scheduler synchronization primitives (account gate, BBO ticket lock) for parallel execution.
 #[cfg(feature = "perp-parallel")]
 pub mod perp_sched;
+/// Persistent FIFO worker pool for the segmented parallel block driver (#21 spike, step 4).
+#[cfg(feature = "perp-parallel")]
+pub mod perp_pool;
 pub mod warm_addresses;
 
 pub use entry::{JournalEntry, JournalEntryTr};
