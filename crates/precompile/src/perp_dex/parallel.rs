@@ -722,6 +722,12 @@ fn parallel_cancel<CTX: ContextTr>(
                 // the contagion floor (forces every higher-txn_id op to the barrier, so the same
                 // maker's later margin-touching ops run AFTER this cancel's deferred margin release)
                 // and downgrade. The serial barrier re-runs the removal in txn_id order.
+                // TODO(perf, pre-multi-market): a NON-OWNER cancel of someone's sole-best order is
+                // present+sole here but reverts at the barrier (owner check) — it still sets the floor,
+                // needlessly forcing the tail serial (a griefer cliff; correctness-neutral). plan_block
+                // already loads the order; capture owner and only set the floor when owner==canceller
+                // (else RunParallel → reverts in parallel, touching nothing). Throughput-only; matters
+                // most once min_downgrade is per-market.
                 min_downgrade.fetch_min(plan.work.ticket, Ordering::SeqCst);
                 Ok(TicketDecision::Downgrade)
             } else {
@@ -937,15 +943,51 @@ where
         .collect()
 }
 
+/// Assign each op's scheduling metadata from its position: `ticket = index` (txn_id order) and
+/// `rank = the maker's running count`. So per maker, `rank` is monotone in `ticket` BY CONSTRUCTION
+/// — the driver OWNS this, callers just supply ops in txn_id order. Without it the held-ticket →
+/// AccountGate wait could deadlock: a place MOVER pins the BBO serve cursor at its ticket while
+/// waiting on the AccountGate for its rank predecessor; if that predecessor had a HIGHER ticket
+/// (rank/ticket inversion) it would be blocked behind the pinned cursor → cycle. Any `ticket`/`rank`
+/// on the input works is overwritten.
+fn normalize_schedule(ops: &[PerpOp]) -> Vec<PerpOp> {
+    let mut next_rank: std::collections::HashMap<Address, u64> = std::collections::HashMap::new();
+    ops.iter()
+        .enumerate()
+        .map(|(i, op)| {
+            let ticket = i as u64;
+            match op {
+                PerpOp::Place(w) => {
+                    let rank = next_rank.entry(w.maker).or_insert(0);
+                    let mut w = w.clone();
+                    w.ticket = ticket;
+                    w.rank = *rank;
+                    *rank += 1;
+                    PerpOp::Place(w)
+                }
+                PerpOp::Cancel(w) => {
+                    let rank = next_rank.entry(w.canceller).or_insert(0);
+                    let mut w = w.clone();
+                    w.ticket = ticket;
+                    w.rank = *rank;
+                    *rank += 1;
+                    PerpOp::Cancel(w)
+                }
+            }
+        })
+        .collect()
+}
+
 /// Execute a block's perp ops with place/cancel running concurrently, producing the SAME net book
 /// delta + per-op results as serial txn_id-order execution (step 3d). Three phases:
-///   1. serial pre-scan ([`plan_block`]): resolve + schedule (ticket/rank are caller-assigned);
+///   1. serial pre-scan ([`plan_block`]): resolve + the PriceCompletion required sets;
 ///   2. parallel: one shared `AccountGate` + `BookSideLock` + `BboTicketLock` + `PriceCompletion`
 ///      + taker-contagion floor, a worker per op (fresh thread-local slot ctx via `make_ctx`);
 ///   3. serial barrier: re-run every downgraded op in txn_id order against the post-parallel book
 ///      ([`place_order_core`] / [`cancel_order_core`]) → FIFO finalize ([`finalize_place_batch_ordering`])
 ///      → block-end order-independent mid sample (D3-b).
-/// `ops` must be in txn_id order with dense tickets `0..ops.len()`. Returns results in that order.
+/// `ops` must be in txn_id order; the driver assigns dense tickets + per-maker ranks itself
+/// ([`normalize_schedule`]). Returns results in that order.
 pub fn transact_block_parallel<CTX, F>(
     book: &Arc<SharedPerpBook>,
     ops: &[PerpOp],
@@ -955,7 +997,9 @@ where
     CTX: ContextTr,
     F: Fn(Arc<SharedPerpBook>) -> CTX + Sync,
 {
-    let prepared = plan_block(book, ops, &make_ctx);
+    // Driver-owned scheduling — ticket = txn_id index, rank = per-maker count (monotone in ticket).
+    let ops = normalize_schedule(ops);
+    let prepared = plan_block(book, &ops, &make_ctx);
     let account_gate = AccountGate::new();
     let book_lock = BookSideLock::new();
     let bbo = BboTicketLock::new();
@@ -1775,6 +1819,63 @@ mod driver_tests {
 
         // Both run at the barrier in txn_id order: cancel O then place P, both Executed.
         assert_eq!(results[0], OpResult::Cancel(CancelOutcome::Executed));
+        assert_eq!(results[1], OpResult::Place(PlaceOutcome::Executed));
+        assert_eq!(serial_delta, parallel_delta);
+    }
+
+    /// Regression for the held-ticket / AccountGate deadlock (design-C review): the driver must OWN
+    /// rank/ticket assignment so a maker's rank is monotone in ticket. Here the caller supplies
+    /// INVERTED ranks (the index-0 mover gets rank 1, the index-1 op rank 0). Without driver
+    /// normalization the index-0 mover would hold the BBO serve cursor while waiting on the AccountGate
+    /// for rank 0 — owned by the higher-ticket op blocked behind the pinned cursor → block-wide hang.
+    /// With `normalize_schedule` the ranks become 0,1 and it completes. Watchdog'd so a regression
+    /// fails loudly.
+    #[test]
+    fn transact_block_parallel_normalizes_inverted_ranks_no_deadlock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let m = user_addr(1);
+            let (a, b) = (oid(50), oid(51));
+            let mk_inv = |order_id, price, rank, ticket| {
+                PerpOp::Place(PlaceWork {
+                    maker: m,
+                    order_id,
+                    market_id: MID,
+                    side: 0,
+                    price,
+                    qty: QTY,
+                    order_type: 0,
+                    tif: 0,
+                    client_order_id: [0u8; 16],
+                    rank,
+                    ticket,
+                })
+            };
+            // INVERTED: index-0 mover @100 gets rank 1; index-1 non-mover @99 gets rank 0.
+            let ops = vec![mk_inv(a, 100 * TICK, 1, 0), mk_inv(b, 99 * TICK, 0, 1)];
+
+            let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+            seed(&mut serial, &[m]);
+            for op in &ops {
+                run_serial_op(&mut serial, op);
+            }
+            let serial_delta = serial.journal_mut().take_perp_delta();
+
+            let book = Arc::new(SharedPerpBook::new());
+            seed(&mut make_slot(book.clone()), &[m]);
+            let results = transact_block_parallel(&book, &ops, make_slot).unwrap();
+            let parallel_delta = book.take_delta();
+            let _ = tx.send((results, serial_delta, parallel_delta));
+        });
+
+        let (results, serial_delta, parallel_delta) = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "transact_block_parallel deadlocked on rank/ticket-inverted input (driver did not normalize)",
+        );
+        worker.join().unwrap();
+        assert_eq!(results[0], OpResult::Place(PlaceOutcome::Executed));
         assert_eq!(results[1], OpResult::Place(PlaceOutcome::Executed));
         assert_eq!(serial_delta, parallel_delta);
     }
