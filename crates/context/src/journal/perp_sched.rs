@@ -42,6 +42,7 @@
 
 use dashmap::DashMap;
 use primitives::Address;
+use std::collections::HashSet;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Poison-tolerant lock of a cursor mutex. The protected value is a plain monotonic counter with no
@@ -175,6 +176,59 @@ impl Drop for ServeAdvance<'_> {
         let mut serve = lock_cursor(&self.lock.serve);
         *serve += 1;
         self.lock.cv.notify_all();
+    }
+}
+
+/// Per-(market, price) completion tracker for the parallel cancel path (Harry's optimization). Every
+/// place/cancel marks `(market, price, txn_id)` done on completion; a cancel at the BEST price waits
+/// (`wait_for`) for the lower-txn_id ops at its price (from the pre-scan) to all be done, so the
+/// level's MEMBERSHIP is complete before it decides whether removing its order empties the best
+/// level. (Below-best cancels and all places don't wait — they just `mark_done`.) Poison-tolerant.
+#[derive(Debug, Default)]
+pub struct PriceCompletion {
+    levels: DashMap<(u64, u64), Arc<PriceLevel>>,
+}
+
+#[derive(Debug, Default)]
+struct PriceLevel {
+    done: Mutex<HashSet<u64>>,
+    cv: Condvar,
+}
+
+impl PriceCompletion {
+    /// Creates an empty (single-block-scoped) tracker.
+    pub fn new() -> Self {
+        Self {
+            levels: DashMap::new(),
+        }
+    }
+
+    fn level(&self, market: u64, price: u64) -> Arc<PriceLevel> {
+        self.levels.entry((market, price)).or_default().clone()
+    }
+
+    /// Records that op `txn_id` finished touching `(market, price)`, waking waiters. Called for EVERY
+    /// place/cancel at the price (incl. reverted/downgraded), so a waiter's required set always
+    /// resolves (the op either rested there or decided not to — either way it is "done" w.r.t. this
+    /// level's membership).
+    pub fn mark_done(&self, market: u64, price: u64, txn_id: u64) {
+        let level = self.level(market, price);
+        let mut done = level.done.lock().unwrap_or_else(|p| p.into_inner());
+        done.insert(txn_id);
+        level.cv.notify_all();
+    }
+
+    /// Blocks until every txn_id in `required` has been marked done at `(market, price)`. Empty
+    /// `required` returns immediately. Poison-tolerant (a panicked marker leaves the set readable).
+    pub fn wait_for(&self, market: u64, price: u64, required: &[u64]) {
+        if required.is_empty() {
+            return;
+        }
+        let level = self.level(market, price);
+        let mut done = level.done.lock().unwrap_or_else(|p| p.into_inner());
+        while !required.iter().all(|t| done.contains(t)) {
+            done = level.cv.wait(done).unwrap_or_else(|p| p.into_inner());
+        }
     }
 }
 
@@ -436,5 +490,34 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A best-price cancel's `wait_for` must block until ALL its required (lower-same-price) txn_ids
+    /// are marked done — not just any subset, and unrelated txn_ids don't satisfy it.
+    #[test]
+    fn price_completion_waits_for_all_required() {
+        let pc = PriceCompletion::new();
+        let proceeded = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let (pc, proceeded) = (&pc, &proceeded);
+            s.spawn(move || {
+                pc.wait_for(1, 100, &[0, 1]);
+                proceeded.store(true, Ordering::SeqCst);
+            });
+            // Mark 0 and an unrelated 2, but NOT 1 — the waiter must stay blocked.
+            pc.mark_done(1, 100, 0);
+            pc.mark_done(1, 100, 2);
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !proceeded.load(Ordering::SeqCst),
+                "wait_for returned before required txn 1 was done"
+            );
+            // Now complete the required set; the waiter must proceed.
+            pc.mark_done(1, 100, 1);
+        });
+        assert!(
+            proceeded.load(Ordering::SeqCst),
+            "wait_for never returned after all required txns were done"
+        );
     }
 }
