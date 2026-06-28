@@ -290,6 +290,13 @@ pub trait JournalTr {
         None
     }
 
+    /// Loads the pre-computed trading-call results for REPLAY mode (canonical parallel execution,
+    /// step 4b) and resets the cursor. The node sets this on the block's journal BEFORE executing the
+    /// transactions (via the `Evm`). Default backend (serial / no perp journal): no-op.
+    fn set_perp_replay(&mut self, results: Vec<PerpReplayResult>) {
+        let _ = results;
+    }
+
     /// Writes a deferred deserialized off-trie blob (#16d Phase 2): the value is kept type-erased
     /// and serialized to bytes ONCE at block end (`take_perp_delta`) via `ser`, instead of on every
     /// write. `clone` keeps the overlay `Clone`. Both fns are monomorphized by the caller (the

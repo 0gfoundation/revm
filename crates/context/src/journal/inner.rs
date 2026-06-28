@@ -413,10 +413,18 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     /// Loads the pre-computed trading-call results for REPLAY mode (canonical parallel execution,
     /// step 4b): during the serial EVM pass the `0x…1003` precompile returns these in block order
     /// instead of re-matching. Single-block-scoped; set on a fresh journal each block, cursor at 0.
-    #[cfg(feature = "perp-parallel")]
+    /// Mirrors [`context_interface::JournalTr::set_perp_replay`]; a no-op without the feature (so the
+    /// node seam through `Evm`/`JournalTr` compiles regardless of the feature).
     pub fn set_perp_replay(&mut self, results: std::vec::Vec<PerpReplayResult>) {
-        self.perp_replay = Some(results);
-        self.perp_replay_cursor = 0;
+        #[cfg(feature = "perp-parallel")]
+        {
+            self.perp_replay = Some(results);
+            self.perp_replay_cursor = 0;
+        }
+        #[cfg(not(feature = "perp-parallel"))]
+        {
+            let _ = results;
+        }
     }
 
     /// Whether this journal is in replay mode. Mirrors [`context_interface::JournalTr::perp_is_replay`];

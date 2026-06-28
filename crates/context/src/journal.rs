@@ -363,6 +363,11 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn set_perp_replay(&mut self, results: Vec<PerpReplayResult>) {
+        self.inner.set_perp_replay(results);
+    }
+
+    #[inline]
     fn perp_contains_struct(&mut self, key: B256) -> bool {
         self.inner.perp_contains_struct(key)
     }
