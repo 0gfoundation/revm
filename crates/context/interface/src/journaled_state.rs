@@ -24,13 +24,18 @@ pub type PerpDelta = HashMap<B256, Vec<u8>>;
 /// EVM loop the `0x…1003` precompile returns this verbatim (gas is flat per selector) instead of
 /// re-verifying / re-matching / re-writing. `output` is the precompile return bytes (the ABI-encoded
 /// orderId for a successful place, the revert reason for a revert); `reverted` is the call status.
-/// Only `reverted` is consensus-relevant — the return data is not folded into the receipts root.
+/// `logs` are the EVM logs the matching emitted in the pre-phase (Trade / OrderPlaced / OrderRested /
+/// OrderCancelled / PositionChanged) — they are RE-EMITTED on replay so the canonical receipts carry
+/// the same perp events as serial execution. Both `reverted` and `logs` are consensus-relevant (logs
+/// feed the receipts root / logs bloom); the return-data `output` is not.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PerpReplayResult {
     /// Whether the original trading call reverted (drives the receipt status).
     pub reverted: bool,
     /// The precompile return bytes to hand back (ABI orderId / revert reason).
     pub output: Vec<u8>,
+    /// The EVM logs the matching emitted in the pre-phase, re-emitted in block order on replay.
+    pub logs: Vec<Log>,
 }
 
 /// Trait that contains database and journal of all changes that were made to the state.

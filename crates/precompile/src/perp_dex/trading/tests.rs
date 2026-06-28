@@ -2521,21 +2521,37 @@ mod golden {
     #[test]
     fn replay_mode_returns_precomputed_result_and_failstops_on_exhaustion() {
         use context::journaled_state::PerpReplayResult;
+        use primitives::{Log, LogData};
         let mut ctx = golden_ctx();
         let input = placeOrderSignedCall::SELECTOR.to_vec();
 
         // Non-replay: a bare selector cannot decode → clean revert (the verify/match path ran).
         let out = run_perp_dex_call(&input, 10_000_000, ALICE, U256::ZERO, false, &mut ctx).unwrap();
         assert!(out.reverted, "non-replay bare selector should revert (undecodable args)");
+        let _ = ctx.journal_mut().take_logs(); // clear any pre-replay logs
 
-        // Replay mode: hand back the pre-computed bytes verbatim — no decode/verify/match.
+        // Replay mode: hand back the pre-computed bytes verbatim (no decode/verify/match) AND re-emit
+        // the pre-computed logs into this call's journal so they land in the tx receipt.
+        let replayed_log = Log {
+            address: PERP_DEX_ADDRESS,
+            data: LogData::new_unchecked(
+                std::vec![B256::repeat_byte(0x11)],
+                Bytes::from(std::vec![1u8, 2, 3]),
+            ),
+        };
         ctx.journal_mut().set_perp_replay(std::vec![PerpReplayResult {
             reverted: false,
             output: std::vec![0xAB; 32],
+            logs: std::vec![replayed_log.clone()],
         }]);
         let out = run_perp_dex_call(&input, 10_000_000, ALICE, U256::ZERO, false, &mut ctx).unwrap();
         assert!(!out.reverted);
         assert_eq!(out.bytes.as_ref(), [0xAB; 32].as_slice());
+        assert_eq!(
+            ctx.journal_mut().take_logs(),
+            std::vec![replayed_log],
+            "replay must re-emit the pre-computed logs into the receipt"
+        );
 
         // Cursor exhausted → fail-stop (an unclassified trading call), not a silent mis-replay.
         let err =

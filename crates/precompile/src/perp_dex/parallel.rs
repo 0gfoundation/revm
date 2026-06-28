@@ -40,7 +40,7 @@ use context::journal::perp_sched::{AccountGate, BboTicketLock, BookSideLock, Pri
 use context::journal::shared_perp::SharedPerpBook;
 use context::journaled_state::JournalCheckpoint;
 use context::{ContextTr, JournalTr};
-use primitives::Address;
+use primitives::{Address, Log};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -896,6 +896,19 @@ pub enum OpResult {
     Cancel(CancelOutcome),
 }
 
+/// One op's result PLUS the EVM logs its matching emitted, returned by [`transact_block_parallel`] in
+/// txn_id order. The matching runs in throwaway per-slot / barrier contexts, so the driver drains each
+/// op's logs (Trade / OrderPlaced / OrderRested / OrderCancelled / PositionChanged) here; the node
+/// carries them into [`PerpReplayResult::logs`] so the serial replay re-emits them and the canonical
+/// receipts carry the same perp events as serial execution. Empty for a reverted op (logs rolled back).
+#[derive(Debug, Clone)]
+pub struct OpReplay {
+    /// The op outcome (Executed / Reverted / Downgrade).
+    pub result: OpResult,
+    /// The EVM logs the op emitted, in emission order.
+    pub logs: Vec<Log>,
+}
+
 /// How the step-4b parallel pre-phase treats one perp transaction's calldata. The node calls
 /// [`classify_perp_tx`] SERIALLY in block order for each top-level `0x…1003` call.
 #[derive(Debug, Clone)]
@@ -1138,17 +1151,17 @@ fn normalize_schedule(ops: &[PerpOp]) -> Vec<PerpOp> {
 ///
 /// `ops` must be in txn_id order. Returns results in that order. `pool` is reused across segments (and,
 /// by the caller, across blocks).
-pub fn transact_block_parallel<CTX, F>(
+pub fn transact_block_parallel_logged<CTX, F>(
     pool: &PerpPool,
     book: &Arc<SharedPerpBook>,
     ops: &[PerpOp],
     make_ctx: F,
-) -> Result<Vec<OpResult>, PrecompileError>
+) -> Result<Vec<OpReplay>, PrecompileError>
 where
     CTX: ContextTr,
     F: Fn(Arc<SharedPerpBook>) -> CTX + Clone + Send + 'static,
 {
-    let mut final_results: Vec<OpResult> = Vec::with_capacity(ops.len());
+    let mut final_results: Vec<OpReplay> = Vec::with_capacity(ops.len());
     let mut markets_touched = std::collections::BTreeSet::new();
     let mut start = 0usize;
 
@@ -1180,7 +1193,7 @@ where
         // Phase 2: parallel batch on the persistent FIFO pool (deadlock-free: strict FIFO + the
         // scheme's wait-edges-point-lower invariant — see PerpPool docs). Jobs are 'static (Arc'd
         // gates/book + cloned make_ctx); each builds its own thread-local slot ctx.
-        let seg_results: Vec<OpResult> = {
+        let seg_results: Vec<OpReplay> = {
             let tasks: Vec<_> = prepared
                 .iter()
                 .map(|p| {
@@ -1192,18 +1205,21 @@ where
                     let bbo = bbo.clone();
                     let pc = price_completion.clone();
                     let md = min_downgrade.clone();
-                    move || -> Result<OpResult, PrecompileError> {
+                    move || -> Result<OpReplay, PrecompileError> {
                         let mut ctx = make_ctx(book);
-                        match &p {
-                            PreparedOp::Place(w) => {
-                                parallel_place(&mut ctx, &ag, &bl, &bbo, &pc, &md, w)
-                                    .map(OpResult::Place)
-                            }
-                            PreparedOp::Cancel(plan) => {
-                                parallel_cancel(&mut ctx, &ag, &bl, &bbo, &pc, &md, plan)
-                                    .map(OpResult::Cancel)
-                            }
-                        }
+                        let result = match &p {
+                            PreparedOp::Place(w) => OpResult::Place(parallel_place(
+                                &mut ctx, &ag, &bl, &bbo, &pc, &md, w,
+                            )?),
+                            PreparedOp::Cancel(plan) => OpResult::Cancel(parallel_cancel(
+                                &mut ctx, &ag, &bl, &bbo, &pc, &md, plan,
+                            )?),
+                        };
+                        // Drain THIS op's emitted logs from its (fresh, single-op) slot ctx — empty for
+                        // a downgraded op (body deferred to the barrier) or a reverted op (logs rolled
+                        // back). Re-emitted verbatim on replay so the canonical receipts match serial.
+                        let logs = ctx.journal_mut().take_logs();
+                        Ok(OpReplay { result, logs })
                     }
                 })
                 .collect();
@@ -1219,7 +1235,7 @@ where
             let mut place_items: Vec<PlaceWork> = Vec::new();
             let mut place_results: Vec<Result<PlaceOutcome, PrecompileError>> = Vec::new();
             for (op, r) in seg_ops.iter().zip(&seg_results) {
-                if let (PerpOp::Place(w), OpResult::Place(o)) = (op, r) {
+                if let (PerpOp::Place(w), OpResult::Place(o)) = (op, &r.result) {
                     place_items.push(w.clone());
                     place_results.push(Ok(*o));
                 }
@@ -1231,7 +1247,7 @@ where
         // after the floor was set, so it sees the floor and downgrades); everything before it executed.
         let first_dg = seg_results.iter().position(|r| {
             matches!(
-                r,
+                r.result,
                 OpResult::Place(PlaceOutcome::Downgrade) | OpResult::Cancel(CancelOutcome::Downgrade)
             )
         });
@@ -1243,7 +1259,7 @@ where
         };
         debug_assert!(
             seg_results[dg..].iter().all(|r| matches!(
-                r,
+                r.result,
                 OpResult::Place(PlaceOutcome::Downgrade) | OpResult::Cancel(CancelOutcome::Downgrade)
             )),
             "the contagion floor must downgrade a contiguous suffix"
@@ -1251,7 +1267,7 @@ where
 
         // Record the parallel-executed prefix, then run the floor op SERIALLY in place against the
         // FIFO-sorted book.
-        final_results.extend(seg_results[..dg].iter().copied());
+        final_results.extend(seg_results.into_iter().take(dg));
         final_results.push(run_barrier_op(&seg_ops[dg], book, &make_ctx)?);
 
         // Re-dispatch the strictly-higher tail (all downgraded → never executed → safe to re-run).
@@ -1267,6 +1283,25 @@ where
     Ok(final_results)
 }
 
+/// Outcome-only wrapper around [`transact_block_parallel_logged`] — drops the captured per-op logs.
+/// The node uses the `_logged` variant (it needs the logs to replay perp events); this convenience
+/// form is for callers/tests that only assert outcomes + the byte-identical state delta.
+pub fn transact_block_parallel<CTX, F>(
+    pool: &PerpPool,
+    book: &Arc<SharedPerpBook>,
+    ops: &[PerpOp],
+    make_ctx: F,
+) -> Result<Vec<OpResult>, PrecompileError>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX + Clone + Send + 'static,
+{
+    Ok(transact_block_parallel_logged(pool, book, ops, make_ctx)?
+        .into_iter()
+        .map(|r| r.result)
+        .collect())
+}
+
 /// Run one downgraded op (a segment's contagion floor) SERIALLY against the shared book on a FRESH ctx
 /// — full matching body for a place, removal for a cancel — disposed via [`dispose_body`] (commit on
 /// Ok, propagate Fatal). A fresh ctx per call sidesteps any cross-segment read-cache staleness. The
@@ -1276,13 +1311,13 @@ fn run_barrier_op<CTX, F>(
     op: &PerpOp,
     book: &Arc<SharedPerpBook>,
     make_ctx: &F,
-) -> Result<OpResult, PrecompileError>
+) -> Result<OpReplay, PrecompileError>
 where
     CTX: ContextTr,
     F: Fn(Arc<SharedPerpBook>) -> CTX,
 {
     let mut ctx = make_ctx(book.clone());
-    match op {
+    let result = match op {
         PerpOp::Place(w) => {
             let cp = ctx.journal_mut().checkpoint();
             let res = place_order_core(
@@ -1297,20 +1332,24 @@ where
                 w.client_order_id,
                 &mut ctx,
             );
-            Ok(OpResult::Place(match dispose_body(&mut ctx, cp, res)? {
+            OpResult::Place(match dispose_body(&mut ctx, cp, res)? {
                 BodyDisposition::Committed => PlaceOutcome::Executed,
                 BodyDisposition::Reverted => PlaceOutcome::Reverted,
-            }))
+            })
         }
         PerpOp::Cancel(w) => {
             let cp = ctx.journal_mut().checkpoint();
             let res = cancel_order_core(w.canceller, w.order_id, &mut ctx);
-            Ok(OpResult::Cancel(match dispose_body(&mut ctx, cp, res)? {
+            OpResult::Cancel(match dispose_body(&mut ctx, cp, res)? {
                 BodyDisposition::Committed => CancelOutcome::Executed,
                 BodyDisposition::Reverted => CancelOutcome::Reverted,
-            }))
+            })
         }
-    }
+    };
+    // Drain the floor op's emitted logs (the taker's Trade/OrderRested/PositionChanged, etc.) from its
+    // fresh ctx before it drops — re-emitted on replay so the canonical receipt carries them.
+    let logs = ctx.journal_mut().take_logs();
+    Ok(OpReplay { result, logs })
 }
 
 #[cfg(test)]
@@ -1797,6 +1836,50 @@ mod driver_tests {
                 cancel_order_core(w.canceller, w.order_id, ctx).unwrap();
             }
         }
+    }
+
+    /// Step-4b log capture (the SERVER-found bug, commit 0310403aa): the parallel path must emit the
+    /// SAME per-tx EVM logs (OrderPlaced / Trade / OrderRested / PositionChanged) as serial — the
+    /// matching runs in throwaway driver contexts, so `transact_block_parallel_logged` drains each op's
+    /// logs and the node re-emits them on replay. Before the capture fix these were dropped, so
+    /// parallelized blocks emitted ZERO perp events → the event-driven verifier's MISSING/RESTED
+    /// cascade. Asserts the captured per-op logs equal a serial run's per-op logs.
+    #[test]
+    fn transact_block_parallel_logged_captures_same_logs_as_serial() {
+        use primitives::Log;
+        let a = user_addr(1);
+        let b = user_addr(2);
+        let ops = vec![
+            mk_place(a, oid(70), 1, 100 * TICK, 0, 0, 0), // SELL@100 → rests (OrderPlaced)
+            mk_place(b, oid(71), 0, 100 * TICK, 0, 0, 1), // BUY@100 taker → fills A (OrderPlaced+Trade+…)
+        ];
+
+        // Serial reference: each op's emitted logs (run_serial_op emits into the journal; drain per op).
+        let mut serial: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut serial, &[a, b]);
+        let serial_logs: Vec<Vec<Log>> = ops
+            .iter()
+            .map(|op| {
+                run_serial_op(&mut serial, op);
+                serial.journal_mut().take_logs()
+            })
+            .collect();
+        assert!(
+            serial_logs.iter().any(|l| !l.is_empty()),
+            "scenario must emit perp logs or the test has no teeth"
+        );
+
+        // Parallel: the per-op logs the driver captured from its throwaway matching contexts.
+        let book = Arc::new(SharedPerpBook::new());
+        seed(&mut make_slot(book.clone()), &[a, b]);
+        let replays =
+            transact_block_parallel_logged(test_pool(), &book, &ops, make_slot).unwrap();
+        let parallel_logs: Vec<Vec<Log>> = replays.iter().map(|r| r.logs.clone()).collect();
+
+        assert_eq!(
+            parallel_logs, serial_logs,
+            "parallel per-op logs must equal serial (the node replays them → receipts match)"
+        );
     }
 
     /// THE step-3d gate: a MIXED block (places + a cancel of a SAME-BLOCK-placed order) run through

@@ -224,10 +224,21 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         || selector == cancelOrderSignedCall::SELECTOR;
     if is_trading_selector && context.journal().perp_is_replay() {
         return match context.journal_mut().perp_replay_next() {
-            Some(r) if r.reverted => {
-                Ok(PrecompileOutput::new_reverted(gas_used, Bytes::from(r.output)))
+            Some(r) => {
+                // Re-emit the EVM logs the pre-phase's matching produced (OrderPlaced / Trade /
+                // OrderRested / OrderCancelled / PositionChanged), in emission order, so THIS tx's
+                // receipt carries the same perp events as serial execution — they feed the receipts /
+                // logs-bloom root, so dropping them would diverge the block (the step-4b server bug).
+                // Empty for a reverted op (its logs were rolled back in the pre-phase).
+                for log in r.logs {
+                    context.journal_mut().log(log);
+                }
+                if r.reverted {
+                    Ok(PrecompileOutput::new_reverted(gas_used, Bytes::from(r.output)))
+                } else {
+                    Ok(PrecompileOutput::new(gas_used, Bytes::from(r.output)))
+                }
             }
-            Some(r) => Ok(PrecompileOutput::new(gas_used, Bytes::from(r.output))),
             // Exhausted: a trading call the pre-phase did not classify — e.g. an internal contract
             // call to 0x…1003 (the scheme assumes top-level perp txs only). Fail-stop rather than
             // silently mis-replaying a later op's result, which would diverge the block.

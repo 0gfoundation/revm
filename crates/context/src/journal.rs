@@ -512,18 +512,18 @@ mod perp_passthrough_tests {
         assert_eq!(j.perp_replay_next(), None);
 
         j.set_perp_replay(std::vec![
-            PerpReplayResult { reverted: false, output: std::vec![1, 2, 3] },
-            PerpReplayResult { reverted: true, output: std::vec![4] },
+            PerpReplayResult { reverted: false, output: std::vec![1, 2, 3], logs: std::vec![] },
+            PerpReplayResult { reverted: true, output: std::vec![4], logs: std::vec![] },
         ]);
         assert!(j.perp_is_replay());
 
         assert_eq!(
             j.perp_replay_next(),
-            Some(PerpReplayResult { reverted: false, output: std::vec![1, 2, 3] })
+            Some(PerpReplayResult { reverted: false, output: std::vec![1, 2, 3], logs: std::vec![] })
         );
         assert_eq!(
             j.perp_replay_next(),
-            Some(PerpReplayResult { reverted: true, output: std::vec![4] })
+            Some(PerpReplayResult { reverted: true, output: std::vec![4], logs: std::vec![] })
         );
         // Exhausted → None (precompile fail-stops), but still in replay mode.
         assert_eq!(j.perp_replay_next(), None);
