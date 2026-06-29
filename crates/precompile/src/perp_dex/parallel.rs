@@ -1882,6 +1882,219 @@ mod driver_tests {
         );
     }
 
+    /// A cold-read store standing in for reth's committed off-trie `canonical_perp`: `perp_storage` is
+    /// served from a seeded map (a PRIOR block's `take_perp_delta`); everything else is empty. Lets the
+    /// driver tests exercise CROSS-BLOCK cold-read consumption, which `make_slot`'s empty InMemoryDB
+    /// cannot (its cold-read is always empty, so every prior test only matched THIS-block book entries).
+    #[derive(Clone, Default)]
+    struct ColdPerpDb {
+        perp: context::journaled_state::PerpDelta,
+    }
+    impl database::Database for ColdPerpDb {
+        type Error = core::convert::Infallible;
+        fn basic(
+            &mut self,
+            _: primitives::Address,
+        ) -> Result<Option<state::AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+        fn code_by_hash(&mut self, _: primitives::B256) -> Result<bytecode::Bytecode, Self::Error> {
+            Ok(bytecode::Bytecode::default())
+        }
+        fn storage(
+            &mut self,
+            _: primitives::Address,
+            _: primitives::StorageKey,
+        ) -> Result<primitives::StorageValue, Self::Error> {
+            Ok(primitives::StorageValue::ZERO)
+        }
+        fn block_hash(&mut self, _: u64) -> Result<primitives::B256, Self::Error> {
+            Ok(primitives::B256::ZERO)
+        }
+        fn perp_storage(&mut self, key: primitives::B256) -> Result<std::vec::Vec<u8>, Self::Error> {
+            Ok(self.perp.get(&key).cloned().unwrap_or_default())
+        }
+    }
+    type ColdCtx = Context<BlockEnv, TxEnv, CfgEnv, ColdPerpDb, Journal<ColdPerpDb>, ()>;
+
+    /// THE step-4b cold-read gate (the residual server bug after the log-capture fix): a taker crossing
+    /// a queue of makers that rested in a PRIOR block — so they live in the cold-read committed store,
+    /// NOT the this-block shared-book overlay — must consume them in FIFO time-priority, byte-identical
+    /// to serial. In production matchingPair/realisticMix failed with pure `TRADE_MISMATCH` (wrong
+    /// maker) while in-block matching + place/cancel passed, isolating the bug to cold-read maker
+    /// consumption — the exact gap no prior driver test covered. Scenario mixes a this-block rest (m3)
+    /// with the cold-read prior queue (m1, m2) and three BUY takers that consume m1, m2, m3 in order.
+    #[test]
+    fn transact_block_parallel_cold_read_queue_taker_fifo_matches_serial() {
+        let p = 100 * TICK;
+        let (m1, m2, m3) = (user_addr(1), user_addr(2), user_addr(3));
+        let (t1, t2, t3) = (user_addr(11), user_addr(12), user_addr(13));
+        let all = [m1, m2, m3, t1, t2, t3];
+
+        // Prior block: m1, m2 rest SELL@P (FIFO) into the committed cold-read store; all accounts funded.
+        let mut prior: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut prior, &all);
+        place_order_core(m1, oid(1), MID, 1, p, QTY, 0, 0, [0u8; 16], &mut prior).unwrap();
+        place_order_core(m2, oid(2), MID, 1, p, QTY, 0, 0, [0u8; 16], &mut prior).unwrap();
+        let committed = prior.journal_mut().take_perp_delta();
+
+        // This block (txn_id order): m3 rests SELL@P (joins the ask), then three BUY@P takers must
+        // consume the FIFO-oldest first → m1, m2, m3.
+        let ops = vec![
+            mk_place(m3, oid(3), 1, p, 0, 0, 0),  // SELL@P → rests (ask = [m1, m2, m3])
+            mk_place(t1, oid(11), 0, p, 0, 0, 1), // BUY@P taker → fills m1
+            mk_place(t2, oid(12), 0, p, 0, 0, 2), // BUY@P taker → fills m2
+            mk_place(t3, oid(13), 0, p, 0, 0, 3), // BUY@P taker → fills m3
+        ];
+
+        // Serial reference over the cold-read committed store.
+        let mut serial: ColdCtx =
+            Context::new(ColdPerpDb { perp: committed.clone() }, SpecId::CANCUN);
+        for op in &ops {
+            run_serial_op(&mut serial, op);
+        }
+        let serial_delta = serial.journal_mut().take_perp_delta();
+
+        // Parallel block driver: a FRESH book over the SAME cold-read store (mirrors the node — prior
+        // makers are NOT in the this-block book overlay, only the cold-read).
+        let committed2 = committed.clone();
+        let make_cold_slot = move |bk: Arc<SharedPerpBook>| -> ColdCtx {
+            let mut c: ColdCtx =
+                Context::new(ColdPerpDb { perp: committed2.clone() }, SpecId::CANCUN);
+            c.journal_mut().set_perp_shared(bk);
+            c
+        };
+        let book = Arc::new(SharedPerpBook::new());
+        let results = transact_block_parallel(test_pool(), &book, &ops, make_cold_slot).unwrap();
+        let parallel_delta = book.take_delta();
+
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(*r, OpResult::Place(PlaceOutcome::Executed), "op {i} should execute");
+        }
+        // Carve out the in-body-vs-block-end mid sample artifact (covered by the mixed-block test); the
+        // maker-fill state is what this gate proves.
+        let (mut s, mut pd) = (serial_delta, parallel_delta);
+        let wkey = storage::keys::price_basis_window_key(MID);
+        s.remove(&wkey);
+        pd.remove(&wkey);
+        assert_eq!(s, pd, "cold-read taker consumption must be FIFO-identical to serial");
+    }
+
+    /// Merge a block's perp delta into a committed cold-read store (mirrors reth's `merge_perp_delta`
+    /// into `canonical_perp`): every key is overwritten with the block's net blob; an empty blob is the
+    /// delete convention, read back as `vec![]`.
+    fn merge_committed(committed: &mut context::journaled_state::PerpDelta, delta: context::journaled_state::PerpDelta) {
+        for (k, v) in delta {
+            committed.insert(k, v);
+        }
+    }
+
+    /// Compare two committed stores treating empty == absent (the delete convention) and carving out the
+    /// block-end mid-sample window; panics with the FIRST diverging key (focused, not a whole-map dump).
+    fn assert_committed_eq(
+        par: &context::journaled_state::PerpDelta,
+        ser: &context::journaled_state::PerpDelta,
+        block: usize,
+    ) {
+        let wkey = storage::keys::price_basis_window_key(MID);
+        let mut diverging = 0usize;
+        let mut first: Option<(primitives::B256, std::vec::Vec<u8>, std::vec::Vec<u8>)> = None;
+        let keys: std::collections::BTreeSet<primitives::B256> =
+            par.keys().chain(ser.keys()).copied().filter(|k| *k != wkey).collect();
+        for k in keys {
+            let pe = par.get(&k).map(|v| v.as_slice()).unwrap_or(&[]);
+            let se = ser.get(&k).map(|v| v.as_slice()).unwrap_or(&[]);
+            if pe != se {
+                diverging += 1;
+                if first.is_none() {
+                    first = Some((k, pe.to_vec(), se.to_vec()));
+                }
+            }
+        }
+        if let Some((k, pe, se)) = first {
+            panic!(
+                "block {block}: {diverging} diverging committed key(s). first key={k:?}\n  parallel={pe:02x?}\n  serial  ={se:02x?}"
+            );
+        }
+    }
+
+    /// THE step-4b matchingPair regression (the residual production bug): a multi-block churn at a
+    /// SINGLE price with parity sides (even acct → BUY, odd → SELL — exactly matchingPair, so no
+    /// self-trade), the committed store carried forward across blocks (cold-read). The parallel driver's
+    /// cumulative committed state must equal serial's after EVERY block. This is the faithful repro of
+    /// the production workload that failed with pure TRADE_MISMATCH; queues build + drain across blocks,
+    /// exercising cross-block cold-read maker consumption under churn.
+    #[test]
+    fn transact_block_parallel_matchingpair_churn_multiblock_matches_serial() {
+        const N_ACCTS: u64 = 16;
+        const OPS_PER_BLOCK: usize = 14; // high SAME-level contention (the race surface)
+        const BLOCKS: usize = 25;
+        const REPS: usize = 10; // re-run the churn to widen the race timing window
+        let p = 100 * TICK;
+        let accts: Vec<Address> = (1..=N_ACCTS).map(user_addr).collect();
+
+        for rep in 0..REPS {
+            // Initial committed store: market + funded accounts (huge balance so margin never
+            // bottlenecks the churn and masks a divergence).
+            let mut init: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+            storage::save_market(&mut init, &test_market()).unwrap();
+            for &a in &accts {
+                fund(&mut init, a, 1_000_000_000_000_000u64);
+            }
+            let initial = init.journal_mut().take_perp_delta();
+            let mut committed_par = initial.clone();
+            let mut committed_ser = initial;
+
+            // Deterministic LCG (seed varies per rep → different tx orders); thread timing varies the
+            // race independently of the seed.
+            let mut rng: u64 = 0x1234_5678_9abc_def0u64.wrapping_add((rep as u64).wrapping_mul(0x9E37_79B9));
+            let mut next = || {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                rng >> 33
+            };
+            let mut oid_ctr: u64 = 1;
+
+            for block in 0..BLOCKS {
+                // This block's ops (generated once, run on BOTH tracks). Side = acct parity (matchingPair:
+                // even acct → BUY, odd → SELL — so no self-trade); many DISTINCT accounts at one price →
+                // concurrent same-level appends.
+                let mut ops = Vec::with_capacity(OPS_PER_BLOCK);
+                for _ in 0..OPS_PER_BLOCK {
+                    let idx = (next() % N_ACCTS) as usize;
+                    let side = ((idx + 1) % 2) as u8; // user_addr(idx+1): odd→SELL(1), even→BUY(0)
+                    let mut oidb = [0u8; 32];
+                    oidb[0..8].copy_from_slice(&oid_ctr.to_be_bytes());
+                    oid_ctr += 1;
+                    ops.push(mk_place(accts[idx], oidb, side, p, 0, 0, 0));
+                }
+
+                // Serial track over its committed cold-read store.
+                let mut s: ColdCtx =
+                    Context::new(ColdPerpDb { perp: committed_ser.clone() }, SpecId::CANCUN);
+                for op in &ops {
+                    run_serial_op(&mut s, op);
+                }
+                merge_committed(&mut committed_ser, s.journal_mut().take_perp_delta());
+
+                // Parallel track: fresh book over its committed cold-read store.
+                let cp = committed_par.clone();
+                let make_cold = move |bk: Arc<SharedPerpBook>| -> ColdCtx {
+                    let mut c: ColdCtx =
+                        Context::new(ColdPerpDb { perp: cp.clone() }, SpecId::CANCUN);
+                    c.journal_mut().set_perp_shared(bk);
+                    c
+                };
+                let book = Arc::new(SharedPerpBook::new());
+                transact_block_parallel(test_pool(), &book, &ops, make_cold).unwrap();
+                merge_committed(&mut committed_par, book.take_delta());
+
+                assert_committed_eq(&committed_par, &committed_ser, rep * BLOCKS + block);
+            }
+        }
+    }
+
     /// THE step-3d gate: a MIXED block (places + a cancel of a SAME-BLOCK-placed order) run through
     /// `transact_block_parallel` produces a book delta byte-identical to the same ops run serially in
     /// txn_id order — INCLUDING price_basis_window. Exercises the unified ticket domain, the shared

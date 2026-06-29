@@ -96,6 +96,7 @@ rand = { workspace = true, features = ["std"] }
 ark-std = { workspace = true }
 rstest.workspace = true
 database = { workspace = true, features = ["std"] }
+state.workspace = true
 
 [features]
 default = ["std", "secp256k1", "blst", "c-kzg", "portable"]
