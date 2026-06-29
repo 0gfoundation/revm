@@ -1302,6 +1302,68 @@ where
         .collect())
 }
 
+/// SERIAL reference execution of a block's perp ops into the shared `book`: each op via its normal
+/// place/cancel core under a checkpoint (commit on Ok; propagate `Fatal`; else `Reverted`), capturing
+/// per-op logs, then the same block-end mid sample the parallel driver does. Produces the per-op
+/// results + logs + (via `book.take_delta()`) the net delta that TRUE serial execution would, given
+/// the same cold-read — the ground truth the parallel path must match.
+///
+/// This is the diff target for the node's `PERP_PARALLEL_AUDIT` (a debug cross-check that re-runs each
+/// block's ops serially and compares state + events against the parallel path to localize a node-side
+/// divergence). NOT used on the production hot path. `ops` must be in txn_id order.
+pub fn transact_block_serial<CTX, F>(
+    book: &Arc<SharedPerpBook>,
+    ops: &[PerpOp],
+    make_ctx: F,
+) -> Result<Vec<OpReplay>, PrecompileError>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX,
+{
+    let mut ctx = make_ctx(book.clone());
+    let mut out = Vec::with_capacity(ops.len());
+    let mut markets_touched = std::collections::BTreeSet::new();
+    for op in ops {
+        let cp = ctx.journal_mut().checkpoint();
+        let result = match op {
+            PerpOp::Place(w) => {
+                markets_touched.insert(w.market_id);
+                let r = place_order_core(
+                    w.maker,
+                    w.order_id,
+                    w.market_id,
+                    w.side,
+                    w.price,
+                    w.qty,
+                    w.order_type,
+                    w.tif,
+                    w.client_order_id,
+                    &mut ctx,
+                );
+                OpResult::Place(match dispose_body(&mut ctx, cp, r)? {
+                    BodyDisposition::Committed => PlaceOutcome::Executed,
+                    BodyDisposition::Reverted => PlaceOutcome::Reverted,
+                })
+            }
+            PerpOp::Cancel(w) => {
+                let r = cancel_order_core(w.canceller, w.order_id, &mut ctx);
+                OpResult::Cancel(match dispose_body(&mut ctx, cp, r)? {
+                    BodyDisposition::Committed => CancelOutcome::Executed,
+                    BodyDisposition::Reverted => CancelOutcome::Reverted,
+                })
+            }
+        };
+        let logs = ctx.journal_mut().take_logs();
+        out.push(OpReplay { result, logs });
+    }
+    // Same block-end order-independent mid sample as the parallel driver, so the two deltas match on
+    // the price-basis window too (it is the only per-op-vs-block-end-differing artifact).
+    for m in markets_touched {
+        crate::perp_dex::risk::finalize_block_mid_sample(&mut ctx, m)?;
+    }
+    Ok(out)
+}
+
 /// Run one downgraded op (a segment's contagion floor) SERIALLY against the shared book on a FRESH ctx
 /// — full matching body for a place, removal for a cancel — disposed via [`dispose_body`] (commit on
 /// Ok, propagate Fatal). A fresh ctx per call sidesteps any cross-segment read-cache staleness. The
@@ -2024,6 +2086,31 @@ mod driver_tests {
                 "a NO-MATCH block must FIFO-sort its touched levels before commit (round {_round})"
             );
         }
+    }
+
+    /// `transact_block_serial` is the diff target for the node's PERP_PARALLEL_AUDIT, so it must
+    /// produce the SAME book delta as the parallel driver for a correct scenario (a crossing taker).
+    /// Both do the block-end mid sample, so the price-basis window matches too — no carve-out needed.
+    #[test]
+    fn transact_block_serial_matches_parallel_delta() {
+        let a = user_addr(1);
+        let b = user_addr(2);
+        let ops = vec![
+            mk_place(a, oid(70), 1, 100 * TICK, 0, 0, 0), // SELL@100 → rests
+            mk_place(b, oid(71), 0, 100 * TICK, 0, 0, 1), // BUY@100 taker → fills A
+        ];
+
+        let book_s = Arc::new(SharedPerpBook::new());
+        seed(&mut make_slot(book_s.clone()), &[a, b]);
+        transact_block_serial(&book_s, &ops, make_slot).unwrap();
+        let ds = book_s.take_delta();
+
+        let book_p = Arc::new(SharedPerpBook::new());
+        seed(&mut make_slot(book_p.clone()), &[a, b]);
+        transact_block_parallel(test_pool(), &book_p, &ops, make_slot).unwrap();
+        let dp = book_p.take_delta();
+
+        assert_eq!(ds, dp, "transact_block_serial must equal the parallel delta (audit ground truth)");
     }
 
     /// Merge a block's perp delta into a committed cold-read store (mirrors reth's `merge_perp_delta`
