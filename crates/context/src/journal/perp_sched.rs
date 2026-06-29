@@ -232,46 +232,46 @@ impl PriceCompletion {
     }
 }
 
-/// Per-(market, side) mutual-exclusion lock guarding the cross-maker SIDE structures of one market's
-/// order book: that side's level FIFO queues AND its price list. Both are mutated via a load → modify
-/// → store sequence that is NOT atomic against the concurrent [`super::shared_perp::SharedPerpBook`]
-/// (load returns an owned `Vec`, the store happens later), so two parallel ops touching the same side
-/// can lose an append/removal. Every parallel place/cancel runs its book-mutating body under this
-/// lock for its order's side.
+/// Per-(market, side, PRICE) mutual-exclusion lock guarding ONE level's FIFO order queue. #21
+/// perp-parallel: this was per-(market, side), but the sorted price list it also guarded is GONE
+/// (tick-walk discovery), so the only remaining cross-op structure is the per-level FIFO
+/// `Vec<order_id>`. The queue is mutated via a load → modify → store that is NOT atomic against the
+/// concurrent [`super::shared_perp::SharedPerpBook`] (load returns an owned `Vec`, the store happens
+/// later), so two parallel ops touching the SAME level can lose an append/removal. **Different prices
+/// use distinct locks** → place/cancel at different prices (and the common different-user case) run
+/// concurrently; only SAME-(market,side,price) ops serialize.
 ///
 /// SCOPE — what this does NOT cover: the per-MARKET `best_bid`/`best_ask` cache, the mid-price
-/// samples, and the `price_basis_window` are NOT guarded here (a Buy op holds the Buy lock, a Sell op
-/// the Sell lock — different mutexes — yet a mover reads the opposite best and read-modify-stores the
-/// shared per-market window). Those per-market keys are instead serialized by the **BBO ticket**:
-/// only movers write them and a mover runs its whole body while holding its BBO ticket (which is
-/// per-market and strictly exclusive). TRIPWIRE: any future path that writes best/window MUST run
+/// samples, and the `price_basis_window` are NOT guarded here. Those per-market keys are serialized by
+/// the **BBO ticket**: only movers write them and a mover runs its whole body while holding its BBO
+/// ticket (per-market, strictly exclusive). TRIPWIRE: any future path that writes best/window MUST run
 /// inside `bbo.run`; moving that out of the held-ticket region would reintroduce a lost-update race
-/// that this lock does NOT catch.
+/// this lock does NOT catch.
 ///
 /// It is the INNERMOST lock in the discipline (BBO ticket → AccountGate → BookSideLock): a leaf that
 /// never blocks on anything while held, so it cannot participate in a deadlock cycle regardless of
-/// the order in which slots reach it. Poison-tolerant (a panicked holder leaves the side usable).
+/// the order in which slots reach it. Poison-tolerant (a panicked holder leaves the level usable).
 #[derive(Debug, Default)]
 pub struct BookSideLock {
-    sides: DashMap<(u64, u8), Arc<Mutex<()>>>,
+    levels: DashMap<(u64, u8, u64), Arc<Mutex<()>>>,
 }
 
 impl BookSideLock {
-    /// Creates an empty (single-block-scoped) per-side lock table.
+    /// Creates an empty (single-block-scoped) per-level lock table.
     pub fn new() -> Self {
         Self {
-            sides: DashMap::new(),
+            levels: DashMap::new(),
         }
     }
 
-    fn side_lock(&self, market: u64, side: u8) -> Arc<Mutex<()>> {
-        self.sides.entry((market, side)).or_default().clone()
+    fn level_lock(&self, market: u64, side: u8, price: u64) -> Arc<Mutex<()>> {
+        self.levels.entry((market, side, price)).or_default().clone()
     }
 
-    /// Runs `f` while holding the `(market, side)` book lock. Poison-tolerant: a previously poisoned
-    /// side is recovered rather than propagating the panic.
-    pub fn run<R>(&self, market: u64, side: u8, f: impl FnOnce() -> R) -> R {
-        let lock = self.side_lock(market, side);
+    /// Runs `f` while holding the `(market, side, price)` book LEVEL lock. Poison-tolerant: a
+    /// previously poisoned level is recovered rather than propagating the panic.
+    pub fn run<R>(&self, market: u64, side: u8, price: u64, f: impl FnOnce() -> R) -> R {
+        let lock = self.level_lock(market, side, price);
         let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         f()
     }
@@ -587,7 +587,7 @@ mod tests {
                 for _ in 0..N {
                     s.spawn(move || {
                         start.wait();
-                        lock.run(7, 0, || {
+                        lock.run(7, 0, 100, || {
                             let c = bid.0.get();
                             let v = unsafe { *c };
                             unsafe { *c = v + 1 };
@@ -595,7 +595,7 @@ mod tests {
                     });
                     s.spawn(move || {
                         start.wait();
-                        lock.run(7, 1, || {
+                        lock.run(7, 1, 100, || {
                             let c = ask.0.get();
                             let v = unsafe { *c };
                             unsafe { *c = v + 1 };

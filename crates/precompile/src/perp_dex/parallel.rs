@@ -345,7 +345,7 @@ fn gated_execute<CTX: ContextTr>(
     work: &PlaceWork,
 ) -> Result<PlaceOutcome, PrecompileError> {
     account_gate.run(work.maker, work.rank, || {
-        book_lock.run(work.market_id, work.side, || {
+        book_lock.run(work.market_id, work.side, work.price, || {
             let cp = ctx.journal_mut().checkpoint();
             let r = place_order_core(
                 work.maker,
@@ -618,9 +618,10 @@ fn gated_cancel<CTX: ContextTr>(
     work: &CancelWork,
     market: u64,
     side: u8,
+    price: u64,
 ) -> Result<CancelOutcome, PrecompileError> {
     account_gate.run(work.canceller, work.rank, || {
-        book_lock.run(market, side, || {
+        book_lock.run(market, side, price, || {
             let cp = ctx.journal_mut().checkpoint();
             let r = cancel_order_core(work.canceller, work.order_id, ctx);
             Ok(match dispose_body(ctx, cp, r)? {
@@ -736,7 +737,8 @@ fn parallel_cancel<CTX: ContextTr>(
             }
             // At best: still holding the ticket, wait for lower-txn_id same-price ops, then decide.
             price_completion.wait_for(market, price, &plan.required);
-            let level = book_lock.run(market, side_u8, || load_level(ctx, market, side, price))?;
+            let level =
+                book_lock.run(market, side_u8, price, || load_level(ctx, market, side, price))?;
             let present = level.iter().any(|id| id == &plan.work.order_id);
             let others_remain = level.iter().any(|id| id != &plan.work.order_id);
             if present && !others_remain {
@@ -776,7 +778,7 @@ fn parallel_cancel<CTX: ContextTr>(
         // book-side lock, in parallel. `remove_from_book_after_cancel` detaches without emptying the
         // top level → no best refresh → safe.
         TicketDecision::RunParallel => {
-            gated_cancel(ctx, account_gate, book_lock, &plan.work, market, side_u8)?
+            gated_cancel(ctx, account_gate, book_lock, &plan.work, market, side_u8, price)?
         }
     };
 
