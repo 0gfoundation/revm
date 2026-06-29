@@ -1980,6 +1980,52 @@ mod driver_tests {
         assert_eq!(s, pd, "cold-read taker consumption must be FIFO-identical to serial");
     }
 
+    /// Direct answer to "is a block with ZERO matches still FIFO-sorted before commit?" — YES. The
+    /// segmented driver runs `finalize_place_batch_ordering` UNCONDITIONALLY per segment, BEFORE the
+    /// no-downgrade `break`, so a no-match block (one segment, all rests) still has every touched
+    /// level's this-block inserts re-sorted by ticket before `take_delta`. Here: 8 DISTINCT accounts
+    /// (so the AccountGate does not serialize them → racy parallel appends) rest SELL@P with NO bids to
+    /// cross → zero matches. The committed book delta must still equal serial (a FIFO level). If the
+    /// sort were tied to "a match happened", this block would commit a racy level. 20 rounds shake the
+    /// append race.
+    #[test]
+    fn no_match_block_still_fifo_sorts_before_commit() {
+        let p = 100 * TICK;
+        let makers: Vec<Address> = (1..=8).map(user_addr).collect();
+        let block: Vec<PerpOp> = makers
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| mk_place(m, oid((i + 1) as u8), 1 /* SELL */, p, 0, 0, 0))
+            .collect();
+
+        for _round in 0..20 {
+            // Serial reference.
+            let mut s: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+            seed(&mut s, &makers);
+            for op in &block {
+                run_serial_op(&mut s, op);
+            }
+            let mut ser = s.journal_mut().take_perp_delta();
+
+            // Parallel driver — this block has ZERO matches (all same-side rests, no opposite book).
+            let book = Arc::new(SharedPerpBook::new());
+            seed(&mut make_slot(book.clone()), &makers);
+            let results = transact_block_parallel(test_pool(), &book, &block, make_slot).unwrap();
+            for r in &results {
+                assert_eq!(*r, OpResult::Place(PlaceOutcome::Executed));
+            }
+            let mut par = book.take_delta();
+
+            let wkey = storage::keys::price_basis_window_key(MID);
+            ser.remove(&wkey);
+            par.remove(&wkey);
+            assert_eq!(
+                ser, par,
+                "a NO-MATCH block must FIFO-sort its touched levels before commit (round {_round})"
+            );
+        }
+    }
+
     /// Merge a block's perp delta into a committed cold-read store (mirrors reth's `merge_perp_delta`
     /// into `canonical_perp`): every key is overwritten with the block's net blob; an empty blob is the
     /// delete convention, read back as `vec![]`.
