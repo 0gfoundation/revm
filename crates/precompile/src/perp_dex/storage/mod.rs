@@ -929,20 +929,24 @@ pub fn refresh_best_ask<CTX: ContextTr>(
 // by walking the tick grid from a starting price. Different-price levels are then independent keys
 // (no shared list) → different-price place/cancel can run in parallel.
 
-/// Max ticks [`next_ask_at_or_above`] / [`next_bid_at_or_below`] scan before treating the side as
-/// EXHAUSTED (no further liquidity / best = 0). `pureChurn` clusters orders near best so the next
-/// non-empty level is normally 1–2 ticks away and this never binds.
-///
-/// TODO(perp-parallel): this is a TEMPORARY sparse-book bound. A wide, sparsely-populated book whose
-/// next level sits > CAP ticks away is wrongly treated as empty (a taker reverts insufficient-
-/// liquidity; a best-refresh sets best = 0, orphaning the far level). Focusing pureChurn for now;
-/// revisit with a per-side occupancy index (sharded bitmap / coarse buckets) — see the perf doc.
-pub const TICK_WALK_CAP: u32 = 4096;
+// Discovery (matching sweeps + best-refresh) runs ONLY in serial contexts (the parallel driver's
+// barrier / the serial EVM pass — every caller of these + refresh_best is serial), so it is free to
+// be a plain price-grid walk. It is UNBOUNDED over the OCCUPIED range — the ask walk stops at the
+// market's max_price, the bid walk at the tick floor — so a level ANY distance away is always found.
+//
+// (#21: this REPLACES the bounded TICK_WALK_CAP=4096. The cap wrongly treated a level > CAP ticks away
+// as empty on a sparse/wide book -> takers stopped sweeping early, best-refresh zeroed best and
+// orphaned the far level -> cross-level wrong fills + non-conservation. See perpdex-parallel-fail.)
+//
+// PERF: an EMPTY / sparse side costs O(range/tick) probes per discovery; pureChurn clusters orders
+// near best so hops are 1-2 ticks and this is cheap. The deferred sparse-book optimization is a coarse
+// per-region occupancy index that SKIPS empty gaps — and it MUST be a commutative signed-delta counter
+// (atomic add, undo subtracts its own delta), NOT a snapshot-restored aggregate value, or a concurrent
+// revert in the parallel batch clobbers a sibling slot's committed bump (lost update).
 
-/// Lowest non-empty ASK level at a price `>= from`, found by walking UP the tick grid from `from`
-/// (inclusive) in `tick` steps. `Ok(None)` = no ask liquidity within [`TICK_WALK_CAP`] ticks of
-/// `from` (caller treats the ask side as exhausted there). `from` must be tick-aligned (all resting
-/// prices are). `tick == 0` (mis-configured market) yields `None` rather than looping.
+/// Lowest non-empty ASK level at a price `>= from`, walking UP the tick grid from `from` (inclusive)
+/// in `tick` steps, up to the market's `max_price`. `Ok(None)` = no ask liquidity at-or-above `from`.
+/// `from` must be tick-aligned (all resting prices are). `tick == 0` (mis-configured market) -> `None`.
 pub fn next_ask_at_or_above<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -952,8 +956,13 @@ pub fn next_ask_at_or_above<CTX: ContextTr>(
     if tick == 0 {
         return Ok(None);
     }
+    // Bound the walk by max_price (no order can rest above it — enforced at placement), so an empty
+    // ask side terminates instead of walking to u64::MAX.
+    let max_price = load_market(context, market_id)?
+        .map(|m| m.max_price)
+        .unwrap_or(0);
     let mut p = from;
-    for _ in 0..TICK_WALK_CAP {
+    while p <= max_price {
         if !load_ask_level(context, market_id, p)?.is_empty() {
             return Ok(Some(p));
         }
@@ -966,7 +975,7 @@ pub fn next_ask_at_or_above<CTX: ContextTr>(
 }
 
 /// Highest non-empty BID level at a price `<= from`, walking DOWN the tick grid from `from`
-/// (inclusive). `Ok(None)` = no bid liquidity within [`TICK_WALK_CAP`] ticks at-or-below `from`.
+/// (inclusive) to the tick floor. `Ok(None)` = no bid liquidity at-or-below `from`.
 /// See [`next_ask_at_or_above`].
 pub fn next_bid_at_or_below<CTX: ContextTr>(
     context: &mut CTX,
@@ -978,7 +987,7 @@ pub fn next_bid_at_or_below<CTX: ContextTr>(
         return Ok(None);
     }
     let mut p = from;
-    for _ in 0..TICK_WALK_CAP {
+    loop {
         if !load_bid_level(context, market_id, p)?.is_empty() {
             return Ok(Some(p));
         }
@@ -987,7 +996,6 @@ pub fn next_bid_at_or_below<CTX: ContextTr>(
         }
         p -= tick;
     }
-    Ok(None)
 }
 
 // ── API key (ed25519 signed orders) ──────────────────────────────────────────

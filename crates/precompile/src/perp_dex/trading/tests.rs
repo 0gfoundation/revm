@@ -138,6 +138,50 @@ fn market_fee_total(ctx: &mut TestCtx) -> u64 {
     U256::from_be_slice(&ret[..32]).to::<u64>()
 }
 
+// ── Regression: unbounded tick-walk over wide gaps (#21, was the TICK_WALK_CAP sparse-book bug) ──
+
+/// SERIAL repro of the server `perpdex-parallel-fail-f9e3c6b37` regression: a taker that must sweep
+/// across a wide price gap. The old TICK_WALK_CAP=4096 bound treated a level > CAP ticks away as
+/// empty, so the taker stopped early, the far maker was orphaned, and the taker's remainder rested —
+/// crossing the book (realisticMix scatters levels tens of thousands of ticks apart; the other tests
+/// cluster levels 1 tick apart so it never fired locally). Fixed by making discovery UNBOUNDED over
+/// the occupied range. This was a SERIAL semantic bug (the tick-walk is shared by both paths), so the
+/// repro runs on the plain serial place/match path. The gap here (WIDE_GAP_TICKS) is deliberately far
+/// past the old cap.
+#[test]
+fn taker_sweeps_across_wide_gap() {
+    const WIDE_GAP_TICKS: u64 = 8_192; // 2x the old TICK_WALK_CAP — would orphan the far level pre-fix
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    // Generous funding: the far level sits at a high price → large notional/margin.
+    fund(&mut ctx, ALICE, 1_000_000_000);
+    fund(&mut ctx, BOB, 1_000_000_000);
+
+    let near = PRICE;
+    let far = PRICE + WIDE_GAP_TICKS * TICK;
+
+    // BOB rests two asks: one at best (near), one far above.
+    place(&mut ctx, BOB, 1, near, QTY, 0, 0); // Sell GTC @ near
+    place(&mut ctx, BOB, 1, far, QTY, 0, 0); // Sell GTC @ far
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), near);
+
+    // ALICE buys 2*QTY at a limit that crosses BOTH asks → serial FIFO sweeps both.
+    place(&mut ctx, ALICE, 0, far, QTY * 2, 0, 0);
+
+    // The far ask must have been consumed; ALICE must not have rested a leftover bid (crossed book).
+    let far_ask = storage::load_ask_level(&mut ctx, MARKET_ID, far).unwrap();
+    assert!(
+        far_ask.is_empty(),
+        "far ask ({WIDE_GAP_TICKS} ticks above best) must be swept, but {} order(s) remain",
+        far_ask.len()
+    );
+    let far_bid = storage::load_bid_level(&mut ctx, MARKET_ID, far).unwrap();
+    assert!(
+        far_bid.is_empty(),
+        "taker should fully fill, not rest a leftover bid at the far price (book would be crossed)"
+    );
+}
+
 // ── Input validation ───────────────────────────────────────────────────────
 
 #[test]
