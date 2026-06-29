@@ -156,18 +156,27 @@ impl TakerSettlement {
             };
             remaining_closing_qty = remaining_closing_qty.saturating_sub(fill_closing_qty);
             let fill_opening_qty = fill.quantity - fill_closing_qty;
+            // Conservation: floor the WHOLE matched quantity ONCE and derive the opening
+            // leg by subtraction, so the taker and maker attribute the SAME total quote to
+            // this fill (closing + opening == calc_value(price, fill.quantity)). Flooring the
+            // closing and opening legs independently lets the two parties' different
+            // close/open split boundaries floor to a different sum → a ±1 phantom mint/burn
+            // per asymmetric fill (Σ v_quote no longer conserved).
+            let fill_value = calc_value(
+                fill.price,
+                fill.quantity,
+                market.base_decimals,
+                market.price_decimals,
+            )?;
             let fill_closing_value = calc_value(
                 fill.price,
                 fill_closing_qty,
                 market.base_decimals,
                 market.price_decimals,
             )?;
-            let fill_opening_value = calc_value(
-                fill.price,
-                fill_opening_qty,
-                market.base_decimals,
-                market.price_decimals,
-            )?;
+            let fill_opening_value = fill_value
+                .checked_sub(fill_closing_value)
+                .ok_or_else(|| perp_err("settlement: fill opening value underflow"))?;
             closing_qty = closing_qty
                 .checked_add(fill_closing_qty)
                 .ok_or_else(|| perp_err("placeOrder: closing quantity overflow"))?;
@@ -456,18 +465,24 @@ fn split_position_fill(
         0
     };
     let opening_qty = fill_qty - closing_qty;
+    // Conservation: single floor of the whole fill, opening derived by subtraction (see the
+    // taker path in `finalize`). Both sides MUST attribute the same total quote to the fill
+    // (closing + opening == calc_value(price, fill_qty)) or asymmetric fills leak ±1.
+    let fill_value = calc_value(
+        fill_price,
+        fill_qty,
+        market.base_decimals,
+        market.price_decimals,
+    )?;
     let closing_value = calc_value(
         fill_price,
         closing_qty,
         market.base_decimals,
         market.price_decimals,
     )?;
-    let opening_value = calc_value(
-        fill_price,
-        opening_qty,
-        market.base_decimals,
-        market.price_decimals,
-    )?;
+    let opening_value = fill_value
+        .checked_sub(closing_value)
+        .ok_or_else(|| perp_err("split_position_fill: opening value underflow"))?;
 
     Ok(PositionFill {
         is_buy,
@@ -979,5 +994,81 @@ mod isolated_margin_tests {
         assert_eq!(wallet, 500, "wallet untouched");
         assert_eq!(p.margin, 20, "deficit covered by remaining margin; 20 left backing the rest");
         assert_eq!(p.amount, 8);
+    }
+}
+
+#[cfg(test)]
+mod split_floor_conservation_tests {
+    use super::split_position_fill;
+    use crate::perp_dex::{
+        math::calc_value,
+        types::{Market, Side},
+    };
+
+    fn mkt(base_decimals: u32, price_decimals: u32) -> Market {
+        Market {
+            market_id: 1,
+            base_decimals,
+            price_decimals,
+            tick_size: 0,
+            step_size: 0,
+            min_quantity: 0,
+            max_quantity: u64::MAX,
+            max_price: u64::MAX,
+            price_update_interval: 0,
+            active: true,
+            funding_interval: 0,
+            interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
+        }
+    }
+
+    // Deterministic xorshift (no std rng in the precompile crate).
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// Split-floor conservation: a fill's closing + opening quote is the SINGLE floor of the
+    /// whole fill — `calc_value(price, fill_qty)` — regardless of where the position's
+    /// close/open boundary falls. That is exactly what makes the taker and maker (who split
+    /// the SAME (price, qty) at DIFFERENT boundaries) attribute the SAME total quote, so the
+    /// virtual-quote ledger is conserved across the two counterparties. The pre-fix code
+    /// floored the closing and opening legs independently, so this sum was off by 1 whenever
+    /// the partition lost a sub-unit — a ±1 phantom mint/burn per asymmetric fill. Fuzzed over
+    /// high-decimal markets where truncation is common; this test FAILS on the pre-fix
+    /// (double-floor) code and passes on the single-floor-derive-by-subtraction fix.
+    #[test]
+    fn closing_plus_opening_equals_single_floor_so_both_sides_agree() {
+        let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..50_000 {
+            let bd = (next(&mut s) % 9) as u32; // 0..=8 base decimals
+            let pd = (next(&mut s) % 9) as u32; // 0..=8 price decimals
+            let m = mkt(bd, pd);
+            let price = next(&mut s) % 2_000_000 + 1; // non-zero
+            let qty = next(&mut s) % 1_000_000 + 1; // non-zero
+            let fill_value = calc_value(price, qty, bd, pd).unwrap();
+
+            // Two counterparties splitting the SAME (price, qty) at DIFFERENT boundaries:
+            // a long hit by a Sell, and a short hit by a Buy, each of random size in [0, qty].
+            let long_amt = (next(&mut s) % (qty + 1)) as i64;
+            let short_amt = -((next(&mut s) % (qty + 1)) as i64);
+            let sell = split_position_fill(long_amt, Side::Sell, price, qty, &m).unwrap();
+            let buy = split_position_fill(short_amt, Side::Buy, price, qty, &m).unwrap();
+
+            // Each side's total attributed quote == the single floor of the whole fill ...
+            assert_eq!(sell.closing_value + sell.opening_value, fill_value);
+            assert_eq!(buy.closing_value + buy.opening_value, fill_value);
+            // ... hence the two counterparties agree EXACTLY — no ±1 phantom between them.
+            assert_eq!(
+                sell.closing_value + sell.opening_value,
+                buy.closing_value + buy.opening_value
+            );
+            // The derived opening leg never underflows (closing value ≤ whole-fill value).
+            assert!(sell.closing_value <= fill_value);
+            assert!(buy.closing_value <= fill_value);
+        }
     }
 }
