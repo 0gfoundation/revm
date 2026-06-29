@@ -232,6 +232,83 @@ impl PriceCompletion {
     }
 }
 
+/// Per-market COMPLETION watermark for the inline-taker single-pass driver (#21 step-4). Every op in a
+/// parallel batch marks its `ticket` done on completion — on EVERY exit (Ok / Err / `?` / panic /
+/// None-resolved cancel / downgrade), via the driver's outermost RAII guard, AFTER its book write has
+/// landed — so the dense consume-once contract drives the contiguous watermark to `N`. An INLINE taker
+/// (or emptying-best cancel) at ticket `j`, before it matches / refreshes best, calls [`wait_below`] to
+/// block until EVERY ticket `< j` has applied its book write = the serial book state at `j`. Unlike
+/// [`PriceCompletion`] (per-(market,price), single known price), this waits across ALL prices because a
+/// taker sweeps a-priori-unknown levels and a lower cancel at any of them must be applied first.
+///
+/// Deadlock-free under the held BBO ticket: every wait-edge points to a STRICTLY lower ticket, and no
+/// lower ticket needs the BBO ticket to complete (movers ran under their own ticket; non-movers
+/// RELEASED it before resting) — consistent with the PerpPool wait-edges-point-lower invariant.
+#[derive(Debug, Default)]
+pub struct MarketCompletion {
+    markets: DashMap<u64, Arc<MarketDone>>,
+}
+
+#[derive(Debug, Default)]
+struct MarketDone {
+    state: Mutex<MarketDoneState>,
+    cv: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct MarketDoneState {
+    /// Every ticket in `[0, watermark)` is done (contiguous low watermark).
+    watermark: u64,
+    /// Done tickets `>= watermark` that arrived out of order (folded into the watermark as the gap fills).
+    above: HashSet<u64>,
+}
+
+impl MarketCompletion {
+    /// Creates an empty (single-block-scoped) completion tracker.
+    pub fn new() -> Self {
+        Self {
+            markets: DashMap::new(),
+        }
+    }
+
+    fn market(&self, market: u64) -> Arc<MarketDone> {
+        self.markets.entry(market).or_default().clone()
+    }
+
+    /// Records that op `ticket` finished applying its book write in `market`, advancing the contiguous
+    /// watermark (draining any buffered higher tickets that the new watermark now reaches) and waking
+    /// waiters. MUST be called exactly once per ticket (dense consume-once), AFTER the store landed.
+    pub fn mark_done(&self, market: u64, ticket: u64) {
+        let md = self.market(market);
+        let mut s = md.state.lock().unwrap_or_else(|p| p.into_inner());
+        debug_assert!(
+            ticket >= s.watermark,
+            "market completion ticket {ticket} marked done twice (watermark {})",
+            s.watermark
+        );
+        if ticket == s.watermark {
+            let mut w = s.watermark + 1;
+            while s.above.remove(&w) {
+                w += 1;
+            }
+            s.watermark = w;
+        } else {
+            s.above.insert(ticket);
+        }
+        md.cv.notify_all();
+    }
+
+    /// Blocks until every ticket in `[0, below)` is done in `market` (the watermark reaches `below`).
+    /// `below == 0` returns immediately. Poison-tolerant.
+    pub fn wait_below(&self, market: u64, below: u64) {
+        let md = self.market(market);
+        let mut s = md.state.lock().unwrap_or_else(|p| p.into_inner());
+        while s.watermark < below {
+            s = md.cv.wait(s).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
 /// Per-(market, side, PRICE) mutual-exclusion lock guarding ONE level's FIFO order queue. #21
 /// perp-parallel: this was per-(market, side), but the sorted price list it also guarded is GONE
 /// (tick-walk discovery), so the only remaining cross-op structure is the per-level FIFO
@@ -288,6 +365,40 @@ mod tests {
 
     fn addr(n: u8) -> Address {
         Address::with_last_byte(n)
+    }
+
+    /// MarketCompletion: out-of-order marks still advance the contiguous watermark; wait_below(j)
+    /// returns once every ticket < j is done.
+    #[test]
+    fn market_completion_folds_out_of_order_marks() {
+        let mc = MarketCompletion::new();
+        mc.mark_done(7, 2); // buffered above (watermark 0)
+        mc.mark_done(7, 0); // watermark -> 1
+        mc.mark_done(7, 1); // watermark -> 3 (1 then 2 from `above`)
+        mc.wait_below(7, 3); // all of 0..3 done -> returns immediately
+    }
+
+    /// MarketCompletion: a waiter for `below` blocks until the watermark reaches it, regardless of the
+    /// order marks arrive in. `join` only completes once the waiter wakes, so a hang = a bug. Looped to
+    /// shake interleavings.
+    #[test]
+    fn market_completion_wait_below_blocks_until_all_lower_done() {
+        for _round in 0..25 {
+            let mc = Arc::new(MarketCompletion::new());
+            let woke = Arc::new(AtomicBool::new(false));
+            let (mc2, woke2) = (mc.clone(), woke.clone());
+            let h = std::thread::spawn(move || {
+                mc2.wait_below(3, 3);
+                woke2.store(true, Ordering::SeqCst);
+            });
+            // Mark out of order; the waiter for below=3 stays blocked until the last gap (ticket 2)
+            // lands. join blocks until the waiter wakes — a hang would fail the test.
+            mc.mark_done(3, 1);
+            mc.mark_done(3, 0);
+            mc.mark_done(3, 2);
+            h.join().unwrap();
+            assert!(woke.load(Ordering::SeqCst));
+        }
     }
 
     /// Rule 6: same-account transactions take effect in `rank` order regardless of thread schedule.
