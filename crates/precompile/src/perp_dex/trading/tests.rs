@@ -277,10 +277,7 @@ fn limit_buy_rests_in_book_when_no_ask() {
 
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // GTC limit buy
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
-    assert_eq!(
-        storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![PRICE]
-    );
+    assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), PRICE);
 }
 
 #[test]
@@ -290,10 +287,7 @@ fn limit_sell_rests_in_book_when_no_bid() {
 
     let id = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // GTC limit sell
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
-    assert_eq!(
-        storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![PRICE]
-    );
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), PRICE);
 }
 
 #[test]
@@ -385,9 +379,7 @@ fn buy_taker_fully_matches_resting_ask() {
 
     assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
     assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
-    assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
-        .unwrap()
-        .is_empty());
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), 0);
 }
 
 #[test]
@@ -400,9 +392,7 @@ fn sell_taker_fully_matches_resting_bid() {
 
     assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
     assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
-    assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
-        .unwrap()
-        .is_empty());
+    assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), 0);
 }
 
 #[test]
@@ -677,10 +667,7 @@ fn partial_fill_leaves_maker_partially_filled_in_book() {
     assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
 
     // Remaining sell still in ask book.
-    assert_eq!(
-        storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![PRICE]
-    );
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), PRICE);
 }
 
 #[test]
@@ -716,9 +703,7 @@ fn maker_fill_does_not_auto_expire_remaining_order_under_isolated_margin() {
     assert_eq!(maker.filled, QTY);
     assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
     // The remaining QTY of the maker's sell is NOT auto-expired — it stays resting.
-    assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
-        .unwrap()
-        .contains(&PRICE));
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), PRICE);
     assert!(!storage::load_ask_level(&mut ctx, MARKET_ID, PRICE)
         .unwrap()
         .is_empty());
@@ -928,9 +913,7 @@ fn self_trade_taker_margin_expiry_does_not_cancel_current_taker_order() {
     assert_eq!(get_order(&mut ctx, bob_sell).status, OrderStatus::Filled);
     assert_eq!(get_order(&mut ctx, taker_buy).status, OrderStatus::Filled);
     assert_eq!(get_order(&mut ctx, old_buy).status, OrderStatus::Expired);
-    assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
-        .unwrap()
-        .is_empty());
+    assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), 0);
     assert_eq!(
         pos(&mut ctx, ALICE),
         PerpPosition {
@@ -991,10 +974,8 @@ fn market_buy_matches_lowest_ask_first() {
 
     assert_eq!(get_order(&mut ctx, low_sell).status, OrderStatus::Filled);
     assert_eq!(get_order(&mut ctx, mkt_buy).status, OrderStatus::Filled);
-    // High-price level must still be present.
-    assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
-        .unwrap()
-        .contains(&high_price));
+    // High-price level must still be present (best_ask refreshed up to it after low filled).
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), high_price);
 }
 
 // ── IOC ───────────────────────────────────────────────────────────────────
@@ -1121,10 +1102,7 @@ fn post_only_rests_when_above_best_bid() {
     let ask_price = PRICE + TICK;
     let id = place(&mut ctx, ALICE, 1, ask_price, QTY, 0, 3); // PostOnly
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
-    assert_eq!(
-        storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![ask_price]
-    );
+    assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), ask_price);
 }
 
 // ── Cancel ────────────────────────────────────────────────────────────────
@@ -1149,9 +1127,7 @@ fn cancel_resting_order_releases_margin_and_clears_book() {
 
     assert_eq!(wallet(&mut ctx, ALICE), WALLET, "margin should be returned");
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Cancelled);
-    assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
-        .unwrap()
-        .is_empty());
+    assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), 0);
 }
 
 #[test]
@@ -1177,10 +1153,9 @@ fn cancel_non_top_bid_keeps_best_bid() {
 
     // best_bid unchanged (top level survived), interior level gone, top still open.
     assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_hi);
-    assert_eq!(
-        storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![p_hi]
-    );
+    assert!(storage::load_bid_level(&mut ctx, MARKET_ID, p_lo)
+        .unwrap()
+        .is_empty());
     assert_eq!(get_order(&mut ctx, lo).status, OrderStatus::Cancelled);
     assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Open);
 }
@@ -1206,10 +1181,9 @@ fn cancel_top_bid_refreshes_best_bid() {
     run_cancel_order(&input, ALICE, &mut ctx).unwrap();
 
     assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_lo);
-    assert_eq!(
-        storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![p_lo]
-    );
+    assert!(storage::load_bid_level(&mut ctx, MARKET_ID, p_hi)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -1233,10 +1207,9 @@ fn cancel_non_top_ask_keeps_best_ask() {
     run_cancel_order(&input, ALICE, &mut ctx).unwrap();
 
     assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), p_lo);
-    assert_eq!(
-        storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![p_lo]
-    );
+    assert!(storage::load_ask_level(&mut ctx, MARKET_ID, p_hi)
+        .unwrap()
+        .is_empty());
     assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Cancelled);
 }
 
@@ -2304,7 +2277,7 @@ mod golden {
     /// BusinessSnapshot is UNCHANGED (pure commitment-representation change). Prior v2 value
     /// 0x3c80c530439970bd37d4bef6bcfd22411740241981764031154765a558bf9f47.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x24d9197680681d1b627f13e28ba971a3e1bf2589a979141ae48989efc797e7e6");
+        b256!("0xa4f990daed21ad051cde3d8858c66708ab8f608ff30c5961b0cce42b6ef97c01");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

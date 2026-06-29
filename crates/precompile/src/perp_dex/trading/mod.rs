@@ -384,9 +384,34 @@ pub fn run_get_book_prices<CTX: ContextTr>(
         .map_err(|_| perp_err("getBookPrices: invalid calldata"))?;
 
     let side = Side::from_u8(args.side).ok_or_else(|| perp_err("getBookPrices: invalid side"))?;
-    let prices = match side {
-        Side::Buy => storage::load_bid_prices(context, args.marketId)?,
-        Side::Sell => storage::load_ask_prices(context, args.marketId)?,
+    // #21: the sorted price list is gone — reconstruct it for this view by tick-walking from best,
+    // collecting non-empty levels in book order (bid DESC, ask ASC). Capped per step by the tick-walk
+    // bound (a level past CAP ticks from the previous is omitted — matches the temporary sparse-book
+    // limitation; this is an RPC view, not consensus).
+    let market = args.marketId;
+    let tick = storage::load_market(context, market)?.map(|m| m.tick_size).unwrap_or(0);
+    let mut prices: Vec<u64> = Vec::new();
+    match side {
+        Side::Buy => {
+            let mut p = storage::load_best_bid(context, market)?;
+            while p != 0 {
+                prices.push(p);
+                p = match p.checked_sub(tick) {
+                    Some(np) => {
+                        storage::next_bid_at_or_below(context, market, np, tick)?.unwrap_or(0)
+                    }
+                    None => 0,
+                };
+            }
+        }
+        Side::Sell => {
+            let mut p = storage::load_best_ask(context, market)?;
+            while p != 0 {
+                prices.push(p);
+                p = storage::next_ask_at_or_above(context, market, p.saturating_add(tick), tick)?
+                    .unwrap_or(0);
+            }
+        }
     };
 
     Ok(Bytes::from(getBookPricesCall::abi_encode_returns(&prices)))
@@ -887,11 +912,12 @@ pub(super) fn match_order<CTX: ContextTr>(
 
     match side {
         Side::Buy => {
-            // Match against asks (sorted ASC: lowest ask first).
-            let ask_prices = storage::load_ask_prices(context, market_id)?;
-            let old_best_ask = ask_prices.first().copied().unwrap_or(0);
+            // Match against asks from best UP the tick grid (#21: no sorted price list).
+            let tick = market.tick_size;
+            let mut ask_price = storage::load_best_ask(context, market_id)?;
+            let old_best_ask = ask_price;
             let mut ask_levels_cleared = false;
-            'outer: for ask_price in ask_prices {
+            'outer: while ask_price != 0 {
                 // For limit buy: only match if ask_price <= our limit.
                 if order_type == OrderType::Limit && ask_price > limit_price {
                     break;
@@ -910,7 +936,6 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 .filter(|id| !expired_during_level.contains(id)),
                         );
                         if new_queue.is_empty() {
-                            storage::remove_ask_price(context, market_id, ask_price)?;
                             ask_levels_cleared = true;
                         }
                         storage::save_ask_level(context, market_id, ask_price, &new_queue)?;
@@ -1028,10 +1053,19 @@ pub(super) fn match_order<CTX: ContextTr>(
                 }
 
                 if new_queue.is_empty() {
-                    storage::remove_ask_price(context, market_id, ask_price)?;
                     ask_levels_cleared = true;
                 }
                 storage::save_ask_level(context, market_id, ask_price, &new_queue)?;
+                // Advance to the next non-empty ask ABOVE this price (tick-walk; capped).
+                ask_price = match storage::next_ask_at_or_above(
+                    context,
+                    market_id,
+                    ask_price.saturating_add(tick),
+                    tick,
+                )? {
+                    Some(p) => p,
+                    None => break,
+                };
             }
             if ask_levels_cleared {
                 let best_ask = storage::refresh_best_ask(context, market_id)?;
@@ -1044,11 +1078,12 @@ pub(super) fn match_order<CTX: ContextTr>(
             }
         }
         Side::Sell => {
-            // Match against bids (sorted DESC: highest bid first).
-            let bid_prices = storage::load_bid_prices(context, market_id)?;
-            let old_best_bid = bid_prices.first().copied().unwrap_or(0);
+            // Match against bids from best DOWN the tick grid (#21: no sorted price list).
+            let tick = market.tick_size;
+            let mut bid_price = storage::load_best_bid(context, market_id)?;
+            let old_best_bid = bid_price;
             let mut bid_levels_cleared = false;
-            'outer: for bid_price in bid_prices {
+            'outer: while bid_price != 0 {
                 // For limit sell: only match if bid_price >= our limit.
                 if order_type == OrderType::Limit && bid_price < limit_price {
                     break;
@@ -1067,7 +1102,6 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 .filter(|id| !expired_during_level.contains(id)),
                         );
                         if new_queue.is_empty() {
-                            storage::remove_bid_price(context, market_id, bid_price)?;
                             bid_levels_cleared = true;
                         }
                         storage::save_bid_level(context, market_id, bid_price, &new_queue)?;
@@ -1183,10 +1217,19 @@ pub(super) fn match_order<CTX: ContextTr>(
                 }
 
                 if new_queue.is_empty() {
-                    storage::remove_bid_price(context, market_id, bid_price)?;
                     bid_levels_cleared = true;
                 }
                 storage::save_bid_level(context, market_id, bid_price, &new_queue)?;
+                // Advance to the next non-empty bid BELOW this price (tick-walk; capped).
+                bid_price = match storage::next_bid_at_or_below(
+                    context,
+                    market_id,
+                    bid_price.saturating_sub(tick),
+                    tick,
+                )? {
+                    Some(p) => p,
+                    None => break,
+                };
             }
             if bid_levels_cleared {
                 let best_bid = storage::refresh_best_bid(context, market_id)?;
@@ -1321,8 +1364,8 @@ fn rest_in_book<CTX: ContextTr>(
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
             // Persist order book state. (#21: the buy-order list was mutated in place above — no
-            // save_buy_orders here.)
-            storage::insert_bid_price(context, market_id, price)?;
+            // save_buy_orders here. The sorted price list is gone — a new price level is discovered by
+            // tick-walk at match time, so resting just appends to this level's FIFO key.)
             storage::push_bid_order(context, market_id, price, *order_id)?;
 
             // Keep best_bid cache up to date.
@@ -1383,8 +1426,8 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
-            // Persist order book state. (#21: the sell-order list was mutated in place above.)
-            storage::insert_ask_price(context, market_id, price)?;
+            // Persist order book state. (#21: the sell-order list was mutated in place above. The
+            // sorted price list is gone — see the bid side.)
             storage::push_ask_order(context, market_id, price, *order_id)?;
 
             // Keep best_ask cache up to date.
@@ -1480,9 +1523,7 @@ fn detach_order_from_level<CTX: ContextTr>(
             let mut queue = storage::load_bid_level(context, market_id, price)?;
             queue.retain(|id| id != order_id);
             let emptied = queue.is_empty();
-            if emptied {
-                storage::remove_bid_price(context, market_id, price)?;
-            }
+            // (#21: no price list to remove from; `emptied` drives the tick-walk best-refresh.)
             storage::save_bid_level(context, market_id, price, &queue)?;
             (old_best, emptied)
         }
@@ -1491,9 +1532,7 @@ fn detach_order_from_level<CTX: ContextTr>(
             let mut queue = storage::load_ask_level(context, market_id, price)?;
             queue.retain(|id| id != order_id);
             let emptied = queue.is_empty();
-            if emptied {
-                storage::remove_ask_price(context, market_id, price)?;
-            }
+            // (#21: no price list to remove from; `emptied` drives the tick-walk best-refresh.)
             storage::save_ask_level(context, market_id, price, &queue)?;
             (old_best, emptied)
         }
@@ -1725,8 +1764,9 @@ fn check_fok_feasibility<CTX: ContextTr>(
     let mut available: u64 = 0;
     match side {
         Side::Buy => {
-            let ask_prices = storage::load_ask_prices(context, market_id)?;
-            'outer: for ask_price in ask_prices {
+            let tick = storage::load_market(context, market_id)?.map(|m| m.tick_size).unwrap_or(0);
+            let mut ask_price = storage::load_best_ask(context, market_id)?;
+            'outer: while ask_price != 0 {
                 if order_type == OrderType::Limit && ask_price > limit_price {
                     break;
                 }
@@ -1741,11 +1781,21 @@ fn check_fok_feasibility<CTX: ContextTr>(
                         }
                     }
                 }
+                ask_price = match storage::next_ask_at_or_above(
+                    context,
+                    market_id,
+                    ask_price.saturating_add(tick),
+                    tick,
+                )? {
+                    Some(p) => p,
+                    None => break,
+                };
             }
         }
         Side::Sell => {
-            let bid_prices = storage::load_bid_prices(context, market_id)?;
-            'outer: for bid_price in bid_prices {
+            let tick = storage::load_market(context, market_id)?.map(|m| m.tick_size).unwrap_or(0);
+            let mut bid_price = storage::load_best_bid(context, market_id)?;
+            'outer: while bid_price != 0 {
                 if order_type == OrderType::Limit && bid_price < limit_price {
                     break;
                 }
@@ -1760,6 +1810,15 @@ fn check_fok_feasibility<CTX: ContextTr>(
                         }
                     }
                 }
+                bid_price = match storage::next_bid_at_or_below(
+                    context,
+                    market_id,
+                    bid_price.saturating_sub(tick),
+                    tick,
+                )? {
+                    Some(p) => p,
+                    None => break,
+                };
             }
         }
     }

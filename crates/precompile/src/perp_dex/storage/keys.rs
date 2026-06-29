@@ -26,8 +26,6 @@ const PFX_USER_NONCE: &[u8] = b"nonc"; // per-user nonce for order-id generation
 const PFX_MARKET: &[u8] = b"mkt\x00";
 const PFX_MARK_PRICE: &[u8] = b"mktp";
 const PFX_OPEN_INT: &[u8] = b"oint";
-const PFX_BID_PRICES: &[u8] = b"bidp"; // sorted Vec<u64> of active bid prices
-const PFX_ASK_PRICES: &[u8] = b"askp"; // sorted Vec<u64> of active ask prices
 const PFX_BID_LEVEL: &[u8] = b"bidl"; // FIFO queue of order IDs at a bid price
 const PFX_ASK_LEVEL: &[u8] = b"askl"; // FIFO queue of order IDs at an ask price
 const PFX_BEST_BID: &[u8] = b"bbd\x00"; // cached best bid price (0 = empty)
@@ -163,16 +161,8 @@ pub fn open_interest_key(market_id: u64) -> B256 {
 }
 
 // ── Order book ────────────────────────────────────────────────────────────
-
-/// Sorted list of all active **bid** prices for a market (Vec<u64>, price DESC).
-pub fn bid_prices_key(market_id: u64) -> B256 {
-    keccak256([PFX_BID_PRICES, &market_id.to_be_bytes()].concat())
-}
-
-/// Sorted list of all active **ask** prices for a market (Vec<u64>, price ASC).
-pub fn ask_prices_key(market_id: u64) -> B256 {
-    keccak256([PFX_ASK_PRICES, &market_id.to_be_bytes()].concat())
-}
+// (#21 perp-parallel: bid_prices_key / ask_prices_key removed — the sorted price list is gone;
+// prices are discovered by tick-walk over the per-level keys below.)
 
 /// FIFO queue of order IDs at a specific bid price level.
 pub fn bid_level_key(market_id: u64, price: u64) -> B256 {

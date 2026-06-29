@@ -843,9 +843,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         // Remove from price level queue.
         let mut queue = storage::load_bid_level(context, market_id, entry.price)?;
         queue.retain(|id| id != &entry.order_id);
-        if queue.is_empty() {
-            storage::remove_bid_price(context, market_id, entry.price)?;
-        }
+        // (#21: no price list; the best-refresh below tick-walks.)
         storage::save_bid_level(context, market_id, entry.price, &queue)?;
 
         context.journal_mut().log(Log {
@@ -869,9 +867,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         }
         let mut queue = storage::load_ask_level(context, market_id, entry.price)?;
         queue.retain(|id| id != &entry.order_id);
-        if queue.is_empty() {
-            storage::remove_ask_price(context, market_id, entry.price)?;
-        }
+        // (#21: no price list; the best-refresh below tick-walks.)
         storage::save_ask_level(context, market_id, entry.price, &queue)?;
 
         context.journal_mut().log(Log {

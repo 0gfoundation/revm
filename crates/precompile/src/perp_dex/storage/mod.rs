@@ -21,8 +21,8 @@ use crate::{
 };
 
 use keys::{
-    account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
-    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, commitment_slot, erc20_balance_slot,
+    account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, best_ask_key,
+    best_bid_key, bid_level_key, commitment_slot, erc20_balance_slot,
     funding_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
     last_traded_price_key, mark_price_key, market_fee_total_key, market_key, market_manager_key,
     open_interest_key, oracle_key, order_key, position_key, premium_accumulator_key,
@@ -197,9 +197,11 @@ fn store_blob<CTX: ContextTr>(
 }
 
 /// Version byte mixed into the per-block commitment hash (catalog #16d). Bumped to 3 at the
-/// switch from the per-call chained v2 (retired) to the per-block net-delta fold, so the two
-/// framings never alias across the consensus transition (a devnet wipe accompanies the bump).
-const BLOCK_COMMITMENT_VERSION: u8 = 3;
+/// switch from the per-call chained v2 (retired) to the per-block net-delta fold; bumped to 4 (#21
+/// perp-parallel) when the sorted bid_prices/ask_prices price lists were dropped (book uses tick-walk
+/// discovery), removing those keys from the committed key-set. Each bump is accompanied by a devnet
+/// wipe so the framings never alias across the consensus transition.
+const BLOCK_COMMITMENT_VERSION: u8 = 4;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -663,38 +665,10 @@ pub fn save_open_interest<CTX: ContextTr>(
 }
 
 // ── Order book: price level lists ─────────────────────────────────────────────
-
-/// Sorted bid prices DESC.
-pub fn load_bid_prices<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-) -> Result<Vec<u64>, PrecompileError> {
-    Ok(load_cached::<_, Vec<u64>>(context, bid_prices_key(market_id))?.unwrap_or_default())
-}
-
-pub fn save_bid_prices<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    prices: &[u64],
-) -> Result<(), PrecompileError> {
-    save_cached(context, bid_prices_key(market_id), &prices.to_vec())
-}
-
-/// Sorted ask prices ASC.
-pub fn load_ask_prices<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-) -> Result<Vec<u64>, PrecompileError> {
-    Ok(load_cached::<_, Vec<u64>>(context, ask_prices_key(market_id))?.unwrap_or_default())
-}
-
-pub fn save_ask_prices<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    prices: &[u64],
-) -> Result<(), PrecompileError> {
-    save_cached(context, ask_prices_key(market_id), &prices.to_vec())
-}
+// REMOVED (#21 perp-parallel): the sorted bid_prices/ask_prices Vec was a single per-side key that
+// every place-at-a-new-price + level-emptying RMW'd, serializing the whole side. The book now
+// discovers prices by tick-walk from best (`next_ask_at_or_above` / `next_bid_at_or_below`), so
+// different-price levels are independent keys with no shared list.
 
 // ── Order book: FIFO queue at a price level ───────────────────────────────────
 
@@ -830,58 +804,8 @@ pub fn save_ask_level<CTX: ContextTr>(
 }
 
 // ── Order book helpers ────────────────────────────────────────────────────────
-
-/// Insert `price` into the bid price list (kept sorted DESC) if not already present.
-pub fn insert_bid_price<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    price: u64,
-) -> Result<(), PrecompileError> {
-    let mut prices = load_bid_prices(context, market_id)?;
-    if !prices.contains(&price) {
-        let idx = prices.partition_point(|&p| p > price);
-        prices.insert(idx, price);
-        save_bid_prices(context, market_id, &prices)?;
-    }
-    Ok(())
-}
-
-/// Insert `price` into the ask price list (kept sorted ASC) if not already present.
-pub fn insert_ask_price<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    price: u64,
-) -> Result<(), PrecompileError> {
-    let mut prices = load_ask_prices(context, market_id)?;
-    if !prices.contains(&price) {
-        let idx = prices.partition_point(|&p| p < price);
-        prices.insert(idx, price);
-        save_ask_prices(context, market_id, &prices)?;
-    }
-    Ok(())
-}
-
-/// Remove `price` from the bid price list (call when level becomes empty).
-pub fn remove_bid_price<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    price: u64,
-) -> Result<(), PrecompileError> {
-    let mut prices = load_bid_prices(context, market_id)?;
-    prices.retain(|&p| p != price);
-    save_bid_prices(context, market_id, &prices)
-}
-
-/// Remove `price` from the ask price list (call when level becomes empty).
-pub fn remove_ask_price<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    price: u64,
-) -> Result<(), PrecompileError> {
-    let mut prices = load_ask_prices(context, market_id)?;
-    prices.retain(|&p| p != price);
-    save_ask_prices(context, market_id, &prices)
-}
+// (#21 perp-parallel: insert_/remove_bid/ask_price removed — no sorted price list to maintain.
+// Resting just pushes to the per-(market,side,price) level key; emptying just leaves an empty level.)
 
 /// Append `order_id` to the FIFO queue at the given bid price level. #21: if the level is already
 /// in the overlay, append IN PLACE (one undo snapshot, no load/store clone round-trip); otherwise
@@ -958,29 +882,110 @@ pub fn save_best_ask<CTX: ContextTr>(
     save_cached(context, best_ask_key(market_id), &price)
 }
 
-/// Re-derive best_bid from the current bid price list (already in journal cache after matching).
-/// Call this after any operation that may have removed the top bid level.
+/// Re-derive best_bid after an op that may have emptied the top bid level. With the price list gone
+/// (#21), we tick-walk DOWN from the OLD best to the highest still-non-empty bid level. This is
+/// correct + bounded because a removal can only LOWER the best (movers set best directly when a
+/// better price arrives), so the new best is at-or-below the old one; capped by [`next_bid_at_or_below`].
 pub fn refresh_best_bid<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let prices = load_bid_prices(context, market_id)?;
-    let best = prices.first().copied().unwrap_or(0);
+    let from = load_best_bid(context, market_id)?;
+    let tick = load_market(context, market_id)?.map(|m| m.tick_size).unwrap_or(0);
+    let best = if from == 0 {
+        0
+    } else {
+        next_bid_at_or_below(context, market_id, from, tick)?.unwrap_or(0)
+    };
     save_best_bid(context, market_id, best)?;
     Ok(best)
 }
 
-/// Re-derive best_ask from the current ask price list (already in journal cache after matching).
-/// Call this after any operation that may have removed the top ask level.
+/// Re-derive best_ask after an op that may have emptied the top ask level — tick-walk UP from the
+/// OLD best to the lowest still-non-empty ask level. See [`refresh_best_bid`].
 pub fn refresh_best_ask<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let prices = load_ask_prices(context, market_id)?;
-    let best = prices.first().copied().unwrap_or(0);
+    let from = load_best_ask(context, market_id)?;
+    let tick = load_market(context, market_id)?.map(|m| m.tick_size).unwrap_or(0);
+    let best = if from == 0 {
+        0
+    } else {
+        next_ask_at_or_above(context, market_id, from, tick)?.unwrap_or(0)
+    };
     save_best_ask(context, market_id, best)?;
     Ok(best)
 }
+
+// ── Tick-walk price discovery (#21 perp-parallel: replaces the sorted bid_prices/ask_prices Vec) ──
+// The sorted per-side price list was a single per-side key that EVERY place-at-a-new-price and every
+// level-emptying RMW'd → it serialized the whole side (the BookSideLock bottleneck). We drop it: a
+// level is found purely from the per-(market,side,price) FIFO key, and "the next price" is discovered
+// by walking the tick grid from a starting price. Different-price levels are then independent keys
+// (no shared list) → different-price place/cancel can run in parallel.
+
+/// Max ticks [`next_ask_at_or_above`] / [`next_bid_at_or_below`] scan before treating the side as
+/// EXHAUSTED (no further liquidity / best = 0). `pureChurn` clusters orders near best so the next
+/// non-empty level is normally 1–2 ticks away and this never binds.
+///
+/// TODO(perp-parallel): this is a TEMPORARY sparse-book bound. A wide, sparsely-populated book whose
+/// next level sits > CAP ticks away is wrongly treated as empty (a taker reverts insufficient-
+/// liquidity; a best-refresh sets best = 0, orphaning the far level). Focusing pureChurn for now;
+/// revisit with a per-side occupancy index (sharded bitmap / coarse buckets) — see the perf doc.
+pub const TICK_WALK_CAP: u32 = 4096;
+
+/// Lowest non-empty ASK level at a price `>= from`, found by walking UP the tick grid from `from`
+/// (inclusive) in `tick` steps. `Ok(None)` = no ask liquidity within [`TICK_WALK_CAP`] ticks of
+/// `from` (caller treats the ask side as exhausted there). `from` must be tick-aligned (all resting
+/// prices are). `tick == 0` (mis-configured market) yields `None` rather than looping.
+pub fn next_ask_at_or_above<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    from: u64,
+    tick: u64,
+) -> Result<Option<u64>, PrecompileError> {
+    if tick == 0 {
+        return Ok(None);
+    }
+    let mut p = from;
+    for _ in 0..TICK_WALK_CAP {
+        if !load_ask_level(context, market_id, p)?.is_empty() {
+            return Ok(Some(p));
+        }
+        p = match p.checked_add(tick) {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+    }
+    Ok(None)
+}
+
+/// Highest non-empty BID level at a price `<= from`, walking DOWN the tick grid from `from`
+/// (inclusive). `Ok(None)` = no bid liquidity within [`TICK_WALK_CAP`] ticks at-or-below `from`.
+/// See [`next_ask_at_or_above`].
+pub fn next_bid_at_or_below<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    from: u64,
+    tick: u64,
+) -> Result<Option<u64>, PrecompileError> {
+    if tick == 0 {
+        return Ok(None);
+    }
+    let mut p = from;
+    for _ in 0..TICK_WALK_CAP {
+        if !load_bid_level(context, market_id, p)?.is_empty() {
+            return Ok(Some(p));
+        }
+        if p < tick {
+            return Ok(None); // below the lowest representable tick → no more bids
+        }
+        p -= tick;
+    }
+    Ok(None)
+}
+
 // ── API key (ed25519 signed orders) ──────────────────────────────────────────
 
 pub fn load_api_key<CTX: ContextTr>(
