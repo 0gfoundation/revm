@@ -767,18 +767,19 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             perp_shared,
             #[cfg(feature = "perp-parallel")]
             perp_writeset,
-            // finalize resets the journal to initial state for reuse → clear replay so the next block
-            // (which re-sets it, or runs serial) does not inherit a stale queue/cursor.
+            // Replay (step 4b) is BLOCK-scoped, exactly like the perp overlay below: `set_perp_replay`
+            // installs the queue+cursor ONCE before the block's tx loop and the cursor advances per
+            // trading CALL across many txs. But `finalize` runs PER TX (the block executor calls
+            // `transact` = `transact_one` + `finalize` for every tx — see the `perp.working` note
+            // below). Clearing the queue/cursor here wiped them on the FIRST tx's finalize, so every
+            // later trading tx fell out of replay mode and re-matched live against the (empty) serial
+            // book → wrong maker on-chain. Leave them untouched; the journal is rebuilt fresh per block
+            // (`perp_replay` defaults to `None`), so no stale queue can leak into a later serial block.
             #[cfg(feature = "perp-parallel")]
-            perp_replay,
+            perp_replay: _,
             #[cfg(feature = "perp-parallel")]
-            perp_replay_cursor,
+            perp_replay_cursor: _,
         } = self;
-        #[cfg(feature = "perp-parallel")]
-        {
-            *perp_replay = None;
-            *perp_replay_cursor = 0;
-        }
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
         // Clear coinbase address warming for next tx
@@ -1608,6 +1609,31 @@ mod perp_tests {
         // Working survives across the tx boundary (intra-block visibility); the undo is spent.
         assert_eq!(j.perp_get_overlay(k(1)), Some(vec![1u8]));
         assert!(j.perp.undo.is_empty());
+    }
+
+    /// Step-4b regression (the server matchingPair bug): `set_perp_replay` installs the trading-call
+    /// replay queue ONCE before a block's tx loop, and the cursor advances per trading CALL across the
+    /// block's many txs — but `finalize` runs PER TX (the block executor calls `transact` =
+    /// `transact_one` + `finalize` for every tx). `finalize` must therefore NOT wipe the block-scoped
+    /// queue/cursor; if it does, only the FIRST trading tx replays and every later one falls out of
+    /// replay mode and re-matches live against the (empty) serial-pass book → wrong on-chain maker.
+    #[cfg(feature = "perp-parallel")]
+    #[test]
+    fn finalize_preserves_block_scoped_replay_across_per_tx_boundaries() {
+        use context_interface::journaled_state::PerpReplayResult;
+        let mut j = new_inner();
+        j.set_perp_replay(std::vec![
+            PerpReplayResult { reverted: false, output: std::vec![1], logs: std::vec![] },
+            PerpReplayResult { reverted: false, output: std::vec![2], logs: std::vec![] },
+        ]);
+        // tx #1: in replay mode, pops result 0.
+        assert!(j.perp_is_replay());
+        assert_eq!(j.perp_replay_next().map(|r| r.output), Some(std::vec![1u8]));
+        // The per-tx finalize must leave the block-scoped replay queue + cursor intact.
+        let _ = j.finalize();
+        assert!(j.perp_is_replay(), "block-scoped replay queue must survive the per-tx finalize");
+        // tx #2: still in replay mode, pops result 1 (the bug dropped the queue → wrong maker here).
+        assert_eq!(j.perp_replay_next().map(|r| r.output), Some(std::vec![2u8]));
     }
 
     #[test]
