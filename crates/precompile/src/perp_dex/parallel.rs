@@ -2042,6 +2042,59 @@ mod driver_tests {
         assert_eq!(s, pd, "cold-read taker consumption must be FIFO-identical to serial");
     }
 
+    /// THE step-4b residual bug, caught by the node PERP_PARALLEL_AUDIT: a block that is JUST a cancel
+    /// of an order resting from a PRIOR block (so the order + its level live in the cold-read committed
+    /// store, NOT the this-block book overlay) must produce the SAME committed state as serial. The
+    /// audit found single-cancel blocks with state_diff=true, logs_diff=false, diverging_keys=1 — the
+    /// parallel cancel path leaves the book in a different state than serial for a cold-read order,
+    /// which a later block's match then consumes wrong (the downstream TRADE_MISMATCH). Covers: a sole
+    /// order at the best level (cancel empties it → BBO moves), and one of several at the same level.
+    #[test]
+    fn cold_read_lone_cancel_matches_serial() {
+        let p = 100 * TICK;
+        let (m1, m2) = (user_addr(1), user_addr(2));
+
+        // scenario 0: sole SELL@P at best (cancel empties the level → BBO moves)
+        // scenario 1: two SELLs@P, cancel the FIRST (FIFO-oldest); scenario 2: cancel the SECOND
+        for scenario in 0..3 {
+            let mut prior: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+            seed(&mut prior, &[m1, m2]);
+            place_order_core(m1, oid(1), MID, 1, p, QTY, 0, 0, [0u8; 16], &mut prior).unwrap();
+            if scenario >= 1 {
+                place_order_core(m2, oid(2), MID, 1, p, QTY, 0, 0, [0u8; 16], &mut prior).unwrap();
+            }
+            let committed = prior.journal_mut().take_perp_delta();
+
+            // Block 2: a LONE cancel of a cold-read order.
+            let (canceller, target) = if scenario == 2 { (m2, oid(2)) } else { (m1, oid(1)) };
+            let ops = vec![PerpOp::Cancel(mk_cancel(canceller, target, 0, 0))];
+
+            // Serial reference (same block-end sample as the parallel driver → window matches).
+            let c_ser = committed.clone();
+            let make_ser = move |bk: Arc<SharedPerpBook>| -> ColdCtx {
+                let mut c: ColdCtx = Context::new(ColdPerpDb { perp: c_ser.clone() }, SpecId::CANCUN);
+                c.journal_mut().set_perp_shared(bk);
+                c
+            };
+            let book_s = Arc::new(SharedPerpBook::new());
+            transact_block_serial(&book_s, &ops, make_ser).unwrap();
+            let serial_delta = book_s.take_delta();
+
+            // Parallel driver over the SAME cold-read.
+            let c_par = committed.clone();
+            let make_par = move |bk: Arc<SharedPerpBook>| -> ColdCtx {
+                let mut c: ColdCtx = Context::new(ColdPerpDb { perp: c_par.clone() }, SpecId::CANCUN);
+                c.journal_mut().set_perp_shared(bk);
+                c
+            };
+            let book_p = Arc::new(SharedPerpBook::new());
+            transact_block_parallel(test_pool(), &book_p, &ops, make_par).unwrap();
+            let parallel_delta = book_p.take_delta();
+
+            assert_committed_eq(&parallel_delta, &serial_delta, scenario);
+        }
+    }
+
     /// Direct answer to "is a block with ZERO matches still FIFO-sorted before commit?" — YES. The
     /// segmented driver runs `finalize_place_batch_ordering` UNCONDITIONALLY per segment, BEFORE the
     /// no-downgrade `break`, so a no-match block (one segment, all rests) still has every touched
