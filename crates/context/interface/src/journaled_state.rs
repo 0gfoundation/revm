@@ -309,9 +309,9 @@ pub trait JournalTr {
     fn perp_store_struct(
         &mut self,
         key: B256,
-        val: std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<dyn core::any::Any + Send + Sync>,
         ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any + Send + Sync>,
     ) {
         let _ = (key, val, ser, clone);
     }

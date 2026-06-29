@@ -307,17 +307,14 @@ mod tests {
     fn shared_book_delta_matches_perpsection() {
         use crate::journal::{JournalEntry, JournalInner};
 
-        // PerpSection's clone fn-ptr returns the looser `Box<dyn Any>` (vs the shared book's
-        // `Send + Sync` box); both serialize via the same `ser_u32`, so the bytes match.
-        fn clone_u32_serial(v: &dyn Any) -> Box<dyn Any> {
-            Box::new(*v.downcast_ref::<u32>().unwrap())
-        }
+        // #21 Phase 3: PerpSection + the shared book now share one `Box<dyn Any + Send + Sync>`
+        // clone fn-ptr type, so the serial side uses the same `clone_u32` as the shared side.
 
         // Serial side.
         let mut j = JournalInner::<JournalEntry>::new();
         j.perp_store(k(1), vec![0xAA]);
         j.perp_store(k(1), vec![0xBB]); // overwrite -> last write wins
-        j.perp_store_struct(k(2), Box::new(5u32), ser_u32, clone_u32_serial);
+        j.perp_store_struct(k(2), Box::new(5u32), ser_u32, clone_u32);
         j.perp_with_struct_mut::<u32, ()>(k(2), |v| *v = 7); // in-place
         j.perp_store(k(3), vec![1, 2, 3]);
         let serial_delta = j.take_perp_delta();

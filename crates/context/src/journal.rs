@@ -340,9 +340,9 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     fn perp_store_struct(
         &mut self,
         key: B256,
-        val: std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<dyn core::any::Any + Send + Sync>,
         ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any + Send + Sync>,
     ) {
         self.inner.perp_store_struct(key, val, ser, clone);
     }

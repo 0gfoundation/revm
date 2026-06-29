@@ -321,8 +321,12 @@ fn ser_blob<T: Serialize + 'static>(v: &dyn core::any::Any) -> Vec<u8> {
     buf
 }
 
-/// Clones a type-erased off-trie blob into a fresh box (keeps the journal overlay `Clone`).
-fn clone_blob<T: Clone + 'static>(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
+/// Clones a type-erased off-trie blob into a fresh box (keeps the overlay `Clone`). The box is
+/// `Send + Sync` because the parallel-path shared book is shared across worker threads (#21 Phase 3);
+/// all off-trie blob types (order lists, accounts, levels) are plain `Send + Sync` data.
+fn clone_blob<T: Clone + Send + Sync + 'static>(
+    v: &dyn core::any::Any,
+) -> std::boxed::Box<dyn core::any::Any + Send + Sync> {
     let val = v
         .downcast_ref::<T>()
         .expect("perp clone_blob: overlay value type mismatch (bug)");
@@ -336,7 +340,7 @@ fn clone_blob<T: Clone + 'static>(v: &dyn core::any::Any) -> std::boxed::Box<dyn
 /// the in-block read cache — `store_struct` invalidates the #14 cold-read cache for this key.
 fn save_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256, val: &T) -> Result<(), PrecompileError>
 where
-    T: Clone + 'static + Serialize,
+    T: Clone + 'static + Serialize + Send + Sync,
 {
     // Bench-only A/B lever (#16d measurement): serialize on every write into the byte overlay,
     // reproducing pre-#16d behavior so a bench can diff per-call vs deferred ser cost.
@@ -709,7 +713,7 @@ fn ser_level(v: &dyn core::any::Any) -> Vec<u8> {
 }
 
 /// Clones a deferred level-FIFO `Struct` (keeps the journal overlay `Clone`).
-fn clone_level(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
+fn clone_level(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any + Send + Sync> {
     std::boxed::Box::new(
         v.downcast_ref::<Vec<[u8; 32]>>()
             .expect("perp clone_level: level-queue type mismatch (bug)")

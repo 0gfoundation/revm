@@ -66,9 +66,9 @@ struct PerpUndo {
 /// the entry is `Clone` without cloning through `dyn Any`.
 enum PerpEntry {
     Struct {
-        val: std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<dyn core::any::Any + Send + Sync>,
         ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any + Send + Sync>,
     },
     Bytes(Vec<u8>),
 }
@@ -218,9 +218,9 @@ impl PerpSection {
     fn store_struct(
         &mut self,
         key: B256,
-        val: std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<dyn core::any::Any + Send + Sync>,
         ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any + Send + Sync>,
     ) {
         let prev = self.working.insert(key, PerpEntry::Struct { val, ser, clone });
         self.undo.push(PerpUndo { key, prev });
@@ -505,35 +505,34 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     pub fn perp_store_struct(
         &mut self,
         key: B256,
-        val: std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<dyn core::any::Any + Send + Sync>,
         ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any + Send + Sync>,
     ) {
         #[cfg(feature = "perp-parallel")]
         if let Some(book) = self.perp_shared.clone() {
-            // Parallel mode: eager-serialize to bytes (no deferred `Struct` in the shared book). The
-            // final block-delta bytes are identical to the serial deferred path (same `ser`); the
-            // in-place struct fast path is serial-only for now. `clone` is unused here. This is the
-            // load-bearing fact behind the TRIPWIRE on `perp_contains_struct`: the book holds ONLY
-            // Bytes, which is why the three Struct-reader methods stay unrouted.
-            book.store_bytes(key, ser(val.as_ref()), &mut self.perp_writeset);
+            // Parallel mode (#21 Phase 3): store the DEFERRED struct in the shared book, exactly like
+            // serial — NOT eager-serialized. This recovers the in-place struct fast path
+            // (perp_contains_struct / perp_with_struct / perp_with_struct_mut, now routed below) and
+            // the single block-end serialization under parallel; the per-(market,side,price)
+            // BookSideLock serializes same-level RMW. Block-delta bytes are identical (same `ser`).
+            book.store_struct(key, val, ser, clone, &mut self.perp_writeset);
             return;
         }
         self.perp.store_struct(key, val, ser, clone);
     }
 
-    // TRIPWIRE (#21 parallel): the next THREE methods (perp_contains_struct / perp_with_struct /
-    // perp_with_struct_mut) are intentionally NOT routed to `perp_shared` — they read the serial
-    // PerpSection unconditionally. This is correct in parallel mode ONLY because `perp_store_struct`
-    // eager-serializes to Bytes there (see its body), so the shared book NEVER holds a `Struct`:
-    // PerpSection stays empty → contains==false, with_struct==None, and the precompile takes the
-    // load path (byte-identical to serial). If a future step routes a real `Struct` into the book
-    // (to recover the in-place fast path under parallel mode), these three MUST gain a `perp_shared`
-    // arm IN THE SAME change — otherwise the gate silently reads the empty PerpSection (dead fast
-    // path) and `perp_with_struct_mut`'s `expect()` could become reachable.
+    // #21 Phase 3: under `perp_shared` these three route to the shared book's struct API (which now
+    // holds deferred `Struct`s — see `perp_store_struct`); else they read the serial `PerpSection`.
+    // The per-(market,side,price) `BookSideLock` the caller holds serializes same-level RMW around the
+    // in-place mutation, so the book's shard guard (held only across `f`) sees a settled level.
     /// Whether `key` holds a deferred `Struct` overlay value (the in-place fast-path gate).
     #[inline]
     pub fn perp_contains_struct(&self, key: B256) -> bool {
+        #[cfg(feature = "perp-parallel")]
+        if let Some(book) = &self.perp_shared {
+            return book.with_struct(key, |_| ()).is_some();
+        }
         self.perp.get_struct(key).is_some()
     }
 
@@ -545,6 +544,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: B256,
         f: impl FnOnce(&T) -> R,
     ) -> Option<R> {
+        #[cfg(feature = "perp-parallel")]
+        if let Some(book) = &self.perp_shared {
+            return book
+                .with_struct(key, |any| any.downcast_ref::<T>().map(f))
+                .flatten();
+        }
         self.perp
             .get_struct(key)
             .and_then(|any| any.downcast_ref::<T>())
@@ -560,6 +565,16 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         key: B256,
         f: impl FnOnce(&mut T) -> R,
     ) -> R {
+        #[cfg(feature = "perp-parallel")]
+        if let Some(book) = self.perp_shared.clone() {
+            return book
+                .with_struct_mut(key, &mut self.perp_writeset, |any| {
+                    f(any
+                        .downcast_mut::<T>()
+                        .expect("perp_with_struct_mut: overlay value type mismatch (bug)"))
+                })
+                .expect("perp_with_struct_mut: key absent (call perp_contains_struct first)");
+        }
         let any = self
             .perp
             .get_struct_mut(key)
@@ -1654,7 +1669,7 @@ mod perp_tests {
     fn ser_u32(v: &dyn core::any::Any) -> Vec<u8> {
         v.downcast_ref::<u32>().unwrap().to_le_bytes().to_vec()
     }
-    fn clone_u32(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
+    fn clone_u32(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any + Send + Sync> {
         std::boxed::Box::new(*v.downcast_ref::<u32>().unwrap())
     }
 
