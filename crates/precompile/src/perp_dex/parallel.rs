@@ -36,13 +36,13 @@ use crate::perp_dex::{
 use crate::PrecompileError;
 use alloy_sol_types::SolCall;
 use context::journal::perp_pool::PerpPool;
-use context::journal::perp_sched::{AccountGate, BboTicketLock, BookSideLock, PriceCompletion};
+use context::journal::perp_sched::{AccountGate, BboTicketLock, BookSideLock, MarketCompletion};
 use context::journal::shared_perp::SharedPerpBook;
 use context::journaled_state::JournalCheckpoint;
 use context::{ContextTr, JournalTr};
 use primitives::{Address, Log};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// How the gated phase must treat one place/cancel under the BBO ticket. See module docs.
@@ -367,37 +367,168 @@ fn gated_execute<CTX: ContextTr>(
     })
 }
 
+/// Shared per-block batch state threaded into every slot. Created ONCE by the driver (and the test
+/// batch helpers): the gates plus the inline-taker machinery — the per-market completion watermark,
+/// the dirty-levels set for on-demand FIFO sort, and the `{order_id -> ticket}` map the sort consults.
+struct BatchEnv<'a> {
+    /// The single market this batch operates on (spike scope); also the completion key for an op whose
+    /// own market is unknown (a None-resolved cancel).
+    market: u64,
+    account_gate: &'a AccountGate,
+    book_lock: &'a BookSideLock,
+    bbo: &'a BboTicketLock,
+    completion: &'a MarketCompletion,
+    /// (side, market, price) levels that took a this-block rest and have not been FIFO-sorted since;
+    /// an inline taker drains + sorts them (by `placed_tickets`) before it matches.
+    dirty: &'a Mutex<HashSet<(u8, u64, u64)>>,
+    /// order_id -> ticket for every Place op in the batch (incl. a taker's OWN rested remainder, whose
+    /// order_id is the taker's). The FIFO sort key — order_id itself is keccak/per-caller, not ordered.
+    placed_tickets: &'a HashMap<[u8; 32], u64>,
+}
+
+/// Marks this op's `ticket` done in the market-wide [`MarketCompletion`] on EVERY exit (Ok / `?` /
+/// panic), constructed at the TOP of parallel_place/parallel_cancel BEFORE any early return (incl. the
+/// None-resolved cancel), so a later inline taker's `wait_below` can never hang on a missing signal.
+/// Drops AFTER the body, so "done" follows the body's write-through book store.
+struct MarketDoneOnDrop<'a> {
+    completion: &'a MarketCompletion,
+    market: u64,
+    ticket: u64,
+}
+
+impl Drop for MarketDoneOnDrop<'_> {
+    fn drop(&mut self) {
+        self.completion.mark_done(self.market, self.ticket);
+    }
+}
+
+/// Record that a this-block rest landed at `(side, market, price)` so the next inline taker FIFO-sorts
+/// it before matching. Idempotent (a set). Poison-tolerant.
+fn mark_dirty(dirty: &Mutex<HashSet<(u8, u64, u64)>>, side: u8, market: u64, price: u64) {
+    dirty
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((side, market, price));
+}
+
+/// On-demand FIFO sort: drain the dirty-levels set and re-sort each level's THIS-BLOCK entries by
+/// `ticket` (via `placed_tickets`), leaving prior-block entries at the front — the same restoration
+/// [`finalize_place_batch_ordering`] does, applied just-in-time before an inline taker reads the book
+/// (parallel non-mover rests append in racy arrival order; the taker must see time-priority order).
+/// Runs under the taker's held BBO ticket AFTER its completion-wait, so the levels are settled +
+/// uncontended.
+fn sort_dirty<CTX: ContextTr>(
+    ctx: &mut CTX,
+    dirty: &Mutex<HashSet<(u8, u64, u64)>>,
+    placed_tickets: &HashMap<[u8; 32], u64>,
+) -> Result<(), PrecompileError> {
+    let levels: Vec<(u8, u64, u64)> = {
+        let mut g = dirty.lock().unwrap_or_else(|p| p.into_inner());
+        g.drain().collect()
+    };
+    for (side, market, price) in levels {
+        let fifo = if side == 0 {
+            storage::load_bid_level(ctx, market, price)?
+        } else {
+            storage::load_ask_level(ctx, market, price)?
+        };
+        let mut prior: Vec<[u8; 32]> = Vec::new();
+        let mut this_block: Vec<[u8; 32]> = Vec::new();
+        for oid in &fifo {
+            if placed_tickets.contains_key(oid) {
+                this_block.push(*oid);
+            } else {
+                prior.push(*oid);
+            }
+        }
+        this_block.sort_by_key(|oid| placed_tickets[oid]);
+        prior.extend(this_block);
+        if prior != fifo {
+            if side == 0 {
+                storage::save_bid_level(ctx, market, price, &prior)?;
+            } else {
+                storage::save_ask_level(ctx, market, price, &prior)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run an INLINE taker (a crossing place) serially while the caller holds the BBO ticket: the full
+/// match body ([`place_order_core`]) under the taker's OWN account turn ONLY — NO book-side lock and
+/// NO re-entry of the BBO ticket. Exclusivity comes from the held ticket + the completion-wait (no
+/// lower op is still writing, no higher op has been served), so the match's level RMWs are
+/// uncontended. The account gate (rank monotone in ticket — [`normalize_schedule`]) advances the
+/// taker's account lane; counterparty makers are settled by the lock-free engine, attributed to this
+/// txn exactly as in serial.
+fn gated_taker<CTX: ContextTr>(
+    ctx: &mut CTX,
+    account_gate: &AccountGate,
+    work: &PlaceWork,
+) -> Result<PlaceOutcome, PrecompileError> {
+    account_gate.run(work.maker, work.rank, || {
+        let cp = ctx.journal_mut().checkpoint();
+        let r = place_order_core(
+            work.maker,
+            work.order_id,
+            work.market_id,
+            work.side,
+            work.price,
+            work.qty,
+            work.order_type,
+            work.tif,
+            work.client_order_id,
+            ctx,
+        );
+        Ok(match dispose_body(ctx, cp, r)? {
+            BodyDisposition::Committed => PlaceOutcome::Executed,
+            BodyDisposition::Reverted => PlaceOutcome::Reverted,
+        })
+    })
+}
+
+/// Run an INLINE cancel at the best price serially while holding the BBO ticket (removing it may move
+/// the BBO): [`cancel_order_core`] under the canceller's account turn ONLY — NO book lock (the held
+/// ticket + completion-wait give exclusivity), so the removal + best-refresh run serial-equivalently.
+fn gated_cancel_inline<CTX: ContextTr>(
+    ctx: &mut CTX,
+    account_gate: &AccountGate,
+    work: &CancelWork,
+) -> Result<CancelOutcome, PrecompileError> {
+    account_gate.run(work.canceller, work.rank, || {
+        let cp = ctx.journal_mut().checkpoint();
+        let r = cancel_order_core(work.canceller, work.order_id, ctx);
+        Ok(match dispose_body(ctx, cp, r)? {
+            BodyDisposition::Committed => CancelOutcome::Executed,
+            BodyDisposition::Reverted => CancelOutcome::Reverted,
+        })
+    })
+}
+
 /// Execute one parallel place (the lock-body). Classify under the BBO ticket; a mover / PostOnly
 /// cross executes under the held ticket (the account rank is waited at the place — Q3), a non-mover
 /// releases the ticket then executes under the account gate (rule 4.iii), a crossing matcher / taker
-/// is marked `Downgrade` for the serial barrier (step 3d does the re-run).
-pub fn parallel_place<CTX: ContextTr>(
+/// runs INLINE under the held ticket (step 4 — after a completion-wait + on-demand FIFO sort).
+pub(crate) fn parallel_place<CTX: ContextTr>(
     ctx: &mut CTX,
-    account_gate: &AccountGate,
-    book_lock: &BookSideLock,
-    bbo: &BboTicketLock,
-    price_completion: &PriceCompletion,
-    min_downgrade: &AtomicU64,
+    env: &BatchEnv<'_>,
     work: &PlaceWork,
 ) -> Result<PlaceOutcome, PrecompileError> {
-    // Publish this place's completion at its (limit) price on EVERY exit, so a higher-txn_id at-best
-    // cancel of a same-block order at this price (mixed batch, step 3d) sees the rest before deciding
-    // emptiness. Fires on Ok / `?` / panic, mirroring the cancel path. A place's price is always
-    // `work.price` regardless of outcome (rested / reverted / downgraded).
-    let _mark_done = MarkDoneOnDrop {
-        price_completion,
-        market: work.market_id,
-        price: work.price,
+    // Mark this ticket done in the market-wide completion watermark on EVERY exit (Ok / `?` / panic),
+    // AFTER the body — so a later inline taker's `wait_below` can never hang on a missing signal.
+    let _done = MarketDoneOnDrop {
+        completion: env.completion,
+        market: env.market,
         ticket: work.ticket,
     };
     enum UnderTicket {
         Done(Result<PlaceOutcome, PrecompileError>),
         Release,
-        Downgrade,
     }
-    let under =
-        bbo.run(work.ticket, || -> Result<UnderTicket, PrecompileError> {
-            let mut plan = match (
+    let under = env
+        .bbo
+        .run(work.ticket, || -> Result<UnderTicket, PrecompileError> {
+            let plan = match (
                 Side::from_u8(work.side),
                 OrderType::from_u8(work.order_type),
                 TimeInForce::from_u8(work.tif),
@@ -410,41 +541,39 @@ pub fn parallel_place<CTX: ContextTr>(
                 // Unparseable order fields → let the body reject it under the ticket.
                 _ => LockPlan::RejectInBody,
             };
-            // Taker contagion: a lower-txn_id taker downgrade in this market forces THIS op to the barrier
-            // too (a barrier taker re-running against the post-parallel book must not match liquidity that
-            // higher-txn_id parallel rests added — in serial those don't exist yet). Classification runs
-            // under the BBO ticket (txn_id order), so the first taker's ticket is the deterministic floor.
-            if min_downgrade.load(Ordering::SeqCst) < work.ticket {
-                plan = LockPlan::DowngradeToBarrier;
-            }
-            // A taker downgrade (crossing / Market / IOC / FOK — NOT a PostOnly self-reject) lowers the
-            // floor for higher tickets. fetch_min is a no-op for a forced (higher-ticket) downgrade.
-            if matches!(plan, LockPlan::DowngradeToBarrier) {
-                min_downgrade.fetch_min(work.ticket, Ordering::SeqCst);
-            }
             match plan {
-                LockPlan::DowngradeToBarrier => Ok(UnderTicket::Downgrade),
-                // A mover (or a PostOnly-cross self-reject) executes while still holding the BBO ticket so
-                // its best-update is serialized; the body itself takes the book-side lock.
-                LockPlan::HoldTicket | LockPlan::RejectInBody => Ok(UnderTicket::Done(
-                    gated_execute(ctx, account_gate, book_lock, work),
-                )),
+                // A crossing matcher / taker (GTC-cross / Market / IOC / FOK) runs INLINE under the
+                // held BBO ticket (step 4 — replaces the deferred barrier + contagion): wait until every
+                // lower-txn_id op's book write has landed (the serial book state at this ticket), then
+                // FIFO-sort the parallel rests it may sweep, then match. No higher ticket has been served
+                // (BBO cursor), no lower op is still writing → the match's level RMWs are uncontended.
+                LockPlan::DowngradeToBarrier => {
+                    env.completion.wait_below(env.market, work.ticket);
+                    sort_dirty(ctx, env.dirty, env.placed_tickets)?;
+                    Ok(UnderTicket::Done(gated_taker(ctx, env.account_gate, work)))
+                }
+                // A mover (or a PostOnly-cross self-reject) executes while holding the BBO ticket so its
+                // best-update is serialized; the body itself takes the book-side lock.
+                LockPlan::HoldTicket | LockPlan::RejectInBody => Ok(UnderTicket::Done(gated_execute(
+                    ctx,
+                    env.account_gate,
+                    env.book_lock,
+                    work,
+                ))),
                 LockPlan::ReleaseTicket => Ok(UnderTicket::Release),
             }
         })?;
-    match under {
+    let outcome = match under {
         UnderTicket::Done(r) => r,
-        UnderTicket::Downgrade => {
-            // Deferred to the barrier, but still CONSUME this maker's account rank (empty body) — a
-            // higher-rank same-account parallel op waits on the AccountGate and would hang otherwise.
-            // The actual effect runs at the serial barrier (in txn_id order). Mirrors the BBO-ticket
-            // pass-through for None-resolved cancels.
-            account_gate.run(work.maker, work.rank, || ());
-            Ok(PlaceOutcome::Downgrade)
-        }
         // Ticket released (non-mover); rest under the account gate + book-side lock, in parallel.
-        UnderTicket::Release => gated_execute(ctx, account_gate, book_lock, work),
+        UnderTicket::Release => gated_execute(ctx, env.account_gate, env.book_lock, work),
+    };
+    // A rest (mover / non-mover / a taker's partial-fill remainder) landed at `work.price` → mark the
+    // level dirty so the next inline taker FIFO-sorts it before matching. Idempotent on no-rest.
+    if matches!(outcome, Ok(PlaceOutcome::Executed)) {
+        mark_dirty(env.dirty, work.side, work.market_id, work.price);
     }
+    outcome
 }
 
 /// Run a batch of parallel-eligible places concurrently against ONE shared book, gated by the
@@ -465,13 +594,24 @@ where
     CTX: ContextTr,
     F: Fn(Arc<SharedPerpBook>) -> CTX + Sync,
 {
-    // Place-only batch: no at-best cancel waits on these, but places still mark_done (harmlessly) so
-    // the same primitive serves the unified mixed batch (step 3d) unchanged. A fresh per-batch
-    // contagion floor (no taker means no forcing → unchanged behavior for non-crossing batches).
-    let price_completion = PriceCompletion::new();
-    let min_downgrade = AtomicU64::new(u64::MAX);
-    let (make_ctx, price_completion, min_downgrade) =
-        (&make_ctx, &price_completion, &min_downgrade);
+    // Build the inline-taker batch state internally so the external signature (used by tests) is
+    // unchanged: a fresh per-market completion watermark, dirty-levels set, and {order_id->ticket} map
+    // for this place-only batch. `market` = the items' (single) market.
+    let completion = MarketCompletion::new();
+    let dirty = Mutex::new(HashSet::new());
+    let placed_tickets: HashMap<[u8; 32], u64> =
+        items.iter().map(|w| (w.order_id, w.ticket)).collect();
+    let market = items.first().map(|w| w.market_id).unwrap_or(0);
+    let env = BatchEnv {
+        market,
+        account_gate,
+        book_lock,
+        bbo,
+        completion: &completion,
+        dirty: &dirty,
+        placed_tickets: &placed_tickets,
+    };
+    let (make_ctx, env) = (&make_ctx, &env);
     thread::scope(|s| {
         let handles: Vec<_> = items
             .iter()
@@ -479,15 +619,7 @@ where
                 let book = book.clone();
                 s.spawn(move || {
                     let mut ctx = make_ctx(book);
-                    parallel_place(
-                        &mut ctx,
-                        account_gate,
-                        book_lock,
-                        bbo,
-                        price_completion,
-                        min_downgrade,
-                        item,
-                    )
+                    parallel_place(&mut ctx, env, item)
                 })
             })
             .collect();
@@ -585,26 +717,13 @@ pub enum CancelOutcome {
     Downgrade,
 }
 
-/// Resolved + scheduled cancel produced by the pre-scan: the order's `(market, side, price)` plus the
-/// tickets of all lower-txn_id ops at the SAME `(market, price)` this cancel must wait for before it
-/// can decide emptiness. `resolved == None` means the order was not loadable (→ the body will revert).
+/// Resolved cancel produced by the pre-scan: the order's `(market, side, price)`. `resolved == None`
+/// means the order was not loadable (→ the body reverts). (#21 step-4: the inline-taker driver's
+/// market-wide completion-wait replaced the per-(market,price) `required` wait set.)
 #[derive(Debug, Clone)]
 struct CancelPlanItem {
     work: CancelWork,
     resolved: Option<(u64, u8, u64)>,
-    required: Vec<u64>,
-}
-
-fn load_level<CTX: ContextTr>(
-    ctx: &mut CTX,
-    market: u64,
-    side: Side,
-    price: u64,
-) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    match side {
-        Side::Buy => storage::load_bid_level(ctx, market, price),
-        Side::Sell => storage::load_ask_level(ctx, market, price),
-    }
 }
 
 /// Run `cancel_order_core` under the canceller's account turn + the order side's book lock, inside a
@@ -632,65 +751,32 @@ fn gated_cancel<CTX: ContextTr>(
     })
 }
 
-/// RAII guard that publishes a cancel's completion at its price on EVERY exit — `Ok`, an early `?`
-/// return (storage error / a future `Fatal`), or a panic. A best-price cancel's [`PriceCompletion`]
-/// wait only resolves once each lower-txn_id op at its price is marked done; if a marker could skip
-/// `mark_done` on an error path the waiter would hang forever (block-wide), so this mirrors the
-/// advance-on-drop discipline of `AccountGate`/`BboTicketLock`.
-struct MarkDoneOnDrop<'a> {
-    price_completion: &'a PriceCompletion,
-    market: u64,
-    price: u64,
-    ticket: u64,
-}
-
-impl Drop for MarkDoneOnDrop<'_> {
-    fn drop(&mut self) {
-        self.price_completion
-            .mark_done(self.market, self.price, self.ticket);
-    }
-}
-
-/// Execute one parallel cancel. Classifies (and, for at-best, decides emptiness) WHILE HOLDING the
-/// BBO ticket: below-best → remove in parallel; at-best → wait for all lower-txn_id same-price ops
-/// ([`PriceCompletion::wait_for`]) so the level is settled, then if removing it would EMPTY the best
-/// level (→ moves the BBO) it sets the contagion floor like a taker and downgrades to the serial
-/// barrier, else it releases the ticket and removes in parallel. Holding the ticket through the
-/// decision guarantees the floor (when set) is seen by every higher-txn_id op, so the deferred tail —
-/// including the same maker's later margin-touching ops — re-runs serial-equivalently at the barrier
-/// (no same-maker op observes the cancel's not-yet-released margin). Every op marks its price done so
-/// higher same-price cancels' waits resolve.
+/// Execute one parallel cancel. Classifies under the BBO ticket: below-best → remove in parallel
+/// (cannot move the BBO); a NON-owner at-best cancel reverts touching nothing → also parallel (3d-7:
+/// a griefer must not serialize the block); an OWNER at-best cancel may EMPTY the level (move the BBO)
+/// → run INLINE under the held ticket (step 4 — replaces the deferred barrier): wait until every
+/// lower-txn_id op's book write has landed, then remove + refresh best, serial-equivalently. The
+/// outermost [`MarketDoneOnDrop`] marks this ticket done on EVERY exit (incl. the None-resolved
+/// early return), so a later inline taker's `wait_below` can never hang.
 fn parallel_cancel<CTX: ContextTr>(
     ctx: &mut CTX,
-    account_gate: &AccountGate,
-    book_lock: &BookSideLock,
-    bbo: &BboTicketLock,
-    price_completion: &PriceCompletion,
-    min_downgrade: &AtomicU64,
+    env: &BatchEnv<'_>,
     plan: &CancelPlanItem,
 ) -> Result<CancelOutcome, PrecompileError> {
+    // Mark this ticket done on EVERY exit (incl. the None branch below, BEFORE it returns). Keyed by
+    // the batch market — a None-resolved cancel has no resolved market of its own.
+    let _done = MarketDoneOnDrop {
+        completion: env.completion,
+        market: env.market,
+        ticket: plan.work.ticket,
+    };
     let (market, side_u8, price) = match plan.resolved {
         Some(t) => t,
-        // Order not loadable → the body reverts (missing order) without touching any level, so it
-        // needs no book lock and no price-completion bookkeeping (no waiter can name a None op's
-        // ticket — `plan_cancel_batch` only adds Some-resolved tickets to a `required` set). It MUST
-        // still consume its BBO ticket, or the serve cursor wedges and every higher ticket hangs.
+        // Order not loadable → revert (missing order), touching no level → no book lock, no wait. Still
+        // takes its BBO ticket turn (empty body) so the serve cursor advances; the guard marks done.
         None => {
-            // Honor the contagion floor here too: if a lower-txn_id op downgraded, this op is ABOVE
-            // the floor and must defer as well. Without this it is the ONLY path that can `Executed`/
-            // `Reverted` above the floor, breaking the driver's contiguous-downgrade-suffix invariant
-            // (a debug_assert trip + a needless re-dispatch). Read the floor UNDER the BBO ticket so a
-            // lower ticket's floor is visible; on a downgrade CONSUME the account rank (empty body)
-            // like every other deferral. Value-neutral — a None cancel is a no-op revert whether it
-            // runs here or re-runs at the barrier — but the driver relies on the invariant.
-            let forced = bbo.run(plan.work.ticket, || {
-                min_downgrade.load(Ordering::SeqCst) < plan.work.ticket
-            });
-            if forced {
-                account_gate.run(plan.work.canceller, plan.work.rank, || ());
-                return Ok(CancelOutcome::Downgrade);
-            }
-            return account_gate.run(plan.work.canceller, plan.work.rank, || {
+            env.bbo.run(plan.work.ticket, || ());
+            return env.account_gate.run(plan.work.canceller, plan.work.rank, || {
                 let cp = ctx.journal_mut().checkpoint();
                 let r = cancel_order_core(plan.work.canceller, plan.work.order_id, ctx);
                 Ok(match dispose_body(ctx, cp, r)? {
@@ -702,88 +788,50 @@ fn parallel_cancel<CTX: ContextTr>(
     };
     let side = Side::from_u8(side_u8).expect("pre-scan resolved a valid side");
 
-    // Publish this op's completion at its price on EVERY exit (incl. the `?` paths below), so higher
-    // same-price cancels' waits always resolve. Fires on drop AFTER the body's book write has landed.
-    let _mark_done = MarkDoneOnDrop {
-        price_completion,
-        market,
-        price,
-        ticket: plan.work.ticket,
-    };
-
-    // 1. Classify + (for at-best) decide emptiness, all WHILE HOLDING the BBO ticket. Holding it
-    //    means no higher-txn_id op classifies until this decision is made, so when an emptying cancel
-    //    sets the contagion floor, every higher op is guaranteed to see it (→ forced to the barrier).
-    //    The taker-contagion floor check comes first; then below-best (parallel) vs at-best. For
-    //    at-best we wait for all lower-txn_id same-price ops to settle the level (a lower-txn_id
-    //    downgrade would have set the floor and forced THIS op above, so reaching here means every
-    //    lower same-price op executed — its effect is applied, not deferred), then check emptiness.
-    enum TicketDecision {
-        Downgrade,
+    enum Flow {
+        Done(Result<CancelOutcome, PrecompileError>),
         RunParallel,
     }
-    let decision = bbo.run(
-        plan.work.ticket,
-        || -> Result<TicketDecision, PrecompileError> {
-            // Forced by a lower-txn_id taker / emptying cancel (every downgrade sets the floor).
-            if min_downgrade.load(Ordering::SeqCst) < plan.work.ticket {
-                return Ok(TicketDecision::Downgrade);
-            }
+    // Classify under the BBO ticket. Below-best → parallel removal. At-best non-owner → parallel
+    // (reverts, BBO unchanged — 3d-7). At-best owner → may move the BBO → INLINE: wait for every
+    // lower-txn_id op to apply, then remove + refresh best under the held ticket. (An owner at-best
+    // cancel that does NOT empty the level also runs inline — a minor over-serialization vs a parallel
+    // removal; deferred perf TODO. Ownership is fixed, so it is checked without waiting.)
+    let flow = env
+        .bbo
+        .run(plan.work.ticket, || -> Result<Flow, PrecompileError> {
             let best_bid = storage::load_best_bid(ctx, market)?;
             let best_ask = storage::load_best_ask(ctx, market)?;
             if !cancel_at_best(side, price, best_bid, best_ask) {
-                // Below best → cannot move the BBO → remove in parallel.
-                return Ok(TicketDecision::RunParallel);
+                return Ok(Flow::RunParallel);
             }
-            // At best: still holding the ticket, wait for lower-txn_id same-price ops, then decide.
-            price_completion.wait_for(market, price, &plan.required);
-            let level =
-                book_lock.run(market, side_u8, price, || load_level(ctx, market, side, price))?;
-            let present = level.iter().any(|id| id == &plan.work.order_id);
-            let others_remain = level.iter().any(|id| id != &plan.work.order_id);
-            if present && !others_remain {
-                // Sole order at the best level → removing it MOVES the BBO. But only an OWNER's cancel
-                // actually removes it: a non-owner cancel reverts ("not owner") at the body, touching
-                // nothing. So only an owner-cancel is treated like a taker — set the contagion floor
-                // (forces every higher-txn_id op to the barrier, so the same maker's later
-                // margin-touching ops run AFTER this cancel's deferred margin release) and downgrade;
-                // the serial barrier re-runs the removal in txn_id order. A NON-owner sole-best cancel
-                // does NOT set the floor (else a griefer cancelling someone's sole-best order would
-                // needlessly force the whole tail serial); it runs in parallel and reverts harmlessly,
-                // byte-identical to serial. (3d-7 fix — owner read locally, no pre-scan plumbing.)
-                let is_owner = storage::load_order(ctx, &plan.work.order_id)?
-                    .map(|o| o.owner == plan.work.canceller.0 .0)
-                    .unwrap_or(false);
-                if is_owner {
-                    min_downgrade.fetch_min(plan.work.ticket, Ordering::SeqCst);
-                    Ok(TicketDecision::Downgrade)
-                } else {
-                    Ok(TicketDecision::RunParallel)
-                }
-            } else {
-                // Others remain (or the order is already gone) → BBO unchanged → remove in parallel.
-                Ok(TicketDecision::RunParallel)
+            let is_owner = storage::load_order(ctx, &plan.work.order_id)?
+                .map(|o| o.owner == plan.work.canceller.0 .0)
+                .unwrap_or(false);
+            if !is_owner {
+                return Ok(Flow::RunParallel);
             }
-        },
-    )?;
-
-    let outcome = match decision {
-        // Forced or emptying → deferred to the barrier; leave the book untouched. Still CONSUME the
-        // account rank (empty body) for the dense consume-once contract.
-        TicketDecision::Downgrade => {
-            account_gate.run(plan.work.canceller, plan.work.rank, || ());
-            CancelOutcome::Downgrade
-        }
-        // Below best, or at-best non-emptying → ticket released; remove under the account gate +
-        // book-side lock, in parallel. `remove_from_book_after_cancel` detaches without emptying the
-        // top level → no best refresh → safe.
-        TicketDecision::RunParallel => {
-            gated_cancel(ctx, account_gate, book_lock, &plan.work, market, side_u8, price)?
-        }
-    };
-
-    // `_mark_done` fires here on drop (or earlier on any `?`/panic), publishing this op at its price.
-    Ok(outcome)
+            env.completion.wait_below(env.market, plan.work.ticket);
+            Ok(Flow::Done(gated_cancel_inline(
+                ctx,
+                env.account_gate,
+                &plan.work,
+            )))
+        })?;
+    match flow {
+        Flow::Done(r) => r,
+        // Below best, or at-best non-owner → ticket released; remove under the account gate +
+        // book-side lock, in parallel.
+        Flow::RunParallel => gated_cancel(
+            ctx,
+            env.account_gate,
+            env.book_lock,
+            &plan.work,
+            market,
+            side_u8,
+            price,
+        ),
+    }
 }
 
 /// Pre-scan (serial, before the parallel phase): resolve each cancel's order to `(market, side,
@@ -813,24 +861,9 @@ where
     items
         .iter()
         .enumerate()
-        .map(|(i, w)| {
-            let required = match resolved[i] {
-                Some((m, _s, p)) => items
-                    .iter()
-                    .zip(&resolved)
-                    .filter(|(w2, r2)| {
-                        w2.ticket < w.ticket
-                            && matches!(r2, Some((m2, _, p2)) if *m2 == m && *p2 == p)
-                    })
-                    .map(|(w2, _)| w2.ticket)
-                    .collect(),
-                None => Vec::new(),
-            };
-            CancelPlanItem {
-                work: w.clone(),
-                resolved: resolved[i],
-                required,
-            }
+        .map(|(i, w)| CancelPlanItem {
+            work: w.clone(),
+            resolved: resolved[i],
         })
         .collect()
 }
@@ -853,10 +886,25 @@ where
     F: Fn(Arc<SharedPerpBook>) -> CTX + Sync,
 {
     let plans = plan_cancel_batch(book, items, &make_ctx);
-    let price_completion = PriceCompletion::new();
-    let min_downgrade = AtomicU64::new(u64::MAX);
-    let (make_ctx, plans, price_completion, min_downgrade) =
-        (&make_ctx, &plans, &price_completion, &min_downgrade);
+    // Cancel-only batch: build the inline-taker batch state internally (external signature unchanged).
+    // No places → empty `placed_tickets`/`dirty`; `market` = the first resolvable cancel's market.
+    let completion = MarketCompletion::new();
+    let dirty = Mutex::new(HashSet::new());
+    let placed_tickets: HashMap<[u8; 32], u64> = HashMap::new();
+    let market = plans
+        .iter()
+        .find_map(|p| p.resolved.map(|(m, _, _)| m))
+        .unwrap_or(0);
+    let env = BatchEnv {
+        market,
+        account_gate,
+        book_lock,
+        bbo,
+        completion: &completion,
+        dirty: &dirty,
+        placed_tickets: &placed_tickets,
+    };
+    let (make_ctx, plans, env) = (&make_ctx, &plans, &env);
     thread::scope(|s| {
         let handles: Vec<_> = plans
             .iter()
@@ -864,15 +912,7 @@ where
                 let book = book.clone();
                 s.spawn(move || {
                     let mut ctx = make_ctx(book);
-                    parallel_cancel(
-                        &mut ctx,
-                        account_gate,
-                        book_lock,
-                        bbo,
-                        price_completion,
-                        min_downgrade,
-                        plan,
-                    )
+                    parallel_cancel(&mut ctx, env, plan)
                 })
             })
             .collect();
@@ -1060,34 +1100,14 @@ where
         })
         .collect();
 
-    let ticket = |op: &PerpOp| match op {
-        PerpOp::Place(w) => w.ticket,
-        PerpOp::Cancel(w) => w.ticket,
-    };
-
     ops.iter()
         .enumerate()
         .map(|(i, op)| match op {
             PerpOp::Place(w) => PreparedOp::Place(w.clone()),
-            PerpOp::Cancel(w) => {
-                let required = match resolved[i] {
-                    Some((m, _s, p)) => ops
-                        .iter()
-                        .zip(&resolved)
-                        .filter(|(o2, r2)| {
-                            ticket(o2) < w.ticket
-                                && matches!(r2, Some((m2, _, p2)) if *m2 == m && *p2 == p)
-                        })
-                        .map(|(o2, _)| ticket(o2))
-                        .collect(),
-                    None => Vec::new(),
-                };
-                PreparedOp::Cancel(CancelPlanItem {
-                    work: w.clone(),
-                    resolved: resolved[i],
-                    required,
-                })
-            }
+            PerpOp::Cancel(w) => PreparedOp::Cancel(CancelPlanItem {
+                work: w.clone(),
+                resolved: resolved[i],
+            }),
         })
         .collect()
 }
@@ -1163,117 +1183,112 @@ where
     CTX: ContextTr,
     F: Fn(Arc<SharedPerpBook>) -> CTX + Clone + Send + 'static,
 {
-    let mut final_results: Vec<OpReplay> = Vec::with_capacity(ops.len());
+    // ONE pass (step 4 — replaces the segmented re-dispatch): normalize to global dense tickets +
+    // per-maker ranks + pre-scan ONCE, then ONE parallel batch. Inline takers execute under the held
+    // BBO ticket (no downgrade), so nothing is deferred / re-dispatched and the gates + plan are built
+    // exactly once. Each op is served + classified + executed exactly once → O(n) (no per-taker tail
+    // re-march/re-plan).
+    let ops = normalize_schedule(ops);
+    let prepared = plan_block(book, &ops, &make_ctx);
+
     let mut markets_touched = std::collections::BTreeSet::new();
-    let mut start = 0usize;
-
-    while start < ops.len() {
-        // Re-normalize THIS segment → dense segment-local tickets + per-maker ranks (a fresh gate
-        // domain each segment), then pre-scan it.
-        let seg_ops = normalize_schedule(&ops[start..]);
-        let prepared = plan_block(book, &seg_ops, &make_ctx);
-        for p in &prepared {
-            match p {
-                PreparedOp::Place(w) => {
-                    markets_touched.insert(w.market_id);
-                }
-                PreparedOp::Cancel(c) => {
-                    if let Some((m, _, _)) = c.resolved {
-                        markets_touched.insert(m);
-                    }
+    for p in &prepared {
+        match p {
+            PreparedOp::Place(w) => {
+                markets_touched.insert(w.market_id);
+            }
+            PreparedOp::Cancel(c) => {
+                if let Some((m, _, _)) = c.resolved {
+                    markets_touched.insert(m);
                 }
             }
         }
+    }
 
-        // Fresh per-segment gates + contagion floor.
-        let account_gate = Arc::new(AccountGate::new());
-        let book_lock = Arc::new(BookSideLock::new());
-        let bbo = Arc::new(BboTicketLock::new());
-        let price_completion = Arc::new(PriceCompletion::new());
-        let min_downgrade = Arc::new(AtomicU64::new(u64::MAX));
+    // The single market this batch operates on (spike scope) — also the completion key for a
+    // None-resolved cancel (which has no market of its own). 0 if the block is all-unresolvable
+    // cancels (then nothing waits on the completion).
+    let market = prepared
+        .iter()
+        .find_map(|p| match p {
+            PreparedOp::Place(w) => Some(w.market_id),
+            PreparedOp::Cancel(c) => c.resolved.map(|(m, _, _)| m),
+        })
+        .unwrap_or(0);
 
-        // Phase 2: parallel batch on the persistent FIFO pool (deadlock-free: strict FIFO + the
-        // scheme's wait-edges-point-lower invariant — see PerpPool docs). Jobs are 'static (Arc'd
-        // gates/book + cloned make_ctx); each builds its own thread-local slot ctx.
-        let seg_results: Vec<OpReplay> = {
-            let tasks: Vec<_> = prepared
-                .iter()
-                .map(|p| {
-                    let p = p.clone();
-                    let book = book.clone();
-                    let make_ctx = make_ctx.clone();
-                    let ag = account_gate.clone();
-                    let bl = book_lock.clone();
-                    let bbo = bbo.clone();
-                    let pc = price_completion.clone();
-                    let md = min_downgrade.clone();
-                    move || -> Result<OpReplay, PrecompileError> {
-                        let mut ctx = make_ctx(book);
-                        let result = match &p {
-                            PreparedOp::Place(w) => OpResult::Place(parallel_place(
-                                &mut ctx, &ag, &bl, &bbo, &pc, &md, w,
-                            )?),
-                            PreparedOp::Cancel(plan) => OpResult::Cancel(parallel_cancel(
-                                &mut ctx, &ag, &bl, &bbo, &pc, &md, plan,
-                            )?),
-                        };
-                        // Drain THIS op's emitted logs from its (fresh, single-op) slot ctx — empty for
-                        // a downgraded op (body deferred to the barrier) or a reverted op (logs rolled
-                        // back). Re-emitted verbatim on replay so the canonical receipts match serial.
-                        let logs = ctx.journal_mut().take_logs();
-                        Ok(OpReplay { result, logs })
-                    }
-                })
-                .collect();
-            pool.run_batch(tasks)
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?
-        };
+    // Gates + inline-taker machinery, built ONCE; Arc'd so the pool's 'static jobs can share them.
+    // `placed_tickets` ({order_id -> ticket} for every place, incl. a taker's own remainder) is the
+    // on-demand FIFO sort key; `dirty` tracks levels needing that sort; `completion` is the per-market
+    // watermark inline takers / emptying cancels wait on.
+    let placed_tickets: HashMap<[u8; 32], u64> = prepared
+        .iter()
+        .filter_map(|p| match p {
+            PreparedOp::Place(w) => Some((w.order_id, w.ticket)),
+            PreparedOp::Cancel(_) => None,
+        })
+        .collect();
+    let shared = Arc::new((
+        AccountGate::new(),
+        BookSideLock::new(),
+        BboTicketLock::new(),
+        MarketCompletion::new(),
+        Mutex::new(HashSet::<(u8, u64, u64)>::new()),
+        placed_tickets,
+    ));
 
-        // Phase 3a: FIFO-sort THIS segment's parallel rests before any serial op reads a level. Keeps
-        // prior level order + appends this segment's rests sorted by (segment-local = global-within-
-        // segment) ticket, so the level stays globally FIFO across segments.
-        {
-            let mut place_items: Vec<PlaceWork> = Vec::new();
-            let mut place_results: Vec<Result<PlaceOutcome, PrecompileError>> = Vec::new();
-            for (op, r) in seg_ops.iter().zip(&seg_results) {
-                if let (PerpOp::Place(w), OpResult::Place(o)) = (op, &r.result) {
-                    place_items.push(w.clone());
-                    place_results.push(Ok(*o));
+    let final_results: Vec<OpReplay> = {
+        let tasks: Vec<_> = prepared
+            .iter()
+            .map(|p| {
+                let p = p.clone();
+                let book = book.clone();
+                let make_ctx = make_ctx.clone();
+                let shared = shared.clone();
+                move || -> Result<OpReplay, PrecompileError> {
+                    let (account_gate, book_lock, bbo, completion, dirty, placed_tickets) = &*shared;
+                    let env = BatchEnv {
+                        market,
+                        account_gate,
+                        book_lock,
+                        bbo,
+                        completion,
+                        dirty,
+                        placed_tickets,
+                    };
+                    let mut ctx = make_ctx(book);
+                    let result = match &p {
+                        PreparedOp::Place(w) => {
+                            OpResult::Place(parallel_place(&mut ctx, &env, w)?)
+                        }
+                        PreparedOp::Cancel(plan) => {
+                            OpResult::Cancel(parallel_cancel(&mut ctx, &env, plan)?)
+                        }
+                    };
+                    // Drain THIS op's emitted logs from its slot ctx (empty for a reverted op — logs
+                    // rolled back). Re-emitted verbatim on replay so canonical receipts match serial.
+                    let logs = ctx.journal_mut().take_logs();
+                    Ok(OpReplay { result, logs })
                 }
+            })
+            .collect();
+        pool.run_batch(tasks)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    // FIFO-sort the FINAL book: inline takers sorted (via `dirty`) the levels they swept just-in-time,
+    // but rests after the last taker — and levels no taker ever read — may still hold racy arrival
+    // order; restore time-priority for the next block / view reads. Idempotent (sorted levels skip).
+    {
+        let mut place_items: Vec<PlaceWork> = Vec::new();
+        let mut place_results: Vec<Result<PlaceOutcome, PrecompileError>> = Vec::new();
+        for (op, r) in ops.iter().zip(&final_results) {
+            if let (PerpOp::Place(w), OpResult::Place(o)) = (op, &r.result) {
+                place_items.push(w.clone());
+                place_results.push(Ok(*o));
             }
-            finalize_place_batch_ordering(book, &place_items, &place_results, &make_ctx)?;
         }
-
-        // The contagion floor downgrades a CONTIGUOUS suffix (every op classifies under the BBO ticket
-        // after the floor was set, so it sees the floor and downgrades); everything before it executed.
-        let first_dg = seg_results.iter().position(|r| {
-            matches!(
-                r.result,
-                OpResult::Place(PlaceOutcome::Downgrade) | OpResult::Cancel(CancelOutcome::Downgrade)
-            )
-        });
-
-        let Some(dg) = first_dg else {
-            // No serial op this segment → the whole remaining tail executed in parallel. Done.
-            final_results.extend(seg_results);
-            break;
-        };
-        debug_assert!(
-            seg_results[dg..].iter().all(|r| matches!(
-                r.result,
-                OpResult::Place(PlaceOutcome::Downgrade) | OpResult::Cancel(CancelOutcome::Downgrade)
-            )),
-            "the contagion floor must downgrade a contiguous suffix"
-        );
-
-        // Record the parallel-executed prefix, then run the floor op SERIALLY in place against the
-        // FIFO-sorted book.
-        final_results.extend(seg_results.into_iter().take(dg));
-        final_results.push(run_barrier_op(&seg_ops[dg], book, &make_ctx)?);
-
-        // Re-dispatch the strictly-higher tail (all downgraded → never executed → safe to re-run).
-        start += dg + 1;
+        finalize_place_batch_ordering(book, &place_items, &place_results, &make_ctx)?;
     }
 
     // Block-end order-independent mid sample (D3-b) for every market the block touched.
@@ -1364,56 +1379,6 @@ where
         crate::perp_dex::risk::finalize_block_mid_sample(&mut ctx, m)?;
     }
     Ok(out)
-}
-
-/// Run one downgraded op (a segment's contagion floor) SERIALLY against the shared book on a FRESH ctx
-/// — full matching body for a place, removal for a cancel — disposed via [`dispose_body`] (commit on
-/// Ok, propagate Fatal). A fresh ctx per call sidesteps any cross-segment read-cache staleness. The
-/// ctx's `perp_is_parallel` stays true so in-body mid sampling is skipped; the driver's block-end
-/// sample records the deterministic final mid.
-fn run_barrier_op<CTX, F>(
-    op: &PerpOp,
-    book: &Arc<SharedPerpBook>,
-    make_ctx: &F,
-) -> Result<OpReplay, PrecompileError>
-where
-    CTX: ContextTr,
-    F: Fn(Arc<SharedPerpBook>) -> CTX,
-{
-    let mut ctx = make_ctx(book.clone());
-    let result = match op {
-        PerpOp::Place(w) => {
-            let cp = ctx.journal_mut().checkpoint();
-            let res = place_order_core(
-                w.maker,
-                w.order_id,
-                w.market_id,
-                w.side,
-                w.price,
-                w.qty,
-                w.order_type,
-                w.tif,
-                w.client_order_id,
-                &mut ctx,
-            );
-            OpResult::Place(match dispose_body(&mut ctx, cp, res)? {
-                BodyDisposition::Committed => PlaceOutcome::Executed,
-                BodyDisposition::Reverted => PlaceOutcome::Reverted,
-            })
-        }
-        PerpOp::Cancel(w) => {
-            let cp = ctx.journal_mut().checkpoint();
-            let res = cancel_order_core(w.canceller, w.order_id, &mut ctx);
-            OpResult::Cancel(match dispose_body(&mut ctx, cp, res)? {
-                BodyDisposition::Committed => CancelOutcome::Executed,
-                BodyDisposition::Reverted => CancelOutcome::Reverted,
-            })
-        }
-    };
-    // Drain the floor op's emitted logs (the taker's Trade/OrderRested/PositionChanged, etc.) from its
-    // fresh ctx before it drops — re-emitted on replay so the canonical receipt carries them.
-    let logs = ctx.journal_mut().take_logs();
-    Ok(OpReplay { result, logs })
 }
 
 #[cfg(test)]
@@ -1550,18 +1515,30 @@ mod driver_tests {
         assert_eq!(serial_delta, parallel_delta);
     }
 
-    /// A taker TIF (IOC) is downgraded to the barrier without touching the book — and without
-    /// needing a seeded market/account (classify decides before the body runs).
+    /// A taker TIF (IOC) now runs INLINE under the held BBO ticket (step 4 — the deferred-barrier
+    /// downgrade is gone): it completion-waits (trivially, ticket 0), then matches. It must NOT return
+    /// `Downgrade` (that path no longer exists). With ticket 0 the inline `wait_below(.., 0)` returns
+    /// immediately, so a single-op batch never hangs.
     #[test]
-    fn parallel_place_taker_tif_downgrades_without_book_writes() {
+    fn parallel_place_taker_runs_inline_never_downgrades() {
         let book = Arc::new(SharedPerpBook::new());
         let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
         ctx.journal_mut().set_perp_shared(book.clone());
         let gate = AccountGate::new();
         let book_lock = BookSideLock::new();
         let bbo = BboTicketLock::new();
-        let pc = PriceCompletion::new();
-        let md = AtomicU64::new(u64::MAX);
+        let completion = MarketCompletion::new();
+        let dirty = Mutex::new(HashSet::new());
+        let placed_tickets = HashMap::new();
+        let env = BatchEnv {
+            market: 1,
+            account_gate: &gate,
+            book_lock: &book_lock,
+            bbo: &bbo,
+            completion: &completion,
+            dirty: &dirty,
+            placed_tickets: &placed_tickets,
+        };
 
         let work = PlaceWork {
             maker: address!("1111111111111111111111111111111111111111"),
@@ -1571,17 +1548,17 @@ mod driver_tests {
             price: 100,
             qty: 1,
             order_type: 0, // Limit
-            tif: 1,        // IOC → taker → downgrade
+            tif: 1,        // IOC → taker → inline
             client_order_id: [0u8; 16],
             rank: 0,
             ticket: 0,
         };
 
-        let out = parallel_place(&mut ctx, &gate, &book_lock, &bbo, &pc, &md, &work).unwrap();
-        assert_eq!(out, PlaceOutcome::Downgrade);
-        assert!(
-            book.take_delta().is_empty(),
-            "a downgrade must write nothing to the book"
+        let out = parallel_place(&mut ctx, &env, &work).unwrap();
+        assert_ne!(
+            out,
+            PlaceOutcome::Downgrade,
+            "takers run inline now and never downgrade"
         );
     }
 
@@ -1838,24 +1815,25 @@ mod driver_tests {
         assert_eq!(s, p);
     }
 
-    /// An at-best cancel that is the SOLE order at the best level → removing it would move the BBO →
-    /// `Downgrade` (deferred to the serial barrier), writing NOTHING in the parallel phase. Proven by
-    /// comparing the book delta with vs without the cancel batch: identical → the cancel wrote nothing.
+    /// An at-best OWNER cancel that is the SOLE order at the best level now runs INLINE under the held
+    /// BBO ticket (step 4 — the deferred-barrier downgrade is gone): it removes the order + refreshes
+    /// best in place. Proven byte-identical to a SERIAL cancel of the same order (outcome + book delta).
     #[test]
-    fn parallel_cancel_sole_best_order_downgrades() {
+    fn parallel_cancel_sole_best_order_runs_inline_matches_serial() {
         let a = user_addr(1);
         let x = oid(10);
 
-        // Reference book: setup place only.
+        // Reference: place X, then cancel X SERIALLY (the engine's own entrypoint).
         let ref_book = Arc::new(SharedPerpBook::new());
         {
             let mut s = make_slot(ref_book.clone());
             seed(&mut s, &[a]);
             rest(&mut s, a, x, 100 * TICK);
+            cancel_order_core(a, x, &mut s).unwrap();
         }
         let ref_delta = ref_book.take_delta();
 
-        // Subject book: same setup, then a cancel batch that must downgrade (X is the sole best order).
+        // Subject: place X, then cancel X via the parallel batch (an inline at-best owner cancel).
         let book = Arc::new(SharedPerpBook::new());
         {
             let mut s = make_slot(book.clone());
@@ -1867,12 +1845,12 @@ mod driver_tests {
         let book_lock = BookSideLock::new();
         let bbo = BboTicketLock::new();
         let results = run_cancel_batch(&book, &gate, &book_lock, &bbo, &cancels, make_slot);
-        assert_eq!(results[0].as_ref().unwrap(), &CancelOutcome::Downgrade);
+        assert_eq!(results[0].as_ref().unwrap(), &CancelOutcome::Executed);
 
         let subject_delta = book.take_delta();
         assert_eq!(
             ref_delta, subject_delta,
-            "a downgraded cancel must not write to the book in the parallel phase"
+            "an inline at-best owner cancel must produce the same book delta as a serial cancel"
         );
     }
 
