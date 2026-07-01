@@ -106,6 +106,48 @@ pub(crate) fn decode_place_order<CTX: ContextTr>(
     })
 }
 
+/// Decoded fields of a direct `placeOrder` for the parallel pre-phase, with the order id DEFERRED:
+/// carries the maker's committed `base_nonce` (read read-only, so decode parallelizes across txs)
+/// instead of an assigned `order_id`. The id + the nonce write are applied SERIALLY in txn order by
+/// [`crate::perp_dex::parallel::finalize_pending_classes`] (via [`compute_order_id`]), so same-account
+/// ids stay byte-identical to serial execution.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPlaceParams {
+    pub maker: Address,
+    pub base_nonce: u64,
+    pub market_id: u64,
+    pub side: u8,
+    pub price: u64,
+    pub qty: u64,
+    pub order_type: u8,
+    pub tif: u8,
+    pub client_order_id: [u8; 16],
+}
+
+/// Parallel-safe decode of a direct `placeOrder`: ABI-decode + READ the maker's nonce, WITHOUT the
+/// [`next_order_id`] read-modify-write (a concurrent write would race across same-account places). The
+/// id is assigned serially downstream. Otherwise mirrors [`decode_place_order`].
+pub(crate) fn decode_place_order_pending<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<PendingPlaceParams, PrecompileError> {
+    let args = placeOrderCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("placeOrder: invalid calldata"))?;
+    let base_nonce = storage::load_user_nonce(context, caller)?;
+    Ok(PendingPlaceParams {
+        maker: caller,
+        base_nonce,
+        market_id: args.marketId,
+        side: args.side,
+        price: args.price,
+        qty: args.quantity,
+        order_type: args.orderType,
+        tif: args.tif,
+        client_order_id: args.clientOrderId.0,
+    })
+}
+
 /// Decode + authenticate a `placeOrderSigned` (ed25519 over the canonical 96-byte message), deriving
 /// `order_id = keccak256(signature)` and rejecting a duplicate (already-submitted) signature.
 pub(crate) fn verify_place_order_signed<CTX: ContextTr>(
@@ -494,16 +536,24 @@ pub(crate) fn verify_ed25519(
 // ── Core order logic (shared by direct and signed paths) ─────────────────────
 
 /// Allocate the next order ID for `account` using the per-user nonce counter.
+/// The keccak-derived id for a direct (plain) place: `keccak256(account ‖ nonce_be)`. SINGLE SOURCE
+/// for the serial [`next_order_id`] and the parallel pre-phase's serial id-assignment
+/// ([`crate::perp_dex::parallel::finalize_pending_classes`]), so a same-account id is byte-identical
+/// however it is produced.
+pub(crate) fn compute_order_id(account: Address, nonce: u64) -> [u8; 32] {
+    let mut buf = [0u8; 28];
+    buf[..20].copy_from_slice(account.as_slice());
+    buf[20..28].copy_from_slice(&nonce.to_be_bytes());
+    keccak256(&buf).0
+}
+
 pub(super) fn next_order_id<CTX: ContextTr>(
     context: &mut CTX,
     account: Address,
 ) -> Result<[u8; 32], PrecompileError> {
     let nonce = storage::load_user_nonce(context, account)?;
-    let mut buf = [0u8; 28];
-    buf[..20].copy_from_slice(account.as_slice());
-    buf[20..28].copy_from_slice(&nonce.to_be_bytes());
     storage::save_user_nonce(context, account, nonce + 1)?;
-    Ok(keccak256(&buf).0)
+    Ok(compute_order_id(account, nonce))
 }
 
 struct ValidatedOrder {

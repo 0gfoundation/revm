@@ -28,9 +28,9 @@ use crate::perp_dex::types::order::{OrderType, Side, TimeInForce};
 use crate::perp_dex::{
     encode_revert_string, storage,
     trading::{
-        cancel_order_core, decode_cancel_order, decode_place_order, encode_place_order_id,
-        place_order_core, verify_cancel_order_signed, verify_place_order_signed, CancelParams,
-        PlaceParams,
+        cancel_order_core, compute_order_id, decode_cancel_order, decode_place_order,
+        decode_place_order_pending, encode_place_order_id, place_order_core,
+        verify_cancel_order_signed, verify_place_order_signed, CancelParams, PlaceParams,
     },
 };
 use crate::PrecompileError;
@@ -413,7 +413,7 @@ mod tests {
 /// One parallel-eligible place to run in a slot. The ed25519 verify + decode is hoisted upstream
 /// (the dominant cost, parallel before the gates); this is the gated mutation. `rank`/`ticket` are
 /// assigned by the batch in txn_id order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceWork {
     pub maker: Address,
     pub order_id: [u8; 32],
@@ -870,7 +870,7 @@ where
 /// One cancel to run in a slot. The ed25519 verify + decode is hoisted upstream; this is the gated
 /// mutation. The order's market/side/price are NOT known until it is loaded, so they are resolved by
 /// the pre-scan ([`plan_cancel_batch`]). `rank`/`ticket` are assigned by the batch in txn_id order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelWork {
     pub canceller: Address,
     pub order_id: [u8; 32],
@@ -1132,7 +1132,7 @@ where
 /// One perp op in a block, in txn_id order. `Place`/`Cancel` carry their pre-assigned `ticket`
 /// (= block-local txn_id, dense 0..n) and per-maker `rank`. The driver fans them out to the parallel
 /// phase; any op that downgrades is re-run on the serial barrier (step 3d-3).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PerpOp {
     Place(PlaceWork),
     Cancel(CancelWork),
@@ -1160,7 +1160,7 @@ pub struct OpReplay {
 
 /// How the step-4b parallel pre-phase treats one perp transaction's calldata. The node calls
 /// [`classify_perp_tx`] SERIALLY in block order for each top-level `0x…1003` call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PerpTxClass {
     /// A trading op to match in the parallel phase. `success_output` is the precompile return bytes to
     /// replay if the driver Executes it (the ABI-encoded orderId for a place; empty for a cancel — a
@@ -1193,38 +1193,40 @@ pub fn classify_perp_tx<CTX: ContextTr>(
         return Ok(PerpTxClass::NotTrading);
     };
 
-    // A non-fatal decode/verify error → Reject (replayed as a revert); a Fatal propagates.
-    let to_reject = |e: PrecompileError| -> Result<PerpTxClass, PrecompileError> {
-        match e {
-            PrecompileError::Fatal(f) => Err(PrecompileError::Fatal(f)),
-            other => Ok(PerpTxClass::Reject {
-                output: encode_revert_string(&other.to_string()).to_vec(),
-            }),
-        }
-    };
-
     if selector == placeOrderCall::SELECTOR {
         match decode_place_order(input_bytes, caller, context) {
             Ok(p) => Ok(place_trade(p)),
-            Err(e) => to_reject(e),
+            Err(e) => reject_or_fatal(e),
         }
     } else if selector == placeOrderSignedCall::SELECTOR {
         match verify_place_order_signed(input_bytes, context) {
             Ok(p) => Ok(place_trade(p)),
-            Err(e) => to_reject(e),
+            Err(e) => reject_or_fatal(e),
         }
     } else if selector == cancelOrderCall::SELECTOR {
         match decode_cancel_order(input_bytes, caller) {
             Ok(c) => Ok(cancel_trade(c)),
-            Err(e) => to_reject(e),
+            Err(e) => reject_or_fatal(e),
         }
     } else if selector == cancelOrderSignedCall::SELECTOR {
         match verify_cancel_order_signed(input_bytes, context) {
             Ok(c) => Ok(cancel_trade(c)),
-            Err(e) => to_reject(e),
+            Err(e) => reject_or_fatal(e),
         }
     } else {
         Ok(PerpTxClass::NotTrading)
+    }
+}
+
+/// A non-fatal decode/verify error → [`PerpTxClass::Reject`] (the serial EVM pass replays it as a
+/// revert); a `Fatal` (storage/system) propagates to abort the block. Shared by [`classify_perp_tx`]
+/// and [`classify_perp_tx_pending`].
+fn reject_or_fatal(e: PrecompileError) -> Result<PerpTxClass, PrecompileError> {
+    match e {
+        PrecompileError::Fatal(f) => Err(PrecompileError::Fatal(f)),
+        other => Ok(PerpTxClass::Reject {
+            output: encode_revert_string(&other.to_string()).to_vec(),
+        }),
     }
 }
 
@@ -1261,6 +1263,123 @@ fn cancel_trade(c: CancelParams) -> PerpTxClass {
             ticket: 0,
         }),
     }
+}
+
+/// A perp tx classified by the PARALLEL pre-phase (#3), with a direct place's order id DEFERRED.
+/// Produced by [`classify_perp_tx_pending`] (READ-ONLY on perp state → the node runs it concurrently
+/// across the block's txs); resolved to a [`PerpTxClass`] by [`finalize_pending_classes`], which
+/// assigns direct-place ids serially in txn order (the nonce read-modify-write cannot race across
+/// same-account places).
+#[derive(Debug, Clone)]
+pub enum PendingPerpTx {
+    /// A direct (plain) `placeOrder`: its id is `keccak256(account ‖ nonce)` assigned in the serial
+    /// pass, `nonce` starting at the committed `base_nonce` (read here in parallel).
+    PendingPlace {
+        maker: Address,
+        base_nonce: u64,
+        market_id: u64,
+        side: u8,
+        price: u64,
+        qty: u64,
+        order_type: u8,
+        tif: u8,
+        client_order_id: [u8; 16],
+    },
+    /// A class already fully resolved in parallel — a signed place (id = keccak(sig), no nonce), a
+    /// cancel, a reject, or a non-trading call — passed through unchanged.
+    Resolved(PerpTxClass),
+}
+
+/// PARALLEL-phase classify (#3): like [`classify_perp_tx`] but a direct `placeOrder` is returned as
+/// [`PendingPerpTx::PendingPlace`] with its id DEFERRED — so this fn is READ-ONLY on the perp state
+/// (no nonce write) and the node can run it CONCURRENTLY across the block's txs (one cold-read ctx per
+/// tx). Every other class (signed place, cancel, reject, not-trading) is fully resolved here, exactly
+/// as [`classify_perp_tx`] would. A `Fatal` propagates; a non-fatal error becomes a `Resolved(Reject)`.
+pub fn classify_perp_tx_pending<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<PendingPerpTx, PrecompileError> {
+    let is_direct_place = input_bytes
+        .get(..4)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        == Some(placeOrderCall::SELECTOR);
+    if is_direct_place {
+        // Direct place: defer the id (its nonce RMW is applied serially in txn order downstream).
+        match decode_place_order_pending(input_bytes, caller, context) {
+            Ok(p) => Ok(PendingPerpTx::PendingPlace {
+                maker: p.maker,
+                base_nonce: p.base_nonce,
+                market_id: p.market_id,
+                side: p.side,
+                price: p.price,
+                qty: p.qty,
+                order_type: p.order_type,
+                tif: p.tif,
+                client_order_id: p.client_order_id,
+            }),
+            Err(e) => Ok(PendingPerpTx::Resolved(reject_or_fatal(e)?)),
+        }
+    } else {
+        // Signed place (id = keccak(sig), no nonce) / cancel / signed cancel / not-trading are all
+        // id-resolved (or id-free) in parallel — delegate to the single-source classify.
+        classify_perp_tx(input_bytes, caller, context).map(PendingPerpTx::Resolved)
+    }
+}
+
+/// SERIAL resolve of the parallel-classified block (#3): assign each direct place's order id from its
+/// maker's nonce sequence in txn order — `keccak256(account ‖ nonce)`, `nonce` starting at the
+/// committed base and incrementing once per direct place — then write each toucher's FINAL nonce to
+/// the shared book. Produces the [`PerpTxClass`] list in txn order, byte-identical to what a serial
+/// [`classify_perp_tx`] scan produces (a signed place / cancel / reject passes through untouched, and
+/// a signed place never advances the nonce, matching serial). `context` must route to the block's
+/// shared book (the nonce writes land there, as the serial classify's do).
+pub fn finalize_pending_classes<CTX: ContextTr>(
+    pending: Vec<PendingPerpTx>,
+    context: &mut CTX,
+) -> Result<Vec<PerpTxClass>, PrecompileError> {
+    // Per-maker running nonce: seeded at the committed base on first sight, incremented per direct
+    // place in txn order. BTreeMap → the final-nonce write loop is deterministically ordered (the
+    // commitment is order-independent regardless, but this removes any doubt).
+    let mut running: std::collections::BTreeMap<Address, u64> = std::collections::BTreeMap::new();
+    let mut out = Vec::with_capacity(pending.len());
+    for p in pending {
+        match p {
+            PendingPerpTx::Resolved(c) => out.push(c),
+            PendingPerpTx::PendingPlace {
+                maker,
+                base_nonce,
+                market_id,
+                side,
+                price,
+                qty,
+                order_type,
+                tif,
+                client_order_id,
+            } => {
+                let n = running.entry(maker).or_insert(base_nonce);
+                let order_id = compute_order_id(maker, *n);
+                *n += 1;
+                out.push(place_trade(PlaceParams {
+                    maker,
+                    order_id,
+                    market_id,
+                    side,
+                    price,
+                    qty,
+                    order_type,
+                    tif,
+                    client_order_id,
+                }));
+            }
+        }
+    }
+    // Persist each toucher's final nonce (= base + count) — the same final state serial leaves (serial
+    // writes base+1..base+count; last-write-wins per key → identical committed value).
+    for (acct, final_nonce) in running {
+        storage::save_user_nonce(context, acct, final_nonce)?;
+    }
+    Ok(out)
 }
 
 /// One op prepared by the serial pre-scan: a place (unchanged) or a cancel with its resolved
@@ -1748,6 +1867,118 @@ mod driver_tests {
             classify_perp_tx(&[0x01, 0x02], a, &mut ctx).unwrap(),
             PerpTxClass::NotTrading
         ));
+    }
+
+    /// #3 (parallel-decode) equivalence: `classify_perp_tx_pending` (read-only, run per-tx as the
+    /// concurrent pre-phase does — all direct places see the SAME committed base nonce) + the serial
+    /// `finalize_pending_classes` must produce the EXACT same `PerpTxClass` list (ops + success_output,
+    /// hence order_ids) as a serial `classify_perp_tx` scan (which does the nonce read-modify-write
+    /// inline). The load-bearing case: MULTIPLE direct places from ONE account must get sequential ids
+    /// base, base+1, … even though the parallel decode read the same base for all of them — the serial
+    /// finalize assigns them by a per-maker running counter in txn order.
+    #[test]
+    fn classify_pending_then_finalize_matches_serial_classify() {
+        use crate::perp_dex::interface::IPerpDex::{cancelOrderCall, placeOrderCall};
+        use alloy_sol_types::SolCall;
+        use primitives::FixedBytes;
+
+        let a = user_addr(1);
+        let b = user_addr(2);
+        let place = |caller: Address, side: u8, price: u64| {
+            (
+                placeOrderCall {
+                    marketId: MID,
+                    side,
+                    price,
+                    quantity: QTY,
+                    orderType: 0,
+                    tif: 0,
+                    clientOrderId: FixedBytes([0u8; 16]),
+                }
+                .abi_encode(),
+                caller,
+            )
+        };
+        let cancel = |caller: Address, o: [u8; 32]| {
+            (
+                cancelOrderCall {
+                    orderId: FixedBytes(o),
+                    marketId: MID,
+                }
+                .abi_encode(),
+                caller,
+            )
+        };
+        // Interleaved block: A×2 direct places, B cancel, B place, A place → A places 3 total, so its
+        // ids MUST be base, base+1, base+2 in txn order (the ids are 0th, 1st, 4th txs).
+        let txs: Vec<(Vec<u8>, Address)> = vec![
+            place(a, 0, 100 * TICK),
+            place(a, 0, 99 * TICK),
+            cancel(b, oid(7)),
+            place(b, 1, 200 * TICK),
+            place(a, 0, 98 * TICK),
+        ];
+
+        // SERIAL reference: classify_perp_tx does the nonce RMW inline, one ctx, in txn order.
+        let mut serial_ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut serial_ctx, &[a, b]);
+        let serial_classes: Vec<PerpTxClass> = txs
+            .iter()
+            .map(|(cd, c)| classify_perp_tx(cd, *c, &mut serial_ctx).unwrap())
+            .collect();
+
+        // PARALLEL: classify_perp_tx_pending is read-only, so running every tx on ONE ctx yields the
+        // SAME committed base nonce for all of A's places (exactly what N concurrent cold-read ctxs
+        // would each see) — no cross-tx nonce visibility. finalize then assigns ids serially.
+        let mut pctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut pctx, &[a, b]);
+        let pending: Vec<PendingPerpTx> = txs
+            .iter()
+            .map(|(cd, c)| classify_perp_tx_pending(cd, *c, &mut pctx).unwrap())
+            .collect();
+        // Sanity: A's three direct places all read the SAME base nonce in the parallel decode.
+        let a_bases: Vec<u64> = pending
+            .iter()
+            .filter_map(|p| match p {
+                PendingPerpTx::PendingPlace {
+                    maker, base_nonce, ..
+                } if *maker == a => Some(*base_nonce),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(a_bases, vec![0, 0, 0], "parallel decode reads committed base for all");
+
+        let mut fctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut fctx, &[a, b]);
+        let parallel_classes = finalize_pending_classes(pending, &mut fctx).unwrap();
+
+        assert_eq!(
+            serial_classes, parallel_classes,
+            "parallel classify+finalize must be byte-identical to serial classify"
+        );
+
+        // Explicit: A's three places carry sequential keccak(a‖0/1/2) ids in txn order.
+        let a_ids: Vec<[u8; 32]> = parallel_classes
+            .iter()
+            .filter_map(|c| match c {
+                PerpTxClass::Trade {
+                    op: PerpOp::Place(w),
+                    ..
+                } if w.maker == a => Some(w.order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            a_ids,
+            vec![
+                compute_order_id(a, 0),
+                compute_order_id(a, 1),
+                compute_order_id(a, 2)
+            ],
+        );
+        // And the final committed nonce for A = base + 3 (matches serial's three +1s).
+        assert_eq!(storage::load_user_nonce(&mut fctx, a).unwrap(), 3);
+        assert_eq!(storage::load_user_nonce(&mut fctx, b).unwrap(), 1);
     }
 
     /// 3d-7 fix: a NON-OWNER cancel of someone's sole-best order. It reverts ("not owner") touching
