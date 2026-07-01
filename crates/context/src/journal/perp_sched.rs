@@ -45,6 +45,7 @@ use primitives::Address;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, Thread};
 use std::time::Instant;
 
 /// Poison-tolerant lock of a cursor mutex. The protected value is a plain monotonic counter with no
@@ -154,11 +155,19 @@ impl Drop for LaneAdvance {
 /// order (the driver assigns tickets `0..N` in txn_id order within a parallel batch).
 #[derive(Debug, Default)]
 pub struct BboTicketLock {
-    /// The ticket currently allowed to run.
+    /// The ticket currently allowed to run. Also the publication edge: its release→acquire carries a
+    /// served ticket's non-atomic BBO/book writes to the next ticket (pinned by
+    /// `bbo_ticket_publishes_writes_to_next_ticket`).
     serve: Mutex<u64>,
-    cv: Condvar,
+    /// Parked successors, keyed `ticket → waiting thread handle`. A waiter registers itself here (under
+    /// the `serve` lock) before parking; the completer of ticket `i` wakes EXACTLY the `i+1` entry — a
+    /// direct single-successor handoff that replaces a `notify_all` thundering herd (every advance used
+    /// to wake all K in-flight waiters, K-1 of which re-parked → O(K)/advance, anti-scaling with the
+    /// pool width). Entries are transient (removed on wake / on self-service). `std::thread::park`'s
+    /// token semantics make an unpark that races ahead of the park harmless (park returns at once).
+    waiters: DashMap<u64, Thread>,
     /// PERP_PROF (§B): when set, `ServeAdvance::drop` times the producer-side handoff
-    /// (`lock serve` + `serve += 1` + `notify_all`) into `advance_ns`. Off ⇒ one relaxed load, no timing.
+    /// (`lock serve` + `serve += 1` + successor `unpark`) into `advance_ns`. Off ⇒ one relaxed load.
     profiled: AtomicBool,
     /// Σ producer-side serve-cursor advance time (the `notify_all` machinery) over the block. Serial
     /// (only one advance runs at a time), so this is the notify/handoff cost NOT counted in `bbo_held`.
@@ -170,7 +179,7 @@ impl BboTicketLock {
     pub fn new() -> Self {
         Self {
             serve: Mutex::new(0),
-            cv: Condvar::new(),
+            waiters: DashMap::new(),
             profiled: AtomicBool::new(false),
             advance_ns: AtomicU64::new(0),
         }
@@ -198,8 +207,23 @@ impl BboTicketLock {
                 "bbo ticket {ticket} already served (serve={})",
                 *serve
             );
-            while *serve != ticket {
-                serve = self.cv.wait(serve).unwrap_or_else(|p| p.into_inner());
+            if *serve != ticket {
+                // Register our handle, THEN loop-check the cursor — the register and every re-check run
+                // under the `serve` lock, so they are serialized with the completer's `advance + take`
+                // (below): either the completer sees our handle and unparks us, or a later re-check
+                // sees the advanced cursor and we never park — the "both miss" interleaving is
+                // impossible. The park token is a second backstop (an unpark landing between register
+                // and `park()` makes that `park()` return immediately). Spurious wakeups are absorbed
+                // by the under-lock re-check.
+                self.waiters.insert(ticket, thread::current());
+                while *serve != ticket {
+                    drop(serve);
+                    thread::park();
+                    serve = lock_cursor(&self.serve);
+                }
+                // Woken / self-served: consume our registration so the map stays clean (the completer
+                // may already have removed it — idempotent).
+                self.waiters.remove(&ticket);
             }
         }
         // Advance on the way out (incl. panic) — see `ServeAdvance`.
@@ -215,11 +239,18 @@ struct ServeAdvance<'a> {
 
 impl Drop for ServeAdvance<'_> {
     fn drop(&mut self) {
-        // §B: time the producer-side handoff (lock serve + advance + notify_all) when profiling.
+        // §B: time the producer-side handoff (lock serve + advance + successor unpark) when profiling.
         let t = self.lock.profiled.load(Ordering::Relaxed).then(Instant::now);
-        let mut serve = lock_cursor(&self.lock.serve);
-        *serve += 1;
-        self.lock.cv.notify_all();
+        let succ = {
+            let mut serve = lock_cursor(&self.lock.serve);
+            *serve += 1;
+            // Take the successor's parked handle (if any) UNDER the serve lock — ordered against the
+            // waiter's register + re-check, so we never miss a successor that has committed to parking.
+            self.lock.waiters.remove(&*serve).map(|(_, th)| th)
+        }; // serve released here → publishes this ticket's BBO writes to the successor.
+        if let Some(th) = succ {
+            th.unpark(); // wake EXACTLY the next ticket — O(1), no thundering herd.
+        }
         if let Some(t) = t {
             self.lock
                 .advance_ns
