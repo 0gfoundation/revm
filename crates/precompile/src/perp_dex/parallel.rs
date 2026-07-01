@@ -42,8 +42,10 @@ use context::journaled_state::JournalCheckpoint;
 use context::{ContextTr, JournalTr};
 use primitives::{Address, Log};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 /// How the gated phase must treat one place/cancel under the BBO ticket. See module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +60,143 @@ pub enum LockPlan {
     /// Non-crossing rest below the best, or a cancel that doesn't empty the best level → release the
     /// ticket and mutate under the per-level lock (parallel).
     ReleaseTicket,
+}
+
+/// Per-block parallel-execution profile (catalog #21, `parallel-instrumentation-spec.md`). A struct of
+/// atomics, created once per block by the driver, shared (Arc) into every pool slot so each op can bump
+/// it lock-free. Near-zero cost when the driver doesn't create one (the `Option<&PerpBlockProfile>` in
+/// `BatchEnv` is `None`). The node reads it at block-end and emits the `PERP_PROF …` line.
+///
+/// §1 achieved concurrency (Little's law): `avg_concurrency = sum_body_ns / phase_wall_ns`; `max_conc`
+/// is the in-flight high-water. §A histogram = the block's op shape. §H = block totals.
+#[derive(Debug, Default)]
+pub struct PerpBlockProfile {
+    // §A classification histogram (bumped at the classify decision).
+    pub n_mover: AtomicU64,        // HoldTicket
+    pub n_release: AtomicU64,      // ReleaseTicket (non-mover, parallel body)
+    pub n_inline_taker: AtomicU64, // DowngradeToBarrier (crossing taker, inline under ticket)
+    pub n_reject: AtomicU64,       // RejectInBody (PostOnly cross)
+    pub n_cancel: AtomicU64,       // cancel ops (coarse)
+    // §1 achieved concurrency.
+    pub sum_body_ns: AtomicU64,    // Σ per-op body wall-time (may exceed phase_wall — that IS concurrency)
+    pub inflight: AtomicUsize,     // transient in-flight body counter
+    pub max_concurrency: AtomicUsize, // high-water of `inflight`
+    // §H block totals (phase_wall + n_ops set by the driver around run_batch).
+    pub phase_wall_ns: AtomicU64,
+    pub n_ops: AtomicU64,
+    // §B BBO-ticket wait vs held. `bbo.run(ticket, f)` = wait (blocked on the serve cursor) + held
+    // (running `f`: the 2 best-reads + classify + any inline mover/taker body). The ticket is a strict
+    // serial cursor (only one op holds it at a time), so Σ`bbo_held_ns` intervals do NOT overlap →
+    // it is a lower bound on the phase's SERIAL critical path; `bbo_held/phase` ≈ the serial-ticket
+    // fraction (spec §B/§7 top row). `bbo_wait_ns` is summed across parallel workers → overlaps (a
+    // queue-depth proxy, not wall time).
+    pub bbo_wait_ns: AtomicU64,
+    pub bbo_held_ns: AtomicU64,
+    // §C per-op cost (subset): Σ time doing the 2 best-reads (`load_best_bid`+`load_best_ask`) +
+    // `classify_place`, i.e. the classify work that runs under the ticket for EVERY op.
+    pub classify_ns: AtomicU64,
+    // §B producer-side serve-cursor handoff: Σ time in `ServeAdvance::drop` (lock serve + advance +
+    // `notify_all`), read from the BboTicketLock at block-end. Isolates the notify machinery from the
+    // consumer-side `bbo_wait` (condvar wake + re-check). Set by the driver, not per-op.
+    pub advance_notify_ns: AtomicU64,
+    // §B rest — the other sched-lock waits, harvested from the per-block locks at block-end. All ~0 on
+    // maxParallel (accounts ≫ ops, distinct prices, no crossers) → confirms the constraint is the BBO
+    // cursor, NOT account/level/taker contention.
+    pub acct_wait_ns: AtomicU64,       // AccountGate: same-account serialization
+    pub book_wait_ns: AtomicU64,       // BookSideLock: same-(market,side,price) contention
+    pub completion_wait_ns: AtomicU64, // MarketCompletion: inline-taker / emptying-cancel wait (crossers)
+    // §F BookSideLock granularity: new level-lock entries (first touch of a price) vs hits. inserts ≈
+    // ops with book_wait ≈ 0 ⇒ the per-price lock is pure per-op overhead on scattered-price flow.
+    pub level_inserts: AtomicU64,
+    pub level_hits: AtomicU64,
+}
+
+impl PerpBlockProfile {
+    /// Mark a body entering the concurrent region: bump in-flight + push the high-water mark.
+    fn body_enter(&self) {
+        let now = self.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.max_concurrency.fetch_max(now, Ordering::Relaxed);
+    }
+    /// Mark a body leaving: accumulate its wall-time and decrement in-flight.
+    fn body_exit(&self, ns: u64) {
+        self.sum_body_ns.fetch_add(ns, Ordering::Relaxed);
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+    fn bump_plan(&self, plan: LockPlan) {
+        match plan {
+            LockPlan::HoldTicket => &self.n_mover,
+            LockPlan::ReleaseTicket => &self.n_release,
+            LockPlan::DowngradeToBarrier => &self.n_inline_taker,
+            LockPlan::RejectInBody => &self.n_reject,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Format the one-line `PERP_PROF …` block record the node emits to reth.log. `blk` + the
+    /// prephase timings (§D) are supplied by the node — they live outside the parallel driver — while
+    /// everything else is read from the block-local atomics. Fields: §H totals (`ops`, `phase_ms`),
+    /// §1 achieved concurrency (`concurrency_avg = sum_body_ns / phase_wall_ns` by Little's law,
+    /// `max_inflight` = the in-flight high-water), §A classification histogram (`n_mover` …
+    /// `n_cancel`), §D prephase (`scan_ms` = serial classify scan, `prephase_ms` = total pre-phase).
+    pub fn format_prof_line(&self, blk: u64, prephase_total_ns: u64, scan_ns: u64) -> String {
+        let phase = self.phase_wall_ns.load(Ordering::Relaxed);
+        let body = self.sum_body_ns.load(Ordering::Relaxed);
+        let conc = if phase > 0 { body as f64 / phase as f64 } else { 0.0 };
+        let ms = |ns: u64| ns as f64 / 1e6;
+        format!(
+            "PERP_PROF blk={blk} ops={} concurrency_avg={conc:.2} max_inflight={} \
+             phase_ms={:.3} body_ms_sum={:.3} prephase_ms={:.3} scan_ms={:.3} \
+             bbo_held_ms={:.3} bbo_wait_ms={:.3} classify_ms={:.3} advance_notify_ms={:.3} \
+             acct_wait_ms={:.3} book_wait_ms={:.3} completion_wait_ms={:.3} level_inserts={} level_hits={} \
+             n_mover={} n_release={} n_inline_taker={} n_reject={} n_cancel={}",
+            self.n_ops.load(Ordering::Relaxed),
+            self.max_concurrency.load(Ordering::Relaxed),
+            ms(phase),
+            ms(body),
+            ms(prephase_total_ns),
+            ms(scan_ns),
+            ms(self.bbo_held_ns.load(Ordering::Relaxed)),
+            ms(self.bbo_wait_ns.load(Ordering::Relaxed)),
+            ms(self.classify_ns.load(Ordering::Relaxed)),
+            ms(self.advance_notify_ns.load(Ordering::Relaxed)),
+            ms(self.acct_wait_ns.load(Ordering::Relaxed)),
+            ms(self.book_wait_ns.load(Ordering::Relaxed)),
+            ms(self.completion_wait_ns.load(Ordering::Relaxed)),
+            self.level_inserts.load(Ordering::Relaxed),
+            self.level_hits.load(Ordering::Relaxed),
+            self.n_mover.load(Ordering::Relaxed),
+            self.n_release.load(Ordering::Relaxed),
+            self.n_inline_taker.load(Ordering::Relaxed),
+            self.n_reject.load(Ordering::Relaxed),
+            self.n_cancel.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// RAII timer for one parallel body: on construct bumps in-flight + starts an `Instant`; on drop
+/// accumulates elapsed ns into `sum_body_ns` and decrements in-flight. `None` = no-op (profiling off).
+/// Wraps each `gated_*` call so `sum_body_ns / phase_wall_ns` = achieved concurrency (§1).
+struct BodyTimer<'a> {
+    prof: Option<&'a PerpBlockProfile>,
+    start: Option<Instant>,
+}
+impl<'a> BodyTimer<'a> {
+    fn new(prof: Option<&'a PerpBlockProfile>) -> Self {
+        if let Some(p) = prof {
+            p.body_enter();
+        }
+        BodyTimer {
+            prof,
+            start: prof.map(|_| Instant::now()),
+        }
+    }
+}
+impl Drop for BodyTimer<'_> {
+    fn drop(&mut self) {
+        if let (Some(p), Some(s)) = (self.prof, self.start) {
+            p.body_exit(s.elapsed().as_nanos() as u64);
+        }
+    }
 }
 
 /// Decide how to handle a place order given the current BBO. Pure; the driver supplies the BBO it
@@ -384,6 +523,9 @@ struct BatchEnv<'a> {
     /// order_id -> ticket for every Place op in the batch (incl. a taker's OWN rested remainder, whose
     /// order_id is the taker's). The FIFO sort key — order_id itself is keccak/per-caller, not ordered.
     placed_tickets: &'a HashMap<[u8; 32], u64>,
+    /// Optional per-block profile (catalog #21 instrumentation). `Some` only when the node set
+    /// `PERP_PROF=1`; `None` = zero-cost. Bodies bump it via [`BodyTimer`]; classify bumps the histogram.
+    prof: Option<&'a PerpBlockProfile>,
 }
 
 /// Marks this op's `ticket` done in the market-wide [`MarketCompletion`] on EVERY exit (Ok / `?` /
@@ -525,48 +667,82 @@ pub(crate) fn parallel_place<CTX: ContextTr>(
         Done(Result<PlaceOutcome, PrecompileError>),
         Release,
     }
+    // §B: time the whole `bbo.run` (= wait on the serve cursor + held running the closure) and, via the
+    // inner closure, the held portion alone → wait = total − held. `held_ns` is written by the closure
+    // (runs inline on this thread) and read after the call.
+    let held_ns = std::cell::Cell::new(0u64);
+    let run_start = env.prof.map(|_| Instant::now());
     let under = env
         .bbo
         .run(work.ticket, || -> Result<UnderTicket, PrecompileError> {
-            let plan = match (
-                Side::from_u8(work.side),
-                OrderType::from_u8(work.order_type),
-                TimeInForce::from_u8(work.tif),
-            ) {
-                (Some(side), Some(order_type), Some(tif)) => {
-                    let best_bid = storage::load_best_bid(ctx, work.market_id)?;
-                    let best_ask = storage::load_best_ask(ctx, work.market_id)?;
-                    classify_place(side, order_type, tif, work.price, best_bid, best_ask)
+            let held_start = env.prof.map(|_| Instant::now());
+            let out = (|| -> Result<UnderTicket, PrecompileError> {
+                let cls_start = env.prof.map(|_| Instant::now());
+                let plan = match (
+                    Side::from_u8(work.side),
+                    OrderType::from_u8(work.order_type),
+                    TimeInForce::from_u8(work.tif),
+                ) {
+                    (Some(side), Some(order_type), Some(tif)) => {
+                        let best_bid = storage::load_best_bid(ctx, work.market_id)?;
+                        let best_ask = storage::load_best_ask(ctx, work.market_id)?;
+                        classify_place(side, order_type, tif, work.price, best_bid, best_ask)
+                    }
+                    // Unparseable order fields → let the body reject it under the ticket.
+                    _ => LockPlan::RejectInBody,
+                };
+                if let (Some(p), Some(cs)) = (env.prof, cls_start) {
+                    // §C: the 2 best-reads + classify_place (runs under the ticket for EVERY op).
+                    p.classify_ns.fetch_add(cs.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
-                // Unparseable order fields → let the body reject it under the ticket.
-                _ => LockPlan::RejectInBody,
-            };
-            match plan {
-                // A crossing matcher / taker (GTC-cross / Market / IOC / FOK) runs INLINE under the
-                // held BBO ticket (step 4 — replaces the deferred barrier + contagion): wait until every
-                // lower-txn_id op's book write has landed (the serial book state at this ticket), then
-                // FIFO-sort the parallel rests it may sweep, then match. No higher ticket has been served
-                // (BBO cursor), no lower op is still writing → the match's level RMWs are uncontended.
-                LockPlan::DowngradeToBarrier => {
-                    env.completion.wait_below(env.market, work.ticket);
-                    sort_dirty(ctx, env.dirty, env.placed_tickets)?;
-                    Ok(UnderTicket::Done(gated_taker(ctx, env.account_gate, work)))
+                if let Some(p) = env.prof {
+                    p.bump_plan(plan); // §A classification histogram
                 }
-                // A mover (or a PostOnly-cross self-reject) executes while holding the BBO ticket so its
-                // best-update is serialized; the body itself takes the book-side lock.
-                LockPlan::HoldTicket | LockPlan::RejectInBody => Ok(UnderTicket::Done(gated_execute(
-                    ctx,
-                    env.account_gate,
-                    env.book_lock,
-                    work,
-                ))),
-                LockPlan::ReleaseTicket => Ok(UnderTicket::Release),
+                match plan {
+                    // A crossing matcher / taker (GTC-cross / Market / IOC / FOK) runs INLINE under the
+                    // held BBO ticket (step 4 — replaces the deferred barrier + contagion): wait until
+                    // every lower-txn_id op's book write has landed (the serial book state at this
+                    // ticket), then FIFO-sort the parallel rests it may sweep, then match. No higher
+                    // ticket has been served (BBO cursor), no lower op is still writing → uncontended.
+                    LockPlan::DowngradeToBarrier => {
+                        env.completion.wait_below(env.market, work.ticket);
+                        sort_dirty(ctx, env.dirty, env.placed_tickets)?;
+                        let _bt = BodyTimer::new(env.prof); // §1 time the inline-taker body
+                        Ok(UnderTicket::Done(gated_taker(ctx, env.account_gate, work)))
+                    }
+                    // A mover (or a PostOnly-cross self-reject) executes while holding the BBO ticket so
+                    // its best-update is serialized; the body itself takes the book-side lock.
+                    LockPlan::HoldTicket | LockPlan::RejectInBody => {
+                        let _bt = BodyTimer::new(env.prof); // §1 time the mover/reject body
+                        Ok(UnderTicket::Done(gated_execute(
+                            ctx,
+                            env.account_gate,
+                            env.book_lock,
+                            work,
+                        )))
+                    }
+                    LockPlan::ReleaseTicket => Ok(UnderTicket::Release),
+                }
+            })();
+            if let (Some(_p), Some(hs)) = (env.prof, held_start) {
+                held_ns.set(hs.elapsed().as_nanos() as u64); // §B held = time under the ticket
             }
+            out
         })?;
+    if let (Some(p), Some(rs)) = (env.prof, run_start) {
+        let total = rs.elapsed().as_nanos() as u64;
+        let held = held_ns.get();
+        p.bbo_held_ns.fetch_add(held, Ordering::Relaxed);
+        // §B wait = total − held (blocked on the serve cursor before the closure ran).
+        p.bbo_wait_ns.fetch_add(total.saturating_sub(held), Ordering::Relaxed);
+    }
     let outcome = match under {
         UnderTicket::Done(r) => r,
         // Ticket released (non-mover); rest under the account gate + book-side lock, in parallel.
-        UnderTicket::Release => gated_execute(ctx, env.account_gate, env.book_lock, work),
+        UnderTicket::Release => {
+            let _bt = BodyTimer::new(env.prof); // §1 time the parallel non-mover body
+            gated_execute(ctx, env.account_gate, env.book_lock, work)
+        }
     };
     // A rest (mover / non-mover / a taker's partial-fill remainder) landed at `work.price` → mark the
     // level dirty so the next inline taker FIFO-sorts it before matching. Idempotent on no-rest.
@@ -610,6 +786,7 @@ where
         completion: &completion,
         dirty: &dirty,
         placed_tickets: &placed_tickets,
+        prof: None,
     };
     let (make_ctx, env) = (&make_ctx, &env);
     thread::scope(|s| {
@@ -770,6 +947,9 @@ fn parallel_cancel<CTX: ContextTr>(
         market: env.market,
         ticket: plan.work.ticket,
     };
+    if let Some(p) = env.prof {
+        p.n_cancel.fetch_add(1, Ordering::Relaxed); // §A cancel op
+    }
     let (market, side_u8, price) = match plan.resolved {
         Some(t) => t,
         // Order not loadable → revert (missing order), touching no level → no book lock, no wait. Still
@@ -797,40 +977,66 @@ fn parallel_cancel<CTX: ContextTr>(
     // lower-txn_id op to apply, then remove + refresh best under the held ticket. (An owner at-best
     // cancel that does NOT empty the level also runs inline — a minor over-serialization vs a parallel
     // removal; deferred perf TODO. Ownership is fixed, so it is checked without waiting.)
+    // §B: same wait/held split as parallel_place — time the whole bbo.run, and held via the inner
+    // closure. classify_ns counts the 2 best-reads (consistent with place).
+    let held_ns = std::cell::Cell::new(0u64);
+    let run_start = env.prof.map(|_| Instant::now());
     let flow = env
         .bbo
         .run(plan.work.ticket, || -> Result<Flow, PrecompileError> {
-            let best_bid = storage::load_best_bid(ctx, market)?;
-            let best_ask = storage::load_best_ask(ctx, market)?;
-            if !cancel_at_best(side, price, best_bid, best_ask) {
-                return Ok(Flow::RunParallel);
+            let held_start = env.prof.map(|_| Instant::now());
+            let out = (|| -> Result<Flow, PrecompileError> {
+                let cls_start = env.prof.map(|_| Instant::now());
+                let best_bid = storage::load_best_bid(ctx, market)?;
+                let best_ask = storage::load_best_ask(ctx, market)?;
+                if let (Some(p), Some(cs)) = (env.prof, cls_start) {
+                    p.classify_ns.fetch_add(cs.elapsed().as_nanos() as u64, Ordering::Relaxed); // §C
+                }
+                if !cancel_at_best(side, price, best_bid, best_ask) {
+                    return Ok(Flow::RunParallel);
+                }
+                let is_owner = storage::load_order(ctx, &plan.work.order_id)?
+                    .map(|o| o.owner == plan.work.canceller.0 .0)
+                    .unwrap_or(false);
+                if !is_owner {
+                    return Ok(Flow::RunParallel);
+                }
+                env.completion.wait_below(env.market, plan.work.ticket);
+                let _bt = BodyTimer::new(env.prof); // §1 time the inline at-best cancel body
+                Ok(Flow::Done(gated_cancel_inline(
+                    ctx,
+                    env.account_gate,
+                    &plan.work,
+                )))
+            })();
+            if let (Some(_p), Some(hs)) = (env.prof, held_start) {
+                held_ns.set(hs.elapsed().as_nanos() as u64); // §B held = time under the ticket
             }
-            let is_owner = storage::load_order(ctx, &plan.work.order_id)?
-                .map(|o| o.owner == plan.work.canceller.0 .0)
-                .unwrap_or(false);
-            if !is_owner {
-                return Ok(Flow::RunParallel);
-            }
-            env.completion.wait_below(env.market, plan.work.ticket);
-            Ok(Flow::Done(gated_cancel_inline(
-                ctx,
-                env.account_gate,
-                &plan.work,
-            )))
+            out
         })?;
+    if let (Some(p), Some(rs)) = (env.prof, run_start) {
+        let total = rs.elapsed().as_nanos() as u64;
+        let held = held_ns.get();
+        p.bbo_held_ns.fetch_add(held, Ordering::Relaxed);
+        // §B wait = total − held (blocked on the serve cursor before the closure ran).
+        p.bbo_wait_ns.fetch_add(total.saturating_sub(held), Ordering::Relaxed);
+    }
     match flow {
         Flow::Done(r) => r,
         // Below best, or at-best non-owner → ticket released; remove under the account gate +
         // book-side lock, in parallel.
-        Flow::RunParallel => gated_cancel(
-            ctx,
-            env.account_gate,
-            env.book_lock,
-            &plan.work,
-            market,
-            side_u8,
-            price,
-        ),
+        Flow::RunParallel => {
+            let _bt = BodyTimer::new(env.prof); // §1 time the parallel cancel body
+            gated_cancel(
+                ctx,
+                env.account_gate,
+                env.book_lock,
+                &plan.work,
+                market,
+                side_u8,
+                price,
+            )
+        }
     }
 }
 
@@ -903,6 +1109,7 @@ where
         completion: &completion,
         dirty: &dirty,
         placed_tickets: &placed_tickets,
+        prof: None,
     };
     let (make_ctx, plans, env) = (&make_ctx, &plans, &env);
     thread::scope(|s| {
@@ -1173,11 +1380,12 @@ fn normalize_schedule(ops: &[PerpOp]) -> Vec<PerpOp> {
 ///
 /// `ops` must be in txn_id order. Returns results in that order. `pool` is reused across segments (and,
 /// by the caller, across blocks).
-pub fn transact_block_parallel_logged<CTX, F>(
+fn transact_block_parallel_inner<CTX, F>(
     pool: &PerpPool,
     book: &Arc<SharedPerpBook>,
     ops: &[PerpOp],
     make_ctx: F,
+    prof: Option<Arc<PerpBlockProfile>>,
 ) -> Result<Vec<OpReplay>, PrecompileError>
 where
     CTX: ContextTr,
@@ -1227,14 +1435,25 @@ where
             PreparedOp::Cancel(_) => None,
         })
         .collect();
+    let bbo = BboTicketLock::new();
+    if prof.is_some() {
+        bbo.set_profiled(true); // §B: time the producer-side serve-cursor advance (notify_all)
+    }
     let shared = Arc::new((
         AccountGate::new(),
         BookSideLock::new(),
-        BboTicketLock::new(),
+        bbo,
         MarketCompletion::new(),
         Mutex::new(HashSet::<(u8, u64, u64)>::new()),
         placed_tickets,
+        prof, // element .6: Option<Arc<PerpBlockProfile>> (Some under PERP_PROF)
     ));
+    if shared.6.is_some() {
+        // §B/§F: enable the sched-lock wait timers + level insert/hit counting for this block.
+        shared.0.set_profiled(true); // AccountGate (acct_wait)
+        shared.1.set_profiled(true); // BookSideLock (book_wait + level inserts/hits)
+        shared.3.set_profiled(true); // MarketCompletion (completion_wait)
+    }
 
     let final_results: Vec<OpReplay> = {
         let tasks: Vec<_> = prepared
@@ -1245,7 +1464,8 @@ where
                 let make_ctx = make_ctx.clone();
                 let shared = shared.clone();
                 move || -> Result<OpReplay, PrecompileError> {
-                    let (account_gate, book_lock, bbo, completion, dirty, placed_tickets) = &*shared;
+                    let (account_gate, book_lock, bbo, completion, dirty, placed_tickets, prof) =
+                        &*shared;
                     let env = BatchEnv {
                         market,
                         account_gate,
@@ -1254,6 +1474,7 @@ where
                         completion,
                         dirty,
                         placed_tickets,
+                        prof: prof.as_deref(),
                     };
                     let mut ctx = make_ctx(book);
                     let result = match &p {
@@ -1271,9 +1492,28 @@ where
                 }
             })
             .collect();
-        pool.run_batch(tasks)
+        let phase_start = Instant::now(); // §1/§H: time the whole parallel batch
+        let res = pool
+            .run_batch(tasks)
             .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>();
+        if let Some(p) = &shared.6 {
+            p.phase_wall_ns
+                .store(phase_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            p.n_ops.store(ops.len() as u64, Ordering::Relaxed);
+            // §B: harvest the producer-side serve-cursor advance (notify_all) total from the ticket lock.
+            p.advance_notify_ns
+                .store(shared.2.advance_ns(), Ordering::Relaxed);
+            // §B rest + §F: harvest the other sched-lock waits + level insert/hit counts.
+            p.acct_wait_ns.store(shared.0.wait_ns(), Ordering::Relaxed);
+            p.book_wait_ns.store(shared.1.wait_ns(), Ordering::Relaxed);
+            p.completion_wait_ns
+                .store(shared.3.wait_ns(), Ordering::Relaxed);
+            let (ins, hits) = shared.1.level_lock_stats();
+            p.level_inserts.store(ins, Ordering::Relaxed);
+            p.level_hits.store(hits, Ordering::Relaxed);
+        }
+        res?
     };
 
     // FIFO-sort the FINAL book: inline takers sorted (via `dirty`) the levels they swept just-in-time,
@@ -1298,6 +1538,39 @@ where
     }
 
     Ok(final_results)
+}
+
+/// Public driver (no profiling) — the node's normal path. Returns per-op replays (with logs).
+pub fn transact_block_parallel_logged<CTX, F>(
+    pool: &PerpPool,
+    book: &Arc<SharedPerpBook>,
+    ops: &[PerpOp],
+    make_ctx: F,
+) -> Result<Vec<OpReplay>, PrecompileError>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX + Clone + Send + 'static,
+{
+    transact_block_parallel_inner(pool, book, ops, make_ctx, None)
+}
+
+/// Profiled driver (catalog #21 `PERP_PROF`): identical execution to [`transact_block_parallel_logged`]
+/// but returns the per-block [`PerpBlockProfile`] (achieved concurrency + classification histogram +
+/// block totals) for the node to emit as the `PERP_PROF …` line. Profiling adds one `Instant` + a few
+/// relaxed atomics per op; the non-profiled path is unaffected.
+pub fn transact_block_parallel_logged_profiled<CTX, F>(
+    pool: &PerpPool,
+    book: &Arc<SharedPerpBook>,
+    ops: &[PerpOp],
+    make_ctx: F,
+) -> Result<(Vec<OpReplay>, Arc<PerpBlockProfile>), PrecompileError>
+where
+    CTX: ContextTr,
+    F: Fn(Arc<SharedPerpBook>) -> CTX + Clone + Send + 'static,
+{
+    let prof = Arc::new(PerpBlockProfile::default());
+    let out = transact_block_parallel_inner(pool, book, ops, make_ctx, Some(prof.clone()))?;
+    Ok((out, prof))
 }
 
 /// Outcome-only wrapper around [`transact_block_parallel_logged`] — drops the captured per-op logs.
@@ -1538,6 +1811,7 @@ mod driver_tests {
             completion: &completion,
             dirty: &dirty,
             placed_tickets: &placed_tickets,
+            prof: None,
         };
 
         let work = PlaceWork {

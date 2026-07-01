@@ -40,10 +40,12 @@
 //! state machine, NO txn_id/rank assignment (all step 3). The serial barrier for market/match
 //! (rule 1) is the driver's phase boundary, not a primitive here.
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use primitives::Address;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Instant;
 
 /// Poison-tolerant lock of a cursor mutex. The protected value is a plain monotonic counter with no
 /// invariant that a panic could break, so recovering a poisoned guard is sound — and it stops one
@@ -59,6 +61,11 @@ fn lock_cursor(m: &Mutex<u64>) -> MutexGuard<'_, u64> {
 #[derive(Debug, Default)]
 pub struct AccountGate {
     lanes: DashMap<Address, Arc<Lane>>,
+    /// PERP_PROF (§B): gate the wait timing (off ⇒ one relaxed load, no `Instant`).
+    profiled: AtomicBool,
+    /// Σ time blocked waiting for this account's prior rank (same-account contention). ~0 when
+    /// accounts ≫ ops/block (the maxParallel design); nonzero ⇒ AccountGate serialization.
+    wait_ns: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -73,7 +80,19 @@ impl AccountGate {
     pub fn new() -> Self {
         Self {
             lanes: DashMap::new(),
+            profiled: AtomicBool::new(false),
+            wait_ns: AtomicU64::new(0),
         }
+    }
+
+    /// Enable §B acct-wait timing (driver calls this under PERP_PROF).
+    pub fn set_profiled(&self, on: bool) {
+        self.profiled.store(on, Ordering::Relaxed);
+    }
+
+    /// Σ same-account wait time this block, in ns.
+    pub fn wait_ns(&self) -> u64 {
+        self.wait_ns.load(Ordering::Relaxed)
     }
 
     fn lane(&self, account: Address) -> Arc<Lane> {
@@ -95,6 +114,7 @@ impl AccountGate {
     /// with an empty body.
     pub fn run<R>(&self, account: Address, rank: u64, f: impl FnOnce() -> R) -> R {
         let lane = self.lane(account);
+        let t = self.profiled.load(Ordering::Relaxed).then(Instant::now); // §B acct wait
         {
             let mut applied = lock_cursor(&lane.applied);
             debug_assert!(
@@ -106,6 +126,10 @@ impl AccountGate {
             while *applied != rank {
                 applied = lane.cv.wait(applied).unwrap_or_else(|p| p.into_inner());
             }
+        }
+        if let Some(t) = t {
+            self.wait_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         // Advance on the way out (incl. panic) — see `LaneAdvance`.
         let _advance = LaneAdvance { lane };
@@ -133,6 +157,12 @@ pub struct BboTicketLock {
     /// The ticket currently allowed to run.
     serve: Mutex<u64>,
     cv: Condvar,
+    /// PERP_PROF (§B): when set, `ServeAdvance::drop` times the producer-side handoff
+    /// (`lock serve` + `serve += 1` + `notify_all`) into `advance_ns`. Off ⇒ one relaxed load, no timing.
+    profiled: AtomicBool,
+    /// Σ producer-side serve-cursor advance time (the `notify_all` machinery) over the block. Serial
+    /// (only one advance runs at a time), so this is the notify/handoff cost NOT counted in `bbo_held`.
+    advance_ns: AtomicU64,
 }
 
 impl BboTicketLock {
@@ -141,7 +171,19 @@ impl BboTicketLock {
         Self {
             serve: Mutex::new(0),
             cv: Condvar::new(),
+            profiled: AtomicBool::new(false),
+            advance_ns: AtomicU64::new(0),
         }
+    }
+
+    /// Enable §B producer-side advance timing (the driver calls this under `PERP_PROF`).
+    pub fn set_profiled(&self, on: bool) {
+        self.profiled.store(on, Ordering::Relaxed);
+    }
+
+    /// Σ producer-side serve-cursor advance (`notify_all` handoff) time this block, in ns.
+    pub fn advance_ns(&self) -> u64 {
+        self.advance_ns.load(Ordering::Relaxed)
     }
 
     /// Runs `f` while holding ticket `ticket`: blocks until it is this ticket's turn, runs `f`
@@ -173,9 +215,16 @@ struct ServeAdvance<'a> {
 
 impl Drop for ServeAdvance<'_> {
     fn drop(&mut self) {
+        // §B: time the producer-side handoff (lock serve + advance + notify_all) when profiling.
+        let t = self.lock.profiled.load(Ordering::Relaxed).then(Instant::now);
         let mut serve = lock_cursor(&self.lock.serve);
         *serve += 1;
         self.lock.cv.notify_all();
+        if let Some(t) = t {
+            self.lock
+                .advance_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -247,6 +296,11 @@ impl PriceCompletion {
 #[derive(Debug, Default)]
 pub struct MarketCompletion {
     markets: DashMap<u64, Arc<MarketDone>>,
+    /// PERP_PROF (§B): gate the wait timing.
+    profiled: AtomicBool,
+    /// Σ time inline takers / emptying-cancels blocked in `wait_below` (the cost of taker
+    /// serialization). ~0 for maxParallel/pureChurn (no crossers); nonzero for realistic crossing flow.
+    wait_ns: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -268,7 +322,19 @@ impl MarketCompletion {
     pub fn new() -> Self {
         Self {
             markets: DashMap::new(),
+            profiled: AtomicBool::new(false),
+            wait_ns: AtomicU64::new(0),
         }
+    }
+
+    /// Enable §B completion-wait timing (driver calls this under PERP_PROF).
+    pub fn set_profiled(&self, on: bool) {
+        self.profiled.store(on, Ordering::Relaxed);
+    }
+
+    /// Σ `wait_below` blocked time this block, in ns (taker-serialization cost).
+    pub fn wait_ns(&self) -> u64 {
+        self.wait_ns.load(Ordering::Relaxed)
     }
 
     fn market(&self, market: u64) -> Arc<MarketDone> {
@@ -302,9 +368,14 @@ impl MarketCompletion {
     /// `below == 0` returns immediately. Poison-tolerant.
     pub fn wait_below(&self, market: u64, below: u64) {
         let md = self.market(market);
+        let t = self.profiled.load(Ordering::Relaxed).then(Instant::now); // §B completion wait
         let mut s = md.state.lock().unwrap_or_else(|p| p.into_inner());
         while s.watermark < below {
             s = md.cv.wait(s).unwrap_or_else(|p| p.into_inner());
+        }
+        if let Some(t) = t {
+            self.wait_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }
 }
@@ -331,6 +402,16 @@ impl MarketCompletion {
 #[derive(Debug, Default)]
 pub struct BookSideLock {
     levels: DashMap<(u64, u8, u64), Arc<Mutex<()>>>,
+    /// PERP_PROF (§B/§F): gate the wait timing + insert/hit counting.
+    profiled: AtomicBool,
+    /// §B: Σ time acquiring the level mutex (same-(market,side,price) contention). ~0 on wide-band
+    /// distinct-price flow (maxParallel); nonzero ⇒ same-price collisions.
+    wait_ns: AtomicU64,
+    /// §F: new level-lock entries (first touch of a price this block — a DashMap insert + Arc/Mutex alloc).
+    lock_inserts: AtomicU64,
+    /// §F: hits on an existing level-lock entry. `inserts ≈ ops` with `wait≈0` ⇒ the per-price lock is
+    /// pure overhead on scattered-price workloads (quantifies the granularity cost).
+    lock_hits: AtomicU64,
 }
 
 impl BookSideLock {
@@ -338,18 +419,57 @@ impl BookSideLock {
     pub fn new() -> Self {
         Self {
             levels: DashMap::new(),
+            profiled: AtomicBool::new(false),
+            wait_ns: AtomicU64::new(0),
+            lock_inserts: AtomicU64::new(0),
+            lock_hits: AtomicU64::new(0),
         }
     }
 
+    /// Enable §B/§F level-lock timing + insert/hit counting (driver calls this under PERP_PROF).
+    pub fn set_profiled(&self, on: bool) {
+        self.profiled.store(on, Ordering::Relaxed);
+    }
+    /// Σ level-mutex acquisition wait this block, in ns.
+    pub fn wait_ns(&self) -> u64 {
+        self.wait_ns.load(Ordering::Relaxed)
+    }
+    /// §F: (new-entry inserts, existing-entry hits) this block.
+    pub fn level_lock_stats(&self) -> (u64, u64) {
+        (
+            self.lock_inserts.load(Ordering::Relaxed),
+            self.lock_hits.load(Ordering::Relaxed),
+        )
+    }
+
     fn level_lock(&self, market: u64, side: u8, price: u64) -> Arc<Mutex<()>> {
-        self.levels.entry((market, side, price)).or_default().clone()
+        let profiled = self.profiled.load(Ordering::Relaxed);
+        match self.levels.entry((market, side, price)) {
+            Entry::Occupied(e) => {
+                if profiled {
+                    self.lock_hits.fetch_add(1, Ordering::Relaxed); // §F hit
+                }
+                e.get().clone()
+            }
+            Entry::Vacant(e) => {
+                if profiled {
+                    self.lock_inserts.fetch_add(1, Ordering::Relaxed); // §F insert (new price)
+                }
+                e.insert(Arc::default()).value().clone()
+            }
+        }
     }
 
     /// Runs `f` while holding the `(market, side, price)` book LEVEL lock. Poison-tolerant: a
     /// previously poisoned level is recovered rather than propagating the panic.
     pub fn run<R>(&self, market: u64, side: u8, price: u64, f: impl FnOnce() -> R) -> R {
         let lock = self.level_lock(market, side, price);
+        let t = self.profiled.load(Ordering::Relaxed).then(Instant::now); // §B book wait
         let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = t {
+            self.wait_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         f()
     }
 }
