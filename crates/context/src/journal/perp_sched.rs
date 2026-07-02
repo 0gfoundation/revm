@@ -153,24 +153,38 @@ impl Drop for LaneAdvance {
 
 /// Ordered exclusive lock for one market's BBO (rules 2+3). Access is granted strictly in `ticket`
 /// order (the driver assigns tickets `0..N` in txn_id order within a parallel batch).
+/// Bounded spin budget for the IMMEDIATE successor (`ticket == serve+1`) before it parks:
+/// exponential `1<<round` PAUSE bursts (Σ = 127 pauses ≈ a few µs) — enough to catch a short held
+/// section (classify on the best mirror ≈ 1-2µs) without the futex round-trip + wake latency, small
+/// enough that a long mover/taker body costs one core only a few µs of spin before the spinner
+/// parks. Farther tickets never spin (spinning a deep queue burns cores). Tunable.
+const BBO_SPIN_ROUNDS: u32 = 7;
+
 #[derive(Debug, Default)]
 pub struct BboTicketLock {
-    /// The ticket currently allowed to run. Also the publication edge: its release→acquire carries a
-    /// served ticket's non-atomic BBO/book writes to the next ticket (pinned by
-    /// `bbo_ticket_publishes_writes_to_next_ticket`).
-    serve: Mutex<u64>,
-    /// Parked successors, keyed `ticket → waiting thread handle`. A waiter registers itself here (under
-    /// the `serve` lock) before parking; the completer of ticket `i` wakes EXACTLY the `i+1` entry — a
-    /// direct single-successor handoff that replaces a `notify_all` thundering herd (every advance used
-    /// to wake all K in-flight waiters, K-1 of which re-parked → O(K)/advance, anti-scaling with the
-    /// pool width). Entries are transient (removed on wake / on self-service). `std::thread::park`'s
-    /// token semantics make an unpark that races ahead of the park harmless (park returns at once).
+    /// The ticket currently allowed to run. LOCK-FREE: waiters `Acquire`-load it (spin or park);
+    /// the completer advances it with a `Release` store — that release→acquire pair on this one
+    /// atomic is the publication edge carrying a served ticket's non-atomic BBO/book writes to the
+    /// next ticket (pinned by `bbo_ticket_publishes_writes_to_next_ticket`). Only the current
+    /// ticket holder ever writes it, so the advance is a plain load+store: no RMW, no mutex, and
+    /// no serve-mutex convoy with concurrently arriving/re-checking waiters.
+    serve: AtomicU64,
+    /// Parked successors, keyed `ticket → waiting thread handle`. A waiter registers itself here
+    /// before its FIRST park; the completer of ticket `i` wakes EXACTLY the `i+1` entry — a direct
+    /// single-successor handoff (no thundering herd). No lost wakeup, both race directions closed:
+    /// - registered before the completer's `remove` → the completer unparks us; `park`'s token
+    ///   makes an unpark that lands before the actual `park()` call return immediately;
+    /// - completer's `remove` before our `insert` → the SAME-KEY DashMap shard lock orders the
+    ///   completer's PRIOR `serve` store before our insert, so our post-insert re-check load sees
+    ///   the advanced cursor and we never park. The "both miss" interleaving is impossible.
+    /// An immediate successor mid-spin intentionally does NOT register — the completer's `remove`
+    /// misses it and the spinner picks the store up via its `Acquire` load (no syscall at all).
     waiters: DashMap<u64, Thread>,
     /// PERP_PROF (§B): when set, `ServeAdvance::drop` times the producer-side handoff
-    /// (`lock serve` + `serve += 1` + successor `unpark`) into `advance_ns`. Off ⇒ one relaxed load.
+    /// (`serve` store + successor take + `unpark`) into `advance_ns`. Off ⇒ one relaxed load.
     profiled: AtomicBool,
-    /// Σ producer-side serve-cursor advance time (the `notify_all` machinery) over the block. Serial
-    /// (only one advance runs at a time), so this is the notify/handoff cost NOT counted in `bbo_held`.
+    /// Σ producer-side serve-cursor advance time over the block. Serial (only one advance runs at
+    /// a time), so this is the handoff cost NOT counted in `bbo_held`.
     advance_ns: AtomicU64,
 }
 
@@ -178,7 +192,7 @@ impl BboTicketLock {
     /// Creates a lock whose first served ticket is 0.
     pub fn new() -> Self {
         Self {
-            serve: Mutex::new(0),
+            serve: AtomicU64::new(0),
             waiters: DashMap::new(),
             profiled: AtomicBool::new(false),
             advance_ns: AtomicU64::new(0),
@@ -190,7 +204,7 @@ impl BboTicketLock {
         self.profiled.store(on, Ordering::Relaxed);
     }
 
-    /// Σ producer-side serve-cursor advance (`notify_all` handoff) time this block, in ns.
+    /// Σ producer-side serve-cursor advance (store + successor unpark) time this block, in ns.
     pub fn advance_ns(&self) -> u64 {
         self.advance_ns.load(Ordering::Relaxed)
     }
@@ -200,29 +214,42 @@ impl BboTicketLock {
     /// returns), then advances the cursor — on Ok, Err, or panic. Passing a ticket without BBO work
     /// = call with an empty body.
     pub fn run<R>(&self, ticket: u64, f: impl FnOnce() -> R) -> R {
-        {
-            let mut serve = lock_cursor(&self.serve);
-            debug_assert!(
-                ticket >= *serve,
-                "bbo ticket {ticket} already served (serve={})",
-                *serve
-            );
-            if *serve != ticket {
-                // Register our handle, THEN loop-check the cursor — the register and every re-check run
-                // under the `serve` lock, so they are serialized with the completer's `advance + take`
-                // (below): either the completer sees our handle and unparks us, or a later re-check
-                // sees the advanced cursor and we never park — the "both miss" interleaving is
-                // impossible. The park token is a second backstop (an unpark landing between register
-                // and `park()` makes that `park()` return immediately). Spurious wakeups are absorbed
-                // by the under-lock re-check.
-                self.waiters.insert(ticket, thread::current());
-                while *serve != ticket {
-                    drop(serve);
-                    thread::park();
-                    serve = lock_cursor(&self.serve);
+        let cur = self.serve.load(Ordering::Acquire);
+        debug_assert!(cur <= ticket, "bbo ticket {ticket} already served (serve={cur})");
+        if cur != ticket {
+            // Lock-free wait. The cursor can only ever REACH `ticket` (never pass it — we are the
+            // sole op holding this ticket, and the cursor stops until our guard advances it), so a
+            // plain equality loop is exact. Three tiers:
+            //  1. immediate successor + unregistered → bounded spin (catch a short predecessor
+            //     held-section with zero syscalls);
+            //  2. spin budget spent / not the successor → register handle, RE-CHECK, then park
+            //     (the re-check after `insert` closes the arrival race — see the field docs);
+            //  3. woken (or spuriously woken via a stale token from an earlier ticket on this
+            //     reused pool thread) → loop re-checks; a miss just re-parks.
+            let mut registered = false;
+            let mut spins = 0u32;
+            loop {
+                let cur = self.serve.load(Ordering::Acquire);
+                if cur == ticket {
+                    break;
                 }
-                // Woken / self-served: consume our registration so the map stays clean (the completer
-                // may already have removed it — idempotent).
+                if !registered {
+                    if ticket == cur + 1 && spins < BBO_SPIN_ROUNDS {
+                        for _ in 0..(1u32 << spins) {
+                            std::hint::spin_loop();
+                        }
+                        spins += 1;
+                        continue;
+                    }
+                    self.waiters.insert(ticket, thread::current());
+                    registered = true;
+                    continue; // re-check AFTER the insert, before the first park
+                }
+                thread::park();
+            }
+            if registered {
+                // Consume our registration so the map stays clean (the completer may already have
+                // removed it — idempotent).
                 self.waiters.remove(&ticket);
             }
         }
@@ -239,16 +266,19 @@ struct ServeAdvance<'a> {
 
 impl Drop for ServeAdvance<'_> {
     fn drop(&mut self) {
-        // §B: time the producer-side handoff (lock serve + advance + successor unpark) when profiling.
+        // §B: time the producer-side handoff (serve store + successor take + unpark) when profiling.
         let t = self.lock.profiled.load(Ordering::Relaxed).then(Instant::now);
-        let succ = {
-            let mut serve = lock_cursor(&self.lock.serve);
-            *serve += 1;
-            // Take the successor's parked handle (if any) UNDER the serve lock — ordered against the
-            // waiter's register + re-check, so we never miss a successor that has committed to parking.
-            self.lock.waiters.remove(&*serve).map(|(_, th)| th)
-        }; // serve released here → publishes this ticket's BBO writes to the successor.
-        if let Some(th) = succ {
+        // Sole writer: only the ticket holder advances, so load+store (no RMW, no lock) is exact.
+        // The `Release` store is the publication edge: the successor's `Acquire` load of `serve`
+        // (spin path) — or the DashMap shard-lock / park-token edges (parked path) — carries every
+        // book write this ticket made.
+        let next = self.lock.serve.load(Ordering::Relaxed) + 1;
+        self.lock.serve.store(next, Ordering::Release);
+        // Take the successor's handle AFTER the store: if the successor registered, we see it here
+        // and unpark (a token-only no-syscall CAS if it is still mid-spin / not yet parked); if the
+        // remove misses, the successor is either mid-spin (its Acquire load picks up the store) or
+        // not yet arrived (its entry check / post-insert re-check sees the advanced cursor).
+        if let Some((_, th)) = self.lock.waiters.remove(&next) {
             th.unpark(); // wake EXACTLY the next ticket — O(1), no thundering herd.
         }
         if let Some(t) = t {
