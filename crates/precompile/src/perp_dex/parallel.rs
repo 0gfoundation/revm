@@ -523,6 +523,15 @@ struct BatchEnv<'a> {
     /// order_id -> ticket for every Place op in the batch (incl. a taker's OWN rested remainder, whose
     /// order_id is the taker's). The FIFO sort key — order_id itself is keccak/per-caller, not ordered.
     placed_tickets: &'a HashMap<[u8; 32], u64>,
+    /// In-memory `market → (best_bid, best_ask)` mirror, plain u64s: the classify hot path reads best
+    /// from HERE (one never-contended mutex + a map get) instead of two overlay/storage reads. Seeded
+    /// from storage at each market's FIRST classify; refreshed (re-read + upsert) after every
+    /// held-ticket body that may move the BBO (mover / reject / inline taker / inline at-best cancel).
+    /// SAFE because every access runs under the held BBO ticket — strictly serialized, and published
+    /// ticket→ticket by the serve handoff — and best is only ever mutated by held-ticket bodies
+    /// (released bodies are non-movers by classification). Storage stays the truth; this never
+    /// writes back.
+    best_mirror: &'a Mutex<HashMap<u64, (u64, u64)>>,
     /// Optional per-block profile (catalog #21 instrumentation). `Some` only when the node set
     /// `PERP_PROF=1`; `None` = zero-cost. Bodies bump it via [`BodyTimer`]; classify bumps the histogram.
     prof: Option<&'a PerpBlockProfile>,
@@ -542,6 +551,48 @@ impl Drop for MarketDoneOnDrop<'_> {
     fn drop(&mut self) {
         self.completion.mark_done(self.market, self.ticket);
     }
+}
+
+/// Best `(bid, ask)` for `market` from the in-memory mirror (see [`BatchEnv::best_mirror`]); seeds it
+/// from storage on the market's first classify. Runs under the held BBO ticket, so the get-or-seed is
+/// race-free and the mutex is never contended. Poison-tolerant.
+fn mirror_best<CTX: ContextTr>(
+    ctx: &mut CTX,
+    mirror: &Mutex<HashMap<u64, (u64, u64)>>,
+    market: u64,
+) -> Result<(u64, u64), PrecompileError> {
+    if let Some(&v) = mirror
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&market)
+    {
+        return Ok(v);
+    }
+    let best_bid = storage::load_best_bid(ctx, market)?;
+    let best_ask = storage::load_best_ask(ctx, market)?;
+    mirror
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(market, (best_bid, best_ask));
+    Ok((best_bid, best_ask))
+}
+
+/// Re-read best from storage and upsert the mirror — called under the held ticket AFTER any body that
+/// may have moved the BBO (mover / reject-in-body / inline taker / inline at-best cancel), BEFORE the
+/// ticket advances, so the next classify reads the post-body best. A reverted body rolls its writes
+/// back first, so the re-read returns the original values (refresh is unconditional + harmless).
+fn mirror_refresh<CTX: ContextTr>(
+    ctx: &mut CTX,
+    mirror: &Mutex<HashMap<u64, (u64, u64)>>,
+    market: u64,
+) -> Result<(), PrecompileError> {
+    let best_bid = storage::load_best_bid(ctx, market)?;
+    let best_ask = storage::load_best_ask(ctx, market)?;
+    mirror
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(market, (best_bid, best_ask));
+    Ok(())
 }
 
 /// Record that a this-block rest landed at `(side, market, price)` so the next inline taker FIFO-sorts
@@ -684,8 +735,9 @@ pub(crate) fn parallel_place<CTX: ContextTr>(
                     TimeInForce::from_u8(work.tif),
                 ) {
                     (Some(side), Some(order_type), Some(tif)) => {
-                        let best_bid = storage::load_best_bid(ctx, work.market_id)?;
-                        let best_ask = storage::load_best_ask(ctx, work.market_id)?;
+                        // Plain-u64 mirror read — no overlay/storage on the classify hot path.
+                        let (best_bid, best_ask) =
+                            mirror_best(ctx, env.best_mirror, work.market_id)?;
                         classify_place(side, order_type, tif, work.price, best_bid, best_ask)
                     }
                     // Unparseable order fields → let the body reject it under the ticket.
@@ -707,19 +759,25 @@ pub(crate) fn parallel_place<CTX: ContextTr>(
                     LockPlan::DowngradeToBarrier => {
                         env.completion.wait_below(env.market, work.ticket);
                         sort_dirty(ctx, env.dirty, env.placed_tickets)?;
-                        let _bt = BodyTimer::new(env.prof); // §1 time the inline-taker body
-                        Ok(UnderTicket::Done(gated_taker(ctx, env.account_gate, work)))
+                        let r = {
+                            let _bt = BodyTimer::new(env.prof); // §1 time the inline-taker body
+                            gated_taker(ctx, env.account_gate, work)
+                        };
+                        // The match may have moved the BBO — refresh the mirror before the ticket
+                        // advances so the next classify reads the post-body best.
+                        mirror_refresh(ctx, env.best_mirror, work.market_id)?;
+                        Ok(UnderTicket::Done(r))
                     }
                     // A mover (or a PostOnly-cross self-reject) executes while holding the BBO ticket so
                     // its best-update is serialized; the body itself takes the book-side lock.
                     LockPlan::HoldTicket | LockPlan::RejectInBody => {
-                        let _bt = BodyTimer::new(env.prof); // §1 time the mover/reject body
-                        Ok(UnderTicket::Done(gated_execute(
-                            ctx,
-                            env.account_gate,
-                            env.book_lock,
-                            work,
-                        )))
+                        let r = {
+                            let _bt = BodyTimer::new(env.prof); // §1 time the mover/reject body
+                            gated_execute(ctx, env.account_gate, env.book_lock, work)
+                        };
+                        // A committed mover moved the BBO (a reject rolled back → re-read = original).
+                        mirror_refresh(ctx, env.best_mirror, work.market_id)?;
+                        Ok(UnderTicket::Done(r))
                     }
                     LockPlan::ReleaseTicket => Ok(UnderTicket::Release),
                 }
@@ -777,6 +835,7 @@ where
     let dirty = Mutex::new(HashSet::new());
     let placed_tickets: HashMap<[u8; 32], u64> =
         items.iter().map(|w| (w.order_id, w.ticket)).collect();
+    let best_mirror = Mutex::new(HashMap::new());
     let market = items.first().map(|w| w.market_id).unwrap_or(0);
     let env = BatchEnv {
         market,
@@ -786,6 +845,7 @@ where
         completion: &completion,
         dirty: &dirty,
         placed_tickets: &placed_tickets,
+        best_mirror: &best_mirror,
         prof: None,
     };
     let (make_ctx, env) = (&make_ctx, &env);
@@ -987,8 +1047,8 @@ fn parallel_cancel<CTX: ContextTr>(
             let held_start = env.prof.map(|_| Instant::now());
             let out = (|| -> Result<Flow, PrecompileError> {
                 let cls_start = env.prof.map(|_| Instant::now());
-                let best_bid = storage::load_best_bid(ctx, market)?;
-                let best_ask = storage::load_best_ask(ctx, market)?;
+                // Plain-u64 mirror read — no overlay/storage on the classify hot path.
+                let (best_bid, best_ask) = mirror_best(ctx, env.best_mirror, market)?;
                 if let (Some(p), Some(cs)) = (env.prof, cls_start) {
                     p.classify_ns.fetch_add(cs.elapsed().as_nanos() as u64, Ordering::Relaxed); // §C
                 }
@@ -1002,12 +1062,13 @@ fn parallel_cancel<CTX: ContextTr>(
                     return Ok(Flow::RunParallel);
                 }
                 env.completion.wait_below(env.market, plan.work.ticket);
-                let _bt = BodyTimer::new(env.prof); // §1 time the inline at-best cancel body
-                Ok(Flow::Done(gated_cancel_inline(
-                    ctx,
-                    env.account_gate,
-                    &plan.work,
-                )))
+                let r = {
+                    let _bt = BodyTimer::new(env.prof); // §1 time the inline at-best cancel body
+                    gated_cancel_inline(ctx, env.account_gate, &plan.work)
+                };
+                // Removing the at-best order may have moved the BBO — refresh before advancing.
+                mirror_refresh(ctx, env.best_mirror, market)?;
+                Ok(Flow::Done(r))
             })();
             if let (Some(_p), Some(hs)) = (env.prof, held_start) {
                 held_ns.set(hs.elapsed().as_nanos() as u64); // §B held = time under the ticket
@@ -1097,6 +1158,7 @@ where
     let completion = MarketCompletion::new();
     let dirty = Mutex::new(HashSet::new());
     let placed_tickets: HashMap<[u8; 32], u64> = HashMap::new();
+    let best_mirror = Mutex::new(HashMap::new());
     let market = plans
         .iter()
         .find_map(|p| p.resolved.map(|(m, _, _)| m))
@@ -1109,6 +1171,7 @@ where
         completion: &completion,
         dirty: &dirty,
         placed_tickets: &placed_tickets,
+        best_mirror: &best_mirror,
         prof: None,
     };
     let (make_ctx, plans, env) = (&make_ctx, &plans, &env);
@@ -1566,6 +1629,7 @@ where
         Mutex::new(HashSet::<(u8, u64, u64)>::new()),
         placed_tickets,
         prof, // element .6: Option<Arc<PerpBlockProfile>> (Some under PERP_PROF)
+        Mutex::new(HashMap::<u64, (u64, u64)>::new()), // element .7: the best (bid, ask) mirror
     ));
     if shared.6.is_some() {
         // §B/§F: enable the sched-lock wait timers + level insert/hit counting for this block.
@@ -1583,8 +1647,16 @@ where
                 let make_ctx = make_ctx.clone();
                 let shared = shared.clone();
                 move || -> Result<OpReplay, PrecompileError> {
-                    let (account_gate, book_lock, bbo, completion, dirty, placed_tickets, prof) =
-                        &*shared;
+                    let (
+                        account_gate,
+                        book_lock,
+                        bbo,
+                        completion,
+                        dirty,
+                        placed_tickets,
+                        prof,
+                        best_mirror,
+                    ) = &*shared;
                     let env = BatchEnv {
                         market,
                         account_gate,
@@ -1593,6 +1665,7 @@ where
                         completion,
                         dirty,
                         placed_tickets,
+                        best_mirror,
                         prof: prof.as_deref(),
                     };
                     let mut ctx = make_ctx(book);
@@ -2034,6 +2107,7 @@ mod driver_tests {
         let completion = MarketCompletion::new();
         let dirty = Mutex::new(HashSet::new());
         let placed_tickets = HashMap::new();
+        let best_mirror = Mutex::new(HashMap::new());
         let env = BatchEnv {
             market: 1,
             account_gate: &gate,
@@ -2042,6 +2116,7 @@ mod driver_tests {
             completion: &completion,
             dirty: &dirty,
             placed_tickets: &placed_tickets,
+            best_mirror: &best_mirror,
             prof: None,
         };
 
