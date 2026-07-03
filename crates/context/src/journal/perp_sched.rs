@@ -151,15 +151,44 @@ impl Drop for LaneAdvance {
     }
 }
 
+/// W-window spin depth for the BBO serve cursor: any waiter within `W` tickets of the cursor
+/// busy-spins on the `Acquire` load and NEVER parks; the completer of ticket `t` wakes the WINDOW
+/// ENTRANT `t+1+W` (not the immediate successor), so a parked thread's futex wake latency
+/// (measured ~40µs on GCP) is hidden behind the `W` short serial sections still ahead of it instead
+/// of sitting on the handoff critical path. Validated on a 32-vCPU (16-physical-core) box: W=8 took
+/// maxParallel phase 52→7.8ms / concurrency 0.87→7.26 and reached same-binary-serial parity; on 8
+/// physical cores W-spin was a net loss (spinners starved the concurrent state-root/exec threads),
+/// so the default is core-gated. `W`'s natural scale ≈ wake_latency / per-op serial cost, capped by
+/// spare cores. Override with `PERP_SPIN_WINDOW` (read once).
+///   W=0 → nobody spins (pure park); W=1 → immediate successor only; larger → deeper pipelining.
+fn spin_window() -> u64 {
+    static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        if let Some(w) = std::env::var("PERP_SPIN_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            return w;
+        }
+        // Core-gated default: spinning needs headroom beyond the ~cores/2 perp pool + the
+        // concurrent exec/state-root/CL threads. Logical-core thresholds (physical ≈ logical/2):
+        // ≥32 logical (≥16 phys) → 8 (the validated winner); ≥16 → 4; below → 0 (park-only, the
+        // measured-safe choice on 8 physical cores).
+        let logical = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if logical >= 32 {
+            8
+        } else if logical >= 16 {
+            4
+        } else {
+            0
+        }
+    })
+}
+
 /// Ordered exclusive lock for one market's BBO (rules 2+3). Access is granted strictly in `ticket`
 /// order (the driver assigns tickets `0..N` in txn_id order within a parallel batch).
-/// Bounded spin budget for the IMMEDIATE successor (`ticket == serve+1`) before it parks:
-/// exponential `1<<round` PAUSE bursts (Σ = 127 pauses ≈ a few µs) — enough to catch a short held
-/// section (classify on the best mirror ≈ 1-2µs) without the futex round-trip + wake latency, small
-/// enough that a long mover/taker body costs one core only a few µs of spin before the spinner
-/// parks. Farther tickets never spin (spinning a deep queue burns cores). Tunable.
-const BBO_SPIN_ROUNDS: u32 = 7;
-
 #[derive(Debug, Default)]
 pub struct BboTicketLock {
     /// The ticket currently allowed to run. LOCK-FREE: waiters `Acquire`-load it (spin or park);
@@ -217,30 +246,30 @@ impl BboTicketLock {
         let cur = self.serve.load(Ordering::Acquire);
         debug_assert!(cur <= ticket, "bbo ticket {ticket} already served (serve={cur})");
         if cur != ticket {
-            // Lock-free wait. The cursor can only ever REACH `ticket` (never pass it — we are the
-            // sole op holding this ticket, and the cursor stops until our guard advances it), so a
-            // plain equality loop is exact. Three tiers:
-            //  1. immediate successor + unregistered → bounded spin (catch a short predecessor
-            //     held-section with zero syscalls);
-            //  2. spin budget spent / not the successor → register handle, RE-CHECK, then park
-            //     (the re-check after `insert` closes the arrival race — see the field docs);
-            //  3. woken (or spuriously woken via a stale token from an earlier ticket on this
-            //     reused pool thread) → loop re-checks; a miss just re-parks.
+            // Lock-free W-window wait. The cursor can only ever REACH `ticket` (never pass it — we
+            // are the sole op holding this ticket, and the cursor stops until our guard advances
+            // it), so a plain equality loop is exact. Three tiers:
+            //  1. IN-WINDOW (`ticket - cur <= W`) → busy-spin, NEVER park: the cursor is at most W
+            //     short serial sections away, so the futex round-trip + wake latency is avoided.
+            //  2. beyond the window → register handle, RE-CHECK, then park. The re-check after
+            //     `insert` closes the arrival race: our wake comes from the completer of
+            //     `ticket-1-W` (the window-entrant wake); if it already fired before we registered,
+            //     the reloaded cursor puts us in-window and we spin instead of parking — no lost
+            //     wakeup (park token + same-key shard ordering are the second guard; see field docs).
+            //  3. woken (entrant wake / stale token on a reused pool thread) → loop re-checks;
+            //     in-window → spin till served; else re-park.
+            let w = spin_window();
             let mut registered = false;
-            let mut spins = 0u32;
             loop {
                 let cur = self.serve.load(Ordering::Acquire);
                 if cur == ticket {
                     break;
                 }
+                if ticket - cur <= w {
+                    std::hint::spin_loop();
+                    continue;
+                }
                 if !registered {
-                    if ticket == cur + 1 && spins < BBO_SPIN_ROUNDS {
-                        for _ in 0..(1u32 << spins) {
-                            std::hint::spin_loop();
-                        }
-                        spins += 1;
-                        continue;
-                    }
                     self.waiters.insert(ticket, thread::current());
                     registered = true;
                     continue; // re-check AFTER the insert, before the first park
@@ -274,12 +303,16 @@ impl Drop for ServeAdvance<'_> {
         // book write this ticket made.
         let next = self.lock.serve.load(Ordering::Relaxed) + 1;
         self.lock.serve.store(next, Ordering::Release);
-        // Take the successor's handle AFTER the store: if the successor registered, we see it here
-        // and unpark (a token-only no-syscall CAS if it is still mid-spin / not yet parked); if the
-        // remove misses, the successor is either mid-spin (its Acquire load picks up the store) or
-        // not yet arrived (its entry check / post-insert re-check sees the advanced cursor).
-        if let Some((_, th)) = self.lock.waiters.remove(&next) {
-            th.unpark(); // wake EXACTLY the next ticket — O(1), no thundering herd.
+        // Wake targets AFTER the store (ordered against the waiter's register + re-check):
+        //  - `next + W` = the WINDOW ENTRANT — it need not run yet, only START SPINNING; its futex
+        //    wake latency hides behind the W serial sections still ahead of it (the pipelined wake);
+        //  - `next` as a safety net (an in-window waiter never parks, so this is normally a miss;
+        //    with W=0 the two keys coincide and this IS the single-successor wake). O(1), no herd.
+        let w = spin_window();
+        for key in [next + w, next] {
+            if let Some((_, th)) = self.lock.waiters.remove(&key) {
+                th.unpark();
+            }
         }
         if let Some(t) = t {
             self.lock
