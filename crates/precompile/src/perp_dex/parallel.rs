@@ -2437,6 +2437,70 @@ mod driver_tests {
     // ── unified block driver (step 3d) ────────────────────────────────────────────
 
     /// Run one block op via its normal SERIAL entrypoint (the differential reference).
+    /// MANUAL perf probe (not a CI test): serial inline per-op cost of an mp-shaped place (a
+    /// non-mover GTC rest below a fixed best) on a WARM ctx — the `x` term in the serial-vs-parallel
+    /// per-tx ledger (parity algebra on val1/32c derived x ≈ 14µs; this measures it directly).
+    /// Run: cargo test -p revm-precompile --release --features perp-parallel \
+    ///        bench_serial_place_per_op -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual perf probe, run with --release --ignored --nocapture"]
+    fn bench_serial_place_per_op() {
+        let users: Vec<Address> = (1..=512).map(user_addr).collect();
+        let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+        seed(&mut ctx, &users);
+        let mkid = |i: u64| {
+            let mut id = [0u8; 32];
+            id[0] = 0xbe;
+            id[24..].copy_from_slice(&i.to_be_bytes());
+            id
+        };
+        // Fixed best_bid at 95*TICK (maxParallel's pre-seeded-best trick): every later buy below it
+        // is a non-mover rest — the mp hot-path shape.
+        place_order_core(users[0], mkid(0), MID, 0, 95 * TICK, QTY, 0, 0, [0u8; 16], &mut ctx)
+            .unwrap();
+        let price_of = |i: u64| (90 - (i % 90)) * TICK; // 90 distinct levels, cycled
+        for i in 1..=200u64 {
+            // warm-up
+            place_order_core(
+                users[(i as usize) % 512],
+                mkid(i),
+                MID,
+                0,
+                price_of(i),
+                QTY,
+                0,
+                0,
+                [0u8; 16],
+                &mut ctx,
+            )
+            .unwrap();
+        }
+        let n: u64 = 1500;
+        let t0 = Instant::now();
+        for i in 201..201 + n {
+            place_order_core(
+                users[(i as usize) % 512],
+                mkid(i),
+                MID,
+                0,
+                price_of(i),
+                QTY,
+                0,
+                0,
+                [0u8; 16],
+                &mut ctx,
+            )
+            .unwrap();
+        }
+        let el = t0.elapsed();
+        println!(
+            "serial place_order_core (mp-shape, warm ctx): {} ops in {:?} -> {:.2} µs/op",
+            n,
+            el,
+            el.as_micros() as f64 / n as f64
+        );
+    }
+
     fn run_serial_op<CTX: ContextTr>(ctx: &mut CTX, op: &PerpOp) {
         match op {
             PerpOp::Place(w) => {
