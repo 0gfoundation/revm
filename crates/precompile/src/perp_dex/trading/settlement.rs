@@ -9,7 +9,7 @@ use crate::{
         interface::IPerpDex,
         math::{
             calc_maker_fee_for_order_qty_with_bps, calc_reservation_notionals, calc_trading_fee,
-            calc_value, checked_u64_to_i64,
+            calc_value, checked_u64_to_i64, is_above_maintenance_margin,
         },
         storage,
         types::{OrderStatus, Side},
@@ -200,6 +200,31 @@ impl TakerSettlement {
             opening_value,
             is_buy,
         )?;
+
+        // Open-into-insolvency guard (K9): a taker may not open/increase a
+        // position that is already below maintenance margin at the current mark.
+        // Together with the placement band this blocks manufacturing an insolvent
+        // position (the insurance-fund mint). Returning Err reverts the whole
+        // placeOrder tx. Skipped when mark is unset (0 — save_market fixtures;
+        // addMarket-created markets always have a mark). Closing/reducing is never
+        // gated: its realized loss beyond margin is legitimate bad debt (below).
+        if opening_qty > 0 {
+            let mark = storage::load_mark_price(context, self.market_id)?;
+            if mark > 0
+                && !is_above_maintenance_margin(
+                    mark,
+                    pos.amount,
+                    pos.v_quote_balance,
+                    pos.margin,
+                    market.base_decimals,
+                    market.price_decimals,
+                )?
+            {
+                return Err(perp_err(
+                    "placeOrder: open would breach maintenance margin",
+                ));
+            }
+        }
 
         // Isolated margin: a realized loss beyond the position's own margin is bad
         // debt routed DIRECTLY to the Insurance Fund — never the taker's wallet.

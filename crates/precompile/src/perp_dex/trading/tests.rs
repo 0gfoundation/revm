@@ -325,6 +325,27 @@ fn price_band_disabled_by_large_bps() {
 }
 
 #[test]
+fn taker_open_below_maintenance_is_rejected() {
+    // Disabled band so we can construct an off-mark fill; mark = 100 ticks.
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 1_000_000);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    // ALICE rests a bid far below mark (50 ticks) — allowed (band disabled).
+    assert!(
+        try_place_limit(&mut ctx, ALICE, 0, 50 * TICK).is_ok(),
+        "resting bid should be accepted"
+    );
+    // BOB sells into it: opens a short at 50 while mark is 100 -> position_value
+    // = -notional + vquote + margin = 0, below the 1/6 maintenance threshold ->
+    // the taker open-solvency guard reverts the whole order.
+    let err = try_place_limit(&mut ctx, BOB, 1, 50 * TICK).unwrap_err();
+    assert!(
+        err.to_string().contains("breach maintenance margin"),
+        "{err}"
+    );
+}
+
+#[test]
 fn price_band_skipped_when_mark_unset() {
     // No mark set (mark == 0): the band cannot be evaluated, so it is skipped.
     // markets created via addMarket always have a mark, so this only affects
