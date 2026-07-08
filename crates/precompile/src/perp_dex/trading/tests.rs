@@ -212,6 +212,131 @@ fn rejects_quantity_below_minimum() {
     assert!(err.to_string().contains("below minimum"), "{err}");
 }
 
+// ── Price band (placement) ──────────────────────────────────────────────────
+
+/// Register a market with an explicit `price_band_bps` (no mark set) and fund
+/// ALICE/BOB generously so far-from-mark acceptance cases can reserve margin.
+/// Tests set the mark themselves via `storage::save_mark_price` when they want
+/// the band active (an unset mark == 0 skips the band by design).
+fn setup_banded(ctx: &mut TestCtx, band_bps: u32) {
+    storage::save_admin(ctx, ADMIN).unwrap();
+    storage::save_market(
+        ctx,
+        &Market {
+            market_id: MARKET_ID,
+            base_decimals: 8,
+            price_decimals: 9,
+            tick_size: TICK,
+            step_size: QTY,
+            min_quantity: QTY,
+            max_quantity: QTY * 1_000,
+            max_price: PRICE * 1_000,
+            price_update_interval: 15,
+            active: true,
+            funding_interval: 0,
+            interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
+            price_band_bps: band_bps,
+        },
+    )
+    .unwrap();
+    fund(ctx, ALICE, WALLET * 1_000);
+    fund(ctx, BOB, WALLET * 1_000);
+}
+
+fn try_place_limit(ctx: &mut TestCtx, caller: Address, side: u8, price: u64) -> Result<Bytes, PrecompileError> {
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side,
+        price,
+        quantity: QTY,
+        orderType: 0, // Limit
+        tif: 0,       // GTC
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    run_place_order(&input, caller, ctx)
+}
+
+#[test]
+fn price_band_rejects_limit_far_above_mark() {
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0); // 0 -> DEFAULT_PRICE_BAND_BPS = 1000 bps (+-10%)
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    // mark = 100 ticks; upper edge = 110 ticks. 111 is just outside.
+    let err = try_place_limit(&mut ctx, ALICE, 0, 111 * TICK).unwrap_err();
+    assert!(err.to_string().contains("outside price band"), "{err}");
+}
+
+#[test]
+fn price_band_rejects_limit_far_below_mark() {
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    // lower edge = 90 ticks. 89 is just outside.
+    let err = try_place_limit(&mut ctx, ALICE, 1, 89 * TICK).unwrap_err();
+    assert!(err.to_string().contains("outside price band"), "{err}");
+}
+
+#[test]
+fn price_band_accepts_limit_at_edges() {
+    // Upper edge (mark + 10%): a resting bid at exactly the band edge is allowed.
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    assert!(
+        try_place_limit(&mut ctx, ALICE, 0, 110 * TICK).is_ok(),
+        "upper-edge order must be accepted"
+    );
+    // Lower edge (mark - 10%): fresh ctx so the ask does not cross the bid above.
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    assert!(
+        try_place_limit(&mut ctx, ALICE, 1, 90 * TICK).is_ok(),
+        "lower-edge order must be accepted"
+    );
+}
+
+#[test]
+fn price_band_honors_configured_bps() {
+    // Explicit 500 bps (+-5%) band, not the default: upper edge = 105 ticks.
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 500);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    assert!(
+        try_place_limit(&mut ctx, ALICE, 0, 105 * TICK).is_ok(),
+        "order at the 5% edge must be accepted"
+    );
+    let err = try_place_limit(&mut ctx, BOB, 0, 106 * TICK).unwrap_err();
+    assert!(err.to_string().contains("outside price band"), "{err}");
+}
+
+#[test]
+fn price_band_disabled_by_large_bps() {
+    // A large band effectively disables the check: a 3x-mark order is accepted.
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 1_000_000);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    assert!(
+        try_place_limit(&mut ctx, ALICE, 0, 300 * TICK).is_ok(),
+        "large-band order far from mark must be accepted"
+    );
+}
+
+#[test]
+fn price_band_skipped_when_mark_unset() {
+    // No mark set (mark == 0): the band cannot be evaluated, so it is skipped.
+    // markets created via addMarket always have a mark, so this only affects
+    // save_market-based fixtures.
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0);
+    assert!(
+        try_place_limit(&mut ctx, ALICE, 0, 300 * TICK).is_ok(),
+        "with no mark the band must not reject"
+    );
+}
+
 #[test]
 fn rejects_quantity_not_multiple_of_step_size() {
     let mut ctx = make_ctx();
@@ -2307,10 +2432,15 @@ mod golden {
     /// 0x3c80c530439970bd37d4bef6bcfd22411740241981764031154765a558bf9f47.
     /// Price-band field (2026-07): `Market` gained `price_band_bps` (serialized as "pb"),
     /// so every stored market blob is longer → write-stream commitment shifts. CHAIN change;
-    /// BusinessSnapshot UNCHANGED (band default is inert until enforcement lands). Prior value
+    /// BusinessSnapshot UNCHANGED. Prior value
     /// 0x24d9197680681d1b627f13e28ba971a3e1bf2589a979141ae48989efc797e7e6.
+    /// Band enforcement (2026-07): this scenario's market band was set to a disabled value
+    /// (1_000_000 bps) so the matching/settlement regression is unaffected by the new
+    /// placement band; the changed "pb" value shifts the blob → commitment. CHAIN change;
+    /// BusinessSnapshot UNCHANGED (band disabled → identical execution). Prior value
+    /// 0x05ec6b7a77d6bc57750d92e5624c5dd8262c291fdfa56da0b8fe1cd312bf6aed.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x05ec6b7a77d6bc57750d92e5624c5dd8262c291fdfa56da0b8fe1cd312bf6aed");
+        b256!("0x4bad03218af966c0aa1b30a0611eebc746d7b9e07ec33115c2d14ae1fe833af3");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -2709,7 +2839,10 @@ mod golden {
                 interestRate: 100,
                 liquidationFeeRateBps: 50,
                 initialMarkPrice: PRICE,
-                priceBandBps: 0,
+                // Disabled band (>> this scenario's max price = 10x mark): the golden
+                // scenario is the matching/settlement/commitment regression, not a band
+                // test. Band enforcement is exercised by dedicated tests below.
+                priceBandBps: 1_000_000,
             }
             .abi_encode(),
         );
@@ -2728,7 +2861,7 @@ mod golden {
                 fundingInterval: 3_600,
                 interestRate: 100,
                 liquidationFeeRateBps: 50,
-                priceBandBps: 0,
+                priceBandBps: 1_000_000, // keep the golden band disabled (see addMarket above)
             }
             .abi_encode(),
         );

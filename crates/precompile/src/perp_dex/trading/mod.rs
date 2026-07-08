@@ -26,7 +26,7 @@ use crate::{
         },
         math::{
             calc_maker_fee_for_order_qty_with_bps, calc_reservation_notionals, calc_trading_fee,
-            calc_value,
+            calc_value, effective_price_band_bps,
         },
         risk::record_mid_price_sample_for_best_quote_change,
         storage,
@@ -484,6 +484,28 @@ fn validate_place_order<CTX: ContextTr>(
         }
         if market.tick_size > 0 && price % market.tick_size != 0 {
             return Err(perp_err("placeOrder: price not multiple of tick_size"));
+        }
+        // Price band (K9 mitigation): reject a limit order whose price is farther
+        // than +-price_band_bps from the current mark. This blocks trading at a
+        // manufactured off-mark price (the mint vector). Enforced at placement per
+        // design; a stale resting order that drifts out of band after a mark move is
+        // handled by the fill-time solvency guard, not here. `price_band_bps == 0`
+        // uses the default; `>= 10_000` widens the lower bound to 0 (toward disabled).
+        // Market orders carry no limit price and are bounded by the in-band book.
+        let mark = storage::load_mark_price(context, market_id)?;
+        if mark > 0 {
+            let bps = effective_price_band_bps(market.price_band_bps) as u128;
+            let mark_u = mark as u128;
+            let upper = mark_u.saturating_mul(10_000 + bps) / 10_000;
+            let lower = if bps >= 10_000 {
+                0
+            } else {
+                mark_u * (10_000 - bps) / 10_000
+            };
+            let price_u = price as u128;
+            if price_u < lower || price_u > upper {
+                return Err(perp_err("placeOrder: price outside price band"));
+            }
         }
     }
 
