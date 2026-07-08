@@ -148,6 +148,12 @@ pub struct Market {
     /// 0 = no fee.
     #[serde(default, rename = "lf")]
     pub liquidation_fee_rate_bps: u32,
+    /// Price band half-width in basis points (1 bps = 0.01%). A limit order is
+    /// rejected at placement if its price lies outside `mark ± price_band_bps`.
+    /// `0` means "use `DEFAULT_PRICE_BAND_BPS`"; a large value (e.g. `>= 10_000`)
+    /// effectively disables the band. Resolve via `crate::perp_dex::math::effective_price_band_bps`.
+    #[serde(default, rename = "pb")]
+    pub price_band_bps: u32,
 }
 
 #[cfg(test)]

@@ -1424,6 +1424,7 @@ mod size_probe_tests {
             funding_interval: 28_800,
             interest_rate: 100,
             liquidation_fee_rate_bps: 50,
+            price_band_bps: 0,
         };
         let buf = encode(&market).unwrap();
         println!("Market: {} bytes", buf.len());
@@ -1588,6 +1589,7 @@ mod encoding_roundtrip_tests {
                 funding_interval: 3600,
                 interest_rate: i64::MIN,
                 liquidation_fee_rate_bps: u32::MAX,
+                price_band_bps: 0,
             },
         );
     }

@@ -23,6 +23,22 @@ pub const MAINTENANCE_MARGIN_DENOMINATOR: i128 = 6;
 /// Trading fee denominator. 1 basis point = 1 / 10_000.
 pub const FEE_BPS_DENOMINATOR: u64 = 10_000;
 
+/// Default price-band half-width (basis points) used when a market's
+/// `price_band_bps` is left at `0`. 1_000 bps = ±10%.
+pub const DEFAULT_PRICE_BAND_BPS: u32 = 1_000;
+
+/// Resolve a market's stored `price_band_bps` to the effective value:
+/// `0` maps to [`DEFAULT_PRICE_BAND_BPS`], any other value is used verbatim
+/// (a large value such as `>= 10_000` effectively disables the band).
+#[inline]
+pub fn effective_price_band_bps(price_band_bps: u32) -> u32 {
+    if price_band_bps == 0 {
+        DEFAULT_PRICE_BAND_BPS
+    } else {
+        price_band_bps
+    }
+}
+
 #[inline]
 fn pow10_u128(exp: u32) -> Result<u128, PrecompileError> {
     10u128

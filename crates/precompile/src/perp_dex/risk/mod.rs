@@ -153,6 +153,19 @@ pub fn run_add_market<CTX: ContextTr>(
             "addMarket: maxPrice must be a multiple of tickSize",
         ));
     }
+    // A mandatory initial mark price lets the price band be active from block one
+    // (no unpriced bootstrap window). It is overwritten by the first updateIndexPrice.
+    if args.initialMarkPrice == 0 {
+        return Err(perp_err("addMarket: initialMarkPrice must be > 0"));
+    }
+    if args.initialMarkPrice > args.maxPrice {
+        return Err(perp_err("addMarket: initialMarkPrice exceeds maxPrice"));
+    }
+    if args.initialMarkPrice % args.tickSize != 0 {
+        return Err(perp_err(
+            "addMarket: initialMarkPrice must be a multiple of tickSize",
+        ));
+    }
 
     let market = Market {
         market_id: args.marketId,
@@ -168,8 +181,10 @@ pub fn run_add_market<CTX: ContextTr>(
         funding_interval: args.fundingInterval,
         interest_rate: args.interestRate,
         liquidation_fee_rate_bps: args.liquidationFeeRateBps,
+        price_band_bps: args.priceBandBps,
     };
     storage::save_market(context, &market)?;
+    storage::save_mark_price(context, args.marketId, args.initialMarkPrice)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
@@ -186,6 +201,17 @@ pub fn run_add_market<CTX: ContextTr>(
             fundingInterval: args.fundingInterval,
             interestRate: args.interestRate,
             liquidationFeeRateBps: args.liquidationFeeRateBps,
+            initialMarkPrice: args.initialMarkPrice,
+            priceBandBps: args.priceBandBps,
+        }
+        .to_log_data(),
+    });
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::MarkPriceUpdated {
+            marketId: args.marketId,
+            price: args.initialMarkPrice,
+            updater: caller,
         }
         .to_log_data(),
     });
@@ -193,7 +219,7 @@ pub fn run_add_market<CTX: ContextTr>(
     Ok(Bytes::new())
 }
 
-/// `updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate)`
+/// `updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps)`
 pub fn run_update_market<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -252,6 +278,7 @@ pub fn run_update_market<CTX: ContextTr>(
     market.funding_interval = args.fundingInterval;
     market.interest_rate = args.interestRate;
     market.liquidation_fee_rate_bps = args.liquidationFeeRateBps;
+    market.price_band_bps = args.priceBandBps;
     storage::save_market(context, &market)?;
 
     context.journal_mut().log(Log {
@@ -268,6 +295,7 @@ pub fn run_update_market<CTX: ContextTr>(
             fundingInterval: args.fundingInterval,
             interestRate: args.interestRate,
             liquidationFeeRateBps: args.liquidationFeeRateBps,
+            priceBandBps: args.priceBandBps,
         }
         .to_log_data(),
     });

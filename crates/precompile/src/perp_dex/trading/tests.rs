@@ -67,6 +67,7 @@ fn setup(ctx: &mut TestCtx) {
             funding_interval: 0,
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
+            price_band_bps: 0,
         },
     )
     .unwrap();
@@ -341,6 +342,7 @@ fn margin_uses_market_price_decimals() {
             funding_interval: 0,
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
+            price_band_bps: 0,
         },
     )
     .unwrap();
@@ -2081,6 +2083,7 @@ mod perf {
                 funding_interval: 3_600,
                 interest_rate: 0,
                 liquidation_fee_rate_bps: 0,
+                price_band_bps: 0,
             },
         )
         .unwrap();
@@ -2302,8 +2305,12 @@ mod golden {
     /// (`take_perp_delta` → `finalize_block_commitment`), replacing the per-call v2 flush.
     /// BusinessSnapshot is UNCHANGED (pure commitment-representation change). Prior v2 value
     /// 0x3c80c530439970bd37d4bef6bcfd22411740241981764031154765a558bf9f47.
+    /// Price-band field (2026-07): `Market` gained `price_band_bps` (serialized as "pb"),
+    /// so every stored market blob is longer → write-stream commitment shifts. CHAIN change;
+    /// BusinessSnapshot UNCHANGED (band default is inert until enforcement lands). Prior value
+    /// 0x24d9197680681d1b627f13e28ba971a3e1bf2589a979141ae48989efc797e7e6.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x24d9197680681d1b627f13e28ba971a3e1bf2589a979141ae48989efc797e7e6");
+        b256!("0x05ec6b7a77d6bc57750d92e5624c5dd8262c291fdfa56da0b8fe1cd312bf6aed");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -2701,6 +2708,8 @@ mod golden {
                 fundingInterval: 3_600,
                 interestRate: 100,
                 liquidationFeeRateBps: 50,
+                initialMarkPrice: PRICE,
+                priceBandBps: 0,
             }
             .abi_encode(),
         );
@@ -2719,6 +2728,7 @@ mod golden {
                 fundingInterval: 3_600,
                 interestRate: 100,
                 liquidationFeeRateBps: 50,
+                priceBandBps: 0,
             }
             .abi_encode(),
         );
