@@ -399,8 +399,12 @@ fn set_leverage_core<CTX: ContextTr>(
     market_id: u64,
     leverage: u64,
 ) -> Result<Bytes, PrecompileError> {
-    if leverage == 0 || leverage > 20 {
-        return Err(perp_err("setLeverage: leverage must be 1–20"));
+    // Max leverage is capped at 6 to stay consistent with the 1/6 maintenance-margin
+    // rate: a fresh position opened at leverage L has equity = notional/L at mark, so
+    // L > 6 would open below maintenance (notional/6) and be rejected by the K9
+    // open-solvency guard. Raising this cap requires lowering MAINTENANCE_MARGIN_DENOMINATOR.
+    if leverage == 0 || leverage > 6 {
+        return Err(perp_err("setLeverage: leverage must be 1–6"));
     }
     storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("setLeverage: unknown market"))?;

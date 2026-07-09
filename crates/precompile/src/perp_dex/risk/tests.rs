@@ -645,9 +645,19 @@ fn set_leverage_allows_increase_with_open_position() {
     setup_market(&mut ctx);
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
 
-    set_leverage(&mut ctx, 10).unwrap();
+    set_leverage(&mut ctx, 6).unwrap();
 
-    assert_eq!(position(&mut ctx, ALICE).leverage, 10);
+    assert_eq!(position(&mut ctx, ALICE).leverage, 6);
+}
+
+#[test]
+fn set_leverage_rejects_above_max_cap() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // Cap is 6 (aligned with the 1/6 maintenance rate so opens never breach it).
+    let err = set_leverage(&mut ctx, 7).unwrap_err();
+    assert!(err.to_string().contains("leverage must be 1–6"), "{err}");
+    assert!(set_leverage(&mut ctx, 6).is_ok(), "6x must be allowed");
 }
 
 #[test]
@@ -673,23 +683,25 @@ fn set_leverage_decrease_without_position_tops_up_order_margin() {
         &mut ctx,
         ALICE,
         UserAccount {
-            perp_wallet_balance: 300_000_000,
+            perp_wallet_balance: 500_000_000,
             ..UserAccount::default()
         },
     )
     .unwrap();
 
-    set_leverage(&mut ctx, 10).unwrap();
-    place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, QTY as u64);
-    assert_eq!(position(&mut ctx, ALICE).margin_reserved, 100_000_000);
-    assert_eq!(wallet(&mut ctx, ALICE), 200_000_000);
-
+    // Order notional is 1e9; leverage 5 -> reserve 200M, leverage 2 -> reserve 500M
+    // (both divide 1e9 cleanly and stay within the 1–6 leverage cap).
     set_leverage(&mut ctx, 5).unwrap();
+    place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, QTY as u64);
+    assert_eq!(position(&mut ctx, ALICE).margin_reserved, 200_000_000);
+    assert_eq!(wallet(&mut ctx, ALICE), 300_000_000);
+
+    set_leverage(&mut ctx, 2).unwrap();
 
     let pos = position(&mut ctx, ALICE);
-    assert_eq!(pos.leverage, 5);
-    assert_eq!(pos.margin_reserved, 200_000_000);
-    assert_eq!(wallet(&mut ctx, ALICE), 100_000_000);
+    assert_eq!(pos.leverage, 2);
+    assert_eq!(pos.margin_reserved, 500_000_000);
+    assert_eq!(wallet(&mut ctx, ALICE), 0);
 }
 
 #[test]
@@ -700,24 +712,26 @@ fn set_leverage_decrease_without_position_rejects_when_order_margin_topup_is_unf
         &mut ctx,
         ALICE,
         UserAccount {
-            perp_wallet_balance: 150_000_000,
+            perp_wallet_balance: 250_000_000,
             ..UserAccount::default()
         },
     )
     .unwrap();
 
-    set_leverage(&mut ctx, 10).unwrap();
+    // Order notional 1e9; leverage 5 -> reserve 200M (wallet 250M -> 50M). Decreasing
+    // to leverage 2 needs reserve 500M (+300M topup) which 50M cannot fund -> reject.
+    set_leverage(&mut ctx, 5).unwrap();
     place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, QTY as u64);
 
-    let err = set_leverage(&mut ctx, 5).unwrap_err();
+    let err = set_leverage(&mut ctx, 2).unwrap_err();
     assert!(
         err.to_string()
             .contains("insufficient perp wallet for order margin"),
         "{err}"
     );
     let pos = position(&mut ctx, ALICE);
-    assert_eq!(pos.leverage, 10);
-    assert_eq!(pos.margin_reserved, 100_000_000);
+    assert_eq!(pos.leverage, 5);
+    assert_eq!(pos.margin_reserved, 200_000_000);
     assert_eq!(wallet(&mut ctx, ALICE), 50_000_000);
 }
 

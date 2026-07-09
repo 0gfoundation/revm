@@ -41,7 +41,7 @@ pub struct PerpPosition {
     /// Total maker fee reserved for open orders (buy side + sell side).
     #[serde(default, rename = "fr")]
     pub fee_reserved: u64,
-    /// Current leverage setting (1–20).
+    /// Current leverage setting (1–6).
     #[serde(rename = "lv")]
     pub leverage: u64,
     /// Cumulative funding index at this position's last funding settlement.
