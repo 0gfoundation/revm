@@ -333,6 +333,18 @@ impl TakerSettlement {
 ///
 /// A maker's trading fee is pre-reserved and released from `pos.fee_reserved`,
 /// not charged from the wallet.
+/// Outcome of attempting to settle one maker fill.
+pub(super) enum MakerFillOutcome {
+    /// The fill was applied; carries the maker's trading fee.
+    Filled { maker_fee: u64 },
+    /// Filling this maker would have opened/increased its position below the
+    /// maintenance-margin threshold at the current mark (K9). The fill was NOT
+    /// applied; the caller must cancel the maker order. Funding accrued on the
+    /// maker's position IS settled and persisted (it is owed regardless of the
+    /// fill, and may already have touched the Insurance Fund inline).
+    RejectedInsolvent,
+}
+
 pub(super) fn settle_maker_fill<CTX: ContextTr>(
     context: &mut CTX,
     maker: Address,
@@ -342,11 +354,15 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     fill_qty: u64,
     taker_side: Side,
     market: &crate::perp_dex::types::Market,
-) -> Result<u64, PrecompileError> {
+) -> Result<MakerFillOutcome, PrecompileError> {
     let maker_side = taker_side.opposite();
     let mut pos = storage::load_position(context, maker, market_id)?;
     let mut account = storage::load_account(context, maker)?;
     // Settle accrued funding on the maker's pre-fill position before its size changes.
+    // This ALWAYS persists (below), on both the filled and rejected paths: funding is
+    // owed independent of the fill, and apply_funding_payment may already have drawn
+    // from the Insurance Fund inline — rolling the position back while leaving that IF
+    // write would leak value.
     crate::perp_dex::funding::settle_position_funding(
         context,
         maker,
@@ -361,6 +377,54 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     // of the deficit test and make it fire spuriously.
     let old_reserved = pos.margin_reserved;
 
+    // Compute the fill on a TRIAL clone first (single computation — the trial result
+    // is adopted verbatim on the accept path, never recomputed). Nothing is persisted
+    // until the solvency decision.
+    let fill = split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market)?;
+    let mut trial_pos = pos.clone();
+    let mut trial_wallet = account.perp_wallet_balance;
+    let (opening_margin, bad_debt) = apply_position_fill(
+        &mut trial_pos,
+        &mut trial_wallet,
+        fill.closing_qty,
+        fill.closing_value,
+        fill.opening_qty,
+        fill.opening_value,
+        fill.is_buy,
+    )?;
+
+    // Open-into-insolvency guard (K9): a fill may not open/increase the maker's
+    // position below maintenance margin at the current mark (the mint precondition
+    // for a stale resting order swept after a mark move). Skipped when mark == 0.
+    // Closing/reducing is never gated — its realized loss beyond margin is legitimate
+    // bad debt (absorbed below on the accept path).
+    if fill.opening_qty > 0 {
+        let mark = storage::load_mark_price(context, market_id)?;
+        if mark > 0
+            && !is_above_maintenance_margin(
+                mark,
+                trial_pos.amount,
+                trial_pos.v_quote_balance,
+                trial_pos.margin,
+                market.base_decimals,
+                market.price_decimals,
+            )?
+        {
+            // Reject: persist ONLY the funding-settled (pre-fill) position — the fill
+            // is skipped and the caller cancels the order. Do NOT reduce the order
+            // entry or absorb the fill's bad debt.
+            storage::save_position(context, maker, market_id, &pos)?;
+            storage::save_account(context, maker, account)?;
+            return Ok(MakerFillOutcome::RejectedInsolvent);
+        }
+    }
+
+    // Accept: adopt the trial result verbatim. Keep the persisted-write order
+    // identical to the pre-guard code (reduce_order → absorb IF → saves) so the
+    // block commitment is unchanged for filled makers.
+    pos = trial_pos;
+    account.perp_wallet_balance = trial_wallet;
+
     let maker_fee = reduce_maker_order_entry_for_fill(
         context,
         maker,
@@ -371,24 +435,13 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
         market,
     )?;
 
-    let fill = split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market)?;
-    let (opening_margin, bad_debt) = apply_position_fill(
-        &mut pos,
-        &mut account.perp_wallet_balance,
-        fill.closing_qty,
-        fill.closing_value,
-        fill.opening_qty,
-        fill.opening_value,
-        fill.is_buy,
-    )?;
-
     // Isolated margin: a realized loss beyond the position's own margin is bad debt
     // routed DIRECTLY to the Insurance Fund — never the maker's wallet or other
     // positions. apply_position_fill already contained the loss within pos.margin.
     absorb_bad_debt_into_insurance_fund(context, market_id, bad_debt)?;
 
-    // Must run after apply_position_fill so pos.amount reflects the new size;
-    // cross-side netting depends on the updated position.
+    // Must run after reduce_maker_order_entry_for_fill (order list changed) and
+    // reflects the new pos.amount; cross-side netting depends on the updated position.
     let new_reserved =
         recompute_maker_order_reserve_after_fill(context, maker, market_id, &mut pos, market)?;
 
@@ -433,7 +486,7 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
 
     // No order is auto-cancelled on a maker fill any more (isolated margin), so the
     // maker fill returns only the maker fee — no expired-order bookkeeping.
-    Ok(maker_fee)
+    Ok(MakerFillOutcome::Filled { maker_fee })
 }
 
 /// Deducts a trading fee from the wallet.

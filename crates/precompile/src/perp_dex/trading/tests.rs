@@ -346,6 +346,36 @@ fn taker_open_below_maintenance_is_rejected() {
 }
 
 #[test]
+fn maker_open_below_maintenance_is_cancelled_not_filled() {
+    use crate::perp_dex::types::OrderStatus;
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 1_000_000); // disabled band so the off-mark ask can rest
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap(); // mark = 100 ticks
+    // ALICE rests an ask far below mark (50 ticks). Filling it would open ALICE a
+    // short at 50 while mark is 100 -> equity 0, below the 1/6 maintenance threshold.
+    let alice_ask = try_place_limit(&mut ctx, ALICE, 1, 50 * TICK).unwrap();
+    let alice_ask: [u8; 32] = alice_ask[..32].try_into().unwrap();
+    // BOB buys into it: the maker open-solvency guard rejects ALICE's fill, so her
+    // order is cancelled and BOB matches nothing (his order rests instead).
+    let _ = try_place_limit(&mut ctx, BOB, 0, 50 * TICK).unwrap();
+    assert_eq!(
+        get_order(&mut ctx, alice_ask).status,
+        OrderStatus::Cancelled,
+        "rejected maker order must be cancelled"
+    );
+    assert_eq!(
+        pos(&mut ctx, ALICE).amount,
+        0,
+        "maker must not have opened an insolvent position"
+    );
+    assert_eq!(
+        pos(&mut ctx, BOB).amount,
+        0,
+        "taker must not have filled against the rejected maker"
+    );
+}
+
+#[test]
 fn price_band_skipped_when_mark_unset() {
     // No mark set (mark == 0): the band cannot be evaluated, so it is skipped.
     // markets created via addMarket always have a mark, so this only affects

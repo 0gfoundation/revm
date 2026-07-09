@@ -14,7 +14,7 @@ mod settlement;
 pub(crate) use liquidation::{
     execute_liquidation_market_order, settle_liquidation_residual_at_mark_price,
 };
-use settlement::{settle_maker_fill, TakerSettlement};
+use settlement::{settle_maker_fill, MakerFillOutcome, TakerSettlement};
 
 use crate::{
     perp_dex::{
@@ -874,17 +874,40 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
-                    taker_settlement.record_fill(ask_price, fill_qty, Side::Buy, market)?;
-                    let maker_fee = settle_maker_fill(
+                    let maker_addr = Address::from(maker_order.owner);
+                    // Maker open-solvency guard (K9): settle the maker first. If filling
+                    // it would open its position below maintenance at mark, cancel the
+                    // maker order (drop it from this level by not re-queuing) and skip —
+                    // the taker's `remaining` is untouched so it keeps matching. Funding
+                    // is settled+persisted inside either way.
+                    let maker_fee = match settle_maker_fill(
                         context,
-                        Address::from(maker_order.owner),
+                        maker_addr,
                         &maker_id,
                         market_id,
                         ask_price,
                         fill_qty,
                         Side::Buy,
                         market,
-                    )?;
+                    )? {
+                        MakerFillOutcome::Filled { maker_fee } => maker_fee,
+                        MakerFillOutcome::RejectedInsolvent => {
+                            cancel_rejected_maker(
+                                context,
+                                maker_addr,
+                                market_id,
+                                Side::Sell,
+                                &maker_id,
+                                &mut maker_order,
+                                market,
+                            )?;
+                            // Dropped from this level (not re-queued). If it was the
+                            // last order at this price, the new_queue-empty check below
+                            // removes the price + refreshes best ask.
+                            continue;
+                        }
+                    };
+                    taker_settlement.record_fill(ask_price, fill_qty, Side::Buy, market)?;
                     let fill_notional = calc_value(
                         ask_price,
                         fill_qty,
@@ -1002,17 +1025,36 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
-                    taker_settlement.record_fill(bid_price, fill_qty, Side::Sell, market)?;
-                    let maker_fee = settle_maker_fill(
+                    let maker_addr = Address::from(maker_order.owner);
+                    // Maker open-solvency guard (K9) — see the mirror on the Buy side.
+                    let maker_fee = match settle_maker_fill(
                         context,
-                        Address::from(maker_order.owner),
+                        maker_addr,
                         &maker_id,
                         market_id,
                         bid_price,
                         fill_qty,
                         Side::Sell,
                         market,
-                    )?;
+                    )? {
+                        MakerFillOutcome::Filled { maker_fee } => maker_fee,
+                        MakerFillOutcome::RejectedInsolvent => {
+                            cancel_rejected_maker(
+                                context,
+                                maker_addr,
+                                market_id,
+                                Side::Buy,
+                                &maker_id,
+                                &mut maker_order,
+                                market,
+                            )?;
+                            // Dropped from this level (not re-queued). If it was the
+                            // last order at this price, the new_queue-empty check below
+                            // removes the price + refreshes best bid.
+                            continue;
+                        }
+                    };
+                    taker_settlement.record_fill(bid_price, fill_qty, Side::Sell, market)?;
                     let fill_notional = calc_value(
                         bid_price,
                         fill_qty,
@@ -1479,6 +1521,36 @@ pub(super) fn remove_from_book_during_match<CTX: ContextTr>(
     if emptied {
         refresh_best_and_sample(context, market_id, side, old_best)?;
     }
+    Ok(())
+}
+
+/// Cancel a maker order that a taker fill would have opened into insolvency
+/// (K9 maker-side guard). Releases the reserved margin + fee back to the maker's
+/// wallet and removes the order from the maker's per-user index (via
+/// `release_margin_for_cancelled_order`), marks the order `Cancelled`, and emits
+/// `OrderCancelled`. The caller drops it from the price-level queue by not
+/// re-adding it to `new_queue`.
+fn cancel_rejected_maker<CTX: ContextTr>(
+    context: &mut CTX,
+    maker: Address,
+    market_id: u64,
+    maker_side: Side,
+    order_id: &[u8; 32],
+    order: &mut crate::perp_dex::types::Order,
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    release_margin_for_cancelled_order(context, maker, market_id, maker_side, order_id, market)?;
+    order.status = OrderStatus::Cancelled;
+    storage::save_order(context, order_id, order)?;
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OrderCancelled {
+            user: maker,
+            orderId: FixedBytes(*order_id),
+            marketId: market_id,
+        }
+        .to_log_data(),
+    });
     Ok(())
 }
 
