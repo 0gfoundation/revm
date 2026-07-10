@@ -25,7 +25,8 @@ use keys::{
     best_ask_key, best_bid_key, bid_level_key, bid_prices_key, commitment_slot, erc20_balance_slot,
     funding_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
     last_traded_price_key, mark_price_key, market_fee_total_key, market_key, market_manager_key,
-    open_interest_key, oracle_key, order_key, position_key, premium_accumulator_key,
+    open_interest_key, oracle_key, order_key, position_key, position_registry_key,
+    premium_accumulator_key,
     price_basis_window_key, trade_count_key, user_buy_orders_key, user_fee_rates_key,
     user_nonce_key, user_sell_orders_key,
 };
@@ -481,7 +482,89 @@ pub fn save_position<CTX: ContextTr>(
     market_id: u64,
     pos: &PerpPosition,
 ) -> Result<(), PrecompileError> {
+    // Maintain the per-market open-position registry on an `amount` zero-crossing.
+    // save_position is the single choke point for ALL position writes, so this hook
+    // cannot be missed. The registry is only touched when membership changes
+    // (open: 0 -> !=0, close: !=0 -> 0); every other save pays just one
+    // overlay-cheap position read (the position is already in the working set).
+    let old_amount = load_position(context, user, market_id)?.amount;
+    if old_amount == 0 && pos.amount != 0 {
+        registry_add(context, market_id, user)?;
+    } else if old_amount != 0 && pos.amount == 0 {
+        registry_remove(context, market_id, user)?;
+    }
     save_cached(context, position_key(user, market_id), pos)
+}
+
+// ── Per-market open-position registry ──────────────────────────────────────
+// The first enumerable set of open positions per market. Written by the
+// save_position zero-crossing hook (above); enumerated by the liquidation sweep.
+// Stored as raw concatenated 20-byte addresses (mirrors the level-FIFO
+// pack_order_ids pattern); insertion order is preserved (deterministic across
+// validators). An empty blob deletes the key. Membership is exact — closed
+// positions are removed — so the set never grows unbounded.
+
+fn pack_addresses(addrs: &[Address]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(addrs.len() * 20);
+    for a in addrs {
+        buf.extend_from_slice(a.as_slice());
+    }
+    buf
+}
+
+fn unpack_addresses(buf: &[u8]) -> Result<Vec<Address>, PrecompileError> {
+    if buf.len() % 20 != 0 {
+        return Err(perp_err("corrupt position-registry blob"));
+    }
+    Ok(buf.chunks_exact(20).map(Address::from_slice).collect())
+}
+
+/// Loads the set of addresses with an open position in `market_id` (insertion order).
+pub fn load_position_registry<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<Vec<Address>, PrecompileError> {
+    unpack_addresses(&load_blob(context, position_registry_key(market_id))?)
+}
+
+/// Persists the registry; an empty slice deletes the key.
+fn save_position_registry<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    addrs: &[Address],
+) -> Result<(), PrecompileError> {
+    store_blob(
+        context,
+        position_registry_key(market_id),
+        &pack_addresses(addrs),
+    )
+}
+
+fn registry_add<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    user: Address,
+) -> Result<(), PrecompileError> {
+    let mut regs = load_position_registry(context, market_id)?;
+    if !regs.contains(&user) {
+        regs.push(user);
+        save_position_registry(context, market_id, &regs)?;
+    }
+    Ok(())
+}
+
+fn registry_remove<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    user: Address,
+) -> Result<(), PrecompileError> {
+    let mut regs = load_position_registry(context, market_id)?;
+    let before = regs.len();
+    regs.retain(|a| a != &user);
+    if regs.len() != before {
+        save_position_registry(context, market_id, &regs)?;
+    }
+    Ok(())
 }
 
 // ── Order entry lists (per-user per-market) ───────────────────────────────────

@@ -26,6 +26,7 @@ const PFX_USER_NONCE: &[u8] = b"nonc"; // per-user nonce for order-id generation
 const PFX_MARKET: &[u8] = b"mkt\x00";
 const PFX_MARK_PRICE: &[u8] = b"mktp";
 const PFX_OPEN_INT: &[u8] = b"oint";
+const PFX_POSITION_REGISTRY: &[u8] = b"preg"; // per-market set of addresses with an open position
 const PFX_BID_PRICES: &[u8] = b"bidp"; // sorted Vec<u64> of active bid prices
 const PFX_ASK_PRICES: &[u8] = b"askp"; // sorted Vec<u64> of active ask prices
 const PFX_BID_LEVEL: &[u8] = b"bidl"; // FIFO queue of order IDs at a bid price
@@ -160,6 +161,13 @@ pub fn mark_price_key(market_id: u64) -> B256 {
 
 pub fn open_interest_key(market_id: u64) -> B256 {
     keccak256([PFX_OPEN_INT, &market_id.to_be_bytes()].concat())
+}
+
+/// Per-market set of addresses holding an open position (packed 20-byte
+/// addresses). Maintained by the `save_position` zero-crossing hook; enumerated
+/// by the liquidation sweep.
+pub fn position_registry_key(market_id: u64) -> B256 {
+    keccak256([PFX_POSITION_REGISTRY, &market_id.to_be_bytes()].concat())
 }
 
 // ── Order book ────────────────────────────────────────────────────────────

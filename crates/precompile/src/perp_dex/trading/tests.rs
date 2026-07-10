@@ -376,6 +376,48 @@ fn maker_open_below_maintenance_is_cancelled_not_filled() {
 }
 
 #[test]
+fn position_registry_tracks_open_positions() {
+    let mut ctx = make_ctx();
+    let m = MARKET_ID;
+    let u1 = user_addr(1);
+    let u2 = user_addr(2);
+    let open = |amt: i64| PerpPosition {
+        amount: amt,
+        ..PerpPosition::default()
+    };
+
+    // Opening (0 -> !=0) adds to the registry.
+    storage::save_position(&mut ctx, u1, m, &open(5)).unwrap();
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, m).unwrap(),
+        vec![u1]
+    );
+    // A second holder appends (insertion order preserved).
+    storage::save_position(&mut ctx, u2, m, &open(-3)).unwrap();
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, m).unwrap(),
+        vec![u1, u2]
+    );
+    // Same-membership save (amount changes sign but stays !=0, e.g. a flip) — no dup.
+    storage::save_position(&mut ctx, u1, m, &open(-7)).unwrap();
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, m).unwrap(),
+        vec![u1, u2]
+    );
+    // Closing (!=0 -> 0) removes, preserving the order of the rest.
+    storage::save_position(&mut ctx, u1, m, &open(0)).unwrap();
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, m).unwrap(),
+        vec![u2]
+    );
+    // Closing the last holder empties the registry (key deleted).
+    storage::save_position(&mut ctx, u2, m, &open(0)).unwrap();
+    assert!(storage::load_position_registry(&mut ctx, m)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn price_band_skipped_when_mark_unset() {
     // No mark set (mark == 0): the band cannot be evaluated, so it is skipped.
     // markets created via addMarket always have a mark, so this only affects
@@ -2490,8 +2532,14 @@ mod golden {
     /// placement band; the changed "pb" value shifts the blob → commitment. CHAIN change;
     /// BusinessSnapshot UNCHANGED (band disabled → identical execution). Prior value
     /// 0x05ec6b7a77d6bc57750d92e5624c5dd8262c291fdfa56da0b8fe1cd312bf6aed.
+    /// Position registry (2026-07, Phase B): save_position maintains a per-market
+    /// open-position registry ("preg" blob) on amount zero-crossings, so opening/closing a
+    /// position adds a registry write to the block net delta → commitment shifts. CHAIN
+    /// change; BusinessSnapshot UNCHANGED (the registry mirrors open positions and is read
+    /// by no view). Prior value
+    /// 0x4bad03218af966c0aa1b30a0611eebc746d7b9e07ec33115c2d14ae1fe833af3.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x4bad03218af966c0aa1b30a0611eebc746d7b9e07ec33115c2d14ae1fe833af3");
+        b256!("0xfcc04c1f1e41e7e284ace52730d47aaeb47955a3fb1ce27d1d52ea2aa34eab1e");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
