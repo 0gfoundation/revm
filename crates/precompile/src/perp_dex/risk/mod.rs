@@ -574,50 +574,59 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     emit_position_changed(context, caller, args.marketId, &pos);
     Ok(Bytes::new())
 }
-/// `liquidate(address user, uint64 marketId)`
-///
-/// Anyone can call this to liquidate an under-margined position.
-/// Closes through the orderbook first; any residual the book cannot absorb is
-/// settled directly at mark price. If solvent after close, a liquidation clearance
-/// fee (market.liquidation_fee_rate_bps of the pre-liquidation margin) is credited
-/// to the Insurance Fund. If bankrupt, the deficit is absorbed by the IF instead.
-pub fn run_liquidate<CTX: ContextTr>(
-    input_bytes: &[u8],
-    caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
-    let args = liquidateCall::abi_decode_validate(input_bytes)
-        .map_err(|_| perp_err("liquidate: invalid calldata"))?;
+/// Result of a single `liquidate_position` attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiquidationOutcome {
+    /// Position was closed; carries the pre-close signed amount and the clearance
+    /// fee credited to the Insurance Fund.
+    Liquidated { amount: i64, reward: u64 },
+    /// No open position (`amount == 0`) — nothing to do.
+    NoPosition,
+    /// Position is at or above the maintenance-margin threshold — not liquidatable.
+    AboveMaintenance,
+}
 
-    let market = storage::load_market(context, args.marketId)?
-        .ok_or_else(|| perp_err("liquidate: unknown market"))?;
-    let mark_price = storage::load_mark_price(context, args.marketId)?;
-    if mark_price == 0 {
-        // A market that never received an oracle price would make the
-        // maintenance-margin gate degenerate (notional and threshold both 0),
-        // so solvency would be judged on the sign of `v_quote + margin` alone.
-        // Refuse to liquidate without a real mark price.
-        return Err(perp_err("liquidate: mark price unavailable"));
-    }
-    let mut pos = storage::load_position(context, args.user, args.marketId)?;
+/// Core liquidation logic, shared by the manual `liquidate` entry point
+/// (`run_liquidate`) and the protocol-automatic sweep (inside
+/// `run_update_index_price`). The caller must already hold the loaded `market`
+/// and a non-zero `mark_price` (the mark==0 degenerate case is rejected by the
+/// wrapper). Settles funding on the position first (so the charge counts toward
+/// insolvency), then:
+/// - `amount == 0`  → `NoPosition` (no state change beyond the funding settle);
+/// - above maintenance → `AboveMaintenance`;
+/// - otherwise closes through the orderbook, settles any residual at mark, charges
+///   the clearance fee to the IF, emits `Liquidation`, and returns `Liquidated`.
+///
+/// `liquidator` is recorded verbatim in the `Liquidation` event (the caller for a
+/// manual liquidation; a system address for the sweep). Bad debt from the close
+/// legs is routed to the IF inside the close paths, not here.
+pub(crate) fn liquidate_position<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    market: &crate::perp_dex::types::Market,
+    mark_price: u64,
+    liquidator: Address,
+) -> Result<LiquidationOutcome, PrecompileError> {
+    let mut pos = storage::load_position(context, user, market_id)?;
 
     if pos.amount == 0 {
-        return Err(perp_err("liquidate: no open position"));
+        return Ok(LiquidationOutcome::NoPosition);
     }
     // Settle accrued funding on the liquidated position first, so the charge
     // counts toward insolvency and is realised before the position is closed.
     {
-        let mut account = storage::load_account(context, args.user)?;
+        let mut account = storage::load_account(context, user)?;
         settle_position_funding(
             context,
-            args.user,
-            &market,
+            user,
+            market,
             &mut pos,
             &mut account.perp_wallet_balance,
         )?;
-        storage::save_account(context, args.user, account)?;
+        storage::save_account(context, user, account)?;
     }
-    storage::save_position(context, args.user, args.marketId, &pos)?;
+    storage::save_position(context, user, market_id, &pos)?;
     if is_above_maintenance_margin(
         mark_price,
         pos.amount,
@@ -626,7 +635,7 @@ pub fn run_liquidate<CTX: ContextTr>(
         market.base_decimals,
         market.price_decimals,
     )? {
-        return Err(perp_err("liquidate: position is above maintenance margin"));
+        return Ok(LiquidationOutcome::AboveMaintenance);
     }
 
     let liq_amount = pos.amount;
@@ -635,21 +644,21 @@ pub fn run_liquidate<CTX: ContextTr>(
     let pre_liq_margin = pos.margin.max(0) as u64;
 
     // Cancel all open orders for this user/market (emits OrderCancelled events).
-    cancel_all_orders_for_market(context, args.user, args.marketId, &market)?;
+    cancel_all_orders_for_market(context, user, market_id, market)?;
 
     // Try to close through the orderbook; settle any residual at mark price.
     let remaining = execute_liquidation_market_order(
         context,
-        args.user,
-        &market,
+        user,
+        market,
         liquidation_side,
         liquidation_quantity,
     )?;
     if remaining > 0 {
         settle_liquidation_residual_at_mark_price(
             context,
-            args.user,
-            &market,
+            user,
+            market,
             liquidation_side,
             mark_price,
         )?;
@@ -660,7 +669,7 @@ pub fn run_liquidate<CTX: ContextTr>(
     // paths (apply_position_fill / settle_liquidation_residual), so the wallet is never
     // negative here. Charge the clearance fee from the liquidated user's remaining
     // wallet (capped at the balance) and credit it to the Insurance Fund.
-    let mut account = storage::load_account(context, args.user)?;
+    let mut account = storage::load_account(context, user)?;
     let clearance_fee = {
         let fee = (pre_liq_margin as u128)
             .saturating_mul(market.liquidation_fee_rate_bps as u128)
@@ -668,7 +677,7 @@ pub fn run_liquidate<CTX: ContextTr>(
         let fee = (fee as u64).min(account.perp_wallet_balance.max(0) as u64);
         if fee > 0 {
             account.debit_perp(fee)?;
-            storage::save_account(context, args.user, account)?;
+            storage::save_account(context, user, account)?;
             let old_if = storage::load_insurance_fund(context)?;
             let new_if = old_if
                 .checked_add(fee)
@@ -690,9 +699,9 @@ pub fn run_liquidate<CTX: ContextTr>(
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::Liquidation {
-            user: args.user,
-            marketId: args.marketId,
-            liquidator: caller,
+            user,
+            marketId: market_id,
+            liquidator,
             amount: liq_amount,
             reward: clearance_fee,
             markPrice: mark_price,
@@ -700,7 +709,44 @@ pub fn run_liquidate<CTX: ContextTr>(
         .to_log_data(),
     });
 
-    Ok(Bytes::new())
+    Ok(LiquidationOutcome::Liquidated {
+        amount: liq_amount,
+        reward: clearance_fee,
+    })
+}
+
+/// `liquidate(address user, uint64 marketId)`
+///
+/// Anyone can call this to liquidate an under-margined position. Thin wrapper over
+/// [`liquidate_position`]: decodes calldata, loads the market + mark price (refusing
+/// a market with no oracle price), and maps the core outcome to the caller-facing
+/// result. `caller` is recorded as the liquidator.
+pub fn run_liquidate<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    let args = liquidateCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("liquidate: invalid calldata"))?;
+
+    let market = storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("liquidate: unknown market"))?;
+    let mark_price = storage::load_mark_price(context, args.marketId)?;
+    if mark_price == 0 {
+        // A market that never received an oracle price would make the
+        // maintenance-margin gate degenerate (notional and threshold both 0),
+        // so solvency would be judged on the sign of `v_quote + margin` alone.
+        // Refuse to liquidate without a real mark price.
+        return Err(perp_err("liquidate: mark price unavailable"));
+    }
+
+    match liquidate_position(context, args.user, args.marketId, &market, mark_price, caller)? {
+        LiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
+        LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
+        LiquidationOutcome::AboveMaintenance => {
+            Err(perp_err("liquidate: position is above maintenance margin"))
+        }
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
