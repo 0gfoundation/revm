@@ -69,6 +69,10 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         OrderType::Market,
         TimeInForce::Ioc,
         market,
+        // Liquidation close: waive the taker trading fee (the liquidated user pays
+        // the clearance fee to the IF instead). Also prevents the close from
+        // reverting when the underwater user cannot cover a taker fee.
+        true,
     )?;
 
     if remaining == 0 {

@@ -2538,8 +2538,14 @@ mod golden {
     /// change; BusinessSnapshot UNCHANGED (the registry mirrors open positions and is read
     /// by no view). Prior value
     /// 0x4bad03218af966c0aa1b30a0611eebc746d7b9e07ec33115c2d14ae1fe833af3.
+    /// Liquidation fee waiver (2026-07, Phase C fix B): a liquidation close no longer
+    /// charges the liquidated user a taker trading fee (they pay only the clearance fee to
+    /// the IF), fixing an underwater user with no free wallet being un-liquidatable.
+    /// CHANGES BusinessSnapshot: ALICE keeps the taker fee she used to pay on her Phase-9
+    /// book close, and the market fee total drops by it. Prior value
+    /// 0xfcc04c1f1e41e7e284ace52730d47aaeb47955a3fb1ce27d1d52ea2aa34eab1e.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xfcc04c1f1e41e7e284ace52730d47aaeb47955a3fb1ce27d1d52ea2aa34eab1e");
+        b256!("0x9b493f51b6dd2011ae1c8b7ebc5a2b2b3b4fc2cc9fd1b46878d5d1a2b85e3435");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -2590,8 +2596,9 @@ mod golden {
             //   − 500_000 addMargin + 250_000 removeMargin − 400 funding
             //   + 169_500 book-leg close (margin release 792_000 + PnL −622_500)
             //   + 56_500 residual mark-price settle (margin 264_000 + PnL
-            //   −207_500) − 1_200 close taker fee − 5_280 clearance fee.
-            alice_account: (U256::from(500_000_000u64), 999_161_105),
+            //   −207_500) − 5_280 clearance fee. The liquidation close taker fee
+            //   is WAIVED (fix B), so there is no −1_200 deduction here.
+            alice_account: (U256::from(500_000_000u64), 999_162_305),
             // BOB perp = 1e9 + 830_000 short PnL (622_500 on the 3-QTY
             //   liquidation leg + 207_500 on the QTY closed via CAROL) + 400
             //   funding credit − 1_446 maker fees − 400_160 still reserved for
@@ -2602,14 +2609,15 @@ mod golden {
             carol_account: (U256::from(5_000_000u64), 4_200_000),
             // 2e9 seed − 1.5e9 deposit + 0.5e9 withdraw.
             bob_erc20: U256::from(1_000_000_000u64),
-            // 100M funding − 50M IF deposit + 1M IF withdraw + 4_661 fees.
-            admin_perp_wallet: 51_004_661,
+            // 100M funding − 50M IF deposit + 1M IF withdraw + 3_461 fees
+            //   (liquidation close taker fee waived — fix B).
+            admin_perp_wallet: 51_003_461,
             // 50M deposit − 1M withdraw + 5_280 clearance fee
             //   (50 bps of ALICE's 1_056_000 pre-liquidation margin).
             insurance_fund: 49_005_280,
-            // ALICE takers 2_015 + close taker 1_200 + BOB maker 806 + 480
-            //   + 160 (CAROL's taker fee is 0 bps: default fee rates).
-            market_fee_total: 4_661,
+            // ALICE takers 2_015 + BOB maker 806 + 480 + 160 (CAROL's taker fee
+            //   is 0 bps; the liquidation close taker fee is waived — fix B).
+            market_fee_total: 3_461,
             mark_price: 80_000_000_000, // $80 post-crash
             funding: (100, 7_215),      // rate = interest-rate clamp; next epoch ts
             signed_buy_status: OrderStatus::Cancelled as u8,

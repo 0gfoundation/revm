@@ -51,13 +51,18 @@ impl TakerSettlement {
         context: &mut CTX,
         user: Address,
         market_id: u64,
+        waive_taker_fee: bool,
     ) -> Result<Self, PrecompileError> {
         let rates = storage::load_user_fee_rates(context, user)?;
         Ok(Self {
             user,
             market_id,
             fills: Vec::new(),
-            taker_fee_bps: rates.taker_fee_bps,
+            // A forced liquidation close pays no taker trading fee — the liquidated
+            // user is already charged the liquidation clearance fee (to the IF). This
+            // also keeps the close from reverting on `ensure_taker_wallet_can_cover_margin`
+            // when the underwater user has no free wallet to cover a taker fee.
+            taker_fee_bps: if waive_taker_fee { 0 } else { rates.taker_fee_bps },
         })
     }
 

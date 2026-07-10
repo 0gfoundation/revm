@@ -749,12 +749,16 @@ pub fn run_liquidate<CTX: ContextTr>(
     }
 }
 
-/// Max positions liquidated per `updateIndexPrice` sweep. The precompile is not
-/// gas-metered per unit of internal work, so this is the only bound on the
-/// sweep's wall-clock cost — which sits on the (delayed-execution) newPayload
-/// critical path. Overflow is deferred to the next update: the registry is
-/// re-scanned every update, and un-liquidated candidates stay underwater until
-/// the mark moves, so nothing is permanently missed.
+/// Max positions actually LIQUIDATED per `updateIndexPrice` sweep. This bounds the
+/// expensive half — each liquidation closes through the book + writes — but NOT the
+/// registry scan itself: the loop still visits every registered candidate until it
+/// has liquidated this many, so a sweep over N mostly-healthy positions is O(N)
+/// (load + funding-settle + revert per healthy candidate). That O(N) scan on the
+/// (delayed-execution) newPayload critical path is a known scale limit; the real fix
+/// is the tick-bucket candidate index (auto-liq Phase E), which visits only
+/// liquidatable candidates. Overflow of THIS cap defers to the next update: the
+/// registry is re-scanned every update and un-liquidated candidates stay underwater
+/// until the mark moves, so nothing is permanently missed.
 const MAX_LIQUIDATIONS_PER_UPDATE: u32 = 50;
 
 /// Protocol-automatic liquidation sweep, run synchronously at the tail of

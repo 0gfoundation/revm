@@ -13,7 +13,7 @@ use crate::perp_dex::{
     trading::run_place_order,
     types::{
         FundingState, IndexPriceHistory, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
-        UserAccount,
+        UserAccount, UserFeeRates,
     },
     USDC_ADDRESS,
 };
@@ -170,6 +170,62 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
     assert_eq!(
         storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
         vec![MAKER]
+    );
+}
+
+#[test]
+fn sweep_liquidates_underwater_user_with_no_free_wallet_for_taker_fee() {
+    // Regression for review fix B: a liquidation closing through the book used to
+    // charge the liquidated user a taker fee and require free wallet to cover it,
+    // so an underwater user with ~0 free wallet was un-liquidatable (the close
+    // reverted -> the sweep silently skipped it -> the position stayed open every
+    // update). The taker fee is now waived on liquidation closes.
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // ALICE: 5x long with ZERO free wallet (all collateral in margin) and a nonzero
+    // taker fee — the exact pre-fix un-liquidatable state.
+    storage::save_account(
+        &mut ctx,
+        ALICE,
+        UserAccount {
+            perp_wallet_balance: 0,
+            ..UserAccount::default()
+        },
+    )
+    .unwrap();
+    storage::save_user_fee_rates(
+        &mut ctx,
+        ALICE,
+        UserFeeRates {
+            maker_fee_bps: 0,
+            taker_fee_bps: 10,
+        },
+    )
+    .unwrap();
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    // MAKER rests a full-size bid at $90 (in band pre-crash) so the liquidation
+    // closes through the book — a nonzero fill notional that would incur a taker
+    // fee pre-fix.
+    place_order(&mut ctx, MAKER, 0, 9_000, QTY as u64);
+
+    // Crash to $85: ALICE below maintenance. The sweep must liquidate her despite
+    // her zero free wallet (fee waived -> total_required 0 -> no wallet gate).
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: 8_500,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    assert_eq!(
+        position(&mut ctx, ALICE).amount,
+        0,
+        "underwater ALICE with 0 free wallet must still be liquidated (taker fee waived)"
     );
 }
 

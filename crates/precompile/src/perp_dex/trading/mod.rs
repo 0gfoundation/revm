@@ -665,6 +665,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.order_type,
                 order.tif,
                 &order.market,
+                false,
             )?;
             if remaining > 0 {
                 rest_in_book(
@@ -694,6 +695,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.order_type,
                 order.tif,
                 &order.market,
+                false,
             )?;
             cancel_unfilled_remainder(context, &order_id, remaining)
         }
@@ -717,6 +719,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.order_type,
                 order.tif,
                 &order.market,
+                false,
             )?;
             ensure_fok_filled(remaining)
         }
@@ -753,6 +756,7 @@ fn execute_market_order<CTX: ContextTr>(
         order.order_type,
         order.tif,
         &order.market,
+        false,
     )?;
     if order.tif == TimeInForce::Fok {
         ensure_fok_filled(remaining)
@@ -810,10 +814,13 @@ pub(super) fn match_order<CTX: ContextTr>(
     order_type: OrderType,
     _tif: TimeInForce,
     market: &crate::perp_dex::types::Market,
+    // When true (liquidation close), the taker pays no trading fee.
+    waive_taker_fee: bool,
 ) -> Result<u64, PrecompileError> {
     let mut remaining = quantity;
     let mut last_trade_price = None;
-    let mut taker_settlement = TakerSettlement::load(context, taker_addr, market_id)?;
+    let mut taker_settlement =
+        TakerSettlement::load(context, taker_addr, market_id, waive_taker_fee)?;
     // The taker order is mutated once per fill and saved ONCE after the loop. Nothing reads
     // it mid-match: settle_maker_fill touches only the maker; finalize touches the taker's
     // position/account, not this Order; and the taker order is not rested in the book until
