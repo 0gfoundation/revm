@@ -749,6 +749,59 @@ pub fn run_liquidate<CTX: ContextTr>(
     }
 }
 
+/// Max positions liquidated per `updateIndexPrice` sweep. The precompile is not
+/// gas-metered per unit of internal work, so this is the only bound on the
+/// sweep's wall-clock cost — which sits on the (delayed-execution) newPayload
+/// critical path. Overflow is deferred to the next update: the registry is
+/// re-scanned every update, and un-liquidated candidates stay underwater until
+/// the mark moves, so nothing is permanently missed.
+const MAX_LIQUIDATIONS_PER_UPDATE: u32 = 50;
+
+/// Protocol-automatic liquidation sweep, run synchronously at the tail of
+/// [`run_update_index_price`] after the new mark + funding are persisted (so the
+/// `Liquidation` events attach to the oracle's updateIndexPrice receipt). Scans
+/// the market's open-position registry and liquidates every candidate below
+/// maintenance at the new mark.
+///
+/// Each candidate is attempted under its own journal checkpoint:
+/// - `Liquidated` → commit the writes;
+/// - healthy / stale (`AboveMaintenance` / `NoPosition`) or a per-account `Err`
+///   → revert (the sweep leaves no trace for that candidate).
+///
+/// A single candidate's error is NEVER propagated — that would revert the whole
+/// price update and the other liquidations. No event is emitted on error (a
+/// node-local DB error must not diverge the event set; a divergent commitment
+/// fail-fasts the faulty node instead).
+fn run_liquidation_sweep<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    market: &crate::perp_dex::types::Market,
+    mark_price: u64,
+) -> Result<(), PrecompileError> {
+    // Snapshot the registry (owned Vec, deterministic insertion order). Liquidations
+    // mutate the live registry via save_position, but iterating the snapshot is stable;
+    // a candidate already closed by an earlier cascade in this sweep resolves to
+    // NoPosition (skipped), and cascade-created candidates are picked up next update.
+    let candidates = storage::load_position_registry(context, market_id)?;
+    let mut liquidated = 0u32;
+    for user in candidates {
+        if liquidated >= MAX_LIQUIDATIONS_PER_UPDATE {
+            break;
+        }
+        let cp = context.journal_mut().checkpoint();
+        match liquidate_position(context, user, market_id, market, mark_price, Address::ZERO) {
+            Ok(LiquidationOutcome::Liquidated { .. }) => {
+                context.journal_mut().checkpoint_commit();
+                liquidated += 1;
+            }
+            Ok(_) | Err(_) => {
+                context.journal_mut().checkpoint_revert(cp);
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
@@ -1318,6 +1371,12 @@ pub fn run_update_index_price<CTX: ContextTr>(
 
         storage::save_premium_accumulator(context, args.marketId, &acc)?;
     }
+
+    // ── 5b. Protocol-automatic liquidation sweep ────────────────────────────────
+    // The new mark + funding are now persisted. Liquidate any position that fell
+    // below maintenance, synchronously inside this oracle tx (so Liquidation logs
+    // attach to this receipt, and there is zero window before the sweep runs).
+    run_liquidation_sweep(context, args.marketId, &market, mark_price)?;
 
     // ── 6. Emit events ────────────────────────────────────────────────────────
     context.journal_mut().log(Log {

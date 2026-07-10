@@ -115,6 +115,65 @@ fn update_index_price_aligns_timestamp_to_market_interval() {
 }
 
 #[test]
+fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx); // mark = ENTRY_PRICE ($100), funding off, clearance fee 0
+
+    // ALICE: 5x long — healthy at $100, underwater once the mark crashes.
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    // MAKER: the same long but heavily collateralised — stays above maintenance
+    // at the crashed mark, so the sweep must skip it.
+    storage::save_position(
+        &mut ctx,
+        MAKER,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY,
+            v_quote_balance: -ENTRY_VALUE,
+            margin: 500_000_000,
+            leverage: 2,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+    // Both are registered as open positions (insertion order).
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
+        vec![ALICE, MAKER]
+    );
+
+    // Crash the mark to $70 via updateIndexPrice (admin) — runs the sweep.
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: 7_000,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // ALICE was under maintenance -> swept (closed at mark, empty book -> residual);
+    // MAKER stayed healthy -> untouched. Registry now holds only MAKER.
+    assert_eq!(
+        position(&mut ctx, ALICE).amount,
+        0,
+        "underwater position must be liquidated by the sweep"
+    );
+    assert_eq!(
+        position(&mut ctx, MAKER).amount,
+        QTY,
+        "healthy position must be left untouched"
+    );
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
+        vec![MAKER]
+    );
+}
+
+#[test]
 fn update_index_price_discards_same_or_older_aligned_timestamp() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);

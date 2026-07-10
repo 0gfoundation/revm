@@ -3350,13 +3350,19 @@ mod golden {
             "not admin",
         );
 
-        // ALICE leaves a resting bid AND a resting ask so liquidate()'s
+        // ALICE leaves a resting bid AND a resting ask so the liquidation's
         // cancel-all clears both book sides. The ask is fully offset by her
         // 4×QTY long, so it reserves no margin — only the maker fee.
         let alice_resting_bid = g_place(&mut ctx, ALICE, 0, PRICE - 30 * TICK, QTY, 0, 0);
         let alice_resting_ask = g_place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
 
-        // Crash: index $100 → $80; ALICE's 5x long drops under maintenance.
+        // BOB quotes only 3×QTY of closing liquidity — resting BEFORE the crash so
+        // the auto-liquidation sweep has it to close against: the sweep closes 3×QTY
+        // through the book and settles the residual QTY at mark price.
+        let bob_bid = g_place(&mut ctx, BOB, 0, PRICE - 20 * TICK, 3 * QTY, 0, 0);
+
+        // Crash: index $100 → $80; ALICE's 5x long drops under maintenance and the
+        // sweep inside updateIndexPrice liquidates her automatically (liquidator = 0x0).
         dex_call(
             &mut ctx,
             ORACLE,
@@ -3368,11 +3374,8 @@ mod golden {
             .abi_encode(),
         );
 
-        // BOB quotes only 3×QTY of closing liquidity, so the liquidation
-        // closes 3×QTY through the book and settles the residual QTY at mark
-        // price; CAROL (anyone) liquidates.
-        let bob_bid = g_place(&mut ctx, BOB, 0, PRICE - 20 * TICK, 3 * QTY, 0, 0);
-        dex_call(
+        // The sweep already closed ALICE, so a manual liquidate now finds no position.
+        dex_call_expect_revert(
             &mut ctx,
             CAROL,
             &liquidateCall {
@@ -3380,6 +3383,7 @@ mod golden {
                 marketId: MARKET_ID,
             }
             .abi_encode(),
+            "liquidate: no open position",
         );
 
         // Phase 9b — CAROL funds up; BOB quotes two same-price bids and CAROL's
