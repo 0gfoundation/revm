@@ -2501,6 +2501,63 @@ mod driver_tests {
         );
     }
 
+    /// MANUAL perf probe (not a CI test): revm-layer per-op cost of a non-mover place as a function
+    /// of BOOK DEPTH — pre-fill the book to N resting orders (cycled over 90 levels so each FIFO
+    /// grows), then time a fresh batch of non-mover places at that depth. Answers definitively (in
+    /// isolation from engine/pack/consensus) whether perp compute scales with book depth — the
+    /// question the online chain-age "decay" work could only see noisily (it concluded perp compute
+    /// got FASTER, i.e. NOT the decay driver; pack×pool-depth was). Cross-checks the 8.5µs simple
+    /// stage-run + ~103µs online E1 layering.
+    /// Run: cargo test -p revm-precompile --release --features perp-parallel \
+    ///        bench_serial_place_depth_sweep -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual perf probe, run with --release --ignored --nocapture"]
+    fn bench_serial_place_depth_sweep() {
+        let users: Vec<Address> = (1..=512).map(user_addr).collect();
+        let mkid = |i: u64| {
+            let mut id = [0u8; 32];
+            id[0] = 0xbe;
+            id[24..].copy_from_slice(&i.to_be_bytes());
+            id
+        };
+        let price_of = |i: u64| (90 - (i % 90)) * TICK; // 90 distinct levels below best, cycled
+        println!("book-depth sweep: non-mover place_order_core (mp-shape, warm ctx)");
+        for &depth in &[100u64, 2_000, 20_000, 100_000] {
+            let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
+            seed(&mut ctx, &users);
+            // Fixed best_bid high above; every buy below it is a non-mover rest.
+            place_order_core(users[0], mkid(0), MID, 0, 95 * TICK, QTY, 0, 0, [0u8; 16], &mut ctx)
+                .unwrap();
+            // Pre-fill the book to `depth` resting non-mover orders (each FIFO ~depth/90 deep).
+            for i in 1..=depth {
+                place_order_core(
+                    users[(i as usize) % 512], mkid(i), MID, 0, price_of(i), QTY, 0, 0,
+                    [0u8; 16], &mut ctx,
+                )
+                .unwrap();
+            }
+            // Timed batch: N fresh non-mover places at this depth.
+            let n: u64 = 1500;
+            let base = depth + 1;
+            let t0 = Instant::now();
+            for i in base..base + n {
+                place_order_core(
+                    users[(i as usize) % 512], mkid(i), MID, 0, price_of(i), QTY, 0, 0,
+                    [0u8; 16], &mut ctx,
+                )
+                .unwrap();
+            }
+            let el = t0.elapsed();
+            println!(
+                "  depth={:>7} resting -> {:.2} µs/op  ({} ops in {:?})",
+                depth,
+                el.as_micros() as f64 / n as f64,
+                n,
+                el
+            );
+        }
+    }
+
     fn run_serial_op<CTX: ContextTr>(ctx: &mut CTX, op: &PerpOp) {
         match op {
             PerpOp::Place(w) => {
