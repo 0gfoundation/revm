@@ -17,6 +17,12 @@ use std::vec::Vec;
 /// (single-node, no-reorg scope). See `docs/perpstate-journal集成方案.md`.
 pub type PerpDelta = HashMap<B256, Vec<u8>>;
 
+/// Type-erased off-trie PerpDEX blob value. `Send + Sync` so a decoded struct can live in the
+/// cross-thread committed store (`canonical_perp`, an `Arc<RwLock<..>>` shared by execution / commit
+/// / RPC threads) and be handed to the EVM cold-read path without re-deserialization. The concrete
+/// perp blob types (Market/Order/Position/…) are plain data, so `Send + Sync` is satisfied for free.
+pub type PerpBlob = dyn core::any::Any + Send + Sync;
+
 /// Trait that contains database and journal of all changes that were made to the state.
 pub trait JournalTr {
     /// Database type that is used in the journal.
@@ -255,9 +261,9 @@ pub trait JournalTr {
     fn perp_store_struct(
         &mut self,
         key: B256,
-        val: std::boxed::Box<dyn core::any::Any>,
-        ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<PerpBlob>,
+        ser: fn(&PerpBlob) -> Vec<u8>,
+        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
     ) {
         let _ = (key, val, ser, clone);
     }
@@ -265,7 +271,7 @@ pub trait JournalTr {
     /// Reads a deferred `Struct` off-trie overlay value (type-erased) written this block; `None` if
     /// absent or written as raw bytes. The caller downcasts + clones (skipping deserialization).
     /// Default backend keeps no overlay and returns `None`.
-    fn perp_get_struct(&mut self, key: B256) -> Option<&dyn core::any::Any> {
+    fn perp_get_struct(&mut self, key: B256) -> Option<&PerpBlob> {
         let _ = key;
         None
     }
@@ -274,7 +280,7 @@ pub trait JournalTr {
     /// (catalog #21): the caller downcasts to `&mut T` and mutates the live struct, avoiding the
     /// load(clone)→modify→store(clone) round-trip. The backend snapshots the prior value into its
     /// revert log first. `None` if absent or written as raw bytes. Default backend returns `None`.
-    fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
+    fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut PerpBlob> {
         let _ = key;
         None
     }
@@ -283,14 +289,14 @@ pub trait JournalTr {
     /// accelerator that lets the precompile skip re-deserializing a blob it already decoded this
     /// block. Type-erased (this crate does not know the blob types); the caller downcasts and
     /// clones. The default backend keeps no cache and returns `None`.
-    fn perp_cache_get(&mut self, key: B256) -> Option<&dyn core::any::Any> {
+    fn perp_cache_get(&mut self, key: B256) -> Option<&PerpBlob> {
         let _ = key;
         None
     }
 
     /// Inserts a deserialized off-trie blob into the block-scoped read cache (no-op by default).
     /// Automatically invalidated on the next [`JournalTr::perp_store`] of the same key.
-    fn perp_cache_put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+    fn perp_cache_put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
         let _ = (key, value);
     }
 

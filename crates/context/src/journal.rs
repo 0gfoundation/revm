@@ -12,7 +12,9 @@ pub use inner::JournalInner;
 use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
-    journaled_state::{AccountLoad, JournalCheckpoint, JournalTr, PerpDelta, TransferError},
+    journaled_state::{
+        AccountLoad, JournalCheckpoint, JournalTr, PerpBlob, PerpDelta, TransferError,
+    },
 };
 use core::ops::{Deref, DerefMut};
 use database_interface::Database;
@@ -329,30 +331,30 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     fn perp_store_struct(
         &mut self,
         key: B256,
-        val: std::boxed::Box<dyn core::any::Any>,
-        ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<PerpBlob>,
+        ser: fn(&PerpBlob) -> Vec<u8>,
+        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
     ) {
         self.inner.perp_store_struct(key, val, ser, clone);
     }
 
     #[inline]
-    fn perp_get_struct(&mut self, key: B256) -> Option<&dyn core::any::Any> {
+    fn perp_get_struct(&mut self, key: B256) -> Option<&PerpBlob> {
         self.inner.perp_get_struct(key)
     }
 
     #[inline]
-    fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
+    fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut PerpBlob> {
         self.inner.perp_get_struct_mut(key)
     }
 
     #[inline]
-    fn perp_cache_get(&mut self, key: B256) -> Option<&dyn core::any::Any> {
+    fn perp_cache_get(&mut self, key: B256) -> Option<&PerpBlob> {
         self.inner.perp_cache_get(key)
     }
 
     #[inline]
-    fn perp_cache_put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+    fn perp_cache_put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
         self.inner.perp_cache_put(key, value);
     }
 

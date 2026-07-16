@@ -2,7 +2,7 @@
 
 pub mod keys;
 
-use context::{ContextTr, JournalTr};
+use context::{journaled_state::PerpBlob, ContextTr, JournalTr};
 use primitives::{Address, HashMap, B256, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
@@ -272,7 +272,7 @@ pub fn finalize_block_commitment<CTX: ContextTr>(
 /// collapses repeated reads of a hot blob within a block to a single decode.
 fn load_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256) -> Result<Option<T>, PrecompileError>
 where
-    T: Clone + 'static + for<'de> Deserialize<'de>,
+    T: Clone + Send + Sync + 'static + for<'de> Deserialize<'de>,
 {
     // Bench-only A/B lever (#14/#16d measurement): deserialize on every read with no cache,
     // reproducing pre-#14 behavior so a bench can diff per-call vs cached deser cost.
@@ -304,7 +304,7 @@ where
     let val: T = decode(&buf)?;
     context
         .journal_mut()
-        .perp_cache_put(key, std::boxed::Box::new(val.clone()));
+        .perp_cache_put(key, std::sync::Arc::new(val.clone()));
     Ok(Some(val))
 }
 
@@ -312,7 +312,7 @@ where
 /// monomorphized per blob type `T` and stored as a fn-ptr in the journal overlay. Produces bytes
 /// IDENTICAL to a direct `encode`, so deferring serialization to block end leaves the commitment
 /// byte-stream (and the on-trie anchor) unchanged. A type mismatch / encode failure is a bug.
-fn ser_blob<T: Serialize + 'static>(v: &dyn core::any::Any) -> Vec<u8> {
+fn ser_blob<T: Serialize + Send + Sync + 'static>(v: &PerpBlob) -> Vec<u8> {
     let val = v
         .downcast_ref::<T>()
         .expect("perp ser_blob: overlay value type mismatch (bug)");
@@ -323,7 +323,7 @@ fn ser_blob<T: Serialize + 'static>(v: &dyn core::any::Any) -> Vec<u8> {
 }
 
 /// Clones a type-erased off-trie blob into a fresh box (keeps the journal overlay `Clone`).
-fn clone_blob<T: Clone + 'static>(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
+fn clone_blob<T: Clone + Send + Sync + 'static>(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
     let val = v
         .downcast_ref::<T>()
         .expect("perp clone_blob: overlay value type mismatch (bug)");
@@ -337,7 +337,7 @@ fn clone_blob<T: Clone + 'static>(v: &dyn core::any::Any) -> std::boxed::Box<dyn
 /// the in-block read cache — `store_struct` invalidates the #14 cold-read cache for this key.
 fn save_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256, val: &T) -> Result<(), PrecompileError>
 where
-    T: Clone + 'static + Serialize,
+    T: Clone + Send + Sync + 'static + Serialize,
 {
     // Bench-only A/B lever (#16d measurement): serialize on every write into the byte overlay,
     // reproducing pre-#16d behavior so a bench can diff per-call vs deferred ser cost.
@@ -812,7 +812,7 @@ fn unpack_order_ids(buf: &[u8]) -> Result<Vec<[u8; 32]>, PrecompileError> {
 /// Block-end serializer for a level FIFO held as a deferred `Struct` (#21): produces the SAME raw
 /// packed bytes as the old `store_blob(pack_order_ids(..))` path, so the off-trie blob (and the
 /// commitment) is byte-identical — only the serialization timing moves to block end.
-fn ser_level(v: &dyn core::any::Any) -> Vec<u8> {
+fn ser_level(v: &PerpBlob) -> Vec<u8> {
     pack_order_ids(
         v.downcast_ref::<Vec<[u8; 32]>>()
             .expect("perp ser_level: level-queue type mismatch (bug)"),
@@ -820,7 +820,7 @@ fn ser_level(v: &dyn core::any::Any) -> Vec<u8> {
 }
 
 /// Clones a deferred level-FIFO `Struct` (keeps the journal overlay `Clone`).
-fn clone_level(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
+fn clone_level(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
     std::boxed::Box::new(
         v.downcast_ref::<Vec<[u8; 32]>>()
             .expect("perp clone_level: level-queue type mismatch (bug)")
@@ -859,7 +859,7 @@ fn load_level_cached<CTX: ContextTr>(
     let queue = unpack_order_ids(&buf)?;
     context
         .journal_mut()
-        .perp_cache_put(key, std::boxed::Box::new(queue.clone()));
+        .perp_cache_put(key, std::sync::Arc::new(queue.clone()));
     Ok(queue)
 }
 

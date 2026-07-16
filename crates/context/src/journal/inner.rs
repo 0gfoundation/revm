@@ -5,7 +5,7 @@ use super::JournalEntryTr;
 use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
-    journaled_state::{AccountLoad, JournalCheckpoint, PerpDelta, TransferError},
+    journaled_state::{AccountLoad, JournalCheckpoint, PerpBlob, PerpDelta, TransferError},
 };
 use core::mem;
 use database_interface::Database;
@@ -64,9 +64,9 @@ struct PerpUndo {
 /// the entry is `Clone` without cloning through `dyn Any`.
 enum PerpEntry {
     Struct {
-        val: std::boxed::Box<dyn core::any::Any>,
-        ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<PerpBlob>,
+        ser: fn(&PerpBlob) -> Vec<u8>,
+        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
     },
     Bytes(Vec<u8>),
 }
@@ -117,7 +117,7 @@ impl PerpEntry {
 /// A pure accelerator carrying no semantic state, so it is transparent to [`PerpSection`]'s
 /// derives: a clone starts empty (re-warms lazily), equality ignores it, and serde skips it.
 #[derive(Default)]
-struct PerpCache(HashMap<B256, std::boxed::Box<dyn core::any::Any>>);
+struct PerpCache(HashMap<B256, std::sync::Arc<PerpBlob>>);
 
 impl Clone for PerpCache {
     fn clone(&self) -> Self {
@@ -133,11 +133,11 @@ impl core::fmt::Debug for PerpCache {
 
 impl PerpCache {
     #[inline]
-    fn get(&self, key: B256) -> Option<&dyn core::any::Any> {
+    fn get(&self, key: B256) -> Option<&PerpBlob> {
         self.0.get(&key).map(|b| b.as_ref())
     }
     #[inline]
-    fn put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+    fn put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
         self.0.insert(key, value);
     }
     #[inline]
@@ -162,7 +162,7 @@ impl PerpSection {
     /// Reads a deferred `Struct` overlay value (type-erased) for the typed fast-path read; `None`
     /// if the key is absent or was written as raw `Bytes`.
     #[inline]
-    fn get_struct(&self, key: B256) -> Option<&dyn core::any::Any> {
+    fn get_struct(&self, key: B256) -> Option<&PerpBlob> {
         match self.working.get(&key) {
             Some(PerpEntry::Struct { val, .. }) => Some(val.as_ref()),
             _ => None,
@@ -176,7 +176,7 @@ impl PerpSection {
     /// raw `Bytes` (the caller falls back to load + `store_struct`). Each call records one undo
     /// snapshot (a clone), so callers fetch the handle ONCE per logical mutation, not in a loop.
     #[inline]
-    fn get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
+    fn get_struct_mut(&mut self, key: B256) -> Option<&mut PerpBlob> {
         // Snapshot the pre-mutation value for revert (clone via the entry's clone fn-ptr). The
         // immutable borrow ends with `snapshot`; only `Struct` entries can be mutated in place.
         let snapshot = match self.working.get(&key) {
@@ -216,9 +216,9 @@ impl PerpSection {
     fn store_struct(
         &mut self,
         key: B256,
-        val: std::boxed::Box<dyn core::any::Any>,
-        ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<PerpBlob>,
+        ser: fn(&PerpBlob) -> Vec<u8>,
+        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
     ) {
         let prev = self.working.insert(key, PerpEntry::Struct { val, ser, clone });
         self.undo.push(PerpUndo { key, prev });
@@ -261,13 +261,13 @@ impl PerpSection {
 
     /// Reads the block-scoped deserialized-blob cache (type-erased). See [`PerpSection::cache`].
     #[inline]
-    fn cache_get(&self, key: B256) -> Option<&dyn core::any::Any> {
+    fn cache_get(&self, key: B256) -> Option<&PerpBlob> {
         self.cache.get(key)
     }
 
     /// Inserts into the block-scoped deserialized-blob cache.
     #[inline]
-    fn cache_put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+    fn cache_put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
         self.cache.put(key, value);
     }
 }
@@ -374,35 +374,35 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     pub fn perp_store_struct(
         &mut self,
         key: B256,
-        val: std::boxed::Box<dyn core::any::Any>,
-        ser: fn(&dyn core::any::Any) -> Vec<u8>,
-        clone: fn(&dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any>,
+        val: std::boxed::Box<PerpBlob>,
+        ser: fn(&PerpBlob) -> Vec<u8>,
+        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
     ) {
         self.perp.store_struct(key, val, ser, clone);
     }
 
     /// Reads a deferred `Struct` overlay value (type-erased) for the typed fast-path read.
     #[inline]
-    pub fn perp_get_struct(&self, key: B256) -> Option<&dyn core::any::Any> {
+    pub fn perp_get_struct(&self, key: B256) -> Option<&PerpBlob> {
         self.perp.get_struct(key)
     }
 
     /// Mutable handle into a deferred `Struct` overlay value for in-place mutation (catalog #21);
     /// snapshots the prior value for revert. `None` if absent or stored as raw bytes.
     #[inline]
-    pub fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut dyn core::any::Any> {
+    pub fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut PerpBlob> {
         self.perp.get_struct_mut(key)
     }
 
     /// Reads the block-scoped deserialized PerpDEX blob cache (catalog #14; type-erased).
     #[inline]
-    pub fn perp_cache_get(&self, key: B256) -> Option<&dyn core::any::Any> {
+    pub fn perp_cache_get(&self, key: B256) -> Option<&PerpBlob> {
         self.perp.cache_get(key)
     }
 
     /// Inserts a deserialized PerpDEX blob into the block-scoped read cache.
     #[inline]
-    pub fn perp_cache_put(&mut self, key: B256, value: std::boxed::Box<dyn core::any::Any>) {
+    pub fn perp_cache_put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
         self.perp.cache_put(key, value);
     }
 
@@ -1280,7 +1280,7 @@ pub fn sload_with_account<DB: Database, ENTRY: JournalEntryTr>(
 
 #[cfg(test)]
 mod perp_tests {
-    use super::JournalInner;
+    use super::{JournalInner, PerpBlob};
     use crate::journal::JournalEntry;
     use primitives::B256;
 
@@ -1376,10 +1376,10 @@ mod perp_tests {
     }
 
     // #16d Phase 2 — deferred-struct overlay path.
-    fn ser_u32(v: &dyn core::any::Any) -> Vec<u8> {
+    fn ser_u32(v: &PerpBlob) -> Vec<u8> {
         v.downcast_ref::<u32>().unwrap().to_le_bytes().to_vec()
     }
-    fn clone_u32(v: &dyn core::any::Any) -> std::boxed::Box<dyn core::any::Any> {
+    fn clone_u32(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
         std::boxed::Box::new(*v.downcast_ref::<u32>().unwrap())
     }
 
