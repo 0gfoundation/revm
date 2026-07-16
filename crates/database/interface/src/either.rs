@@ -51,6 +51,16 @@ where
             Self::Right(db) => db.perp_storage(key),
         }
     }
+
+    fn perp_load_arc(
+        &mut self,
+        key: B256,
+    ) -> Result<Option<std::sync::Arc<crate::PerpBlob>>, Self::Error> {
+        match self {
+            Self::Left(db) => db.perp_load_arc(key),
+            Self::Right(db) => db.perp_load_arc(key),
+        }
+    }
 }
 
 impl<L, R> DatabaseCommit for Either<L, R>

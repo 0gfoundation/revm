@@ -38,6 +38,14 @@ pub use async_db::{DatabaseAsync, WrapDatabaseAsync};
 pub use empty_db::{EmptyDB, EmptyDBTyped};
 pub use try_commit::{ArcUpgradeError, TryDatabaseCommit};
 
+/// Type-erased off-trie PerpDEX blob value. `Send + Sync` so a decoded struct can live in the
+/// cross-thread committed store (`canonical_perp`, an `Arc<RwLock<..>>` shared by execution / commit
+/// / RPC threads) and be handed to the EVM cold-read path (`Database::perp_load_arc`) without
+/// re-deserialization. The concrete perp blob types (Market/Order/Position/…) are plain data, so
+/// `Send + Sync` is satisfied for free. Defined here (the `Database` layer) so both the DB trait
+/// and the higher journal/precompile layers share one type; re-exported by `revm-context-interface`.
+pub type PerpBlob = dyn core::any::Any + Send + Sync;
+
 /// Database error marker is needed to implement From conversion for Error type.
 pub trait DBErrorMarker {}
 
@@ -75,6 +83,20 @@ pub trait Database {
     fn perp_storage(&mut self, key: B256) -> Result<Vec<u8>, Self::Error> {
         let _ = key;
         Ok(Vec::new())
+    }
+
+    /// Cold-read an off-trie PerpDEX blob as an already-decoded, shared struct (skipping
+    /// deserialization). The committed store (`canonical_perp`) keeps decoded structs behind
+    /// `Arc<PerpBlob>` across blocks; a hit hands back an `Arc` clone (ref-count bump, no decode,
+    /// no byte copy). `Ok(None)` = not available as a struct (caller falls back to `perp_storage`
+    /// bytes + decode). The default keeps no decoded store and returns `None`, so behavior is
+    /// unchanged until an embedder (reth's `PerpDb`) overrides it — byte-identical fallback.
+    fn perp_load_arc(
+        &mut self,
+        key: B256,
+    ) -> Result<Option<std::sync::Arc<PerpBlob>>, Self::Error> {
+        let _ = key;
+        Ok(None)
     }
 }
 

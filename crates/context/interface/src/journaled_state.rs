@@ -17,11 +17,9 @@ use std::vec::Vec;
 /// (single-node, no-reorg scope). See `docs/perpstate-journal集成方案.md`.
 pub type PerpDelta = HashMap<B256, Vec<u8>>;
 
-/// Type-erased off-trie PerpDEX blob value. `Send + Sync` so a decoded struct can live in the
-/// cross-thread committed store (`canonical_perp`, an `Arc<RwLock<..>>` shared by execution / commit
-/// / RPC threads) and be handed to the EVM cold-read path without re-deserialization. The concrete
-/// perp blob types (Market/Order/Position/…) are plain data, so `Send + Sync` is satisfied for free.
-pub type PerpBlob = dyn core::any::Any + Send + Sync;
+/// Type-erased off-trie PerpDEX blob value; defined at the `Database` layer and re-exported here so
+/// the journal/precompile share one type with the DB cold-read seam. See [`database_interface::PerpBlob`].
+pub use database_interface::PerpBlob;
 
 /// Trait that contains database and journal of all changes that were made to the state.
 pub trait JournalTr {
