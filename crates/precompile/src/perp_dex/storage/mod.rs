@@ -2,7 +2,10 @@
 
 pub mod keys;
 
-use context::{journaled_state::PerpBlob, ContextTr, JournalTr};
+use context::{
+    journaled_state::{PerpBlob, PerpDelta},
+    ContextTr, JournalTr,
+};
 use primitives::{Address, HashMap, B256, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
@@ -211,14 +214,16 @@ const BLOCK_COMMITMENT_VERSION: u8 = 3;
 /// framed with len 0 (same convention as the per-call path). Pure: the caller reads `C_prev` and
 /// sstores the result. This commits the block's net STATE CHANGE; chained onto the previous block's
 /// `C` it forms a block-granular running commitment, the off-trie analogue of the state root.
-pub fn compute_block_commitment(prev: U256, delta: &HashMap<B256, Vec<u8>>) -> U256 {
+pub fn compute_block_commitment(prev: U256, delta: &PerpDelta) -> U256 {
     let mut keys: Vec<&B256> = delta.keys().collect();
     keys.sort_unstable();
     let mut hasher = blake3::Hasher::new();
     hasher.update(&prev.to_be_bytes::<32>());
     hasher.update(&[BLOCK_COMMITMENT_VERSION]);
     for key in keys {
-        let value = &delta[key];
+        // Fold the canonical BYTES only — `decoded` never feeds the commitment (选项A), so the
+        // byte-stream (and the on-trie anchor) is identical to the pre-Arc pipeline.
+        let value = &delta[key].bytes;
         hasher.update(key.as_slice());
         hasher.update(&(value.len() as u32).to_be_bytes());
         hasher.update(value);
@@ -240,7 +245,7 @@ pub fn compute_block_commitment(prev: U256, delta: &HashMap<B256, Vec<u8>>) -> U
 /// block-end call site has no such enclosing commit.) Journaled like any sstore.
 pub fn finalize_block_commitment<CTX: ContextTr>(
     context: &mut CTX,
-    delta: &HashMap<B256, Vec<u8>>,
+    delta: &PerpDelta,
 ) -> Result<(), PrecompileError> {
     if delta.is_empty() {
         return Ok(());
@@ -294,6 +299,21 @@ where
     if let Some(any) = context.journal_mut().perp_cache_get(key) {
         if let Some(v) = any.downcast_ref::<T>() {
             return Ok(Some(v.clone()));
+        }
+    }
+    // Cross-block decoded store (选项A): the committed store retains the struct another block
+    // already decoded — reuse it (Arc bump, no deserialization, no byte copy). Returns None when
+    // the key has any in-block overlay write (overlay precedence) or no decoded entry exists.
+    if let Some(arc) = context
+        .journal_mut()
+        .perp_load_arc(key)
+        .map_err(convert_db_err::<CTX::Db>)?
+    {
+        if let Some(v) = arc.downcast_ref::<T>() {
+            let out = v.clone();
+            // Share the SAME Arc in the block-scoped #14 cache for subsequent in-block reads.
+            context.journal_mut().perp_cache_put(key, arc);
+            return Ok(Some(out));
         }
     }
     // Cold read: committed off-trie store (or an overlay Bytes entry) → decode once → cache.
@@ -852,6 +872,19 @@ fn load_level_cached<CTX: ContextTr>(
             return Ok(q.clone());
         }
     }
+    // Cross-block decoded store (选项A): level queues written via `save_*_level` are typed
+    // `Vec<[u8;32]>` structs in the delta, so a prior block's decoded queue is reusable here too.
+    if let Some(arc) = context
+        .journal_mut()
+        .perp_load_arc(key)
+        .map_err(convert_db_err::<CTX::Db>)?
+    {
+        if let Some(q) = arc.downcast_ref::<Vec<[u8; 32]>>() {
+            let out = q.clone();
+            context.journal_mut().perp_cache_put(key, arc);
+            return Ok(out);
+        }
+    }
     let buf = load_blob(context, key)?;
     if buf.is_empty() {
         return Ok(Vec::new());
@@ -1365,10 +1398,14 @@ mod commitment_tests {
         let (k1, b1) = (B256::with_last_byte(1), vec![0xAAu8]);
         let (k2, b2) = (B256::with_last_byte(2), vec![0xBBu8, 0xCC]);
         let (k3, b3) = (B256::with_last_byte(3), Vec::<u8>::new()); // deleted key, framed len 0
-        let mut delta: HashMap<B256, Vec<u8>> = HashMap::default();
-        delta.insert(k1, b1.clone());
-        delta.insert(k2, b2.clone());
-        delta.insert(k3, b3.clone());
+        let mut delta = PerpDelta::default();
+        let e = |b: &Vec<u8>| context::journaled_state::PerpDeltaEntry {
+            decoded: None,
+            bytes: b.clone(),
+        };
+        delta.insert(k1, e(&b1));
+        delta.insert(k2, e(&b2));
+        delta.insert(k3, e(&b3));
 
         // Independent reference: BTreeMap (sorted), v3 framing.
         let mut sorted: std::collections::BTreeMap<B256, Vec<u8>> = std::collections::BTreeMap::new();
@@ -1393,7 +1430,7 @@ mod commitment_tests {
 
         // Empty delta is a no-op (slot stays at genesis 0).
         let mut ctx2 = new_test_ctx();
-        finalize_block_commitment(&mut ctx2, &HashMap::default()).unwrap();
+        finalize_block_commitment(&mut ctx2, &PerpDelta::default()).unwrap();
         assert_eq!(read_commitment(&mut ctx2), U256::ZERO);
     }
 

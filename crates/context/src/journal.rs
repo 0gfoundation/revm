@@ -323,6 +323,20 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn perp_load_arc(
+        &mut self,
+        key: B256,
+    ) -> Result<Option<std::sync::Arc<PerpBlob>>, <Self::Database as Database>::Error> {
+        // Overlay precedence: any in-block write (struct or bytes) must be served by the overlay
+        // tiers / byte path — the committed store is stale for this key within this block.
+        if self.inner.perp_has_overlay(key) {
+            return Ok(None);
+        }
+        // Cold miss: committed cross-block store, already decoded (no deserialization).
+        self.database.perp_load_arc(key)
+    }
+
+    #[inline]
     fn perp_store(&mut self, key: B256, value: Vec<u8>) {
         self.inner.perp_store(key, value);
     }

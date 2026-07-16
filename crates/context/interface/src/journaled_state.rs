@@ -15,7 +15,33 @@ use std::vec::Vec;
 /// the [`JournalTr::State`] returned by [`JournalTr::finalize`], so perp data never enters
 /// the state trie. An empty value means the key is absent/deleted. Carries no pre-images
 /// (single-node, no-reorg scope). See `docs/perpstate-journal集成方案.md`.
-pub type PerpDelta = HashMap<B256, Vec<u8>>;
+pub type PerpDelta = HashMap<B256, PerpDeltaEntry>;
+
+/// One net off-trie PerpDEX write drained at block end (选项A: delta carries the decoded struct).
+///
+/// `bytes` is the canonical serialization — the ONLY input to the block commitment fold and disk
+/// persistence, byte-identical to the pre-Arc pipeline. `decoded` rides along so the committed
+/// in-memory store (`canonical_perp`) can retain the already-decoded struct across blocks and hand
+/// it back to future cold reads (`Database::perp_load_arc`) without re-deserializing; it never
+/// feeds the commitment. `None` for raw-byte writes and deletes.
+#[derive(Clone)]
+pub struct PerpDeltaEntry {
+    /// Decoded struct for the cross-block committed store (`None` = raw bytes / delete).
+    pub decoded: Option<std::sync::Arc<PerpBlob>>,
+    /// Canonical bytes: commitment fold + persistence. Empty = delete the key.
+    pub bytes: Vec<u8>,
+}
+
+impl core::fmt::Debug for PerpDeltaEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "PerpDeltaEntry {{ decoded: {}, bytes: {} }}",
+            if self.decoded.is_some() { "Some(..)" } else { "None" },
+            self.bytes.len()
+        )
+    }
+}
 
 /// Type-erased off-trie PerpDEX blob value; defined at the `Database` layer and re-exported here so
 /// the journal/precompile share one type with the DB cold-read seam. See [`database_interface::PerpBlob`].
@@ -243,6 +269,19 @@ pub trait JournalTr {
     fn perp_load(&mut self, key: B256) -> Result<Vec<u8>, <Self::Database as Database>::Error> {
         let _ = key;
         Ok(Vec::new())
+    }
+
+    /// Cold-reads an off-trie PerpDEX blob as an already-decoded shared struct from the committed
+    /// cross-block store, skipping deserialization ([`Database::perp_load_arc`]). Returns `None`
+    /// whenever the key has ANY in-block overlay write (struct or bytes) — the overlay is newer
+    /// than the committed store, and the byte path ([`JournalTr::perp_load`]) serves it — or when
+    /// the committed store has no decoded struct for the key (caller falls back to bytes+decode).
+    fn perp_load_arc(
+        &mut self,
+        key: B256,
+    ) -> Result<Option<std::sync::Arc<PerpBlob>>, <Self::Database as Database>::Error> {
+        let _ = key;
+        Ok(None)
     }
 
     /// Writes an off-trie PerpDEX blob, journaled so it reverts in lock-step with the surrounding

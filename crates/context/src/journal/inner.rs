@@ -5,7 +5,7 @@ use super::JournalEntryTr;
 use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
-    journaled_state::{AccountLoad, JournalCheckpoint, PerpBlob, PerpDelta, TransferError},
+    journaled_state::{AccountLoad, JournalCheckpoint, PerpBlob, PerpDelta, PerpDeltaEntry, TransferError},
 };
 use core::mem;
 use database_interface::Database;
@@ -255,7 +255,25 @@ impl PerpSection {
         self.cache.clear();
         mem::take(&mut self.working)
             .into_iter()
-            .map(|(k, e)| (k, e.into_bytes()))
+            .map(|(k, e)| {
+                let entry = match e {
+                    // Typed write: serialize ONCE for commitment/persistence (byte-identical to
+                    // the pre-Arc pipeline) and ride the decoded struct along for the committed
+                    // cross-block store (选项A) — Box -> Arc, no re-decode.
+                    PerpEntry::Struct { val, ser, .. } => {
+                        let bytes = ser(val.as_ref());
+                        PerpDeltaEntry {
+                            decoded: Some(std::sync::Arc::from(val)),
+                            bytes,
+                        }
+                    }
+                    PerpEntry::Bytes(b) => PerpDeltaEntry {
+                        decoded: None,
+                        bytes: b,
+                    },
+                };
+                (k, entry)
+            })
             .collect()
     }
 
@@ -359,6 +377,14 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn perp_get_overlay(&self, key: B256) -> Option<Vec<u8>> {
         self.perp.get_bytes(key)
+    }
+
+    /// Whether `key` has ANY in-block overlay write (struct or raw bytes). Used by the decoded
+    /// cold-read path (`JournalTr::perp_load_arc`) to keep overlay precedence: an overlaid key
+    /// must be served by the overlay (bytes/struct tiers), never by the committed store.
+    #[inline]
+    pub fn perp_has_overlay(&self, key: B256) -> bool {
+        self.perp.working.contains_key(&key)
     }
 
     /// Writes an off-trie PerpDEX blob (raw bytes) to the overlay, journaled for revert.
@@ -1368,8 +1394,8 @@ mod perp_tests {
         j.perp_store(k(1), vec![2]); // last write wins
         j.perp_store(k(3), vec![]); // empty value = delete marker
         let delta = j.take_perp_delta();
-        assert_eq!(delta.get(&k(1)), Some(&vec![2u8]));
-        assert_eq!(delta.get(&k(3)), Some(&Vec::<u8>::new()));
+        assert_eq!(delta.get(&k(1)).map(|e| &e.bytes), Some(&vec![2u8]));
+        assert_eq!(delta.get(&k(3)).map(|e| &e.bytes), Some(&Vec::<u8>::new()));
         assert_eq!(delta.len(), 2);
         assert!(j.perp.working.is_empty());
         assert!(j.perp.undo.is_empty());
@@ -1397,7 +1423,7 @@ mod perp_tests {
         assert_eq!(j2.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&7u32));
         // Block-end drain serializes ONCE.
         let delta = j.take_perp_delta();
-        assert_eq!(delta.get(&k(1)), Some(&7u32.to_le_bytes().to_vec()));
+        assert_eq!(delta.get(&k(1)).map(|e| &e.bytes), Some(&7u32.to_le_bytes().to_vec()));
     }
 
     #[test]
@@ -1465,8 +1491,8 @@ mod perp_tests {
         let _ = j.finalize();
         // End of block: harvest. Both committed writes must be present.
         let delta = j.take_perp_delta();
-        assert_eq!(delta.get(&k(1)), Some(&vec![0xAAu8]));
-        assert_eq!(delta.get(&k(2)), Some(&vec![0xBBu8]));
+        assert_eq!(delta.get(&k(1)).map(|e| &e.bytes), Some(&vec![0xAAu8]));
+        assert_eq!(delta.get(&k(2)).map(|e| &e.bytes), Some(&vec![0xBBu8]));
         assert_eq!(delta.len(), 2);
         // Drained after harvest.
         assert!(j.perp.working.is_empty());
