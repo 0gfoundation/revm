@@ -43,6 +43,16 @@ impl core::fmt::Debug for PerpDeltaEntry {
     }
 }
 
+// `decoded` is a byte-derived cache (`decoded == deserialize(bytes)`), so canonical `bytes`
+// equality IS semantic equality — compare bytes only. This keeps `PerpDelta` and the reth
+// execution-output types that embed it `PartialEq`/`Eq` (Arc<dyn Any> is neither).
+impl PartialEq for PerpDeltaEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+impl Eq for PerpDeltaEntry {}
+
 /// Type-erased off-trie PerpDEX blob value; defined at the `Database` layer and re-exported here so
 /// the journal/precompile share one type with the DB cold-read seam. See [`database_interface::PerpBlob`].
 pub use database_interface::PerpBlob;
