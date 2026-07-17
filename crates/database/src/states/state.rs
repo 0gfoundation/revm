@@ -313,6 +313,16 @@ impl<DB: Database> Database for State<DB> {
         // pass straight through to the underlying database.
         self.database.perp_storage(key)
     }
+
+    fn perp_load_arc(
+        &mut self,
+        key: B256,
+    ) -> Result<Option<std::sync::Arc<database_interface::PerpBlob>>, Self::Error> {
+        // Off-trie perp store is not in State's bundle; forward the decoded cross-block fast path
+        // to the underlying DB (选项A). Without this forward `State` would use the trait default
+        // (`None`) and the Arc reuse path would NEVER fire — see AB report 20260717 (0% hit).
+        self.database.perp_load_arc(key)
+    }
 }
 
 impl<DB: Database> DatabaseCommit for State<DB> {
@@ -399,6 +409,52 @@ mod tests {
         AccountRevert, AccountStatus, BundleAccount, RevertToSlot,
     };
     use primitives::{keccak256, U256};
+
+    /// Regression: `State<DB>` must FORWARD `perp_load_arc` to its inner DB (选项A cross-block
+    /// decoded read). It previously used the trait default (`None`), so the executor DB
+    /// `State<PerpDb<..>>` masked PerpDb's override and the Arc reuse path was 0% hit
+    /// (AB report 20260717). The off-trie perp store is not in State's bundle, so pass-through.
+    #[test]
+    fn state_forwards_perp_load_arc() {
+        use database_interface::PerpBlob;
+        use std::sync::Arc;
+
+        // A DB that serves a decoded perp struct via perp_load_arc for one key.
+        #[derive(Default)]
+        struct ArcDb;
+        impl Database for ArcDb {
+            type Error = core::convert::Infallible;
+            fn basic(&mut self, _: Address) -> Result<Option<AccountInfo>, Self::Error> {
+                Ok(None)
+            }
+            fn code_by_hash(&mut self, _: B256) -> Result<Bytecode, Self::Error> {
+                Ok(Bytecode::default())
+            }
+            fn storage(&mut self, _: Address, _: U256) -> Result<U256, Self::Error> {
+                Ok(U256::ZERO)
+            }
+            fn block_hash(&mut self, _: u64) -> Result<B256, Self::Error> {
+                Ok(B256::ZERO)
+            }
+            fn perp_load_arc(
+                &mut self,
+                key: B256,
+            ) -> Result<Option<Arc<PerpBlob>>, Self::Error> {
+                if key == B256::with_last_byte(7) {
+                    Ok(Some(Arc::new(1234u64) as Arc<PerpBlob>))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+
+        let mut state = State::builder().with_database(ArcDb).build();
+        // Forwarded → Some for the known key, downcasts to the stored struct (no decode).
+        let got = state.perp_load_arc(B256::with_last_byte(7)).unwrap();
+        assert_eq!(got.and_then(|a| a.downcast_ref::<u64>().copied()), Some(1234u64));
+        // Absent key → None (still forwarded, inner returns None).
+        assert!(state.perp_load_arc(B256::with_last_byte(9)).unwrap().is_none());
+    }
 
     #[test]
     fn block_hash_cache() {
