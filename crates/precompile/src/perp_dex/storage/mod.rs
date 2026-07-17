@@ -801,6 +801,85 @@ pub fn save_ask_prices<CTX: ContextTr>(
     save_cached(context, ask_prices_key(market_id), &prices.to_vec())
 }
 
+// ── In-place orderbook mutation (catalog #21, generalized) ──────────────────────
+// Mirror of `mutate_buy_orders`/`mutate_sell_orders`: fast-path mutates the deferred `Struct`
+// already in the block overlay IN PLACE (zero clone, zero re-encode); slow-path (first touch this
+// block) loads once (选项A: one Arc clone from the committed store, no re-deserialize) and stores
+// the struct back into the overlay. Byte-identical final bytes → commitment unchanged.
+// These variants ALWAYS write on the slow path — matching the callers whose pre-#21 form ended in an
+// UNCONDITIONAL `save_*` (remove_*_price, level detach). Conditional-write callers (insert_*_price)
+// are handled inline to preserve their "no write when unchanged" delta semantics (golden).
+
+fn mutate_bid_prices<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    f: impl FnOnce(&mut Vec<u64>) -> R,
+) -> Result<R, PrecompileError> {
+    let key = bid_prices_key(market_id);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
+            return Ok(f(prices));
+        }
+    }
+    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
+    let r = f(&mut prices);
+    save_cached(context, key, &prices)?;
+    Ok(r)
+}
+
+fn mutate_ask_prices<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    f: impl FnOnce(&mut Vec<u64>) -> R,
+) -> Result<R, PrecompileError> {
+    let key = ask_prices_key(market_id);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
+            return Ok(f(prices));
+        }
+    }
+    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
+    let r = f(&mut prices);
+    save_cached(context, key, &prices)?;
+    Ok(r)
+}
+
+pub fn mutate_bid_level<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    f: impl FnOnce(&mut Vec<[u8; 32]>) -> R,
+) -> Result<R, PrecompileError> {
+    let key = bid_level_key(market_id, price);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
+            return Ok(f(q));
+        }
+    }
+    let mut queue = load_bid_level(context, market_id, price)?;
+    let r = f(&mut queue);
+    save_bid_level(context, market_id, price, &queue)?;
+    Ok(r)
+}
+
+pub fn mutate_ask_level<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    f: impl FnOnce(&mut Vec<[u8; 32]>) -> R,
+) -> Result<R, PrecompileError> {
+    let key = ask_level_key(market_id, price);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
+            return Ok(f(q));
+        }
+    }
+    let mut queue = load_ask_level(context, market_id, price)?;
+    let r = f(&mut queue);
+    save_ask_level(context, market_id, price, &queue)?;
+    Ok(r)
+}
+
 // ── Order book: FIFO queue at a price level ───────────────────────────────────
 
 /// Packs an order-id FIFO queue as raw concatenated 32-byte ids — the most compact form for a
@@ -954,11 +1033,24 @@ pub fn insert_bid_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let mut prices = load_bid_prices(context, market_id)?;
+    let key = bid_prices_key(market_id);
+    // Fast path: already touched this block → in-place present-check + insert (no load/store clone).
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
+            if !prices.contains(&price) {
+                let idx = prices.partition_point(|&p| p > price);
+                prices.insert(idx, price);
+            }
+            return Ok(());
+        }
+    }
+    // Slow path (first touch): load once; write ONLY when inserting — preserving the pre-#21
+    // "no store when the price is already present" delta semantics (commitment/golden neutral).
+    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
     if !prices.contains(&price) {
         let idx = prices.partition_point(|&p| p > price);
         prices.insert(idx, price);
-        save_bid_prices(context, market_id, &prices)?;
+        save_cached(context, key, &prices)?;
     }
     Ok(())
 }
@@ -969,11 +1061,21 @@ pub fn insert_ask_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let mut prices = load_ask_prices(context, market_id)?;
+    let key = ask_prices_key(market_id);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
+            if !prices.contains(&price) {
+                let idx = prices.partition_point(|&p| p < price);
+                prices.insert(idx, price);
+            }
+            return Ok(());
+        }
+    }
+    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
     if !prices.contains(&price) {
         let idx = prices.partition_point(|&p| p < price);
         prices.insert(idx, price);
-        save_ask_prices(context, market_id, &prices)?;
+        save_cached(context, key, &prices)?;
     }
     Ok(())
 }
@@ -984,9 +1086,7 @@ pub fn remove_bid_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let mut prices = load_bid_prices(context, market_id)?;
-    prices.retain(|&p| p != price);
-    save_bid_prices(context, market_id, &prices)
+    mutate_bid_prices(context, market_id, |prices| prices.retain(|&p| p != price))
 }
 
 /// Remove `price` from the ask price list (call when level becomes empty).
@@ -995,9 +1095,7 @@ pub fn remove_ask_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let mut prices = load_ask_prices(context, market_id)?;
-    prices.retain(|&p| p != price);
-    save_ask_prices(context, market_id, &prices)
+    mutate_ask_prices(context, market_id, |prices| prices.retain(|&p| p != price))
 }
 
 /// Append `order_id` to the FIFO queue at the given bid price level. #21: if the level is already

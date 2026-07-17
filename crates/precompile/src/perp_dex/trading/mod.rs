@@ -1408,24 +1408,26 @@ fn detach_order_from_level<CTX: ContextTr>(
     let (old_best, emptied) = match side {
         Side::Buy => {
             let old_best = storage::load_best_bid(context, market_id)?;
-            let mut queue = storage::load_bid_level(context, market_id, price)?;
-            queue.retain(|id| id != order_id);
-            let emptied = queue.is_empty();
+            // #21 generalized: remove IN PLACE (fast path when the level is already in the block
+            // overlay), byte-identical to the load-retain-save round-trip.
+            let emptied = storage::mutate_bid_level(context, market_id, price, |q| {
+                q.retain(|id| id != order_id);
+                q.is_empty()
+            })?;
             if emptied {
                 storage::remove_bid_price(context, market_id, price)?;
             }
-            storage::save_bid_level(context, market_id, price, &queue)?;
             (old_best, emptied)
         }
         Side::Sell => {
             let old_best = storage::load_best_ask(context, market_id)?;
-            let mut queue = storage::load_ask_level(context, market_id, price)?;
-            queue.retain(|id| id != order_id);
-            let emptied = queue.is_empty();
+            let emptied = storage::mutate_ask_level(context, market_id, price, |q| {
+                q.retain(|id| id != order_id);
+                q.is_empty()
+            })?;
             if emptied {
                 storage::remove_ask_price(context, market_id, price)?;
             }
-            storage::save_ask_level(context, market_id, price, &queue)?;
             (old_best, emptied)
         }
     };

@@ -975,13 +975,14 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
             order.status = OrderStatus::Cancelled;
             storage::save_order(context, &entry.order_id, &order)?;
         }
-        // Remove from price level queue.
-        let mut queue = storage::load_bid_level(context, market_id, entry.price)?;
-        queue.retain(|id| id != &entry.order_id);
-        if queue.is_empty() {
+        // Remove from price level queue (in place; #21 generalized).
+        let empty = storage::mutate_bid_level(context, market_id, entry.price, |q| {
+            q.retain(|id| id != &entry.order_id);
+            q.is_empty()
+        })?;
+        if empty {
             storage::remove_bid_price(context, market_id, entry.price)?;
         }
-        storage::save_bid_level(context, market_id, entry.price, &queue)?;
 
         context.journal_mut().log(Log {
             address: PERP_DEX_ADDRESS,
@@ -1002,12 +1003,13 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
             order.status = OrderStatus::Cancelled;
             storage::save_order(context, &entry.order_id, &order)?;
         }
-        let mut queue = storage::load_ask_level(context, market_id, entry.price)?;
-        queue.retain(|id| id != &entry.order_id);
-        if queue.is_empty() {
+        let empty = storage::mutate_ask_level(context, market_id, entry.price, |q| {
+            q.retain(|id| id != &entry.order_id);
+            q.is_empty()
+        })?;
+        if empty {
             storage::remove_ask_price(context, market_id, entry.price)?;
         }
-        storage::save_ask_level(context, market_id, entry.price, &queue)?;
 
         context.journal_mut().log(Log {
             address: PERP_DEX_ADDRESS,
