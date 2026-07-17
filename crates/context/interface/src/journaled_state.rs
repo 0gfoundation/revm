@@ -37,7 +37,11 @@ impl core::fmt::Debug for PerpDeltaEntry {
         write!(
             f,
             "PerpDeltaEntry {{ decoded: {}, bytes: {} }}",
-            if self.decoded.is_some() { "Some(..)" } else { "None" },
+            if self.decoded.is_some() {
+                "Some(..)"
+            } else {
+                "None"
+            },
             self.bytes.len()
         )
     }
@@ -337,6 +341,15 @@ pub trait JournalTr {
     /// block. Type-erased (this crate does not know the blob types); the caller downcasts and
     /// clones. The default backend keeps no cache and returns `None`.
     fn perp_cache_get(&mut self, key: B256) -> Option<&PerpBlob> {
+        let _ = key;
+        None
+    }
+
+    /// Returns the cached blob `Arc` itself (refcount bump, no deep clone) for zero-copy typed
+    /// reads (点1 borrow-read): the caller `Arc::downcast`s to `Arc<T>` and reads via `&*arc`,
+    /// eliminating the per-read deep clone that `perp_cache_get` + downcast+clone incurs. Default
+    /// backend keeps no cache → `None`.
+    fn perp_cache_get_arc(&mut self, key: B256) -> Option<std::sync::Arc<PerpBlob>> {
         let _ = key;
         None
     }

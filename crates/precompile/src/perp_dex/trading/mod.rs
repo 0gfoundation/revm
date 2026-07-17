@@ -124,7 +124,7 @@ pub fn run_place_order_signed<CTX: ContextTr>(
 
     // Derive orderId from signature: same sig, same id, duplicate check is the replay guard.
     let order_id: [u8; 32] = keccak256(args.signature.as_ref()).0;
-    if storage::load_order(context, &order_id)?.is_some() {
+    if storage::load_order_ref(context, &order_id)?.is_some() {
         return Err(perp_err(
             "placeOrderSigned: duplicate signature (already submitted)",
         ));
@@ -213,7 +213,7 @@ pub fn run_get_order<CTX: ContextTr>(
         .map_err(|_| perp_err("getOrder: invalid calldata"))?;
     let order_id: [u8; 32] = args.orderId.0;
 
-    let order = storage::load_order(context, &order_id)?
+    let order = storage::load_order_ref(context, &order_id)?
         .ok_or_else(|| perp_err("getOrder: order not found"))?;
 
     let owner = Address::from(order.owner);
@@ -238,8 +238,8 @@ pub fn run_get_open_orders<CTX: ContextTr>(
     let args = getOpenOrdersCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getOpenOrders: invalid calldata"))?;
 
-    let buy_entries = storage::load_buy_orders(context, args.user, args.marketId)?;
-    let sell_entries = storage::load_sell_orders(context, args.user, args.marketId)?;
+    let buy_entries = storage::load_buy_orders_ref(context, args.user, args.marketId)?;
+    let sell_entries = storage::load_sell_orders_ref(context, args.user, args.marketId)?;
     let total = buy_entries.len() + sell_entries.len();
 
     let mut order_ids = Vec::with_capacity(total);
@@ -247,13 +247,13 @@ pub fn run_get_open_orders<CTX: ContextTr>(
     let mut prices = Vec::with_capacity(total);
     let mut remaining_quantities = Vec::with_capacity(total);
 
-    for entry in buy_entries {
+    for entry in buy_entries.iter() {
         order_ids.push(FixedBytes(entry.order_id));
         sides.push(Side::Buy as u8);
         prices.push(entry.price);
         remaining_quantities.push(entry.amount);
     }
-    for entry in sell_entries {
+    for entry in sell_entries.iter() {
         order_ids.push(FixedBytes(entry.order_id));
         sides.push(Side::Sell as u8);
         prices.push(entry.price);
@@ -293,8 +293,8 @@ pub fn run_get_book_prices<CTX: ContextTr>(
 
     let side = Side::from_u8(args.side).ok_or_else(|| perp_err("getBookPrices: invalid side"))?;
     let prices = match side {
-        Side::Buy => storage::load_bid_prices(context, args.marketId)?,
-        Side::Sell => storage::load_ask_prices(context, args.marketId)?,
+        Side::Buy => storage::load_bid_prices_ref(context, args.marketId)?,
+        Side::Sell => storage::load_ask_prices_ref(context, args.marketId)?,
     };
 
     Ok(Bytes::from(getBookPricesCall::abi_encode_returns(&prices)))
@@ -310,10 +310,10 @@ pub fn run_get_book_level<CTX: ContextTr>(
 
     let side = Side::from_u8(args.side).ok_or_else(|| perp_err("getBookLevel: invalid side"))?;
     let queue = match side {
-        Side::Buy => storage::load_bid_level(context, args.marketId, args.price)?,
-        Side::Sell => storage::load_ask_level(context, args.marketId, args.price)?,
+        Side::Buy => storage::load_bid_level_arc(context, args.marketId, args.price)?,
+        Side::Sell => storage::load_ask_level_arc(context, args.marketId, args.price)?,
     };
-    let order_ids = queue.into_iter().map(FixedBytes).collect();
+    let order_ids = queue.iter().copied().map(FixedBytes).collect();
 
     Ok(Bytes::from(getBookLevelCall::abi_encode_returns(
         &order_ids,
@@ -784,7 +784,7 @@ fn cancel_order_core<CTX: ContextTr>(
     }
 
     let market_id = order.market_id;
-    let market = storage::load_market(context, market_id)?
+    let market = storage::load_market_ref(context, market_id)?
         .ok_or_else(|| perp_err("cancelOrder: unknown market"))?;
     execute_order_cancellation(
         context,
@@ -831,15 +831,15 @@ pub(super) fn match_order<CTX: ContextTr>(
     match side {
         Side::Buy => {
             // Match against asks (sorted ASC: lowest ask first).
-            let ask_prices = storage::load_ask_prices(context, market_id)?;
+            let ask_prices = storage::load_ask_prices_ref(context, market_id)?;
             let old_best_ask = ask_prices.first().copied().unwrap_or(0);
             let mut ask_levels_cleared = false;
-            'outer: for ask_price in ask_prices {
+            'outer: for ask_price in ask_prices.iter().copied() {
                 // For limit buy: only match if ask_price <= our limit.
                 if order_type == OrderType::Limit && ask_price > limit_price {
                     break;
                 }
-                let queue = storage::load_ask_level(context, market_id, ask_price)?;
+                let queue = storage::load_ask_level_arc(context, market_id, ask_price)?;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
                 let mut qi = 0;
 
@@ -982,15 +982,15 @@ pub(super) fn match_order<CTX: ContextTr>(
         }
         Side::Sell => {
             // Match against bids (sorted DESC: highest bid first).
-            let bid_prices = storage::load_bid_prices(context, market_id)?;
+            let bid_prices = storage::load_bid_prices_ref(context, market_id)?;
             let old_best_bid = bid_prices.first().copied().unwrap_or(0);
             let mut bid_levels_cleared = false;
-            'outer: for bid_price in bid_prices {
+            'outer: for bid_price in bid_prices.iter().copied() {
                 // For limit sell: only match if bid_price >= our limit.
                 if order_type == OrderType::Limit && bid_price < limit_price {
                     break;
                 }
-                let queue = storage::load_bid_level(context, market_id, bid_price)?;
+                let queue = storage::load_bid_level_arc(context, market_id, bid_price)?;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
                 let mut qi = 0;
 
@@ -1204,7 +1204,7 @@ fn rest_in_book<CTX: ContextTr>(
             // #21 靶子2: insert into the user's buy-order list (sorted price DESC) IN PLACE and
             // recompute the flip-aware reservation inside the borrow — no load/store clone of the
             // list. The other side is loaded owned (the two-sided calc needs both).
-            let sell_entries = storage::load_sell_orders(context, user, market_id)?;
+            let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
             let new_entry = OrderEntry {
                 order_id: *order_id,
                 price,
@@ -1267,7 +1267,7 @@ fn rest_in_book<CTX: ContextTr>(
         Side::Sell => {
             // #21 靶子2: insert into the user's sell-order list (sorted price ASC) IN PLACE and
             // recompute the flip-aware reservation inside the borrow — no load/store clone.
-            let buy_entries = storage::load_buy_orders(context, user, market_id)?;
+            let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
             let new_entry = OrderEntry {
                 order_id: *order_id,
                 price,
@@ -1584,20 +1584,21 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
             // `filled` can lag it during the same matching round, so the release
             // is sized from the entry, not from order.quantity - order.filled.
             // #21 靶子2: remove + recompute IN PLACE (no load/store clone of the list).
-            let sell_entries = storage::load_sell_orders(context, user, market_id)?;
+            let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let (cancelled_entry, (new_notional, sell_notional, c_notional)) = storage::mutate_buy_orders(
-                context,
-                user,
-                market_id,
-                |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
-                    let cancelled = remove_order_entry(entries, order_id, "buy")?;
-                    let notionals =
-                        calc_reservation_notionals(entries, &sell_entries, bd, pd, pos_amount)?;
-                    Ok((cancelled, notionals))
-                },
-            )??;
+            let (cancelled_entry, (new_notional, sell_notional, c_notional)) =
+                storage::mutate_buy_orders(
+                    context,
+                    user,
+                    market_id,
+                    |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
+                        let cancelled = remove_order_entry(entries, order_id, "buy")?;
+                        let notionals =
+                            calc_reservation_notionals(entries, &sell_entries, bd, pd, pos_amount)?;
+                        Ok((cancelled, notionals))
+                    },
+                )??;
             let leverage = pos.leverage;
             pos.set_reservations(new_notional, sell_notional, c_notional, leverage);
             let new_reserved = pos.margin_reserved;
@@ -1628,20 +1629,21 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
             // not the per-side max — the per-side fields lag it under the model).
             let old_reserved = pos.margin_reserved;
             // #21 靶子2: remove + recompute IN PLACE (no load/store clone of the list).
-            let buy_entries = storage::load_buy_orders(context, user, market_id)?;
+            let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let (cancelled_entry, (buy_notional, new_notional, c_notional)) = storage::mutate_sell_orders(
-                context,
-                user,
-                market_id,
-                |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
-                    let cancelled = remove_order_entry(entries, order_id, "sell")?;
-                    let notionals =
-                        calc_reservation_notionals(&buy_entries, entries, bd, pd, pos_amount)?;
-                    Ok((cancelled, notionals))
-                },
-            )??;
+            let (cancelled_entry, (buy_notional, new_notional, c_notional)) =
+                storage::mutate_sell_orders(
+                    context,
+                    user,
+                    market_id,
+                    |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
+                        let cancelled = remove_order_entry(entries, order_id, "sell")?;
+                        let notionals =
+                            calc_reservation_notionals(&buy_entries, entries, bd, pd, pos_amount)?;
+                        Ok((cancelled, notionals))
+                    },
+                )??;
             let leverage = pos.leverage;
             pos.set_reservations(buy_notional, new_notional, c_notional, leverage);
             let new_reserved = pos.margin_reserved;
@@ -1688,14 +1690,14 @@ fn check_fok_feasibility<CTX: ContextTr>(
     let mut available: u64 = 0;
     match side {
         Side::Buy => {
-            let ask_prices = storage::load_ask_prices(context, market_id)?;
-            'outer: for ask_price in ask_prices {
+            let ask_prices = storage::load_ask_prices_ref(context, market_id)?;
+            'outer: for ask_price in ask_prices.iter().copied() {
                 if order_type == OrderType::Limit && ask_price > limit_price {
                     break;
                 }
-                let queue = storage::load_ask_level(context, market_id, ask_price)?;
-                for maker_id in &queue {
-                    if let Some(o) = storage::load_order(context, maker_id)? {
+                let queue = storage::load_ask_level_arc(context, market_id, ask_price)?;
+                for maker_id in queue.iter() {
+                    if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
                             available += o.quantity - o.filled;
                             if available >= quantity {
@@ -1707,14 +1709,14 @@ fn check_fok_feasibility<CTX: ContextTr>(
             }
         }
         Side::Sell => {
-            let bid_prices = storage::load_bid_prices(context, market_id)?;
-            'outer: for bid_price in bid_prices {
+            let bid_prices = storage::load_bid_prices_ref(context, market_id)?;
+            'outer: for bid_price in bid_prices.iter().copied() {
                 if order_type == OrderType::Limit && bid_price < limit_price {
                     break;
                 }
-                let queue = storage::load_bid_level(context, market_id, bid_price)?;
-                for maker_id in &queue {
-                    if let Some(o) = storage::load_order(context, maker_id)? {
+                let queue = storage::load_bid_level_arc(context, market_id, bid_price)?;
+                for maker_id in queue.iter() {
+                    if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
                             available += o.quantity - o.filled;
                             if available >= quantity {

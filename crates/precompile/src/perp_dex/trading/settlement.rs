@@ -62,7 +62,11 @@ impl TakerSettlement {
             // user is already charged the liquidation clearance fee (to the IF). This
             // also keeps the close from reverting on `ensure_taker_wallet_can_cover_margin`
             // when the underwater user has no free wallet to cover a taker fee.
-            taker_fee_bps: if waive_taker_fee { 0 } else { rates.taker_fee_bps },
+            taker_fee_bps: if waive_taker_fee {
+                0
+            } else {
+                rates.taker_fee_bps
+            },
         })
     }
 
@@ -225,9 +229,7 @@ impl TakerSettlement {
                     market.price_decimals,
                 )?
             {
-                return Err(perp_err(
-                    "placeOrder: open would breach maintenance margin",
-                ));
+                return Err(perp_err("placeOrder: open would breach maintenance margin"));
             }
         }
 
@@ -594,7 +596,7 @@ fn ensure_taker_wallet_can_cover_margin<CTX: ContextTr>(
         return Ok(());
     }
 
-    if storage::load_account(context, user)?.has_available_perp(required_margin) {
+    if storage::load_account_ref(context, user)?.has_available_perp(required_margin) {
         return Ok(());
     }
 
@@ -607,7 +609,7 @@ fn ensure_taker_wallet_can_cover_margin<CTX: ContextTr>(
         market,
     )?;
 
-    if !storage::load_account(context, user)?.has_available_perp(required_margin) {
+    if !storage::load_account_ref(context, user)?.has_available_perp(required_margin) {
         return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
     }
     Ok(())
@@ -627,12 +629,12 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
     required_margin: u64,
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
-    while !storage::load_account(context, user)?.has_available_perp(required_margin) {
+    while !storage::load_account_ref(context, user)?.has_available_perp(required_margin) {
         let order_id = match side {
-            Side::Buy => storage::load_buy_orders(context, user, market_id)?
+            Side::Buy => storage::load_buy_orders_ref(context, user, market_id)?
                 .last()
                 .map(|e| e.order_id),
-            Side::Sell => storage::load_sell_orders(context, user, market_id)?
+            Side::Sell => storage::load_sell_orders_ref(context, user, market_id)?
                 .last()
                 .map(|e| e.order_id),
         };
@@ -768,7 +770,10 @@ fn apply_position_fill(
             let from_margin = deficit.min(remaining_margin);
             pos.margin = pos
                 .margin
-                .checked_sub(checked_u64_to_i64(from_margin, "settlement: margin drawdown")?)
+                .checked_sub(checked_u64_to_i64(
+                    from_margin,
+                    "settlement: margin drawdown",
+                )?)
                 .ok_or_else(|| perp_err("settlement: margin overflow"))?;
             bad_debt = deficit - from_margin;
         }
@@ -991,8 +996,8 @@ fn recompute_maker_order_reserve_after_fill<CTX: ContextTr>(
     pos: &mut crate::perp_dex::types::PerpPosition,
     market: &crate::perp_dex::types::Market,
 ) -> Result<u64, PrecompileError> {
-    let buy_entries = storage::load_buy_orders(context, user, market_id)?;
-    let sell_entries = storage::load_sell_orders(context, user, market_id)?;
+    let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
+    let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
     let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
         &buy_entries,
         &sell_entries,
@@ -1043,7 +1048,10 @@ mod isolated_margin_tests {
         let (opening, bad_debt) =
             apply_position_fill(&mut p, &mut wallet, 10, 600, 0, 0, false).unwrap();
         assert_eq!((opening, bad_debt), (0, 300));
-        assert_eq!(wallet, 500, "isolated margin: a position loss never debits the wallet");
+        assert_eq!(
+            wallet, 500,
+            "isolated margin: a position loss never debits the wallet"
+        );
         assert_eq!(p.margin, 0);
         assert_eq!(p.amount, 0);
     }
@@ -1059,7 +1067,10 @@ mod isolated_margin_tests {
             apply_position_fill(&mut p, &mut wallet, 4, 240, 0, 0, false).unwrap();
         assert_eq!((opening, bad_debt), (0, 60));
         assert_eq!(wallet, 500, "wallet untouched");
-        assert_eq!(p.margin, 0, "remaining margin fully drawn down to cover the deficit");
+        assert_eq!(
+            p.margin, 0,
+            "remaining margin fully drawn down to cover the deficit"
+        );
         assert_eq!(p.amount, 6);
         assert_eq!(p.v_quote_balance, -600);
     }
@@ -1075,7 +1086,10 @@ mod isolated_margin_tests {
             apply_position_fill(&mut p, &mut wallet, 2, 120, 0, 0, false).unwrap();
         assert_eq!((opening, bad_debt), (0, 0));
         assert_eq!(wallet, 500, "wallet untouched");
-        assert_eq!(p.margin, 20, "deficit covered by remaining margin; 20 left backing the rest");
+        assert_eq!(
+            p.margin, 20,
+            "deficit covered by remaining margin; 20 left backing the rest"
+        );
         assert_eq!(p.amount, 8);
     }
 }

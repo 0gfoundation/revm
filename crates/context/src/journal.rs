@@ -368,6 +368,11 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     }
 
     #[inline]
+    fn perp_cache_get_arc(&mut self, key: B256) -> Option<std::sync::Arc<PerpBlob>> {
+        self.inner.perp_cache_get_arc(key)
+    }
+
+    #[inline]
     fn perp_cache_put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
         self.inner.perp_cache_put(key, value);
     }
@@ -466,7 +471,7 @@ mod perp_passthrough_tests {
         assert_eq!(j.perp_load(k(1)).unwrap(), vec![99]);
 
         j.checkpoint_revert(cp); // overlay write removed (prev == None)
-        // Overlay miss again → falls through to the committed store, NOT to empty.
+                                 // Overlay miss again → falls through to the committed store, NOT to empty.
         assert_eq!(j.perp_load(k(1)).unwrap(), vec![7]);
     }
 }

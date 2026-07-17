@@ -11,14 +11,14 @@ use crate::{
         errors::perp_err,
         funding::settle_position_funding,
         interface::IPerpDex::{
-            self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall,
-            getAdminCall, getAveragePremiumIndexCall, getAveragePremiumIndexReturn,
-            getFundingStateCall, getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn,
-            getInsuranceFundCall, getMarkPriceCall, getMarketCall, getMarketReturn,
-            getMarketManagerAddressCall, getOracleAddressCall, getPositionCall, getPositionReturn,
-            initAdminCall, liquidateCall, removePositionMarginCall, setLeverageCall,
-            setLeverageSignedCall, setMarketManagerAddressCall, setOracleAddressCall,
-            transferAdminCall, updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
+            self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
+            getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
+            getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn, getInsuranceFundCall,
+            getMarkPriceCall, getMarketCall, getMarketManagerAddressCall, getMarketReturn,
+            getOracleAddressCall, getPositionCall, getPositionReturn, initAdminCall, liquidateCall,
+            removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
+            setMarketManagerAddressCall, setOracleAddressCall, transferAdminCall,
+            updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
         },
         math::{
             calc_funding_rate, calc_value, checked_u64_to_i64, is_above_maintenance_margin,
@@ -117,7 +117,7 @@ pub fn run_add_market<CTX: ContextTr>(
 
     require_admin_or_market_manager(caller, context)?;
 
-    if storage::load_market(context, args.marketId)?.is_some() {
+    if storage::load_market_ref(context, args.marketId)?.is_some() {
         return Err(perp_err("addMarket: market already exists"));
     }
     if args.priceDecimals > 18 {
@@ -303,7 +303,6 @@ pub fn run_update_market<CTX: ContextTr>(
     Ok(Bytes::new())
 }
 
-
 /// `getMarkPrice(uint64 marketId) returns (uint64 price)`
 pub fn run_get_mark_price<CTX: ContextTr>(
     input_bytes: &[u8],
@@ -324,7 +323,7 @@ pub fn run_get_market<CTX: ContextTr>(
     let args = getMarketCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getMarket: invalid calldata"))?;
 
-    let market = storage::load_market(context, args.marketId)?
+    let market = storage::load_market_ref(context, args.marketId)?
         .ok_or_else(|| perp_err("getMarket: unknown market"))?;
 
     Ok(Bytes::from(getMarketCall::abi_encode_returns(
@@ -406,7 +405,7 @@ fn set_leverage_core<CTX: ContextTr>(
     if leverage == 0 || leverage > 6 {
         return Err(perp_err("setLeverage: leverage must be 1–6"));
     }
-    storage::load_market(context, market_id)?
+    storage::load_market_ref(context, market_id)?
         .ok_or_else(|| perp_err("setLeverage: unknown market"))?;
 
     let mut pos = storage::load_position(context, account, market_id)?;
@@ -444,7 +443,7 @@ pub fn run_get_position<CTX: ContextTr>(
     let args = getPositionCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getPosition: invalid calldata"))?;
 
-    let pos = storage::load_position(context, args.user, args.marketId)?;
+    let pos = storage::load_position_ref(context, args.user, args.marketId)?;
     Ok(Bytes::from(getPositionCall::abi_encode_returns(
         &getPositionReturn {
             amount: pos.amount,
@@ -471,7 +470,7 @@ pub fn run_add_position_margin<CTX: ContextTr>(
         return Err(perp_err("addPositionMargin: amount must be > 0"));
     }
     let amount = checked_u64_to_i64(args.amount, "addPositionMargin: amount")?;
-    let market = storage::load_market(context, args.marketId)?
+    let market = storage::load_market_ref(context, args.marketId)?
         .ok_or_else(|| perp_err("addPositionMargin: unknown market"))?;
 
     let mut pos = storage::load_position(context, caller, args.marketId)?;
@@ -480,7 +479,13 @@ pub fn run_add_position_margin<CTX: ContextTr>(
     }
     let mut account = storage::load_account(context, caller)?;
     // Settle accrued funding before touching the position.
-    settle_position_funding(context, caller, &market, &mut pos, &mut account.perp_wallet_balance)?;
+    settle_position_funding(
+        context,
+        caller,
+        &market,
+        &mut pos,
+        &mut account.perp_wallet_balance,
+    )?;
     if !account.has_available_perp(args.amount) {
         return Err(perp_err(
             "addPositionMargin: insufficient perp wallet balance",
@@ -512,7 +517,7 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
         return Err(perp_err("removePositionMargin: amount must be > 0"));
     }
     let amount = checked_u64_to_i64(args.amount, "removePositionMargin: amount")?;
-    let market = storage::load_market(context, args.marketId)?
+    let market = storage::load_market_ref(context, args.marketId)?
         .ok_or_else(|| perp_err("removePositionMargin: unknown market"))?;
     let mark_price = storage::load_mark_price(context, args.marketId)?;
     if mark_price == 0 {
@@ -525,7 +530,13 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     }
     let mut account = storage::load_account(context, caller)?;
     // Settle accrued funding first so the checks below see post-funding margin.
-    settle_position_funding(context, caller, &market, &mut pos, &mut account.perp_wallet_balance)?;
+    settle_position_funding(
+        context,
+        caller,
+        &market,
+        &mut pos,
+        &mut account.perp_wallet_balance,
+    )?;
     if pos.margin < amount {
         return Err(perp_err(
             "removePositionMargin: insufficient position margin",
@@ -639,7 +650,11 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     }
 
     let liq_amount = pos.amount;
-    let liquidation_side = if pos.amount > 0 { Side::Sell } else { Side::Buy };
+    let liquidation_side = if pos.amount > 0 {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
     let liquidation_quantity = pos.amount.unsigned_abs();
     let pre_liq_margin = pos.margin.max(0) as u64;
 
@@ -671,8 +686,7 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     // wallet (capped at the balance) and credit it to the Insurance Fund.
     let mut account = storage::load_account(context, user)?;
     let clearance_fee = {
-        let fee = (pre_liq_margin as u128)
-            .saturating_mul(market.liquidation_fee_rate_bps as u128)
+        let fee = (pre_liq_margin as u128).saturating_mul(market.liquidation_fee_rate_bps as u128)
             / 10_000;
         let fee = (fee as u64).min(account.perp_wallet_balance.max(0) as u64);
         if fee > 0 {
@@ -729,7 +743,7 @@ pub fn run_liquidate<CTX: ContextTr>(
     let args = liquidateCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("liquidate: invalid calldata"))?;
 
-    let market = storage::load_market(context, args.marketId)?
+    let market = storage::load_market_ref(context, args.marketId)?
         .ok_or_else(|| perp_err("liquidate: unknown market"))?;
     let mark_price = storage::load_mark_price(context, args.marketId)?;
     if mark_price == 0 {
@@ -740,7 +754,14 @@ pub fn run_liquidate<CTX: ContextTr>(
         return Err(perp_err("liquidate: mark price unavailable"));
     }
 
-    match liquidate_position(context, args.user, args.marketId, &market, mark_price, caller)? {
+    match liquidate_position(
+        context,
+        args.user,
+        args.marketId,
+        &market,
+        mark_price,
+        caller,
+    )? {
         LiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
         LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
         LiquidationOutcome::AboveMaintenance => {
@@ -969,8 +990,8 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     let old_best_ask = storage::load_best_ask(context, market_id)?;
 
     // --- Buy orders ---
-    let buy_entries = storage::load_buy_orders(context, user, market_id)?;
-    for entry in &buy_entries {
+    let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
+    for entry in buy_entries.iter() {
         if let Some(mut order) = storage::load_order(context, &entry.order_id)? {
             order.status = OrderStatus::Cancelled;
             storage::save_order(context, &entry.order_id, &order)?;
@@ -997,8 +1018,8 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     storage::save_buy_orders(context, user, market_id, &[])?;
 
     // --- Sell orders ---
-    let sell_entries = storage::load_sell_orders(context, user, market_id)?;
-    for entry in &sell_entries {
+    let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
+    for entry in sell_entries.iter() {
         if let Some(mut order) = storage::load_order(context, &entry.order_id)? {
             order.status = OrderStatus::Cancelled;
             storage::save_order(context, &entry.order_id, &order)?;
@@ -1066,7 +1087,9 @@ pub fn run_deposit_insurance_fund<CTX: ContextTr>(
 
     let mut account = storage::load_account(context, caller)?;
     if !account.has_available_perp(args.amount) {
-        return Err(perp_err("depositInsuranceFund: insufficient perp wallet balance"));
+        return Err(perp_err(
+            "depositInsuranceFund: insufficient perp wallet balance",
+        ));
     }
     account.debit_perp(args.amount)?;
     storage::save_account(context, caller, account)?;
@@ -1109,7 +1132,9 @@ pub fn run_withdraw_insurance_fund<CTX: ContextTr>(
     let delta = checked_u64_to_i64(args.amount, "withdrawInsuranceFund: delta")?;
     let balance = storage::load_insurance_fund(context)?;
     if args.amount > balance {
-        return Err(perp_err("withdrawInsuranceFund: amount exceeds fund balance"));
+        return Err(perp_err(
+            "withdrawInsuranceFund: amount exceeds fund balance",
+        ));
     }
     let new_balance = balance - args.amount;
     storage::save_insurance_fund(context, new_balance)?;
@@ -1138,7 +1163,9 @@ pub fn run_get_insurance_fund<CTX: ContextTr>(
     getInsuranceFundCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getInsuranceFund: invalid calldata"))?;
     let balance = storage::load_insurance_fund(context)?;
-    Ok(Bytes::from(getInsuranceFundCall::abi_encode_returns(&balance)))
+    Ok(Bytes::from(getInsuranceFundCall::abi_encode_returns(
+        &balance,
+    )))
 }
 
 // ── Market manager role ───────────────────────────────────────────────────────
@@ -1176,9 +1203,9 @@ pub fn run_get_market_manager<CTX: ContextTr>(
     getMarketManagerAddressCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getMarketManagerAddress: invalid calldata"))?;
     let manager = storage::load_market_manager(context)?;
-    Ok(Bytes::from(getMarketManagerAddressCall::abi_encode_returns(
-        &manager,
-    )))
+    Ok(Bytes::from(
+        getMarketManagerAddressCall::abi_encode_returns(&manager),
+    ))
 }
 
 // ── Oracle address ────────────────────────────────────────────────────────────
@@ -1245,7 +1272,7 @@ pub fn run_update_index_price<CTX: ContextTr>(
     if args.indexPrice == 0 {
         return Err(perp_err("updateIndexPrice: indexPrice must be > 0"));
     }
-    let market = storage::load_market(context, args.marketId)?
+    let market = storage::load_market_ref(context, args.marketId)?
         .ok_or_else(|| perp_err("updateIndexPrice: unknown market"))?;
     if args.indexPrice > market.max_price {
         return Err(perp_err(
@@ -1449,7 +1476,7 @@ pub fn run_get_funding_state<CTX: ContextTr>(
     let args = getFundingStateCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getFundingState: invalid calldata"))?;
     let state = storage::load_funding_state(context, args.marketId)?;
-    let market = storage::load_market(context, args.marketId)?
+    let market = storage::load_market_ref(context, args.marketId)?
         .ok_or_else(|| perp_err("getFundingState: unknown market"))?;
     Ok(Bytes::from(getFundingStateCall::abi_encode_returns(
         &getFundingStateReturn {
@@ -1467,7 +1494,7 @@ pub fn run_get_average_premium_index<CTX: ContextTr>(
 ) -> Result<Bytes, PrecompileError> {
     let args = getAveragePremiumIndexCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getAveragePremiumIndex: invalid calldata"))?;
-    storage::load_market(context, args.marketId)?
+    storage::load_market_ref(context, args.marketId)?
         .ok_or_else(|| perp_err("getAveragePremiumIndex: unknown market"))?;
     let acc = storage::load_premium_accumulator(context, args.marketId)?;
     Ok(Bytes::from(getAveragePremiumIndexCall::abi_encode_returns(

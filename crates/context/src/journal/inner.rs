@@ -5,7 +5,9 @@ use super::JournalEntryTr;
 use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
-    journaled_state::{AccountLoad, JournalCheckpoint, PerpBlob, PerpDelta, PerpDeltaEntry, TransferError},
+    journaled_state::{
+        AccountLoad, JournalCheckpoint, PerpBlob, PerpDelta, PerpDeltaEntry, TransferError,
+    },
 };
 use core::mem;
 use database_interface::Database;
@@ -136,6 +138,12 @@ impl PerpCache {
     fn get(&self, key: B256) -> Option<&PerpBlob> {
         self.0.get(&key).map(|b| b.as_ref())
     }
+    /// Returns the cached `Arc` itself (refcount bump, no deep clone) for zero-copy typed reads
+    /// (点1 borrow-read): the caller `Arc::downcast`s to `Arc<T>` and reads via `&*arc`.
+    #[inline]
+    fn get_arc(&self, key: B256) -> Option<std::sync::Arc<PerpBlob>> {
+        self.0.get(&key).cloned()
+    }
     #[inline]
     fn put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
         self.0.insert(key, value);
@@ -220,7 +228,9 @@ impl PerpSection {
         ser: fn(&PerpBlob) -> Vec<u8>,
         clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
     ) {
-        let prev = self.working.insert(key, PerpEntry::Struct { val, ser, clone });
+        let prev = self
+            .working
+            .insert(key, PerpEntry::Struct { val, ser, clone });
         self.undo.push(PerpUndo { key, prev });
         self.cache.remove(key);
     }
@@ -281,6 +291,13 @@ impl PerpSection {
     #[inline]
     fn cache_get(&self, key: B256) -> Option<&PerpBlob> {
         self.cache.get(key)
+    }
+
+    /// Returns the cached blob `Arc` (refcount bump) for zero-copy typed reads (点1). See
+    /// [`PerpCache::get_arc`].
+    #[inline]
+    fn cache_get_arc(&self, key: B256) -> Option<std::sync::Arc<PerpBlob>> {
+        self.cache.get_arc(key)
     }
 
     /// Inserts into the block-scoped deserialized-blob cache.
@@ -424,6 +441,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn perp_cache_get(&self, key: B256) -> Option<&PerpBlob> {
         self.perp.cache_get(key)
+    }
+
+    /// Returns the cached blob `Arc` (refcount bump, no deep clone) for zero-copy typed reads (点1).
+    #[inline]
+    pub fn perp_cache_get_arc(&self, key: B256) -> Option<std::sync::Arc<PerpBlob>> {
+        self.perp.cache_get_arc(key)
     }
 
     /// Inserts a deserialized PerpDEX blob into the block-scoped read cache.
@@ -919,7 +942,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // Truncate the per-call commitment log back to its checkpoint length, dropping the framed
         // writes appended after the checkpoint so the call-exit hash stays consistent with the
         // reverted overlay. The log is append-only within a call, so a length truncate suffices.
-        self.perp_commitment_log.truncate(checkpoint.perp_commitment_log_len);
+        self.perp_commitment_log
+            .truncate(checkpoint.perp_commitment_log_len);
     }
 
     /// Performs selfdestruct action.
@@ -1415,15 +1439,24 @@ mod perp_tests {
         j.perp_store_struct(k(1), std::boxed::Box::new(7u32), ser_u32, clone_u32);
 
         // Typed fast-path read returns the struct (no serialization).
-        assert_eq!(j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&7u32));
+        assert_eq!(
+            j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(),
+            Some(&7u32)
+        );
         // Byte-interface read serializes on demand (same bytes the delta will carry).
         assert_eq!(j.perp_get_overlay(k(1)), Some(7u32.to_le_bytes().to_vec()));
         // Clone (the JournalInner Clone path) preserves the deferred struct via the clone fn-ptr.
         let j2 = j.clone();
-        assert_eq!(j2.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&7u32));
+        assert_eq!(
+            j2.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(),
+            Some(&7u32)
+        );
         // Block-end drain serializes ONCE.
         let delta = j.take_perp_delta();
-        assert_eq!(delta.get(&k(1)).map(|e| &e.bytes), Some(&7u32.to_le_bytes().to_vec()));
+        assert_eq!(
+            delta.get(&k(1)).map(|e| &e.bytes),
+            Some(&7u32.to_le_bytes().to_vec())
+        );
     }
 
     #[test]
@@ -1447,14 +1480,23 @@ mod perp_tests {
 
         let cp = j.checkpoint();
         // In-place mutation via the &mut handle — no load/store round-trip, one undo snapshot.
-        *j.perp_get_struct_mut(k(1)).unwrap().downcast_mut::<u32>().unwrap() = 99;
-        assert_eq!(j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&99u32));
+        *j.perp_get_struct_mut(k(1))
+            .unwrap()
+            .downcast_mut::<u32>()
+            .unwrap() = 99;
+        assert_eq!(
+            j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(),
+            Some(&99u32)
+        );
         // Block-end serialization would carry the mutated value.
         assert_eq!(j.perp_get_overlay(k(1)), Some(99u32.to_le_bytes().to_vec()));
 
         // Revert restores the pre-mutation value (snapshot-on-mutate undo).
         j.checkpoint_revert(cp);
-        assert_eq!(j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(), Some(&10u32));
+        assert_eq!(
+            j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(),
+            Some(&10u32)
+        );
 
         // Absent and raw-`Bytes` keys cannot be mutated in place.
         assert!(j.perp_get_struct_mut(k(2)).is_none());

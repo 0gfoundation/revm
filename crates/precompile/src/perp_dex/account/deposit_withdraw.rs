@@ -190,7 +190,7 @@ pub fn run_get_account<CTX: ContextTr>(
     let args = getAccountCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getAccount: invalid calldata"))?;
 
-    let account = storage::load_account(context, args.user)?;
+    let account = storage::load_account_ref(context, args.user)?;
     let usdc_balance: U256 = account.usdc_balance.clone().into();
     let perp_wallet_balance = account.visible_perp_wallet_balance();
 

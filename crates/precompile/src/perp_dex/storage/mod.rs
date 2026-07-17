@@ -29,9 +29,8 @@ use keys::{
     funding_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
     last_traded_price_key, mark_price_key, market_fee_total_key, market_key, market_manager_key,
     open_interest_key, oracle_key, order_key, position_key, position_registry_key,
-    premium_accumulator_key,
-    price_basis_window_key, trade_count_key, user_buy_orders_key, user_fee_rates_key,
-    user_nonce_key, user_sell_orders_key,
+    premium_accumulator_key, price_basis_window_key, trade_count_key, user_buy_orders_key,
+    user_fee_rates_key, user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -275,7 +274,10 @@ pub fn finalize_block_commitment<CTX: ContextTr>(
 /// is absent (empty); the caller applies its own default / `Option` semantics (absence is not
 /// cached). The cache lives in the journal's block-scoped, revert-cleared `PerpSection`, so this
 /// collapses repeated reads of a hot blob within a block to a single decode.
-fn load_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256) -> Result<Option<T>, PrecompileError>
+fn load_cached<CTX: ContextTr, T>(
+    context: &mut CTX,
+    key: B256,
+) -> Result<Option<T>, PrecompileError>
 where
     T: Clone + Send + Sync + 'static + for<'de> Deserialize<'de>,
 {
@@ -328,6 +330,65 @@ where
     Ok(Some(val))
 }
 
+/// Zero-copy typed read (点1 borrow-read): returns the blob as `Arc<T>` WITHOUT the per-read deep
+/// clone that [`load_cached`] pays. On a #14 cache hit or a cross-block decoded-store hit (选项A)
+/// this is a pure `Arc` refcount bump + `Arc::downcast` — no deserialization AND no struct copy.
+/// Callers read fields via `&*arc` (Deref). Same source precedence as [`load_cached`], so it
+/// returns the identical value; use this for PURE reads (no write-back). RMW paths keep
+/// [`load_cached`] / `perp_get_struct_mut`.
+///
+/// The one path that still copies is an in-block deferred `Struct` overlay write (a key WRITTEN
+/// this block then read back): the overlay owns a UNIQUE `Box`, so it is cloned into a fresh `Arc`
+/// — same cost as `load_cached`, no worse. Cache/cross-block/cold reads (the common case) are the
+/// win.
+fn load_arc<CTX: ContextTr, T>(
+    context: &mut CTX,
+    key: B256,
+) -> Result<Option<std::sync::Arc<T>>, PrecompileError>
+where
+    T: Clone + Send + Sync + 'static + for<'de> Deserialize<'de>,
+{
+    #[cfg(test)]
+    if bench_counter::force_percall() {
+        let buf = load_blob(context, key)?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(std::sync::Arc::new(decode(&buf)?)));
+    }
+    // In-block deferred Struct write: overlay owns a unique Box → clone into an Arc (unavoidable).
+    if let Some(any) = context.journal_mut().perp_get_struct(key) {
+        if let Some(v) = any.downcast_ref::<T>() {
+            return Ok(Some(std::sync::Arc::new(v.clone())));
+        }
+    }
+    // #14 cold-read cache: hand back the SAME Arc typed — refcount bump, zero clone.
+    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
+        if let Ok(t) = std::sync::Arc::downcast::<T>(arc) {
+            return Ok(Some(t));
+        }
+    }
+    // Cross-block decoded store (选项A): share the Arc into #14 then hand it back typed — zero clone.
+    if let Some(arc) = context
+        .journal_mut()
+        .perp_load_arc(key)
+        .map_err(convert_db_err::<CTX::Db>)?
+    {
+        context.journal_mut().perp_cache_put(key, arc.clone());
+        if let Ok(t) = std::sync::Arc::downcast::<T>(arc) {
+            return Ok(Some(t));
+        }
+    }
+    // Cold read: decode once into an Arc, cache the SAME Arc, return it (saves load_cached's clone).
+    let buf = load_blob(context, key)?;
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let t: std::sync::Arc<T> = std::sync::Arc::new(decode(&buf)?);
+    context.journal_mut().perp_cache_put(key, t.clone());
+    Ok(Some(t))
+}
+
 /// Serializes a type-erased off-trie blob to its canonical bytes — the #16d block-end serializer,
 /// monomorphized per blob type `T` and stored as a fn-ptr in the journal overlay. Produces bytes
 /// IDENTICAL to a direct `encode`, so deferring serialization to block end leaves the commitment
@@ -355,7 +416,11 @@ fn clone_blob<T: Clone + Send + Sync + 'static>(v: &PerpBlob) -> std::boxed::Box
 /// block-end `take_perp_delta` lowers it to canonical bytes ONCE (so a key written N times this
 /// block is serialized once, not N times). No per-write `encode`, and the struct overlay doubles as
 /// the in-block read cache — `store_struct` invalidates the #14 cold-read cache for this key.
-fn save_cached<CTX: ContextTr, T>(context: &mut CTX, key: B256, val: &T) -> Result<(), PrecompileError>
+fn save_cached<CTX: ContextTr, T>(
+    context: &mut CTX,
+    key: B256,
+    val: &T,
+) -> Result<(), PrecompileError>
 where
     T: Clone + Send + Sync + 'static + Serialize,
 {
@@ -394,6 +459,17 @@ pub fn load_account<CTX: ContextTr>(
     user: Address,
 ) -> Result<UserAccount, PrecompileError> {
     Ok(load_cached::<_, UserAccount>(context, account_key(user))?.unwrap_or_default())
+}
+
+/// Zero-copy account read (点1): `Arc<UserAccount>`, no per-read clone. Defaulted like
+/// [`load_account`]. PURE reads only (availability checks). Debit/credit RMW keep [`load_account`]
+/// + [`save_account`].
+pub fn load_account_ref<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+) -> Result<std::sync::Arc<UserAccount>, PrecompileError> {
+    Ok(load_arc::<_, UserAccount>(context, account_key(user))?
+        .unwrap_or_else(|| std::sync::Arc::new(UserAccount::default())))
 }
 
 pub fn save_account<CTX: ContextTr>(
@@ -496,6 +572,21 @@ pub fn load_position<CTX: ContextTr>(
     Ok(load_cached::<_, PerpPosition>(context, position_key(user, market_id))?.unwrap_or_default())
 }
 
+/// Zero-copy position read (点1): `Arc<PerpPosition>`, no per-read clone. Defaulted like
+/// [`load_position`] (absent → default position) so call sites keep `p.field` (Deref) ergonomics.
+/// PURE reads only (margin / size / entry checks). Fill/settlement RMW keep [`load_position`] +
+/// [`save_position`].
+pub fn load_position_ref<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+) -> Result<std::sync::Arc<PerpPosition>, PrecompileError> {
+    Ok(
+        load_arc::<_, PerpPosition>(context, position_key(user, market_id))?
+            .unwrap_or_else(|| std::sync::Arc::new(PerpPosition::default())),
+    )
+}
+
 pub fn save_position<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
@@ -507,7 +598,7 @@ pub fn save_position<CTX: ContextTr>(
     // cannot be missed. The registry is only touched when membership changes
     // (open: 0 -> !=0, close: !=0 -> 0); every other save pays just one
     // overlay-cheap position read (the position is already in the working set).
-    let old_amount = load_position(context, user, market_id)?.amount;
+    let old_amount = load_position_ref(context, user, market_id)?.amount;
     if old_amount == 0 && pos.amount != 0 {
         registry_add(context, market_id, user)?;
     } else if old_amount != 0 && pos.amount == 0 {
@@ -594,8 +685,24 @@ pub fn load_buy_orders<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<Vec<OrderEntry>, PrecompileError> {
-    Ok(load_cached::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?
-        .unwrap_or_default())
+    Ok(
+        load_cached::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?
+            .unwrap_or_default(),
+    )
+}
+
+/// Zero-copy user buy-order-entry list (点1): `Arc<Vec<OrderEntry>>`, no per-read clone. PURE reads
+/// only (opposite-side snapshot in reservation calc / `.last()` / iteration). List edits use
+/// [`mutate_buy_orders`].
+pub fn load_buy_orders_ref<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+) -> Result<std::sync::Arc<Vec<OrderEntry>>, PrecompileError> {
+    Ok(
+        load_arc::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?
+            .unwrap_or_else(|| std::sync::Arc::new(Vec::new())),
+    )
 }
 
 pub fn save_buy_orders<CTX: ContextTr>(
@@ -606,7 +713,11 @@ pub fn save_buy_orders<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     // Cache the owned Vec; msgpack-encoding a `&[T]` and a `&Vec<T>` is byte-identical (both a
     // sequence), so the commitment stream is unchanged.
-    save_cached(context, user_buy_orders_key(user, market_id), &entries.to_vec())
+    save_cached(
+        context,
+        user_buy_orders_key(user, market_id),
+        &entries.to_vec(),
+    )
 }
 
 pub fn load_sell_orders<CTX: ContextTr>(
@@ -614,8 +725,23 @@ pub fn load_sell_orders<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<Vec<OrderEntry>, PrecompileError> {
-    Ok(load_cached::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?
-        .unwrap_or_default())
+    Ok(
+        load_cached::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?
+            .unwrap_or_default(),
+    )
+}
+
+/// Zero-copy user sell-order-entry list (点1): `Arc<Vec<OrderEntry>>`, no per-read clone. PURE reads
+/// only. List edits use [`mutate_sell_orders`].
+pub fn load_sell_orders_ref<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+) -> Result<std::sync::Arc<Vec<OrderEntry>>, PrecompileError> {
+    Ok(
+        load_arc::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?
+            .unwrap_or_else(|| std::sync::Arc::new(Vec::new())),
+    )
 }
 
 pub fn save_sell_orders<CTX: ContextTr>(
@@ -624,7 +750,11 @@ pub fn save_sell_orders<CTX: ContextTr>(
     market_id: u64,
     entries: &[OrderEntry],
 ) -> Result<(), PrecompileError> {
-    save_cached(context, user_sell_orders_key(user, market_id), &entries.to_vec())
+    save_cached(
+        context,
+        user_sell_orders_key(user, market_id),
+        &entries.to_vec(),
+    )
 }
 
 /// In-place mutate the user's buy-order list (#21 靶子2): if it's already in the overlay, run `f`
@@ -678,6 +808,15 @@ pub fn load_order<CTX: ContextTr>(
     load_cached::<_, Order>(context, order_key(order_id))
 }
 
+/// Zero-copy order read (点1): `Arc<Order>`, no per-read clone. PURE reads only (dup check / FOK
+/// feasibility / field reads). Mutating an order keeps [`load_order`] + [`save_order`].
+pub fn load_order_ref<CTX: ContextTr>(
+    context: &mut CTX,
+    order_id: &[u8; 32],
+) -> Result<Option<std::sync::Arc<Order>>, PrecompileError> {
+    load_arc::<_, Order>(context, order_key(order_id))
+}
+
 pub fn save_order<CTX: ContextTr>(
     context: &mut CTX,
     order_id: &[u8; 32],
@@ -724,6 +863,15 @@ pub fn load_market<CTX: ContextTr>(
     market_id: u64,
 ) -> Result<Option<Market>, PrecompileError> {
     load_cached::<_, Market>(context, market_key(market_id))
+}
+
+/// Zero-copy market read (点1): `Arc<Market>`, no per-read clone. PURE reads only (params / mark /
+/// funding). RMW (funding/config writes) keep [`load_market`] + [`save_market`].
+pub fn load_market_ref<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<Option<std::sync::Arc<Market>>, PrecompileError> {
+    load_arc::<_, Market>(context, market_key(market_id))
 }
 
 pub fn save_market<CTX: ContextTr>(
@@ -777,6 +925,16 @@ pub fn load_bid_prices<CTX: ContextTr>(
     Ok(load_cached::<_, Vec<u64>>(context, bid_prices_key(market_id))?.unwrap_or_default())
 }
 
+/// Zero-copy sorted bid prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only (BBO /
+/// matching walk). Price-list edits keep [`mutate_bid_prices`] / [`insert_bid_price`].
+pub fn load_bid_prices_ref<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<std::sync::Arc<Vec<u64>>, PrecompileError> {
+    Ok(load_arc::<_, Vec<u64>>(context, bid_prices_key(market_id))?
+        .unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
+}
+
 pub fn save_bid_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -791,6 +949,15 @@ pub fn load_ask_prices<CTX: ContextTr>(
     market_id: u64,
 ) -> Result<Vec<u64>, PrecompileError> {
     Ok(load_cached::<_, Vec<u64>>(context, ask_prices_key(market_id))?.unwrap_or_default())
+}
+
+/// Zero-copy sorted ask prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only.
+pub fn load_ask_prices_ref<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<std::sync::Arc<Vec<u64>>, PrecompileError> {
+    Ok(load_arc::<_, Vec<u64>>(context, ask_prices_key(market_id))?
+        .unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
 }
 
 pub fn save_ask_prices<CTX: ContextTr>(
@@ -975,6 +1142,43 @@ fn load_level_cached<CTX: ContextTr>(
     Ok(queue)
 }
 
+/// Zero-copy level FIFO read (点1): returns the queue as `Arc<Vec<[u8;32]>>` without the per-read
+/// clone [`load_level_cached`] pays. Mirrors its source precedence; cold path uses
+/// `unpack_order_ids` (levels are packed, not serde). For PURE reads only (peeks / prechecks);
+/// consuming match RMW keeps `load_level_cached` + `save_*_level`.
+fn load_level_arc<CTX: ContextTr>(
+    context: &mut CTX,
+    key: B256,
+) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
+    if let Some(any) = context.journal_mut().perp_get_struct(key) {
+        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
+            return Ok(std::sync::Arc::new(q.clone()));
+        }
+    }
+    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
+        if let Ok(q) = std::sync::Arc::downcast::<Vec<[u8; 32]>>(arc) {
+            return Ok(q);
+        }
+    }
+    if let Some(arc) = context
+        .journal_mut()
+        .perp_load_arc(key)
+        .map_err(convert_db_err::<CTX::Db>)?
+    {
+        context.journal_mut().perp_cache_put(key, arc.clone());
+        if let Ok(q) = std::sync::Arc::downcast::<Vec<[u8; 32]>>(arc) {
+            return Ok(q);
+        }
+    }
+    let buf = load_blob(context, key)?;
+    if buf.is_empty() {
+        return Ok(std::sync::Arc::new(Vec::new()));
+    }
+    let queue: std::sync::Arc<Vec<[u8; 32]>> = std::sync::Arc::new(unpack_order_ids(&buf)?);
+    context.journal_mut().perp_cache_put(key, queue.clone());
+    Ok(queue)
+}
+
 /// Reads a bid level FIFO.
 pub fn load_bid_level<CTX: ContextTr>(
     context: &mut CTX,
@@ -982,6 +1186,15 @@ pub fn load_bid_level<CTX: ContextTr>(
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
     load_level_cached(context, bid_level_key(market_id, price))
+}
+
+/// Zero-copy bid level FIFO read (点1). See [`load_level_arc`]. PURE reads only.
+pub fn load_bid_level_arc<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
+    load_level_arc(context, bid_level_key(market_id, price))
 }
 
 /// Writes a bid level FIFO. #21: stores the `Vec` as a deferred `Struct` (packed ONCE at block end
@@ -1008,6 +1221,15 @@ pub fn load_ask_level<CTX: ContextTr>(
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
     load_level_cached(context, ask_level_key(market_id, price))
+}
+
+/// Zero-copy ask level FIFO read (点1). See [`load_level_arc`]. PURE reads only.
+pub fn load_ask_level_arc<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
+    load_level_arc(context, ask_level_key(market_id, price))
 }
 
 pub fn save_ask_level<CTX: ContextTr>(
@@ -1481,12 +1703,6 @@ mod commitment_tests {
             .data
     }
 
-
-
-
-
-
-
     /// #16d: `compute_block_commitment` hashes the block NET delta once. Cross-checked against an
     /// independent BTreeMap reference (sorted, v3 framing) — a different impl than production's
     /// HashMap+sort, so agreement is a genuine check. Includes a deleted key (empty value, len 0).
@@ -1506,7 +1722,8 @@ mod commitment_tests {
         delta.insert(k3, e(&b3));
 
         // Independent reference: BTreeMap (sorted), v3 framing.
-        let mut sorted: std::collections::BTreeMap<B256, Vec<u8>> = std::collections::BTreeMap::new();
+        let mut sorted: std::collections::BTreeMap<B256, Vec<u8>> =
+            std::collections::BTreeMap::new();
         sorted.insert(k1, b1);
         sorted.insert(k2, b2);
         sorted.insert(k3, b3);
@@ -1544,8 +1761,12 @@ mod commitment_tests {
         store_blob(&mut ctx, k1, &b1).unwrap();
         store_blob(&mut ctx, k2, &b2).unwrap();
         store_blob(&mut ctx, k1, &[0x09]).unwrap(); // overwrite k1; net delta keeps the last value
-        // No per-call flush: the on-trie slot stays at genesis until block end.
-        assert_eq!(read_commitment(&mut ctx), U256::ZERO, "slot must not move until block end");
+                                                    // No per-call flush: the on-trie slot stays at genesis until block end.
+        assert_eq!(
+            read_commitment(&mut ctx),
+            U256::ZERO,
+            "slot must not move until block end"
+        );
 
         let delta = ctx.journal_mut().take_perp_delta();
         let expected = compute_block_commitment(U256::ZERO, &delta);
@@ -1569,15 +1790,19 @@ mod size_probe_tests {
             owner: [0xAB; 20],
             market_id: 1,
             side: Side::Buy,
-            price: 65_432_10,        // 7 digits
-            quantity: 150_000_000,   // 1.5 BTC @ 8 decimals
+            price: 65_432_10,      // 7 digits
+            quantity: 150_000_000, // 1.5 BTC @ 8 decimals
             filled: 50_000_000,
             order_type: OrderType::Limit,
             tif: TimeInForce::Gtc,
             status: OrderStatus::PartiallyFilled,
         };
         let buf = encode(&order).unwrap();
-        println!("Order: {} bytes; hex={}", buf.len(), primitives::hex::encode(&buf));
+        println!(
+            "Order: {} bytes; hex={}",
+            buf.len(),
+            primitives::hex::encode(&buf)
+        );
 
         let entry = OrderEntry {
             order_id: [0xCD; 32],
@@ -1585,10 +1810,22 @@ mod size_probe_tests {
             amount: 150_000_000,
             maker_fee_bps: 2,
         };
-        println!("OrderEntry x1 (in vec): {} bytes", encode(&vec![entry]).unwrap().len());
-        println!("OrderEntry x5: {} bytes", encode(&vec![entry; 5]).unwrap().len());
-        println!("OrderEntry x20: {} bytes", encode(&vec![entry; 20]).unwrap().len());
-        println!("OrderEntry single hex={}", primitives::hex::encode(encode(&entry).unwrap()));
+        println!(
+            "OrderEntry x1 (in vec): {} bytes",
+            encode(&vec![entry]).unwrap().len()
+        );
+        println!(
+            "OrderEntry x5: {} bytes",
+            encode(&vec![entry; 5]).unwrap().len()
+        );
+        println!(
+            "OrderEntry x20: {} bytes",
+            encode(&vec![entry; 20]).unwrap().len()
+        );
+        println!(
+            "OrderEntry single hex={}",
+            primitives::hex::encode(encode(&entry).unwrap())
+        );
 
         let prices: Vec<u64> = (0..1u64).map(|i| 65_000_00 + i * 10).collect();
         println!("bid_prices x1: {} bytes", encode(&prices).unwrap().len());
@@ -1601,7 +1838,10 @@ mod size_probe_tests {
         println!("level queue x1: {} bytes", encode(&q).unwrap().len());
         let q: Vec<[u8; 32]> = vec![[0xEF; 32]; 5];
         println!("level queue x5: {} bytes", encode(&q).unwrap().len());
-        println!("level queue single elem hex={}", primitives::hex::encode(encode(&[0xEFu8; 32]).unwrap()));
+        println!(
+            "level queue single elem hex={}",
+            primitives::hex::encode(encode(&[0xEFu8; 32]).unwrap())
+        );
 
         let pos = PerpPosition {
             amount: 150_000_000,
@@ -1618,15 +1858,26 @@ mod size_probe_tests {
             last_funding_index: 123_456_789_012_345i128,
         };
         let buf = encode(&pos).unwrap();
-        println!("PerpPosition: {} bytes; hex={}", buf.len(), primitives::hex::encode(&buf));
-        println!("PerpPosition default: {} bytes", encode(&PerpPosition::default()).unwrap().len());
+        println!(
+            "PerpPosition: {} bytes; hex={}",
+            buf.len(),
+            primitives::hex::encode(&buf)
+        );
+        println!(
+            "PerpPosition default: {} bytes",
+            encode(&PerpPosition::default()).unwrap().len()
+        );
 
         let acct = UserAccount {
             usdc_balance: "123456789000000000000".into(), // 21-digit decimal string
             perp_wallet_balance: 1_234_567_890,
         };
         let buf = encode(&acct).unwrap();
-        println!("UserAccount: {} bytes; hex={}", buf.len(), primitives::hex::encode(&buf));
+        println!(
+            "UserAccount: {} bytes; hex={}",
+            buf.len(),
+            primitives::hex::encode(&buf)
+        );
 
         let market = Market {
             market_id: 1,
@@ -1661,31 +1912,65 @@ mod size_probe_tests {
             last_pi: -1234,
             last_sample_ts: 1_750_000_123,
         };
-        println!("PremiumIndexAccumulator: {} bytes", encode(&acc).unwrap().len());
+        println!(
+            "PremiumIndexAccumulator: {} bytes",
+            encode(&acc).unwrap().len()
+        );
 
         let mut window = PriceBasisWindow::default();
         for i in 0..PRICE_BASIS_WINDOW_SIZE as u64 {
             let _ = window.record_observation(1_750_000_000 + i, 65_000_00 + i);
         }
-        println!("PriceBasisWindow full: {} bytes", encode(&window).unwrap().len());
-        println!("PriceBasisWindow empty: {} bytes", encode(&PriceBasisWindow::default()).unwrap().len());
+        println!(
+            "PriceBasisWindow full: {} bytes",
+            encode(&window).unwrap().len()
+        );
+        println!(
+            "PriceBasisWindow empty: {} bytes",
+            encode(&PriceBasisWindow::default()).unwrap().len()
+        );
 
         let mut hist = IndexPriceHistory::default();
         for i in 0..32u64 {
             hist.push(
-                IndexPriceState { index_price: 65_000_00 + i, timestamp: 1_750_000_000 + i },
+                IndexPriceState {
+                    index_price: 65_000_00 + i,
+                    timestamp: 1_750_000_000 + i,
+                },
                 32,
             );
         }
-        println!("IndexPriceHistory x32: {} bytes", encode(&hist).unwrap().len());
+        println!(
+            "IndexPriceHistory x32: {} bytes",
+            encode(&hist).unwrap().len()
+        );
 
-        println!("UserFeeRates: {} bytes", encode(&UserFeeRates { maker_fee_bps: 2, taker_fee_bps: 5 }).unwrap().len());
-        println!("u64 scalar (mark price 6_543_210): {} bytes", encode(&6_543_210u64).unwrap().len());
-        println!("u64 scalar small (nonce 7): {} bytes", encode(&7u64).unwrap().len());
+        println!(
+            "UserFeeRates: {} bytes",
+            encode(&UserFeeRates {
+                maker_fee_bps: 2,
+                taker_fee_bps: 5
+            })
+            .unwrap()
+            .len()
+        );
+        println!(
+            "u64 scalar (mark price 6_543_210): {} bytes",
+            encode(&6_543_210u64).unwrap().len()
+        );
+        println!(
+            "u64 scalar small (nonce 7): {} bytes",
+            encode(&7u64).unwrap().len()
+        );
         println!("Address: {} bytes", encode(&Address::ZERO).unwrap().len());
         println!(
             "ApiKey: {} bytes",
-            encode(&ApiKey { pubkey: [9; 32], expiry: 1_750_000_000 }).unwrap().len()
+            encode(&ApiKey {
+                pubkey: [9; 32],
+                expiry: 1_750_000_000
+            })
+            .unwrap()
+            .len()
         );
     }
 }
@@ -1758,10 +2043,27 @@ mod encoding_roundtrip_tests {
         let id: [u8; 32] = core::array::from_fn(|i| (0xFF - i as u8) ^ 0x3C);
         rt(
             "OrderEntry",
-            OrderEntry { order_id: id, price: u64::MAX, amount: u64::MAX, maker_fee_bps: 12_345 },
+            OrderEntry {
+                order_id: id,
+                price: u64::MAX,
+                amount: u64::MAX,
+                maker_fee_bps: 12_345,
+            },
         );
-        rt("ApiKey", ApiKey { pubkey: id, expiry: u64::MAX });
-        rt("ApiKey-never-expires", ApiKey { pubkey: [0xFF; 32], expiry: 0 });
+        rt(
+            "ApiKey",
+            ApiKey {
+                pubkey: id,
+                expiry: u64::MAX,
+            },
+        );
+        rt(
+            "ApiKey-never-expires",
+            ApiKey {
+                pubkey: [0xFF; 32],
+                expiry: 0,
+            },
+        );
     }
 
     #[test]
@@ -1785,7 +2087,10 @@ mod encoding_roundtrip_tests {
         );
         rt(
             "PerpPosition-pos-i128",
-            PerpPosition { last_funding_index: i128::MAX, ..PerpPosition::default() },
+            PerpPosition {
+                last_funding_index: i128::MAX,
+                ..PerpPosition::default()
+            },
         );
     }
 
@@ -1855,15 +2160,26 @@ mod encoding_roundtrip_tests {
         for q in [
             vec![],
             vec![[0xFFu8; 32]],
-            vec![[0x00u8; 32], [0x80u8; 32], core::array::from_fn(|i| i as u8)],
+            vec![
+                [0x00u8; 32],
+                [0x80u8; 32],
+                core::array::from_fn(|i| i as u8),
+            ],
         ] {
             let packed = pack_order_ids(&q);
             assert_eq!(packed.len(), q.len() * 32);
-            assert_eq!(unpack_order_ids(&packed).unwrap(), q, "pack/unpack must round-trip");
+            assert_eq!(
+                unpack_order_ids(&packed).unwrap(),
+                q,
+                "pack/unpack must round-trip"
+            );
         }
         // A blob whose length is not a multiple of 32 is rejected, never silently truncated.
         for bad_len in [1usize, 31, 33, 63] {
-            assert!(unpack_order_ids(&vec![0xABu8; bad_len]).is_err(), "len {bad_len} must error");
+            assert!(
+                unpack_order_ids(&vec![0xABu8; bad_len]).is_err(),
+                "len {bad_len} must error"
+            );
         }
     }
 }
