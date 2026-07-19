@@ -200,9 +200,11 @@ fn store_blob<CTX: ContextTr>(
 }
 
 /// Version byte mixed into the per-block commitment hash (catalog #16d). Bumped to 3 at the
-/// switch from the per-call chained v2 (retired) to the per-block net-delta fold, so the two
-/// framings never alias across the consensus transition (a devnet wipe accompanies the bump).
-const BLOCK_COMMITMENT_VERSION: u8 = 3;
+/// switch from the per-call chained v2 (retired) to the per-block net-delta fold; bumped to 4
+/// at the switch from keccak-derived storage keys to direct-packed keys (catalog #12), so the
+/// two key framings never alias across the consensus transition (a devnet wipe accompanies the
+/// bump).
+const BLOCK_COMMITMENT_VERSION: u8 = 4;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

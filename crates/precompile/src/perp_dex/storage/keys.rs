@@ -1,56 +1,122 @@
 //! Storage key derivation for the PerpDEX precompile.
 //!
-//! Every storage key is `B256 = keccak256(prefix ++ domain-fields)`.
-//! Fixed 4-byte ASCII prefixes prevent cross-domain collisions within the
-//! off-trie PerpDEX key space (the journal's perp section). These keys used to
-//! address slots under `PERP_DEX_ADDRESS` in the state trie; perp blobs now live
-//! off-trie, but the key derivation is unchanged.
+//! Off-trie PerpState keys are **HashMap keys, not state-trie keys**, so they need no
+//! cryptographic derivation — only a deterministic, collision-free encoding. Each key is
+//! packed directly as `prefix(4) ++ fixed-layout big-endian fields ++ zero-pad` into 32 bytes
+//! (catalog #12). This is **injective by construction**: distinct 4-byte prefixes separate
+//! namespaces, and fixed-size fields separate entries within a namespace — strictly stronger
+//! than keccak's probabilistic collision-resistance, and far cheaper (a `memcpy`, no hash, no
+//! heap alloc).
+//!
+//! Two deliberate exceptions:
+//! * [`order_key`] is the **raw 32-byte order id** (no room for a prefix). The order id is
+//!   itself a preimage-resistant keccak output, so it cannot be steered onto any structured
+//!   (prefixed) key — the same separation the EVM relies on between mapping and scalar slots.
+//! * [`erc20_balance_slot`] stays `keccak256(...)` because it addresses a **real ERC-20
+//!   contract's on-trie storage** (MockUSDC `_balances`), a different store entirely.
+//!
+//! Changing this layout moves every off-trie key and the block commitment → it is a CHAIN
+//! change (requires a chain wipe + golden re-pin + `BLOCK_COMMITMENT_VERSION` bump).
 
-use primitives::{b256, keccak256, Address, B256};
+use primitives::{keccak256, Address, B256};
 
-// ── Key-family prefixes ───────────────────────────────────────────────────
-// The five parameterless prefixes (admn/orcl/mkgr/infd/cmit) are folded into
-// precomputed `*_KEY` constants below; the prefix consts are kept so the
-// `const_key_tests` pin can re-derive and compare.
-#[cfg_attr(not(test), allow(dead_code))]
-const PFX_ADMIN: &[u8] = b"admn";
-const PFX_ACCOUNT: &[u8] = b"acct";
-const PFX_USER_FEE: &[u8] = b"ufee";
-const PFX_MARKET_FEE_TOTAL: &[u8] = b"mfee"; // per-market collected trading fee total
-const PFX_TRADE_COUNT: &[u8] = b"tcnt"; // per-market sequential trade ID counter
-const PFX_POSITION: &[u8] = b"pos\x00";
-const PFX_BUY_ORDERS: &[u8] = b"bord"; // per-user buy order entries
-const PFX_SELL_ORDERS: &[u8] = b"sord"; // per-user sell order entries
-const PFX_ORDER: &[u8] = b"ord\x00"; // full Order struct by order_id
-const PFX_USER_NONCE: &[u8] = b"nonc"; // per-user nonce for order-id generation
-const PFX_MARKET: &[u8] = b"mkt\x00";
-const PFX_MARK_PRICE: &[u8] = b"mktp";
-const PFX_OPEN_INT: &[u8] = b"oint";
-const PFX_POSITION_REGISTRY: &[u8] = b"preg"; // per-market set of addresses with an open position
-const PFX_BID_PRICES: &[u8] = b"bidp"; // sorted Vec<u64> of active bid prices
-const PFX_ASK_PRICES: &[u8] = b"askp"; // sorted Vec<u64> of active ask prices
-const PFX_BID_LEVEL: &[u8] = b"bidl"; // FIFO queue of order IDs at a bid price
-const PFX_ASK_LEVEL: &[u8] = b"askl"; // FIFO queue of order IDs at an ask price
-const PFX_BEST_BID: &[u8] = b"bbd\x00"; // cached best bid price (0 = empty)
-const PFX_BEST_ASK: &[u8] = b"bak\x00"; // cached best ask price (0 = empty)
-const PFX_API_KEY: &[u8] = b"apik"; // per-user per-slot ed25519 key
-const PFX_API_KEY_IDS: &[u8] = b"akid"; // per-user list of registered key_ids
-#[cfg_attr(not(test), allow(dead_code))]
-const PFX_ORACLE: &[u8] = b"orcl"; // authorized oracle address (updateIndexPrice role)
-#[cfg_attr(not(test), allow(dead_code))]
-const PFX_MARKET_MANAGER: &[u8] = b"mkgr"; // authorized market manager address (addMarket/updateMarket role)
-const PFX_INDEX_PRICE: &[u8] = b"idxp"; // per-market IndexPriceState
-const PFX_INDEX_HISTORY: &[u8] = b"idxh"; // per-market IndexPriceHistory
-const PFX_BASIS_WINDOW: &[u8] = b"bswn"; // per-market PriceBasisWindow (30s mid samples)
-const PFX_LAST_TRADED: &[u8] = b"ltrd"; // per-market last traded price (contract price)
-const PFX_FUNDING_STATE: &[u8] = b"fund"; // per-market FundingState
-const PFX_PREMIUM_ACCUMULATOR: &[u8] = b"pacc"; // per-market PremiumIndexAccumulator
-#[cfg_attr(not(test), allow(dead_code))]
-const PFX_INSURANCE_FUND: &[u8] = b"infd"; // global insurance fund balance
-#[cfg_attr(not(test), allow(dead_code))]
-const PFX_COMMITMENT: &[u8] = b"cmit"; // global on-trie commitment over the off-trie perp write-stream
+// ── Key-family prefixes (4-byte, ASCII, must be pairwise distinct) ─────────────
+const PFX_ADMIN: [u8; 4] = *b"admn";
+const PFX_ACCOUNT: [u8; 4] = *b"acct";
+const PFX_USER_FEE: [u8; 4] = *b"ufee";
+const PFX_MARKET_FEE_TOTAL: [u8; 4] = *b"mfee"; // per-market collected trading fee total
+const PFX_TRADE_COUNT: [u8; 4] = *b"tcnt"; // per-market sequential trade ID counter
+const PFX_POSITION: [u8; 4] = *b"pos\x00";
+const PFX_BUY_ORDERS: [u8; 4] = *b"bord"; // per-user buy order entries
+const PFX_SELL_ORDERS: [u8; 4] = *b"sord"; // per-user sell order entries
+const PFX_USER_NONCE: [u8; 4] = *b"nonc"; // per-user nonce for order-id generation
+const PFX_MARKET: [u8; 4] = *b"mkt\x00";
+const PFX_MARK_PRICE: [u8; 4] = *b"mktp";
+const PFX_OPEN_INT: [u8; 4] = *b"oint";
+const PFX_POSITION_REGISTRY: [u8; 4] = *b"preg"; // per-market set of addresses with an open position
+const PFX_BID_PRICES: [u8; 4] = *b"bidp"; // sorted Vec<u64> of active bid prices
+const PFX_ASK_PRICES: [u8; 4] = *b"askp"; // sorted Vec<u64> of active ask prices
+const PFX_BID_LEVEL: [u8; 4] = *b"bidl"; // FIFO queue of order IDs at a bid price
+const PFX_ASK_LEVEL: [u8; 4] = *b"askl"; // FIFO queue of order IDs at an ask price
+const PFX_BEST_BID: [u8; 4] = *b"bbd\x00"; // cached best bid price (0 = empty)
+const PFX_BEST_ASK: [u8; 4] = *b"bak\x00"; // cached best ask price (0 = empty)
+const PFX_API_KEY: [u8; 4] = *b"apik"; // per-user per-slot ed25519 key
+const PFX_API_KEY_IDS: [u8; 4] = *b"akid"; // per-user list of registered key_ids
+const PFX_ORACLE: [u8; 4] = *b"orcl"; // authorized oracle address (updateIndexPrice role)
+const PFX_MARKET_MANAGER: [u8; 4] = *b"mkgr"; // authorized market manager address (addMarket/updateMarket role)
+const PFX_INDEX_PRICE: [u8; 4] = *b"idxp"; // per-market IndexPriceState
+const PFX_INDEX_HISTORY: [u8; 4] = *b"idxh"; // per-market IndexPriceHistory
+const PFX_BASIS_WINDOW: [u8; 4] = *b"bswn"; // per-market PriceBasisWindow (30s mid samples)
+const PFX_LAST_TRADED: [u8; 4] = *b"ltrd"; // per-market last traded price (contract price)
+const PFX_FUNDING_STATE: [u8; 4] = *b"fund"; // per-market FundingState
+const PFX_PREMIUM_ACCUMULATOR: [u8; 4] = *b"pacc"; // per-market PremiumIndexAccumulator
+const PFX_INSURANCE_FUND: [u8; 4] = *b"infd"; // global insurance fund balance
+const PFX_COMMITMENT: [u8; 4] = *b"cmit"; // global on-trie commitment anchor slot
 
-// ── ERC-20 helper (shared with deposit/withdraw) ──────────────────────────
+// ── Packing helpers (catalog #12: pack, don't hash) ───────────────────────────
+// All produce `prefix ++ fields ++ zero-pad` in a stack `[u8; 32]` — no hash, no heap alloc.
+// The field layouts are fixed-size + big-endian, so the packed bytes are deterministic across
+// validators and enter the block commitment unchanged in structure.
+
+/// `prefix(4) ++ 28 zero` — a parameterless global slot.
+const fn packed_const(prefix: [u8; 4]) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[0] = prefix[0];
+    buf[1] = prefix[1];
+    buf[2] = prefix[2];
+    buf[3] = prefix[3];
+    B256::new(buf)
+}
+
+/// `prefix(4) ++ market_id(8 BE) ++ 20 zero`.
+#[inline]
+fn pack_market(prefix: [u8; 4], market_id: u64) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[..4].copy_from_slice(&prefix);
+    buf[4..12].copy_from_slice(&market_id.to_be_bytes());
+    B256::new(buf)
+}
+
+/// `prefix(4) ++ address(20) ++ 8 zero`.
+#[inline]
+fn pack_addr(prefix: [u8; 4], user: Address) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[..4].copy_from_slice(&prefix);
+    buf[4..24].copy_from_slice(user.as_slice());
+    B256::new(buf)
+}
+
+/// `prefix(4) ++ address(20) ++ market_id(8 BE)` — fills all 32 bytes (the tightest key).
+#[inline]
+fn pack_addr_market(prefix: [u8; 4], user: Address, market_id: u64) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[..4].copy_from_slice(&prefix);
+    buf[4..24].copy_from_slice(user.as_slice());
+    buf[24..32].copy_from_slice(&market_id.to_be_bytes());
+    B256::new(buf)
+}
+
+/// `prefix(4) ++ market_id(8 BE) ++ price(8 BE) ++ 12 zero`.
+#[inline]
+fn pack_market_price(prefix: [u8; 4], market_id: u64, price: u64) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[..4].copy_from_slice(&prefix);
+    buf[4..12].copy_from_slice(&market_id.to_be_bytes());
+    buf[12..20].copy_from_slice(&price.to_be_bytes());
+    B256::new(buf)
+}
+
+/// `prefix(4) ++ address(20) ++ key_id(1) ++ 7 zero`.
+#[inline]
+fn pack_addr_u8(prefix: [u8; 4], user: Address, key_id: u8) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[..4].copy_from_slice(&prefix);
+    buf[4..24].copy_from_slice(user.as_slice());
+    buf[24] = key_id;
+    B256::new(buf)
+}
+
+// ── ERC-20 helper (on-trie, external contract — stays keccak) ──────────────────
 
 /// Standard OpenZeppelin ERC-20 `_balances[account]` storage slot.
 ///
@@ -58,7 +124,10 @@ const PFX_COMMITMENT: &[u8] = b"cmit"; // global on-trie commitment over the off
 /// state variable (slot 0).  EIP-7201 namespaced storage is only used by
 /// `ERC20Upgradeable.sol`, not by the standard `ERC20.sol`.
 ///
-/// Slot = `keccak256(abi.encode(account, uint256(0)))`.
+/// Slot = `keccak256(abi.encode(account, uint256(0)))`. This addresses a REAL ERC-20
+/// contract's on-trie storage (not the off-trie perp store), so it MUST stay keccak to match
+/// the Solidity mapping layout — it is a different store and never collides with packed
+/// off-trie keys.
 pub fn erc20_balance_slot(account: Address) -> B256 {
     let mut buf = [0u8; 64];
     buf[12..32].copy_from_slice(account.as_slice()); // left-pad address to 32 bytes
@@ -66,19 +135,16 @@ pub fn erc20_balance_slot(account: Address) -> B256 {
     keccak256(buf)
 }
 
-/// Global on-trie storage slot under 0x1003 holding the chained keccak commitment over the
-/// off-trie PerpState write-stream. It is anchored ON the state trie (a normal account-storage
-/// slot, distinct from the off-trie B256 domain keys and from the erc20 balance slots) so that
-/// any perp-write divergence surfaces in the state root and is detected by consensus.
+// ── Commitment anchor (on-trie slot under 0x1003) ──────────────────────────────
+
+/// Global on-trie storage slot under 0x1003 holding the chained commitment over the off-trie
+/// PerpState write-stream. Anchored ON the state trie so any perp-write divergence surfaces in
+/// the state root and is caught by consensus. 0x1003's on-trie storage holds ONLY this slot, so
+/// packing it (`"cmit" ++ zero`) cannot collide with anything.
 ///
-/// Precomputed `keccak256(b"cmit")` — this is hashed on every `store_blob` fold, so it must
-/// not be recomputed per call. Pinned against the live derivation in `const_key_tests`.
-///
-/// Invariant: this slot is written ONLY by `storage::flush_commitment` (the per-call fold flush).
-/// The per-call accumulator seeds itself from a single `sload` of this slot, so any future code
-/// that needs to change the commitment must go through the accumulator, never a raw `sstore` here.
-pub const COMMITMENT_SLOT: B256 =
-    b256!("0x5315529dd419e7000541b58e86740e824fd9f29774b5ca4423b92157a3c38b37");
+/// Invariant: written ONLY by `storage::flush_commitment` (the per-call fold flush); the
+/// accumulator seeds from a single `sload` of this slot.
+pub const COMMITMENT_SLOT: B256 = packed_const(PFX_COMMITMENT);
 
 /// See [`COMMITMENT_SLOT`].
 #[inline]
@@ -86,13 +152,10 @@ pub fn commitment_slot() -> B256 {
     COMMITMENT_SLOT
 }
 
-// ── Admin ─────────────────────────────────────────────────────────────────
+// ── Admin / roles (parameterless global slots) ─────────────────────────────────
 
 /// Single slot storing the admin address (20 bytes, zero = uninitialized).
-///
-/// Precomputed `keccak256(b"admn")`, pinned in `const_key_tests`.
-pub const ADMIN_KEY: B256 =
-    b256!("0x0cd72d51fc618f526ac2c21501d7abd9edf6395566bb827168c6d03aa2596b61");
+pub const ADMIN_KEY: B256 = packed_const(PFX_ADMIN);
 
 /// See [`ADMIN_KEY`].
 #[inline]
@@ -100,141 +163,134 @@ pub fn admin_key() -> B256 {
     ADMIN_KEY
 }
 
-// ── Global counters ───────────────────────────────────────────────────────
+// ── Global counters ───────────────────────────────────────────────────────────
 
 /// Per-market sequential trade ID counter.
 pub fn trade_count_key(market_id: u64) -> B256 {
-    keccak256([PFX_TRADE_COUNT, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_TRADE_COUNT, market_id)
 }
 
-// ── Account ───────────────────────────────────────────────────────────────
+// ── Account ─────────────────────────────────────────────────────────────────
 
 pub fn account_key(user: Address) -> B256 {
-    keccak256([PFX_ACCOUNT, user.as_slice()].concat())
+    pack_addr(PFX_ACCOUNT, user)
 }
 
 pub fn user_fee_rates_key(user: Address) -> B256 {
-    keccak256([PFX_USER_FEE, user.as_slice()].concat())
+    pack_addr(PFX_USER_FEE, user)
 }
 
 pub fn market_fee_total_key(market_id: u64) -> B256 {
-    keccak256([PFX_MARKET_FEE_TOTAL, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_MARKET_FEE_TOTAL, market_id)
 }
 
-// ── Perp position ─────────────────────────────────────────────────────────
+// ── Perp position ─────────────────────────────────────────────────────────────
 
 pub fn position_key(user: Address, market_id: u64) -> B256 {
-    keccak256([PFX_POSITION, user.as_slice(), &market_id.to_be_bytes()].concat())
+    pack_addr_market(PFX_POSITION, user, market_id)
 }
 
 /// Buy-order entries for a user in a market (Vec<OrderEntry>, sorted price DESC).
 pub fn user_buy_orders_key(user: Address, market_id: u64) -> B256 {
-    keccak256([PFX_BUY_ORDERS, user.as_slice(), &market_id.to_be_bytes()].concat())
+    pack_addr_market(PFX_BUY_ORDERS, user, market_id)
 }
 
 /// Sell-order entries for a user in a market (Vec<OrderEntry>, sorted price ASC).
 pub fn user_sell_orders_key(user: Address, market_id: u64) -> B256 {
-    keccak256([PFX_SELL_ORDERS, user.as_slice(), &market_id.to_be_bytes()].concat())
+    pack_addr_market(PFX_SELL_ORDERS, user, market_id)
 }
 
-// ── Orders ────────────────────────────────────────────────────────────────
+// ── Orders ──────────────────────────────────────────────────────────────────
 
 /// Full `Order` struct keyed by 32-byte order ID.
+///
+/// UNLIKE every other off-trie key this is the **raw `order_id`** — no prefix, no hash. The
+/// order id is itself a preimage-resistant keccak output (`keccak256(account ‖ nonce)` for
+/// `placeOrder`, `keccak256(signature)` for `placeOrderSigned`), so it is a uniformly
+/// distributed 32-byte value that cannot be steered onto any structured (prefixed) key —
+/// exactly how the EVM separates mapping slots from scalar slots.
+///
+/// INVARIANT: order-id generation MUST remain a preimage-resistant hash. If it ever becomes
+/// low-entropy (e.g. a raw counter), this key needs a namespace tag or its own hash again,
+/// otherwise a crafted order id could collide with a structured key.
 pub fn order_key(order_id: &[u8; 32]) -> B256 {
-    keccak256([PFX_ORDER, order_id.as_slice()].concat())
+    B256::new(*order_id)
 }
 
 /// Per-user nonce used to derive unique order IDs.
 pub fn user_nonce_key(user: Address) -> B256 {
-    keccak256([PFX_USER_NONCE, user.as_slice()].concat())
+    pack_addr(PFX_USER_NONCE, user)
 }
 
-// ── Market ────────────────────────────────────────────────────────────────
+// ── Market ────────────────────────────────────────────────────────────────────
 
 pub fn market_key(market_id: u64) -> B256 {
-    keccak256([PFX_MARKET, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_MARKET, market_id)
 }
 
 pub fn mark_price_key(market_id: u64) -> B256 {
-    keccak256([PFX_MARK_PRICE, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_MARK_PRICE, market_id)
 }
 
 pub fn open_interest_key(market_id: u64) -> B256 {
-    keccak256([PFX_OPEN_INT, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_OPEN_INT, market_id)
 }
 
 /// Per-market set of addresses holding an open position (packed 20-byte
 /// addresses). Maintained by the `save_position` zero-crossing hook; enumerated
 /// by the liquidation sweep.
 pub fn position_registry_key(market_id: u64) -> B256 {
-    keccak256([PFX_POSITION_REGISTRY, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_POSITION_REGISTRY, market_id)
 }
 
-// ── Order book ────────────────────────────────────────────────────────────
+// ── Order book ────────────────────────────────────────────────────────────────
 
 /// Sorted list of all active **bid** prices for a market (Vec<u64>, price DESC).
 pub fn bid_prices_key(market_id: u64) -> B256 {
-    keccak256([PFX_BID_PRICES, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_BID_PRICES, market_id)
 }
 
 /// Sorted list of all active **ask** prices for a market (Vec<u64>, price ASC).
 pub fn ask_prices_key(market_id: u64) -> B256 {
-    keccak256([PFX_ASK_PRICES, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_ASK_PRICES, market_id)
 }
 
 /// FIFO queue of order IDs at a specific bid price level.
 pub fn bid_level_key(market_id: u64, price: u64) -> B256 {
-    keccak256(
-        [
-            PFX_BID_LEVEL,
-            &market_id.to_be_bytes(),
-            &price.to_be_bytes(),
-        ]
-        .concat(),
-    )
+    pack_market_price(PFX_BID_LEVEL, market_id, price)
 }
 
 /// FIFO queue of order IDs at a specific ask price level.
 pub fn ask_level_key(market_id: u64, price: u64) -> B256 {
-    keccak256(
-        [
-            PFX_ASK_LEVEL,
-            &market_id.to_be_bytes(),
-            &price.to_be_bytes(),
-        ]
-        .concat(),
-    )
+    pack_market_price(PFX_ASK_LEVEL, market_id, price)
 }
 
 /// Cached best bid price for a market (0 = no bids).
 pub fn best_bid_key(market_id: u64) -> B256 {
-    keccak256([PFX_BEST_BID, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_BEST_BID, market_id)
 }
 
 /// Cached best ask price for a market (0 = no asks).
 pub fn best_ask_key(market_id: u64) -> B256 {
-    keccak256([PFX_BEST_ASK, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_BEST_ASK, market_id)
 }
 
-// ── API key (ed25519 signed orders) ──────────────────────────────────────────
+// ── API key (ed25519 signed orders) ────────────────────────────────────────────
 
 /// ed25519 key for a specific (user, key_id) slot.
 pub fn api_key_key(user: Address, key_id: u8) -> B256 {
-    keccak256([PFX_API_KEY, user.as_slice(), &[key_id]].concat())
+    pack_addr_u8(PFX_API_KEY, user, key_id)
 }
 
 /// List of registered key_ids for a user (Vec<u8>).
 pub fn api_key_ids_key(user: Address) -> B256 {
-    keccak256([PFX_API_KEY_IDS, user.as_slice()].concat())
+    pack_addr(PFX_API_KEY_IDS, user)
 }
 
-// ── Oracle price feed ─────────────────────────────────────────────────────────
+// ── Oracle / market-manager roles ──────────────────────────────────────────────
 
 /// Authorized oracle address (Address; zero = not set).
-///
-/// Precomputed `keccak256(b"orcl")`, pinned in `const_key_tests`.
-pub const ORACLE_KEY: B256 =
-    b256!("0xd411ab2cb54ccbef75296e12fdcf4fa6caf9f2b8da09908875765e8ae2c02c24");
+pub const ORACLE_KEY: B256 = packed_const(PFX_ORACLE);
 
 /// See [`ORACLE_KEY`].
 #[inline]
@@ -243,10 +299,7 @@ pub fn oracle_key() -> B256 {
 }
 
 /// Authorized market manager address (Address; zero = not set).
-///
-/// Precomputed `keccak256(b"mkgr")`, pinned in `const_key_tests`.
-pub const MARKET_MANAGER_KEY: B256 =
-    b256!("0xe2693bd7dc3c7bbb81d1b8591a1f844a3a1f4be6bde409c947fffc86c87163bd");
+pub const MARKET_MANAGER_KEY: B256 = packed_const(PFX_MARKET_MANAGER);
 
 /// See [`MARKET_MANAGER_KEY`].
 #[inline]
@@ -256,41 +309,38 @@ pub fn market_manager_key() -> B256 {
 
 /// Per-market IndexPriceState (index_price + timestamp).
 pub fn index_price_state_key(market_id: u64) -> B256 {
-    keccak256([PFX_INDEX_PRICE, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_INDEX_PRICE, market_id)
 }
 
 /// Per-market recent index price checkpoints.
 pub fn index_price_history_key(market_id: u64) -> B256 {
-    keccak256([PFX_INDEX_HISTORY, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_INDEX_HISTORY, market_id)
 }
 
 /// Per-market PriceBasisWindow (30-second mid-price ring buffer).
 pub fn price_basis_window_key(market_id: u64) -> B256 {
-    keccak256([PFX_BASIS_WINDOW, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_BASIS_WINDOW, market_id)
 }
 
 /// Per-market last traded price (the "contract price" input to mark price median).
 pub fn last_traded_price_key(market_id: u64) -> B256 {
-    keccak256([PFX_LAST_TRADED, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_LAST_TRADED, market_id)
 }
 
 /// Per-market FundingState (last rate, interval, next timestamp).
 pub fn funding_state_key(market_id: u64) -> B256 {
-    keccak256([PFX_FUNDING_STATE, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_FUNDING_STATE, market_id)
 }
 
 /// Per-market PremiumIndexAccumulator (linearly-weighted premium index for funding).
 pub fn premium_accumulator_key(market_id: u64) -> B256 {
-    keccak256([PFX_PREMIUM_ACCUMULATOR, &market_id.to_be_bytes()].concat())
+    pack_market(PFX_PREMIUM_ACCUMULATOR, market_id)
 }
 
-// ── Insurance Fund ────────────────────────────────────────────────────────────
+// ── Insurance Fund ──────────────────────────────────────────────────────────────
 
 /// Global insurance fund balance (u64, USDC micro-units).
-///
-/// Precomputed `keccak256(b"infd")`, pinned in `const_key_tests`.
-pub const INSURANCE_FUND_KEY: B256 =
-    b256!("0x292dee8007df30a0d76dd66c314b3df92655b9311e95dcbf55734d3b9f3ea8e7");
+pub const INSURANCE_FUND_KEY: B256 = packed_const(PFX_INSURANCE_FUND);
 
 /// See [`INSURANCE_FUND_KEY`].
 #[inline]
@@ -302,16 +352,107 @@ pub fn insurance_fund_key() -> B256 {
 mod const_key_tests {
     use super::*;
 
-    /// Pins every precomputed key constant against its live keccak derivation.
-    /// A mistyped constant here would silently move a storage key (and, for
-    /// `COMMITMENT_SLOT`, the consensus-visible anchor slot under 0x1003) —
-    /// the golden commitment test guards the same thing end-to-end.
+    /// Cross-namespace injectivity depends on prefixes being pairwise distinct.
     #[test]
-    fn precomputed_constants_match_derivation() {
-        assert_eq!(COMMITMENT_SLOT, keccak256(PFX_COMMITMENT), "cmit");
-        assert_eq!(ADMIN_KEY, keccak256(PFX_ADMIN), "admn");
-        assert_eq!(ORACLE_KEY, keccak256(PFX_ORACLE), "orcl");
-        assert_eq!(MARKET_MANAGER_KEY, keccak256(PFX_MARKET_MANAGER), "mkgr");
-        assert_eq!(INSURANCE_FUND_KEY, keccak256(PFX_INSURANCE_FUND), "infd");
+    fn prefixes_distinct() {
+        let all: &[[u8; 4]] = &[
+            PFX_ADMIN,
+            PFX_ACCOUNT,
+            PFX_USER_FEE,
+            PFX_MARKET_FEE_TOTAL,
+            PFX_TRADE_COUNT,
+            PFX_POSITION,
+            PFX_BUY_ORDERS,
+            PFX_SELL_ORDERS,
+            PFX_USER_NONCE,
+            PFX_MARKET,
+            PFX_MARK_PRICE,
+            PFX_OPEN_INT,
+            PFX_POSITION_REGISTRY,
+            PFX_BID_PRICES,
+            PFX_ASK_PRICES,
+            PFX_BID_LEVEL,
+            PFX_ASK_LEVEL,
+            PFX_BEST_BID,
+            PFX_BEST_ASK,
+            PFX_API_KEY,
+            PFX_API_KEY_IDS,
+            PFX_ORACLE,
+            PFX_MARKET_MANAGER,
+            PFX_INDEX_PRICE,
+            PFX_INDEX_HISTORY,
+            PFX_BASIS_WINDOW,
+            PFX_LAST_TRADED,
+            PFX_FUNDING_STATE,
+            PFX_PREMIUM_ACCUMULATOR,
+            PFX_INSURANCE_FUND,
+            PFX_COMMITMENT,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "duplicate prefix at {i},{j}");
+            }
+        }
+    }
+
+    /// Known-answer pins. A layout/prefix change moves every key + the golden commitment (a
+    /// CHAIN change); this catches an ACCIDENTAL one. Regenerate deliberately on a real change.
+    #[test]
+    fn known_answer_pins() {
+        let a = Address::from([0xABu8; 20]);
+
+        // account = "acct" ++ addr ++ 8 zero
+        let mut want = [0u8; 32];
+        want[..4].copy_from_slice(b"acct");
+        want[4..24].copy_from_slice(a.as_slice());
+        assert_eq!(account_key(a), B256::new(want));
+
+        // position = "pos\0" ++ addr ++ market(8) — fills all 32 bytes (tightest key)
+        let mut wp = [0u8; 32];
+        wp[..4].copy_from_slice(b"pos\x00");
+        wp[4..24].copy_from_slice(a.as_slice());
+        wp[24..32].copy_from_slice(&7u64.to_be_bytes());
+        assert_eq!(position_key(a, 7), B256::new(wp));
+
+        // market = "mkt\0" ++ market(8) ++ 20 zero
+        let mut wm = [0u8; 32];
+        wm[..4].copy_from_slice(b"mkt\x00");
+        wm[4..12].copy_from_slice(&7u64.to_be_bytes());
+        assert_eq!(market_key(7), B256::new(wm));
+
+        // bid_level = "bidl" ++ market(8) ++ price(8) ++ 12 zero
+        let mut wl = [0u8; 32];
+        wl[..4].copy_from_slice(b"bidl");
+        wl[4..12].copy_from_slice(&7u64.to_be_bytes());
+        wl[12..20].copy_from_slice(&100u64.to_be_bytes());
+        assert_eq!(bid_level_key(7, 100), B256::new(wl));
+
+        // order = raw id (no prefix, no hash)
+        let id = [0x42u8; 32];
+        assert_eq!(order_key(&id), B256::new(id));
+
+        // parameterless globals = prefix ++ 28 zero
+        let mut wadmin = [0u8; 32];
+        wadmin[..4].copy_from_slice(b"admn");
+        assert_eq!(admin_key(), B256::new(wadmin));
+        let mut wcmit = [0u8; 32];
+        wcmit[..4].copy_from_slice(b"cmit");
+        assert_eq!(commitment_slot(), B256::new(wcmit));
+    }
+
+    /// Same fields under different families must differ; the raw-order namespace must not equal
+    /// any structured key (spot-check — full injectivity holds by construction).
+    #[test]
+    fn no_cross_family_collision() {
+        let a = Address::from([0x22u8; 20]);
+        assert_ne!(position_key(a, 3), user_buy_orders_key(a, 3));
+        assert_ne!(position_key(a, 3), user_sell_orders_key(a, 3));
+        assert_ne!(user_buy_orders_key(a, 3), user_sell_orders_key(a, 3));
+        assert_ne!(market_key(3), mark_price_key(3));
+        assert_ne!(bid_prices_key(3), ask_prices_key(3));
+        assert_ne!(bid_level_key(3, 100), ask_level_key(3, 100));
+        // raw order id vs a structured key
+        let id = [0x01u8; 32];
+        assert_ne!(order_key(&id), position_key(a, 3));
     }
 }

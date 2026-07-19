@@ -244,7 +244,12 @@ fn setup_banded(ctx: &mut TestCtx, band_bps: u32) {
     fund(ctx, BOB, WALLET * 1_000);
 }
 
-fn try_place_limit(ctx: &mut TestCtx, caller: Address, side: u8, price: u64) -> Result<Bytes, PrecompileError> {
+fn try_place_limit(
+    ctx: &mut TestCtx,
+    caller: Address,
+    side: u8,
+    price: u64,
+) -> Result<Bytes, PrecompileError> {
     let input = placeOrderCall {
         marketId: MARKET_ID,
         side,
@@ -351,8 +356,8 @@ fn maker_open_below_maintenance_is_cancelled_not_filled() {
     let mut ctx = make_ctx();
     setup_banded(&mut ctx, 1_000_000); // disabled band so the off-mark ask can rest
     storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap(); // mark = 100 ticks
-    // ALICE rests an ask far below mark (50 ticks). Filling it would open ALICE a
-    // short at 50 while mark is 100 -> equity 0, below the 1/6 maintenance threshold.
+                                                                   // ALICE rests an ask far below mark (50 ticks). Filling it would open ALICE a
+                                                                   // short at 50 while mark is 100 -> equity 0, below the 1/6 maintenance threshold.
     let alice_ask = try_place_limit(&mut ctx, ALICE, 1, 50 * TICK).unwrap();
     let alice_ask: [u8; 32] = alice_ask[..32].try_into().unwrap();
     // BOB buys into it: the maker open-solvency guard rejects ALICE's fill, so her
@@ -2544,8 +2549,12 @@ mod golden {
     /// CHANGES BusinessSnapshot: ALICE keeps the taker fee she used to pay on her Phase-9
     /// book close, and the market fee total drops by it. Prior value
     /// 0xfcc04c1f1e41e7e284ace52730d47aaeb47955a3fb1ce27d1d52ea2aa34eab1e.
+    /// RE-PIN (catalog #12, direct-packed storage keys + `BLOCK_COMMITMENT_VERSION` 3→4): the
+    /// business snapshot is unchanged; only the key bytes folded into the commitment differ, so
+    /// this is a legitimate CHAIN re-pin (devnet wipe). Prior value
+    /// 0x9b493f51b6dd2011ae1c8b7ebc5a2b2b3b4fc2cc9fd1b46878d5d1a2b85e3435.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x9b493f51b6dd2011ae1c8b7ebc5a2b2b3b4fc2cc9fd1b46878d5d1a2b85e3435");
+        b256!("0x8bcfa8def86af905253c4de33a0ca43634683e94191de931bf9235a38be9597d");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -2642,7 +2651,10 @@ mod golden {
     /// the explicit slot-pin assert at the top of `run_golden_scenario` fails
     /// with a clear message instead.
     fn golden_commitment_slot() -> B256 {
-        keccak256(b"cmit")
+        // Independent re-derivation of the packed anchor slot (#12): "cmit" ++ 28 zero.
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(b"cmit");
+        B256::new(b)
     }
 
     /// Standard OZ ERC-20 `_balances[user]` slot (mapping at slot 0), derived
