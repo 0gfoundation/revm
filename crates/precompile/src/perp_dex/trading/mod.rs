@@ -292,9 +292,17 @@ pub fn run_get_book_prices<CTX: ContextTr>(
         .map_err(|_| perp_err("getBookPrices: invalid calldata"))?;
 
     let side = Side::from_u8(args.side).ok_or_else(|| perp_err("getBookPrices: invalid side"))?;
-    let prices = match side {
-        Side::Buy => storage::load_bid_prices_ref(context, args.marketId)?,
-        Side::Sell => storage::load_ask_prices_ref(context, args.marketId)?,
+    // BTreeSet is ascending; return the API's best-first order: bids DESC (rev), asks ASC.
+    let prices: Vec<u64> = match side {
+        Side::Buy => storage::load_bid_prices_ref(context, args.marketId)?
+            .iter()
+            .rev()
+            .copied()
+            .collect(),
+        Side::Sell => storage::load_ask_prices_ref(context, args.marketId)?
+            .iter()
+            .copied()
+            .collect(),
     };
 
     Ok(Bytes::from(getBookPricesCall::abi_encode_returns(&prices)))
@@ -983,9 +991,9 @@ pub(super) fn match_order<CTX: ContextTr>(
         Side::Sell => {
             // Match against bids (sorted DESC: highest bid first).
             let bid_prices = storage::load_bid_prices_ref(context, market_id)?;
-            let old_best_bid = bid_prices.first().copied().unwrap_or(0);
+            let old_best_bid = bid_prices.last().copied().unwrap_or(0); // bids: best = max
             let mut bid_levels_cleared = false;
-            'outer: for bid_price in bid_prices.iter().copied() {
+            'outer: for bid_price in bid_prices.iter().rev().copied() {
                 // For limit sell: only match if bid_price >= our limit.
                 if order_type == OrderType::Limit && bid_price < limit_price {
                     break;
@@ -1710,7 +1718,7 @@ fn check_fok_feasibility<CTX: ContextTr>(
         }
         Side::Sell => {
             let bid_prices = storage::load_bid_prices_ref(context, market_id)?;
-            'outer: for bid_price in bid_prices.iter().copied() {
+            'outer: for bid_price in bid_prices.iter().rev().copied() {
                 if order_type == OrderType::Limit && bid_price < limit_price {
                     break;
                 }

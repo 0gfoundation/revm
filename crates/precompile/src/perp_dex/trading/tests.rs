@@ -503,7 +503,7 @@ fn limit_buy_rests_in_book_when_no_ask() {
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
     assert_eq!(
         storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![PRICE]
+        std::collections::BTreeSet::from([PRICE])
     );
 }
 
@@ -516,7 +516,7 @@ fn limit_sell_rests_in_book_when_no_bid() {
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
     assert_eq!(
         storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![PRICE]
+        std::collections::BTreeSet::from([PRICE])
     );
 }
 
@@ -904,7 +904,7 @@ fn partial_fill_leaves_maker_partially_filled_in_book() {
     // Remaining sell still in ask book.
     assert_eq!(
         storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![PRICE]
+        std::collections::BTreeSet::from([PRICE])
     );
 }
 
@@ -1348,7 +1348,7 @@ fn post_only_rests_when_above_best_bid() {
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
     assert_eq!(
         storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![ask_price]
+        std::collections::BTreeSet::from([ask_price])
     );
 }
 
@@ -1404,7 +1404,7 @@ fn cancel_non_top_bid_keeps_best_bid() {
     assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_hi);
     assert_eq!(
         storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![p_hi]
+        std::collections::BTreeSet::from([p_hi])
     );
     assert_eq!(get_order(&mut ctx, lo).status, OrderStatus::Cancelled);
     assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Open);
@@ -1433,7 +1433,7 @@ fn cancel_top_bid_refreshes_best_bid() {
     assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_lo);
     assert_eq!(
         storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![p_lo]
+        std::collections::BTreeSet::from([p_lo])
     );
 }
 
@@ -1460,7 +1460,7 @@ fn cancel_non_top_ask_keeps_best_ask() {
     assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), p_lo);
     assert_eq!(
         storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        vec![p_lo]
+        std::collections::BTreeSet::from([p_lo])
     );
     assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Cancelled);
 }
@@ -2553,8 +2553,11 @@ mod golden {
     /// business snapshot is unchanged; only the key bytes folded into the commitment differ, so
     /// this is a legitimate CHAIN re-pin (devnet wipe). Prior value
     /// 0x9b493f51b6dd2011ae1c8b7ebc5a2b2b3b4fc2cc9fd1b46878d5d1a2b85e3435.
+    /// RE-PIN (catalog #22, price index Vec<u64>→BTreeSet<u64> + `BLOCK_COMMITMENT_VERSION` 4→5):
+    /// business snapshot unchanged; the serialized price-level bytes change (container + order).
+    /// Prior value 0x8bcfa8def86af905253c4de33a0ca43634683e94191de931bf9235a38be9597d.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x8bcfa8def86af905253c4de33a0ca43634683e94191de931bf9235a38be9597d");
+        b256!("0xcfa7fe64e534bd9adf65df5a2e4529b95754e150519352daeed5ce77d01f71c9");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
