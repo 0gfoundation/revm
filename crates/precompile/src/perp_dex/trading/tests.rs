@@ -503,7 +503,7 @@ fn limit_buy_rests_in_book_when_no_ask() {
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
     assert_eq!(
         storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
-        std::collections::BTreeSet::from([PRICE])
+        vec![PRICE]
     );
 }
 
@@ -516,7 +516,7 @@ fn limit_sell_rests_in_book_when_no_bid() {
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
     assert_eq!(
         storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        std::collections::BTreeSet::from([PRICE])
+        vec![PRICE]
     );
 }
 
@@ -904,7 +904,7 @@ fn partial_fill_leaves_maker_partially_filled_in_book() {
     // Remaining sell still in ask book.
     assert_eq!(
         storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        std::collections::BTreeSet::from([PRICE])
+        vec![PRICE]
     );
 }
 
@@ -1348,7 +1348,7 @@ fn post_only_rests_when_above_best_bid() {
     assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
     assert_eq!(
         storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        std::collections::BTreeSet::from([ask_price])
+        vec![ask_price]
     );
 }
 
@@ -1404,7 +1404,7 @@ fn cancel_non_top_bid_keeps_best_bid() {
     assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_hi);
     assert_eq!(
         storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
-        std::collections::BTreeSet::from([p_hi])
+        vec![p_hi]
     );
     assert_eq!(get_order(&mut ctx, lo).status, OrderStatus::Cancelled);
     assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Open);
@@ -1433,7 +1433,7 @@ fn cancel_top_bid_refreshes_best_bid() {
     assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), p_lo);
     assert_eq!(
         storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
-        std::collections::BTreeSet::from([p_lo])
+        vec![p_lo]
     );
 }
 
@@ -1460,7 +1460,7 @@ fn cancel_non_top_ask_keeps_best_ask() {
     assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), p_lo);
     assert_eq!(
         storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
-        std::collections::BTreeSet::from([p_lo])
+        vec![p_lo]
     );
     assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Cancelled);
 }

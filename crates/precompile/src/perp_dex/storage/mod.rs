@@ -9,7 +9,6 @@ use context::{
 use primitives::{Address, HashMap, B256, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 
 use crate::perp_dex::PERP_DEX_ADDRESS;
 use crate::{
@@ -204,7 +203,7 @@ fn store_blob<CTX: ContextTr>(
 /// switch from the per-call chained v2 (retired) to the per-block net-delta fold; bumped to 4
 /// at the switch from keccak-derived storage keys to direct-packed keys (catalog #12), so the
 /// two key framings never alias across the consensus transition (a devnet wipe accompanies the
-/// bump); bumped to 5 at the price-index switch from sorted `Vec<u64>` to `BTreeSet<u64>`
+/// bump); bumped to 5 at the price-index switch from sorted `Vec<u64>` to `Vec<u64>`
 /// (catalog #22) — the serialized price-level bytes change (container + order).
 const BLOCK_COMMITMENT_VERSION: u8 = 5;
 
@@ -969,39 +968,61 @@ pub fn save_open_interest<CTX: ContextTr>(
 }
 
 // ── Order book: price level lists ─────────────────────────────────────────────
-// The active price levels per side are a `BTreeSet<u64>` (catalog #22): O(log n)
-// insert/remove/contains and O(1) best-price (min/max), vs the old sorted `Vec<u64>` whose
-// `contains()`/`insert()`/`retain()` were O(book-depth) linear scans (the #1 warm-exec cost at
-// depth — 64→1024 lvls = 3.2→20µs/op microbench). BTreeSet iterates ASCENDING and serializes
-// deterministically (sorted), so it is consensus-safe. Side order for matching/BBO:
+// The active price levels per side are a SORTED `Vec<u64>` (ascending). Present-check /
+// insert-position use `binary_search` = O(log n) (NOT a linear `contains`); insert/remove are
+// O(n) memmove of contiguous u64 — trivially cheap at real book depth. This reverts catalog #22's
+// `BTreeSet<u64>`, which was O(log n) insert/remove but paid node allocation, pointer-chasing
+// iteration, and — worst — O(n log n)+n-alloc cross-block cold rebuild and slower per-block
+// serialization. A 3-way A/B (2026-07-20) showed sorted-Vec+binary_search beats BTreeSet at every
+// depth. The Vec is kept ascending so its msgpack bytes are byte-identical to the BTreeSet's (both
+// serialize as an ascending array) → commitment UNCHANGED, no CHAIN change. Side order for BBO:
 //   * asks — best = min = `.first()`; walk lowest-first = `.iter()`.
 //   * bids — best = max = `.last()`;  walk highest-first = `.iter().rev()`.
+
+/// Insert `x` into a sorted (ascending) `Vec` if absent; returns `true` if newly inserted.
+/// O(log n) `binary_search` + O(n) memmove — the sorted-Vec analogue of `BTreeSet::insert`.
+#[inline]
+fn sorted_insert(v: &mut Vec<u64>, x: u64) -> bool {
+    match v.binary_search(&x) {
+        Ok(_) => false,
+        Err(i) => {
+            v.insert(i, x);
+            true
+        }
+    }
+}
+
+/// Remove `x` from a sorted `Vec` if present. O(log n) search + O(n) memmove.
+#[inline]
+fn sorted_remove(v: &mut Vec<u64>, x: u64) {
+    if let Ok(i) = v.binary_search(&x) {
+        v.remove(i);
+    }
+}
 
 /// Active bid price levels (best = max).
 pub fn load_bid_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-) -> Result<BTreeSet<u64>, PrecompileError> {
-    Ok(load_cached::<_, BTreeSet<u64>>(context, bid_prices_key(market_id))?.unwrap_or_default())
+) -> Result<Vec<u64>, PrecompileError> {
+    Ok(load_cached::<_, Vec<u64>>(context, bid_prices_key(market_id))?.unwrap_or_default())
 }
 
-/// Zero-copy active bid prices (点1): `Arc<BTreeSet<u64>>`, no per-read clone. PURE reads only
+/// Zero-copy active bid prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only
 /// (BBO / matching walk — bids walk `.iter().rev()`, best = `.last()`). Edits use
 /// [`insert_bid_price`] / [`remove_bid_price`].
 pub fn load_bid_prices_ref<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-) -> Result<std::sync::Arc<BTreeSet<u64>>, PrecompileError> {
-    Ok(
-        load_arc::<_, BTreeSet<u64>>(context, bid_prices_key(market_id))?
-            .unwrap_or_else(|| std::sync::Arc::new(BTreeSet::new())),
-    )
+) -> Result<std::sync::Arc<Vec<u64>>, PrecompileError> {
+    Ok(load_arc::<_, Vec<u64>>(context, bid_prices_key(market_id))?
+        .unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
 }
 
 pub fn save_bid_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-    prices: &BTreeSet<u64>,
+    prices: &Vec<u64>,
 ) -> Result<(), PrecompileError> {
     save_cached(context, bid_prices_key(market_id), prices)
 }
@@ -1010,26 +1031,24 @@ pub fn save_bid_prices<CTX: ContextTr>(
 pub fn load_ask_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-) -> Result<BTreeSet<u64>, PrecompileError> {
-    Ok(load_cached::<_, BTreeSet<u64>>(context, ask_prices_key(market_id))?.unwrap_or_default())
+) -> Result<Vec<u64>, PrecompileError> {
+    Ok(load_cached::<_, Vec<u64>>(context, ask_prices_key(market_id))?.unwrap_or_default())
 }
 
-/// Zero-copy active ask prices (点1): `Arc<BTreeSet<u64>>`, no per-read clone. PURE reads only
+/// Zero-copy active ask prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only
 /// (asks walk `.iter()`, best = `.first()`).
 pub fn load_ask_prices_ref<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-) -> Result<std::sync::Arc<BTreeSet<u64>>, PrecompileError> {
-    Ok(
-        load_arc::<_, BTreeSet<u64>>(context, ask_prices_key(market_id))?
-            .unwrap_or_else(|| std::sync::Arc::new(BTreeSet::new())),
-    )
+) -> Result<std::sync::Arc<Vec<u64>>, PrecompileError> {
+    Ok(load_arc::<_, Vec<u64>>(context, ask_prices_key(market_id))?
+        .unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
 }
 
 pub fn save_ask_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-    prices: &BTreeSet<u64>,
+    prices: &Vec<u64>,
 ) -> Result<(), PrecompileError> {
     save_cached(context, ask_prices_key(market_id), prices)
 }
@@ -1046,15 +1065,15 @@ pub fn save_ask_prices<CTX: ContextTr>(
 fn mutate_bid_prices<CTX: ContextTr, R>(
     context: &mut CTX,
     market_id: u64,
-    f: impl FnOnce(&mut BTreeSet<u64>) -> R,
+    f: impl FnOnce(&mut Vec<u64>) -> R,
 ) -> Result<R, PrecompileError> {
     let key = bid_prices_key(market_id);
     if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(prices) = any.downcast_mut::<BTreeSet<u64>>() {
+        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
             return Ok(f(prices));
         }
     }
-    let mut prices: BTreeSet<u64> = load_cached(context, key)?.unwrap_or_default();
+    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
     let r = f(&mut prices);
     save_cached(context, key, &prices)?;
     Ok(r)
@@ -1063,15 +1082,15 @@ fn mutate_bid_prices<CTX: ContextTr, R>(
 fn mutate_ask_prices<CTX: ContextTr, R>(
     context: &mut CTX,
     market_id: u64,
-    f: impl FnOnce(&mut BTreeSet<u64>) -> R,
+    f: impl FnOnce(&mut Vec<u64>) -> R,
 ) -> Result<R, PrecompileError> {
     let key = ask_prices_key(market_id);
     if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(prices) = any.downcast_mut::<BTreeSet<u64>>() {
+        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
             return Ok(f(prices));
         }
     }
-    let mut prices: BTreeSet<u64> = load_cached(context, key)?.unwrap_or_default();
+    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
     let r = f(&mut prices);
     save_cached(context, key, &prices)?;
     Ok(r)
@@ -1315,7 +1334,7 @@ pub fn save_ask_level<CTX: ContextTr>(
 
 // ── Order book helpers ────────────────────────────────────────────────────────
 
-/// Insert `price` into the active bid price set if not already present. O(log n) (BTreeSet).
+/// Insert `price` into the active bid price set if not already present. O(log n) binary_search + O(n) memmove.
 pub fn insert_bid_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -1324,21 +1343,21 @@ pub fn insert_bid_price<CTX: ContextTr>(
     let key = bid_prices_key(market_id);
     // Fast path: already touched this block → in-place insert (idempotent, no load/store clone).
     if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(prices) = any.downcast_mut::<BTreeSet<u64>>() {
-            prices.insert(price);
+        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
+            sorted_insert(prices, price);
             return Ok(());
         }
     }
     // Slow path (first touch): load once; write ONLY when the price is newly inserted —
     // preserving the "no store when already present" delta semantics (fewer commitment entries).
-    let mut prices: BTreeSet<u64> = load_cached(context, key)?.unwrap_or_default();
-    if prices.insert(price) {
+    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
+    if sorted_insert(&mut prices, price) {
         save_cached(context, key, &prices)?;
     }
     Ok(())
 }
 
-/// Insert `price` into the active ask price set if not already present. O(log n) (BTreeSet).
+/// Insert `price` into the active ask price set if not already present. O(log n) binary_search + O(n) memmove.
 pub fn insert_ask_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -1346,13 +1365,13 @@ pub fn insert_ask_price<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let key = ask_prices_key(market_id);
     if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(prices) = any.downcast_mut::<BTreeSet<u64>>() {
-            prices.insert(price);
+        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
+            sorted_insert(prices, price);
             return Ok(());
         }
     }
-    let mut prices: BTreeSet<u64> = load_cached(context, key)?.unwrap_or_default();
-    if prices.insert(price) {
+    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
+    if sorted_insert(&mut prices, price) {
         save_cached(context, key, &prices)?;
     }
     Ok(())
@@ -1365,7 +1384,7 @@ pub fn remove_bid_price<CTX: ContextTr>(
     price: u64,
 ) -> Result<(), PrecompileError> {
     mutate_bid_prices(context, market_id, |prices| {
-        prices.remove(&price);
+        sorted_remove(prices, price);
     })
 }
 
@@ -1376,7 +1395,7 @@ pub fn remove_ask_price<CTX: ContextTr>(
     price: u64,
 ) -> Result<(), PrecompileError> {
     mutate_ask_prices(context, market_id, |prices| {
-        prices.remove(&price);
+        sorted_remove(prices, price);
     })
 }
 
