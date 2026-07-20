@@ -139,131 +139,38 @@ impl TakerSettlement {
 
         let mut pos = storage::load_position(context, self.user, self.market_id)?;
         let mut account = storage::load_account(context, self.user)?;
-        // Settle accrued funding on the pre-fill position before its size changes.
-        crate::perp_dex::funding::settle_position_funding(
+        // commit-only #23: funding computed IN MEMORY (no IF write) so a taker reject below
+        // (K9 open-into-insolvency, arithmetic) leaves ZERO writes instead of relying on undo.
+        let pending_funding = crate::perp_dex::funding::compute_funding_settlement(
             context,
             self.user,
             market,
             &mut pos,
             &mut account.perp_wallet_balance,
         )?;
-        let mut remaining_closing_qty = pos.amount.unsigned_abs();
-        let mut closing_qty = 0u64;
-        let mut closing_value = 0u64;
-        let mut opening_qty = 0u64;
-        let mut opening_value = 0u64;
-        let is_buy = taker_side == Side::Buy;
+        let buy_entries = storage::load_buy_orders_ref(context, self.user, self.market_id)?;
+        let sell_entries = storage::load_sell_orders_ref(context, self.user, self.market_id)?;
+        let mark = storage::load_mark_price(context, self.market_id)?;
 
-        for fill in &self.fills {
-            if fill.taker_side != taker_side {
-                return Err(perp_invariant_err("taker settlement mixed fill sides"));
-            }
-            let fill_closing_qty = if (is_buy && pos.amount < 0) || (!is_buy && pos.amount > 0) {
-                fill.quantity.min(remaining_closing_qty)
-            } else {
-                0
-            };
-            remaining_closing_qty = remaining_closing_qty.saturating_sub(fill_closing_qty);
-            let fill_opening_qty = fill.quantity - fill_closing_qty;
-            // Conservation: floor the WHOLE matched quantity ONCE and derive the opening
-            // leg by subtraction, so the taker and maker attribute the SAME total quote to
-            // this fill (closing + opening == calc_value(price, fill.quantity)). Flooring the
-            // closing and opening legs independently lets the two parties' different
-            // close/open split boundaries floor to a different sum → a ±1 phantom mint/burn
-            // per asymmetric fill (Σ v_quote no longer conserved).
-            let fill_value = calc_value(
-                fill.price,
-                fill.quantity,
-                market.base_decimals,
-                market.price_decimals,
-            )?;
-            let fill_closing_value = calc_value(
-                fill.price,
-                fill_closing_qty,
-                market.base_decimals,
-                market.price_decimals,
-            )?;
-            let fill_opening_value = fill_value
-                .checked_sub(fill_closing_value)
-                .ok_or_else(|| perp_err("settlement: fill opening value underflow"))?;
-            closing_qty = closing_qty
-                .checked_add(fill_closing_qty)
-                .ok_or_else(|| perp_err("placeOrder: closing quantity overflow"))?;
-            closing_value = closing_value
-                .checked_add(fill_closing_value)
-                .ok_or_else(|| perp_err("placeOrder: closing value overflow"))?;
-            opening_qty = opening_qty
-                .checked_add(fill_opening_qty)
-                .ok_or_else(|| perp_err("placeOrder: opening quantity overflow"))?;
-            opening_value = opening_value
-                .checked_add(fill_opening_value)
-                .ok_or_else(|| perp_err("placeOrder: opening value overflow"))?;
-        }
-
-        let (opening_margin_required, bad_debt) = apply_position_fill(
+        let core = finalize_core(
             &mut pos,
-            &mut account.perp_wallet_balance,
-            closing_qty,
-            closing_value,
-            opening_qty,
-            opening_value,
-            is_buy,
-        )?;
-
-        // Open-into-insolvency guard (K9): a taker may not open/increase a
-        // position that is already below maintenance margin at the current mark.
-        // Together with the placement band this blocks manufacturing an insolvent
-        // position (the insurance-fund mint). Returning Err reverts the whole
-        // placeOrder tx. Skipped when mark is unset (0 — save_market fixtures;
-        // addMarket-created markets always have a mark). Closing/reducing is never
-        // gated: its realized loss beyond margin is legitimate bad debt (below).
-        if opening_qty > 0 {
-            let mark = storage::load_mark_price(context, self.market_id)?;
-            if mark > 0
-                && !is_above_maintenance_margin(
-                    mark,
-                    pos.amount,
-                    pos.v_quote_balance,
-                    pos.margin,
-                    market.base_decimals,
-                    market.price_decimals,
-                )?
-            {
-                return Err(perp_err("placeOrder: open would breach maintenance margin"));
-            }
-        }
-
-        // Isolated margin: a realized loss beyond the position's own margin is bad
-        // debt routed DIRECTLY to the Insurance Fund — never the taker's wallet.
-        // apply_position_fill already contained the loss within pos.margin.
-        absorb_bad_debt_into_insurance_fund(context, self.market_id, bad_debt)?;
-
-        // pos.amount changed; recompute margin_reserved so cross-side netting
-        // for the taker's remaining open orders reflects the new position size.
-        // MR delta is reconciled with wallet via mr_credit/mr_extra below;
-        // without this, W + M + MR is not conserved across the fill.
-        let old_mr = pos.margin_reserved;
-        recompute_maker_order_reserve_after_fill(
-            context,
-            self.user,
-            self.market_id,
-            &mut pos,
+            &mut account,
+            &buy_entries,
+            &sell_entries,
+            &self.fills,
+            taker_side,
+            mark,
+            self.taker_fee_bps,
             market,
         )?;
-        let new_mr = pos.margin_reserved;
-        let mr_credit = old_mr.saturating_sub(new_mr); // MR decreased: freed margin back to wallet
-        let mr_extra = new_mr.saturating_sub(old_mr); // MR increased: wallet must cover the gap
-        account.credit_perp(mr_credit)?;
 
-        let fee_notional = closing_value
-            .checked_add(opening_value)
-            .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
-        let fee = calc_trading_fee(fee_notional, self.taker_fee_bps)?;
-        let total_required = opening_margin_required
-            .checked_add(fee)
-            .ok_or_else(|| perp_err("placeOrder: opening margin + fee overflow"))?
-            .checked_add(mr_extra)
-            .ok_or_else(|| perp_err("placeOrder: total required overflow"))?;
+        // ── APPLY (taker accepted; same write/log sequence as the pre-extraction code) ──
+        if let Some(p) = pending_funding {
+            crate::perp_dex::funding::apply_funding_settlement(context, p)?;
+        }
+        absorb_bad_debt_into_insurance_fund(context, self.market_id, core.bad_debt)?;
+        let fee = core.fee;
+        let total_required = core.total_required;
 
         // Single save covers all position mutations (apply_position_fill +
         // recompute) and the PnL credit to wallet.
@@ -438,6 +345,143 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     // No order is auto-cancelled on a maker fill any more (isolated margin), so the
     // maker fill returns only the maker fee — no expired-order bookkeeping.
     Ok(MakerFillOutcome::Filled { maker_fee })
+}
+
+/// Effect summary of [`finalize_core`] (the pure taker-settlement decision).
+pub(super) struct TakerFillCore {
+    pub(super) bad_debt: u64,
+    pub(super) fee: u64,
+    pub(super) total_required: u64,
+}
+
+/// PURE core of [`TakerSettlement::finalize`] (commit-only #23, tranche-4): fill aggregation
+/// (conservation-exact close/open split), position fill, K9 open-into-insolvency guard, flip-aware
+/// reserve recompute + MR reconciliation, fee + total-required — over in-memory copies only, NO
+/// storage access. Any `Err` (K9 reject, checked arithmetic) fires before the caller has written
+/// anything. The entry lists are read-only here (the taker's lists are only mutated by the
+/// wallet-cover cancels, which remain in the storage wrapper).
+#[allow(clippy::too_many_arguments)]
+fn finalize_core(
+    pos: &mut crate::perp_dex::types::PerpPosition,
+    account: &mut crate::perp_dex::types::UserAccount,
+    buy_entries: &[crate::perp_dex::types::OrderEntry],
+    sell_entries: &[crate::perp_dex::types::OrderEntry],
+    fills: &[RecordedFill],
+    taker_side: Side,
+    mark_price: u64,
+    taker_fee_bps: u64,
+    market: &crate::perp_dex::types::Market,
+) -> Result<TakerFillCore, PrecompileError> {
+    let mut remaining_closing_qty = pos.amount.unsigned_abs();
+    let mut closing_qty = 0u64;
+    let mut closing_value = 0u64;
+    let mut opening_qty = 0u64;
+    let mut opening_value = 0u64;
+    let is_buy = taker_side == Side::Buy;
+
+    for fill in fills {
+        if fill.taker_side != taker_side {
+            return Err(perp_invariant_err("taker settlement mixed fill sides"));
+        }
+        let fill_closing_qty = if (is_buy && pos.amount < 0) || (!is_buy && pos.amount > 0) {
+            fill.quantity.min(remaining_closing_qty)
+        } else {
+            0
+        };
+        remaining_closing_qty = remaining_closing_qty.saturating_sub(fill_closing_qty);
+        let fill_opening_qty = fill.quantity - fill_closing_qty;
+        // Conservation: floor the WHOLE matched quantity ONCE and derive the opening leg by
+        // subtraction, so the taker and maker attribute the SAME total quote to this fill
+        // (closing + opening == calc_value(price, fill.quantity)); independent flooring lets the
+        // two parties' split boundaries floor to a different sum → ±1 phantom mint/burn.
+        let fill_value = calc_value(
+            fill.price,
+            fill.quantity,
+            market.base_decimals,
+            market.price_decimals,
+        )?;
+        let fill_closing_value = calc_value(
+            fill.price,
+            fill_closing_qty,
+            market.base_decimals,
+            market.price_decimals,
+        )?;
+        let fill_opening_value = fill_value
+            .checked_sub(fill_closing_value)
+            .ok_or_else(|| perp_err("settlement: fill opening value underflow"))?;
+        closing_qty = closing_qty
+            .checked_add(fill_closing_qty)
+            .ok_or_else(|| perp_err("placeOrder: closing quantity overflow"))?;
+        closing_value = closing_value
+            .checked_add(fill_closing_value)
+            .ok_or_else(|| perp_err("placeOrder: closing value overflow"))?;
+        opening_qty = opening_qty
+            .checked_add(fill_opening_qty)
+            .ok_or_else(|| perp_err("placeOrder: opening quantity overflow"))?;
+        opening_value = opening_value
+            .checked_add(fill_opening_value)
+            .ok_or_else(|| perp_err("placeOrder: opening value overflow"))?;
+    }
+
+    let (opening_margin_required, bad_debt) = apply_position_fill(
+        pos,
+        &mut account.perp_wallet_balance,
+        closing_qty,
+        closing_value,
+        opening_qty,
+        opening_value,
+        is_buy,
+    )?;
+
+    // Open-into-insolvency guard (K9): a taker may not open/increase a position that is already
+    // below maintenance margin at the current mark. Skipped when mark is unset (0). Closing/
+    // reducing is never gated: its realized loss beyond margin is legitimate bad debt.
+    if opening_qty > 0
+        && mark_price > 0
+        && !is_above_maintenance_margin(
+            mark_price,
+            pos.amount,
+            pos.v_quote_balance,
+            pos.margin,
+            market.base_decimals,
+            market.price_decimals,
+        )?
+    {
+        return Err(perp_err("placeOrder: open would breach maintenance margin"));
+    }
+
+    // pos.amount changed; recompute margin_reserved so cross-side netting for the taker's
+    // remaining open orders reflects the new position size. MR delta reconciles with the wallet
+    // via mr_credit/mr_extra; without this, W + M + MR is not conserved across the fill.
+    let old_mr = pos.margin_reserved;
+    let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
+        buy_entries,
+        sell_entries,
+        market.base_decimals,
+        market.price_decimals,
+        pos.amount,
+    )?;
+    pos.set_reservations(buy_notional, sell_notional, c_notional, pos.leverage);
+    let new_mr = pos.margin_reserved;
+    let mr_credit = old_mr.saturating_sub(new_mr); // MR decreased: freed margin back to wallet
+    let mr_extra = new_mr.saturating_sub(old_mr); // MR increased: wallet must cover the gap
+    account.credit_perp(mr_credit)?;
+
+    let fee_notional = closing_value
+        .checked_add(opening_value)
+        .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
+    let fee = calc_trading_fee(fee_notional, taker_fee_bps)?;
+    let total_required = opening_margin_required
+        .checked_add(fee)
+        .ok_or_else(|| perp_err("placeOrder: opening margin + fee overflow"))?
+        .checked_add(mr_extra)
+        .ok_or_else(|| perp_err("placeOrder: total required overflow"))?;
+
+    Ok(TakerFillCore {
+        bad_debt,
+        fee,
+        total_required,
+    })
 }
 
 /// Outcome of [`settle_maker_fill_core`]: the pure maker-fill decision + its effect summary.

@@ -9,7 +9,7 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 use crate::{
     perp_dex::{
         errors::perp_err,
-        funding::{apply_funding_settlement, compute_funding_settlement, settle_position_funding},
+        funding::{apply_funding_settlement, compute_funding_settlement},
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
             getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
