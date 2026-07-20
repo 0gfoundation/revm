@@ -164,6 +164,39 @@ impl TakerSettlement {
             market,
         )?;
 
+        // commit-only #23: decide wallet-cover feasibility PRE-WRITE by simulating the LIFO
+        // same-side cancels on working copies. Shares release_margin_core with the real cancel
+        // path below, so the simulation and the apply-phase loop cannot diverge. If even
+        // cancelling every same-side order leaves the wallet short, reject HERE — before the
+        // funding/IF/save writes below (the real loop's final check becomes an invariant).
+        if !account.has_available_perp(core.total_required) {
+            let mut sim_pos = pos.clone();
+            let mut sim_account = account.clone();
+            let mut sim_buy = buy_entries.to_vec();
+            let mut sim_sell = sell_entries.to_vec();
+            loop {
+                if sim_account.has_available_perp(core.total_required) {
+                    break;
+                }
+                let next = match taker_side {
+                    Side::Buy => sim_buy.last().map(|e| e.order_id),
+                    Side::Sell => sim_sell.last().map(|e| e.order_id),
+                };
+                let Some(oid) = next else {
+                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                };
+                super::release_margin_core(
+                    &mut sim_pos,
+                    &mut sim_account,
+                    &mut sim_buy,
+                    &mut sim_sell,
+                    taker_side,
+                    &oid,
+                    market,
+                )?;
+            }
+        }
+
         // ── APPLY (taker accepted; same write/log sequence as the pre-extraction code) ──
         if let Some(p) = pending_funding {
             crate::perp_dex::funding::apply_funding_settlement(context, p)?;
