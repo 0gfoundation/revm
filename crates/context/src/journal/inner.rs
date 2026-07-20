@@ -58,6 +58,25 @@ struct PerpUndo {
     prev: Option<PerpEntry>,
 }
 
+/// Commit-only migration tripwire (catalog #23). Counts `checkpoint_revert`s that actually rolled
+/// back a NON-EMPTY perp write set — each one is a live "write-then-error" path that, under a
+/// commit-only model (no undo), would leave a partial write and corrupt state. The migration to
+/// validate-then-apply drives this counter to ZERO across the full test battery + realistic
+/// workloads; only once it stays zero is it safe to delete the undo machinery. Undo still runs as
+/// the safety net until then. Read/reset via [`perp_undo_rollback_count`] /
+/// [`reset_perp_undo_rollback_count`].
+pub static PERP_UNDO_ROLLBACKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Reads the commit-only migration tripwire counter (see [`PERP_UNDO_ROLLBACKS`]).
+pub fn perp_undo_rollback_count() -> u64 {
+    PERP_UNDO_ROLLBACKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resets the commit-only migration tripwire counter to zero.
+pub fn reset_perp_undo_rollback_count() {
+    PERP_UNDO_ROLLBACKS.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// One off-trie overlay value (#16d Phase 2). A typed `save_*` write stores the DESERIALIZED blob
 /// (`Struct`) and defers serialization to block end; a raw byte write (`store_blob`, e.g. level
 /// queues) stores `Bytes`. Both lower to the canonical off-trie bytes via `into_bytes`/`to_bytes`;
@@ -937,6 +956,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
 
         // Revert off-trie PerpDEX overlay writes made after the checkpoint, in lock-step with
         // the EVM journal entries above.
+        // Commit-only migration tripwire (#23): a NON-EMPTY rollback here is a live
+        // write-then-error path. Undo still runs (safety net) until the migration proves this
+        // never fires across the battery, after which the undo machinery is removed.
+        if checkpoint.perp_journal_i < self.perp.undo.len() {
+            PERP_UNDO_ROLLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         self.perp.undo_to(checkpoint.perp_journal_i);
 
         // Truncate the per-call commitment log back to its checkpoint length, dropping the framed
