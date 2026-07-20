@@ -365,115 +365,59 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     let maker_side = taker_side.opposite();
     let mut pos = storage::load_position(context, maker, market_id)?;
     let mut account = storage::load_account(context, maker)?;
-    // Settle accrued funding on the maker's pre-fill position before its size changes.
-    // This ALWAYS persists (below), on both the filled and rejected paths: funding is
-    // owed independent of the fill, and apply_funding_payment may already have drawn
-    // from the Insurance Fund inline — rolling the position back while leaving that IF
-    // write would leak value.
-    crate::perp_dex::funding::settle_position_funding(
+    // Funding is owed independent of the fill outcome, so it persists on BOTH the filled and
+    // rejected paths — computed in memory here (commit-only #23), applied below.
+    let pending_funding = crate::perp_dex::funding::compute_funding_settlement(
         context,
         maker,
         market,
         &mut pos,
         &mut account.perp_wallet_balance,
     )?;
-    // Snapshot before mutations — used to verify and release the pre-fill
-    // reservation. MUST be the flip-aware reservation (pos.margin_reserved), the
-    // same quantity new_reserved is recomputed as below: comparing a flip-aware
-    // new_reserved against a max-of-side old_reserved would mismatch the two ends
-    // of the deficit test and make it fire spuriously.
-    let old_reserved = pos.margin_reserved;
+    let mut buy_entries = storage::load_buy_orders(context, maker, market_id)?;
+    let mut sell_entries = storage::load_sell_orders(context, maker, market_id)?;
+    let mark = storage::load_mark_price(context, market_id)?;
 
-    // Compute the fill on a TRIAL clone first (single computation — the trial result
-    // is adopted verbatim on the accept path, never recomputed). Nothing is persisted
-    // until the solvency decision.
-    let fill = split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market)?;
-    let mut trial_pos = pos.clone();
-    let mut trial_wallet = account.perp_wallet_balance;
-    let (opening_margin, bad_debt) = apply_position_fill(
-        &mut trial_pos,
-        &mut trial_wallet,
-        fill.closing_qty,
-        fill.closing_value,
-        fill.opening_qty,
-        fill.opening_value,
-        fill.is_buy,
-    )?;
-
-    // Open-into-insolvency guard (K9): a fill may not open/increase the maker's
-    // position below maintenance margin at the current mark (the mint precondition
-    // for a stale resting order swept after a mark move). Skipped when mark == 0.
-    // Closing/reducing is never gated — its realized loss beyond margin is legitimate
-    // bad debt (absorbed below on the accept path).
-    if fill.opening_qty > 0 {
-        let mark = storage::load_mark_price(context, market_id)?;
-        if mark > 0
-            && !is_above_maintenance_margin(
-                mark,
-                trial_pos.amount,
-                trial_pos.v_quote_balance,
-                trial_pos.margin,
-                market.base_decimals,
-                market.price_decimals,
-            )?
-        {
-            // Reject: persist ONLY the funding-settled (pre-fill) position — the fill
-            // is skipped and the caller cancels the order. Do NOT reduce the order
-            // entry or absorb the fill's bad debt.
-            storage::save_position(context, maker, market_id, &pos)?;
-            storage::save_account(context, maker, account)?;
-            return Ok(MakerFillOutcome::RejectedInsolvent);
-        }
-    }
-
-    // Accept: adopt the trial result verbatim. Keep the persisted-write order
-    // identical to the pre-guard code (reduce_order → absorb IF → saves) so the
-    // block commitment is unchanged for filled makers.
-    pos = trial_pos;
-    account.perp_wallet_balance = trial_wallet;
-
-    let maker_fee = reduce_maker_order_entry_for_fill(
-        context,
-        maker,
-        market_id,
+    let core = settle_maker_fill_core(
+        &mut pos,
+        &mut account,
+        &mut buy_entries,
+        &mut sell_entries,
+        mark,
         maker_side,
         maker_order_id,
+        fill_price,
         fill_qty,
         market,
     )?;
 
-    // Isolated margin: a realized loss beyond the position's own margin is bad debt
-    // routed DIRECTLY to the Insurance Fund — never the maker's wallet or other
-    // positions. apply_position_fill already contained the loss within pos.margin.
-    absorb_bad_debt_into_insurance_fund(context, market_id, bad_debt)?;
+    let (maker_fee, bad_debt) = match core {
+        MakerFillCore::RejectedInsolvent => {
+            // Reject: persist ONLY the funding-settled (pre-fill) position — the fill is
+            // skipped and the caller cancels the order. No entry reduce, no bad-debt absorb.
+            if let Some(p) = pending_funding {
+                crate::perp_dex::funding::apply_funding_settlement(context, p)?;
+            }
+            storage::save_position(context, maker, market_id, &pos)?;
+            storage::save_account(context, maker, account)?;
+            return Ok(MakerFillOutcome::RejectedInsolvent);
+        }
+        MakerFillCore::Filled {
+            maker_fee,
+            bad_debt,
+        } => (maker_fee, bad_debt),
+    };
 
-    // Must run after reduce_maker_order_entry_for_fill (order list changed) and
-    // reflects the new pos.amount; cross-side netting depends on the updated position.
-    let new_reserved =
-        recompute_maker_order_reserve_after_fill(context, maker, market_id, &mut pos, market)?;
-
-    pos.fee_reserved = pos.fee_reserved.saturating_sub(maker_fee);
-
-    // opening_margin ≤ old_reserved is guaranteed; this is how much of old_reserved
-    // is free to cover new_reserved after pos.margin is funded.
-    let max_sustainable_reserved = old_reserved.saturating_sub(opening_margin);
-
-    if new_reserved > max_sustainable_reserved {
-        // Reserve-deficit: the post-fill flip-aware reservation needs marginally more
-        // MR than the pre-fill reservation leaves after funding opening_margin. Post
-        // formula-C this only ever fires as a ≤1-unit floor-rounding residual in
-        // high-decimal markets. Isolated margin: do NOT debit the wallet or cancel
-        // orders. Clamp the stored reservation to what is actually backed
-        // (max_sustainable_reserved) so the cancel-release stays exact — a ≤1-unit
-        // conservative under-reservation, well within formula-C's tightness.
-        pos.margin_reserved = max_sustainable_reserved;
-    } else {
-        let net_release = old_reserved
-            .saturating_sub(new_reserved)
-            .saturating_sub(opening_margin);
-        account.credit_perp(net_release)?;
+    // Accept path — same write/log sequence as before the core extraction: funding (IF + logs),
+    // maker-side entry list, bad-debt absorb (IF + logs), pos/account, fee credit, PositionChanged.
+    if let Some(p) = pending_funding {
+        crate::perp_dex::funding::apply_funding_settlement(context, p)?;
     }
-
+    match maker_side {
+        Side::Buy => storage::save_buy_orders(context, maker, market_id, &buy_entries)?,
+        Side::Sell => storage::save_sell_orders(context, maker, market_id, &sell_entries)?,
+    }
+    absorb_bad_debt_into_insurance_fund(context, market_id, bad_debt)?;
     storage::save_position(context, maker, market_id, &pos)?;
     storage::save_account(context, maker, account)?;
     credit_fee_recipient(context, market_id, maker_fee)?;
@@ -494,6 +438,110 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     // No order is auto-cancelled on a maker fill any more (isolated margin), so the
     // maker fill returns only the maker fee — no expired-order bookkeeping.
     Ok(MakerFillOutcome::Filled { maker_fee })
+}
+
+/// Outcome of [`settle_maker_fill_core`]: the pure maker-fill decision + its effect summary.
+pub(super) enum MakerFillCore {
+    Filled { maker_fee: u64, bad_debt: u64 },
+    RejectedInsolvent,
+}
+
+/// PURE core of [`settle_maker_fill`] (commit-only #23, tranche-4): the complete maker-fill
+/// decision sequence — trial fill, K9 open-into-insolvency guard, entry reduce, flip-aware
+/// reserve recompute, net release — over in-memory working copies only. NO storage access, so the
+/// match compute phase can run it to full fidelity before any write. The caller has already
+/// computed funding on `pos`/`account` (funding persists regardless of outcome) and supplies both
+/// order-entry lists (the maker side is reduced; both feed the reserve recompute).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn settle_maker_fill_core(
+    pos: &mut crate::perp_dex::types::PerpPosition,
+    account: &mut crate::perp_dex::types::UserAccount,
+    buy_entries: &mut Vec<crate::perp_dex::types::OrderEntry>,
+    sell_entries: &mut Vec<crate::perp_dex::types::OrderEntry>,
+    mark_price: u64,
+    maker_side: Side,
+    maker_order_id: &[u8; 32],
+    fill_price: u64,
+    fill_qty: u64,
+    market: &crate::perp_dex::types::Market,
+) -> Result<MakerFillCore, PrecompileError> {
+    // Snapshot before mutations — used to verify and release the pre-fill reservation. MUST be
+    // the flip-aware reservation (pos.margin_reserved), the same quantity new_reserved is
+    // recomputed as below.
+    let old_reserved = pos.margin_reserved;
+
+    // Compute the fill on a TRIAL clone first (single computation — adopted verbatim on accept).
+    let fill = split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market)?;
+    let mut trial_pos = pos.clone();
+    let mut trial_wallet = account.perp_wallet_balance;
+    let (opening_margin, bad_debt) = apply_position_fill(
+        &mut trial_pos,
+        &mut trial_wallet,
+        fill.closing_qty,
+        fill.closing_value,
+        fill.opening_qty,
+        fill.opening_value,
+        fill.is_buy,
+    )?;
+
+    // Open-into-insolvency guard (K9): a fill may not open/increase the maker's position below
+    // maintenance margin at the current mark. Skipped when mark == 0. Closing/reducing is never
+    // gated — its realized loss beyond margin is legitimate bad debt (absorbed on accept).
+    if fill.opening_qty > 0
+        && mark_price > 0
+        && !is_above_maintenance_margin(
+            mark_price,
+            trial_pos.amount,
+            trial_pos.v_quote_balance,
+            trial_pos.margin,
+            market.base_decimals,
+            market.price_decimals,
+        )?
+    {
+        return Ok(MakerFillCore::RejectedInsolvent);
+    }
+
+    // Accept: adopt the trial result verbatim.
+    *pos = trial_pos;
+    account.perp_wallet_balance = trial_wallet;
+
+    let (entries, label) = match maker_side {
+        Side::Buy => (&mut *buy_entries, "buy"),
+        Side::Sell => (&mut *sell_entries, "sell"),
+    };
+    let maker_fee = reduce_order_entry_core(entries, maker_order_id, fill_qty, market, label)?;
+
+    // Flip-aware reserve recompute (must follow the entry reduce + reflect the new pos.amount).
+    let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
+        buy_entries,
+        sell_entries,
+        market.base_decimals,
+        market.price_decimals,
+        pos.amount,
+    )?;
+    pos.set_reservations(buy_notional, sell_notional, c_notional, pos.leverage);
+    let new_reserved = pos.margin_reserved;
+
+    pos.fee_reserved = pos.fee_reserved.saturating_sub(maker_fee);
+
+    // opening_margin ≤ old_reserved is guaranteed; this is how much of old_reserved is free to
+    // cover new_reserved after pos.margin is funded.
+    let max_sustainable_reserved = old_reserved.saturating_sub(opening_margin);
+    if new_reserved > max_sustainable_reserved {
+        // Reserve-deficit (≤1-unit floor-rounding residual post formula-C): clamp the stored
+        // reservation to what is actually backed so the cancel-release stays exact.
+        pos.margin_reserved = max_sustainable_reserved;
+    } else {
+        let net_release = old_reserved
+            .saturating_sub(new_reserved)
+            .saturating_sub(opening_margin);
+        account.credit_perp(net_release)?;
+    }
+
+    Ok(MakerFillCore::Filled {
+        maker_fee,
+        bad_debt,
+    })
 }
 
 /// Deducts a trading fee from the wallet.
