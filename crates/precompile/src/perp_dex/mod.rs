@@ -208,6 +208,16 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         None => return Err(PrecompileError::StatefulInvalidInput),
     };
 
+    // commit-only #23: EOA-direct calls only. Perp writes are commit-only (the per-op undo is
+    // being removed), so no enclosing frame that could revert AFTER a successful perp call may
+    // exist. Frame depth: a top-level (tx-level) call executes at depth 1 (0 when unit tests
+    // invoke this entry directly); ANY contract-mediated call — CALL or DELEGATECALL (which
+    // spoofs caller==origin but still adds a frame) — is deeper and is rejected. The in-process
+    // liquidation sweep is a plain function call inside this same frame, unaffected.
+    if context.journal_mut().depth() > 1 {
+        return Err(errors::perp_err("perpdex: EOA direct calls only"));
+    }
+
     // Dispatch — note: no `?` here; errors are caught below and converted to
     // clean REVERT output so ethers.js can read `e.reason`.
     let result = match selector {
