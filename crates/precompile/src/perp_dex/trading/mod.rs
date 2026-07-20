@@ -876,6 +876,7 @@ pub(super) fn match_order<CTX: ContextTr>(
     // Nothing reads it from storage mid-match: the registry touches only the makers, finalize
     // touches the taker's position/account, and the taker order is not in any book queue yet.
 
+    let _walk_t0 = std::time::Instant::now();
     match side {
         Side::Buy => {
             // Match against asks (sorted ASC: lowest ask first).
@@ -1232,6 +1233,8 @@ pub(super) fn match_order<CTX: ContextTr>(
         }
     }
 
+    storage::add_match_walk_ns(_walk_t0.elapsed().as_nanos() as u64);
+
     // ── commit-only #23 L2b: the walk above performed ZERO storage writes (all effects live in
     // the registry copies + ordered events), so every genuine reject here leaves state untouched.
 
@@ -1256,11 +1259,15 @@ pub(super) fn match_order<CTX: ContextTr>(
     } else {
         None
     };
+    let _fin_t0 = std::time::Instant::now();
     let taker_plan =
         taker_settlement.finalize_compute(context, &mut registry, side, market, rest_req)?;
+    storage::add_match_finalize_ns(_fin_t0.elapsed().as_nanos() as u64);
 
     // ── APPLY (no genuine rejects past this point) ──
+    let _flush_t0 = std::time::Instant::now();
     registry.flush(context, market_id)?;
+    storage::add_match_flush_ns(_flush_t0.elapsed().as_nanos() as u64);
     if let Some(plan) = taker_plan {
         settlement::finalize_apply(context, plan, side, market)?;
     }

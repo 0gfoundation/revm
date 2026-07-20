@@ -163,84 +163,136 @@ impl TakerSettlement {
             market,
         )?;
 
-        // Model the taker's post-APPLY state on clones (what finalize_apply + rest_in_book will see
-        // in storage): fill-cover LIFO cancels for `total_required`, then debit `total_required`.
-        // Uses release_margin_core — the SAME primitive finalize_apply's real cancel loop uses — so
-        // the simulation cannot diverge from what actually gets written.
-        let mut sim_pos = w.pos.clone();
-        let mut sim_account = w.account.clone();
-        let mut sim_buy = w.buy_entries.clone();
-        let mut sim_sell = w.sell_entries.clone();
-        while !sim_account.has_available_perp(core.total_required) {
-            let next = match taker_side {
-                Side::Buy => sim_buy.last().map(|e| e.order_id),
-                Side::Sell => sim_sell.last().map(|e| e.order_id),
-            };
-            let Some(oid) = next else {
-                return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
-            };
-            super::release_margin_core(
-                &mut sim_pos,
-                &mut sim_account,
-                &mut sim_buy,
-                &mut sim_sell,
-                taker_side,
-                &oid,
-                market,
-            )?;
-        }
-        // Debit the fill requirement (finalize_apply does this to storage).
-        sim_account.debit_perp(core.total_required)?;
+        // commit-only #23 perf (Level 2): the resting remainder's reservation delta is computed
+        // CLONE-FREE — temporarily insert the entry into the taker's REAL list, measure, then
+        // remove it (Vec insert+remove at the same index is an exact identity restore), cloning
+        // only an O(1) PerpPosition. The list is left pristine for flush.
+        let rest_delta = match &rest {
+            Some(r) => {
+                let entry = crate::perp_dex::types::OrderEntry {
+                    order_id: [0u8; 32],
+                    price: r.price,
+                    amount: r.qty,
+                    maker_fee_bps: r.maker_fee_bps,
+                };
+                let old_mr = w.pos.margin_reserved;
+                let idx = match taker_side {
+                    Side::Buy => {
+                        let i = w.buy_entries.partition_point(|e| e.price > r.price);
+                        w.buy_entries.insert(i, entry);
+                        i
+                    }
+                    Side::Sell => {
+                        let i = w.sell_entries.partition_point(|e| e.price < r.price);
+                        w.sell_entries.insert(i, entry);
+                        i
+                    }
+                };
+                let res = calc_reservation_notionals(
+                    &w.buy_entries,
+                    &w.sell_entries,
+                    market.base_decimals,
+                    market.price_decimals,
+                    w.pos.amount,
+                );
+                // Restore the list BEFORE propagating any error, so w stays pristine for flush.
+                match taker_side {
+                    Side::Buy => {
+                        w.buy_entries.remove(idx);
+                    }
+                    Side::Sell => {
+                        w.sell_entries.remove(idx);
+                    }
+                }
+                let (bn, sn, cn) = res?;
+                let mut tp = w.pos.clone();
+                tp.set_reservations(bn, sn, cn, w.pos.leverage);
+                let margin_delta = tp.margin_reserved.saturating_sub(old_mr);
+                let order_fee =
+                    calc_maker_fee_for_order_qty_with_bps(r.price, r.qty, r.maker_fee_bps, market)?;
+                margin_delta
+                    .checked_add(order_fee)
+                    .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?
+            }
+            None => 0,
+        };
+        let need = core
+            .total_required
+            .checked_add(rest_delta)
+            .ok_or_else(|| perp_err("placeOrder: fills+rest requirement overflow"))?;
 
-        // Rest feasibility: replay rest_in_book's reservation math on the post-apply sim state
-        // (identical shared primitives), rejecting the WHOLE order pre-write if the remainder
-        // cannot be booked. NOTE: no additional cover-cancels here — the rest must fit from what
-        // the fill-cover left, matching the pre-commit-only "rest Errs → whole order reverts".
-        if let Some(r) = rest {
-            let new_entry = crate::perp_dex::types::OrderEntry {
-                order_id: [0u8; 32],
-                price: r.price,
-                amount: r.qty,
-                maker_fee_bps: r.maker_fee_bps,
-            };
-            let (entries, other): (&mut Vec<_>, &Vec<_>) = match taker_side {
-                Side::Buy => {
-                    let idx = sim_buy.partition_point(|e| e.price > r.price);
-                    sim_buy.insert(idx, new_entry);
-                    (&mut sim_buy, &sim_sell)
+        // LEVEL 1 fast path (the common case): the taker's wallet already covers fills + rest with
+        // NO same-side cancels → produce the plan with ZERO order-list clones. Correct because
+        // has_available(total_required + rest_delta) implies no cover is needed AND the post-fill
+        // leftover (wallet − total_required) ≥ rest_delta, so finalize_apply's real cover loop does
+        // nothing and rest_in_book's check passes. Only a genuinely tight taker falls to the cover
+        // simulation below.
+        if !w.account.has_available_perp(need) {
+            // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
+            // release_margin_core so the sim cannot diverge from finalize_apply's real loop. Rest
+            // feasibility is re-checked on the POST-cover sim list (cover shrinks the taker side,
+            // changing the rest reservation — so rest_delta above, computed pre-cover, is only used
+            // for the fast-path check; the cover branch re-derives it post-cover).
+            let mut sim_pos = w.pos.clone();
+            let mut sim_account = w.account.clone();
+            let mut sim_buy = w.buy_entries.clone();
+            let mut sim_sell = w.sell_entries.clone();
+            storage::note_order_list_clone(sim_buy.len());
+            storage::note_order_list_clone(sim_sell.len());
+            while !sim_account.has_available_perp(core.total_required) {
+                let next = match taker_side {
+                    Side::Buy => sim_buy.last().map(|e| e.order_id),
+                    Side::Sell => sim_sell.last().map(|e| e.order_id),
+                };
+                let Some(oid) = next else {
+                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                };
+                super::release_margin_core(
+                    &mut sim_pos,
+                    &mut sim_account,
+                    &mut sim_buy,
+                    &mut sim_sell,
+                    taker_side,
+                    &oid,
+                    market,
+                )?;
+            }
+            sim_account.debit_perp(core.total_required)?;
+            if let Some(r) = &rest {
+                let new_entry = crate::perp_dex::types::OrderEntry {
+                    order_id: [0u8; 32],
+                    price: r.price,
+                    amount: r.qty,
+                    maker_fee_bps: r.maker_fee_bps,
+                };
+                match taker_side {
+                    Side::Buy => {
+                        let i = sim_buy.partition_point(|e| e.price > r.price);
+                        sim_buy.insert(i, new_entry);
+                    }
+                    Side::Sell => {
+                        let i = sim_sell.partition_point(|e| e.price < r.price);
+                        sim_sell.insert(i, new_entry);
+                    }
                 }
-                Side::Sell => {
-                    let idx = sim_sell.partition_point(|e| e.price < r.price);
-                    sim_sell.insert(idx, new_entry);
-                    (&mut sim_sell, &sim_buy)
-                }
-            };
-            let (bn, sn, cn) = match taker_side {
-                Side::Buy => calc_reservation_notionals(
-                    entries,
-                    other,
+                let (bn, sn, cn) = calc_reservation_notionals(
+                    &sim_buy,
+                    &sim_sell,
                     market.base_decimals,
                     market.price_decimals,
                     sim_pos.amount,
-                )?,
-                Side::Sell => calc_reservation_notionals(
-                    other,
-                    entries,
-                    market.base_decimals,
-                    market.price_decimals,
-                    sim_pos.amount,
-                )?,
-            };
-            let old_reserved = sim_pos.margin_reserved;
-            sim_pos.set_reservations(bn, sn, cn, sim_pos.leverage);
-            let margin_delta = sim_pos.margin_reserved.saturating_sub(old_reserved);
-            let order_fee =
-                calc_maker_fee_for_order_qty_with_bps(r.price, r.qty, r.maker_fee_bps, market)?;
-            let delta = margin_delta
-                .checked_add(order_fee)
-                .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
-            if !sim_account.has_available_perp(delta) {
-                return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                )?;
+                let old_reserved = sim_pos.margin_reserved;
+                sim_pos.set_reservations(bn, sn, cn, sim_pos.leverage);
+                let margin_delta = sim_pos.margin_reserved.saturating_sub(old_reserved);
+                let order_fee =
+                    calc_maker_fee_for_order_qty_with_bps(r.price, r.qty, r.maker_fee_bps, market)?;
+                let delta = margin_delta
+                    .checked_add(order_fee)
+                    .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
+                if !sim_account.has_available_perp(delta) {
+                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                }
             }
         }
 
