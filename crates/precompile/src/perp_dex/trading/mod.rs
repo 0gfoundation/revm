@@ -820,7 +820,7 @@ pub(super) fn match_order<CTX: ContextTr>(
     limit_price: u64,
     quantity: u64,
     order_type: OrderType,
-    _tif: TimeInForce,
+    tif: TimeInForce,
     market: &crate::perp_dex::types::Market,
     // When true (liquidation close), the taker pays no trading fee.
     waive_taker_fee: bool,
@@ -846,6 +846,7 @@ pub(super) fn match_order<CTX: ContextTr>(
             let ask_prices = storage::load_ask_prices_ref(context, market_id)?;
             let old_best_ask = ask_prices.first().copied().unwrap_or(0);
             let mut ask_levels_cleared = false;
+            let mut removed_asks: Vec<u64> = Vec::new();
             'outer: for ask_price in ask_prices.iter().copied() {
                 // For limit buy: only match if ask_price <= our limit.
                 if order_type == OrderType::Limit && ask_price > limit_price {
@@ -859,10 +860,18 @@ pub(super) fn match_order<CTX: ContextTr>(
                     if remaining == 0 {
                         new_queue.extend(queue[qi..].iter().copied());
                         if new_queue.is_empty() {
-                            storage::remove_ask_price(context, market_id, ask_price)?;
+                            registry.push_event(settlement::MatchEvent::RemovePrice {
+                                is_bid: false,
+                                price: ask_price,
+                            });
+                            removed_asks.push(ask_price);
                             ask_levels_cleared = true;
                         }
-                        storage::save_ask_level(context, market_id, ask_price, &new_queue)?;
+                        registry.push_event(settlement::MatchEvent::SaveLevel {
+                            is_bid: false,
+                            price: ask_price,
+                            queue: new_queue,
+                        });
                         break 'outer;
                     }
                     let maker_id = queue[qi];
@@ -979,18 +988,36 @@ pub(super) fn match_order<CTX: ContextTr>(
                 }
 
                 if new_queue.is_empty() {
-                    storage::remove_ask_price(context, market_id, ask_price)?;
+                    registry.push_event(settlement::MatchEvent::RemovePrice {
+                        is_bid: false,
+                        price: ask_price,
+                    });
+                    removed_asks.push(ask_price);
                     ask_levels_cleared = true;
                 }
-                storage::save_ask_level(context, market_id, ask_price, &new_queue)?;
+                registry.push_event(settlement::MatchEvent::SaveLevel {
+                    is_bid: false,
+                    price: ask_price,
+                    queue: new_queue,
+                });
             }
             if ask_levels_cleared {
-                let best_ask = storage::refresh_best_ask(context, market_id)?;
+                // New best ask from the walk's own knowledge: the price-index snapshot minus the
+                // levels this match emptied — identical to what refresh_best_ask reads after the
+                // (deferred) removals are applied.
+                let best_ask = ask_prices
+                    .iter()
+                    .copied()
+                    .find(|p| !removed_asks.contains(p))
+                    .unwrap_or(0);
+                registry.push_event(settlement::MatchEvent::SaveBest {
+                    is_bid: false,
+                    price: best_ask,
+                });
                 if best_ask != old_best_ask {
                     let best_bid = storage::load_best_bid(context, market_id)?;
-                    record_mid_price_sample_for_best_quote_change(
-                        context, market_id, best_bid, best_ask,
-                    )?;
+                    registry
+                        .push_event(settlement::MatchEvent::MidPriceSample { best_bid, best_ask });
                 }
             }
         }
@@ -999,6 +1026,7 @@ pub(super) fn match_order<CTX: ContextTr>(
             let bid_prices = storage::load_bid_prices_ref(context, market_id)?;
             let old_best_bid = bid_prices.last().copied().unwrap_or(0); // bids: best = max
             let mut bid_levels_cleared = false;
+            let mut removed_bids: Vec<u64> = Vec::new();
             'outer: for bid_price in bid_prices.iter().rev().copied() {
                 // For limit sell: only match if bid_price >= our limit.
                 if order_type == OrderType::Limit && bid_price < limit_price {
@@ -1012,10 +1040,18 @@ pub(super) fn match_order<CTX: ContextTr>(
                     if remaining == 0 {
                         new_queue.extend(queue[qi..].iter().copied());
                         if new_queue.is_empty() {
-                            storage::remove_bid_price(context, market_id, bid_price)?;
+                            registry.push_event(settlement::MatchEvent::RemovePrice {
+                                is_bid: true,
+                                price: bid_price,
+                            });
+                            removed_bids.push(bid_price);
                             bid_levels_cleared = true;
                         }
-                        storage::save_bid_level(context, market_id, bid_price, &new_queue)?;
+                        registry.push_event(settlement::MatchEvent::SaveLevel {
+                            is_bid: true,
+                            price: bid_price,
+                            queue: new_queue,
+                        });
                         break 'outer;
                     }
                     let maker_id = queue[qi];
@@ -1125,35 +1161,64 @@ pub(super) fn match_order<CTX: ContextTr>(
                 }
 
                 if new_queue.is_empty() {
-                    storage::remove_bid_price(context, market_id, bid_price)?;
+                    registry.push_event(settlement::MatchEvent::RemovePrice {
+                        is_bid: true,
+                        price: bid_price,
+                    });
+                    removed_bids.push(bid_price);
                     bid_levels_cleared = true;
                 }
-                storage::save_bid_level(context, market_id, bid_price, &new_queue)?;
+                registry.push_event(settlement::MatchEvent::SaveLevel {
+                    is_bid: true,
+                    price: bid_price,
+                    queue: new_queue,
+                });
             }
             if bid_levels_cleared {
-                let best_bid = storage::refresh_best_bid(context, market_id)?;
+                // New best bid = max non-removed price in the snapshot (mirrors refresh_best_bid
+                // reading the index after the deferred removals).
+                let best_bid = bid_prices
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|p| !removed_bids.contains(p))
+                    .unwrap_or(0);
+                registry.push_event(settlement::MatchEvent::SaveBest {
+                    is_bid: true,
+                    price: best_bid,
+                });
                 if best_bid != old_best_bid {
                     let best_ask = storage::load_best_ask(context, market_id)?;
-                    record_mid_price_sample_for_best_quote_change(
-                        context, market_id, best_bid, best_ask,
-                    )?;
+                    registry
+                        .push_event(settlement::MatchEvent::MidPriceSample { best_bid, best_ask });
                 }
             }
         }
     }
 
-    // Flush the per-user working copies BEFORE the taker settlement: on a self-match (the taker
-    // filling their own resting order — no self-trade prevention by design) the taker is also a
-    // registry user, and finalize must read the maker-side effects from storage as it did when
-    // the loop saved per fill.
-    registry.flush(context, market_id)?;
+    // ── commit-only #23 L2b: the walk above performed ZERO storage writes (all effects live in
+    // the registry copies + ordered events), so every genuine reject here leaves state untouched.
 
-    // Persist the taker order once with its accumulated fill (saved here, not per fill,
-    // since nothing reads it during the match). Skipped when nothing matched.
+    // 1. FOK: unfillable → reject with zero writes (previously the whole match committed and the
+    //    caller's post-hoc check reverted it via undo).
+    if tif == TimeInForce::Fok && remaining > 0 {
+        return Err(perp_err("placeOrder: FOK order cannot be fully filled"));
+    }
+
+    // 2. Taker settlement compute: K9 open-into-insolvency / wallet-cover / checked-arithmetic
+    //    rejects — all pre-write. The taker joins the registry (self-match reuses the evolved
+    //    copies) and its fill effects are flushed with everyone else's below.
+    let taker_plan = taker_settlement.finalize_compute(context, &mut registry, side, market)?;
+
+    // ── APPLY (no genuine rejects past this point) ──
+    registry.flush(context, market_id)?;
+    // Persist the taker order once with its accumulated fill. Skipped when nothing matched.
     if remaining < quantity {
         storage::save_order(context, taker_order_id, &taker_order)?;
     }
-    taker_settlement.finalize(context, side, market)?;
+    if let Some(plan) = taker_plan {
+        settlement::finalize_apply(context, plan, side, market)?;
+    }
     if let Some(price) = last_trade_price {
         storage::save_last_traded_price(context, market_id, price)?;
     }

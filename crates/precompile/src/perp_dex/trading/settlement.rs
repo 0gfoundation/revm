@@ -127,36 +127,29 @@ impl TakerSettlement {
     /// 6. **Deduct opening margin and fee from wallet** — both deducted cleanly
     ///    from the wallet; position margin is never touched for fee payment.
     /// 7. **Emit log** — single `PositionChanged` event for the full order.
-    pub(super) fn finalize<CTX: ContextTr>(
+    pub(super) fn finalize_compute<CTX: ContextTr>(
         self,
         context: &mut CTX,
+        reg: &mut MatchRegistry,
         taker_side: Side,
         market: &crate::perp_dex::types::Market,
-    ) -> Result<(), PrecompileError> {
+    ) -> Result<Option<TakerPlan>, PrecompileError> {
         if self.fills.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
-        let mut pos = storage::load_position(context, self.user, self.market_id)?;
-        let mut account = storage::load_account(context, self.user)?;
-        // commit-only #23: funding computed IN MEMORY (no IF write) so a taker reject below
-        // (K9 open-into-insolvency, arithmetic) leaves ZERO writes instead of relying on undo.
-        let pending_funding = crate::perp_dex::funding::compute_funding_settlement(
-            context,
-            self.user,
-            market,
-            &mut pos,
-            &mut account.perp_wallet_balance,
-        )?;
-        let buy_entries = storage::load_buy_orders_ref(context, self.user, self.market_id)?;
-        let sell_entries = storage::load_sell_orders_ref(context, self.user, self.market_id)?;
+        // The taker joins the registry: funding computed on the copy (event pushed after all
+        // maker events — the same stream position finalize applied it at), and on a self-match
+        // the fills' maker-side effects are already in these copies.
+        let i = reg.get_or_load(context, self.user, self.market_id, market)?;
         let mark = storage::load_mark_price(context, self.market_id)?;
+        let w = &mut reg.users[i].1;
 
         let core = finalize_core(
-            &mut pos,
-            &mut account,
-            &buy_entries,
-            &sell_entries,
+            &mut w.pos,
+            &mut w.account,
+            &w.buy_entries,
+            &w.sell_entries,
             &self.fills,
             taker_side,
             mark,
@@ -164,16 +157,15 @@ impl TakerSettlement {
             market,
         )?;
 
-        // commit-only #23: decide wallet-cover feasibility PRE-WRITE by simulating the LIFO
-        // same-side cancels on working copies. Shares release_margin_core with the real cancel
-        // path below, so the simulation and the apply-phase loop cannot diverge. If even
-        // cancelling every same-side order leaves the wallet short, reject HERE — before the
-        // funding/IF/save writes below (the real loop's final check becomes an invariant).
-        if !account.has_available_perp(core.total_required) {
-            let mut sim_pos = pos.clone();
-            let mut sim_account = account.clone();
-            let mut sim_buy = buy_entries.to_vec();
-            let mut sim_sell = sell_entries.to_vec();
+        // Wallet-cover feasibility decided NOW, pre-write, by simulating the LIFO same-side
+        // cancels on clones of the registry copies (shares release_margin_core with the real
+        // cancel loop in finalize_apply, so they cannot diverge). If even cancelling every
+        // same-side order leaves the wallet short, reject — nothing has been written.
+        if !w.account.has_available_perp(core.total_required) {
+            let mut sim_pos = w.pos.clone();
+            let mut sim_account = w.account.clone();
+            let mut sim_buy = w.buy_entries.clone();
+            let mut sim_sell = w.sell_entries.clone();
             loop {
                 if sim_account.has_available_perp(core.total_required) {
                     break;
@@ -197,52 +189,72 @@ impl TakerSettlement {
             }
         }
 
-        // ── APPLY (taker accepted; same write/log sequence as the pre-extraction code) ──
-        if let Some(p) = pending_funding {
-            crate::perp_dex::funding::apply_funding_settlement(context, p)?;
-        }
-        absorb_bad_debt_into_insurance_fund(context, self.market_id, core.bad_debt)?;
-        let fee = core.fee;
-        let total_required = core.total_required;
-
-        // Single save covers all position mutations (apply_position_fill +
-        // recompute) and the PnL credit to wallet.
-        storage::save_position(context, self.user, self.market_id, &pos)?;
-        storage::save_account(context, self.user, account)?;
-
-        ensure_taker_wallet_can_cover_margin(
-            context,
-            self.user,
-            self.market_id,
-            taker_side,
-            total_required,
-            market,
-        )?;
-
-        // Reload account only: cancellations may have changed the wallet balance.
-        // pos is already correct in storage — release_margin_for_cancelled_order
-        // saves its own pos updates, and the log fields (amount/margin/v_quote)
-        // are not touched by cancellations.
-        account = storage::load_account(context, self.user)?;
-        account.debit_perp(total_required)?;
-        storage::save_account(context, self.user, account)?;
-        credit_fee_recipient(context, self.market_id, fee)?;
-
-        context.journal_mut().log(Log {
-            address: PERP_DEX_ADDRESS,
-            data: IPerpDex::PositionChanged {
-                user: self.user,
-                marketId: self.market_id,
-                amount: pos.amount,
-                vQuoteBalance: pos.v_quote_balance,
-                margin: pos.margin,
-                leverage: pos.leverage,
-            }
-            .to_log_data(),
+        let pos_log = w.pos.clone();
+        reg.push_event(MatchEvent::AbsorbBadDebt {
+            market_id: self.market_id,
+            amount: core.bad_debt,
         });
 
-        Ok(())
+        Ok(Some(TakerPlan {
+            user: self.user,
+            market_id: self.market_id,
+            fee: core.fee,
+            total_required: core.total_required,
+            pos_log,
+        }))
     }
+}
+
+/// The taker settlement's APPLY half (commit-only #23 L2b): everything after the decision —
+/// the wallet-cover cancel loop (guaranteed to suffice by the compute simulation; its final
+/// check is now an unreachable invariant), the margin+fee debit, the fee credit, and the
+/// taker PositionChanged log. The taker's pos/account fill effects are written by the registry
+/// flush; the cancels/debit below re-load and update storage exactly as before.
+pub(super) struct TakerPlan {
+    user: Address,
+    market_id: u64,
+    fee: u64,
+    total_required: u64,
+    pos_log: crate::perp_dex::types::PerpPosition,
+}
+
+pub(super) fn finalize_apply<CTX: ContextTr>(
+    context: &mut CTX,
+    plan: TakerPlan,
+    taker_side: Side,
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    ensure_taker_wallet_can_cover_margin(
+        context,
+        plan.user,
+        plan.market_id,
+        taker_side,
+        plan.total_required,
+        market,
+    )?;
+
+    // Reload account only: cancellations may have changed the wallet balance. pos is already
+    // correct in storage (registry flush) — the cancels save their own pos updates, and the log
+    // fields (amount/margin/v_quote) are not touched by cancellations.
+    let mut account = storage::load_account(context, plan.user)?;
+    account.debit_perp(plan.total_required)?;
+    storage::save_account(context, plan.user, account)?;
+    credit_fee_recipient(context, plan.market_id, plan.fee)?;
+
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::PositionChanged {
+            user: plan.user,
+            marketId: plan.market_id,
+            amount: plan.pos_log.amount,
+            vQuoteBalance: plan.pos_log.v_quote_balance,
+            margin: plan.pos_log.margin,
+            leverage: plan.pos_log.leverage,
+        }
+        .to_log_data(),
+    });
+
+    Ok(())
 }
 
 /// Outcome of attempting to settle one maker fill. A maker's trading fee is pre-reserved and
@@ -309,6 +321,23 @@ pub(super) enum MatchEvent {
         taker_side: Side,
         taker_fee: u64,
         maker_fee: u64,
+    },
+    SaveLevel {
+        is_bid: bool,
+        price: u64,
+        queue: Vec<[u8; 32]>,
+    },
+    RemovePrice {
+        is_bid: bool,
+        price: u64,
+    },
+    SaveBest {
+        is_bid: bool,
+        price: u64,
+    },
+    MidPriceSample {
+        best_bid: u64,
+        best_ask: u64,
     },
 }
 
@@ -449,6 +478,36 @@ impl MatchRegistry {
                         }
                         .to_log_data(),
                     });
+                }
+                MatchEvent::SaveLevel {
+                    is_bid,
+                    price,
+                    queue,
+                } => {
+                    if is_bid {
+                        storage::save_bid_level(context, market_id, price, &queue)?;
+                    } else {
+                        storage::save_ask_level(context, market_id, price, &queue)?;
+                    }
+                }
+                MatchEvent::RemovePrice { is_bid, price } => {
+                    if is_bid {
+                        storage::remove_bid_price(context, market_id, price)?;
+                    } else {
+                        storage::remove_ask_price(context, market_id, price)?;
+                    }
+                }
+                MatchEvent::SaveBest { is_bid, price } => {
+                    if is_bid {
+                        storage::save_best_bid(context, market_id, price)?;
+                    } else {
+                        storage::save_best_ask(context, market_id, price)?;
+                    }
+                }
+                MatchEvent::MidPriceSample { best_bid, best_ask } => {
+                    crate::perp_dex::risk::record_mid_price_sample_for_best_quote_change(
+                        context, market_id, best_bid, best_ask,
+                    )?;
                 }
                 MatchEvent::Trade {
                     market_id,
