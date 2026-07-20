@@ -29,7 +29,7 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
     quantity: u64,
 ) -> Result<u64, PrecompileError> {
     let order_id = next_order_id(context, user)?;
-    let order = Order {
+    let mut order = Order {
         owner: user.0 .0,
         market_id: market.market_id,
         side,
@@ -40,8 +40,8 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         tif: TimeInForce::Ioc,
         status: OrderStatus::Open,
     };
-    storage::save_order(context, &order_id, &order)?;
-
+    // commit-only #23: the close order is persisted ONCE after matching (below); the
+    // OrderPlaced log keeps its original position (logs are EVM-journaled).
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderPlaced {
@@ -73,7 +73,9 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         // the clearance fee to the IF instead). Also prevents the close from
         // reverting when the underwater user cannot cover a taker fee.
         true,
+        &mut order,
     )?;
+    storage::save_order(context, &order_id, &order)?;
 
     if remaining == 0 {
         // Full fill: clean up any rounding residuals left in the position.

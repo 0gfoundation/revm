@@ -426,7 +426,10 @@ fn place_order_core<CTX: ContextTr>(
         tif_u8,
     )?;
 
-    persist_new_order(
+    // commit-only #23: build the Order in memory + emit OrderPlaced at its original stream
+    // position (logs are EVM-journaled and revert with the tx — only the STORAGE persist is
+    // deferred to the single final save after all genuine rejects have passed).
+    let mut taker_order = announce_new_order(
         context,
         account,
         &order_id,
@@ -435,7 +438,7 @@ fn place_order_core<CTX: ContextTr>(
         quantity,
         client_order_id,
         &validated,
-    )?;
+    );
 
     match validated.order_type {
         OrderType::Limit => execute_limit_order(
@@ -447,11 +450,23 @@ fn place_order_core<CTX: ContextTr>(
             quantity,
             client_order_id,
             validated,
-        ),
+            &mut taker_order,
+        )?,
         OrderType::Market => execute_market_order(
-            context, account, order_id, market_id, price, quantity, validated,
-        ),
+            context,
+            account,
+            order_id,
+            market_id,
+            price,
+            quantity,
+            validated,
+            &mut taker_order,
+        )?,
     }
+    // Single final persist of the taker order's terminal state (Open / PartiallyFilled /
+    // Filled / Expired) — same final value + key as the old persist-then-update writes.
+    storage::save_order(context, &order_id, &taker_order).map(|_| ())?;
+    Ok(())
 }
 
 fn validate_place_order<CTX: ContextTr>(
@@ -525,7 +540,7 @@ fn validate_place_order<CTX: ContextTr>(
     })
 }
 
-fn persist_new_order<CTX: ContextTr>(
+fn announce_new_order<CTX: ContextTr>(
     context: &mut CTX,
     account: Address,
     order_id: &[u8; 32],
@@ -534,7 +549,7 @@ fn persist_new_order<CTX: ContextTr>(
     quantity: u64,
     client_order_id: [u8; 16],
     order: &ValidatedOrder,
-) -> Result<(), PrecompileError> {
+) -> Order {
     let order = Order {
         owner: account.0 .0,
         market_id,
@@ -546,7 +561,6 @@ fn persist_new_order<CTX: ContextTr>(
         tif: order.tif,
         status: OrderStatus::Open,
     };
-    storage::save_order(context, order_id, &order)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
@@ -564,26 +578,15 @@ fn persist_new_order<CTX: ContextTr>(
         .to_log_data(),
     });
 
-    Ok(())
+    order
 }
 
-fn cancel_unfilled_remainder<CTX: ContextTr>(
-    context: &mut CTX,
-    order_id: &[u8; 32],
-    remaining: u64,
-) -> Result<(), PrecompileError> {
-    if remaining == 0 {
-        return Ok(());
+/// Binance-style TIF expiry (IOC/market not fully filled) → Expired, not Cancelled (which is
+/// reserved for user-initiated cancels). In-memory only; the caller performs the final persist.
+fn cancel_unfilled_remainder(taker_order: &mut Order, remaining: u64) {
+    if remaining > 0 {
+        taker_order.status = OrderStatus::Expired;
     }
-
-    if let Some(mut o) = storage::load_order(context, order_id)? {
-        // Binance-style: TIF expiry (IOC/market not fully filled) → Expired,
-        // not Cancelled. Cancelled is reserved for user-initiated cancels.
-        o.status = OrderStatus::Expired;
-        storage::save_order(context, order_id, &o)?;
-    }
-
-    Ok(())
 }
 
 fn ensure_fok_filled(remaining: u64) -> Result<(), PrecompileError> {
@@ -644,6 +647,7 @@ fn execute_limit_order<CTX: ContextTr>(
     quantity: u64,
     client_order_id: [u8; 16],
     order: ValidatedOrder,
+    taker_order: &mut Order,
 ) -> Result<(), PrecompileError> {
     match order.tif {
         TimeInForce::PostOnly => {
@@ -674,6 +678,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 &order.market,
                 false,
+                taker_order,
             )?;
             if remaining > 0 {
                 rest_in_book(
@@ -704,8 +709,10 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 &order.market,
                 false,
+                taker_order,
             )?;
-            cancel_unfilled_remainder(context, &order_id, remaining)
+            cancel_unfilled_remainder(taker_order, remaining);
+            Ok(())
         }
         TimeInForce::Fok => {
             check_fok_feasibility(
@@ -728,6 +735,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 &order.market,
                 false,
+                taker_order,
             )?;
             ensure_fok_filled(remaining)
         }
@@ -742,6 +750,7 @@ fn execute_market_order<CTX: ContextTr>(
     price: u64,
     quantity: u64,
     order: ValidatedOrder,
+    taker_order: &mut Order,
 ) -> Result<(), PrecompileError> {
     if order.tif == TimeInForce::Fok {
         check_fok_feasibility(
@@ -765,11 +774,13 @@ fn execute_market_order<CTX: ContextTr>(
         order.tif,
         &order.market,
         false,
+        taker_order,
     )?;
     if order.tif == TimeInForce::Fok {
         ensure_fok_filled(remaining)
     } else {
-        cancel_unfilled_remainder(context, &order_id, remaining)
+        cancel_unfilled_remainder(taker_order, remaining);
+        Ok(())
     }
 }
 
@@ -824,6 +835,10 @@ pub(super) fn match_order<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
     // When true (liquidation close), the taker pays no trading fee.
     waive_taker_fee: bool,
+    // The taker's Order threaded in memory (commit-only #23): NOT yet persisted — the caller
+    // performs the single final save after every genuine reject has passed, so a rejected
+    // placement leaves no phantom order (and a signed order's signature is not burned).
+    taker_order: &mut Order,
 ) -> Result<u64, PrecompileError> {
     let mut remaining = quantity;
     let mut last_trade_price = None;
@@ -833,12 +848,9 @@ pub(super) fn match_order<CTX: ContextTr>(
     // once (funding settled at first touch, exactly where the first per-maker settle did it) and
     // saved once at the flush below — same write-key set and net values as the old per-fill saves.
     let mut registry = settlement::MatchRegistry::new();
-    // The taker order is mutated once per fill and saved ONCE after the loop. Nothing reads
-    // it mid-match: settle_maker_fill touches only the maker; finalize touches the taker's
-    // position/account, not this Order; and the taker order is not rested in the book until
-    // after match_order returns, so it can never be a maker in the queue it sweeps.
-    let mut taker_order = storage::load_order(context, taker_order_id)?
-        .ok_or_else(|| perp_invariant_err("taker order missing during match"))?;
+    // The taker order is mutated in memory per fill; the CALLER persists the final state once.
+    // Nothing reads it from storage mid-match: the registry touches only the makers, finalize
+    // touches the taker's position/account, and the taker order is not in any book queue yet.
 
     match side {
         Side::Buy => {
@@ -1212,10 +1224,6 @@ pub(super) fn match_order<CTX: ContextTr>(
 
     // ── APPLY (no genuine rejects past this point) ──
     registry.flush(context, market_id)?;
-    // Persist the taker order once with its accumulated fill. Skipped when nothing matched.
-    if remaining < quantity {
-        storage::save_order(context, taker_order_id, &taker_order)?;
-    }
     if let Some(plan) = taker_plan {
         settlement::finalize_apply(context, plan, side, market)?;
     }
