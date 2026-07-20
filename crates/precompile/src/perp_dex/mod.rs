@@ -36,13 +36,12 @@ use crate::{
             getApiKeysCall, getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall,
             getFundingStateCall, getIndexPriceCall, getInsuranceFundCall, getMarkPriceCall,
             getMarketCall, getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
-            getOracleAddressCall, getOrderCall, getPositionCall, getUserFeeRatesCall, initAdminCall,
-            liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
+            getOracleAddressCall, getOrderCall, getPositionCall, getUserFeeRatesCall,
+            initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
             removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
             setMarketManagerAddressCall, setOracleAddressCall, setUserFeeRatesCall,
-            transferAdminCall, transferFromPerpCall,
-            transferToPerpCall, updateIndexPriceCall, updateMarketCall, withdrawCall,
-            withdrawInsuranceFundCall,
+            transferAdminCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
+            updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
         },
         risk::{
             run_add_market, run_add_position_margin, run_deposit_insurance_fund, run_get_admin,
@@ -218,6 +217,11 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         return Err(errors::perp_err("perpdex: EOA direct calls only"));
     }
 
+    // commit-only #23 residual-write-then-error tripwire: snapshot the global perp-write counter
+    // before dispatch. A call that ends REVERTED must not have written the overlay
+    // (validate-then-apply); if it did, undo is gone and the write leaked. Diagnostic only.
+    let writes_before = context::journal::inner::perp_write_count();
+
     // Dispatch — note: no `?` here; errors are caught below and converted to
     // clean REVERT output so ethers.js can read `e.reason`.
     let result = match selector {
@@ -312,9 +316,36 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         Err(PrecompileError::Fatal(e)) => Err(PrecompileError::Fatal(e)),
         // All other errors become a clean REVERT with an ABI-encoded reason
         // string, so ethers.js exposes `e.reason` to the caller.
-        Err(e) => Ok(PrecompileOutput::new_reverted(
-            gas_used,
-            encode_revert_string(&e.to_string()),
-        )),
+        Err(e) => {
+            // Tripwire: a reverting call that WROTE the overlay is a residual write-then-error
+            // (commit-only #23 — the write leaks with no undo). Record the offending selector +
+            // count into a global so the exact path can be surfaced (read via
+            // [`last_perp_write_then_revert`]); diagnostic only, not a halt.
+            let writes_after = context::journal::inner::perp_write_count();
+            if writes_after != writes_before {
+                let sel = u32::from_be_bytes(selector);
+                LAST_WRITE_THEN_REVERT_SELECTOR.store(sel, core::sync::atomic::Ordering::Relaxed);
+                PERP_WRITE_THEN_REVERT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(PrecompileOutput::new_reverted(
+                gas_used,
+                encode_revert_string(&e.to_string()),
+            ))
+        }
     }
+}
+
+/// commit-only #23 tripwire state: the last selector that reverted AFTER writing the overlay
+/// (a residual write-then-error), and how many such events have occurred process-wide.
+pub static LAST_WRITE_THEN_REVERT_SELECTOR: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static PERP_WRITE_THEN_REVERT_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Returns `(count, last_selector)` of residual write-then-error reverts seen so far.
+pub fn last_perp_write_then_revert() -> (u64, u32) {
+    (
+        PERP_WRITE_THEN_REVERT_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+        LAST_WRITE_THEN_REVERT_SELECTOR.load(core::sync::atomic::Ordering::Relaxed),
+    )
 }

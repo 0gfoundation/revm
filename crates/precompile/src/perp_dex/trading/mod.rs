@@ -695,6 +695,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 &order.market,
                 false,
+                true, // GTC: rest the remainder → pre-validate its margin atomically with fills
                 taker_order,
             )?;
             if remaining > 0 {
@@ -726,6 +727,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 &order.market,
                 false,
+                false, // IOC: unmatched remainder is dropped, never rested
                 taker_order,
             )?;
             cancel_unfilled_remainder(taker_order, remaining);
@@ -752,6 +754,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 &order.market,
                 false,
+                false, // FOK: fully filled or rejected — never rests
                 taker_order,
             )?;
             ensure_fok_filled(remaining)
@@ -791,6 +794,7 @@ fn execute_market_order<CTX: ContextTr>(
         order.tif,
         &order.market,
         false,
+        false, // market order: never rests
         taker_order,
     )?;
     if order.tif == TimeInForce::Fok {
@@ -852,6 +856,9 @@ pub(super) fn match_order<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
     // When true (liquidation close), the taker pays no trading fee.
     waive_taker_fee: bool,
+    // When true (GTC), the caller will rest the unmatched remainder — so the rest's margin is
+    // pre-validated atomically with the fills (commit-only #23 atomic-reject).
+    rest_remainder: bool,
     // The taker's Order threaded in memory (commit-only #23): NOT yet persisted — the caller
     // performs the single final save after every genuine reject has passed, so a rejected
     // placement leaves no phantom order (and a signed order's signature is not burned).
@@ -1236,8 +1243,21 @@ pub(super) fn match_order<CTX: ContextTr>(
 
     // 2. Taker settlement compute: K9 open-into-insolvency / wallet-cover / checked-arithmetic
     //    rejects — all pre-write. The taker joins the registry (self-match reuses the evolved
-    //    copies) and its fill effects are flushed with everyone else's below.
-    let taker_plan = taker_settlement.finalize_compute(context, &mut registry, side, market)?;
+    //    copies) and its fill effects are flushed with everyone else's below. When the caller will
+    //    REST the remainder (GTC), pass the rest requirement so the fills+rest margin is validated
+    //    atomically here (else the fills commit and rest_in_book could revert, leaking them).
+    let rest_req = if rest_remainder && remaining > 0 {
+        let maker_fee_bps = storage::load_user_fee_rates(context, taker_addr)?.maker_fee_bps;
+        Some(settlement::RestReq {
+            price: limit_price,
+            qty: remaining,
+            maker_fee_bps,
+        })
+    } else {
+        None
+    };
+    let taker_plan =
+        taker_settlement.finalize_compute(context, &mut registry, side, market, rest_req)?;
 
     // ── APPLY (no genuine rejects past this point) ──
     registry.flush(context, market_id)?;

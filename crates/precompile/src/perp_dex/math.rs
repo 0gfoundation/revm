@@ -402,39 +402,57 @@ pub fn calc_buy_side_dual(
     let mut rem_a = if position_a >= 0 {
         0i64
     } else {
-        position_a.checked_neg().ok_or_else(|| perp_err("math: position amount overflow"))?
+        position_a
+            .checked_neg()
+            .ok_or_else(|| perp_err("math: position amount overflow"))?
     };
     let mut rem_b = if position_b >= 0 {
         0i64
     } else {
-        position_b.checked_neg().ok_or_else(|| perp_err("math: position amount overflow"))?
+        position_b
+            .checked_neg()
+            .ok_or_else(|| perp_err("math: position amount overflow"))?
     };
     let mut res_a = 0u64;
     let mut res_b = 0u64;
     let mut total = 0u64;
     for e in buy_entries {
-        total = total.checked_add(e.amount).ok_or_else(|| perp_err("math: total buy order amount"))?;
+        total = total
+            .checked_add(e.amount)
+            .ok_or_else(|| perp_err("math: total buy order amount"))?;
         let amount = checked_u64_to_i64(e.amount, "math: buy order amount")?;
         let open_a = open_amount(&mut rem_a, amount)?;
         let open_b = open_amount(&mut rem_b, amount)?;
         if open_a == open_b {
             if open_a > 0 {
                 let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
-                res_a = res_a.checked_add(v).ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
-                res_b = res_b.checked_add(v).ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
+                res_a = res_a
+                    .checked_add(v)
+                    .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
+                res_b = res_b
+                    .checked_add(v)
+                    .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
             }
         } else {
             if open_a > 0 {
                 let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
-                res_a = res_a.checked_add(v).ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
+                res_a = res_a
+                    .checked_add(v)
+                    .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
             }
             if open_b > 0 {
                 let v = calc_value(e.price, open_b as u64, base_decimals, price_decimals)?;
-                res_b = res_b.checked_add(v).ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
+                res_b = res_b
+                    .checked_add(v)
+                    .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
             }
         }
     }
-    Ok((res_a, res_b, checked_u64_to_i64(total, "math: total buy order amount")?))
+    Ok((
+        res_a,
+        res_b,
+        checked_u64_to_i64(total, "math: total buy order amount")?,
+    ))
 }
 
 /// Sell-side opening notional at TWO positions in a single ASC pass (#21 靶子3); see
@@ -452,28 +470,42 @@ pub fn calc_sell_side_dual(
     let mut res_b = 0u64;
     let mut total = 0u64;
     for e in sell_entries {
-        total = total.checked_add(e.amount).ok_or_else(|| perp_err("math: total sell order amount"))?;
+        total = total
+            .checked_add(e.amount)
+            .ok_or_else(|| perp_err("math: total sell order amount"))?;
         let amount = checked_u64_to_i64(e.amount, "math: sell order amount")?;
         let open_a = open_amount(&mut rem_a, amount)?;
         let open_b = open_amount(&mut rem_b, amount)?;
         if open_a == open_b {
             if open_a > 0 {
                 let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
-                res_a = res_a.checked_add(v).ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
-                res_b = res_b.checked_add(v).ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
+                res_a = res_a
+                    .checked_add(v)
+                    .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
+                res_b = res_b
+                    .checked_add(v)
+                    .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
             }
         } else {
             if open_a > 0 {
                 let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
-                res_a = res_a.checked_add(v).ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
+                res_a = res_a
+                    .checked_add(v)
+                    .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
             }
             if open_b > 0 {
                 let v = calc_value(e.price, open_b as u64, base_decimals, price_decimals)?;
-                res_b = res_b.checked_add(v).ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
+                res_b = res_b
+                    .checked_add(v)
+                    .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
             }
         }
     }
-    Ok((res_a, res_b, checked_u64_to_i64(total, "math: total sell order amount")?))
+    Ok((
+        res_a,
+        res_b,
+        checked_u64_to_i64(total, "math: total sell order amount")?,
+    ))
 }
 
 /// Flip-aware worst-case reservation notional for a user's resting book.
@@ -590,11 +622,13 @@ mod reservation_notional_tests {
         for _ in 0..5000 {
             let nb = (next(&mut s) % 6) as usize;
             let ns = (next(&mut s) % 6) as usize;
-            let mut buys: Vec<OrderEntry> =
-                (0..nb).map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1)).collect();
+            let mut buys: Vec<OrderEntry> = (0..nb)
+                .map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1))
+                .collect();
             buys.sort_by(|a, b| b.price.cmp(&a.price)); // DESC
-            let mut sells: Vec<OrderEntry> =
-                (0..ns).map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1)).collect();
+            let mut sells: Vec<OrderEntry> = (0..ns)
+                .map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1))
+                .collect();
             sells.sort_by(|a, b| a.price.cmp(&b.price)); // ASC
             let p = (next(&mut s) % 400) as i64 - 200;
 
@@ -604,13 +638,25 @@ mod reservation_notional_tests {
             let pos_after_buys = p + total_buy;
 
             let (ba, bb, tb) = calc_buy_side_dual(&buys, bd, pd, p, pos_after_sells).unwrap();
-            assert_eq!(ba, calc_buy_side_reserved_notional(&buys, bd, pd, p).unwrap());
-            assert_eq!(bb, calc_buy_side_reserved_notional(&buys, bd, pd, pos_after_sells).unwrap());
+            assert_eq!(
+                ba,
+                calc_buy_side_reserved_notional(&buys, bd, pd, p).unwrap()
+            );
+            assert_eq!(
+                bb,
+                calc_buy_side_reserved_notional(&buys, bd, pd, pos_after_sells).unwrap()
+            );
             assert_eq!(tb, total_buy);
 
             let (sa, sb, ts) = calc_sell_side_dual(&sells, bd, pd, p, pos_after_buys).unwrap();
-            assert_eq!(sa, calc_sell_side_reserved_notional(&sells, bd, pd, p).unwrap());
-            assert_eq!(sb, calc_sell_side_reserved_notional(&sells, bd, pd, pos_after_buys).unwrap());
+            assert_eq!(
+                sa,
+                calc_sell_side_reserved_notional(&sells, bd, pd, p).unwrap()
+            );
+            assert_eq!(
+                sb,
+                calc_sell_side_reserved_notional(&sells, bd, pd, pos_after_buys).unwrap()
+            );
             assert_eq!(ts, total_sell);
         }
     }

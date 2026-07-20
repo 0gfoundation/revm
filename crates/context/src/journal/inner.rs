@@ -51,6 +51,17 @@ pub struct PerpSection {
     cache: PerpCache,
 }
 
+/// Global monotonic counter of off-trie PerpDEX overlay WRITES (commit-only #23 diagnostic).
+/// Incremented by `store_bytes`/`store_struct`/`get_struct_mut`. Used to detect residual
+/// write-then-error paths: a precompile call that returns REVERTED must not have bumped this
+/// (validate-then-apply). Not consensus state — a process-wide debugging tripwire.
+pub static PERP_WRITE_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub fn perp_write_count() -> u64 {
+    PERP_WRITE_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// One off-trie overlay value (#16d Phase 2). A typed `save_*` write stores the DESERIALIZED blob
 /// (`Struct`) and defers serialization to block end; a raw byte write (`store_blob`, e.g. level
 /// queues) stores `Bytes`. Both lower to the canonical off-trie bytes via `into_bytes`/`to_bytes`;
@@ -181,6 +192,7 @@ impl PerpSection {
             return None;
         }
         self.dirty_this_tx = true;
+        PERP_WRITE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // The struct is about to change in place; drop any stale deser-cache entry (mirrors `store_*`).
         self.cache.remove(key);
         match self.working.get_mut(&key) {
@@ -195,6 +207,7 @@ impl PerpSection {
     fn store_bytes(&mut self, key: B256, value: Vec<u8>) {
         self.working.insert(key, PerpEntry::Bytes(value));
         self.dirty_this_tx = true;
+        PERP_WRITE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Invalidate the deser cache; a typed cached save re-populates it (write-through).
         self.cache.remove(key);
     }
@@ -212,6 +225,7 @@ impl PerpSection {
         self.working
             .insert(key, PerpEntry::Struct { val, ser, clone });
         self.dirty_this_tx = true;
+        PERP_WRITE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.cache.remove(key);
     }
 

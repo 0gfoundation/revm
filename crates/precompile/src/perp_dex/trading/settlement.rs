@@ -133,6 +133,12 @@ impl TakerSettlement {
         reg: &mut MatchRegistry,
         taker_side: Side,
         market: &crate::perp_dex::types::Market,
+        // commit-only #23 (atomic-reject, Harry 2026-07-20): when the caller will REST the taker's
+        // remainder (GTC), the resting order's margin must be affordable from the post-fill wallet
+        // TOO — otherwise the fills would commit and the subsequent rest_in_book would revert,
+        // leaking the fills. Validated here, pre-flush, so an unaffordable fills+rest order rejects
+        // atomically with zero writes (matching the pre-commit-only whole-order revert).
+        rest: Option<RestReq>,
     ) -> Result<Option<TakerPlan>, PrecompileError> {
         if self.fills.is_empty() {
             return Ok(None);
@@ -157,35 +163,84 @@ impl TakerSettlement {
             market,
         )?;
 
-        // Wallet-cover feasibility decided NOW, pre-write, by simulating the LIFO same-side
-        // cancels on clones of the registry copies (shares release_margin_core with the real
-        // cancel loop in finalize_apply, so they cannot diverge). If even cancelling every
-        // same-side order leaves the wallet short, reject — nothing has been written.
-        if !w.account.has_available_perp(core.total_required) {
-            let mut sim_pos = w.pos.clone();
-            let mut sim_account = w.account.clone();
-            let mut sim_buy = w.buy_entries.clone();
-            let mut sim_sell = w.sell_entries.clone();
-            loop {
-                if sim_account.has_available_perp(core.total_required) {
-                    break;
+        // Model the taker's post-APPLY state on clones (what finalize_apply + rest_in_book will see
+        // in storage): fill-cover LIFO cancels for `total_required`, then debit `total_required`.
+        // Uses release_margin_core — the SAME primitive finalize_apply's real cancel loop uses — so
+        // the simulation cannot diverge from what actually gets written.
+        let mut sim_pos = w.pos.clone();
+        let mut sim_account = w.account.clone();
+        let mut sim_buy = w.buy_entries.clone();
+        let mut sim_sell = w.sell_entries.clone();
+        while !sim_account.has_available_perp(core.total_required) {
+            let next = match taker_side {
+                Side::Buy => sim_buy.last().map(|e| e.order_id),
+                Side::Sell => sim_sell.last().map(|e| e.order_id),
+            };
+            let Some(oid) = next else {
+                return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+            };
+            super::release_margin_core(
+                &mut sim_pos,
+                &mut sim_account,
+                &mut sim_buy,
+                &mut sim_sell,
+                taker_side,
+                &oid,
+                market,
+            )?;
+        }
+        // Debit the fill requirement (finalize_apply does this to storage).
+        sim_account.debit_perp(core.total_required)?;
+
+        // Rest feasibility: replay rest_in_book's reservation math on the post-apply sim state
+        // (identical shared primitives), rejecting the WHOLE order pre-write if the remainder
+        // cannot be booked. NOTE: no additional cover-cancels here — the rest must fit from what
+        // the fill-cover left, matching the pre-commit-only "rest Errs → whole order reverts".
+        if let Some(r) = rest {
+            let new_entry = crate::perp_dex::types::OrderEntry {
+                order_id: [0u8; 32],
+                price: r.price,
+                amount: r.qty,
+                maker_fee_bps: r.maker_fee_bps,
+            };
+            let (entries, other): (&mut Vec<_>, &Vec<_>) = match taker_side {
+                Side::Buy => {
+                    let idx = sim_buy.partition_point(|e| e.price > r.price);
+                    sim_buy.insert(idx, new_entry);
+                    (&mut sim_buy, &sim_sell)
                 }
-                let next = match taker_side {
-                    Side::Buy => sim_buy.last().map(|e| e.order_id),
-                    Side::Sell => sim_sell.last().map(|e| e.order_id),
-                };
-                let Some(oid) = next else {
-                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
-                };
-                super::release_margin_core(
-                    &mut sim_pos,
-                    &mut sim_account,
-                    &mut sim_buy,
-                    &mut sim_sell,
-                    taker_side,
-                    &oid,
-                    market,
-                )?;
+                Side::Sell => {
+                    let idx = sim_sell.partition_point(|e| e.price < r.price);
+                    sim_sell.insert(idx, new_entry);
+                    (&mut sim_sell, &sim_buy)
+                }
+            };
+            let (bn, sn, cn) = match taker_side {
+                Side::Buy => calc_reservation_notionals(
+                    entries,
+                    other,
+                    market.base_decimals,
+                    market.price_decimals,
+                    sim_pos.amount,
+                )?,
+                Side::Sell => calc_reservation_notionals(
+                    other,
+                    entries,
+                    market.base_decimals,
+                    market.price_decimals,
+                    sim_pos.amount,
+                )?,
+            };
+            let old_reserved = sim_pos.margin_reserved;
+            sim_pos.set_reservations(bn, sn, cn, sim_pos.leverage);
+            let margin_delta = sim_pos.margin_reserved.saturating_sub(old_reserved);
+            let order_fee =
+                calc_maker_fee_for_order_qty_with_bps(r.price, r.qty, r.maker_fee_bps, market)?;
+            let delta = margin_delta
+                .checked_add(order_fee)
+                .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
+            if !sim_account.has_available_perp(delta) {
+                return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
         }
 
@@ -203,6 +258,15 @@ impl TakerSettlement {
             pos_log,
         }))
     }
+}
+
+/// The taker's intent to rest its unmatched remainder (commit-only #23 atomic-reject): the
+/// resting order's price, quantity, and the taker's maker-fee bps — enough for [`finalize_compute`]
+/// to pre-validate the rest's margin against the post-fill wallet.
+pub(super) struct RestReq {
+    pub(super) price: u64,
+    pub(super) qty: u64,
+    pub(super) maker_fee_bps: u64,
 }
 
 /// The taker settlement's APPLY half (commit-only #23 L2b): everything after the decision —

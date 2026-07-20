@@ -73,6 +73,7 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         // the clearance fee to the IF instead). Also prevents the close from
         // reverting when the underwater user cannot cover a taker fee.
         true,
+        false, // liquidation close (IOC): never rests
         &mut order,
     )?;
     storage::save_order(context, &order_id, &order)?;
