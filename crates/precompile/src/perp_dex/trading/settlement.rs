@@ -273,17 +273,71 @@ pub(super) struct UserWork {
     dirty_sell: bool,
 }
 
+/// One deferred side effect of the match walk (commit-only #23, L2a). The walk pushes these in
+/// the EXACT sequence the old code performed them; [`MatchRegistry::flush`] replays them in order,
+/// so the log stream and the insurance-fund/trade-counter evolutions are byte-identical.
+pub(super) enum MatchEvent {
+    ApplyFunding(crate::perp_dex::funding::PendingFunding),
+    AbsorbBadDebt {
+        market_id: u64,
+        amount: u64,
+    },
+    FeeCredit {
+        market_id: u64,
+        amount: u64,
+    },
+    PositionChanged {
+        user: Address,
+        pos: crate::perp_dex::types::PerpPosition,
+    },
+    SaveOrder {
+        order_id: [u8; 32],
+        order: crate::perp_dex::types::Order,
+    },
+    OrderCancelled {
+        user: Address,
+        order_id: [u8; 32],
+    },
+    Trade {
+        market_id: u64,
+        taker_order_id: [u8; 32],
+        maker_order_id: [u8; 32],
+        taker: Address,
+        maker: Address,
+        price: u64,
+        quantity: u64,
+        taker_side: Side,
+        taker_fee: u64,
+        maker_fee: u64,
+    },
+}
+
 pub(super) struct MatchRegistry {
     users: Vec<(Address, UserWork)>,
+    events: Vec<MatchEvent>,
+    /// Fee recipient seen during the walk + credits not yet materialised into a working copy
+    /// (see [`Self::credit_admin`]).
+    fee_admin: Option<Address>,
+    admin_credit_pending: u64,
 }
 
 impl MatchRegistry {
     pub(super) fn new() -> Self {
-        Self { users: Vec::new() }
+        Self {
+            users: Vec::new(),
+            events: Vec::new(),
+            fee_admin: None,
+            admin_credit_pending: 0,
+        }
     }
 
-    /// First touch loads pos/account/both lists and settles funding (compute in memory + apply
-    /// IF/logs immediately — the same stream position as today's first per-maker settle).
+    pub(super) fn push_event(&mut self, e: MatchEvent) {
+        self.events.push(e);
+    }
+
+    /// First touch loads pos/account/both lists and settles funding: computed in memory NOW (the
+    /// walk's working copies must carry the post-funding state) with the IF write + logs deferred
+    /// as an event at this exact stream position.
     fn get_or_load<CTX: ContextTr>(
         &mut self,
         context: &mut CTX,
@@ -304,10 +358,16 @@ impl MatchRegistry {
             &mut account.perp_wallet_balance,
         )?;
         if let Some(p) = pending {
-            crate::perp_dex::funding::apply_funding_settlement(context, p)?;
+            self.events.push(MatchEvent::ApplyFunding(p));
         }
         let buy_entries = storage::load_buy_orders(context, user, market_id)?;
         let sell_entries = storage::load_sell_orders(context, user, market_id)?;
+        // Read-through: fees credited to the admin before they joined the registry are pending;
+        // fold them into the copy so this user's wallet matches the old per-fill storage writes.
+        if self.fee_admin == Some(user) && self.admin_credit_pending > 0 {
+            account.credit_perp(self.admin_credit_pending)?;
+            self.admin_credit_pending = 0;
+        }
         self.users.push((
             user,
             UserWork {
@@ -322,31 +382,118 @@ impl MatchRegistry {
         Ok(self.users.len() - 1)
     }
 
-    /// Credits `amount` into `user`'s perp wallet through the registry if present (so a fee
-    /// recipient who is also a trading party in this match sees a consistent evolution), else
-    /// directly through storage (the common case).
-    fn credit_perp_via<CTX: ContextTr>(
-        &mut self,
-        context: &mut CTX,
-        user: Address,
-        amount: u64,
-    ) -> Result<(), PrecompileError> {
-        if let Some((_, w)) = self.users.iter_mut().find(|(a, _)| *a == user) {
-            w.account.credit_perp(amount)?;
-            return Ok(());
+    /// Fee-recipient wallet credit with registry read-through (zero storage writes during the
+    /// walk): if the admin is a registry user the credit lands on their working copy NOW (so an
+    /// admin who is also a maker sees earlier fees mid-walk, as the old per-fill storage writes
+    /// provided); otherwise it accumulates and [`Self::flush`] materialises the total once (same
+    /// key, same net value as the old per-fill credits). `get_or_load` folds the pending amount in
+    /// if the admin joins the registry later.
+    fn credit_admin(&mut self, admin: Address, amount: u64) -> Result<(), PrecompileError> {
+        self.fee_admin = Some(admin);
+        if let Some((_, w)) = self.users.iter_mut().find(|(a, _)| *a == admin) {
+            return w.account.credit_perp(amount);
         }
-        let mut account = storage::load_account(context, user)?;
-        account.credit_perp(amount)?;
-        storage::save_account(context, user, account)
+        self.admin_credit_pending = self
+            .admin_credit_pending
+            .checked_add(amount)
+            .ok_or_else(|| perp_err("placeOrder: admin fee credit overflow"))?;
+        Ok(())
     }
 
-    /// Writes every touched user's final state: dirty lists, then position + account (both always
-    /// dirty — funding/fill effects). Same key set as today's per-fill saves, net values equal.
+    /// Applies the match: replays the deferred events in the EXACT order the walk recorded them
+    /// (byte-identical log stream + IF/trade-counter evolution), then writes every touched user's
+    /// final state (dirty lists, position + account — same key set as the old per-fill saves).
     pub(super) fn flush<CTX: ContextTr>(
-        self,
+        mut self,
         context: &mut CTX,
         market_id: u64,
     ) -> Result<(), PrecompileError> {
+        let events = core::mem::take(&mut self.events);
+        for e in events {
+            match e {
+                MatchEvent::ApplyFunding(p) => {
+                    crate::perp_dex::funding::apply_funding_settlement(context, p)?;
+                }
+                MatchEvent::AbsorbBadDebt { market_id, amount } => {
+                    absorb_bad_debt_into_insurance_fund(context, market_id, amount)?;
+                }
+                MatchEvent::FeeCredit { market_id, amount } => {
+                    // Wallet credit already handled via the registry read-through (credit_admin);
+                    // only the fee-total write replays here.
+                    storage::add_market_fee_total(context, market_id, amount)?;
+                }
+                MatchEvent::PositionChanged { user, pos } => {
+                    context.journal_mut().log(Log {
+                        address: PERP_DEX_ADDRESS,
+                        data: IPerpDex::PositionChanged {
+                            user,
+                            marketId: market_id,
+                            amount: pos.amount,
+                            vQuoteBalance: pos.v_quote_balance,
+                            margin: pos.margin,
+                            leverage: pos.leverage,
+                        }
+                        .to_log_data(),
+                    });
+                }
+                MatchEvent::SaveOrder { order_id, order } => {
+                    storage::save_order(context, &order_id, &order)?;
+                }
+                MatchEvent::OrderCancelled { user, order_id } => {
+                    context.journal_mut().log(Log {
+                        address: PERP_DEX_ADDRESS,
+                        data: IPerpDex::OrderCancelled {
+                            user,
+                            orderId: primitives::FixedBytes(order_id),
+                            marketId: market_id,
+                        }
+                        .to_log_data(),
+                    });
+                }
+                MatchEvent::Trade {
+                    market_id,
+                    taker_order_id,
+                    maker_order_id,
+                    taker,
+                    maker,
+                    price,
+                    quantity,
+                    taker_side,
+                    taker_fee,
+                    maker_fee,
+                } => {
+                    let trade_id = storage::next_trade_id(context, market_id)?;
+                    context.journal_mut().log(Log {
+                        address: PERP_DEX_ADDRESS,
+                        data: IPerpDex::Trade {
+                            marketId: market_id,
+                            tradeId: trade_id,
+                            takerOrderId: primitives::FixedBytes(taker_order_id),
+                            makerOrderId: primitives::FixedBytes(maker_order_id),
+                            taker,
+                            maker,
+                            price,
+                            quantity,
+                            takerSide: taker_side as u8,
+                            takerFee: taker_fee,
+                            makerFee: maker_fee,
+                        }
+                        .to_log_data(),
+                    });
+                }
+            }
+        }
+        // Admin fee credits never materialised into a working copy (admin was not a trading
+        // party): one storage credit of the accumulated total — same key + net value as the old
+        // per-fill credits.
+        if self.admin_credit_pending > 0 {
+            let admin = self
+                .fee_admin
+                .ok_or_else(|| perp_invariant_err("pending admin fee credit without an admin"))?;
+            let mut account = storage::load_account(context, admin)?;
+            account.credit_perp(self.admin_credit_pending)?;
+            storage::save_account(context, admin, account)?;
+        }
         for (user, w) in self.users {
             if w.dirty_buy {
                 storage::save_buy_orders(context, user, market_id, &w.buy_entries)?;
@@ -408,29 +555,28 @@ pub(super) fn settle_maker_fill_registry<CTX: ContextTr>(
     }
     let pos_snapshot = w.pos.clone();
 
-    absorb_bad_debt_into_insurance_fund(context, market_id, bad_debt)?;
-    // Fee credit: fee total immediately (global key); admin wallet through the registry if the
-    // admin is also a trading party here.
+    reg.push_event(MatchEvent::AbsorbBadDebt {
+        market_id,
+        amount: bad_debt,
+    });
+    // Fee credit: the admin==ZERO reject is checked NOW (read-only, pre-write); the fee-total
+    // write defers as an event, and the admin wallet credit routes through the registry
+    // read-through so an admin who is also a trading party sees earlier fees mid-walk.
     if maker_fee > 0 {
         let admin = storage::load_admin(context)?;
         if admin == Address::ZERO {
             return Err(perp_err("placeOrder: fee recipient not initialised"));
         }
-        storage::add_market_fee_total(context, market_id, maker_fee)?;
-        reg.credit_perp_via(context, admin, maker_fee)?;
+        reg.push_event(MatchEvent::FeeCredit {
+            market_id,
+            amount: maker_fee,
+        });
+        reg.credit_admin(admin, maker_fee)?;
     }
 
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::PositionChanged {
-            user: maker,
-            marketId: market_id,
-            amount: pos_snapshot.amount,
-            vQuoteBalance: pos_snapshot.v_quote_balance,
-            margin: pos_snapshot.margin,
-            leverage: pos_snapshot.leverage,
-        }
-        .to_log_data(),
+    reg.push_event(MatchEvent::PositionChanged {
+        user: maker,
+        pos: pos_snapshot,
     });
 
     Ok(MakerFillOutcome::Filled { maker_fee })
@@ -465,15 +611,13 @@ pub(super) fn cancel_rejected_maker_registry<CTX: ContextTr>(
         Side::Sell => w.dirty_sell = true,
     }
     maker_order.status = OrderStatus::Cancelled;
-    storage::save_order(context, order_id, maker_order)?;
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::OrderCancelled {
-            user: maker,
-            orderId: primitives::FixedBytes(*order_id),
-            marketId: market_id,
-        }
-        .to_log_data(),
+    reg.push_event(MatchEvent::SaveOrder {
+        order_id: *order_id,
+        order: maker_order.clone(),
+    });
+    reg.push_event(MatchEvent::OrderCancelled {
+        user: maker,
+        order_id: *order_id,
     });
     Ok(())
 }
@@ -1061,32 +1205,6 @@ fn apply_position_fill(
 }
 
 // ── Order entry updates after fill ───────────────────────────────────────────
-
-/// Shrinks the maker's order entry by `fill_qty` and returns the fee that was
-/// pre-reserved for the filled portion (old fee − new fee).
-///
-/// The fee delta is computed as a difference of two `calc_trading_fee` calls
-/// rather than a direct proportion so that rounding is consistent with how the
-/// fee was originally reserved at order placement.
-fn reduce_maker_order_entry_for_fill<CTX: ContextTr>(
-    context: &mut CTX,
-    user: Address,
-    market_id: u64,
-    side: Side,
-    order_id: &[u8; 32],
-    fill_qty: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<u64, PrecompileError> {
-    match side {
-        // #21 靶子2: update the maker entry's remaining amount IN PLACE (no load/store clone).
-        Side::Buy => storage::mutate_buy_orders(context, user, market_id, |entries| {
-            reduce_order_entry_core(entries, order_id, fill_qty, market, "buy")
-        })?,
-        Side::Sell => storage::mutate_sell_orders(context, user, market_id, |entries| {
-            reduce_order_entry_core(entries, order_id, fill_qty, market, "sell")
-        })?,
-    }
-}
 
 /// PURE core of [`reduce_maker_order_entry_for_fill`] (commit-only #23, tranche-4 step 1):
 /// operates on an in-memory entry list only — no storage access — so the match compute phase can

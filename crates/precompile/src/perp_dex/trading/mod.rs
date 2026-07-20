@@ -938,23 +938,20 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let taker_fee =
                         calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
                     last_trade_price = Some(ask_price);
-                    emit_trade(
-                        context,
-                        TradeEvent {
-                            market_id,
-                            taker_order_id,
-                            maker_order_id: &maker_id,
-                            taker: taker_addr,
-                            maker: Address::from(maker_order.owner),
-                            price: ask_price,
-                            quantity: fill_qty,
-                            taker_side: Side::Buy,
-                            taker_fee,
-                            maker_fee,
-                        },
-                    )?;
+                    registry.push_event(settlement::MatchEvent::Trade {
+                        market_id,
+                        taker_order_id: *taker_order_id,
+                        maker_order_id: maker_id,
+                        taker: taker_addr,
+                        maker: Address::from(maker_order.owner),
+                        price: ask_price,
+                        quantity: fill_qty,
+                        taker_side: Side::Buy,
+                        taker_fee,
+                        maker_fee,
+                    });
 
-                    // Update the maker order in place — settle_maker_fill does not touch the
+                    // Update the maker order in place — the registry settle does not touch the
                     // maker Order struct, so the value loaded above is still current.
                     maker_order.filled += fill_qty;
                     maker_order.status = if maker_order.filled >= maker_order.quantity {
@@ -962,7 +959,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    storage::save_order(context, &maker_id, &maker_order)?;
+                    registry.push_event(settlement::MatchEvent::SaveOrder {
+                        order_id: maker_id,
+                        order: maker_order.clone(),
+                    });
 
                     // Accumulate into the hoisted taker order (saved once after the loop).
                     taker_order.filled += fill_qty;
@@ -1087,21 +1087,18 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let taker_fee =
                         calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
                     last_trade_price = Some(bid_price);
-                    emit_trade(
-                        context,
-                        TradeEvent {
-                            market_id,
-                            taker_order_id,
-                            maker_order_id: &maker_id,
-                            taker: taker_addr,
-                            maker: Address::from(maker_order.owner),
-                            price: bid_price,
-                            quantity: fill_qty,
-                            taker_side: Side::Sell,
-                            taker_fee,
-                            maker_fee,
-                        },
-                    )?;
+                    registry.push_event(settlement::MatchEvent::Trade {
+                        market_id,
+                        taker_order_id: *taker_order_id,
+                        maker_order_id: maker_id,
+                        taker: taker_addr,
+                        maker: Address::from(maker_order.owner),
+                        price: bid_price,
+                        quantity: fill_qty,
+                        taker_side: Side::Sell,
+                        taker_fee,
+                        maker_fee,
+                    });
 
                     maker_order.filled += fill_qty;
                     maker_order.status = if maker_order.filled >= maker_order.quantity {
@@ -1109,7 +1106,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    storage::save_order(context, &maker_id, &maker_order)?;
+                    registry.push_event(settlement::MatchEvent::SaveOrder {
+                        order_id: maker_id,
+                        order: maker_order.clone(),
+                    });
 
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
@@ -1158,44 +1158,6 @@ pub(super) fn match_order<CTX: ContextTr>(
         storage::save_last_traded_price(context, market_id, price)?;
     }
     Ok(remaining)
-}
-
-struct TradeEvent<'a> {
-    market_id: u64,
-    taker_order_id: &'a [u8; 32],
-    maker_order_id: &'a [u8; 32],
-    taker: Address,
-    maker: Address,
-    price: u64,
-    quantity: u64,
-    taker_side: Side,
-    taker_fee: u64,
-    maker_fee: u64,
-}
-
-fn emit_trade<CTX: ContextTr>(
-    context: &mut CTX,
-    trade: TradeEvent<'_>,
-) -> Result<(), PrecompileError> {
-    let trade_id = storage::next_trade_id(context, trade.market_id)?;
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::Trade {
-            marketId: trade.market_id,
-            tradeId: trade_id,
-            takerOrderId: FixedBytes(*trade.taker_order_id),
-            makerOrderId: FixedBytes(*trade.maker_order_id),
-            taker: trade.taker,
-            maker: trade.maker,
-            price: trade.price,
-            quantity: trade.quantity,
-            takerSide: trade.taker_side as u8,
-            takerFee: trade.taker_fee,
-            makerFee: trade.maker_fee,
-        }
-        .to_log_data(),
-    });
-    Ok(())
 }
 
 // ── Resting in book ───────────────────────────────────────────────────────────
