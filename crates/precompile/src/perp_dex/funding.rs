@@ -32,14 +32,6 @@ use crate::{
     PrecompileError,
 };
 
-/// Settle accrued funding on `pos` against the market's cumulative funding index,
-/// then re-anchor the position to the current index.
-///
-/// `wallet` is the owner's `perp_wallet_balance` (passed separately so the caller
-/// keeps ownership of the rest of the account). The caller is responsible for
-/// persisting `pos` and the account afterwards.
-///
-/// No-op (beyond re-anchoring) for a flat position or when the index has not moved.
 /// A funding settlement computed in memory but NOT yet written (commit-only #23). The
 /// wallet→margin waterfall has already been applied to the caller's in-memory `pos`/`wallet`; the
 /// insurance-fund charge + `FundingSettled` payload are carried here for a later
