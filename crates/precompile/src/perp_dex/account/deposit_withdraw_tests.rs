@@ -108,6 +108,15 @@ fn deposit_rejects_when_total_would_exceed_i64_max() {
         &mut ctx,
     )
     .unwrap();
+    // Capture state after the first (valid) deposit.
+    let caller_usdc_before = storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, ALICE).unwrap();
+    let dex_usdc_before =
+        storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, PERP_DEX_ADDRESS).unwrap();
+    let internal_before = storage::load_account(&mut ctx, ALICE)
+        .unwrap()
+        .usdc_balance
+        .clone();
+
     let err = run_deposit(
         &depositCall { amount: two_thirds }.abi_encode(),
         ALICE,
@@ -115,6 +124,26 @@ fn deposit_rejects_when_total_would_exceed_i64_max() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("exceed i64::MAX"), "{err}");
+
+    // commit-only #23 (validate-then-apply): the rejected deposit must leave ZERO writes. This
+    // unit test never invokes checkpoint_revert, so any pre-error write is VISIBLE here — under
+    // the old write-then-error ordering the caller/DEX USDC legs had already moved before the MAX
+    // reject (a USDC-loss under commit-only). This asserts the reject touches nothing.
+    assert_eq!(
+        storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, ALICE).unwrap(),
+        caller_usdc_before,
+        "rejected deposit moved caller USDC"
+    );
+    assert_eq!(
+        storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, PERP_DEX_ADDRESS).unwrap(),
+        dex_usdc_before,
+        "rejected deposit moved DEX custody"
+    );
+    assert_eq!(
+        storage::load_account(&mut ctx, ALICE).unwrap().usdc_balance,
+        internal_before,
+        "rejected deposit changed internal balance"
+    );
 }
 
 #[test]
@@ -241,8 +270,9 @@ fn deposit_revert_rolls_back_both_on_trie_and_off_trie() {
     run_deposit(&depositCall { amount }.abi_encode(), ALICE, &mut ctx).unwrap();
 
     // After deposit: internal perp account credited (off-trie), ERC-20 balance drained (on-trie).
-    let (usdc_internal, _) =
-        decode_get_account(&run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap());
+    let (usdc_internal, _) = decode_get_account(
+        &run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap(),
+    );
     assert_eq!(usdc_internal, amount);
     assert_eq!(
         storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, ALICE).unwrap(),
@@ -253,9 +283,14 @@ fn deposit_revert_rolls_back_both_on_trie_and_off_trie() {
     ctx.journal_mut().checkpoint_revert(cp);
 
     // Both stores roll back together.
-    let (usdc_internal_after, _) =
-        decode_get_account(&run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap());
-    assert_eq!(usdc_internal_after, U256::ZERO, "off-trie internal balance must revert");
+    let (usdc_internal_after, _) = decode_get_account(
+        &run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap(),
+    );
+    assert_eq!(
+        usdc_internal_after,
+        U256::ZERO,
+        "off-trie internal balance must revert"
+    );
     assert_eq!(
         storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, ALICE).unwrap(),
         amount,
