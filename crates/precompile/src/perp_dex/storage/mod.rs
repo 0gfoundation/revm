@@ -683,64 +683,15 @@ fn registry_remove<CTX: ContextTr>(
 
 // ── Order entry lists (per-user per-market) ───────────────────────────────────
 
-/// Diagnostic (commit-only #23 perf): counts OWNED order-list clones + total entries copied, to
-/// apportion the realistic-scenario matching-path cost (owned `load_*_orders` vs Arc `_ref`).
-pub static ORDER_LIST_CLONES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static ORDER_LIST_CLONE_ENTRIES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
-#[inline]
-pub fn order_list_clone_stats() -> (u64, u64) {
-    (
-        ORDER_LIST_CLONES.load(core::sync::atomic::Ordering::Relaxed),
-        ORDER_LIST_CLONE_ENTRIES.load(core::sync::atomic::Ordering::Relaxed),
-    )
-}
-#[inline]
-pub fn note_order_list_clone(entries: usize) {
-    ORDER_LIST_CLONES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    ORDER_LIST_CLONE_ENTRIES.fetch_add(entries as u64, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Phase timers (commit-only #23 perf apportionment): nanoseconds accumulated in the match hot
-/// path — the read-only book WALK, the taker FINALIZE-compute (incl. the rest/wallet-cover sim),
-/// and the FLUSH (event replay + per-user saves). Read via [`match_phase_ns`] after a run.
-pub static MATCH_WALK_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static MATCH_FINALIZE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static MATCH_FLUSH_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static MATCH_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[inline]
-pub fn add_match_walk_ns(ns: u64) {
-    MATCH_WALK_NS.fetch_add(ns, core::sync::atomic::Ordering::Relaxed);
-    MATCH_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-#[inline]
-pub fn add_match_finalize_ns(ns: u64) {
-    MATCH_FINALIZE_NS.fetch_add(ns, core::sync::atomic::Ordering::Relaxed);
-}
-#[inline]
-pub fn add_match_flush_ns(ns: u64) {
-    MATCH_FLUSH_NS.fetch_add(ns, core::sync::atomic::Ordering::Relaxed);
-}
-/// `(walk_ns, finalize_ns, flush_ns, match_calls)`.
-pub fn match_phase_ns() -> (u64, u64, u64, u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    (
-        MATCH_WALK_NS.load(Relaxed),
-        MATCH_FINALIZE_NS.load(Relaxed),
-        MATCH_FLUSH_NS.load(Relaxed),
-        MATCH_CALLS.load(Relaxed),
-    )
-}
-
 pub fn load_buy_orders<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
 ) -> Result<Vec<OrderEntry>, PrecompileError> {
-    let v = load_cached::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?
-        .unwrap_or_default();
-    note_order_list_clone(v.len());
-    Ok(v)
+    Ok(
+        load_cached::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?
+            .unwrap_or_default(),
+    )
 }
 
 /// Zero-copy user buy-order-entry list (点1): `Arc<Vec<OrderEntry>>`, no per-read clone. PURE reads
@@ -777,10 +728,10 @@ pub fn load_sell_orders<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<Vec<OrderEntry>, PrecompileError> {
-    let v = load_cached::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?
-        .unwrap_or_default();
-    note_order_list_clone(v.len());
-    Ok(v)
+    Ok(
+        load_cached::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?
+            .unwrap_or_default(),
+    )
 }
 
 /// Zero-copy user sell-order-entry list (点1): `Arc<Vec<OrderEntry>>`, no per-read clone. PURE reads

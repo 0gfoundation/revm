@@ -237,8 +237,6 @@ impl TakerSettlement {
             let mut sim_account = w.account.clone();
             let mut sim_buy = w.buy_entries.clone();
             let mut sim_sell = w.sell_entries.clone();
-            storage::note_order_list_clone(sim_buy.len());
-            storage::note_order_list_clone(sim_sell.len());
             while !sim_account.has_available_perp(core.total_required) {
                 let next = match taker_side {
                     Side::Buy => sim_buy.last().map(|e| e.order_id),
