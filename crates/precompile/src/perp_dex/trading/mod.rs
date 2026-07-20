@@ -1584,106 +1584,87 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let mut account = storage::load_account(context, user)?;
+    let mut buy_entries = storage::load_buy_orders(context, user, market_id)?;
+    let mut sell_entries = storage::load_sell_orders(context, user, market_id)?;
 
+    release_margin_core(
+        &mut pos,
+        &mut account,
+        &mut buy_entries,
+        &mut sell_entries,
+        side,
+        order_id,
+        market,
+    )?;
+
+    // Persist: only the cancelled side's list changed (keeps the write-key set identical to the
+    // old in-place mutate), then position + account.
     match side {
-        Side::Buy => {
-            // Flip-aware reservation snapshot before removal (pos.margin_reserved,
-            // not the per-side max — the per-side fields lag it under the model).
-            let old_reserved = pos.margin_reserved;
-            // The book entry's `amount` is the authoritative remaining quantity
-            // (kept current by reduce_maker_order_entry_for_fill); the order's
-            // `filled` can lag it during the same matching round, so the release
-            // is sized from the entry, not from order.quantity - order.filled.
-            // #21 靶子2: remove + recompute IN PLACE (no load/store clone of the list).
-            let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
-            let pos_amount = pos.amount;
-            let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let (cancelled_entry, (new_notional, sell_notional, c_notional)) =
-                storage::mutate_buy_orders(
-                    context,
-                    user,
-                    market_id,
-                    |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
-                        let cancelled = remove_order_entry(entries, order_id, "buy")?;
-                        let notionals =
-                            calc_reservation_notionals(entries, &sell_entries, bd, pd, pos_amount)?;
-                        Ok((cancelled, notionals))
-                    },
-                )??;
-            let leverage = pos.leverage;
-            pos.set_reservations(new_notional, sell_notional, c_notional, leverage);
-            let new_reserved = pos.margin_reserved;
-            let freed = old_reserved.saturating_sub(new_reserved);
-            let fee_freed = calc_maker_fee_for_order_qty_with_bps(
-                cancelled_entry.price,
-                cancelled_entry.amount,
-                cancelled_entry.maker_fee_bps,
-                market,
-            )?;
-            // Return released margin + fee reservation in one credit (mirrors the
-            // combined debit on the placement path).
-            let total_freed = freed
-                .checked_add(fee_freed)
-                .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
-            account.credit_perp(total_freed)?;
-            // Surface drift instead of masking it (was saturating_sub).
-            let prev_fee = pos.fee_reserved;
-            pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
-                perp_invariant_err(format!(
-                    "fee_reserved {prev_fee} < fee to release {fee_freed}"
-                ))
-            })?;
-            // #21: buy-order list mutated in place above — no save here.
-        }
-        Side::Sell => {
-            // Flip-aware reservation snapshot before removal (pos.margin_reserved,
-            // not the per-side max — the per-side fields lag it under the model).
-            let old_reserved = pos.margin_reserved;
-            // #21 靶子2: remove + recompute IN PLACE (no load/store clone of the list).
-            let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
-            let pos_amount = pos.amount;
-            let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let (cancelled_entry, (buy_notional, new_notional, c_notional)) =
-                storage::mutate_sell_orders(
-                    context,
-                    user,
-                    market_id,
-                    |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
-                        let cancelled = remove_order_entry(entries, order_id, "sell")?;
-                        let notionals =
-                            calc_reservation_notionals(&buy_entries, entries, bd, pd, pos_amount)?;
-                        Ok((cancelled, notionals))
-                    },
-                )??;
-            let leverage = pos.leverage;
-            pos.set_reservations(buy_notional, new_notional, c_notional, leverage);
-            let new_reserved = pos.margin_reserved;
-            let freed = old_reserved.saturating_sub(new_reserved);
-            let fee_freed = calc_maker_fee_for_order_qty_with_bps(
-                cancelled_entry.price,
-                cancelled_entry.amount,
-                cancelled_entry.maker_fee_bps,
-                market,
-            )?;
-            // Return released margin + fee reservation in one credit (mirrors the
-            // combined debit on the placement path).
-            let total_freed = freed
-                .checked_add(fee_freed)
-                .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
-            account.credit_perp(total_freed)?;
-            // Surface drift instead of masking it (was saturating_sub).
-            let prev_fee = pos.fee_reserved;
-            pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
-                perp_invariant_err(format!(
-                    "fee_reserved {prev_fee} < fee to release {fee_freed}"
-                ))
-            })?;
-            // #21: sell-order list mutated in place above — no save here.
-        }
+        Side::Buy => storage::save_buy_orders(context, user, market_id, &buy_entries)?,
+        Side::Sell => storage::save_sell_orders(context, user, market_id, &sell_entries)?,
     }
-
     storage::save_position(context, user, market_id, &pos)?;
     storage::save_account(context, user, account)?;
+    Ok(())
+}
+
+/// PURE core of [`release_margin_for_cancelled_order`] (commit-only #23, tranche-4): removes the
+/// entry, recomputes the flip-aware reservation, and credits the freed margin + fee reservation —
+/// over in-memory working copies only, NO storage access. The match compute phase runs this to
+/// simulate the taker wallet-cover LIFO cancels (and plan them) before any write.
+///
+/// The book entry's `amount` is the authoritative remaining quantity (kept current by
+/// `reduce_order_entry_core`); the order's `filled` can lag it during the same matching round, so
+/// the release is sized from the entry, not from `order.quantity - order.filled`.
+pub(super) fn release_margin_core(
+    pos: &mut crate::perp_dex::types::PerpPosition,
+    account: &mut crate::perp_dex::types::UserAccount,
+    buy_entries: &mut Vec<OrderEntry>,
+    sell_entries: &mut Vec<OrderEntry>,
+    side: Side,
+    order_id: &[u8; 32],
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    // Flip-aware reservation snapshot before removal (pos.margin_reserved, not the per-side max —
+    // the per-side fields lag it under the model).
+    let old_reserved = pos.margin_reserved;
+    let cancelled_entry = {
+        let (entries, label) = match side {
+            Side::Buy => (&mut *buy_entries, "buy"),
+            Side::Sell => (&mut *sell_entries, "sell"),
+        };
+        remove_order_entry(entries, order_id, label)?
+    };
+    let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
+        buy_entries,
+        sell_entries,
+        market.base_decimals,
+        market.price_decimals,
+        pos.amount,
+    )?;
+    let leverage = pos.leverage;
+    pos.set_reservations(buy_notional, sell_notional, c_notional, leverage);
+    let new_reserved = pos.margin_reserved;
+    let freed = old_reserved.saturating_sub(new_reserved);
+    let fee_freed = calc_maker_fee_for_order_qty_with_bps(
+        cancelled_entry.price,
+        cancelled_entry.amount,
+        cancelled_entry.maker_fee_bps,
+        market,
+    )?;
+    // Return released margin + fee reservation in one credit (mirrors the combined debit on the
+    // placement path).
+    let total_freed = freed
+        .checked_add(fee_freed)
+        .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
+    account.credit_perp(total_freed)?;
+    // Surface drift instead of masking it (was saturating_sub).
+    let prev_fee = pos.fee_reserved;
+    pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
+        perp_invariant_err(format!(
+            "fee_reserved {prev_fee} < fee to release {fee_freed}"
+        ))
+    })?;
     Ok(())
 }
 
