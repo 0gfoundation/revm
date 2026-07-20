@@ -508,13 +508,16 @@ fn credit_fee_recipient<CTX: ContextTr>(
     if amount == 0 {
         return Ok(());
     }
-    storage::add_market_fee_total(context, market_id, amount)?;
+    // commit-only #23: validate (admin set + credit fits) BEFORE any write. Previously
+    // add_market_fee_total wrote before the admin==ZERO reject → a stranded fee-total bump.
     let admin = storage::load_admin(context)?;
     if admin == Address::ZERO {
         return Err(perp_err("placeOrder: fee recipient not initialised"));
     }
     let mut account = storage::load_account(context, admin)?;
     account.credit_perp(amount)?;
+    // ── APPLY ── (fee-total then account, same order as before)
+    storage::add_market_fee_total(context, market_id, amount)?;
     storage::save_account(context, admin, account)
 }
 
