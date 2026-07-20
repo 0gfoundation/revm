@@ -633,20 +633,19 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     if pos.amount == 0 {
         return Ok(LiquidationOutcome::NoPosition);
     }
-    // Settle accrued funding on the liquidated position first, so the charge
-    // counts toward insolvency and is realised before the position is closed.
-    {
-        let mut account = storage::load_account(context, user)?;
-        settle_position_funding(
-            context,
-            user,
-            market,
-            &mut pos,
-            &mut account.perp_wallet_balance,
-        )?;
-        storage::save_account(context, user, account)?;
-    }
-    storage::save_position(context, user, market_id, &pos)?;
+    // commit-only #23: compute accrued funding IN MEMORY first (no insurance-fund write), so the
+    // maintenance check sees the post-funding position but an AboveMaintenance outcome leaves
+    // ZERO writes. This is what makes the liquidation sweep's healthy-candidate scan write-free
+    // (previously every scanned healthy account wrote a funding settle that only checkpoint_revert
+    // discarded) and makes manual liquidate reject cleanly without relying on undo.
+    let mut account = storage::load_account(context, user)?;
+    let pending_funding = compute_funding_settlement(
+        context,
+        user,
+        market,
+        &mut pos,
+        &mut account.perp_wallet_balance,
+    )?;
     if is_above_maintenance_margin(
         mark_price,
         pos.amount,
@@ -657,6 +656,13 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     )? {
         return Ok(LiquidationOutcome::AboveMaintenance);
     }
+
+    // ── APPLY (liquidatable — commit the funding settle, then close) ──
+    if let Some(p) = pending_funding {
+        apply_funding_settlement(context, p)?;
+    }
+    storage::save_account(context, user, account)?;
+    storage::save_position(context, user, market_id, &pos)?;
 
     let liq_amount = pos.amount;
     let liquidation_side = if pos.amount > 0 {

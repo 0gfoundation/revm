@@ -467,6 +467,42 @@ fn settle_funding_charge_beyond_margin_absorbs_from_insurance_fund() {
 }
 
 #[test]
+fn healthy_candidate_scan_is_write_free_even_with_accrued_funding() {
+    // commit-only #23: liquidate_position on a HEALTHY position computes funding in memory and
+    // returns AboveMaintenance with ZERO writes — even when the accrued funding would dip into
+    // the insurance fund. Previously it persisted the funding settle (IF draw + pos/account) and
+    // relied on checkpoint_revert/tx-revert to discard it; unit tests never revert, so any
+    // pre-reject write is visible here.
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
+    set_funding_index(&mut ctx, 75_000_000); // small charge (7.5M < wallet 50M): stays healthy
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let pos_before = position(&mut ctx, ALICE);
+    let acct_before = storage::load_account(&mut ctx, ALICE).unwrap();
+
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    let out = liquidate_position(&mut ctx, ALICE, MARKET_ID, &market, ENTRY_PRICE, KEEPER).unwrap();
+    assert!(
+        matches!(out, LiquidationOutcome::AboveMaintenance),
+        "{out:?}"
+    );
+
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        if_before,
+        "IF drawn"
+    );
+    assert_eq!(position(&mut ctx, ALICE), pos_before, "position written");
+    assert_eq!(
+        storage::load_account(&mut ctx, ALICE).unwrap(),
+        acct_before,
+        "account written"
+    );
+}
+
+#[test]
 fn add_margin_rejected_after_funding_leaves_insurance_fund_untouched() {
     // commit-only #23 (validate-then-apply): a margin op that settles funding (drawing from the
     // insurance fund) and THEN rejects must leave the IF untouched. Under the old ordering the
