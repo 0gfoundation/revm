@@ -1221,12 +1221,13 @@ fn rest_in_book<CTX: ContextTr>(
             };
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
+            // commit-only #23: simulate the insert on an OWNED copy (no write), so the
+            // has_available reject below leaves the stored list untouched.
+            let mut buy_list = storage::load_buy_orders(context, user, market_id)?;
+            let idx = buy_list.partition_point(|e| e.price > price);
+            buy_list.insert(idx, new_entry);
             let (new_buy_side_notional, sell_notional, c_notional) =
-                storage::mutate_buy_orders(context, user, market_id, |entries| {
-                    let idx = entries.partition_point(|e| e.price > price);
-                    entries.insert(idx, new_entry);
-                    calc_reservation_notionals(entries, &sell_entries, bd, pd, pos_amount)
-                })??;
+                calc_reservation_notionals(&buy_list, &sell_entries, bd, pd, pos_amount)?;
             let order_fee_reserved =
                 calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
             // Adding an order can only grow the buy-side notional (checked before
@@ -1259,8 +1260,8 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
-            // Persist order book state. (#21: the buy-order list was mutated in place above — no
-            // save_buy_orders here.)
+            // ── APPLY (all rejects passed) ──
+            storage::save_buy_orders(context, user, market_id, &buy_list)?;
             storage::insert_bid_price(context, market_id, price)?;
             storage::push_bid_order(context, market_id, price, *order_id)?;
 
@@ -1284,12 +1285,13 @@ fn rest_in_book<CTX: ContextTr>(
             };
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
+            // commit-only #23: simulate the insert on an OWNED copy (no write), so the
+            // has_available reject below leaves the stored list untouched.
+            let mut sell_list = storage::load_sell_orders(context, user, market_id)?;
+            let idx = sell_list.partition_point(|e| e.price < price);
+            sell_list.insert(idx, new_entry);
             let (buy_notional, new_sell_side_notional, c_notional) =
-                storage::mutate_sell_orders(context, user, market_id, |entries| {
-                    let idx = entries.partition_point(|e| e.price < price);
-                    entries.insert(idx, new_entry);
-                    calc_reservation_notionals(&buy_entries, entries, bd, pd, pos_amount)
-                })??;
+                calc_reservation_notionals(&buy_entries, &sell_list, bd, pd, pos_amount)?;
             let order_fee_reserved =
                 calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
             // Adding an order can only grow the sell-side notional (checked before
@@ -1322,7 +1324,8 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
-            // Persist order book state. (#21: the sell-order list was mutated in place above.)
+            // ── APPLY (all rejects passed) ──
+            storage::save_sell_orders(context, user, market_id, &sell_list)?;
             storage::insert_ask_price(context, market_id, price)?;
             storage::push_ask_order(context, market_id, price, *order_id)?;
 
