@@ -14,7 +14,7 @@ mod settlement;
 pub(crate) use liquidation::{
     execute_liquidation_market_order, settle_liquidation_residual_at_mark_price,
 };
-use settlement::{settle_maker_fill, MakerFillOutcome, TakerSettlement};
+use settlement::{MakerFillOutcome, TakerSettlement};
 
 use crate::{
     perp_dex::{
@@ -829,6 +829,10 @@ pub(super) fn match_order<CTX: ContextTr>(
     let mut last_trade_price = None;
     let mut taker_settlement =
         TakerSettlement::load(context, taker_addr, market_id, waive_taker_fee)?;
+    // commit-only #23 L1: per-user working copies for this match. Each touched maker is loaded
+    // once (funding settled at first touch, exactly where the first per-maker settle did it) and
+    // saved once at the flush below — same write-key set and net values as the old per-fill saves.
+    let mut registry = settlement::MatchRegistry::new();
     // The taker order is mutated once per fill and saved ONCE after the loop. Nothing reads
     // it mid-match: settle_maker_fill touches only the maker; finalize touches the taker's
     // position/account, not this Order; and the taker order is not rested in the book until
@@ -895,8 +899,9 @@ pub(super) fn match_order<CTX: ContextTr>(
                     // maker order (drop it from this level by not re-queuing) and skip —
                     // the taker's `remaining` is untouched so it keeps matching. Funding
                     // is settled+persisted inside either way.
-                    let maker_fee = match settle_maker_fill(
+                    let maker_fee = match settlement::settle_maker_fill_registry(
                         context,
+                        &mut registry,
                         maker_addr,
                         &maker_id,
                         market_id,
@@ -907,8 +912,9 @@ pub(super) fn match_order<CTX: ContextTr>(
                     )? {
                         MakerFillOutcome::Filled { maker_fee } => maker_fee,
                         MakerFillOutcome::RejectedInsolvent => {
-                            cancel_rejected_maker(
+                            settlement::cancel_rejected_maker_registry(
                                 context,
+                                &mut registry,
                                 maker_addr,
                                 market_id,
                                 Side::Sell,
@@ -1042,8 +1048,9 @@ pub(super) fn match_order<CTX: ContextTr>(
 
                     let maker_addr = Address::from(maker_order.owner);
                     // Maker open-solvency guard (K9) — see the mirror on the Buy side.
-                    let maker_fee = match settle_maker_fill(
+                    let maker_fee = match settlement::settle_maker_fill_registry(
                         context,
+                        &mut registry,
                         maker_addr,
                         &maker_id,
                         market_id,
@@ -1054,8 +1061,9 @@ pub(super) fn match_order<CTX: ContextTr>(
                     )? {
                         MakerFillOutcome::Filled { maker_fee } => maker_fee,
                         MakerFillOutcome::RejectedInsolvent => {
-                            cancel_rejected_maker(
+                            settlement::cancel_rejected_maker_registry(
                                 context,
+                                &mut registry,
                                 maker_addr,
                                 market_id,
                                 Side::Buy,
@@ -1133,6 +1141,12 @@ pub(super) fn match_order<CTX: ContextTr>(
             }
         }
     }
+
+    // Flush the per-user working copies BEFORE the taker settlement: on a self-match (the taker
+    // filling their own resting order — no self-trade prevention by design) the taker is also a
+    // registry user, and finalize must read the maker-side effects from storage as it did when
+    // the loop saved per fill.
+    registry.flush(context, market_id)?;
 
     // Persist the taker order once with its accumulated fill (saved here, not per fill,
     // since nothing reads it during the match). Skipped when nothing matched.
@@ -1541,36 +1555,6 @@ pub(super) fn remove_from_book_during_match<CTX: ContextTr>(
     if emptied {
         refresh_best_and_sample(context, market_id, side, old_best)?;
     }
-    Ok(())
-}
-
-/// Cancel a maker order that a taker fill would have opened into insolvency
-/// (K9 maker-side guard). Releases the reserved margin + fee back to the maker's
-/// wallet and removes the order from the maker's per-user index (via
-/// `release_margin_for_cancelled_order`), marks the order `Cancelled`, and emits
-/// `OrderCancelled`. The caller drops it from the price-level queue by not
-/// re-adding it to `new_queue`.
-fn cancel_rejected_maker<CTX: ContextTr>(
-    context: &mut CTX,
-    maker: Address,
-    market_id: u64,
-    maker_side: Side,
-    order_id: &[u8; 32],
-    order: &mut crate::perp_dex::types::Order,
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
-    release_margin_for_cancelled_order(context, maker, market_id, maker_side, order_id, market)?;
-    order.status = OrderStatus::Cancelled;
-    storage::save_order(context, order_id, order)?;
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::OrderCancelled {
-            user: maker,
-            orderId: FixedBytes(*order_id),
-            marketId: market_id,
-        }
-        .to_log_data(),
-    });
     Ok(())
 }
 

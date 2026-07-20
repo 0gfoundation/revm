@@ -245,55 +245,130 @@ impl TakerSettlement {
     }
 }
 
-/// Settles one fill event on the maker side.
-///
-/// Unlike the taker path, makers are settled one fill at a time — there is no
-/// accumulator because each maker order is a distinct price level that the
-/// matcher processes independently.
-///
-/// # Margin accounting
-///
-/// The maker pre-reserved margin (`old_reserved`) is captured **before** any
-/// mutation so it reflects the full pre-fill reservation.  After the fill:
-/// - the order entry shrinks (or disappears),
-/// - the position changes size,
-/// - `new_reserved` is recomputed from scratch (not incrementally) to avoid
-///   drift, and
-/// - `opening_margin` covers any new position exposure.
-///
-/// `old_reserved` distributes across three destinations after the fill:
-///
-/// ```text
-/// old_reserved = opening_margin + new_reserved + net_release
-/// ```
-///
-/// - `opening_margin` → transitions from MR into `pos.margin`.  Always
-///   covered: `opening_margin ≤ fill_margin ≤ side_margin ≤ old_reserved`.
-/// - `new_reserved`   → stays locked in MR for remaining open orders.
-/// - `net_release`    → returned to wallet (≥ 0 in the common case).
-///
-/// When a fill **crosses the position sign** (long → short or vice versa),
-/// cross-side netting shifts and `new_reserved` can exceed
-/// `old_reserved − opening_margin` (deficit).  In that case the maker's open
-/// orders are auto-cancelled (dominant side first, LIFO) until MR fits within
-/// what was pre-paid — mirroring the taker's `ensure` logic.
-///
-/// A maker's trading fee is pre-reserved and released from `pos.fee_reserved`,
-/// not charged from the wallet.
-/// Outcome of attempting to settle one maker fill.
+/// Outcome of attempting to settle one maker fill. A maker's trading fee is pre-reserved and
+/// released from `pos.fee_reserved`, not charged from the wallet.
 pub(super) enum MakerFillOutcome {
     /// The fill was applied; carries the maker's trading fee.
     Filled { maker_fee: u64 },
-    /// Filling this maker would have opened/increased its position below the
-    /// maintenance-margin threshold at the current mark (K9). The fill was NOT
-    /// applied; the caller must cancel the maker order. Funding accrued on the
-    /// maker's position IS settled and persisted (it is owed regardless of the
-    /// fill, and may already have touched the Insurance Fund inline).
+    /// Filling this maker would have opened/increased its position below the maintenance-margin
+    /// threshold at the current mark (K9). The fill was NOT applied; the caller must cancel the
+    /// maker order. Funding accrued on the maker's position IS settled and persisted (it is owed
+    /// regardless of the fill, and may already have touched the Insurance Fund inline).
     RejectedInsolvent,
 }
 
-pub(super) fn settle_maker_fill<CTX: ContextTr>(
+// ── Match working-copy registry (commit-only #23, tranche-4 L1) ─────────────────
+// Per-user working copies for one match: each touched user (maker, and taker on self-match) is
+// loaded ONCE (with funding computed+applied at first touch, exactly where today's first
+// settle_maker_fill did it) and saved ONCE at flush — same write-key set and net values as
+// today's per-fill saves, with per-list dirty flags so an untouched list never enters the delta.
+// Vec-backed (few users per match) for deterministic flush order.
+
+pub(super) struct UserWork {
+    pos: crate::perp_dex::types::PerpPosition,
+    account: crate::perp_dex::types::UserAccount,
+    buy_entries: Vec<crate::perp_dex::types::OrderEntry>,
+    sell_entries: Vec<crate::perp_dex::types::OrderEntry>,
+    dirty_buy: bool,
+    dirty_sell: bool,
+}
+
+pub(super) struct MatchRegistry {
+    users: Vec<(Address, UserWork)>,
+}
+
+impl MatchRegistry {
+    pub(super) fn new() -> Self {
+        Self { users: Vec::new() }
+    }
+
+    /// First touch loads pos/account/both lists and settles funding (compute in memory + apply
+    /// IF/logs immediately — the same stream position as today's first per-maker settle).
+    fn get_or_load<CTX: ContextTr>(
+        &mut self,
+        context: &mut CTX,
+        user: Address,
+        market_id: u64,
+        market: &crate::perp_dex::types::Market,
+    ) -> Result<usize, PrecompileError> {
+        if let Some(i) = self.users.iter().position(|(a, _)| *a == user) {
+            return Ok(i);
+        }
+        let mut pos = storage::load_position(context, user, market_id)?;
+        let mut account = storage::load_account(context, user)?;
+        let pending = crate::perp_dex::funding::compute_funding_settlement(
+            context,
+            user,
+            market,
+            &mut pos,
+            &mut account.perp_wallet_balance,
+        )?;
+        if let Some(p) = pending {
+            crate::perp_dex::funding::apply_funding_settlement(context, p)?;
+        }
+        let buy_entries = storage::load_buy_orders(context, user, market_id)?;
+        let sell_entries = storage::load_sell_orders(context, user, market_id)?;
+        self.users.push((
+            user,
+            UserWork {
+                pos,
+                account,
+                buy_entries,
+                sell_entries,
+                dirty_buy: false,
+                dirty_sell: false,
+            },
+        ));
+        Ok(self.users.len() - 1)
+    }
+
+    /// Credits `amount` into `user`'s perp wallet through the registry if present (so a fee
+    /// recipient who is also a trading party in this match sees a consistent evolution), else
+    /// directly through storage (the common case).
+    fn credit_perp_via<CTX: ContextTr>(
+        &mut self,
+        context: &mut CTX,
+        user: Address,
+        amount: u64,
+    ) -> Result<(), PrecompileError> {
+        if let Some((_, w)) = self.users.iter_mut().find(|(a, _)| *a == user) {
+            w.account.credit_perp(amount)?;
+            return Ok(());
+        }
+        let mut account = storage::load_account(context, user)?;
+        account.credit_perp(amount)?;
+        storage::save_account(context, user, account)
+    }
+
+    /// Writes every touched user's final state: dirty lists, then position + account (both always
+    /// dirty — funding/fill effects). Same key set as today's per-fill saves, net values equal.
+    pub(super) fn flush<CTX: ContextTr>(
+        self,
+        context: &mut CTX,
+        market_id: u64,
+    ) -> Result<(), PrecompileError> {
+        for (user, w) in self.users {
+            if w.dirty_buy {
+                storage::save_buy_orders(context, user, market_id, &w.buy_entries)?;
+            }
+            if w.dirty_sell {
+                storage::save_sell_orders(context, user, market_id, &w.sell_entries)?;
+            }
+            storage::save_position(context, user, market_id, &w.pos)?;
+            storage::save_account(context, user, w.account)?;
+        }
+        Ok(())
+    }
+}
+
+/// Registry-backed maker fill (commit-only #23 L1): identical decision + effects to
+/// [`settle_maker_fill`] but pos/account/lists evolve in the registry (saved once at flush).
+/// IF writes (bad debt), fee credit, and the PositionChanged log stay immediate — the same
+/// stream positions as today.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn settle_maker_fill_registry<CTX: ContextTr>(
     context: &mut CTX,
+    reg: &mut MatchRegistry,
     maker: Address,
     maker_order_id: &[u8; 32],
     market_id: u64,
@@ -303,26 +378,15 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
 ) -> Result<MakerFillOutcome, PrecompileError> {
     let maker_side = taker_side.opposite();
-    let mut pos = storage::load_position(context, maker, market_id)?;
-    let mut account = storage::load_account(context, maker)?;
-    // Funding is owed independent of the fill outcome, so it persists on BOTH the filled and
-    // rejected paths — computed in memory here (commit-only #23), applied below.
-    let pending_funding = crate::perp_dex::funding::compute_funding_settlement(
-        context,
-        maker,
-        market,
-        &mut pos,
-        &mut account.perp_wallet_balance,
-    )?;
-    let mut buy_entries = storage::load_buy_orders(context, maker, market_id)?;
-    let mut sell_entries = storage::load_sell_orders(context, maker, market_id)?;
+    let i = reg.get_or_load(context, maker, market_id, market)?;
     let mark = storage::load_mark_price(context, market_id)?;
 
+    let w = &mut reg.users[i].1;
     let core = settle_maker_fill_core(
-        &mut pos,
-        &mut account,
-        &mut buy_entries,
-        &mut sell_entries,
+        &mut w.pos,
+        &mut w.account,
+        &mut w.buy_entries,
+        &mut w.sell_entries,
         mark,
         maker_side,
         maker_order_id,
@@ -332,52 +396,86 @@ pub(super) fn settle_maker_fill<CTX: ContextTr>(
     )?;
 
     let (maker_fee, bad_debt) = match core {
-        MakerFillCore::RejectedInsolvent => {
-            // Reject: persist ONLY the funding-settled (pre-fill) position — the fill is
-            // skipped and the caller cancels the order. No entry reduce, no bad-debt absorb.
-            if let Some(p) = pending_funding {
-                crate::perp_dex::funding::apply_funding_settlement(context, p)?;
-            }
-            storage::save_position(context, maker, market_id, &pos)?;
-            storage::save_account(context, maker, account)?;
-            return Ok(MakerFillOutcome::RejectedInsolvent);
-        }
+        MakerFillCore::RejectedInsolvent => return Ok(MakerFillOutcome::RejectedInsolvent),
         MakerFillCore::Filled {
             maker_fee,
             bad_debt,
         } => (maker_fee, bad_debt),
     };
-
-    // Accept path — same write/log sequence as before the core extraction: funding (IF + logs),
-    // maker-side entry list, bad-debt absorb (IF + logs), pos/account, fee credit, PositionChanged.
-    if let Some(p) = pending_funding {
-        crate::perp_dex::funding::apply_funding_settlement(context, p)?;
-    }
     match maker_side {
-        Side::Buy => storage::save_buy_orders(context, maker, market_id, &buy_entries)?,
-        Side::Sell => storage::save_sell_orders(context, maker, market_id, &sell_entries)?,
+        Side::Buy => w.dirty_buy = true,
+        Side::Sell => w.dirty_sell = true,
     }
+    let pos_snapshot = w.pos.clone();
+
     absorb_bad_debt_into_insurance_fund(context, market_id, bad_debt)?;
-    storage::save_position(context, maker, market_id, &pos)?;
-    storage::save_account(context, maker, account)?;
-    credit_fee_recipient(context, market_id, maker_fee)?;
+    // Fee credit: fee total immediately (global key); admin wallet through the registry if the
+    // admin is also a trading party here.
+    if maker_fee > 0 {
+        let admin = storage::load_admin(context)?;
+        if admin == Address::ZERO {
+            return Err(perp_err("placeOrder: fee recipient not initialised"));
+        }
+        storage::add_market_fee_total(context, market_id, maker_fee)?;
+        reg.credit_perp_via(context, admin, maker_fee)?;
+    }
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::PositionChanged {
             user: maker,
             marketId: market_id,
-            amount: pos.amount,
-            vQuoteBalance: pos.v_quote_balance,
-            margin: pos.margin,
-            leverage: pos.leverage,
+            amount: pos_snapshot.amount,
+            vQuoteBalance: pos_snapshot.v_quote_balance,
+            margin: pos_snapshot.margin,
+            leverage: pos_snapshot.leverage,
         }
         .to_log_data(),
     });
 
-    // No order is auto-cancelled on a maker fill any more (isolated margin), so the
-    // maker fill returns only the maker fee — no expired-order bookkeeping.
     Ok(MakerFillOutcome::Filled { maker_fee })
+}
+
+/// Registry-backed K9 maker cancel: releases the rejected order's margin on the registry copies
+/// (flushed later) and writes the order status + OrderCancelled log immediately (same positions
+/// as today's cancel_rejected_maker).
+pub(super) fn cancel_rejected_maker_registry<CTX: ContextTr>(
+    context: &mut CTX,
+    reg: &mut MatchRegistry,
+    maker: Address,
+    market_id: u64,
+    maker_side: Side,
+    order_id: &[u8; 32],
+    maker_order: &mut crate::perp_dex::types::Order,
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    let i = reg.get_or_load(context, maker, market_id, market)?;
+    let w = &mut reg.users[i].1;
+    super::release_margin_core(
+        &mut w.pos,
+        &mut w.account,
+        &mut w.buy_entries,
+        &mut w.sell_entries,
+        maker_side,
+        order_id,
+        market,
+    )?;
+    match maker_side {
+        Side::Buy => w.dirty_buy = true,
+        Side::Sell => w.dirty_sell = true,
+    }
+    maker_order.status = OrderStatus::Cancelled;
+    storage::save_order(context, order_id, maker_order)?;
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OrderCancelled {
+            user: maker,
+            orderId: primitives::FixedBytes(*order_id),
+            marketId: market_id,
+        }
+        .to_log_data(),
+    });
+    Ok(())
 }
 
 /// Effect summary of [`finalize_core`] (the pure taker-settlement decision).
