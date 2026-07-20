@@ -9,7 +9,7 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 use crate::{
     perp_dex::{
         errors::perp_err,
-        funding::settle_position_funding,
+        funding::{apply_funding_settlement, compute_funding_settlement, settle_position_funding},
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
             getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
@@ -478,8 +478,9 @@ pub fn run_add_position_margin<CTX: ContextTr>(
         return Err(perp_err("addPositionMargin: no open position"));
     }
     let mut account = storage::load_account(context, caller)?;
-    // Settle accrued funding before touching the position.
-    settle_position_funding(
+    // commit-only #23: compute funding IN MEMORY (no insurance-fund write yet), so a reject below
+    // leaves the IF untouched. The wallet/margin waterfall is applied to the in-memory pos/account.
+    let pending_funding = compute_funding_settlement(
         context,
         caller,
         &market,
@@ -491,13 +492,16 @@ pub fn run_add_position_margin<CTX: ContextTr>(
             "addPositionMargin: insufficient perp wallet balance",
         ));
     }
-
     account.debit_perp(args.amount)?;
     pos.margin = pos
         .margin
         .checked_add(amount)
         .ok_or_else(|| perp_err("addPositionMargin: margin overflow"))?;
 
+    // ── APPLY (all rejects passed) ──
+    if let Some(p) = pending_funding {
+        apply_funding_settlement(context, p)?;
+    }
     storage::save_account(context, caller, account)?;
     storage::save_position(context, caller, args.marketId, &pos)?;
     emit_position_margin_adjusted(context, caller, args.marketId, amount, &pos);
@@ -529,8 +533,9 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
         return Err(perp_err("removePositionMargin: no open position"));
     }
     let mut account = storage::load_account(context, caller)?;
-    // Settle accrued funding first so the checks below see post-funding margin.
-    settle_position_funding(
+    // commit-only #23: compute funding IN MEMORY first (no IF write yet) so the checks below see
+    // post-funding margin, and a reject leaves the insurance fund untouched.
+    let pending_funding = compute_funding_settlement(
         context,
         caller,
         &market,
@@ -579,6 +584,10 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     account.credit_perp(args.amount)?;
     pos.margin = new_margin;
 
+    // ── APPLY (all rejects passed) ──
+    if let Some(p) = pending_funding {
+        apply_funding_settlement(context, p)?;
+    }
     storage::save_account(context, caller, account)?;
     storage::save_position(context, caller, args.marketId, &pos)?;
     emit_position_margin_adjusted(context, caller, args.marketId, -amount, &pos);

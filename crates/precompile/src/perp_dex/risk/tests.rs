@@ -5,11 +5,11 @@ use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, U256};
 
 use crate::perp_dex::{
+    funding::settle_position_funding,
     interface::IPerpDex::{
         addPositionMarginCall, liquidateCall, placeOrderCall, removePositionMarginCall,
         setLeverageCall, updateIndexPriceCall,
     },
-    funding::settle_position_funding,
     trading::run_place_order,
     types::{
         FundingState, IndexPriceHistory, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
@@ -392,7 +392,14 @@ fn settle_alice_funding(ctx: &mut TestCtx) -> (PerpPosition, UserAccount) {
     let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
     let mut pos = storage::load_position(ctx, ALICE, MARKET_ID).unwrap();
     let mut account = storage::load_account(ctx, ALICE).unwrap();
-    settle_position_funding(ctx, ALICE, &market, &mut pos, &mut account.perp_wallet_balance).unwrap();
+    settle_position_funding(
+        ctx,
+        ALICE,
+        &market,
+        &mut pos,
+        &mut account.perp_wallet_balance,
+    )
+    .unwrap();
     (pos, account)
 }
 
@@ -406,7 +413,10 @@ fn settle_funding_long_pays_from_wallet() {
     let (pos, account) = settle_alice_funding(&mut ctx);
 
     assert_eq!(account.perp_wallet_balance, USER_WALLET as i64 - 7_500_000);
-    assert_eq!(pos.margin, MARGIN, "wallet covered the charge; margin untouched");
+    assert_eq!(
+        pos.margin, MARGIN,
+        "wallet covered the charge; margin untouched"
+    );
     assert_eq!(pos.last_funding_index, 75_000_000, "re-anchored to index");
 }
 
@@ -433,7 +443,11 @@ fn settle_funding_charge_waterfalls_wallet_then_margin() {
     let (pos, account) = settle_alice_funding(&mut ctx);
 
     assert_eq!(account.perp_wallet_balance, 0, "wallet drained to 0 first");
-    assert_eq!(pos.margin, MARGIN - 10_000_000, "remainder taken from margin");
+    assert_eq!(
+        pos.margin,
+        MARGIN - 10_000_000,
+        "remainder taken from margin"
+    );
 }
 
 #[test]
@@ -450,6 +464,55 @@ fn settle_funding_charge_beyond_margin_absorbs_from_insurance_fund() {
     assert_eq!(pos.margin, 0);
     // 50M shortfall absorbed from the 80M insurance fund → 30M left.
     assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 30_000_000);
+}
+
+#[test]
+fn add_margin_rejected_after_funding_leaves_insurance_fund_untouched() {
+    // commit-only #23 (validate-then-apply): a margin op that settles funding (drawing from the
+    // insurance fund) and THEN rejects must leave the IF untouched. Under the old ordering the
+    // funding was applied (IF drawn) before the has_available reject and only undone by
+    // checkpoint_revert; this unit test never invokes revert, so a pre-reject IF draw is visible.
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx); // ALICE wallet = USER_WALLET = 50M
+    storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
+    set_funding_index(&mut ctx, 3_000_000_000); // charge 300M > wallet 50M + margin 200M → dips IF
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+
+    // Funding drains the wallet to 0 → the add-margin can't be covered → reject.
+    let err = add_position_margin(&mut ctx, 1_000_000).unwrap_err();
+    assert!(
+        err.to_string().contains("insufficient perp wallet"),
+        "{err}"
+    );
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        if_before,
+        "rejected add-margin must not draw from the insurance fund"
+    );
+}
+
+#[test]
+fn remove_margin_rejected_after_funding_leaves_insurance_fund_untouched() {
+    // Symmetric to the add-margin case: funding drains margin to 0, then the removal rejects
+    // (insufficient position margin) — the IF must be untouched.
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
+    set_funding_index(&mut ctx, 3_000_000_000); // drains wallet + margin, dips IF
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+
+    let err = remove_position_margin(&mut ctx, 1_000_000).unwrap_err();
+    assert!(
+        err.to_string().contains("insufficient position margin"),
+        "{err}"
+    );
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        if_before,
+        "rejected remove-margin must not draw from the insurance fund"
+    );
 }
 
 #[test]
@@ -479,7 +542,10 @@ fn settle_funding_noop_for_flat_position_but_reanchors() {
 
     let (pos, account) = settle_alice_funding(&mut ctx);
 
-    assert_eq!(account.perp_wallet_balance, USER_WALLET as i64, "no charge on a flat position");
+    assert_eq!(
+        account.perp_wallet_balance, USER_WALLET as i64,
+        "no charge on a flat position"
+    );
     assert_eq!(pos.last_funding_index, 75_000_000, "still re-anchored");
 }
 
@@ -957,7 +1023,7 @@ fn remove_position_margin_settles_pending_funding_first() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     set_funding_index(&mut ctx, 75_000_000); // charge 7.5M for a QTY long
-    // Long with excess margin so a 50M removal is allowed after funding.
+                                             // Long with excess margin so a 50M removal is allowed after funding.
     storage::save_position(
         &mut ctx,
         ALICE,
@@ -976,7 +1042,10 @@ fn remove_position_margin_settles_pending_funding_first() {
 
     let pos = position(&mut ctx, ALICE);
     // Funding (7.5M) charged from wallet first, then 50M margin returned to wallet.
-    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET - 7_500_000 + 50_000_000);
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        USER_WALLET - 7_500_000 + 50_000_000
+    );
     assert_eq!(pos.margin, 350_000_000);
     assert_eq!(pos.last_funding_index, 75_000_000);
 }
@@ -992,7 +1061,10 @@ fn add_position_margin_settles_pending_funding_first() {
 
     let pos = position(&mut ctx, ALICE);
     // 7.5M funding charged from wallet, then 10M moved wallet → margin.
-    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET - 7_500_000 - 10_000_000);
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        USER_WALLET - 7_500_000 - 10_000_000
+    );
     assert_eq!(pos.margin, MARGIN + 10_000_000);
     assert_eq!(pos.last_funding_index, 75_000_000);
 }
@@ -1011,7 +1083,11 @@ fn liquidate_settles_funding_into_insolvency() {
     // be rejected; funding must be applied first so liquidation proceeds.
     liquidate(&mut ctx, ALICE).unwrap();
 
-    assert_eq!(position(&mut ctx, ALICE).amount, 0, "position fully liquidated");
+    assert_eq!(
+        position(&mut ctx, ALICE).amount,
+        0,
+        "position fully liquidated"
+    );
 }
 
 #[test]
@@ -1085,7 +1161,10 @@ fn liquidate_settles_residual_at_mark_when_orderbook_cannot_fully_close() {
     liquidate(&mut ctx, ALICE).unwrap();
 
     let alice = position(&mut ctx, ALICE);
-    assert_eq!(alice.amount, 0, "position fully closed via book + residual-at-mark");
+    assert_eq!(
+        alice.amount, 0,
+        "position fully closed via book + residual-at-mark"
+    );
     assert_eq!(alice.v_quote_balance, 0);
 }
 
