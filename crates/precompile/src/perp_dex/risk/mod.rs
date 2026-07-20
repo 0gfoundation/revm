@@ -828,14 +828,24 @@ fn run_liquidation_sweep<CTX: ContextTr>(
         if liquidated >= MAX_LIQUIDATIONS_PER_UPDATE {
             break;
         }
+        // commit-only (#23): healthy candidates are write-free (funding is computed in memory
+        // and only applied when liquidatable), so the checkpoint only balances EVM-side state.
+        // A liquidation that FAILS mid-apply would leave partial perp writes with no undo — a
+        // corruption-anyway condition: halt loudly rather than skip silently.
         let cp = context.journal_mut().checkpoint();
         match liquidate_position(context, user, market_id, market, mark_price, Address::ZERO) {
             Ok(LiquidationOutcome::Liquidated { .. }) => {
                 context.journal_mut().checkpoint_commit();
                 liquidated += 1;
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
+                // AboveMaintenance / NoPosition: zero perp writes were made.
                 context.journal_mut().checkpoint_revert(cp);
+            }
+            Err(e) => {
+                panic!(
+                    "liquidation sweep: liquidate_position failed mid-apply (commit-only invariant): {e:?}"
+                );
             }
         }
     }
