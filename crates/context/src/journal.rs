@@ -461,17 +461,16 @@ mod perp_passthrough_tests {
     }
 
     #[test]
-    fn revert_of_overlay_write_re_exposes_committed_value() {
+    fn overlay_write_survives_revert_commit_only() {
+        // commit-only (#23): the overlay write persists through the frame revert and keeps
+        // shadowing the committed store.
         let mut db = PerpBackedDb::default();
         db.perp.insert(k(1), vec![7]); // committed value
         let mut j: Journal<PerpBackedDb> = Journal::new(db);
 
         let cp = j.checkpoint();
         j.perp_store(k(1), vec![99]); // overlay shadows committed
+        j.checkpoint_revert(cp);
         assert_eq!(j.perp_load(k(1)).unwrap(), vec![99]);
-
-        j.checkpoint_revert(cp); // overlay write removed (prev == None)
-                                 // Overlay miss again → falls through to the committed store, NOT to empty.
-        assert_eq!(j.perp_load(k(1)).unwrap(), vec![7]);
     }
 }

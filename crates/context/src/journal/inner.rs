@@ -26,7 +26,7 @@ use std::vec::Vec;
 /// but it is deliberately never folded into the [`EvmState`] returned by
 /// [`JournalInner::finalize`], so it stays out of the state trie. `working` holds ONLY the
 /// keys written during the current block (reads pass through to the committed store without
-/// caching); `undo` is the per-transaction reversible log. See
+/// caching). See
 /// `docs/perpstate-journal集成方案.md`.
 // #16d Phase 2: drops PartialEq/Eq/serde (all unused on the journal types — verified zero usage)
 // so `working` can hold deserialized blobs (`Box<dyn Any>`, neither Eq nor serde). Clone is kept;
@@ -37,44 +37,18 @@ pub struct PerpSection {
     /// (`Struct`, serialized once at block end) or raw bytes (`Bytes`, e.g. via `store_blob`).
     /// `Bytes(empty)` means the key is absent/deleted.
     working: HashMap<B256, PerpEntry>,
-    /// Reversible undo log for `working`, mirroring the EVM journal `Vec<ENTRY>`.
-    undo: Vec<PerpUndo>,
+    /// Whether the CURRENT transaction has written the overlay (commit-only #23: perp writes are
+    /// never rolled back, so this only guards the discard_tx invariant — a tx-level abort after
+    /// perp writes is a corruption-anyway condition and halts loudly).
+    dirty_this_tx: bool,
     /// Block-scoped cache of DESERIALIZED blobs (catalog #14): a pure accelerator over `working`
     /// + cold reads, type-erased so this crate need not know the precompile's blob types. The
     /// precompile's cached load/save helpers populate it; it is invalidated per-key on `store`,
-    /// cleared on any revert (`undo_to`) and at the block boundary (`take_delta`), and kept across
+    /// cleared at the block boundary (`take_delta`), and kept across
     /// txns within a block (like `working`). Transparent to this struct's derives — clones empty,
     /// ignored by equality, skipped by serde — since it is always reconstructible and carries no
     /// semantic state.
     cache: PerpCache,
-}
-
-/// A single reversible PerpDEX overlay write: restores `prev` on revert
-/// (`None` = the key was absent in `working`, so revert removes it). `prev` is the entry moved out
-/// by `HashMap::insert` at write time, so no clone is needed for the undo log.
-#[derive(Debug, Clone)]
-struct PerpUndo {
-    key: B256,
-    prev: Option<PerpEntry>,
-}
-
-/// Commit-only migration tripwire (catalog #23). Counts `checkpoint_revert`s that actually rolled
-/// back a NON-EMPTY perp write set — each one is a live "write-then-error" path that, under a
-/// commit-only model (no undo), would leave a partial write and corrupt state. The migration to
-/// validate-then-apply drives this counter to ZERO across the full test battery + realistic
-/// workloads; only once it stays zero is it safe to delete the undo machinery. Undo still runs as
-/// the safety net until then. Read/reset via [`perp_undo_rollback_count`] /
-/// [`reset_perp_undo_rollback_count`].
-pub static PERP_UNDO_ROLLBACKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Reads the commit-only migration tripwire counter (see [`PERP_UNDO_ROLLBACKS`]).
-pub fn perp_undo_rollback_count() -> u64 {
-    PERP_UNDO_ROLLBACKS.load(core::sync::atomic::Ordering::Relaxed)
-}
-
-/// Resets the commit-only migration tripwire counter to zero.
-pub fn reset_perp_undo_rollback_count() {
-    PERP_UNDO_ROLLBACKS.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// One off-trie overlay value (#16d Phase 2). A typed `save_*` write stores the DESERIALIZED blob
@@ -196,28 +170,17 @@ impl PerpSection {
         }
     }
 
-    /// Mutable handle into a deferred `Struct` overlay value for IN-PLACE mutation (catalog #21):
-    /// snapshots the current value into the undo log ONCE (so a mid-tx revert restores it), then
-    /// returns `&mut dyn Any` for the caller to downcast + mutate the live struct directly — avoiding
-    /// the load(clone)→modify→store(clone) round-trip. `None` if the key is absent or was written as
-    /// raw `Bytes` (the caller falls back to load + `store_struct`). Each call records one undo
-    /// snapshot (a clone), so callers fetch the handle ONCE per logical mutation, not in a loop.
+    /// Mutable handle into a deferred `Struct` overlay value for IN-PLACE mutation (catalog #21).
+    /// commit-only (#23): NO undo snapshot is taken — perp writes are never rolled back (the
+    /// EOA-direct guard forbids enclosing frames; genuine rejects are validate-then-apply and
+    /// zero-write; remaining error paths are corruption-anyway class). This deleted deep-clone
+    /// was the per-mutation cost the migration removes. `None` if the key is absent or `Bytes`.
     #[inline]
     fn get_struct_mut(&mut self, key: B256) -> Option<&mut PerpBlob> {
-        // Snapshot the pre-mutation value for revert (clone via the entry's clone fn-ptr). The
-        // immutable borrow ends with `snapshot`; only `Struct` entries can be mutated in place.
-        let snapshot = match self.working.get(&key) {
-            Some(PerpEntry::Struct { val, ser, clone }) => PerpEntry::Struct {
-                val: clone(val.as_ref()),
-                ser: *ser,
-                clone: *clone,
-            },
-            _ => return None,
-        };
-        self.undo.push(PerpUndo {
-            key,
-            prev: Some(snapshot),
-        });
+        if !matches!(self.working.get(&key), Some(PerpEntry::Struct { .. })) {
+            return None;
+        }
+        self.dirty_this_tx = true;
         // The struct is about to change in place; drop any stale deser-cache entry (mirrors `store_*`).
         self.cache.remove(key);
         match self.working.get_mut(&key) {
@@ -227,18 +190,17 @@ impl PerpSection {
         }
     }
 
-    /// Writes raw `Bytes` (byte-path writers, e.g. `store_blob`), recording the prior entry (moved
-    /// out by `insert`) for revert.
+    /// Writes raw `Bytes` (byte-path writers, e.g. `store_blob`). commit-only: no undo record.
     #[inline]
     fn store_bytes(&mut self, key: B256, value: Vec<u8>) {
-        let prev = self.working.insert(key, PerpEntry::Bytes(value));
-        self.undo.push(PerpUndo { key, prev });
+        self.working.insert(key, PerpEntry::Bytes(value));
+        self.dirty_this_tx = true;
         // Invalidate the deser cache; a typed cached save re-populates it (write-through).
         self.cache.remove(key);
     }
 
     /// Writes a deferred `Struct` (typed writers): no serialization now — lowered to bytes once at
-    /// `take_delta`. Records the prior entry for revert.
+    /// `take_delta`. commit-only: no undo record.
     #[inline]
     fn store_struct(
         &mut self,
@@ -247,38 +209,17 @@ impl PerpSection {
         ser: fn(&PerpBlob) -> Vec<u8>,
         clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
     ) {
-        let prev = self
-            .working
+        self.working
             .insert(key, PerpEntry::Struct { val, ser, clone });
-        self.undo.push(PerpUndo { key, prev });
+        self.dirty_this_tx = true;
         self.cache.remove(key);
     }
 
-    /// Reverts overlay writes recorded at or after undo index `i`, in reverse order.
-    fn undo_to(&mut self, i: usize) {
-        if i >= self.undo.len() {
-            return;
-        }
-        // A revert restores prior overlay values, so any deser-cache entry may now be stale; drop
-        // the whole cache (it re-warms lazily). Coarse but always correct.
-        self.cache.clear();
-        for entry in self.undo.drain(i..).rev() {
-            match entry.prev {
-                Some(prev) => {
-                    self.working.insert(entry.key, prev);
-                }
-                None => {
-                    self.working.remove(&entry.key);
-                }
-            }
-        }
-    }
-
     /// Drains the net in-block writes as a [`PerpDelta`], serializing each entry to canonical bytes
-    /// ONCE here — deferred `Struct` writes are serialized at this block boundary (#16d). Clears undo.
+    /// ONCE here — deferred `Struct` writes are serialized at this block boundary (#16d).
     #[inline]
     fn take_delta(&mut self) -> PerpDelta {
-        self.undo.clear();
+        self.dirty_this_tx = false;
         // Block boundary: the next block must not see this block's cached structs (the committed
         // store changes between blocks via the delta merge).
         self.cache.clear();
@@ -364,7 +305,7 @@ pub struct JournalInner<ENTRY> {
     pub spec: SpecId,
     /// Warm addresses containing both coinbase and current precompiles.
     pub warm_addresses: WarmAddresses,
-    /// Off-trie PerpDEX overlay + undo log. Journaled like the rest of the state, but never
+    /// Off-trie PerpDEX overlay (commit-only). Journaled like the rest of the state, but never
     /// folded into the [`EvmState`] returned by [`Self::finalize`], so it stays off the trie.
     pub perp: PerpSection,
     /// Per-call PerpDEX commitment log. Each off-trie write appends its framed bytes
@@ -474,13 +415,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         self.perp.cache_put(key, value);
     }
 
-    /// Reverts off-trie PerpDEX overlay writes back to the given undo index.
-    #[inline]
-    pub fn perp_undo_to(&mut self, perp_journal_i: usize) {
-        self.perp.undo_to(perp_journal_i);
-    }
-
-    /// Drains the block's net off-trie PerpDEX writes ([`PerpDelta`]) and clears the undo log.
+    /// Drains the block's net off-trie PerpDEX writes ([`PerpDelta`]).
     #[inline]
     pub fn take_perp_delta(&mut self) -> PerpDelta {
         self.perp.take_delta()
@@ -536,8 +471,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         journal.clear();
 
         // Keep the perp overlay (later txs in this block must see this tx's writes, exactly
-        // like `state` above); only the tx-scoped undo log is spent.
-        perp.undo.clear();
+        // like `state` above).
+        perp.dirty_this_tx = false;
 
         // The commitment log is call-scoped (hashed/discarded at each precompile call exit), so it
         // must be empty at this tx boundary; reset defensively against any leak.
@@ -570,9 +505,15 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         journal.drain(..).rev().for_each(|entry| {
             entry.revert(state, None, is_spurious_dragon_enabled);
         });
-        // Revert this transaction's perp overlay writes too (mirrors the journal revert above),
-        // so a discarded tx leaves no perp residue.
-        perp.undo_to(0);
+        // commit-only (#23): perp writes cannot be rolled back, so a tx-level abort AFTER perp
+        // writes would leave residue the EVM side no longer has. Consensus-path tx-level errors
+        // are all pre-execution (no perp writes); execution failures surface as frame reverts
+        // (validate-then-apply → zero perp writes). Reaching here dirty means an infra-level
+        // failure mid-perp-write — halt loudly rather than corrupt silently.
+        assert!(
+            !perp.dirty_this_tx,
+            "discard_tx after perp writes: commit-only invariant violated"
+        );
         // Call-scoped commitment log must be empty at this tx boundary; reset defensively.
         perp_commitment_log.clear();
         transient_storage.clear();
@@ -622,8 +563,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // across the block's transactions until the end-of-block `take_perp_delta` harvest drains
         // it into the canonical off-trie store. Clearing it here dropped every committed tx's perp
         // write before it could be harvested (canonical_perp stayed empty forever). Only the
-        // tx-scoped undo log is reset, mirroring `commit_tx`, which already keeps `working`.
-        perp.undo.clear();
+        // tx-scoped dirty flag is reset, mirroring `commit_tx`, which already keeps `working`.
+        perp.dirty_this_tx = false;
         // Call-scoped commitment log must be empty at this tx boundary; reset defensively.
         perp_commitment_log.clear();
 
@@ -922,7 +863,6 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let checkpoint = JournalCheckpoint {
             log_i: self.logs.len(),
             journal_i: self.journal.len(),
-            perp_journal_i: self.perp.undo.len(),
             perp_commitment_log_len: self.perp_commitment_log.len(),
         };
         self.depth += 1;
@@ -954,15 +894,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                 });
         }
 
-        // Revert off-trie PerpDEX overlay writes made after the checkpoint, in lock-step with
-        // the EVM journal entries above.
-        // Commit-only migration tripwire (#23): a NON-EMPTY rollback here is a live
-        // write-then-error path. Undo still runs (safety net) until the migration proves this
-        // never fires across the battery, after which the undo machinery is removed.
-        if checkpoint.perp_journal_i < self.perp.undo.len() {
-            PERP_UNDO_ROLLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-        self.perp.undo_to(checkpoint.perp_journal_i);
+        // commit-only (#23): off-trie PerpDEX overlay writes are NOT rolled back. The EOA-direct
+        // guard forbids enclosing frames, genuine perp rejects are validate-then-apply (zero
+        // writes before any Err), and the remaining error paths are corruption-anyway class
+        // (panics). The undo machinery this used to drive is deleted.
 
         // Truncate the per-call commitment log back to its checkpoint length, dropping the framed
         // writes appended after the checkpoint so the call-exit hash stays consistent with the
@@ -1368,72 +1303,62 @@ mod perp_tests {
     }
 
     #[test]
-    fn checkpoint_revert_restores_prior_perp_write() {
+    fn perp_writes_survive_checkpoint_revert() {
+        // commit-only (#23): perp overlay writes are NOT rolled back by frame reverts (there is
+        // no undo). The EOA-direct guard + validate-then-apply guarantee no genuine reject can
+        // follow a perp write, so a revert never needs to clean perp state.
         let mut j = new_inner();
-        // tx1 writes a baseline value, committed at the tx boundary.
         j.perp_store(k(1), vec![1, 2, 3]);
         j.commit_tx();
 
-        // A sub-call overwrites the key, then reverts.
         let cp = j.checkpoint();
         j.perp_store(k(1), vec![9, 9]);
-        assert_eq!(j.perp_get_overlay(k(1)), Some(vec![9u8, 9]));
         j.checkpoint_revert(cp);
 
-        // The committed baseline is restored, and depth is balanced.
-        assert_eq!(j.perp_get_overlay(k(1)), Some(vec![1u8, 2, 3]));
+        // The write SURVIVES the revert; only EVM-side state/logs are rolled back.
+        assert_eq!(j.perp_get_overlay(k(1)), Some(vec![9u8, 9]));
         assert_eq!(j.depth, 0);
     }
 
     #[test]
-    fn checkpoint_revert_removes_newly_written_key() {
+    fn perp_new_key_survives_checkpoint_revert() {
+        // commit-only (#23): a key first written inside a reverted frame also survives.
         let mut j = new_inner();
         let cp = j.checkpoint();
         j.perp_store(k(2), vec![5]);
-        assert_eq!(j.perp_get_overlay(k(2)), Some(vec![5u8]));
         j.checkpoint_revert(cp);
-        // The key was absent before the checkpoint, so revert removes it from the overlay
-        // (a later read falls through to the committed store).
-        assert_eq!(j.perp_get_overlay(k(2)), None);
-        assert!(j.perp.working.is_empty());
-        assert!(j.perp.undo.is_empty());
+        assert_eq!(j.perp_get_overlay(k(2)), Some(vec![5u8]));
     }
 
     #[test]
-    fn discard_tx_wipes_perp_writes() {
+    #[should_panic(expected = "commit-only invariant violated")]
+    fn discard_tx_after_perp_writes_panics() {
+        // commit-only (#23): perp writes cannot be rolled back, so a tx-level abort after perp
+        // writes is a corruption-anyway condition — loud halt over silent residue.
         let mut j = new_inner();
         j.perp_store(k(1), vec![1]);
-        j.perp_store(k(2), vec![2]);
         j.discard_tx();
-        // A discarded transaction leaves no perp residue.
-        assert_eq!(j.perp_get_overlay(k(1)), None);
-        assert_eq!(j.perp_get_overlay(k(2)), None);
-        assert!(j.perp.undo.is_empty());
     }
 
     #[test]
-    fn discard_tx_preserves_prior_committed_baseline() {
+    fn discard_tx_without_perp_writes_preserves_committed_baseline() {
         let mut j = new_inner();
-        // tx1 writes a baseline value and commits at the tx boundary (working kept, undo cleared).
+        // tx1 writes a baseline value and commits at the tx boundary.
         j.perp_store(k(1), vec![1]);
         j.commit_tx();
-        // tx2 writes another key, then is discarded.
-        j.perp_store(k(2), vec![2]);
+        // tx2 makes NO perp writes and is discarded — fine, and the baseline survives.
         j.discard_tx();
-        // discard_tx (undo_to(0)) must revert ONLY tx2's writes, never tx1's committed baseline —
-        // this distinguishes the correct undo-log replay from a naive working.clear().
         assert_eq!(j.perp_get_overlay(k(1)), Some(vec![1u8]));
-        assert_eq!(j.perp_get_overlay(k(2)), None);
     }
 
     #[test]
-    fn commit_tx_preserves_working_and_clears_undo() {
+    fn commit_tx_preserves_working_and_clears_dirty_flag() {
         let mut j = new_inner();
         j.perp_store(k(1), vec![1]);
         j.commit_tx();
-        // Working survives across the tx boundary (intra-block visibility); the undo is spent.
+        // Working survives across the tx boundary (intra-block visibility).
         assert_eq!(j.perp_get_overlay(k(1)), Some(vec![1u8]));
-        assert!(j.perp.undo.is_empty());
+        assert!(!j.perp.dirty_this_tx);
     }
 
     #[test]
@@ -1447,7 +1372,7 @@ mod perp_tests {
         assert_eq!(delta.get(&k(3)).map(|e| &e.bytes), Some(&Vec::<u8>::new()));
         assert_eq!(delta.len(), 2);
         assert!(j.perp.working.is_empty());
-        assert!(j.perp.undo.is_empty());
+        assert!(!j.perp.dirty_this_tx);
     }
 
     // #16d Phase 2 — deferred-struct overlay path.
@@ -1485,26 +1410,25 @@ mod perp_tests {
     }
 
     #[test]
-    fn perp_store_struct_reverts() {
+    fn perp_store_struct_survives_checkpoint_revert() {
+        // commit-only (#23): deferred-struct writes also survive frame reverts.
         let mut j = new_inner();
         let cp = j.checkpoint();
         j.perp_store_struct(k(1), std::boxed::Box::new(42u32), ser_u32, clone_u32);
-        assert!(j.perp_get_struct(k(1)).is_some());
         j.checkpoint_revert(cp);
-        // The struct write is move-undone in lock-step with the byte path.
-        assert!(j.perp_get_struct(k(1)).is_none());
-        assert_eq!(j.perp_get_overlay(k(1)), None);
+        assert!(j.perp_get_struct(k(1)).is_some());
+        assert_eq!(j.perp_get_overlay(k(1)), Some(42u32.to_le_bytes().to_vec()));
     }
 
     #[test]
-    fn perp_get_struct_mut_mutates_in_place_and_reverts() {
+    fn perp_get_struct_mut_mutates_in_place_commit_only() {
         let mut j = new_inner();
-        // Seed a struct committed BEFORE the checkpoint (the revert baseline).
         j.perp_store_struct(k(1), std::boxed::Box::new(10u32), ser_u32, clone_u32);
-        j.commit_tx(); // working keeps the struct; undo spent.
+        j.commit_tx();
 
         let cp = j.checkpoint();
-        // In-place mutation via the &mut handle — no load/store round-trip, one undo snapshot.
+        // In-place mutation via the &mut handle — no load/store round-trip, and commit-only:
+        // NO undo snapshot (the deleted deep-clone this migration removes).
         *j.perp_get_struct_mut(k(1))
             .unwrap()
             .downcast_mut::<u32>()
@@ -1516,11 +1440,11 @@ mod perp_tests {
         // Block-end serialization would carry the mutated value.
         assert_eq!(j.perp_get_overlay(k(1)), Some(99u32.to_le_bytes().to_vec()));
 
-        // Revert restores the pre-mutation value (snapshot-on-mutate undo).
+        // The mutation survives a frame revert (commit-only).
         j.checkpoint_revert(cp);
         assert_eq!(
             j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(),
-            Some(&10u32)
+            Some(&99u32)
         );
 
         // Absent and raw-`Bytes` keys cannot be mutated in place.
@@ -1539,8 +1463,8 @@ mod perp_tests {
         // ...but `finalize` runs PER TX in block execution, so it must NOT wipe the block-scoped
         // overlay; the write survives for the end-of-block `take_perp_delta` harvest.
         assert_eq!(j.perp.get_bytes(k(1)), Some(vec![7u8]));
-        // The tx-scoped undo log is still reset.
-        assert!(j.perp.undo.is_empty());
+        // The tx-scoped dirty flag is still reset.
+        assert!(!j.perp.dirty_this_tx);
     }
 
     /// Regression for the canonical_perp persistence bug: the block executor runs
@@ -1566,38 +1490,36 @@ mod perp_tests {
     }
 
     #[test]
-    fn nested_checkpoint_revert_only_undoes_inner_scope() {
+    fn nested_checkpoint_revert_keeps_perp_writes_commit_only() {
+        // commit-only (#23): perp writes survive nested frame reverts at every depth.
         let mut j = new_inner();
         let outer = j.checkpoint();
         j.perp_store(k(1), vec![10]);
         let inner = j.checkpoint();
         j.perp_store(k(2), vec![20]);
 
-        // Revert the inner scope: k(2) gone, k(1) survives.
         j.checkpoint_revert(inner);
         assert_eq!(j.perp_get_overlay(k(1)), Some(vec![10u8]));
-        assert_eq!(j.perp_get_overlay(k(2)), None);
+        assert_eq!(j.perp_get_overlay(k(2)), Some(vec![20u8]));
 
-        // Revert the outer scope: both gone, depth balanced.
         j.checkpoint_revert(outer);
-        assert_eq!(j.perp_get_overlay(k(1)), None);
+        assert_eq!(j.perp_get_overlay(k(1)), Some(vec![10u8]));
         assert_eq!(j.depth, 0);
     }
 
-    /// Property test: under an arbitrary, deterministically-generated sequence of
-    /// store / checkpoint / checkpoint_commit / checkpoint_revert operations (with nesting),
-    /// the perp overlay must always equal an independent reference model of the same writes.
-    /// This stresses the undo log far beyond the hand-written cases above. Dependency-free
+    /// Property test (commit-only #23): under an arbitrary sequence of store / checkpoint /
+    /// checkpoint_commit / checkpoint_revert operations, the perp overlay equals a reference
+    /// model that NEVER rolls back — perp writes persist through every revert. Dependency-free
     /// (xorshift PRNG, fixed seed → reproducible).
     #[test]
     fn fuzz_overlay_matches_reference_model_under_nested_checkpoints() {
         use std::collections::HashMap as RefMap;
 
         let mut j = new_inner();
-        // Reference overlay model, mirroring perp.working.
+        // Reference overlay model, mirroring perp.working (commit-only: never rolled back).
         let mut model: RefMap<B256, Vec<u8>> = RefMap::new();
-        // Stack of (checkpoint token, model snapshot) for nested scopes.
-        let mut snaps: Vec<(_, RefMap<B256, Vec<u8>>)> = Vec::new();
+        // Stack of checkpoint tokens for nested scopes (no snapshots — writes persist).
+        let mut snaps: Vec<_> = Vec::new();
 
         // Deterministic xorshift64 PRNG.
         let mut s: u64 = 0x9E3779B97F4A7C15;
@@ -1623,7 +1545,7 @@ mod perp_tests {
                 // checkpoint
                 2 => {
                     let cp = j.checkpoint();
-                    snaps.push((cp, model.clone()));
+                    snaps.push(cp);
                 }
                 // checkpoint_commit: keep changes, drop the snapshot
                 3 => {
@@ -1632,11 +1554,10 @@ mod perp_tests {
                         snaps.pop();
                     }
                 }
-                // checkpoint_revert: restore to the snapshot
+                // checkpoint_revert: commit-only — the model is NOT restored.
                 _ => {
-                    if let Some((cp, snap)) = snaps.pop() {
+                    if let Some(cp) = snaps.pop() {
                         j.checkpoint_revert(cp);
-                        model = snap;
                     }
                 }
             }

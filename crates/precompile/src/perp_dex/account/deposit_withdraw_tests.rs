@@ -262,38 +262,27 @@ fn get_account_clamps_negative_perp_wallet_to_zero() {
 /// account (off-trie, perp section). Reverting the surrounding checkpoint must roll BOTH
 /// back in lock-step — the one place the EVM journal and the perp undo log must agree.
 #[test]
-fn deposit_revert_rolls_back_both_on_trie_and_off_trie() {
+fn deposit_commit_only_revert_semantics() {
+    // commit-only (#23): the off-trie perp write SURVIVES an enclosing frame revert while the
+    // on-trie ERC-20 legs (EVM journal) roll back. Exactly this divergence is why the
+    // EOA-direct depth guard forbids enclosing frames on-chain — this unit test constructs the
+    // forbidden situation directly (unit calls run at depth 0, below the guard) to document it.
     let amount = U256::from(1_000_000u64);
     let mut ctx = make_ctx(amount); // ALICE holds `amount` USDC (ERC-20, on-trie)
 
     let cp = ctx.journal_mut().checkpoint();
     run_deposit(&depositCall { amount }.abi_encode(), ALICE, &mut ctx).unwrap();
-
-    // After deposit: internal perp account credited (off-trie), ERC-20 balance drained (on-trie).
-    let (usdc_internal, _) = decode_get_account(
-        &run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap(),
-    );
-    assert_eq!(usdc_internal, amount);
-    assert_eq!(
-        storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, ALICE).unwrap(),
-        U256::ZERO
-    );
-
-    // Revert the whole call under one checkpoint.
     ctx.journal_mut().checkpoint_revert(cp);
 
-    // Both stores roll back together.
+    // Off-trie internal balance persists (commit-only)...
     let (usdc_internal_after, _) = decode_get_account(
         &run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap(),
     );
-    assert_eq!(
-        usdc_internal_after,
-        U256::ZERO,
-        "off-trie internal balance must revert"
-    );
+    assert_eq!(usdc_internal_after, amount, "off-trie write is commit-only");
+    // ...while the on-trie ERC-20 balance reverts with the EVM journal.
     assert_eq!(
         storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, ALICE).unwrap(),
         amount,
-        "on-trie ERC-20 balance must revert"
+        "on-trie ERC-20 balance reverts with the EVM journal"
     );
 }

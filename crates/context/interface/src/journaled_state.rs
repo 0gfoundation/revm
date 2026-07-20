@@ -416,8 +416,6 @@ pub struct JournalCheckpoint {
     /// Checkpoint to where on revert we will go back to and revert other journal entries.
     pub journal_i: usize,
     /// Checkpoint into the off-trie PerpDEX undo log; on revert, perp overlay writes made
-    /// after this index are undone in lock-step with the EVM journal entries.
-    pub perp_journal_i: usize,
     /// Length of the per-call PerpDEX commitment log at this checkpoint. On revert the log is
     /// truncated back to this length, dropping writes made after the checkpoint in lock-step with
     /// the perp overlay (the log is append-only within a call and hashed only at call exit).

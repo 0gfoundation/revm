@@ -1727,24 +1727,19 @@ fn perp_data_stays_off_trie_not_in_evm_state() {
 }
 
 #[test]
-fn reverted_subcall_leaves_no_perp_residue() {
+fn perp_writes_survive_enclosing_revert_commit_only() {
+    // commit-only (#23): a successful placement's perp writes SURVIVE an enclosing frame
+    // revert (there is no perp undo). On-chain the EOA-direct depth guard forbids enclosing
+    // frames entirely; this documents the journal-level semantics.
     let mut ctx = make_ctx();
     setup(&mut ctx);
 
-    // Snapshot before the (to-be-reverted) sub-call.
     let cp = ctx.journal_mut().checkpoint();
     let order_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
-    assert!(
-        storage::load_order(&mut ctx, &order_id).unwrap().is_some(),
-        "order should exist after placing"
-    );
-
-    // Revert the sub-call: the placed order must vanish — the perp overlay reverts in
-    // lock-step with the EVM journal.
     ctx.journal_mut().checkpoint_revert(cp);
     assert!(
-        storage::load_order(&mut ctx, &order_id).unwrap().is_none(),
-        "reverted sub-call must leave no perp residue"
+        storage::load_order(&mut ctx, &order_id).unwrap().is_some(),
+        "perp writes are commit-only: they survive the enclosing revert"
     );
 }
 

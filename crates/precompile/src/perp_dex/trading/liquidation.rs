@@ -2,7 +2,7 @@ use alloy_primitives::IntoLogData;
 use context::{ContextTr, JournalTr};
 use primitives::{Address, FixedBytes, Log};
 
-use super::{match_order, next_order_id};
+use super::match_order;
 use crate::{
     perp_dex::{
         errors::{perp_err, perp_invariant_err},
@@ -28,7 +28,7 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
     side: Side,
     quantity: u64,
 ) -> Result<u64, PrecompileError> {
-    let order_id = next_order_id(context, user)?;
+    let (order_id, bumped_nonce) = super::peek_order_id(context, user)?;
     let mut order = Order {
         owner: user.0 .0,
         market_id: market.market_id,
@@ -76,6 +76,7 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         &mut order,
     )?;
     storage::save_order(context, &order_id, &order)?;
+    super::commit_order_nonce(context, user, bumped_nonce)?;
 
     if remaining == 0 {
         // Full fill: clean up any rounding residuals left in the position.

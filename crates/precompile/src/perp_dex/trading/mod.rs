@@ -61,7 +61,7 @@ pub fn run_place_order<CTX: ContextTr>(
     let args = placeOrderCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("placeOrder: invalid calldata"))?;
 
-    let order_id = next_order_id(context, caller)?;
+    let (order_id, bumped_nonce) = peek_order_id(context, caller)?;
     place_order_core(
         caller,
         order_id,
@@ -74,6 +74,9 @@ pub fn run_place_order<CTX: ContextTr>(
         args.clientOrderId.0,
         context,
     )?;
+    // Placement succeeded — persist the nonce bump (commit-only: rejected placements above
+    // returned early and left the nonce untouched).
+    commit_order_nonce(context, caller, bumped_nonce)?;
     Ok(Bytes::from(placeOrderCall::abi_encode_returns(
         &FixedBytes(order_id),
     )))
@@ -385,16 +388,30 @@ pub(crate) fn verify_ed25519(
 // ── Core order logic (shared by direct and signed paths) ─────────────────────
 
 /// Allocate the next order ID for `account` using the per-user nonce counter.
-pub(super) fn next_order_id<CTX: ContextTr>(
+/// Derives the next order id from the CURRENT nonce WITHOUT bumping it (commit-only #23: the
+/// nonce write happens only after the placement fully succeeds — a rejected placement leaves the
+/// nonce untouched, so the same id is reused, matching the old revert-rollback behavior).
+/// Returns `(order_id, bumped_nonce)`; the caller persists the bump via
+/// [`commit_order_nonce`] on the success path.
+pub(super) fn peek_order_id<CTX: ContextTr>(
     context: &mut CTX,
     account: Address,
-) -> Result<[u8; 32], PrecompileError> {
+) -> Result<([u8; 32], u64), PrecompileError> {
     let nonce = storage::load_user_nonce(context, account)?;
     let mut buf = [0u8; 28];
     buf[..20].copy_from_slice(account.as_slice());
     buf[20..28].copy_from_slice(&nonce.to_be_bytes());
-    storage::save_user_nonce(context, account, nonce + 1)?;
-    Ok(keccak256(&buf).0)
+    Ok((keccak256(&buf).0, nonce + 1))
+}
+
+/// Persists the nonce bump reserved by [`peek_order_id`]. Call ONLY after the placement
+/// succeeded (all genuine rejects passed).
+pub(super) fn commit_order_nonce<CTX: ContextTr>(
+    context: &mut CTX,
+    account: Address,
+    bumped_nonce: u64,
+) -> Result<(), PrecompileError> {
+    storage::save_user_nonce(context, account, bumped_nonce)
 }
 
 struct ValidatedOrder {
