@@ -1669,25 +1669,53 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let mut account = storage::load_account(context, user)?;
-    let mut buy_entries = storage::load_buy_orders(context, user, market_id)?;
-    let mut sell_entries = storage::load_sell_orders(context, user, market_id)?;
+    // commit-only #23 CLONE-FREE: read both sides via Arc (zero clone) and compute the POST-cancel
+    // reservation by FOLDING a FILTERED iterator (the cancelled side minus this order_id) — no
+    // owned list clone. order_ids are unique per side, so the filter drops exactly the one entry
+    // remove_order_entry would (byte-identical reservation → golden-neutral). Cancel has no reject,
+    // so this is a pure apply.
+    let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
+    let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
+    let (buy_notional, sell_notional, c_notional) = match side {
+        Side::Buy => crate::perp_dex::math::calc_reservation_notionals_it(
+            buy_ref.iter().copied().filter(|e| &e.order_id != order_id),
+            sell_ref.iter().copied(),
+            market.base_decimals,
+            market.price_decimals,
+            pos.amount,
+        )?,
+        Side::Sell => crate::perp_dex::math::calc_reservation_notionals_it(
+            buy_ref.iter().copied(),
+            sell_ref.iter().copied().filter(|e| &e.order_id != order_id),
+            market.base_decimals,
+            market.price_decimals,
+            pos.amount,
+        )?,
+    };
+    drop(buy_ref);
+    drop(sell_ref);
 
-    release_margin_core(
+    // Real removal (in-place on a warm list / one materialize on a cold first-touch) — this returns
+    // the cancelled entry (and reproduces remove_order_entry's not-found invariant verbatim), which
+    // apply_release_effect needs for the fee. Only the cancelled side's key is written.
+    let cancelled_entry = match side {
+        Side::Buy => storage::mutate_buy_orders(context, user, market_id, |list| {
+            remove_order_entry(list, order_id, "buy")
+        })??,
+        Side::Sell => storage::mutate_sell_orders(context, user, market_id, |list| {
+            remove_order_entry(list, order_id, "sell")
+        })??,
+    };
+
+    apply_release_effect(
         &mut pos,
         &mut account,
-        &mut buy_entries,
-        &mut sell_entries,
-        side,
-        order_id,
+        buy_notional,
+        sell_notional,
+        c_notional,
+        &cancelled_entry,
         market,
     )?;
-
-    // Persist: only the cancelled side's list changed (keeps the write-key set identical to the
-    // old in-place mutate), then position + account.
-    match side {
-        Side::Buy => storage::save_buy_orders(context, user, market_id, &buy_entries)?,
-        Side::Sell => storage::save_sell_orders(context, user, market_id, &sell_entries)?,
-    }
     storage::save_position(context, user, market_id, &pos)?;
     storage::save_account(context, user, account)?;
     Ok(())
@@ -1710,9 +1738,6 @@ pub(super) fn release_margin_core(
     order_id: &[u8; 32],
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
-    // Flip-aware reservation snapshot before removal (pos.margin_reserved, not the per-side max —
-    // the per-side fields lag it under the model).
-    let old_reserved = pos.margin_reserved;
     let cancelled_entry = {
         let (entries, label) = match side {
             Side::Buy => (&mut *buy_entries, "buy"),
@@ -1727,14 +1752,45 @@ pub(super) fn release_margin_core(
         market.price_decimals,
         pos.amount,
     )?;
-    let leverage = pos.leverage;
-    pos.set_reservations(buy_notional, sell_notional, c_notional, leverage);
-    let new_reserved = pos.margin_reserved;
-    let freed = old_reserved.saturating_sub(new_reserved);
+    apply_release_effect(
+        pos,
+        account,
+        buy_notional,
+        sell_notional,
+        c_notional,
+        &cancelled_entry,
+        market,
+    )
+}
+
+/// Applies a cancel's margin release given the POST-cancel reservation notionals + the cancelled
+/// entry: snapshots the flip-aware reservation, credits the freed margin + fee back to the wallet,
+/// and drops the fee reservation. ONE implementation shared by the registry path (owned lists, via
+/// [`release_margin_core`]) and the storage wrapper (Arc-filtered fold, below) so the freed/fee
+/// credit math has a single source of truth. `old_reserved` is snapshotted here before
+/// `set_reservations` — the preceding entry removal never touches `pos.margin_reserved`, so this is
+/// the same value the pre-refactor code captured before the removal.
+fn apply_release_effect(
+    pos: &mut crate::perp_dex::types::PerpPosition,
+    account: &mut crate::perp_dex::types::UserAccount,
+    new_buy_notional: u64,
+    new_sell_notional: u64,
+    new_c_notional: u64,
+    cancelled: &OrderEntry,
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    let old_reserved = pos.margin_reserved;
+    pos.set_reservations(
+        new_buy_notional,
+        new_sell_notional,
+        new_c_notional,
+        pos.leverage,
+    );
+    let freed = old_reserved.saturating_sub(pos.margin_reserved);
     let fee_freed = calc_maker_fee_for_order_qty_with_bps(
-        cancelled_entry.price,
-        cancelled_entry.amount,
-        cancelled_entry.maker_fee_bps,
+        cancelled.price,
+        cancelled.amount,
+        cancelled.maker_fee_bps,
         market,
     )?;
     // Return released margin + fee reservation in one credit (mirrors the combined debit on the
