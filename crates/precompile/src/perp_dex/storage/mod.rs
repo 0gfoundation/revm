@@ -298,14 +298,10 @@ where
         }
         return Ok(Some(decode(&buf)?));
     }
-    // Fast path: a deferred struct written this block — downcast + clone, no deserialization.
+    // Single in-block probe: `perp_get_struct` now serves BOTH a deferred `Struct` write AND a
+    // `Cached` cold-read blob (#14 folded into the working map) — downcast + clone, no deser, and
+    // no separate cache probe.
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(v) = any.downcast_ref::<T>() {
-            return Ok(Some(v.clone()));
-        }
-    }
-    // Cold-read deser cache (#14), for keys only READ this block (not in the write overlay).
-    if let Some(any) = context.journal_mut().perp_cache_get(key) {
         if let Some(v) = any.downcast_ref::<T>() {
             return Ok(Some(v.clone()));
         }
@@ -363,16 +359,18 @@ where
         }
         return Ok(Some(std::sync::Arc::new(decode(&buf)?)));
     }
+    // #14 cache tier FIRST: hand back the SAME Arc typed — refcount bump, zero clone. Checked
+    // before `perp_get_struct` because that now also returns cached blobs (as `&`), which would
+    // force a deep clone here; the Arc path preserves the zero-clone bump.
+    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
+        if let Ok(t) = std::sync::Arc::downcast::<T>(arc) {
+            return Ok(Some(t));
+        }
+    }
     // In-block deferred Struct write: overlay owns a unique Box → clone into an Arc (unavoidable).
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
         if let Some(v) = any.downcast_ref::<T>() {
             return Ok(Some(std::sync::Arc::new(v.clone())));
-        }
-    }
-    // #14 cold-read cache: hand back the SAME Arc typed — refcount bump, zero clone.
-    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
-        if let Ok(t) = std::sync::Arc::downcast::<T>(arc) {
-            return Ok(Some(t));
         }
     }
     // Cross-block decoded store (选项A): share the Arc into #14 then hand it back typed — zero clone.
@@ -1161,12 +1159,8 @@ fn load_level_cached<CTX: ContextTr>(
     context: &mut CTX,
     key: B256,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
+    // Single in-block probe: `perp_get_struct` serves both a written `Struct` and a `Cached` queue.
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
-            return Ok(q.clone());
-        }
-    }
-    if let Some(any) = context.journal_mut().perp_cache_get(key) {
         if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
             return Ok(q.clone());
         }
@@ -1203,14 +1197,16 @@ fn load_level_arc<CTX: ContextTr>(
     context: &mut CTX,
     key: B256,
 ) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
-    if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
-            return Ok(std::sync::Arc::new(q.clone()));
-        }
-    }
+    // #14 cache tier FIRST (Arc bump, zero clone) — before `perp_get_struct`, which now also
+    // returns cached blobs as `&` and would force a deep clone.
     if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
         if let Ok(q) = std::sync::Arc::downcast::<Vec<[u8; 32]>>(arc) {
             return Ok(q);
+        }
+    }
+    if let Some(any) = context.journal_mut().perp_get_struct(key) {
+        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
+            return Ok(std::sync::Arc::new(q.clone()));
         }
     }
     if let Some(arc) = context
