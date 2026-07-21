@@ -2551,8 +2551,12 @@ mod golden {
     /// RE-PIN (catalog #22, price index Vec<u64>→BTreeSet<u64> + `BLOCK_COMMITMENT_VERSION` 4→5):
     /// business snapshot unchanged; the serialized price-level bytes change (container + order).
     /// Prior value 0x8bcfa8def86af905253c4de33a0ca43634683e94191de931bf9235a38be9597d.
+    /// RE-PIN (catalog #25, orderId keccak256→blake3 + `BLOCK_COMMITMENT_VERSION` 5→6): business
+    /// snapshot unchanged; every orderId changes → off-trie order keys (order_key = raw orderId)
+    /// + level-queue contents fold different bytes. Devnet wipe accompanies the bump. Prior value
+    /// 0xcfa7fe64e534bd9adf65df5a2e4529b95754e150519352daeed5ce77d01f71c9.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xcfa7fe64e534bd9adf65df5a2e4529b95754e150519352daeed5ce77d01f71c9");
+        b256!("0x43e66591472c05f5797770241749fb9055ad2745e2bc981bc2c1d146e74ed77c");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
