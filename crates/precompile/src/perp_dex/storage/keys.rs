@@ -38,6 +38,8 @@ const PFX_BID_PRICES: [u8; 4] = *b"bidp"; // sorted Vec<u64> of active bid price
 const PFX_ASK_PRICES: [u8; 4] = *b"askp"; // sorted Vec<u64> of active ask prices
 const PFX_BID_LEVEL: [u8; 4] = *b"bidl"; // FIFO queue of order IDs at a bid price
 const PFX_ASK_LEVEL: [u8; 4] = *b"askl"; // FIFO queue of order IDs at an ask price
+const PFX_BID_COUNT: [u8; 4] = *b"bidc"; // # of LIVE orders at a bid price level (lazy-queue)
+const PFX_ASK_COUNT: [u8; 4] = *b"askc"; // # of LIVE orders at an ask price level (lazy-queue)
 const PFX_BEST_BID: [u8; 4] = *b"bbd\x00"; // cached best bid price (0 = empty)
 const PFX_BEST_ASK: [u8; 4] = *b"bak\x00"; // cached best ask price (0 = empty)
 const PFX_API_KEY: [u8; 4] = *b"apik"; // per-user per-slot ed25519 key
@@ -52,6 +54,8 @@ const PFX_FUNDING_STATE: [u8; 4] = *b"fund"; // per-market FundingState
 const PFX_PREMIUM_ACCUMULATOR: [u8; 4] = *b"pacc"; // per-market PremiumIndexAccumulator
 const PFX_INSURANCE_FUND: [u8; 4] = *b"infd"; // global insurance fund balance
 const PFX_COMMITMENT: [u8; 4] = *b"cmit"; // global on-trie commitment anchor slot
+const PFX_SEEN_SIG: [u8; 4] = *b"seen"; // signed-order replay guard: seen signature markers
+const PFX_SEEN_BUCKET: [u8; 4] = *b"snbk"; // time-bucketed index of seen-sig keys (for GC)
 
 // ── Packing helpers (catalog #12: pack, don't hash) ───────────────────────────
 // All produce `prefix ++ fields ++ zero-pad` in a stack `[u8; 32]` — no hash, no heap alloc.
@@ -265,6 +269,19 @@ pub fn ask_level_key(market_id: u64, price: u64) -> B256 {
     pack_market_price(PFX_ASK_LEVEL, market_id, price)
 }
 
+/// Count of LIVE (Open/PartiallyFilled) orders at a bid price level. The lazy-queue design leaves
+/// cancelled/filled order-ids in the FIFO queue (swept opportunistically by the next match walk),
+/// so `queue.len()` no longer measures liveness — this count is the authoritative
+/// "is the level empty?" signal that keeps the price index + BBO cache live at O(1) on cancel.
+pub fn bid_count_key(market_id: u64, price: u64) -> B256 {
+    pack_market_price(PFX_BID_COUNT, market_id, price)
+}
+
+/// Count of LIVE orders at an ask price level. See [`bid_count_key`].
+pub fn ask_count_key(market_id: u64, price: u64) -> B256 {
+    pack_market_price(PFX_ASK_COUNT, market_id, price)
+}
+
 /// Cached best bid price for a market (0 = no bids).
 pub fn best_bid_key(market_id: u64) -> B256 {
     pack_market(PFX_BEST_BID, market_id)
@@ -348,6 +365,29 @@ pub fn insurance_fund_key() -> B256 {
     INSURANCE_FUND_KEY
 }
 
+// ── Signed-order replay guard (seen-signature set) ─────────────────────────────
+// Decoupled from the order map: with delete-on-terminal the order-id is no longer a durable
+// replay witness (a filled/cancelled signed order is deleted), so a signature's replay guard lives
+// in its own namespace. `keccak256(signature)` is already computed for the order id, so the seen
+// key REUSES it (no extra hash) — a `prefix(4) ++ hash[..28]` direct-pack. 28-byte truncation of a
+// preimage-resistant hash keeps ~2^112 collision resistance, ample for a replay marker; the prefix
+// separates it from the raw-keccak order-id namespace so the two can never alias.
+
+/// Replay-guard key for a signed order, derived from `keccak256(signature)` (`sig_hash`).
+pub fn seen_sig_key(sig_hash: &[u8; 32]) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[..4].copy_from_slice(&PFX_SEEN_SIG);
+    buf[4..32].copy_from_slice(&sig_hash[..28]);
+    B256::new(buf)
+}
+
+/// Time bucket (`timestamp / bucket_width`) holding the seen-sig keys recorded in that window, as a
+/// raw-packed `Vec<[u8;32]>` (like a level FIFO). Enumerated ONLY by the lazy GC, which drops whole
+/// expired buckets; never consulted on the replay-check hot path.
+pub fn seen_bucket_key(bucket_id: u64) -> B256 {
+    pack_market(PFX_SEEN_BUCKET, bucket_id)
+}
+
 #[cfg(test)]
 mod const_key_tests {
     use super::*;
@@ -373,6 +413,8 @@ mod const_key_tests {
             PFX_ASK_PRICES,
             PFX_BID_LEVEL,
             PFX_ASK_LEVEL,
+            PFX_BID_COUNT,
+            PFX_ASK_COUNT,
             PFX_BEST_BID,
             PFX_BEST_ASK,
             PFX_API_KEY,
@@ -387,6 +429,8 @@ mod const_key_tests {
             PFX_PREMIUM_ACCUMULATOR,
             PFX_INSURANCE_FUND,
             PFX_COMMITMENT,
+            PFX_SEEN_SIG,
+            PFX_SEEN_BUCKET,
         ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {

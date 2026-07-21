@@ -24,13 +24,14 @@ use crate::{
 };
 
 use keys::{
-    account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
-    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, commitment_slot, erc20_balance_slot,
-    funding_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
-    last_traded_price_key, mark_price_key, market_fee_total_key, market_key, market_manager_key,
-    open_interest_key, oracle_key, order_key, position_key, position_registry_key,
-    premium_accumulator_key, price_basis_window_key, trade_count_key, user_buy_orders_key,
-    user_fee_rates_key, user_nonce_key, user_sell_orders_key,
+    account_key, admin_key, api_key_ids_key, api_key_key, ask_count_key, ask_level_key,
+    ask_prices_key, best_ask_key, best_bid_key, bid_count_key, bid_level_key, bid_prices_key,
+    commitment_slot, erc20_balance_slot, funding_state_key, index_price_history_key,
+    index_price_state_key, insurance_fund_key, last_traded_price_key, mark_price_key,
+    market_fee_total_key, market_key, market_manager_key, open_interest_key, oracle_key, order_key,
+    position_key, position_registry_key, premium_accumulator_key, price_basis_window_key,
+    seen_bucket_key, seen_sig_key, trade_count_key, user_buy_orders_key, user_fee_rates_key,
+    user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -204,8 +205,11 @@ fn store_blob<CTX: ContextTr>(
 /// at the switch from keccak-derived storage keys to direct-packed keys (catalog #12), so the
 /// two key framings never alias across the consensus transition (a devnet wipe accompanies the
 /// bump); bumped to 5 at the price-index switch from sorted `Vec<u64>` to `Vec<u64>`
-/// (catalog #22) — the serialized price-level bytes change (container + order).
-const BLOCK_COMMITMENT_VERSION: u8 = 5;
+/// (catalog #22) — the serialized price-level bytes change (container + order); bumped to 6 at the
+/// order-lifecycle redesign (commit-only #23): delete-on-terminal removes filled/cancelled orders
+/// from the map, the new per-level live-order count + lazy FIFO change the level-key set, and the
+/// signed-order replay guard moved to the seen-signature namespace — all shift the net-delta bytes.
+const BLOCK_COMMITMENT_VERSION: u8 = 6;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -828,6 +832,19 @@ pub fn save_order<CTX: ContextTr>(
     save_cached(context, order_key(order_id), order)
 }
 
+/// Deletes an order record (delete-on-terminal): writes an empty blob, the established "absent"
+/// convention (`load_order` → `None`, and the block delta merges an empty value as a store DELETE).
+/// Writing empty `Bytes` over any prior `Struct` overlay for this key clears it (HashMap replace +
+/// deser-cache eviction), so a save-then-delete in the same block reads back absent. Callers use
+/// this the instant an order reaches a terminal status so the order map only ever holds live
+/// (Open/PartiallyFilled) orders.
+pub fn delete_order<CTX: ContextTr>(
+    context: &mut CTX,
+    order_id: &[u8; 32],
+) -> Result<(), PrecompileError> {
+    store_blob(context, order_key(order_id), &[])
+}
+
 // ── Global trade counter ──────────────────────────────────────────────────────
 
 /// Atomically increment and return the *current* trade ID for a market, then store the
@@ -1390,6 +1407,100 @@ pub fn push_ask_order<CTX: ContextTr>(
     save_ask_level(context, market_id, price, &queue)
 }
 
+// ── Per-level live-order count (lazy-queue) ────────────────────────────────────
+// The number of LIVE (Open/PartiallyFilled) orders at a price level. The lazy-queue design leaves
+// cancelled/filled order-ids sitting in the FIFO queue (swept opportunistically the next time a
+// match walks the level), so `queue.len()` no longer tracks liveness. This count is the
+// authoritative "is the level empty?" signal — cancel decrements it in O(1) (no queue scan) and,
+// when it hits 0, removes the price from the side's index + refreshes the BBO. Absent = 0; a count
+// of 0 deletes the key (empty blob). Maintained by: rest (+1), cancel (−1), cancel-all (−live),
+// and the match walk (set to the post-walk survivor count via the registry `SaveCount` event).
+
+pub fn load_bid_count<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<u64, PrecompileError> {
+    Ok(load_cached::<_, u64>(context, bid_count_key(market_id, price))?.unwrap_or(0))
+}
+
+pub fn load_ask_count<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<u64, PrecompileError> {
+    Ok(load_cached::<_, u64>(context, ask_count_key(market_id, price))?.unwrap_or(0))
+}
+
+pub fn save_bid_count<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    count: u64,
+) -> Result<(), PrecompileError> {
+    let key = bid_count_key(market_id, price);
+    if count == 0 {
+        store_blob(context, key, &[])
+    } else {
+        save_cached(context, key, &count)
+    }
+}
+
+pub fn save_ask_count<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    count: u64,
+) -> Result<(), PrecompileError> {
+    let key = ask_count_key(market_id, price);
+    if count == 0 {
+        store_blob(context, key, &[])
+    } else {
+        save_cached(context, key, &count)
+    }
+}
+
+/// Increment a side's level count by 1 (order rested). Returns the new count.
+pub fn incr_level_count<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    side: crate::perp_dex::types::Side,
+    price: u64,
+) -> Result<u64, PrecompileError> {
+    use crate::perp_dex::types::Side;
+    let new = match side {
+        Side::Buy => load_bid_count(context, market_id, price)?.saturating_add(1),
+        Side::Sell => load_ask_count(context, market_id, price)?.saturating_add(1),
+    };
+    match side {
+        Side::Buy => save_bid_count(context, market_id, price, new)?,
+        Side::Sell => save_ask_count(context, market_id, price, new)?,
+    }
+    Ok(new)
+}
+
+/// Decrement a side's level count by `n` (orders removed: cancel / bulk-cancel). Returns the new
+/// count. Saturates at 0 (an under-decrement would mean the count drifted from the queue's live
+/// membership — callers treat a resulting 0 as "level empty").
+pub fn decr_level_count<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    side: crate::perp_dex::types::Side,
+    price: u64,
+    n: u64,
+) -> Result<u64, PrecompileError> {
+    use crate::perp_dex::types::Side;
+    let new = match side {
+        Side::Buy => load_bid_count(context, market_id, price)?.saturating_sub(n),
+        Side::Sell => load_ask_count(context, market_id, price)?.saturating_sub(n),
+    };
+    match side {
+        Side::Buy => save_bid_count(context, market_id, price, new)?,
+        Side::Sell => save_ask_count(context, market_id, price, new)?,
+    }
+    Ok(new)
+}
+
 // ── Best bid / ask cache ──────────────────────────────────────────────────────
 // Stored as a single u64 per market.  0 means "no orders on that side".
 // Kept in sync with the sorted price lists so callers can avoid loading the
@@ -1686,6 +1797,72 @@ pub fn absorb_from_insurance_fund<CTX: ContextTr>(
     Ok((absorbed, remaining))
 }
 
+// ── Signed-order replay guard (seen-signature set) ─────────────────────────────
+// Replaces the order-map presence check as the replay witness for `placeOrderSigned`. Under
+// delete-on-terminal a filled/cancelled signed order is DELETED, so its order-id no longer proves
+// "this signature was already submitted" — this set does, in its own key namespace. The hot-path
+// check is a single O(1) overlay lookup that REUSES the `keccak256(signature)` already computed for
+// the order id (no extra hash). A seen marker is tiny; time-bucketing bounds the set to the recv
+// window. Crucially, `check_recv_window` rejects any signature older than the window BEFORE the
+// seen check runs, so a stale marker can never cause a false reject — GC exists purely to bound
+// storage, and losing a marker late is harmless.
+
+const SEEN_BUCKET_WIDTH_SECS: u64 = 15;
+/// Buckets retained behind the current one before GC drops them. `RETENTION * WIDTH` must exceed
+/// the max recv window (+ clock skew) so a bucket is dropped only once EVERY signature it could
+/// hold is already recv-window-expired (hence its marker unreachable). 6 * 15 = 90s > 60s + 5s.
+const SEEN_RETENTION_BUCKETS: u64 = 6;
+
+/// Replay check: has this signature (by `keccak256(signature)`) already been submitted?
+pub fn is_signature_seen<CTX: ContextTr>(
+    context: &mut CTX,
+    sig_hash: &[u8; 32],
+) -> Result<bool, PrecompileError> {
+    Ok(!load_blob(context, seen_sig_key(sig_hash))?.is_empty())
+}
+
+/// Records a signature as seen and indexes its seen-key in the GC bucket for the signature's OWN
+/// timestamp (`sig_ts`, already validated inside the recv window) — so the marker is reclaimed a
+/// fixed time after the signature was signed, independent of when it was submitted.
+pub fn mark_signature_seen<CTX: ContextTr>(
+    context: &mut CTX,
+    sig_hash: &[u8; 32],
+    sig_ts: u64,
+) -> Result<(), PrecompileError> {
+    let key = seen_sig_key(sig_hash);
+    store_blob(context, key, &[1u8])?; // non-empty marker ('empty' == absent)
+    let bucket = sig_ts / SEEN_BUCKET_WIDTH_SECS;
+    let bkey = seen_bucket_key(bucket);
+    let mut ids = unpack_order_ids(&load_blob(context, bkey)?)?;
+    ids.push(key.0);
+    store_blob(context, bkey, &pack_order_ids(&ids))
+}
+
+/// Lazy GC: drop the one bucket now `RETENTION` behind the block's current bucket, deleting every
+/// seen marker it indexed and then the bucket itself. Bounded (O(bucket size)) per call; the
+/// retention margin guarantees every signature in the dropped bucket is already recv-window-
+/// expired. Under continuous signed traffic each bucket is visited exactly once; a gap longer than
+/// one bucket width can skip a bucket, leaving harmless stale markers until a wipe (acceptable
+/// pre-production — they never cause false rejects). Call after each accepted signed order.
+pub fn gc_seen_buckets<CTX: ContextTr>(
+    context: &mut CTX,
+    block_ts: u64,
+) -> Result<(), PrecompileError> {
+    let cur = block_ts / SEEN_BUCKET_WIDTH_SECS;
+    if cur < SEEN_RETENTION_BUCKETS {
+        return Ok(());
+    }
+    let bkey = seen_bucket_key(cur - SEEN_RETENTION_BUCKETS);
+    let ids = unpack_order_ids(&load_blob(context, bkey)?)?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    for id in &ids {
+        store_blob(context, B256::new(*id), &[])?;
+    }
+    store_blob(context, bkey, &[])
+}
+
 // ── Premium index accumulator ─────────────────────────────────────────────────
 
 pub fn load_premium_accumulator<CTX: ContextTr>(
@@ -1803,6 +1980,50 @@ mod commitment_tests {
         finalize_block_commitment(&mut ctx, &delta).unwrap();
         assert_eq!(read_commitment(&mut ctx), expected);
         assert_ne!(expected, U256::ZERO);
+    }
+
+    /// Signed-order replay guard (commit-only #23, decoupled from the order map): a marked
+    /// signature reads back seen; an unrelated one does not; and the time-bucket GC reclaims the
+    /// marker once the block clock is `RETENTION` buckets past the signature's own bucket.
+    #[test]
+    fn seen_signature_guard_and_bucket_gc() {
+        let mut ctx = new_test_ctx();
+        let sig_a = [0x11u8; 32];
+        let sig_b = [0x22u8; 32];
+        let ts = 1_000u64;
+
+        assert!(!is_signature_seen(&mut ctx, &sig_a).unwrap());
+        mark_signature_seen(&mut ctx, &sig_a, ts).unwrap();
+        assert!(
+            is_signature_seen(&mut ctx, &sig_a).unwrap(),
+            "marked signature reads back seen"
+        );
+        assert!(
+            !is_signature_seen(&mut ctx, &sig_b).unwrap(),
+            "unrelated signature is not seen"
+        );
+
+        let bucket_a = ts / SEEN_BUCKET_WIDTH_SECS;
+        // GC targeting a bucket BEFORE sig_a's must not touch it.
+        gc_seen_buckets(
+            &mut ctx,
+            (bucket_a + SEEN_RETENTION_BUCKETS - 1) * SEEN_BUCKET_WIDTH_SECS,
+        )
+        .unwrap();
+        assert!(
+            is_signature_seen(&mut ctx, &sig_a).unwrap(),
+            "marker survives until its bucket is RETENTION behind the clock"
+        );
+        // GC exactly at sig_a's bucket + RETENTION reclaims it.
+        gc_seen_buckets(
+            &mut ctx,
+            (bucket_a + SEEN_RETENTION_BUCKETS) * SEEN_BUCKET_WIDTH_SECS,
+        )
+        .unwrap();
+        assert!(
+            !is_signature_seen(&mut ctx, &sig_a).unwrap(),
+            "GC reclaimed the expired marker"
+        );
     }
 }
 
