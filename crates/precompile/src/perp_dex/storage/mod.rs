@@ -204,10 +204,8 @@ fn store_blob<CTX: ContextTr>(
 /// at the switch from keccak-derived storage keys to direct-packed keys (catalog #12), so the
 /// two key framings never alias across the consensus transition (a devnet wipe accompanies the
 /// bump); bumped to 5 at the price-index switch from sorted `Vec<u64>` to `Vec<u64>`
-/// (catalog #22) — the serialized price-level bytes change (container + order); bumped to 6 at the
-/// orderId keccak256→blake3 switch (catalog #25) — every orderId changes, so the off-trie order
-/// keys (order_key = raw orderId) + level-queue contents fold different bytes into the commitment.
-const BLOCK_COMMITMENT_VERSION: u8 = 6;
+/// (catalog #22) — the serialized price-level bytes change (container + order).
+const BLOCK_COMMITMENT_VERSION: u8 = 5;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

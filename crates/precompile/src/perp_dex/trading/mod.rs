@@ -3,7 +3,7 @@
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
 use context::{ContextTr, JournalTr};
-use primitives::{Address, Bytes, FixedBytes, Log};
+use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 
 use context::Block as BlockTr;
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -84,10 +84,8 @@ pub fn run_place_order<CTX: ContextTr>(
 
 /// `placeOrderSigned(address account, ..., uint64 timestamp, bytes signature) returns (bytes32 orderId)`
 ///
-/// orderId = blake3(signature) (catalog #25; was keccak256). Replay protection is implicit: a
-/// second submission of the same signature produces the same orderId, which already exists in
-/// storage, and is rejected. NB: any off-chain relayer/SDK that recomputes this orderId to track
-/// or cancel a signed order MUST use blake3 too.
+/// orderId = keccak256(signature). Replay protection is implicit: a second submission of the
+/// same signature produces the same orderId, which already exists in storage, and is rejected.
 pub fn run_place_order_signed<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -128,7 +126,7 @@ pub fn run_place_order_signed<CTX: ContextTr>(
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
 
     // Derive orderId from signature: same sig, same id, duplicate check is the replay guard.
-    let order_id: [u8; 32] = *blake3::hash(args.signature.as_ref()).as_bytes();
+    let order_id: [u8; 32] = keccak256(args.signature.as_ref()).0;
     if storage::load_order_ref(context, &order_id)?.is_some() {
         return Err(perp_err(
             "placeOrderSigned: duplicate signature (already submitted)",
@@ -403,12 +401,7 @@ pub(super) fn peek_order_id<CTX: ContextTr>(
     let mut buf = [0u8; 28];
     buf[..20].copy_from_slice(account.as_slice());
     buf[20..28].copy_from_slice(&nonce.to_be_bytes());
-    // blake3 (catalog #25): the orderId is a perp-internal opaque 32-byte id (used as the off-trie
-    // order key + in level queues + events), NOT an Ethereum-consensus hash, so the algorithm is a
-    // free choice — blake3 is faster than software-keccak here (asm-keccak is off) and unifies the
-    // perp hot path on blake3 (same as the block commitment). Off-chain code that recomputes an
-    // orderId MUST match this. keccak stays only for erc20_balance_slot (Solidity layout).
-    Ok((*blake3::hash(&buf).as_bytes(), nonce + 1))
+    Ok((keccak256(&buf).0, nonce + 1))
 }
 
 /// Persists the nonce bump reserved by [`peek_order_id`]. Call ONLY after the placement
