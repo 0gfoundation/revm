@@ -634,28 +634,31 @@ fn ensure_fok_filled(remaining: u64) -> Result<(), PrecompileError> {
     }
 }
 
+/// PostOnly cross check. Reads the BBO ONCE (both sides, one MarketHot probe) and RETURNS it so the
+/// caller can thread it into `rest_in_book` (no match runs on the PostOnly path, so the BBO stays
+/// current from here to the rest).
 fn ensure_post_only_does_not_cross<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     side: Side,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(u64, u64), PrecompileError> {
+    let h = storage::load_market_hot(context, market_id)?;
+    let (best_bid, best_ask) = (h.best_bid, h.best_ask);
     match side {
         Side::Buy => {
-            let best_ask = storage::load_best_ask(context, market_id)?;
             if best_ask != 0 && best_ask <= price {
                 return Err(perp_err("placeOrder: PostOnly order would match"));
             }
         }
         Side::Sell => {
-            let best_bid = storage::load_best_bid(context, market_id)?;
             if best_bid != 0 && best_bid >= price {
                 return Err(perp_err("placeOrder: PostOnly order would match"));
             }
         }
     }
 
-    Ok(())
+    Ok((best_bid, best_ask))
 }
 
 fn remove_order_entry(
@@ -688,7 +691,8 @@ fn execute_limit_order<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     match order.tif {
         TimeInForce::PostOnly => {
-            ensure_post_only_does_not_cross(context, market_id, order.side, price)?;
+            // No match runs → the do-not-cross BBO is still current at rest; thread it in.
+            let bbo = ensure_post_only_does_not_cross(context, market_id, order.side, price)?;
             rest_in_book(
                 context,
                 account,
@@ -700,6 +704,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 client_order_id,
                 &order.market,
+                Some(bbo),
             )
         }
         TimeInForce::Gtc => {
@@ -730,6 +735,8 @@ fn execute_limit_order<CTX: ContextTr>(
                     order.tif,
                     client_order_id,
                     &order.market,
+                    // GTC: matching ran → read the (post-match) BBO inside rest_in_book.
+                    None,
                 )?;
             }
             Ok(())
@@ -1366,10 +1373,24 @@ fn rest_in_book<CTX: ContextTr>(
     tif: TimeInForce,
     client_order_id: [u8; 16],
     market: &crate::perp_dex::types::Market,
+    // 2b resolve-once: (best_bid, best_ask). `Some` = the caller already read the BBO (PostOnly
+    // threads its do-not-cross read — no match ran, so it is still current). `None` = read it here
+    // once. rest runs AFTER matching (GTC), and matching only moves the OPPOSITE side from the one
+    // we rest on, so a rest-time read yields both bests current — no staleness.
+    bbo: Option<(u64, u64)>,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let mut account = storage::load_account(context, user)?;
     let maker_fee_bps = storage::load_user_fee_rates(context, user)?.maker_fee_bps;
+    // ONE BBO resolve for both the best-update check and the mid-price sample (was up to two
+    // separate load_best_bid/load_best_ask reads per arm).
+    let (best_bid, best_ask) = match bbo {
+        Some(b) => b,
+        None => {
+            let h = storage::load_market_hot(context, market_id)?;
+            (h.best_bid, h.best_ask)
+        }
+    };
 
     match side {
         Side::Buy => {
@@ -1448,10 +1469,9 @@ fn rest_in_book<CTX: ContextTr>(
             storage::incr_level_count(context, market_id, Side::Buy, price)?;
 
             // Keep best_bid cache up to date.
-            let cur_best_bid = storage::load_best_bid(context, market_id)?;
-            if cur_best_bid == 0 || price > cur_best_bid {
+            if best_bid == 0 || price > best_bid {
                 storage::save_best_bid(context, market_id, price)?;
-                let best_ask = storage::load_best_ask(context, market_id)?;
+                // best_ask from the single resolve above (post-match for GTC).
                 record_mid_price_sample_for_best_quote_change(context, market_id, price, best_ask)?;
             }
         }
@@ -1525,10 +1545,9 @@ fn rest_in_book<CTX: ContextTr>(
             storage::incr_level_count(context, market_id, Side::Sell, price)?;
 
             // Keep best_ask cache up to date.
-            let cur_best_ask = storage::load_best_ask(context, market_id)?;
-            if cur_best_ask == 0 || price < cur_best_ask {
+            if best_ask == 0 || price < best_ask {
                 storage::save_best_ask(context, market_id, price)?;
-                let best_bid = storage::load_best_bid(context, market_id)?;
+                // best_bid from the single resolve above (post-match for GTC).
                 record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, price)?;
             }
         }
