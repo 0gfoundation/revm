@@ -31,7 +31,7 @@ use keys::{
     insurance_fund_key, market_fee_total_key, market_hot_key, market_key, market_manager_key,
     oracle_key, order_key, position_key, position_registry_key, premium_accumulator_key,
     price_basis_window_key, seen_bucket_key, seen_sig_key, trade_count_key, user_buy_orders_key,
-    user_fee_rates_key, user_nonce_key, user_sell_orders_key,
+    user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -210,8 +210,10 @@ fn store_blob<CTX: ContextTr>(
 /// from the map, the new per-level live-order count + lazy FIFO change the level-key set, and the
 /// signed-order replay guard moved to the seen-signature namespace — all shift the net-delta bytes;
 /// bumped to 7 grouping the five per-market hot scalars (mark price, best bid/ask, last traded,
-/// open interest) into one `MarketHot` blob — the delta keys + framing regroup (values identical).
-const BLOCK_COMMITMENT_VERSION: u8 = 7;
+/// open interest) into one `MarketHot` blob — the delta keys + framing regroup (values identical);
+/// bumped to 8 folding the two per-user scalar keys (fee-rate bps, order nonce) into the account
+/// blob — the account blob grows and their standalone keys disappear from the delta.
+const BLOCK_COMMITMENT_VERSION: u8 = 8;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -487,11 +489,40 @@ pub fn save_account<CTX: ContextTr>(
     save_cached(context, account_key(user), &account)
 }
 
+/// In-place RMW of a user's account blob (mirror of [`mutate_buy_orders`]): fast-path mutates the
+/// deferred `Struct` already in the overlay (zero clone — no `usdc_balance` String copy); slow-path
+/// loads once → mutate → store. Used by the folded fee-rate / nonce setters so they coalesce with
+/// balance writes into ONE account write.
+fn mutate_account<CTX: ContextTr, R>(
+    context: &mut CTX,
+    user: Address,
+    f: impl FnOnce(&mut UserAccount) -> R,
+) -> Result<R, PrecompileError> {
+    let key = account_key(user);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(a) = any.downcast_mut::<UserAccount>() {
+            return Ok(f(a));
+        }
+    }
+    let mut a: UserAccount = load_cached(context, key)?.unwrap_or_default();
+    let r = f(&mut a);
+    save_cached(context, key, &a)?;
+    Ok(r)
+}
+
+// Fee rates + nonce are folded into UserAccount (per-user, co-read with the account on the hot
+// placement path). Reads go through `load_account_ref` (Arc bump — never clones the usdc_balance
+// String); writes RMW the account blob in place.
+
 pub fn load_user_fee_rates<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<UserFeeRates, PrecompileError> {
-    Ok(load_cached::<_, UserFeeRates>(context, user_fee_rates_key(user))?.unwrap_or_default())
+    let a = load_account_ref(context, user)?;
+    Ok(UserFeeRates {
+        maker_fee_bps: a.maker_fee_bps,
+        taker_fee_bps: a.taker_fee_bps,
+    })
 }
 
 pub fn save_user_fee_rates<CTX: ContextTr>(
@@ -499,7 +530,10 @@ pub fn save_user_fee_rates<CTX: ContextTr>(
     user: Address,
     rates: UserFeeRates,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, user_fee_rates_key(user), &rates)
+    mutate_account(context, user, |a| {
+        a.maker_fee_bps = rates.maker_fee_bps;
+        a.taker_fee_bps = rates.taker_fee_bps;
+    })
 }
 
 pub fn load_market_fee_total<CTX: ContextTr>(
@@ -859,13 +893,13 @@ pub fn next_trade_id<CTX: ContextTr>(
     Ok(current)
 }
 
-// ── User nonce ────────────────────────────────────────────────────────────────
+// ── User nonce (folded into UserAccount) ────────────────────────────────────────
 
 pub fn load_user_nonce<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, user_nonce_key(user))?.unwrap_or(0))
+    Ok(load_account_ref(context, user)?.nonce)
 }
 
 pub fn save_user_nonce<CTX: ContextTr>(
@@ -873,7 +907,7 @@ pub fn save_user_nonce<CTX: ContextTr>(
     user: Address,
     nonce: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, user_nonce_key(user), &nonce)
+    mutate_account(context, user, |a| a.nonce = nonce)
 }
 
 // ── Market ────────────────────────────────────────────────────────────────────
@@ -2150,6 +2184,9 @@ mod size_probe_tests {
         let acct = UserAccount {
             usdc_balance: "123456789000000000000".into(), // 21-digit decimal string
             perp_wallet_balance: 1_234_567_890,
+            maker_fee_bps: 2,
+            taker_fee_bps: 5,
+            nonce: 7,
         };
         let buf = encode(&acct).unwrap();
         println!(

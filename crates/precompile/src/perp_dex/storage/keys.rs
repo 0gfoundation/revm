@@ -22,14 +22,12 @@ use primitives::{keccak256, Address, B256};
 
 // ── Key-family prefixes (4-byte, ASCII, must be pairwise distinct) ─────────────
 const PFX_ADMIN: [u8; 4] = *b"admn";
-const PFX_ACCOUNT: [u8; 4] = *b"acct";
-const PFX_USER_FEE: [u8; 4] = *b"ufee";
+const PFX_ACCOUNT: [u8; 4] = *b"acct"; // per-user account (balance + folded fee bps + order nonce)
 const PFX_MARKET_FEE_TOTAL: [u8; 4] = *b"mfee"; // per-market collected trading fee total
 const PFX_TRADE_COUNT: [u8; 4] = *b"tcnt"; // per-market sequential trade ID counter
 const PFX_POSITION: [u8; 4] = *b"pos\x00";
 const PFX_BUY_ORDERS: [u8; 4] = *b"bord"; // per-user buy order entries
 const PFX_SELL_ORDERS: [u8; 4] = *b"sord"; // per-user sell order entries
-const PFX_USER_NONCE: [u8; 4] = *b"nonc"; // per-user nonce for order-id generation
 const PFX_MARKET: [u8; 4] = *b"mkt\x00";
 const PFX_MARKET_HOT: [u8; 4] = *b"mhot"; // per-market grouped hot scalars (MarketHot): mark/BBO/last/OI
 const PFX_POSITION_REGISTRY: [u8; 4] = *b"preg"; // per-market set of addresses with an open position
@@ -176,9 +174,7 @@ pub fn account_key(user: Address) -> B256 {
     pack_addr(PFX_ACCOUNT, user)
 }
 
-pub fn user_fee_rates_key(user: Address) -> B256 {
-    pack_addr(PFX_USER_FEE, user)
-}
+// Fee rates + order nonce are folded into the account blob (see [`account_key`]) — no own keys.
 
 pub fn market_fee_total_key(market_id: u64) -> B256 {
     pack_market(PFX_MARKET_FEE_TOTAL, market_id)
@@ -215,11 +211,6 @@ pub fn user_sell_orders_key(user: Address, market_id: u64) -> B256 {
 /// otherwise a crafted order id could collide with a structured key.
 pub fn order_key(order_id: &[u8; 32]) -> B256 {
     B256::new(*order_id)
-}
-
-/// Per-user nonce used to derive unique order IDs.
-pub fn user_nonce_key(user: Address) -> B256 {
-    pack_addr(PFX_USER_NONCE, user)
 }
 
 // ── Market ────────────────────────────────────────────────────────────────────
@@ -380,13 +371,11 @@ mod const_key_tests {
         let all: &[[u8; 4]] = &[
             PFX_ADMIN,
             PFX_ACCOUNT,
-            PFX_USER_FEE,
             PFX_MARKET_FEE_TOTAL,
             PFX_TRADE_COUNT,
             PFX_POSITION,
             PFX_BUY_ORDERS,
             PFX_SELL_ORDERS,
-            PFX_USER_NONCE,
             PFX_MARKET,
             PFX_MARKET_HOT,
             PFX_POSITION_REGISTRY,

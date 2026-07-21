@@ -2656,8 +2656,12 @@ mod golden {
     /// keys into one grouped `MarketHot` blob, so the block-delta keys + framing regroup. Every
     /// value — and the business snapshot — is IDENTICAL. Prior value
     /// 0xcf5c23c371fd0661b74856c2d08e7df707b3b61831297a870e77276ae531a53f.
+    /// RE-PIN (per-user scalar fold + `BLOCK_COMMITMENT_VERSION` 7→8): the fee-rate bps + order
+    /// nonce moved from two standalone per-user keys into the account blob (those keys leave the
+    /// delta; the account blob grows). Values + business snapshot IDENTICAL. Prior value
+    /// 0x2d7a551bd8ef02c3d4933462314b1182be29f40fc284bf1b1c111eb1e423c956.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x2d7a551bd8ef02c3d4933462314b1182be29f40fc284bf1b1c111eb1e423c956");
+        b256!("0x7288ee0d91edb642537fc632a47eb12d27542977b4ffb7bf97d6bf31a874336c");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
