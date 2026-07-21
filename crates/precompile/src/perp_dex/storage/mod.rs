@@ -15,8 +15,9 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         types::{
-            ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, Order, OrderEntry,
-            PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount, UserFeeRates,
+            ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, MarketHot, Order,
+            OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount,
+            UserFeeRates,
         },
     },
     stateful_precompiles::convert_db_err,
@@ -25,13 +26,12 @@ use crate::{
 
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_count_key, ask_level_key,
-    ask_prices_key, best_ask_key, best_bid_key, bid_count_key, bid_level_key, bid_prices_key,
-    commitment_slot, erc20_balance_slot, funding_state_key, index_price_history_key,
-    index_price_state_key, insurance_fund_key, last_traded_price_key, mark_price_key,
-    market_fee_total_key, market_key, market_manager_key, open_interest_key, oracle_key, order_key,
-    position_key, position_registry_key, premium_accumulator_key, price_basis_window_key,
-    seen_bucket_key, seen_sig_key, trade_count_key, user_buy_orders_key, user_fee_rates_key,
-    user_nonce_key, user_sell_orders_key,
+    ask_prices_key, bid_count_key, bid_level_key, bid_prices_key, commitment_slot,
+    erc20_balance_slot, funding_state_key, index_price_history_key, index_price_state_key,
+    insurance_fund_key, market_fee_total_key, market_hot_key, market_key, market_manager_key,
+    oracle_key, order_key, position_key, position_registry_key, premium_accumulator_key,
+    price_basis_window_key, seen_bucket_key, seen_sig_key, trade_count_key, user_buy_orders_key,
+    user_fee_rates_key, user_nonce_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -208,8 +208,10 @@ fn store_blob<CTX: ContextTr>(
 /// (catalog #22) — the serialized price-level bytes change (container + order); bumped to 6 at the
 /// order-lifecycle redesign (commit-only #23): delete-on-terminal removes filled/cancelled orders
 /// from the map, the new per-level live-order count + lazy FIFO change the level-key set, and the
-/// signed-order replay guard moved to the seen-signature namespace — all shift the net-delta bytes.
-const BLOCK_COMMITMENT_VERSION: u8 = 6;
+/// signed-order replay guard moved to the seen-signature namespace — all shift the net-delta bytes;
+/// bumped to 7 grouping the five per-market hot scalars (mark price, best bid/ask, last traded,
+/// open interest) into one `MarketHot` blob — the delta keys + framing regroup (values identical).
+const BLOCK_COMMITMENT_VERSION: u8 = 7;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -899,13 +901,47 @@ pub fn save_market<CTX: ContextTr>(
     save_cached(context, market_key(market.market_id), market)
 }
 
+// ── Per-market hot scalars (grouped: MarketHot) ─────────────────────────────────
+// mark price + best bid/ask + last traded + open interest live in ONE blob, so co-accessing them
+// costs a single probe/decode/Arc sharing one cache line (was five separate keys). The old
+// per-scalar `load_/save_` helpers below stay as thin field accessors — call sites are unchanged —
+// and multiple scalar touches of the same market now share one cached MarketHot and coalesce into
+// one overlay write / block-delta entry.
+
+pub fn load_market_hot<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<MarketHot, PrecompileError> {
+    Ok(load_cached::<_, MarketHot>(context, market_hot_key(market_id))?.unwrap_or_default())
+}
+
+/// In-place RMW of a market's hot scalars (mirror of [`mutate_buy_orders`]): fast-path mutates the
+/// deferred `Struct` already in the overlay (zero clone, one write coalesced across scalar setters);
+/// slow-path loads once → mutate → store. Byte-identical final blob to a load→modify→save.
+fn mutate_market_hot<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    f: impl FnOnce(&mut MarketHot) -> R,
+) -> Result<R, PrecompileError> {
+    let key = market_hot_key(market_id);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(h) = any.downcast_mut::<MarketHot>() {
+            return Ok(f(h));
+        }
+    }
+    let mut h: MarketHot = load_cached(context, key)?.unwrap_or_default();
+    let r = f(&mut h);
+    save_cached(context, key, &h)?;
+    Ok(r)
+}
+
 // ── Mark price ────────────────────────────────────────────────────────────────
 
 pub fn load_mark_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, mark_price_key(market_id))?.unwrap_or(0))
+    Ok(load_market_hot(context, market_id)?.mark_price)
 }
 
 pub fn save_mark_price<CTX: ContextTr>(
@@ -913,7 +949,7 @@ pub fn save_mark_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, mark_price_key(market_id), &price)
+    mutate_market_hot(context, market_id, |h| h.mark_price = price)
 }
 
 // ── Open interest ─────────────────────────────────────────────────────────────
@@ -922,7 +958,7 @@ pub fn load_open_interest<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, open_interest_key(market_id))?.unwrap_or(0))
+    Ok(load_market_hot(context, market_id)?.open_interest)
 }
 
 pub fn save_open_interest<CTX: ContextTr>(
@@ -930,7 +966,7 @@ pub fn save_open_interest<CTX: ContextTr>(
     market_id: u64,
     oi: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, open_interest_key(market_id), &oi)
+    mutate_market_hot(context, market_id, |h| h.open_interest = oi)
 }
 
 // ── Order book: price level lists ─────────────────────────────────────────────
@@ -1498,15 +1534,15 @@ pub fn decr_level_count<CTX: ContextTr>(
 }
 
 // ── Best bid / ask cache ──────────────────────────────────────────────────────
-// Stored as a single u64 per market.  0 means "no orders on that side".
-// Kept in sync with the sorted price lists so callers can avoid loading the
-// full list just for a PostOnly check or a quick spread query.
+// Field accessors on the grouped [`MarketHot`] blob (0 = "no orders on that side"). Kept in sync
+// with the sorted price lists so callers can avoid loading the full list for a PostOnly / spread
+// check.
 
 pub fn load_best_bid<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, best_bid_key(market_id))?.unwrap_or(0))
+    Ok(load_market_hot(context, market_id)?.best_bid)
 }
 
 pub fn save_best_bid<CTX: ContextTr>(
@@ -1514,14 +1550,14 @@ pub fn save_best_bid<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, best_bid_key(market_id), &price)
+    mutate_market_hot(context, market_id, |h| h.best_bid = price)
 }
 
 pub fn load_best_ask<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, best_ask_key(market_id))?.unwrap_or(0))
+    Ok(load_market_hot(context, market_id)?.best_ask)
 }
 
 pub fn save_best_ask<CTX: ContextTr>(
@@ -1529,7 +1565,7 @@ pub fn save_best_ask<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, best_ask_key(market_id), &price)
+    mutate_market_hot(context, market_id, |h| h.best_ask = price)
 }
 
 /// Re-derive best_bid from the current bid price list (already in journal cache after matching).
@@ -1717,16 +1753,13 @@ pub fn save_price_basis_window<CTX: ContextTr>(
 }
 
 // ── Last traded price (contract price) ───────────────────────────────────────
+// Field accessor on the grouped [`MarketHot`] blob.
 
 pub fn load_last_traded_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let buf = load_blob(context, last_traded_price_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    decode(&buf)
+    Ok(load_market_hot(context, market_id)?.last_traded)
 }
 
 pub fn save_last_traded_price<CTX: ContextTr>(
@@ -1734,8 +1767,7 @@ pub fn save_last_traded_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&price)?;
-    store_blob(context, last_traded_price_key(market_id), &buf)
+    mutate_market_hot(context, market_id, |h| h.last_traded = price)
 }
 
 // ── Funding state ─────────────────────────────────────────────────────────────

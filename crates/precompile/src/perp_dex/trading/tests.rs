@@ -2651,8 +2651,13 @@ mod golden {
     /// snapshot is UNCHANGED except that terminal orders are no longer queryable (getOrder reverts
     /// → DELETED sentinel) — positions/accounts/fees/mark/funding are identical. Prior value
     /// 0xcfa7fe64e534bd9adf65df5a2e4529b95754e150519352daeed5ce77d01f71c9.
+    /// RE-PIN (MarketHot grouping + `BLOCK_COMMITMENT_VERSION` 6→7): the five per-market hot
+    /// scalars (mark price, best bid/ask, last traded, open interest) moved from five single-scalar
+    /// keys into one grouped `MarketHot` blob, so the block-delta keys + framing regroup. Every
+    /// value — and the business snapshot — is IDENTICAL. Prior value
+    /// 0xcf5c23c371fd0661b74856c2d08e7df707b3b61831297a870e77276ae531a53f.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xcf5c23c371fd0661b74856c2d08e7df707b3b61831297a870e77276ae531a53f");
+        b256!("0x2d7a551bd8ef02c3d4933462314b1182be29f40fc284bf1b1c111eb1e423c956");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

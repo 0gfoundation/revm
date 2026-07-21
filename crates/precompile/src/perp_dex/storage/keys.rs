@@ -31,8 +31,7 @@ const PFX_BUY_ORDERS: [u8; 4] = *b"bord"; // per-user buy order entries
 const PFX_SELL_ORDERS: [u8; 4] = *b"sord"; // per-user sell order entries
 const PFX_USER_NONCE: [u8; 4] = *b"nonc"; // per-user nonce for order-id generation
 const PFX_MARKET: [u8; 4] = *b"mkt\x00";
-const PFX_MARK_PRICE: [u8; 4] = *b"mktp";
-const PFX_OPEN_INT: [u8; 4] = *b"oint";
+const PFX_MARKET_HOT: [u8; 4] = *b"mhot"; // per-market grouped hot scalars (MarketHot): mark/BBO/last/OI
 const PFX_POSITION_REGISTRY: [u8; 4] = *b"preg"; // per-market set of addresses with an open position
 const PFX_BID_PRICES: [u8; 4] = *b"bidp"; // sorted Vec<u64> of active bid prices
 const PFX_ASK_PRICES: [u8; 4] = *b"askp"; // sorted Vec<u64> of active ask prices
@@ -40,8 +39,6 @@ const PFX_BID_LEVEL: [u8; 4] = *b"bidl"; // FIFO queue of order IDs at a bid pri
 const PFX_ASK_LEVEL: [u8; 4] = *b"askl"; // FIFO queue of order IDs at an ask price
 const PFX_BID_COUNT: [u8; 4] = *b"bidc"; // # of LIVE orders at a bid price level (lazy-queue)
 const PFX_ASK_COUNT: [u8; 4] = *b"askc"; // # of LIVE orders at an ask price level (lazy-queue)
-const PFX_BEST_BID: [u8; 4] = *b"bbd\x00"; // cached best bid price (0 = empty)
-const PFX_BEST_ASK: [u8; 4] = *b"bak\x00"; // cached best ask price (0 = empty)
 const PFX_API_KEY: [u8; 4] = *b"apik"; // per-user per-slot ed25519 key
 const PFX_API_KEY_IDS: [u8; 4] = *b"akid"; // per-user list of registered key_ids
 const PFX_ORACLE: [u8; 4] = *b"orcl"; // authorized oracle address (updateIndexPrice role)
@@ -49,7 +46,6 @@ const PFX_MARKET_MANAGER: [u8; 4] = *b"mkgr"; // authorized market manager addre
 const PFX_INDEX_PRICE: [u8; 4] = *b"idxp"; // per-market IndexPriceState
 const PFX_INDEX_HISTORY: [u8; 4] = *b"idxh"; // per-market IndexPriceHistory
 const PFX_BASIS_WINDOW: [u8; 4] = *b"bswn"; // per-market PriceBasisWindow (30s mid samples)
-const PFX_LAST_TRADED: [u8; 4] = *b"ltrd"; // per-market last traded price (contract price)
 const PFX_FUNDING_STATE: [u8; 4] = *b"fund"; // per-market FundingState
 const PFX_PREMIUM_ACCUMULATOR: [u8; 4] = *b"pacc"; // per-market PremiumIndexAccumulator
 const PFX_INSURANCE_FUND: [u8; 4] = *b"infd"; // global insurance fund balance
@@ -232,12 +228,10 @@ pub fn market_key(market_id: u64) -> B256 {
     pack_market(PFX_MARKET, market_id)
 }
 
-pub fn mark_price_key(market_id: u64) -> B256 {
-    pack_market(PFX_MARK_PRICE, market_id)
-}
-
-pub fn open_interest_key(market_id: u64) -> B256 {
-    pack_market(PFX_OPEN_INT, market_id)
+/// Per-market grouped hot scalars (`MarketHot`): mark price, best bid/ask, last traded, open
+/// interest. Replaces the five former single-scalar keys with one, so a co-access is one probe.
+pub fn market_hot_key(market_id: u64) -> B256 {
+    pack_market(PFX_MARKET_HOT, market_id)
 }
 
 /// Per-market set of addresses holding an open position (packed 20-byte
@@ -282,15 +276,8 @@ pub fn ask_count_key(market_id: u64, price: u64) -> B256 {
     pack_market_price(PFX_ASK_COUNT, market_id, price)
 }
 
-/// Cached best bid price for a market (0 = no bids).
-pub fn best_bid_key(market_id: u64) -> B256 {
-    pack_market(PFX_BEST_BID, market_id)
-}
-
-/// Cached best ask price for a market (0 = no asks).
-pub fn best_ask_key(market_id: u64) -> B256 {
-    pack_market(PFX_BEST_ASK, market_id)
-}
+// Best bid/ask, last-traded, open-interest, and mark price now live in the grouped
+// [`market_hot_key`] blob (`MarketHot`) — no per-scalar keys.
 
 // ── API key (ed25519 signed orders) ────────────────────────────────────────────
 
@@ -337,11 +324,6 @@ pub fn index_price_history_key(market_id: u64) -> B256 {
 /// Per-market PriceBasisWindow (30-second mid-price ring buffer).
 pub fn price_basis_window_key(market_id: u64) -> B256 {
     pack_market(PFX_BASIS_WINDOW, market_id)
-}
-
-/// Per-market last traded price (the "contract price" input to mark price median).
-pub fn last_traded_price_key(market_id: u64) -> B256 {
-    pack_market(PFX_LAST_TRADED, market_id)
 }
 
 /// Per-market FundingState (last rate, interval, next timestamp).
@@ -406,8 +388,7 @@ mod const_key_tests {
             PFX_SELL_ORDERS,
             PFX_USER_NONCE,
             PFX_MARKET,
-            PFX_MARK_PRICE,
-            PFX_OPEN_INT,
+            PFX_MARKET_HOT,
             PFX_POSITION_REGISTRY,
             PFX_BID_PRICES,
             PFX_ASK_PRICES,
@@ -415,8 +396,6 @@ mod const_key_tests {
             PFX_ASK_LEVEL,
             PFX_BID_COUNT,
             PFX_ASK_COUNT,
-            PFX_BEST_BID,
-            PFX_BEST_ASK,
             PFX_API_KEY,
             PFX_API_KEY_IDS,
             PFX_ORACLE,
@@ -424,7 +403,6 @@ mod const_key_tests {
             PFX_INDEX_PRICE,
             PFX_INDEX_HISTORY,
             PFX_BASIS_WINDOW,
-            PFX_LAST_TRADED,
             PFX_FUNDING_STATE,
             PFX_PREMIUM_ACCUMULATOR,
             PFX_INSURANCE_FUND,
@@ -492,7 +470,7 @@ mod const_key_tests {
         assert_ne!(position_key(a, 3), user_buy_orders_key(a, 3));
         assert_ne!(position_key(a, 3), user_sell_orders_key(a, 3));
         assert_ne!(user_buy_orders_key(a, 3), user_sell_orders_key(a, 3));
-        assert_ne!(market_key(3), mark_price_key(3));
+        assert_ne!(market_key(3), market_hot_key(3));
         assert_ne!(bid_prices_key(3), ask_prices_key(3));
         assert_ne!(bid_level_key(3, 100), ask_level_key(3, 100));
         // raw order id vs a structured key

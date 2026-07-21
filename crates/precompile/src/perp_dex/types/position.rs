@@ -156,6 +156,27 @@ pub struct Market {
     pub price_band_bps: u32,
 }
 
+/// Per-market HOT scalars, grouped into ONE off-trie blob so the frequently-co-accessed values
+/// (matching / BBO / funding / mark-price median) cost a SINGLE map probe + decode + Arc, sharing
+/// one cache line — instead of five separate keys (five probes, five decodes, five allocs). All
+/// `Copy` u64s, so a whole-struct clone to extract one field is a trivial memcpy. Grouping coarsens
+/// the block-delta granularity to per-market (a write to any field re-emits the blob), which is a
+/// CHAIN change (commitment bytes regroup) but leaves every value — and thus the business
+/// snapshot — identical.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct MarketHot {
+    /// Mark price (oracle-driven median input to funding / risk).
+    pub mark_price: u64,
+    /// Cached best bid (0 = no bids). Kept in sync with the bid price index.
+    pub best_bid: u64,
+    /// Cached best ask (0 = no asks). Kept in sync with the ask price index.
+    pub best_ask: u64,
+    /// Last traded ("contract") price — an input to the mark-price median.
+    pub last_traded: u64,
+    /// Open interest (base-asset units).
+    pub open_interest: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
