@@ -551,7 +551,8 @@ fn validate_place_order<CTX: ContextTr>(
         // handled by the fill-time solvency guard, not here. `price_band_bps == 0`
         // uses the default; `>= 10_000` widens the lower bound to 0 (toward disabled).
         // Market orders carry no limit price and are bounded by the in-band book.
-        let mark = storage::load_mark_price(context, market_id)?;
+        // mark_price is a field of the Market we already loaded — no separate storage read.
+        let mark = market.mark_price;
         if mark > 0 {
             let bps = effective_price_band_bps(market.price_band_bps) as u128;
             let mark_u = mark as u128;

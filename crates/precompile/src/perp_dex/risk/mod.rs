@@ -182,9 +182,10 @@ pub fn run_add_market<CTX: ContextTr>(
         interest_rate: args.interestRate,
         liquidation_fee_rate_bps: args.liquidationFeeRateBps,
         price_band_bps: args.priceBandBps,
+        // mark_price now lives in the Market blob (was a separate save_mark_price call).
+        mark_price: args.initialMarkPrice,
     };
     storage::save_market(context, &market)?;
-    storage::save_mark_price(context, args.marketId, args.initialMarkPrice)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,

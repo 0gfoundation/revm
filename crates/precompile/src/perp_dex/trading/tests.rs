@@ -68,6 +68,7 @@ fn setup(ctx: &mut TestCtx) {
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
+            mark_price: 0,
         },
     )
     .unwrap();
@@ -248,6 +249,7 @@ fn setup_banded(ctx: &mut TestCtx, band_bps: u32) {
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
             price_band_bps: band_bps,
+            mark_price: 0,
         },
     )
     .unwrap();
@@ -574,6 +576,7 @@ fn margin_uses_market_price_decimals() {
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
+            mark_price: 0,
         },
     )
     .unwrap();
@@ -2395,6 +2398,7 @@ mod perf {
                 interest_rate: 0,
                 liquidation_fee_rate_bps: 0,
                 price_band_bps: 0,
+                mark_price: 0,
             },
         )
         .unwrap();
@@ -2660,8 +2664,12 @@ mod golden {
     /// nonce moved from two standalone per-user keys into the account blob (those keys leave the
     /// delta; the account blob grows). Values + business snapshot IDENTICAL. Prior value
     /// 0x2d7a551bd8ef02c3d4933462314b1182be29f40fc284bf1b1c111eb1e423c956.
+    /// RE-PIN (mark_price → Market + `BLOCK_COMMITMENT_VERSION` 8→9): mark_price moved out of the
+    /// MarketHot blob into the Market blob (write-rare + co-read with config). Both blobs' bytes
+    /// change (Market gains a field, MarketHot loses one); values + business snapshot IDENTICAL.
+    /// Prior value 0x7288ee0d91edb642537fc632a47eb12d27542977b4ffb7bf97d6bf31a874336c.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x7288ee0d91edb642537fc632a47eb12d27542977b4ffb7bf97d6bf31a874336c");
+        b256!("0x47f8225b07e2e1cc951203cc35b2aab40cc7801f43880c8ec3850344de3c78dc");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

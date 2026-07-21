@@ -212,8 +212,10 @@ fn store_blob<CTX: ContextTr>(
 /// bumped to 7 grouping the five per-market hot scalars (mark price, best bid/ask, last traded,
 /// open interest) into one `MarketHot` blob — the delta keys + framing regroup (values identical);
 /// bumped to 8 folding the two per-user scalar keys (fee-rate bps, order nonce) into the account
-/// blob — the account blob grows and their standalone keys disappear from the delta.
-const BLOCK_COMMITMENT_VERSION: u8 = 8;
+/// blob — the account blob grows and their standalone keys disappear from the delta; bumped to 9
+/// moving mark_price out of `MarketHot` into the `Market` blob (write-rare + co-read with config) —
+/// both blobs' bytes change (Market gains a field, MarketHot loses one).
+const BLOCK_COMMITMENT_VERSION: u8 = 9;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -938,12 +940,33 @@ pub fn save_market<CTX: ContextTr>(
     save_cached(context, market_key(market.market_id), market)
 }
 
+/// In-place RMW of the Market blob (mirror of [`mutate_account`]): fast-path mutates the deferred
+/// `Struct` already in the overlay (zero clone); slow-path loads once → mutate → store. Used by
+/// [`save_mark_price`] to set the mark field without a full load+save owned clone pair. Errors on a
+/// market that was never saved (rather than fabricate a phantom zero Market) — every caller
+/// (`updateIndexPrice`, tests) writes the full Market first, so this never fires in practice.
+fn mutate_market<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    f: impl FnOnce(&mut Market) -> R,
+) -> Result<R, PrecompileError> {
+    let key = market_key(market_id);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(m) = any.downcast_mut::<Market>() {
+            return Ok(f(m));
+        }
+    }
+    let mut m: Market =
+        load_cached(context, key)?.ok_or_else(|| perp_err("mutate_market: unknown market"))?;
+    let r = f(&mut m);
+    save_cached(context, key, &m)?;
+    Ok(r)
+}
+
 // ── Per-market hot scalars (grouped: MarketHot) ─────────────────────────────────
-// mark price + best bid/ask + last traded + open interest live in ONE blob, so co-accessing them
-// costs a single probe/decode/Arc sharing one cache line (was five separate keys). The old
-// per-scalar `load_/save_` helpers below stay as thin field accessors — call sites are unchanged —
-// and multiple scalar touches of the same market now share one cached MarketHot and coalesce into
-// one overlay write / block-delta entry.
+// best bid/ask + last traded + open interest (the PER-TRADE scalars) live in ONE blob → co-access
+// = one probe/decode/Arc, one cache line, one coalesced write. (Mark price is NOT here — it is
+// write-rare + co-read with config, so it lives in the Market blob; see [`load_mark_price`].)
 
 pub fn load_market_hot<CTX: ContextTr>(
     context: &mut CTX,
@@ -972,13 +995,18 @@ fn mutate_market_hot<CTX: ContextTr, R>(
     Ok(r)
 }
 
-// ── Mark price ────────────────────────────────────────────────────────────────
+// ── Mark price (a field of the Market blob) ─────────────────────────────────────
+// Callers already holding `&Market` (validate band check, the match walk) should read
+// `market.mark_price` directly — zero extra probe. These helpers are for callers WITHOUT the
+// Market in hand (and for tests); they read via the Arc (no clone) / RMW the Market field.
 
 pub fn load_mark_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_market_hot(context, market_id)?.mark_price)
+    Ok(load_market_ref(context, market_id)?
+        .map(|m| m.mark_price)
+        .unwrap_or(0))
 }
 
 pub fn save_mark_price<CTX: ContextTr>(
@@ -986,7 +1014,7 @@ pub fn save_mark_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    mutate_market_hot(context, market_id, |h| h.mark_price = price)
+    mutate_market(context, market_id, |m| m.mark_price = price)
 }
 
 // ── Open interest ─────────────────────────────────────────────────────────────
@@ -2213,6 +2241,7 @@ mod size_probe_tests {
             interest_rate: 100,
             liquidation_fee_rate_bps: 50,
             price_band_bps: 0,
+            mark_price: 0,
         };
         let buf = encode(&market).unwrap();
         println!("Market: {} bytes", buf.len());
@@ -2432,6 +2461,7 @@ mod encoding_roundtrip_tests {
                 interest_rate: i64::MIN,
                 liquidation_fee_rate_bps: u32::MAX,
                 price_band_bps: 0,
+                mark_price: u64::MAX,
             },
         );
     }

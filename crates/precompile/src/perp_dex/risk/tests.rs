@@ -65,6 +65,7 @@ fn setup_market(ctx: &mut TestCtx) {
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
+            mark_price: 0,
         },
     )
     .unwrap();

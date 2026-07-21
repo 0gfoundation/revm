@@ -148,7 +148,7 @@ impl TakerSettlement {
         // maker events — the same stream position finalize applied it at), and on a self-match
         // the fills' maker-side effects are already in these copies.
         let i = reg.get_or_load(context, self.user, self.market_id, market)?;
-        let mark = storage::load_mark_price(context, self.market_id)?;
+        let mark = market.mark_price; // field of the threaded Market — no storage read
         let w = &mut reg.users[i].1;
 
         let core = finalize_core(
@@ -721,7 +721,8 @@ pub(super) fn settle_maker_fill_registry<CTX: ContextTr>(
 ) -> Result<MakerFillOutcome, PrecompileError> {
     let maker_side = taker_side.opposite();
     let i = reg.get_or_load(context, maker, market_id, market)?;
-    let mark = storage::load_mark_price(context, market_id)?;
+    // mark_price is a field of the threaded Market — no per-maker storage read.
+    let mark = market.mark_price;
 
     let w = &mut reg.users[i].1;
     let core = settle_maker_fill_core(
@@ -1630,6 +1631,7 @@ mod split_floor_conservation_tests {
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
+            mark_price: 0,
         }
     }
 

@@ -154,19 +154,24 @@ pub struct Market {
     /// effectively disables the band. Resolve via `crate::perp_dex::math::effective_price_band_bps`.
     #[serde(default, rename = "pb")]
     pub price_band_bps: u32,
+    /// Mark price (oracle-driven, in `price_decimals` units). Lives in the Market blob — NOT in
+    /// `MarketHot` — because it is WRITE-RARE (only `updateIndexPrice`/`addMarket` write it, at
+    /// oracle cadence, never per-trade) yet READ-HOT and always co-read with the market config
+    /// (band check, maker settlement). Keeping it here means a single `load_market` yields config +
+    /// mark, and callers already holding `&Market` (validate, the match walk) read `market.mark_price`
+    /// with zero extra probe. `updateMarket` is load-modify-save so it preserves this field.
+    #[serde(default, rename = "mp")]
+    pub mark_price: u64,
 }
 
-/// Per-market HOT scalars, grouped into ONE off-trie blob so the frequently-co-accessed values
-/// (matching / BBO / funding / mark-price median) cost a SINGLE map probe + decode + Arc, sharing
-/// one cache line — instead of five separate keys (five probes, five decodes, five allocs). All
-/// `Copy` u64s, so a whole-struct clone to extract one field is a trivial memcpy. Grouping coarsens
-/// the block-delta granularity to per-market (a write to any field re-emits the blob), which is a
-/// CHAIN change (commitment bytes regroup) but leaves every value — and thus the business
-/// snapshot — identical.
+/// Per-market HOT scalars that change PER-TRADE, grouped into ONE off-trie blob so co-accessing
+/// them costs a SINGLE probe/decode/Arc sharing one cache line (was four separate keys). All `Copy`
+/// u64s → whole-struct clone is a trivial memcpy. Grouping coarsens the block-delta to per-market
+/// (any field write re-emits the blob) — fine here since these all move together on a trade.
+/// (Mark price is deliberately NOT here — it is write-rare + co-read with config, so it lives in
+/// [`Market`]; see its `mark_price` field.)
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct MarketHot {
-    /// Mark price (oracle-driven median input to funding / risk).
-    pub mark_price: u64,
     /// Cached best bid (0 = no bids). Kept in sync with the bid price index.
     pub best_bid: u64,
     /// Cached best ask (0 = no asks). Kept in sync with the ask price index.
