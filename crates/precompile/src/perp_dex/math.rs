@@ -393,7 +393,7 @@ fn open_amount(remaining: &mut i64, amount: i64) -> Result<i64, PrecompileError>
 /// expensive notional math vs two scans. The total order qty is summed in the same pass (free),
 /// removing a separate sum pass.
 pub fn calc_buy_side_dual(
-    buy_entries: &[OrderEntry],
+    buy_entries: impl Iterator<Item = OrderEntry>,
     base_decimals: u32,
     price_decimals: u32,
     position_a: i64,
@@ -458,7 +458,7 @@ pub fn calc_buy_side_dual(
 /// Sell-side opening notional at TWO positions in a single ASC pass (#21 靶子3); see
 /// [`calc_buy_side_dual`]. Returns `(S(position_a), S(position_b), total_sell_qty)`.
 pub fn calc_sell_side_dual(
-    sell_entries: &[OrderEntry],
+    sell_entries: impl Iterator<Item = OrderEntry>,
     base_decimals: u32,
     price_decimals: u32,
     position_a: i64,
@@ -538,12 +538,40 @@ pub fn calc_reservation_notionals(
     price_decimals: u32,
     position_amount: i64,
 ) -> Result<(u64, u64, u64), PrecompileError> {
+    calc_reservation_notionals_it(
+        buy_entries.iter().copied(),
+        sell_entries.iter().copied(),
+        base_decimals,
+        price_decimals,
+        position_amount,
+    )
+}
+
+/// Iterator form of [`calc_reservation_notionals`] (commit-only #23 perf): folds the two sides
+/// from iterators instead of slices, so a caller can evaluate the reservation of a HYPOTHETICAL
+/// book (e.g. "current list + one entry at its sorted position", via `.chain`) WITHOUT cloning the
+/// list or writing the overlay — the validate-then-apply probe for rest_in_book / release. The
+/// slice form above is a thin wrapper (`.iter().copied()`), so both paths run the exact same fold
+/// → byte-identical results (the price-index/notional bytes folded into the commitment are
+/// unchanged). `S: Clone` because the sell side is iterated twice (total-qty pass + dual pass); the
+/// buy side is consumed once. `OrderEntry: Copy`, so by-value iteration is a cheap stack copy.
+pub fn calc_reservation_notionals_it<B, S>(
+    buy_entries: B,
+    sell_entries: S,
+    base_decimals: u32,
+    price_decimals: u32,
+    position_amount: i64,
+) -> Result<(u64, u64, u64), PrecompileError>
+where
+    B: Iterator<Item = OrderEntry>,
+    S: Iterator<Item = OrderEntry> + Clone,
+{
     // #21 靶子3: compute all four opening notionals in THREE passes instead of six. The buy leg
     // needs the post-all-sells position (max-short), so total_sell_qty comes first (one cheap sum
     // pass); the buy dual then yields B + B' AND total_buy_qty in one pass; the sell dual yields
     // S + S' (it needs the post-all-buys position from total_buy_qty). Each value is byte-identical
     // to the old separate calc_*_reserved_notional calls (gated by the dual_matches_separate test).
-    let total_sell_qty = total_entry_amount(sell_entries, "math: total sell order amount")?;
+    let total_sell_qty = total_entry_amount(sell_entries.clone(), "math: total sell order amount")?;
     // Position after every sell fills → most short; surviving buys re-open from there.
     let position_after_sells = position_amount
         .checked_sub(total_sell_qty)
@@ -581,7 +609,10 @@ pub fn calc_reservation_notionals(
 }
 
 /// Sum of all order-entry amounts as an `i64` (checked).
-fn total_entry_amount(entries: &[OrderEntry], ctx: &str) -> Result<i64, PrecompileError> {
+fn total_entry_amount(
+    entries: impl Iterator<Item = OrderEntry>,
+    ctx: &str,
+) -> Result<i64, PrecompileError> {
     let mut total = 0u64;
     for e in entries {
         total = total.checked_add(e.amount).ok_or_else(|| perp_err(ctx))?;
@@ -637,7 +668,8 @@ mod reservation_notional_tests {
             let pos_after_sells = p - total_sell;
             let pos_after_buys = p + total_buy;
 
-            let (ba, bb, tb) = calc_buy_side_dual(&buys, bd, pd, p, pos_after_sells).unwrap();
+            let (ba, bb, tb) =
+                calc_buy_side_dual(buys.iter().copied(), bd, pd, p, pos_after_sells).unwrap();
             assert_eq!(
                 ba,
                 calc_buy_side_reserved_notional(&buys, bd, pd, p).unwrap()
@@ -648,7 +680,8 @@ mod reservation_notional_tests {
             );
             assert_eq!(tb, total_buy);
 
-            let (sa, sb, ts) = calc_sell_side_dual(&sells, bd, pd, p, pos_after_buys).unwrap();
+            let (sa, sb, ts) =
+                calc_sell_side_dual(sells.iter().copied(), bd, pd, p, pos_after_buys).unwrap();
             assert_eq!(
                 sa,
                 calc_sell_side_reserved_notional(&sells, bd, pd, p).unwrap()

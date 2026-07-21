@@ -1295,10 +1295,15 @@ fn rest_in_book<CTX: ContextTr>(
 
     match side {
         Side::Buy => {
-            // #21 靶子2: insert into the user's buy-order list (sorted price DESC) IN PLACE and
-            // recompute the flip-aware reservation inside the borrow — no load/store clone of the
-            // list. The other side is loaded owned (the two-sided calc needs both).
+            // commit-only #23 CLONE-FREE probe: read BOTH sides via Arc (zero clone) and evaluate
+            // the reservation of "buy-list ⊕ new_entry (at its sorted slot)" by FOLDING a chained
+            // iterator — the hypothetical entry is never inserted into a real/owned list, so a
+            // reject below leaves the overlay untouched (validate-then-apply: check first). The
+            // fold is byte-identical to inserting-then-computing, so the accepted reservation is
+            // unchanged (golden-neutral).
             let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
+            let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
+            let buy_slice = buy_ref.as_slice();
             let new_entry = OrderEntry {
                 order_id: *order_id,
                 price,
@@ -1307,13 +1312,19 @@ fn rest_in_book<CTX: ContextTr>(
             };
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            // commit-only #23: simulate the insert on an OWNED copy (no write), so the
-            // has_available reject below leaves the stored list untouched.
-            let mut buy_list = storage::load_buy_orders(context, user, market_id)?;
-            let idx = buy_list.partition_point(|e| e.price > price);
-            buy_list.insert(idx, new_entry);
+            let idx = buy_slice.partition_point(|e| e.price > price);
             let (new_buy_side_notional, sell_notional, c_notional) =
-                calc_reservation_notionals(&buy_list, &sell_entries, bd, pd, pos_amount)?;
+                crate::perp_dex::math::calc_reservation_notionals_it(
+                    buy_slice[..idx]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(new_entry))
+                        .chain(buy_slice[idx..].iter().copied()),
+                    sell_entries.iter().copied(),
+                    bd,
+                    pd,
+                    pos_amount,
+                )?;
             let order_fee_reserved =
                 calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
             // Adding an order can only grow the buy-side notional (checked before
@@ -1346,8 +1357,14 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
-            // ── APPLY (all rejects passed) ──
-            storage::save_buy_orders(context, user, market_id, &buy_list)?;
+            // ── APPLY (all rejects passed) ── NOW do the real insert: in-place on a warm list
+            // (zero clone), or one materialize-clone on a cold first-touch (unavoidable — it IS
+            // the write of a previously-committed list). partition_point re-derives the same idx.
+            drop(buy_ref);
+            storage::mutate_buy_orders(context, user, market_id, |list| {
+                let i = list.partition_point(|e| e.price > price);
+                list.insert(i, new_entry);
+            })?;
             storage::insert_bid_price(context, market_id, price)?;
             storage::push_bid_order(context, market_id, price, *order_id)?;
 
@@ -1360,9 +1377,11 @@ fn rest_in_book<CTX: ContextTr>(
             }
         }
         Side::Sell => {
-            // #21 靶子2: insert into the user's sell-order list (sorted price ASC) IN PLACE and
-            // recompute the flip-aware reservation inside the borrow — no load/store clone.
+            // commit-only #23 CLONE-FREE probe (mirror of the buy arm): fold sell-list ⊕ new_entry
+            // over Arc-borrowed lists, no owned clone, reject leaves the overlay untouched.
             let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
+            let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
+            let sell_slice = sell_ref.as_slice();
             let new_entry = OrderEntry {
                 order_id: *order_id,
                 price,
@@ -1371,13 +1390,19 @@ fn rest_in_book<CTX: ContextTr>(
             };
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            // commit-only #23: simulate the insert on an OWNED copy (no write), so the
-            // has_available reject below leaves the stored list untouched.
-            let mut sell_list = storage::load_sell_orders(context, user, market_id)?;
-            let idx = sell_list.partition_point(|e| e.price < price);
-            sell_list.insert(idx, new_entry);
+            let idx = sell_slice.partition_point(|e| e.price < price);
             let (buy_notional, new_sell_side_notional, c_notional) =
-                calc_reservation_notionals(&buy_entries, &sell_list, bd, pd, pos_amount)?;
+                crate::perp_dex::math::calc_reservation_notionals_it(
+                    buy_entries.iter().copied(),
+                    sell_slice[..idx]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(new_entry))
+                        .chain(sell_slice[idx..].iter().copied()),
+                    bd,
+                    pd,
+                    pos_amount,
+                )?;
             let order_fee_reserved =
                 calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
             // Adding an order can only grow the sell-side notional (checked before
@@ -1410,8 +1435,12 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
-            // ── APPLY (all rejects passed) ──
-            storage::save_sell_orders(context, user, market_id, &sell_list)?;
+            // ── APPLY (all rejects passed) ── real insert: in-place (warm) / one materialize (cold).
+            drop(sell_ref);
+            storage::mutate_sell_orders(context, user, market_id, |list| {
+                let i = list.partition_point(|e| e.price < price);
+                list.insert(i, new_entry);
+            })?;
             storage::insert_ask_price(context, market_id, price)?;
             storage::push_ask_order(context, market_id, price, *order_id)?;
 
