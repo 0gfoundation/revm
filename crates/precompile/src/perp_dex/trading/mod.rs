@@ -333,11 +333,11 @@ pub fn run_get_book_level<CTX: ContextTr>(
         .map_err(|_| perp_err("getBookLevel: invalid calldata"))?;
 
     let side = Side::from_u8(args.side).ok_or_else(|| perp_err("getBookLevel: invalid side"))?;
-    let queue = match side {
+    let level = match side {
         Side::Buy => storage::load_bid_level_arc(context, args.marketId, args.price)?,
         Side::Sell => storage::load_ask_level_arc(context, args.marketId, args.price)?,
     };
-    let order_ids = queue.iter().copied().map(FixedBytes).collect();
+    let order_ids = level.ids.iter().copied().map(FixedBytes).collect();
 
     Ok(Bytes::from(getBookLevelCall::abi_encode_returns(
         &order_ids,
@@ -914,8 +914,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                 if order_type == OrderType::Limit && ask_price > limit_price {
                     break;
                 }
-                let queue = storage::load_ask_level_arc(context, market_id, ask_price)?;
-                let count_old = storage::load_ask_count(context, market_id, ask_price)?;
+                // ONE probe gets both the FIFO ids and the live count (Obs-1 merge).
+                let blob = storage::load_ask_level_arc(context, market_id, ask_price)?;
+                let count_old = blob.count;
+                let queue = &blob.ids;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
                 // Live makers that LEAVE this level during the walk (fully filled / K9-rejected).
                 // The post-walk live count is `count_old - level_removed`; stale ids the walk sweeps
@@ -930,7 +932,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                         let count_new = count_old.saturating_sub(level_removed);
                         if count_new == 0 {
                             // Level logically empty (any ids left in new_queue are stale) — drop the
-                            // price + clear the queue + delete the count.
+                            // price; SaveLevel with count 0 deletes the blob (clears stale ids).
                             registry.push_event(settlement::MatchEvent::RemovePrice {
                                 is_bid: false,
                                 price: ask_price,
@@ -941,6 +943,7 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 is_bid: false,
                                 price: ask_price,
                                 queue: Vec::new(),
+                                count: 0,
                             });
                         } else {
                             // Live orders remain in the untouched tail — keep it verbatim (any stale
@@ -949,13 +952,9 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 is_bid: false,
                                 price: ask_price,
                                 queue: new_queue,
+                                count: count_new,
                             });
                         }
-                        registry.push_event(settlement::MatchEvent::SaveCount {
-                            is_bid: false,
-                            price: ask_price,
-                            count: count_new,
-                        });
                         break 'outer;
                     }
                     let maker_id = queue[qi];
@@ -1085,19 +1084,16 @@ pub(super) fn match_order<CTX: ContextTr>(
                         is_bid: false,
                         price: ask_price,
                         queue: Vec::new(),
+                        count: 0,
                     });
                 } else {
                     registry.push_event(settlement::MatchEvent::SaveLevel {
                         is_bid: false,
                         price: ask_price,
                         queue: new_queue,
+                        count: count_new,
                     });
                 }
-                registry.push_event(settlement::MatchEvent::SaveCount {
-                    is_bid: false,
-                    price: ask_price,
-                    count: count_new,
-                });
             }
             if ask_levels_cleared {
                 // New best ask from the walk's own knowledge: the price-index snapshot minus the
@@ -1130,8 +1126,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                 if order_type == OrderType::Limit && bid_price < limit_price {
                     break;
                 }
-                let queue = storage::load_bid_level_arc(context, market_id, bid_price)?;
-                let count_old = storage::load_bid_count(context, market_id, bid_price)?;
+                // ONE probe gets both the FIFO ids and the live count (Obs-1 merge).
+                let blob = storage::load_bid_level_arc(context, market_id, bid_price)?;
+                let count_old = blob.count;
+                let queue = &blob.ids;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
                 // See the mirror on the Buy side.
                 let mut level_removed = 0u64;
@@ -1152,19 +1150,16 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 is_bid: true,
                                 price: bid_price,
                                 queue: Vec::new(),
+                                count: 0,
                             });
                         } else {
                             registry.push_event(settlement::MatchEvent::SaveLevel {
                                 is_bid: true,
                                 price: bid_price,
                                 queue: new_queue,
+                                count: count_new,
                             });
                         }
-                        registry.push_event(settlement::MatchEvent::SaveCount {
-                            is_bid: true,
-                            price: bid_price,
-                            count: count_new,
-                        });
                         break 'outer;
                     }
                     let maker_id = queue[qi];
@@ -1281,19 +1276,16 @@ pub(super) fn match_order<CTX: ContextTr>(
                         is_bid: true,
                         price: bid_price,
                         queue: Vec::new(),
+                        count: 0,
                     });
                 } else {
                     registry.push_event(settlement::MatchEvent::SaveLevel {
                         is_bid: true,
                         price: bid_price,
                         queue: new_queue,
+                        count: count_new,
                     });
                 }
-                registry.push_event(settlement::MatchEvent::SaveCount {
-                    is_bid: true,
-                    price: bid_price,
-                    count: count_new,
-                });
             }
             if bid_levels_cleared {
                 // New best bid = max non-removed price in the snapshot (mirrors refresh_best_bid
@@ -1465,8 +1457,8 @@ fn rest_in_book<CTX: ContextTr>(
                 list.insert(i, new_entry);
             })?;
             storage::insert_bid_price(context, market_id, price)?;
+            // push_bid_order also bumps the level's live count (folded into the level blob).
             storage::push_bid_order(context, market_id, price, *order_id)?;
-            storage::incr_level_count(context, market_id, Side::Buy, price)?;
 
             // Keep best_bid cache up to date.
             if best_bid == 0 || price > best_bid {
@@ -1541,8 +1533,8 @@ fn rest_in_book<CTX: ContextTr>(
                 list.insert(i, new_entry);
             })?;
             storage::insert_ask_price(context, market_id, price)?;
+            // push_ask_order also bumps the level's live count (folded into the level blob).
             storage::push_ask_order(context, market_id, price, *order_id)?;
-            storage::incr_level_count(context, market_id, Side::Sell, price)?;
 
             // Keep best_ask cache up to date.
             if best_ask == 0 || price < best_ask {
@@ -1640,10 +1632,11 @@ fn detach_order_from_level<CTX: ContextTr>(
     let (old_best, emptied) = match side {
         Side::Buy => {
             let old_best = storage::load_best_bid(context, market_id)?;
+            // decr_level_count clears the FIFO ids when the count hits 0 (blob → delete); we only
+            // need to drop the price from the index.
             let emptied = storage::decr_level_count(context, market_id, Side::Buy, price, 1)? == 0;
             if emptied {
                 storage::remove_bid_price(context, market_id, price)?;
-                storage::save_bid_level(context, market_id, price, &[])?;
             }
             (old_best, emptied)
         }
@@ -1652,7 +1645,6 @@ fn detach_order_from_level<CTX: ContextTr>(
             let emptied = storage::decr_level_count(context, market_id, Side::Sell, price, 1)? == 0;
             if emptied {
                 storage::remove_ask_price(context, market_id, price)?;
-                storage::save_ask_level(context, market_id, price, &[])?;
             }
             (old_best, emptied)
         }
@@ -1926,7 +1918,7 @@ fn check_fok_feasibility<CTX: ContextTr>(
                     break;
                 }
                 let queue = storage::load_ask_level_arc(context, market_id, ask_price)?;
-                for maker_id in queue.iter() {
+                for maker_id in queue.ids.iter() {
                     if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
                             available += o.quantity - o.filled;
@@ -1945,7 +1937,7 @@ fn check_fok_feasibility<CTX: ContextTr>(
                     break;
                 }
                 let queue = storage::load_bid_level_arc(context, market_id, bid_price)?;
-                for maker_id in queue.iter() {
+                for maker_id in queue.ids.iter() {
                     if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
                             available += o.quantity - o.filled;

@@ -1017,11 +1017,11 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         // delete-on-terminal: drop the order record (was: save Cancelled).
         storage::delete_order(context, &entry.order_id)?;
         // lazy-queue: decrement the level's live count and leave the id for the next match walk to
-        // sweep (other users' orders may share this price). Emptied → drop price + clear queue.
+        // sweep (other users' orders may share this price). decr_level_count clears the FIFO on
+        // reaching 0 (blob → delete); we only drop the price from the index.
         let empty = storage::decr_level_count(context, market_id, Side::Buy, entry.price, 1)? == 0;
         if empty {
             storage::remove_bid_price(context, market_id, entry.price)?;
-            storage::save_bid_level(context, market_id, entry.price, &[])?;
         }
 
         context.journal_mut().log(Log {
@@ -1044,7 +1044,6 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         let empty = storage::decr_level_count(context, market_id, Side::Sell, entry.price, 1)? == 0;
         if empty {
             storage::remove_ask_price(context, market_id, entry.price)?;
-            storage::save_ask_level(context, market_id, entry.price, &[])?;
         }
 
         context.journal_mut().log(Log {

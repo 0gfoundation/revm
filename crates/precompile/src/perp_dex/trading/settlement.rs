@@ -439,16 +439,13 @@ pub(super) enum MatchEvent {
         taker_fee: u64,
         maker_fee: u64,
     },
+    /// Writes a level blob: its FIFO `queue` (ids) AND the post-walk LIVE `count` (Obs-1 merge —
+    /// count lives in the level blob, so one event, not a separate SaveCount). `count == 0` deletes
+    /// the level.
     SaveLevel {
         is_bid: bool,
         price: u64,
         queue: Vec<[u8; 32]>,
-    },
-    /// lazy-queue: the post-walk count of LIVE orders at a level (drives the empty→remove-price
-    /// decision independently of the FIFO queue length, which may retain swept stale ids).
-    SaveCount {
-        is_bid: bool,
-        price: u64,
         count: u64,
     },
     RemovePrice {
@@ -610,22 +607,12 @@ impl MatchRegistry {
                     is_bid,
                     price,
                     queue,
-                } => {
-                    if is_bid {
-                        storage::save_bid_level(context, market_id, price, &queue)?;
-                    } else {
-                        storage::save_ask_level(context, market_id, price, &queue)?;
-                    }
-                }
-                MatchEvent::SaveCount {
-                    is_bid,
-                    price,
                     count,
                 } => {
                     if is_bid {
-                        storage::save_bid_count(context, market_id, price, count)?;
+                        storage::save_bid_level(context, market_id, price, count, &queue)?;
                     } else {
-                        storage::save_ask_count(context, market_id, price, count)?;
+                        storage::save_ask_level(context, market_id, price, count, &queue)?;
                     }
                 }
                 MatchEvent::RemovePrice { is_bid, price } => {

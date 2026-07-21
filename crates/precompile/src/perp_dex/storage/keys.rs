@@ -35,8 +35,6 @@ const PFX_BID_PRICES: [u8; 4] = *b"bidp"; // sorted Vec<u64> of active bid price
 const PFX_ASK_PRICES: [u8; 4] = *b"askp"; // sorted Vec<u64> of active ask prices
 const PFX_BID_LEVEL: [u8; 4] = *b"bidl"; // FIFO queue of order IDs at a bid price
 const PFX_ASK_LEVEL: [u8; 4] = *b"askl"; // FIFO queue of order IDs at an ask price
-const PFX_BID_COUNT: [u8; 4] = *b"bidc"; // # of LIVE orders at a bid price level (lazy-queue)
-const PFX_ASK_COUNT: [u8; 4] = *b"askc"; // # of LIVE orders at an ask price level (lazy-queue)
 const PFX_API_KEY: [u8; 4] = *b"apik"; // per-user per-slot ed25519 key
 const PFX_API_KEY_IDS: [u8; 4] = *b"akid"; // per-user list of registered key_ids
 const PFX_ORACLE: [u8; 4] = *b"orcl"; // authorized oracle address (updateIndexPrice role)
@@ -254,18 +252,8 @@ pub fn ask_level_key(market_id: u64, price: u64) -> B256 {
     pack_market_price(PFX_ASK_LEVEL, market_id, price)
 }
 
-/// Count of LIVE (Open/PartiallyFilled) orders at a bid price level. The lazy-queue design leaves
-/// cancelled/filled order-ids in the FIFO queue (swept opportunistically by the next match walk),
-/// so `queue.len()` no longer measures liveness — this count is the authoritative
-/// "is the level empty?" signal that keeps the price index + BBO cache live at O(1) on cancel.
-pub fn bid_count_key(market_id: u64, price: u64) -> B256 {
-    pack_market_price(PFX_BID_COUNT, market_id, price)
-}
-
-/// Count of LIVE orders at an ask price level. See [`bid_count_key`].
-pub fn ask_count_key(market_id: u64, price: u64) -> B256 {
-    pack_market_price(PFX_ASK_COUNT, market_id, price)
-}
+// The per-level live-order count now lives INSIDE the level blob (see storage `LevelBlob`) — no
+// separate count key.
 
 // Best bid/ask, last-traded, open-interest, and mark price now live in the grouped
 // [`market_hot_key`] blob (`MarketHot`) — no per-scalar keys.
@@ -383,8 +371,6 @@ mod const_key_tests {
             PFX_ASK_PRICES,
             PFX_BID_LEVEL,
             PFX_ASK_LEVEL,
-            PFX_BID_COUNT,
-            PFX_ASK_COUNT,
             PFX_API_KEY,
             PFX_API_KEY_IDS,
             PFX_ORACLE,

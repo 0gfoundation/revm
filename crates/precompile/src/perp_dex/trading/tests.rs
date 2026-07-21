@@ -365,7 +365,6 @@ fn taker_open_below_maintenance_is_rejected() {
 
 #[test]
 fn maker_open_below_maintenance_is_cancelled_not_filled() {
-    use crate::perp_dex::types::OrderStatus;
     let mut ctx = make_ctx();
     setup_banded(&mut ctx, 1_000_000); // disabled band so the off-mark ask can rest
     storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap(); // mark = 100 ticks
@@ -2668,8 +2667,12 @@ mod golden {
     /// MarketHot blob into the Market blob (write-rare + co-read with config). Both blobs' bytes
     /// change (Market gains a field, MarketHot loses one); values + business snapshot IDENTICAL.
     /// Prior value 0x7288ee0d91edb642537fc632a47eb12d27542977b4ffb7bf97d6bf31a874336c.
+    /// RE-PIN (level count merge + `BLOCK_COMMITMENT_VERSION` 9→10): each level's live-order count
+    /// folded INTO its FIFO blob (`LevelBlob`, count(8 BE) prefix); the per-level count keys
+    /// disappear + the level blob framing changes. Values + business snapshot IDENTICAL. Prior
+    /// value 0x47f8225b07e2e1cc951203cc35b2aab40cc7801f43880c8ec3850344de3c78dc.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x47f8225b07e2e1cc951203cc35b2aab40cc7801f43880c8ec3850344de3c78dc");
+        b256!("0x25389cb16beb55f0800734570a0ac4d48f9f6309452932b7204fa682dd397d45");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

@@ -25,13 +25,12 @@ use crate::{
 };
 
 use keys::{
-    account_key, admin_key, api_key_ids_key, api_key_key, ask_count_key, ask_level_key,
-    ask_prices_key, bid_count_key, bid_level_key, bid_prices_key, commitment_slot,
-    erc20_balance_slot, funding_state_key, index_price_history_key, index_price_state_key,
-    insurance_fund_key, market_fee_total_key, market_hot_key, market_key, market_manager_key,
-    oracle_key, order_key, position_key, position_registry_key, premium_accumulator_key,
-    price_basis_window_key, seen_bucket_key, seen_sig_key, trade_count_key, user_buy_orders_key,
-    user_sell_orders_key,
+    account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
+    bid_level_key, bid_prices_key, commitment_slot, erc20_balance_slot, funding_state_key,
+    index_price_history_key, index_price_state_key, insurance_fund_key, market_fee_total_key,
+    market_hot_key, market_key, market_manager_key, oracle_key, order_key, position_key,
+    position_registry_key, premium_accumulator_key, price_basis_window_key, seen_bucket_key,
+    seen_sig_key, trade_count_key, user_buy_orders_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -214,8 +213,10 @@ fn store_blob<CTX: ContextTr>(
 /// bumped to 8 folding the two per-user scalar keys (fee-rate bps, order nonce) into the account
 /// blob — the account blob grows and their standalone keys disappear from the delta; bumped to 9
 /// moving mark_price out of `MarketHot` into the `Market` blob (write-rare + co-read with config) —
-/// both blobs' bytes change (Market gains a field, MarketHot loses one).
-const BLOCK_COMMITMENT_VERSION: u8 = 9;
+/// both blobs' bytes change (Market gains a field, MarketHot loses one); bumped to 10 folding each
+/// level's live-order count INTO its FIFO blob (`LevelBlob`, count(8 BE) prefix) — the per-level
+/// count keys disappear and the level blob framing changes.
+const BLOCK_COMMITMENT_VERSION: u8 = 10;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -1163,39 +1164,22 @@ fn mutate_ask_prices<CTX: ContextTr, R>(
     Ok(r)
 }
 
-pub fn mutate_bid_level<CTX: ContextTr, R>(
+/// In-place RMW of a level blob (count + ids): fast-path mutates the deferred `Struct` in the
+/// overlay (zero clone); slow-path loads once → mutate → store. Used by [`push_bid_order`] (push id
+/// + count++) and [`decr_level_count`] (count−−).
+fn mutate_level<CTX: ContextTr, R>(
     context: &mut CTX,
-    market_id: u64,
-    price: u64,
-    f: impl FnOnce(&mut Vec<[u8; 32]>) -> R,
+    key: B256,
+    f: impl FnOnce(&mut LevelBlob) -> R,
 ) -> Result<R, PrecompileError> {
-    let key = bid_level_key(market_id, price);
     if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            return Ok(f(q));
+        if let Some(b) = any.downcast_mut::<LevelBlob>() {
+            return Ok(f(b));
         }
     }
-    let mut queue = load_bid_level(context, market_id, price)?;
-    let r = f(&mut queue);
-    save_bid_level(context, market_id, price, &queue)?;
-    Ok(r)
-}
-
-pub fn mutate_ask_level<CTX: ContextTr, R>(
-    context: &mut CTX,
-    market_id: u64,
-    price: u64,
-    f: impl FnOnce(&mut Vec<[u8; 32]>) -> R,
-) -> Result<R, PrecompileError> {
-    let key = ask_level_key(market_id, price);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            return Ok(f(q));
-        }
-    }
-    let mut queue = load_ask_level(context, market_id, price)?;
-    let r = f(&mut queue);
-    save_ask_level(context, market_id, price, &queue)?;
+    let mut b = load_level(context, key)?;
+    let r = f(&mut b);
+    save_level(context, key, &b);
     Ok(r)
 }
 
@@ -1227,21 +1211,57 @@ fn unpack_order_ids(buf: &[u8]) -> Result<Vec<[u8; 32]>, PrecompileError> {
         .collect())
 }
 
-/// Block-end serializer for a level FIFO held as a deferred `Struct` (#21): produces the SAME raw
-/// packed bytes as the old `store_blob(pack_order_ids(..))` path, so the off-trie blob (and the
-/// commitment) is byte-identical — only the serialization timing moves to block end.
+/// A price level's FIFO + its live-order count, in ONE blob (count folded in — they are written
+/// together on rest/match, so this halves the per-level keys in the delta/commitment and lets the
+/// match walk read ids + count in one probe). `count` = LIVE (Open/PartiallyFilled) orders; `ids`
+/// = the FIFO (live + lazily-swept stale). Packed raw as `count(8 BE) ++ id0(32) ++ id1(32) ...`
+/// (no msgpack, P4/#20 compactness). `count == 0` means the level is EMPTY → packs to an empty buf
+/// (the delete convention); stale `ids` are discarded on empty.
+#[derive(Clone, Default)]
+pub struct LevelBlob {
+    pub count: u64,
+    pub ids: Vec<[u8; 32]>,
+}
+
+/// Packs a [`LevelBlob`]: empty when the level is empty (count 0) → delete; else count prefix + ids.
+fn pack_level(b: &LevelBlob) -> Vec<u8> {
+    if b.count == 0 {
+        return Vec::new();
+    }
+    let mut buf = Vec::with_capacity(8 + b.ids.len() * 32);
+    buf.extend_from_slice(&b.count.to_be_bytes());
+    for id in &b.ids {
+        buf.extend_from_slice(id);
+    }
+    buf
+}
+
+/// Inverse of [`pack_level`]. Empty buf → empty level (count 0, no ids).
+fn unpack_level(buf: &[u8]) -> Result<LevelBlob, PrecompileError> {
+    if buf.is_empty() {
+        return Ok(LevelBlob::default());
+    }
+    if buf.len() < 8 {
+        return Err(perp_err("corrupt level blob (short)"));
+    }
+    let count = u64::from_be_bytes(buf[..8].try_into().unwrap());
+    let ids = unpack_order_ids(&buf[8..])?;
+    Ok(LevelBlob { count, ids })
+}
+
+/// Block-end serializer for a level held as a deferred `Struct` (#21): raw `count ++ ids` bytes.
 fn ser_level(v: &PerpBlob) -> Vec<u8> {
-    pack_order_ids(
-        v.downcast_ref::<Vec<[u8; 32]>>()
-            .expect("perp ser_level: level-queue type mismatch (bug)"),
+    pack_level(
+        v.downcast_ref::<LevelBlob>()
+            .expect("perp ser_level: level-blob type mismatch (bug)"),
     )
 }
 
-/// Clones a deferred level-FIFO `Struct` (keeps the journal overlay `Clone`).
+/// Clones a deferred level `Struct` (keeps the journal overlay `Clone`).
 fn clone_level(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
     std::boxed::Box::new(
-        v.downcast_ref::<Vec<[u8; 32]>>()
-            .expect("perp clone_level: level-queue type mismatch (bug)")
+        v.downcast_ref::<LevelBlob>()
+            .expect("perp clone_level: level-blob type mismatch (bug)")
             .clone(),
     )
 }
@@ -1256,58 +1276,51 @@ fn clone_level(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
 /// a re-fetch + re-unpack down to a clone. Safe: the write-overlay (`perp_get_struct`) is checked
 /// FIRST and shadows this entry; `store` invalidates the cache per-key; a revert clears the whole
 /// cache; and the cache is excluded from the block delta, so it can never affect the commitment.
-fn load_level_cached<CTX: ContextTr>(
-    context: &mut CTX,
-    key: B256,
-) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    // Single in-block probe: `perp_get_struct` serves both a written `Struct` and a `Cached` queue.
+/// Reads a level blob (count + ids), cloned. Single in-block probe (Struct or Cached) → cross-block
+/// decoded store (选项A) → cold byte store (unpack); caches the cold read.
+fn load_level<CTX: ContextTr>(context: &mut CTX, key: B256) -> Result<LevelBlob, PrecompileError> {
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
-            return Ok(q.clone());
+        if let Some(b) = any.downcast_ref::<LevelBlob>() {
+            return Ok(b.clone());
         }
     }
-    // Cross-block decoded store (选项A): level queues written via `save_*_level` are typed
-    // `Vec<[u8;32]>` structs in the delta, so a prior block's decoded queue is reusable here too.
     if let Some(arc) = context
         .journal_mut()
         .perp_load_arc(key)
         .map_err(convert_db_err::<CTX::Db>)?
     {
-        if let Some(q) = arc.downcast_ref::<Vec<[u8; 32]>>() {
-            let out = q.clone();
+        if let Some(b) = arc.downcast_ref::<LevelBlob>() {
+            let out = b.clone();
             context.journal_mut().perp_cache_put(key, arc);
             return Ok(out);
         }
     }
     let buf = load_blob(context, key)?;
     if buf.is_empty() {
-        return Ok(Vec::new());
+        return Ok(LevelBlob::default());
     }
-    let queue = unpack_order_ids(&buf)?;
+    let b = unpack_level(&buf)?;
     context
         .journal_mut()
-        .perp_cache_put(key, std::sync::Arc::new(queue.clone()));
-    Ok(queue)
+        .perp_cache_put(key, std::sync::Arc::new(b.clone()));
+    Ok(b)
 }
 
-/// Zero-copy level FIFO read (点1): returns the queue as `Arc<Vec<[u8;32]>>` without the per-read
-/// clone [`load_level_cached`] pays. Mirrors its source precedence; cold path uses
-/// `unpack_order_ids` (levels are packed, not serde). For PURE reads only (peeks / prechecks);
-/// consuming match RMW keeps `load_level_cached` + `save_*_level`.
+/// Zero-copy level read (点1): `Arc<LevelBlob>` (ids + count) without a per-read deep clone on a
+/// cache/cross-block hit. The match walk reads ids + count from ONE probe; FOK / getBookLevel read
+/// `.ids`. Same source precedence as [`load_level`].
 fn load_level_arc<CTX: ContextTr>(
     context: &mut CTX,
     key: B256,
-) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
-    // #14 cache tier FIRST (Arc bump, zero clone) — before `perp_get_struct`, which now also
-    // returns cached blobs as `&` and would force a deep clone.
+) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
     if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
-        if let Ok(q) = std::sync::Arc::downcast::<Vec<[u8; 32]>>(arc) {
-            return Ok(q);
+        if let Ok(b) = std::sync::Arc::downcast::<LevelBlob>(arc) {
+            return Ok(b);
         }
     }
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
-            return Ok(std::sync::Arc::new(q.clone()));
+        if let Some(b) = any.downcast_ref::<LevelBlob>() {
+            return Ok(std::sync::Arc::new(b.clone()));
         }
     }
     if let Some(arc) = context
@@ -1316,83 +1329,100 @@ fn load_level_arc<CTX: ContextTr>(
         .map_err(convert_db_err::<CTX::Db>)?
     {
         context.journal_mut().perp_cache_put(key, arc.clone());
-        if let Ok(q) = std::sync::Arc::downcast::<Vec<[u8; 32]>>(arc) {
-            return Ok(q);
+        if let Ok(b) = std::sync::Arc::downcast::<LevelBlob>(arc) {
+            return Ok(b);
         }
     }
     let buf = load_blob(context, key)?;
     if buf.is_empty() {
-        return Ok(std::sync::Arc::new(Vec::new()));
+        return Ok(std::sync::Arc::new(LevelBlob::default()));
     }
-    let queue: std::sync::Arc<Vec<[u8; 32]>> = std::sync::Arc::new(unpack_order_ids(&buf)?);
-    context.journal_mut().perp_cache_put(key, queue.clone());
-    Ok(queue)
+    let b: std::sync::Arc<LevelBlob> = std::sync::Arc::new(unpack_level(&buf)?);
+    context.journal_mut().perp_cache_put(key, b.clone());
+    Ok(b)
 }
 
-/// Reads a bid level FIFO.
+/// Writes a level blob as a deferred `Struct` (#21; packed once at block end by [`ser_level`]).
+/// `count == 0` packs to empty = delete.
+fn save_level<CTX: ContextTr>(context: &mut CTX, key: B256, b: &LevelBlob) {
+    context.journal_mut().perp_store_struct(
+        key,
+        std::boxed::Box::new(b.clone()),
+        ser_level,
+        clone_level,
+    );
+}
+
+/// Reads a bid level's FIFO ids (for tests / callers that only need the ids).
 pub fn load_bid_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    load_level_cached(context, bid_level_key(market_id, price))
+    Ok(load_level(context, bid_level_key(market_id, price))?.ids)
 }
 
-/// Zero-copy bid level FIFO read (点1). See [`load_level_arc`]. PURE reads only.
+/// Zero-copy bid level read (点1): `Arc<LevelBlob>` (ids + count).
 pub fn load_bid_level_arc<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
-) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
+) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
     load_level_arc(context, bid_level_key(market_id, price))
 }
 
-/// Writes a bid level FIFO. #21: stores the `Vec` as a deferred `Struct` (packed ONCE at block end
-/// by [`ser_level`]) instead of re-packing the whole blob per op — byte-identical final bytes.
+/// Writes a bid level (live `count` + `ids`).
 pub fn save_bid_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
-    queue: &[[u8; 32]],
+    count: u64,
+    ids: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    context.journal_mut().perp_store_struct(
+    save_level(
+        context,
         bid_level_key(market_id, price),
-        std::boxed::Box::new(queue.to_vec()),
-        ser_level,
-        clone_level,
+        &LevelBlob {
+            count,
+            ids: ids.to_vec(),
+        },
     );
     Ok(())
 }
 
-/// Reads an ask level FIFO.
+/// Reads an ask level's FIFO ids.
 pub fn load_ask_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    load_level_cached(context, ask_level_key(market_id, price))
+    Ok(load_level(context, ask_level_key(market_id, price))?.ids)
 }
 
-/// Zero-copy ask level FIFO read (点1). See [`load_level_arc`]. PURE reads only.
+/// Zero-copy ask level read (点1): `Arc<LevelBlob>` (ids + count).
 pub fn load_ask_level_arc<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
-) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
+) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
     load_level_arc(context, ask_level_key(market_id, price))
 }
 
+/// Writes an ask level (live `count` + `ids`).
 pub fn save_ask_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
-    queue: &[[u8; 32]],
+    count: u64,
+    ids: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    context.journal_mut().perp_store_struct(
+    save_level(
+        context,
         ask_level_key(market_id, price),
-        std::boxed::Box::new(queue.to_vec()),
-        ser_level,
-        clone_level,
+        &LevelBlob {
+            count,
+            ids: ids.to_vec(),
+        },
     );
     Ok(())
 }
@@ -1464,61 +1494,47 @@ pub fn remove_ask_price<CTX: ContextTr>(
     })
 }
 
-/// Append `order_id` to the FIFO queue at the given bid price level. #21: if the level is already
-/// in the overlay, append IN PLACE (one undo snapshot, no load/store clone round-trip); otherwise
-/// materialize it once (committed bytes / absent) and store as a deferred `Struct`.
+/// Rest an order at a bid level: push its id to the FIFO AND bump the live count, in ONE in-place
+/// blob mutate (was push + a separate incr_level_count on a separate key).
 pub fn push_bid_order<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
-    let key = bid_level_key(market_id, price);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            q.push(order_id);
-            return Ok(());
-        }
-    }
-    let mut queue = load_bid_level(context, market_id, price)?;
-    queue.push(order_id);
-    save_bid_level(context, market_id, price, &queue)
+    mutate_level(context, bid_level_key(market_id, price), |b| {
+        b.ids.push(order_id);
+        b.count += 1;
+    })
 }
 
-/// Append `order_id` to the FIFO queue at the given ask price level. See [`push_bid_order`].
+/// Rest an order at an ask level. See [`push_bid_order`].
 pub fn push_ask_order<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
-    let key = ask_level_key(market_id, price);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            q.push(order_id);
-            return Ok(());
-        }
-    }
-    let mut queue = load_ask_level(context, market_id, price)?;
-    queue.push(order_id);
-    save_ask_level(context, market_id, price, &queue)
+    mutate_level(context, ask_level_key(market_id, price), |b| {
+        b.ids.push(order_id);
+        b.count += 1;
+    })
 }
 
 // ── Per-level live-order count (lazy-queue) ────────────────────────────────────
-// The number of LIVE (Open/PartiallyFilled) orders at a price level. The lazy-queue design leaves
-// cancelled/filled order-ids sitting in the FIFO queue (swept opportunistically the next time a
-// match walks the level), so `queue.len()` no longer tracks liveness. This count is the
-// authoritative "is the level empty?" signal — cancel decrements it in O(1) (no queue scan) and,
-// when it hits 0, removes the price from the side's index + refreshes the BBO. Absent = 0; a count
-// of 0 deletes the key (empty blob). Maintained by: rest (+1), cancel (−1), cancel-all (−live),
-// and the match walk (set to the post-walk survivor count via the registry `SaveCount` event).
+// The count of LIVE (Open/PartiallyFilled) orders at a level, stored IN the level blob next to the
+// FIFO ids (Obs-1 merge: one key, not two). lazy-queue leaves cancelled/filled ids in the FIFO
+// (swept by the next match walk), so `ids.len()` no longer tracks liveness — `count` is the
+// authoritative "is the level empty?" signal. Maintained by: rest (push +1), cancel (decr −1),
+// cancel-all (decr −live), and the match walk (`SaveLevel` carries the post-walk survivor count).
+// count == 0 → the whole level blob is deleted (stale ids discarded).
 
 pub fn load_bid_count<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, bid_count_key(market_id, price))?.unwrap_or(0))
+    Ok(load_level(context, bid_level_key(market_id, price))?.count)
 }
 
 pub fn load_ask_count<CTX: ContextTr>(
@@ -1526,59 +1542,12 @@ pub fn load_ask_count<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, ask_count_key(market_id, price))?.unwrap_or(0))
-}
-
-pub fn save_bid_count<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    price: u64,
-    count: u64,
-) -> Result<(), PrecompileError> {
-    let key = bid_count_key(market_id, price);
-    if count == 0 {
-        store_blob(context, key, &[])
-    } else {
-        save_cached(context, key, &count)
-    }
-}
-
-pub fn save_ask_count<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    price: u64,
-    count: u64,
-) -> Result<(), PrecompileError> {
-    let key = ask_count_key(market_id, price);
-    if count == 0 {
-        store_blob(context, key, &[])
-    } else {
-        save_cached(context, key, &count)
-    }
-}
-
-/// Increment a side's level count by 1 (order rested). Returns the new count.
-pub fn incr_level_count<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    side: crate::perp_dex::types::Side,
-    price: u64,
-) -> Result<u64, PrecompileError> {
-    use crate::perp_dex::types::Side;
-    let new = match side {
-        Side::Buy => load_bid_count(context, market_id, price)?.saturating_add(1),
-        Side::Sell => load_ask_count(context, market_id, price)?.saturating_add(1),
-    };
-    match side {
-        Side::Buy => save_bid_count(context, market_id, price, new)?,
-        Side::Sell => save_ask_count(context, market_id, price, new)?,
-    }
-    Ok(new)
+    Ok(load_level(context, ask_level_key(market_id, price))?.count)
 }
 
 /// Decrement a side's level count by `n` (orders removed: cancel / bulk-cancel). Returns the new
-/// count. Saturates at 0 (an under-decrement would mean the count drifted from the queue's live
-/// membership — callers treat a resulting 0 as "level empty").
+/// count. On reaching 0 the level is EMPTY → the FIFO ids are cleared so the blob packs to empty
+/// (delete); the caller still removes the price from the index. Saturates at 0.
 pub fn decr_level_count<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -1587,15 +1556,17 @@ pub fn decr_level_count<CTX: ContextTr>(
     n: u64,
 ) -> Result<u64, PrecompileError> {
     use crate::perp_dex::types::Side;
-    let new = match side {
-        Side::Buy => load_bid_count(context, market_id, price)?.saturating_sub(n),
-        Side::Sell => load_ask_count(context, market_id, price)?.saturating_sub(n),
+    let key = match side {
+        Side::Buy => bid_level_key(market_id, price),
+        Side::Sell => ask_level_key(market_id, price),
     };
-    match side {
-        Side::Buy => save_bid_count(context, market_id, price, new)?,
-        Side::Sell => save_ask_count(context, market_id, price, new)?,
-    }
-    Ok(new)
+    mutate_level(context, key, |b| {
+        b.count = b.count.saturating_sub(n);
+        if b.count == 0 {
+            b.ids.clear();
+        }
+        b.count
+    })
 }
 
 // ── Best bid / ask cache ──────────────────────────────────────────────────────
