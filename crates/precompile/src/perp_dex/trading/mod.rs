@@ -84,8 +84,12 @@ pub fn run_place_order<CTX: ContextTr>(
 
 /// `placeOrderSigned(address account, ..., uint64 timestamp, bytes signature) returns (bytes32 orderId)`
 ///
-/// orderId = keccak256(signature). Replay protection is implicit: a second submission of the
-/// same signature produces the same orderId, which already exists in storage, and is rejected.
+/// orderId = keccak256(signature). Replay protection lives in the seen-signature set (commit-only
+/// #23): delete-on-terminal removes a filled/cancelled order from the map, so the order-id is no
+/// longer a durable replay witness — the seen-set is. A second submission of the same signature
+/// hits the same seen marker and is rejected. The marker is time-bucketed and reclaimed once the
+/// signature's recv window has fully elapsed (a stale replay is rejected by `check_recv_window`
+/// first, so reclaiming the marker is safe).
 pub fn run_place_order_signed<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -125,9 +129,9 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
 
-    // Derive orderId from signature: same sig, same id, duplicate check is the replay guard.
+    // orderId = keccak256(signature); the SAME hash keys the seen-signature replay set.
     let order_id: [u8; 32] = keccak256(args.signature.as_ref()).0;
-    if storage::load_order_ref(context, &order_id)?.is_some() {
+    if storage::is_signature_seen(context, &order_id)? {
         return Err(perp_err(
             "placeOrderSigned: duplicate signature (already submitted)",
         ));
@@ -145,6 +149,15 @@ pub fn run_place_order_signed<CTX: ContextTr>(
         args.clientOrderId.0,
         context,
     )?;
+
+    // Placement succeeded — burn the signature (commit-only: a REJECTED placement above returned
+    // early WITHOUT marking, so it stays replayable within its recv window, exactly as the old
+    // order-map guard behaved). Index it under its signed timestamp for time-bucketed GC, then
+    // sweep one expired bucket.
+    let block_ts: u64 = context.block().timestamp().saturating_to();
+    storage::mark_signature_seen(context, &order_id, args.timestamp)?;
+    storage::gc_seen_buckets(context, block_ts)?;
+
     Ok(Bytes::from(placeOrderSignedCall::abi_encode_returns(
         &FixedBytes(order_id),
     )))
@@ -480,9 +493,15 @@ fn place_order_core<CTX: ContextTr>(
             &mut taker_order,
         )?,
     }
-    // Single final persist of the taker order's terminal state (Open / PartiallyFilled /
-    // Filled / Expired) — same final value + key as the old persist-then-update writes.
-    storage::save_order(context, &order_id, &taker_order).map(|_| ())?;
+    // Single final persist of the taker order. delete-on-terminal: a Filled/Expired taker leaves
+    // NO record (it fully filled or its IOC/FOK/market remainder expired — never resting); an
+    // Open/PartiallyFilled taker rested, so it is saved live (its book entry / level FIFO / live
+    // count were already written by `rest_in_book`).
+    if taker_order.status.is_terminal() {
+        storage::delete_order(context, &order_id)?;
+    } else {
+        storage::save_order(context, &order_id, &taker_order)?;
+    }
     Ok(())
 }
 
@@ -832,7 +851,6 @@ fn cancel_order_core<CTX: ContextTr>(
         market_id,
         order_id,
         order,
-        OrderStatus::Cancelled,
         &market,
         // Explicit cancel: no matching ran in this call, so the BBO cache is live.
         remove_from_book_after_cancel,
@@ -889,24 +907,46 @@ pub(super) fn match_order<CTX: ContextTr>(
                     break;
                 }
                 let queue = storage::load_ask_level_arc(context, market_id, ask_price)?;
+                let count_old = storage::load_ask_count(context, market_id, ask_price)?;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
+                // Live makers that LEAVE this level during the walk (fully filled / K9-rejected).
+                // The post-walk live count is `count_old - level_removed`; stale ids the walk sweeps
+                // (already gone from the book) are NOT counted here — they were decremented when
+                // they left. See `finalize_level_count` below.
+                let mut level_removed = 0u64;
                 let mut qi = 0;
 
                 while qi < queue.len() {
                     if remaining == 0 {
                         new_queue.extend(queue[qi..].iter().copied());
-                        if new_queue.is_empty() {
+                        let count_new = count_old.saturating_sub(level_removed);
+                        if count_new == 0 {
+                            // Level logically empty (any ids left in new_queue are stale) — drop the
+                            // price + clear the queue + delete the count.
                             registry.push_event(settlement::MatchEvent::RemovePrice {
                                 is_bid: false,
                                 price: ask_price,
                             });
                             removed_asks.push(ask_price);
                             ask_levels_cleared = true;
+                            registry.push_event(settlement::MatchEvent::SaveLevel {
+                                is_bid: false,
+                                price: ask_price,
+                                queue: Vec::new(),
+                            });
+                        } else {
+                            // Live orders remain in the untouched tail — keep it verbatim (any stale
+                            // ids ride along and are swept on the next walk).
+                            registry.push_event(settlement::MatchEvent::SaveLevel {
+                                is_bid: false,
+                                price: ask_price,
+                                queue: new_queue,
+                            });
                         }
-                        registry.push_event(settlement::MatchEvent::SaveLevel {
+                        registry.push_event(settlement::MatchEvent::SaveCount {
                             is_bid: false,
                             price: ask_price,
-                            queue: new_queue,
+                            count: count_new,
                         });
                         break 'outer;
                     }
@@ -922,18 +962,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                         {
                             o
                         }
-                        Some(o) => {
-                            return Err(perp_invariant_err(format!(
-                                "ask queue contains order {:?} with terminal status {:?}",
-                                maker_id, o.status
-                            )))
-                        }
-                        None => {
-                            return Err(perp_invariant_err(format!(
-                                "ask queue references order {:?} not found in storage",
-                                maker_id
-                            )))
-                        }
+                        // lazy-queue sweep: a cancelled/filled maker was deleted (delete-on-terminal)
+                        // but its id lingers in the FIFO — drop it (not re-queued), no count change
+                        // (it was decremented when it left the book).
+                        _ => continue,
                     };
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
@@ -967,9 +999,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 &mut maker_order,
                                 market,
                             )?;
-                            // Dropped from this level (not re-queued). If it was the
-                            // last order at this price, the new_queue-empty check below
-                            // removes the price + refreshes best ask.
+                            // A live maker left the level (cancelled): count it. Dropped from the
+                            // queue (not re-queued); if it was the last live order the count hits 0
+                            // and the level is removed below.
+                            level_removed += 1;
                             continue;
                         }
                     };
@@ -1004,10 +1037,18 @@ pub(super) fn match_order<CTX: ContextTr>(
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    registry.push_event(settlement::MatchEvent::SaveOrder {
-                        order_id: maker_id,
-                        order: maker_order.clone(),
-                    });
+                    // delete-on-terminal: a fully-filled maker leaves the map (and the level, via
+                    // level_removed); a partial fill stays and is re-queued below.
+                    if maker_order.status == OrderStatus::Filled {
+                        registry
+                            .push_event(settlement::MatchEvent::DeleteOrder { order_id: maker_id });
+                        level_removed += 1;
+                    } else {
+                        registry.push_event(settlement::MatchEvent::SaveOrder {
+                            order_id: maker_id,
+                            order: maker_order.clone(),
+                        });
+                    }
 
                     // Accumulate into the hoisted taker order (saved once after the loop).
                     taker_order.filled += fill_qty;
@@ -1023,18 +1064,31 @@ pub(super) fn match_order<CTX: ContextTr>(
                     }
                 }
 
-                if new_queue.is_empty() {
+                // Normal level end (taker still had capacity → consumed every live maker here).
+                let count_new = count_old.saturating_sub(level_removed);
+                if count_new == 0 {
                     registry.push_event(settlement::MatchEvent::RemovePrice {
                         is_bid: false,
                         price: ask_price,
                     });
                     removed_asks.push(ask_price);
                     ask_levels_cleared = true;
+                    registry.push_event(settlement::MatchEvent::SaveLevel {
+                        is_bid: false,
+                        price: ask_price,
+                        queue: Vec::new(),
+                    });
+                } else {
+                    registry.push_event(settlement::MatchEvent::SaveLevel {
+                        is_bid: false,
+                        price: ask_price,
+                        queue: new_queue,
+                    });
                 }
-                registry.push_event(settlement::MatchEvent::SaveLevel {
+                registry.push_event(settlement::MatchEvent::SaveCount {
                     is_bid: false,
                     price: ask_price,
-                    queue: new_queue,
+                    count: count_new,
                 });
             }
             if ask_levels_cleared {
@@ -1069,24 +1123,39 @@ pub(super) fn match_order<CTX: ContextTr>(
                     break;
                 }
                 let queue = storage::load_bid_level_arc(context, market_id, bid_price)?;
+                let count_old = storage::load_bid_count(context, market_id, bid_price)?;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
+                // See the mirror on the Buy side.
+                let mut level_removed = 0u64;
                 let mut qi = 0;
 
                 while qi < queue.len() {
                     if remaining == 0 {
                         new_queue.extend(queue[qi..].iter().copied());
-                        if new_queue.is_empty() {
+                        let count_new = count_old.saturating_sub(level_removed);
+                        if count_new == 0 {
                             registry.push_event(settlement::MatchEvent::RemovePrice {
                                 is_bid: true,
                                 price: bid_price,
                             });
                             removed_bids.push(bid_price);
                             bid_levels_cleared = true;
+                            registry.push_event(settlement::MatchEvent::SaveLevel {
+                                is_bid: true,
+                                price: bid_price,
+                                queue: Vec::new(),
+                            });
+                        } else {
+                            registry.push_event(settlement::MatchEvent::SaveLevel {
+                                is_bid: true,
+                                price: bid_price,
+                                queue: new_queue,
+                            });
                         }
-                        registry.push_event(settlement::MatchEvent::SaveLevel {
+                        registry.push_event(settlement::MatchEvent::SaveCount {
                             is_bid: true,
                             price: bid_price,
-                            queue: new_queue,
+                            count: count_new,
                         });
                         break 'outer;
                     }
@@ -1102,18 +1171,8 @@ pub(super) fn match_order<CTX: ContextTr>(
                         {
                             o
                         }
-                        Some(o) => {
-                            return Err(perp_invariant_err(format!(
-                                "bid queue contains order {:?} with terminal status {:?}",
-                                maker_id, o.status
-                            )))
-                        }
-                        None => {
-                            return Err(perp_invariant_err(format!(
-                                "bid queue references order {:?} not found in storage",
-                                maker_id
-                            )))
-                        }
+                        // lazy-queue sweep (see the Buy mirror): stale id → drop, no count change.
+                        _ => continue,
                     };
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
@@ -1143,9 +1202,8 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 &mut maker_order,
                                 market,
                             )?;
-                            // Dropped from this level (not re-queued). If it was the
-                            // last order at this price, the new_queue-empty check below
-                            // removes the price + refreshes best bid.
+                            // A live maker left the level (see the Buy mirror): count it.
+                            level_removed += 1;
                             continue;
                         }
                     };
@@ -1178,10 +1236,17 @@ pub(super) fn match_order<CTX: ContextTr>(
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    registry.push_event(settlement::MatchEvent::SaveOrder {
-                        order_id: maker_id,
-                        order: maker_order.clone(),
-                    });
+                    // delete-on-terminal (see the Buy mirror).
+                    if maker_order.status == OrderStatus::Filled {
+                        registry
+                            .push_event(settlement::MatchEvent::DeleteOrder { order_id: maker_id });
+                        level_removed += 1;
+                    } else {
+                        registry.push_event(settlement::MatchEvent::SaveOrder {
+                            order_id: maker_id,
+                            order: maker_order.clone(),
+                        });
+                    }
 
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
@@ -1196,18 +1261,30 @@ pub(super) fn match_order<CTX: ContextTr>(
                     }
                 }
 
-                if new_queue.is_empty() {
+                let count_new = count_old.saturating_sub(level_removed);
+                if count_new == 0 {
                     registry.push_event(settlement::MatchEvent::RemovePrice {
                         is_bid: true,
                         price: bid_price,
                     });
                     removed_bids.push(bid_price);
                     bid_levels_cleared = true;
+                    registry.push_event(settlement::MatchEvent::SaveLevel {
+                        is_bid: true,
+                        price: bid_price,
+                        queue: Vec::new(),
+                    });
+                } else {
+                    registry.push_event(settlement::MatchEvent::SaveLevel {
+                        is_bid: true,
+                        price: bid_price,
+                        queue: new_queue,
+                    });
                 }
-                registry.push_event(settlement::MatchEvent::SaveLevel {
+                registry.push_event(settlement::MatchEvent::SaveCount {
                     is_bid: true,
                     price: bid_price,
-                    queue: new_queue,
+                    count: count_new,
                 });
             }
             if bid_levels_cleared {
@@ -1367,6 +1444,7 @@ fn rest_in_book<CTX: ContextTr>(
             })?;
             storage::insert_bid_price(context, market_id, price)?;
             storage::push_bid_order(context, market_id, price, *order_id)?;
+            storage::incr_level_count(context, market_id, Side::Buy, price)?;
 
             // Keep best_bid cache up to date.
             let cur_best_bid = storage::load_best_bid(context, market_id)?;
@@ -1443,6 +1521,7 @@ fn rest_in_book<CTX: ContextTr>(
             })?;
             storage::insert_ask_price(context, market_id, price)?;
             storage::push_ask_order(context, market_id, price, *order_id)?;
+            storage::incr_level_count(context, market_id, Side::Sell, price)?;
 
             // Keep best_ask cache up to date.
             let cur_best_ask = storage::load_best_ask(context, market_id)?;
@@ -1478,7 +1557,7 @@ fn rest_in_book<CTX: ContextTr>(
 // ── Cancel helpers ─────────────────────────────────────────────────────────────
 
 /// Atomically executes all four steps of an order cancellation:
-/// remove from book → release reserved margin → mark Cancelled → emit log.
+/// remove from book → release reserved margin → delete the order record → emit log.
 ///
 /// Both the explicit user-initiated cancel path and the auto-cancel-for-margin
 /// path in settlement use this function so the invariant "these steps always
@@ -1494,8 +1573,7 @@ pub(super) fn execute_order_cancellation<CTX: ContextTr, F>(
     user: Address,
     market_id: u64,
     order_id: [u8; 32],
-    mut order: Order,
-    terminal_status: OrderStatus,
+    order: Order,
     market: &crate::perp_dex::types::Market,
     remove: F,
 ) -> Result<(), PrecompileError>
@@ -1504,8 +1582,11 @@ where
 {
     remove(context, market_id, order.side, order.price, &order_id)?;
     release_margin_for_cancelled_order(context, user, market_id, order.side, &order_id, market)?;
-    order.status = terminal_status;
-    storage::save_order(context, &order_id, &order)?;
+    // delete-on-terminal: the cancelled/expired order is removed from the map. Its id may linger in
+    // the level FIFO (lazy-queue) until a match walk sweeps it; `remove` already decremented the
+    // level's live count. The Cancelled/Expired distinction (previously only the saved status; the
+    // event has always been OrderCancelled) is dropped with the record — history is disposable.
+    storage::delete_order(context, &order_id)?;
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderCancelled {
@@ -1529,30 +1610,29 @@ fn detach_order_from_level<CTX: ContextTr>(
     market_id: u64,
     side: Side,
     price: u64,
-    order_id: &[u8; 32],
+    _order_id: &[u8; 32],
 ) -> Result<(bool, u64), PrecompileError> {
+    // lazy-queue: `order_id` is intentionally NOT removed from the FIFO queue — that O(depth) scan
+    // is replaced by an O(1) decrement of the level's LIVE count. The stale id is swept when the
+    // next match walk reaches it (load_order → None → skip). When the count hits 0 the level is
+    // logically empty: drop the price from the index and clear the (now all-stale) queue in one
+    // shot, so single-order-per-level churn (count 1→0 each cancel) never accumulates stale ids.
     let (old_best, emptied) = match side {
         Side::Buy => {
             let old_best = storage::load_best_bid(context, market_id)?;
-            // #21 generalized: remove IN PLACE (fast path when the level is already in the block
-            // overlay), byte-identical to the load-retain-save round-trip.
-            let emptied = storage::mutate_bid_level(context, market_id, price, |q| {
-                q.retain(|id| id != order_id);
-                q.is_empty()
-            })?;
+            let emptied = storage::decr_level_count(context, market_id, Side::Buy, price, 1)? == 0;
             if emptied {
                 storage::remove_bid_price(context, market_id, price)?;
+                storage::save_bid_level(context, market_id, price, &[])?;
             }
             (old_best, emptied)
         }
         Side::Sell => {
             let old_best = storage::load_best_ask(context, market_id)?;
-            let emptied = storage::mutate_ask_level(context, market_id, price, |q| {
-                q.retain(|id| id != order_id);
-                q.is_empty()
-            })?;
+            let emptied = storage::decr_level_count(context, market_id, Side::Sell, price, 1)? == 0;
             if emptied {
                 storage::remove_ask_price(context, market_id, price)?;
+                storage::save_ask_level(context, market_id, price, &[])?;
             }
             (old_best, emptied)
         }

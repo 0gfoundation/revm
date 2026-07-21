@@ -76,7 +76,10 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         false, // liquidation close (IOC): never rests
         &mut order,
     )?;
-    storage::save_order(context, &order_id, &order)?;
+    // delete-on-terminal: the liquidation close is an IOC that never rests — it exists only to
+    // drive the match + emit OrderPlaced/Trade. Its record is dropped (never a live/queryable
+    // resting order; any residual is settled at mark price by the caller).
+    storage::delete_order(context, &order_id)?;
     super::commit_order_nonce(context, user, bumped_nonce)?;
 
     if remaining == 0 {

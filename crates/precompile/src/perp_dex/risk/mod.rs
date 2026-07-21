@@ -1009,25 +1009,20 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     market_id: u64,
     _market: &Market,
 ) -> Result<(), PrecompileError> {
-    use crate::perp_dex::types::OrderStatus;
-
     let old_best_bid = storage::load_best_bid(context, market_id)?;
     let old_best_ask = storage::load_best_ask(context, market_id)?;
 
     // --- Buy orders ---
     let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
     for entry in buy_entries.iter() {
-        if let Some(mut order) = storage::load_order(context, &entry.order_id)? {
-            order.status = OrderStatus::Cancelled;
-            storage::save_order(context, &entry.order_id, &order)?;
-        }
-        // Remove from price level queue (in place; #21 generalized).
-        let empty = storage::mutate_bid_level(context, market_id, entry.price, |q| {
-            q.retain(|id| id != &entry.order_id);
-            q.is_empty()
-        })?;
+        // delete-on-terminal: drop the order record (was: save Cancelled).
+        storage::delete_order(context, &entry.order_id)?;
+        // lazy-queue: decrement the level's live count and leave the id for the next match walk to
+        // sweep (other users' orders may share this price). Emptied → drop price + clear queue.
+        let empty = storage::decr_level_count(context, market_id, Side::Buy, entry.price, 1)? == 0;
         if empty {
             storage::remove_bid_price(context, market_id, entry.price)?;
+            storage::save_bid_level(context, market_id, entry.price, &[])?;
         }
 
         context.journal_mut().log(Log {
@@ -1045,16 +1040,12 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     // --- Sell orders ---
     let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
     for entry in sell_entries.iter() {
-        if let Some(mut order) = storage::load_order(context, &entry.order_id)? {
-            order.status = OrderStatus::Cancelled;
-            storage::save_order(context, &entry.order_id, &order)?;
-        }
-        let empty = storage::mutate_ask_level(context, market_id, entry.price, |q| {
-            q.retain(|id| id != &entry.order_id);
-            q.is_empty()
-        })?;
+        // delete-on-terminal + lazy-queue (see the buy loop above).
+        storage::delete_order(context, &entry.order_id)?;
+        let empty = storage::decr_level_count(context, market_id, Side::Sell, entry.price, 1)? == 0;
         if empty {
             storage::remove_ask_price(context, market_id, entry.price)?;
+            storage::save_ask_level(context, market_id, entry.price, &[])?;
         }
 
         context.journal_mut().log(Log {

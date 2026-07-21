@@ -420,6 +420,11 @@ pub(super) enum MatchEvent {
         order_id: [u8; 32],
         order: crate::perp_dex::types::Order,
     },
+    /// delete-on-terminal: drop a maker order that reached a terminal status (fully filled during
+    /// the walk, or cancelled by the K9 insolvency reject) from the order map.
+    DeleteOrder {
+        order_id: [u8; 32],
+    },
     OrderCancelled {
         user: Address,
         order_id: [u8; 32],
@@ -440,6 +445,13 @@ pub(super) enum MatchEvent {
         is_bid: bool,
         price: u64,
         queue: Vec<[u8; 32]>,
+    },
+    /// lazy-queue: the post-walk count of LIVE orders at a level (drives the empty→remove-price
+    /// decision independently of the FIFO queue length, which may retain swept stale ids).
+    SaveCount {
+        is_bid: bool,
+        price: u64,
+        count: u64,
     },
     RemovePrice {
         is_bid: bool,
@@ -582,6 +594,9 @@ impl MatchRegistry {
                 MatchEvent::SaveOrder { order_id, order } => {
                     storage::save_order(context, &order_id, &order)?;
                 }
+                MatchEvent::DeleteOrder { order_id } => {
+                    storage::delete_order(context, &order_id)?;
+                }
                 MatchEvent::OrderCancelled { user, order_id } => {
                     context.journal_mut().log(Log {
                         address: PERP_DEX_ADDRESS,
@@ -602,6 +617,17 @@ impl MatchRegistry {
                         storage::save_bid_level(context, market_id, price, &queue)?;
                     } else {
                         storage::save_ask_level(context, market_id, price, &queue)?;
+                    }
+                }
+                MatchEvent::SaveCount {
+                    is_bid,
+                    price,
+                    count,
+                } => {
+                    if is_bid {
+                        storage::save_bid_count(context, market_id, price, count)?;
+                    } else {
+                        storage::save_ask_count(context, market_id, price, count)?;
                     }
                 }
                 MatchEvent::RemovePrice { is_bid, price } => {
@@ -783,10 +809,12 @@ pub(super) fn cancel_rejected_maker_registry<CTX: ContextTr>(
         Side::Buy => w.dirty_buy = true,
         Side::Sell => w.dirty_sell = true,
     }
+    // delete-on-terminal: the rejected maker is Cancelled → removed from the map (its id stays in
+    // the level queue and is swept as a stale entry; the match walk decrements the live count for
+    // this reject, so the level's count stays accurate).
     maker_order.status = OrderStatus::Cancelled;
-    reg.push_event(MatchEvent::SaveOrder {
+    reg.push_event(MatchEvent::DeleteOrder {
         order_id: *order_id,
-        order: maker_order.clone(),
     });
     reg.push_event(MatchEvent::OrderCancelled {
         user: maker,
@@ -1207,7 +1235,6 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
             market_id,
             order_id,
             order,
-            OrderStatus::Expired,
             market,
             // Runs mid-matching (taker margin-cover): the BBO cache lags the book.
             super::remove_from_book_during_match,
