@@ -491,9 +491,12 @@ pub fn save_account<CTX: ContextTr>(
 
 /// In-place RMW of a user's account blob (mirror of [`mutate_buy_orders`]): fast-path mutates the
 /// deferred `Struct` already in the overlay (zero clone — no `usdc_balance` String copy); slow-path
-/// loads once → mutate → store. Used by the folded fee-rate / nonce setters so they coalesce with
-/// balance writes into ONE account write.
-fn mutate_account<CTX: ContextTr, R>(
+/// loads once → mutate → store. Used by the folded fee-rate / nonce setters AND by wallet
+/// credit/debit sites that previously did `load_account` (owned clone) → mutate → `save_account`
+/// (clone again): routing those through here removes both `UserAccount` deep clones (each of which
+/// heap-allocates the `usdc_balance` String) on the warm path. Byte-identical final blob to
+/// load→modify→save, so it is golden-neutral.
+pub fn mutate_account<CTX: ContextTr, R>(
     context: &mut CTX,
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,

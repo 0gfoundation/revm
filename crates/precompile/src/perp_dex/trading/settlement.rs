@@ -347,12 +347,10 @@ pub(super) fn finalize_apply<CTX: ContextTr>(
         market,
     )?;
 
-    // Reload account only: cancellations may have changed the wallet balance. pos is already
-    // correct in storage (registry flush) — the cancels save their own pos updates, and the log
-    // fields (amount/margin/v_quote) are not touched by cancellations.
-    let mut account = storage::load_account(context, plan.user)?;
-    account.debit_perp(plan.total_required)?;
-    storage::save_account(context, plan.user, account)?;
+    // Debit the taker wallet in place (no UserAccount/String load+save clone pair). pos is already
+    // correct in storage (registry flush); cancels saved their own pos updates and the log fields
+    // are untouched by cancellations.
+    storage::mutate_account(context, plan.user, |a| a.debit_perp(plan.total_required))??;
     credit_fee_recipient(context, plan.market_id, plan.fee)?;
 
     context.journal_mut().log(Log {
@@ -689,9 +687,7 @@ impl MatchRegistry {
             let admin = self
                 .fee_admin
                 .ok_or_else(|| perp_invariant_err("pending admin fee credit without an admin"))?;
-            let mut account = storage::load_account(context, admin)?;
-            account.credit_perp(self.admin_credit_pending)?;
-            storage::save_account(context, admin, account)?;
+            storage::mutate_account(context, admin, |a| a.credit_perp(self.admin_credit_pending))??;
         }
         for (user, w) in self.users {
             if w.dirty_buy {
@@ -1082,11 +1078,20 @@ fn credit_fee_recipient<CTX: ContextTr>(
     if admin == Address::ZERO {
         return Err(perp_err("placeOrder: fee recipient not initialised"));
     }
-    let mut account = storage::load_account(context, admin)?;
-    account.credit_perp(amount)?;
-    // ── APPLY ── (fee-total then account, same order as before)
+    // Validate the credit fits as a READ-ONLY check (mirrors credit_perp's guard) so the fee-total
+    // write below can't be stranded by a later overflow — without a load+save owned clone pair.
+    {
+        let a =
+            i64::try_from(amount).map_err(|_| perp_err("perp wallet: amount exceeds i64::MAX"))?;
+        storage::load_account_ref(context, admin)?
+            .perp_wallet_balance
+            .checked_add(a)
+            .ok_or_else(|| perp_err("perp wallet: balance overflow"))?;
+    }
+    // ── APPLY ── (fee-total then account, same order as before). The credit is an in-place mutate
+    // (zero-clone on the warm path); it cannot fail now (validated above).
     storage::add_market_fee_total(context, market_id, amount)?;
-    storage::save_account(context, admin, account)
+    storage::mutate_account(context, admin, |a| a.credit_perp(amount))?
 }
 
 /// Output of [`split_position_fill`]: the closing and opening legs of a maker

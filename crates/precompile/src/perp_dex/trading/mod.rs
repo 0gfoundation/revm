@@ -1748,7 +1748,6 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
-    let mut account = storage::load_account(context, user)?;
     // commit-only #23 CLONE-FREE: read both sides via Arc (zero clone) and compute the POST-cancel
     // reservation by FOLDING a FILTERED iterator (the cancelled side minus this order_id) — no
     // owned list clone. order_ids are unique per side, so the filter drops exactly the one entry
@@ -1787,9 +1786,8 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
         })??,
     };
 
-    apply_release_effect(
+    let total_freed = apply_release_effect(
         &mut pos,
-        &mut account,
         buy_notional,
         sell_notional,
         c_notional,
@@ -1797,7 +1795,8 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
         market,
     )?;
     storage::save_position(context, user, market_id, &pos)?;
-    storage::save_account(context, user, account)?;
+    // In-place wallet credit (no UserAccount/String load+save clone pair).
+    storage::mutate_account(context, user, |a| a.credit_perp(total_freed))??;
     Ok(())
 }
 
@@ -1832,33 +1831,33 @@ pub(super) fn release_margin_core(
         market.price_decimals,
         pos.amount,
     )?;
-    apply_release_effect(
+    let total_freed = apply_release_effect(
         pos,
-        account,
         buy_notional,
         sell_notional,
         c_notional,
         &cancelled_entry,
         market,
-    )
+    )?;
+    // Registry path: credit the owned working-copy account (saved once at flush).
+    account.credit_perp(total_freed)
 }
 
-/// Applies a cancel's margin release given the POST-cancel reservation notionals + the cancelled
-/// entry: snapshots the flip-aware reservation, credits the freed margin + fee back to the wallet,
-/// and drops the fee reservation. ONE implementation shared by the registry path (owned lists, via
-/// [`release_margin_core`]) and the storage wrapper (Arc-filtered fold, below) so the freed/fee
-/// credit math has a single source of truth. `old_reserved` is snapshotted here before
-/// `set_reservations` — the preceding entry removal never touches `pos.margin_reserved`, so this is
-/// the same value the pre-refactor code captured before the removal.
+/// Applies a cancel's margin release to the POSITION given the POST-cancel reservation notionals +
+/// the cancelled entry: snapshots the flip-aware reservation, drops the fee reservation, and RETURNS
+/// the total amount to credit back to the wallet (freed margin + fee reservation). The CALLER
+/// applies that credit — the registry path onto its owned working-copy account, the storage path via
+/// `mutate_account` (in-place, no owned load+save clone pair) — so this stays account-representation-
+/// agnostic and the freed/fee math has a single source of truth. `old_reserved` is snapshotted here
+/// before `set_reservations`; the preceding entry removal never touches `pos.margin_reserved`.
 fn apply_release_effect(
     pos: &mut crate::perp_dex::types::PerpPosition,
-    account: &mut crate::perp_dex::types::UserAccount,
     new_buy_notional: u64,
     new_sell_notional: u64,
     new_c_notional: u64,
     cancelled: &OrderEntry,
     market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
+) -> Result<u64, PrecompileError> {
     let old_reserved = pos.margin_reserved;
     pos.set_reservations(
         new_buy_notional,
@@ -1873,12 +1872,10 @@ fn apply_release_effect(
         cancelled.maker_fee_bps,
         market,
     )?;
-    // Return released margin + fee reservation in one credit (mirrors the combined debit on the
-    // placement path).
+    // Released margin + fee reservation credited in one (mirrors the combined debit on placement).
     let total_freed = freed
         .checked_add(fee_freed)
         .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
-    account.credit_perp(total_freed)?;
     // Surface drift instead of masking it (was saturating_sub).
     let prev_fee = pos.fee_reserved;
     pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
@@ -1886,7 +1883,7 @@ fn apply_release_effect(
             "fee_reserved {prev_fee} < fee to release {fee_freed}"
         ))
     })?;
-    Ok(())
+    Ok(total_freed)
 }
 
 // ── FOK / PostOnly pre-checks ─────────────────────────────────────────────────

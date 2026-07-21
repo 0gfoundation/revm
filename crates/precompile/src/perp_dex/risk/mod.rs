@@ -875,19 +875,17 @@ fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
 
     if new_reserved > old_reserved {
         let delta = new_reserved - old_reserved;
-        let mut account = storage::load_account(context, user)?;
-        if !account.has_available_perp(delta) {
+        // validate-then-apply: the availability reject is a READ-ONLY precheck (mutate_account
+        // always writes, so a rejecting closure would write-on-reject). Reject → zero write.
+        if !storage::load_account_ref(context, user)?.has_available_perp(delta) {
             return Err(perp_err(
                 "setLeverage: insufficient perp wallet for order margin",
             ));
         }
-        account.debit_perp(delta)?;
-        storage::save_account(context, user, account)?;
+        storage::mutate_account(context, user, |a| a.debit_perp(delta))??;
     } else if old_reserved > new_reserved {
         let delta = old_reserved - new_reserved;
-        let mut account = storage::load_account(context, user)?;
-        account.credit_perp(delta)?;
-        storage::save_account(context, user, account)?;
+        storage::mutate_account(context, user, |a| a.credit_perp(delta))??;
     }
     Ok(())
 }
@@ -1072,9 +1070,8 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         .checked_add(pos.fee_reserved)
         .ok_or_else(|| perp_err("cancelAllOrders: released reserve overflow"))?;
     if released > 0 {
-        let mut account = storage::load_account(context, user)?;
-        account.credit_perp(released)?;
-        storage::save_account(context, user, account)?;
+        // In-place credit (no UserAccount/String load+save clone pair).
+        storage::mutate_account(context, user, |a| a.credit_perp(released))??;
     }
     pos.set_reservations(0, 0, 0, pos.leverage);
     pos.fee_reserved = 0;
