@@ -12,7 +12,7 @@ mod liquidation;
 mod settlement;
 
 pub(crate) use liquidation::{
-    execute_liquidation_market_order, settle_liquidation_residual_at_mark_price,
+    execute_liquidation_market_order, run_adl, settle_liquidation_residual_at_mark_price,
 };
 use settlement::{settle_maker_fill, MakerFillOutcome, TakerSettlement};
 

@@ -718,7 +718,7 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
 ///   position's REMAINING margin first; anything still uncovered is `bad_debt`,
 ///   which the caller routes DIRECTLY to the Insurance Fund. A realized loss is
 ///   never debited from the wallet or another position's margin.
-fn apply_position_fill(
+pub(super) fn apply_position_fill(
     pos: &mut crate::perp_dex::types::PerpPosition,
     wallet: &mut i64,
     closing_qty: u64,

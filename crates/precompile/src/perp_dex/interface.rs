@@ -270,6 +270,11 @@ sol! {
         // Feeds: /income (LIQUIDATION_FEE for liquidator)
         event Liquidation(address indexed user, uint64 indexed marketId, address liquidator, int64 amount, uint64 reward, uint64 markPrice);
 
+        // Auto-deleveraging: one per forced trade closing a liquidated insolvent
+        // residual (`liquidatedUser`) against an opposite-side holder (`adlUser`) at
+        // the liquidated position's bankruptcy `price`. `qty` = deleveraged size.
+        event Adl(address indexed liquidatedUser, address indexed adlUser, uint64 indexed marketId, uint64 qty, uint64 price);
+
         // Feeds: market metadata bootstrap for indexer
         event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint64 initialMarkPrice, uint32 priceBandBps);
         // Feeds: market metadata updates for indexer

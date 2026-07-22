@@ -7,7 +7,10 @@ use crate::{
     perp_dex::{
         errors::{perp_err, perp_invariant_err},
         interface::IPerpDex,
-        math::{calc_value, checked_u64_to_i64},
+        math::{
+            calc_bankruptcy_price, calc_position_equity, calc_value, calc_value_i64,
+            checked_u64_to_i64,
+        },
         storage,
         types::{Market, Order, OrderStatus, OrderType, Side, TimeInForce},
         PERP_DEX_ADDRESS,
@@ -153,4 +156,165 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<CTX: ContextTr>(
     super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
 
     Ok(())
+}
+
+/// Auto-deleveraging (ADL, scheme X): close a liquidated position's INSOLVENT
+/// book-unfillable residual as a forced trade against opposite-side holders at the
+/// residual's bankruptcy price `P_b`. No Insurance Fund, no mint: the loser closes at
+/// the price where its own equity is exactly 0 (no bad debt), and each opposite holder
+/// that can absorb at `P_b` without going insolvent gives up exactly its share of the
+/// shortfall. Both legs of every fill use the SAME single-floored `calc_value(P_b,
+/// take)`, so Σ vQuote and Σ amount are conserved (a real trade, not a synthetic close).
+///
+/// Runs inside the liquidation sweep, bounded by the shared `budget` (total ADL fills
+/// for the whole `updateIndexPrice`). Any residual left unclosed (budget exhausted, or
+/// not enough deeply-in-profit opposite holders) stays open and is re-swept next update.
+///
+/// v1 simplifications: (a) opposite holders with open orders (`margin_reserved` /
+/// `fee_reserved` > 0) are excluded, so no flip-aware reservation recompute / order
+/// auto-cancel is needed — the residual's natural counterparties are the off-book
+/// holders anyway; (b) opposite holders that are themselves below water are skipped
+/// (the sweep liquidates them), never forced into bad debt; cascades from ADL'ing a
+/// thin winner resolve on a later sweep, not by in-`run_adl` recursion.
+pub(crate) fn run_adl<CTX: ContextTr>(
+    context: &mut CTX,
+    loser: Address,
+    market: &Market,
+    mark_price: u64,
+    budget: &mut u32,
+) -> Result<(), PrecompileError> {
+    let mut loser_pos = storage::load_position(context, loser, market.market_id)?;
+    if loser_pos.amount == 0 || *budget == 0 {
+        return Ok(());
+    }
+    let bd = market.base_decimals;
+    let pd = market.price_decimals;
+    let p_b = calc_bankruptcy_price(loser_pos.amount, loser_pos.v_quote_balance, loser_pos.margin, bd, pd)?;
+    if p_b == 0 {
+        return Ok(()); // <=1x residual is never insolvent — nothing to ADL
+    }
+    let loser_is_long = loser_pos.amount > 0;
+
+    // Enumerate + rank opposite-side candidates ONCE (rank stable within this call).
+    let registry = storage::load_position_registry(context, market.market_id)?;
+    let mut cands: Vec<(Address, i128, i128)> = Vec::new(); // (addr, uPnL@mark, equity@mark)
+    for user in registry {
+        if user == loser {
+            continue;
+        }
+        let wp = storage::load_position(context, user, market.market_id)?;
+        if wp.amount == 0 || (wp.amount > 0) == loser_is_long {
+            continue; // flat or same side as the loser
+        }
+        if wp.margin_reserved != 0 || wp.fee_reserved != 0 {
+            continue; // v1: has open orders — skip (avoid reservation recompute)
+        }
+        let eq_mark = calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
+        if eq_mark <= 0 {
+            continue; // itself liquidatable — leave to the sweep
+        }
+        let eq_pb = calc_position_equity(p_b, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
+        if eq_pb < 0 {
+            continue; // cannot absorb at P_b without going insolvent
+        }
+        let notional = calc_value_i64(mark_price, wp.amount, bd, pd)? as i128;
+        cands.push((user, notional + wp.v_quote_balance as i128, eq_mark as i128));
+    }
+    // ROE = uPnL/equity DESC (equity>0), Address ASC tie-break; cross-multiply, no div.
+    // `saturating_mul` is deterministic and cannot panic — both products only approach
+    // i128::MAX at the joint i64 extremes, where a saturated tie deterministically falls
+    // through to the Address tie-break (equal ROE ranking either way).
+    cands.sort_by(|a, b| {
+        let lhs = a.1.saturating_mul(b.2); // uPnL_A * eq_B
+        let rhs = b.1.saturating_mul(a.2); // uPnL_B * eq_A
+        rhs.cmp(&lhs).then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut remaining = loser_pos.amount.unsigned_abs();
+    let loser_close_is_buy = !loser_is_long; // long closes by selling, short by buying
+    let winner_close_is_buy = loser_is_long; // opposite side
+    let mut loser_account = storage::load_account(context, loser)?;
+    let mut did_any = false;
+
+    for (winner, _, _) in cands {
+        if *budget == 0 || remaining == 0 {
+            break;
+        }
+        let mut winner_pos = storage::load_position(context, winner, market.market_id)?;
+        let mut winner_account = storage::load_account(context, winner)?;
+        let take = winner_pos.amount.unsigned_abs().min(remaining);
+        let committed = adl_fill(
+            &mut loser_pos, &mut loser_account.perp_wallet_balance, loser_close_is_buy,
+            &mut winner_pos, &mut winner_account.perp_wallet_balance, winner_close_is_buy,
+            take, p_b, bd, pd,
+        )?;
+        if committed == 0 {
+            continue; // no clean (bad-debt-free) fill possible — skip this winner
+        }
+        storage::save_position(context, winner, market.market_id, &winner_pos)?;
+        storage::save_account(context, winner, winner_account)?;
+        context.journal_mut().log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::Adl {
+                liquidatedUser: loser,
+                adlUser: winner,
+                marketId: market.market_id,
+                qty: committed,
+                price: p_b,
+            }
+            .to_log_data(),
+        });
+        remaining -= committed;
+        *budget -= 1;
+        did_any = true;
+    }
+
+    if did_any {
+        // Loser residual reduced by the ADL'd quantity. If fully closed the registry
+        // hook drops it; otherwise it stays open and is re-swept next update.
+        storage::save_position(context, loser, market.market_id, &loser_pos)?;
+        storage::save_account(context, loser, loser_account)?;
+    }
+    Ok(())
+}
+
+/// One ADL forced trade: close `take` of both the loser and one opposite holder at
+/// `p_b`, shrinking `take` (bounded) so NEITHER side realizes bad debt from sub-unit
+/// flooring. Both legs use the SAME single-floored `calc_value(p_b, take)`. Returns the
+/// quantity actually closed (0 if no clean fill is possible near `take`).
+#[allow(clippy::too_many_arguments)]
+fn adl_fill(
+    loser_pos: &mut crate::perp_dex::types::PerpPosition,
+    loser_wallet: &mut i64,
+    loser_close_is_buy: bool,
+    winner_pos: &mut crate::perp_dex::types::PerpPosition,
+    winner_wallet: &mut i64,
+    winner_close_is_buy: bool,
+    take: u64,
+    p_b: u64,
+    bd: u32,
+    pd: u32,
+) -> Result<u64, PrecompileError> {
+    use super::settlement::apply_position_fill;
+    let floor = take.saturating_sub(4); // try take, take-1, .., take-4 (dust is <=1-2)
+    let mut t = take;
+    while t > 0 && t > floor {
+        let v = calc_value(p_b, t, bd, pd)?;
+        // Trial on clones; commit only if BOTH sides are bad-debt free.
+        let mut lp = loser_pos.clone();
+        let mut lw = *loser_wallet;
+        let (_, loser_bd) = apply_position_fill(&mut lp, &mut lw, t, v, 0, 0, loser_close_is_buy)?;
+        let mut wp = winner_pos.clone();
+        let mut ww = *winner_wallet;
+        let (_, winner_bd) = apply_position_fill(&mut wp, &mut ww, t, v, 0, 0, winner_close_is_buy)?;
+        if loser_bd == 0 && winner_bd == 0 {
+            *loser_pos = lp;
+            *loser_wallet = lw;
+            *winner_pos = wp;
+            *winner_wallet = ww;
+            return Ok(t);
+        }
+        t -= 1;
+    }
+    Ok(0)
 }
