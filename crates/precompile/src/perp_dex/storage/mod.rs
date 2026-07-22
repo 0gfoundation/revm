@@ -340,66 +340,10 @@ where
     Ok(Some(val))
 }
 
-/// Zero-copy typed read (点1 borrow-read): returns the blob as `Arc<T>` WITHOUT the per-read deep
-/// clone that [`load_cached`] pays. On a #14 cache hit or a cross-block decoded-store hit (选项A)
-/// this is a pure `Arc` refcount bump + `Arc::downcast` — no deserialization AND no struct copy.
-/// Callers read fields via `&*arc` (Deref). Same source precedence as [`load_cached`], so it
-/// returns the identical value; use this for PURE reads (no write-back). RMW paths keep
-/// [`load_cached`] / `perp_get_struct_mut`.
-///
-/// The one path that still copies is an in-block deferred `Struct` overlay write (a key WRITTEN
-/// this block then read back): the overlay owns a UNIQUE `Box`, so it is cloned into a fresh `Arc`
-/// — same cost as `load_cached`, no worse. Cache/cross-block/cold reads (the common case) are the
-/// win.
-fn load_arc<CTX: ContextTr, T>(
-    context: &mut CTX,
-    key: B256,
-) -> Result<Option<std::sync::Arc<T>>, PrecompileError>
-where
-    T: Clone + Send + Sync + 'static + for<'de> Deserialize<'de>,
-{
-    #[cfg(test)]
-    if bench_counter::force_percall() {
-        let buf = load_blob(context, key)?;
-        if buf.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(std::sync::Arc::new(decode(&buf)?)));
-    }
-    // #14 cache tier FIRST: hand back the SAME Arc typed — refcount bump, zero clone. Checked
-    // before `perp_get_struct` because that now also returns cached blobs (as `&`), which would
-    // force a deep clone here; the Arc path preserves the zero-clone bump.
-    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
-        if let Ok(t) = std::sync::Arc::downcast::<T>(arc) {
-            return Ok(Some(t));
-        }
-    }
-    // In-block deferred Struct write: overlay owns a unique Box → clone into an Arc (unavoidable).
-    if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(v) = any.downcast_ref::<T>() {
-            return Ok(Some(std::sync::Arc::new(v.clone())));
-        }
-    }
-    // Cross-block decoded store (选项A): share the Arc into #14 then hand it back typed — zero clone.
-    if let Some(arc) = context
-        .journal_mut()
-        .perp_load_arc(key)
-        .map_err(convert_db_err::<CTX::Db>)?
-    {
-        context.journal_mut().perp_cache_put(key, arc.clone());
-        if let Ok(t) = std::sync::Arc::downcast::<T>(arc) {
-            return Ok(Some(t));
-        }
-    }
-    // Cold read: decode once into an Arc, cache the SAME Arc, return it (saves load_cached's clone).
-    let buf = load_blob(context, key)?;
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    let t: std::sync::Arc<T> = std::sync::Arc::new(decode(&buf)?);
-    context.journal_mut().perp_cache_put(key, t.clone());
-    Ok(Some(t))
-}
+// (Removed `load_arc<T>` — the generic zero-clone Arc reader. Every `_ref` reader now hits the
+// typed store's per-namespace `*_arc` accessor instead; the last caller went away with the bidp/askp
+// cutover. The remaining type-erased read machinery — `load_cached`, `load_level_arc`, the #14 cache
+// tiers — is deleted wholesale in Stage C once every namespace is cut over.)
 
 /// Serializes a type-erased off-trie blob to its canonical bytes — the #16d block-end serializer,
 /// monomorphized per blob type `T` and stored as a fn-ptr in the journal overlay. Produces bytes
