@@ -27,7 +27,7 @@ use primitives::{Address, HashMap, B256};
 use std::sync::Arc;
 use std::vec::Vec;
 
-use crate::perp_dex::storage::{encode, keys};
+use crate::perp_dex::storage::{encode, keys, pack_level, LevelBlob};
 use crate::perp_dex::types::{Market, MarketHot, Order, OrderEntry, PerpPosition, UserAccount};
 use crate::PrecompileError;
 
@@ -46,6 +46,8 @@ enum StoreSlot {
     Order([u8; 32]),
     BidPrices(u64),
     AskPrices(u64),
+    BidLevel(u64, u64),
+    AskLevel(u64, u64),
 }
 
 /// Three-state read result from a typed sub-map.
@@ -100,6 +102,8 @@ pub struct TypedPerpStore {
     orders: HashMap<[u8; 32], Slot<Order>>,
     bid_prices: HashMap<u64, Slot<Vec<u64>>>,
     ask_prices: HashMap<u64, Slot<Vec<u64>>>,
+    bid_levels: HashMap<(u64, u64), Slot<LevelBlob>>,
+    ask_levels: HashMap<(u64, u64), Slot<LevelBlob>>,
     // Stage B extends with the remaining namespaces, same patterns:
     //   bid_levels / ask_levels / bid_prices / ask_prices /
     //   market_fee_total / trade_count / position_registry / api_keys / api_key_ids /
@@ -577,6 +581,98 @@ impl TypedPerpStore {
         self.mark(keys::ask_prices_key(market_id), StoreSlot::AskPrices(market_id));
     }
 
+    // ── per-(market, price) level FIFO blobs (bidl / askl), RAW pack_level codec ──
+    // NOTE: LevelBlob is NOT msgpack — take_delta serializes it via `pack_level`, where
+    // `count == 0` packs to EMPTY bytes = the delete convention. So a level is emptied by setting
+    // count=0 (ids cleared), NOT by a None tombstone; the slot stays `Some(LevelBlob{count:0})` and
+    // the delete manifests only in the delta bytes (byte-identical to the old ser_level path).
+    // A cold-absent level (fill None) reads as an empty default blob, same as `unpack_level("")`.
+
+    /// Resident level blob (`None` = not resident this block → cold path).
+    pub fn bid_level(&self, market_id: u64, price: u64) -> Option<&LevelBlob> {
+        self.bid_levels
+            .get(&(market_id, price))
+            .and_then(|s| s.as_deref())
+    }
+
+    /// Zero-clone shared read (Arc bump); `None` = not resident (miss/cold-absent).
+    pub fn bid_level_arc(&self, market_id: u64, price: u64) -> Option<Arc<LevelBlob>> {
+        self.bid_levels.get(&(market_id, price)).and_then(|s| s.clone())
+    }
+
+    /// Whether the key is resident this block (Some slot present), regardless of live/absent.
+    pub fn bid_level_resident(&self, market_id: u64, price: u64) -> bool {
+        self.bid_levels.contains_key(&(market_id, price))
+    }
+
+    /// Inserts/overwrites the level blob and marks dirty.
+    pub fn set_bid_level(&mut self, market_id: u64, price: u64, value: LevelBlob) {
+        self.mark(keys::bid_level_key(market_id, price), StoreSlot::BidLevel(market_id, price));
+        self.bid_levels.insert((market_id, price), Some(Arc::new(value)));
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark).
+    pub fn fill_bid_level(&mut self, market_id: u64, price: u64, value: Option<Arc<LevelBlob>>) {
+        self.bid_levels.entry((market_id, price)).or_insert(value);
+    }
+
+    /// `&mut` to the resident blob (materialize empty default if deleted/absent), AUTO-marking dirty
+    /// — for the in-place mutators (push / decr). CoW: clone iff shared.
+    pub fn bid_level_mut(&mut self, market_id: u64, price: u64) -> &mut LevelBlob {
+        self.dirty
+            .insert(keys::bid_level_key(market_id, price), StoreSlot::BidLevel(market_id, price));
+        self.write_count += 1;
+        self.tx_dirty = true;
+        Arc::make_mut(
+            self.bid_levels
+                .entry((market_id, price))
+                .or_insert_with(|| Some(Arc::new(LevelBlob::default())))
+                .get_or_insert_with(|| Arc::new(LevelBlob::default())),
+        )
+    }
+
+    /// Resident ask level blob (`None` = not resident). See bid side.
+    pub fn ask_level(&self, market_id: u64, price: u64) -> Option<&LevelBlob> {
+        self.ask_levels
+            .get(&(market_id, price))
+            .and_then(|s| s.as_deref())
+    }
+
+    /// Zero-clone shared read (Arc bump). See bid side.
+    pub fn ask_level_arc(&self, market_id: u64, price: u64) -> Option<Arc<LevelBlob>> {
+        self.ask_levels.get(&(market_id, price)).and_then(|s| s.clone())
+    }
+
+    /// Whether the ask level key is resident this block. See bid side.
+    pub fn ask_level_resident(&self, market_id: u64, price: u64) -> bool {
+        self.ask_levels.contains_key(&(market_id, price))
+    }
+
+    /// Inserts/overwrites and marks dirty. See bid side.
+    pub fn set_ask_level(&mut self, market_id: u64, price: u64, value: LevelBlob) {
+        self.mark(keys::ask_level_key(market_id, price), StoreSlot::AskLevel(market_id, price));
+        self.ask_levels.insert((market_id, price), Some(Arc::new(value)));
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark). See bid side.
+    pub fn fill_ask_level(&mut self, market_id: u64, price: u64, value: Option<Arc<LevelBlob>>) {
+        self.ask_levels.entry((market_id, price)).or_insert(value);
+    }
+
+    /// `&mut` (materialize empty default), AUTO-marking dirty. See bid side.
+    pub fn ask_level_mut(&mut self, market_id: u64, price: u64) -> &mut LevelBlob {
+        self.dirty
+            .insert(keys::ask_level_key(market_id, price), StoreSlot::AskLevel(market_id, price));
+        self.write_count += 1;
+        self.tx_dirty = true;
+        Arc::make_mut(
+            self.ask_levels
+                .entry((market_id, price))
+                .or_insert_with(|| Some(Arc::new(LevelBlob::default())))
+                .get_or_insert_with(|| Arc::new(LevelBlob::default())),
+        )
+    }
+
     /// Number of keys written this block (dirty-set size). Diagnostic / test hook.
     pub fn dirty_len(&self) -> usize {
         self.dirty.len()
@@ -630,6 +726,15 @@ impl TypedPerpStore {
                     Some(Some(v)) => encode(v.as_ref())?,
                     _ => Vec::new(),
                 },
+                // RAW codec (pack_level, not msgpack); count==0 → empty (delete).
+                StoreSlot::BidLevel(m, p) => match self.bid_levels.get(&(m, p)) {
+                    Some(Some(b)) => pack_level(b.as_ref()),
+                    _ => Vec::new(),
+                },
+                StoreSlot::AskLevel(m, p) => match self.ask_levels.get(&(m, p)) {
+                    Some(Some(b)) => pack_level(b.as_ref()),
+                    _ => Vec::new(),
+                },
             };
             out.push((key, bytes));
         }
@@ -665,6 +770,20 @@ impl PerpStore for TypedPerpStore {
                 },
             }
         }
+        // RAW-codec level entry (pack_level, NOT msgpack): count==0 → empty bytes (delete). Mirrors
+        // the overlay's ser_level Struct drain — decoded rides along (选项A), bytes = pack_level.
+        fn level_entry(v: Option<&Slot<LevelBlob>>) -> PerpDeltaEntry {
+            match v {
+                Some(Some(b)) => PerpDeltaEntry {
+                    decoded: Some(b.clone() as Arc<PerpBlob>),
+                    bytes: pack_level(b.as_ref()),
+                },
+                _ => PerpDeltaEntry {
+                    decoded: None,
+                    bytes: Vec::new(),
+                },
+            }
+        }
         for (key, slot) in self.dirty.drain() {
             let e = match slot {
                 StoreSlot::Account(u) => entry(self.accounts.get(&u)),
@@ -676,6 +795,8 @@ impl PerpStore for TypedPerpStore {
                 StoreSlot::Order(id) => entry(self.orders.get(&id)),
                 StoreSlot::BidPrices(m) => entry(self.bid_prices.get(&m)),
                 StoreSlot::AskPrices(m) => entry(self.ask_prices.get(&m)),
+                StoreSlot::BidLevel(m, p) => level_entry(self.bid_levels.get(&(m, p))),
+                StoreSlot::AskLevel(m, p) => level_entry(self.ask_levels.get(&(m, p))),
             };
             out.insert(key, e);
         }

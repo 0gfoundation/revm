@@ -6,7 +6,7 @@ use context::{
     journaled_state::{PerpBlob, PerpDelta},
     ContextTr, JournalTr,
 };
-use primitives::{Address, HashMap, B256, U256};
+use primitives::{Address, B256, U256};
 use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
 
@@ -1328,24 +1328,9 @@ fn mutate_ask_prices<CTX: ContextTr, R>(
     Ok(f(typed_store_mut(context).ask_prices_mut(market_id)))
 }
 
-/// In-place RMW of a level blob (count + ids): fast-path mutates the deferred `Struct` in the
-/// overlay (zero clone); slow-path loads once → mutate → store. Used by [`push_bid_order`] (push id
-/// + count++) and [`decr_level_count`] (count−−).
-fn mutate_level<CTX: ContextTr, R>(
-    context: &mut CTX,
-    key: B256,
-    f: impl FnOnce(&mut LevelBlob) -> R,
-) -> Result<R, PrecompileError> {
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(b) = any.downcast_mut::<LevelBlob>() {
-            return Ok(f(b));
-        }
-    }
-    let mut b = load_level(context, key)?;
-    let r = f(&mut b);
-    save_level(context, key, &b);
-    Ok(r)
-}
+// (Removed the key-based `mutate_level` — superseded by side-aware `mutate_bid_level` /
+// `mutate_ask_level` on the typed store; the RAW-codec level path no longer flows through the
+// type-erased overlay.)
 
 // ── Order book: FIFO queue at a price level ───────────────────────────────────
 
@@ -1381,14 +1366,15 @@ fn unpack_order_ids(buf: &[u8]) -> Result<Vec<[u8; 32]>, PrecompileError> {
 /// = the FIFO (live + lazily-swept stale). Packed raw as `count(8 BE) ++ id0(32) ++ id1(32) ...`
 /// (no msgpack, P4/#20 compactness). `count == 0` means the level is EMPTY → packs to an empty buf
 /// (the delete convention); stale `ids` are discarded on empty.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct LevelBlob {
     pub count: u64,
     pub ids: Vec<[u8; 32]>,
 }
 
 /// Packs a [`LevelBlob`]: empty when the level is empty (count 0) → delete; else count prefix + ids.
-fn pack_level(b: &LevelBlob) -> Vec<u8> {
+/// `pub(crate)` so the typed store's `take_delta` reproduces the RAW (non-msgpack) level codec.
+pub(crate) fn pack_level(b: &LevelBlob) -> Vec<u8> {
     if b.count == 0 {
         return Vec::new();
     }
@@ -1413,108 +1399,92 @@ fn unpack_level(buf: &[u8]) -> Result<LevelBlob, PrecompileError> {
     Ok(LevelBlob { count, ids })
 }
 
-/// Block-end serializer for a level held as a deferred `Struct` (#21): raw `count ++ ids` bytes.
-fn ser_level(v: &PerpBlob) -> Vec<u8> {
-    pack_level(
-        v.downcast_ref::<LevelBlob>()
-            .expect("perp ser_level: level-blob type mismatch (bug)"),
-    )
-}
-
-/// Clones a deferred level `Struct` (keeps the journal overlay `Clone`).
-fn clone_level(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
-    std::boxed::Box::new(
-        v.downcast_ref::<LevelBlob>()
-            .expect("perp clone_level: level-blob type mismatch (bug)")
-            .clone(),
-    )
-}
-
-/// Reads a level FIFO queue. #21: if the queue is in the overlay as a deferred `Struct`
-/// (`Vec<[u8;32]>`), clone it directly (no serialize→unpack round-trip). Otherwise consult the
-/// #14 cold-read cache, then fall back to the committed byte store (cold read + unpack) and cache
-/// the unpacked queue.
-///
-/// Caching the read collapses repeated reads of a level only READ (not yet written) this block —
-/// e.g. the FOK feasibility pre-scan followed by the match pass re-reading the same levels — from
-/// a re-fetch + re-unpack down to a clone. Safe: the write-overlay (`perp_get_struct`) is checked
-/// FIRST and shadows this entry; `store` invalidates the cache per-key; a revert clears the whole
-/// cache; and the cache is excluded from the block delta, so it can never affect the commitment.
-/// Reads a level blob (count + ids), cloned. Single in-block probe (Struct or Cached) → cross-block
-/// decoded store (选项A) → cold byte store (unpack); caches the cold read.
-fn load_level<CTX: ContextTr>(context: &mut CTX, key: B256) -> Result<LevelBlob, PrecompileError> {
-    if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(b) = any.downcast_ref::<LevelBlob>() {
-            return Ok(b.clone());
-        }
-    }
-    if let Some(arc) = context
-        .journal_mut()
-        .perp_load_arc(key)
-        .map_err(convert_db_err::<CTX::Db>)?
-    {
-        if let Some(b) = arc.downcast_ref::<LevelBlob>() {
-            let out = b.clone();
-            context.journal_mut().perp_cache_put(key, arc);
-            return Ok(out);
-        }
-    }
-    let buf = load_blob(context, key)?;
-    if buf.is_empty() {
-        return Ok(LevelBlob::default());
-    }
-    let b = unpack_level(&buf)?;
-    context
-        .journal_mut()
-        .perp_cache_put(key, std::sync::Arc::new(b.clone()));
-    Ok(b)
-}
-
-/// Zero-copy level read (点1): `Arc<LevelBlob>` (ids + count) without a per-read deep clone on a
-/// cache/cross-block hit. The match walk reads ids + count from ONE probe; FOK / getBookLevel read
-/// `.ids`. Same source precedence as [`load_level`].
-fn load_level_arc<CTX: ContextTr>(
+/// Cold read for a level (raw codec): cross-block decoded store (Arc<LevelBlob>, zero clone) →
+/// committed bytes → `unpack_level` once. Mirrors [`cold_load`] but for the non-msgpack level blob.
+fn cold_load_level<CTX: ContextTr>(
     context: &mut CTX,
     key: B256,
-) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
-    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
-        if let Ok(b) = std::sync::Arc::downcast::<LevelBlob>(arc) {
-            return Ok(b);
-        }
-    }
-    if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(b) = any.downcast_ref::<LevelBlob>() {
-            return Ok(std::sync::Arc::new(b.clone()));
-        }
-    }
+) -> Result<Option<std::sync::Arc<LevelBlob>>, PrecompileError> {
     if let Some(arc) = context
         .journal_mut()
         .perp_load_arc(key)
         .map_err(convert_db_err::<CTX::Db>)?
     {
-        context.journal_mut().perp_cache_put(key, arc.clone());
         if let Ok(b) = std::sync::Arc::downcast::<LevelBlob>(arc) {
-            return Ok(b);
+            return Ok(Some(b));
         }
     }
     let buf = load_blob(context, key)?;
     if buf.is_empty() {
-        return Ok(std::sync::Arc::new(LevelBlob::default()));
+        return Ok(None);
     }
-    let b: std::sync::Arc<LevelBlob> = std::sync::Arc::new(unpack_level(&buf)?);
-    context.journal_mut().perp_cache_put(key, b.clone());
-    Ok(b)
+    Ok(Some(std::sync::Arc::new(unpack_level(&buf)?)))
 }
 
-/// Writes a level blob as a deferred `Struct` (#21; packed once at block end by [`ser_level`]).
-/// `count == 0` packs to empty = delete.
-fn save_level<CTX: ContextTr>(context: &mut CTX, key: B256, b: &LevelBlob) {
-    context.journal_mut().perp_store_struct(
-        key,
-        std::boxed::Box::new(b.clone()),
-        ser_level,
-        clone_level,
-    );
+// (Removed `ser_level` / `clone_level` — the overlay deferred-`Struct` level serializer + cloner.
+// The typed store serializes levels directly via `pack_level` in its `take_delta`; the raw-codec
+// level path no longer uses the type-erased overlay's fn-pointer machinery.)
+
+/// Reads a resident bid level blob (typed store) or cold-loads + fills it. A cold-absent level is
+/// the empty default (count 0, no ids) — same as `unpack_level("")`.
+fn bid_level_blob<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
+    if let Some(arc) = typed_store_mut(context).bid_level_arc(market_id, price) {
+        return Ok(arc);
+    }
+    if typed_store_mut(context).bid_level_resident(market_id, price) {
+        return Ok(std::sync::Arc::new(LevelBlob::default())); // resident cold-absent (fill None)
+    }
+    let arc = cold_load_level(context, bid_level_key(market_id, price))?;
+    typed_store_mut(context).fill_bid_level(market_id, price, arc.clone());
+    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(LevelBlob::default())))
+}
+
+fn ask_level_blob<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
+    if let Some(arc) = typed_store_mut(context).ask_level_arc(market_id, price) {
+        return Ok(arc);
+    }
+    if typed_store_mut(context).ask_level_resident(market_id, price) {
+        return Ok(std::sync::Arc::new(LevelBlob::default()));
+    }
+    let arc = cold_load_level(context, ask_level_key(market_id, price))?;
+    typed_store_mut(context).fill_ask_level(market_id, price, arc.clone());
+    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(LevelBlob::default())))
+}
+
+/// In-place RMW of a bid level (count + ids), auto-marking dirty (matches the old unconditional
+/// mutate_level→save_level). Materializes (cold-fill if first touch) then mutates in place.
+fn mutate_bid_level<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    f: impl FnOnce(&mut LevelBlob) -> R,
+) -> Result<R, PrecompileError> {
+    if !typed_store_mut(context).bid_level_resident(market_id, price) {
+        let arc = cold_load_level(context, bid_level_key(market_id, price))?;
+        typed_store_mut(context).fill_bid_level(market_id, price, arc);
+    }
+    Ok(f(typed_store_mut(context).bid_level_mut(market_id, price)))
+}
+
+fn mutate_ask_level<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+    f: impl FnOnce(&mut LevelBlob) -> R,
+) -> Result<R, PrecompileError> {
+    if !typed_store_mut(context).ask_level_resident(market_id, price) {
+        let arc = cold_load_level(context, ask_level_key(market_id, price))?;
+        typed_store_mut(context).fill_ask_level(market_id, price, arc);
+    }
+    Ok(f(typed_store_mut(context).ask_level_mut(market_id, price)))
 }
 
 /// Reads a bid level's FIFO ids (for tests / callers that only need the ids).
@@ -1523,7 +1493,7 @@ pub fn load_bid_level<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    Ok(load_level(context, bid_level_key(market_id, price))?.ids)
+    Ok(bid_level_blob(context, market_id, price)?.ids.clone())
 }
 
 /// Zero-copy bid level read (点1): `Arc<LevelBlob>` (ids + count).
@@ -1532,7 +1502,7 @@ pub fn load_bid_level_arc<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
-    load_level_arc(context, bid_level_key(market_id, price))
+    bid_level_blob(context, market_id, price)
 }
 
 /// Writes a bid level (live `count` + `ids`).
@@ -1543,10 +1513,10 @@ pub fn save_bid_level<CTX: ContextTr>(
     count: u64,
     ids: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    save_level(
-        context,
-        bid_level_key(market_id, price),
-        &LevelBlob {
+    typed_store_mut(context).set_bid_level(
+        market_id,
+        price,
+        LevelBlob {
             count,
             ids: ids.to_vec(),
         },
@@ -1560,7 +1530,7 @@ pub fn load_ask_level<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    Ok(load_level(context, ask_level_key(market_id, price))?.ids)
+    Ok(ask_level_blob(context, market_id, price)?.ids.clone())
 }
 
 /// Zero-copy ask level read (点1): `Arc<LevelBlob>` (ids + count).
@@ -1569,7 +1539,7 @@ pub fn load_ask_level_arc<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
-    load_level_arc(context, ask_level_key(market_id, price))
+    ask_level_blob(context, market_id, price)
 }
 
 /// Writes an ask level (live `count` + `ids`).
@@ -1580,10 +1550,10 @@ pub fn save_ask_level<CTX: ContextTr>(
     count: u64,
     ids: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    save_level(
-        context,
-        ask_level_key(market_id, price),
-        &LevelBlob {
+    typed_store_mut(context).set_ask_level(
+        market_id,
+        price,
+        LevelBlob {
             count,
             ids: ids.to_vec(),
         },
@@ -1654,7 +1624,7 @@ pub fn push_bid_order<CTX: ContextTr>(
     price: u64,
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
-    mutate_level(context, bid_level_key(market_id, price), |b| {
+    mutate_bid_level(context, market_id, price, |b| {
         b.ids.push(order_id);
         b.count += 1;
     })
@@ -1667,7 +1637,7 @@ pub fn push_ask_order<CTX: ContextTr>(
     price: u64,
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
-    mutate_level(context, ask_level_key(market_id, price), |b| {
+    mutate_ask_level(context, market_id, price, |b| {
         b.ids.push(order_id);
         b.count += 1;
     })
@@ -1686,7 +1656,7 @@ pub fn load_bid_count<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_level(context, bid_level_key(market_id, price))?.count)
+    Ok(bid_level_blob(context, market_id, price)?.count)
 }
 
 pub fn load_ask_count<CTX: ContextTr>(
@@ -1694,7 +1664,7 @@ pub fn load_ask_count<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_level(context, ask_level_key(market_id, price))?.count)
+    Ok(ask_level_blob(context, market_id, price)?.count)
 }
 
 /// Decrement a side's level count by `n` (orders removed: cancel / bulk-cancel). Returns the new
@@ -1708,17 +1678,17 @@ pub fn decr_level_count<CTX: ContextTr>(
     n: u64,
 ) -> Result<u64, PrecompileError> {
     use crate::perp_dex::types::Side;
-    let key = match side {
-        Side::Buy => bid_level_key(market_id, price),
-        Side::Sell => ask_level_key(market_id, price),
-    };
-    mutate_level(context, key, |b| {
+    let f = |b: &mut LevelBlob| {
         b.count = b.count.saturating_sub(n);
         if b.count == 0 {
             b.ids.clear();
         }
         b.count
-    })
+    };
+    match side {
+        Side::Buy => mutate_bid_level(context, market_id, price, f),
+        Side::Sell => mutate_ask_level(context, market_id, price, f),
+    }
 }
 
 // ── Best bid / ask cache ──────────────────────────────────────────────────────
