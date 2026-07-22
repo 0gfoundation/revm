@@ -212,7 +212,7 @@ fn rejects_quantity_below_minimum() {
     assert!(err.to_string().contains("below minimum"), "{err}");
 }
 
-// ── Price band (placement) ──────────────────────────────────────────────────
+// ── Price band (fill-time) ──────────────────────────────────────────────────
 
 /// Register a market with an explicit `price_band_bps` (no mark set) and fund
 /// ALICE/BOB generously so far-from-mark acceptance cases can reserve margin.
@@ -259,68 +259,153 @@ fn try_place_limit(ctx: &mut TestCtx, caller: Address, side: u8, price: u64) -> 
 }
 
 #[test]
-fn price_band_rejects_limit_far_above_mark() {
+fn out_of_band_limit_orders_now_rest_at_placement() {
+    // The placement band is GONE: a limit order far from mark is ACCEPTED and rests.
+    // It is harmless — a fill can only ever occur if the mark legitimately reaches it,
+    // and the fill-time band blocks any off-mark cross meanwhile.
     let mut ctx = make_ctx();
-    setup_banded(&mut ctx, 0); // 0 -> DEFAULT_PRICE_BAND_BPS = 1000 bps (+-10%)
+    setup_banded(&mut ctx, 0); // default +-10%
     storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
-    // mark = 100 ticks; upper edge = 110 ticks. 111 is just outside.
-    let err = try_place_limit(&mut ctx, ALICE, 0, 111 * TICK).unwrap_err();
-    assert!(err.to_string().contains("outside price band"), "{err}");
-}
-
-#[test]
-fn price_band_rejects_limit_far_below_mark() {
-    let mut ctx = make_ctx();
-    setup_banded(&mut ctx, 0);
-    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
-    // lower edge = 90 ticks. 89 is just outside.
-    let err = try_place_limit(&mut ctx, ALICE, 1, 89 * TICK).unwrap_err();
-    assert!(err.to_string().contains("outside price band"), "{err}");
-}
-
-#[test]
-fn price_band_accepts_limit_at_edges() {
-    // Upper edge (mark + 10%): a resting bid at exactly the band edge is allowed.
-    let mut ctx = make_ctx();
-    setup_banded(&mut ctx, 0);
-    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    // mark = 100 ticks: a bid 30% above and an ask 60% below both rest, no rejection.
     assert!(
-        try_place_limit(&mut ctx, ALICE, 0, 110 * TICK).is_ok(),
-        "upper-edge order must be accepted"
+        try_place_limit(&mut ctx, ALICE, 0, 130 * TICK).is_ok(),
+        "far-above bid must now rest, not be rejected at placement"
     );
-    // Lower edge (mark - 10%): fresh ctx so the ask does not cross the bid above.
-    let mut ctx = make_ctx();
-    setup_banded(&mut ctx, 0);
-    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
     assert!(
-        try_place_limit(&mut ctx, ALICE, 1, 90 * TICK).is_ok(),
-        "lower-edge order must be accepted"
+        try_place_limit(&mut ctx, BOB, 1, 40 * TICK).is_ok(),
+        "far-below ask must now rest, not be rejected at placement"
     );
 }
 
 #[test]
-fn price_band_honors_configured_bps() {
-    // Explicit 500 bps (+-5%) band, not the default: upper edge = 105 ticks.
+fn fill_band_blocks_buy_against_ask_above_band() {
+    // mark 100, default +-10% -> upper edge 110. An ask at 120 rests, but a crossing buy
+    // must NOT fill it: the fill-time band ends matching at the first ask above mark+band.
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    let ask = try_place_limit(&mut ctx, ALICE, 1, 120 * TICK).unwrap();
+    let ask: [u8; 32] = ask[..32].try_into().unwrap();
+    let _ = try_place_limit(&mut ctx, BOB, 0, 200 * TICK).unwrap(); // crosses 120 in price
+    assert_eq!(
+        get_order(&mut ctx, ask).filled,
+        0,
+        "out-of-band ask must not fill"
+    );
+    assert_eq!(
+        pos(&mut ctx, BOB).amount,
+        0,
+        "buy taker must not fill above the band"
+    );
+}
+
+#[test]
+fn fill_band_skips_buy_against_ask_below_band() {
+    // mark 100, lower edge 90. An ask at 50 (e.g. a closing maker dumping cheap) rests;
+    // a buy taker must SKIP it rather than seize the off-mark price (hole-#1 direction).
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    let ask = try_place_limit(&mut ctx, ALICE, 1, 50 * TICK).unwrap();
+    let ask: [u8; 32] = ask[..32].try_into().unwrap();
+    let _ = try_place_limit(&mut ctx, BOB, 0, 200 * TICK).unwrap();
+    assert_eq!(
+        get_order(&mut ctx, ask).filled,
+        0,
+        "off-mark-cheap ask must be skipped"
+    );
+    assert_eq!(
+        pos(&mut ctx, BOB).amount,
+        0,
+        "buy taker must not fill below the band"
+    );
+}
+
+#[test]
+fn fill_band_blocks_sell_against_bid_below_band() {
+    // mark 100, lower edge 90. A bid at 40 rests, but a crossing sell must NOT fill it.
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    let bid = try_place_limit(&mut ctx, ALICE, 0, 40 * TICK).unwrap();
+    let bid: [u8; 32] = bid[..32].try_into().unwrap();
+    let _ = try_place_limit(&mut ctx, BOB, 1, TICK).unwrap(); // sell crosses 40 in price
+    assert_eq!(
+        get_order(&mut ctx, bid).filled,
+        0,
+        "out-of-band bid must not fill"
+    );
+    assert_eq!(
+        pos(&mut ctx, BOB).amount,
+        0,
+        "sell taker must not fill below the band"
+    );
+}
+
+#[test]
+fn fill_band_skips_sell_against_bid_above_band() {
+    // mark 100, upper edge 110. A bid at 200 (e.g. a closing maker buying rich) rests;
+    // a sell taker must SKIP it (hole-#1 direction).
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    let bid = try_place_limit(&mut ctx, ALICE, 0, 200 * TICK).unwrap();
+    let bid: [u8; 32] = bid[..32].try_into().unwrap();
+    let _ = try_place_limit(&mut ctx, BOB, 1, TICK).unwrap();
+    assert_eq!(
+        get_order(&mut ctx, bid).filled,
+        0,
+        "off-mark-rich bid must be skipped"
+    );
+    assert_eq!(
+        pos(&mut ctx, BOB).amount,
+        0,
+        "sell taker must not fill above the band"
+    );
+}
+
+#[test]
+fn fill_band_allows_fill_at_edge() {
+    // The band edge is inclusive: an ask at exactly mark+10% (110) fills a crossing buy.
+    let mut ctx = make_ctx();
+    setup_banded(&mut ctx, 0);
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    let _ = try_place_limit(&mut ctx, ALICE, 1, 110 * TICK).unwrap(); // ask at edge
+    let _ = try_place_limit(&mut ctx, BOB, 0, 110 * TICK).unwrap(); // buy fills at edge
+    assert!(
+        pos(&mut ctx, BOB).amount > 0,
+        "buy must fill at the band edge"
+    );
+    assert!(
+        pos(&mut ctx, ALICE).amount < 0,
+        "maker sell must fill at the band edge"
+    );
+}
+
+#[test]
+fn fill_band_honors_configured_bps() {
+    // Explicit 500 bps (+-5%) -> upper edge 105. An ask at 106 is out of band (no fill).
     let mut ctx = make_ctx();
     setup_banded(&mut ctx, 500);
     storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
-    assert!(
-        try_place_limit(&mut ctx, ALICE, 0, 105 * TICK).is_ok(),
-        "order at the 5% edge must be accepted"
+    let ask = try_place_limit(&mut ctx, ALICE, 1, 106 * TICK).unwrap();
+    let ask: [u8; 32] = ask[..32].try_into().unwrap();
+    let _ = try_place_limit(&mut ctx, BOB, 0, 200 * TICK).unwrap();
+    assert_eq!(
+        get_order(&mut ctx, ask).filled,
+        0,
+        "ask just outside the 5% band must not fill"
     );
-    let err = try_place_limit(&mut ctx, BOB, 0, 106 * TICK).unwrap_err();
-    assert!(err.to_string().contains("outside price band"), "{err}");
-}
 
-#[test]
-fn price_band_disabled_by_large_bps() {
-    // A large band effectively disables the check: a 3x-mark order is accepted.
+    // Fresh ctx: an ask at the 5% edge (105) fills.
     let mut ctx = make_ctx();
-    setup_banded(&mut ctx, 1_000_000);
+    setup_banded(&mut ctx, 500);
     storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    let _ = try_place_limit(&mut ctx, ALICE, 1, 105 * TICK).unwrap();
+    let _ = try_place_limit(&mut ctx, BOB, 0, 105 * TICK).unwrap();
     assert!(
-        try_place_limit(&mut ctx, ALICE, 0, 300 * TICK).is_ok(),
-        "large-band order far from mark must be accepted"
+        pos(&mut ctx, BOB).amount > 0,
+        "ask at the 5% edge must fill"
     );
 }
 
@@ -415,19 +500,6 @@ fn position_registry_tracks_open_positions() {
     assert!(storage::load_position_registry(&mut ctx, m)
         .unwrap()
         .is_empty());
-}
-
-#[test]
-fn price_band_skipped_when_mark_unset() {
-    // No mark set (mark == 0): the band cannot be evaluated, so it is skipped.
-    // markets created via addMarket always have a mark, so this only affects
-    // save_market-based fixtures.
-    let mut ctx = make_ctx();
-    setup_banded(&mut ctx, 0);
-    assert!(
-        try_place_limit(&mut ctx, ALICE, 0, 300 * TICK).is_ok(),
-        "with no mark the band must not reject"
-    );
 }
 
 #[test]
