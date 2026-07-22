@@ -98,9 +98,25 @@ pub struct TypedPerpStore {
     /// the last-written one). Mirrors the phase-1 `dirty_keys` list, but carries the typed slot so
     /// `take_delta` needs no packed-key parsing. Drained by [`TypedPerpStore::take_delta`].
     dirty: HashMap<B256, StoreSlot>,
+    /// Monotonic write counter — the typed-store half of the commit-only #23 tripwire (summed with
+    /// the overlay's counter by the journal). Cutover namespaces would otherwise be invisible to
+    /// the write-then-revert detector.
+    write_count: u64,
+    /// Whether the CURRENT transaction wrote this store (reset at tx boundaries by the journal) —
+    /// the typed-store half of the `discard_tx` corruption guard.
+    tx_dirty: bool,
 }
 
 impl TypedPerpStore {
+    /// Single write-bookkeeping choke point: dirty-set entry (delta membership) + tripwire
+    /// counters. Every state-changing accessor funnels through here — the typed-store analogue of
+    /// the overlay's `store_struct`/`store_bytes` bookkeeping.
+    fn mark(&mut self, key: B256, slot: StoreSlot) {
+        self.dirty.insert(key, slot);
+        self.write_count += 1;
+        self.tx_dirty = true;
+    }
+
     // ── per-user account ───────────────────────────────────────────────────────
     /// Three-state read of a user's account (see [`Resident`]).
     pub fn account(&self, user: Address) -> Resident<'_, UserAccount> {
@@ -118,26 +134,44 @@ impl TypedPerpStore {
     pub fn account_mut(&mut self, user: Address) -> Option<&mut UserAccount> {
         match self.accounts.get_mut(&user) {
             Some(Some(a)) => {
+                // Inlined `mark` (disjoint-field borrows: `a` holds `accounts`).
                 self.dirty
                     .insert(keys::account_key(user), StoreSlot::Account(user));
+                self.write_count += 1;
+                self.tx_dirty = true;
                 Some(Arc::make_mut(a))
             }
             _ => None,
         }
     }
 
+    /// Zero-clone shared read for the `load_*_ref` path: hands back the sub-map's Arc (refcount
+    /// bump). Same three states as [`Self::account`], flattened: `Some(arc)` = hit; `None` covers
+    /// BOTH deleted and miss — callers needing the distinction use [`Self::account`] first.
+    pub fn account_arc(&self, user: Address) -> Option<Arc<UserAccount>> {
+        self.accounts.get(&user).and_then(|s| s.clone())
+    }
+
+    /// Cold-fill from the cross-block committed store: stores the SAME Arc (zero clone) WITHOUT
+    /// marking dirty — a fill is a cache event, not a write (exactly `cache_put` semantics; a
+    /// dirty mark here would inject a spurious key into the block delta = commitment fork).
+    /// `None` caches ABSENCE (repeated missing-key loads stop re-probing the DB; not a tombstone —
+    /// no dirty mark, so nothing is emitted at block end). Never overwrites an existing entry
+    /// (write-wins, mirroring `cache_put`).
+    pub fn fill_account(&mut self, user: Address, value: Option<Arc<UserAccount>>) {
+        self.accounts.entry(user).or_insert(value);
+    }
+
     /// Inserts/overwrites a user's account and marks its key dirty.
     pub fn set_account(&mut self, user: Address, value: UserAccount) {
-        self.dirty
-            .insert(keys::account_key(user), StoreSlot::Account(user));
+        self.mark(keys::account_key(user), StoreSlot::Account(user));
         self.accounts.insert(user, Some(Arc::new(value)));
     }
 
     /// Removes a user's account: leaves a resident tombstone (reads → [`Resident::Deleted`]) and
     /// marks the key dirty (block-end delta emits empty bytes).
     pub fn remove_account(&mut self, user: Address) {
-        self.dirty
-            .insert(keys::account_key(user), StoreSlot::Account(user));
+        self.mark(keys::account_key(user), StoreSlot::Account(user));
         self.accounts.insert(user, None);
     }
 
@@ -155,8 +189,11 @@ impl TypedPerpStore {
     pub fn market_mut(&mut self, market_id: u64) -> Option<&mut Market> {
         match self.markets.get_mut(&market_id) {
             Some(Some(m)) => {
+                // Inlined `mark` (disjoint-field borrows: `m` holds `markets`).
                 self.dirty
                     .insert(keys::market_key(market_id), StoreSlot::Market(market_id));
+                self.write_count += 1;
+                self.tx_dirty = true;
                 Some(Arc::make_mut(m))
             }
             _ => None,
@@ -165,8 +202,7 @@ impl TypedPerpStore {
 
     /// Inserts/overwrites a market and marks its key dirty.
     pub fn set_market(&mut self, market_id: u64, value: Market) {
-        self.dirty
-            .insert(keys::market_key(market_id), StoreSlot::Market(market_id));
+        self.mark(keys::market_key(market_id), StoreSlot::Market(market_id));
         self.markets.insert(market_id, Some(Arc::new(value)));
     }
 
@@ -184,10 +220,13 @@ impl TypedPerpStore {
     pub fn position_mut(&mut self, user: Address, market_id: u64) -> Option<&mut PerpPosition> {
         match self.positions.get_mut(&(user, market_id)) {
             Some(Some(p)) => {
+                // Inlined `mark` (disjoint-field borrows: `p` holds `positions`).
                 self.dirty.insert(
                     keys::position_key(user, market_id),
                     StoreSlot::Position(user, market_id),
                 );
+                self.write_count += 1;
+                self.tx_dirty = true;
                 Some(Arc::make_mut(p))
             }
             _ => None,
@@ -196,19 +235,19 @@ impl TypedPerpStore {
 
     /// Inserts/overwrites a position and marks its key dirty.
     pub fn set_position(&mut self, user: Address, market_id: u64, value: PerpPosition) {
-        self.dirty.insert(
+        self.mark(
             keys::position_key(user, market_id),
             StoreSlot::Position(user, market_id),
-        );
+            );
         self.positions.insert((user, market_id), Some(Arc::new(value)));
     }
 
     /// Removes a position: resident tombstone + dirty mark (delta emits empty bytes).
     pub fn remove_position(&mut self, user: Address, market_id: u64) {
-        self.dirty.insert(
+        self.mark(
             keys::position_key(user, market_id),
             StoreSlot::Position(user, market_id),
-        );
+            );
         self.positions.insert((user, market_id), None);
     }
 
@@ -293,6 +332,18 @@ impl PerpStore for TypedPerpStore {
 
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
         self
+    }
+
+    fn write_count(&self) -> u64 {
+        self.write_count
+    }
+
+    fn tx_dirty(&self) -> bool {
+        self.tx_dirty
+    }
+
+    fn reset_tx_dirty(&mut self) {
+        self.tx_dirty = false;
     }
 }
 

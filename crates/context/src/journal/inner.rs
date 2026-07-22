@@ -538,10 +538,16 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         self.perp_commitment_log.len()
     }
 
-    /// Monotonic count of off-trie overlay writes on this journal (commit-only #23 tripwire).
+    /// Monotonic count of off-trie perp writes on this journal (commit-only #23 tripwire):
+    /// overlay writes + typed live-store writes, so cutover namespaces stay visible.
     #[inline]
     pub fn perp_write_count(&self) -> u64 {
         self.perp.write_count
+            + self
+                .perp_live
+                .as_ref()
+                .map(|s| s.write_count())
+                .unwrap_or(0)
     }
 
     /// Prepare for next transaction, by committing the current journal to history, incrementing the transaction id
@@ -570,8 +576,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
         let _ = state;
-        // Live store is block-scoped like `perp` — kept across tx boundaries.
-        let _ = perp_live;
+        // Live store is block-scoped like `perp` — kept across tx boundaries; only its per-tx
+        // dirty flag resets (mirrors `perp.dirty_this_tx` below).
+        if let Some(s) = perp_live.as_mut() {
+            s.reset_tx_dirty();
+        }
         transient_storage.clear();
         *depth = 0;
 
@@ -609,9 +618,6 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             perp_commitment_log,
             perp_live,
         } = self;
-        // Live store is block-scoped like `perp` — kept (commit-only; the dirty_this_tx guard
-        // below is the discard-after-write tripwire for both).
-        let _ = perp_live;
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
         journal.drain(..).rev().for_each(|entry| {
@@ -626,6 +632,15 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             !perp.dirty_this_tx,
             "discard_tx after perp writes: commit-only invariant violated"
         );
+        // Same guard for the typed live store (cutover namespaces bypass the overlay); reset the
+        // flag after the check like `dirty_this_tx` — the store itself is block-scoped and kept.
+        if let Some(s) = perp_live.as_mut() {
+            assert!(
+                !s.tx_dirty(),
+                "discard_tx after perp live-store writes: commit-only invariant violated"
+            );
+            s.reset_tx_dirty();
+        }
         // Call-scoped commitment log must be empty at this tx boundary; reset defensively.
         perp_commitment_log.clear();
         transient_storage.clear();
@@ -661,8 +676,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
         // Live store is block-scoped like `perp.working` below — NOT cleared per-tx here; its
-        // dirty set drains at the end-of-block `take_perp_delta` harvest.
-        let _ = perp_live;
+        // dirty set drains at the end-of-block `take_perp_delta` harvest. Only the per-tx dirty
+        // flag resets (mirrors `perp.dirty_this_tx`).
+        if let Some(s) = perp_live.as_mut() {
+            s.reset_tx_dirty();
+        }
         // Clear coinbase address warming for next tx
         warm_addresses.clear_coinbase();
 

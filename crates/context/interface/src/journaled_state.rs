@@ -85,6 +85,20 @@ pub trait PerpStore: core::fmt::Debug + core::any::Any + Send + Sync {
 
     /// Upcast for the precompile's per-op `downcast_mut` to the concrete typed store.
     fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
+
+    /// Monotonic write counter — the typed-store half of the commit-only #23 tripwire. The journal
+    /// SUMS this with the overlay's counter in [`JournalTr::perp_write_count`], so namespaces cut
+    /// over to the typed store stay visible to the write-then-revert detector.
+    fn write_count(&self) -> u64;
+
+    /// Whether the CURRENT transaction wrote this store — the typed-store half of the
+    /// `discard_tx` corruption guard (commit-only: a tx-level abort after a perp write is a
+    /// corruption-anyway condition and must halt loudly).
+    fn tx_dirty(&self) -> bool;
+
+    /// Resets the per-tx dirty flag; called by the journal at tx boundaries
+    /// (commit/discard/finalize), mirroring the overlay's `dirty_this_tx` reset.
+    fn reset_tx_dirty(&mut self);
 }
 
 impl Clone for std::boxed::Box<dyn PerpStore> {

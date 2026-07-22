@@ -466,11 +466,67 @@ pub fn save_admin<CTX: ContextTr>(
 
 // ── UserAccount ───────────────────────────────────────────────────────────────
 
+// ── Typed live store (Stage B cutover) ────────────────────────────────────────
+// The `acct` namespace is the first to run on the strongly-typed `TypedPerpStore` instead of the
+// type-erased overlay: reads/writes hit a typed sub-map (one whole-store downcast + one natural-key
+// probe) instead of the 4-probe B256 overlay dance. Canonical bytes (same `encode`) and delta
+// key-set semantics are unchanged, so the block commitment is byte-identical (golden-neutral).
+
+/// Per-op handle to the typed live store: installs it on first touch, then downcasts the opaque
+/// journal slot (whole-store erasure — one `TypeId` compare, not per-blob).
+fn typed_store_mut<CTX: ContextTr>(context: &mut CTX) -> &mut crate::perp_dex::typed_store::TypedPerpStore {
+    let journal = context.journal_mut();
+    if journal.perp_live_get_mut().is_none() {
+        journal.perp_live_init(std::boxed::Box::new(
+            crate::perp_dex::typed_store::TypedPerpStore::default(),
+        ));
+    }
+    journal
+        .perp_live_get_mut()
+        .expect("perp live store just initialized")
+        .as_any_mut()
+        .downcast_mut::<crate::perp_dex::typed_store::TypedPerpStore>()
+        .expect("perp live store is TypedPerpStore")
+}
+
+/// Cold path for the `acct` namespace: cross-block decoded store (Arc, zero clone) → committed
+/// bytes (decode once). Fills the typed store (cache semantics, no dirty mark; absence cached
+/// too) and returns the Arc. Mirrors `load_cached`'s tier 2+3 for the pre-cutover path.
+fn cold_fill_account<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+) -> Result<Option<std::sync::Arc<UserAccount>>, PrecompileError> {
+    let key = account_key(user);
+    // 选项A decoded store first (already-decoded Arc, no deserialization).
+    let mut arc: Option<std::sync::Arc<UserAccount>> = context
+        .journal_mut()
+        .perp_load_arc(key)
+        .map_err(convert_db_err::<CTX::Db>)?
+        .and_then(|any| std::sync::Arc::downcast::<UserAccount>(any).ok());
+    // Bytes fallback (overlay bytes or committed store) → decode once.
+    if arc.is_none() {
+        let buf = load_blob(context, key)?;
+        if !buf.is_empty() {
+            arc = Some(std::sync::Arc::new(decode::<UserAccount>(&buf)?));
+        }
+    }
+    typed_store_mut(context).fill_account(user, arc.clone());
+    Ok(arc)
+}
+
 pub fn load_account<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<UserAccount, PrecompileError> {
-    Ok(load_cached::<_, UserAccount>(context, account_key(user))?.unwrap_or_default())
+    use crate::perp_dex::typed_store::Resident;
+    match typed_store_mut(context).account(user) {
+        Resident::Hit(a) => return Ok(a.clone()),
+        Resident::Deleted => return Ok(UserAccount::default()),
+        Resident::Miss => {}
+    }
+    Ok(cold_fill_account(context, user)?
+        .map(|a| (*a).clone())
+        .unwrap_or_default())
 }
 
 /// Zero-copy account read (点1): `Arc<UserAccount>`, no per-read clone. Defaulted like
@@ -480,7 +536,16 @@ pub fn load_account_ref<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<std::sync::Arc<UserAccount>, PrecompileError> {
-    Ok(load_arc::<_, UserAccount>(context, account_key(user))?
+    use crate::perp_dex::typed_store::Resident;
+    // Hot path: resident Arc, refcount bump only.
+    if let Some(arc) = typed_store_mut(context).account_arc(user) {
+        return Ok(arc);
+    }
+    // Deleted (definitively absent) must NOT fall through to the stale committed store.
+    if matches!(typed_store_mut(context).account(user), Resident::Deleted) {
+        return Ok(std::sync::Arc::new(UserAccount::default()));
+    }
+    Ok(cold_fill_account(context, user)?
         .unwrap_or_else(|| std::sync::Arc::new(UserAccount::default())))
 }
 
@@ -489,7 +554,8 @@ pub fn save_account<CTX: ContextTr>(
     user: Address,
     account: UserAccount,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, account_key(user), &account)
+    typed_store_mut(context).set_account(user, account);
+    Ok(())
 }
 
 /// In-place RMW of a user's account blob (mirror of [`mutate_buy_orders`]): fast-path mutates the
@@ -504,15 +570,14 @@ pub fn mutate_account<CTX: ContextTr, R>(
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,
 ) -> Result<R, PrecompileError> {
-    let key = account_key(user);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(a) = any.downcast_mut::<UserAccount>() {
-            return Ok(f(a));
-        }
+    // Fast path: resident in the typed store → in-place &mut (CoW lift on first write).
+    if let Some(a) = typed_store_mut(context).account_mut(user) {
+        return Ok(f(a));
     }
-    let mut a: UserAccount = load_cached(context, key)?.unwrap_or_default();
+    // Cold/deleted: materialize once (fills the store), mutate, store the result.
+    let mut a = load_account(context, user)?;
     let r = f(&mut a);
-    save_cached(context, key, &a)?;
+    typed_store_mut(context).set_account(user, a);
     Ok(r)
 }
 
