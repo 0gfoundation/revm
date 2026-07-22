@@ -200,6 +200,16 @@ impl TypedPerpStore {
         }
     }
 
+    /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss (see [`Self::account_arc`]).
+    pub fn market_arc(&self, market_id: u64) -> Option<Arc<Market>> {
+        self.markets.get(&market_id).and_then(|s| s.clone())
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark; see [`Self::fill_account`]).
+    pub fn fill_market(&mut self, market_id: u64, value: Option<Arc<Market>>) {
+        self.markets.entry(market_id).or_insert(value);
+    }
+
     /// Inserts/overwrites a market and marks its key dirty.
     pub fn set_market(&mut self, market_id: u64, value: Market) {
         self.mark(keys::market_key(market_id), StoreSlot::Market(market_id));
@@ -231,6 +241,21 @@ impl TypedPerpStore {
             }
             _ => None,
         }
+    }
+
+    /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss (see [`Self::account_arc`]).
+    pub fn position_arc(&self, user: Address, market_id: u64) -> Option<Arc<PerpPosition>> {
+        self.positions.get(&(user, market_id)).and_then(|s| s.clone())
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark; see [`Self::fill_account`]).
+    pub fn fill_position(
+        &mut self,
+        user: Address,
+        market_id: u64,
+        value: Option<Arc<PerpPosition>>,
+    ) {
+        self.positions.entry((user, market_id)).or_insert(value);
     }
 
     /// Inserts/overwrites a position and marks its key dirty.

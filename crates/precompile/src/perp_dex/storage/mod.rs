@@ -489,28 +489,61 @@ fn typed_store_mut<CTX: ContextTr>(context: &mut CTX) -> &mut crate::perp_dex::t
         .expect("perp live store is TypedPerpStore")
 }
 
-/// Cold path for the `acct` namespace: cross-block decoded store (Arc, zero clone) → committed
-/// bytes (decode once). Fills the typed store (cache semantics, no dirty mark; absence cached
-/// too) and returns the Arc. Mirrors `load_cached`'s tier 2+3 for the pre-cutover path.
-fn cold_fill_account<CTX: ContextTr>(
+/// Generic cold read for a cutover namespace: cross-block decoded store (Arc, zero clone) →
+/// committed bytes (decode once). Mirrors `load_cached`'s tier 2+3. The caller fills its typed
+/// sub-map (fill is per-namespace).
+fn cold_load<CTX: ContextTr, T>(
     context: &mut CTX,
-    user: Address,
-) -> Result<Option<std::sync::Arc<UserAccount>>, PrecompileError> {
-    let key = account_key(user);
+    key: B256,
+) -> Result<Option<std::sync::Arc<T>>, PrecompileError>
+where
+    T: Send + Sync + 'static + for<'de> Deserialize<'de>,
+{
     // 选项A decoded store first (already-decoded Arc, no deserialization).
-    let mut arc: Option<std::sync::Arc<UserAccount>> = context
+    let mut arc: Option<std::sync::Arc<T>> = context
         .journal_mut()
         .perp_load_arc(key)
         .map_err(convert_db_err::<CTX::Db>)?
-        .and_then(|any| std::sync::Arc::downcast::<UserAccount>(any).ok());
+        .and_then(|any| std::sync::Arc::downcast::<T>(any).ok());
     // Bytes fallback (overlay bytes or committed store) → decode once.
     if arc.is_none() {
         let buf = load_blob(context, key)?;
         if !buf.is_empty() {
-            arc = Some(std::sync::Arc::new(decode::<UserAccount>(&buf)?));
+            arc = Some(std::sync::Arc::new(decode::<T>(&buf)?));
         }
     }
+    Ok(arc)
+}
+
+/// Cold path for the `acct` namespace: [`cold_load`] + fill (cache semantics, no dirty mark;
+/// absence cached too).
+fn cold_fill_account<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+) -> Result<Option<std::sync::Arc<UserAccount>>, PrecompileError> {
+    let arc = cold_load::<_, UserAccount>(context, account_key(user))?;
     typed_store_mut(context).fill_account(user, arc.clone());
+    Ok(arc)
+}
+
+/// Cold path for the `mkt` namespace (see [`cold_fill_account`]).
+fn cold_fill_market<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<Option<std::sync::Arc<Market>>, PrecompileError> {
+    let arc = cold_load::<_, Market>(context, market_key(market_id))?;
+    typed_store_mut(context).fill_market(market_id, arc.clone());
+    Ok(arc)
+}
+
+/// Cold path for the `pos` namespace (see [`cold_fill_account`]).
+fn cold_fill_position<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+) -> Result<Option<std::sync::Arc<PerpPosition>>, PrecompileError> {
+    let arc = cold_load::<_, PerpPosition>(context, position_key(user, market_id))?;
+    typed_store_mut(context).fill_position(user, market_id, arc.clone());
     Ok(arc)
 }
 
@@ -681,7 +714,15 @@ pub fn load_position<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<PerpPosition, PrecompileError> {
-    Ok(load_cached::<_, PerpPosition>(context, position_key(user, market_id))?.unwrap_or_default())
+    use crate::perp_dex::typed_store::Resident;
+    match typed_store_mut(context).position(user, market_id) {
+        Resident::Hit(p) => return Ok(p.clone()),
+        Resident::Deleted => return Ok(PerpPosition::default()),
+        Resident::Miss => {}
+    }
+    Ok(cold_fill_position(context, user, market_id)?
+        .map(|p| (*p).clone())
+        .unwrap_or_default())
 }
 
 /// Zero-copy position read (点1): `Arc<PerpPosition>`, no per-read clone. Defaulted like
@@ -693,10 +734,20 @@ pub fn load_position_ref<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<std::sync::Arc<PerpPosition>, PrecompileError> {
-    Ok(
-        load_arc::<_, PerpPosition>(context, position_key(user, market_id))?
-            .unwrap_or_else(|| std::sync::Arc::new(PerpPosition::default())),
-    )
+    use crate::perp_dex::typed_store::Resident;
+    // Hot path: resident Arc, refcount bump only.
+    if let Some(arc) = typed_store_mut(context).position_arc(user, market_id) {
+        return Ok(arc);
+    }
+    // Deleted (definitively absent) must NOT fall through to the stale committed store.
+    if matches!(
+        typed_store_mut(context).position(user, market_id),
+        Resident::Deleted
+    ) {
+        return Ok(std::sync::Arc::new(PerpPosition::default()));
+    }
+    Ok(cold_fill_position(context, user, market_id)?
+        .unwrap_or_else(|| std::sync::Arc::new(PerpPosition::default())))
 }
 
 pub fn save_position<CTX: ContextTr>(
@@ -709,14 +760,15 @@ pub fn save_position<CTX: ContextTr>(
     // save_position is the single choke point for ALL position writes, so this hook
     // cannot be missed. The registry is only touched when membership changes
     // (open: 0 -> !=0, close: !=0 -> 0); every other save pays just one
-    // overlay-cheap position read (the position is already in the working set).
+    // typed-sub-map-cheap position read (the position is already resident).
     let old_amount = load_position_ref(context, user, market_id)?.amount;
     if old_amount == 0 && pos.amount != 0 {
         registry_add(context, market_id, user)?;
     } else if old_amount != 0 && pos.amount == 0 {
         registry_remove(context, market_id, user)?;
     }
-    save_cached(context, position_key(user, market_id), pos)
+    typed_store_mut(context).set_position(user, market_id, pos.clone());
+    Ok(())
 }
 
 // ── Per-market open-position registry ──────────────────────────────────────
@@ -987,7 +1039,13 @@ pub fn load_market<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<Option<Market>, PrecompileError> {
-    load_cached::<_, Market>(context, market_key(market_id))
+    use crate::perp_dex::typed_store::Resident;
+    match typed_store_mut(context).market(market_id) {
+        Resident::Hit(m) => return Ok(Some(m.clone())),
+        Resident::Deleted => return Ok(None),
+        Resident::Miss => {}
+    }
+    Ok(cold_fill_market(context, market_id)?.map(|m| (*m).clone()))
 }
 
 /// Zero-copy market read (点1): `Arc<Market>`, no per-read clone. PURE reads only (params / mark /
@@ -996,36 +1054,49 @@ pub fn load_market_ref<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<Option<std::sync::Arc<Market>>, PrecompileError> {
-    load_arc::<_, Market>(context, market_key(market_id))
+    use crate::perp_dex::typed_store::Resident;
+    // Hot path: resident Arc, refcount bump only.
+    if let Some(arc) = typed_store_mut(context).market_arc(market_id) {
+        return Ok(Some(arc));
+    }
+    // Deleted (definitively absent) must NOT fall through to the stale committed store.
+    if matches!(
+        typed_store_mut(context).market(market_id),
+        Resident::Deleted
+    ) {
+        return Ok(None);
+    }
+    cold_fill_market(context, market_id)
 }
 
 pub fn save_market<CTX: ContextTr>(
     context: &mut CTX,
     market: &Market,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, market_key(market.market_id), market)
+    typed_store_mut(context).set_market(market.market_id, market.clone());
+    Ok(())
 }
 
-/// In-place RMW of the Market blob (mirror of [`mutate_account`]): fast-path mutates the deferred
-/// `Struct` already in the overlay (zero clone); slow-path loads once → mutate → store. Used by
-/// [`save_mark_price`] to set the mark field without a full load+save owned clone pair. Errors on a
-/// market that was never saved (rather than fabricate a phantom zero Market) — every caller
-/// (`updateIndexPrice`, tests) writes the full Market first, so this never fires in practice.
+/// In-place RMW of the Market blob (mirror of [`mutate_account`]): fast-path mutates the value
+/// resident in the typed store (CoW lift on first write, in-place thereafter); slow-path loads
+/// once → mutate → store. Used by [`save_mark_price`] to set the mark field without a full
+/// load+save owned clone pair. Errors on a market that was never saved (rather than fabricate a
+/// phantom zero Market) — every caller (`updateIndexPrice`, tests) writes the full Market first,
+/// so this never fires in practice.
 fn mutate_market<CTX: ContextTr, R>(
     context: &mut CTX,
     market_id: u64,
     f: impl FnOnce(&mut Market) -> R,
 ) -> Result<R, PrecompileError> {
-    let key = market_key(market_id);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(m) = any.downcast_mut::<Market>() {
-            return Ok(f(m));
-        }
+    // Fast path: resident in the typed store → in-place &mut.
+    if let Some(m) = typed_store_mut(context).market_mut(market_id) {
+        return Ok(f(m));
     }
-    let mut m: Market =
-        load_cached(context, key)?.ok_or_else(|| perp_err("mutate_market: unknown market"))?;
+    // Cold/deleted: materialize once (fills the store), mutate, store the result.
+    let mut m = load_market(context, market_id)?
+        .ok_or_else(|| perp_err("mutate_market: unknown market"))?;
     let r = f(&mut m);
-    save_cached(context, key, &m)?;
+    typed_store_mut(context).set_market(market_id, m);
     Ok(r)
 }
 
