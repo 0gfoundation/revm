@@ -6,7 +6,8 @@ use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
     journaled_state::{
-        AccountLoad, JournalCheckpoint, PerpBlob, PerpDelta, PerpDeltaEntry, TransferError,
+        AccountLoad, JournalCheckpoint, PerpBlob, PerpDelta, PerpDeltaEntry, PerpStore,
+        TransferError,
     },
 };
 use core::mem;
@@ -373,6 +374,13 @@ pub struct JournalInner<ENTRY> {
     /// length is snapshotted into [`JournalCheckpoint`] and truncated back on revert. Never folded
     /// into [`EvmState`].
     pub perp_commitment_log: Vec<u8>,
+    /// Strongly-typed live off-trie store (live-struct swap, Stage A) — an opaque
+    /// [`PerpStore`] the precompile installs on first touch and downcasts per op. Block-scoped
+    /// like [`Self::perp`]: survives commit_tx/discard_tx/finalize; its dirty set drains into the
+    /// block delta at [`Self::take_perp_delta`]. `None` until the precompile initializes it (and
+    /// always `None` while the overlay remains the authoritative store — Stage B cuts namespaces
+    /// over one by one, with the delta being the union of both sources).
+    pub perp_live: Option<std::boxed::Box<dyn PerpStore>>,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -398,6 +406,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses: WarmAddresses::new(),
             perp: PerpSection::default(),
             perp_commitment_log: Vec::new(),
+            perp_live: None,
         }
     }
 
@@ -474,9 +483,41 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     }
 
     /// Drains the block's net off-trie PerpDEX writes ([`PerpDelta`]).
+    ///
+    /// Union of the overlay drain and the live typed store's dirty set (Stage A/B of the
+    /// live-struct swap: a namespace lives on exactly ONE side, so the key sets are disjoint;
+    /// asserted in debug). Store entries are inserted second, so on a (buggy) collision the typed
+    /// store deterministically wins.
     #[inline]
     pub fn take_perp_delta(&mut self) -> PerpDelta {
-        self.perp.take_delta()
+        let mut delta = self.perp.take_delta();
+        if let Some(store) = self.perp_live.as_mut() {
+            for (k, e) in store.take_delta() {
+                let prev = delta.insert(k, e);
+                debug_assert!(
+                    prev.is_none(),
+                    "perp key {k:?} written via BOTH the overlay and the live store"
+                );
+            }
+        }
+        delta
+    }
+
+    /// Installs the strongly-typed live store (live-struct swap). See
+    /// `JournalTr::perp_live_init` for the seam contract.
+    #[inline]
+    pub fn perp_live_init(&mut self, store: std::boxed::Box<dyn PerpStore>) {
+        debug_assert!(
+            self.perp_live.is_none(),
+            "perp live store initialized twice"
+        );
+        self.perp_live = Some(store);
+    }
+
+    /// Mutable handle to the installed live store (`None` until initialized).
+    #[inline]
+    pub fn perp_live_get_mut(&mut self) -> Option<&mut dyn PerpStore> {
+        self.perp_live.as_deref_mut()
     }
 
     /// Appends framed bytes for one off-trie write to the per-call PerpDEX commitment log.
@@ -524,10 +565,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             perp,
             perp_commitment_log,
+            perp_live,
         } = self;
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
         let _ = state;
+        // Live store is block-scoped like `perp` — kept across tx boundaries.
+        let _ = perp_live;
         transient_storage.clear();
         *depth = 0;
 
@@ -563,7 +607,11 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             perp,
             perp_commitment_log,
+            perp_live,
         } = self;
+        // Live store is block-scoped like `perp` — kept (commit-only; the dirty_this_tx guard
+        // below is the discard-after-write tripwire for both).
+        let _ = perp_live;
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
         journal.drain(..).rev().for_each(|entry| {
@@ -608,9 +656,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             warm_addresses,
             perp,
             perp_commitment_log,
+            perp_live,
         } = self;
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
+        // Live store is block-scoped like `perp.working` below — NOT cleared per-tx here; its
+        // dirty set drains at the end-of-block `take_perp_delta` harvest.
+        let _ = perp_live;
         // Clear coinbase address warming for next tx
         warm_addresses.clear_coinbase();
 

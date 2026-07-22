@@ -61,6 +61,38 @@ impl Eq for PerpDeltaEntry {}
 /// the journal/precompile share one type with the DB cold-read seam. See [`database_interface::PerpBlob`].
 pub use database_interface::PerpBlob;
 
+/// Opaque handle to a strongly-typed off-trie PerpDEX store (live-struct swap, Stage A).
+///
+/// Type erasure at WHOLE-STORE granularity: the journal holds ONE `Box<dyn PerpStore>` and never
+/// names the perp entity types; the precompile owns the concrete store (typed per-namespace
+/// sub-maps) and downcasts once per operation via [`PerpStore::as_any_mut`]. This replaces the
+/// per-blob `dyn Any` overlay tier (downcast + multi-probe per access) without moving perp types
+/// into this crate or changing the DB/reth seam.
+///
+/// Lifecycle mirrors the block-scoped overlay: the store lives in the journal, accumulates writes
+/// across the block's transactions (commit-only — no checkpoint rollback), and its dirty set is
+/// drained into a [`PerpDelta`] at the block-end [`JournalTr::take_perp_delta`] harvest. The store
+/// object itself persists (it is the within-block working set; cross-block reuse still flows
+/// through `Database::perp_load_arc`).
+pub trait PerpStore: core::fmt::Debug + core::any::Any + Send + Sync {
+    /// Drains the store's dirty set into net `(key, canonical bytes)` writes — same contract as
+    /// the overlay drain: one entry per touched key, final value, empty bytes = delete. Encode
+    /// failure is a bug (panics), matching the overlay's `ser` fn-pointer convention.
+    fn take_delta(&mut self) -> PerpDelta;
+
+    /// Clones the store into a fresh box (`JournalInner` is `Clone`; e.g. `Journal::to_inner`).
+    fn clone_box(&self) -> std::boxed::Box<dyn PerpStore>;
+
+    /// Upcast for the precompile's per-op `downcast_mut` to the concrete typed store.
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
+}
+
+impl Clone for std::boxed::Box<dyn PerpStore> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
 /// Trait that contains database and journal of all changes that were made to the state.
 pub trait JournalTr {
     /// Database type that is used in the journal.
@@ -398,6 +430,20 @@ pub trait JournalTr {
     /// consensus state. Journal-local, so the diff is only meaningful within one call. Default: 0.
     fn perp_write_count(&self) -> u64 {
         0
+    }
+
+    /// Installs the strongly-typed live store (live-struct swap, Stage A). Called once by the
+    /// precompile on first touch; later calls in the same journal are a bug (the slot is already
+    /// occupied — see [`JournalTr::perp_live_get_mut`]). Default: drops the store (no perp wired).
+    fn perp_live_init(&mut self, store: std::boxed::Box<dyn PerpStore>) {
+        let _ = store;
+    }
+
+    /// Mutable handle to the installed live store; `None` until [`JournalTr::perp_live_init`] (or
+    /// on journal implementations without perp support). The precompile downcasts the result to
+    /// its concrete typed store once per operation. Default: `None`.
+    fn perp_live_get_mut(&mut self) -> Option<&mut dyn PerpStore> {
+        None
     }
 
     /// Clear current journal resetting it to initial state and return changes state.

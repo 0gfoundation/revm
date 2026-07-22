@@ -13,7 +13,7 @@ use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
     journaled_state::{
-        AccountLoad, JournalCheckpoint, JournalTr, PerpBlob, PerpDelta, TransferError,
+        AccountLoad, JournalCheckpoint, JournalTr, PerpBlob, PerpDelta, PerpStore, TransferError,
     },
 };
 use core::ops::{Deref, DerefMut};
@@ -400,6 +400,16 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
     #[inline]
     fn perp_write_count(&self) -> u64 {
         self.inner.perp_write_count()
+    }
+
+    #[inline]
+    fn perp_live_init(&mut self, store: std::boxed::Box<dyn PerpStore>) {
+        self.inner.perp_live_init(store);
+    }
+
+    #[inline]
+    fn perp_live_get_mut(&mut self) -> Option<&mut dyn PerpStore> {
+        self.inner.perp_live_get_mut()
     }
 
     /// Clear current journal resetting it to initial state and return changes state.

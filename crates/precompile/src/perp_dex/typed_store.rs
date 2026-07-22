@@ -22,7 +22,9 @@
 //! current `get_struct_mut` write-count semantics), and `take_delta` reads each dirty entity's FINAL
 //! value straight from its sub-map (absent = removed = empty bytes = the delete convention).
 
+use context::journaled_state::{PerpBlob, PerpDelta, PerpDeltaEntry, PerpStore};
 use primitives::{Address, HashMap, B256};
+use std::sync::Arc;
 use std::vec::Vec;
 
 use crate::perp_dex::storage::{encode, keys};
@@ -41,7 +43,7 @@ enum StoreSlot {
 }
 
 /// Strongly-typed off-trie store (Stage A). See the module docs.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TypedPerpStore {
     accounts: HashMap<Address, UserAccount>,
     markets: HashMap<u64, Market>,
@@ -182,6 +184,52 @@ impl TypedPerpStore {
     }
 }
 
+/// The whole-store erasure seam (Stage A.2): the journal holds this as `Box<dyn PerpStore>` and
+/// the storage layer downcasts once per op via [`PerpStore::as_any_mut`]. `take_delta` here feeds
+/// the block-end `take_perp_delta` union — entries carry `decoded` (Arc of the typed value, for
+/// the cross-block committed store, 选项A) alongside the canonical bytes, mirroring what the
+/// overlay drain produces for `PerpEntry::Struct`.
+impl PerpStore for TypedPerpStore {
+    fn take_delta(&mut self) -> PerpDelta {
+        let mut out = PerpDelta::default();
+        // Encode failure is a bug (matches the overlay's `ser_blob` convention: the value was
+        // well-formed enough to store, so canonical encoding cannot fail).
+        fn entry<T: serde::Serialize + Clone + Send + Sync + 'static>(
+            v: Option<&T>,
+        ) -> PerpDeltaEntry {
+            match v {
+                Some(v) => PerpDeltaEntry {
+                    decoded: Some(Arc::new(v.clone()) as Arc<PerpBlob>),
+                    bytes: encode(v).expect("perp typed-store encode failure"),
+                },
+                // Removed this block → empty bytes (the delete convention); nothing to retain in
+                // the decoded cross-block store.
+                None => PerpDeltaEntry {
+                    decoded: None,
+                    bytes: Vec::new(),
+                },
+            }
+        }
+        for (key, slot) in self.dirty.drain() {
+            let e = match slot {
+                StoreSlot::Account(u) => entry(self.accounts.get(&u)),
+                StoreSlot::Market(m) => entry(self.markets.get(&m)),
+                StoreSlot::Position(u, m) => entry(self.positions.get(&(u, m))),
+            };
+            out.insert(key, e);
+        }
+        out
+    }
+
+    fn clone_box(&self) -> Box<dyn PerpStore> {
+        Box::new(self.clone())
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +344,56 @@ mod tests {
             delta[0].1.is_empty(),
             "removed entity → empty bytes (delete convention)"
         );
+    }
+
+    /// Stage A.2 end-to-end: install `TypedPerpStore` into a real `Journal` through the
+    /// `JournalTr` seam, write through the per-op downcast, and harvest via `take_perp_delta` —
+    /// the union path the block executor calls. Also proves overlay + live-store deltas merge
+    /// (disjoint keys) and that the live-store entry carries canonical bytes + decoded Arc.
+    #[test]
+    fn journal_seam_install_downcast_write_harvest() {
+        use context::{Journal, JournalTr};
+        use database::InMemoryDB;
+
+        let mut journal: Journal<InMemoryDB> = Journal::new(InMemoryDB::default());
+        let u = addr(0x44);
+
+        // Install through the seam (first touch), then per-op: get_mut → downcast → typed write.
+        journal.perp_live_init(Box::new(TypedPerpStore::default()));
+        {
+            let store = journal
+                .perp_live_get_mut()
+                .expect("installed")
+                .as_any_mut()
+                .downcast_mut::<TypedPerpStore>()
+                .expect("concrete type");
+            let mut acct = UserAccount::default();
+            acct.nonce = 9;
+            store.set_account(u, acct);
+        }
+
+        // A raw overlay write on a DIFFERENT key — the union must carry both.
+        let level_key = keys::bid_level_key(7, 100);
+        journal.perp_store(level_key, vec![1, 2, 3]);
+
+        let delta = journal.take_perp_delta();
+        assert_eq!(delta.len(), 2, "overlay + live-store union");
+        assert_eq!(delta[&level_key].bytes, vec![1, 2, 3]);
+
+        let acct_entry = &delta[&keys::account_key(u)];
+        let mut expect = UserAccount::default();
+        expect.nonce = 9;
+        assert_eq!(acct_entry.bytes, encode(&expect).unwrap(), "canonical bytes");
+        let decoded = acct_entry
+            .decoded
+            .as_ref()
+            .expect("live-store entry carries decoded Arc")
+            .downcast_ref::<UserAccount>()
+            .expect("decoded is the typed value");
+        assert_eq!(decoded.nonce, 9);
+
+        // Dirty set drained: a second harvest is empty.
+        assert!(journal.take_perp_delta().is_empty());
     }
 
     #[test]
