@@ -36,20 +36,6 @@ use crate::{
     PrecompileError,
 };
 
-/// Maker fee using the user's *current* fee rate (placement path). Cancel/fill
-/// paths instead use the rate snapshotted on the order entry, via
-/// `math::calc_maker_fee_for_order_qty_with_bps`.
-fn calc_maker_fee_for_order_qty<CTX: ContextTr>(
-    context: &mut CTX,
-    user: Address,
-    price: u64,
-    qty: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<u64, PrecompileError> {
-    let rates = storage::load_user_fee_rates(context, user)?;
-    calc_maker_fee_for_order_qty_with_bps(price, qty, rates.maker_fee_bps, market)
-}
-
 // ── Public entry-points ───────────────────────────────────────────────────────
 
 /// `placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif) returns (bytes32 orderId)`
@@ -1373,7 +1359,8 @@ fn rest_in_book<CTX: ContextTr>(
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let mut account = storage::load_account(context, user)?;
-    let maker_fee_bps = storage::load_user_fee_rates(context, user)?.maker_fee_bps;
+    // fee rate is a field of the account we already loaded (folded in) — no separate fee-rate read.
+    let maker_fee_bps = account.maker_fee_bps;
     // ONE BBO resolve for both the best-update check and the mid-price sample (was up to two
     // separate load_best_bid/load_best_ask reads per arm).
     let (best_bid, best_ask) = match bbo {
@@ -1416,8 +1403,9 @@ fn rest_in_book<CTX: ContextTr>(
                     pd,
                     pos_amount,
                 )?;
+            // Reuse the maker_fee_bps already read from `account` (no internal fee-rate re-load).
             let order_fee_reserved =
-                calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
+                calc_maker_fee_for_order_qty_with_bps(price, qty, maker_fee_bps, market)?;
             // Adding an order can only grow the buy-side notional (checked before
             // set_reservations overwrites the stored value).
             if new_buy_side_notional < pos.buy_side_reserved_notional {
@@ -1494,8 +1482,9 @@ fn rest_in_book<CTX: ContextTr>(
                     pd,
                     pos_amount,
                 )?;
+            // Reuse the maker_fee_bps already read from `account` (no internal fee-rate re-load).
             let order_fee_reserved =
-                calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
+                calc_maker_fee_for_order_qty_with_bps(price, qty, maker_fee_bps, market)?;
             // Adding an order can only grow the sell-side notional (checked before
             // set_reservations overwrites the stored value).
             if new_sell_side_notional < pos.sell_side_reserved_notional {
