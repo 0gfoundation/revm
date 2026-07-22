@@ -142,11 +142,14 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
         vec![ALICE, MAKER]
     );
 
-    // Crash the mark to $70 via updateIndexPrice (admin) — runs the sweep.
+    // Crash the mark to $85 via updateIndexPrice (admin) — runs the sweep. At $85 the
+    // 5x long is BELOW maintenance but still SOLVENT (equity >= 0), so its empty-book
+    // residual closes at mark (no ADL, no IF); an insolvent residual would instead go
+    // to ADL (see `adl_*` tests).
     run_update_index_price(
         &updateIndexPriceCall {
             marketId: MARKET_ID,
-            indexPrice: 7_000,
+            indexPrice: 8_500,
             timestamp: 31,
         }
         .abi_encode(),
@@ -155,7 +158,7 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
     )
     .unwrap();
 
-    // ALICE was under maintenance -> swept (closed at mark, empty book -> residual);
+    // ALICE was under maintenance -> swept (solvent residual closed at mark, empty book);
     // MAKER stayed healthy -> untouched. Registry now holds only MAKER.
     assert_eq!(
         position(&mut ctx, ALICE).amount,
@@ -227,6 +230,118 @@ fn sweep_liquidates_underwater_user_with_no_free_wallet_for_taker_fee() {
         0,
         "underwater ALICE with 0 free wallet must still be liquidated (taker fee waived)"
     );
+}
+
+// ── ADL (auto-deleveraging, scheme X) ───────────────────────────────────────────
+
+fn seed_position_account(
+    ctx: &mut TestCtx,
+    user: Address,
+    amount: i64,
+    v_quote: i64,
+    margin: i64,
+    leverage: u64,
+    wallet: i64,
+) {
+    storage::save_account(
+        ctx,
+        user,
+        UserAccount { perp_wallet_balance: wallet, ..UserAccount::default() },
+    )
+    .unwrap();
+    storage::save_position(
+        ctx,
+        user,
+        MARKET_ID,
+        &PerpPosition { amount, v_quote_balance: v_quote, margin, leverage, ..PerpPosition::default() },
+    )
+    .unwrap();
+}
+
+// Σ(perp_wallet + margin + vQuote) over `users`, plus the global insurance fund.
+fn conservation_sum(ctx: &mut TestCtx, users: &[Address]) -> i128 {
+    let mut s = storage::load_insurance_fund(ctx).unwrap() as i128;
+    for &u in users {
+        let a = storage::load_account(ctx, u).unwrap();
+        let p = storage::load_position(ctx, u, MARKET_ID).unwrap();
+        s += a.perp_wallet_balance as i128 + p.margin as i128 + p.v_quote_balance as i128;
+    }
+    s
+}
+
+#[test]
+fn adl_closes_insolvent_residual_against_opposite_holder_conserving_no_if() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // ALICE: 5x long 10 @ $100 (margin $200, vq -$1000), $50 free wallet.
+    seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+    // KEEPER: the opposite side — 5x short 10 @ $100 (margin $200, vq +$1000), off-book,
+    // profitable once the mark drops. This is the ADL counterparty.
+    seed_position_account(&mut ctx, KEEPER, -QTY, ENTRY_VALUE, MARGIN, 5, 0);
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
+        vec![ALICE, KEEPER]
+    );
+
+    let users = [ALICE, KEEPER];
+    let value_before = conservation_sum(&mut ctx, &users);
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let amount_before: i64 = users.iter().map(|&u| position(&mut ctx, u).amount).sum();
+    assert_eq!(amount_before, 0, "zero-sum market");
+
+    // Crash to $75: ALICE insolvent (equity -$50, bankruptcy price $80). Empty book →
+    // full residual → ADL against KEEPER at $80.
+    run_update_index_price(
+        &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: 7_500, timestamp: 31 }.abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    assert_eq!(position(&mut ctx, ALICE).amount, 0, "insolvent long fully ADL'd");
+    assert_eq!(position(&mut ctx, KEEPER).amount, 0, "opposite short absorbed the residual");
+    assert!(storage::load_position_registry(&mut ctx, MARKET_ID).unwrap().is_empty());
+    // Scheme X: ADL routes NO bad debt to the Insurance Fund.
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        if_before,
+        "ADL must not touch the insurance fund"
+    );
+    // Full value conservation + Σamount conserved (ADL is a real trade, not synthetic).
+    assert_eq!(conservation_sum(&mut ctx, &users), value_before, "ADL must conserve value");
+    let amount_after: i64 = users.iter().map(|&u| position(&mut ctx, u).amount).sum();
+    assert_eq!(amount_after, 0, "Σamount conserved");
+    // Isolated margin: the liquidated long's wallet is untouched by the loss.
+    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET, "loser wallet untouched by the loss");
+}
+
+#[test]
+fn adl_defers_insolvent_residual_when_no_eligible_opposite_holder() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // Only ALICE (insolvent long) exists — no opposite-side holder to ADL against.
+    seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let value_before = conservation_sum(&mut ctx, &[ALICE]);
+
+    run_update_index_price(
+        &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: 7_500, timestamp: 31 }.abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // No opposite holder → the insolvent residual is DEFERRED (stays open, still
+    // registered), NOT closed at mark to the IF (scheme X). Nothing moved.
+    assert_eq!(position(&mut ctx, ALICE).amount, QTY, "insolvent residual deferred, not force-closed");
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
+        vec![ALICE],
+        "deferred position stays registered for the next sweep"
+    );
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), if_before, "IF untouched on defer");
+    assert_eq!(conservation_sum(&mut ctx, &[ALICE]), value_before, "nothing moved on defer");
 }
 
 #[test]
