@@ -42,6 +42,39 @@ enum StoreSlot {
     Position(Address, u64),
 }
 
+/// Three-state read result from a typed sub-map.
+///
+/// The distinction between `Deleted` and `Miss` is a CORRECTNESS requirement, not an optimization:
+/// a key removed THIS block must read as definitively-absent (`Deleted`), never fall through to the
+/// committed cross-block store — which still holds the pre-delete value until the block-end delta
+/// lands. (The overlay encodes the same thing today as a resident `Bytes(empty)` entry.) `Miss`
+/// alone sends the reader to the cold path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resident<'a, T> {
+    /// Not resident this block — the caller falls through to the cold/cross-block path.
+    Miss,
+    /// Removed this block — definitively absent; do NOT fall through.
+    Deleted,
+    /// Resident value.
+    Hit(&'a T),
+}
+
+impl<'a, T> Resident<'a, T> {
+    /// `Hit` payload as an `Option` (test/diagnostic convenience; production readers must match
+    /// all three states — collapsing `Deleted` into `None` is exactly the fall-through bug).
+    pub fn hit(self) -> Option<&'a T> {
+        match self {
+            Resident::Hit(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// Sub-map entry: `None` = removed THIS block (a resident tombstone — reads report
+/// [`Resident::Deleted`] instead of falling through to the stale committed store; the block delta
+/// emits empty bytes). `Some` = live value.
+type Slot<T> = Option<Arc<T>>;
+
 /// Strongly-typed off-trie store (Stage A). See the module docs.
 ///
 /// Sub-maps hold `Arc<T>`, not owned `T` — this is what keeps every current perf property when the
@@ -52,9 +85,9 @@ enum StoreSlot {
 /// Arc back to the cross-block store without cloning.
 #[derive(Clone, Debug, Default)]
 pub struct TypedPerpStore {
-    accounts: HashMap<Address, Arc<UserAccount>>,
-    markets: HashMap<u64, Arc<Market>>,
-    positions: HashMap<(Address, u64), Arc<PerpPosition>>,
+    accounts: HashMap<Address, Slot<UserAccount>>,
+    markets: HashMap<u64, Slot<Market>>,
+    positions: HashMap<(Address, u64), Slot<PerpPosition>>,
     // Stage B extends with the remaining namespaces, same patterns:
     //   orders / bid_levels / ask_levels / bid_prices / ask_prices / market_hot /
     //   market_fee_total / trade_count / position_registry / api_keys / api_key_ids /
@@ -69,73 +102,96 @@ pub struct TypedPerpStore {
 
 impl TypedPerpStore {
     // ── per-user account ───────────────────────────────────────────────────────
-    /// Shared read of a user's account (`None` = not resident this block).
-    pub fn account(&self, user: Address) -> Option<&UserAccount> {
-        self.accounts.get(&user).map(|a| a.as_ref())
+    /// Three-state read of a user's account (see [`Resident`]).
+    pub fn account(&self, user: Address) -> Resident<'_, UserAccount> {
+        match self.accounts.get(&user) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(a)) => Resident::Hit(a.as_ref()),
+        }
     }
 
     /// `&mut` access marks the key dirty (conservative: any mutable borrow is a potential write,
     /// matching the current `get_struct_mut` write-count semantics). CoW: clones the value iff
-    /// the Arc is shared (first write after a cold fill), in-place thereafter.
+    /// the Arc is shared (first write after a cold fill), in-place thereafter. `None` for a
+    /// missing OR deleted entry (mutating either is a caller bug; callers materialize first).
     pub fn account_mut(&mut self, user: Address) -> Option<&mut UserAccount> {
-        if self.accounts.contains_key(&user) {
-            self.dirty
-                .insert(keys::account_key(user), StoreSlot::Account(user));
+        match self.accounts.get_mut(&user) {
+            Some(Some(a)) => {
+                self.dirty
+                    .insert(keys::account_key(user), StoreSlot::Account(user));
+                Some(Arc::make_mut(a))
+            }
+            _ => None,
         }
-        self.accounts.get_mut(&user).map(Arc::make_mut)
     }
 
     /// Inserts/overwrites a user's account and marks its key dirty.
     pub fn set_account(&mut self, user: Address, value: UserAccount) {
         self.dirty
             .insert(keys::account_key(user), StoreSlot::Account(user));
-        self.accounts.insert(user, Arc::new(value));
+        self.accounts.insert(user, Some(Arc::new(value)));
     }
 
-    /// Removes a user's account (block-end delta emits an empty-bytes tombstone).
+    /// Removes a user's account: leaves a resident tombstone (reads → [`Resident::Deleted`]) and
+    /// marks the key dirty (block-end delta emits empty bytes).
     pub fn remove_account(&mut self, user: Address) {
         self.dirty
             .insert(keys::account_key(user), StoreSlot::Account(user));
-        self.accounts.remove(&user);
+        self.accounts.insert(user, None);
     }
 
     // ── per-market config ────────────────────────────────────────────────────
-    /// Shared read of a market's config (`None` = not resident this block).
-    pub fn market(&self, market_id: u64) -> Option<&Market> {
-        self.markets.get(&market_id).map(|m| m.as_ref())
+    /// Three-state read of a market's config (see [`Resident`]).
+    pub fn market(&self, market_id: u64) -> Resident<'_, Market> {
+        match self.markets.get(&market_id) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(m)) => Resident::Hit(m.as_ref()),
+        }
     }
 
     /// Mutable market access; marks its key dirty (see [`Self::account_mut`]).
     pub fn market_mut(&mut self, market_id: u64) -> Option<&mut Market> {
-        if self.markets.contains_key(&market_id) {
-            self.dirty
-                .insert(keys::market_key(market_id), StoreSlot::Market(market_id));
+        match self.markets.get_mut(&market_id) {
+            Some(Some(m)) => {
+                self.dirty
+                    .insert(keys::market_key(market_id), StoreSlot::Market(market_id));
+                Some(Arc::make_mut(m))
+            }
+            _ => None,
         }
-        self.markets.get_mut(&market_id).map(Arc::make_mut)
     }
 
     /// Inserts/overwrites a market and marks its key dirty.
     pub fn set_market(&mut self, market_id: u64, value: Market) {
         self.dirty
             .insert(keys::market_key(market_id), StoreSlot::Market(market_id));
-        self.markets.insert(market_id, Arc::new(value));
+        self.markets.insert(market_id, Some(Arc::new(value)));
     }
 
     // ── per-(user, market) position ──────────────────────────────────────────
-    /// Shared read of a user's position in a market (`None` = not resident this block).
-    pub fn position(&self, user: Address, market_id: u64) -> Option<&PerpPosition> {
-        self.positions.get(&(user, market_id)).map(|p| p.as_ref())
+    /// Three-state read of a user's position in a market (see [`Resident`]).
+    pub fn position(&self, user: Address, market_id: u64) -> Resident<'_, PerpPosition> {
+        match self.positions.get(&(user, market_id)) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(p)) => Resident::Hit(p.as_ref()),
+        }
     }
 
     /// Mutable position access; marks its key dirty (see [`Self::account_mut`]).
     pub fn position_mut(&mut self, user: Address, market_id: u64) -> Option<&mut PerpPosition> {
-        if self.positions.contains_key(&(user, market_id)) {
-            self.dirty.insert(
-                keys::position_key(user, market_id),
-                StoreSlot::Position(user, market_id),
-            );
+        match self.positions.get_mut(&(user, market_id)) {
+            Some(Some(p)) => {
+                self.dirty.insert(
+                    keys::position_key(user, market_id),
+                    StoreSlot::Position(user, market_id),
+                );
+                Some(Arc::make_mut(p))
+            }
+            _ => None,
         }
-        self.positions.get_mut(&(user, market_id)).map(Arc::make_mut)
     }
 
     /// Inserts/overwrites a position and marks its key dirty.
@@ -144,16 +200,16 @@ impl TypedPerpStore {
             keys::position_key(user, market_id),
             StoreSlot::Position(user, market_id),
         );
-        self.positions.insert((user, market_id), Arc::new(value));
+        self.positions.insert((user, market_id), Some(Arc::new(value)));
     }
 
-    /// Removes a position (block-end delta emits an empty-bytes tombstone).
+    /// Removes a position: resident tombstone + dirty mark (delta emits empty bytes).
     pub fn remove_position(&mut self, user: Address, market_id: u64) {
         self.dirty.insert(
             keys::position_key(user, market_id),
             StoreSlot::Position(user, market_id),
         );
-        self.positions.remove(&(user, market_id));
+        self.positions.insert((user, market_id), None);
     }
 
     /// Number of keys written this block (dirty-set size). Diagnostic / test hook.
@@ -171,18 +227,19 @@ impl TypedPerpStore {
         let mut out: Vec<(B256, Vec<u8>)> = Vec::with_capacity(self.dirty.len());
         // Disjoint field borrows: draining `self.dirty` while reading the typed sub-maps.
         for (key, slot) in self.dirty.drain() {
+            // Absent-from-map and resident-tombstone both lower to empty bytes (delete).
             let bytes = match slot {
                 StoreSlot::Account(u) => match self.accounts.get(&u) {
-                    Some(v) => encode(v.as_ref())?,
-                    None => Vec::new(),
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
                 },
                 StoreSlot::Market(m) => match self.markets.get(&m) {
-                    Some(v) => encode(v.as_ref())?,
-                    None => Vec::new(),
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
                 },
                 StoreSlot::Position(u, m) => match self.positions.get(&(u, m)) {
-                    Some(v) => encode(v.as_ref())?,
-                    None => Vec::new(),
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
                 },
             };
             out.push((key, bytes));
@@ -204,16 +261,16 @@ impl PerpStore for TypedPerpStore {
         // well-formed enough to store, so canonical encoding cannot fail). `decoded` shares the
         // sub-map's Arc — zero clone into the cross-block committed store.
         fn entry<T: serde::Serialize + Send + Sync + 'static>(
-            v: Option<&Arc<T>>,
+            v: Option<&Slot<T>>,
         ) -> PerpDeltaEntry {
             match v {
-                Some(v) => PerpDeltaEntry {
+                Some(Some(v)) => PerpDeltaEntry {
                     decoded: Some(v.clone() as Arc<PerpBlob>),
                     bytes: encode(v.as_ref()).expect("perp typed-store encode failure"),
                 },
-                // Removed this block → empty bytes (the delete convention); nothing to retain in
-                // the decoded cross-block store.
-                None => PerpDeltaEntry {
+                // Removed this block (resident tombstone) → empty bytes (the delete convention);
+                // nothing to retain in the decoded cross-block store.
+                _ => PerpDeltaEntry {
                     decoded: None,
                     bytes: Vec::new(),
                 },
@@ -273,23 +330,23 @@ mod tests {
         let mut store = TypedPerpStore::default();
         let u = addr(0xAB);
 
-        assert!(store.account(u).is_none());
+        assert_eq!(store.account(u), Resident::Miss);
         store.set_account(u, UserAccount::default());
         {
             let a = store.account_mut(u).expect("just set");
             a.nonce = 7;
             a.perp_wallet_balance = 123;
         }
-        assert_eq!(store.account(u).unwrap().nonce, 7);
+        assert_eq!(store.account(u).hit().unwrap().nonce, 7);
 
         store.set_market(1, sample_market(1));
-        assert_eq!(store.market(1).unwrap().mark_price, 65_000_00);
+        assert_eq!(store.market(1).hit().unwrap().mark_price, 65_000_00);
 
         let mut pos = PerpPosition::default();
         pos.amount = -42;
         pos.leverage = 6;
         store.set_position(u, 1, pos.clone());
-        assert_eq!(store.position(u, 1).unwrap().amount, -42);
+        assert_eq!(store.position(u, 1).hit().unwrap().amount, -42);
     }
 
     #[test]
@@ -415,26 +472,48 @@ mod tests {
 
         // Simulated cross-block fill: an Arc handed in from the committed store.
         let canonical = Arc::new(UserAccount::default());
-        store.accounts.insert(u, canonical.clone());
+        store.accounts.insert(u, Some(canonical.clone()));
+        let resident = |s: &TypedPerpStore| s.accounts.get(&u).unwrap().clone().unwrap();
         assert!(
-            Arc::ptr_eq(&canonical, store.accounts.get(&u).unwrap()),
+            Arc::ptr_eq(&canonical, &resident(&store)),
             "fill shares the SAME allocation (zero clone)"
         );
 
         // First write breaks the share (one clone), external Arc keeps the old value.
         store.account_mut(u).unwrap().nonce = 42;
-        assert!(!Arc::ptr_eq(&canonical, store.accounts.get(&u).unwrap()));
+        assert!(!Arc::ptr_eq(&canonical, &resident(&store)));
         assert_eq!(canonical.nonce, 0, "external holder untouched");
-        assert_eq!(store.account(u).unwrap().nonce, 42);
+        assert_eq!(store.account(u).hit().unwrap().nonce, 42);
 
         // Second write: Arc now unique → in-place, no further clone (same allocation).
-        let after_first = Arc::as_ptr(store.accounts.get(&u).unwrap());
+        let after_first = Arc::as_ptr(&resident(&store));
         store.account_mut(u).unwrap().nonce = 43;
         assert_eq!(
             after_first,
-            Arc::as_ptr(store.accounts.get(&u).unwrap()),
+            Arc::as_ptr(&resident(&store)),
             "unique Arc mutates in place"
         );
+    }
+
+    /// The tombstone-residency property: a key removed THIS block reads `Deleted` (definitively
+    /// absent — the reader must NOT fall through to the committed store, which still holds the
+    /// pre-delete value), while a never-touched key reads `Miss` (cold path). Collapsing the two
+    /// is exactly the read-back-after-delete consensus bug.
+    #[test]
+    fn removed_reads_deleted_not_miss() {
+        let mut store = TypedPerpStore::default();
+        let u = addr(0x66);
+
+        store.set_position(u, 3, PerpPosition::default());
+        store.remove_position(u, 3);
+        assert_eq!(store.position(u, 3), Resident::Deleted);
+        assert_eq!(store.position(u, 4), Resident::Miss, "untouched key");
+        assert!(store.position_mut(u, 3).is_none(), "no mutable access to a tombstone");
+
+        // The tombstone still emits the delete in the delta.
+        let delta = store.take_delta().unwrap();
+        assert_eq!(delta.len(), 1);
+        assert!(delta[0].1.is_empty());
     }
 
     #[test]
