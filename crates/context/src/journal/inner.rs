@@ -47,17 +47,13 @@ pub struct PerpSection {
     /// perp writes is a corruption-anyway condition and halts loudly). A cache fill does NOT set
     /// this (it is not a write).
     dirty_this_tx: bool,
-}
-
-/// Global monotonic counter of off-trie PerpDEX overlay WRITES (commit-only #23 diagnostic).
-/// Incremented by `store_bytes`/`store_struct`/`get_struct_mut`. Used to detect residual
-/// write-then-error paths: a precompile call that returns REVERTED must not have bumped this
-/// (validate-then-apply). Not consensus state — a process-wide debugging tripwire.
-pub static PERP_WRITE_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-#[inline]
-pub fn perp_write_count() -> u64 {
-    PERP_WRITE_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+    /// Monotonic count of off-trie overlay WRITES on THIS journal (commit-only #23 diagnostic).
+    /// Bumped by `store_bytes`/`store_struct`/`get_struct_mut`. A precompile call snapshots it
+    /// before dispatch and re-reads on a REVERTED exit; an increase means a residual
+    /// write-then-error (validate-then-apply was violated). Not consensus state. Journal-local (was
+    /// a process-wide atomic) — the tripwire only ever diffs it within one single-threaded call, so
+    /// a plain non-atomic increment on the `&mut self` write path is sufficient and cheaper.
+    write_count: u64,
 }
 
 /// One off-trie overlay value (#16d Phase 2). A typed `save_*` write stores the DESERIALIZED blob
@@ -153,7 +149,7 @@ impl PerpSection {
             return None;
         }
         self.dirty_this_tx = true;
-        PERP_WRITE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.write_count += 1;
         match self.working.get_mut(&key) {
             Some(PerpEntry::Struct { val, .. }) => Some(val.as_mut()),
             // Unreachable: matched `Struct` above and `working` was not touched since.
@@ -167,7 +163,7 @@ impl PerpSection {
     fn store_bytes(&mut self, key: B256, value: Vec<u8>) {
         self.working.insert(key, PerpEntry::Bytes(value));
         self.dirty_this_tx = true;
-        PERP_WRITE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.write_count += 1;
     }
 
     /// Writes a deferred `Struct` (typed writers): no serialization now — lowered to bytes once at
@@ -183,7 +179,7 @@ impl PerpSection {
         self.working
             .insert(key, PerpEntry::Struct { val, ser, clone });
         self.dirty_this_tx = true;
-        PERP_WRITE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.write_count += 1;
     }
 
     /// Drains the net in-block WRITES as a [`PerpDelta`], serializing each `Struct` to canonical
@@ -424,6 +420,12 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     #[inline]
     pub fn perp_fold_log_len(&self) -> usize {
         self.perp_commitment_log.len()
+    }
+
+    /// Monotonic count of off-trie overlay writes on this journal (commit-only #23 tripwire).
+    #[inline]
+    pub fn perp_write_count(&self) -> u64 {
+        self.perp.write_count
     }
 
     /// Prepare for next transaction, by committing the current journal to history, incrementing the transaction id

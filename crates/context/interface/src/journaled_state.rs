@@ -392,6 +392,14 @@ pub trait JournalTr {
         0
     }
 
+    /// Monotonic count of off-trie PerpDEX overlay WRITES this journal has performed (commit-only
+    /// #23 diagnostic). A precompile call snapshots this before dispatch and re-reads on a REVERTED
+    /// exit; an increase means a residual write-then-error (validate-then-apply was violated). Not
+    /// consensus state. Journal-local, so the diff is only meaningful within one call. Default: 0.
+    fn perp_write_count(&self) -> u64 {
+        0
+    }
+
     /// Clear current journal resetting it to initial state and return changes state.
     fn finalize(&mut self) -> Self::State;
 }

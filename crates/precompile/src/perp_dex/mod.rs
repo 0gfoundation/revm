@@ -217,10 +217,10 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         return Err(errors::perp_err("perpdex: EOA direct calls only"));
     }
 
-    // commit-only #23 residual-write-then-error tripwire: snapshot the global perp-write counter
+    // commit-only #23 residual-write-then-error tripwire: snapshot the journal's perp-write counter
     // before dispatch. A call that ends REVERTED must not have written the overlay
     // (validate-then-apply); if it did, undo is gone and the write leaked. Diagnostic only.
-    let writes_before = context::journal::inner::perp_write_count();
+    let writes_before = context.journal_mut().perp_write_count();
 
     // Dispatch — note: no `?` here; errors are caught below and converted to
     // clean REVERT output so ethers.js can read `e.reason`.
@@ -321,7 +321,7 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
             // (commit-only #23 — the write leaks with no undo). Record the offending selector +
             // count into a global so the exact path can be surfaced (read via
             // [`last_perp_write_then_revert`]); diagnostic only, not a halt.
-            let writes_after = context::journal::inner::perp_write_count();
+            let writes_after = context.journal_mut().perp_write_count();
             if writes_after != writes_before {
                 let sel = u32::from_be_bytes(selector);
                 LAST_WRITE_THEN_REVERT_SELECTOR.store(sel, core::sync::atomic::Ordering::Relaxed);

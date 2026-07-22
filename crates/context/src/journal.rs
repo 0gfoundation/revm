@@ -397,6 +397,11 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
         self.inner.perp_fold_log_len()
     }
 
+    #[inline]
+    fn perp_write_count(&self) -> u64 {
+        self.inner.perp_write_count()
+    }
+
     /// Clear current journal resetting it to initial state and return changes state.
     #[inline]
     fn finalize(&mut self) -> Self::State {
