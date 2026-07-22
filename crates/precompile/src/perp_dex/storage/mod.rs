@@ -35,7 +35,7 @@ use keys::{
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
 
-fn encode<T: Serialize>(val: &T) -> Result<Vec<u8>, PrecompileError> {
+pub(crate) fn encode<T: Serialize>(val: &T) -> Result<Vec<u8>, PrecompileError> {
     let mut buf = Vec::new();
     // Positional (array) msgpack: struct field NAMES are NOT serialized (P4/#20) — smaller blobs
     // and faster decode; the decoder reads fields by position via serde's `visit_seq`. Cross-
@@ -47,7 +47,7 @@ fn encode<T: Serialize>(val: &T) -> Result<Vec<u8>, PrecompileError> {
     Ok(buf)
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<T, PrecompileError> {
+pub(crate) fn decode<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<T, PrecompileError> {
     let mut de = RMPDeserializer::new(buf);
     Deserialize::deserialize(&mut de).map_err(|_| perp_err("msgpack decode error"))
 }

@@ -69,6 +69,7 @@ pub mod math;
 pub mod risk;
 pub mod storage;
 pub mod trading;
+pub mod typed_store;
 pub mod types;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
