@@ -250,6 +250,60 @@ pub fn calc_liquidation_price(
     i64::try_from(price).map_err(|_| perp_err("math: liquidation price exceeds i64"))
 }
 
+/// Bankruptcy price: the price at which the position's equity is exactly zero
+/// (`calc_value_i64(P_b, amount) + v_quote_balance + margin == 0`). This is
+/// [`calc_liquidation_price`] WITHOUT the maintenance-margin adjustment (equity == 0,
+/// not equity == maintenance). Returns 0 if `amount == 0`.
+///
+/// Used by ADL to close a liquidated residual against opposite-side holders as a
+/// forced trade at `P_b`. Rounding is chosen so the LIQUIDATED position's equity at
+/// `P_b` is `>= 0` (a long rounds the price UP, a short rounds it DOWN): closing the
+/// residual at `P_b` then never realizes a loss beyond the position's own margin, so
+/// it never produces bad debt — ADL scheme X routes NO bad debt to the Insurance
+/// Fund. A tiny (<= 1 sub-unit) equity surplus is a conserving credit from the ADL
+/// counterparty, never a mint.
+#[inline]
+pub fn calc_bankruptcy_price(
+    amount: i64,
+    v_quote_balance: i64,
+    margin: i64,
+    base_decimals: u32,
+    price_decimals: u32,
+) -> Result<u64, PrecompileError> {
+    if amount == 0 {
+        return Ok(0);
+    }
+    let numerator = (-(v_quote_balance as i128 + margin as i128))
+        .checked_mul(pow10_i128(price_decimals)?)
+        .and_then(|v| v.checked_mul(pow10_i128(base_decimals).ok()?))
+        .ok_or_else(|| perp_err("math: bankruptcy price numerator overflow"))?;
+    let denominator = (amount as i128)
+        .checked_mul(pow10_i128(QUOTE_DECIMALS)?)
+        .ok_or_else(|| perp_err("math: bankruptcy price denominator overflow"))?;
+    // Integer division truncates toward zero. For a long (num>0, den>0) that floors,
+    // so round UP to keep equity(P_b) >= 0; a short (num<0, den<0) yields a floored
+    // positive, which is already the DOWN rounding we want.
+    let mut price = numerator / denominator;
+    if amount > 0 && numerator % denominator != 0 {
+        price += 1;
+    }
+    // `calc_value_i64` floors internally, so nudge once more if that flooring pushed
+    // the liquidated equity a sub-unit negative (long: price up, short: price down).
+    // Bounded, deterministic.
+    for _ in 0..2 {
+        let p = u64::try_from(price).map_err(|_| perp_err("math: bankruptcy price exceeds u64"))?;
+        let eq = calc_value_i64(p, amount, base_decimals, price_decimals)?
+            .checked_add(v_quote_balance)
+            .and_then(|v| v.checked_add(margin))
+            .ok_or_else(|| perp_err("math: bankruptcy equity overflow"))?;
+        if eq >= 0 {
+            return Ok(p);
+        }
+        price += if amount > 0 { 1 } else { -1 };
+    }
+    u64::try_from(price).map_err(|_| perp_err("math: bankruptcy price exceeds u64"))
+}
+
 /// Compute the funding rate using Binance's formula:
 ///   F = P + clamp(interest_rate − P, CLAMP_LOWER_BOUND, CLAMP_UPPER_BOUND)
 ///   F_final = clamp(F, MIN_FUNDING_RATE, MAX_FUNDING_RATE)
@@ -653,6 +707,64 @@ mod reservation_notional_tests {
         let (b, s, c) = calc_reservation_notionals(&[], &sells, 0, 0, 0).unwrap();
         assert_eq!(b, 0);
         assert_eq!(c, s);
+    }
+}
+
+#[cfg(test)]
+mod bankruptcy_price_tests {
+    use super::*;
+
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// For realistic longs AND shorts across many decimals/leverages, the bankruptcy
+    /// price must satisfy `0 <= equity(P_b) <= dust` — i.e. closing the residual at
+    /// `P_b` NEVER leaves the position insolvent (no bad debt, ADL scheme X routes none
+    /// to the IF), and `P_b` is tight (equity is a sub-unit above zero, a conserving
+    /// crumb, never a mint).
+    #[test]
+    fn bankruptcy_price_keeps_liquidated_equity_nonnegative_and_tight() {
+        let mut s: u64 = 0xc0ffee_1234_5678;
+        for _ in 0..20000 {
+            let bd = (next(&mut s) % 5) as u32; // 0..=4
+            let pd = (next(&mut s) % 5) as u32; // 0..=4
+            let entry = (next(&mut s) % 10_000_000 + 1) as u64; // <= maxPrice (1e8)
+            let qty = (next(&mut s) % 100_000 + 1) as u64;
+            let lev = (next(&mut s) % 6 + 1) as i64; // 1..=6
+            let notional = match calc_value(entry, qty, bd, pd) {
+                Ok(v) if v > 0 && v <= i64::MAX as u64 => v as i64,
+                _ => continue, // beyond realistic on-chain bounds (maxPrice/maxQuantity)
+            };
+            let margin = notional / lev;
+            let is_long = next(&mut s) & 1 == 0;
+            // Long: paid the notional (vq negative); short: received it (vq positive).
+            let (amount, v_quote) = if is_long {
+                (qty as i64, -notional)
+            } else {
+                (-(qty as i64), notional)
+            };
+
+            let p_b = calc_bankruptcy_price(amount, v_quote, margin, bd, pd).unwrap();
+            // P_b == 0 is valid for a <=1x position (bankrupt only at price 0 => never
+            // insolvent => never ADL'd). Only the equity invariant must hold.
+            let eq = match calc_position_equity(p_b, amount, v_quote, margin, bd, pd) {
+                Ok(e) => e,
+                Err(_) => continue, // P_b*amount beyond i64 (unrealistic)
+            };
+            assert!(eq >= 0, "equity(P_b) < 0 => bad debt: eq={eq} P_b={p_b} amount={amount} vq={v_quote} m={margin} bd={bd} pd={pd}");
+            // Tightness: equity at P_b is within one price sub-unit's worth of value.
+            let one_tick = calc_value(1, qty, bd, pd).unwrap() as i64 + 2;
+            assert!(eq <= one_tick, "equity(P_b) not tight: eq={eq} bound={one_tick} P_b={p_b}");
+        }
+    }
+
+    #[test]
+    fn bankruptcy_price_zero_amount_is_zero() {
+        assert_eq!(calc_bankruptcy_price(0, -100, 10, 2, 2).unwrap(), 0);
     }
 }
 
