@@ -288,6 +288,11 @@ pub fn finalize_block_commitment<CTX: ContextTr>(
 /// is absent (empty); the caller applies its own default / `Option` semantics (absence is not
 /// cached). The cache lives in the journal's block-scoped, revert-cleared `PerpSection`, so this
 /// collapses repeated reads of a hot blob within a block to a single decode.
+///
+/// DEAD as of the Stage-B completion: every namespace is now on the typed store (hot) or the byte
+/// tier (cold). Retained (with its Struct-tier seam calls keeping the seam "used") ONLY so Stage C
+/// deletes it together with `PerpEntry::Struct`/`Cached`, the #14 cache, and the journal Struct seam.
+#[allow(dead_code)]
 fn load_cached<CTX: ContextTr, T>(
     context: &mut CTX,
     key: B256,
@@ -372,6 +377,9 @@ fn clone_blob<T: Clone + Send + Sync + 'static>(v: &PerpBlob) -> std::boxed::Box
 /// block-end `take_perp_delta` lowers it to canonical bytes ONCE (so a key written N times this
 /// block is serialized once, not N times). No per-write `encode`, and the struct overlay doubles as
 /// the in-block read cache — `store_struct` invalidates the #14 cold-read cache for this key.
+///
+/// DEAD as of Stage-B completion — see [`load_cached`]. Removed with the Struct tier in Stage C.
+#[allow(dead_code)]
 fn save_cached<CTX: ContextTr, T>(
     context: &mut CTX,
     key: B256,
@@ -398,14 +406,22 @@ where
 
 /// Returns `Address::ZERO` when no admin has been initialised yet.
 pub fn load_admin<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
-    Ok(load_cached::<_, Address>(context, admin_key())?.unwrap_or(Address::ZERO))
+    // Cold/admin-cadence namespace on the cheap BYTE tier (load_blob/store_blob), like the other
+    // role/index/funding namespaces — NOT the type-erased Struct tier (that machinery is deleted in
+    // Stage C). Byte-identical canonical bytes (`encode(Address)`), so golden-neutral.
+    let buf = load_blob(context, admin_key())?;
+    if buf.is_empty() {
+        return Ok(Address::ZERO);
+    }
+    decode(&buf)
 }
 
 pub fn save_admin<CTX: ContextTr>(
     context: &mut CTX,
     admin: Address,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, admin_key(), &admin)
+    let buf = encode(&admin)?;
+    store_blob(context, admin_key(), &buf)
 }
 
 // ── UserAccount ───────────────────────────────────────────────────────────────
@@ -588,7 +604,12 @@ pub fn load_market_fee_total<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, market_fee_total_key(market_id))?.unwrap_or(0))
+    // Byte tier (the write side `add_market_fee_total` already uses store_blob) — off the Struct tier.
+    let buf = load_blob(context, market_fee_total_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
 }
 
 pub fn add_market_fee_total<CTX: ContextTr>(
@@ -989,8 +1010,11 @@ pub fn next_trade_id<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let current: u64 = load_cached::<_, u64>(context, trade_count_key(market_id))?.unwrap_or(0);
-    save_cached(context, trade_count_key(market_id), &(current + 1))?;
+    // Byte tier (off the Struct tier); always writes the incremented counter.
+    let buf = load_blob(context, trade_count_key(market_id))?;
+    let current: u64 = if buf.is_empty() { 0 } else { decode(&buf)? };
+    let nbuf = encode(&(current + 1))?;
+    store_blob(context, trade_count_key(market_id), &nbuf)?;
     Ok(current)
 }
 
