@@ -341,41 +341,7 @@ impl<DB: Database, ENTRY: JournalEntryTr> JournalTr for Journal<DB, ENTRY> {
         self.inner.perp_store(key, value);
     }
 
-    #[inline]
-    fn perp_store_struct(
-        &mut self,
-        key: B256,
-        val: std::boxed::Box<PerpBlob>,
-        ser: fn(&PerpBlob) -> Vec<u8>,
-        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
-    ) {
-        self.inner.perp_store_struct(key, val, ser, clone);
-    }
-
-    #[inline]
-    fn perp_get_struct(&mut self, key: B256) -> Option<&PerpBlob> {
-        self.inner.perp_get_struct(key)
-    }
-
-    #[inline]
-    fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut PerpBlob> {
-        self.inner.perp_get_struct_mut(key)
-    }
-
-    #[inline]
-    fn perp_cache_get(&mut self, key: B256) -> Option<&PerpBlob> {
-        self.inner.perp_cache_get(key)
-    }
-
-    #[inline]
-    fn perp_cache_get_arc(&mut self, key: B256) -> Option<std::sync::Arc<PerpBlob>> {
-        self.inner.perp_cache_get_arc(key)
-    }
-
-    #[inline]
-    fn perp_cache_put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
-        self.inner.perp_cache_put(key, value);
-    }
+    // (Stage C) Struct-tier delegators removed — see JournalTr / JournalInner.
 
     #[inline]
     fn take_perp_delta(&mut self) -> PerpDelta {

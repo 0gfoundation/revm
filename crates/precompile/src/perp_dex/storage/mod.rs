@@ -3,7 +3,7 @@
 pub mod keys;
 
 use context::{
-    journaled_state::{PerpBlob, PerpDelta},
+    journaled_state::PerpDelta,
     ContextTr, JournalTr,
 };
 use primitives::{Address, B256, U256};
@@ -283,126 +283,13 @@ pub fn finalize_block_commitment<CTX: ContextTr>(
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
-/// Cached typed read of an off-trie blob (catalog #14). Returns the block-cached deserialized
-/// value if present, else loads + msgpack-decodes the blob and caches it. `Ok(None)` if the blob
-/// is absent (empty); the caller applies its own default / `Option` semantics (absence is not
-/// cached). The cache lives in the journal's block-scoped, revert-cleared `PerpSection`, so this
-/// collapses repeated reads of a hot blob within a block to a single decode.
-///
-/// DEAD as of the Stage-B completion: every namespace is now on the typed store (hot) or the byte
-/// tier (cold). Retained (with its Struct-tier seam calls keeping the seam "used") ONLY so Stage C
-/// deletes it together with `PerpEntry::Struct`/`Cached`, the #14 cache, and the journal Struct seam.
-#[allow(dead_code)]
-fn load_cached<CTX: ContextTr, T>(
-    context: &mut CTX,
-    key: B256,
-) -> Result<Option<T>, PrecompileError>
-where
-    T: Clone + Send + Sync + 'static + for<'de> Deserialize<'de>,
-{
-    // Bench-only A/B lever (#14/#16d measurement): deserialize on every read with no cache,
-    // reproducing pre-#14 behavior so a bench can diff per-call vs cached deser cost.
-    #[cfg(test)]
-    if bench_counter::force_percall() {
-        let buf = load_blob(context, key)?;
-        if buf.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(decode(&buf)?));
-    }
-    // Single in-block probe: `perp_get_struct` now serves BOTH a deferred `Struct` write AND a
-    // `Cached` cold-read blob (#14 folded into the working map) — downcast + clone, no deser, and
-    // no separate cache probe.
-    if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(v) = any.downcast_ref::<T>() {
-            return Ok(Some(v.clone()));
-        }
-    }
-    // Cross-block decoded store (选项A): the committed store retains the struct another block
-    // already decoded — reuse it (Arc bump, no deserialization, no byte copy). Returns None when
-    // the key has any in-block overlay write (overlay precedence) or no decoded entry exists.
-    if let Some(arc) = context
-        .journal_mut()
-        .perp_load_arc(key)
-        .map_err(convert_db_err::<CTX::Db>)?
-    {
-        if let Some(v) = arc.downcast_ref::<T>() {
-            let out = v.clone();
-            // Share the SAME Arc in the block-scoped #14 cache for subsequent in-block reads.
-            context.journal_mut().perp_cache_put(key, arc);
-            return Ok(Some(out));
-        }
-    }
-    // Cold read: committed off-trie store (or an overlay Bytes entry) → decode once → cache.
-    let buf = load_blob(context, key)?;
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    let val: T = decode(&buf)?;
-    context
-        .journal_mut()
-        .perp_cache_put(key, std::sync::Arc::new(val.clone()));
-    Ok(Some(val))
-}
-
-// (Removed `load_arc<T>` — the generic zero-clone Arc reader. Every `_ref` reader now hits the
-// typed store's per-namespace `*_arc` accessor instead; the last caller went away with the bidp/askp
-// cutover. The remaining type-erased read machinery — `load_cached`, `load_level_arc`, the #14 cache
-// tiers — is deleted wholesale in Stage C once every namespace is cut over.)
-
-/// Serializes a type-erased off-trie blob to its canonical bytes — the #16d block-end serializer,
-/// monomorphized per blob type `T` and stored as a fn-ptr in the journal overlay. Produces bytes
-/// IDENTICAL to a direct `encode`, so deferring serialization to block end leaves the commitment
-/// byte-stream (and the on-trie anchor) unchanged. A type mismatch / encode failure is a bug.
-fn ser_blob<T: Serialize + Send + Sync + 'static>(v: &PerpBlob) -> Vec<u8> {
-    let val = v
-        .downcast_ref::<T>()
-        .expect("perp ser_blob: overlay value type mismatch (bug)");
-    let buf = encode(val).expect("perp ser_blob: blob encode failed (bug)");
-    #[cfg(test)]
-    bench_counter::record_block_end_ser(buf.len());
-    buf
-}
-
-/// Clones a type-erased off-trie blob into a fresh box (keeps the journal overlay `Clone`).
-fn clone_blob<T: Clone + Send + Sync + 'static>(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
-    let val = v
-        .downcast_ref::<T>()
-        .expect("perp clone_blob: overlay value type mismatch (bug)");
-    std::boxed::Box::new(val.clone())
-}
-
-/// Cached typed write of an off-trie blob (#16d Phase 2): DEFERS serialization. Stores the
-/// deserialized struct plus its monomorphized `ser`/`clone` fns in the journal overlay; the
-/// block-end `take_perp_delta` lowers it to canonical bytes ONCE (so a key written N times this
-/// block is serialized once, not N times). No per-write `encode`, and the struct overlay doubles as
-/// the in-block read cache — `store_struct` invalidates the #14 cold-read cache for this key.
-///
-/// DEAD as of Stage-B completion — see [`load_cached`]. Removed with the Struct tier in Stage C.
-#[allow(dead_code)]
-fn save_cached<CTX: ContextTr, T>(
-    context: &mut CTX,
-    key: B256,
-    val: &T,
-) -> Result<(), PrecompileError>
-where
-    T: Clone + Send + Sync + 'static + Serialize,
-{
-    // Bench-only A/B lever (#16d measurement): serialize on every write into the byte overlay,
-    // reproducing pre-#16d behavior so a bench can diff per-call vs deferred ser cost.
-    #[cfg(test)]
-    if bench_counter::force_percall() {
-        let buf = encode(val)?;
-        return store_blob(context, key, &buf);
-    }
-    context.journal_mut().perp_store_struct(
-        key,
-        std::boxed::Box::new(val.clone()),
-        ser_blob::<T>,
-        clone_blob::<T>,
-    );
-    Ok(())
-}
+// ── (Stage C) type-erased Struct-tier read/write machinery REMOVED ──────────────
+// `load_cached` / `save_cached` (the #14-cached deferred-`Struct` reader/writer) and their
+// `ser_blob` / `clone_blob` fn-pointers are gone: every hot namespace reads/writes the strongly-
+// typed live store, and every cold namespace uses the byte tier (`load_blob` / `store_blob`). The
+// journal's `PerpEntry::Struct`/`Cached`, the #14 cache, and the `perp_get_struct*`/`perp_cache_*`/
+// `perp_store_struct` seam are deleted in revm-context alongside this. The cross-block decoded read
+// (`perp_load_arc`, 选项A) survives — the typed store's cold path uses it (see `cold_load`).
 
 /// Returns `Address::ZERO` when no admin has been initialised yet.
 pub fn load_admin<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {

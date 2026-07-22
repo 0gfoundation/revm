@@ -6,8 +6,7 @@ use bytecode::Bytecode;
 use context_interface::{
     context::{SStoreResult, SelfDestructResult, StateLoad},
     journaled_state::{
-        AccountLoad, JournalCheckpoint, PerpBlob, PerpDelta, PerpDeltaEntry, PerpStore,
-        TransferError,
+        AccountLoad, JournalCheckpoint, PerpDelta, PerpDeltaEntry, PerpStore, TransferError,
     },
 };
 use core::mem;
@@ -29,300 +28,59 @@ use std::vec::Vec;
 /// keys written during the current block (reads pass through to the committed store without
 /// caching). See
 /// `docs/perpstate-journal集成方案.md`.
-// #16d Phase 2: drops PartialEq/Eq/serde (all unused on the journal types — verified zero usage)
-// so `working` can hold deserialized blobs (`Box<dyn Any>`, neither Eq nor serde). Clone is kept;
-// `PerpEntry` stays Clone via a per-entry clone fn-pointer.
+// (Stage C) `working` is now a plain BYTE overlay. The type-erased Struct/Cached tiers (dyn-Any
+// deferred writes + the #14 cold-read cache) are removed: hot perp state lives in the precompile's
+// strongly-typed live store (see [`JournalInner::perp_live`]); only the COLD namespaces (roles,
+// index/funding, insurance, api keys, replay guards, registry, fee/trade counters) use this tier.
 #[derive(Debug, Clone, Default)]
 pub struct PerpSection {
-    /// Single in-block map holding three tiers of [`PerpEntry`] (catalog #14 cache folded in here,
-    /// so a read probes ONE map instead of two):
-    /// * `Struct` — a deferred deserialized WRITE (serialized once at block end).
-    /// * `Bytes` — a raw-byte WRITE (e.g. `store_blob`); `Bytes(empty)` = absent/deleted.
-    /// * `Cached` — a cold-read ACCELERATOR (decoded blob copied from the committed store); NOT a
-    ///   write, so it is excluded from the block delta and cleared at the block boundary.
-    /// Invariant: at most one entry per key. A write overwrites any `Cached`; [`Self::cache_put`]
-    /// never overwrites a `Struct`/`Bytes` write (that would drop the write from the delta).
-    working: HashMap<B256, PerpEntry>,
+    /// In-block byte overlay for the cold off-trie namespaces. A write is a raw byte value;
+    /// `Vec::new()` (empty) is the deleted-key convention. The committed cross-block store serves
+    /// any key NOT written here (overlay precedence via [`Self::has_write`]).
+    working: HashMap<B256, Vec<u8>>,
     /// Whether the CURRENT transaction has written the overlay (commit-only #23: perp writes are
-    /// never rolled back, so this only guards the discard_tx invariant — a tx-level abort after
-    /// perp writes is a corruption-anyway condition and halts loudly). A cache fill does NOT set
-    /// this (it is not a write).
+    /// never rolled back, so this only guards the discard_tx invariant — a tx-level abort after a
+    /// perp write is a corruption-anyway condition and halts loudly).
     dirty_this_tx: bool,
-    /// Monotonic count of off-trie overlay WRITES on THIS journal (commit-only #23 diagnostic).
-    /// Bumped by `store_bytes`/`store_struct`/`get_struct_mut`. A precompile call snapshots it
-    /// before dispatch and re-reads on a REVERTED exit; an increase means a residual
-    /// write-then-error (validate-then-apply was violated). Not consensus state. Journal-local (was
-    /// a process-wide atomic) — the tripwire only ever diffs it within one single-threaded call, so
-    /// a plain non-atomic increment on the `&mut self` write path is sufficient and cheaper.
+    /// Monotonic count of byte-overlay WRITES on THIS journal (commit-only #23 diagnostic; summed
+    /// with the typed live store's counter by [`JournalInner::perp_write_count`]). Journal-local,
+    /// diffed only within one single-threaded call → plain non-atomic increment.
     write_count: u64,
-    /// Shadow-phase (live-struct co-design): append-only list of keys written this block, one push
-    /// per `store_struct` / `store_bytes` (the only two paths that put a delta-eligible entry into
-    /// `working`). Deduplicated at [`Self::take_delta`] to reproduce the block delta's key-set +
-    /// bytes — validates that EVERY write funnels through those two choke points before the overlay
-    /// is later swapped for a live typed store. Per-block (mirrors `working`; cleared in take_delta,
-    /// NOT in commit_tx). Debug-only bookkeeping — not consensus state, excluded from the commitment;
-    /// compiled out entirely in release (Phase 1 has no production role for it — the delta is still
-    /// the overlay drain). Becomes the primary delta producer in Phase 2 (then release-active).
-    #[cfg(debug_assertions)]
-    dirty_keys: Vec<B256>,
-}
-
-/// One off-trie overlay value (#16d Phase 2). A typed `save_*` write stores the DESERIALIZED blob
-/// (`Struct`) and defers serialization to block end; a raw byte write (`store_blob`, e.g. level
-/// queues) stores `Bytes`. Both lower to the canonical off-trie bytes via `into_bytes`/`to_bytes`;
-/// `Bytes(empty)` is the deleted-key convention. The `ser`/`clone` fn pointers are monomorphized in
-/// the precompile (carrying the blob type + msgpack codec), so this crate stays format-agnostic and
-/// the entry is `Clone` without cloning through `dyn Any`.
-enum PerpEntry {
-    Struct {
-        val: std::boxed::Box<PerpBlob>,
-        ser: fn(&PerpBlob) -> Vec<u8>,
-        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
-    },
-    Bytes(Vec<u8>),
-    /// Cold-read accelerator (catalog #14, folded into `working`): a decoded blob shared from the
-    /// committed store. NOT a write — excluded from the block delta, carries no `ser` fn (served to
-    /// typed reads only; byte reads fall through to the store), and reclaimed at the block boundary.
-    Cached(std::sync::Arc<PerpBlob>),
-}
-
-impl Clone for PerpEntry {
-    fn clone(&self) -> Self {
-        match self {
-            PerpEntry::Struct { val, ser, clone } => PerpEntry::Struct {
-                val: clone(val.as_ref()),
-                ser: *ser,
-                clone: *clone,
-            },
-            PerpEntry::Bytes(b) => PerpEntry::Bytes(b.clone()),
-            // Cache tier: refcount bump, no deep clone.
-            PerpEntry::Cached(arc) => PerpEntry::Cached(arc.clone()),
-        }
-    }
-}
-
-impl core::fmt::Debug for PerpEntry {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            PerpEntry::Struct { .. } => f.write_str("PerpEntry::Struct(..)"),
-            PerpEntry::Bytes(b) => write!(f, "PerpEntry::Bytes({} bytes)", b.len()),
-            PerpEntry::Cached(_) => f.write_str("PerpEntry::Cached(..)"),
-        }
-    }
 }
 
 impl PerpSection {
-    /// Reads the overlay for `key` as canonical bytes (in-block writes only); `None` = not written.
-    /// A deferred `Struct` is serialized on demand — rare via this path (the typed read uses
-    /// `get_struct`); byte-path keys (level queues) are the common case and just clone.
+    /// Reads the byte overlay for `key` (in-block writes only); `None` = not written this block.
     #[inline]
     fn get_bytes(&self, key: B256) -> Option<Vec<u8>> {
-        match self.working.get(&key)? {
-            PerpEntry::Struct { val, ser, .. } => Some(ser(val.as_ref())),
-            PerpEntry::Bytes(b) => Some(b.clone()),
-            // Cache tier serves typed reads only (no `ser` fn); byte reads of a cached-only key
-            // fall through to the committed store (whose bytes equal the cached blob's).
-            PerpEntry::Cached(_) => None,
-        }
+        self.working.get(&key).cloned()
     }
 
-    /// Whether `key` has an in-block WRITE (`Struct`/`Bytes`) — excludes the cache tier, so a
-    /// cold-read accelerator never shadows the committed store on the cross-block read path.
+    /// Whether `key` has an in-block byte WRITE (incl. an empty-bytes delete) — drives the
+    /// cross-block read's overlay precedence.
     #[inline]
     fn has_write(&self, key: B256) -> bool {
-        matches!(
-            self.working.get(&key),
-            Some(PerpEntry::Struct { .. }) | Some(PerpEntry::Bytes(_))
-        )
+        self.working.contains_key(&key)
     }
 
-    /// Immutable typed read tier (one probe): serves both a deferred `Struct` WRITE and a `Cached`
-    /// cold-read blob. `None` for a raw `Bytes` write or an absent key. Folding the #14 cache in
-    /// here lets the read path drop its separate cache probe.
-    #[inline]
-    fn get_struct(&self, key: B256) -> Option<&PerpBlob> {
-        match self.working.get(&key) {
-            Some(PerpEntry::Struct { val, .. }) => Some(val.as_ref()),
-            Some(PerpEntry::Cached(arc)) => Some(arc.as_ref()),
-            _ => None,
-        }
-    }
-
-    /// Mutable handle into a deferred `Struct` WRITE for IN-PLACE mutation (catalog #21). Returns
-    /// `None` for `Cached` (a shared Arc is not uniquely mutable — the caller materializes it as a
-    /// `Struct` write first), `Bytes`, or absent.
-    /// commit-only (#23): NO undo snapshot is taken — perp writes are never rolled back (the
-    /// EOA-direct guard forbids enclosing frames; genuine rejects are validate-then-apply and
-    /// zero-write; remaining error paths are corruption-anyway class).
-    #[inline]
-    fn get_struct_mut(&mut self, key: B256) -> Option<&mut PerpBlob> {
-        if !matches!(self.working.get(&key), Some(PerpEntry::Struct { .. })) {
-            return None;
-        }
-        self.dirty_this_tx = true;
-        self.write_count += 1;
-        match self.working.get_mut(&key) {
-            Some(PerpEntry::Struct { val, .. }) => Some(val.as_mut()),
-            // Unreachable: matched `Struct` above and `working` was not touched since.
-            _ => None,
-        }
-    }
-
-    /// Writes raw `Bytes` (byte-path writers, e.g. `store_blob`). Overwrites any `Cached` tier for
-    /// this key. commit-only: no undo record.
+    /// Writes a raw byte value (byte-path writers, e.g. `store_blob`). `Vec::new()` = delete.
+    /// commit-only: no undo record.
     #[inline]
     fn store_bytes(&mut self, key: B256, value: Vec<u8>) {
-        self.working.insert(key, PerpEntry::Bytes(value));
+        self.working.insert(key, value);
         self.dirty_this_tx = true;
         self.write_count += 1;
-        #[cfg(debug_assertions)]
-        self.dirty_keys.push(key);
     }
 
-    /// Writes a deferred `Struct` (typed writers): no serialization now — lowered to bytes once at
-    /// `take_delta`. Overwrites any `Cached` tier. commit-only: no undo record.
-    #[inline]
-    fn store_struct(
-        &mut self,
-        key: B256,
-        val: std::boxed::Box<PerpBlob>,
-        ser: fn(&PerpBlob) -> Vec<u8>,
-        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
-    ) {
-        self.working
-            .insert(key, PerpEntry::Struct { val, ser, clone });
-        self.dirty_this_tx = true;
-        self.write_count += 1;
-        #[cfg(debug_assertions)]
-        self.dirty_keys.push(key);
-    }
-
-    /// Drains the net in-block WRITES as a [`PerpDelta`], serializing each `Struct` to canonical
-    /// bytes ONCE here (#16d). `Cached` entries are cold-read accelerators, NOT writes — dropped
-    /// here (never enter the delta / commitment), which also clears the cache at the block boundary.
+    /// Drains the net in-block byte WRITES as a [`PerpDelta`] (empty value = delete). Carries no
+    /// decoded struct (byte tier); the typed live store contributes its own decoded entries to the
+    /// union in [`JournalInner::take_perp_delta`].
     #[inline]
     fn take_delta(&mut self) -> PerpDelta {
         self.dirty_this_tx = false;
-
-        // Shadow-phase check (live-struct co-design phase 1): materialize the delta BYTES from the
-        // append-only `dirty_keys` list using the SAME point-lookup + serialize the phase-2 live
-        // store producer will use, so it can be compared below against the authoritative overlay
-        // drain. A dirty key that is missing / `Cached` here means a write reached the overlay
-        // WITHOUT going through `store_struct`/`store_bytes` (the only two push sites) — the exact
-        // hazard the shadow phase exists to catch. Debug-only; the production delta is still the
-        // drain. Golden-neutral (nothing here feeds the commitment).
-        #[cfg(debug_assertions)]
-        let shadow_bytes: std::collections::BTreeMap<B256, Vec<u8>> = {
-            let mut m = std::collections::BTreeMap::new();
-            for &k in &self.dirty_keys {
-                match self.working.get(&k) {
-                    Some(PerpEntry::Struct { val, ser, .. }) => {
-                        // last-write-wins (a key pushed N times overwrites — matches the overlay)
-                        m.insert(k, ser(val.as_ref()));
-                    }
-                    Some(PerpEntry::Bytes(b)) => {
-                        m.insert(k, b.clone());
-                    }
-                    other => debug_assert!(
-                        false,
-                        "perp dirty key {k:?} is not a Struct/Bytes overlay write: {other:?}"
-                    ),
-                }
-            }
-            m
-        };
-
-        // Authoritative production delta: drain the overlay (unchanged behavior).
-        let delta: PerpDelta = mem::take(&mut self.working)
+        mem::take(&mut self.working)
             .into_iter()
-            .filter_map(|(k, e)| match e {
-                // Typed write: serialize ONCE for commitment/persistence (byte-identical to the
-                // pre-Arc pipeline) and ride the decoded struct along for the committed cross-block
-                // store (选项A) — Box -> Arc, no re-decode.
-                PerpEntry::Struct { val, ser, .. } => {
-                    let bytes = ser(val.as_ref());
-                    Some((
-                        k,
-                        PerpDeltaEntry {
-                            decoded: Some(std::sync::Arc::from(val)),
-                            bytes,
-                        },
-                    ))
-                }
-                PerpEntry::Bytes(b) => Some((
-                    k,
-                    PerpDeltaEntry {
-                        decoded: None,
-                        bytes: b,
-                    },
-                )),
-                // Cache tier: not a block write → excluded from the delta (and thus dropped here).
-                PerpEntry::Cached(_) => None,
-            })
-            .collect();
-
-        // Shadow-phase assert: the dirty-key-driven bytes map must equal the drained delta's bytes,
-        // key-for-key. A size/key/bytes mismatch = a write bypassed the choke points or the
-        // dirty-key producer diverges from the overlay drain (the phase-2 producer is wrong).
-        #[cfg(debug_assertions)]
-        {
-            debug_assert_eq!(
-                shadow_bytes.len(),
-                delta.len(),
-                "perp shadow delta size {} != drained delta size {} (a write bypassed store_struct/store_bytes?)",
-                shadow_bytes.len(),
-                delta.len()
-            );
-            for (k, dentry) in &delta {
-                match shadow_bytes.get(k) {
-                    Some(sb) => debug_assert!(
-                        *sb == dentry.bytes,
-                        "perp shadow bytes mismatch for key {k:?}"
-                    ),
-                    None => debug_assert!(
-                        false,
-                        "perp key {k:?} in drained delta but absent from dirty_keys"
-                    ),
-                }
-            }
-        }
-
-        // dirty_keys mirrors `working` (per-block): drained here, never at commit_tx/finalize.
-        #[cfg(debug_assertions)]
-        self.dirty_keys.clear();
-        delta
-    }
-
-    /// Cache-tier read (type-erased). See [`PerpEntry::Cached`].
-    #[inline]
-    fn cache_get(&self, key: B256) -> Option<&PerpBlob> {
-        match self.working.get(&key) {
-            Some(PerpEntry::Cached(arc)) => Some(arc.as_ref()),
-            _ => None,
-        }
-    }
-
-    /// Cache-tier `Arc` (refcount bump, no deep clone) for zero-copy typed reads (点1).
-    #[inline]
-    fn cache_get_arc(&self, key: B256) -> Option<std::sync::Arc<PerpBlob>> {
-        match self.working.get(&key) {
-            Some(PerpEntry::Cached(arc)) => Some(arc.clone()),
-            _ => None,
-        }
-    }
-
-    /// Populates the cache tier from a cold/cross-block read. Does NOT set `dirty_this_tx` or bump
-    /// the write counter (a cache fill is not a write). CRITICAL: must never overwrite a `Struct`/
-    /// `Bytes` WRITE for this key — that would drop the write from the block delta (a consensus
-    /// bug). A write always wins; the cache only fills absent-or-already-cached slots.
-    #[inline]
-    fn cache_put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
-        match self.working.get(&key) {
-            Some(PerpEntry::Struct { .. }) | Some(PerpEntry::Bytes(_)) => {} // write wins
-            _ => {
-                self.working.insert(key, PerpEntry::Cached(value));
-            }
-        }
+            .map(|(k, bytes)| (k, PerpDeltaEntry { decoded: None, bytes }))
+            .collect()
     }
 }
 
@@ -437,50 +195,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         self.perp.store_bytes(key, value);
     }
 
-    /// Writes a deferred deserialized blob (#16d Phase 2): serialization is deferred to the
-    /// block-end `take_perp_delta`. `ser`/`clone` are monomorphized in the precompile, so this
-    /// crate stays format-agnostic.
-    #[inline]
-    pub fn perp_store_struct(
-        &mut self,
-        key: B256,
-        val: std::boxed::Box<PerpBlob>,
-        ser: fn(&PerpBlob) -> Vec<u8>,
-        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
-    ) {
-        self.perp.store_struct(key, val, ser, clone);
-    }
-
-    /// Reads a deferred `Struct` overlay value (type-erased) for the typed fast-path read.
-    #[inline]
-    pub fn perp_get_struct(&self, key: B256) -> Option<&PerpBlob> {
-        self.perp.get_struct(key)
-    }
-
-    /// Mutable handle into a deferred `Struct` overlay value for in-place mutation (catalog #21);
-    /// snapshots the prior value for revert. `None` if absent or stored as raw bytes.
-    #[inline]
-    pub fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut PerpBlob> {
-        self.perp.get_struct_mut(key)
-    }
-
-    /// Reads the block-scoped deserialized PerpDEX blob cache (catalog #14; type-erased).
-    #[inline]
-    pub fn perp_cache_get(&self, key: B256) -> Option<&PerpBlob> {
-        self.perp.cache_get(key)
-    }
-
-    /// Returns the cached blob `Arc` (refcount bump, no deep clone) for zero-copy typed reads (点1).
-    #[inline]
-    pub fn perp_cache_get_arc(&self, key: B256) -> Option<std::sync::Arc<PerpBlob>> {
-        self.perp.cache_get_arc(key)
-    }
-
-    /// Inserts a deserialized PerpDEX blob into the block-scoped read cache.
-    #[inline]
-    pub fn perp_cache_put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
-        self.perp.cache_put(key, value);
-    }
+    // (Stage C) Struct-tier delegators (perp_store_struct / perp_get_struct / perp_get_struct_mut /
+    // perp_cache_*) removed with the dyn-Any overlay tier.
 
     /// Drains the block's net off-trie PerpDEX writes ([`PerpDelta`]).
     ///
@@ -1424,7 +1140,7 @@ pub fn sload_with_account<DB: Database, ENTRY: JournalEntryTr>(
 
 #[cfg(test)]
 mod perp_tests {
-    use super::{JournalInner, PerpBlob};
+    use super::JournalInner;
     use crate::journal::JournalEntry;
     use primitives::B256;
 
@@ -1509,83 +1225,11 @@ mod perp_tests {
         assert!(!j.perp.dirty_this_tx);
     }
 
-    // #16d Phase 2 — deferred-struct overlay path.
-    fn ser_u32(v: &PerpBlob) -> Vec<u8> {
-        v.downcast_ref::<u32>().unwrap().to_le_bytes().to_vec()
-    }
-    fn clone_u32(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
-        std::boxed::Box::new(*v.downcast_ref::<u32>().unwrap())
-    }
-
-    #[test]
-    fn perp_store_struct_defers_serialization() {
-        let mut j = new_inner();
-        j.perp_store_struct(k(1), std::boxed::Box::new(7u32), ser_u32, clone_u32);
-
-        // Typed fast-path read returns the struct (no serialization).
-        assert_eq!(
-            j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(),
-            Some(&7u32)
-        );
-        // Byte-interface read serializes on demand (same bytes the delta will carry).
-        assert_eq!(j.perp_get_overlay(k(1)), Some(7u32.to_le_bytes().to_vec()));
-        // Clone (the JournalInner Clone path) preserves the deferred struct via the clone fn-ptr.
-        let j2 = j.clone();
-        assert_eq!(
-            j2.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(),
-            Some(&7u32)
-        );
-        // Block-end drain serializes ONCE.
-        let delta = j.take_perp_delta();
-        assert_eq!(
-            delta.get(&k(1)).map(|e| &e.bytes),
-            Some(&7u32.to_le_bytes().to_vec())
-        );
-    }
-
-    #[test]
-    fn perp_store_struct_survives_checkpoint_revert() {
-        // commit-only (#23): deferred-struct writes also survive frame reverts.
-        let mut j = new_inner();
-        let cp = j.checkpoint();
-        j.perp_store_struct(k(1), std::boxed::Box::new(42u32), ser_u32, clone_u32);
-        j.checkpoint_revert(cp);
-        assert!(j.perp_get_struct(k(1)).is_some());
-        assert_eq!(j.perp_get_overlay(k(1)), Some(42u32.to_le_bytes().to_vec()));
-    }
-
-    #[test]
-    fn perp_get_struct_mut_mutates_in_place_commit_only() {
-        let mut j = new_inner();
-        j.perp_store_struct(k(1), std::boxed::Box::new(10u32), ser_u32, clone_u32);
-        j.commit_tx();
-
-        let cp = j.checkpoint();
-        // In-place mutation via the &mut handle — no load/store round-trip, and commit-only:
-        // NO undo snapshot (the deleted deep-clone this migration removes).
-        *j.perp_get_struct_mut(k(1))
-            .unwrap()
-            .downcast_mut::<u32>()
-            .unwrap() = 99;
-        assert_eq!(
-            j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(),
-            Some(&99u32)
-        );
-        // Block-end serialization would carry the mutated value.
-        assert_eq!(j.perp_get_overlay(k(1)), Some(99u32.to_le_bytes().to_vec()));
-
-        // The mutation survives a frame revert (commit-only).
-        j.checkpoint_revert(cp);
-        assert_eq!(
-            j.perp_get_struct(k(1)).unwrap().downcast_ref::<u32>(),
-            Some(&99u32)
-        );
-
-        // Absent and raw-`Bytes` keys cannot be mutated in place.
-        assert!(j.perp_get_struct_mut(k(2)).is_none());
-        j.perp_store(k(3), vec![1, 2, 3]);
-        assert!(j.perp_get_struct_mut(k(3)).is_none());
-    }
+    // (Stage C) The deferred-`Struct` overlay tests (perp_store_struct_defers_serialization,
+    // perp_store_struct_survives_checkpoint_revert, perp_get_struct_mut_mutates_in_place_commit_only)
+    // were removed with the dyn-Any Struct tier. The byte-tier overlay behavior they shared
+    // (checkpoint-revert survival, commit-only, per-tx finalize, take_delta drain) is still covered
+    // by the perp_store/perp_get_overlay tests in this module; the typed live store has its own tests.
 
     #[test]
     fn finalize_excludes_perp_from_state_but_preserves_block_overlay() {

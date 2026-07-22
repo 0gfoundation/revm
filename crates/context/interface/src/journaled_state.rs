@@ -351,60 +351,11 @@ pub trait JournalTr {
         let _ = (key, value);
     }
 
-    /// Writes a deferred deserialized off-trie blob (#16d Phase 2): the value is kept type-erased
-    /// and serialized to bytes ONCE at block end (`take_perp_delta`) via `ser`, instead of on every
-    /// write. `clone` keeps the overlay `Clone`. Both fns are monomorphized by the caller (the
-    /// precompile), so this crate needs no blob types or codec. Default backend is a no-op.
-    fn perp_store_struct(
-        &mut self,
-        key: B256,
-        val: std::boxed::Box<PerpBlob>,
-        ser: fn(&PerpBlob) -> Vec<u8>,
-        clone: fn(&PerpBlob) -> std::boxed::Box<PerpBlob>,
-    ) {
-        let _ = (key, val, ser, clone);
-    }
-
-    /// Reads a deferred `Struct` off-trie overlay value (type-erased) written this block; `None` if
-    /// absent or written as raw bytes. The caller downcasts + clones (skipping deserialization).
-    /// Default backend keeps no overlay and returns `None`.
-    fn perp_get_struct(&mut self, key: B256) -> Option<&PerpBlob> {
-        let _ = key;
-        None
-    }
-
-    /// Mutable handle into a deferred `Struct` off-trie overlay value for IN-PLACE mutation
-    /// (catalog #21): the caller downcasts to `&mut T` and mutates the live struct, avoiding the
-    /// load(clone)→modify→store(clone) round-trip. The backend snapshots the prior value into its
-    /// revert log first. `None` if absent or written as raw bytes. Default backend returns `None`.
-    fn perp_get_struct_mut(&mut self, key: B256) -> Option<&mut PerpBlob> {
-        let _ = key;
-        None
-    }
-
-    /// Reads the block-scoped deserialized off-trie blob cache (catalog #14): a per-block
-    /// accelerator that lets the precompile skip re-deserializing a blob it already decoded this
-    /// block. Type-erased (this crate does not know the blob types); the caller downcasts and
-    /// clones. The default backend keeps no cache and returns `None`.
-    fn perp_cache_get(&mut self, key: B256) -> Option<&PerpBlob> {
-        let _ = key;
-        None
-    }
-
-    /// Returns the cached blob `Arc` itself (refcount bump, no deep clone) for zero-copy typed
-    /// reads (点1 borrow-read): the caller `Arc::downcast`s to `Arc<T>` and reads via `&*arc`,
-    /// eliminating the per-read deep clone that `perp_cache_get` + downcast+clone incurs. Default
-    /// backend keeps no cache → `None`.
-    fn perp_cache_get_arc(&mut self, key: B256) -> Option<std::sync::Arc<PerpBlob>> {
-        let _ = key;
-        None
-    }
-
-    /// Inserts a deserialized off-trie blob into the block-scoped read cache (no-op by default).
-    /// Automatically invalidated on the next [`JournalTr::perp_store`] of the same key.
-    fn perp_cache_put(&mut self, key: B256, value: std::sync::Arc<PerpBlob>) {
-        let _ = (key, value);
-    }
+    // (Stage C) The type-erased Struct-tier seam — perp_store_struct / perp_get_struct /
+    // perp_get_struct_mut / perp_cache_get / perp_cache_get_arc / perp_cache_put — is REMOVED.
+    // Hot namespaces live in the precompile's strongly-typed store (installed via
+    // [`JournalTr::perp_live_init`]); cold namespaces use the byte tier ([`JournalTr::perp_store`] /
+    // [`JournalTr::perp_load`]). `perp_load_arc` (选项A cross-block decoded read) survives above.
 
     /// Drains and returns the block's net off-trie PerpDEX writes ([`PerpDelta`]).
     ///
