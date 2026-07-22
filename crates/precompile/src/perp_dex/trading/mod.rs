@@ -26,7 +26,7 @@ use crate::{
         },
         math::{
             calc_maker_fee_for_order_qty_with_bps, calc_reservation_notionals, calc_trading_fee,
-            calc_value, effective_price_band_bps,
+            calc_value,
         },
         risk::record_mid_price_sample_for_best_quote_change,
         storage,
@@ -485,28 +485,12 @@ fn validate_place_order<CTX: ContextTr>(
         if market.tick_size > 0 && price % market.tick_size != 0 {
             return Err(perp_err("placeOrder: price not multiple of tick_size"));
         }
-        // Price band (K9 mitigation): reject a limit order whose price is farther
-        // than +-price_band_bps from the current mark. This blocks trading at a
-        // manufactured off-mark price (the mint vector). Enforced at placement per
-        // design; a stale resting order that drifts out of band after a mark move is
-        // handled by the fill-time solvency guard, not here. `price_band_bps == 0`
-        // uses the default; `>= 10_000` widens the lower bound to 0 (toward disabled).
-        // Market orders carry no limit price and are bounded by the in-band book.
-        let mark = storage::load_mark_price(context, market_id)?;
-        if mark > 0 {
-            let bps = effective_price_band_bps(market.price_band_bps) as u128;
-            let mark_u = mark as u128;
-            let upper = mark_u.saturating_mul(10_000 + bps) / 10_000;
-            let lower = if bps >= 10_000 {
-                0
-            } else {
-                mark_u * (10_000 - bps) / 10_000
-            };
-            let price_u = price as u128;
-            if price_u < lower || price_u > upper {
-                return Err(perp_err("placeOrder: price outside price band"));
-            }
-        }
+        // No placement-time price band: an out-of-band limit order is allowed to REST
+        // (a deep passive order is harmless — it can only ever fill if the mark legitimately
+        // reaches it). The off-mark guard lives at FILL time in `match_order` /
+        // `check_fok_feasibility` (see `math::mark_band_bounds`), which is immune to
+        // post-placement mark drift and also bounds market-order slippage. The upper price
+        // sanity cap (`price > market.max_price`) above still prevents absurd book pollution.
     }
 
     Ok(ValidatedOrder {
@@ -707,6 +691,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 price,
                 quantity,
                 order.order_type,
+                &order.market,
             )?;
             let remaining = match_order(
                 context,
@@ -743,6 +728,7 @@ fn execute_market_order<CTX: ContextTr>(
             price,
             quantity,
             order.order_type,
+            &order.market,
         )?;
     }
     let remaining = match_order(
@@ -828,6 +814,16 @@ pub(super) fn match_order<CTX: ContextTr>(
     let mut taker_order = storage::load_order(context, taker_order_id)?
         .ok_or_else(|| perp_invariant_err("taker order missing during match"))?;
 
+    // Fill-time price band: a fill may never execute farther than ±band from the CURRENT
+    // mark, regardless of order type. Because each side of the book is sorted, this is a
+    // clean early break — the first out-of-band level ends matching and everything past it
+    // (necessarily farther) is skipped. This is the sole off-mark guard (there is no
+    // placement-time band): it sees post-placement mark drift, lets harmless deep passive
+    // orders rest, and gives market orders implicit slippage protection.
+    let mark = storage::load_mark_price(context, market_id)?;
+    let (mark_upper, mark_lower) =
+        crate::perp_dex::math::mark_band_bounds(mark, market.price_band_bps);
+
     match side {
         Side::Buy => {
             // Match against asks (sorted ASC: lowest ask first).
@@ -835,8 +831,18 @@ pub(super) fn match_order<CTX: ContextTr>(
             let old_best_ask = ask_prices.first().copied().unwrap_or(0);
             let mut ask_levels_cleared = false;
             'outer: for ask_price in ask_prices.iter().copied() {
+                // Fill-time band (lower): an ask below mark-band is an off-mark price
+                // (e.g. a closing maker dumping cheap); skip it — higher, in-band asks may
+                // still match. It stays resting until the mark legitimately reaches it.
+                if (ask_price as u128) < mark_lower {
+                    continue;
+                }
                 // For limit buy: only match if ask_price <= our limit.
                 if order_type == OrderType::Limit && ask_price > limit_price {
+                    break;
+                }
+                // Fill-time band (upper): asks above mark+band end matching (ascending).
+                if ask_price as u128 > mark_upper {
                     break;
                 }
                 let queue = storage::load_ask_level_arc(context, market_id, ask_price)?;
@@ -986,8 +992,18 @@ pub(super) fn match_order<CTX: ContextTr>(
             let old_best_bid = bid_prices.first().copied().unwrap_or(0);
             let mut bid_levels_cleared = false;
             'outer: for bid_price in bid_prices.iter().copied() {
+                // Fill-time band (upper): a bid above mark+band is an off-mark price
+                // (e.g. a closing maker buying rich); skip it — lower, in-band bids may
+                // still match. It stays resting until the mark legitimately reaches it.
+                if (bid_price as u128) > mark_upper {
+                    continue;
+                }
                 // For limit sell: only match if bid_price >= our limit.
                 if order_type == OrderType::Limit && bid_price < limit_price {
+                    break;
+                }
+                // Fill-time band (lower): bids below mark-band end matching (descending).
+                if (bid_price as u128) < mark_lower {
                     break;
                 }
                 let queue = storage::load_bid_level_arc(context, market_id, bid_price)?;
@@ -1686,13 +1702,26 @@ fn check_fok_feasibility<CTX: ContextTr>(
     limit_price: u64,
     quantity: u64,
     order_type: OrderType,
+    market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
     let mut available: u64 = 0;
+    // Count only IN-BAND liquidity: match_order will not fill past the band, so FOK
+    // feasibility must apply the same bound or it would pass a FOK that then can't fully
+    // fill.
+    let mark = storage::load_mark_price(context, market_id)?;
+    let (mark_upper, mark_lower) =
+        crate::perp_dex::math::mark_band_bounds(mark, market.price_band_bps);
     match side {
         Side::Buy => {
             let ask_prices = storage::load_ask_prices_ref(context, market_id)?;
             'outer: for ask_price in ask_prices.iter().copied() {
+                if (ask_price as u128) < mark_lower {
+                    continue;
+                }
                 if order_type == OrderType::Limit && ask_price > limit_price {
+                    break;
+                }
+                if ask_price as u128 > mark_upper {
                     break;
                 }
                 let queue = storage::load_ask_level_arc(context, market_id, ask_price)?;
@@ -1711,7 +1740,13 @@ fn check_fok_feasibility<CTX: ContextTr>(
         Side::Sell => {
             let bid_prices = storage::load_bid_prices_ref(context, market_id)?;
             'outer: for bid_price in bid_prices.iter().copied() {
+                if (bid_price as u128) > mark_upper {
+                    continue;
+                }
                 if order_type == OrderType::Limit && bid_price < limit_price {
+                    break;
+                }
+                if (bid_price as u128) < mark_lower {
                     break;
                 }
                 let queue = storage::load_bid_level_arc(context, market_id, bid_price)?;
