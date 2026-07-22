@@ -39,6 +39,29 @@ pub fn effective_price_band_bps(price_band_bps: u32) -> u32 {
     }
 }
 
+/// Inclusive price-band bounds `(upper, lower)` around `mark`, in the u128 price space.
+/// A price `P` is IN band iff `lower <= P <= upper`. The band is enforced at FILL time
+/// (in the matching loop), not at placement: a resting order may sit anywhere in the
+/// book, but a taker/liquidation fill never executes farther than ±band from the CURRENT
+/// mark — which is immune to post-placement mark drift and lets harmless deep passive
+/// orders rest. `mark == 0` (unset) returns `(u128::MAX, 0)` = no band. `bps >= 10_000`
+/// widens the lower bound to `0` (matching [`effective_price_band_bps`] "disabled").
+#[inline]
+pub fn mark_band_bounds(mark: u64, price_band_bps: u32) -> (u128, u128) {
+    if mark == 0 {
+        return (u128::MAX, 0);
+    }
+    let bps = effective_price_band_bps(price_band_bps) as u128;
+    let m = mark as u128;
+    let upper = m.saturating_mul(10_000 + bps) / 10_000;
+    let lower = if bps >= 10_000 {
+        0
+    } else {
+        m * (10_000 - bps) / 10_000
+    };
+    (upper, lower)
+}
+
 #[inline]
 fn pow10_u128(exp: u32) -> Result<u128, PrecompileError> {
     10u128
@@ -816,5 +839,47 @@ mod funding_payment_tests {
             calc_funding_payment(10, -DELTA_ONE_EPOCH, 0, 2).unwrap(),
             7_500_000
         );
+    }
+}
+
+#[cfg(test)]
+mod mark_band_bounds_tests {
+    use super::{mark_band_bounds, DEFAULT_PRICE_BAND_BPS};
+
+    #[test]
+    fn unset_mark_disables_band() {
+        // mark == 0: cannot evaluate a band -> (MAX, 0) = no bound either way.
+        assert_eq!(mark_band_bounds(0, 1_000), (u128::MAX, 0));
+        assert_eq!(mark_band_bounds(0, 0), (u128::MAX, 0));
+    }
+
+    #[test]
+    fn zero_bps_uses_default_ten_percent() {
+        assert_eq!(DEFAULT_PRICE_BAND_BPS, 1_000);
+        // mark 100 -> [90, 110].
+        assert_eq!(mark_band_bounds(100, 0), (110, 90));
+    }
+
+    #[test]
+    fn configured_bps_is_used_verbatim() {
+        // 500 bps = +-5%. mark 100 -> [95, 105].
+        assert_eq!(mark_band_bounds(100, 500), (105, 95));
+    }
+
+    #[test]
+    fn large_bps_widens_lower_bound_to_zero() {
+        // bps >= 10_000: lower clamps to 0; upper still grows with bps.
+        assert_eq!(mark_band_bounds(100, 10_000), (200, 0));
+        let (upper, lower) = mark_band_bounds(100, 1_000_000);
+        assert_eq!(lower, 0);
+        assert_eq!(upper, 100 * (10_000 + 1_000_000) / 10_000);
+    }
+
+    #[test]
+    fn no_overflow_at_extremes() {
+        // huge mark * huge bps must saturate, not panic.
+        let (upper, lower) = mark_band_bounds(u64::MAX, u32::MAX);
+        assert_eq!(lower, 0);
+        assert!(upper > 0);
     }
 }
