@@ -21,12 +21,12 @@ use crate::{
             updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
         },
         math::{
-            calc_funding_rate, calc_value, checked_u64_to_i64, is_above_maintenance_margin,
-            FUNDING_RATE_ONE,
+            calc_funding_rate, calc_position_equity, calc_value, checked_u64_to_i64,
+            is_above_maintenance_margin, FUNDING_RATE_ONE,
         },
         storage,
         trading::{
-            check_api_key_expiry, check_recv_window, execute_liquidation_market_order,
+            check_api_key_expiry, check_recv_window, execute_liquidation_market_order, run_adl,
             settle_liquidation_residual_at_mark_price, verify_ed25519,
         },
         types::{FundingState, IndexPriceState, Market, PremiumIndexAccumulator, Side},
@@ -618,6 +618,7 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
     mark_price: u64,
     liquidator: Address,
+    adl_budget: &mut u32,
 ) -> Result<LiquidationOutcome, PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
 
@@ -670,13 +671,32 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
         liquidation_quantity,
     )?;
     if remaining > 0 {
-        settle_liquidation_residual_at_mark_price(
-            context,
-            user,
-            market,
-            liquidation_side,
+        // Residual: a SOLVENT residual (equity >= 0 at mark — the position is below
+        // maintenance but not yet bankrupt) is returned to the loser by closing at mark
+        // (no bad debt, no ADL, no IF). An INSOLVENT residual (equity < 0) is closed as
+        // a forced trade against opposite-side holders at the bankruptcy price via ADL
+        // (scheme X: no IF). ADL leftover (budget exhausted / not enough deeply-in-profit
+        // opposite holders) stays open and is re-swept next update.
+        let residual = storage::load_position(context, user, market_id)?;
+        let residual_equity = calc_position_equity(
             mark_price,
+            residual.amount,
+            residual.v_quote_balance,
+            residual.margin,
+            market.base_decimals,
+            market.price_decimals,
         )?;
+        if residual_equity >= 0 {
+            settle_liquidation_residual_at_mark_price(
+                context,
+                user,
+                market,
+                liquidation_side,
+                mark_price,
+            )?;
+        } else {
+            run_adl(context, user, market, mark_price, adl_budget)?;
+        }
     }
 
     // Isolated margin: the position's loss (book leg + residual) was already contained
@@ -754,6 +774,7 @@ pub fn run_liquidate<CTX: ContextTr>(
         return Err(perp_err("liquidate: mark price unavailable"));
     }
 
+    let mut adl_budget = ADL_BUDGET_PER_UPDATE;
     match liquidate_position(
         context,
         args.user,
@@ -761,6 +782,7 @@ pub fn run_liquidate<CTX: ContextTr>(
         &market,
         mark_price,
         caller,
+        &mut adl_budget,
     )? {
         LiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
         LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
@@ -781,6 +803,15 @@ pub fn run_liquidate<CTX: ContextTr>(
 /// registry is re-scanned every update and un-liquidated candidates stay underwater
 /// until the mark moves, so nothing is permanently missed.
 const MAX_LIQUIDATIONS_PER_UPDATE: u32 = 50;
+
+/// Total ADL fills allowed across ONE `updateIndexPrice` (shared by every liquidation
+/// in the sweep). ADL closes an insolvent book-unfillable residual as forced trades
+/// against opposite-side holders (scheme X: no Insurance Fund on the residual path);
+/// each fill writes two positions, so this bounds the per-tx work on the delayed-
+/// execution critical path. A residual not fully closed within the budget stays open
+/// and is re-swept next update — deferral is safe (no realized bad debt, the opposite
+/// side's offsetting gains persist).
+const ADL_BUDGET_PER_UPDATE: u32 = 128;
 
 /// Protocol-automatic liquidation sweep, run synchronously at the tail of
 /// [`run_update_index_price`] after the new mark + funding are persisted (so the
@@ -809,12 +840,23 @@ fn run_liquidation_sweep<CTX: ContextTr>(
     // NoPosition (skipped), and cascade-created candidates are picked up next update.
     let candidates = storage::load_position_registry(context, market_id)?;
     let mut liquidated = 0u32;
+    // One ADL-fill budget shared across every liquidation in this sweep (bounds per-tx
+    // ADL work regardless of how many positions liquidate).
+    let mut adl_budget = ADL_BUDGET_PER_UPDATE;
     for user in candidates {
         if liquidated >= MAX_LIQUIDATIONS_PER_UPDATE {
             break;
         }
         let cp = context.journal_mut().checkpoint();
-        match liquidate_position(context, user, market_id, market, mark_price, Address::ZERO) {
+        match liquidate_position(
+            context,
+            user,
+            market_id,
+            market,
+            mark_price,
+            Address::ZERO,
+            &mut adl_budget,
+        ) {
             Ok(LiquidationOutcome::Liquidated { .. }) => {
                 context.journal_mut().checkpoint_commit();
                 liquidated += 1;
