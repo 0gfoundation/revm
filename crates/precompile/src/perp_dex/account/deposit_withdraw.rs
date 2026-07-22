@@ -7,7 +7,7 @@ use primitives::{Address, Bytes, Log, U256};
 
 use crate::{
     perp_dex::{
-        errors::perp_err,
+        errors::{perp_err, perp_invariant_err},
         interface::IPerpDex::{
             self, depositCall, getAccountCall, getAccountReturn, transferFromPerpCall,
             transferToPerpCall, withdrawCall, TransferFromPerp, TransferToPerp,
@@ -33,25 +33,26 @@ pub fn run_deposit<CTX: ContextTr>(
         return Err(perp_err("deposit: amount must be > 0"));
     }
 
-    // 1. Check and deduct the caller's ERC-20 USDC balance.
+    // ── VALIDATE + COMPUTE (commit-only #23: all fallible logic BEFORE any write) ──────────
+    // Load balances and run every reject up front, so a rejected deposit leaves ZERO writes
+    // (previously the two ERC-20 legs moved before the MAX check → a reject stranded custody:
+    // USDC-loss under commit-only).
     let user_usdc = load_erc20_balance(context, USDC_ADDRESS, caller)?;
     if user_usdc < amount {
         return Err(perp_err("deposit: insufficient USDC balance"));
     }
-    save_erc20_balance(context, USDC_ADDRESS, caller, user_usdc - amount)?;
-
-    // 2. Credit the DEX's ERC-20 USDC custody.
     let dex_usdc = load_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS)?;
-    save_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS, dex_usdc + amount)?;
-
-    // 3. Credit the caller's internal spot balance.
     let mut account = storage::load_account(context, caller)?;
     let prev: U256 = account.usdc_balance.clone().into();
     let new_balance = prev + amount;
     if new_balance > U256::from(MAX_PERP_WALLET_BALANCE) {
         return Err(perp_err("deposit: total balance would exceed i64::MAX"));
     }
-    account.usdc_balance = new_balance.into();
+
+    // ── APPLY (no logic reject past this point; only DB-error `?`, which aborts the block) ──
+    save_erc20_balance(context, USDC_ADDRESS, caller, user_usdc - amount)?; // 1. debit caller USDC
+    save_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS, dex_usdc + amount)?; // 2. credit DEX custody
+    account.usdc_balance = new_balance.into(); // 3. credit internal spot balance
     storage::save_account(context, caller, account)?;
 
     context.journal_mut().log(Log {
@@ -80,22 +81,27 @@ pub fn run_withdraw<CTX: ContextTr>(
         return Err(perp_err("withdraw: amount must be > 0"));
     }
 
-    // 1. Debit the caller's internal spot balance.
+    // ── VALIDATE + COMPUTE (commit-only #23: all fallible logic + loads BEFORE any write) ──
     let mut account = storage::load_account(context, caller)?;
     let prev: U256 = account.usdc_balance.clone().into();
     if prev < amount {
         return Err(perp_err("withdraw: insufficient internal balance"));
     }
-    account.usdc_balance = (prev - amount).into();
-    storage::save_account(context, caller, account)?;
-
-    // 2. Deduct the DEX's ERC-20 USDC custody.
     let dex_usdc = load_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS)?;
-    save_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS, dex_usdc - amount)?;
-
-    // 3. Return USDC to the caller's wallet.
     let user_usdc = load_erc20_balance(context, USDC_ADDRESS, caller)?;
-    save_erc20_balance(context, USDC_ADDRESS, caller, user_usdc + amount)?;
+    // Custody invariant: the DEX always holds >= the sum of internal balances, so dex >= amount.
+    // Reject before any write rather than underflow `dex_usdc - amount` after the account debit.
+    if dex_usdc < amount {
+        return Err(perp_invariant_err(
+            "withdraw: DEX custody below withdrawal amount",
+        ));
+    }
+
+    // ── APPLY (no logic reject past this point; only DB-error `?`, which aborts the block) ──
+    account.usdc_balance = (prev - amount).into(); // 1. debit internal spot balance
+    storage::save_account(context, caller, account)?;
+    save_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS, dex_usdc - amount)?; // 2. debit DEX custody
+    save_erc20_balance(context, USDC_ADDRESS, caller, user_usdc + amount)?; // 3. return USDC to caller
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,

@@ -14,7 +14,7 @@ mod settlement;
 pub(crate) use liquidation::{
     execute_liquidation_market_order, run_adl, settle_liquidation_residual_at_mark_price,
 };
-use settlement::{settle_maker_fill, MakerFillOutcome, TakerSettlement};
+use settlement::{MakerFillOutcome, TakerSettlement};
 
 use crate::{
     perp_dex::{
@@ -36,20 +36,6 @@ use crate::{
     PrecompileError,
 };
 
-/// Maker fee using the user's *current* fee rate (placement path). Cancel/fill
-/// paths instead use the rate snapshotted on the order entry, via
-/// `math::calc_maker_fee_for_order_qty_with_bps`.
-fn calc_maker_fee_for_order_qty<CTX: ContextTr>(
-    context: &mut CTX,
-    user: Address,
-    price: u64,
-    qty: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<u64, PrecompileError> {
-    let rates = storage::load_user_fee_rates(context, user)?;
-    calc_maker_fee_for_order_qty_with_bps(price, qty, rates.maker_fee_bps, market)
-}
-
 // ── Public entry-points ───────────────────────────────────────────────────────
 
 /// `placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif) returns (bytes32 orderId)`
@@ -61,7 +47,7 @@ pub fn run_place_order<CTX: ContextTr>(
     let args = placeOrderCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("placeOrder: invalid calldata"))?;
 
-    let order_id = next_order_id(context, caller)?;
+    let (order_id, bumped_nonce) = peek_order_id(context, caller)?;
     place_order_core(
         caller,
         order_id,
@@ -74,6 +60,9 @@ pub fn run_place_order<CTX: ContextTr>(
         args.clientOrderId.0,
         context,
     )?;
+    // Placement succeeded — persist the nonce bump (commit-only: rejected placements above
+    // returned early and left the nonce untouched).
+    commit_order_nonce(context, caller, bumped_nonce)?;
     Ok(Bytes::from(placeOrderCall::abi_encode_returns(
         &FixedBytes(order_id),
     )))
@@ -81,8 +70,12 @@ pub fn run_place_order<CTX: ContextTr>(
 
 /// `placeOrderSigned(address account, ..., uint64 timestamp, bytes signature) returns (bytes32 orderId)`
 ///
-/// orderId = keccak256(signature). Replay protection is implicit: a second submission of the
-/// same signature produces the same orderId, which already exists in storage, and is rejected.
+/// orderId = keccak256(signature). Replay protection lives in the seen-signature set (commit-only
+/// #23): delete-on-terminal removes a filled/cancelled order from the map, so the order-id is no
+/// longer a durable replay witness — the seen-set is. A second submission of the same signature
+/// hits the same seen marker and is rejected. The marker is time-bucketed and reclaimed once the
+/// signature's recv window has fully elapsed (a stale replay is rejected by `check_recv_window`
+/// first, so reclaiming the marker is safe).
 pub fn run_place_order_signed<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -122,9 +115,9 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
 
-    // Derive orderId from signature: same sig, same id, duplicate check is the replay guard.
+    // orderId = keccak256(signature); the SAME hash keys the seen-signature replay set.
     let order_id: [u8; 32] = keccak256(args.signature.as_ref()).0;
-    if storage::load_order_ref(context, &order_id)?.is_some() {
+    if storage::is_signature_seen(context, &order_id)? {
         return Err(perp_err(
             "placeOrderSigned: duplicate signature (already submitted)",
         ));
@@ -142,6 +135,15 @@ pub fn run_place_order_signed<CTX: ContextTr>(
         args.clientOrderId.0,
         context,
     )?;
+
+    // Placement succeeded — burn the signature (commit-only: a REJECTED placement above returned
+    // early WITHOUT marking, so it stays replayable within its recv window, exactly as the old
+    // order-map guard behaved). Index it under its signed timestamp for time-bucketed GC, then
+    // sweep one expired bucket.
+    let block_ts: u64 = context.block().timestamp().saturating_to();
+    storage::mark_signature_seen(context, &order_id, args.timestamp)?;
+    storage::gc_seen_buckets(context, block_ts)?;
+
     Ok(Bytes::from(placeOrderSignedCall::abi_encode_returns(
         &FixedBytes(order_id),
     )))
@@ -292,9 +294,17 @@ pub fn run_get_book_prices<CTX: ContextTr>(
         .map_err(|_| perp_err("getBookPrices: invalid calldata"))?;
 
     let side = Side::from_u8(args.side).ok_or_else(|| perp_err("getBookPrices: invalid side"))?;
-    let prices = match side {
-        Side::Buy => storage::load_bid_prices_ref(context, args.marketId)?,
-        Side::Sell => storage::load_ask_prices_ref(context, args.marketId)?,
+    // BTreeSet is ascending; return the API's best-first order: bids DESC (rev), asks ASC.
+    let prices: Vec<u64> = match side {
+        Side::Buy => storage::load_bid_prices_ref(context, args.marketId)?
+            .iter()
+            .rev()
+            .copied()
+            .collect(),
+        Side::Sell => storage::load_ask_prices_ref(context, args.marketId)?
+            .iter()
+            .copied()
+            .collect(),
     };
 
     Ok(Bytes::from(getBookPricesCall::abi_encode_returns(&prices)))
@@ -309,11 +319,11 @@ pub fn run_get_book_level<CTX: ContextTr>(
         .map_err(|_| perp_err("getBookLevel: invalid calldata"))?;
 
     let side = Side::from_u8(args.side).ok_or_else(|| perp_err("getBookLevel: invalid side"))?;
-    let queue = match side {
+    let level = match side {
         Side::Buy => storage::load_bid_level_arc(context, args.marketId, args.price)?,
         Side::Sell => storage::load_ask_level_arc(context, args.marketId, args.price)?,
     };
-    let order_ids = queue.iter().copied().map(FixedBytes).collect();
+    let order_ids = level.ids.iter().copied().map(FixedBytes).collect();
 
     Ok(Bytes::from(getBookLevelCall::abi_encode_returns(
         &order_ids,
@@ -377,16 +387,30 @@ pub(crate) fn verify_ed25519(
 // ── Core order logic (shared by direct and signed paths) ─────────────────────
 
 /// Allocate the next order ID for `account` using the per-user nonce counter.
-pub(super) fn next_order_id<CTX: ContextTr>(
+/// Derives the next order id from the CURRENT nonce WITHOUT bumping it (commit-only #23: the
+/// nonce write happens only after the placement fully succeeds — a rejected placement leaves the
+/// nonce untouched, so the same id is reused, matching the old revert-rollback behavior).
+/// Returns `(order_id, bumped_nonce)`; the caller persists the bump via
+/// [`commit_order_nonce`] on the success path.
+pub(super) fn peek_order_id<CTX: ContextTr>(
     context: &mut CTX,
     account: Address,
-) -> Result<[u8; 32], PrecompileError> {
+) -> Result<([u8; 32], u64), PrecompileError> {
     let nonce = storage::load_user_nonce(context, account)?;
     let mut buf = [0u8; 28];
     buf[..20].copy_from_slice(account.as_slice());
     buf[20..28].copy_from_slice(&nonce.to_be_bytes());
-    storage::save_user_nonce(context, account, nonce + 1)?;
-    Ok(keccak256(&buf).0)
+    Ok((keccak256(&buf).0, nonce + 1))
+}
+
+/// Persists the nonce bump reserved by [`peek_order_id`]. Call ONLY after the placement
+/// succeeded (all genuine rejects passed).
+pub(super) fn commit_order_nonce<CTX: ContextTr>(
+    context: &mut CTX,
+    account: Address,
+    bumped_nonce: u64,
+) -> Result<(), PrecompileError> {
+    storage::save_user_nonce(context, account, bumped_nonce)
 }
 
 struct ValidatedOrder {
@@ -418,7 +442,10 @@ fn place_order_core<CTX: ContextTr>(
         tif_u8,
     )?;
 
-    persist_new_order(
+    // commit-only #23: build the Order in memory + emit OrderPlaced at its original stream
+    // position (logs are EVM-journaled and revert with the tx — only the STORAGE persist is
+    // deferred to the single final save after all genuine rejects have passed).
+    let mut taker_order = announce_new_order(
         context,
         account,
         &order_id,
@@ -427,7 +454,7 @@ fn place_order_core<CTX: ContextTr>(
         quantity,
         client_order_id,
         &validated,
-    )?;
+    );
 
     match validated.order_type {
         OrderType::Limit => execute_limit_order(
@@ -439,11 +466,29 @@ fn place_order_core<CTX: ContextTr>(
             quantity,
             client_order_id,
             validated,
-        ),
+            &mut taker_order,
+        )?,
         OrderType::Market => execute_market_order(
-            context, account, order_id, market_id, price, quantity, validated,
-        ),
+            context,
+            account,
+            order_id,
+            market_id,
+            price,
+            quantity,
+            validated,
+            &mut taker_order,
+        )?,
     }
+    // Single final persist of the taker order. delete-on-terminal: a Filled/Expired taker leaves
+    // NO record (it fully filled or its IOC/FOK/market remainder expired — never resting); an
+    // Open/PartiallyFilled taker rested, so it is saved live (its book entry / level FIFO / live
+    // count were already written by `rest_in_book`).
+    if taker_order.status.is_terminal() {
+        storage::delete_order(context, &order_id)?;
+    } else {
+        storage::save_order(context, &order_id, &taker_order)?;
+    }
+    Ok(())
 }
 
 fn validate_place_order<CTX: ContextTr>(
@@ -501,7 +546,7 @@ fn validate_place_order<CTX: ContextTr>(
     })
 }
 
-fn persist_new_order<CTX: ContextTr>(
+fn announce_new_order<CTX: ContextTr>(
     context: &mut CTX,
     account: Address,
     order_id: &[u8; 32],
@@ -510,7 +555,7 @@ fn persist_new_order<CTX: ContextTr>(
     quantity: u64,
     client_order_id: [u8; 16],
     order: &ValidatedOrder,
-) -> Result<(), PrecompileError> {
+) -> Order {
     let order = Order {
         owner: account.0 .0,
         market_id,
@@ -522,7 +567,6 @@ fn persist_new_order<CTX: ContextTr>(
         tif: order.tif,
         status: OrderStatus::Open,
     };
-    storage::save_order(context, order_id, &order)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
@@ -540,26 +584,15 @@ fn persist_new_order<CTX: ContextTr>(
         .to_log_data(),
     });
 
-    Ok(())
+    order
 }
 
-fn cancel_unfilled_remainder<CTX: ContextTr>(
-    context: &mut CTX,
-    order_id: &[u8; 32],
-    remaining: u64,
-) -> Result<(), PrecompileError> {
-    if remaining == 0 {
-        return Ok(());
+/// Binance-style TIF expiry (IOC/market not fully filled) → Expired, not Cancelled (which is
+/// reserved for user-initiated cancels). In-memory only; the caller performs the final persist.
+fn cancel_unfilled_remainder(taker_order: &mut Order, remaining: u64) {
+    if remaining > 0 {
+        taker_order.status = OrderStatus::Expired;
     }
-
-    if let Some(mut o) = storage::load_order(context, order_id)? {
-        // Binance-style: TIF expiry (IOC/market not fully filled) → Expired,
-        // not Cancelled. Cancelled is reserved for user-initiated cancels.
-        o.status = OrderStatus::Expired;
-        storage::save_order(context, order_id, &o)?;
-    }
-
-    Ok(())
 }
 
 fn ensure_fok_filled(remaining: u64) -> Result<(), PrecompileError> {
@@ -570,28 +603,31 @@ fn ensure_fok_filled(remaining: u64) -> Result<(), PrecompileError> {
     }
 }
 
+/// PostOnly cross check. Reads the BBO ONCE (both sides, one MarketHot probe) and RETURNS it so the
+/// caller can thread it into `rest_in_book` (no match runs on the PostOnly path, so the BBO stays
+/// current from here to the rest).
 fn ensure_post_only_does_not_cross<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     side: Side,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(u64, u64), PrecompileError> {
+    let h = storage::load_market_hot(context, market_id)?;
+    let (best_bid, best_ask) = (h.best_bid, h.best_ask);
     match side {
         Side::Buy => {
-            let best_ask = storage::load_best_ask(context, market_id)?;
             if best_ask != 0 && best_ask <= price {
                 return Err(perp_err("placeOrder: PostOnly order would match"));
             }
         }
         Side::Sell => {
-            let best_bid = storage::load_best_bid(context, market_id)?;
             if best_bid != 0 && best_bid >= price {
                 return Err(perp_err("placeOrder: PostOnly order would match"));
             }
         }
     }
 
-    Ok(())
+    Ok((best_bid, best_ask))
 }
 
 fn remove_order_entry(
@@ -620,10 +656,12 @@ fn execute_limit_order<CTX: ContextTr>(
     quantity: u64,
     client_order_id: [u8; 16],
     order: ValidatedOrder,
+    taker_order: &mut Order,
 ) -> Result<(), PrecompileError> {
     match order.tif {
         TimeInForce::PostOnly => {
-            ensure_post_only_does_not_cross(context, market_id, order.side, price)?;
+            // No match runs → the do-not-cross BBO is still current at rest; thread it in.
+            let bbo = ensure_post_only_does_not_cross(context, market_id, order.side, price)?;
             rest_in_book(
                 context,
                 account,
@@ -635,6 +673,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 client_order_id,
                 &order.market,
+                Some(bbo),
             )
         }
         TimeInForce::Gtc => {
@@ -650,6 +689,8 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 &order.market,
                 false,
+                true, // GTC: rest the remainder → pre-validate its margin atomically with fills
+                taker_order,
             )?;
             if remaining > 0 {
                 rest_in_book(
@@ -663,6 +704,8 @@ fn execute_limit_order<CTX: ContextTr>(
                     order.tif,
                     client_order_id,
                     &order.market,
+                    // GTC: matching ran → read the (post-match) BBO inside rest_in_book.
+                    None,
                 )?;
             }
             Ok(())
@@ -680,8 +723,11 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 &order.market,
                 false,
+                false, // IOC: unmatched remainder is dropped, never rested
+                taker_order,
             )?;
-            cancel_unfilled_remainder(context, &order_id, remaining)
+            cancel_unfilled_remainder(taker_order, remaining);
+            Ok(())
         }
         TimeInForce::Fok => {
             check_fok_feasibility(
@@ -705,6 +751,8 @@ fn execute_limit_order<CTX: ContextTr>(
                 order.tif,
                 &order.market,
                 false,
+                false, // FOK: fully filled or rejected — never rests
+                taker_order,
             )?;
             ensure_fok_filled(remaining)
         }
@@ -719,6 +767,7 @@ fn execute_market_order<CTX: ContextTr>(
     price: u64,
     quantity: u64,
     order: ValidatedOrder,
+    taker_order: &mut Order,
 ) -> Result<(), PrecompileError> {
     if order.tif == TimeInForce::Fok {
         check_fok_feasibility(
@@ -743,11 +792,14 @@ fn execute_market_order<CTX: ContextTr>(
         order.tif,
         &order.market,
         false,
+        false, // market order: never rests
+        taker_order,
     )?;
     if order.tif == TimeInForce::Fok {
         ensure_fok_filled(remaining)
     } else {
-        cancel_unfilled_remainder(context, &order_id, remaining)
+        cancel_unfilled_remainder(taker_order, remaining);
+        Ok(())
     }
 }
 
@@ -778,7 +830,6 @@ fn cancel_order_core<CTX: ContextTr>(
         market_id,
         order_id,
         order,
-        OrderStatus::Cancelled,
         &market,
         // Explicit cancel: no matching ran in this call, so the BBO cache is live.
         remove_from_book_after_cancel,
@@ -798,29 +849,38 @@ pub(super) fn match_order<CTX: ContextTr>(
     limit_price: u64,
     quantity: u64,
     order_type: OrderType,
-    _tif: TimeInForce,
+    tif: TimeInForce,
     market: &crate::perp_dex::types::Market,
     // When true (liquidation close), the taker pays no trading fee.
     waive_taker_fee: bool,
+    // When true (GTC), the caller will rest the unmatched remainder — so the rest's margin is
+    // pre-validated atomically with the fills (commit-only #23 atomic-reject).
+    rest_remainder: bool,
+    // The taker's Order threaded in memory (commit-only #23): NOT yet persisted — the caller
+    // performs the single final save after every genuine reject has passed, so a rejected
+    // placement leaves no phantom order (and a signed order's signature is not burned).
+    taker_order: &mut Order,
 ) -> Result<u64, PrecompileError> {
     let mut remaining = quantity;
     let mut last_trade_price = None;
     let mut taker_settlement =
         TakerSettlement::load(context, taker_addr, market_id, waive_taker_fee)?;
-    // The taker order is mutated once per fill and saved ONCE after the loop. Nothing reads
-    // it mid-match: settle_maker_fill touches only the maker; finalize touches the taker's
-    // position/account, not this Order; and the taker order is not rested in the book until
-    // after match_order returns, so it can never be a maker in the queue it sweeps.
-    let mut taker_order = storage::load_order(context, taker_order_id)?
-        .ok_or_else(|| perp_invariant_err("taker order missing during match"))?;
+    // commit-only #23 L1: per-user working copies for this match. Each touched maker is loaded
+    // once (funding settled at first touch, exactly where the first per-maker settle did it) and
+    // saved once at the flush below — same write-key set and net values as the old per-fill saves.
+    let mut registry = settlement::MatchRegistry::new();
+    // The taker order is mutated in memory per fill; the CALLER persists the final state once.
+    // Nothing reads it from storage mid-match: the registry touches only the makers, finalize
+    // touches the taker's position/account, and the taker order is not in any book queue yet.
 
     // Fill-time price band: a fill may never execute farther than ±band from the CURRENT
     // mark, regardless of order type. Because each side of the book is sorted, this is a
     // clean early break — the first out-of-band level ends matching and everything past it
     // (necessarily farther) is skipped. This is the sole off-mark guard (there is no
     // placement-time band): it sees post-placement mark drift, lets harmless deep passive
-    // orders rest, and gives market orders implicit slippage protection.
-    let mark = storage::load_mark_price(context, market_id)?;
+    // orders rest, and gives market orders implicit slippage protection. mark_price is a
+    // field of the Market already loaded — no separate storage read.
+    let mark = market.mark_price;
     let (mark_upper, mark_lower) =
         crate::perp_dex::math::mark_band_bounds(mark, market.price_band_bps);
 
@@ -830,6 +890,7 @@ pub(super) fn match_order<CTX: ContextTr>(
             let ask_prices = storage::load_ask_prices_ref(context, market_id)?;
             let old_best_ask = ask_prices.first().copied().unwrap_or(0);
             let mut ask_levels_cleared = false;
+            let mut removed_asks: Vec<u64> = Vec::new();
             'outer: for ask_price in ask_prices.iter().copied() {
                 // Fill-time band (lower): an ask below mark-band is an off-mark price
                 // (e.g. a closing maker dumping cheap); skip it — higher, in-band asks may
@@ -845,18 +906,47 @@ pub(super) fn match_order<CTX: ContextTr>(
                 if ask_price as u128 > mark_upper {
                     break;
                 }
-                let queue = storage::load_ask_level_arc(context, market_id, ask_price)?;
+                // ONE probe gets both the FIFO ids and the live count (Obs-1 merge).
+                let blob = storage::load_ask_level_arc(context, market_id, ask_price)?;
+                let count_old = blob.count;
+                let queue = &blob.ids;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
+                // Live makers that LEAVE this level during the walk (fully filled / K9-rejected).
+                // The post-walk live count is `count_old - level_removed`; stale ids the walk sweeps
+                // (already gone from the book) are NOT counted here — they were decremented when
+                // they left. See `finalize_level_count` below.
+                let mut level_removed = 0u64;
                 let mut qi = 0;
 
                 while qi < queue.len() {
                     if remaining == 0 {
                         new_queue.extend(queue[qi..].iter().copied());
-                        if new_queue.is_empty() {
-                            storage::remove_ask_price(context, market_id, ask_price)?;
+                        let count_new = count_old.saturating_sub(level_removed);
+                        if count_new == 0 {
+                            // Level logically empty (any ids left in new_queue are stale) — drop the
+                            // price; SaveLevel with count 0 deletes the blob (clears stale ids).
+                            registry.push_event(settlement::MatchEvent::RemovePrice {
+                                is_bid: false,
+                                price: ask_price,
+                            });
+                            removed_asks.push(ask_price);
                             ask_levels_cleared = true;
+                            registry.push_event(settlement::MatchEvent::SaveLevel {
+                                is_bid: false,
+                                price: ask_price,
+                                queue: Vec::new(),
+                                count: 0,
+                            });
+                        } else {
+                            // Live orders remain in the untouched tail — keep it verbatim (any stale
+                            // ids ride along and are swept on the next walk).
+                            registry.push_event(settlement::MatchEvent::SaveLevel {
+                                is_bid: false,
+                                price: ask_price,
+                                queue: new_queue,
+                                count: count_new,
+                            });
                         }
-                        storage::save_ask_level(context, market_id, ask_price, &new_queue)?;
                         break 'outer;
                     }
                     let maker_id = queue[qi];
@@ -871,18 +961,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                         {
                             o
                         }
-                        Some(o) => {
-                            return Err(perp_invariant_err(format!(
-                                "ask queue contains order {:?} with terminal status {:?}",
-                                maker_id, o.status
-                            )))
-                        }
-                        None => {
-                            return Err(perp_invariant_err(format!(
-                                "ask queue references order {:?} not found in storage",
-                                maker_id
-                            )))
-                        }
+                        // lazy-queue sweep: a cancelled/filled maker was deleted (delete-on-terminal)
+                        // but its id lingers in the FIFO — drop it (not re-queued), no count change
+                        // (it was decremented when it left the book).
+                        _ => continue,
                     };
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
@@ -893,8 +975,9 @@ pub(super) fn match_order<CTX: ContextTr>(
                     // maker order (drop it from this level by not re-queuing) and skip —
                     // the taker's `remaining` is untouched so it keeps matching. Funding
                     // is settled+persisted inside either way.
-                    let maker_fee = match settle_maker_fill(
+                    let maker_fee = match settlement::settle_maker_fill_registry(
                         context,
+                        &mut registry,
                         maker_addr,
                         &maker_id,
                         market_id,
@@ -905,8 +988,9 @@ pub(super) fn match_order<CTX: ContextTr>(
                     )? {
                         MakerFillOutcome::Filled { maker_fee } => maker_fee,
                         MakerFillOutcome::RejectedInsolvent => {
-                            cancel_rejected_maker(
+                            settlement::cancel_rejected_maker_registry(
                                 context,
+                                &mut registry,
                                 maker_addr,
                                 market_id,
                                 Side::Sell,
@@ -914,9 +998,10 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 &mut maker_order,
                                 market,
                             )?;
-                            // Dropped from this level (not re-queued). If it was the
-                            // last order at this price, the new_queue-empty check below
-                            // removes the price + refreshes best ask.
+                            // A live maker left the level (cancelled): count it. Dropped from the
+                            // queue (not re-queued); if it was the last live order the count hits 0
+                            // and the level is removed below.
+                            level_removed += 1;
                             continue;
                         }
                     };
@@ -930,23 +1015,20 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let taker_fee =
                         calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
                     last_trade_price = Some(ask_price);
-                    emit_trade(
-                        context,
-                        TradeEvent {
-                            market_id,
-                            taker_order_id,
-                            maker_order_id: &maker_id,
-                            taker: taker_addr,
-                            maker: Address::from(maker_order.owner),
-                            price: ask_price,
-                            quantity: fill_qty,
-                            taker_side: Side::Buy,
-                            taker_fee,
-                            maker_fee,
-                        },
-                    )?;
+                    registry.push_event(settlement::MatchEvent::Trade {
+                        market_id,
+                        taker_order_id: *taker_order_id,
+                        maker_order_id: maker_id,
+                        taker: taker_addr,
+                        maker: Address::from(maker_order.owner),
+                        price: ask_price,
+                        quantity: fill_qty,
+                        taker_side: Side::Buy,
+                        taker_fee,
+                        maker_fee,
+                    });
 
-                    // Update the maker order in place — settle_maker_fill does not touch the
+                    // Update the maker order in place — the registry settle does not touch the
                     // maker Order struct, so the value loaded above is still current.
                     maker_order.filled += fill_qty;
                     maker_order.status = if maker_order.filled >= maker_order.quantity {
@@ -954,7 +1036,18 @@ pub(super) fn match_order<CTX: ContextTr>(
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    storage::save_order(context, &maker_id, &maker_order)?;
+                    // delete-on-terminal: a fully-filled maker leaves the map (and the level, via
+                    // level_removed); a partial fill stays and is re-queued below.
+                    if maker_order.status == OrderStatus::Filled {
+                        registry
+                            .push_event(settlement::MatchEvent::DeleteOrder { order_id: maker_id });
+                        level_removed += 1;
+                    } else {
+                        registry.push_event(settlement::MatchEvent::SaveOrder {
+                            order_id: maker_id,
+                            order: maker_order.clone(),
+                        });
+                    }
 
                     // Accumulate into the hoisted taker order (saved once after the loop).
                     taker_order.filled += fill_qty;
@@ -970,28 +1063,57 @@ pub(super) fn match_order<CTX: ContextTr>(
                     }
                 }
 
-                if new_queue.is_empty() {
-                    storage::remove_ask_price(context, market_id, ask_price)?;
+                // Normal level end (taker still had capacity → consumed every live maker here).
+                let count_new = count_old.saturating_sub(level_removed);
+                if count_new == 0 {
+                    registry.push_event(settlement::MatchEvent::RemovePrice {
+                        is_bid: false,
+                        price: ask_price,
+                    });
+                    removed_asks.push(ask_price);
                     ask_levels_cleared = true;
+                    registry.push_event(settlement::MatchEvent::SaveLevel {
+                        is_bid: false,
+                        price: ask_price,
+                        queue: Vec::new(),
+                        count: 0,
+                    });
+                } else {
+                    registry.push_event(settlement::MatchEvent::SaveLevel {
+                        is_bid: false,
+                        price: ask_price,
+                        queue: new_queue,
+                        count: count_new,
+                    });
                 }
-                storage::save_ask_level(context, market_id, ask_price, &new_queue)?;
             }
             if ask_levels_cleared {
-                let best_ask = storage::refresh_best_ask(context, market_id)?;
+                // New best ask from the walk's own knowledge: the price-index snapshot minus the
+                // levels this match emptied — identical to what refresh_best_ask reads after the
+                // (deferred) removals are applied.
+                let best_ask = ask_prices
+                    .iter()
+                    .copied()
+                    .find(|p| !removed_asks.contains(p))
+                    .unwrap_or(0);
+                registry.push_event(settlement::MatchEvent::SaveBest {
+                    is_bid: false,
+                    price: best_ask,
+                });
                 if best_ask != old_best_ask {
                     let best_bid = storage::load_best_bid(context, market_id)?;
-                    record_mid_price_sample_for_best_quote_change(
-                        context, market_id, best_bid, best_ask,
-                    )?;
+                    registry
+                        .push_event(settlement::MatchEvent::MidPriceSample { best_bid, best_ask });
                 }
             }
         }
         Side::Sell => {
             // Match against bids (sorted DESC: highest bid first).
             let bid_prices = storage::load_bid_prices_ref(context, market_id)?;
-            let old_best_bid = bid_prices.first().copied().unwrap_or(0);
+            let old_best_bid = bid_prices.last().copied().unwrap_or(0); // bids: best = max
             let mut bid_levels_cleared = false;
-            'outer: for bid_price in bid_prices.iter().copied() {
+            let mut removed_bids: Vec<u64> = Vec::new();
+            'outer: for bid_price in bid_prices.iter().rev().copied() {
                 // Fill-time band (upper): a bid above mark+band is an off-mark price
                 // (e.g. a closing maker buying rich); skip it — lower, in-band bids may
                 // still match. It stays resting until the mark legitimately reaches it.
@@ -1006,18 +1128,40 @@ pub(super) fn match_order<CTX: ContextTr>(
                 if (bid_price as u128) < mark_lower {
                     break;
                 }
-                let queue = storage::load_bid_level_arc(context, market_id, bid_price)?;
+                // ONE probe gets both the FIFO ids and the live count (Obs-1 merge).
+                let blob = storage::load_bid_level_arc(context, market_id, bid_price)?;
+                let count_old = blob.count;
+                let queue = &blob.ids;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
+                // See the mirror on the Buy side.
+                let mut level_removed = 0u64;
                 let mut qi = 0;
 
                 while qi < queue.len() {
                     if remaining == 0 {
                         new_queue.extend(queue[qi..].iter().copied());
-                        if new_queue.is_empty() {
-                            storage::remove_bid_price(context, market_id, bid_price)?;
+                        let count_new = count_old.saturating_sub(level_removed);
+                        if count_new == 0 {
+                            registry.push_event(settlement::MatchEvent::RemovePrice {
+                                is_bid: true,
+                                price: bid_price,
+                            });
+                            removed_bids.push(bid_price);
                             bid_levels_cleared = true;
+                            registry.push_event(settlement::MatchEvent::SaveLevel {
+                                is_bid: true,
+                                price: bid_price,
+                                queue: Vec::new(),
+                                count: 0,
+                            });
+                        } else {
+                            registry.push_event(settlement::MatchEvent::SaveLevel {
+                                is_bid: true,
+                                price: bid_price,
+                                queue: new_queue,
+                                count: count_new,
+                            });
                         }
-                        storage::save_bid_level(context, market_id, bid_price, &new_queue)?;
                         break 'outer;
                     }
                     let maker_id = queue[qi];
@@ -1032,26 +1176,17 @@ pub(super) fn match_order<CTX: ContextTr>(
                         {
                             o
                         }
-                        Some(o) => {
-                            return Err(perp_invariant_err(format!(
-                                "bid queue contains order {:?} with terminal status {:?}",
-                                maker_id, o.status
-                            )))
-                        }
-                        None => {
-                            return Err(perp_invariant_err(format!(
-                                "bid queue references order {:?} not found in storage",
-                                maker_id
-                            )))
-                        }
+                        // lazy-queue sweep (see the Buy mirror): stale id → drop, no count change.
+                        _ => continue,
                     };
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
                     let maker_addr = Address::from(maker_order.owner);
                     // Maker open-solvency guard (K9) — see the mirror on the Buy side.
-                    let maker_fee = match settle_maker_fill(
+                    let maker_fee = match settlement::settle_maker_fill_registry(
                         context,
+                        &mut registry,
                         maker_addr,
                         &maker_id,
                         market_id,
@@ -1062,8 +1197,9 @@ pub(super) fn match_order<CTX: ContextTr>(
                     )? {
                         MakerFillOutcome::Filled { maker_fee } => maker_fee,
                         MakerFillOutcome::RejectedInsolvent => {
-                            cancel_rejected_maker(
+                            settlement::cancel_rejected_maker_registry(
                                 context,
+                                &mut registry,
                                 maker_addr,
                                 market_id,
                                 Side::Buy,
@@ -1071,9 +1207,8 @@ pub(super) fn match_order<CTX: ContextTr>(
                                 &mut maker_order,
                                 market,
                             )?;
-                            // Dropped from this level (not re-queued). If it was the
-                            // last order at this price, the new_queue-empty check below
-                            // removes the price + refreshes best bid.
+                            // A live maker left the level (see the Buy mirror): count it.
+                            level_removed += 1;
                             continue;
                         }
                     };
@@ -1087,21 +1222,18 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let taker_fee =
                         calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
                     last_trade_price = Some(bid_price);
-                    emit_trade(
-                        context,
-                        TradeEvent {
-                            market_id,
-                            taker_order_id,
-                            maker_order_id: &maker_id,
-                            taker: taker_addr,
-                            maker: Address::from(maker_order.owner),
-                            price: bid_price,
-                            quantity: fill_qty,
-                            taker_side: Side::Sell,
-                            taker_fee,
-                            maker_fee,
-                        },
-                    )?;
+                    registry.push_event(settlement::MatchEvent::Trade {
+                        market_id,
+                        taker_order_id: *taker_order_id,
+                        maker_order_id: maker_id,
+                        taker: taker_addr,
+                        maker: Address::from(maker_order.owner),
+                        price: bid_price,
+                        quantity: fill_qty,
+                        taker_side: Side::Sell,
+                        taker_fee,
+                        maker_fee,
+                    });
 
                     maker_order.filled += fill_qty;
                     maker_order.status = if maker_order.filled >= maker_order.quantity {
@@ -1109,7 +1241,17 @@ pub(super) fn match_order<CTX: ContextTr>(
                     } else {
                         OrderStatus::PartiallyFilled
                     };
-                    storage::save_order(context, &maker_id, &maker_order)?;
+                    // delete-on-terminal (see the Buy mirror).
+                    if maker_order.status == OrderStatus::Filled {
+                        registry
+                            .push_event(settlement::MatchEvent::DeleteOrder { order_id: maker_id });
+                        level_removed += 1;
+                    } else {
+                        registry.push_event(settlement::MatchEvent::SaveOrder {
+                            order_id: maker_id,
+                            order: maker_order.clone(),
+                        });
+                    }
 
                     taker_order.filled += fill_qty;
                     taker_order.status = if taker_order.filled >= taker_order.quantity {
@@ -1124,72 +1266,87 @@ pub(super) fn match_order<CTX: ContextTr>(
                     }
                 }
 
-                if new_queue.is_empty() {
-                    storage::remove_bid_price(context, market_id, bid_price)?;
+                let count_new = count_old.saturating_sub(level_removed);
+                if count_new == 0 {
+                    registry.push_event(settlement::MatchEvent::RemovePrice {
+                        is_bid: true,
+                        price: bid_price,
+                    });
+                    removed_bids.push(bid_price);
                     bid_levels_cleared = true;
+                    registry.push_event(settlement::MatchEvent::SaveLevel {
+                        is_bid: true,
+                        price: bid_price,
+                        queue: Vec::new(),
+                        count: 0,
+                    });
+                } else {
+                    registry.push_event(settlement::MatchEvent::SaveLevel {
+                        is_bid: true,
+                        price: bid_price,
+                        queue: new_queue,
+                        count: count_new,
+                    });
                 }
-                storage::save_bid_level(context, market_id, bid_price, &new_queue)?;
             }
             if bid_levels_cleared {
-                let best_bid = storage::refresh_best_bid(context, market_id)?;
+                // New best bid = max non-removed price in the snapshot (mirrors refresh_best_bid
+                // reading the index after the deferred removals).
+                let best_bid = bid_prices
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|p| !removed_bids.contains(p))
+                    .unwrap_or(0);
+                registry.push_event(settlement::MatchEvent::SaveBest {
+                    is_bid: true,
+                    price: best_bid,
+                });
                 if best_bid != old_best_bid {
                     let best_ask = storage::load_best_ask(context, market_id)?;
-                    record_mid_price_sample_for_best_quote_change(
-                        context, market_id, best_bid, best_ask,
-                    )?;
+                    registry
+                        .push_event(settlement::MatchEvent::MidPriceSample { best_bid, best_ask });
                 }
             }
         }
     }
 
-    // Persist the taker order once with its accumulated fill (saved here, not per fill,
-    // since nothing reads it during the match). Skipped when nothing matched.
-    if remaining < quantity {
-        storage::save_order(context, taker_order_id, &taker_order)?;
+    // ── commit-only #23 L2b: the walk above performed ZERO storage writes (all effects live in
+    // the registry copies + ordered events), so every genuine reject here leaves state untouched.
+
+    // 1. FOK: unfillable → reject with zero writes (previously the whole match committed and the
+    //    caller's post-hoc check reverted it via undo).
+    if tif == TimeInForce::Fok && remaining > 0 {
+        return Err(perp_err("placeOrder: FOK order cannot be fully filled"));
     }
-    taker_settlement.finalize(context, side, market)?;
+
+    // 2. Taker settlement compute: K9 open-into-insolvency / wallet-cover / checked-arithmetic
+    //    rejects — all pre-write. The taker joins the registry (self-match reuses the evolved
+    //    copies) and its fill effects are flushed with everyone else's below. When the caller will
+    //    REST the remainder (GTC), pass the rest requirement so the fills+rest margin is validated
+    //    atomically here (else the fills commit and rest_in_book could revert, leaking them).
+    let rest_req = if rest_remainder && remaining > 0 {
+        let maker_fee_bps = storage::load_user_fee_rates(context, taker_addr)?.maker_fee_bps;
+        Some(settlement::RestReq {
+            price: limit_price,
+            qty: remaining,
+            maker_fee_bps,
+        })
+    } else {
+        None
+    };
+    let taker_plan =
+        taker_settlement.finalize_compute(context, &mut registry, side, market, rest_req)?;
+
+    // ── APPLY (no genuine rejects past this point) ──
+    registry.flush(context, market_id)?;
+    if let Some(plan) = taker_plan {
+        settlement::finalize_apply(context, plan, side, market)?;
+    }
     if let Some(price) = last_trade_price {
         storage::save_last_traded_price(context, market_id, price)?;
     }
     Ok(remaining)
-}
-
-struct TradeEvent<'a> {
-    market_id: u64,
-    taker_order_id: &'a [u8; 32],
-    maker_order_id: &'a [u8; 32],
-    taker: Address,
-    maker: Address,
-    price: u64,
-    quantity: u64,
-    taker_side: Side,
-    taker_fee: u64,
-    maker_fee: u64,
-}
-
-fn emit_trade<CTX: ContextTr>(
-    context: &mut CTX,
-    trade: TradeEvent<'_>,
-) -> Result<(), PrecompileError> {
-    let trade_id = storage::next_trade_id(context, trade.market_id)?;
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::Trade {
-            marketId: trade.market_id,
-            tradeId: trade_id,
-            takerOrderId: FixedBytes(*trade.taker_order_id),
-            makerOrderId: FixedBytes(*trade.maker_order_id),
-            taker: trade.taker,
-            maker: trade.maker,
-            price: trade.price,
-            quantity: trade.quantity,
-            takerSide: trade.taker_side as u8,
-            takerFee: trade.taker_fee,
-            makerFee: trade.maker_fee,
-        }
-        .to_log_data(),
-    });
-    Ok(())
 }
 
 // ── Resting in book ───────────────────────────────────────────────────────────
@@ -1210,17 +1367,37 @@ fn rest_in_book<CTX: ContextTr>(
     tif: TimeInForce,
     client_order_id: [u8; 16],
     market: &crate::perp_dex::types::Market,
+    // 2b resolve-once: (best_bid, best_ask). `Some` = the caller already read the BBO (PostOnly
+    // threads its do-not-cross read — no match ran, so it is still current). `None` = read it here
+    // once. rest runs AFTER matching (GTC), and matching only moves the OPPOSITE side from the one
+    // we rest on, so a rest-time read yields both bests current — no staleness.
+    bbo: Option<(u64, u64)>,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let mut account = storage::load_account(context, user)?;
-    let maker_fee_bps = storage::load_user_fee_rates(context, user)?.maker_fee_bps;
+    // fee rate is a field of the account we already loaded (folded in) — no separate fee-rate read.
+    let maker_fee_bps = account.maker_fee_bps;
+    // ONE BBO resolve for both the best-update check and the mid-price sample (was up to two
+    // separate load_best_bid/load_best_ask reads per arm).
+    let (best_bid, best_ask) = match bbo {
+        Some(b) => b,
+        None => {
+            let h = storage::load_market_hot(context, market_id)?;
+            (h.best_bid, h.best_ask)
+        }
+    };
 
     match side {
         Side::Buy => {
-            // #21 靶子2: insert into the user's buy-order list (sorted price DESC) IN PLACE and
-            // recompute the flip-aware reservation inside the borrow — no load/store clone of the
-            // list. The other side is loaded owned (the two-sided calc needs both).
+            // commit-only #23 CLONE-FREE probe: read BOTH sides via Arc (zero clone) and evaluate
+            // the reservation of "buy-list ⊕ new_entry (at its sorted slot)" by FOLDING a chained
+            // iterator — the hypothetical entry is never inserted into a real/owned list, so a
+            // reject below leaves the overlay untouched (validate-then-apply: check first). The
+            // fold is byte-identical to inserting-then-computing, so the accepted reservation is
+            // unchanged (golden-neutral).
             let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
+            let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
+            let buy_slice = buy_ref.as_slice();
             let new_entry = OrderEntry {
                 order_id: *order_id,
                 price,
@@ -1229,14 +1406,22 @@ fn rest_in_book<CTX: ContextTr>(
             };
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
+            let idx = buy_slice.partition_point(|e| e.price > price);
             let (new_buy_side_notional, sell_notional, c_notional) =
-                storage::mutate_buy_orders(context, user, market_id, |entries| {
-                    let idx = entries.partition_point(|e| e.price > price);
-                    entries.insert(idx, new_entry);
-                    calc_reservation_notionals(entries, &sell_entries, bd, pd, pos_amount)
-                })??;
+                crate::perp_dex::math::calc_reservation_notionals_it(
+                    buy_slice[..idx]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(new_entry))
+                        .chain(buy_slice[idx..].iter().copied()),
+                    sell_entries.iter().copied(),
+                    bd,
+                    pd,
+                    pos_amount,
+                )?;
+            // Reuse the maker_fee_bps already read from `account` (no internal fee-rate re-load).
             let order_fee_reserved =
-                calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
+                calc_maker_fee_for_order_qty_with_bps(price, qty, maker_fee_bps, market)?;
             // Adding an order can only grow the buy-side notional (checked before
             // set_reservations overwrites the stored value).
             if new_buy_side_notional < pos.buy_side_reserved_notional {
@@ -1267,23 +1452,31 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
-            // Persist order book state. (#21: the buy-order list was mutated in place above — no
-            // save_buy_orders here.)
+            // ── APPLY (all rejects passed) ── NOW do the real insert: in-place on a warm list
+            // (zero clone), or one materialize-clone on a cold first-touch (unavoidable — it IS
+            // the write of a previously-committed list). partition_point re-derives the same idx.
+            drop(buy_ref);
+            storage::mutate_buy_orders(context, user, market_id, |list| {
+                let i = list.partition_point(|e| e.price > price);
+                list.insert(i, new_entry);
+            })?;
             storage::insert_bid_price(context, market_id, price)?;
+            // push_bid_order also bumps the level's live count (folded into the level blob).
             storage::push_bid_order(context, market_id, price, *order_id)?;
 
             // Keep best_bid cache up to date.
-            let cur_best_bid = storage::load_best_bid(context, market_id)?;
-            if cur_best_bid == 0 || price > cur_best_bid {
+            if best_bid == 0 || price > best_bid {
                 storage::save_best_bid(context, market_id, price)?;
-                let best_ask = storage::load_best_ask(context, market_id)?;
+                // best_ask from the single resolve above (post-match for GTC).
                 record_mid_price_sample_for_best_quote_change(context, market_id, price, best_ask)?;
             }
         }
         Side::Sell => {
-            // #21 靶子2: insert into the user's sell-order list (sorted price ASC) IN PLACE and
-            // recompute the flip-aware reservation inside the borrow — no load/store clone.
+            // commit-only #23 CLONE-FREE probe (mirror of the buy arm): fold sell-list ⊕ new_entry
+            // over Arc-borrowed lists, no owned clone, reject leaves the overlay untouched.
             let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
+            let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
+            let sell_slice = sell_ref.as_slice();
             let new_entry = OrderEntry {
                 order_id: *order_id,
                 price,
@@ -1292,14 +1485,22 @@ fn rest_in_book<CTX: ContextTr>(
             };
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
+            let idx = sell_slice.partition_point(|e| e.price < price);
             let (buy_notional, new_sell_side_notional, c_notional) =
-                storage::mutate_sell_orders(context, user, market_id, |entries| {
-                    let idx = entries.partition_point(|e| e.price < price);
-                    entries.insert(idx, new_entry);
-                    calc_reservation_notionals(&buy_entries, entries, bd, pd, pos_amount)
-                })??;
+                crate::perp_dex::math::calc_reservation_notionals_it(
+                    buy_entries.iter().copied(),
+                    sell_slice[..idx]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(new_entry))
+                        .chain(sell_slice[idx..].iter().copied()),
+                    bd,
+                    pd,
+                    pos_amount,
+                )?;
+            // Reuse the maker_fee_bps already read from `account` (no internal fee-rate re-load).
             let order_fee_reserved =
-                calc_maker_fee_for_order_qty(context, user, price, qty, market)?;
+                calc_maker_fee_for_order_qty_with_bps(price, qty, maker_fee_bps, market)?;
             // Adding an order can only grow the sell-side notional (checked before
             // set_reservations overwrites the stored value).
             if new_sell_side_notional < pos.sell_side_reserved_notional {
@@ -1330,15 +1531,20 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
-            // Persist order book state. (#21: the sell-order list was mutated in place above.)
+            // ── APPLY (all rejects passed) ── real insert: in-place (warm) / one materialize (cold).
+            drop(sell_ref);
+            storage::mutate_sell_orders(context, user, market_id, |list| {
+                let i = list.partition_point(|e| e.price < price);
+                list.insert(i, new_entry);
+            })?;
             storage::insert_ask_price(context, market_id, price)?;
+            // push_ask_order also bumps the level's live count (folded into the level blob).
             storage::push_ask_order(context, market_id, price, *order_id)?;
 
             // Keep best_ask cache up to date.
-            let cur_best_ask = storage::load_best_ask(context, market_id)?;
-            if cur_best_ask == 0 || price < cur_best_ask {
+            if best_ask == 0 || price < best_ask {
                 storage::save_best_ask(context, market_id, price)?;
-                let best_bid = storage::load_best_bid(context, market_id)?;
+                // best_bid from the single resolve above (post-match for GTC).
                 record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, price)?;
             }
         }
@@ -1368,7 +1574,7 @@ fn rest_in_book<CTX: ContextTr>(
 // ── Cancel helpers ─────────────────────────────────────────────────────────────
 
 /// Atomically executes all four steps of an order cancellation:
-/// remove from book → release reserved margin → mark Cancelled → emit log.
+/// remove from book → release reserved margin → delete the order record → emit log.
 ///
 /// Both the explicit user-initiated cancel path and the auto-cancel-for-margin
 /// path in settlement use this function so the invariant "these steps always
@@ -1384,8 +1590,7 @@ pub(super) fn execute_order_cancellation<CTX: ContextTr, F>(
     user: Address,
     market_id: u64,
     order_id: [u8; 32],
-    mut order: Order,
-    terminal_status: OrderStatus,
+    order: Order,
     market: &crate::perp_dex::types::Market,
     remove: F,
 ) -> Result<(), PrecompileError>
@@ -1394,8 +1599,11 @@ where
 {
     remove(context, market_id, order.side, order.price, &order_id)?;
     release_margin_for_cancelled_order(context, user, market_id, order.side, &order_id, market)?;
-    order.status = terminal_status;
-    storage::save_order(context, &order_id, &order)?;
+    // delete-on-terminal: the cancelled/expired order is removed from the map. Its id may linger in
+    // the level FIFO (lazy-queue) until a match walk sweeps it; `remove` already decremented the
+    // level's live count. The Cancelled/Expired distinction (previously only the saved status; the
+    // event has always been OrderCancelled) is dropped with the record — history is disposable.
+    storage::delete_order(context, &order_id)?;
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderCancelled {
@@ -1419,17 +1627,19 @@ fn detach_order_from_level<CTX: ContextTr>(
     market_id: u64,
     side: Side,
     price: u64,
-    order_id: &[u8; 32],
+    _order_id: &[u8; 32],
 ) -> Result<(bool, u64), PrecompileError> {
+    // lazy-queue: `order_id` is intentionally NOT removed from the FIFO queue — that O(depth) scan
+    // is replaced by an O(1) decrement of the level's LIVE count. The stale id is swept when the
+    // next match walk reaches it (load_order → None → skip). When the count hits 0 the level is
+    // logically empty: drop the price from the index and clear the (now all-stale) queue in one
+    // shot, so single-order-per-level churn (count 1→0 each cancel) never accumulates stale ids.
     let (old_best, emptied) = match side {
         Side::Buy => {
             let old_best = storage::load_best_bid(context, market_id)?;
-            // #21 generalized: remove IN PLACE (fast path when the level is already in the block
-            // overlay), byte-identical to the load-retain-save round-trip.
-            let emptied = storage::mutate_bid_level(context, market_id, price, |q| {
-                q.retain(|id| id != order_id);
-                q.is_empty()
-            })?;
+            // decr_level_count clears the FIFO ids when the count hits 0 (blob → delete); we only
+            // need to drop the price from the index.
+            let emptied = storage::decr_level_count(context, market_id, Side::Buy, price, 1)? == 0;
             if emptied {
                 storage::remove_bid_price(context, market_id, price)?;
             }
@@ -1437,10 +1647,7 @@ fn detach_order_from_level<CTX: ContextTr>(
         }
         Side::Sell => {
             let old_best = storage::load_best_ask(context, market_id)?;
-            let emptied = storage::mutate_ask_level(context, market_id, price, |q| {
-                q.retain(|id| id != order_id);
-                q.is_empty()
-            })?;
+            let emptied = storage::decr_level_count(context, market_id, Side::Sell, price, 1)? == 0;
             if emptied {
                 storage::remove_ask_price(context, market_id, price)?;
             }
@@ -1549,36 +1756,6 @@ pub(super) fn remove_from_book_during_match<CTX: ContextTr>(
     Ok(())
 }
 
-/// Cancel a maker order that a taker fill would have opened into insolvency
-/// (K9 maker-side guard). Releases the reserved margin + fee back to the maker's
-/// wallet and removes the order from the maker's per-user index (via
-/// `release_margin_for_cancelled_order`), marks the order `Cancelled`, and emits
-/// `OrderCancelled`. The caller drops it from the price-level queue by not
-/// re-adding it to `new_queue`.
-fn cancel_rejected_maker<CTX: ContextTr>(
-    context: &mut CTX,
-    maker: Address,
-    market_id: u64,
-    maker_side: Side,
-    order_id: &[u8; 32],
-    order: &mut crate::perp_dex::types::Order,
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
-    release_margin_for_cancelled_order(context, maker, market_id, maker_side, order_id, market)?;
-    order.status = OrderStatus::Cancelled;
-    storage::save_order(context, order_id, order)?;
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::OrderCancelled {
-            user: maker,
-            orderId: FixedBytes(*order_id),
-            marketId: market_id,
-        }
-        .to_log_data(),
-    });
-    Ok(())
-}
-
 pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
@@ -1588,108 +1765,142 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
-    let mut account = storage::load_account(context, user)?;
+    // commit-only #23 CLONE-FREE: read both sides via Arc (zero clone) and compute the POST-cancel
+    // reservation by FOLDING a FILTERED iterator (the cancelled side minus this order_id) — no
+    // owned list clone. order_ids are unique per side, so the filter drops exactly the one entry
+    // remove_order_entry would (byte-identical reservation → golden-neutral). Cancel has no reject,
+    // so this is a pure apply.
+    let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
+    let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
+    let (buy_notional, sell_notional, c_notional) = match side {
+        Side::Buy => crate::perp_dex::math::calc_reservation_notionals_it(
+            buy_ref.iter().copied().filter(|e| &e.order_id != order_id),
+            sell_ref.iter().copied(),
+            market.base_decimals,
+            market.price_decimals,
+            pos.amount,
+        )?,
+        Side::Sell => crate::perp_dex::math::calc_reservation_notionals_it(
+            buy_ref.iter().copied(),
+            sell_ref.iter().copied().filter(|e| &e.order_id != order_id),
+            market.base_decimals,
+            market.price_decimals,
+            pos.amount,
+        )?,
+    };
+    drop(buy_ref);
+    drop(sell_ref);
 
-    match side {
-        Side::Buy => {
-            // Flip-aware reservation snapshot before removal (pos.margin_reserved,
-            // not the per-side max — the per-side fields lag it under the model).
-            let old_reserved = pos.margin_reserved;
-            // The book entry's `amount` is the authoritative remaining quantity
-            // (kept current by reduce_maker_order_entry_for_fill); the order's
-            // `filled` can lag it during the same matching round, so the release
-            // is sized from the entry, not from order.quantity - order.filled.
-            // #21 靶子2: remove + recompute IN PLACE (no load/store clone of the list).
-            let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
-            let pos_amount = pos.amount;
-            let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let (cancelled_entry, (new_notional, sell_notional, c_notional)) =
-                storage::mutate_buy_orders(
-                    context,
-                    user,
-                    market_id,
-                    |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
-                        let cancelled = remove_order_entry(entries, order_id, "buy")?;
-                        let notionals =
-                            calc_reservation_notionals(entries, &sell_entries, bd, pd, pos_amount)?;
-                        Ok((cancelled, notionals))
-                    },
-                )??;
-            let leverage = pos.leverage;
-            pos.set_reservations(new_notional, sell_notional, c_notional, leverage);
-            let new_reserved = pos.margin_reserved;
-            let freed = old_reserved.saturating_sub(new_reserved);
-            let fee_freed = calc_maker_fee_for_order_qty_with_bps(
-                cancelled_entry.price,
-                cancelled_entry.amount,
-                cancelled_entry.maker_fee_bps,
-                market,
-            )?;
-            // Return released margin + fee reservation in one credit (mirrors the
-            // combined debit on the placement path).
-            let total_freed = freed
-                .checked_add(fee_freed)
-                .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
-            account.credit_perp(total_freed)?;
-            // Surface drift instead of masking it (was saturating_sub).
-            let prev_fee = pos.fee_reserved;
-            pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
-                perp_invariant_err(format!(
-                    "fee_reserved {prev_fee} < fee to release {fee_freed}"
-                ))
-            })?;
-            // #21: buy-order list mutated in place above — no save here.
-        }
-        Side::Sell => {
-            // Flip-aware reservation snapshot before removal (pos.margin_reserved,
-            // not the per-side max — the per-side fields lag it under the model).
-            let old_reserved = pos.margin_reserved;
-            // #21 靶子2: remove + recompute IN PLACE (no load/store clone of the list).
-            let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
-            let pos_amount = pos.amount;
-            let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let (cancelled_entry, (buy_notional, new_notional, c_notional)) =
-                storage::mutate_sell_orders(
-                    context,
-                    user,
-                    market_id,
-                    |entries| -> Result<(OrderEntry, (u64, u64, u64)), PrecompileError> {
-                        let cancelled = remove_order_entry(entries, order_id, "sell")?;
-                        let notionals =
-                            calc_reservation_notionals(&buy_entries, entries, bd, pd, pos_amount)?;
-                        Ok((cancelled, notionals))
-                    },
-                )??;
-            let leverage = pos.leverage;
-            pos.set_reservations(buy_notional, new_notional, c_notional, leverage);
-            let new_reserved = pos.margin_reserved;
-            let freed = old_reserved.saturating_sub(new_reserved);
-            let fee_freed = calc_maker_fee_for_order_qty_with_bps(
-                cancelled_entry.price,
-                cancelled_entry.amount,
-                cancelled_entry.maker_fee_bps,
-                market,
-            )?;
-            // Return released margin + fee reservation in one credit (mirrors the
-            // combined debit on the placement path).
-            let total_freed = freed
-                .checked_add(fee_freed)
-                .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
-            account.credit_perp(total_freed)?;
-            // Surface drift instead of masking it (was saturating_sub).
-            let prev_fee = pos.fee_reserved;
-            pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
-                perp_invariant_err(format!(
-                    "fee_reserved {prev_fee} < fee to release {fee_freed}"
-                ))
-            })?;
-            // #21: sell-order list mutated in place above — no save here.
-        }
-    }
+    // Real removal (in-place on a warm list / one materialize on a cold first-touch) — this returns
+    // the cancelled entry (and reproduces remove_order_entry's not-found invariant verbatim), which
+    // apply_release_effect needs for the fee. Only the cancelled side's key is written.
+    let cancelled_entry = match side {
+        Side::Buy => storage::mutate_buy_orders(context, user, market_id, |list| {
+            remove_order_entry(list, order_id, "buy")
+        })??,
+        Side::Sell => storage::mutate_sell_orders(context, user, market_id, |list| {
+            remove_order_entry(list, order_id, "sell")
+        })??,
+    };
 
+    let total_freed = apply_release_effect(
+        &mut pos,
+        buy_notional,
+        sell_notional,
+        c_notional,
+        &cancelled_entry,
+        market,
+    )?;
     storage::save_position(context, user, market_id, &pos)?;
-    storage::save_account(context, user, account)?;
+    // In-place wallet credit (no UserAccount/String load+save clone pair).
+    storage::mutate_account(context, user, |a| a.credit_perp(total_freed))??;
     Ok(())
+}
+
+/// PURE core of [`release_margin_for_cancelled_order`] (commit-only #23, tranche-4): removes the
+/// entry, recomputes the flip-aware reservation, and credits the freed margin + fee reservation —
+/// over in-memory working copies only, NO storage access. The match compute phase runs this to
+/// simulate the taker wallet-cover LIFO cancels (and plan them) before any write.
+///
+/// The book entry's `amount` is the authoritative remaining quantity (kept current by
+/// `reduce_order_entry_core`); the order's `filled` can lag it during the same matching round, so
+/// the release is sized from the entry, not from `order.quantity - order.filled`.
+pub(super) fn release_margin_core(
+    pos: &mut crate::perp_dex::types::PerpPosition,
+    account: &mut crate::perp_dex::types::UserAccount,
+    buy_entries: &mut Vec<OrderEntry>,
+    sell_entries: &mut Vec<OrderEntry>,
+    side: Side,
+    order_id: &[u8; 32],
+    market: &crate::perp_dex::types::Market,
+) -> Result<(), PrecompileError> {
+    let cancelled_entry = {
+        let (entries, label) = match side {
+            Side::Buy => (&mut *buy_entries, "buy"),
+            Side::Sell => (&mut *sell_entries, "sell"),
+        };
+        remove_order_entry(entries, order_id, label)?
+    };
+    let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
+        buy_entries,
+        sell_entries,
+        market.base_decimals,
+        market.price_decimals,
+        pos.amount,
+    )?;
+    let total_freed = apply_release_effect(
+        pos,
+        buy_notional,
+        sell_notional,
+        c_notional,
+        &cancelled_entry,
+        market,
+    )?;
+    // Registry path: credit the owned working-copy account (saved once at flush).
+    account.credit_perp(total_freed)
+}
+
+/// Applies a cancel's margin release to the POSITION given the POST-cancel reservation notionals +
+/// the cancelled entry: snapshots the flip-aware reservation, drops the fee reservation, and RETURNS
+/// the total amount to credit back to the wallet (freed margin + fee reservation). The CALLER
+/// applies that credit — the registry path onto its owned working-copy account, the storage path via
+/// `mutate_account` (in-place, no owned load+save clone pair) — so this stays account-representation-
+/// agnostic and the freed/fee math has a single source of truth. `old_reserved` is snapshotted here
+/// before `set_reservations`; the preceding entry removal never touches `pos.margin_reserved`.
+fn apply_release_effect(
+    pos: &mut crate::perp_dex::types::PerpPosition,
+    new_buy_notional: u64,
+    new_sell_notional: u64,
+    new_c_notional: u64,
+    cancelled: &OrderEntry,
+    market: &crate::perp_dex::types::Market,
+) -> Result<u64, PrecompileError> {
+    let old_reserved = pos.margin_reserved;
+    pos.set_reservations(
+        new_buy_notional,
+        new_sell_notional,
+        new_c_notional,
+        pos.leverage,
+    );
+    let freed = old_reserved.saturating_sub(pos.margin_reserved);
+    let fee_freed = calc_maker_fee_for_order_qty_with_bps(
+        cancelled.price,
+        cancelled.amount,
+        cancelled.maker_fee_bps,
+        market,
+    )?;
+    // Released margin + fee reservation credited in one (mirrors the combined debit on placement).
+    let total_freed = freed
+        .checked_add(fee_freed)
+        .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
+    // Surface drift instead of masking it (was saturating_sub).
+    let prev_fee = pos.fee_reserved;
+    pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
+        perp_invariant_err(format!(
+            "fee_reserved {prev_fee} < fee to release {fee_freed}"
+        ))
+    })?;
+    Ok(total_freed)
 }
 
 // ── FOK / PostOnly pre-checks ─────────────────────────────────────────────────
@@ -1707,8 +1918,8 @@ fn check_fok_feasibility<CTX: ContextTr>(
     let mut available: u64 = 0;
     // Count only IN-BAND liquidity: match_order will not fill past the band, so FOK
     // feasibility must apply the same bound or it would pass a FOK that then can't fully
-    // fill.
-    let mark = storage::load_mark_price(context, market_id)?;
+    // fill. (mark_price is a field of the Market already loaded.)
+    let mark = market.mark_price;
     let (mark_upper, mark_lower) =
         crate::perp_dex::math::mark_band_bounds(mark, market.price_band_bps);
     match side {
@@ -1725,7 +1936,7 @@ fn check_fok_feasibility<CTX: ContextTr>(
                     break;
                 }
                 let queue = storage::load_ask_level_arc(context, market_id, ask_price)?;
-                for maker_id in queue.iter() {
+                for maker_id in queue.ids.iter() {
                     if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
                             available += o.quantity - o.filled;
@@ -1739,7 +1950,7 @@ fn check_fok_feasibility<CTX: ContextTr>(
         }
         Side::Sell => {
             let bid_prices = storage::load_bid_prices_ref(context, market_id)?;
-            'outer: for bid_price in bid_prices.iter().copied() {
+            'outer: for bid_price in bid_prices.iter().rev().copied() {
                 if (bid_price as u128) > mark_upper {
                     continue;
                 }
@@ -1750,7 +1961,7 @@ fn check_fok_feasibility<CTX: ContextTr>(
                     break;
                 }
                 let queue = storage::load_bid_level_arc(context, market_id, bid_price)?;
-                for maker_id in queue.iter() {
+                for maker_id in queue.ids.iter() {
                     if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
                             available += o.quantity - o.filled;

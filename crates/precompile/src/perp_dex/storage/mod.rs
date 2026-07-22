@@ -15,8 +15,9 @@ use crate::{
     perp_dex::{
         errors::perp_err,
         types::{
-            ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, Order, OrderEntry,
-            PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount, UserFeeRates,
+            ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, MarketHot, Order,
+            OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount,
+            UserFeeRates,
         },
     },
     stateful_precompiles::convert_db_err,
@@ -25,12 +26,11 @@ use crate::{
 
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
-    best_ask_key, best_bid_key, bid_level_key, bid_prices_key, commitment_slot, erc20_balance_slot,
-    funding_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
-    last_traded_price_key, mark_price_key, market_fee_total_key, market_key, market_manager_key,
-    open_interest_key, oracle_key, order_key, position_key, position_registry_key,
-    premium_accumulator_key, price_basis_window_key, trade_count_key, user_buy_orders_key,
-    user_fee_rates_key, user_nonce_key, user_sell_orders_key,
+    bid_level_key, bid_prices_key, commitment_slot, erc20_balance_slot, funding_state_key,
+    index_price_history_key, index_price_state_key, insurance_fund_key, market_fee_total_key,
+    market_hot_key, market_key, market_manager_key, oracle_key, order_key, position_key,
+    position_registry_key, premium_accumulator_key, price_basis_window_key, seen_bucket_key,
+    seen_sig_key, trade_count_key, user_buy_orders_key, user_sell_orders_key,
 };
 
 // ── Generic msgpack helpers ───────────────────────────────────────────────────
@@ -200,9 +200,23 @@ fn store_blob<CTX: ContextTr>(
 }
 
 /// Version byte mixed into the per-block commitment hash (catalog #16d). Bumped to 3 at the
-/// switch from the per-call chained v2 (retired) to the per-block net-delta fold, so the two
-/// framings never alias across the consensus transition (a devnet wipe accompanies the bump).
-const BLOCK_COMMITMENT_VERSION: u8 = 3;
+/// switch from the per-call chained v2 (retired) to the per-block net-delta fold; bumped to 4
+/// at the switch from keccak-derived storage keys to direct-packed keys (catalog #12), so the
+/// two key framings never alias across the consensus transition (a devnet wipe accompanies the
+/// bump); bumped to 5 at the price-index switch from sorted `Vec<u64>` to `Vec<u64>`
+/// (catalog #22) — the serialized price-level bytes change (container + order); bumped to 6 at the
+/// order-lifecycle redesign (commit-only #23): delete-on-terminal removes filled/cancelled orders
+/// from the map, the new per-level live-order count + lazy FIFO change the level-key set, and the
+/// signed-order replay guard moved to the seen-signature namespace — all shift the net-delta bytes;
+/// bumped to 7 grouping the five per-market hot scalars (mark price, best bid/ask, last traded,
+/// open interest) into one `MarketHot` blob — the delta keys + framing regroup (values identical);
+/// bumped to 8 folding the two per-user scalar keys (fee-rate bps, order nonce) into the account
+/// blob — the account blob grows and their standalone keys disappear from the delta; bumped to 9
+/// moving mark_price out of `MarketHot` into the `Market` blob (write-rare + co-read with config) —
+/// both blobs' bytes change (Market gains a field, MarketHot loses one); bumped to 10 folding each
+/// level's live-order count INTO its FIFO blob (`LevelBlob`, count(8 BE) prefix) — the per-level
+/// count keys disappear and the level blob framing changes.
+const BLOCK_COMMITMENT_VERSION: u8 = 10;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -291,14 +305,10 @@ where
         }
         return Ok(Some(decode(&buf)?));
     }
-    // Fast path: a deferred struct written this block — downcast + clone, no deserialization.
+    // Single in-block probe: `perp_get_struct` now serves BOTH a deferred `Struct` write AND a
+    // `Cached` cold-read blob (#14 folded into the working map) — downcast + clone, no deser, and
+    // no separate cache probe.
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(v) = any.downcast_ref::<T>() {
-            return Ok(Some(v.clone()));
-        }
-    }
-    // Cold-read deser cache (#14), for keys only READ this block (not in the write overlay).
-    if let Some(any) = context.journal_mut().perp_cache_get(key) {
         if let Some(v) = any.downcast_ref::<T>() {
             return Ok(Some(v.clone()));
         }
@@ -356,16 +366,18 @@ where
         }
         return Ok(Some(std::sync::Arc::new(decode(&buf)?)));
     }
+    // #14 cache tier FIRST: hand back the SAME Arc typed — refcount bump, zero clone. Checked
+    // before `perp_get_struct` because that now also returns cached blobs (as `&`), which would
+    // force a deep clone here; the Arc path preserves the zero-clone bump.
+    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
+        if let Ok(t) = std::sync::Arc::downcast::<T>(arc) {
+            return Ok(Some(t));
+        }
+    }
     // In-block deferred Struct write: overlay owns a unique Box → clone into an Arc (unavoidable).
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
         if let Some(v) = any.downcast_ref::<T>() {
             return Ok(Some(std::sync::Arc::new(v.clone())));
-        }
-    }
-    // #14 cold-read cache: hand back the SAME Arc typed — refcount bump, zero clone.
-    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
-        if let Ok(t) = std::sync::Arc::downcast::<T>(arc) {
-            return Ok(Some(t));
         }
     }
     // Cross-block decoded store (选项A): share the Arc into #14 then hand it back typed — zero clone.
@@ -480,11 +492,43 @@ pub fn save_account<CTX: ContextTr>(
     save_cached(context, account_key(user), &account)
 }
 
+/// In-place RMW of a user's account blob (mirror of [`mutate_buy_orders`]): fast-path mutates the
+/// deferred `Struct` already in the overlay (zero clone — no `usdc_balance` String copy); slow-path
+/// loads once → mutate → store. Used by the folded fee-rate / nonce setters AND by wallet
+/// credit/debit sites that previously did `load_account` (owned clone) → mutate → `save_account`
+/// (clone again): routing those through here removes both `UserAccount` deep clones (each of which
+/// heap-allocates the `usdc_balance` String) on the warm path. Byte-identical final blob to
+/// load→modify→save, so it is golden-neutral.
+pub fn mutate_account<CTX: ContextTr, R>(
+    context: &mut CTX,
+    user: Address,
+    f: impl FnOnce(&mut UserAccount) -> R,
+) -> Result<R, PrecompileError> {
+    let key = account_key(user);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(a) = any.downcast_mut::<UserAccount>() {
+            return Ok(f(a));
+        }
+    }
+    let mut a: UserAccount = load_cached(context, key)?.unwrap_or_default();
+    let r = f(&mut a);
+    save_cached(context, key, &a)?;
+    Ok(r)
+}
+
+// Fee rates + nonce are folded into UserAccount (per-user, co-read with the account on the hot
+// placement path). Reads go through `load_account_ref` (Arc bump — never clones the usdc_balance
+// String); writes RMW the account blob in place.
+
 pub fn load_user_fee_rates<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<UserFeeRates, PrecompileError> {
-    Ok(load_cached::<_, UserFeeRates>(context, user_fee_rates_key(user))?.unwrap_or_default())
+    let a = load_account_ref(context, user)?;
+    Ok(UserFeeRates {
+        maker_fee_bps: a.maker_fee_bps,
+        taker_fee_bps: a.taker_fee_bps,
+    })
 }
 
 pub fn save_user_fee_rates<CTX: ContextTr>(
@@ -492,7 +536,10 @@ pub fn save_user_fee_rates<CTX: ContextTr>(
     user: Address,
     rates: UserFeeRates,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, user_fee_rates_key(user), &rates)
+    mutate_account(context, user, |a| {
+        a.maker_fee_bps = rates.maker_fee_bps;
+        a.taker_fee_bps = rates.taker_fee_bps;
+    })
 }
 
 pub fn load_market_fee_total<CTX: ContextTr>(
@@ -825,6 +872,19 @@ pub fn save_order<CTX: ContextTr>(
     save_cached(context, order_key(order_id), order)
 }
 
+/// Deletes an order record (delete-on-terminal): writes an empty blob, the established "absent"
+/// convention (`load_order` → `None`, and the block delta merges an empty value as a store DELETE).
+/// Writing empty `Bytes` over any prior `Struct` overlay for this key clears it (HashMap replace +
+/// deser-cache eviction), so a save-then-delete in the same block reads back absent. Callers use
+/// this the instant an order reaches a terminal status so the order map only ever holds live
+/// (Open/PartiallyFilled) orders.
+pub fn delete_order<CTX: ContextTr>(
+    context: &mut CTX,
+    order_id: &[u8; 32],
+) -> Result<(), PrecompileError> {
+    store_blob(context, order_key(order_id), &[])
+}
+
 // ── Global trade counter ──────────────────────────────────────────────────────
 
 /// Atomically increment and return the *current* trade ID for a market, then store the
@@ -839,13 +899,13 @@ pub fn next_trade_id<CTX: ContextTr>(
     Ok(current)
 }
 
-// ── User nonce ────────────────────────────────────────────────────────────────
+// ── User nonce (folded into UserAccount) ────────────────────────────────────────
 
 pub fn load_user_nonce<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, user_nonce_key(user))?.unwrap_or(0))
+    Ok(load_account_ref(context, user)?.nonce)
 }
 
 pub fn save_user_nonce<CTX: ContextTr>(
@@ -853,7 +913,7 @@ pub fn save_user_nonce<CTX: ContextTr>(
     user: Address,
     nonce: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, user_nonce_key(user), &nonce)
+    mutate_account(context, user, |a| a.nonce = nonce)
 }
 
 // ── Market ────────────────────────────────────────────────────────────────────
@@ -881,13 +941,73 @@ pub fn save_market<CTX: ContextTr>(
     save_cached(context, market_key(market.market_id), market)
 }
 
-// ── Mark price ────────────────────────────────────────────────────────────────
+/// In-place RMW of the Market blob (mirror of [`mutate_account`]): fast-path mutates the deferred
+/// `Struct` already in the overlay (zero clone); slow-path loads once → mutate → store. Used by
+/// [`save_mark_price`] to set the mark field without a full load+save owned clone pair. Errors on a
+/// market that was never saved (rather than fabricate a phantom zero Market) — every caller
+/// (`updateIndexPrice`, tests) writes the full Market first, so this never fires in practice.
+fn mutate_market<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    f: impl FnOnce(&mut Market) -> R,
+) -> Result<R, PrecompileError> {
+    let key = market_key(market_id);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(m) = any.downcast_mut::<Market>() {
+            return Ok(f(m));
+        }
+    }
+    let mut m: Market =
+        load_cached(context, key)?.ok_or_else(|| perp_err("mutate_market: unknown market"))?;
+    let r = f(&mut m);
+    save_cached(context, key, &m)?;
+    Ok(r)
+}
+
+// ── Per-market hot scalars (grouped: MarketHot) ─────────────────────────────────
+// best bid/ask + last traded + open interest (the PER-TRADE scalars) live in ONE blob → co-access
+// = one probe/decode/Arc, one cache line, one coalesced write. (Mark price is NOT here — it is
+// write-rare + co-read with config, so it lives in the Market blob; see [`load_mark_price`].)
+
+pub fn load_market_hot<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<MarketHot, PrecompileError> {
+    Ok(load_cached::<_, MarketHot>(context, market_hot_key(market_id))?.unwrap_or_default())
+}
+
+/// In-place RMW of a market's hot scalars (mirror of [`mutate_buy_orders`]): fast-path mutates the
+/// deferred `Struct` already in the overlay (zero clone, one write coalesced across scalar setters);
+/// slow-path loads once → mutate → store. Byte-identical final blob to a load→modify→save.
+fn mutate_market_hot<CTX: ContextTr, R>(
+    context: &mut CTX,
+    market_id: u64,
+    f: impl FnOnce(&mut MarketHot) -> R,
+) -> Result<R, PrecompileError> {
+    let key = market_hot_key(market_id);
+    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
+        if let Some(h) = any.downcast_mut::<MarketHot>() {
+            return Ok(f(h));
+        }
+    }
+    let mut h: MarketHot = load_cached(context, key)?.unwrap_or_default();
+    let r = f(&mut h);
+    save_cached(context, key, &h)?;
+    Ok(r)
+}
+
+// ── Mark price (a field of the Market blob) ─────────────────────────────────────
+// Callers already holding `&Market` (validate band check, the match walk) should read
+// `market.mark_price` directly — zero extra probe. These helpers are for callers WITHOUT the
+// Market in hand (and for tests); they read via the Arc (no clone) / RMW the Market field.
 
 pub fn load_mark_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, mark_price_key(market_id))?.unwrap_or(0))
+    Ok(load_market_ref(context, market_id)?
+        .map(|m| m.mark_price)
+        .unwrap_or(0))
 }
 
 pub fn save_mark_price<CTX: ContextTr>(
@@ -895,7 +1015,7 @@ pub fn save_mark_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, mark_price_key(market_id), &price)
+    mutate_market(context, market_id, |m| m.mark_price = price)
 }
 
 // ── Open interest ─────────────────────────────────────────────────────────────
@@ -904,7 +1024,7 @@ pub fn load_open_interest<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, open_interest_key(market_id))?.unwrap_or(0))
+    Ok(load_market_hot(context, market_id)?.open_interest)
 }
 
 pub fn save_open_interest<CTX: ContextTr>(
@@ -912,12 +1032,43 @@ pub fn save_open_interest<CTX: ContextTr>(
     market_id: u64,
     oi: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, open_interest_key(market_id), &oi)
+    mutate_market_hot(context, market_id, |h| h.open_interest = oi)
 }
 
 // ── Order book: price level lists ─────────────────────────────────────────────
+// The active price levels per side are a SORTED `Vec<u64>` (ascending). Present-check /
+// insert-position use `binary_search` = O(log n) (NOT a linear `contains`); insert/remove are
+// O(n) memmove of contiguous u64 — trivially cheap at real book depth. This reverts catalog #22's
+// `BTreeSet<u64>`, which was O(log n) insert/remove but paid node allocation, pointer-chasing
+// iteration, and — worst — O(n log n)+n-alloc cross-block cold rebuild and slower per-block
+// serialization. A 3-way A/B (2026-07-20) showed sorted-Vec+binary_search beats BTreeSet at every
+// depth. The Vec is kept ascending so its msgpack bytes are byte-identical to the BTreeSet's (both
+// serialize as an ascending array) → commitment UNCHANGED, no CHAIN change. Side order for BBO:
+//   * asks — best = min = `.first()`; walk lowest-first = `.iter()`.
+//   * bids — best = max = `.last()`;  walk highest-first = `.iter().rev()`.
 
-/// Sorted bid prices DESC.
+/// Insert `x` into a sorted (ascending) `Vec` if absent; returns `true` if newly inserted.
+/// O(log n) `binary_search` + O(n) memmove — the sorted-Vec analogue of `BTreeSet::insert`.
+#[inline]
+fn sorted_insert(v: &mut Vec<u64>, x: u64) -> bool {
+    match v.binary_search(&x) {
+        Ok(_) => false,
+        Err(i) => {
+            v.insert(i, x);
+            true
+        }
+    }
+}
+
+/// Remove `x` from a sorted `Vec` if present. O(log n) search + O(n) memmove.
+#[inline]
+fn sorted_remove(v: &mut Vec<u64>, x: u64) {
+    if let Ok(i) = v.binary_search(&x) {
+        v.remove(i);
+    }
+}
+
+/// Active bid price levels (best = max).
 pub fn load_bid_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -925,8 +1076,9 @@ pub fn load_bid_prices<CTX: ContextTr>(
     Ok(load_cached::<_, Vec<u64>>(context, bid_prices_key(market_id))?.unwrap_or_default())
 }
 
-/// Zero-copy sorted bid prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only (BBO /
-/// matching walk). Price-list edits keep [`mutate_bid_prices`] / [`insert_bid_price`].
+/// Zero-copy active bid prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only
+/// (BBO / matching walk — bids walk `.iter().rev()`, best = `.last()`). Edits use
+/// [`insert_bid_price`] / [`remove_bid_price`].
 pub fn load_bid_prices_ref<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -938,12 +1090,12 @@ pub fn load_bid_prices_ref<CTX: ContextTr>(
 pub fn save_bid_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-    prices: &[u64],
+    prices: &Vec<u64>,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, bid_prices_key(market_id), &prices.to_vec())
+    save_cached(context, bid_prices_key(market_id), prices)
 }
 
-/// Sorted ask prices ASC.
+/// Active ask price levels (best = min).
 pub fn load_ask_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -951,7 +1103,8 @@ pub fn load_ask_prices<CTX: ContextTr>(
     Ok(load_cached::<_, Vec<u64>>(context, ask_prices_key(market_id))?.unwrap_or_default())
 }
 
-/// Zero-copy sorted ask prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only.
+/// Zero-copy active ask prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only
+/// (asks walk `.iter()`, best = `.first()`).
 pub fn load_ask_prices_ref<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -963,9 +1116,9 @@ pub fn load_ask_prices_ref<CTX: ContextTr>(
 pub fn save_ask_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
-    prices: &[u64],
+    prices: &Vec<u64>,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, ask_prices_key(market_id), &prices.to_vec())
+    save_cached(context, ask_prices_key(market_id), prices)
 }
 
 // ── In-place orderbook mutation (catalog #21, generalized) ──────────────────────
@@ -1011,39 +1164,22 @@ fn mutate_ask_prices<CTX: ContextTr, R>(
     Ok(r)
 }
 
-pub fn mutate_bid_level<CTX: ContextTr, R>(
+/// In-place RMW of a level blob (count + ids): fast-path mutates the deferred `Struct` in the
+/// overlay (zero clone); slow-path loads once → mutate → store. Used by [`push_bid_order`] (push id
+/// + count++) and [`decr_level_count`] (count−−).
+fn mutate_level<CTX: ContextTr, R>(
     context: &mut CTX,
-    market_id: u64,
-    price: u64,
-    f: impl FnOnce(&mut Vec<[u8; 32]>) -> R,
+    key: B256,
+    f: impl FnOnce(&mut LevelBlob) -> R,
 ) -> Result<R, PrecompileError> {
-    let key = bid_level_key(market_id, price);
     if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            return Ok(f(q));
+        if let Some(b) = any.downcast_mut::<LevelBlob>() {
+            return Ok(f(b));
         }
     }
-    let mut queue = load_bid_level(context, market_id, price)?;
-    let r = f(&mut queue);
-    save_bid_level(context, market_id, price, &queue)?;
-    Ok(r)
-}
-
-pub fn mutate_ask_level<CTX: ContextTr, R>(
-    context: &mut CTX,
-    market_id: u64,
-    price: u64,
-    f: impl FnOnce(&mut Vec<[u8; 32]>) -> R,
-) -> Result<R, PrecompileError> {
-    let key = ask_level_key(market_id, price);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            return Ok(f(q));
-        }
-    }
-    let mut queue = load_ask_level(context, market_id, price)?;
-    let r = f(&mut queue);
-    save_ask_level(context, market_id, price, &queue)?;
+    let mut b = load_level(context, key)?;
+    let r = f(&mut b);
+    save_level(context, key, &b);
     Ok(r)
 }
 
@@ -1075,21 +1211,57 @@ fn unpack_order_ids(buf: &[u8]) -> Result<Vec<[u8; 32]>, PrecompileError> {
         .collect())
 }
 
-/// Block-end serializer for a level FIFO held as a deferred `Struct` (#21): produces the SAME raw
-/// packed bytes as the old `store_blob(pack_order_ids(..))` path, so the off-trie blob (and the
-/// commitment) is byte-identical — only the serialization timing moves to block end.
+/// A price level's FIFO + its live-order count, in ONE blob (count folded in — they are written
+/// together on rest/match, so this halves the per-level keys in the delta/commitment and lets the
+/// match walk read ids + count in one probe). `count` = LIVE (Open/PartiallyFilled) orders; `ids`
+/// = the FIFO (live + lazily-swept stale). Packed raw as `count(8 BE) ++ id0(32) ++ id1(32) ...`
+/// (no msgpack, P4/#20 compactness). `count == 0` means the level is EMPTY → packs to an empty buf
+/// (the delete convention); stale `ids` are discarded on empty.
+#[derive(Clone, Default)]
+pub struct LevelBlob {
+    pub count: u64,
+    pub ids: Vec<[u8; 32]>,
+}
+
+/// Packs a [`LevelBlob`]: empty when the level is empty (count 0) → delete; else count prefix + ids.
+fn pack_level(b: &LevelBlob) -> Vec<u8> {
+    if b.count == 0 {
+        return Vec::new();
+    }
+    let mut buf = Vec::with_capacity(8 + b.ids.len() * 32);
+    buf.extend_from_slice(&b.count.to_be_bytes());
+    for id in &b.ids {
+        buf.extend_from_slice(id);
+    }
+    buf
+}
+
+/// Inverse of [`pack_level`]. Empty buf → empty level (count 0, no ids).
+fn unpack_level(buf: &[u8]) -> Result<LevelBlob, PrecompileError> {
+    if buf.is_empty() {
+        return Ok(LevelBlob::default());
+    }
+    if buf.len() < 8 {
+        return Err(perp_err("corrupt level blob (short)"));
+    }
+    let count = u64::from_be_bytes(buf[..8].try_into().unwrap());
+    let ids = unpack_order_ids(&buf[8..])?;
+    Ok(LevelBlob { count, ids })
+}
+
+/// Block-end serializer for a level held as a deferred `Struct` (#21): raw `count ++ ids` bytes.
 fn ser_level(v: &PerpBlob) -> Vec<u8> {
-    pack_order_ids(
-        v.downcast_ref::<Vec<[u8; 32]>>()
-            .expect("perp ser_level: level-queue type mismatch (bug)"),
+    pack_level(
+        v.downcast_ref::<LevelBlob>()
+            .expect("perp ser_level: level-blob type mismatch (bug)"),
     )
 }
 
-/// Clones a deferred level-FIFO `Struct` (keeps the journal overlay `Clone`).
+/// Clones a deferred level `Struct` (keeps the journal overlay `Clone`).
 fn clone_level(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
     std::boxed::Box::new(
-        v.downcast_ref::<Vec<[u8; 32]>>()
-            .expect("perp clone_level: level-queue type mismatch (bug)")
+        v.downcast_ref::<LevelBlob>()
+            .expect("perp clone_level: level-blob type mismatch (bug)")
             .clone(),
     )
 }
@@ -1104,60 +1276,51 @@ fn clone_level(v: &PerpBlob) -> std::boxed::Box<PerpBlob> {
 /// a re-fetch + re-unpack down to a clone. Safe: the write-overlay (`perp_get_struct`) is checked
 /// FIRST and shadows this entry; `store` invalidates the cache per-key; a revert clears the whole
 /// cache; and the cache is excluded from the block delta, so it can never affect the commitment.
-fn load_level_cached<CTX: ContextTr>(
-    context: &mut CTX,
-    key: B256,
-) -> Result<Vec<[u8; 32]>, PrecompileError> {
+/// Reads a level blob (count + ids), cloned. Single in-block probe (Struct or Cached) → cross-block
+/// decoded store (选项A) → cold byte store (unpack); caches the cold read.
+fn load_level<CTX: ContextTr>(context: &mut CTX, key: B256) -> Result<LevelBlob, PrecompileError> {
     if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
-            return Ok(q.clone());
+        if let Some(b) = any.downcast_ref::<LevelBlob>() {
+            return Ok(b.clone());
         }
     }
-    if let Some(any) = context.journal_mut().perp_cache_get(key) {
-        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
-            return Ok(q.clone());
-        }
-    }
-    // Cross-block decoded store (选项A): level queues written via `save_*_level` are typed
-    // `Vec<[u8;32]>` structs in the delta, so a prior block's decoded queue is reusable here too.
     if let Some(arc) = context
         .journal_mut()
         .perp_load_arc(key)
         .map_err(convert_db_err::<CTX::Db>)?
     {
-        if let Some(q) = arc.downcast_ref::<Vec<[u8; 32]>>() {
-            let out = q.clone();
+        if let Some(b) = arc.downcast_ref::<LevelBlob>() {
+            let out = b.clone();
             context.journal_mut().perp_cache_put(key, arc);
             return Ok(out);
         }
     }
     let buf = load_blob(context, key)?;
     if buf.is_empty() {
-        return Ok(Vec::new());
+        return Ok(LevelBlob::default());
     }
-    let queue = unpack_order_ids(&buf)?;
+    let b = unpack_level(&buf)?;
     context
         .journal_mut()
-        .perp_cache_put(key, std::sync::Arc::new(queue.clone()));
-    Ok(queue)
+        .perp_cache_put(key, std::sync::Arc::new(b.clone()));
+    Ok(b)
 }
 
-/// Zero-copy level FIFO read (点1): returns the queue as `Arc<Vec<[u8;32]>>` without the per-read
-/// clone [`load_level_cached`] pays. Mirrors its source precedence; cold path uses
-/// `unpack_order_ids` (levels are packed, not serde). For PURE reads only (peeks / prechecks);
-/// consuming match RMW keeps `load_level_cached` + `save_*_level`.
+/// Zero-copy level read (点1): `Arc<LevelBlob>` (ids + count) without a per-read deep clone on a
+/// cache/cross-block hit. The match walk reads ids + count from ONE probe; FOK / getBookLevel read
+/// `.ids`. Same source precedence as [`load_level`].
 fn load_level_arc<CTX: ContextTr>(
     context: &mut CTX,
     key: B256,
-) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
-    if let Some(any) = context.journal_mut().perp_get_struct(key) {
-        if let Some(q) = any.downcast_ref::<Vec<[u8; 32]>>() {
-            return Ok(std::sync::Arc::new(q.clone()));
+) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
+    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
+        if let Ok(b) = std::sync::Arc::downcast::<LevelBlob>(arc) {
+            return Ok(b);
         }
     }
-    if let Some(arc) = context.journal_mut().perp_cache_get_arc(key) {
-        if let Ok(q) = std::sync::Arc::downcast::<Vec<[u8; 32]>>(arc) {
-            return Ok(q);
+    if let Some(any) = context.journal_mut().perp_get_struct(key) {
+        if let Some(b) = any.downcast_ref::<LevelBlob>() {
+            return Ok(std::sync::Arc::new(b.clone()));
         }
     }
     if let Some(arc) = context
@@ -1166,118 +1329,130 @@ fn load_level_arc<CTX: ContextTr>(
         .map_err(convert_db_err::<CTX::Db>)?
     {
         context.journal_mut().perp_cache_put(key, arc.clone());
-        if let Ok(q) = std::sync::Arc::downcast::<Vec<[u8; 32]>>(arc) {
-            return Ok(q);
+        if let Ok(b) = std::sync::Arc::downcast::<LevelBlob>(arc) {
+            return Ok(b);
         }
     }
     let buf = load_blob(context, key)?;
     if buf.is_empty() {
-        return Ok(std::sync::Arc::new(Vec::new()));
+        return Ok(std::sync::Arc::new(LevelBlob::default()));
     }
-    let queue: std::sync::Arc<Vec<[u8; 32]>> = std::sync::Arc::new(unpack_order_ids(&buf)?);
-    context.journal_mut().perp_cache_put(key, queue.clone());
-    Ok(queue)
+    let b: std::sync::Arc<LevelBlob> = std::sync::Arc::new(unpack_level(&buf)?);
+    context.journal_mut().perp_cache_put(key, b.clone());
+    Ok(b)
 }
 
-/// Reads a bid level FIFO.
+/// Writes a level blob as a deferred `Struct` (#21; packed once at block end by [`ser_level`]).
+/// `count == 0` packs to empty = delete.
+fn save_level<CTX: ContextTr>(context: &mut CTX, key: B256, b: &LevelBlob) {
+    context.journal_mut().perp_store_struct(
+        key,
+        std::boxed::Box::new(b.clone()),
+        ser_level,
+        clone_level,
+    );
+}
+
+/// Reads a bid level's FIFO ids (for tests / callers that only need the ids).
 pub fn load_bid_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    load_level_cached(context, bid_level_key(market_id, price))
+    Ok(load_level(context, bid_level_key(market_id, price))?.ids)
 }
 
-/// Zero-copy bid level FIFO read (点1). See [`load_level_arc`]. PURE reads only.
+/// Zero-copy bid level read (点1): `Arc<LevelBlob>` (ids + count).
 pub fn load_bid_level_arc<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
-) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
+) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
     load_level_arc(context, bid_level_key(market_id, price))
 }
 
-/// Writes a bid level FIFO. #21: stores the `Vec` as a deferred `Struct` (packed ONCE at block end
-/// by [`ser_level`]) instead of re-packing the whole blob per op — byte-identical final bytes.
+/// Writes a bid level (live `count` + `ids`).
 pub fn save_bid_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
-    queue: &[[u8; 32]],
+    count: u64,
+    ids: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    context.journal_mut().perp_store_struct(
+    save_level(
+        context,
         bid_level_key(market_id, price),
-        std::boxed::Box::new(queue.to_vec()),
-        ser_level,
-        clone_level,
+        &LevelBlob {
+            count,
+            ids: ids.to_vec(),
+        },
     );
     Ok(())
 }
 
-/// Reads an ask level FIFO.
+/// Reads an ask level's FIFO ids.
 pub fn load_ask_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    load_level_cached(context, ask_level_key(market_id, price))
+    Ok(load_level(context, ask_level_key(market_id, price))?.ids)
 }
 
-/// Zero-copy ask level FIFO read (点1). See [`load_level_arc`]. PURE reads only.
+/// Zero-copy ask level read (点1): `Arc<LevelBlob>` (ids + count).
 pub fn load_ask_level_arc<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
-) -> Result<std::sync::Arc<Vec<[u8; 32]>>, PrecompileError> {
+) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
     load_level_arc(context, ask_level_key(market_id, price))
 }
 
+/// Writes an ask level (live `count` + `ids`).
 pub fn save_ask_level<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
-    queue: &[[u8; 32]],
+    count: u64,
+    ids: &[[u8; 32]],
 ) -> Result<(), PrecompileError> {
-    context.journal_mut().perp_store_struct(
+    save_level(
+        context,
         ask_level_key(market_id, price),
-        std::boxed::Box::new(queue.to_vec()),
-        ser_level,
-        clone_level,
+        &LevelBlob {
+            count,
+            ids: ids.to_vec(),
+        },
     );
     Ok(())
 }
 
 // ── Order book helpers ────────────────────────────────────────────────────────
 
-/// Insert `price` into the bid price list (kept sorted DESC) if not already present.
+/// Insert `price` into the active bid price set if not already present. O(log n) binary_search + O(n) memmove.
 pub fn insert_bid_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
     let key = bid_prices_key(market_id);
-    // Fast path: already touched this block → in-place present-check + insert (no load/store clone).
+    // Fast path: already touched this block → in-place insert (idempotent, no load/store clone).
     if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
         if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
-            if !prices.contains(&price) {
-                let idx = prices.partition_point(|&p| p > price);
-                prices.insert(idx, price);
-            }
+            sorted_insert(prices, price);
             return Ok(());
         }
     }
-    // Slow path (first touch): load once; write ONLY when inserting — preserving the pre-#21
-    // "no store when the price is already present" delta semantics (commitment/golden neutral).
+    // Slow path (first touch): load once; write ONLY when the price is newly inserted —
+    // preserving the "no store when already present" delta semantics (fewer commitment entries).
     let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
-    if !prices.contains(&price) {
-        let idx = prices.partition_point(|&p| p > price);
-        prices.insert(idx, price);
+    if sorted_insert(&mut prices, price) {
         save_cached(context, key, &prices)?;
     }
     Ok(())
 }
 
-/// Insert `price` into the ask price list (kept sorted ASC) if not already present.
+/// Insert `price` into the active ask price set if not already present. O(log n) binary_search + O(n) memmove.
 pub fn insert_ask_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -1286,90 +1461,124 @@ pub fn insert_ask_price<CTX: ContextTr>(
     let key = ask_prices_key(market_id);
     if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
         if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
-            if !prices.contains(&price) {
-                let idx = prices.partition_point(|&p| p < price);
-                prices.insert(idx, price);
-            }
+            sorted_insert(prices, price);
             return Ok(());
         }
     }
     let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
-    if !prices.contains(&price) {
-        let idx = prices.partition_point(|&p| p < price);
-        prices.insert(idx, price);
+    if sorted_insert(&mut prices, price) {
         save_cached(context, key, &prices)?;
     }
     Ok(())
 }
 
-/// Remove `price` from the bid price list (call when level becomes empty).
+/// Remove `price` from the active bid price set (call when level becomes empty). O(log n).
 pub fn remove_bid_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    mutate_bid_prices(context, market_id, |prices| prices.retain(|&p| p != price))
+    mutate_bid_prices(context, market_id, |prices| {
+        sorted_remove(prices, price);
+    })
 }
 
-/// Remove `price` from the ask price list (call when level becomes empty).
+/// Remove `price` from the active ask price set (call when level becomes empty). O(log n).
 pub fn remove_ask_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    mutate_ask_prices(context, market_id, |prices| prices.retain(|&p| p != price))
+    mutate_ask_prices(context, market_id, |prices| {
+        sorted_remove(prices, price);
+    })
 }
 
-/// Append `order_id` to the FIFO queue at the given bid price level. #21: if the level is already
-/// in the overlay, append IN PLACE (one undo snapshot, no load/store clone round-trip); otherwise
-/// materialize it once (committed bytes / absent) and store as a deferred `Struct`.
+/// Rest an order at a bid level: push its id to the FIFO AND bump the live count, in ONE in-place
+/// blob mutate (was push + a separate incr_level_count on a separate key).
 pub fn push_bid_order<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
-    let key = bid_level_key(market_id, price);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            q.push(order_id);
-            return Ok(());
-        }
-    }
-    let mut queue = load_bid_level(context, market_id, price)?;
-    queue.push(order_id);
-    save_bid_level(context, market_id, price, &queue)
+    mutate_level(context, bid_level_key(market_id, price), |b| {
+        b.ids.push(order_id);
+        b.count += 1;
+    })
 }
 
-/// Append `order_id` to the FIFO queue at the given ask price level. See [`push_bid_order`].
+/// Rest an order at an ask level. See [`push_bid_order`].
 pub fn push_ask_order<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
     price: u64,
     order_id: [u8; 32],
 ) -> Result<(), PrecompileError> {
-    let key = ask_level_key(market_id, price);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(q) = any.downcast_mut::<Vec<[u8; 32]>>() {
-            q.push(order_id);
-            return Ok(());
+    mutate_level(context, ask_level_key(market_id, price), |b| {
+        b.ids.push(order_id);
+        b.count += 1;
+    })
+}
+
+// ── Per-level live-order count (lazy-queue) ────────────────────────────────────
+// The count of LIVE (Open/PartiallyFilled) orders at a level, stored IN the level blob next to the
+// FIFO ids (Obs-1 merge: one key, not two). lazy-queue leaves cancelled/filled ids in the FIFO
+// (swept by the next match walk), so `ids.len()` no longer tracks liveness — `count` is the
+// authoritative "is the level empty?" signal. Maintained by: rest (push +1), cancel (decr −1),
+// cancel-all (decr −live), and the match walk (`SaveLevel` carries the post-walk survivor count).
+// count == 0 → the whole level blob is deleted (stale ids discarded).
+
+pub fn load_bid_count<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<u64, PrecompileError> {
+    Ok(load_level(context, bid_level_key(market_id, price))?.count)
+}
+
+pub fn load_ask_count<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    price: u64,
+) -> Result<u64, PrecompileError> {
+    Ok(load_level(context, ask_level_key(market_id, price))?.count)
+}
+
+/// Decrement a side's level count by `n` (orders removed: cancel / bulk-cancel). Returns the new
+/// count. On reaching 0 the level is EMPTY → the FIFO ids are cleared so the blob packs to empty
+/// (delete); the caller still removes the price from the index. Saturates at 0.
+pub fn decr_level_count<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    side: crate::perp_dex::types::Side,
+    price: u64,
+    n: u64,
+) -> Result<u64, PrecompileError> {
+    use crate::perp_dex::types::Side;
+    let key = match side {
+        Side::Buy => bid_level_key(market_id, price),
+        Side::Sell => ask_level_key(market_id, price),
+    };
+    mutate_level(context, key, |b| {
+        b.count = b.count.saturating_sub(n);
+        if b.count == 0 {
+            b.ids.clear();
         }
-    }
-    let mut queue = load_ask_level(context, market_id, price)?;
-    queue.push(order_id);
-    save_ask_level(context, market_id, price, &queue)
+        b.count
+    })
 }
 
 // ── Best bid / ask cache ──────────────────────────────────────────────────────
-// Stored as a single u64 per market.  0 means "no orders on that side".
-// Kept in sync with the sorted price lists so callers can avoid loading the
-// full list just for a PostOnly check or a quick spread query.
+// Field accessors on the grouped [`MarketHot`] blob (0 = "no orders on that side"). Kept in sync
+// with the sorted price lists so callers can avoid loading the full list for a PostOnly / spread
+// check.
 
 pub fn load_best_bid<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, best_bid_key(market_id))?.unwrap_or(0))
+    Ok(load_market_hot(context, market_id)?.best_bid)
 }
 
 pub fn save_best_bid<CTX: ContextTr>(
@@ -1377,14 +1586,14 @@ pub fn save_best_bid<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, best_bid_key(market_id), &price)
+    mutate_market_hot(context, market_id, |h| h.best_bid = price)
 }
 
 pub fn load_best_ask<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    Ok(load_cached::<_, u64>(context, best_ask_key(market_id))?.unwrap_or(0))
+    Ok(load_market_hot(context, market_id)?.best_ask)
 }
 
 pub fn save_best_ask<CTX: ContextTr>(
@@ -1392,7 +1601,7 @@ pub fn save_best_ask<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, best_ask_key(market_id), &price)
+    mutate_market_hot(context, market_id, |h| h.best_ask = price)
 }
 
 /// Re-derive best_bid from the current bid price list (already in journal cache after matching).
@@ -1402,7 +1611,7 @@ pub fn refresh_best_bid<CTX: ContextTr>(
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
     let prices = load_bid_prices(context, market_id)?;
-    let best = prices.first().copied().unwrap_or(0);
+    let best = prices.last().copied().unwrap_or(0); // bids: best = max
     save_best_bid(context, market_id, best)?;
     Ok(best)
 }
@@ -1580,16 +1789,13 @@ pub fn save_price_basis_window<CTX: ContextTr>(
 }
 
 // ── Last traded price (contract price) ───────────────────────────────────────
+// Field accessor on the grouped [`MarketHot`] blob.
 
 pub fn load_last_traded_price<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<u64, PrecompileError> {
-    let buf = load_blob(context, last_traded_price_key(market_id))?;
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    decode(&buf)
+    Ok(load_market_hot(context, market_id)?.last_traded)
 }
 
 pub fn save_last_traded_price<CTX: ContextTr>(
@@ -1597,8 +1803,7 @@ pub fn save_last_traded_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let buf = encode(&price)?;
-    store_blob(context, last_traded_price_key(market_id), &buf)
+    mutate_market_hot(context, market_id, |h| h.last_traded = price)
 }
 
 // ── Funding state ─────────────────────────────────────────────────────────────
@@ -1654,6 +1859,72 @@ pub fn absorb_from_insurance_fund<CTX: ContextTr>(
     let remaining = deficit - absorbed;
     save_insurance_fund(context, balance - absorbed)?;
     Ok((absorbed, remaining))
+}
+
+// ── Signed-order replay guard (seen-signature set) ─────────────────────────────
+// Replaces the order-map presence check as the replay witness for `placeOrderSigned`. Under
+// delete-on-terminal a filled/cancelled signed order is DELETED, so its order-id no longer proves
+// "this signature was already submitted" — this set does, in its own key namespace. The hot-path
+// check is a single O(1) overlay lookup that REUSES the `keccak256(signature)` already computed for
+// the order id (no extra hash). A seen marker is tiny; time-bucketing bounds the set to the recv
+// window. Crucially, `check_recv_window` rejects any signature older than the window BEFORE the
+// seen check runs, so a stale marker can never cause a false reject — GC exists purely to bound
+// storage, and losing a marker late is harmless.
+
+const SEEN_BUCKET_WIDTH_SECS: u64 = 15;
+/// Buckets retained behind the current one before GC drops them. `RETENTION * WIDTH` must exceed
+/// the max recv window (+ clock skew) so a bucket is dropped only once EVERY signature it could
+/// hold is already recv-window-expired (hence its marker unreachable). 6 * 15 = 90s > 60s + 5s.
+const SEEN_RETENTION_BUCKETS: u64 = 6;
+
+/// Replay check: has this signature (by `keccak256(signature)`) already been submitted?
+pub fn is_signature_seen<CTX: ContextTr>(
+    context: &mut CTX,
+    sig_hash: &[u8; 32],
+) -> Result<bool, PrecompileError> {
+    Ok(!load_blob(context, seen_sig_key(sig_hash))?.is_empty())
+}
+
+/// Records a signature as seen and indexes its seen-key in the GC bucket for the signature's OWN
+/// timestamp (`sig_ts`, already validated inside the recv window) — so the marker is reclaimed a
+/// fixed time after the signature was signed, independent of when it was submitted.
+pub fn mark_signature_seen<CTX: ContextTr>(
+    context: &mut CTX,
+    sig_hash: &[u8; 32],
+    sig_ts: u64,
+) -> Result<(), PrecompileError> {
+    let key = seen_sig_key(sig_hash);
+    store_blob(context, key, &[1u8])?; // non-empty marker ('empty' == absent)
+    let bucket = sig_ts / SEEN_BUCKET_WIDTH_SECS;
+    let bkey = seen_bucket_key(bucket);
+    let mut ids = unpack_order_ids(&load_blob(context, bkey)?)?;
+    ids.push(key.0);
+    store_blob(context, bkey, &pack_order_ids(&ids))
+}
+
+/// Lazy GC: drop the one bucket now `RETENTION` behind the block's current bucket, deleting every
+/// seen marker it indexed and then the bucket itself. Bounded (O(bucket size)) per call; the
+/// retention margin guarantees every signature in the dropped bucket is already recv-window-
+/// expired. Under continuous signed traffic each bucket is visited exactly once; a gap longer than
+/// one bucket width can skip a bucket, leaving harmless stale markers until a wipe (acceptable
+/// pre-production — they never cause false rejects). Call after each accepted signed order.
+pub fn gc_seen_buckets<CTX: ContextTr>(
+    context: &mut CTX,
+    block_ts: u64,
+) -> Result<(), PrecompileError> {
+    let cur = block_ts / SEEN_BUCKET_WIDTH_SECS;
+    if cur < SEEN_RETENTION_BUCKETS {
+        return Ok(());
+    }
+    let bkey = seen_bucket_key(cur - SEEN_RETENTION_BUCKETS);
+    let ids = unpack_order_ids(&load_blob(context, bkey)?)?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    for id in &ids {
+        store_blob(context, B256::new(*id), &[])?;
+    }
+    store_blob(context, bkey, &[])
 }
 
 // ── Premium index accumulator ─────────────────────────────────────────────────
@@ -1774,6 +2045,50 @@ mod commitment_tests {
         assert_eq!(read_commitment(&mut ctx), expected);
         assert_ne!(expected, U256::ZERO);
     }
+
+    /// Signed-order replay guard (commit-only #23, decoupled from the order map): a marked
+    /// signature reads back seen; an unrelated one does not; and the time-bucket GC reclaims the
+    /// marker once the block clock is `RETENTION` buckets past the signature's own bucket.
+    #[test]
+    fn seen_signature_guard_and_bucket_gc() {
+        let mut ctx = new_test_ctx();
+        let sig_a = [0x11u8; 32];
+        let sig_b = [0x22u8; 32];
+        let ts = 1_000u64;
+
+        assert!(!is_signature_seen(&mut ctx, &sig_a).unwrap());
+        mark_signature_seen(&mut ctx, &sig_a, ts).unwrap();
+        assert!(
+            is_signature_seen(&mut ctx, &sig_a).unwrap(),
+            "marked signature reads back seen"
+        );
+        assert!(
+            !is_signature_seen(&mut ctx, &sig_b).unwrap(),
+            "unrelated signature is not seen"
+        );
+
+        let bucket_a = ts / SEEN_BUCKET_WIDTH_SECS;
+        // GC targeting a bucket BEFORE sig_a's must not touch it.
+        gc_seen_buckets(
+            &mut ctx,
+            (bucket_a + SEEN_RETENTION_BUCKETS - 1) * SEEN_BUCKET_WIDTH_SECS,
+        )
+        .unwrap();
+        assert!(
+            is_signature_seen(&mut ctx, &sig_a).unwrap(),
+            "marker survives until its bucket is RETENTION behind the clock"
+        );
+        // GC exactly at sig_a's bucket + RETENTION reclaims it.
+        gc_seen_buckets(
+            &mut ctx,
+            (bucket_a + SEEN_RETENTION_BUCKETS) * SEEN_BUCKET_WIDTH_SECS,
+        )
+        .unwrap();
+        assert!(
+            !is_signature_seen(&mut ctx, &sig_a).unwrap(),
+            "GC reclaimed the expired marker"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1871,6 +2186,9 @@ mod size_probe_tests {
         let acct = UserAccount {
             usdc_balance: "123456789000000000000".into(), // 21-digit decimal string
             perp_wallet_balance: 1_234_567_890,
+            maker_fee_bps: 2,
+            taker_fee_bps: 5,
+            nonce: 7,
         };
         let buf = encode(&acct).unwrap();
         println!(
@@ -1894,6 +2212,7 @@ mod size_probe_tests {
             interest_rate: 100,
             liquidation_fee_rate_bps: 50,
             price_band_bps: 0,
+            mark_price: 0,
         };
         let buf = encode(&market).unwrap();
         println!("Market: {} bytes", buf.len());
@@ -2113,6 +2432,7 @@ mod encoding_roundtrip_tests {
                 interest_rate: i64::MIN,
                 liquidation_fee_rate_bps: u32::MAX,
                 price_band_bps: 0,
+                mark_price: u64::MAX,
             },
         );
     }

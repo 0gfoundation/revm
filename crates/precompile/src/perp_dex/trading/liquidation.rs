@@ -2,7 +2,7 @@ use alloy_primitives::IntoLogData;
 use context::{ContextTr, JournalTr};
 use primitives::{Address, FixedBytes, Log};
 
-use super::{match_order, next_order_id};
+use super::match_order;
 use crate::{
     perp_dex::{
         errors::{perp_err, perp_invariant_err},
@@ -31,8 +31,8 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
     side: Side,
     quantity: u64,
 ) -> Result<u64, PrecompileError> {
-    let order_id = next_order_id(context, user)?;
-    let order = Order {
+    let (order_id, bumped_nonce) = super::peek_order_id(context, user)?;
+    let mut order = Order {
         owner: user.0 .0,
         market_id: market.market_id,
         side,
@@ -43,8 +43,8 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         tif: TimeInForce::Ioc,
         status: OrderStatus::Open,
     };
-    storage::save_order(context, &order_id, &order)?;
-
+    // commit-only #23: the close order is persisted ONCE after matching (below); the
+    // OrderPlaced log keeps its original position (logs are EVM-journaled).
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderPlaced {
@@ -76,7 +76,14 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         // the clearance fee to the IF instead). Also prevents the close from
         // reverting when the underwater user cannot cover a taker fee.
         true,
+        false, // liquidation close (IOC): never rests
+        &mut order,
     )?;
+    // delete-on-terminal: the liquidation close is an IOC that never rests — it exists only to
+    // drive the match + emit OrderPlaced/Trade. Its record is dropped (never a live/queryable
+    // resting order; any residual is settled at mark price by the caller).
+    storage::delete_order(context, &order_id)?;
+    super::commit_order_nonce(context, user, bumped_nonce)?;
 
     if remaining == 0 {
         // Full fill: clean up any rounding residuals left in the position.

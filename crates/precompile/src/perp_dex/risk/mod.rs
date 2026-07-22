@@ -9,7 +9,7 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 use crate::{
     perp_dex::{
         errors::perp_err,
-        funding::settle_position_funding,
+        funding::{apply_funding_settlement, compute_funding_settlement},
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
             getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
@@ -182,9 +182,10 @@ pub fn run_add_market<CTX: ContextTr>(
         interest_rate: args.interestRate,
         liquidation_fee_rate_bps: args.liquidationFeeRateBps,
         price_band_bps: args.priceBandBps,
+        // mark_price now lives in the Market blob (was a separate save_mark_price call).
+        mark_price: args.initialMarkPrice,
     };
     storage::save_market(context, &market)?;
-    storage::save_mark_price(context, args.marketId, args.initialMarkPrice)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
@@ -478,8 +479,9 @@ pub fn run_add_position_margin<CTX: ContextTr>(
         return Err(perp_err("addPositionMargin: no open position"));
     }
     let mut account = storage::load_account(context, caller)?;
-    // Settle accrued funding before touching the position.
-    settle_position_funding(
+    // commit-only #23: compute funding IN MEMORY (no insurance-fund write yet), so a reject below
+    // leaves the IF untouched. The wallet/margin waterfall is applied to the in-memory pos/account.
+    let pending_funding = compute_funding_settlement(
         context,
         caller,
         &market,
@@ -491,13 +493,16 @@ pub fn run_add_position_margin<CTX: ContextTr>(
             "addPositionMargin: insufficient perp wallet balance",
         ));
     }
-
     account.debit_perp(args.amount)?;
     pos.margin = pos
         .margin
         .checked_add(amount)
         .ok_or_else(|| perp_err("addPositionMargin: margin overflow"))?;
 
+    // ── APPLY (all rejects passed) ──
+    if let Some(p) = pending_funding {
+        apply_funding_settlement(context, p)?;
+    }
     storage::save_account(context, caller, account)?;
     storage::save_position(context, caller, args.marketId, &pos)?;
     emit_position_margin_adjusted(context, caller, args.marketId, amount, &pos);
@@ -529,8 +534,9 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
         return Err(perp_err("removePositionMargin: no open position"));
     }
     let mut account = storage::load_account(context, caller)?;
-    // Settle accrued funding first so the checks below see post-funding margin.
-    settle_position_funding(
+    // commit-only #23: compute funding IN MEMORY first (no IF write yet) so the checks below see
+    // post-funding margin, and a reject leaves the insurance fund untouched.
+    let pending_funding = compute_funding_settlement(
         context,
         caller,
         &market,
@@ -579,6 +585,10 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     account.credit_perp(args.amount)?;
     pos.margin = new_margin;
 
+    // ── APPLY (all rejects passed) ──
+    if let Some(p) = pending_funding {
+        apply_funding_settlement(context, p)?;
+    }
     storage::save_account(context, caller, account)?;
     storage::save_position(context, caller, args.marketId, &pos)?;
     emit_position_margin_adjusted(context, caller, args.marketId, -amount, &pos);
@@ -625,20 +635,19 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     if pos.amount == 0 {
         return Ok(LiquidationOutcome::NoPosition);
     }
-    // Settle accrued funding on the liquidated position first, so the charge
-    // counts toward insolvency and is realised before the position is closed.
-    {
-        let mut account = storage::load_account(context, user)?;
-        settle_position_funding(
-            context,
-            user,
-            market,
-            &mut pos,
-            &mut account.perp_wallet_balance,
-        )?;
-        storage::save_account(context, user, account)?;
-    }
-    storage::save_position(context, user, market_id, &pos)?;
+    // commit-only #23: compute accrued funding IN MEMORY first (no insurance-fund write), so the
+    // maintenance check sees the post-funding position but an AboveMaintenance outcome leaves
+    // ZERO writes. This is what makes the liquidation sweep's healthy-candidate scan write-free
+    // (previously every scanned healthy account wrote a funding settle that only checkpoint_revert
+    // discarded) and makes manual liquidate reject cleanly without relying on undo.
+    let mut account = storage::load_account(context, user)?;
+    let pending_funding = compute_funding_settlement(
+        context,
+        user,
+        market,
+        &mut pos,
+        &mut account.perp_wallet_balance,
+    )?;
     if is_above_maintenance_margin(
         mark_price,
         pos.amount,
@@ -649,6 +658,13 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     )? {
         return Ok(LiquidationOutcome::AboveMaintenance);
     }
+
+    // ── APPLY (liquidatable — commit the funding settle, then close) ──
+    if let Some(p) = pending_funding {
+        apply_funding_settlement(context, p)?;
+    }
+    storage::save_account(context, user, account)?;
+    storage::save_position(context, user, market_id, &pos)?;
 
     let liq_amount = pos.amount;
     let liquidation_side = if pos.amount > 0 {
@@ -847,6 +863,10 @@ fn run_liquidation_sweep<CTX: ContextTr>(
         if liquidated >= MAX_LIQUIDATIONS_PER_UPDATE {
             break;
         }
+        // commit-only (#23): healthy candidates are write-free (funding is computed in memory
+        // and only applied when liquidatable), so the checkpoint only balances EVM-side state.
+        // A liquidation that FAILS mid-apply would leave partial perp writes with no undo — a
+        // corruption-anyway condition: halt loudly rather than skip silently.
         let cp = context.journal_mut().checkpoint();
         match liquidate_position(
             context,
@@ -861,8 +881,14 @@ fn run_liquidation_sweep<CTX: ContextTr>(
                 context.journal_mut().checkpoint_commit();
                 liquidated += 1;
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
+                // AboveMaintenance / NoPosition: zero perp writes were made.
                 context.journal_mut().checkpoint_revert(cp);
+            }
+            Err(e) => {
+                panic!(
+                    "liquidation sweep: liquidate_position failed mid-apply (commit-only invariant): {e:?}"
+                );
             }
         }
     }
@@ -892,19 +918,17 @@ fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
 
     if new_reserved > old_reserved {
         let delta = new_reserved - old_reserved;
-        let mut account = storage::load_account(context, user)?;
-        if !account.has_available_perp(delta) {
+        // validate-then-apply: the availability reject is a READ-ONLY precheck (mutate_account
+        // always writes, so a rejecting closure would write-on-reject). Reject → zero write.
+        if !storage::load_account_ref(context, user)?.has_available_perp(delta) {
             return Err(perp_err(
                 "setLeverage: insufficient perp wallet for order margin",
             ));
         }
-        account.debit_perp(delta)?;
-        storage::save_account(context, user, account)?;
+        storage::mutate_account(context, user, |a| a.debit_perp(delta))??;
     } else if old_reserved > new_reserved {
         let delta = old_reserved - new_reserved;
-        let mut account = storage::load_account(context, user)?;
-        account.credit_perp(delta)?;
-        storage::save_account(context, user, account)?;
+        storage::mutate_account(context, user, |a| a.credit_perp(delta))??;
     }
     Ok(())
 }
@@ -1026,23 +1050,18 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     market_id: u64,
     _market: &Market,
 ) -> Result<(), PrecompileError> {
-    use crate::perp_dex::types::OrderStatus;
-
     let old_best_bid = storage::load_best_bid(context, market_id)?;
     let old_best_ask = storage::load_best_ask(context, market_id)?;
 
     // --- Buy orders ---
     let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
     for entry in buy_entries.iter() {
-        if let Some(mut order) = storage::load_order(context, &entry.order_id)? {
-            order.status = OrderStatus::Cancelled;
-            storage::save_order(context, &entry.order_id, &order)?;
-        }
-        // Remove from price level queue (in place; #21 generalized).
-        let empty = storage::mutate_bid_level(context, market_id, entry.price, |q| {
-            q.retain(|id| id != &entry.order_id);
-            q.is_empty()
-        })?;
+        // delete-on-terminal: drop the order record (was: save Cancelled).
+        storage::delete_order(context, &entry.order_id)?;
+        // lazy-queue: decrement the level's live count and leave the id for the next match walk to
+        // sweep (other users' orders may share this price). decr_level_count clears the FIFO on
+        // reaching 0 (blob → delete); we only drop the price from the index.
+        let empty = storage::decr_level_count(context, market_id, Side::Buy, entry.price, 1)? == 0;
         if empty {
             storage::remove_bid_price(context, market_id, entry.price)?;
         }
@@ -1062,14 +1081,9 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     // --- Sell orders ---
     let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
     for entry in sell_entries.iter() {
-        if let Some(mut order) = storage::load_order(context, &entry.order_id)? {
-            order.status = OrderStatus::Cancelled;
-            storage::save_order(context, &entry.order_id, &order)?;
-        }
-        let empty = storage::mutate_ask_level(context, market_id, entry.price, |q| {
-            q.retain(|id| id != &entry.order_id);
-            q.is_empty()
-        })?;
+        // delete-on-terminal + lazy-queue (see the buy loop above).
+        storage::delete_order(context, &entry.order_id)?;
+        let empty = storage::decr_level_count(context, market_id, Side::Sell, entry.price, 1)? == 0;
         if empty {
             storage::remove_ask_price(context, market_id, entry.price)?;
         }
@@ -1098,9 +1112,8 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         .checked_add(pos.fee_reserved)
         .ok_or_else(|| perp_err("cancelAllOrders: released reserve overflow"))?;
     if released > 0 {
-        let mut account = storage::load_account(context, user)?;
-        account.credit_perp(released)?;
-        storage::save_account(context, user, account)?;
+        // In-place credit (no UserAccount/String load+save clone pair).
+        storage::mutate_account(context, user, |a| a.credit_perp(released))??;
     }
     pos.set_reservations(0, 0, 0, pos.leverage);
     pos.fee_reserved = 0;

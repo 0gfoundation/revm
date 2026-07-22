@@ -11,4 +11,4 @@ pub use oracle::{
     PRICE_BASIS_WINDOW_SIZE,
 };
 pub use order::{Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce};
-pub use position::{Market, PerpPosition};
+pub use position::{Market, MarketHot, PerpPosition};

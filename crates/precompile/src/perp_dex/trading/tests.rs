@@ -68,6 +68,7 @@ fn setup(ctx: &mut TestCtx) {
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
+            mark_price: 0,
         },
     )
     .unwrap();
@@ -125,6 +126,17 @@ fn place(
 
 fn get_order(ctx: &mut TestCtx, id: [u8; 32]) -> crate::perp_dex::types::Order {
     storage::load_order(ctx, &id).unwrap().unwrap()
+}
+
+/// delete-on-terminal (commit-only #23): a Filled/Cancelled/Expired order is removed from the map.
+/// Tests that used to assert `get_order(id).status == <terminal>` now assert the record is GONE —
+/// the concrete terminal flavour (fill vs cancel vs expire) is no longer stored; each test pins the
+/// actual outcome via its position/account/book assertions.
+fn assert_terminal(ctx: &mut TestCtx, id: [u8; 32]) {
+    assert!(
+        storage::load_order(ctx, &id).unwrap().is_none(),
+        "order {id:?} should be terminal (deleted under delete-on-terminal) but is still present"
+    );
 }
 
 fn market_fee_total(ctx: &mut TestCtx) -> u64 {
@@ -237,6 +249,7 @@ fn setup_banded(ctx: &mut TestCtx, band_bps: u32) {
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
             price_band_bps: band_bps,
+            mark_price: 0,
         },
     )
     .unwrap();
@@ -244,7 +257,12 @@ fn setup_banded(ctx: &mut TestCtx, band_bps: u32) {
     fund(ctx, BOB, WALLET * 1_000);
 }
 
-fn try_place_limit(ctx: &mut TestCtx, caller: Address, side: u8, price: u64) -> Result<Bytes, PrecompileError> {
+fn try_place_limit(
+    ctx: &mut TestCtx,
+    caller: Address,
+    side: u8,
+    price: u64,
+) -> Result<Bytes, PrecompileError> {
     let input = placeOrderCall {
         marketId: MARKET_ID,
         side,
@@ -432,22 +450,18 @@ fn taker_open_below_maintenance_is_rejected() {
 
 #[test]
 fn maker_open_below_maintenance_is_cancelled_not_filled() {
-    use crate::perp_dex::types::OrderStatus;
     let mut ctx = make_ctx();
     setup_banded(&mut ctx, 1_000_000); // disabled band so the off-mark ask can rest
     storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap(); // mark = 100 ticks
-    // ALICE rests an ask far below mark (50 ticks). Filling it would open ALICE a
-    // short at 50 while mark is 100 -> equity 0, below the 1/6 maintenance threshold.
+                                                                   // ALICE rests an ask far below mark (50 ticks). Filling it would open ALICE a
+                                                                   // short at 50 while mark is 100 -> equity 0, below the 1/6 maintenance threshold.
     let alice_ask = try_place_limit(&mut ctx, ALICE, 1, 50 * TICK).unwrap();
     let alice_ask: [u8; 32] = alice_ask[..32].try_into().unwrap();
     // BOB buys into it: the maker open-solvency guard rejects ALICE's fill, so her
     // order is cancelled and BOB matches nothing (his order rests instead).
     let _ = try_place_limit(&mut ctx, BOB, 0, 50 * TICK).unwrap();
-    assert_eq!(
-        get_order(&mut ctx, alice_ask).status,
-        OrderStatus::Cancelled,
-        "rejected maker order must be cancelled"
-    );
+    // rejected maker order must be cancelled → deleted under delete-on-terminal.
+    assert_terminal(&mut ctx, alice_ask);
     assert_eq!(
         pos(&mut ctx, ALICE).amount,
         0,
@@ -633,6 +647,7 @@ fn margin_uses_market_price_decimals() {
             interest_rate: 0,
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
+            mark_price: 0,
         },
     )
     .unwrap();
@@ -675,8 +690,8 @@ fn buy_taker_fully_matches_resting_ask() {
     let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
     let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy
 
-    assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, buy_id);
+    assert_terminal(&mut ctx, sell_id);
     assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
         .unwrap()
         .is_empty());
@@ -690,8 +705,8 @@ fn sell_taker_fully_matches_resting_bid() {
     let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // resting bid
     let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // taker sell
 
-    assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, buy_id);
+    assert_terminal(&mut ctx, sell_id);
     assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
         .unwrap()
         .is_empty());
@@ -871,7 +886,7 @@ fn taker_reverse_uses_released_close_margin_before_opening_margin_check() {
     place(&mut ctx, BOB, 1, PRICE, QTY * 2, 0, 0); // resting ask
     let market_buy = place(&mut ctx, ALICE, 0, 0, QTY * 2, 1, 1);
 
-    assert_eq!(get_order(&mut ctx, market_buy).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, market_buy);
     assert_eq!(wallet(&mut ctx, ALICE), 0);
     assert_eq!(
         pos(&mut ctx, ALICE),
@@ -947,8 +962,8 @@ fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
 
     let market_buy = place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);
 
-    assert_eq!(get_order(&mut ctx, market_buy).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, low_buy).status, OrderStatus::Expired);
+    assert_terminal(&mut ctx, market_buy);
+    assert_terminal(&mut ctx, low_buy);
     assert_eq!(get_order(&mut ctx, high_buy).status, OrderStatus::Open);
     assert_eq!(wallet(&mut ctx, ALICE), 0);
 }
@@ -966,7 +981,7 @@ fn partial_fill_leaves_maker_partially_filled_in_book() {
         OrderStatus::PartiallyFilled
     );
     assert_eq!(get_order(&mut ctx, sell_id).filled, QTY);
-    assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, buy_id);
 
     // Remaining sell still in ask book.
     assert_eq!(
@@ -1006,7 +1021,7 @@ fn maker_fill_does_not_auto_expire_remaining_order_under_isolated_margin() {
     let maker = get_order(&mut ctx, sell_id);
     assert_eq!(maker.status, OrderStatus::PartiallyFilled);
     assert_eq!(maker.filled, QTY);
-    assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, buy_id);
     // The remaining QTY of the maker's sell is NOT auto-expired — it stays resting.
     assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
         .unwrap()
@@ -1045,7 +1060,7 @@ fn underwater_maker_close_routes_bad_debt_to_insurance_fund_not_wallet() {
     // closing BOB's long at PRICE — a loss of 1e6 against a 500k margin.
     let _sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
     let buy = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
-    assert_eq!(get_order(&mut ctx, buy).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, buy);
 
     // realised = margin_release(500k) + vq(-2e6) + close(+1e6) = -500k → bad debt 500k.
     let bob = pos(&mut ctx, BOB);
@@ -1092,7 +1107,7 @@ fn cross_side_flip_no_longer_triggers_maker_reserve_deficit_under_flip_aware_res
     // (1) Alice opens a long of 1*QTY at Pm by lifting Bob's resting ask.
     let _bob_open = place(&mut ctx, BOB, 1, pm, QTY, 0, 0); // Bob sells (maker)
     let alice_open = place(&mut ctx, ALICE, 0, pm, QTY, 0, 0); // Alice buys (taker)
-    assert_eq!(get_order(&mut ctx, alice_open).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, alice_open);
     assert_eq!(pos(&mut ctx, ALICE).amount, QTY as i64, "Alice long +1");
 
     // (2) Alice rests buys at Plo (below market, no cross): qty 1 then qty 2.
@@ -1128,10 +1143,10 @@ fn cross_side_flip_no_longer_triggers_maker_reserve_deficit_under_flip_aware_res
     // (4) Bob (a DIFFERENT taker) buys 2*QTY at Phi, lifting Alice's qty-2 ask.
     //     This closes 1*QTY of Alice's long and opens 1*QTY short => FLIP to -1.
     let bob_take = place(&mut ctx, BOB, 0, phi, QTY * 2, 0, 0);
-    assert_eq!(get_order(&mut ctx, bob_take).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, bob_take);
 
     // The qty-2 ask that Bob lifted is filled.
-    assert_eq!(get_order(&mut ctx, alice_sell2).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, alice_sell2);
 
     // Position flipped sign: +1 long -> -1 short.
     let pos_after = pos(&mut ctx, ALICE);
@@ -1175,7 +1190,7 @@ fn fifo_queue_fills_earlier_order_first() {
     // Alice buys QTY — should hit Bob's order first (FIFO).
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
-    assert_eq!(get_order(&mut ctx, bob_id).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, bob_id);
     assert_eq!(get_order(&mut ctx, carol_id).status, OrderStatus::Open);
 }
 
@@ -1187,8 +1202,8 @@ fn self_trade_finalizes_taker_from_latest_maker_state() {
     let sell_id = place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
     let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
-    assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, sell_id);
+    assert_terminal(&mut ctx, buy_id);
     assert_eq!(wallet(&mut ctx, ALICE), WALLET);
     assert_eq!(
         pos(&mut ctx, ALICE),
@@ -1216,10 +1231,10 @@ fn self_trade_taker_margin_expiry_does_not_cancel_current_taker_order() {
 
     let taker_buy = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 0);
 
-    assert_eq!(get_order(&mut ctx, self_sell).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, bob_sell).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, taker_buy).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, old_buy).status, OrderStatus::Expired);
+    assert_terminal(&mut ctx, self_sell);
+    assert_terminal(&mut ctx, bob_sell);
+    assert_terminal(&mut ctx, taker_buy);
+    assert_terminal(&mut ctx, old_buy);
     assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
         .unwrap()
         .is_empty());
@@ -1255,10 +1270,10 @@ fn taker_margin_expiry_records_mid_when_best_bid_is_cleared() {
     ctx.block.timestamp = U256::from(10);
     let taker_buy = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
-    assert_eq!(get_order(&mut ctx, taker_buy).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, bob_sell).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, taker_buy);
+    assert_terminal(&mut ctx, bob_sell);
     assert_eq!(get_order(&mut ctx, carol_sell).status, OrderStatus::Open);
-    assert_eq!(get_order(&mut ctx, old_buy).status, OrderStatus::Expired);
+    assert_terminal(&mut ctx, old_buy);
     assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), 0);
     assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), PRICE);
 
@@ -1281,8 +1296,8 @@ fn market_buy_matches_lowest_ask_first() {
     // Market IOC buy — should hit the lowest ask.
     let mkt_buy = place(&mut ctx, ALICE, 0, 0, QTY, 1, 1); // orderType=Market, tif=IOC
 
-    assert_eq!(get_order(&mut ctx, low_sell).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, mkt_buy).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, low_sell);
+    assert_terminal(&mut ctx, mkt_buy);
     // High-price level must still be present.
     assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
         .unwrap()
@@ -1317,9 +1332,13 @@ fn ioc_with_no_liquidity_is_immediately_cancelled() {
     setup(&mut ctx);
 
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 1); // IOC, no asks
-    let o = get_order(&mut ctx, id);
-    assert_eq!(o.status, OrderStatus::Expired);
-    assert_eq!(o.filled, 0);
+                                                          // Expired (no liquidity) → deleted under delete-on-terminal; no fill → no position.
+    assert_terminal(&mut ctx, id);
+    assert_eq!(
+        pos(&mut ctx, ALICE).amount,
+        0,
+        "IOC with no liquidity fills nothing"
+    );
 }
 
 #[test]
@@ -1331,9 +1350,13 @@ fn ioc_partial_fill_cancels_remainder() {
 
     // IOC buy for 2×QTY: fills QTY, remainder expired.
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 1);
-    let o = get_order(&mut ctx, id);
-    assert_eq!(o.status, OrderStatus::Expired);
-    assert_eq!(o.filled, QTY);
+    // Expired (remainder) → deleted; the QTY that DID fill is pinned via the opened position.
+    assert_terminal(&mut ctx, id);
+    assert_eq!(
+        pos(&mut ctx, ALICE).amount,
+        QTY as i64,
+        "IOC filled QTY before expiring the remainder"
+    );
 }
 
 // ── FOK ───────────────────────────────────────────────────────────────────
@@ -1371,8 +1394,8 @@ fn fok_fully_fills_when_sufficient_liquidity() {
     let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY * 2, 0, 0);
     let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 2); // FOK
 
-    assert_eq!(get_order(&mut ctx, buy_id).status, OrderStatus::Filled);
-    assert_eq!(get_order(&mut ctx, sell_id).status, OrderStatus::Filled);
+    assert_terminal(&mut ctx, buy_id);
+    assert_terminal(&mut ctx, sell_id);
 }
 
 // ── PostOnly ──────────────────────────────────────────────────────────────
@@ -1440,10 +1463,85 @@ fn cancel_resting_order_releases_margin_and_clears_book() {
     run_cancel_order(&input, ALICE, &mut ctx).unwrap();
 
     assert_eq!(wallet(&mut ctx, ALICE), WALLET, "margin should be returned");
-    assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Cancelled);
+    assert_terminal(&mut ctx, id);
     assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn lazy_queue_sweeps_cancelled_maker_on_match() {
+    // Two asks at the same price. Cancelling the first DELETES its record but leaves the id in the
+    // level FIFO (lazy-queue) — only the live count drops to 1. A buy taker then walks the level,
+    // skips the stale id (load_order → None), fills the survivor, and empties the level. Exercises
+    // the None→skip sweep + per-level count end-to-end.
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    let ask1 = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    let ask2 = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    assert_eq!(
+        storage::load_ask_count(&mut ctx, MARKET_ID, PRICE).unwrap(),
+        2,
+        "both live"
+    );
+
+    // Cancel the first: deleted from the map, count → 1, id lingers in the FIFO (lazy).
+    run_cancel_order(
+        &cancelOrderCall {
+            orderId: ask1.into(),
+            marketId: MARKET_ID,
+        }
+        .abi_encode(),
+        BOB,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_terminal(&mut ctx, ask1);
+    assert_eq!(
+        storage::load_ask_count(&mut ctx, MARKET_ID, PRICE).unwrap(),
+        1,
+        "count decremented in O(1)"
+    );
+    assert_eq!(
+        storage::load_ask_level(&mut ctx, MARKET_ID, PRICE)
+            .unwrap()
+            .len(),
+        2,
+        "stale id still in the FIFO (lazy-queue, not eagerly removed)"
+    );
+    assert_eq!(
+        storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
+        vec![PRICE],
+        "level still present (count > 0)"
+    );
+
+    // Buy taker for QTY: sweeps the stale ask1 (skip) and fills the live ask2 → level empties.
+    let taker = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+    assert_terminal(&mut ctx, taker); // fully filled
+    assert_terminal(&mut ctx, ask2); // filled maker deleted
+    assert_eq!(
+        pos(&mut ctx, ALICE).amount,
+        QTY as i64,
+        "taker opened exactly QTY (stale maker contributed nothing)"
+    );
+    assert_eq!(
+        storage::load_ask_count(&mut ctx, MARKET_ID, PRICE).unwrap(),
+        0,
+        "level empty"
+    );
+    assert!(
+        storage::load_ask_prices(&mut ctx, MARKET_ID)
+            .unwrap()
+            .is_empty(),
+        "price removed from index"
+    );
+    assert!(
+        storage::load_ask_level(&mut ctx, MARKET_ID, PRICE)
+            .unwrap()
+            .is_empty(),
+        "queue cleared on empty"
+    );
 }
 
 #[test]
@@ -1473,7 +1571,7 @@ fn cancel_non_top_bid_keeps_best_bid() {
         storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
         vec![p_hi]
     );
-    assert_eq!(get_order(&mut ctx, lo).status, OrderStatus::Cancelled);
+    assert_terminal(&mut ctx, lo);
     assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Open);
 }
 
@@ -1529,7 +1627,7 @@ fn cancel_non_top_ask_keeps_best_ask() {
         storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
         vec![p_lo]
     );
-    assert_eq!(get_order(&mut ctx, hi).status, OrderStatus::Cancelled);
+    assert_terminal(&mut ctx, hi);
 }
 
 #[test]
@@ -1609,7 +1707,9 @@ fn cancel_rejects_already_filled_order() {
     }
     .abi_encode();
     let err = run_cancel_order(&input, BOB, &mut ctx).unwrap_err();
-    assert!(err.to_string().contains("not cancellable"), "{err}");
+    // delete-on-terminal: the filled order was removed, so cancel now reports "order not found"
+    // (was "not cancellable" when the Filled record lingered). Both reject.
+    assert!(err.to_string().contains("order not found"), "{err}");
 }
 
 #[test]
@@ -1794,24 +1894,19 @@ fn perp_data_stays_off_trie_not_in_evm_state() {
 }
 
 #[test]
-fn reverted_subcall_leaves_no_perp_residue() {
+fn perp_writes_survive_enclosing_revert_commit_only() {
+    // commit-only (#23): a successful placement's perp writes SURVIVE an enclosing frame
+    // revert (there is no perp undo). On-chain the EOA-direct depth guard forbids enclosing
+    // frames entirely; this documents the journal-level semantics.
     let mut ctx = make_ctx();
     setup(&mut ctx);
 
-    // Snapshot before the (to-be-reverted) sub-call.
     let cp = ctx.journal_mut().checkpoint();
     let order_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
-    assert!(
-        storage::load_order(&mut ctx, &order_id).unwrap().is_some(),
-        "order should exist after placing"
-    );
-
-    // Revert the sub-call: the placed order must vanish — the perp overlay reverts in
-    // lock-step with the EVM journal.
     ctx.journal_mut().checkpoint_revert(cp);
     assert!(
-        storage::load_order(&mut ctx, &order_id).unwrap().is_none(),
-        "reverted sub-call must leave no perp residue"
+        storage::load_order(&mut ctx, &order_id).unwrap().is_some(),
+        "perp writes are commit-only: they survive the enclosing revert"
     );
 }
 
@@ -2374,6 +2469,7 @@ mod perf {
                 interest_rate: 0,
                 liquidation_fee_rate_bps: 0,
                 price_band_bps: 0,
+                mark_price: 0,
             },
         )
         .unwrap();
@@ -2616,8 +2712,39 @@ mod golden {
     /// CHANGES BusinessSnapshot: ALICE keeps the taker fee she used to pay on her Phase-9
     /// book close, and the market fee total drops by it. Prior value
     /// 0xfcc04c1f1e41e7e284ace52730d47aaeb47955a3fb1ce27d1d52ea2aa34eab1e.
+    /// RE-PIN (catalog #12, direct-packed storage keys + `BLOCK_COMMITMENT_VERSION` 3→4): the
+    /// business snapshot is unchanged; only the key bytes folded into the commitment differ, so
+    /// this is a legitimate CHAIN re-pin (devnet wipe). Prior value
+    /// 0x9b493f51b6dd2011ae1c8b7ebc5a2b2b3b4fc2cc9fd1b46878d5d1a2b85e3435.
+    /// RE-PIN (catalog #22, price index Vec<u64>→BTreeSet<u64> + `BLOCK_COMMITMENT_VERSION` 4→5):
+    /// business snapshot unchanged; the serialized price-level bytes change (container + order).
+    /// Prior value 0x8bcfa8def86af905253c4de33a0ca43634683e94191de931bf9235a38be9597d.
+    /// RE-PIN (order-lifecycle redesign, commit-only #23 + `BLOCK_COMMITMENT_VERSION` 5→6):
+    /// delete-on-terminal removes filled/cancelled orders from the map (their blobs leave the net
+    /// delta, replaced by empty-value deletes), a new per-level live-order count key is folded in,
+    /// and the signed-order replay guard moved to the seen-signature namespace. The business
+    /// snapshot is UNCHANGED except that terminal orders are no longer queryable (getOrder reverts
+    /// → DELETED sentinel) — positions/accounts/fees/mark/funding are identical. Prior value
+    /// 0xcfa7fe64e534bd9adf65df5a2e4529b95754e150519352daeed5ce77d01f71c9.
+    /// RE-PIN (MarketHot grouping + `BLOCK_COMMITMENT_VERSION` 6→7): the five per-market hot
+    /// scalars (mark price, best bid/ask, last traded, open interest) moved from five single-scalar
+    /// keys into one grouped `MarketHot` blob, so the block-delta keys + framing regroup. Every
+    /// value — and the business snapshot — is IDENTICAL. Prior value
+    /// 0xcf5c23c371fd0661b74856c2d08e7df707b3b61831297a870e77276ae531a53f.
+    /// RE-PIN (per-user scalar fold + `BLOCK_COMMITMENT_VERSION` 7→8): the fee-rate bps + order
+    /// nonce moved from two standalone per-user keys into the account blob (those keys leave the
+    /// delta; the account blob grows). Values + business snapshot IDENTICAL. Prior value
+    /// 0x2d7a551bd8ef02c3d4933462314b1182be29f40fc284bf1b1c111eb1e423c956.
+    /// RE-PIN (mark_price → Market + `BLOCK_COMMITMENT_VERSION` 8→9): mark_price moved out of the
+    /// MarketHot blob into the Market blob (write-rare + co-read with config). Both blobs' bytes
+    /// change (Market gains a field, MarketHot loses one); values + business snapshot IDENTICAL.
+    /// Prior value 0x7288ee0d91edb642537fc632a47eb12d27542977b4ffb7bf97d6bf31a874336c.
+    /// RE-PIN (level count merge + `BLOCK_COMMITMENT_VERSION` 9→10): each level's live-order count
+    /// folded INTO its FIFO blob (`LevelBlob`, count(8 BE) prefix); the per-level count keys
+    /// disappear + the level blob framing changes. Values + business snapshot IDENTICAL. Prior
+    /// value 0x47f8225b07e2e1cc951203cc35b2aab40cc7801f43880c8ec3850344de3c78dc.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x9b493f51b6dd2011ae1c8b7ebc5a2b2b3b4fc2cc9fd1b46878d5d1a2b85e3435");
+        b256!("0x25389cb16beb55f0800734570a0ac4d48f9f6309452932b7204fa682dd397d45");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -2692,16 +2819,20 @@ mod golden {
             market_fee_total: 3_461,
             mark_price: 80_000_000_000, // $80 post-crash
             funding: (100, 7_215),      // rate = interest-rate clamp; next epoch ts
-            signed_buy_status: OrderStatus::Cancelled as u8,
-            gtc_cancelled_status: OrderStatus::Cancelled as u8,
-            ioc_status: OrderStatus::Expired as u8,
-            mkt_expired_status: OrderStatus::Expired as u8,
-            po_ask_cancelled_status: OrderStatus::Cancelled as u8,
-            liq_cancelled_bid_status: OrderStatus::Cancelled as u8,
-            liq_cancelled_ask_status: OrderStatus::Cancelled as u8,
-            bob_bid_status: OrderStatus::Filled as u8,
+            // delete-on-terminal (commit-only #23): every terminal order (Filled/Cancelled/Expired)
+            // is removed from the map → getOrder reverts → DELETED sentinel. Only the still-resting
+            // tail bid remains queryable (Open). Business outcomes are pinned by the position /
+            // account / fee fields above, not these status bytes.
+            signed_buy_status: DELETED,
+            gtc_cancelled_status: DELETED,
+            ioc_status: DELETED,
+            mkt_expired_status: DELETED,
+            po_ask_cancelled_status: DELETED,
+            liq_cancelled_bid_status: DELETED,
+            liq_cancelled_ask_status: DELETED,
+            bob_bid_status: DELETED,
             bob_tail_bid_status: OrderStatus::Open as u8,
-            carol_close_status: OrderStatus::Filled as u8,
+            carol_close_status: DELETED,
         }
     }
 
@@ -2714,7 +2845,10 @@ mod golden {
     /// the explicit slot-pin assert at the top of `run_golden_scenario` fails
     /// with a clear message instead.
     fn golden_commitment_slot() -> B256 {
-        keccak256(b"cmit")
+        // Independent re-derivation of the packed anchor slot (#12): "cmit" ++ 28 zero.
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(b"cmit");
+        B256::new(b)
     }
 
     /// Standard OZ ERC-20 `_balances[user]` slot (mapping at slot 0), derived
@@ -2851,16 +2985,31 @@ mod golden {
         ret[..32].try_into().unwrap()
     }
 
+    /// Sentinel for a terminal order under delete-on-terminal (commit-only #23): a
+    /// Filled/Cancelled/Expired order is removed from the map, so `getOrder` reverts "not found".
+    /// The scenario asserts this sentinel where it used to assert the terminal status — the actual
+    /// business outcome (fill/cancel) is pinned by the position/account/fee/event assertions, not
+    /// by a queryable status byte.
+    const DELETED: u8 = 0xFF;
+
     fn order_status(ctx: &mut TestCtx, id: [u8; 32]) -> u8 {
-        let ret = dex_view(
-            ctx,
+        let out = run_perp_dex_call(
             &getOrderCall {
                 orderId: id.into(),
                 marketId: MARKET_ID,
             }
             .abi_encode(),
-        );
-        getOrderCall::abi_decode_returns(&ret).unwrap().status
+            10_000_000,
+            CAROL,
+            U256::ZERO,
+            true,
+            ctx,
+        )
+        .expect("view call must not hard-fail");
+        if out.reverted {
+            return DELETED; // delete-on-terminal: terminal order was removed from the map
+        }
+        getOrderCall::abi_decode_returns(&out.bytes).unwrap().status
     }
 
     // ── ed25519 signed-call calldata (fixed key seed, fixed timestamps) ────
@@ -3291,8 +3440,8 @@ mod golden {
         let _alice_taker1 = g_place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);
         assert_eq!(
             order_status(&mut ctx, bob_l1a),
-            OrderStatus::Filled as u8,
-            "L1 head maker must be filled"
+            DELETED,
+            "L1 head maker must be filled (delete-on-terminal → removed from map)"
         );
         assert_eq!(
             order_status(&mut ctx, bob_l1b),
@@ -3339,7 +3488,10 @@ mod golden {
                 marketId: MARKET_ID,
             }
             .abi_encode(),
-            "not cancellable",
+            // delete-on-terminal: the first cancel deleted the record, so re-cancelling it is now
+            // "order not found" (was "not cancellable" when the Cancelled record lingered). Both
+            // reject the replay.
+            "order not found",
         );
 
         // IOC with no crossing liquidity → Expired.
@@ -3487,8 +3639,8 @@ mod golden {
         let carol_close = g_place(&mut ctx, CAROL, 1, PRICE - 20 * TICK, QTY, 0, 0);
         assert_eq!(
             order_status(&mut ctx, bob_head_bid),
-            OrderStatus::Filled as u8,
-            "head bid must be filled by CAROL's taker sell"
+            DELETED,
+            "head bid must be filled by CAROL's taker sell (delete-on-terminal → removed)"
         );
         let tail_queue = getBookLevelCall::abi_decode_returns(&dex_view(
             &mut ctx,
@@ -3734,5 +3886,166 @@ mod golden {
             first.1, second.1,
             "business end-state must be deterministic"
         );
+    }
+}
+
+// ── commit-only #23 conservation repro (realisticMix-shaped, EVM-framed) ─────────
+#[cfg(test)]
+mod commit_only_conservation {
+    use super::*;
+    use crate::perp_dex::{math::calc_value, run_perp_dex_call};
+
+    const N_ACCT: u64 = 12;
+    const ACCT_WALLET: u64 = 3_000_000; // TIGHT: forces wallet-cover cancels + insolvency rejects
+
+    fn addr(i: u64) -> Address {
+        let mut b = [0u8; 20];
+        b[11] = 0xE0;
+        b[12..20].copy_from_slice(&i.to_be_bytes());
+        Address::from(b)
+    }
+
+    fn total_equity(ctx: &mut TestCtx) -> i128 {
+        let mut s: i128 = 0;
+        for i in 0..N_ACCT {
+            let a = addr(i);
+            let acc = storage::load_account(ctx, a).unwrap();
+            s += acc.perp_wallet_balance as i128;
+            let p = storage::load_position(ctx, a, MARKET_ID).unwrap();
+            s += p.margin as i128 + p.margin_reserved as i128 + p.fee_reserved as i128;
+            let mv = calc_value(PRICE, p.amount.unsigned_abs(), 8, 9).unwrap() as i128;
+            s += if p.amount >= 0 { mv } else { -mv };
+            s += p.v_quote_balance as i128;
+        }
+        s += storage::load_insurance_fund(ctx).unwrap() as i128;
+        s += market_fee_total(ctx) as i128;
+        s += storage::load_account(ctx, ADMIN)
+            .unwrap()
+            .perp_wallet_balance as i128;
+        s
+    }
+
+    /// One order through the FULL entry point, EVM-framed exactly like on-chain: checkpoint,
+    /// run, commit on success / revert on reverted-or-error, then commit_tx (tx boundary).
+    /// Returns the order id on a successful place.
+    fn framed_place(
+        ctx: &mut TestCtx,
+        c: Address,
+        side: u8,
+        price: u64,
+        qty: u64,
+        tif: u8,
+    ) -> Option<[u8; 32]> {
+        let input = placeOrderCall {
+            marketId: MARKET_ID,
+            side,
+            price,
+            quantity: qty,
+            orderType: 0,
+            tif,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
+        let cp = ctx.journal_mut().checkpoint();
+        let out = run_perp_dex_call(&input, 10_000_000, c, U256::ZERO, false, ctx)
+            .expect("must not hard-fail");
+        let id = if out.reverted {
+            ctx.journal_mut().checkpoint_revert(cp);
+            None
+        } else {
+            ctx.journal_mut().checkpoint_commit();
+            Some(out.bytes[..32].try_into().unwrap())
+        };
+        ctx.journal_mut().commit_tx();
+        id
+    }
+
+    fn framed_cancel(ctx: &mut TestCtx, c: Address, oid: [u8; 32]) {
+        let input = cancelOrderCall {
+            orderId: oid.into(),
+            marketId: MARKET_ID,
+        }
+        .abi_encode();
+        let cp = ctx.journal_mut().checkpoint();
+        let out = run_perp_dex_call(&input, 10_000_000, c, U256::ZERO, false, ctx)
+            .expect("must not hard-fail");
+        if out.reverted {
+            ctx.journal_mut().checkpoint_revert(cp);
+        } else {
+            ctx.journal_mut().checkpoint_commit();
+        }
+        ctx.journal_mut().commit_tx();
+    }
+
+    #[test]
+    fn realistic_mix_conserves_equity() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+        for i in 0..N_ACCT {
+            fund(&mut ctx, addr(i), ACCT_WALLET);
+        }
+        let initial = total_equity(&mut ctx);
+
+        let mut s: u64 = 0x243F6A8885A308D3;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut resting: Vec<Option<[u8; 32]>> = vec![None; N_ACCT as usize];
+
+        for op in 0..6000u32 {
+            let ai = (rng() % N_ACCT) as usize;
+            let c = addr(ai as u64);
+            // Probabilistic requote (30%): otherwise let orders REST to build a deep multi-level book.
+            if resting[ai].is_some() && rng() % 100 < 30 {
+                framed_cancel(&mut ctx, c, resting[ai].take().unwrap());
+            } else {
+                let roll = rng() % 100;
+                let qty = QTY * (1 + rng() % 8);
+                // Wide bands (±6 ticks) → many distinct price levels → multi-level sweeps.
+                let placed = if roll < 25 {
+                    framed_place(&mut ctx, c, 0, PRICE - TICK * (1 + rng() % 6), qty, 3)
+                } else if roll < 50 {
+                    framed_place(&mut ctx, c, 1, PRICE + TICK * (1 + rng() % 6), qty, 3)
+                } else if roll < 70 {
+                    // IOC Buy taker crossing the WHOLE ask band (sweeps multiple sell levels)
+                    framed_place(&mut ctx, c, 0, PRICE + TICK * 7, qty, 1)
+                } else if roll < 85 {
+                    framed_place(&mut ctx, c, 1, PRICE - TICK * 7, qty, 1)
+                } else if roll < 95 {
+                    let side = (rng() % 2) as u8;
+                    let price = if side == 0 {
+                        PRICE + TICK * (1 + rng() % 6)
+                    } else {
+                        PRICE - TICK * (1 + rng() % 6)
+                    };
+                    framed_place(&mut ctx, c, side, price, qty, 0)
+                } else {
+                    let side = (rng() % 2) as u8;
+                    let price = if side == 0 {
+                        PRICE + TICK * 7
+                    } else {
+                        PRICE - TICK * 7
+                    };
+                    framed_place(&mut ctx, c, side, price, qty, 2)
+                };
+                // Remember any order that may have rested (maker sides + non-crossing GTC).
+                if let Some(id) = placed {
+                    resting[ai] = Some(id);
+                }
+            }
+            // Per-op conservation: total system equity is invariant (no funding / no mark move /
+            // no bad debt). A residual write-then-error leaks value and breaks this immediately.
+            let now = total_equity(&mut ctx);
+            assert_eq!(
+                now,
+                initial,
+                "equity drifted by {} at op {op}",
+                now - initial
+            );
+        }
     }
 }

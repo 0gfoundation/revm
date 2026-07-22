@@ -85,6 +85,20 @@ pub enum OrderStatus {
     Expired = 4,
 }
 
+impl OrderStatus {
+    /// A terminal status = the order will never trade again. Under delete-on-terminal the order
+    /// record is DELETED from storage the moment it reaches one of these (history is disposable —
+    /// off-chain indexers reconstruct it from the OrderFilled/OrderCancelled event stream), so the
+    /// order map holds only live (Open/PartiallyFilled) orders and never grows unbounded.
+    #[inline]
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Expired
+        )
+    }
+}
+
 // ── Structs ───────────────────────────────────────────────────────────────
 
 /// Full on-chain order record, stored keyed by `order_id`.
