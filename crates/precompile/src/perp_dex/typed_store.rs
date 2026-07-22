@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use crate::perp_dex::storage::{encode, keys};
-use crate::perp_dex::types::{Market, PerpPosition, UserAccount};
+use crate::perp_dex::types::{Market, MarketHot, Order, OrderEntry, PerpPosition, UserAccount};
 use crate::PrecompileError;
 
 /// Identifies which typed sub-map + identity a dirty `B256` key refers to, so [`TypedPerpStore::take_delta`]
@@ -40,6 +40,10 @@ enum StoreSlot {
     Account(Address),
     Market(u64),
     Position(Address, u64),
+    MarketHot(u64),
+    BuyOrders(Address, u64),
+    SellOrders(Address, u64),
+    Order([u8; 32]),
 }
 
 /// Three-state read result from a typed sub-map.
@@ -88,8 +92,12 @@ pub struct TypedPerpStore {
     accounts: HashMap<Address, Slot<UserAccount>>,
     markets: HashMap<u64, Slot<Market>>,
     positions: HashMap<(Address, u64), Slot<PerpPosition>>,
+    market_hots: HashMap<u64, Slot<MarketHot>>,
+    buy_orders: HashMap<(Address, u64), Slot<Vec<OrderEntry>>>,
+    sell_orders: HashMap<(Address, u64), Slot<Vec<OrderEntry>>>,
+    orders: HashMap<[u8; 32], Slot<Order>>,
     // Stage B extends with the remaining namespaces, same patterns:
-    //   orders / bid_levels / ask_levels / bid_prices / ask_prices / market_hot /
+    //   bid_levels / ask_levels / bid_prices / ask_prices /
     //   market_fee_total / trade_count / position_registry / api_keys / api_key_ids /
     //   index_price / index_history / basis_window / funding_state / premium_accumulator /
     //   roles (admin/oracle/market_manager) / insurance_fund / seen_sig / seen_bucket
@@ -276,6 +284,184 @@ impl TypedPerpStore {
         self.positions.insert((user, market_id), None);
     }
 
+    // ── per-market hot scalars (MarketHot) ──────────────────────────────────
+    /// Three-state read (see [`Resident`]).
+    pub fn market_hot(&self, market_id: u64) -> Resident<'_, MarketHot> {
+        match self.market_hots.get(&market_id) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(h)) => Resident::Hit(h.as_ref()),
+        }
+    }
+
+    /// Mutable access; marks dirty (see [`Self::account_mut`]).
+    pub fn market_hot_mut(&mut self, market_id: u64) -> Option<&mut MarketHot> {
+        match self.market_hots.get_mut(&market_id) {
+            Some(Some(h)) => {
+                self.dirty.insert(
+                    keys::market_hot_key(market_id),
+                    StoreSlot::MarketHot(market_id),
+                );
+                self.write_count += 1;
+                self.tx_dirty = true;
+                Some(Arc::make_mut(h))
+            }
+            _ => None,
+        }
+    }
+
+    /// Inserts/overwrites and marks dirty.
+    pub fn set_market_hot(&mut self, market_id: u64, value: MarketHot) {
+        self.mark(
+            keys::market_hot_key(market_id),
+            StoreSlot::MarketHot(market_id),
+        );
+        self.market_hots.insert(market_id, Some(Arc::new(value)));
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark; see [`Self::fill_account`]).
+    pub fn fill_market_hot(&mut self, market_id: u64, value: Option<Arc<MarketHot>>) {
+        self.market_hots.entry(market_id).or_insert(value);
+    }
+
+    // ── per-(user, market) order-entry lists (bord / sord) ──────────────────
+    /// Three-state read of the buy-order list (see [`Resident`]).
+    pub fn buy_orders(&self, user: Address, market_id: u64) -> Resident<'_, Vec<OrderEntry>> {
+        match self.buy_orders.get(&(user, market_id)) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(v)) => Resident::Hit(v.as_ref()),
+        }
+    }
+
+    /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    pub fn buy_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<Vec<OrderEntry>>> {
+        self.buy_orders.get(&(user, market_id)).and_then(|s| s.clone())
+    }
+
+    /// Mutable access; marks dirty (see [`Self::account_mut`]).
+    pub fn buy_orders_mut(&mut self, user: Address, market_id: u64) -> Option<&mut Vec<OrderEntry>> {
+        match self.buy_orders.get_mut(&(user, market_id)) {
+            Some(Some(v)) => {
+                self.dirty.insert(
+                    keys::user_buy_orders_key(user, market_id),
+                    StoreSlot::BuyOrders(user, market_id),
+                );
+                self.write_count += 1;
+                self.tx_dirty = true;
+                Some(Arc::make_mut(v))
+            }
+            _ => None,
+        }
+    }
+
+    /// Inserts/overwrites and marks dirty. NOTE: an EMPTY list is a legitimate stored value
+    /// (encodes to msgpack `0x90`, key stays present) — never converted to a delete.
+    pub fn set_buy_orders(&mut self, user: Address, market_id: u64, value: Vec<OrderEntry>) {
+        self.mark(
+            keys::user_buy_orders_key(user, market_id),
+            StoreSlot::BuyOrders(user, market_id),
+        );
+        self.buy_orders.insert((user, market_id), Some(Arc::new(value)));
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark).
+    pub fn fill_buy_orders(
+        &mut self,
+        user: Address,
+        market_id: u64,
+        value: Option<Arc<Vec<OrderEntry>>>,
+    ) {
+        self.buy_orders.entry((user, market_id)).or_insert(value);
+    }
+
+    /// Three-state read of the sell-order list (see [`Resident`]).
+    pub fn sell_orders(&self, user: Address, market_id: u64) -> Resident<'_, Vec<OrderEntry>> {
+        match self.sell_orders.get(&(user, market_id)) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(v)) => Resident::Hit(v.as_ref()),
+        }
+    }
+
+    /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    pub fn sell_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<Vec<OrderEntry>>> {
+        self.sell_orders.get(&(user, market_id)).and_then(|s| s.clone())
+    }
+
+    /// Mutable access; marks dirty (see [`Self::account_mut`]).
+    pub fn sell_orders_mut(
+        &mut self,
+        user: Address,
+        market_id: u64,
+    ) -> Option<&mut Vec<OrderEntry>> {
+        match self.sell_orders.get_mut(&(user, market_id)) {
+            Some(Some(v)) => {
+                self.dirty.insert(
+                    keys::user_sell_orders_key(user, market_id),
+                    StoreSlot::SellOrders(user, market_id),
+                );
+                self.write_count += 1;
+                self.tx_dirty = true;
+                Some(Arc::make_mut(v))
+            }
+            _ => None,
+        }
+    }
+
+    /// Inserts/overwrites and marks dirty (empty list stays a stored `0x90`, see buy side).
+    pub fn set_sell_orders(&mut self, user: Address, market_id: u64, value: Vec<OrderEntry>) {
+        self.mark(
+            keys::user_sell_orders_key(user, market_id),
+            StoreSlot::SellOrders(user, market_id),
+        );
+        self.sell_orders.insert((user, market_id), Some(Arc::new(value)));
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark).
+    pub fn fill_sell_orders(
+        &mut self,
+        user: Address,
+        market_id: u64,
+        value: Option<Arc<Vec<OrderEntry>>>,
+    ) {
+        self.sell_orders.entry((user, market_id)).or_insert(value);
+    }
+
+    // ── per-order records (delete-on-terminal) ──────────────────────────────
+    /// Three-state read (see [`Resident`]). `Deleted` is load-bearing here: delete-on-terminal
+    /// removes the record in-block, and getOrder must see not-found, not the stale committed row.
+    pub fn order(&self, order_id: &[u8; 32]) -> Resident<'_, Order> {
+        match self.orders.get(order_id) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(o)) => Resident::Hit(o.as_ref()),
+        }
+    }
+
+    /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    pub fn order_arc(&self, order_id: &[u8; 32]) -> Option<Arc<Order>> {
+        self.orders.get(order_id).and_then(|s| s.clone())
+    }
+
+    /// Inserts/overwrites and marks dirty.
+    pub fn set_order(&mut self, order_id: &[u8; 32], value: Order) {
+        self.mark(keys::order_key(order_id), StoreSlot::Order(*order_id));
+        self.orders.insert(*order_id, Some(Arc::new(value)));
+    }
+
+    /// Deletes the record (delete-on-terminal): resident tombstone + dirty mark → the delta emits
+    /// empty bytes (the store DELETE convention).
+    pub fn remove_order(&mut self, order_id: &[u8; 32]) {
+        self.mark(keys::order_key(order_id), StoreSlot::Order(*order_id));
+        self.orders.insert(*order_id, None);
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark).
+    pub fn fill_order(&mut self, order_id: &[u8; 32], value: Option<Arc<Order>>) {
+        self.orders.entry(*order_id).or_insert(value);
+    }
+
     /// Number of keys written this block (dirty-set size). Diagnostic / test hook.
     pub fn dirty_len(&self) -> usize {
         self.dirty.len()
@@ -302,6 +488,22 @@ impl TypedPerpStore {
                     _ => Vec::new(),
                 },
                 StoreSlot::Position(u, m) => match self.positions.get(&(u, m)) {
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
+                },
+                StoreSlot::MarketHot(m) => match self.market_hots.get(&m) {
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
+                },
+                StoreSlot::BuyOrders(u, m) => match self.buy_orders.get(&(u, m)) {
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
+                },
+                StoreSlot::SellOrders(u, m) => match self.sell_orders.get(&(u, m)) {
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
+                },
+                StoreSlot::Order(id) => match self.orders.get(&id) {
                     Some(Some(v)) => encode(v.as_ref())?,
                     _ => Vec::new(),
                 },
@@ -345,6 +547,10 @@ impl PerpStore for TypedPerpStore {
                 StoreSlot::Account(u) => entry(self.accounts.get(&u)),
                 StoreSlot::Market(m) => entry(self.markets.get(&m)),
                 StoreSlot::Position(u, m) => entry(self.positions.get(&(u, m))),
+                StoreSlot::MarketHot(m) => entry(self.market_hots.get(&m)),
+                StoreSlot::BuyOrders(u, m) => entry(self.buy_orders.get(&(u, m))),
+                StoreSlot::SellOrders(u, m) => entry(self.sell_orders.get(&(u, m))),
+                StoreSlot::Order(id) => entry(self.orders.get(&id)),
             };
             out.insert(key, e);
         }

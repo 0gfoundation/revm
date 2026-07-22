@@ -849,10 +849,15 @@ pub fn load_buy_orders<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<Vec<OrderEntry>, PrecompileError> {
-    Ok(
-        load_cached::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?
-            .unwrap_or_default(),
-    )
+    use crate::perp_dex::typed_store::Resident;
+    match typed_store_mut(context).buy_orders(user, market_id) {
+        Resident::Hit(v) => return Ok(v.clone()),
+        Resident::Deleted => return Ok(Vec::new()),
+        Resident::Miss => {}
+    }
+    let arc = cold_load::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?;
+    typed_store_mut(context).fill_buy_orders(user, market_id, arc.clone());
+    Ok(arc.map(|v| (*v).clone()).unwrap_or_default())
 }
 
 /// Zero-copy user buy-order-entry list (点1): `Arc<Vec<OrderEntry>>`, no per-read clone. PURE reads
@@ -863,10 +868,19 @@ pub fn load_buy_orders_ref<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<std::sync::Arc<Vec<OrderEntry>>, PrecompileError> {
-    Ok(
-        load_arc::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?
-            .unwrap_or_else(|| std::sync::Arc::new(Vec::new())),
-    )
+    use crate::perp_dex::typed_store::Resident;
+    if let Some(arc) = typed_store_mut(context).buy_orders_arc(user, market_id) {
+        return Ok(arc);
+    }
+    if matches!(
+        typed_store_mut(context).buy_orders(user, market_id),
+        Resident::Deleted
+    ) {
+        return Ok(std::sync::Arc::new(Vec::new()));
+    }
+    let arc = cold_load::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?;
+    typed_store_mut(context).fill_buy_orders(user, market_id, arc.clone());
+    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
 }
 
 pub fn save_buy_orders<CTX: ContextTr>(
@@ -875,13 +889,9 @@ pub fn save_buy_orders<CTX: ContextTr>(
     market_id: u64,
     entries: &[OrderEntry],
 ) -> Result<(), PrecompileError> {
-    // Cache the owned Vec; msgpack-encoding a `&[T]` and a `&Vec<T>` is byte-identical (both a
-    // sequence), so the commitment stream is unchanged.
-    save_cached(
-        context,
-        user_buy_orders_key(user, market_id),
-        &entries.to_vec(),
-    )
+    // An EMPTY list is a stored value (msgpack `0x90`, key present) — never a delete.
+    typed_store_mut(context).set_buy_orders(user, market_id, entries.to_vec());
+    Ok(())
 }
 
 pub fn load_sell_orders<CTX: ContextTr>(
@@ -889,10 +899,15 @@ pub fn load_sell_orders<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<Vec<OrderEntry>, PrecompileError> {
-    Ok(
-        load_cached::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?
-            .unwrap_or_default(),
-    )
+    use crate::perp_dex::typed_store::Resident;
+    match typed_store_mut(context).sell_orders(user, market_id) {
+        Resident::Hit(v) => return Ok(v.clone()),
+        Resident::Deleted => return Ok(Vec::new()),
+        Resident::Miss => {}
+    }
+    let arc = cold_load::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?;
+    typed_store_mut(context).fill_sell_orders(user, market_id, arc.clone());
+    Ok(arc.map(|v| (*v).clone()).unwrap_or_default())
 }
 
 /// Zero-copy user sell-order-entry list (点1): `Arc<Vec<OrderEntry>>`, no per-read clone. PURE reads
@@ -902,10 +917,19 @@ pub fn load_sell_orders_ref<CTX: ContextTr>(
     user: Address,
     market_id: u64,
 ) -> Result<std::sync::Arc<Vec<OrderEntry>>, PrecompileError> {
-    Ok(
-        load_arc::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?
-            .unwrap_or_else(|| std::sync::Arc::new(Vec::new())),
-    )
+    use crate::perp_dex::typed_store::Resident;
+    if let Some(arc) = typed_store_mut(context).sell_orders_arc(user, market_id) {
+        return Ok(arc);
+    }
+    if matches!(
+        typed_store_mut(context).sell_orders(user, market_id),
+        Resident::Deleted
+    ) {
+        return Ok(std::sync::Arc::new(Vec::new()));
+    }
+    let arc = cold_load::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?;
+    typed_store_mut(context).fill_sell_orders(user, market_id, arc.clone());
+    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
 }
 
 pub fn save_sell_orders<CTX: ContextTr>(
@@ -914,33 +938,27 @@ pub fn save_sell_orders<CTX: ContextTr>(
     market_id: u64,
     entries: &[OrderEntry],
 ) -> Result<(), PrecompileError> {
-    save_cached(
-        context,
-        user_sell_orders_key(user, market_id),
-        &entries.to_vec(),
-    )
+    typed_store_mut(context).set_sell_orders(user, market_id, entries.to_vec());
+    Ok(())
 }
 
-/// In-place mutate the user's buy-order list (#21 靶子2): if it's already in the overlay, run `f`
-/// on the live `&mut Vec` (one undo snapshot, no load/store clone round-trip); otherwise load it
-/// (cache/cold) → run `f` → store as a deferred struct. `f`'s return value passes through (e.g. the
-/// recomputed reservation, computed inside the borrow so it sees the post-mutation list). The result
-/// is byte-identical to load→modify→`save_buy_orders` since the block-end ser fn is the same msgpack.
+/// In-place mutate the user's buy-order list (#21 靶子2): if it's resident in the typed store, run
+/// `f` on the live `&mut Vec` (CoW lift on first write, no load/store clone round-trip); otherwise
+/// load it (cache/cold) → run `f` → store. `f`'s return value passes through (e.g. the recomputed
+/// reservation, computed inside the borrow so it sees the post-mutation list). The result is
+/// byte-identical to load→modify→`save_buy_orders` since the block-end ser is the same msgpack.
 pub fn mutate_buy_orders<CTX: ContextTr, R>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
     f: impl FnOnce(&mut Vec<OrderEntry>) -> R,
 ) -> Result<R, PrecompileError> {
-    let key = user_buy_orders_key(user, market_id);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(entries) = any.downcast_mut::<Vec<OrderEntry>>() {
-            return Ok(f(entries));
-        }
+    if let Some(entries) = typed_store_mut(context).buy_orders_mut(user, market_id) {
+        return Ok(f(entries));
     }
-    let mut entries: Vec<OrderEntry> = load_cached(context, key)?.unwrap_or_default();
+    let mut entries = load_buy_orders(context, user, market_id)?;
     let r = f(&mut entries);
-    save_cached(context, key, &entries)?;
+    typed_store_mut(context).set_buy_orders(user, market_id, entries);
     Ok(r)
 }
 
@@ -951,15 +969,12 @@ pub fn mutate_sell_orders<CTX: ContextTr, R>(
     market_id: u64,
     f: impl FnOnce(&mut Vec<OrderEntry>) -> R,
 ) -> Result<R, PrecompileError> {
-    let key = user_sell_orders_key(user, market_id);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(entries) = any.downcast_mut::<Vec<OrderEntry>>() {
-            return Ok(f(entries));
-        }
+    if let Some(entries) = typed_store_mut(context).sell_orders_mut(user, market_id) {
+        return Ok(f(entries));
     }
-    let mut entries: Vec<OrderEntry> = load_cached(context, key)?.unwrap_or_default();
+    let mut entries = load_sell_orders(context, user, market_id)?;
     let r = f(&mut entries);
-    save_cached(context, key, &entries)?;
+    typed_store_mut(context).set_sell_orders(user, market_id, entries);
     Ok(r)
 }
 
@@ -969,7 +984,16 @@ pub fn load_order<CTX: ContextTr>(
     context: &mut CTX,
     order_id: &[u8; 32],
 ) -> Result<Option<Order>, PrecompileError> {
-    load_cached::<_, Order>(context, order_key(order_id))
+    use crate::perp_dex::typed_store::Resident;
+    match typed_store_mut(context).order(order_id) {
+        Resident::Hit(o) => return Ok(Some(o.clone())),
+        // Deleted-this-block (delete-on-terminal) reads as not-found — never the stale committed row.
+        Resident::Deleted => return Ok(None),
+        Resident::Miss => {}
+    }
+    let arc = cold_load::<_, Order>(context, order_key(order_id))?;
+    typed_store_mut(context).fill_order(order_id, arc.clone());
+    Ok(arc.map(|o| (*o).clone()))
 }
 
 /// Zero-copy order read (点1): `Arc<Order>`, no per-read clone. PURE reads only (dup check / FOK
@@ -978,7 +1002,16 @@ pub fn load_order_ref<CTX: ContextTr>(
     context: &mut CTX,
     order_id: &[u8; 32],
 ) -> Result<Option<std::sync::Arc<Order>>, PrecompileError> {
-    load_arc::<_, Order>(context, order_key(order_id))
+    use crate::perp_dex::typed_store::Resident;
+    if let Some(arc) = typed_store_mut(context).order_arc(order_id) {
+        return Ok(Some(arc));
+    }
+    if matches!(typed_store_mut(context).order(order_id), Resident::Deleted) {
+        return Ok(None);
+    }
+    let arc = cold_load::<_, Order>(context, order_key(order_id))?;
+    typed_store_mut(context).fill_order(order_id, arc.clone());
+    Ok(arc)
 }
 
 pub fn save_order<CTX: ContextTr>(
@@ -986,20 +1019,21 @@ pub fn save_order<CTX: ContextTr>(
     order_id: &[u8; 32],
     order: &Order,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, order_key(order_id), order)
+    typed_store_mut(context).set_order(order_id, order.clone());
+    Ok(())
 }
 
-/// Deletes an order record (delete-on-terminal): writes an empty blob, the established "absent"
-/// convention (`load_order` → `None`, and the block delta merges an empty value as a store DELETE).
-/// Writing empty `Bytes` over any prior `Struct` overlay for this key clears it (HashMap replace +
-/// deser-cache eviction), so a save-then-delete in the same block reads back absent. Callers use
-/// this the instant an order reaches a terminal status so the order map only ever holds live
-/// (Open/PartiallyFilled) orders.
+/// Deletes an order record (delete-on-terminal): a resident tombstone in the typed store —
+/// `load_order` → `None` for the rest of the block, and the block delta emits empty bytes (the
+/// store DELETE convention), byte-identical to the old empty-blob write. A save-then-delete in the
+/// same block reads back absent. Callers use this the instant an order reaches a terminal status
+/// so the order map only ever holds live (Open/PartiallyFilled) orders.
 pub fn delete_order<CTX: ContextTr>(
     context: &mut CTX,
     order_id: &[u8; 32],
 ) -> Result<(), PrecompileError> {
-    store_blob(context, order_key(order_id), &[])
+    typed_store_mut(context).remove_order(order_id);
+    Ok(())
 }
 
 // ── Global trade counter ──────────────────────────────────────────────────────
@@ -1109,26 +1143,31 @@ pub fn load_market_hot<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<MarketHot, PrecompileError> {
-    Ok(load_cached::<_, MarketHot>(context, market_hot_key(market_id))?.unwrap_or_default())
+    use crate::perp_dex::typed_store::Resident;
+    match typed_store_mut(context).market_hot(market_id) {
+        Resident::Hit(h) => return Ok(h.clone()),
+        Resident::Deleted => return Ok(MarketHot::default()),
+        Resident::Miss => {}
+    }
+    let arc = cold_load::<_, MarketHot>(context, market_hot_key(market_id))?;
+    typed_store_mut(context).fill_market_hot(market_id, arc.clone());
+    Ok(arc.map(|h| (*h).clone()).unwrap_or_default())
 }
 
 /// In-place RMW of a market's hot scalars (mirror of [`mutate_buy_orders`]): fast-path mutates the
-/// deferred `Struct` already in the overlay (zero clone, one write coalesced across scalar setters);
-/// slow-path loads once → mutate → store. Byte-identical final blob to a load→modify→save.
+/// value resident in the typed store (CoW lift on first write, one write coalesced across scalar
+/// setters); slow-path loads once → mutate → store. Byte-identical final blob to a load→modify→save.
 fn mutate_market_hot<CTX: ContextTr, R>(
     context: &mut CTX,
     market_id: u64,
     f: impl FnOnce(&mut MarketHot) -> R,
 ) -> Result<R, PrecompileError> {
-    let key = market_hot_key(market_id);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(h) = any.downcast_mut::<MarketHot>() {
-            return Ok(f(h));
-        }
+    if let Some(h) = typed_store_mut(context).market_hot_mut(market_id) {
+        return Ok(f(h));
     }
-    let mut h: MarketHot = load_cached(context, key)?.unwrap_or_default();
+    let mut h = load_market_hot(context, market_id)?;
     let r = f(&mut h);
-    save_cached(context, key, &h)?;
+    typed_store_mut(context).set_market_hot(market_id, h);
     Ok(r)
 }
 
