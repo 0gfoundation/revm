@@ -1243,12 +1243,45 @@ fn sorted_remove(v: &mut Vec<u64>, x: u64) {
     }
 }
 
+/// Fills the typed store's bid-price index from the cold store if not resident this block.
+fn ensure_bid_prices_resident<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<(), PrecompileError> {
+    use crate::perp_dex::typed_store::Resident;
+    if matches!(typed_store_mut(context).bid_prices(market_id), Resident::Miss) {
+        let arc = cold_load::<_, Vec<u64>>(context, bid_prices_key(market_id))?;
+        typed_store_mut(context).fill_bid_prices(market_id, arc);
+    }
+    Ok(())
+}
+
+fn ensure_ask_prices_resident<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+) -> Result<(), PrecompileError> {
+    use crate::perp_dex::typed_store::Resident;
+    if matches!(typed_store_mut(context).ask_prices(market_id), Resident::Miss) {
+        let arc = cold_load::<_, Vec<u64>>(context, ask_prices_key(market_id))?;
+        typed_store_mut(context).fill_ask_prices(market_id, arc);
+    }
+    Ok(())
+}
+
 /// Active bid price levels (best = max).
 pub fn load_bid_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<Vec<u64>, PrecompileError> {
-    Ok(load_cached::<_, Vec<u64>>(context, bid_prices_key(market_id))?.unwrap_or_default())
+    use crate::perp_dex::typed_store::Resident;
+    match typed_store_mut(context).bid_prices(market_id) {
+        Resident::Hit(v) => return Ok(v.clone()),
+        Resident::Deleted => return Ok(Vec::new()),
+        Resident::Miss => {}
+    }
+    let arc = cold_load::<_, Vec<u64>>(context, bid_prices_key(market_id))?;
+    typed_store_mut(context).fill_bid_prices(market_id, arc.clone());
+    Ok(arc.map(|v| (*v).clone()).unwrap_or_default())
 }
 
 /// Zero-copy active bid prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only
@@ -1258,8 +1291,16 @@ pub fn load_bid_prices_ref<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<std::sync::Arc<Vec<u64>>, PrecompileError> {
-    Ok(load_arc::<_, Vec<u64>>(context, bid_prices_key(market_id))?
-        .unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
+    use crate::perp_dex::typed_store::Resident;
+    if let Some(arc) = typed_store_mut(context).bid_prices_arc(market_id) {
+        return Ok(arc);
+    }
+    if matches!(typed_store_mut(context).bid_prices(market_id), Resident::Deleted) {
+        return Ok(std::sync::Arc::new(Vec::new()));
+    }
+    let arc = cold_load::<_, Vec<u64>>(context, bid_prices_key(market_id))?;
+    typed_store_mut(context).fill_bid_prices(market_id, arc.clone());
+    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
 }
 
 pub fn save_bid_prices<CTX: ContextTr>(
@@ -1267,7 +1308,8 @@ pub fn save_bid_prices<CTX: ContextTr>(
     market_id: u64,
     prices: &Vec<u64>,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, bid_prices_key(market_id), prices)
+    typed_store_mut(context).set_bid_prices(market_id, prices.clone());
+    Ok(())
 }
 
 /// Active ask price levels (best = min).
@@ -1275,7 +1317,15 @@ pub fn load_ask_prices<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<Vec<u64>, PrecompileError> {
-    Ok(load_cached::<_, Vec<u64>>(context, ask_prices_key(market_id))?.unwrap_or_default())
+    use crate::perp_dex::typed_store::Resident;
+    match typed_store_mut(context).ask_prices(market_id) {
+        Resident::Hit(v) => return Ok(v.clone()),
+        Resident::Deleted => return Ok(Vec::new()),
+        Resident::Miss => {}
+    }
+    let arc = cold_load::<_, Vec<u64>>(context, ask_prices_key(market_id))?;
+    typed_store_mut(context).fill_ask_prices(market_id, arc.clone());
+    Ok(arc.map(|v| (*v).clone()).unwrap_or_default())
 }
 
 /// Zero-copy active ask prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only
@@ -1284,8 +1334,16 @@ pub fn load_ask_prices_ref<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
 ) -> Result<std::sync::Arc<Vec<u64>>, PrecompileError> {
-    Ok(load_arc::<_, Vec<u64>>(context, ask_prices_key(market_id))?
-        .unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
+    use crate::perp_dex::typed_store::Resident;
+    if let Some(arc) = typed_store_mut(context).ask_prices_arc(market_id) {
+        return Ok(arc);
+    }
+    if matches!(typed_store_mut(context).ask_prices(market_id), Resident::Deleted) {
+        return Ok(std::sync::Arc::new(Vec::new()));
+    }
+    let arc = cold_load::<_, Vec<u64>>(context, ask_prices_key(market_id))?;
+    typed_store_mut(context).fill_ask_prices(market_id, arc.clone());
+    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
 }
 
 pub fn save_ask_prices<CTX: ContextTr>(
@@ -1293,7 +1351,8 @@ pub fn save_ask_prices<CTX: ContextTr>(
     market_id: u64,
     prices: &Vec<u64>,
 ) -> Result<(), PrecompileError> {
-    save_cached(context, ask_prices_key(market_id), prices)
+    typed_store_mut(context).set_ask_prices(market_id, prices.clone());
+    Ok(())
 }
 
 // ── In-place orderbook mutation (catalog #21, generalized) ──────────────────────
@@ -1310,16 +1369,10 @@ fn mutate_bid_prices<CTX: ContextTr, R>(
     market_id: u64,
     f: impl FnOnce(&mut Vec<u64>) -> R,
 ) -> Result<R, PrecompileError> {
-    let key = bid_prices_key(market_id);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
-            return Ok(f(prices));
-        }
-    }
-    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
-    let r = f(&mut prices);
-    save_cached(context, key, &prices)?;
-    Ok(r)
+    // Unconditional write (matches the old load→f→save): materialize (cold-fill if first touch)
+    // then mutate the resident Vec in place with an auto-mark.
+    ensure_bid_prices_resident(context, market_id)?;
+    Ok(f(typed_store_mut(context).bid_prices_mut(market_id)))
 }
 
 fn mutate_ask_prices<CTX: ContextTr, R>(
@@ -1327,16 +1380,8 @@ fn mutate_ask_prices<CTX: ContextTr, R>(
     market_id: u64,
     f: impl FnOnce(&mut Vec<u64>) -> R,
 ) -> Result<R, PrecompileError> {
-    let key = ask_prices_key(market_id);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
-            return Ok(f(prices));
-        }
-    }
-    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
-    let r = f(&mut prices);
-    save_cached(context, key, &prices)?;
-    Ok(r)
+    ensure_ask_prices_resident(context, market_id)?;
+    Ok(f(typed_store_mut(context).ask_prices_mut(market_id)))
 }
 
 /// In-place RMW of a level blob (count + ids): fast-path mutates the deferred `Struct` in the
@@ -1610,19 +1655,13 @@ pub fn insert_bid_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let key = bid_prices_key(market_id);
-    // Fast path: already touched this block → in-place insert (idempotent, no load/store clone).
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
-            sorted_insert(prices, price);
-            return Ok(());
-        }
-    }
-    // Slow path (first touch): load once; write ONLY when the price is newly inserted —
-    // preserving the "no store when already present" delta semantics (fewer commitment entries).
-    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
-    if sorted_insert(&mut prices, price) {
-        save_cached(context, key, &prices)?;
+    // Conditional write: dirty-mark (delta membership) fires ONLY when the price is newly inserted,
+    // preserving the "no store when already present" commitment semantics. Materialize first, then
+    // sorted_insert via the no-mark handle and mark iff it changed.
+    ensure_bid_prices_resident(context, market_id)?;
+    let changed = sorted_insert(typed_store_mut(context).bid_prices_mut_nomark(market_id), price);
+    if changed {
+        typed_store_mut(context).mark_bid_prices(market_id);
     }
     Ok(())
 }
@@ -1633,16 +1672,10 @@ pub fn insert_ask_price<CTX: ContextTr>(
     market_id: u64,
     price: u64,
 ) -> Result<(), PrecompileError> {
-    let key = ask_prices_key(market_id);
-    if let Some(any) = context.journal_mut().perp_get_struct_mut(key) {
-        if let Some(prices) = any.downcast_mut::<Vec<u64>>() {
-            sorted_insert(prices, price);
-            return Ok(());
-        }
-    }
-    let mut prices: Vec<u64> = load_cached(context, key)?.unwrap_or_default();
-    if sorted_insert(&mut prices, price) {
-        save_cached(context, key, &prices)?;
+    ensure_ask_prices_resident(context, market_id)?;
+    let changed = sorted_insert(typed_store_mut(context).ask_prices_mut_nomark(market_id), price);
+    if changed {
+        typed_store_mut(context).mark_ask_prices(market_id);
     }
     Ok(())
 }

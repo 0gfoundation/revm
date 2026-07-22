@@ -44,6 +44,8 @@ enum StoreSlot {
     BuyOrders(Address, u64),
     SellOrders(Address, u64),
     Order([u8; 32]),
+    BidPrices(u64),
+    AskPrices(u64),
 }
 
 /// Three-state read result from a typed sub-map.
@@ -96,6 +98,8 @@ pub struct TypedPerpStore {
     buy_orders: HashMap<(Address, u64), Slot<Vec<OrderEntry>>>,
     sell_orders: HashMap<(Address, u64), Slot<Vec<OrderEntry>>>,
     orders: HashMap<[u8; 32], Slot<Order>>,
+    bid_prices: HashMap<u64, Slot<Vec<u64>>>,
+    ask_prices: HashMap<u64, Slot<Vec<u64>>>,
     // Stage B extends with the remaining namespaces, same patterns:
     //   bid_levels / ask_levels / bid_prices / ask_prices /
     //   market_fee_total / trade_count / position_registry / api_keys / api_key_ids /
@@ -462,6 +466,117 @@ impl TypedPerpStore {
         self.orders.entry(*order_id).or_insert(value);
     }
 
+    // ── per-market active price levels (bidp / askp), sorted Vec<u64> ────────
+    /// Three-state read of the bid price index (see [`Resident`]).
+    pub fn bid_prices(&self, market_id: u64) -> Resident<'_, Vec<u64>> {
+        match self.bid_prices.get(&market_id) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(v)) => Resident::Hit(v.as_ref()),
+        }
+    }
+
+    /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    pub fn bid_prices_arc(&self, market_id: u64) -> Option<Arc<Vec<u64>>> {
+        self.bid_prices.get(&market_id).and_then(|s| s.clone())
+    }
+
+    /// Inserts/overwrites the whole index and marks dirty.
+    pub fn set_bid_prices(&mut self, market_id: u64, value: Vec<u64>) {
+        self.mark(keys::bid_prices_key(market_id), StoreSlot::BidPrices(market_id));
+        self.bid_prices.insert(market_id, Some(Arc::new(value)));
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark).
+    pub fn fill_bid_prices(&mut self, market_id: u64, value: Option<Arc<Vec<u64>>>) {
+        self.bid_prices.entry(market_id).or_insert(value);
+    }
+
+    /// `&mut` to the resident index (materialize empty if deleted/absent), AUTO-marking dirty —
+    /// for the UNCONDITIONAL mutate (remove_*_price / mutate_bid_prices, which always write).
+    pub fn bid_prices_mut(&mut self, market_id: u64) -> &mut Vec<u64> {
+        self.dirty
+            .insert(keys::bid_prices_key(market_id), StoreSlot::BidPrices(market_id));
+        self.write_count += 1;
+        self.tx_dirty = true;
+        Arc::make_mut(
+            self.bid_prices
+                .entry(market_id)
+                .or_insert_with(|| Some(Arc::new(Vec::new())))
+                .get_or_insert_with(|| Arc::new(Vec::new())),
+        )
+    }
+
+    /// `&mut` to the resident index WITHOUT marking — the caller marks (via [`Self::mark_bid_prices`])
+    /// only if it actually changed, preserving `insert_*_price`'s conditional-write delta semantics.
+    pub fn bid_prices_mut_nomark(&mut self, market_id: u64) -> &mut Vec<u64> {
+        Arc::make_mut(
+            self.bid_prices
+                .entry(market_id)
+                .or_insert_with(|| Some(Arc::new(Vec::new())))
+                .get_or_insert_with(|| Arc::new(Vec::new())),
+        )
+    }
+
+    /// Marks the bid-price index dirty (delta membership). Pair with [`Self::bid_prices_mut_nomark`].
+    pub fn mark_bid_prices(&mut self, market_id: u64) {
+        self.mark(keys::bid_prices_key(market_id), StoreSlot::BidPrices(market_id));
+    }
+
+    /// Three-state read of the ask price index (see [`Resident`]).
+    pub fn ask_prices(&self, market_id: u64) -> Resident<'_, Vec<u64>> {
+        match self.ask_prices.get(&market_id) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(v)) => Resident::Hit(v.as_ref()),
+        }
+    }
+
+    /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    pub fn ask_prices_arc(&self, market_id: u64) -> Option<Arc<Vec<u64>>> {
+        self.ask_prices.get(&market_id).and_then(|s| s.clone())
+    }
+
+    /// Inserts/overwrites the whole index and marks dirty.
+    pub fn set_ask_prices(&mut self, market_id: u64, value: Vec<u64>) {
+        self.mark(keys::ask_prices_key(market_id), StoreSlot::AskPrices(market_id));
+        self.ask_prices.insert(market_id, Some(Arc::new(value)));
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark).
+    pub fn fill_ask_prices(&mut self, market_id: u64, value: Option<Arc<Vec<u64>>>) {
+        self.ask_prices.entry(market_id).or_insert(value);
+    }
+
+    /// `&mut` to the resident index, AUTO-marking dirty (unconditional mutate). See bid side.
+    pub fn ask_prices_mut(&mut self, market_id: u64) -> &mut Vec<u64> {
+        self.dirty
+            .insert(keys::ask_prices_key(market_id), StoreSlot::AskPrices(market_id));
+        self.write_count += 1;
+        self.tx_dirty = true;
+        Arc::make_mut(
+            self.ask_prices
+                .entry(market_id)
+                .or_insert_with(|| Some(Arc::new(Vec::new())))
+                .get_or_insert_with(|| Arc::new(Vec::new())),
+        )
+    }
+
+    /// `&mut` WITHOUT marking (caller marks conditionally). See bid side.
+    pub fn ask_prices_mut_nomark(&mut self, market_id: u64) -> &mut Vec<u64> {
+        Arc::make_mut(
+            self.ask_prices
+                .entry(market_id)
+                .or_insert_with(|| Some(Arc::new(Vec::new())))
+                .get_or_insert_with(|| Arc::new(Vec::new())),
+        )
+    }
+
+    /// Marks the ask-price index dirty. Pair with [`Self::ask_prices_mut_nomark`].
+    pub fn mark_ask_prices(&mut self, market_id: u64) {
+        self.mark(keys::ask_prices_key(market_id), StoreSlot::AskPrices(market_id));
+    }
+
     /// Number of keys written this block (dirty-set size). Diagnostic / test hook.
     pub fn dirty_len(&self) -> usize {
         self.dirty.len()
@@ -504,6 +619,14 @@ impl TypedPerpStore {
                     _ => Vec::new(),
                 },
                 StoreSlot::Order(id) => match self.orders.get(&id) {
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
+                },
+                StoreSlot::BidPrices(m) => match self.bid_prices.get(&m) {
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
+                },
+                StoreSlot::AskPrices(m) => match self.ask_prices.get(&m) {
                     Some(Some(v)) => encode(v.as_ref())?,
                     _ => Vec::new(),
                 },
@@ -551,6 +674,8 @@ impl PerpStore for TypedPerpStore {
                 StoreSlot::BuyOrders(u, m) => entry(self.buy_orders.get(&(u, m))),
                 StoreSlot::SellOrders(u, m) => entry(self.sell_orders.get(&(u, m))),
                 StoreSlot::Order(id) => entry(self.orders.get(&id)),
+                StoreSlot::BidPrices(m) => entry(self.bid_prices.get(&m)),
+                StoreSlot::AskPrices(m) => entry(self.ask_prices.get(&m)),
             };
             out.insert(key, e);
         }
