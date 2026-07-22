@@ -43,11 +43,18 @@ enum StoreSlot {
 }
 
 /// Strongly-typed off-trie store (Stage A). See the module docs.
+///
+/// Sub-maps hold `Arc<T>`, not owned `T` — this is what keeps every current perf property when the
+/// cold path is wired (Stage B): a cross-block fill from the committed decoded store
+/// (`Database::perp_load_arc` hands an `Arc`) stores the SAME Arc (zero clone); `load_*_ref`
+/// zero-clone reads stay a refcount bump; and mutation goes through [`std::sync::Arc::make_mut`] —
+/// clone IF shared (exactly the first-touch CoW lift), in-place thereafter. `take_delta` hands the
+/// Arc back to the cross-block store without cloning.
 #[derive(Clone, Debug, Default)]
 pub struct TypedPerpStore {
-    accounts: HashMap<Address, UserAccount>,
-    markets: HashMap<u64, Market>,
-    positions: HashMap<(Address, u64), PerpPosition>,
+    accounts: HashMap<Address, Arc<UserAccount>>,
+    markets: HashMap<u64, Arc<Market>>,
+    positions: HashMap<(Address, u64), Arc<PerpPosition>>,
     // Stage B extends with the remaining namespaces, same patterns:
     //   orders / bid_levels / ask_levels / bid_prices / ask_prices / market_hot /
     //   market_fee_total / trade_count / position_registry / api_keys / api_key_ids /
@@ -64,24 +71,25 @@ impl TypedPerpStore {
     // ── per-user account ───────────────────────────────────────────────────────
     /// Shared read of a user's account (`None` = not resident this block).
     pub fn account(&self, user: Address) -> Option<&UserAccount> {
-        self.accounts.get(&user)
+        self.accounts.get(&user).map(|a| a.as_ref())
     }
 
     /// `&mut` access marks the key dirty (conservative: any mutable borrow is a potential write,
-    /// matching the current `get_struct_mut` write-count semantics).
+    /// matching the current `get_struct_mut` write-count semantics). CoW: clones the value iff
+    /// the Arc is shared (first write after a cold fill), in-place thereafter.
     pub fn account_mut(&mut self, user: Address) -> Option<&mut UserAccount> {
         if self.accounts.contains_key(&user) {
             self.dirty
                 .insert(keys::account_key(user), StoreSlot::Account(user));
         }
-        self.accounts.get_mut(&user)
+        self.accounts.get_mut(&user).map(Arc::make_mut)
     }
 
     /// Inserts/overwrites a user's account and marks its key dirty.
     pub fn set_account(&mut self, user: Address, value: UserAccount) {
         self.dirty
             .insert(keys::account_key(user), StoreSlot::Account(user));
-        self.accounts.insert(user, value);
+        self.accounts.insert(user, Arc::new(value));
     }
 
     /// Removes a user's account (block-end delta emits an empty-bytes tombstone).
@@ -94,7 +102,7 @@ impl TypedPerpStore {
     // ── per-market config ────────────────────────────────────────────────────
     /// Shared read of a market's config (`None` = not resident this block).
     pub fn market(&self, market_id: u64) -> Option<&Market> {
-        self.markets.get(&market_id)
+        self.markets.get(&market_id).map(|m| m.as_ref())
     }
 
     /// Mutable market access; marks its key dirty (see [`Self::account_mut`]).
@@ -103,20 +111,20 @@ impl TypedPerpStore {
             self.dirty
                 .insert(keys::market_key(market_id), StoreSlot::Market(market_id));
         }
-        self.markets.get_mut(&market_id)
+        self.markets.get_mut(&market_id).map(Arc::make_mut)
     }
 
     /// Inserts/overwrites a market and marks its key dirty.
     pub fn set_market(&mut self, market_id: u64, value: Market) {
         self.dirty
             .insert(keys::market_key(market_id), StoreSlot::Market(market_id));
-        self.markets.insert(market_id, value);
+        self.markets.insert(market_id, Arc::new(value));
     }
 
     // ── per-(user, market) position ──────────────────────────────────────────
     /// Shared read of a user's position in a market (`None` = not resident this block).
     pub fn position(&self, user: Address, market_id: u64) -> Option<&PerpPosition> {
-        self.positions.get(&(user, market_id))
+        self.positions.get(&(user, market_id)).map(|p| p.as_ref())
     }
 
     /// Mutable position access; marks its key dirty (see [`Self::account_mut`]).
@@ -127,7 +135,7 @@ impl TypedPerpStore {
                 StoreSlot::Position(user, market_id),
             );
         }
-        self.positions.get_mut(&(user, market_id))
+        self.positions.get_mut(&(user, market_id)).map(Arc::make_mut)
     }
 
     /// Inserts/overwrites a position and marks its key dirty.
@@ -136,7 +144,7 @@ impl TypedPerpStore {
             keys::position_key(user, market_id),
             StoreSlot::Position(user, market_id),
         );
-        self.positions.insert((user, market_id), value);
+        self.positions.insert((user, market_id), Arc::new(value));
     }
 
     /// Removes a position (block-end delta emits an empty-bytes tombstone).
@@ -165,15 +173,15 @@ impl TypedPerpStore {
         for (key, slot) in self.dirty.drain() {
             let bytes = match slot {
                 StoreSlot::Account(u) => match self.accounts.get(&u) {
-                    Some(v) => encode(v)?,
+                    Some(v) => encode(v.as_ref())?,
                     None => Vec::new(),
                 },
                 StoreSlot::Market(m) => match self.markets.get(&m) {
-                    Some(v) => encode(v)?,
+                    Some(v) => encode(v.as_ref())?,
                     None => Vec::new(),
                 },
                 StoreSlot::Position(u, m) => match self.positions.get(&(u, m)) {
-                    Some(v) => encode(v)?,
+                    Some(v) => encode(v.as_ref())?,
                     None => Vec::new(),
                 },
             };
@@ -193,14 +201,15 @@ impl PerpStore for TypedPerpStore {
     fn take_delta(&mut self) -> PerpDelta {
         let mut out = PerpDelta::default();
         // Encode failure is a bug (matches the overlay's `ser_blob` convention: the value was
-        // well-formed enough to store, so canonical encoding cannot fail).
-        fn entry<T: serde::Serialize + Clone + Send + Sync + 'static>(
-            v: Option<&T>,
+        // well-formed enough to store, so canonical encoding cannot fail). `decoded` shares the
+        // sub-map's Arc — zero clone into the cross-block committed store.
+        fn entry<T: serde::Serialize + Send + Sync + 'static>(
+            v: Option<&Arc<T>>,
         ) -> PerpDeltaEntry {
             match v {
                 Some(v) => PerpDeltaEntry {
-                    decoded: Some(Arc::new(v.clone()) as Arc<PerpBlob>),
-                    bytes: encode(v).expect("perp typed-store encode failure"),
+                    decoded: Some(v.clone() as Arc<PerpBlob>),
+                    bytes: encode(v.as_ref()).expect("perp typed-store encode failure"),
                 },
                 // Removed this block → empty bytes (the delete convention); nothing to retain in
                 // the decoded cross-block store.
@@ -394,6 +403,38 @@ mod tests {
 
         // Dirty set drained: a second harvest is empty.
         assert!(journal.take_perp_delta().is_empty());
+    }
+
+    /// The Arc-CoW property the Stage-B cold path relies on: a fill can share an external Arc
+    /// (zero clone — same allocation), and the first mutable access breaks the share exactly once
+    /// (`Arc::make_mut`), leaving the external holder's value untouched.
+    #[test]
+    fn arc_cow_shares_cold_fill_and_clones_only_on_first_write() {
+        let mut store = TypedPerpStore::default();
+        let u = addr(0x55);
+
+        // Simulated cross-block fill: an Arc handed in from the committed store.
+        let canonical = Arc::new(UserAccount::default());
+        store.accounts.insert(u, canonical.clone());
+        assert!(
+            Arc::ptr_eq(&canonical, store.accounts.get(&u).unwrap()),
+            "fill shares the SAME allocation (zero clone)"
+        );
+
+        // First write breaks the share (one clone), external Arc keeps the old value.
+        store.account_mut(u).unwrap().nonce = 42;
+        assert!(!Arc::ptr_eq(&canonical, store.accounts.get(&u).unwrap()));
+        assert_eq!(canonical.nonce, 0, "external holder untouched");
+        assert_eq!(store.account(u).unwrap().nonce, 42);
+
+        // Second write: Arc now unique → in-place, no further clone (same allocation).
+        let after_first = Arc::as_ptr(store.accounts.get(&u).unwrap());
+        store.account_mut(u).unwrap().nonce = 43;
+        assert_eq!(
+            after_first,
+            Arc::as_ptr(store.accounts.get(&u).unwrap()),
+            "unique Arc mutates in place"
+        );
     }
 
     #[test]
