@@ -37,12 +37,13 @@ Add a parallel dirty-key list and assert it reproduces the overlay-drained delta
 
 Replace type-erased `working` values with a typed live store; `dirty_keys` becomes the primary delta source.
 
-- **`PerpStore`** typed maps (accounts / positions / markets / levels / orders …). Two shapes:
-  - *(a) enum-in-place:* keep it in `JournalInner` but store `enum PerpTyped { Account(UserAccount), Position(PerpPosition), Market(Market), Level(LevelBlob), … }` — kills `dyn Any` without relocating out of the generic revm-context crate.
-  - *(b) relocate:* move the store to a concrete slot the precompile owns (fully typed, arena/`SlotMap` + `HashMap<Identity, Handle>` for one-probe-per-entity-per-tx). More invasive; enables Vec-index repeated access.
-- **load/save/mutate** → direct typed access (resolve-once: one identity→handle probe per entity per tx, then `&mut` / Vec index). No B256 hashing, no downcast, no per-write serialize.
-- **Writes push key (or handle) to `dirty_keys`.**
-- **`take_delta` materializes from `dirty_keys`:** dedup → per key `canonical_key` (B256, direct construct per #12) + `canonical_bytes` (canonical pack/msgpack) or tombstone → `PerpDelta`. Feeds `compute_block_commitment` (**unchanged**) + persistence (**unchanged, same MDBX txn**).
+**Chosen architecture — erase at WHOLE-STORE granularity, not per-blob** (avoids both cross-crate type relocation and any reth change; strictly better than the two shapes originally sketched here):
+
+- `JournalInner` holds ONE opaque `Box<dyn PerpStore>` (trait in `context-interface`, `: Any + Send + Sync` with `take_delta` + `as_any_mut`). `revm-context` never names the perp types.
+- `revm-precompile` OWNS a strongly-typed `TypedPerpStore` (per-namespace sub-maps keyed by natural identity). Storage layer downcasts the whole store ONCE per op → typed sub-map access. Types stay in `revm-precompile`; reth `canonical_perp` UNCHANGED (cold read still bytes → decode into the typed store).
+- Per op: **1 whole-store downcast (~1 ns TypeId) + 1 typed sub-map probe** (natural key, smaller than B256) — vs today's ~4 B256 probes + per-blob downcast + cache machinery. Borrow rule: do NOT hold `&mut store` across the call (it locks `context`, needed for logs/erc20/sstore/db); take a per-op short borrow like today, just typed.
+- **Sub-stages:** **A.1** = self-contained `TypedPerpStore` + `take_delta`, 3 representative key patterns, byte-identity tests — **DONE (`b6e14953`)**. **A.2** = wire the journal (`trait PerpStore`; `Option<Box<dyn PerpStore>>` slot — check `JournalInner: Clone`, add `clone_box` or gate perp out of the checkpoint clone; route `take_perp_delta`). **B** = extend `TypedPerpStore` to all ~26 namespaces + cut over `storage/mod.rs` load/save/mutate. **C** = delete the old overlay / `PerpEntry` / dyn-Any-per-blob / #14 cache.
+- **`take_delta` materializes from a typed dirty set** (`HashMap<B256, StoreSlot>`): per dirty key read the entity from its sub-map → `canonical_key` (B256) + `canonical_bytes` (the SAME `encode` as `save_*`) or empty-bytes tombstone → the `(key, bytes)` stream. Feeds `compute_block_commitment` (**unchanged**) + persistence (**unchanged, same MDBX txn**).
 - **Deletions:** on delete push key + mark removed; materialization emits empty bytes (len 0). **Centralize this one rule** (don't re-derive "present-default == removed" at ~25 sites).
 - **RPC isolation:** RPC sim paths (eth_estimateGas binary-search, eth_call/trace/debug) re-execute on the shared read handle → they get a **CoW view** over the live store, dropped after the call; their `dirty_keys` discarded (never committed). The consensus execution (payload_validator execute_block) gets `&mut` canonical.
 - **Restart-determinism:** handles NEVER feed the hash — only content-addressed B256 keys + canonical bytes do. (Interned-slot layout is restart-unstable → would be a latent consensus split.)
