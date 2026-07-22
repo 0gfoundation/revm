@@ -54,6 +54,16 @@ pub struct PerpSection {
     /// a process-wide atomic) — the tripwire only ever diffs it within one single-threaded call, so
     /// a plain non-atomic increment on the `&mut self` write path is sufficient and cheaper.
     write_count: u64,
+    /// Shadow-phase (live-struct co-design): append-only list of keys written this block, one push
+    /// per `store_struct` / `store_bytes` (the only two paths that put a delta-eligible entry into
+    /// `working`). Deduplicated at [`Self::take_delta`] to reproduce the block delta's key-set +
+    /// bytes — validates that EVERY write funnels through those two choke points before the overlay
+    /// is later swapped for a live typed store. Per-block (mirrors `working`; cleared in take_delta,
+    /// NOT in commit_tx). Debug-only bookkeeping — not consensus state, excluded from the commitment;
+    /// compiled out entirely in release (Phase 1 has no production role for it — the delta is still
+    /// the overlay drain). Becomes the primary delta producer in Phase 2 (then release-active).
+    #[cfg(debug_assertions)]
+    dirty_keys: Vec<B256>,
 }
 
 /// One off-trie overlay value (#16d Phase 2). A typed `save_*` write stores the DESERIALIZED blob
@@ -164,6 +174,8 @@ impl PerpSection {
         self.working.insert(key, PerpEntry::Bytes(value));
         self.dirty_this_tx = true;
         self.write_count += 1;
+        #[cfg(debug_assertions)]
+        self.dirty_keys.push(key);
     }
 
     /// Writes a deferred `Struct` (typed writers): no serialization now — lowered to bytes once at
@@ -180,6 +192,8 @@ impl PerpSection {
             .insert(key, PerpEntry::Struct { val, ser, clone });
         self.dirty_this_tx = true;
         self.write_count += 1;
+        #[cfg(debug_assertions)]
+        self.dirty_keys.push(key);
     }
 
     /// Drains the net in-block WRITES as a [`PerpDelta`], serializing each `Struct` to canonical
@@ -188,7 +202,37 @@ impl PerpSection {
     #[inline]
     fn take_delta(&mut self) -> PerpDelta {
         self.dirty_this_tx = false;
-        mem::take(&mut self.working)
+
+        // Shadow-phase check (live-struct co-design phase 1): materialize the delta BYTES from the
+        // append-only `dirty_keys` list using the SAME point-lookup + serialize the phase-2 live
+        // store producer will use, so it can be compared below against the authoritative overlay
+        // drain. A dirty key that is missing / `Cached` here means a write reached the overlay
+        // WITHOUT going through `store_struct`/`store_bytes` (the only two push sites) — the exact
+        // hazard the shadow phase exists to catch. Debug-only; the production delta is still the
+        // drain. Golden-neutral (nothing here feeds the commitment).
+        #[cfg(debug_assertions)]
+        let shadow_bytes: std::collections::BTreeMap<B256, Vec<u8>> = {
+            let mut m = std::collections::BTreeMap::new();
+            for &k in &self.dirty_keys {
+                match self.working.get(&k) {
+                    Some(PerpEntry::Struct { val, ser, .. }) => {
+                        // last-write-wins (a key pushed N times overwrites — matches the overlay)
+                        m.insert(k, ser(val.as_ref()));
+                    }
+                    Some(PerpEntry::Bytes(b)) => {
+                        m.insert(k, b.clone());
+                    }
+                    other => debug_assert!(
+                        false,
+                        "perp dirty key {k:?} is not a Struct/Bytes overlay write: {other:?}"
+                    ),
+                }
+            }
+            m
+        };
+
+        // Authoritative production delta: drain the overlay (unchanged behavior).
+        let delta: PerpDelta = mem::take(&mut self.working)
             .into_iter()
             .filter_map(|(k, e)| match e {
                 // Typed write: serialize ONCE for commitment/persistence (byte-identical to the
@@ -214,7 +258,38 @@ impl PerpSection {
                 // Cache tier: not a block write → excluded from the delta (and thus dropped here).
                 PerpEntry::Cached(_) => None,
             })
-            .collect()
+            .collect();
+
+        // Shadow-phase assert: the dirty-key-driven bytes map must equal the drained delta's bytes,
+        // key-for-key. A size/key/bytes mismatch = a write bypassed the choke points or the
+        // dirty-key producer diverges from the overlay drain (the phase-2 producer is wrong).
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(
+                shadow_bytes.len(),
+                delta.len(),
+                "perp shadow delta size {} != drained delta size {} (a write bypassed store_struct/store_bytes?)",
+                shadow_bytes.len(),
+                delta.len()
+            );
+            for (k, dentry) in &delta {
+                match shadow_bytes.get(k) {
+                    Some(sb) => debug_assert!(
+                        *sb == dentry.bytes,
+                        "perp shadow bytes mismatch for key {k:?}"
+                    ),
+                    None => debug_assert!(
+                        false,
+                        "perp key {k:?} in drained delta but absent from dirty_keys"
+                    ),
+                }
+            }
+        }
+
+        // dirty_keys mirrors `working` (per-block): drained here, never at commit_tx/finalize.
+        #[cfg(debug_assertions)]
+        self.dirty_keys.clear();
+        delta
     }
 
     /// Cache-tier read (type-erased). See [`PerpEntry::Cached`].
