@@ -260,8 +260,10 @@ sol! {
         // takerFee / makerFee: USDC micro-units (6-decimal) charged to each side for this fill
         event Trade(uint64 indexed marketId, uint64 tradeId, bytes32 takerOrderId, bytes32 makerOrderId, address taker, address maker, uint64 price, uint64 quantity, uint8 takerSide, uint64 takerFee, uint64 makerFee);
 
-        // Feeds: /positionRisk (history), /income (REALIZED_PNL — derived from vQuoteBalance delta)
-        event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage);
+        // Feeds: /positionRisk (history), /income (REALIZED_PNL)
+        // realizedPnl is gross close PnL and excludes released margin, fees, and funding.
+        // closedQuantity is zero for non-closing position updates.
+        event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage, int64 realizedPnl, uint64 closedQuantity);
         // Feeds: isolated margin adjustment history. delta > 0 means add margin; delta < 0 means remove margin.
         event PositionMarginAdjusted(address indexed user, uint64 indexed marketId, int64 delta, int64 margin);
         // Feeds: useful for debugging / audit; no direct REST endpoint

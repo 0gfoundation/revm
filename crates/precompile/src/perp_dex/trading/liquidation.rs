@@ -135,22 +135,26 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<CTX: ContextTr>(
         -residual_value_i64
     };
 
-    // realized = margin_release + vq_fraction + close_quote_delta
-    // For a full residual close, all remaining margin and v_quote are consumed.
-    let realized = pos
+    let closed_quantity = pos.amount.unsigned_abs();
+    let realized_pnl = pos
+        .v_quote_balance
+        .checked_add(close_quote_delta)
+        .ok_or_else(|| perp_err("liquidation: residual realized PnL overflow"))?;
+    let settlement_credit = pos
         .margin
-        .checked_add(pos.v_quote_balance)
-        .and_then(|v| v.checked_add(close_quote_delta))
-        .ok_or_else(|| perp_err("liquidation: residual PnL overflow"))?;
+        .checked_add(realized_pnl)
+        .ok_or_else(|| perp_err("liquidation: residual close credit overflow"))?;
 
     // Isolated margin: a profitable/solvent residual returns equity to the wallet; an
     // insolvent residual (loss exceeds the position's remaining margin) does NOT debit
     // the wallet — the shortfall is bad debt routed directly to the Insurance Fund.
-    let bad_debt = if realized >= 0 {
-        account.perp_wallet_balance = account.perp_wallet_balance.saturating_add(realized);
+    let bad_debt = if settlement_credit >= 0 {
+        account.perp_wallet_balance = account
+            .perp_wallet_balance
+            .saturating_add(settlement_credit);
         0u64
     } else {
-        realized.unsigned_abs()
+        settlement_credit.unsigned_abs()
     };
 
     pos.amount = 0;
@@ -161,6 +165,14 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<CTX: ContextTr>(
     storage::save_account(context, user, account)?;
 
     super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
+    emit_position_changed(
+        context,
+        user,
+        market.market_id,
+        &pos,
+        realized_pnl,
+        closed_quantity,
+    );
 
     Ok(())
 }
@@ -196,7 +208,13 @@ pub(crate) fn run_adl<CTX: ContextTr>(
     }
     let bd = market.base_decimals;
     let pd = market.price_decimals;
-    let p_b = calc_bankruptcy_price(loser_pos.amount, loser_pos.v_quote_balance, loser_pos.margin, bd, pd)?;
+    let p_b = calc_bankruptcy_price(
+        loser_pos.amount,
+        loser_pos.v_quote_balance,
+        loser_pos.margin,
+        bd,
+        pd,
+    )?;
     if p_b == 0 {
         return Ok(()); // <=1x residual is never insolvent — nothing to ADL
     }
@@ -216,7 +234,8 @@ pub(crate) fn run_adl<CTX: ContextTr>(
         if wp.margin_reserved != 0 || wp.fee_reserved != 0 {
             continue; // v1: has open orders — skip (avoid reservation recompute)
         }
-        let eq_mark = calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
+        let eq_mark =
+            calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
         if eq_mark <= 0 {
             continue; // itself liquidatable — leave to the sweep
         }
@@ -250,14 +269,21 @@ pub(crate) fn run_adl<CTX: ContextTr>(
         let mut winner_pos = storage::load_position(context, winner, market.market_id)?;
         let mut winner_account = storage::load_account(context, winner)?;
         let take = winner_pos.amount.unsigned_abs().min(remaining);
-        let committed = adl_fill(
-            &mut loser_pos, &mut loser_account.perp_wallet_balance, loser_close_is_buy,
-            &mut winner_pos, &mut winner_account.perp_wallet_balance, winner_close_is_buy,
-            take, p_b, bd, pd,
-        )?;
-        if committed == 0 {
+        let Some(fill) = adl_fill(
+            &mut loser_pos,
+            &mut loser_account.perp_wallet_balance,
+            loser_close_is_buy,
+            &mut winner_pos,
+            &mut winner_account.perp_wallet_balance,
+            winner_close_is_buy,
+            take,
+            p_b,
+            bd,
+            pd,
+        )?
+        else {
             continue; // no clean (bad-debt-free) fill possible — skip this winner
-        }
+        };
         storage::save_position(context, winner, market.market_id, &winner_pos)?;
         storage::save_account(context, winner, winner_account)?;
         context.journal_mut().log(Log {
@@ -266,12 +292,28 @@ pub(crate) fn run_adl<CTX: ContextTr>(
                 liquidatedUser: loser,
                 adlUser: winner,
                 marketId: market.market_id,
-                qty: committed,
+                qty: fill.quantity,
                 price: p_b,
             }
             .to_log_data(),
         });
-        remaining -= committed;
+        emit_position_changed(
+            context,
+            loser,
+            market.market_id,
+            &loser_pos,
+            fill.loser_realized_pnl,
+            fill.quantity,
+        );
+        emit_position_changed(
+            context,
+            winner,
+            market.market_id,
+            &winner_pos,
+            fill.winner_realized_pnl,
+            fill.quantity,
+        );
+        remaining -= fill.quantity;
         *budget -= 1;
         did_any = true;
     }
@@ -288,7 +330,14 @@ pub(crate) fn run_adl<CTX: ContextTr>(
 /// One ADL forced trade: close `take` of both the loser and one opposite holder at
 /// `p_b`, shrinking `take` (bounded) so NEITHER side realizes bad debt from sub-unit
 /// flooring. Both legs use the SAME single-floored `calc_value(p_b, take)`. Returns the
-/// quantity actually closed (0 if no clean fill is possible near `take`).
+/// the committed quantity and each participant's realized PnL, or `None` if no
+/// clean fill is possible near `take`.
+struct AdlFillOutcome {
+    quantity: u64,
+    loser_realized_pnl: i64,
+    winner_realized_pnl: i64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn adl_fill(
     loser_pos: &mut crate::perp_dex::types::PerpPosition,
@@ -301,7 +350,7 @@ fn adl_fill(
     p_b: u64,
     bd: u32,
     pd: u32,
-) -> Result<u64, PrecompileError> {
+) -> Result<Option<AdlFillOutcome>, PrecompileError> {
     use super::settlement::apply_position_fill;
     let floor = take.saturating_sub(4); // try take, take-1, .., take-4 (dust is <=1-2)
     let mut t = take;
@@ -310,18 +359,47 @@ fn adl_fill(
         // Trial on clones; commit only if BOTH sides are bad-debt free.
         let mut lp = loser_pos.clone();
         let mut lw = *loser_wallet;
-        let (_, loser_bd) = apply_position_fill(&mut lp, &mut lw, t, v, 0, 0, loser_close_is_buy)?;
+        let loser_outcome = apply_position_fill(&mut lp, &mut lw, t, v, 0, 0, loser_close_is_buy)?;
         let mut wp = winner_pos.clone();
         let mut ww = *winner_wallet;
-        let (_, winner_bd) = apply_position_fill(&mut wp, &mut ww, t, v, 0, 0, winner_close_is_buy)?;
-        if loser_bd == 0 && winner_bd == 0 {
+        let winner_outcome =
+            apply_position_fill(&mut wp, &mut ww, t, v, 0, 0, winner_close_is_buy)?;
+        if loser_outcome.bad_debt == 0 && winner_outcome.bad_debt == 0 {
             *loser_pos = lp;
             *loser_wallet = lw;
             *winner_pos = wp;
             *winner_wallet = ww;
-            return Ok(t);
+            return Ok(Some(AdlFillOutcome {
+                quantity: t,
+                loser_realized_pnl: loser_outcome.realized_pnl,
+                winner_realized_pnl: winner_outcome.realized_pnl,
+            }));
         }
         t -= 1;
     }
-    Ok(0)
+    Ok(None)
+}
+
+fn emit_position_changed<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    pos: &crate::perp_dex::types::PerpPosition,
+    realized_pnl: i64,
+    closed_quantity: u64,
+) {
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::PositionChanged {
+            user,
+            marketId: market_id,
+            amount: pos.amount,
+            vQuoteBalance: pos.v_quote_balance,
+            margin: pos.margin,
+            leverage: pos.leverage,
+            realizedPnl: realized_pnl,
+            closedQuantity: closed_quantity,
+        }
+        .to_log_data(),
+    });
 }

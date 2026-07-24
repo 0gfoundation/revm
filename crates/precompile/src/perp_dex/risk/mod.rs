@@ -948,6 +948,8 @@ fn emit_position_changed<CTX: ContextTr>(
             vQuoteBalance: pos.v_quote_balance,
             margin: pos.margin,
             leverage: pos.leverage,
+            realizedPnl: 0,
+            closedQuantity: 0,
         }
         .to_log_data(),
     });

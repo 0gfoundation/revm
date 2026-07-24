@@ -306,6 +306,8 @@ impl TakerSettlement {
             fee: core.fee,
             total_required: core.total_required,
             pos_log,
+            realized_pnl: core.realized_pnl,
+            closed_quantity: core.closed_quantity,
         }))
     }
 }
@@ -330,6 +332,8 @@ pub(super) struct TakerPlan {
     fee: u64,
     total_required: u64,
     pos_log: crate::perp_dex::types::PerpPosition,
+    realized_pnl: i64,
+    closed_quantity: u64,
 }
 
 pub(super) fn finalize_apply<CTX: ContextTr>(
@@ -362,6 +366,8 @@ pub(super) fn finalize_apply<CTX: ContextTr>(
             vQuoteBalance: plan.pos_log.v_quote_balance,
             margin: plan.pos_log.margin,
             leverage: plan.pos_log.leverage,
+            realizedPnl: plan.realized_pnl,
+            closedQuantity: plan.closed_quantity,
         }
         .to_log_data(),
     });
@@ -413,6 +419,8 @@ pub(super) enum MatchEvent {
     PositionChanged {
         user: Address,
         pos: crate::perp_dex::types::PerpPosition,
+        realized_pnl: i64,
+        closed_quantity: u64,
     },
     SaveOrder {
         order_id: [u8; 32],
@@ -572,7 +580,12 @@ impl MatchRegistry {
                     // only the fee-total write replays here.
                     storage::add_market_fee_total(context, market_id, amount)?;
                 }
-                MatchEvent::PositionChanged { user, pos } => {
+                MatchEvent::PositionChanged {
+                    user,
+                    pos,
+                    realized_pnl,
+                    closed_quantity,
+                } => {
                     context.journal_mut().log(Log {
                         address: PERP_DEX_ADDRESS,
                         data: IPerpDex::PositionChanged {
@@ -582,6 +595,8 @@ impl MatchRegistry {
                             vQuoteBalance: pos.v_quote_balance,
                             margin: pos.margin,
                             leverage: pos.leverage,
+                            realizedPnl: realized_pnl,
+                            closedQuantity: closed_quantity,
                         }
                         .to_log_data(),
                     });
@@ -725,12 +740,14 @@ pub(super) fn settle_maker_fill_registry<CTX: ContextTr>(
         market,
     )?;
 
-    let (maker_fee, bad_debt) = match core {
+    let (maker_fee, bad_debt, realized_pnl, closed_quantity) = match core {
         MakerFillCore::RejectedInsolvent => return Ok(MakerFillOutcome::RejectedInsolvent),
         MakerFillCore::Filled {
             maker_fee,
             bad_debt,
-        } => (maker_fee, bad_debt),
+            realized_pnl,
+            closed_quantity,
+        } => (maker_fee, bad_debt, realized_pnl, closed_quantity),
     };
     match maker_side {
         Side::Buy => w.dirty_buy = true,
@@ -760,6 +777,8 @@ pub(super) fn settle_maker_fill_registry<CTX: ContextTr>(
     reg.push_event(MatchEvent::PositionChanged {
         user: maker,
         pos: pos_snapshot,
+        realized_pnl,
+        closed_quantity,
     });
 
     Ok(MakerFillOutcome::Filled { maker_fee })
@@ -812,6 +831,8 @@ pub(super) struct TakerFillCore {
     pub(super) bad_debt: u64,
     pub(super) fee: u64,
     pub(super) total_required: u64,
+    pub(super) realized_pnl: i64,
+    pub(super) closed_quantity: u64,
 }
 
 /// PURE core of [`TakerSettlement::finalize`] (commit-only #23, tranche-4): fill aggregation
@@ -883,7 +904,7 @@ fn finalize_core(
             .ok_or_else(|| perp_err("placeOrder: opening value overflow"))?;
     }
 
-    let (opening_margin_required, bad_debt) = apply_position_fill(
+    let fill_outcome = apply_position_fill(
         pos,
         &mut account.perp_wallet_balance,
         closing_qty,
@@ -931,22 +952,30 @@ fn finalize_core(
         .checked_add(opening_value)
         .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
     let fee = calc_trading_fee(fee_notional, taker_fee_bps)?;
-    let total_required = opening_margin_required
+    let total_required = fill_outcome
+        .opening_margin
         .checked_add(fee)
         .ok_or_else(|| perp_err("placeOrder: opening margin + fee overflow"))?
         .checked_add(mr_extra)
         .ok_or_else(|| perp_err("placeOrder: total required overflow"))?;
 
     Ok(TakerFillCore {
-        bad_debt,
+        bad_debt: fill_outcome.bad_debt,
         fee,
         total_required,
+        realized_pnl: fill_outcome.realized_pnl,
+        closed_quantity: closing_qty,
     })
 }
 
 /// Outcome of [`settle_maker_fill_core`]: the pure maker-fill decision + its effect summary.
 pub(super) enum MakerFillCore {
-    Filled { maker_fee: u64, bad_debt: u64 },
+    Filled {
+        maker_fee: u64,
+        bad_debt: u64,
+        realized_pnl: i64,
+        closed_quantity: u64,
+    },
     RejectedInsolvent,
 }
 
@@ -978,7 +1007,7 @@ pub(super) fn settle_maker_fill_core(
     let fill = split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market)?;
     let mut trial_pos = pos.clone();
     let mut trial_wallet = account.perp_wallet_balance;
-    let (opening_margin, bad_debt) = apply_position_fill(
+    let fill_outcome = apply_position_fill(
         &mut trial_pos,
         &mut trial_wallet,
         fill.closing_qty,
@@ -1030,7 +1059,7 @@ pub(super) fn settle_maker_fill_core(
 
     // opening_margin ≤ old_reserved is guaranteed; this is how much of old_reserved is free to
     // cover new_reserved after pos.margin is funded.
-    let max_sustainable_reserved = old_reserved.saturating_sub(opening_margin);
+    let max_sustainable_reserved = old_reserved.saturating_sub(fill_outcome.opening_margin);
     if new_reserved > max_sustainable_reserved {
         // Reserve-deficit (≤1-unit floor-rounding residual post formula-C): clamp the stored
         // reservation to what is actually backed so the cancel-release stays exact.
@@ -1038,13 +1067,15 @@ pub(super) fn settle_maker_fill_core(
     } else {
         let net_release = old_reserved
             .saturating_sub(new_reserved)
-            .saturating_sub(opening_margin);
+            .saturating_sub(fill_outcome.opening_margin);
         account.credit_perp(net_release)?;
     }
 
     Ok(MakerFillCore::Filled {
         maker_fee,
-        bad_debt,
+        bad_debt: fill_outcome.bad_debt,
+        realized_pnl: fill_outcome.realized_pnl,
+        closed_quantity: fill.closing_qty,
     })
 }
 
@@ -1273,7 +1304,7 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
 ///
 /// # Return value
 ///
-/// Returns `(opening_margin, bad_debt)`:
+/// Returns the opening margin, bad debt, and gross realized PnL:
 /// - `opening_margin` — margin required to open the new position leg; the caller
 ///   deducts it from the wallet (maker: from reserved MR; taker: from the wallet).
 /// - `bad_debt` — isolated-margin shortfall: when a close realizes a loss that
@@ -1281,6 +1312,13 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
 ///   position's REMAINING margin first; anything still uncovered is `bad_debt`,
 ///   which the caller routes DIRECTLY to the Insurance Fund. A realized loss is
 ///   never debited from the wallet or another position's margin.
+/// - `realized_pnl` — gross close PnL, excluding released margin, fees, and funding.
+pub(super) struct PositionFillOutcome {
+    pub(super) opening_margin: u64,
+    pub(super) bad_debt: u64,
+    pub(super) realized_pnl: i64,
+}
+
 pub(super) fn apply_position_fill(
     pos: &mut crate::perp_dex::types::PerpPosition,
     wallet: &mut i64,
@@ -1289,8 +1327,9 @@ pub(super) fn apply_position_fill(
     opening_qty: u64,
     opening_value: u64,
     is_buy: bool,
-) -> Result<(u64, u64), PrecompileError> {
+) -> Result<PositionFillOutcome, PrecompileError> {
     let mut bad_debt = 0u64;
+    let mut realized_pnl = 0i64;
     if closing_qty > 0 {
         let pos_abs = pos.amount.unsigned_abs() as u128;
         let remaining_qty = pos_abs - closing_qty as u128;
@@ -1308,27 +1347,29 @@ pub(super) fn apply_position_fill(
         } else {
             closing_value
         };
-        let realised = margin_release
-            .checked_add(vq_fraction)
-            .and_then(|v| v.checked_add(close_quote_delta))
-            .ok_or_else(|| perp_err("settlement: realised PnL overflow"))?;
+        realized_pnl = vq_fraction
+            .checked_add(close_quote_delta)
+            .ok_or_else(|| perp_err("settlement: realized PnL overflow"))?;
+        let settlement_credit = margin_release
+            .checked_add(realized_pnl)
+            .ok_or_else(|| perp_err("settlement: close credit overflow"))?;
         // Release the closed slice's margin out of the position regardless of PnL;
         // `pos.margin` now holds only the remaining (un-closed) margin.
         pos.margin = pos
             .margin
             .checked_sub(margin_release)
             .ok_or_else(|| perp_err("settlement: margin overflow"))?;
-        if realised >= 0 {
+        if settlement_credit >= 0 {
             // Solvent close: the closed slice's leftover collateral + profit
             // returns to the wallet.
-            *wallet = wallet.saturating_add(realised);
+            *wallet = wallet.saturating_add(settlement_credit);
         } else {
             // Insolvent close: the loss exceeds the closed slice's collateral.
             // ISOLATED MARGIN — do NOT touch the wallet. Draw the deficit from the
             // position's REMAINING margin first; any shortfall beyond the whole
             // position's margin is bad debt, routed to the Insurance Fund by the
             // caller. A realized loss never reaches the wallet or another position.
-            let deficit = realised.unsigned_abs();
+            let deficit = settlement_credit.unsigned_abs();
             let remaining_margin = pos.margin.max(0) as u64;
             let from_margin = deficit.min(remaining_margin);
             pos.margin = pos
@@ -1394,7 +1435,11 @@ pub(super) fn apply_position_fill(
         0
     };
 
-    Ok((opening_margin, bad_debt))
+    Ok(PositionFillOutcome {
+        opening_margin,
+        bad_debt,
+        realized_pnl,
+    })
 }
 
 // ── Order entry updates after fill ───────────────────────────────────────────
@@ -1528,12 +1573,13 @@ mod isolated_margin_tests {
     #[test]
     fn solvent_full_close_credits_profit_no_bad_debt() {
         // Long 10 @ entry value 1000, margin 100; close all at exit value 1200 (profit).
-        // realised = margin_release(100) + vq_fraction(-1000) + close(+1200) = +300.
+        // Gross PnL is -1000 + 1200 = +200; wallet credit also returns margin 100.
         let mut p = long(10, -1000, 100);
         let mut wallet = 0i64;
-        let (opening, bad_debt) =
-            apply_position_fill(&mut p, &mut wallet, 10, 1200, 0, 0, false).unwrap();
-        assert_eq!((opening, bad_debt), (0, 0));
+        let outcome = apply_position_fill(&mut p, &mut wallet, 10, 1200, 0, 0, false).unwrap();
+        assert_eq!(outcome.opening_margin, 0);
+        assert_eq!(outcome.bad_debt, 0);
+        assert_eq!(outcome.realized_pnl, 200);
         assert_eq!(wallet, 300); // returned margin 100 + realized profit 200
         assert_eq!(p.margin, 0);
         assert_eq!(p.amount, 0);
@@ -1541,13 +1587,13 @@ mod isolated_margin_tests {
 
     #[test]
     fn underwater_full_close_routes_bad_debt_and_leaves_wallet_untouched() {
-        // Close all at exit value 600 (loss): realised = 100 - 1000 + 600 = -300.
-        // Full close → no remaining margin → entire 300 deficit is bad debt → IF.
+        // Gross PnL is -1000 + 600 = -400. Margin covers 100; remaining 300 is bad debt.
         let mut p = long(10, -1000, 100);
         let mut wallet = 500i64; // free balance that MUST NOT be touched
-        let (opening, bad_debt) =
-            apply_position_fill(&mut p, &mut wallet, 10, 600, 0, 0, false).unwrap();
-        assert_eq!((opening, bad_debt), (0, 300));
+        let outcome = apply_position_fill(&mut p, &mut wallet, 10, 600, 0, 0, false).unwrap();
+        assert_eq!(outcome.opening_margin, 0);
+        assert_eq!(outcome.bad_debt, 300);
+        assert_eq!(outcome.realized_pnl, -400);
         assert_eq!(
             wallet, 500,
             "isolated margin: a position loss never debits the wallet"
@@ -1559,13 +1605,14 @@ mod isolated_margin_tests {
     #[test]
     fn underwater_partial_close_draws_remaining_margin_then_bad_debt() {
         // Close 4 of 10 at exit value 240 (loss). remaining 6.
-        // margin_release=40, vq_fraction=-400, realised=40-400+240=-120 → deficit 120.
+        // Gross PnL is -400 + 240 = -160; released margin 40 leaves a 120 deficit.
         // remaining margin after release = 60; draw all 60; bad_debt = 60.
         let mut p = long(10, -1000, 100);
         let mut wallet = 500i64;
-        let (opening, bad_debt) =
-            apply_position_fill(&mut p, &mut wallet, 4, 240, 0, 0, false).unwrap();
-        assert_eq!((opening, bad_debt), (0, 60));
+        let outcome = apply_position_fill(&mut p, &mut wallet, 4, 240, 0, 0, false).unwrap();
+        assert_eq!(outcome.opening_margin, 0);
+        assert_eq!(outcome.bad_debt, 60);
+        assert_eq!(outcome.realized_pnl, -160);
         assert_eq!(wallet, 500, "wallet untouched");
         assert_eq!(
             p.margin, 0,
@@ -1578,19 +1625,32 @@ mod isolated_margin_tests {
     #[test]
     fn underwater_partial_close_fully_covered_by_remaining_margin() {
         // Close 2 of 10 at exit value 120 (loss). remaining 8.
-        // margin_release=20, vq_fraction=-200, realised=20-200+120=-60 → deficit 60.
+        // Gross PnL is -200 + 120 = -80; released margin 20 leaves a 60 deficit.
         // remaining margin after release = 80; draw 60; bad_debt 0; 20 margin left.
         let mut p = long(10, -1000, 100);
         let mut wallet = 500i64;
-        let (opening, bad_debt) =
-            apply_position_fill(&mut p, &mut wallet, 2, 120, 0, 0, false).unwrap();
-        assert_eq!((opening, bad_debt), (0, 0));
+        let outcome = apply_position_fill(&mut p, &mut wallet, 2, 120, 0, 0, false).unwrap();
+        assert_eq!(outcome.opening_margin, 0);
+        assert_eq!(outcome.bad_debt, 0);
+        assert_eq!(outcome.realized_pnl, -80);
         assert_eq!(wallet, 500, "wallet untouched");
         assert_eq!(
             p.margin, 20,
             "deficit covered by remaining margin; 20 left backing the rest"
         );
         assert_eq!(p.amount, 8);
+    }
+
+    #[test]
+    fn break_even_close_reports_zero_pnl_and_returns_margin() {
+        let mut p = long(10, -1000, 100);
+        let mut wallet = 0i64;
+
+        let outcome = apply_position_fill(&mut p, &mut wallet, 10, 1000, 0, 0, false).unwrap();
+
+        assert_eq!(outcome.realized_pnl, 0);
+        assert_eq!(outcome.bad_debt, 0);
+        assert_eq!(wallet, 100);
     }
 }
 

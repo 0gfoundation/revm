@@ -1,5 +1,5 @@
 use super::*;
-use alloy_sol_types::SolCall;
+use alloy_sol_types::{SolCall, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, Address, FixedBytes, U256};
@@ -46,6 +46,25 @@ fn make_ctx() -> TestCtx {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
     }
     ctx
+}
+
+fn take_position_changes(
+    ctx: &mut TestCtx,
+) -> Vec<crate::perp_dex::interface::IPerpDex::PositionChanged> {
+    JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .filter(|log| {
+            log.data.topics().first()
+                == Some(&crate::perp_dex::interface::IPerpDex::PositionChanged::SIGNATURE_HASH)
+        })
+        .map(|log| {
+            crate::perp_dex::interface::IPerpDex::PositionChanged::decode_raw_log(
+                log.data.topics(),
+                &log.data.data,
+            )
+            .unwrap()
+        })
+        .collect()
 }
 
 /// Register the default BTC-perp market and fund ALICE + BOB with WALLET.
@@ -931,6 +950,14 @@ fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
     place(&mut ctx, CAROL, 1, open_price, QTY, 0, 0);
     place(&mut ctx, ALICE, 0, 0, QTY * 2, 1, 1);
 
+    let position_changes = take_position_changes(&mut ctx);
+    let taker_change = position_changes
+        .iter()
+        .find(|change| change.user == ALICE)
+        .unwrap();
+    assert_eq!(taker_change.realizedPnl, 100_000);
+    assert_eq!(taker_change.closedQuantity, QTY);
+
     assert_eq!(
         pos(&mut ctx, ALICE),
         PerpPosition {
@@ -942,6 +969,36 @@ fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
         }
     );
     assert_eq!(wallet(&mut ctx, ALICE), 0);
+}
+
+#[test]
+fn maker_close_emits_fill_realized_pnl() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    storage::save_position(
+        &mut ctx,
+        BOB,
+        MARKET_ID,
+        &PerpPosition {
+            amount: -(QTY as i64),
+            v_quote_balance: FILL_VALUE as i64,
+            margin: INIT_MARGIN as i64,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+
+    let close_price = PRICE - 10 * TICK;
+    place(&mut ctx, BOB, 0, close_price, QTY, 0, 0);
+    place(&mut ctx, ALICE, 1, close_price, QTY, 0, 0);
+
+    let position_changes = take_position_changes(&mut ctx);
+    let maker_change = position_changes
+        .iter()
+        .find(|change| change.user == BOB)
+        .unwrap();
+    assert_eq!(maker_change.realizedPnl, 100_000);
+    assert_eq!(maker_change.closedQuantity, QTY);
 }
 
 #[test]
