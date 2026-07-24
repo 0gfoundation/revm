@@ -204,48 +204,146 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
 }
 
 #[test]
-fn index_update_reserves_sweep_balance_gas_before_writing_mark() {
+fn index_update_persists_mark_when_liquidation_event_budget_is_unavailable() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
     let _ = JournalTr::take_logs(ctx.journal_mut());
-    let writes_before = ctx.journal_mut().perp_write_count();
     let input = updateIndexPriceCall {
         marketId: MARKET_ID,
         indexPrice: 8_500,
         timestamp: 31,
     }
     .abi_encode();
-    let sweep_event_bound = u64::from(MAX_LIQUIDATIONS_PER_UPDATE + ADL_BUDGET_PER_UPDATE) + 1;
 
-    let err = run_perp_dex_call(
-        &input,
-        50_000 + sweep_event_bound * ACCOUNT_BALANCE_CHANGED_GAS - 1,
+    let output = run_perp_dex_call(&input, 50_000, ADMIN, U256::ZERO, false, &mut ctx).unwrap();
+    assert!(!output.reverted);
+    assert_eq!(output.gas_used, 50_000);
+    assert_eq!(
+        storage::load_index_price_state(&mut ctx, MARKET_ID)
+            .unwrap()
+            .timestamp,
+        30
+    );
+    assert_eq!(
+        storage::load_mark_price(&mut ctx, MARKET_ID).unwrap(),
+        8_500
+    );
+    assert_eq!(position(&mut ctx, ALICE).amount, QTY);
+    assert!(JournalTr::take_logs(ctx.journal_mut()).iter().all(|log| {
+        log.data.topics().first()
+            != Some(&crate::perp_dex::interface::IPerpDex::AccountBalanceChanged::SIGNATURE_HASH)
+    }));
+
+    let retry = updateIndexPriceCall {
+        marketId: MARKET_ID,
+        indexPrice: 8_500,
+        timestamp: 46,
+    }
+    .abi_encode();
+    let output = run_perp_dex_call(&retry, 10_000_000, ADMIN, U256::ZERO, false, &mut ctx).unwrap();
+    assert!(!output.reverted);
+    assert_eq!(output.gas_used, 50_000 + ACCOUNT_BALANCE_CHANGED_GAS);
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+}
+
+#[test]
+fn healthy_index_update_does_not_reserve_for_large_order_book() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    for _ in 0..200 {
+        place_maker_order(&mut ctx, Side::Buy as u8, 100, 1);
+    }
+    assert_eq!(
+        storage::load_bid_count(&mut ctx, MARKET_ID, 100).unwrap(),
+        200
+    );
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let output = run_perp_dex_call(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        50_000,
         ADMIN,
         U256::ZERO,
         false,
         &mut ctx,
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(matches!(err, PrecompileError::OutOfGas));
-    assert_eq!(ctx.journal_mut().perp_write_count(), writes_before);
+    assert!(!output.reverted);
+    assert_eq!(output.gas_used, 50_000);
     assert_eq!(
         storage::load_index_price_state(&mut ctx, MARKET_ID)
             .unwrap()
             .timestamp,
-        0
-    );
-    assert_eq!(
-        storage::load_mark_price(&mut ctx, MARKET_ID).unwrap(),
-        ENTRY_PRICE
+        30
     );
     assert_eq!(position(&mut ctx, ALICE).amount, QTY);
-    assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+}
 
-    let output = run_perp_dex_call(&input, 10_000_000, ADMIN, U256::ZERO, false, &mut ctx).unwrap();
-    assert!(!output.reverted);
-    assert_eq!(output.gas_used, 50_000 + ACCOUNT_BALANCE_CHANGED_GAS);
+#[test]
+fn liquidation_matching_caps_distinct_maker_accounts() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let maker_count = MAX_LIQUIDATION_MAKER_ACCOUNTS + 1;
+    let quantity = u64::try_from(maker_count).unwrap();
+    let entry_value = calc_value(ENTRY_PRICE, quantity, 0, PRICE_DECIMALS).unwrap();
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: i64::try_from(quantity).unwrap(),
+            v_quote_balance: -i64::try_from(entry_value).unwrap(),
+            margin: i64::try_from(entry_value / 5).unwrap(),
+            leverage: 5,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+
+    for index in 0..maker_count {
+        let maker = indexed_maker(index);
+        storage::save_account(
+            &mut ctx,
+            maker,
+            UserAccount {
+                perp_wallet_balance: 200_000_000,
+                ..UserAccount::default()
+            },
+        )
+        .unwrap();
+        place_order(&mut ctx, maker, Side::Buy as u8, LONG_LIQ_PRICE, 1);
+    }
+
+    let market = storage::load_market_ref(&mut ctx, MARKET_ID)
+        .unwrap()
+        .unwrap();
+    let remaining =
+        execute_liquidation_market_order(&mut ctx, ALICE, &market, Side::Sell, quantity).unwrap();
+
+    assert_eq!(remaining, 1);
+    assert_eq!(
+        position(&mut ctx, ALICE).amount,
+        1,
+        "the residual remains for the liquidation residual/ADL path"
+    );
+    assert_eq!(position(&mut ctx, indexed_maker(0)).amount, 1);
+    assert_eq!(
+        position(&mut ctx, indexed_maker(MAX_LIQUIDATION_MAKER_ACCOUNTS)).amount,
+        0,
+        "the first maker beyond the cap must remain untouched"
+    );
+    assert_eq!(
+        storage::load_bid_count(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -753,6 +851,7 @@ fn healthy_candidate_scan_is_write_free_even_with_accrued_funding() {
         ENTRY_PRICE,
         KEEPER,
         &mut adl_budget,
+        false,
     )
     .unwrap();
     assert!(
@@ -1039,6 +1138,13 @@ fn liquidate(ctx: &mut TestCtx, user: Address) -> Result<Bytes, PrecompileError>
 
 fn place_maker_order(ctx: &mut TestCtx, side: u8, price: u64, qty: u64) {
     place_order(ctx, MAKER, side, price, qty);
+}
+
+fn indexed_maker(index: usize) -> Address {
+    let mut bytes = [0u8; 20];
+    bytes[0] = 0x44;
+    bytes[12..].copy_from_slice(&u64::try_from(index).unwrap().to_be_bytes());
+    Address::from(bytes)
 }
 
 fn place_order(ctx: &mut TestCtx, user: Address, side: u8, price: u64, qty: u64) {

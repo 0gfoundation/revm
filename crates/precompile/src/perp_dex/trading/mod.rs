@@ -16,6 +16,12 @@ pub(crate) use liquidation::{
 };
 use settlement::{MakerFillOutcome, TakerSettlement};
 
+/// Maximum distinct maker accounts a single liquidation close may touch.
+///
+/// Any unfilled quantity after reaching the cap follows the existing residual/ADL path. This keeps
+/// the balance after-image count bounded independently of order-book size.
+pub(crate) const MAX_LIQUIDATION_MAKER_ACCOUNTS: usize = 128;
+
 use crate::{
     perp_dex::{
         errors::{perp_err, perp_invariant_err},
@@ -852,8 +858,9 @@ pub(super) fn match_order<CTX: ContextTr>(
     order_type: OrderType,
     tif: TimeInForce,
     market: &crate::perp_dex::types::Market,
-    // When true (liquidation close), the taker pays no trading fee.
-    waive_taker_fee: bool,
+    // When true, this is a liquidation close: the taker fee is waived and the number of distinct
+    // maker accounts is capped so balance after-image gas has a fixed pre-write upper bound.
+    liquidation_close: bool,
     // When true (GTC), the caller will rest the unmatched remainder — so the rest's margin is
     // pre-validated atomically with the fills (commit-only #23 atomic-reject).
     rest_remainder: bool,
@@ -865,7 +872,7 @@ pub(super) fn match_order<CTX: ContextTr>(
     let mut remaining = quantity;
     let mut last_trade_price = None;
     let mut taker_settlement =
-        TakerSettlement::load(context, taker_addr, market_id, waive_taker_fee)?;
+        TakerSettlement::load(context, taker_addr, market_id, liquidation_close)?;
     // commit-only #23 L1: per-user working copies for this match. Each touched maker is loaded
     // once (funding settled at first touch, exactly where the first per-maker settle did it) and
     // saved once at the flush below — same write-key set and net values as the old per-fill saves.
@@ -971,6 +978,26 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let fill_qty = remaining.min(available);
 
                     let maker_addr = Address::from(maker_order.owner);
+                    if liquidation_close
+                        && registry
+                            .would_exceed_user_limit(maker_addr, MAX_LIQUIDATION_MAKER_ACCOUNTS)
+                    {
+                        new_queue.push(maker_id);
+                        new_queue.extend(queue[qi..].iter().copied());
+                        let count_new = count_old.saturating_sub(level_removed);
+                        if count_new == 0 {
+                            return Err(perp_invariant_err(
+                                "liquidation maker cap reached with zero live level count",
+                            ));
+                        }
+                        registry.push_event(settlement::MatchEvent::SaveLevel {
+                            is_bid: false,
+                            price: ask_price,
+                            queue: new_queue,
+                            count: count_new,
+                        });
+                        break 'outer;
+                    }
                     // Maker open-solvency guard (K9): settle the maker first. If filling
                     // it would open its position below maintenance at mark, cancel the
                     // maker order (drop it from this level by not re-queuing) and skip —
@@ -1184,6 +1211,26 @@ pub(super) fn match_order<CTX: ContextTr>(
                     let fill_qty = remaining.min(available);
 
                     let maker_addr = Address::from(maker_order.owner);
+                    if liquidation_close
+                        && registry
+                            .would_exceed_user_limit(maker_addr, MAX_LIQUIDATION_MAKER_ACCOUNTS)
+                    {
+                        new_queue.push(maker_id);
+                        new_queue.extend(queue[qi..].iter().copied());
+                        let count_new = count_old.saturating_sub(level_removed);
+                        if count_new == 0 {
+                            return Err(perp_invariant_err(
+                                "liquidation maker cap reached with zero live level count",
+                            ));
+                        }
+                        registry.push_event(settlement::MatchEvent::SaveLevel {
+                            is_bid: true,
+                            price: bid_price,
+                            queue: new_queue,
+                            count: count_new,
+                        });
+                        break 'outer;
+                    }
                     // Maker open-solvency guard (K9) — see the mirror on the Buy side.
                     let maker_fee = match settlement::settle_maker_fill_registry(
                         context,

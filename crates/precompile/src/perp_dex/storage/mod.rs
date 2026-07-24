@@ -512,6 +512,11 @@ pub fn reserve_balance_events<CTX: ContextTr>(
     typed_store_mut(context).reserve_balance_events(required_events)
 }
 
+/// Returns the number of distinct accounts already changed by the current top-level call.
+pub fn tracked_balance_account_count<CTX: ContextTr>(context: &mut CTX) -> u64 {
+    typed_store_mut(context).tracked_balance_account_count()
+}
+
 /// Finishes balance tracking and returns initial balances in deterministic address order.
 pub fn take_balance_tracking<CTX: ContextTr>(
     context: &mut CTX,

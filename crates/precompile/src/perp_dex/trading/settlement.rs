@@ -499,6 +499,10 @@ impl MatchRegistry {
         self.events.push(e);
     }
 
+    pub(super) fn would_exceed_user_limit(&self, user: Address, limit: usize) -> bool {
+        self.users.len() >= limit && self.users.iter().all(|(address, _)| *address != user)
+    }
+
     pub(super) fn balance_event_upper_bound(
         &self,
         include_taker_fee_recipient: bool,

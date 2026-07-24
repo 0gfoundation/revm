@@ -8,7 +8,7 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 
 use crate::{
     perp_dex::{
-        errors::{perp_err, perp_invariant_err},
+        errors::{perp_err, perp_fatal_invariant_err},
         funding::{apply_funding_settlement, compute_funding_settlement},
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
@@ -28,6 +28,7 @@ use crate::{
         trading::{
             check_api_key_expiry, check_recv_window, execute_liquidation_market_order, run_adl,
             settle_liquidation_residual_at_mark_price, verify_ed25519,
+            MAX_LIQUIDATION_MAKER_ACCOUNTS,
         },
         types::{FundingState, IndexPriceState, Market, PremiumIndexAccumulator, Side},
         PERP_DEX_ADDRESS,
@@ -608,6 +609,8 @@ pub(crate) enum LiquidationOutcome {
     NoPosition,
     /// Position is at or above the maintenance-margin threshold — not liquidatable.
     AboveMaintenance,
+    /// The oracle call did not fund the bounded account set for another liquidation.
+    DeferredBalanceEventGas,
 }
 
 /// Core liquidation logic, shared by the manual `liquidate` entry point
@@ -632,6 +635,7 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     mark_price: u64,
     liquidator: Address,
     adl_budget: &mut u32,
+    defer_on_balance_event_oog: bool,
 ) -> Result<LiquidationOutcome, PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
 
@@ -670,7 +674,9 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     };
     let liquidation_quantity = pos.amount.unsigned_abs();
     let pre_liq_margin = pos.margin.max(0) as u64;
-    reserve_liquidation_balance_events(context, market_id, Some(liquidation_side.opposite()))?;
+    if !reserve_liquidation_balance_events(context, *adl_budget, defer_on_balance_event_oog)? {
+        return Ok(LiquidationOutcome::DeferredBalanceEventGas);
+    }
 
     // ── APPLY (liquidatable — commit the funding settle, then close) ──
     if let Some(p) = pending_funding {
@@ -803,12 +809,16 @@ pub fn run_liquidate<CTX: ContextTr>(
         mark_price,
         caller,
         &mut adl_budget,
+        false,
     )? {
         LiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
         LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
         LiquidationOutcome::AboveMaintenance => {
             Err(perp_err("liquidate: position is above maintenance margin"))
         }
+        LiquidationOutcome::DeferredBalanceEventGas => Err(perp_fatal_invariant_err(
+            "manual liquidation unexpectedly deferred for balance event gas",
+        )),
     }
 }
 
@@ -833,60 +843,35 @@ const MAX_LIQUIDATIONS_PER_UPDATE: u32 = 50;
 /// side's offsetting gains persist).
 const ADL_BUDGET_PER_UPDATE: u32 = 128;
 
-fn reserve_live_order_balance_events<CTX: ContextTr>(
-    context: &mut CTX,
-    market_id: u64,
-    side: Side,
-    mut required_events: u64,
-) -> Result<u64, PrecompileError> {
-    let prices = match side {
-        Side::Buy => storage::load_bid_prices_ref(context, market_id)?,
-        Side::Sell => storage::load_ask_prices_ref(context, market_id)?,
-    };
-    for price in prices.iter().copied() {
-        let level_count = match side {
-            Side::Buy => storage::load_bid_level_arc(context, market_id, price)?.count,
-            Side::Sell => storage::load_ask_level_arc(context, market_id, price)?.count,
-        };
-        required_events = required_events
-            .checked_add(level_count)
-            .ok_or_else(|| perp_invariant_err("liquidation live order count overflow"))?;
-        storage::reserve_balance_events(context, required_events)?;
-    }
-    Ok(required_events)
-}
-
-/// Reserves a safe pre-write upper bound for balance changes during liquidation.
+/// Reserves the bounded account set that one liquidation can change.
 ///
-/// Each live maker order can introduce at most one distinct account; ADL is capped globally per
-/// call; liquidated users and the fee recipient contribute the remaining fixed terms. Duplicate
-/// users deliberately over-reserve. Reserving after each level also bounds the amount of new
-/// order-book scanning performed by the event gas supplied to the call.
+/// The matcher enforces [`MAX_LIQUIDATION_MAKER_ACCOUNTS`], ADL already consumes a shared capped
+/// budget, and the two fixed slots cover the liquidated user and fee recipient. Accounts changed by
+/// earlier sweep candidates are included so their reservations cannot be reused by later users.
+/// Sweep callers defer the next liquidation when this bound does not fit; manual callers return
+/// out-of-gas before their first write.
 fn reserve_liquidation_balance_events<CTX: ContextTr>(
     context: &mut CTX,
-    market_id: u64,
-    matching_side: Option<Side>,
-) -> Result<(), PrecompileError> {
-    let liquidated_users = if matching_side.is_some() {
-        1
-    } else {
-        u64::from(MAX_LIQUIDATIONS_PER_UPDATE)
-    };
-    let required_events = liquidated_users
-        .checked_add(u64::from(ADL_BUDGET_PER_UPDATE))
+    adl_budget: u32,
+    defer_on_out_of_gas: bool,
+) -> Result<bool, PrecompileError> {
+    let maker_accounts = u64::try_from(MAX_LIQUIDATION_MAKER_ACCOUNTS)
+        .map_err(|_| perp_fatal_invariant_err("liquidation maker account cap exceeds u64"))?;
+    let candidate_bound = 1u64
+        .checked_add(maker_accounts)
+        .and_then(|count| count.checked_add(u64::from(adl_budget)))
         .and_then(|count| count.checked_add(1))
-        .ok_or_else(|| perp_invariant_err("liquidation balance event bound overflow"))?;
-    storage::reserve_balance_events(context, required_events)?;
-
-    let required_events = match matching_side {
-        Some(side) => reserve_live_order_balance_events(context, market_id, side, required_events)?,
-        None => {
-            let required_events =
-                reserve_live_order_balance_events(context, market_id, Side::Buy, required_events)?;
-            reserve_live_order_balance_events(context, market_id, Side::Sell, required_events)?
-        }
-    };
-    storage::reserve_balance_events(context, required_events)
+        .ok_or_else(|| perp_fatal_invariant_err("liquidation balance event bound overflow"))?;
+    let required_events = storage::tracked_balance_account_count(context)
+        .checked_add(candidate_bound)
+        .ok_or_else(|| {
+            perp_fatal_invariant_err("cumulative liquidation balance event bound overflow")
+        })?;
+    match storage::reserve_balance_events(context, required_events) {
+        Ok(()) => Ok(true),
+        Err(PrecompileError::OutOfGas) if defer_on_out_of_gas => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Protocol-automatic liquidation sweep, run synchronously at the tail of
@@ -897,13 +882,11 @@ fn reserve_liquidation_balance_events<CTX: ContextTr>(
 ///
 /// Each candidate is attempted under its own journal checkpoint:
 /// - `Liquidated` → commit the writes;
-/// - healthy / stale (`AboveMaintenance` / `NoPosition`) or a per-account `Err`
-///   → revert (the sweep leaves no trace for that candidate).
+/// - healthy / stale (`AboveMaintenance` / `NoPosition`) → revert (the sweep leaves no trace);
+/// - `DeferredBalanceEventGas` → revert the candidate and stop, retaining the oracle update.
 ///
-/// A single candidate's error is NEVER propagated — that would revert the whole
-/// price update and the other liquidations. No event is emitted on error (a
-/// node-local DB error must not diverge the event set; a divergent commitment
-/// fail-fasts the faulty node instead).
+/// Any other error after the liquidatability check is a commit-only invariant failure and aborts
+/// the node rather than allowing a partial write set.
 fn run_liquidation_sweep<CTX: ContextTr>(
     context: &mut CTX,
     market_id: u64,
@@ -936,10 +919,15 @@ fn run_liquidation_sweep<CTX: ContextTr>(
             mark_price,
             Address::ZERO,
             &mut adl_budget,
+            true,
         ) {
             Ok(LiquidationOutcome::Liquidated { .. }) => {
                 context.journal_mut().checkpoint_commit();
                 liquidated += 1;
+            }
+            Ok(LiquidationOutcome::DeferredBalanceEventGas) => {
+                context.journal_mut().checkpoint_revert(cp);
+                break;
             }
             Ok(_) => {
                 // AboveMaintenance / NoPosition: zero perp writes were made.
@@ -1436,11 +1424,6 @@ pub fn run_update_index_price<CTX: ContextTr>(
     } else {
         raw_mark.min(market.max_price).max(1)
     };
-
-    let sweep_candidates = storage::load_position_registry(context, args.marketId)?;
-    if !sweep_candidates.is_empty() {
-        reserve_liquidation_balance_events(context, args.marketId, None)?;
-    }
 
     // ── 4. Persist index price + mark price ──────────────────────────────────
     storage::save_index_price_state(

@@ -159,6 +159,13 @@ impl TypedPerpStore {
         Ok(())
     }
 
+    /// Returns the number of distinct accounts already changed by the current top-level call.
+    pub fn tracked_balance_account_count(&self) -> u64 {
+        self.balance_tracking
+            .as_ref()
+            .map_or(0, |tracking| tracking.initial.len() as u64)
+    }
+
     /// Records the first public balance for an account after its event gas was reserved.
     pub fn track_initial_balance(
         &mut self,
