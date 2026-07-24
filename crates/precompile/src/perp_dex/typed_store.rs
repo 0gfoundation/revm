@@ -94,6 +94,42 @@ struct BalanceTracking {
     initial: BTreeMap<Address, PublicAccountBalance>,
 }
 
+impl BalanceTracking {
+    fn new(max_events: u64) -> Self {
+        Self {
+            max_events,
+            reserved_events: 0,
+            initial: BTreeMap::new(),
+        }
+    }
+
+    fn reserve(&mut self, required_events: u64) -> Result<(), PrecompileError> {
+        if required_events > self.max_events {
+            return Err(PrecompileError::OutOfGas);
+        }
+        self.reserved_events = self.reserved_events.max(required_events);
+        Ok(())
+    }
+
+    fn account_count(&self) -> u64 {
+        self.initial.len() as u64
+    }
+
+    fn record(
+        &mut self,
+        user: Address,
+        balance: PublicAccountBalance,
+    ) -> Result<(), PrecompileError> {
+        if !self.initial.contains_key(&user) && self.account_count() >= self.reserved_events {
+            return Err(perp_fatal_invariant_err(
+                "account balance changed without reserved event gas",
+            ));
+        }
+        self.initial.entry(user).or_insert(balance);
+        Ok(())
+    }
+}
+
 /// Strongly-typed off-trie store (Stage A). See the module docs.
 ///
 /// Sub-maps hold `Arc<T>`, not owned `T` — this is what keeps every current perf property when the
@@ -141,20 +177,13 @@ pub struct TypedPerpStore {
 impl TypedPerpStore {
     /// Starts top-level balance tracking with the event capacity funded by the call's gas limit.
     pub fn begin_balance_tracking(&mut self, max_events: u64) {
-        self.balance_tracking = Some(BalanceTracking {
-            max_events,
-            reserved_events: 0,
-            initial: BTreeMap::new(),
-        });
+        self.balance_tracking = Some(BalanceTracking::new(max_events));
     }
 
     /// Reserves capacity for a pre-write upper bound of balance after-images.
     pub fn reserve_balance_events(&mut self, required_events: u64) -> Result<(), PrecompileError> {
         if let Some(tracking) = self.balance_tracking.as_mut() {
-            if required_events > tracking.max_events {
-                return Err(PrecompileError::OutOfGas);
-            }
-            tracking.reserved_events = tracking.reserved_events.max(required_events);
+            tracking.reserve(required_events)?;
         }
         Ok(())
     }
@@ -163,7 +192,7 @@ impl TypedPerpStore {
     pub fn tracked_balance_account_count(&self) -> u64 {
         self.balance_tracking
             .as_ref()
-            .map_or(0, |tracking| tracking.initial.len() as u64)
+            .map_or(0, BalanceTracking::account_count)
     }
 
     /// Records the first public balance for an account after its event gas was reserved.
@@ -173,14 +202,7 @@ impl TypedPerpStore {
         balance: PublicAccountBalance,
     ) -> Result<(), PrecompileError> {
         if let Some(tracking) = self.balance_tracking.as_mut() {
-            if !tracking.initial.contains_key(&user)
-                && tracking.initial.len() as u64 >= tracking.reserved_events
-            {
-                return Err(perp_fatal_invariant_err(
-                    "account balance changed without reserved event gas",
-                ));
-            }
-            tracking.initial.entry(user).or_insert(balance);
+            tracking.record(user, balance)?;
         }
         Ok(())
     }

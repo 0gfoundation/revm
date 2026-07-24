@@ -613,6 +613,15 @@ pub(crate) enum LiquidationOutcome {
     DeferredBalanceEventGas,
 }
 
+/// Controls how liquidation handles insufficient gas for balance after-images.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BalanceEventGasPolicy {
+    /// Propagate the reservation failure before any liquidation writes.
+    Require,
+    /// Defer the liquidation so an oracle update can continue.
+    Defer,
+}
+
 /// Core liquidation logic, shared by the manual `liquidate` entry point
 /// (`run_liquidate`) and the protocol-automatic sweep (inside
 /// `run_update_index_price`). The caller must already hold the loaded `market`
@@ -635,7 +644,7 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     mark_price: u64,
     liquidator: Address,
     adl_budget: &mut u32,
-    defer_on_balance_event_oog: bool,
+    balance_event_gas_policy: BalanceEventGasPolicy,
 ) -> Result<LiquidationOutcome, PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
 
@@ -674,7 +683,7 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     };
     let liquidation_quantity = pos.amount.unsigned_abs();
     let pre_liq_margin = pos.margin.max(0) as u64;
-    if !reserve_liquidation_balance_events(context, *adl_budget, defer_on_balance_event_oog)? {
+    if !reserve_liquidation_balance_events(context, *adl_budget, balance_event_gas_policy)? {
         return Ok(LiquidationOutcome::DeferredBalanceEventGas);
     }
 
@@ -809,7 +818,7 @@ pub fn run_liquidate<CTX: ContextTr>(
         mark_price,
         caller,
         &mut adl_budget,
-        false,
+        BalanceEventGasPolicy::Require,
     )? {
         LiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
         LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
@@ -853,7 +862,7 @@ const ADL_BUDGET_PER_UPDATE: u32 = 128;
 fn reserve_liquidation_balance_events<CTX: ContextTr>(
     context: &mut CTX,
     adl_budget: u32,
-    defer_on_out_of_gas: bool,
+    policy: BalanceEventGasPolicy,
 ) -> Result<bool, PrecompileError> {
     let maker_accounts = u64::try_from(MAX_LIQUIDATION_MAKER_ACCOUNTS)
         .map_err(|_| perp_fatal_invariant_err("liquidation maker account cap exceeds u64"))?;
@@ -869,7 +878,7 @@ fn reserve_liquidation_balance_events<CTX: ContextTr>(
         })?;
     match storage::reserve_balance_events(context, required_events) {
         Ok(()) => Ok(true),
-        Err(PrecompileError::OutOfGas) if defer_on_out_of_gas => Ok(false),
+        Err(PrecompileError::OutOfGas) if policy == BalanceEventGasPolicy::Defer => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -919,7 +928,7 @@ fn run_liquidation_sweep<CTX: ContextTr>(
             mark_price,
             Address::ZERO,
             &mut adl_budget,
-            true,
+            BalanceEventGasPolicy::Defer,
         ) {
             Ok(LiquidationOutcome::Liquidated { .. }) => {
                 context.journal_mut().checkpoint_commit();

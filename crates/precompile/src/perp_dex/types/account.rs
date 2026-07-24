@@ -63,8 +63,11 @@ impl Default for UserAccount {
 /// Public account values emitted by the precompile and returned by `getAccount`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PublicAccountBalance {
+    /// Spot USDC held inside the DEX.
     pub usdc_balance: U256,
+    /// Total perp collateral excluding unrealized PnL.
     pub total_perp_collateral: U256,
+    /// Perp collateral currently available for trading or transfer.
     pub available_perp_balance: u64,
 }
 
@@ -87,6 +90,7 @@ impl UserAccount {
             .unwrap_or_default()
     }
 
+    /// Returns the clamped public balance after-image for this account.
     pub fn public_balance(&self) -> PublicAccountBalance {
         PublicAccountBalance {
             usdc_balance: self.usdc_balance.clone().into(),

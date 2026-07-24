@@ -430,24 +430,55 @@ pub fn load_account_ref<CTX: ContextTr>(
         .unwrap_or_else(|| std::sync::Arc::new(UserAccount::default())))
 }
 
+#[derive(Clone, Copy)]
+struct AccountBalanceBaseline {
+    available_wallet: i64,
+    total_collateral: i128,
+    public: PublicAccountBalance,
+}
+
+impl AccountBalanceBaseline {
+    fn capture(account: &UserAccount) -> Self {
+        Self {
+            available_wallet: account.perp_wallet_balance,
+            total_collateral: account.total_perp_collateral,
+            public: account.public_balance(),
+        }
+    }
+
+    fn reconcile(self, account: &mut UserAccount) -> Result<PublicAccountBalance, PrecompileError> {
+        let wallet_delta = i128::from(account.perp_wallet_balance)
+            .checked_sub(i128::from(self.available_wallet))
+            .ok_or_else(|| perp_fatal_invariant_err("account wallet delta overflow"))?;
+        account.total_perp_collateral = self
+            .total_collateral
+            .checked_add(wallet_delta)
+            .ok_or_else(|| perp_fatal_invariant_err("account total collateral overflow"))?;
+        Ok(account.public_balance())
+    }
+}
+
+fn track_public_balance_change<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    initial: PublicAccountBalance,
+    final_balance: PublicAccountBalance,
+) -> Result<(), PrecompileError> {
+    if initial != final_balance {
+        typed_store_mut(context).track_initial_balance(user, initial)?;
+    }
+    Ok(())
+}
+
 pub fn save_account<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     mut account: UserAccount,
 ) -> Result<(), PrecompileError> {
     let old = load_account_ref(context, user)?;
-    let wallet_delta = i128::from(account.perp_wallet_balance)
-        .checked_sub(i128::from(old.perp_wallet_balance))
-        .ok_or_else(|| perp_fatal_invariant_err("account wallet delta overflow"))?;
-    account.total_perp_collateral = old
-        .total_perp_collateral
-        .checked_add(wallet_delta)
-        .ok_or_else(|| perp_fatal_invariant_err("account total collateral overflow"))?;
-    let old_public = old.public_balance();
-    let new_public = account.public_balance();
-    if old_public != new_public {
-        typed_store_mut(context).track_initial_balance(user, old_public)?;
-    }
+    let baseline = AccountBalanceBaseline::capture(&old);
+    let new_public = baseline.reconcile(&mut account)?;
+    track_public_balance_change(context, user, baseline.public, new_public)?;
     typed_store_mut(context).set_account(user, account);
     Ok(())
 }
@@ -465,37 +496,23 @@ pub fn mutate_account<CTX: ContextTr, R>(
     f: impl FnOnce(&mut UserAccount) -> R,
 ) -> Result<R, PrecompileError> {
     let old = load_account_ref(context, user)?;
-    let old_wallet = old.perp_wallet_balance;
-    let old_total = old.total_perp_collateral;
-    let old_public = old.public_balance();
+    let baseline = AccountBalanceBaseline::capture(&old);
+    drop(old);
 
     // Fast path: resident in the typed store → in-place &mut (CoW lift on first write).
     let (r, new_public) = if let Some(a) = typed_store_mut(context).account_mut(user) {
         let r = f(a);
-        let wallet_delta = i128::from(a.perp_wallet_balance)
-            .checked_sub(i128::from(old_wallet))
-            .ok_or_else(|| perp_fatal_invariant_err("account wallet delta overflow"))?;
-        a.total_perp_collateral = old_total
-            .checked_add(wallet_delta)
-            .ok_or_else(|| perp_fatal_invariant_err("account total collateral overflow"))?;
-        (r, a.public_balance())
+        let new_public = baseline.reconcile(a)?;
+        (r, new_public)
     } else {
-        // Cold/deleted: materialize once (fills the store), mutate, store the result.
-        let mut a = (*old).clone();
+        // Deleted/absent fallback: materialize the default, mutate, and store it.
+        let mut a = load_account(context, user)?;
         let r = f(&mut a);
-        let wallet_delta = i128::from(a.perp_wallet_balance)
-            .checked_sub(i128::from(old_wallet))
-            .ok_or_else(|| perp_fatal_invariant_err("account wallet delta overflow"))?;
-        a.total_perp_collateral = old_total
-            .checked_add(wallet_delta)
-            .ok_or_else(|| perp_fatal_invariant_err("account total collateral overflow"))?;
-        let new_public = a.public_balance();
+        let new_public = baseline.reconcile(&mut a)?;
         typed_store_mut(context).set_account(user, a);
         (r, new_public)
     };
-    if old_public != new_public {
-        typed_store_mut(context).track_initial_balance(user, old_public)?;
-    }
+    track_public_balance_change(context, user, baseline.public, new_public)?;
     Ok(r)
 }
 
@@ -544,9 +561,7 @@ fn adjust_total_perp_collateral<CTX: ContextTr>(
             perp_fatal_invariant_err("account total collateral overflow from position")
         })?;
     let new_public = account.public_balance();
-    if old_public != new_public {
-        typed_store_mut(context).track_initial_balance(user, old_public)?;
-    }
+    track_public_balance_change(context, user, old_public, new_public)?;
     typed_store_mut(context).set_account(user, account);
     Ok(())
 }
@@ -692,6 +707,13 @@ pub fn load_position_ref<CTX: ContextTr>(
         .unwrap_or_else(|| std::sync::Arc::new(PerpPosition::default())))
 }
 
+fn position_collateral_allocation(position: &PerpPosition) -> Result<i128, PrecompileError> {
+    i128::from(position.margin)
+        .checked_add(i128::from(position.margin_reserved))
+        .and_then(|value| value.checked_add(i128::from(position.fee_reserved)))
+        .ok_or_else(|| perp_fatal_invariant_err("position collateral allocation overflow"))
+}
+
 pub fn save_position<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
@@ -705,14 +727,8 @@ pub fn save_position<CTX: ContextTr>(
     // typed-sub-map-cheap position read (the position is already resident).
     let old_position = load_position_ref(context, user, market_id)?;
     let old_amount = old_position.amount;
-    let allocation = |position: &PerpPosition| {
-        i128::from(position.margin)
-            .checked_add(i128::from(position.margin_reserved))
-            .and_then(|value| value.checked_add(i128::from(position.fee_reserved)))
-            .ok_or_else(|| perp_fatal_invariant_err("position collateral allocation overflow"))
-    };
-    let allocation_delta = allocation(pos)?
-        .checked_sub(allocation(old_position.as_ref())?)
+    let allocation_delta = position_collateral_allocation(pos)?
+        .checked_sub(position_collateral_allocation(old_position.as_ref())?)
         .ok_or_else(|| perp_fatal_invariant_err("position collateral delta overflow"))?;
 
     if old_amount == 0 && pos.amount != 0 {

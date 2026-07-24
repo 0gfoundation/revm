@@ -183,6 +183,49 @@ fn encode_revert_string(msg: &str) -> primitives::Bytes {
     primitives::Bytes::from(data)
 }
 
+fn emit_account_balance_after_images<CTX: ContextTr>(
+    base_gas_used: u64,
+    gas_limit: u64,
+    context: &mut CTX,
+) -> Result<u64, PrecompileError> {
+    let initial_balances = storage::take_balance_tracking(context);
+    let mut changed_balances = Vec::with_capacity(initial_balances.len());
+    for (user, initial) in initial_balances {
+        let final_balance = storage::load_account_ref(context, user)?.public_balance();
+        if final_balance != initial {
+            changed_balances.push((user, final_balance));
+        }
+    }
+
+    let balance_event_count = u64::try_from(changed_balances.len())
+        .map_err(|_| errors::perp_fatal_invariant_err("account balance event count overflow"))?;
+    let balance_event_gas = balance_event_count
+        .checked_mul(ACCOUNT_BALANCE_CHANGED_GAS)
+        .ok_or_else(|| errors::perp_fatal_invariant_err("account balance event gas overflow"))?;
+    let gas_used = base_gas_used
+        .checked_add(balance_event_gas)
+        .ok_or_else(|| errors::perp_fatal_invariant_err("perpdex total gas overflow"))?;
+    if gas_used > gas_limit {
+        return Err(errors::perp_fatal_invariant_err(
+            "account balance events exceeded reserved gas",
+        ));
+    }
+
+    for (user, final_balance) in changed_balances {
+        context.journal_mut().log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::AccountBalanceChanged {
+                user,
+                usdcBalance: final_balance.usdc_balance,
+                perpWalletBalance: final_balance.total_perp_collateral,
+                availablePerpBalance: final_balance.available_perp_balance,
+            }
+            .to_log_data(),
+        });
+    }
+    Ok(gas_used)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn run_perp_dex_call<CTX: ContextTr>(
@@ -320,77 +363,43 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
 
     match result {
         Ok(bytes) => {
-            let initial_balances = storage::take_balance_tracking(context);
-            let mut changed_balances = Vec::with_capacity(initial_balances.len());
-            for (user, initial) in initial_balances {
-                let final_balance = storage::load_account_ref(context, user)?.public_balance();
-                if final_balance == initial {
-                    continue;
-                }
-                changed_balances.push((user, final_balance));
-            }
-            let balance_event_count = u64::try_from(changed_balances.len()).map_err(|_| {
-                errors::perp_fatal_invariant_err("account balance event count overflow")
-            })?;
-            let balance_event_gas = balance_event_count
-                .checked_mul(ACCOUNT_BALANCE_CHANGED_GAS)
-                .ok_or_else(|| {
-                    errors::perp_fatal_invariant_err("account balance event gas overflow")
-                })?;
-            let gas_used = base_gas_used
-                .checked_add(balance_event_gas)
-                .ok_or_else(|| errors::perp_fatal_invariant_err("perpdex total gas overflow"))?;
-            if gas_used > gas_limit {
-                return Err(errors::perp_fatal_invariant_err(
-                    "account balance events exceeded reserved gas",
-                ));
-            }
-            for (user, final_balance) in changed_balances {
-                context.journal_mut().log(Log {
-                    address: PERP_DEX_ADDRESS,
-                    data: IPerpDex::AccountBalanceChanged {
-                        user,
-                        usdcBalance: final_balance.usdc_balance,
-                        perpWalletBalance: final_balance.total_perp_collateral,
-                        availablePerpBalance: final_balance.available_perp_balance,
-                    }
-                    .to_log_data(),
-                });
-            }
+            let gas_used = emit_account_balance_after_images(base_gas_used, gas_limit, context)?;
             Ok(PrecompileOutput::new(gas_used, bytes))
         }
-        Err(PrecompileError::OutOfGas) => {
+        Err(error) => {
             storage::discard_balance_tracking(context);
-            if context.journal_mut().perp_write_count() != writes_before {
-                return Err(errors::perp_fatal_invariant_err(
-                    "account balance event gas exhausted after perpdex writes",
-                ));
+            match error {
+                PrecompileError::OutOfGas => {
+                    if context.journal_mut().perp_write_count() != writes_before {
+                        return Err(errors::perp_fatal_invariant_err(
+                            "account balance event gas exhausted after perpdex writes",
+                        ));
+                    }
+                    Err(PrecompileError::OutOfGas)
+                }
+                // Fatal errors propagate as-is (storage / system bugs).
+                PrecompileError::Fatal(error) => Err(PrecompileError::Fatal(error)),
+                // All other errors become a clean REVERT with an ABI-encoded reason
+                // string, so ethers.js exposes `e.reason` to the caller.
+                error => {
+                    // Tripwire: a reverting call that WROTE the overlay is a residual
+                    // write-then-error (commit-only #23 — the write leaks with no undo). Record the
+                    // offending selector + count into a global so the exact path can be surfaced
+                    // (read via [`last_perp_write_then_revert`]); diagnostic only, not a halt.
+                    let writes_after = context.journal_mut().perp_write_count();
+                    if writes_after != writes_before {
+                        let sel = u32::from_be_bytes(selector);
+                        LAST_WRITE_THEN_REVERT_SELECTOR
+                            .store(sel, core::sync::atomic::Ordering::Relaxed);
+                        PERP_WRITE_THEN_REVERT_COUNT
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(PrecompileOutput::new_reverted(
+                        base_gas_used,
+                        encode_revert_string(&error.to_string()),
+                    ))
+                }
             }
-            Err(PrecompileError::OutOfGas)
-        }
-        // Fatal errors propagate as-is (storage / system bugs).
-        Err(PrecompileError::Fatal(e)) => {
-            storage::discard_balance_tracking(context);
-            Err(PrecompileError::Fatal(e))
-        }
-        // All other errors become a clean REVERT with an ABI-encoded reason
-        // string, so ethers.js exposes `e.reason` to the caller.
-        Err(e) => {
-            storage::discard_balance_tracking(context);
-            // Tripwire: a reverting call that WROTE the overlay is a residual write-then-error
-            // (commit-only #23 — the write leaks with no undo). Record the offending selector +
-            // count into a global so the exact path can be surfaced (read via
-            // [`last_perp_write_then_revert`]); diagnostic only, not a halt.
-            let writes_after = context.journal_mut().perp_write_count();
-            if writes_after != writes_before {
-                let sel = u32::from_be_bytes(selector);
-                LAST_WRITE_THEN_REVERT_SELECTOR.store(sel, core::sync::atomic::Ordering::Relaxed);
-                PERP_WRITE_THEN_REVERT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(PrecompileOutput::new_reverted(
-                base_gas_used,
-                encode_revert_string(&e.to_string()),
-            ))
         }
     }
 }

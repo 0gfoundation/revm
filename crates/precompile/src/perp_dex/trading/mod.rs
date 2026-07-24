@@ -979,23 +979,12 @@ pub(super) fn match_order<CTX: ContextTr>(
 
                     let maker_addr = Address::from(maker_order.owner);
                     if liquidation_close
-                        && registry
-                            .would_exceed_user_limit(maker_addr, MAX_LIQUIDATION_MAKER_ACCOUNTS)
+                        && !registry.can_touch_user(maker_addr, MAX_LIQUIDATION_MAKER_ACCOUNTS)
                     {
                         new_queue.push(maker_id);
                         new_queue.extend(queue[qi..].iter().copied());
                         let count_new = count_old.saturating_sub(level_removed);
-                        if count_new == 0 {
-                            return Err(perp_invariant_err(
-                                "liquidation maker cap reached with zero live level count",
-                            ));
-                        }
-                        registry.push_event(settlement::MatchEvent::SaveLevel {
-                            is_bid: false,
-                            price: ask_price,
-                            queue: new_queue,
-                            count: count_new,
-                        });
+                        registry.defer_maker_level(false, ask_price, new_queue, count_new)?;
                         break 'outer;
                     }
                     // Maker open-solvency guard (K9): settle the maker first. If filling
@@ -1212,23 +1201,12 @@ pub(super) fn match_order<CTX: ContextTr>(
 
                     let maker_addr = Address::from(maker_order.owner);
                     if liquidation_close
-                        && registry
-                            .would_exceed_user_limit(maker_addr, MAX_LIQUIDATION_MAKER_ACCOUNTS)
+                        && !registry.can_touch_user(maker_addr, MAX_LIQUIDATION_MAKER_ACCOUNTS)
                     {
                         new_queue.push(maker_id);
                         new_queue.extend(queue[qi..].iter().copied());
                         let count_new = count_old.saturating_sub(level_removed);
-                        if count_new == 0 {
-                            return Err(perp_invariant_err(
-                                "liquidation maker cap reached with zero live level count",
-                            ));
-                        }
-                        registry.push_event(settlement::MatchEvent::SaveLevel {
-                            is_bid: true,
-                            price: bid_price,
-                            queue: new_queue,
-                            count: count_new,
-                        });
+                        registry.defer_maker_level(true, bid_price, new_queue, count_new)?;
                         break 'outer;
                     }
                     // Maker open-solvency guard (K9) — see the mirror on the Buy side.

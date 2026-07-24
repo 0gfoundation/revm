@@ -851,7 +851,7 @@ fn healthy_candidate_scan_is_write_free_even_with_accrued_funding() {
         ENTRY_PRICE,
         KEEPER,
         &mut adl_budget,
-        false,
+        BalanceEventGasPolicy::Require,
     )
     .unwrap();
     assert!(

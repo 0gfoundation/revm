@@ -499,8 +499,29 @@ impl MatchRegistry {
         self.events.push(e);
     }
 
-    pub(super) fn would_exceed_user_limit(&self, user: Address, limit: usize) -> bool {
-        self.users.len() >= limit && self.users.iter().all(|(address, _)| *address != user)
+    pub(super) fn can_touch_user(&self, user: Address, limit: usize) -> bool {
+        self.users.len() < limit || self.users.iter().any(|(address, _)| *address == user)
+    }
+
+    pub(super) fn defer_maker_level(
+        &mut self,
+        is_bid: bool,
+        price: u64,
+        queue: Vec<[u8; 32]>,
+        count: u64,
+    ) -> Result<(), PrecompileError> {
+        if count == 0 {
+            return Err(perp_invariant_err(
+                "liquidation maker cap reached with zero live level count",
+            ));
+        }
+        self.push_event(MatchEvent::SaveLevel {
+            is_bid,
+            price,
+            queue,
+            count,
+        });
+        Ok(())
     }
 
     pub(super) fn balance_event_upper_bound(
