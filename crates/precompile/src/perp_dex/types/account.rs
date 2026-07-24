@@ -1,4 +1,5 @@
 //! User account stored in the PerpDEX precompile.
+use primitives::U256;
 use serde::{Deserialize, Serialize};
 
 use crate::{as_bin::AsBinStr, perp_dex::errors::perp_err, PrecompileError};
@@ -38,6 +39,12 @@ pub struct UserAccount {
     /// Monotonic per-user nonce used to derive order ids (`keccak(account ‖ nonce)`).
     #[serde(rename = "NO", default)]
     pub nonce: u64,
+
+    /// Total perp collateral allocated to this account: available wallet plus
+    /// position margin, order-margin reservation, and fee reservation.
+    /// Unrealized PnL is deliberately excluded.
+    #[serde(rename = "TC", default)]
+    pub total_perp_collateral: i128,
 }
 
 impl Default for UserAccount {
@@ -48,18 +55,43 @@ impl Default for UserAccount {
             maker_fee_bps: 0,
             taker_fee_bps: 0,
             nonce: 0,
+            total_perp_collateral: 0,
         }
     }
 }
 
+/// Public account values emitted by the precompile and returned by `getAccount`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PublicAccountBalance {
+    pub usdc_balance: U256,
+    pub total_perp_collateral: U256,
+    pub available_perp_balance: u64,
+}
+
 impl UserAccount {
-    /// Balance exposed through the existing ABI. Negative internal balances are
+    /// Available balance exposed through the ABI. Negative internal balances are
     /// reported as zero until liquidation/bankruptcy handling is wired.
     pub fn visible_perp_wallet_balance(&self) -> u64 {
         if self.perp_wallet_balance <= 0 {
             0
         } else {
             self.perp_wallet_balance as u64
+        }
+    }
+
+    /// Total collateral exposed through the ABI. A negative internal value is
+    /// never public and indicates an account awaiting bankruptcy handling.
+    pub fn visible_total_perp_collateral(&self) -> U256 {
+        u128::try_from(self.total_perp_collateral)
+            .map(U256::from)
+            .unwrap_or_default()
+    }
+
+    pub fn public_balance(&self) -> PublicAccountBalance {
+        PublicAccountBalance {
+            usdc_balance: self.usdc_balance.clone().into(),
+            total_perp_collateral: self.visible_total_perp_collateral(),
+            available_perp_balance: self.visible_perp_wallet_balance(),
         }
     }
 

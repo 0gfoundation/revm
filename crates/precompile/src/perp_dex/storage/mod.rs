@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::perp_dex::PERP_DEX_ADDRESS;
 use crate::{
     perp_dex::{
-        errors::perp_err,
+        errors::{perp_err, perp_fatal_invariant_err},
         types::{
             ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, MarketHot, Order,
-            OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount,
-            UserFeeRates,
+            OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
+            PublicAccountBalance, UserAccount, UserFeeRates,
         },
     },
     stateful_precompiles::convert_db_err,
@@ -215,8 +215,9 @@ fn store_blob<CTX: ContextTr>(
 /// moving mark_price out of `MarketHot` into the `Market` blob (write-rare + co-read with config) —
 /// both blobs' bytes change (Market gains a field, MarketHot loses one); bumped to 10 folding each
 /// level's live-order count INTO its FIFO blob (`LevelBlob`, count(8 BE) prefix) — the per-level
-/// count keys disappear and the level blob framing changes.
-const BLOCK_COMMITMENT_VERSION: u8 = 10;
+/// count keys disappear and the level blob framing changes; bumped to 11 when total perp
+/// collateral was appended to the account blob.
+const BLOCK_COMMITMENT_VERSION: u8 = 11;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -432,8 +433,21 @@ pub fn load_account_ref<CTX: ContextTr>(
 pub fn save_account<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
-    account: UserAccount,
+    mut account: UserAccount,
 ) -> Result<(), PrecompileError> {
+    let old = load_account_ref(context, user)?;
+    let wallet_delta = i128::from(account.perp_wallet_balance)
+        .checked_sub(i128::from(old.perp_wallet_balance))
+        .ok_or_else(|| perp_fatal_invariant_err("account wallet delta overflow"))?;
+    account.total_perp_collateral = old
+        .total_perp_collateral
+        .checked_add(wallet_delta)
+        .ok_or_else(|| perp_fatal_invariant_err("account total collateral overflow"))?;
+    let old_public = old.public_balance();
+    let new_public = account.public_balance();
+    if old_public != new_public {
+        typed_store_mut(context).track_initial_balance(user, old_public);
+    }
     typed_store_mut(context).set_account(user, account);
     Ok(())
 }
@@ -450,15 +464,75 @@ pub fn mutate_account<CTX: ContextTr, R>(
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,
 ) -> Result<R, PrecompileError> {
+    let old = load_account_ref(context, user)?;
+    let old_wallet = old.perp_wallet_balance;
+    let old_total = old.total_perp_collateral;
+    let old_public = old.public_balance();
+
     // Fast path: resident in the typed store → in-place &mut (CoW lift on first write).
-    if let Some(a) = typed_store_mut(context).account_mut(user) {
-        return Ok(f(a));
+    let (r, new_public) = if let Some(a) = typed_store_mut(context).account_mut(user) {
+        let r = f(a);
+        let wallet_delta = i128::from(a.perp_wallet_balance)
+            .checked_sub(i128::from(old_wallet))
+            .ok_or_else(|| perp_fatal_invariant_err("account wallet delta overflow"))?;
+        a.total_perp_collateral = old_total
+            .checked_add(wallet_delta)
+            .ok_or_else(|| perp_fatal_invariant_err("account total collateral overflow"))?;
+        (r, a.public_balance())
+    } else {
+        // Cold/deleted: materialize once (fills the store), mutate, store the result.
+        let mut a = (*old).clone();
+        let r = f(&mut a);
+        let wallet_delta = i128::from(a.perp_wallet_balance)
+            .checked_sub(i128::from(old_wallet))
+            .ok_or_else(|| perp_fatal_invariant_err("account wallet delta overflow"))?;
+        a.total_perp_collateral = old_total
+            .checked_add(wallet_delta)
+            .ok_or_else(|| perp_fatal_invariant_err("account total collateral overflow"))?;
+        let new_public = a.public_balance();
+        typed_store_mut(context).set_account(user, a);
+        (r, new_public)
+    };
+    if old_public != new_public {
+        typed_store_mut(context).track_initial_balance(user, old_public);
     }
-    // Cold/deleted: materialize once (fills the store), mutate, store the result.
-    let mut a = load_account(context, user)?;
-    let r = f(&mut a);
-    typed_store_mut(context).set_account(user, a);
     Ok(r)
+}
+
+pub fn begin_balance_tracking<CTX: ContextTr>(context: &mut CTX) {
+    typed_store_mut(context).begin_balance_tracking();
+}
+
+pub fn take_balance_tracking<CTX: ContextTr>(
+    context: &mut CTX,
+) -> Vec<(Address, PublicAccountBalance)> {
+    typed_store_mut(context).take_balance_tracking()
+}
+
+pub fn discard_balance_tracking<CTX: ContextTr>(context: &mut CTX) {
+    typed_store_mut(context).discard_balance_tracking();
+}
+
+fn adjust_total_perp_collateral<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    delta: i128,
+) -> Result<(), PrecompileError> {
+    let old = load_account_ref(context, user)?;
+    let old_public = old.public_balance();
+    let mut account = (*old).clone();
+    account.total_perp_collateral = account
+        .total_perp_collateral
+        .checked_add(delta)
+        .ok_or_else(|| {
+            perp_fatal_invariant_err("account total collateral overflow from position")
+        })?;
+    let new_public = account.public_balance();
+    if old_public != new_public {
+        typed_store_mut(context).track_initial_balance(user, old_public);
+    }
+    typed_store_mut(context).set_account(user, account);
+    Ok(())
 }
 
 // Fee rates + nonce are folded into UserAccount (per-user, co-read with the account on the hot
@@ -613,11 +687,25 @@ pub fn save_position<CTX: ContextTr>(
     // cannot be missed. The registry is only touched when membership changes
     // (open: 0 -> !=0, close: !=0 -> 0); every other save pays just one
     // typed-sub-map-cheap position read (the position is already resident).
-    let old_amount = load_position_ref(context, user, market_id)?.amount;
+    let old_position = load_position_ref(context, user, market_id)?;
+    let old_amount = old_position.amount;
+    let allocation = |position: &PerpPosition| {
+        i128::from(position.margin)
+            .checked_add(i128::from(position.margin_reserved))
+            .and_then(|value| value.checked_add(i128::from(position.fee_reserved)))
+            .ok_or_else(|| perp_fatal_invariant_err("position collateral allocation overflow"))
+    };
+    let allocation_delta = allocation(pos)?
+        .checked_sub(allocation(old_position.as_ref())?)
+        .ok_or_else(|| perp_fatal_invariant_err("position collateral delta overflow"))?;
+
     if old_amount == 0 && pos.amount != 0 {
         registry_add(context, market_id, user)?;
     } else if old_amount != 0 && pos.amount == 0 {
         registry_remove(context, market_id, user)?;
+    }
+    if allocation_delta != 0 {
+        adjust_total_perp_collateral(context, user, allocation_delta)?;
     }
     typed_store_mut(context).set_position(user, market_id, pos.clone());
     Ok(())
@@ -2222,6 +2310,7 @@ mod size_probe_tests {
             maker_fee_bps: 2,
             taker_fee_bps: 5,
             nonce: 7,
+            total_perp_collateral: 1_234_567_890,
         };
         let buf = encode(&acct).unwrap();
         println!(

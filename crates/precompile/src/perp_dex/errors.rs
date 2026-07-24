@@ -11,3 +11,9 @@ pub fn perp_err(msg: impl Into<String>) -> PrecompileError {
 pub fn perp_invariant_err(msg: impl Into<String>) -> PrecompileError {
     PrecompileError::Other(format!("[INVARIANT] {}", msg.into()))
 }
+
+/// Fatal invariant violation. Use this for accounting failures that make the
+/// in-memory state unsafe to continue executing.
+pub fn perp_fatal_invariant_err(msg: impl Into<String>) -> PrecompileError {
+    PrecompileError::Fatal(format!("[INVARIANT] {}", msg.into()))
+}

@@ -5,8 +5,10 @@ use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, Address, FixedBytes, U256};
 
 use crate::perp_dex::{
-    interface::IPerpDex::{cancelOrderCall, getMarketFeeTotalCall, getOrderCall, placeOrderCall},
-    storage,
+    interface::IPerpDex::{
+        cancelOrderCall, getMarketFeeTotalCall, getOrderCall, placeOrderCall, AccountBalanceChanged,
+    },
+    run_perp_dex_call, storage,
     types::{FundingState, Market, OrderStatus, PerpPosition, UserFeeRates},
     PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
@@ -714,6 +716,64 @@ fn buy_taker_fully_matches_resting_ask() {
     assert!(storage::load_ask_prices(&mut ctx, MARKET_ID)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn matched_call_emits_one_final_balance_after_image_per_user_in_address_order() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    storage::save_user_fee_rates(
+        &mut ctx,
+        BOB,
+        UserFeeRates {
+            maker_fee_bps: 1,
+            taker_fee_bps: 0,
+        },
+    )
+    .unwrap();
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let output = run_perp_dex_call(
+        &placeOrderCall {
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode(),
+        10_000_000,
+        ALICE,
+        U256::ZERO,
+        false,
+        &mut ctx,
+    )
+    .unwrap();
+    assert!(!output.reverted);
+
+    let events = JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
+        .map(|log| {
+            AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        [events[0].user, events[1].user, events[2].user],
+        [ALICE, BOB, ADMIN]
+    );
+    for event in events {
+        let balance = storage::load_account(&mut ctx, event.user)
+            .unwrap()
+            .public_balance();
+        assert_eq!(event.usdcBalance, balance.usdc_balance);
+        assert_eq!(event.perpWalletBalance, balance.total_perp_collateral);
+        assert_eq!(event.availablePerpBalance, balance.available_perp_balance);
+    }
 }
 
 #[test]
@@ -2800,8 +2860,11 @@ mod golden {
     /// folded INTO its FIFO blob (`LevelBlob`, count(8 BE) prefix); the per-level count keys
     /// disappear + the level blob framing changes. Values + business snapshot IDENTICAL. Prior
     /// value 0x47f8225b07e2e1cc951203cc35b2aab40cc7801f43880c8ec3850344de3c78dc.
+    /// RE-PIN (event-authored account balances + `BLOCK_COMMITMENT_VERSION` 10→11): total perp
+    /// collateral was appended to the account blob and is now pinned alongside the exact available
+    /// balance. Prior value 0x25389cb16beb55f0800734570a0ac4d48f9f6309452932b7204fa682dd397d45.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x25389cb16beb55f0800734570a0ac4d48f9f6309452932b7204fa682dd397d45");
+        b256!("0x9989c4d3675808defbb3baba3f828cb43151b6ffb81f0a902a2ef68286717648");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -2811,13 +2874,13 @@ mod golden {
         alice_position: (i64, i64, i64),
         bob_position: (i64, i64, i64),
         carol_position: (i64, i64, i64),
-        /// (spot usdc balance, perp wallet balance)
-        alice_account: (U256, u64),
-        bob_account: (U256, u64),
-        carol_account: (U256, u64),
+        /// (spot USDC balance, total perp collateral, available perp balance)
+        alice_account: (U256, U256, u64),
+        bob_account: (U256, U256, u64),
+        carol_account: (U256, U256, u64),
         bob_erc20: U256,
         /// Trading-fee sink (taker+maker fees credit the admin's perp wallet).
-        admin_perp_wallet: u64,
+        admin_perp_wallet: (U256, u64),
         insurance_fund: u64,
         market_fee_total: u64,
         mark_price: u64,
@@ -2854,20 +2917,32 @@ mod golden {
             //   + 56_500 residual mark-price settle (margin 264_000 + PnL
             //   −207_500) − 5_280 clearance fee. The liquidation close taker fee
             //   is WAIVED (fix B), so there is no −1_200 deduction here.
-            alice_account: (U256::from(500_000_000u64), 999_162_305),
+            alice_account: (
+                U256::from(500_000_000u64),
+                U256::from(999_162_305u64),
+                999_162_305,
+            ),
             // BOB perp = 1e9 + 830_000 short PnL (622_500 on the 3-QTY
             //   liquidation leg + 207_500 on the QTY closed via CAROL) + 400
             //   funding credit − 1_446 maker fees − 400_160 still reserved for
             //   the resting tail bid (400_000 MR + 160 fee)
             //   − 500_000_000 transferFromPerp.
-            bob_account: (U256::from(500_000_000u64), 500_428_794),
+            bob_account: (
+                U256::from(500_000_000u64),
+                U256::from(500_828_954u64),
+                500_428_794,
+            ),
             // CAROL perp = 5_000_000 funded − 800_000 short opening margin.
-            carol_account: (U256::from(5_000_000u64), 4_200_000),
+            carol_account: (
+                U256::from(5_000_000u64),
+                U256::from(5_000_000u64),
+                4_200_000,
+            ),
             // 2e9 seed − 1.5e9 deposit + 0.5e9 withdraw.
             bob_erc20: U256::from(1_000_000_000u64),
             // 100M funding − 50M IF deposit + 1M IF withdraw + 3_461 fees
             //   (liquidation close taker fee waived — fix B).
-            admin_perp_wallet: 51_003_461,
+            admin_perp_wallet: (U256::from(51_003_461u64), 51_003_461),
             // 50M deposit − 1M withdraw + 5_280 clearance fee
             //   (50 bps of ALICE's 1_056_000 pre-liquidation margin).
             insurance_fund: 49_005_280,
@@ -3892,11 +3967,26 @@ mod golden {
             alice_position: (alice_pos.amount, alice_pos.vQuoteBalance, alice_pos.margin),
             bob_position: (bob_pos.amount, bob_pos.vQuoteBalance, bob_pos.margin),
             carol_position: (carol_pos.amount, carol_pos.vQuoteBalance, carol_pos.margin),
-            alice_account: (alice_acct.usdcBalance, alice_acct.perpWalletBalance),
-            bob_account: (bob_acct.usdcBalance, bob_acct.perpWalletBalance),
-            carol_account: (carol_acct.usdcBalance, carol_acct.perpWalletBalance),
+            alice_account: (
+                alice_acct.usdcBalance,
+                alice_acct.perpWalletBalance,
+                alice_acct.availablePerpBalance,
+            ),
+            bob_account: (
+                bob_acct.usdcBalance,
+                bob_acct.perpWalletBalance,
+                bob_acct.availablePerpBalance,
+            ),
+            carol_account: (
+                carol_acct.usdcBalance,
+                carol_acct.perpWalletBalance,
+                carol_acct.availablePerpBalance,
+            ),
             bob_erc20,
-            admin_perp_wallet: admin_acct.perpWalletBalance,
+            admin_perp_wallet: (
+                admin_acct.perpWalletBalance,
+                admin_acct.availablePerpBalance,
+            ),
             insurance_fund,
             market_fee_total,
             mark_price,

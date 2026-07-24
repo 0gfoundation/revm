@@ -188,7 +188,7 @@ pub fn run_transfer_from_perp<CTX: ContextTr>(
     Ok(Bytes::new())
 }
 
-/// `getAccount(address user)` — returns `(usdcBalance, perpWalletBalance)`.
+/// `getAccount(address user)` — returns spot, total perp collateral, and available perp.
 pub fn run_get_account<CTX: ContextTr>(
     input_bytes: &[u8],
     context: &mut CTX,
@@ -198,12 +198,14 @@ pub fn run_get_account<CTX: ContextTr>(
 
     let account = storage::load_account_ref(context, args.user)?;
     let usdc_balance: U256 = account.usdc_balance.clone().into();
-    let perp_wallet_balance = account.visible_perp_wallet_balance();
+    let perp_wallet_balance = account.visible_total_perp_collateral();
+    let available_perp_balance = account.visible_perp_wallet_balance();
 
     Ok(Bytes::from(getAccountCall::abi_encode_returns(
         &getAccountReturn {
             usdcBalance: usdc_balance,
             perpWalletBalance: perp_wallet_balance,
+            availablePerpBalance: available_perp_balance,
         },
     )))
 }

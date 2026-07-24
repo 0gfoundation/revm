@@ -28,7 +28,9 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use crate::perp_dex::storage::{encode, keys, pack_level, LevelBlob};
-use crate::perp_dex::types::{Market, MarketHot, Order, OrderEntry, PerpPosition, UserAccount};
+use crate::perp_dex::types::{
+    Market, MarketHot, Order, OrderEntry, PerpPosition, PublicAccountBalance, UserAccount,
+};
 use crate::PrecompileError;
 
 /// Identifies which typed sub-map + identity a dirty `B256` key refers to, so [`TypedPerpStore::take_delta`]
@@ -121,9 +123,35 @@ pub struct TypedPerpStore {
     /// Whether the CURRENT transaction wrote this store (reset at tx boundaries by the journal) —
     /// the typed-store half of the `discard_tx` corruption guard.
     tx_dirty: bool,
+    /// Initial public balances for accounts touched by the current top-level
+    /// precompile call. `None` keeps direct storage tests and internal helpers
+    /// outside the ABI entry point free of event bookkeeping.
+    balance_tracking: Option<HashMap<Address, PublicAccountBalance>>,
 }
 
 impl TypedPerpStore {
+    pub fn begin_balance_tracking(&mut self) {
+        self.balance_tracking = Some(HashMap::new());
+    }
+
+    pub fn track_initial_balance(&mut self, user: Address, balance: PublicAccountBalance) {
+        if let Some(initial) = self.balance_tracking.as_mut() {
+            initial.entry(user).or_insert(balance);
+        }
+    }
+
+    pub fn take_balance_tracking(&mut self) -> Vec<(Address, PublicAccountBalance)> {
+        self.balance_tracking
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn discard_balance_tracking(&mut self) {
+        self.balance_tracking = None;
+    }
+
     /// Single write-bookkeeping choke point: dirty-set entry (delta membership) + tripwire
     /// counters. Every state-changing accessor funnels through here — the typed-store analogue of
     /// the overlay's `store_struct`/`store_bytes` bookkeeping.

@@ -19,9 +19,10 @@
 
 use std::{collections::HashMap, sync::OnceLock};
 
+use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
 use context::{ContextTr, JournalTr};
-use primitives::{address, Address, U256};
+use primitives::{address, Address, Log, U256};
 
 use crate::{
     perp_dex::{
@@ -31,7 +32,7 @@ use crate::{
             run_set_user_fee_rates, run_transfer_from_perp, run_transfer_to_perp, run_withdraw,
         },
         interface::IPerpDex::{
-            addMarketCall, addPositionMarginCall, cancelOrderCall, cancelOrderSignedCall,
+            self, addMarketCall, addPositionMarginCall, cancelOrderCall, cancelOrderSignedCall,
             depositCall, depositInsuranceFundCall, getAccountCall, getAdminCall, getApiKeyCall,
             getApiKeysCall, getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall,
             getFundingStateCall, getIndexPriceCall, getInsuranceFundCall, getMarkPriceCall,
@@ -222,6 +223,7 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
     // before dispatch. A call that ends REVERTED must not have written the overlay
     // (validate-then-apply); if it did, undo is gone and the write leaked. Diagnostic only.
     let writes_before = context.journal_mut().perp_write_count();
+    storage::begin_balance_tracking(context);
 
     // Dispatch — note: no `?` here; errors are caught below and converted to
     // clean REVERT output so ethers.js can read `e.reason`.
@@ -308,16 +310,40 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         s if s == getAveragePremiumIndexCall::SELECTOR => {
             run_get_average_premium_index(input_bytes, context)
         }
-        _ => return Err(PrecompileError::StatefulInvalidInput),
+        _ => Err(PrecompileError::StatefulInvalidInput),
     };
 
     match result {
-        Ok(bytes) => Ok(PrecompileOutput::new(gas_used, bytes)),
+        Ok(bytes) => {
+            let mut initial_balances = storage::take_balance_tracking(context);
+            initial_balances.sort_unstable_by_key(|(user, _)| *user);
+            for (user, initial) in initial_balances {
+                let final_balance = storage::load_account_ref(context, user)?.public_balance();
+                if final_balance == initial {
+                    continue;
+                }
+                context.journal_mut().log(Log {
+                    address: PERP_DEX_ADDRESS,
+                    data: IPerpDex::AccountBalanceChanged {
+                        user,
+                        usdcBalance: final_balance.usdc_balance,
+                        perpWalletBalance: final_balance.total_perp_collateral,
+                        availablePerpBalance: final_balance.available_perp_balance,
+                    }
+                    .to_log_data(),
+                });
+            }
+            Ok(PrecompileOutput::new(gas_used, bytes))
+        }
         // Fatal errors propagate as-is (storage / system bugs).
-        Err(PrecompileError::Fatal(e)) => Err(PrecompileError::Fatal(e)),
+        Err(PrecompileError::Fatal(e)) => {
+            storage::discard_balance_tracking(context);
+            Err(PrecompileError::Fatal(e))
+        }
         // All other errors become a clean REVERT with an ABI-encoded reason
         // string, so ethers.js exposes `e.reason` to the caller.
         Err(e) => {
+            storage::discard_balance_tracking(context);
             // Tripwire: a reverting call that WROTE the overlay is a residual write-then-error
             // (commit-only #23 — the write leaks with no undo). Record the offending selector +
             // count into a global so the exact path can be surfaced (read via

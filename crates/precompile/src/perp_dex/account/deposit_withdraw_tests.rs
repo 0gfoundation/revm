@@ -1,5 +1,5 @@
 use super::*;
-use alloy_sol_types::SolCall;
+use alloy_sol_types::{SolCall, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId};
@@ -8,7 +8,7 @@ use crate::perp_dex::{
     account::{run_get_user_fee_rates, run_set_user_fee_rates},
     interface::IPerpDex::{
         depositCall, getAccountCall, getUserFeeRatesCall, setUserFeeRatesCall,
-        transferFromPerpCall, transferToPerpCall, withdrawCall,
+        transferFromPerpCall, transferToPerpCall, withdrawCall, AccountBalanceChanged,
     },
     storage,
     storage::keys::erc20_balance_slot,
@@ -31,10 +31,11 @@ fn make_ctx(alice_usdc: U256) -> TestCtx {
     ctx
 }
 
-fn decode_get_account(bytes: &Bytes) -> (U256, u64) {
+fn decode_get_account(bytes: &Bytes) -> (U256, U256, u64) {
     let usdc = U256::from_be_slice(&bytes[..32]);
-    let perp = U256::from_be_slice(&bytes[32..64]).to::<u64>();
-    (usdc, perp)
+    let total = U256::from_be_slice(&bytes[32..64]);
+    let available = U256::from_be_slice(&bytes[64..96]).to::<u64>();
+    (usdc, total, available)
 }
 
 fn decode_user_fee_rates(bytes: &Bytes) -> (u64, u64) {
@@ -49,7 +50,7 @@ fn deposit_moves_usdc_to_internal_account() {
     let mut ctx = make_ctx(amount);
     run_deposit(&depositCall { amount }.abi_encode(), ALICE, &mut ctx).unwrap();
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
-    let (usdc, _perp) = decode_get_account(&ret);
+    let (usdc, _total, _available) = decode_get_account(&ret);
     assert_eq!(usdc, amount);
 }
 
@@ -171,7 +172,7 @@ fn withdraw_returns_usdc_to_wallet() {
     run_deposit(&depositCall { amount }.abi_encode(), ALICE, &mut ctx).unwrap();
     run_withdraw(&withdrawCall { amount }.abi_encode(), ALICE, &mut ctx).unwrap();
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
-    let (usdc, _) = decode_get_account(&ret);
+    let (usdc, _, _) = decode_get_account(&ret);
     assert_eq!(usdc, U256::ZERO);
 }
 
@@ -218,9 +219,10 @@ fn transfer_to_and_from_perp_wallet() {
     .unwrap();
 
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
-    let (usdc, perp) = decode_get_account(&ret);
+    let (usdc, total, available) = decode_get_account(&ret);
     assert_eq!(usdc, U256::from(1_000_000u64));
-    assert_eq!(perp, transfer_amt);
+    assert_eq!(total, U256::from(transfer_amt));
+    assert_eq!(available, transfer_amt);
 
     run_transfer_from_perp(
         &transferFromPerpCall {
@@ -232,18 +234,20 @@ fn transfer_to_and_from_perp_wallet() {
     )
     .unwrap();
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
-    let (usdc2, perp2) = decode_get_account(&ret);
+    let (usdc2, total2, available2) = decode_get_account(&ret);
     assert_eq!(usdc2, deposit_amt);
-    assert_eq!(perp2, 0);
+    assert_eq!(total2, U256::ZERO);
+    assert_eq!(available2, 0);
 }
 
 #[test]
 fn get_account_returns_zero_for_new_user() {
     let mut ctx = make_ctx(U256::ZERO);
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
-    let (usdc, perp) = decode_get_account(&ret);
+    let (usdc, total, available) = decode_get_account(&ret);
     assert_eq!(usdc, U256::ZERO);
-    assert_eq!(perp, 0);
+    assert_eq!(total, U256::ZERO);
+    assert_eq!(available, 0);
 }
 
 #[test]
@@ -254,8 +258,9 @@ fn get_account_clamps_negative_perp_wallet_to_zero() {
     storage::save_account(&mut ctx, ALICE, account).unwrap();
 
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
-    let (_usdc, perp) = decode_get_account(&ret);
-    assert_eq!(perp, 0);
+    let (_usdc, total, available) = decode_get_account(&ret);
+    assert_eq!(total, U256::ZERO);
+    assert_eq!(available, 0);
 }
 
 /// A deposit writes the USDC ERC-20 balance (on-trie, EVM journal) AND the internal perp
@@ -275,7 +280,7 @@ fn deposit_commit_only_revert_semantics() {
     ctx.journal_mut().checkpoint_revert(cp);
 
     // Off-trie internal balance persists (commit-only)...
-    let (usdc_internal_after, _) = decode_get_account(
+    let (usdc_internal_after, _, _) = decode_get_account(
         &run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap(),
     );
     assert_eq!(usdc_internal_after, amount, "off-trie write is commit-only");
@@ -285,4 +290,110 @@ fn deposit_commit_only_revert_semantics() {
         amount,
         "on-trie ERC-20 balance reverts with the EVM journal"
     );
+}
+
+#[test]
+fn account_total_tracks_available_and_allocated_collateral() {
+    let mut ctx = make_ctx(U256::ZERO);
+    storage::save_account(
+        &mut ctx,
+        ALICE,
+        crate::perp_dex::types::UserAccount {
+            perp_wallet_balance: 100,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        1,
+        &crate::perp_dex::types::PerpPosition {
+            margin: 40,
+            margin_reserved: 10,
+            fee_reserved: 5,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    storage::mutate_account(&mut ctx, ALICE, |account| account.debit_perp(55))
+        .unwrap()
+        .unwrap();
+
+    let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
+    let (_, total, available) = decode_get_account(&ret);
+    assert_eq!(total, U256::from(100));
+    assert_eq!(available, 45);
+}
+
+#[test]
+fn successful_call_emits_one_final_balance_after_image() {
+    let amount = U256::from(1_000_000_u64);
+    let mut ctx = make_ctx(amount);
+    let output = crate::perp_dex::run_perp_dex_call(
+        &depositCall { amount }.abi_encode(),
+        1_000_000,
+        ALICE,
+        U256::ZERO,
+        false,
+        &mut ctx,
+    )
+    .unwrap();
+    assert!(!output.reverted);
+
+    let events = JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
+        .map(|log| {
+            AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].user, ALICE);
+    assert_eq!(events[0].usdcBalance, amount);
+    assert_eq!(events[0].perpWalletBalance, U256::ZERO);
+    assert_eq!(events[0].availablePerpBalance, 0);
+}
+
+#[test]
+fn reverted_call_emits_no_balance_after_image() {
+    let mut ctx = make_ctx(U256::ZERO);
+    let output = crate::perp_dex::run_perp_dex_call(
+        &depositCall { amount: U256::ZERO }.abi_encode(),
+        1_000_000,
+        ALICE,
+        U256::ZERO,
+        false,
+        &mut ctx,
+    )
+    .unwrap();
+    assert!(output.reverted);
+    assert!(JournalTr::take_logs(ctx.journal_mut())
+        .iter()
+        .all(|log| log.data.topics().first() != Some(&AccountBalanceChanged::SIGNATURE_HASH)));
+}
+
+#[test]
+fn metadata_only_call_emits_no_balance_after_image() {
+    let mut ctx = make_ctx(U256::ZERO);
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+
+    let output = crate::perp_dex::run_perp_dex_call(
+        &setUserFeeRatesCall {
+            user: ALICE,
+            makerFeeBps: 1,
+            takerFeeBps: 2,
+        }
+        .abi_encode(),
+        1_000_000,
+        ADMIN,
+        U256::ZERO,
+        false,
+        &mut ctx,
+    )
+    .unwrap();
+    assert!(!output.reverted);
+    assert!(JournalTr::take_logs(ctx.journal_mut())
+        .iter()
+        .all(|log| log.data.topics().first() != Some(&AccountBalanceChanged::SIGNATURE_HASH)));
 }
