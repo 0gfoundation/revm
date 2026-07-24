@@ -8,7 +8,7 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 
 use crate::{
     perp_dex::{
-        errors::perp_err,
+        errors::{perp_err, perp_invariant_err},
         funding::{apply_funding_settlement, compute_funding_settlement},
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
@@ -417,6 +417,7 @@ fn set_leverage_core<CTX: ContextTr>(
         ));
     }
 
+    storage::reserve_balance_events(context, 1)?;
     rebalance_order_margin_for_leverage(context, account, &mut pos, leverage)?;
     pos.leverage = leverage;
     storage::save_position(context, account, market_id, &pos)?;
@@ -500,6 +501,7 @@ pub fn run_add_position_margin<CTX: ContextTr>(
         .ok_or_else(|| perp_err("addPositionMargin: margin overflow"))?;
 
     // ── APPLY (all rejects passed) ──
+    storage::reserve_balance_events(context, 1)?;
     if let Some(p) = pending_funding {
         apply_funding_settlement(context, p)?;
     }
@@ -586,6 +588,7 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     pos.margin = new_margin;
 
     // ── APPLY (all rejects passed) ──
+    storage::reserve_balance_events(context, 1)?;
     if let Some(p) = pending_funding {
         apply_funding_settlement(context, p)?;
     }
@@ -659,13 +662,6 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
         return Ok(LiquidationOutcome::AboveMaintenance);
     }
 
-    // ── APPLY (liquidatable — commit the funding settle, then close) ──
-    if let Some(p) = pending_funding {
-        apply_funding_settlement(context, p)?;
-    }
-    storage::save_account(context, user, account)?;
-    storage::save_position(context, user, market_id, &pos)?;
-
     let liq_amount = pos.amount;
     let liquidation_side = if pos.amount > 0 {
         Side::Sell
@@ -674,6 +670,14 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     };
     let liquidation_quantity = pos.amount.unsigned_abs();
     let pre_liq_margin = pos.margin.max(0) as u64;
+    reserve_liquidation_balance_events(context, market_id, Some(liquidation_side.opposite()))?;
+
+    // ── APPLY (liquidatable — commit the funding settle, then close) ──
+    if let Some(p) = pending_funding {
+        apply_funding_settlement(context, p)?;
+    }
+    storage::save_account(context, user, account)?;
+    storage::save_position(context, user, market_id, &pos)?;
 
     // Cancel all open orders for this user/market (emits OrderCancelled events).
     cancel_all_orders_for_market(context, user, market_id, market)?;
@@ -828,6 +832,62 @@ const MAX_LIQUIDATIONS_PER_UPDATE: u32 = 50;
 /// and is re-swept next update — deferral is safe (no realized bad debt, the opposite
 /// side's offsetting gains persist).
 const ADL_BUDGET_PER_UPDATE: u32 = 128;
+
+fn reserve_live_order_balance_events<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    side: Side,
+    mut required_events: u64,
+) -> Result<u64, PrecompileError> {
+    let prices = match side {
+        Side::Buy => storage::load_bid_prices_ref(context, market_id)?,
+        Side::Sell => storage::load_ask_prices_ref(context, market_id)?,
+    };
+    for price in prices.iter().copied() {
+        let level_count = match side {
+            Side::Buy => storage::load_bid_level_arc(context, market_id, price)?.count,
+            Side::Sell => storage::load_ask_level_arc(context, market_id, price)?.count,
+        };
+        required_events = required_events
+            .checked_add(level_count)
+            .ok_or_else(|| perp_invariant_err("liquidation live order count overflow"))?;
+        storage::reserve_balance_events(context, required_events)?;
+    }
+    Ok(required_events)
+}
+
+/// Reserves a safe pre-write upper bound for balance changes during liquidation.
+///
+/// Each live maker order can introduce at most one distinct account; ADL is capped globally per
+/// call; liquidated users and the fee recipient contribute the remaining fixed terms. Duplicate
+/// users deliberately over-reserve. Reserving after each level also bounds the amount of new
+/// order-book scanning performed by the event gas supplied to the call.
+fn reserve_liquidation_balance_events<CTX: ContextTr>(
+    context: &mut CTX,
+    market_id: u64,
+    matching_side: Option<Side>,
+) -> Result<(), PrecompileError> {
+    let liquidated_users = if matching_side.is_some() {
+        1
+    } else {
+        u64::from(MAX_LIQUIDATIONS_PER_UPDATE)
+    };
+    let required_events = liquidated_users
+        .checked_add(u64::from(ADL_BUDGET_PER_UPDATE))
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| perp_invariant_err("liquidation balance event bound overflow"))?;
+    storage::reserve_balance_events(context, required_events)?;
+
+    let required_events = match matching_side {
+        Some(side) => reserve_live_order_balance_events(context, market_id, side, required_events)?,
+        None => {
+            let required_events =
+                reserve_live_order_balance_events(context, market_id, Side::Buy, required_events)?;
+            reserve_live_order_balance_events(context, market_id, Side::Sell, required_events)?
+        }
+    };
+    storage::reserve_balance_events(context, required_events)
+}
 
 /// Protocol-automatic liquidation sweep, run synchronously at the tail of
 /// [`run_update_index_price`] after the new mark + funding are persisted (so the
@@ -1148,6 +1208,7 @@ pub fn run_deposit_insurance_fund<CTX: ContextTr>(
             "depositInsuranceFund: insufficient perp wallet balance",
         ));
     }
+    storage::reserve_balance_events(context, 1)?;
     account.debit_perp(args.amount)?;
     storage::save_account(context, caller, account)?;
 
@@ -1193,6 +1254,7 @@ pub fn run_withdraw_insurance_fund<CTX: ContextTr>(
             "withdrawInsuranceFund: amount exceeds fund balance",
         ));
     }
+    storage::reserve_balance_events(context, 1)?;
     let new_balance = balance - args.amount;
     storage::save_insurance_fund(context, new_balance)?;
 
@@ -1374,6 +1436,11 @@ pub fn run_update_index_price<CTX: ContextTr>(
     } else {
         raw_mark.min(market.max_price).max(1)
     };
+
+    let sweep_candidates = storage::load_position_registry(context, args.marketId)?;
+    if !sweep_candidates.is_empty() {
+        reserve_liquidation_balance_events(context, args.marketId, None)?;
+    }
 
     // ── 4. Persist index price + mark price ──────────────────────────────────
     storage::save_index_price_state(

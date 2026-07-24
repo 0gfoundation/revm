@@ -336,6 +336,12 @@ pub(super) struct TakerPlan {
     closed_quantity: u64,
 }
 
+impl TakerPlan {
+    pub(super) fn charges_fee(&self) -> bool {
+        self.fee > 0
+    }
+}
+
 pub(super) fn finalize_apply<CTX: ContextTr>(
     context: &mut CTX,
     plan: TakerPlan,
@@ -491,6 +497,19 @@ impl MatchRegistry {
 
     pub(super) fn push_event(&mut self, e: MatchEvent) {
         self.events.push(e);
+    }
+
+    pub(super) fn balance_event_upper_bound(
+        &self,
+        include_taker_fee_recipient: bool,
+    ) -> Result<u64, PrecompileError> {
+        let users = u64::try_from(self.users.len())
+            .map_err(|_| perp_invariant_err("match user count exceeds u64"))?;
+        let pending_admin = u64::from(self.admin_credit_pending > 0);
+        users
+            .checked_add(pending_admin)
+            .and_then(|count| count.checked_add(u64::from(include_taker_fee_recipient)))
+            .ok_or_else(|| perp_invariant_err("match balance event bound overflow"))
     }
 
     /// First touch loads pos/account/both lists and settles funding: computed in memory NOW (the

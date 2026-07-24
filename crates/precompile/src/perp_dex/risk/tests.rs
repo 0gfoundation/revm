@@ -10,12 +10,13 @@ use crate::perp_dex::{
         addPositionMarginCall, liquidateCall, placeOrderCall, removePositionMarginCall,
         setLeverageCall, updateIndexPriceCall,
     },
+    run_perp_dex_call,
     trading::run_place_order,
     types::{
         FundingState, IndexPriceHistory, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
         UserAccount, UserFeeRates,
     },
-    USDC_ADDRESS,
+    ACCOUNT_BALANCE_CHANGED_GAS, USDC_ADDRESS,
 };
 
 const ALICE: Address = address!("1111111111111111111111111111111111111111");
@@ -200,6 +201,51 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
         storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
         vec![MAKER]
     );
+}
+
+#[test]
+fn index_update_reserves_sweep_balance_gas_before_writing_mark() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    let writes_before = ctx.journal_mut().perp_write_count();
+    let input = updateIndexPriceCall {
+        marketId: MARKET_ID,
+        indexPrice: 8_500,
+        timestamp: 31,
+    }
+    .abi_encode();
+    let sweep_event_bound = u64::from(MAX_LIQUIDATIONS_PER_UPDATE + ADL_BUDGET_PER_UPDATE) + 1;
+
+    let err = run_perp_dex_call(
+        &input,
+        50_000 + sweep_event_bound * ACCOUNT_BALANCE_CHANGED_GAS - 1,
+        ADMIN,
+        U256::ZERO,
+        false,
+        &mut ctx,
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, PrecompileError::OutOfGas));
+    assert_eq!(ctx.journal_mut().perp_write_count(), writes_before);
+    assert_eq!(
+        storage::load_index_price_state(&mut ctx, MARKET_ID)
+            .unwrap()
+            .timestamp,
+        0
+    );
+    assert_eq!(
+        storage::load_mark_price(&mut ctx, MARKET_ID).unwrap(),
+        ENTRY_PRICE
+    );
+    assert_eq!(position(&mut ctx, ALICE).amount, QTY);
+    assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+
+    let output = run_perp_dex_call(&input, 10_000_000, ADMIN, U256::ZERO, false, &mut ctx).unwrap();
+    assert!(!output.reverted);
+    assert_eq!(output.gas_used, 50_000 + ACCOUNT_BALANCE_CHANGED_GAS);
 }
 
 #[test]

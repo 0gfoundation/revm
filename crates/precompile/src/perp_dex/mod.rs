@@ -81,6 +81,10 @@ pub const PERP_DEX_ADDRESS: Address = address!("00000000000000000000000000000000
 /// USDC token address on this chain.
 pub const USDC_ADDRESS: Address = address!("5ddA922Df9244b87635144e59D26f5A6e9FD90c3");
 
+/// Canonical EVM gas for `AccountBalanceChanged`: LOG2 (signature + indexed user)
+/// with three ABI words (96 bytes) of data.
+pub(crate) const ACCOUNT_BALANCE_CHANGED_GAS: u64 = 375 + 2 * 375 + 96 * 8;
+
 // ── Selector table ────────────────────────────────────────────────────────────
 
 /// `(gas_cost, can_be_called_in_static_context)`
@@ -196,7 +200,7 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         .and_then(|s| s.try_into().ok())
         .ok_or(PrecompileError::StatefulInvalidInput)?;
 
-    let gas_used = match selectors_map().get(&selector) {
+    let base_gas_used = match selectors_map().get(&selector) {
         Some(&(gas_cost, can_be_static)) => {
             if gas_cost > gas_limit {
                 return Err(PrecompileError::OutOfGas);
@@ -223,7 +227,8 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
     // before dispatch. A call that ends REVERTED must not have written the overlay
     // (validate-then-apply); if it did, undo is gone and the write leaked. Diagnostic only.
     let writes_before = context.journal_mut().perp_write_count();
-    storage::begin_balance_tracking(context);
+    let max_balance_events = (gas_limit - base_gas_used) / ACCOUNT_BALANCE_CHANGED_GAS;
+    storage::begin_balance_tracking(context, max_balance_events);
 
     // Dispatch — note: no `?` here; errors are caught below and converted to
     // clean REVERT output so ethers.js can read `e.reason`.
@@ -315,13 +320,32 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
 
     match result {
         Ok(bytes) => {
-            let mut initial_balances = storage::take_balance_tracking(context);
-            initial_balances.sort_unstable_by_key(|(user, _)| *user);
+            let initial_balances = storage::take_balance_tracking(context);
+            let mut changed_balances = Vec::with_capacity(initial_balances.len());
             for (user, initial) in initial_balances {
                 let final_balance = storage::load_account_ref(context, user)?.public_balance();
                 if final_balance == initial {
                     continue;
                 }
+                changed_balances.push((user, final_balance));
+            }
+            let balance_event_count = u64::try_from(changed_balances.len()).map_err(|_| {
+                errors::perp_fatal_invariant_err("account balance event count overflow")
+            })?;
+            let balance_event_gas = balance_event_count
+                .checked_mul(ACCOUNT_BALANCE_CHANGED_GAS)
+                .ok_or_else(|| {
+                    errors::perp_fatal_invariant_err("account balance event gas overflow")
+                })?;
+            let gas_used = base_gas_used
+                .checked_add(balance_event_gas)
+                .ok_or_else(|| errors::perp_fatal_invariant_err("perpdex total gas overflow"))?;
+            if gas_used > gas_limit {
+                return Err(errors::perp_fatal_invariant_err(
+                    "account balance events exceeded reserved gas",
+                ));
+            }
+            for (user, final_balance) in changed_balances {
                 context.journal_mut().log(Log {
                     address: PERP_DEX_ADDRESS,
                     data: IPerpDex::AccountBalanceChanged {
@@ -334,6 +358,15 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
                 });
             }
             Ok(PrecompileOutput::new(gas_used, bytes))
+        }
+        Err(PrecompileError::OutOfGas) => {
+            storage::discard_balance_tracking(context);
+            if context.journal_mut().perp_write_count() != writes_before {
+                return Err(errors::perp_fatal_invariant_err(
+                    "account balance event gas exhausted after perpdex writes",
+                ));
+            }
+            Err(PrecompileError::OutOfGas)
         }
         // Fatal errors propagate as-is (storage / system bugs).
         Err(PrecompileError::Fatal(e)) => {
@@ -355,7 +388,7 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
                 PERP_WRITE_THEN_REVERT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             Ok(PrecompileOutput::new_reverted(
-                gas_used,
+                base_gas_used,
                 encode_revert_string(&e.to_string()),
             ))
         }

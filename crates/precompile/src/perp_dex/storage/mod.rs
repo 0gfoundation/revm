@@ -446,7 +446,7 @@ pub fn save_account<CTX: ContextTr>(
     let old_public = old.public_balance();
     let new_public = account.public_balance();
     if old_public != new_public {
-        typed_store_mut(context).track_initial_balance(user, old_public);
+        typed_store_mut(context).track_initial_balance(user, old_public)?;
     }
     typed_store_mut(context).set_account(user, account);
     Ok(())
@@ -494,21 +494,32 @@ pub fn mutate_account<CTX: ContextTr, R>(
         (r, new_public)
     };
     if old_public != new_public {
-        typed_store_mut(context).track_initial_balance(user, old_public);
+        typed_store_mut(context).track_initial_balance(user, old_public)?;
     }
     Ok(r)
 }
 
-pub fn begin_balance_tracking<CTX: ContextTr>(context: &mut CTX) {
-    typed_store_mut(context).begin_balance_tracking();
+/// Starts balance tracking for a top-level call with its gas-funded event capacity.
+pub fn begin_balance_tracking<CTX: ContextTr>(context: &mut CTX, max_events: u64) {
+    typed_store_mut(context).begin_balance_tracking(max_events);
 }
 
+/// Reserves a pre-write upper bound of balance after-images for the current call.
+pub fn reserve_balance_events<CTX: ContextTr>(
+    context: &mut CTX,
+    required_events: u64,
+) -> Result<(), PrecompileError> {
+    typed_store_mut(context).reserve_balance_events(required_events)
+}
+
+/// Finishes balance tracking and returns initial balances in deterministic address order.
 pub fn take_balance_tracking<CTX: ContextTr>(
     context: &mut CTX,
 ) -> Vec<(Address, PublicAccountBalance)> {
     typed_store_mut(context).take_balance_tracking()
 }
 
+/// Clears balance tracking without producing after-images.
 pub fn discard_balance_tracking<CTX: ContextTr>(context: &mut CTX) {
     typed_store_mut(context).discard_balance_tracking();
 }
@@ -529,7 +540,7 @@ fn adjust_total_perp_collateral<CTX: ContextTr>(
         })?;
     let new_public = account.public_balance();
     if old_public != new_public {
-        typed_store_mut(context).track_initial_balance(user, old_public);
+        typed_store_mut(context).track_initial_balance(user, old_public)?;
     }
     typed_store_mut(context).set_account(user, account);
     Ok(())

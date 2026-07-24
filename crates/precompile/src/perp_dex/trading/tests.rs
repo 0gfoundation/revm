@@ -753,6 +753,10 @@ fn matched_call_emits_one_final_balance_after_image_per_user_in_address_order() 
     )
     .unwrap();
     assert!(!output.reverted);
+    assert_eq!(
+        output.gas_used,
+        200_000 + 3 * crate::perp_dex::ACCOUNT_BALANCE_CHANGED_GAS
+    );
 
     let events = JournalTr::take_logs(ctx.journal_mut())
         .into_iter()
@@ -774,6 +778,82 @@ fn matched_call_emits_one_final_balance_after_image_per_user_in_address_order() 
         assert_eq!(event.perpWalletBalance, balance.total_perp_collateral);
         assert_eq!(event.availablePerpBalance, balance.available_perp_balance);
     }
+}
+
+#[test]
+fn matched_call_reserves_all_balance_event_gas_before_flushing() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    storage::save_user_fee_rates(
+        &mut ctx,
+        BOB,
+        UserFeeRates {
+            maker_fee_bps: 1,
+            taker_fee_bps: 0,
+        },
+    )
+    .unwrap();
+    let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    let writes_before = ctx.journal_mut().perp_write_count();
+    let maker_order_before = storage::load_order(&mut ctx, &sell_id).unwrap();
+    let alice_before = storage::load_account(&mut ctx, ALICE)
+        .unwrap()
+        .public_balance();
+    let bob_before = storage::load_account(&mut ctx, BOB)
+        .unwrap()
+        .public_balance();
+    let admin_before = storage::load_account(&mut ctx, ADMIN)
+        .unwrap()
+        .public_balance();
+
+    let err = run_perp_dex_call(
+        &placeOrderCall {
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode(),
+        200_000 + 3 * crate::perp_dex::ACCOUNT_BALANCE_CHANGED_GAS - 1,
+        ALICE,
+        U256::ZERO,
+        false,
+        &mut ctx,
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, crate::PrecompileError::OutOfGas));
+    assert_eq!(ctx.journal_mut().perp_write_count(), writes_before);
+    assert_eq!(
+        storage::load_order(&mut ctx, &sell_id).unwrap(),
+        maker_order_before
+    );
+    assert_eq!(storage::load_user_nonce(&mut ctx, ALICE).unwrap(), 0);
+    assert_eq!(
+        storage::load_account(&mut ctx, ALICE)
+            .unwrap()
+            .public_balance(),
+        alice_before
+    );
+    assert_eq!(
+        storage::load_account(&mut ctx, BOB)
+            .unwrap()
+            .public_balance(),
+        bob_before
+    );
+    assert_eq!(
+        storage::load_account(&mut ctx, ADMIN)
+            .unwrap()
+            .public_balance(),
+        admin_before
+    );
+    assert!(JournalTr::take_logs(ctx.journal_mut())
+        .iter()
+        .all(|log| log.data.topics().first() != Some(&AccountBalanceChanged::SIGNATURE_HASH)));
 }
 
 #[test]

@@ -50,6 +50,7 @@ pub fn run_deposit<CTX: ContextTr>(
     }
 
     // ── APPLY (no logic reject past this point; only DB-error `?`, which aborts the block) ──
+    storage::reserve_balance_events(context, 1)?;
     save_erc20_balance(context, USDC_ADDRESS, caller, user_usdc - amount)?; // 1. debit caller USDC
     save_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS, dex_usdc + amount)?; // 2. credit DEX custody
     account.usdc_balance = new_balance.into(); // 3. credit internal spot balance
@@ -98,6 +99,7 @@ pub fn run_withdraw<CTX: ContextTr>(
     }
 
     // ── APPLY (no logic reject past this point; only DB-error `?`, which aborts the block) ──
+    storage::reserve_balance_events(context, 1)?;
     account.usdc_balance = (prev - amount).into(); // 1. debit internal spot balance
     storage::save_account(context, caller, account)?;
     save_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS, dex_usdc - amount)?; // 2. debit DEX custody
@@ -135,6 +137,7 @@ pub fn run_transfer_to_perp<CTX: ContextTr>(
     if spot < amount_u256 {
         return Err(perp_err("transferToPerp: insufficient spot balance"));
     }
+    storage::reserve_balance_events(context, 1)?;
     account.usdc_balance = (spot - amount_u256).into();
     account.credit_perp(amount)?;
     storage::save_account(context, caller, account)?;
@@ -171,6 +174,7 @@ pub fn run_transfer_from_perp<CTX: ContextTr>(
             "transferFromPerp: insufficient perp wallet balance",
         ));
     }
+    storage::reserve_balance_events(context, 1)?;
     account.debit_perp(amount)?;
     let spot: U256 = account.usdc_balance.clone().into();
     account.usdc_balance = (spot + U256::from(amount)).into();

@@ -24,9 +24,11 @@
 
 use context::journaled_state::{PerpBlob, PerpDelta, PerpDeltaEntry, PerpStore};
 use primitives::{Address, HashMap, B256};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::vec::Vec;
 
+use crate::perp_dex::errors::perp_fatal_invariant_err;
 use crate::perp_dex::storage::{encode, keys, pack_level, LevelBlob};
 use crate::perp_dex::types::{
     Market, MarketHot, Order, OrderEntry, PerpPosition, PublicAccountBalance, UserAccount,
@@ -85,6 +87,13 @@ impl<'a, T> Resident<'a, T> {
 /// emits empty bytes). `Some` = live value.
 type Slot<T> = Option<Arc<T>>;
 
+#[derive(Clone, Debug)]
+struct BalanceTracking {
+    max_events: u64,
+    reserved_events: u64,
+    initial: BTreeMap<Address, PublicAccountBalance>,
+}
+
 /// Strongly-typed off-trie store (Stage A). See the module docs.
 ///
 /// Sub-maps hold `Arc<T>`, not owned `T` — this is what keeps every current perf property when the
@@ -126,28 +135,60 @@ pub struct TypedPerpStore {
     /// Initial public balances for accounts touched by the current top-level
     /// precompile call. `None` keeps direct storage tests and internal helpers
     /// outside the ABI entry point free of event bookkeeping.
-    balance_tracking: Option<HashMap<Address, PublicAccountBalance>>,
+    balance_tracking: Option<BalanceTracking>,
 }
 
 impl TypedPerpStore {
-    pub fn begin_balance_tracking(&mut self) {
-        self.balance_tracking = Some(HashMap::new());
+    /// Starts top-level balance tracking with the event capacity funded by the call's gas limit.
+    pub fn begin_balance_tracking(&mut self, max_events: u64) {
+        self.balance_tracking = Some(BalanceTracking {
+            max_events,
+            reserved_events: 0,
+            initial: BTreeMap::new(),
+        });
     }
 
-    pub fn track_initial_balance(&mut self, user: Address, balance: PublicAccountBalance) {
-        if let Some(initial) = self.balance_tracking.as_mut() {
-            initial.entry(user).or_insert(balance);
+    /// Reserves capacity for a pre-write upper bound of balance after-images.
+    pub fn reserve_balance_events(&mut self, required_events: u64) -> Result<(), PrecompileError> {
+        if let Some(tracking) = self.balance_tracking.as_mut() {
+            if required_events > tracking.max_events {
+                return Err(PrecompileError::OutOfGas);
+            }
+            tracking.reserved_events = tracking.reserved_events.max(required_events);
         }
+        Ok(())
     }
 
+    /// Records the first public balance for an account after its event gas was reserved.
+    pub fn track_initial_balance(
+        &mut self,
+        user: Address,
+        balance: PublicAccountBalance,
+    ) -> Result<(), PrecompileError> {
+        if let Some(tracking) = self.balance_tracking.as_mut() {
+            if !tracking.initial.contains_key(&user)
+                && tracking.initial.len() as u64 >= tracking.reserved_events
+            {
+                return Err(perp_fatal_invariant_err(
+                    "account balance changed without reserved event gas",
+                ));
+            }
+            tracking.initial.entry(user).or_insert(balance);
+        }
+        Ok(())
+    }
+
+    /// Finishes balance tracking and returns initial balances in deterministic address order.
     pub fn take_balance_tracking(&mut self) -> Vec<(Address, PublicAccountBalance)> {
         self.balance_tracking
             .take()
+            .map(|tracking| tracking.initial)
             .unwrap_or_default()
             .into_iter()
             .collect()
     }
 
+    /// Clears top-level balance tracking without producing after-images.
     pub fn discard_balance_tracking(&mut self) {
         self.balance_tracking = None;
     }

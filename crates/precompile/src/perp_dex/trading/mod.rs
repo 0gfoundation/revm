@@ -824,6 +824,7 @@ fn cancel_order_core<CTX: ContextTr>(
     let market_id = order.market_id;
     let market = storage::load_market_ref(context, market_id)?
         .ok_or_else(|| perp_err("cancelOrder: unknown market"))?;
+    storage::reserve_balance_events(context, 1)?;
     execute_order_cancellation(
         context,
         account,
@@ -1339,6 +1340,12 @@ pub(super) fn match_order<CTX: ContextTr>(
         taker_settlement.finalize_compute(context, &mut registry, side, market, rest_req)?;
 
     // ── APPLY (no genuine rejects past this point) ──
+    let balance_event_upper_bound = registry.balance_event_upper_bound(
+        taker_plan
+            .as_ref()
+            .is_some_and(settlement::TakerPlan::charges_fee),
+    )?;
+    storage::reserve_balance_events(context, balance_event_upper_bound)?;
     registry.flush(context, market_id)?;
     if let Some(plan) = taker_plan {
         settlement::finalize_apply(context, plan, side, market)?;
@@ -1455,6 +1462,7 @@ fn rest_in_book<CTX: ContextTr>(
             // ── APPLY (all rejects passed) ── NOW do the real insert: in-place on a warm list
             // (zero clone), or one materialize-clone on a cold first-touch (unavoidable — it IS
             // the write of a previously-committed list). partition_point re-derives the same idx.
+            storage::reserve_balance_events(context, 1)?;
             drop(buy_ref);
             storage::mutate_buy_orders(context, user, market_id, |list| {
                 let i = list.partition_point(|e| e.price > price);
@@ -1532,6 +1540,7 @@ fn rest_in_book<CTX: ContextTr>(
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
             // ── APPLY (all rejects passed) ── real insert: in-place (warm) / one materialize (cold).
+            storage::reserve_balance_events(context, 1)?;
             drop(sell_ref);
             storage::mutate_sell_orders(context, user, market_id, |list| {
                 let i = list.partition_point(|e| e.price < price);
