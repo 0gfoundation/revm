@@ -98,6 +98,51 @@ sol! {
         /// Gas: BASE_BATCH + N * cancelOrder-cost, charged up front from the pre-decode array length.
         /// Reverts as a whole (zero writes) for: bad calldata, N == 0, N > 256, insufficient gas.
         function batchCancelOrders(bytes32[] orderIds) external returns (bytes statuses);
+        /// One order of a batch placement — the same seven arguments `placeOrder` takes, minus the
+        /// market-wide ones. All fields are STATIC, so `PlaceItem[]` encodes as an offset word, a
+        /// length word, then N * 224 bytes inline (7 words per item, no per-element offset table).
+        /// That fixed stride is what makes the pre-decode length bound in `BatchArrayLayout` sound.
+        struct PlaceItem {
+            uint64  marketId;
+            uint8   side;       // 0 = Buy, 1 = Sell
+            uint64  price;      // ignored for Market orders
+            uint64  quantity;
+            uint8   orderType;  // 0 = Limit, 1 = Market
+            uint8   tif;        // 0 = GTC, 1 = IOC, 2 = FOK, 3 = PostOnly
+            bytes16 clientOrderId;
+        }
+        /// Place up to MAX_BATCH_PLACE (64) orders in one call, on behalf of the caller.
+        ///
+        /// Atomicity is **abort-forward**, not all-or-nothing: items run in strict calldata order and
+        /// a per-item genuine reject (unknown/inactive market, bad side/orderType/tif, qty or price
+        /// out of range, PostOnly would cross, FOK unfillable, insufficient margin, K9
+        /// open-into-insolvency) does NOT undo the items before it. The call returns Ok once the loop
+        /// has begun. A rejected item is write-clean AND log-clean — it emits no `OrderPlaced`.
+        ///
+        /// Each item matches the book **as left by the previous item**, so self-crossing inside one
+        /// batch is allowed and behaves exactly like submitting the items as separate transactions in
+        /// that order.
+        ///
+        /// `statuses` = N concatenated 34-byte records, index-aligned to `orders`:
+        ///   byte 0      tag      1 = Accepted (rests: Open/PartiallyFilled),
+        ///                        2 = Accepted and terminal (fully Filled, or an IOC/FOK/market
+        ///                            remainder that Expired — no resting record is left),
+        ///                        0 = Rejected, 3 = Aborted, 4 = NotAttempted
+        ///   bytes 1..33 orderId  the id the order was placed under; ZERO for tags 0/3/4 (a
+        ///                        rejected item never consumed an id, so none exists)
+        ///   byte 33     reason   numeric reason code; 0 when accepted
+        /// Reason codes are NUMERIC (never strings) — see `PerpBatchReason` in `perp_dex::batch`;
+        /// place-path rejects occupy the 16..=63 band. `statuses` is the outcome AT THE TIME the item
+        /// ran: the taker wallet-cover path can auto-cancel an order an earlier item just rested, and
+        /// the logs (`Trade` / `OrderCancelled` / `PositionChanged`) are the authority on final state.
+        ///
+        /// orderId derivation is the SAME per-user nonce chain `placeOrder` uses —
+        /// keccak256(account || nonce) — and the nonce advances by exactly the number of items that
+        /// consumed an id (accepted, plus an aborted item). A rejected item consumes nothing.
+        ///
+        /// Gas: BASE_BATCH + N * placeOrder-cost, charged up front from the pre-decode array length.
+        /// Reverts as a whole (zero writes) for: bad calldata, N == 0, N > 64, insufficient gas.
+        function batchPlaceOrders(PlaceItem[] orders) external returns (bytes statuses);
         /// Query order details.
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
         function getOrder(bytes32 orderId, uint64 marketId) external view returns (
@@ -262,6 +307,37 @@ sol! {
             uint64 timestamp,
             uint64 recvWindow,
             bytes32[] orderIds,
+            bytes calldata signature
+        ) external returns (bytes statuses);
+
+        /// Place up to MAX_BATCH_PLACE (64) orders for `account`, authenticated by ONE ed25519
+        /// signature covering the whole batch.
+        ///
+        /// Message: "perpdex_v1_batch_order"(22) || account(20) || keyId(1) || timestamp(8)
+        ///          || recvWindow(8) || N(4, big-endian)
+        ///          || N x [ marketId(8) || side(1) || price(8) || quantity(8) || orderType(1)
+        ///                   || tif(1) || clientOrderId(16) ]        // 43 bytes per item
+        /// N is inside the digest, so the batch's size, content and order cannot be tampered with.
+        /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
+        ///
+        /// orderId derivation differs from the direct path — it does NOT touch the per-user nonce:
+        ///   orderId[k] = keccak256(signature || uint32(k) big-endian)
+        /// i.e. index-distinct and bound to this one signature. (The single-order `placeOrderSigned`
+        /// uses the raw keccak256(signature), which would collide across the N items of a batch.)
+        ///
+        /// Replay protection is mandatory here (unlike single-order signed placement, where a
+        /// REJECTED placement deliberately stays replayable in-window): the signature is burned in
+        /// the seen-signature set right after verification, unconditionally — including a batch in
+        /// which every item was rejected — because a batch returns Ok and could otherwise be
+        /// resubmitted and partly re-execute. Resubmitting reverts the whole call.
+        ///
+        /// Returns the same index-aligned 34-byte-per-item `statuses` blob as batchPlaceOrders.
+        function batchPlaceOrdersSigned(
+            address account,
+            uint8 keyId,
+            uint64 timestamp,
+            uint64 recvWindow,
+            PlaceItem[] orders,
             bytes calldata signature
         ) external returns (bytes statuses);
 

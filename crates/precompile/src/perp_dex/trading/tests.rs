@@ -4505,19 +4505,20 @@ mod batch_cancel {
             },
             errors::{perp_err, perp_fatal_invariant_err, perp_invariant_err},
             interface::IPerpDex::{
-                batchCancelOrdersCall, batchCancelOrdersSignedCall, cancelOrderCall,
-                cancelOrderSignedCall, OrderCancelled,
+                batchCancelOrdersCall, batchCancelOrdersSignedCall, batchPlaceOrdersCall,
+                batchPlaceOrdersSignedCall, cancelOrderCall, cancelOrderSignedCall, OrderCancelled,
             },
             selectors_map,
             types::{ApiKey, Order, OrderStatus, OrderType, Side, TimeInForce},
-            CANCEL_ORDER_GAS,
+            CANCEL_ORDER_GAS, PLACE_ORDER_GAS,
         },
         PrecompileError,
     };
     use ed25519_dalek::{Signer, SigningKey};
 
-    const SIGNED_TS: u64 = 1; // == BlockEnv::default() timestamp
-    const SIGNED_RECV: u64 = 60;
+    // Shared with the `batch_place` module below (same shell, same signed-call scaffolding).
+    pub(super) const SIGNED_TS: u64 = 1; // == BlockEnv::default() timestamp
+    pub(super) const SIGNED_RECV: u64 = 60;
 
     // ── helpers ────────────────────────────────────────────────────────────
 
@@ -4530,13 +4531,13 @@ mod batch_cancel {
 
     /// One decoded status record.
     #[derive(Debug, PartialEq, Eq)]
-    struct Status {
-        tag: u8,
-        order_id: [u8; 32],
-        reason: u8,
+    pub(super) struct Status {
+        pub(super) tag: u8,
+        pub(super) order_id: [u8; 32],
+        pub(super) reason: u8,
     }
 
-    fn decode_statuses(blob: &[u8]) -> Vec<Status> {
+    pub(super) fn decode_statuses(blob: &[u8]) -> Vec<Status> {
         assert_eq!(
             blob.len() % BATCH_STATUS_RECORD_LEN,
             0,
@@ -4551,7 +4552,7 @@ mod batch_cancel {
             .collect()
     }
 
-    fn expect(tag: PerpBatchTag, id: [u8; 32], reason: PerpBatchReason) -> Status {
+    pub(super) fn expect(tag: PerpBatchTag, id: [u8; 32], reason: PerpBatchReason) -> Status {
         Status {
             tag: tag as u8,
             order_id: id,
@@ -4830,7 +4831,7 @@ mod batch_cancel {
 
         // (a) write-clean error → Rejected, loop continues.
         let mut ctx = make_ctx();
-        let blob = batch::drive_batch(&mut ctx, 3, echo, |_ctx, k| {
+        let run = batch::drive_batch(&mut ctx, 3, echo, |_ctx, k| {
             if k == 1 {
                 Err(perp_invariant_err("write-clean invariant"))
             } else {
@@ -4838,8 +4839,9 @@ mod batch_cancel {
             }
         })
         .unwrap();
+        assert_eq!((run.accepted, run.aborted_at), (2, None));
         assert_eq!(
-            decode_statuses(&blob),
+            decode_statuses(&run.statuses),
             vec![
                 expect(PerpBatchTag::Accepted, echo(0), PerpBatchReason::None),
                 expect(PerpBatchTag::Rejected, echo(1), PerpBatchReason::Invariant),
@@ -4850,7 +4852,7 @@ mod batch_cancel {
 
         // (b) error AFTER a perp write → Aborted + NotAttempted tail, still Ok.
         let mut ctx = make_ctx();
-        let blob = batch::drive_batch(&mut ctx, 4, echo, |ctx, k| {
+        let run = batch::drive_batch(&mut ctx, 4, echo, |ctx, k| {
             if k == 1 {
                 storage::save_user_nonce(ctx, ALICE, 7)?;
                 Err(perp_err("plain reject, but it wrote first"))
@@ -4859,8 +4861,10 @@ mod batch_cancel {
             }
         })
         .unwrap();
+        // The place path advances the order nonce by `accepted` + the aborted item's own id.
+        assert_eq!((run.accepted, run.aborted_at), (1, Some(1)));
         assert_eq!(
-            decode_statuses(&blob),
+            decode_statuses(&run.statuses),
             vec![
                 expect(PerpBatchTag::Accepted, echo(0), PerpBatchReason::None),
                 expect(PerpBatchTag::Aborted, echo(1), PerpBatchReason::Other),
@@ -4935,7 +4939,7 @@ mod batch_cancel {
 
     #[test]
     fn batch_unit_matches_single_selector_cost() {
-        // The per-item unit must BE the single-cancel selector cost, not a re-invented number.
+        // The per-item unit must BE the single-selector cost, not a re-invented number.
         assert_eq!(
             selectors_map()
                 .get(&cancelOrderCall::SELECTOR)
@@ -4950,10 +4954,29 @@ mod batch_cancel {
                 .0,
             CANCEL_ORDER_GAS
         );
+        // Same for place — and the value itself is pinned, since it is now a shared const.
+        assert_eq!(CANCEL_ORDER_GAS, 80_000);
+        assert_eq!(PLACE_ORDER_GAS, 200_000);
+        assert_eq!(
+            selectors_map()
+                .get(&placeOrderCall::SELECTOR)
+                .expect("placeOrder in table")
+                .0,
+            PLACE_ORDER_GAS
+        );
+        assert_eq!(
+            selectors_map()
+                .get(&placeOrderSignedCall::SELECTOR)
+                .unwrap()
+                .0,
+            PLACE_ORDER_GAS
+        );
         // …and the batch selectors' table entry is only the ENVELOPE FLOOR.
         for sel in [
             batchCancelOrdersCall::SELECTOR,
             batchCancelOrdersSignedCall::SELECTOR,
+            batchPlaceOrdersCall::SELECTOR,
+            batchPlaceOrdersSignedCall::SELECTOR,
         ] {
             let (cost, can_be_static) = *selectors_map().get(&sel).expect("batch sel in table");
             assert_eq!(cost, BASE_BATCH_GAS);
@@ -5092,7 +5115,7 @@ mod batch_cancel {
         .abi_encode()
     }
 
-    fn register_key(ctx: &mut TestCtx, user: Address, sk: &SigningKey) {
+    pub(super) fn register_key(ctx: &mut TestCtx, user: Address, sk: &SigningKey) {
         storage::save_api_key(
             ctx,
             user,
@@ -5320,8 +5343,94 @@ mod batch_cancel {
             reason_code(&perp_err("cancelOrder: unknown market")),
             PerpBatchReason::UnknownMarket
         );
+        // Place path (Phase 2). Every message below is copied from `validate_place_order` /
+        // `execute_*` / `rest_in_book` / `finalize_compute`; a rename must fail HERE.
+        for (msg, want) in [
+            ("unknown market", PerpBatchReason::PlaceUnknownMarket),
+            ("market not active", PerpBatchReason::MarketNotActive),
+            ("invalid side", PerpBatchReason::InvalidSide),
+            ("invalid orderType", PerpBatchReason::InvalidOrderType),
+            ("invalid tif", PerpBatchReason::InvalidTif),
+            (
+                "quantity below minimum",
+                PerpBatchReason::QuantityBelowMinimum,
+            ),
+            (
+                "quantity exceeds maximum",
+                PerpBatchReason::QuantityAboveMaximum,
+            ),
+            (
+                "quantity not multiple of step_size",
+                PerpBatchReason::QuantityStepSize,
+            ),
+            ("limit order price must be > 0", PerpBatchReason::PriceZero),
+            ("price exceeds maximum", PerpBatchReason::PriceAboveMaximum),
+            (
+                "price not multiple of tick_size",
+                PerpBatchReason::PriceTickSize,
+            ),
+            (
+                "PostOnly order would match",
+                PerpBatchReason::PostOnlyWouldMatch,
+            ),
+            (
+                "FOK order cannot be fully filled",
+                PerpBatchReason::FokUnfillable,
+            ),
+            (
+                "insufficient perp wallet for margin",
+                PerpBatchReason::InsufficientMargin,
+            ),
+            (
+                "open would breach maintenance margin",
+                PerpBatchReason::OpenIntoInsolvency,
+            ),
+            (
+                "fee recipient not initialised",
+                PerpBatchReason::FeeRecipientNotSet,
+            ),
+            ("reserve delta overflow", PerpBatchReason::ArithmeticGuard),
+            ("fee reserve overflow", PerpBatchReason::ArithmeticGuard),
+            (
+                "fills+rest requirement overflow",
+                PerpBatchReason::ArithmeticGuard,
+            ),
+            ("total required overflow", PerpBatchReason::ArithmeticGuard),
+            ("order nonce overflow", PerpBatchReason::ArithmeticGuard),
+            ("brand new place reject", PerpBatchReason::Other),
+        ] {
+            assert_eq!(
+                reason_code(&perp_err(format!("placeOrder: {msg}"))),
+                want,
+                "placeOrder: {msg}"
+            );
+        }
+        // Non-`placeOrder:`-prefixed engine guards reachable from the place path.
+        assert_eq!(
+            reason_code(&perp_err("settlement: realized PnL overflow")),
+            PerpBatchReason::ArithmeticGuard
+        );
+        assert_eq!(
+            reason_code(&perp_err("perp wallet: amount exceeds i64::MAX")),
+            PerpBatchReason::ArithmeticGuard
+        );
+        assert_eq!(
+            reason_code(&perp_err("split_position_fill: opening value underflow")),
+            PerpBatchReason::ArithmeticGuard
+        );
+        // Reject codes are PARTITIONED by path: a place reject never lands in the cancel band and
+        // vice versa (both selectors have an "unknown market", and they must not share a code).
+        assert_ne!(
+            reason_code(&perp_err("placeOrder: unknown market")),
+            reason_code(&perp_err("cancelOrder: unknown market"))
+        );
         assert_eq!(
             reason_code(&perp_invariant_err("anything")),
+            PerpBatchReason::Invariant
+        );
+        // An `[INVARIANT] ` prefix wins over any place/cancel text inside it.
+        assert_eq!(
+            reason_code(&perp_invariant_err("placeOrder: unknown market")),
             PerpBatchReason::Invariant
         );
         assert_eq!(
@@ -5345,6 +5454,40 @@ mod batch_cancel {
         );
         assert_eq!(BATCH_STATUS_RECORD_LEN, 34);
         assert_eq!(MAX_BATCH_CANCEL, 256);
+        assert_eq!(crate::perp_dex::batch::MAX_BATCH_PLACE, 64);
+        // Wire values of every reason code: consensus-adjacent client contract.
+        assert_eq!(
+            [
+                PerpBatchReason::None as u8,
+                PerpBatchReason::OrderNotFound as u8,
+                PerpBatchReason::NotOwner as u8,
+                PerpBatchReason::NotCancellable as u8,
+                PerpBatchReason::UnknownMarket as u8,
+                PerpBatchReason::PlaceUnknownMarket as u8,
+                PerpBatchReason::MarketNotActive as u8,
+                PerpBatchReason::InvalidSide as u8,
+                PerpBatchReason::InvalidOrderType as u8,
+                PerpBatchReason::InvalidTif as u8,
+                PerpBatchReason::QuantityBelowMinimum as u8,
+                PerpBatchReason::QuantityAboveMaximum as u8,
+                PerpBatchReason::QuantityStepSize as u8,
+                PerpBatchReason::PriceZero as u8,
+                PerpBatchReason::PriceAboveMaximum as u8,
+                PerpBatchReason::PriceTickSize as u8,
+                PerpBatchReason::PostOnlyWouldMatch as u8,
+                PerpBatchReason::FokUnfillable as u8,
+                PerpBatchReason::InsufficientMargin as u8,
+                PerpBatchReason::OpenIntoInsolvency as u8,
+                PerpBatchReason::FeeRecipientNotSet as u8,
+                PerpBatchReason::ArithmeticGuard as u8,
+                PerpBatchReason::Invariant as u8,
+                PerpBatchReason::Other as u8,
+            ],
+            [
+                0, 1, 2, 3, 4, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 253,
+                254, 255
+            ]
+        );
     }
 
     /// Batch selectors are not view calls.
@@ -5354,6 +5497,976 @@ mod batch_cancel {
         setup(&mut ctx);
         let err = run_perp_dex_call(
             &direct_calldata(&[[0x11u8; 32]]),
+            30_000_000,
+            ALICE,
+            U256::ZERO,
+            true,
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PrecompileError::StaticRestrictionViolation),
+            "got {err:?}"
+        );
+    }
+}
+
+// ── Batch place (Phase 2) ──────────────────────────────────────────────────
+//
+// Reuses the Phase 1 shell verbatim (pre-decode length validation, dynamic gas, the 34-byte
+// index-aligned status blob, abort-forward). What is NEW and therefore what these tests hammer:
+// the orderId/nonce rule (`save_order` has no collision guard, so a wrong rule is silent state
+// corruption), the Accepted-vs-Filled tag split, the place-path reason codes, the 224-byte element
+// stride, and the Phase 0 synergy that makes a batch safe at all — a rejected item emits no
+// `OrderPlaced`.
+mod batch_place {
+    use super::batch_cancel::{
+        decode_statuses, expect, register_key, Status, SIGNED_RECV, SIGNED_TS,
+    };
+    use super::*;
+    use crate::{
+        perp_dex::{
+            batch::{
+                self, PerpBatchReason, PerpBatchTag, BASE_BATCH_GAS, BATCH_STATUS_RECORD_LEN,
+                MAX_BATCH_PLACE, PLACE_ITEM_ENCODED_LEN,
+            },
+            interface::IPerpDex::{
+                batchPlaceOrdersCall, batchPlaceOrdersSignedCall, OrderPlaced, PlaceItem, Trade,
+            },
+            PLACE_ORDER_GAS,
+        },
+        PrecompileError,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const ZERO_ID: [u8; 32] = [0u8; 32];
+    /// A market id that was never registered.
+    const NO_MARKET: u64 = 999;
+    /// Registered but `active: false`.
+    const INACTIVE_MARKET: u64 = 2;
+
+    // ── helpers ────────────────────────────────────────────────────────────
+
+    fn item_in(
+        market_id: u64,
+        side: u8,
+        price: u64,
+        qty: u64,
+        order_type: u8,
+        tif: u8,
+    ) -> PlaceItem {
+        PlaceItem {
+            marketId: market_id,
+            side,
+            price,
+            quantity: qty,
+            orderType: order_type,
+            tif,
+            clientOrderId: FixedBytes::default(),
+        }
+    }
+
+    /// Limit GTC item on the default market.
+    fn gtc(side: u8, price: u64, qty: u64) -> PlaceItem {
+        item_in(MARKET_ID, side, price, qty, 0, 0)
+    }
+
+    fn direct_calldata(items: &[PlaceItem]) -> Vec<u8> {
+        batchPlaceOrdersCall {
+            orders: items.to_vec(),
+        }
+        .abi_encode()
+    }
+
+    /// Runs a batch through the real entry point and returns the raw statuses blob.
+    fn batch_place(ctx: &mut TestCtx, caller: Address, items: &[PlaceItem]) -> Vec<u8> {
+        let out = run_perp_dex_call(
+            &direct_calldata(items),
+            30_000_000,
+            caller,
+            U256::ZERO,
+            false,
+            ctx,
+        )
+        .expect("batch must not hard-fail");
+        assert!(
+            !out.reverted,
+            "batch must return Ok once the loop has begun (reverted with {:?})",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        assert_eq!(
+            out.gas_used,
+            BASE_BATCH_GAS + items.len() as u64 * PLACE_ORDER_GAS,
+            "the FULL dynamic cost must be what the output charges"
+        );
+        batchPlaceOrdersCall::abi_decode_returns(&out.bytes)
+            .unwrap()
+            .to_vec()
+    }
+
+    fn nonce(ctx: &mut TestCtx, user: Address) -> u64 {
+        storage::load_user_nonce(ctx, user).unwrap()
+    }
+
+    /// The id item `k` of a direct batch must use, given the nonce the batch started from.
+    fn direct_id(user: Address, base_nonce: u64, ids_consumed_before: u64) -> [u8; 32] {
+        derive_order_id(user, base_nonce + ids_consumed_before)
+    }
+
+    fn register_inactive_market(ctx: &mut TestCtx) {
+        let mut m = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+        m.market_id = INACTIVE_MARKET;
+        m.active = false;
+        storage::save_market(ctx, &m).unwrap();
+    }
+
+    fn order_placed_ids(ctx: &mut TestCtx) -> Vec<[u8; 32]> {
+        JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .filter(|l| l.data.topics().first() == Some(&OrderPlaced::SIGNATURE_HASH))
+            .map(|l| {
+                OrderPlaced::decode_raw_log(l.data.topics(), &l.data.data)
+                    .unwrap()
+                    .orderId
+                    .0
+            })
+            .collect()
+    }
+
+    fn trade_count(ctx: &mut TestCtx) -> usize {
+        JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .filter(|l| l.data.topics().first() == Some(&Trade::SIGNATURE_HASH))
+            .count()
+    }
+
+    // ── 1. happy path: rest + fill in one batch ────────────────────────────
+
+    #[test]
+    fn batch_place_mixes_resting_and_filled_and_is_index_aligned() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        // One resting ask for item 0 to sweep.
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let base = nonce(&mut ctx, ALICE);
+
+        let items = [
+            gtc(0, PRICE, QTY),            // crosses BOB's ask → fully filled
+            gtc(0, PRICE - TICK, QTY),     // rests as a bid
+            gtc(1, PRICE + 2 * TICK, QTY), // rests as an ask
+        ];
+        let blob = batch_place(&mut ctx, ALICE, &items);
+
+        let (id0, id1, id2) = (
+            direct_id(ALICE, base, 0),
+            direct_id(ALICE, base, 1),
+            direct_id(ALICE, base, 2),
+        );
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                // Terminal ⇒ Filled: it swept the book and left no resting record.
+                expect(PerpBatchTag::Filled, id0, PerpBatchReason::None),
+                expect(PerpBatchTag::Accepted, id1, PerpBatchReason::None),
+                expect(PerpBatchTag::Accepted, id2, PerpBatchReason::None),
+            ]
+        );
+        // Tags agree with storage: Filled ⇒ deleted, Accepted ⇒ live.
+        assert_terminal(&mut ctx, id0);
+        assert!(storage::load_order(&mut ctx, &id1).unwrap().is_some());
+        assert!(storage::load_order(&mut ctx, &id2).unwrap().is_some());
+        // Three accepted items consumed exactly three ids.
+        assert_eq!(nonce(&mut ctx, ALICE), base + 3);
+        // One OrderPlaced per accepted item, in calldata order.
+        assert_eq!(order_placed_ids(&mut ctx), vec![id0, id1, id2]);
+    }
+
+    /// A partial fill that rests its remainder is `PartiallyFilled` — NOT terminal, so tag 1.
+    #[test]
+    fn partially_filled_remainder_reports_the_resting_tag() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // only QTY on the ask
+        let base = nonce(&mut ctx, ALICE);
+
+        let blob = batch_place(&mut ctx, ALICE, &[gtc(0, PRICE, QTY * 2)]);
+
+        let id0 = direct_id(ALICE, base, 0);
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![expect(PerpBatchTag::Accepted, id0, PerpBatchReason::None)]
+        );
+        let order = get_order(&mut ctx, id0);
+        assert_eq!(order.filled, QTY);
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(nonce(&mut ctx, ALICE), base + 1);
+    }
+
+    /// An IOC that matches nothing is ACCEPTED but terminal (Expired) — tag 2, not tag 1, and no
+    /// resting record. Pins the "terminal ⇒ Filled" rule against the non-fill flavour.
+    #[test]
+    fn accepted_but_expired_ioc_reports_the_terminal_tag() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let base = nonce(&mut ctx, ALICE);
+
+        let items = [item_in(MARKET_ID, 0, PRICE, QTY, 0, 1)]; // IOC, empty book
+        let blob = batch_place(&mut ctx, ALICE, &items);
+
+        let id0 = direct_id(ALICE, base, 0);
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![expect(PerpBatchTag::Filled, id0, PerpBatchReason::None)]
+        );
+        assert_terminal(&mut ctx, id0);
+        // Accepted ⇒ the id was consumed, and OrderPlaced was emitted.
+        assert_eq!(nonce(&mut ctx, ALICE), base + 1);
+        assert_eq!(order_placed_ids(&mut ctx), vec![id0]);
+    }
+
+    // ── 2. THE id/nonce rule ───────────────────────────────────────────────
+
+    /// A rejected item must consume NO id: the accepted items' ids stay gapless, and the nonce
+    /// advances by exactly the accepted count. (A drifting nonce would let a later batch re-derive an
+    /// id a resting order already holds, and `save_order` has no collision guard.)
+    #[test]
+    fn rejected_items_consume_no_id_so_ids_are_gapless() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let base = nonce(&mut ctx, ALICE);
+
+        let items = [
+            gtc(0, PRICE - TICK, QTY),
+            item_in(NO_MARKET, 0, PRICE, QTY, 0, 0), // reject
+            gtc(0, PRICE - 2 * TICK, QTY),
+            item_in(MARKET_ID, 7, PRICE, QTY, 0, 0), // reject: invalid side
+            gtc(0, PRICE - 3 * TICK, QTY),
+        ];
+        let blob = batch_place(&mut ctx, ALICE, &items);
+
+        let (d0, d1, d2) = (
+            direct_id(ALICE, base, 0),
+            direct_id(ALICE, base, 1),
+            direct_id(ALICE, base, 2),
+        );
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                expect(PerpBatchTag::Accepted, d0, PerpBatchReason::None),
+                // A rejected item has NO id — the field is zero, not an echo.
+                expect(
+                    PerpBatchTag::Rejected,
+                    ZERO_ID,
+                    PerpBatchReason::PlaceUnknownMarket
+                ),
+                expect(PerpBatchTag::Accepted, d1, PerpBatchReason::None),
+                expect(
+                    PerpBatchTag::Rejected,
+                    ZERO_ID,
+                    PerpBatchReason::InvalidSide
+                ),
+                expect(PerpBatchTag::Accepted, d2, PerpBatchReason::None),
+            ]
+        );
+        for id in [d0, d1, d2] {
+            assert!(
+                storage::load_order(&mut ctx, &id).unwrap().is_some(),
+                "every accepted item must rest under its reported id"
+            );
+        }
+        assert_eq!(
+            nonce(&mut ctx, ALICE),
+            base + 3,
+            "the nonce must advance by the ACCEPTED count (3), not by N (5)"
+        );
+        // …and the very next single-order placement continues the same chain.
+        assert_eq!(place(&mut ctx, ALICE, 0, PRICE - 4 * TICK, QTY, 0, 0), {
+            direct_id(ALICE, base, 3)
+        });
+    }
+
+    /// Two successive direct batches from the same account must never produce a duplicate live id.
+    #[test]
+    fn two_successive_direct_batches_never_reuse_a_live_order_id() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let base = nonce(&mut ctx, ALICE);
+
+        let first = batch_place(
+            &mut ctx,
+            ALICE,
+            &[
+                gtc(0, PRICE - TICK, QTY),
+                gtc(0, PRICE - 2 * TICK, QTY),
+                gtc(0, PRICE - 3 * TICK, QTY),
+            ],
+        );
+        let second = batch_place(
+            &mut ctx,
+            ALICE,
+            &[
+                gtc(0, PRICE - 4 * TICK, QTY),
+                gtc(0, PRICE - 5 * TICK, QTY),
+                gtc(0, PRICE - 6 * TICK, QTY),
+            ],
+        );
+
+        let mut ids: Vec<[u8; 32]> = decode_statuses(&first)
+            .iter()
+            .chain(decode_statuses(&second).iter())
+            .map(|s| {
+                assert_eq!(s.tag, PerpBatchTag::Accepted as u8);
+                s.order_id
+            })
+            .collect();
+        assert_eq!(ids.len(), 6);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(*id, direct_id(ALICE, base, i as u64), "id {i} off-chain");
+            assert!(
+                storage::load_order(&mut ctx, id).unwrap().is_some(),
+                "all six orders must be live at once — a reused id would have overwritten one"
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 6, "ids must be pairwise distinct");
+        assert_eq!(nonce(&mut ctx, ALICE), base + 6);
+    }
+
+    /// An ALL-rejected batch must leave the nonce key untouched (no redundant same-value write, so
+    /// the batch contributes zero keys to the block delta).
+    #[test]
+    fn all_rejected_batch_writes_nothing_at_all() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let base = nonce(&mut ctx, ALICE);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+
+        let blob = batch_place(
+            &mut ctx,
+            ALICE,
+            &[
+                item_in(NO_MARKET, 0, PRICE, QTY, 0, 0),
+                item_in(MARKET_ID, 9, PRICE, QTY, 0, 0),
+            ],
+        );
+
+        assert!(decode_statuses(&blob)
+            .iter()
+            .all(|s| s.tag == PerpBatchTag::Rejected as u8 && s.order_id == ZERO_ID));
+        assert_eq!(
+            JournalTr::perp_write_count(ctx.journal_mut()),
+            writes_before,
+            "an all-rejected batch must be write-clean, nonce included"
+        );
+        assert_eq!(nonce(&mut ctx, ALICE), base);
+        assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+    }
+
+    // ── 3. reject reason codes ─────────────────────────────────────────────
+
+    /// Every place-path reject the engine can raise from one call, each mapped to its code — and the
+    /// whole batch write-clean, which is what the driver's runtime classification keys off.
+    #[test]
+    fn every_place_reject_maps_to_its_code_and_is_write_clean() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        register_inactive_market(&mut ctx);
+        // A resting ask at PRICE gives the PostOnly-cross and FOK-unfillable cases something real.
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+
+        let cases: [(PlaceItem, PerpBatchReason); 14] = [
+            (
+                item_in(NO_MARKET, 0, PRICE, QTY, 0, 0),
+                PerpBatchReason::PlaceUnknownMarket,
+            ),
+            (
+                item_in(INACTIVE_MARKET, 0, PRICE, QTY, 0, 0),
+                PerpBatchReason::MarketNotActive,
+            ),
+            (
+                item_in(MARKET_ID, 7, PRICE, QTY, 0, 0),
+                PerpBatchReason::InvalidSide,
+            ),
+            (
+                item_in(MARKET_ID, 0, PRICE, QTY, 9, 0),
+                PerpBatchReason::InvalidOrderType,
+            ),
+            (
+                item_in(MARKET_ID, 0, PRICE, QTY, 0, 9),
+                PerpBatchReason::InvalidTif,
+            ),
+            (
+                gtc(0, PRICE, QTY / 2),
+                PerpBatchReason::QuantityBelowMinimum,
+            ),
+            (
+                gtc(0, PRICE, QTY * 2_000),
+                PerpBatchReason::QuantityAboveMaximum,
+            ),
+            (gtc(0, PRICE, QTY + 1), PerpBatchReason::QuantityStepSize),
+            (gtc(0, 0, QTY), PerpBatchReason::PriceZero),
+            (
+                gtc(0, PRICE * 2_000, QTY),
+                PerpBatchReason::PriceAboveMaximum,
+            ),
+            (gtc(0, PRICE + 1, QTY), PerpBatchReason::PriceTickSize),
+            (
+                item_in(MARKET_ID, 0, PRICE, QTY, 0, 3), // PostOnly, would cross BOB's ask
+                PerpBatchReason::PostOnlyWouldMatch,
+            ),
+            (
+                item_in(MARKET_ID, 0, PRICE - 4 * TICK, QTY, 0, 2), // FOK, nothing to fill against
+                PerpBatchReason::FokUnfillable,
+            ),
+            (
+                // Rests (below the ask, so no match) but its margin dwarfs the 10-USDC wallet.
+                gtc(0, PRICE - 5 * TICK, QTY * 1_000),
+                PerpBatchReason::InsufficientMargin,
+            ),
+        ];
+
+        let items: Vec<PlaceItem> = cases.iter().map(|(i, _)| i.clone()).collect();
+        let blob = batch_place(&mut ctx, ALICE, &items);
+
+        assert_eq!(
+            decode_statuses(&blob),
+            cases
+                .iter()
+                .map(|(_, code)| expect(PerpBatchTag::Rejected, ZERO_ID, *code))
+                .collect::<Vec<Status>>()
+        );
+        assert_eq!(
+            JournalTr::perp_write_count(ctx.journal_mut()),
+            writes_before,
+            "every place-path genuine reject must be write-clean"
+        );
+        assert!(
+            JournalTr::take_logs(ctx.journal_mut()).is_empty(),
+            "and log-clean: a rejected placement emits no OrderPlaced (Phase 0)"
+        );
+    }
+
+    /// The Phase 0 synergy that makes a batch safe: a rejected item emits NO `OrderPlaced`, even
+    /// though the batch returns `Ok` and therefore never truncates the log stream.
+    #[test]
+    fn rejected_item_emits_no_order_placed_while_the_accepted_one_does() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let base = nonce(&mut ctx, ALICE);
+
+        let blob = batch_place(
+            &mut ctx,
+            ALICE,
+            &[
+                item_in(MARKET_ID, 0, PRICE, QTY, 0, 3), // PostOnly cross → rejected
+                gtc(0, PRICE - TICK, QTY),               // rests
+            ],
+        );
+
+        let accepted = direct_id(ALICE, base, 0);
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                expect(
+                    PerpBatchTag::Rejected,
+                    ZERO_ID,
+                    PerpBatchReason::PostOnlyWouldMatch
+                ),
+                expect(PerpBatchTag::Accepted, accepted, PerpBatchReason::None),
+            ]
+        );
+        assert_eq!(
+            order_placed_ids(&mut ctx),
+            vec![accepted],
+            "exactly one OrderPlaced, for the accepted item only"
+        );
+    }
+
+    // ── 4. intra-batch determinism ─────────────────────────────────────────
+
+    /// Item `i` rests, item `i+1` matches it: allowed, and identical to submitting the two as
+    /// separate transactions in that order (there is no self-trade guard).
+    #[test]
+    fn intra_batch_self_cross_fills_the_earlier_item() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let base = nonce(&mut ctx, ALICE);
+
+        let blob = batch_place(&mut ctx, ALICE, &[gtc(1, PRICE, QTY), gtc(0, PRICE, QTY)]);
+
+        let (maker, taker) = (direct_id(ALICE, base, 0), direct_id(ALICE, base, 1));
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                // `statuses` is the outcome AT THE TIME the item ran: item 0 DID rest. Item 1 then
+                // consumed it, so the maker is terminal by end-of-call — the logs are the authority.
+                expect(PerpBatchTag::Accepted, maker, PerpBatchReason::None),
+                expect(PerpBatchTag::Filled, taker, PerpBatchReason::None),
+            ]
+        );
+        assert_terminal(&mut ctx, maker);
+        assert_terminal(&mut ctx, taker);
+        assert_eq!(nonce(&mut ctx, ALICE), base + 2);
+        // Self-trade nets out exactly as the equivalent two single-order txs do.
+        assert_eq!(wallet(&mut ctx, ALICE), WALLET);
+        assert_eq!(
+            pos(&mut ctx, ALICE),
+            PerpPosition {
+                leverage: 1,
+                ..PerpPosition::default()
+            }
+        );
+        assert_eq!(trade_count(&mut ctx), 1);
+    }
+
+    #[test]
+    fn status_blob_is_byte_identical_across_runs() {
+        let scenario = || {
+            let mut ctx = make_ctx();
+            setup(&mut ctx);
+            place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+            batch_place(
+                &mut ctx,
+                ALICE,
+                &[
+                    gtc(0, PRICE, QTY),                      // fills
+                    item_in(NO_MARKET, 0, PRICE, QTY, 0, 0), // rejected
+                    gtc(0, PRICE - TICK, QTY),               // rests
+                    item_in(MARKET_ID, 0, PRICE, QTY, 0, 3), // PostOnly, book now empty → rests
+                ],
+            )
+        };
+        let first = scenario();
+        assert_eq!(first, scenario());
+        assert_eq!(first, scenario());
+        assert_eq!(first.len(), 4 * BATCH_STATUS_RECORD_LEN);
+    }
+
+    // ── 5. pre-loop faults revert the whole call ───────────────────────────
+
+    #[test]
+    fn empty_and_oversized_batches_revert_write_clean() {
+        for items in [
+            Vec::<PlaceItem>::new(),
+            vec![gtc(0, PRICE - TICK, QTY); MAX_BATCH_PLACE + 1],
+        ] {
+            let mut ctx = make_ctx();
+            setup(&mut ctx);
+            let _ = JournalTr::take_logs(ctx.journal_mut());
+            let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+
+            let out = run_perp_dex_call(
+                &direct_calldata(&items),
+                u64::MAX, // never let gas be the reason
+                ALICE,
+                U256::ZERO,
+                false,
+                &mut ctx,
+            )
+            .unwrap();
+            assert!(
+                out.reverted,
+                "N = {} must revert the whole call",
+                items.len()
+            );
+            assert_eq!(
+                JournalTr::perp_write_count(ctx.journal_mut()),
+                writes_before,
+                "a pre-loop fault must be write-clean"
+            );
+            assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+        }
+    }
+
+    /// N == MAX is accepted: 64 real resting orders, 64 distinct ids, one nonce advance of 64.
+    #[test]
+    fn max_batch_place_is_accepted() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        fund(&mut ctx, ALICE, WALLET * 20); // 64 rests at ~1 USDC of margin each
+        let base = nonce(&mut ctx, ALICE);
+
+        let items: Vec<PlaceItem> = (0..MAX_BATCH_PLACE as u64)
+            .map(|i| gtc(0, PRICE - i * TICK, QTY))
+            .collect();
+        let blob = batch_place(&mut ctx, ALICE, &items);
+
+        assert_eq!(blob.len(), MAX_BATCH_PLACE * BATCH_STATUS_RECORD_LEN);
+        let mut ids: Vec<[u8; 32]> = decode_statuses(&blob)
+            .iter()
+            .map(|s| {
+                assert_eq!(s.tag, PerpBatchTag::Accepted as u8, "{s:?}");
+                s.order_id
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), MAX_BATCH_PLACE);
+        assert_eq!(nonce(&mut ctx, ALICE), base + MAX_BATCH_PLACE as u64);
+    }
+
+    // ── 6. gas ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn insufficient_gas_limit_is_out_of_gas_before_any_write() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+        let items = [gtc(0, PRICE - TICK, QTY), gtc(0, PRICE - 2 * TICK, QTY)];
+
+        let full = BASE_BATCH_GAS + 2 * PLACE_ORDER_GAS;
+        let err = run_perp_dex_call(
+            &direct_calldata(&items),
+            full - 1,
+            ALICE,
+            U256::ZERO,
+            false,
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PrecompileError::OutOfGas), "got {err:?}");
+        assert_eq!(
+            JournalTr::perp_write_count(ctx.journal_mut()),
+            writes_before,
+            "OutOfGas must precede every write"
+        );
+        assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+
+        // Exactly the computed cost succeeds and charges exactly that.
+        let out = run_perp_dex_call(
+            &direct_calldata(&items),
+            full,
+            ALICE,
+            U256::ZERO,
+            false,
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(!out.reverted);
+        assert_eq!(out.gas_used, full);
+    }
+
+    /// The 224-byte element stride must be what backs the pre-decode length bound. The decisive case
+    /// is `stride confusion`: a declared length that a 32-byte-per-element bound would accept and a
+    /// 224-byte-per-element bound must reject.
+    #[test]
+    fn hostile_length_word_reverts_without_allocating() {
+        assert_eq!(PLACE_ITEM_ENCODED_LEN, 224);
+        // selector || offset(0x20) || length || <body>
+        let head = |len: u32, body: usize| {
+            let mut v = vec![0u8; 4 + 64 + body];
+            v[..4].copy_from_slice(&batchPlaceOrdersCall::SELECTOR);
+            v[35] = 0x20;
+            v[64..68].copy_from_slice(&len.to_be_bytes());
+            v
+        };
+
+        let huge_u32 = head(u32::MAX, 0);
+        let mut huge_u256 = head(1, 0);
+        huge_u256[36..68].fill(0xff);
+        let mut bad_offset = head(1, PLACE_ITEM_ENCODED_LEN);
+        bad_offset[35] = 0x40;
+        // 7 items declared, 7*32 bytes of body: enough for a bytes32[] of 7, 7× short for PlaceItem[].
+        let stride_confusion = head(7, 7 * 32);
+        // One item declared, one word short of its 224 bytes.
+        let truncated = head(1, PLACE_ITEM_ENCODED_LEN - 32);
+
+        for (name, input) in [
+            ("u32::MAX length", huge_u32),
+            ("u256 length", huge_u256),
+            ("non-canonical offset", bad_offset),
+            ("32-byte-stride body for a 224-byte item", stride_confusion),
+            ("truncated final item", truncated),
+        ] {
+            let mut ctx = make_ctx();
+            setup(&mut ctx);
+            let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+            let out =
+                run_perp_dex_call(&input, u64::MAX, ALICE, U256::ZERO, false, &mut ctx).unwrap();
+            assert!(out.reverted, "{name} must revert");
+            assert_eq!(
+                out.gas_used, BASE_BATCH_GAS,
+                "{name}: an unreadable length word charges only the envelope floor"
+            );
+            assert_eq!(
+                JournalTr::perp_write_count(ctx.journal_mut()),
+                writes_before,
+                "{name} must be write-clean"
+            );
+        }
+
+        // A well-formed one-item call is exactly selector + offset + length + one 224-byte item, and
+        // the pre-decode read agrees with the decoder.
+        let good = direct_calldata(&[gtc(0, PRICE, QTY)]);
+        assert_eq!(good.len(), 4 + 32 + 32 + PLACE_ITEM_ENCODED_LEN);
+        assert_eq!(
+            batch::PLACE_DIRECT_LAYOUT.checked_len(&good).unwrap(),
+            1,
+            "the pre-decode read must accept the canonical encoding"
+        );
+        assert_eq!(
+            batch::batch_dynamic_gas(batchPlaceOrdersCall::SELECTOR, &good),
+            Some(BASE_BATCH_GAS + PLACE_ORDER_GAS)
+        );
+    }
+
+    #[test]
+    fn gas_math_saturates_instead_of_wrapping() {
+        assert_eq!(batch::batch_gas(usize::MAX, PLACE_ORDER_GAS), u64::MAX);
+        assert_eq!(
+            batch::batch_gas(MAX_BATCH_PLACE, PLACE_ORDER_GAS),
+            BASE_BATCH_GAS + MAX_BATCH_PLACE as u64 * PLACE_ORDER_GAS
+        );
+        assert!(batch::batch_dynamic_gas(batchPlaceOrdersCall::SELECTOR, &[0u8; 8]).is_none());
+    }
+
+    // ── 7. signed batch ────────────────────────────────────────────────────
+
+    fn sign(
+        items: &[PlaceItem],
+        sk: &SigningKey,
+        account: Address,
+        ts: u64,
+        recv: u64,
+    ) -> [u8; 64] {
+        let msg = batch_place_message(account, 0, ts, recv, items);
+        sk.sign(&msg).to_bytes()
+    }
+
+    fn signed_calldata(
+        sk: &SigningKey,
+        account: Address,
+        timestamp: u64,
+        recv_window: u64,
+        items: &[PlaceItem],
+        // Items actually put on the wire; `None` = same as the signed set.
+        wire_items: Option<&[PlaceItem]>,
+    ) -> Vec<u8> {
+        batchPlaceOrdersSignedCall {
+            account,
+            keyId: 0,
+            timestamp,
+            recvWindow: recv_window,
+            orders: wire_items.unwrap_or(items).to_vec(),
+            signature: sign(items, sk, account, timestamp, recv_window)
+                .to_vec()
+                .into(),
+        }
+        .abi_encode()
+    }
+
+    /// `orderId[k] = keccak256(signature || u32BE(k))`.
+    fn expected_signed_id(signature: &[u8; 64], k: u32) -> [u8; 32] {
+        let mut buf = [0u8; 68];
+        buf[..64].copy_from_slice(signature);
+        buf[64..].copy_from_slice(&k.to_be_bytes());
+        primitives::keccak256(buf).0
+    }
+
+    #[test]
+    fn signed_batch_place_happy_path_with_index_distinct_ids() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register_key(&mut ctx, ALICE, &sk);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let base = nonce(&mut ctx, ALICE);
+
+        let items = [
+            gtc(0, PRICE, QTY),        // fills against BOB
+            gtc(0, PRICE - TICK, QTY), // rests
+            gtc(1, PRICE + TICK, QTY), // rests
+        ];
+        let input = signed_calldata(&sk, ALICE, SIGNED_TS, SIGNED_RECV, &items, None);
+        let out =
+            run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(!out.reverted, "{:?}", String::from_utf8_lossy(&out.bytes));
+        assert_eq!(out.gas_used, BASE_BATCH_GAS + 3 * PLACE_ORDER_GAS);
+
+        let sig = sign(&items, &sk, ALICE, SIGNED_TS, SIGNED_RECV);
+        let ids = [
+            expected_signed_id(&sig, 0),
+            expected_signed_id(&sig, 1),
+            expected_signed_id(&sig, 2),
+        ];
+        let blob = batchPlaceOrdersSignedCall::abi_decode_returns(&out.bytes).unwrap();
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                expect(PerpBatchTag::Filled, ids[0], PerpBatchReason::None),
+                expect(PerpBatchTag::Accepted, ids[1], PerpBatchReason::None),
+                expect(PerpBatchTag::Accepted, ids[2], PerpBatchReason::None),
+            ]
+        );
+        // Pairwise distinct — the raw keccak256(signature) of the single-order path would have
+        // handed all three the SAME id and silently overwritten two orders.
+        let mut sorted = ids;
+        sorted.sort_unstable();
+        assert!(sorted.windows(2).all(|w| w[0] != w[1]));
+        assert!(storage::load_order(&mut ctx, &ids[1]).unwrap().is_some());
+        assert!(storage::load_order(&mut ctx, &ids[2]).unwrap().is_some());
+        // The signed path does NOT touch the per-user nonce.
+        assert_eq!(nonce(&mut ctx, ALICE), base);
+        assert_eq!(order_placed_ids(&mut ctx), ids.to_vec());
+    }
+
+    #[test]
+    fn signed_batch_rejects_tampered_content() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let a = gtc(0, PRICE - TICK, QTY);
+        let b = gtc(0, PRICE - 2 * TICK, QTY);
+        let c = gtc(0, PRICE - 3 * TICK, QTY);
+        // Same item as `a` with one field changed.
+        let a_price = gtc(0, PRICE - 5 * TICK, QTY);
+        let a_qty = gtc(0, PRICE - TICK, QTY * 2);
+        let mut a_cloid = a.clone();
+        a_cloid.clientOrderId = FixedBytes([9u8; 16]);
+
+        for (name, signed, wire) in [
+            (
+                "item price changed",
+                vec![a.clone(), b.clone()],
+                vec![a_price, b.clone()],
+            ),
+            (
+                "item quantity changed",
+                vec![a.clone(), b.clone()],
+                vec![a_qty, b.clone()],
+            ),
+            (
+                "clientOrderId changed",
+                vec![a.clone(), b.clone()],
+                vec![a_cloid, b.clone()],
+            ),
+            (
+                "N grew",
+                vec![a.clone(), b.clone()],
+                vec![a.clone(), b.clone(), c.clone()],
+            ),
+            ("N shrank", vec![a.clone(), b.clone()], vec![a.clone()]),
+            (
+                "order permuted",
+                vec![a.clone(), b.clone()],
+                vec![b.clone(), a.clone()],
+            ),
+        ] {
+            let mut ctx = make_ctx();
+            setup(&mut ctx);
+            register_key(&mut ctx, ALICE, &sk);
+            let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+            let input = signed_calldata(&sk, ALICE, SIGNED_TS, SIGNED_RECV, &signed, Some(&wire));
+            let out =
+                run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
+            assert!(out.reverted, "{name} must fail verification");
+            assert_eq!(
+                JournalTr::perp_write_count(ctx.journal_mut()),
+                writes_before,
+                "{name}: signature failure is pre-write"
+            );
+            assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+        }
+    }
+
+    /// A replayed signed batch must REVERT rather than re-derive its (live) ids: the ids are a pure
+    /// function of the signature, so without the burn the second run would `save_order` over the
+    /// first run's resting orders.
+    #[test]
+    fn signed_batch_replay_reverts_instead_of_re_deriving_live_ids() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register_key(&mut ctx, ALICE, &sk);
+
+        let items = [
+            gtc(0, PRICE - TICK, QTY),
+            item_in(NO_MARKET, 0, PRICE, QTY, 0, 0), // rejected → partial acceptance
+        ];
+        let input = signed_calldata(&sk, ALICE, SIGNED_TS, SIGNED_RECV, &items, None);
+        let out =
+            run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(!out.reverted);
+        let blob = batchPlaceOrdersSignedCall::abi_decode_returns(&out.bytes).unwrap();
+        let st = decode_statuses(&blob);
+        assert_eq!(st[0].tag, PerpBatchTag::Accepted as u8);
+        assert_eq!(st[1].tag, PerpBatchTag::Rejected as u8);
+        let live = st[0].order_id;
+
+        let out =
+            run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(out.reverted, "a replayed batch must revert");
+        assert!(String::from_utf8_lossy(&out.bytes).contains("duplicate signature"));
+        assert!(
+            storage::load_order(&mut ctx, &live).unwrap().is_some(),
+            "the first run's order must still be there, untouched"
+        );
+    }
+
+    #[test]
+    fn signed_batch_requires_key_window_and_expiry() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let items = [gtc(0, PRICE - TICK, QTY)];
+
+        // No key registered.
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let input = signed_calldata(&sk, ALICE, SIGNED_TS, SIGNED_RECV, &items, None);
+        let out =
+            run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(out.reverted);
+        assert!(String::from_utf8_lossy(&out.bytes).contains("no api key"));
+
+        // Timestamp in the future.
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        register_key(&mut ctx, ALICE, &sk);
+        let input = signed_calldata(&sk, ALICE, 10_000, SIGNED_RECV, &items, None);
+        let out =
+            run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(out.reverted);
+        assert!(String::from_utf8_lossy(&out.bytes).contains("future"));
+    }
+
+    /// The digest is the TIGHT 43-bytes-per-item packing, not the 224-byte ABI encoding.
+    #[test]
+    fn signed_digest_layout_is_pinned() {
+        let items = [gtc(0, PRICE, QTY), gtc(1, PRICE + TICK, QTY * 2)];
+        let msg = batch_place_message(ALICE, 3, 111, 22, &items);
+        assert_eq!(msg.len(), 22 + 20 + 1 + 8 + 8 + 4 + 2 * 43);
+        assert_eq!(&msg[..22], b"perpdex_v1_batch_order");
+        assert_eq!(&msg[22..42], ALICE.as_slice());
+        assert_eq!(msg[42], 3);
+        assert_eq!(&msg[43..51], &111u64.to_be_bytes());
+        assert_eq!(&msg[51..59], &22u64.to_be_bytes());
+        assert_eq!(&msg[59..63], &2u32.to_be_bytes());
+        // First item, tightly packed.
+        assert_eq!(&msg[63..71], &MARKET_ID.to_be_bytes());
+        assert_eq!(msg[71], 0);
+        assert_eq!(&msg[72..80], &PRICE.to_be_bytes());
+        assert_eq!(&msg[80..88], &QTY.to_be_bytes());
+        assert_eq!(msg[88], 0);
+        assert_eq!(msg[89], 0);
+        assert_eq!(&msg[90..106], &[0u8; 16]);
+        // Second item starts right after.
+        assert_eq!(&msg[106..114], &MARKET_ID.to_be_bytes());
+        assert_eq!(msg[114], 1);
+    }
+
+    #[test]
+    fn batch_place_selectors_are_not_static_callable() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let err = run_perp_dex_call(
+            &direct_calldata(&[gtc(0, PRICE, QTY)]),
             30_000_000,
             ALICE,
             U256::ZERO,

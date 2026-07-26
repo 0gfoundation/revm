@@ -34,8 +34,9 @@ use crate::{
         },
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, batchCancelOrdersCall,
-            batchCancelOrdersSignedCall, cancelOrderCall, cancelOrderSignedCall, depositCall,
-            depositInsuranceFundCall, getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
+            batchCancelOrdersSignedCall, batchPlaceOrdersCall, batchPlaceOrdersSignedCall,
+            cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
+            getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
             getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
             getIndexPriceCall, getInsuranceFundCall, getMarkPriceCall, getMarketCall,
             getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
@@ -56,10 +57,10 @@ use crate::{
             run_update_index_price, run_update_market, run_withdraw_insurance_fund,
         },
         trading::{
-            run_batch_cancel_orders, run_batch_cancel_orders_signed, run_cancel_order,
-            run_cancel_order_signed, run_get_book_level, run_get_book_prices,
-            run_get_market_fee_total, run_get_open_orders, run_get_order, run_place_order,
-            run_place_order_signed,
+            run_batch_cancel_orders, run_batch_cancel_orders_signed, run_batch_place_orders,
+            run_batch_place_orders_signed, run_cancel_order, run_cancel_order_signed,
+            run_get_book_level, run_get_book_prices, run_get_market_fee_total, run_get_open_orders,
+            run_get_order, run_place_order, run_place_order_signed,
         },
     },
     PrecompileError, PrecompileOutput, PrecompileResult,
@@ -91,6 +92,13 @@ pub const USDC_ADDRESS: Address = address!("5ddA922Df9244b87635144e59D26f5A6e9FD
 /// `BASE_BATCH_GAS + N * CANCEL_ORDER_GAS`, so the two can never drift apart. The value is the
 /// pre-existing table cost, unchanged (`batch_unit_matches_single_selector_cost` pins it).
 pub const CANCEL_ORDER_GAS: u64 = 80_000;
+
+/// Flat gas of a single `placeOrder` / `placeOrderSigned`.
+///
+/// Same rule as [`CANCEL_ORDER_GAS`]: this is ALSO the per-item unit of `batchPlaceOrders`
+/// (`BASE_BATCH_GAS + N * PLACE_ORDER_GAS`), so the batch can never drift from the single selector.
+/// The value is the pre-existing table cost, unchanged.
+pub const PLACE_ORDER_GAS: u64 = 200_000;
 
 // ── Selector table ────────────────────────────────────────────────────────────
 
@@ -132,11 +140,15 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(setLeverageCall::SELECTOR, (20_000, false));
         m.insert(setLeverageSignedCall::SELECTOR, (20_000, false));
         // Trading
-        m.insert(placeOrderCall::SELECTOR, (200_000, false));
+        m.insert(placeOrderCall::SELECTOR, (PLACE_ORDER_GAS, false));
         m.insert(cancelOrderCall::SELECTOR, (CANCEL_ORDER_GAS, false));
-        // Batch cancel: floor only — see the doc comment on SELECTORS.
+        // Batch place / cancel: floor only — see the doc comment on SELECTORS.
         m.insert(
             batchCancelOrdersCall::SELECTOR,
+            (batch::BASE_BATCH_GAS, false),
+        );
+        m.insert(
+            batchPlaceOrdersCall::SELECTOR,
             (batch::BASE_BATCH_GAS, false),
         );
         m.insert(getOrderCall::SELECTOR, (5_000, true));
@@ -155,11 +167,15 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getApiKeyCall::SELECTOR, (5_000, true));
         m.insert(getApiKeysCall::SELECTOR, (10_000, true));
         // Signed order submission (relayer path)
-        m.insert(placeOrderSignedCall::SELECTOR, (200_000, false));
+        m.insert(placeOrderSignedCall::SELECTOR, (PLACE_ORDER_GAS, false));
         m.insert(cancelOrderSignedCall::SELECTOR, (CANCEL_ORDER_GAS, false));
-        // Batch cancel (signed): floor only — see the doc comment on SELECTORS.
+        // Batch place / cancel (signed): floor only — see the doc comment on SELECTORS.
         m.insert(
             batchCancelOrdersSignedCall::SELECTOR,
+            (batch::BASE_BATCH_GAS, false),
+        );
+        m.insert(
+            batchPlaceOrdersSignedCall::SELECTOR,
             (batch::BASE_BATCH_GAS, false),
         );
         // Insurance Fund
@@ -340,6 +356,12 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         }
         s if s == batchCancelOrdersSignedCall::SELECTOR => {
             run_batch_cancel_orders_signed(input_bytes, context)
+        }
+        s if s == batchPlaceOrdersCall::SELECTOR => {
+            run_batch_place_orders(input_bytes, caller, context)
+        }
+        s if s == batchPlaceOrdersSignedCall::SELECTOR => {
+            run_batch_place_orders_signed(input_bytes, context)
         }
         s if s == getOrderCall::SELECTOR => run_get_order(input_bytes, context),
         s if s == getOpenOrdersCall::SELECTOR => run_get_open_orders(input_bytes, context),

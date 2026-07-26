@@ -27,8 +27,11 @@ use context::{ContextTr, JournalTr};
 use crate::{
     perp_dex::{
         errors::perp_err,
-        interface::IPerpDex::{batchCancelOrdersCall, batchCancelOrdersSignedCall},
-        CANCEL_ORDER_GAS,
+        interface::IPerpDex::{
+            batchCancelOrdersCall, batchCancelOrdersSignedCall, batchPlaceOrdersCall,
+            batchPlaceOrdersSignedCall,
+        },
+        CANCEL_ORDER_GAS, PLACE_ORDER_GAS,
     },
     PrecompileError,
 };
@@ -41,6 +44,12 @@ use alloy_sol_types::SolCall;
 /// Enforced on the **decoded** length (authoritative), never on the pre-decode length word, so a
 /// legal-but-non-minimal encoding can never fail a valid batch.
 pub const MAX_BATCH_CANCEL: usize = 256;
+
+/// Maximum number of orders accepted by `batchPlaceOrders` / `batchPlaceOrdersSigned`.
+///
+/// Lower than [`MAX_BATCH_CANCEL`] because a placement can sweep the book: this is the
+/// latency/DoS knob, not a gas knob. Enforced on the **decoded** length, exactly like the cancel cap.
+pub const MAX_BATCH_PLACE: usize = 64;
 
 /// Fixed width of one status record in the returned blob: `tag(1) || orderId(32) || reason(1)`.
 pub const BATCH_STATUS_RECORD_LEN: usize = 34;
@@ -71,12 +80,18 @@ pub struct BatchArrayLayout {
     /// Canonical byte offset (relative to the end of the selector) the argument's tail must sit at.
     /// For the first dynamic argument of a standard encoder this is `head_words * 32`.
     pub tail_offset: usize,
+    /// Encoded size of ONE element, i.e. the stride of the array body. Only valid for arrays whose
+    /// element type is **static** (then the body is `len * elem_size` bytes inline): `bytes32` is
+    /// 32, and a 7-field static struct such as `PlaceItem` is 7 * 32 = 224. A dynamic element type
+    /// would have an offset table instead, so this bound would not hold — do not add one.
+    pub elem_size: usize,
 }
 
 /// `batchCancelOrders(bytes32[])` — one head word, tail immediately after it.
 pub const CANCEL_DIRECT_LAYOUT: BatchArrayLayout = BatchArrayLayout {
     head_word: 0,
     tail_offset: 0x20,
+    elem_size: 32,
 };
 
 /// `batchCancelOrdersSigned(address,uint8,uint64,uint64,bytes32[],bytes)` — six head words; the
@@ -84,6 +99,26 @@ pub const CANCEL_DIRECT_LAYOUT: BatchArrayLayout = BatchArrayLayout {
 pub const CANCEL_SIGNED_LAYOUT: BatchArrayLayout = BatchArrayLayout {
     head_word: 4,
     tail_offset: 0xc0,
+    elem_size: 32,
+};
+
+/// Encoded width of one `PlaceItem`: `marketId, side, price, quantity, orderType, tif,
+/// clientOrderId` — seven **static** fields, so it encodes as 7 words inline with no offset table.
+pub const PLACE_ITEM_ENCODED_LEN: usize = 7 * 32;
+
+/// `batchPlaceOrders(PlaceItem[])` — one head word, tail immediately after it, 224-byte stride.
+pub const PLACE_DIRECT_LAYOUT: BatchArrayLayout = BatchArrayLayout {
+    head_word: 0,
+    tail_offset: 0x20,
+    elem_size: PLACE_ITEM_ENCODED_LEN,
+};
+
+/// `batchPlaceOrdersSigned(address,uint8,uint64,uint64,PlaceItem[],bytes)` — six head words; the
+/// `orders` head is word 4 and, being the first dynamic argument, its tail starts at 6*32 = 0xc0.
+pub const PLACE_SIGNED_LAYOUT: BatchArrayLayout = BatchArrayLayout {
+    head_word: 4,
+    tail_offset: 0xc0,
+    elem_size: PLACE_ITEM_ENCODED_LEN,
 };
 
 impl BatchArrayLayout {
@@ -97,7 +132,9 @@ impl BatchArrayLayout {
     ///    `alloy-sol-types`' `DynSeqToken::decode_from` calls `vec_try_with_capacity(len)` on this
     ///    attacker-controlled word *before* reading any element, so a ~100-byte call carrying a huge
     ///    length word is a memory-DoS vector. The gas path is not allowed to be the only thing that
-    ///    distrusts this word, so the same check gates the decode.
+    ///    distrusts this word, so the same check gates the decode. The backing bound uses this
+    ///    layout's [`elem_size`](Self::elem_size) stride, so a 224-byte-per-item `PlaceItem[]` needs
+    ///    7× as many real bytes as a `bytes32[]` of the same declared length.
     pub fn checked_len(&self, input: &[u8]) -> Result<usize, PrecompileError> {
         let head_start = 4 + self.head_word * 32;
         let head = input
@@ -119,7 +156,7 @@ impl BatchArrayLayout {
         let len = u32::from_be_bytes(len_word[28..32].try_into().unwrap()) as usize;
 
         let need = len
-            .checked_mul(32)
+            .checked_mul(self.elem_size)
             .and_then(|body| body.checked_add(len_start + 32))
             .ok_or_else(|| perp_err("batch: array length out of range"))?;
         if input.len() < need {
@@ -136,14 +173,17 @@ impl BatchArrayLayout {
 /// failed). In that case only the envelope floor is charged and the batch handler turns the very
 /// same defensive read into a clean `Error(string)` revert — no work happens on either path.
 ///
-/// The per-item unit is taken straight from the single-order selector's cost
-/// (`CANCEL_ORDER_GAS`) — never a re-invented number. Phase 2 adds a `batchPlaceOrders` arm here
-/// with the `placeOrder` cost.
+/// The per-item unit is taken straight from the single-order selector's cost (`CANCEL_ORDER_GAS`,
+/// `PLACE_ORDER_GAS`) — never a re-invented number.
 pub fn batch_dynamic_gas(selector: [u8; 4], input: &[u8]) -> Option<u64> {
     let (layout, unit) = if selector == batchCancelOrdersCall::SELECTOR {
         (CANCEL_DIRECT_LAYOUT, CANCEL_ORDER_GAS)
     } else if selector == batchCancelOrdersSignedCall::SELECTOR {
         (CANCEL_SIGNED_LAYOUT, CANCEL_ORDER_GAS)
+    } else if selector == batchPlaceOrdersCall::SELECTOR {
+        (PLACE_DIRECT_LAYOUT, PLACE_ORDER_GAS)
+    } else if selector == batchPlaceOrdersSignedCall::SELECTOR {
+        (PLACE_SIGNED_LAYOUT, PLACE_ORDER_GAS)
     } else {
         return None;
     };
@@ -170,10 +210,15 @@ pub fn check_batch_len(n: usize, max: usize, what: &str) -> Result<(), Precompil
 pub enum PerpBatchTag {
     /// Genuine per-item reject — write-clean, the loop continued.
     Rejected = 0,
-    /// Accepted: the cancel removed the order (or, in Phase 2, the placement rests in the book).
+    /// Accepted and still LIVE: the cancel removed the order, or the placement **rests** in the book
+    /// (`Open` / `PartiallyFilled`). For a placement the `orderId` field is the id it rests under.
     Accepted = 1,
-    /// Reserved for `batchPlaceOrders` (Phase 2): accepted AND fully filled. Never produced by
-    /// `batchCancelOrders`; the numbering is fixed here so Phase 2 reuses this enum unchanged.
+    /// Accepted and TERMINAL — `batchPlaceOrders` only: the placement reached a terminal status and
+    /// left no resting record, i.e. it fully filled (`Filled`) or its IOC/FOK/market remainder
+    /// `Expired`. The rule is exactly `OrderStatus::is_terminal()`; which flavour it was, and the
+    /// fill prices/quantities, come from the `Trade` / `PositionChanged` logs (a terminal order is
+    /// deleted from the order map, so `getOrder` cannot answer it). Never produced by
+    /// `batchCancelOrders`.
     Filled = 2,
     /// The item errored **after** writing perp state (invariant / arithmetic / post-write). Its
     /// writes cannot be undone, so the loop stops here and the call still returns `Ok`.
@@ -185,9 +230,12 @@ pub enum PerpBatchTag {
 /// Byte 33 of a status record — the numeric reason. **Never** an error string: batch results must
 /// not carry `format!`/`{:?}` output.
 ///
-/// Bands are fixed so Phase 2 can extend without renumbering:
-///   `0` none · `1..=15` cancel-path rejects · `16..=63` reserved for place-path rejects ·
-///   `254` invariant · `255` catch-all.
+/// The user-reject bands are **partitioned by path**, so a client only ever sees its own selector's
+/// band:
+///   `0` none · `1..=15` cancel-path rejects · `16..=63` place-path rejects ·
+///   `253..=255` path-independent engine codes (arith guard / invariant / catch-all).
+/// That is why `PlaceUnknownMarket` is 16 rather than reusing
+/// [`UnknownMarket`](Self::UnknownMarket) = 4 — the two selectors never share a reject code.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PerpBatchReason {
@@ -201,6 +249,44 @@ pub enum PerpBatchReason {
     NotCancellable = 3,
     /// `cancelOrder: unknown market`
     UnknownMarket = 4,
+    /// `placeOrder: unknown market`
+    PlaceUnknownMarket = 16,
+    /// `placeOrder: market not active`
+    MarketNotActive = 17,
+    /// `placeOrder: invalid side`
+    InvalidSide = 18,
+    /// `placeOrder: invalid orderType`
+    InvalidOrderType = 19,
+    /// `placeOrder: invalid tif`
+    InvalidTif = 20,
+    /// `placeOrder: quantity below minimum`
+    QuantityBelowMinimum = 21,
+    /// `placeOrder: quantity exceeds maximum`
+    QuantityAboveMaximum = 22,
+    /// `placeOrder: quantity not multiple of step_size`
+    QuantityStepSize = 23,
+    /// `placeOrder: limit order price must be > 0`
+    PriceZero = 24,
+    /// `placeOrder: price exceeds maximum`
+    PriceAboveMaximum = 25,
+    /// `placeOrder: price not multiple of tick_size`
+    PriceTickSize = 26,
+    /// `placeOrder: PostOnly order would match`
+    PostOnlyWouldMatch = 27,
+    /// `placeOrder: FOK order cannot be fully filled`
+    FokUnfillable = 28,
+    /// `placeOrder: insufficient perp wallet for margin` — the resting-margin reject in
+    /// `rest_in_book`, and the taker's fills+rest / post-auto-cancel wallet-cover reject in
+    /// `finalize_compute`.
+    InsufficientMargin = 29,
+    /// `placeOrder: open would breach maintenance margin` — the K9 open-into-insolvency guard.
+    OpenIntoInsolvency = 30,
+    /// `placeOrder: fee recipient not initialised`
+    FeeRecipientNotSet = 31,
+    /// A checked-arithmetic guard (`… overflow` / `… underflow` / `exceeds i64…`), matched
+    /// structurally because the engine has ~30 of them and they are all
+    /// unreachable-by-construction. Path-independent, hence the engine band.
+    ArithmeticGuard = 253,
     /// An `[INVARIANT] `-prefixed error (`perp_invariant_err`). Always paired with
     /// [`PerpBatchTag::Aborted`] in practice.
     Invariant = 254,
@@ -223,6 +309,12 @@ pub fn reason_code(err: &PrecompileError) -> PerpBatchReason {
     if msg.starts_with("[INVARIANT] ") {
         return PerpBatchReason::Invariant;
     }
+    // Place path FIRST, and by prefix: every reject `place_order_core` raises is prefixed
+    // `placeOrder: `, and some of its texts ("unknown market") also appear on the cancel path. The
+    // strip_prefix arm returns unconditionally, so the two bands can never bleed into each other.
+    if let Some(rest) = msg.strip_prefix("placeOrder: ") {
+        return place_reason(rest);
+    }
     // Cancel path (`cancel_order_core`): all four are pure reads, hence write-clean.
     if msg.contains("order not found") {
         PerpBatchReason::OrderNotFound
@@ -232,9 +324,43 @@ pub fn reason_code(err: &PrecompileError) -> PerpBatchReason {
         PerpBatchReason::NotCancellable
     } else if msg.contains("unknown market") {
         PerpBatchReason::UnknownMarket
+    } else if is_arith_guard(msg) {
+        // Settlement's own guards ("settlement: … overflow", "perp wallet: …", …) are reachable from
+        // the place path without the `placeOrder: ` prefix.
+        PerpBatchReason::ArithmeticGuard
     } else {
         PerpBatchReason::Other
     }
+}
+
+/// Place-path reason table, applied to the message with its `placeOrder: ` prefix stripped.
+fn place_reason(rest: &str) -> PerpBatchReason {
+    match rest {
+        "unknown market" => PerpBatchReason::PlaceUnknownMarket,
+        "market not active" => PerpBatchReason::MarketNotActive,
+        "invalid side" => PerpBatchReason::InvalidSide,
+        "invalid orderType" => PerpBatchReason::InvalidOrderType,
+        "invalid tif" => PerpBatchReason::InvalidTif,
+        "quantity below minimum" => PerpBatchReason::QuantityBelowMinimum,
+        "quantity exceeds maximum" => PerpBatchReason::QuantityAboveMaximum,
+        "quantity not multiple of step_size" => PerpBatchReason::QuantityStepSize,
+        "limit order price must be > 0" => PerpBatchReason::PriceZero,
+        "price exceeds maximum" => PerpBatchReason::PriceAboveMaximum,
+        "price not multiple of tick_size" => PerpBatchReason::PriceTickSize,
+        "PostOnly order would match" => PerpBatchReason::PostOnlyWouldMatch,
+        "FOK order cannot be fully filled" => PerpBatchReason::FokUnfillable,
+        "insufficient perp wallet for margin" => PerpBatchReason::InsufficientMargin,
+        "open would breach maintenance margin" => PerpBatchReason::OpenIntoInsolvency,
+        "fee recipient not initialised" => PerpBatchReason::FeeRecipientNotSet,
+        other if is_arith_guard(other) => PerpBatchReason::ArithmeticGuard,
+        _ => PerpBatchReason::Other,
+    }
+}
+
+/// A checked-arithmetic guard message, matched structurally rather than one-by-one: the place and
+/// settlement paths have ~30 of them, all unreachable-by-construction, so they share one code.
+fn is_arith_guard(msg: &str) -> bool {
+    msg.ends_with("overflow") || msg.ends_with("underflow") || msg.contains("exceeds i64")
 }
 
 /// Index-aligned status blob: `n` fixed-width [`BATCH_STATUS_RECORD_LEN`]-byte records in input
@@ -285,6 +411,23 @@ pub fn perp_batch_abort_count() -> u64 {
 
 // ── Abort-forward driver ──────────────────────────────────────────────────────
 
+/// What [`drive_batch`] observed, on top of the encoded blob.
+///
+/// The two counters exist for callers that must reconcile a resource against "how many items really
+/// happened" — `batchPlaceOrders` advances the per-user order nonce by exactly the number of ids the
+/// batch consumed (`accepted` + an aborted item, which may have written under its id). Cancel
+/// ignores them.
+#[derive(Debug)]
+pub struct BatchRun {
+    /// The index-aligned status blob, `n * BATCH_STATUS_RECORD_LEN` bytes.
+    pub statuses: Vec<u8>,
+    /// How many items returned `Ok` (tags [`PerpBatchTag::Accepted`] / [`PerpBatchTag::Filled`]).
+    pub accepted: usize,
+    /// Index of the item that aborted (errored **after** writing perp state), if any. When set, the
+    /// items after it were never attempted.
+    pub aborted_at: Option<usize>,
+}
+
 /// Runs `n` items in strict calldata order and encodes an index-aligned status blob.
 ///
 /// * `Ok((tag, id))` → that tag, reason `None`.
@@ -298,25 +441,31 @@ pub fn perp_batch_abort_count() -> u64 {
 ///   still return `Ok` (see the module docs).
 ///
 /// `echo_id(k)` supplies the id recorded for items that produce no id of their own (rejects, the
-/// abort, the untouched tail). `batchCancelOrders` echoes the input `orderIds[k]` there.
+/// abort, the untouched tail). `batchCancelOrders` echoes the input `orderIds[k]` there;
+/// `batchPlaceOrders` returns **zero** there, because a rejected placement never got an id.
 pub fn drive_batch<CTX, EchoFn, ItemFn>(
     context: &mut CTX,
     n: usize,
     echo_id: EchoFn,
     mut run_item: ItemFn,
-) -> Result<Vec<u8>, PrecompileError>
+) -> Result<BatchRun, PrecompileError>
 where
     CTX: ContextTr,
     EchoFn: Fn(usize) -> [u8; 32],
     ItemFn: FnMut(&mut CTX, usize) -> Result<(PerpBatchTag, [u8; 32]), PrecompileError>,
 {
     let mut blob = BatchStatusBlob::with_capacity(n);
+    let mut accepted = 0usize;
+    let mut aborted_at = None;
     let mut k = 0usize;
     while k < n {
         // Runtime genuine-vs-abort witness, snapshotted per item (NOT a string match on the error).
         let writes_before = context.journal_mut().perp_write_count();
         match run_item(context, k) {
-            Ok((tag, order_id)) => blob.push(tag, &order_id, PerpBatchReason::None),
+            Ok((tag, order_id)) => {
+                accepted += 1;
+                blob.push(tag, &order_id, PerpBatchReason::None);
+            }
             Err(PrecompileError::Fatal(e)) => return Err(PrecompileError::Fatal(e)),
             Err(e) => {
                 let wrote = context.journal_mut().perp_write_count() != writes_before;
@@ -326,6 +475,7 @@ where
                     blob.push(PerpBatchTag::Rejected, &echo_id(k), code);
                 } else {
                     PERP_BATCH_ABORT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    aborted_at = Some(k);
                     blob.push(PerpBatchTag::Aborted, &echo_id(k), code);
                     for tail in (k + 1)..n {
                         blob.push(
@@ -341,5 +491,9 @@ where
         k += 1;
     }
     debug_assert_eq!(blob.len(), n, "status blob must stay index-aligned");
-    Ok(blob.into_bytes())
+    Ok(BatchRun {
+        statuses: blob.into_bytes(),
+        accepted,
+        aborted_at,
+    })
 }
