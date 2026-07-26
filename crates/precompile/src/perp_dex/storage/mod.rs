@@ -516,22 +516,10 @@ pub fn mutate_account<CTX: ContextTr, R>(
     Ok(r)
 }
 
-/// Starts balance tracking for a top-level call with its gas-funded event capacity.
-pub fn begin_balance_tracking<CTX: ContextTr>(context: &mut CTX, max_events: u64) {
-    typed_store_mut(context).begin_balance_tracking(max_events);
-}
-
-/// Reserves a pre-write upper bound of balance after-images for the current call.
-pub fn reserve_balance_events<CTX: ContextTr>(
-    context: &mut CTX,
-    required_events: u64,
-) -> Result<(), PrecompileError> {
-    typed_store_mut(context).reserve_balance_events(required_events)
-}
-
-/// Returns the number of distinct accounts already changed by the current top-level call.
-pub fn tracked_balance_account_count<CTX: ContextTr>(context: &mut CTX) -> u64 {
-    typed_store_mut(context).tracked_balance_account_count()
+/// Starts balance tracking for a top-level call. Balance after-image events are free (flat
+/// per-selector gas), so there is no event capacity to reserve.
+pub fn begin_balance_tracking<CTX: ContextTr>(context: &mut CTX) {
+    typed_store_mut(context).begin_balance_tracking();
 }
 
 /// Finishes balance tracking and returns initial balances in deterministic address order.

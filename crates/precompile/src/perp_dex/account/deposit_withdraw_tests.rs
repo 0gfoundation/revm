@@ -12,7 +12,7 @@ use crate::perp_dex::{
     },
     storage,
     storage::keys::erc20_balance_slot,
-    ACCOUNT_BALANCE_CHANGED_GAS, USDC_ADDRESS,
+    USDC_ADDRESS,
 };
 
 const ALICE: Address = address!("1111111111111111111111111111111111111111");
@@ -340,7 +340,8 @@ fn successful_call_emits_one_final_balance_after_image() {
     )
     .unwrap();
     assert!(!output.reverted);
-    assert_eq!(output.gas_used, 50_000 + ACCOUNT_BALANCE_CHANGED_GAS);
+    // Balance after-image events are free: the call is charged only the flat deposit gas.
+    assert_eq!(output.gas_used, 50_000);
 
     let events = JournalTr::take_logs(ctx.journal_mut())
         .into_iter()
@@ -354,37 +355,6 @@ fn successful_call_emits_one_final_balance_after_image() {
     assert_eq!(events[0].usdcBalance, amount);
     assert_eq!(events[0].perpWalletBalance, U256::ZERO);
     assert_eq!(events[0].availablePerpBalance, 0);
-}
-
-#[test]
-fn balance_after_image_gas_is_reserved_before_deposit_writes() {
-    let amount = U256::from(1_000_000_u64);
-    let mut ctx = make_ctx(amount);
-    let writes_before = ctx.journal_mut().perp_write_count();
-
-    let err = crate::perp_dex::run_perp_dex_call(
-        &depositCall { amount }.abi_encode(),
-        50_000 + ACCOUNT_BALANCE_CHANGED_GAS - 1,
-        ALICE,
-        U256::ZERO,
-        false,
-        &mut ctx,
-    )
-    .unwrap_err();
-
-    assert!(matches!(err, crate::PrecompileError::OutOfGas));
-    assert_eq!(ctx.journal_mut().perp_write_count(), writes_before);
-    assert_eq!(
-        storage::load_erc20_balance(&mut ctx, USDC_ADDRESS, ALICE).unwrap(),
-        amount
-    );
-    assert_eq!(
-        storage::load_account(&mut ctx, ALICE)
-            .unwrap()
-            .public_balance(),
-        crate::perp_dex::types::PublicAccountBalance::default()
-    );
-    assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
 }
 
 #[test]

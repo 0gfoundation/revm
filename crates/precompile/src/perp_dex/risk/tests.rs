@@ -11,12 +11,12 @@ use crate::perp_dex::{
         setLeverageCall, updateIndexPriceCall,
     },
     run_perp_dex_call,
-    trading::run_place_order,
+    trading::{run_place_order, MAX_LIQUIDATION_MAKER_ACCOUNTS},
     types::{
         FundingState, IndexPriceHistory, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
         UserAccount, UserFeeRates,
     },
-    ACCOUNT_BALANCE_CHANGED_GAS, USDC_ADDRESS,
+    USDC_ADDRESS,
 };
 
 const ALICE: Address = address!("1111111111111111111111111111111111111111");
@@ -201,50 +201,6 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
         storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
         vec![MAKER]
     );
-}
-
-#[test]
-fn index_update_persists_mark_when_liquidation_event_budget_is_unavailable() {
-    let mut ctx = make_ctx();
-    setup_market(&mut ctx);
-    save_position(&mut ctx, QTY, -ENTRY_VALUE);
-    let _ = JournalTr::take_logs(ctx.journal_mut());
-    let input = updateIndexPriceCall {
-        marketId: MARKET_ID,
-        indexPrice: 8_500,
-        timestamp: 31,
-    }
-    .abi_encode();
-
-    let output = run_perp_dex_call(&input, 50_000, ADMIN, U256::ZERO, false, &mut ctx).unwrap();
-    assert!(!output.reverted);
-    assert_eq!(output.gas_used, 50_000);
-    assert_eq!(
-        storage::load_index_price_state(&mut ctx, MARKET_ID)
-            .unwrap()
-            .timestamp,
-        30
-    );
-    assert_eq!(
-        storage::load_mark_price(&mut ctx, MARKET_ID).unwrap(),
-        8_500
-    );
-    assert_eq!(position(&mut ctx, ALICE).amount, QTY);
-    assert!(JournalTr::take_logs(ctx.journal_mut()).iter().all(|log| {
-        log.data.topics().first()
-            != Some(&crate::perp_dex::interface::IPerpDex::AccountBalanceChanged::SIGNATURE_HASH)
-    }));
-
-    let retry = updateIndexPriceCall {
-        marketId: MARKET_ID,
-        indexPrice: 8_500,
-        timestamp: 46,
-    }
-    .abi_encode();
-    let output = run_perp_dex_call(&retry, 10_000_000, ADMIN, U256::ZERO, false, &mut ctx).unwrap();
-    assert!(!output.reverted);
-    assert_eq!(output.gas_used, 50_000 + ACCOUNT_BALANCE_CHANGED_GAS);
-    assert_eq!(position(&mut ctx, ALICE).amount, 0);
 }
 
 #[test]
@@ -851,7 +807,6 @@ fn healthy_candidate_scan_is_write_free_even_with_accrued_funding() {
         ENTRY_PRICE,
         KEEPER,
         &mut adl_budget,
-        BalanceEventGasPolicy::Require,
     )
     .unwrap();
     assert!(

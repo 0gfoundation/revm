@@ -8,7 +8,7 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 
 use crate::{
     perp_dex::{
-        errors::{perp_err, perp_fatal_invariant_err},
+        errors::perp_err,
         funding::{apply_funding_settlement, compute_funding_settlement},
         interface::IPerpDex::{
             self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
@@ -28,7 +28,6 @@ use crate::{
         trading::{
             check_api_key_expiry, check_recv_window, execute_liquidation_market_order, run_adl,
             settle_liquidation_residual_at_mark_price, verify_ed25519,
-            MAX_LIQUIDATION_MAKER_ACCOUNTS,
         },
         types::{FundingState, IndexPriceState, Market, PremiumIndexAccumulator, Side},
         PERP_DEX_ADDRESS,
@@ -418,7 +417,6 @@ fn set_leverage_core<CTX: ContextTr>(
         ));
     }
 
-    storage::reserve_balance_events(context, 1)?;
     rebalance_order_margin_for_leverage(context, account, &mut pos, leverage)?;
     pos.leverage = leverage;
     storage::save_position(context, account, market_id, &pos)?;
@@ -502,7 +500,6 @@ pub fn run_add_position_margin<CTX: ContextTr>(
         .ok_or_else(|| perp_err("addPositionMargin: margin overflow"))?;
 
     // ── APPLY (all rejects passed) ──
-    storage::reserve_balance_events(context, 1)?;
     if let Some(p) = pending_funding {
         apply_funding_settlement(context, p)?;
     }
@@ -589,7 +586,6 @@ pub fn run_remove_position_margin<CTX: ContextTr>(
     pos.margin = new_margin;
 
     // ── APPLY (all rejects passed) ──
-    storage::reserve_balance_events(context, 1)?;
     if let Some(p) = pending_funding {
         apply_funding_settlement(context, p)?;
     }
@@ -609,17 +605,6 @@ pub(crate) enum LiquidationOutcome {
     NoPosition,
     /// Position is at or above the maintenance-margin threshold — not liquidatable.
     AboveMaintenance,
-    /// The oracle call did not fund the bounded account set for another liquidation.
-    DeferredBalanceEventGas,
-}
-
-/// Controls how liquidation handles insufficient gas for balance after-images.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BalanceEventGasPolicy {
-    /// Propagate the reservation failure before any liquidation writes.
-    Require,
-    /// Defer the liquidation so an oracle update can continue.
-    Defer,
 }
 
 /// Core liquidation logic, shared by the manual `liquidate` entry point
@@ -644,7 +629,6 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     mark_price: u64,
     liquidator: Address,
     adl_budget: &mut u32,
-    balance_event_gas_policy: BalanceEventGasPolicy,
 ) -> Result<LiquidationOutcome, PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
 
@@ -683,9 +667,6 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
     };
     let liquidation_quantity = pos.amount.unsigned_abs();
     let pre_liq_margin = pos.margin.max(0) as u64;
-    if !reserve_liquidation_balance_events(context, *adl_budget, balance_event_gas_policy)? {
-        return Ok(LiquidationOutcome::DeferredBalanceEventGas);
-    }
 
     // ── APPLY (liquidatable — commit the funding settle, then close) ──
     if let Some(p) = pending_funding {
@@ -818,16 +799,12 @@ pub fn run_liquidate<CTX: ContextTr>(
         mark_price,
         caller,
         &mut adl_budget,
-        BalanceEventGasPolicy::Require,
     )? {
         LiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
         LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
         LiquidationOutcome::AboveMaintenance => {
             Err(perp_err("liquidate: position is above maintenance margin"))
         }
-        LiquidationOutcome::DeferredBalanceEventGas => Err(perp_fatal_invariant_err(
-            "manual liquidation unexpectedly deferred for balance event gas",
-        )),
     }
 }
 
@@ -852,37 +829,6 @@ const MAX_LIQUIDATIONS_PER_UPDATE: u32 = 50;
 /// side's offsetting gains persist).
 const ADL_BUDGET_PER_UPDATE: u32 = 128;
 
-/// Reserves the bounded account set that one liquidation can change.
-///
-/// The matcher enforces [`MAX_LIQUIDATION_MAKER_ACCOUNTS`], ADL already consumes a shared capped
-/// budget, and the two fixed slots cover the liquidated user and fee recipient. Accounts changed by
-/// earlier sweep candidates are included so their reservations cannot be reused by later users.
-/// Sweep callers defer the next liquidation when this bound does not fit; manual callers return
-/// out-of-gas before their first write.
-fn reserve_liquidation_balance_events<CTX: ContextTr>(
-    context: &mut CTX,
-    adl_budget: u32,
-    policy: BalanceEventGasPolicy,
-) -> Result<bool, PrecompileError> {
-    let maker_accounts = u64::try_from(MAX_LIQUIDATION_MAKER_ACCOUNTS)
-        .map_err(|_| perp_fatal_invariant_err("liquidation maker account cap exceeds u64"))?;
-    let candidate_bound = 1u64
-        .checked_add(maker_accounts)
-        .and_then(|count| count.checked_add(u64::from(adl_budget)))
-        .and_then(|count| count.checked_add(1))
-        .ok_or_else(|| perp_fatal_invariant_err("liquidation balance event bound overflow"))?;
-    let required_events = storage::tracked_balance_account_count(context)
-        .checked_add(candidate_bound)
-        .ok_or_else(|| {
-            perp_fatal_invariant_err("cumulative liquidation balance event bound overflow")
-        })?;
-    match storage::reserve_balance_events(context, required_events) {
-        Ok(()) => Ok(true),
-        Err(PrecompileError::OutOfGas) if policy == BalanceEventGasPolicy::Defer => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
 /// Protocol-automatic liquidation sweep, run synchronously at the tail of
 /// [`run_update_index_price`] after the new mark + funding are persisted (so the
 /// `Liquidation` events attach to the oracle's updateIndexPrice receipt). Scans
@@ -891,8 +837,7 @@ fn reserve_liquidation_balance_events<CTX: ContextTr>(
 ///
 /// Each candidate is attempted under its own journal checkpoint:
 /// - `Liquidated` → commit the writes;
-/// - healthy / stale (`AboveMaintenance` / `NoPosition`) → revert (the sweep leaves no trace);
-/// - `DeferredBalanceEventGas` → revert the candidate and stop, retaining the oracle update.
+/// - healthy / stale (`AboveMaintenance` / `NoPosition`) → revert (the sweep leaves no trace).
 ///
 /// Any other error after the liquidatability check is a commit-only invariant failure and aborts
 /// the node rather than allowing a partial write set.
@@ -928,15 +873,10 @@ fn run_liquidation_sweep<CTX: ContextTr>(
             mark_price,
             Address::ZERO,
             &mut adl_budget,
-            BalanceEventGasPolicy::Defer,
         ) {
             Ok(LiquidationOutcome::Liquidated { .. }) => {
                 context.journal_mut().checkpoint_commit();
                 liquidated += 1;
-            }
-            Ok(LiquidationOutcome::DeferredBalanceEventGas) => {
-                context.journal_mut().checkpoint_revert(cp);
-                break;
             }
             Ok(_) => {
                 // AboveMaintenance / NoPosition: zero perp writes were made.
@@ -1205,7 +1145,6 @@ pub fn run_deposit_insurance_fund<CTX: ContextTr>(
             "depositInsuranceFund: insufficient perp wallet balance",
         ));
     }
-    storage::reserve_balance_events(context, 1)?;
     account.debit_perp(args.amount)?;
     storage::save_account(context, caller, account)?;
 
@@ -1251,7 +1190,6 @@ pub fn run_withdraw_insurance_fund<CTX: ContextTr>(
             "withdrawInsuranceFund: amount exceeds fund balance",
         ));
     }
-    storage::reserve_balance_events(context, 1)?;
     let new_balance = balance - args.amount;
     storage::save_insurance_fund(context, new_balance)?;
 
