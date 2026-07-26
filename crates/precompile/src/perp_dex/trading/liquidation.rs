@@ -78,6 +78,9 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
         true,
         false, // liquidation close (IOC): never rests
         &mut order,
+        // The liquidation close emits its OrderPlaced itself (above), so there is nothing buffered
+        // for the match apply to flush — its log behavior is unchanged.
+        &mut None,
     )?;
     // delete-on-terminal: the liquidation close is an IOC that never rests — it exists only to
     // drive the match + emit OrderPlaced/Trade. Its record is dropped (never a live/queryable

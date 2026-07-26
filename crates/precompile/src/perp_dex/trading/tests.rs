@@ -1561,6 +1561,297 @@ fn post_only_rests_when_above_best_bid() {
     );
 }
 
+// ── OrderPlaced emission: accepted-only (batch-trade Phase 0) ──────────────
+//
+// `OrderPlaced` is buffered by `announce_new_order` and flushed at the first APPLY point, so it is
+// emitted IFF the placement is accepted while keeping its original stream position (first among its
+// own order's events). The single-order selectors revert on `Err` and truncate the logs anyway; the
+// batch selectors will CATCH the per-item error and return `Ok`, so an eagerly-emitted log would
+// survive in the receipts for an order that never existed.
+
+/// Drains the journal and maps each log to a short perp-event name, in emission order.
+/// (`take_logs` drains, so a call reports only the events since the previous call.)
+fn take_event_names(ctx: &mut TestCtx) -> Vec<&'static str> {
+    use crate::perp_dex::interface::IPerpDex::{
+        FundingSettled, InsuranceFundChanged, InsuranceFundDepleted, OrderCancelled, OrderPlaced,
+        OrderRested, PositionChanged, Trade,
+    };
+    JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .map(|log| {
+            let sig = log.data.topics().first().copied();
+            let named: &[(&'static str, FixedBytes<32>)] = &[
+                ("OrderPlaced", OrderPlaced::SIGNATURE_HASH),
+                ("OrderRested", OrderRested::SIGNATURE_HASH),
+                ("Trade", Trade::SIGNATURE_HASH),
+                ("PositionChanged", PositionChanged::SIGNATURE_HASH),
+                ("OrderCancelled", OrderCancelled::SIGNATURE_HASH),
+                ("FundingSettled", FundingSettled::SIGNATURE_HASH),
+                ("InsuranceFundChanged", InsuranceFundChanged::SIGNATURE_HASH),
+                (
+                    "InsuranceFundDepleted",
+                    InsuranceFundDepleted::SIGNATURE_HASH,
+                ),
+                (
+                    "AccountBalanceChanged",
+                    AccountBalanceChanged::SIGNATURE_HASH,
+                ),
+            ];
+            named
+                .iter()
+                .find(|(_, h)| sig == Some(*h))
+                .map(|(n, _)| *n)
+                .unwrap_or("Unknown")
+        })
+        .collect()
+}
+
+fn count_of(names: &[&str], want: &str) -> usize {
+    names.iter().filter(|n| **n == want).count()
+}
+
+#[test]
+fn rejected_post_only_placement_emits_no_logs() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0); // resting bid at PRICE
+    take_event_names(&mut ctx); // drain BOB's accepted placement
+
+    // PostOnly sell at PRICE would cross → rejected before any apply.
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side: 1,
+        price: PRICE,
+        quantity: QTY,
+        orderType: 0,
+        tif: 3, // PostOnly
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
+    assert!(
+        err.to_string().contains("PostOnly order would match"),
+        "{err}"
+    );
+
+    let logs = take_event_names(&mut ctx);
+    assert!(
+        logs.is_empty(),
+        "a rejected placement must emit no logs at all, got {logs:?}"
+    );
+}
+
+#[test]
+fn rejected_fok_placement_emits_no_logs() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // only QTY available
+    take_event_names(&mut ctx);
+
+    // FOK buy for 2×QTY cannot be fully filled → rejected.
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side: 0,
+        price: PRICE,
+        quantity: QTY * 2,
+        orderType: 0,
+        tif: 2, // FOK
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
+    assert!(
+        err.to_string().contains("FOK order cannot be fully filled"),
+        "{err}"
+    );
+
+    let logs = take_event_names(&mut ctx);
+    assert!(
+        logs.is_empty(),
+        "a rejected FOK placement must emit no logs at all, got {logs:?}"
+    );
+}
+
+/// The deepest reject: the walk has already computed its fills when `finalize_compute` rejects the
+/// taker on wallet cover — still pre-flush, so nothing (not even `OrderPlaced`) may be emitted.
+#[test]
+fn rejected_taker_wallet_cover_emits_no_logs() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
+
+    let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
+    alice.perp_wallet_balance = (INIT_MARGIN - 1) as i64;
+    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+    take_event_names(&mut ctx);
+
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side: 0,
+        price: PRICE,
+        quantity: QTY,
+        orderType: 0,
+        tif: 0,
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("insufficient perp wallet for margin"),
+        "{err}"
+    );
+
+    let logs = take_event_names(&mut ctx);
+    assert!(
+        logs.is_empty(),
+        "a taker rejected in finalize_compute must emit no logs at all, got {logs:?}"
+    );
+}
+
+/// The zero-fill GTC case: nothing matched, so `finalize_compute` early-returned and
+/// `rest_in_book`'s margin reject is the LAST genuine reject — the buffered log must survive the
+/// (empty) match flush unemitted and die with the reject.
+#[test]
+fn rejected_rest_in_book_margin_emits_no_logs() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    take_event_names(&mut ctx);
+
+    // Empty book → no fills; 11×QTY at leverage 1 needs 11 USDC of margin but WALLET is 10.
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side: 0,
+        price: PRICE,
+        quantity: QTY * 11,
+        orderType: 0,
+        tif: 0, // GTC
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("insufficient perp wallet for margin"),
+        "{err}"
+    );
+
+    let logs = take_event_names(&mut ctx);
+    assert!(
+        logs.is_empty(),
+        "a placement rejected by rest_in_book must emit no logs at all, got {logs:?}"
+    );
+}
+
+#[test]
+fn accepted_match_emits_order_placed_before_its_trade() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
+    take_event_names(&mut ctx);
+
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // GTC buy, fully fills
+
+    let logs = take_event_names(&mut ctx);
+    assert_eq!(
+        count_of(&logs, "OrderPlaced"),
+        1,
+        "exactly one OrderPlaced, got {logs:?}"
+    );
+    let placed = logs.iter().position(|n| *n == "OrderPlaced").unwrap();
+    let trade = logs
+        .iter()
+        .position(|n| *n == "Trade")
+        .unwrap_or_else(|| panic!("expected a Trade, got {logs:?}"));
+    let pos_changed = logs
+        .iter()
+        .position(|n| *n == "PositionChanged")
+        .unwrap_or_else(|| panic!("expected a PositionChanged, got {logs:?}"));
+    assert!(
+        placed < trade && placed < pos_changed,
+        "OrderPlaced must precede its Trade/PositionChanged, got {logs:?}"
+    );
+}
+
+#[test]
+fn accepted_resting_placement_emits_exactly_one_order_placed() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    take_event_names(&mut ctx);
+
+    // Empty book → no fill, rests (flushed at match_order's apply, no-op at rest_in_book's).
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // GTC
+    let logs = take_event_names(&mut ctx);
+    assert_eq!(
+        logs,
+        vec!["OrderPlaced", "OrderRested"],
+        "a resting GTC emits OrderPlaced then OrderRested"
+    );
+
+    // PostOnly never calls match_order → rest_in_book's apply block is the ONLY flush site.
+    place(&mut ctx, BOB, 1, PRICE + TICK, QTY, 0, 3); // PostOnly
+    let logs = take_event_names(&mut ctx);
+    assert_eq!(
+        logs,
+        vec!["OrderPlaced", "OrderRested"],
+        "a resting PostOnly emits OrderPlaced then OrderRested"
+    );
+}
+
+/// Two apply sites are reached (match flush, then the rest) — the `take()` must keep it at one.
+#[test]
+fn accepted_partial_fill_then_rest_emits_exactly_one_order_placed() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // only QTY available
+    take_event_names(&mut ctx);
+
+    place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 0); // GTC buy: fills QTY, rests QTY
+
+    let logs = take_event_names(&mut ctx);
+    assert_eq!(
+        count_of(&logs, "OrderPlaced"),
+        1,
+        "exactly one OrderPlaced across both apply sites, got {logs:?}"
+    );
+    assert_eq!(logs.first().copied(), Some("OrderPlaced"), "{logs:?}");
+    assert_eq!(
+        count_of(&logs, "OrderRested"),
+        1,
+        "the remainder rested, got {logs:?}"
+    );
+}
+
+#[test]
+fn accepted_ioc_expiring_with_no_fill_still_emits_one_order_placed() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    take_event_names(&mut ctx);
+
+    // IOC against an empty book: accepted, matches nothing, rests nothing, expires.
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 1); // IOC
+    let logs = take_event_names(&mut ctx);
+    assert_eq!(
+        logs,
+        vec!["OrderPlaced"],
+        "an accepted IOC that expired unfilled still emits exactly its OrderPlaced"
+    );
+
+    // Same for a market order with no book.
+    place(&mut ctx, ALICE, 0, 0, QTY, 1, 1); // Market/IOC
+    let logs = take_event_names(&mut ctx);
+    assert_eq!(
+        logs,
+        vec!["OrderPlaced"],
+        "an accepted market order that expired unfilled still emits exactly its OrderPlaced"
+    );
+}
+
 // ── Cancel ────────────────────────────────────────────────────────────────
 
 #[test]

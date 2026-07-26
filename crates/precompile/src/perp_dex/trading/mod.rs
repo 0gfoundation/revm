@@ -448,11 +448,11 @@ fn place_order_core<CTX: ContextTr>(
         tif_u8,
     )?;
 
-    // commit-only #23: build the Order in memory + emit OrderPlaced at its original stream
-    // position (logs are EVM-journaled and revert with the tx — only the STORAGE persist is
-    // deferred to the single final save after all genuine rejects have passed).
-    let mut taker_order = announce_new_order(
-        context,
+    // commit-only #23: build the Order in memory. The OrderPlaced log is BUFFERED (not emitted):
+    // every genuine reject still lies ahead, and the batch selectors catch a per-item error without
+    // reverting the frame — so the log is flushed by `emit_pending_order_placed` at the first APPLY
+    // point (match flush / rest / the final persist below), keeping its original stream position.
+    let (mut taker_order, pending) = announce_new_order(
         account,
         &order_id,
         market_id,
@@ -461,6 +461,7 @@ fn place_order_core<CTX: ContextTr>(
         client_order_id,
         &validated,
     );
+    let mut pending = Some(pending);
 
     match validated.order_type {
         OrderType::Limit => execute_limit_order(
@@ -473,6 +474,7 @@ fn place_order_core<CTX: ContextTr>(
             client_order_id,
             validated,
             &mut taker_order,
+            &mut pending,
         )?,
         OrderType::Market => execute_market_order(
             context,
@@ -483,8 +485,13 @@ fn place_order_core<CTX: ContextTr>(
             quantity,
             validated,
             &mut taker_order,
+            &mut pending,
         )?,
     }
+    // Fallback flush: the order is accepted (every genuine reject returned above) but reached no
+    // other apply site — an IOC/market order that expired against an empty book matches nothing and
+    // rests nothing, yet legitimately emits OrderPlaced. No-op when an apply already flushed it.
+    emit_pending_order_placed(context, &mut pending);
     // Single final persist of the taker order. delete-on-terminal: a Filled/Expired taker leaves
     // NO record (it fully filled or its IOC/FOK/market remainder expired — never resting); an
     // Open/PartiallyFilled taker rested, so it is saved live (its book entry / level FIFO / live
@@ -552,45 +559,95 @@ fn validate_place_order<CTX: ContextTr>(
     })
 }
 
-fn announce_new_order<CTX: ContextTr>(
+/// The `OrderPlaced` log of a placement that is not yet known-accepted.
+///
+/// `announce_new_order` runs BEFORE every genuine reject (PostOnly-would-cross, FOK-unfillable,
+/// the taker K9 / wallet-cover / fills+rest rejects in `finalize_compute`, `rest_in_book`'s margin
+/// rejects), so it may not emit: today a per-call `Err` reverts the frame and truncates the logs,
+/// but the batch selectors CATCH a per-item error and return `Ok` overall — the frame does not
+/// revert, and an `OrderPlaced` for an order that never existed would survive in the receipts.
+///
+/// The EVM journal is append-only (a log cannot be un-emitted), so the log is BUFFERED here and
+/// flushed by [`emit_pending_order_placed`] at the first APPLY point the place path reaches. That
+/// preserves the original log-stream position: nothing between the announce and the first apply
+/// emits a log (the match walk is write- and log-free; every `Trade` / `PositionChanged` /
+/// `OrderCancelled` / `InsuranceFund*` is deferred into `MatchRegistry::flush`), so `OrderPlaced`
+/// still comes first for its order.
+pub(super) struct PendingOrderPlaced {
+    user: Address,
+    market_id: u64,
+    order_id: [u8; 32],
+    side: u8,
+    price: u64,
+    quantity: u64,
+    order_type: u8,
+    tif: u8,
+    client_order_id: [u8; 16],
+}
+
+/// Flushes the buffered `OrderPlaced` — **exactly once**: the `take()` makes every later call a
+/// no-op, so all apply sites can call it unconditionally. Also a no-op for callers that have no
+/// pending log (the liquidation close emits its own `OrderPlaced` and passes `&mut None`).
+pub(super) fn emit_pending_order_placed<CTX: ContextTr>(
     context: &mut CTX,
+    pending: &mut Option<PendingOrderPlaced>,
+) {
+    let Some(p) = pending.take() else {
+        return;
+    };
+    context.journal_mut().log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::OrderPlaced {
+            user: p.user,
+            marketId: p.market_id,
+            orderId: FixedBytes(p.order_id),
+            side: p.side,
+            price: p.price,
+            quantity: p.quantity,
+            orderType: p.order_type,
+            tif: p.tif,
+            clientOrderId: FixedBytes(p.client_order_id),
+        }
+        .to_log_data(),
+    });
+}
+
+/// Builds the taker `Order` in memory plus its not-yet-emitted `OrderPlaced`
+/// ([`PendingOrderPlaced`]). Read-only: no storage write, and — unlike before — no log either.
+fn announce_new_order(
     account: Address,
     order_id: &[u8; 32],
     market_id: u64,
     price: u64,
     quantity: u64,
     client_order_id: [u8; 16],
-    order: &ValidatedOrder,
-) -> Order {
+    validated: &ValidatedOrder,
+) -> (Order, PendingOrderPlaced) {
     let order = Order {
         owner: account.0 .0,
         market_id,
-        side: order.side,
+        side: validated.side,
         price,
         quantity,
         filled: 0,
-        order_type: order.order_type,
-        tif: order.tif,
+        order_type: validated.order_type,
+        tif: validated.tif,
         status: OrderStatus::Open,
     };
 
-    context.journal_mut().log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::OrderPlaced {
-            user: account,
-            marketId: market_id,
-            orderId: FixedBytes(*order_id),
-            side: order.side as u8,
-            price,
-            quantity,
-            orderType: order.order_type as u8,
-            tif: order.tif as u8,
-            clientOrderId: FixedBytes(client_order_id),
-        }
-        .to_log_data(),
-    });
+    let pending = PendingOrderPlaced {
+        user: account,
+        market_id,
+        order_id: *order_id,
+        side: validated.side as u8,
+        price,
+        quantity,
+        order_type: validated.order_type as u8,
+        tif: validated.tif as u8,
+        client_order_id,
+    };
 
-    order
+    (order, pending)
 }
 
 /// Binance-style TIF expiry (IOC/market not fully filled) → Expired, not Cancelled (which is
@@ -663,6 +720,7 @@ fn execute_limit_order<CTX: ContextTr>(
     client_order_id: [u8; 16],
     order: ValidatedOrder,
     taker_order: &mut Order,
+    pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PrecompileError> {
     match order.tif {
         TimeInForce::PostOnly => {
@@ -680,6 +738,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 client_order_id,
                 &order.market,
                 Some(bbo),
+                pending_placed,
             )
         }
         TimeInForce::Gtc => {
@@ -697,6 +756,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 false,
                 true, // GTC: rest the remainder → pre-validate its margin atomically with fills
                 taker_order,
+                pending_placed,
             )?;
             if remaining > 0 {
                 rest_in_book(
@@ -712,6 +772,7 @@ fn execute_limit_order<CTX: ContextTr>(
                     &order.market,
                     // GTC: matching ran → read the (post-match) BBO inside rest_in_book.
                     None,
+                    pending_placed,
                 )?;
             }
             Ok(())
@@ -731,6 +792,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 false,
                 false, // IOC: unmatched remainder is dropped, never rested
                 taker_order,
+                pending_placed,
             )?;
             cancel_unfilled_remainder(taker_order, remaining);
             Ok(())
@@ -759,6 +821,7 @@ fn execute_limit_order<CTX: ContextTr>(
                 false,
                 false, // FOK: fully filled or rejected — never rests
                 taker_order,
+                pending_placed,
             )?;
             ensure_fok_filled(remaining)
         }
@@ -774,6 +837,7 @@ fn execute_market_order<CTX: ContextTr>(
     quantity: u64,
     order: ValidatedOrder,
     taker_order: &mut Order,
+    pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PrecompileError> {
     if order.tif == TimeInForce::Fok {
         check_fok_feasibility(
@@ -800,6 +864,7 @@ fn execute_market_order<CTX: ContextTr>(
         false,
         false, // market order: never rests
         taker_order,
+        pending_placed,
     )?;
     if order.tif == TimeInForce::Fok {
         ensure_fok_filled(remaining)
@@ -867,6 +932,10 @@ pub(super) fn match_order<CTX: ContextTr>(
     // performs the single final save after every genuine reject has passed, so a rejected
     // placement leaves no phantom order (and a signed order's signature is not burned).
     taker_order: &mut Order,
+    // The place path's buffered `OrderPlaced`, flushed at the APPLY below so it precedes this
+    // order's own Trade/PositionChanged/OrderCancelled events. `&mut None` for callers that emit
+    // their own OrderPlaced (the liquidation close).
+    pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<u64, PrecompileError> {
     let mut remaining = quantity;
     let mut last_trade_price = None;
@@ -1364,6 +1433,20 @@ pub(super) fn match_order<CTX: ContextTr>(
         taker_settlement.finalize_compute(context, &mut registry, side, market, rest_req)?;
 
     // ── APPLY (no genuine rejects past this point) ──
+    // Flush the buffered OrderPlaced FIRST so it precedes this order's own Trade /
+    // PositionChanged events, which the flush below emits (log order preserved).
+    //
+    // ONE exception keeps "emitted ⟺ accepted" honest: `finalize_compute` early-returns on an
+    // EMPTY fill set, so on a zero-fill GTC its atomic fills+rest margin pre-check never ran and
+    // `rest_in_book`'s margin reject is still ahead of us — the sole genuine reject that can fire
+    // after this apply. In that case the log stays buffered and `rest_in_book` flushes it inside
+    // its own apply block. (Zero-fill means the walk matched nothing, so the flush has no Trade /
+    // PositionChanged of ours to precede; at most it carries an insolvent-maker cancel, whose log
+    // then lands before this order's OrderPlaced — a foreign order's event, not this order's.)
+    let rest_reject_still_ahead = rest_remainder && remaining > 0 && taker_plan.is_none();
+    if !rest_reject_still_ahead {
+        emit_pending_order_placed(context, pending_placed);
+    }
     registry.flush(context, market_id)?;
     if let Some(plan) = taker_plan {
         settlement::finalize_apply(context, plan, side, market)?;
@@ -1397,6 +1480,10 @@ fn rest_in_book<CTX: ContextTr>(
     // once. rest runs AFTER matching (GTC), and matching only moves the OPPOSITE side from the one
     // we rest on, so a rest-time read yields both bests current — no staleness.
     bbo: Option<(u64, u64)>,
+    // The place path's buffered `OrderPlaced`, flushed at the top of the APPLY block below (so it
+    // lands before this order's `OrderRested`, and only once the margin rejects have passed).
+    // Already-`None` on the GTC path when the match flush emitted it.
+    pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let mut account = storage::load_account(context, user)?;
@@ -1480,6 +1567,7 @@ fn rest_in_book<CTX: ContextTr>(
             // ── APPLY (all rejects passed) ── NOW do the real insert: in-place on a warm list
             // (zero clone), or one materialize-clone on a cold first-touch (unavoidable — it IS
             // the write of a previously-committed list). partition_point re-derives the same idx.
+            emit_pending_order_placed(context, pending_placed);
             drop(buy_ref);
             storage::mutate_buy_orders(context, user, market_id, |list| {
                 let i = list.partition_point(|e| e.price > price);
@@ -1557,6 +1645,7 @@ fn rest_in_book<CTX: ContextTr>(
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
 
             // ── APPLY (all rejects passed) ── real insert: in-place (warm) / one materialize (cold).
+            emit_pending_order_placed(context, pending_placed);
             drop(sell_ref);
             storage::mutate_sell_orders(context, user, market_id, |list| {
                 let i = list.partition_point(|e| e.price < price);
