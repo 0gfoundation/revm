@@ -9,6 +9,7 @@
 //! ├── mod.rs            ← you are here (selector routing, entry point)
 //! ├── interface.rs      ← Solidity ABI (sol! macro)
 //! ├── errors.rs         ← perp_err helper
+//! ├── batch.rs          ← batch-call shell (pre-decode length, gas, statuses, abort-forward)
 //! ├── math.rs           ← pure financial math functions
 //! ├── types/            ← data structures (account, order, position, market)
 //! ├── storage/          ← on-chain storage helpers
@@ -32,11 +33,12 @@ use crate::{
             run_set_user_fee_rates, run_transfer_from_perp, run_transfer_to_perp, run_withdraw,
         },
         interface::IPerpDex::{
-            self, addMarketCall, addPositionMarginCall, cancelOrderCall, cancelOrderSignedCall,
-            depositCall, depositInsuranceFundCall, getAccountCall, getAdminCall, getApiKeyCall,
-            getApiKeysCall, getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall,
-            getFundingStateCall, getIndexPriceCall, getInsuranceFundCall, getMarkPriceCall,
-            getMarketCall, getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
+            self, addMarketCall, addPositionMarginCall, batchCancelOrdersCall,
+            batchCancelOrdersSignedCall, cancelOrderCall, cancelOrderSignedCall, depositCall,
+            depositInsuranceFundCall, getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
+            getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
+            getIndexPriceCall, getInsuranceFundCall, getMarkPriceCall, getMarketCall,
+            getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
             getOracleAddressCall, getOrderCall, getPositionCall, getUserFeeRatesCall,
             initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
             removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
@@ -54,7 +56,8 @@ use crate::{
             run_update_index_price, run_update_market, run_withdraw_insurance_fund,
         },
         trading::{
-            run_cancel_order, run_cancel_order_signed, run_get_book_level, run_get_book_prices,
+            run_batch_cancel_orders, run_batch_cancel_orders_signed, run_cancel_order,
+            run_cancel_order_signed, run_get_book_level, run_get_book_prices,
             run_get_market_fee_total, run_get_open_orders, run_get_order, run_place_order,
             run_place_order_signed,
         },
@@ -63,6 +66,7 @@ use crate::{
 };
 
 pub mod account;
+pub mod batch;
 pub mod errors;
 pub mod funding;
 pub mod interface;
@@ -81,9 +85,21 @@ pub const PERP_DEX_ADDRESS: Address = address!("00000000000000000000000000000000
 /// USDC token address on this chain.
 pub const USDC_ADDRESS: Address = address!("5ddA922Df9244b87635144e59D26f5A6e9FD90c3");
 
+/// Flat gas of a single `cancelOrder` / `cancelOrderSigned`.
+///
+/// Defined once because it is ALSO the batch per-item unit: `batchCancelOrders` charges
+/// `BASE_BATCH_GAS + N * CANCEL_ORDER_GAS`, so the two can never drift apart. The value is the
+/// pre-existing table cost, unchanged (`batch_unit_matches_single_selector_cost` pins it).
+pub const CANCEL_ORDER_GAS: u64 = 80_000;
+
 // ── Selector table ────────────────────────────────────────────────────────────
 
 /// `(gas_cost, can_be_called_in_static_context)`
+///
+/// For the `batch*` selectors `gas_cost` is only the **envelope floor** ([`batch::BASE_BATCH_GAS`]):
+/// it drives the early `gas_cost > gas_limit` rejection and the static-context check, while the real
+/// charge `BASE_BATCH_GAS + N * unit` is computed from the pre-decode array length in
+/// [`run_perp_dex_call`] and is what lands in the returned [`PrecompileOutput`].
 static SELECTORS: OnceLock<HashMap<[u8; 4], (u64, bool)>> = OnceLock::new();
 
 fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
@@ -117,7 +133,12 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(setLeverageSignedCall::SELECTOR, (20_000, false));
         // Trading
         m.insert(placeOrderCall::SELECTOR, (200_000, false));
-        m.insert(cancelOrderCall::SELECTOR, (80_000, false));
+        m.insert(cancelOrderCall::SELECTOR, (CANCEL_ORDER_GAS, false));
+        // Batch cancel: floor only — see the doc comment on SELECTORS.
+        m.insert(
+            batchCancelOrdersCall::SELECTOR,
+            (batch::BASE_BATCH_GAS, false),
+        );
         m.insert(getOrderCall::SELECTOR, (5_000, true));
         m.insert(getOpenOrdersCall::SELECTOR, (20_000, true));
         m.insert(getBookPricesCall::SELECTOR, (20_000, true));
@@ -135,7 +156,12 @@ fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getApiKeysCall::SELECTOR, (10_000, true));
         // Signed order submission (relayer path)
         m.insert(placeOrderSignedCall::SELECTOR, (200_000, false));
-        m.insert(cancelOrderSignedCall::SELECTOR, (80_000, false));
+        m.insert(cancelOrderSignedCall::SELECTOR, (CANCEL_ORDER_GAS, false));
+        // Batch cancel (signed): floor only — see the doc comment on SELECTORS.
+        m.insert(
+            batchCancelOrdersSignedCall::SELECTOR,
+            (batch::BASE_BATCH_GAS, false),
+        );
         // Insurance Fund
         m.insert(depositInsuranceFundCall::SELECTOR, (30_000, false));
         m.insert(withdrawInsuranceFundCall::SELECTOR, (30_000, false));
@@ -235,6 +261,20 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         None => return Err(PrecompileError::StatefulInvalidInput),
     };
 
+    // Dynamic-gas batch selectors. The table cost checked above is only the envelope FLOOR; the real
+    // charge is `BASE_BATCH_GAS + N * unit`, where `N` is read PRE-DECODE from the calldata (this
+    // decision has to precede ABI decoding). Done here — before the dispatch, before any write — so
+    // an insufficient `gas_limit` is a clean `OutOfGas` with zero writes, exactly like the fixed-cost
+    // check above. `None` means "not a batch selector", or "the length word is untrustworthy", in
+    // which case only the floor is charged and the handler produces the clean revert.
+    let mut charged_gas = base_gas_used;
+    if let Some(cost) = batch::batch_dynamic_gas(selector, input_bytes) {
+        if cost > gas_limit {
+            return Err(PrecompileError::OutOfGas);
+        }
+        charged_gas = cost;
+    }
+
     // commit-only #23: EOA-direct calls only. Perp writes are commit-only (the per-op undo is
     // being removed), so no enclosing frame that could revert AFTER a successful perp call may
     // exist. Frame depth: a top-level (tx-level) call executes at depth 1 (0 when unit tests
@@ -295,6 +335,12 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
         // Trading
         s if s == placeOrderCall::SELECTOR => run_place_order(input_bytes, caller, context),
         s if s == cancelOrderCall::SELECTOR => run_cancel_order(input_bytes, caller, context),
+        s if s == batchCancelOrdersCall::SELECTOR => {
+            run_batch_cancel_orders(input_bytes, caller, context)
+        }
+        s if s == batchCancelOrdersSignedCall::SELECTOR => {
+            run_batch_cancel_orders_signed(input_bytes, context)
+        }
         s if s == getOrderCall::SELECTOR => run_get_order(input_bytes, context),
         s if s == getOpenOrdersCall::SELECTOR => run_get_open_orders(input_bytes, context),
         s if s == getBookPricesCall::SELECTOR => run_get_book_prices(input_bytes, context),
@@ -341,10 +387,10 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
 
     match result {
         Ok(bytes) => {
-            // Balance after-image events are FREE — the call is charged only the flat
-            // per-selector `base_gas_used`.
+            // Balance after-image events are FREE — the call is charged only `charged_gas`
+            // (the flat per-selector cost, or `BASE_BATCH_GAS + N * unit` for a batch selector).
             emit_account_balance_after_images(context)?;
-            Ok(PrecompileOutput::new(base_gas_used, bytes))
+            Ok(PrecompileOutput::new(charged_gas, bytes))
         }
         // Fatal errors propagate as-is (storage / system bugs).
         Err(PrecompileError::Fatal(error)) => {
@@ -366,7 +412,7 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
                 PERP_WRITE_THEN_REVERT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
             Ok(PrecompileOutput::new_reverted(
-                base_gas_used,
+                charged_gas,
                 encode_revert_string(&error.to_string()),
             ))
         }

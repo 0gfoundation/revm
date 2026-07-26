@@ -83,6 +83,21 @@ sol! {
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
         function cancelOrder(bytes32 orderId, uint64 marketId) external;
+        /// Cancel up to MAX_BATCH_CANCEL (256) open orders in one call (caller must be the owner of each).
+        ///
+        /// Atomicity is **abort-forward**, not all-or-nothing: each id is attempted in calldata order
+        /// and a per-item genuine reject (not found / not owner / not cancellable / unknown market)
+        /// does NOT undo the items before it. The call returns Ok once the loop has begun.
+        ///
+        /// `statuses` = N concatenated 34-byte records, index-aligned to `orderIds`:
+        ///   byte 0     tag       0 = Rejected, 1 = Accepted (cancelled), 3 = Aborted, 4 = NotAttempted
+        ///   bytes 1..33 orderId  the input id, echoed
+        ///   byte 33    reason    numeric reason code; 0 when accepted
+        /// Reason codes are NUMERIC (never strings) — see `PerpBatchReason` in `perp_dex::batch`.
+        ///
+        /// Gas: BASE_BATCH + N * cancelOrder-cost, charged up front from the pre-decode array length.
+        /// Reverts as a whole (zero writes) for: bad calldata, N == 0, N > 256, insufficient gas.
+        function batchCancelOrders(bytes32[] orderIds) external returns (bytes statuses);
         /// Query order details.
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
         function getOrder(bytes32 orderId, uint64 marketId) external view returns (
@@ -226,6 +241,29 @@ sol! {
             uint8 keyId,
             bytes calldata signature
         ) external;
+
+        /// Cancel up to MAX_BATCH_CANCEL (256) orders for `account`, authenticated by ONE
+        /// ed25519 signature covering the whole batch.
+        ///
+        /// Message: "perpdex_v1_batch_cancel"(23) || account(20) || keyId(1) || timestamp(8)
+        ///          || recvWindow(8) || N(4, big-endian) || N x orderId(32)
+        /// N is inside the digest, so the batch's size, content and order cannot be tampered with.
+        /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
+        ///
+        /// Replay protection is EXPLICIT here (unlike the single-order cancel, whose guard is
+        /// implicit in "a cancelled order cannot be cancelled again"): the signature is burned in
+        /// the seen-signature set after verification, unconditionally — including a batch in which
+        /// every item was rejected. Resubmitting the same signature reverts the whole call.
+        ///
+        /// Returns the same index-aligned 34-byte-per-item `statuses` blob as batchCancelOrders.
+        function batchCancelOrdersSigned(
+            address account,
+            uint8 keyId,
+            uint64 timestamp,
+            uint64 recvWindow,
+            bytes32[] orderIds,
+            bytes calldata signature
+        ) external returns (bytes statuses);
 
         // ── Events ───────────────────────────────────────────────────────
         event AdminInitialized(address indexed admin);

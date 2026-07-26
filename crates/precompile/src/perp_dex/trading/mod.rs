@@ -24,11 +24,13 @@ pub(crate) const MAX_LIQUIDATION_MAKER_ACCOUNTS: usize = 128;
 
 use crate::{
     perp_dex::{
+        batch::{self, PerpBatchTag},
         errors::{perp_err, perp_invariant_err},
         interface::IPerpDex::{
-            self, cancelOrderCall, cancelOrderSignedCall, getBookLevelCall, getBookPricesCall,
-            getMarketFeeTotalCall, getOpenOrdersCall, getOpenOrdersReturn, getOrderCall,
-            getOrderReturn, placeOrderCall, placeOrderSignedCall,
+            self, batchCancelOrdersCall, batchCancelOrdersSignedCall, cancelOrderCall,
+            cancelOrderSignedCall, getBookLevelCall, getBookPricesCall, getMarketFeeTotalCall,
+            getOpenOrdersCall, getOpenOrdersReturn, getOrderCall, getOrderReturn, placeOrderCall,
+            placeOrderSignedCall,
         },
         math::{
             calc_maker_fee_for_order_qty_with_bps, calc_reservation_notionals, calc_trading_fee,
@@ -207,6 +209,160 @@ pub fn run_cancel_order<CTX: ContextTr>(
     let args = cancelOrderCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("cancelOrder: invalid calldata"))?;
     cancel_order_core(caller, args.orderId.0, context)
+}
+
+// ── Batch cancel (Phase 1) ───────────────────────────────────────────────────
+//
+// The shell lives in `perp_dex::batch`: pre-decode length reading, the up-front gas bound, the
+// numeric reason codes, the 34-byte status records and the abort-forward driver — all selector-
+// agnostic, so `batchPlaceOrders` (Phase 2) reuses them with a different per-item closure.
+//
+// `cancel_order_core` is reused VERBATIM: no forked matching, settlement or margin logic. All four
+// of its genuine rejects (order not found / not owner / not cancellable / unknown market) are pure
+// reads, which is why cancel is the clean unit to build the shell on — a rejected item marks no
+// typed-store key dirty, contributes zero keys to the block delta, and is invisible to the
+// commitment.
+//
+// Atomicity is abort-forward (see the `batch` module docs for why "propagate → whole-batch revert"
+// cannot be implemented under commit-only). Everything that can revert the WHOLE call is checked
+// before the loop and is pre-write, so the commit-only write-then-error tripwire stays clean:
+// bad calldata, `N == 0`, `N > MAX_BATCH_CANCEL`, gas (in `run_perp_dex_call`), `depth() > 1`
+// (likewise), and — for the signed variant — signature/recvWindow/api-key/replay failures.
+
+/// `batchCancelOrders(bytes32[] orderIds) returns (bytes statuses)`
+///
+/// Cancels each id in strict calldata order on behalf of `caller`. Returns the index-aligned status
+/// blob; see [`batch`] for the record layout.
+pub fn run_batch_cancel_orders<CTX: ContextTr>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    // Defensive pre-decode length read, repeated here on purpose: the gas path in
+    // `run_perp_dex_call` must not be the only thing that distrusts the declared length word, since
+    // `abi_decode_validate` reserves capacity for it before looking at the calldata size.
+    batch::CANCEL_DIRECT_LAYOUT.checked_len(input_bytes)?;
+    let args = batchCancelOrdersCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("batchCancelOrders: invalid calldata"))?;
+    let ids = args.orderIds;
+    // MAX is enforced on the DECODED length (authoritative), so a legal-but-non-minimal encoding
+    // cannot fail a valid batch.
+    batch::check_batch_len(ids.len(), batch::MAX_BATCH_CANCEL, "batchCancelOrders")?;
+
+    let statuses = batch::drive_batch(
+        context,
+        ids.len(),
+        |k| ids[k].0,
+        |ctx, k| {
+            cancel_order_core(caller, ids[k].0, ctx).map(|_| (PerpBatchTag::Accepted, ids[k].0))
+        },
+    )?;
+    Ok(Bytes::from(batchCancelOrdersCall::abi_encode_returns(
+        &Bytes::from(statuses),
+    )))
+}
+
+/// `batchCancelOrdersSigned(address account, uint8 keyId, uint64 timestamp, uint64 recvWindow, bytes32[] orderIds, bytes signature) returns (bytes statuses)`
+///
+/// ONE ed25519 signature authorises the whole batch. Canonical fixed-layout message, big-endian:
+///
+/// ```text
+/// "perpdex_v1_batch_cancel"(23) || account(20) || keyId(1) || timestamp(8) || recvWindow(8)
+///   || N(4) || N x orderId(32)
+/// ```
+///
+/// `N` is inside the digest, so the batch's size, content and order cannot be tampered with.
+pub fn run_batch_cancel_orders_signed<CTX: ContextTr>(
+    input_bytes: &[u8],
+    context: &mut CTX,
+) -> Result<Bytes, PrecompileError> {
+    batch::CANCEL_SIGNED_LAYOUT.checked_len(input_bytes)?;
+    let args = batchCancelOrdersSignedCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("batchCancelOrdersSigned: invalid calldata"))?;
+    let ids = args.orderIds;
+    batch::check_batch_len(
+        ids.len(),
+        batch::MAX_BATCH_CANCEL,
+        "batchCancelOrdersSigned",
+    )?;
+
+    // Same validation ORDER as the other signed entry points: api key → recvWindow → expiry →
+    // verify. Every step below is a pure read, so any failure reverts the whole call write-clean.
+    let api_key = storage::load_api_key(context, args.account, args.keyId)?
+        .ok_or_else(|| perp_err("batchCancelOrdersSigned: no api key registered for account"))?;
+
+    check_recv_window(context, args.timestamp, args.recvWindow)
+        .map_err(|e| perp_err(format!("batchCancelOrdersSigned: {e}")))?;
+
+    check_api_key_expiry(context, &api_key)
+        .map_err(|e| perp_err(format!("batchCancelOrdersSigned: {e}")))?;
+
+    let pubkey = api_key.pubkey;
+    let msg = batch_cancel_message(
+        args.account,
+        args.keyId,
+        args.timestamp,
+        args.recvWindow,
+        &ids,
+    );
+    verify_ed25519(&pubkey, &msg, &args.signature)
+        .map_err(|e| perp_err(format!("batchCancelOrdersSigned: {e}")))?;
+
+    // Replay guard is MANDATORY here. The single-order rule — "a rejected signature stays replayable
+    // inside its recv window" — must NOT carry over: a batch returns Ok, so leaving the signature
+    // unburned would let a partially-accepted (or even all-rejected) batch be resubmitted and partly
+    // re-execute. Hence: check before the loop (duplicate → whole-call revert, pre-write) and burn
+    // immediately after verification, UNCONDITIONALLY, before the first item runs.
+    let sig_hash: [u8; 32] = keccak256(args.signature.as_ref()).0;
+    if storage::is_signature_seen(context, &sig_hash)? {
+        return Err(perp_err(
+            "batchCancelOrdersSigned: duplicate signature (already submitted)",
+        ));
+    }
+    // ── last pre-loop fault has passed; the first write happens here ──
+    let block_ts: u64 = context.block().timestamp().saturating_to();
+    storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
+    storage::gc_seen_buckets(context, block_ts)?;
+
+    let account = args.account;
+    let statuses = batch::drive_batch(
+        context,
+        ids.len(),
+        |k| ids[k].0,
+        |ctx, k| {
+            cancel_order_core(account, ids[k].0, ctx).map(|_| (PerpBatchTag::Accepted, ids[k].0))
+        },
+    )?;
+    Ok(Bytes::from(
+        batchCancelOrdersSignedCall::abi_encode_returns(&Bytes::from(statuses)),
+    ))
+}
+
+/// Canonical batch-cancel digest preimage (64-byte header + 32 bytes per id):
+/// `"perpdex_v1_batch_cancel"(23) || account(20) || keyId(1) || timestamp(8) || recvWindow(8)
+///  || N(4) || N x orderId(32)`, all integers big-endian.
+///
+/// `N` is the DECODED id count, so a tampered length cannot be made to verify.
+pub(crate) fn batch_cancel_message(
+    account: Address,
+    key_id: u8,
+    timestamp: u64,
+    recv_window: u64,
+    ids: &[FixedBytes<32>],
+) -> Vec<u8> {
+    const TAG: &[u8; 23] = b"perpdex_v1_batch_cancel";
+    const HEADER: usize = 23 + 20 + 1 + 8 + 8 + 4;
+    let mut msg = Vec::with_capacity(HEADER + ids.len() * 32);
+    msg.extend_from_slice(TAG);
+    msg.extend_from_slice(account.as_slice());
+    msg.push(key_id);
+    msg.extend_from_slice(&timestamp.to_be_bytes());
+    msg.extend_from_slice(&recv_window.to_be_bytes());
+    msg.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+    for id in ids {
+        msg.extend_from_slice(id.as_slice());
+    }
+    msg
 }
 
 /// `getOrder(bytes32 orderId, uint64 marketId) returns (address owner, uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint64 filled, uint8 status)`
