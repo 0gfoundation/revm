@@ -23,6 +23,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use context::{ContextTr, JournalTr};
+use primitives::Address;
 
 use crate::{
     perp_dex::{
@@ -31,7 +32,7 @@ use crate::{
             batchCancelOrdersCall, batchCancelOrdersSignedCall, batchPlaceOrdersCall,
             batchPlaceOrdersSignedCall,
         },
-        CANCEL_ORDER_GAS, PLACE_ORDER_GAS,
+        storage, CANCEL_ORDER_GAS, PLACE_ORDER_GAS,
     },
     PrecompileError,
 };
@@ -464,6 +465,7 @@ pub struct BatchRun {
 /// written under it — so the caller has to be told which one was burned.
 pub fn drive_batch<CTX, EchoFn, ItemFn>(
     context: &mut CTX,
+    initiator: Address,
     n: usize,
     echo_id: EchoFn,
     mut run_item: ItemFn,
@@ -473,6 +475,11 @@ where
     EchoFn: Fn(usize, PerpBatchTag) -> [u8; 32],
     ItemFn: FnMut(&mut CTX, usize) -> Result<(PerpBatchTag, [u8; 32]), PrecompileError>,
 {
+    // A batch acts for exactly ONE initiator: hold its account/position/order-lists in a
+    // batch-scoped local working-set so per-item reads/writes stay cache-local, flushed to the main
+    // store ONCE below. Orderbook + all non-initiator state are NOT hoisted (they route to main
+    // through the un-owned accessor path). Net write-set is identical → commitment byte-identical.
+    storage::begin_batch_ws(context, initiator);
     let mut blob = BatchStatusBlob::with_capacity(n);
     let mut accepted = 0usize;
     let mut aborted_at = None;
@@ -518,6 +525,13 @@ where
         k += 1;
     }
     debug_assert_eq!(blob.len(), n, "status blob must stay index-aligned");
+    // Reached on BOTH the normal-completion and abort-forward (`break`) paths: flush the initiator's
+    // working-set into the main store before returning. On abort-forward the aborted item's partial
+    // writes are KEPT (commit-only has no undo — replicating today's leave-committed behaviour is
+    // what keeps the commitment byte-identical). Genuine rejects are write-clean, so nothing to
+    // restore. The Fatal early-return above intentionally skips this: the folded `tx_dirty` keeps
+    // the `discard_tx` commit-only guard armed for the halt.
+    storage::flush_batch_ws(context);
     Ok(BatchRun {
         statuses: blob.into_bytes(),
         accepted,

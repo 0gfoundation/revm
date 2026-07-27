@@ -251,6 +251,7 @@ pub fn run_batch_cancel_orders<CTX: ContextTr>(
 
     let run = batch::drive_batch(
         context,
+        caller,
         ids.len(),
         |k, _| ids[k].0,
         |ctx, k| {
@@ -327,6 +328,7 @@ pub fn run_batch_cancel_orders_signed<CTX: ContextTr>(
     let account = args.account;
     let run = batch::drive_batch(
         context,
+        account,
         ids.len(),
         |k, _| ids[k].0,
         |ctx, k| {
@@ -446,6 +448,7 @@ pub fn run_batch_place_orders<CTX: ContextTr>(
     let item_id = core::cell::Cell::new([0u8; 32]);
     let run = batch::drive_batch(
         context,
+        caller,
         orders.len(),
         // A rejected / never-attempted placement consumed no id (report zero). An ABORTED one did:
         // it wrote — possibly under that id — and `commit_batch_order_nonce` advances the nonce past
@@ -548,6 +551,7 @@ pub fn run_batch_place_orders_signed<CTX: ContextTr>(
     let account = args.account;
     let run = batch::drive_batch(
         context,
+        account,
         orders.len(),
         // An ABORTED item's id was consumed (it wrote, possibly under that id), so report it; a
         // rejected / never-attempted item consumed none. Derivation is a pure function of `k`.

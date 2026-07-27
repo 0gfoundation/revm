@@ -537,6 +537,21 @@ pub fn discard_balance_tracking<CTX: ContextTr>(context: &mut CTX) {
     typed_store_mut(context).discard_balance_tracking();
 }
 
+/// Attaches the batch single-initiator working-set for `owner` (see
+/// [`crate::perp_dex::typed_store::TypedPerpStore::begin_batch`]). Called by `drive_batch` before
+/// the item loop; every account/position/buy/sell access whose subject is `owner` then routes to a
+/// batch-scoped local instead of the main store, flushed once by [`flush_batch_ws`].
+pub fn begin_batch_ws<CTX: ContextTr>(context: &mut CTX, owner: Address) {
+    typed_store_mut(context).begin_batch(owner);
+}
+
+/// Flushes the batch working-set into the main store and detaches it (see
+/// [`crate::perp_dex::typed_store::TypedPerpStore::flush_batch`]). Called by `drive_batch` on both
+/// the normal-completion and abort-forward paths, before the driver returns.
+pub fn flush_batch_ws<CTX: ContextTr>(context: &mut CTX) {
+    typed_store_mut(context).flush_batch();
+}
+
 fn adjust_total_perp_collateral<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,

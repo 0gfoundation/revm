@@ -4884,7 +4884,7 @@ mod batch_cancel {
 
         // (a) write-clean error → Rejected, loop continues.
         let mut ctx = make_ctx();
-        let run = batch::drive_batch(&mut ctx, 3, echo_at, |_ctx, k| {
+        let run = batch::drive_batch(&mut ctx, ALICE, 3, echo_at, |_ctx, k| {
             if k == 1 {
                 Err(perp_invariant_err("write-clean invariant"))
             } else {
@@ -4905,7 +4905,7 @@ mod batch_cancel {
 
         // (b) error AFTER a perp write → Aborted + NotAttempted tail, still Ok.
         let mut ctx = make_ctx();
-        let run = batch::drive_batch(&mut ctx, 4, echo_at, |ctx, k| {
+        let run = batch::drive_batch(&mut ctx, ALICE, 4, echo_at, |ctx, k| {
             if k == 1 {
                 storage::save_user_nonce(ctx, ALICE, 7)?;
                 Err(perp_err("plain reject, but it wrote first"))
@@ -4929,7 +4929,7 @@ mod batch_cancel {
 
         // (c) Fatal propagates untouched, even though the loop had already begun.
         let mut ctx = make_ctx();
-        let err = batch::drive_batch(&mut ctx, 3, echo_at, |_ctx, k| {
+        let err = batch::drive_batch(&mut ctx, ALICE, 3, echo_at, |_ctx, k| {
             if k == 1 {
                 Err(perp_fatal_invariant_err("node-level"))
             } else {
@@ -6833,5 +6833,229 @@ mod batch_place {
             "an aborted batch must still burn its signature"
         );
         assert!(String::from_utf8_lossy(&out.bytes).contains("duplicate signature"));
+    }
+
+    // ── 10. batch single-user working-set equivalence (this PR) ─────────────
+    //
+    // The working-set relocates the initiator's account/position/order-lists into a batch-scoped
+    // local, flushed to the main store ONCE at end-of-batch. These three tests pin the property
+    // that makes it a pure perf refactor: the net state — and the off-trie perp delta / block
+    // commitment — a batch produces is IDENTICAL to the same operations run as separate
+    // single-order txs, including the abort-forward no-undo case and a same-initiator self-match
+    // (maker == taker == the working-set owner), which is the split-copy double-spend risk.
+
+    /// Places one order through the SAME entry point a batch uses (`run_perp_dex_call`), so a
+    /// batch-vs-per-item comparison differs only in the batching, never in the entry path.
+    fn single_place(ctx: &mut TestCtx, caller: Address, item: &PlaceItem) {
+        let input = placeOrderCall {
+            marketId: item.marketId,
+            side: item.side,
+            price: item.price,
+            quantity: item.quantity,
+            orderType: item.orderType,
+            tif: item.tif,
+            clientOrderId: item.clientOrderId,
+        }
+        .abi_encode();
+        let out = run_perp_dex_call(&input, 30_000_000, caller, U256::ZERO, false, ctx)
+            .expect("single place must not hard-fail");
+        assert!(
+            !out.reverted,
+            "single place reverted: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+    }
+
+    /// Full observable state the working-set hoists: position, visible + total perp collateral, and
+    /// both order-entry lists.
+    fn user_state(
+        ctx: &mut TestCtx,
+        user: Address,
+    ) -> (
+        PerpPosition,
+        u64,
+        i128,
+        Vec<crate::perp_dex::types::OrderEntry>,
+        Vec<crate::perp_dex::types::OrderEntry>,
+    ) {
+        let p = storage::load_position(ctx, user, MARKET_ID).unwrap();
+        let acct = storage::load_account(ctx, user).unwrap();
+        let buy = storage::load_buy_orders(ctx, user, MARKET_ID).unwrap();
+        let sell = storage::load_sell_orders(ctx, user, MARKET_ID).unwrap();
+        (
+            p,
+            acct.visible_perp_wallet_balance(),
+            acct.total_perp_collateral,
+            buy,
+            sell,
+        )
+    }
+
+    /// The block's net off-trie perp delta folded into a commitment (drains the dirty set — call
+    /// last). Equal commitments ⇒ byte-identical net write-set ⇒ golden-neutral.
+    fn perp_commitment(ctx: &mut TestCtx) -> U256 {
+        let delta = ctx.journal_mut().take_perp_delta();
+        storage::compute_block_commitment(U256::ZERO, &delta)
+    }
+
+    /// A same-initiator self-match INSIDE one batch: item 0 rests ALICE's bid, item 1 is ALICE's
+    /// crossing sell that consumes it. ALICE is BOTH the resting maker and the taker, so the
+    /// working-set must serve ONE coherent copy to both sides of the match — a split ws/main copy
+    /// would double-spend. The batch must net out to EXACTLY the two-separate-tx result.
+    #[test]
+    fn initiator_self_match_within_batch() {
+        let items = [
+            gtc(0, PRICE, QTY), // rests as ALICE's bid
+            gtc(1, PRICE, QTY), // ALICE sells into her own bid → self-match fill
+        ];
+
+        // Batch path (one call, working-set active).
+        let mut cb = make_ctx();
+        setup(&mut cb);
+        let base = nonce(&mut cb, ALICE);
+        let blob = batch_place(&mut cb, ALICE, &items);
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                expect(
+                    PerpBatchTag::Accepted,
+                    direct_id(ALICE, base, 0),
+                    PerpBatchReason::None
+                ),
+                expect(
+                    PerpBatchTag::Filled,
+                    direct_id(ALICE, base, 1),
+                    PerpBatchReason::None
+                ),
+            ],
+            "item 0 rested, item 1 self-matched it (fully filled)"
+        );
+
+        // Per-item path (same entry point, two separate txs).
+        let mut cs = make_ctx();
+        setup(&mut cs);
+        assert_eq!(nonce(&mut cs, ALICE), base, "same starting nonce");
+        for it in &items {
+            single_place(&mut cs, ALICE, it);
+        }
+
+        // Single coherent copy: the batch state equals the two-tx state — no double-spend.
+        assert_eq!(
+            user_state(&mut cb, ALICE),
+            user_state(&mut cs, ALICE),
+            "self-match batch state must equal two separate single-order txs"
+        );
+        assert_eq!(nonce(&mut cb, ALICE), nonce(&mut cs, ALICE));
+        // And the off-trie perp delta folds to the same commitment (golden-neutral).
+        assert_eq!(
+            perp_commitment(&mut cb),
+            perp_commitment(&mut cs),
+            "self-match batch perp delta must equal the two-tx delta"
+        );
+    }
+
+    /// A post-write abort on the INITIATOR inside a batch (reusing `arm_post_write_place_abort`):
+    /// the crossing item fills ALICE against BOB — writing ALICE's working-set position/account —
+    /// and THEN the fee-recipient reject fires. It must be `Aborted`, the tail `NotAttempted`, the
+    /// call still `Ok`, the committed prefix present, and — the working-set-specific angle — the
+    /// aborted item's PARTIAL writes must be flushed and KEPT (commit-only has no undo: the ws is
+    /// flushed on the abort path, never restored).
+    #[test]
+    fn batch_post_write_abort_still_caught() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        arm_post_write_place_abort(&mut ctx); // ALICE taker-fee 100bps, BOB rests ask @ PRICE, admin=ZERO
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let base = nonce(&mut ctx, ALICE);
+        let aborts_before = batch::perp_batch_abort_count();
+
+        let items = [
+            gtc(0, PRICE - TICK, QTY),     // item 0: rests → the committed prefix
+            gtc(0, PRICE, QTY),            // item 1: crosses BOB, writes, then fee reject
+            gtc(0, PRICE - 2 * TICK, QTY), // item 2: never attempted
+        ];
+        // `batch_place` asserts the call did NOT revert (abort-forward returns Ok).
+        let blob = batch_place(&mut ctx, ALICE, &items);
+
+        let (id0, id1) = (direct_id(ALICE, base, 0), direct_id(ALICE, base, 1));
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                expect(PerpBatchTag::Accepted, id0, PerpBatchReason::None),
+                expect(
+                    PerpBatchTag::Aborted,
+                    id1,
+                    PerpBatchReason::FeeRecipientNotSet
+                ),
+                expect(PerpBatchTag::NotAttempted, ZERO_ID, PerpBatchReason::None),
+            ],
+            "post-write error on the initiator → Aborted, tail NotAttempted"
+        );
+        assert_eq!(batch::perp_batch_abort_count(), aborts_before + 1);
+
+        // Committed prefix (item 0's resting bid) survives with its order intact.
+        assert!(
+            storage::load_order(&mut ctx, &id0).unwrap().is_some(),
+            "committed prefix order must survive the abort"
+        );
+        // The ABORTED item's partial writes are KEPT, not restored: item 1's fill opened ALICE +QTY
+        // long in the working-set, which the abort path flushed to the main store.
+        assert_eq!(
+            pos(&mut ctx, ALICE).amount,
+            QTY as i64,
+            "the aborted item's partial fill must remain committed (flushed, not restored)"
+        );
+        assert_eq!(
+            pos(&mut ctx, BOB).amount,
+            -(QTY as i64),
+            "BOB (non-initiator maker, written straight to main) took the other side"
+        );
+        // Nonce advanced past the burned aborted id (1 accepted + 1 aborted both consume an id).
+        assert_eq!(nonce(&mut ctx, ALICE), base + 2);
+    }
+
+    /// A fully-accepted multi-item batch (one crossing a maker, two resting) must produce the
+    /// identical final state — and the identical off-trie perp delta / commitment — as the same
+    /// operations run as N single-order txs: the flush-once ≡ write-through equivalence.
+    #[test]
+    fn batch_all_accepted_flush_equals_per_item() {
+        let items = [
+            gtc(0, PRICE, QTY),            // crosses BOB's resting ask → fills
+            gtc(0, PRICE - TICK, QTY),     // rests as a bid
+            gtc(1, PRICE + 2 * TICK, QTY), // rests as an ask
+        ];
+
+        let mut cb = make_ctx();
+        setup(&mut cb);
+        place(&mut cb, BOB, 1, PRICE, QTY, 0, 0); // maker ALICE's item 0 sweeps
+        let _ = JournalTr::take_logs(cb.journal_mut());
+        batch_place(&mut cb, ALICE, &items);
+
+        let mut cs = make_ctx();
+        setup(&mut cs);
+        place(&mut cs, BOB, 1, PRICE, QTY, 0, 0);
+        let _ = JournalTr::take_logs(cs.journal_mut());
+        for it in &items {
+            single_place(&mut cs, ALICE, it);
+        }
+
+        // Both the initiator and the (non-hoisted) maker end identically.
+        assert_eq!(
+            user_state(&mut cb, ALICE),
+            user_state(&mut cs, ALICE),
+            "ALICE (initiator) state must match per-item"
+        );
+        assert_eq!(
+            user_state(&mut cb, BOB),
+            user_state(&mut cs, BOB),
+            "BOB (maker) state must match per-item"
+        );
+        assert_eq!(nonce(&mut cb, ALICE), nonce(&mut cs, ALICE));
+        // The whole net off-trie perp delta folds to the same commitment (golden-neutral).
+        assert_eq!(
+            perp_commitment(&mut cb),
+            perp_commitment(&mut cs),
+            "batch block commitment must equal the per-item commitment"
+        );
     }
 }

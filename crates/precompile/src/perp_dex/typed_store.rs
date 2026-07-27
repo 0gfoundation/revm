@@ -23,7 +23,7 @@
 //! value straight from its sub-map (absent = removed = empty bytes = the delete convention).
 
 use context::journaled_state::{PerpBlob, PerpDelta, PerpDeltaEntry, PerpStore};
-use primitives::{Address, HashMap, B256};
+use primitives::{Address, HashMap, HashSet, B256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::vec::Vec;
@@ -86,6 +86,46 @@ impl<'a, T> Resident<'a, T> {
 /// emits empty bytes). `Some` = live value.
 type Slot<T> = Option<Arc<T>>;
 
+/// Batch-scoped single-initiator working-set (the "batch single-user working-set" optimization).
+///
+/// A batch (`batchPlaceOrders`/`batchCancelOrders` + signed) acts for exactly ONE initiator. While
+/// a batch runs, the initiator's `UserAccount`, per-market `PerpPosition`, and per-market buy/sell
+/// `OrderEntry` lists are held HERE — a small, cache-hot local — instead of forcing every per-item
+/// read/write through the main store's large sub-maps. The lists carry the #A reservation
+/// aggregates on the `PerpPosition` for free. Everything NON-initiator (makers, admin, insurance
+/// fund) and the orderbook (levels / price indexes / order structs) is NOT hoisted — those keep
+/// hitting the main store directly through the un-owned accessor path.
+///
+/// The seam is entirely inside the account/position/buy/sell accessors: when a batch is attached
+/// and the accessor's subject address is the `owner`, the accessor routes to this local; otherwise
+/// it falls straight through to the main sub-map. [`TypedPerpStore::flush_batch`] moves every DIRTY
+/// entity's final `Slot` into the main store ONCE at end-of-batch and marks its key (→ block delta),
+/// so the net write-set — and therefore the block commitment — is byte-identical to running the
+/// items without the working-set.
+#[derive(Clone, Debug, Default)]
+struct BatchWorkingSet {
+    /// The single subject address this working-set stands in for.
+    owner: Address,
+    /// `None` = untouched (reads fall through to main); `Some(None)` = deleted tombstone;
+    /// `Some(Some(arc))` = live value.
+    account: Option<Slot<UserAccount>>,
+    /// Per-market positions/lists: key present = resident in the ws (cache fill OR write); absent =
+    /// untouched (reads fall through to main). Carries the #A reservation aggregates on the position.
+    positions: HashMap<u64, Slot<PerpPosition>>,
+    buy: HashMap<u64, Slot<Vec<OrderEntry>>>,
+    sell: HashMap<u64, Slot<Vec<OrderEntry>>>,
+    /// Per-entity dirty flags: only DIRTY entities are flushed (a loaded-but-unwritten entity must
+    /// not enter the block delta — that would be a spurious key = a commitment fork).
+    account_dirty: bool,
+    pos_dirty: HashSet<u64>,
+    buy_dirty: HashSet<u64>,
+    sell_dirty: HashSet<u64>,
+    /// Monotonic count of ws WRITES — the working-set half of the #23 commit-only write witness.
+    /// Folded into [`PerpStore::write_count`]/[`PerpStore::tx_dirty`] so `drive_batch`'s per-item
+    /// witness (and the `discard_tx` guard) see initiator writes with no change to their logic.
+    write_count: u64,
+}
+
 #[derive(Clone, Debug)]
 struct BalanceTracking {
     initial: BTreeMap<Address, PublicAccountBalance>,
@@ -146,6 +186,9 @@ pub struct TypedPerpStore {
     /// precompile call. `None` keeps direct storage tests and internal helpers
     /// outside the ABI entry point free of event bookkeeping.
     balance_tracking: Option<BalanceTracking>,
+    /// Batch single-initiator working-set — `Some` only between [`Self::begin_batch`] and
+    /// [`Self::flush_batch`] (i.e. for the duration of one batch call). See [`BatchWorkingSet`].
+    batch: Option<BatchWorkingSet>,
 }
 
 impl TypedPerpStore {
@@ -194,6 +237,19 @@ impl TypedPerpStore {
     // ── per-user account ───────────────────────────────────────────────────────
     /// Three-state read of a user's account (see [`Resident`]).
     pub fn account(&self, user: Address) -> Resident<'_, UserAccount> {
+        // Batch working-set guard: the initiator reads its own account from the ws first. A ws-miss
+        // (untouched) falls through to main — reads never seed (they are `&self`); the first WRITE
+        // seeds the ws, and every read then checks the ws first, so the two copies never diverge.
+        if let Some(b) = self.batch.as_ref() {
+            if b.owner == user {
+                if let Some(slot) = b.account.as_ref() {
+                    return match slot {
+                        Some(a) => Resident::Hit(a.as_ref()),
+                        None => Resident::Deleted,
+                    };
+                }
+            }
+        }
         match self.accounts.get(&user) {
             None => Resident::Miss,
             Some(None) => Resident::Deleted,
@@ -206,6 +262,29 @@ impl TypedPerpStore {
     /// the Arc is shared (first write after a cold fill), in-place thereafter. `None` for a
     /// missing OR deleted entry (mutating either is a caller bug; callers materialize first).
     pub fn account_mut(&mut self, user: Address) -> Option<&mut UserAccount> {
+        // Batch working-set guard: route the initiator's mutation to the ws. Seed from main if the
+        // ws slot is still untouched (defensive — every write is preceded by a read, but the read
+        // does not seed). A ws write bumps the ws write_count + dirty flag, NOT `self.*`.
+        if self.batch.as_ref().is_some_and(|b| b.owner == user) {
+            // Seed from main ONLY when the ws slot is still untouched — guarding the clone behind
+            // `is_none` avoids an Arc bump on every repeat initiator write (the exact cost this
+            // working-set exists to remove). `self.accounts` / `self.batch` are disjoint fields.
+            let main = self.accounts.get(&user);
+            let b = self.batch.as_mut().unwrap();
+            if b.account.is_none() {
+                if let Some(slot) = main {
+                    b.account = Some(slot.clone());
+                }
+            }
+            return match b.account.as_mut() {
+                Some(Some(a)) => {
+                    b.write_count += 1;
+                    b.account_dirty = true;
+                    Some(Arc::make_mut(a))
+                }
+                _ => None,
+            };
+        }
         match self.accounts.get_mut(&user) {
             Some(Some(a)) => {
                 // Inlined `mark` (disjoint-field borrows: `a` holds `accounts`).
@@ -223,6 +302,13 @@ impl TypedPerpStore {
     /// bump). Same three states as [`Self::account`], flattened: `Some(arc)` = hit; `None` covers
     /// BOTH deleted and miss — callers needing the distinction use [`Self::account`] first.
     pub fn account_arc(&self, user: Address) -> Option<Arc<UserAccount>> {
+        if let Some(b) = self.batch.as_ref() {
+            if b.owner == user {
+                if let Some(slot) = b.account.as_ref() {
+                    return slot.clone();
+                }
+            }
+        }
         self.accounts.get(&user).and_then(|s| s.clone())
     }
 
@@ -233,11 +319,29 @@ impl TypedPerpStore {
     /// no dirty mark, so nothing is emitted at block end). Never overwrites an existing entry
     /// (write-wins, mirroring `cache_put`).
     pub fn fill_account(&mut self, user: Address, value: Option<Arc<UserAccount>>) {
+        // Batch working-set guard: cache the initiator's cold fill in the ws (no dirty, no
+        // write_count — a fill is a cache event). Never overwrite (write-wins, like the main path).
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                if b.account.is_none() {
+                    b.account = Some(value);
+                }
+                return;
+            }
+        }
         self.accounts.entry(user).or_insert(value);
     }
 
     /// Inserts/overwrites a user's account and marks its key dirty.
     pub fn set_account(&mut self, user: Address, value: UserAccount) {
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                b.account = Some(Some(Arc::new(value)));
+                b.account_dirty = true;
+                b.write_count += 1;
+                return;
+            }
+        }
         self.mark(keys::account_key(user), StoreSlot::Account(user));
         self.accounts.insert(user, Some(Arc::new(value)));
     }
@@ -245,6 +349,14 @@ impl TypedPerpStore {
     /// Removes a user's account: leaves a resident tombstone (reads → [`Resident::Deleted`]) and
     /// marks the key dirty (block-end delta emits empty bytes).
     pub fn remove_account(&mut self, user: Address) {
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                b.account = Some(None);
+                b.account_dirty = true;
+                b.write_count += 1;
+                return;
+            }
+        }
         self.mark(keys::account_key(user), StoreSlot::Account(user));
         self.accounts.insert(user, None);
     }
@@ -293,6 +405,16 @@ impl TypedPerpStore {
     // ── per-(user, market) position ──────────────────────────────────────────
     /// Three-state read of a user's position in a market (see [`Resident`]).
     pub fn position(&self, user: Address, market_id: u64) -> Resident<'_, PerpPosition> {
+        if let Some(b) = self.batch.as_ref() {
+            if b.owner == user {
+                if let Some(slot) = b.positions.get(&market_id) {
+                    return match slot {
+                        Some(p) => Resident::Hit(p.as_ref()),
+                        None => Resident::Deleted,
+                    };
+                }
+            }
+        }
         match self.positions.get(&(user, market_id)) {
             None => Resident::Miss,
             Some(None) => Resident::Deleted,
@@ -302,6 +424,28 @@ impl TypedPerpStore {
 
     /// Mutable position access; marks its key dirty (see [`Self::account_mut`]).
     pub fn position_mut(&mut self, user: Address, market_id: u64) -> Option<&mut PerpPosition> {
+        if self.batch.as_ref().is_some_and(|b| b.owner == user) {
+            // Read the main seed FIRST (owned clone = Arc bump) so the disjoint `self.positions` and
+            // `self.batch` field borrows never overlap; then a single short-chain ws borrow. Seed
+            // only when main is RESIDENT (`Some(_)`) — an absent main must leave the ws non-resident
+            // so a later read still Misses to the cold path (not a spurious Deleted tombstone).
+            let main = self.positions.get(&(user, market_id));
+            let b = self.batch.as_mut().unwrap();
+            if !b.positions.contains_key(&market_id) {
+                // Clone (Arc bump) ONLY when seeding — not on every repeat initiator write.
+                if let Some(slot) = main {
+                    b.positions.insert(market_id, slot.clone());
+                }
+            }
+            return match b.positions.get_mut(&market_id) {
+                Some(Some(p)) => {
+                    b.pos_dirty.insert(market_id);
+                    b.write_count += 1;
+                    Some(Arc::make_mut(p))
+                }
+                _ => None,
+            };
+        }
         match self.positions.get_mut(&(user, market_id)) {
             Some(Some(p)) => {
                 // Inlined `mark` (disjoint-field borrows: `p` holds `positions`).
@@ -319,6 +463,13 @@ impl TypedPerpStore {
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss (see [`Self::account_arc`]).
     pub fn position_arc(&self, user: Address, market_id: u64) -> Option<Arc<PerpPosition>> {
+        if let Some(b) = self.batch.as_ref() {
+            if b.owner == user {
+                if let Some(slot) = b.positions.get(&market_id) {
+                    return slot.clone();
+                }
+            }
+        }
         self.positions.get(&(user, market_id)).and_then(|s| s.clone())
     }
 
@@ -329,11 +480,25 @@ impl TypedPerpStore {
         market_id: u64,
         value: Option<Arc<PerpPosition>>,
     ) {
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                b.positions.entry(market_id).or_insert(value);
+                return;
+            }
+        }
         self.positions.entry((user, market_id)).or_insert(value);
     }
 
     /// Inserts/overwrites a position and marks its key dirty.
     pub fn set_position(&mut self, user: Address, market_id: u64, value: PerpPosition) {
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                b.positions.insert(market_id, Some(Arc::new(value)));
+                b.pos_dirty.insert(market_id);
+                b.write_count += 1;
+                return;
+            }
+        }
         self.mark(
             keys::position_key(user, market_id),
             StoreSlot::Position(user, market_id),
@@ -343,6 +508,14 @@ impl TypedPerpStore {
 
     /// Removes a position: resident tombstone + dirty mark (delta emits empty bytes).
     pub fn remove_position(&mut self, user: Address, market_id: u64) {
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                b.positions.insert(market_id, None);
+                b.pos_dirty.insert(market_id);
+                b.write_count += 1;
+                return;
+            }
+        }
         self.mark(
             keys::position_key(user, market_id),
             StoreSlot::Position(user, market_id),
@@ -393,6 +566,16 @@ impl TypedPerpStore {
     // ── per-(user, market) order-entry lists (bord / sord) ──────────────────
     /// Three-state read of the buy-order list (see [`Resident`]).
     pub fn buy_orders(&self, user: Address, market_id: u64) -> Resident<'_, Vec<OrderEntry>> {
+        if let Some(b) = self.batch.as_ref() {
+            if b.owner == user {
+                if let Some(slot) = b.buy.get(&market_id) {
+                    return match slot {
+                        Some(v) => Resident::Hit(v.as_ref()),
+                        None => Resident::Deleted,
+                    };
+                }
+            }
+        }
         match self.buy_orders.get(&(user, market_id)) {
             None => Resident::Miss,
             Some(None) => Resident::Deleted,
@@ -402,11 +585,36 @@ impl TypedPerpStore {
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
     pub fn buy_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<Vec<OrderEntry>>> {
+        if let Some(b) = self.batch.as_ref() {
+            if b.owner == user {
+                if let Some(slot) = b.buy.get(&market_id) {
+                    return slot.clone();
+                }
+            }
+        }
         self.buy_orders.get(&(user, market_id)).and_then(|s| s.clone())
     }
 
     /// Mutable access; marks dirty (see [`Self::account_mut`]).
     pub fn buy_orders_mut(&mut self, user: Address, market_id: u64) -> Option<&mut Vec<OrderEntry>> {
+        if self.batch.as_ref().is_some_and(|b| b.owner == user) {
+            let main = self.buy_orders.get(&(user, market_id));
+            let b = self.batch.as_mut().unwrap();
+            // Clone only when seeding (see [`Self::position_mut`]).
+            if !b.buy.contains_key(&market_id) {
+                if let Some(slot) = main {
+                    b.buy.insert(market_id, slot.clone());
+                }
+            }
+            return match b.buy.get_mut(&market_id) {
+                Some(Some(v)) => {
+                    b.buy_dirty.insert(market_id);
+                    b.write_count += 1;
+                    Some(Arc::make_mut(v))
+                }
+                _ => None,
+            };
+        }
         match self.buy_orders.get_mut(&(user, market_id)) {
             Some(Some(v)) => {
                 self.dirty.insert(
@@ -424,6 +632,14 @@ impl TypedPerpStore {
     /// Inserts/overwrites and marks dirty. NOTE: an EMPTY list is a legitimate stored value
     /// (encodes to msgpack `0x90`, key stays present) — never converted to a delete.
     pub fn set_buy_orders(&mut self, user: Address, market_id: u64, value: Vec<OrderEntry>) {
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                b.buy.insert(market_id, Some(Arc::new(value)));
+                b.buy_dirty.insert(market_id);
+                b.write_count += 1;
+                return;
+            }
+        }
         self.mark(
             keys::user_buy_orders_key(user, market_id),
             StoreSlot::BuyOrders(user, market_id),
@@ -438,11 +654,27 @@ impl TypedPerpStore {
         market_id: u64,
         value: Option<Arc<Vec<OrderEntry>>>,
     ) {
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                b.buy.entry(market_id).or_insert(value);
+                return;
+            }
+        }
         self.buy_orders.entry((user, market_id)).or_insert(value);
     }
 
     /// Three-state read of the sell-order list (see [`Resident`]).
     pub fn sell_orders(&self, user: Address, market_id: u64) -> Resident<'_, Vec<OrderEntry>> {
+        if let Some(b) = self.batch.as_ref() {
+            if b.owner == user {
+                if let Some(slot) = b.sell.get(&market_id) {
+                    return match slot {
+                        Some(v) => Resident::Hit(v.as_ref()),
+                        None => Resident::Deleted,
+                    };
+                }
+            }
+        }
         match self.sell_orders.get(&(user, market_id)) {
             None => Resident::Miss,
             Some(None) => Resident::Deleted,
@@ -452,6 +684,13 @@ impl TypedPerpStore {
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
     pub fn sell_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<Vec<OrderEntry>>> {
+        if let Some(b) = self.batch.as_ref() {
+            if b.owner == user {
+                if let Some(slot) = b.sell.get(&market_id) {
+                    return slot.clone();
+                }
+            }
+        }
         self.sell_orders.get(&(user, market_id)).and_then(|s| s.clone())
     }
 
@@ -461,6 +700,24 @@ impl TypedPerpStore {
         user: Address,
         market_id: u64,
     ) -> Option<&mut Vec<OrderEntry>> {
+        if self.batch.as_ref().is_some_and(|b| b.owner == user) {
+            let main = self.sell_orders.get(&(user, market_id));
+            let b = self.batch.as_mut().unwrap();
+            // Clone only when seeding (see [`Self::position_mut`]).
+            if !b.sell.contains_key(&market_id) {
+                if let Some(slot) = main {
+                    b.sell.insert(market_id, slot.clone());
+                }
+            }
+            return match b.sell.get_mut(&market_id) {
+                Some(Some(v)) => {
+                    b.sell_dirty.insert(market_id);
+                    b.write_count += 1;
+                    Some(Arc::make_mut(v))
+                }
+                _ => None,
+            };
+        }
         match self.sell_orders.get_mut(&(user, market_id)) {
             Some(Some(v)) => {
                 self.dirty.insert(
@@ -477,6 +734,14 @@ impl TypedPerpStore {
 
     /// Inserts/overwrites and marks dirty (empty list stays a stored `0x90`, see buy side).
     pub fn set_sell_orders(&mut self, user: Address, market_id: u64, value: Vec<OrderEntry>) {
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                b.sell.insert(market_id, Some(Arc::new(value)));
+                b.sell_dirty.insert(market_id);
+                b.write_count += 1;
+                return;
+            }
+        }
         self.mark(
             keys::user_sell_orders_key(user, market_id),
             StoreSlot::SellOrders(user, market_id),
@@ -491,6 +756,12 @@ impl TypedPerpStore {
         market_id: u64,
         value: Option<Arc<Vec<OrderEntry>>>,
     ) {
+        if let Some(b) = self.batch.as_mut() {
+            if b.owner == user {
+                b.sell.entry(market_id).or_insert(value);
+                return;
+            }
+        }
         self.sell_orders.entry((user, market_id)).or_insert(value);
     }
 
@@ -731,6 +1002,73 @@ impl TypedPerpStore {
         )
     }
 
+    // ── Batch single-initiator working-set lifecycle ───────────────────────────
+    /// Attaches a batch-scoped working-set for `owner`. Every subsequent account/position/buy/sell
+    /// accessor whose subject is `owner` routes to the local working-set until [`Self::flush_batch`];
+    /// non-owner subjects (makers, admin, insurance fund) fall straight through, unchanged. Called by
+    /// `drive_batch` before the item loop.
+    pub fn begin_batch(&mut self, owner: Address) {
+        debug_assert!(self.batch.is_none(), "nested batch working-set");
+        self.batch = Some(BatchWorkingSet {
+            owner,
+            ..BatchWorkingSet::default()
+        });
+    }
+
+    /// Flushes the batch working-set into the main store and detaches it. Each DIRTY entity's final
+    /// `Slot` is moved into its main sub-map and its key `mark`ed (→ block delta, → write witness).
+    /// Loaded-but-unwritten entities are dropped (a fill is a cache event; flushing it would inject a
+    /// spurious delta key = commitment fork). This is a RAW move-and-mark, NOT a `save_*` replay: the
+    /// per-item co-writes (position registry, `total_perp_collateral`, other users' balances) already
+    /// hit the main store during the items — replaying them would double-count. Deterministic order
+    /// (account, then positions/buy/sell by ascending market_id) though the commitment re-sorts by
+    /// key regardless. Idempotent: a no-op if no batch is attached.
+    pub fn flush_batch(&mut self) {
+        let Some(mut b) = self.batch.take() else {
+            return;
+        };
+        let owner = b.owner;
+        if b.account_dirty {
+            if let Some(slot) = b.account.take() {
+                self.accounts.insert(owner, slot);
+                self.mark(keys::account_key(owner), StoreSlot::Account(owner));
+            }
+        }
+        let mut pos_keys: Vec<u64> = b.pos_dirty.iter().copied().collect();
+        pos_keys.sort_unstable();
+        for mid in pos_keys {
+            if let Some(slot) = b.positions.remove(&mid) {
+                self.positions.insert((owner, mid), slot);
+                self.mark(
+                    keys::position_key(owner, mid),
+                    StoreSlot::Position(owner, mid),
+                );
+            }
+        }
+        let mut buy_keys: Vec<u64> = b.buy_dirty.iter().copied().collect();
+        buy_keys.sort_unstable();
+        for mid in buy_keys {
+            if let Some(slot) = b.buy.remove(&mid) {
+                self.buy_orders.insert((owner, mid), slot);
+                self.mark(
+                    keys::user_buy_orders_key(owner, mid),
+                    StoreSlot::BuyOrders(owner, mid),
+                );
+            }
+        }
+        let mut sell_keys: Vec<u64> = b.sell_dirty.iter().copied().collect();
+        sell_keys.sort_unstable();
+        for mid in sell_keys {
+            if let Some(slot) = b.sell.remove(&mid) {
+                self.sell_orders.insert((owner, mid), slot);
+                self.mark(
+                    keys::user_sell_orders_key(owner, mid),
+                    StoreSlot::SellOrders(owner, mid),
+                );
+            }
+        }
+    }
+
     /// Number of keys written this block (dirty-set size). Diagnostic / test hook.
     pub fn dirty_len(&self) -> usize {
         self.dirty.len()
@@ -870,11 +1208,20 @@ impl PerpStore for TypedPerpStore {
     }
 
     fn write_count(&self) -> u64 {
-        self.write_count
+        // Fold the batch working-set's write counter so an initiator write during a batch is visible
+        // to `drive_batch`'s per-item witness with NO change to its classification logic.
+        // NOTE: this is NOT monotonic across `flush_batch` — the ws counts every write while flush
+        // marks once per dirty entity, so the total can DROP when the batch detaches. Every consumer
+        // is safe: the per-item witness samples deltas strictly inside the loop (pre-flush), and the
+        // whole-call write-then-revert tripwire only cares whether the count MOVED (it never does on
+        // an Ok-returning batch). Do not add a consumer that assumes monotonic growth across a batch.
+        self.write_count + self.batch.as_ref().map_or(0, |b| b.write_count)
     }
 
     fn tx_dirty(&self) -> bool {
-        self.tx_dirty
+        // Fold the working-set: an initiator write during a batch (even one not yet flushed — the
+        // Fatal early-return path) keeps the `discard_tx` commit-only guard armed.
+        self.tx_dirty || self.batch.as_ref().is_some_and(|b| b.write_count > 0)
     }
 
     fn reset_tx_dirty(&mut self) {
