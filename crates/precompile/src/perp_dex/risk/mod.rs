@@ -1075,7 +1075,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
             .to_log_data(),
         });
     }
-    storage::save_buy_orders(context, user, market_id, &[])?;
+    storage::save_buy_orders(context, user, market_id, &std::collections::VecDeque::new())?;
 
     // --- Sell orders ---
     let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
@@ -1097,7 +1097,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
             .to_log_data(),
         });
     }
-    storage::save_sell_orders(context, user, market_id, &[])?;
+    storage::save_sell_orders(context, user, market_id, &std::collections::VecDeque::new())?;
     let best_bid = storage::refresh_best_bid(context, market_id)?;
     let best_ask = storage::refresh_best_ask(context, market_id)?;
     if best_bid != old_best_bid || best_ask != old_best_ask {

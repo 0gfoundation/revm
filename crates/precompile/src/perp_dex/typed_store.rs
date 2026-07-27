@@ -112,8 +112,8 @@ struct BatchWorkingSet {
     /// Per-market positions/lists: key present = resident in the ws (cache fill OR write); absent =
     /// untouched (reads fall through to main). Carries the #A reservation aggregates on the position.
     positions: HashMap<u64, Slot<PerpPosition>>,
-    buy: HashMap<u64, Slot<Vec<OrderEntry>>>,
-    sell: HashMap<u64, Slot<Vec<OrderEntry>>>,
+    buy: HashMap<u64, Slot<std::collections::VecDeque<OrderEntry>>>,
+    sell: HashMap<u64, Slot<std::collections::VecDeque<OrderEntry>>>,
     /// Per-entity dirty flags: only DIRTY entities are flushed (a loaded-but-unwritten entity must
     /// not enter the block delta — that would be a spurious key = a commitment fork).
     account_dirty: bool,
@@ -158,8 +158,8 @@ pub struct TypedPerpStore {
     markets: HashMap<u64, Slot<Market>>,
     positions: HashMap<(Address, u64), Slot<PerpPosition>>,
     market_hots: HashMap<u64, Slot<MarketHot>>,
-    buy_orders: HashMap<(Address, u64), Slot<Vec<OrderEntry>>>,
-    sell_orders: HashMap<(Address, u64), Slot<Vec<OrderEntry>>>,
+    buy_orders: HashMap<(Address, u64), Slot<std::collections::VecDeque<OrderEntry>>>,
+    sell_orders: HashMap<(Address, u64), Slot<std::collections::VecDeque<OrderEntry>>>,
     orders: HashMap<[u8; 32], Slot<Order>>,
     bid_prices: HashMap<u64, Slot<Vec<u64>>>,
     ask_prices: HashMap<u64, Slot<Vec<u64>>>,
@@ -565,7 +565,7 @@ impl TypedPerpStore {
 
     // ── per-(user, market) order-entry lists (bord / sord) ──────────────────
     /// Three-state read of the buy-order list (see [`Resident`]).
-    pub fn buy_orders(&self, user: Address, market_id: u64) -> Resident<'_, Vec<OrderEntry>> {
+    pub fn buy_orders(&self, user: Address, market_id: u64) -> Resident<'_, std::collections::VecDeque<OrderEntry>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
                 if let Some(slot) = b.buy.get(&market_id) {
@@ -584,7 +584,7 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
-    pub fn buy_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<Vec<OrderEntry>>> {
+    pub fn buy_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<std::collections::VecDeque<OrderEntry>>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
                 if let Some(slot) = b.buy.get(&market_id) {
@@ -596,7 +596,7 @@ impl TypedPerpStore {
     }
 
     /// Mutable access; marks dirty (see [`Self::account_mut`]).
-    pub fn buy_orders_mut(&mut self, user: Address, market_id: u64) -> Option<&mut Vec<OrderEntry>> {
+    pub fn buy_orders_mut(&mut self, user: Address, market_id: u64) -> Option<&mut std::collections::VecDeque<OrderEntry>> {
         if self.batch.as_ref().is_some_and(|b| b.owner == user) {
             let main = self.buy_orders.get(&(user, market_id));
             let b = self.batch.as_mut().unwrap();
@@ -631,7 +631,7 @@ impl TypedPerpStore {
 
     /// Inserts/overwrites and marks dirty. NOTE: an EMPTY list is a legitimate stored value
     /// (encodes to msgpack `0x90`, key stays present) — never converted to a delete.
-    pub fn set_buy_orders(&mut self, user: Address, market_id: u64, value: Vec<OrderEntry>) {
+    pub fn set_buy_orders(&mut self, user: Address, market_id: u64, value: std::collections::VecDeque<OrderEntry>) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {
                 b.buy.insert(market_id, Some(Arc::new(value)));
@@ -652,7 +652,7 @@ impl TypedPerpStore {
         &mut self,
         user: Address,
         market_id: u64,
-        value: Option<Arc<Vec<OrderEntry>>>,
+        value: Option<Arc<std::collections::VecDeque<OrderEntry>>>,
     ) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {
@@ -664,7 +664,7 @@ impl TypedPerpStore {
     }
 
     /// Three-state read of the sell-order list (see [`Resident`]).
-    pub fn sell_orders(&self, user: Address, market_id: u64) -> Resident<'_, Vec<OrderEntry>> {
+    pub fn sell_orders(&self, user: Address, market_id: u64) -> Resident<'_, std::collections::VecDeque<OrderEntry>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
                 if let Some(slot) = b.sell.get(&market_id) {
@@ -683,7 +683,7 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
-    pub fn sell_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<Vec<OrderEntry>>> {
+    pub fn sell_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<std::collections::VecDeque<OrderEntry>>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
                 if let Some(slot) = b.sell.get(&market_id) {
@@ -699,7 +699,7 @@ impl TypedPerpStore {
         &mut self,
         user: Address,
         market_id: u64,
-    ) -> Option<&mut Vec<OrderEntry>> {
+    ) -> Option<&mut std::collections::VecDeque<OrderEntry>> {
         if self.batch.as_ref().is_some_and(|b| b.owner == user) {
             let main = self.sell_orders.get(&(user, market_id));
             let b = self.batch.as_mut().unwrap();
@@ -733,7 +733,7 @@ impl TypedPerpStore {
     }
 
     /// Inserts/overwrites and marks dirty (empty list stays a stored `0x90`, see buy side).
-    pub fn set_sell_orders(&mut self, user: Address, market_id: u64, value: Vec<OrderEntry>) {
+    pub fn set_sell_orders(&mut self, user: Address, market_id: u64, value: std::collections::VecDeque<OrderEntry>) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {
                 b.sell.insert(market_id, Some(Arc::new(value)));
@@ -754,7 +754,7 @@ impl TypedPerpStore {
         &mut self,
         user: Address,
         market_id: u64,
-        value: Option<Arc<Vec<OrderEntry>>>,
+        value: Option<Arc<std::collections::VecDeque<OrderEntry>>>,
     ) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {

@@ -8,7 +8,7 @@ use crate::{
         errors::{perp_err, perp_invariant_err},
         interface::IPerpDex,
         math::{
-            calc_maker_fee_for_order_qty_with_bps, calc_reservation_notionals, calc_trading_fee,
+            calc_maker_fee_for_order_qty_with_bps, calc_trading_fee,
             calc_value, checked_u64_to_i64, is_above_maintenance_margin,
         },
         storage,
@@ -224,9 +224,9 @@ impl TakerSettlement {
                         i
                     }
                 };
-                let res = calc_reservation_notionals(
-                    &w.buy_entries,
-                    &w.sell_entries,
+                let res = crate::perp_dex::math::calc_reservation_notionals_it(
+                    w.buy_entries.iter().copied(),
+                    w.sell_entries.iter().copied(),
                     market.base_decimals,
                     market.price_decimals,
                     w.pos.amount,
@@ -275,8 +275,8 @@ impl TakerSettlement {
             let mut sim_sell = w.sell_entries.clone();
             while !sim_account.has_available_perp(core.total_required) {
                 let next = match taker_side {
-                    Side::Buy => sim_buy.last().map(|e| e.order_id),
-                    Side::Sell => sim_sell.last().map(|e| e.order_id),
+                    Side::Buy => sim_buy.back().map(|e| e.order_id),
+                    Side::Sell => sim_sell.back().map(|e| e.order_id),
                 };
                 let Some(oid) = next else {
                     return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
@@ -309,9 +309,9 @@ impl TakerSettlement {
                         sim_sell.insert(i, new_entry);
                     }
                 }
-                let (bn, sn, cn) = calc_reservation_notionals(
-                    &sim_buy,
-                    &sim_sell,
+                let (bn, sn, cn) = crate::perp_dex::math::calc_reservation_notionals_it(
+                    sim_buy.iter().copied(),
+                    sim_sell.iter().copied(),
                     market.base_decimals,
                     market.price_decimals,
                     sim_pos.amount,
@@ -370,8 +370,8 @@ pub(super) struct RestReq {
 fn rest_is_affordable(
     pos: &crate::perp_dex::types::PerpPosition,
     account: &crate::perp_dex::types::UserAccount,
-    buy_entries: &[crate::perp_dex::types::OrderEntry],
-    sell_entries: &[crate::perp_dex::types::OrderEntry],
+    buy_entries: &std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
+    sell_entries: &std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
     taker_side: Side,
     rest: &RestReq,
     market: &crate::perp_dex::types::Market,
@@ -387,11 +387,11 @@ fn rest_is_affordable(
         Side::Buy => {
             let i = buy_entries.partition_point(|e| e.price > rest.price);
             crate::perp_dex::math::calc_reservation_notionals_it(
-                buy_entries[..i]
-                    .iter()
+                buy_entries
+                    .range(..i)
                     .copied()
                     .chain(core::iter::once(entry))
-                    .chain(buy_entries[i..].iter().copied()),
+                    .chain(buy_entries.range(i..).copied()),
                 sell_entries.iter().copied(),
                 bd,
                 pd,
@@ -402,11 +402,11 @@ fn rest_is_affordable(
             let i = sell_entries.partition_point(|e| e.price < rest.price);
             crate::perp_dex::math::calc_reservation_notionals_it(
                 buy_entries.iter().copied(),
-                sell_entries[..i]
-                    .iter()
+                sell_entries
+                    .range(..i)
                     .copied()
                     .chain(core::iter::once(entry))
-                    .chain(sell_entries[i..].iter().copied()),
+                    .chain(sell_entries.range(i..).copied()),
                 bd,
                 pd,
                 pos.amount,
@@ -500,8 +500,8 @@ pub(super) enum MakerFillOutcome {
 pub(super) struct UserWork {
     pos: crate::perp_dex::types::PerpPosition,
     account: crate::perp_dex::types::UserAccount,
-    buy_entries: Vec<crate::perp_dex::types::OrderEntry>,
-    sell_entries: Vec<crate::perp_dex::types::OrderEntry>,
+    buy_entries: std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
+    sell_entries: std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
     dirty_buy: bool,
     dirty_sell: bool,
 }
@@ -998,8 +998,8 @@ pub(super) struct TakerFillCore {
 fn finalize_core(
     pos: &mut crate::perp_dex::types::PerpPosition,
     account: &mut crate::perp_dex::types::UserAccount,
-    buy_entries: &[crate::perp_dex::types::OrderEntry],
-    sell_entries: &[crate::perp_dex::types::OrderEntry],
+    buy_entries: &std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
+    sell_entries: &std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
     fills: &[RecordedFill],
     taker_side: Side,
     mark_price: u64,
@@ -1088,9 +1088,10 @@ fn finalize_core(
     // remaining open orders reflects the new position size. MR delta reconciles with the wallet
     // via mr_credit/mr_extra; without this, W + M + MR is not conserved across the fill.
     let old_mr = pos.margin_reserved;
-    let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
-        buy_entries,
-        sell_entries,
+    let (buy_notional, sell_notional, c_notional) =
+        crate::perp_dex::math::calc_reservation_notionals_it(
+            buy_entries.iter().copied(),
+            sell_entries.iter().copied(),
         market.base_decimals,
         market.price_decimals,
         pos.amount,
@@ -1142,8 +1143,8 @@ pub(super) enum MakerFillCore {
 pub(super) fn settle_maker_fill_core(
     pos: &mut crate::perp_dex::types::PerpPosition,
     account: &mut crate::perp_dex::types::UserAccount,
-    buy_entries: &mut Vec<crate::perp_dex::types::OrderEntry>,
-    sell_entries: &mut Vec<crate::perp_dex::types::OrderEntry>,
+    buy_entries: &mut std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
+    sell_entries: &mut std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
     mark_price: u64,
     maker_side: Side,
     maker_order_id: &[u8; 32],
@@ -1198,9 +1199,10 @@ pub(super) fn settle_maker_fill_core(
     let maker_fee = reduce_order_entry_core(entries, maker_order_id, fill_qty, market, label)?;
 
     // Flip-aware reserve recompute (must follow the entry reduce + reflect the new pos.amount).
-    let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
-        buy_entries,
-        sell_entries,
+    let (buy_notional, sell_notional, c_notional) =
+        crate::perp_dex::math::calc_reservation_notionals_it(
+            buy_entries.iter().copied(),
+            sell_entries.iter().copied(),
         market.base_decimals,
         market.price_decimals,
         pos.amount,
@@ -1380,10 +1382,10 @@ fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
     while !storage::load_account_ref(context, user)?.has_available_perp(required_margin) {
         let order_id = match side {
             Side::Buy => storage::load_buy_orders_ref(context, user, market_id)?
-                .last()
+                .back()
                 .map(|e| e.order_id),
             Side::Sell => storage::load_sell_orders_ref(context, user, market_id)?
-                .last()
+                .back()
                 .map(|e| e.order_id),
         };
         let Some(order_id) = order_id else {
@@ -1602,7 +1604,7 @@ pub(super) fn apply_position_fill(
 /// run it on working copies and the storage wrapper above runs it in the journal overlay. Shrinks
 /// the entry by `fill_qty`, removes it at zero, returns the released fee reservation.
 pub(super) fn reduce_order_entry_core(
-    entries: &mut Vec<crate::perp_dex::types::OrderEntry>,
+    entries: &mut std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
     order_id: &[u8; 32],
     fill_qty: u64,
     market: &crate::perp_dex::types::Market,
@@ -1696,9 +1698,10 @@ fn recompute_maker_order_reserve_after_fill<CTX: ContextTr>(
 ) -> Result<u64, PrecompileError> {
     let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
     let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
-    let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
-        &buy_entries,
-        &sell_entries,
+    let (buy_notional, sell_notional, c_notional) =
+        crate::perp_dex::math::calc_reservation_notionals_it(
+            buy_entries.iter().copied(),
+            sell_entries.iter().copied(),
         market.base_decimals,
         market.price_decimals,
         pos.amount,

@@ -33,7 +33,7 @@ use crate::{
             getOrderCall, getOrderReturn, placeOrderCall, placeOrderSignedCall, PlaceItem,
         },
         math::{
-            calc_maker_fee_for_order_qty_with_bps, calc_reservation_notionals, calc_trading_fee,
+            calc_maker_fee_for_order_qty_with_bps, calc_trading_fee,
             calc_value,
         },
         risk::record_mid_price_sample_for_best_quote_change,
@@ -1177,7 +1177,7 @@ fn ensure_post_only_does_not_cross<CTX: ContextTr>(
 }
 
 fn remove_order_entry(
-    entries: &mut Vec<OrderEntry>,
+    entries: &mut std::collections::VecDeque<OrderEntry>,
     order_id: &[u8; 32],
     side_label: &str,
 ) -> Result<OrderEntry, PrecompileError> {
@@ -1190,7 +1190,10 @@ fn remove_order_entry(
                 order_id
             ))
         })?;
-    Ok(entries.remove(idx))
+    // VecDeque::remove returns Option (unlike Vec::remove); idx came from position() so it is Some.
+    Ok(entries
+        .remove(idx)
+        .expect("index from position() is in bounds"))
 }
 
 fn execute_limit_order<CTX: ContextTr>(
@@ -1954,23 +1957,18 @@ pub(super) fn match_order<CTX: ContextTr>(
 /// totals in sync — caught loudly in tests / the correctness gate, compiled out in release.
 #[inline]
 fn debug_assert_totals(
-    buy: &[OrderEntry],
-    sell: &[OrderEntry],
+    buy: impl Iterator<Item = OrderEntry>,
+    sell: impl Iterator<Item = OrderEntry>,
     pos: &crate::perp_dex::types::PerpPosition,
     base_decimals: u32,
     price_decimals: u32,
 ) {
     #[cfg(debug_assertions)]
     {
-        let (bq, bn) =
-            crate::perp_dex::math::sum_side_totals(buy.iter().copied(), base_decimals, price_decimals)
-                .expect("sum buy totals");
-        let (sq, sn) = crate::perp_dex::math::sum_side_totals(
-            sell.iter().copied(),
-            base_decimals,
-            price_decimals,
-        )
-        .expect("sum sell totals");
+        let (bq, bn) = crate::perp_dex::math::sum_side_totals(buy, base_decimals, price_decimals)
+            .expect("sum buy totals");
+        let (sq, sn) = crate::perp_dex::math::sum_side_totals(sell, base_decimals, price_decimals)
+            .expect("sum sell totals");
         debug_assert_eq!(
             (bq, bn, sq, sn),
             (
@@ -1986,6 +1984,14 @@ fn debug_assert_totals(
     {
         let _ = (buy, sell, pos, base_decimals, price_decimals);
     }
+}
+
+/// Consuming a Deque-or-slice as an OrderEntry iterator for the reservation calls / oracle.
+#[inline]
+fn entries_iter(
+    v: &std::collections::VecDeque<OrderEntry>,
+) -> impl Iterator<Item = OrderEntry> + Clone + '_ {
+    v.iter().copied()
 }
 
 fn rest_in_book<CTX: ContextTr>(
@@ -2033,7 +2039,6 @@ fn rest_in_book<CTX: ContextTr>(
             // unchanged (golden-neutral).
             let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
             let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
-            let buy_slice = buy_ref.as_slice();
             let new_entry = OrderEntry {
                 order_id: *order_id,
                 price,
@@ -2042,8 +2047,14 @@ fn rest_in_book<CTX: ContextTr>(
             };
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let idx = buy_slice.partition_point(|e| e.price > price);
-            debug_assert_totals(buy_slice, sell_entries.as_slice(), &pos, bd, pd);
+            let idx = buy_ref.partition_point(|e| e.price > price);
+            debug_assert_totals(
+                entries_iter(&buy_ref),
+                entries_iter(&sell_entries),
+                &pos,
+                bd,
+                pd,
+            );
             // #A: reconstruct the reservation from the maintained per-side aggregates + this order's
             // hypothetical contribution (no O(n) fold). Byte-identical to the fold above.
             let entry_notional = crate::perp_dex::math::calc_value(price, qty, bd, pd)?;
@@ -2057,11 +2068,11 @@ fn rest_in_book<CTX: ContextTr>(
                 .ok_or_else(|| perp_err("placeOrder: total buy notional overflow"))?;
             let (new_buy_side_notional, sell_notional, c_notional) =
                 crate::perp_dex::math::calc_reservation_notionals_from_totals_it(
-                    buy_slice[..idx]
-                        .iter()
+                    buy_ref
+                        .range(..idx)
                         .copied()
                         .chain(std::iter::once(new_entry))
-                        .chain(buy_slice[idx..].iter().copied()),
+                        .chain(buy_ref.range(idx..).copied()),
                     sell_entries.iter().copied(),
                     new_tbq,
                     new_tbn,
@@ -2132,7 +2143,6 @@ fn rest_in_book<CTX: ContextTr>(
             // over Arc-borrowed lists, no owned clone, reject leaves the overlay untouched.
             let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
             let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
-            let sell_slice = sell_ref.as_slice();
             let new_entry = OrderEntry {
                 order_id: *order_id,
                 price,
@@ -2141,8 +2151,14 @@ fn rest_in_book<CTX: ContextTr>(
             };
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let idx = sell_slice.partition_point(|e| e.price < price);
-            debug_assert_totals(buy_entries.as_slice(), sell_slice, &pos, bd, pd);
+            let idx = sell_ref.partition_point(|e| e.price < price);
+            debug_assert_totals(
+                entries_iter(&buy_entries),
+                entries_iter(&sell_ref),
+                &pos,
+                bd,
+                pd,
+            );
             // #A: reconstruct from maintained aggregates + this order's hypothetical contribution.
             let entry_notional = crate::perp_dex::math::calc_value(price, qty, bd, pd)?;
             let new_tsq = pos
@@ -2156,11 +2172,11 @@ fn rest_in_book<CTX: ContextTr>(
             let (buy_notional, new_sell_side_notional, c_notional) =
                 crate::perp_dex::math::calc_reservation_notionals_from_totals_it(
                     buy_entries.iter().copied(),
-                    sell_slice[..idx]
-                        .iter()
+                    sell_ref
+                        .range(..idx)
                         .copied()
                         .chain(std::iter::once(new_entry))
-                        .chain(sell_slice[idx..].iter().copied()),
+                        .chain(sell_ref.range(idx..).copied()),
                     pos.total_buy_qty,
                     pos.total_buy_notional,
                     new_tsq,
@@ -2483,11 +2499,11 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     }
     let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
     let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
-    debug_assert_totals(&buy_ref, &sell_ref, &pos, bd, pd);
+    debug_assert_totals(entries_iter(&buy_ref), entries_iter(&sell_ref), &pos, bd, pd);
     let (buy_notional, sell_notional, c_notional) =
-        crate::perp_dex::math::calc_reservation_notionals_from_totals(
-            buy_ref.as_slice(),
-            sell_ref.as_slice(),
+        crate::perp_dex::math::calc_reservation_notionals_from_totals_it(
+            buy_ref.iter().copied(),
+            sell_ref.iter().copied(),
             pos.total_buy_qty,
             pos.total_buy_notional,
             pos.total_sell_qty,
@@ -2524,8 +2540,8 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
 pub(super) fn release_margin_core(
     pos: &mut crate::perp_dex::types::PerpPosition,
     account: &mut crate::perp_dex::types::UserAccount,
-    buy_entries: &mut Vec<OrderEntry>,
-    sell_entries: &mut Vec<OrderEntry>,
+    buy_entries: &mut std::collections::VecDeque<OrderEntry>,
+    sell_entries: &mut std::collections::VecDeque<OrderEntry>,
     side: Side,
     order_id: &[u8; 32],
     market: &crate::perp_dex::types::Market,
@@ -2537,13 +2553,14 @@ pub(super) fn release_margin_core(
         };
         remove_order_entry(entries, order_id, label)?
     };
-    let (buy_notional, sell_notional, c_notional) = calc_reservation_notionals(
-        buy_entries,
-        sell_entries,
-        market.base_decimals,
-        market.price_decimals,
-        pos.amount,
-    )?;
+    let (buy_notional, sell_notional, c_notional) =
+        crate::perp_dex::math::calc_reservation_notionals_it(
+            buy_entries.iter().copied(),
+            sell_entries.iter().copied(),
+            market.base_decimals,
+            market.price_decimals,
+            pos.amount,
+        )?;
     let total_freed = apply_release_effect(
         pos,
         buy_notional,

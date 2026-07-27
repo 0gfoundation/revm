@@ -826,26 +826,26 @@ pub fn load_buy_orders<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
-) -> Result<Vec<OrderEntry>, PrecompileError> {
+) -> Result<std::collections::VecDeque<OrderEntry>, PrecompileError> {
     use crate::perp_dex::typed_store::Resident;
     match typed_store_mut(context).buy_orders(user, market_id) {
         Resident::Hit(v) => return Ok(v.clone()),
-        Resident::Deleted => return Ok(Vec::new()),
+        Resident::Deleted => return Ok(std::collections::VecDeque::new()),
         Resident::Miss => {}
     }
-    let arc = cold_load::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?;
+    let arc = cold_load::<_, std::collections::VecDeque<OrderEntry>>(context, user_buy_orders_key(user, market_id))?;
     typed_store_mut(context).fill_buy_orders(user, market_id, arc.clone());
     Ok(arc.map(|v| (*v).clone()).unwrap_or_default())
 }
 
-/// Zero-copy user buy-order-entry list (点1): `Arc<Vec<OrderEntry>>`, no per-read clone. PURE reads
+/// Zero-copy user buy-order-entry list (点1): `Arc<std::collections::VecDeque<OrderEntry>>`, no per-read clone. PURE reads
 /// only (opposite-side snapshot in reservation calc / `.last()` / iteration). List edits use
 /// [`mutate_buy_orders`].
 pub fn load_buy_orders_ref<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
-) -> Result<std::sync::Arc<Vec<OrderEntry>>, PrecompileError> {
+) -> Result<std::sync::Arc<std::collections::VecDeque<OrderEntry>>, PrecompileError> {
     use crate::perp_dex::typed_store::Resident;
     if let Some(arc) = typed_store_mut(context).buy_orders_arc(user, market_id) {
         return Ok(arc);
@@ -854,21 +854,21 @@ pub fn load_buy_orders_ref<CTX: ContextTr>(
         typed_store_mut(context).buy_orders(user, market_id),
         Resident::Deleted
     ) {
-        return Ok(std::sync::Arc::new(Vec::new()));
+        return Ok(std::sync::Arc::new(std::collections::VecDeque::new()));
     }
-    let arc = cold_load::<_, Vec<OrderEntry>>(context, user_buy_orders_key(user, market_id))?;
+    let arc = cold_load::<_, std::collections::VecDeque<OrderEntry>>(context, user_buy_orders_key(user, market_id))?;
     typed_store_mut(context).fill_buy_orders(user, market_id, arc.clone());
-    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
+    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(std::collections::VecDeque::new())))
 }
 
 pub fn save_buy_orders<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
-    entries: &[OrderEntry],
+    entries: &std::collections::VecDeque<OrderEntry>,
 ) -> Result<(), PrecompileError> {
     // An EMPTY list is a stored value (msgpack `0x90`, key present) — never a delete.
-    typed_store_mut(context).set_buy_orders(user, market_id, entries.to_vec());
+    typed_store_mut(context).set_buy_orders(user, market_id, entries.iter().copied().collect());
     Ok(())
 }
 
@@ -876,25 +876,25 @@ pub fn load_sell_orders<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
-) -> Result<Vec<OrderEntry>, PrecompileError> {
+) -> Result<std::collections::VecDeque<OrderEntry>, PrecompileError> {
     use crate::perp_dex::typed_store::Resident;
     match typed_store_mut(context).sell_orders(user, market_id) {
         Resident::Hit(v) => return Ok(v.clone()),
-        Resident::Deleted => return Ok(Vec::new()),
+        Resident::Deleted => return Ok(std::collections::VecDeque::new()),
         Resident::Miss => {}
     }
-    let arc = cold_load::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?;
+    let arc = cold_load::<_, std::collections::VecDeque<OrderEntry>>(context, user_sell_orders_key(user, market_id))?;
     typed_store_mut(context).fill_sell_orders(user, market_id, arc.clone());
     Ok(arc.map(|v| (*v).clone()).unwrap_or_default())
 }
 
-/// Zero-copy user sell-order-entry list (点1): `Arc<Vec<OrderEntry>>`, no per-read clone. PURE reads
+/// Zero-copy user sell-order-entry list (点1): `Arc<std::collections::VecDeque<OrderEntry>>`, no per-read clone. PURE reads
 /// only. List edits use [`mutate_sell_orders`].
 pub fn load_sell_orders_ref<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
-) -> Result<std::sync::Arc<Vec<OrderEntry>>, PrecompileError> {
+) -> Result<std::sync::Arc<std::collections::VecDeque<OrderEntry>>, PrecompileError> {
     use crate::perp_dex::typed_store::Resident;
     if let Some(arc) = typed_store_mut(context).sell_orders_arc(user, market_id) {
         return Ok(arc);
@@ -903,20 +903,20 @@ pub fn load_sell_orders_ref<CTX: ContextTr>(
         typed_store_mut(context).sell_orders(user, market_id),
         Resident::Deleted
     ) {
-        return Ok(std::sync::Arc::new(Vec::new()));
+        return Ok(std::sync::Arc::new(std::collections::VecDeque::new()));
     }
-    let arc = cold_load::<_, Vec<OrderEntry>>(context, user_sell_orders_key(user, market_id))?;
+    let arc = cold_load::<_, std::collections::VecDeque<OrderEntry>>(context, user_sell_orders_key(user, market_id))?;
     typed_store_mut(context).fill_sell_orders(user, market_id, arc.clone());
-    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
+    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(std::collections::VecDeque::new())))
 }
 
 pub fn save_sell_orders<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
-    entries: &[OrderEntry],
+    entries: &std::collections::VecDeque<OrderEntry>,
 ) -> Result<(), PrecompileError> {
-    typed_store_mut(context).set_sell_orders(user, market_id, entries.to_vec());
+    typed_store_mut(context).set_sell_orders(user, market_id, entries.iter().copied().collect());
     Ok(())
 }
 
@@ -929,7 +929,7 @@ pub fn mutate_buy_orders<CTX: ContextTr, R>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
-    f: impl FnOnce(&mut Vec<OrderEntry>) -> R,
+    f: impl FnOnce(&mut std::collections::VecDeque<OrderEntry>) -> R,
 ) -> Result<R, PrecompileError> {
     if let Some(entries) = typed_store_mut(context).buy_orders_mut(user, market_id) {
         return Ok(f(entries));
@@ -945,7 +945,7 @@ pub fn mutate_sell_orders<CTX: ContextTr, R>(
     context: &mut CTX,
     user: Address,
     market_id: u64,
-    f: impl FnOnce(&mut Vec<OrderEntry>) -> R,
+    f: impl FnOnce(&mut std::collections::VecDeque<OrderEntry>) -> R,
 ) -> Result<R, PrecompileError> {
     if let Some(entries) = typed_store_mut(context).sell_orders_mut(user, market_id) {
         return Ok(f(entries));
