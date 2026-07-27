@@ -140,7 +140,43 @@ impl TakerSettlement {
         // atomically with zero writes (matching the pre-commit-only whole-order revert).
         rest: Option<RestReq>,
     ) -> Result<Option<TakerPlan>, PrecompileError> {
+        // An EMPTY fill set must NOT skip the rest validation. `match_order` flushes the registry
+        // immediately after this call, and the walk records writes even when nothing filled (a
+        // `SaveLevel` for every level it entered, plus the `DeleteOrder`/`OrderCancelled`/
+        // `RemovePrice`/`SaveBest` of a maker the K9 guard rejected). So a rest that `rest_in_book`
+        // would later refuse has to be refused HERE, pre-flush — otherwise those writes commit
+        // under an order the caller then rejects (a leak in the single-order path, a spurious
+        // `Aborted` in a batch). NOTHING fill-specific runs on this path: no fee, no position
+        // change, no registry join — only the rest's affordability is measured, and the affordable
+        // case still returns `Ok(None)` (there is no fill to plan).
         if self.fills.is_empty() {
+            let Some(r) = &rest else {
+                return Ok(None);
+            };
+            // Measure against the state `rest_in_book` will see AFTER the flush: the taker's
+            // registry working copy if the walk already touched it (a self-match maker the K9 guard
+            // cancelled — the flush writes exactly that copy, funding included), else storage.
+            let affordable = match reg.user_work(self.user) {
+                Some(w) => rest_is_affordable(
+                    &w.pos,
+                    &w.account,
+                    &w.buy_entries,
+                    &w.sell_entries,
+                    taker_side,
+                    r,
+                    market,
+                )?,
+                None => {
+                    let pos = storage::load_position_ref(context, self.user, self.market_id)?;
+                    let account = storage::load_account_ref(context, self.user)?;
+                    let buy = storage::load_buy_orders_ref(context, self.user, self.market_id)?;
+                    let sell = storage::load_sell_orders_ref(context, self.user, self.market_id)?;
+                    rest_is_affordable(&pos, &account, &buy, &sell, taker_side, r, market)?
+                }
+            };
+            if !affordable {
+                return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+            }
             return Ok(None);
         }
 
@@ -321,6 +357,73 @@ pub(super) struct RestReq {
     pub(super) maker_fee_bps: u64,
 }
 
+/// Can `rest` be funded from this (pos, account, order-list) state? The zero-fill arm of
+/// [`TakerSettlement::finalize_compute`] uses this to raise the rest-margin reject BEFORE the
+/// registry flush, so the walk's writes never commit under an order that is about to be refused.
+///
+/// The formula is `rest_in_book`'s own, evaluated CLONE-FREE over the hypothetical
+/// "list ⊕ rest entry at its sorted slot" (`calc_reservation_notionals_it` folds the chained
+/// iterator, byte-identically to inserting first): flip-aware `margin_reserved` delta + the
+/// order's reserved maker fee, checked against the available wallet. Being the same formula on the
+/// same state is what makes the pre-flush reject sound — `rest_in_book`'s later check cannot then
+/// fire post-write.
+fn rest_is_affordable(
+    pos: &crate::perp_dex::types::PerpPosition,
+    account: &crate::perp_dex::types::UserAccount,
+    buy_entries: &[crate::perp_dex::types::OrderEntry],
+    sell_entries: &[crate::perp_dex::types::OrderEntry],
+    taker_side: Side,
+    rest: &RestReq,
+    market: &crate::perp_dex::types::Market,
+) -> Result<bool, PrecompileError> {
+    let entry = crate::perp_dex::types::OrderEntry {
+        order_id: [0u8; 32],
+        price: rest.price,
+        amount: rest.qty,
+        maker_fee_bps: rest.maker_fee_bps,
+    };
+    let (bd, pd) = (market.base_decimals, market.price_decimals);
+    let (bn, sn, cn) = match taker_side {
+        Side::Buy => {
+            let i = buy_entries.partition_point(|e| e.price > rest.price);
+            crate::perp_dex::math::calc_reservation_notionals_it(
+                buy_entries[..i]
+                    .iter()
+                    .copied()
+                    .chain(core::iter::once(entry))
+                    .chain(buy_entries[i..].iter().copied()),
+                sell_entries.iter().copied(),
+                bd,
+                pd,
+                pos.amount,
+            )?
+        }
+        Side::Sell => {
+            let i = sell_entries.partition_point(|e| e.price < rest.price);
+            crate::perp_dex::math::calc_reservation_notionals_it(
+                buy_entries.iter().copied(),
+                sell_entries[..i]
+                    .iter()
+                    .copied()
+                    .chain(core::iter::once(entry))
+                    .chain(sell_entries[i..].iter().copied()),
+                bd,
+                pd,
+                pos.amount,
+            )?
+        }
+    };
+    let mut probe = pos.clone();
+    probe.set_reservations(bn, sn, cn, pos.leverage);
+    let margin_delta = probe.margin_reserved.saturating_sub(pos.margin_reserved);
+    let order_fee =
+        calc_maker_fee_for_order_qty_with_bps(rest.price, rest.qty, rest.maker_fee_bps, market)?;
+    let delta = margin_delta
+        .checked_add(order_fee)
+        .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
+    Ok(account.has_available_perp(delta))
+}
+
 /// The taker settlement's APPLY half (commit-only #23 L2b): everything after the decision —
 /// the wallet-cover cancel loop (guaranteed to suffice by the compute simulation; its final
 /// check is now an unreachable invariant), the margin+fee debit, the fee credit, and the
@@ -491,6 +594,14 @@ impl MatchRegistry {
 
     pub(super) fn push_event(&mut self, e: MatchEvent) {
         self.events.push(e);
+    }
+
+    /// The user's working copy **if they already joined this match** — never loads, never inserts.
+    /// The flush writes exactly these copies, so for a user in the registry this IS the post-flush
+    /// state (funding already folded in by [`Self::get_or_load`]); that is what the zero-fill rest
+    /// pre-check must measure against on a self-match.
+    fn user_work(&self, user: Address) -> Option<&UserWork> {
+        self.users.iter().find(|(a, _)| *a == user).map(|(_, w)| w)
     }
 
     pub(super) fn can_touch_user(&self, user: Address, limit: usize) -> bool {

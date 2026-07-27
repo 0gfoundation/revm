@@ -170,24 +170,37 @@ impl BatchArrayLayout {
 /// length; `None` for every other selector.
 ///
 /// `None` is also returned when the length word cannot be trusted ([`BatchArrayLayout::checked_len`]
-/// failed). In that case only the envelope floor is charged and the batch handler turns the very
-/// same defensive read into a clean `Error(string)` revert — no work happens on either path.
+/// failed) **or when it exceeds the selector's `MAX_BATCH_*` cap**. In both cases only the envelope
+/// floor is charged and the batch handler turns the very same defensive read (or
+/// [`check_batch_len`]) into a clean `Error(string)` revert — no work happens on either path, so
+/// per-item gas must not be billed for it. Without the cap check an `N = 257` cancel batch would be
+/// charged `20_000 + 257 * 80_000 ≈ 20.6M` gas for a call that reverts having done nothing.
+///
+/// The cap is applied to the PRE-DECODE length only to size the charge; the authoritative
+/// enforcement stays on the DECODED length in [`check_batch_len`] (a legal-but-non-minimal encoding
+/// can therefore never fail a valid batch).
 ///
 /// The per-item unit is taken straight from the single-order selector's cost (`CANCEL_ORDER_GAS`,
 /// `PLACE_ORDER_GAS`) — never a re-invented number.
 pub fn batch_dynamic_gas(selector: [u8; 4], input: &[u8]) -> Option<u64> {
-    let (layout, unit) = if selector == batchCancelOrdersCall::SELECTOR {
-        (CANCEL_DIRECT_LAYOUT, CANCEL_ORDER_GAS)
+    let (layout, unit, max) = if selector == batchCancelOrdersCall::SELECTOR {
+        (CANCEL_DIRECT_LAYOUT, CANCEL_ORDER_GAS, MAX_BATCH_CANCEL)
     } else if selector == batchCancelOrdersSignedCall::SELECTOR {
-        (CANCEL_SIGNED_LAYOUT, CANCEL_ORDER_GAS)
+        (CANCEL_SIGNED_LAYOUT, CANCEL_ORDER_GAS, MAX_BATCH_CANCEL)
     } else if selector == batchPlaceOrdersCall::SELECTOR {
-        (PLACE_DIRECT_LAYOUT, PLACE_ORDER_GAS)
+        (PLACE_DIRECT_LAYOUT, PLACE_ORDER_GAS, MAX_BATCH_PLACE)
     } else if selector == batchPlaceOrdersSignedCall::SELECTOR {
-        (PLACE_SIGNED_LAYOUT, PLACE_ORDER_GAS)
+        (PLACE_SIGNED_LAYOUT, PLACE_ORDER_GAS, MAX_BATCH_PLACE)
     } else {
         return None;
     };
-    Some(batch_gas(layout.checked_len(input).ok()?, unit))
+    let n = layout.checked_len(input).ok()?;
+    if n > max {
+        // Over the cap: the call reverts in `check_batch_len` having done ZERO work — bill the
+        // envelope floor, not N items.
+        return None;
+    }
+    Some(batch_gas(n, unit))
 }
 
 /// Pre-loop length gate on the **decoded** array: an empty or oversized batch reverts the whole
@@ -221,7 +234,9 @@ pub enum PerpBatchTag {
     /// `batchCancelOrders`.
     Filled = 2,
     /// The item errored **after** writing perp state (invariant / arithmetic / post-write). Its
-    /// writes cannot be undone, so the loop stops here and the call still returns `Ok`.
+    /// writes cannot be undone, so the loop stops here and the call still returns `Ok`. For a
+    /// placement the `orderId` field is the id the abort BURNED (the nonce advances past it, so it
+    /// is never re-derived) — the only way a caller can tell which id the aborted item consumed.
     Aborted = 3,
     /// Never run: an earlier item aborted.
     NotAttempted = 4,
@@ -440,9 +455,13 @@ pub struct BatchRun {
 ///   write cannot be undone, so record `Aborted`, fill the tail with `NotAttempted`, stop, and
 ///   still return `Ok` (see the module docs).
 ///
-/// `echo_id(k)` supplies the id recorded for items that produce no id of their own (rejects, the
-/// abort, the untouched tail). `batchCancelOrders` echoes the input `orderIds[k]` there;
-/// `batchPlaceOrders` returns **zero** there, because a rejected placement never got an id.
+/// `echo_id(k, tag)` supplies the id recorded for items that produce no id of their own — `tag` is
+/// the one about to be written ([`PerpBatchTag::Rejected`], [`PerpBatchTag::Aborted`] or
+/// [`PerpBatchTag::NotAttempted`]), because the right answer differs per tag.
+/// `batchCancelOrders` echoes the input `orderIds[k]` for all three. `batchPlaceOrders` returns
+/// **zero** for `Rejected`/`NotAttempted` (no id was consumed, so none exists) but the item's
+/// DERIVED id for `Aborted`: that id was consumed — the nonce advances past it and the item may have
+/// written under it — so the caller has to be told which one was burned.
 pub fn drive_batch<CTX, EchoFn, ItemFn>(
     context: &mut CTX,
     n: usize,
@@ -451,7 +470,7 @@ pub fn drive_batch<CTX, EchoFn, ItemFn>(
 ) -> Result<BatchRun, PrecompileError>
 where
     CTX: ContextTr,
-    EchoFn: Fn(usize) -> [u8; 32],
+    EchoFn: Fn(usize, PerpBatchTag) -> [u8; 32],
     ItemFn: FnMut(&mut CTX, usize) -> Result<(PerpBatchTag, [u8; 32]), PrecompileError>,
 {
     let mut blob = BatchStatusBlob::with_capacity(n);
@@ -472,15 +491,23 @@ where
                 let code = reason_code(&e);
                 if !wrote {
                     // Write-clean: HL-style per-item reject, the batch carries on.
-                    blob.push(PerpBatchTag::Rejected, &echo_id(k), code);
+                    blob.push(
+                        PerpBatchTag::Rejected,
+                        &echo_id(k, PerpBatchTag::Rejected),
+                        code,
+                    );
                 } else {
                     PERP_BATCH_ABORT_COUNT.fetch_add(1, Ordering::Relaxed);
                     aborted_at = Some(k);
-                    blob.push(PerpBatchTag::Aborted, &echo_id(k), code);
+                    blob.push(
+                        PerpBatchTag::Aborted,
+                        &echo_id(k, PerpBatchTag::Aborted),
+                        code,
+                    );
                     for tail in (k + 1)..n {
                         blob.push(
                             PerpBatchTag::NotAttempted,
-                            &echo_id(tail),
+                            &echo_id(tail, PerpBatchTag::NotAttempted),
                             PerpBatchReason::None,
                         );
                     }

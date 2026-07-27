@@ -252,7 +252,7 @@ pub fn run_batch_cancel_orders<CTX: ContextTr>(
     let run = batch::drive_batch(
         context,
         ids.len(),
-        |k| ids[k].0,
+        |k, _| ids[k].0,
         |ctx, k| {
             cancel_order_core(caller, ids[k].0, ctx).map(|_| (PerpBatchTag::Accepted, ids[k].0))
         },
@@ -322,13 +322,13 @@ pub fn run_batch_cancel_orders_signed<CTX: ContextTr>(
     // ── last pre-loop fault has passed; the first write happens here ──
     let block_ts: u64 = context.block().timestamp().saturating_to();
     storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
-    storage::gc_seen_buckets(context, block_ts)?;
+    gc_seen_buckets_best_effort(context, block_ts)?;
 
     let account = args.account;
     let run = batch::drive_batch(
         context,
         ids.len(),
-        |k| ids[k].0,
+        |k, _| ids[k].0,
         |ctx, k| {
             cancel_order_core(account, ids[k].0, ctx).map(|_| (PerpBatchTag::Accepted, ids[k].0))
         },
@@ -336,6 +336,28 @@ pub fn run_batch_cancel_orders_signed<CTX: ContextTr>(
     Ok(Bytes::from(
         batchCancelOrdersSignedCall::abi_encode_returns(&Bytes::from(run.statuses)),
     ))
+}
+
+/// Best-effort seen-signature GC.
+///
+/// The sweep is pure housekeeping — it drops replay markers whose recv window expired a full
+/// retention margin ago — but it is a fallible WRITE, and it runs after the signature has been
+/// burned. Under commit-only an `Err` here would revert a call whose burn is already committed:
+/// that signature becomes permanently unusable while its work never happened. So an ordinary error
+/// is dropped on the floor. A half-done sweep is harmless by the same retention argument
+/// (`storage::gc_seen_buckets`): the markers it drops can no longer cause a false reject, and a
+/// bucket it fails to finish is re-visited or simply leaks stale markers until a wipe.
+///
+/// A [`PrecompileError::Fatal`] still propagates — that is a node/DB fault, not a housekeeping
+/// failure, and it must not be masked (same rule `drive_batch` applies to per-item errors).
+fn gc_seen_buckets_best_effort<CTX: ContextTr>(
+    context: &mut CTX,
+    block_ts: u64,
+) -> Result<(), PrecompileError> {
+    match storage::gc_seen_buckets(context, block_ts) {
+        Err(PrecompileError::Fatal(e)) => Err(PrecompileError::Fatal(e)),
+        _ => Ok(()),
+    }
 }
 
 /// Canonical batch-cancel digest preimage (64-byte header + 32 bytes per id):
@@ -395,8 +417,9 @@ pub(crate) fn batch_cancel_message(
 ///
 /// Places each item in strict calldata order on behalf of `caller`; each item matches the book as
 /// left by the previous one. Returns the index-aligned status blob; see [`batch`] for the record
-/// layout. The `orderId` field is the placed id for an accepted item and ZERO for a rejected /
-/// aborted / never-attempted one (no id was consumed, so none exists).
+/// layout. The `orderId` field is the placed id for an accepted item, the BURNED id for an aborted
+/// one (it consumed an id and the nonce advances past it), and ZERO for a rejected /
+/// never-attempted one (no id was consumed, so none exists).
 pub fn run_batch_place_orders<CTX: ContextTr>(
     input_bytes: &[u8],
     caller: Address,
@@ -416,23 +439,34 @@ pub fn run_batch_place_orders<CTX: ContextTr>(
     // and no liquidation can run from a placement (the auto-liq sweep lives in
     // `run_update_index_price`).
     let base_nonce = storage::load_user_nonce(context, caller)?;
-    let mut ids_consumed = 0u64;
+    // `Cell` because both closures need it: `run_item` advances it, `echo_id` reads the id of the
+    // item that is failing. Single-threaded, no borrow conflict.
+    let ids_consumed = core::cell::Cell::new(0u64);
+    // The id the CURRENT item derived, published before anything can fail under it.
+    let item_id = core::cell::Cell::new([0u8; 32]);
     let run = batch::drive_batch(
         context,
         orders.len(),
-        // A rejected/aborted/never-attempted placement has no id to report.
-        |_| [0u8; 32],
+        // A rejected / never-attempted placement consumed no id (report zero). An ABORTED one did:
+        // it wrote — possibly under that id — and `commit_batch_order_nonce` advances the nonce past
+        // it, so the caller must be told which id was burned.
+        |_, tag| match tag {
+            PerpBatchTag::Aborted => item_id.get(),
+            _ => [0u8; 32],
+        },
         |ctx, k| {
             let nonce = base_nonce
-                .checked_add(ids_consumed)
+                .checked_add(ids_consumed.get())
                 .ok_or_else(|| perp_err("placeOrder: order nonce overflow"))?;
             let order_id = derive_order_id(caller, nonce);
+            item_id.set(order_id);
             let tag = place_batch_item(ctx, caller, order_id, &orders[k])?;
             // Reached only on acceptance — a reject returned above and consumed no id.
-            ids_consumed += 1;
+            ids_consumed.set(ids_consumed.get() + 1);
             Ok((tag, order_id))
         },
     )?;
+    let ids_consumed = ids_consumed.get();
     debug_assert_eq!(run.accepted as u64, ids_consumed);
     commit_batch_order_nonce(context, caller, base_nonce, ids_consumed, run.aborted_at)?;
     Ok(Bytes::from(batchPlaceOrdersCall::abi_encode_returns(
@@ -509,13 +543,18 @@ pub fn run_batch_place_orders_signed<CTX: ContextTr>(
     // ── last pre-loop fault has passed; the first write happens here ──
     let block_ts: u64 = context.block().timestamp().saturating_to();
     storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
-    storage::gc_seen_buckets(context, block_ts)?;
+    gc_seen_buckets_best_effort(context, block_ts)?;
 
     let account = args.account;
     let run = batch::drive_batch(
         context,
         orders.len(),
-        |_| [0u8; 32],
+        // An ABORTED item's id was consumed (it wrote, possibly under that id), so report it; a
+        // rejected / never-attempted item consumed none. Derivation is a pure function of `k`.
+        |k, tag| match tag {
+            PerpBatchTag::Aborted => signed_batch_order_id(&signature, k as u32),
+            _ => [0u8; 32],
+        },
         |ctx, k| {
             let order_id = signed_batch_order_id(&signature, k as u32);
             let tag = place_batch_item(ctx, account, order_id, &orders[k])?;
@@ -574,7 +613,14 @@ fn commit_batch_order_nonce<CTX: ContextTr>(
     if consumed == 0 {
         return Ok(());
     }
-    commit_order_nonce(context, account, base_nonce.saturating_add(consumed))
+    // checked, NOT saturating: at `base_nonce == u64::MAX` a saturating add would clamp and leave
+    // the nonce on a value already spent, so the next placement would re-derive a LIVE order id and
+    // `save_order` (no collision guard) would silently overwrite it. Same guard the per-item
+    // derivation in the loop uses, same message.
+    let next = base_nonce
+        .checked_add(consumed)
+        .ok_or_else(|| perp_err("placeOrder: order nonce overflow"))?;
+    commit_order_nonce(context, account, next)
 }
 
 /// Signed-batch order id: `keccak256(signature(64) || k(4, big-endian))`.
@@ -1869,17 +1915,19 @@ pub(super) fn match_order<CTX: ContextTr>(
     // Flush the buffered OrderPlaced FIRST so it precedes this order's own Trade /
     // PositionChanged events, which the flush below emits (log order preserved).
     //
-    // ONE exception keeps "emitted ⟺ accepted" honest: `finalize_compute` early-returns on an
-    // EMPTY fill set, so on a zero-fill GTC its atomic fills+rest margin pre-check never ran and
-    // `rest_in_book`'s margin reject is still ahead of us — the sole genuine reject that can fire
-    // after this apply. In that case the log stays buffered and `rest_in_book` flushes it inside
-    // its own apply block. (Zero-fill means the walk matched nothing, so the flush has no Trade /
-    // PositionChanged of ours to precede; at most it carries an insolvent-maker cancel, whose log
-    // then lands before this order's OrderPlaced — a foreign order's event, not this order's.)
-    let rest_reject_still_ahead = rest_remainder && remaining > 0 && taker_plan.is_none();
-    if !rest_reject_still_ahead {
-        emit_pending_order_placed(context, pending_placed);
-    }
+    // UNCONDITIONAL, and provably so: `finalize_compute` validates the GTC rest even when the fill
+    // set is EMPTY, so every genuine reject of this placement — PostOnly-cross, FOK-unfillable, the
+    // taker K9 / wallet-cover / fills+rest margin rejects, and now the zero-fill rest-margin reject
+    // that used to surface only later in `rest_in_book` — has already fired above, pre-flush and
+    // write-clean. `rest_in_book` re-checks the same formula on the same post-flush state, so its
+    // reject can no longer be reached from here. What is left past this point is invariant /
+    // arithmetic guards, plus `finalize_apply`'s two residuals: the wallet-cover check (an
+    // unreachable invariant — the compute phase simulated the same cancel loop) and
+    // `credit_fee_recipient`'s "fee recipient not initialised", which needs an UNSET admin and is
+    // therefore unreachable on any live chain (a market cannot be added without a non-zero admin,
+    // and neither `initAdmin` nor `transferAdmin` can set one back to zero). Nothing a user can
+    // provoke rejects after this line, so "emitted ⟺ accepted" holds with no exception.
+    emit_pending_order_placed(context, pending_placed);
     registry.flush(context, market_id)?;
     if let Some(plan) = taker_plan {
         settlement::finalize_apply(context, plan, side, market)?;

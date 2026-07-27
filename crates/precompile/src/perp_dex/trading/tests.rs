@@ -1712,9 +1712,9 @@ fn rejected_taker_wallet_cover_emits_no_logs() {
     );
 }
 
-/// The zero-fill GTC case: nothing matched, so `finalize_compute` early-returned and
-/// `rest_in_book`'s margin reject is the LAST genuine reject — the buffered log must survive the
-/// (empty) match flush unemitted and die with the reject.
+/// The zero-fill GTC case: nothing matched, so the rest-margin reject is raised by
+/// `finalize_compute`'s empty-fill arm (pre-flush) rather than later in `rest_in_book` — either way
+/// the buffered `OrderPlaced` must die with the reject, unemitted.
 #[test]
 fn rejected_rest_in_book_margin_emits_no_logs() {
     let mut ctx = make_ctx();
@@ -1744,6 +1744,52 @@ fn rejected_rest_in_book_margin_emits_no_logs() {
         logs.is_empty(),
         "a placement rejected by rest_in_book must emit no logs at all, got {logs:?}"
     );
+}
+
+/// A zero-fill GTC whose rest is unaffordable must reject WRITE-CLEAN, even when the match walk
+/// entered a level (and therefore recorded writes).
+///
+/// The walk pushes a `SaveLevel` for every level it enters — here the crossing ask level survives
+/// the walk with its live count intact because its only queued id is stale (lazy-queue sweep), so
+/// nothing fills. Those writes used to be committed by `registry.flush` and only afterwards did
+/// `rest_in_book` raise the perfectly ordinary margin reject: under commit-only they LEAKED (the
+/// frame revert does not roll perp state back) and inside a batch they faked an `Aborted`. The rest
+/// is now validated in `finalize_compute` before the flush, so the reject writes nothing.
+#[test]
+fn zero_fill_rest_margin_reject_is_write_clean() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    // A resting ask at PRICE whose order RECORD is then removed: the level keeps its live count and
+    // its FIFO id, so a crossing taker enters the level, sweeps the stale id and fills nothing.
+    let stale = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    storage::delete_order(&mut ctx, &stale).unwrap();
+    take_event_names(&mut ctx);
+    let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+
+    // Crosses that level (no fill), then wants to rest 11 USDC of margin against a 10 USDC wallet.
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side: 0,
+        price: PRICE,
+        quantity: QTY * 11,
+        orderType: 0,
+        tif: 0, // GTC
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("insufficient perp wallet for margin"),
+        "{err}"
+    );
+    assert_eq!(
+        JournalTr::perp_write_count(ctx.journal_mut()),
+        writes_before,
+        "the zero-fill rest-margin reject must fire BEFORE the match flush (no leaked writes)"
+    );
+    let logs = take_event_names(&mut ctx);
+    assert!(logs.is_empty(), "and it must emit nothing, got {logs:?}");
 }
 
 #[test]
@@ -4828,10 +4874,13 @@ mod batch_cancel {
     #[test]
     fn driver_classifies_by_write_count_not_by_message() {
         let echo = |k: usize| [k as u8; 32];
+        // `drive_batch` now asks for (index, tag) — the tag lets the place path report the id an
+        // ABORT burned; the cancel path (and this driver test) is tag-agnostic.
+        let echo_at = |k: usize, _tag: PerpBatchTag| echo(k);
 
         // (a) write-clean error → Rejected, loop continues.
         let mut ctx = make_ctx();
-        let run = batch::drive_batch(&mut ctx, 3, echo, |_ctx, k| {
+        let run = batch::drive_batch(&mut ctx, 3, echo_at, |_ctx, k| {
             if k == 1 {
                 Err(perp_invariant_err("write-clean invariant"))
             } else {
@@ -4852,7 +4901,7 @@ mod batch_cancel {
 
         // (b) error AFTER a perp write → Aborted + NotAttempted tail, still Ok.
         let mut ctx = make_ctx();
-        let run = batch::drive_batch(&mut ctx, 4, echo, |ctx, k| {
+        let run = batch::drive_batch(&mut ctx, 4, echo_at, |ctx, k| {
             if k == 1 {
                 storage::save_user_nonce(ctx, ALICE, 7)?;
                 Err(perp_err("plain reject, but it wrote first"))
@@ -4876,7 +4925,7 @@ mod batch_cancel {
 
         // (c) Fatal propagates untouched, even though the loop had already begun.
         let mut ctx = make_ctx();
-        let err = batch::drive_batch(&mut ctx, 3, echo, |_ctx, k| {
+        let err = batch::drive_batch(&mut ctx, 3, echo_at, |_ctx, k| {
             if k == 1 {
                 Err(perp_fatal_invariant_err("node-level"))
             } else {
@@ -5083,6 +5132,33 @@ mod batch_cancel {
         );
         // A length word that would wrap `len * 32` is rejected outright by the pre-decode read.
         assert!(batch::batch_dynamic_gas(batchCancelOrdersCall::SELECTOR, &[0u8; 8]).is_none());
+    }
+
+    /// An over-cap batch reverts in `check_batch_len` having done ZERO work, so it must be billed the
+    /// envelope floor only. `N = MAX + 1 = 257` would otherwise cost `20_000 + 257 * 80_000` ≈ 20.6M
+    /// gas for a call that performs nothing at all.
+    #[test]
+    fn over_cap_batch_is_billed_only_the_envelope_floor() {
+        let over = direct_calldata(&vec![[0x11u8; 32]; MAX_BATCH_CANCEL + 1]);
+        assert_eq!(
+            batch::batch_dynamic_gas(batchCancelOrdersCall::SELECTOR, &over),
+            None,
+            "an over-cap declared length must not be billed per item"
+        );
+
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let out = run_perp_dex_call(&over, u64::MAX, ALICE, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(out.reverted, "over-cap must still revert the whole call");
+        assert!(String::from_utf8_lossy(&out.bytes).contains("batch too large"));
+        assert_eq!(out.gas_used, BASE_BATCH_GAS);
+
+        // N == MAX is billed in full, so the clamp cannot silently under-bill a legal batch.
+        let at_cap = direct_calldata(&vec![[0x11u8; 32]; MAX_BATCH_CANCEL]);
+        assert_eq!(
+            batch::batch_dynamic_gas(batchCancelOrdersCall::SELECTOR, &at_cap),
+            Some(BASE_BATCH_GAS + MAX_BATCH_CANCEL as u64 * CANCEL_ORDER_GAS)
+        );
     }
 
     // ── 6. signed batch ────────────────────────────────────────────────────
@@ -6478,5 +6554,280 @@ mod batch_place {
             matches!(err, PrecompileError::StaticRestrictionViolation),
             "got {err:?}"
         );
+    }
+
+    // ── 8. abort-forward on the PLACE path ─────────────────────────────────
+
+    /// Arms the one post-write error the place path still has: the fee recipient is cleared while the
+    /// taker still owes a taker fee, so `credit_fee_recipient` — which runs in `finalize_apply`,
+    /// AFTER `registry.flush` committed the fill — raises "fee recipient not initialised".
+    ///
+    /// ALICE pays a 1% taker fee; BOB (the maker) pays none, which is what keeps the walk's own
+    /// admin check (`settle_maker_fill_registry`, only reached when `maker_fee > 0`) from catching it
+    /// pre-flush. Leaves a resting ask at PRICE for the crossing item to consume.
+    fn arm_post_write_place_abort(ctx: &mut TestCtx) {
+        storage::save_user_fee_rates(
+            ctx,
+            ALICE,
+            UserFeeRates {
+                maker_fee_bps: 0,
+                taker_fee_bps: 100,
+            },
+        )
+        .unwrap();
+        place(ctx, BOB, 1, PRICE, QTY, 0, 0);
+        storage::save_admin(ctx, Address::ZERO).unwrap();
+    }
+
+    /// End-to-end abort-forward on `batchPlaceOrders` (the cancel-path analogue is
+    /// `batch_cancel_aborts_forward_on_a_post_write_invariant`): the crossing item writes and THEN
+    /// fails, so it is `Aborted`, the tail is `NotAttempted`, the call still returns `Ok`, the
+    /// committed prefix keeps its order — and the nonce advances PAST the aborted item, so its id can
+    /// never be re-derived (`save_order` has no collision guard). The aborted record reports that
+    /// burned id, which is the only way a caller can learn which one was consumed.
+    #[test]
+    fn aborts_forward_on_a_post_write_place_error() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        arm_post_write_place_abort(&mut ctx);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let base = nonce(&mut ctx, ALICE);
+        let aborts_before = batch::perp_batch_abort_count();
+
+        let items = [
+            gtc(0, PRICE - TICK, QTY),     // rests → the committed prefix
+            gtc(0, PRICE, QTY),            // crosses BOB's ask → writes, then the fee reject
+            gtc(0, PRICE - 2 * TICK, QTY), // never attempted
+        ];
+        // `batch_place` asserts the call did NOT revert.
+        let blob = batch_place(&mut ctx, ALICE, &items);
+
+        let (id0, id1) = (direct_id(ALICE, base, 0), direct_id(ALICE, base, 1));
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                expect(PerpBatchTag::Accepted, id0, PerpBatchReason::None),
+                expect(
+                    PerpBatchTag::Aborted,
+                    id1,
+                    PerpBatchReason::FeeRecipientNotSet
+                ),
+                expect(PerpBatchTag::NotAttempted, ZERO_ID, PerpBatchReason::None),
+            ]
+        );
+        assert_eq!(batch::perp_batch_abort_count(), aborts_before + 1);
+        assert!(
+            storage::load_order(&mut ctx, &id0).unwrap().is_some(),
+            "the committed prefix must survive the abort, with its order intact"
+        );
+        assert_eq!(
+            nonce(&mut ctx, ALICE),
+            base + 2,
+            "consumed = 1 accepted + 1 aborted: the aborted id must be BURNED, not reusable"
+        );
+        // The next placement continues past the burned id rather than re-deriving it.
+        let next = place(&mut ctx, ALICE, 0, PRICE - 5 * TICK, QTY, 0, 0);
+        assert_ne!(next, id1, "an aborted item's id must never be re-derived");
+        assert_eq!(next, direct_id(ALICE, base, 2));
+    }
+
+    /// A zero-fill GTC whose rest is unaffordable is a ROUTINE user reject, and must stay one: the
+    /// match walk enters the crossing level (its only queued id is stale, so nothing fills) and
+    /// records a `SaveLevel`, but that write must not commit — otherwise the driver's write-counter
+    /// witness sees movement and mis-classifies the reject as an `Aborted`, dropping the rest of the
+    /// batch. Third-party influenceable (anyone can leave a stale id at the victim's price), which is
+    /// why it is pinned end-to-end.
+    #[test]
+    fn zero_fill_rest_reject_is_a_reject_not_an_abort() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let stale = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        storage::delete_order(&mut ctx, &stale).unwrap();
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let base = nonce(&mut ctx, ALICE);
+        let aborts_before = batch::perp_batch_abort_count();
+
+        let blob = batch_place(
+            &mut ctx,
+            ALICE,
+            &[
+                // Crosses the stale level, fills nothing, then wants 11 USDC of margin for the rest
+                // out of a 10 USDC wallet.
+                gtc(0, PRICE, QTY * 11),
+                gtc(0, PRICE - TICK, QTY), // must still be attempted
+            ],
+        );
+
+        let id1 = direct_id(ALICE, base, 0);
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                expect(
+                    PerpBatchTag::Rejected,
+                    ZERO_ID,
+                    PerpBatchReason::InsufficientMargin
+                ),
+                expect(PerpBatchTag::Accepted, id1, PerpBatchReason::None),
+            ]
+        );
+        assert_eq!(
+            batch::perp_batch_abort_count(),
+            aborts_before,
+            "the reject is write-clean, so nothing may be counted as an abort"
+        );
+        assert_eq!(nonce(&mut ctx, ALICE), base + 1);
+    }
+
+    /// The nonce advance must be CHECKED: a saturating add would clamp at `u64::MAX` and leave the
+    /// nonce on a value already spent, so the next placement would re-derive a live id.
+    #[test]
+    fn nonce_overflow_is_rejected_rather_than_clamped() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let err = commit_batch_order_nonce(&mut ctx, ALICE, u64::MAX, 1, None).unwrap_err();
+        assert!(err.to_string().contains("order nonce overflow"), "{err}");
+        assert_eq!(nonce(&mut ctx, ALICE), 0, "and nothing was written");
+    }
+
+    /// An over-cap batch reverts in `check_batch_len` having done ZERO work, so it must be billed the
+    /// envelope floor only — never `BASE + N * unit` for work it never performs.
+    #[test]
+    fn over_cap_batch_is_billed_only_the_envelope_floor() {
+        let over = direct_calldata(&vec![gtc(0, PRICE - TICK, QTY); MAX_BATCH_PLACE + 1]);
+        assert_eq!(
+            batch::batch_dynamic_gas(batchPlaceOrdersCall::SELECTOR, &over),
+            None,
+            "an over-cap declared length must not be billed per item"
+        );
+
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let out = run_perp_dex_call(&over, u64::MAX, ALICE, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(out.reverted, "over-cap must still revert the whole call");
+        assert!(String::from_utf8_lossy(&out.bytes).contains("batch too large"));
+        assert_eq!(out.gas_used, BASE_BATCH_GAS);
+
+        // N == MAX is billed in full, so the clamp cannot silently under-bill a legal batch.
+        let at_cap = direct_calldata(&vec![gtc(0, PRICE - TICK, QTY); MAX_BATCH_PLACE]);
+        assert_eq!(
+            batch::batch_dynamic_gas(batchPlaceOrdersCall::SELECTOR, &at_cap),
+            Some(BASE_BATCH_GAS + MAX_BATCH_PLACE as u64 * PLACE_ORDER_GAS)
+        );
+    }
+
+    // ── 9. signed: header tampering + the burn under an abort ──────────────
+
+    /// Every HEADER field is inside the digest, not just the items: `account`, `keyId`, `timestamp`
+    /// and `recvWindow` (item fields / N / permutation live in `signed_batch_rejects_tampered_content`).
+    /// A key is registered for BOTH accounts under BOTH key ids so each case fails on VERIFICATION and
+    /// not for a boring reason like "no api key", and the tampered timestamp/recvWindow are chosen to
+    /// still pass `check_recv_window` (skew 5s, window clamped to 60s).
+    #[test]
+    fn signed_batch_rejects_tampered_header_fields() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let items = [gtc(0, PRICE - TICK, QTY)];
+        // Signed under ALICE / keyId 0 / SIGNED_TS / SIGNED_RECV.
+        let sig = sign(&items, &sk, ALICE, SIGNED_TS, SIGNED_RECV);
+        let wire = |account: Address, key_id: u8, ts: u64, recv: u64| {
+            batchPlaceOrdersSignedCall {
+                account,
+                keyId: key_id,
+                timestamp: ts,
+                recvWindow: recv,
+                orders: items.to_vec(),
+                signature: sig.to_vec().into(),
+            }
+            .abi_encode()
+        };
+
+        for (name, input) in [
+            ("account swapped", wire(BOB, 0, SIGNED_TS, SIGNED_RECV)),
+            ("keyId changed", wire(ALICE, 1, SIGNED_TS, SIGNED_RECV)),
+            (
+                "timestamp changed",
+                wire(ALICE, 0, SIGNED_TS + 1, SIGNED_RECV),
+            ),
+            (
+                "recvWindow changed",
+                wire(ALICE, 0, SIGNED_TS, SIGNED_RECV + 1),
+            ),
+        ] {
+            let mut ctx = make_ctx();
+            setup(&mut ctx);
+            for user in [ALICE, BOB] {
+                for key_id in [0u8, 1] {
+                    storage::save_api_key(
+                        &mut ctx,
+                        user,
+                        key_id,
+                        ApiKey {
+                            pubkey: sk.verifying_key().to_bytes(),
+                            expiry: 0,
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+            let out =
+                run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
+            assert!(out.reverted, "{name} must fail verification");
+            let reason = String::from_utf8_lossy(&out.bytes).to_string();
+            assert!(
+                reason.contains("signature verification failed"),
+                "{name} must fail on the SIGNATURE, got {reason}"
+            );
+            assert_eq!(
+                JournalTr::perp_write_count(ctx.journal_mut()),
+                writes_before,
+                "{name}: signature failure is pre-write"
+            );
+            assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+        }
+    }
+
+    /// The signature is burned BEFORE the loop, unconditionally — so a batch that ABORTS mid-way
+    /// (returning `Ok`, with committed writes) can never be replayed to re-run its tail.
+    #[test]
+    fn signed_batch_abort_still_burns_the_signature() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register_key(&mut ctx, ALICE, &sk);
+        arm_post_write_place_abort(&mut ctx);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        let items = [
+            gtc(0, PRICE, QTY),        // crosses BOB's ask → writes, then the fee reject
+            gtc(0, PRICE - TICK, QTY), // never attempted
+        ];
+        let input = signed_calldata(&sk, ALICE, SIGNED_TS, SIGNED_RECV, &items, None);
+        let out =
+            run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(!out.reverted, "an abort must still return Ok");
+        let blob = batchPlaceOrdersSignedCall::abi_decode_returns(&out.bytes).unwrap();
+        let st = decode_statuses(&blob);
+        let sig = sign(&items, &sk, ALICE, SIGNED_TS, SIGNED_RECV);
+        assert_eq!(
+            st,
+            vec![
+                // The signed path reports the aborted item's derived id too.
+                expect(
+                    PerpBatchTag::Aborted,
+                    expected_signed_id(&sig, 0),
+                    PerpBatchReason::FeeRecipientNotSet
+                ),
+                expect(PerpBatchTag::NotAttempted, ZERO_ID, PerpBatchReason::None),
+            ]
+        );
+
+        // Replay of the very same signature reverts the whole call.
+        let out =
+            run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(
+            out.reverted,
+            "an aborted batch must still burn its signature"
+        );
+        assert!(String::from_utf8_lossy(&out.bytes).contains("duplicate signature"));
     }
 }
