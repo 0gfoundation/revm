@@ -697,6 +697,204 @@ fn total_entry_amount(
     checked_u64_to_i64(total, ctx)
 }
 
+// ── Incremental-reservation primitives (catalog #A, Step 1) ─────────────────────────────────
+//
+// The flip-aware reservation `calc_reservation_notionals` folds THREE passes over the acting
+// account's whole buy+sell lists on every place/cancel — O(n) in the account's resting-order
+// count. Sim A (docs/hl-rust-sim-bottleneck-results-20260727.md) showed this is THE hot-path
+// bottleneck: a 3 655-order MM's place+cancel is 19× a 1-order account's, and those long-list MMs
+// are the dominant churners.
+//
+// These primitives reconstruct each side's opening notional from a MAINTAINED per-side aggregate
+// instead of a full fold. The key identity (proven byte-exact below):
+//
+//     side_notional(cover C) = TotalNotional − Σ_{covered prefix} calc_value(price_i, amount_i)
+//                                             + calc_value(price_boundary, open_at_boundary)
+//
+// where `TotalNotional = Σ_i calc_value(price_i, amount_i)` is the sum of the SAME per-order
+// floored `calc_value` terms the fold produces (so it is maintainable ± one term per insert/remove
+// with ZERO floor-composition error — `calc_value` floors per call, so only this per-order-floored
+// definition stays byte-identical). The covered prefix is the highest-price buys / lowest-price
+// sells totalling `C` in quantity; it is EMPTY when C = 0 (a flat/aligned position or a one-sided
+// book) → the leg is just `TotalNotional`, computed with NO list walk. Otherwise the walk spans
+// only the cover prefix (bounded by |position| / the flip totals), never the full list.
+
+/// `(Σ amount, Σ calc_value(price, amount))` over a side's order list — the maintained aggregate
+/// the leg reconstruction below consumes. Cold-rebuild / test helper; production maintains these
+/// incrementally so this full pass runs only on a cold first-touch.
+pub fn sum_side_totals(
+    entries: impl Iterator<Item = OrderEntry>,
+    base_decimals: u32,
+    price_decimals: u32,
+) -> Result<(u64, u64), PrecompileError> {
+    let mut qty = 0u64;
+    let mut notional = 0u64;
+    for e in entries {
+        qty = qty
+            .checked_add(e.amount)
+            .ok_or_else(|| perp_err("math: side total qty overflow"))?;
+        let v = calc_value(e.price, e.amount, base_decimals, price_decimals)?;
+        notional = notional
+            .checked_add(v)
+            .ok_or_else(|| perp_err("math: side total notional overflow"))?;
+    }
+    Ok((qty, notional))
+}
+
+/// Reconstruct one side's opening notional at cover threshold `cover` (≥ 0) from `total_notional`,
+/// walking ONLY the cover prefix. `entries` must be in the side's cover order (buys DESC, sells
+/// ASC — the same order the fold consumes). Byte-identical to
+/// `calc_{buy,sell}_side_reserved_notional` (see the fuzz gate `from_totals_matches_fold`).
+fn side_leg_from_total(
+    entries: impl Iterator<Item = OrderEntry>,
+    total_notional: u64,
+    base_decimals: u32,
+    price_decimals: u32,
+    cover: i64,
+) -> Result<u64, PrecompileError> {
+    if cover <= 0 {
+        return Ok(total_notional);
+    }
+    let mut remaining = cover as u64;
+    let mut leg = total_notional;
+    for e in entries {
+        if remaining >= e.amount {
+            // Fully covered: this order opens nothing → drop its full per-order notional.
+            let cv = calc_value(e.price, e.amount, base_decimals, price_decimals)?;
+            leg = leg
+                .checked_sub(cv)
+                .ok_or_else(|| perp_err("math: side leg cover underflow"))?;
+            remaining -= e.amount;
+            if remaining == 0 {
+                break; // all subsequent orders open fully → already counted in total_notional
+            }
+        } else {
+            // Boundary order: covers `remaining`, opens `amount - remaining`.
+            let open = e.amount - remaining;
+            let cv_full = calc_value(e.price, e.amount, base_decimals, price_decimals)?;
+            let cv_open = calc_value(e.price, open, base_decimals, price_decimals)?;
+            leg = leg
+                .checked_sub(cv_full)
+                .ok_or_else(|| perp_err("math: side leg boundary underflow"))?
+                .checked_add(cv_open)
+                .ok_or_else(|| perp_err("math: side leg boundary overflow"))?;
+            break;
+        }
+    }
+    Ok(leg)
+}
+
+/// Flip-aware worst-case reservation `(B, S, c_notional)` — byte-identical to
+/// [`calc_reservation_notionals`] — reconstructed from the maintained per-side aggregates
+/// `(total_buy_qty, total_buy_notional, total_sell_qty, total_sell_notional)` instead of a full
+/// fold. Each of the four legs (B, B′, S, S′) walks only its cover prefix, so a flat/aligned or
+/// one-sided book is O(1). `buy_entries` DESC, `sell_entries` ASC.
+pub fn calc_reservation_notionals_from_totals(
+    buy_entries: &[OrderEntry],
+    sell_entries: &[OrderEntry],
+    total_buy_qty: u64,
+    total_buy_notional: u64,
+    total_sell_qty: u64,
+    total_sell_notional: u64,
+    base_decimals: u32,
+    price_decimals: u32,
+    position_amount: i64,
+) -> Result<(u64, u64, u64), PrecompileError> {
+    calc_reservation_notionals_from_totals_it(
+        buy_entries.iter().copied(),
+        sell_entries.iter().copied(),
+        total_buy_qty,
+        total_buy_notional,
+        total_sell_qty,
+        total_sell_notional,
+        base_decimals,
+        price_decimals,
+        position_amount,
+    )
+}
+
+/// Iterator form of [`calc_reservation_notionals_from_totals`] — lets a caller evaluate the
+/// reservation of a HYPOTHETICAL book (current list + one entry at its sorted slot, via `.chain`)
+/// with NO owned clone (the validate-then-apply probe in `rest_in_book`). `B`/`S: Clone` because
+/// each side is iterated twice (own-position leg + flip leg). Byte-identical to the slice form.
+#[allow(clippy::too_many_arguments)]
+pub fn calc_reservation_notionals_from_totals_it<B, S>(
+    buy_entries: B,
+    sell_entries: S,
+    total_buy_qty: u64,
+    total_buy_notional: u64,
+    total_sell_qty: u64,
+    total_sell_notional: u64,
+    base_decimals: u32,
+    price_decimals: u32,
+    position_amount: i64,
+) -> Result<(u64, u64, u64), PrecompileError>
+where
+    B: Iterator<Item = OrderEntry> + Clone,
+    S: Iterator<Item = OrderEntry> + Clone,
+{
+    let p = position_amount;
+    let tsq = checked_u64_to_i64(total_sell_qty, "math: total sell qty")?;
+    let tbq = checked_u64_to_i64(total_buy_qty, "math: total buy qty")?;
+
+    // B = buy leg at current position (cover the short, if any).
+    let cover_b = if p >= 0 { 0 } else { -p };
+    let b = side_leg_from_total(
+        buy_entries.clone(),
+        total_buy_notional,
+        base_decimals,
+        price_decimals,
+        cover_b,
+    )?;
+    // B′ = buy leg after all sells fill (position → most short).
+    let pos_after_sells = p
+        .checked_sub(tsq)
+        .ok_or_else(|| perp_err("math: flip-short position overflow"))?;
+    let cover_b_flip = if pos_after_sells >= 0 {
+        0
+    } else {
+        -pos_after_sells
+    };
+    let b_flip = side_leg_from_total(
+        buy_entries,
+        total_buy_notional,
+        base_decimals,
+        price_decimals,
+        cover_b_flip,
+    )?;
+    // S = sell leg at current position (cover the long, if any).
+    let cover_s = if p <= 0 { 0 } else { p };
+    let s = side_leg_from_total(
+        sell_entries.clone(),
+        total_sell_notional,
+        base_decimals,
+        price_decimals,
+        cover_s,
+    )?;
+    // S′ = sell leg after all buys fill (position → most long).
+    let pos_after_buys = p
+        .checked_add(tbq)
+        .ok_or_else(|| perp_err("math: flip-long position overflow"))?;
+    let cover_s_flip = if pos_after_buys <= 0 { 0 } else { pos_after_buys };
+    let s_flip = side_leg_from_total(
+        sell_entries,
+        total_sell_notional,
+        base_decimals,
+        price_decimals,
+        cover_s_flip,
+    )?;
+
+    let leg_short = (s as u128)
+        .checked_add(b_flip as u128)
+        .ok_or_else(|| perp_err("math: flip-short leg overflow"))?;
+    let leg_long = (b as u128)
+        .checked_add(s_flip as u128)
+        .ok_or_else(|| perp_err("math: flip-long leg overflow"))?;
+    let c_notional = u64::try_from(leg_short.max(leg_long))
+        .map_err(|_| perp_err("math: flip-aware reservation notional exceeds u64"))?;
+    Ok((b, s, c_notional))
+}
+
 #[cfg(test)]
 mod reservation_notional_tests {
     use super::*;
@@ -768,6 +966,40 @@ mod reservation_notional_tests {
                 calc_sell_side_reserved_notional(&sells, bd, pd, pos_after_buys).unwrap()
             );
             assert_eq!(ts, total_sell);
+        }
+    }
+
+    /// #A Step 1 GATE: the incremental `calc_reservation_notionals_from_totals` must be
+    /// BYTE-IDENTICAL to the fold `calc_reservation_notionals` over random two-sided books +
+    /// positions (so switching the call sites to it leaves the commitment/golden unchanged).
+    /// Totals are computed via `sum_side_totals` exactly as production will maintain them.
+    #[test]
+    fn from_totals_matches_fold() {
+        let mut s: u64 = 0x243f6a8885a308d3;
+        for &(bd, pd) in &[(0u32, 0u32), (4, 2), (8, 9), (3, 2)] {
+            for _ in 0..5000 {
+                let nb = (next(&mut s) % 8) as usize;
+                let ns = (next(&mut s) % 8) as usize;
+                let mut buys: Vec<OrderEntry> = (0..nb)
+                    .map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1))
+                    .collect();
+                buys.sort_by(|a, b| b.price.cmp(&a.price)); // DESC
+                let mut sells: Vec<OrderEntry> = (0..ns)
+                    .map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1))
+                    .collect();
+                sells.sort_by(|a, b| a.price.cmp(&b.price)); // ASC
+                let p = (next(&mut s) % 800) as i64 - 400;
+
+                let (tbq, tbn) = sum_side_totals(buys.iter().copied(), bd, pd).unwrap();
+                let (tsq, tsn) = sum_side_totals(sells.iter().copied(), bd, pd).unwrap();
+
+                let fold = calc_reservation_notionals(&buys, &sells, bd, pd, p).unwrap();
+                let incr = calc_reservation_notionals_from_totals(
+                    &buys, &sells, tbq, tbn, tsq, tsn, bd, pd, p,
+                )
+                .unwrap();
+                assert_eq!(fold, incr, "bd={bd} pd={pd} p={p} buys={buys:?} sells={sells:?}");
+            }
         }
     }
 

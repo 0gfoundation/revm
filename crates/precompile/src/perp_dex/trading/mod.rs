@@ -1381,6 +1381,45 @@ pub(super) fn match_order<CTX: ContextTr>(
 /// The margin model uses `max(buy_reserved, sell_reserved)` so only the dominant side
 /// actually locks capital.  Adding an order on the weaker side only increases the wallet
 /// deduction when it surpasses the other side's reservation.
+/// #A oracle (debug builds only): assert the maintained per-side aggregates on `pos` equal a fresh
+/// recompute from the actual order lists. A divergence means a mutation site failed to keep the
+/// totals in sync — caught loudly in tests / the correctness gate, compiled out in release.
+#[inline]
+fn debug_assert_totals(
+    buy: &[OrderEntry],
+    sell: &[OrderEntry],
+    pos: &crate::perp_dex::types::PerpPosition,
+    base_decimals: u32,
+    price_decimals: u32,
+) {
+    #[cfg(debug_assertions)]
+    {
+        let (bq, bn) =
+            crate::perp_dex::math::sum_side_totals(buy.iter().copied(), base_decimals, price_decimals)
+                .expect("sum buy totals");
+        let (sq, sn) = crate::perp_dex::math::sum_side_totals(
+            sell.iter().copied(),
+            base_decimals,
+            price_decimals,
+        )
+        .expect("sum sell totals");
+        debug_assert_eq!(
+            (bq, bn, sq, sn),
+            (
+                pos.total_buy_qty,
+                pos.total_buy_notional,
+                pos.total_sell_qty,
+                pos.total_sell_notional
+            ),
+            "#A maintained reservation totals diverged from the order lists"
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (buy, sell, pos, base_decimals, price_decimals);
+    }
+}
+
 fn rest_in_book<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
@@ -1432,14 +1471,30 @@ fn rest_in_book<CTX: ContextTr>(
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
             let idx = buy_slice.partition_point(|e| e.price > price);
+            debug_assert_totals(buy_slice, sell_entries.as_slice(), &pos, bd, pd);
+            // #A: reconstruct the reservation from the maintained per-side aggregates + this order's
+            // hypothetical contribution (no O(n) fold). Byte-identical to the fold above.
+            let entry_notional = crate::perp_dex::math::calc_value(price, qty, bd, pd)?;
+            let new_tbq = pos
+                .total_buy_qty
+                .checked_add(qty)
+                .ok_or_else(|| perp_err("placeOrder: total buy qty overflow"))?;
+            let new_tbn = pos
+                .total_buy_notional
+                .checked_add(entry_notional)
+                .ok_or_else(|| perp_err("placeOrder: total buy notional overflow"))?;
             let (new_buy_side_notional, sell_notional, c_notional) =
-                crate::perp_dex::math::calc_reservation_notionals_it(
+                crate::perp_dex::math::calc_reservation_notionals_from_totals_it(
                     buy_slice[..idx]
                         .iter()
                         .copied()
                         .chain(std::iter::once(new_entry))
                         .chain(buy_slice[idx..].iter().copied()),
                     sell_entries.iter().copied(),
+                    new_tbq,
+                    new_tbn,
+                    pos.total_sell_qty,
+                    pos.total_sell_notional,
                     bd,
                     pd,
                     pos_amount,
@@ -1476,6 +1531,9 @@ fn rest_in_book<CTX: ContextTr>(
                 .fee_reserved
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
+            // #A: commit the maintained buy aggregates (op accepted).
+            pos.total_buy_qty = new_tbq;
+            pos.total_buy_notional = new_tbn;
 
             // ── APPLY (all rejects passed) ── NOW do the real insert: in-place on a warm list
             // (zero clone), or one materialize-clone on a cold first-touch (unavoidable — it IS
@@ -1511,14 +1569,29 @@ fn rest_in_book<CTX: ContextTr>(
             let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
             let idx = sell_slice.partition_point(|e| e.price < price);
+            debug_assert_totals(buy_entries.as_slice(), sell_slice, &pos, bd, pd);
+            // #A: reconstruct from maintained aggregates + this order's hypothetical contribution.
+            let entry_notional = crate::perp_dex::math::calc_value(price, qty, bd, pd)?;
+            let new_tsq = pos
+                .total_sell_qty
+                .checked_add(qty)
+                .ok_or_else(|| perp_err("placeOrder: total sell qty overflow"))?;
+            let new_tsn = pos
+                .total_sell_notional
+                .checked_add(entry_notional)
+                .ok_or_else(|| perp_err("placeOrder: total sell notional overflow"))?;
             let (buy_notional, new_sell_side_notional, c_notional) =
-                crate::perp_dex::math::calc_reservation_notionals_it(
+                crate::perp_dex::math::calc_reservation_notionals_from_totals_it(
                     buy_entries.iter().copied(),
                     sell_slice[..idx]
                         .iter()
                         .copied()
                         .chain(std::iter::once(new_entry))
                         .chain(sell_slice[idx..].iter().copied()),
+                    pos.total_buy_qty,
+                    pos.total_buy_notional,
+                    new_tsq,
+                    new_tsn,
                     bd,
                     pd,
                     pos_amount,
@@ -1555,6 +1628,9 @@ fn rest_in_book<CTX: ContextTr>(
                 .fee_reserved
                 .checked_add(order_fee_reserved)
                 .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
+            // #A: commit the maintained sell aggregates (op accepted).
+            pos.total_sell_qty = new_tsq;
+            pos.total_sell_notional = new_tsn;
 
             // ── APPLY (all rejects passed) ── real insert: in-place (warm) / one materialize (cold).
             drop(sell_ref);
@@ -1790,35 +1866,11 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     market: &crate::perp_dex::types::Market,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
-    // commit-only #23 CLONE-FREE: read both sides via Arc (zero clone) and compute the POST-cancel
-    // reservation by FOLDING a FILTERED iterator (the cancelled side minus this order_id) — no
-    // owned list clone. order_ids are unique per side, so the filter drops exactly the one entry
-    // remove_order_entry would (byte-identical reservation → golden-neutral). Cancel has no reject,
-    // so this is a pure apply.
-    let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
-    let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
-    let (buy_notional, sell_notional, c_notional) = match side {
-        Side::Buy => crate::perp_dex::math::calc_reservation_notionals_it(
-            buy_ref.iter().copied().filter(|e| &e.order_id != order_id),
-            sell_ref.iter().copied(),
-            market.base_decimals,
-            market.price_decimals,
-            pos.amount,
-        )?,
-        Side::Sell => crate::perp_dex::math::calc_reservation_notionals_it(
-            buy_ref.iter().copied(),
-            sell_ref.iter().copied().filter(|e| &e.order_id != order_id),
-            market.base_decimals,
-            market.price_decimals,
-            pos.amount,
-        )?,
-    };
-    drop(buy_ref);
-    drop(sell_ref);
+    let (bd, pd) = (market.base_decimals, market.price_decimals);
 
-    // Real removal (in-place on a warm list / one materialize on a cold first-touch) — this returns
-    // the cancelled entry (and reproduces remove_order_entry's not-found invariant verbatim), which
-    // apply_release_effect needs for the fee. Only the cancelled side's key is written.
+    // Real removal FIRST (in-place on a warm list / one materialize on a cold first-touch) — returns
+    // the cancelled entry (and reproduces remove_order_entry's not-found invariant verbatim). Only
+    // the cancelled side's key is written. Cancel has no reject, so this is a pure apply.
     let cancelled_entry = match side {
         Side::Buy => storage::mutate_buy_orders(context, user, market_id, |list| {
             remove_order_entry(list, order_id, "buy")
@@ -1827,6 +1879,51 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
             remove_order_entry(list, order_id, "sell")
         })??,
     };
+
+    // #A: subtract the cancelled order's contribution from the maintained per-side aggregates, then
+    // reconstruct the POST-cancel flip-aware reservation from them (byte-identical to the filtered
+    // fold this replaced) — no O(n) fold over the whole list.
+    let entry_notional =
+        crate::perp_dex::math::calc_value(cancelled_entry.price, cancelled_entry.amount, bd, pd)?;
+    match side {
+        Side::Buy => {
+            pos.total_buy_qty = pos
+                .total_buy_qty
+                .checked_sub(cancelled_entry.amount)
+                .ok_or_else(|| perp_invariant_err("cancel: total buy qty underflow"))?;
+            pos.total_buy_notional = pos
+                .total_buy_notional
+                .checked_sub(entry_notional)
+                .ok_or_else(|| perp_invariant_err("cancel: total buy notional underflow"))?;
+        }
+        Side::Sell => {
+            pos.total_sell_qty = pos
+                .total_sell_qty
+                .checked_sub(cancelled_entry.amount)
+                .ok_or_else(|| perp_invariant_err("cancel: total sell qty underflow"))?;
+            pos.total_sell_notional = pos
+                .total_sell_notional
+                .checked_sub(entry_notional)
+                .ok_or_else(|| perp_invariant_err("cancel: total sell notional underflow"))?;
+        }
+    }
+    let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
+    let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
+    debug_assert_totals(&buy_ref, &sell_ref, &pos, bd, pd);
+    let (buy_notional, sell_notional, c_notional) =
+        crate::perp_dex::math::calc_reservation_notionals_from_totals(
+            buy_ref.as_slice(),
+            sell_ref.as_slice(),
+            pos.total_buy_qty,
+            pos.total_buy_notional,
+            pos.total_sell_qty,
+            pos.total_sell_notional,
+            bd,
+            pd,
+            pos.amount,
+        )?;
+    drop(buy_ref);
+    drop(sell_ref);
 
     let total_freed = apply_release_effect(
         &mut pos,
