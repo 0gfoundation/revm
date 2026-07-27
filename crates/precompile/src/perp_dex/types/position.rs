@@ -49,6 +49,27 @@ pub struct PerpPosition {
     /// settled lazily on every position-touching op. See the `funding` module.
     #[serde(default, rename = "fi")]
     pub last_funding_index: i128,
+    // ── Incremental-reservation aggregates (catalog #A) ──────────────────────
+    // Maintained mirrors of the resting-order lists, so the flip-aware reservation is
+    // reconstructed via `math::calc_reservation_notionals_from_totals` (O(cover-prefix),
+    // O(1) when flat/one-sided) instead of an O(n) fold over the whole list on every
+    // place/cancel. `*_notional` is the SUM OF PER-ORDER `calc_value(price, amount)` (each
+    // floored exactly as the fold produces it) → maintainable ± one term with zero
+    // floor-composition error. Kept in sync at every order-list mutation (place/cancel
+    // incrementally; fills/liquidation by recompute-from-list). Derivable from the lists via
+    // `math::sum_side_totals`, so a genesis/default 0 is correct only for an empty book.
+    /// Σ resting BUY order amounts (base units).
+    #[serde(default, rename = "tbq")]
+    pub total_buy_qty: u64,
+    /// Σ `calc_value(price, amount)` over resting BUY orders (quote units).
+    #[serde(default, rename = "tbn")]
+    pub total_buy_notional: u64,
+    /// Σ resting SELL order amounts (base units).
+    #[serde(default, rename = "tsq")]
+    pub total_sell_qty: u64,
+    /// Σ `calc_value(price, amount)` over resting SELL orders (quote units).
+    #[serde(default, rename = "tsn")]
+    pub total_sell_notional: u64,
 }
 
 impl PerpPosition {
@@ -105,6 +126,10 @@ impl Default for PerpPosition {
             fee_reserved: 0,
             leverage: 1,
             last_funding_index: 0,
+            total_buy_qty: 0,
+            total_buy_notional: 0,
+            total_sell_qty: 0,
+            total_sell_notional: 0,
         }
     }
 }

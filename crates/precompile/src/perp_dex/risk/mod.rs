@@ -1116,6 +1116,11 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
     }
     pos.set_reservations(0, 0, 0, pos.leverage);
     pos.fee_reserved = 0;
+    // #A: both order lists were cleared → the maintained reservation aggregates are now 0.
+    pos.total_buy_qty = 0;
+    pos.total_buy_notional = 0;
+    pos.total_sell_qty = 0;
+    pos.total_sell_notional = 0;
     storage::save_position(context, user, market_id, &pos)?;
 
     Ok(())

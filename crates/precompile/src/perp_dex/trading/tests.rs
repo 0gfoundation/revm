@@ -3202,8 +3202,12 @@ mod golden {
     /// RE-PIN (event-authored account balances + `BLOCK_COMMITMENT_VERSION` 10→11): total perp
     /// collateral was appended to the account blob and is now pinned alongside the exact available
     /// balance. Prior value 0x25389cb16beb55f0800734570a0ac4d48f9f6309452932b7204fa682dd397d45.
+    /// RE-PIN (#A incremental-reservation aggregates + `BLOCK_COMMITMENT_VERSION` 11→12): the
+    /// `tbq/tbn/tsq/tsn` maintained totals were appended to the position blob (behavior-identical —
+    /// the business snapshot below is unchanged; only the persisted layout + commitment differ).
+    /// Prior value 0x9989c4d3675808defbb3baba3f828cb43151b6ffb81f0a902a2ef68286717648.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x9989c4d3675808defbb3baba3f828cb43151b6ffb81f0a902a2ef68286717648");
+        b256!("0x06ee401de8dd26982c5820f9263f67c349cb139ac9fc4d6b4fbfbb73a0e57a0e");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

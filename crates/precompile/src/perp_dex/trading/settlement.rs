@@ -827,13 +827,30 @@ impl MatchRegistry {
                 .ok_or_else(|| perp_invariant_err("pending admin fee credit without an admin"))?;
             storage::mutate_account(context, admin, |a| a.credit_perp(self.admin_credit_pending))??;
         }
-        for (user, w) in self.users {
+        // #A: base/price decimals for the reservation-aggregate recompute below (load once).
+        let (bd, pd) = {
+            let m = storage::load_market_ref(context, market_id)?
+                .ok_or_else(|| perp_invariant_err("match flush: unknown market"))?;
+            (m.base_decimals, m.price_decimals)
+        };
+        for (user, mut w) in self.users {
             if w.dirty_buy {
                 storage::save_buy_orders(context, user, market_id, &w.buy_entries)?;
             }
             if w.dirty_sell {
                 storage::save_sell_orders(context, user, market_id, &w.sell_entries)?;
             }
+            // #A: the match may have filled/cancelled maker & taker orders — resync the maintained
+            // reservation aggregates from the authoritative working-copy lists (recompute, not
+            // incremental: the match path is rare and already re-serialises the whole list here).
+            let (tbq, tbn) =
+                crate::perp_dex::math::sum_side_totals(w.buy_entries.iter().copied(), bd, pd)?;
+            let (tsq, tsn) =
+                crate::perp_dex::math::sum_side_totals(w.sell_entries.iter().copied(), bd, pd)?;
+            w.pos.total_buy_qty = tbq;
+            w.pos.total_buy_notional = tbn;
+            w.pos.total_sell_qty = tsq;
+            w.pos.total_sell_notional = tsn;
             storage::save_position(context, user, market_id, &w.pos)?;
             storage::save_account(context, user, w.account)?;
         }

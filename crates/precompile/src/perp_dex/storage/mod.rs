@@ -217,7 +217,10 @@ fn store_blob<CTX: ContextTr>(
 /// level's live-order count INTO its FIFO blob (`LevelBlob`, count(8 BE) prefix) — the per-level
 /// count keys disappear and the level blob framing changes; bumped to 11 when total perp
 /// collateral was appended to the account blob.
-const BLOCK_COMMITMENT_VERSION: u8 = 11;
+// #A: bumped 11→12 for the PerpPosition reservation-aggregate fields (tbq/tbn/tsq/tsn) — a CHAIN
+// change (position blob layout changed → persisted state + commitment differ). Requires a golden
+// re-pin (below) + a coordinated wipe on deploy.
+const BLOCK_COMMITMENT_VERSION: u8 = 12;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -2312,6 +2315,10 @@ mod size_probe_tests {
             fee_reserved: 10_000,
             leverage: 10,
             last_funding_index: 123_456_789_012_345i128,
+            total_buy_qty: 60_000_000,
+            total_buy_notional: 50_000_000,
+            total_sell_qty: 12_000_000,
+            total_sell_notional: 10_000_000,
         };
         let buf = encode(&pos).unwrap();
         println!(
@@ -2544,6 +2551,10 @@ mod encoding_roundtrip_tests {
                 fee_reserved: u64::MAX,
                 leverage: 20,
                 last_funding_index: i128::MIN,
+                total_buy_qty: u64::MAX,
+                total_buy_notional: u64::MAX,
+                total_sell_qty: 0,
+                total_sell_notional: u64::MAX,
             },
         );
         rt(
