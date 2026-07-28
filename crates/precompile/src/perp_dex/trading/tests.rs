@@ -6886,8 +6886,8 @@ mod batch_place {
             p,
             acct.visible_perp_wallet_balance(),
             acct.total_perp_collateral,
-            buy,
-            sell,
+            Vec::from(buy),
+            Vec::from(sell),
         )
     }
 
