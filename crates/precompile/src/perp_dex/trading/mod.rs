@@ -1196,6 +1196,76 @@ fn remove_order_entry(
         .expect("index from position() is in bounds"))
 }
 
+/// #B: index of `order_id` in a PRICE-SORTED list, found via binary-search to the price-run
+/// (O(log n)) then a scan of that small same-price run — instead of an O(n) id scan. The order's
+/// `price` is always known at the call site (the loaded Order / the matched level). `buy_side`
+/// picks the sort direction (buys DESC, sells ASC). Returns None if absent (price not in the list,
+/// or no entry in the price-run carries `order_id`).
+pub(super) fn find_entry_by_price_id(
+    entries: &std::collections::VecDeque<OrderEntry>,
+    order_id: &[u8; 32],
+    price: u64,
+    buy_side: bool,
+) -> Option<usize> {
+    let search = || -> Option<usize> {
+        let probe = if buy_side {
+            entries.binary_search_by(|e| price.cmp(&e.price)) // DESC: monotone Less→Eq→Greater
+        } else {
+            entries.binary_search_by(|e| e.price.cmp(&price)) // ASC
+        };
+        let anchor = probe.ok()?;
+        // Walk to the start of the equal-price run, then scan it for the order_id (run is tiny:
+        // per-price occupancy p50=1 / p90=3).
+        let mut start = anchor;
+        while start > 0 && entries[start - 1].price == price {
+            start -= 1;
+        }
+        let mut k = start;
+        while k < entries.len() && entries[k].price == price {
+            if &entries[k].order_id == order_id {
+                return Some(k);
+            }
+            k += 1;
+        }
+        None
+    };
+    let result = search();
+    // Guard rail: the binary search converts "list happens to be price-sorted" from a perf property
+    // into a CORRECTNESS precondition (the old linear id-scan was order-agnostic). order_ids are
+    // unique per side, so the binary-search index MUST equal the linear-scan index — assert it in
+    // debug builds (zero release cost). This turns any future sortedness regression (buys DESC /
+    // sells ASC broken by some later change) into a loud test failure here instead of a silent
+    // "entry not found" revert at cancel / fill time.
+    debug_assert_eq!(
+        result,
+        entries.iter().position(|e| &e.order_id == order_id),
+        "find_entry_by_price_id disagrees with linear id scan — per-account order list is not \
+         price-sorted (buys DESC / sells ASC invariant broken?)"
+    );
+    result
+}
+
+/// #B: `remove_order_entry` for the hot cancel path — O(log n) via [`find_entry_by_price_id`]
+/// instead of the O(n) id scan. Byte-identical result to `remove_order_entry` (removes the same
+/// unique entry; order_ids are unique per side).
+fn remove_order_entry_by_price(
+    entries: &mut std::collections::VecDeque<OrderEntry>,
+    order_id: &[u8; 32],
+    price: u64,
+    buy_side: bool,
+    side_label: &str,
+) -> Result<OrderEntry, PrecompileError> {
+    let idx = find_entry_by_price_id(entries, order_id, price, buy_side).ok_or_else(|| {
+        perp_invariant_err(format!(
+            "{side_label} entry for order {:?} not found during cancel",
+            order_id
+        ))
+    })?;
+    Ok(entries
+        .remove(idx)
+        .expect("index from find_entry_by_price_id is in bounds"))
+}
+
 fn execute_limit_order<CTX: ContextTr>(
     context: &mut CTX,
     account: Address,
@@ -2458,15 +2528,21 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     let mut pos = storage::load_position(context, user, market_id)?;
     let (bd, pd) = (market.base_decimals, market.price_decimals);
 
+    // #B: the cancelled order's price (O(1) warm load) lets remove_order_entry_by_price binary-search
+    // to it (O(log n)) instead of an O(n) id scan over the account's list.
+    let price = storage::load_order_ref(context, order_id)?
+        .map(|o| o.price)
+        .ok_or_else(|| perp_invariant_err("cancel: order missing for price lookup"))?;
+
     // Real removal FIRST (in-place on a warm list / one materialize on a cold first-touch) — returns
     // the cancelled entry (and reproduces remove_order_entry's not-found invariant verbatim). Only
     // the cancelled side's key is written. Cancel has no reject, so this is a pure apply.
     let cancelled_entry = match side {
         Side::Buy => storage::mutate_buy_orders(context, user, market_id, |list| {
-            remove_order_entry(list, order_id, "buy")
+            remove_order_entry_by_price(list, order_id, price, true, "buy")
         })??,
         Side::Sell => storage::mutate_sell_orders(context, user, market_id, |list| {
-            remove_order_entry(list, order_id, "sell")
+            remove_order_entry_by_price(list, order_id, price, false, "sell")
         })??,
     };
 

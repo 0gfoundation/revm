@@ -1196,7 +1196,17 @@ pub(super) fn settle_maker_fill_core(
         Side::Buy => (&mut *buy_entries, "buy"),
         Side::Sell => (&mut *sell_entries, "sell"),
     };
-    let maker_fee = reduce_order_entry_core(entries, maker_order_id, fill_qty, market, label)?;
+    // #B: fill_price == the resting maker's order price (a match executes at the maker's level), so
+    // it is exactly the sort key reduce_order_entry_core binary-searches on.
+    let maker_fee = reduce_order_entry_core(
+        entries,
+        maker_order_id,
+        fill_price,
+        matches!(maker_side, Side::Buy),
+        fill_qty,
+        market,
+        label,
+    )?;
 
     // Flip-aware reserve recompute (must follow the entry reduce + reflect the new pos.amount).
     let (buy_notional, sell_notional, c_notional) =
@@ -1603,35 +1613,42 @@ pub(super) fn apply_position_fill(
 /// operates on an in-memory entry list only — no storage access — so the match compute phase can
 /// run it on working copies and the storage wrapper above runs it in the journal overlay. Shrinks
 /// the entry by `fill_qty`, removes it at zero, returns the released fee reservation.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn reduce_order_entry_core(
     entries: &mut std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
     order_id: &[u8; 32],
+    price: u64,
+    buy_side: bool,
     fill_qty: u64,
     market: &crate::perp_dex::types::Market,
     side_label: &str,
 ) -> Result<u64, PrecompileError> {
-    match entries.iter_mut().find(|e| &e.order_id == order_id) {
-        Some(e) => {
-            if e.amount < fill_qty {
-                return Err(perp_invariant_err(format!(
-                    "{side_label} entry for order {order_id:?} has insufficient amount during fill update"
-                )));
-            }
-            let old_order_fee =
-                calc_maker_fee_for_order_qty_with_bps(e.price, e.amount, e.maker_fee_bps, market)?;
-            e.amount = e.amount.saturating_sub(fill_qty);
-            let new_order_fee =
-                calc_maker_fee_for_order_qty_with_bps(e.price, e.amount, e.maker_fee_bps, market)?;
-            let fee_released = old_order_fee.saturating_sub(new_order_fee);
-            if e.amount == 0 {
-                entries.retain(|e| &e.order_id != order_id);
-            }
-            Ok(fee_released)
-        }
-        None => Err(perp_invariant_err(format!(
+    // #B: binary-search to the maker's price (known = the matched level) then scan the tiny
+    // same-price run — O(log n) instead of the O(n) id scan; full-fill removal is O(1)-ish
+    // VecDeque::remove instead of the O(n) retain.
+    let idx = super::find_entry_by_price_id(entries, order_id, price, buy_side).ok_or_else(|| {
+        perp_invariant_err(format!(
             "{side_label} entry for order {order_id:?} not found during fill update"
-        ))),
+        ))
+    })?;
+    let (e_price, e_amount, e_fee_bps) =
+        (entries[idx].price, entries[idx].amount, entries[idx].maker_fee_bps);
+    if e_amount < fill_qty {
+        return Err(perp_invariant_err(format!(
+            "{side_label} entry for order {order_id:?} has insufficient amount during fill update"
+        )));
     }
+    let old_order_fee = calc_maker_fee_for_order_qty_with_bps(e_price, e_amount, e_fee_bps, market)?;
+    let new_amount = e_amount.saturating_sub(fill_qty);
+    let new_order_fee =
+        calc_maker_fee_for_order_qty_with_bps(e_price, new_amount, e_fee_bps, market)?;
+    let fee_released = old_order_fee.saturating_sub(new_order_fee);
+    if new_amount == 0 {
+        entries.remove(idx);
+    } else {
+        entries[idx].amount = new_amount;
+    }
+    Ok(fee_released)
 }
 
 /// Routes position **bad debt** — a realized loss beyond the position's own margin —
