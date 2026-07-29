@@ -2606,7 +2606,7 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     )?;
     storage::save_position(context, user, market_id, &pos)?;
     // In-place wallet credit (no UserAccount/String load+save clone pair).
-    storage::mutate_account(context, user, |a| a.credit_perp(total_freed))??;
+    storage::mutate_account_balance(context, user, |a| a.credit_perp(total_freed))??;
     Ok(())
 }
 

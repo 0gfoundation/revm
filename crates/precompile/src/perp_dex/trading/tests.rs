@@ -763,24 +763,34 @@ fn matched_call_emits_a_balance_event_at_each_balance_moving_write() {
             AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
         })
         .collect::<Vec<_>>();
-    // One event per balance-MOVING write, in WRITE order — not one coalesced after-image per user
-    // in address order (that call-scoped tracker is gone). Here: ADMIN's fee credit is written
-    // during settlement, before the taker's own account is saved, so ADMIN precedes ALICE.
+    // One event per emitting WRITE, in write order — not one coalesced after-image per user in
+    // address order (that call-scoped tracker is gone). There is no change detection: a site emits
+    // because it is an account-write site that can move money, so the same user can appear more than
+    // once and a write that happened not to move its wallet still reports. That redundancy is the
+    // deliberate trade: a duplicate event is harmless, a MISSED one would not be.
     //
-    // BOB (the maker) appears at all only if the fill moved his wallet; it does not — his margin and
-    // maker fee were debited into `margin_reserved`/`fee_reserved` at placement, so the fill only
-    // shuffles value between position fields. His fee is reported by `Trade`/`PositionChanged`.
+    // Here: ADMIN's fee credit lands first, then the settlement flush saves each touched account —
+    // BOB (the maker, whose wallet did not actually move: his margin and fee were debited into
+    // `margin_reserved`/`fee_reserved` back at placement) and the taker.
     assert_eq!(
         events.iter().map(|e| e.user).collect::<Vec<_>>(),
-        vec![ADMIN, ALICE]
+        vec![ADMIN, BOB, ALICE, ALICE]
     );
-    // Every event carries the account's values AS OF that write. The last event for a user is
-    // therefore its final state; assert that for both (each appears once here).
+    // Every event carries that account's values AS OF its write, so the LAST event for a user is its
+    // final state. Each user's final event is checked against the stored account below.
+    let mut last: std::collections::BTreeMap<Address, _> = std::collections::BTreeMap::new();
     for event in events {
-        let acct = storage::load_account(&mut ctx, event.user).unwrap();
+        last.insert(event.user, event);
+    }
+    for (user, event) in last {
+        let acct = storage::load_account(&mut ctx, user).unwrap();
         let usdc: U256 = acct.usdc_balance.clone().into();
-        assert_eq!(event.usdcBalance, usdc);
-        assert_eq!(event.availablePerpBalance, acct.visible_perp_wallet_balance());
+        assert_eq!(event.usdcBalance, usdc, "final event for {user:?}");
+        assert_eq!(
+            event.availablePerpBalance,
+            acct.visible_perp_wallet_balance(),
+            "final event for {user:?}"
+        );
     }
 }
 

@@ -435,10 +435,11 @@ pub fn load_account_ref<CTX: ContextTr>(
 
 /// Emits `AccountBalanceChanged` for `user` right here, at the write site.
 ///
-/// One event per account write that MOVES a balance — no de-duplication, no coalescing, and no
-/// call-scoped state. A write that leaves both `usdc_balance` and the visible wallet untouched (a
-/// fee-rate update, the per-placement nonce bump) emits nothing, since reporting a *balance* change
-/// there would be pure noise.
+/// One event per balance-moving write, emitted by the write site itself — no de-duplication, no
+/// coalescing, no call-scoped state, and no change DETECTION: the caller picks the emitting entry
+/// point ([`save_account`], [`mutate_account_balance`]) precisely because it knows it moved money.
+/// Writes that cannot move a balance (the per-placement nonce bump, fee-rate updates) go through the
+/// silent [`mutate_account`] and emit nothing.
 /// It replaces the former call-scoped after-image tracker (a `BTreeMap` baseline per touched
 /// account, drained and re-read at the end of the top-level call to emit one coalesced event per
 /// user). That machinery cost, per account write, a pre-write account read plus two
@@ -475,15 +476,7 @@ pub fn save_account<CTX: ContextTr>(
     user: Address,
     account: UserAccount,
 ) -> Result<(), PrecompileError> {
-    let old = load_account_ref(context, user)?;
-    // Zero-alloc change check: both values are live here, so the decimal usdc string compares as
-    // `&str` (no clone, no U256 parse) and the wallet as `i64`.
-    let changed = old.usdc_balance.0 != account.usdc_balance.0
-        || old.visible_perp_wallet_balance() != account.visible_perp_wallet_balance();
-    drop(old);
-    if changed {
-        emit_account_balance_changed(context, user, &account);
-    }
+    emit_account_balance_changed(context, user, &account);
     typed_store_mut(context).set_account(user, account);
     Ok(())
 }
@@ -530,27 +523,41 @@ pub fn mutate_account<CTX: ContextTr, R>(
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,
 ) -> Result<R, PrecompileError> {
-    // Fast path: resident in the typed store → in-place &mut (CoW lift on first write). The
-    // pre-image is snapshotted from the SAME borrow (no extra read, and no retained Arc — holding
-    // one would force `Arc::make_mut` to deep-copy).
-    let (r, changed, after) = if let Some(a) = typed_store_mut(context).account_mut(user) {
-        let before = (a.usdc_balance.0.clone(), a.perp_wallet_balance);
-        let r = f(a);
-        let changed = before.0 != a.usdc_balance.0 || before.1 != a.perp_wallet_balance;
-        (r, changed, if changed { Some(a.clone()) } else { None })
-    } else {
-        // Deleted/absent fallback: materialize the default, mutate, and store it.
-        let mut a = load_account(context, user)?;
-        let before = (a.usdc_balance.0.clone(), a.perp_wallet_balance);
-        let r = f(&mut a);
-        let changed = before.0 != a.usdc_balance.0 || before.1 != a.perp_wallet_balance;
-        typed_store_mut(context).set_account(user, a.clone());
-        (r, changed, if changed { Some(a) } else { None })
-    };
-    if let Some(after) = after {
-        let _ = changed;
-        emit_account_balance_changed(context, user, &after);
+    // Fast path: resident in the typed store → in-place &mut (CoW lift on first write).
+    if let Some(a) = typed_store_mut(context).account_mut(user) {
+        return Ok(f(a));
     }
+    // Deleted/absent fallback: materialize the default, mutate, and store it.
+    let mut a = load_account(context, user)?;
+    let r = f(&mut a);
+    typed_store_mut(context).set_account(user, a);
+    Ok(r)
+}
+
+/// [`mutate_account`] for mutations that MOVE a balance (`credit_perp` / `debit_perp`): emits
+/// `AccountBalanceChanged` with the post-mutation values.
+///
+/// Split from `mutate_account` (which stays silent) so neither path pays for change DETECTION. The
+/// caller always knows whether it moved money, and emitting unconditionally is the fail-safe
+/// direction — a duplicate event is harmless, a missing one is not. `mutate_account` therefore
+/// serves only the writes that provably cannot move a balance: the per-placement nonce bump and
+/// fee-rate updates. Detecting instead cost those a `usdc_balance` String clone per call for a
+/// comparison that could never fire.
+pub fn mutate_account_balance<CTX: ContextTr, R>(
+    context: &mut CTX,
+    user: Address,
+    f: impl FnOnce(&mut UserAccount) -> R,
+) -> Result<R, PrecompileError> {
+    let (r, after) = if let Some(a) = typed_store_mut(context).account_mut(user) {
+        let r = f(a);
+        (r, a.clone())
+    } else {
+        let mut a = load_account(context, user)?;
+        let r = f(&mut a);
+        typed_store_mut(context).set_account(user, a.clone());
+        (r, a)
+    };
+    emit_account_balance_changed(context, user, &after);
     Ok(r)
 }
 

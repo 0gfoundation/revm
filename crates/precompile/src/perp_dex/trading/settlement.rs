@@ -457,7 +457,7 @@ pub(super) fn finalize_apply<CTX: ContextTr>(
     // Debit the taker wallet in place (no UserAccount/String load+save clone pair). pos is already
     // correct in storage (registry flush); cancels saved their own pos updates and the log fields
     // are untouched by cancellations.
-    storage::mutate_account(context, plan.user, |a| a.debit_perp(plan.total_required))??;
+    storage::mutate_account_balance(context, plan.user, |a| a.debit_perp(plan.total_required))??;
     credit_fee_recipient(context, plan.market_id, plan.fee)?;
 
     context.journal_mut().log(Log {
@@ -825,7 +825,7 @@ impl MatchRegistry {
             let admin = self
                 .fee_admin
                 .ok_or_else(|| perp_invariant_err("pending admin fee credit without an admin"))?;
-            storage::mutate_account(context, admin, |a| a.credit_perp(self.admin_credit_pending))??;
+            storage::mutate_account_balance(context, admin, |a| a.credit_perp(self.admin_credit_pending))??;
         }
         // #A: base/price decimals for the reservation-aggregate recompute below (load once).
         let (bd, pd) = {
@@ -1275,7 +1275,7 @@ fn credit_fee_recipient<CTX: ContextTr>(
     // ── APPLY ── (fee-total then account, same order as before). The credit is an in-place mutate
     // (zero-clone on the warm path); it cannot fail now (validated above).
     storage::add_market_fee_total(context, market_id, amount)?;
-    storage::mutate_account(context, admin, |a| a.credit_perp(amount))?
+    storage::mutate_account_balance(context, admin, |a| a.credit_perp(amount))?
 }
 
 /// Output of [`split_position_fill`]: the closing and opening legs of a maker

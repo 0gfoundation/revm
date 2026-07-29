@@ -922,10 +922,10 @@ fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
                 "setLeverage: insufficient perp wallet for order margin",
             ));
         }
-        storage::mutate_account(context, user, |a| a.debit_perp(delta))??;
+        storage::mutate_account_balance(context, user, |a| a.debit_perp(delta))??;
     } else if old_reserved > new_reserved {
         let delta = old_reserved - new_reserved;
-        storage::mutate_account(context, user, |a| a.credit_perp(delta))??;
+        storage::mutate_account_balance(context, user, |a| a.credit_perp(delta))??;
     }
     Ok(())
 }
@@ -1112,7 +1112,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
         .ok_or_else(|| perp_err("cancelAllOrders: released reserve overflow"))?;
     if released > 0 {
         // In-place credit (no UserAccount/String load+save clone pair).
-        storage::mutate_account(context, user, |a| a.credit_perp(released))??;
+        storage::mutate_account_balance(context, user, |a| a.credit_perp(released))??;
     }
     pos.set_reservations(0, 0, 0, pos.leverage);
     pos.fee_reserved = 0;
