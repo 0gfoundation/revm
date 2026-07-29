@@ -24,13 +24,12 @@
 
 use context::journaled_state::{PerpBlob, PerpDelta, PerpDeltaEntry, PerpStore};
 use primitives::{Address, HashMap, HashSet, B256};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::vec::Vec;
 
 use crate::perp_dex::storage::{encode, keys, pack_level, LevelBlob};
 use crate::perp_dex::types::{
-    Market, MarketHot, Order, OrderEntry, PerpPosition, PublicAccountBalance, UserAccount,
+    Market, MarketHot, Order, OrderEntry, PerpPosition, UserAccount,
 };
 use crate::PrecompileError;
 
@@ -126,24 +125,6 @@ struct BatchWorkingSet {
     write_count: u64,
 }
 
-#[derive(Clone, Debug)]
-struct BalanceTracking {
-    initial: BTreeMap<Address, PublicAccountBalance>,
-}
-
-impl BalanceTracking {
-    fn new() -> Self {
-        Self {
-            initial: BTreeMap::new(),
-        }
-    }
-
-    fn record(&mut self, user: Address, balance: PublicAccountBalance) {
-        // First-write-wins: the initial balance is the value BEFORE this call's first write.
-        self.initial.entry(user).or_insert(balance);
-    }
-}
-
 /// Strongly-typed off-trie store (Stage A). See the module docs.
 ///
 /// Sub-maps hold `Arc<T>`, not owned `T` — this is what keeps every current perf property when the
@@ -182,49 +163,12 @@ pub struct TypedPerpStore {
     /// Whether the CURRENT transaction wrote this store (reset at tx boundaries by the journal) —
     /// the typed-store half of the `discard_tx` corruption guard.
     tx_dirty: bool,
-    /// Initial public balances for accounts touched by the current top-level
-    /// precompile call. `None` keeps direct storage tests and internal helpers
-    /// outside the ABI entry point free of event bookkeeping.
-    balance_tracking: Option<BalanceTracking>,
     /// Batch single-initiator working-set — `Some` only between [`Self::begin_batch`] and
     /// [`Self::flush_batch`] (i.e. for the duration of one batch call). See [`BatchWorkingSet`].
     batch: Option<BatchWorkingSet>,
 }
 
 impl TypedPerpStore {
-    /// Starts top-level balance tracking for the current call. Balance after-image events are free
-    /// (charged at the flat per-selector gas), so there is no event capacity to fund here.
-    pub fn begin_balance_tracking(&mut self) {
-        self.balance_tracking = Some(BalanceTracking::new());
-    }
-
-    /// Records the first public balance for an account touched by the current top-level call.
-    pub fn track_initial_balance(
-        &mut self,
-        user: Address,
-        balance: PublicAccountBalance,
-    ) -> Result<(), PrecompileError> {
-        if let Some(tracking) = self.balance_tracking.as_mut() {
-            tracking.record(user, balance);
-        }
-        Ok(())
-    }
-
-    /// Finishes balance tracking and returns initial balances in deterministic address order.
-    pub fn take_balance_tracking(&mut self) -> Vec<(Address, PublicAccountBalance)> {
-        self.balance_tracking
-            .take()
-            .map(|tracking| tracking.initial)
-            .unwrap_or_default()
-            .into_iter()
-            .collect()
-    }
-
-    /// Clears top-level balance tracking without producing after-images.
-    pub fn discard_balance_tracking(&mut self) {
-        self.balance_tracking = None;
-    }
-
     /// Single write-bookkeeping choke point: dirty-set entry (delta membership) + tripwire
     /// counters. Every state-changing accessor funnels through here — the typed-store analogue of
     /// the overlay's `store_struct`/`store_bytes` bookkeeping.

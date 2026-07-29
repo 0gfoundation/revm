@@ -719,7 +719,7 @@ fn buy_taker_fully_matches_resting_ask() {
 }
 
 #[test]
-fn matched_call_emits_one_final_balance_after_image_per_user_in_address_order() {
+fn matched_call_emits_a_balance_event_at_each_balance_moving_write() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
     storage::save_user_fee_rates(
@@ -763,20 +763,24 @@ fn matched_call_emits_one_final_balance_after_image_per_user_in_address_order() 
             AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
         })
         .collect::<Vec<_>>();
-    // ALICE (taker: wallet debited for margin) and ADMIN (fee credit) — but NOT BOB. The maker's
-    // publicly-visible balances are untouched by the fill: his margin and maker fee were already
-    // debited from the wallet into `margin_reserved`/`fee_reserved` when the order was placed, so
-    // the fill only moves value between position fields. That movement used to be observable via
-    // the `total_perp_collateral` aggregate; with the aggregate gone the maker's fee payment is
-    // reported by the `Trade` / `PositionChanged` events instead.
-    assert_eq!(events.len(), 2);
-    assert_eq!([events[0].user, events[1].user], [ALICE, ADMIN]);
+    // One event per balance-MOVING write, in WRITE order — not one coalesced after-image per user
+    // in address order (that call-scoped tracker is gone). Here: ADMIN's fee credit is written
+    // during settlement, before the taker's own account is saved, so ADMIN precedes ALICE.
+    //
+    // BOB (the maker) appears at all only if the fill moved his wallet; it does not — his margin and
+    // maker fee were debited into `margin_reserved`/`fee_reserved` at placement, so the fill only
+    // shuffles value between position fields. His fee is reported by `Trade`/`PositionChanged`.
+    assert_eq!(
+        events.iter().map(|e| e.user).collect::<Vec<_>>(),
+        vec![ADMIN, ALICE]
+    );
+    // Every event carries the account's values AS OF that write. The last event for a user is
+    // therefore its final state; assert that for both (each appears once here).
     for event in events {
-        let balance = storage::load_account(&mut ctx, event.user)
-            .unwrap()
-            .public_balance();
-        assert_eq!(event.usdcBalance, balance.usdc_balance);
-        assert_eq!(event.availablePerpBalance, balance.available_perp_balance);
+        let acct = storage::load_account(&mut ctx, event.user).unwrap();
+        let usdc: U256 = acct.usdc_balance.clone().into();
+        assert_eq!(event.usdcBalance, usdc);
+        assert_eq!(event.availablePerpBalance, acct.visible_perp_wallet_balance());
     }
 }
 
@@ -1836,8 +1840,8 @@ fn accepted_resting_placement_emits_exactly_one_order_placed() {
     let logs = take_event_names(&mut ctx);
     assert_eq!(
         logs,
-        vec!["OrderPlaced", "OrderRested"],
-        "a resting GTC emits OrderPlaced then OrderRested"
+        vec!["OrderPlaced", "AccountBalanceChanged", "OrderRested"],
+        "a resting GTC emits OrderPlaced, the margin debit's balance change, then OrderRested"
     );
 
     // PostOnly never calls match_order → rest_in_book's apply block is the ONLY flush site.
@@ -1845,8 +1849,8 @@ fn accepted_resting_placement_emits_exactly_one_order_placed() {
     let logs = take_event_names(&mut ctx);
     assert_eq!(
         logs,
-        vec!["OrderPlaced", "OrderRested"],
-        "a resting PostOnly emits OrderPlaced then OrderRested"
+        vec!["OrderPlaced", "AccountBalanceChanged", "OrderRested"],
+        "a resting PostOnly emits OrderPlaced, the margin debit's balance change, then OrderRested"
     );
 }
 
@@ -6424,6 +6428,9 @@ mod batch_place {
             setup(&mut ctx);
             register_key(&mut ctx, ALICE, &sk);
             let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+            // Drain setup's own events: account funding now emits AccountBalanceChanged at the
+            // write site, so only the logs produced by the call below are under test here.
+            let _ = JournalTr::take_logs(ctx.journal_mut());
             let input = signed_calldata(&sk, ALICE, SIGNED_TS, SIGNED_RECV, &signed, Some(&wire));
             let out =
                 run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
@@ -6753,6 +6760,9 @@ mod batch_place {
                 }
             }
             let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+            // Drain setup's own events (funding emits AccountBalanceChanged at the write site) so
+            // only the logs produced by the call below are under test.
+            let _ = JournalTr::take_logs(ctx.journal_mut());
             let out =
                 run_perp_dex_call(&input, 30_000_000, CAROL, U256::ZERO, false, &mut ctx).unwrap();
             assert!(out.reverted, "{name} must fail verification");

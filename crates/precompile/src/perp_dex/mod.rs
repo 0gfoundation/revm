@@ -20,10 +20,9 @@
 
 use std::{collections::HashMap, sync::OnceLock};
 
-use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
 use context::{ContextTr, JournalTr};
-use primitives::{address, Address, Log, U256};
+use primitives::{address, Address, U256};
 
 use crate::{
     perp_dex::{
@@ -33,7 +32,7 @@ use crate::{
             run_set_user_fee_rates, run_transfer_from_perp, run_transfer_to_perp, run_withdraw,
         },
         interface::IPerpDex::{
-            self, addMarketCall, addPositionMarginCall, batchCancelOrdersCall,
+            addMarketCall, addPositionMarginCall, batchCancelOrdersCall,
             batchCancelOrdersSignedCall, batchPlaceOrdersCall, batchPlaceOrdersSignedCall,
             cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
             getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
@@ -221,30 +220,6 @@ fn encode_revert_string(msg: &str) -> primitives::Bytes {
     primitives::Bytes::from(data)
 }
 
-/// Emits one final `AccountBalanceChanged` after-image per account whose public balance changed
-/// during the call, in deterministic address order. These events are FREE — the call is charged
-/// only the flat per-selector gas, exactly like `Trade` / `PositionChanged`.
-fn emit_account_balance_after_images<CTX: ContextTr>(
-    context: &mut CTX,
-) -> Result<(), PrecompileError> {
-    let initial_balances = storage::take_balance_tracking(context);
-    for (user, initial) in initial_balances {
-        let final_balance = storage::load_account_ref(context, user)?.public_balance();
-        if final_balance == initial {
-            continue;
-        }
-        context.journal_mut().log(Log {
-            address: PERP_DEX_ADDRESS,
-            data: IPerpDex::AccountBalanceChanged {
-                user,
-                usdcBalance: final_balance.usdc_balance,
-                availablePerpBalance: final_balance.available_perp_balance,
-            }
-            .to_log_data(),
-        });
-    }
-    Ok(())
-}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -304,7 +279,6 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
     // before dispatch. A call that ends REVERTED must not have written the overlay
     // (validate-then-apply); if it did, undo is gone and the write leaked. Diagnostic only.
     let writes_before = context.journal_mut().perp_write_count();
-    storage::begin_balance_tracking(context);
 
     // Dispatch — note: no `?` here; errors are caught below and converted to
     // clean REVERT output so ethers.js can read `e.reason`.
@@ -408,20 +382,19 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
 
     match result {
         Ok(bytes) => {
-            // Balance after-image events are FREE — the call is charged only `charged_gas`
-            // (the flat per-selector cost, or `BASE_BATCH_GAS + N * unit` for a batch selector).
-            emit_account_balance_after_images(context)?;
+            // `AccountBalanceChanged` is emitted at each account write (see
+            // `storage::emit_account_balance_changed`), so there is nothing to flush here. Those
+            // events are FREE — the call is charged only `charged_gas` (the flat per-selector cost,
+            // or `BASE_BATCH_GAS + N * unit` for a batch selector).
             Ok(PrecompileOutput::new(charged_gas, bytes))
         }
         // Fatal errors propagate as-is (storage / system bugs).
         Err(PrecompileError::Fatal(error)) => {
-            storage::discard_balance_tracking(context);
             Err(PrecompileError::Fatal(error))
         }
         // All other errors become a clean REVERT with an ABI-encoded reason
         // string, so ethers.js exposes `e.reason` to the caller.
         Err(error) => {
-            storage::discard_balance_tracking(context);
             // Tripwire: a reverting call that WROTE the overlay is a residual write-then-error
             // (commit-only #23 — the write leaks with no undo). Record the offending selector +
             // count into a global so the exact path can be surfaced (read via

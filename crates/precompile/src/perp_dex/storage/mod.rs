@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::perp_dex::PERP_DEX_ADDRESS;
 use crate::{
     perp_dex::{
-        errors::{perp_err, perp_fatal_invariant_err},
+        errors::perp_err,
         types::{
             ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, MarketHot, Order,
             OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
@@ -433,16 +433,41 @@ pub fn load_account_ref<CTX: ContextTr>(
         .unwrap_or_else(|| std::sync::Arc::new(UserAccount::default())))
 }
 
-fn track_public_balance_change<CTX: ContextTr>(
-    context: &mut CTX,
-    user: Address,
-    initial: PublicAccountBalance,
-    final_balance: PublicAccountBalance,
-) -> Result<(), PrecompileError> {
-    if initial != final_balance {
-        typed_store_mut(context).track_initial_balance(user, initial)?;
-    }
-    Ok(())
+/// Emits `AccountBalanceChanged` for `user` right here, at the write site.
+///
+/// One event per account write that MOVES a balance — no de-duplication, no coalescing, and no
+/// call-scoped state. A write that leaves both `usdc_balance` and the visible wallet untouched (a
+/// fee-rate update, the per-placement nonce bump) emits nothing, since reporting a *balance* change
+/// there would be pure noise.
+/// It replaces the former call-scoped after-image tracker (a `BTreeMap` baseline per touched
+/// account, drained and re-read at the end of the top-level call to emit one coalesced event per
+/// user). That machinery cost, per account write, a pre-write account read plus two
+/// `PublicAccountBalance` constructions — each cloning the decimal `usdc_balance` String and
+/// parsing it to `U256` — plus a third construction at drain time, to suppress events that a
+/// consumer can just as easily ignore. Emitting directly is one construction, no baseline read, no
+/// map, and no drain.
+///
+/// Consequences (intended): the same account can now produce several events within one call (e.g.
+/// each maker fill it takes part in), an account whose balance nets back to its starting value still
+/// reports the intermediate writes, and events appear interleaved with `Trade`/`PositionChanged` in
+/// write order rather than appended in address order at the end of the call.
+fn emit_account_balance_changed<CTX: ContextTr>(context: &mut CTX, user: Address, account: &UserAccount) {
+    let PublicAccountBalance {
+        usdc_balance,
+        available_perp_balance,
+    } = account.public_balance();
+    context.journal_mut().log(primitives::Log {
+        address: PERP_DEX_ADDRESS,
+        data: {
+            use alloy_primitives::IntoLogData;
+            crate::perp_dex::interface::IPerpDex::AccountBalanceChanged {
+                user,
+                usdcBalance: usdc_balance,
+                availablePerpBalance: available_perp_balance,
+            }
+            .to_log_data()
+        },
+    });
 }
 
 pub fn save_account<CTX: ContextTr>(
@@ -450,9 +475,15 @@ pub fn save_account<CTX: ContextTr>(
     user: Address,
     account: UserAccount,
 ) -> Result<(), PrecompileError> {
-    let initial_public = load_account_ref(context, user)?.public_balance();
-    let new_public = account.public_balance();
-    track_public_balance_change(context, user, initial_public, new_public)?;
+    let old = load_account_ref(context, user)?;
+    // Zero-alloc change check: both values are live here, so the decimal usdc string compares as
+    // `&str` (no clone, no U256 parse) and the wallet as `i64`.
+    let changed = old.usdc_balance.0 != account.usdc_balance.0
+        || old.visible_perp_wallet_balance() != account.visible_perp_wallet_balance();
+    drop(old);
+    if changed {
+        emit_account_balance_changed(context, user, &account);
+    }
     typed_store_mut(context).set_account(user, account);
     Ok(())
 }
@@ -499,42 +530,33 @@ pub fn mutate_account<CTX: ContextTr, R>(
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,
 ) -> Result<R, PrecompileError> {
-    let initial_public = load_account_ref(context, user)?.public_balance();
-
-    // Fast path: resident in the typed store → in-place &mut (CoW lift on first write).
-    let (r, new_public) = if let Some(a) = typed_store_mut(context).account_mut(user) {
+    // Fast path: resident in the typed store → in-place &mut (CoW lift on first write). The
+    // pre-image is snapshotted from the SAME borrow (no extra read, and no retained Arc — holding
+    // one would force `Arc::make_mut` to deep-copy).
+    let (r, changed, after) = if let Some(a) = typed_store_mut(context).account_mut(user) {
+        let before = (a.usdc_balance.0.clone(), a.perp_wallet_balance);
         let r = f(a);
-        let new_public = a.public_balance();
-        (r, new_public)
+        let changed = before.0 != a.usdc_balance.0 || before.1 != a.perp_wallet_balance;
+        (r, changed, if changed { Some(a.clone()) } else { None })
     } else {
         // Deleted/absent fallback: materialize the default, mutate, and store it.
         let mut a = load_account(context, user)?;
+        let before = (a.usdc_balance.0.clone(), a.perp_wallet_balance);
         let r = f(&mut a);
-        let new_public = a.public_balance();
-        typed_store_mut(context).set_account(user, a);
-        (r, new_public)
+        let changed = before.0 != a.usdc_balance.0 || before.1 != a.perp_wallet_balance;
+        typed_store_mut(context).set_account(user, a.clone());
+        (r, changed, if changed { Some(a) } else { None })
     };
-    track_public_balance_change(context, user, initial_public, new_public)?;
+    if let Some(after) = after {
+        let _ = changed;
+        emit_account_balance_changed(context, user, &after);
+    }
     Ok(r)
 }
 
 /// Starts balance tracking for a top-level call. Balance after-image events are free (flat
-/// per-selector gas), so there is no event capacity to reserve.
-pub fn begin_balance_tracking<CTX: ContextTr>(context: &mut CTX) {
-    typed_store_mut(context).begin_balance_tracking();
-}
 
-/// Finishes balance tracking and returns initial balances in deterministic address order.
-pub fn take_balance_tracking<CTX: ContextTr>(
-    context: &mut CTX,
-) -> Vec<(Address, PublicAccountBalance)> {
-    typed_store_mut(context).take_balance_tracking()
-}
 
-/// Clears balance tracking without producing after-images.
-pub fn discard_balance_tracking<CTX: ContextTr>(context: &mut CTX) {
-    typed_store_mut(context).discard_balance_tracking();
-}
 
 /// Attaches the batch single-initiator working-set for `owner` (see
 /// [`crate::perp_dex::typed_store::TypedPerpStore::begin_batch`]). Called by `drive_batch` before
