@@ -979,12 +979,14 @@ fn place_order_core<CTX: ContextTr>(
     // NO record (it fully filled or its IOC/FOK/market remainder expired — never resting); an
     // Open/PartiallyFilled taker rested, so it is saved live (its book entry / level FIFO / live
     // count were already written by `rest_in_book`).
-    if taker_order.status.is_terminal() {
+    let status = taker_order.status;
+    if status.is_terminal() {
         storage::delete_order(context, &order_id)?;
     } else {
-        storage::save_order(context, &order_id, &taker_order)?;
+        // taker_order is owned here — move it in instead of cloning through save_order(&Order).
+        storage::save_order_owned(context, &order_id, taker_order)?;
     }
-    Ok(taker_order.status)
+    Ok(status)
 }
 
 fn validate_place_order<CTX: ContextTr>(
@@ -2086,6 +2088,10 @@ fn rest_in_book<CTX: ContextTr>(
     pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
+    // This path only ever changes the margin / reservation fields, so capture the collateral
+    // allocation NOW and hand its delta to the single account write at the end — that avoids
+    // save_position's re-read + zero-crossing registry work (pos.amount is never written here).
+    let alloc_before = storage::position_collateral_allocation(&pos)?;
     let mut account = storage::load_account(context, user)?;
     // fee rate is a field of the account we already loaded (folded in) — no separate fee-rate read.
     let maker_fee_bps = account.maker_fee_bps;
@@ -2311,8 +2317,15 @@ fn rest_in_book<CTX: ContextTr>(
         }
     }
 
-    storage::save_position(context, user, market_id, &pos)?;
-    storage::save_account(context, user, account)?;
+    // ONE position write (owned → no clone; no re-read; no dead registry hooks) + ONE account write
+    // carrying BOTH the wallet debit and the collateral-allocation delta. This replaces the previous
+    // two independent account writes (adjust_total_perp_collateral inside save_position, then
+    // save_account) — same stored values, same balance event, one fewer read/clone/dirty insert.
+    let alloc_delta = storage::position_collateral_allocation(&pos)?
+        .checked_sub(alloc_before)
+        .ok_or_else(|| perp_err("placeOrder: collateral allocation delta overflow"))?;
+    storage::save_position_reservation_only(context, user, market_id, pos)?;
+    storage::save_account_with_allocation(context, user, account, alloc_delta)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,

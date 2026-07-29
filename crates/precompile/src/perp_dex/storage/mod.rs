@@ -486,6 +486,81 @@ pub fn save_account<CTX: ContextTr>(
     Ok(())
 }
 
+/// [`save_account`] that ALSO folds a position collateral-allocation delta into the same
+/// `total_perp_collateral` write.
+///
+/// A reservation-only position write (order rests / order cancelled) used to cost TWO independent
+/// account writes: `save_position` → `adjust_total_perp_collateral` (its own read + `UserAccount`
+/// clone + `set_account`), then the caller's own `save_account`. Both merely add a delta to the same
+/// scalar, so they collapse into one baseline read + one reconcile + one `set_account`.
+///
+/// Value-identical (`total = old_total + wallet_delta + allocation_delta`; both are additive, so
+/// order does not matter) and event-identical (balance tracking is first-write-wins and we pass the
+/// same pre-write baseline) — hence golden-neutral.
+pub fn save_account_with_allocation<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    mut account: UserAccount,
+    allocation_delta: i128,
+) -> Result<(), PrecompileError> {
+    let old = load_account_ref(context, user)?;
+    let baseline = AccountBalanceBaseline::capture(&old);
+    // reconcile sets total = old_total + wallet_delta; then fold in the position allocation delta.
+    baseline.reconcile(&mut account)?;
+    account.total_perp_collateral = account
+        .total_perp_collateral
+        .checked_add(allocation_delta)
+        .ok_or_else(|| {
+            perp_fatal_invariant_err("account total collateral overflow from position")
+        })?;
+    let new_public = account.public_balance();
+    track_public_balance_change(context, user, baseline.public, new_public)?;
+    typed_store_mut(context).set_account(user, account);
+    Ok(())
+}
+
+/// Position write for paths that change ONLY the margin / reservation fields — an order resting or
+/// a cancelled order releasing margin.
+///
+/// Such a path never writes `pos.amount`, which makes three parts of [`save_position`] provably
+/// dead work here: the old-position re-read, the `amount` zero-crossing position-registry hooks, and
+/// the collateral-allocation re-derivation. The caller already knows its own allocation delta (it
+/// just changed `margin_reserved` / `fee_reserved`) and folds it into its single account write via
+/// [`save_account_with_allocation`]. Takes the position BY VALUE — the caller owns it, so the
+/// `pos.clone()` that `save_position(&PerpPosition)` forces is skipped too.
+///
+/// Debug-asserts that `amount` really is unchanged, so any future caller that violates the
+/// precondition fails loudly instead of silently skipping the registry/collateral maintenance.
+pub fn save_position_reservation_only<CTX: ContextTr>(
+    context: &mut CTX,
+    user: Address,
+    market_id: u64,
+    pos: PerpPosition,
+) -> Result<(), PrecompileError> {
+    #[cfg(debug_assertions)]
+    {
+        let old = load_position_ref(context, user, market_id)?;
+        debug_assert_eq!(
+            old.amount, pos.amount,
+            "save_position_reservation_only on a path that changed pos.amount — the zero-crossing \
+             registry hooks + collateral re-derivation in save_position are NOT dead there"
+        );
+    }
+    typed_store_mut(context).set_position(user, market_id, pos);
+    Ok(())
+}
+
+/// [`save_order`] taking the order BY VALUE — the place path owns its `Order`, so this skips the
+/// clone that `save_order(&Order)` forces.
+pub fn save_order_owned<CTX: ContextTr>(
+    context: &mut CTX,
+    order_id: &[u8; 32],
+    order: Order,
+) -> Result<(), PrecompileError> {
+    typed_store_mut(context).set_order(order_id, order);
+    Ok(())
+}
+
 /// In-place RMW of a user's account blob (mirror of [`mutate_buy_orders`]): fast-path mutates the
 /// deferred `Struct` already in the overlay (zero clone — no `usdc_balance` String copy); slow-path
 /// loads once → mutate → store. Used by the folded fee-rate / nonce setters AND by wallet
@@ -713,7 +788,7 @@ pub fn load_position_ref<CTX: ContextTr>(
         .unwrap_or_else(|| std::sync::Arc::new(PerpPosition::default())))
 }
 
-fn position_collateral_allocation(position: &PerpPosition) -> Result<i128, PrecompileError> {
+pub(crate) fn position_collateral_allocation(position: &PerpPosition) -> Result<i128, PrecompileError> {
     i128::from(position.margin)
         .checked_add(i128::from(position.margin_reserved))
         .and_then(|value| value.checked_add(i128::from(position.fee_reserved)))
