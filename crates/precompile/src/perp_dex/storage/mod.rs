@@ -220,7 +220,7 @@ fn store_blob<CTX: ContextTr>(
 // #A: bumped 11→12 for the PerpPosition reservation-aggregate fields (tbq/tbn/tsq/tsn) — a CHAIN
 // change (position blob layout changed → persisted state + commitment differ). Requires a golden
 // re-pin (below) + a coordinated wipe on deploy.
-const BLOCK_COMMITMENT_VERSION: u8 = 12;
+const BLOCK_COMMITMENT_VERSION: u8 = 13;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -433,34 +433,6 @@ pub fn load_account_ref<CTX: ContextTr>(
         .unwrap_or_else(|| std::sync::Arc::new(UserAccount::default())))
 }
 
-#[derive(Clone, Copy)]
-struct AccountBalanceBaseline {
-    available_wallet: i64,
-    total_collateral: i128,
-    public: PublicAccountBalance,
-}
-
-impl AccountBalanceBaseline {
-    fn capture(account: &UserAccount) -> Self {
-        Self {
-            available_wallet: account.perp_wallet_balance,
-            total_collateral: account.total_perp_collateral,
-            public: account.public_balance(),
-        }
-    }
-
-    fn reconcile(self, account: &mut UserAccount) -> Result<PublicAccountBalance, PrecompileError> {
-        let wallet_delta = i128::from(account.perp_wallet_balance)
-            .checked_sub(i128::from(self.available_wallet))
-            .ok_or_else(|| perp_fatal_invariant_err("account wallet delta overflow"))?;
-        account.total_perp_collateral = self
-            .total_collateral
-            .checked_add(wallet_delta)
-            .ok_or_else(|| perp_fatal_invariant_err("account total collateral overflow"))?;
-        Ok(account.public_balance())
-    }
-}
-
 fn track_public_balance_change<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
@@ -476,61 +448,15 @@ fn track_public_balance_change<CTX: ContextTr>(
 pub fn save_account<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
-    mut account: UserAccount,
+    account: UserAccount,
 ) -> Result<(), PrecompileError> {
-    let old = load_account_ref(context, user)?;
-    let baseline = AccountBalanceBaseline::capture(&old);
-    let new_public = baseline.reconcile(&mut account)?;
-    track_public_balance_change(context, user, baseline.public, new_public)?;
-    typed_store_mut(context).set_account(user, account);
-    Ok(())
-}
-
-/// [`save_account`] that ALSO folds a position collateral-allocation delta into the same
-/// `total_perp_collateral` write.
-///
-/// A reservation-only position write (order rests / order cancelled) used to cost TWO independent
-/// account writes: `save_position` → `adjust_total_perp_collateral` (its own read + `UserAccount`
-/// clone + `set_account`), then the caller's own `save_account`. Both merely add a delta to the same
-/// scalar, so they collapse into one baseline read + one reconcile + one `set_account`.
-///
-/// Value-identical (`total = old_total + wallet_delta + allocation_delta`; both are additive, so
-/// order does not matter) and event-identical (balance tracking is first-write-wins and we pass the
-/// same pre-write baseline) — hence golden-neutral.
-pub fn save_account_with_allocation<CTX: ContextTr>(
-    context: &mut CTX,
-    user: Address,
-    mut account: UserAccount,
-    allocation_delta: i128,
-) -> Result<(), PrecompileError> {
-    let old = load_account_ref(context, user)?;
-    let baseline = AccountBalanceBaseline::capture(&old);
-    // reconcile sets total = old_total + wallet_delta; then fold in the position allocation delta.
-    baseline.reconcile(&mut account)?;
-    account.total_perp_collateral = account
-        .total_perp_collateral
-        .checked_add(allocation_delta)
-        .ok_or_else(|| {
-            perp_fatal_invariant_err("account total collateral overflow from position")
-        })?;
+    let initial_public = load_account_ref(context, user)?.public_balance();
     let new_public = account.public_balance();
-    track_public_balance_change(context, user, baseline.public, new_public)?;
+    track_public_balance_change(context, user, initial_public, new_public)?;
     typed_store_mut(context).set_account(user, account);
     Ok(())
 }
 
-/// Position write for paths that change ONLY the margin / reservation fields — an order resting or
-/// a cancelled order releasing margin.
-///
-/// Such a path never writes `pos.amount`, which makes three parts of [`save_position`] provably
-/// dead work here: the old-position re-read, the `amount` zero-crossing position-registry hooks, and
-/// the collateral-allocation re-derivation. The caller already knows its own allocation delta (it
-/// just changed `margin_reserved` / `fee_reserved`) and folds it into its single account write via
-/// [`save_account_with_allocation`]. Takes the position BY VALUE — the caller owns it, so the
-/// `pos.clone()` that `save_position(&PerpPosition)` forces is skipped too.
-///
-/// Debug-asserts that `amount` really is unchanged, so any future caller that violates the
-/// precondition fails loudly instead of silently skipping the registry/collateral maintenance.
 pub fn save_position_reservation_only<CTX: ContextTr>(
     context: &mut CTX,
     user: Address,
@@ -573,24 +499,22 @@ pub fn mutate_account<CTX: ContextTr, R>(
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,
 ) -> Result<R, PrecompileError> {
-    let old = load_account_ref(context, user)?;
-    let baseline = AccountBalanceBaseline::capture(&old);
-    drop(old);
+    let initial_public = load_account_ref(context, user)?.public_balance();
 
     // Fast path: resident in the typed store → in-place &mut (CoW lift on first write).
     let (r, new_public) = if let Some(a) = typed_store_mut(context).account_mut(user) {
         let r = f(a);
-        let new_public = baseline.reconcile(a)?;
+        let new_public = a.public_balance();
         (r, new_public)
     } else {
         // Deleted/absent fallback: materialize the default, mutate, and store it.
         let mut a = load_account(context, user)?;
         let r = f(&mut a);
-        let new_public = baseline.reconcile(&mut a)?;
+        let new_public = a.public_balance();
         typed_store_mut(context).set_account(user, a);
         (r, new_public)
     };
-    track_public_balance_change(context, user, baseline.public, new_public)?;
+    track_public_balance_change(context, user, initial_public, new_public)?;
     Ok(r)
 }
 
@@ -627,25 +551,6 @@ pub fn flush_batch_ws<CTX: ContextTr>(context: &mut CTX) {
     typed_store_mut(context).flush_batch();
 }
 
-fn adjust_total_perp_collateral<CTX: ContextTr>(
-    context: &mut CTX,
-    user: Address,
-    delta: i128,
-) -> Result<(), PrecompileError> {
-    let old = load_account_ref(context, user)?;
-    let old_public = old.public_balance();
-    let mut account = (*old).clone();
-    account.total_perp_collateral = account
-        .total_perp_collateral
-        .checked_add(delta)
-        .ok_or_else(|| {
-            perp_fatal_invariant_err("account total collateral overflow from position")
-        })?;
-    let new_public = account.public_balance();
-    track_public_balance_change(context, user, old_public, new_public)?;
-    typed_store_mut(context).set_account(user, account);
-    Ok(())
-}
 
 // Fee rates + nonce are folded into UserAccount (per-user, co-read with the account on the hot
 // placement path). Reads go through `load_account_ref` (Arc bump — never clones the usdc_balance
@@ -788,12 +693,6 @@ pub fn load_position_ref<CTX: ContextTr>(
         .unwrap_or_else(|| std::sync::Arc::new(PerpPosition::default())))
 }
 
-pub(crate) fn position_collateral_allocation(position: &PerpPosition) -> Result<i128, PrecompileError> {
-    i128::from(position.margin)
-        .checked_add(i128::from(position.margin_reserved))
-        .and_then(|value| value.checked_add(i128::from(position.fee_reserved)))
-        .ok_or_else(|| perp_fatal_invariant_err("position collateral allocation overflow"))
-}
 
 pub fn save_position<CTX: ContextTr>(
     context: &mut CTX,
@@ -806,19 +705,11 @@ pub fn save_position<CTX: ContextTr>(
     // cannot be missed. The registry is only touched when membership changes
     // (open: 0 -> !=0, close: !=0 -> 0); every other save pays just one
     // typed-sub-map-cheap position read (the position is already resident).
-    let old_position = load_position_ref(context, user, market_id)?;
-    let old_amount = old_position.amount;
-    let allocation_delta = position_collateral_allocation(pos)?
-        .checked_sub(position_collateral_allocation(old_position.as_ref())?)
-        .ok_or_else(|| perp_fatal_invariant_err("position collateral delta overflow"))?;
-
+    let old_amount = load_position_ref(context, user, market_id)?.amount;
     if old_amount == 0 && pos.amount != 0 {
         registry_add(context, market_id, user)?;
     } else if old_amount != 0 && pos.amount == 0 {
         registry_remove(context, market_id, user)?;
-    }
-    if allocation_delta != 0 {
-        adjust_total_perp_collateral(context, user, allocation_delta)?;
     }
     typed_store_mut(context).set_position(user, market_id, pos.clone());
     Ok(())
@@ -2427,7 +2318,6 @@ mod size_probe_tests {
             maker_fee_bps: 2,
             taker_fee_bps: 5,
             nonce: 7,
-            total_perp_collateral: 1_234_567_890,
         };
         let buf = encode(&acct).unwrap();
         println!(

@@ -763,17 +763,19 @@ fn matched_call_emits_one_final_balance_after_image_per_user_in_address_order() 
             AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
         })
         .collect::<Vec<_>>();
-    assert_eq!(events.len(), 3);
-    assert_eq!(
-        [events[0].user, events[1].user, events[2].user],
-        [ALICE, BOB, ADMIN]
-    );
+    // ALICE (taker: wallet debited for margin) and ADMIN (fee credit) — but NOT BOB. The maker's
+    // publicly-visible balances are untouched by the fill: his margin and maker fee were already
+    // debited from the wallet into `margin_reserved`/`fee_reserved` when the order was placed, so
+    // the fill only moves value between position fields. That movement used to be observable via
+    // the `total_perp_collateral` aggregate; with the aggregate gone the maker's fee payment is
+    // reported by the `Trade` / `PositionChanged` events instead.
+    assert_eq!(events.len(), 2);
+    assert_eq!([events[0].user, events[1].user], [ALICE, ADMIN]);
     for event in events {
         let balance = storage::load_account(&mut ctx, event.user)
             .unwrap()
             .public_balance();
         assert_eq!(event.usdcBalance, balance.usdc_balance);
-        assert_eq!(event.perpWalletBalance, balance.total_perp_collateral);
         assert_eq!(event.availablePerpBalance, balance.available_perp_balance);
     }
 }
@@ -3206,8 +3208,13 @@ mod golden {
     /// `tbq/tbn/tsq/tsn` maintained totals were appended to the position blob (behavior-identical —
     /// the business snapshot below is unchanged; only the persisted layout + commitment differ).
     /// Prior value 0x9989c4d3675808defbb3baba3f828cb43151b6ffb81f0a902a2ef68286717648.
+    /// RE-PIN (drop the `total_perp_collateral` aggregate + `BLOCK_COMMITMENT_VERSION` 12→13): the
+    /// derivable "TC" field was REMOVED from the account blob (it was maintained on every hot write
+    /// but read by no protocol rule). Business snapshot below keeps every surviving value; only the
+    /// persisted layout, the getAccount/AccountBalanceChanged arity and the commitment differ.
+    /// Prior value 0x06ee401de8dd26982c5820f9263f67c349cb139ac9fc4d6b4fbfbb73a0e57a0e.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x06ee401de8dd26982c5820f9263f67c349cb139ac9fc4d6b4fbfbb73a0e57a0e");
+        b256!("0x57f0decebb761eab19cdd63aa4bda2613a809f65f41f8ac499af6096fe980142");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -3217,13 +3224,13 @@ mod golden {
         alice_position: (i64, i64, i64),
         bob_position: (i64, i64, i64),
         carol_position: (i64, i64, i64),
-        /// (spot USDC balance, total perp collateral, available perp balance)
-        alice_account: (U256, U256, u64),
-        bob_account: (U256, U256, u64),
-        carol_account: (U256, U256, u64),
+        /// (spot USDC balance, available perp balance)
+        alice_account: (U256, u64),
+        bob_account: (U256, u64),
+        carol_account: (U256, u64),
         bob_erc20: U256,
         /// Trading-fee sink (taker+maker fees credit the admin's perp wallet).
-        admin_perp_wallet: (U256, u64),
+        admin_perp_wallet: u64,
         insurance_fund: u64,
         market_fee_total: u64,
         mark_price: u64,
@@ -3260,32 +3267,20 @@ mod golden {
             //   + 56_500 residual mark-price settle (margin 264_000 + PnL
             //   −207_500) − 5_280 clearance fee. The liquidation close taker fee
             //   is WAIVED (fix B), so there is no −1_200 deduction here.
-            alice_account: (
-                U256::from(500_000_000u64),
-                U256::from(999_162_305u64),
-                999_162_305,
-            ),
+            alice_account: (U256::from(500_000_000u64), 999_162_305),
             // BOB perp = 1e9 + 830_000 short PnL (622_500 on the 3-QTY
             //   liquidation leg + 207_500 on the QTY closed via CAROL) + 400
             //   funding credit − 1_446 maker fees − 400_160 still reserved for
             //   the resting tail bid (400_000 MR + 160 fee)
             //   − 500_000_000 transferFromPerp.
-            bob_account: (
-                U256::from(500_000_000u64),
-                U256::from(500_828_954u64),
-                500_428_794,
-            ),
+            bob_account: (U256::from(500_000_000u64), 500_428_794),
             // CAROL perp = 5_000_000 funded − 800_000 short opening margin.
-            carol_account: (
-                U256::from(5_000_000u64),
-                U256::from(5_000_000u64),
-                4_200_000,
-            ),
+            carol_account: (U256::from(5_000_000u64), 4_200_000),
             // 2e9 seed − 1.5e9 deposit + 0.5e9 withdraw.
             bob_erc20: U256::from(1_000_000_000u64),
             // 100M funding − 50M IF deposit + 1M IF withdraw + 3_461 fees
             //   (liquidation close taker fee waived — fix B).
-            admin_perp_wallet: (U256::from(51_003_461u64), 51_003_461),
+            admin_perp_wallet: 51_003_461,
             // 50M deposit − 1M withdraw + 5_280 clearance fee
             //   (50 bps of ALICE's 1_056_000 pre-liquidation margin).
             insurance_fund: 49_005_280,
@@ -4310,26 +4305,11 @@ mod golden {
             alice_position: (alice_pos.amount, alice_pos.vQuoteBalance, alice_pos.margin),
             bob_position: (bob_pos.amount, bob_pos.vQuoteBalance, bob_pos.margin),
             carol_position: (carol_pos.amount, carol_pos.vQuoteBalance, carol_pos.margin),
-            alice_account: (
-                alice_acct.usdcBalance,
-                alice_acct.perpWalletBalance,
-                alice_acct.availablePerpBalance,
-            ),
-            bob_account: (
-                bob_acct.usdcBalance,
-                bob_acct.perpWalletBalance,
-                bob_acct.availablePerpBalance,
-            ),
-            carol_account: (
-                carol_acct.usdcBalance,
-                carol_acct.perpWalletBalance,
-                carol_acct.availablePerpBalance,
-            ),
+            alice_account: (alice_acct.usdcBalance, alice_acct.availablePerpBalance),
+            bob_account: (bob_acct.usdcBalance, bob_acct.availablePerpBalance),
+            carol_account: (carol_acct.usdcBalance, carol_acct.availablePerpBalance),
             bob_erc20,
-            admin_perp_wallet: (
-                admin_acct.perpWalletBalance,
-                admin_acct.availablePerpBalance,
-            ),
+            admin_perp_wallet: admin_acct.availablePerpBalance,
             insurance_fund,
             market_fee_total,
             mark_price,
@@ -6874,7 +6854,6 @@ mod batch_place {
     ) -> (
         PerpPosition,
         u64,
-        i128,
         Vec<crate::perp_dex::types::OrderEntry>,
         Vec<crate::perp_dex::types::OrderEntry>,
     ) {
@@ -6885,7 +6864,6 @@ mod batch_place {
         (
             p,
             acct.visible_perp_wallet_balance(),
-            acct.total_perp_collateral,
             Vec::from(buy),
             Vec::from(sell),
         )

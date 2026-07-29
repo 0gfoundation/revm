@@ -39,12 +39,11 @@ pub struct UserAccount {
     /// Monotonic per-user nonce used to derive order ids (`keccak(account ‖ nonce)`).
     #[serde(rename = "NO", default)]
     pub nonce: u64,
-
-    /// Total perp collateral allocated to this account: available wallet plus
-    /// position margin, order-margin reservation, and fee reservation.
-    /// Unrealized PnL is deliberately excluded.
-    #[serde(rename = "TC", default)]
-    pub total_perp_collateral: i128,
+    // NOTE: the former "TC" (`total_perp_collateral`) aggregate is GONE. It was
+    // `wallet + Σ_positions(margin + margin_reserved + fee_reserved)` — fully derivable from state
+    // that is already published, used by no protocol rule, yet incrementally maintained on the
+    // hottest write paths (an extra account read + clone + write per order rest/cancel). Consumers
+    // that want it compute it off-chain from `getAccount` + `getPosition`.
 }
 
 impl Default for UserAccount {
@@ -55,7 +54,6 @@ impl Default for UserAccount {
             maker_fee_bps: 0,
             taker_fee_bps: 0,
             nonce: 0,
-            total_perp_collateral: 0,
         }
     }
 }
@@ -65,8 +63,6 @@ impl Default for UserAccount {
 pub struct PublicAccountBalance {
     /// Spot USDC held inside the DEX.
     pub usdc_balance: U256,
-    /// Total perp collateral excluding unrealized PnL.
-    pub total_perp_collateral: U256,
     /// Perp collateral currently available for trading or transfer.
     pub available_perp_balance: u64,
 }
@@ -82,19 +78,10 @@ impl UserAccount {
         }
     }
 
-    /// Total collateral exposed through the ABI. A negative internal value is
-    /// never public and indicates an account awaiting bankruptcy handling.
-    pub fn visible_total_perp_collateral(&self) -> U256 {
-        u128::try_from(self.total_perp_collateral)
-            .map(U256::from)
-            .unwrap_or_default()
-    }
-
     /// Returns the clamped public balance after-image for this account.
     pub fn public_balance(&self) -> PublicAccountBalance {
         PublicAccountBalance {
             usdc_balance: self.usdc_balance.clone().into(),
-            total_perp_collateral: self.visible_total_perp_collateral(),
             available_perp_balance: self.visible_perp_wallet_balance(),
         }
     }

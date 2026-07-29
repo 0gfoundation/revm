@@ -1019,7 +1019,7 @@ impl TypedPerpStore {
     /// `Slot` is moved into its main sub-map and its key `mark`ed (→ block delta, → write witness).
     /// Loaded-but-unwritten entities are dropped (a fill is a cache event; flushing it would inject a
     /// spurious delta key = commitment fork). This is a RAW move-and-mark, NOT a `save_*` replay: the
-    /// per-item co-writes (position registry, `total_perp_collateral`, other users' balances) already
+    /// per-item co-writes (position registry, other users' balances) already
     /// hit the main store during the items — replaying them would double-count. Deterministic order
     /// (account, then positions/buy/sell by ascending market_id) though the commitment re-sorts by
     /// key regardless. Idempotent: a no-op if no batch is attached.

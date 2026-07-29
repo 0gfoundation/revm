@@ -21,7 +21,7 @@ sol! {
         /// Move USDC from the perp trading wallet back to spot balance.
         function transferFromPerp(uint64 amount) external;
         /// Query a user's full account balances.
-        function getAccount(address user) external view returns (uint256 usdcBalance, uint256 perpWalletBalance, uint64 availablePerpBalance);
+        function getAccount(address user) external view returns (uint256 usdcBalance, uint64 availablePerpBalance);
         /// Set per-user trading fee rates in basis points. Only callable by admin.
         function setUserFeeRates(address user, uint64 makerFeeBps, uint64 takerFeeBps) external;
         /// Query per-user trading fee rates in basis points. Unset users default to zero.
@@ -356,7 +356,7 @@ sol! {
         event TransferToPerp(address indexed user, uint64 amount);
         event TransferFromPerp(address indexed user, uint64 amount);
         /// Final public balance after-image, emitted once per changed account per successful call.
-        event AccountBalanceChanged(address indexed user, uint256 usdcBalance, uint256 perpWalletBalance, uint64 availablePerpBalance);
+        event AccountBalanceChanged(address indexed user, uint256 usdcBalance, uint64 availablePerpBalance);
         event UserFeeRatesUpdated(address indexed user, uint64 makerFeeBps, uint64 takerFeeBps);
 
         // Emitted once per accepted placeOrder / placeOrderSigned call, before any matching.

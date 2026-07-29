@@ -238,7 +238,6 @@ fn emit_account_balance_after_images<CTX: ContextTr>(
             data: IPerpDex::AccountBalanceChanged {
                 user,
                 usdcBalance: final_balance.usdc_balance,
-                perpWalletBalance: final_balance.total_perp_collateral,
                 availablePerpBalance: final_balance.available_perp_balance,
             }
             .to_log_data(),

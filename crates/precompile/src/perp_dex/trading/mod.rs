@@ -2088,10 +2088,6 @@ fn rest_in_book<CTX: ContextTr>(
     pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PrecompileError> {
     let mut pos = storage::load_position(context, user, market_id)?;
-    // This path only ever changes the margin / reservation fields, so capture the collateral
-    // allocation NOW and hand its delta to the single account write at the end — that avoids
-    // save_position's re-read + zero-crossing registry work (pos.amount is never written here).
-    let alloc_before = storage::position_collateral_allocation(&pos)?;
     let mut account = storage::load_account(context, user)?;
     // fee rate is a field of the account we already loaded (folded in) — no separate fee-rate read.
     let maker_fee_bps = account.maker_fee_bps;
@@ -2317,15 +2313,11 @@ fn rest_in_book<CTX: ContextTr>(
         }
     }
 
-    // ONE position write (owned → no clone; no re-read; no dead registry hooks) + ONE account write
-    // carrying BOTH the wallet debit and the collateral-allocation delta. This replaces the previous
-    // two independent account writes (adjust_total_perp_collateral inside save_position, then
-    // save_account) — same stored values, same balance event, one fewer read/clone/dirty insert.
-    let alloc_delta = storage::position_collateral_allocation(&pos)?
-        .checked_sub(alloc_before)
-        .ok_or_else(|| perp_err("placeOrder: collateral allocation delta overflow"))?;
+    // Resting only touches the margin/reservation fields, so this skips save_position's
+    // old-position re-read + `amount` zero-crossing registry hooks (dead work here) and moves the
+    // position in by value instead of cloning it.
     storage::save_position_reservation_only(context, user, market_id, pos)?;
-    storage::save_account_with_allocation(context, user, account, alloc_delta)?;
+    storage::save_account(context, user, account)?;
 
     context.journal_mut().log(Log {
         address: PERP_DEX_ADDRESS,
