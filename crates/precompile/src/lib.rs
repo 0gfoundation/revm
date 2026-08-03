@@ -69,9 +69,7 @@ use primitives::{
 };
 use std::vec::Vec;
 
-use crate::{
-    da_signers::DA_SIGNERS_ADDRESS, perp_dex::PERP_DEX_ADDRESS, wa0gi_base::WA0GI_BASE_ADDRESS,
-};
+use crate::{perp_dex::PERP_DEX_ADDRESS, wa0gi_base::WA0GI_BASE_ADDRESS};
 
 /// Calculate the linear cost of a precompile.
 pub fn calc_linear_cost_u32(len: usize, base: u64, word: u64) -> u64 {
@@ -130,7 +128,9 @@ impl Precompiles {
                 hash::RIPEMD160,
                 identity::FUN,
             ]);
-            precompiles.extend_stateful([DA_SIGNERS_ADDRESS, WA0GI_BASE_ADDRESS, PERP_DEX_ADDRESS]);
+            // DASigners (0x1000) is intentionally NOT registered: the DA precompile is
+            // disabled on this branch, so calls to 0x1000 behave as calls to an empty account.
+            precompiles.extend_stateful([WA0GI_BASE_ADDRESS, PERP_DEX_ADDRESS]);
             precompiles
         })
     }
@@ -556,6 +556,31 @@ mod test {
     fn test_intersection_precompile_sets() {
         let intersection = Precompiles::homestead().intersection(Precompiles::byzantium());
 
-        assert_eq!(intersection.len(), 7)
+        // 4 homestead stateless + 2 stateful (WA0GIBase, PerpDEX); DASigners is disabled
+        assert_eq!(intersection.len(), 6)
+    }
+
+    #[test]
+    fn test_da_signers_precompile_disabled() {
+        use crate::da_signers::DA_SIGNERS_ADDRESS;
+
+        for spec in [
+            PrecompileSpecId::HOMESTEAD,
+            PrecompileSpecId::BYZANTIUM,
+            PrecompileSpecId::ISTANBUL,
+            PrecompileSpecId::BERLIN,
+            PrecompileSpecId::CANCUN,
+            PrecompileSpecId::PRAGUE,
+            PrecompileSpecId::OSAKA,
+        ] {
+            let precompiles = Precompiles::new(spec);
+            assert!(!precompiles.is_stateful(&DA_SIGNERS_ADDRESS));
+            assert!(!precompiles.contains(&DA_SIGNERS_ADDRESS));
+        }
+
+        // The other stateful precompiles must stay registered.
+        let latest = Precompiles::new(PrecompileSpecId::OSAKA);
+        assert!(latest.is_stateful(&WA0GI_BASE_ADDRESS));
+        assert!(latest.is_stateful(&PERP_DEX_ADDRESS));
     }
 }
