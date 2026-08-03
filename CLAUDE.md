@@ -12,7 +12,13 @@ The project is used by major Ethereum infrastructure including Reth, Foundry, Ha
 
 ## 0G PerpDEX Development Posture (READ FIRST)
 
-This is the **0gfoundation fork** of revm. It hosts the **PerpDEX precompile** (`crates/precompile/src/perp_dex/`, address `0x…1003`) and its **off-trie PerpState + chained block commitment**, consumed by the 0G chain (0g-reth).
+This is the **0gfoundation fork** of revm. It hosts the **PerpDEX engine** (address `0x…1003`) and its **off-trie PerpState + chained block commitment**, consumed by the 0G chain (0g-reth). Since the `perp-engine-extraction` branch the perp code is split into three layers:
+
+- `crates/perp-core` — state core (types, math, keys, msgpack codec, `TypedPerpStore`, `compute_block_commitment`); error type `PerpError`. No EVM deps beyond `revm-context-interface` (the journal seam types stay there).
+- `crates/perp-engine` — the matching engine (trading/settlement/liquidation, risk, account, funding, batch, sol! ABI, storage access layer, and the call shell: selector table/gas/depth gate/revert encoding). Generic over `host::PerpHost`; a **blanket impl makes every `CTX: ContextTr` a host**, and `InMemoryHost` runs the engine standalone (perf benches drive it without building the EVM). `end_block()` + `compute_block_commitment` reproduce the block lifecycle.
+- `crates/precompile/src/perp_dex/` — a thin shell: `PrecompileResult` adapter over `perp_engine::run_perp_dex_call`, the block-end commitment anchor (`storage::finalize_block_commitment`, path unchanged for alloy-evm), `From<PerpError> for PrecompileError`, and facade re-exports at all historical `perp_dex::*` paths (so external callers and the bench harness are unaffected).
+
+When touching engine logic, edit `perp-engine`/`perp-core`; the golden commitment test (`commitment_golden_scenario`, now in `perp-engine`) still pins byte-identity.
 
 **The PerpDEX / off-trie-state / commitment layer is PRE-PRODUCTION. There is no mainnet, no users, no historical data, and the chain is wiped and restarted at will.** Therefore, for changes scoped to the PerpDEX precompile, its off-trie state, its serialization, and its block commitment:
 
