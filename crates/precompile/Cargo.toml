@@ -72,20 +72,11 @@ ark-bls12-381 = { workspace = true, features = ["curve"] }
 # p256verify precompile
 p256 = { workspace = true, features = ["ecdsa"] }
 
-# ed25519 signature verification for signed order submission
-ed25519-dalek.workspace = true
-
 # utils
 cfg-if.workspace = true
 arrayref = "0.3.6"
 rmp-serde.workspace = true
 serde.workspace = true
-# BLAKE3 for the PerpDEX off-trie commitment hash (faster than keccak; the slot is an internal
-# anchor so the hash function is a free choice).
-blake3.workspace = true
-# Compact PerpDEX blob encoding: integer-repr enums + msgpack-bin fixed byte arrays.
-serde_repr.workspace = true
-serde_bytes.workspace = true
 
 # alloy
 
@@ -121,9 +112,7 @@ std = [
 	"ark-serialize/std",
 	"ark-std/std",
 	"p256/std",
-	"ed25519-dalek/std",
 	"rug?/std",
-	"blake3/std",
 ]
 hashbrown = ["primitives/hashbrown"]
 # In-memory bench fixtures + the HL-window replay harness (`bench_util`, `hl_window_replay` bin).

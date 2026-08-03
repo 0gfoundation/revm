@@ -6,60 +6,18 @@
 //! # Module layout
 //! ```text
 //! perp_dex/
-//! ├── mod.rs            ← you are here (selector routing, entry point)
-//! ├── interface.rs      ← Solidity ABI (sol! macro)
-//! ├── errors.rs         ← perp_err helper
-//! ├── batch.rs          ← batch-call shell (pre-decode length, gas, statuses, abort-forward)
-//! ├── math.rs           ← pure financial math functions
-//! ├── types/            ← data structures (account, order, position, market)
-//! ├── storage/          ← on-chain storage helpers
-//! ├── account/          ← deposit / withdraw / transfers / getAccount
-//! ├── trading/          ← order placement, cancellation, matching
-//! └── risk/             ← markets, leverage, mark price, positions, liquidation
+//! ├── mod.rs      ← you are here: PrecompileResult adapter over perp_engine::run_perp_dex_call
+//! │                 + facade re-exports at the historical perp_dex::* paths
+//! ├── storage.rs  ← facade over perp_engine::storage + the block-end commitment anchor
+//! ├── errors.rs   ← PrecompileError constructors + From<PerpError>
+//! └── prof.rs     ← bench-util stage profiler
+//! The engine itself lives in the `perp-engine` crate; the state core in `perp-core`.
 //! ```
 
 use context::ContextTr;
 use primitives::{Address, U256};
 
-use perp_engine::{
-    account::{
-        run_deposit, run_get_account, run_get_api_key, run_get_api_keys,
-        run_get_user_fee_rates, run_register_api_key, run_revoke_api_key,
-        run_set_user_fee_rates, run_transfer_from_perp, run_transfer_to_perp, run_withdraw,
-    },
-    interface::IPerpDex::{
-        addMarketCall, addPositionMarginCall, batchCancelOrdersCall,
-            batchCancelOrdersSignedCall, batchPlaceOrdersCall, batchPlaceOrdersSignedCall,
-            cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
-            getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
-            getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
-            getIndexPriceCall, getInsuranceFundCall, getMarkPriceCall, getMarketCall,
-            getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
-            getOracleAddressCall, getOrderCall, getPositionCall, getUserFeeRatesCall,
-            initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
-            removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
-            setMarketManagerAddressCall, setOracleAddressCall, setUserFeeRatesCall,
-            transferAdminCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
-            updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
-        },
-    risk::{
-        run_add_market, run_add_position_margin, run_deposit_insurance_fund, run_get_admin,
-        run_get_average_premium_index, run_get_funding_state, run_get_index_price,
-        run_get_insurance_fund, run_get_mark_price, run_get_market, run_get_market_manager,
-        run_get_oracle_address, run_get_position, run_init_admin, run_liquidate,
-        run_remove_position_margin, run_set_leverage, run_set_leverage_signed,
-        run_set_market_manager, run_set_oracle_address, run_transfer_admin,
-        run_update_index_price, run_update_market, run_withdraw_insurance_fund,
-    },
-    trading::{
-        run_batch_cancel_orders, run_batch_cancel_orders_signed, run_batch_place_orders,
-        run_batch_place_orders_signed, run_cancel_order, run_cancel_order_signed,
-        run_get_book_level, run_get_book_prices, run_get_market_fee_total, run_get_open_orders,
-        run_get_order, run_place_order, run_place_order_signed,
-    },
-};
-
-use crate::{PrecompileError, PrecompileOutput, PrecompileResult};
+use crate::{PrecompileOutput, PrecompileResult};
 
 pub mod errors;
 #[cfg(any(feature = "bench-util", test))]

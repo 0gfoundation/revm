@@ -49,6 +49,10 @@ pub trait PerpHost {
 
     /// Cross-block cold read of an already-decoded blob (skips deserialization when the
     /// committed store holds the decoded `Arc`). `None` → fall back to [`Self::perp_load`].
+    ///
+    /// CONTRACT: a key with any in-block overlay write must return `None` — the committed
+    /// store is stale for that key within this block, and only the byte path
+    /// ([`Self::perp_load`]) sees the overlay value. (The journal impl enforces this.)
     fn perp_load_arc(&mut self, key: B256) -> Result<Option<Arc<PerpBlob>>, PerpError>;
 
     /// Emits an engine event (EVM log at the precompile boundary).
@@ -89,9 +93,9 @@ pub trait PerpHost {
 // ── Blanket host: any revm context ────────────────────────────────────────────
 
 /// Maps a journal/database error into a clean engine reject, mirroring the historical
-/// `convert_db_err` (`PrecompileError::Other`) behavior.
+/// `convert_db_err` behavior (same `Storage Error: …` reason string, `Other` shape).
 fn db_err<E: core::fmt::Debug>(e: E) -> PerpError {
-    perp_err(format!("Database error: {e:?}"))
+    perp_err(format!("Storage Error: {e:?}"))
 }
 
 impl<CTX: ContextTr> PerpHost for CTX {
@@ -252,6 +256,11 @@ impl PerpHost for InMemoryHost {
     }
 
     fn perp_load_arc(&mut self, key: B256) -> Result<Option<Arc<PerpBlob>>, PerpError> {
+        // Overlay precedence (trait contract): an in-block write makes the committed
+        // decoded Arc stale for this key — the byte path serves the overlay value.
+        if self.overlay.contains_key(&key) {
+            return Ok(None);
+        }
         Ok(self.committed.get(&key).and_then(|(_, d)| d.clone()))
     }
 

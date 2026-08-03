@@ -3,7 +3,6 @@
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
 use crate::host::PerpHost;
-use ed25519_dalek::{Signature, VerifyingKey};
 use primitives::{Address, Bytes, FixedBytes, Log};
 
 use crate::{

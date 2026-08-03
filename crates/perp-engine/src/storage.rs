@@ -6,7 +6,7 @@ use crate::host::PerpHost;
 use context_interface::journaled_state::PerpDelta;
 use context_interface::JournalTr;
 use primitives::{Address, B256, U256};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::PERP_DEX_ADDRESS;
 use crate::{
@@ -21,7 +21,7 @@ use crate::{
 
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
-    bid_level_key, bid_prices_key, commitment_slot, erc20_balance_slot, funding_state_key,
+    bid_level_key, bid_prices_key, commitment_slot, funding_state_key,
     index_price_history_key, index_price_state_key, insurance_fund_key, market_fee_total_key,
     market_hot_key, market_key, market_manager_key, oracle_key, order_key, position_key,
     position_registry_key, premium_accumulator_key, price_basis_window_key, seen_bucket_key,
@@ -233,7 +233,7 @@ pub fn load_admin<H: PerpHost>(context: &mut H) -> Result<Address, PerpError> {
     if buf.is_empty() {
         return Ok(Address::ZERO);
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn save_admin<H: PerpHost>(
@@ -532,7 +532,7 @@ pub fn load_market_fee_total<H: PerpHost>(
     if buf.is_empty() {
         return Ok(0);
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn add_market_fee_total<H: PerpHost>(
@@ -557,10 +557,6 @@ pub fn load_erc20_balance<H: PerpHost>(
     token: Address,
     account: Address,
 ) -> Result<U256, PerpError> {
-    let slot = erc20_balance_slot(account);
-    // Ensure the token address is loaded into journal state before sload.
-    // sload panics if the account is absent from the journal.
-    let _ = slot;
     context.external_balance(token, account)
 }
 
@@ -1669,7 +1665,7 @@ pub fn load_api_key_ids<H: PerpHost>(
     if buf.is_empty() {
         return Ok(vec![]);
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 fn save_api_key_ids<H: PerpHost>(
@@ -1688,7 +1684,7 @@ pub fn load_oracle<H: PerpHost>(context: &mut H) -> Result<Address, PerpError> {
     if buf.is_empty() {
         return Ok(Address::ZERO);
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn save_oracle<H: PerpHost>(
@@ -1704,7 +1700,7 @@ pub fn load_market_manager<H: PerpHost>(context: &mut H) -> Result<Address, Perp
     if buf.is_empty() {
         return Ok(Address::ZERO);
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn save_market_manager<H: PerpHost>(
@@ -1725,7 +1721,7 @@ pub fn load_index_price_state<H: PerpHost>(
     if buf.is_empty() {
         return Ok(IndexPriceState::default());
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn save_index_price_state<H: PerpHost>(
@@ -1747,7 +1743,7 @@ pub fn load_index_price_history<H: PerpHost>(
     if buf.is_empty() {
         return Ok(IndexPriceHistory::default());
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn save_index_price_history<H: PerpHost>(
@@ -1767,7 +1763,7 @@ pub fn load_price_basis_window<H: PerpHost>(
     if buf.is_empty() {
         return Ok(PriceBasisWindow::default());
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn save_price_basis_window<H: PerpHost>(
@@ -1807,7 +1803,7 @@ pub fn load_funding_state<H: PerpHost>(
     if buf.is_empty() {
         return Ok(FundingState::default());
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn save_funding_state<H: PerpHost>(
@@ -1826,7 +1822,7 @@ pub fn load_insurance_fund<H: PerpHost>(context: &mut H) -> Result<u64, PerpErro
     if buf.is_empty() {
         return Ok(0);
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn save_insurance_fund<H: PerpHost>(
@@ -1928,7 +1924,7 @@ pub fn load_premium_accumulator<H: PerpHost>(
     if buf.is_empty() {
         return Ok(PremiumIndexAccumulator::default());
     }
-    Ok(decode(&buf)?)
+    decode(&buf)
 }
 
 pub fn save_premium_accumulator<H: PerpHost>(
@@ -2305,7 +2301,7 @@ mod encoding_roundtrip_tests {
 
     fn rt<T>(label: &str, v: T)
     where
-        T: Serialize + for<'de> Deserialize<'de> + PartialEq + core::fmt::Debug,
+        T: serde::Serialize + for<'de> Deserialize<'de> + PartialEq + core::fmt::Debug,
     {
         let buf = encode(&v).unwrap();
         let back: T = decode(&buf).unwrap();

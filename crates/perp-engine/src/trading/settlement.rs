@@ -683,7 +683,7 @@ impl MatchRegistry {
     fn credit_admin(&mut self, admin: Address, amount: u64) -> Result<(), PerpError> {
         self.fee_admin = Some(admin);
         if let Some((_, w)) = self.users.iter_mut().find(|(a, _)| *a == admin) {
-            return Ok(w.account.credit_perp(amount)?);
+            return w.account.credit_perp(amount);
         }
         self.admin_credit_pending = self
             .admin_credit_pending
@@ -1273,7 +1273,7 @@ fn credit_fee_recipient<H: PerpHost>(
     // ── APPLY ── (fee-total then account, same order as before). The credit is an in-place mutate
     // (zero-clone on the warm path); it cannot fail now (validated above).
     storage::add_market_fee_total(context, market_id, amount)?;
-    storage::mutate_account_balance(context, admin, |a| Ok(a.credit_perp(amount)?))?
+    storage::mutate_account_balance(context, admin, |a| a.credit_perp(amount))?
 }
 
 /// Output of [`split_position_fill`]: the closing and opening legs of a maker
