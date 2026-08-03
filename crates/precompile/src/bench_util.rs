@@ -1065,18 +1065,25 @@ fn exec_window_op(
             }
         }
     };
+    // Three-way outcome, aligned with the offchain harness's map-based split PLUS the
+    // engine-level truth: `hit` = map found AND the order was still live (engine Ok);
+    // `stale` = map found but the order already terminated (delete-on-terminal → same
+    // not-found path as miss, kept separate so the map-based rate stays comparable);
+    // `miss` = oid/cloid never accepted → sentinel id → genuine not-found path.
     let cancel = |ctx: &mut CanonCtx,
                   maps: &mut IdMaps,
                   t: &mut HashMap<&'static str, Vec<u64>>,
                   uidx: u64, target: Option<[u8; 32]>,
-                  k_hit: &'static str, k_miss: &'static str|
+                  k_hit: &'static str, k_stale: &'static str, k_miss: &'static str|
      -> bool {
         let _ = maps;
+        let mapped = target.is_some();
         let oid = target.unwrap_or([0x55u8; 32]); // never-seen id → genuine miss path
         let cin = cancel_input(oid);
-        let (dt, hit) = timed_cancel_g(ctx, user_addr(uidx), &cin, via_envelope);
-        t.get_mut(if hit { k_hit } else { k_miss }).unwrap().push(dt);
-        hit
+        let (dt, ok) = timed_cancel_g(ctx, user_addr(uidx), &cin, via_envelope);
+        let k = if ok { k_hit } else if mapped { k_stale } else { k_miss };
+        t.get_mut(k).unwrap().push(dt);
+        ok
     };
     match op {
         WindowOp::Place { uidx, side, praw, qty, ot, tif, oid, cloid } => {
@@ -1088,13 +1095,13 @@ fn exec_window_op(
         WindowOp::Cancel { uidx, oid } => {
             ensure!(*uidx);
             let target = maps.by_oid.get(oid.as_ref()).copied();
-            cancel(ctx, maps, t, *uidx, target, "cancel_hit", "cancel_miss");
+            cancel(ctx, maps, t, *uidx, target, "cancel_hit", "cancel_stale", "cancel_miss");
             1
         }
         WindowOp::CancelCloid { uidx, cloid } => {
             ensure!(*uidx);
             let target = maps.by_cloid.get(&(*uidx, cloid.clone())).copied();
-            cancel(ctx, maps, t, *uidx, target, "cancel_hit", "cancel_miss");
+            cancel(ctx, maps, t, *uidx, target, "cancel_hit", "cancel_stale", "cancel_miss");
             1
         }
         WindowOp::Modify { uidx, side, praw, qty, oid, cloid } => {
@@ -1104,7 +1111,7 @@ fn exec_window_op(
                 .get(oid.as_ref())
                 .copied()
                 .or_else(|| maps.by_cloid.get(&(*uidx, cloid.clone())).copied());
-            cancel(ctx, maps, t, *uidx, target, "mod_cancel_hit", "mod_cancel_miss");
+            cancel(ctx, maps, t, *uidx, target, "mod_cancel_hit", "mod_cancel_stale", "mod_cancel_miss");
             place(ctx, maps, t, *uidx, *side, *praw, *qty, LIMIT, 0 /*GTC*/, oid, cloid,
                   "mod_place_match", "mod_place_rest", "mod_place_reject");
             2
@@ -1112,9 +1119,11 @@ fn exec_window_op(
     }
 }
 
-const REPLAY_BUCKETS: [&str; 10] = [
-    "place_match", "place_rest", "place_reject", "cancel_hit", "cancel_miss",
-    "mod_cancel_hit", "mod_cancel_miss", "mod_place_match", "mod_place_rest", "mod_place_reject",
+const REPLAY_BUCKETS: [&str; 12] = [
+    "place_match", "place_rest", "place_reject",
+    "cancel_hit", "cancel_stale", "cancel_miss",
+    "mod_cancel_hit", "mod_cancel_stale", "mod_cancel_miss",
+    "mod_place_match", "mod_place_rest", "mod_place_reject",
 ];
 
 /// Seed book0 → replay warmup (untimed) → replay the timed window, with optional
