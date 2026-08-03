@@ -857,6 +857,12 @@ fn order_matched_g<CTX: ContextTr>(ctx: &mut CTX, oid: &[u8; 32]) -> bool {
         Some(o) => o.filled > 0,
     }
 }
+std::thread_local! {
+    /// Reject-reason histogram for DIRECT-mode places (diagnostic; printed in the report).
+    static REJECT_HIST: std::cell::RefCell<std::collections::HashMap<String, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::default());
+}
+
 fn timed_place_g<CTX: ContextTr>(
     ctx: &mut CTX, u: Address, input: &[u8], via_envelope: bool,
 ) -> (u64, Option<[u8; 32]>) {
@@ -873,7 +879,15 @@ fn timed_place_g<CTX: ContextTr>(
         let t0 = Instant::now();
         let res = run_place_order(input, u, ctx);
         let dt = t0.elapsed().as_nanos() as u64;
-        (dt, res.ok().map(|r| r[..32].try_into().unwrap()))
+        match res {
+            Ok(r) => (dt, Some(r[..32].try_into().unwrap())),
+            Err(e) => {
+                REJECT_HIST.with(|h| {
+                    *h.borrow_mut().entry(e.to_string()).or_insert(0) += 1;
+                });
+                (dt, None)
+            }
+        }
     }
 }
 fn timed_cancel_g<CTX: ContextTr>(
@@ -932,6 +946,29 @@ fn parse_window_op(line: &str) -> Option<WindowOp> {
         "cancelByCloid" => Some(WindowOp::CancelCloid { uidx, cloid }),
         _ => None,
     }
+}
+
+/// Book shape: (bid_levels, ask_levels, live_bid_orders, live_ask_orders).
+fn book_stats(ctx: &mut CanonCtx) -> (usize, usize, u64, u64) {
+    let bids: Vec<u64> = storage::load_bid_prices_ref(ctx, MARKET_ID).unwrap().to_vec();
+    let asks: Vec<u64> = storage::load_ask_prices_ref(ctx, MARKET_ID).unwrap().to_vec();
+    let mut nb = 0u64;
+    for p in &bids {
+        nb += storage::load_bid_count(ctx, MARKET_ID, *p).unwrap();
+    }
+    let mut na = 0u64;
+    for p in &asks {
+        na += storage::load_ask_count(ctx, MARKET_ID, *p).unwrap();
+    }
+    (bids.len(), asks.len(), nb, na)
+}
+
+fn drain_reject_hist() -> Vec<(String, u64)> {
+    REJECT_HIST.with(|h| {
+        let mut v: Vec<(String, u64)> = h.borrow_mut().drain().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    })
 }
 
 pub struct HlReplayOpts {
@@ -1136,6 +1173,13 @@ pub fn hl_window_replay(book0_path: &str, warmup_path: Option<&str>, ops_path: &
         }
         out.push_str(&format!("warmup: {wn} ops replayed (untimed)\n"));
         for k in REPLAY_BUCKETS { t.get_mut(k).unwrap().clear(); }
+        let (bl, al, nb, na) = book_stats(&mut ctx);
+        out.push_str(&format!(
+            "post-warmup book: {bl} bid levels ({nb} live) / {al} ask levels ({na} live)\n"
+        ));
+        for (reason, n) in drain_reject_hist() {
+            out.push_str(&format!("  warmup reject {n:>9}  {reason}\n"));
+        }
     }
 
     // Drain the giant seed+warmup delta so the first timed block starts clean.
@@ -1174,6 +1218,15 @@ pub fn hl_window_replay(book0_path: &str, warmup_path: Option<&str>, ops_path: &
         blocks.push(simulate_block_boundary(&mut ctx, &mut prev_c));
     }
     let wall_ns = wall0.elapsed().as_nanos() as u64;
+    {
+        let (bl, al, nb, na) = book_stats(&mut ctx);
+        out.push_str(&format!(
+            "post-window book: {bl} bid levels ({nb} live) / {al} ask levels ({na} live)\n"
+        ));
+        for (reason, n) in drain_reject_hist() {
+            out.push_str(&format!("  window reject {n:>9}  {reason}\n"));
+        }
+    }
 
     // ---- report ----
     out.push_str(&format!(
