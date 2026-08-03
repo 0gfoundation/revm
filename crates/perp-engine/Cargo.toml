@@ -32,3 +32,10 @@ blake3 = { workspace = true, features = ["std"] }
 [features]
 default = ["std"]
 std = ["perp-core/std", "primitives/std", "context-interface/std", "ed25519-dalek/std"]
+# Gates the engine-only HL-window replay benchmark binary (`hl_replay`).
+replay-bench = ["std"]
+
+[[bin]]
+name = "hl_replay"
+path = "src/bin/hl_replay.rs"
+required-features = ["replay-bench"]
