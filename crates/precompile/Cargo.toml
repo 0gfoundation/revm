@@ -90,6 +90,10 @@ serde_bytes.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 
+# bench-util only (HL-window on-chain replay harness)
+database = { workspace = true, features = ["std"], optional = true }
+state = { workspace = true, optional = true }
+
 [dev-dependencies]
 criterion.workspace = true
 rand = { workspace = true, features = ["std"] }
@@ -120,6 +124,8 @@ std = [
 	"blake3/std",
 ]
 hashbrown = ["primitives/hashbrown"]
+# In-memory bench fixtures + the HL-window replay harness (`bench_util`, `hl_window_replay` bin).
+bench-util = ["std", "dep:database", "dep:state"]
 asm-keccak = ["primitives/asm-keccak"]
 asm-sha2 = ["sha2/asm"]
 
@@ -148,6 +154,11 @@ bn = ["dep:bn"]
 # Use rug (that wraps gmp) for modexp precompile.
 # It is faster library but licences as GPL code, if enabled please make sure to follow the license.
 gmp = ["dep:rug"]
+
+[[bin]]
+name = "hl_window_replay"
+path = "src/bin/hl_window_replay.rs"
+required-features = ["bench-util"]
 
 [[bench]]
 name = "bench"

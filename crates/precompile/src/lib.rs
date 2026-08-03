@@ -24,6 +24,8 @@ pub mod journal;
 pub mod kzg_point_evaluation;
 pub mod modexp;
 pub mod perp_dex;
+#[cfg(feature = "bench-util")]
+pub mod bench_util;
 pub mod secp256k1;
 pub mod secp256r1;
 pub mod stateful_precompiles;

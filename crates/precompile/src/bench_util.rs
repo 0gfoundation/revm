@@ -727,7 +727,8 @@ fn prof_stage_report(label: &str, rows: &[[u64; crate::perp_dex::prof::N]], stag
     idx.sort_by_key(|&i| total_of(&rows[i]));
     // band = mean per-stage over a slice of the sorted-by-total ops.
     let band_mean = |lo: f64, hi: f64, s: usize| -> f64 {
-        let (a, b) = (((n as f64 * lo) as usize).min(n - 1), ((n as f64 * hi) as usize).clamp(1, n));
+        let (a, b): (usize, usize) =
+            (((n as f64 * lo) as usize).min(n - 1), ((n as f64 * hi) as usize).clamp(1, n));
         let sl = &idx[a..b.max(a + 1)];
         sl.iter().map(|&i| rows[i][s] as f64).sum::<f64>() / sl.len() as f64
     };
@@ -755,5 +756,487 @@ fn prof_stage_report(label: &str, rows: &[[u64; crate::perp_dex::prof::N]], stag
         "{:<15} {:<8.0} {:<7} {:<8.0} {:<8.0}\n",
         "TOTAL", mean_total, "", p50t, p99t
     ));
+    out
+}
+
+// ═══════════ HL-window replay against the on-chain engine (hl_window_replay) ═══════════
+//
+// Extends `faithful_replay` for the hlrej (HL-reject-faithful) datasets + block-boundary costs:
+//   (a) hlrej force-price fidelity — `max_price` is raised so the forced $9,999,999 buy
+//       passes the bounds check and rejects on the post-only CROSS check (the same path HL
+//       used), and forced tiny sell prices ($0.001) clamp to one tick instead of being
+//       skipped by the `praw <= 0` guard;
+//   (b) warmup replay (untimed) instead of the book0 price shift;
+//   (c) cloid maps keyed per (user, cloid) — HL cloids are only unique within a user;
+//   (d) `modify` handled as cancel+place (no native modify), timed into its own buckets;
+//   (e) optional block boundaries every N rows: the journal's perp delta is harvested
+//       (`take_perp_delta`, which pays the dirty-set serialization), the chained block
+//       commitment is folded and timed, the delta is merged into a canonical store
+//       mirroring reth's `canonical_perp` (bytes + decoded-Arc fast path), and the live
+//       store is re-initialized — emulating the fresh-journal-per-block production shape.
+
+use context::journaled_state::PerpBlob;
+use primitives::{StorageKey, StorageValue, B256};
+
+/// In-memory stand-in for reth's committed off-trie store (`canonical_perp`): serves the
+/// journal's cross-block cold reads once a simulated block boundary has drained the overlay.
+#[derive(Debug, Default)]
+pub struct CanonPerpDb {
+    pub inner: InMemoryDB,
+    pub perp: std::collections::HashMap<B256, (Vec<u8>, Option<std::sync::Arc<PerpBlob>>)>,
+}
+
+impl database::Database for CanonPerpDb {
+    type Error = <InMemoryDB as database::Database>::Error;
+    fn basic(&mut self, address: Address) -> Result<Option<state::AccountInfo>, Self::Error> {
+        database::Database::basic(&mut self.inner, address)
+    }
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<state::Bytecode, Self::Error> {
+        database::Database::code_by_hash(&mut self.inner, code_hash)
+    }
+    fn storage(&mut self, address: Address, index: StorageKey) -> Result<StorageValue, Self::Error> {
+        database::Database::storage(&mut self.inner, address, index)
+    }
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        database::Database::block_hash(&mut self.inner, number)
+    }
+    fn perp_storage(&mut self, key: B256) -> Result<Vec<u8>, Self::Error> {
+        Ok(self.perp.get(&key).map(|(b, _)| b.clone()).unwrap_or_default())
+    }
+    fn perp_load_arc(
+        &mut self,
+        key: B256,
+    ) -> Result<Option<std::sync::Arc<PerpBlob>>, Self::Error> {
+        Ok(self.perp.get(&key).and_then(|(_, d)| d.clone()))
+    }
+}
+
+pub type CanonCtx = Context<BlockEnv, TxEnv, CfgEnv, CanonPerpDb, Journal<CanonPerpDb>, ()>;
+
+fn make_ctx_canon() -> CanonCtx {
+    let mut ctx: CanonCtx = Context::new(CanonPerpDb::default(), SpecId::CANCUN);
+    for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ADMIN] {
+        JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
+    }
+    ctx
+}
+
+/// `faithful_market` with `max_price` raised above the hlrej forced-buy price
+/// ($9,999,999 → raw 999,999,900 at pd2) so forced rejects take the post-only CROSS path.
+fn hlrej_market() -> Market {
+    let mut m = faithful_market();
+    m.max_price = 1_000_000_000;
+    m
+}
+
+fn to_raw_price_hlrej(px_usd: f64) -> i64 {
+    let raw = (px_usd * 100.0).round() as i64;
+    let snapped = (raw / 10) * 10;
+    // hlrej forced sells are $0.001 → 0 after snap; clamp to one tick so they reach the
+    // engine and reject on the cross check instead of being silently skipped.
+    if px_usd > 0.0 && snapped == 0 { HL_TICK as i64 } else { snapped }
+}
+
+// Generic (any-ContextTr) clones of the small BenchCtx-typed helpers above.
+fn fund_g<CTX: ContextTr>(ctx: &mut CTX, user: Address, amount: u64) {
+    JournalTr::load_account(ctx.journal_mut(), user).unwrap();
+    let mut acc = storage::load_account(ctx, user).unwrap();
+    acc.credit_perp(amount).unwrap();
+    storage::save_account(ctx, user, acc).unwrap();
+}
+fn try_place_g<CTX: ContextTr>(
+    ctx: &mut CTX, user: Address, side: u8, price: u64, qty: u64, ot: u8, tif: u8,
+) -> Option<[u8; 32]> {
+    run_place_order(&place_input(side, price, qty, ot, tif), user, ctx)
+        .ok()
+        .map(|r| r[..32].try_into().unwrap())
+}
+fn order_matched_g<CTX: ContextTr>(ctx: &mut CTX, oid: &[u8; 32]) -> bool {
+    match storage::load_order_ref(ctx, oid).unwrap() {
+        None => true,
+        Some(o) => o.filled > 0,
+    }
+}
+fn timed_place_g<CTX: ContextTr>(
+    ctx: &mut CTX, u: Address, input: &[u8], via_envelope: bool,
+) -> (u64, Option<[u8; 32]>) {
+    if via_envelope {
+        let t0 = Instant::now();
+        let res = crate::perp_dex::run_perp_dex_call(input, u64::MAX, u, U256::ZERO, false, ctx);
+        let dt = t0.elapsed().as_nanos() as u64;
+        let oid = match res {
+            Ok(o) if !o.reverted => o.bytes.get(..32).and_then(|s| s.try_into().ok()),
+            _ => None,
+        };
+        (dt, oid)
+    } else {
+        let t0 = Instant::now();
+        let res = run_place_order(input, u, ctx);
+        let dt = t0.elapsed().as_nanos() as u64;
+        (dt, res.ok().map(|r| r[..32].try_into().unwrap()))
+    }
+}
+fn timed_cancel_g<CTX: ContextTr>(
+    ctx: &mut CTX, u: Address, input: &[u8], via_envelope: bool,
+) -> (u64, bool) {
+    if via_envelope {
+        let t0 = Instant::now();
+        let res = crate::perp_dex::run_perp_dex_call(input, u64::MAX, u, U256::ZERO, false, ctx);
+        let dt = t0.elapsed().as_nanos() as u64;
+        (dt, matches!(res, Ok(ref o) if !o.reverted))
+    } else {
+        let t0 = Instant::now();
+        let ok = run_cancel_order(input, u, ctx).is_ok();
+        let dt = t0.elapsed().as_nanos() as u64;
+        (dt, ok)
+    }
+}
+
+/// One pre-parsed window op (compact: the timed loop pays engine + map cost, not TSV parsing).
+enum WindowOp {
+    Place { uidx: u64, side: u8, praw: u64, qty: u64, ot: u8, tif: u8, oid: Box<str>, cloid: Box<str> },
+    Cancel { uidx: u64, oid: Box<str> },
+    CancelCloid { uidx: u64, cloid: Box<str> },
+    Modify { uidx: u64, side: u8, praw: u64, qty: u64, oid: Box<str>, cloid: Box<str> },
+}
+
+fn parse_window_op(line: &str) -> Option<WindowOp> {
+    let c: Vec<&str> = line.split('\t').collect();
+    if c.len() < 10 {
+        return None;
+    }
+    // ts opType assetId isBuy px sz userIdx oid cloid flags
+    let uidx: u64 = c[6].parse().ok()?;
+    let oid: Box<str> = c[7].into();
+    let cloid: Box<str> = c[8].into();
+    match c[1] {
+        "order" | "modify" => {
+            let is_buy: u64 = c[3].parse().unwrap_or(0);
+            let px: f64 = c[4].parse().unwrap_or(0.0);
+            let sz: f64 = c[5].parse().unwrap_or(0.0);
+            let qty = to_raw_qty(sz);
+            let praw = to_raw_price_hlrej(px);
+            if qty == 0 || praw <= 0 {
+                return None;
+            }
+            let side = if is_buy == 1 { BUY } else { SELL };
+            if c[1] == "order" {
+                let flags: u64 = c[9].parse().unwrap_or(0);
+                let (ot, tif) = map_tif(flags);
+                Some(WindowOp::Place { uidx, side, praw: praw as u64, qty, ot, tif, oid, cloid })
+            } else {
+                Some(WindowOp::Modify { uidx, side, praw: praw as u64, qty, oid, cloid })
+            }
+        }
+        "cancel" => Some(WindowOp::Cancel { uidx, oid }),
+        "cancelByCloid" => Some(WindowOp::CancelCloid { uidx, cloid }),
+        _ => None,
+    }
+}
+
+pub struct HlReplayOpts {
+    pub max_ops: usize,
+    pub via_envelope: bool,
+    /// Simulated block size in rows; 0 = no block boundaries (one giant block, warm store).
+    pub block_rows: usize,
+}
+
+#[derive(Default)]
+struct IdMaps {
+    by_oid: HashMap<Box<str>, [u8; 32]>,
+    by_cloid: HashMap<(u64, Box<str>), [u8; 32]>,
+}
+
+struct BlockStat {
+    keys: usize,
+    take_ns: u64,
+    fold_ns: u64,
+}
+
+fn simulate_block_boundary(ctx: &mut CanonCtx, prev_c: &mut U256) -> BlockStat {
+    let t0 = Instant::now();
+    let delta = ctx.journal_mut().take_perp_delta();
+    let take_ns = t0.elapsed().as_nanos() as u64;
+    let t1 = Instant::now();
+    let c = crate::perp_dex::storage::compute_block_commitment(*prev_c, &delta);
+    let fold_ns = t1.elapsed().as_nanos() as u64;
+    *prev_c = c;
+    let keys = delta.len();
+    // Merge into the canonical store (production does this off the execution hot path, so
+    // it is deliberately NOT part of take_ns/fold_ns) and hand the journal a fresh live
+    // store — the next simulated block cold-reads exactly like a fresh production journal.
+    for (k, e) in delta {
+        if e.bytes.is_empty() {
+            ctx.db_mut().perp.remove(&k);
+        } else {
+            ctx.db_mut().perp.insert(k, (e.bytes, e.decoded));
+        }
+    }
+    // Fresh live store for the next simulated block (production journals are per-block).
+    // In-place reset via downcast: `perp_live_init` asserts single-init, so the installed
+    // store is overwritten rather than replaced.
+    if let Some(store) = ctx.journal_mut().perp_live_get_mut() {
+        if let Some(typed) = store
+            .as_any_mut()
+            .downcast_mut::<crate::perp_dex::typed_store::TypedPerpStore>()
+        {
+            *typed = crate::perp_dex::typed_store::TypedPerpStore::default();
+        }
+    }
+    BlockStat { keys, take_ns, fold_ns }
+}
+
+/// Executes one op; pushes its engine time into the right bucket. Returns engine calls made.
+#[allow(clippy::too_many_arguments)]
+fn exec_window_op(
+    ctx: &mut CanonCtx,
+    op: &WindowOp,
+    maps: &mut IdMaps,
+    funded: &mut std::collections::HashSet<u64>,
+    t: &mut HashMap<&'static str, Vec<u64>>,
+    via_envelope: bool,
+) -> u32 {
+    macro_rules! ensure {
+        ($u:expr) => {
+            if funded.insert($u) {
+                fund_g(ctx, user_addr($u), FAITHFUL_WALLET);
+            }
+        };
+    }
+    let mut place = |ctx: &mut CanonCtx,
+                     maps: &mut IdMaps,
+                     t: &mut HashMap<&'static str, Vec<u64>>,
+                     uidx: u64, side: u8, praw: u64, qty: u64, ot: u8, tif: u8,
+                     oid: &str, cloid: &str,
+                     k_match: &'static str, k_rest: &'static str, k_rej: &'static str| {
+        let input = place_input(side, praw, qty, ot, tif);
+        let (dt, outcome) = timed_place_g(ctx, user_addr(uidx), &input, via_envelope);
+        match outcome {
+            None => t.get_mut(k_rej).unwrap().push(dt),
+            Some(engine_oid) => {
+                if !cloid.is_empty() && cloid != "0x" {
+                    maps.by_cloid.insert((uidx, cloid.into()), engine_oid);
+                }
+                if !oid.is_empty() {
+                    maps.by_oid.insert(oid.into(), engine_oid);
+                }
+                if order_matched_g(ctx, &engine_oid) {
+                    t.get_mut(k_match).unwrap().push(dt);
+                } else {
+                    t.get_mut(k_rest).unwrap().push(dt);
+                }
+            }
+        }
+    };
+    let cancel = |ctx: &mut CanonCtx,
+                  maps: &mut IdMaps,
+                  t: &mut HashMap<&'static str, Vec<u64>>,
+                  uidx: u64, target: Option<[u8; 32]>,
+                  k_hit: &'static str, k_miss: &'static str|
+     -> bool {
+        let _ = maps;
+        let oid = target.unwrap_or([0x55u8; 32]); // never-seen id → genuine miss path
+        let cin = cancel_input(oid);
+        let (dt, hit) = timed_cancel_g(ctx, user_addr(uidx), &cin, via_envelope);
+        t.get_mut(if hit { k_hit } else { k_miss }).unwrap().push(dt);
+        hit
+    };
+    match op {
+        WindowOp::Place { uidx, side, praw, qty, ot, tif, oid, cloid } => {
+            ensure!(*uidx);
+            place(ctx, maps, t, *uidx, *side, *praw, *qty, *ot, *tif, oid, cloid,
+                  "place_match", "place_rest", "place_reject");
+            1
+        }
+        WindowOp::Cancel { uidx, oid } => {
+            ensure!(*uidx);
+            let target = maps.by_oid.get(oid.as_ref()).copied();
+            cancel(ctx, maps, t, *uidx, target, "cancel_hit", "cancel_miss");
+            1
+        }
+        WindowOp::CancelCloid { uidx, cloid } => {
+            ensure!(*uidx);
+            let target = maps.by_cloid.get(&(*uidx, cloid.clone())).copied();
+            cancel(ctx, maps, t, *uidx, target, "cancel_hit", "cancel_miss");
+            1
+        }
+        WindowOp::Modify { uidx, side, praw, qty, oid, cloid } => {
+            ensure!(*uidx);
+            let target = maps
+                .by_oid
+                .get(oid.as_ref())
+                .copied()
+                .or_else(|| maps.by_cloid.get(&(*uidx, cloid.clone())).copied());
+            cancel(ctx, maps, t, *uidx, target, "mod_cancel_hit", "mod_cancel_miss");
+            place(ctx, maps, t, *uidx, *side, *praw, *qty, LIMIT, 0 /*GTC*/, oid, cloid,
+                  "mod_place_match", "mod_place_rest", "mod_place_reject");
+            2
+        }
+    }
+}
+
+const REPLAY_BUCKETS: [&str; 10] = [
+    "place_match", "place_rest", "place_reject", "cancel_hit", "cancel_miss",
+    "mod_cancel_hit", "mod_cancel_miss", "mod_place_match", "mod_place_rest", "mod_place_reject",
+];
+
+/// Seed book0 → replay warmup (untimed) → replay the timed window, with optional
+/// simulated block boundaries. Returns a text report.
+pub fn hl_window_replay(book0_path: &str, warmup_path: Option<&str>, ops_path: &str, o: HlReplayOpts) -> String {
+    let mut ctx = make_ctx_canon();
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+    storage::save_market(&mut ctx, &hlrej_market()).unwrap();
+    let mut funded: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut maps = IdMaps::default();
+    let mut out = String::new();
+
+    // ---- seed book0 (no price shift: warmup replay carries the gap when provided) ----
+    let shift: i64 = if warmup_path.is_some() { 0 } else { HL_BOOK0_SHIFT };
+    let b = std::fs::read_to_string(book0_path).expect("read book0");
+    let (mut b_ok, mut b_skip) = (0u64, 0u64);
+    for line in b.lines() {
+        if line.is_empty() { continue; }
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() < 7 { continue; }
+        // assetId isBuy px sz userIdx oid placeTs
+        let is_buy: u64 = c[1].parse().unwrap_or(0);
+        let px: f64 = c[2].parse().unwrap_or(0.0);
+        let sz: f64 = c[3].parse().unwrap_or(0.0);
+        let uidx: u64 = c[4].parse().unwrap_or(u64::MAX);
+        let qty = to_raw_qty(sz);
+        let praw = to_raw_price_hlrej(px) + shift;
+        if qty == 0 || praw <= 0 || uidx == u64::MAX { b_skip += 1; continue; }
+        if funded.insert(uidx) {
+            fund_g(&mut ctx, user_addr(uidx), FAITHFUL_WALLET);
+        }
+        let side = if is_buy == 1 { BUY } else { SELL };
+        match try_place_g(&mut ctx, user_addr(uidx), side, praw as u64, qty, LIMIT, POST_ONLY) {
+            Some(engine_oid) => {
+                maps.by_oid.insert(c[5].into(), engine_oid);
+                b_ok += 1;
+            }
+            None => b_skip += 1,
+        }
+    }
+    out.push_str(&format!("book0: {b_ok} rested, {b_skip} skipped (shift {shift})\n"));
+
+    // ---- untimed buckets for warmup (thrown away; the calls still mutate state) ----
+    let mut t: HashMap<&'static str, Vec<u64>> = HashMap::default();
+    for k in REPLAY_BUCKETS { t.insert(k, Vec::new()); }
+
+    if let Some(wp) = warmup_path {
+        let w = std::fs::read_to_string(wp).expect("read warmup");
+        let mut wn = 0u64;
+        for line in w.lines() {
+            if line.is_empty() { continue; }
+            if let Some(op) = parse_window_op(line) {
+                exec_window_op(&mut ctx, &op, &mut maps, &mut funded, &mut t, o.via_envelope);
+                wn += 1;
+            }
+        }
+        out.push_str(&format!("warmup: {wn} ops replayed (untimed)\n"));
+        for k in REPLAY_BUCKETS { t.get_mut(k).unwrap().clear(); }
+    }
+
+    // Drain the giant seed+warmup delta so the first timed block starts clean.
+    let mut prev_c = U256::ZERO;
+    if o.block_rows > 0 {
+        let bs = simulate_block_boundary(&mut ctx, &mut prev_c);
+        out.push_str(&format!(
+            "warmup-end boundary: {} keys, take {:.1} ms, fold {:.1} ms\n",
+            bs.keys, bs.take_ns as f64 / 1e6, bs.fold_ns as f64 / 1e6
+        ));
+    }
+
+    // ---- pre-parse the timed window ----
+    let raw = std::fs::read_to_string(ops_path).expect("read ops");
+    let mut ops: Vec<WindowOp> = Vec::new();
+    for line in raw.lines() {
+        if ops.len() >= o.max_ops { break; }
+        if line.is_empty() { continue; }
+        if let Some(op) = parse_window_op(line) {
+            ops.push(op);
+        }
+    }
+    drop(raw);
+
+    // ---- timed replay ----
+    let mut blocks: Vec<BlockStat> = Vec::new();
+    let mut engine_calls: u64 = 0;
+    let wall0 = Instant::now();
+    for (i, op) in ops.iter().enumerate() {
+        engine_calls += exec_window_op(&mut ctx, op, &mut maps, &mut funded, &mut t, o.via_envelope) as u64;
+        if o.block_rows > 0 && (i + 1) % o.block_rows == 0 {
+            blocks.push(simulate_block_boundary(&mut ctx, &mut prev_c));
+        }
+    }
+    if o.block_rows > 0 && ops.len() % o.block_rows != 0 {
+        blocks.push(simulate_block_boundary(&mut ctx, &mut prev_c));
+    }
+    let wall_ns = wall0.elapsed().as_nanos() as u64;
+
+    // ---- report ----
+    out.push_str(&format!(
+        "window: {} rows replayed, {} engine calls, mode {}\n\n",
+        ops.len(),
+        engine_calls,
+        if o.via_envelope { "ENVELOPE" } else { "DIRECT" }
+    ));
+    out.push_str("op_type          n         mean_us  p50    p90    p99\n");
+    let mut engine_ns: u64 = 0;
+    for k in REPLAY_BUCKETS {
+        let v = t.get_mut(k).unwrap();
+        v.sort_unstable();
+        let n = v.len();
+        engine_ns += v.iter().sum::<u64>();
+        let mean = if n > 0 { v.iter().sum::<u64>() as f64 / n as f64 / 1000.0 } else { 0.0 };
+        out.push_str(&format!(
+            "{:<16} {:<9} {:<8.2} {:<6.2} {:<6.2} {:<6.2}\n",
+            k, n, mean,
+            pct(v, 0.50) as f64 / 1000.0,
+            pct(v, 0.90) as f64 / 1000.0,
+            pct(v, 0.99) as f64 / 1000.0,
+        ));
+    }
+    let blk_take: u64 = blocks.iter().map(|b| b.take_ns).sum();
+    let blk_fold: u64 = blocks.iter().map(|b| b.fold_ns).sum();
+    out.push_str(&format!(
+        "\nengine time: {:.3} s | engine calls/s {:.0} | rows/s (engine-only) {:.0}\n",
+        engine_ns as f64 / 1e9,
+        engine_calls as f64 * 1e9 / engine_ns.max(1) as f64,
+        ops.len() as f64 * 1e9 / engine_ns.max(1) as f64,
+    ));
+    out.push_str(&format!(
+        "loop wall:   {:.3} s | rows/s (wall, incl. maps+boundaries) {:.0}\n",
+        wall_ns as f64 / 1e9,
+        ops.len() as f64 * 1e9 / wall_ns.max(1) as f64,
+    ));
+    if !blocks.is_empty() {
+        let n = blocks.len() as f64;
+        let mut keys: Vec<usize> = blocks.iter().map(|b| b.keys).collect();
+        keys.sort_unstable();
+        let mut takes: Vec<u64> = blocks.iter().map(|b| b.take_ns).collect();
+        takes.sort_unstable();
+        let mut folds: Vec<u64> = blocks.iter().map(|b| b.fold_ns).collect();
+        folds.sort_unstable();
+        out.push_str(&format!(
+            "\nblocks: {} × {} rows | keys/block p50 {} max {} | take_delta us mean {:.1} p50 {:.1} p99 {:.1} | commit-fold us mean {:.1} p50 {:.1} p99 {:.1}\n",
+            blocks.len(), o.block_rows,
+            keys[keys.len() / 2], keys[keys.len() - 1],
+            blk_take as f64 / n / 1e3,
+            takes[takes.len() / 2] as f64 / 1e3,
+            pct(&takes, 0.99) as f64 / 1e3,
+            blk_fold as f64 / n / 1e3,
+            folds[folds.len() / 2] as f64 / 1e3,
+            pct(&folds, 0.99) as f64 / 1e3,
+        ));
+        out.push_str(&format!(
+            "block-end overhead: {:.3} s total = {:.1}% of engine time = {:.0} ns/row amortized | final C = {:#x}\n",
+            (blk_take + blk_fold) as f64 / 1e9,
+            100.0 * (blk_take + blk_fold) as f64 / engine_ns.max(1) as f64,
+            (blk_take + blk_fold) as f64 / ops.len().max(1) as f64,
+            prev_c,
+        ));
+    }
     out
 }

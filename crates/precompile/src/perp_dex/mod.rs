@@ -71,6 +71,8 @@ pub mod errors;
 pub mod funding;
 pub mod interface;
 pub mod math;
+#[cfg(any(feature = "bench-util", test))]
+pub mod prof;
 pub mod risk;
 pub mod storage;
 pub mod trading;

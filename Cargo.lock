@@ -4011,6 +4011,7 @@ dependencies = [
  "revm-context",
  "revm-database",
  "revm-primitives",
+ "revm-state",
  "ripemd",
  "rmp-serde",
  "rstest",
