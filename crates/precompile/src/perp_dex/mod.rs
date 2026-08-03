@@ -58,5 +58,8 @@ pub fn run_perp_dex_call<CTX: ContextTr>(
     }
 }
 
-/// Re-exported diagnostics for the commit-only write-then-revert tripwire.
-pub use perp_engine::call::last_perp_write_then_revert;
+/// Re-exported diagnostics for the commit-only write-then-revert tripwire — the query
+/// function AND the two atomics themselves (both were `pub` at this path historically).
+pub use perp_engine::call::{
+    last_perp_write_then_revert, LAST_WRITE_THEN_REVERT_SELECTOR, PERP_WRITE_THEN_REVERT_COUNT,
+};
