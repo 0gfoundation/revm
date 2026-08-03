@@ -94,6 +94,7 @@ impl PerpPosition {
     /// change in `margin_reserved` around this call (NOT from the per-side
     /// fields — those lag `margin_reserved` under the flip-aware model) and own
     /// `fee_reserved` separately.
+    #[inline]
     pub fn set_reservations(
         &mut self,
         buy_notional: u64,

@@ -70,6 +70,7 @@ pub struct PublicAccountBalance {
 impl UserAccount {
     /// Available balance exposed through the ABI. Negative internal balances are
     /// reported as zero until liquidation/bankruptcy handling is wired.
+    #[inline]
     pub fn visible_perp_wallet_balance(&self) -> u64 {
         if self.perp_wallet_balance <= 0 {
             0
@@ -79,6 +80,7 @@ impl UserAccount {
     }
 
     /// Returns the clamped public balance after-image for this account.
+    #[inline]
     pub fn public_balance(&self) -> PublicAccountBalance {
         PublicAccountBalance {
             usdc_balance: self.usdc_balance.clone().into(),
@@ -87,6 +89,7 @@ impl UserAccount {
     }
 
     /// Returns whether the wallet can cover a user-initiated debit.
+    #[inline]
     pub fn has_available_perp(&self, amount: u64) -> bool {
         match i64::try_from(amount) {
             Ok(amount) => self.perp_wallet_balance >= amount,
@@ -95,6 +98,7 @@ impl UserAccount {
     }
 
     /// Adds positive perp wallet balance.
+    #[inline]
     pub fn credit_perp(&mut self, amount: u64) -> Result<(), PerpError> {
         let amount =
             i64::try_from(amount).map_err(|_| perp_err("perp wallet: amount exceeds i64::MAX"))?;
@@ -106,6 +110,7 @@ impl UserAccount {
     }
 
     /// Debits perp wallet balance, allowing the internal value to go negative.
+    #[inline]
     pub fn debit_perp(&mut self, amount: u64) -> Result<(), PerpError> {
         let amount =
             i64::try_from(amount).map_err(|_| perp_err("perp wallet: amount exceeds i64::MAX"))?;

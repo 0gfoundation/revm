@@ -40,6 +40,7 @@ impl Default for PriceBasisWindow {
 
 impl PriceBasisWindow {
     /// Pushes one mid-price sample into the ring buffer.
+    #[inline]
     pub fn push_sample(&mut self, timestamp: u64, mid_price: u64) {
         let idx = self.write_idx as usize;
         self.timestamps[idx] = timestamp;
@@ -74,6 +75,7 @@ impl PriceBasisWindow {
     }
 
     /// Time-weighted average `mid - index_at_time` over the latest basis window.
+    #[inline]
     pub fn moving_average_basis(
         &self,
         index_history: &IndexPriceHistory,
@@ -180,6 +182,7 @@ pub struct IndexPriceHistory {
 }
 
 impl IndexPriceHistory {
+    #[inline]
     pub fn push(&mut self, state: IndexPriceState, max_checkpoints: usize) {
         if state.index_price == 0 {
             return;
@@ -202,6 +205,7 @@ impl IndexPriceHistory {
         }
     }
 
+    #[inline]
     pub fn price_at_or_before(&self, timestamp: u64) -> Option<u64> {
         self.checkpoints
             .iter()
@@ -264,6 +268,7 @@ impl PremiumIndexAccumulator {
     }
 
     /// Starts a fresh epoch with the observed premium index at `timestamp`.
+    #[inline]
     pub fn start_epoch(
         &mut self,
         epoch_start_ts: u64,
@@ -282,6 +287,7 @@ impl PremiumIndexAccumulator {
     ///
     /// Slots before `end_ts` use the latest known PI. If `endpoint_pi` is set
     /// and `end_ts` lands exactly on a sample slot, the endpoint slot uses it.
+    #[inline]
     pub fn fill_slots_until(
         &mut self,
         end_ts: u64,
@@ -313,6 +319,7 @@ impl PremiumIndexAccumulator {
     }
 
     /// Linearly-weighted average: Σ(k·PI_k) / Σk = weighted_sum / (n·(n+1)/2).
+    #[inline]
     pub fn average(&self) -> Result<i64, PerpError> {
         if self.sample_count == 0 {
             return Ok(0);

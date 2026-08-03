@@ -372,6 +372,7 @@ pub fn calc_funding_payment(
 /// Recalculate the buy-side opening notional from the current buy-order list.
 /// `buy_entries` must be sorted by price descending.
 /// `position_amount` is the current net position before this order list.
+#[inline]
 pub fn calc_buy_side_reserved_notional(
     buy_entries: &[OrderEntry],
     base_decimals: u32,
@@ -408,6 +409,7 @@ pub fn calc_buy_side_reserved_notional(
 
 /// Recalculate the sell-side opening notional from the current sell-order list.
 /// `sell_entries` must be sorted by price ascending.
+#[inline]
 pub fn calc_sell_side_reserved_notional(
     sell_entries: &[OrderEntry],
     base_decimals: u32,
@@ -466,6 +468,7 @@ fn open_amount(remaining: &mut i64, amount: i64) -> Result<i64, PerpError> {
 /// covers (the common deep-open case), `calc_value` is computed once and added to both, halving the
 /// expensive notional math vs two scans. The total order qty is summed in the same pass (free),
 /// removing a separate sum pass.
+#[inline]
 pub fn calc_buy_side_dual(
     buy_entries: impl Iterator<Item = OrderEntry>,
     base_decimals: u32,
@@ -531,6 +534,7 @@ pub fn calc_buy_side_dual(
 
 /// Sell-side opening notional at TWO positions in a single ASC pass (#21 靶子3); see
 /// [`calc_buy_side_dual`]. Returns `(S(position_a), S(position_b), total_sell_qty)`.
+#[inline]
 pub fn calc_sell_side_dual(
     sell_entries: impl Iterator<Item = OrderEntry>,
     base_decimals: u32,
@@ -605,6 +609,7 @@ pub fn calc_sell_side_dual(
 /// The combined leg is summed in `u128` and floored once on division by
 /// leverage in `set_reservations` (single floor, not a sum of per-leg floors),
 /// which is the strictly-safer rounding.
+#[inline]
 pub fn calc_reservation_notionals(
     buy_entries: &[OrderEntry],
     sell_entries: &[OrderEntry],
@@ -719,6 +724,7 @@ fn total_entry_amount(
 /// `(Σ amount, Σ calc_value(price, amount))` over a side's order list — the maintained aggregate
 /// the leg reconstruction below consumes. Cold-rebuild / test helper; production maintains these
 /// incrementally so this full pass runs only on a cold first-touch.
+#[inline]
 pub fn sum_side_totals(
     entries: impl Iterator<Item = OrderEntry>,
     base_decimals: u32,
@@ -786,6 +792,7 @@ fn side_leg_from_total(
 /// `(total_buy_qty, total_buy_notional, total_sell_qty, total_sell_notional)` instead of a full
 /// fold. Each of the four legs (B, B′, S, S′) walks only its cover prefix, so a flat/aligned or
 /// one-sided book is O(1). `buy_entries` DESC, `sell_entries` ASC.
+#[inline]
 pub fn calc_reservation_notionals_from_totals(
     buy_entries: &[OrderEntry],
     sell_entries: &[OrderEntry],

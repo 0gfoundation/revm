@@ -73,6 +73,7 @@ pub enum Resident<'a, T> {
 impl<'a, T> Resident<'a, T> {
     /// `Hit` payload as an `Option` (test/diagnostic convenience; production readers must match
     /// all three states — collapsing `Deleted` into `None` is exactly the fall-through bug).
+    #[inline]
     pub fn hit(self) -> Option<&'a T> {
         match self {
             Resident::Hit(v) => Some(v),
@@ -181,6 +182,7 @@ impl TypedPerpStore {
 
     // ── per-user account ───────────────────────────────────────────────────────
     /// Three-state read of a user's account (see [`Resident`]).
+    #[inline]
     pub fn account(&self, user: Address) -> Resident<'_, UserAccount> {
         // Batch working-set guard: the initiator reads its own account from the ws first. A ws-miss
         // (untouched) falls through to main — reads never seed (they are `&self`); the first WRITE
@@ -206,6 +208,7 @@ impl TypedPerpStore {
     /// matching the current `get_struct_mut` write-count semantics). CoW: clones the value iff
     /// the Arc is shared (first write after a cold fill), in-place thereafter. `None` for a
     /// missing OR deleted entry (mutating either is a caller bug; callers materialize first).
+    #[inline]
     pub fn account_mut(&mut self, user: Address) -> Option<&mut UserAccount> {
         // Batch working-set guard: route the initiator's mutation to the ws. Seed from main if the
         // ws slot is still untouched (defensive — every write is preceded by a read, but the read
@@ -246,6 +249,7 @@ impl TypedPerpStore {
     /// Zero-clone shared read for the `load_*_ref` path: hands back the sub-map's Arc (refcount
     /// bump). Same three states as [`Self::account`], flattened: `Some(arc)` = hit; `None` covers
     /// BOTH deleted and miss — callers needing the distinction use [`Self::account`] first.
+    #[inline]
     pub fn account_arc(&self, user: Address) -> Option<Arc<UserAccount>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
@@ -263,6 +267,7 @@ impl TypedPerpStore {
     /// `None` caches ABSENCE (repeated missing-key loads stop re-probing the DB; not a tombstone —
     /// no dirty mark, so nothing is emitted at block end). Never overwrites an existing entry
     /// (write-wins, mirroring `cache_put`).
+    #[inline]
     pub fn fill_account(&mut self, user: Address, value: Option<Arc<UserAccount>>) {
         // Batch working-set guard: cache the initiator's cold fill in the ws (no dirty, no
         // write_count — a fill is a cache event). Never overwrite (write-wins, like the main path).
@@ -278,6 +283,7 @@ impl TypedPerpStore {
     }
 
     /// Inserts/overwrites a user's account and marks its key dirty.
+    #[inline]
     pub fn set_account(&mut self, user: Address, value: UserAccount) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {
@@ -293,6 +299,7 @@ impl TypedPerpStore {
 
     /// Removes a user's account: leaves a resident tombstone (reads → [`Resident::Deleted`]) and
     /// marks the key dirty (block-end delta emits empty bytes).
+    #[inline]
     pub fn remove_account(&mut self, user: Address) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {
@@ -308,6 +315,7 @@ impl TypedPerpStore {
 
     // ── per-market config ────────────────────────────────────────────────────
     /// Three-state read of a market's config (see [`Resident`]).
+    #[inline]
     pub fn market(&self, market_id: u64) -> Resident<'_, Market> {
         match self.markets.get(&market_id) {
             None => Resident::Miss,
@@ -317,6 +325,7 @@ impl TypedPerpStore {
     }
 
     /// Mutable market access; marks its key dirty (see [`Self::account_mut`]).
+    #[inline]
     pub fn market_mut(&mut self, market_id: u64) -> Option<&mut Market> {
         match self.markets.get_mut(&market_id) {
             Some(Some(m)) => {
@@ -332,16 +341,19 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss (see [`Self::account_arc`]).
+    #[inline]
     pub fn market_arc(&self, market_id: u64) -> Option<Arc<Market>> {
         self.markets.get(&market_id).and_then(|s| s.clone())
     }
 
     /// Cold-fill (cache semantics, no dirty mark; see [`Self::fill_account`]).
+    #[inline]
     pub fn fill_market(&mut self, market_id: u64, value: Option<Arc<Market>>) {
         self.markets.entry(market_id).or_insert(value);
     }
 
     /// Inserts/overwrites a market and marks its key dirty.
+    #[inline]
     pub fn set_market(&mut self, market_id: u64, value: Market) {
         self.mark(keys::market_key(market_id), StoreSlot::Market(market_id));
         self.markets.insert(market_id, Some(Arc::new(value)));
@@ -349,6 +361,7 @@ impl TypedPerpStore {
 
     // ── per-(user, market) position ──────────────────────────────────────────
     /// Three-state read of a user's position in a market (see [`Resident`]).
+    #[inline]
     pub fn position(&self, user: Address, market_id: u64) -> Resident<'_, PerpPosition> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
@@ -368,6 +381,7 @@ impl TypedPerpStore {
     }
 
     /// Mutable position access; marks its key dirty (see [`Self::account_mut`]).
+    #[inline]
     pub fn position_mut(&mut self, user: Address, market_id: u64) -> Option<&mut PerpPosition> {
         if self.batch.as_ref().is_some_and(|b| b.owner == user) {
             // Read the main seed FIRST (owned clone = Arc bump) so the disjoint `self.positions` and
@@ -407,6 +421,7 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss (see [`Self::account_arc`]).
+    #[inline]
     pub fn position_arc(&self, user: Address, market_id: u64) -> Option<Arc<PerpPosition>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
@@ -419,6 +434,7 @@ impl TypedPerpStore {
     }
 
     /// Cold-fill (cache semantics, no dirty mark; see [`Self::fill_account`]).
+    #[inline]
     pub fn fill_position(
         &mut self,
         user: Address,
@@ -435,6 +451,7 @@ impl TypedPerpStore {
     }
 
     /// Inserts/overwrites a position and marks its key dirty.
+    #[inline]
     pub fn set_position(&mut self, user: Address, market_id: u64, value: PerpPosition) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {
@@ -452,6 +469,7 @@ impl TypedPerpStore {
     }
 
     /// Removes a position: resident tombstone + dirty mark (delta emits empty bytes).
+    #[inline]
     pub fn remove_position(&mut self, user: Address, market_id: u64) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {
@@ -470,6 +488,7 @@ impl TypedPerpStore {
 
     // ── per-market hot scalars (MarketHot) ──────────────────────────────────
     /// Three-state read (see [`Resident`]).
+    #[inline]
     pub fn market_hot(&self, market_id: u64) -> Resident<'_, MarketHot> {
         match self.market_hots.get(&market_id) {
             None => Resident::Miss,
@@ -479,6 +498,7 @@ impl TypedPerpStore {
     }
 
     /// Mutable access; marks dirty (see [`Self::account_mut`]).
+    #[inline]
     pub fn market_hot_mut(&mut self, market_id: u64) -> Option<&mut MarketHot> {
         match self.market_hots.get_mut(&market_id) {
             Some(Some(h)) => {
@@ -495,6 +515,7 @@ impl TypedPerpStore {
     }
 
     /// Inserts/overwrites and marks dirty.
+    #[inline]
     pub fn set_market_hot(&mut self, market_id: u64, value: MarketHot) {
         self.mark(
             keys::market_hot_key(market_id),
@@ -504,12 +525,14 @@ impl TypedPerpStore {
     }
 
     /// Cold-fill (cache semantics, no dirty mark; see [`Self::fill_account`]).
+    #[inline]
     pub fn fill_market_hot(&mut self, market_id: u64, value: Option<Arc<MarketHot>>) {
         self.market_hots.entry(market_id).or_insert(value);
     }
 
     // ── per-(user, market) order-entry lists (bord / sord) ──────────────────
     /// Three-state read of the buy-order list (see [`Resident`]).
+    #[inline]
     pub fn buy_orders(&self, user: Address, market_id: u64) -> Resident<'_, std::collections::VecDeque<OrderEntry>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
@@ -529,6 +552,7 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    #[inline]
     pub fn buy_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<std::collections::VecDeque<OrderEntry>>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
@@ -541,6 +565,7 @@ impl TypedPerpStore {
     }
 
     /// Mutable access; marks dirty (see [`Self::account_mut`]).
+    #[inline]
     pub fn buy_orders_mut(&mut self, user: Address, market_id: u64) -> Option<&mut std::collections::VecDeque<OrderEntry>> {
         if self.batch.as_ref().is_some_and(|b| b.owner == user) {
             let main = self.buy_orders.get(&(user, market_id));
@@ -576,6 +601,7 @@ impl TypedPerpStore {
 
     /// Inserts/overwrites and marks dirty. NOTE: an EMPTY list is a legitimate stored value
     /// (encodes to msgpack `0x90`, key stays present) — never converted to a delete.
+    #[inline]
     pub fn set_buy_orders(&mut self, user: Address, market_id: u64, value: std::collections::VecDeque<OrderEntry>) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {
@@ -593,6 +619,7 @@ impl TypedPerpStore {
     }
 
     /// Cold-fill (cache semantics, no dirty mark).
+    #[inline]
     pub fn fill_buy_orders(
         &mut self,
         user: Address,
@@ -609,6 +636,7 @@ impl TypedPerpStore {
     }
 
     /// Three-state read of the sell-order list (see [`Resident`]).
+    #[inline]
     pub fn sell_orders(&self, user: Address, market_id: u64) -> Resident<'_, std::collections::VecDeque<OrderEntry>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
@@ -628,6 +656,7 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    #[inline]
     pub fn sell_orders_arc(&self, user: Address, market_id: u64) -> Option<Arc<std::collections::VecDeque<OrderEntry>>> {
         if let Some(b) = self.batch.as_ref() {
             if b.owner == user {
@@ -640,6 +669,7 @@ impl TypedPerpStore {
     }
 
     /// Mutable access; marks dirty (see [`Self::account_mut`]).
+    #[inline]
     pub fn sell_orders_mut(
         &mut self,
         user: Address,
@@ -678,6 +708,7 @@ impl TypedPerpStore {
     }
 
     /// Inserts/overwrites and marks dirty (empty list stays a stored `0x90`, see buy side).
+    #[inline]
     pub fn set_sell_orders(&mut self, user: Address, market_id: u64, value: std::collections::VecDeque<OrderEntry>) {
         if let Some(b) = self.batch.as_mut() {
             if b.owner == user {
@@ -695,6 +726,7 @@ impl TypedPerpStore {
     }
 
     /// Cold-fill (cache semantics, no dirty mark).
+    #[inline]
     pub fn fill_sell_orders(
         &mut self,
         user: Address,
@@ -713,6 +745,7 @@ impl TypedPerpStore {
     // ── per-order records (delete-on-terminal) ──────────────────────────────
     /// Three-state read (see [`Resident`]). `Deleted` is load-bearing here: delete-on-terminal
     /// removes the record in-block, and getOrder must see not-found, not the stale committed row.
+    #[inline]
     pub fn order(&self, order_id: &[u8; 32]) -> Resident<'_, Order> {
         match self.orders.get(order_id) {
             None => Resident::Miss,
@@ -722,11 +755,13 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    #[inline]
     pub fn order_arc(&self, order_id: &[u8; 32]) -> Option<Arc<Order>> {
         self.orders.get(order_id).and_then(|s| s.clone())
     }
 
     /// Inserts/overwrites and marks dirty.
+    #[inline]
     pub fn set_order(&mut self, order_id: &[u8; 32], value: Order) {
         self.mark(keys::order_key(order_id), StoreSlot::Order(*order_id));
         self.orders.insert(*order_id, Some(Arc::new(value)));
@@ -734,18 +769,21 @@ impl TypedPerpStore {
 
     /// Deletes the record (delete-on-terminal): resident tombstone + dirty mark → the delta emits
     /// empty bytes (the store DELETE convention).
+    #[inline]
     pub fn remove_order(&mut self, order_id: &[u8; 32]) {
         self.mark(keys::order_key(order_id), StoreSlot::Order(*order_id));
         self.orders.insert(*order_id, None);
     }
 
     /// Cold-fill (cache semantics, no dirty mark).
+    #[inline]
     pub fn fill_order(&mut self, order_id: &[u8; 32], value: Option<Arc<Order>>) {
         self.orders.entry(*order_id).or_insert(value);
     }
 
     // ── per-market active price levels (bidp / askp), sorted Vec<u64> ────────
     /// Three-state read of the bid price index (see [`Resident`]).
+    #[inline]
     pub fn bid_prices(&self, market_id: u64) -> Resident<'_, Vec<u64>> {
         match self.bid_prices.get(&market_id) {
             None => Resident::Miss,
@@ -755,23 +793,27 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    #[inline]
     pub fn bid_prices_arc(&self, market_id: u64) -> Option<Arc<Vec<u64>>> {
         self.bid_prices.get(&market_id).and_then(|s| s.clone())
     }
 
     /// Inserts/overwrites the whole index and marks dirty.
+    #[inline]
     pub fn set_bid_prices(&mut self, market_id: u64, value: Vec<u64>) {
         self.mark(keys::bid_prices_key(market_id), StoreSlot::BidPrices(market_id));
         self.bid_prices.insert(market_id, Some(Arc::new(value)));
     }
 
     /// Cold-fill (cache semantics, no dirty mark).
+    #[inline]
     pub fn fill_bid_prices(&mut self, market_id: u64, value: Option<Arc<Vec<u64>>>) {
         self.bid_prices.entry(market_id).or_insert(value);
     }
 
     /// `&mut` to the resident index (materialize empty if deleted/absent), AUTO-marking dirty —
     /// for the UNCONDITIONAL mutate (remove_*_price / mutate_bid_prices, which always write).
+    #[inline]
     pub fn bid_prices_mut(&mut self, market_id: u64) -> &mut Vec<u64> {
         self.dirty
             .insert(keys::bid_prices_key(market_id), StoreSlot::BidPrices(market_id));
@@ -787,6 +829,7 @@ impl TypedPerpStore {
 
     /// `&mut` to the resident index WITHOUT marking — the caller marks (via [`Self::mark_bid_prices`])
     /// only if it actually changed, preserving `insert_*_price`'s conditional-write delta semantics.
+    #[inline]
     pub fn bid_prices_mut_nomark(&mut self, market_id: u64) -> &mut Vec<u64> {
         Arc::make_mut(
             self.bid_prices
@@ -797,11 +840,13 @@ impl TypedPerpStore {
     }
 
     /// Marks the bid-price index dirty (delta membership). Pair with [`Self::bid_prices_mut_nomark`].
+    #[inline]
     pub fn mark_bid_prices(&mut self, market_id: u64) {
         self.mark(keys::bid_prices_key(market_id), StoreSlot::BidPrices(market_id));
     }
 
     /// Three-state read of the ask price index (see [`Resident`]).
+    #[inline]
     pub fn ask_prices(&self, market_id: u64) -> Resident<'_, Vec<u64>> {
         match self.ask_prices.get(&market_id) {
             None => Resident::Miss,
@@ -811,22 +856,26 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    #[inline]
     pub fn ask_prices_arc(&self, market_id: u64) -> Option<Arc<Vec<u64>>> {
         self.ask_prices.get(&market_id).and_then(|s| s.clone())
     }
 
     /// Inserts/overwrites the whole index and marks dirty.
+    #[inline]
     pub fn set_ask_prices(&mut self, market_id: u64, value: Vec<u64>) {
         self.mark(keys::ask_prices_key(market_id), StoreSlot::AskPrices(market_id));
         self.ask_prices.insert(market_id, Some(Arc::new(value)));
     }
 
     /// Cold-fill (cache semantics, no dirty mark).
+    #[inline]
     pub fn fill_ask_prices(&mut self, market_id: u64, value: Option<Arc<Vec<u64>>>) {
         self.ask_prices.entry(market_id).or_insert(value);
     }
 
     /// `&mut` to the resident index, AUTO-marking dirty (unconditional mutate). See bid side.
+    #[inline]
     pub fn ask_prices_mut(&mut self, market_id: u64) -> &mut Vec<u64> {
         self.dirty
             .insert(keys::ask_prices_key(market_id), StoreSlot::AskPrices(market_id));
@@ -841,6 +890,7 @@ impl TypedPerpStore {
     }
 
     /// `&mut` WITHOUT marking (caller marks conditionally). See bid side.
+    #[inline]
     pub fn ask_prices_mut_nomark(&mut self, market_id: u64) -> &mut Vec<u64> {
         Arc::make_mut(
             self.ask_prices
@@ -851,6 +901,7 @@ impl TypedPerpStore {
     }
 
     /// Marks the ask-price index dirty. Pair with [`Self::ask_prices_mut_nomark`].
+    #[inline]
     pub fn mark_ask_prices(&mut self, market_id: u64) {
         self.mark(keys::ask_prices_key(market_id), StoreSlot::AskPrices(market_id));
     }
@@ -863,6 +914,7 @@ impl TypedPerpStore {
     // A cold-absent level (fill None) reads as an empty default blob, same as `unpack_level("")`.
 
     /// Resident level blob (`None` = not resident this block → cold path).
+    #[inline]
     pub fn bid_level(&self, market_id: u64, price: u64) -> Option<&LevelBlob> {
         self.bid_levels
             .get(&(market_id, price))
@@ -870,28 +922,33 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump); `None` = not resident (miss/cold-absent).
+    #[inline]
     pub fn bid_level_arc(&self, market_id: u64, price: u64) -> Option<Arc<LevelBlob>> {
         self.bid_levels.get(&(market_id, price)).and_then(|s| s.clone())
     }
 
     /// Whether the key is resident this block (Some slot present), regardless of live/absent.
+    #[inline]
     pub fn bid_level_resident(&self, market_id: u64, price: u64) -> bool {
         self.bid_levels.contains_key(&(market_id, price))
     }
 
     /// Inserts/overwrites the level blob and marks dirty.
+    #[inline]
     pub fn set_bid_level(&mut self, market_id: u64, price: u64, value: LevelBlob) {
         self.mark(keys::bid_level_key(market_id, price), StoreSlot::BidLevel(market_id, price));
         self.bid_levels.insert((market_id, price), Some(Arc::new(value)));
     }
 
     /// Cold-fill (cache semantics, no dirty mark).
+    #[inline]
     pub fn fill_bid_level(&mut self, market_id: u64, price: u64, value: Option<Arc<LevelBlob>>) {
         self.bid_levels.entry((market_id, price)).or_insert(value);
     }
 
     /// `&mut` to the resident blob (materialize empty default if deleted/absent), AUTO-marking dirty
     /// — for the in-place mutators (push / decr). CoW: clone iff shared.
+    #[inline]
     pub fn bid_level_mut(&mut self, market_id: u64, price: u64) -> &mut LevelBlob {
         self.dirty
             .insert(keys::bid_level_key(market_id, price), StoreSlot::BidLevel(market_id, price));
@@ -906,6 +963,7 @@ impl TypedPerpStore {
     }
 
     /// Resident ask level blob (`None` = not resident). See bid side.
+    #[inline]
     pub fn ask_level(&self, market_id: u64, price: u64) -> Option<&LevelBlob> {
         self.ask_levels
             .get(&(market_id, price))
@@ -913,27 +971,32 @@ impl TypedPerpStore {
     }
 
     /// Zero-clone shared read (Arc bump). See bid side.
+    #[inline]
     pub fn ask_level_arc(&self, market_id: u64, price: u64) -> Option<Arc<LevelBlob>> {
         self.ask_levels.get(&(market_id, price)).and_then(|s| s.clone())
     }
 
     /// Whether the ask level key is resident this block. See bid side.
+    #[inline]
     pub fn ask_level_resident(&self, market_id: u64, price: u64) -> bool {
         self.ask_levels.contains_key(&(market_id, price))
     }
 
     /// Inserts/overwrites and marks dirty. See bid side.
+    #[inline]
     pub fn set_ask_level(&mut self, market_id: u64, price: u64, value: LevelBlob) {
         self.mark(keys::ask_level_key(market_id, price), StoreSlot::AskLevel(market_id, price));
         self.ask_levels.insert((market_id, price), Some(Arc::new(value)));
     }
 
     /// Cold-fill (cache semantics, no dirty mark). See bid side.
+    #[inline]
     pub fn fill_ask_level(&mut self, market_id: u64, price: u64, value: Option<Arc<LevelBlob>>) {
         self.ask_levels.entry((market_id, price)).or_insert(value);
     }
 
     /// `&mut` (materialize empty default), AUTO-marking dirty. See bid side.
+    #[inline]
     pub fn ask_level_mut(&mut self, market_id: u64, price: u64) -> &mut LevelBlob {
         self.dirty
             .insert(keys::ask_level_key(market_id, price), StoreSlot::AskLevel(market_id, price));
@@ -952,6 +1015,7 @@ impl TypedPerpStore {
     /// accessor whose subject is `owner` routes to the local working-set until [`Self::flush_batch`];
     /// non-owner subjects (makers, admin, insurance fund) fall straight through, unchanged. Called by
     /// `drive_batch` before the item loop.
+    #[inline]
     pub fn begin_batch(&mut self, owner: Address) {
         debug_assert!(self.batch.is_none(), "nested batch working-set");
         self.batch = Some(BatchWorkingSet {
@@ -968,6 +1032,7 @@ impl TypedPerpStore {
     /// hit the main store during the items — replaying them would double-count. Deterministic order
     /// (account, then positions/buy/sell by ascending market_id) though the commitment re-sorts by
     /// key regardless. Idempotent: a no-op if no batch is attached.
+    #[inline]
     pub fn flush_batch(&mut self) {
         let Some(mut b) = self.batch.take() else {
             return;
@@ -1015,6 +1080,7 @@ impl TypedPerpStore {
     }
 
     /// Number of keys written this block (dirty-set size). Diagnostic / test hook.
+    #[inline]
     pub fn dirty_len(&self) -> usize {
         self.dirty.len()
     }
@@ -1025,6 +1091,7 @@ impl TypedPerpStore {
     /// from the SAME [`encode`](crate::codec::encode) as `save_*`, so the stream is
     /// byte-identical to the current overlay drain. Returned sorted by key (deterministic; the
     /// commitment sorts regardless).
+    #[inline]
     pub fn take_delta(&mut self) -> Result<Vec<(B256, Vec<u8>)>, PerpError> {
         let mut out: Vec<(B256, Vec<u8>)> = Vec::with_capacity(self.dirty.len());
         // Disjoint field borrows: draining `self.dirty` while reading the typed sub-maps.

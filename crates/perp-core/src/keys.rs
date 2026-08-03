@@ -124,6 +124,7 @@ fn pack_addr_u8(prefix: [u8; 4], user: Address, key_id: u8) -> B256 {
 /// contract's on-trie storage (not the off-trie perp store), so it MUST stay keccak to match
 /// the Solidity mapping layout — it is a different store and never collides with packed
 /// off-trie keys.
+#[inline]
 pub fn erc20_balance_slot(account: Address) -> B256 {
     let mut buf = [0u8; 64];
     buf[12..32].copy_from_slice(account.as_slice()); // left-pad address to 32 bytes
@@ -162,34 +163,40 @@ pub fn admin_key() -> B256 {
 // ── Global counters ───────────────────────────────────────────────────────────
 
 /// Per-market sequential trade ID counter.
+#[inline]
 pub fn trade_count_key(market_id: u64) -> B256 {
     pack_market(PFX_TRADE_COUNT, market_id)
 }
 
 // ── Account ─────────────────────────────────────────────────────────────────
 
+#[inline]
 pub fn account_key(user: Address) -> B256 {
     pack_addr(PFX_ACCOUNT, user)
 }
 
 // Fee rates + order nonce are folded into the account blob (see [`account_key`]) — no own keys.
 
+#[inline]
 pub fn market_fee_total_key(market_id: u64) -> B256 {
     pack_market(PFX_MARKET_FEE_TOTAL, market_id)
 }
 
 // ── Perp position ─────────────────────────────────────────────────────────────
 
+#[inline]
 pub fn position_key(user: Address, market_id: u64) -> B256 {
     pack_addr_market(PFX_POSITION, user, market_id)
 }
 
 /// Buy-order entries for a user in a market (Vec<OrderEntry>, sorted price DESC).
+#[inline]
 pub fn user_buy_orders_key(user: Address, market_id: u64) -> B256 {
     pack_addr_market(PFX_BUY_ORDERS, user, market_id)
 }
 
 /// Sell-order entries for a user in a market (Vec<OrderEntry>, sorted price ASC).
+#[inline]
 pub fn user_sell_orders_key(user: Address, market_id: u64) -> B256 {
     pack_addr_market(PFX_SELL_ORDERS, user, market_id)
 }
@@ -207,18 +214,21 @@ pub fn user_sell_orders_key(user: Address, market_id: u64) -> B256 {
 /// INVARIANT: order-id generation MUST remain a preimage-resistant hash. If it ever becomes
 /// low-entropy (e.g. a raw counter), this key needs a namespace tag or its own hash again,
 /// otherwise a crafted order id could collide with a structured key.
+#[inline]
 pub fn order_key(order_id: &[u8; 32]) -> B256 {
     B256::new(*order_id)
 }
 
 // ── Market ────────────────────────────────────────────────────────────────────
 
+#[inline]
 pub fn market_key(market_id: u64) -> B256 {
     pack_market(PFX_MARKET, market_id)
 }
 
 /// Per-market grouped hot scalars (`MarketHot`): mark price, best bid/ask, last traded, open
 /// interest. Replaces the five former single-scalar keys with one, so a co-access is one probe.
+#[inline]
 pub fn market_hot_key(market_id: u64) -> B256 {
     pack_market(PFX_MARKET_HOT, market_id)
 }
@@ -226,6 +236,7 @@ pub fn market_hot_key(market_id: u64) -> B256 {
 /// Per-market set of addresses holding an open position (packed 20-byte
 /// addresses). Maintained by the `save_position` zero-crossing hook; enumerated
 /// by the liquidation sweep.
+#[inline]
 pub fn position_registry_key(market_id: u64) -> B256 {
     pack_market(PFX_POSITION_REGISTRY, market_id)
 }
@@ -233,21 +244,25 @@ pub fn position_registry_key(market_id: u64) -> B256 {
 // ── Order book ────────────────────────────────────────────────────────────────
 
 /// Sorted list of all active **bid** prices for a market (Vec<u64>, price DESC).
+#[inline]
 pub fn bid_prices_key(market_id: u64) -> B256 {
     pack_market(PFX_BID_PRICES, market_id)
 }
 
 /// Sorted list of all active **ask** prices for a market (Vec<u64>, price ASC).
+#[inline]
 pub fn ask_prices_key(market_id: u64) -> B256 {
     pack_market(PFX_ASK_PRICES, market_id)
 }
 
 /// FIFO queue of order IDs at a specific bid price level.
+#[inline]
 pub fn bid_level_key(market_id: u64, price: u64) -> B256 {
     pack_market_price(PFX_BID_LEVEL, market_id, price)
 }
 
 /// FIFO queue of order IDs at a specific ask price level.
+#[inline]
 pub fn ask_level_key(market_id: u64, price: u64) -> B256 {
     pack_market_price(PFX_ASK_LEVEL, market_id, price)
 }
@@ -261,11 +276,13 @@ pub fn ask_level_key(market_id: u64, price: u64) -> B256 {
 // ── API key (ed25519 signed orders) ────────────────────────────────────────────
 
 /// ed25519 key for a specific (user, key_id) slot.
+#[inline]
 pub fn api_key_key(user: Address, key_id: u8) -> B256 {
     pack_addr_u8(PFX_API_KEY, user, key_id)
 }
 
 /// List of registered key_ids for a user (Vec<u8>).
+#[inline]
 pub fn api_key_ids_key(user: Address) -> B256 {
     pack_addr(PFX_API_KEY_IDS, user)
 }
@@ -291,26 +308,31 @@ pub fn market_manager_key() -> B256 {
 }
 
 /// Per-market IndexPriceState (index_price + timestamp).
+#[inline]
 pub fn index_price_state_key(market_id: u64) -> B256 {
     pack_market(PFX_INDEX_PRICE, market_id)
 }
 
 /// Per-market recent index price checkpoints.
+#[inline]
 pub fn index_price_history_key(market_id: u64) -> B256 {
     pack_market(PFX_INDEX_HISTORY, market_id)
 }
 
 /// Per-market PriceBasisWindow (30-second mid-price ring buffer).
+#[inline]
 pub fn price_basis_window_key(market_id: u64) -> B256 {
     pack_market(PFX_BASIS_WINDOW, market_id)
 }
 
 /// Per-market FundingState (last rate, interval, next timestamp).
+#[inline]
 pub fn funding_state_key(market_id: u64) -> B256 {
     pack_market(PFX_FUNDING_STATE, market_id)
 }
 
 /// Per-market PremiumIndexAccumulator (linearly-weighted premium index for funding).
+#[inline]
 pub fn premium_accumulator_key(market_id: u64) -> B256 {
     pack_market(PFX_PREMIUM_ACCUMULATOR, market_id)
 }
@@ -335,6 +357,7 @@ pub fn insurance_fund_key() -> B256 {
 // separates it from the raw-keccak order-id namespace so the two can never alias.
 
 /// Replay-guard key for a signed order, derived from `keccak256(signature)` (`sig_hash`).
+#[inline]
 pub fn seen_sig_key(sig_hash: &[u8; 32]) -> B256 {
     let mut buf = [0u8; 32];
     buf[..4].copy_from_slice(&PFX_SEEN_SIG);
@@ -345,6 +368,7 @@ pub fn seen_sig_key(sig_hash: &[u8; 32]) -> B256 {
 /// Time bucket (`timestamp / bucket_width`) holding the seen-sig keys recorded in that window, as a
 /// raw-packed `Vec<[u8;32]>` (like a level FIFO). Enumerated ONLY by the lazy GC, which drops whole
 /// expired buckets; never consulted on the replay-check hot path.
+#[inline]
 pub fn seen_bucket_key(bucket_id: u64) -> B256 {
     pack_market(PFX_SEEN_BUCKET, bucket_id)
 }

@@ -27,6 +27,7 @@ pub fn decode<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<T, PerpError> 
 }
 
 
+#[inline]
 pub fn unpack_order_ids(buf: &[u8]) -> Result<Vec<[u8; 32]>, PerpError> {
     if buf.len() % 32 != 0 {
         return Err(perp_err("corrupt order-id queue blob"));
@@ -55,6 +56,7 @@ pub struct LevelBlob {
 
 /// Packs a [`LevelBlob`]: empty when the level is empty (count 0) → delete; else count prefix + ids.
 /// Public so the typed store's `take_delta` (and the engine) reproduce the RAW (non-msgpack) level codec.
+#[inline]
 pub fn pack_level(b: &LevelBlob) -> Vec<u8> {
     if b.count == 0 {
         return Vec::new();
@@ -68,6 +70,7 @@ pub fn pack_level(b: &LevelBlob) -> Vec<u8> {
 }
 
 /// Inverse of [`pack_level`]. Empty buf → empty level (count 0, no ids).
+#[inline]
 pub fn unpack_level(buf: &[u8]) -> Result<LevelBlob, PerpError> {
     if buf.is_empty() {
         return Ok(LevelBlob::default());
