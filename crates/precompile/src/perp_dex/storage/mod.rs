@@ -1,6 +1,6 @@
 //! Storage helpers for the PerpDEX precompile.
 
-pub mod keys;
+pub use perp_core::keys;
 
 use context::{
     journaled_state::PerpDelta,
@@ -33,24 +33,10 @@ use keys::{
     seen_sig_key, trade_count_key, user_buy_orders_key, user_sell_orders_key,
 };
 
-// ── Generic msgpack helpers ───────────────────────────────────────────────────
-
-pub(crate) fn encode<T: Serialize>(val: &T) -> Result<Vec<u8>, PrecompileError> {
-    let mut buf = Vec::new();
-    // Positional (array) msgpack: struct field NAMES are NOT serialized (P4/#20) — smaller blobs
-    // and faster decode; the decoder reads fields by position via serde's `visit_seq`. Cross-
-    // version blob compatibility is intentionally dropped (the chain is wiped on any encoding
-    // change anyway, since blob bytes feed the on-trie commitment), so field ORDER in `types/` is
-    // now layout-significant — only append fields, never reorder/insert.
-    val.serialize(&mut RMPSerializer::new(&mut buf))
-        .map_err(|_| perp_err("msgpack encode error"))?;
-    Ok(buf)
-}
-
-pub(crate) fn decode<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<T, PrecompileError> {
-    let mut de = RMPDeserializer::new(buf);
-    Deserialize::deserialize(&mut de).map_err(|_| perp_err("msgpack decode error"))
-}
+// Canonical codec + block commitment live in `perp_core`; re-exported so in-crate callers
+// (and the bench harness) keep their `storage::encode`-style paths.
+pub use perp_core::codec::{encode, decode, pack_level, unpack_level, unpack_order_ids, LevelBlob};
+pub use perp_core::commitment::{compute_block_commitment, BLOCK_COMMITMENT_VERSION};
 
 /// Test-only instrumentation wrapped around the single off-trie blob read/write choke
 /// (`load_blob`/`store_blob`). Quantifies the ser/deser VOLUME of a run and the redundancy that a
@@ -199,55 +185,6 @@ fn store_blob<CTX: ContextTr>(
     Ok(())
 }
 
-/// Version byte mixed into the per-block commitment hash (catalog #16d). Bumped to 3 at the
-/// switch from the per-call chained v2 (retired) to the per-block net-delta fold; bumped to 4
-/// at the switch from keccak-derived storage keys to direct-packed keys (catalog #12), so the
-/// two key framings never alias across the consensus transition (a devnet wipe accompanies the
-/// bump); bumped to 5 at the price-index switch from sorted `Vec<u64>` to `Vec<u64>`
-/// (catalog #22) — the serialized price-level bytes change (container + order); bumped to 6 at the
-/// order-lifecycle redesign (commit-only #23): delete-on-terminal removes filled/cancelled orders
-/// from the map, the new per-level live-order count + lazy FIFO change the level-key set, and the
-/// signed-order replay guard moved to the seen-signature namespace — all shift the net-delta bytes;
-/// bumped to 7 grouping the five per-market hot scalars (mark price, best bid/ask, last traded,
-/// open interest) into one `MarketHot` blob — the delta keys + framing regroup (values identical);
-/// bumped to 8 folding the two per-user scalar keys (fee-rate bps, order nonce) into the account
-/// blob — the account blob grows and their standalone keys disappear from the delta; bumped to 9
-/// moving mark_price out of `MarketHot` into the `Market` blob (write-rare + co-read with config) —
-/// both blobs' bytes change (Market gains a field, MarketHot loses one); bumped to 10 folding each
-/// level's live-order count INTO its FIFO blob (`LevelBlob`, count(8 BE) prefix) — the per-level
-/// count keys disappear and the level blob framing changes; bumped to 11 when total perp
-/// collateral was appended to the account blob.
-// #A: bumped 11→12 for the PerpPosition reservation-aggregate fields (tbq/tbn/tsq/tsn) — a CHAIN
-// change (position blob layout changed → persisted state + commitment differ). Requires a golden
-// re-pin (below) + a coordinated wipe on deploy.
-const BLOCK_COMMITMENT_VERSION: u8 = 13;
-
-/// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
-///
-/// `C_block = blake3(C_prev ‖ BLOCK_COMMITMENT_VERSION ‖ Σ_sorted(key(32) ‖ len(u32 BE) ‖ value))`,
-/// keys ascending. `delta` is the net block writes from [`JournalTr::take_perp_delta`] (already one
-/// value per key, post-revert), so no coalescing is needed — only deterministic key-sorting (keys
-/// are a total order; the HashMap is never iterated for the hash). An empty value is a deleted key,
-/// framed with len 0 (same convention as the per-call path). Pure: the caller reads `C_prev` and
-/// sstores the result. This commits the block's net STATE CHANGE; chained onto the previous block's
-/// `C` it forms a block-granular running commitment, the off-trie analogue of the state root.
-pub fn compute_block_commitment(prev: U256, delta: &PerpDelta) -> U256 {
-    let mut keys: Vec<&B256> = delta.keys().collect();
-    keys.sort_unstable();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&prev.to_be_bytes::<32>());
-    hasher.update(&[BLOCK_COMMITMENT_VERSION]);
-    for key in keys {
-        // Fold the canonical BYTES only — `decoded` never feeds the commitment (选项A), so the
-        // byte-stream (and the on-trie anchor) is identical to the pre-Arc pipeline.
-        let value = &delta[key].bytes;
-        hasher.update(key.as_slice());
-        hasher.update(&(value.len() as u32).to_be_bytes());
-        hasher.update(value);
-    }
-    U256::from_be_bytes(*hasher.finalize().as_bytes())
-}
-
 /// Block-end hook (catalog #16d): folds the block's net perp delta into the on-trie 0x1003 anchor
 /// ONCE, replacing the per-call [`flush_commitment`]. The block executor calls this after
 /// [`JournalTr::take_perp_delta`], while the journal is still alive. No-op on an empty delta.
@@ -304,7 +241,7 @@ pub fn load_admin<CTX: ContextTr>(context: &mut CTX) -> Result<Address, Precompi
     if buf.is_empty() {
         return Ok(Address::ZERO);
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn save_admin<CTX: ContextTr>(
@@ -616,7 +553,7 @@ pub fn load_market_fee_total<CTX: ContextTr>(
     if buf.is_empty() {
         return Ok(0);
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn add_market_fee_total<CTX: ContextTr>(
@@ -1378,59 +1315,6 @@ fn pack_order_ids(queue: &[[u8; 32]]) -> Vec<u8> {
 }
 
 /// Inverse of [`pack_order_ids`]: chunks a raw blob into 32-byte ids.
-fn unpack_order_ids(buf: &[u8]) -> Result<Vec<[u8; 32]>, PrecompileError> {
-    if buf.len() % 32 != 0 {
-        return Err(perp_err("corrupt order-id queue blob"));
-    }
-    Ok(buf
-        .chunks_exact(32)
-        .map(|chunk| {
-            let mut id = [0u8; 32];
-            id.copy_from_slice(chunk);
-            id
-        })
-        .collect())
-}
-
-/// A price level's FIFO + its live-order count, in ONE blob (count folded in — they are written
-/// together on rest/match, so this halves the per-level keys in the delta/commitment and lets the
-/// match walk read ids + count in one probe). `count` = LIVE (Open/PartiallyFilled) orders; `ids`
-/// = the FIFO (live + lazily-swept stale). Packed raw as `count(8 BE) ++ id0(32) ++ id1(32) ...`
-/// (no msgpack, P4/#20 compactness). `count == 0` means the level is EMPTY → packs to an empty buf
-/// (the delete convention); stale `ids` are discarded on empty.
-#[derive(Clone, Debug, Default)]
-pub struct LevelBlob {
-    pub count: u64,
-    pub ids: Vec<[u8; 32]>,
-}
-
-/// Packs a [`LevelBlob`]: empty when the level is empty (count 0) → delete; else count prefix + ids.
-/// `pub(crate)` so the typed store's `take_delta` reproduces the RAW (non-msgpack) level codec.
-pub(crate) fn pack_level(b: &LevelBlob) -> Vec<u8> {
-    if b.count == 0 {
-        return Vec::new();
-    }
-    let mut buf = Vec::with_capacity(8 + b.ids.len() * 32);
-    buf.extend_from_slice(&b.count.to_be_bytes());
-    for id in &b.ids {
-        buf.extend_from_slice(id);
-    }
-    buf
-}
-
-/// Inverse of [`pack_level`]. Empty buf → empty level (count 0, no ids).
-fn unpack_level(buf: &[u8]) -> Result<LevelBlob, PrecompileError> {
-    if buf.is_empty() {
-        return Ok(LevelBlob::default());
-    }
-    if buf.len() < 8 {
-        return Err(perp_err("corrupt level blob (short)"));
-    }
-    let count = u64::from_be_bytes(buf[..8].try_into().unwrap());
-    let ids = unpack_order_ids(&buf[8..])?;
-    Ok(LevelBlob { count, ids })
-}
-
 /// Cold read for a level (raw codec): cross-block decoded store (Arc<LevelBlob>, zero clone) →
 /// committed bytes → `unpack_level` once. Mirrors [`cold_load`] but for the non-msgpack level blob.
 fn cold_load_level<CTX: ContextTr>(
@@ -1832,7 +1716,7 @@ pub fn load_api_key_ids<CTX: ContextTr>(
     if buf.is_empty() {
         return Ok(vec![]);
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 fn save_api_key_ids<CTX: ContextTr>(
@@ -1851,7 +1735,7 @@ pub fn load_oracle<CTX: ContextTr>(context: &mut CTX) -> Result<Address, Precomp
     if buf.is_empty() {
         return Ok(Address::ZERO);
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn save_oracle<CTX: ContextTr>(
@@ -1867,7 +1751,7 @@ pub fn load_market_manager<CTX: ContextTr>(context: &mut CTX) -> Result<Address,
     if buf.is_empty() {
         return Ok(Address::ZERO);
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn save_market_manager<CTX: ContextTr>(
@@ -1888,7 +1772,7 @@ pub fn load_index_price_state<CTX: ContextTr>(
     if buf.is_empty() {
         return Ok(IndexPriceState::default());
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn save_index_price_state<CTX: ContextTr>(
@@ -1910,7 +1794,7 @@ pub fn load_index_price_history<CTX: ContextTr>(
     if buf.is_empty() {
         return Ok(IndexPriceHistory::default());
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn save_index_price_history<CTX: ContextTr>(
@@ -1930,7 +1814,7 @@ pub fn load_price_basis_window<CTX: ContextTr>(
     if buf.is_empty() {
         return Ok(PriceBasisWindow::default());
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn save_price_basis_window<CTX: ContextTr>(
@@ -1970,7 +1854,7 @@ pub fn load_funding_state<CTX: ContextTr>(
     if buf.is_empty() {
         return Ok(FundingState::default());
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn save_funding_state<CTX: ContextTr>(
@@ -1989,7 +1873,7 @@ pub fn load_insurance_fund<CTX: ContextTr>(context: &mut CTX) -> Result<u64, Pre
     if buf.is_empty() {
         return Ok(0);
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn save_insurance_fund<CTX: ContextTr>(
@@ -2091,7 +1975,7 @@ pub fn load_premium_accumulator<CTX: ContextTr>(
     if buf.is_empty() {
         return Ok(PremiumIndexAccumulator::default());
     }
-    decode(&buf)
+    Ok(decode(&buf)?)
 }
 
 pub fn save_premium_accumulator<CTX: ContextTr>(

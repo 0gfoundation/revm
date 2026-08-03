@@ -21,6 +21,7 @@ workspace = true
 # revm
 primitives.workspace = true
 context.workspace = true
+perp-core.workspace = true
 bytecode.workspace = true
 
 # modexp precompiles

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{perp_dex::errors::perp_err, PrecompileError};
+use crate::error::{perp_err, PerpError};
 
 pub const PRICE_BASIS_WINDOW_SIZE: usize = 30;
 
@@ -78,7 +78,7 @@ impl PriceBasisWindow {
         &self,
         index_history: &IndexPriceHistory,
         end_ts: u64,
-    ) -> Result<i64, PrecompileError> {
+    ) -> Result<i64, PerpError> {
         if end_ts == 0 {
             return Ok(0);
         }
@@ -247,7 +247,7 @@ pub struct PremiumIndexAccumulator {
 
 impl PremiumIndexAccumulator {
     /// Push one premium-index slot. Weight = sample_count + 1 (1-indexed).
-    fn push_slot(&mut self, pi: i64) -> Result<(), PrecompileError> {
+    fn push_slot(&mut self, pi: i64) -> Result<(), PerpError> {
         let next_count = self
             .sample_count
             .checked_add(1)
@@ -269,7 +269,7 @@ impl PremiumIndexAccumulator {
         epoch_start_ts: u64,
         timestamp: u64,
         pi: i64,
-    ) -> Result<(), PrecompileError> {
+    ) -> Result<(), PerpError> {
         self.weighted_sum = 0;
         self.sample_count = 0;
         self.epoch_start_ts = epoch_start_ts;
@@ -287,7 +287,7 @@ impl PremiumIndexAccumulator {
         end_ts: u64,
         sample_interval: u64,
         endpoint_pi: Option<i64>,
-    ) -> Result<(), PrecompileError> {
+    ) -> Result<(), PerpError> {
         if sample_interval == 0 || self.last_sample_ts == 0 || end_ts <= self.last_sample_ts {
             return Ok(());
         }
@@ -313,7 +313,7 @@ impl PremiumIndexAccumulator {
     }
 
     /// Linearly-weighted average: Σ(k·PI_k) / Σk = weighted_sum / (n·(n+1)/2).
-    pub fn average(&self) -> Result<i64, PrecompileError> {
+    pub fn average(&self) -> Result<i64, PerpError> {
         if self.sample_count == 0 {
             return Ok(0);
         }

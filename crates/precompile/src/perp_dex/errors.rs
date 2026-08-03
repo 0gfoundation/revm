@@ -17,3 +17,15 @@ pub fn perp_invariant_err(msg: impl Into<String>) -> PrecompileError {
 pub fn perp_fatal_invariant_err(msg: impl Into<String>) -> PrecompileError {
     PrecompileError::Fatal(format!("[INVARIANT] {}", msg.into()))
 }
+
+/// Boundary conversion: engine-core errors surface as the same two `PrecompileError`
+/// shapes the perp code has always used (`Other` = clean revert, `Fatal` = halt), so
+/// engine calls compose with `?` in shell code unchanged.
+impl From<perp_core::PerpError> for crate::PrecompileError {
+    fn from(e: perp_core::PerpError) -> Self {
+        match e {
+            perp_core::PerpError::Reject(m) => crate::PrecompileError::Other(m),
+            perp_core::PerpError::Fatal(m) => crate::PrecompileError::Fatal(m),
+        }
+    }
+}

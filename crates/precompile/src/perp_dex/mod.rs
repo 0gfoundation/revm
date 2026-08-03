@@ -70,14 +70,14 @@ pub mod batch;
 pub mod errors;
 pub mod funding;
 pub mod interface;
-pub mod math;
+pub use perp_core::math;
 #[cfg(any(feature = "bench-util", test))]
 pub mod prof;
 pub mod risk;
 pub mod storage;
 pub mod trading;
-pub mod typed_store;
-pub mod types;
+pub use perp_core::typed_store;
+pub use perp_core::types;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

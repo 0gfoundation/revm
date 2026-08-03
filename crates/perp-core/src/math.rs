@@ -4,11 +4,8 @@
 //! Quote amounts use 6-decimal fixed-point (`QUOTE_DECIMALS = 6`).
 
 use crate::{
-    perp_dex::{
-        errors::perp_err,
-        types::{Market, OrderEntry},
-    },
-    PrecompileError,
+    error::{perp_err, PerpError},
+    types::{Market, OrderEntry},
 };
 
 pub const QUOTE_DECIMALS: u32 = 6;
@@ -63,21 +60,21 @@ pub fn mark_band_bounds(mark: u64, price_band_bps: u32) -> (u128, u128) {
 }
 
 #[inline]
-fn pow10_u128(exp: u32) -> Result<u128, PrecompileError> {
+fn pow10_u128(exp: u32) -> Result<u128, PerpError> {
     10u128
         .checked_pow(exp)
         .ok_or_else(|| perp_err("math: decimal exponent overflow"))
 }
 
 #[inline]
-fn pow10_i128(exp: u32) -> Result<i128, PrecompileError> {
+fn pow10_i128(exp: u32) -> Result<i128, PerpError> {
     10i128
         .checked_pow(exp)
         .ok_or_else(|| perp_err("math: decimal exponent overflow"))
 }
 
 #[inline]
-pub fn checked_u64_to_i64(value: u64, context: &str) -> Result<i64, PrecompileError> {
+pub fn checked_u64_to_i64(value: u64, context: &str) -> Result<i64, PerpError> {
     i64::try_from(value).map_err(|_| perp_err(format!("{context}: value exceeds i64::MAX")))
 }
 
@@ -88,7 +85,7 @@ pub fn calc_value(
     quantity: u64,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     let quote_scale = pow10_u128(QUOTE_DECIMALS)?;
     let numerator = (price as u128)
         .checked_mul(quantity as u128)
@@ -103,7 +100,7 @@ pub fn calc_value(
 
 /// Trading fee in quote units, rounded down.
 #[inline]
-pub fn calc_trading_fee(notional: u64, fee_bps: u64) -> Result<u64, PrecompileError> {
+pub fn calc_trading_fee(notional: u64, fee_bps: u64) -> Result<u64, PerpError> {
     let fee = (notional as u128)
         .checked_mul(fee_bps as u128)
         .ok_or_else(|| perp_err("math: trading fee overflow"))?
@@ -121,7 +118,7 @@ pub fn calc_maker_fee_for_order_qty_with_bps(
     qty: u64,
     maker_fee_bps: u64,
     market: &Market,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     let notional = calc_value(price, qty, market.base_decimals, market.price_decimals)?;
     calc_trading_fee(notional, maker_fee_bps)
 }
@@ -133,7 +130,7 @@ pub fn calc_value_i64(
     quantity: i64,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<i64, PrecompileError> {
+) -> Result<i64, PerpError> {
     let quote_scale = pow10_i128(QUOTE_DECIMALS)?;
     let numerator = (price as i128)
         .checked_mul(quantity as i128)
@@ -155,7 +152,7 @@ pub fn is_above_maintenance_margin(
     margin: i64,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<bool, PrecompileError> {
+) -> Result<bool, PerpError> {
     let notional = calc_value_i64(mark_price, amount, base_decimals, price_decimals)?;
     let position_value = notional
         .checked_add(v_quote_balance)
@@ -179,7 +176,7 @@ pub fn calc_position_equity(
     margin: i64,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<i64, PrecompileError> {
+) -> Result<i64, PerpError> {
     calc_value_i64(mark_price, amount, base_decimals, price_decimals)?
         .checked_add(v_quote_balance)
         .and_then(|v| v.checked_add(margin))
@@ -192,7 +189,7 @@ pub fn calc_remaining_margin(
     total_quantity: u64,
     incoming_quantity: u64,
     initial_margin: i64,
-) -> Result<i64, PrecompileError> {
+) -> Result<i64, PerpError> {
     if incoming_quantity >= total_quantity {
         return Ok(0);
     }
@@ -210,7 +207,7 @@ pub fn calc_new_margin_reserved_after_leverage_update(
     old_leverage: u64,
     new_leverage: u64,
     old_margin_reserved: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     if new_leverage == 0 {
         return Err(perp_err("math: leverage cannot be zero"));
     }
@@ -228,7 +225,7 @@ pub fn calc_entry_price(
     v_quote_balance: i64,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     if amount == 0 {
         return Ok(0);
     }
@@ -251,7 +248,7 @@ pub fn calc_liquidation_price(
     margin: i64,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<i64, PrecompileError> {
+) -> Result<i64, PerpError> {
     if amount == 0 {
         return Ok(0);
     }
@@ -292,7 +289,7 @@ pub fn calc_bankruptcy_price(
     margin: i64,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     if amount == 0 {
         return Ok(0);
     }
@@ -359,7 +356,7 @@ pub fn calc_funding_payment(
     index_delta: i128,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<i64, PrecompileError> {
+) -> Result<i64, PerpError> {
     let numerator = (amount as i128)
         .checked_mul(index_delta)
         .and_then(|v| v.checked_mul(pow10_i128(QUOTE_DECIMALS).ok()?))
@@ -380,7 +377,7 @@ pub fn calc_buy_side_reserved_notional(
     base_decimals: u32,
     price_decimals: u32,
     position_amount: i64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     let mut remaining = if position_amount >= 0 {
         0i64
     } else {
@@ -416,7 +413,7 @@ pub fn calc_sell_side_reserved_notional(
     base_decimals: u32,
     price_decimals: u32,
     position_amount: i64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     let mut remaining = if position_amount <= 0 {
         0i64
     } else {
@@ -448,7 +445,7 @@ pub fn calc_sell_side_reserved_notional(
 /// (0 while still covering; the overflow at the boundary; the full amount once past). Matches the
 /// per-entry logic in [`calc_buy_side_reserved_notional`] exactly.
 #[inline]
-fn open_amount(remaining: &mut i64, amount: i64) -> Result<i64, PrecompileError> {
+fn open_amount(remaining: &mut i64, amount: i64) -> Result<i64, PerpError> {
     *remaining = remaining
         .checked_sub(amount)
         .ok_or_else(|| perp_err("math: cover remaining overflow"))?;
@@ -475,7 +472,7 @@ pub fn calc_buy_side_dual(
     price_decimals: u32,
     position_a: i64,
     position_b: i64,
-) -> Result<(u64, u64, i64), PrecompileError> {
+) -> Result<(u64, u64, i64), PerpError> {
     let mut rem_a = if position_a >= 0 {
         0i64
     } else {
@@ -540,7 +537,7 @@ pub fn calc_sell_side_dual(
     price_decimals: u32,
     position_a: i64,
     position_b: i64,
-) -> Result<(u64, u64, i64), PrecompileError> {
+) -> Result<(u64, u64, i64), PerpError> {
     let mut rem_a = if position_a <= 0 { 0i64 } else { position_a };
     let mut rem_b = if position_b <= 0 { 0i64 } else { position_b };
     let mut res_a = 0u64;
@@ -614,7 +611,7 @@ pub fn calc_reservation_notionals(
     base_decimals: u32,
     price_decimals: u32,
     position_amount: i64,
-) -> Result<(u64, u64, u64), PrecompileError> {
+) -> Result<(u64, u64, u64), PerpError> {
     calc_reservation_notionals_it(
         buy_entries.iter().copied(),
         sell_entries.iter().copied(),
@@ -638,7 +635,7 @@ pub fn calc_reservation_notionals_it<B, S>(
     base_decimals: u32,
     price_decimals: u32,
     position_amount: i64,
-) -> Result<(u64, u64, u64), PrecompileError>
+) -> Result<(u64, u64, u64), PerpError>
 where
     B: Iterator<Item = OrderEntry>,
     S: Iterator<Item = OrderEntry> + Clone,
@@ -689,7 +686,7 @@ where
 fn total_entry_amount(
     entries: impl Iterator<Item = OrderEntry>,
     ctx: &str,
-) -> Result<i64, PrecompileError> {
+) -> Result<i64, PerpError> {
     let mut total = 0u64;
     for e in entries {
         total = total.checked_add(e.amount).ok_or_else(|| perp_err(ctx))?;
@@ -726,7 +723,7 @@ pub fn sum_side_totals(
     entries: impl Iterator<Item = OrderEntry>,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<(u64, u64), PrecompileError> {
+) -> Result<(u64, u64), PerpError> {
     let mut qty = 0u64;
     let mut notional = 0u64;
     for e in entries {
@@ -751,7 +748,7 @@ fn side_leg_from_total(
     base_decimals: u32,
     price_decimals: u32,
     cover: i64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     if cover <= 0 {
         return Ok(total_notional);
     }
@@ -799,7 +796,7 @@ pub fn calc_reservation_notionals_from_totals(
     base_decimals: u32,
     price_decimals: u32,
     position_amount: i64,
-) -> Result<(u64, u64, u64), PrecompileError> {
+) -> Result<(u64, u64, u64), PerpError> {
     calc_reservation_notionals_from_totals_it(
         buy_entries.iter().copied(),
         sell_entries.iter().copied(),
@@ -828,7 +825,7 @@ pub fn calc_reservation_notionals_from_totals_it<B, S>(
     base_decimals: u32,
     price_decimals: u32,
     position_amount: i64,
-) -> Result<(u64, u64, u64), PrecompileError>
+) -> Result<(u64, u64, u64), PerpError>
 where
     B: Iterator<Item = OrderEntry> + Clone,
     S: Iterator<Item = OrderEntry> + Clone,

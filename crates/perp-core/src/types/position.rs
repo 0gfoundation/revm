@@ -78,7 +78,7 @@ impl PerpPosition {
     /// `buy_notional` / `sell_notional` are each side's open-order opening
     /// notional at the current position; `c_notional` is the **flip-aware**
     /// worst-case reservation notional `max(S + B', B + S')` produced by
-    /// [`crate::perp_dex::math::calc_reservation_notionals`], which accounts for
+    /// [`crate::math::calc_reservation_notionals`], which accounts for
     /// a position sign-flip when one side of the book fully fills. Writes:
     /// - per-side `*_reserved_notional` = each side's notional (informational),
     /// - per-side `*_margin_reserved`   = notional / leverage (informational;
@@ -94,7 +94,7 @@ impl PerpPosition {
     /// change in `margin_reserved` around this call (NOT from the per-side
     /// fields — those lag `margin_reserved` under the flip-aware model) and own
     /// `fee_reserved` separately.
-    pub(crate) fn set_reservations(
+    pub fn set_reservations(
         &mut self,
         buy_notional: u64,
         sell_notional: u64,
@@ -176,7 +176,7 @@ pub struct Market {
     /// Price band half-width in basis points (1 bps = 0.01%). A limit order is
     /// rejected at placement if its price lies outside `mark ± price_band_bps`.
     /// `0` means "use `DEFAULT_PRICE_BAND_BPS`"; a large value (e.g. `>= 10_000`)
-    /// effectively disables the band. Resolve via `crate::perp_dex::math::effective_price_band_bps`.
+    /// effectively disables the band. Resolve via `crate::math::effective_price_band_bps`.
     #[serde(default, rename = "pb")]
     pub price_band_bps: u32,
     /// Mark price (oracle-driven, in `price_decimals` units). Lives in the Market blob — NOT in

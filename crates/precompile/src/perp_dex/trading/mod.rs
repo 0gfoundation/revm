@@ -2651,7 +2651,7 @@ pub(super) fn release_margin_core(
         market,
     )?;
     // Registry path: credit the owned working-copy account (saved once at flush).
-    account.credit_perp(total_freed)
+    Ok(account.credit_perp(total_freed)?)
 }
 
 /// Applies a cancel's margin release to the POSITION given the POST-cancel reservation notionals +

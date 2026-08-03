@@ -3353,6 +3353,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3148f5046208a5d56bcfc03053e3ca6334e51da8dfb19b6cdc8b306fae3283e"
 
 [[package]]
+name = "perp-core"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "revm-context",
+ "revm-context-interface",
+ "revm-database",
+ "revm-primitives",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_repr",
+]
+
+[[package]]
 name = "pest"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4006,6 +4021,7 @@ dependencies = [
  "kzg-rs",
  "libsecp256k1",
  "p256",
+ "perp-core",
  "rand 0.9.1",
  "revm-bytecode",
  "revm-context",

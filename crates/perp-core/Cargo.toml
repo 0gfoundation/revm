@@ -1,0 +1,32 @@
+[package]
+name = "perp-core"
+description = "0G PerpDEX core: state types, codec, typed store, block commitment. No EVM dependencies beyond the revm journal seam types."
+version = "1.0.0"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+primitives.workspace = true
+context-interface.workspace = true
+serde = { workspace = true, features = ["derive"] }
+rmp-serde.workspace = true
+serde_repr.workspace = true
+serde_bytes.workspace = true
+blake3 = { workspace = true, features = ["std"] }
+
+[features]
+default = ["std"]
+std = ["primitives/std", "serde/std", "context-interface/std"]
+
+[dev-dependencies]
+# The journal-seam integration test installs TypedPerpStore into a real Journal.
+context.workspace = true
+database = { workspace = true, features = ["std"] }

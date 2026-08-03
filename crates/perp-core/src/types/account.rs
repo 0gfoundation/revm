@@ -2,7 +2,7 @@
 use primitives::U256;
 use serde::{Deserialize, Serialize};
 
-use crate::{as_bin::AsBinStr, perp_dex::errors::perp_err, PrecompileError};
+use crate::{as_bin::AsBinStr, error::{perp_err, PerpError}};
 
 /// Maximum positive balance accepted by the signed perp wallet.
 pub const MAX_PERP_WALLET_BALANCE: u64 = i64::MAX as u64;
@@ -95,7 +95,7 @@ impl UserAccount {
     }
 
     /// Adds positive perp wallet balance.
-    pub fn credit_perp(&mut self, amount: u64) -> Result<(), PrecompileError> {
+    pub fn credit_perp(&mut self, amount: u64) -> Result<(), PerpError> {
         let amount =
             i64::try_from(amount).map_err(|_| perp_err("perp wallet: amount exceeds i64::MAX"))?;
         self.perp_wallet_balance = self
@@ -106,7 +106,7 @@ impl UserAccount {
     }
 
     /// Debits perp wallet balance, allowing the internal value to go negative.
-    pub fn debit_perp(&mut self, amount: u64) -> Result<(), PrecompileError> {
+    pub fn debit_perp(&mut self, amount: u64) -> Result<(), PerpError> {
         let amount =
             i64::try_from(amount).map_err(|_| perp_err("perp wallet: amount exceeds i64::MAX"))?;
         self.perp_wallet_balance = self

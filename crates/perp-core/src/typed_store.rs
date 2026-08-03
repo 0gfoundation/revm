@@ -5,7 +5,7 @@
 //! `dyn Any` overlay that today lives in `revm-context`'s `PerpSection`. Reads/writes hit a typed
 //! sub-map directly (no per-blob `downcast`, no 4-probe overlay dance), and block-end
 //! [`TypedPerpStore::take_delta`] re-derives the canonical `(B256 key, bytes)` pairs from a dirty
-//! set using the SAME [`encode`](crate::perp_dex::storage::encode) the current `save_*` path uses —
+//! set using the SAME [`encode`](crate::codec::encode) the current `save_*` path uses —
 //! so the pairs are byte-identical to the overlay drain and the block commitment
 //! (`compute_block_commitment`) is unchanged.
 //!
@@ -22,16 +22,17 @@
 //! current `get_struct_mut` write-count semantics), and `take_delta` reads each dirty entity's FINAL
 //! value straight from its sub-map (absent = removed = empty bytes = the delete convention).
 
-use context::journaled_state::{PerpBlob, PerpDelta, PerpDeltaEntry, PerpStore};
+use context_interface::journaled_state::{PerpBlob, PerpDelta, PerpDeltaEntry, PerpStore};
 use primitives::{Address, HashMap, HashSet, B256};
 use std::sync::Arc;
 use std::vec::Vec;
 
-use crate::perp_dex::storage::{encode, keys, pack_level, LevelBlob};
-use crate::perp_dex::types::{
+use crate::codec::{encode, pack_level, LevelBlob};
+use crate::keys;
+use crate::types::{
     Market, MarketHot, Order, OrderEntry, PerpPosition, UserAccount,
 };
-use crate::PrecompileError;
+use crate::error::PerpError;
 
 /// Identifies which typed sub-map + identity a dirty `B256` key refers to, so [`TypedPerpStore::take_delta`]
 /// can read the entity's current value back out (or detect its removal → tombstone) without
@@ -1021,10 +1022,10 @@ impl TypedPerpStore {
     /// Drains the block's dirty set into canonical `(key, bytes)` pairs — the input
     /// `compute_block_commitment` folds and the persistence layer writes. An entity that is absent
     /// from its sub-map (removed this block) yields EMPTY bytes (the delete convention). Bytes come
-    /// from the SAME [`encode`](crate::perp_dex::storage::encode) as `save_*`, so the stream is
+    /// from the SAME [`encode`](crate::codec::encode) as `save_*`, so the stream is
     /// byte-identical to the current overlay drain. Returned sorted by key (deterministic; the
     /// commitment sorts regardless).
-    pub fn take_delta(&mut self) -> Result<Vec<(B256, Vec<u8>)>, PrecompileError> {
+    pub fn take_delta(&mut self) -> Result<Vec<(B256, Vec<u8>)>, PerpError> {
         let mut out: Vec<(B256, Vec<u8>)> = Vec::with_capacity(self.dirty.len());
         // Disjoint field borrows: draining `self.dirty` while reading the typed sub-maps.
         for (key, slot) in self.dirty.drain() {
@@ -1176,7 +1177,7 @@ impl PerpStore for TypedPerpStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perp_dex::storage::decode;
+    use crate::codec::decode;
 
     fn sample_market(id: u64) -> Market {
         Market {
