@@ -15,6 +15,12 @@ pub enum PerpError {
     /// Fatal invariant violation: accounting failure that makes the in-memory state
     /// unsafe to continue executing. Propagates as a halting error, never a revert.
     Fatal(String),
+    /// Call-shell error: the selector's flat gas exceeds the provided gas limit.
+    OutOfGas,
+    /// Call-shell error: a state-mutating selector was invoked in a static context.
+    StaticRestrictionViolation,
+    /// Call-shell error: missing/unknown selector or malformed stateful-call input.
+    StatefulInvalidInput,
 }
 
 impl core::fmt::Display for PerpError {
@@ -22,6 +28,9 @@ impl core::fmt::Display for PerpError {
         match self {
             PerpError::Reject(m) => f.write_str(m),
             PerpError::Fatal(m) => f.write_str(m),
+            PerpError::OutOfGas => f.write_str("out of gas"),
+            PerpError::StaticRestrictionViolation => f.write_str("static restriction violated"),
+            PerpError::StatefulInvalidInput => f.write_str("invalid stateful-call input"),
         }
     }
 }

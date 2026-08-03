@@ -2,46 +2,44 @@
 
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
-use context::{Block as BlockTr, ContextTr, JournalTr};
+use crate::host::PerpHost;
 use ed25519_dalek::{Signature, VerifyingKey};
 use primitives::{Address, Bytes, FixedBytes, Log};
 
 use crate::{
-    perp_dex::{
         errors::perp_err,
-        funding::{apply_funding_settlement, compute_funding_settlement},
-        interface::IPerpDex::{
-            self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
-            getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
-            getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn, getInsuranceFundCall,
-            getMarkPriceCall, getMarketCall, getMarketManagerAddressCall, getMarketReturn,
-            getOracleAddressCall, getPositionCall, getPositionReturn, initAdminCall, liquidateCall,
-            removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
-            setMarketManagerAddressCall, setOracleAddressCall, transferAdminCall,
-            updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
-        },
-        math::{
-            calc_funding_rate, calc_position_equity, calc_value, checked_u64_to_i64,
-            is_above_maintenance_margin, FUNDING_RATE_ONE,
-        },
-        storage,
-        trading::{
-            check_api_key_expiry, check_recv_window, execute_liquidation_market_order, run_adl,
-            settle_liquidation_residual_at_mark_price, verify_ed25519,
-        },
-        types::{FundingState, IndexPriceState, Market, PremiumIndexAccumulator, Side},
-        PERP_DEX_ADDRESS,
+    funding::{apply_funding_settlement, compute_funding_settlement},
+    interface::IPerpDex::{
+        self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
+        getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
+        getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn, getInsuranceFundCall,
+        getMarkPriceCall, getMarketCall, getMarketManagerAddressCall, getMarketReturn,
+        getOracleAddressCall, getPositionCall, getPositionReturn, initAdminCall, liquidateCall,
+        removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
+        setMarketManagerAddressCall, setOracleAddressCall, transferAdminCall,
+        updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
     },
-    PrecompileError,
+    math::{
+        calc_funding_rate, calc_position_equity, calc_value, checked_u64_to_i64,
+        is_above_maintenance_margin, FUNDING_RATE_ONE,
+    },
+    storage,
+    trading::{
+        check_api_key_expiry, check_recv_window, execute_liquidation_market_order, run_adl,
+        settle_liquidation_residual_at_mark_price, verify_ed25519,
+    },
+    types::{FundingState, IndexPriceState, Market, PremiumIndexAccumulator, Side},
+    PERP_DEX_ADDRESS,
+    PerpError,
 };
 
 // ── Admin: ownership ──────────────────────────────────────────────────────────
 
 /// `initAdmin(address admin)` — one-time initialisation; fails if already set.
-pub fn run_init_admin<CTX: ContextTr>(
+pub fn run_init_admin<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = initAdminCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("initAdmin: invalid calldata"))?;
 
@@ -54,7 +52,7 @@ pub fn run_init_admin<CTX: ContextTr>(
     }
     storage::save_admin(context, args.admin)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::AdminInitialized { admin: args.admin }.to_log_data(),
     });
@@ -62,11 +60,11 @@ pub fn run_init_admin<CTX: ContextTr>(
 }
 
 /// `transferAdmin(address newAdmin)` — only callable by current admin.
-pub fn run_transfer_admin<CTX: ContextTr>(
+pub fn run_transfer_admin<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = transferAdminCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("transferAdmin: invalid calldata"))?;
 
@@ -82,7 +80,7 @@ pub fn run_transfer_admin<CTX: ContextTr>(
     }
     storage::save_admin(context, args.newAdmin)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::AdminTransferred {
             previousAdmin: current,
@@ -94,10 +92,10 @@ pub fn run_transfer_admin<CTX: ContextTr>(
 }
 
 /// `getAdmin() returns (address admin)`
-pub fn run_get_admin<CTX: ContextTr>(
+pub fn run_get_admin<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     getAdminCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getAdmin: invalid calldata"))?;
     let admin = storage::load_admin(context)?;
@@ -107,11 +105,11 @@ pub fn run_get_admin<CTX: ContextTr>(
 // ── Admin: market management ──────────────────────────────────────────────────
 
 /// `addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate)`
-pub fn run_add_market<CTX: ContextTr>(
+pub fn run_add_market<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = addMarketCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("addMarket: invalid calldata"))?;
 
@@ -187,7 +185,7 @@ pub fn run_add_market<CTX: ContextTr>(
     };
     storage::save_market(context, &market)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::MarketAdded {
             marketId: args.marketId,
@@ -207,7 +205,7 @@ pub fn run_add_market<CTX: ContextTr>(
         }
         .to_log_data(),
     });
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::MarkPriceUpdated {
             marketId: args.marketId,
@@ -221,11 +219,11 @@ pub fn run_add_market<CTX: ContextTr>(
 }
 
 /// `updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps)`
-pub fn run_update_market<CTX: ContextTr>(
+pub fn run_update_market<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = updateMarketCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("updateMarket: invalid calldata"))?;
 
@@ -282,7 +280,7 @@ pub fn run_update_market<CTX: ContextTr>(
     market.price_band_bps = args.priceBandBps;
     storage::save_market(context, &market)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::MarketUpdated {
             marketId: args.marketId,
@@ -305,10 +303,10 @@ pub fn run_update_market<CTX: ContextTr>(
 }
 
 /// `getMarkPrice(uint64 marketId) returns (uint64 price)`
-pub fn run_get_mark_price<CTX: ContextTr>(
+pub fn run_get_mark_price<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getMarkPriceCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getMarkPrice: invalid calldata"))?;
 
@@ -317,10 +315,10 @@ pub fn run_get_mark_price<CTX: ContextTr>(
 }
 
 /// `getMarket(uint64 marketId) returns (uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active)`
-pub fn run_get_market<CTX: ContextTr>(
+pub fn run_get_market<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getMarketCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getMarket: invalid calldata"))?;
 
@@ -348,21 +346,21 @@ pub fn run_get_market<CTX: ContextTr>(
 // ── Leverage ──────────────────────────────────────────────────────────────────
 
 /// `setLeverage(uint64 marketId, uint64 leverage)`
-pub fn run_set_leverage<CTX: ContextTr>(
+pub fn run_set_leverage<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = setLeverageCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("setLeverage: invalid calldata"))?;
     set_leverage_core(context, caller, args.marketId, args.leverage)
 }
 
 /// `setLeverageSigned(address account, uint64 marketId, uint64 leverage, uint64 timestamp, uint64 recvWindow, uint8 keyId, bytes signature)`
-pub fn run_set_leverage_signed<CTX: ContextTr>(
+pub fn run_set_leverage_signed<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = setLeverageSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("setLeverageSigned: invalid calldata"))?;
 
@@ -393,12 +391,12 @@ pub fn run_set_leverage_signed<CTX: ContextTr>(
     set_leverage_core(context, args.account, args.marketId, args.leverage)
 }
 
-fn set_leverage_core<CTX: ContextTr>(
-    context: &mut CTX,
+fn set_leverage_core<H: PerpHost>(
+    context: &mut H,
     account: Address,
     market_id: u64,
     leverage: u64,
-) -> Result<Bytes, PrecompileError> {
+) -> Result<Bytes, PerpError> {
     // Max leverage is capped at 6 to stay consistent with the 1/6 maintenance-margin
     // rate: a fresh position opened at leverage L has equity = notional/L at mark, so
     // L > 6 would open below maintenance (notional/6) and be rejected by the K9
@@ -421,7 +419,7 @@ fn set_leverage_core<CTX: ContextTr>(
     pos.leverage = leverage;
     storage::save_position(context, account, market_id, &pos)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::LeverageChanged {
             user: account,
@@ -437,10 +435,10 @@ fn set_leverage_core<CTX: ContextTr>(
 // ── Positions ─────────────────────────────────────────────────────────────────
 
 /// `getPosition(address user, uint64 marketId) returns (int64 amount, int64 vQuoteBalance, int64 margin, uint64 marginReserved, uint64 leverage)`
-pub fn run_get_position<CTX: ContextTr>(
+pub fn run_get_position<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getPositionCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getPosition: invalid calldata"))?;
 
@@ -460,11 +458,11 @@ pub fn run_get_position<CTX: ContextTr>(
 // ── Liquidation ───────────────────────────────────────────────────────────────
 
 /// `addPositionMargin(uint64 marketId, uint64 amount)`
-pub fn run_add_position_margin<CTX: ContextTr>(
+pub fn run_add_position_margin<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = addPositionMarginCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("addPositionMargin: invalid calldata"))?;
     if args.amount == 0 {
@@ -511,11 +509,11 @@ pub fn run_add_position_margin<CTX: ContextTr>(
 }
 
 /// `removePositionMargin(uint64 marketId, uint64 amount)`
-pub fn run_remove_position_margin<CTX: ContextTr>(
+pub fn run_remove_position_margin<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = removePositionMarginCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("removePositionMargin: invalid calldata"))?;
     if args.amount == 0 {
@@ -621,15 +619,15 @@ pub(crate) enum LiquidationOutcome {
 /// `liquidator` is recorded verbatim in the `Liquidation` event (the caller for a
 /// manual liquidation; a system address for the sweep). Bad debt from the close
 /// legs is routed to the IF inside the close paths, not here.
-pub(crate) fn liquidate_position<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn liquidate_position<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-    market: &crate::perp_dex::types::Market,
+    market: &crate::types::Market,
     mark_price: u64,
     liquidator: Address,
     adl_budget: &mut u32,
-) -> Result<LiquidationOutcome, PrecompileError> {
+) -> Result<LiquidationOutcome, PerpError> {
     let mut pos = storage::load_position(context, user, market_id)?;
 
     if pos.amount == 0 {
@@ -734,7 +732,7 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
                 .ok_or_else(|| perp_err("liquidate: insurance fund overflow"))?;
             storage::save_insurance_fund(context, new_if)?;
             let fee_i64 = checked_u64_to_i64(fee, "liquidate: clearance fee delta")?;
-            context.journal_mut().log(Log {
+            context.log(Log {
                 address: PERP_DEX_ADDRESS,
                 data: IPerpDex::InsuranceFundChanged {
                     delta: fee_i64,
@@ -746,7 +744,7 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
         fee
     };
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::Liquidation {
             user,
@@ -771,11 +769,11 @@ pub(crate) fn liquidate_position<CTX: ContextTr>(
 /// [`liquidate_position`]: decodes calldata, loads the market + mark price (refusing
 /// a market with no oracle price), and maps the core outcome to the caller-facing
 /// result. `caller` is recorded as the liquidator.
-pub fn run_liquidate<CTX: ContextTr>(
+pub fn run_liquidate<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = liquidateCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("liquidate: invalid calldata"))?;
 
@@ -841,12 +839,12 @@ const ADL_BUDGET_PER_UPDATE: u32 = 128;
 ///
 /// Any other error after the liquidatability check is a commit-only invariant failure and aborts
 /// the node rather than allowing a partial write set.
-fn run_liquidation_sweep<CTX: ContextTr>(
-    context: &mut CTX,
+fn run_liquidation_sweep<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-    market: &crate::perp_dex::types::Market,
+    market: &crate::types::Market,
     mark_price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     // Snapshot the registry (owned Vec, deterministic insertion order). Liquidations
     // mutate the live registry via save_position, but iterating the snapshot is stable;
     // a candidate already closed by an earlier cascade in this sweep resolves to
@@ -864,7 +862,7 @@ fn run_liquidation_sweep<CTX: ContextTr>(
         // and only applied when liquidatable), so the checkpoint only balances EVM-side state.
         // A liquidation that FAILS mid-apply would leave partial perp writes with no undo — a
         // corruption-anyway condition: halt loudly rather than skip silently.
-        let cp = context.journal_mut().checkpoint();
+        let cp = context.checkpoint();
         match liquidate_position(
             context,
             user,
@@ -875,12 +873,12 @@ fn run_liquidation_sweep<CTX: ContextTr>(
             &mut adl_budget,
         ) {
             Ok(LiquidationOutcome::Liquidated { .. }) => {
-                context.journal_mut().checkpoint_commit();
+                context.checkpoint_commit();
                 liquidated += 1;
             }
             Ok(_) => {
                 // AboveMaintenance / NoPosition: zero perp writes were made.
-                context.journal_mut().checkpoint_revert(cp);
+                context.checkpoint_revert(cp);
             }
             Err(e) => {
                 panic!(
@@ -894,12 +892,12 @@ fn run_liquidation_sweep<CTX: ContextTr>(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
-    context: &mut CTX,
+fn rebalance_order_margin_for_leverage<H: PerpHost>(
+    context: &mut H,
     user: Address,
-    pos: &mut crate::perp_dex::types::PerpPosition,
+    pos: &mut crate::types::PerpPosition,
     new_leverage: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     // Re-derive the reservation from the unchanged stored notionals at the new
     // leverage via the single source of truth, then reconcile the wallet by the
     // change in the flip-aware reservation. The notionals (per-side B/S and the
@@ -930,13 +928,13 @@ fn rebalance_order_margin_for_leverage<CTX: ContextTr>(
     Ok(())
 }
 
-fn emit_position_changed<CTX: ContextTr>(
-    context: &mut CTX,
+fn emit_position_changed<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-    pos: &crate::perp_dex::types::PerpPosition,
+    pos: &crate::types::PerpPosition,
 ) {
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::PositionChanged {
             user,
@@ -952,14 +950,14 @@ fn emit_position_changed<CTX: ContextTr>(
     });
 }
 
-fn emit_position_margin_adjusted<CTX: ContextTr>(
-    context: &mut CTX,
+fn emit_position_margin_adjusted<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     delta: i64,
-    pos: &crate::perp_dex::types::PerpPosition,
+    pos: &crate::types::PerpPosition,
 ) {
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::PositionMarginAdjusted {
             user,
@@ -971,10 +969,10 @@ fn emit_position_margin_adjusted<CTX: ContextTr>(
     });
 }
 
-fn require_admin<CTX: ContextTr>(
+fn require_admin<H: PerpHost>(
     caller: Address,
-    context: &mut CTX,
-) -> Result<(), PrecompileError> {
+    context: &mut H,
+) -> Result<(), PerpError> {
     let admin = storage::load_admin(context)?;
     if admin == Address::ZERO {
         return Err(perp_err("not authorised: admin not initialised"));
@@ -991,7 +989,7 @@ fn validate_market_bounds(
     price_decimals: u32,
     max_quantity: u64,
     max_price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     if base_decimals > 18 {
         return Err(perp_err(format!("{prefix}: baseDecimals must be <= 18")));
     }
@@ -1024,7 +1022,7 @@ fn validate_funding_config(
     prefix: &str,
     price_update_interval: u64,
     funding_interval: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     if funding_interval == 0 {
         return Ok(());
     }
@@ -1043,12 +1041,12 @@ fn validate_funding_config(
 
 /// Cancel every open order for `user` in `market`, returning reserved margin
 /// back to their perp wallet.
-pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     _market: &Market,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let old_best_bid = storage::load_best_bid(context, market_id)?;
     let old_best_ask = storage::load_best_ask(context, market_id)?;
 
@@ -1065,7 +1063,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
             storage::remove_bid_price(context, market_id, entry.price)?;
         }
 
-        context.journal_mut().log(Log {
+        context.log(Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::OrderCancelled {
                 user,
@@ -1087,7 +1085,7 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
             storage::remove_ask_price(context, market_id, entry.price)?;
         }
 
-        context.journal_mut().log(Log {
+        context.log(Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::OrderCancelled {
                 user,
@@ -1130,11 +1128,11 @@ pub(crate) fn cancel_all_orders_for_market<CTX: ContextTr>(
 
 /// `depositInsuranceFund(uint64 amount)` — admin only.
 /// Debits `amount` from the admin's perp wallet and credits it to the insurance fund.
-pub fn run_deposit_insurance_fund<CTX: ContextTr>(
+pub fn run_deposit_insurance_fund<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = depositInsuranceFundCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("depositInsuranceFund: invalid calldata"))?;
 
@@ -1160,7 +1158,7 @@ pub fn run_deposit_insurance_fund<CTX: ContextTr>(
         .ok_or_else(|| perp_err("depositInsuranceFund: balance overflow"))?;
     storage::save_insurance_fund(context, new_balance)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::InsuranceFundChanged {
             delta,
@@ -1174,11 +1172,11 @@ pub fn run_deposit_insurance_fund<CTX: ContextTr>(
 
 /// `withdrawInsuranceFund(uint64 amount)` — admin only.
 /// Withdraws `amount` from the insurance fund back to the admin's perp wallet.
-pub fn run_withdraw_insurance_fund<CTX: ContextTr>(
+pub fn run_withdraw_insurance_fund<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = withdrawInsuranceFundCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("withdrawInsuranceFund: invalid calldata"))?;
 
@@ -1202,7 +1200,7 @@ pub fn run_withdraw_insurance_fund<CTX: ContextTr>(
     account.credit_perp(args.amount)?;
     storage::save_account(context, caller, account)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::InsuranceFundChanged {
             delta: -delta,
@@ -1215,10 +1213,10 @@ pub fn run_withdraw_insurance_fund<CTX: ContextTr>(
 }
 
 /// `getInsuranceFund()` — returns the current insurance fund balance.
-pub fn run_get_insurance_fund<CTX: ContextTr>(
+pub fn run_get_insurance_fund<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     getInsuranceFundCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getInsuranceFund: invalid calldata"))?;
     let balance = storage::load_insurance_fund(context)?;
@@ -1230,11 +1228,11 @@ pub fn run_get_insurance_fund<CTX: ContextTr>(
 // ── Market manager role ───────────────────────────────────────────────────────
 
 /// `setMarketManagerAddress(address manager)` — admin only. Zero revokes.
-pub fn run_set_market_manager<CTX: ContextTr>(
+pub fn run_set_market_manager<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = setMarketManagerAddressCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("setMarketManagerAddress: invalid calldata"))?;
 
@@ -1243,7 +1241,7 @@ pub fn run_set_market_manager<CTX: ContextTr>(
     let previous = storage::load_market_manager(context)?;
     storage::save_market_manager(context, args.manager)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::MarketManagerUpdated {
             previousManager: previous,
@@ -1255,10 +1253,10 @@ pub fn run_set_market_manager<CTX: ContextTr>(
 }
 
 /// `getMarketManagerAddress() returns (address manager)`
-pub fn run_get_market_manager<CTX: ContextTr>(
+pub fn run_get_market_manager<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     getMarketManagerAddressCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getMarketManagerAddress: invalid calldata"))?;
     let manager = storage::load_market_manager(context)?;
@@ -1270,11 +1268,11 @@ pub fn run_get_market_manager<CTX: ContextTr>(
 // ── Oracle address ────────────────────────────────────────────────────────────
 
 /// `setOracleAddress(address oracle)` — admin only.
-pub fn run_set_oracle_address<CTX: ContextTr>(
+pub fn run_set_oracle_address<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = setOracleAddressCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("setOracleAddress: invalid calldata"))?;
 
@@ -1283,7 +1281,7 @@ pub fn run_set_oracle_address<CTX: ContextTr>(
     let previous = storage::load_oracle(context)?;
     storage::save_oracle(context, args.oracle)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OracleAddressUpdated {
             previousOracle: previous,
@@ -1295,10 +1293,10 @@ pub fn run_set_oracle_address<CTX: ContextTr>(
 }
 
 /// `getOracleAddress() returns (address oracle)`
-pub fn run_get_oracle_address<CTX: ContextTr>(
+pub fn run_get_oracle_address<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     getOracleAddressCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getOracleAddress: invalid calldata"))?;
     let oracle = storage::load_oracle(context)?;
@@ -1318,11 +1316,11 @@ pub fn run_get_oracle_address<CTX: ContextTr>(
 /// 2. Save the new index price state.
 /// 4. Snap mark price to tick_size and persist it.
 /// 5. Emit IndexPriceUpdated + MarkPriceUpdated.
-pub fn run_update_index_price<CTX: ContextTr>(
+pub fn run_update_index_price<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = updateIndexPriceCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("updateIndexPrice: invalid calldata"))?;
 
@@ -1471,7 +1469,7 @@ pub fn run_update_index_price<CTX: ContextTr>(
     run_liquidation_sweep(context, args.marketId, &market, mark_price)?;
 
     // ── 6. Emit events ────────────────────────────────────────────────────────
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::IndexPriceUpdated {
             marketId: args.marketId,
@@ -1483,7 +1481,7 @@ pub fn run_update_index_price<CTX: ContextTr>(
         }
         .to_log_data(),
     });
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::MarkPriceUpdated {
             marketId: args.marketId,
@@ -1493,7 +1491,7 @@ pub fn run_update_index_price<CTX: ContextTr>(
         .to_log_data(),
     });
     if let Some((rate, avg_pi, sample_count)) = computed_rate {
-        context.journal_mut().log(Log {
+        context.log(Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::FundingRateComputed {
                 marketId: args.marketId,
@@ -1510,10 +1508,10 @@ pub fn run_update_index_price<CTX: ContextTr>(
 }
 
 /// `getIndexPrice(uint64 marketId) returns (uint64 indexPrice, uint64 lastTimestamp)`
-pub fn run_get_index_price<CTX: ContextTr>(
+pub fn run_get_index_price<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getIndexPriceCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getIndexPrice: invalid calldata"))?;
     let state = storage::load_index_price_state(context, args.marketId)?;
@@ -1528,10 +1526,10 @@ pub fn run_get_index_price<CTX: ContextTr>(
 // ── Funding state ─────────────────────────────────────────────────────────────
 
 /// `getFundingState(uint64 marketId) returns (int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs)`
-pub fn run_get_funding_state<CTX: ContextTr>(
+pub fn run_get_funding_state<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getFundingStateCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getFundingState: invalid calldata"))?;
     let state = storage::load_funding_state(context, args.marketId)?;
@@ -1547,10 +1545,10 @@ pub fn run_get_funding_state<CTX: ContextTr>(
 }
 
 /// `getAveragePremiumIndex(uint64 marketId) returns (int64 avgPremiumIndex, uint64 sampleCount)`
-pub fn run_get_average_premium_index<CTX: ContextTr>(
+pub fn run_get_average_premium_index<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getAveragePremiumIndexCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getAveragePremiumIndex: invalid calldata"))?;
     storage::load_market_ref(context, args.marketId)?
@@ -1601,24 +1599,24 @@ fn align_price_update_timestamp(timestamp: u64, interval: u64) -> u64 {
 
 fn max_index_price_checkpoints(price_update_interval: u64) -> usize {
     let interval = price_update_interval.max(1);
-    (crate::perp_dex::types::PRICE_BASIS_WINDOW_SIZE as u64)
+    (crate::types::PRICE_BASIS_WINDOW_SIZE as u64)
         .div_ceil(interval)
         .saturating_add(2) as usize
 }
 
-pub(crate) fn record_mid_price_sample_for_best_quote_change<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn record_mid_price_sample_for_best_quote_change<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     best_bid: u64,
     best_ask: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let mid_price = match (best_bid, best_ask) {
         (0, 0) => return Ok(()),
         (0, ask) => ask,
         (bid, 0) => bid,
         (bid, ask) => ((bid as u128 + ask as u128) / 2) as u64,
     };
-    let timestamp: u64 = context.block().timestamp().saturating_to();
+    let timestamp: u64 = context.timestamp();
 
     let mut window = storage::load_price_basis_window(context, market_id)?;
     // Skip the (large) re-store when the observation changed nothing — i.e. every best-quote
@@ -1630,10 +1628,10 @@ pub(crate) fn record_mid_price_sample_for_best_quote_change<CTX: ContextTr>(
     Ok(())
 }
 
-fn require_admin_or_oracle<CTX: ContextTr>(
+fn require_admin_or_oracle<H: PerpHost>(
     caller: Address,
-    context: &mut CTX,
-) -> Result<(), PrecompileError> {
+    context: &mut H,
+) -> Result<(), PerpError> {
     let admin = storage::load_admin(context)?;
     if admin == Address::ZERO {
         return Err(perp_err("not authorised: admin not initialised"));
@@ -1648,10 +1646,10 @@ fn require_admin_or_oracle<CTX: ContextTr>(
     Err(perp_err("not authorised: caller is not admin or oracle"))
 }
 
-fn require_admin_or_market_manager<CTX: ContextTr>(
+fn require_admin_or_market_manager<H: PerpHost>(
     caller: Address,
-    context: &mut CTX,
-) -> Result<(), PrecompileError> {
+    context: &mut H,
+) -> Result<(), PerpError> {
     let admin = storage::load_admin(context)?;
     if admin == Address::ZERO {
         return Err(perp_err("not authorised: admin not initialised"));

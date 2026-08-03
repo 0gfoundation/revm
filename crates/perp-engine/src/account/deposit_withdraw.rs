@@ -2,29 +2,27 @@
 
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
-use context::{ContextTr, JournalTr};
+use crate::host::PerpHost;
 use primitives::{Address, Bytes, Log, U256};
 
 use crate::{
-    perp_dex::{
         errors::{perp_err, perp_invariant_err},
-        interface::IPerpDex::{
-            self, depositCall, getAccountCall, getAccountReturn, transferFromPerpCall,
-            transferToPerpCall, withdrawCall, TransferFromPerp, TransferToPerp,
-        },
-        storage::{self, load_erc20_balance, save_erc20_balance},
-        types::MAX_PERP_WALLET_BALANCE,
-        PERP_DEX_ADDRESS, USDC_ADDRESS,
+    interface::IPerpDex::{
+        self, depositCall, getAccountCall, getAccountReturn, transferFromPerpCall,
+        transferToPerpCall, withdrawCall, TransferFromPerp, TransferToPerp,
     },
-    PrecompileError,
+    storage::{self, load_erc20_balance, save_erc20_balance},
+    types::MAX_PERP_WALLET_BALANCE,
+    PERP_DEX_ADDRESS, USDC_ADDRESS,
+    PerpError,
 };
 
 /// `deposit(uint256 amount)` — pull USDC from caller → DEX, credit internal account.
-pub fn run_deposit<CTX: ContextTr>(
+pub fn run_deposit<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = depositCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("deposit: invalid calldata"))?;
     let amount = args.amount;
@@ -55,7 +53,7 @@ pub fn run_deposit<CTX: ContextTr>(
     account.usdc_balance = new_balance.into(); // 3. credit internal spot balance
     storage::save_account(context, caller, account)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::Deposit {
             user: caller,
@@ -68,11 +66,11 @@ pub fn run_deposit<CTX: ContextTr>(
 }
 
 /// `withdraw(uint256 amount)` — return USDC from DEX → caller, debit internal account.
-pub fn run_withdraw<CTX: ContextTr>(
+pub fn run_withdraw<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = withdrawCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("withdraw: invalid calldata"))?;
     let amount = args.amount;
@@ -103,7 +101,7 @@ pub fn run_withdraw<CTX: ContextTr>(
     save_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS, dex_usdc - amount)?; // 2. debit DEX custody
     save_erc20_balance(context, USDC_ADDRESS, caller, user_usdc + amount)?; // 3. return USDC to caller
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::Withdraw {
             user: caller,
@@ -116,11 +114,11 @@ pub fn run_withdraw<CTX: ContextTr>(
 }
 
 /// `transferToPerp(uint64 amount)` — move USDC from spot balance → perp trading wallet.
-pub fn run_transfer_to_perp<CTX: ContextTr>(
+pub fn run_transfer_to_perp<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = transferToPerpCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("transferToPerp: invalid calldata"))?;
     let amount = args.amount;
@@ -139,7 +137,7 @@ pub fn run_transfer_to_perp<CTX: ContextTr>(
     account.credit_perp(amount)?;
     storage::save_account(context, caller, account)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: TransferToPerp {
             user: caller,
@@ -152,11 +150,11 @@ pub fn run_transfer_to_perp<CTX: ContextTr>(
 }
 
 /// `transferFromPerp(uint64 amount)` — move USDC from perp trading wallet → spot balance.
-pub fn run_transfer_from_perp<CTX: ContextTr>(
+pub fn run_transfer_from_perp<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = transferFromPerpCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("transferFromPerp: invalid calldata"))?;
     let amount = args.amount;
@@ -176,7 +174,7 @@ pub fn run_transfer_from_perp<CTX: ContextTr>(
     account.usdc_balance = (spot + U256::from(amount)).into();
     storage::save_account(context, caller, account)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: TransferFromPerp {
             user: caller,
@@ -189,10 +187,10 @@ pub fn run_transfer_from_perp<CTX: ContextTr>(
 }
 
 /// `getAccount(address user)` — returns spot, total perp collateral, and available perp.
-pub fn run_get_account<CTX: ContextTr>(
+pub fn run_get_account<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getAccountCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getAccount: invalid calldata"))?;
 

@@ -1,21 +1,19 @@
 use alloy_primitives::IntoLogData;
-use context::{ContextTr, JournalTr};
+use crate::host::PerpHost;
 use primitives::{Address, FixedBytes, Log};
 
 use super::match_order;
 use crate::{
-    perp_dex::{
         errors::{perp_err, perp_invariant_err},
-        interface::IPerpDex,
-        math::{
-            calc_bankruptcy_price, calc_position_equity, calc_value, calc_value_i64,
-            checked_u64_to_i64,
-        },
-        storage,
-        types::{Market, Order, OrderStatus, OrderType, Side, TimeInForce},
-        PERP_DEX_ADDRESS,
+    interface::IPerpDex,
+    math::{
+        calc_bankruptcy_price, calc_position_equity, calc_value, calc_value_i64,
+        checked_u64_to_i64,
     },
-    PrecompileError,
+    storage,
+    types::{Market, Order, OrderStatus, OrderType, Side, TimeInForce},
+    PERP_DEX_ADDRESS,
+    PerpError,
 };
 
 /// Execute the liquidation close as an internal market IOC order.
@@ -24,13 +22,13 @@ use crate::{
 /// book absorbs the entire position (`remaining == 0`) the position storage is
 /// cleaned up here. If the book can only partially fill, the caller is
 /// responsible for settling the residual (see `settle_liquidation_residual_at_mark_price`).
-pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market: &Market,
     side: Side,
     quantity: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     let (order_id, bumped_nonce) = super::peek_order_id(context, user)?;
     let mut order = Order {
         owner: user.0 .0,
@@ -45,7 +43,7 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
     };
     // commit-only #23: the close order is persisted ONCE after matching (below); the
     // OrderPlaced log keeps its original position (logs are EVM-journaled).
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderPlaced {
             user,
@@ -113,13 +111,13 @@ pub(crate) fn execute_liquidation_market_order<CTX: ContextTr>(
 /// Isolated margin: the loss is contained to the position's margin; any shortfall
 /// beyond it is bad debt routed directly to the Insurance Fund here. The wallet is
 /// never debited by the residual loss (only credited if the residual is solvent).
-pub(crate) fn settle_liquidation_residual_at_mark_price<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market: &Market,
     liquidation_side: Side,
     mark_price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let mut pos = storage::load_position(context, user, market.market_id)?;
     let mut account = storage::load_account(context, user)?;
 
@@ -198,13 +196,13 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<CTX: ContextTr>(
 /// holders anyway; (b) opposite holders that are themselves below water are skipped
 /// (the sweep liquidates them), never forced into bad debt; cascades from ADL'ing a
 /// thin winner resolve on a later sweep, not by in-`run_adl` recursion.
-pub(crate) fn run_adl<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn run_adl<H: PerpHost>(
+    context: &mut H,
     loser: Address,
     market: &Market,
     mark_price: u64,
     budget: &mut u32,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let mut loser_pos = storage::load_position(context, loser, market.market_id)?;
     if loser_pos.amount == 0 || *budget == 0 {
         return Ok(());
@@ -289,7 +287,7 @@ pub(crate) fn run_adl<CTX: ContextTr>(
         };
         storage::save_position(context, winner, market.market_id, &winner_pos)?;
         storage::save_account(context, winner, winner_account)?;
-        context.journal_mut().log(Log {
+        context.log(Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::Adl {
                 liquidatedUser: loser,
@@ -343,17 +341,17 @@ struct AdlFillOutcome {
 
 #[allow(clippy::too_many_arguments)]
 fn adl_fill(
-    loser_pos: &mut crate::perp_dex::types::PerpPosition,
+    loser_pos: &mut crate::types::PerpPosition,
     loser_wallet: &mut i64,
     loser_close_is_buy: bool,
-    winner_pos: &mut crate::perp_dex::types::PerpPosition,
+    winner_pos: &mut crate::types::PerpPosition,
     winner_wallet: &mut i64,
     winner_close_is_buy: bool,
     take: u64,
     p_b: u64,
     bd: u32,
     pd: u32,
-) -> Result<Option<AdlFillOutcome>, PrecompileError> {
+) -> Result<Option<AdlFillOutcome>, PerpError> {
     use super::settlement::apply_position_fill;
     let floor = take.saturating_sub(4); // try take, take-1, .., take-4 (dust is <=1-2)
     let mut t = take;
@@ -383,15 +381,15 @@ fn adl_fill(
     Ok(None)
 }
 
-fn emit_position_changed<CTX: ContextTr>(
-    context: &mut CTX,
+fn emit_position_changed<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-    pos: &crate::perp_dex::types::PerpPosition,
+    pos: &crate::types::PerpPosition,
     realized_pnl: i64,
     closed_quantity: u64,
 ) {
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::PositionChanged {
             user,

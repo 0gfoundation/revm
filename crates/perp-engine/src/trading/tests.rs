@@ -1,10 +1,11 @@
+use context::ContextTr;
 use super::*;
 use alloy_sol_types::{SolCall, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, Address, FixedBytes, U256};
 
-use crate::perp_dex::{
+use crate::{
     interface::IPerpDex::{
         cancelOrderCall, getMarketFeeTotalCall, getOrderCall, placeOrderCall, AccountBalanceChanged,
     },
@@ -52,15 +53,15 @@ fn make_ctx() -> TestCtx {
 
 fn take_position_changes(
     ctx: &mut TestCtx,
-) -> Vec<crate::perp_dex::interface::IPerpDex::PositionChanged> {
+) -> Vec<crate::interface::IPerpDex::PositionChanged> {
     JournalTr::take_logs(ctx.journal_mut())
         .into_iter()
         .filter(|log| {
             log.data.topics().first()
-                == Some(&crate::perp_dex::interface::IPerpDex::PositionChanged::SIGNATURE_HASH)
+                == Some(&crate::interface::IPerpDex::PositionChanged::SIGNATURE_HASH)
         })
         .map(|log| {
-            crate::perp_dex::interface::IPerpDex::PositionChanged::decode_raw_log(
+            crate::interface::IPerpDex::PositionChanged::decode_raw_log(
                 log.data.topics(),
                 &log.data.data,
             )
@@ -145,7 +146,7 @@ fn place(
     ret[..32].try_into().unwrap()
 }
 
-fn get_order(ctx: &mut TestCtx, id: [u8; 32]) -> crate::perp_dex::types::Order {
+fn get_order(ctx: &mut TestCtx, id: [u8; 32]) -> crate::types::Order {
     storage::load_order(ctx, &id).unwrap().unwrap()
 }
 
@@ -283,7 +284,7 @@ fn try_place_limit(
     caller: Address,
     side: u8,
     price: u64,
-) -> Result<Bytes, PrecompileError> {
+) -> Result<Bytes, PerpError> {
     let input = placeOrderCall {
         marketId: MARKET_ID,
         side,
@@ -1588,7 +1589,7 @@ fn post_only_rests_when_above_best_bid() {
 /// Drains the journal and maps each log to a short perp-event name, in emission order.
 /// (`take_logs` drains, so a call reports only the events since the previous call.)
 fn take_event_names(ctx: &mut TestCtx) -> Vec<&'static str> {
-    use crate::perp_dex::interface::IPerpDex::{
+    use crate::interface::IPerpDex::{
         FundingSettled, InsuranceFundChanged, InsuranceFundDepleted, OrderCancelled, OrderPlaced,
         OrderRested, PositionChanged, Trade,
     };
@@ -2139,7 +2140,7 @@ fn remove_from_book_after_cancel_rejects_bid_above_cached_best() {
     let err = super::remove_from_book_after_cancel(
         &mut ctx,
         MARKET_ID,
-        crate::perp_dex::types::Side::Buy,
+        crate::types::Side::Buy,
         PRICE,
         &id,
     )
@@ -2397,7 +2398,7 @@ fn perp_writes_survive_enclosing_revert_commit_only() {
 // margin rejection ever triggers).
 mod perf {
     use super::*;
-    use crate::perp_dex::{
+    use crate::{
         interface::IPerpDex::{placeOrderSignedCall, updateIndexPriceCall},
         risk::run_update_index_price,
         types::ApiKey,
@@ -2564,7 +2565,7 @@ mod perf {
         label: &str,
         elapsed: Duration,
         calls: u64,
-        st: &crate::perp_dex::storage::bench_counter::Stats,
+        st: &crate::storage::bench_counter::Stats,
     ) {
         // Post-#14 + #16d the typed msgpack helpers no longer hit the byte choke: reads go through
         // the struct overlay (perp_get_struct, no decode) and writes are deferred (perp_store_struct,
@@ -2601,7 +2602,7 @@ mod perf {
     #[test]
     #[ignore = "block-level perf; run with --release --ignored --nocapture"]
     fn perf_block_rest_heavy() {
-        use crate::perp_dex::storage::bench_counter as bc;
+        use crate::storage::bench_counter as bc;
         const N_MAKERS: u64 = 4;
         const N_LEVELS: u64 = 8;
         const ROUNDS: u64 = 500; // N_MAKERS * ROUNDS = 2000 resting placements
@@ -2646,7 +2647,7 @@ mod perf {
     #[test]
     #[ignore = "block-level perf; run with --release --ignored --nocapture"]
     fn perf_block_mixed() {
-        use crate::perp_dex::storage::bench_counter as bc;
+        use crate::storage::bench_counter as bc;
         const N_MAKERS: u64 = 4;
         const N_LEVELS: u64 = 8;
         const ROUNDS: u64 = 600;
@@ -2725,7 +2726,7 @@ mod perf {
     #[test]
     #[ignore = "block-level perf; run with --release --ignored --nocapture"]
     fn perf_block_bbo_churn() {
-        use crate::perp_dex::storage::bench_counter as bc;
+        use crate::storage::bench_counter as bc;
         const ROUNDS: u64 = 2000; // each round = place+cancel @ bid AND place+cancel @ ask (4 calls)
 
         let bid_px = PRICE - TICK; // best bid
@@ -3126,7 +3127,7 @@ fn fill_settles_funding_for_taker_and_maker() {
 // liquidation residual settle at mark price; getBookPrices / getBookLevel.
 mod golden {
     use super::*;
-    use crate::perp_dex::{
+    use crate::{
         interface::IPerpDex::{
             addMarketCall, addPositionMarginCall, cancelOrderSignedCall, depositCall,
             depositInsuranceFundCall, getAccountCall, getApiKeysCall, getAveragePremiumIndexCall,
@@ -4377,7 +4378,7 @@ mod golden {
 #[cfg(test)]
 mod commit_only_conservation {
     use super::*;
-    use crate::perp_dex::{math::calc_value, run_perp_dex_call};
+    use crate::{math::calc_value, run_perp_dex_call};
 
     const N_ACCT: u64 = 12;
     const ACCT_WALLET: u64 = 3_000_000; // TIGHT: forces wallet-cover cancels + insolvency rejects
@@ -4542,21 +4543,19 @@ mod commit_only_conservation {
 mod batch_cancel {
     use super::*;
     use crate::{
-        perp_dex::{
-            batch::{
-                self, PerpBatchReason, PerpBatchTag, BASE_BATCH_GAS, BATCH_STATUS_RECORD_LEN,
-                MAX_BATCH_CANCEL,
-            },
-            errors::{perp_err, perp_fatal_invariant_err, perp_invariant_err},
-            interface::IPerpDex::{
-                batchCancelOrdersCall, batchCancelOrdersSignedCall, batchPlaceOrdersCall,
-                batchPlaceOrdersSignedCall, cancelOrderCall, cancelOrderSignedCall, OrderCancelled,
-            },
-            selectors_map,
-            types::{ApiKey, Order, OrderStatus, OrderType, Side, TimeInForce},
-            CANCEL_ORDER_GAS, PLACE_ORDER_GAS,
+                batch::{
+            self, PerpBatchReason, PerpBatchTag, BASE_BATCH_GAS, BATCH_STATUS_RECORD_LEN,
+            MAX_BATCH_CANCEL,
         },
-        PrecompileError,
+        errors::{perp_err, perp_fatal_invariant_err, perp_invariant_err},
+        interface::IPerpDex::{
+            batchCancelOrdersCall, batchCancelOrdersSignedCall, batchPlaceOrdersCall,
+            batchPlaceOrdersSignedCall, cancelOrderCall, cancelOrderSignedCall, OrderCancelled,
+        },
+        call::selectors_map,
+        types::{ApiKey, Order, OrderStatus, OrderType, Side, TimeInForce},
+        CANCEL_ORDER_GAS, PLACE_ORDER_GAS,
+        PerpError,
     };
     use ed25519_dalek::{Signer, SigningKey};
 
@@ -4931,7 +4930,7 @@ mod batch_cancel {
             }
         })
         .unwrap_err();
-        assert!(matches!(err, PrecompileError::Fatal(_)), "got {err:?}");
+        assert!(matches!(err, PerpError::Fatal(_)), "got {err:?}");
     }
 
     // ── 4. pre-loop length faults revert the whole call ────────────────────
@@ -5050,7 +5049,7 @@ mod batch_cancel {
             &mut ctx,
         )
         .unwrap_err();
-        assert!(matches!(err, PrecompileError::OutOfGas), "got {err:?}");
+        assert!(matches!(err, PerpError::OutOfGas), "got {err:?}");
         assert_eq!(
             JournalTr::perp_write_count(ctx.journal_mut()),
             writes_before,
@@ -5512,7 +5511,7 @@ mod batch_cancel {
             PerpBatchReason::Other
         );
         assert_eq!(
-            reason_code(&PrecompileError::OutOfGas),
+            reason_code(&PerpError::OutOfGas),
             PerpBatchReason::Other
         );
         // Tag / reason wire values are consensus-adjacent client contract: pin them.
@@ -5528,7 +5527,7 @@ mod batch_cancel {
         );
         assert_eq!(BATCH_STATUS_RECORD_LEN, 34);
         assert_eq!(MAX_BATCH_CANCEL, 256);
-        assert_eq!(crate::perp_dex::batch::MAX_BATCH_PLACE, 64);
+        assert_eq!(crate::batch::MAX_BATCH_PLACE, 64);
         // Wire values of every reason code: consensus-adjacent client contract.
         assert_eq!(
             [
@@ -5579,7 +5578,7 @@ mod batch_cancel {
         )
         .unwrap_err();
         assert!(
-            matches!(err, PrecompileError::StaticRestrictionViolation),
+            matches!(err, PerpError::StaticRestrictionViolation),
             "got {err:?}"
         );
     }
@@ -5599,17 +5598,15 @@ mod batch_place {
     };
     use super::*;
     use crate::{
-        perp_dex::{
-            batch::{
-                self, PerpBatchReason, PerpBatchTag, BASE_BATCH_GAS, BATCH_STATUS_RECORD_LEN,
-                MAX_BATCH_PLACE, PLACE_ITEM_ENCODED_LEN,
-            },
-            interface::IPerpDex::{
-                batchPlaceOrdersCall, batchPlaceOrdersSignedCall, OrderPlaced, PlaceItem, Trade,
-            },
-            PLACE_ORDER_GAS,
+                batch::{
+            self, PerpBatchReason, PerpBatchTag, BASE_BATCH_GAS, BATCH_STATUS_RECORD_LEN,
+            MAX_BATCH_PLACE, PLACE_ITEM_ENCODED_LEN,
         },
-        PrecompileError,
+        interface::IPerpDex::{
+            batchPlaceOrdersCall, batchPlaceOrdersSignedCall, OrderPlaced, PlaceItem, Trade,
+        },
+        PLACE_ORDER_GAS,
+        PerpError,
     };
     use ed25519_dalek::{Signer, SigningKey};
 
@@ -6207,7 +6204,7 @@ mod batch_place {
             &mut ctx,
         )
         .unwrap_err();
-        assert!(matches!(err, PrecompileError::OutOfGas), "got {err:?}");
+        assert!(matches!(err, PerpError::OutOfGas), "got {err:?}");
         assert_eq!(
             JournalTr::perp_write_count(ctx.journal_mut()),
             writes_before,
@@ -6552,7 +6549,7 @@ mod batch_place {
         )
         .unwrap_err();
         assert!(
-            matches!(err, PrecompileError::StaticRestrictionViolation),
+            matches!(err, PerpError::StaticRestrictionViolation),
             "got {err:?}"
         );
     }
@@ -6874,8 +6871,8 @@ mod batch_place {
     ) -> (
         PerpPosition,
         u64,
-        Vec<crate::perp_dex::types::OrderEntry>,
-        Vec<crate::perp_dex::types::OrderEntry>,
+        Vec<crate::types::OrderEntry>,
+        Vec<crate::types::OrderEntry>,
     ) {
         let p = storage::load_position(ctx, user, MARKET_ID).unwrap();
         let acct = storage::load_account(ctx, user).unwrap();

@@ -1,10 +1,11 @@
+use context::ContextTr;
 use super::*;
 use alloy_sol_types::{SolCall, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, U256};
 
-use crate::perp_dex::{
+use crate::{
     funding::settle_position_funding,
     interface::IPerpDex::{
         addPositionMarginCall, liquidateCall, placeOrderCall, removePositionMarginCall,
@@ -49,15 +50,15 @@ fn make_ctx() -> TestCtx {
 
 fn take_position_changes(
     ctx: &mut TestCtx,
-) -> Vec<crate::perp_dex::interface::IPerpDex::PositionChanged> {
+) -> Vec<crate::interface::IPerpDex::PositionChanged> {
     JournalTr::take_logs(ctx.journal_mut())
         .into_iter()
         .filter(|log| {
             log.data.topics().first()
-                == Some(&crate::perp_dex::interface::IPerpDex::PositionChanged::SIGNATURE_HASH)
+                == Some(&crate::interface::IPerpDex::PositionChanged::SIGNATURE_HASH)
         })
         .map(|log| {
-            crate::perp_dex::interface::IPerpDex::PositionChanged::decode_raw_log(
+            crate::interface::IPerpDex::PositionChanged::decode_raw_log(
                 log.data.topics(),
                 &log.data.data,
             )
@@ -887,7 +888,7 @@ fn settle_funding_emits_funding_settled_event() {
     let _ = settle_alice_funding(&mut ctx);
 
     let logs = JournalTr::take_logs(ctx.journal_mut());
-    let topic = crate::perp_dex::interface::IPerpDex::FundingSettled::SIGNATURE_HASH;
+    let topic = crate::interface::IPerpDex::FundingSettled::SIGNATURE_HASH;
     assert!(
         logs.iter().any(|l| l.data.topics().first() == Some(&topic)),
         "a FundingSettled event must be emitted on a non-zero funding settlement"
@@ -1082,7 +1083,7 @@ fn mid_window_uses_ring_order_after_wrap() {
     assert_eq!(window.moving_average_basis(&history, 35).unwrap(), 19);
 }
 
-fn liquidate(ctx: &mut TestCtx, user: Address) -> Result<Bytes, PrecompileError> {
+fn liquidate(ctx: &mut TestCtx, user: Address) -> Result<Bytes, PerpError> {
     let input = liquidateCall {
         user,
         marketId: MARKET_ID,
@@ -1116,7 +1117,7 @@ fn place_order(ctx: &mut TestCtx, user: Address, side: u8, price: u64, qty: u64)
     run_place_order(&input, user, ctx).unwrap();
 }
 
-fn set_leverage(ctx: &mut TestCtx, leverage: u64) -> Result<Bytes, PrecompileError> {
+fn set_leverage(ctx: &mut TestCtx, leverage: u64) -> Result<Bytes, PerpError> {
     run_set_leverage(
         &setLeverageCall {
             marketId: MARKET_ID,
@@ -1154,7 +1155,7 @@ fn save_position(ctx: &mut TestCtx, amount: i64, v_quote_balance: i64) {
     .unwrap();
 }
 
-fn add_position_margin(ctx: &mut TestCtx, amount: u64) -> Result<Bytes, PrecompileError> {
+fn add_position_margin(ctx: &mut TestCtx, amount: u64) -> Result<Bytes, PerpError> {
     run_add_position_margin(
         &addPositionMarginCall {
             marketId: MARKET_ID,
@@ -1166,7 +1167,7 @@ fn add_position_margin(ctx: &mut TestCtx, amount: u64) -> Result<Bytes, Precompi
     )
 }
 
-fn remove_position_margin(ctx: &mut TestCtx, amount: u64) -> Result<Bytes, PrecompileError> {
+fn remove_position_margin(ctx: &mut TestCtx, amount: u64) -> Result<Bytes, PerpError> {
     run_remove_position_margin(
         &removePositionMarginCall {
             marketId: MARKET_ID,

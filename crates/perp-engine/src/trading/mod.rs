@@ -2,10 +2,9 @@
 
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
-use context::{ContextTr, JournalTr};
+use crate::host::PerpHost;
 use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 
-use context::Block as BlockTr;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 mod liquidation;
@@ -23,35 +22,33 @@ use settlement::{MakerFillOutcome, TakerSettlement};
 pub(crate) const MAX_LIQUIDATION_MAKER_ACCOUNTS: usize = 128;
 
 use crate::{
-    perp_dex::{
         batch::{self, PerpBatchTag},
-        errors::{perp_err, perp_invariant_err},
-        interface::IPerpDex::{
-            self, batchCancelOrdersCall, batchCancelOrdersSignedCall, batchPlaceOrdersCall,
-            batchPlaceOrdersSignedCall, cancelOrderCall, cancelOrderSignedCall, getBookLevelCall,
-            getBookPricesCall, getMarketFeeTotalCall, getOpenOrdersCall, getOpenOrdersReturn,
-            getOrderCall, getOrderReturn, placeOrderCall, placeOrderSignedCall, PlaceItem,
-        },
-        math::{
-            calc_maker_fee_for_order_qty_with_bps, calc_trading_fee,
-            calc_value,
-        },
-        risk::record_mid_price_sample_for_best_quote_change,
-        storage,
-        types::{ApiKey, Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce},
-        PERP_DEX_ADDRESS,
+    errors::{perp_err, perp_invariant_err},
+    interface::IPerpDex::{
+        self, batchCancelOrdersCall, batchCancelOrdersSignedCall, batchPlaceOrdersCall,
+        batchPlaceOrdersSignedCall, cancelOrderCall, cancelOrderSignedCall, getBookLevelCall,
+        getBookPricesCall, getMarketFeeTotalCall, getOpenOrdersCall, getOpenOrdersReturn,
+        getOrderCall, getOrderReturn, placeOrderCall, placeOrderSignedCall, PlaceItem,
     },
-    PrecompileError,
+    math::{
+        calc_maker_fee_for_order_qty_with_bps, calc_trading_fee,
+        calc_value,
+    },
+    risk::record_mid_price_sample_for_best_quote_change,
+    storage,
+    types::{ApiKey, Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce},
+    PERP_DEX_ADDRESS,
+    PerpError,
 };
 
 // ── Public entry-points ───────────────────────────────────────────────────────
 
 /// `placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif) returns (bytes32 orderId)`
-pub fn run_place_order<CTX: ContextTr>(
+pub fn run_place_order<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = placeOrderCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("placeOrder: invalid calldata"))?;
 
@@ -84,10 +81,10 @@ pub fn run_place_order<CTX: ContextTr>(
 /// hits the same seen marker and is rejected. The marker is time-bucketed and reclaimed once the
 /// signature's recv window has fully elapsed (a stale replay is rejected by `check_recv_window`
 /// first, so reclaiming the marker is safe).
-pub fn run_place_order_signed<CTX: ContextTr>(
+pub fn run_place_order_signed<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = placeOrderSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("placeOrderSigned: invalid calldata"))?;
 
@@ -148,7 +145,7 @@ pub fn run_place_order_signed<CTX: ContextTr>(
     // early WITHOUT marking, so it stays replayable within its recv window, exactly as the old
     // order-map guard behaved). Index it under its signed timestamp for time-bucketed GC, then
     // sweep one expired bucket.
-    let block_ts: u64 = context.block().timestamp().saturating_to();
+    let block_ts: u64 = context.timestamp();
     storage::mark_signature_seen(context, &order_id, args.timestamp)?;
     storage::gc_seen_buckets(context, block_ts)?;
 
@@ -161,10 +158,10 @@ pub fn run_place_order_signed<CTX: ContextTr>(
 ///
 /// Replay protection is implicit: cancelling an already-cancelled order is rejected by
 /// cancel_order_core ("order not cancellable").
-pub fn run_cancel_order_signed<CTX: ContextTr>(
+pub fn run_cancel_order_signed<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = cancelOrderSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("cancelOrderSigned: invalid calldata"))?;
 
@@ -201,11 +198,11 @@ pub fn run_cancel_order_signed<CTX: ContextTr>(
 ///
 /// `marketId` is accepted for ABI compatibility but ignored — the order is
 /// looked up globally by `orderId`.
-pub fn run_cancel_order<CTX: ContextTr>(
+pub fn run_cancel_order<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = cancelOrderCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("cancelOrder: invalid calldata"))?;
     cancel_order_core(caller, args.orderId.0, context)
@@ -233,11 +230,11 @@ pub fn run_cancel_order<CTX: ContextTr>(
 ///
 /// Cancels each id in strict calldata order on behalf of `caller`. Returns the index-aligned status
 /// blob; see [`batch`] for the record layout.
-pub fn run_batch_cancel_orders<CTX: ContextTr>(
+pub fn run_batch_cancel_orders<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     // Defensive pre-decode length read, repeated here on purpose: the gas path in
     // `run_perp_dex_call` must not be the only thing that distrusts the declared length word, since
     // `abi_decode_validate` reserves capacity for it before looking at the calldata size.
@@ -273,10 +270,10 @@ pub fn run_batch_cancel_orders<CTX: ContextTr>(
 /// ```
 ///
 /// `N` is inside the digest, so the batch's size, content and order cannot be tampered with.
-pub fn run_batch_cancel_orders_signed<CTX: ContextTr>(
+pub fn run_batch_cancel_orders_signed<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     batch::CANCEL_SIGNED_LAYOUT.checked_len(input_bytes)?;
     let args = batchCancelOrdersSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("batchCancelOrdersSigned: invalid calldata"))?;
@@ -321,7 +318,7 @@ pub fn run_batch_cancel_orders_signed<CTX: ContextTr>(
         ));
     }
     // ── last pre-loop fault has passed; the first write happens here ──
-    let block_ts: u64 = context.block().timestamp().saturating_to();
+    let block_ts: u64 = context.timestamp();
     storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
     gc_seen_buckets_best_effort(context, block_ts)?;
 
@@ -350,14 +347,14 @@ pub fn run_batch_cancel_orders_signed<CTX: ContextTr>(
 /// (`storage::gc_seen_buckets`): the markers it drops can no longer cause a false reject, and a
 /// bucket it fails to finish is re-visited or simply leaks stale markers until a wipe.
 ///
-/// A [`PrecompileError::Fatal`] still propagates — that is a node/DB fault, not a housekeeping
+/// A [`PerpError::Fatal`] still propagates — that is a node/DB fault, not a housekeeping
 /// failure, and it must not be masked (same rule `drive_batch` applies to per-item errors).
-fn gc_seen_buckets_best_effort<CTX: ContextTr>(
-    context: &mut CTX,
+fn gc_seen_buckets_best_effort<H: PerpHost>(
+    context: &mut H,
     block_ts: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     match storage::gc_seen_buckets(context, block_ts) {
-        Err(PrecompileError::Fatal(e)) => Err(PrecompileError::Fatal(e)),
+        Err(PerpError::Fatal(e)) => Err(PerpError::Fatal(e)),
         _ => Ok(()),
     }
 }
@@ -422,11 +419,11 @@ pub(crate) fn batch_cancel_message(
 /// layout. The `orderId` field is the placed id for an accepted item, the BURNED id for an aborted
 /// one (it consumed an id and the nonce advances past it), and ZERO for a rejected /
 /// never-attempted one (no id was consumed, so none exists).
-pub fn run_batch_place_orders<CTX: ContextTr>(
+pub fn run_batch_place_orders<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     // Defensive pre-decode length read, repeated here on purpose (see `run_batch_cancel_orders`):
     // `abi_decode_validate` reserves capacity for the declared length before looking at the
     // calldata size, and one `PlaceItem` is 224 bytes, so the bound is 7× tighter than cancel's.
@@ -489,10 +486,10 @@ pub fn run_batch_place_orders<CTX: ContextTr>(
 ///
 /// `N` is inside the digest, so the batch's size, content and order cannot be tampered with.
 /// Order ids are `keccak256(signature || u32BE(k))` — the per-user nonce is NOT used or advanced.
-pub fn run_batch_place_orders_signed<CTX: ContextTr>(
+pub fn run_batch_place_orders_signed<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     batch::PLACE_SIGNED_LAYOUT.checked_len(input_bytes)?;
     let args = batchPlaceOrdersSignedCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("batchPlaceOrdersSigned: invalid calldata"))?;
@@ -544,7 +541,7 @@ pub fn run_batch_place_orders_signed<CTX: ContextTr>(
         ));
     }
     // ── last pre-loop fault has passed; the first write happens here ──
-    let block_ts: u64 = context.block().timestamp().saturating_to();
+    let block_ts: u64 = context.timestamp();
     storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
     gc_seen_buckets_best_effort(context, block_ts)?;
 
@@ -571,12 +568,12 @@ pub fn run_batch_place_orders_signed<CTX: ContextTr>(
 }
 
 /// One batch item: `place_order_core` verbatim, plus the status → tag mapping.
-fn place_batch_item<CTX: ContextTr>(
-    context: &mut CTX,
+fn place_batch_item<H: PerpHost>(
+    context: &mut H,
     account: Address,
     order_id: [u8; 32],
     item: &PlaceItem,
-) -> Result<PerpBatchTag, PrecompileError> {
+) -> Result<PerpBatchTag, PerpError> {
     let status = place_order_core(
         account,
         order_id,
@@ -606,13 +603,13 @@ fn place_batch_item<CTX: ContextTr>(
 ///
 /// Skips the write entirely when nothing was consumed, so an all-rejected batch contributes zero
 /// keys to the block delta (a redundant same-value write would still mark the key dirty).
-fn commit_batch_order_nonce<CTX: ContextTr>(
-    context: &mut CTX,
+fn commit_batch_order_nonce<H: PerpHost>(
+    context: &mut H,
     account: Address,
     base_nonce: u64,
     accepted: u64,
     aborted_at: Option<usize>,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let consumed = accepted + u64::from(aborted_at.is_some());
     if consumed == 0 {
         return Ok(());
@@ -681,10 +678,10 @@ pub(crate) fn batch_place_message(
 ///
 /// The input `marketId` is accepted for ABI compatibility but ignored — the
 /// order is looked up globally by `orderId`.
-pub fn run_get_order<CTX: ContextTr>(
+pub fn run_get_order<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getOrderCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getOrder: invalid calldata"))?;
     let order_id: [u8; 32] = args.orderId.0;
@@ -707,10 +704,10 @@ pub fn run_get_order<CTX: ContextTr>(
 }
 
 /// `getOpenOrders(address user, uint64 marketId) returns (bytes32[] orderIds, uint8[] sides, uint64[] prices, uint64[] remainingQuantities)`
-pub fn run_get_open_orders<CTX: ContextTr>(
+pub fn run_get_open_orders<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getOpenOrdersCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getOpenOrders: invalid calldata"))?;
 
@@ -747,10 +744,10 @@ pub fn run_get_open_orders<CTX: ContextTr>(
 }
 
 /// `getMarketFeeTotal(uint64 marketId) returns (uint64 totalFee)`
-pub fn run_get_market_fee_total<CTX: ContextTr>(
+pub fn run_get_market_fee_total<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getMarketFeeTotalCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getMarketFeeTotal: invalid calldata"))?;
     let total = storage::load_market_fee_total(context, args.marketId)?;
@@ -760,10 +757,10 @@ pub fn run_get_market_fee_total<CTX: ContextTr>(
 }
 
 /// `getBookPrices(uint64 marketId, uint8 side) returns (uint64[] prices)`
-pub fn run_get_book_prices<CTX: ContextTr>(
+pub fn run_get_book_prices<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getBookPricesCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getBookPrices: invalid calldata"))?;
 
@@ -785,10 +782,10 @@ pub fn run_get_book_prices<CTX: ContextTr>(
 }
 
 /// `getBookLevel(uint64 marketId, uint8 side, uint64 price) returns (bytes32[] orderIds)`
-pub fn run_get_book_level<CTX: ContextTr>(
+pub fn run_get_book_level<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getBookLevelCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getBookLevel: invalid calldata"))?;
 
@@ -809,26 +806,26 @@ pub fn run_get_book_level<CTX: ContextTr>(
 const MAX_RECV_WINDOW: u64 = 60; // seconds
 const CLOCK_SKEW_ALLOWANCE: u64 = 5; // seconds of future tolerance
 
-pub(crate) fn check_api_key_expiry<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn check_api_key_expiry<H: PerpHost>(
+    context: &mut H,
     key: &ApiKey,
 ) -> Result<(), &'static str> {
     if key.expiry == 0 {
         return Ok(());
     }
-    let block_ts: u64 = context.block().timestamp().saturating_to();
+    let block_ts: u64 = context.timestamp();
     if block_ts >= key.expiry {
         return Err("api key has expired");
     }
     Ok(())
 }
 
-pub(crate) fn check_recv_window<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn check_recv_window<H: PerpHost>(
+    context: &mut H,
     timestamp: u64,
     recv_window: u64,
 ) -> Result<(), &'static str> {
-    let block_ts: u64 = context.block().timestamp().saturating_to();
+    let block_ts: u64 = context.timestamp();
     let window = recv_window.min(MAX_RECV_WINDOW);
 
     if timestamp > block_ts + CLOCK_SKEW_ALLOWANCE {
@@ -866,10 +863,10 @@ pub(crate) fn verify_ed25519(
 /// nonce untouched, so the same id is reused, matching the old revert-rollback behavior).
 /// Returns `(order_id, bumped_nonce)`; the caller persists the bump via
 /// [`commit_order_nonce`] on the success path.
-pub(super) fn peek_order_id<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn peek_order_id<H: PerpHost>(
+    context: &mut H,
     account: Address,
-) -> Result<([u8; 32], u64), PrecompileError> {
+) -> Result<([u8; 32], u64), PerpError> {
     let nonce = storage::load_user_nonce(context, account)?;
     Ok((derive_order_id(account, nonce), nonce + 1))
 }
@@ -889,16 +886,16 @@ pub(super) fn derive_order_id(account: Address, nonce: u64) -> [u8; 32] {
 
 /// Persists the nonce bump reserved by [`peek_order_id`]. Call ONLY after the placement
 /// succeeded (all genuine rejects passed).
-pub(super) fn commit_order_nonce<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn commit_order_nonce<H: PerpHost>(
+    context: &mut H,
     account: Address,
     bumped_nonce: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     storage::save_user_nonce(context, account, bumped_nonce)
 }
 
 struct ValidatedOrder {
-    market: crate::perp_dex::types::Market,
+    market: crate::types::Market,
     side: Side,
     order_type: OrderType,
     tif: TimeInForce,
@@ -909,7 +906,7 @@ struct ValidatedOrder {
 /// `is_terminal()` = it fully filled or its IOC/FOK/market remainder expired, leaving no record.
 /// (`batchPlaceOrders` maps that split onto the `Accepted` / `Filled` status tags. The single-order
 /// entry points ignore it — they answer with the order id and let the caller read the logs.)
-fn place_order_core<CTX: ContextTr>(
+fn place_order_core<H: PerpHost>(
     account: Address,
     order_id: [u8; 32],
     market_id: u64,
@@ -919,8 +916,8 @@ fn place_order_core<CTX: ContextTr>(
     order_type_u8: u8,
     tif_u8: u8,
     client_order_id: [u8; 16],
-    context: &mut CTX,
-) -> Result<OrderStatus, PrecompileError> {
+    context: &mut H,
+) -> Result<OrderStatus, PerpError> {
     let validated = validate_place_order(
         context,
         market_id,
@@ -989,15 +986,15 @@ fn place_order_core<CTX: ContextTr>(
     Ok(status)
 }
 
-fn validate_place_order<CTX: ContextTr>(
-    context: &mut CTX,
+fn validate_place_order<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     side_u8: u8,
     price: u64,
     quantity: u64,
     order_type_u8: u8,
     tif_u8: u8,
-) -> Result<ValidatedOrder, PrecompileError> {
+) -> Result<ValidatedOrder, PerpError> {
     let market = storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("placeOrder: unknown market"))?;
     if !market.active {
@@ -1073,14 +1070,14 @@ pub(super) struct PendingOrderPlaced {
 /// Flushes the buffered `OrderPlaced` — **exactly once**: the `take()` makes every later call a
 /// no-op, so all apply sites can call it unconditionally. Also a no-op for callers that have no
 /// pending log (the liquidation close emits its own `OrderPlaced` and passes `&mut None`).
-pub(super) fn emit_pending_order_placed<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn emit_pending_order_placed<H: PerpHost>(
+    context: &mut H,
     pending: &mut Option<PendingOrderPlaced>,
 ) {
     let Some(p) = pending.take() else {
         return;
     };
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderPlaced {
             user: p.user,
@@ -1143,7 +1140,7 @@ fn cancel_unfilled_remainder(taker_order: &mut Order, remaining: u64) {
     }
 }
 
-fn ensure_fok_filled(remaining: u64) -> Result<(), PrecompileError> {
+fn ensure_fok_filled(remaining: u64) -> Result<(), PerpError> {
     if remaining == 0 {
         Ok(())
     } else {
@@ -1154,12 +1151,12 @@ fn ensure_fok_filled(remaining: u64) -> Result<(), PrecompileError> {
 /// PostOnly cross check. Reads the BBO ONCE (both sides, one MarketHot probe) and RETURNS it so the
 /// caller can thread it into `rest_in_book` (no match runs on the PostOnly path, so the BBO stays
 /// current from here to the rest).
-fn ensure_post_only_does_not_cross<CTX: ContextTr>(
-    context: &mut CTX,
+fn ensure_post_only_does_not_cross<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     side: Side,
     price: u64,
-) -> Result<(u64, u64), PrecompileError> {
+) -> Result<(u64, u64), PerpError> {
     let h = storage::load_market_hot(context, market_id)?;
     let (best_bid, best_ask) = (h.best_bid, h.best_ask);
     match side {
@@ -1182,7 +1179,7 @@ fn remove_order_entry(
     entries: &mut std::collections::VecDeque<OrderEntry>,
     order_id: &[u8; 32],
     side_label: &str,
-) -> Result<OrderEntry, PrecompileError> {
+) -> Result<OrderEntry, PerpError> {
     let idx = entries
         .iter()
         .position(|e| &e.order_id == order_id)
@@ -1256,7 +1253,7 @@ fn remove_order_entry_by_price(
     price: u64,
     buy_side: bool,
     side_label: &str,
-) -> Result<OrderEntry, PrecompileError> {
+) -> Result<OrderEntry, PerpError> {
     let idx = find_entry_by_price_id(entries, order_id, price, buy_side).ok_or_else(|| {
         perp_invariant_err(format!(
             "{side_label} entry for order {:?} not found during cancel",
@@ -1268,8 +1265,8 @@ fn remove_order_entry_by_price(
         .expect("index from find_entry_by_price_id is in bounds"))
 }
 
-fn execute_limit_order<CTX: ContextTr>(
-    context: &mut CTX,
+fn execute_limit_order<H: PerpHost>(
+    context: &mut H,
     account: Address,
     order_id: [u8; 32],
     market_id: u64,
@@ -1279,7 +1276,7 @@ fn execute_limit_order<CTX: ContextTr>(
     order: ValidatedOrder,
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     match order.tif {
         TimeInForce::PostOnly => {
             // No match runs → the do-not-cross BBO is still current at rest; thread it in.
@@ -1386,8 +1383,8 @@ fn execute_limit_order<CTX: ContextTr>(
     }
 }
 
-fn execute_market_order<CTX: ContextTr>(
-    context: &mut CTX,
+fn execute_market_order<H: PerpHost>(
+    context: &mut H,
     account: Address,
     order_id: [u8; 32],
     market_id: u64,
@@ -1396,7 +1393,7 @@ fn execute_market_order<CTX: ContextTr>(
     order: ValidatedOrder,
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     if order.tif == TimeInForce::Fok {
         check_fok_feasibility(
             context,
@@ -1432,11 +1429,11 @@ fn execute_market_order<CTX: ContextTr>(
     }
 }
 
-fn cancel_order_core<CTX: ContextTr>(
+fn cancel_order_core<H: PerpHost>(
     account: Address,
     order_id: [u8; 32],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let order = storage::load_order(context, &order_id)?
         .ok_or_else(|| perp_err("cancelOrder: order not found"))?;
 
@@ -1469,8 +1466,8 @@ fn cancel_order_core<CTX: ContextTr>(
 // ── Matching engine ───────────────────────────────────────────────────────────
 
 /// Core matching loop.  Returns the unfilled quantity after matching.
-pub(super) fn match_order<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn match_order<H: PerpHost>(
+    context: &mut H,
     taker_addr: Address,
     taker_order_id: &[u8; 32],
     market_id: u64,
@@ -1479,7 +1476,7 @@ pub(super) fn match_order<CTX: ContextTr>(
     quantity: u64,
     order_type: OrderType,
     tif: TimeInForce,
-    market: &crate::perp_dex::types::Market,
+    market: &crate::types::Market,
     // When true, this is a liquidation close: the taker fee is waived and the number of distinct
     // maker accounts is capped so balance after-image gas has a fixed pre-write upper bound.
     liquidation_close: bool,
@@ -1494,7 +1491,7 @@ pub(super) fn match_order<CTX: ContextTr>(
     // order's own Trade/PositionChanged/OrderCancelled events. `&mut None` for callers that emit
     // their own OrderPlaced (the liquidation close).
     pending_placed: &mut Option<PendingOrderPlaced>,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     let mut remaining = quantity;
     let mut last_trade_price = None;
     let mut taker_settlement =
@@ -1516,7 +1513,7 @@ pub(super) fn match_order<CTX: ContextTr>(
     // field of the Market already loaded — no separate storage read.
     let mark = market.mark_price;
     let (mark_upper, mark_lower) =
-        crate::perp_dex::math::mark_band_bounds(mark, market.price_band_bps);
+        crate::math::mark_band_bounds(mark, market.price_band_bps);
 
     match side {
         Side::Buy => {
@@ -2031,15 +2028,15 @@ pub(super) fn match_order<CTX: ContextTr>(
 fn debug_assert_totals(
     buy: impl Iterator<Item = OrderEntry>,
     sell: impl Iterator<Item = OrderEntry>,
-    pos: &crate::perp_dex::types::PerpPosition,
+    pos: &crate::types::PerpPosition,
     base_decimals: u32,
     price_decimals: u32,
 ) {
     #[cfg(debug_assertions)]
     {
-        let (bq, bn) = crate::perp_dex::math::sum_side_totals(buy, base_decimals, price_decimals)
+        let (bq, bn) = crate::math::sum_side_totals(buy, base_decimals, price_decimals)
             .expect("sum buy totals");
-        let (sq, sn) = crate::perp_dex::math::sum_side_totals(sell, base_decimals, price_decimals)
+        let (sq, sn) = crate::math::sum_side_totals(sell, base_decimals, price_decimals)
             .expect("sum sell totals");
         debug_assert_eq!(
             (bq, bn, sq, sn),
@@ -2066,8 +2063,8 @@ fn entries_iter(
     v.iter().copied()
 }
 
-fn rest_in_book<CTX: ContextTr>(
-    context: &mut CTX,
+fn rest_in_book<H: PerpHost>(
+    context: &mut H,
     user: Address,
     order_id: &[u8; 32],
     market_id: u64,
@@ -2076,7 +2073,7 @@ fn rest_in_book<CTX: ContextTr>(
     qty: u64,
     tif: TimeInForce,
     client_order_id: [u8; 16],
-    market: &crate::perp_dex::types::Market,
+    market: &crate::types::Market,
     // 2b resolve-once: (best_bid, best_ask). `Some` = the caller already read the BBO (PostOnly
     // threads its do-not-cross read — no match ran, so it is still current). `None` = read it here
     // once. rest runs AFTER matching (GTC), and matching only moves the OPPOSITE side from the one
@@ -2086,7 +2083,7 @@ fn rest_in_book<CTX: ContextTr>(
     // lands before this order's `OrderRested`, and only once the margin rejects have passed).
     // Already-`None` on the GTC path when the match flush emitted it.
     pending_placed: &mut Option<PendingOrderPlaced>,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let mut account = storage::load_account(context, user)?;
     // fee rate is a field of the account we already loaded (folded in) — no separate fee-rate read.
@@ -2129,7 +2126,7 @@ fn rest_in_book<CTX: ContextTr>(
             );
             // #A: reconstruct the reservation from the maintained per-side aggregates + this order's
             // hypothetical contribution (no O(n) fold). Byte-identical to the fold above.
-            let entry_notional = crate::perp_dex::math::calc_value(price, qty, bd, pd)?;
+            let entry_notional = crate::math::calc_value(price, qty, bd, pd)?;
             let new_tbq = pos
                 .total_buy_qty
                 .checked_add(qty)
@@ -2139,7 +2136,7 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(entry_notional)
                 .ok_or_else(|| perp_err("placeOrder: total buy notional overflow"))?;
             let (new_buy_side_notional, sell_notional, c_notional) =
-                crate::perp_dex::math::calc_reservation_notionals_from_totals_it(
+                crate::math::calc_reservation_notionals_from_totals_it(
                     buy_ref
                         .range(..idx)
                         .copied()
@@ -2232,7 +2229,7 @@ fn rest_in_book<CTX: ContextTr>(
                 pd,
             );
             // #A: reconstruct from maintained aggregates + this order's hypothetical contribution.
-            let entry_notional = crate::perp_dex::math::calc_value(price, qty, bd, pd)?;
+            let entry_notional = crate::math::calc_value(price, qty, bd, pd)?;
             let new_tsq = pos
                 .total_sell_qty
                 .checked_add(qty)
@@ -2242,7 +2239,7 @@ fn rest_in_book<CTX: ContextTr>(
                 .checked_add(entry_notional)
                 .ok_or_else(|| perp_err("placeOrder: total sell notional overflow"))?;
             let (buy_notional, new_sell_side_notional, c_notional) =
-                crate::perp_dex::math::calc_reservation_notionals_from_totals_it(
+                crate::math::calc_reservation_notionals_from_totals_it(
                     buy_entries.iter().copied(),
                     sell_ref
                         .range(..idx)
@@ -2319,7 +2316,7 @@ fn rest_in_book<CTX: ContextTr>(
     storage::save_position_reservation_only(context, user, market_id, pos)?;
     storage::save_account(context, user, account)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderRested {
             user,
@@ -2351,17 +2348,17 @@ fn rest_in_book<CTX: ContextTr>(
 /// explicit cancel path (cache live → may skip the BBO refresh), or
 /// [`remove_from_book_during_match`] from the settlement auto-cancel paths (cache
 /// stale mid-matching → must always refresh).
-pub(super) fn execute_order_cancellation<CTX: ContextTr, F>(
-    context: &mut CTX,
+pub(super) fn execute_order_cancellation<H: PerpHost, F>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     order_id: [u8; 32],
     order: Order,
-    market: &crate::perp_dex::types::Market,
+    market: &crate::types::Market,
     remove: F,
-) -> Result<(), PrecompileError>
+) -> Result<(), PerpError>
 where
-    F: FnOnce(&mut CTX, u64, Side, u64, &[u8; 32]) -> Result<(), PrecompileError>,
+    F: FnOnce(&mut H, u64, Side, u64, &[u8; 32]) -> Result<(), PerpError>,
 {
     remove(context, market_id, order.side, order.price, &order_id)?;
     release_margin_for_cancelled_order(context, user, market_id, order.side, &order_id, market)?;
@@ -2370,7 +2367,7 @@ where
     // level's live count. The Cancelled/Expired distinction (previously only the saved status; the
     // event has always been OrderCancelled) is dropped with the record — history is disposable.
     storage::delete_order(context, &order_id)?;
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderCancelled {
             user,
@@ -2388,13 +2385,13 @@ where
 ///
 /// Returns `(level_emptied, old_best)` where `old_best` is the side's cached best
 /// captured BEFORE any mutation (so callers can decide how to refresh it).
-fn detach_order_from_level<CTX: ContextTr>(
-    context: &mut CTX,
+fn detach_order_from_level<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     side: Side,
     price: u64,
     _order_id: &[u8; 32],
-) -> Result<(bool, u64), PrecompileError> {
+) -> Result<(bool, u64), PerpError> {
     // lazy-queue: `order_id` is intentionally NOT removed from the FIFO queue — that O(depth) scan
     // is replaced by an O(1) decrement of the level's LIVE count. The stale id is swept when the
     // next match walk reaches it (load_order → None → skip). When the count hits 0 the level is
@@ -2425,12 +2422,12 @@ fn detach_order_from_level<CTX: ContextTr>(
 
 /// Recompute the side's best from its (already-mutated) price list and, if it moved
 /// off `old_best`, record a mid-price sample. Shared by both removal entry points.
-fn refresh_best_and_sample<CTX: ContextTr>(
-    context: &mut CTX,
+fn refresh_best_and_sample<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     side: Side,
     old_best: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     match side {
         Side::Buy => {
             let best_bid = storage::refresh_best_bid(context, market_id)?;
@@ -2466,13 +2463,13 @@ fn refresh_best_and_sample<CTX: ContextTr>(
 ///   - Sell: price == best_ask → refresh; price >  best_ask → skip; price <  best_ask → invariant
 /// A removal "beyond" the cached best is impossible with a live cache, so it trips
 /// an invariant error (guards against a stale cache reaching this path).
-pub(super) fn remove_from_book_after_cancel<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn remove_from_book_after_cancel<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     side: Side,
     price: u64,
     order_id: &[u8; 32],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let (emptied, old_best) = detach_order_from_level(context, market_id, side, price, order_id)?;
     if !emptied {
         return Ok(());
@@ -2508,13 +2505,13 @@ pub(super) fn remove_from_book_after_cancel<CTX: ContextTr>(
 /// best_bid/best_ask cache is deliberately stale — match_order defers its single
 /// refresh to after the sweep. The price-vs-cache test is untrustworthy here, so
 /// always recompute the best from the price list to keep the cached value correct.
-pub(super) fn remove_from_book_during_match<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn remove_from_book_during_match<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     side: Side,
     price: u64,
     order_id: &[u8; 32],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let (emptied, old_best) = detach_order_from_level(context, market_id, side, price, order_id)?;
     if emptied {
         refresh_best_and_sample(context, market_id, side, old_best)?;
@@ -2522,14 +2519,14 @@ pub(super) fn remove_from_book_during_match<CTX: ContextTr>(
     Ok(())
 }
 
-pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn release_margin_for_cancelled_order<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     side: Side,
     order_id: &[u8; 32],
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<(), PerpError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let (bd, pd) = (market.base_decimals, market.price_decimals);
 
@@ -2555,7 +2552,7 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     // reconstruct the POST-cancel flip-aware reservation from them (byte-identical to the filtered
     // fold this replaced) — no O(n) fold over the whole list.
     let entry_notional =
-        crate::perp_dex::math::calc_value(cancelled_entry.price, cancelled_entry.amount, bd, pd)?;
+        crate::math::calc_value(cancelled_entry.price, cancelled_entry.amount, bd, pd)?;
     match side {
         Side::Buy => {
             pos.total_buy_qty = pos
@@ -2582,7 +2579,7 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
     let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
     debug_assert_totals(entries_iter(&buy_ref), entries_iter(&sell_ref), &pos, bd, pd);
     let (buy_notional, sell_notional, c_notional) =
-        crate::perp_dex::math::calc_reservation_notionals_from_totals_it(
+        crate::math::calc_reservation_notionals_from_totals_it(
             buy_ref.iter().copied(),
             sell_ref.iter().copied(),
             pos.total_buy_qty,
@@ -2619,14 +2616,14 @@ pub(super) fn release_margin_for_cancelled_order<CTX: ContextTr>(
 /// `reduce_order_entry_core`); the order's `filled` can lag it during the same matching round, so
 /// the release is sized from the entry, not from `order.quantity - order.filled`.
 pub(super) fn release_margin_core(
-    pos: &mut crate::perp_dex::types::PerpPosition,
-    account: &mut crate::perp_dex::types::UserAccount,
+    pos: &mut crate::types::PerpPosition,
+    account: &mut crate::types::UserAccount,
     buy_entries: &mut std::collections::VecDeque<OrderEntry>,
     sell_entries: &mut std::collections::VecDeque<OrderEntry>,
     side: Side,
     order_id: &[u8; 32],
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<(), PerpError> {
     let cancelled_entry = {
         let (entries, label) = match side {
             Side::Buy => (&mut *buy_entries, "buy"),
@@ -2635,7 +2632,7 @@ pub(super) fn release_margin_core(
         remove_order_entry(entries, order_id, label)?
     };
     let (buy_notional, sell_notional, c_notional) =
-        crate::perp_dex::math::calc_reservation_notionals_it(
+        crate::math::calc_reservation_notionals_it(
             buy_entries.iter().copied(),
             sell_entries.iter().copied(),
             market.base_decimals,
@@ -2662,13 +2659,13 @@ pub(super) fn release_margin_core(
 /// agnostic and the freed/fee math has a single source of truth. `old_reserved` is snapshotted here
 /// before `set_reservations`; the preceding entry removal never touches `pos.margin_reserved`.
 fn apply_release_effect(
-    pos: &mut crate::perp_dex::types::PerpPosition,
+    pos: &mut crate::types::PerpPosition,
     new_buy_notional: u64,
     new_sell_notional: u64,
     new_c_notional: u64,
     cancelled: &OrderEntry,
-    market: &crate::perp_dex::types::Market,
-) -> Result<u64, PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<u64, PerpError> {
     let old_reserved = pos.margin_reserved;
     pos.set_reservations(
         new_buy_notional,
@@ -2700,22 +2697,22 @@ fn apply_release_effect(
 // ── FOK / PostOnly pre-checks ─────────────────────────────────────────────────
 
 /// Check whether the book can fully fill a FOK order.  Returns error if not.
-fn check_fok_feasibility<CTX: ContextTr>(
-    context: &mut CTX,
+fn check_fok_feasibility<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     side: Side,
     limit_price: u64,
     quantity: u64,
     order_type: OrderType,
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<(), PerpError> {
     let mut available: u64 = 0;
     // Count only IN-BAND liquidity: match_order will not fill past the band, so FOK
     // feasibility must apply the same bound or it would pass a FOK that then can't fully
     // fill. (mark_price is a field of the Market already loaded.)
     let mark = market.mark_price;
     let (mark_upper, mark_lower) =
-        crate::perp_dex::math::mark_band_bounds(mark, market.price_band_bps);
+        crate::math::mark_band_bounds(mark, market.price_band_bps);
     match side {
         Side::Buy => {
             let ask_prices = storage::load_ask_prices_ref(context, market_id)?;

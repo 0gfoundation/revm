@@ -3368,6 +3368,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "perp-engine"
+version = "1.0.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "blake3",
+ "ed25519-dalek",
+ "perp-core",
+ "revm-context",
+ "revm-context-interface",
+ "revm-database",
+ "revm-primitives",
+ "rstest",
+ "serde",
+]
+
+[[package]]
 name = "pest"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4022,6 +4039,7 @@ dependencies = [
  "libsecp256k1",
  "p256",
  "perp-core",
+ "perp-engine",
  "rand 0.9.1",
  "revm-bytecode",
  "revm-context",

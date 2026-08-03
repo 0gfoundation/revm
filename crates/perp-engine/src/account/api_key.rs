@@ -2,29 +2,27 @@
 
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
-use context::{ContextTr, JournalTr};
+use crate::host::PerpHost;
 use primitives::{Address, Bytes, FixedBytes, Log};
 
 use crate::{
-    perp_dex::{
         errors::perp_err,
-        interface::IPerpDex::{
-            self, getApiKeyCall, getApiKeyReturn, getApiKeysCall, getApiKeysReturn,
-            registerApiKeyCall, revokeApiKeyCall,
-        },
-        storage,
-        types::ApiKey,
-        PERP_DEX_ADDRESS,
+    interface::IPerpDex::{
+        self, getApiKeyCall, getApiKeyReturn, getApiKeysCall, getApiKeysReturn,
+        registerApiKeyCall, revokeApiKeyCall,
     },
-    PrecompileError,
+    storage,
+    types::ApiKey,
+    PERP_DEX_ADDRESS,
+    PerpError,
 };
 
 /// `registerApiKey(uint8 keyId, bytes32 pubkey, uint64 expiry)`
-pub fn run_register_api_key<CTX: ContextTr>(
+pub fn run_register_api_key<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = registerApiKeyCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("registerApiKey: invalid calldata"))?;
 
@@ -43,7 +41,7 @@ pub fn run_register_api_key<CTX: ContextTr>(
         },
     )?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::ApiKeyRegistered {
             user: caller,
@@ -58,17 +56,17 @@ pub fn run_register_api_key<CTX: ContextTr>(
 }
 
 /// `revokeApiKey(uint8 keyId)`
-pub fn run_revoke_api_key<CTX: ContextTr>(
+pub fn run_revoke_api_key<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = revokeApiKeyCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("revokeApiKey: invalid calldata"))?;
 
     storage::delete_api_key(context, caller, args.keyId)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::ApiKeyRevoked {
             user: caller,
@@ -81,10 +79,10 @@ pub fn run_revoke_api_key<CTX: ContextTr>(
 }
 
 /// `getApiKey(address user, uint8 keyId) returns (bytes32 pubkey, uint64 expiry)`
-pub fn run_get_api_key<CTX: ContextTr>(
+pub fn run_get_api_key<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getApiKeyCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getApiKey: invalid calldata"))?;
 
@@ -98,10 +96,10 @@ pub fn run_get_api_key<CTX: ContextTr>(
 }
 
 /// `getApiKeys(address user) returns (uint8[] keyIds, bytes32[] pubkeys, uint64[] expiries)`
-pub fn run_get_api_keys<CTX: ContextTr>(
+pub fn run_get_api_keys<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getApiKeysCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getApiKeys: invalid calldata"))?;
 

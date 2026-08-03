@@ -1,10 +1,11 @@
+use context::ContextTr;
 use super::*;
 use alloy_sol_types::{SolCall, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId};
 
-use crate::perp_dex::{
+use crate::{
     account::{run_get_user_fee_rates, run_set_user_fee_rates},
     interface::IPerpDex::{
         depositCall, getAccountCall, getUserFeeRatesCall, setUserFeeRatesCall,
@@ -293,7 +294,7 @@ fn get_account_reports_available_wallet_net_of_allocations() {
     storage::save_account(
         &mut ctx,
         ALICE,
-        crate::perp_dex::types::UserAccount {
+        crate::types::UserAccount {
             perp_wallet_balance: 100,
             ..Default::default()
         },
@@ -303,7 +304,7 @@ fn get_account_reports_available_wallet_net_of_allocations() {
         &mut ctx,
         ALICE,
         1,
-        &crate::perp_dex::types::PerpPosition {
+        &crate::types::PerpPosition {
             margin: 40,
             margin_reserved: 10,
             fee_reserved: 5,
@@ -327,7 +328,7 @@ fn get_account_reports_available_wallet_net_of_allocations() {
 fn successful_call_emits_one_final_balance_after_image() {
     let amount = U256::from(1_000_000_u64);
     let mut ctx = make_ctx(amount);
-    let output = crate::perp_dex::run_perp_dex_call(
+    let output = crate::run_perp_dex_call(
         &depositCall { amount }.abi_encode(),
         1_000_000,
         ALICE,
@@ -356,7 +357,7 @@ fn successful_call_emits_one_final_balance_after_image() {
 #[test]
 fn reverted_call_emits_no_balance_after_image() {
     let mut ctx = make_ctx(U256::ZERO);
-    let output = crate::perp_dex::run_perp_dex_call(
+    let output = crate::run_perp_dex_call(
         &depositCall { amount: U256::ZERO }.abi_encode(),
         1_000_000,
         ALICE,
@@ -377,7 +378,7 @@ fn metadata_only_call_emits_no_balance_after_image() {
     let mut ctx = make_ctx(U256::ZERO);
     storage::save_admin(&mut ctx, ADMIN).unwrap();
 
-    let output = crate::perp_dex::run_perp_dex_call(
+    let output = crate::run_perp_dex_call(
         &setUserFeeRatesCall {
             user: ALICE,
             makerFeeBps: 1,

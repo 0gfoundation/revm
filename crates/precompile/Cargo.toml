@@ -22,6 +22,7 @@ workspace = true
 primitives.workspace = true
 context.workspace = true
 perp-core.workspace = true
+perp-engine.workspace = true
 bytecode.workspace = true
 
 # modexp precompiles

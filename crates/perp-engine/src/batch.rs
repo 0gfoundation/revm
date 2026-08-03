@@ -16,25 +16,23 @@
 //! committed. Hence abort-forward: mark the offending item `Aborted`, mark the tail `NotAttempted`,
 //! stop, and return `Ok` so the committed prefix keeps its logs and stays consistent with state.
 //!
-//! Only a true [`PrecompileError::Fatal`] propagates. Note that `perp_invariant_err` is
-//! `PrecompileError::Other` with an `[INVARIANT] ` prefix (`errors.rs:11`), **not** `Fatal` — an
+//! Only a true [`PerpError::Fatal`] propagates. Note that `perp_invariant_err` is
+//! `PerpError::Reject` with an `[INVARIANT] ` prefix (`errors.rs:11`), **not** `Fatal` — an
 //! invariant is an abort, not a propagate.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use context::{ContextTr, JournalTr};
+use crate::host::PerpHost;
 use primitives::Address;
 
 use crate::{
-    perp_dex::{
         errors::perp_err,
-        interface::IPerpDex::{
-            batchCancelOrdersCall, batchCancelOrdersSignedCall, batchPlaceOrdersCall,
-            batchPlaceOrdersSignedCall,
-        },
-        storage, CANCEL_ORDER_GAS, PLACE_ORDER_GAS,
+    interface::IPerpDex::{
+        batchCancelOrdersCall, batchCancelOrdersSignedCall, batchPlaceOrdersCall,
+        batchPlaceOrdersSignedCall,
     },
-    PrecompileError,
+    storage, CANCEL_ORDER_GAS, PLACE_ORDER_GAS,
+    PerpError,
 };
 use alloy_sol_types::SolCall;
 
@@ -136,7 +134,7 @@ impl BatchArrayLayout {
     ///    distrusts this word, so the same check gates the decode. The backing bound uses this
     ///    layout's [`elem_size`](Self::elem_size) stride, so a 224-byte-per-item `PlaceItem[]` needs
     ///    7× as many real bytes as a `bytes32[]` of the same declared length.
-    pub fn checked_len(&self, input: &[u8]) -> Result<usize, PrecompileError> {
+    pub fn checked_len(&self, input: &[u8]) -> Result<usize, PerpError> {
         let head_start = 4 + self.head_word * 32;
         let head = input
             .get(head_start..head_start + 32)
@@ -206,7 +204,7 @@ pub fn batch_dynamic_gas(selector: [u8; 4], input: &[u8]) -> Option<u64> {
 
 /// Pre-loop length gate on the **decoded** array: an empty or oversized batch reverts the whole
 /// call. Both faults are pre-write, so the commit-only write tripwire stays clean.
-pub fn check_batch_len(n: usize, max: usize, what: &str) -> Result<(), PrecompileError> {
+pub fn check_batch_len(n: usize, max: usize, what: &str) -> Result<(), PerpError> {
     if n == 0 {
         return Err(perp_err(format!("{what}: empty batch")));
     }
@@ -317,9 +315,9 @@ pub enum PerpBatchReason {
 /// [`drive_batch`]), exactly so that this table cannot silently change semantics. An unrecognised
 /// message degrades to [`PerpBatchReason::Other`]; `reason_code_table_is_pinned` in the trading
 /// tests pins each mapping so a message rename fails loudly instead of silently.
-pub fn reason_code(err: &PrecompileError) -> PerpBatchReason {
+pub fn reason_code(err: &PerpError) -> PerpBatchReason {
     let msg = match err {
-        PrecompileError::Other(msg) => msg.as_str(),
+        PerpError::Reject(msg) => msg.as_str(),
         _ => return PerpBatchReason::Other,
     };
     if msg.starts_with("[INVARIANT] ") {
@@ -463,17 +461,17 @@ pub struct BatchRun {
 /// **zero** for `Rejected`/`NotAttempted` (no id was consumed, so none exists) but the item's
 /// DERIVED id for `Aborted`: that id was consumed — the nonce advances past it and the item may have
 /// written under it — so the caller has to be told which one was burned.
-pub fn drive_batch<CTX, EchoFn, ItemFn>(
-    context: &mut CTX,
+pub fn drive_batch<H, EchoFn, ItemFn>(
+    context: &mut H,
     initiator: Address,
     n: usize,
     echo_id: EchoFn,
     mut run_item: ItemFn,
-) -> Result<BatchRun, PrecompileError>
+) -> Result<BatchRun, PerpError>
 where
-    CTX: ContextTr,
+    H: PerpHost,
     EchoFn: Fn(usize, PerpBatchTag) -> [u8; 32],
-    ItemFn: FnMut(&mut CTX, usize) -> Result<(PerpBatchTag, [u8; 32]), PrecompileError>,
+    ItemFn: FnMut(&mut H, usize) -> Result<(PerpBatchTag, [u8; 32]), PerpError>,
 {
     // A batch acts for exactly ONE initiator: hold its account/position/order-lists in a
     // batch-scoped local working-set so per-item reads/writes stay cache-local, flushed to the main
@@ -486,15 +484,15 @@ where
     let mut k = 0usize;
     while k < n {
         // Runtime genuine-vs-abort witness, snapshotted per item (NOT a string match on the error).
-        let writes_before = context.journal_mut().perp_write_count();
+        let writes_before = context.perp_write_count();
         match run_item(context, k) {
             Ok((tag, order_id)) => {
                 accepted += 1;
                 blob.push(tag, &order_id, PerpBatchReason::None);
             }
-            Err(PrecompileError::Fatal(e)) => return Err(PrecompileError::Fatal(e)),
+            Err(PerpError::Fatal(e)) => return Err(PerpError::Fatal(e)),
             Err(e) => {
-                let wrote = context.journal_mut().perp_write_count() != writes_before;
+                let wrote = context.perp_write_count() != writes_before;
                 let code = reason_code(&e);
                 if !wrote {
                     // Write-clean: HL-style per-item reject, the batch carries on.

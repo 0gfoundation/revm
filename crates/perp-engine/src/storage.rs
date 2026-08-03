@@ -2,26 +2,21 @@
 
 pub use perp_core::keys;
 
-use context::{
-    journaled_state::PerpDelta,
-    ContextTr, JournalTr,
-};
+use crate::host::PerpHost;
+use context_interface::journaled_state::PerpDelta;
+use context_interface::JournalTr;
 use primitives::{Address, B256, U256};
-use rmp_serde::{Deserializer as RMPDeserializer, Serializer as RMPSerializer};
 use serde::{Deserialize, Serialize};
 
-use crate::perp_dex::PERP_DEX_ADDRESS;
+use crate::PERP_DEX_ADDRESS;
 use crate::{
-    perp_dex::{
         errors::perp_err,
-        types::{
-            ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, MarketHot, Order,
-            OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
-            PublicAccountBalance, UserAccount, UserFeeRates,
-        },
+    types::{
+        ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, MarketHot, Order,
+        OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
+        PublicAccountBalance, UserAccount, UserFeeRates,
     },
-    stateful_precompiles::convert_db_err,
-    PrecompileError,
+    PerpError,
 };
 
 use keys::{
@@ -156,11 +151,8 @@ pub(crate) mod bench_counter {
 /// lived in the state trie under `PERP_DEX_ADDRESS`; perp data now rides the journal's perp
 /// section instead, so it gets the same revert lifecycle but never enters the state root.
 /// See `docs/perpstate-journal集成方案.md` §4.2.
-fn load_blob<CTX: ContextTr>(context: &mut CTX, key: B256) -> Result<Vec<u8>, PrecompileError> {
-    let buf = context
-        .journal_mut()
-        .perp_load(key)
-        .map_err(convert_db_err::<CTX::Db>)?;
+fn load_blob<H: PerpHost>(context: &mut H, key: B256) -> Result<Vec<u8>, PerpError> {
+    let buf = context.perp_load(key)?;
     #[cfg(test)]
     bench_counter::record_read(key, buf.len());
     Ok(buf)
@@ -174,14 +166,14 @@ fn load_blob<CTX: ContextTr>(context: &mut CTX, key: B256) -> Result<Vec<u8>, Pr
 /// the net delta by [`finalize_block_commitment`] (which the block executor calls after
 /// `take_perp_delta`), so a key written N times across the block is hashed once. This replaces the
 /// former per-call `flush_commitment` over a per-write framed log.
-fn store_blob<CTX: ContextTr>(
-    context: &mut CTX,
+fn store_blob<H: PerpHost>(
+    context: &mut H,
     key: B256,
     buf: &[u8],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     #[cfg(test)]
     bench_counter::record_write(key, buf.len());
-    context.journal_mut().perp_store(key, buf.to_vec());
+    context.perp_store(key, buf.to_vec());
     Ok(())
 }
 
@@ -197,27 +189,27 @@ fn store_blob<CTX: ContextTr>(
 /// becomes a bundle transition. The alloy-evm `Evm::finalize_perp_commitment` wrapper does exactly
 /// that. (Pre-#16d this ran inside a tx, so the enclosing `transact`+commit carried it; the
 /// block-end call site has no such enclosing commit.) Journaled like any sstore.
-pub fn finalize_block_commitment<CTX: ContextTr>(
+pub fn finalize_block_commitment<CTX: context_interface::ContextTr>(
     context: &mut CTX,
     delta: &PerpDelta,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     if delta.is_empty() {
         return Ok(());
     }
     context
         .journal_mut()
         .warm_account(PERP_DEX_ADDRESS)
-        .map_err(convert_db_err::<CTX::Db>)?;
+        .map_err(|e| perp_err(format!("Database error: {e:?}")))?;
     let c_prev = context
         .journal_mut()
         .sload(PERP_DEX_ADDRESS, commitment_slot().into())
-        .map_err(convert_db_err::<CTX::Db>)?
+        .map_err(|e| perp_err(format!("Database error: {e:?}")))?
         .data;
     let c_new = compute_block_commitment(c_prev, delta);
     context
         .journal_mut()
         .sstore(PERP_DEX_ADDRESS, commitment_slot().into(), c_new)
-        .map_err(convert_db_err::<CTX::Db>)?;
+        .map_err(|e| perp_err(format!("Database error: {e:?}")))?;
     context.journal_mut().touch_account(PERP_DEX_ADDRESS);
     Ok(())
 }
@@ -233,7 +225,7 @@ pub fn finalize_block_commitment<CTX: ContextTr>(
 // (`perp_load_arc`, 选项A) survives — the typed store's cold path uses it (see `cold_load`).
 
 /// Returns `Address::ZERO` when no admin has been initialised yet.
-pub fn load_admin<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
+pub fn load_admin<H: PerpHost>(context: &mut H) -> Result<Address, PerpError> {
     // Cold/admin-cadence namespace on the cheap BYTE tier (load_blob/store_blob), like the other
     // role/index/funding namespaces — NOT the type-erased Struct tier (that machinery is deleted in
     // Stage C). Byte-identical canonical bytes (`encode(Address)`), so golden-neutral.
@@ -244,10 +236,10 @@ pub fn load_admin<CTX: ContextTr>(context: &mut CTX) -> Result<Address, Precompi
     Ok(decode(&buf)?)
 }
 
-pub fn save_admin<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_admin<H: PerpHost>(
+    context: &mut H,
     admin: Address,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(&admin)?;
     store_blob(context, admin_key(), &buf)
 }
@@ -262,36 +254,23 @@ pub fn save_admin<CTX: ContextTr>(
 
 /// Per-op handle to the typed live store: installs it on first touch, then downcasts the opaque
 /// journal slot (whole-store erasure — one `TypeId` compare, not per-blob).
-fn typed_store_mut<CTX: ContextTr>(context: &mut CTX) -> &mut crate::perp_dex::typed_store::TypedPerpStore {
-    let journal = context.journal_mut();
-    if journal.perp_live_get_mut().is_none() {
-        journal.perp_live_init(std::boxed::Box::new(
-            crate::perp_dex::typed_store::TypedPerpStore::default(),
-        ));
-    }
-    journal
-        .perp_live_get_mut()
-        .expect("perp live store just initialized")
-        .as_any_mut()
-        .downcast_mut::<crate::perp_dex::typed_store::TypedPerpStore>()
-        .expect("perp live store is TypedPerpStore")
+fn typed_store_mut<H: PerpHost>(context: &mut H) -> &mut crate::typed_store::TypedPerpStore {
+    context.live()
 }
 
 /// Generic cold read for a cutover namespace: cross-block decoded store (Arc, zero clone) →
 /// committed bytes (decode once). Mirrors `load_cached`'s tier 2+3. The caller fills its typed
 /// sub-map (fill is per-namespace).
-fn cold_load<CTX: ContextTr, T>(
-    context: &mut CTX,
+fn cold_load<H: PerpHost, T>(
+    context: &mut H,
     key: B256,
-) -> Result<Option<std::sync::Arc<T>>, PrecompileError>
+) -> Result<Option<std::sync::Arc<T>>, PerpError>
 where
     T: Send + Sync + 'static + for<'de> Deserialize<'de>,
 {
     // 选项A decoded store first (already-decoded Arc, no deserialization).
     let mut arc: Option<std::sync::Arc<T>> = context
-        .journal_mut()
-        .perp_load_arc(key)
-        .map_err(convert_db_err::<CTX::Db>)?
+        .perp_load_arc(key)?
         .and_then(|any| std::sync::Arc::downcast::<T>(any).ok());
     // Bytes fallback (overlay bytes or committed store) → decode once.
     if arc.is_none() {
@@ -305,41 +284,41 @@ where
 
 /// Cold path for the `acct` namespace: [`cold_load`] + fill (cache semantics, no dirty mark;
 /// absence cached too).
-fn cold_fill_account<CTX: ContextTr>(
-    context: &mut CTX,
+fn cold_fill_account<H: PerpHost>(
+    context: &mut H,
     user: Address,
-) -> Result<Option<std::sync::Arc<UserAccount>>, PrecompileError> {
+) -> Result<Option<std::sync::Arc<UserAccount>>, PerpError> {
     let arc = cold_load::<_, UserAccount>(context, account_key(user))?;
     typed_store_mut(context).fill_account(user, arc.clone());
     Ok(arc)
 }
 
 /// Cold path for the `mkt` namespace (see [`cold_fill_account`]).
-fn cold_fill_market<CTX: ContextTr>(
-    context: &mut CTX,
+fn cold_fill_market<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<Option<std::sync::Arc<Market>>, PrecompileError> {
+) -> Result<Option<std::sync::Arc<Market>>, PerpError> {
     let arc = cold_load::<_, Market>(context, market_key(market_id))?;
     typed_store_mut(context).fill_market(market_id, arc.clone());
     Ok(arc)
 }
 
 /// Cold path for the `pos` namespace (see [`cold_fill_account`]).
-fn cold_fill_position<CTX: ContextTr>(
-    context: &mut CTX,
+fn cold_fill_position<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-) -> Result<Option<std::sync::Arc<PerpPosition>>, PrecompileError> {
+) -> Result<Option<std::sync::Arc<PerpPosition>>, PerpError> {
     let arc = cold_load::<_, PerpPosition>(context, position_key(user, market_id))?;
     typed_store_mut(context).fill_position(user, market_id, arc.clone());
     Ok(arc)
 }
 
-pub fn load_account<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_account<H: PerpHost>(
+    context: &mut H,
     user: Address,
-) -> Result<UserAccount, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<UserAccount, PerpError> {
+    use crate::typed_store::Resident;
     match typed_store_mut(context).account(user) {
         Resident::Hit(a) => return Ok(a.clone()),
         Resident::Deleted => return Ok(UserAccount::default()),
@@ -353,11 +332,11 @@ pub fn load_account<CTX: ContextTr>(
 /// Zero-copy account read (点1): `Arc<UserAccount>`, no per-read clone. Defaulted like
 /// [`load_account`]. PURE reads only (availability checks). Debit/credit RMW keep [`load_account`]
 /// + [`save_account`].
-pub fn load_account_ref<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_account_ref<H: PerpHost>(
+    context: &mut H,
     user: Address,
-) -> Result<std::sync::Arc<UserAccount>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<std::sync::Arc<UserAccount>, PerpError> {
+    use crate::typed_store::Resident;
     // Hot path: resident Arc, refcount bump only.
     if let Some(arc) = typed_store_mut(context).account_arc(user) {
         return Ok(arc);
@@ -389,16 +368,16 @@ pub fn load_account_ref<CTX: ContextTr>(
 /// each maker fill it takes part in), an account whose balance nets back to its starting value still
 /// reports the intermediate writes, and events appear interleaved with `Trade`/`PositionChanged` in
 /// write order rather than appended in address order at the end of the call.
-fn emit_account_balance_changed<CTX: ContextTr>(context: &mut CTX, user: Address, account: &UserAccount) {
+fn emit_account_balance_changed<H: PerpHost>(context: &mut H, user: Address, account: &UserAccount) {
     let PublicAccountBalance {
         usdc_balance,
         available_perp_balance,
     } = account.public_balance();
-    context.journal_mut().log(primitives::Log {
+    context.log(primitives::Log {
         address: PERP_DEX_ADDRESS,
         data: {
             use alloy_primitives::IntoLogData;
-            crate::perp_dex::interface::IPerpDex::AccountBalanceChanged {
+            crate::interface::IPerpDex::AccountBalanceChanged {
                 user,
                 usdcBalance: usdc_balance,
                 availablePerpBalance: available_perp_balance,
@@ -408,22 +387,22 @@ fn emit_account_balance_changed<CTX: ContextTr>(context: &mut CTX, user: Address
     });
 }
 
-pub fn save_account<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_account<H: PerpHost>(
+    context: &mut H,
     user: Address,
     account: UserAccount,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     emit_account_balance_changed(context, user, &account);
     typed_store_mut(context).set_account(user, account);
     Ok(())
 }
 
-pub fn save_position_reservation_only<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_position_reservation_only<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     pos: PerpPosition,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     #[cfg(debug_assertions)]
     {
         let old = load_position_ref(context, user, market_id)?;
@@ -439,11 +418,11 @@ pub fn save_position_reservation_only<CTX: ContextTr>(
 
 /// [`save_order`] taking the order BY VALUE — the place path owns its `Order`, so this skips the
 /// clone that `save_order(&Order)` forces.
-pub fn save_order_owned<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_order_owned<H: PerpHost>(
+    context: &mut H,
     order_id: &[u8; 32],
     order: Order,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     typed_store_mut(context).set_order(order_id, order);
     Ok(())
 }
@@ -455,11 +434,11 @@ pub fn save_order_owned<CTX: ContextTr>(
 /// (clone again): routing those through here removes both `UserAccount` deep clones (each of which
 /// heap-allocates the `usdc_balance` String) on the warm path. Byte-identical final blob to
 /// load→modify→save, so it is golden-neutral.
-pub fn mutate_account<CTX: ContextTr, R>(
-    context: &mut CTX,
+pub fn mutate_account<H: PerpHost, R>(
+    context: &mut H,
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     // Fast path: resident in the typed store → in-place &mut (CoW lift on first write).
     if let Some(a) = typed_store_mut(context).account_mut(user) {
         return Ok(f(a));
@@ -480,11 +459,11 @@ pub fn mutate_account<CTX: ContextTr, R>(
 /// serves only the writes that provably cannot move a balance: the per-placement nonce bump and
 /// fee-rate updates. Detecting instead cost those a `usdc_balance` String clone per call for a
 /// comparison that could never fire.
-pub fn mutate_account_balance<CTX: ContextTr, R>(
-    context: &mut CTX,
+pub fn mutate_account_balance<H: PerpHost, R>(
+    context: &mut H,
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     let (r, after) = if let Some(a) = typed_store_mut(context).account_mut(user) {
         let r = f(a);
         (r, a.clone())
@@ -503,17 +482,17 @@ pub fn mutate_account_balance<CTX: ContextTr, R>(
 
 
 /// Attaches the batch single-initiator working-set for `owner` (see
-/// [`crate::perp_dex::typed_store::TypedPerpStore::begin_batch`]). Called by `drive_batch` before
+/// [`crate::typed_store::TypedPerpStore::begin_batch`]). Called by `drive_batch` before
 /// the item loop; every account/position/buy/sell access whose subject is `owner` then routes to a
 /// batch-scoped local instead of the main store, flushed once by [`flush_batch_ws`].
-pub fn begin_batch_ws<CTX: ContextTr>(context: &mut CTX, owner: Address) {
+pub fn begin_batch_ws<H: PerpHost>(context: &mut H, owner: Address) {
     typed_store_mut(context).begin_batch(owner);
 }
 
 /// Flushes the batch working-set into the main store and detaches it (see
-/// [`crate::perp_dex::typed_store::TypedPerpStore::flush_batch`]). Called by `drive_batch` on both
+/// [`crate::typed_store::TypedPerpStore::flush_batch`]). Called by `drive_batch` on both
 /// the normal-completion and abort-forward paths, before the driver returns.
-pub fn flush_batch_ws<CTX: ContextTr>(context: &mut CTX) {
+pub fn flush_batch_ws<H: PerpHost>(context: &mut H) {
     typed_store_mut(context).flush_batch();
 }
 
@@ -522,10 +501,10 @@ pub fn flush_batch_ws<CTX: ContextTr>(context: &mut CTX) {
 // placement path). Reads go through `load_account_ref` (Arc bump — never clones the usdc_balance
 // String); writes RMW the account blob in place.
 
-pub fn load_user_fee_rates<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_user_fee_rates<H: PerpHost>(
+    context: &mut H,
     user: Address,
-) -> Result<UserFeeRates, PrecompileError> {
+) -> Result<UserFeeRates, PerpError> {
     let a = load_account_ref(context, user)?;
     Ok(UserFeeRates {
         maker_fee_bps: a.maker_fee_bps,
@@ -533,21 +512,21 @@ pub fn load_user_fee_rates<CTX: ContextTr>(
     })
 }
 
-pub fn save_user_fee_rates<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_user_fee_rates<H: PerpHost>(
+    context: &mut H,
     user: Address,
     rates: UserFeeRates,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_account(context, user, |a| {
         a.maker_fee_bps = rates.maker_fee_bps;
         a.taker_fee_bps = rates.taker_fee_bps;
     })
 }
 
-pub fn load_market_fee_total<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_market_fee_total<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     // Byte tier (the write side `add_market_fee_total` already uses store_blob) — off the Struct tier.
     let buf = load_blob(context, market_fee_total_key(market_id))?;
     if buf.is_empty() {
@@ -556,11 +535,11 @@ pub fn load_market_fee_total<CTX: ContextTr>(
     Ok(decode(&buf)?)
 }
 
-pub fn add_market_fee_total<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn add_market_fee_total<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     amount: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     if amount == 0 {
         return Ok(());
     }
@@ -573,57 +552,35 @@ pub fn add_market_fee_total<CTX: ContextTr>(
 
 // ── ERC-20 balance helpers ─────────────────────────────────────────────────────
 
-pub fn load_erc20_balance<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_erc20_balance<H: PerpHost>(
+    context: &mut H,
     token: Address,
     account: Address,
-) -> Result<U256, PrecompileError> {
+) -> Result<U256, PerpError> {
     let slot = erc20_balance_slot(account);
     // Ensure the token address is loaded into journal state before sload.
     // sload panics if the account is absent from the journal.
-    context
-        .journal_mut()
-        .warm_account(token)
-        .map_err(convert_db_err::<CTX::Db>)?;
-    let value = context
-        .journal_mut()
-        .sload(token, slot.into())
-        .map_err(convert_db_err::<CTX::Db>)?
-        .data;
-    Ok(value)
+    let _ = slot;
+    context.external_balance(token, account)
 }
 
-pub fn save_erc20_balance<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_erc20_balance<H: PerpHost>(
+    context: &mut H,
     token: Address,
     account: Address,
     balance: U256,
-) -> Result<(), PrecompileError> {
-    let slot = erc20_balance_slot(account);
-    // Ensure the token address is loaded into journal state before sstore.
-    context
-        .journal_mut()
-        .warm_account(token)
-        .map_err(convert_db_err::<CTX::Db>)?;
-    context
-        .journal_mut()
-        .sstore(token, slot.into(), balance)
-        .map_err(convert_db_err::<CTX::Db>)?;
-    // Mark the token account as touched so its storage changes are included in
-    // the BundleState transition.  Without this, apply_account_state() skips
-    // untouched accounts and the sstore above is silently dropped from the DB commit.
-    context.journal_mut().touch_account(token);
-    Ok(())
+) -> Result<(), PerpError> {
+    context.set_external_balance(token, account, balance)
 }
 
 // ── PerpPosition ──────────────────────────────────────────────────────────────
 
-pub fn load_position<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_position<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-) -> Result<PerpPosition, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<PerpPosition, PerpError> {
+    use crate::typed_store::Resident;
     match typed_store_mut(context).position(user, market_id) {
         Resident::Hit(p) => return Ok(p.clone()),
         Resident::Deleted => return Ok(PerpPosition::default()),
@@ -638,12 +595,12 @@ pub fn load_position<CTX: ContextTr>(
 /// [`load_position`] (absent → default position) so call sites keep `p.field` (Deref) ergonomics.
 /// PURE reads only (margin / size / entry checks). Fill/settlement RMW keep [`load_position`] +
 /// [`save_position`].
-pub fn load_position_ref<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_position_ref<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-) -> Result<std::sync::Arc<PerpPosition>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<std::sync::Arc<PerpPosition>, PerpError> {
+    use crate::typed_store::Resident;
     // Hot path: resident Arc, refcount bump only.
     if let Some(arc) = typed_store_mut(context).position_arc(user, market_id) {
         return Ok(arc);
@@ -660,12 +617,12 @@ pub fn load_position_ref<CTX: ContextTr>(
 }
 
 
-pub fn save_position<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_position<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     pos: &PerpPosition,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     // Maintain the per-market open-position registry on an `amount` zero-crossing.
     // save_position is the single choke point for ALL position writes, so this hook
     // cannot be missed. The registry is only touched when membership changes
@@ -697,7 +654,7 @@ fn pack_addresses(addrs: &[Address]) -> Vec<u8> {
     buf
 }
 
-fn unpack_addresses(buf: &[u8]) -> Result<Vec<Address>, PrecompileError> {
+fn unpack_addresses(buf: &[u8]) -> Result<Vec<Address>, PerpError> {
     if buf.len() % 20 != 0 {
         return Err(perp_err("corrupt position-registry blob"));
     }
@@ -705,19 +662,19 @@ fn unpack_addresses(buf: &[u8]) -> Result<Vec<Address>, PrecompileError> {
 }
 
 /// Loads the set of addresses with an open position in `market_id` (insertion order).
-pub fn load_position_registry<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_position_registry<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<Vec<Address>, PrecompileError> {
+) -> Result<Vec<Address>, PerpError> {
     unpack_addresses(&load_blob(context, position_registry_key(market_id))?)
 }
 
 /// Persists the registry; an empty slice deletes the key.
-fn save_position_registry<CTX: ContextTr>(
-    context: &mut CTX,
+fn save_position_registry<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     addrs: &[Address],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     store_blob(
         context,
         position_registry_key(market_id),
@@ -725,11 +682,11 @@ fn save_position_registry<CTX: ContextTr>(
     )
 }
 
-fn registry_add<CTX: ContextTr>(
-    context: &mut CTX,
+fn registry_add<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     user: Address,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let mut regs = load_position_registry(context, market_id)?;
     if !regs.contains(&user) {
         regs.push(user);
@@ -738,11 +695,11 @@ fn registry_add<CTX: ContextTr>(
     Ok(())
 }
 
-fn registry_remove<CTX: ContextTr>(
-    context: &mut CTX,
+fn registry_remove<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     user: Address,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let mut regs = load_position_registry(context, market_id)?;
     let before = regs.len();
     regs.retain(|a| a != &user);
@@ -754,12 +711,12 @@ fn registry_remove<CTX: ContextTr>(
 
 // ── Order entry lists (per-user per-market) ───────────────────────────────────
 
-pub fn load_buy_orders<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_buy_orders<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-) -> Result<std::collections::VecDeque<OrderEntry>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<std::collections::VecDeque<OrderEntry>, PerpError> {
+    use crate::typed_store::Resident;
     match typed_store_mut(context).buy_orders(user, market_id) {
         Resident::Hit(v) => return Ok(v.clone()),
         Resident::Deleted => return Ok(std::collections::VecDeque::new()),
@@ -773,12 +730,12 @@ pub fn load_buy_orders<CTX: ContextTr>(
 /// Zero-copy user buy-order-entry list (点1): `Arc<std::collections::VecDeque<OrderEntry>>`, no per-read clone. PURE reads
 /// only (opposite-side snapshot in reservation calc / `.last()` / iteration). List edits use
 /// [`mutate_buy_orders`].
-pub fn load_buy_orders_ref<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_buy_orders_ref<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-) -> Result<std::sync::Arc<std::collections::VecDeque<OrderEntry>>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<std::sync::Arc<std::collections::VecDeque<OrderEntry>>, PerpError> {
+    use crate::typed_store::Resident;
     if let Some(arc) = typed_store_mut(context).buy_orders_arc(user, market_id) {
         return Ok(arc);
     }
@@ -793,23 +750,23 @@ pub fn load_buy_orders_ref<CTX: ContextTr>(
     Ok(arc.unwrap_or_else(|| std::sync::Arc::new(std::collections::VecDeque::new())))
 }
 
-pub fn save_buy_orders<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_buy_orders<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     entries: &std::collections::VecDeque<OrderEntry>,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     // An EMPTY list is a stored value (msgpack `0x90`, key present) — never a delete.
     typed_store_mut(context).set_buy_orders(user, market_id, entries.iter().copied().collect());
     Ok(())
 }
 
-pub fn load_sell_orders<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_sell_orders<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-) -> Result<std::collections::VecDeque<OrderEntry>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<std::collections::VecDeque<OrderEntry>, PerpError> {
+    use crate::typed_store::Resident;
     match typed_store_mut(context).sell_orders(user, market_id) {
         Resident::Hit(v) => return Ok(v.clone()),
         Resident::Deleted => return Ok(std::collections::VecDeque::new()),
@@ -822,12 +779,12 @@ pub fn load_sell_orders<CTX: ContextTr>(
 
 /// Zero-copy user sell-order-entry list (点1): `Arc<std::collections::VecDeque<OrderEntry>>`, no per-read clone. PURE reads
 /// only. List edits use [`mutate_sell_orders`].
-pub fn load_sell_orders_ref<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_sell_orders_ref<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-) -> Result<std::sync::Arc<std::collections::VecDeque<OrderEntry>>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<std::sync::Arc<std::collections::VecDeque<OrderEntry>>, PerpError> {
+    use crate::typed_store::Resident;
     if let Some(arc) = typed_store_mut(context).sell_orders_arc(user, market_id) {
         return Ok(arc);
     }
@@ -842,12 +799,12 @@ pub fn load_sell_orders_ref<CTX: ContextTr>(
     Ok(arc.unwrap_or_else(|| std::sync::Arc::new(std::collections::VecDeque::new())))
 }
 
-pub fn save_sell_orders<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_sell_orders<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     entries: &std::collections::VecDeque<OrderEntry>,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     typed_store_mut(context).set_sell_orders(user, market_id, entries.iter().copied().collect());
     Ok(())
 }
@@ -857,12 +814,12 @@ pub fn save_sell_orders<CTX: ContextTr>(
 /// load it (cache/cold) → run `f` → store. `f`'s return value passes through (e.g. the recomputed
 /// reservation, computed inside the borrow so it sees the post-mutation list). The result is
 /// byte-identical to load→modify→`save_buy_orders` since the block-end ser is the same msgpack.
-pub fn mutate_buy_orders<CTX: ContextTr, R>(
-    context: &mut CTX,
+pub fn mutate_buy_orders<H: PerpHost, R>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     f: impl FnOnce(&mut std::collections::VecDeque<OrderEntry>) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     if let Some(entries) = typed_store_mut(context).buy_orders_mut(user, market_id) {
         return Ok(f(entries));
     }
@@ -873,12 +830,12 @@ pub fn mutate_buy_orders<CTX: ContextTr, R>(
 }
 
 /// In-place mutate the user's sell-order list (#21 靶子2). See [`mutate_buy_orders`].
-pub fn mutate_sell_orders<CTX: ContextTr, R>(
-    context: &mut CTX,
+pub fn mutate_sell_orders<H: PerpHost, R>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     f: impl FnOnce(&mut std::collections::VecDeque<OrderEntry>) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     if let Some(entries) = typed_store_mut(context).sell_orders_mut(user, market_id) {
         return Ok(f(entries));
     }
@@ -890,11 +847,11 @@ pub fn mutate_sell_orders<CTX: ContextTr, R>(
 
 // ── Full Order struct ─────────────────────────────────────────────────────────
 
-pub fn load_order<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_order<H: PerpHost>(
+    context: &mut H,
     order_id: &[u8; 32],
-) -> Result<Option<Order>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<Option<Order>, PerpError> {
+    use crate::typed_store::Resident;
     match typed_store_mut(context).order(order_id) {
         Resident::Hit(o) => return Ok(Some(o.clone())),
         // Deleted-this-block (delete-on-terminal) reads as not-found — never the stale committed row.
@@ -908,11 +865,11 @@ pub fn load_order<CTX: ContextTr>(
 
 /// Zero-copy order read (点1): `Arc<Order>`, no per-read clone. PURE reads only (dup check / FOK
 /// feasibility / field reads). Mutating an order keeps [`load_order`] + [`save_order`].
-pub fn load_order_ref<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_order_ref<H: PerpHost>(
+    context: &mut H,
     order_id: &[u8; 32],
-) -> Result<Option<std::sync::Arc<Order>>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<Option<std::sync::Arc<Order>>, PerpError> {
+    use crate::typed_store::Resident;
     if let Some(arc) = typed_store_mut(context).order_arc(order_id) {
         return Ok(Some(arc));
     }
@@ -924,11 +881,11 @@ pub fn load_order_ref<CTX: ContextTr>(
     Ok(arc)
 }
 
-pub fn save_order<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_order<H: PerpHost>(
+    context: &mut H,
     order_id: &[u8; 32],
     order: &Order,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     typed_store_mut(context).set_order(order_id, order.clone());
     Ok(())
 }
@@ -938,10 +895,10 @@ pub fn save_order<CTX: ContextTr>(
 /// store DELETE convention), byte-identical to the old empty-blob write. A save-then-delete in the
 /// same block reads back absent. Callers use this the instant an order reaches a terminal status
 /// so the order map only ever holds live (Open/PartiallyFilled) orders.
-pub fn delete_order<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn delete_order<H: PerpHost>(
+    context: &mut H,
     order_id: &[u8; 32],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     typed_store_mut(context).remove_order(order_id);
     Ok(())
 }
@@ -951,10 +908,10 @@ pub fn delete_order<CTX: ContextTr>(
 /// Atomically increment and return the *current* trade ID for a market, then store the
 /// incremented value.  Returns 0 for the first trade in that market, 1 for the second, etc.
 /// Trade IDs are per-market so that indexers can use them directly as `fromId` cursors.
-pub fn next_trade_id<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn next_trade_id<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     // Byte tier (off the Struct tier); always writes the incremented counter.
     let buf = load_blob(context, trade_count_key(market_id))?;
     let current: u64 = if buf.is_empty() { 0 } else { decode(&buf)? };
@@ -965,28 +922,28 @@ pub fn next_trade_id<CTX: ContextTr>(
 
 // ── User nonce (folded into UserAccount) ────────────────────────────────────────
 
-pub fn load_user_nonce<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_user_nonce<H: PerpHost>(
+    context: &mut H,
     user: Address,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     Ok(load_account_ref(context, user)?.nonce)
 }
 
-pub fn save_user_nonce<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_user_nonce<H: PerpHost>(
+    context: &mut H,
     user: Address,
     nonce: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_account(context, user, |a| a.nonce = nonce)
 }
 
 // ── Market ────────────────────────────────────────────────────────────────────
 
-pub fn load_market<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_market<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<Option<Market>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<Option<Market>, PerpError> {
+    use crate::typed_store::Resident;
     match typed_store_mut(context).market(market_id) {
         Resident::Hit(m) => return Ok(Some(m.clone())),
         Resident::Deleted => return Ok(None),
@@ -997,11 +954,11 @@ pub fn load_market<CTX: ContextTr>(
 
 /// Zero-copy market read (点1): `Arc<Market>`, no per-read clone. PURE reads only (params / mark /
 /// funding). RMW (funding/config writes) keep [`load_market`] + [`save_market`].
-pub fn load_market_ref<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_market_ref<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<Option<std::sync::Arc<Market>>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<Option<std::sync::Arc<Market>>, PerpError> {
+    use crate::typed_store::Resident;
     // Hot path: resident Arc, refcount bump only.
     if let Some(arc) = typed_store_mut(context).market_arc(market_id) {
         return Ok(Some(arc));
@@ -1016,10 +973,10 @@ pub fn load_market_ref<CTX: ContextTr>(
     cold_fill_market(context, market_id)
 }
 
-pub fn save_market<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_market<H: PerpHost>(
+    context: &mut H,
     market: &Market,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     typed_store_mut(context).set_market(market.market_id, market.clone());
     Ok(())
 }
@@ -1030,11 +987,11 @@ pub fn save_market<CTX: ContextTr>(
 /// load+save owned clone pair. Errors on a market that was never saved (rather than fabricate a
 /// phantom zero Market) — every caller (`updateIndexPrice`, tests) writes the full Market first,
 /// so this never fires in practice.
-fn mutate_market<CTX: ContextTr, R>(
-    context: &mut CTX,
+fn mutate_market<H: PerpHost, R>(
+    context: &mut H,
     market_id: u64,
     f: impl FnOnce(&mut Market) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     // Fast path: resident in the typed store → in-place &mut.
     if let Some(m) = typed_store_mut(context).market_mut(market_id) {
         return Ok(f(m));
@@ -1052,11 +1009,11 @@ fn mutate_market<CTX: ContextTr, R>(
 // = one probe/decode/Arc, one cache line, one coalesced write. (Mark price is NOT here — it is
 // write-rare + co-read with config, so it lives in the Market blob; see [`load_mark_price`].)
 
-pub fn load_market_hot<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_market_hot<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<MarketHot, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<MarketHot, PerpError> {
+    use crate::typed_store::Resident;
     match typed_store_mut(context).market_hot(market_id) {
         Resident::Hit(h) => return Ok(h.clone()),
         Resident::Deleted => return Ok(MarketHot::default()),
@@ -1070,11 +1027,11 @@ pub fn load_market_hot<CTX: ContextTr>(
 /// In-place RMW of a market's hot scalars (mirror of [`mutate_buy_orders`]): fast-path mutates the
 /// value resident in the typed store (CoW lift on first write, one write coalesced across scalar
 /// setters); slow-path loads once → mutate → store. Byte-identical final blob to a load→modify→save.
-fn mutate_market_hot<CTX: ContextTr, R>(
-    context: &mut CTX,
+fn mutate_market_hot<H: PerpHost, R>(
+    context: &mut H,
     market_id: u64,
     f: impl FnOnce(&mut MarketHot) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     if let Some(h) = typed_store_mut(context).market_hot_mut(market_id) {
         return Ok(f(h));
     }
@@ -1089,37 +1046,37 @@ fn mutate_market_hot<CTX: ContextTr, R>(
 // `market.mark_price` directly — zero extra probe. These helpers are for callers WITHOUT the
 // Market in hand (and for tests); they read via the Arc (no clone) / RMW the Market field.
 
-pub fn load_mark_price<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_mark_price<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     Ok(load_market_ref(context, market_id)?
         .map(|m| m.mark_price)
         .unwrap_or(0))
 }
 
-pub fn save_mark_price<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_mark_price<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_market(context, market_id, |m| m.mark_price = price)
 }
 
 // ── Open interest ─────────────────────────────────────────────────────────────
 
-pub fn load_open_interest<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_open_interest<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     Ok(load_market_hot(context, market_id)?.open_interest)
 }
 
-pub fn save_open_interest<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_open_interest<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     oi: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_market_hot(context, market_id, |h| h.open_interest = oi)
 }
 
@@ -1157,11 +1114,11 @@ fn sorted_remove(v: &mut Vec<u64>, x: u64) {
 }
 
 /// Fills the typed store's bid-price index from the cold store if not resident this block.
-fn ensure_bid_prices_resident<CTX: ContextTr>(
-    context: &mut CTX,
+fn ensure_bid_prices_resident<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<(), PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<(), PerpError> {
+    use crate::typed_store::Resident;
     if matches!(typed_store_mut(context).bid_prices(market_id), Resident::Miss) {
         let arc = cold_load::<_, Vec<u64>>(context, bid_prices_key(market_id))?;
         typed_store_mut(context).fill_bid_prices(market_id, arc);
@@ -1169,11 +1126,11 @@ fn ensure_bid_prices_resident<CTX: ContextTr>(
     Ok(())
 }
 
-fn ensure_ask_prices_resident<CTX: ContextTr>(
-    context: &mut CTX,
+fn ensure_ask_prices_resident<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<(), PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<(), PerpError> {
+    use crate::typed_store::Resident;
     if matches!(typed_store_mut(context).ask_prices(market_id), Resident::Miss) {
         let arc = cold_load::<_, Vec<u64>>(context, ask_prices_key(market_id))?;
         typed_store_mut(context).fill_ask_prices(market_id, arc);
@@ -1182,11 +1139,11 @@ fn ensure_ask_prices_resident<CTX: ContextTr>(
 }
 
 /// Active bid price levels (best = max).
-pub fn load_bid_prices<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_bid_prices<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<Vec<u64>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<Vec<u64>, PerpError> {
+    use crate::typed_store::Resident;
     match typed_store_mut(context).bid_prices(market_id) {
         Resident::Hit(v) => return Ok(v.clone()),
         Resident::Deleted => return Ok(Vec::new()),
@@ -1200,11 +1157,11 @@ pub fn load_bid_prices<CTX: ContextTr>(
 /// Zero-copy active bid prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only
 /// (BBO / matching walk — bids walk `.iter().rev()`, best = `.last()`). Edits use
 /// [`insert_bid_price`] / [`remove_bid_price`].
-pub fn load_bid_prices_ref<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_bid_prices_ref<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<std::sync::Arc<Vec<u64>>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<std::sync::Arc<Vec<u64>>, PerpError> {
+    use crate::typed_store::Resident;
     if let Some(arc) = typed_store_mut(context).bid_prices_arc(market_id) {
         return Ok(arc);
     }
@@ -1216,21 +1173,21 @@ pub fn load_bid_prices_ref<CTX: ContextTr>(
     Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
 }
 
-pub fn save_bid_prices<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_bid_prices<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     prices: &Vec<u64>,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     typed_store_mut(context).set_bid_prices(market_id, prices.clone());
     Ok(())
 }
 
 /// Active ask price levels (best = min).
-pub fn load_ask_prices<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_ask_prices<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<Vec<u64>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<Vec<u64>, PerpError> {
+    use crate::typed_store::Resident;
     match typed_store_mut(context).ask_prices(market_id) {
         Resident::Hit(v) => return Ok(v.clone()),
         Resident::Deleted => return Ok(Vec::new()),
@@ -1243,11 +1200,11 @@ pub fn load_ask_prices<CTX: ContextTr>(
 
 /// Zero-copy active ask prices (点1): `Arc<Vec<u64>>`, no per-read clone. PURE reads only
 /// (asks walk `.iter()`, best = `.first()`).
-pub fn load_ask_prices_ref<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_ask_prices_ref<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<std::sync::Arc<Vec<u64>>, PrecompileError> {
-    use crate::perp_dex::typed_store::Resident;
+) -> Result<std::sync::Arc<Vec<u64>>, PerpError> {
+    use crate::typed_store::Resident;
     if let Some(arc) = typed_store_mut(context).ask_prices_arc(market_id) {
         return Ok(arc);
     }
@@ -1259,11 +1216,11 @@ pub fn load_ask_prices_ref<CTX: ContextTr>(
     Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
 }
 
-pub fn save_ask_prices<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_ask_prices<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     prices: &Vec<u64>,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     typed_store_mut(context).set_ask_prices(market_id, prices.clone());
     Ok(())
 }
@@ -1277,22 +1234,22 @@ pub fn save_ask_prices<CTX: ContextTr>(
 // UNCONDITIONAL `save_*` (remove_*_price, level detach). Conditional-write callers (insert_*_price)
 // are handled inline to preserve their "no write when unchanged" delta semantics (golden).
 
-fn mutate_bid_prices<CTX: ContextTr, R>(
-    context: &mut CTX,
+fn mutate_bid_prices<H: PerpHost, R>(
+    context: &mut H,
     market_id: u64,
     f: impl FnOnce(&mut Vec<u64>) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     // Unconditional write (matches the old load→f→save): materialize (cold-fill if first touch)
     // then mutate the resident Vec in place with an auto-mark.
     ensure_bid_prices_resident(context, market_id)?;
     Ok(f(typed_store_mut(context).bid_prices_mut(market_id)))
 }
 
-fn mutate_ask_prices<CTX: ContextTr, R>(
-    context: &mut CTX,
+fn mutate_ask_prices<H: PerpHost, R>(
+    context: &mut H,
     market_id: u64,
     f: impl FnOnce(&mut Vec<u64>) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     ensure_ask_prices_resident(context, market_id)?;
     Ok(f(typed_store_mut(context).ask_prices_mut(market_id)))
 }
@@ -1317,15 +1274,11 @@ fn pack_order_ids(queue: &[[u8; 32]]) -> Vec<u8> {
 /// Inverse of [`pack_order_ids`]: chunks a raw blob into 32-byte ids.
 /// Cold read for a level (raw codec): cross-block decoded store (Arc<LevelBlob>, zero clone) →
 /// committed bytes → `unpack_level` once. Mirrors [`cold_load`] but for the non-msgpack level blob.
-fn cold_load_level<CTX: ContextTr>(
-    context: &mut CTX,
+fn cold_load_level<H: PerpHost>(
+    context: &mut H,
     key: B256,
-) -> Result<Option<std::sync::Arc<LevelBlob>>, PrecompileError> {
-    if let Some(arc) = context
-        .journal_mut()
-        .perp_load_arc(key)
-        .map_err(convert_db_err::<CTX::Db>)?
-    {
+) -> Result<Option<std::sync::Arc<LevelBlob>>, PerpError> {
+    if let Some(arc) = context.perp_load_arc(key)? {
         if let Ok(b) = std::sync::Arc::downcast::<LevelBlob>(arc) {
             return Ok(Some(b));
         }
@@ -1343,11 +1296,11 @@ fn cold_load_level<CTX: ContextTr>(
 
 /// Reads a resident bid level blob (typed store) or cold-loads + fills it. A cold-absent level is
 /// the empty default (count 0, no ids) — same as `unpack_level("")`.
-fn bid_level_blob<CTX: ContextTr>(
-    context: &mut CTX,
+fn bid_level_blob<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
+) -> Result<std::sync::Arc<LevelBlob>, PerpError> {
     if let Some(arc) = typed_store_mut(context).bid_level_arc(market_id, price) {
         return Ok(arc);
     }
@@ -1359,11 +1312,11 @@ fn bid_level_blob<CTX: ContextTr>(
     Ok(arc.unwrap_or_else(|| std::sync::Arc::new(LevelBlob::default())))
 }
 
-fn ask_level_blob<CTX: ContextTr>(
-    context: &mut CTX,
+fn ask_level_blob<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
+) -> Result<std::sync::Arc<LevelBlob>, PerpError> {
     if let Some(arc) = typed_store_mut(context).ask_level_arc(market_id, price) {
         return Ok(arc);
     }
@@ -1377,12 +1330,12 @@ fn ask_level_blob<CTX: ContextTr>(
 
 /// In-place RMW of a bid level (count + ids), auto-marking dirty (matches the old unconditional
 /// mutate_level→save_level). Materializes (cold-fill if first touch) then mutates in place.
-fn mutate_bid_level<CTX: ContextTr, R>(
-    context: &mut CTX,
+fn mutate_bid_level<H: PerpHost, R>(
+    context: &mut H,
     market_id: u64,
     price: u64,
     f: impl FnOnce(&mut LevelBlob) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     if !typed_store_mut(context).bid_level_resident(market_id, price) {
         let arc = cold_load_level(context, bid_level_key(market_id, price))?;
         typed_store_mut(context).fill_bid_level(market_id, price, arc);
@@ -1390,12 +1343,12 @@ fn mutate_bid_level<CTX: ContextTr, R>(
     Ok(f(typed_store_mut(context).bid_level_mut(market_id, price)))
 }
 
-fn mutate_ask_level<CTX: ContextTr, R>(
-    context: &mut CTX,
+fn mutate_ask_level<H: PerpHost, R>(
+    context: &mut H,
     market_id: u64,
     price: u64,
     f: impl FnOnce(&mut LevelBlob) -> R,
-) -> Result<R, PrecompileError> {
+) -> Result<R, PerpError> {
     if !typed_store_mut(context).ask_level_resident(market_id, price) {
         let arc = cold_load_level(context, ask_level_key(market_id, price))?;
         typed_store_mut(context).fill_ask_level(market_id, price, arc);
@@ -1404,31 +1357,31 @@ fn mutate_ask_level<CTX: ContextTr, R>(
 }
 
 /// Reads a bid level's FIFO ids (for tests / callers that only need the ids).
-pub fn load_bid_level<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_bid_level<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<Vec<[u8; 32]>, PrecompileError> {
+) -> Result<Vec<[u8; 32]>, PerpError> {
     Ok(bid_level_blob(context, market_id, price)?.ids.clone())
 }
 
 /// Zero-copy bid level read (点1): `Arc<LevelBlob>` (ids + count).
-pub fn load_bid_level_arc<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_bid_level_arc<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
+) -> Result<std::sync::Arc<LevelBlob>, PerpError> {
     bid_level_blob(context, market_id, price)
 }
 
 /// Writes a bid level (live `count` + `ids`).
-pub fn save_bid_level<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_bid_level<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
     count: u64,
     ids: &[[u8; 32]],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     typed_store_mut(context).set_bid_level(
         market_id,
         price,
@@ -1441,31 +1394,31 @@ pub fn save_bid_level<CTX: ContextTr>(
 }
 
 /// Reads an ask level's FIFO ids.
-pub fn load_ask_level<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_ask_level<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<Vec<[u8; 32]>, PrecompileError> {
+) -> Result<Vec<[u8; 32]>, PerpError> {
     Ok(ask_level_blob(context, market_id, price)?.ids.clone())
 }
 
 /// Zero-copy ask level read (点1): `Arc<LevelBlob>` (ids + count).
-pub fn load_ask_level_arc<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_ask_level_arc<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<std::sync::Arc<LevelBlob>, PrecompileError> {
+) -> Result<std::sync::Arc<LevelBlob>, PerpError> {
     ask_level_blob(context, market_id, price)
 }
 
 /// Writes an ask level (live `count` + `ids`).
-pub fn save_ask_level<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_ask_level<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
     count: u64,
     ids: &[[u8; 32]],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     typed_store_mut(context).set_ask_level(
         market_id,
         price,
@@ -1480,11 +1433,11 @@ pub fn save_ask_level<CTX: ContextTr>(
 // ── Order book helpers ────────────────────────────────────────────────────────
 
 /// Insert `price` into the active bid price set if not already present. O(log n) binary_search + O(n) memmove.
-pub fn insert_bid_price<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn insert_bid_price<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     // Conditional write: dirty-mark (delta membership) fires ONLY when the price is newly inserted,
     // preserving the "no store when already present" commitment semantics. Materialize first, then
     // sorted_insert via the no-mark handle and mark iff it changed.
@@ -1497,11 +1450,11 @@ pub fn insert_bid_price<CTX: ContextTr>(
 }
 
 /// Insert `price` into the active ask price set if not already present. O(log n) binary_search + O(n) memmove.
-pub fn insert_ask_price<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn insert_ask_price<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     ensure_ask_prices_resident(context, market_id)?;
     let changed = sorted_insert(typed_store_mut(context).ask_prices_mut_nomark(market_id), price);
     if changed {
@@ -1511,22 +1464,22 @@ pub fn insert_ask_price<CTX: ContextTr>(
 }
 
 /// Remove `price` from the active bid price set (call when level becomes empty). O(log n).
-pub fn remove_bid_price<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn remove_bid_price<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_bid_prices(context, market_id, |prices| {
         sorted_remove(prices, price);
     })
 }
 
 /// Remove `price` from the active ask price set (call when level becomes empty). O(log n).
-pub fn remove_ask_price<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn remove_ask_price<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_ask_prices(context, market_id, |prices| {
         sorted_remove(prices, price);
     })
@@ -1534,12 +1487,12 @@ pub fn remove_ask_price<CTX: ContextTr>(
 
 /// Rest an order at a bid level: push its id to the FIFO AND bump the live count, in ONE in-place
 /// blob mutate (was push + a separate incr_level_count on a separate key).
-pub fn push_bid_order<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn push_bid_order<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
     order_id: [u8; 32],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_bid_level(context, market_id, price, |b| {
         b.ids.push(order_id);
         b.count += 1;
@@ -1547,12 +1500,12 @@ pub fn push_bid_order<CTX: ContextTr>(
 }
 
 /// Rest an order at an ask level. See [`push_bid_order`].
-pub fn push_ask_order<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn push_ask_order<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
     order_id: [u8; 32],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_ask_level(context, market_id, price, |b| {
         b.ids.push(order_id);
         b.count += 1;
@@ -1567,33 +1520,33 @@ pub fn push_ask_order<CTX: ContextTr>(
 // cancel-all (decr −live), and the match walk (`SaveLevel` carries the post-walk survivor count).
 // count == 0 → the whole level blob is deleted (stale ids discarded).
 
-pub fn load_bid_count<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_bid_count<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     Ok(bid_level_blob(context, market_id, price)?.count)
 }
 
-pub fn load_ask_count<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_ask_count<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     Ok(ask_level_blob(context, market_id, price)?.count)
 }
 
 /// Decrement a side's level count by `n` (orders removed: cancel / bulk-cancel). Returns the new
 /// count. On reaching 0 the level is EMPTY → the FIFO ids are cleared so the blob packs to empty
 /// (delete); the caller still removes the price from the index. Saturates at 0.
-pub fn decr_level_count<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn decr_level_count<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-    side: crate::perp_dex::types::Side,
+    side: crate::types::Side,
     price: u64,
     n: u64,
-) -> Result<u64, PrecompileError> {
-    use crate::perp_dex::types::Side;
+) -> Result<u64, PerpError> {
+    use crate::types::Side;
     let f = |b: &mut LevelBlob| {
         b.count = b.count.saturating_sub(n);
         if b.count == 0 {
@@ -1612,42 +1565,42 @@ pub fn decr_level_count<CTX: ContextTr>(
 // with the sorted price lists so callers can avoid loading the full list for a PostOnly / spread
 // check.
 
-pub fn load_best_bid<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_best_bid<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     Ok(load_market_hot(context, market_id)?.best_bid)
 }
 
-pub fn save_best_bid<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_best_bid<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_market_hot(context, market_id, |h| h.best_bid = price)
 }
 
-pub fn load_best_ask<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_best_ask<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     Ok(load_market_hot(context, market_id)?.best_ask)
 }
 
-pub fn save_best_ask<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_best_ask<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_market_hot(context, market_id, |h| h.best_ask = price)
 }
 
 /// Re-derive best_bid from the current bid price list (already in journal cache after matching).
 /// Call this after any operation that may have removed the top bid level.
-pub fn refresh_best_bid<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn refresh_best_bid<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     let prices = load_bid_prices(context, market_id)?;
     let best = prices.last().copied().unwrap_or(0); // bids: best = max
     save_best_bid(context, market_id, best)?;
@@ -1656,10 +1609,10 @@ pub fn refresh_best_bid<CTX: ContextTr>(
 
 /// Re-derive best_ask from the current ask price list (already in journal cache after matching).
 /// Call this after any operation that may have removed the top ask level.
-pub fn refresh_best_ask<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn refresh_best_ask<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     let prices = load_ask_prices(context, market_id)?;
     let best = prices.first().copied().unwrap_or(0);
     save_best_ask(context, market_id, best)?;
@@ -1667,11 +1620,11 @@ pub fn refresh_best_ask<CTX: ContextTr>(
 }
 // ── API key (ed25519 signed orders) ──────────────────────────────────────────
 
-pub fn load_api_key<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_api_key<H: PerpHost>(
+    context: &mut H,
     user: Address,
     key_id: u8,
-) -> Result<Option<ApiKey>, PrecompileError> {
+) -> Result<Option<ApiKey>, PerpError> {
     let buf = load_blob(context, api_key_key(user, key_id))?;
     if buf.is_empty() {
         return Ok(None);
@@ -1679,12 +1632,12 @@ pub fn load_api_key<CTX: ContextTr>(
     Ok(Some(decode(&buf)?))
 }
 
-pub fn save_api_key<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_api_key<H: PerpHost>(
+    context: &mut H,
     user: Address,
     key_id: u8,
     key: ApiKey,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(&key)?;
     store_blob(context, api_key_key(user, key_id), &buf)?;
     // Track this key_id in the user's id list (deduplicated).
@@ -1697,21 +1650,21 @@ pub fn save_api_key<CTX: ContextTr>(
     Ok(())
 }
 
-pub fn delete_api_key<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn delete_api_key<H: PerpHost>(
+    context: &mut H,
     user: Address,
     key_id: u8,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     store_blob(context, api_key_key(user, key_id), &[])?;
     let mut ids = load_api_key_ids(context, user)?;
     ids.retain(|&id| id != key_id);
     save_api_key_ids(context, user, &ids)
 }
 
-pub fn load_api_key_ids<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_api_key_ids<H: PerpHost>(
+    context: &mut H,
     user: Address,
-) -> Result<Vec<u8>, PrecompileError> {
+) -> Result<Vec<u8>, PerpError> {
     let buf = load_blob(context, api_key_ids_key(user))?;
     if buf.is_empty() {
         return Ok(vec![]);
@@ -1719,18 +1672,18 @@ pub fn load_api_key_ids<CTX: ContextTr>(
     Ok(decode(&buf)?)
 }
 
-fn save_api_key_ids<CTX: ContextTr>(
-    context: &mut CTX,
+fn save_api_key_ids<H: PerpHost>(
+    context: &mut H,
     user: Address,
     ids: &[u8],
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(&ids)?;
     store_blob(context, api_key_ids_key(user), &buf)
 }
 
 // ── Role addresses ────────────────────────────────────────────────────────────
 
-pub fn load_oracle<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
+pub fn load_oracle<H: PerpHost>(context: &mut H) -> Result<Address, PerpError> {
     let buf = load_blob(context, oracle_key())?;
     if buf.is_empty() {
         return Ok(Address::ZERO);
@@ -1738,15 +1691,15 @@ pub fn load_oracle<CTX: ContextTr>(context: &mut CTX) -> Result<Address, Precomp
     Ok(decode(&buf)?)
 }
 
-pub fn save_oracle<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_oracle<H: PerpHost>(
+    context: &mut H,
     oracle: Address,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(&oracle)?;
     store_blob(context, oracle_key(), &buf)
 }
 
-pub fn load_market_manager<CTX: ContextTr>(context: &mut CTX) -> Result<Address, PrecompileError> {
+pub fn load_market_manager<H: PerpHost>(context: &mut H) -> Result<Address, PerpError> {
     let buf = load_blob(context, market_manager_key())?;
     if buf.is_empty() {
         return Ok(Address::ZERO);
@@ -1754,20 +1707,20 @@ pub fn load_market_manager<CTX: ContextTr>(context: &mut CTX) -> Result<Address,
     Ok(decode(&buf)?)
 }
 
-pub fn save_market_manager<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_market_manager<H: PerpHost>(
+    context: &mut H,
     manager: Address,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(&manager)?;
     store_blob(context, market_manager_key(), &buf)
 }
 
 // ── Index price state ─────────────────────────────────────────────────────────
 
-pub fn load_index_price_state<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_index_price_state<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<IndexPriceState, PrecompileError> {
+) -> Result<IndexPriceState, PerpError> {
     let buf = load_blob(context, index_price_state_key(market_id))?;
     if buf.is_empty() {
         return Ok(IndexPriceState::default());
@@ -1775,21 +1728,21 @@ pub fn load_index_price_state<CTX: ContextTr>(
     Ok(decode(&buf)?)
 }
 
-pub fn save_index_price_state<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_index_price_state<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     state: &IndexPriceState,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(state)?;
     store_blob(context, index_price_state_key(market_id), &buf)
 }
 
 // ── Price mid window (30s MA basis input) ─────────────────────────────────────
 
-pub fn load_index_price_history<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_index_price_history<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<IndexPriceHistory, PrecompileError> {
+) -> Result<IndexPriceHistory, PerpError> {
     let buf = load_blob(context, index_price_history_key(market_id))?;
     if buf.is_empty() {
         return Ok(IndexPriceHistory::default());
@@ -1797,19 +1750,19 @@ pub fn load_index_price_history<CTX: ContextTr>(
     Ok(decode(&buf)?)
 }
 
-pub fn save_index_price_history<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_index_price_history<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     history: &IndexPriceHistory,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(history)?;
     store_blob(context, index_price_history_key(market_id), &buf)
 }
 
-pub fn load_price_basis_window<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_price_basis_window<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<PriceBasisWindow, PrecompileError> {
+) -> Result<PriceBasisWindow, PerpError> {
     let buf = load_blob(context, price_basis_window_key(market_id))?;
     if buf.is_empty() {
         return Ok(PriceBasisWindow::default());
@@ -1817,11 +1770,11 @@ pub fn load_price_basis_window<CTX: ContextTr>(
     Ok(decode(&buf)?)
 }
 
-pub fn save_price_basis_window<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_price_basis_window<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     window: &PriceBasisWindow,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(window)?;
     store_blob(context, price_basis_window_key(market_id), &buf)
 }
@@ -1829,27 +1782,27 @@ pub fn save_price_basis_window<CTX: ContextTr>(
 // ── Last traded price (contract price) ───────────────────────────────────────
 // Field accessor on the grouped [`MarketHot`] blob.
 
-pub fn load_last_traded_price<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_last_traded_price<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     Ok(load_market_hot(context, market_id)?.last_traded)
 }
 
-pub fn save_last_traded_price<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_last_traded_price<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     price: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     mutate_market_hot(context, market_id, |h| h.last_traded = price)
 }
 
 // ── Funding state ─────────────────────────────────────────────────────────────
 
-pub fn load_funding_state<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_funding_state<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<FundingState, PrecompileError> {
+) -> Result<FundingState, PerpError> {
     let buf = load_blob(context, funding_state_key(market_id))?;
     if buf.is_empty() {
         return Ok(FundingState::default());
@@ -1857,18 +1810,18 @@ pub fn load_funding_state<CTX: ContextTr>(
     Ok(decode(&buf)?)
 }
 
-pub fn save_funding_state<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_funding_state<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     state: &FundingState,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(state)?;
     store_blob(context, funding_state_key(market_id), &buf)
 }
 
 // ── Insurance Fund ────────────────────────────────────────────────────────────
 
-pub fn load_insurance_fund<CTX: ContextTr>(context: &mut CTX) -> Result<u64, PrecompileError> {
+pub fn load_insurance_fund<H: PerpHost>(context: &mut H) -> Result<u64, PerpError> {
     let buf = load_blob(context, insurance_fund_key())?;
     if buf.is_empty() {
         return Ok(0);
@@ -1876,10 +1829,10 @@ pub fn load_insurance_fund<CTX: ContextTr>(context: &mut CTX) -> Result<u64, Pre
     Ok(decode(&buf)?)
 }
 
-pub fn save_insurance_fund<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_insurance_fund<H: PerpHost>(
+    context: &mut H,
     balance: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(&balance)?;
     store_blob(context, insurance_fund_key(), &buf)
 }
@@ -1888,10 +1841,10 @@ pub fn save_insurance_fund<CTX: ContextTr>(
 /// Returns `(absorbed, remaining_deficit)`.
 /// If the fund covers everything, `remaining_deficit` is 0.
 /// If the fund is insufficient, it is drained to zero and `remaining_deficit` > 0.
-pub fn absorb_from_insurance_fund<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn absorb_from_insurance_fund<H: PerpHost>(
+    context: &mut H,
     deficit: u64,
-) -> Result<(u64, u64), PrecompileError> {
+) -> Result<(u64, u64), PerpError> {
     let balance = load_insurance_fund(context)?;
     let absorbed = deficit.min(balance);
     let remaining = deficit - absorbed;
@@ -1916,21 +1869,21 @@ const SEEN_BUCKET_WIDTH_SECS: u64 = 15;
 const SEEN_RETENTION_BUCKETS: u64 = 6;
 
 /// Replay check: has this signature (by `keccak256(signature)`) already been submitted?
-pub fn is_signature_seen<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn is_signature_seen<H: PerpHost>(
+    context: &mut H,
     sig_hash: &[u8; 32],
-) -> Result<bool, PrecompileError> {
+) -> Result<bool, PerpError> {
     Ok(!load_blob(context, seen_sig_key(sig_hash))?.is_empty())
 }
 
 /// Records a signature as seen and indexes its seen-key in the GC bucket for the signature's OWN
 /// timestamp (`sig_ts`, already validated inside the recv window) — so the marker is reclaimed a
 /// fixed time after the signature was signed, independent of when it was submitted.
-pub fn mark_signature_seen<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn mark_signature_seen<H: PerpHost>(
+    context: &mut H,
     sig_hash: &[u8; 32],
     sig_ts: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let key = seen_sig_key(sig_hash);
     store_blob(context, key, &[1u8])?; // non-empty marker ('empty' == absent)
     let bucket = sig_ts / SEEN_BUCKET_WIDTH_SECS;
@@ -1946,10 +1899,10 @@ pub fn mark_signature_seen<CTX: ContextTr>(
 /// expired. Under continuous signed traffic each bucket is visited exactly once; a gap longer than
 /// one bucket width can skip a bucket, leaving harmless stale markers until a wipe (acceptable
 /// pre-production — they never cause false rejects). Call after each accepted signed order.
-pub fn gc_seen_buckets<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn gc_seen_buckets<H: PerpHost>(
+    context: &mut H,
     block_ts: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let cur = block_ts / SEEN_BUCKET_WIDTH_SECS;
     if cur < SEEN_RETENTION_BUCKETS {
         return Ok(());
@@ -1967,10 +1920,10 @@ pub fn gc_seen_buckets<CTX: ContextTr>(
 
 // ── Premium index accumulator ─────────────────────────────────────────────────
 
-pub fn load_premium_accumulator<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn load_premium_accumulator<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
-) -> Result<PremiumIndexAccumulator, PrecompileError> {
+) -> Result<PremiumIndexAccumulator, PerpError> {
     let buf = load_blob(context, premium_accumulator_key(market_id))?;
     if buf.is_empty() {
         return Ok(PremiumIndexAccumulator::default());
@@ -1978,11 +1931,11 @@ pub fn load_premium_accumulator<CTX: ContextTr>(
     Ok(decode(&buf)?)
 }
 
-pub fn save_premium_accumulator<CTX: ContextTr>(
-    context: &mut CTX,
+pub fn save_premium_accumulator<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     acc: &PremiumIndexAccumulator,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     let buf = encode(acc)?;
     store_blob(context, premium_accumulator_key(market_id), &buf)
 }
@@ -1993,6 +1946,8 @@ mod commitment_tests {
     use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
     use database::InMemoryDB;
     use primitives::hardfork::SpecId;
+
+    use context::ContextTr;
 
     type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
 
@@ -2132,7 +2087,7 @@ mod commitment_tests {
 #[cfg(test)]
 mod size_probe_tests {
     use super::*;
-    use crate::perp_dex::types::{
+    use crate::types::{
         OrderStatus, OrderType, Side, TimeInForce, PRICE_BASIS_WINDOW_SIZE,
     };
 
@@ -2346,7 +2301,7 @@ mod size_probe_tests {
 #[cfg(test)]
 mod encoding_roundtrip_tests {
     use super::*;
-    use crate::perp_dex::types::{OrderStatus, OrderType, Side, TimeInForce};
+    use crate::types::{OrderStatus, OrderType, Side, TimeInForce};
 
     fn rt<T>(label: &str, v: T)
     where

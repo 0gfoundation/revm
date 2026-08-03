@@ -1,21 +1,19 @@
 use alloy_primitives::IntoLogData;
-use context::{ContextTr, JournalTr};
+use crate::host::PerpHost;
 use primitives::{Address, Log};
 
 use super::execute_order_cancellation;
 use crate::{
-    perp_dex::{
         errors::{perp_err, perp_invariant_err},
-        interface::IPerpDex,
-        math::{
-            calc_maker_fee_for_order_qty_with_bps, calc_trading_fee,
-            calc_value, checked_u64_to_i64, is_above_maintenance_margin,
-        },
-        storage,
-        types::{OrderStatus, Side},
-        PERP_DEX_ADDRESS,
+    interface::IPerpDex,
+    math::{
+        calc_maker_fee_for_order_qty_with_bps, calc_trading_fee,
+        calc_value, checked_u64_to_i64, is_above_maintenance_margin,
     },
-    PrecompileError,
+    storage,
+    types::{OrderStatus, Side},
+    PERP_DEX_ADDRESS,
+    PerpError,
 };
 
 // ── Position settlement ───────────────────────────────────────────────────────
@@ -47,12 +45,12 @@ impl TakerSettlement {
     /// accumulator.  `remaining_closing_qty` is initialised from the current
     /// position size so that the first `record_fill` sees the full closing
     /// capacity.
-    pub(super) fn load<CTX: ContextTr>(
-        context: &mut CTX,
+    pub(super) fn load<H: PerpHost>(
+        context: &mut H,
         user: Address,
         market_id: u64,
         waive_taker_fee: bool,
-    ) -> Result<Self, PrecompileError> {
+    ) -> Result<Self, PerpError> {
         let rates = storage::load_user_fee_rates(context, user)?;
         Ok(Self {
             user,
@@ -98,8 +96,8 @@ impl TakerSettlement {
         fill_price: u64,
         fill_qty: u64,
         taker_side: Side,
-        _market: &crate::perp_dex::types::Market,
-    ) -> Result<(), PrecompileError> {
+        _market: &crate::types::Market,
+    ) -> Result<(), PerpError> {
         self.fills.push(RecordedFill {
             price: fill_price,
             quantity: fill_qty,
@@ -127,19 +125,19 @@ impl TakerSettlement {
     /// 6. **Deduct opening margin and fee from wallet** — both deducted cleanly
     ///    from the wallet; position margin is never touched for fee payment.
     /// 7. **Emit log** — single `PositionChanged` event for the full order.
-    pub(super) fn finalize_compute<CTX: ContextTr>(
+    pub(super) fn finalize_compute<H: PerpHost>(
         self,
-        context: &mut CTX,
+        context: &mut H,
         reg: &mut MatchRegistry,
         taker_side: Side,
-        market: &crate::perp_dex::types::Market,
+        market: &crate::types::Market,
         // commit-only #23 (atomic-reject, Harry 2026-07-20): when the caller will REST the taker's
         // remainder (GTC), the resting order's margin must be affordable from the post-fill wallet
         // TOO — otherwise the fills would commit and the subsequent rest_in_book would revert,
         // leaking the fills. Validated here, pre-flush, so an unaffordable fills+rest order rejects
         // atomically with zero writes (matching the pre-commit-only whole-order revert).
         rest: Option<RestReq>,
-    ) -> Result<Option<TakerPlan>, PrecompileError> {
+    ) -> Result<Option<TakerPlan>, PerpError> {
         // An EMPTY fill set must NOT skip the rest validation. `match_order` flushes the registry
         // immediately after this call, and the walk records writes even when nothing filled (a
         // `SaveLevel` for every level it entered, plus the `DeleteOrder`/`OrderCancelled`/
@@ -205,7 +203,7 @@ impl TakerSettlement {
         // only an O(1) PerpPosition. The list is left pristine for flush.
         let rest_delta = match &rest {
             Some(r) => {
-                let entry = crate::perp_dex::types::OrderEntry {
+                let entry = crate::types::OrderEntry {
                     order_id: [0u8; 32],
                     price: r.price,
                     amount: r.qty,
@@ -224,7 +222,7 @@ impl TakerSettlement {
                         i
                     }
                 };
-                let res = crate::perp_dex::math::calc_reservation_notionals_it(
+                let res = crate::math::calc_reservation_notionals_it(
                     w.buy_entries.iter().copied(),
                     w.sell_entries.iter().copied(),
                     market.base_decimals,
@@ -293,7 +291,7 @@ impl TakerSettlement {
             }
             sim_account.debit_perp(core.total_required)?;
             if let Some(r) = &rest {
-                let new_entry = crate::perp_dex::types::OrderEntry {
+                let new_entry = crate::types::OrderEntry {
                     order_id: [0u8; 32],
                     price: r.price,
                     amount: r.qty,
@@ -309,7 +307,7 @@ impl TakerSettlement {
                         sim_sell.insert(i, new_entry);
                     }
                 }
-                let (bn, sn, cn) = crate::perp_dex::math::calc_reservation_notionals_it(
+                let (bn, sn, cn) = crate::math::calc_reservation_notionals_it(
                     sim_buy.iter().copied(),
                     sim_sell.iter().copied(),
                     market.base_decimals,
@@ -368,15 +366,15 @@ pub(super) struct RestReq {
 /// same state is what makes the pre-flush reject sound — `rest_in_book`'s later check cannot then
 /// fire post-write.
 fn rest_is_affordable(
-    pos: &crate::perp_dex::types::PerpPosition,
-    account: &crate::perp_dex::types::UserAccount,
-    buy_entries: &std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
-    sell_entries: &std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
+    pos: &crate::types::PerpPosition,
+    account: &crate::types::UserAccount,
+    buy_entries: &std::collections::VecDeque<crate::types::OrderEntry>,
+    sell_entries: &std::collections::VecDeque<crate::types::OrderEntry>,
     taker_side: Side,
     rest: &RestReq,
-    market: &crate::perp_dex::types::Market,
-) -> Result<bool, PrecompileError> {
-    let entry = crate::perp_dex::types::OrderEntry {
+    market: &crate::types::Market,
+) -> Result<bool, PerpError> {
+    let entry = crate::types::OrderEntry {
         order_id: [0u8; 32],
         price: rest.price,
         amount: rest.qty,
@@ -386,7 +384,7 @@ fn rest_is_affordable(
     let (bn, sn, cn) = match taker_side {
         Side::Buy => {
             let i = buy_entries.partition_point(|e| e.price > rest.price);
-            crate::perp_dex::math::calc_reservation_notionals_it(
+            crate::math::calc_reservation_notionals_it(
                 buy_entries
                     .range(..i)
                     .copied()
@@ -400,7 +398,7 @@ fn rest_is_affordable(
         }
         Side::Sell => {
             let i = sell_entries.partition_point(|e| e.price < rest.price);
-            crate::perp_dex::math::calc_reservation_notionals_it(
+            crate::math::calc_reservation_notionals_it(
                 buy_entries.iter().copied(),
                 sell_entries
                     .range(..i)
@@ -434,17 +432,17 @@ pub(super) struct TakerPlan {
     market_id: u64,
     fee: u64,
     total_required: u64,
-    pos_log: crate::perp_dex::types::PerpPosition,
+    pos_log: crate::types::PerpPosition,
     realized_pnl: i64,
     closed_quantity: u64,
 }
 
-pub(super) fn finalize_apply<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn finalize_apply<H: PerpHost>(
+    context: &mut H,
     plan: TakerPlan,
     taker_side: Side,
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<(), PerpError> {
     ensure_taker_wallet_can_cover_margin(
         context,
         plan.user,
@@ -460,7 +458,7 @@ pub(super) fn finalize_apply<CTX: ContextTr>(
     storage::mutate_account_balance(context, plan.user, |a| a.debit_perp(plan.total_required))??;
     credit_fee_recipient(context, plan.market_id, plan.fee)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::PositionChanged {
             user: plan.user,
@@ -498,10 +496,10 @@ pub(super) enum MakerFillOutcome {
 // Vec-backed (few users per match) for deterministic flush order.
 
 pub(super) struct UserWork {
-    pos: crate::perp_dex::types::PerpPosition,
-    account: crate::perp_dex::types::UserAccount,
-    buy_entries: std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
-    sell_entries: std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
+    pos: crate::types::PerpPosition,
+    account: crate::types::UserAccount,
+    buy_entries: std::collections::VecDeque<crate::types::OrderEntry>,
+    sell_entries: std::collections::VecDeque<crate::types::OrderEntry>,
     dirty_buy: bool,
     dirty_sell: bool,
 }
@@ -510,7 +508,7 @@ pub(super) struct UserWork {
 /// the EXACT sequence the old code performed them; [`MatchRegistry::flush`] replays them in order,
 /// so the log stream and the insurance-fund/trade-counter evolutions are byte-identical.
 pub(super) enum MatchEvent {
-    ApplyFunding(crate::perp_dex::funding::PendingFunding),
+    ApplyFunding(crate::funding::PendingFunding),
     AbsorbBadDebt {
         market_id: u64,
         amount: u64,
@@ -521,13 +519,13 @@ pub(super) enum MatchEvent {
     },
     PositionChanged {
         user: Address,
-        pos: crate::perp_dex::types::PerpPosition,
+        pos: crate::types::PerpPosition,
         realized_pnl: i64,
         closed_quantity: u64,
     },
     SaveOrder {
         order_id: [u8; 32],
-        order: crate::perp_dex::types::Order,
+        order: crate::types::Order,
     },
     /// delete-on-terminal: drop a maker order that reached a terminal status (fully filled during
     /// the walk, or cancelled by the K9 insolvency reject) from the order map.
@@ -614,7 +612,7 @@ impl MatchRegistry {
         price: u64,
         queue: Vec<[u8; 32]>,
         count: u64,
-    ) -> Result<(), PrecompileError> {
+    ) -> Result<(), PerpError> {
         if count == 0 {
             return Err(perp_invariant_err(
                 "liquidation maker cap reached with zero live level count",
@@ -632,19 +630,19 @@ impl MatchRegistry {
     /// First touch loads pos/account/both lists and settles funding: computed in memory NOW (the
     /// walk's working copies must carry the post-funding state) with the IF write + logs deferred
     /// as an event at this exact stream position.
-    fn get_or_load<CTX: ContextTr>(
+    fn get_or_load<H: PerpHost>(
         &mut self,
-        context: &mut CTX,
+        context: &mut H,
         user: Address,
         market_id: u64,
-        market: &crate::perp_dex::types::Market,
-    ) -> Result<usize, PrecompileError> {
+        market: &crate::types::Market,
+    ) -> Result<usize, PerpError> {
         if let Some(i) = self.users.iter().position(|(a, _)| *a == user) {
             return Ok(i);
         }
         let mut pos = storage::load_position(context, user, market_id)?;
         let mut account = storage::load_account(context, user)?;
-        let pending = crate::perp_dex::funding::compute_funding_settlement(
+        let pending = crate::funding::compute_funding_settlement(
             context,
             user,
             market,
@@ -682,7 +680,7 @@ impl MatchRegistry {
     /// provided); otherwise it accumulates and [`Self::flush`] materialises the total once (same
     /// key, same net value as the old per-fill credits). `get_or_load` folds the pending amount in
     /// if the admin joins the registry later.
-    fn credit_admin(&mut self, admin: Address, amount: u64) -> Result<(), PrecompileError> {
+    fn credit_admin(&mut self, admin: Address, amount: u64) -> Result<(), PerpError> {
         self.fee_admin = Some(admin);
         if let Some((_, w)) = self.users.iter_mut().find(|(a, _)| *a == admin) {
             return Ok(w.account.credit_perp(amount)?);
@@ -697,16 +695,16 @@ impl MatchRegistry {
     /// Applies the match: replays the deferred events in the EXACT order the walk recorded them
     /// (byte-identical log stream + IF/trade-counter evolution), then writes every touched user's
     /// final state (dirty lists, position + account — same key set as the old per-fill saves).
-    pub(super) fn flush<CTX: ContextTr>(
+    pub(super) fn flush<H: PerpHost>(
         mut self,
-        context: &mut CTX,
+        context: &mut H,
         market_id: u64,
-    ) -> Result<(), PrecompileError> {
+    ) -> Result<(), PerpError> {
         let events = core::mem::take(&mut self.events);
         for e in events {
             match e {
                 MatchEvent::ApplyFunding(p) => {
-                    crate::perp_dex::funding::apply_funding_settlement(context, p)?;
+                    crate::funding::apply_funding_settlement(context, p)?;
                 }
                 MatchEvent::AbsorbBadDebt { market_id, amount } => {
                     absorb_bad_debt_into_insurance_fund(context, market_id, amount)?;
@@ -722,7 +720,7 @@ impl MatchRegistry {
                     realized_pnl,
                     closed_quantity,
                 } => {
-                    context.journal_mut().log(Log {
+                    context.log(Log {
                         address: PERP_DEX_ADDRESS,
                         data: IPerpDex::PositionChanged {
                             user,
@@ -744,7 +742,7 @@ impl MatchRegistry {
                     storage::delete_order(context, &order_id)?;
                 }
                 MatchEvent::OrderCancelled { user, order_id } => {
-                    context.journal_mut().log(Log {
+                    context.log(Log {
                         address: PERP_DEX_ADDRESS,
                         data: IPerpDex::OrderCancelled {
                             user,
@@ -781,7 +779,7 @@ impl MatchRegistry {
                     }
                 }
                 MatchEvent::MidPriceSample { best_bid, best_ask } => {
-                    crate::perp_dex::risk::record_mid_price_sample_for_best_quote_change(
+                    crate::risk::record_mid_price_sample_for_best_quote_change(
                         context, market_id, best_bid, best_ask,
                     )?;
                 }
@@ -798,7 +796,7 @@ impl MatchRegistry {
                     maker_fee,
                 } => {
                     let trade_id = storage::next_trade_id(context, market_id)?;
-                    context.journal_mut().log(Log {
+                    context.log(Log {
                         address: PERP_DEX_ADDRESS,
                         data: IPerpDex::Trade {
                             marketId: market_id,
@@ -844,9 +842,9 @@ impl MatchRegistry {
             // reservation aggregates from the authoritative working-copy lists (recompute, not
             // incremental: the match path is rare and already re-serialises the whole list here).
             let (tbq, tbn) =
-                crate::perp_dex::math::sum_side_totals(w.buy_entries.iter().copied(), bd, pd)?;
+                crate::math::sum_side_totals(w.buy_entries.iter().copied(), bd, pd)?;
             let (tsq, tsn) =
-                crate::perp_dex::math::sum_side_totals(w.sell_entries.iter().copied(), bd, pd)?;
+                crate::math::sum_side_totals(w.sell_entries.iter().copied(), bd, pd)?;
             w.pos.total_buy_qty = tbq;
             w.pos.total_buy_notional = tbn;
             w.pos.total_sell_qty = tsq;
@@ -863,8 +861,8 @@ impl MatchRegistry {
 /// IF writes (bad debt), fee credit, and the PositionChanged log stay immediate — the same
 /// stream positions as today.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn settle_maker_fill_registry<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn settle_maker_fill_registry<H: PerpHost>(
+    context: &mut H,
     reg: &mut MatchRegistry,
     maker: Address,
     maker_order_id: &[u8; 32],
@@ -872,8 +870,8 @@ pub(super) fn settle_maker_fill_registry<CTX: ContextTr>(
     fill_price: u64,
     fill_qty: u64,
     taker_side: Side,
-    market: &crate::perp_dex::types::Market,
-) -> Result<MakerFillOutcome, PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<MakerFillOutcome, PerpError> {
     let maker_side = taker_side.opposite();
     let i = reg.get_or_load(context, maker, market_id, market)?;
     // mark_price is a field of the threaded Market — no per-maker storage read.
@@ -940,16 +938,16 @@ pub(super) fn settle_maker_fill_registry<CTX: ContextTr>(
 /// Registry-backed K9 maker cancel: releases the rejected order's margin on the registry copies
 /// (flushed later) and writes the order status + OrderCancelled log immediately (same positions
 /// as today's cancel_rejected_maker).
-pub(super) fn cancel_rejected_maker_registry<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
+    context: &mut H,
     reg: &mut MatchRegistry,
     maker: Address,
     market_id: u64,
     maker_side: Side,
     order_id: &[u8; 32],
-    maker_order: &mut crate::perp_dex::types::Order,
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
+    maker_order: &mut crate::types::Order,
+    market: &crate::types::Market,
+) -> Result<(), PerpError> {
     let i = reg.get_or_load(context, maker, market_id, market)?;
     let w = &mut reg.users[i].1;
     super::release_margin_core(
@@ -996,16 +994,16 @@ pub(super) struct TakerFillCore {
 /// wallet-cover cancels, which remain in the storage wrapper).
 #[allow(clippy::too_many_arguments)]
 fn finalize_core(
-    pos: &mut crate::perp_dex::types::PerpPosition,
-    account: &mut crate::perp_dex::types::UserAccount,
-    buy_entries: &std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
-    sell_entries: &std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
+    pos: &mut crate::types::PerpPosition,
+    account: &mut crate::types::UserAccount,
+    buy_entries: &std::collections::VecDeque<crate::types::OrderEntry>,
+    sell_entries: &std::collections::VecDeque<crate::types::OrderEntry>,
     fills: &[RecordedFill],
     taker_side: Side,
     mark_price: u64,
     taker_fee_bps: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<TakerFillCore, PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<TakerFillCore, PerpError> {
     let mut remaining_closing_qty = pos.amount.unsigned_abs();
     let mut closing_qty = 0u64;
     let mut closing_value = 0u64;
@@ -1089,7 +1087,7 @@ fn finalize_core(
     // via mr_credit/mr_extra; without this, W + M + MR is not conserved across the fill.
     let old_mr = pos.margin_reserved;
     let (buy_notional, sell_notional, c_notional) =
-        crate::perp_dex::math::calc_reservation_notionals_it(
+        crate::math::calc_reservation_notionals_it(
             buy_entries.iter().copied(),
             sell_entries.iter().copied(),
         market.base_decimals,
@@ -1141,17 +1139,17 @@ pub(super) enum MakerFillCore {
 /// order-entry lists (the maker side is reduced; both feed the reserve recompute).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn settle_maker_fill_core(
-    pos: &mut crate::perp_dex::types::PerpPosition,
-    account: &mut crate::perp_dex::types::UserAccount,
-    buy_entries: &mut std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
-    sell_entries: &mut std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
+    pos: &mut crate::types::PerpPosition,
+    account: &mut crate::types::UserAccount,
+    buy_entries: &mut std::collections::VecDeque<crate::types::OrderEntry>,
+    sell_entries: &mut std::collections::VecDeque<crate::types::OrderEntry>,
     mark_price: u64,
     maker_side: Side,
     maker_order_id: &[u8; 32],
     fill_price: u64,
     fill_qty: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<MakerFillCore, PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<MakerFillCore, PerpError> {
     // Snapshot before mutations — used to verify and release the pre-fill reservation. MUST be
     // the flip-aware reservation (pos.margin_reserved), the same quantity new_reserved is
     // recomputed as below.
@@ -1210,7 +1208,7 @@ pub(super) fn settle_maker_fill_core(
 
     // Flip-aware reserve recompute (must follow the entry reduce + reflect the new pos.amount).
     let (buy_notional, sell_notional, c_notional) =
-        crate::perp_dex::math::calc_reservation_notionals_it(
+        crate::math::calc_reservation_notionals_it(
             buy_entries.iter().copied(),
             sell_entries.iter().copied(),
         market.base_decimals,
@@ -1248,11 +1246,11 @@ pub(super) fn settle_maker_fill_core(
 ///
 
 /// Credits the trading fee to the protocol fee pool and the admin account.
-fn credit_fee_recipient<CTX: ContextTr>(
-    context: &mut CTX,
+fn credit_fee_recipient<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     amount: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     if amount == 0 {
         return Ok(());
     }
@@ -1299,8 +1297,8 @@ fn split_position_fill(
     side: Side,
     fill_price: u64,
     fill_qty: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<PositionFill, PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<PositionFill, PerpError> {
     let is_buy = side == Side::Buy;
     let closing_qty = if is_buy && position_amount < 0 {
         fill_qty.min((-position_amount) as u64)
@@ -1344,14 +1342,14 @@ fn split_position_fill(
 /// Only same-side orders are cancelled: opposite-side orders rely on their own
 /// reserved margin for netting and cannot be safely freed here without
 /// invalidating that accounting.
-fn ensure_taker_wallet_can_cover_margin<CTX: ContextTr>(
-    context: &mut CTX,
+fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     side: Side,
     required_margin: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<(), PerpError> {
     if required_margin == 0 {
         return Ok(());
     }
@@ -1381,14 +1379,14 @@ fn ensure_taker_wallet_can_cover_margin<CTX: ContextTr>(
 /// LIFO cancellation preserves earlier orders at better price priority.
 /// If the wallet is still short after all orders are exhausted the loop exits
 /// silently; the caller is responsible for the final sufficiency check.
-fn cancel_same_side_orders_until_wallet_covers<CTX: ContextTr>(
-    context: &mut CTX,
+fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
     side: Side,
     required_margin: u64,
-    market: &crate::perp_dex::types::Market,
-) -> Result<(), PrecompileError> {
+    market: &crate::types::Market,
+) -> Result<(), PerpError> {
     while !storage::load_account_ref(context, user)?.has_available_perp(required_margin) {
         let order_id = match side {
             Side::Buy => storage::load_buy_orders_ref(context, user, market_id)?
@@ -1485,14 +1483,14 @@ pub(super) struct PositionFillOutcome {
 }
 
 pub(super) fn apply_position_fill(
-    pos: &mut crate::perp_dex::types::PerpPosition,
+    pos: &mut crate::types::PerpPosition,
     wallet: &mut i64,
     closing_qty: u64,
     closing_value: u64,
     opening_qty: u64,
     opening_value: u64,
     is_buy: bool,
-) -> Result<PositionFillOutcome, PrecompileError> {
+) -> Result<PositionFillOutcome, PerpError> {
     let mut bad_debt = 0u64;
     let mut realized_pnl = 0i64;
     if closing_qty > 0 {
@@ -1615,14 +1613,14 @@ pub(super) fn apply_position_fill(
 /// the entry by `fill_qty`, removes it at zero, returns the released fee reservation.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reduce_order_entry_core(
-    entries: &mut std::collections::VecDeque<crate::perp_dex::types::OrderEntry>,
+    entries: &mut std::collections::VecDeque<crate::types::OrderEntry>,
     order_id: &[u8; 32],
     price: u64,
     buy_side: bool,
     fill_qty: u64,
-    market: &crate::perp_dex::types::Market,
+    market: &crate::types::Market,
     side_label: &str,
-) -> Result<u64, PrecompileError> {
+) -> Result<u64, PerpError> {
     // #B: binary-search to the maker's price (known = the matched level) then scan the tiny
     // same-price run — O(log n) instead of the O(n) id scan; full-fill removal is O(1)-ish
     // VecDeque::remove instead of the O(n) retain.
@@ -1659,11 +1657,11 @@ pub(super) fn reduce_order_entry_core(
 /// old `resolve_maker_wallet_deficit`, this does NOT credit a wallet — the loss was
 /// already contained to the position's margin in `apply_position_fill`, so the wallet
 /// is never involved. Shared by every close path (maker fill, taker fill, liquidation).
-pub(super) fn absorb_bad_debt_into_insurance_fund<CTX: ContextTr>(
-    context: &mut CTX,
+pub(super) fn absorb_bad_debt_into_insurance_fund<H: PerpHost>(
+    context: &mut H,
     market_id: u64,
     bad_debt: u64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     if bad_debt == 0 {
         return Ok(());
     }
@@ -1671,7 +1669,7 @@ pub(super) fn absorb_bad_debt_into_insurance_fund<CTX: ContextTr>(
     if absorbed > 0 {
         let new_if_balance = storage::load_insurance_fund(context)?;
         let absorbed_i64 = checked_u64_to_i64(absorbed, "settlement: bad-debt IF absorption")?;
-        context.journal_mut().log(Log {
+        context.log(Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::InsuranceFundChanged {
                 delta: -absorbed_i64,
@@ -1681,7 +1679,7 @@ pub(super) fn absorb_bad_debt_into_insurance_fund<CTX: ContextTr>(
         });
     }
     if remaining > 0 {
-        context.journal_mut().log(Log {
+        context.log(Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::InsuranceFundDepleted {
                 marketId: market_id,
@@ -1706,17 +1704,17 @@ pub(super) fn absorb_bad_debt_into_insurance_fund<CTX: ContextTr>(
 /// cover the peak across that flip, not merely the larger side today. This must
 /// be called **after** [`apply_position_fill`] so that `pos.amount` already
 /// reflects the new size.
-fn recompute_maker_order_reserve_after_fill<CTX: ContextTr>(
-    context: &mut CTX,
+fn recompute_maker_order_reserve_after_fill<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market_id: u64,
-    pos: &mut crate::perp_dex::types::PerpPosition,
-    market: &crate::perp_dex::types::Market,
-) -> Result<u64, PrecompileError> {
+    pos: &mut crate::types::PerpPosition,
+    market: &crate::types::Market,
+) -> Result<u64, PerpError> {
     let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
     let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
     let (buy_notional, sell_notional, c_notional) =
-        crate::perp_dex::math::calc_reservation_notionals_it(
+        crate::math::calc_reservation_notionals_it(
             buy_entries.iter().copied(),
             sell_entries.iter().copied(),
         market.base_decimals,
@@ -1730,7 +1728,7 @@ fn recompute_maker_order_reserve_after_fill<CTX: ContextTr>(
 #[cfg(test)]
 mod isolated_margin_tests {
     use super::apply_position_fill;
-    use crate::perp_dex::types::PerpPosition;
+    use crate::types::PerpPosition;
 
     /// Long `amount` units, entry value `-v_quote_balance`, isolated `margin`, leverage 1.
     fn long(amount: i64, v_quote_balance: i64, margin: i64) -> PerpPosition {
@@ -1830,7 +1828,7 @@ mod isolated_margin_tests {
 #[cfg(test)]
 mod split_floor_conservation_tests {
     use super::split_position_fill;
-    use crate::perp_dex::{
+    use crate::{
         math::calc_value,
         types::{Market, Side},
     };

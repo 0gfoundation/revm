@@ -26,6 +26,13 @@ impl From<perp_core::PerpError> for crate::PrecompileError {
         match e {
             perp_core::PerpError::Reject(m) => crate::PrecompileError::Other(m),
             perp_core::PerpError::Fatal(m) => crate::PrecompileError::Fatal(m),
+            perp_core::PerpError::OutOfGas => crate::PrecompileError::OutOfGas,
+            perp_core::PerpError::StaticRestrictionViolation => {
+                crate::PrecompileError::StaticRestrictionViolation
+            }
+            perp_core::PerpError::StatefulInvalidInput => {
+                crate::PrecompileError::StatefulInvalidInput
+            }
         }
     }
 }

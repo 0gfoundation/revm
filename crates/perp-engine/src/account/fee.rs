@@ -1,27 +1,25 @@
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
-use context::{ContextTr, JournalTr};
+use crate::host::PerpHost;
 use primitives::{Address, Bytes, Log};
 
 use crate::{
-    perp_dex::{
         errors::perp_err,
-        interface::IPerpDex::{
-            self, getUserFeeRatesCall, getUserFeeRatesReturn, setUserFeeRatesCall,
-        },
-        math::FEE_BPS_DENOMINATOR,
-        storage,
-        types::UserFeeRates,
-        PERP_DEX_ADDRESS,
+    interface::IPerpDex::{
+        self, getUserFeeRatesCall, getUserFeeRatesReturn, setUserFeeRatesCall,
     },
-    PrecompileError,
+    math::FEE_BPS_DENOMINATOR,
+    storage,
+    types::UserFeeRates,
+    PERP_DEX_ADDRESS,
+    PerpError,
 };
 
-pub fn run_set_user_fee_rates<CTX: ContextTr>(
+pub fn run_set_user_fee_rates<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = setUserFeeRatesCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("setUserFeeRates: invalid calldata"))?;
 
@@ -39,7 +37,7 @@ pub fn run_set_user_fee_rates<CTX: ContextTr>(
     };
     storage::save_user_fee_rates(context, args.user, rates)?;
 
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::UserFeeRatesUpdated {
             user: args.user,
@@ -52,10 +50,10 @@ pub fn run_set_user_fee_rates<CTX: ContextTr>(
     Ok(Bytes::new())
 }
 
-pub fn run_get_user_fee_rates<CTX: ContextTr>(
+pub fn run_get_user_fee_rates<H: PerpHost>(
     input_bytes: &[u8],
-    context: &mut CTX,
-) -> Result<Bytes, PrecompileError> {
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
     let args = getUserFeeRatesCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getUserFeeRates: invalid calldata"))?;
     let rates = storage::load_user_fee_rates(context, args.user)?;
@@ -67,10 +65,10 @@ pub fn run_get_user_fee_rates<CTX: ContextTr>(
     )))
 }
 
-fn require_admin<CTX: ContextTr>(
+fn require_admin<H: PerpHost>(
     caller: Address,
-    context: &mut CTX,
-) -> Result<(), PrecompileError> {
+    context: &mut H,
+) -> Result<(), PerpError> {
     let admin = storage::load_admin(context)?;
     if admin == Address::ZERO {
         return Err(perp_err("not authorised: admin not initialised"));

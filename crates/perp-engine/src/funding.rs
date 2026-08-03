@@ -17,19 +17,17 @@
 //! any remainder is absorbed from the insurance fund (bad debt is written off).
 
 use alloy_primitives::IntoLogData;
-use context::{ContextTr, JournalTr};
+use crate::host::PerpHost;
 use primitives::{Address, Log};
 
 use crate::{
-    perp_dex::{
         errors::perp_err,
-        interface::IPerpDex,
-        math::{calc_funding_payment, checked_u64_to_i64},
-        storage,
-        types::{Market, PerpPosition},
-        PERP_DEX_ADDRESS,
-    },
-    PrecompileError,
+    interface::IPerpDex,
+    math::{calc_funding_payment, checked_u64_to_i64},
+    storage,
+    types::{Market, PerpPosition},
+    PERP_DEX_ADDRESS,
+    PerpError,
 };
 
 /// A funding settlement computed in memory but NOT yet written (commit-only #23). The
@@ -49,13 +47,13 @@ pub(crate) struct PendingFunding {
 /// `pos`/`wallet` (wallet→margin waterfall), re-anchors `last_funding_index`, and returns the
 /// pending insurance-fund charge + log payload (`None` if there was no funding event). Performs NO
 /// storage writes, so it is safe to call before a validation reject.
-pub(crate) fn compute_funding_settlement<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn compute_funding_settlement<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market: &Market,
     pos: &mut PerpPosition,
     wallet: &mut i64,
-) -> Result<Option<PendingFunding>, PrecompileError> {
+) -> Result<Option<PendingFunding>, PerpError> {
     let funding = storage::load_funding_state(context, market.market_id)?;
     let index = funding.cumulative_funding_index;
 
@@ -109,16 +107,16 @@ pub(crate) fn compute_funding_settlement<CTX: ContextTr>(
 /// Commits a [`PendingFunding`]: absorbs the insurance-fund shortfall (the ONLY storage write in
 /// the funding path) and emits the `InsuranceFund*` / `FundingSettled` logs. MUST run only after
 /// the caller has decided to commit (all rejects passed).
-pub(crate) fn apply_funding_settlement<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn apply_funding_settlement<H: PerpHost>(
+    context: &mut H,
     p: PendingFunding,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     if p.if_charge > 0 {
         let (absorbed, bad_debt) = storage::absorb_from_insurance_fund(context, p.if_charge)?;
         let new_if = storage::load_insurance_fund(context)?;
         if absorbed > 0 {
             let absorbed_i64 = checked_u64_to_i64(absorbed, "funding: IF absorption delta")?;
-            context.journal_mut().log(Log {
+            context.log(Log {
                 address: PERP_DEX_ADDRESS,
                 data: IPerpDex::InsuranceFundChanged {
                     delta: -absorbed_i64,
@@ -128,7 +126,7 @@ pub(crate) fn apply_funding_settlement<CTX: ContextTr>(
             });
         }
         if bad_debt > 0 {
-            context.journal_mut().log(Log {
+            context.log(Log {
                 address: PERP_DEX_ADDRESS,
                 data: IPerpDex::InsuranceFundDepleted {
                     marketId: p.market_id,
@@ -140,7 +138,7 @@ pub(crate) fn apply_funding_settlement<CTX: ContextTr>(
     }
 
     let mark_price = storage::load_mark_price(context, p.market_id)?;
-    context.journal_mut().log(Log {
+    context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::FundingSettled {
             marketId: p.market_id,
@@ -158,13 +156,13 @@ pub(crate) fn apply_funding_settlement<CTX: ContextTr>(
 /// to reject between the two (matching settlement, liquidation). Migrated callers (margin
 /// add/remove) instead use [`compute_funding_settlement`] + [`apply_funding_settlement`] with their
 /// rejects in between so a rejected op leaves the insurance fund untouched.
-pub(crate) fn settle_position_funding<CTX: ContextTr>(
-    context: &mut CTX,
+pub(crate) fn settle_position_funding<H: PerpHost>(
+    context: &mut H,
     user: Address,
     market: &Market,
     pos: &mut PerpPosition,
     wallet: &mut i64,
-) -> Result<(), PrecompileError> {
+) -> Result<(), PerpError> {
     if let Some(pending) = compute_funding_settlement(context, user, market, pos, wallet)? {
         apply_funding_settlement(context, pending)?;
     }
