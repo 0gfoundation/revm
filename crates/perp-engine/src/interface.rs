@@ -379,7 +379,7 @@ sol! {
         // Feeds: /positionRisk (history), /income (REALIZED_PNL)
         // realizedPnl is gross close PnL and excludes released margin, fees, and funding.
         // closedQuantity is zero for non-closing position updates.
-        event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage, int64 realizedPnl, uint64 closedQuantity);
+        event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 marginReserved, uint64 feeReserved, uint64 leverage, int64 realizedPnl, uint64 closedQuantity);
         // Feeds: isolated margin adjustment history. delta > 0 means add margin; delta < 0 means remove margin.
         event PositionMarginAdjusted(address indexed user, uint64 indexed marketId, int64 delta, int64 margin);
         // Feeds: useful for debugging / audit; no direct REST endpoint

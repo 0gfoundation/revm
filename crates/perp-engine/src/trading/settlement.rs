@@ -328,7 +328,6 @@ impl TakerSettlement {
             }
         }
 
-        let pos_log = w.pos.clone();
         reg.push_event(MatchEvent::AbsorbBadDebt {
             market_id: self.market_id,
             amount: core.bad_debt,
@@ -339,7 +338,6 @@ impl TakerSettlement {
             market_id: self.market_id,
             fee: core.fee,
             total_required: core.total_required,
-            pos_log,
             realized_pnl: core.realized_pnl,
             closed_quantity: core.closed_quantity,
         }))
@@ -432,7 +430,6 @@ pub(super) struct TakerPlan {
     market_id: u64,
     fee: u64,
     total_required: u64,
-    pos_log: crate::types::PerpPosition,
     realized_pnl: i64,
     closed_quantity: u64,
 }
@@ -458,20 +455,15 @@ pub(super) fn finalize_apply<H: PerpHost>(
     storage::mutate_account_balance(context, plan.user, |a| a.debit_perp(plan.total_required))??;
     credit_fee_recipient(context, plan.market_id, plan.fee)?;
 
-    context.log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::PositionChanged {
-            user: plan.user,
-            marketId: plan.market_id,
-            amount: plan.pos_log.amount,
-            vQuoteBalance: plan.pos_log.v_quote_balance,
-            margin: plan.pos_log.margin,
-            leverage: plan.pos_log.leverage,
-            realizedPnl: plan.realized_pnl,
-            closedQuantity: plan.closed_quantity,
-        }
-        .to_log_data(),
-    });
+    let position = storage::load_position(context, plan.user, plan.market_id)?;
+    crate::events::emit_position_changed(
+        context,
+        plan.user,
+        plan.market_id,
+        &position,
+        plan.realized_pnl,
+        plan.closed_quantity,
+    );
 
     Ok(())
 }
@@ -720,20 +712,14 @@ impl MatchRegistry {
                     realized_pnl,
                     closed_quantity,
                 } => {
-                    context.log(Log {
-                        address: PERP_DEX_ADDRESS,
-                        data: IPerpDex::PositionChanged {
-                            user,
-                            marketId: market_id,
-                            amount: pos.amount,
-                            vQuoteBalance: pos.v_quote_balance,
-                            margin: pos.margin,
-                            leverage: pos.leverage,
-                            realizedPnl: realized_pnl,
-                            closedQuantity: closed_quantity,
-                        }
-                        .to_log_data(),
-                    });
+                    crate::events::emit_position_changed(
+                        context,
+                        user,
+                        market_id,
+                        &pos,
+                        realized_pnl,
+                        closed_quantity,
+                    );
                 }
                 MatchEvent::SaveOrder { order_id, order } => {
                     storage::save_order(context, &order_id, &order)?;
@@ -963,6 +949,7 @@ pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
         Side::Buy => w.dirty_buy = true,
         Side::Sell => w.dirty_sell = true,
     }
+    let position_after_cancel = w.pos.clone();
     // delete-on-terminal: the rejected maker is Cancelled → removed from the map (its id stays in
     // the level queue and is swept as a stale entry; the match walk decrements the live count for
     // this reject, so the level's count stays accurate).
@@ -973,6 +960,12 @@ pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
     reg.push_event(MatchEvent::OrderCancelled {
         user: maker,
         order_id: *order_id,
+    });
+    reg.push_event(MatchEvent::PositionChanged {
+        user: maker,
+        pos: position_after_cancel,
+        realized_pnl: 0,
+        closed_quantity: 0,
     });
     Ok(())
 }
@@ -1425,6 +1418,7 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
             market,
             // Runs mid-matching (taker margin-cover): the BBO cache lags the book.
             super::remove_from_book_during_match,
+            false,
         )?;
     }
 

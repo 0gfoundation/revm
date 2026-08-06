@@ -427,13 +427,14 @@ fn set_leverage_core<H: PerpHost>(
         }
         .to_log_data(),
     });
+    crate::events::emit_position_changed(context, account, market_id, &pos, 0, 0);
 
     Ok(Bytes::new())
 }
 
 // ── Positions ─────────────────────────────────────────────────────────────────
 
-/// `getPosition(address user, uint64 marketId) returns (int64 amount, int64 vQuoteBalance, int64 margin, uint64 marginReserved, uint64 leverage)`
+/// `getPosition(address user, uint64 marketId) returns (int64 amount, int64 vQuoteBalance, int64 margin, uint64 marginReserved, uint64 feeReserved, uint64 leverage)`
 pub fn run_get_position<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -503,7 +504,7 @@ pub fn run_add_position_margin<H: PerpHost>(
     storage::save_account(context, caller, account)?;
     storage::save_position(context, caller, args.marketId, &pos)?;
     emit_position_margin_adjusted(context, caller, args.marketId, amount, &pos);
-    emit_position_changed(context, caller, args.marketId, &pos);
+    crate::events::emit_position_changed(context, caller, args.marketId, &pos, 0, 0);
     Ok(Bytes::new())
 }
 
@@ -589,7 +590,7 @@ pub fn run_remove_position_margin<H: PerpHost>(
     storage::save_account(context, caller, account)?;
     storage::save_position(context, caller, args.marketId, &pos)?;
     emit_position_margin_adjusted(context, caller, args.marketId, -amount, &pos);
-    emit_position_changed(context, caller, args.marketId, &pos);
+    crate::events::emit_position_changed(context, caller, args.marketId, &pos, 0, 0);
     Ok(Bytes::new())
 }
 /// Result of a single `liquidate_position` attempt.
@@ -927,28 +928,6 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
     Ok(())
 }
 
-fn emit_position_changed<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    market_id: u64,
-    pos: &crate::types::PerpPosition,
-) {
-    context.log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::PositionChanged {
-            user,
-            marketId: market_id,
-            amount: pos.amount,
-            vQuoteBalance: pos.v_quote_balance,
-            margin: pos.margin,
-            leverage: pos.leverage,
-            realizedPnl: 0,
-            closedQuantity: 0,
-        }
-        .to_log_data(),
-    });
-}
-
 fn emit_position_margin_adjusted<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -1103,6 +1082,7 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
 
     // Recalculate reserves (now 0 since all orders cancelled).
     let mut pos = storage::load_position(context, user, market_id)?;
+    let reservations_changed = pos.margin_reserved != 0 || pos.fee_reserved != 0;
     let released = pos
         .margin_reserved
         .checked_add(pos.fee_reserved)
@@ -1119,6 +1099,9 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
     pos.total_sell_qty = 0;
     pos.total_sell_notional = 0;
     storage::save_position(context, user, market_id, &pos)?;
+    if reservations_changed {
+        crate::events::emit_position_changed(context, user, market_id, &pos, 0, 0);
+    }
 
     Ok(())
 }

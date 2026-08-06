@@ -1245,6 +1245,7 @@ fn set_leverage_decrease_without_position_tops_up_order_margin() {
     place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, QTY as u64);
     assert_eq!(position(&mut ctx, ALICE).margin_reserved, 200_000_000);
     assert_eq!(wallet(&mut ctx, ALICE), 300_000_000);
+    take_position_changes(&mut ctx);
 
     set_leverage(&mut ctx, 2).unwrap();
 
@@ -1252,6 +1253,11 @@ fn set_leverage_decrease_without_position_tops_up_order_margin() {
     assert_eq!(pos.leverage, 2);
     assert_eq!(pos.margin_reserved, 500_000_000);
     assert_eq!(wallet(&mut ctx, ALICE), 0);
+    let events = take_position_changes(&mut ctx);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].marginReserved, pos.margin_reserved);
+    assert_eq!(events[0].feeReserved, pos.fee_reserved);
+    assert_eq!(events[0].leverage, pos.leverage);
 }
 
 #[test]

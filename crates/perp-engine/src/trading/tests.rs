@@ -631,9 +631,21 @@ fn resting_buy_reserves_margin_from_perp_wallet() {
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
     // buy_side_margin_reserved = calc_value(PRICE, QTY, 8, 9) / leverage(1) = FILL_VALUE
-    assert_eq!(pos(&mut ctx, ALICE).buy_side_margin_reserved, INIT_MARGIN);
-    assert_eq!(pos(&mut ctx, ALICE).fee_reserved, MAKER_FEE);
+    let stored = pos(&mut ctx, ALICE);
+    assert_eq!(stored.buy_side_margin_reserved, INIT_MARGIN);
+    assert_eq!(stored.fee_reserved, MAKER_FEE);
     assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN - MAKER_FEE);
+
+    let events = take_position_changes(&mut ctx);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].amount, stored.amount);
+    assert_eq!(events[0].vQuoteBalance, stored.v_quote_balance);
+    assert_eq!(events[0].margin, stored.margin);
+    assert_eq!(events[0].marginReserved, stored.margin_reserved);
+    assert_eq!(events[0].feeReserved, stored.fee_reserved);
+    assert_eq!(events[0].leverage, stored.leverage);
+    assert_eq!(events[0].realizedPnl, 0);
+    assert_eq!(events[0].closedQuantity, 0);
 }
 
 #[test]
@@ -1074,7 +1086,7 @@ fn maker_close_emits_fill_realized_pnl() {
     let position_changes = take_position_changes(&mut ctx);
     let maker_change = position_changes
         .iter()
-        .find(|change| change.user == BOB)
+        .find(|change| change.user == BOB && change.closedQuantity > 0)
         .unwrap();
     assert_eq!(maker_change.realizedPnl, 100_000);
     assert_eq!(maker_change.closedQuantity, QTY);
@@ -1095,6 +1107,7 @@ fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
     let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
     alice.perp_wallet_balance = (INIT_MARGIN + TAKER_FEE - low_buy_margin) as i64;
     storage::save_account(&mut ctx, ALICE, alice).unwrap();
+    take_position_changes(&mut ctx);
 
     let market_buy = place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);
 
@@ -1102,6 +1115,20 @@ fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
     assert_terminal(&mut ctx, low_buy);
     assert_eq!(get_order(&mut ctx, high_buy).status, OrderStatus::Open);
     assert_eq!(wallet(&mut ctx, ALICE), 0);
+
+    let stored = pos(&mut ctx, ALICE);
+    let taker_events = take_position_changes(&mut ctx)
+        .into_iter()
+        .filter(|event| event.user == ALICE)
+        .collect::<Vec<_>>();
+    assert_eq!(taker_events.len(), 1);
+    let event = &taker_events[0];
+    assert_eq!(event.amount, stored.amount);
+    assert_eq!(event.vQuoteBalance, stored.v_quote_balance);
+    assert_eq!(event.margin, stored.margin);
+    assert_eq!(event.marginReserved, stored.margin_reserved);
+    assert_eq!(event.feeReserved, stored.fee_reserved);
+    assert_eq!(event.leverage, stored.leverage);
 }
 
 #[test]
@@ -1851,8 +1878,13 @@ fn accepted_resting_placement_emits_exactly_one_order_placed() {
     let logs = take_event_names(&mut ctx);
     assert_eq!(
         logs,
-        vec!["OrderPlaced", "AccountBalanceChanged", "OrderRested"],
-        "a resting GTC emits OrderPlaced, the margin debit's balance change, then OrderRested"
+        vec![
+            "OrderPlaced",
+            "AccountBalanceChanged",
+            "OrderRested",
+            "PositionChanged",
+        ],
+        "a resting GTC emits OrderPlaced, balance and rest events, then the position after-image"
     );
 
     // PostOnly never calls match_order → rest_in_book's apply block is the ONLY flush site.
@@ -1860,8 +1892,13 @@ fn accepted_resting_placement_emits_exactly_one_order_placed() {
     let logs = take_event_names(&mut ctx);
     assert_eq!(
         logs,
-        vec!["OrderPlaced", "AccountBalanceChanged", "OrderRested"],
-        "a resting PostOnly emits OrderPlaced, the margin debit's balance change, then OrderRested"
+        vec![
+            "OrderPlaced",
+            "AccountBalanceChanged",
+            "OrderRested",
+            "PositionChanged",
+        ],
+        "a resting PostOnly emits OrderPlaced, balance and rest events, then the position after-image"
     );
 }
 
@@ -1927,6 +1964,7 @@ fn cancel_resting_order_releases_margin_and_clears_book() {
         wallet(&mut ctx, ALICE) < WALLET,
         "margin should be reserved"
     );
+    take_position_changes(&mut ctx);
 
     let input = cancelOrderCall {
         orderId: id.into(),
@@ -1940,6 +1978,13 @@ fn cancel_resting_order_releases_margin_and_clears_book() {
     assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
         .unwrap()
         .is_empty());
+    let stored = pos(&mut ctx, ALICE);
+    let events = take_position_changes(&mut ctx);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].marginReserved, stored.margin_reserved);
+    assert_eq!(events[0].feeReserved, stored.fee_reserved);
+    assert_eq!(events[0].marginReserved, 0);
+    assert_eq!(events[0].feeReserved, 0);
 }
 
 #[test]

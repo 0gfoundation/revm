@@ -20,6 +20,7 @@
 pub mod account;
 pub mod batch;
 pub mod call;
+mod events;
 pub mod funding;
 pub mod host;
 pub mod interface;

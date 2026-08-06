@@ -1459,6 +1459,7 @@ fn cancel_order_core<H: PerpHost>(
         &market,
         // Explicit cancel: no matching ran in this call, so the BBO cache is live.
         remove_from_book_after_cancel,
+        true,
     )?;
     Ok(Bytes::new())
 }
@@ -2313,6 +2314,7 @@ fn rest_in_book<H: PerpHost>(
     // Resting only touches the margin/reservation fields, so this skips save_position's
     // old-position re-read + `amount` zero-crossing registry hooks (dead work here) and moves the
     // position in by value instead of cloning it.
+    let position_changed = crate::events::position_changed_log(user, market_id, &pos, 0, 0);
     storage::save_position_reservation_only(context, user, market_id, pos)?;
     storage::save_account(context, user, account)?;
 
@@ -2330,6 +2332,7 @@ fn rest_in_book<H: PerpHost>(
         }
         .to_log_data(),
     });
+    context.log(position_changed);
 
     Ok(())
 }
@@ -2356,12 +2359,21 @@ pub(super) fn execute_order_cancellation<H: PerpHost, F>(
     order: Order,
     market: &crate::types::Market,
     remove: F,
+    emit_position_state: bool,
 ) -> Result<(), PerpError>
 where
     F: FnOnce(&mut H, u64, Side, u64, &[u8; 32]) -> Result<(), PerpError>,
 {
     remove(context, market_id, order.side, order.price, &order_id)?;
-    release_margin_for_cancelled_order(context, user, market_id, order.side, &order_id, market)?;
+    let position_changed = release_margin_for_cancelled_order(
+        context,
+        user,
+        market_id,
+        order.side,
+        &order_id,
+        market,
+        emit_position_state,
+    )?;
     // delete-on-terminal: the cancelled/expired order is removed from the map. Its id may linger in
     // the level FIFO (lazy-queue) until a match walk sweeps it; `remove` already decremented the
     // level's live count. The Cancelled/Expired distinction (previously only the saved status; the
@@ -2376,6 +2388,9 @@ where
         }
         .to_log_data(),
     });
+    if let Some(position_changed) = position_changed {
+        context.log(position_changed);
+    }
     Ok(())
 }
 
@@ -2526,7 +2541,8 @@ pub(super) fn release_margin_for_cancelled_order<H: PerpHost>(
     side: Side,
     order_id: &[u8; 32],
     market: &crate::types::Market,
-) -> Result<(), PerpError> {
+    emit_position_state: bool,
+) -> Result<Option<Log>, PerpError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     let (bd, pd) = (market.base_decimals, market.price_decimals);
 
@@ -2601,10 +2617,12 @@ pub(super) fn release_margin_for_cancelled_order<H: PerpHost>(
         &cancelled_entry,
         market,
     )?;
+    let position_changed = emit_position_state
+        .then(|| crate::events::position_changed_log(user, market_id, &pos, 0, 0));
     storage::save_position(context, user, market_id, &pos)?;
     // In-place wallet credit (no UserAccount/String load+save clone pair).
     storage::mutate_account_balance(context, user, |a| a.credit_perp(total_freed))??;
-    Ok(())
+    Ok(position_changed)
 }
 
 /// PURE core of [`release_margin_for_cancelled_order`] (commit-only #23, tranche-4): removes the

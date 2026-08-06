@@ -97,6 +97,7 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         pos.v_quote_balance = 0;
         pos.margin = 0;
         storage::save_position(context, user, market.market_id, &pos)?;
+        crate::events::emit_position_changed(context, user, market.market_id, &pos, 0, 0);
     }
 
     Ok(remaining)
@@ -166,7 +167,7 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
     storage::save_account(context, user, account)?;
 
     super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
-    emit_position_changed(
+    crate::events::emit_position_changed(
         context,
         user,
         market.market_id,
@@ -298,7 +299,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             }
             .to_log_data(),
         });
-        emit_position_changed(
+        crate::events::emit_position_changed(
             context,
             loser,
             market.market_id,
@@ -306,7 +307,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             fill.loser_realized_pnl,
             fill.quantity,
         );
-        emit_position_changed(
+        crate::events::emit_position_changed(
             context,
             winner,
             market.market_id,
@@ -379,28 +380,4 @@ fn adl_fill(
         t -= 1;
     }
     Ok(None)
-}
-
-fn emit_position_changed<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    market_id: u64,
-    pos: &crate::types::PerpPosition,
-    realized_pnl: i64,
-    closed_quantity: u64,
-) {
-    context.log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::PositionChanged {
-            user,
-            marketId: market_id,
-            amount: pos.amount,
-            vQuoteBalance: pos.v_quote_balance,
-            margin: pos.margin,
-            leverage: pos.leverage,
-            realizedPnl: realized_pnl,
-            closedQuantity: closed_quantity,
-        }
-        .to_log_data(),
-    });
 }
