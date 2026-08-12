@@ -1561,3 +1561,204 @@ fn liquidate_refunds_reserved_margin_before_market_close() {
     );
     assert_eq!(position(&mut ctx, ALICE).margin_reserved, 0);
 }
+
+// ── mark_price > 0 is a MARKET-LIFETIME INVARIANT ───────────────────────────
+//
+// Every market that exists has a non-zero mark, and no reachable call can zero it:
+//   * `addMarket` rejects `initialMarkPrice == 0` and stores it as the market's mark;
+//   * `updateMarket` never touches `mark_price`;
+//   * `updateIndexPrice` rejects `indexPrice == 0`, and each of the three mark
+//     components is floored away from zero (`price1`/`price2` via `.max(1)`,
+//     `contract_price` falls back to the non-zero index before any trade), so their
+//     median is >= 1 and the tick-snap floor keeps it >= `tick_size`.
+//
+// These tests pin that chain. Margin/risk math is allowed to treat a live market's
+// mark as non-zero — the `mark_price > 0` guards elsewhere are defensive only, and
+// reachable exclusively by writing a mark-0 Market straight to storage (which the
+// `*_when_mark_price_unset` tests do deliberately). If any of these fail, that
+// assumption is broken and every consumer of the mark must be re-audited.
+
+/// The `addMarket` gas floor from the selector table.
+const ADD_MARKET_GAS: u64 = 100_000;
+
+/// A valid `addMarket` payload for `market_id`, parameterised on the initial mark.
+fn add_market_call(market_id: u64, initial_mark_price: u64) -> Vec<u8> {
+    crate::interface::IPerpDex::addMarketCall {
+        marketId: market_id,
+        baseDecimals: 0,
+        priceDecimals: PRICE_DECIMALS,
+        tickSize: 1,
+        stepSize: 1,
+        minQuantity: 1,
+        maxQuantity: 1_000_000,
+        maxPrice: 1_000_000,
+        priceUpdateInterval: 15,
+        fundingInterval: 0,
+        interestRate: 0,
+        liquidationFeeRateBps: 0,
+        initialMarkPrice: initial_mark_price,
+        priceBandBps: 0,
+    }
+    .abi_encode()
+}
+
+fn call_add_market(ctx: &mut TestCtx, market_id: u64, initial_mark_price: u64) -> Bytes {
+    let output = run_perp_dex_call(
+        &add_market_call(market_id, initial_mark_price),
+        ADD_MARKET_GAS,
+        ADMIN,
+        U256::ZERO,
+        false,
+        ctx,
+    )
+    .unwrap();
+    assert!(
+        !output.reverted,
+        "addMarket reverted: {:?}",
+        String::from_utf8_lossy(output.bytes.as_ref())
+    );
+    output.bytes
+}
+
+#[test]
+fn add_market_rejects_zero_initial_mark_price() {
+    let mut ctx = make_ctx();
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+
+    let output = run_perp_dex_call(
+        &add_market_call(7, 0),
+        ADD_MARKET_GAS,
+        ADMIN,
+        U256::ZERO,
+        false,
+        &mut ctx,
+    )
+    .unwrap();
+
+    assert!(output.reverted, "a zero initialMarkPrice must be rejected");
+    let reason = String::from_utf8_lossy(output.bytes.as_ref()).to_string();
+    assert!(
+        reason.contains("initialMarkPrice must be > 0"),
+        "unexpected revert reason: {reason}"
+    );
+    // Rejected pre-write: no market was created.
+    assert!(storage::load_market(&mut ctx, 7).unwrap().is_none());
+}
+
+#[test]
+fn add_market_stores_a_nonzero_mark_price() {
+    let mut ctx = make_ctx();
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+
+    call_add_market(&mut ctx, 7, ENTRY_PRICE);
+
+    assert_eq!(
+        storage::load_mark_price(&mut ctx, 7).unwrap(),
+        ENTRY_PRICE,
+        "the initial mark must be the market's mark from creation"
+    );
+}
+
+#[test]
+fn mark_price_stays_nonzero_across_index_updates() {
+    let mut ctx = make_ctx();
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+    call_add_market(&mut ctx, 7, ENTRY_PRICE);
+
+    // Walk the mark down toward zero with the smallest index the market accepts (1 tick).
+    // No trade has happened, so contract_price falls back to the index — this is the
+    // component combination most likely to floor at zero if the guards were missing.
+    let mut ts = 15u64;
+    for index_price in [ENTRY_PRICE / 2, ENTRY_PRICE / 10, 100, 10, 1] {
+        let output = run_perp_dex_call(
+            &updateIndexPriceCall {
+                marketId: 7,
+                indexPrice: index_price,
+                timestamp: ts,
+            }
+            .abi_encode(),
+            50_000,
+            ADMIN,
+            U256::ZERO,
+            false,
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(
+            !output.reverted,
+            "updateIndexPrice({index_price}) reverted: {:?}",
+            String::from_utf8_lossy(output.bytes.as_ref())
+        );
+        let mark = storage::load_mark_price(&mut ctx, 7).unwrap();
+        assert!(
+            mark > 0,
+            "mark hit zero at index {index_price} — the mark>0 invariant is broken"
+        );
+        ts += 15;
+    }
+}
+
+#[test]
+fn update_index_price_rejects_zero_index() {
+    let mut ctx = make_ctx();
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+    call_add_market(&mut ctx, 7, ENTRY_PRICE);
+
+    let output = run_perp_dex_call(
+        &updateIndexPriceCall {
+            marketId: 7,
+            indexPrice: 0,
+            timestamp: 15,
+        }
+        .abi_encode(),
+        50_000,
+        ADMIN,
+        U256::ZERO,
+        false,
+        &mut ctx,
+    )
+    .unwrap();
+
+    assert!(output.reverted, "a zero indexPrice must be rejected");
+    // The mark is untouched by the rejected update.
+    assert_eq!(storage::load_mark_price(&mut ctx, 7).unwrap(), ENTRY_PRICE);
+}
+
+#[test]
+fn update_market_cannot_zero_the_mark_price() {
+    let mut ctx = make_ctx();
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+    call_add_market(&mut ctx, 7, ENTRY_PRICE);
+
+    let output = run_perp_dex_call(
+        &crate::interface::IPerpDex::updateMarketCall {
+            marketId: 7,
+            tickSize: 1,
+            stepSize: 1,
+            minQuantity: 1,
+            maxQuantity: 1_000_000,
+            maxPrice: 1_000_000,
+            priceUpdateInterval: 15,
+            active: true,
+            fundingInterval: 0,
+            interestRate: 0,
+            liquidationFeeRateBps: 0,
+            priceBandBps: 0,
+        }
+        .abi_encode(),
+        ADD_MARKET_GAS,
+        ADMIN,
+        U256::ZERO,
+        false,
+        &mut ctx,
+    )
+    .unwrap();
+    assert!(
+        !output.reverted,
+        "updateMarket reverted: {:?}",
+        String::from_utf8_lossy(output.bytes.as_ref())
+    );
+
+    // updateMarket carries no mark field, so the mark survives untouched.
+    assert_eq!(storage::load_mark_price(&mut ctx, 7).unwrap(), ENTRY_PRICE);
+}
