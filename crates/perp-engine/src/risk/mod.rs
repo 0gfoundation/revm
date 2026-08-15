@@ -20,8 +20,8 @@ use crate::{
         updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
     },
     math::{
-        calc_funding_rate, calc_position_equity, calc_value, checked_u64_to_i64,
-        is_above_maintenance_margin, FUNDING_RATE_ONE,
+        calc_funding_rate, calc_position_equity, calc_value, calc_value_i64, checked_u64_to_i64,
+        is_above_maintenance_margin, max_leverage_for_notional, FUNDING_RATE_ONE,
     },
     storage,
     trading::{
@@ -516,17 +516,35 @@ fn set_leverage_core<H: PerpHost>(
     let market = storage::load_market_ref(context, market_id)?
         .ok_or_else(|| perp_err("setLeverage: unknown market"))?;
 
-    // The cap is tier 0's max_leverage — the market's own risk table is the single source
-    // of truth. Tier 0 covers notional from 0, so it is the loosest cap any position can
-    // enjoy; growing into a higher tier tightens it further (enforced per-open at the
-    // settlement cores). The spec's relation runs table → rate: mmr(0) = 1/(2*L₀), so the
-    // legacy 1/6 rate IS L₀ = 3.
-    let cap = market.tiers.as_slice()[0].max_leverage as u64;
+    let mut pos = storage::load_position(context, account, market_id)?;
+
+    // The cap comes from the market's own risk table — the single source of truth, so the
+    // cap and the maintenance rate can never disagree (mmr(n) = 1/(2*max_leverage(n)); the
+    // legacy 1/6 rate IS L₀ = 3).
+    //
+    // Look the tier up by the position's CURRENT notional rather than hardcoding tier 0.
+    // Tier 0 is merely the value this collapses to in two cases that both happen to hold
+    // today — a single-tier table, and a flat position (notional 0 lands in tier 0) — so
+    // hardcoding it would bake in a special case. Under a real multi-tier table a position
+    // already sitting in a higher bracket must be held to THAT bracket's cap: otherwise a
+    // trader in a 2x tier could set 3x here, and `rebalance_order_margin_for_leverage`
+    // below would release resting-order margin down to the 3x requirement while the
+    // position's bracket demands 2x. (Binance rejects the same call with "exceeded the
+    // maximum allowable position at current leverage".) Same quantity and same helper the
+    // per-open guard uses at the settlement cores, so the two agree by construction.
+    let abs_notional = calc_value_i64(
+        storage::load_mark_price(context, market_id)?,
+        pos.amount,
+        market.base_decimals,
+        market.price_decimals,
+    )?
+    .checked_abs()
+    .ok_or_else(|| perp_err("setLeverage: tier notional abs overflow"))?;
+    let cap = max_leverage_for_notional(&market.tiers, abs_notional) as u64;
     if leverage == 0 || leverage > cap {
         return Err(perp_err(format!("setLeverage: leverage must be 1–{cap}")));
     }
 
-    let mut pos = storage::load_position(context, account, market_id)?;
     let old_leverage = pos.leverage.max(1);
     if pos.amount != 0 && leverage < old_leverage {
         return Err(perp_err(

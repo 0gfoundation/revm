@@ -1288,6 +1288,60 @@ fn set_leverage_cap_follows_the_market_tier_table() {
     assert!(set_leverage(&mut ctx, 2).is_ok(), "2x is the new cap");
 }
 
+/// The cap is looked up by the position's CURRENT notional, not hardcoded to tier 0.
+///
+/// Tier 0 is only what that lookup collapses to for a flat position (notional 0) or a
+/// single-tier table — both true today, which is exactly why hardcoding it would bake in a
+/// special case that silently becomes wrong the moment a real table is configured. A trader
+/// already sitting in a tighter bracket must be held to THAT bracket: otherwise they could
+/// raise leverage past it here and `rebalance_order_margin_for_leverage` would release
+/// resting-order margin down to a requirement their bracket does not allow.
+///
+/// `setup_market` runs base_decimals 0 / price_decimals 2 with mark $100.00, so
+/// `notional = amount * 1e8` in 6-dp quote units: amount 4 → $400 (tier 0), amount 5 → $500
+/// (tier 1).
+#[test]
+fn set_leverage_cap_follows_the_position_s_own_tier_not_tier_zero() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // [0, $500) → 3x ;  [$500, ∞) → 2x
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0, 500_000_000], &[3, 2]).unwrap();
+
+    // Flat: notional 0 lands in tier 0, so the loosest cap applies — this is the case that
+    // makes a hardcoded `tiers[0]` look correct.
+    assert!(
+        set_leverage(&mut ctx, 3).is_ok(),
+        "a flat position gets tier 0's 3x"
+    );
+
+    // Still inside tier 0 at $400.
+    save_position_with_leverage(&mut ctx, 4, -400_000_000, 1);
+    assert!(
+        set_leverage(&mut ctx, 3).is_ok(),
+        "$400 notional is still tier 0"
+    );
+
+    // $500 crosses into tier 1, whose cap is 2x — a hardcoded tiers[0] would wrongly allow 3x.
+    save_position_with_leverage(&mut ctx, 5, -500_000_000, 1);
+    let err = set_leverage(&mut ctx, 3).unwrap_err();
+    assert!(
+        err.to_string().contains("leverage must be 1–2"),
+        "a position in the 2x tier must not be allowed 3x, got {err}"
+    );
+    assert!(
+        set_leverage(&mut ctx, 2).is_ok(),
+        "2x is allowed inside the 2x tier"
+    );
+
+    // A short of the same size is the same notional — the lookup uses |notional|.
+    save_position_with_leverage(&mut ctx, -5, 500_000_000, 1);
+    let err = set_leverage(&mut ctx, 3).unwrap_err();
+    assert!(
+        err.to_string().contains("leverage must be 1–2"),
+        "the tier lookup must be side-agnostic, got {err}"
+    );
+}
+
 // ── setMarginTiers / getMarginTiers ───────────────────────────────────────────
 
 #[test]
