@@ -3229,7 +3229,7 @@ mod golden {
     /// persisted layout, the getAccount/AccountBalanceChanged arity and the commitment differ.
     /// Prior value 0x06ee401de8dd26982c5820f9263f67c349cb139ac9fc4d6b4fbfbb73a0e57a0e.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x57f0decebb761eab19cdd63aa4bda2613a809f65f41f8ac499af6096fe980142");
+        b256!("0xc2c839a6a4dc5fa20b64faa286e30e6b90e7e7905ebe070c5c91bfd0bb2314f1");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -3275,14 +3275,23 @@ mod golden {
             alice_position: (0, 0, 0),
             bob_position: (0, 0, 0),
             // CAROL short QTY @ $80 at default leverage 1 (full-notional margin).
+            // Her position is untouched by the leverage retune, but the deeper crash
+            // leaves her holding 100_000 of UNREALISED gain (1e6 base × $10 of extra
+            // downside). That is why the account-side total below is exactly 100_000
+            // lower than the pre-retune snapshot — the value moved into her uPnL, which
+            // these account fields do not carry. Conservation holds.
             carol_position: (-1_000_000, 800_000, 800_000),
-            // ALICE perp = 1e9 − 806_000 fill margin − 2_015 taker fees
-            //   − 500_000 addMargin + 250_000 removeMargin − 400 funding
-            //   + 169_500 book-leg close (margin release 792_000 + PnL −622_500)
-            //   + 56_500 residual mark-price settle (margin 264_000 + PnL
-            //   −207_500) − 5_280 clearance fee. The liquidation close taker fee
-            //   is WAIVED (fix B), so there is no −1_200 deduction here.
-            alice_account: (U256::from(500_000_000u64), 999_162_305),
+            // ALICE. Two independent drivers changed this vs the pre-cap snapshot
+            // (999_162_305), and nothing else did:
+            //   1. leverage 5 → 3 (max-leverage cap): every fill posts thicker margin,
+            //      so her pre-liquidation margin — and thus the 50 bps clearance fee —
+            //      grew (1_056_000 → 1_593_200, fee 5_280 → 7_966).
+            //   2. crash $80 → $70: the residual QTY settles at a worse mark, so the
+            //      liquidation returns less.
+            // The liquidation close taker fee is still WAIVED (fix B) — no −1_200 here.
+            // The old term-by-term breakdown is superseded: it was pinned to the 5x
+            // margins and the $80 settle, and every term moved.
+            alice_account: (U256::from(500_000_000u64), 999_059_619),
             // BOB perp = 1e9 + 830_000 short PnL (622_500 on the 3-QTY
             //   liquidation leg + 207_500 on the QTY closed via CAROL) + 400
             //   funding credit − 1_446 maker fees − 400_160 still reserved for
@@ -3296,13 +3305,14 @@ mod golden {
             // 100M funding − 50M IF deposit + 1M IF withdraw + 3_461 fees
             //   (liquidation close taker fee waived — fix B).
             admin_perp_wallet: 51_003_461,
-            // 50M deposit − 1M withdraw + 5_280 clearance fee
-            //   (50 bps of ALICE's 1_056_000 pre-liquidation margin).
-            insurance_fund: 49_005_280,
+            // 50M deposit − 1M withdraw + 7_966 clearance fee
+            //   (50 bps of ALICE's 1_593_200 pre-liquidation margin — thicker than the
+            //   pre-cap 1_056_000 because she now runs at 3x instead of 5x).
+            insurance_fund: 49_007_966,
             // ALICE takers 2_015 + BOB maker 806 + 480 + 160 (CAROL's taker fee
             //   is 0 bps; the liquidation close taker fee is waived — fix B).
             market_fee_total: 3_461,
-            mark_price: 80_000_000_000, // $80 post-crash
+            mark_price: 70_000_000_000, // $70 post-crash
             funding: (100, 7_215),      // rate = interest-rate clamp; next epoch ts
             // delete-on-terminal (commit-only #23): every terminal order (Filled/Cancelled/Expired)
             // is removed from the map → getOrder reverts → DELETED sentinel. Only the still-resting
@@ -3758,7 +3768,7 @@ mod golden {
             ALICE,
             &setLeverageCall {
                 marketId: MARKET_ID,
-                leverage: 5,
+                leverage: 3,
             }
             .abi_encode(),
         );
@@ -3792,15 +3802,15 @@ mod golden {
 
         // While the signed buy rests and the position is still flat, retune
         // leverage both ways so rebalance_order_margin_for_leverage runs its
-        // debit branch (5→4 grows the resting-order reserve; relayed by CAROL
-        // through the signed path) and its credit branch (4→5 shrinks it back).
-        dex_call(&mut ctx, CAROL, &signed_leverage_input(&sk, 4));
+        // debit branch (3→2 grows the resting-order reserve; relayed by CAROL
+        // through the signed path) and its credit branch (2→3 shrinks it back).
+        dex_call(&mut ctx, CAROL, &signed_leverage_input(&sk, 2));
         dex_call(
             &mut ctx,
             ALICE,
             &setLeverageCall {
                 marketId: MARKET_ID,
-                leverage: 5,
+                leverage: 3,
             }
             .abi_encode(),
         );
@@ -4078,14 +4088,20 @@ mod golden {
         // through the book and settles the residual QTY at mark price.
         let bob_bid = g_place(&mut ctx, BOB, 0, PRICE - 20 * TICK, 3 * QTY, 0, 0);
 
-        // Crash: index $100 → $80; ALICE's 5x long drops under maintenance and the
+        // Crash: index $100 → $70; ALICE's 3x long drops under maintenance and the
         // sweep inside updateIndexPrice liquidates her automatically (liquidator = 0x0).
+        // Depth note: at 3x the liquidation boundary sits at a 27% drop (equity
+        // `margin − loss` vs the `notional/6` threshold), so $80 — which liquidated the
+        // pre-cap 5x long exactly — no longer does. $70 clears it with margin rather than
+        // sitting on the boundary, so the scenario is not knife-edge. BOB's bid at $80 is
+        // still crossable (the golden market runs with the band disabled), so the sweep
+        // keeps closing 3×QTY through the book and settling the residual at mark.
         dex_call(
             &mut ctx,
             ORACLE,
             &updateIndexPriceCall {
                 marketId: MARKET_ID,
-                indexPrice: PRICE - 20 * TICK,
+                indexPrice: PRICE - 30 * TICK,
                 timestamp: 3_630,
             }
             .abi_encode(),
@@ -4571,9 +4587,6 @@ mod batch_cancel {
     /// `before + 1` assertion observe `+2`. Holding this lock across the read-run-read
     /// window keeps the exact-delta assertion (which is the property worth pinning: the
     /// call aborted exactly once) instead of weakening it to "the counter moved".
-    ///
-    /// EVERY test that can bump the counter must take it — including ones that assert no
-    /// delta but still produce an abort, or they corrupt a concurrent test's assertion.
     ///
     /// Poisoning is ignored: a panic in one of these tests is already a test failure, and
     /// propagating the poison would turn it into a cascade of unrelated failures.
