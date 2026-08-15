@@ -242,12 +242,8 @@ impl TakerSettlement {
                 let (bn, sn, cn) = res?;
                 let mut tp = w.pos.clone();
                 tp.set_reservations(bn, sn, cn, w.pos.leverage);
-                let margin_delta = tp.margin_reserved.saturating_sub(old_mr);
-                let order_fee =
-                    calc_maker_fee_for_order_qty_with_bps(r.price, r.qty, r.maker_fee_bps, market)?;
-                margin_delta
-                    .checked_add(order_fee)
-                    .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?
+                // Margin reservation ONLY — resting escrows no fee (see `rest_in_book`).
+                tp.margin_reserved.saturating_sub(old_mr)
             }
             None => 0,
         };
@@ -317,12 +313,7 @@ impl TakerSettlement {
                 )?;
                 let old_reserved = sim_pos.margin_reserved;
                 sim_pos.set_reservations(bn, sn, cn, sim_pos.leverage);
-                let margin_delta = sim_pos.margin_reserved.saturating_sub(old_reserved);
-                let order_fee =
-                    calc_maker_fee_for_order_qty_with_bps(r.price, r.qty, r.maker_fee_bps, market)?;
-                let delta = margin_delta
-                    .checked_add(order_fee)
-                    .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
+                let delta = sim_pos.margin_reserved.saturating_sub(old_reserved);
                 if !sim_account.has_available_perp(delta) {
                     return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
                 }
@@ -414,12 +405,7 @@ fn rest_is_affordable(
     };
     let mut probe = pos.clone();
     probe.set_reservations(bn, sn, cn, pos.leverage);
-    let margin_delta = probe.margin_reserved.saturating_sub(pos.margin_reserved);
-    let order_fee =
-        calc_maker_fee_for_order_qty_with_bps(rest.price, rest.qty, rest.maker_fee_bps, market)?;
-    let delta = margin_delta
-        .checked_add(order_fee)
-        .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
+    let delta = probe.margin_reserved.saturating_sub(pos.margin_reserved);
     Ok(account.has_available_perp(delta))
 }
 
@@ -477,8 +463,9 @@ pub(super) fn finalize_apply<H: PerpHost>(
     Ok(())
 }
 
-/// Outcome of attempting to settle one maker fill. A maker's trading fee is pre-reserved and
-/// released from `pos.fee_reserved`, not charged from the wallet.
+/// Outcome of attempting to settle one maker fill. A maker's trading fee is charged from the
+/// margin the fill funds (`min(fee, opening_margin)`), the remainder from the wallet — the same
+/// rule the taker path uses. There is no fee escrow.
 pub(super) enum MakerFillOutcome {
     /// The fill was applied; carries the maker's trading fee.
     Filled { maker_fee: u64 },
@@ -1066,6 +1053,26 @@ fn finalize_core(
         is_buy,
     )?;
 
+    // ── Trading fee: charged from the margin this fill just funded (Binance parity) ──
+    // Computed HERE, before K9, because the fee must have LEFT the position margin by the time
+    // maintenance is checked — otherwise a fill could be admitted that is instantly liquidatable.
+    // `fee_from_margin = min(fee, opening_margin)` cannot underflow: `apply_position_fill` just
+    // added the whole `opening_margin` to `pos.margin` (and never leaves `pos.margin` negative),
+    // and a pure close has `opening_margin == 0` → the whole fee falls to the wallet, exactly as
+    // before this change. A flip splits proportionally: the fee is charged on the FULL notional
+    // while only the opening leg funds margin, so a naive `margin -= fee` would over-draw.
+    let fee_notional = closing_value
+        .checked_add(opening_value)
+        .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
+    let fee = calc_trading_fee(fee_notional, taker_fee_bps)?;
+    let fee_from_margin = fee.min(fill_outcome.opening_margin);
+    let fee_from_wallet = fee - fee_from_margin;
+    let from_margin_i64 = checked_u64_to_i64(fee_from_margin, "settlement: fee from margin")?;
+    pos.margin = pos
+        .margin
+        .checked_sub(from_margin_i64)
+        .ok_or_else(|| perp_err("settlement: margin fee underflow"))?;
+
     // Open-into-insolvency guard (K9): a taker may not open/increase a position that is already
     // below maintenance margin at the current mark. Skipped when mark is unset (0). Closing/
     // reducing is never gated: its realized loss beyond margin is legitimate bad debt.
@@ -1125,13 +1132,14 @@ fn finalize_core(
     let mr_extra = new_mr.saturating_sub(old_mr); // MR increased: wallet must cover the gap
     account.credit_perp(mr_credit)?;
 
-    let fee_notional = closing_value
-        .checked_add(opening_value)
-        .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
-    let fee = calc_trading_fee(fee_notional, taker_fee_bps)?;
+    // The wallet funds the opening margin, the reservation growth, and only the part of the fee
+    // the opening margin could not absorb. Conservation: wallet moves by
+    // −(opening_margin + fee_from_wallet + mr_extra), margin by +(opening_margin − fee_from_margin)
+    // and MR by +mr_extra, so the user's net change is exactly −fee — the full amount
+    // `finalize_apply` hands to the fee recipient.
     let total_required = fill_outcome
         .opening_margin
-        .checked_add(fee)
+        .checked_add(fee_from_wallet)
         .ok_or_else(|| perp_err("placeOrder: opening margin + fee overflow"))?
         .checked_add(mr_extra)
         .ok_or_else(|| perp_err("placeOrder: total required overflow"))?;
@@ -1180,6 +1188,28 @@ pub(super) fn settle_maker_fill_core(
     // recomputed as below.
     let old_reserved = pos.margin_reserved;
 
+    // READ-ONLY: locate the maker's book entry and price this fill's share of the order's maker
+    // fee. Done up front because the fee must be charged BEFORE the K9 check below, while the
+    // entry itself may only be reduced once the fill is accepted (a K9 reject leaves the entry in
+    // place for `cancel_rejected_maker_registry` to release).
+    // #B: fill_price == the resting maker's order price (a match executes at the maker's level), so
+    // it is exactly the sort key `entry_fill_plan` binary-searches on.
+    let (entry_idx, entry_new_amount, maker_fee) = entry_fill_plan(
+        match maker_side {
+            Side::Buy => &*buy_entries,
+            Side::Sell => &*sell_entries,
+        },
+        maker_order_id,
+        fill_price,
+        matches!(maker_side, Side::Buy),
+        fill_qty,
+        market,
+        match maker_side {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        },
+    )?;
+
     // Compute the fill on a TRIAL clone first (single computation — adopted verbatim on accept).
     let fill = split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market)?;
     let mut trial_pos = pos.clone();
@@ -1193,6 +1223,24 @@ pub(super) fn settle_maker_fill_core(
         fill.opening_value,
         fill.is_buy,
     )?;
+
+    // ── Maker trading fee: charged from the margin this fill just funded (Binance parity) ──
+    // This is a NEW wallet-side charge, not a deletion: the maker fee used to be pre-escrowed in
+    // `pos.fee_reserved` at placement and merely released here, so nothing debited the maker's
+    // wallet. Now the fee comes out of `opening_margin` first, with only the uncovered part
+    // (the pure-close case, `opening_margin == 0`) falling to the wallet. Applied to the TRIAL
+    // copy so it is already out of `trial_pos.margin` when K9 runs below.
+    let fee_from_margin = maker_fee.min(fill_outcome.opening_margin);
+    let fee_from_wallet = maker_fee - fee_from_margin;
+    let from_margin_i64 = checked_u64_to_i64(fee_from_margin, "settlement: fee from margin")?;
+    let from_wallet_i64 = checked_u64_to_i64(fee_from_wallet, "settlement: fee from wallet")?;
+    trial_pos.margin = trial_pos
+        .margin
+        .checked_sub(from_margin_i64)
+        .ok_or_else(|| perp_err("settlement: margin fee underflow"))?;
+    trial_wallet = trial_wallet
+        .checked_sub(from_wallet_i64)
+        .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
 
     // Open-into-insolvency guard (K9): a fill may not open/increase the maker's position below
     // maintenance margin at the current mark. Skipped when mark == 0. Closing/reducing is never
@@ -1235,21 +1283,19 @@ pub(super) fn settle_maker_fill_core(
     *pos = trial_pos;
     account.perp_wallet_balance = trial_wallet;
 
-    let (entries, label) = match maker_side {
-        Side::Buy => (&mut *buy_entries, "buy"),
-        Side::Sell => (&mut *sell_entries, "sell"),
-    };
-    // #B: fill_price == the resting maker's order price (a match executes at the maker's level), so
-    // it is exactly the sort key reduce_order_entry_core binary-searches on.
-    let maker_fee = reduce_order_entry_core(
-        entries,
-        maker_order_id,
-        fill_price,
-        matches!(maker_side, Side::Buy),
-        fill_qty,
-        market,
-        label,
-    )?;
+    // Apply the entry reduce planned above (the lists were untouched in between, so `entry_idx`
+    // is still valid). Full fill → the entry leaves the list.
+    {
+        let entries = match maker_side {
+            Side::Buy => &mut *buy_entries,
+            Side::Sell => &mut *sell_entries,
+        };
+        if entry_new_amount == 0 {
+            entries.remove(entry_idx);
+        } else {
+            entries[entry_idx].amount = entry_new_amount;
+        }
+    }
 
     // Flip-aware reserve recompute (must follow the entry reduce + reflect the new pos.amount).
     let (buy_notional, sell_notional, c_notional) =
@@ -1262,8 +1308,6 @@ pub(super) fn settle_maker_fill_core(
     )?;
     pos.set_reservations(buy_notional, sell_notional, c_notional, pos.leverage);
     let new_reserved = pos.margin_reserved;
-
-    pos.fee_reserved = pos.fee_reserved.saturating_sub(maker_fee);
 
     // opening_margin ≤ old_reserved is guaranteed; this is how much of old_reserved is free to
     // cover new_reserved after pos.margin is funded.
@@ -1652,20 +1696,26 @@ pub(super) fn apply_position_fill(
 
 // ── Order entry updates after fill ───────────────────────────────────────────
 
-/// PURE core of [`reduce_maker_order_entry_for_fill`] (commit-only #23, tranche-4 step 1):
-/// operates on an in-memory entry list only — no storage access — so the match compute phase can
-/// run it on working copies and the storage wrapper above runs it in the journal overlay. Shrinks
-/// the entry by `fill_qty`, removes it at zero, returns the released fee reservation.
+/// READ-ONLY plan for shrinking a maker's book entry by `fill_qty`. Returns
+/// `(index, post-fill amount, this fill's maker fee)` and touches nothing, so the caller can price
+/// and GATE the fill (K9 runs on a position the fee has already left) before committing to the
+/// mutation — and so a K9 reject leaves the entry intact for the cancel path to release.
+///
+/// The fee is the DIFFERENCE between the whole order's fee at its pre- and post-fill amounts,
+/// never `calc_trading_fee(fill notional)`: differencing two whole-order fees makes the per-fill
+/// fees of a partially-filled order sum EXACTLY to the order's total fee, with no floor-composition
+/// drift across partial fills. (Under the old escrow this same quantity was the amount RELEASED
+/// from `pos.fee_reserved`; it is unchanged — only its funding source moved.)
 #[allow(clippy::too_many_arguments)]
-pub(super) fn reduce_order_entry_core(
-    entries: &mut std::collections::VecDeque<crate::types::OrderEntry>,
+fn entry_fill_plan(
+    entries: &std::collections::VecDeque<crate::types::OrderEntry>,
     order_id: &[u8; 32],
     price: u64,
     buy_side: bool,
     fill_qty: u64,
     market: &crate::types::Market,
     side_label: &str,
-) -> Result<u64, PerpError> {
+) -> Result<(usize, u64, u64), PerpError> {
     // #B: binary-search to the maker's price (known = the matched level) then scan the tiny
     // same-price run — O(log n) instead of the O(n) id scan; full-fill removal is O(1)-ish
     // VecDeque::remove instead of the O(n) retain.
@@ -1685,13 +1735,7 @@ pub(super) fn reduce_order_entry_core(
     let new_amount = e_amount.saturating_sub(fill_qty);
     let new_order_fee =
         calc_maker_fee_for_order_qty_with_bps(e_price, new_amount, e_fee_bps, market)?;
-    let fee_released = old_order_fee.saturating_sub(new_order_fee);
-    if new_amount == 0 {
-        entries.remove(idx);
-    } else {
-        entries[idx].amount = new_amount;
-    }
-    Ok(fee_released)
+    Ok((idx, new_amount, old_order_fee.saturating_sub(new_order_fee)))
 }
 
 /// Routes position **bad debt** — a realized loss beyond the position's own margin —

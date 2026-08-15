@@ -31,7 +31,7 @@ use crate::{
         getOrderCall, getOrderReturn, placeOrderCall, placeOrderSignedCall, PlaceItem,
     },
     math::{
-        calc_maker_fee_for_order_qty_with_bps, calc_trading_fee,
+        calc_trading_fee,
         calc_value,
     },
     risk::record_mid_price_sample_for_best_quote_change,
@@ -2151,9 +2151,6 @@ fn rest_in_book<H: PerpHost>(
                     pd,
                     pos_amount,
                 )?;
-            // Reuse the maker_fee_bps already read from `account` (no internal fee-rate re-load).
-            let order_fee_reserved =
-                calc_maker_fee_for_order_qty_with_bps(price, qty, maker_fee_bps, market)?;
             // Adding an order can only grow the buy-side notional (checked before
             // set_reservations overwrites the stored value).
             if new_buy_side_notional < pos.buy_side_reserved_notional {
@@ -2170,19 +2167,14 @@ fn rest_in_book<H: PerpHost>(
             let leverage = pos.leverage;
             pos.set_reservations(new_buy_side_notional, sell_notional, c_notional, leverage);
             let new_reserved = pos.margin_reserved;
-            let margin_delta = new_reserved.saturating_sub(old_reserved);
-            let delta = margin_delta
-                .checked_add(order_fee_reserved)
-                .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
+            // Margin reservation ONLY — placement no longer withholds the order's prospective
+            // trading fee (Binance parity: the fee is charged out of the margin the FILL funds).
+            let delta = new_reserved.saturating_sub(old_reserved);
 
             if !account.has_available_perp(delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
             account.debit_perp(delta)?;
-            pos.fee_reserved = pos
-                .fee_reserved
-                .checked_add(order_fee_reserved)
-                .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
             // #A: commit the maintained buy aggregates (op accepted).
             pos.total_buy_qty = new_tbq;
             pos.total_buy_notional = new_tbn;
@@ -2254,9 +2246,6 @@ fn rest_in_book<H: PerpHost>(
                     pd,
                     pos_amount,
                 )?;
-            // Reuse the maker_fee_bps already read from `account` (no internal fee-rate re-load).
-            let order_fee_reserved =
-                calc_maker_fee_for_order_qty_with_bps(price, qty, maker_fee_bps, market)?;
             // Adding an order can only grow the sell-side notional (checked before
             // set_reservations overwrites the stored value).
             if new_sell_side_notional < pos.sell_side_reserved_notional {
@@ -2273,19 +2262,13 @@ fn rest_in_book<H: PerpHost>(
             let leverage = pos.leverage;
             pos.set_reservations(buy_notional, new_sell_side_notional, c_notional, leverage);
             let new_reserved = pos.margin_reserved;
-            let margin_delta = new_reserved.saturating_sub(old_reserved);
-            let delta = margin_delta
-                .checked_add(order_fee_reserved)
-                .ok_or_else(|| perp_err("placeOrder: reserve delta overflow"))?;
+            // Margin reservation ONLY — see the buy arm.
+            let delta = new_reserved.saturating_sub(old_reserved);
 
             if !account.has_available_perp(delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
             account.debit_perp(delta)?;
-            pos.fee_reserved = pos
-                .fee_reserved
-                .checked_add(order_fee_reserved)
-                .ok_or_else(|| perp_err("placeOrder: fee reserve overflow"))?;
             // #A: commit the maintained sell aggregates (op accepted).
             pos.total_sell_qty = new_tsq;
             pos.total_sell_notional = new_tsn;
@@ -2593,14 +2576,7 @@ pub(super) fn release_margin_for_cancelled_order<H: PerpHost>(
     drop(buy_ref);
     drop(sell_ref);
 
-    let total_freed = apply_release_effect(
-        &mut pos,
-        buy_notional,
-        sell_notional,
-        c_notional,
-        &cancelled_entry,
-        market,
-    )?;
+    let total_freed = apply_release_effect(&mut pos, buy_notional, sell_notional, c_notional);
     storage::save_position(context, user, market_id, &pos)?;
     // In-place wallet credit (no UserAccount/String load+save clone pair).
     storage::mutate_account_balance(context, user, |a| a.credit_perp(total_freed))??;
@@ -2608,7 +2584,7 @@ pub(super) fn release_margin_for_cancelled_order<H: PerpHost>(
 }
 
 /// PURE core of [`release_margin_for_cancelled_order`] (commit-only #23, tranche-4): removes the
-/// entry, recomputes the flip-aware reservation, and credits the freed margin + fee reservation —
+/// entry, recomputes the flip-aware reservation, and credits the freed margin —
 /// over in-memory working copies only, NO storage access. The match compute phase runs this to
 /// simulate the taker wallet-cover LIFO cancels (and plan them) before any write.
 ///
@@ -2624,13 +2600,13 @@ pub(super) fn release_margin_core(
     order_id: &[u8; 32],
     market: &crate::types::Market,
 ) -> Result<(), PerpError> {
-    let cancelled_entry = {
+    {
         let (entries, label) = match side {
             Side::Buy => (&mut *buy_entries, "buy"),
             Side::Sell => (&mut *sell_entries, "sell"),
         };
-        remove_order_entry(entries, order_id, label)?
-    };
+        remove_order_entry(entries, order_id, label)?;
+    }
     let (buy_notional, sell_notional, c_notional) =
         crate::math::calc_reservation_notionals_it(
             buy_entries.iter().copied(),
@@ -2639,33 +2615,28 @@ pub(super) fn release_margin_core(
             market.price_decimals,
             pos.amount,
         )?;
-    let total_freed = apply_release_effect(
-        pos,
-        buy_notional,
-        sell_notional,
-        c_notional,
-        &cancelled_entry,
-        market,
-    )?;
+    let total_freed = apply_release_effect(pos, buy_notional, sell_notional, c_notional);
     // Registry path: credit the owned working-copy account (saved once at flush).
     account.credit_perp(total_freed)
 }
 
-/// Applies a cancel's margin release to the POSITION given the POST-cancel reservation notionals +
-/// the cancelled entry: snapshots the flip-aware reservation, drops the fee reservation, and RETURNS
-/// the total amount to credit back to the wallet (freed margin + fee reservation). The CALLER
-/// applies that credit — the registry path onto its owned working-copy account, the storage path via
-/// `mutate_account` (in-place, no owned load+save clone pair) — so this stays account-representation-
-/// agnostic and the freed/fee math has a single source of truth. `old_reserved` is snapshotted here
-/// before `set_reservations`; the preceding entry removal never touches `pos.margin_reserved`.
+/// Applies a cancel's margin release to the POSITION given the POST-cancel reservation notionals:
+/// snapshots the flip-aware reservation, rewrites it, and RETURNS the amount to credit back to the
+/// wallet. The CALLER applies that credit — the registry path onto its owned working-copy account,
+/// the storage path via `mutate_account` (in-place, no owned load+save clone pair) — so this stays
+/// account-representation-agnostic and the freed math has a single source of truth. `old_reserved`
+/// is snapshotted here before `set_reservations`; the preceding entry removal never touches
+/// `pos.margin_reserved`.
+///
+/// Margin is the ONLY thing a cancel releases: placement escrows no trading fee (the fee is charged
+/// at fill time out of the margin the fill funds), so a cancel returns the wallet to EXACTLY its
+/// pre-placement value.
 fn apply_release_effect(
     pos: &mut crate::types::PerpPosition,
     new_buy_notional: u64,
     new_sell_notional: u64,
     new_c_notional: u64,
-    cancelled: &OrderEntry,
-    market: &crate::types::Market,
-) -> Result<u64, PerpError> {
+) -> u64 {
     let old_reserved = pos.margin_reserved;
     pos.set_reservations(
         new_buy_notional,
@@ -2673,25 +2644,7 @@ fn apply_release_effect(
         new_c_notional,
         pos.leverage,
     );
-    let freed = old_reserved.saturating_sub(pos.margin_reserved);
-    let fee_freed = calc_maker_fee_for_order_qty_with_bps(
-        cancelled.price,
-        cancelled.amount,
-        cancelled.maker_fee_bps,
-        market,
-    )?;
-    // Released margin + fee reservation credited in one (mirrors the combined debit on placement).
-    let total_freed = freed
-        .checked_add(fee_freed)
-        .ok_or_else(|| perp_err("cancel: released reserve overflow"))?;
-    // Surface drift instead of masking it (was saturating_sub).
-    let prev_fee = pos.fee_reserved;
-    pos.fee_reserved = prev_fee.checked_sub(fee_freed).ok_or_else(|| {
-        perp_invariant_err(format!(
-            "fee_reserved {prev_fee} < fee to release {fee_freed}"
-        ))
-    })?;
-    Ok(total_freed)
+    old_reserved.saturating_sub(pos.margin_reserved)
 }
 
 // ── FOK / PostOnly pre-checks ─────────────────────────────────────────────────

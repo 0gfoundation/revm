@@ -40,7 +40,7 @@ pub struct UserAccount {
     #[serde(rename = "NO", default)]
     pub nonce: u64,
     // NOTE: the former "TC" (`total_perp_collateral`) aggregate is GONE. It was
-    // `wallet + Σ_positions(margin + margin_reserved + fee_reserved)` — fully derivable from state
+    // `wallet + Σ_positions(margin + margin_reserved)` — fully derivable from state
     // that is already published, used by no protocol rule, yet incrementally maintained on the
     // hottest write paths (an extra account read + clone + write per order rest/cancel). Consumers
     // that want it compute it off-chain from `getAccount` + `getPosition`.

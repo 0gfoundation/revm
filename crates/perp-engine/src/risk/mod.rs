@@ -586,7 +586,6 @@ pub fn run_get_position<H: PerpHost>(
             vQuoteBalance: pos.v_quote_balance,
             margin: pos.margin,
             marginReserved: pos.margin_reserved,
-            feeReserved: pos.fee_reserved,
             leverage: pos.leverage,
         },
     )))
@@ -1241,18 +1240,16 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
         record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, best_ask)?;
     }
 
-    // Recalculate reserves (now 0 since all orders cancelled).
+    // Recalculate reserves (now 0 since all orders cancelled). Margin is the only escrow a
+    // resting order holds — the trading fee is charged at fill time from the margin the fill
+    // funds, never withheld at placement — so the whole reservation goes straight back.
     let mut pos = storage::load_position(context, user, market_id)?;
-    let released = pos
-        .margin_reserved
-        .checked_add(pos.fee_reserved)
-        .ok_or_else(|| perp_err("cancelAllOrders: released reserve overflow"))?;
+    let released = pos.margin_reserved;
     if released > 0 {
         // In-place credit (no UserAccount/String load+save clone pair).
         storage::mutate_account_balance(context, user, |a| a.credit_perp(released))??;
     }
     pos.set_reservations(0, 0, 0, pos.leverage);
-    pos.fee_reserved = 0;
     // #A: both order lists were cleared → the maintained reservation aggregates are now 0.
     pos.total_buy_qty = 0;
     pos.total_buy_notional = 0;

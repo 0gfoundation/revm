@@ -86,6 +86,49 @@ fn admin_can_set_user_fee_rates() {
     assert_eq!(decode_user_fee_rates(&ret), (2, 5));
 }
 
+/// The fee-rate ceiling is 1_000 bps (10%), not the old 100%-of-notional `FEE_BPS_DENOMINATOR`.
+/// Defence in depth only: the binding rule is K9 at fill time (the fee now leaves the position
+/// margin, so `f > 1/(2·L_max)` simply makes a max-leverage open fail maintenance).
+#[test]
+fn set_user_fee_rates_accepts_1000_bps_and_rejects_1001() {
+    let mut ctx = make_ctx(U256::ZERO);
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+
+    run_set_user_fee_rates(
+        &setUserFeeRatesCall {
+            user: ALICE,
+            makerFeeBps: 1_000,
+            takerFeeBps: 1_000,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+    let ret = run_get_user_fee_rates(&getUserFeeRatesCall { user: ALICE }.abi_encode(), &mut ctx)
+        .unwrap();
+    assert_eq!(decode_user_fee_rates(&ret), (1_000, 1_000));
+
+    for (maker, taker) in [(1_001u64, 0u64), (0, 1_001)] {
+        let err = run_set_user_fee_rates(
+            &setUserFeeRatesCall {
+                user: ALICE,
+                makerFeeBps: maker,
+                takerFeeBps: taker,
+            }
+            .abi_encode(),
+            ADMIN,
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("fee bps exceeds 1000"), "{err}");
+    }
+    // The rejected calls left the accepted rates in place.
+    let ret = run_get_user_fee_rates(&getUserFeeRatesCall { user: ALICE }.abi_encode(), &mut ctx)
+        .unwrap();
+    assert_eq!(decode_user_fee_rates(&ret), (1_000, 1_000));
+}
+
 #[test]
 fn deposit_rejects_zero_amount() {
     let mut ctx = make_ctx(U256::from(1_000_000u64));
@@ -307,7 +350,6 @@ fn get_account_reports_available_wallet_net_of_allocations() {
         &crate::types::PerpPosition {
             margin: 40,
             margin_reserved: 10,
-            fee_reserved: 5,
             ..Default::default()
         },
     )

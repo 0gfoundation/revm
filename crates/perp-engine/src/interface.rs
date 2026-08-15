@@ -199,7 +199,6 @@ sol! {
             int64  vQuoteBalance,
             int64  margin,
             uint64 marginReserved,
-            uint64 feeReserved,
             uint64 leverage
         );
         /// Add isolated margin from the caller's perp wallet to an open position.

@@ -492,6 +492,86 @@ fn adl_closes_insolvent_residual_against_opposite_holder_conserving_no_if() {
     );
 }
 
+/// The "holder has open orders" exclusion is asked of the ORDER LISTS, not of
+/// `margin_reserved`. A PURE-REDUCE resting order (fully absorbed by the holder's own position)
+/// reserves ZERO margin, so the reservation proxy would wave such a holder through and ADL would
+/// fill against him without the flip-aware reservation recompute / auto-cancel that v1 exists to
+/// avoid. Before the `fee_reserved` escrow was removed, the ONLY thing catching this case was the
+/// `fee_reserved != 0` half of the old predicate — deleting it without a replacement would have
+/// silently regressed here.
+#[test]
+fn adl_skips_opposite_holder_whose_only_order_reserves_no_margin() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_position_account(
+        &mut ctx,
+        ALICE,
+        QTY,
+        -ENTRY_VALUE,
+        MARGIN,
+        5,
+        USER_WALLET as i64,
+    );
+    // KEEPER: the sole opposite-side holder — 5x short 10 @ $100, deeply profitable once the
+    // mark drops, i.e. exactly the candidate ADL wants. A maker fee rate makes this the case the
+    // OLD `fee_reserved != 0` clause used to catch.
+    seed_position_account(&mut ctx, KEEPER, -QTY, ENTRY_VALUE, MARGIN, 5, 0);
+    storage::save_user_fee_rates(
+        &mut ctx,
+        KEEPER,
+        UserFeeRates {
+            maker_fee_bps: 200,
+            taker_fee_bps: 0,
+        },
+    )
+    .unwrap();
+
+    // A BUY of his whole short is PURE REDUCE: it opens no new exposure, so it reserves nothing.
+    // $80 is deep enough to sit below the fill-time band (the sweep bands against the pre-update
+    // mark of $100, so ±10% = [$90, $110]), which is what keeps the liquidation's market sell
+    // from simply eating this bid — the whole residual has to reach ADL for the predicate to be
+    // exercised. It does not move the mark: price1 and the contract price both stay at the index,
+    // so their median is the index regardless of the basis this bid contributes.
+    place_order(&mut ctx, KEEPER, 0, 8_000, QTY as u64);
+    let keeper_pos = position(&mut ctx, KEEPER);
+    assert_eq!(
+        keeper_pos.margin_reserved, 0,
+        "pure-reduce order must reserve no margin — this is what makes the \
+         `margin_reserved != 0` proxy insufficient"
+    );
+    assert_eq!(wallet(&mut ctx, KEEPER), 0, "and cost nothing to place");
+
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let value_before = conservation_sum(&mut ctx, &[ALICE, KEEPER]);
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: 7_500,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // The only opposite holder is excluded → the insolvent residual DEFERS, exactly as if no
+    // counterparty existed. Nothing moved on either side.
+    assert_eq!(
+        position(&mut ctx, ALICE).amount,
+        QTY,
+        "residual must defer — the order-holding counterparty is not eligible"
+    );
+    assert_eq!(
+        position(&mut ctx, KEEPER).amount,
+        -QTY,
+        "order-holding holder must not be ADL'd"
+    );
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), if_before);
+    assert_eq!(conservation_sum(&mut ctx, &[ALICE, KEEPER]), value_before);
+}
+
 #[test]
 fn adl_defers_insolvent_residual_when_no_eligible_opposite_holder() {
     let mut ctx = make_ctx();

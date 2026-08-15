@@ -190,8 +190,8 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
 /// for the whole `updateIndexPrice`). Any residual left unclosed (budget exhausted, or
 /// not enough deeply-in-profit opposite holders) stays open and is re-swept next update.
 ///
-/// v1 simplifications: (a) opposite holders with open orders (`margin_reserved` /
-/// `fee_reserved` > 0) are excluded, so no flip-aware reservation recompute / order
+/// v1 simplifications: (a) opposite holders holding ANY resting order (asked of the order
+/// lists directly) are excluded, so no flip-aware reservation recompute / order
 /// auto-cancel is needed — the residual's natural counterparties are the off-book
 /// holders anyway; (b) opposite holders that are themselves below water are skipped
 /// (the sweep liquidates them), never forced into bad debt; cascades from ADL'ing a
@@ -232,8 +232,14 @@ pub(crate) fn run_adl<H: PerpHost>(
         if wp.amount == 0 || (wp.amount > 0) == loser_is_long {
             continue; // flat or same side as the loser
         }
-        if wp.margin_reserved != 0 || wp.fee_reserved != 0 {
-            continue; // v1: has open orders — skip (avoid reservation recompute)
+        // v1: skip holders with ANY resting order — avoids the flip-aware reservation recompute /
+        // order auto-cancel an ADL fill on them would require. Asked DIRECTLY of the order lists,
+        // not proxied through `margin_reserved != 0`: a PURE-REDUCE order (fully absorbed by the
+        // position) reserves ZERO margin, so the reservation proxy would let such a holder through.
+        if !storage::load_buy_orders_ref(context, user, market.market_id)?.is_empty()
+            || !storage::load_sell_orders_ref(context, user, market.market_id)?.is_empty()
+        {
+            continue;
         }
         let eq_mark =
             calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;

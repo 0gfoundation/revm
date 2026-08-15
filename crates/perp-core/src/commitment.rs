@@ -29,7 +29,7 @@ use primitives::{B256, U256};
 // Margin tiers (Phase 1): bumped 13→14 for the `tiers` field appended to the `Market` blob — every
 // stored market blob grows by its (default, single-tier) table. CHAIN change; behaviour is
 // arithmetically identical (mmr = 1/(2*3) = 1/6 == the deleted MAINTENANCE_MARGIN_DENOMINATOR).
-pub const BLOCK_COMMITMENT_VERSION: u8 = 14;
+pub const BLOCK_COMMITMENT_VERSION: u8 = 15;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

@@ -18,6 +18,17 @@ pub const CLAMP_LOWER_BOUND: i64 = -500; // -0.05%
 /// Trading fee denominator. 1 basis point = 1 / 10_000.
 pub const FEE_BPS_DENOMINATOR: u64 = 10_000;
 
+/// Hard ceiling accepted by `setUserFeeRates` for either fee rate: 1_000 bps = 10% of notional.
+///
+/// Defence in depth, NOT the binding rule. The trading fee is charged out of the margin the fill
+/// funds (`fee_from_margin = min(fee, opening_margin)`), so for a max-leverage open to survive the
+/// K9 maintenance check the rate must satisfy `f ≤ 1/(2·L_max)` — the tier's maintenance rate,
+/// `1/6 ≈ 1_666 bps` at the default `L_max = 3`. K9 enforces exactly that at FILL time, per market
+/// and per position size (the tier table can lower `L_max`, raising the real bound). This static
+/// cap only removes the absurd end of the range: the previous bound was `FEE_BPS_DENOMINATOR`,
+/// i.e. a 100%-of-notional fee.
+pub const MAX_USER_FEE_BPS: u64 = 1_000;
+
 /// Default price-band half-width (basis points) used when a market's
 /// `price_band_bps` is left at `0`. 1_000 bps = ±10%.
 pub const DEFAULT_PRICE_BAND_BPS: u32 = 1_000;

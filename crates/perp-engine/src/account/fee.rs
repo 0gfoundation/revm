@@ -8,7 +8,7 @@ use crate::{
     interface::IPerpDex::{
         self, getUserFeeRatesCall, getUserFeeRatesReturn, setUserFeeRatesCall,
     },
-    math::FEE_BPS_DENOMINATOR,
+    math::MAX_USER_FEE_BPS,
     storage,
     types::UserFeeRates,
     PERP_DEX_ADDRESS,
@@ -27,8 +27,8 @@ pub fn run_set_user_fee_rates<H: PerpHost>(
     if args.user == Address::ZERO {
         return Err(perp_err("setUserFeeRates: user cannot be zero address"));
     }
-    if args.makerFeeBps > FEE_BPS_DENOMINATOR || args.takerFeeBps > FEE_BPS_DENOMINATOR {
-        return Err(perp_err("setUserFeeRates: fee bps exceeds 100%"));
+    if args.makerFeeBps > MAX_USER_FEE_BPS || args.takerFeeBps > MAX_USER_FEE_BPS {
+        return Err(perp_err("setUserFeeRates: fee bps exceeds 1000 (10%)"));
     }
 
     let rates = UserFeeRates {

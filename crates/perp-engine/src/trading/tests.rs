@@ -634,8 +634,9 @@ fn resting_buy_reserves_margin_from_perp_wallet() {
 
     // buy_side_margin_reserved = calc_value(PRICE, QTY, 8, 9) / leverage(1) = FILL_VALUE
     assert_eq!(pos(&mut ctx, ALICE).buy_side_margin_reserved, INIT_MARGIN);
-    assert_eq!(pos(&mut ctx, ALICE).fee_reserved, MAKER_FEE);
-    assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN - MAKER_FEE);
+    // Margin is the ONLY escrow: the prospective maker fee is NOT withheld at placement
+    // (it is charged out of the margin the fill funds).
+    assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN);
 }
 
 #[test]
@@ -647,8 +648,8 @@ fn resting_sell_reserves_margin_from_perp_wallet() {
 
     // sell_side_margin_reserved = calc_value(PRICE, QTY, 8, 9) / leverage(1) = FILL_VALUE
     assert_eq!(pos(&mut ctx, BOB).sell_side_margin_reserved, INIT_MARGIN);
-    assert_eq!(pos(&mut ctx, BOB).fee_reserved, MAKER_FEE);
-    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN - MAKER_FEE);
+    // No fee escrow at placement — see the buy-side twin above.
+    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
 }
 
 #[test]
@@ -688,12 +689,7 @@ fn margin_uses_market_price_decimals() {
         pos(&mut ctx, ALICE).buy_side_margin_reserved,
         expected_margin
     );
-    let expected_maker_fee = 0;
-    assert_eq!(pos(&mut ctx, ALICE).fee_reserved, expected_maker_fee);
-    assert_eq!(
-        wallet(&mut ctx, ALICE),
-        200_000_000 - expected_margin - expected_maker_fee
-    );
+    assert_eq!(wallet(&mut ctx, ALICE), 200_000_000 - expected_margin);
 }
 
 #[test]
@@ -774,8 +770,8 @@ fn matched_call_emits_a_balance_event_at_each_balance_moving_write() {
     // deliberate trade: a duplicate event is harmless, a MISSED one would not be.
     //
     // Here: ADMIN's fee credit lands first, then the settlement flush saves each touched account —
-    // BOB (the maker, whose wallet did not actually move: his margin and fee were debited into
-    // `margin_reserved`/`fee_reserved` back at placement) and the taker.
+    // BOB (the maker, whose wallet did not actually move: the fill converts his `margin_reserved`
+    // into position margin one-for-one, and his fee is charged out of that margin) and the taker.
     assert_eq!(
         events.iter().map(|e| e.user).collect::<Vec<_>>(),
         vec![ADMIN, BOB, ALICE, ALICE]
@@ -853,23 +849,37 @@ fn fill_debits_init_margin_from_both_wallets() {
     assert_eq!(wallet(&mut ctx, ADMIN), TAKER_FEE + MAKER_FEE);
 }
 
+/// A maker OPEN fill funds its fee entirely out of the margin the fill itself posts, so it needs
+/// NO free wallet — the property the old `fee_reserved` escrow provided, now provided by the
+/// Binance rule instead. (Was `maker_fill_consumes_reserved_fee_instead_of_position_margin`, which
+/// pinned the escrow; it also ran at MAKER_FEE = 0, so it could not observe the funding source.)
 #[test]
-fn maker_fill_consumes_reserved_fee_instead_of_position_margin() {
+fn maker_open_fill_funds_its_fee_from_margin_needing_no_free_wallet() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
+    storage::save_user_fee_rates(
+        &mut ctx,
+        BOB,
+        UserFeeRates {
+            maker_fee_bps: 200,
+            taker_fee_bps: 0,
+        },
+    )
+    .unwrap();
+    let maker_fee = FILL_VALUE * 200 / 10_000;
 
-    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask reserves margin + maker fee
+    // Drain every spare unit: the reservation is all BOB has left backing this order.
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask reserves margin only
     let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
     bob.perp_wallet_balance = 0;
     storage::save_account(&mut ctx, BOB, bob).unwrap();
 
-    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy fills him
 
     let bob_pos = pos(&mut ctx, BOB);
-    assert_eq!(bob_pos.margin, INIT_MARGIN as i64);
-    assert_eq!(bob_pos.fee_reserved, 0);
+    assert_eq!(bob_pos.margin, (INIT_MARGIN - maker_fee) as i64);
     assert_eq!(wallet(&mut ctx, BOB), 0);
-    assert_eq!(wallet(&mut ctx, ADMIN), TAKER_FEE + MAKER_FEE);
+    assert_eq!(wallet(&mut ctx, ADMIN), maker_fee);
 }
 
 #[test]
@@ -904,6 +914,241 @@ fn market_fee_total_tracks_collected_maker_and_taker_fees() {
     let expected_total = expected_taker_fee + expected_maker_fee;
     assert_eq!(market_fee_total(&mut ctx), expected_total);
     assert_eq!(wallet(&mut ctx, ADMIN), expected_total);
+}
+
+// ── Fee funding: charged from the margin the fill funds, never escrowed at placement ────────
+// One test per path of `fee_from_margin = min(fee, opening_margin)`.
+
+/// PURE OPEN, taker. Binance parity (`isolatedWallet = Ne/L − f·Ne`): the wallet funds the
+/// opening margin and NOTHING else — the fee is taken out of that margin, not added on top.
+#[test]
+fn taker_open_fill_charges_fee_from_margin_not_on_top_of_the_wallet() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    storage::save_user_fee_rates(
+        &mut ctx,
+        ALICE,
+        UserFeeRates {
+            maker_fee_bps: 0,
+            taker_fee_bps: 100,
+        },
+    )
+    .unwrap();
+    let fee = FILL_VALUE * 100 / 10_000;
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask, maker fee 0
+    let alice_before = wallet(&mut ctx, ALICE);
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy — ALICE is flat, so PURE open
+
+    assert_eq!(
+        alice_before - wallet(&mut ctx, ALICE),
+        INIT_MARGIN,
+        "wallet funds the opening margin ONLY (was margin + fee)"
+    );
+    assert_eq!(
+        pos(&mut ctx, ALICE).margin,
+        (INIT_MARGIN - fee) as i64,
+        "the fee left the position margin"
+    );
+    assert_eq!(
+        wallet(&mut ctx, ADMIN),
+        fee,
+        "the recipient is still paid the FULL fee"
+    );
+}
+
+/// PURE OPEN, maker. The highest-risk arm: this path had no wallet charge at all before (the fee
+/// was released from the `fee_reserved` escrow), so the funding had to be ADDED, not deleted.
+#[test]
+fn maker_open_fill_charges_fee_from_margin_not_from_the_wallet() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    storage::save_user_fee_rates(
+        &mut ctx,
+        BOB,
+        UserFeeRates {
+            maker_fee_bps: 200,
+            taker_fee_bps: 0,
+        },
+    )
+    .unwrap();
+    let fee = FILL_VALUE * 200 / 10_000;
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // rest: margin reserve only, no fee escrow
+    let bob_resting = wallet(&mut ctx, BOB);
+    assert_eq!(bob_resting, WALLET - INIT_MARGIN);
+
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // ALICE takes it (taker fee 0)
+
+    // The reservation converts 1:1 into position margin, so the fill moves the wallet by zero and
+    // the fee is carved out of the margin. BOB's total (wallet + margin) fell by exactly `fee`.
+    assert_eq!(
+        wallet(&mut ctx, BOB),
+        bob_resting,
+        "the fill must not debit the maker's wallet"
+    );
+    assert_eq!(pos(&mut ctx, BOB).margin, (INIT_MARGIN - fee) as i64);
+    assert_eq!(wallet(&mut ctx, ADMIN), fee, "recipient paid in full");
+    assert_eq!(
+        wallet(&mut ctx, BOB) as i64 + pos(&mut ctx, BOB).margin,
+        (WALLET - fee) as i64,
+        "conservation: the maker is down exactly the fee"
+    );
+}
+
+/// PURE CLOSE. `opening_margin == 0` → there is nothing to charge the fee to, so the wallet pays
+/// all of it: behaviour IDENTICAL to before the escrow was removed.
+#[test]
+fn pure_close_fill_charges_the_whole_fee_to_the_wallet() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    storage::save_user_fee_rates(
+        &mut ctx,
+        ALICE,
+        UserFeeRates {
+            maker_fee_bps: 0,
+            taker_fee_bps: 100,
+        },
+    )
+    .unwrap();
+    let fee = FILL_VALUE * 100 / 10_000;
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // ALICE long QTY
+    let margin_held = pos(&mut ctx, ALICE).margin; // INIT_MARGIN − the opening fee
+    let alice_before = wallet(&mut ctx, ALICE);
+
+    place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0); // BOB bids (pure reduce of his short)
+    place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0); // ALICE sells — PURE close at zero PnL
+
+    let alice = pos(&mut ctx, ALICE);
+    assert_eq!((alice.amount, alice.margin), (0, 0));
+    assert_eq!(
+        wallet(&mut ctx, ALICE) as i64 - alice_before as i64,
+        margin_held - fee as i64,
+        "the close returns its margin and the wallet pays the whole fee"
+    );
+    assert_eq!(wallet(&mut ctx, ADMIN), fee * 2);
+}
+
+/// FLIP: one fill that closes part of a position and opens the rest, with the fee charged on the
+/// FULL notional. This is the case a naive `margin -= fee` gets wrong — the fee here EXCEEDS the
+/// opening margin, so it must split. `min()` bounds the margin draw, the remainder goes to the
+/// wallet, and nothing underflows. (`mark_price` is 0 in this fixture, so K9 is not in play; the
+/// ordering of the fee against K9 is a separate concern from this arithmetic.)
+#[test]
+fn flip_fill_splits_the_fee_between_margin_and_wallet_without_underflow() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    fund(&mut ctx, ALICE, 90_000_000);
+    fund(&mut ctx, BOB, 90_000_000);
+    let funded = (WALLET + 90_000_000) as i64;
+    storage::save_user_fee_rates(
+        &mut ctx,
+        ALICE,
+        UserFeeRates {
+            maker_fee_bps: 0,
+            taker_fee_bps: 1_000, // 10% — the tightened ceiling
+        },
+    )
+    .unwrap();
+
+    // ALICE opens long 10·QTY (notional 10 USDC at leverage 1).
+    place(&mut ctx, BOB, 1, PRICE, QTY * 10, 0, 0);
+    place(&mut ctx, ALICE, 0, PRICE, QTY * 10, 0, 0);
+    let open_fee = FILL_VALUE * 10 * 1_000 / 10_000; // 1_000_000
+    assert_eq!(
+        pos(&mut ctx, ALICE).margin,
+        (FILL_VALUE * 10 - open_fee) as i64
+    );
+
+    // Now sell 11·QTY into a resting bid: closes the 10 long and opens 1 short.
+    place(&mut ctx, BOB, 0, PRICE, QTY * 11, 0, 0);
+    let margin_before = pos(&mut ctx, ALICE).margin; // 9_000_000
+    let wallet_before = wallet(&mut ctx, ALICE) as i64;
+    place(&mut ctx, ALICE, 1, PRICE, QTY * 11, 0, 0);
+
+    // Fee is on the FULL 11 units; only the 1-unit opening leg funds margin.
+    let flip_fee = FILL_VALUE * 11 * 1_000 / 10_000; // 1_100_000
+    let opening_margin = FILL_VALUE; // 1 unit at leverage 1
+    let fee_from_margin = flip_fee.min(opening_margin); // 1_000_000 — bounded by min()
+    let fee_from_wallet = flip_fee - fee_from_margin; //   100_000 — the remainder
+    assert!(flip_fee > opening_margin, "this must be a genuine split");
+
+    let alice = pos(&mut ctx, ALICE);
+    assert_eq!(
+        alice.amount,
+        -(QTY as i64),
+        "flipped from long 10 to short 1"
+    );
+    assert_eq!(
+        alice.margin,
+        (opening_margin - fee_from_margin) as i64,
+        "no underflow: the margin draw is capped at the opening margin"
+    );
+    let wallet_after = wallet(&mut ctx, ALICE) as i64;
+    assert_eq!(
+        wallet_after - wallet_before,
+        margin_before - (opening_margin + fee_from_wallet) as i64,
+        "the wallet returns the closed margin, then funds the new leg + the fee remainder"
+    );
+    // Conservation across the flip: (wallet + margin) fell by exactly the fee (PnL is zero here),
+    // and the recipient holds every fee charged so far.
+    assert_eq!(
+        (wallet_after + alice.margin) - (wallet_before + margin_before),
+        -(flip_fee as i64)
+    );
+    assert_eq!(wallet(&mut ctx, ADMIN), open_fee + flip_fee);
+    assert_eq!(
+        wallet_after + alice.margin,
+        funded - (open_fee + flip_fee) as i64
+    );
+}
+
+/// Placement escrows the margin reserve and NOTHING else, and a cancel returns the wallet to
+/// exactly its pre-placement value (the fee round-trip that used to run through `fee_reserved`
+/// simply does not happen any more).
+#[test]
+fn placement_reserves_margin_only_and_cancel_restores_the_wallet_exactly() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    storage::save_user_fee_rates(
+        &mut ctx,
+        ALICE,
+        UserFeeRates {
+            maker_fee_bps: 200,
+            taker_fee_bps: 0,
+        },
+    )
+    .unwrap();
+
+    let before = wallet(&mut ctx, ALICE);
+    let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    assert_eq!(
+        before - wallet(&mut ctx, ALICE),
+        INIT_MARGIN,
+        "available balance drops by the margin reserve ONLY — no fee is withheld"
+    );
+    assert_eq!(pos(&mut ctx, ALICE).margin_reserved, INIT_MARGIN);
+
+    run_cancel_order(
+        &cancelOrderCall {
+            orderId: id.into(),
+            marketId: MARKET_ID,
+        }
+        .abi_encode(),
+        ALICE,
+        &mut ctx,
+    )
+    .unwrap();
+
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        before,
+        "cancel is a clean round-trip"
+    );
+    assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
 }
 
 #[test]
@@ -3239,8 +3484,26 @@ mod golden {
     /// only rule change (leverage cap 6 → 3) was pre-absorbed by the Phase-0.5 retune of this
     /// scenario, so the business snapshot below is UNCHANGED. Prior value
     /// 0xc2c839a6a4dc5fa20b64faa286e30e6b90e7e7905ebe070c5c91bfd0bb2314f1.
+    /// RE-PIN (remove the `fee_reserved` escrow + `BLOCK_COMMITMENT_VERSION` 14→15): `PerpPosition`
+    /// LOST its "fr" field (every position blob shortens + every later field shifts), placement no
+    /// longer debits the order's prospective fee, and each fill charges the fee out of the margin
+    /// it funds (`fee_from_margin = min(fee, opening_margin)`). This CHANGES the business snapshot
+    /// — deliberately, it is the point of the change — in exactly three places, all conserving:
+    ///   * `bob_account` 500_428_794 → 500_428_954 (+160): the 160 fee escrowed against BOB's still
+    ///     resting tail bid is no longer withheld, so it sits in his AVAILABLE balance instead of
+    ///     `pos.fee_reserved`. Pure bucket move — his total collateral is unchanged.
+    ///   * `insurance_fund` 49_007_966 → 49_007_956 (−10) and `alice_account` 999_059_619 →
+    ///     999_059_629 (+10): ALICE's opening taker fees now come out of her position margin, so
+    ///     her pre-liquidation margin is 2_000 lower (1_593_200 → 1_591_200) and the 50 bps
+    ///     clearance fee on it drops 7_966 → 7_956. She keeps that 10; the IF receives it no
+    ///     longer. Σ(ALICE, IF) is unchanged.
+    ///
+    /// `admin_perp_wallet` (51_003_461) and `market_fee_total` (3_461) are UNCHANGED: every trading
+    /// fee is still collected in full, only its funding source moved. Positions, CAROL, and every
+    /// order status are identical. Prior value
+    /// 0x677500b3559bb22e070c48c9134c3d33c37086b2249f3fb1e88e516a04a8fa04.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x677500b3559bb22e070c48c9134c3d33c37086b2249f3fb1e88e516a04a8fa04");
+        b256!("0xa3fcb1f0cccd86eacd6ec33cfae4604a98577cd669c1b2d7ff3997aa0bf6b3ad");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -3302,13 +3565,20 @@ mod golden {
             // The liquidation close taker fee is still WAIVED (fix B) — no −1_200 here.
             // The old term-by-term breakdown is superseded: it was pinned to the 5x
             // margins and the $80 settle, and every term moved.
-            alice_account: (U256::from(500_000_000u64), 999_059_619),
+            //   3. fee_reserved removal: her opening taker fees are charged to the
+            //      position margin instead of the wallet, so the margin the clearance
+            //      fee is levied on is 2_000 thinner and that fee is 10 smaller — the
+            //      10 stays with her (and the IF below is 10 lower). Nothing else on
+            //      her side moves: the 2_000 she does not pay from the wallet is
+            //      exactly the 2_000 less that her margin returns at liquidation.
+            alice_account: (U256::from(500_000_000u64), 999_059_629),
             // BOB perp = 1e9 + 830_000 short PnL (622_500 on the 3-QTY
             //   liquidation leg + 207_500 on the QTY closed via CAROL) + 400
-            //   funding credit − 1_446 maker fees − 400_160 still reserved for
-            //   the resting tail bid (400_000 MR + 160 fee)
+            //   funding credit − 1_446 maker fees − 400_000 still reserved for
+            //   the resting tail bid (margin only: the 160 fee that used to be
+            //   escrowed alongside it is no longer withheld at placement)
             //   − 500_000_000 transferFromPerp.
-            bob_account: (U256::from(500_000_000u64), 500_428_794),
+            bob_account: (U256::from(500_000_000u64), 500_428_954),
             // CAROL perp = 5_000_000 funded − 800_000 short opening margin.
             carol_account: (U256::from(5_000_000u64), 4_200_000),
             // 2e9 seed − 1.5e9 deposit + 0.5e9 withdraw.
@@ -3317,9 +3587,12 @@ mod golden {
             //   (liquidation close taker fee waived — fix B).
             admin_perp_wallet: 51_003_461,
             // 50M deposit − 1M withdraw + 7_966 clearance fee
-            //   (50 bps of ALICE's 1_593_200 pre-liquidation margin — thicker than the
-            //   pre-cap 1_056_000 because she now runs at 3x instead of 5x).
-            insurance_fund: 49_007_966,
+            //   (50 bps of ALICE's 1_591_200 pre-liquidation margin — thicker than the
+            //   pre-cap 1_056_000 because she now runs at 3x instead of 5x, and 2_000
+            //   thinner than before the fee_reserved removal because her opening taker
+            //   fees are now charged to that margin; the 10 the IF no longer collects
+            //   is the 10 ALICE keeps above).
+            insurance_fund: 49_007_956,
             // ALICE takers 2_015 + BOB maker 806 + 480 + 160 (CAROL's taker fee
             //   is 0 bps; the liquidation close taker fee is waived — fix B).
             market_fee_total: 3_461,
@@ -4424,7 +4697,7 @@ mod commit_only_conservation {
             let acc = storage::load_account(ctx, a).unwrap();
             s += acc.perp_wallet_balance as i128;
             let p = storage::load_position(ctx, a, MARKET_ID).unwrap();
-            s += p.margin as i128 + p.margin_reserved as i128 + p.fee_reserved as i128;
+            s += p.margin as i128 + p.margin_reserved as i128;
             let mv = calc_value(PRICE, p.amount.unsigned_abs(), 8, 9).unwrap() as i128;
             s += if p.amount >= 0 { mv } else { -mv };
             s += p.v_quote_balance as i128;

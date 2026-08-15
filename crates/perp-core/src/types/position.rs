@@ -44,9 +44,12 @@ pub struct PerpPosition {
     /// Sell-side open-order notional before leverage division.
     #[serde(default, rename = "srn")]
     pub sell_side_reserved_notional: u64,
-    /// Total maker fee reserved for open orders (buy side + sell side).
-    #[serde(default, rename = "fr")]
-    pub fee_reserved: u64,
+    // NOTE: the former "fr" (`fee_reserved`) escrow is GONE. Placement used to withhold the
+    // order's prospective maker fee from the wallet on top of the margin reservation and release
+    // it at fill/cancel. Binance has no such bucket: the trading fee is charged out of the margin
+    // the fill itself funds (`isolatedWallet = Ne/L − f·Ne`), so `availableBalance` is not reduced
+    // by a fee that may never be paid. Every fill site now applies
+    // `fee_from_margin = min(fee, opening_margin)` / `fee_from_wallet = fee − fee_from_margin`.
     /// Current leverage setting. Bounded by the market's tier-0 `max_leverage`
     /// (see [`MarginTiers`]) at `setLeverage` time; 1 when unset.
     #[serde(rename = "lv")]
@@ -99,8 +102,9 @@ impl PerpPosition {
     ///
     /// Leverage is floored at 1. Callers compute the wallet delta from the
     /// change in `margin_reserved` around this call (NOT from the per-side
-    /// fields — those lag `margin_reserved` under the flip-aware model) and own
-    /// `fee_reserved` separately.
+    /// fields — those lag `margin_reserved` under the flip-aware model). It is
+    /// the ONLY escrow a resting order takes: the trading fee is charged at fill
+    /// time out of the margin the fill funds, never withheld at placement.
     #[inline]
     pub fn set_reservations(
         &mut self,
@@ -131,7 +135,6 @@ impl Default for PerpPosition {
             buy_side_reserved_notional: 0,
             sell_side_margin_reserved: 0,
             sell_side_reserved_notional: 0,
-            fee_reserved: 0,
             leverage: 1,
             last_funding_index: 0,
             total_buy_qty: 0,
