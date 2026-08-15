@@ -25,7 +25,7 @@ use crate::perp_dex::{
     trading::{
         run_batch_cancel_orders, run_batch_place_orders, run_cancel_order, run_place_order,
     },
-    types::{Market, OrderEntry},
+    types::{MarginTiers, Market, OrderEntry},
     PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
 
@@ -88,6 +88,7 @@ fn the_market() -> Market {
         price_band_bps: 1_000_000,
         // Mark anchored at BASE so Sim C's taker (which fills near BASE) is well inside the band.
         mark_price: BASE,
+        tiers: MarginTiers::default(),
     }
 }
 
@@ -443,6 +444,7 @@ fn faithful_market() -> Market {
         liquidation_fee_rate_bps: 0,
         price_band_bps: 1_000_000, // disabled
         mark_price: 0,
+        tiers: MarginTiers::default(),
     }
 }
 pub fn hl_ctx_faithful() -> BenchCtx {

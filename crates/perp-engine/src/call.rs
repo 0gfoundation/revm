@@ -24,22 +24,24 @@ use crate::{
         cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
         getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
         getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
-        getIndexPriceCall, getInsuranceFundCall, getMarkPriceCall, getMarketCall,
+        getIndexPriceCall, getInsuranceFundCall, getMarginTiersCall, getMarkPriceCall,
+        getMarketCall,
         getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
         getOracleAddressCall, getOrderCall, getPositionCall, getUserFeeRatesCall,
         initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
         removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
-        setMarketManagerAddressCall, setOracleAddressCall, setUserFeeRatesCall,
+        setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall,
+        setUserFeeRatesCall,
         transferAdminCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
         updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
     },
     risk::{
         run_add_market, run_add_position_margin, run_deposit_insurance_fund, run_get_admin,
         run_get_average_premium_index, run_get_funding_state, run_get_index_price,
-        run_get_insurance_fund, run_get_mark_price, run_get_market, run_get_market_manager,
-        run_get_oracle_address, run_get_position, run_init_admin, run_liquidate,
-        run_remove_position_margin, run_set_leverage, run_set_leverage_signed,
-        run_set_market_manager, run_set_oracle_address, run_transfer_admin,
+        run_get_insurance_fund, run_get_margin_tiers, run_get_mark_price, run_get_market,
+        run_get_market_manager, run_get_oracle_address, run_get_position, run_init_admin,
+        run_liquidate, run_remove_position_margin, run_set_leverage, run_set_leverage_signed,
+        run_set_margin_tiers, run_set_market_manager, run_set_oracle_address, run_transfer_admin,
         run_update_index_price, run_update_market, run_withdraw_insurance_fund,
     },
     trading::{
@@ -110,6 +112,9 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(updateMarketCall::SELECTOR, (50_000, false));
         m.insert(getMarkPriceCall::SELECTOR, (5_000, true));
         m.insert(getMarketCall::SELECTOR, (5_000, true));
+        // Risk table: setter mirrors addMarket's admin-write cost; getter is a plain view.
+        m.insert(setMarginTiersCall::SELECTOR, (100_000, false));
+        m.insert(getMarginTiersCall::SELECTOR, (5_000, true));
         // Leverage
         m.insert(setLeverageCall::SELECTOR, (20_000, false));
         m.insert(setLeverageSignedCall::SELECTOR, (20_000, false));
@@ -293,6 +298,10 @@ pub fn run_perp_dex_call<H: PerpHost>(
         s if s == updateMarketCall::SELECTOR => run_update_market(input_bytes, caller, context),
         s if s == getMarkPriceCall::SELECTOR => run_get_mark_price(input_bytes, context),
         s if s == getMarketCall::SELECTOR => run_get_market(input_bytes, context),
+        s if s == setMarginTiersCall::SELECTOR => {
+            run_set_margin_tiers(input_bytes, caller, context)
+        }
+        s if s == getMarginTiersCall::SELECTOR => run_get_margin_tiers(input_bytes, context),
         // Leverage
         s if s == setLeverageCall::SELECTOR => run_set_leverage(input_bytes, caller, context),
         s if s == setLeverageSignedCall::SELECTOR => run_set_leverage_signed(input_bytes, context),

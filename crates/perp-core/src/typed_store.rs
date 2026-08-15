@@ -1244,7 +1244,7 @@ impl PerpStore for TypedPerpStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::decode;
+    use crate::{codec::decode, types::MarginTiers};
 
     fn sample_market(id: u64) -> Market {
         Market {
@@ -1263,6 +1263,7 @@ mod tests {
             liquidation_fee_rate_bps: 50,
             price_band_bps: 500,
             mark_price: 65_000_00,
+            tiers: MarginTiers::default(),
         }
     }
 

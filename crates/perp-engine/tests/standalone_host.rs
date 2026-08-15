@@ -6,7 +6,7 @@ use perp_core::compute_block_commitment;
 use perp_engine::{
     interface::IPerpDex::{cancelOrderCall, placeOrderCall},
     run_perp_dex_call, storage,
-    types::Market,
+    types::{MarginTiers, Market},
     InMemoryHost, PerpHost, USDC_ADDRESS,
 };
 use primitives::{address, Address, FixedBytes, U256};
@@ -33,6 +33,7 @@ fn market() -> Market {
         liquidation_fee_rate_bps: 0,
         price_band_bps: 1_000_000, // disabled
         mark_price: 0,
+        tiers: MarginTiers::default(),
     }
 }
 

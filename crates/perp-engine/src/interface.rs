@@ -55,6 +55,25 @@ sol! {
         /// Query the current average premium index for the active funding epoch.
         function getAveragePremiumIndex(uint64 marketId) external view returns (int64 avgPremiumIndex, uint64 sampleCount);
 
+        /// Replace a market's margin-tier table (admin or market manager).
+        ///
+        /// Two index-aligned parallel arrays (same shape as the batch calls): tier `i` is
+        /// `{lowerBounds[i], maxLeverages[i]}`. Deliberately NOT part of `updateMarket`, so
+        /// retuning tick/step/funding can never reset the risk table.
+        ///
+        /// Rejected (whole call, zero writes) unless ALL hold: the market exists; the two
+        /// arrays are the same length; `1 <= length <= MAX_MARGIN_TIERS (8)`;
+        /// `lowerBounds[0] == 0`; `lowerBounds` strictly increasing; every `maxLeverages[i]`
+        /// in `1..=MAX_LEVERAGE_HARD_CAP (100)`; `maxLeverages` non-increasing.
+        ///
+        /// Tier 0's `maxLeverage` becomes the market's `setLeverage` cap. Existing positions
+        /// are NOT re-checked: an over-levered position keeps running and is only refused
+        /// when it next tries to OPEN.
+        function setMarginTiers(uint64 marketId, uint64[] lowerBounds, uint32[] maxLeverages) external;
+        /// Read a market's margin-tier table as the same two index-aligned arrays
+        /// `setMarginTiers` takes. Reverts if the market does not exist.
+        function getMarginTiers(uint64 marketId) external view returns (uint64[] lowerBounds, uint32[] maxLeverages);
+
         // ── Leverage ───────────────────────────────────────────────────────
         /// Set the leverage for the caller's position in a market.
         function setLeverage(uint64 marketId, uint64 leverage) external;
@@ -395,6 +414,9 @@ sol! {
 
         // Feeds: market metadata bootstrap for indexer
         event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint64 initialMarkPrice, uint32 priceBandBps);
+        // Feeds: market risk-table updates for indexer / risk UI.
+        // Index-aligned parallel arrays; the full replacement table, not a delta.
+        event MarginTiersUpdated(uint64 indexed marketId, uint64[] lowerBounds, uint32[] maxLeverages);
         // Feeds: market metadata updates for indexer
         event MarketUpdated(uint64 indexed marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps);
         // Feeds: /premiumIndex (mark price history), /fundingRate (markPrice field)

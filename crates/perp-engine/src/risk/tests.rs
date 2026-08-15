@@ -8,14 +8,14 @@ use primitives::{address, hardfork::SpecId, U256};
 use crate::{
     funding::settle_position_funding,
     interface::IPerpDex::{
-        addPositionMarginCall, liquidateCall, placeOrderCall, removePositionMarginCall,
-        setLeverageCall, updateIndexPriceCall,
+        addPositionMarginCall, getMarginTiersCall, liquidateCall, placeOrderCall,
+        removePositionMarginCall, setLeverageCall, setMarginTiersCall, updateIndexPriceCall,
     },
     run_perp_dex_call,
     trading::{run_place_order, MAX_LIQUIDATION_MAKER_ACCOUNTS},
     types::{
-        FundingState, IndexPriceHistory, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
-        UserAccount, UserFeeRates,
+        FundingState, IndexPriceHistory, MarginTiers, PerpPosition, PremiumIndexAccumulator,
+        PriceBasisWindow, UserAccount, UserFeeRates,
     },
     USDC_ADDRESS,
 };
@@ -87,6 +87,7 @@ fn setup_market(ctx: &mut TestCtx) {
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
             mark_price: 0,
+            tiers: MarginTiers::default(),
         },
     )
     .unwrap();
@@ -1117,6 +1118,26 @@ fn place_order(ctx: &mut TestCtx, user: Address, side: u8, price: u64, qty: u64)
     run_place_order(&input, user, ctx).unwrap();
 }
 
+fn try_place_order(
+    ctx: &mut TestCtx,
+    user: Address,
+    side: u8,
+    price: u64,
+    qty: u64,
+) -> Result<Bytes, PerpError> {
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side,
+        price,
+        quantity: qty,
+        orderType: 0,
+        tif: 0,
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    run_place_order(&input, user, ctx)
+}
+
 fn set_leverage(ctx: &mut TestCtx, leverage: u64) -> Result<Bytes, PerpError> {
     run_set_leverage(
         &setLeverageCall {
@@ -1127,6 +1148,38 @@ fn set_leverage(ctx: &mut TestCtx, leverage: u64) -> Result<Bytes, PerpError> {
         ALICE,
         ctx,
     )
+}
+
+fn set_margin_tiers(
+    ctx: &mut TestCtx,
+    caller: Address,
+    market_id: u64,
+    lower_bounds: &[u64],
+    max_leverages: &[u32],
+) -> Result<Bytes, PerpError> {
+    run_set_margin_tiers(
+        &setMarginTiersCall {
+            marketId: market_id,
+            lowerBounds: lower_bounds.to_vec(),
+            maxLeverages: max_leverages.to_vec(),
+        }
+        .abi_encode(),
+        caller,
+        ctx,
+    )
+}
+
+fn get_margin_tiers(ctx: &mut TestCtx, market_id: u64) -> (Vec<u64>, Vec<u32>) {
+    let out = run_get_margin_tiers(
+        &getMarginTiersCall {
+            marketId: market_id,
+        }
+        .abi_encode(),
+        ctx,
+    )
+    .unwrap();
+    let decoded = getMarginTiersCall::abi_decode_returns(&out).unwrap();
+    (decoded.lowerBounds, decoded.maxLeverages)
 }
 
 fn wallet(ctx: &mut TestCtx, user: Address) -> u64 {
@@ -1140,6 +1193,17 @@ fn position(ctx: &mut TestCtx, user: Address) -> PerpPosition {
 }
 
 fn save_position(ctx: &mut TestCtx, amount: i64, v_quote_balance: i64) {
+    save_position_with_leverage(ctx, amount, v_quote_balance, 5);
+}
+
+/// `save_position` with an explicit leverage — the leverage tests need one INSIDE the
+/// market's tier-0 cap (3) so `setLeverage` reaches the branch under test.
+fn save_position_with_leverage(
+    ctx: &mut TestCtx,
+    amount: i64,
+    v_quote_balance: i64,
+    leverage: u64,
+) {
     storage::save_position(
         ctx,
         ALICE,
@@ -1148,7 +1212,7 @@ fn save_position(ctx: &mut TestCtx, amount: i64, v_quote_balance: i64) {
             amount,
             v_quote_balance,
             margin: MARGIN,
-            leverage: 5,
+            leverage,
             ..PerpPosition::default()
         },
     )
@@ -1193,36 +1257,354 @@ fn liquidate_rejects_healthy_position() {
 fn set_leverage_allows_increase_with_open_position() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
-    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    save_position_with_leverage(&mut ctx, QTY, -ENTRY_VALUE, 2);
 
-    set_leverage(&mut ctx, 6).unwrap();
+    set_leverage(&mut ctx, 3).unwrap();
 
-    assert_eq!(position(&mut ctx, ALICE).leverage, 6);
+    assert_eq!(position(&mut ctx, ALICE).leverage, 3);
 }
 
 #[test]
 fn set_leverage_rejects_above_max_cap() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
-    // Cap is 6 (aligned with the 1/6 maintenance rate so opens never breach it).
-    let err = set_leverage(&mut ctx, 7).unwrap_err();
-    assert!(err.to_string().contains("leverage must be 1–6"), "{err}");
-    assert!(set_leverage(&mut ctx, 6).is_ok(), "6x must be allowed");
+    // The cap is tier 0's max_leverage — 3 for a default (single-tier) market.
+    let err = set_leverage(&mut ctx, 4).unwrap_err();
+    assert!(err.to_string().contains("leverage must be 1–3"), "{err}");
+    assert!(set_leverage(&mut ctx, 3).is_ok(), "3x must be allowed");
+}
+
+#[test]
+fn set_leverage_cap_follows_the_market_tier_table() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    assert!(set_leverage(&mut ctx, 3).is_ok(), "3x is the default cap");
+
+    // Retune tier 0 down to 2x: the setLeverage cap must move with it.
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0], &[2]).unwrap();
+
+    let err = set_leverage(&mut ctx, 3).unwrap_err();
+    assert!(err.to_string().contains("leverage must be 1–2"), "{err}");
+    assert!(set_leverage(&mut ctx, 2).is_ok(), "2x is the new cap");
+}
+
+// ── setMarginTiers / getMarginTiers ───────────────────────────────────────────
+
+#[test]
+fn add_market_installs_the_default_single_tier_table() {
+    let mut ctx = make_ctx();
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+    call_add_market(&mut ctx, 7, 10_000);
+
+    assert_eq!(get_margin_tiers(&mut ctx, 7), (vec![0u64], vec![3u32]));
+}
+
+#[test]
+fn update_market_preserves_the_tier_table() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_margin_tiers(
+        &mut ctx,
+        ADMIN,
+        MARKET_ID,
+        &[0, 1_000_000, 5_000_000],
+        &[3, 2, 1],
+    )
+    .unwrap();
+
+    run_update_market(
+        &crate::interface::IPerpDex::updateMarketCall {
+            marketId: MARKET_ID,
+            tickSize: 2,
+            stepSize: 1,
+            minQuantity: 1,
+            maxQuantity: 1_000_000,
+            maxPrice: 1_000_000,
+            priceUpdateInterval: 30,
+            active: false,
+            fundingInterval: 0,
+            interestRate: 0,
+            liquidationFeeRateBps: 7,
+            priceBandBps: 0,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // Retuning tick/step/funding must not touch the risk table.
+    assert_eq!(
+        get_margin_tiers(&mut ctx, MARKET_ID),
+        (vec![0, 1_000_000, 5_000_000], vec![3, 2, 1])
+    );
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    assert_eq!(
+        market.tick_size, 2,
+        "the rest of updateMarket still applied"
+    );
+}
+
+#[test]
+fn set_margin_tiers_accepts_and_round_trips_a_multi_tier_table() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+
+    set_margin_tiers(
+        &mut ctx,
+        ADMIN,
+        MARKET_ID,
+        &[0, 50_000_000_000, 250_000_000_000],
+        &[3, 2, 1],
+    )
+    .unwrap();
+
+    assert_eq!(
+        get_margin_tiers(&mut ctx, MARKET_ID),
+        (vec![0, 50_000_000_000, 250_000_000_000], vec![3, 2, 1])
+    );
+    // And it survives a storage round-trip through the msgpack blob.
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    let bytes = perp_core::codec::encode(&market).unwrap();
+    let decoded: crate::types::Market = perp_core::codec::decode(&bytes).unwrap();
+    assert_eq!(decoded.tiers, market.tiers);
+}
+
+#[test]
+fn set_margin_tiers_accepts_the_maximum_table_size() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let bounds: Vec<u64> = (0..crate::types::MAX_MARGIN_TIERS as u64)
+        .map(|i| i * 1_000_000)
+        .collect();
+    let levs: Vec<u32> = (0..crate::types::MAX_MARGIN_TIERS as u32)
+        .map(|i| 8 - i)
+        .collect();
+
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &bounds, &levs).unwrap();
+
+    assert_eq!(get_margin_tiers(&mut ctx, MARKET_ID), (bounds, levs));
+}
+
+#[test]
+fn set_margin_tiers_requires_admin_or_market_manager() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+
+    let err = set_margin_tiers(&mut ctx, ALICE, MARKET_ID, &[0], &[2]).unwrap_err();
+    assert!(err.to_string().contains("not authorised"), "{err}");
+    // Unchanged.
+    assert_eq!(get_margin_tiers(&mut ctx, MARKET_ID), (vec![0], vec![3]));
+}
+
+/// Every invariant gets its OWN error string, and every reject leaves the stored table
+/// untouched (validate-then-apply: perp writes are commit-only).
+#[test]
+fn set_margin_tiers_rejects_each_invariant_individually() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+
+    let cases: &[(&[u64], &[u32], &str)] = &[
+        (
+            &[0, 1_000],
+            &[3],
+            "lowerBounds and maxLeverages length mismatch",
+        ),
+        (&[], &[], "at least one tier required"),
+        (
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+            &[9, 8, 7, 6, 5, 4, 3, 2, 1],
+            "at most 8 tiers allowed",
+        ),
+        (&[1_000], &[3], "first tier must start at 0"),
+        (
+            &[0, 1_000, 1_000],
+            &[3, 2, 1],
+            "lowerBounds must be strictly increasing",
+        ),
+        (
+            &[0, 2_000, 1_000],
+            &[3, 2, 1],
+            "lowerBounds must be strictly increasing",
+        ),
+        (&[0], &[0], "maxLeverage must be 1–100"),
+        (&[0], &[101], "maxLeverage must be 1–100"),
+        (&[0, 1_000], &[2, 3], "maxLeverages must be non-increasing"),
+    ];
+
+    for (bounds, levs, expected) in cases {
+        let err = set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, bounds, levs).unwrap_err();
+        assert!(
+            err.to_string().contains(expected),
+            "expected {expected:?}, got {err}"
+        );
+        assert_eq!(
+            get_margin_tiers(&mut ctx, MARKET_ID),
+            (vec![0], vec![3]),
+            "a reject must not write ({expected})"
+        );
+    }
+}
+
+#[test]
+fn set_margin_tiers_rejects_unknown_market() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let err = set_margin_tiers(&mut ctx, ADMIN, 999, &[0], &[2]).unwrap_err();
+    assert!(err.to_string().contains("unknown market"), "{err}");
+}
+
+#[test]
+fn get_margin_tiers_rejects_unknown_market() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let err = run_get_margin_tiers(&getMarginTiersCall { marketId: 999 }.abi_encode(), &mut ctx)
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown market"), "{err}");
+}
+
+#[test]
+fn set_margin_tiers_emits_the_full_replacement_table() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0, 1_000_000], &[3, 2]).unwrap();
+
+    let updated: Vec<_> = JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .filter(|log| {
+            log.data.topics().first() == Some(&IPerpDex::MarginTiersUpdated::SIGNATURE_HASH)
+        })
+        .map(|log| {
+            IPerpDex::MarginTiersUpdated::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+        })
+        .collect();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].marketId, MARKET_ID);
+    assert_eq!(updated[0].lowerBounds, vec![0, 1_000_000]);
+    assert_eq!(updated[0].maxLeverages, vec![3, 2]);
+}
+
+// ── Per-open margin-tier guard ────────────────────────────────────────────────
+
+/// Fund ALICE, sit her at `leverage`, and rest a MAKER sell of `qty` at the mark so an
+/// ALICE buy of `qty` opens a fresh long of that size.
+fn stage_open_into_tier(ctx: &mut TestCtx, leverage: u64, qty: u64) {
+    storage::save_account(
+        ctx,
+        ALICE,
+        UserAccount {
+            perp_wallet_balance: 2_000_000_000,
+            ..UserAccount::default()
+        },
+    )
+    .unwrap();
+    set_leverage(ctx, leverage).unwrap();
+    place_order(ctx, MAKER, Side::Sell as u8, ENTRY_PRICE, qty);
+}
+
+/// v1 no-op proof: under the DEFAULT single-tier table the guard can never fire, because
+/// its bound is exactly the `setLeverage` cap.
+#[test]
+fn per_open_tier_guard_is_a_no_op_under_the_default_table() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // qty 2 at $100 = 200_000_000 quote units of notional — well past any tier boundary
+    // the multi-tier test below installs.
+    stage_open_into_tier(&mut ctx, 3, 2);
+
+    try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap();
+
+    assert_eq!(position(&mut ctx, ALICE).amount, 2);
+}
+
+/// NOT redundant with K9: this position is solvent at mark (K9 passes) and is refused
+/// purely because its size crossed into a tier whose max leverage is below the position's.
+#[test]
+fn per_open_tier_guard_rejects_growing_into_a_lower_leverage_tier() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    stage_open_into_tier(&mut ctx, 3, 2);
+    // Tier 1 starts below the 200_000_000 notional this open produces and caps leverage at 1.
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0, 150_000_000], &[3, 1]).unwrap();
+
+    let err = try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("leverage exceeds the margin tier for this position size"),
+        "{err}"
+    );
+    // Pre-write reject: no position, and the maker's ask is untouched.
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    assert_eq!(position(&mut ctx, MAKER).amount, 0);
+}
+
+/// The same open is ACCEPTED once the trader's leverage is inside the reached tier's cap —
+/// so the guard gates on the tier, not on the trade.
+#[test]
+fn per_open_tier_guard_accepts_leverage_inside_the_reached_tier() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    stage_open_into_tier(&mut ctx, 1, 2);
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0, 150_000_000], &[3, 1]).unwrap();
+
+    try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap();
+
+    assert_eq!(position(&mut ctx, ALICE).amount, 2);
+}
+
+/// The maker leg of the same guard: a resting maker whose fill would grow him into a
+/// lower-leverage tier is refused (his order is cancelled) instead of being filled.
+#[test]
+fn per_open_tier_guard_rejects_the_maker_leg_too() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_account(
+        &mut ctx,
+        ALICE,
+        UserAccount {
+            perp_wallet_balance: 2_000_000_000,
+            ..UserAccount::default()
+        },
+    )
+    .unwrap();
+    // MAKER rests at 3x BEFORE the retune (resting itself is never tier-gated).
+    run_set_leverage(
+        &setLeverageCall {
+            marketId: MARKET_ID,
+            leverage: 3,
+        }
+        .abi_encode(),
+        MAKER,
+        &mut ctx,
+    )
+    .unwrap();
+    place_order(&mut ctx, MAKER, Side::Sell as u8, ENTRY_PRICE, 2);
+
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0, 150_000_000], &[3, 1]).unwrap();
+
+    // ALICE is at the default 1x, so HER leg is fine; the maker's is not.
+    try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap();
+
+    assert_eq!(position(&mut ctx, MAKER).amount, 0, "maker fill refused");
+    assert_eq!(position(&mut ctx, ALICE).amount, 0, "nothing matched");
 }
 
 #[test]
 fn set_leverage_rejects_decrease_with_open_position() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
-    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    save_position_with_leverage(&mut ctx, QTY, -ENTRY_VALUE, 3);
 
-    let err = set_leverage(&mut ctx, 4).unwrap_err();
+    let err = set_leverage(&mut ctx, 2).unwrap_err();
     assert!(
         err.to_string()
             .contains("cannot reduce leverage with open position"),
         "{err}"
     );
-    assert_eq!(position(&mut ctx, ALICE).leverage, 5);
+    assert_eq!(position(&mut ctx, ALICE).leverage, 3);
 }
 
 #[test]
@@ -1239,12 +1621,12 @@ fn set_leverage_decrease_without_position_tops_up_order_margin() {
     )
     .unwrap();
 
-    // Order notional is 1e9; leverage 5 -> reserve 200M, leverage 2 -> reserve 500M
-    // (both divide 1e9 cleanly and stay within the 1–6 leverage cap).
-    set_leverage(&mut ctx, 5).unwrap();
+    // Order notional is 1e9; leverage 3 -> reserve 333_333_333, leverage 2 -> reserve 500M
+    // (both within the tier-0 leverage cap of 3).
+    set_leverage(&mut ctx, 3).unwrap();
     place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, QTY as u64);
-    assert_eq!(position(&mut ctx, ALICE).margin_reserved, 200_000_000);
-    assert_eq!(wallet(&mut ctx, ALICE), 300_000_000);
+    assert_eq!(position(&mut ctx, ALICE).margin_reserved, 333_333_333);
+    assert_eq!(wallet(&mut ctx, ALICE), 166_666_667);
 
     set_leverage(&mut ctx, 2).unwrap();
 
@@ -1262,15 +1644,16 @@ fn set_leverage_decrease_without_position_rejects_when_order_margin_topup_is_unf
         &mut ctx,
         ALICE,
         UserAccount {
-            perp_wallet_balance: 250_000_000,
+            perp_wallet_balance: 400_000_000,
             ..UserAccount::default()
         },
     )
     .unwrap();
 
-    // Order notional 1e9; leverage 5 -> reserve 200M (wallet 250M -> 50M). Decreasing
-    // to leverage 2 needs reserve 500M (+300M topup) which 50M cannot fund -> reject.
-    set_leverage(&mut ctx, 5).unwrap();
+    // Order notional 1e9; leverage 3 -> reserve 333_333_333 (wallet 400M -> 66_666_667).
+    // Decreasing to leverage 2 needs reserve 500M (+166_666_667 topup) which 66_666_667
+    // cannot fund -> reject.
+    set_leverage(&mut ctx, 3).unwrap();
     place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, QTY as u64);
 
     let err = set_leverage(&mut ctx, 2).unwrap_err();
@@ -1280,9 +1663,9 @@ fn set_leverage_decrease_without_position_rejects_when_order_margin_topup_is_unf
         "{err}"
     );
     let pos = position(&mut ctx, ALICE);
-    assert_eq!(pos.leverage, 5);
-    assert_eq!(pos.margin_reserved, 200_000_000);
-    assert_eq!(wallet(&mut ctx, ALICE), 50_000_000);
+    assert_eq!(pos.leverage, 3);
+    assert_eq!(pos.margin_reserved, 333_333_333);
+    assert_eq!(wallet(&mut ctx, ALICE), 66_666_667);
 }
 
 #[test]

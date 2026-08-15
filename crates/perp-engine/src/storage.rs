@@ -2084,7 +2084,7 @@ mod commitment_tests {
 mod size_probe_tests {
     use super::*;
     use crate::types::{
-        OrderStatus, OrderType, Side, TimeInForce, PRICE_BASIS_WINDOW_SIZE,
+        MarginTiers, OrderStatus, OrderType, Side, TimeInForce, PRICE_BASIS_WINDOW_SIZE,
     };
 
     #[test]
@@ -2206,6 +2206,7 @@ mod size_probe_tests {
             liquidation_fee_rate_bps: 50,
             price_band_bps: 0,
             mark_price: 0,
+            tiers: MarginTiers::default(),
         };
         let buf = encode(&market).unwrap();
         println!("Market: {} bytes", buf.len());
@@ -2297,7 +2298,7 @@ mod size_probe_tests {
 #[cfg(test)]
 mod encoding_roundtrip_tests {
     use super::*;
-    use crate::types::{OrderStatus, OrderType, Side, TimeInForce};
+    use crate::types::{MarginTiers, OrderStatus, OrderType, Side, TimeInForce};
 
     fn rt<T>(label: &str, v: T)
     where
@@ -2430,6 +2431,7 @@ mod encoding_roundtrip_tests {
                 liquidation_fee_rate_bps: u32::MAX,
                 price_band_bps: 0,
                 mark_price: u64::MAX,
+                tiers: MarginTiers::default(),
             },
         );
     }

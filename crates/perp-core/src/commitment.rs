@@ -26,7 +26,10 @@ use primitives::{B256, U256};
 // #A: bumped 11→12 for the PerpPosition reservation-aggregate fields (tbq/tbn/tsq/tsn) — a CHAIN
 // change (position blob layout changed → persisted state + commitment differ). Requires a golden
 // re-pin (below) + a coordinated wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 13;
+// Margin tiers (Phase 1): bumped 13→14 for the `tiers` field appended to the `Market` blob — every
+// stored market blob grows by its (default, single-tier) table. CHAIN change; behaviour is
+// arithmetically identical (mmr = 1/(2*3) = 1/6 == the deleted MAINTENANCE_MARGIN_DENOMINATOR).
+pub const BLOCK_COMMITMENT_VERSION: u8 = 14;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

@@ -12,9 +12,10 @@ use crate::{
         self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
         getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
         getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn, getInsuranceFundCall,
-        getMarkPriceCall, getMarketCall, getMarketManagerAddressCall, getMarketReturn,
-        getOracleAddressCall, getPositionCall, getPositionReturn, initAdminCall, liquidateCall,
-        removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
+        getMarginTiersCall, getMarginTiersReturn, getMarkPriceCall, getMarketCall,
+        getMarketManagerAddressCall, getMarketReturn, getOracleAddressCall, getPositionCall,
+        getPositionReturn, initAdminCall, liquidateCall, removePositionMarginCall,
+        setLeverageCall, setLeverageSignedCall, setMarginTiersCall,
         setMarketManagerAddressCall, setOracleAddressCall, transferAdminCall,
         updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
     },
@@ -27,7 +28,10 @@ use crate::{
         check_api_key_expiry, check_recv_window, execute_liquidation_market_order, run_adl,
         settle_liquidation_residual_at_mark_price, verify_ed25519,
     },
-    types::{FundingState, IndexPriceState, Market, PremiumIndexAccumulator, Side},
+    types::{
+        FundingState, IndexPriceState, MarginTier, MarginTiers, Market,
+        PremiumIndexAccumulator, Side, MAX_LEVERAGE_HARD_CAP, MAX_MARGIN_TIERS,
+    },
     PERP_DEX_ADDRESS,
     PerpError,
 };
@@ -181,6 +185,11 @@ pub fn run_add_market<H: PerpHost>(
         price_band_bps: args.priceBandBps,
         // mark_price now lives in the Market blob (was a separate save_mark_price call).
         mark_price: args.initialMarkPrice,
+        // `addMarket` is deliberately NOT grown to carry the tier table (it is already
+        // 14 args with a fixed-offset signed layout). Every market is born single-tier
+        // `[{0, DEFAULT_MAX_LEVERAGE}]` — maintenance rate 1/6, leverage cap 3 — and is
+        // retuned afterwards by `setMarginTiers`.
+        tiers: MarginTiers::default(),
     };
     storage::save_market(context, &market)?;
 
@@ -277,6 +286,9 @@ pub fn run_update_market<H: PerpHost>(
     market.interest_rate = args.interestRate;
     market.liquidation_fee_rate_bps = args.liquidationFeeRateBps;
     market.price_band_bps = args.priceBandBps;
+    // NOTE: `market.tiers` is deliberately absent here. The update is field-by-field over
+    // the LOADED market, so the risk table survives verbatim — retuning tick/step/funding
+    // can never reset it. Tiers move only through `setMarginTiers`.
     storage::save_market(context, &market)?;
 
     context.log(Log {
@@ -299,6 +311,111 @@ pub fn run_update_market<H: PerpHost>(
     });
 
     Ok(Bytes::new())
+}
+
+/// `setMarginTiers(uint64 marketId, uint64[] lowerBounds, uint32[] maxLeverages)`
+///
+/// Replaces a market's margin-tier table wholesale. ALL validation runs before the single
+/// `save_market` (validate-then-apply: perp writes are commit-only, so no genuine reject
+/// may follow a write). Each invariant carries its own error string.
+pub fn run_set_margin_tiers<H: PerpHost>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = setMarginTiersCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("setMarginTiers: invalid calldata"))?;
+
+    require_admin_or_market_manager(caller, context)?;
+
+    let mut market = storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("setMarginTiers: unknown market"))?;
+
+    // ── validate (every check precedes the write) ──
+    if args.lowerBounds.len() != args.maxLeverages.len() {
+        return Err(perp_err(
+            "setMarginTiers: lowerBounds and maxLeverages length mismatch",
+        ));
+    }
+    if args.lowerBounds.is_empty() {
+        return Err(perp_err("setMarginTiers: at least one tier required"));
+    }
+    if args.lowerBounds.len() > MAX_MARGIN_TIERS {
+        return Err(perp_err(format!(
+            "setMarginTiers: at most {MAX_MARGIN_TIERS} tiers allowed"
+        )));
+    }
+    if args.lowerBounds[0] != 0 {
+        return Err(perp_err("setMarginTiers: first tier must start at 0"));
+    }
+    if args.lowerBounds.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(perp_err(
+            "setMarginTiers: lowerBounds must be strictly increasing",
+        ));
+    }
+    if args
+        .maxLeverages
+        .iter()
+        .any(|&l| l == 0 || l > MAX_LEVERAGE_HARD_CAP)
+    {
+        return Err(perp_err(format!(
+            "setMarginTiers: maxLeverage must be 1–{MAX_LEVERAGE_HARD_CAP}"
+        )));
+    }
+    if args.maxLeverages.windows(2).any(|w| w[1] > w[0]) {
+        return Err(perp_err(
+            "setMarginTiers: maxLeverages must be non-increasing",
+        ));
+    }
+
+    let rows: Vec<MarginTier> = args
+        .lowerBounds
+        .iter()
+        .zip(args.maxLeverages.iter())
+        .map(|(&lower_bound_notional, &max_leverage)| MarginTier {
+            lower_bound_notional,
+            max_leverage,
+        })
+        .collect();
+    // Unreachable: the length bounds above are exactly `from_tiers`' precondition.
+    let tiers = MarginTiers::from_tiers(&rows)
+        .ok_or_else(|| perp_err("setMarginTiers: invalid tier count"))?;
+
+    // ── APPLY (all rejects passed) ──
+    market.tiers = tiers;
+    storage::save_market(context, &market)?;
+
+    context.log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::MarginTiersUpdated {
+            marketId: args.marketId,
+            lowerBounds: args.lowerBounds,
+            maxLeverages: args.maxLeverages,
+        }
+        .to_log_data(),
+    });
+
+    Ok(Bytes::new())
+}
+
+/// `getMarginTiers(uint64 marketId) returns (uint64[] lowerBounds, uint32[] maxLeverages)`
+pub fn run_get_margin_tiers<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = getMarginTiersCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getMarginTiers: invalid calldata"))?;
+
+    let market = storage::load_market_ref(context, args.marketId)?
+        .ok_or_else(|| perp_err("getMarginTiers: unknown market"))?;
+
+    let table = market.tiers.as_slice();
+    Ok(Bytes::from(getMarginTiersCall::abi_encode_returns(
+        &getMarginTiersReturn {
+            lowerBounds: table.iter().map(|t| t.lower_bound_notional).collect(),
+            maxLeverages: table.iter().map(|t| t.max_leverage).collect(),
+        },
+    )))
 }
 
 /// `getMarkPrice(uint64 marketId) returns (uint64 price)`
@@ -396,15 +513,18 @@ fn set_leverage_core<H: PerpHost>(
     market_id: u64,
     leverage: u64,
 ) -> Result<Bytes, PerpError> {
-    // Max leverage is capped at 6 to stay consistent with the 1/6 maintenance-margin
-    // rate: a fresh position opened at leverage L has equity = notional/L at mark, so
-    // L > 6 would open below maintenance (notional/6) and be rejected by the K9
-    // open-solvency guard. Raising this cap requires lowering MAINTENANCE_MARGIN_DENOMINATOR.
-    if leverage == 0 || leverage > 6 {
-        return Err(perp_err("setLeverage: leverage must be 1–6"));
-    }
-    storage::load_market_ref(context, market_id)?
+    let market = storage::load_market_ref(context, market_id)?
         .ok_or_else(|| perp_err("setLeverage: unknown market"))?;
+
+    // The cap is tier 0's max_leverage — the market's own risk table is the single source
+    // of truth. Tier 0 covers notional from 0, so it is the loosest cap any position can
+    // enjoy; growing into a higher tier tightens it further (enforced per-open at the
+    // settlement cores). The spec's relation runs table → rate: mmr(0) = 1/(2*L₀), so the
+    // legacy 1/6 rate IS L₀ = 3.
+    let cap = market.tiers.as_slice()[0].max_leverage as u64;
+    if leverage == 0 || leverage > cap {
+        return Err(perp_err(format!("setLeverage: leverage must be 1–{cap}")));
+    }
 
     let mut pos = storage::load_position(context, account, market_id)?;
     let old_leverage = pos.leverage.max(1);
@@ -567,6 +687,7 @@ pub fn run_remove_position_margin<H: PerpHost>(
     // (`v_quote_balance`), so collateral cannot be stripped from a position
     // that is sliding underwater.
     if !is_above_maintenance_margin(
+        &market.tiers,
         mark_price,
         pos.amount,
         pos.v_quote_balance,
@@ -646,6 +767,7 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         &mut account.perp_wallet_balance,
     )?;
     if is_above_maintenance_margin(
+        &market.tiers,
         mark_price,
         pos.amount,
         pos.v_quote_balance,

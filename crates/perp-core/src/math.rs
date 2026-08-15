@@ -5,7 +5,7 @@
 
 use crate::{
     error::{perp_err, PerpError},
-    types::{Market, OrderEntry},
+    types::{MarginTiers, Market, OrderEntry},
 };
 
 pub const QUOTE_DECIMALS: u32 = 6;
@@ -15,8 +15,6 @@ pub const MAX_FUNDING_RATE: i64 = 7_500; // +0.75%
 pub const MIN_FUNDING_RATE: i64 = -7_500; // -0.75%
 pub const CLAMP_UPPER_BOUND: i64 = 500; // +0.05%  (inner clamp for I−P)
 pub const CLAMP_LOWER_BOUND: i64 = -500; // -0.05%
-/// Maintenance margin = notional / 6, approximately 16.67%.
-pub const MAINTENANCE_MARGIN_DENOMINATOR: i128 = 6;
 /// Trading fee denominator. 1 basis point = 1 / 10_000.
 pub const FEE_BPS_DENOMINATOR: u64 = 10_000;
 
@@ -143,9 +141,74 @@ pub fn calc_value_i64(
     i64::try_from(value).map_err(|_| perp_err("math: signed value exceeds i64"))
 }
 
+/// Maintenance margin required for a position of `abs_notional` quote units under a
+/// market's margin-tier table.
+///
+/// Spec (`perpdex-docs trading/margin-tiers.md`):
+/// `maintenance_margin = notional * mmr(n) - deduction(n)`, `mmr(n) = 1 / (2*L_n)`,
+/// `deduction(n) = deduction(n-1) + B_n * (mmr(n) - mmr(n-1))`.
+///
+/// # Why this is the SLICE form and not the spec's subtractive recursion
+///
+/// **Do not "correct" this back to `notional*mmr(n) - deduction(n)`.** Over the reals the
+/// two are identical; over integers they are not. Evaluating the deduction term as one
+/// floored rational `⌊B·(mmr_n − mmr_{n−1})⌋` is DISCONTINUOUS at 53.1% of two-tier
+/// boundaries (exhaustive scan, L₀∈2..8, L₁<L₀, B∈1..400) — e.g. `[{0,3},{50e9,2}]` yields
+/// 8_333_333_334 at the boundary where the previous tier's own rule yields 8_333_333_333.
+/// A +1 step in the *liquidate-a-healthy-position* direction: precisely the discontinuity
+/// the deduction exists to remove, and fully deterministic, so every node would agree on
+/// the wrong number and it would never surface as a consensus fault.
+///
+/// The slice (marginal) form below charges each fully-crossed band `(B_{k+1} − B_k)/(2·L_k)`
+/// with ONE floor per slice plus one on the partial slice. It is algebraically the same sum
+/// over the reals, is 0% discontinuous at boundaries (the terms are shared verbatim by both
+/// sides of a boundary — see `tier_boundaries_are_continuous`), and is monotone
+/// non-decreasing in notional.
+///
+/// `abs_notional` must already be non-negative (callers pass `notional.checked_abs()?`);
+/// a negative input is clamped to 0 rather than producing a negative requirement.
+/// A tier's `max_leverage` is floored at 1 so a corrupt blob cannot divide by zero.
+#[inline]
+pub fn maintenance_margin(tiers: &MarginTiers, abs_notional: i64) -> Result<i64, PerpError> {
+    let n = (abs_notional as i128).max(0);
+    let table = tiers.as_slice();
+    let mut acc: i128 = 0;
+    let mut lo: i128 = 0;
+    let mut lev: i128 = (table[0].max_leverage as i128).max(1);
+    for tier in &table[1..] {
+        let bound = tier.lower_bound_notional as i128;
+        if n < bound {
+            break;
+        }
+        acc += (bound - lo) / (2 * lev);
+        lo = bound;
+        lev = (tier.max_leverage as i128).max(1);
+    }
+    acc += (n - lo) / (2 * lev);
+    i64::try_from(acc).map_err(|_| perp_err("math: maintenance margin exceeds i64"))
+}
+
+/// Maximum leverage a market's tier table permits at `abs_notional` quote units: the
+/// `max_leverage` of the last tier whose `lower_bound_notional` the notional reaches.
+/// At notional 0 this is tier 0's `max_leverage` — the market's `setLeverage` cap.
+#[inline]
+pub fn max_leverage_for_notional(tiers: &MarginTiers, abs_notional: i64) -> u32 {
+    let n = (abs_notional as i128).max(0);
+    let table = tiers.as_slice();
+    let mut lev = table[0].max_leverage;
+    for tier in &table[1..] {
+        if n < tier.lower_bound_notional as i128 {
+            break;
+        }
+        lev = tier.max_leverage;
+    }
+    lev
+}
+
 /// Returns `true` if the position is above the maintenance-margin threshold.
 #[inline]
 pub fn is_above_maintenance_margin(
+    tiers: &MarginTiers,
     mark_price: u64,
     amount: i64,
     v_quote_balance: i64,
@@ -158,12 +221,12 @@ pub fn is_above_maintenance_margin(
         .checked_add(v_quote_balance)
         .and_then(|v| v.checked_add(margin))
         .ok_or_else(|| perp_err("math: maintenance margin value overflow"))?;
-    let threshold_denominator = i64::try_from(MAINTENANCE_MARGIN_DENOMINATOR)
-        .map_err(|_| perp_err("math: maintenance margin denominator exceeds i64"))?;
-    let threshold = notional
-        .checked_abs()
-        .ok_or_else(|| perp_err("math: maintenance margin abs overflow"))?
-        / threshold_denominator;
+    let threshold = maintenance_margin(
+        tiers,
+        notional
+            .checked_abs()
+            .ok_or_else(|| perp_err("math: maintenance margin abs overflow"))?,
+    )?;
     Ok(position_value >= threshold)
 }
 
@@ -240,40 +303,11 @@ pub fn calc_entry_price(
     u64::try_from(price).map_err(|_| perp_err("math: entry price exceeds u64"))
 }
 
-/// Liquidation price. Returns 0 if `amount == 0`.
-#[inline]
-pub fn calc_liquidation_price(
-    amount: i64,
-    v_quote_balance: i64,
-    margin: i64,
-    base_decimals: u32,
-    price_decimals: u32,
-) -> Result<i64, PerpError> {
-    if amount == 0 {
-        return Ok(0);
-    }
-    let numerator = (-(v_quote_balance as i128 + margin as i128))
-        .checked_mul(pow10_i128(price_decimals)?)
-        .and_then(|v| v.checked_mul(pow10_i128(base_decimals).ok()?))
-        .ok_or_else(|| perp_err("math: liquidation price numerator overflow"))?;
-    let margin_adjust = if amount > 0 {
-        MAINTENANCE_MARGIN_DENOMINATOR - 1
-    } else {
-        MAINTENANCE_MARGIN_DENOMINATOR + 1
-    };
-    let denominator = (amount as i128)
-        .checked_mul(pow10_i128(QUOTE_DECIMALS)?)
-        .and_then(|v| v.checked_mul(margin_adjust))
-        .ok_or_else(|| perp_err("math: liquidation price denominator overflow"))?
-        / MAINTENANCE_MARGIN_DENOMINATOR;
-    let price = numerator / denominator;
-    i64::try_from(price).map_err(|_| perp_err("math: liquidation price exceeds i64"))
-}
-
 /// Bankruptcy price: the price at which the position's equity is exactly zero
-/// (`calc_value_i64(P_b, amount) + v_quote_balance + margin == 0`). This is
-/// [`calc_liquidation_price`] WITHOUT the maintenance-margin adjustment (equity == 0,
-/// not equity == maintenance). Returns 0 if `amount == 0`.
+/// (`calc_value_i64(P_b, amount) + v_quote_balance + margin == 0`). This is the price at
+/// which the position is EXACTLY bankrupt, i.e. the liquidation price WITHOUT the
+/// maintenance-margin adjustment (equity == 0, not equity == maintenance). Returns 0 if
+/// `amount == 0`.
 ///
 /// Used by ADL to close a liquidated residual against opposite-side holders as a
 /// forced trade at `P_b`. Rounding is chosen so the LIQUIDATED position's equity at
@@ -1196,5 +1230,221 @@ mod mark_band_bounds_tests {
         let (upper, lower) = mark_band_bounds(u64::MAX, u32::MAX);
         assert_eq!(lower, 0);
         assert!(upper > 0);
+    }
+}
+
+// ── Margin tiers ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod margin_tier_tests {
+    use super::*;
+    use crate::types::{MarginTier, MarginTiers};
+
+    fn table(rows: &[(u64, u32)]) -> MarginTiers {
+        let v: Vec<MarginTier> = rows
+            .iter()
+            .map(|&(lower_bound_notional, max_leverage)| MarginTier {
+                lower_bound_notional,
+                max_leverage,
+            })
+            .collect();
+        MarginTiers::from_tiers(&v).expect("valid tier count")
+    }
+
+    /// Deterministic xorshift (no rng dependency in this crate).
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// v1 BEHAVIOUR-PRESERVATION PROOF: the default single tier `{0, 3}` has
+    /// `mmr = 1/(2*3) = 1/6`, i.e. exactly the deleted `MAINTENANCE_MARGIN_DENOMINATOR`.
+    /// Every reachable notional must reproduce the old `notional / 6` byte for byte.
+    #[test]
+    fn single_default_tier_is_notional_over_six() {
+        let t = MarginTiers::default();
+        assert_eq!(t.as_slice(), table(&[(0, 3)]).as_slice());
+
+        assert_eq!(maintenance_margin(&t, 0).unwrap(), 0);
+        for n in 0..5_000i64 {
+            assert_eq!(maintenance_margin(&t, n).unwrap(), n / 6, "n={n}");
+        }
+        // Dense sweep across the magnitude range, plus the i64 extremes.
+        let mut s: u64 = 0x51ed_270b_d772_1e6f;
+        for _ in 0..20_000 {
+            let n = (next(&mut s) % (i64::MAX as u64 / 2)) as i64;
+            assert_eq!(maintenance_margin(&t, n).unwrap(), n / 6, "n={n}");
+        }
+        for n in [
+            i64::MAX,
+            i64::MAX - 1,
+            i64::MAX - 2,
+            i64::MAX - 3,
+            i64::MAX - 4,
+            i64::MAX - 5,
+            i64::MAX / 6,
+            1_000_000_000_000_000_000,
+        ] {
+            assert_eq!(maintenance_margin(&t, n).unwrap(), n / 6, "n={n}");
+        }
+    }
+
+    /// THE LOAD-BEARING TEST. At a tier boundary the two adjacent tiers' rules must agree
+    /// EXACTLY: the requirement at `B_n` computed from the full table must equal the
+    /// requirement at `B_n` computed from the table truncated just before tier `n` (i.e.
+    /// still under the previous tier's rule). Any +1 step here liquidates a healthy
+    /// position on a negligible size increase — deterministically, on every node.
+    ///
+    /// This test FAILS on the spec's literal subtractive recursion (a single floored
+    /// `⌊B*(mmr_n - mmr_{n-1})⌋` deduction) and PASSES on the slice form. That is its
+    /// entire purpose — see [`maintenance_margin`]'s doc comment.
+    #[test]
+    fn tier_boundaries_are_continuous() {
+        // Exhaustive small 2-tier grid.
+        for l0 in 2u32..=8 {
+            for l1 in 1u32..l0 {
+                for b in 1u64..=400 {
+                    let full = table(&[(0, l0), (b, l1)]);
+                    let truncated = table(&[(0, l0)]);
+                    assert_eq!(
+                        maintenance_margin(&full, b as i64).unwrap(),
+                        maintenance_margin(&truncated, b as i64).unwrap(),
+                        "discontinuity at 2-tier boundary l0={l0} l1={l1} b={b}"
+                    );
+                }
+            }
+        }
+
+        // Randomised 3..=8-tier tables, checked at EVERY boundary.
+        let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..4_000 {
+            let n_tiers = 3 + (next(&mut s) % 6) as usize; // 3..=8
+            let mut rows: Vec<(u64, u32)> = Vec::with_capacity(n_tiers);
+            let mut bound = 0u64;
+            let mut lev = 1 + (next(&mut s) % 100) as u32;
+            rows.push((0, lev));
+            for _ in 1..n_tiers {
+                // Strictly increasing bounds spanning several magnitudes.
+                bound += 1 + next(&mut s) % 10_000_000_000;
+                // Non-increasing leverage.
+                lev = 1 + next(&mut s) as u32 % lev;
+                rows.push((bound, lev));
+            }
+            let full = table(&rows);
+            for k in 1..rows.len() {
+                let b = rows[k].0 as i64;
+                let truncated = table(&rows[..k]);
+                assert_eq!(
+                    maintenance_margin(&full, b).unwrap(),
+                    maintenance_margin(&truncated, b).unwrap(),
+                    "discontinuity at boundary {k} of {rows:?}"
+                );
+            }
+        }
+    }
+
+    /// The exact counter-example the slice form exists for: at the boundary of
+    /// `[{0,3},{50e9,2}]` the previous tier's rule gives 8_333_333_333 (= 50e9/6) while the
+    /// spec's literal recursion gives 8_333_333_334 — a +1 step in the
+    /// liquidate-a-healthy-position direction.
+    #[test]
+    fn documented_counter_example_stays_on_the_slice_value() {
+        let b: i64 = 50_000_000_000;
+        let full = table(&[(0, 3), (b as u64, 2)]);
+        assert_eq!(maintenance_margin(&full, b).unwrap(), 8_333_333_333);
+        assert_eq!(maintenance_margin(&table(&[(0, 3)]), b).unwrap(), 8_333_333_333);
+
+        // What the spec's literal recursion produces, spelled out so the divergence is
+        // visible in the source and nobody "fixes" the implementation back to it:
+        //   notional*mmr(1) - deduction(1),  deduction(1) = floor(B * (mmr(1) - mmr(0)))
+        //                                                 = floor(B * (1/4 - 1/6)) = floor(B/12)
+        let literal = b as i128 / 4 - b as i128 / 12;
+        assert_eq!(
+            literal, 8_333_333_334,
+            "the literal recursion is the +1 the slice form exists to avoid"
+        );
+    }
+
+    /// Maintenance margin must never decrease as the position grows — otherwise a trader
+    /// could shed a requirement by adding size.
+    #[test]
+    fn maintenance_margin_is_monotone_in_notional() {
+        let tables = [
+            table(&[(0, 3)]),
+            table(&[(0, 3), (1_000, 2), (5_000, 1)]),
+            table(&[(0, 100), (7, 50), (13, 9), (101, 3), (1_000_003, 1)]),
+            table(&[
+                (0, 20),
+                (1_000_000, 10),
+                (5_000_000, 5),
+                (25_000_000, 4),
+                (100_000_000, 3),
+                (500_000_000, 2),
+                (2_500_000_000, 1),
+                (10_000_000_000, 1),
+            ]),
+        ];
+        for t in &tables {
+            let mut prev = 0i64;
+            for n in 0..30_000i64 {
+                let mm = maintenance_margin(t, n).unwrap();
+                assert!(mm >= prev, "mm dropped at n={n} in {t:?}");
+                prev = mm;
+            }
+            // And across the boundaries at scale.
+            let mut prev = maintenance_margin(t, 0).unwrap();
+            let mut n = 0i64;
+            while n < 12_000_000_000 {
+                n += 999_331;
+                let mm = maintenance_margin(t, n).unwrap();
+                assert!(mm >= prev, "mm dropped at n={n} in {t:?}");
+                prev = mm;
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_margin_clamps_negative_input_and_survives_a_zero_leverage_blob() {
+        let t = table(&[(0, 3)]);
+        assert_eq!(maintenance_margin(&t, -1).unwrap(), 0);
+        // A corrupt max_leverage of 0 must not divide by zero (floored to 1 → mmr 1/2).
+        let corrupt = table(&[(0, 0)]);
+        assert_eq!(maintenance_margin(&corrupt, 100).unwrap(), 50);
+    }
+
+    #[test]
+    fn max_leverage_for_notional_picks_the_reached_tier() {
+        let t = table(&[(0, 5), (1_000, 3), (10_000, 1)]);
+        assert_eq!(max_leverage_for_notional(&t, 0), 5);
+        assert_eq!(max_leverage_for_notional(&t, 999), 5);
+        assert_eq!(max_leverage_for_notional(&t, 1_000), 3);
+        assert_eq!(max_leverage_for_notional(&t, 9_999), 3);
+        assert_eq!(max_leverage_for_notional(&t, 10_000), 1);
+        assert_eq!(max_leverage_for_notional(&t, i64::MAX), 1);
+        // Default table: constant, equal to the setLeverage cap.
+        let d = MarginTiers::default();
+        assert_eq!(max_leverage_for_notional(&d, 0), 3);
+        assert_eq!(max_leverage_for_notional(&d, i64::MAX), 3);
+    }
+
+    /// `is_above_maintenance_margin` under the default table must reproduce the pre-tier
+    /// `>= notional/6` comparison verbatim — including the exact `>=` boundary.
+    #[test]
+    fn is_above_maintenance_margin_matches_the_legacy_rate() {
+        let t = MarginTiers::default();
+        let (bd, pd) = (8u32, 2u32);
+        let mut s: u64 = 0xdead_beef_1234_5678;
+        for _ in 0..20_000 {
+            let mark = next(&mut s) % 1_000_000 + 1;
+            let amount = (next(&mut s) % 2_000_000) as i64 - 1_000_000;
+            let vq = (next(&mut s) % 4_000_000) as i64 - 2_000_000;
+            let margin = (next(&mut s) % 2_000_000) as i64;
+            let got = is_above_maintenance_margin(&t, mark, amount, vq, margin, bd, pd).unwrap();
+            let notional = calc_value_i64(mark, amount, bd, pd).unwrap();
+            let want = notional + vq + margin >= notional.abs() / 6;
+            assert_eq!(got, want, "mark={mark} a={amount} vq={vq} m={margin}");
+        }
     }
 }

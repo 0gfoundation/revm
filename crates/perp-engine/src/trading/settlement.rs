@@ -8,7 +8,8 @@ use crate::{
     interface::IPerpDex,
     math::{
         calc_maker_fee_for_order_qty_with_bps, calc_trading_fee,
-        calc_value, checked_u64_to_i64, is_above_maintenance_margin,
+        calc_value, calc_value_i64, checked_u64_to_i64, is_above_maintenance_margin,
+        max_leverage_for_notional,
     },
     storage,
     types::{OrderStatus, Side},
@@ -1071,6 +1072,7 @@ fn finalize_core(
     if opening_qty > 0
         && mark_price > 0
         && !is_above_maintenance_margin(
+            &market.tiers,
             mark_price,
             pos.amount,
             pos.v_quote_balance,
@@ -1080,6 +1082,29 @@ fn finalize_core(
         )?
     {
         return Err(perp_err("placeOrder: open would breach maintenance margin"));
+    }
+
+    // Per-open margin-tier guard. NOT redundant with K9 above: K9 only asks "is the
+    // resulting position solvent at mark", so a user sitting at leverage 5 who grows into
+    // a max-leverage-3 tier passes K9 yet must still be refused. Under today's single-tier
+    // table this can never fire (the bound equals the `setLeverage` cap), which is exactly
+    // the point: enabling multi-tier becomes a pure config change. Pre-write, like every
+    // other genuine reject on this path (commit-only #23).
+    if opening_qty > 0 {
+        let abs_notional = calc_value_i64(
+            mark_price,
+            pos.amount,
+            market.base_decimals,
+            market.price_decimals,
+        )?
+        .checked_abs()
+        .ok_or_else(|| perp_err("placeOrder: tier notional abs overflow"))?;
+        let tier_cap = max_leverage_for_notional(&market.tiers, abs_notional);
+        if pos.leverage.max(1) > tier_cap as u64 {
+            return Err(perp_err(
+                "placeOrder: leverage exceeds the margin tier for this position size",
+            ));
+        }
     }
 
     // pos.amount changed; recompute margin_reserved so cross-side netting for the taker's
@@ -1175,6 +1200,7 @@ pub(super) fn settle_maker_fill_core(
     if fill.opening_qty > 0
         && mark_price > 0
         && !is_above_maintenance_margin(
+            &market.tiers,
             mark_price,
             trial_pos.amount,
             trial_pos.v_quote_balance,
@@ -1184,6 +1210,25 @@ pub(super) fn settle_maker_fill_core(
         )?
     {
         return Ok(MakerFillCore::RejectedInsolvent);
+    }
+
+    // Per-open margin-tier guard — the maker-side twin of the taker guard in
+    // `finalize_core`. Not redundant with K9 (which only checks solvency at mark);
+    // a no-op under the single-tier default, so enabling multi-tier is a config change.
+    // Evaluated on the TRIAL copy, before anything is adopted → pre-write.
+    if fill.opening_qty > 0 {
+        let abs_notional = calc_value_i64(
+            mark_price,
+            trial_pos.amount,
+            market.base_decimals,
+            market.price_decimals,
+        )?
+        .checked_abs()
+        .ok_or_else(|| perp_err("settlement: tier notional abs overflow"))?;
+        let tier_cap = max_leverage_for_notional(&market.tiers, abs_notional);
+        if trial_pos.leverage.max(1) > tier_cap as u64 {
+            return Ok(MakerFillCore::RejectedInsolvent);
+        }
     }
 
     // Accept: adopt the trial result verbatim.
@@ -1830,7 +1875,7 @@ mod split_floor_conservation_tests {
     use super::split_position_fill;
     use crate::{
         math::calc_value,
-        types::{Market, Side},
+        types::{MarginTiers, Market, Side},
     };
 
     fn mkt(base_decimals: u32, price_decimals: u32) -> Market {
@@ -1850,6 +1895,7 @@ mod split_floor_conservation_tests {
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
             mark_price: 0,
+            tiers: MarginTiers::default(),
         }
     }
 

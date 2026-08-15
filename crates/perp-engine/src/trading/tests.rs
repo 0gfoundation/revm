@@ -10,7 +10,7 @@ use crate::{
         cancelOrderCall, getMarketFeeTotalCall, getOrderCall, placeOrderCall, AccountBalanceChanged,
     },
     run_perp_dex_call, storage,
-    types::{FundingState, Market, OrderStatus, PerpPosition, UserFeeRates},
+    types::{FundingState, MarginTiers, Market, OrderStatus, PerpPosition, UserFeeRates},
     PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
 
@@ -91,6 +91,7 @@ fn setup(ctx: &mut TestCtx) {
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
             mark_price: 0,
+            tiers: MarginTiers::default(),
         },
     )
     .unwrap();
@@ -272,6 +273,7 @@ fn setup_banded(ctx: &mut TestCtx, band_bps: u32) {
             liquidation_fee_rate_bps: 0,
             price_band_bps: band_bps,
             mark_price: 0,
+            tiers: MarginTiers::default(),
         },
     )
     .unwrap();
@@ -670,6 +672,7 @@ fn margin_uses_market_price_decimals() {
             liquidation_fee_rate_bps: 0,
             price_band_bps: 0,
             mark_price: 0,
+            tiers: MarginTiers::default(),
         },
     )
     .unwrap();
@@ -2943,6 +2946,7 @@ mod perf {
                 liquidation_fee_rate_bps: 0,
                 price_band_bps: 0,
                 mark_price: 0,
+                tiers: MarginTiers::default(),
             },
         )
         .unwrap();
@@ -3228,8 +3232,15 @@ mod golden {
     /// but read by no protocol rule). Business snapshot below keeps every surviving value; only the
     /// persisted layout, the getAccount/AccountBalanceChanged arity and the commitment differ.
     /// Prior value 0x06ee401de8dd26982c5820f9263f67c349cb139ac9fc4d6b4fbfbb73a0e57a0e.
+    /// RE-PIN (margin tiers Phase 1 + `BLOCK_COMMITMENT_VERSION` 13→14): `Market` gained the
+    /// `tiers` table (appended last, serialised as "mt"), so every stored market blob grows by
+    /// its default single-tier `[{0, 3}]` row. Arithmetically BEHAVIOUR-PRESERVING — the tier
+    /// maintenance rate `1/(2*3)` is the deleted `MAINTENANCE_MARGIN_DENOMINATOR = 6` — and the
+    /// only rule change (leverage cap 6 → 3) was pre-absorbed by the Phase-0.5 retune of this
+    /// scenario, so the business snapshot below is UNCHANGED. Prior value
+    /// 0xc2c839a6a4dc5fa20b64faa286e30e6b90e7e7905ebe070c5c91bfd0bb2314f1.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xc2c839a6a4dc5fa20b64faa286e30e6b90e7e7905ebe070c5c91bfd0bb2314f1");
+        b256!("0x677500b3559bb22e070c48c9134c3d33c37086b2249f3fb1e88e516a04a8fa04");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
