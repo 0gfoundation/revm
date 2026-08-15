@@ -4563,6 +4563,30 @@ mod batch_cancel {
     pub(super) const SIGNED_TS: u64 = 1; // == BlockEnv::default() timestamp
     pub(super) const SIGNED_RECV: u64 = 60;
 
+    /// Serialises every test that asserts an exact delta on `PERP_BATCH_ABORT_COUNT`.
+    ///
+    /// That counter is deliberately PROCESS-WIDE (it is a diagnostic tripwire, not per-call
+    /// state), and cargo runs tests in parallel — so two tests that each abort once can
+    /// interleave between one test's `before` read and its `after` read, making a
+    /// `before + 1` assertion observe `+2`. Holding this lock across the read-run-read
+    /// window keeps the exact-delta assertion (which is the property worth pinning: the
+    /// call aborted exactly once) instead of weakening it to "the counter moved".
+    ///
+    /// EVERY test that can bump the counter must take it — including ones that assert no
+    /// delta but still produce an abort, or they corrupt a concurrent test's assertion.
+    ///
+    /// Poisoning is ignored: a panic in one of these tests is already a test failure, and
+    /// propagating the poison would turn it into a cascade of unrelated failures.
+    pub(super) static ABORT_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes [`ABORT_COUNTER_LOCK`], ignoring poisoning. Hold the guard for the whole
+    /// read-run-read window.
+    pub(super) fn lock_abort_counter() -> std::sync::MutexGuard<'static, ()> {
+        ABORT_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // ── helpers ────────────────────────────────────────────────────────────
 
     fn direct_calldata(ids: &[[u8; 32]]) -> Vec<u8> {
@@ -4843,6 +4867,7 @@ mod batch_cancel {
             OrderStatus::Open,
         );
         let _ = JournalTr::take_logs(ctx.journal_mut());
+        let _abort_guard = lock_abort_counter();
         let aborts_before = batch::perp_batch_abort_count();
 
         let ids = [good, orphan, untouched];
@@ -4870,6 +4895,9 @@ mod batch_cancel {
     /// (no reliance on any error string).
     #[test]
     fn driver_classifies_by_write_count_not_by_message() {
+        // Produces aborts (so it bumps the global counter) even though it asserts no delta —
+        // it must still hold the lock or it corrupts a concurrent test's exact-delta assertion.
+        let _abort_guard = lock_abort_counter();
         let echo = |k: usize| [k as u8; 32];
         // `drive_batch` now asks for (index, tag) — the tag lets the place path report the id an
         // ABORT burned; the cancel path (and this driver test) is tag-agnostic.
@@ -5594,7 +5622,7 @@ mod batch_cancel {
 // `OrderPlaced`.
 mod batch_place {
     use super::batch_cancel::{
-        decode_statuses, expect, register_key, Status, SIGNED_RECV, SIGNED_TS,
+        decode_statuses, expect, lock_abort_counter, register_key, Status, SIGNED_RECV, SIGNED_TS,
     };
     use super::*;
     use crate::{
@@ -6590,6 +6618,7 @@ mod batch_place {
         arm_post_write_place_abort(&mut ctx);
         let _ = JournalTr::take_logs(ctx.journal_mut());
         let base = nonce(&mut ctx, ALICE);
+        let _abort_guard = lock_abort_counter();
         let aborts_before = batch::perp_batch_abort_count();
 
         let items = [
@@ -6643,6 +6672,7 @@ mod batch_place {
         storage::delete_order(&mut ctx, &stale).unwrap();
         let _ = JournalTr::take_logs(ctx.journal_mut());
         let base = nonce(&mut ctx, ALICE);
+        let _abort_guard = lock_abort_counter();
         let aborts_before = batch::perp_batch_abort_count();
 
         let blob = batch_place(
@@ -6791,6 +6821,9 @@ mod batch_place {
     /// (returning `Ok`, with committed writes) can never be replayed to re-run its tail.
     #[test]
     fn signed_batch_abort_still_burns_the_signature() {
+        // Produces an abort (bumps the global counter) without asserting a delta — same
+        // reason as `driver_classifies_by_write_count_not_by_message`: it must hold the lock.
+        let _abort_guard = lock_abort_counter();
         let mut ctx = make_ctx();
         setup(&mut ctx);
         let sk = SigningKey::from_bytes(&[7u8; 32]);
@@ -6962,6 +6995,7 @@ mod batch_place {
         arm_post_write_place_abort(&mut ctx); // ALICE taker-fee 100bps, BOB rests ask @ PRICE, admin=ZERO
         let _ = JournalTr::take_logs(ctx.journal_mut());
         let base = nonce(&mut ctx, ALICE);
+        let _abort_guard = lock_abort_counter();
         let aborts_before = batch::perp_batch_abort_count();
 
         let items = [
