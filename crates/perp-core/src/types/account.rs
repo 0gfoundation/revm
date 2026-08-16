@@ -88,9 +88,31 @@ impl UserAccount {
         }
     }
 
-    /// Returns whether the wallet can cover a user-initiated debit.
+    /// Returns whether the wallet can cover a user-initiated debit of `amount`.
+    ///
+    /// # Invariant
+    ///
+    /// **A risk-reducing or zero-cost action must never be gated on a balance the
+    /// user does not need.**
+    ///
+    /// `perp_wallet_balance` is deliberately SIGNED and can legitimately be
+    /// negative — a close-path fee, a funding charge, or a maker settlement
+    /// deficit can drive it below zero. A debit of **zero** is therefore always
+    /// affordable: nothing is being taken from the wallet, so there is nothing to
+    /// afford. Without the `amount == 0` arm the comparison is `-5 >= 0` ==
+    /// `false`, and a negative-balance user is refused precisely the actions that
+    /// would REDUCE their risk — a pure-reduce order (whose flip-aware
+    /// reservation delta is 0), and a close (whose `total_required` is 0 whenever
+    /// the fill opens nothing and the taker fee is covered).
+    ///
+    /// This widens no funding hole: every NON-zero debit is still refused unless
+    /// the signed balance covers it in full, and a debit above `i64::MAX` is
+    /// still refused outright.
     #[inline]
     pub fn has_available_perp(&self, amount: u64) -> bool {
+        if amount == 0 {
+            return true;
+        }
         match i64::try_from(amount) {
             Ok(amount) => self.perp_wallet_balance >= amount,
             Err(_) => false,
@@ -132,4 +154,44 @@ pub struct ApiKey {
     /// Unix-second expiry timestamp. `0` means the key never expires.
     #[serde(rename = "E")]
     pub expiry: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acct(perp_wallet_balance: i64) -> UserAccount {
+        UserAccount {
+            perp_wallet_balance,
+            ..UserAccount::default()
+        }
+    }
+
+    /// REGRESSION (B1). Pinned bug: `has_available_perp(0)` was `-5 >= 0` ==
+    /// `false`, so a NEGATIVE wallet refused a debit of ZERO — blocking the
+    /// risk-REDUCING actions (pure-reduce placement, close) whose required debit
+    /// is exactly 0.
+    #[test]
+    fn a_zero_debit_is_affordable_at_any_balance_including_negative() {
+        for balance in [i64::MIN, -1_000_000, -5, -1, 0, 1, i64::MAX] {
+            assert!(
+                acct(balance).has_available_perp(0),
+                "a zero debit must be affordable at balance {balance}"
+            );
+        }
+    }
+
+    /// The fix must not open a hole: every non-zero debit keeps the old rule.
+    #[test]
+    fn a_nonzero_debit_still_requires_the_balance_to_cover_it() {
+        assert!(!acct(-5).has_available_perp(1));
+        assert!(!acct(-5).has_available_perp(u64::MAX));
+        assert!(!acct(0).has_available_perp(1));
+        assert!(!acct(9).has_available_perp(10));
+        assert!(acct(10).has_available_perp(10), "the >= boundary is unchanged");
+        assert!(acct(11).has_available_perp(10));
+        // Above i64::MAX is still refused outright, even from a maximal balance.
+        assert!(!acct(i64::MAX).has_available_perp(i64::MAX as u64 + 1));
+        assert!(acct(i64::MAX).has_available_perp(i64::MAX as u64));
+    }
 }

@@ -7385,3 +7385,439 @@ mod batch_place {
         );
     }
 }
+
+// ── Risk-reducing admission (B1 zero-cost debit + B3 characterisation) ──────
+//
+// Invariant under test: **a user must never be blocked from REDUCING risk.**
+//
+// B1 is the fix for `UserAccount::has_available_perp(0)` returning `false` on a
+// negative wallet (`-5 >= 0`). B3 is a CHARACTERISATION of the audit claim
+// "Binance ADMITS, we REJECT: a partly-closing sell on a long" — the tests below
+// pin the actual `margin_reserved` / wallet-delta numbers so the verdict lives in
+// code, not prose.
+mod risk_reducing_admission {
+    use super::*;
+
+    /// $110 — one QTY lot is worth 1_100_000 here (calc_value(110e9, 1e6, 8, 9)).
+    const P_HIGH: u64 = 110 * TICK;
+    /// $120 — one QTY lot is worth 1_200_000.
+    const P_HIGHER: u64 = 120 * TICK;
+    /// $105 — one QTY lot is worth 1_050_000.
+    const P_MID: u64 = 105 * TICK;
+    /// $90 — one QTY lot is worth 900_000.
+    const P_LOW: u64 = 90 * TICK;
+
+    /// Raw SIGNED wallet balance. The `wallet()` helper reports
+    /// `visible_perp_wallet_balance()`, which clamps negatives to 0 — useless here.
+    fn raw_wallet(ctx: &mut TestCtx, user: Address) -> i64 {
+        storage::load_account(ctx, user).unwrap().perp_wallet_balance
+    }
+
+    /// Overwrite the signed perp wallet directly (same pattern as the existing
+    /// `alice.perp_wallet_balance = …` tests). A negative value is REACHABLE in
+    /// production — a close-path fee or funding charge can drive it below zero.
+    fn set_raw_wallet(ctx: &mut TestCtx, user: Address, v: i64) {
+        let mut a = storage::load_account(ctx, user).unwrap();
+        a.perp_wallet_balance = v;
+        storage::save_account(ctx, user, a).unwrap();
+    }
+
+    /// Seed a flat long of `lots` QTY-sized lots opened at PRICE (margin at leverage 1).
+    fn seed_long(ctx: &mut TestCtx, user: Address, lots: i64) {
+        let notional = lots * FILL_VALUE as i64;
+        storage::save_position(
+            ctx,
+            user,
+            MARKET_ID,
+            &PerpPosition {
+                amount: lots * QTY as i64,
+                v_quote_balance: -notional,
+                margin: notional,
+                leverage: 1,
+                ..PerpPosition::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn try_place(
+        ctx: &mut TestCtx,
+        caller: Address,
+        side: u8,
+        price: u64,
+        qty: u64,
+        order_type: u8,
+        tif: u8,
+    ) -> Result<Bytes, PerpError> {
+        let input = placeOrderCall {
+            marketId: MARKET_ID,
+            side,
+            price,
+            quantity: qty,
+            orderType: order_type,
+            tif,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
+        run_place_order(&input, caller, ctx)
+    }
+
+    fn cancel(ctx: &mut TestCtx, caller: Address, id: [u8; 32]) -> Result<Bytes, PerpError> {
+        let input = cancelOrderCall {
+            orderId: id.into(),
+            marketId: MARKET_ID,
+        }
+        .abi_encode();
+        run_cancel_order(&input, caller, ctx)
+    }
+
+    // ── B1 ─────────────────────────────────────────────────────────────────
+
+    /// REGRESSION (B1). Pinned bug: `has_available_perp(0)` evaluated `-5 >= 0`
+    /// == `false`, so a NEGATIVE perp wallet refused a debit of ZERO. This
+    /// placement reserves nothing (pure reduce ⇒ delta 0) yet was rejected with
+    /// "insufficient perp wallet for margin" — locking a negative-balance user
+    /// out of exactly the order that would REDUCE their risk.
+    #[test]
+    fn b1_negative_wallet_admits_a_zero_delta_reduce_only_rest() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 2);
+        set_raw_wallet(&mut ctx, ALICE, -5);
+
+        let ret = try_place(&mut ctx, ALICE, 1, P_HIGH, QTY, 0, 0)
+            .expect("a zero-cost risk-reducing order must be admitted on a negative wallet");
+        let id: [u8; 32] = ret[..32].try_into().unwrap();
+
+        assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
+        assert_eq!(
+            pos(&mut ctx, ALICE).margin_reserved,
+            0,
+            "a sell fully covered by the long opens nothing"
+        );
+        assert_eq!(
+            raw_wallet(&mut ctx, ALICE),
+            -5,
+            "a zero debit must leave the wallet untouched"
+        );
+    }
+
+    /// REGRESSION (B1), the sharper half: the CLOSE path, which is gated by a
+    /// `has_available_perp` site the audit's list of six does NOT contain —
+    /// `finalize_compute` in `trading/settlement.rs`.
+    ///
+    /// A pure close with a zero taker fee has `total_required == 0`
+    /// (`opening_margin + fee_from_wallet + mr_extra`, all zero). The gate is
+    /// evaluated on the POST-fill working copy, so a shallow deficit is masked:
+    /// the closing cashflow lifts the wallet positive before the check and the
+    /// close goes through even pre-fix. The bug only bites when the deficit is
+    /// DEEPER than the margin the close releases — which is exactly the user who
+    /// most needs to de-risk. Here: wallet −2_000_000, a 1-lot long releasing
+    /// 1_000_000, so the post-fill wallet is still −1_000_000 and
+    /// `has_available_perp(0)` returned false. Pre-fix that dropped into the
+    /// wallet-cover branch, found no same-side order to cancel, and rejected the
+    /// close with "insufficient perp wallet for margin" — the deepest-underwater
+    /// user was the one locked out of closing.
+    #[test]
+    fn b1_deeply_negative_wallet_user_can_still_close_a_position() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 1);
+        place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0); // BOB rests a bid at $100
+        // Deficit deeper than the 1_000_000 the close will release.
+        set_raw_wallet(&mut ctx, ALICE, -2_000_000);
+
+        try_place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 1)
+            .expect("closing a position must never be blocked by a negative wallet");
+
+        assert_eq!(pos(&mut ctx, ALICE).amount, 0, "position closed");
+        assert_eq!(
+            raw_wallet(&mut ctx, ALICE),
+            -2_000_000 + INIT_MARGIN as i64,
+            "the released position margin reduces the deficit; still negative, still allowed"
+        );
+    }
+
+    /// REGRESSION (B1) on the audit's missed site, and the ugliest shape of it.
+    /// `finalize_compute`'s cover branch runs a SIMULATED LIFO cancel loop,
+    /// `while !sim_account.has_available_perp(core.total_required)`, which a
+    /// negative wallet entered even at `total_required == 0`. Here the resting
+    /// sell is fully covered by the long, so it reserves NOTHING: cancelling it
+    /// in-sim credits 0, the wallet stays negative, the list is exhausted and the
+    /// close was REJECTED — the user was told to liquidate orders that could not
+    /// possibly help. (Had the order reserved something the sim could instead
+    /// have "succeeded" while the apply half, guarded by
+    /// `ensure_taker_wallet_can_cover_margin`'s own `required_margin == 0` early
+    /// return, performed no real cancel — the two halves disagreeing.)
+    /// Post-fix both halves take the zero fast path: the close is admitted and
+    /// the resting order is untouched.
+    #[test]
+    fn b1_zero_cost_close_does_not_disturb_resting_same_side_orders() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 2);
+        // A resting sell fully covered by the long: reserves nothing, and is the
+        // LIFO victim the sim cover loop would have reached for.
+        let resting = place(&mut ctx, ALICE, 1, P_HIGHER, QTY, 0, 0);
+        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
+        place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0); // BOB rests a bid at $100
+        set_raw_wallet(&mut ctx, ALICE, -5_000_000); // deeper than anything released
+
+        try_place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 1).expect("zero-cost close admitted");
+
+        assert_eq!(pos(&mut ctx, ALICE).amount, QTY as i64, "1 of 2 lots closed");
+        assert_eq!(
+            get_order(&mut ctx, resting).status,
+            OrderStatus::Open,
+            "the resting same-side order must survive a zero-cost close"
+        );
+    }
+
+    /// Companion to the above: the SHALLOW-deficit close was already fine pre-fix
+    /// (the closing cashflow lifts the working copy positive before the gate).
+    /// Pinned so the two cases are not conflated.
+    #[test]
+    fn b1_shallow_negative_wallet_close_was_already_admitted() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 1);
+        place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0);
+        set_raw_wallet(&mut ctx, ALICE, -5);
+
+        try_place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 1).expect("close admitted");
+
+        assert_eq!(pos(&mut ctx, ALICE).amount, 0);
+        assert_eq!(raw_wallet(&mut ctx, ALICE), INIT_MARGIN as i64 - 5);
+    }
+
+    /// B1 companion: the cancel path has NO balance gate by design. Pinning that
+    /// so nobody "helpfully" adds one.
+    #[test]
+    fn b1_negative_wallet_user_can_still_cancel() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let id = place(&mut ctx, ALICE, 0, P_LOW, QTY, 0, 0);
+        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 900_000);
+        set_raw_wallet(&mut ctx, ALICE, -5);
+
+        cancel(&mut ctx, ALICE, id).expect("cancel is ungated and must stay ungated");
+
+        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
+        assert_eq!(
+            raw_wallet(&mut ctx, ALICE),
+            900_000 - 5,
+            "the released reservation is credited back even from a negative wallet"
+        );
+    }
+
+    /// B1 must NOT open a funding hole: a genuinely margin-requiring order is
+    /// still refused on a negative wallet, and the ≥ boundary is unchanged.
+    #[test]
+    fn b1_negative_wallet_still_refuses_a_nonzero_debit() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        set_raw_wallet(&mut ctx, ALICE, -5);
+
+        let err = try_place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("insufficient perp wallet for margin"),
+            "{err}"
+        );
+        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0, "reject wrote nothing");
+
+        // Boundary is untouched: one unit short still fails, exactly enough passes.
+        set_raw_wallet(&mut ctx, ALICE, INIT_MARGIN as i64 - 1);
+        assert!(try_place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0).is_err());
+        set_raw_wallet(&mut ctx, ALICE, INIT_MARGIN as i64);
+        try_place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0).expect("exactly enough must pass");
+        assert_eq!(raw_wallet(&mut ctx, ALICE), 0);
+    }
+
+    // ── B3 ① pure reduce ───────────────────────────────────────────────────
+
+    /// B3 ①: a sell whose qty ≤ the long position opens NOTHING — `open_amount`
+    /// returns 0 for every entry still covered — so S = 0, and with no buys
+    /// B = B' = S' = 0 ⇒ C = max(S + B', B + S') = 0 ⇒ delta = 0.
+    /// Admitted at a POSITIVE, ZERO and (post-B1) NEGATIVE wallet alike.
+    /// VERDICT: ① is already fine; B1 is all it needed.
+    #[test]
+    fn b3_case1_pure_reduce_is_zero_delta_at_positive_zero_and_negative_balance() {
+        for balance in [WALLET as i64, 0i64, -5i64] {
+            let mut ctx = make_ctx();
+            setup(&mut ctx);
+            seed_long(&mut ctx, ALICE, 2);
+            set_raw_wallet(&mut ctx, ALICE, balance);
+
+            // Partial reduce: 1 lot against a 2-lot long.
+            try_place(&mut ctx, ALICE, 1, P_HIGH, QTY, 0, 0)
+                .unwrap_or_else(|e| panic!("partial reduce refused at balance {balance}: {e}"));
+            let p = pos(&mut ctx, ALICE);
+            assert_eq!(p.sell_side_reserved_notional, 0);
+            assert_eq!(p.margin_reserved_notional, 0);
+            assert_eq!(p.margin_reserved, 0);
+            assert_eq!(raw_wallet(&mut ctx, ALICE), balance, "delta == 0");
+
+            // Full reduce: the second lot, still exactly covered by the long.
+            try_place(&mut ctx, ALICE, 1, P_HIGHER, QTY, 0, 0)
+                .unwrap_or_else(|e| panic!("full reduce refused at balance {balance}: {e}"));
+            let p = pos(&mut ctx, ALICE);
+            assert_eq!(p.total_sell_qty, QTY * 2);
+            assert_eq!(p.margin_reserved, 0, "aggregate sells == long ⇒ still 0");
+            assert_eq!(raw_wallet(&mut ctx, ALICE), balance, "delta == 0");
+        }
+    }
+
+    // ── B3 ② flip ──────────────────────────────────────────────────────────
+
+    /// B3 ②: sell qty > long position. The excess is a genuine SHORT open, so
+    /// S = calc_value(price, qty − position) > 0 and delta > 0. A fully-deployed
+    /// user IS refused — and correctly so under this margin model.
+    ///
+    /// VERDICT: **not independently fixable.** Binance admits the flip only
+    /// because its joint `max()` nets the position margin the flip would RELEASE
+    /// (here: the long's own 1_000_000 of `pos.margin`, asserted untouched
+    /// below). Crediting that is A3 — a separate product decision — so this test
+    /// pins the CURRENT, self-consistent behaviour rather than "fixing" it.
+    #[test]
+    fn b3_case2_flip_needs_fresh_margin_because_the_released_position_margin_is_not_credited() {
+        // Fully deployed ⇒ refused.
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 1);
+        set_raw_wallet(&mut ctx, ALICE, 0);
+        let err = try_place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("insufficient perp wallet for margin"),
+            "{err}"
+        );
+        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0, "reject wrote nothing");
+
+        // One unit short of the opening requirement: still refused.
+        set_raw_wallet(&mut ctx, ALICE, 1_100_000 - 1);
+        assert!(try_place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0).is_err());
+
+        // Exactly the opening leg (1 excess lot at $110) is admitted.
+        set_raw_wallet(&mut ctx, ALICE, 1_100_000);
+        try_place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0)
+            .expect("admitted at exactly the opening requirement");
+        let p = pos(&mut ctx, ALICE);
+        assert_eq!(p.sell_side_reserved_notional, 1_100_000);
+        assert_eq!(p.margin_reserved, 1_100_000, "C = max(S + B', B + S') = S");
+        assert_eq!(raw_wallet(&mut ctx, ALICE), 0);
+        assert_eq!(
+            p.margin, 1_000_000,
+            "the long's own margin is NOT released/credited toward the flip — that credit is A3"
+        );
+    }
+
+    // ── B3 ③ reduce with other resting orders ──────────────────────────────
+
+    /// B3 ③a: an OPPOSITE-side resting order does NOT change the answer. The
+    /// flip-aware `B'` leg is evaluated at `p − total_sell_qty`, which for a
+    /// genuinely reducing sell (`qty ≤ p`) stays ≥ 0 — so B' is unchanged and
+    /// C is unchanged ⇒ delta still 0.
+    #[test]
+    fn b3_case3a_opposite_side_resting_order_does_not_block_a_reduce() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 2);
+
+        // Every buy OPENS on top of a long, so this reserves its full notional.
+        place(&mut ctx, ALICE, 0, P_LOW, QTY, 0, 0);
+        let p = pos(&mut ctx, ALICE);
+        assert_eq!(p.buy_side_reserved_notional, 900_000);
+        assert_eq!(p.margin_reserved, 900_000);
+
+        set_raw_wallet(&mut ctx, ALICE, 0); // fully deployed
+
+        try_place(&mut ctx, ALICE, 1, P_HIGH, QTY, 0, 0)
+            .expect("a reduce must be admitted despite a resting opposite-side order");
+        let p = pos(&mut ctx, ALICE);
+        // S = 0 (covered); B' = B(2 − 1 = +1 lot) = 900_000; S' = S(2 + 1) = 0
+        //   ⇒ C = max(0 + 900_000, 900_000 + 0) = 900_000 — UNCHANGED.
+        assert_eq!(p.sell_side_reserved_notional, 0);
+        assert_eq!(p.buy_side_reserved_notional, 900_000);
+        assert_eq!(p.margin_reserved, 900_000);
+        assert_eq!(raw_wallet(&mut ctx, ALICE), 0, "delta == 0");
+    }
+
+    /// B3 ③b: a SAME-side resting order DOES change the answer — but only by
+    /// consuming the position's cover. A second sell that is individually
+    /// reduce-only (1 lot ≤ a 2-lot long) takes the AGGREGATE sell qty to 3 lots
+    /// against a 2-lot long, i.e. a genuine 1-lot short open. Same root cause as
+    /// ②, so likewise A3 territory — NOT an independent bug.
+    #[test]
+    fn b3_case3b_same_side_resting_orders_turn_a_reduce_into_an_aggregate_flip() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 2);
+
+        // First sell exactly covers the long ⇒ reserves nothing.
+        place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0);
+        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
+
+        set_raw_wallet(&mut ctx, ALICE, 0); // fully deployed
+
+        let err = try_place(&mut ctx, ALICE, 1, P_HIGHER, QTY, 0, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("insufficient perp wallet for margin"),
+            "{err}"
+        );
+        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0, "reject wrote nothing");
+
+        // The opening leg is the 1 excess lot, priced at the HIGHEST sell ($120).
+        set_raw_wallet(&mut ctx, ALICE, 1_200_000);
+        try_place(&mut ctx, ALICE, 1, P_HIGHER, QTY, 0, 0).expect("admitted with the margin");
+        let p = pos(&mut ctx, ALICE);
+        assert_eq!(p.total_sell_qty, QTY * 3);
+        assert_eq!(p.sell_side_reserved_notional, 1_200_000);
+        assert_eq!(p.margin_reserved, 1_200_000);
+        assert_eq!(raw_wallet(&mut ctx, ALICE), 0);
+    }
+
+    /// B3 ③c (fell out of ③b): once the aggregate over-covers, the sell side is
+    /// scanned ASC, so the CHEAPEST sells absorb the position's cover and the
+    /// dearest are pushed into the opening bucket. The marginal charge is
+    /// therefore levied at the OTHER order's price, and can EXCEED the new
+    /// order's own notional.
+    ///
+    /// Not a bug — 3 lots sold from a 2-lot long IS a 1-lot short, and reserving
+    /// it at the dearest surviving price is the correct worst case — but it means
+    /// "my order is reduce-only, why am I charged more than it is worth?" has a
+    /// real, explainable answer. Pinned so the behaviour is deliberate.
+    #[test]
+    fn b3_case3c_marginal_charge_is_priced_at_the_other_order_not_the_new_one() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 2);
+        place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0); // 2 lots @ $110, exact cover
+        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
+
+        set_raw_wallet(&mut ctx, ALICE, 1_100_000);
+        // New order: 1 lot @ $105, own notional 1_050_000. Sells are scanned ASC,
+        // so it sorts FIRST and absorbs 1 lot of the 2-lot cover, opening nothing.
+        // The $110 order then absorbs the remaining 1 lot of cover and OPENS its
+        // other lot — at $110.
+        try_place(&mut ctx, ALICE, 1, P_MID, QTY, 0, 0).expect("admitted");
+        let p = pos(&mut ctx, ALICE);
+        assert_eq!(
+            p.sell_side_reserved_notional, 1_100_000,
+            "charged at $110 (the other order), not at the new order's $105"
+        );
+        assert_eq!(p.margin_reserved, 1_100_000);
+        assert_eq!(raw_wallet(&mut ctx, ALICE), 0);
+        // ...and that charge STRICTLY EXCEEDS the new order's own notional
+        // (1 lot @ $105 = 1_050_000) — the point of this test.
+        let own_notional =
+            crate::math::calc_value(P_MID, QTY, 8, 9).unwrap();
+        assert_eq!(own_notional, 1_050_000);
+        assert!(
+            p.margin_reserved > own_notional,
+            "reduce-only order charged {} > its own notional {own_notional}",
+            p.margin_reserved
+        );
+    }
+}
