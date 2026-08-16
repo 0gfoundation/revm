@@ -2204,19 +2204,69 @@ fn remove_position_margin_returns_safe_excess_margin_to_wallet() {
     assert_eq!(position(&mut ctx, ALICE).margin, MARGIN);
 }
 
+/// B2: MAINTENANCE margin is the only requirement gate. The initial-margin gate that used to sit
+/// in front of it is gone (Binance checks MM continuously and never re-checks IM).
+///
+/// Same scenario as before the change — remove $40 from a $200 margin on a $1 000 position — and
+/// it is still REFUSED, but by the maintenance gate, which is the tighter and more correct one:
+/// notional $1 000 ⇒ MM = 1000/6 = $166.67, and $200 − $40 = $160 < $166.67.
 #[test]
-fn remove_position_margin_rejects_below_initial_margin_requirement() {
+fn remove_position_margin_rejects_when_it_would_breach_maintenance() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
 
     let err = remove_position_margin(&mut ctx, 40_000_000).unwrap_err();
     assert!(
-        err.to_string().contains("below initial margin requirement"),
-        "{err}"
+        err.to_string().contains("below maintenance margin"),
+        "the maintenance gate, not the removed initial-margin gate: {err}"
     );
     assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET);
     assert_eq!(position(&mut ctx, ALICE).margin, MARGIN);
+
+    // And the boundary is genuinely the maintenance threshold, not the old IM one: removing
+    // $33.33 leaves $166_666_667, one unit above MM = $166_666_666, and is ALLOWED. Under the
+    // old gate every one of these was refused, because IM = N/5 = $200 == the whole margin.
+    assert!(remove_position_margin(&mut ctx, 33_333_333).is_ok());
+    assert_eq!(position(&mut ctx, ALICE).margin, 166_666_667);
+}
+
+/// B2, the case that made the old gate unusable: at a market's MAX leverage a freshly opened
+/// position is already BELOW the initial-margin requirement, because since `7cc26360` the
+/// opening fill funds the trading fee out of the margin (`floor(N/L) − fee`). The old gate
+/// therefore refused EVERY removal — and even refused `add(X)` followed by `remove(X)`, a round
+/// trip that leaves the position exactly where it started.
+#[test]
+fn remove_position_margin_round_trips_at_max_leverage() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // Max leverage 3, and margin one fee-tick BELOW floor(N/3) — exactly the post-fill state.
+    let post_fee_margin = 1_000_000_000i64 / 3 - 1_000;
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY,
+            v_quote_balance: -ENTRY_VALUE,
+            margin: post_fee_margin,
+            leverage: 3,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+    let wallet_before = wallet(&mut ctx, ALICE);
+
+    // add then remove the same amount: a no-op round trip that the old IM gate rejected.
+    add_position_margin(&mut ctx, 10_000_000).unwrap();
+    remove_position_margin(&mut ctx, 10_000_000).unwrap();
+    assert_eq!(position(&mut ctx, ALICE).margin, post_fee_margin);
+    assert_eq!(wallet(&mut ctx, ALICE), wallet_before);
+
+    // And genuine excess above maintenance is withdrawable: MM = 1000/6 = 166_666_666, so
+    // dropping from 333_332_333 to 233_332_333 stays comfortably clear.
+    remove_position_margin(&mut ctx, 100_000_000).unwrap();
+    assert_eq!(position(&mut ctx, ALICE).margin, post_fee_margin - 100_000_000);
 }
 
 #[test]

@@ -672,26 +672,24 @@ pub fn run_remove_position_margin<H: PerpHost>(
         ));
     }
     let new_margin = pos.margin - amount;
-    let required_initial_margin = calc_value(
-        mark_price,
-        pos.amount.unsigned_abs(),
-        market.base_decimals,
-        market.price_decimals,
-    )? / pos.leverage.max(1);
-    let required_initial_margin = checked_u64_to_i64(
-        required_initial_margin,
-        "removePositionMargin: initial margin",
-    )?;
-    if new_margin < required_initial_margin {
-        return Err(perp_err(
-            "removePositionMargin: resulting margin below initial margin requirement",
-        ));
-    }
-    // Reject if removing this margin would push the position to/under the
-    // maintenance-margin threshold (i.e. make it immediately liquidatable).
-    // Unlike the initial-margin check above, this accounts for unrealized PnL
-    // (`v_quote_balance`), so collateral cannot be stripped from a position
-    // that is sliding underwater.
+    // MAINTENANCE margin is the only requirement gate here — initial margin is deliberately NOT
+    // checked (B2, Binance parity).
+    //
+    // There used to be an additional `new_margin < ROUND_DOWN(N/L)` gate. It was strictly
+    // stronger than the maintenance check below and it made `removePositionMargin` unusable in
+    // the ordinary case: since `7cc26360` an opening fill funds the trading fee OUT of the
+    // margin, so a freshly opened position at its market's max leverage already sits at
+    // `floor(N/L) − fee`, i.e. BELOW the initial-margin requirement. Every removal was refused,
+    // and even `addPositionMargin(X)` followed by `removePositionMargin(X)` — a round trip that
+    // moves the position nowhere — was refused.
+    //
+    // Binance checks maintenance margin continuously and never re-checks initial margin
+    // (`binance-margin-verified-model.md` §1.5: margin is validated at placement and not again;
+    // `addPositionMargin`/`removePositionMargin` are a pure transfer that "不改 IM,不改 MM").
+    // The maintenance gate is the one that matters and is strictly the right one here: it
+    // accounts for unrealized PnL via `v_quote_balance`, which the initial-margin form did not,
+    // so collateral still cannot be stripped from a position that is sliding underwater — and a
+    // position can never be left immediately liquidatable.
     if !is_above_maintenance_margin(
         &market.tiers,
         mark_price,
