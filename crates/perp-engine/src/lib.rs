@@ -23,6 +23,7 @@ pub mod call;
 pub mod funding;
 pub mod host;
 pub mod interface;
+pub mod margin_view;
 pub mod risk;
 pub mod storage;
 pub mod trading;

@@ -18,14 +18,15 @@ use crate::{
     },
     batch,
     errors,
+    margin_view::{run_get_account_margin, run_get_margin_info},
     interface::IPerpDex::{
         addMarketCall, addPositionMarginCall, batchCancelOrdersCall,
         batchCancelOrdersSignedCall, batchPlaceOrdersCall, batchPlaceOrdersSignedCall,
         cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
-        getAccountCall, getAdminCall, getApiKeyCall, getApiKeysCall,
+        getAccountCall, getAccountMarginCall, getAdminCall, getApiKeyCall, getApiKeysCall,
         getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
-        getIndexPriceCall, getInsuranceFundCall, getMarginTiersCall, getMarkPriceCall,
-        getMarketCall,
+        getIndexPriceCall, getInsuranceFundCall, getMarginInfoCall, getMarginTiersCall,
+        getMarkPriceCall, getMarketCall,
         getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
         getOracleAddressCall, getOrderCall, getPositionCall, getUserFeeRatesCall,
         initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
@@ -136,6 +137,12 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getBookLevelCall::SELECTOR, (20_000, true));
         // Positions
         m.insert(getPositionCall::SELECTOR, (5_000, true));
+        // Derived margin views: pure reads (`can_be_static`). Priced like `getOpenOrders`
+        // (20_000) because `getMarginInfo` walks the same two per-user order lists; the
+        // account roll-up does that once per market id and is bounded by
+        // `margin_view::MAX_MARGIN_INFO_MARKETS`.
+        m.insert(getMarginInfoCall::SELECTOR, (20_000, true));
+        m.insert(getAccountMarginCall::SELECTOR, (50_000, true));
         m.insert(addPositionMarginCall::SELECTOR, (30_000, false));
         m.insert(removePositionMarginCall::SELECTOR, (30_000, false));
         // Liquidation
@@ -326,6 +333,8 @@ pub fn run_perp_dex_call<H: PerpHost>(
         s if s == getBookLevelCall::SELECTOR => run_get_book_level(input_bytes, context),
         // Positions
         s if s == getPositionCall::SELECTOR => run_get_position(input_bytes, context),
+        s if s == getMarginInfoCall::SELECTOR => run_get_margin_info(input_bytes, context),
+        s if s == getAccountMarginCall::SELECTOR => run_get_account_margin(input_bytes, context),
         s if s == addPositionMarginCall::SELECTOR => {
             run_add_position_margin(input_bytes, caller, context)
         }

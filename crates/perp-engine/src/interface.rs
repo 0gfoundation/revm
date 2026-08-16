@@ -201,6 +201,185 @@ sol! {
             uint64 marginReserved,
             uint64 leverage
         );
+
+        // ── Derived margin view (Binance-shaped; pure read, stores nothing) ───
+        //
+        // Binance stores only a small ledger (`walletBalance`, per-position `isolatedWallet`,
+        // `positionAmt`, `entryPrice`) and DERIVES every margin quantity on read. We instead
+        // STORE five quantities Binance derives (`margin_reserved`, `margin_reserved_notional`,
+        // `buy/sell_side_margin_reserved`, `buy/sell_side_reserved_notional`) and physically
+        // debit the wallet for them.
+        //
+        // These two views do NOT change that. They report the Binance-shaped numbers ALONGSIDE
+        // ours, so integrators get the fields they actually compare against and we can measure
+        // the gap between Binance's formulas and our escrow. They move no money, write no
+        // storage, and change no execution rule.
+        //
+        // Formula source: `misc/binance-margin-verified-model.md` §1.1/§2 and
+        // `misc/binance-v3-account-balance-field-reference.md` §4 (Binance USDⓈ-M mainnet,
+        // ISOLATED + ONE-WAY, measured to 8 decimals).
+
+        /// Binance-shaped margin report for one `(user, marketId)`, computed on demand.
+        ///
+        /// Unlike Binance's own `v3 account.positions[]` — which reports `notional`,
+        /// `initialMargin` and `maintMargin` while omitting every input needed to check them
+        /// (no mark, no entry, no leverage, no bid/ask notional), forcing two more endpoint
+        /// calls — the first six returns are the INPUTS, so a client can recompute all seven
+        /// derived values locally and byte-exactly.
+        ///
+        /// Inputs:
+        ///   markPrice       market's current mark, in `priceDecimals` fixed-point units.
+        ///   positionAmt     signed net position (base units). Positive = long.
+        ///   vQuoteBalance   virtual quote balance; `entryPrice = -vQuoteBalance / positionAmt`.
+        ///   leverage        the position's leverage setting (never 0 — floored at 1).
+        ///   bidNotional     `Bid` = Σ over the user's resting BUYS in this market of
+        ///                   `qty × that order's LIMIT price` (NOT mark), each term floored to
+        ///                   quote units exactly as the engine's own reservation fold floors it.
+        ///   askNotional     `Ask`, same over resting SELLS.
+        ///
+        /// Derived (Binance formulas, Binance rounding):
+        ///   notional              `trunc(|positionAmt| × markPrice)` — TRUNCATED, and every
+        ///                         field below uses this truncated value, not raw mark.
+        ///   unrealizedProfit      `positionAmt × (markPrice − entryPrice)`, TRUNCATED TOWARD
+        ///                         ZERO (not floor). Computed here as
+        ///                         `signedNotional + vQuoteBalance`, where `signedNotional` is
+        ///                         `notional` carrying `positionAmt`'s sign.
+        ///   isolatedMargin        `isolatedWallet + unrealizedProfit`. Our `isolatedWallet` is
+        ///                         the position's own margin, returned as `positionMargin`.
+        ///                         This is position EQUITY at mark, not a balance: it may sit
+        ///                         below `positionMargin`, and it may go negative.
+        ///   positionInitialMargin `ROUND_UP(notional / leverage)` — ROUND_UP, not truncate.
+        ///   initialMargin         `ROUND_UP( max(|N + Bid|, |N − Ask|) / leverage )` — the
+        ///                         JOINT requirement over position AND resting orders, a genuine
+        ///                         `max()` (neither branch always wins). `N` is the SIGNED
+        ///                         notional: the two branches are "exposure if every buy fills"
+        ///                         and "exposure if every sell fills".
+        ///                         NOTE this deliberately mixes bases — `N` at mark, `Bid`/`Ask`
+        ///                         at limit price. That is Binance's formula, and this view
+        ///                         reports Binance's numbers.
+        ///   openOrderInitialMargin  `initialMargin − positionInitialMargin`. Computed as that
+        ///                         DIFFERENCE OF TWO ROUND_UPs, never as a single round-up of a
+        ///                         difference — the convenience form
+        ///                         `ROUND_UP(max(0, Bid, Ask − 2N) / L)` is not equivalent at
+        ///                         1 ulp, because `ceil(a) − ceil(b) != ceil(a − b)`.
+        ///   maintMargin           maintenance margin at `notional` under this market's tier
+        ///                         table (`getMarginTiers`).
+        ///
+        /// Ours, for comparison:
+        ///   marginReservedActual  the capital this position's resting orders ACTUALLY have
+        ///                         escrowed out of the wallet right now (`getPosition`'s
+        ///                         `marginReserved`). This is the number to compare against
+        ///                         `openOrderInitialMargin`: they answer the same question on
+        ///                         different bases and DIVERGE whenever a resting order could
+        ///                         flip the position's sign — Binance nets the position margin
+        ///                         that the flip would release, we do not.
+        ///   positionMargin        the position's own allocated margin (`isolatedWallet`).
+        ///
+        /// Reverts if the market does not exist. A user with no position and no orders reads
+        /// back all zeros with `leverage = 1`.
+        function getMarginInfo(address user, uint64 marketId) external view returns (
+            uint64 markPrice,
+            int64  positionAmt,
+            int64  vQuoteBalance,
+            uint64 leverage,
+            uint64 bidNotional,
+            uint64 askNotional,
+            uint64 notional,
+            int64  unrealizedProfit,
+            int64  isolatedMargin,
+            uint64 positionInitialMargin,
+            uint64 openOrderInitialMargin,
+            uint64 initialMargin,
+            uint64 maintMargin,
+            uint64 marginReservedActual,
+            int64  positionMargin
+        );
+
+        /// Account-level roll-up of [`getMarginInfo`] over an EXPLICIT list of markets.
+        ///
+        /// `marketIds` is an argument rather than "all the user's markets" because the engine
+        /// has no per-user market index and no global market list: the only enumerable
+        /// membership set is the per-market open-position registry, which maps market → users
+        /// (the wrong direction), and it does not include markets where the user only has
+        /// resting orders. Rather than invent an unbounded scan or add a stored index, the
+        /// caller names the markets. Duplicate ids are counted ONCE. At most
+        /// MAX_MARGIN_INFO_MARKETS (64) ids; an unknown market id reverts.
+        ///
+        ///   walletBalance             the user's perp wallet, SIGNED and unclamped (unlike
+        ///                             `getAccount`'s `availablePerpBalance`, which floors at 0).
+        ///   marginBalance             `walletBalance + totalUnrealizedProfit`.
+        ///   totalInitialMargin        Σ `initialMargin`         (== the next two, summed).
+        ///   totalPositionInitialMargin Σ `positionInitialMargin`.
+        ///   totalOpenOrderInitialMargin Σ `openOrderInitialMargin`.
+        ///   totalMaintMargin          Σ `maintMargin`.
+        ///   totalUnrealizedProfit     Σ `unrealizedProfit`.
+        ///   availableBalance          `walletBalance − totalOpenOrderInitialMargin`.
+        ///
+        /// ⚠️ THE SINGLE MOST CONFUSABLE POINT IN THIS ABI — what `walletBalance` is net of.
+        ///
+        /// Binance keeps THREE nested balances and derives the innermost on read:
+        ///
+        /// ```text
+        /// walletBalance                                              (gross)
+        /// crossWalletBalance = walletBalance      - SUM isolatedWallet (net of positions)
+        /// availableBalance   = crossWalletBalance - SUM ooIM           (net of open orders)
+        /// ```
+        ///
+        /// Only the outer two are ledger state there; `Σ ooIM` is never debited from anything,
+        /// it is recomputed from the resting book on every read.
+        ///
+        /// We keep exactly ONE balance, and it is the INNERMOST one. `perp_wallet_balance` has
+        /// already had BOTH subtractions physically applied to it: each position's `margin` is
+        /// debited when the position opens, AND each order's `margin_reserved` delta is debited
+        /// at placement and credited back at cancel/fill. So:
+        ///
+        /// ```text
+        /// our     walletBalance      ~= Binance availableBalance  (both "spendable right now")
+        /// Binance crossWalletBalance ~= walletBalance + SUM marginReservedActual
+        /// Binance walletBalance      ~= that          + SUM positionMargin
+        /// ```
+        ///
+        /// (`marginReservedActual` and `positionMargin` per market come from `getMarginInfo`.)
+        ///
+        /// **Consequence: `availableBalance` as returned here subtracts the open-order
+        /// requirement TWICE** — once physically, inside `walletBalance`, on our own escrow
+        /// basis; once arithmetically, on Binance's `ooIM` basis. It is therefore NOT spendable
+        /// headroom (that is `walletBalance` itself). It is deliberately Binance's *formula*
+        /// evaluated on our ledger, which is what this whole layer exists to expose. The
+        /// like-for-like reconstruction is
+        ///
+        /// ```text
+        /// binanceAvailableBalance = walletBalance + SUM marginReservedActual
+        ///                                         - totalOpenOrderInitialMargin
+        /// ```
+        ///
+        /// and the difference between that and `walletBalance` — i.e.
+        /// `Σ marginReservedActual − totalOpenOrderInitialMargin` — IS the measured gap between
+        /// Binance's requirement and our escrow. The same caveat applies to `marginBalance`:
+        /// Binance's is built on their GROSS wallet, ours on the innermost one.
+        ///
+        /// ⚠️ Second, smaller departure: **we do NOT truncate `availableBalance` at zero.**
+        /// Binance does — it was measured reporting `0.00000000` where the true value was
+        /// `−0.00085981`, and the reference doc's verdict is that you therefore cannot use
+        /// their field to tell whether an account is under-covered. Ours is `int64` and is
+        /// allowed to go negative. Given the double subtraction above, a NEGATIVE value here is
+        /// ordinary for any account with resting orders and is not by itself a distress signal.
+        ///
+        /// Like `getMarginInfo` this is a pure read: it stores nothing and moves no money. In
+        /// particular a negative `availableBalance` triggers no cancellation — resting orders
+        /// are never torn down mid-life by this layer.
+        function getAccountMargin(address user, uint64[] marketIds) external view returns (
+            int64  walletBalance,
+            int64  marginBalance,
+            uint64 totalInitialMargin,
+            uint64 totalPositionInitialMargin,
+            uint64 totalOpenOrderInitialMargin,
+            uint64 totalMaintMargin,
+            int64  totalUnrealizedProfit,
+            int64  availableBalance,
+            uint64 totalMarginReserved
+        );
+
         /// Add isolated margin from the caller's perp wallet to an open position.
         function addPositionMargin(uint64 marketId, uint64 amount) external;
         /// Remove isolated margin from an open position back to the caller's perp wallet.
