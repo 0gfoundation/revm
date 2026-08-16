@@ -35,7 +35,12 @@ use primitives::{B256, U256};
 // set (and `liquidate_position` no longer writes the account at all). No layout change; this is an
 // EXECUTION-RULE change, so the values folded into the delta differ. CHAIN change: golden re-pin
 // (below) + a coordinated wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 16;
+// Per-user market index (derived-ooIM Phase 0): bumped 16→17 — a NEW off-trie namespace
+// ("umkt", per-user set of the markets the user is active in) enters the block delta whenever a
+// user enters or leaves a market. Purely ADDITIVE: no existing blob's layout or value changes and
+// no execution rule moves (the golden BusinessSnapshot is unchanged), but the delta gains keys, so
+// the commitment shifts. CHAIN change: golden re-pin (below) + a coordinated wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 17;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

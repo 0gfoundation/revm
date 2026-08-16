@@ -51,6 +51,7 @@ enum StoreSlot {
     AskPrices(u64),
     BidLevel(u64, u64),
     AskLevel(u64, u64),
+    UserMarkets(Address),
 }
 
 /// Three-state read result from a typed sub-map.
@@ -148,6 +149,12 @@ pub struct TypedPerpStore {
     ask_prices: HashMap<u64, Slot<Vec<u64>>>,
     bid_levels: HashMap<(u64, u64), Slot<LevelBlob>>,
     ask_levels: HashMap<(u64, u64), Slot<LevelBlob>>,
+    /// Per-user set of market ids the user is active in (ascending, `<= MAX_USER_MARKETS` long).
+    /// NOT hoisted into the batch working-set: it is written only on a market ENTER/LEAVE
+    /// transition (rare even inside a batch), so the ws's amortization has nothing to amortize —
+    /// and keeping one copy removes any chance of the ws and the main map disagreeing about
+    /// membership while the batch's per-item hooks read it back.
+    user_markets: HashMap<Address, Slot<Vec<u64>>>,
     // Stage B extends with the remaining namespaces, same patterns:
     //   bid_levels / ask_levels / bid_prices / ask_prices /
     //   market_fee_total / trade_count / position_registry / api_keys / api_key_ids /
@@ -1010,6 +1017,57 @@ impl TypedPerpStore {
         )
     }
 
+    // ── per-user market index (umkt), sorted Vec<u64> ───────────────────────
+    // Membership set of the markets a user is active in (non-zero position OR at least one
+    // resting order). Same shape as the per-market price indexes (`Vec<u64>`, msgpack): kept
+    // ASCENDING so the stored blob is canonical — the same logical set always serializes to the
+    // same bytes regardless of the order the markets were entered in.
+    //
+    // The EMPTY set is a DELETE (resident tombstone → empty bytes), not a stored `0x90`: it
+    // mirrors the `preg` position-registry convention ("an empty blob deletes the key") and keeps
+    // the namespace bounded by the number of CURRENTLY-active users rather than of all users ever.
+
+    /// Three-state read of a user's market set (see [`Resident`]).
+    #[inline]
+    pub fn user_markets(&self, user: Address) -> Resident<'_, Vec<u64>> {
+        match self.user_markets.get(&user) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(v)) => Resident::Hit(v.as_ref()),
+        }
+    }
+
+    /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    #[inline]
+    pub fn user_markets_arc(&self, user: Address) -> Option<Arc<Vec<u64>>> {
+        self.user_markets.get(&user).and_then(|s| s.clone())
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark; see [`Self::fill_account`]).
+    #[inline]
+    pub fn fill_user_markets(&mut self, user: Address, value: Option<Arc<Vec<u64>>>) {
+        self.user_markets.entry(user).or_insert(value);
+    }
+
+    /// Inserts/overwrites the set and marks its key dirty. The caller keeps it ascending.
+    #[inline]
+    pub fn set_user_markets(&mut self, user: Address, value: Vec<u64>) {
+        debug_assert!(
+            value.windows(2).all(|w| w[0] < w[1]),
+            "user market set must be strictly ascending (canonical bytes)"
+        );
+        self.mark(keys::user_markets_key(user), StoreSlot::UserMarkets(user));
+        self.user_markets.insert(user, Some(Arc::new(value)));
+    }
+
+    /// Removes the set (the user left their last market): resident tombstone + dirty mark, so the
+    /// block delta emits empty bytes (the store DELETE convention).
+    #[inline]
+    pub fn remove_user_markets(&mut self, user: Address) {
+        self.mark(keys::user_markets_key(user), StoreSlot::UserMarkets(user));
+        self.user_markets.insert(user, None);
+    }
+
     // ── Batch single-initiator working-set lifecycle ───────────────────────────
     /// Attaches a batch-scoped working-set for `owner`. Every subsequent account/position/buy/sell
     /// accessor whose subject is `owner` routes to the local working-set until [`Self::flush_batch`];
@@ -1143,6 +1201,10 @@ impl TypedPerpStore {
                     Some(Some(b)) => pack_level(b.as_ref()),
                     _ => Vec::new(),
                 },
+                StoreSlot::UserMarkets(u) => match self.user_markets.get(&u) {
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
+                },
             };
             out.push((key, bytes));
         }
@@ -1205,6 +1267,7 @@ impl PerpStore for TypedPerpStore {
                 StoreSlot::AskPrices(m) => entry(self.ask_prices.get(&m)),
                 StoreSlot::BidLevel(m, p) => level_entry(self.bid_levels.get(&(m, p))),
                 StoreSlot::AskLevel(m, p) => level_entry(self.ask_levels.get(&(m, p))),
+                StoreSlot::UserMarkets(u) => entry(self.user_markets.get(&u)),
             };
             out.insert(key, e);
         }
@@ -1460,6 +1523,47 @@ mod tests {
         let delta = store.take_delta().unwrap();
         assert_eq!(delta.len(), 1);
         assert!(delta[0].1.is_empty());
+    }
+
+    /// Per-user market index (`umkt`): canonical ASCENDING bytes independent of the order the
+    /// markets were inserted, and an EMPTY set is a DELETE (empty bytes), not a stored `0x90`.
+    #[test]
+    fn user_markets_are_canonical_and_empty_is_a_delete() {
+        let u = addr(0x77);
+        let bytes_for = |order: &[u64]| {
+            let mut store = TypedPerpStore::default();
+            // The caller keeps the set sorted; what is pinned here is that the SET, not the
+            // insertion order, determines the bytes.
+            let mut set: Vec<u64> = Vec::new();
+            for &m in order {
+                if let Err(i) = set.binary_search(&m) {
+                    set.insert(i, m);
+                }
+                store.set_user_markets(u, set.clone());
+            }
+            let delta = store.take_delta().unwrap();
+            assert_eq!(delta.len(), 1, "one key however many writes");
+            assert_eq!(delta[0].0, keys::user_markets_key(u));
+            delta[0].1.clone()
+        };
+        let ascending = bytes_for(&[1, 5, 9]);
+        assert_eq!(ascending, bytes_for(&[9, 1, 5]));
+        assert_eq!(ascending, bytes_for(&[5, 9, 1]));
+        assert_eq!(ascending, encode(&vec![1u64, 5, 9]).unwrap());
+
+        // Leaving the last market deletes the key.
+        let mut store = TypedPerpStore::default();
+        store.set_user_markets(u, vec![3]);
+        let _ = store.take_delta().unwrap();
+        store.remove_user_markets(u);
+        assert_eq!(
+            store.user_markets(u),
+            Resident::Deleted,
+            "not a fall-through Miss"
+        );
+        let delta = store.take_delta().unwrap();
+        assert_eq!(delta.len(), 1);
+        assert!(delta[0].1.is_empty(), "empty set → delete convention");
     }
 
     #[test]

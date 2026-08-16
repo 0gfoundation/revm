@@ -3527,8 +3527,19 @@ mod golden {
     /// positions, `admin_perp_wallet`, `market_fee_total`, `mark_price`, `funding` and every order
     /// status are identical. Prior value
     /// 0xa3fcb1f0cccd86eacd6ec33cfae4604a98577cd669c1b2d7ff3997aa0bf6b3ad.
+    /// RE-PIN (per-user market index, derived-ooIM Phase 0 + `BLOCK_COMMITMENT_VERSION` 16→17): a
+    /// NEW off-trie namespace ("umkt") records, per user, the set of markets they are active in
+    /// (non-zero position OR at least one resting order) — the inverse of the per-market position
+    /// registry, which points the wrong way for the derived-ooIM sum and is blind to markets where
+    /// a user holds only resting orders. Entering/leaving a market now adds a `umkt` write to the
+    /// block net delta, so the commitment shifts. Purely ADDITIVE: nothing reads the index yet, no
+    /// existing blob's layout or value changes, and no execution rule moves — the BusinessSnapshot
+    /// below is UNCHANGED. (This scenario is single-market, so it exercises enter-on-first-order
+    /// and leave-on-fully-flat; multi-market ordering and the cap are covered by the dedicated
+    /// `user_market_index` tests.) Prior value
+    /// 0xfd17be42969baf09c8e87f990e084ff83180f179c3118e13ed4ccf81e5d92828.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xfd17be42969baf09c8e87f990e084ff83180f179c3118e13ed4ccf81e5d92828");
+        b256!("0xb6b78e299b6b96f6dcc0c667c76cc4895ae4cd1932b305fdcda9c0907e998ee0");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -7855,6 +7866,680 @@ mod risk_reducing_admission {
             p.margin_reserved > own_notional,
             "reduce-only order charged {} > its own notional {own_notional}",
             p.margin_reserved
+        );
+    }
+}
+
+// ── Per-user market index (derived-ooIM Phase 0) ─────────────────────────────
+//
+// The index (`umkt`) answers "which markets is this user active in?", where ACTIVE means a
+// non-zero position OR at least one resting order. Nothing reads it yet — these tests are the
+// whole proof that it is maintained correctly, so the centrepiece is the ground-truth property
+// test: after EVERY step of a randomised operation sequence, the STORED index of each user must
+// equal the set recomputed independently from the position + order lists.
+mod user_market_index {
+    use super::*;
+    use crate::{
+        interface::IPerpDex::{
+            batchCancelOrdersCall, batchPlaceOrdersCall, liquidateCall, setLeverageCall, PlaceItem,
+        },
+        risk::{run_liquidate, run_set_leverage},
+        run_perp_dex_call,
+        storage::keys as storage_keys,
+        types::MAX_USER_MARKETS,
+    };
+
+    /// One `PlaceItem` (the batch analogue of [`try_place_in`]'s arguments).
+    fn item_in(
+        market_id: u64,
+        side: u8,
+        price: u64,
+        qty: u64,
+        order_type: u8,
+        tif: u8,
+    ) -> PlaceItem {
+        PlaceItem {
+            marketId: market_id,
+            side,
+            price,
+            quantity: qty,
+            orderType: order_type,
+            tif,
+            clientOrderId: FixedBytes::default(),
+        }
+    }
+
+    /// Markets the property test roams over.
+    const MARKETS: [u64; 3] = [1, 2, 3];
+    /// Deep pockets: the point of these tests is membership, never a margin reject.
+    const RICH: u64 = WALLET * 10_000;
+
+    fn market_at(id: u64) -> Market {
+        Market {
+            market_id: id,
+            base_decimals: 8,
+            price_decimals: 9,
+            tick_size: TICK,
+            step_size: QTY,
+            min_quantity: QTY,
+            max_quantity: QTY * 1_000,
+            max_price: PRICE * 1_000,
+            price_update_interval: 15,
+            active: true,
+            funding_interval: 0,
+            interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
+            // mark 0 disables the fill-time band, so matching in these tests is driven purely by
+            // the book. The liquidation op sets a mark deliberately and puts it back.
+            price_band_bps: 0,
+            mark_price: 0,
+            tiers: MarginTiers::default(),
+        }
+    }
+
+    fn setup_markets(ctx: &mut TestCtx, ids: &[u64], users: &[Address], wallet: u64) {
+        storage::save_admin(ctx, ADMIN).unwrap();
+        for &id in ids {
+            storage::save_market(ctx, &market_at(id)).unwrap();
+        }
+        for &u in users {
+            fund(ctx, u, wallet);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_place_in(
+        ctx: &mut TestCtx,
+        caller: Address,
+        market: u64,
+        side: u8,
+        price: u64,
+        qty: u64,
+        order_type: u8,
+        tif: u8,
+    ) -> Result<Bytes, PerpError> {
+        let input = placeOrderCall {
+            marketId: market,
+            side,
+            price,
+            quantity: qty,
+            orderType: order_type,
+            tif,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
+        run_place_order(&input, caller, ctx)
+    }
+
+    fn place_in(ctx: &mut TestCtx, caller: Address, market: u64, side: u8, price: u64) -> [u8; 32] {
+        let ret = try_place_in(ctx, caller, market, side, price, QTY, 0, 0).expect("placement");
+        ret[..32].try_into().unwrap()
+    }
+
+    fn cancel_in(
+        ctx: &mut TestCtx,
+        caller: Address,
+        market: u64,
+        id: [u8; 32],
+    ) -> Result<Bytes, PerpError> {
+        let input = cancelOrderCall {
+            orderId: id.into(),
+            marketId: market,
+        }
+        .abi_encode();
+        run_cancel_order(&input, caller, ctx)
+    }
+
+    /// The STORED index.
+    fn index(ctx: &mut TestCtx, user: Address) -> Vec<u64> {
+        storage::load_user_markets(ctx, user).unwrap()
+    }
+
+    /// The index recomputed from scratch out of the state it mirrors — the ground truth the
+    /// property test compares against. Deliberately re-derives the predicate from the three
+    /// underlying reads rather than reusing any engine helper.
+    fn ground_truth(ctx: &mut TestCtx, user: Address, markets: &[u64]) -> Vec<u64> {
+        markets
+            .iter()
+            .copied()
+            .filter(|&m| {
+                storage::load_position(ctx, user, m).unwrap().amount != 0
+                    || !storage::load_buy_orders(ctx, user, m).unwrap().is_empty()
+                    || !storage::load_sell_orders(ctx, user, m).unwrap().is_empty()
+            })
+            .collect()
+    }
+
+    fn assert_index_matches(ctx: &mut TestCtx, users: &[Address], markets: &[u64], step: &str) {
+        for &u in users {
+            assert_eq!(
+                index(ctx, u),
+                ground_truth(ctx, u, markets),
+                "user {u} index diverged from ground truth after {step}"
+            );
+        }
+    }
+
+    /// Deterministic xorshift (same generator as the settlement conservation fuzz).
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    // ── 1. The deliverable: ground-truth property test ──────────────────────
+
+    /// What one randomised pass actually reached. A property test that never gets to the
+    /// interesting transitions proves nothing, so the pass returns its coverage and the test
+    /// asserts on it.
+    #[derive(Debug, Default)]
+    struct FuzzCoverage {
+        enters: u32,
+        leaves: u32,
+        liquidations: u32,
+        flips: u32,
+    }
+
+    /// One randomised pass: a mix of place / cancel / fill / partial fill / close / flip /
+    /// liquidate across 3 markets and 2 users, asserting after EVERY step that each user's STORED
+    /// index equals `{ market : position != 0 OR buy_orders non-empty OR sell_orders non-empty }`,
+    /// recomputed independently from storage.
+    ///
+    /// This is what proves the maintenance hooks cover every transition: any write path that moves
+    /// `pos.amount` or an order list without going through them desynchronises the index within a
+    /// step or two of being exercised. Rejected operations are kept in the mix on purpose — a
+    /// reject must leave the index untouched too (validate-then-apply).
+    fn run_fuzz(seed: u64, wallet: u64, steps: u32) -> FuzzCoverage {
+        let users = [ALICE, BOB];
+        let mut ctx = make_ctx();
+        setup_markets(&mut ctx, &MARKETS, &users, wallet);
+        // Leverage 3 (the default tier cap) so an adverse mark can actually breach maintenance —
+        // a leverage-1 position is mathematically never liquidatable.
+        for &u in &users {
+            for &m in &MARKETS {
+                run_set_leverage(
+                    &setLeverageCall {
+                        marketId: m,
+                        leverage: 3,
+                    }
+                    .abi_encode(),
+                    u,
+                    &mut ctx,
+                )
+                .unwrap();
+            }
+        }
+        assert_index_matches(&mut ctx, &users, &MARKETS, "setup");
+
+        // Live order ids per (user index, market) so cancels have something real to aim at.
+        let mut live: Vec<Vec<[u8; 32]>> = vec![Vec::new(); users.len() * MARKETS.len()];
+        let slot = |ui: usize, mi: usize| ui * MARKETS.len() + mi;
+
+        let mut cov = FuzzCoverage::default();
+        let mut s: u64 = seed;
+        for step in 0..steps {
+            let r = next(&mut s);
+            let ui = (r % users.len() as u64) as usize;
+            let mi = ((r >> 8) % MARKETS.len() as u64) as usize;
+            let user = users[ui];
+            let market = MARKETS[mi];
+            let op = (r >> 16) % 8;
+            // Prices straddle $100 in $5 steps so orders both rest and cross.
+            let price = (90 + ((r >> 24) % 5) * 5) * TICK;
+            // 1..=4 lots: partial fills, full fills and over-fills (flips) all occur.
+            let qty = QTY * (1 + ((r >> 32) % 4));
+
+            let before: Vec<Vec<u64>> = users.iter().map(|&u| index(&mut ctx, u)).collect();
+            let amount_before = storage::load_position(&mut ctx, user, market)
+                .unwrap()
+                .amount;
+
+            let what: &str = match op {
+                // Resting / crossing GTC limits on both sides (the bread and butter: rest,
+                // full fill, partial fill, position open/increase/decrease/close/flip).
+                0..=3 => {
+                    let side = (op % 2) as u8;
+                    if let Ok(ret) = try_place_in(&mut ctx, user, market, side, price, qty, 0, 0) {
+                        let id: [u8; 32] = ret[..32].try_into().unwrap();
+                        // Only a still-live (resting) order is a future cancel target.
+                        if storage::load_order(&mut ctx, &id).unwrap().is_some() {
+                            live[slot(ui, mi)].push(id);
+                        }
+                    }
+                    "limit place"
+                }
+                // Market order: fills or expires, never rests.
+                4 => {
+                    let side = ((r >> 40) % 2) as u8;
+                    let _ = try_place_in(&mut ctx, user, market, side, 0, qty, 1, 1);
+                    "market place"
+                }
+                // Cancel one live order (the last-cancel is what removes an order-only member).
+                5 | 6 => {
+                    if let Some(id) = live[slot(ui, mi)].pop() {
+                        let _ = cancel_in(&mut ctx, user, market, id);
+                    }
+                    "cancel"
+                }
+                // Liquidate: cancel-all + close, the widest single-step transition there is.
+                // Crash/spike the mark against the holder's side, liquidate, then restore mark 0
+                // (which is also what keeps the fill-time band out of the other ops' way).
+                _ => {
+                    let amount = storage::load_position(&mut ctx, user, market)
+                        .unwrap()
+                        .amount;
+                    if amount != 0 {
+                        let mark = if amount > 0 { 10 * TICK } else { 400 * TICK };
+                        storage::save_mark_price(&mut ctx, market, mark).unwrap();
+                        let _ = run_liquidate(
+                            &liquidateCall {
+                                user,
+                                marketId: market,
+                            }
+                            .abi_encode(),
+                            users[1 - ui],
+                            &mut ctx,
+                        );
+                        storage::save_mark_price(&mut ctx, market, 0).unwrap();
+                        // Liquidation cancel-all kills every resting order of that user here.
+                        live[slot(ui, mi)].clear();
+                        if storage::load_position(&mut ctx, user, market)
+                            .unwrap()
+                            .amount
+                            == 0
+                        {
+                            cov.liquidations += 1;
+                        }
+                    }
+                    "liquidate"
+                }
+            };
+
+            let amount_after = storage::load_position(&mut ctx, user, market)
+                .unwrap()
+                .amount;
+            if amount_before.signum() * amount_after.signum() == -1 {
+                cov.flips += 1;
+            }
+            for (i, &u) in users.iter().enumerate() {
+                let after = index(&mut ctx, u);
+                cov.enters += after.iter().filter(|m| !before[i].contains(m)).count() as u32;
+                cov.leaves += before[i].iter().filter(|m| !after.contains(m)).count() as u32;
+            }
+
+            assert_index_matches(
+                &mut ctx,
+                &users,
+                &MARKETS,
+                &format!("step {step} ({what}, user {ui}, market {market})"),
+            );
+            // The index is a SET, always ascending, and never exceeds the cap.
+            for &u in &users {
+                let ix = index(&mut ctx, u);
+                assert!(
+                    ix.windows(2).all(|w| w[0] < w[1]),
+                    "index not strictly ascending at step {step}: {ix:?}"
+                );
+                assert!(ix.len() <= MAX_USER_MARKETS, "cap breached at step {step}");
+            }
+        }
+        cov
+    }
+
+    /// The centrepiece. Two passes with deliberately different money:
+    ///
+    /// * **deep pockets** — placements are never margin-rejected, so the mix is dominated by clean
+    ///   rests, fills, flips and liquidations;
+    /// * **thin wallets** — the paths that only appear when money runs out: the taker wallet-cover
+    ///   LIFO cancel cascade and the maker open-into-insolvency reject. Both empty an order list
+    ///   *mid-match*, through the match registry's flush, with the holder flat before AND after —
+    ///   the one shape no other hook can repair, so it is the pass that makes the order-list
+    ///   `save_*` hooks load-bearing.
+    #[test]
+    fn index_matches_ground_truth_after_every_operation() {
+        let deep = run_fuzz(0x0d_e4_11_ed_5e_ed_00_1f, RICH, 800);
+        let thin = run_fuzz(0x5c_a4_ce_11_a7_10_00_23, WALLET, 800);
+        println!("user-market-index fuzz coverage: deep={deep:?} thin={thin:?}");
+        for (name, cov) in [("deep", &deep), ("thin", &thin)] {
+            assert!(
+                cov.enters >= 20,
+                "{name}: too few market entries ({})",
+                cov.enters
+            );
+            assert!(
+                cov.leaves >= 20,
+                "{name}: too few market exits ({})",
+                cov.leaves
+            );
+        }
+        assert!(deep.liquidations >= 1, "no liquidation ever completed");
+        assert!(deep.flips >= 1, "no position ever flipped sign");
+    }
+
+    // ── 2. Enter / leave round trip ─────────────────────────────────────────
+
+    /// Entering a market inserts ONCE (a second order in the same market is not a second entry);
+    /// leaving happens on the LAST order cancel, not the first; and a position with no orders at
+    /// all still keeps the user in.
+    #[test]
+    fn enter_once_leave_on_the_last_order_and_a_position_alone_keeps_membership() {
+        let users = [ALICE, BOB];
+        let mut ctx = make_ctx();
+        setup_markets(&mut ctx, &MARKETS, &users, RICH);
+        assert!(index(&mut ctx, ALICE).is_empty(), "starts in no market");
+
+        // First resting bid in market 1 → enter.
+        let a1 = place_in(&mut ctx, ALICE, 1, 0, 95 * TICK);
+        assert_eq!(index(&mut ctx, ALICE), vec![1]);
+
+        // Second order in the SAME market → still one entry, not two.
+        let a2 = place_in(&mut ctx, ALICE, 1, 0, 94 * TICK);
+        assert_eq!(
+            index(&mut ctx, ALICE),
+            vec![1],
+            "second order must not re-enter"
+        );
+        // ...and the other side of the same market is not a third entry either.
+        let a3 = place_in(&mut ctx, ALICE, 1, 1, 105 * TICK);
+        assert_eq!(index(&mut ctx, ALICE), vec![1]);
+
+        // A different market appends (ascending).
+        let b1 = place_in(&mut ctx, ALICE, 2, 0, 95 * TICK);
+        assert_eq!(index(&mut ctx, ALICE), vec![1, 2]);
+
+        // Cancelling all but one order in market 1 keeps her in it.
+        cancel_in(&mut ctx, ALICE, 1, a1).unwrap();
+        cancel_in(&mut ctx, ALICE, 1, a3).unwrap();
+        assert_eq!(
+            index(&mut ctx, ALICE),
+            vec![1, 2],
+            "one order left → still a member"
+        );
+        // The LAST cancel leaves.
+        cancel_in(&mut ctx, ALICE, 1, a2).unwrap();
+        assert_eq!(
+            index(&mut ctx, ALICE),
+            vec![2],
+            "last order cancelled → left market 1"
+        );
+
+        // A POSITION with no orders keeps her in: BOB lifts her market-2 bid, so her only
+        // remaining trace there is the long it opened.
+        place_in(&mut ctx, BOB, 2, 1, 95 * TICK);
+        assert_terminal(&mut ctx, b1);
+        assert!(
+            storage::load_buy_orders(&mut ctx, ALICE, 2)
+                .unwrap()
+                .is_empty()
+                && storage::load_position(&mut ctx, ALICE, 2).unwrap().amount != 0,
+            "market 2 must now be position-only for ALICE"
+        );
+        assert_eq!(
+            index(&mut ctx, ALICE),
+            vec![2],
+            "a position alone keeps membership"
+        );
+        assert_eq!(
+            index(&mut ctx, BOB),
+            vec![2],
+            "and gives BOB the opposite side"
+        );
+
+        // Closing the position is the last thing she had there: BOB quotes a bid (he is short,
+        // so this closes both sides) and ALICE market-sells into it.
+        place_in(&mut ctx, BOB, 2, 0, 95 * TICK);
+        try_place_in(&mut ctx, ALICE, 2, 1, 0, QTY, 1, 1).unwrap();
+        assert_eq!(
+            storage::load_position(&mut ctx, ALICE, 2).unwrap().amount,
+            0
+        );
+        assert_eq!(storage::load_position(&mut ctx, BOB, 2).unwrap().amount, 0);
+        assert!(
+            index(&mut ctx, ALICE).is_empty(),
+            "flat everywhere → index key deleted"
+        );
+        assert!(
+            index(&mut ctx, BOB).is_empty(),
+            "the maker leaves on the same fill"
+        );
+    }
+
+    // ── 3. The cap ──────────────────────────────────────────────────────────
+
+    /// Entering one market past [`MAX_USER_MARKETS`] rejects with its own error string, and does
+    /// so BEFORE any write: the refused market has no order, no book entry and no index slot, and
+    /// the user's wallet and order nonce are exactly where they were.
+    #[test]
+    fn cap_rejects_the_market_past_the_limit_before_any_write() {
+        let over = MAX_USER_MARKETS as u64 + 1;
+        let all: Vec<u64> = (1..=over).collect();
+        let mut ctx = make_ctx();
+        setup_markets(&mut ctx, &all, &[ALICE], RICH);
+
+        for m in 1..=MAX_USER_MARKETS as u64 {
+            place_in(&mut ctx, ALICE, m, 0, 95 * TICK);
+        }
+        let full: Vec<u64> = (1..=MAX_USER_MARKETS as u64).collect();
+        assert_eq!(index(&mut ctx, ALICE), full, "exactly at the cap");
+
+        let wallet_before = wallet(&mut ctx, ALICE);
+        let nonce_before = storage::load_user_nonce(&mut ctx, ALICE).unwrap();
+        let err = try_place_in(&mut ctx, ALICE, over, 0, 95 * TICK, QTY, 0, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("user market limit reached"),
+            "wrong error: {err}"
+        );
+
+        // Pre-write: nothing about the refused market exists, and nothing of ALICE's moved.
+        assert_eq!(
+            index(&mut ctx, ALICE),
+            full,
+            "index unchanged by the reject"
+        );
+        assert!(storage::load_buy_orders(&mut ctx, ALICE, over)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage::load_position(&mut ctx, ALICE, over)
+                .unwrap()
+                .amount,
+            0
+        );
+        assert!(storage::load_bid_prices(&mut ctx, over).unwrap().is_empty());
+        assert_eq!(wallet(&mut ctx, ALICE), wallet_before, "no margin reserved");
+        assert_eq!(
+            storage::load_user_nonce(&mut ctx, ALICE).unwrap(),
+            nonce_before,
+            "a rejected placement must not consume an order id"
+        );
+
+        // A market she is ALREADY in is still admitted at the cap — the gate bounds the SET, not
+        // the order count.
+        place_in(&mut ctx, ALICE, 1, 0, 94 * TICK);
+        assert_eq!(index(&mut ctx, ALICE), full);
+
+        // Leaving one frees exactly one slot.
+        let orders = storage::load_buy_orders(&mut ctx, ALICE, 2).unwrap();
+        for e in orders.iter() {
+            cancel_in(&mut ctx, ALICE, 2, e.order_id).unwrap();
+        }
+        assert!(!index(&mut ctx, ALICE).contains(&2));
+        place_in(&mut ctx, ALICE, over, 0, 95 * TICK);
+        assert!(
+            index(&mut ctx, ALICE).contains(&over),
+            "freed slot is reusable"
+        );
+    }
+
+    // ── 4. Canonical ordering ───────────────────────────────────────────────
+
+    /// The stored blob depends only on the SET, never on the order the markets were entered in.
+    /// Compared on the real block-delta bytes (what the commitment folds), not on the decoded Vec.
+    #[test]
+    fn same_set_reached_by_different_orders_has_byte_identical_blobs() {
+        fn blob_after(entry_order: &[u64]) -> Vec<u8> {
+            let mut ctx = make_ctx();
+            setup_markets(&mut ctx, &MARKETS, &[ALICE], RICH);
+            for (i, &m) in entry_order.iter().enumerate() {
+                // Vary the side and price too, so nothing but the set can coincide.
+                let side = (i % 2) as u8;
+                let price = if side == 0 { 95 * TICK } else { 105 * TICK };
+                place_in(&mut ctx, ALICE, m, side, price);
+            }
+            let delta = JournalTr::take_perp_delta(ctx.journal_mut());
+            delta
+                .get(&storage_keys::user_markets_key(ALICE))
+                .expect("the index key is in the block delta")
+                .bytes
+                .clone()
+        }
+
+        let ascending = blob_after(&[1, 2, 3]);
+        let descending = blob_after(&[3, 2, 1]);
+        let shuffled = blob_after(&[2, 3, 1]);
+        assert_eq!(
+            ascending, descending,
+            "entry order must not reach the bytes"
+        );
+        assert_eq!(ascending, shuffled, "entry order must not reach the bytes");
+        assert!(!ascending.is_empty());
+        // And it really is the canonical encoding of the ascending set.
+        assert_eq!(ascending, storage::encode(&vec![1u64, 2, 3]).unwrap());
+
+        // Re-entering after leaving is likewise order-free: {1,3} is {1,3} either way.
+        assert_eq!(blob_after(&[1, 3]), blob_after(&[3, 1]));
+    }
+
+    // ── 6. The batch single-initiator working-set ───────────────────────────
+
+    /// A batch routes the initiator's position and order lists through a call-scoped working-set
+    /// that is only flushed into the main store at the end, while the index itself is NOT hoisted.
+    /// The maintenance hooks therefore read one copy and write another — this pins that the two
+    /// stay in agreement, both per item and after the flush.
+    #[test]
+    fn batch_place_and_cancel_maintain_the_index_through_the_working_set() {
+        let mut ctx = make_ctx();
+        setup_markets(&mut ctx, &MARKETS, &[ALICE], RICH);
+
+        let items: Vec<PlaceItem> = MARKETS
+            .iter()
+            .flat_map(|&m| {
+                [
+                    item_in(m, 0, 95 * TICK, QTY, 0, 0),
+                    item_in(m, 1, 105 * TICK, QTY, 0, 0),
+                ]
+            })
+            .collect();
+        let out = run_perp_dex_call(
+            &batchPlaceOrdersCall {
+                orders: items.clone(),
+            }
+            .abi_encode(),
+            30_000_000,
+            ALICE,
+            U256::ZERO,
+            false,
+            &mut ctx,
+        )
+        .expect("batch place");
+        assert!(!out.reverted);
+        assert_eq!(
+            index(&mut ctx, ALICE),
+            MARKETS.to_vec(),
+            "one batch entered all three markets"
+        );
+        assert_index_matches(&mut ctx, &[ALICE], &MARKETS, "batch place");
+
+        // Batch-cancel everything: every leg empties, so ALICE leaves every market.
+        let ids: Vec<FixedBytes<32>> = MARKETS
+            .iter()
+            .flat_map(|&m| {
+                let buys = storage::load_buy_orders(&mut ctx, ALICE, m).unwrap();
+                let sells = storage::load_sell_orders(&mut ctx, ALICE, m).unwrap();
+                buys.iter()
+                    .chain(sells.iter())
+                    .map(|e| FixedBytes(e.order_id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ids.len(), items.len());
+        let out = run_perp_dex_call(
+            &batchCancelOrdersCall { orderIds: ids }.abi_encode(),
+            30_000_000,
+            ALICE,
+            U256::ZERO,
+            false,
+            &mut ctx,
+        )
+        .expect("batch cancel");
+        assert!(!out.reverted);
+        assert_index_matches(&mut ctx, &[ALICE], &MARKETS, "batch cancel");
+        assert!(
+            index(&mut ctx, ALICE).is_empty(),
+            "cancelling every order leaves every market"
+        );
+    }
+
+    // ── 5. Liquidation clears the market ────────────────────────────────────
+
+    /// A liquidation cancels every resting order AND closes the position, so it is the one
+    /// operation that can clear all three legs at once — the user must leave the market.
+    #[test]
+    fn liquidation_removes_the_user_from_the_market_it_clears() {
+        let users = [ALICE, BOB];
+        let mut ctx = make_ctx();
+        setup_markets(&mut ctx, &MARKETS, &users, RICH);
+        for &m in &[1u64, 2] {
+            run_set_leverage(
+                &setLeverageCall {
+                    marketId: m,
+                    leverage: 3,
+                }
+                .abi_encode(),
+                ALICE,
+                &mut ctx,
+            )
+            .unwrap();
+        }
+
+        // ALICE goes long market 1 (BOB is the maker), and keeps resting orders on BOTH sides
+        // there plus an unrelated order in market 2.
+        place_in(&mut ctx, BOB, 1, 1, 100 * TICK);
+        place_in(&mut ctx, ALICE, 1, 0, 100 * TICK);
+        assert!(storage::load_position(&mut ctx, ALICE, 1).unwrap().amount > 0);
+        place_in(&mut ctx, ALICE, 1, 0, 90 * TICK);
+        place_in(&mut ctx, ALICE, 1, 1, 130 * TICK);
+        place_in(&mut ctx, ALICE, 2, 0, 95 * TICK);
+        assert_eq!(index(&mut ctx, ALICE), vec![1, 2]);
+
+        // Crash the mark: the long breaches maintenance and CAROL liquidates it.
+        storage::save_mark_price(&mut ctx, 1, 10 * TICK).unwrap();
+        run_liquidate(
+            &liquidateCall {
+                user: ALICE,
+                marketId: 1,
+            }
+            .abi_encode(),
+            CAROL,
+            &mut ctx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage::load_position(&mut ctx, ALICE, 1).unwrap().amount,
+            0
+        );
+        assert!(storage::load_buy_orders(&mut ctx, ALICE, 1)
+            .unwrap()
+            .is_empty());
+        assert!(storage::load_sell_orders(&mut ctx, ALICE, 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            index(&mut ctx, ALICE),
+            vec![2],
+            "liquidation cleared market 1; the untouched market 2 order keeps her there"
         );
     }
 }

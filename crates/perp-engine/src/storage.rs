@@ -10,11 +10,11 @@ use serde::Deserialize;
 
 use crate::PERP_DEX_ADDRESS;
 use crate::{
-        errors::perp_err,
+        errors::{perp_err, perp_invariant_err},
     types::{
         ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, MarketHot, Order,
         OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
-        PublicAccountBalance, UserAccount, UserFeeRates,
+        PublicAccountBalance, UserAccount, UserFeeRates, MAX_USER_MARKETS,
     },
     PerpError,
 };
@@ -25,7 +25,7 @@ use keys::{
     index_price_history_key, index_price_state_key, insurance_fund_key, market_fee_total_key,
     market_hot_key, market_key, market_manager_key, oracle_key, order_key, position_key,
     position_registry_key, premium_accumulator_key, price_basis_window_key, seen_bucket_key,
-    seen_sig_key, trade_count_key, user_buy_orders_key, user_sell_orders_key,
+    seen_sig_key, trade_count_key, user_buy_orders_key, user_markets_key, user_sell_orders_key,
 };
 
 // Canonical codec + block commitment live in `perp_core`; re-exported so in-crate callers
@@ -631,6 +631,10 @@ pub fn save_position<H: PerpHost>(
         registry_remove(context, market_id, user)?;
     }
     typed_store_mut(context).set_position(user, market_id, pos.clone());
+    // Per-user market index: the SAME zero-crossing, but evaluated AFTER the write — the
+    // leave branch re-reads the position to decide whether the user still has anything here,
+    // so it has to see the new `amount`.
+    sync_user_market_membership(context, user, market_id, old_amount != 0, pos.amount != 0)?;
     Ok(())
 }
 
@@ -705,6 +709,168 @@ fn registry_remove<H: PerpHost>(
     Ok(())
 }
 
+// ── Per-user market index (`umkt`) ─────────────────────────────────────────
+// The INVERSE of the per-market position registry above: for a user, which markets are they
+// active in? "Active" means **a non-zero position OR at least one resting order** — the position
+// registry cannot answer this, both because its direction is market → users and because it is
+// blind to a market where the user holds only resting orders.
+//
+// Stored as an ASCENDING `Vec<u64>` in the typed store (same shape as the per-market price
+// indexes). Ascending is what makes the blob CANONICAL: the same logical set reached by different
+// operation orders serialises to the same bytes. Membership is exact — leaving a market removes
+// the id, and emptying the set deletes the key (the `preg` convention) — so it never grows
+// unbounded, and it is additionally capped at [`MAX_USER_MARKETS`].
+//
+// Maintained by [`sync_user_market_membership`], called from the write choke points of the
+// activity predicate: [`save_position`] (position leg) and [`save_buy_orders`] /
+// [`save_sell_orders`] / [`mutate_buy_orders`] / [`mutate_sell_orders`] (order-list legs).
+// NOTHING reads it yet — it is deliberately inert until the derived-ooIM admission path lands.
+
+/// The markets `user` is active in (ascending). Empty when the user is flat everywhere.
+pub fn load_user_markets<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+) -> Result<Vec<u64>, PerpError> {
+    Ok((*load_user_markets_ref(context, user)?).clone())
+}
+
+/// Zero-clone read of [`load_user_markets`] (`Arc<Vec<u64>>`, refcount bump).
+pub fn load_user_markets_ref<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+) -> Result<std::sync::Arc<Vec<u64>>, PerpError> {
+    use crate::typed_store::Resident;
+    if let Some(arc) = typed_store_mut(context).user_markets_arc(user) {
+        return Ok(arc);
+    }
+    // Deleted (left the last market THIS block) is definitively empty — it must not fall through
+    // to the committed store, which still holds the pre-delete set.
+    if matches!(
+        typed_store_mut(context).user_markets(user),
+        Resident::Deleted
+    ) {
+        return Ok(std::sync::Arc::new(Vec::new()));
+    }
+    let arc = cold_load::<_, Vec<u64>>(context, user_markets_key(user))?;
+    typed_store_mut(context).fill_user_markets(user, arc.clone());
+    Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
+}
+
+/// Pre-write admission gate for the [`MAX_USER_MARKETS`] cap.
+///
+/// Called from the VALIDATION phase of order placement — the only way a user can enter a market
+/// they are not already in (a position can only appear through a fill of an order they placed;
+/// a maker fill, a liquidation, an ADL or a funding settlement always acts on a market the user
+/// is already active in). Pure read: it writes nothing, so it is a genuine reject in the
+/// commit-only sense and may precede every write on the path.
+pub fn ensure_user_market_admission<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<(), PerpError> {
+    let markets = load_user_markets_ref(context, user)?;
+    if markets.len() >= MAX_USER_MARKETS && markets.binary_search(&market_id).is_err() {
+        return Err(perp_err(format!(
+            "placeOrder: user market limit reached ({MAX_USER_MARKETS} markets)"
+        )));
+    }
+    Ok(())
+}
+
+/// Adds `market_id` to `user`'s set (idempotent; keeps it ascending).
+///
+/// The cap here is an INVARIANT backstop, not the enforcement point: every path that can reach it
+/// passed [`ensure_user_market_admission`] before writing anything, so a full set at this point
+/// means the gate was bypassed. It is reported rather than silently dropped — a dropped id would
+/// desynchronise the index from the state it mirrors, which is exactly the bug the cap exists to
+/// make impossible.
+fn user_markets_add<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<(), PerpError> {
+    let mut markets = load_user_markets(context, user)?;
+    let Err(i) = markets.binary_search(&market_id) else {
+        return Ok(()); // already a member — no write, so no spurious delta key
+    };
+    if markets.len() >= MAX_USER_MARKETS {
+        return Err(perp_invariant_err(format!(
+            "user market index: {user} exceeded {MAX_USER_MARKETS} markets entering market \
+             {market_id} (admission gate bypassed?)"
+        )));
+    }
+    markets.insert(i, market_id);
+    typed_store_mut(context).set_user_markets(user, markets);
+    Ok(())
+}
+
+/// Removes `market_id` from `user`'s set; deletes the key when the set empties.
+fn user_markets_remove<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<(), PerpError> {
+    let mut markets = load_user_markets(context, user)?;
+    let Ok(i) = markets.binary_search(&market_id) else {
+        return Ok(()); // not a member — no write
+    };
+    markets.remove(i);
+    if markets.is_empty() {
+        typed_store_mut(context).remove_user_markets(user);
+    } else {
+        typed_store_mut(context).set_user_markets(user, markets);
+    }
+    Ok(())
+}
+
+/// Ground truth of the membership predicate, read back from storage: does `user` hold a non-zero
+/// position OR any resting order in `market_id`?
+fn user_market_is_active<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<bool, PerpError> {
+    if load_position_ref(context, user, market_id)?.amount != 0 {
+        return Ok(true);
+    }
+    if !load_buy_orders_ref(context, user, market_id)?.is_empty() {
+        return Ok(true);
+    }
+    Ok(!load_sell_orders_ref(context, user, market_id)?.is_empty())
+}
+
+/// Per-write index maintenance, called AFTER one leg of the activity predicate (the position, the
+/// buy list or the sell list) has been written, with that leg's own before/after emptiness.
+///
+/// Only a leg TRANSITION can change membership, so the common case (`was == now`) costs a single
+/// bool compare and touches no storage:
+/// * leg became non-empty → the user is active here → insert (idempotent: a user who was already
+///   in the market through another leg writes nothing).
+/// * leg became empty → the user MIGHT have left; consult the other two legs and remove only if
+///   all three are now inactive.
+///
+/// Evaluating this after the leg's own write is what makes it order-independent: whichever leg
+/// moves last sees the other two in their final state, so any interleaving of the three writes
+/// converges on the same set.
+fn sync_user_market_membership<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    leg_was_active: bool,
+    leg_now_active: bool,
+) -> Result<(), PerpError> {
+    if leg_was_active == leg_now_active {
+        return Ok(());
+    }
+    if leg_now_active {
+        user_markets_add(context, user, market_id)
+    } else if user_market_is_active(context, user, market_id)? {
+        Ok(())
+    } else {
+        user_markets_remove(context, user, market_id)
+    }
+}
+
 // ── Order entry lists (per-user per-market) ───────────────────────────────────
 
 pub fn load_buy_orders<H: PerpHost>(
@@ -752,8 +918,10 @@ pub fn save_buy_orders<H: PerpHost>(
     market_id: u64,
     entries: &std::collections::VecDeque<OrderEntry>,
 ) -> Result<(), PerpError> {
+    let was_active = !load_buy_orders_ref(context, user, market_id)?.is_empty();
     // An EMPTY list is a stored value (msgpack `0x90`, key present) — never a delete.
     typed_store_mut(context).set_buy_orders(user, market_id, entries.iter().copied().collect());
+    sync_user_market_membership(context, user, market_id, was_active, !entries.is_empty())?;
     Ok(())
 }
 
@@ -801,7 +969,9 @@ pub fn save_sell_orders<H: PerpHost>(
     market_id: u64,
     entries: &std::collections::VecDeque<OrderEntry>,
 ) -> Result<(), PerpError> {
+    let was_active = !load_sell_orders_ref(context, user, market_id)?.is_empty();
     typed_store_mut(context).set_sell_orders(user, market_id, entries.iter().copied().collect());
+    sync_user_market_membership(context, user, market_id, was_active, !entries.is_empty())?;
     Ok(())
 }
 
@@ -816,12 +986,23 @@ pub fn mutate_buy_orders<H: PerpHost, R>(
     market_id: u64,
     f: impl FnOnce(&mut std::collections::VecDeque<OrderEntry>) -> R,
 ) -> Result<R, PerpError> {
-    if let Some(entries) = typed_store_mut(context).buy_orders_mut(user, market_id) {
-        return Ok(f(entries));
-    }
-    let mut entries = load_buy_orders(context, user, market_id)?;
-    let r = f(&mut entries);
-    typed_store_mut(context).set_buy_orders(user, market_id, entries);
+    // Emptiness before/after the edit drives the per-user market index (free here: the list is
+    // already borrowed, so neither probe costs a storage access).
+    let (r, was_active, now_active) =
+        if let Some(entries) = typed_store_mut(context).buy_orders_mut(user, market_id) {
+            let was = !entries.is_empty();
+            let r = f(entries);
+            let now = !entries.is_empty();
+            (r, was, now)
+        } else {
+            let mut entries = load_buy_orders(context, user, market_id)?;
+            let was = !entries.is_empty();
+            let r = f(&mut entries);
+            let now = !entries.is_empty();
+            typed_store_mut(context).set_buy_orders(user, market_id, entries);
+            (r, was, now)
+        };
+    sync_user_market_membership(context, user, market_id, was_active, now_active)?;
     Ok(r)
 }
 
@@ -832,12 +1013,22 @@ pub fn mutate_sell_orders<H: PerpHost, R>(
     market_id: u64,
     f: impl FnOnce(&mut std::collections::VecDeque<OrderEntry>) -> R,
 ) -> Result<R, PerpError> {
-    if let Some(entries) = typed_store_mut(context).sell_orders_mut(user, market_id) {
-        return Ok(f(entries));
-    }
-    let mut entries = load_sell_orders(context, user, market_id)?;
-    let r = f(&mut entries);
-    typed_store_mut(context).set_sell_orders(user, market_id, entries);
+    // See [`mutate_buy_orders`] for the emptiness before/after that drives the market index.
+    let (r, was_active, now_active) =
+        if let Some(entries) = typed_store_mut(context).sell_orders_mut(user, market_id) {
+            let was = !entries.is_empty();
+            let r = f(entries);
+            let now = !entries.is_empty();
+            (r, was, now)
+        } else {
+            let mut entries = load_sell_orders(context, user, market_id)?;
+            let was = !entries.is_empty();
+            let r = f(&mut entries);
+            let now = !entries.is_empty();
+            typed_store_mut(context).set_sell_orders(user, market_id, entries);
+            (r, was, now)
+        };
+    sync_user_market_membership(context, user, market_id, was_active, now_active)?;
     Ok(r)
 }
 

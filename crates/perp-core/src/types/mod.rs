@@ -4,7 +4,9 @@ pub mod oracle;
 pub mod order;
 pub mod position;
 
-pub use account::{ApiKey, PublicAccountBalance, UserAccount, MAX_PERP_WALLET_BALANCE};
+pub use account::{
+    ApiKey, PublicAccountBalance, UserAccount, MAX_PERP_WALLET_BALANCE, MAX_USER_MARKETS,
+};
 pub use fee::UserFeeRates;
 pub use oracle::{
     FundingState, IndexPriceHistory, IndexPriceState, PremiumIndexAccumulator, PriceBasisWindow,

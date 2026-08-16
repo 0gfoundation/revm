@@ -31,6 +31,7 @@ const PFX_SELL_ORDERS: [u8; 4] = *b"sord"; // per-user sell order entries
 const PFX_MARKET: [u8; 4] = *b"mkt\x00";
 const PFX_MARKET_HOT: [u8; 4] = *b"mhot"; // per-market grouped hot scalars (MarketHot): mark/BBO/last/OI
 const PFX_POSITION_REGISTRY: [u8; 4] = *b"preg"; // per-market set of addresses with an open position
+const PFX_USER_MARKETS: [u8; 4] = *b"umkt"; // per-user set of market ids the user is active in
 const PFX_BID_PRICES: [u8; 4] = *b"bidp"; // sorted Vec<u64> of active bid prices
 const PFX_ASK_PRICES: [u8; 4] = *b"askp"; // sorted Vec<u64> of active ask prices
 const PFX_BID_LEVEL: [u8; 4] = *b"bidl"; // FIFO queue of order IDs at a bid price
@@ -241,6 +242,20 @@ pub fn position_registry_key(market_id: u64) -> B256 {
     pack_market(PFX_POSITION_REGISTRY, market_id)
 }
 
+// ── Per-user market index ──────────────────────────────────────────────────────
+
+/// Per-user set of market ids the user is **active** in — active meaning a non-zero position
+/// OR at least one resting order in that market (`Vec<u64>`, ascending).
+///
+/// The inverse direction of [`position_registry_key`] (which is market → users and, by
+/// construction, blind to markets where a user holds only resting orders). Maintained by the
+/// `save_position` / order-list write hooks in `perp-engine`'s storage layer; bounded by
+/// `MAX_USER_MARKETS`.
+#[inline]
+pub fn user_markets_key(user: Address) -> B256 {
+    pack_addr(PFX_USER_MARKETS, user)
+}
+
 // ── Order book ────────────────────────────────────────────────────────────────
 
 /// Sorted list of all active **bid** prices for a market (Vec<u64>, price DESC).
@@ -391,6 +406,7 @@ mod const_key_tests {
             PFX_MARKET,
             PFX_MARKET_HOT,
             PFX_POSITION_REGISTRY,
+            PFX_USER_MARKETS,
             PFX_BID_PRICES,
             PFX_ASK_PRICES,
             PFX_BID_LEVEL,
@@ -448,6 +464,12 @@ mod const_key_tests {
         wl[12..20].copy_from_slice(&100u64.to_be_bytes());
         assert_eq!(bid_level_key(7, 100), B256::new(wl));
 
+        // user market index = "umkt" ++ addr ++ 8 zero
+        let mut wu = [0u8; 32];
+        wu[..4].copy_from_slice(b"umkt");
+        wu[4..24].copy_from_slice(a.as_slice());
+        assert_eq!(user_markets_key(a), B256::new(wu));
+
         // order = raw id (no prefix, no hash)
         let id = [0x42u8; 32];
         assert_eq!(order_key(&id), B256::new(id));
@@ -470,6 +492,9 @@ mod const_key_tests {
         assert_ne!(position_key(a, 3), user_sell_orders_key(a, 3));
         assert_ne!(user_buy_orders_key(a, 3), user_sell_orders_key(a, 3));
         assert_ne!(market_key(3), market_hot_key(3));
+        // per-user market index shares `pack_addr`'s shape with the account/api-key-ids families
+        assert_ne!(user_markets_key(a), account_key(a));
+        assert_ne!(user_markets_key(a), api_key_ids_key(a));
         assert_ne!(bid_prices_key(3), ask_prices_key(3));
         assert_ne!(bid_level_key(3, 100), ask_level_key(3, 100));
         // raw order id vs a structured key

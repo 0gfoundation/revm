@@ -7,6 +7,26 @@ use crate::{as_bin::AsBinStr, error::{perp_err, PerpError}};
 /// Maximum positive balance accepted by the signed perp wallet.
 pub const MAX_PERP_WALLET_BALANCE: u64 = i64::MAX as u64;
 
+/// Maximum number of markets one user may be **active** in simultaneously — active meaning a
+/// non-zero position OR at least one resting order (the per-user market index, `umkt`).
+///
+/// Bounded for the same reason as [`MAX_MARGIN_TIERS`](crate::types::MAX_MARGIN_TIERS) and the
+/// `MAX_BATCH_*` caps: every table an untrusted caller can grow has to have a ceiling, or one
+/// account can make a single blob — and every read of it — arbitrarily expensive.
+///
+/// **16.** Two things set the number:
+/// * *What it costs.* The index exists so `available = perp_wallet_balance − Σ_markets ooIM`
+///   can be evaluated (the derived-ooIM work); that sum is 2 loads per member market, so the cap
+///   is the worst-case fan-out of an admission check — 32 loads at 16, the same order as one
+///   `MAX_BATCH_PLACE` (64) batch already pays. The stored blob is ≤ 16 × u64 ≈ 145 bytes.
+/// * *What it must not block.* A user is only counted while they hold a position or a live order,
+///   and leaving a market frees the slot immediately, so 16 is 16 *concurrent* exposures — well
+///   past any realistic single-account book on a venue with a handful of listed markets.
+///
+/// Raising it is a pure constant change (no stored layout depends on it); the reject it drives is
+/// `placeOrder: user market limit reached`, refused BEFORE any write.
+pub const MAX_USER_MARKETS: usize = 16;
+
 /// On-chain record for a single user's DEX account.
 ///
 /// * `usdc_balance`        – U256 USDC units held in the DEX (deposit/withdraw layer).

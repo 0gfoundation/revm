@@ -927,6 +927,12 @@ fn place_order_core<H: PerpHost>(
         order_type_u8,
         tif_u8,
     )?;
+    // Per-user market-index cap. This is the ONLY way into a market the user is not already
+    // active in — a position can only appear through a fill of an order they placed, and every
+    // other position writer (maker fill, liquidation, ADL, funding) acts on a market where the
+    // user already holds a position or a resting order. Placed with the other genuine rejects,
+    // BEFORE any write, so the commit-only "no reject after a write" rule holds.
+    storage::ensure_user_market_admission(context, account, market_id)?;
 
     // commit-only #23: build the Order in memory. The OrderPlaced log is BUFFERED (not emitted):
     // every genuine reject still lies ahead, and the batch selectors catch a per-item error without
