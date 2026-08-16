@@ -630,13 +630,7 @@ impl MatchRegistry {
         }
         let mut pos = storage::load_position(context, user, market_id)?;
         let mut account = storage::load_account(context, user)?;
-        let pending = crate::funding::compute_funding_settlement(
-            context,
-            user,
-            market,
-            &mut pos,
-            &mut account.perp_wallet_balance,
-        )?;
+        let pending = crate::funding::compute_funding_settlement(context, user, market, &mut pos)?;
         if let Some(p) = pending {
             self.events.push(MatchEvent::ApplyFunding(p));
         }

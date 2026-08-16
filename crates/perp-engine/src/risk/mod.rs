@@ -614,14 +614,9 @@ pub fn run_add_position_margin<H: PerpHost>(
     }
     let mut account = storage::load_account(context, caller)?;
     // commit-only #23: compute funding IN MEMORY (no insurance-fund write yet), so a reject below
-    // leaves the IF untouched. The wallet/margin waterfall is applied to the in-memory pos/account.
-    let pending_funding = compute_funding_settlement(
-        context,
-        caller,
-        &market,
-        &mut pos,
-        &mut account.perp_wallet_balance,
-    )?;
+    // leaves the IF untouched. The credit/charge lands on the in-memory `pos.margin` — funding is
+    // isolated to the position and never touches the account-global wallet.
+    let pending_funding = compute_funding_settlement(context, caller, &market, &mut pos)?;
     if !account.has_available_perp(args.amount) {
         return Err(perp_err(
             "addPositionMargin: insufficient perp wallet balance",
@@ -670,13 +665,7 @@ pub fn run_remove_position_margin<H: PerpHost>(
     let mut account = storage::load_account(context, caller)?;
     // commit-only #23: compute funding IN MEMORY first (no IF write yet) so the checks below see
     // post-funding margin, and a reject leaves the insurance fund untouched.
-    let pending_funding = compute_funding_settlement(
-        context,
-        caller,
-        &market,
-        &mut pos,
-        &mut account.perp_wallet_balance,
-    )?;
+    let pending_funding = compute_funding_settlement(context, caller, &market, &mut pos)?;
     if pos.margin < amount {
         return Err(perp_err(
             "removePositionMargin: insufficient position margin",
@@ -775,14 +764,13 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // ZERO writes. This is what makes the liquidation sweep's healthy-candidate scan write-free
     // (previously every scanned healthy account wrote a funding settle that only checkpoint_revert
     // discarded) and makes manual liquidate reject cleanly without relying on undo.
-    let mut account = storage::load_account(context, user)?;
-    let pending_funding = compute_funding_settlement(
-        context,
-        user,
-        market,
-        &mut pos,
-        &mut account.perp_wallet_balance,
-    )?;
+    //
+    // Funding settles against `pos.margin` only, so this path no longer loads/writes the account at
+    // all: the load existed solely to hand the wallet to the settlement, and the matching
+    // `save_account` below would have re-written a byte-identical blob (and emitted a spurious
+    // `AccountBalanceChanged` for a balance that did not move). The liquidation's real wallet
+    // movements happen inside the close legs, which write the account themselves.
+    let pending_funding = compute_funding_settlement(context, user, market, &mut pos)?;
     if is_above_maintenance_margin(
         &market.tiers,
         mark_price,
@@ -808,7 +796,6 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     if let Some(p) = pending_funding {
         apply_funding_settlement(context, p)?;
     }
-    storage::save_account(context, user, account)?;
     storage::save_position(context, user, market_id, &pos)?;
 
     // Cancel all open orders for this user/market (emits OrderCancelled events).

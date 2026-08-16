@@ -788,20 +788,15 @@ fn set_funding_index(ctx: &mut TestCtx, index: i128) {
 fn settle_alice_funding(ctx: &mut TestCtx) -> (PerpPosition, UserAccount) {
     let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
     let mut pos = storage::load_position(ctx, ALICE, MARKET_ID).unwrap();
-    let mut account = storage::load_account(ctx, ALICE).unwrap();
-    settle_position_funding(
-        ctx,
-        ALICE,
-        &market,
-        &mut pos,
-        &mut account.perp_wallet_balance,
-    )
-    .unwrap();
+    settle_position_funding(ctx, ALICE, &market, &mut pos).unwrap();
+    // Funding must not touch the account at all, so the account is read back from STORAGE after
+    // settlement — asserting on a copy loaded before the call would be tautological.
+    let account = storage::load_account(ctx, ALICE).unwrap();
     (pos, account)
 }
 
 #[test]
-fn settle_funding_long_pays_from_wallet() {
+fn settle_funding_long_pays_from_position_margin() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx); // ALICE wallet = USER_WALLET = 50_000_000
     set_funding_index(&mut ctx, 75_000_000); // charge for QTY long = 7_500_000
@@ -809,16 +804,19 @@ fn settle_funding_long_pays_from_wallet() {
 
     let (pos, account) = settle_alice_funding(&mut ctx);
 
-    assert_eq!(account.perp_wallet_balance, USER_WALLET as i64 - 7_500_000);
+    // A1: funding settles against the POSITION. The charge lands on `pos.margin` — the term the
+    // maintenance check reads — and the account-global wallet, which also backs every OTHER
+    // market's orders, does not move.
+    assert_eq!(pos.margin, MARGIN - 7_500_000, "charge taken from margin");
     assert_eq!(
-        pos.margin, MARGIN,
-        "wallet covered the charge; margin untouched"
+        account.perp_wallet_balance, USER_WALLET as i64,
+        "wallet untouched (isolated margin)"
     );
     assert_eq!(pos.last_funding_index, 75_000_000, "re-anchored to index");
 }
 
 #[test]
-fn settle_funding_short_receives_into_wallet() {
+fn settle_funding_short_receives_into_position_margin() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     set_funding_index(&mut ctx, 75_000_000);
@@ -826,24 +824,36 @@ fn settle_funding_short_receives_into_wallet() {
 
     let (pos, account) = settle_alice_funding(&mut ctx);
 
-    assert_eq!(account.perp_wallet_balance, USER_WALLET as i64 + 7_500_000);
-    assert_eq!(pos.margin, MARGIN);
+    assert_eq!(
+        pos.margin,
+        MARGIN + 7_500_000,
+        "credit lands on the position"
+    );
+    assert_eq!(account.perp_wallet_balance, USER_WALLET as i64);
 }
 
 #[test]
-fn settle_funding_charge_waterfalls_wallet_then_margin() {
+fn settle_funding_charge_never_touches_the_wallet() {
+    // A1 (was `settle_funding_charge_waterfalls_wallet_then_margin`): the wallet→margin waterfall
+    // is GONE. Same fixture — a 60M charge against a 50M wallet and a 200M margin — but the wallet
+    // is no longer drained first; the whole charge bites the position.
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     set_funding_index(&mut ctx, 600_000_000); // charge = 60_000_000 > wallet 50M
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
 
     let (pos, account) = settle_alice_funding(&mut ctx);
 
-    assert_eq!(account.perp_wallet_balance, 0, "wallet drained to 0 first");
     assert_eq!(
-        pos.margin,
-        MARGIN - 10_000_000,
-        "remainder taken from margin"
+        account.perp_wallet_balance, USER_WALLET as i64,
+        "wallet is not a funding source any more"
+    );
+    assert_eq!(pos.margin, MARGIN - 60_000_000, "full charge from margin");
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        if_before,
+        "margin covered it — no insurance-fund spill"
     );
 }
 
@@ -852,12 +862,18 @@ fn settle_funding_charge_beyond_margin_absorbs_from_insurance_fund() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
-    set_funding_index(&mut ctx, 3_000_000_000); // charge = 300M > wallet 50M + margin 200M
+    // A1 re-scale: the pre-A1 index of 3_000_000_000 (charge 300M) left a 50M IF shortfall only
+    // because the wallet absorbed the first 50M. With the wallet leg gone, margin alone absorbs
+    // 200M, so the index is scaled to keep the SAME 50M shortfall this test was written to pin.
+    set_funding_index(&mut ctx, 2_500_000_000); // charge = 250M > margin 200M
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
 
     let (pos, account) = settle_alice_funding(&mut ctx);
 
-    assert_eq!(account.perp_wallet_balance, 0);
+    assert_eq!(
+        account.perp_wallet_balance, USER_WALLET as i64,
+        "wallet untouched even when the position cannot cover the charge"
+    );
     assert_eq!(pos.margin, 0);
     // 50M shortfall absorbed from the 80M insurance fund → 30M left.
     assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 30_000_000);
@@ -918,12 +934,13 @@ fn add_margin_rejected_after_funding_leaves_insurance_fund_untouched() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx); // ALICE wallet = USER_WALLET = 50M
     storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
-    set_funding_index(&mut ctx, 3_000_000_000); // charge 300M > wallet 50M + margin 200M → dips IF
+    set_funding_index(&mut ctx, 3_000_000_000); // charge 300M > margin 200M → dips IF
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
     let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
 
-    // Funding drains the wallet to 0 → the add-margin can't be covered → reject.
-    let err = add_position_margin(&mut ctx, 1_000_000).unwrap_err();
+    // A1: funding no longer drains the wallet, so the reject is driven by asking for more than
+    // the (untouched) 50M wallet holds. The pending IF draw is unchanged — that is the point.
+    let err = add_position_margin(&mut ctx, 100_000_000).unwrap_err();
     assert!(
         err.to_string().contains("insufficient perp wallet"),
         "{err}"
@@ -990,6 +1007,349 @@ fn settle_funding_noop_for_flat_position_but_reanchors() {
         "no charge on a flat position"
     );
     assert_eq!(pos.last_funding_index, 75_000_000, "still re-anchored");
+}
+
+// ── A1: funding settles against the POSITION ─────────────────────────────────
+//
+// Funding lands on `pos.margin`, the exact term `is_above_maintenance_margin` reads, so it MOVES
+// the liquidation price (Binance's measured behaviour) instead of being absorbed by an
+// account-global wallet that also backs every other market's orders.
+
+/// Quote units of notional per one price tick, for a `QTY`-sized position on this fixture's market
+/// (`base_decimals = 0`, `price_decimals = PRICE_DECIMALS`). Notional is
+/// `price * qty * 10^(QUOTE_DECIMALS - PRICE_DECIMALS)`.
+fn quote_per_price_tick(qty: i64) -> i128 {
+    qty as i128 * 10i128.pow(crate::math::QUOTE_DECIMALS - PRICE_DECIMALS)
+}
+
+/// Maintenance headroom at `mark`: `equity − maintenance_margin`, i.e. the distance to the
+/// liquidation boundary in quote units. Negative ⇒ liquidatable.
+fn maintenance_headroom(tiers: &MarginTiers, mark: u64, pos: &PerpPosition) -> i64 {
+    let notional = calc_value_i64(mark, pos.amount, 0, PRICE_DECIMALS).unwrap();
+    let equity = notional + pos.v_quote_balance + pos.margin;
+    equity - crate::math::maintenance_margin(tiers, notional.abs()).unwrap()
+}
+
+/// Solves OUR OWN liquidation condition for a LONG by bisecting the production predicate
+/// (`is_above_maintenance_margin` — the exact call the sweep makes): the lowest mark at which the
+/// position is still above maintenance. One tick below this is liquidation.
+fn long_liquidation_price(tiers: &MarginTiers, pos: &PerpPosition) -> u64 {
+    let above = |p: u64| {
+        is_above_maintenance_margin(
+            tiers,
+            p,
+            pos.amount,
+            pos.v_quote_balance,
+            pos.margin,
+            0,
+            PRICE_DECIMALS,
+        )
+        .unwrap()
+    };
+    let (mut lo, mut hi) = (1u64, 1_000_000u64); // hi = the fixture market's max_price
+    assert!(
+        above(hi),
+        "precondition: solvent at the top of the price range"
+    );
+    assert!(!above(lo), "precondition: liquidatable at the bottom");
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if above(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+#[test]
+fn funding_charge_moves_the_liquidation_price_by_the_closed_form() {
+    // THE test for A1. Binance (mainnet-measured) moves the liquidation price by
+    //     dLP = funding / (qty * (MMR - 1))
+    // when funding hits a position — qty cancels out of the derivation, and for a CHARGE of `f`
+    // on a long it reduces to a rise of `f / (qty * (1 - MMR))`. Pre-A1 the wallet absorbed the
+    // charge, so a well-funded wallet pinned the liquidation price in place indefinitely and
+    // subsidised a losing funding stream. Now the charge lands on `pos.margin` and the boundary
+    // moves.
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    save_position(&mut ctx, QTY, -ENTRY_VALUE); // long QTY @ $100, margin $200
+    set_funding_index(&mut ctx, 75_000_000); // charge = 7_500_000 on a QTY long
+    const CHARGE: i64 = 7_500_000;
+
+    let before = position(&mut ctx, ALICE);
+    let lp_before = long_liquidation_price(&market.tiers, &before);
+    let headroom_before = maintenance_headroom(&market.tiers, ENTRY_PRICE, &before);
+
+    let (after, _) = settle_alice_funding(&mut ctx);
+    let lp_after = long_liquidation_price(&market.tiers, &after);
+    let headroom_after = maintenance_headroom(&market.tiers, ENTRY_PRICE, &after);
+
+    assert_eq!(
+        before.margin - after.margin,
+        CHARGE,
+        "the charge must come out of the position"
+    );
+    // Headroom at the unchanged mark falls by exactly the charge (equity moves, MM does not).
+    assert_eq!(headroom_before - headroom_after, CHARGE);
+
+    // Closed form, in price ticks. The default single tier gives MMR = 1/(2*3) = 1/6.
+    let expected_shift = (CHARGE as i128 * 6) / (quote_per_price_tick(QTY) * 5);
+    assert_eq!(expected_shift, 90, "0.90 in $, i.e. 90 ticks at 2 decimals");
+    assert_eq!(
+        i128::from(lp_after) - i128::from(lp_before),
+        expected_shift,
+        "funding must move OUR liquidation price exactly as the closed form predicts"
+    );
+    // Absolute pin: $96.00 → $96.90 for a 10-lot long at $100 with $200 of margin.
+    assert_eq!((lp_before, lp_after), (9_600, 9_690));
+}
+
+#[test]
+fn funding_credit_lands_in_the_position_and_makes_it_safer() {
+    // The credit side was unconditionally divergent pre-A1 (`*wallet += payment`), so a receiving
+    // position never got safer. Now the credit is isolated margin: headroom grows by exactly the
+    // payment and the wallet does not move.
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    save_position(&mut ctx, -QTY, ENTRY_VALUE); // short receives when the rate is positive
+    set_funding_index(&mut ctx, 75_000_000);
+    const CREDIT: i64 = 7_500_000;
+
+    let before = position(&mut ctx, ALICE);
+    let headroom_before = maintenance_headroom(&market.tiers, ENTRY_PRICE, &before);
+
+    let (after, account) = settle_alice_funding(&mut ctx);
+
+    assert_eq!(
+        after.margin - before.margin,
+        CREDIT,
+        "credit into the position"
+    );
+    assert_eq!(
+        account.perp_wallet_balance, USER_WALLET as i64,
+        "the wallet must not move on a credit either"
+    );
+    assert_eq!(
+        maintenance_headroom(&market.tiers, ENTRY_PRICE, &after) - headroom_before,
+        CREDIT,
+        "a receiving position gets SAFER by exactly the payment"
+    );
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        USER_WALLET,
+        "and nothing was written to the stored account"
+    );
+}
+
+#[test]
+fn funding_on_one_market_leaves_another_markets_headroom_intact() {
+    // Isolated-margin CONTAINMENT. Pre-A1 `wallet` was the single account-global free pool, so a
+    // funding charge on market A drained the collateral backing market B's orders. Here the
+    // market-1 charge (60M) is LARGER than the whole wallet (50M) — pre-A1 that zeroed the wallet
+    // and market 2 became unfundable — yet market 2 must still be able to reserve the full 50M.
+    const OTHER_MARKET: u64 = 2;
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let mut other = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    other.market_id = OTHER_MARKET;
+    storage::save_market(&mut ctx, &other).unwrap();
+    storage::save_mark_price(&mut ctx, OTHER_MARKET, ENTRY_PRICE).unwrap();
+
+    save_position(&mut ctx, QTY, -ENTRY_VALUE); // market 1: long QTY, margin 200M
+    set_funding_index(&mut ctx, 600_000_000); // market-1 charge = 60_000_000 > wallet 50M
+
+    let (pos1, _) = settle_alice_funding(&mut ctx);
+    assert_eq!(
+        pos1.margin,
+        MARGIN - 60_000_000,
+        "charge contained in market 1"
+    );
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        USER_WALLET,
+        "market-1 funding must not touch the account-global wallet"
+    );
+
+    // Market 2 order-placement headroom is therefore untouched: a bid whose margin reservation
+    // consumes the ENTIRE wallet still places (price 5_000 * QTY/10 lot → 50M notional at 1x).
+    let input = placeOrderCall {
+        marketId: OTHER_MARKET,
+        side: Side::Buy as u8,
+        price: 5_000,
+        quantity: 1,
+        orderType: 0,
+        tif: 0,
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    run_place_order(&input, ALICE, &mut ctx)
+        .expect("market-2 headroom must survive market-1 funding");
+
+    let pos2 = storage::load_position(&mut ctx, ALICE, OTHER_MARKET).unwrap();
+    assert_eq!(
+        pos2.margin_reserved, USER_WALLET,
+        "the whole wallet is reservable on market 2"
+    );
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        0,
+        "and only market 2's OWN reservation debits it — the full 50M was available to spend"
+    );
+}
+
+#[test]
+fn funding_charge_past_margin_absorbs_from_insurance_fund_and_logs() {
+    use alloy_sol_types::SolEvent;
+    // The IF remainder path is REACHABLE now that the wallet no longer cushions charges — this is
+    // the correct isolated semantics (the position, not the account, backs its own funding).
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
+    set_funding_index(&mut ctx, 2_500_000_000); // charge 250M vs margin 200M → 50M remainder
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let (pos, _) = settle_alice_funding(&mut ctx);
+    assert_eq!(pos.margin, 0);
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 30_000_000);
+
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    let changed: Vec<_> = logs
+        .iter()
+        .filter(|l| {
+            l.data.topics().first()
+                == Some(&crate::interface::IPerpDex::InsuranceFundChanged::SIGNATURE_HASH)
+        })
+        .map(|l| {
+            crate::interface::IPerpDex::InsuranceFundChanged::decode_raw_log(
+                l.data.topics(),
+                &l.data.data,
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        changed.len(),
+        1,
+        "one absorption → one InsuranceFundChanged"
+    );
+    assert_eq!(changed[0].delta, -50_000_000);
+    assert_eq!(changed[0].newBalance, 30_000_000);
+    assert!(
+        !logs.iter().any(|l| l.data.topics().first()
+            == Some(&crate::interface::IPerpDex::InsuranceFundDepleted::SIGNATURE_HASH)),
+        "the fund covered it — no depletion event"
+    );
+}
+
+#[test]
+fn funding_charge_past_the_insurance_fund_emits_depletion() {
+    use alloy_sol_types::SolEvent;
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
+    set_funding_index(&mut ctx, 5_000_000_000); // charge 500M vs margin 200M → 300M remainder
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let (pos, _) = settle_alice_funding(&mut ctx);
+    assert_eq!(pos.margin, 0);
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        USER_WALLET,
+        "wallet still untouched"
+    );
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 0);
+
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    let changed = logs
+        .iter()
+        .find(|l| {
+            l.data.topics().first()
+                == Some(&crate::interface::IPerpDex::InsuranceFundChanged::SIGNATURE_HASH)
+        })
+        .map(|l| {
+            crate::interface::IPerpDex::InsuranceFundChanged::decode_raw_log(
+                l.data.topics(),
+                &l.data.data,
+            )
+            .unwrap()
+        })
+        .expect("InsuranceFundChanged for the 80M it could absorb");
+    assert_eq!((changed.delta, changed.newBalance), (-80_000_000, 0));
+
+    let depleted = logs
+        .iter()
+        .find(|l| {
+            l.data.topics().first()
+                == Some(&crate::interface::IPerpDex::InsuranceFundDepleted::SIGNATURE_HASH)
+        })
+        .map(|l| {
+            crate::interface::IPerpDex::InsuranceFundDepleted::decode_raw_log(
+                l.data.topics(),
+                &l.data.data,
+            )
+            .unwrap()
+        })
+        .expect("InsuranceFundDepleted for the 220M written off");
+    assert_eq!(depleted.marketId, MARKET_ID);
+    assert_eq!(depleted.badDebt, 220_000_000);
+}
+
+#[test]
+fn funding_alone_pushes_a_position_into_the_sweep() {
+    // SWEEP ORDERING: `run_update_index_price` persists the new funding index and THEN runs
+    // `run_liquidation_sweep`, and `liquidate_position` settles funding in memory BEFORE its
+    // `is_above_maintenance_margin` call — so the sweep sees the POST-funding margin. That is the
+    // point of A1: funding alone can now liquidate. Pre-A1 the charge went to the wallet, the
+    // margin was untouched, and this position survived.
+    //
+    // At mark $100 the QTY long has equity 200M against a 166.67M maintenance requirement. A 40M
+    // funding charge leaves 160M — under the threshold — with the mark completely unchanged.
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    set_funding_index(&mut ctx, 400_000_000); // charge = 40_000_000
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE, // SAME price — nothing but funding moved
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    assert_eq!(
+        position(&mut ctx, ALICE).amount,
+        0,
+        "funding alone must be able to trigger the sweep"
+    );
+
+    // Control: the identical update with NO accrued funding leaves the position open, proving the
+    // liquidation above is caused by funding and not by the price update.
+    let mut ctl = make_ctx();
+    setup_market(&mut ctl);
+    save_position(&mut ctl, QTY, -ENTRY_VALUE);
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctl,
+    )
+    .unwrap();
+    assert_eq!(position(&mut ctl, ALICE).amount, QTY, "control stays open");
 }
 
 #[test]
@@ -1931,12 +2291,10 @@ fn remove_position_margin_settles_pending_funding_first() {
     remove_position_margin(&mut ctx, 50_000_000).unwrap();
 
     let pos = position(&mut ctx, ALICE);
-    // Funding (7.5M) charged from wallet first, then 50M margin returned to wallet.
-    assert_eq!(
-        wallet(&mut ctx, ALICE),
-        USER_WALLET - 7_500_000 + 50_000_000
-    );
-    assert_eq!(pos.margin, 350_000_000);
+    // A1: funding (7.5M) is charged to the MARGIN (400M → 392.5M), then 50M of margin is returned
+    // to the wallet. The wallet therefore only sees the removal, never the funding.
+    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET + 50_000_000);
+    assert_eq!(pos.margin, 400_000_000 - 7_500_000 - 50_000_000);
     assert_eq!(pos.last_funding_index, 75_000_000);
 }
 
@@ -1950,12 +2308,10 @@ fn add_position_margin_settles_pending_funding_first() {
     add_position_margin(&mut ctx, 10_000_000).unwrap();
 
     let pos = position(&mut ctx, ALICE);
-    // 7.5M funding charged from wallet, then 10M moved wallet → margin.
-    assert_eq!(
-        wallet(&mut ctx, ALICE),
-        USER_WALLET - 7_500_000 - 10_000_000
-    );
-    assert_eq!(pos.margin, MARGIN + 10_000_000);
+    // A1: 7.5M funding charged to the margin, then 10M moved wallet → margin. Only the 10M
+    // top-up leaves the wallet.
+    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET - 10_000_000);
+    assert_eq!(pos.margin, MARGIN - 7_500_000 + 10_000_000);
     assert_eq!(pos.last_funding_index, 75_000_000);
 }
 

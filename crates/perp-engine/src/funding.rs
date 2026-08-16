@@ -11,10 +11,19 @@
 //! position *before* mutating it, so the entire accrual is realised against the
 //! `amount` that was actually held over the period.
 //!
-//! Settlement direction (matches `calc_funding_payment`'s sign): a positive
-//! payment is credited to the perp wallet; a negative payment (a charge) is taken
-//! from the wallet first (down to 0), then the position's isolated `margin`, and
-//! any remainder is absorbed from the insurance fund (bad debt is written off).
+//! Settlement direction (matches `calc_funding_payment`'s sign): funding settles
+//! against the POSITION, never the account-global perp wallet. A positive payment
+//! is credited to the position's isolated `margin`; a negative payment (a charge)
+//! is taken from that same `margin` (down to 0) and any remainder is absorbed from
+//! the insurance fund (bad debt is written off).
+//!
+//! This is what makes isolated margin actually isolated, and it is Binance's
+//! measured behaviour: funding hits the position's isolated wallet directly and
+//! leaves the cross/free wallet at `0E-8`. Because `margin` is exactly the term the
+//! maintenance check reads, funding now MOVES the liquidation price by the verified
+//! closed form `dLP = funding / (qty * (MMR - 1))`, i.e. a losing funding stream can
+//! push a position into liquidation instead of being subsidised indefinitely by a
+//! well-funded wallet that also backs every OTHER market's orders.
 
 use alloy_primitives::IntoLogData;
 use crate::host::PerpHost;
@@ -30,11 +39,11 @@ use crate::{
     PerpError,
 };
 
-/// A funding settlement computed in memory but NOT yet written (commit-only #23). The
-/// wallet→margin waterfall has already been applied to the caller's in-memory `pos`/`wallet`; the
-/// insurance-fund charge + `FundingSettled` payload are carried here for a later
-/// [`apply_funding_settlement`]. This lets a caller REJECT (before any storage write) between the
-/// funding computation and its commit — so a rejected op never draws from the insurance fund.
+/// A funding settlement computed in memory but NOT yet written (commit-only #23). The margin
+/// credit/charge has already been applied to the caller's in-memory `pos`; the insurance-fund
+/// charge + `FundingSettled` payload are carried here for a later [`apply_funding_settlement`].
+/// This lets a caller REJECT (before any storage write) between the funding computation and its
+/// commit — so a rejected op never draws from the insurance fund.
 pub(crate) struct PendingFunding {
     if_charge: u64,
     payment: i64,
@@ -44,15 +53,18 @@ pub(crate) struct PendingFunding {
 }
 
 /// Pure funding computation: reads funding state, applies the funding payment to the in-memory
-/// `pos`/`wallet` (wallet→margin waterfall), re-anchors `last_funding_index`, and returns the
-/// pending insurance-fund charge + log payload (`None` if there was no funding event). Performs NO
-/// storage writes, so it is safe to call before a validation reject.
+/// `pos.margin` (margin → insurance-fund remainder on a charge), re-anchors `last_funding_index`,
+/// and returns the pending insurance-fund charge + log payload (`None` if there was no funding
+/// event). Performs NO storage writes, so it is safe to call before a validation reject.
+///
+/// Takes NO wallet: funding is isolated to the position (see the module docs). The caller's
+/// `UserAccount` is untouched by funding, so a caller that loads the account only for this call can
+/// drop the load entirely.
 pub(crate) fn compute_funding_settlement<H: PerpHost>(
     context: &mut H,
     user: Address,
     market: &Market,
     pos: &mut PerpPosition,
-    wallet: &mut i64,
 ) -> Result<Option<PendingFunding>, PerpError> {
     let funding = storage::load_funding_state(context, market.market_id)?;
     let index = funding.cumulative_funding_index;
@@ -70,22 +82,22 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
         )?;
         if payment != 0 {
             let if_charge = if payment > 0 {
-                // Credit: the position receives funding into the perp wallet.
-                *wallet = wallet
+                // Credit: the position receives funding into its own isolated margin, so a
+                // receiving position gets SAFER (its maintenance headroom grows) — the wallet,
+                // which backs every other market's orders, does not move.
+                pos.margin = pos
+                    .margin
                     .checked_add(payment)
-                    .ok_or_else(|| perp_err("funding: wallet credit overflow"))?;
+                    .ok_or_else(|| perp_err("funding: position margin credit overflow"))?;
                 0
             } else {
-                // Charge: wallet (down to 0) → position margin → insurance-fund remainder.
+                // Charge: position margin (down to 0) → insurance-fund remainder. No wallet leg —
+                // the charge must bite the position that owes it, which is what moves the
+                // liquidation price and lets funding alone push a position under maintenance.
                 let mut charge = (-(payment as i128)) as u64;
-                let from_wallet = ((*wallet).max(0) as i128).min(charge as i128) as u64;
-                *wallet -= from_wallet as i64;
-                charge -= from_wallet;
-                if charge > 0 {
-                    let from_margin = (pos.margin.max(0) as i128).min(charge as i128) as u64;
-                    pos.margin -= from_margin as i64;
-                    charge -= from_margin;
-                }
+                let from_margin = (pos.margin.max(0) as i128).min(charge as i128) as u64;
+                pos.margin -= from_margin as i64;
+                charge -= from_margin;
                 charge
             };
             pending = Some(PendingFunding {
@@ -161,9 +173,8 @@ pub(crate) fn settle_position_funding<H: PerpHost>(
     user: Address,
     market: &Market,
     pos: &mut PerpPosition,
-    wallet: &mut i64,
 ) -> Result<(), PerpError> {
-    if let Some(pending) = compute_funding_settlement(context, user, market, pos, wallet)? {
+    if let Some(pending) = compute_funding_settlement(context, user, market, pos)? {
         apply_funding_settlement(context, pending)?;
     }
     Ok(())

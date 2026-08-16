@@ -29,7 +29,13 @@ use primitives::{B256, U256};
 // Margin tiers (Phase 1): bumped 13→14 for the `tiers` field appended to the `Market` blob — every
 // stored market blob grows by its (default, single-tier) table. CHAIN change; behaviour is
 // arithmetically identical (mmr = 1/(2*3) = 1/6 == the deleted MAINTENANCE_MARGIN_DENOMINATOR).
-pub const BLOCK_COMMITMENT_VERSION: u8 = 15;
+// fee_reserved removal: bumped 14→15 — `PerpPosition` lost its "fr" field.
+// Isolated funding (A1): bumped 15→16 — funding now settles against `pos.margin` instead of the
+// account-global perp wallet, so the same funding event writes a different position/account value
+// set (and `liquidate_position` no longer writes the account at all). No layout change; this is an
+// EXECUTION-RULE change, so the values folded into the delta differ. CHAIN change: golden re-pin
+// (below) + a coordinated wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 16;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

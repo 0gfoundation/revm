@@ -3356,8 +3356,9 @@ fn fill_settles_funding_for_taker_and_maker() {
 // determinism; changes touching only these will not move the golden value):
 //   * bankrupt liquidation: absorb_from_insurance_fund / InsuranceFundDepleted
 //     / bad-debt write-off (solvent path with clearance fee IS covered)
-//   * funding-charge waterfall into position margin / insurance fund (the
-//     scenario's funding charge is covered by the wallet)
+//   * funding charge spilling past the position margin into the insurance fund
+//     (the scenario's funding charge is fully covered by ALICE's position margin;
+//     the spill path is covered by risk::tests)
 //   * margin-shortfall auto-cancel cascade: taker-side
 //     cancel_same_side_orders_until_wallet_covers — requires a taker
 //     margin-cover cascade that would dominate the scenario
@@ -3502,8 +3503,32 @@ mod golden {
     /// fee is still collected in full, only its funding source moved. Positions, CAROL, and every
     /// order status are identical. Prior value
     /// 0x677500b3559bb22e070c48c9134c3d33c37086b2249f3fb1e88e516a04a8fa04.
+    /// RE-PIN (A1 isolated funding + `BLOCK_COMMITMENT_VERSION` 15→16): funding settles against
+    /// `pos.margin` instead of the account-global perp wallet (credit AND charge; the wallet leg is
+    /// gone, the charge falls straight through to the insurance fund once margin is exhausted).
+    /// Restores isolated-margin containment and makes funding move the liquidation price, matching
+    /// Binance's measured behaviour. `liquidate_position` also stops loading/writing the account —
+    /// funding was its only reason to, so the write was a byte-identical re-store (and a spurious
+    /// `AccountBalanceChanged`). This is an EXECUTION-RULE change, not a layout change, so the
+    /// values folded into the delta differ. It CHANGES the business snapshot in exactly two places,
+    /// which are the SAME two units of value:
+    ///   * `alice_account` 999_059_629 → 999_059_631 (+2) and `insurance_fund` 49_007_956 →
+    ///     49_007_954 (−2). ALICE's Phase-8 funding charge of 400 no longer leaves her wallet; it
+    ///     comes out of her position margin instead, so her pre-liquidation margin is 400 thinner
+    ///     (1_591_200 → 1_590_800) and the 50 bps clearance fee levied on it drops 7_956 → 7_954.
+    ///     Her wallet keeps the 400 it was not charged and gets back 400 less margin at
+    ///     liquidation (net 0), and keeps the 2 the IF no longer collects. Σ(ALICE, IF) is
+    ///     unchanged — a pure 2-unit transfer, no phantom value.
+    ///
+    /// `bob_account` is UNCHANGED at 500_428_954 even though his +400 funding credit now lands in
+    /// `pos.margin` rather than the wallet: he ends FLAT (`bob_position == (0, 0, 0)`), and closing
+    /// a position to zero releases its entire remaining margin to the wallet, so the 400 arrives by
+    /// a different route and no proportional-release floor strands any of it. CAROL, both other
+    /// positions, `admin_perp_wallet`, `market_fee_total`, `mark_price`, `funding` and every order
+    /// status are identical. Prior value
+    /// 0xa3fcb1f0cccd86eacd6ec33cfae4604a98577cd669c1b2d7ff3997aa0bf6b3ad.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xa3fcb1f0cccd86eacd6ec33cfae4604a98577cd669c1b2d7ff3997aa0bf6b3ad");
+        b256!("0xfd17be42969baf09c8e87f990e084ff83180f179c3118e13ed4ccf81e5d92828");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -3571,13 +3596,24 @@ mod golden {
             //      10 stays with her (and the IF below is 10 lower). Nothing else on
             //      her side moves: the 2_000 she does not pay from the wallet is
             //      exactly the 2_000 less that her margin returns at liquidation.
-            alice_account: (U256::from(500_000_000u64), 999_059_629),
+            //   4. A1 isolated funding: same shape, one step smaller. Her 400 funding
+            //      charge is taken from the position margin instead of the wallet, so
+            //      the pre-liquidation margin is a further 400 thinner (1_591_200 →
+            //      1_590_800) and the clearance fee drops 7_956 → 7_954. The 400 she
+            //      does not pay from the wallet is exactly the 400 less her margin
+            //      returns, so the only net movement is the +2 she keeps (= the 2 the
+            //      IF below no longer collects).
+            alice_account: (U256::from(500_000_000u64), 999_059_631),
             // BOB perp = 1e9 + 830_000 short PnL (622_500 on the 3-QTY
             //   liquidation leg + 207_500 on the QTY closed via CAROL) + 400
             //   funding credit − 1_446 maker fees − 400_000 still reserved for
             //   the resting tail bid (margin only: the 160 fee that used to be
             //   escrowed alongside it is no longer withheld at placement)
             //   − 500_000_000 transferFromPerp.
+            // A1 note: the 400 funding credit is now paid into his POSITION margin, not
+            //   straight into the wallet. He ends flat, and closing to zero releases the
+            //   whole remaining margin, so the 400 still lands here — unchanged total,
+            //   different route.
             bob_account: (U256::from(500_000_000u64), 500_428_954),
             // CAROL perp = 5_000_000 funded − 800_000 short opening margin.
             carol_account: (U256::from(5_000_000u64), 4_200_000),
@@ -3586,13 +3622,14 @@ mod golden {
             // 100M funding − 50M IF deposit + 1M IF withdraw + 3_461 fees
             //   (liquidation close taker fee waived — fix B).
             admin_perp_wallet: 51_003_461,
-            // 50M deposit − 1M withdraw + 7_966 clearance fee
-            //   (50 bps of ALICE's 1_591_200 pre-liquidation margin — thicker than the
-            //   pre-cap 1_056_000 because she now runs at 3x instead of 5x, and 2_000
-            //   thinner than before the fee_reserved removal because her opening taker
-            //   fees are now charged to that margin; the 10 the IF no longer collects
-            //   is the 10 ALICE keeps above).
-            insurance_fund: 49_007_956,
+            // 50M deposit − 1M withdraw + 7_954 clearance fee
+            //   (50 bps of ALICE's 1_590_800 pre-liquidation margin — thicker than the
+            //   pre-cap 1_056_000 because she now runs at 3x instead of 5x, and 2_400
+            //   thinner than before the fee_reserved removal + A1 because her opening
+            //   taker fees (2_000) and her funding charge (400) are now both charged to
+            //   that margin; the 12 the IF no longer collects is the 12 ALICE keeps
+            //   above).
+            insurance_fund: 49_007_954,
             // ALICE takers 2_015 + BOB maker 806 + 480 + 160 (CAROL's taker fee
             //   is 0 bps; the liquidation close taker fee is waived — fix B).
             market_fee_total: 3_461,
