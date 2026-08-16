@@ -1437,6 +1437,22 @@ fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
         return Ok(());
     }
 
+    // Derived-ooIM Phase 1 dual gate (debug only). This runs POST-flush, so storage is
+    // authoritative: the registry has already written the fills' positions/accounts and the
+    // consumed order entries, hence Σ ooIM here is already the POST-fill value and the only
+    // thing left to fund is `required_margin` (the fills' opening margin + taker fee). Position
+    // margin is NOT part of the ooIM migration — only the OPEN-ORDER requirement is — so the
+    // derived requirement is the same number on both bases.
+    #[cfg(debug_assertions)]
+    crate::margin_view::debug_assert_gates_agree(
+        context,
+        user,
+        "placeOrder: taker fills margin",
+        Some(market_id),
+        required_margin,
+        required_margin as i128,
+    );
+
     if storage::load_account_ref(context, user)?.has_available_perp(required_margin) {
         return Ok(());
     }

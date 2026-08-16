@@ -216,6 +216,145 @@ pub fn max_leverage_for_notional(tiers: &MarginTiers, abs_notional: i64) -> u32 
     lev
 }
 
+// ── Derived open-order initial margin (ooIM) ─────────────────────────────────────────────────
+//
+// The requirement a set of RESTING orders imposes, DERIVED from the position and the book
+// instead of escrowed at placement. This is the quantity the derived-ooIM migration replaces
+// `PerpPosition::margin_reserved` with; Phase 1 only computes it alongside the escrow.
+//
+//     PIM  = ROUND_UP( |N| / L )                        position initial margin
+//     IM   = ROUND_UP( max(|N + Bid|, |N − Ask|) / L )  joint requirement
+//     ooIM = IM − PIM
+//
+// with `N` the SIGNED position notional at MARK, `Bid` = Σ (remaining qty × LIMIT price) over
+// resting buys, `Ask` the same over sells, and `L` the position leverage. The two branches are
+// the exposure left if every buy fills and if every sell fills.
+//
+// Formula source: `misc/binance-margin-verified-model.md` §1.1 (formula set) and §2 (rounding),
+// plus `misc/binance-v3-account-balance-field-reference.md` §2/§4. Every rounding decision below
+// is the one those documents settled against mainnet samples; see the doc comments.
+
+/// `ROUND_UP(numerator / divisor)` — the rounding Binance uses for `initialMargin` and
+/// `positionInitialMargin`.
+///
+/// Settled as ROUND_UP (not `HALF_UP`, not `trunc`, not `floor`) on 14/14 discriminating mainnet
+/// samples (`binance-margin-verified-model.md` §2). Note this is the OPPOSITE direction from
+/// [`maintenance_margin`], which truncates — the two are different requirements with
+/// independently measured rounding, and neither should be "made consistent" with the other.
+///
+/// `divisor` is floored at 1 exactly as [`crate::types::PerpPosition::set_reservations`] floors
+/// leverage, so a zero/corrupt leverage cannot divide by zero.
+#[inline]
+pub fn round_up_div(numerator: u128, divisor: u64) -> u128 {
+    numerator.div_ceil(divisor.max(1) as u128)
+}
+
+/// The three derived margin quantities for one `(position, resting orders)` pair, plus the
+/// leverage they were evaluated at. Output of [`open_order_margin_at_leverage`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenOrderMargin {
+    /// `ROUND_UP(|N| / L)` — what the POSITION alone requires.
+    pub position_initial_margin: u64,
+    /// `ROUND_UP(max(|N + Bid|, |N − Ask|) / L)` — position and resting orders JOINTLY.
+    pub initial_margin: u64,
+    /// `IM − PIM` — the marginal requirement the resting orders add. Zero when there are none.
+    pub open_order_initial_margin: u64,
+    /// The leverage actually used (input floored at 1, and tier-capped by
+    /// [`open_order_margin`]).
+    pub effective_leverage: u64,
+}
+
+/// The pure ooIM formula at an EXPLICIT leverage — no tier table consulted.
+///
+/// Pure integer arithmetic over `(signed_notional, bid, ask, leverage)`; no storage, no floats.
+/// `signed_notional` is `N` at MARK (negative for a short); `bid`/`ask` are at each order's LIMIT
+/// price. Mixing the two bases is deliberate — it is Binance's formula.
+///
+/// # Rounding
+///
+/// `ooIM` is the DIFFERENCE OF TWO ROUND_UPs, never a single round-up of a difference: the
+/// convenience form `ROUND_UP(max(0, Bid, Ask − 2N) / L)` is NOT equivalent at 1 ulp because
+/// `ceil(a) − ceil(b) != ceil(a − b)` (`binance-margin-verified-model.md` §1.1).
+///
+/// # Overflow
+///
+/// `N ± Bid|Ask` is evaluated in `i128` and the branches in `u128`, so no intermediate can wrap
+/// (`|N| < 2^63`, `Bid, Ask < 2^64` ⟹ each branch `< 2^65`). Only the final narrowing to `u64`
+/// can fail, and it does so as a clean error rather than silently.
+///
+/// # Why `IM >= PIM` (so the subtraction cannot wrap)
+///
+/// Whichever branch shares `N`'s sign already dominates `|N|` for any `Bid, Ask >= 0`: for
+/// `N >= 0`, `|N + Bid| >= N`; for `N < 0`, `|N − Ask| >= |N|`. The `saturating_sub` below is
+/// belt-and-braces on that invariant, not a rounding decision.
+pub fn open_order_margin_at_leverage(
+    signed_notional: i64,
+    bid: u64,
+    ask: u64,
+    leverage: u64,
+) -> Result<OpenOrderMargin, PerpError> {
+    let lev = leverage.max(1);
+    let n = signed_notional as i128;
+
+    let bid_branch = n
+        .checked_add(bid as i128)
+        .ok_or_else(|| perp_err("math: ooIM bid branch overflow"))?
+        .unsigned_abs();
+    let ask_branch = n
+        .checked_sub(ask as i128)
+        .ok_or_else(|| perp_err("math: ooIM ask branch overflow"))?
+        .unsigned_abs();
+
+    let position_initial_margin =
+        u64::try_from(round_up_div(signed_notional.unsigned_abs() as u128, lev))
+            .map_err(|_| perp_err("math: position initial margin exceeds u64"))?;
+    let initial_margin = u64::try_from(round_up_div(bid_branch.max(ask_branch), lev))
+        .map_err(|_| perp_err("math: initial margin exceeds u64"))?;
+
+    Ok(OpenOrderMargin {
+        position_initial_margin,
+        initial_margin,
+        open_order_initial_margin: initial_margin.saturating_sub(position_initial_margin),
+        effective_leverage: lev,
+    })
+}
+
+/// [`open_order_margin_at_leverage`] with the leverage TIER-CAPPED at the COMBINED notional.
+///
+/// `L_eff = min(leverage, max_leverage_for_notional(tiers, max(|N + Bid|, |N − Ask|)))`, i.e.
+/// the same cap [`max_leverage_for_notional`] enforces in `set_leverage_core`, but evaluated at
+/// the notional the position would carry if the book filled rather than at the position's
+/// current notional. A user cannot escape a tier's leverage cap by setting leverage while small
+/// and then resting orders that would grow them past the boundary.
+///
+/// This is the variant the ADMISSION path uses. The Binance-parity READ path deliberately does
+/// NOT apply the cap (Binance reports `initialMargin` at the position's own `leverage` field),
+/// so it calls [`open_order_margin_at_leverage`] directly — the arithmetic is shared, only the
+/// leverage input differs.
+pub fn open_order_margin(
+    tiers: &MarginTiers,
+    signed_notional: i64,
+    bid: u64,
+    ask: u64,
+    leverage: u64,
+) -> Result<OpenOrderMargin, PerpError> {
+    let n = signed_notional as i128;
+    let bid_branch = n
+        .checked_add(bid as i128)
+        .ok_or_else(|| perp_err("math: ooIM bid branch overflow"))?
+        .unsigned_abs();
+    let ask_branch = n
+        .checked_sub(ask as i128)
+        .ok_or_else(|| perp_err("math: ooIM ask branch overflow"))?
+        .unsigned_abs();
+    // `max_leverage_for_notional` takes i64; a combined notional past i64::MAX is already past
+    // every tier bound, so saturating there picks the top (smallest-leverage) tier — the
+    // conservative direction.
+    let combined = i64::try_from(bid_branch.max(ask_branch)).unwrap_or(i64::MAX);
+    let cap = max_leverage_for_notional(tiers, combined) as u64;
+    open_order_margin_at_leverage(signed_notional, bid, ask, leverage.max(1).min(cap.max(1)))
+}
+
 /// Returns `true` if the position is above the maintenance-margin threshold.
 #[inline]
 pub fn is_above_maintenance_margin(
@@ -1456,6 +1595,257 @@ mod margin_tier_tests {
             let notional = calc_value_i64(mark, amount, bd, pd).unwrap();
             let want = notional + vq + margin >= notional.abs() / 6;
             assert_eq!(got, want, "mark={mark} a={amount} vq={vq} m={margin}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_order_margin_tests {
+    use super::*;
+    use crate::types::{MarginTier, MarginTiers};
+
+    fn table(rows: &[(u64, u32)]) -> MarginTiers {
+        let v: Vec<MarginTier> = rows
+            .iter()
+            .map(|&(lower_bound_notional, max_leverage)| MarginTier {
+                lower_bound_notional,
+                max_leverage,
+            })
+            .collect();
+        MarginTiers::from_tiers(&v).unwrap()
+    }
+
+    /// `(PIM, IM, ooIM)` at an explicit leverage — the uncapped formula.
+    fn at(n: i64, bid: u64, ask: u64, lev: u64) -> (u64, u64, u64) {
+        let m = open_order_margin_at_leverage(n, bid, ask, lev).unwrap();
+        (
+            m.position_initial_margin,
+            m.initial_margin,
+            m.open_order_initial_margin,
+        )
+    }
+
+    /// No resting orders ⇒ IM collapses to PIM ⇒ ooIM is exactly 0, at every leverage and both
+    /// position signs. This is the identity the whole migration leans on: a user with no open
+    /// orders must see no derived requirement at all.
+    #[test]
+    fn zero_orders_means_zero_open_order_margin() {
+        for &n in &[
+            0i64,
+            1,
+            7,
+            1_000_000,
+            -1,
+            -7,
+            -1_000_000,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            for &lev in &[1u64, 2, 3, 7, 100] {
+                let m = open_order_margin_at_leverage(n, 0, 0, lev).unwrap();
+                assert_eq!(m.open_order_initial_margin, 0, "n={n} lev={lev}");
+                assert_eq!(
+                    m.initial_margin, m.position_initial_margin,
+                    "n={n} lev={lev}"
+                );
+            }
+        }
+    }
+
+    /// Flat position, buys only: `N = 0` ⇒ `max(|0 + Bid|, |0 − 0|) = Bid`, so the whole
+    /// requirement is the bid leg and PIM is 0 ⇒ ooIM == IM == ROUND_UP(Bid / L).
+    #[test]
+    fn flat_with_only_bids() {
+        assert_eq!(at(0, 1_000_000, 0, 1), (0, 1_000_000, 1_000_000));
+        assert_eq!(at(0, 1_000_000, 0, 4), (0, 250_000, 250_000));
+        // ROUND_UP, not floor and not HALF_UP: 999_999/4 = 249_999.75 → 250_000.
+        assert_eq!(at(0, 999_999, 0, 4), (0, 250_000, 250_000));
+        // ...and the exact multiple does NOT get a spurious +1.
+        assert_eq!(at(0, 1_000_000, 0, 4), (0, 250_000, 250_000));
+        assert_eq!(
+            at(0, 1, 0, 1_000_000),
+            (0, 1, 1),
+            "one unit still rounds UP to 1"
+        );
+    }
+
+    /// Flat position, sells only: `max(|0|, |0 − Ask|) = Ask` — the mirror image. The ask branch
+    /// takes an ABSOLUTE value, so a sell-only book is a requirement, not a credit.
+    #[test]
+    fn flat_with_only_asks() {
+        assert_eq!(at(0, 0, 1_000_000, 1), (0, 1_000_000, 1_000_000));
+        assert_eq!(at(0, 0, 1_000_000, 4), (0, 250_000, 250_000));
+        assert_eq!(at(0, 0, 999_999, 4), (0, 250_000, 250_000));
+    }
+
+    /// A LONG position: a resting BUY compounds the exposure (`|N + Bid|` grows), a resting SELL
+    /// nets against it (`|N − Ask|` shrinks while `Ask <= 2N`). Same |order| notional, opposite
+    /// effect — the asymmetry that makes this a genuinely different function from our
+    /// `max(buy_side, sell_side)` escrow.
+    #[test]
+    fn long_with_bids_adds_but_long_with_asks_nets() {
+        let n = 1_000_000i64;
+        // Bid side: |1e6 + 4e5| = 1.4e6 ⇒ IM 700_000 at L=2, PIM 500_000 ⇒ ooIM 200_000.
+        assert_eq!(at(n, 400_000, 0, 2), (500_000, 700_000, 200_000));
+        // Ask side, same 4e5: |1e6 − 4e5| = 6e5 < |N| ⇒ IM is the PIM branch ⇒ ooIM 0.
+        assert_eq!(at(n, 0, 400_000, 2), (500_000, 500_000, 0));
+        // An ask big enough to flip the net exposure short DOES cost again: |1e6 − 3e6| = 2e6.
+        assert_eq!(at(n, 0, 3_000_000, 2), (500_000, 1_000_000, 500_000));
+        // Exactly closing the position (Ask == N) is the cheapest point: net exposure 0, but the
+        // BID branch (|N| itself) still floors IM at PIM ⇒ ooIM 0.
+        assert_eq!(at(n, 0, 1_000_000, 2), (500_000, 500_000, 0));
+        // Mirror on a SHORT: a resting SELL compounds, a resting BUY nets.
+        assert_eq!(at(-n, 0, 400_000, 2), (500_000, 700_000, 200_000));
+        assert_eq!(at(-n, 400_000, 0, 2), (500_000, 500_000, 0));
+    }
+
+    /// The branch switch. With `N` fixed, `|N + Bid|` vs `|N − Ask|` cross at a determinable
+    /// point; walk `Ask` across it one unit at a time and check the winner changes exactly there.
+    ///
+    /// `N = 1_000_000`, `Bid = 200_000` ⇒ bid branch = 1_200_000, constant. The ask branch is
+    /// `|1_000_000 − Ask|`, which reaches 1_200_000 at `Ask = 2_200_000`. So the bid branch wins
+    /// for `Ask < 2_200_000`, they TIE at `2_200_000`, and the ask branch wins beyond.
+    #[test]
+    fn the_max_switches_branch_at_the_crossing_point() {
+        let (n, bid) = (1_000_000i64, 200_000u64);
+        let bid_branch = 1_200_000u64;
+        for (ask, want) in [
+            (2_199_998u64, bid_branch),
+            (2_199_999, bid_branch),
+            (2_200_000, bid_branch), // tie: |1e6 − 2.2e6| == 1.2e6
+            (2_200_001, 1_200_001),  // ask branch takes over, by exactly 1
+            (2_200_002, 1_200_002),
+        ] {
+            let m = open_order_margin_at_leverage(n, bid, ask, 1).unwrap();
+            assert_eq!(m.initial_margin, want, "ask={ask}");
+            // ...and the max is genuinely a max, never a sum and never "one side always wins".
+            let ask_branch = (n as i128 - ask as i128).unsigned_abs() as u64;
+            assert_eq!(m.initial_margin, bid_branch.max(ask_branch), "ask={ask}");
+            assert_ne!(
+                m.initial_margin,
+                bid_branch + ask_branch,
+                "the two sides must not add"
+            );
+        }
+    }
+
+    /// ooIM is the DIFFERENCE OF TWO ROUND_UPs, never `ROUND_UP` of a difference. Pinned on a
+    /// case where the two disagree by exactly 1 unit: `|N| = 9`, combined = 31, `L = 4` ⇒
+    /// `ceil(31/4) − ceil(9/4) = 8 − 3 = 5`, whereas the convenience form
+    /// `ceil((31 − 9)/4) = ceil(5.5) = 6`. A parity checker built on the convenience form
+    /// mis-reports by one unit (`binance-margin-verified-model.md` §1.1).
+    #[test]
+    fn oo_im_is_a_difference_of_round_ups_not_a_round_up_of_a_difference() {
+        // N = 9 long, Bid = 22 ⇒ bid branch 31, ask branch 9 ⇒ combined 31.
+        let m = open_order_margin_at_leverage(9, 22, 0, 4).unwrap();
+        assert_eq!((m.position_initial_margin, m.initial_margin), (3, 8));
+        assert_eq!(m.open_order_initial_margin, 5);
+        // The convenience form would say 6 — 1 unit too strict.
+        assert_ne!(m.open_order_initial_margin, (31u64 - 9).div_ceil(4));
+    }
+
+    /// The tier cap bites at the COMBINED notional, not the position's own. A user at leverage 10
+    /// with a small position and a large resting bid is capped by the tier the *combined* notional
+    /// lands in — which is the whole point of evaluating the cap post-fill.
+    #[test]
+    fn tier_cap_uses_the_combined_notional() {
+        // Tier 0: < 1_000_000 ⇒ 10x. Tier 1: >= 1_000_000 ⇒ 2x.
+        let t = table(&[(0, 10), (1_000_000, 2)]);
+        // Position alone (999_999) is still tier 0, so the UNCAPPED formula uses L = 10.
+        let un = open_order_margin_at_leverage(999_999, 0, 0, 10).unwrap();
+        assert_eq!((un.effective_leverage, un.initial_margin), (10, 100_000));
+        assert_eq!(
+            open_order_margin(&t, 999_999, 0, 0, 10).unwrap(),
+            un,
+            "no orders ⇒ combined == |N| ⇒ still tier 0, cap inert"
+        );
+        // Add a bid of 1 ⇒ combined 1_000_000 ⇒ tier 1 ⇒ L capped 10 → 2.
+        let cap = open_order_margin(&t, 999_999, 1, 0, 10).unwrap();
+        assert_eq!(cap.effective_leverage, 2);
+        assert_eq!(cap.initial_margin, 500_000); // ceil(1_000_000 / 2)
+        assert_eq!(cap.position_initial_margin, 500_000); // ceil(999_999 / 2)
+        assert_eq!(cap.open_order_initial_margin, 0);
+        // The uncapped path at the same inputs stays at L = 10 — the two variants really differ.
+        assert_eq!(
+            open_order_margin_at_leverage(999_999, 1, 0, 10)
+                .unwrap()
+                .initial_margin,
+            100_000
+        );
+        // Exactly ON the boundary is tier 1 (`>=`), one below is tier 0 — same convention as
+        // `max_leverage_for_notional` / `maintenance_margin`.
+        assert_eq!(
+            open_order_margin(&t, 0, 999_999, 0, 10)
+                .unwrap()
+                .effective_leverage,
+            10
+        );
+        assert_eq!(
+            open_order_margin(&t, 0, 1_000_000, 0, 10)
+                .unwrap()
+                .effective_leverage,
+            2
+        );
+        // The cap only ever LOWERS: a user already below the cap is untouched.
+        assert_eq!(
+            open_order_margin(&t, 0, 1_000_000, 0, 1)
+                .unwrap()
+                .effective_leverage,
+            1
+        );
+    }
+
+    /// Leverage 0 is floored at 1 (as `set_reservations` does) rather than dividing by zero, and
+    /// the tier-capped entry point inherits that floor even if a corrupt tier says `max_leverage
+    /// = 0`.
+    #[test]
+    fn zero_leverage_is_floored_at_one() {
+        assert_eq!(at(0, 1_000, 0, 0), (0, 1_000, 1_000));
+        let t = table(&[(0, 0)]);
+        let m = open_order_margin(&t, 0, 1_000, 0, 5).unwrap();
+        assert_eq!((m.effective_leverage, m.initial_margin), (1, 1_000));
+    }
+
+    /// Extremes must produce a clean error, never a wrap. `|N| ~ 2^63` plus `Bid ~ 2^64` exceeds
+    /// `u64` after a leverage-1 divide, so the narrowing must reject.
+    #[test]
+    fn saturating_inputs_error_rather_than_wrap() {
+        assert!(open_order_margin_at_leverage(i64::MAX, u64::MAX, 0, 1).is_err());
+        assert!(open_order_margin_at_leverage(i64::MIN, 0, u64::MAX, 1).is_err());
+        // ...but the same inputs at a big enough leverage fit, and stay ordered.
+        let m = open_order_margin_at_leverage(i64::MAX, u64::MAX, 0, 4).unwrap();
+        assert!(m.initial_margin >= m.position_initial_margin);
+    }
+
+    /// `IM >= PIM` for every sign/magnitude combination — the invariant that makes
+    /// `open_order_initial_margin`'s subtraction total. Randomised, since it is a claim about all
+    /// inputs rather than a hand case.
+    #[test]
+    fn initial_margin_never_falls_below_position_initial_margin() {
+        let mut s: u64 = 0x00_1f_bd_a5_c0_de_00_11;
+        let next = |s: &mut u64| {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        };
+        for _ in 0..20_000 {
+            let n = (next(&mut s) % 4_000_000_000) as i64 - 2_000_000_000;
+            let bid = next(&mut s) % 4_000_000_000;
+            let ask = next(&mut s) % 4_000_000_000;
+            let lev = next(&mut s) % 100 + 1;
+            let m = open_order_margin_at_leverage(n, bid, ask, lev).unwrap();
+            assert!(
+                m.initial_margin >= m.position_initial_margin,
+                "n={n} bid={bid} ask={ask} lev={lev}: IM {} < PIM {}",
+                m.initial_margin,
+                m.position_initial_margin
+            );
+            // ooIM == 0 exactly when the position branch already dominates.
+            assert_eq!(
+                m.open_order_initial_margin == 0,
+                m.initial_margin == m.position_initial_margin
+            );
         }
     }
 }

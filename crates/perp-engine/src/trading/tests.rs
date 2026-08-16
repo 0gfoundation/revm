@@ -8020,6 +8020,116 @@ mod user_market_index {
         }
     }
 
+    // ── Step 0 of the derived-ooIM migration: are the maintained aggregates Bid/Ask? ────────
+    //
+    // The derived open-order requirement is
+    //     ooIM = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) − ROUND_UP(|N| / L)
+    // where Binance defines `Bid` as Σ over the user's CURRENTLY RESTING buy orders of
+    // (REMAINING quantity × that order's LIMIT price), and `Ask` the same over sells. The whole
+    // migration rests on `PerpPosition::total_buy_notional` / `total_sell_notional` being
+    // EXACTLY those two quantities, maintained incrementally.
+    //
+    // `assert_side_totals_are_bid_and_ask` below is the proof obligation. It does not reuse
+    // `math::sum_side_totals` (the engine's own fold — reusing it would only prove the engine
+    // agrees with itself); it re-derives the sum inline, and additionally re-derives each term
+    // from the authoritative `Order` record so that "remaining quantity" and "LIMIT price" are
+    // checked as CLAIMS about the order, not just as fields of the mirror.
+
+    /// The test market's fixed-point widths (see [`market_at`]).
+    const BD: u32 = 8;
+    const PD: u32 = 9;
+
+    /// Assert, for every `(user, market)`, that the four maintained per-side aggregates equal a
+    /// ground truth recomputed independently from the user's actual resting orders, AND that
+    /// each resting entry really is `(remaining qty, limit price)` of a live order.
+    ///
+    /// Four distinct claims, each of which a maintenance bug breaks differently:
+    /// 1. every entry in an order LIST is backed by an `Order` that is still resting
+    ///    (`Open`/`PartiallyFilled`) — so the list is "currently resting orders", not a graveyard;
+    /// 2. `entry.price` is that order's LIMIT price (so the notional is at the limit, not at a
+    ///    fill/mark price);
+    /// 3. `entry.amount` is `quantity − filled`, the REMAINING quantity (so a partial fill really
+    ///    does shrink the term);
+    /// 4. the stored aggregates equal the inline Σ over those entries.
+    fn assert_side_totals_are_bid_and_ask(
+        ctx: &mut TestCtx,
+        users: &[Address],
+        markets: &[u64],
+        step: &str,
+    ) {
+        for &u in users {
+            for &m in markets {
+                let mut truth = [0u64; 4]; // tbq, tbn, tsq, tsn
+                for (side, buy) in [(Side::Buy, true), (Side::Sell, false)] {
+                    let entries = if buy {
+                        storage::load_buy_orders(ctx, u, m).unwrap()
+                    } else {
+                        storage::load_sell_orders(ctx, u, m).unwrap()
+                    };
+                    for e in entries.iter() {
+                        // (1) backed by a live, still-resting order in THIS market on THIS side.
+                        let o = storage::load_order(ctx, &e.order_id)
+                            .unwrap()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                "{step}: user {u} market {m} {side:?} list holds entry {:?} with \
+                                 no order record — a filled/cancelled order was left in the list",
+                                e.order_id
+                            )
+                            });
+                        assert!(
+                            matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled),
+                            "{step}: user {u} market {m} {side:?} list holds entry {:?} whose \
+                             order is terminal ({:?}) — it is not a RESTING order",
+                            e.order_id,
+                            o.status
+                        );
+                        assert_eq!(
+                            (o.market_id, o.side),
+                            (m, side),
+                            "{step}: entry {:?} filed under the wrong (market, side)",
+                            e.order_id
+                        );
+                        // (2) the notional basis is the order's LIMIT price.
+                        assert_eq!(
+                            e.price, o.price,
+                            "{step}: user {u} market {m} entry {:?} price {} is not the order's \
+                             LIMIT price {}",
+                            e.order_id, e.price, o.price
+                        );
+                        // (3) the quantity is what is still RESTING, i.e. net of partial fills.
+                        assert_eq!(
+                            e.amount,
+                            o.quantity - o.filled,
+                            "{step}: user {u} market {m} entry {:?} amount {} != remaining \
+                             (quantity {} − filled {}) — a partial fill did not shrink the term",
+                            e.order_id,
+                            e.amount,
+                            o.quantity,
+                            o.filled
+                        );
+                        // (4) fold, inline — deliberately NOT `math::sum_side_totals`.
+                        let i = if buy { 0 } else { 2 };
+                        truth[i] += e.amount;
+                        truth[i + 1] += crate::math::calc_value(e.price, e.amount, BD, PD).unwrap();
+                    }
+                }
+                let p = storage::load_position(ctx, u, m).unwrap();
+                assert_eq!(
+                    (
+                        p.total_buy_qty,
+                        p.total_buy_notional,
+                        p.total_sell_qty,
+                        p.total_sell_notional
+                    ),
+                    (truth[0], truth[1], truth[2], truth[3]),
+                    "{step}: user {u} market {m}: maintained (tbq, tbn=Bid, tsq, tsn=Ask) diverged \
+                     from the resting-order ground truth"
+                );
+            }
+        }
+    }
+
     /// Deterministic xorshift (same generator as the settlement conservation fuzz).
     fn next(s: &mut u64) -> u64 {
         *s ^= *s << 13;
@@ -8168,12 +8278,14 @@ mod user_market_index {
                 cov.leaves += before[i].iter().filter(|m| !after.contains(m)).count() as u32;
             }
 
-            assert_index_matches(
-                &mut ctx,
-                &users,
-                &MARKETS,
-                &format!("step {step} ({what}, user {ui}, market {market})"),
-            );
+            let where_ = format!("step {step} ({what}, user {ui}, market {market})");
+            assert_index_matches(&mut ctx, &users, &MARKETS, &where_);
+            // Derived-ooIM Step 0: the SAME sweep also proves the per-side reservation
+            // aggregates are exactly Binance's Bid/Ask after every transition. One pass, two
+            // invariants — the op mix (rest / partial fill / full fill / flip / cancel /
+            // mid-match auto-cancel / liquidation cancel-all / reject) is precisely the set of
+            // transitions that can desynchronise them.
+            assert_side_totals_are_bid_and_ask(&mut ctx, &users, &MARKETS, &where_);
             // The index is a SET, always ascending, and never exceeds the cap.
             for &u in &users {
                 let ix = index(&mut ctx, u);
@@ -8214,6 +8326,41 @@ mod user_market_index {
             );
         }
         assert!(deep.liquidations >= 1, "no liquidation ever completed");
+        assert!(deep.flips >= 1, "no position ever flipped sign");
+    }
+
+    /// **Derived-ooIM Step 0 deliverable.** The maintained per-side aggregates
+    /// `total_buy_notional` / `total_sell_notional` ARE Binance's `Bid` / `Ask` — Σ over the
+    /// user's currently resting orders of (remaining quantity × LIMIT price) — and the two qty
+    /// aggregates are the matching Σ quantity, after EVERY step of a randomised sequence.
+    ///
+    /// The per-step assertion lives inside [`run_fuzz`] (see
+    /// [`assert_side_totals_are_bid_and_ask`]); this test drives it over its own seeds so the
+    /// property has a named owner, and asserts the pass actually reached the transitions that
+    /// could break it. Two passes, deliberately different money, exactly as the index property
+    /// test: the thin-wallet pass is the only one that reaches the taker wallet-cover LIFO
+    /// cancel cascade and the mid-match order-list rewrite, which are the two paths that resync
+    /// the aggregates by RECOMPUTE rather than incrementally.
+    ///
+    /// Mutation-tested: deleting any one of the five maintenance sites — the place-path
+    /// increment (`trading/mod.rs` buy/sell arms), the cancel-path decrement, the match-flush
+    /// recompute (`settlement.rs`), or the liquidation cancel-all zeroing (`risk/mod.rs`) —
+    /// fails this test.
+    #[test]
+    fn side_aggregates_are_exactly_bid_and_ask_after_every_operation() {
+        let deep = run_fuzz(0x00_1f_bd_a5_c0_de_00_11, RICH, 800);
+        let thin = run_fuzz(0x7a_51_de_ad_be_ef_00_29, WALLET, 800);
+        println!("ooIM Bid/Ask fuzz coverage: deep={deep:?} thin={thin:?}");
+        // A pass that never rests, never partially fills and never liquidates would assert
+        // "0 == 0" 800 times. Reuse the index pass's own coverage floors.
+        for (name, cov) in [("deep", &deep), ("thin", &thin)] {
+            assert!(cov.enters >= 20, "{name}: too few market entries");
+            assert!(cov.leaves >= 20, "{name}: too few market exits");
+        }
+        assert!(
+            deep.liquidations >= 1,
+            "no liquidation cancel-all exercised"
+        );
         assert!(deep.flips >= 1, "no position ever flipped sign");
     }
 
@@ -8541,5 +8688,465 @@ mod user_market_index {
             vec![2],
             "liquidation cleared market 1; the untouched market 2 order keeps her there"
         );
+    }
+}
+
+// ── Derived-ooIM Phase 1: the divergence characterisation ────────────────────────────────────
+//
+// Phase 1 computes Binance's derived open-order requirement
+//     ooIM = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) − ROUND_UP(|N| / L)
+// alongside our escrow `PerpPosition::margin_reserved`, and asserts at every admission point
+// that the two reach the same accept/reject decision. They do NOT, and that is the product of
+// this phase. A suite-wide census over 5099 gate evaluations measured:
+//
+//   * 238 / 5099 (4.7%)  reach OPPOSITE DECISIONS,
+//   * 1499 / 5099 (29%)  price the same operation differently (Δescrow != ΔooIM),
+//   * 1249 / 5099 (25%)  hold a different available (Σ margin_reserved != Σ ooIM),
+//   * 0 / 5099           diverge for any OTHER reason — which is what the dual gate still
+//                        asserts, and what would catch a bug in the formula or the probe.
+//
+// The tests below pin each mechanism with concrete numbers, so Phase 2 knows exactly what it is
+// changing. THEY PIN A DIVERGENCE ON PURPOSE. A future change that makes one of them agree is a
+// behaviour change and must be justified, not silently absorbed.
+//
+// Fixture arithmetic: base_decimals 8, price_decimals 9, so one QTY lot (0.01) at $P is worth
+// `P × 10_000` quote units — $100 ⇒ 1_000_000, $90 ⇒ 900_000, $110 ⇒ 1_100_000.
+mod derived_ooim_divergence {
+    use super::*;
+    use crate::margin_view::{
+        position_derived_margin, total_margin_reserved, total_open_order_initial_margin,
+    };
+    use crate::types::MarginTier;
+
+    const P_LOW: u64 = 90 * TICK;
+    const P_HIGH: u64 = 110 * TICK;
+
+    fn market_with(mark: u64, tiers: MarginTiers) -> Market {
+        Market {
+            market_id: MARKET_ID,
+            base_decimals: 8,
+            price_decimals: 9,
+            tick_size: TICK,
+            step_size: QTY,
+            min_quantity: QTY,
+            max_quantity: QTY * 1_000,
+            max_price: PRICE * 1_000,
+            price_update_interval: 15,
+            active: true,
+            funding_interval: 0,
+            interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
+            price_band_bps: 0,
+            mark_price: mark,
+            tiers,
+        }
+    }
+
+    /// A market with a live mark price. `setup()` leaves `mark_price` at 0, which makes the
+    /// DERIVED basis blind to every position (`N = trunc(|amt| × 0) = 0`) — a test artefact, not
+    /// production behaviour (`addMarket` rejects a zero mark). Several of these tests exist
+    /// precisely to separate that artefact from the real divergences.
+    fn setup_marked(ctx: &mut TestCtx, mark: u64) {
+        storage::save_admin(ctx, ADMIN).unwrap();
+        storage::save_market(ctx, &market_with(mark, MarginTiers::default())).unwrap();
+        fund(ctx, ALICE, WALLET * 100);
+        fund(ctx, BOB, WALLET * 100);
+    }
+
+    fn place(ctx: &mut TestCtx, who: Address, side: u8, price: u64, lots: u64) -> [u8; 32] {
+        let input = placeOrderCall {
+            marketId: MARKET_ID,
+            side,
+            price,
+            quantity: QTY * lots,
+            orderType: 0,
+            tif: 3, // PostOnly: rest without matching, so the book state is exactly as written
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
+        let ret = run_place_order(&input, who, ctx).expect("placement");
+        ret[..32].try_into().unwrap()
+    }
+
+    fn seed_position(ctx: &mut TestCtx, who: Address, lots: i64, leverage: u64) {
+        let notional = lots * FILL_VALUE as i64;
+        storage::save_position(
+            ctx,
+            who,
+            MARKET_ID,
+            &PerpPosition {
+                amount: lots * QTY as i64,
+                v_quote_balance: -notional,
+                margin: notional.abs(),
+                leverage,
+                ..PerpPosition::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// `(escrow margin_reserved, derived ooIM)` for ALICE in the test market, right now.
+    fn bases(ctx: &mut TestCtx) -> (u64, u64) {
+        let m = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+        let p = storage::load_position(ctx, ALICE, MARKET_ID).unwrap();
+        (
+            p.margin_reserved,
+            position_derived_margin(&m, &p).unwrap().tier_capped_oo_im,
+        )
+    }
+
+    // ── 1. Cross-side orders: our escrow ADDS the residuals, Binance takes a MAX ─────────────
+
+    /// **The headline structural divergence.** With orders resting on BOTH sides of the same
+    /// market our escrow charges `max(S + B', B + S')` — each side's residual after the position
+    /// is netted off, ADDED to the other side's full leg — while Binance charges
+    /// `max(|N + Bid|, |N − Ask|)`, the larger of the two TERMINAL exposures. These are different
+    /// functions, and the escrow is strictly the stricter one here.
+    ///
+    /// Flat position, mark $100, leverage 1, resting BUY 2 lots @ $90 and SELL 1 lot @ $110:
+    ///
+    /// | quantity | value     | how |
+    /// |----------|-----------|-----|
+    /// | `Bid`    | 1_800_000 | 2 × 900_000 |
+    /// | `Ask`    | 1_100_000 | 1 × 1_100_000 |
+    /// | escrow   | 2_000_000 | `max(S + B', B + S') = max(1_100_000 + 900_000, 1_800_000 + 0)` |
+    /// | ooIM     | 1_800_000 | `max(\|0 + 1_800_000\|, \|0 − 1_100_000\|) − 0` |
+    ///
+    /// `B' = 900_000` is the buy leg left over after one lot of it is consumed covering the short
+    /// the sells would open; Binance has no such term — it never models the two sides filling in
+    /// sequence. **Escrow over-charges by 200_000 (+11.1%).**
+    #[test]
+    fn cross_side_escrow_adds_the_residual_binance_takes_the_max() {
+        let mut ctx = make_ctx();
+        setup_marked(&mut ctx, PRICE);
+        place(&mut ctx, ALICE, 0, P_LOW, 2);
+        place(&mut ctx, ALICE, 1, P_HIGH, 1);
+
+        let p = storage::load_position(&mut ctx, ALICE, MARKET_ID).unwrap();
+        assert_eq!(
+            (p.amount, p.total_buy_notional, p.total_sell_notional),
+            (0, 1_800_000, 1_100_000)
+        );
+
+        let (escrow, oo_im) = bases(&mut ctx);
+        assert_eq!(escrow, 2_000_000, "escrow = max(S + B', B + S')");
+        assert_eq!(oo_im, 1_800_000, "ooIM = max(|N+Bid|, |N-Ask|) - |N|/L");
+        assert_eq!(
+            escrow - oo_im,
+            200_000,
+            "escrow over-charges the cross-side book"
+        );
+    }
+
+    /// The same shape one lot smaller happens to AGREE — the divergence is not "cross-side always
+    /// differs", it is that the two functions cross. BUY 1 lot @ $90, SELL 1 lot @ $110, flat:
+    /// `max(1_100_000 + 0, 900_000 + 0) = 1_100_000` and `max(900_000, 1_100_000) = 1_100_000`.
+    /// Pinned so the boundary of the divergence set is recorded, not just its interior.
+    #[test]
+    fn cross_side_one_for_one_happens_to_agree() {
+        let mut ctx = make_ctx();
+        setup_marked(&mut ctx, PRICE);
+        place(&mut ctx, ALICE, 0, P_LOW, 1);
+        place(&mut ctx, ALICE, 1, P_HIGH, 1);
+        assert_eq!(bases(&mut ctx), (1_100_000, 1_100_000));
+    }
+
+    // ── 2. Mark price moving: escrow is FROZEN, ooIM re-values ──────────────────────────────
+
+    /// **The divergence that cannot be designed away.** Our escrow is decided once, at placement,
+    /// and never revisited; ooIM re-values the position leg at the CURRENT mark on every read. So
+    /// a mark move alone changes the derived requirement while the escrow sits still.
+    ///
+    /// Long 1 lot, resting SELL 3 lots @ $110 (`Ask = 3_300_000`), leverage 1. Escrow is
+    /// `2_200_000` at every mark (`max(S + B', B + S')` is computed in QUANTITY space against the
+    /// position and at the orders' LIMIT prices — the mark is not an input to it at all):
+    ///
+    /// | mark | `N`       | `max(\|N+Bid\|, \|N−Ask\|)` | PIM       | ooIM      | escrow    | gap        |
+    /// |------|-----------|---------------------------|-----------|-----------|-----------|------------|
+    /// | $100 | 1_000_000 | 2_300_000 (ask branch)    | 1_000_000 | 1_300_000 | 2_200_000 |   +900_000 |
+    /// | $150 | 1_500_000 | 1_800_000 (ask branch)    | 1_500_000 |   300_000 | 2_200_000 | +1_900_000 |
+    /// | $200 | 2_000_000 | 2_000_000 (bid branch)    | 2_000_000 |         0 | 2_200_000 | +2_200_000 |
+    ///
+    /// At $200 the position has grown big enough that the resting sells are pure risk REDUCTION
+    /// and Binance charges nothing for them, while we still hold the full placement-time escrow.
+    /// **A 2× mark move swings ooIM from 1_300_000 to 0 with no order and no fill.**
+    #[test]
+    fn mark_moves_reprice_oo_im_while_the_escrow_stays_frozen() {
+        let mut ctx = make_ctx();
+        setup_marked(&mut ctx, PRICE);
+        seed_position(&mut ctx, ALICE, 1, 1);
+        place(&mut ctx, ALICE, 1, P_HIGH, 3);
+
+        let mut seen = Vec::new();
+        for mark in [PRICE, 150 * TICK, 200 * TICK] {
+            storage::save_mark_price(&mut ctx, MARKET_ID, mark).unwrap();
+            seen.push(bases(&mut ctx));
+        }
+        assert_eq!(
+            seen,
+            vec![(2_200_000, 1_300_000), (2_200_000, 300_000), (2_200_000, 0)],
+            "escrow frozen at 2_200_000; ooIM 1_300_000 -> 300_000 -> 0 on mark alone"
+        );
+    }
+
+    /// The mark move is not one-directional either: a mark move AGAINST the position inflates
+    /// ooIM past the escrow, i.e. the derived basis becomes the STRICTER one. Same position and
+    /// book, mark crashed to $10: `N = 100_000`, ask branch `|100_000 − 3_300_000| = 3_200_000`,
+    /// PIM `100_000` ⇒ ooIM `3_100_000` against an escrow of `2_200_000` — **derived is
+    /// 900_000 stricter**. Divergence runs in BOTH directions, which is why the Phase 1 probe is
+    /// an equality check and not an AND-gate.
+    #[test]
+    fn an_adverse_mark_makes_the_derived_basis_the_stricter_one() {
+        let mut ctx = make_ctx();
+        setup_marked(&mut ctx, PRICE);
+        seed_position(&mut ctx, ALICE, 1, 1);
+        place(&mut ctx, ALICE, 1, P_HIGH, 3);
+        storage::save_mark_price(&mut ctx, MARKET_ID, 10 * TICK).unwrap();
+        assert_eq!(bases(&mut ctx), (2_200_000, 3_100_000));
+    }
+
+    // ── 3. mark == 0 is a TEST artefact, and it explains most of the suite's divergences ─────
+
+    /// The `risk_reducing_admission` divergences (a pure-reduce order that our escrow charges
+    /// nothing for and the derived basis charges in full) are ENTIRELY an artefact of the shared
+    /// `setup()` fixture leaving `mark_price` at 0: with `N = 0` the derived basis cannot see the
+    /// position at all, so a risk-reducing sell looks like a naked one.
+    ///
+    /// Same state, two marks. Long 2 lots, resting SELL 1 lot @ $110:
+    /// * mark 0    ⇒ `N = 0`       ⇒ ooIM `1_100_000`, escrow `0` — the artefact.
+    /// * mark $100 ⇒ `N = 2_000_000` ⇒ `max(2_000_000, 900_000) = 2_000_000 = PIM` ⇒ ooIM `0`,
+    ///   escrow `0` — **they AGREE**.
+    ///
+    /// Production cannot reach the first row (`addMarket` rejects a zero mark and every mark
+    /// component is floored at 1), so "the derived basis punishes risk-reducing orders" is NOT a
+    /// real finding. Recording it here stops it being rediscovered as one.
+    #[test]
+    fn the_pure_reduce_divergence_is_a_zero_mark_artefact_only() {
+        let mut ctx = make_ctx();
+        setup_marked(&mut ctx, 0);
+        seed_position(&mut ctx, ALICE, 2, 1);
+        place(&mut ctx, ALICE, 1, P_HIGH, 1);
+        assert_eq!(
+            bases(&mut ctx),
+            (0, 1_100_000),
+            "mark 0: derived is blind to the long"
+        );
+
+        storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+        assert_eq!(
+            bases(&mut ctx),
+            (0, 0),
+            "mark $100: both agree a pure reduce is free"
+        );
+    }
+
+    // ── 4. A position that flips sign under a two-sided book ────────────────────────────────
+
+    /// Orders resting on both sides while the position crosses zero. The escrow's flip-aware
+    /// `max(S + B', B + S')` exists precisely to survive this, and it does — but it tracks the
+    /// flip in QUANTITY space at LIMIT prices, while ooIM tracks it in NOTIONAL space at MARK, so
+    /// the two trace different curves through the flip.
+    ///
+    /// Book fixed at BUY 2 lots @ $90 (`Bid = 1_800_000`) and SELL 2 lots @ $110
+    /// (`Ask = 2_200_000`), mark $100, leverage 1, position walked from +2 lots to −2 lots:
+    ///
+    /// | position | `N`        | escrow    | ooIM      | escrow − ooIM |
+    /// |----------|------------|-----------|-----------|---------------|
+    /// | +2 lots  |  2_000_000 | 1_800_000 | 1_800_000 |             0 |
+    /// | +1 lot   |  1_000_000 | 2_000_000 | 1_800_000 |      +200_000 |
+    /// |  flat    |          0 | 2_200_000 | 2_200_000 |             0 |
+    /// | −1 lot   | −1_000_000 | 2_200_000 | 2_200_000 |             0 |
+    /// | −2 lots  | −2_000_000 | 2_200_000 | 2_200_000 |             0 |
+    ///
+    /// ooIM is a STEP function of the position: it is `Bid` while the position is long enough for
+    /// the bid branch to win and `Ask` once the ask branch takes over, switching at the flip. The
+    /// escrow tracks the same two plateaus but bulges above them in the middle, at +1 lot, by
+    /// exactly the 200_000 cross-side residual of the previous test — one lot of the buy leg
+    /// survives covering the short the sells would open, and gets ADDED to the sell leg. So the
+    /// flip itself is NOT a divergence source; the same single mechanism is, and it shows up
+    /// wherever the position only PARTIALLY covers one side of a two-sided book.
+    #[test]
+    fn a_sign_flip_under_a_two_sided_book_traces_different_curves() {
+        let mut ctx = make_ctx();
+        setup_marked(&mut ctx, PRICE);
+        place(&mut ctx, ALICE, 0, P_LOW, 2);
+        place(&mut ctx, ALICE, 1, P_HIGH, 2);
+
+        let mut walk = Vec::new();
+        for lots in [2i64, 1, 0, -1, -2] {
+            // Move ONLY `amount`; the book and its aggregates stay exactly as placed, so the
+            // position sign is the single independent variable.
+            let mut p = storage::load_position(&mut ctx, ALICE, MARKET_ID).unwrap();
+            p.amount = lots * QTY as i64;
+            let m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+            let (b, s, c) = crate::math::calc_reservation_notionals_from_totals_it(
+                storage::load_buy_orders(&mut ctx, ALICE, MARKET_ID)
+                    .unwrap()
+                    .iter()
+                    .copied(),
+                storage::load_sell_orders(&mut ctx, ALICE, MARKET_ID)
+                    .unwrap()
+                    .iter()
+                    .copied(),
+                p.total_buy_qty,
+                p.total_buy_notional,
+                p.total_sell_qty,
+                p.total_sell_notional,
+                m.base_decimals,
+                m.price_decimals,
+                p.amount,
+            )
+            .unwrap();
+            p.set_reservations(b, s, c, p.leverage);
+            walk.push((
+                p.margin_reserved,
+                position_derived_margin(&m, &p).unwrap().tier_capped_oo_im,
+            ));
+        }
+        assert_eq!(
+            walk,
+            vec![
+                (1_800_000, 1_800_000),
+                (2_000_000, 1_800_000),
+                (2_200_000, 2_200_000),
+                (2_200_000, 2_200_000),
+                (2_200_000, 2_200_000),
+            ],
+            "the two bases agree except at +1 lot, where the escrow adds the 200_000 residual"
+        );
+    }
+
+    // ── 5. A tier boundary straddled by the ORDERS, not the position ────────────────────────
+
+    /// The admission basis tier-caps leverage at the COMBINED notional, so a book that pushes a
+    /// small position over a tier boundary re-prices the POSITION too. Our escrow has no such
+    /// term — it divides by `pos.leverage` unconditionally.
+    ///
+    /// Tiers `[(0, 10x), (2_000_000, 2x)]`, position long 1 lot at leverage 10, mark $100
+    /// (`N = 1_000_000`, comfortably tier 0):
+    ///
+    /// | resting BUY | `Bid`     | combined  | tier | `L_eff` | ooIM    | escrow  |
+    /// |-------------|-----------|-----------|------|---------|---------|---------|
+    /// | 1 lot @ $90 |   900_000 | 1_900_000 | 0    | 10      |  90_000 |  90_000 |
+    /// | 2 lots @ $90| 1_800_000 | 2_800_000 | 1    | 2       | 900_000 | 180_000 |
+    ///
+    /// One extra lot crosses the boundary and the derived requirement jumps **10×**, from 90_000
+    /// to 900_000, while the escrow merely doubles. `L_eff` drops 10 → 2, which re-prices the
+    /// pre-existing position as well as the new order — a discontinuity the escrow basis simply
+    /// does not have.
+    #[test]
+    fn a_tier_boundary_crossed_by_the_orders_repricees_the_position_too() {
+        let tiers = MarginTiers::from_tiers(&[
+            MarginTier {
+                lower_bound_notional: 0,
+                max_leverage: 10,
+            },
+            MarginTier {
+                lower_bound_notional: 2_000_000,
+                max_leverage: 2,
+            },
+        ])
+        .unwrap();
+        for (lots, want) in [(1u64, (90_000u64, 90_000u64)), (2, (180_000, 900_000))] {
+            let mut ctx = make_ctx();
+            storage::save_admin(&mut ctx, ADMIN).unwrap();
+            storage::save_market(&mut ctx, &market_with(PRICE, tiers)).unwrap();
+            fund(&mut ctx, ALICE, WALLET * 100);
+            seed_position(&mut ctx, ALICE, 1, 10);
+            place(&mut ctx, ALICE, 0, P_LOW, lots);
+            assert_eq!(bases(&mut ctx), want, "{lots} lot(s) resting");
+        }
+    }
+
+    // ── 6. The account-level fold, and the gross-up that Phase 1 must not get wrong ─────────
+
+    /// The Σ walkers agree with the per-market numbers, the market index really is the support of
+    /// the sum, and — the trap — `available_new` must GROSS UP by the escrow before subtracting
+    /// Σ ooIM, because `perp_wallet_balance` has already been debited by it.
+    ///
+    /// Flat, mark $100, BUY 2 lots @ $90 + SELL 1 lot @ $110 (the cross-side case above):
+    /// escrow `2_000_000` is physically out of the wallet, ooIM is `1_800_000`. The naive
+    /// `wallet − Σ ooIM` would report `2_000_000 + 1_800_000 = 3_800_000` less than the true
+    /// gross — nearly double-charging a 2M book.
+    #[test]
+    fn the_derived_available_grosses_the_escrow_back_up_before_subtracting() {
+        let mut ctx = make_ctx();
+        setup_marked(&mut ctx, PRICE);
+        let funded = storage::load_account(&mut ctx, ALICE)
+            .unwrap()
+            .perp_wallet_balance;
+        place(&mut ctx, ALICE, 0, P_LOW, 2);
+        place(&mut ctx, ALICE, 1, P_HIGH, 1);
+
+        let wallet = storage::load_account(&mut ctx, ALICE)
+            .unwrap()
+            .perp_wallet_balance;
+        assert_eq!(
+            wallet,
+            funded - 2_000_000,
+            "the escrow really is debited from the wallet"
+        );
+
+        assert_eq!(total_margin_reserved(&mut ctx, ALICE).unwrap(), 2_000_000);
+        assert_eq!(
+            total_open_order_initial_margin(&mut ctx, ALICE).unwrap(),
+            1_800_000
+        );
+
+        // The correct basis: gross the escrow back up, THEN subtract the derived requirement.
+        let correct = crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap();
+        assert_eq!(correct, wallet as i128 + 2_000_000 - 1_800_000);
+        assert_eq!(
+            correct,
+            funded as i128 - 1_800_000,
+            "the derived basis charges the DERIVED requirement and nothing else"
+        );
+
+        // The trap, stated numerically: forgetting the gross-up charges the book TWICE.
+        let naive = wallet as i128 - 1_800_000;
+        assert_eq!(
+            correct - naive,
+            2_000_000,
+            "the double-count the gross-up removes"
+        );
+    }
+
+    /// A user active in SEVERAL markets folds every one of them, and a market they have left
+    /// contributes nothing (it is not in the index, and its ooIM would be 0 anyway).
+    #[test]
+    fn the_sum_spans_every_market_in_the_index_and_only_those() {
+        let mut ctx = make_ctx();
+        storage::save_admin(&mut ctx, ADMIN).unwrap();
+        for id in 1..=3u64 {
+            let mut m = market_with(PRICE, MarginTiers::default());
+            m.market_id = id;
+            storage::save_market(&mut ctx, &m).unwrap();
+        }
+        fund(&mut ctx, ALICE, WALLET * 100);
+
+        let mut expect = 0u128;
+        for id in 1..=3u64 {
+            let input = placeOrderCall {
+                marketId: id,
+                side: 0,
+                price: P_LOW,
+                quantity: QTY * id,
+                orderType: 0,
+                tif: 3,
+                clientOrderId: FixedBytes::default(),
+            }
+            .abi_encode();
+            run_place_order(&input, ALICE, &mut ctx).unwrap();
+            expect += 900_000u128 * id as u128;
+        }
+        assert_eq!(
+            storage::load_user_markets(&mut ctx, ALICE).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            total_open_order_initial_margin(&mut ctx, ALICE).unwrap(),
+            expect
+        );
+        assert_eq!(expect, 5_400_000, "900_000 × (1 + 2 + 3)");
     }
 }

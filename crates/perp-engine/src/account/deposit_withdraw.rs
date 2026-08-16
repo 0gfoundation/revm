@@ -164,6 +164,20 @@ pub fn run_transfer_from_perp<H: PerpHost>(
     }
 
     let mut account = storage::load_account(context, caller)?;
+    // Derived-ooIM Phase 1 dual gate (debug only). Cash leaving the perp wallet: Σ ooIM is
+    // untouched, so the derived requirement is the same `amount`; only the AVAILABLE differs
+    // (`+ Σ margin_reserved − Σ ooIM`). This is the money-OUT gate — the one where an
+    // over-permissive derived basis would let a user strip collateral out from under resting
+    // orders — so it matters most that the two agree.
+    #[cfg(debug_assertions)]
+    crate::margin_view::debug_assert_gates_agree(
+        context,
+        caller,
+        "transferFromPerp",
+        None,
+        amount,
+        amount as i128,
+    );
     if !account.has_available_perp(amount) {
         return Err(perp_err(
             "transferFromPerp: insufficient perp wallet balance",

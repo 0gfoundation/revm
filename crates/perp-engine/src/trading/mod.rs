@@ -2177,6 +2177,27 @@ fn rest_in_book<H: PerpHost>(
             // trading fee (Binance parity: the fee is charged out of the margin the FILL funds).
             let delta = new_reserved.saturating_sub(old_reserved);
 
+            // Derived-ooIM Phase 1 dual gate (debug only). `pos` still carries the PRE-op
+            // aggregates here — they are committed a few lines below — so it is the "before"
+            // snapshot as-is, and "after" is it with this order's contribution folded in.
+            // `set_reservations` above touched only the reservation fields, which ooIM does not
+            // read. The ESCROW check below alone still decides.
+            #[cfg(debug_assertions)]
+            {
+                let mut after = pos.clone();
+                after.total_buy_qty = new_tbq;
+                after.total_buy_notional = new_tbn;
+                let d = crate::margin_view::derived_requirement_delta(market, &pos, &after)
+                    .expect("dual gate: ooIM delta");
+                crate::margin_view::debug_assert_gates_agree(
+                    context,
+                    user,
+                    "placeOrder: rest BUY",
+                    Some(market_id),
+                    delta,
+                    d,
+                );
+            }
             if !account.has_available_perp(delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
@@ -2271,6 +2292,23 @@ fn rest_in_book<H: PerpHost>(
             // Margin reservation ONLY — see the buy arm.
             let delta = new_reserved.saturating_sub(old_reserved);
 
+            // Derived-ooIM Phase 1 dual gate (debug only) — mirror of the buy arm.
+            #[cfg(debug_assertions)]
+            {
+                let mut after = pos.clone();
+                after.total_sell_qty = new_tsq;
+                after.total_sell_notional = new_tsn;
+                let d = crate::margin_view::derived_requirement_delta(market, &pos, &after)
+                    .expect("dual gate: ooIM delta");
+                crate::margin_view::debug_assert_gates_agree(
+                    context,
+                    user,
+                    "placeOrder: rest SELL",
+                    Some(market_id),
+                    delta,
+                    d,
+                );
+            }
             if !account.has_available_perp(delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }

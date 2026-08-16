@@ -552,7 +552,7 @@ fn set_leverage_core<H: PerpHost>(
         ));
     }
 
-    rebalance_order_margin_for_leverage(context, account, &mut pos, leverage)?;
+    rebalance_order_margin_for_leverage(context, account, &market, &mut pos, leverage)?;
     pos.leverage = leverage;
     storage::save_position(context, account, market_id, &pos)?;
 
@@ -617,6 +617,20 @@ pub fn run_add_position_margin<H: PerpHost>(
     // leaves the IF untouched. The credit/charge lands on the in-memory `pos.margin` — funding is
     // isolated to the position and never touches the account-global wallet.
     let pending_funding = compute_funding_settlement(context, caller, &market, &mut pos)?;
+    // Derived-ooIM Phase 1 dual gate (debug only). This is a CASH move (wallet → position
+    // margin), not an open-order requirement: it changes neither `Bid`/`Ask` nor `N` nor `L`, so
+    // Σ ooIM is unchanged and the derived requirement is the same `amount` the escrow basis asks
+    // for. The two decisions can still differ, because the two AVAILABLES differ by
+    // `Σ margin_reserved − Σ ooIM`. That is exactly what this probe is here to detect.
+    #[cfg(debug_assertions)]
+    crate::margin_view::debug_assert_gates_agree(
+        context,
+        caller,
+        "addPositionMargin",
+        Some(args.marketId),
+        args.amount,
+        args.amount as i128,
+    );
     if !account.has_available_perp(args.amount) {
         return Err(perp_err(
             "addPositionMargin: insufficient perp wallet balance",
@@ -1015,9 +1029,13 @@ fn run_liquidation_sweep<H: PerpHost>(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+/// `market` is consumed only by the derived-ooIM Phase 1 dual gate (mark price + tier table +
+/// decimals), which is compiled out of release builds — hence the conditional `unused_variables`.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
 fn rebalance_order_margin_for_leverage<H: PerpHost>(
     context: &mut H,
     user: Address,
+    market: &crate::types::Market,
     pos: &mut crate::types::PerpPosition,
     new_leverage: u64,
 ) -> Result<(), PerpError> {
@@ -1036,6 +1054,25 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
 
     if new_reserved > old_reserved {
         let delta = new_reserved - old_reserved;
+        // Derived-ooIM Phase 1 dual gate (debug only). setLeverage moves neither the position nor
+        // the book, so `Bid`/`Ask`/`N` are unchanged and the ONLY thing that moves ooIM is the
+        // leverage divisor: "before" is the stored position, "after" is it at `new_leverage`.
+        #[cfg(debug_assertions)]
+        {
+            let before = (*storage::load_position_ref(context, user, market.market_id)?).clone();
+            let mut after = before.clone();
+            after.leverage = new_leverage;
+            let d = crate::margin_view::derived_requirement_delta(market, &before, &after)
+                .expect("dual gate: ooIM delta");
+            crate::margin_view::debug_assert_gates_agree(
+                context,
+                user,
+                "setLeverage: order-margin rebalance",
+                Some(market.market_id),
+                delta,
+                d,
+            );
+        }
         // validate-then-apply: the availability reject is a READ-ONLY precheck (mutate_account
         // always writes, so a rejecting closure would write-on-reject). Reject → zero write.
         if !storage::load_account_ref(context, user)?.has_available_perp(delta) {
@@ -1264,6 +1301,16 @@ pub fn run_deposit_insurance_fund<H: PerpHost>(
     }
 
     let mut account = storage::load_account(context, caller)?;
+    // Derived-ooIM Phase 1 dual gate (debug only) — a pure cash-out, see `addPositionMargin`.
+    #[cfg(debug_assertions)]
+    crate::margin_view::debug_assert_gates_agree(
+        context,
+        caller,
+        "depositInsuranceFund",
+        None,
+        args.amount,
+        args.amount as i128,
+    );
     if !account.has_available_perp(args.amount) {
         return Err(perp_err(
             "depositInsuranceFund: insufficient perp wallet balance",
