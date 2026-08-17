@@ -368,10 +368,14 @@ pub fn load_account_ref<H: PerpHost>(
 /// each maker fill it takes part in), an account whose balance nets back to its starting value still
 /// reports the intermediate writes, and events appear interleaved with `Trade`/`PositionChanged` in
 /// write order rather than appended in address order at the end of the call.
-fn emit_account_balance_changed<H: PerpHost>(context: &mut H, user: Address, account: &UserAccount) {
+fn emit_account_balance_changed<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    account: &UserAccount,
+) {
     let PublicAccountBalance {
         usdc_balance,
-        available_perp_balance,
+        perp_wallet_balance,
     } = account.public_balance();
     context.log(primitives::Log {
         address: PERP_DEX_ADDRESS,
@@ -380,7 +384,7 @@ fn emit_account_balance_changed<H: PerpHost>(context: &mut H, user: Address, acc
             crate::interface::IPerpDex::AccountBalanceChanged {
                 user,
                 usdcBalance: usdc_balance,
-                availablePerpBalance: available_perp_balance,
+                perpWalletBalance: perp_wallet_balance,
             }
             .to_log_data()
         },
@@ -2342,12 +2346,6 @@ mod size_probe_tests {
             amount: 150_000_000,
             v_quote_balance: -98_148_315,
             margin: 9_814_831,
-            margin_reserved: 5_000_000,
-            margin_reserved_notional: 50_000_000,
-            buy_side_margin_reserved: 5_000_000,
-            buy_side_reserved_notional: 50_000_000,
-            sell_side_margin_reserved: 1_000_000,
-            sell_side_reserved_notional: 10_000_000,
             leverage: 10,
             last_funding_index: 123_456_789_012_345i128,
             total_buy_qty: 60_000_000,
@@ -2577,12 +2575,6 @@ mod encoding_roundtrip_tests {
                 amount: i64::MIN,
                 v_quote_balance: i64::MAX,
                 margin: -1,
-                margin_reserved: u64::MAX,
-                margin_reserved_notional: u64::MAX,
-                buy_side_margin_reserved: 0,
-                buy_side_reserved_notional: u64::MAX,
-                sell_side_margin_reserved: 7,
-                sell_side_reserved_notional: 0,
                 leverage: 20,
                 last_funding_index: i128::MIN,
                 total_buy_qty: u64::MAX,

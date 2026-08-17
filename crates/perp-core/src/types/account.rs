@@ -60,7 +60,7 @@ pub struct UserAccount {
     #[serde(rename = "NO", default)]
     pub nonce: u64,
     // NOTE: the former "TC" (`total_perp_collateral`) aggregate is GONE. It was
-    // `wallet + Σ_positions(margin + margin_reserved)` — fully derivable from state
+    // `wallet + Σ_positions(margin + the since-deleted margin_reserved)` — fully derivable from state
     // that is already published, used by no protocol rule, yet incrementally maintained on the
     // hottest write paths (an extra account read + clone + write per order rest/cancel). Consumers
     // that want it compute it off-chain from `getAccount` + `getPosition`.
@@ -78,18 +78,26 @@ impl Default for UserAccount {
     }
 }
 
-/// Public account values emitted by the precompile and returned by `getAccount`.
+/// Public account values emitted by the precompile in `AccountBalanceChanged`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PublicAccountBalance {
     /// Spot USDC held inside the DEX.
     pub usdc_balance: U256,
-    /// Perp collateral currently available for trading or transfer.
-    pub available_perp_balance: u64,
+    /// The CROSS perp wallet, clamped at 0 — Binance's `crossWalletBalance`.
+    ///
+    /// NOT spendable headroom: the open-order requirement (`Σ ooIM`) is derived, never debited,
+    /// so it is still sitting inside this number. The spendable figure is
+    /// `getAccount().availablePerpBalance`. This after-image deliberately reports the STORED
+    /// balance rather than the derived available, because it is emitted at the account write
+    /// site — mid-operation, before the position and order-list writes of the same call — where a
+    /// derived number would be computed against half-updated state and would also cost a
+    /// `Σ ooIM` walk on the hottest write path.
+    pub perp_wallet_balance: u64,
 }
 
 impl UserAccount {
-    /// Available balance exposed through the ABI. Negative internal balances are
-    /// reported as zero until liquidation/bankruptcy handling is wired.
+    /// The CROSS perp wallet clamped at 0, as exposed in `AccountBalanceChanged`. Negative
+    /// internal balances are reported as zero until liquidation/bankruptcy handling is wired.
     #[inline]
     pub fn visible_perp_wallet_balance(&self) -> u64 {
         if self.perp_wallet_balance <= 0 {
@@ -104,38 +112,7 @@ impl UserAccount {
     pub fn public_balance(&self) -> PublicAccountBalance {
         PublicAccountBalance {
             usdc_balance: self.usdc_balance.clone().into(),
-            available_perp_balance: self.visible_perp_wallet_balance(),
-        }
-    }
-
-    /// Returns whether the wallet can cover a user-initiated debit of `amount`.
-    ///
-    /// # Invariant
-    ///
-    /// **A risk-reducing or zero-cost action must never be gated on a balance the
-    /// user does not need.**
-    ///
-    /// `perp_wallet_balance` is deliberately SIGNED and can legitimately be
-    /// negative — a close-path fee, a funding charge, or a maker settlement
-    /// deficit can drive it below zero. A debit of **zero** is therefore always
-    /// affordable: nothing is being taken from the wallet, so there is nothing to
-    /// afford. Without the `amount == 0` arm the comparison is `-5 >= 0` ==
-    /// `false`, and a negative-balance user is refused precisely the actions that
-    /// would REDUCE their risk — a pure-reduce order (whose flip-aware
-    /// reservation delta is 0), and a close (whose `total_required` is 0 whenever
-    /// the fill opens nothing and the taker fee is covered).
-    ///
-    /// This widens no funding hole: every NON-zero debit is still refused unless
-    /// the signed balance covers it in full, and a debit above `i64::MAX` is
-    /// still refused outright.
-    #[inline]
-    pub fn has_available_perp(&self, amount: u64) -> bool {
-        if amount == 0 {
-            return true;
-        }
-        match i64::try_from(amount) {
-            Ok(amount) => self.perp_wallet_balance >= amount,
-            Err(_) => false,
+            perp_wallet_balance: self.visible_perp_wallet_balance(),
         }
     }
 
@@ -187,31 +164,33 @@ mod tests {
         }
     }
 
-    /// REGRESSION (B1). Pinned bug: `has_available_perp(0)` was `-5 >= 0` ==
-    /// `false`, so a NEGATIVE wallet refused a debit of ZERO — blocking the
-    /// risk-REDUCING actions (pure-reduce placement, close) whose required debit
-    /// is exactly 0.
+    /// The signed wallet passes NEGATIVE values through to the ledger and clamps only the
+    /// public view. A close-path fee, a funding charge or a maker settlement deficit can each
+    /// drive it below zero, and the clamp must not hide that from `credit_perp`/`debit_perp`.
     #[test]
-    fn a_zero_debit_is_affordable_at_any_balance_including_negative() {
-        for balance in [i64::MIN, -1_000_000, -5, -1, 0, 1, i64::MAX] {
-            assert!(
-                acct(balance).has_available_perp(0),
-                "a zero debit must be affordable at balance {balance}"
-            );
-        }
+    fn a_negative_wallet_is_reported_as_zero_but_kept_internally() {
+        let a = acct(-5);
+        assert_eq!(a.visible_perp_wallet_balance(), 0);
+        assert_eq!(a.perp_wallet_balance, -5);
+        assert_eq!(acct(10).visible_perp_wallet_balance(), 10);
+        assert_eq!(acct(0).visible_perp_wallet_balance(), 0);
     }
 
-    /// The fix must not open a hole: every non-zero debit keeps the old rule.
+    /// `debit_perp` is a pure ledger move with NO affordability rule of its own — the caller
+    /// gates. (It used to have a companion `has_available_perp(amount)`, which asked
+    /// `perp_wallet_balance >= amount`. That question is wrong now: the wallet is the CROSS
+    /// wallet and still holds the collateral backing every resting order, so the gate is
+    /// `margin_view::derived_available_balance` and its `derived_can_afford`. The predicate was
+    /// deleted rather than left lying around for someone to reuse.)
     #[test]
-    fn a_nonzero_debit_still_requires_the_balance_to_cover_it() {
-        assert!(!acct(-5).has_available_perp(1));
-        assert!(!acct(-5).has_available_perp(u64::MAX));
-        assert!(!acct(0).has_available_perp(1));
-        assert!(!acct(9).has_available_perp(10));
-        assert!(acct(10).has_available_perp(10), "the >= boundary is unchanged");
-        assert!(acct(11).has_available_perp(10));
-        // Above i64::MAX is still refused outright, even from a maximal balance.
-        assert!(!acct(i64::MAX).has_available_perp(i64::MAX as u64 + 1));
-        assert!(acct(i64::MAX).has_available_perp(i64::MAX as u64));
+    fn debit_and_credit_are_pure_ledger_moves_that_allow_a_negative_balance() {
+        let mut a = acct(10);
+        a.debit_perp(25).unwrap();
+        assert_eq!(a.perp_wallet_balance, -15, "no affordability rule here");
+        a.credit_perp(5).unwrap();
+        assert_eq!(a.perp_wallet_balance, -10);
+        // Above i64::MAX is still refused outright rather than wrapping.
+        assert!(acct(0).debit_perp(i64::MAX as u64 + 1).is_err());
+        assert!(acct(i64::MAX).credit_perp(1).is_err());
     }
 }

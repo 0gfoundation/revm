@@ -116,6 +116,46 @@ fn pos(ctx: &mut TestCtx, user: Address) -> PerpPosition {
     storage::load_position(ctx, user, MARKET_ID).unwrap()
 }
 
+/// The DERIVED open-order requirement `ooIM` for `user` in the test market — the replacement for
+/// the deleted `pos.margin_reserved` field in every assertion that used to read it. Unlike that
+/// field this is not stored: it is recomputed from `(N, Bid, Ask, L)` and moves with the mark.
+fn oo_im(ctx: &mut TestCtx, user: Address) -> u64 {
+    let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+    let p = storage::load_position(ctx, user, MARKET_ID).unwrap();
+    crate::margin_view::position_open_order_margin(&market, &p).unwrap()
+}
+
+/// `perp_wallet_balance − Σ ooIM` — the account's spendable headroom, i.e. the quantity every
+/// admission gate now compares against. Signed: it can legitimately go negative.
+fn available(ctx: &mut TestCtx, user: Address) -> i128 {
+    crate::margin_view::derived_available_balance(ctx, user).unwrap()
+}
+
+/// Set `user`'s wallet so that AVAILABLE lands exactly on `target`.
+///
+/// The derived-basis analogue of the old `perp_wallet_balance = <hand-computed leftover>`
+/// fixtures: those numbers were the leftover AFTER the escrow had physically removed the resting
+/// orders' margin, i.e. they WERE the available. Nothing is removed any more, so reproducing the
+/// same account state means putting the requirement back into the wallet.
+fn set_available(ctx: &mut TestCtx, user: Address, target: i64) {
+    let current = available(ctx, user);
+    let mut acc = storage::load_account(ctx, user).unwrap();
+    acc.perp_wallet_balance += (target as i128 - current) as i64;
+    storage::save_account(ctx, user, acc).unwrap();
+    assert_eq!(available(ctx, user), target as i128);
+}
+
+/// Give the test market a live mark price.
+///
+/// `setup()` leaves `mark_price` at 0, which PRODUCTION CANNOT REACH (`addMarket` rejects a zero
+/// initial mark and every mark component is floored away from zero). A zero mark makes `N = 0`,
+/// so the derived basis is blind to the position and a risk-reducing order looks naked. Any test
+/// whose subject is how a POSITION interacts with resting orders has to set a real mark, or it is
+/// pinning a fixture artefact.
+fn set_mark(ctx: &mut TestCtx, price: u64) {
+    storage::save_mark_price(ctx, MARKET_ID, price).unwrap();
+}
+
 /// Deterministic distinct test user address from a small index (avoids ALICE/BOB/CAROL/ADMIN).
 fn user_addr(i: u64) -> Address {
     let mut b = [0u8; 20];
@@ -625,31 +665,37 @@ fn limit_sell_rests_in_book_when_no_bid() {
     );
 }
 
+/// CHANGED BY THE ESCROW REMOVAL (mechanism, not size). The order still commits `INIT_MARGIN` of
+/// the account, but the WALLET no longer moves: the commitment is the derived requirement
+/// `ooIM = ROUND_UP(Bid / L)`, subtracted from the available on read.
 #[test]
-fn resting_buy_reserves_margin_from_perp_wallet() {
+fn resting_buy_commits_open_order_margin_without_debiting_the_wallet() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
 
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
-    // buy_side_margin_reserved = calc_value(PRICE, QTY, 8, 9) / leverage(1) = FILL_VALUE
-    assert_eq!(pos(&mut ctx, ALICE).buy_side_margin_reserved, INIT_MARGIN);
-    // Margin is the ONLY escrow: the prospective maker fee is NOT withheld at placement
-    // (it is charged out of the margin the fill funds).
-    assert_eq!(wallet(&mut ctx, ALICE), WALLET - INIT_MARGIN);
+    // Flat position ⇒ N = 0 ⇒ ooIM = ROUND_UP(Bid / 1) = calc_value(PRICE, QTY, 8, 9).
+    assert_eq!(oo_im(&mut ctx, ALICE), INIT_MARGIN);
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        WALLET,
+        "resting escrows NOTHING — not the margin, and not the prospective maker fee"
+    );
+    assert_eq!(available(&mut ctx, ALICE), (WALLET - INIT_MARGIN) as i128);
 }
 
+/// Sell-side twin of the above.
 #[test]
-fn resting_sell_reserves_margin_from_perp_wallet() {
+fn resting_sell_commits_open_order_margin_without_debiting_the_wallet() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
 
     place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
 
-    // sell_side_margin_reserved = calc_value(PRICE, QTY, 8, 9) / leverage(1) = FILL_VALUE
-    assert_eq!(pos(&mut ctx, BOB).sell_side_margin_reserved, INIT_MARGIN);
-    // No fee escrow at placement — see the buy-side twin above.
-    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
+    assert_eq!(oo_im(&mut ctx, BOB), INIT_MARGIN);
+    assert_eq!(wallet(&mut ctx, BOB), WALLET);
+    assert_eq!(available(&mut ctx, BOB), (WALLET - INIT_MARGIN) as i128);
 }
 
 #[test]
@@ -685,11 +731,13 @@ fn margin_uses_market_price_decimals() {
 
     place(&mut ctx, ALICE, 0, price, qty, 0, 0);
 
+    assert_eq!(oo_im(&mut ctx, ALICE), expected_margin);
+    // CHANGED BY THE ESCROW REMOVAL: the wallet is untouched; the charge lands on `available`.
+    assert_eq!(wallet(&mut ctx, ALICE), 200_000_000);
     assert_eq!(
-        pos(&mut ctx, ALICE).buy_side_margin_reserved,
-        expected_margin
+        available(&mut ctx, ALICE),
+        (200_000_000 - expected_margin) as i128
     );
-    assert_eq!(wallet(&mut ctx, ALICE), 200_000_000 - expected_margin);
 }
 
 #[test]
@@ -787,7 +835,7 @@ fn matched_call_emits_a_balance_event_at_each_balance_moving_write() {
         let usdc: U256 = acct.usdc_balance.clone().into();
         assert_eq!(event.usdcBalance, usdc, "final event for {user:?}");
         assert_eq!(
-            event.availablePerpBalance,
+            event.perpWalletBalance,
             acct.visible_perp_wallet_balance(),
             "final event for {user:?}"
         );
@@ -849,10 +897,17 @@ fn fill_debits_init_margin_from_both_wallets() {
     assert_eq!(wallet(&mut ctx, ADMIN), TAKER_FEE + MAKER_FEE);
 }
 
-/// A maker OPEN fill funds its fee entirely out of the margin the fill itself posts, so it needs
-/// NO free wallet — the property the old `fee_reserved` escrow provided, now provided by the
-/// Binance rule instead. (Was `maker_fill_consumes_reserved_fee_instead_of_position_margin`, which
-/// pinned the escrow; it also ran at MAKER_FEE = 0, so it could not observe the funding source.)
+/// A maker OPEN fill funds its FEE entirely out of the margin the fill itself posts, so the fee
+/// needs no free wallet on top of the margin — the property the old `fee_reserved` escrow
+/// provided, now provided by the Binance rule instead.
+///
+/// CHANGED BY THE ESCROW REMOVAL: the fixture used to drain BOB's wallet to ZERO before the fill,
+/// because the order's own escrow was all the funding the fill needed. The MARGIN escrow is gone
+/// too, so the fill draws `INIT_MARGIN` from the wallet at fill time and a zero wallet would make
+/// it unfundable — the maker's order would be cancelled instead of filled (pinned separately in
+/// `an_unfundable_maker_fill_is_cancelled_and_the_taker_walks_on`). The fixture now leaves BOB
+/// exactly the margin and NOT ONE UNIT MORE, which is the sharpest form of the claim under test:
+/// the fee is carved out of that margin, never charged on top of it.
 #[test]
 fn maker_open_fill_funds_its_fee_from_margin_needing_no_free_wallet() {
     let mut ctx = make_ctx();
@@ -868,18 +923,77 @@ fn maker_open_fill_funds_its_fee_from_margin_needing_no_free_wallet() {
     .unwrap();
     let maker_fee = FILL_VALUE * 200 / 10_000;
 
-    // Drain every spare unit: the reservation is all BOB has left backing this order.
-    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask reserves margin only
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask, no escrow taken
+                                               // Exactly the opening margin, nothing spare for a fee.
     let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
-    bob.perp_wallet_balance = 0;
+    bob.perp_wallet_balance = INIT_MARGIN as i64;
     storage::save_account(&mut ctx, BOB, bob).unwrap();
 
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy fills him
 
     let bob_pos = pos(&mut ctx, BOB);
     assert_eq!(bob_pos.margin, (INIT_MARGIN - maker_fee) as i64);
-    assert_eq!(wallet(&mut ctx, BOB), 0);
+    assert_eq!(
+        wallet(&mut ctx, BOB),
+        0,
+        "the wallet funded the margin and NOT the fee"
+    );
     assert_eq!(wallet(&mut ctx, ADMIN), maker_fee);
+}
+
+/// **THE MAKER-FILL FUNDING RULE.** Deleting the placement escrow means a maker fill's opening
+/// margin has to come out of the wallet AT FILL TIME, and the money may not be there — the wallet
+/// is only ever gated against `Σ ooIM` at ADMISSION, and `ooIM` (which values the position leg at
+/// mark and nets the close a fill performs) is not an upper bound on a fill's actual draw.
+///
+/// The engine refuses to underfund: the fill returns `MakerFillOutcome::RejectedInsolvent`, the
+/// same channel the K9 maintenance guard uses, so the maker's order is CANCELLED and the taker
+/// walks on to the next maker instead of the whole match aborting. Nothing is minted, no wallet
+/// goes negative, and the taker's own order still completes against the liquidity behind it.
+#[test]
+fn an_unfundable_maker_fill_is_cancelled_and_the_taker_walks_on() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    fund(&mut ctx, CAROL, WALLET);
+
+    // BOB rests at $100 (FIFO-first), CAROL behind him at the same price.
+    let bob_sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    let carol_sell = place(&mut ctx, CAROL, 1, PRICE, QTY, 0, 0);
+    // BOB is then drained — reachable in production via a fee, a funding charge or an adverse
+    // mark move between admission and fill.
+    let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
+    bob.perp_wallet_balance = INIT_MARGIN as i64 - 1; // ONE unit short
+    storage::save_account(&mut ctx, BOB, bob).unwrap();
+
+    let taker = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    // BOB's order is cancelled, not filled; his wallet is untouched and NOT negative.
+    assert_terminal(&mut ctx, bob_sell);
+    assert_eq!(pos(&mut ctx, BOB).amount, 0, "no position was opened");
+    assert_eq!(
+        storage::load_account(&mut ctx, BOB)
+            .unwrap()
+            .perp_wallet_balance,
+        INIT_MARGIN as i64 - 1,
+        "the maker's wallet must not go negative funding a fill it cannot afford"
+    );
+    // The taker's order still fills — against CAROL, one place further down the queue.
+    assert_terminal(&mut ctx, taker);
+    assert_terminal(&mut ctx, carol_sell);
+    assert_eq!(pos(&mut ctx, ALICE).amount, QTY as i64);
+    assert_eq!(pos(&mut ctx, CAROL).amount, -(QTY as i64));
+
+    // One unit more and BOB fills normally — the boundary is exactly the opening margin.
+    let mut ctx2 = make_ctx();
+    setup(&mut ctx2);
+    let bob_sell2 = place(&mut ctx2, BOB, 1, PRICE, QTY, 0, 0);
+    let mut bob2 = storage::load_account(&mut ctx2, BOB).unwrap();
+    bob2.perp_wallet_balance = INIT_MARGIN as i64;
+    storage::save_account(&mut ctx2, BOB, bob2).unwrap();
+    place(&mut ctx2, ALICE, 0, PRICE, QTY, 0, 0);
+    assert_terminal(&mut ctx2, bob_sell2);
+    assert_eq!(pos(&mut ctx2, BOB).amount, -(QTY as i64), "filled");
+    assert_eq!(wallet(&mut ctx2, BOB), 0);
 }
 
 #[test]
@@ -974,18 +1088,21 @@ fn maker_open_fill_charges_fee_from_margin_not_from_the_wallet() {
     .unwrap();
     let fee = FILL_VALUE * 200 / 10_000;
 
-    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // rest: margin reserve only, no fee escrow
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // rest: no escrow of any kind
     let bob_resting = wallet(&mut ctx, BOB);
-    assert_eq!(bob_resting, WALLET - INIT_MARGIN);
+    // CHANGED BY THE ESCROW REMOVAL: resting takes nothing, so the wallet is still whole here.
+    assert_eq!(bob_resting, WALLET);
 
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // ALICE takes it (taker fee 0)
 
-    // The reservation converts 1:1 into position margin, so the fill moves the wallet by zero and
-    // the fee is carved out of the margin. BOB's total (wallet + margin) fell by exactly `fee`.
+    // CHANGED: the fill DOES debit the maker's wallet now — by the opening margin, which the
+    // placement escrow used to have withheld already. Net of the two steps the maker is in
+    // exactly the same place as before (`WALLET - INIT_MARGIN`), and the fee is still carved out
+    // of the margin rather than charged on top: BOB's total (wallet + margin) fell by `fee` only.
     assert_eq!(
         wallet(&mut ctx, BOB),
-        bob_resting,
-        "the fill must not debit the maker's wallet"
+        bob_resting - INIT_MARGIN,
+        "the fill funds the opening margin from the wallet"
     );
     assert_eq!(pos(&mut ctx, BOB).margin, (INIT_MARGIN - fee) as i64);
     assert_eq!(wallet(&mut ctx, ADMIN), fee, "recipient paid in full");
@@ -1105,11 +1222,12 @@ fn flip_fill_splits_the_fee_between_margin_and_wallet_without_underflow() {
     );
 }
 
-/// Placement escrows the margin reserve and NOTHING else, and a cancel returns the wallet to
-/// exactly its pre-placement value (the fee round-trip that used to run through `fee_reserved`
-/// simply does not happen any more).
+/// CHANGED BY THE ESCROW REMOVAL. Placement used to DEBIT the margin reserve (and nothing else)
+/// and a cancel used to CREDIT it back. Now neither leg touches the wallet at all: placement
+/// raises the derived requirement and cancel drops it, so the round-trip is exact for the same
+/// reason but with no money moving in either direction. The maker fee is still not withheld.
 #[test]
-fn placement_reserves_margin_only_and_cancel_restores_the_wallet_exactly() {
+fn placement_charges_no_wallet_and_cancel_restores_the_available_exactly() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
     storage::save_user_fee_rates(
@@ -1123,14 +1241,20 @@ fn placement_reserves_margin_only_and_cancel_restores_the_wallet_exactly() {
     .unwrap();
 
     let before = wallet(&mut ctx, ALICE);
+    let available_before = available(&mut ctx, ALICE);
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
     assert_eq!(
-        before - wallet(&mut ctx, ALICE),
-        INIT_MARGIN,
-        "available balance drops by the margin reserve ONLY — no fee is withheld"
+        wallet(&mut ctx, ALICE),
+        before,
+        "the wallet does not move at placement"
     );
-    assert_eq!(pos(&mut ctx, ALICE).margin_reserved, INIT_MARGIN);
+    assert_eq!(
+        available_before - available(&mut ctx, ALICE),
+        INIT_MARGIN as i128,
+        "available drops by the open-order margin ONLY — no fee is withheld"
+    );
+    assert_eq!(oo_im(&mut ctx, ALICE), INIT_MARGIN);
 
     run_cancel_order(
         &cancelOrderCall {
@@ -1146,33 +1270,66 @@ fn placement_reserves_margin_only_and_cancel_restores_the_wallet_exactly() {
     assert_eq!(
         wallet(&mut ctx, ALICE),
         before,
-        "cancel is a clean round-trip"
+        "cancel moves no money either — the wallet never left `before`"
     );
-    assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
+    assert_eq!(oo_im(&mut ctx, ALICE), 0);
+    assert_eq!(
+        available(&mut ctx, ALICE),
+        available_before,
+        "cancel is a clean round-trip on the available"
+    );
 }
 
+/// CHANGED BY THE DERIVED-ooIM SWITCH. Two things move, both structural:
+///
+///  * A LIVE MARK is now required for the scenario to mean anything. With `setup()`'s mark of 0
+///    the derived basis cannot see BOB's short at all, so his 2-lot buy would read as a naked
+///    2e6 requirement instead of a hedge. Production always has a mark; the fixture did not.
+///  * BOB's 2-lot buy against his own 1-lot short costs him NOTHING: at mark $100 the joint
+///    requirement is `max(|N + Bid|, |N − Ask|) = max(|−1e6 + 2e6|, |−1e6|) = 1e6`, exactly
+///    `|N|`, so `ooIM = 1e6 − 1e6 = 0`. Buying 2 lots against a 1-lot short can leave at most a
+///    1-lot LONG — the same exposure, already margined. The escrow charged 1e6 for it (the
+///    excess lot's opening notional), which is the flip-nets-nothing over-charge the migration
+///    removed.
+///
+/// The claim under test is unchanged and still holds: once the fill closes BOB's short, the
+/// surviving 1-lot buy stops being a hedge and becomes a full 1e6 requirement again.
 #[test]
-fn maker_fill_recomputes_remaining_order_margin_after_position_close() {
+fn maker_fill_reprices_the_remaining_order_requirement_after_the_position_closes() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
+    set_mark(&mut ctx, PRICE);
 
     place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
     assert_eq!(pos(&mut ctx, BOB).amount, -(QTY as i64));
+    // The maker fill funded BOB's opening margin FROM THE WALLET (there was no escrow to draw
+    // on) — same net position as before the migration, reached in one step instead of two.
+    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
 
     let buy_id = place(&mut ctx, BOB, 0, PRICE, QTY * 2, 0, 0);
-    let bob = pos(&mut ctx, BOB);
-    assert_eq!(bob.buy_side_margin_reserved, INIT_MARGIN);
-    assert_eq!(wallet(&mut ctx, BOB), WALLET - (INIT_MARGIN * 2));
+    assert_eq!(
+        oo_im(&mut ctx, BOB),
+        0,
+        "a 2-lot buy hedging a 1-lot short is free"
+    );
+    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
+    assert_eq!(available(&mut ctx, BOB), (WALLET - INIT_MARGIN) as i128);
 
     place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
 
     let bob = pos(&mut ctx, BOB);
     assert_eq!(bob.amount, 0);
     assert_eq!(bob.margin, 0);
-    assert_eq!(bob.buy_side_margin_reserved, INIT_MARGIN);
-    assert_eq!(bob.margin_reserved, INIT_MARGIN);
-    assert_eq!(wallet(&mut ctx, BOB), WALLET - INIT_MARGIN);
+    // Flat again ⇒ N = 0 ⇒ the surviving 1-lot buy is charged in full.
+    assert_eq!(
+        bob.total_buy_notional, INIT_MARGIN,
+        "Bid after the partial fill"
+    );
+    assert_eq!(oo_im(&mut ctx, BOB), INIT_MARGIN);
+    // Closing the short returned its whole margin to the wallet.
+    assert_eq!(wallet(&mut ctx, BOB), WALLET);
+    assert_eq!(available(&mut ctx, BOB), (WALLET - INIT_MARGIN) as i128);
     assert_eq!(
         get_order(&mut ctx, buy_id).status,
         OrderStatus::PartiallyFilled
@@ -1339,17 +1496,25 @@ fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
     let low_buy = place(&mut ctx, ALICE, 0, low_buy_price, QTY, 0, 0);
     place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
 
+    // CHANGED BY THE ESCROW REMOVAL: the fixture's hand-set balance was the leftover AFTER the
+    // escrow removed both resting buys' margin — i.e. it was the AVAILABLE. Nothing is removed
+    // now, so the same account state is expressed as `available == 20_000`, and the cover loop
+    // frees headroom (by dropping `Bid`) rather than cash.
     let low_buy_margin = 980_000;
-    let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
-    alice.perp_wallet_balance = (INIT_MARGIN + TAKER_FEE - low_buy_margin) as i64;
-    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+    set_available(
+        &mut ctx,
+        ALICE,
+        (INIT_MARGIN + TAKER_FEE - low_buy_margin) as i64,
+    );
 
     let market_buy = place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);
 
     assert_terminal(&mut ctx, market_buy);
     assert_terminal(&mut ctx, low_buy);
     assert_eq!(get_order(&mut ctx, high_buy).status, OrderStatus::Open);
-    assert_eq!(wallet(&mut ctx, ALICE), 0);
+    // Cancelling the $98 buy freed 980_000 of requirement, which exactly funded the 1_000_000
+    // opening margin out of the 20_000 that was already free. Nothing is left over.
+    assert_eq!(available(&mut ctx, ALICE), 0);
 }
 
 #[test]
@@ -1384,21 +1549,26 @@ fn maker_fill_does_not_auto_expire_remaining_order_under_isolated_margin() {
     setup(&mut ctx);
 
     let sell_id = place(&mut ctx, BOB, 1, PRICE, QTY * 2, 0, 0);
-    storage::save_position(
-        &mut ctx,
-        BOB,
-        MARKET_ID,
-        &PerpPosition {
-            amount: QTY as i64,
-            v_quote_balance: -(FILL_VALUE as i64),
-            leverage: 1,
-            ..PerpPosition::default()
-        },
-    )
-    .unwrap();
-    let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
-    bob.perp_wallet_balance = 0;
-    storage::save_account(&mut ctx, BOB, bob).unwrap();
+    // LOAD-modify-save, NOT a fresh `PerpPosition { .. ..default() }`: overwriting the position
+    // wholesale would also zero `total_sell_qty`/`total_sell_notional`, desynchronising the
+    // maintained `Bid`/`Ask` aggregates from the order list the placement above just wrote. Those
+    // aggregates now feed the derived requirement and are maintained incrementally by the fill
+    // path, so a fixture that clobbers them produces a state the engine can never reach (and
+    // trips its own underflow invariant).
+    let mut bob_pos = storage::load_position(&mut ctx, BOB, MARKET_ID).unwrap();
+    bob_pos.amount = QTY as i64;
+    bob_pos.v_quote_balance = -(FILL_VALUE as i64);
+    bob_pos.leverage = 1;
+    storage::save_position(&mut ctx, BOB, MARKET_ID, &bob_pos).unwrap();
+    // Zero wallet, kept deliberately — this is the only low-wallet maker-fill coverage in the file
+    // and it is the header's actual subject ("even with a zero wallet"). The new fill-time
+    // insolvency gate CANNOT fire here: ALICE's buy closes BOB's long exactly, so
+    // `split_position_fill` yields `opening_qty == 0` and therefore `opening_margin == 0`, and the
+    // gate reads `opening_margin > 0 && trial_wallet < opening_margin`. A pure close is affordable
+    // at any balance, including a negative one (the B1 invariant) — which is what this pins.
+    let mut bob_acc = storage::load_account(&mut ctx, BOB).unwrap();
+    bob_acc.perp_wallet_balance = 0;
+    storage::save_account(&mut ctx, BOB, bob_acc).unwrap();
 
     let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
@@ -1462,25 +1632,41 @@ fn underwater_maker_close_routes_bad_debt_to_insurance_fund_not_wallet() {
     );
 }
 
+/// CHANGED BY THE ESCROW REMOVAL — the failure mode this test guarded CANNOT EXIST any more.
+///
+/// It was the brute-force MINIMUM "maker reserve deficit" scenario: under the old max-of-side
+/// reservation a cross-side flip fill could find the stored reservation smaller than the fill
+/// needed, firing a mid-fill deficit debit; formula C (`max(S + B', B + S')`) fixed that by
+/// over-collecting up front. With no stored reservation at all there is nothing to be short of,
+/// and formula C itself is gone. What is still worth pinning is the SCENARIO: a fill that flips
+/// the position's sign while orders rest on both sides must leave every other resting order
+/// untouched and conserve value exactly.
+///
+/// The fixture now needs a LIVE MARK (`setup()` leaves it 0, which blinds the derived basis to
+/// the position — the whole subject here) and therefore a widened price band, since the fills
+/// deliberately span $250–$300.
+///
+/// Numbers that moved, and why:
+///   * up-front commitment 8e6 → **6e6**. At mark $250 with `N = +2.5e6`, `Bid = 6e6`,
+///     `Ask = 9e6`: `IM = max(|2.5+6|, |2.5−9|) = 8.5e6`, `PIM = 2.5e6`, `ooIM = 6e6`. Formula C
+///     added a further 2e6 for the buy leg re-opening after a total sell-side flip; Binance's
+///     joint max already contains that path and does not double count it.
+///   * ALICE's wallet after the flip 12.5e6 → **17.5e6**, because 5e6 of escrow was never taken
+///     out of it. Her AVAILABLE (14.5e6) is what to compare, and the two ledgers agree on every
+///     unit of value — asserted below.
 #[test]
-fn cross_side_flip_no_longer_triggers_maker_reserve_deficit_under_flip_aware_reservation() {
-    // Regression for the flip-aware reservation (formula C = max(S + B', B + S')).
-    //
-    // This is the brute-force MINIMUM deficit scenario under the OLD max-of-side
-    // reservation (lev=1, pos +1 -> -1, buys=[(2,1),(2,2)], sells=[(3,1),(3,2)],
-    // fill the qty-2 sell at price 3). Under max-of-side the maker reserved only
-    // 6e6 up front and the cross-side flip fill fired the reserve-deficit branch
-    // (debiting 1e6 mid-fill). Under C the maker reserves the flip-aware worst
-    // case (8e6) UP FRONT, so the same flip fill creates NO deficit — the branch
-    // does not fire and no resting order is auto-cancelled.
+fn a_cross_side_flip_fill_leaves_the_other_resting_orders_alone() {
     //   Plo = $200 (buy level, below market)
-    //   Pm  = $250 (Alice opens long here against Bob)
+    //   Pm  = $250 (Alice opens long here against Bob, and the mark)
     //   Phi = $300 (sell level, above market)  -> own book uncrossed (200<300)
     let mut ctx = make_ctx();
     setup(&mut ctx);
-    // Bob (taker) funded generously. Alice now needs MORE up-front margin than
-    // under max-of-side (C reserves the full flip exposure), so fund her beyond
-    // the old single WALLET: total = 2 * WALLET = 20e6.
+    // A live mark, and a band wide enough for the $250–$300 spread the scenario needs.
+    let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    market.mark_price = 250 * TICK;
+    market.price_band_bps = 1_000_000;
+    storage::save_market(&mut ctx, &market).unwrap();
+
     fund(&mut ctx, BOB, WALLET * 100);
     fund(&mut ctx, ALICE, WALLET);
 
@@ -1493,6 +1679,7 @@ fn cross_side_flip_no_longer_triggers_maker_reserve_deficit_under_flip_aware_res
     let alice_open = place(&mut ctx, ALICE, 0, pm, QTY, 0, 0); // Alice buys (taker)
     assert_terminal(&mut ctx, alice_open);
     assert_eq!(pos(&mut ctx, ALICE).amount, QTY as i64, "Alice long +1");
+    assert_eq!(wallet(&mut ctx, ALICE), 17_500_000, "20e6 − 2.5e6 margin");
 
     // (2) Alice rests buys at Plo (below market, no cross): qty 1 then qty 2.
     let alice_buy1 = place(&mut ctx, ALICE, 0, plo, QTY, 0, 0);
@@ -1510,52 +1697,52 @@ fn cross_side_flip_no_longer_triggers_maker_reserve_deficit_under_flip_aware_res
 
     let pos_before = pos(&mut ctx, ALICE);
     assert_eq!(pos_before.amount, QTY as i64);
-    // Per-side opening notionals net to 6e6 each, so OLD max-of-side would
-    // reserve only 6e6. The FLIP-AWARE reservation is strictly higher: if all 3
-    // sell-lots fill, the position goes to -2 and the resting buys re-open more
-    // notional, so C = max(S + B', B + S')
-    //   = max(6e6 + B'(p=-2)=2e6 , 6e6 + S'(p=+4)=0) = 8e6.
-    assert_eq!(pos_before.buy_side_reserved_notional, 6_000_000);
-    assert_eq!(pos_before.sell_side_reserved_notional, 6_000_000);
     assert_eq!(
-        pos_before.margin_reserved, 8_000_000,
-        "flip-aware reservation (C) collected up front; max-of-side would be 6e6"
+        (
+            pos_before.total_buy_notional,
+            pos_before.total_sell_notional
+        ),
+        (6_000_000, 9_000_000)
     );
-    // 20e6 funded - 2.5e6 opening margin - 8e6 flip-aware reservation = 9.5e6.
-    assert_eq!(wallet(&mut ctx, ALICE), 9_500_000);
+    // IM = max(|2.5e6 + 6e6|, |2.5e6 − 9e6|) = 8.5e6; PIM = 2.5e6 ⇒ ooIM = 6e6. The three sells
+    // beyond the long are already inside the bid branch, so the last two cost nothing extra.
+    assert_eq!(oo_im(&mut ctx, ALICE), 6_000_000);
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        17_500_000,
+        "resting debited nothing"
+    );
+    assert_eq!(available(&mut ctx, ALICE), 11_500_000);
 
     // (4) Bob (a DIFFERENT taker) buys 2*QTY at Phi, lifting Alice's qty-2 ask.
     //     This closes 1*QTY of Alice's long and opens 1*QTY short => FLIP to -1.
     let bob_take = place(&mut ctx, BOB, 0, phi, QTY * 2, 0, 0);
     assert_terminal(&mut ctx, bob_take);
-
-    // The qty-2 ask that Bob lifted is filled.
     assert_terminal(&mut ctx, alice_sell2);
 
     // Position flipped sign: +1 long -> -1 short.
     let pos_after = pos(&mut ctx, ALICE);
     assert_eq!(pos_after.amount, -(QTY as i64), "sign flip +1 -> -1");
-    assert_eq!(pos_after.buy_side_reserved_notional, 4_000_000);
-    assert_eq!(pos_after.sell_side_reserved_notional, 3_000_000);
-    // Post-fill flip-aware reservation: C = max(S + B', B + S')
-    //   = max(3e6 + B'(p=-2)=2e6 , 4e6 + S'(p=+2)=0) = 5e6.
-    assert_eq!(pos_after.margin_reserved, 5_000_000);
-
-    // NO DEFICIT (the whole point of formula C):
-    //   old_reserved(C)=8e6, opening_margin=3e6 => max_sustainable=8e6-3e6=5e6;
-    //   new_reserved(C)=5e6 is NOT > 5e6 (it sits exactly on the tight boundary),
-    //   so the ELSE branch runs: net_release = sat(8e6 - 5e6 - 3e6) = 0, with no
-    //   deficit debit. The wallet receives only the +3e6 closing cashflow
-    //   (2.5e6 margin returned + 0.5e6 realised PnL on the long opened @ $250
-    //   and closed @ $300):  9.5e6 + 3e6 = 12.5e6.
-    // (Under the OLD max-of-side path the deficit branch debited 1e6, leaving a
-    //  balance 1e6 lower; C eliminates that debit.)
     assert_eq!(
-        wallet(&mut ctx, ALICE),
-        12_500_000,
-        "no deficit debit under flip-aware reservation (max-of-side would be 1e6 lower)"
+        pos_after.margin, 3_000_000,
+        "the new short's own margin, at $300"
     );
-    // The deficit branch never fired, so every other resting order is untouched.
+    // The maker fill funded that 3e6 FROM THE WALLET (there is no escrow to draw on) and the
+    // close returned 2.5e6 of margin + 0.5e6 of realised profit, so the wallet nets +0.5e6 ...
+    assert_eq!(wallet(&mut ctx, ALICE), 17_500_000);
+    // ... and the residual book is repriced against the new SHORT: Bid 6e6, Ask 3e6, N = −2.5e6
+    // ⇒ IM = max(|−2.5+6|, |−2.5−3|) = 5.5e6, PIM = 2.5e6 ⇒ ooIM = 3e6.
+    assert_eq!(oo_im(&mut ctx, ALICE), 3_000_000);
+    assert_eq!(available(&mut ctx, ALICE), 14_500_000);
+
+    // Conservation across the flip: ALICE's wallet + position margin grew by exactly the 0.5e6
+    // she realised (long opened at $250, closed at $300), and by nothing else.
+    assert_eq!(
+        wallet(&mut ctx, ALICE) as i128 + pos_after.margin as i128,
+        (WALLET * 2) as i128 + 500_000
+    );
+
+    // No auto-cancel: every other resting order is untouched.
     assert_eq!(get_order(&mut ctx, alice_sell1).status, OrderStatus::Open);
     assert_eq!(get_order(&mut ctx, alice_buy1).status, OrderStatus::Open);
     assert_eq!(get_order(&mut ctx, alice_buy2).status, OrderStatus::Open);
@@ -1608,10 +1795,10 @@ fn self_trade_taker_margin_expiry_does_not_cancel_current_taker_order() {
     let self_sell = place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
     let bob_sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
 
+    // CHANGED BY THE ESCROW REMOVAL: the hand-set balance was the post-escrow leftover, i.e. the
+    // available. See `taker_fill_cancels_worst_same_side_order_to_cover_opening_margin`.
     let old_buy_margin = 980_000;
-    let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
-    alice.perp_wallet_balance = (INIT_MARGIN - old_buy_margin) as i64;
-    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+    set_available(&mut ctx, ALICE, (INIT_MARGIN - old_buy_margin) as i64);
 
     let taker_buy = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 0);
 
@@ -1646,10 +1833,10 @@ fn taker_margin_expiry_records_mid_when_best_bid_is_cleared() {
     let bob_sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
     let carol_sell = place(&mut ctx, CAROL, 1, PRICE, QTY, 0, 0);
 
+    // CHANGED BY THE ESCROW REMOVAL: the hand-set balance was the post-escrow leftover, i.e. the
+    // available. See `taker_fill_cancels_worst_same_side_order_to_cover_opening_margin`.
     let old_buy_margin = 980_000;
-    let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
-    alice.perp_wallet_balance = (INIT_MARGIN - old_buy_margin) as i64;
-    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+    set_available(&mut ctx, ALICE, (INIT_MARGIN - old_buy_margin) as i64);
 
     ctx.block.timestamp = U256::from(10);
     let taker_buy = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
@@ -2099,8 +2286,9 @@ fn accepted_resting_placement_emits_exactly_one_order_placed() {
     let logs = take_event_names(&mut ctx);
     assert_eq!(
         logs,
-        vec!["OrderPlaced", "AccountBalanceChanged", "OrderRested"],
-        "a resting GTC emits OrderPlaced, the margin debit's balance change, then OrderRested"
+        vec!["OrderPlaced", "OrderRested"],
+        "a resting GTC emits OrderPlaced then OrderRested — and NO AccountBalanceChanged, \
+         because with the escrow gone resting moves no money and writes no account"
     );
 
     // PostOnly never calls match_order → rest_in_book's apply block is the ONLY flush site.
@@ -2108,8 +2296,8 @@ fn accepted_resting_placement_emits_exactly_one_order_placed() {
     let logs = take_event_names(&mut ctx);
     assert_eq!(
         logs,
-        vec!["OrderPlaced", "AccountBalanceChanged", "OrderRested"],
-        "a resting PostOnly emits OrderPlaced, the margin debit's balance change, then OrderRested"
+        vec!["OrderPlaced", "OrderRested"],
+        "same for PostOnly — no balance event, no balance change"
     );
 }
 
@@ -2165,16 +2353,19 @@ fn accepted_ioc_expiring_with_no_fill_still_emits_one_order_placed() {
 
 // ── Cancel ────────────────────────────────────────────────────────────────
 
+/// CHANGED BY THE ESCROW REMOVAL: the wallet no longer moves in either direction, so the
+/// place/cancel round-trip is asserted on the AVAILABLE (`wallet − Σ ooIM`) instead.
 #[test]
-fn cancel_resting_order_releases_margin_and_clears_book() {
+fn cancel_resting_order_frees_the_requirement_and_clears_book() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
 
     let id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
     assert!(
-        wallet(&mut ctx, ALICE) < WALLET,
-        "margin should be reserved"
+        available(&mut ctx, ALICE) < WALLET as i128,
+        "the order should be holding a requirement"
     );
+    assert_eq!(wallet(&mut ctx, ALICE), WALLET, "and holding no cash");
 
     let input = cancelOrderCall {
         orderId: id.into(),
@@ -2183,7 +2374,12 @@ fn cancel_resting_order_releases_margin_and_clears_book() {
     .abi_encode();
     run_cancel_order(&input, ALICE, &mut ctx).unwrap();
 
-    assert_eq!(wallet(&mut ctx, ALICE), WALLET, "margin should be returned");
+    assert_eq!(
+        available(&mut ctx, ALICE),
+        WALLET as i128,
+        "the requirement should be released"
+    );
+    assert_eq!(wallet(&mut ctx, ALICE), WALLET);
     assert_terminal(&mut ctx, id);
     assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
         .unwrap()
@@ -3538,8 +3734,27 @@ mod golden {
     /// and leave-on-fully-flat; multi-market ordering and the cap are covered by the dedicated
     /// `user_market_index` tests.) Prior value
     /// 0xfd17be42969baf09c8e87f990e084ff83180f179c3118e13ed4ccf81e5d92828.
+    /// RE-PIN (derived open-order margin, Phase 2 + `BLOCK_COMMITMENT_VERSION` 17→18): the
+    /// open-order margin ESCROW is DELETED. `PerpPosition` loses its six reservation fields
+    /// ("mr", "mrn", "br", "brn", "sr", "srn"), so every position blob shortens and its later
+    /// fields shift; and placement, cancel, `setLeverage` and the fill paths no longer move the
+    /// wallet for a reservation, so the account values folded into the delta differ as well. The
+    /// requirement is now DERIVED on read (`ooIM = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) −
+    /// ROUND_UP(|N| / L)`) and subtracted at the admission gate rather than debited.
+    ///
+    /// The BusinessSnapshot below is **UNCHANGED, field for field**, which is worth stating
+    /// because it is not the general case — the derived and escrow bases disagree on plenty of
+    /// book shapes. This scenario avoids all of them: it is single-market, every party ends flat
+    /// or with a one-sided book at leverage 1, and the ONE order still resting at the end (BOB's
+    /// tail bid) sits against a FLAT position, where `ooIM = ROUND_UP(Bid / 1)` is exactly the
+    /// 400_000 the escrow held. So BOB's `availablePerpBalance` arrives at the same 500_428_954
+    /// by a different route: his wallet is 400_000 higher (never debited) and the derived
+    /// requirement subtracts exactly that. Likewise every maker fill's opening margin, formerly
+    /// converted 1:1 out of the placement escrow, is now drawn from the wallet at fill time — the
+    /// same net movement in two steps instead of two. Prior value
+    /// 0xb6b78e299b6b96f6dcc0c667c76cc4895ae4cd1932b305fdcda9c0907e998ee0.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xb6b78e299b6b96f6dcc0c667c76cc4895ae4cd1932b305fdcda9c0907e998ee0");
+        b256!("0x2c2ab72998e3f53edf5a6bcb3c7ad552f0543babf6830b8fc87ce707b213e8ac");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -4745,7 +4960,9 @@ mod commit_only_conservation {
             let acc = storage::load_account(ctx, a).unwrap();
             s += acc.perp_wallet_balance as i128;
             let p = storage::load_position(ctx, a, MARKET_ID).unwrap();
-            s += p.margin as i128 + p.margin_reserved as i128;
+            // Only `margin` is physically held now — the open-order requirement is derived and
+            // was never taken out of the wallet, so there is no reservation term to add back.
+            s += p.margin as i128;
             let mv = calc_value(PRICE, p.amount.unsigned_abs(), 8, 9).unwrap() as i128;
             s += if p.amount >= 0 { mv } else { -mv };
             s += p.v_quote_balance as i128;
@@ -7438,11 +7655,22 @@ mod batch_place {
 //
 // Invariant under test: **a user must never be blocked from REDUCING risk.**
 //
-// B1 is the fix for `UserAccount::has_available_perp(0)` returning `false` on a
-// negative wallet (`-5 >= 0`). B3 is a CHARACTERISATION of the audit claim
-// "Binance ADMITS, we REJECT: a partly-closing sell on a long" — the tests below
-// pin the actual `margin_reserved` / wallet-delta numbers so the verdict lives in
-// code, not prose.
+// B1 was the fix for `UserAccount::has_available_perp(0)` returning `false` on a negative wallet
+// (`-5 >= 0`); its derived-basis restatement is `derived_can_afford`'s "a non-positive
+// requirement is always affordable". B3 was a CHARACTERISATION of the audit claim "Binance
+// ADMITS, we REJECT: a partly-closing sell on a long".
+//
+// ⚠️ REWRITTEN BY THE DERIVED-ooIM SWITCH. B3's whole subject was the ESCROW's answer, and the
+// escrow is gone — so the audit claim it characterised is now largely RESOLVED rather than
+// merely pinned, and two of the cases flip from REJECT to ACCEPT. Every case below states what
+// moved and why. Two mechanical changes run through all of them:
+//
+//   * every test sets a LIVE MARK. `setup()` leaves `mark_price` at 0, which makes `N = 0` and
+//     so blinds the derived basis to the position — under which NOTHING here is risk-reducing
+//     and the module would be testing a fixture artefact. Production cannot reach a zero mark
+//     (`addMarket` rejects it), and the Phase-1 census pinned this exact confusion.
+//   * "fully deployed" now means AVAILABLE = 0, not wallet = 0: placing an order no longer
+//     debits, so the pressure lives in `wallet − Σ ooIM`.
 mod risk_reducing_admission {
     use super::*;
 
@@ -7471,6 +7699,12 @@ mod risk_reducing_admission {
     }
 
     /// Seed a flat long of `lots` QTY-sized lots opened at PRICE (margin at leverage 1).
+    /// `setup()` plus a live mark at $100 — see the module header for why every test needs it.
+    fn setup_marked(ctx: &mut TestCtx) {
+        setup(ctx);
+        set_mark(ctx, PRICE);
+    }
+
     fn seed_long(ctx: &mut TestCtx, user: Address, lots: i64) {
         let notional = lots * FILL_VALUE as i64;
         storage::save_position(
@@ -7529,7 +7763,7 @@ mod risk_reducing_admission {
     #[test]
     fn b1_negative_wallet_admits_a_zero_delta_reduce_only_rest() {
         let mut ctx = make_ctx();
-        setup(&mut ctx);
+        setup_marked(&mut ctx);
         seed_long(&mut ctx, ALICE, 2);
         set_raw_wallet(&mut ctx, ALICE, -5);
 
@@ -7538,10 +7772,12 @@ mod risk_reducing_admission {
         let id: [u8; 32] = ret[..32].try_into().unwrap();
 
         assert_eq!(get_order(&mut ctx, id).status, OrderStatus::Open);
+        // N = +2e6 (2 lots at mark $100), Ask = 1.1e6 ⇒
+        // IM = max(|2e6 + 0|, |2e6 − 1.1e6|) = 2e6 = PIM ⇒ ooIM = 0. Same answer the escrow gave.
         assert_eq!(
-            pos(&mut ctx, ALICE).margin_reserved,
+            oo_im(&mut ctx, ALICE),
             0,
-            "a sell fully covered by the long opens nothing"
+            "a sell fully covered by the long adds no exposure"
         );
         assert_eq!(
             raw_wallet(&mut ctx, ALICE),
@@ -7569,10 +7805,10 @@ mod risk_reducing_admission {
     #[test]
     fn b1_deeply_negative_wallet_user_can_still_close_a_position() {
         let mut ctx = make_ctx();
-        setup(&mut ctx);
+        setup_marked(&mut ctx);
         seed_long(&mut ctx, ALICE, 1);
         place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0); // BOB rests a bid at $100
-        // Deficit deeper than the 1_000_000 the close will release.
+                                                   // Deficit deeper than the 1_000_000 the close will release.
         set_raw_wallet(&mut ctx, ALICE, -2_000_000);
 
         try_place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 1)
@@ -7598,22 +7834,28 @@ mod risk_reducing_admission {
     /// `ensure_taker_wallet_can_cover_margin`'s own `required_margin == 0` early
     /// return, performed no real cancel — the two halves disagreeing.)
     /// Post-fix both halves take the zero fast path: the close is admitted and
-    /// the resting order is untouched.
+    /// the resting order is untouched. (Under the derived basis the cover loop's
+    /// guard is `derived_can_afford(available, 0)`, which is unconditionally true —
+    /// the same fast path, restated.)
     #[test]
     fn b1_zero_cost_close_does_not_disturb_resting_same_side_orders() {
         let mut ctx = make_ctx();
-        setup(&mut ctx);
+        setup_marked(&mut ctx);
         seed_long(&mut ctx, ALICE, 2);
-        // A resting sell fully covered by the long: reserves nothing, and is the
+        // A resting sell fully covered by the long: costs nothing, and is the
         // LIFO victim the sim cover loop would have reached for.
         let resting = place(&mut ctx, ALICE, 1, P_HIGHER, QTY, 0, 0);
-        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
+        assert_eq!(oo_im(&mut ctx, ALICE), 0);
         place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0); // BOB rests a bid at $100
         set_raw_wallet(&mut ctx, ALICE, -5_000_000); // deeper than anything released
 
         try_place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 1).expect("zero-cost close admitted");
 
-        assert_eq!(pos(&mut ctx, ALICE).amount, QTY as i64, "1 of 2 lots closed");
+        assert_eq!(
+            pos(&mut ctx, ALICE).amount,
+            QTY as i64,
+            "1 of 2 lots closed"
+        );
         assert_eq!(
             get_order(&mut ctx, resting).status,
             OrderStatus::Open,
@@ -7627,7 +7869,7 @@ mod risk_reducing_admission {
     #[test]
     fn b1_shallow_negative_wallet_close_was_already_admitted() {
         let mut ctx = make_ctx();
-        setup(&mut ctx);
+        setup_marked(&mut ctx);
         seed_long(&mut ctx, ALICE, 1);
         place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0);
         set_raw_wallet(&mut ctx, ALICE, -5);
@@ -7640,21 +7882,32 @@ mod risk_reducing_admission {
 
     /// B1 companion: the cancel path has NO balance gate by design. Pinning that
     /// so nobody "helpfully" adds one.
+    ///
+    /// CHANGED BY THE ESCROW REMOVAL: a cancel no longer CREDITS the wallet (it used to return
+    /// the 900_000 reservation, so the wallet went `-5` → `899_995`). It moves no money at all;
+    /// what it returns is HEADROOM, by dropping this market's `Bid` to 0 and with it the
+    /// requirement. Both halves are asserted.
     #[test]
     fn b1_negative_wallet_user_can_still_cancel() {
         let mut ctx = make_ctx();
-        setup(&mut ctx);
+        setup_marked(&mut ctx);
         let id = place(&mut ctx, ALICE, 0, P_LOW, QTY, 0, 0);
-        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 900_000);
+        assert_eq!(oo_im(&mut ctx, ALICE), 900_000);
         set_raw_wallet(&mut ctx, ALICE, -5);
+        assert_eq!(super::available(&mut ctx, ALICE), -900_005);
 
         cancel(&mut ctx, ALICE, id).expect("cancel is ungated and must stay ungated");
 
-        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
+        assert_eq!(oo_im(&mut ctx, ALICE), 0);
         assert_eq!(
             raw_wallet(&mut ctx, ALICE),
-            900_000 - 5,
-            "the released reservation is credited back even from a negative wallet"
+            -5,
+            "the wallet does not move — there was never anything escrowed to give back"
+        );
+        assert_eq!(
+            super::available(&mut ctx, ALICE),
+            -5,
+            "but the 900_000 of headroom the order was holding is released"
         );
     }
 
@@ -7663,7 +7916,7 @@ mod risk_reducing_admission {
     #[test]
     fn b1_negative_wallet_still_refuses_a_nonzero_debit() {
         let mut ctx = make_ctx();
-        setup(&mut ctx);
+        setup_marked(&mut ctx);
         set_raw_wallet(&mut ctx, ALICE, -5);
 
         let err = try_place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0).unwrap_err();
@@ -7672,38 +7925,41 @@ mod risk_reducing_admission {
                 .contains("insufficient perp wallet for margin"),
             "{err}"
         );
-        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0, "reject wrote nothing");
+        assert_eq!(oo_im(&mut ctx, ALICE), 0, "reject wrote nothing");
 
         // Boundary is untouched: one unit short still fails, exactly enough passes.
+        // (Flat position ⇒ N = 0 ⇒ the requirement is the full 1e6 notional at leverage 1.)
         set_raw_wallet(&mut ctx, ALICE, INIT_MARGIN as i64 - 1);
         assert!(try_place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0).is_err());
         set_raw_wallet(&mut ctx, ALICE, INIT_MARGIN as i64);
         try_place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0).expect("exactly enough must pass");
-        assert_eq!(raw_wallet(&mut ctx, ALICE), 0);
+        // CHANGED: the wallet is no longer debited, so it is the AVAILABLE that lands on 0.
+        assert_eq!(raw_wallet(&mut ctx, ALICE), INIT_MARGIN as i64);
+        assert_eq!(super::available(&mut ctx, ALICE), 0);
     }
 
     // ── B3 ① pure reduce ───────────────────────────────────────────────────
 
-    /// B3 ①: a sell whose qty ≤ the long position opens NOTHING — `open_amount`
-    /// returns 0 for every entry still covered — so S = 0, and with no buys
-    /// B = B' = S' = 0 ⇒ C = max(S + B', B + S') = 0 ⇒ delta = 0.
-    /// Admitted at a POSITIVE, ZERO and (post-B1) NEGATIVE wallet alike.
-    /// VERDICT: ① is already fine; B1 is all it needed.
+    /// B3 ①: a sell against a long adds no EXPOSURE, so it adds no requirement. At mark $100 with
+    /// a 2-lot long, `N = 2e6`; one lot sold at $110 gives `Ask = 1.1e6` and
+    /// `IM = max(|2e6|, |2e6 − 1.1e6|) = 2e6 = PIM ⇒ ooIM = 0`; the second lot at $120 takes
+    /// `Ask` to 2.3e6 and `IM = max(2e6, 3e5)` is still 2e6 ⇒ ooIM still 0.
+    /// Admitted at a POSITIVE, ZERO and NEGATIVE wallet alike.
+    ///
+    /// VERDICT UNCHANGED by the migration — the escrow reached 0 here too (by a different route:
+    /// its per-side cover scan found every entry covered). ① was already fine.
     #[test]
     fn b3_case1_pure_reduce_is_zero_delta_at_positive_zero_and_negative_balance() {
         for balance in [WALLET as i64, 0i64, -5i64] {
             let mut ctx = make_ctx();
-            setup(&mut ctx);
+            setup_marked(&mut ctx);
             seed_long(&mut ctx, ALICE, 2);
             set_raw_wallet(&mut ctx, ALICE, balance);
 
             // Partial reduce: 1 lot against a 2-lot long.
             try_place(&mut ctx, ALICE, 1, P_HIGH, QTY, 0, 0)
                 .unwrap_or_else(|e| panic!("partial reduce refused at balance {balance}: {e}"));
-            let p = pos(&mut ctx, ALICE);
-            assert_eq!(p.sell_side_reserved_notional, 0);
-            assert_eq!(p.margin_reserved_notional, 0);
-            assert_eq!(p.margin_reserved, 0);
+            assert_eq!(oo_im(&mut ctx, ALICE), 0);
             assert_eq!(raw_wallet(&mut ctx, ALICE), balance, "delta == 0");
 
             // Full reduce: the second lot, still exactly covered by the long.
@@ -7711,27 +7967,38 @@ mod risk_reducing_admission {
                 .unwrap_or_else(|e| panic!("full reduce refused at balance {balance}: {e}"));
             let p = pos(&mut ctx, ALICE);
             assert_eq!(p.total_sell_qty, QTY * 2);
-            assert_eq!(p.margin_reserved, 0, "aggregate sells == long ⇒ still 0");
+            assert_eq!(
+                oo_im(&mut ctx, ALICE),
+                0,
+                "aggregate sells still net inside the long"
+            );
             assert_eq!(raw_wallet(&mut ctx, ALICE), balance, "delta == 0");
         }
     }
 
     // ── B3 ② flip ──────────────────────────────────────────────────────────
 
-    /// B3 ②: sell qty > long position. The excess is a genuine SHORT open, so
-    /// S = calc_value(price, qty − position) > 0 and delta > 0. A fully-deployed
-    /// user IS refused — and correctly so under this margin model.
+    /// B3 ②: a sell LARGER than the long genuinely opens a short, so it costs something —
+    /// but far less than the escrow charged.
     ///
-    /// VERDICT: **not independently fixable.** Binance admits the flip only
-    /// because its joint `max()` nets the position margin the flip would RELEASE
-    /// (here: the long's own 1_000_000 of `pos.margin`, asserted untouched
-    /// below). Crediting that is A3 — a separate product decision — so this test
-    /// pins the CURRENT, self-consistent behaviour rather than "fixing" it.
+    /// CHANGED BY THE DERIVED-ooIM SWITCH: requirement **1_100_000 → 200_000**. Long 1 lot at
+    /// mark $100 (`N = 1e6`), sell 2 lots at $110 (`Ask = 2.2e6`):
+    ///   `IM  = ROUND_UP(max(|1e6 + 0|, |1e6 − 2.2e6|) / 1) = 1.2e6`
+    ///   `PIM = 1e6`  ⇒  `ooIM = 200_000`
+    /// The escrow charged the excess lot's whole opening notional (1 lot @ $110 = 1_100_000) and
+    /// netted nothing, because it priced the two sides separately in QUANTITY space. Binance's
+    /// joint `max()` measures the exposure that would REMAIN after the flip — a 1.2e6 short
+    /// against a 1e6 long already margined — so it charges only the 200_000 of extra exposure.
+    /// The old comment called crediting the released position margin "A3, a separate product
+    /// decision"; adopting Binance's formula settles it.
+    ///
+    /// The SHAPE is unchanged: fully deployed ⇒ refused; one unit short ⇒ refused; exactly the
+    /// requirement ⇒ admitted. Only the threshold moved.
     #[test]
-    fn b3_case2_flip_needs_fresh_margin_because_the_released_position_margin_is_not_credited() {
+    fn b3_case2_flip_is_charged_only_the_residual_exposure_not_the_whole_opening_leg() {
         // Fully deployed ⇒ refused.
         let mut ctx = make_ctx();
-        setup(&mut ctx);
+        setup_marked(&mut ctx);
         seed_long(&mut ctx, ALICE, 1);
         set_raw_wallet(&mut ctx, ALICE, 0);
         let err = try_place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0).unwrap_err();
@@ -7740,133 +8007,154 @@ mod risk_reducing_admission {
                 .contains("insufficient perp wallet for margin"),
             "{err}"
         );
-        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0, "reject wrote nothing");
+        assert_eq!(oo_im(&mut ctx, ALICE), 0, "reject wrote nothing");
 
-        // One unit short of the opening requirement: still refused.
-        set_raw_wallet(&mut ctx, ALICE, 1_100_000 - 1);
+        // One unit short of the requirement: still refused.
+        set_raw_wallet(&mut ctx, ALICE, 200_000 - 1);
         assert!(try_place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0).is_err());
 
-        // Exactly the opening leg (1 excess lot at $110) is admitted.
-        set_raw_wallet(&mut ctx, ALICE, 1_100_000);
+        // Exactly the residual exposure is admitted.
+        set_raw_wallet(&mut ctx, ALICE, 200_000);
         try_place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0)
-            .expect("admitted at exactly the opening requirement");
+            .expect("admitted at exactly the derived requirement");
         let p = pos(&mut ctx, ALICE);
-        assert_eq!(p.sell_side_reserved_notional, 1_100_000);
-        assert_eq!(p.margin_reserved, 1_100_000, "C = max(S + B', B + S') = S");
-        assert_eq!(raw_wallet(&mut ctx, ALICE), 0);
+        assert_eq!(p.total_sell_notional, 2_200_000, "Ask");
+        assert_eq!(oo_im(&mut ctx, ALICE), 200_000);
+        assert_eq!(raw_wallet(&mut ctx, ALICE), 200_000, "nothing was debited");
+        assert_eq!(super::available(&mut ctx, ALICE), 0);
         assert_eq!(
             p.margin, 1_000_000,
-            "the long's own margin is NOT released/credited toward the flip — that credit is A3"
+            "the long's own margin is untouched — it is NETTED in the requirement, not moved"
         );
     }
 
     // ── B3 ③ reduce with other resting orders ──────────────────────────────
 
-    /// B3 ③a: an OPPOSITE-side resting order does NOT change the answer. The
-    /// flip-aware `B'` leg is evaluated at `p − total_sell_qty`, which for a
-    /// genuinely reducing sell (`qty ≤ p`) stays ≥ 0 — so B' is unchanged and
-    /// C is unchanged ⇒ delta still 0.
+    /// B3 ③a: an OPPOSITE-side resting order does NOT change the answer.
+    ///
+    /// Long 2 lots (`N = 2e6`) with a buy of 1 lot @ $90 resting (`Bid = 900_000`):
+    /// `IM = max(|2e6 + 9e5|, |2e6|) = 2.9e6`, `PIM = 2e6` ⇒ `ooIM = 900_000`, the same number
+    /// the escrow held. Adding a reducing sell of 1 lot @ $110 (`Ask = 1.1e6`) leaves the BID
+    /// branch winning at 2.9e6, so `ooIM` is unchanged ⇒ Δ = 0 and it is free.
+    ///
+    /// VERDICT UNCHANGED by the migration. "Fully deployed" is now expressed as AVAILABLE = 0.
     #[test]
     fn b3_case3a_opposite_side_resting_order_does_not_block_a_reduce() {
         let mut ctx = make_ctx();
-        setup(&mut ctx);
+        setup_marked(&mut ctx);
         seed_long(&mut ctx, ALICE, 2);
 
-        // Every buy OPENS on top of a long, so this reserves its full notional.
+        // Every buy OPENS on top of a long, so this costs its full notional.
         place(&mut ctx, ALICE, 0, P_LOW, QTY, 0, 0);
-        let p = pos(&mut ctx, ALICE);
-        assert_eq!(p.buy_side_reserved_notional, 900_000);
-        assert_eq!(p.margin_reserved, 900_000);
+        assert_eq!(oo_im(&mut ctx, ALICE), 900_000);
 
-        set_raw_wallet(&mut ctx, ALICE, 0); // fully deployed
+        set_available(&mut ctx, ALICE, 0); // fully deployed
 
         try_place(&mut ctx, ALICE, 1, P_HIGH, QTY, 0, 0)
             .expect("a reduce must be admitted despite a resting opposite-side order");
-        let p = pos(&mut ctx, ALICE);
-        // S = 0 (covered); B' = B(2 − 1 = +1 lot) = 900_000; S' = S(2 + 1) = 0
-        //   ⇒ C = max(0 + 900_000, 900_000 + 0) = 900_000 — UNCHANGED.
-        assert_eq!(p.sell_side_reserved_notional, 0);
-        assert_eq!(p.buy_side_reserved_notional, 900_000);
-        assert_eq!(p.margin_reserved, 900_000);
-        assert_eq!(raw_wallet(&mut ctx, ALICE), 0, "delta == 0");
+        assert_eq!(
+            oo_im(&mut ctx, ALICE),
+            900_000,
+            "UNCHANGED — the bid branch still wins"
+        );
+        assert_eq!(super::available(&mut ctx, ALICE), 0, "delta == 0");
     }
 
-    /// B3 ③b: a SAME-side resting order DOES change the answer — but only by
-    /// consuming the position's cover. A second sell that is individually
-    /// reduce-only (1 lot ≤ a 2-lot long) takes the AGGREGATE sell qty to 3 lots
-    /// against a 2-lot long, i.e. a genuine 1-lot short open. Same root cause as
-    /// ②, so likewise A3 territory — NOT an independent bug.
+    /// B3 ③b: **FLIPS FROM REJECT TO ACCEPT.** This is the audit claim ("Binance ADMITS, we
+    /// REJECT: a partly-closing sell on a long") resolved rather than characterised.
+    ///
+    /// Long 2 lots (`N = 2e6`). A first sell of 2 lots @ $110 exactly covers it; a second sell of
+    /// 1 lot @ $120 takes the AGGREGATE to 3 lots against a 2-lot long — a genuine 1-lot short in
+    /// QUANTITY space, which is what the escrow charged for (1_200_000, the excess lot at the
+    /// dearest price). In NOTIONAL space at mark it is not:
+    ///   `Ask = 2.2e6 + 1.2e6 = 3.4e6`, `IM = max(|2e6|, |2e6 − 3.4e6|) = max(2e6, 1.4e6) = 2e6`
+    ///   `= PIM` ⇒ `ooIM = 0`.
+    /// If every sell filled, the account would hold 1.4e6 of SHORT exposure — strictly less than
+    /// the 2e6 of LONG exposure it is already margined for. No additional initial margin is
+    /// required, and Binance charges none.
+    ///
+    /// EXTRA SCRUTINY (this admits an order we used to refuse): the loosening is bounded and
+    /// guarded. `pos.margin` still fully backs the existing 2-lot long; the sells' own opening
+    /// margin is charged at FILL time out of the wallet (and the fill is refused, and the order
+    /// cancelled, if the wallet cannot fund it); and K9 still refuses any fill that would leave
+    /// the resulting position below maintenance. What is no longer charged is margin for a
+    /// worst-case exposure SMALLER than the one already margined — which was never a risk.
     #[test]
-    fn b3_case3b_same_side_resting_orders_turn_a_reduce_into_an_aggregate_flip() {
+    fn b3_case3b_same_side_resting_orders_that_stay_inside_the_long_are_free() {
         let mut ctx = make_ctx();
-        setup(&mut ctx);
+        setup_marked(&mut ctx);
         seed_long(&mut ctx, ALICE, 2);
 
-        // First sell exactly covers the long ⇒ reserves nothing.
+        // First sell exactly covers the long ⇒ costs nothing.
         place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0);
-        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
+        assert_eq!(oo_im(&mut ctx, ALICE), 0);
 
-        set_raw_wallet(&mut ctx, ALICE, 0); // fully deployed
+        set_available(&mut ctx, ALICE, 0); // fully deployed
 
+        // The escrow REFUSED this (it wanted 1_200_000). The derived basis admits it for free.
+        try_place(&mut ctx, ALICE, 1, P_HIGHER, QTY, 0, 0)
+            .expect("aggregate short exposure 1.4e6 < the 2e6 long already margined");
+        let p = pos(&mut ctx, ALICE);
+        assert_eq!(p.total_sell_qty, QTY * 3);
+        assert_eq!(p.total_sell_notional, 3_400_000, "Ask");
+        assert_eq!(oo_im(&mut ctx, ALICE), 0);
+        assert_eq!(super::available(&mut ctx, ALICE), 0, "nothing was charged");
+
+        // The boundary is real, not vacuous: one more lot at $120 takes Ask to 4.6e6, the ask
+        // branch overtakes (|2e6 − 4.6e6| = 2.6e6 > 2e6) and the excess IS charged.
         let err = try_place(&mut ctx, ALICE, 1, P_HIGHER, QTY, 0, 0).unwrap_err();
         assert!(
             err.to_string()
                 .contains("insufficient perp wallet for margin"),
             "{err}"
         );
-        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0, "reject wrote nothing");
-
-        // The opening leg is the 1 excess lot, priced at the HIGHEST sell ($120).
-        set_raw_wallet(&mut ctx, ALICE, 1_200_000);
-        try_place(&mut ctx, ALICE, 1, P_HIGHER, QTY, 0, 0).expect("admitted with the margin");
-        let p = pos(&mut ctx, ALICE);
-        assert_eq!(p.total_sell_qty, QTY * 3);
-        assert_eq!(p.sell_side_reserved_notional, 1_200_000);
-        assert_eq!(p.margin_reserved, 1_200_000);
-        assert_eq!(raw_wallet(&mut ctx, ALICE), 0);
+        let w = raw_wallet(&mut ctx, ALICE);
+        set_raw_wallet(&mut ctx, ALICE, w + 600_000);
+        try_place(&mut ctx, ALICE, 1, P_HIGHER, QTY, 0, 0)
+            .expect("2.6e6 − 2e6 = 600_000 is exactly the marginal requirement");
+        assert_eq!(oo_im(&mut ctx, ALICE), 600_000);
+        assert_eq!(super::available(&mut ctx, ALICE), 0);
     }
 
-    /// B3 ③c (fell out of ③b): once the aggregate over-covers, the sell side is
-    /// scanned ASC, so the CHEAPEST sells absorb the position's cover and the
-    /// dearest are pushed into the opening bucket. The marginal charge is
-    /// therefore levied at the OTHER order's price, and can EXCEED the new
-    /// order's own notional.
+    /// B3 ③c: **THE PHENOMENON THIS TEST PINNED NO LONGER EXISTS.**
     ///
-    /// Not a bug — 3 lots sold from a 2-lot long IS a 1-lot short, and reserving
-    /// it at the dearest surviving price is the correct worst case — but it means
-    /// "my order is reduce-only, why am I charged more than it is worth?" has a
-    /// real, explainable answer. Pinned so the behaviour is deliberate.
+    /// It used to record that once the aggregate over-covers, the sell side is scanned ASC, so
+    /// the CHEAPEST sells absorb the position's cover and the dearest are pushed into the opening
+    /// bucket — meaning a reduce-only order could be charged at ANOTHER order's price, and more
+    /// than its own notional was worth. That was an artefact of a per-order cover scan.
+    ///
+    /// `ooIM` has no such scan: it is a function of `(N, Bid, Ask, L)` alone, and `Bid`/`Ask` are
+    /// plain sums. So the requirement cannot depend on which order is "the new one", and cannot
+    /// depend on the ORDER in which two orders were placed. That is what this test now pins —
+    /// the property that replaced the anomaly.
     #[test]
-    fn b3_case3c_marginal_charge_is_priced_at_the_other_order_not_the_new_one() {
-        let mut ctx = make_ctx();
-        setup(&mut ctx);
-        seed_long(&mut ctx, ALICE, 2);
-        place(&mut ctx, ALICE, 1, P_HIGH, QTY * 2, 0, 0); // 2 lots @ $110, exact cover
-        assert_eq!(pos(&mut ctx, ALICE).margin_reserved, 0);
+    fn b3_case3c_the_requirement_is_order_independent_not_priced_at_a_particular_order() {
+        // Place the $110 order first, then the $105 one ...
+        let mut a = make_ctx();
+        setup_marked(&mut a);
+        seed_long(&mut a, ALICE, 2);
+        place(&mut a, ALICE, 1, P_HIGH, QTY * 2, 0, 0); // 2 lots @ $110
+        assert_eq!(oo_im(&mut a, ALICE), 0);
+        try_place(&mut a, ALICE, 1, P_MID, QTY, 0, 0).expect("admitted");
 
-        set_raw_wallet(&mut ctx, ALICE, 1_100_000);
-        // New order: 1 lot @ $105, own notional 1_050_000. Sells are scanned ASC,
-        // so it sorts FIRST and absorbs 1 lot of the 2-lot cover, opening nothing.
-        // The $110 order then absorbs the remaining 1 lot of cover and OPENS its
-        // other lot — at $110.
-        try_place(&mut ctx, ALICE, 1, P_MID, QTY, 0, 0).expect("admitted");
-        let p = pos(&mut ctx, ALICE);
+        // ... and the other way round.
+        let mut b = make_ctx();
+        setup_marked(&mut b);
+        seed_long(&mut b, ALICE, 2);
+        place(&mut b, ALICE, 1, P_MID, QTY, 0, 0); // 1 lot @ $105
+        try_place(&mut b, ALICE, 1, P_HIGH, QTY * 2, 0, 0).expect("admitted");
+
+        // Same book, same requirement, whichever order was "the new one".
+        assert_eq!(pos(&mut a, ALICE).total_sell_notional, 3_250_000);
         assert_eq!(
-            p.sell_side_reserved_notional, 1_100_000,
-            "charged at $110 (the other order), not at the new order's $105"
+            pos(&mut b, ALICE).total_sell_notional,
+            pos(&mut a, ALICE).total_sell_notional
         );
-        assert_eq!(p.margin_reserved, 1_100_000);
-        assert_eq!(raw_wallet(&mut ctx, ALICE), 0);
-        // ...and that charge STRICTLY EXCEEDS the new order's own notional
-        // (1 lot @ $105 = 1_050_000) — the point of this test.
-        let own_notional =
-            crate::math::calc_value(P_MID, QTY, 8, 9).unwrap();
-        assert_eq!(own_notional, 1_050_000);
-        assert!(
-            p.margin_reserved > own_notional,
-            "reduce-only order charged {} > its own notional {own_notional}",
-            p.margin_reserved
-        );
+        assert_eq!(oo_im(&mut b, ALICE), oo_im(&mut a, ALICE));
+        // And the value: Ask = 2.2e6 + 1.05e6 = 3.25e6, |2e6 − 3.25e6| = 1.25e6 < |N| = 2e6,
+        // so the bid branch still wins and NOTHING is charged. Under the escrow this book cost
+        // 1_100_000 — "charged at $110, more than the $105 order's own notional".
+        assert_eq!(oo_im(&mut a, ALICE), 0);
     }
 }
 
@@ -8691,31 +8979,27 @@ mod user_market_index {
     }
 }
 
-// ── Derived-ooIM Phase 1: the divergence characterisation ────────────────────────────────────
+// ── The derived open-order requirement: the scenarios the escrow used to price differently ───
 //
-// Phase 1 computes Binance's derived open-order requirement
+// The engine's open-order requirement is
 //     ooIM = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) − ROUND_UP(|N| / L)
-// alongside our escrow `PerpPosition::margin_reserved`, and asserts at every admission point
-// that the two reach the same accept/reject decision. They do NOT, and that is the product of
-// this phase. A suite-wide census over 5099 gate evaluations measured:
+// with `N` the position notional at MARK and `Bid`/`Ask` the resting orders at their LIMIT
+// prices, summed over the per-user market index to give `available = wallet − Σ ooIM`.
 //
-//   * 238 / 5099 (4.7%)  reach OPPOSITE DECISIONS,
-//   * 1499 / 5099 (29%)  price the same operation differently (Δescrow != ΔooIM),
-//   * 1249 / 5099 (25%)  hold a different available (Σ margin_reserved != Σ ooIM),
-//   * 0 / 5099           diverge for any OTHER reason — which is what the dual gate still
-//                        asserts, and what would catch a bug in the formula or the probe.
-//
-// The tests below pin each mechanism with concrete numbers, so Phase 2 knows exactly what it is
-// changing. THEY PIN A DIVERGENCE ON PURPOSE. A future change that makes one of them agree is a
-// behaviour change and must be justified, not silently absorbed.
+// This module was written in Phase 1 as a CENSUS: it pinned, scenario by scenario, where that
+// formula disagreed with the flip-aware escrow `max(S + B', B + S')` it has now replaced. (For
+// the record, the census measured 238 / 5099 gate evaluations reaching OPPOSITE decisions, 1499
+// pricing the same operation differently, and 1249 holding a different available. Those figures
+// describe a comparison that no longer exists.) The escrow is gone, so the escrow half of every
+// assertion is gone with it — but the SCENARIOS are the only place these book shapes are
+// recorded, so each test survives as a behaviour pin on the surviving basis, with the number the
+// escrow used to produce kept in the prose as the delta this migration accepted.
 //
 // Fixture arithmetic: base_decimals 8, price_decimals 9, so one QTY lot (0.01) at $P is worth
 // `P × 10_000` quote units — $100 ⇒ 1_000_000, $90 ⇒ 900_000, $110 ⇒ 1_100_000.
 mod derived_ooim_divergence {
     use super::*;
-    use crate::margin_view::{
-        position_derived_margin, total_margin_reserved, total_open_order_initial_margin,
-    };
+    use crate::margin_view::{position_open_order_margin, total_open_order_initial_margin};
     use crate::types::MarginTier;
 
     const P_LOW: u64 = 90 * TICK;
@@ -8743,9 +9027,9 @@ mod derived_ooim_divergence {
     }
 
     /// A market with a live mark price. `setup()` leaves `mark_price` at 0, which makes the
-    /// DERIVED basis blind to every position (`N = trunc(|amt| × 0) = 0`) — a test artefact, not
-    /// production behaviour (`addMarket` rejects a zero mark). Several of these tests exist
-    /// precisely to separate that artefact from the real divergences.
+    /// derived basis blind to every position (`N = trunc(|amt| × 0) = 0`) — a test artefact, not
+    /// production behaviour (`addMarket` rejects a zero mark). One test below exists precisely to
+    /// separate that artefact from the real numbers.
     fn setup_marked(ctx: &mut TestCtx, mark: u64) {
         storage::save_admin(ctx, ADMIN).unwrap();
         storage::save_market(ctx, &market_with(mark, MarginTiers::default())).unwrap();
@@ -8785,23 +9069,18 @@ mod derived_ooim_divergence {
         .unwrap();
     }
 
-    /// `(escrow margin_reserved, derived ooIM)` for ALICE in the test market, right now.
-    fn bases(ctx: &mut TestCtx) -> (u64, u64) {
+    /// ALICE's derived open-order requirement in the test market, right now.
+    fn oo_im_alice(ctx: &mut TestCtx) -> u64 {
         let m = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
         let p = storage::load_position(ctx, ALICE, MARKET_ID).unwrap();
-        (
-            p.margin_reserved,
-            position_derived_margin(&m, &p).unwrap().tier_capped_oo_im,
-        )
+        position_open_order_margin(&m, &p).unwrap()
     }
 
-    // ── 1. Cross-side orders: our escrow ADDS the residuals, Binance takes a MAX ─────────────
+    // ── 1. Cross-side orders are charged the MAX of the two terminal exposures ───────────────
 
-    /// **The headline structural divergence.** With orders resting on BOTH sides of the same
-    /// market our escrow charges `max(S + B', B + S')` — each side's residual after the position
-    /// is netted off, ADDED to the other side's full leg — while Binance charges
-    /// `max(|N + Bid|, |N − Ask|)`, the larger of the two TERMINAL exposures. These are different
-    /// functions, and the escrow is strictly the stricter one here.
+    /// **The headline shape.** With orders resting on BOTH sides of the same market the
+    /// requirement is `max(|N + Bid|, |N − Ask|)`: the larger of the two exposures the book could
+    /// leave behind, not the sum of anything.
     ///
     /// Flat position, mark $100, leverage 1, resting BUY 2 lots @ $90 and SELL 1 lot @ $110:
     ///
@@ -8809,14 +9088,15 @@ mod derived_ooim_divergence {
     /// |----------|-----------|-----|
     /// | `Bid`    | 1_800_000 | 2 × 900_000 |
     /// | `Ask`    | 1_100_000 | 1 × 1_100_000 |
-    /// | escrow   | 2_000_000 | `max(S + B', B + S') = max(1_100_000 + 900_000, 1_800_000 + 0)` |
     /// | ooIM     | 1_800_000 | `max(\|0 + 1_800_000\|, \|0 − 1_100_000\|) − 0` |
     ///
-    /// `B' = 900_000` is the buy leg left over after one lot of it is consumed covering the short
-    /// the sells would open; Binance has no such term — it never models the two sides filling in
-    /// sequence. **Escrow over-charges by 200_000 (+11.1%).**
+    /// The retired escrow charged 2_000_000 here — `max(S + B', B + S')`, where `B' = 900_000` is
+    /// the buy leg left over after one lot of it is consumed covering the short the sells would
+    /// open. It modelled the two sides filling in SEQUENCE; Binance's formula does not, and the
+    /// owner accepted that loosening. **The migration cut this book's requirement by 200_000
+    /// (−10%).**
     #[test]
-    fn cross_side_escrow_adds_the_residual_binance_takes_the_max() {
+    fn a_cross_side_book_is_charged_the_larger_terminal_exposure() {
         let mut ctx = make_ctx();
         setup_marked(&mut ctx, PRICE);
         place(&mut ctx, ALICE, 0, P_LOW, 2);
@@ -8828,50 +9108,47 @@ mod derived_ooim_divergence {
             (0, 1_800_000, 1_100_000)
         );
 
-        let (escrow, oo_im) = bases(&mut ctx);
-        assert_eq!(escrow, 2_000_000, "escrow = max(S + B', B + S')");
-        assert_eq!(oo_im, 1_800_000, "ooIM = max(|N+Bid|, |N-Ask|) - |N|/L");
         assert_eq!(
-            escrow - oo_im,
-            200_000,
-            "escrow over-charges the cross-side book"
+            oo_im_alice(&mut ctx),
+            1_800_000,
+            "ooIM = max(|N+Bid|, |N-Ask|) - |N|/L"
         );
     }
 
-    /// The same shape one lot smaller happens to AGREE — the divergence is not "cross-side always
-    /// differs", it is that the two functions cross. BUY 1 lot @ $90, SELL 1 lot @ $110, flat:
-    /// `max(1_100_000 + 0, 900_000 + 0) = 1_100_000` and `max(900_000, 1_100_000) = 1_100_000`.
-    /// Pinned so the boundary of the divergence set is recorded, not just its interior.
+    /// The same shape one lot smaller: BUY 1 lot @ $90, SELL 1 lot @ $110, flat ⇒
+    /// `max(900_000, 1_100_000) = 1_100_000`. The escrow happened to agree here
+    /// (`max(1_100_000 + 0, 900_000 + 0)`), so the boundary of the old divergence set is recorded
+    /// and not just its interior.
     #[test]
-    fn cross_side_one_for_one_happens_to_agree() {
+    fn cross_side_one_for_one_is_the_dearer_side() {
         let mut ctx = make_ctx();
         setup_marked(&mut ctx, PRICE);
         place(&mut ctx, ALICE, 0, P_LOW, 1);
         place(&mut ctx, ALICE, 1, P_HIGH, 1);
-        assert_eq!(bases(&mut ctx), (1_100_000, 1_100_000));
+        assert_eq!(oo_im_alice(&mut ctx), 1_100_000);
     }
 
-    // ── 2. Mark price moving: escrow is FROZEN, ooIM re-values ──────────────────────────────
+    // ── 2. The requirement RE-VALUES on every mark move ──────────────────────────────────────
 
-    /// **The divergence that cannot be designed away.** Our escrow is decided once, at placement,
-    /// and never revisited; ooIM re-values the position leg at the CURRENT mark on every read. So
-    /// a mark move alone changes the derived requirement while the escrow sits still.
+    /// **The property the escrow structurally could not have.** `ooIM` values the position leg at
+    /// the CURRENT mark on every read, so the requirement moves when the mark moves — with no
+    /// order, no fill, and no action by the user. The escrow was decided once at placement and
+    /// never revisited (it was computed in QUANTITY space at the orders' LIMIT prices; the mark
+    /// was not an input to it at all), so it sat frozen at 2_200_000 across this whole walk.
     ///
-    /// Long 1 lot, resting SELL 3 lots @ $110 (`Ask = 3_300_000`), leverage 1. Escrow is
-    /// `2_200_000` at every mark (`max(S + B', B + S')` is computed in QUANTITY space against the
-    /// position and at the orders' LIMIT prices — the mark is not an input to it at all):
+    /// Long 1 lot, resting SELL 3 lots @ $110 (`Ask = 3_300_000`), leverage 1:
     ///
-    /// | mark | `N`       | `max(\|N+Bid\|, \|N−Ask\|)` | PIM       | ooIM      | escrow    | gap        |
-    /// |------|-----------|---------------------------|-----------|-----------|-----------|------------|
-    /// | $100 | 1_000_000 | 2_300_000 (ask branch)    | 1_000_000 | 1_300_000 | 2_200_000 |   +900_000 |
-    /// | $150 | 1_500_000 | 1_800_000 (ask branch)    | 1_500_000 |   300_000 | 2_200_000 | +1_900_000 |
-    /// | $200 | 2_000_000 | 2_000_000 (bid branch)    | 2_000_000 |         0 | 2_200_000 | +2_200_000 |
+    /// | mark | `N`       | `max(\|N+Bid\|, \|N−Ask\|)` | PIM       | ooIM      | (old escrow) |
+    /// |------|-----------|---------------------------|-----------|-----------|--------------|
+    /// | $100 | 1_000_000 | 2_300_000 (ask branch)    | 1_000_000 | 1_300_000 |    2_200_000 |
+    /// | $150 | 1_500_000 | 1_800_000 (ask branch)    | 1_500_000 |   300_000 |    2_200_000 |
+    /// | $200 | 2_000_000 | 2_000_000 (bid branch)    | 2_000_000 |         0 |    2_200_000 |
     ///
     /// At $200 the position has grown big enough that the resting sells are pure risk REDUCTION
-    /// and Binance charges nothing for them, while we still hold the full placement-time escrow.
-    /// **A 2× mark move swings ooIM from 1_300_000 to 0 with no order and no fill.**
+    /// and nothing is charged for them. **A 2× mark move swings the requirement from 1_300_000 to
+    /// 0 with no order and no fill.**
     #[test]
-    fn mark_moves_reprice_oo_im_while_the_escrow_stays_frozen() {
+    fn a_mark_move_reprices_the_requirement_with_no_order_and_no_fill() {
         let mut ctx = make_ctx();
         setup_marked(&mut ctx, PRICE);
         seed_position(&mut ctx, ALICE, 1, 1);
@@ -8880,162 +9157,121 @@ mod derived_ooim_divergence {
         let mut seen = Vec::new();
         for mark in [PRICE, 150 * TICK, 200 * TICK] {
             storage::save_mark_price(&mut ctx, MARKET_ID, mark).unwrap();
-            seen.push(bases(&mut ctx));
+            seen.push(oo_im_alice(&mut ctx));
         }
         assert_eq!(
             seen,
-            vec![(2_200_000, 1_300_000), (2_200_000, 300_000), (2_200_000, 0)],
-            "escrow frozen at 2_200_000; ooIM 1_300_000 -> 300_000 -> 0 on mark alone"
+            vec![1_300_000, 300_000, 0],
+            "ooIM 1_300_000 -> 300_000 -> 0 on the mark alone"
         );
     }
 
-    /// The mark move is not one-directional either: a mark move AGAINST the position inflates
-    /// ooIM past the escrow, i.e. the derived basis becomes the STRICTER one. Same position and
-    /// book, mark crashed to $10: `N = 100_000`, ask branch `|100_000 − 3_300_000| = 3_200_000`,
-    /// PIM `100_000` ⇒ ooIM `3_100_000` against an escrow of `2_200_000` — **derived is
-    /// 900_000 stricter**. Divergence runs in BOTH directions, which is why the Phase 1 probe is
-    /// an equality check and not an AND-gate.
+    /// The re-valuation runs BOTH ways: a mark move AGAINST the position inflates the
+    /// requirement. Same position and book, mark crashed to $10: `N = 100_000`, ask branch
+    /// `|100_000 − 3_300_000| = 3_200_000`, PIM `100_000` ⇒ ooIM `3_100_000` — 900_000 MORE than
+    /// the escrow's frozen 2_200_000. The migration is not a uniform loosening; it is a different
+    /// function, stricter in some states and looser in others.
     #[test]
-    fn an_adverse_mark_makes_the_derived_basis_the_stricter_one() {
+    fn an_adverse_mark_raises_the_requirement_above_what_the_escrow_held() {
         let mut ctx = make_ctx();
         setup_marked(&mut ctx, PRICE);
         seed_position(&mut ctx, ALICE, 1, 1);
         place(&mut ctx, ALICE, 1, P_HIGH, 3);
         storage::save_mark_price(&mut ctx, MARKET_ID, 10 * TICK).unwrap();
-        assert_eq!(bases(&mut ctx), (2_200_000, 3_100_000));
+        assert_eq!(oo_im_alice(&mut ctx), 3_100_000);
     }
 
-    // ── 3. mark == 0 is a TEST artefact, and it explains most of the suite's divergences ─────
+    // ── 3. mark == 0 is a TEST artefact, and it is worth knowing which is which ──────────────
 
-    /// The `risk_reducing_admission` divergences (a pure-reduce order that our escrow charges
-    /// nothing for and the derived basis charges in full) are ENTIRELY an artefact of the shared
-    /// `setup()` fixture leaving `mark_price` at 0: with `N = 0` the derived basis cannot see the
-    /// position at all, so a risk-reducing sell looks like a naked one.
-    ///
-    /// Same state, two marks. Long 2 lots, resting SELL 1 lot @ $110:
-    /// * mark 0    ⇒ `N = 0`       ⇒ ooIM `1_100_000`, escrow `0` — the artefact.
-    /// * mark $100 ⇒ `N = 2_000_000` ⇒ `max(2_000_000, 900_000) = 2_000_000 = PIM` ⇒ ooIM `0`,
-    ///   escrow `0` — **they AGREE**.
+    /// A zero mark makes `N = 0`, so the derived basis cannot see the position at all and a
+    /// risk-reducing sell reads as a naked one. Same state, two marks. Long 2 lots, resting SELL
+    /// 1 lot @ $110:
+    /// * mark 0    ⇒ `N = 0`         ⇒ ooIM `1_100_000` — the artefact.
+    /// * mark $100 ⇒ `N = 2_000_000` ⇒ `max(2_000_000, 900_000) = 2_000_000 = PIM` ⇒ ooIM `0`.
     ///
     /// Production cannot reach the first row (`addMarket` rejects a zero mark and every mark
-    /// component is floored at 1), so "the derived basis punishes risk-reducing orders" is NOT a
-    /// real finding. Recording it here stops it being rediscovered as one.
+    /// component is floored away from zero), so "the derived basis punishes risk-reducing orders"
+    /// is NOT a real finding. Recording it here stops it being rediscovered as one — and is why
+    /// several tests elsewhere in this file had to start setting a mark.
     #[test]
-    fn the_pure_reduce_divergence_is_a_zero_mark_artefact_only() {
+    fn the_pure_reduce_charge_is_a_zero_mark_artefact_only() {
         let mut ctx = make_ctx();
         setup_marked(&mut ctx, 0);
         seed_position(&mut ctx, ALICE, 2, 1);
         place(&mut ctx, ALICE, 1, P_HIGH, 1);
         assert_eq!(
-            bases(&mut ctx),
-            (0, 1_100_000),
-            "mark 0: derived is blind to the long"
+            oo_im_alice(&mut ctx),
+            1_100_000,
+            "mark 0: the basis is blind to the long"
         );
 
         storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
-        assert_eq!(
-            bases(&mut ctx),
-            (0, 0),
-            "mark $100: both agree a pure reduce is free"
-        );
+        assert_eq!(oo_im_alice(&mut ctx), 0, "mark $100: a pure reduce is free");
     }
 
     // ── 4. A position that flips sign under a two-sided book ────────────────────────────────
 
-    /// Orders resting on both sides while the position crosses zero. The escrow's flip-aware
-    /// `max(S + B', B + S')` exists precisely to survive this, and it does — but it tracks the
-    /// flip in QUANTITY space at LIMIT prices, while ooIM tracks it in NOTIONAL space at MARK, so
-    /// the two trace different curves through the flip.
+    /// `ooIM` as a function of the position, with the book held fixed. Book: BUY 2 lots @ $90
+    /// (`Bid = 1_800_000`) and SELL 2 lots @ $110 (`Ask = 2_200_000`), mark $100, leverage 1,
+    /// position walked from +2 lots to −2 lots:
     ///
-    /// Book fixed at BUY 2 lots @ $90 (`Bid = 1_800_000`) and SELL 2 lots @ $110
-    /// (`Ask = 2_200_000`), mark $100, leverage 1, position walked from +2 lots to −2 lots:
+    /// | position | `N`        | ooIM      | (old escrow) |
+    /// |----------|------------|-----------|--------------|
+    /// | +2 lots  |  2_000_000 | 1_800_000 |    1_800_000 |
+    /// | +1 lot   |  1_000_000 | 1_800_000 |    2_000_000 |
+    /// |  flat    |          0 | 2_200_000 |    2_200_000 |
+    /// | −1 lot   | −1_000_000 | 2_200_000 |    2_200_000 |
+    /// | −2 lots  | −2_000_000 | 2_200_000 |    2_200_000 |
     ///
-    /// | position | `N`        | escrow    | ooIM      | escrow − ooIM |
-    /// |----------|------------|-----------|-----------|---------------|
-    /// | +2 lots  |  2_000_000 | 1_800_000 | 1_800_000 |             0 |
-    /// | +1 lot   |  1_000_000 | 2_000_000 | 1_800_000 |      +200_000 |
-    /// |  flat    |          0 | 2_200_000 | 2_200_000 |             0 |
-    /// | −1 lot   | −1_000_000 | 2_200_000 | 2_200_000 |             0 |
-    /// | −2 lots  | −2_000_000 | 2_200_000 | 2_200_000 |             0 |
-    ///
-    /// ooIM is a STEP function of the position: it is `Bid` while the position is long enough for
-    /// the bid branch to win and `Ask` once the ask branch takes over, switching at the flip. The
-    /// escrow tracks the same two plateaus but bulges above them in the middle, at +1 lot, by
-    /// exactly the 200_000 cross-side residual of the previous test — one lot of the buy leg
-    /// survives covering the short the sells would open, and gets ADDED to the sell leg. So the
-    /// flip itself is NOT a divergence source; the same single mechanism is, and it shows up
-    /// wherever the position only PARTIALLY covers one side of a two-sided book.
+    /// It is a STEP function: `Bid` while the position is long enough for the bid branch to win,
+    /// `Ask` once the ask branch takes over. The escrow tracked the same two plateaus but bulged
+    /// 200_000 above them at +1 lot — the cross-side residual of test 1, appearing wherever the
+    /// position only PARTIALLY covers one side of a two-sided book. The flip itself was never the
+    /// divergence source; that one mechanism was.
     #[test]
-    fn a_sign_flip_under_a_two_sided_book_traces_different_curves() {
+    fn the_requirement_is_a_step_function_of_the_position_under_a_two_sided_book() {
         let mut ctx = make_ctx();
         setup_marked(&mut ctx, PRICE);
         place(&mut ctx, ALICE, 0, P_LOW, 2);
         place(&mut ctx, ALICE, 1, P_HIGH, 2);
 
+        let m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
         let mut walk = Vec::new();
         for lots in [2i64, 1, 0, -1, -2] {
             // Move ONLY `amount`; the book and its aggregates stay exactly as placed, so the
             // position sign is the single independent variable.
             let mut p = storage::load_position(&mut ctx, ALICE, MARKET_ID).unwrap();
             p.amount = lots * QTY as i64;
-            let m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
-            let (b, s, c) = crate::math::calc_reservation_notionals_from_totals_it(
-                storage::load_buy_orders(&mut ctx, ALICE, MARKET_ID)
-                    .unwrap()
-                    .iter()
-                    .copied(),
-                storage::load_sell_orders(&mut ctx, ALICE, MARKET_ID)
-                    .unwrap()
-                    .iter()
-                    .copied(),
-                p.total_buy_qty,
-                p.total_buy_notional,
-                p.total_sell_qty,
-                p.total_sell_notional,
-                m.base_decimals,
-                m.price_decimals,
-                p.amount,
-            )
-            .unwrap();
-            p.set_reservations(b, s, c, p.leverage);
-            walk.push((
-                p.margin_reserved,
-                position_derived_margin(&m, &p).unwrap().tier_capped_oo_im,
-            ));
+            walk.push(position_open_order_margin(&m, &p).unwrap());
         }
         assert_eq!(
             walk,
-            vec![
-                (1_800_000, 1_800_000),
-                (2_000_000, 1_800_000),
-                (2_200_000, 2_200_000),
-                (2_200_000, 2_200_000),
-                (2_200_000, 2_200_000),
-            ],
-            "the two bases agree except at +1 lot, where the escrow adds the 200_000 residual"
+            vec![1_800_000, 1_800_000, 2_200_000, 2_200_000, 2_200_000],
+            "Bid while the long dominates, then Ask — one step, no bulge"
         );
     }
 
-    // ── 5. A tier boundary straddled by the ORDERS, not the position ────────────────────────
+    // ── 5. The tier table does NOT enter the requirement ────────────────────────────────────
 
-    /// The admission basis tier-caps leverage at the COMBINED notional, so a book that pushes a
-    /// small position over a tier boundary re-prices the POSITION too. Our escrow has no such
-    /// term — it divides by `pos.leverage` unconditionally.
+    /// Phase 1 briefly enforced a TIER-CAPPED ooIM, which re-priced the position leg whenever the
+    /// COMBINED notional crossed a tier boundary. It was rejected: open orders are priced at the
+    /// position's own leverage, uncapped, as Binance does (tiers still govern maintenance margin,
+    /// which is continuous). This test pins the consequence on the exact fixture that used to
+    /// show a 10× discontinuity.
     ///
     /// Tiers `[(0, 10x), (2_000_000, 2x)]`, position long 1 lot at leverage 10, mark $100
-    /// (`N = 1_000_000`, comfortably tier 0):
+    /// (`N = 1_000_000`):
     ///
-    /// | resting BUY | `Bid`     | combined  | tier | `L_eff` | ooIM    | escrow  |
-    /// |-------------|-----------|-----------|------|---------|---------|---------|
-    /// | 1 lot @ $90 |   900_000 | 1_900_000 | 0    | 10      |  90_000 |  90_000 |
-    /// | 2 lots @ $90| 1_800_000 | 2_800_000 | 1    | 2       | 900_000 | 180_000 |
+    /// | resting BUY  | `Bid`     | combined  | ooIM    | (tier-capped variant) |
+    /// |--------------|-----------|-----------|---------|-----------------------|
+    /// | 1 lot @ $90  |   900_000 | 1_900_000 |  90_000 |                90_000 |
+    /// | 2 lots @ $90 | 1_800_000 | 2_800_000 | 180_000 |               900_000 |
     ///
-    /// One extra lot crosses the boundary and the derived requirement jumps **10×**, from 90_000
-    /// to 900_000, while the escrow merely doubles. `L_eff` drops 10 → 2, which re-prices the
-    /// pre-existing position as well as the new order — a discontinuity the escrow basis simply
-    /// does not have.
+    /// The capped variant dropped `L_eff` 10 → 2 on the second row, which re-priced the
+    /// PRE-EXISTING position as well as the new order and multiplied the requirement by 10 for
+    /// one extra lot. The surviving definition is linear in `Bid`: 90_000 → 180_000.
     #[test]
-    fn a_tier_boundary_crossed_by_the_orders_repricees_the_position_too() {
+    fn the_tier_table_does_not_enter_the_open_order_requirement() {
         let tiers = MarginTiers::from_tiers(&[
             MarginTier {
                 lower_bound_notional: 0,
@@ -9047,29 +9283,32 @@ mod derived_ooim_divergence {
             },
         ])
         .unwrap();
-        for (lots, want) in [(1u64, (90_000u64, 90_000u64)), (2, (180_000, 900_000))] {
+        for (lots, want) in [(1u64, 90_000u64), (2, 180_000)] {
             let mut ctx = make_ctx();
             storage::save_admin(&mut ctx, ADMIN).unwrap();
             storage::save_market(&mut ctx, &market_with(PRICE, tiers)).unwrap();
             fund(&mut ctx, ALICE, WALLET * 100);
             seed_position(&mut ctx, ALICE, 1, 10);
             place(&mut ctx, ALICE, 0, P_LOW, lots);
-            assert_eq!(bases(&mut ctx), want, "{lots} lot(s) resting");
+            assert_eq!(oo_im_alice(&mut ctx), want, "{lots} lot(s) resting");
         }
     }
 
-    // ── 6. The account-level fold, and the gross-up that Phase 1 must not get wrong ─────────
+    // ── 6. The account-level fold, and the available it produces ────────────────────────────
 
-    /// The Σ walkers agree with the per-market numbers, the market index really is the support of
-    /// the sum, and — the trap — `available_new` must GROSS UP by the escrow before subtracting
-    /// Σ ooIM, because `perp_wallet_balance` has already been debited by it.
+    /// The Σ walker agrees with the per-market numbers, and `available` is
+    /// `perp_wallet_balance − Σ ooIM` with NO gross-up term.
     ///
-    /// Flat, mark $100, BUY 2 lots @ $90 + SELL 1 lot @ $110 (the cross-side case above):
-    /// escrow `2_000_000` is physically out of the wallet, ooIM is `1_800_000`. The naive
-    /// `wallet − Σ ooIM` would report `2_000_000 + 1_800_000 = 3_800_000` less than the true
-    /// gross — nearly double-charging a 2M book.
+    /// Phase 1 needed one (`+ Σ margin_reserved`) because the escrow had already been debited
+    /// from the wallet, so subtracting Σ ooIM on top would have charged the book twice. Nothing
+    /// is debited now: the funded balance IS the gross, and adding anything back would re-open
+    /// that double-count from the other side. This test is the pin on that — it is the single
+    /// easiest thing to get backwards in this migration.
+    ///
+    /// Flat, mark $100, BUY 2 lots @ $90 + SELL 1 lot @ $110 (the cross-side case of test 1):
+    /// ooIM is 1_800_000, the wallet is untouched, and available is funded − 1_800_000.
     #[test]
-    fn the_derived_available_grosses_the_escrow_back_up_before_subtracting() {
+    fn the_derived_available_subtracts_the_requirement_exactly_once() {
         let mut ctx = make_ctx();
         setup_marked(&mut ctx, PRICE);
         let funded = storage::load_account(&mut ctx, ALICE)
@@ -9081,34 +9320,17 @@ mod derived_ooim_divergence {
         let wallet = storage::load_account(&mut ctx, ALICE)
             .unwrap()
             .perp_wallet_balance;
+        assert_eq!(wallet, funded, "the escrow is gone — nothing was debited");
         assert_eq!(
-            wallet,
-            funded - 2_000_000,
-            "the escrow really is debited from the wallet"
-        );
-
-        assert_eq!(total_margin_reserved(&mut ctx, ALICE).unwrap(), 2_000_000);
-        assert_eq!(
-            total_open_order_initial_margin(&mut ctx, ALICE).unwrap(),
+            total_open_order_initial_margin(&mut ctx, ALICE, None).unwrap(),
             1_800_000
         );
 
-        // The correct basis: gross the escrow back up, THEN subtract the derived requirement.
-        let correct = crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap();
-        assert_eq!(correct, wallet as i128 + 2_000_000 - 1_800_000);
-        assert_eq!(
-            correct,
-            funded as i128 - 1_800_000,
-            "the derived basis charges the DERIVED requirement and nothing else"
-        );
-
-        // The trap, stated numerically: forgetting the gross-up charges the book TWICE.
-        let naive = wallet as i128 - 1_800_000;
-        assert_eq!(
-            correct - naive,
-            2_000_000,
-            "the double-count the gross-up removes"
-        );
+        let available = crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap();
+        assert_eq!(available, funded as i128 - 1_800_000);
+        // The trap, stated numerically: grossing the (nonexistent) escrow back up, as Phase 1
+        // correctly did, would now over-report by exactly the requirement.
+        assert_ne!(available, funded as i128);
     }
 
     /// A user active in SEVERAL markets folds every one of them, and a market they have left
@@ -9144,7 +9366,7 @@ mod derived_ooim_divergence {
             vec![1, 2, 3]
         );
         assert_eq!(
-            total_open_order_initial_margin(&mut ctx, ALICE).unwrap(),
+            total_open_order_initial_margin(&mut ctx, ALICE, None).unwrap(),
             expect
         );
         assert_eq!(expect, 5_400_000, "900_000 × (1 + 2 + 3)");

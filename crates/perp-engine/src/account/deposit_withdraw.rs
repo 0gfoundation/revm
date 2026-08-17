@@ -164,21 +164,13 @@ pub fn run_transfer_from_perp<H: PerpHost>(
     }
 
     let mut account = storage::load_account(context, caller)?;
-    // Derived-ooIM Phase 1 dual gate (debug only). Cash leaving the perp wallet: Σ ooIM is
-    // untouched, so the derived requirement is the same `amount`; only the AVAILABLE differs
-    // (`+ Σ margin_reserved − Σ ooIM`). This is the money-OUT gate — the one where an
-    // over-permissive derived basis would let a user strip collateral out from under resting
-    // orders — so it matters most that the two agree.
-    #[cfg(debug_assertions)]
-    crate::margin_view::debug_assert_gates_agree(
-        context,
-        caller,
-        "transferFromPerp",
-        None,
-        amount,
-        amount as i128,
-    );
-    if !account.has_available_perp(amount) {
+    // Derived-ooIM gate. Cash leaving the perp wallet entirely: `Σ ooIM` is untouched (neither
+    // the book nor any position moves), so the requirement is exactly `amount` and it must come
+    // out of AVAILABLE. This is THE money-out gate — the one place where getting the basis wrong
+    // lets a user strip the collateral out from under their own resting orders — so it reads
+    // `perp_wallet_balance − Σ ooIM`, never the raw wallet.
+    let available = crate::margin_view::derived_available_balance(context, caller)?;
+    if !crate::margin_view::derived_can_afford(available, amount as i128) {
         return Err(perp_err(
             "transferFromPerp: insufficient perp wallet balance",
         ));
@@ -200,7 +192,13 @@ pub fn run_transfer_from_perp<H: PerpHost>(
     Ok(Bytes::new())
 }
 
-/// `getAccount(address user)` — returns spot, total perp collateral, and available perp.
+/// `getAccount(address user)` — returns spot USDC and the DERIVED available perp balance.
+///
+/// `availablePerpBalance` is `max(0, perp_wallet_balance − Σ_markets ooIM)`: the same quantity
+/// the engine's admission gates enforce, clamped at 0 for the `uint64` return. It is NOT
+/// `perp_wallet_balance` — that is the CROSS wallet (Binance's `crossWalletBalance`), which still
+/// carries the money backing every resting order. Use `getAccountMargin` for the signed,
+/// unclamped decomposition.
 pub fn run_get_account<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -208,9 +206,11 @@ pub fn run_get_account<H: PerpHost>(
     let args = getAccountCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getAccount: invalid calldata"))?;
 
+    let available = crate::margin_view::derived_available_balance(context, args.user)?;
     let account = storage::load_account_ref(context, args.user)?;
     let usdc_balance: U256 = account.usdc_balance.clone().into();
-    let available_perp_balance = account.visible_perp_wallet_balance();
+    let available_perp_balance = u64::try_from(available.max(0))
+        .map_err(|_| perp_err("getAccount: available perp balance exceeds u64"))?;
 
     Ok(Bytes::from(getAccountCall::abi_encode_returns(
         &getAccountReturn {

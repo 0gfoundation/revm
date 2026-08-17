@@ -242,15 +242,15 @@ pub fn max_leverage_for_notional(tiers: &MarginTiers, abs_notional: i64) -> u32 
 /// [`maintenance_margin`], which truncates — the two are different requirements with
 /// independently measured rounding, and neither should be "made consistent" with the other.
 ///
-/// `divisor` is floored at 1 exactly as [`crate::types::PerpPosition::set_reservations`] floors
-/// leverage, so a zero/corrupt leverage cannot divide by zero.
+/// `divisor` is floored at 1, so a defaulted or corrupt `pos.leverage` of 0 cannot divide by
+/// zero.
 #[inline]
 pub fn round_up_div(numerator: u128, divisor: u64) -> u128 {
     numerator.div_ceil(divisor.max(1) as u128)
 }
 
 /// The three derived margin quantities for one `(position, resting orders)` pair, plus the
-/// leverage they were evaluated at. Output of [`open_order_margin_at_leverage`].
+/// leverage they were evaluated at. Output of [`open_order_margin`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OpenOrderMargin {
     /// `ROUND_UP(|N| / L)` — what the POSITION alone requires.
@@ -264,7 +264,27 @@ pub struct OpenOrderMargin {
     pub effective_leverage: u64,
 }
 
-/// The pure ooIM formula at an EXPLICIT leverage — no tier table consulted.
+/// **The** open-order margin formula. There is exactly one; every ooIM in the engine comes from
+/// here, at the POSITION'S OWN leverage, UNCAPPED by the tier table.
+///
+/// ```text
+/// PIM  = ROUND_UP(|N| / L)
+/// IM   = ROUND_UP( max(|N + Bid|, |N − Ask|) / L )
+/// ooIM = IM − PIM
+/// ```
+///
+/// # Why no tier cap
+///
+/// A tier-capped variant briefly existed (leverage clamped to
+/// `max_leverage_for_notional(tiers, max(|N + Bid|, |N − Ask|))`, i.e. priced at the notional the
+/// position would carry if the whole book filled) so the ADMISSION gate could not be dodged by
+/// setting leverage while small and then resting orders past a tier boundary. It was rejected:
+/// Binance prices open orders at the position's leverage, full stop, and the capped form is a
+/// second, silently different ooIM whose discontinuity at a boundary re-prices the PRE-EXISTING
+/// position too (a 10× jump from one extra lot — measured). Tiers still govern MAINTENANCE margin,
+/// which is continuous, and `set_leverage` still caps against tier 0; an over-levered position is
+/// refused when it next tries to OPEN (`max_leverage_for_notional` in the fill guards). Do not
+/// reintroduce a second definition here.
 ///
 /// Pure integer arithmetic over `(signed_notional, bid, ask, leverage)`; no storage, no floats.
 /// `signed_notional` is `N` at MARK (negative for a short); `bid`/`ask` are at each order's LIMIT
@@ -287,7 +307,7 @@ pub struct OpenOrderMargin {
 /// Whichever branch shares `N`'s sign already dominates `|N|` for any `Bid, Ask >= 0`: for
 /// `N >= 0`, `|N + Bid| >= N`; for `N < 0`, `|N − Ask| >= |N|`. The `saturating_sub` below is
 /// belt-and-braces on that invariant, not a rounding decision.
-pub fn open_order_margin_at_leverage(
+pub fn open_order_margin(
     signed_notional: i64,
     bid: u64,
     ask: u64,
@@ -317,42 +337,6 @@ pub fn open_order_margin_at_leverage(
         open_order_initial_margin: initial_margin.saturating_sub(position_initial_margin),
         effective_leverage: lev,
     })
-}
-
-/// [`open_order_margin_at_leverage`] with the leverage TIER-CAPPED at the COMBINED notional.
-///
-/// `L_eff = min(leverage, max_leverage_for_notional(tiers, max(|N + Bid|, |N − Ask|)))`, i.e.
-/// the same cap [`max_leverage_for_notional`] enforces in `set_leverage_core`, but evaluated at
-/// the notional the position would carry if the book filled rather than at the position's
-/// current notional. A user cannot escape a tier's leverage cap by setting leverage while small
-/// and then resting orders that would grow them past the boundary.
-///
-/// This is the variant the ADMISSION path uses. The Binance-parity READ path deliberately does
-/// NOT apply the cap (Binance reports `initialMargin` at the position's own `leverage` field),
-/// so it calls [`open_order_margin_at_leverage`] directly — the arithmetic is shared, only the
-/// leverage input differs.
-pub fn open_order_margin(
-    tiers: &MarginTiers,
-    signed_notional: i64,
-    bid: u64,
-    ask: u64,
-    leverage: u64,
-) -> Result<OpenOrderMargin, PerpError> {
-    let n = signed_notional as i128;
-    let bid_branch = n
-        .checked_add(bid as i128)
-        .ok_or_else(|| perp_err("math: ooIM bid branch overflow"))?
-        .unsigned_abs();
-    let ask_branch = n
-        .checked_sub(ask as i128)
-        .ok_or_else(|| perp_err("math: ooIM ask branch overflow"))?
-        .unsigned_abs();
-    // `max_leverage_for_notional` takes i64; a combined notional past i64::MAX is already past
-    // every tier bound, so saturating there picks the top (smallest-leverage) tier — the
-    // conservative direction.
-    let combined = i64::try_from(bid_branch.max(ask_branch)).unwrap_or(i64::MAX);
-    let cap = max_leverage_for_notional(tiers, combined) as u64;
-    open_order_margin_at_leverage(signed_notional, bid, ask, leverage.max(1).min(cap.max(1)))
 }
 
 /// Returns `true` if the position is above the maintenance-margin threshold.
@@ -412,23 +396,6 @@ pub fn calc_remaining_margin(
         .ok_or_else(|| perp_err("math: remaining margin overflow"))?
         / total_quantity as i128;
     i64::try_from(scaled).map_err(|_| perp_err("math: remaining margin exceeds i64"))
-}
-
-/// Recalculate margin reserves after a leverage change.
-#[inline]
-pub fn calc_new_margin_reserved_after_leverage_update(
-    old_leverage: u64,
-    new_leverage: u64,
-    old_margin_reserved: u64,
-) -> Result<u64, PerpError> {
-    if new_leverage == 0 {
-        return Err(perp_err("math: leverage cannot be zero"));
-    }
-    let value = (old_margin_reserved as u128)
-        .checked_mul(old_leverage as u128)
-        .ok_or_else(|| perp_err("math: leverage margin overflow"))?
-        / new_leverage as u128;
-    u64::try_from(value).map_err(|_| perp_err("math: leverage margin exceeds u64"))
 }
 
 /// Entry price derived from position state. Returns 0 if `amount == 0`.
@@ -553,357 +520,14 @@ pub fn calc_funding_payment(
     i64::try_from(payment).map_err(|_| perp_err("math: funding payment exceeds i64"))
 }
 
-/// Recalculate the buy-side opening notional from the current buy-order list.
-/// `buy_entries` must be sorted by price descending.
-/// `position_amount` is the current net position before this order list.
-#[inline]
-pub fn calc_buy_side_reserved_notional(
-    buy_entries: &[OrderEntry],
-    base_decimals: u32,
-    price_decimals: u32,
-    position_amount: i64,
-) -> Result<u64, PerpError> {
-    let mut remaining = if position_amount >= 0 {
-        0i64
-    } else {
-        position_amount
-            .checked_neg()
-            .ok_or_else(|| perp_err("math: position amount overflow"))?
-    };
-    let mut reserved_notional = 0u64;
-    for e in buy_entries {
-        let amount = checked_u64_to_i64(e.amount, "math: buy order amount")?;
-        remaining = remaining
-            .checked_sub(amount)
-            .ok_or_else(|| perp_err("math: buy remaining overflow"))?;
-        if remaining <= 0 {
-            let net_open = remaining
-                .checked_neg()
-                .ok_or_else(|| perp_err("math: buy net open overflow"))?
-                as u64;
-            let notional = calc_value(e.price, net_open, base_decimals, price_decimals)?;
-            reserved_notional = reserved_notional
-                .checked_add(notional)
-                .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
-            remaining = 0;
-        }
-    }
-    Ok(reserved_notional)
-}
-
-/// Recalculate the sell-side opening notional from the current sell-order list.
-/// `sell_entries` must be sorted by price ascending.
-#[inline]
-pub fn calc_sell_side_reserved_notional(
-    sell_entries: &[OrderEntry],
-    base_decimals: u32,
-    price_decimals: u32,
-    position_amount: i64,
-) -> Result<u64, PerpError> {
-    let mut remaining = if position_amount <= 0 {
-        0i64
-    } else {
-        position_amount
-    };
-    let mut reserved_notional = 0u64;
-    for e in sell_entries {
-        let amount = checked_u64_to_i64(e.amount, "math: sell order amount")?;
-        remaining = remaining
-            .checked_sub(amount)
-            .ok_or_else(|| perp_err("math: sell remaining overflow"))?;
-        if remaining <= 0 {
-            let net_open = remaining
-                .checked_neg()
-                .ok_or_else(|| perp_err("math: sell net open overflow"))?
-                as u64;
-            let notional = calc_value(e.price, net_open, base_decimals, price_decimals)?;
-            reserved_notional = reserved_notional
-                .checked_add(notional)
-                .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
-            remaining = 0;
-        }
-    }
-    Ok(reserved_notional)
-}
-
-/// One step of the cover→open scan, shared by the single and dual notional fns: subtract this
-/// order's `amount` from the remaining-to-cover, returning the amount of THIS order that opens
-/// (0 while still covering; the overflow at the boundary; the full amount once past). Matches the
-/// per-entry logic in [`calc_buy_side_reserved_notional`] exactly.
-#[inline]
-fn open_amount(remaining: &mut i64, amount: i64) -> Result<i64, PerpError> {
-    *remaining = remaining
-        .checked_sub(amount)
-        .ok_or_else(|| perp_err("math: cover remaining overflow"))?;
-    if *remaining <= 0 {
-        let open = remaining
-            .checked_neg()
-            .ok_or_else(|| perp_err("math: net open overflow"))?;
-        *remaining = 0;
-        Ok(open)
-    } else {
-        Ok(0)
-    }
-}
-
-/// Buy-side opening notional at TWO positions in a single DESC pass (#21 靶子3): returns
-/// `(B(position_a), B(position_b), total_buy_qty)`. Each value is byte-identical to a separate
-/// [`calc_buy_side_reserved_notional`] call — but when an order opens the SAME amount for both
-/// covers (the common deep-open case), `calc_value` is computed once and added to both, halving the
-/// expensive notional math vs two scans. The total order qty is summed in the same pass (free),
-/// removing a separate sum pass.
-#[inline]
-pub fn calc_buy_side_dual(
-    buy_entries: impl Iterator<Item = OrderEntry>,
-    base_decimals: u32,
-    price_decimals: u32,
-    position_a: i64,
-    position_b: i64,
-) -> Result<(u64, u64, i64), PerpError> {
-    let mut rem_a = if position_a >= 0 {
-        0i64
-    } else {
-        position_a
-            .checked_neg()
-            .ok_or_else(|| perp_err("math: position amount overflow"))?
-    };
-    let mut rem_b = if position_b >= 0 {
-        0i64
-    } else {
-        position_b
-            .checked_neg()
-            .ok_or_else(|| perp_err("math: position amount overflow"))?
-    };
-    let mut res_a = 0u64;
-    let mut res_b = 0u64;
-    let mut total = 0u64;
-    for e in buy_entries {
-        total = total
-            .checked_add(e.amount)
-            .ok_or_else(|| perp_err("math: total buy order amount"))?;
-        let amount = checked_u64_to_i64(e.amount, "math: buy order amount")?;
-        let open_a = open_amount(&mut rem_a, amount)?;
-        let open_b = open_amount(&mut rem_b, amount)?;
-        if open_a == open_b {
-            if open_a > 0 {
-                let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
-                res_a = res_a
-                    .checked_add(v)
-                    .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
-                res_b = res_b
-                    .checked_add(v)
-                    .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
-            }
-        } else {
-            if open_a > 0 {
-                let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
-                res_a = res_a
-                    .checked_add(v)
-                    .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
-            }
-            if open_b > 0 {
-                let v = calc_value(e.price, open_b as u64, base_decimals, price_decimals)?;
-                res_b = res_b
-                    .checked_add(v)
-                    .ok_or_else(|| perp_err("math: buy reserve notional overflow"))?;
-            }
-        }
-    }
-    Ok((
-        res_a,
-        res_b,
-        checked_u64_to_i64(total, "math: total buy order amount")?,
-    ))
-}
-
-/// Sell-side opening notional at TWO positions in a single ASC pass (#21 靶子3); see
-/// [`calc_buy_side_dual`]. Returns `(S(position_a), S(position_b), total_sell_qty)`.
-#[inline]
-pub fn calc_sell_side_dual(
-    sell_entries: impl Iterator<Item = OrderEntry>,
-    base_decimals: u32,
-    price_decimals: u32,
-    position_a: i64,
-    position_b: i64,
-) -> Result<(u64, u64, i64), PerpError> {
-    let mut rem_a = if position_a <= 0 { 0i64 } else { position_a };
-    let mut rem_b = if position_b <= 0 { 0i64 } else { position_b };
-    let mut res_a = 0u64;
-    let mut res_b = 0u64;
-    let mut total = 0u64;
-    for e in sell_entries {
-        total = total
-            .checked_add(e.amount)
-            .ok_or_else(|| perp_err("math: total sell order amount"))?;
-        let amount = checked_u64_to_i64(e.amount, "math: sell order amount")?;
-        let open_a = open_amount(&mut rem_a, amount)?;
-        let open_b = open_amount(&mut rem_b, amount)?;
-        if open_a == open_b {
-            if open_a > 0 {
-                let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
-                res_a = res_a
-                    .checked_add(v)
-                    .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
-                res_b = res_b
-                    .checked_add(v)
-                    .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
-            }
-        } else {
-            if open_a > 0 {
-                let v = calc_value(e.price, open_a as u64, base_decimals, price_decimals)?;
-                res_a = res_a
-                    .checked_add(v)
-                    .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
-            }
-            if open_b > 0 {
-                let v = calc_value(e.price, open_b as u64, base_decimals, price_decimals)?;
-                res_b = res_b
-                    .checked_add(v)
-                    .ok_or_else(|| perp_err("math: sell reserve notional overflow"))?;
-            }
-        }
-    }
-    Ok((
-        res_a,
-        res_b,
-        checked_u64_to_i64(total, "math: total sell order amount")?,
-    ))
-}
-
-/// Flip-aware worst-case reservation notional for a user's resting book.
-///
-/// Returns `(buy_notional B, sell_notional S, c_notional)` where:
-/// - `B = calc_buy_side_reserved_notional(buys, p)` — buy-side opening notional
-///   at the current position `p`,
-/// - `S = calc_sell_side_reserved_notional(sells, p)` — sell-side likewise,
-/// - `c_notional = max(S + B', B + S')` — the peak capital the position can
-///   require across a full sign-flip in either direction:
-///   - `B' = B(p − total_sell_qty)`: if every sell fills first the position
-///     goes maximally short, so the surviving buys re-open more notional,
-///   - `S' = S(p + total_buy_qty)`: symmetric for the long extreme.
-///
-/// `max-of-side = max(B, S)` under-reserves because it ignores that a fill on
-/// one side flips the position and re-prices the *other* side's opening leg;
-/// `c_notional` is the tight peak (verified exact: it equals the reachable
-/// maximum of [realized-position margin + remaining-order reservation] given
-/// the engine's price-priority fill order — buys filled DESC, sells ASC — which
-/// is a load-bearing precondition). It dominates `max-of-side`
-/// (`c_notional ≥ max(B, S)` since `B', S' ≥ 0`), so reservations only grow.
-///
-/// The combined leg is summed in `u128` and floored once on division by
-/// leverage in `set_reservations` (single floor, not a sum of per-leg floors),
-/// which is the strictly-safer rounding.
-#[inline]
-pub fn calc_reservation_notionals(
-    buy_entries: &[OrderEntry],
-    sell_entries: &[OrderEntry],
-    base_decimals: u32,
-    price_decimals: u32,
-    position_amount: i64,
-) -> Result<(u64, u64, u64), PerpError> {
-    calc_reservation_notionals_it(
-        buy_entries.iter().copied(),
-        sell_entries.iter().copied(),
-        base_decimals,
-        price_decimals,
-        position_amount,
-    )
-}
-
-/// Iterator form of [`calc_reservation_notionals`] (commit-only #23 perf): folds the two sides
-/// from iterators instead of slices, so a caller can evaluate the reservation of a HYPOTHETICAL
-/// book (e.g. "current list + one entry at its sorted position", via `.chain`) WITHOUT cloning the
-/// list or writing the overlay — the validate-then-apply probe for rest_in_book / release. The
-/// slice form above is a thin wrapper (`.iter().copied()`), so both paths run the exact same fold
-/// → byte-identical results (the price-index/notional bytes folded into the commitment are
-/// unchanged). `S: Clone` because the sell side is iterated twice (total-qty pass + dual pass); the
-/// buy side is consumed once. `OrderEntry: Copy`, so by-value iteration is a cheap stack copy.
-pub fn calc_reservation_notionals_it<B, S>(
-    buy_entries: B,
-    sell_entries: S,
-    base_decimals: u32,
-    price_decimals: u32,
-    position_amount: i64,
-) -> Result<(u64, u64, u64), PerpError>
-where
-    B: Iterator<Item = OrderEntry>,
-    S: Iterator<Item = OrderEntry> + Clone,
-{
-    // #21 靶子3: compute all four opening notionals in THREE passes instead of six. The buy leg
-    // needs the post-all-sells position (max-short), so total_sell_qty comes first (one cheap sum
-    // pass); the buy dual then yields B + B' AND total_buy_qty in one pass; the sell dual yields
-    // S + S' (it needs the post-all-buys position from total_buy_qty). Each value is byte-identical
-    // to the old separate calc_*_reserved_notional calls (gated by the dual_matches_separate test).
-    let total_sell_qty = total_entry_amount(sell_entries.clone(), "math: total sell order amount")?;
-    // Position after every sell fills → most short; surviving buys re-open from there.
-    let position_after_sells = position_amount
-        .checked_sub(total_sell_qty)
-        .ok_or_else(|| perp_err("math: flip-short position overflow"))?;
-    let (buy_notional, buy_flip_notional, total_buy_qty) = calc_buy_side_dual(
-        buy_entries,
-        base_decimals,
-        price_decimals,
-        position_amount,
-        position_after_sells,
-    )?;
-
-    // Position after every buy fills → most long; surviving sells re-open from there.
-    let position_after_buys = position_amount
-        .checked_add(total_buy_qty)
-        .ok_or_else(|| perp_err("math: flip-long position overflow"))?;
-    let (sell_notional, sell_flip_notional, _) = calc_sell_side_dual(
-        sell_entries,
-        base_decimals,
-        price_decimals,
-        position_amount,
-        position_after_buys,
-    )?;
-
-    let leg_short = (sell_notional as u128)
-        .checked_add(buy_flip_notional as u128)
-        .ok_or_else(|| perp_err("math: flip-short leg overflow"))?;
-    let leg_long = (buy_notional as u128)
-        .checked_add(sell_flip_notional as u128)
-        .ok_or_else(|| perp_err("math: flip-long leg overflow"))?;
-    let c_notional = u64::try_from(leg_short.max(leg_long))
-        .map_err(|_| perp_err("math: flip-aware reservation notional exceeds u64"))?;
-
-    Ok((buy_notional, sell_notional, c_notional))
-}
-
-/// Sum of all order-entry amounts as an `i64` (checked).
-fn total_entry_amount(
-    entries: impl Iterator<Item = OrderEntry>,
-    ctx: &str,
-) -> Result<i64, PerpError> {
-    let mut total = 0u64;
-    for e in entries {
-        total = total.checked_add(e.amount).ok_or_else(|| perp_err(ctx))?;
-    }
-    checked_u64_to_i64(total, ctx)
-}
-
-// ── Incremental-reservation primitives (catalog #A, Step 1) ─────────────────────────────────
+// ── Per-side resting-order aggregates (Binance `Bid` / `Ask`) ───────────────────────────────
 //
-// The flip-aware reservation `calc_reservation_notionals` folds THREE passes over the acting
-// account's whole buy+sell lists on every place/cancel — O(n) in the account's resting-order
-// count. Sim A (docs/hl-rust-sim-bottleneck-results-20260727.md) showed this is THE hot-path
-// bottleneck: a 3 655-order MM's place+cancel is 19× a 1-order account's, and those long-list MMs
-// are the dominant churners.
-//
-// These primitives reconstruct each side's opening notional from a MAINTAINED per-side aggregate
-// instead of a full fold. The key identity (proven byte-exact below):
-//
-//     side_notional(cover C) = TotalNotional − Σ_{covered prefix} calc_value(price_i, amount_i)
-//                                             + calc_value(price_boundary, open_at_boundary)
-//
-// where `TotalNotional = Σ_i calc_value(price_i, amount_i)` is the sum of the SAME per-order
-// floored `calc_value` terms the fold produces (so it is maintainable ± one term per insert/remove
-// with ZERO floor-composition error — `calc_value` floors per call, so only this per-order-floored
-// definition stays byte-identical). The covered prefix is the highest-price buys / lowest-price
-// sells totalling `C` in quantity; it is EMPTY when C = 0 (a flat/aligned position or a one-sided
-// book) → the leg is just `TotalNotional`, computed with NO list walk. Otherwise the walk spans
-// only the cover prefix (bounded by |position| / the flip totals), never the full list.
+// The flip-aware escrow reservation these primitives used to feed is GONE (derived-ooIM Phase 2):
+// the open-order requirement is now derived on demand from `(N, Bid, Ask, L)` by
+// [`open_order_margin`], so the only thing still needed off the order lists is each side's
+// `(Σ qty, Σ notional)` — which IS `(·, Bid)` / `(·, Ask)`. The cover-prefix leg reconstruction
+// (`side_leg_from_total`), the four-leg `max(S + B', B + S')` fold and their per-side helpers were
+// deleted with the escrow; nothing computes an opening notional per side any more.
 
 /// `(Σ amount, Σ calc_value(price, amount))` over a side's order list — the maintained aggregate
 /// the leg reconstruction below consumes. Cold-rebuild / test helper; production maintains these
@@ -926,310 +550,6 @@ pub fn sum_side_totals(
             .ok_or_else(|| perp_err("math: side total notional overflow"))?;
     }
     Ok((qty, notional))
-}
-
-/// Reconstruct one side's opening notional at cover threshold `cover` (≥ 0) from `total_notional`,
-/// walking ONLY the cover prefix. `entries` must be in the side's cover order (buys DESC, sells
-/// ASC — the same order the fold consumes). Byte-identical to
-/// `calc_{buy,sell}_side_reserved_notional` (see the fuzz gate `from_totals_matches_fold`).
-fn side_leg_from_total(
-    entries: impl Iterator<Item = OrderEntry>,
-    total_notional: u64,
-    base_decimals: u32,
-    price_decimals: u32,
-    cover: i64,
-) -> Result<u64, PerpError> {
-    if cover <= 0 {
-        return Ok(total_notional);
-    }
-    let mut remaining = cover as u64;
-    let mut leg = total_notional;
-    for e in entries {
-        if remaining >= e.amount {
-            // Fully covered: this order opens nothing → drop its full per-order notional.
-            let cv = calc_value(e.price, e.amount, base_decimals, price_decimals)?;
-            leg = leg
-                .checked_sub(cv)
-                .ok_or_else(|| perp_err("math: side leg cover underflow"))?;
-            remaining -= e.amount;
-            if remaining == 0 {
-                break; // all subsequent orders open fully → already counted in total_notional
-            }
-        } else {
-            // Boundary order: covers `remaining`, opens `amount - remaining`.
-            let open = e.amount - remaining;
-            let cv_full = calc_value(e.price, e.amount, base_decimals, price_decimals)?;
-            let cv_open = calc_value(e.price, open, base_decimals, price_decimals)?;
-            leg = leg
-                .checked_sub(cv_full)
-                .ok_or_else(|| perp_err("math: side leg boundary underflow"))?
-                .checked_add(cv_open)
-                .ok_or_else(|| perp_err("math: side leg boundary overflow"))?;
-            break;
-        }
-    }
-    Ok(leg)
-}
-
-/// Flip-aware worst-case reservation `(B, S, c_notional)` — byte-identical to
-/// [`calc_reservation_notionals`] — reconstructed from the maintained per-side aggregates
-/// `(total_buy_qty, total_buy_notional, total_sell_qty, total_sell_notional)` instead of a full
-/// fold. Each of the four legs (B, B′, S, S′) walks only its cover prefix, so a flat/aligned or
-/// one-sided book is O(1). `buy_entries` DESC, `sell_entries` ASC.
-#[inline]
-pub fn calc_reservation_notionals_from_totals(
-    buy_entries: &[OrderEntry],
-    sell_entries: &[OrderEntry],
-    total_buy_qty: u64,
-    total_buy_notional: u64,
-    total_sell_qty: u64,
-    total_sell_notional: u64,
-    base_decimals: u32,
-    price_decimals: u32,
-    position_amount: i64,
-) -> Result<(u64, u64, u64), PerpError> {
-    calc_reservation_notionals_from_totals_it(
-        buy_entries.iter().copied(),
-        sell_entries.iter().copied(),
-        total_buy_qty,
-        total_buy_notional,
-        total_sell_qty,
-        total_sell_notional,
-        base_decimals,
-        price_decimals,
-        position_amount,
-    )
-}
-
-/// Iterator form of [`calc_reservation_notionals_from_totals`] — lets a caller evaluate the
-/// reservation of a HYPOTHETICAL book (current list + one entry at its sorted slot, via `.chain`)
-/// with NO owned clone (the validate-then-apply probe in `rest_in_book`). `B`/`S: Clone` because
-/// each side is iterated twice (own-position leg + flip leg). Byte-identical to the slice form.
-#[allow(clippy::too_many_arguments)]
-pub fn calc_reservation_notionals_from_totals_it<B, S>(
-    buy_entries: B,
-    sell_entries: S,
-    total_buy_qty: u64,
-    total_buy_notional: u64,
-    total_sell_qty: u64,
-    total_sell_notional: u64,
-    base_decimals: u32,
-    price_decimals: u32,
-    position_amount: i64,
-) -> Result<(u64, u64, u64), PerpError>
-where
-    B: Iterator<Item = OrderEntry> + Clone,
-    S: Iterator<Item = OrderEntry> + Clone,
-{
-    let p = position_amount;
-    let tsq = checked_u64_to_i64(total_sell_qty, "math: total sell qty")?;
-    let tbq = checked_u64_to_i64(total_buy_qty, "math: total buy qty")?;
-
-    // B = buy leg at current position (cover the short, if any).
-    let cover_b = if p >= 0 { 0 } else { -p };
-    let b = side_leg_from_total(
-        buy_entries.clone(),
-        total_buy_notional,
-        base_decimals,
-        price_decimals,
-        cover_b,
-    )?;
-    // B′ = buy leg after all sells fill (position → most short).
-    let pos_after_sells = p
-        .checked_sub(tsq)
-        .ok_or_else(|| perp_err("math: flip-short position overflow"))?;
-    let cover_b_flip = if pos_after_sells >= 0 {
-        0
-    } else {
-        -pos_after_sells
-    };
-    let b_flip = side_leg_from_total(
-        buy_entries,
-        total_buy_notional,
-        base_decimals,
-        price_decimals,
-        cover_b_flip,
-    )?;
-    // S = sell leg at current position (cover the long, if any).
-    let cover_s = if p <= 0 { 0 } else { p };
-    let s = side_leg_from_total(
-        sell_entries.clone(),
-        total_sell_notional,
-        base_decimals,
-        price_decimals,
-        cover_s,
-    )?;
-    // S′ = sell leg after all buys fill (position → most long).
-    let pos_after_buys = p
-        .checked_add(tbq)
-        .ok_or_else(|| perp_err("math: flip-long position overflow"))?;
-    let cover_s_flip = if pos_after_buys <= 0 { 0 } else { pos_after_buys };
-    let s_flip = side_leg_from_total(
-        sell_entries,
-        total_sell_notional,
-        base_decimals,
-        price_decimals,
-        cover_s_flip,
-    )?;
-
-    let leg_short = (s as u128)
-        .checked_add(b_flip as u128)
-        .ok_or_else(|| perp_err("math: flip-short leg overflow"))?;
-    let leg_long = (b as u128)
-        .checked_add(s_flip as u128)
-        .ok_or_else(|| perp_err("math: flip-long leg overflow"))?;
-    let c_notional = u64::try_from(leg_short.max(leg_long))
-        .map_err(|_| perp_err("math: flip-aware reservation notional exceeds u64"))?;
-    Ok((b, s, c_notional))
-}
-
-#[cfg(test)]
-mod reservation_notional_tests {
-    use super::*;
-
-    fn entry(price: u64, amount: u64) -> OrderEntry {
-        OrderEntry {
-            order_id: [0u8; 32],
-            price,
-            amount,
-            maker_fee_bps: 0,
-        }
-    }
-
-    // Deterministic xorshift PRNG (no std rng in the precompile crate).
-    fn next(s: &mut u64) -> u64 {
-        *s ^= *s << 13;
-        *s ^= *s >> 7;
-        *s ^= *s << 17;
-        *s
-    }
-
-    /// #21 靶子3 GATE: the dual-cover scans must be byte-identical to two separate single-cover
-    /// scans (so `calc_reservation_notionals` stays byte-identical → commitment unchanged). Fuzzed
-    /// over random two-sided books + positions, using the SAME (position, position-after-flip)
-    /// covers `calc_reservation_notionals` feeds them.
-    #[test]
-    fn dual_matches_separate_scans() {
-        let mut s: u64 = 0x9e3779b97f4a7c15;
-        let bd = 4u32;
-        let pd = 2u32;
-        for _ in 0..5000 {
-            let nb = (next(&mut s) % 6) as usize;
-            let ns = (next(&mut s) % 6) as usize;
-            let mut buys: Vec<OrderEntry> = (0..nb)
-                .map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1))
-                .collect();
-            buys.sort_by(|a, b| b.price.cmp(&a.price)); // DESC
-            let mut sells: Vec<OrderEntry> = (0..ns)
-                .map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1))
-                .collect();
-            sells.sort_by(|a, b| a.price.cmp(&b.price)); // ASC
-            let p = (next(&mut s) % 400) as i64 - 200;
-
-            let total_buy: i64 = buys.iter().map(|e| e.amount as i64).sum();
-            let total_sell: i64 = sells.iter().map(|e| e.amount as i64).sum();
-            let pos_after_sells = p - total_sell;
-            let pos_after_buys = p + total_buy;
-
-            let (ba, bb, tb) =
-                calc_buy_side_dual(buys.iter().copied(), bd, pd, p, pos_after_sells).unwrap();
-            assert_eq!(
-                ba,
-                calc_buy_side_reserved_notional(&buys, bd, pd, p).unwrap()
-            );
-            assert_eq!(
-                bb,
-                calc_buy_side_reserved_notional(&buys, bd, pd, pos_after_sells).unwrap()
-            );
-            assert_eq!(tb, total_buy);
-
-            let (sa, sb, ts) =
-                calc_sell_side_dual(sells.iter().copied(), bd, pd, p, pos_after_buys).unwrap();
-            assert_eq!(
-                sa,
-                calc_sell_side_reserved_notional(&sells, bd, pd, p).unwrap()
-            );
-            assert_eq!(
-                sb,
-                calc_sell_side_reserved_notional(&sells, bd, pd, pos_after_buys).unwrap()
-            );
-            assert_eq!(ts, total_sell);
-        }
-    }
-
-    /// #A Step 1 GATE: the incremental `calc_reservation_notionals_from_totals` must be
-    /// BYTE-IDENTICAL to the fold `calc_reservation_notionals` over random two-sided books +
-    /// positions (so switching the call sites to it leaves the commitment/golden unchanged).
-    /// Totals are computed via `sum_side_totals` exactly as production will maintain them.
-    #[test]
-    fn from_totals_matches_fold() {
-        let mut s: u64 = 0x243f6a8885a308d3;
-        for &(bd, pd) in &[(0u32, 0u32), (4, 2), (8, 9), (3, 2)] {
-            for _ in 0..5000 {
-                let nb = (next(&mut s) % 8) as usize;
-                let ns = (next(&mut s) % 8) as usize;
-                let mut buys: Vec<OrderEntry> = (0..nb)
-                    .map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1))
-                    .collect();
-                buys.sort_by(|a, b| b.price.cmp(&a.price)); // DESC
-                let mut sells: Vec<OrderEntry> = (0..ns)
-                    .map(|_| entry(next(&mut s) % 50 + 1, next(&mut s) % 100 + 1))
-                    .collect();
-                sells.sort_by(|a, b| a.price.cmp(&b.price)); // ASC
-                let p = (next(&mut s) % 800) as i64 - 400;
-
-                let (tbq, tbn) = sum_side_totals(buys.iter().copied(), bd, pd).unwrap();
-                let (tsq, tsn) = sum_side_totals(sells.iter().copied(), bd, pd).unwrap();
-
-                let fold = calc_reservation_notionals(&buys, &sells, bd, pd, p).unwrap();
-                let incr = calc_reservation_notionals_from_totals(
-                    &buys, &sells, tbq, tbn, tsq, tsn, bd, pd, p,
-                )
-                .unwrap();
-                assert_eq!(fold, incr, "bd={bd} pd={pd} p={p} buys={buys:?} sells={sells:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn flip_aware_c_matches_worked_example() {
-        // buys = [(price 3, qty 2), (price 2, qty 1)] (DESC), sells = [(4, 1)],
-        // position = -1, base_decimals = price_decimals = 0 (values scale by
-        // QUOTE_DECIMALS = 1e6). Hand-derived:
-        //   B = B(-1)      = 3 + 2 = 5      (both buys re-open from short 1)
-        //   S = S(-1)      = 4              (sell opens short)
-        //   B' = B(-2)     = 2     (after the lone sell fills → short 2)
-        //   S' = S(+2)     = 0     (after all 3 buys fill → long 2; sell only closes)
-        //   C = max(S + B', B + S') = max(4 + 2, 5 + 0) = 6.
-        let buys = [entry(3, 2), entry(2, 1)];
-        let sells = [entry(4, 1)];
-        let (b, s, c) = calc_reservation_notionals(&buys, &sells, 0, 0, -1).unwrap();
-        assert_eq!(b, 5_000_000);
-        assert_eq!(s, 4_000_000);
-        assert_eq!(c, 6_000_000);
-        // C strictly exceeds the old max-of-side (5e6): it covers the flip.
-        assert!(c > b.max(s));
-    }
-
-    #[test]
-    fn flip_aware_c_equals_max_of_side_for_one_sided_book() {
-        // A one-sided (buy-only) book cannot flip the position the other way,
-        // so the flip-aware C collapses to the plain buy-side notional.
-        let buys = [entry(10, 3)];
-        let (b, s, c) = calc_reservation_notionals(&buys, &[], 0, 0, 0).unwrap();
-        assert_eq!(s, 0);
-        assert_eq!(c, b);
-        assert_eq!(c, b.max(s));
-    }
-
-    #[test]
-    fn flip_aware_c_is_symmetric_for_one_sided_sell_book() {
-        // Symmetric to the buy-only case: sell-only book → C == sell notional.
-        let sells = [entry(7, 4)];
-        let (b, s, c) = calc_reservation_notionals(&[], &sells, 0, 0, 0).unwrap();
-        assert_eq!(b, 0);
-        assert_eq!(c, s);
-    }
 }
 
 #[cfg(test)]
@@ -1602,22 +922,10 @@ mod margin_tier_tests {
 #[cfg(test)]
 mod open_order_margin_tests {
     use super::*;
-    use crate::types::{MarginTier, MarginTiers};
 
-    fn table(rows: &[(u64, u32)]) -> MarginTiers {
-        let v: Vec<MarginTier> = rows
-            .iter()
-            .map(|&(lower_bound_notional, max_leverage)| MarginTier {
-                lower_bound_notional,
-                max_leverage,
-            })
-            .collect();
-        MarginTiers::from_tiers(&v).unwrap()
-    }
-
-    /// `(PIM, IM, ooIM)` at an explicit leverage — the uncapped formula.
+    /// `(PIM, IM, ooIM)` at an explicit leverage.
     fn at(n: i64, bid: u64, ask: u64, lev: u64) -> (u64, u64, u64) {
-        let m = open_order_margin_at_leverage(n, bid, ask, lev).unwrap();
+        let m = open_order_margin(n, bid, ask, lev).unwrap();
         (
             m.position_initial_margin,
             m.initial_margin,
@@ -1642,7 +950,7 @@ mod open_order_margin_tests {
             i64::MIN,
         ] {
             for &lev in &[1u64, 2, 3, 7, 100] {
-                let m = open_order_margin_at_leverage(n, 0, 0, lev).unwrap();
+                let m = open_order_margin(n, 0, 0, lev).unwrap();
                 assert_eq!(m.open_order_initial_margin, 0, "n={n} lev={lev}");
                 assert_eq!(
                     m.initial_margin, m.position_initial_margin,
@@ -1716,7 +1024,7 @@ mod open_order_margin_tests {
             (2_200_001, 1_200_001),  // ask branch takes over, by exactly 1
             (2_200_002, 1_200_002),
         ] {
-            let m = open_order_margin_at_leverage(n, bid, ask, 1).unwrap();
+            let m = open_order_margin(n, bid, ask, 1).unwrap();
             assert_eq!(m.initial_margin, want, "ask={ask}");
             // ...and the max is genuinely a max, never a sum and never "one side always wins".
             let ask_branch = (n as i128 - ask as i128).unsigned_abs() as u64;
@@ -1737,72 +1045,56 @@ mod open_order_margin_tests {
     #[test]
     fn oo_im_is_a_difference_of_round_ups_not_a_round_up_of_a_difference() {
         // N = 9 long, Bid = 22 ⇒ bid branch 31, ask branch 9 ⇒ combined 31.
-        let m = open_order_margin_at_leverage(9, 22, 0, 4).unwrap();
+        let m = open_order_margin(9, 22, 0, 4).unwrap();
         assert_eq!((m.position_initial_margin, m.initial_margin), (3, 8));
         assert_eq!(m.open_order_initial_margin, 5);
         // The convenience form would say 6 — 1 unit too strict.
         assert_ne!(m.open_order_initial_margin, (31u64 - 9).div_ceil(4));
     }
 
-    /// The tier cap bites at the COMBINED notional, not the position's own. A user at leverage 10
-    /// with a small position and a large resting bid is capped by the tier the *combined* notional
-    /// lands in — which is the whole point of evaluating the cap post-fill.
+    /// **The tier table is NOT an input to ooIM.** There is exactly one ooIM definition and it
+    /// divides by the POSITION'S OWN leverage, whatever tier the combined notional lands in.
+    ///
+    /// A tier-capped second variant existed briefly (Phase 1) and was rejected — see the
+    /// "Why no tier cap" note on [`open_order_margin`]. This test pins the consequence with the
+    /// numbers that variant used to produce, so a reintroduction is a visible failure and not a
+    /// silent tightening: with `N = 999_999`, `Bid = 1` and `L = 10`, the combined notional is
+    /// exactly 1_000_000. Had a table `[(0, 10x), (1_000_000, 2x)]` been consulted, `L` would have
+    /// been capped 10 → 2 and IM would read 500_000 with ooIM 0. It does not: IM stays
+    /// `ceil(1_000_000 / 10) = 100_000` and ooIM `100_000 − ceil(999_999/10) = 100_000 − 100_000
+    /// = 0`.
     #[test]
-    fn tier_cap_uses_the_combined_notional() {
-        // Tier 0: < 1_000_000 ⇒ 10x. Tier 1: >= 1_000_000 ⇒ 2x.
-        let t = table(&[(0, 10), (1_000_000, 2)]);
-        // Position alone (999_999) is still tier 0, so the UNCAPPED formula uses L = 10.
-        let un = open_order_margin_at_leverage(999_999, 0, 0, 10).unwrap();
-        assert_eq!((un.effective_leverage, un.initial_margin), (10, 100_000));
+    fn the_position_leverage_is_used_uncapped_by_any_tier() {
+        let no_orders = open_order_margin(999_999, 0, 0, 10).unwrap();
         assert_eq!(
-            open_order_margin(&t, 999_999, 0, 0, 10).unwrap(),
-            un,
-            "no orders ⇒ combined == |N| ⇒ still tier 0, cap inert"
+            (no_orders.effective_leverage, no_orders.initial_margin),
+            (10, 100_000)
         );
-        // Add a bid of 1 ⇒ combined 1_000_000 ⇒ tier 1 ⇒ L capped 10 → 2.
-        let cap = open_order_margin(&t, 999_999, 1, 0, 10).unwrap();
-        assert_eq!(cap.effective_leverage, 2);
-        assert_eq!(cap.initial_margin, 500_000); // ceil(1_000_000 / 2)
-        assert_eq!(cap.position_initial_margin, 500_000); // ceil(999_999 / 2)
-        assert_eq!(cap.open_order_initial_margin, 0);
-        // The uncapped path at the same inputs stays at L = 10 — the two variants really differ.
+        let over_boundary = open_order_margin(999_999, 1, 0, 10).unwrap();
         assert_eq!(
-            open_order_margin_at_leverage(999_999, 1, 0, 10)
-                .unwrap()
-                .initial_margin,
-            100_000
+            over_boundary.effective_leverage, 10,
+            "leverage must NOT be lowered by the combined notional"
         );
-        // Exactly ON the boundary is tier 1 (`>=`), one below is tier 0 — same convention as
-        // `max_leverage_for_notional` / `maintenance_margin`.
-        assert_eq!(
-            open_order_margin(&t, 0, 999_999, 0, 10)
-                .unwrap()
-                .effective_leverage,
-            10
+        assert_eq!(over_boundary.initial_margin, 100_000); // ceil(1_000_000 / 10)
+        assert_ne!(
+            over_boundary.initial_margin, 500_000,
+            "500_000 is the tier-capped answer the rejected variant gave"
         );
+        // The only leverage input is the argument: the same inputs at L = 2 DO give the capped
+        // numbers, proving the difference above is the leverage and nothing else.
+        let at_two = open_order_margin(999_999, 1, 0, 2).unwrap();
         assert_eq!(
-            open_order_margin(&t, 0, 1_000_000, 0, 10)
-                .unwrap()
-                .effective_leverage,
-            2
-        );
-        // The cap only ever LOWERS: a user already below the cap is untouched.
-        assert_eq!(
-            open_order_margin(&t, 0, 1_000_000, 0, 1)
-                .unwrap()
-                .effective_leverage,
-            1
+            (at_two.initial_margin, at_two.position_initial_margin),
+            (500_000, 500_000)
         );
     }
 
-    /// Leverage 0 is floored at 1 (as `set_reservations` does) rather than dividing by zero, and
-    /// the tier-capped entry point inherits that floor even if a corrupt tier says `max_leverage
-    /// = 0`.
+    /// Leverage 0 is floored at 1 rather than dividing by zero (a defaulted or corrupt
+    /// `pos.leverage` must not trap).
     #[test]
     fn zero_leverage_is_floored_at_one() {
         assert_eq!(at(0, 1_000, 0, 0), (0, 1_000, 1_000));
-        let t = table(&[(0, 0)]);
-        let m = open_order_margin(&t, 0, 1_000, 0, 5).unwrap();
+        let m = open_order_margin(0, 1_000, 0, 0).unwrap();
         assert_eq!((m.effective_leverage, m.initial_margin), (1, 1_000));
     }
 
@@ -1810,10 +1102,10 @@ mod open_order_margin_tests {
     /// `u64` after a leverage-1 divide, so the narrowing must reject.
     #[test]
     fn saturating_inputs_error_rather_than_wrap() {
-        assert!(open_order_margin_at_leverage(i64::MAX, u64::MAX, 0, 1).is_err());
-        assert!(open_order_margin_at_leverage(i64::MIN, 0, u64::MAX, 1).is_err());
+        assert!(open_order_margin(i64::MAX, u64::MAX, 0, 1).is_err());
+        assert!(open_order_margin(i64::MIN, 0, u64::MAX, 1).is_err());
         // ...but the same inputs at a big enough leverage fit, and stay ordered.
-        let m = open_order_margin_at_leverage(i64::MAX, u64::MAX, 0, 4).unwrap();
+        let m = open_order_margin(i64::MAX, u64::MAX, 0, 4).unwrap();
         assert!(m.initial_margin >= m.position_initial_margin);
     }
 
@@ -1834,7 +1126,7 @@ mod open_order_margin_tests {
             let bid = next(&mut s) % 4_000_000_000;
             let ask = next(&mut s) % 4_000_000_000;
             let lev = next(&mut s) % 100 + 1;
-            let m = open_order_margin_at_leverage(n, bid, ask, lev).unwrap();
+            let m = open_order_margin(n, bid, ask, lev).unwrap();
             assert!(
                 m.initial_margin >= m.position_initial_margin,
                 "n={n} bid={bid} ask={ask} lev={lev}: IM {} < PIM {}",

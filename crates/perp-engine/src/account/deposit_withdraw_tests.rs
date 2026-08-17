@@ -349,7 +349,6 @@ fn get_account_reports_available_wallet_net_of_allocations() {
         1,
         &crate::types::PerpPosition {
             margin: 40,
-            margin_reserved: 10,
             ..Default::default()
         },
     )
@@ -358,9 +357,11 @@ fn get_account_reports_available_wallet_net_of_allocations() {
         .unwrap()
         .unwrap();
 
-    // getAccount reports the AVAILABLE wallet only. The former `total_perp_collateral` aggregate
-    // (available + position margin/reservations = 100 here) is no longer stored or returned —
-    // consumers derive it from getAccount + getPosition off-chain.
+    // getAccount reports the DERIVED available: `perp_wallet_balance - Σ ooIM`. Position margin
+    // is already out of the wallet (it was debited at open), and this fixture has no resting
+    // orders, so `Σ ooIM` is 0 and the answer is the wallet itself. The former
+    // `total_perp_collateral` aggregate is no longer stored or returned — consumers derive it
+    // from getAccount + getPosition off-chain.
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
     let (_, available) = decode_get_account(&ret);
     assert_eq!(available, 45);
@@ -393,7 +394,9 @@ fn successful_call_emits_one_final_balance_after_image() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].user, ALICE);
     assert_eq!(events[0].usdcBalance, amount);
-    assert_eq!(events[0].availablePerpBalance, 0);
+    // The event carries the CROSS wallet (renamed from `availablePerpBalance` with the escrow
+    // removal): a deposit only moves spot USDC, so the perp wallet is still 0.
+    assert_eq!(events[0].perpWalletBalance, 0);
 }
 
 #[test]

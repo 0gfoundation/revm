@@ -40,7 +40,15 @@ use primitives::{B256, U256};
 // user enters or leaves a market. Purely ADDITIVE: no existing blob's layout or value changes and
 // no execution rule moves (the golden BusinessSnapshot is unchanged), but the delta gains keys, so
 // the commitment shifts. CHAIN change: golden re-pin (below) + a coordinated wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 17;
+// Derived open-order margin (Phase 2): bumped 17→18 — the open-order margin ESCROW is DELETED.
+// `PerpPosition` loses six fields ("mr", "mrn", "br", "brn", "sr", "srn"), so every stored
+// position blob shortens and its later fields shift; and placement/cancel/fill/setLeverage no
+// longer move the wallet for a reservation, so the account values folded into the delta differ
+// too. Both a LAYOUT and an EXECUTION-RULE change. The open-order requirement is now DERIVED on
+// read (`ooIM = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) − ROUND_UP(|N| / L)`) and merely
+// subtracted at the admission gate. CHAIN change: golden re-pin (below) + a coordinated wipe on
+// deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 18;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

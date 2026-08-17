@@ -571,7 +571,12 @@ fn set_leverage_core<H: PerpHost>(
 
 // ── Positions ─────────────────────────────────────────────────────────────────
 
-/// `getPosition(address user, uint64 marketId) returns (int64 amount, int64 vQuoteBalance, int64 margin, uint64 marginReserved, uint64 leverage)`
+/// `getPosition(address user, uint64 marketId) returns (int64 amount, int64 vQuoteBalance, int64 margin, uint64 openOrderMargin, uint64 leverage)`
+///
+/// `openOrderMargin` is DERIVED (`getMarginInfo`'s `openOrderInitialMargin`), not stored: the
+/// escrow field that used to occupy this slot is gone. It needs the market's mark price and
+/// decimals, hence the extra `load_market_ref`; an unknown market yields `0` rather than a revert,
+/// preserving this view's "reads back all zeros for a user with nothing here" behaviour.
 pub fn run_get_position<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -580,12 +585,16 @@ pub fn run_get_position<H: PerpHost>(
         .map_err(|_| perp_err("getPosition: invalid calldata"))?;
 
     let pos = storage::load_position_ref(context, args.user, args.marketId)?;
+    let open_order_margin = match storage::load_market_ref(context, args.marketId)? {
+        Some(market) => crate::margin_view::position_open_order_margin(&market, &pos)?,
+        None => 0,
+    };
     Ok(Bytes::from(getPositionCall::abi_encode_returns(
         &getPositionReturn {
             amount: pos.amount,
             vQuoteBalance: pos.v_quote_balance,
             margin: pos.margin,
-            marginReserved: pos.margin_reserved,
+            openOrderMargin: open_order_margin,
             leverage: pos.leverage,
         },
     )))
@@ -617,21 +626,12 @@ pub fn run_add_position_margin<H: PerpHost>(
     // leaves the IF untouched. The credit/charge lands on the in-memory `pos.margin` — funding is
     // isolated to the position and never touches the account-global wallet.
     let pending_funding = compute_funding_settlement(context, caller, &market, &mut pos)?;
-    // Derived-ooIM Phase 1 dual gate (debug only). This is a CASH move (wallet → position
-    // margin), not an open-order requirement: it changes neither `Bid`/`Ask` nor `N` nor `L`, so
-    // Σ ooIM is unchanged and the derived requirement is the same `amount` the escrow basis asks
-    // for. The two decisions can still differ, because the two AVAILABLES differ by
-    // `Σ margin_reserved − Σ ooIM`. That is exactly what this probe is here to detect.
-    #[cfg(debug_assertions)]
-    crate::margin_view::debug_assert_gates_agree(
-        context,
-        caller,
-        "addPositionMargin",
-        Some(args.marketId),
-        args.amount,
-        args.amount as i128,
-    );
-    if !account.has_available_perp(args.amount) {
+    // Derived-ooIM gate. A CASH move (wallet → position margin), not an open-order requirement:
+    // it changes neither `Bid`/`Ask` nor `N` nor `L`, so Σ ooIM is unchanged and the requirement
+    // is exactly `amount`. It must come out of AVAILABLE, not the raw wallet — otherwise a user
+    // could park their whole balance in position margin out from under their resting orders.
+    let available = crate::margin_view::derived_available_balance(context, caller)?;
+    if !crate::margin_view::derived_can_afford(available, args.amount as i128) {
         return Err(perp_err(
             "addPositionMargin: insufficient perp wallet balance",
         ));
@@ -1029,61 +1029,41 @@ fn run_liquidation_sweep<H: PerpHost>(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// `market` is consumed only by the derived-ooIM Phase 1 dual gate (mark price + tier table +
-/// decimals), which is compiled out of release builds — hence the conditional `unused_variables`.
-#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+/// Gate a leverage change on the DERIVED open-order requirement it would create.
+///
+/// Under the escrow this function MOVED MONEY: the reservation was `c_notional / leverage`, so
+/// raising leverage released wallet cash and lowering it debited more. Nothing is escrowed any
+/// more, so nothing moves here — but the requirement still changes, because `ooIM` divides by
+/// `L`. Lowering leverage raises `Σ ooIM` and must be refused when the account cannot carry it;
+/// raising leverage lowers it and is always free.
+///
+/// `Bid`/`Ask`/`N` are untouched by `setLeverage` (it moves neither the position nor the book), so
+/// "before" is the stored position and "after" is the same position at `new_leverage` — the only
+/// input that differs is the divisor. Pure read + reject: zero writes on either outcome, so this
+/// may precede every write on the path (commit-only).
 fn rebalance_order_margin_for_leverage<H: PerpHost>(
     context: &mut H,
     user: Address,
     market: &crate::types::Market,
-    pos: &mut crate::types::PerpPosition,
+    pos: &crate::types::PerpPosition,
     new_leverage: u64,
 ) -> Result<(), PerpError> {
-    // Re-derive the reservation from the unchanged stored notionals at the new
-    // leverage via the single source of truth, then reconcile the wallet by the
-    // change in the flip-aware reservation. The notionals (per-side B/S and the
-    // flip-aware c_notional held in margin_reserved_notional) are
-    // leverage-independent — setLeverage changes neither the position nor the
-    // book — so only the /leverage divisor changes and no book reload is needed.
-    let old_reserved = pos.margin_reserved;
-    let buy_notional = pos.buy_side_reserved_notional;
-    let sell_notional = pos.sell_side_reserved_notional;
-    let c_notional = pos.margin_reserved_notional;
-    pos.set_reservations(buy_notional, sell_notional, c_notional, new_leverage);
-    let new_reserved = pos.margin_reserved;
-
-    if new_reserved > old_reserved {
-        let delta = new_reserved - old_reserved;
-        // Derived-ooIM Phase 1 dual gate (debug only). setLeverage moves neither the position nor
-        // the book, so `Bid`/`Ask`/`N` are unchanged and the ONLY thing that moves ooIM is the
-        // leverage divisor: "before" is the stored position, "after" is it at `new_leverage`.
-        #[cfg(debug_assertions)]
-        {
-            let before = (*storage::load_position_ref(context, user, market.market_id)?).clone();
-            let mut after = before.clone();
-            after.leverage = new_leverage;
-            let d = crate::margin_view::derived_requirement_delta(market, &before, &after)
-                .expect("dual gate: ooIM delta");
-            crate::margin_view::debug_assert_gates_agree(
-                context,
-                user,
-                "setLeverage: order-margin rebalance",
-                Some(market.market_id),
-                delta,
-                d,
-            );
-        }
-        // validate-then-apply: the availability reject is a READ-ONLY precheck (mutate_account
-        // always writes, so a rejecting closure would write-on-reject). Reject → zero write.
-        if !storage::load_account_ref(context, user)?.has_available_perp(delta) {
-            return Err(perp_err(
-                "setLeverage: insufficient perp wallet for order margin",
-            ));
-        }
-        storage::mutate_account_balance(context, user, |a| a.debit_perp(delta))??;
-    } else if old_reserved > new_reserved {
-        let delta = old_reserved - new_reserved;
-        storage::mutate_account_balance(context, user, |a| a.credit_perp(delta))??;
+    let mut after = pos.clone();
+    after.leverage = new_leverage;
+    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
+    // The available is measured on the CURRENT (pre-change) state, which is what `delta` is the
+    // increment to — with the caller's in-memory `pos` overriding storage for this market, since
+    // it is not written until after this gate. A non-positive delta is free (`derived_can_afford`).
+    let available = crate::margin_view::derived_available_balance_with(
+        context,
+        user,
+        None,
+        Some((market.market_id, pos)),
+    )?;
+    if !crate::margin_view::derived_can_afford(available, delta) {
+        return Err(perp_err(
+            "setLeverage: insufficient perp wallet for order margin",
+        ));
     }
     Ok(())
 }
@@ -1262,21 +1242,12 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
         record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, best_ask)?;
     }
 
-    // Recalculate reserves (now 0 since all orders cancelled). Margin is the only escrow a
-    // resting order holds — the trading fee is charged at fill time from the margin the fill
-    // funds, never withheld at placement — so the whole reservation goes straight back.
+    // Both order lists were cleared → `Bid = Ask = 0`, so this position's derived open-order
+    // requirement drops to 0 by itself. NOTHING is credited back to the wallet: a resting order
+    // escrows nothing (neither margin nor fee), so a cancel — including this cancel-all — moves
+    // no money at all. It only shrinks `Σ ooIM`, i.e. frees AVAILABLE, not balance.
     let mut pos = storage::load_position(context, user, market_id)?;
-    let released = pos.margin_reserved;
-    if released > 0 {
-        // In-place credit (no UserAccount/String load+save clone pair).
-        storage::mutate_account_balance(context, user, |a| a.credit_perp(released))??;
-    }
-    pos.set_reservations(0, 0, 0, pos.leverage);
-    // #A: both order lists were cleared → the maintained reservation aggregates are now 0.
-    pos.total_buy_qty = 0;
-    pos.total_buy_notional = 0;
-    pos.total_sell_qty = 0;
-    pos.total_sell_notional = 0;
+    pos.clear_side_aggregates();
     storage::save_position(context, user, market_id, &pos)?;
 
     Ok(())
@@ -1301,17 +1272,9 @@ pub fn run_deposit_insurance_fund<H: PerpHost>(
     }
 
     let mut account = storage::load_account(context, caller)?;
-    // Derived-ooIM Phase 1 dual gate (debug only) — a pure cash-out, see `addPositionMargin`.
-    #[cfg(debug_assertions)]
-    crate::margin_view::debug_assert_gates_agree(
-        context,
-        caller,
-        "depositInsuranceFund",
-        None,
-        args.amount,
-        args.amount as i128,
-    );
-    if !account.has_available_perp(args.amount) {
+    // Derived-ooIM gate — a pure cash-out, see `addPositionMargin`.
+    let available = crate::margin_view::derived_available_balance(context, caller)?;
+    if !crate::margin_view::derived_can_afford(available, args.amount as i128) {
         return Err(perp_err(
             "depositInsuranceFund: insufficient perp wallet balance",
         ));

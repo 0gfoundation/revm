@@ -1,32 +1,35 @@
-//! Derived margin read layer — Binance-shaped margin reporting, computed on demand.
+//! Derived margin layer — the single source of every open-order margin number in the engine.
 //!
 //! # What this is
 //!
 //! Binance USDⓈ-M stores only a small ledger (`walletBalance`, per-position `isolatedWallet`,
-//! `positionAmt`, `entryPrice`) and **derives** every margin quantity on read. We instead
-//! **store** five quantities Binance derives — `margin_reserved`, `margin_reserved_notional`,
-//! `buy/sell_side_margin_reserved`, `buy/sell_side_reserved_notional` — and physically debit
-//! the wallet for them at placement.
+//! `positionAmt`, `entryPrice`) and **derives** every margin quantity on read. We now do the same:
+//! the six escrow fields this module used to merely *report against* (`margin_reserved`,
+//! `margin_reserved_notional`, `buy/sell_side_margin_reserved`, `buy/sell_side_reserved_notional`)
+//! are GONE, nothing is debited from the wallet when an order rests, and the open-order
+//! requirement is computed here, on demand, from `(N, Bid, Ask, L)`.
 //!
-//! This module does **not** change that. It is a **pure read layer** that reports the
-//! Binance-shaped numbers alongside ours, so that
+//! So this is no longer a pure read layer: [`derived_available_balance`] is the **admission
+//! basis** every money-out gate in the engine now asks. It still writes nothing — every loader it
+//! calls is a `_ref` (cache-fill, never dirty-mark) reader, so it enters no key into the block
+//! delta — but its ANSWER now decides accept/reject.
 //!
-//! 1. integrators get the fields they actually compare against, and
-//! 2. we can MEASURE the gap between Binance's formulas and our escrow before deciding
-//!    whether to restructure enforcement.
+//! ```text
+//! ooIM(market)   = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) − ROUND_UP(|N| / L)
+//! available      = perp_wallet_balance − Σ_markets ooIM(market)
+//! ```
 //!
-//! It stores nothing, moves no money, and changes no execution rule. Every loader it calls is
-//! one of the `_ref` (cache-fill, never dirty-mark) readers, so no key enters the block delta
-//! and the commitment is untouched.
+//! summed over the per-user market index (the only enumerable set of a user's markets).
+//! `perp_wallet_balance` is the analogue of Binance's `crossWalletBalance`: position margin has
+//! been physically moved out of it, the open-order requirement has NOT.
 //!
 //! # Formula source
 //!
 //! `misc/binance-margin-verified-model.md` §1.1 (the formula set) and §2 (the rounding model),
 //! plus `misc/binance-v3-account-balance-field-reference.md` §2/§4 (field-by-field, with the
 //! discriminating mainnet samples). Every rounding mode below cites the evidence that settled
-//! it. Two behaviours of Binance's are deliberately **not** copied — see
-//! [`run_get_account_margin`] (`availableBalance` is not clamped at zero) and the ABI comment
-//! on `getMarginInfo` (the inputs are returned, so the outputs are locally checkable).
+//! it. One behaviour of Binance's is deliberately **not** copied — see [`run_get_account_margin`]
+//! (`availableBalance` is not clamped at zero).
 
 use alloy_sol_types::SolCall;
 use primitives::{Address, Bytes};
@@ -37,10 +40,7 @@ use crate::{
     interface::IPerpDex::{
         getAccountMarginCall, getAccountMarginReturn, getMarginInfoCall, getMarginInfoReturn,
     },
-    math::{
-        calc_value_i64, checked_u64_to_i64, maintenance_margin, open_order_margin,
-        open_order_margin_at_leverage,
-    },
+    math::{calc_value_i64, checked_u64_to_i64, maintenance_margin, open_order_margin},
     storage, PerpError,
 };
 
@@ -95,21 +95,8 @@ pub struct MarginInfo {
     pub open_order_initial_margin: u64,
     /// `ROUND_UP(max(|N + Bid|, |N − Ask|) / L)` — the joint requirement.
     pub initial_margin: u64,
-    /// `open_order_initial_margin` recomputed with the leverage TIER-CAPPED at the combined
-    /// notional ([`math::open_order_margin`]). NOT part of the `getMarginInfo` ABI — Binance
-    /// reports its numbers at the position's own `leverage`, and this read layer reports
-    /// Binance's numbers. This field exists for the derived-ooIM ADMISSION path, which is the
-    /// one place the cap belongs: see [`total_open_order_initial_margin`].
-    ///
-    /// Equal to `open_order_initial_margin` whenever the position's leverage is already within
-    /// the combined notional's tier — which is the common case, since `setLeverage` caps against
-    /// the tier table at the time it is called.
-    pub open_order_initial_margin_tier_capped: u64,
     /// Maintenance margin at `N` under this market's tier table.
     pub maint_margin: u64,
-    // ── ours, for comparison ──
-    /// What our engine has ACTUALLY escrowed for this position's resting orders.
-    pub margin_reserved_actual: u64,
     /// The position's own allocated margin — our `isolatedWallet`.
     pub position_margin: i64,
 }
@@ -124,12 +111,8 @@ pub struct MarginInfo {
 ///
 /// `Bid`/`Ask` come from the maintained per-side aggregates on `pos` (proven equal to the
 /// resting-order fold; see [`compute_margin_info`]), `N` from `pos.amount` at `market.mark_price`,
-/// and `L` from `pos.leverage`.
-///
-/// Returns both leverage variants because they are wanted by different callers and share every
-/// input: `binance` is at the position's own leverage (what the read path reports),
-/// `tier_capped_oo_im` re-derives ooIM with the tier cap applied at the combined notional (what
-/// the admission path enforces).
+/// and `L` from `pos.leverage` — UNCAPPED by the tier table (see the "Why no tier cap" note on
+/// [`crate::math::open_order_margin`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PositionDerivedMargin {
     /// `N` — signed position notional at MARK, truncated toward zero.
@@ -138,10 +121,8 @@ pub struct PositionDerivedMargin {
     pub bid_notional: u64,
     /// `Ask` — the same over resting sells.
     pub ask_notional: u64,
-    /// PIM / IM / ooIM at the position's own leverage, UNCAPPED by the tier table.
-    pub binance: crate::math::OpenOrderMargin,
-    /// ooIM with the leverage tier-capped at the combined notional.
-    pub tier_capped_oo_im: u64,
+    /// PIM / IM / ooIM at the position's own leverage.
+    pub margin: crate::math::OpenOrderMargin,
 }
 
 /// Compute [`PositionDerivedMargin`] for one `(market, position)`. Pure function, no storage.
@@ -149,7 +130,6 @@ pub fn position_derived_margin(
     market: &crate::types::Market,
     pos: &crate::types::PerpPosition,
 ) -> Result<PositionDerivedMargin, PerpError> {
-    let leverage = pos.leverage.max(1);
     let signed_notional = calc_value_i64(
         market.mark_price,
         pos.amount,
@@ -161,21 +141,26 @@ pub fn position_derived_margin(
         signed_notional,
         bid_notional,
         ask_notional,
-        binance: open_order_margin_at_leverage(
+        margin: open_order_margin(
             signed_notional,
             bid_notional,
             ask_notional,
-            leverage,
+            // `pos.leverage` may be a defaulted/corrupt 0; `open_order_margin` floors it at 1.
+            pos.leverage,
         )?,
-        tier_capped_oo_im: open_order_margin(
-            &market.tiers,
-            signed_notional,
-            bid_notional,
-            ask_notional,
-            leverage,
-        )?
-        .open_order_initial_margin,
     })
+}
+
+/// `ooIM` for one `(market, position)` — the requirement the position's RESTING ORDERS add, on
+/// top of what the position alone already needs. The quantity every gate sums.
+#[inline]
+pub fn position_open_order_margin(
+    market: &crate::types::Market,
+    pos: &crate::types::PerpPosition,
+) -> Result<u64, PerpError> {
+    Ok(position_derived_margin(market, pos)?
+        .margin
+        .open_order_initial_margin)
 }
 
 /// Compute [`MarginInfo`] for one `(user, market)`. Pure: reads only, no writes.
@@ -191,7 +176,7 @@ pub fn compute_margin_info<H: PerpHost>(
         .ok_or_else(|| perp_err("getMarginInfo: unknown market"))?;
     let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
     let pos = storage::load_position_ref(context, user, market_id)?;
-    // `PerpPosition::set_reservations` floors leverage at 1; do the same here so a defaulted or
+    // Leverage is floored at 1 here as it is inside `open_order_margin`, so a defaulted or
     // corrupt 0 divides as 1 rather than trapping.
     let leverage = pos.leverage.max(1);
 
@@ -263,10 +248,9 @@ pub fn compute_margin_info<H: PerpHost>(
         .ok_or_else(|| perp_err("getMarginInfo: isolated margin overflow"))?;
 
     // ── positionInitialMargin / initialMargin / openOrderInitialMargin ──────────────────
-    // The formula itself lives in `math::open_order_margin_at_leverage` — ONE implementation,
-    // shared verbatim with the derived-ooIM admission path (`total_open_order_initial_margin`
-    // below). Everything above this line is this layer's job: turning storage into the four pure
-    // inputs `(N, Bid, Ask, L)`.
+    // The formula itself lives in `math::open_order_margin` — ONE implementation, shared
+    // verbatim with the admission path (`total_open_order_initial_margin` below). Everything above
+    // this line is this layer's job: turning storage into the four pure inputs `(N, Bid, Ask, L)`.
     //
     //   PIM  = ROUND_UP(|N| / L)
     //   IM   = ROUND_UP( max(|N + Bid|, |N − Ask|) / L )
@@ -285,10 +269,9 @@ pub fn compute_margin_info<H: PerpHost>(
     // NOTE this deliberately mixes bases: `N` is at MARK, `Bid`/`Ask` are at each order's LIMIT
     // price. That is Binance's formula, and this layer reports Binance's numbers.
     //
-    // At the position's OWN leverage, deliberately UNCAPPED by the tier table: Binance derives
-    // `initialMargin` from the position's `leverage` field, so applying the cap here would make
-    // the reported number stop being Binance's. The tier-capped variant is computed separately
-    // below for the admission path.
+    // At the position's OWN leverage, UNCAPPED by the tier table: Binance derives `initialMargin`
+    // from the position's `leverage` field. There is only one ooIM definition — this is the same
+    // number the admission gate enforces, not a parallel "reported" one.
     let derived =
         position_derived_margin(&market, &pos).map_err(|e| relabel_derived(e, "getMarginInfo"))?;
     debug_assert_eq!(
@@ -300,10 +283,9 @@ pub fn compute_margin_info<H: PerpHost>(
         (signed_notional, bid_notional, ask_notional),
         "position_derived_margin must consume the same (N, Bid, Ask) this function reports"
     );
-    let position_initial_margin = derived.binance.position_initial_margin;
-    let initial_margin = derived.binance.initial_margin;
-    let open_order_initial_margin = derived.binance.open_order_initial_margin;
-    let open_order_initial_margin_tier_capped = derived.tier_capped_oo_im;
+    let position_initial_margin = derived.margin.position_initial_margin;
+    let initial_margin = derived.margin.initial_margin;
+    let open_order_initial_margin = derived.margin.open_order_initial_margin;
 
     // ── maintMargin ─────────────────────────────────────────────────────────────────────
     // Binance: `trunc(N × MMR − cum)` with the tier recursion
@@ -332,17 +314,15 @@ pub fn compute_margin_info<H: PerpHost>(
         position_initial_margin,
         open_order_initial_margin,
         initial_margin,
-        open_order_initial_margin_tier_capped,
         maint_margin,
-        margin_reserved_actual: pos.margin_reserved,
         position_margin: pos.margin,
     })
 }
 
-// ── Derived-ooIM admission basis (Phase 1: computed, not enforced) ───────────────────────────
+// ── Derived-ooIM admission basis (the live enforcement gate) ─────────────────────────────────
 
 /// `Σ_markets ooIM` for `user`, over the per-user market index — the account-level open-order
-/// requirement on the DERIVED basis.
+/// requirement.
 ///
 /// Enumerates exactly the markets the user is active in (non-zero position OR at least one
 /// resting order), which is precisely the support of the sum: a market the user has left
@@ -350,10 +330,11 @@ pub fn compute_margin_info<H: PerpHost>(
 /// there is no other way to enumerate a user's markets, and walking every market on the exchange
 /// would be unbounded.
 ///
-/// Uses the TIER-CAPPED variant ([`math::open_order_margin`]): this is an enforcement quantity,
-/// so a user must not be able to buy a lower requirement by holding a leverage the combined
-/// notional's tier no longer permits. The Binance-parity read path deliberately reports the
-/// uncapped one; see [`MarginInfo::open_order_initial_margin_tier_capped`].
+/// `override_market` substitutes an IN-MEMORY position for one market id, so a caller can price
+/// the state it is ABOUT to write (the hypothetical post-placement position) or the state a match
+/// is holding in its registry working copy, without touching storage. When the overridden id is
+/// not yet in the index — a user entering a market — its term is added anyway, which is exactly
+/// what the placement gate needs.
 ///
 /// Pure read — every loader it reaches is a `_ref` (cache-fill, never dirty-mark) reader, so it
 /// enters no key into the block delta and cannot move the commitment. Returns `u128` so the fold
@@ -361,176 +342,107 @@ pub fn compute_margin_info<H: PerpHost>(
 pub fn total_open_order_initial_margin<H: PerpHost>(
     context: &mut H,
     user: Address,
+    override_market: Option<(u64, &crate::types::PerpPosition)>,
 ) -> Result<u128, PerpError> {
     let markets = storage::load_user_markets_ref(context, user)?;
     let mut total: u128 = 0;
+    let mut applied_override = false;
     for market_id in markets.iter().copied() {
         // The index is a set, so no id repeats and no term is double-counted.
-        total += compute_margin_info(context, user, market_id)?
-            .open_order_initial_margin_tier_capped as u128;
+        let market = storage::load_market_ref(context, market_id)?.ok_or_else(|| {
+            crate::errors::perp_invariant_err(format!(
+                "derived margin: user market index holds unknown market {market_id}"
+            ))
+        })?;
+        total += match override_market {
+            Some((id, pos)) if id == market_id => {
+                applied_override = true;
+                position_open_order_margin(&market, pos)?
+            }
+            _ => {
+                let pos = storage::load_position_ref(context, user, market_id)?;
+                position_open_order_margin(&market, &pos)?
+            }
+        } as u128;
+    }
+    if let Some((id, pos)) = override_market {
+        if !applied_override {
+            // Entering a market: the index is only written at save time, so the id the caller is
+            // pricing is legitimately absent. A market that does not exist contributes nothing
+            // (the placement path rejects an unknown market long before this point).
+            if let Some(market) = storage::load_market_ref(context, id)? {
+                total += position_open_order_margin(&market, pos)? as u128;
+            }
+        }
     }
     Ok(total)
 }
 
-/// `Σ_markets pos.margin_reserved` for `user` — the account-level escrow that has ALREADY been
-/// physically debited from `perp_wallet_balance`, over the same index.
-///
-/// This is the gross-up term. `margin_reserved` is exactly what `debit_perp` moved: placement
-/// debits the DELTA of `margin_reserved` and cancel/fill credits it back, so the running sum of
-/// those deltas is the current value of the field. It is the FLIP-AWARE combined reservation
-/// `c_notional / leverage` (`max(S + B', B + S')`), NOT the sum of the two per-side fields —
-/// `buy_side_margin_reserved` and `sell_side_margin_reserved` are informational and are used only
-/// as a cancel-ordering heuristic (see `PerpPosition::set_reservations`). Summing those instead
-/// would over-count a two-sided book.
-pub fn total_margin_reserved<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-) -> Result<u128, PerpError> {
-    let markets = storage::load_user_markets_ref(context, user)?;
-    let mut total: u128 = 0;
-    for market_id in markets.iter().copied() {
-        total += storage::load_position_ref(context, user, market_id)?.margin_reserved as u128;
-    }
-    Ok(total)
-}
-
-/// The user's available balance on the DERIVED basis, grossed up out of the escrow basis.
-///
-/// # The double-count trap
-///
-/// During Phase 1 the escrow is STILL ACTIVE, so `perp_wallet_balance` has ALREADY been debited
-/// by every reservation. `perp_wallet_balance − Σ ooIM` would therefore subtract the open-order
-/// requirement TWICE — once physically (escrow), once arithmetically (derived). The escrow must
-/// be added back first:
+/// The user's available balance — **the admission basis**.
 ///
 /// ```text
-/// wallet_gross  = perp_wallet_balance + Σ_markets pos.margin_reserved
-/// available_new = wallet_gross − Σ_markets ooIM
+/// available = perp_wallet_balance − Σ_markets ooIM
 /// ```
 ///
-/// `wallet_gross` is the analogue of Binance's `crossWalletBalance`; `available_new` of their
-/// `availableBalance`. In Phase 2, when the escrow is deleted, the gross-up term becomes
-/// identically zero and this collapses to `perp_wallet_balance − Σ ooIM`.
+/// There is no gross-up term. Phase 1 needed one (`+ Σ margin_reserved`) because the escrow had
+/// ALREADY been debited from the wallet, so subtracting Σ ooIM on top would have charged the
+/// open-order requirement twice. Nothing is debited any more: `perp_wallet_balance` IS the gross
+/// (Binance's `crossWalletBalance`), and adding anything back here would re-open that
+/// double-count from the other side.
 ///
-/// Signed and unclamped, in `i128`: the comparison the caller makes is against a `u64`
-/// requirement, and clamping at zero would hide exactly the under-coverage the gate exists to
-/// detect.
+/// Signed and unclamped, in `i128`: clamping at zero would hide exactly the under-coverage the
+/// gate exists to detect, and a mark move alone can legitimately push it negative.
 pub fn derived_available_balance<H: PerpHost>(
     context: &mut H,
     user: Address,
 ) -> Result<i128, PerpError> {
-    let wallet = storage::load_account_ref(context, user)?.perp_wallet_balance as i128;
-    let gross = wallet + total_margin_reserved(context, user)? as i128;
-    Ok(gross - total_open_order_initial_margin(context, user)? as i128)
+    derived_available_balance_with(context, user, None, None)
 }
 
-/// `ooIM(after) − ooIM(before)` for one market on the TIER-CAPPED basis — the marginal derived
-/// requirement of an operation that changes a position's resting-order aggregates.
+/// [`derived_available_balance`] with in-memory overrides for the wallet and/or one market's
+/// position — the form the fill paths need, where the authoritative values live in a registry
+/// working copy that has not been flushed yet.
+pub fn derived_available_balance_with<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    wallet_override: Option<i64>,
+    override_market: Option<(u64, &crate::types::PerpPosition)>,
+) -> Result<i128, PerpError> {
+    let wallet = match wallet_override {
+        Some(w) => w,
+        None => storage::load_account_ref(context, user)?.perp_wallet_balance,
+    };
+    Ok(wallet as i128 - total_open_order_initial_margin(context, user, override_market)? as i128)
+}
+
+/// The affordability test on the derived basis: `available >= requirement`, with a NON-POSITIVE
+/// requirement always affordable.
 ///
-/// Signed: the tier cap can lower the effective leverage as the combined notional grows, which
-/// raises PIM as well as IM, so `ooIM = IM − PIM` is not monotone in `Bid`/`Ask` in general.
-#[cfg(debug_assertions)]
+/// That exemption is the derived-basis restatement of the `has_available_perp(0) == true`
+/// invariant (B1): **a risk-reducing or zero-cost action must never be gated on a balance the
+/// user does not need.** `available` is signed and can be legitimately negative — a mark move
+/// alone can push it there with no action by the user — so without the exemption a user in that
+/// state would be refused precisely the operations that would REDUCE their risk: a pure-reduce
+/// order (whose `Δ ooIM` is ≤ 0), a close, a cancel-driven cover. It widens no hole: every
+/// POSITIVE requirement is still refused unless `available` covers it in full.
+#[inline]
+pub fn derived_can_afford(available: i128, requirement: i128) -> bool {
+    requirement <= 0 || available >= requirement
+}
+
+/// `ooIM(after) − ooIM(before)` for one market — the marginal derived requirement of an operation
+/// that changes a position's resting-order aggregates, its size, or its leverage.
+///
+/// Signed: an order that reduces net exposure lowers ooIM, and a fill that grows the position can
+/// lower it too (a resting sell against a bigger long nets further). A non-positive delta is free
+/// (see [`derived_can_afford`]).
 pub fn derived_requirement_delta(
     market: &crate::types::Market,
     before: &crate::types::PerpPosition,
     after: &crate::types::PerpPosition,
 ) -> Result<i128, PerpError> {
-    Ok(
-        position_derived_margin(market, after)?.tier_capped_oo_im as i128
-            - position_derived_margin(market, before)?.tier_capped_oo_im as i128,
-    )
-}
-
-/// **Phase 1 dual gate.** Compare the DERIVED admission basis against the live ESCROW check at
-/// one admission point, and panic if they disagree for a reason that is not one of the two
-/// characterised mechanisms.
-///
-/// # What this asserts, and why it is not simply "the two agree"
-///
-/// It is not, because they do not. The escrow and the derived requirement are DIFFERENT
-/// FUNCTIONS of the same state, and a suite-wide census (5099 gate evaluations across the whole
-/// test suite) measured them disagreeing on the DECISION in 238 of them (4.7%), and on the
-/// QUANTITIES far more often: 1499/5099 (29%) price the same operation differently, and
-/// 1249/5099 (25%) have `Σ margin_reserved != Σ ooIM`. Asserting plain equality would fail 9 of
-/// the 386 existing tests. Those failures are findings, not test bugs — see the
-/// `derived_ooim_divergence` module for each one pinned with concrete numbers.
-///
-/// So what is asserted is the one claim that IS universal, and that is exactly the claim that
-/// catches a bug in this probe or in the formula:
-///
-/// > **If the two bases price the operation identically AND hold the same available balance,
-/// > they MUST reach the same decision.**
-///
-/// A disagreement outside those two escape hatches would mean the gate arithmetic itself is
-/// wrong — a third mechanism that nothing in the model predicts. The census confirms it never
-/// happens (0/5099).
-///
-/// The two sanctioned mechanisms, both of which Phase 2 changes DELIBERATELY:
-///
-/// 1. **Marginal-charge divergence** (`escrow_requirement != derived_requirement`, 29% of
-///    evaluations). Our escrow prices an order by the change in the flip-aware worst-case
-///    reservation `max(S + B', B + S')`, computed in QUANTITY space against the position and
-///    evaluated at the orders' LIMIT prices. Binance prices it by the change in
-///    `max(|N + Bid|, |N − Ask|)`, computed in NOTIONAL space with the position leg at MARK.
-///    Different functions; they coincide only by accident.
-/// 2. **Available-stock divergence** (`Σ margin_reserved != Σ ooIM`, 25%). The same mismatch
-///    integrated over the account's whole book, plus the fact that the escrow is FROZEN at
-///    placement while ooIM re-values the position leg at the CURRENT mark on every read.
-///
-/// # The gross-up (the trap this function exists to get right)
-///
-/// The escrow is still active, so `perp_wallet_balance` has ALREADY been debited by every
-/// reservation. The derived available must add it back before subtracting Σ ooIM, or the
-/// open-order requirement is charged twice — see [`derived_available_balance`].
-///
-/// # Why the requirement is comparable across the two bases
-///
-/// The escrow move at every admission point is wallet → escrow (or wallet → position margin /
-/// out of the system), so `wallet_gross = wallet + Σ margin_reserved` is INVARIANT across an
-/// order placement. Hence `available_new_before >= Δ ooIM` is exactly `available_new_after >= 0`,
-/// the same shape as `wallet >= delta` ⟺ `wallet_after >= 0` on the escrow basis. The two gates
-/// are therefore answering the same question about the same operation, on two different bases.
-///
-/// The ESCROW check alone still decides accept/reject: this function only observes. Behaviour in
-/// Phase 1 is unchanged BY CONSTRUCTION, so the golden commitment is unchanged by construction
-/// rather than by hope.
-///
-/// Debug builds only, and `#[cfg]`-gated (not `if cfg!(…)`) so neither the function nor the
-/// argument expressions at the call sites exist in a release build.
-#[cfg(debug_assertions)]
-pub fn debug_assert_gates_agree<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    site: &str,
-    market_id: Option<u64>,
-    escrow_requirement: u64,
-    derived_requirement: i128,
-) {
-    let account = storage::load_account_ref(context, user).expect("dual gate: load account");
-    let escrow_available = account.perp_wallet_balance;
-    let escrow_ok = account.has_available_perp(escrow_requirement);
-
-    let escrow_sum = total_margin_reserved(context, user).expect("dual gate: Σ margin_reserved");
-    let oo_im_sum = total_open_order_initial_margin(context, user).expect("dual gate: Σ ooIM");
-    let derived_available = escrow_available as i128 + escrow_sum as i128 - oo_im_sum as i128;
-    let derived_ok = derived_available >= derived_requirement;
-
-    if escrow_ok == derived_ok {
-        return;
-    }
-    // Characterised mechanism 1: the two bases priced the operation differently.
-    if escrow_requirement as i128 != derived_requirement {
-        return;
-    }
-    // Characterised mechanism 2: the two bases hold a different available.
-    if escrow_sum != oo_im_sum {
-        return;
-    }
-    panic!(
-        "derived-ooIM dual gate: UNCHARACTERISED divergence at {site}\n           The two bases priced this operation IDENTICALLY and hold the SAME available, yet reached \n           opposite decisions. No mechanism in the model predicts this — the gate arithmetic is wrong.\n           user               = {user}\n           market             = {market_id:?}\n           escrow available   = {escrow_available} (perp_wallet_balance)\n           escrow requirement = {escrow_requirement}  -> {}\n           derived available  = {derived_available} (= {escrow_available} + Σmr {escrow_sum} - ΣooIM {oo_im_sum})\n           derived requirement= {derived_requirement}  -> {}",
-        if escrow_ok { "ACCEPT" } else { "REJECT" },
-        if derived_ok { "ACCEPT" } else { "REJECT" },
-    );
+    Ok(position_open_order_margin(market, after)? as i128
+        - position_open_order_margin(market, before)? as i128)
 }
 
 /// `getMarginInfo(address user, uint64 marketId) returns (...)` — see the ABI doc comment in
@@ -559,7 +471,6 @@ pub fn run_get_margin_info<H: PerpHost>(
             openOrderInitialMargin: info.open_order_initial_margin,
             initialMargin: info.initial_margin,
             maintMargin: info.maint_margin,
-            marginReservedActual: info.margin_reserved_actual,
             positionMargin: info.position_margin,
         },
     )))
@@ -571,33 +482,44 @@ pub fn run_get_margin_info<H: PerpHost>(
 /// preserved — no map iteration anywhere, so the output is deterministic) and adds the two
 /// account-level identities.
 ///
-/// # The two deliberate departures from Binance
+/// # `walletBalance` is Binance's `crossWalletBalance`, and `availableBalance` is real
+///
+/// Binance keeps THREE nested balances and derives the innermost on read:
+///
+/// ```text
+/// walletBalance                                                (gross)
+/// crossWalletBalance = walletBalance      − Σ isolatedWallet   (net of positions)
+/// availableBalance   = crossWalletBalance − Σ ooIM             (net of open orders)
+/// ```
+///
+/// Only the outer two are ledger state there; `Σ ooIM` is never debited from anything. We keep
+/// exactly ONE stored balance and it is the MIDDLE one: `perp_wallet_balance` has had the
+/// position leg physically taken out of it (margin moves to `pos.margin` at open) and the
+/// open-order leg NOT — the escrow that used to debit it was deleted. So
+///
+/// ```text
+/// our walletBalance         == Binance crossWalletBalance
+/// our availableBalance      == Binance availableBalance  == walletBalance − Σ ooIM
+/// Binance gross walletBalance == walletBalance + Σ positionMargin
+/// ```
+///
+/// and `availableBalance` here is genuinely spendable headroom — the SAME quantity the engine's
+/// admission gates enforce ([`derived_available_balance`]), not a parallel reporting number.
+/// (Under the old escrow it double-subtracted the open-order requirement; that caveat is gone
+/// with the escrow.)
+///
+/// # The one deliberate departure from Binance
 ///
 /// **`availableBalance` is NOT clamped at zero.** Binance's is: it was measured reporting
 /// `0.00000000` where the true value was `−0.00085981`, and the reference doc's own verdict is
 /// that you therefore **cannot use it to tell whether an account is under-covered**. Ours is
-/// `int64` and is allowed to go negative — strictly more information, at no cost. (A negative
-/// value is not an error state and triggers nothing: like Binance, we do not tear resting
-/// orders down mid-life, and this layer could not write anything if it wanted to.)
+/// `int64` and is allowed to go negative — strictly more information, at no cost. A negative
+/// value is not an error state and triggers nothing here: like Binance, we do not tear resting
+/// orders down mid-life on a mark move, and this call could not write anything if it wanted to.
 ///
-/// **`walletBalance` is the INNERMOST of Binance's three nested balances, not the outermost.**
-/// Binance keeps `walletBalance` (gross) and `crossWalletBalance = walletBalance − Σ
-/// isolatedWallet` as ledger state, and derives `availableBalance = crossWalletBalance − Σ
-/// ooIM` on read — the open-order requirement is never debited from anything there. We keep one
-/// balance, and BOTH subtractions have already been physically applied to it: position margin at
-/// open, and the `margin_reserved` delta at placement (credited back at cancel/fill). So our
-/// `walletBalance` is the analogue of their `availableBalance`, their `crossWalletBalance` is
-/// `walletBalance + Σ marginReservedActual`, and their gross `walletBalance` is that plus
-/// Σ `positionMargin`.
-///
-/// **Consequence, stated plainly: `availableBalance` here subtracts the open-order requirement
-/// TWICE** — once physically inside `walletBalance` on OUR escrow basis, once arithmetically on
-/// BINANCE's `ooIM` basis. It is not spendable headroom (that is `walletBalance` itself); it is
-/// Binance's formula evaluated against our ledger, which is the point of this layer. The
-/// like-for-like reconstruction is `walletBalance + Σ marginReservedActual −
-/// totalOpenOrderInitialMargin`, and `Σ marginReservedActual − totalOpenOrderInitialMargin` is
-/// itself the measured gap between Binance's requirement and our escrow. `marginBalance` carries
-/// the same caveat (Binance's is built on their gross wallet, ours on the innermost one).
+/// Note the sum is over the CALLER'S list of market ids, while the engine's own gate sums over
+/// the per-user market index. They agree exactly when the list covers the index; a short list
+/// under-counts `totalOpenOrderInitialMargin` and therefore over-reports `availableBalance`.
 pub fn run_get_account_margin<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -618,9 +540,6 @@ pub fn run_get_account_margin<H: PerpHost>(
     let mut total_open_order_initial_margin: u128 = 0;
     let mut total_maint_margin: u128 = 0;
     let mut total_unrealized_profit: i128 = 0;
-    // OUR escrow sum, so the account level is self-contained: a client can reconstruct the
-    // Binance-basis gross wallet without also fetching every per-market getMarginInfo.
-    let mut total_margin_reserved: u128 = 0;
 
     let user = args.user;
     let mut seen: Vec<u64> = Vec::with_capacity(args.marketIds.len());
@@ -637,11 +556,10 @@ pub fn run_get_account_margin<H: PerpHost>(
         total_open_order_initial_margin += info.open_order_initial_margin as u128;
         total_maint_margin += info.maint_margin as u128;
         total_unrealized_profit += info.unrealized_profit as i128;
-        total_margin_reserved += info.margin_reserved_actual as u128;
     }
 
     // `walletBalance` SIGNED and unclamped — `getAccount`'s `availablePerpBalance` floors a
-    // negative internal balance at 0; here the sign is the point.
+    // negative value at 0; here the sign is the point.
     let wallet_balance = storage::load_account_ref(context, user)?.perp_wallet_balance;
 
     let total_unrealized_profit = i64::try_from(total_unrealized_profit)
@@ -651,31 +569,9 @@ pub fn run_get_account_margin<H: PerpHost>(
 
     // `marginBalance = walletBalance + totalUnrealizedProfit` (exact on 22/22 mainnet snapshots).
     let margin_balance = (wallet_balance as i128) + (total_unrealized_profit as i128);
-    // `availableBalance = walletBalance − totalOpenOrderInitialMargin`. NOT clamped at zero
-    // (Binance clamps; the doc's own verdict is that theirs is therefore useless for detecting
-    // under-coverage). See the doc comment above for why this double-subtracts the open-order
-    // requirement and what the like-for-like Binance reconstruction is.
-    // `availableBalance` IS `perp_wallet_balance`, with no further subtraction.
-    //
-    // Binance keeps three nested balances — `walletBalance` ⊃ `crossWalletBalance` ⊃
-    // `availableBalance` — and never debits the open-order requirement from any of them; their
-    // `availableBalance` is derived by subtracting it. We keep exactly ONE balance and it is the
-    // INNERMOST: `place_order` physically debits the reservation (`trading/mod.rs:2173`
-    // `debit_perp(delta)`) and credits it back on cancel/fill, and the position allocation was
-    // already moved out at fill. So our wallet is spendable headroom by construction, and
-    // subtracting `totalOpenOrderInitialMargin` here would charge the open-order requirement
-    // TWICE — once physically on our escrow basis, once arithmetically on Binance's.
-    //
-    // The Binance-basis quantities are still reported, as requirements, for comparison:
-    //   their crossWalletBalance ≈ walletBalance + totalMarginReserved
-    //   like-for-like available  = walletBalance + totalMarginReserved − totalOpenOrderInitialMargin
-    // and the delta between that and `walletBalance` is exactly the escrow-vs-requirement
-    // divergence (see the divergence test).
-    //
-    // NOT clamped at zero, deliberately: the reference doc measured Binance reporting
-    // `0.00000000` where the true value was `−0.00085981` and concluded the field therefore
-    // cannot be used to detect under-coverage. Ours is signed and stays signed.
-    let available_balance = wallet_balance as i128;
+    // `availableBalance = walletBalance − totalOpenOrderInitialMargin` — Binance's identity,
+    // literally, now that nothing debits the open-order requirement from the wallet. Unclamped.
+    let available_balance = wallet_balance as i128 - total_open_order_initial_margin as i128;
 
     Ok(Bytes::from(getAccountMarginCall::abi_encode_returns(
         &getAccountMarginReturn {
@@ -693,8 +589,6 @@ pub fn run_get_account_margin<H: PerpHost>(
             totalUnrealizedProfit: total_unrealized_profit,
             availableBalance: i64::try_from(available_balance)
                 .map_err(|_| perp_err("getAccountMargin: available balance exceeds i64"))?,
-            totalMarginReserved: u64::try_from(total_margin_reserved)
-                .map_err(|_| perp_err("getAccountMargin: total margin reserved exceeds u64"))?,
         },
     )))
 }

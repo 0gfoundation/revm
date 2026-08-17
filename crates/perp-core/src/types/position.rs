@@ -26,24 +26,15 @@ pub struct PerpPosition {
     /// Margin (collateral) allocated to this position.
     #[serde(rename = "m")]
     pub margin: i64,
-    /// Total margin reserved for open orders (max of buy- and sell-side).
-    #[serde(rename = "mr")]
-    pub margin_reserved: u64,
-    /// Total open-order notional used to derive `margin_reserved`.
-    #[serde(default, rename = "mrn")]
-    pub margin_reserved_notional: u64,
-    /// Margin reserved for the buy side of open orders.
-    #[serde(rename = "br")]
-    pub buy_side_margin_reserved: u64,
-    /// Buy-side open-order notional before leverage division.
-    #[serde(default, rename = "brn")]
-    pub buy_side_reserved_notional: u64,
-    /// Margin reserved for the sell side of open orders.
-    #[serde(rename = "sr")]
-    pub sell_side_margin_reserved: u64,
-    /// Sell-side open-order notional before leverage division.
-    #[serde(default, rename = "srn")]
-    pub sell_side_reserved_notional: u64,
+    // NOTE: the former open-order margin ESCROW is GONE — the six fields "mr"
+    // (`margin_reserved`), "mrn", "br", "brn", "sr", "srn" were deleted with it. Placement used to
+    // compute the flip-aware worst-case reservation `max(S + B', B + S')`, store it here, and
+    // physically `debit_perp` the wallet by its delta (credited back at cancel/fill). Binance has
+    // no such bucket: the open-order requirement is DERIVED on demand from `(N, Bid, Ask, L)` as
+    // `ooIM = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) − ROUND_UP(|N| / L)`
+    // ([`crate::math::open_order_margin`]) and merely SUBTRACTED from the wallet at the admission
+    // gate, never debited. `Bid`/`Ask` are exactly `total_buy_notional`/`total_sell_notional`
+    // below, so everything the escrow used to store is reconstructible from what remains.
     // NOTE: the former "fr" (`fee_reserved`) escrow is GONE. Placement used to withhold the
     // order's prospective maker fee from the wallet on top of the margin reservation and release
     // it at fill/cancel. Binance has no such bucket: the trading fee is charged out of the margin
@@ -59,15 +50,18 @@ pub struct PerpPosition {
     /// settled lazily on every position-touching op. See the `funding` module.
     #[serde(default, rename = "fi")]
     pub last_funding_index: i128,
-    // ── Incremental-reservation aggregates (catalog #A) ──────────────────────
-    // Maintained mirrors of the resting-order lists, so the flip-aware reservation is
-    // reconstructed via `math::calc_reservation_notionals_from_totals` (O(cover-prefix),
-    // O(1) when flat/one-sided) instead of an O(n) fold over the whole list on every
-    // place/cancel. `*_notional` is the SUM OF PER-ORDER `calc_value(price, amount)` (each
-    // floored exactly as the fold produces it) → maintainable ± one term with zero
-    // floor-composition error. Kept in sync at every order-list mutation (place/cancel
-    // incrementally; fills/liquidation by recompute-from-list). Derivable from the lists via
-    // `math::sum_side_totals`, so a genesis/default 0 is correct only for an empty book.
+    // ── Per-side resting-order aggregates = Binance's `Bid` / `Ask` (catalog #A) ─────────────
+    // Maintained mirrors of the resting-order lists. `*_notional` is the SUM OF PER-ORDER
+    // `calc_value(price, amount)` at each order's LIMIT price (each floored exactly as a fold
+    // over the list produces it) → maintainable ± one term with zero floor-composition error.
+    // Kept in sync at every order-list mutation (place/cancel incrementally; fills/liquidation by
+    // recompute-from-list). Derivable from the lists via `math::sum_side_totals`, so a
+    // genesis/default 0 is correct only for an empty book.
+    //
+    // These ARE Binance's `bidNotional` / `askNotional`, proven equal to the resting-order fold
+    // after every transition by `side_aggregates_are_exactly_bid_and_ask_after_every_operation`.
+    // They are the sole inputs (with `amount`, `leverage` and the mark) to the DERIVED open-order
+    // requirement that replaced the escrow — see the note where the escrow fields used to be.
     /// Σ resting BUY order amounts (base units).
     #[serde(default, rename = "tbq")]
     pub total_buy_qty: u64,
@@ -83,43 +77,15 @@ pub struct PerpPosition {
 }
 
 impl PerpPosition {
-    /// Single source of truth for the margin-reservation fields.
-    ///
-    /// `buy_notional` / `sell_notional` are each side's open-order opening
-    /// notional at the current position; `c_notional` is the **flip-aware**
-    /// worst-case reservation notional `max(S + B', B + S')` produced by
-    /// [`crate::math::calc_reservation_notionals`], which accounts for
-    /// a position sign-flip when one side of the book fully fills. Writes:
-    /// - per-side `*_reserved_notional` = each side's notional (informational),
-    /// - per-side `*_margin_reserved`   = notional / leverage (informational;
-    ///   used only as a cancel-ordering heuristic),
-    /// - `margin_reserved_notional`     = `c_notional`,
-    /// - `margin_reserved`              = `c_notional / leverage` — the capital
-    ///   actually locked. A single floor of the combined leg (not a sum of
-    ///   per-leg floors), so it never under-reserves; and `c_notional ≥
-    ///   max(buy_notional, sell_notional)`, so it is always ≥ the old
-    ///   max-of-side reservation.
-    ///
-    /// Leverage is floored at 1. Callers compute the wallet delta from the
-    /// change in `margin_reserved` around this call (NOT from the per-side
-    /// fields — those lag `margin_reserved` under the flip-aware model). It is
-    /// the ONLY escrow a resting order takes: the trading fee is charged at fill
-    /// time out of the margin the fill funds, never withheld at placement.
+    /// Zero both sides' resting-order aggregates — the state after every order in this market has
+    /// left the book (liquidation's cancel-all). `Bid = Ask = 0` ⇒ the derived open-order
+    /// requirement for this market is 0.
     #[inline]
-    pub fn set_reservations(
-        &mut self,
-        buy_notional: u64,
-        sell_notional: u64,
-        c_notional: u64,
-        leverage: u64,
-    ) {
-        let lev = leverage.max(1);
-        self.buy_side_reserved_notional = buy_notional;
-        self.sell_side_reserved_notional = sell_notional;
-        self.buy_side_margin_reserved = buy_notional / lev;
-        self.sell_side_margin_reserved = sell_notional / lev;
-        self.margin_reserved_notional = c_notional;
-        self.margin_reserved = c_notional / lev;
+    pub fn clear_side_aggregates(&mut self) {
+        self.total_buy_qty = 0;
+        self.total_buy_notional = 0;
+        self.total_sell_qty = 0;
+        self.total_sell_notional = 0;
     }
 }
 
@@ -129,12 +95,6 @@ impl Default for PerpPosition {
             amount: 0,
             v_quote_balance: 0,
             margin: 0,
-            margin_reserved: 0,
-            margin_reserved_notional: 0,
-            buy_side_margin_reserved: 0,
-            buy_side_reserved_notional: 0,
-            sell_side_margin_reserved: 0,
-            sell_side_reserved_notional: 0,
             leverage: 1,
             last_funding_index: 0,
             total_buy_qty: 0,
@@ -394,25 +354,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn set_reservations_writes_fields_from_flip_aware_notional() {
-        let mut p = PerpPosition::default();
-        // c_notional (1500) is the flip-aware reservation; per-side fields stay
-        // informational (each = side_notional / leverage).
-        p.set_reservations(1000, 400, 1500, 5);
-        assert_eq!(p.buy_side_reserved_notional, 1000);
-        assert_eq!(p.sell_side_reserved_notional, 400);
-        assert_eq!(p.buy_side_margin_reserved, 200); // 1000 / 5 (informational)
-        assert_eq!(p.sell_side_margin_reserved, 80); // 400 / 5  (informational)
-        assert_eq!(p.margin_reserved_notional, 1500); // the flip-aware notional
-        assert_eq!(p.margin_reserved, 300); // 1500 / 5, single floor of the combined leg
-    }
-
-    #[test]
-    fn set_reservations_floors_zero_leverage_to_one() {
-        let mut p = PerpPosition::default();
-        p.set_reservations(1000, 0, 1000, 0);
-        assert_eq!(p.buy_side_margin_reserved, 1000); // 1000 / max(0, 1)
-        assert_eq!(p.margin_reserved, 1000); // c_notional / max(0, 1)
+    fn clear_side_aggregates_zeroes_bid_and_ask() {
+        let mut p = PerpPosition {
+            total_buy_qty: 7,
+            total_buy_notional: 1000,
+            total_sell_qty: 3,
+            total_sell_notional: 400,
+            amount: 5,
+            margin: 100,
+            ..PerpPosition::default()
+        };
+        p.clear_side_aggregates();
+        assert_eq!(
+            (
+                p.total_buy_qty,
+                p.total_buy_notional,
+                p.total_sell_qty,
+                p.total_sell_notional
+            ),
+            (0, 0, 0, 0)
+        );
+        // Only the order-book aggregates move — the position itself is untouched.
+        assert_eq!((p.amount, p.margin), (5, 100));
     }
 
     // ── MarginTiers codec ─────────────────────────────────────────────────
@@ -509,16 +472,5 @@ mod tests {
         let bytes = crate::codec::encode(&m).unwrap();
         let back: Market = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, m);
-    }
-
-    #[test]
-    fn set_reservations_zeroes_all_fields_on_zero_notional() {
-        let mut p = PerpPosition::default();
-        p.set_reservations(500, 500, 800, 5);
-        p.set_reservations(0, 0, 0, 5);
-        assert_eq!(p.buy_side_reserved_notional, 0);
-        assert_eq!(p.sell_side_reserved_notional, 0);
-        assert_eq!(p.margin_reserved, 0);
-        assert_eq!(p.margin_reserved_notional, 0);
     }
 }

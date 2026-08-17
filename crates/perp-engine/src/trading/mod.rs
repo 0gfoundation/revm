@@ -1981,11 +1981,9 @@ pub(super) fn match_order<H: PerpHost>(
     //    REST the remainder (GTC), pass the rest requirement so the fills+rest margin is validated
     //    atomically here (else the fills commit and rest_in_book could revert, leaking them).
     let rest_req = if rest_remainder && remaining > 0 {
-        let maker_fee_bps = storage::load_user_fee_rates(context, taker_addr)?.maker_fee_bps;
         Some(settlement::RestReq {
             price: limit_price,
             qty: remaining,
-            maker_fee_bps,
         })
     } else {
         None
@@ -2091,9 +2089,14 @@ fn rest_in_book<H: PerpHost>(
     pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PerpError> {
     let mut pos = storage::load_position(context, user, market_id)?;
-    let mut account = storage::load_account(context, user)?;
-    // fee rate is a field of the account we already loaded (folded in) — no separate fee-rate read.
-    let maker_fee_bps = account.maker_fee_bps;
+    // Resting escrows nothing, so the account is READ-ONLY here: the fee rate (folded into the
+    // account blob) for the book entry, and the cross wallet for the derived admission gate. An
+    // `_ref` read — no owned clone, and no `save_account` at the end, so no spurious
+    // `AccountBalanceChanged` for a call that moves no money.
+    let (maker_fee_bps, wallet) = {
+        let account = storage::load_account_ref(context, user)?;
+        (account.maker_fee_bps, account.perp_wallet_balance)
+    };
     // ONE BBO resolve for both the best-update check and the mid-price sample (was up to two
     // separate load_best_bid/load_best_ask reads per arm).
     let (best_bid, best_ask) = match bbo {
@@ -2106,13 +2109,10 @@ fn rest_in_book<H: PerpHost>(
 
     match side {
         Side::Buy => {
-            // commit-only #23 CLONE-FREE probe: read BOTH sides via Arc (zero clone) and evaluate
-            // the reservation of "buy-list ⊕ new_entry (at its sorted slot)" by FOLDING a chained
-            // iterator — the hypothetical entry is never inserted into a real/owned list, so a
-            // reject below leaves the overlay untouched (validate-then-apply: check first). The
-            // fold is byte-identical to inserting-then-computing, so the accepted reservation is
-            // unchanged (golden-neutral).
-            let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
+            // commit-only #23 CLONE-FREE probe: the hypothetical "buy-list ⊕ new_entry" is never
+            // materialised — the derived requirement reads only the per-side AGGREGATES, so the
+            // whole probe is two `checked_add`s. A reject below therefore leaves the overlay
+            // untouched (validate-then-apply: check first, insert after).
             let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
             let new_entry = OrderEntry {
                 order_id: *order_id,
@@ -2120,18 +2120,24 @@ fn rest_in_book<H: PerpHost>(
                 amount: qty,
                 maker_fee_bps,
             };
-            let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let idx = buy_ref.partition_point(|e| e.price > price);
-            debug_assert_totals(
-                entries_iter(&buy_ref),
-                entries_iter(&sell_entries),
-                &pos,
-                bd,
-                pd,
-            );
-            // #A: reconstruct the reservation from the maintained per-side aggregates + this order's
-            // hypothetical contribution (no O(n) fold). Byte-identical to the fold above.
+            #[cfg(debug_assertions)]
+            {
+                // The aggregates ARE `Bid`/`Ask` and now feed the admission gate directly, so keep
+                // the raw-list fold as a live oracle on them (debug-only: the two list loads exist
+                // for this check alone).
+                let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
+                debug_assert_totals(
+                    entries_iter(&buy_ref),
+                    entries_iter(&sell_entries),
+                    &pos,
+                    bd,
+                    pd,
+                );
+            }
+            // `Bid` grows by this order's notional at its LIMIT price — the same per-order-floored
+            // `calc_value` term the fold would contribute, so the aggregate stays exactly Binance's
+            // `bidNotional`.
             let entry_notional = crate::math::calc_value(price, qty, bd, pd)?;
             let new_tbq = pos
                 .total_buy_qty
@@ -2141,70 +2147,28 @@ fn rest_in_book<H: PerpHost>(
                 .total_buy_notional
                 .checked_add(entry_notional)
                 .ok_or_else(|| perp_err("placeOrder: total buy notional overflow"))?;
-            let (new_buy_side_notional, sell_notional, c_notional) =
-                crate::math::calc_reservation_notionals_from_totals_it(
-                    buy_ref
-                        .range(..idx)
-                        .copied()
-                        .chain(std::iter::once(new_entry))
-                        .chain(buy_ref.range(idx..).copied()),
-                    sell_entries.iter().copied(),
-                    new_tbq,
-                    new_tbn,
-                    pos.total_sell_qty,
-                    pos.total_sell_notional,
-                    bd,
-                    pd,
-                    pos_amount,
-                )?;
-            // Adding an order can only grow the buy-side notional (checked before
-            // set_reservations overwrites the stored value).
-            if new_buy_side_notional < pos.buy_side_reserved_notional {
-                return Err(perp_invariant_err(format!(
-                    "buy-side reservation notional decreased after adding order: {} -> {}",
-                    pos.buy_side_reserved_notional, new_buy_side_notional
-                )));
-            }
 
-            // Wallet delta is the change in the flip-aware reservation
-            // (pos.margin_reserved), NOT the per-side max — the per-side fields
-            // lag margin_reserved under the flip-aware model.
-            let old_reserved = pos.margin_reserved;
-            let leverage = pos.leverage;
-            pos.set_reservations(new_buy_side_notional, sell_notional, c_notional, leverage);
-            let new_reserved = pos.margin_reserved;
-            // Margin reservation ONLY — placement no longer withholds the order's prospective
-            // trading fee (Binance parity: the fee is charged out of the margin the FILL funds).
-            let delta = new_reserved.saturating_sub(old_reserved);
-
-            // Derived-ooIM Phase 1 dual gate (debug only). `pos` still carries the PRE-op
-            // aggregates here — they are committed a few lines below — so it is the "before"
-            // snapshot as-is, and "after" is it with this order's contribution folded in.
-            // `set_reservations` above touched only the reservation fields, which ooIM does not
-            // read. The ESCROW check below alone still decides.
-            #[cfg(debug_assertions)]
-            {
-                let mut after = pos.clone();
-                after.total_buy_qty = new_tbq;
-                after.total_buy_notional = new_tbn;
-                let d = crate::margin_view::derived_requirement_delta(market, &pos, &after)
-                    .expect("dual gate: ooIM delta");
-                crate::margin_view::debug_assert_gates_agree(
-                    context,
-                    user,
-                    "placeOrder: rest BUY",
-                    Some(market_id),
-                    delta,
-                    d,
-                );
-            }
-            if !account.has_available_perp(delta) {
+            // ── Derived-ooIM admission gate ──
+            // Requirement = `ooIM(after) − ooIM(before)` for THIS market; available =
+            // `perp_wallet_balance − Σ ooIM(before)` across the user's whole market index, with
+            // `pos` overriding storage for this market (it is not written until below). Nothing is
+            // debited: resting an order moves no money, it only raises the requirement.
+            // A non-positive delta — a pure-reduce order — is free at any balance.
+            let mut after = pos.clone();
+            after.total_buy_qty = new_tbq;
+            after.total_buy_notional = new_tbn;
+            let delta = crate::margin_view::derived_requirement_delta(market, &pos, &after)?;
+            let available = crate::margin_view::derived_available_balance_with(
+                context,
+                user,
+                Some(wallet),
+                Some((market_id, &pos)),
+            )?;
+            if !crate::margin_view::derived_can_afford(available, delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
-            account.debit_perp(delta)?;
-            // #A: commit the maintained buy aggregates (op accepted).
-            pos.total_buy_qty = new_tbq;
-            pos.total_buy_notional = new_tbn;
+            // Commit the maintained buy aggregates (op accepted).
+            pos = after;
 
             // ── APPLY (all rejects passed) ── NOW do the real insert: in-place on a warm list
             // (zero clone), or one materialize-clone on a cold first-touch (unavoidable — it IS
@@ -2227,9 +2191,7 @@ fn rest_in_book<H: PerpHost>(
             }
         }
         Side::Sell => {
-            // commit-only #23 CLONE-FREE probe (mirror of the buy arm): fold sell-list ⊕ new_entry
-            // over Arc-borrowed lists, no owned clone, reject leaves the overlay untouched.
-            let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
+            // commit-only #23 CLONE-FREE probe (mirror of the buy arm).
             let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
             let new_entry = OrderEntry {
                 order_id: *order_id,
@@ -2237,17 +2199,18 @@ fn rest_in_book<H: PerpHost>(
                 amount: qty,
                 maker_fee_bps,
             };
-            let pos_amount = pos.amount;
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let idx = sell_ref.partition_point(|e| e.price < price);
-            debug_assert_totals(
-                entries_iter(&buy_entries),
-                entries_iter(&sell_ref),
-                &pos,
-                bd,
-                pd,
-            );
-            // #A: reconstruct from maintained aggregates + this order's hypothetical contribution.
+            #[cfg(debug_assertions)]
+            {
+                let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
+                debug_assert_totals(
+                    entries_iter(&buy_entries),
+                    entries_iter(&sell_ref),
+                    &pos,
+                    bd,
+                    pd,
+                );
+            }
             let entry_notional = crate::math::calc_value(price, qty, bd, pd)?;
             let new_tsq = pos
                 .total_sell_qty
@@ -2257,65 +2220,22 @@ fn rest_in_book<H: PerpHost>(
                 .total_sell_notional
                 .checked_add(entry_notional)
                 .ok_or_else(|| perp_err("placeOrder: total sell notional overflow"))?;
-            let (buy_notional, new_sell_side_notional, c_notional) =
-                crate::math::calc_reservation_notionals_from_totals_it(
-                    buy_entries.iter().copied(),
-                    sell_ref
-                        .range(..idx)
-                        .copied()
-                        .chain(std::iter::once(new_entry))
-                        .chain(sell_ref.range(idx..).copied()),
-                    pos.total_buy_qty,
-                    pos.total_buy_notional,
-                    new_tsq,
-                    new_tsn,
-                    bd,
-                    pd,
-                    pos_amount,
-                )?;
-            // Adding an order can only grow the sell-side notional (checked before
-            // set_reservations overwrites the stored value).
-            if new_sell_side_notional < pos.sell_side_reserved_notional {
-                return Err(perp_invariant_err(format!(
-                    "sell-side reservation notional decreased after adding order: {} -> {}",
-                    pos.sell_side_reserved_notional, new_sell_side_notional
-                )));
-            }
 
-            // Wallet delta is the change in the flip-aware reservation
-            // (pos.margin_reserved), NOT the per-side max — the per-side fields
-            // lag margin_reserved under the flip-aware model.
-            let old_reserved = pos.margin_reserved;
-            let leverage = pos.leverage;
-            pos.set_reservations(buy_notional, new_sell_side_notional, c_notional, leverage);
-            let new_reserved = pos.margin_reserved;
-            // Margin reservation ONLY — see the buy arm.
-            let delta = new_reserved.saturating_sub(old_reserved);
-
-            // Derived-ooIM Phase 1 dual gate (debug only) — mirror of the buy arm.
-            #[cfg(debug_assertions)]
-            {
-                let mut after = pos.clone();
-                after.total_sell_qty = new_tsq;
-                after.total_sell_notional = new_tsn;
-                let d = crate::margin_view::derived_requirement_delta(market, &pos, &after)
-                    .expect("dual gate: ooIM delta");
-                crate::margin_view::debug_assert_gates_agree(
-                    context,
-                    user,
-                    "placeOrder: rest SELL",
-                    Some(market_id),
-                    delta,
-                    d,
-                );
-            }
-            if !account.has_available_perp(delta) {
+            // ── Derived-ooIM admission gate ── (see the buy arm)
+            let mut after = pos.clone();
+            after.total_sell_qty = new_tsq;
+            after.total_sell_notional = new_tsn;
+            let delta = crate::margin_view::derived_requirement_delta(market, &pos, &after)?;
+            let available = crate::margin_view::derived_available_balance_with(
+                context,
+                user,
+                Some(wallet),
+                Some((market_id, &pos)),
+            )?;
+            if !crate::margin_view::derived_can_afford(available, delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
-            account.debit_perp(delta)?;
-            // #A: commit the maintained sell aggregates (op accepted).
-            pos.total_sell_qty = new_tsq;
-            pos.total_sell_notional = new_tsn;
+            pos = after;
 
             // ── APPLY (all rejects passed) ── real insert: in-place (warm) / one materialize (cold).
             emit_pending_order_placed(context, pending_placed);
@@ -2337,11 +2257,10 @@ fn rest_in_book<H: PerpHost>(
         }
     }
 
-    // Resting only touches the margin/reservation fields, so this skips save_position's
-    // old-position re-read + `amount` zero-crossing registry hooks (dead work here) and moves the
-    // position in by value instead of cloning it.
+    // Resting only touches the per-side aggregates, so this skips save_position's old-position
+    // re-read + `amount` zero-crossing registry hooks (dead work here) and moves the position in
+    // by value instead of cloning it. The account is NOT written: resting moves no money.
     storage::save_position_reservation_only(context, user, market_id, pos)?;
-    storage::save_account(context, user, account)?;
 
     context.log(Log {
         address: PERP_DEX_ADDRESS,
@@ -2546,6 +2465,15 @@ pub(super) fn remove_from_book_during_match<H: PerpHost>(
     Ok(())
 }
 
+/// Detach a cancelled order from the owner's per-market entry list and shrink the maintained
+/// per-side aggregates by exactly its contribution.
+///
+/// Formerly this also RELEASED the order's escrowed margin back to the wallet. There is no escrow:
+/// a cancel moves **no money at all**. What it does is lower `Bid` (or `Ask`), which lowers this
+/// market's derived `ooIM` and therefore RAISES the account's available balance — the same effect,
+/// with nothing changing hands. The function is kept (under its call sites' name) because the
+/// "book removal, entry removal and aggregate update always happen together" invariant is still
+/// the thing worth enforcing in one place.
 pub(super) fn release_margin_for_cancelled_order<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -2575,120 +2503,84 @@ pub(super) fn release_margin_for_cancelled_order<H: PerpHost>(
         })??,
     };
 
-    // #A: subtract the cancelled order's contribution from the maintained per-side aggregates, then
-    // reconstruct the POST-cancel flip-aware reservation from them (byte-identical to the filtered
-    // fold this replaced) — no O(n) fold over the whole list.
+    // Subtract exactly the per-order-floored term this entry contributed, so the aggregate stays
+    // byte-identical to a fresh fold over the remaining list (asserted below in debug).
     let entry_notional =
         crate::math::calc_value(cancelled_entry.price, cancelled_entry.amount, bd, pd)?;
-    match side {
-        Side::Buy => {
-            pos.total_buy_qty = pos
-                .total_buy_qty
-                .checked_sub(cancelled_entry.amount)
-                .ok_or_else(|| perp_invariant_err("cancel: total buy qty underflow"))?;
-            pos.total_buy_notional = pos
-                .total_buy_notional
-                .checked_sub(entry_notional)
-                .ok_or_else(|| perp_invariant_err("cancel: total buy notional underflow"))?;
-        }
-        Side::Sell => {
-            pos.total_sell_qty = pos
-                .total_sell_qty
-                .checked_sub(cancelled_entry.amount)
-                .ok_or_else(|| perp_invariant_err("cancel: total sell qty underflow"))?;
-            pos.total_sell_notional = pos
-                .total_sell_notional
-                .checked_sub(entry_notional)
-                .ok_or_else(|| perp_invariant_err("cancel: total sell notional underflow"))?;
-        }
-    }
-    let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
-    let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
-    debug_assert_totals(entries_iter(&buy_ref), entries_iter(&sell_ref), &pos, bd, pd);
-    let (buy_notional, sell_notional, c_notional) =
-        crate::math::calc_reservation_notionals_from_totals_it(
-            buy_ref.iter().copied(),
-            sell_ref.iter().copied(),
-            pos.total_buy_qty,
-            pos.total_buy_notional,
-            pos.total_sell_qty,
-            pos.total_sell_notional,
+    remove_entry_from_side_aggregates(&mut pos, side, cancelled_entry.amount, entry_notional)?;
+    #[cfg(debug_assertions)]
+    {
+        let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
+        let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
+        debug_assert_totals(
+            entries_iter(&buy_ref),
+            entries_iter(&sell_ref),
+            &pos,
             bd,
             pd,
-            pos.amount,
-        )?;
-    drop(buy_ref);
-    drop(sell_ref);
-
-    let total_freed = apply_release_effect(&mut pos, buy_notional, sell_notional, c_notional);
+        );
+    }
     storage::save_position(context, user, market_id, &pos)?;
-    // In-place wallet credit (no UserAccount/String load+save clone pair).
-    storage::mutate_account_balance(context, user, |a| a.credit_perp(total_freed))??;
+    Ok(())
+}
+
+/// Shrink one side's `(Σ qty, Σ notional)` aggregate by a departing entry's contribution.
+/// An underflow means the aggregate and the list have desynchronised — an invariant break, not a
+/// user-facing reject.
+fn remove_entry_from_side_aggregates(
+    pos: &mut crate::types::PerpPosition,
+    side: Side,
+    amount: u64,
+    notional: u64,
+) -> Result<(), PerpError> {
+    let (qty_field, notional_field, label) = match side {
+        Side::Buy => (&mut pos.total_buy_qty, &mut pos.total_buy_notional, "buy"),
+        Side::Sell => (
+            &mut pos.total_sell_qty,
+            &mut pos.total_sell_notional,
+            "sell",
+        ),
+    };
+    *qty_field = qty_field
+        .checked_sub(amount)
+        .ok_or_else(|| perp_invariant_err(format!("cancel: total {label} qty underflow")))?;
+    *notional_field = notional_field
+        .checked_sub(notional)
+        .ok_or_else(|| perp_invariant_err(format!("cancel: total {label} notional underflow")))?;
     Ok(())
 }
 
 /// PURE core of [`release_margin_for_cancelled_order`] (commit-only #23, tranche-4): removes the
-/// entry, recomputes the flip-aware reservation, and credits the freed margin —
-/// over in-memory working copies only, NO storage access. The match compute phase runs this to
-/// simulate the taker wallet-cover LIFO cancels (and plan them) before any write.
+/// entry from the working-copy list and shrinks the per-side aggregates — over in-memory copies
+/// only, NO storage access. The match compute phase runs this to simulate the taker's LIFO
+/// cover-cancels (and plan them) before any write.
 ///
-/// The book entry's `amount` is the authoritative remaining quantity (kept current by
-/// `reduce_order_entry_core`); the order's `filled` can lag it during the same matching round, so
-/// the release is sized from the entry, not from `order.quantity - order.filled`.
+/// Moves no money (there is no escrow to release); its effect on affordability is entirely via the
+/// smaller `Bid`/`Ask` it leaves behind. The book entry's `amount` is the authoritative remaining
+/// quantity (kept current by `reduce_order_entry_core`); the order's `filled` can lag it during the
+/// same matching round, so the aggregate is shrunk by the entry, not by `order.quantity - filled`.
 pub(super) fn release_margin_core(
     pos: &mut crate::types::PerpPosition,
-    account: &mut crate::types::UserAccount,
     buy_entries: &mut std::collections::VecDeque<OrderEntry>,
     sell_entries: &mut std::collections::VecDeque<OrderEntry>,
     side: Side,
     order_id: &[u8; 32],
     market: &crate::types::Market,
 ) -> Result<(), PerpError> {
-    {
+    let removed = {
         let (entries, label) = match side {
             Side::Buy => (&mut *buy_entries, "buy"),
             Side::Sell => (&mut *sell_entries, "sell"),
         };
-        remove_order_entry(entries, order_id, label)?;
-    }
-    let (buy_notional, sell_notional, c_notional) =
-        crate::math::calc_reservation_notionals_it(
-            buy_entries.iter().copied(),
-            sell_entries.iter().copied(),
-            market.base_decimals,
-            market.price_decimals,
-            pos.amount,
-        )?;
-    let total_freed = apply_release_effect(pos, buy_notional, sell_notional, c_notional);
-    // Registry path: credit the owned working-copy account (saved once at flush).
-    account.credit_perp(total_freed)
-}
-
-/// Applies a cancel's margin release to the POSITION given the POST-cancel reservation notionals:
-/// snapshots the flip-aware reservation, rewrites it, and RETURNS the amount to credit back to the
-/// wallet. The CALLER applies that credit — the registry path onto its owned working-copy account,
-/// the storage path via `mutate_account` (in-place, no owned load+save clone pair) — so this stays
-/// account-representation-agnostic and the freed math has a single source of truth. `old_reserved`
-/// is snapshotted here before `set_reservations`; the preceding entry removal never touches
-/// `pos.margin_reserved`.
-///
-/// Margin is the ONLY thing a cancel releases: placement escrows no trading fee (the fee is charged
-/// at fill time out of the margin the fill funds), so a cancel returns the wallet to EXACTLY its
-/// pre-placement value.
-fn apply_release_effect(
-    pos: &mut crate::types::PerpPosition,
-    new_buy_notional: u64,
-    new_sell_notional: u64,
-    new_c_notional: u64,
-) -> u64 {
-    let old_reserved = pos.margin_reserved;
-    pos.set_reservations(
-        new_buy_notional,
-        new_sell_notional,
-        new_c_notional,
-        pos.leverage,
-    );
-    old_reserved.saturating_sub(pos.margin_reserved)
+        remove_order_entry(entries, order_id, label)?
+    };
+    let notional = crate::math::calc_value(
+        removed.price,
+        removed.amount,
+        market.base_decimals,
+        market.price_decimals,
+    )?;
+    remove_entry_from_side_aggregates(pos, side, removed.amount, notional)
 }
 
 // ── FOK / PostOnly pre-checks ─────────────────────────────────────────────────

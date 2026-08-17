@@ -107,7 +107,7 @@ fn fund(ctx: &mut TestCtx, user: Address, amount: u64) {
 }
 
 /// Install a synthetic position. Used where the test only cares about the derived READ; the
-/// tests that assert `marginReservedActual` drive the real engine instead.
+/// tests that assert what the ENGINE did drive it through the real call path instead.
 fn set_position(
     ctx: &mut TestCtx,
     user: Address,
@@ -143,11 +143,9 @@ fn entry(order_id: u8, price: u64, amount: u64) -> OrderEntry {
     }
 }
 
-/// Install resting order lists AND recompute the reservation fields exactly the way the engine
-/// does (`calc_reservation_notionals` → `PerpPosition::set_reservations`, plus the maintained
-/// per-side aggregates), so the state a test reads back is the state a real place/cancel
-/// sequence would have left. `buys` must be price-DESC and `sells` price-ASC, the engine's own
-/// list invariant.
+/// Install resting order lists AND the maintained per-side aggregates exactly the way the engine
+/// does, so the state a test reads back is the state a real place/cancel sequence would have
+/// left. `buys` must be price-DESC and `sells` price-ASC, the engine's own list invariant.
 fn set_orders(
     ctx: &mut TestCtx,
     user: Address,
@@ -170,10 +168,6 @@ fn set_orders(
     storage::save_sell_orders(ctx, user, market_id, &sells.iter().copied().collect()).unwrap();
 
     let mut pos = storage::load_position(ctx, user, market_id).unwrap();
-    let (b, s, c) =
-        crate::math::calc_reservation_notionals(buys, sells, bd, pd, pos.amount).unwrap();
-    let leverage = pos.leverage;
-    pos.set_reservations(b, s, c, leverage);
     let (tbq, tbn) = sum_side_totals(buys.iter().copied(), bd, pd).unwrap();
     let (tsq, tsn) = sum_side_totals(sells.iter().copied(), bd, pd).unwrap();
     pos.total_buy_qty = tbq;
@@ -228,7 +222,7 @@ fn revert_reason(ctx: &mut TestCtx, input: &[u8]) -> String {
     String::from_utf8(out.bytes[68..68 + len].to_vec()).unwrap()
 }
 
-/// Place a real order through the engine (so the wallet debit and `margin_reserved` write are
+/// Place a real order through the engine (so the book, the aggregates and the gate are
 /// the engine's own, not the test's).
 fn place(ctx: &mut TestCtx, caller: Address, side: u8, price: u64, qty: u64) {
     let input = placeOrderCall {
@@ -266,7 +260,6 @@ fn flat_account_reads_back_zero_and_sane() {
     assert_eq!(i.openOrderInitialMargin, 0);
     assert_eq!(i.initialMargin, 0);
     assert_eq!(i.maintMargin, 0);
-    assert_eq!(i.marginReservedActual, 0);
     assert_eq!(i.positionMargin, 0);
 
     let a = account_margin(&mut ctx, ALICE, &[MARKET_A]);
@@ -277,7 +270,7 @@ fn flat_account_reads_back_zero_and_sane() {
     assert_eq!(a.totalOpenOrderInitialMargin, 0);
     assert_eq!(a.totalMaintMargin, 0);
     assert_eq!(a.totalUnrealizedProfit, 0);
-    // With no resting orders the double-subtraction caveat is inert: available == wallet.
+    // No resting orders ⇒ Σ ooIM is 0 ⇒ available == wallet.
     assert_eq!(a.availableBalance, (500 * USD) as i64);
 
     // An empty market list is legal and yields the pure ledger view.
@@ -317,7 +310,6 @@ fn long_without_orders_has_im_equal_pim_and_no_open_order_margin() {
     assert_eq!(i.openOrderInitialMargin, 0);
     // Default tier table is a single tier {0, maxLeverage 3} => mmr = 1/(2*3): 220e6 / 6.
     assert_eq!(i.maintMargin, 36_666_666);
-    assert_eq!(i.marginReservedActual, 0);
 }
 
 // ── 3. The joint max() really switches branches ────────────────────────────
@@ -486,14 +478,17 @@ fn available_balance_is_reported_negative_not_clamped() {
     //
     // Two properties, and they are separate:
     //
-    //   (a) `availableBalance` is NOT double-charged. Our wallet is already net of both the
-    //       position allocation and the order escrow, so the field is the wallet itself. A
-    //       healthy account with resting orders must NOT report negative just for having them —
-    //       that was the bug in the first cut of this layer.
+    //   (a) `availableBalance` subtracts the open-order requirement EXACTLY ONCE. The wallet is
+    //       the CROSS wallet — net of the position allocation, NOT of the resting orders — so the
+    //       single arithmetic subtraction here is the whole charge.
     //   (b) when the wallet genuinely IS negative, the field passes the sign through.
     //
-    // (a) — driven through the REAL engine so the debit is the engine's: ALICE funds $500 and
-    // rests a $400 buy. The escrow physically removes $400, leaving $100 spendable.
+    // (a) — driven through the REAL engine: ALICE funds $500 and rests a $400 buy. Nothing is
+    // debited (the wallet stays $500); the $400 shows up as a REQUIREMENT, leaving $100 available.
+    //
+    // CHANGED BY THE ESCROW REMOVAL: `walletBalance` was 100 here (the escrow had physically
+    // removed $400) and `availableBalance` was the wallet itself. It is now 500 and 100. Same
+    // spendable headroom, reached the Binance way — which is the point of the migration.
     let mut ctx = make_ctx();
     setup_a(&mut ctx);
     fund(&mut ctx, ALICE, 500 * USD);
@@ -502,23 +497,19 @@ fn available_balance_is_reported_negative_not_clamped() {
     let i = margin_info(&mut ctx, ALICE, MARKET_A);
     assert_eq!(i.bidNotional, 400 * USD);
     assert_eq!(i.openOrderInitialMargin, 400 * USD);
-    assert_eq!(i.marginReservedActual, 400 * USD);
 
     let a = account_margin(&mut ctx, ALICE, &[MARKET_A]);
-    assert_eq!(a.walletBalance, 100 * USD as i64, "engine debited the escrow");
+    assert_eq!(
+        a.walletBalance,
+        500 * USD as i64,
+        "resting an order debits nothing"
+    );
     assert_eq!(a.totalOpenOrderInitialMargin, 400 * USD);
-    assert_eq!(a.totalMarginReserved, 400 * USD);
     assert_eq!(
         a.availableBalance,
         100 * USD as i64,
-        "spendable headroom — the open-order requirement must not be subtracted a second time"
+        "spendable headroom = wallet - ooIM, charged exactly once"
     );
-
-    // The like-for-like Binance reconstruction adds our escrow back before applying their
-    // requirement. On this non-flipping book the two bases agree, so it lands on the wallet.
-    let binance_available =
-        a.walletBalance + a.totalMarginReserved as i64 - a.totalOpenOrderInitialMargin as i64;
-    assert_eq!(binance_available, 100 * USD as i64);
 
     // (b) a genuinely negative wallet — reachable: a close-path fee can drive it there — is
     // reported negative, not clamped. Binance measured 0.00000000 where the true value was
@@ -569,45 +560,33 @@ fn wallet_balance_is_signed_where_get_account_clamps_to_zero() {
     );
 }
 
-// ── 7. THE DIVERGENCE MEASUREMENT ──────────────────────────────────────────
+// ── 7. THE FLIP THE MIGRATION WAS FOR ──────────────────────────────────────
 
 #[test]
-fn divergence_flip_on_the_book_binance_ooim_vs_our_escrow() {
+fn a_resting_order_that_can_flip_the_position_is_charged_the_joint_max() {
     // ─────────────────────────────────────────────────────────────────────────────────────
-    // THIS IS THE NUMBER THE NEXT DESIGN DECISION DEPENDS ON.
+    // The book shape that motivated the whole derived-ooIM migration, kept as a behaviour pin.
     //
     // Setup (the reference doc's own worked example, `binance-margin-verified-model.md` §5):
     // a LONG 2 at $100 with a resting SELL of 5 @ $100, leverage 1, entry = mark = limit = $100.
-    // The sell can flip the position's sign, which is precisely where the two models part.
+    // The sell can flip the position's sign, which is exactly where the retired escrow and
+    // Binance's formula parted company.
     //
-    //   Binance (joint requirement over position AND orders, netting the flip):
+    //   Binance (joint requirement over position AND orders, netting the flip) — what we now do:
     //     N   = $200,  Bid = $0,  Ask = $500
     //     IM  = ROUND_UP(max(|200 + 0|, |200 - 500|) / 1) = $300
     //     PIM = ROUND_UP(200 / 1)                         = $200
     //     ooIM = IM - PIM                                 = $100
-    //     TOTAL capital tied up                           = IM = $300
+    //     TOTAL capital tied up = positionMargin $200 + ooIM $100 = IM = $300
     //
-    //   Ours (position margin escrowed at open + flip-aware order reservation, side by side):
-    //     positionMargin        = $200   (already debited from the wallet at open)
-    //     marginReservedActual  = $300   (c_notional = max(S + B', B + S') = $300, /L)
-    //     TOTAL capital tied up = $500
+    //   The retired escrow charged `c_notional = max(S + B', B + S') = $300` for the ORDERS
+    //   ALONE, on top of the $200 position margin — $500 of capital, 1.67x. The $200 gap was
+    //   exactly `positionMargin`, and it was structural, not rounding: when the sell fills the
+    //   long closes and its $200 of margin is released, which Binance's single joint `max()`
+    //   nets by construction and a per-side reservation bucket cannot.
     //
-    //   MEASURED DIVERGENCE
-    //     per-order basis : marginReservedActual - ooIM  = 300 - 100 = $200
-    //     account basis   : (margin + reserved) - IM     = 500 - 300 = $200
-    //     as a ratio      : we lock 1.67x Binance's requirement on this book
-    //
-    //   The $200 gap is EXACTLY `positionMargin`. The reason is structural, not a rounding
-    //   artifact: when the sell fills, the long closes and its $200 of margin is released — but
-    //   our reservation bucket never subtracts margin that a fill would free, while Binance's
-    //   single joint `max()` does, by construction. So the gap equals the position margin the
-    //   flip would release, and it appears whenever (and only whenever) a resting order can
-    //   flip the position's sign. On non-flipping books the two agree (see
-    //   `joint_max_switches_branches_between_bid_and_ask` case (a): our reservation and
-    //   Binance's ooIM are both driven by the same opening notional there).
-    //
-    //   NOTE the direction: we are STRICTER. Nothing here is an under-collateralisation. The
-    //   open question this number sizes is how much capital efficiency that costs.
+    //   MEASURED HERE: the account now ties up $300 total on this book instead of $500. The
+    //   loosening is deliberate and was accepted with the migration.
     // ─────────────────────────────────────────────────────────────────────────────────────
     let mut ctx = make_ctx();
     setup_a(&mut ctx);
@@ -632,37 +611,33 @@ fn divergence_flip_on_the_book_binance_ooim_vs_our_escrow() {
     assert_eq!(i.notional, 200 * USD);
     assert_eq!(i.unrealizedProfit, 0, "mark == entry");
 
-    // Binance basis.
+    // The Binance numbers — unchanged by the migration; these were already correct as a REPORT
+    // and are now also what is enforced.
     assert_eq!(i.positionInitialMargin, 200 * USD);
     assert_eq!(i.initialMargin, 300 * USD);
     assert_eq!(i.openOrderInitialMargin, 100 * USD);
 
-    // Ours.
+    // Total capital tied up == IM, exactly. This identity is the migration: `positionMargin` is
+    // physically held, `ooIM` is arithmetically withheld, and together they are the joint
+    // requirement — no third bucket, no double count.
     assert_eq!(i.positionMargin, 200 * USD as i64);
-    assert_eq!(i.marginReservedActual, 300 * USD);
-
-    // THE GAP.
-    assert_eq!(
-        i.marginReservedActual as i64 - i.openOrderInitialMargin as i64,
-        200 * USD as i64,
-        "order-basis divergence"
-    );
-    assert_eq!(
-        (i.positionMargin + i.marginReservedActual as i64) - i.initialMargin as i64,
-        200 * USD as i64,
-        "account-basis divergence == the position margin the flip would release"
-    );
-    assert_eq!(i.marginReservedActual as i64 - i.openOrderInitialMargin as i64, i.positionMargin);
-
-    // And it is visible in the wallet: $10 000 - $200 (open) - $300 (reserve) = $9 500.
     let a = account_margin(&mut ctx, ALICE, &[MARKET_A]);
-    assert_eq!(a.walletBalance, 9_500 * USD as i64);
+    assert_eq!(
+        i.positionMargin + a.totalOpenOrderInitialMargin as i64,
+        a.totalInitialMargin as i64
+    );
     assert_eq!(a.totalInitialMargin, 300 * USD);
-    // Binance would have left $10 000 - $300 = $9 700 spendable on the same book.
-    let binance_available = a.walletBalance + i.marginReservedActual as i64
-        - a.totalOpenOrderInitialMargin as i64;
-    assert_eq!(binance_available, 9_700 * USD as i64);
-    assert_eq!(binance_available - a.walletBalance, 200 * USD as i64);
+
+    // And in the wallet: $10 000 - $200 (the position, physically debited at open). The $100
+    // ooIM is NOT debited — it is subtracted on read.
+    assert_eq!(a.walletBalance, 9_800 * USD as i64);
+    assert_eq!(a.availableBalance, 9_700 * USD as i64);
+    // The escrow basis left only $9 500 spendable on this same book (it debited $200 + $300).
+    assert_eq!(
+        a.availableBalance - 9_500 * USD as i64,
+        200 * USD as i64,
+        "the flip's released position margin, no longer charged twice"
+    );
 }
 
 // ── 8. Self-consistency: the outputs are recomputable from the inputs ──────
@@ -764,22 +739,61 @@ fn outputs_are_recomputable_from_the_reported_inputs() {
         acc.totalUnrealizedProfit,
         a_info.unrealizedProfit + b_info.unrealizedProfit
     );
-    assert_eq!(acc.marginBalance, acc.walletBalance + acc.totalUnrealizedProfit);
-    // `availableBalance` IS the wallet — our wallet is already net of BOTH the position
-    // allocation and the order escrow, so subtracting the open-order requirement again would
-    // charge it twice (once physically on our basis, once arithmetically on Binance's).
-    assert_eq!(acc.availableBalance, acc.walletBalance);
-    // The Binance-basis reconstruction is a separate derived quantity: add our escrow back,
-    // then apply their requirement.
     assert_eq!(
-        acc.walletBalance + acc.totalMarginReserved as i64 - acc.totalOpenOrderInitialMargin as i64,
-        acc.availableBalance + acc.totalMarginReserved as i64
-            - acc.totalOpenOrderInitialMargin as i64
+        acc.marginBalance,
+        acc.walletBalance + acc.totalUnrealizedProfit
+    );
+    // `availableBalance = walletBalance - Σ ooIM`, Binance's identity literally. The wallet is
+    // net of the POSITION allocation only; the open-order requirement is subtracted here and
+    // nowhere else.
+    assert_eq!(
+        acc.availableBalance,
+        acc.walletBalance - acc.totalOpenOrderInitialMargin as i64
+    );
+    assert!(
+        acc.totalOpenOrderInitialMargin > 0,
+        "the identity above is only meaningful with orders resting"
     );
 
     // Order of the id list does not change any total.
     let reversed = account_margin(&mut ctx, ALICE, &[MARKET_B, MARKET_A]);
     assert_eq!(as_tuple(&reversed), as_tuple(&acc));
+}
+
+// ── The affordability predicate (B1's derived-basis restatement) ───────────
+
+/// REGRESSION (B1), carried over from `UserAccount::has_available_perp`, which this predicate
+/// replaced when the escrow was deleted.
+///
+/// The original bug was `has_available_perp(0)` evaluating `-5 >= 0 == false`, so a NEGATIVE
+/// wallet refused a debit of ZERO — locking a distressed user out of exactly the actions that
+/// would reduce their risk. The derived basis makes the same trap MORE reachable, not less:
+/// `available = wallet − Σ ooIM` can go negative on a mark move alone, with no action by the
+/// user. So the exemption has to survive, restated as "a non-positive requirement is always
+/// affordable".
+#[test]
+fn a_non_positive_requirement_is_affordable_at_any_available_including_negative() {
+    for available in [i128::MIN, -1_000_000, -5, -1, 0, 1, i128::MAX] {
+        for requirement in [i128::MIN, -1_000_000, -1, 0] {
+            assert!(
+                derived_can_afford(available, requirement),
+                "requirement {requirement} must be free at available {available}"
+            );
+        }
+    }
+}
+
+/// ...and it opens no hole: every POSITIVE requirement is still refused unless the available
+/// covers it in full, with the `>=` boundary unchanged.
+#[test]
+fn a_positive_requirement_still_needs_the_available_to_cover_it() {
+    assert!(!derived_can_afford(-5, 1));
+    assert!(!derived_can_afford(0, 1));
+    assert!(!derived_can_afford(9, 10));
+    assert!(derived_can_afford(10, 10), "the >= boundary");
+    assert!(derived_can_afford(11, 10));
+    assert!(!derived_can_afford(i128::MIN, 1));
+    assert!(derived_can_afford(i128::MAX, i128::MAX));
 }
 
 // ── Argument handling ──────────────────────────────────────────────────────

@@ -534,10 +534,12 @@ fn adl_skips_opposite_holder_whose_only_order_reserves_no_margin() {
     // so their median is the index regardless of the basis this bid contributes.
     place_order(&mut ctx, KEEPER, 0, 8_000, QTY as u64);
     let keeper_pos = position(&mut ctx, KEEPER);
+    let keeper_market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
     assert_eq!(
-        keeper_pos.margin_reserved, 0,
-        "pure-reduce order must reserve no margin — this is what makes the \
-         `margin_reserved != 0` proxy insufficient"
+        crate::margin_view::position_open_order_margin(&keeper_market, &keeper_pos).unwrap(),
+        0,
+        "pure-reduce order requires no open-order margin — this is what makes any \
+         `requirement != 0` proxy insufficient for 'has resting orders'"
     );
     assert_eq!(wallet(&mut ctx, KEEPER), 0, "and cost nothing to place");
 
@@ -1189,15 +1191,28 @@ fn funding_on_one_market_leaves_another_markets_headroom_intact() {
     run_place_order(&input, ALICE, &mut ctx)
         .expect("market-2 headroom must survive market-1 funding");
 
+    // CHANGED BY THE ESCROW REMOVAL: the placement itself debits NOTHING, so the wallet still
+    // reads 50M. The claim under test is unchanged and is now expressed on the derived basis:
+    // market 2's requirement (`ooIM` = 50M notional at 1x) consumed the whole available balance,
+    // proving all 50M was spendable despite the market-1 funding charge.
+    let market2 = storage::load_market(&mut ctx, OTHER_MARKET)
+        .unwrap()
+        .unwrap();
     let pos2 = storage::load_position(&mut ctx, ALICE, OTHER_MARKET).unwrap();
     assert_eq!(
-        pos2.margin_reserved, USER_WALLET,
-        "the whole wallet is reservable on market 2"
+        crate::margin_view::position_open_order_margin(&market2, &pos2).unwrap(),
+        USER_WALLET,
+        "the whole wallet is committable on market 2"
     );
     assert_eq!(
         wallet(&mut ctx, ALICE),
+        USER_WALLET,
+        "resting escrows nothing — the wallet is untouched by the placement"
+    );
+    assert_eq!(
+        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap(),
         0,
-        "and only market 2's OWN reservation debits it — the full 50M was available to spend"
+        "and the full 50M was available to commit — market-1 funding took none of it"
     );
 }
 
@@ -1630,6 +1645,14 @@ fn wallet(ctx: &mut TestCtx, user: Address) -> u64 {
 
 fn position(ctx: &mut TestCtx, user: Address) -> PerpPosition {
     storage::load_position(ctx, user, MARKET_ID).unwrap()
+}
+
+/// The DERIVED open-order requirement for `user` in the test market — the replacement for the
+/// deleted `pos.margin_reserved` field in every assertion that used to read it.
+fn oo_im(ctx: &mut TestCtx, user: Address) -> u64 {
+    let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+    let pos = storage::load_position(ctx, user, MARKET_ID).unwrap();
+    crate::margin_view::position_open_order_margin(&market, &pos).unwrap()
 }
 
 fn save_position(ctx: &mut TestCtx, amount: i64, v_quote_balance: i64) {
@@ -2101,6 +2124,13 @@ fn set_leverage_rejects_decrease_with_open_position() {
     assert_eq!(position(&mut ctx, ALICE).leverage, 3);
 }
 
+/// CHANGED BY THE DERIVED-ooIM SWITCH (values, not outcome). Two mechanisms move the numbers:
+///   * the requirement is `ROUND_UP(Bid / L)`, where the escrow floored: `1e9 / 3` is
+///     333_333_334 here, not 333_333_333;
+///   * nothing is debited, so the WALLET stays at its funded value and the pressure shows up in
+///     the derived available (`wallet − Σ ooIM`) instead.
+/// The behaviour under test — a leverage DECREASE raises the open-order requirement and must be
+/// funded — is unchanged, and it still exactly exhausts the account.
 #[test]
 fn set_leverage_decrease_without_position_tops_up_order_margin() {
     let mut ctx = make_ctx();
@@ -2115,19 +2145,32 @@ fn set_leverage_decrease_without_position_tops_up_order_margin() {
     )
     .unwrap();
 
-    // Order notional is 1e9; leverage 3 -> reserve 333_333_333, leverage 2 -> reserve 500M
-    // (both within the tier-0 leverage cap of 3).
+    // Order notional (Bid) is 1e9, position flat so N = 0; ooIM = ROUND_UP(1e9 / L):
+    // leverage 3 -> 333_333_334, leverage 2 -> 500_000_000 (both within the tier-0 cap of 3).
     set_leverage(&mut ctx, 3).unwrap();
     place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, QTY as u64);
-    assert_eq!(position(&mut ctx, ALICE).margin_reserved, 333_333_333);
-    assert_eq!(wallet(&mut ctx, ALICE), 166_666_667);
+    assert_eq!(oo_im(&mut ctx, ALICE), 333_333_334);
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        500_000_000,
+        "placement debits nothing"
+    );
+    assert_eq!(
+        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap(),
+        166_666_666
+    );
 
+    // The top-up needed is 500_000_000 − 333_333_334 = 166_666_666 — exactly the available.
     set_leverage(&mut ctx, 2).unwrap();
 
     let pos = position(&mut ctx, ALICE);
     assert_eq!(pos.leverage, 2);
-    assert_eq!(pos.margin_reserved, 500_000_000);
-    assert_eq!(wallet(&mut ctx, ALICE), 0);
+    assert_eq!(oo_im(&mut ctx, ALICE), 500_000_000);
+    assert_eq!(wallet(&mut ctx, ALICE), 500_000_000);
+    assert_eq!(
+        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -2144,9 +2187,10 @@ fn set_leverage_decrease_without_position_rejects_when_order_margin_topup_is_unf
     )
     .unwrap();
 
-    // Order notional 1e9; leverage 3 -> reserve 333_333_333 (wallet 400M -> 66_666_667).
-    // Decreasing to leverage 2 needs reserve 500M (+166_666_667 topup) which 66_666_667
-    // cannot fund -> reject.
+    // CHANGED BY THE DERIVED-ooIM SWITCH (values, not outcome) — see the previous test.
+    // Order notional 1e9; leverage 3 -> ooIM 333_333_334, leaving 66_666_666 available out of
+    // the 400M wallet. Decreasing to leverage 2 needs 500M (+166_666_666) which 66_666_666
+    // cannot fund -> reject, exactly as before.
     set_leverage(&mut ctx, 3).unwrap();
     place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, QTY as u64);
 
@@ -2158,8 +2202,12 @@ fn set_leverage_decrease_without_position_rejects_when_order_margin_topup_is_unf
     );
     let pos = position(&mut ctx, ALICE);
     assert_eq!(pos.leverage, 3);
-    assert_eq!(pos.margin_reserved, 333_333_333);
-    assert_eq!(wallet(&mut ctx, ALICE), 66_666_667);
+    assert_eq!(oo_im(&mut ctx, ALICE), 333_333_334);
+    assert_eq!(wallet(&mut ctx, ALICE), 400_000_000);
+    assert_eq!(
+        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap(),
+        66_666_666
+    );
 }
 
 #[test]
@@ -2464,25 +2512,55 @@ fn liquidate_settles_residual_at_mark_when_orderbook_cannot_fully_close() {
     assert_eq!(alice.v_quote_balance, 0);
 }
 
+/// CHANGED BY THE ESCROW REMOVAL (mechanism, not outcome). This used to assert that liquidation
+/// REFUNDS the cancelled orders' escrowed margin to the wallet — the fixture poked
+/// `margin_reserved = 33_000_000` in by hand and the wallet came back 33_000_000 richer. There is
+/// no escrow to refund: a cancel moves no money. What liquidation's cancel-all does is clear the
+/// position's `Bid`/`Ask`, which drops its open-order REQUIREMENT to 0 and so frees the same
+/// headroom without any transfer. The test now uses a REAL resting order (the hand-poked field is
+/// gone) and pins both halves: the wallet gets exactly the position settlement and not a unit
+/// more, and the requirement is 0 afterwards.
 #[test]
-fn liquidate_refunds_reserved_margin_before_market_close() {
+fn liquidate_clears_the_open_order_requirement_without_refunding_anything() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
-    let mut pos = position(&mut ctx, ALICE);
-    pos.margin_reserved = 33_000_000;
-    pos.buy_side_margin_reserved = 33_000_000;
-    storage::save_position(&mut ctx, ALICE, MARKET_ID, &pos).unwrap();
+    // A real resting bid, deep enough not to be hit by the liquidation's market sell (the fill
+    // band around the $90 mark is [$81, $99]). 3 units @ $27.00 = 81_000_000 of `Bid`; against
+    // the long's N = 900_000_000 at mark $90 and leverage 5:
+    //   ooIM = ROUND_UP(981_000_000 / 5) − ROUND_UP(900_000_000 / 5) = 16_200_000,
+    // comfortably inside ALICE's $50 wallet.
+    place_order(&mut ctx, ALICE, Side::Buy as u8, 2_700, 3);
     storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
+    assert_eq!(
+        oo_im(&mut ctx, ALICE),
+        16_200_000,
+        "requirement while resting"
+    );
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        USER_WALLET,
+        "placing it debited nothing"
+    );
     place_maker_order(&mut ctx, Side::Buy as u8, LONG_LIQ_PRICE, QTY as u64);
 
     liquidate(&mut ctx, ALICE).unwrap();
 
+    // Only the position settlement reaches the wallet — no reservation refund term.
     assert_eq!(
         wallet(&mut ctx, ALICE),
-        USER_WALLET + 33_000_000 + 100_000_000 - LONG_LIQ_TAKER_FEE
+        USER_WALLET + 100_000_000 - LONG_LIQ_TAKER_FEE
     );
-    assert_eq!(position(&mut ctx, ALICE).margin_reserved, 0);
+    // Cancel-all cleared the book side, so the requirement is gone.
+    assert_eq!(oo_im(&mut ctx, ALICE), 0);
+    let pos = position(&mut ctx, ALICE);
+    assert_eq!((pos.total_buy_qty, pos.total_buy_notional), (0, 0));
+    assert!(
+        storage::load_buy_orders(&mut ctx, ALICE, MARKET_ID)
+            .unwrap()
+            .is_empty(),
+        "cancel-all emptied the entry list"
+    );
 }
 
 // ── mark_price > 0 is a MARKET-LIFETIME INVARIANT ───────────────────────────
@@ -2684,4 +2762,386 @@ fn update_market_cannot_zero_the_mark_price() {
 
     // updateMarket carries no mark field, so the mark survives untouched.
     assert_eq!(storage::load_mark_price(&mut ctx, 7).unwrap(), ENTRY_PRICE);
+}
+
+// ── VALUE CONSERVATION (the primary correctness gate for the escrow removal) ─────────────────
+//
+// Deleting the open-order escrow moves money between buckets, so the thing that has to be proved
+// is that no bucket gains or loses a unit the others do not account for.
+//
+// # The identity
+//
+// Every USDC unit inside the perp system sits in exactly one of three places, and one accounting
+// adjustment closes the loop:
+//
+// ```text
+// E(p) = Σ_users perp_wallet_balance            // free collateral (the CROSS wallet)
+//      + Σ_positions margin                     // collateral allocated to a position
+//      + insurance_fund                         // the mutualised buffer
+//      + Σ_positions (v_quote_balance + signed_value(p, amount))   // unrealised PnL at price p
+// ```
+//
+// Notes on what is deliberately NOT in it:
+//
+// * **The open-order requirement is absent, and that is the point.** `Σ ooIM` is derived, never
+//   held: after this migration there is no third bucket for it. (Before the migration the same
+//   identity carried a `Σ margin_reserved` term.)
+// * **`market_fee_total` is a counter, not a balance.** Trading fees are credited to the ADMIN's
+//   `perp_wallet_balance`, which is already inside `Σ_users` — the admin is a user. Adding the
+//   counter as well would double-count every fee.
+// * **The unrealised-PnL term is needed** because a fill moves value between `v_quote_balance`
+//   and the wallet/margin. Both counterparties of a fill attribute the SAME single-floored
+//   `calc_value(price, qty)` (the split-floor rule), so `Σ v_quote` and `Σ amount` are each
+//   conserved by trading and the term nets to zero across the book — but it must be present for
+//   the per-user sum to balance.
+// * **It is evaluated at a PRICE.** `E(p) = C + p·A` with `C` and `A` both readable, and a
+//   liquidation residual that the book could not absorb is settled against no counterparty at the
+//   CURRENT mark: that changes `C` and `A` individually but leaves `E(mark)` fixed. So every
+//   assertion below evaluates the before-state and the after-state at the SAME price — the mark
+//   in force after the operation, which is the mark any residual settled at.
+//
+// # What breaks it, legitimately
+//
+// * **Socialised bad debt** (`InsuranceFundDepleted`): value the insurance fund could not cover
+//   is written off, and `E` rises by the uncovered amount. The fund is seeded far past anything
+//   these scenarios can produce, and the test asserts the event never fires.
+// * **Funding**, which is not a zero-sum transfer between longs and shorts here (it settles each
+//   position against the index and spills into the insurance fund). Disabled in this market.
+// * **`transferToPerp` / `transferFromPerp`**, which are genuine external flows. Not used here.
+#[cfg(test)]
+mod value_conservation {
+    use super::*;
+
+    const N: u64 = 8;
+    const SEED_WALLET: i64 = 400_000_000; // $400 each
+    const SEED_IF: u64 = 10_000_000_000; // deep enough that bad debt is always covered
+
+    fn user(i: u64) -> Address {
+        let mut b = [0u8; 20];
+        b[0] = 0x7C;
+        b[12..20].copy_from_slice(&i.to_be_bytes());
+        Address::from(b)
+    }
+
+    /// `(C, A)`: the price-independent part of the identity, and the net open interest.
+    /// `C = Σ(wallet + margin + v_quote) + insurance_fund`, `A = Σ amount`.
+    fn state(ctx: &mut TestCtx) -> (i128, i128) {
+        let mut c = storage::load_insurance_fund(ctx).unwrap() as i128;
+        let mut a: i128 = 0;
+        for i in 0..N {
+            let u = user(i);
+            let acc = storage::load_account(ctx, u).unwrap();
+            let p = storage::load_position(ctx, u, MARKET_ID).unwrap();
+            c += acc.perp_wallet_balance as i128 + p.margin as i128 + p.v_quote_balance as i128;
+            a += p.amount as i128;
+        }
+        // ADMIN is the trading-fee sink, so it is part of the closed system.
+        c += storage::load_account(ctx, ADMIN)
+            .unwrap()
+            .perp_wallet_balance as i128;
+        (c, a)
+    }
+
+    /// `E(p) = C + signed_value(p, A)`. `base_decimals = 0` and `price_decimals = 2` here, so
+    /// `calc_value` is exact (`p × q × 10^4`) and the per-user sum equals the value of the sum.
+    fn equity(c: i128, a: i128, price: u64) -> i128 {
+        let v = crate::math::calc_value(price, a.unsigned_abs() as u64, 0, PRICE_DECIMALS).unwrap()
+            as i128;
+        c + if a >= 0 { v } else { -v }
+    }
+
+    fn framed<F: FnOnce(&mut TestCtx) -> Result<Bytes, PerpError>>(ctx: &mut TestCtx, f: F) {
+        // EVM-framed exactly like on-chain: a genuine reject reverts the frame and must leave the
+        // system value untouched, so rejects are part of what this test covers.
+        let cp = ctx.journal_mut().checkpoint();
+        match f(ctx) {
+            Ok(_) => ctx.journal_mut().checkpoint_commit(),
+            Err(PerpError::Reject(_)) => ctx.journal_mut().checkpoint_revert(cp),
+            Err(e) => panic!("hard failure: {e:?}"),
+        }
+        ctx.journal_mut().commit_tx();
+    }
+
+    /// Fills, partial fills, cancels, leverage changes, liquidations and ADL, in a randomised
+    /// order, with the total system value re-checked after EVERY operation.
+    #[test]
+    fn a_randomised_operation_sequence_conserves_total_system_value() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        // A live clearance fee, so the liquidation → insurance-fund leg is exercised (it is a
+        // transfer inside the identity, not an inflow).
+        let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+        m.liquidation_fee_rate_bps = 50;
+        m.price_band_bps = 2_000; // ±20%, wide enough for the mark walk below
+        storage::save_market(&mut ctx, &m).unwrap();
+        storage::save_insurance_fund(&mut ctx, SEED_IF).unwrap();
+        for i in 0..N {
+            let u = user(i);
+            storage::save_account(
+                &mut ctx,
+                u,
+                UserAccount {
+                    perp_wallet_balance: SEED_WALLET,
+                    // Live fee rates: fees must move between users and ADMIN without leaking.
+                    maker_fee_bps: 5,
+                    taker_fee_bps: 10,
+                    ..UserAccount::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let mut s: u64 = 0xC0FFEE_1234_5678;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+
+        let mut resting: Vec<Option<[u8; 32]>> = vec![None; N as usize];
+        let (mut c0, mut a0) = state(&mut ctx);
+        let mut index_price: u64 = ENTRY_PRICE;
+        let mut ts: u64 = 100;
+        let mut liquidations = 0u32;
+        let mut fills = 0u32;
+
+        for op in 0..1200u32 {
+            let i = (rng() % N) as usize;
+            let who = user(i as u64);
+            let roll = rng() % 100;
+
+            if roll < 12 {
+                if let Some(id) = resting[i].take() {
+                    framed(&mut ctx, |c| {
+                        crate::trading::run_cancel_order(
+                            &crate::interface::IPerpDex::cancelOrderCall {
+                                orderId: id.into(),
+                                marketId: MARKET_ID,
+                            }
+                            .abi_encode(),
+                            who,
+                            c,
+                        )
+                    });
+                }
+            } else if roll < 20 {
+                let lev = 1 + rng() % 3;
+                framed(&mut ctx, |c| {
+                    run_set_leverage(
+                        &setLeverageCall {
+                            marketId: MARKET_ID,
+                            leverage: lev,
+                        }
+                        .abi_encode(),
+                        who,
+                        c,
+                    )
+                });
+            } else if roll < 90 {
+                // Place: passive limits build the book, aggressive limits cross it (fills,
+                // partial fills, and the taker cover path when the account is tight).
+                let mark = storage::load_mark_price(&mut ctx, MARKET_ID).unwrap();
+                let side = (rng() % 2) as u8;
+                let aggressive = rng() % 100 < 40;
+                let offset = (1 + rng() % 8) as u64 * 100; // $1..$8
+                let price = if (side == 0) == aggressive {
+                    mark.saturating_add(offset)
+                } else {
+                    mark.saturating_sub(offset).max(100)
+                };
+                let qty = 1 + rng() % 6;
+                let before = storage::load_position(&mut ctx, who, MARKET_ID)
+                    .unwrap()
+                    .amount;
+                let mut id = None;
+                framed(&mut ctx, |c| {
+                    let r = try_place_order(c, who, side, price, qty);
+                    if let Ok(bytes) = &r {
+                        id = Some(bytes[..32].try_into().unwrap());
+                    }
+                    r
+                });
+                if let Some(id) = id {
+                    resting[i] = Some(id);
+                }
+                if storage::load_position(&mut ctx, who, MARKET_ID)
+                    .unwrap()
+                    .amount
+                    != before
+                {
+                    fills += 1;
+                }
+            } else {
+                // Oracle update: moves the mark and runs the liquidation sweep (which runs ADL on
+                // any insolvent residual the book cannot absorb). The index is walked as a
+                // SAWTOOTH between $60 and $160 rather than a random walk — positions here run at
+                // leverage <= 3 against a 1/6 maintenance rate, so only a sustained ~35% adverse
+                // move actually puts one under water, and the point of this test is to reach the
+                // liquidation / residual-settle / ADL paths, not to wander near the entry price.
+                let target: i64 = if (op / 150) % 2 == 0 { 6_000 } else { 16_000 };
+                let drift = (target - index_price as i64) / 6;
+                let jitter = (rng() % 600) as i64 - 300;
+                index_price = (index_price as i64 + drift + jitter).clamp(4_000, 20_000) as u64;
+                ts += 16;
+                let registry_before = storage::load_position_registry(&mut ctx, MARKET_ID)
+                    .unwrap()
+                    .len();
+                framed(&mut ctx, |c| {
+                    run_update_index_price(
+                        &updateIndexPriceCall {
+                            marketId: MARKET_ID,
+                            indexPrice: index_price,
+                            timestamp: ts,
+                        }
+                        .abi_encode(),
+                        ADMIN,
+                        c,
+                    )
+                });
+                let registry_after = storage::load_position_registry(&mut ctx, MARKET_ID)
+                    .unwrap()
+                    .len();
+                liquidations += registry_before.saturating_sub(registry_after) as u32;
+            }
+
+            // ── The gate ──
+            // Both sides evaluated at the POST-operation mark: that is the price any liquidation
+            // residual was settled at, and the only price at which the identity closes across it.
+            let mark = storage::load_mark_price(&mut ctx, MARKET_ID).unwrap();
+            let (c1, a1) = state(&mut ctx);
+            assert_eq!(
+                equity(c1, a1, mark),
+                equity(c0, a0, mark),
+                "value leaked at op {op}: {} (mark {mark})",
+                equity(c1, a1, mark) - equity(c0, a0, mark)
+            );
+            // Socialised bad debt would make `E` rise LEGITIMATELY, so the gate above would stop
+            // meaning anything. `absorb_from_insurance_fund` can only leave a remainder once the
+            // fund is exhausted, so a strictly-positive fund proves no write-off happened. (The
+            // events themselves are unreadable here: `commit_tx` drains the journal's log buffer.)
+            assert!(
+                storage::load_insurance_fund(&mut ctx).unwrap() > 0,
+                "insurance fund exhausted at op {op} — E is no longer comparable"
+            );
+            // Never a negative wallet: with the escrow gone, position margin is funded from the
+            // wallet at fill time, and an underfunded maker must be REFUSED (its order cancelled),
+            // never allowed to back real margin with untracked debt.
+            for k in 0..N {
+                let w = storage::load_account(&mut ctx, user(k))
+                    .unwrap()
+                    .perp_wallet_balance;
+                assert!(w >= 0, "user {k} wallet went negative ({w}) at op {op}");
+            }
+            c0 = c1;
+            a0 = a1;
+        }
+
+        // The scenario has to actually reach the interesting paths, or it proves nothing.
+        println!("conservation scenario: {fills} fills, {liquidations} liquidations");
+        assert!(fills > 100, "too few fills: {fills}");
+        assert!(liquidations > 0, "no position was ever liquidated");
+        // ADL is deliberately NOT asserted here: it needs an insolvent residual the book could not
+        // absorb AND an opposite-side holder with no resting orders at all, which a book-building
+        // fuzz almost never produces. It gets its own deterministic leg below (and
+        // `adl_closes_insolvent_residual_against_opposite_holder_conserving_no_if` above covers
+        // the mechanics).
+    }
+
+    /// The ADL leg of the same identity: a forced close against a real counterparty at the
+    /// liquidated position's bankruptcy price must move value between the two participants and
+    /// create none. Deterministic, because the fuzz above cannot reliably reach it.
+    #[test]
+    fn an_adl_forced_close_conserves_total_system_value() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        storage::save_insurance_fund(&mut ctx, SEED_IF).unwrap();
+
+        // user(0): 5x long 10 @ $100 (margin $200, vq −$1000) — the position that goes under.
+        // user(1): the sole opposite holder, 5x short 10 @ $100, OFF-BOOK (no resting orders),
+        //          deeply in profit once the mark crashes. This is the ADL counterparty.
+        // (Same shape as `adl_closes_insolvent_residual_against_opposite_holder_conserving_no_if`,
+        // re-measured here against the full system identity rather than a two-user sum.)
+        for (i, amount, vq) in [(0u64, QTY, -ENTRY_VALUE), (1, -QTY, ENTRY_VALUE)] {
+            storage::save_account(
+                &mut ctx,
+                user(i),
+                UserAccount {
+                    perp_wallet_balance: SEED_WALLET,
+                    ..UserAccount::default()
+                },
+            )
+            .unwrap();
+            storage::save_position(
+                &mut ctx,
+                user(i),
+                MARKET_ID,
+                &PerpPosition {
+                    amount,
+                    v_quote_balance: vq,
+                    margin: MARGIN,
+                    leverage: 5,
+                    ..PerpPosition::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let (c0, a0) = state(&mut ctx);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        // Crash to $75, past the long's $80 bankruptcy price, with an EMPTY book — so the
+        // liquidation's market close fills nothing and the whole insolvent residual reaches ADL.
+        // Called directly, not through `framed`: `commit_tx` drains the journal's log buffer, and
+        // the ADL / depletion events are what this test reads back.
+        run_update_index_price(
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: 7_500,
+                timestamp: 31,
+            }
+            .abi_encode(),
+            ADMIN,
+            &mut ctx,
+        )
+        .unwrap();
+
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        let adls = logs
+            .iter()
+            .filter(|l| {
+                l.data.topics().first() == Some(&crate::interface::IPerpDex::Adl::SIGNATURE_HASH)
+            })
+            .count();
+        let depleted = logs
+            .iter()
+            .filter(|l| {
+                l.data.topics().first()
+                    == Some(&crate::interface::IPerpDex::InsuranceFundDepleted::SIGNATURE_HASH)
+            })
+            .count();
+        assert!(adls > 0, "the residual did not reach ADL");
+        assert_eq!(
+            depleted, 0,
+            "no socialised write-off — E must be comparable"
+        );
+
+        let mark = storage::load_mark_price(&mut ctx, MARKET_ID).unwrap();
+        let (c1, a1) = state(&mut ctx);
+        assert_eq!(
+            equity(c1, a1, mark),
+            equity(c0, a0, mark),
+            "ADL leaked {}",
+            equity(c1, a1, mark) - equity(c0, a0, mark)
+        );
+        // ADL is a real trade, so it conserves Σ amount too — unlike a residual settled at mark.
+        assert_eq!(a1, a0, "ADL must not mint or burn open interest");
+        assert_eq!(
+            storage::load_position(&mut ctx, user(0), MARKET_ID)
+                .unwrap()
+                .amount,
+            0,
+            "the insolvent residual was fully deleveraged"
+        );
+    }
 }

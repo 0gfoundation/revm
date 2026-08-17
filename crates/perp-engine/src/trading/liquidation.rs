@@ -232,10 +232,11 @@ pub(crate) fn run_adl<H: PerpHost>(
         if wp.amount == 0 || (wp.amount > 0) == loser_is_long {
             continue; // flat or same side as the loser
         }
-        // v1: skip holders with ANY resting order — avoids the flip-aware reservation recompute /
-        // order auto-cancel an ADL fill on them would require. Asked DIRECTLY of the order lists,
-        // not proxied through `margin_reserved != 0`: a PURE-REDUCE order (fully absorbed by the
-        // position) reserves ZERO margin, so the reservation proxy would let such a holder through.
+        // v1: skip holders with ANY resting order — an ADL fill moves their position, which
+        // re-prices every order they have resting, and v1 does not want to reason about that.
+        // Asked DIRECTLY of the order lists, never proxied through "their open-order requirement
+        // is non-zero": a PURE-REDUCE order (fully absorbed by the position) requires ZERO margin,
+        // so a requirement-based proxy would let such a holder through.
         if !storage::load_buy_orders_ref(context, user, market.market_id)?.is_empty()
             || !storage::load_sell_orders_ref(context, user, market.market_id)?.is_empty()
         {

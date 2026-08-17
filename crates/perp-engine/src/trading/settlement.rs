@@ -113,19 +113,20 @@ impl TakerSettlement {
     ///
     /// 1. **Apply position fill** — mutates `pos` and credits realised PnL from
     ///    the closing leg to the wallet.
-    /// 2. **Recompute margin_reserved** — `pos.amount` changed; cross-side
-    ///    netting for the taker's remaining open orders must be updated so that
-    ///    subsequent order placement sees accurate available margin.
-    /// 3. **Compute fee** — based solely on traded notional.
-    /// 4. **Save** — persists all position and PnL changes in one write so that
+    /// 2. **Compute fee** — based solely on traded notional, charged out of the margin the fill
+    ///    funds (`fee_from_margin = min(fee, opening_margin)`), remainder from the wallet.
+    /// 3. **Save** — persists all position and PnL changes in one write so that
     ///    the next step reads the correct wallet balance from storage.
-    /// 5. **Ensure wallet covers opening margin + fee** — if short, same-side
-    ///    open orders are auto-cancelled (LIFO) to free reserved margin.
-    ///    `release_margin_for_cancelled_order` saves its own pos updates, so
-    ///    only account needs to be reloaded after this step.
-    /// 6. **Deduct opening margin and fee from wallet** — both deducted cleanly
+    /// 4. **Ensure the AVAILABLE balance covers opening margin + fee** — if short, same-side open
+    ///    orders are auto-cancelled (LIFO). Cancelling frees no cash (nothing is escrowed); it
+    ///    lowers `Bid`/`Ask` and so lowers `Σ ooIM`, which raises the available.
+    /// 5. **Deduct opening margin and fee from wallet** — both deducted cleanly
     ///    from the wallet; position margin is never touched for fee payment.
-    /// 7. **Emit log** — single `PositionChanged` event for the full order.
+    /// 6. **Emit log** — single `PositionChanged` event for the full order.
+    ///
+    /// The old step 2, "recompute `margin_reserved`", is gone with the escrow: the fill's effect
+    /// on the taker's remaining open-order requirement is picked up on the next `ooIM` evaluation
+    /// from the new `pos.amount`, with no stored field to reconcile.
     pub(super) fn finalize_compute<H: PerpHost>(
         self,
         context: &mut H,
@@ -155,24 +156,27 @@ impl TakerSettlement {
             // Measure against the state `rest_in_book` will see AFTER the flush: the taker's
             // registry working copy if the walk already touched it (a self-match maker the K9 guard
             // cancelled — the flush writes exactly that copy, funding included), else storage.
-            let affordable = match reg.user_work(self.user) {
-                Some(w) => rest_is_affordable(
-                    &w.pos,
-                    &w.account,
-                    &w.buy_entries,
-                    &w.sell_entries,
-                    taker_side,
-                    r,
-                    market,
-                )?,
-                None => {
-                    let pos = storage::load_position_ref(context, self.user, self.market_id)?;
-                    let account = storage::load_account_ref(context, self.user)?;
-                    let buy = storage::load_buy_orders_ref(context, self.user, self.market_id)?;
-                    let sell = storage::load_sell_orders_ref(context, self.user, self.market_id)?;
-                    rest_is_affordable(&pos, &account, &buy, &sell, taker_side, r, market)?
-                }
+            let (bd, pd) = (market.base_decimals, market.price_decimals);
+            let (pos, wallet) = match reg.user_work(self.user) {
+                Some(w) => (
+                    work_position_snapshot(w, bd, pd)?,
+                    w.account.perp_wallet_balance,
+                ),
+                None => (
+                    (*storage::load_position_ref(context, self.user, self.market_id)?).clone(),
+                    storage::load_account_ref(context, self.user)?.perp_wallet_balance,
+                ),
             };
+            let affordable = rest_is_affordable(
+                context,
+                self.user,
+                self.market_id,
+                &pos,
+                wallet,
+                taker_side,
+                r,
+                market,
+            )?;
             if !affordable {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
@@ -189,8 +193,6 @@ impl TakerSettlement {
         let core = finalize_core(
             &mut w.pos,
             &mut w.account,
-            &w.buy_entries,
-            &w.sell_entries,
             &self.fills,
             taker_side,
             mark,
@@ -198,77 +200,61 @@ impl TakerSettlement {
             market,
         )?;
 
-        // commit-only #23 perf (Level 2): the resting remainder's reservation delta is computed
-        // CLONE-FREE — temporarily insert the entry into the taker's REAL list, measure, then
-        // remove it (Vec insert+remove at the same index is an exact identity restore), cloning
-        // only an O(1) PerpPosition. The list is left pristine for flush.
+        // ── Derived-ooIM gate for "these fills, then rest the remainder" ─────────────────────
+        // Two things must come out of the same available balance: `core.total_required` (real
+        // cash — the opening margin plus the part of the fee margin could not absorb) and the
+        // marginal `ooIM` of the order about to rest. Neither is escrowed; the second is not even
+        // a debit, it just raises the requirement.
+        //
+        // Everything is measured on the POST-FILL state the flush is about to write:
+        // `after_fills` is `w.pos` with `Bid`/`Ask` taken from the working lists the walk has
+        // already consumed entries from, and the wallet is `w.account`'s, which already carries
+        // this fill's close proceeds. That is exactly what `finalize_apply` will re-derive from
+        // storage after the flush, so the pre-flush decision and the post-flush one agree.
+        let (bd, pd) = (market.base_decimals, market.price_decimals);
+        let after_fills = work_position_snapshot(w, bd, pd)?;
         let rest_delta = match &rest {
             Some(r) => {
-                let entry = crate::types::OrderEntry {
-                    order_id: [0u8; 32],
-                    price: r.price,
-                    amount: r.qty,
-                    maker_fee_bps: r.maker_fee_bps,
-                };
-                let old_mr = w.pos.margin_reserved;
-                let idx = match taker_side {
-                    Side::Buy => {
-                        let i = w.buy_entries.partition_point(|e| e.price > r.price);
-                        w.buy_entries.insert(i, entry);
-                        i
-                    }
-                    Side::Sell => {
-                        let i = w.sell_entries.partition_point(|e| e.price < r.price);
-                        w.sell_entries.insert(i, entry);
-                        i
-                    }
-                };
-                let res = crate::math::calc_reservation_notionals_it(
-                    w.buy_entries.iter().copied(),
-                    w.sell_entries.iter().copied(),
-                    market.base_decimals,
-                    market.price_decimals,
-                    w.pos.amount,
-                );
-                // Restore the list BEFORE propagating any error, so w stays pristine for flush.
-                match taker_side {
-                    Side::Buy => {
-                        w.buy_entries.remove(idx);
-                    }
-                    Side::Sell => {
-                        w.sell_entries.remove(idx);
-                    }
-                }
-                let (bn, sn, cn) = res?;
-                let mut tp = w.pos.clone();
-                tp.set_reservations(bn, sn, cn, w.pos.leverage);
-                // Margin reservation ONLY — resting escrows no fee (see `rest_in_book`).
-                tp.margin_reserved.saturating_sub(old_mr)
+                let after_rest = with_rest_entry(&after_fills, taker_side, r, bd, pd)?;
+                crate::margin_view::derived_requirement_delta(market, &after_fills, &after_rest)?
             }
             None => 0,
         };
-        let need = core
-            .total_required
+        let need = (core.total_required as i128)
             .checked_add(rest_delta)
             .ok_or_else(|| perp_err("placeOrder: fills+rest requirement overflow"))?;
+        let wallet = w.account.perp_wallet_balance;
+        let available = crate::margin_view::derived_available_balance_with(
+            context,
+            self.user,
+            Some(wallet),
+            Some((self.market_id, &after_fills)),
+        )?;
 
-        // LEVEL 1 fast path (the common case): the taker's wallet already covers fills + rest with
-        // NO same-side cancels → produce the plan with ZERO order-list clones. Correct because
-        // has_available(total_required + rest_delta) implies no cover is needed AND the post-fill
-        // leftover (wallet − total_required) ≥ rest_delta, so finalize_apply's real cover loop does
-        // nothing and rest_in_book's check passes. Only a genuinely tight taker falls to the cover
-        // simulation below.
-        if !w.account.has_available_perp(need) {
+        // LEVEL 1 fast path (the common case): the available already covers fills + rest with NO
+        // cover cancels → produce the plan with ZERO order-list clones. Correct because covering
+        // `total_required + rest_delta` implies `finalize_apply`'s cover loop does nothing AND the
+        // post-debit leftover still covers the rest. Only a genuinely tight taker falls through.
+        if !crate::margin_view::derived_can_afford(available, need) {
             // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
-            // release_margin_core so the sim cannot diverge from finalize_apply's real loop. Rest
-            // feasibility is re-checked on the POST-cover sim list (cover shrinks the taker side,
-            // changing the rest reservation — so rest_delta above, computed pre-cover, is only used
-            // for the fast-path check; the cover branch re-derives it post-cover).
-            let mut sim_pos = w.pos.clone();
-            let mut sim_account = w.account.clone();
+            // `release_margin_core` so the sim cannot diverge from `finalize_apply`'s real loop.
+            // A cancel frees no cash now — it lowers `Bid`/`Ask` and therefore `Σ ooIM`, which is
+            // what raises the available. Rest feasibility is re-checked on the POST-cover state
+            // (cover shrinks the taker's side, changing the rest's marginal requirement, so the
+            // `rest_delta` computed above is only used for the fast-path test).
+            let mut sim_pos = after_fills.clone();
             let mut sim_buy = w.buy_entries.clone();
             let mut sim_sell = w.sell_entries.clone();
-            while !sim_account.has_available_perp(core.total_required) {
+            loop {
+                let avail = crate::margin_view::derived_available_balance_with(
+                    context,
+                    self.user,
+                    Some(wallet),
+                    Some((self.market_id, &sim_pos)),
+                )?;
+                if crate::margin_view::derived_can_afford(avail, core.total_required as i128) {
+                    break;
+                }
                 let next = match taker_side {
                     Side::Buy => sim_buy.back().map(|e| e.order_id),
                     Side::Sell => sim_sell.back().map(|e| e.order_id),
@@ -278,7 +264,6 @@ impl TakerSettlement {
                 };
                 super::release_margin_core(
                     &mut sim_pos,
-                    &mut sim_account,
                     &mut sim_buy,
                     &mut sim_sell,
                     taker_side,
@@ -286,35 +271,24 @@ impl TakerSettlement {
                     market,
                 )?;
             }
-            sim_account.debit_perp(core.total_required)?;
             if let Some(r) = &rest {
-                let new_entry = crate::types::OrderEntry {
-                    order_id: [0u8; 32],
-                    price: r.price,
-                    amount: r.qty,
-                    maker_fee_bps: r.maker_fee_bps,
-                };
-                match taker_side {
-                    Side::Buy => {
-                        let i = sim_buy.partition_point(|e| e.price > r.price);
-                        sim_buy.insert(i, new_entry);
-                    }
-                    Side::Sell => {
-                        let i = sim_sell.partition_point(|e| e.price < r.price);
-                        sim_sell.insert(i, new_entry);
-                    }
-                }
-                let (bn, sn, cn) = crate::math::calc_reservation_notionals_it(
-                    sim_buy.iter().copied(),
-                    sim_sell.iter().copied(),
-                    market.base_decimals,
-                    market.price_decimals,
-                    sim_pos.amount,
+                // Post-cover, post-debit: the rest must fit in what is left.
+                let wallet_after = wallet
+                    .checked_sub(checked_u64_to_i64(
+                        core.total_required,
+                        "settlement: taker total required",
+                    )?)
+                    .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
+                let after_rest = with_rest_entry(&sim_pos, taker_side, r, bd, pd)?;
+                let delta =
+                    crate::margin_view::derived_requirement_delta(market, &sim_pos, &after_rest)?;
+                let avail = crate::margin_view::derived_available_balance_with(
+                    context,
+                    self.user,
+                    Some(wallet_after),
+                    Some((self.market_id, &sim_pos)),
                 )?;
-                let old_reserved = sim_pos.margin_reserved;
-                sim_pos.set_reservations(bn, sn, cn, sim_pos.leverage);
-                let delta = sim_pos.margin_reserved.saturating_sub(old_reserved);
-                if !sim_account.has_available_perp(delta) {
+                if !crate::margin_view::derived_can_afford(avail, delta) {
                     return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
                 }
             }
@@ -339,74 +313,96 @@ impl TakerSettlement {
 }
 
 /// The taker's intent to rest its unmatched remainder (commit-only #23 atomic-reject): the
-/// resting order's price, quantity, and the taker's maker-fee bps — enough for [`finalize_compute`]
-/// to pre-validate the rest's margin against the post-fill wallet.
+/// resting order's price and quantity — enough for [`finalize_compute`] to pre-validate the
+/// rest's derived requirement against the post-fill available balance. (The taker's maker-fee bps
+/// used to ride along too, for the escrow probe's `OrderEntry`; the requirement is a function of
+/// `(price, qty)` alone, so it is gone.)
 pub(super) struct RestReq {
     pub(super) price: u64,
     pub(super) qty: u64,
-    pub(super) maker_fee_bps: u64,
 }
 
-/// Can `rest` be funded from this (pos, account, order-list) state? The zero-fill arm of
+/// The registry working copy's position AS THE FLUSH WILL WRITE IT: `w.pos` with the per-side
+/// aggregates resynced from the working order lists, which are the authoritative record of what
+/// the match walk has consumed so far.
+///
+/// The aggregates ARE `Bid`/`Ask`, and `Bid`/`Ask` are inputs to `ooIM`, so any gate evaluated
+/// mid-match has to see the walk's effect on them. `settle_maker_fill_core` and
+/// `release_margin_core` maintain them incrementally as they mutate the lists; this recomputes
+/// from the lists so a gate can never be decided on a stale aggregate, and the flush asserts the
+/// two agree.
+fn work_position_snapshot(
+    w: &UserWork,
+    base_decimals: u32,
+    price_decimals: u32,
+) -> Result<crate::types::PerpPosition, PerpError> {
+    let mut pos = w.pos.clone();
+    let (tbq, tbn) =
+        crate::math::sum_side_totals(w.buy_entries.iter().copied(), base_decimals, price_decimals)?;
+    let (tsq, tsn) = crate::math::sum_side_totals(
+        w.sell_entries.iter().copied(),
+        base_decimals,
+        price_decimals,
+    )?;
+    pos.total_buy_qty = tbq;
+    pos.total_buy_notional = tbn;
+    pos.total_sell_qty = tsq;
+    pos.total_sell_notional = tsn;
+    Ok(pos)
+}
+
+/// `pos` with the taker's would-be resting remainder folded into `Bid`/`Ask` — the hypothetical
+/// the rest gate prices. No list is materialised: the requirement reads only the aggregates, and
+/// the order contributes exactly the per-order-floored `calc_value` term it would add to the fold.
+fn with_rest_entry(
+    pos: &crate::types::PerpPosition,
+    taker_side: Side,
+    rest: &RestReq,
+    base_decimals: u32,
+    price_decimals: u32,
+) -> Result<crate::types::PerpPosition, PerpError> {
+    let notional = calc_value(rest.price, rest.qty, base_decimals, price_decimals)?;
+    let mut after = pos.clone();
+    let (qty_field, notional_field) = match taker_side {
+        Side::Buy => (&mut after.total_buy_qty, &mut after.total_buy_notional),
+        Side::Sell => (&mut after.total_sell_qty, &mut after.total_sell_notional),
+    };
+    *qty_field = qty_field
+        .checked_add(rest.qty)
+        .ok_or_else(|| perp_err("placeOrder: rest qty overflow"))?;
+    *notional_field = notional_field
+        .checked_add(notional)
+        .ok_or_else(|| perp_err("placeOrder: rest notional overflow"))?;
+    Ok(after)
+}
+
+/// Can `rest` be admitted from this state? The zero-fill arm of
 /// [`TakerSettlement::finalize_compute`] uses this to raise the rest-margin reject BEFORE the
 /// registry flush, so the walk's writes never commit under an order that is about to be refused.
 ///
-/// The formula is `rest_in_book`'s own, evaluated CLONE-FREE over the hypothetical
-/// "list ⊕ rest entry at its sorted slot" (`calc_reservation_notionals_it` folds the chained
-/// iterator, byte-identically to inserting first): flip-aware `margin_reserved` delta + the
-/// order's reserved maker fee, checked against the available wallet. Being the same formula on the
-/// same state is what makes the pre-flush reject sound — `rest_in_book`'s later check cannot then
-/// fire post-write.
-fn rest_is_affordable(
+/// The formula is `rest_in_book`'s own — `derived_available >= Δ ooIM`, evaluated over the same
+/// hypothetical `Bid`/`Ask` — on the same state. Being the same test on the same state is what
+/// makes the pre-flush reject sound: `rest_in_book`'s later check cannot then fire post-write.
+fn rest_is_affordable<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
     pos: &crate::types::PerpPosition,
-    account: &crate::types::UserAccount,
-    buy_entries: &std::collections::VecDeque<crate::types::OrderEntry>,
-    sell_entries: &std::collections::VecDeque<crate::types::OrderEntry>,
+    wallet: i64,
     taker_side: Side,
     rest: &RestReq,
     market: &crate::types::Market,
 ) -> Result<bool, PerpError> {
-    let entry = crate::types::OrderEntry {
-        order_id: [0u8; 32],
-        price: rest.price,
-        amount: rest.qty,
-        maker_fee_bps: rest.maker_fee_bps,
-    };
     let (bd, pd) = (market.base_decimals, market.price_decimals);
-    let (bn, sn, cn) = match taker_side {
-        Side::Buy => {
-            let i = buy_entries.partition_point(|e| e.price > rest.price);
-            crate::math::calc_reservation_notionals_it(
-                buy_entries
-                    .range(..i)
-                    .copied()
-                    .chain(core::iter::once(entry))
-                    .chain(buy_entries.range(i..).copied()),
-                sell_entries.iter().copied(),
-                bd,
-                pd,
-                pos.amount,
-            )?
-        }
-        Side::Sell => {
-            let i = sell_entries.partition_point(|e| e.price < rest.price);
-            crate::math::calc_reservation_notionals_it(
-                buy_entries.iter().copied(),
-                sell_entries
-                    .range(..i)
-                    .copied()
-                    .chain(core::iter::once(entry))
-                    .chain(sell_entries.range(i..).copied()),
-                bd,
-                pd,
-                pos.amount,
-            )?
-        }
-    };
-    let mut probe = pos.clone();
-    probe.set_reservations(bn, sn, cn, pos.leverage);
-    let delta = probe.margin_reserved.saturating_sub(pos.margin_reserved);
-    Ok(account.has_available_perp(delta))
+    let after = with_rest_entry(pos, taker_side, rest, bd, pd)?;
+    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
+    let available = crate::margin_view::derived_available_balance_with(
+        context,
+        user,
+        Some(wallet),
+        Some((market_id, pos)),
+    )?;
+    Ok(crate::margin_view::derived_can_afford(available, delta))
 }
 
 /// The taker settlement's APPLY half (commit-only #23 L2b): everything after the decision —
@@ -469,10 +465,18 @@ pub(super) fn finalize_apply<H: PerpHost>(
 pub(super) enum MakerFillOutcome {
     /// The fill was applied; carries the maker's trading fee.
     Filled { maker_fee: u64 },
-    /// Filling this maker would have opened/increased its position below the maintenance-margin
-    /// threshold at the current mark (K9). The fill was NOT applied; the caller must cancel the
-    /// maker order. Funding accrued on the maker's position IS settled and persisted (it is owed
-    /// regardless of the fill, and may already have touched the Insurance Fund inline).
+    /// The fill was NOT applied and the caller must cancel the maker order. Three triggers, all
+    /// meaning "this maker cannot take this fill":
+    ///
+    /// 1. it would open/increase the position below the maintenance-margin threshold at the
+    ///    current mark (K9);
+    /// 2. it would open at a leverage the resulting size's margin tier no longer permits;
+    /// 3. **the maker's wallet cannot fund the opening margin.** New with the escrow removal —
+    ///    placement no longer withholds that capital, so it has to be there at fill time and may
+    ///    not be. See the long note in [`settle_maker_fill_core`].
+    ///
+    /// Funding accrued on the maker's position IS settled and persisted regardless (it is owed
+    /// whether or not the fill happens, and may already have touched the Insurance Fund inline).
     RejectedInsolvent,
 }
 
@@ -820,13 +824,25 @@ impl MatchRegistry {
             if w.dirty_sell {
                 storage::save_sell_orders(context, user, market_id, &w.sell_entries)?;
             }
-            // #A: the match may have filled/cancelled maker & taker orders — resync the maintained
-            // reservation aggregates from the authoritative working-copy lists (recompute, not
-            // incremental: the match path is rare and already re-serialises the whole list here).
-            let (tbq, tbn) =
-                crate::math::sum_side_totals(w.buy_entries.iter().copied(), bd, pd)?;
-            let (tsq, tsn) =
-                crate::math::sum_side_totals(w.sell_entries.iter().copied(), bd, pd)?;
+            // The match may have filled/cancelled maker & taker orders — resync the per-side
+            // aggregates from the authoritative working-copy lists (recompute, not incremental:
+            // the match path is rare and already re-serialises the whole list here).
+            let (tbq, tbn) = crate::math::sum_side_totals(w.buy_entries.iter().copied(), bd, pd)?;
+            let (tsq, tsn) = crate::math::sum_side_totals(w.sell_entries.iter().copied(), bd, pd)?;
+            // ...and the walk maintains them INCREMENTALLY as it goes, because the gates it
+            // evaluates mid-match (and `release_margin_core`, which subtracts from them) read
+            // them. Belt-and-braces: the two must agree, or a gate was decided on a stale `Bid`.
+            debug_assert_eq!(
+                (
+                    w.pos.total_buy_qty,
+                    w.pos.total_buy_notional,
+                    w.pos.total_sell_qty,
+                    w.pos.total_sell_notional
+                ),
+                (tbq, tbn, tsq, tsn),
+                "match flush: incrementally-maintained (Bid, Ask) for {user} diverged from the \
+                 working-copy order lists"
+            );
             w.pos.total_buy_qty = tbq;
             w.pos.total_buy_notional = tbn;
             w.pos.total_sell_qty = tsq;
@@ -917,9 +933,10 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     Ok(MakerFillOutcome::Filled { maker_fee })
 }
 
-/// Registry-backed K9 maker cancel: releases the rejected order's margin on the registry copies
-/// (flushed later) and writes the order status + OrderCancelled log immediately (same positions
-/// as today's cancel_rejected_maker).
+/// Registry-backed maker cancel for a `RejectedInsolvent` fill: drops the rejected order from the
+/// registry copies (flushed later) and writes the order status + OrderCancelled log immediately
+/// (same stream positions as before). No money moves — the order held no escrow; removing it from
+/// `Bid`/`Ask` is the whole effect.
 pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
     context: &mut H,
     reg: &mut MatchRegistry,
@@ -934,7 +951,6 @@ pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
     let w = &mut reg.users[i].1;
     super::release_margin_core(
         &mut w.pos,
-        &mut w.account,
         &mut w.buy_entries,
         &mut w.sell_entries,
         maker_side,
@@ -969,17 +985,17 @@ pub(super) struct TakerFillCore {
 }
 
 /// PURE core of [`TakerSettlement::finalize`] (commit-only #23, tranche-4): fill aggregation
-/// (conservation-exact close/open split), position fill, K9 open-into-insolvency guard, flip-aware
-/// reserve recompute + MR reconciliation, fee + total-required — over in-memory copies only, NO
-/// storage access. Any `Err` (K9 reject, checked arithmetic) fires before the caller has written
-/// anything. The entry lists are read-only here (the taker's lists are only mutated by the
-/// wallet-cover cancels, which remain in the storage wrapper).
+/// (conservation-exact close/open split), position fill, K9 open-into-insolvency guard, fee +
+/// total-required — over in-memory copies only, NO storage access. Any `Err` (K9 reject, checked
+/// arithmetic) fires before the caller has written anything.
+///
+/// It no longer needs the taker's order lists: they were inputs to the flip-aware reservation
+/// recompute, which went with the escrow. The fills do not touch the taker's own resting orders
+/// (except on a self-match, which the registry handles on the maker side).
 #[allow(clippy::too_many_arguments)]
 fn finalize_core(
     pos: &mut crate::types::PerpPosition,
     account: &mut crate::types::UserAccount,
-    buy_entries: &std::collections::VecDeque<crate::types::OrderEntry>,
-    sell_entries: &std::collections::VecDeque<crate::types::OrderEntry>,
     fills: &[RecordedFill],
     taker_side: Side,
     mark_price: u64,
@@ -1108,35 +1124,20 @@ fn finalize_core(
         }
     }
 
-    // pos.amount changed; recompute margin_reserved so cross-side netting for the taker's
-    // remaining open orders reflects the new position size. MR delta reconciles with the wallet
-    // via mr_credit/mr_extra; without this, W + M + MR is not conserved across the fill.
-    let old_mr = pos.margin_reserved;
-    let (buy_notional, sell_notional, c_notional) =
-        crate::math::calc_reservation_notionals_it(
-            buy_entries.iter().copied(),
-            sell_entries.iter().copied(),
-        market.base_decimals,
-        market.price_decimals,
-        pos.amount,
-    )?;
-    pos.set_reservations(buy_notional, sell_notional, c_notional, pos.leverage);
-    let new_mr = pos.margin_reserved;
-    let mr_credit = old_mr.saturating_sub(new_mr); // MR decreased: freed margin back to wallet
-    let mr_extra = new_mr.saturating_sub(old_mr); // MR increased: wallet must cover the gap
-    account.credit_perp(mr_credit)?;
-
-    // The wallet funds the opening margin, the reservation growth, and only the part of the fee
-    // the opening margin could not absorb. Conservation: wallet moves by
-    // −(opening_margin + fee_from_wallet + mr_extra), margin by +(opening_margin − fee_from_margin)
-    // and MR by +mr_extra, so the user's net change is exactly −fee — the full amount
-    // `finalize_apply` hands to the fee recipient.
+    // The reservation recompute that used to sit here is GONE with the escrow. `pos.amount`
+    // changing does re-price the taker's remaining resting orders — but on the DERIVED basis that
+    // shows up by itself, in the next `ooIM` evaluation, with no stored field to reconcile and no
+    // `mr_credit`/`mr_extra` wallet legs to keep `W + M + MR` conserved. `W + M` is conserved here
+    // by construction: the wallet funds exactly what the position and the fee recipient receive.
+    //
+    // The wallet funds the opening margin plus only the part of the fee the opening margin could
+    // not absorb. Conservation: wallet moves by −(opening_margin + fee_from_wallet), margin by
+    // +(opening_margin − fee_from_margin), so the user's net change is exactly −fee — the full
+    // amount `finalize_apply` hands to the fee recipient.
     let total_required = fill_outcome
         .opening_margin
         .checked_add(fee_from_wallet)
-        .ok_or_else(|| perp_err("placeOrder: opening margin + fee overflow"))?
-        .checked_add(mr_extra)
-        .ok_or_else(|| perp_err("placeOrder: total required overflow"))?;
+        .ok_or_else(|| perp_err("placeOrder: opening margin + fee overflow"))?;
 
     Ok(TakerFillCore {
         bad_debt: fill_outcome.bad_debt,
@@ -1177,11 +1178,6 @@ pub(super) fn settle_maker_fill_core(
     fill_qty: u64,
     market: &crate::types::Market,
 ) -> Result<MakerFillCore, PerpError> {
-    // Snapshot before mutations — used to verify and release the pre-fill reservation. MUST be
-    // the flip-aware reservation (pos.margin_reserved), the same quantity new_reserved is
-    // recomputed as below.
-    let old_reserved = pos.margin_reserved;
-
     // READ-ONLY: locate the maker's book entry and price this fill's share of the order's maker
     // fee. Done up front because the fee must be charged BEFORE the K9 check below, while the
     // entry itself may only be reduced once the fill is accepted (a K9 reject leaves the entry in
@@ -1236,6 +1232,35 @@ pub(super) fn settle_maker_fill_core(
         .checked_sub(from_wallet_i64)
         .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
 
+    // ── Opening margin now comes out of the WALLET, at fill time ──────────────────────────────
+    // Under the escrow this was free here: `apply_position_fill` added `opening_margin` to
+    // `pos.margin` and the money came from `old_reserved`, the capital placement had already
+    // withheld. Nothing is withheld any more, so the wallet has to fund it NOW — and the money may
+    // not be there. `perp_wallet_balance` is only guaranteed to cover `Σ ooIM` at the moment each
+    // order was ADMITTED; a later mark move, a taker fill, or a fee can leave it short, and ooIM
+    // (which values the position leg at MARK and nets the close a fill performs) is not an upper
+    // bound on the fill's actual draw in the first place.
+    //
+    // A short maker is REJECTED, not underfunded: letting `trial_wallet` go negative would back
+    // real position margin with a wallet debt nothing tracks. The reject reuses the K9 channel —
+    // `RejectedInsolvent` → the caller cancels the maker order (`cancel_rejected_maker_registry`)
+    // and the taker walks on to the next maker — so one unfundable maker never aborts the match.
+    //
+    // Gated on `trial_wallet`, i.e. AFTER this fill's own close proceeds have landed: a flip
+    // legitimately funds its opening leg out of the closing leg's released margin and profit.
+    // A zero draw is always affordable, even from a negative wallet (the B1 invariant): a pure
+    // close opens nothing and must never be blocked.
+    let opening_margin_i64 = checked_u64_to_i64(
+        fill_outcome.opening_margin,
+        "settlement: maker opening margin",
+    )?;
+    if opening_margin_i64 > 0 && trial_wallet < opening_margin_i64 {
+        return Ok(MakerFillCore::RejectedInsolvent);
+    }
+    trial_wallet = trial_wallet
+        .checked_sub(opening_margin_i64)
+        .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
+
     // Open-into-insolvency guard (K9): a fill may not open/increase the maker's position below
     // maintenance margin at the current mark. Skipped when mark == 0. Closing/reducing is never
     // gated — its realized loss beyond margin is legitimate bad debt (absorbed on accept).
@@ -1278,44 +1303,32 @@ pub(super) fn settle_maker_fill_core(
     account.perp_wallet_balance = trial_wallet;
 
     // Apply the entry reduce planned above (the lists were untouched in between, so `entry_idx`
-    // is still valid). Full fill → the entry leaves the list.
+    // is still valid), and shrink `Bid`/`Ask` by exactly the term the reduce removes. Using the
+    // DIFFERENCE of the two per-order-floored `calc_value`s (not `calc_value(price, fill_qty)`)
+    // is what keeps the aggregate byte-identical to a fresh fold over the reduced list, which the
+    // registry flush asserts.
     {
         let entries = match maker_side {
             Side::Buy => &mut *buy_entries,
             Side::Sell => &mut *sell_entries,
         };
+        let e = entries[entry_idx];
+        let (bd, pd) = (market.base_decimals, market.price_decimals);
+        let notional_delta = calc_value(e.price, e.amount, bd, pd)?
+            .checked_sub(calc_value(e.price, entry_new_amount, bd, pd)?)
+            .ok_or_else(|| {
+                perp_invariant_err("settlement: maker entry notional delta underflow")
+            })?;
         if entry_new_amount == 0 {
             entries.remove(entry_idx);
         } else {
             entries[entry_idx].amount = entry_new_amount;
         }
+        super::remove_entry_from_side_aggregates(pos, maker_side, fill_qty, notional_delta)?;
     }
-
-    // Flip-aware reserve recompute (must follow the entry reduce + reflect the new pos.amount).
-    let (buy_notional, sell_notional, c_notional) =
-        crate::math::calc_reservation_notionals_it(
-            buy_entries.iter().copied(),
-            sell_entries.iter().copied(),
-        market.base_decimals,
-        market.price_decimals,
-        pos.amount,
-    )?;
-    pos.set_reservations(buy_notional, sell_notional, c_notional, pos.leverage);
-    let new_reserved = pos.margin_reserved;
-
-    // opening_margin ≤ old_reserved is guaranteed; this is how much of old_reserved is free to
-    // cover new_reserved after pos.margin is funded.
-    let max_sustainable_reserved = old_reserved.saturating_sub(fill_outcome.opening_margin);
-    if new_reserved > max_sustainable_reserved {
-        // Reserve-deficit (≤1-unit floor-rounding residual post formula-C): clamp the stored
-        // reservation to what is actually backed so the cancel-release stays exact.
-        pos.margin_reserved = max_sustainable_reserved;
-    } else {
-        let net_release = old_reserved
-            .saturating_sub(new_reserved)
-            .saturating_sub(fill_outcome.opening_margin);
-        account.credit_perp(net_release)?;
-    }
+    // No reservation recompute and no `net_release`: the escrow those maintained is gone, and the
+    // fill's effect on the maker's remaining open-order requirement is picked up on the next
+    // `ooIM` evaluation from the `Bid`/`Ask` just updated and the new `pos.amount`.
 
     Ok(MakerFillCore::Filled {
         maker_fee,
@@ -1419,12 +1432,26 @@ fn split_position_fill(
     })
 }
 
-/// Verifies the taker's wallet can cover the opening margin requirement,
-/// auto-cancelling same-side open orders (LIFO) to free reserved margin if not.
+/// Verifies the taker's AVAILABLE balance can cover this fill's cash requirement (opening margin
+/// plus the part of the fee margin could not absorb), auto-cancelling same-side open orders (LIFO)
+/// to free it if not.
 ///
-/// Only same-side orders are cancelled: opposite-side orders rely on their own
-/// reserved margin for netting and cannot be safely freed here without
-/// invalidating that accounting.
+/// Runs POST-FLUSH, so storage is authoritative: the registry has already written the fills'
+/// positions/accounts and the consumed order entries, hence `Σ ooIM` here is already the POST-fill
+/// value. `finalize_compute` simulated exactly this loop on the same state pre-flush, so reaching
+/// the final reject below would mean the two diverged.
+///
+/// # What a cancel frees, now that nothing is escrowed
+///
+/// Under the escrow a cancel credited cash back to the wallet, which is how this loop used to
+/// work. It does not any more — a cancel moves no money. It removes the order from `Bid`/`Ask`,
+/// which lowers `Σ ooIM`, which RAISES `available = wallet − Σ ooIM`. Same loop, same termination,
+/// different mechanism; and it is why the check has to be on the derived available rather than on
+/// `perp_wallet_balance` (against which cancelling would achieve nothing, making the loop a
+/// pointless order-shredder that then rejected anyway).
+///
+/// Only same-side orders are cancelled: the opposite side is what NETS against the position the
+/// fill just built, so tearing it down could raise the requirement rather than lower it.
 fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -1437,23 +1464,7 @@ fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
         return Ok(());
     }
 
-    // Derived-ooIM Phase 1 dual gate (debug only). This runs POST-flush, so storage is
-    // authoritative: the registry has already written the fills' positions/accounts and the
-    // consumed order entries, hence Σ ooIM here is already the POST-fill value and the only
-    // thing left to fund is `required_margin` (the fills' opening margin + taker fee). Position
-    // margin is NOT part of the ooIM migration — only the OPEN-ORDER requirement is — so the
-    // derived requirement is the same number on both bases.
-    #[cfg(debug_assertions)]
-    crate::margin_view::debug_assert_gates_agree(
-        context,
-        user,
-        "placeOrder: taker fills margin",
-        Some(market_id),
-        required_margin,
-        required_margin as i128,
-    );
-
-    if storage::load_account_ref(context, user)?.has_available_perp(required_margin) {
+    if taker_margin_is_covered(context, user, required_margin)? {
         return Ok(());
     }
 
@@ -1466,17 +1477,31 @@ fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
         market,
     )?;
 
-    if !storage::load_account_ref(context, user)?.has_available_perp(required_margin) {
+    if !taker_margin_is_covered(context, user, required_margin)? {
         return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
     }
     Ok(())
 }
 
-/// Cancels same-side open orders one at a time (last-placed first) until the
-/// wallet covers `required_margin`, or no orders remain.
+/// `derived_available >= required_margin`, read from storage. The single predicate both the
+/// cover loop and its bracketing checks use, so they cannot drift apart.
+fn taker_margin_is_covered<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    required_margin: u64,
+) -> Result<bool, PerpError> {
+    let available = crate::margin_view::derived_available_balance(context, user)?;
+    Ok(crate::margin_view::derived_can_afford(
+        available,
+        required_margin as i128,
+    ))
+}
+
+/// Cancels same-side open orders one at a time (last-placed first) until the AVAILABLE balance
+/// covers `required_margin`, or no orders remain.
 ///
 /// LIFO cancellation preserves earlier orders at better price priority.
-/// If the wallet is still short after all orders are exhausted the loop exits
+/// If the account is still short after all orders are exhausted the loop exits
 /// silently; the caller is responsible for the final sufficiency check.
 fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
     context: &mut H,
@@ -1486,7 +1511,7 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
     required_margin: u64,
     market: &crate::types::Market,
 ) -> Result<(), PerpError> {
-    while !storage::load_account_ref(context, user)?.has_available_perp(required_margin) {
+    while !taker_margin_is_covered(context, user, required_margin)? {
         let order_id = match side {
             Side::Buy => storage::load_buy_orders_ref(context, user, market_id)?
                 .back()
@@ -1788,40 +1813,6 @@ pub(super) fn absorb_bad_debt_into_insurance_fund<H: PerpHost>(
         });
     }
     Ok(())
-}
-
-/// Recomputes the maker's order margin reservation from scratch after a fill.
-///
-/// A full recomputation (rather than an incremental update) avoids accumulated
-/// rounding error across many partial fills.  The result is written back into
-/// `pos` and also returned as `pos.margin_reserved`.
-///
-/// Cross-side netting: `margin_reserved` is the flip-aware worst-case
-/// `max(S + B', B + S')` (see [`calc_reservation_notionals`]) — a long position
-/// offsets sell-order exposure (and vice versa), but a fill that flips the
-/// position re-prices the opposite side's opening leg, so the reservation must
-/// cover the peak across that flip, not merely the larger side today. This must
-/// be called **after** [`apply_position_fill`] so that `pos.amount` already
-/// reflects the new size.
-fn recompute_maker_order_reserve_after_fill<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    market_id: u64,
-    pos: &mut crate::types::PerpPosition,
-    market: &crate::types::Market,
-) -> Result<u64, PerpError> {
-    let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
-    let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
-    let (buy_notional, sell_notional, c_notional) =
-        crate::math::calc_reservation_notionals_it(
-            buy_entries.iter().copied(),
-            sell_entries.iter().copied(),
-        market.base_decimals,
-        market.price_decimals,
-        pos.amount,
-    )?;
-    pos.set_reservations(buy_notional, sell_notional, c_notional, pos.leverage);
-    Ok(pos.margin_reserved)
 }
 
 #[cfg(test)]
