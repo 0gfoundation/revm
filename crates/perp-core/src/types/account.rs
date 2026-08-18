@@ -114,14 +114,16 @@ pub struct UserAccount {
     ///
     /// ## Observability
     ///
-    /// The true signed value IS readable through the ABI: `getAccountMargin` returns
-    /// `int64 walletBalance` and `int64 availableBalance` unclamped. Only the `uint64` surfaces —
-    /// `getAccount().availablePerpBalance` and the `AccountBalanceChanged` after-image, both via
-    /// [`UserAccount::visible_perp_wallet_balance`] — floor at 0, matching Binance's own clamped
-    /// `availableBalance` (`misc/binance-v3-account-balance-field-reference.md`, the
+    /// The true signed value IS readable through the ABI: BOTH account views —
+    /// `getAccount(address)` (index-driven) and `getAccountMargin(address, uint64[])` — return
+    /// `int64 totalCrossWalletBalance` and `int64 availableBalance` unclamped. The only remaining
+    /// `uint64` surface is the `AccountBalanceChanged` after-image, via
+    /// [`UserAccount::visible_perp_wallet_balance`], which floors at 0 the way Binance's own clamped
+    /// `availableBalance` does (`misc/binance-v3-account-balance-field-reference.md`, the
     /// `availableBalance` row / R5: computed `−0.00085981`, reported `0.00000000`). An operator
-    /// watching only the EVENT stream therefore cannot see a deficit and must poll
-    /// `getAccountMargin`.
+    /// watching only the EVENT stream therefore cannot see a deficit and must poll either view.
+    /// (`getAccount` used to floor too, under the name `availablePerpBalance`; that blind spot was
+    /// removed when it became the full account-level roll-up.)
     #[serde(rename = "PB")]
     pub perp_wallet_balance: i64,
 
@@ -167,7 +169,7 @@ pub struct PublicAccountBalance {
     ///
     /// NOT spendable headroom: the open-order requirement (`Σ ooIM`) is derived, never debited,
     /// so it is still sitting inside this number. The spendable figure is
-    /// `getAccount().availablePerpBalance`. This after-image deliberately reports the STORED
+    /// `getAccount().availableBalance`. This after-image deliberately reports the STORED
     /// balance rather than the derived available, because it is emitted at the account write
     /// site — mid-operation, before the position and order-list writes of the same call — where a
     /// derived number would be computed against half-updated state and would also cost a

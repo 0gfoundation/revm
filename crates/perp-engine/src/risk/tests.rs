@@ -3910,19 +3910,25 @@ mod usdc_custody {
         );
         assert_custody_closes(&mut ctx, TOTAL_DEPOSITED, "after MK tops up");
 
-        // ── 9. The two ABI views AGREE, and the signed one is still the honest one ──
-        // `getAccount` clamps (it returns `uint64`); `getAccountMargin` returns `int64
-        // walletBalance` / `int64 availableBalance` unclamped. Under M1′ that difference was the
-        // whole difference between "we carry a receivable" and "we carry an INVISIBLE receivable" —
-        // an operator watching only the event stream could not see a deficit accumulate. Under M1
-        // there is nothing for the clamp to hide on this path and both report the same number; the
-        // signed surface is kept because it is still the only honest one for the commission case.
+        // ── 9. The two ABI views AGREE, and both are signed ──
+        // Both account views are unclamped now: `getAccount` returns the roll-up over the per-user
+        // market index, `getAccountMargin` the same arithmetic over a caller list. Under M1′ the
+        // clamp on the old `getAccount().availablePerpBalance` was the whole difference between "we
+        // carry a receivable" and "we carry an INVISIBLE receivable" — an operator watching only the
+        // event stream could not see a deficit accumulate. Under M1 there is nothing to hide on this
+        // path, so this asserts the two views land on the same number from the two different market
+        // sets (the index holds MARKET_ID, which is what the list below passes).
         let expected = MK_TOP_UP as i64 - 1; // the 1 unit transferred out just above
-        let clamped_view =
-            run_get_account(&getAccountCall { user: MK }.abi_encode(), &mut ctx).unwrap();
+        let index_view = getAccountCall::abi_decode_returns(
+            &run_get_account(&getAccountCall { user: MK }.abi_encode(), &mut ctx).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            U256::from_be_slice(&clamped_view[32..64]).to::<u64>(),
-            expected as u64,
+            (
+                index_view.totalCrossWalletBalance,
+                index_view.availableBalance
+            ),
+            (expected, expected),
             "getAccount reports the full available balance — nothing is being floored away"
         );
         let signed_view = getAccountMarginCall::abi_decode_returns(
@@ -3938,9 +3944,12 @@ mod usdc_custody {
         )
         .unwrap();
         assert_eq!(
-            (signed_view.walletBalance, signed_view.availableBalance),
+            (
+                signed_view.totalCrossWalletBalance,
+                signed_view.availableBalance
+            ),
             (expected, expected),
-            "getAccountMargin agrees with the clamped view (no resting orders, so ooIM = 0)"
+            "getAccountMargin agrees with the index-driven view (no resting orders, so ooIM = 0)"
         );
     }
 }

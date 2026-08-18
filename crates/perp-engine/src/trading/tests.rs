@@ -4263,13 +4263,19 @@ mod golden {
         alice_position: (i64, i64, i64),
         bob_position: (i64, i64, i64),
         carol_position: (i64, i64, i64),
-        /// (spot USDC balance, available perp balance)
-        alice_account: (U256, u64),
-        bob_account: (U256, u64),
-        carol_account: (U256, u64),
+        /// (spot USDC balance, `getAccount().availableBalance`)
+        ///
+        /// The second element widened `u64` → `i64` when `getAccount`'s clamped
+        /// `availablePerpBalance` was replaced by the signed `availableBalance`. Every VALUE this
+        /// scenario pins is unchanged — the quantity is the same `perp_wallet_balance - SUM ooIM`,
+        /// and none of these accounts is under water at the end of the scenario, so nothing was
+        /// being floored away for the clamp to hide.
+        alice_account: (U256, i64),
+        bob_account: (U256, i64),
+        carol_account: (U256, i64),
         bob_erc20: U256,
         /// Trading-fee sink (taker+maker fees credit the admin's perp wallet).
-        admin_perp_wallet: u64,
+        admin_perp_wallet: i64,
         insurance_fund: u64,
         market_fee_total: u64,
         mark_price: u64,
@@ -5429,11 +5435,11 @@ mod golden {
             alice_position: (alice_pos.amount, alice_pos.vQuoteBalance, alice_pos.margin),
             bob_position: (bob_pos.amount, bob_pos.vQuoteBalance, bob_pos.margin),
             carol_position: (carol_pos.amount, carol_pos.vQuoteBalance, carol_pos.margin),
-            alice_account: (alice_acct.usdcBalance, alice_acct.availablePerpBalance),
-            bob_account: (bob_acct.usdcBalance, bob_acct.availablePerpBalance),
-            carol_account: (carol_acct.usdcBalance, carol_acct.availablePerpBalance),
+            alice_account: (alice_acct.usdcBalance, alice_acct.availableBalance),
+            bob_account: (bob_acct.usdcBalance, bob_acct.availableBalance),
+            carol_account: (carol_acct.usdcBalance, carol_acct.availableBalance),
             bob_erc20,
-            admin_perp_wallet: admin_acct.availablePerpBalance,
+            admin_perp_wallet: admin_acct.availableBalance,
             insurance_fund,
             market_fee_total,
             mark_price,

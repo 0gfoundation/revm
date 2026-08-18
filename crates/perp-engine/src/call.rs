@@ -99,7 +99,22 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(withdrawCall::SELECTOR, (50_000, false));
         m.insert(transferToPerpCall::SELECTOR, (20_000, false));
         m.insert(transferFromPerpCall::SELECTOR, (20_000, false));
-        m.insert(getAccountCall::SELECTOR, (5_000, true));
+        // `getAccount` is the account-level margin roll-up over the per-user market index, so it is
+        // priced in the "walks a per-user list" tier (20_000) alongside `getMarginInfo` /
+        // `getOpenOrders`, NOT the 5_000 scalar-getter tier it used to sit in.
+        //
+        // The LOADS did not change: at 5_000 it already walked the index through
+        // `derived_available_balance` (≤ MAX_USER_MARKETS = 16 markets × {market, position,
+        // MarketHot, sell list} = ≤ 66 `_ref` loads worst case), and the index-driven roll-up
+        // reaches exactly the same set — the added work is pure arithmetic (a ≤8-band maintenance
+        // tier walk and `Σ positionMargin`, both off values already in hand). What changed is what
+        // the selector BUYS: it now returns everything `getAccountMargin` returns, which is priced
+        // at 50_000 for ≤64 ids, i.e. ~781/market. Leaving `getAccount` at 5_000 would make it the
+        // cheap way to buy 16 markets of the same margin math — a 16× pricing gap between two
+        // selectors doing identical per-market work. 20_000 closes it with margin: it is 1.6× the
+        // rate `getAccountMargin` charges for the same 16 markets (50_000 × 16/64 = 12_500).
+        // FLAT per selector, never per-item — dynamic metering for this precompile was rejected.
+        m.insert(getAccountCall::SELECTOR, (20_000, true));
         m.insert(setUserFeeRatesCall::SELECTOR, (30_000, false));
         m.insert(getUserFeeRatesCall::SELECTOR, (5_000, true));
         m.insert(getMarketFeeTotalCall::SELECTOR, (5_000, true));

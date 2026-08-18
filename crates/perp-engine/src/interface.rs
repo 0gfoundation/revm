@@ -20,13 +20,117 @@ sol! {
         function transferToPerp(uint64 amount) external;
         /// Move USDC from the perp trading wallet back to spot balance.
         function transferFromPerp(uint64 amount) external;
-        /// Query a user's spot USDC and DERIVED available perp balance.
+        /// Query a user's spot USDC plus the full account-level margin roll-up, over the markets
+        /// the user is actually active in. **INDEX-DRIVEN**: the caller passes no market list —
+        /// this walks the per-user market index (`umkt`, at most MAX_USER_MARKETS = 16 ids), which
+        /// is exactly the support of every sum below (a market the user has left contributes
+        /// `N = Bid = Ask = 0`). So unlike `getAccountMargin`, whose totals are only as complete as
+        /// the list handed to it, these totals are COMPLETE by construction.
         ///
-        /// `availablePerpBalance` = `max(0, perpWalletBalance − Σ_markets ooIM)` over the markets
-        /// the user is active in — the same quantity every admission gate enforces. It is NOT the
-        /// stored wallet: that is the CROSS wallet, reported unclamped by `getAccountMargin` and
-        /// by the `AccountBalanceChanged` event.
-        function getAccount(address user) external view returns (uint256 usdcBalance, uint64 availablePerpBalance);
+        /// This is the `GET /fapi/v3/account` account-level scalar set, less two fields we
+        /// deliberately do not have (see the end of this comment). Every balance-like field is
+        /// `int64` and **UNCLAMPED**.
+        ///
+        /// ⚠️ THE OLD `uint64 availablePerpBalance` IS GONE, replaced by `int64 availableBalance`.
+        /// It floored at 0, which made a deficit invisible through this call: an operator polling
+        /// only `getAccount` could not distinguish "exactly covered" from "under-covered by any
+        /// amount". That is the identical trap Binance's own clamped `availableBalance` has, and
+        /// `misc/binance-v3-account-balance-field-reference.md` §1 is explicit that their field
+        /// therefore **cannot be used to tell whether an account is under-covered** (measured:
+        /// reported `0.00000000` against a true `−0.00085981`). We had no reason to inherit it.
+        ///
+        ///   usdcBalance                 spot / withdrawal-layer USDC held inside the DEX. This is
+        ///                               the SPOT side and is NOT part of any total below — it is
+        ///                               also the balance `withdraw` actually gates on.
+        ///   totalWalletBalance          Binance `totalWalletBalance` — the GROSS perp wallet:
+        ///                               `totalCrossWalletBalance + Σ positionMargin`. Requires the
+        ///                               index walk: no aggregate stores it (the former
+        ///                               `total_perp_collateral` "TC" field was deleted as
+        ///                               derivable state maintained on the hottest write paths).
+        ///   totalCrossWalletBalance     Binance `totalCrossWalletBalance` — our stored
+        ///                               `perpWalletBalance`, verbatim and signed. Position margin
+        ///                               has physically left it; the open-order requirement has not.
+        ///   totalMarginBalance          Binance `totalMarginBalance` =
+        ///                               `totalWalletBalance + totalUnrealizedProfit`. Total account
+        ///                               EQUITY. GROSS-based, so it is NOT
+        ///                               `totalCrossWalletBalance + totalUnrealizedProfit`.
+        ///   totalUnrealizedProfit       Σ `getMarginInfo.unrealizedProfit`.
+        ///   totalInitialMargin          Σ `initialMargin` (== the next two, summed).
+        ///   totalPositionInitialMargin  Σ `positionInitialMargin`.
+        ///   totalOpenOrderInitialMargin Σ `openOrderInitialMargin`. Escrowed NOWHERE — derived.
+        ///   totalMaintMargin            Σ `maintMargin`. Below it, positions are liquidatable.
+        ///   availableBalance            `totalCrossWalletBalance − totalOpenOrderInitialMargin`,
+        ///                               signed and UNCLAMPED. The exact quantity every admission
+        ///                               gate enforces (`derived_available_balance`), so it is the
+        ///                               real headroom, not a parallel reporting number. CROSS-based
+        ///                               on purpose: the silos are already out of the cross wallet.
+        ///                               A negative value is not by itself distress — a mark move
+        ///                               alone reaches it, and resting orders are not torn down for
+        ///                               it — but new risk-INCREASING actions are refused until it
+        ///                               recovers.
+        ///   marketIds                   the index contents, ascending: the exact market set every
+        ///                               total above was summed over. Returned so the totals are
+        ///                               SELF-CHECKABLE — `Σ getMarginInfo(user, id)` over this
+        ///                               array must reproduce them field for field. Empty for an
+        ///                               account with no positions and no resting orders, in which
+        ///                               case every total is 0 and the call still succeeds.
+        ///
+        /// ⚠️ TWO BINANCE FIELDS DELIBERATELY NOT IMPLEMENTED.
+        ///
+        /// * `totalCrossUnPnl` — we are ISOLATED-ONLY. There are no cross positions, so this is
+        ///   structurally 0 forever, not "0 right now". A field that can only ever be zero is worse
+        ///   than no field: it invites a caller to build a cross-vs-isolated split that does not
+        ///   exist here. (Binance's own samples are `0`/absent under ISOLATED too — the reference
+        ///   doc §6.2 records the correct reading as "not activated under isolated", which for us
+        ///   is permanent rather than a mode setting.)
+        /// * `maxWithdrawAmount` — two independent reasons. (1) The reference doc records
+        ///   `maxWithdrawAmount == availableBalance` as an OBSERVATION over 69 readings, **not a
+        ///   formula**: no counterexample could be constructed, and untested conditions
+        ///   (open-position risk, cross-account borrowing) are suspected. Shipping it would be
+        ///   presenting an extrapolation as a rule. (2) It would be actively misleading here even
+        ///   if the identity held: `withdraw` gates on `usdcBalance`, the SPOT side, not on the perp
+        ///   wallet, so a field named "max withdraw" sitting among the perp totals would name the
+        ///   wrong number. If you want "max transferable out of the perp wallet", that is
+        ///   `availableBalance` — the quantity `transferFromPerp` gates on — and it is already
+        ///   right there. It is not duplicated under a second name.
+        ///
+        /// ⚠️ PORTING PITFALLS FROM §7 THAT WE DO NOT REPRODUCE.
+        ///
+        /// Two are structurally impossible for us, one took discipline:
+        /// * §7.0 (the same semantic zero serialised three ways — `"0"`, `"0.00000000"`, `"0.000"`
+        ///   — inside ONE object): IMPOSSIBLE. Every field here is a fixed-width ABI integer in
+        ///   base units; zero has exactly one 32-byte encoding and there is no decimal-string
+        ///   surface anywhere in this precompile to disagree with itself.
+        /// * §7.1.1 (`unrealizedProfit` on one endpoint vs `unRealizedProfit` on another, same
+        ///   quantity, so one shared deserialiser silently reads zero): DISCIPLINE, not structure —
+        ///   nothing in `sol!` would catch a second spelling. We use the lowercase-`r`
+        ///   `unrealizedProfit` / `totalUnrealizedProfit` on every selector, and there is no second
+        ///   spelling in the ABI.
+        /// * §7.1.2 (the same quantity under different names on different endpoints — Binance's
+        ///   `balance` vs `walletBalance`): DISCIPLINE, and we had this bug. `getAccountMargin`
+        ///   used to call the cross wallet `walletBalance`, colliding with Binance's name for the
+        ///   GROSS wallet — an error of a full position's margin for anyone comparing them. Both
+        ///   selectors now say `totalCrossWalletBalance` for that one quantity, and the gross one is
+        ///   only ever `totalWalletBalance`.
+        /// * §7.1.3 (v3's `positions[]` reports derived quantities while deleting every input, so a
+        ///   caller cannot self-check): WE DO NOT. `marketIds` above plus `getMarginInfo` (whose
+        ///   first six returns are the raw inputs `markPrice, positionAmt, vQuoteBalance, leverage,
+        ///   bidNotional, askNotional`) let a caller recompute every total here from scratch and
+        ///   byte-exactly. That round-trip is pinned by
+        ///   `margin_view_tests::get_account_totals_equal_the_sum_of_per_market_get_margin_info`.
+        function getAccount(address user) external view returns (
+            uint256  usdcBalance,
+            int64    totalWalletBalance,
+            int64    totalCrossWalletBalance,
+            int64    totalMarginBalance,
+            int64    totalUnrealizedProfit,
+            uint64   totalInitialMargin,
+            uint64   totalPositionInitialMargin,
+            uint64   totalOpenOrderInitialMargin,
+            uint64   totalMaintMargin,
+            int64    availableBalance,
+            uint64[] marketIds
+        );
         /// Set per-user trading fee rates in basis points. Only callable by admin.
         function setUserFeeRates(address user, uint64 makerFeeBps, uint64 takerFeeBps) external;
         /// Query per-user trading fee rates in basis points. Unset users default to zero.
@@ -315,24 +419,42 @@ sol! {
 
         /// Account-level roll-up of [`getMarginInfo`] over an EXPLICIT list of markets.
         ///
-        /// `marketIds` is an argument rather than "all the user's markets" because the ABI
-        /// predates the per-user market index and a caller-supplied list keeps the gas flat.
-        /// Duplicate ids are counted ONCE. At most MAX_MARGIN_INFO_MARKETS (64) ids; an unknown
-        /// market id reverts. NOTE the engine's own admission gate sums over the per-user market
-        /// index instead, so a SHORT list under-counts `totalOpenOrderInitialMargin` here and
+        /// **Prefer `getAccount`** unless you specifically want a SUBSET: it takes no list, walks
+        /// the per-user market index itself, and its totals are therefore complete. This selector
+        /// exists for the "just these markets" query and for paging past MAX_USER_MARKETS.
+        ///
+        /// The arithmetic is literally shared with `getAccount` — one set of Σ walkers
+        /// (`margin_view::account_margin_scalars`), differing only in where the market set comes
+        /// from. Duplicate ids are counted ONCE. At most MAX_MARGIN_INFO_MARKETS (64) ids; an
+        /// unknown market id reverts. NOTE the engine's own admission gate sums over the per-user
+        /// market index, so a SHORT list under-counts `totalOpenOrderInitialMargin` here and
         /// therefore over-reports `availableBalance` relative to what the engine will enforce.
         ///
-        ///   walletBalance             the user's perp wallet, SIGNED and unclamped (unlike
-        ///                             `getAccount`'s `availablePerpBalance`, which floors at 0).
-        ///   marginBalance             `walletBalance + totalUnrealizedProfit`.
+        ///   totalCrossWalletBalance   the user's perp wallet, SIGNED and unclamped. Binance's
+        ///                             `totalCrossWalletBalance` — see the ⚠️ below for why this is
+        ///                             NOT Binance's `totalWalletBalance`, which it used to be
+        ///                             misnamed after.
+        ///   crossMarginBalance        `totalCrossWalletBalance + totalUnrealizedProfit`. NOT a
+        ///                             Binance field, and NOT Binance's `totalMarginBalance` (that
+        ///                             one is GROSS-based; `getAccount` returns it).
         ///   totalInitialMargin        Σ `initialMargin`         (== the next two, summed).
         ///   totalPositionInitialMargin Σ `positionInitialMargin`.
         ///   totalOpenOrderInitialMargin Σ `openOrderInitialMargin`.
         ///   totalMaintMargin          Σ `maintMargin`.
         ///   totalUnrealizedProfit     Σ `unrealizedProfit`.
-        ///   availableBalance          `walletBalance − totalOpenOrderInitialMargin`.
+        ///   availableBalance          `totalCrossWalletBalance − totalOpenOrderInitialMargin`.
         ///
-        /// ⚠️ WHAT `walletBalance` IS NET OF.
+        /// `totalWalletBalance` is deliberately absent here: `Σ positionMargin` over a PARTIAL list
+        /// under-counts the silos, so the gross wallet it implies would be a "total" that is not
+        /// total. `getAccount` walks the whole index and can name it honestly.
+        ///
+        /// ⚠️ WHAT `totalCrossWalletBalance` IS NET OF — AND THE NAMING BUG THIS FIXES.
+        ///
+        /// This field was called `walletBalance` until the index-driven `getAccount` landed. That
+        /// was wrong: Binance's `walletBalance` / `totalWalletBalance` is the GROSS wallet, ours is
+        /// the CROSS wallet, and the two differ by `Σ isolatedWallet` — a full position's margin.
+        /// Anyone lining our field up against Binance's same-named one was off by exactly that.
+        /// `marginBalance` → `crossMarginBalance` is the same fix one level up.
         ///
         /// Binance keeps THREE nested balances and derives the innermost on read:
         ///
@@ -351,9 +473,10 @@ sol! {
         /// `margin_reserved` delta at placement is gone. So:
         ///
         /// ```text
-        /// our     walletBalance      == Binance crossWalletBalance
-        /// our     availableBalance   == Binance availableBalance      (both spendable headroom)
-        /// Binance walletBalance      == our walletBalance + SUM positionMargin
+        /// our     totalCrossWalletBalance == Binance totalCrossWalletBalance
+        /// our     availableBalance        == Binance availableBalance   (both spendable headroom)
+        /// Binance totalWalletBalance      == our cross + SUM positionMargin
+        ///                                    ^ getAccount returns this, over the whole index
         /// ```
         ///
         /// `availableBalance` here is therefore the REAL headroom — the very quantity the
@@ -376,24 +499,24 @@ sol! {
         /// an error: the position's liquidation price is computed from the SHORT margin, which is the
         /// honest one. (Two earlier versions of this comment were wrong: one said such a fill "will be
         /// cancelled at fill time" (pre-escrow-removal behaviour), the next said the shortfall lands
-        /// on `walletBalance` (model M1′, a conjecture R11 refuted).)
+        /// on the cross wallet (model M1′, a conjecture R11 refuted).)
         ///
-        /// `walletBalance` is nonetheless still `int64`, because one narrow case remains: a maker
-        /// commission the capped opening margin could not absorb — on a pure close, the whole fee. A
-        /// NEGATIVE `walletBalance` is a RECEIVABLE, not protocol bad debt: it is a negative claim
-        /// inside the custody identity, it blocks every money-out gate, and it nets against the
-        /// user's next deposit. See `types::UserAccount::perp_wallet_balance` for the derivation, the
-        /// no-double-count argument, and why absorbing it from the Insurance Fund would be strictly
-        /// worse.
+        /// `totalCrossWalletBalance` is nonetheless still `int64`, because one narrow case remains:
+        /// a maker commission the capped opening margin could not absorb — on a pure close, the
+        /// whole fee. A NEGATIVE cross wallet is a RECEIVABLE, not protocol bad debt: it is a
+        /// negative claim inside the custody identity, it blocks every money-out gate, and it nets
+        /// against the user's next deposit. See `types::UserAccount::perp_wallet_balance` for the
+        /// derivation, the no-double-count argument, and why absorbing it from the Insurance Fund
+        /// would be strictly worse.
         ///
-        /// ⚠️ These two `int64`s are the ONLY ABI surface that exposes a deficit: `getAccount`'s
-        /// `availablePerpBalance` and `AccountBalanceChanged`'s `perpWalletBalance` are `uint64`
-        /// and floor at 0, so an operator watching only events cannot see one accumulate.
+        /// ⚠️ `AccountBalanceChanged`'s `perpWalletBalance` is `uint64` and floors at 0, so an
+        /// operator watching only the EVENT stream cannot see a deficit accumulate. Both signed
+        /// views — this selector and `getAccount` — expose it; polling either is enough.
         ///
         /// Like `getMarginInfo` this is a pure read: it stores nothing and moves no money.
         function getAccountMargin(address user, uint64[] marketIds) external view returns (
-            int64  walletBalance,
-            int64  marginBalance,
+            int64  totalCrossWalletBalance,
+            int64  crossMarginBalance,
             uint64 totalInitialMargin,
             uint64 totalPositionInitialMargin,
             uint64 totalOpenOrderInitialMargin,
@@ -579,7 +702,7 @@ sol! {
         /// `perpWalletBalance` is the CROSS wallet (Binance's `crossWalletBalance`), clamped at 0
         /// — NOT spendable headroom. The open-order requirement is derived and never debited, so
         /// it is still inside this number; subtract `getAccountMargin`'s
-        /// `totalOpenOrderInitialMargin`, or read `getAccount`'s `availablePerpBalance`, to get
+        /// `totalOpenOrderInitialMargin`, or read either account view's `availableBalance`, to get
         /// what the engine will actually let the user spend. The event carries the stored balance
         /// on purpose: it fires at the account write site, mid-call, where a derived figure would
         /// be measured against half-updated positions.

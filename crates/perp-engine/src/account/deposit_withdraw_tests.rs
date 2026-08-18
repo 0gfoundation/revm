@@ -1,6 +1,6 @@
-use context::ContextTr;
 use super::*;
 use alloy_sol_types::{SolCall, SolEvent};
+use context::ContextTr;
 use context::{BlockEnv, CfgEnv, Context, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId};
@@ -32,10 +32,14 @@ fn make_ctx(alice_usdc: U256) -> TestCtx {
     ctx
 }
 
-fn decode_get_account(bytes: &Bytes) -> (U256, u64) {
-    let usdc = U256::from_be_slice(&bytes[..32]);
-    let available = U256::from_be_slice(&bytes[32..64]).to::<u64>();
-    (usdc, available)
+/// `(usdcBalance, availableBalance)` — the two fields these deposit/withdraw/transfer tests care
+/// about, decoded through the real ABI decoder rather than by slicing words. It used to slice
+/// `bytes[32..64]` for the (then-second, then-`uint64`) available balance; `getAccount` now returns
+/// ten scalars plus `marketIds`, so word 1 is `totalWalletBalance` and hand-slicing would silently
+/// read the wrong field. The full roll-up is exercised in `margin_view_tests`.
+fn decode_get_account(bytes: &Bytes) -> (U256, i64) {
+    let ret = getAccountCall::abi_decode_returns(bytes).expect("getAccount returns must decode");
+    (ret.usdcBalance, ret.availableBalance)
 }
 
 fn decode_user_fee_rates(bytes: &Bytes) -> (u64, u64) {
@@ -264,7 +268,7 @@ fn transfer_to_and_from_perp_wallet() {
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
     let (usdc, available) = decode_get_account(&ret);
     assert_eq!(usdc, U256::from(1_000_000u64));
-    assert_eq!(available, transfer_amt);
+    assert_eq!(available, transfer_amt as i64);
 
     run_transfer_from_perp(
         &transferFromPerpCall {
@@ -290,16 +294,43 @@ fn get_account_returns_zero_for_new_user() {
     assert_eq!(available, 0);
 }
 
+/// A NEGATIVE cross wallet shows through `getAccount` as a negative number.
+///
+/// This test used to be `get_account_clamps_negative_perp_wallet_to_zero` and asserted `0`. That
+/// clamp was the blind spot the signed roll-up removed: floored at 0, this call could not tell
+/// "exactly covered" from "under-covered by a dollar", which is exactly the verdict
+/// `misc/binance-v3-account-balance-field-reference.md` §1 reaches about Binance's own clamped
+/// `availableBalance` (reported `0.00000000` against a true `-0.00085981`). Every balance-like
+/// field is now `int64` and reports the sign.
+///
+/// `AccountBalanceChanged.perpWalletBalance` still floors at 0 (it is `uint64`), so this is now the
+/// cheap way for an operator to see a deficit without polling `getAccountMargin`.
 #[test]
-fn get_account_clamps_negative_perp_wallet_to_zero() {
+fn get_account_on_a_bare_account_reports_a_negative_cross_wallet_unclamped() {
     let mut ctx = make_ctx(U256::ZERO);
     let mut account = storage::load_account(&mut ctx, ALICE).unwrap();
     account.perp_wallet_balance = -1_000_000;
     storage::save_account(&mut ctx, ALICE, account).unwrap();
 
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
-    let (_usdc, available) = decode_get_account(&ret);
-    assert_eq!(available, 0);
+    let a = getAccountCall::abi_decode_returns(&ret).unwrap();
+    assert_eq!(
+        a.availableBalance, -1_000_000,
+        "the sign is the whole point"
+    );
+    assert_eq!(a.totalCrossWalletBalance, -1_000_000);
+    // No markets, so no silos and no unrealized PnL: gross == cross, and equity == gross.
+    assert_eq!(a.totalWalletBalance, -1_000_000);
+    assert_eq!(a.totalMarginBalance, -1_000_000);
+    assert!(a.marketIds.is_empty());
+    // The clamped surface still floors — that is the contrast this pins.
+    assert_eq!(
+        storage::load_account_ref(&mut ctx, ALICE)
+            .unwrap()
+            .visible_perp_wallet_balance(),
+        0,
+        "the uint64 event projection still floors; only the ABI view is honest"
+    );
 }
 
 /// A deposit writes the USDC ERC-20 balance (on-trie, EVM journal) AND the internal perp

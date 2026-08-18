@@ -52,7 +52,7 @@ use primitives::{Address, Bytes};
 
 use crate::host::PerpHost;
 use crate::{
-    errors::perp_err,
+    errors::{perp_err, perp_invariant_err},
     interface::IPerpDex::{
         getAccountMarginCall, getAccountMarginReturn, getMarginInfoCall, getMarginInfoReturn,
     },
@@ -660,14 +660,217 @@ pub fn run_get_margin_info<H: PerpHost>(
     )))
 }
 
+// ── Account-level Σ walkers (ONE implementation, two ABI entry points) ───────────────────────
+//
+// `getAccount` and `getAccountMargin` report the same account-level scalars and differ in exactly
+// one thing: where the market set comes from (the per-user index vs the caller's `uint64[]`).
+// Everything below the market set — the per-market fold, the six Σ accumulators, the narrowing,
+// and the four balance identities — lives here, once. Two copies of margin arithmetic that can
+// drift is the failure this layer exists to remove, so there is no second Σ anywhere: an entry
+// point that wants account-level numbers calls [`account_margin_scalars`] or it is a bug.
+
+/// Where a market set came from. This selects the ERROR SHAPE for an id that names no market, and
+/// **nothing else** — the arithmetic is bit-identical either way, which is the whole point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketSetSource {
+    /// The per-user market index (`umkt`) — engine-maintained, therefore TRUSTED and already a
+    /// set. An id in it that names no market is corrupt state, not a caller mistake, and is raised
+    /// as an `[INVARIANT]` reject — the same guard [`total_open_order_initial_margin`] applies
+    /// while walking this same set.
+    UserIndex,
+    /// A caller-supplied `uint64[]`. An unknown id is an ordinary business reject, labelled with
+    /// the offending id so the caller can tell WHICH entry failed. Duplicates are folded once.
+    CallerList,
+}
+
+/// The six Σ accumulators, in accumulator width so the fold cannot overflow before it is narrowed.
+///
+/// `total_position_margin` is `Σ isolatedWallet` — the money physically sitting in the position
+/// silos. It is the term that separates Binance's `totalWalletBalance` (gross) from its
+/// `totalCrossWalletBalance` (our stored `perp_wallet_balance`), and it has to be WALKED: the
+/// former `total_perp_collateral` ("TC") aggregate that used to carry it was deliberately deleted
+/// (see the note at the end of `types::UserAccount`) because it was derivable state maintained on
+/// the hottest write paths. Nothing stores it now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccountMarginTotals {
+    /// Σ `initialMargin`.
+    pub total_initial_margin: u128,
+    /// Σ `positionInitialMargin`.
+    pub total_position_initial_margin: u128,
+    /// Σ `openOrderInitialMargin` — the same quantity [`total_open_order_initial_margin`] folds
+    /// for the admission gate, over the same per-market helper.
+    pub total_open_order_initial_margin: u128,
+    /// Σ `maintMargin`.
+    pub total_maint_margin: u128,
+    /// Σ `unrealizedProfit`.
+    pub total_unrealized_profit: i128,
+    /// Σ `positionMargin` (`isolatedWallet`) — the silos.
+    pub total_position_margin: i128,
+}
+
+/// Every account-level scalar either view reports, narrowed to the ABI's widths with the balance
+/// identities applied. Computed ONCE by [`account_margin_scalars`], so the two entry points can
+/// only differ in which of these fields they encode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccountMarginScalars {
+    /// Binance `totalWalletBalance` — the GROSS wallet: `totalCrossWalletBalance + Σ isolatedWallet`.
+    /// Complete only when the market set is the whole index (see [`MarketSetSource`]).
+    pub total_wallet_balance: i64,
+    /// Binance `totalCrossWalletBalance` — our stored `perp_wallet_balance`, verbatim. Signed and
+    /// unclamped.
+    pub total_cross_wallet_balance: i64,
+    /// Binance `totalMarginBalance` = `totalWalletBalance + totalUnrealizedProfit` — total account
+    /// EQUITY. Note this is GROSS-based, so it is NOT `total_cross_wallet_balance + upnl`.
+    pub total_margin_balance: i64,
+    /// `totalCrossWalletBalance + totalUnrealizedProfit`. **Not a Binance field** — it is
+    /// [`Self::total_margin_balance`] minus `Σ isolatedWallet`, and it is what a caller working
+    /// from a PARTIAL market list can honestly be given (a "total wallet balance" over a partial
+    /// list would be a total that is not total).
+    pub cross_margin_balance: i64,
+    /// Binance `totalUnrealizedProfit` = Σ `unrealizedProfit`.
+    pub total_unrealized_profit: i64,
+    /// Binance `totalInitialMargin` (== the next two, summed).
+    pub total_initial_margin: u64,
+    /// Binance `totalPositionInitialMargin`.
+    pub total_position_initial_margin: u64,
+    /// Binance `totalOpenOrderInitialMargin`.
+    pub total_open_order_initial_margin: u64,
+    /// Binance `totalMaintMargin`.
+    pub total_maint_margin: u64,
+    /// Binance `availableBalance` = `totalCrossWalletBalance − totalOpenOrderInitialMargin`, and
+    /// deliberately **NOT clamped at zero** (Binance's is; see [`run_get_account_margin`]).
+    /// Cross-based, not gross: the silos are already out of the cross wallet.
+    pub available_balance: i64,
+}
+
+/// Fold [`compute_margin_info`] over a market set. **The only account-level Σ in the engine.**
+///
+/// Deterministic: the ids are consumed in iteration order with no map iteration anywhere, and a
+/// repeated id is folded ONCE (a duplicate would double-count every total). The index is already a
+/// set, so the dedup is a no-op there and exists for the caller-list path.
+///
+/// Pure read — every loader it reaches is a `_ref` (cache-fill, never dirty-mark) reader, so it
+/// enters no key into the block delta and cannot move the commitment.
+pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
+    context: &mut H,
+    user: Address,
+    market_ids: I,
+    source: MarketSetSource,
+    who: &str,
+) -> Result<AccountMarginTotals, PerpError> {
+    let market_ids = market_ids.into_iter();
+    let mut totals = AccountMarginTotals::default();
+    let (lower, _) = market_ids.size_hint();
+    let mut seen: Vec<u64> = Vec::with_capacity(lower);
+    for market_id in market_ids {
+        // O(n^2) over a set bounded by MAX_MARGIN_INFO_MARKETS (64) / MAX_USER_MARKETS (16).
+        if seen.contains(&market_id) {
+            continue;
+        }
+        seen.push(market_id);
+        if source == MarketSetSource::UserIndex
+            && storage::load_market_ref(context, market_id)?.is_none()
+        {
+            // Checked here rather than by reshaping `compute_margin_info`'s reject, so that its
+            // OTHER rejects (the overflow guards) stay ordinary rejects on this path too. Same
+            // guard, same wording as `total_open_order_initial_margin`.
+            return Err(perp_invariant_err(format!(
+                "{who}: user market index holds unknown market {market_id}"
+            )));
+        }
+        let info = compute_margin_info(context, user, market_id)
+            .map_err(|e| relabel_market(e, who, market_id))?;
+        totals.total_initial_margin += info.initial_margin as u128;
+        totals.total_position_initial_margin += info.position_initial_margin as u128;
+        totals.total_open_order_initial_margin += info.open_order_initial_margin as u128;
+        totals.total_maint_margin += info.maint_margin as u128;
+        totals.total_unrealized_profit += info.unrealized_profit as i128;
+        totals.total_position_margin += info.position_margin as i128;
+    }
+    Ok(totals)
+}
+
+/// [`fold_account_margin`] plus the stored cross wallet, narrowed to the ABI's widths with the
+/// four balance identities applied. **The single source of every account-level scalar.**
+///
+/// ```text
+/// totalCrossWalletBalance = perp_wallet_balance                                  (stored)
+/// totalWalletBalance      = totalCrossWalletBalance + Σ isolatedWallet           (Binance gross)
+/// totalMarginBalance      = totalWalletBalance      + totalUnrealizedProfit      (equity)
+/// crossMarginBalance      = totalCrossWalletBalance + totalUnrealizedProfit
+/// availableBalance        = totalCrossWalletBalance − totalOpenOrderInitialMargin
+/// ```
+///
+/// Each narrowing is the point where a pathological state surfaces as a clean revert instead of
+/// wrapping.
+pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
+    context: &mut H,
+    user: Address,
+    market_ids: I,
+    source: MarketSetSource,
+    who: &str,
+) -> Result<AccountMarginScalars, PerpError> {
+    let totals = fold_account_margin(context, user, market_ids, source, who)?;
+    // Signed and unclamped: this is the CROSS wallet exactly as stored. A negative value is a
+    // settled receivable (see `types::UserAccount::perp_wallet_balance`), and hiding it behind a
+    // `uint64` floor is precisely the blind spot the old `availablePerpBalance` had.
+    let cross = storage::load_account_ref(context, user)?.perp_wallet_balance;
+
+    let narrow_u64 = |v: u128, what: &str| {
+        u64::try_from(v).map_err(|_| perp_err(format!("{who}: {what} exceeds u64")))
+    };
+    let narrow_i64 = |v: i128, what: &str| {
+        i64::try_from(v).map_err(|_| perp_err(format!("{who}: {what} exceeds i64")))
+    };
+
+    let total_unrealized_profit =
+        narrow_i64(totals.total_unrealized_profit, "total unrealized profit")?;
+    let total_open_order_initial_margin = narrow_u64(
+        totals.total_open_order_initial_margin,
+        "total open-order initial margin",
+    )?;
+    let total_wallet_balance = narrow_i64(
+        cross as i128 + totals.total_position_margin,
+        "total wallet balance",
+    )?;
+
+    Ok(AccountMarginScalars {
+        total_wallet_balance,
+        total_cross_wallet_balance: cross,
+        total_margin_balance: narrow_i64(
+            total_wallet_balance as i128 + total_unrealized_profit as i128,
+            "total margin balance",
+        )?,
+        cross_margin_balance: narrow_i64(
+            cross as i128 + total_unrealized_profit as i128,
+            "cross margin balance",
+        )?,
+        total_unrealized_profit,
+        total_initial_margin: narrow_u64(totals.total_initial_margin, "total initial margin")?,
+        total_position_initial_margin: narrow_u64(
+            totals.total_position_initial_margin,
+            "total position initial margin",
+        )?,
+        total_open_order_initial_margin,
+        total_maint_margin: narrow_u64(totals.total_maint_margin, "total maintenance margin")?,
+        available_balance: narrow_i64(
+            cross as i128 - total_open_order_initial_margin as i128,
+            "available balance",
+        )?,
+    })
+}
+
 /// `getAccountMargin(address user, uint64[] marketIds) returns (...)`.
 ///
-/// Folds [`compute_margin_info`] over `marketIds` (duplicates counted once, calldata order
-/// preserved — no map iteration anywhere, so the output is deterministic) and adds the two
-/// account-level identities.
+/// A thin shell over [`account_margin_scalars`] with [`MarketSetSource::CallerList`] — the
+/// arithmetic is shared verbatim with `getAccount`, which passes the per-user index instead. This
+/// function contains no margin math of its own.
 ///
-/// # `walletBalance` is Binance's `crossWalletBalance`, and `availableBalance` is real
+/// # Why the wallet field is called `totalCrossWalletBalance` and not `walletBalance`
 ///
+/// It used to be called `walletBalance`, and that was a NAMING BUG: Binance's `walletBalance` is
+/// the GROSS wallet, ours is the cross wallet, and the two differ by `Σ isolatedWallet` — a full
+/// position's margin. Anyone comparing the two same-named fields was off by exactly that.
 /// Binance keeps THREE nested balances and derives the innermost on read:
 ///
 /// ```text
@@ -682,15 +885,27 @@ pub fn run_get_margin_info<H: PerpHost>(
 /// open-order leg NOT — the escrow that used to debit it was deleted. So
 ///
 /// ```text
-/// our walletBalance         == Binance crossWalletBalance
-/// our availableBalance      == Binance availableBalance  == walletBalance − Σ ooIM
-/// Binance gross walletBalance == walletBalance + Σ positionMargin
+/// our totalCrossWalletBalance == Binance totalCrossWalletBalance
+/// our availableBalance        == Binance availableBalance  == cross − Σ ooIM
+/// Binance totalWalletBalance  == our cross + Σ positionMargin   ← `getAccount` returns this
 /// ```
 ///
 /// and `availableBalance` here is genuinely spendable headroom — the SAME quantity the engine's
 /// admission gates enforce ([`derived_available_balance`]), not a parallel reporting number.
 /// (Under the old escrow it double-subtracted the open-order requirement; that caveat is gone
 /// with the escrow.)
+///
+/// `marginBalance` was renamed `crossMarginBalance` for the same reason: it is `cross + Σ upnl`,
+/// whereas Binance's `totalMarginBalance` is `GROSS + Σ upnl`. `getAccount` returns that one.
+///
+/// # Why `totalWalletBalance` is deliberately NOT returned here
+///
+/// It would be a total that is not total. `Σ isolatedWallet` over a caller-supplied SHORT list
+/// under-counts the silos, so the "gross wallet" it implies would be lower than the real one — and
+/// unlike `totalOpenOrderInitialMargin`, whose under-count at least errs toward reporting LESS
+/// headroom, an under-counted gross wallet errs toward reporting the account as poorer than it is
+/// while giving the field a name that promises completeness. `getAccount` walks the whole index and
+/// can name it honestly; this entry point cannot, so it does not offer the field at all.
 ///
 /// # The one deliberate departure from Binance
 ///
@@ -716,74 +931,35 @@ pub fn run_get_account_margin<H: PerpHost>(
         )));
     }
 
-    // Signed/wide accumulators: each per-market term is bounded by u64/i64, and the id list is
-    // bounded by MAX_MARGIN_INFO_MARKETS, so i128/u128 cannot overflow here — the narrowing
-    // conversions at the end are where a pathological state surfaces as a clean revert.
-    let mut total_initial_margin: u128 = 0;
-    let mut total_position_initial_margin: u128 = 0;
-    let mut total_open_order_initial_margin: u128 = 0;
-    let mut total_maint_margin: u128 = 0;
-    let mut total_unrealized_profit: i128 = 0;
-
-    let user = args.user;
-    let mut seen: Vec<u64> = Vec::with_capacity(args.marketIds.len());
-    for market_id in args.marketIds.iter().copied() {
-        // A repeated id would double-count every total; fold it once. O(n^2) over n <= 64.
-        if seen.contains(&market_id) {
-            continue;
-        }
-        seen.push(market_id);
-        let info = compute_margin_info(context, user, market_id)
-            .map_err(|e| relabel(e, market_id))?;
-        total_initial_margin += info.initial_margin as u128;
-        total_position_initial_margin += info.position_initial_margin as u128;
-        total_open_order_initial_margin += info.open_order_initial_margin as u128;
-        total_maint_margin += info.maint_margin as u128;
-        total_unrealized_profit += info.unrealized_profit as i128;
-    }
-
-    // `walletBalance` SIGNED and unclamped — `getAccount`'s `availablePerpBalance` floors a
-    // negative value at 0; here the sign is the point.
-    let wallet_balance = storage::load_account_ref(context, user)?.perp_wallet_balance;
-
-    let total_unrealized_profit = i64::try_from(total_unrealized_profit)
-        .map_err(|_| perp_err("getAccountMargin: total unrealized profit exceeds i64"))?;
-    let total_open_order_initial_margin = u64::try_from(total_open_order_initial_margin)
-        .map_err(|_| perp_err("getAccountMargin: total open-order initial margin exceeds u64"))?;
-
-    // `marginBalance = walletBalance + totalUnrealizedProfit` (exact on 22/22 mainnet snapshots).
-    let margin_balance = (wallet_balance as i128) + (total_unrealized_profit as i128);
-    // `availableBalance = walletBalance − totalOpenOrderInitialMargin` — Binance's identity,
-    // literally, now that nothing debits the open-order requirement from the wallet. Unclamped.
-    let available_balance = wallet_balance as i128 - total_open_order_initial_margin as i128;
+    let s = account_margin_scalars(
+        context,
+        args.user,
+        args.marketIds.iter().copied(),
+        MarketSetSource::CallerList,
+        "getAccountMargin",
+    )?;
 
     Ok(Bytes::from(getAccountMarginCall::abi_encode_returns(
         &getAccountMarginReturn {
-            walletBalance: wallet_balance,
-            marginBalance: i64::try_from(margin_balance)
-                .map_err(|_| perp_err("getAccountMargin: margin balance exceeds i64"))?,
-            totalInitialMargin: u64::try_from(total_initial_margin)
-                .map_err(|_| perp_err("getAccountMargin: total initial margin exceeds u64"))?,
-            totalPositionInitialMargin: u64::try_from(total_position_initial_margin).map_err(
-                |_| perp_err("getAccountMargin: total position initial margin exceeds u64"),
-            )?,
-            totalOpenOrderInitialMargin: total_open_order_initial_margin,
-            totalMaintMargin: u64::try_from(total_maint_margin)
-                .map_err(|_| perp_err("getAccountMargin: total maintenance margin exceeds u64"))?,
-            totalUnrealizedProfit: total_unrealized_profit,
-            availableBalance: i64::try_from(available_balance)
-                .map_err(|_| perp_err("getAccountMargin: available balance exceeds i64"))?,
+            totalCrossWalletBalance: s.total_cross_wallet_balance,
+            crossMarginBalance: s.cross_margin_balance,
+            totalInitialMargin: s.total_initial_margin,
+            totalPositionInitialMargin: s.total_position_initial_margin,
+            totalOpenOrderInitialMargin: s.total_open_order_initial_margin,
+            totalMaintMargin: s.total_maint_margin,
+            totalUnrealizedProfit: s.total_unrealized_profit,
+            availableBalance: s.available_balance,
         },
     )))
 }
 
-/// Re-label a per-market reject so the caller can tell WHICH id in the array failed
+/// Re-label a per-market reject so the caller can tell WHICH id in the market set failed
 /// (`compute_margin_info` only knows it is "getMarginInfo: unknown market"). Fatals and the
 /// shell-level variants propagate verbatim — they are not business rejects and must not be
 /// reshaped into one.
-fn relabel(e: PerpError, market_id: u64) -> PerpError {
+fn relabel_market(e: PerpError, who: &str, market_id: u64) -> PerpError {
     match e {
-        PerpError::Reject(m) => perp_err(format!("getAccountMargin: market {market_id}: {m}")),
+        PerpError::Reject(m) => perp_err(format!("{who}: market {market_id}: {m}")),
         other => other,
     }
 }
