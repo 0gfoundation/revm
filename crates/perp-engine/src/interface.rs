@@ -368,15 +368,23 @@ sol! {
         /// there, and like Binance we do not tear resting orders down mid-life for it. What it
         /// does mean is that new risk-INCREASING actions are refused until it recovers.
         ///
-        /// A resting order that fills while the wallet cannot fund its margin still FILLS — the
-        /// shortfall lands on `walletBalance`, which is why that field is `int64` too. (This
-        /// comment previously said such a fill "will be cancelled at fill time"; that was the
-        /// pre-escrow-removal behaviour and it is gone. §1.6 measured Binance leaving an
-        /// under-covered lien alone and never sweeping it.) A NEGATIVE `walletBalance` is a
-        /// RECEIVABLE, not protocol bad debt: it is a negative claim inside the custody identity,
-        /// it blocks every money-out gate, and it nets against the user's next deposit. See
-        /// `types::UserAccount::perp_wallet_balance` for the derivation, the no-double-count
-        /// argument, and why absorbing it from the Insurance Fund would be strictly worse.
+        /// A resting order that fills while the wallet cannot fund its margin still FILLS — and the
+        /// shortfall lands on the POSITION, not here: `positionMargin` / `isolatedWallet` is funded
+        /// with `min(requirement, cash at hand)` and left short by the rest (model **M1**, measured
+        /// on Binance by R11 — `derived-ooim-plan.md` §3a). Consumers must therefore expect
+        /// `positionMargin < positionInitialMargin` after such a fill, and must not read the gap as
+        /// an error: the position's liquidation price is computed from the SHORT margin, which is the
+        /// honest one. (Two earlier versions of this comment were wrong: one said such a fill "will be
+        /// cancelled at fill time" (pre-escrow-removal behaviour), the next said the shortfall lands
+        /// on `walletBalance` (model M1′, a conjecture R11 refuted).)
+        ///
+        /// `walletBalance` is nonetheless still `int64`, because one narrow case remains: a maker
+        /// commission the capped opening margin could not absorb — on a pure close, the whole fee. A
+        /// NEGATIVE `walletBalance` is a RECEIVABLE, not protocol bad debt: it is a negative claim
+        /// inside the custody identity, it blocks every money-out gate, and it nets against the
+        /// user's next deposit. See `types::UserAccount::perp_wallet_balance` for the derivation, the
+        /// no-double-count argument, and why absorbing it from the Insurance Fund would be strictly
+        /// worse.
         ///
         /// ⚠️ These two `int64`s are the ONLY ABI surface that exposes a deficit: `getAccount`'s
         /// `availablePerpBalance` and `AccountBalanceChanged`'s `perpWalletBalance` are `uint64`

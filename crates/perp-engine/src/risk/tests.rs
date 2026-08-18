@@ -3190,17 +3190,26 @@ mod value_conservation {
     }
 
     /// The UNDERFUNDED MAKER FILL leg of the same identity. A maker whose wallet cannot cover the
-    /// opening margin now FILLS anyway and goes negative (`settle_maker_fill_core`), which is the
-    /// one new way to reach a negative wallet — and the one place a missing debit would MINT.
+    /// opening margin FILLS anyway (`settle_maker_fill_core`), with the silo funded only to the cash
+    /// at hand — model **M1**, measured by R11 (`derived-ooim-plan.md` §3a).
+    ///
+    /// **Why this leg still matters after the M1 switch.** Capping the opening margin is exactly the
+    /// kind of change that looks conservative and mints: the cap has to move the wallet debit DOWN
+    /// by the same amount it moves the silo credit down, or value appears/disappears. The identity
+    /// `C = Σ(wallet + margin + v_quote) + IF` is blind to WHERE the shortfall sits — M1 and M1′
+    /// conserve equally well, they just split `wallet + margin` differently — so it is the only
+    /// gate that catches the two halves drifting apart.
     ///
     /// Deterministic, because the fuzz above cannot reliably reach it: its users start with $400
     /// each at leverage <= 3, and draining one to within a hair of an opening margin by chance is
     /// not something 1200 random ops produce.
     ///
-    /// MUTATION-CHECKED: deleting the `trial_wallet -= opening_margin` line in
-    /// `settle_maker_fill_core` (which is what "just let the fill through" naively looks like)
-    /// breaks the assertion below by exactly the opening margin — the silo would be funded from
-    /// nowhere.
+    /// MUTATION-CHECKED, both directions of the M1 cap:
+    /// * deleting `trial_wallet -= opening_margin` in `settle_maker_fill_core` (what "just let the
+    ///   fill through" naively looks like) leaves the silo funded from nowhere — `equity` gains the
+    ///   whole opening margin;
+    /// * dropping the `.min((*wallet).max(0) as u64)` cap in `apply_position_fill` (i.e. reverting
+    ///   to M1′) is caught by the two split assertions below, not by the conservation one.
     #[test]
     fn an_underfunded_maker_fill_conserves_total_system_value() {
         let mut ctx = make_ctx();
@@ -3236,19 +3245,24 @@ mod value_conservation {
 
         place_order(&mut ctx, taker, 0, ENTRY_PRICE, QTY as u64);
 
-        // The fill happened, the silo is funded IN FULL, and the wallet carries the deficit.
+        // The fill happened, the SILO is short by the missing unit, and the wallet is emptied to
+        // exactly zero: `opening_margin = min(1_000_000_000, 999_999_999)`.
         let maker_pos = storage::load_position(&mut ctx, maker, MARKET_ID).unwrap();
         assert_eq!(maker_pos.amount, -QTY, "the short was opened");
-        assert_eq!(maker_pos.margin, opening_margin, "silo funded in full");
+        assert_eq!(
+            maker_pos.margin,
+            opening_margin - 1,
+            "silo funded to the cash at hand and no further — short by the 1 unit (M1)"
+        );
         assert_eq!(
             storage::load_account(&mut ctx, maker)
                 .unwrap()
                 .perp_wallet_balance,
-            -1,
-            "the wallet absorbed the shortfall"
+            0,
+            "the wallet is emptied, not driven negative (M1′ would read −1 here)"
         );
 
-        // ── The gate: a deficit is a TRANSFER, not a mint ──
+        // ── The gate: a shortfall is a TRANSFER, not a mint ──
         let (c1, a1) = state(&mut ctx);
         assert_eq!(
             equity(c1, a1, mark),
@@ -3260,7 +3274,8 @@ mod value_conservation {
         assert_eq!(
             storage::load_insurance_fund(&mut ctx).unwrap(),
             SEED_IF,
-            "the deficit is NOT socialised — it stays on the user's wallet"
+            "the shortfall is NOT socialised at fill time — it rides on the position, and only \
+             reaches the fund if that position later closes insolvent (usdc_custody covers that)"
         );
     }
 }
@@ -3321,11 +3336,11 @@ mod usdc_custody {
         storage::keys::erc20_balance_slot,
     };
 
-    /// The maker that ends up carrying the deficit.
+    /// The maker whose position ends up carrying the deficit.
     const MK: Address = address!("00000000000000000000000000000000000000d1");
     /// Taker of MK's opening sell.
     const T1: Address = address!("00000000000000000000000000000000000000d2");
-    /// Taker of MK's flipping buy — the fill that drives MK's wallet negative.
+    /// Taker of MK's flipping buy — the fill that leaves MK's silo SHORT.
     const T2: Address = address!("00000000000000000000000000000000000000d3");
     /// Rests the punitive bid MK's liquidation is forced to close into.
     const LQ: Address = address!("00000000000000000000000000000000000000d4");
@@ -3335,7 +3350,7 @@ mod usdc_custody {
     const HOLDERS: [Address; 5] = [MK, T1, T2, LQ, ADMIN];
 
     const MK_DEPOSIT: u64 = 400_000_000; // $400 — all of MK's own money, ever
-    const MK_TOP_UP: u64 = 20_000_000; //   $20 deposited AFTER the deficit exists
+    const MK_TOP_UP: u64 = 20_000_000; //   $20 deposited AFTER the liquidation
     const T1_DEPOSIT: u64 = 2_000_000_000;
     const T2_DEPOSIT: u64 = 3_000_000_000;
     const LQ_DEPOSIT: u64 = 1_000_000_000;
@@ -3393,8 +3408,12 @@ mod usdc_custody {
                 funding_interval: 0,
                 interest_rate: 0,
                 // LIVE clearance fee, so the liquidation charges one. It also pins `risk/mod.rs`'s
-                // `.min(account.perp_wallet_balance.max(0))`: an ALREADY-negative wallet must be
-                // charged nothing rather than pushed further under.
+                // `.min(account.perp_wallet_balance.max(0))`: MK's wallet is EMPTY when the
+                // liquidation lands (the fill drained it into the silo), so the fee must come out as
+                // ZERO rather than pushing him under water. Under M1′ this pinned the same clamp
+                // against an already-NEGATIVE wallet; the `max(0)` half of it is now covered by
+                // `a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet` plus the unit
+                // tests in `types::account`.
                 liquidation_fee_rate_bps: 50,
                 // ±50%. Wide, and it has to be: the liquidation close below must reach a bid
                 // well under the new mark. Note WHY the default (`0` → ±10%) is not enough —
@@ -3533,35 +3552,62 @@ mod usdc_custody {
             .sum()
     }
 
-    /// A maker fill that the wallet cannot fund drives `perp_wallet_balance` NEGATIVE, and the
-    /// position it funded is then liquidated INSOLVENT so the Insurance Fund covers the part the
-    /// margin could not. The end state is exactly the one a previous audit called "protocol-level
-    /// bad debt that is not routed to the IF". This produces it through real calls and then asks
-    /// the only question that can settle it: **does the custodied USDC still equal the sum of
-    /// everyone's claims?**
+    /// A maker fill that the wallet cannot fund opens a position whose silo is **SHORT** (model M1),
+    /// and that position is then liquidated INSOLVENT so the Insurance Fund covers the part the silo
+    /// could not. Two questions, one scenario:
     ///
-    /// It does. Which makes the negative balance a RECEIVABLE, not a loss:
+    /// 1. **does the custodied USDC still equal the sum of everyone's claims?** (the identity, at
+    ///    every checkpoint — the original purpose of this test, unchanged);
+    /// 2. **does the shortfall RESOLVE, leaving nothing stranded?** (the structural property that
+    ///    motivated switching M1′ → M1).
     ///
-    /// * it is inside the identity as a NEGATIVE claim, so the protocol has not over-promised;
-    /// * clamping it at 0 (what every `uint64` ABI surface reports) is what breaks the identity,
-    ///   by exactly the deficit — the assertion below measures that directly;
-    /// * it blocks every money-out gate and nets against the next deposit, both exercised here;
-    /// * Binance does the same thing: a lien is allowed to sit under-covered and is never swept
-    ///   (`misc/binance-margin-verified-model.md` §1.6 — at
-    ///   `crossWalletBalance − totalOpenOrderInitialMargin = −0.00085981` a resting order stayed
-    ///   `status='NEW'` while a NEW order was refused `-2019` in the same instant).
+    /// # What moved, and why this scenario is still the right one
     ///
-    /// # ⚠️ This test is deliberately hostile to the "absorb it from the Insurance Fund" fix
+    /// This test was written against **M1′**, where the silo was funded IN FULL and MK's
+    /// `perp_wallet_balance` went NEGATIVE by the shortfall. It then proved that the negative was a
+    /// RECEIVABLE rather than a leak (the identity closed with it in as a negative claim, and it was
+    /// CLAMPING it that broke the identity). That was all true — but a receivable that only a
+    /// voluntary deposit can clear is a strictly worse structure than one the protocol resolves by
+    /// itself, and R11 measured that Binance does the latter (`derived-ooim-plan.md` §3a).
     ///
-    /// Crediting MK's deficit out of the IF keeps the SUM unchanged (IF down, wallet up) — so the
-    /// identity alone would not notice. It is nonetheless strictly worse than leaving it: it
-    /// FORGIVES a debt the protocol can still collect, letting a user go negative and walk away
-    /// with the fund eating it. The two pinned assertions at the end — MK's wallet is exactly the
-    /// unforgiven deficit, and the IF absorbed exactly the beyond-margin slice and nothing more —
-    /// both fail if anyone wires that up. That is on purpose. Do not "fix" them.
+    /// Under **M1** the same scenario, unchanged call for call, produces the deficit INSIDE the
+    /// position instead: the silo receives the $300 of cash actually at hand against a $366.67
+    /// requirement, so it is $66.67 short. Nothing else about the fill changes. The consequence
+    /// shows up at liquidation, and it is the whole point:
+    ///
+    /// ```text
+    /// M1′  silo 366.67 → close loses 460.00 → IF absorbs  93.33 ,  wallet stranded at −66.67
+    /// M1   silo 300.00 → close loses 460.00 → IF absorbs 160.00 ,  wallet at 0
+    ///                                             ↑ +66.67 = exactly the stranded balance
+    /// ```
+    ///
+    /// The shortfall travels with the position and is absorbed by the EXISTING
+    /// liquidation-deficit → insurance-fund path (`absorb_bad_debt_into_insurance_fund`). No new
+    /// mechanism, no new term in the identity: `Σ margin` is $66.67 lower and `Σ wallet` $66.67
+    /// higher, and the identity is a sum over both.
+    ///
+    /// # What the custody identity now covers
+    ///
+    /// Every checkpoint is kept verbatim, and the identity is EXERCISED THE SAME WAY — it is still
+    /// asserted across an underfunded maker fill, an insolvent liquidation and a later deposit, and
+    /// it still has to close against real on-trie USDC. What it no longer *contains* is a negative
+    /// `wallet` term, because this path no longer produces one. That leg has not been deleted, it has
+    /// MOVED: the only remaining producer of a negative `perp_wallet_balance` is a maker fee the
+    /// capped opening margin could not absorb (chiefly a pure close whose proceeds an insolvent close
+    /// ate), which is commission-sized and is the one place Binance's own wallet goes negative too.
+    /// It is pinned by `trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet`,
+    /// and the signed field + clamped ABI view are kept for it.
+    ///
+    /// # ⚠️ Still deliberately hostile to "absorb the shortfall from the Insurance Fund" at FILL time
+    ///
+    /// Crediting a fill-time shortfall out of the IF keeps the SUM unchanged (IF down, wallet or silo
+    /// up), so the identity alone would not notice. It remains wrong: it socialises a loss that has
+    /// not happened yet — the position may well close in profit — and it double-pays, because the IF
+    /// already absorbs the beyond-silo slice at liquidation. The pinned split at the end (own cash +
+    /// IF == the whole realized loss, with the IF term equal to the beyond-silo slice and nothing
+    /// more) fails if anyone wires that up. That is on purpose.
     #[test]
-    fn custodied_usdc_still_equals_all_claims_when_an_underfunded_makers_position_is_liquidated_insolvent(
-    ) {
+    fn custodied_usdc_still_equals_all_claims_when_a_short_silo_position_is_liquidated_insolvent() {
         let mut ctx = make_ctx_with_usdc(&[
             (MK, MK_DEPOSIT + MK_TOP_UP),
             (T1, T1_DEPOSIT),
@@ -3636,7 +3682,7 @@ mod usdc_custody {
         // (`trading/mod.rs`'s buy arm even documents this band: unlike a sell, a resting BUY gets
         // no Assuming-Price uplift, so for us the `ooIM = 0` band is both free AND fillable).
         // The fill then closes the short at a LOSS — so the margin it releases is less than the
-        // margin the new long leg needs — and the shortfall lands on the wallet.
+        // margin the new long leg needs — and the shortfall stays in the SILO (M1).
         assert_eq!(
             oo_im(&mut ctx, MK),
             0,
@@ -3646,23 +3692,56 @@ mod usdc_custody {
         assert_eq!(oo_im(&mut ctx, MK), 0);
         place_order(&mut ctx, T2, SELL, 11_000, 2 * QTY as u64);
 
+        // Cash at hand for the opening leg = wallet 66_666_667 + released margin 333_333_333
+        //   + realized −100_000_000 (short 10 @ $100 closed at $110) = 300_000_000,
+        // against a requirement of 1_100_000_000 / 3 = 366_666_666. So
+        //   opening_margin = min(366_666_666, 300_000_000) = 300_000_000   ⇒ silo SHORT 66_666_666
+        //   wallet         = 300_000_000 − 300_000_000     = 0             ⇒ NOT negative
+        const SILO_SHORTFALL: i64 = 66_666_666;
         let mk_long = storage::load_position(&mut ctx, MK, MARKET_ID).unwrap();
         assert_eq!(
             (mk_long.amount, mk_long.v_quote_balance, mk_long.margin),
-            (QTY, -1_100_000_000, 366_666_666),
-            "the flip filled: short closed, long 10 @ $110 opened, silo funded IN FULL"
+            (QTY, -1_100_000_000, 300_000_000),
+            "the flip filled: short closed, long 10 @ $110 opened, silo funded to the CASH AT \
+             HAND — short of its 366_666_666 requirement (M1, not M1′)"
         );
-        let deficit_after_flip = storage::load_account(&mut ctx, MK)
-            .unwrap()
-            .perp_wallet_balance;
         assert_eq!(
-            deficit_after_flip, -66_666_666,
-            "the wallet funded the opening leg and went NEGATIVE — no cancel, no clamp"
+            366_666_666 - mk_long.margin,
+            SILO_SHORTFALL,
+            "the shortfall is exactly the cash the wallet could not produce"
+        );
+        assert_eq!(
+            storage::load_account(&mut ctx, MK)
+                .unwrap()
+                .perp_wallet_balance,
+            0,
+            "the wallet is emptied into the silo and stops there — M1′ read −66_666_666 here"
+        );
+        // K9 passed on the SHORT silo, which is the honest test: equity at the $110 mark is
+        // `300_000_000 − 1_100_000_000 + 1_100_000_000` against a `1_100_000_000 / 6` maintenance
+        // requirement. Had the fill been priced against a full silo it would have looked safer than
+        // it is — that optimism is what M1 removes.
+        let mkt_tiers = storage::load_market(&mut ctx, MARKET_ID)
+            .unwrap()
+            .unwrap()
+            .tiers;
+        assert!(
+            crate::math::is_above_maintenance_margin(
+                &mkt_tiers,
+                11_000,
+                mk_long.amount,
+                mk_long.v_quote_balance,
+                mk_long.margin,
+                0,
+                PRICE_DECIMALS,
+            )
+            .unwrap(),
+            "the short-silo position is solvent at the mark it opened at"
         );
         assert_custody_closes(
             &mut ctx,
             custody_before_top_up,
-            "after the underfunded flip fill",
+            "after the short-silo flip fill",
         );
 
         // ── 5. A punitive resting bid at $64, then crash the mark to $70 ──
@@ -3696,24 +3775,37 @@ mod usdc_custody {
         );
         let if_after_liq = storage::load_insurance_fund(&mut ctx).unwrap();
         let if_absorbed = (if_before_liq - if_after_liq) as i128;
+        // ── THE STRUCTURAL PROPERTY M1 BUYS ──
+        // The IF absorbs the loss beyond the silo, and the silo is SHORT, so the fill-time
+        // shortfall is absorbed here too — through the pre-existing bad-debt path, with no new
+        // mechanism. $460 loss − $300 silo = $160, which is the $93.33 M1′ would have routed PLUS
+        // the $66.67 M1′ would have stranded on the wallet forever.
         assert_eq!(
-            if_absorbed, 93_333_334,
-            "the IF covers the loss BEYOND the position's margin — and only that: the close's \
-             $460 loss met a $366.67 silo, so $93.33 reached the fund"
+            if_absorbed, 160_000_000,
+            "the IF covers the loss BEYOND the silo — and the silo was short, so the fill-time \
+             shortfall resolves here"
+        );
+        assert_eq!(
+            if_absorbed - 93_333_334,
+            SILO_SHORTFALL as i128,
+            "and the extra the IF takes vs the full-silo case IS the shortfall, to the unit"
         );
         assert!(
             if_after_liq > 0,
             "no socialised write-off: the identity must stay comparable"
         );
 
-        // The wallet is untouched by the liquidation: isolated margin never debits it, and the
-        // clearance fee is capped at `perp_wallet_balance.max(0)` — 0 here (risk/mod.rs).
+        // MK ends with NOTHING STRANDED: no position, no silo, and a wallet at exactly zero. The
+        // wallet is untouched by the liquidation itself — isolated margin never debits it, and the
+        // clearance fee is capped at `perp_wallet_balance.max(0)` = 0 (risk/mod.rs). This is the
+        // assertion M1′ could not make: there it ended at −66_666_666, with the position that
+        // justified the debit gone and nothing in the engine able to clear it.
         assert_eq!(
             storage::load_account(&mut ctx, MK)
                 .unwrap()
                 .perp_wallet_balance,
-            deficit_after_flip,
-            "liquidation neither charged nor forgave the deficit"
+            0,
+            "no stranded balance: the deficit left with the position it was attached to"
         );
 
         // ── 6. THE VERDICT: custody still equals the sum of all claims ──
@@ -3723,29 +3815,37 @@ mod usdc_custody {
             "after the insolvent liquidation",
         );
 
-        // ...and it is the CLAMPED view that breaks it, by exactly the deficit. This is the
-        // mechanical statement of "receivable, not leak": the identity DEPENDS on the negative
-        // term being negative. Read the wallets as `uint64` (what `getAccount` and
-        // `AccountBalanceChanged` report) and the protocol appears to owe $66.67 more than it
-        // holds — which is the deficit, seen from the other side.
+        // ...and, unlike under M1′, the CLAMPED view closes too. Under M1′ this assertion measured
+        // the identity being broken by exactly the deficit (`uint64` ABI surfaces read the negative
+        // wallet as 0, over-stating claims): that was the mechanical proof the negative term was
+        // load-bearing. Under M1 there is no negative term left on this path, so the ledger and
+        // everything `getAccount` / `AccountBalanceChanged` report AGREE — which is the stronger
+        // statement and the one worth pinning: an operator reading only the clamped ABI can no
+        // longer be misled about this scenario. Reintroducing M1′ makes this fail.
         let clamped = claims(&mut ctx, true);
         assert_eq!(
             clamped.total_at(7_000) - custody_before_top_up,
-            -deficit_after_flip as i128,
-            "clamping the wallet at 0 must over-state claims by exactly the deficit"
+            0,
+            "no clamped-vs-stored gap: nothing on this path drives a wallet negative any more"
+        );
+        assert_eq!(
+            clamped, c,
+            "and that is because the two views are now identical, not because two errors cancel"
         );
 
-        // ── 7. NO DOUBLE COUNT — the loss splits into three DISJOINT slices ──
-        // MK's whole realized loss over both fills, funded by: MK's own deposited cash, the
-        // receivable (the negative wallet), and the Insurance Fund. If the IF had absorbed the
-        // same economic loss the negative wallet already represents, this would over-shoot by the
-        // overlap. It is exact, so there is no overlap. (Fees are 0 and funding is off in this
+        // ── 7. NO DOUBLE COUNT — the loss splits into two DISJOINT slices ──
+        // MK's whole realized loss over both fills, funded by: MK's own deposited cash, and the
+        // Insurance Fund. Under M1′ this was a THREE-way split — own cash + receivable + IF — and
+        // the receivable term has not vanished, it has MERGED into the IF term (that is the
+        // `if_absorbed − 93_333_334 == SILO_SHORTFALL` assertion above). If the IF ever absorbed the
+        // shortfall a SECOND time (e.g. someone also "resolves" it at fill time) this over-shoots by
+        // the overlap. It is exact, so there is no overlap. (Fees are 0 and funding is off in this
         // market, so realized PnL is MK's entire P&L.)
         let mk_total_realized = liq_realized + -100_000_000; // flip close: short @ $100 → $110
         assert_eq!(
-            MK_DEPOSIT as i128 + (-deficit_after_flip as i128) + if_absorbed,
+            MK_DEPOSIT as i128 + if_absorbed,
             -mk_total_realized,
-            "MK's loss must decompose EXACTLY into own-cash + receivable + IF"
+            "MK's loss must decompose EXACTLY into own-cash + IF, with a ZERO receivable term"
         );
         assert!(
             if_absorbed < -mk_total_realized,
@@ -3757,7 +3857,13 @@ mod usdc_custody {
             "sanity: `claims` is a pure read"
         );
 
-        // ── 8. Receivable semantics: blocks money-out, nets against the next deposit ──
+        // ── 8. A user at zero is refused money-out; a user who tops up is NOT working off a debt ──
+        // Under M1′ this section proved receivable semantics: money-out refused because `available`
+        // was negative, and the next deposit swallowed by the deficit. Under M1 the first half still
+        // holds (MK is at exactly 0, and `derived_can_afford` refuses every POSITIVE requirement),
+        // while the second half INVERTS — and that inversion is the user-visible payoff of the
+        // switch: MK's $20 is his to spend, because the shortfall was settled against the insurance
+        // fund when the position it belonged to died.
         for (label, r) in [
             (
                 "transferFromPerp",
@@ -3781,7 +3887,7 @@ mod usdc_custody {
         ] {
             assert!(
                 r.is_err(),
-                "{label} must refuse a user whose perp wallet is under water"
+                "{label} must refuse a user whose perp wallet has nothing available"
             );
         }
 
@@ -3790,8 +3896,8 @@ mod usdc_custody {
             storage::load_account(&mut ctx, MK)
                 .unwrap()
                 .perp_wallet_balance,
-            deficit_after_flip + MK_TOP_UP as i64,
-            "a later deposit NETS against the deficit — it is not credited to a fresh bucket"
+            MK_TOP_UP as i64,
+            "the deposit lands in full — there is no deficit left for it to net against"
         );
         assert!(
             run_transfer_from_perp(
@@ -3799,22 +3905,25 @@ mod usdc_custody {
                 MK,
                 &mut ctx,
             )
-            .is_err(),
-            "still under water, so money-out is still refused"
+            .is_ok(),
+            "and it is SPENDABLE: under M1′ MK would still be under water here, refused"
         );
         assert_custody_closes(&mut ctx, TOTAL_DEPOSITED, "after MK tops up");
 
-        // ── 9. Is the deficit visible to an operator? ──
-        // `getAccount` clamps (it returns `uint64`), but `getAccountMargin` returns `int64
-        // walletBalance` / `int64 availableBalance` unclamped, so the true signed value IS
-        // readable through the ABI. Pinned here because it is the whole difference between "we
-        // carry a receivable" and "we carry an invisible receivable".
+        // ── 9. The two ABI views AGREE, and the signed one is still the honest one ──
+        // `getAccount` clamps (it returns `uint64`); `getAccountMargin` returns `int64
+        // walletBalance` / `int64 availableBalance` unclamped. Under M1′ that difference was the
+        // whole difference between "we carry a receivable" and "we carry an INVISIBLE receivable" —
+        // an operator watching only the event stream could not see a deficit accumulate. Under M1
+        // there is nothing for the clamp to hide on this path and both report the same number; the
+        // signed surface is kept because it is still the only honest one for the commission case.
+        let expected = MK_TOP_UP as i64 - 1; // the 1 unit transferred out just above
         let clamped_view =
             run_get_account(&getAccountCall { user: MK }.abi_encode(), &mut ctx).unwrap();
         assert_eq!(
             U256::from_be_slice(&clamped_view[32..64]).to::<u64>(),
-            0,
-            "getAccount floors availablePerpBalance at 0"
+            expected as u64,
+            "getAccount reports the full available balance — nothing is being floored away"
         );
         let signed_view = getAccountMarginCall::abi_decode_returns(
             &run_get_account_margin(
@@ -3830,11 +3939,8 @@ mod usdc_custody {
         .unwrap();
         assert_eq!(
             (signed_view.walletBalance, signed_view.availableBalance),
-            (
-                deficit_after_flip + MK_TOP_UP as i64,
-                deficit_after_flip + MK_TOP_UP as i64
-            ),
-            "getAccountMargin reports the true SIGNED deficit (no resting orders, so ooIM = 0)"
+            (expected, expected),
+            "getAccountMargin agrees with the clamped view (no resting orders, so ooIM = 0)"
         );
     }
 }

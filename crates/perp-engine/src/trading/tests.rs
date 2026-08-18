@@ -906,8 +906,8 @@ fn fill_debits_init_margin_from_both_wallets() {
 /// CHANGED BY THE ESCROW REMOVAL: the fixture used to drain BOB's wallet to ZERO before the fill,
 /// because the order's own escrow was all the funding the fill needed. The MARGIN escrow is gone
 /// too, so the fill draws `INIT_MARGIN` from the wallet at fill time and a zero wallet would make
-/// it unfundable — the fill still happens and the wallet goes negative (pinned separately in
-/// `an_unfundable_maker_fill_still_fills_and_the_wallet_goes_negative`). The fixture now leaves BOB
+/// it unfundable — the fill still happens and the SILO comes up short (pinned separately in
+/// `an_unfundable_maker_fill_still_fills_and_the_silo_is_short_not_the_wallet`). The fixture now leaves BOB
 /// exactly the margin and NOT ONE UNIT MORE, which is the sharpest form of the claim under test:
 /// the fee is carved out of that margin, never charged on top of it.
 #[test]
@@ -948,25 +948,37 @@ fn maker_open_fill_funds_its_fee_from_margin_needing_no_free_wallet() {
 /// is only ever gated against `Σ ooIM` at ADMISSION, and `ooIM` (which values the position leg at
 /// mark and nets the close a fill performs) is not an upper bound on a fill's actual draw.
 ///
-/// **The fill happens anyway, and the wallet goes negative.** This test used to pin the opposite
-/// (`RejectedInsolvent` → the maker order cancelled, the taker walking on to the next maker); that
-/// is model **M2 ("don't fill")** in `misc/binance-flip-and-admission.md` §3.3, and BOTH surviving
-/// candidates for Binance's real behaviour (M1 and M1′) FILL. The measured backing for filling is
-/// independent of that open question: `binance-margin-verified-model.md` §1.6 caught an
-/// already-resting order sitting at `status = 'NEW'` while headroom was NEGATIVE
-/// (`crossWalletBalance − totalOpenOrderInitialMargin = −0.00085981`) at the same instant a NEW
-/// order was refused `-2019` — the exchange lets a lien be under-covered and never sweeps it.
-/// Admission is a one-time check; only LIQUIDATION kills an order.
+/// **The fill happens anyway, and the SILO takes the shortfall** — model **M1**. This test has been
+/// rewritten twice. It first pinned `RejectedInsolvent` (the maker order cancelled, the taker
+/// walking on) = model **M2 ("don't fill")** in `misc/binance-flip-and-admission.md` §3.3, which is
+/// wrong: the measured exchange behaviour is that an already-resting order sits at `status = 'NEW'`
+/// while headroom is NEGATIVE (`crossWalletBalance − totalOpenOrderInitialMargin = −0.00085981`) at
+/// the same instant a NEW order is refused `-2019` (`binance-margin-verified-model.md` §1.6) —
+/// admission is a one-time check and only LIQUIDATION kills an order. It then pinned **M1′** (silo
+/// funded in full, wallet driven negative), which §3.3 flagged as a ~50/50 CONJECTURE.
 ///
-/// So the maker's position is funded in full and the deficit lands in `perp_wallet_balance`, whose
-/// signed-internal / clamped-external shape is exactly Binance's true-negative-but-reported-zero
-/// `availableBalance` (working model M1′ — a CONJECTURE, see the note in
-/// `settle_maker_fill_core`). Nothing is minted: the position gains exactly what the wallet loses.
+/// R11 settled it and it is **M1** (`derived-ooim-plan.md` §3a): the silo receives all the cash
+/// there is and not a satoshi more — measured `isolatedWallet == W0 + realized` digit-for-digit
+/// against a higher IM-implied figure — and the wallet does NOT carry a margin shortfall.
+///
+/// Arithmetic here: BOB's requirement is `INIT_MARGIN` (leverage 1, so the full fill notional) and
+/// his wallet holds `INIT_MARGIN − 1`, so
+/// `opening_margin = min(INIT_MARGIN, INIT_MARGIN − 1) = INIT_MARGIN − 1`: the silo is short by
+/// exactly 1 and the wallet lands on 0, not −1. Nothing is minted either way — the position gains
+/// exactly what the wallet loses — but under M1 the missing unit is attached to the POSITION, so
+/// closing or liquidating it resolves the deficit instead of stranding it (see
+/// `risk::tests::usdc_custody`).
 #[test]
-fn an_unfundable_maker_fill_still_fills_and_the_wallet_goes_negative() {
+fn an_unfundable_maker_fill_still_fills_and_the_silo_is_short_not_the_wallet() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
     fund(&mut ctx, CAROL, WALLET);
+    // A LIVE mark, so K9 actually runs on the short-funded trial position (it is skipped at
+    // `mark == 0`) and so `compute_margin_info` below reports a real requirement. BOB's short at
+    // the mark has equity `999_999 + 1e6 − 1e6` against a `1e6/6` maintenance requirement, so K9
+    // passes — a silo short by 1 is nowhere near insolvent, which is the R11 shape (`silo/MM`
+    // there was 24.5×).
+    set_mark(&mut ctx, PRICE);
 
     // BOB rests at $100 (FIFO-first), CAROL behind him at the same price.
     let bob_sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
@@ -985,25 +997,33 @@ fn an_unfundable_maker_fill_still_fills_and_the_wallet_goes_negative() {
     let bob_pos = pos(&mut ctx, BOB);
     assert_eq!(bob_pos.amount, -(QTY as i64), "the short was opened");
     assert_eq!(
-        bob_pos.margin, INIT_MARGIN as i64,
-        "the silo is funded to the FULL requirement, not short by the deficit (M1′, not M1)"
+        bob_pos.margin,
+        INIT_MARGIN as i64 - 1,
+        "the silo got all the cash there was and not a unit more: SHORT of its own \
+         INIT_MARGIN requirement by exactly the 1-unit shortfall (M1, not M1′)"
     );
     assert_eq!(
         storage::load_account(&mut ctx, BOB)
             .unwrap()
             .perp_wallet_balance,
-        -1,
-        "the wallet absorbs the shortfall and goes negative by exactly it"
-    );
-    assert_eq!(
-        storage::load_account(&mut ctx, BOB)
-            .unwrap()
-            .visible_perp_wallet_balance(),
         0,
-        "clamped at the ABI boundary — Binance reports 0 for a negative true value"
+        "the wallet is drained to exactly zero and does NOT go negative — the deficit is \
+         attached to the position, not decoupled from it"
+    );
+    // The requirement itself is unchanged — it is the FUNDING that fell short, and the gap is
+    // visible as `positionInitialMargin > positionMargin` (the §3.9 shape, which
+    // `a_position_naturally_below_its_own_initial_margin_survives_normally` proves is normal).
+    let info = crate::margin_view::compute_margin_info(&mut ctx, BOB, MARKET_ID).unwrap();
+    assert_eq!(info.position_initial_margin, INIT_MARGIN);
+    assert_eq!(
+        info.position_initial_margin as i64 - bob_pos.margin,
+        1,
+        "the silo is short of its own IM by exactly the unfunded unit"
     );
     // Conservation: BOB's wallet + position margin is unchanged by the fill (he opened at the mark,
-    // so there is no PnL and no fee here), so nothing was minted to fund the silo.
+    // so there is no PnL and no fee here), so nothing was minted to fund the silo — and nothing was
+    // burned by capping it either. This assertion holds identically under M1 and M1′; it is the
+    // SPLIT between the two terms that moved.
     assert_eq!(
         storage::load_account(&mut ctx, BOB)
             .unwrap()
@@ -1023,12 +1043,11 @@ fn an_unfundable_maker_fill_still_fills_and_the_wallet_goes_negative() {
     );
     assert_eq!(pos(&mut ctx, CAROL).amount, 0);
 
-    // The deficit is a real claim, not a free lunch: it puts AVAILABLE below zero, so every
-    // money-out gate (`transferFromPerp`, `withdraw`, `addPositionMargin`, any new order with a
-    // positive requirement) refuses BOB until it is funded. Crediting the wallet nets straight
-    // against it. NOTHING in the engine ever writes a deficit off — closing the position it funded
-    // releases the margin back, and beyond that only a deposit clears it.
-    assert_eq!(available(&mut ctx, BOB), -1);
+    // The shortfall is still a real constraint, it just sits in the silo now: BOB's AVAILABLE is
+    // exactly zero, so every money-out gate (`transferFromPerp`, `withdraw`, `addPositionMargin`,
+    // any new order with a positive requirement) still refuses him. What changed is that he is not
+    // in DEBT — a unit credited to him is spendable rather than swallowed by a deficit.
+    assert_eq!(available(&mut ctx, BOB), 0);
     assert!(!crate::margin_view::derived_can_afford(
         available(&mut ctx, BOB),
         1
@@ -1036,9 +1055,202 @@ fn an_unfundable_maker_fill_still_fills_and_the_wallet_goes_negative() {
     fund(&mut ctx, BOB, 1);
     assert_eq!(
         available(&mut ctx, BOB),
-        0,
-        "a credit nets against the deficit"
+        1,
+        "the credit is spendable: under M1′ it would have been absorbed netting a −1 deficit"
     );
+}
+
+/// **LP HONESTY — the second reason M1 beats M1′.** A short silo is not a cosmetic bookkeeping
+/// choice: `pos.margin` is the `isolatedWallet` every maintenance evaluation is measured against
+/// (`is_above_maintenance_margin`, and through it `liquidate()` and the sweep), so funding it short
+/// moves the position's liquidation price to where its risk actually is. Under M1′ the silo looked
+/// FULL — the deficit was parked on an account-global wallet no maintenance check reads — so LP was
+/// optimistic by exactly the shortfall while the protocol carried the risk.
+///
+/// Same fixture as the test above, with a 300_000-unit shortfall instead of 1, and the mark then
+/// pushed to $160. BOB is short QTY with `v_quote = +1_000_000`:
+///
+/// ```text
+///                     equity = margin + v_quote − value(mark)      MM = value(mark)/6
+///   short silo  700_000 + 1_000_000 − 1_600_000 =  100_000   <   266_666   ⇒ LIQUIDATABLE
+///   full  silo  1_000_000 + 1_000_000 − 1_600_000 = 400_000   ≥   266_666   ⇒ safe
+/// ```
+///
+/// So the whole 300_000 of shortfall shows up in the maintenance buffer, and the counterfactual is
+/// the SAME function with the SAME arguments but the full margin — not a re-derivation.
+#[test]
+fn a_short_silo_lowers_the_maintenance_buffer_it_is_measured_against() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    set_mark(&mut ctx, PRICE);
+    const SHORTFALL: u64 = 300_000;
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
+    bob.perp_wallet_balance = (INIT_MARGIN - SHORTFALL) as i64;
+    storage::save_account(&mut ctx, BOB, bob).unwrap();
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    let bob_pos = pos(&mut ctx, BOB);
+    assert_eq!(bob_pos.margin, (INIT_MARGIN - SHORTFALL) as i64);
+    assert_eq!(wallet(&mut ctx, BOB), 0);
+
+    // The shortfall is ABI-visible as the position's own margin, i.e. as `isolatedWallet` —
+    // consumers compute LP from this number, so it has to be the short one.
+    set_mark(&mut ctx, 160 * TICK);
+    let i = crate::margin_view::compute_margin_info(&mut ctx, BOB, MARKET_ID).unwrap();
+    assert_eq!(i.position_margin, (INIT_MARGIN - SHORTFALL) as i64);
+    assert_eq!(i.maint_margin, 1_600_000 / 6);
+    assert_eq!(
+        i.isolated_margin, 100_000,
+        "equity carries the shortfall: 700_000 margin + 400_000 unrealised loss offset"
+    );
+    assert!(
+        i.isolated_margin < i.maint_margin as i64,
+        "the short-silo position is BELOW maintenance at $160"
+    );
+
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    let is_safe = |margin: i64| {
+        crate::math::is_above_maintenance_margin(
+            &market.tiers,
+            160 * TICK,
+            bob_pos.amount,
+            bob_pos.v_quote_balance,
+            margin,
+            market.base_decimals,
+            market.price_decimals,
+        )
+        .unwrap()
+    };
+    assert!(!is_safe(bob_pos.margin), "short silo: liquidatable");
+    assert!(
+        is_safe(INIT_MARGIN as i64),
+        "the SAME position with the silo funded in full is safe at this mark — the 300_000 of \
+         shortfall is exactly what moved the liquidation price, and M1′ hid it"
+    );
+
+    // And it is not merely arithmetic: the real liquidation path acts on it.
+    assert!(
+        crate::risk::run_liquidate(
+            &crate::interface::IPerpDex::liquidateCall {
+                user: BOB,
+                marketId: MARKET_ID,
+            }
+            .abi_encode(),
+            CAROL,
+            &mut ctx,
+        )
+        .is_ok(),
+        "liquidate() reads pos.margin, so a short silo really does get liquidated here"
+    );
+    assert_eq!(pos(&mut ctx, BOB).amount, 0);
+}
+
+/// **The ONE remaining route to a negative `perp_wallet_balance`: an unabsorbable maker COMMISSION.**
+///
+/// After the M1 switch every other decrease is bounded below by zero — every money-out gate
+/// (`transferFromPerp`, `addPositionMargin`, `depositInsuranceFund`) refuses unless
+/// `derived_can_afford(available, amount)` with `amount > 0`, and `available = wallet − Σ ooIM ≤
+/// wallet`; the taker fill is gated the same way on `total_required`; funding settles into
+/// `pos.margin` and never touches the wallet; the liquidation clearance fee is explicitly
+/// `.min(perp_wallet_balance.max(0))`; a liquidation residual and both ADL legs only ever CREDIT.
+/// What is left is `fee_from_wallet = maker_fee − min(maker_fee, opening_margin)` in
+/// `settle_maker_fill_core`: when the capped opening margin cannot absorb the commission, the wallet
+/// pays the rest — and a PURE CLOSE has no opening margin at all.
+///
+/// This is deliberate, it is §3a's recommendation for the commission gap (let the position carry it
+/// where there is a position to carry it, and do NOT open a second insurance-fund path), and it is
+/// bounded by the fee. It is also the one place Binance's own wallet goes negative: R11 measured
+/// `−0.25717240`, exactly the fill commission, cleared by `INSURANCE_CLEAR` seconds later. Ours is
+/// not cleared, so `perp_wallet_balance: i64` and its clamped ABI view stay.
+///
+/// Arithmetic: BOB is long QTY at entry $100 with a leverage-3 silo of 333_333 and an EMPTY wallet,
+/// and rests a sell at the $60 mark (a pure reduce, so `ooIM = 0` admits it for free). The close
+/// realizes `−1_000_000 + 600_000 = −400_000` against 333_333 of released margin, so it is INSOLVENT
+/// — 66_667 of bad debt to the fund, and isolated margin leaves the wallet untouched at 0. The
+/// 200 bps maker fee on the 600_000 filled is then 12_000 with nothing to absorb it.
+#[test]
+fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    set_mark(&mut ctx, 60 * TICK);
+    storage::save_insurance_fund(&mut ctx, 10_000_000).unwrap();
+    storage::save_user_fee_rates(
+        &mut ctx,
+        BOB,
+        UserFeeRates {
+            maker_fee_bps: 200,
+            taker_fee_bps: 0,
+        },
+    )
+    .unwrap();
+    // BOB: long QTY @ $100, leverage 3, and NOT ONE UNIT of free wallet.
+    storage::save_position(
+        &mut ctx,
+        BOB,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -(FILL_VALUE as i64),
+            margin: (FILL_VALUE / 3) as i64,
+            leverage: 3,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+    let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
+    bob.perp_wallet_balance = 0;
+    storage::save_account(&mut ctx, BOB, bob).unwrap();
+
+    // A pure-reduce sell is free on the derived basis (`|N − Ask| == 0`), so an empty wallet is no
+    // obstacle to RESTING it — which is why this state is reachable without any hand-written order.
+    assert_eq!(oo_im(&mut ctx, BOB), 0);
+    let bob_sell = place(&mut ctx, BOB, 1, 60 * TICK, QTY, 0, 0);
+    assert_eq!(oo_im(&mut ctx, BOB), 0, "still free once it is resting");
+
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    place(&mut ctx, ALICE, 0, 60 * TICK, QTY, 0, 0); // taker buy fills BOB
+    assert_terminal(&mut ctx, bob_sell);
+
+    let maker_fee: i64 = 600_000 * 200 / 10_000; // 12_000
+    let bob_pos = pos(&mut ctx, BOB);
+    assert_eq!(
+        (bob_pos.amount, bob_pos.margin),
+        (0, 0),
+        "flat, silo emptied"
+    );
+    assert_eq!(
+        storage::load_account(&mut ctx, BOB)
+            .unwrap()
+            .perp_wallet_balance,
+        -maker_fee,
+        "the wallet went negative by EXACTLY the commission and no more — no margin shortfall \
+         reaches it any more (that is the M1 cap), only a fee with nothing left to absorb it"
+    );
+    assert_eq!(
+        storage::load_account(&mut ctx, BOB)
+            .unwrap()
+            .visible_perp_wallet_balance(),
+        0,
+        "clamped at the ABI boundary; `getAccountMargin`'s int64 surface reports the true value"
+    );
+    // Not a mint: the fee recipient really was paid, and the insolvent close's beyond-margin slice
+    // really did reach the fund. The negative is the funding gap between the two.
+    assert_eq!(wallet(&mut ctx, ADMIN), maker_fee as u64);
+    assert_eq!(
+        if_before - storage::load_insurance_fund(&mut ctx).unwrap(),
+        66_667,
+        "loss 400_000 − released margin 333_333"
+    );
+    // Money-out is refused while under water, and a deposit nets against it — the receivable
+    // machinery is unchanged, it just guards a commission-sized transient now.
+    assert!(!crate::margin_view::derived_can_afford(
+        available(&mut ctx, BOB),
+        1
+    ));
+    fund(&mut ctx, BOB, maker_fee as u64);
+    assert_eq!(available(&mut ctx, BOB), 0, "the credit nets the deficit");
 }
 
 /// The `RejectedInsolvent` channel is still LIVE — it just no longer answers "the wallet is short".
@@ -4020,11 +4232,28 @@ mod golden {
     /// equity at the new mark is 700_000 against a 150_000 maintenance requirement), and change (2)
     /// is not reachable in this scenario at all — no maker here is ever short of its opening margin,
     /// which is why it carries no snapshot movement and is covered by
-    /// `an_unfundable_maker_fill_still_fills_and_the_wallet_goes_negative` plus the conservation leg
-    /// `an_underfunded_maker_fill_conserves_total_system_value` instead. Prior value
+    /// `an_unfundable_maker_fill_still_fills_and_the_silo_is_short_not_the_wallet` plus the
+    /// conservation leg `an_underfunded_maker_fill_conserves_total_system_value` instead. Prior value
     /// 0x2c2ab72998e3f53edf5a6bcb3c7ad552f0543babf6830b8fc87ce707b213e8ac.
+    /// RE-PIN (M1 maker fills + `BLOCK_COMMITMENT_VERSION` 19→20): an underfunded maker fill now
+    /// funds its opening leg with `min(opening_value / L, cash at hand)` and lets `pos.margin` be
+    /// SHORT by the remainder, instead of funding the silo in full and driving
+    /// `perp_wallet_balance` negative (M1′ → M1; R11 measured M1, `derived-ooim-plan.md` §3a).
+    ///
+    /// **This scenario's write set is BYTE-IDENTICAL across that change, and the BusinessSnapshot is
+    /// UNCHANGED, field for field** — for the same reason the previous re-pin gave for its own
+    /// change (2): no maker here is ever short of its opening margin, so the capped and uncapped
+    /// branches compute the same `opening_margin` everywhere in it. VERIFIED, not assumed: the whole
+    /// suite including this pin passed at the OLD value with the new execution rule in place and the
+    /// version byte still 19. The value below therefore moves for exactly ONE reason — the version
+    /// byte is hashed into the commitment (`compute_block_commitment`) — and the underlying delta is
+    /// unmoved. The rule change itself stays covered by
+    /// `an_unfundable_maker_fill_still_fills_and_the_silo_is_short_not_the_wallet`,
+    /// `an_underfunded_maker_fill_conserves_total_system_value` and
+    /// `risk::tests::usdc_custody`. Prior value
+    /// 0x4a3ed7121a77b1e482a3db667cbe90b0331aa3acd5a350c9508f53e11d33c061.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x4a3ed7121a77b1e482a3db667cbe90b0331aa3acd5a350c9508f53e11d33c061");
+        b256!("0x88dc1d5927c36e45585ce99ed8453bf7665a57c89ceb29ee10165fa4ccf41319");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

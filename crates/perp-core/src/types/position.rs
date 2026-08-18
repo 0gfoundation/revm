@@ -35,9 +35,19 @@ pub struct PerpPosition {
     /// (`isolatedWallet = Ne/L − f·Ne`, see the `fee_reserved` note below). Funding charges, close
     /// legs and ADL drain it further with no IM floor.
     ///
+    /// A SECOND, larger mechanism was added with model M1: a maker fill whose wallet cannot cover the
+    /// opening margin funds this field with `min(requirement, cash at hand)` and leaves it short by
+    /// the remainder, because that is what R11 measured Binance doing — silo
+    /// `63.10632800 == W0 + realized` against an IM-implied `64.16451380`
+    /// (`derived-ooim-plan.md` §3a, `trading::settlement::OpeningMarginFunding`). Unlike a fee-sized
+    /// gap this one is unbounded, so treating "short of IM" as an invariant violation is not merely
+    /// pedantic — it would fire in production.
+    ///
     /// The only continuous requirement gate in the engine is
-    /// [`crate::math::is_above_maintenance_margin`]. Pinned by
-    /// `a_position_naturally_below_its_own_initial_margin_survives_normally`.
+    /// [`crate::math::is_above_maintenance_margin`], and it reads THIS field, so a short silo
+    /// correctly prices its own liquidation. Pinned by
+    /// `a_position_naturally_below_its_own_initial_margin_survives_normally` and
+    /// `trading::tests::a_short_silo_lowers_the_maintenance_buffer_it_is_measured_against`.
     #[serde(rename = "m")]
     pub margin: i64,
     // NOTE: the former open-order margin ESCROW is GONE — the six fields "mr"

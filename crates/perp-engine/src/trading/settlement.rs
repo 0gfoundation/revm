@@ -1196,6 +1196,11 @@ fn finalize_core(
         opening_qty,
         opening_value,
         is_buy,
+        // NOT capped, unlike the maker path: the taker's draw is gated at fill time — the caller
+        // (`finalize_compute`) refuses, or covers-then-refuses, unless `available` covers
+        // `total_required`, and `available = wallet − Σ ooIM ≤ wallet`, so the cash IS there. A cap
+        // here would silently short-fund a taker the gate already vouched for.
+        OpeningMarginFunding::Requirement,
     )?;
 
     // ── Trading fee: charged from the margin this fill just funded (Binance parity) ──
@@ -1347,6 +1352,9 @@ pub(super) fn settle_maker_fill_core(
         fill.opening_qty,
         fill.opening_value,
         fill.is_buy,
+        // M1 (see the block below `trial_wallet -= opening_margin`): the maker's opening leg is
+        // funded with the cash actually at hand, and `trial_pos.margin` carries any shortfall.
+        OpeningMarginFunding::CappedAtCashAtHand,
     )?;
 
     // ── Maker trading fee: charged from the margin this fill just funded (Binance parity) ──
@@ -1367,7 +1375,7 @@ pub(super) fn settle_maker_fill_core(
         .checked_sub(from_wallet_i64)
         .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
 
-    // ── Opening margin comes out of the WALLET at fill time, EVEN IF THE WALLET GOES NEGATIVE ──
+    // ── Opening margin comes out of the WALLET at fill time, capped at what is there (M1) ──
     // Under the escrow this was free here: `apply_position_fill` added `opening_margin` to
     // `pos.margin` and the money came from `old_reserved`, the capital placement had already
     // withheld. Nothing is withheld any more, so the wallet has to fund it NOW — and the money may
@@ -1378,8 +1386,7 @@ pub(super) fn settle_maker_fill_core(
     //
     // # The fill HAPPENS. Why this is not a reject
     //
-    // MEASURED, and it does not depend on the open modelling question below: Binance lets an
-    // open-order lien sit UNDER-COVERED and never sweeps it. At
+    // MEASURED: Binance lets an open-order lien sit UNDER-COVERED and never sweeps it. At
     // `crossWalletBalance − totalOpenOrderInitialMargin = −0.00085981` an already-resting order
     // stayed `status = 'NEW'` for the whole observation window while, IN THE SAME INSTANT, a NEW
     // order was refused `-2019`. The doc's verdict: 「预留是一笔留置权,交易所允许它被欠覆盖,也不做
@@ -1389,56 +1396,57 @@ pub(super) fn settle_maker_fill_core(
     //
     // This code used to return `RejectedInsolvent` here, which cancelled the maker order and let
     // the taker walk on. That is model **M2 ("don't fill")** in
-    // `misc/binance-flip-and-admission.md` §3.3 — and BOTH live candidates for what Binance does
-    // (M1 and M1′) FILL. So cancelling was wrong under either.
+    // `misc/binance-flip-and-admission.md` §3.3, and it is wrong: the fill goes through.
     //
-    // # Where the deficit lands — 🔶 CONJECTURE, not measurement
+    // # Where the deficit lands — MEASURED (R11): the SILO, not the wallet
     //
-    // §3.3 marks its working model **M1′** (silo funded in full, `availableBalance`'s TRUE value
-    // goes negative, the reported value clamped at 0) an explicit conjecture pending a v4
-    // experiment, with the author ~50/50 between it and **M1** (silo funded SHORT, available stays
-    // 0). Nine rounds have produced exactly one flipping fill and it was fully funded (M0), so the
-    // underfunded case has never been observed. Do not read the code below as measured fact.
+    // This used to implement **M1′** (silo funded in full, wallet driven NEGATIVE by the
+    // shortfall), from a conjecture §3.3 marked ~50/50 pending an experiment. R11 ran it and
+    // measured **M1** (`derived-ooim-plan.md` §3a): the silo receives all the cash there is and not
+    // a satoshi more — `isolatedWallet = 63.10632800 = W0 63.89332800 + realized −0.78700000`,
+    // digit-for-digit, against an IM-implied `64.16451380`, i.e. deliberately `1.05818580` SHORT.
+    // The wallet went negative only by the fill COMMISSION (`−0.25717240`) and the insurance fund
+    // cleared that three seconds later. (`1.05818580 + 0.25717240 == 1.31535820`, the whole gap,
+    // exactly bisected.)
     //
-    // We implement M1′, which for us is the code that was already here: `perp_wallet_balance` is
-    // `i64` and `visible_perp_wallet_balance()` clamps at the ABI boundary — internally signed,
-    // externally floored — the exact shape of Binance's true-negative/reported-zero
-    // `availableBalance`. If v4 lands on M1 instead, the change is a `min(available)` clamp on
-    // `opening_margin` in `apply_position_fill`; small, but semantically opposite, so it must not
-    // be pre-empted.
+    // So the cap lives in `apply_position_fill` (`OpeningMarginFunding::CappedAtCashAtHand`) and
+    // the debit below can no longer take `trial_wallet` under zero for a margin shortfall. What it
+    // buys is STRUCTURAL, not just parity:
     //
-    // The debit is NOT optional. Dropping it would fund `pos.margin` from nowhere — a mint, which
-    // the conservation fuzz catches immediately.
+    // * Under M1 the deficit IS PART OF THE POSITION, so it is resolved when the position closes or
+    //   is liquidated, through the EXISTING liquidation-deficit → insurance-fund path: a thinner
+    //   silo absorbs less of the close's loss, so more of it arrives as `bad_debt` and
+    //   `absorb_bad_debt_into_insurance_fund` routes it. Nothing is stranded.
+    //   Under M1′ the deficit was DECOUPLED from the position: liquidate the position and an
+    //   isolated negative wallet is left behind with no path out of it.
+    //   Pinned end-to-end by `risk::tests::usdc_custody`.
+    // * The liquidation price is HONEST. `is_above_maintenance_margin` and the liquidation sweep
+    //   read `pos.margin`, so a silo that really is short prices its own LP against real risk.
+    //   Under M1′ the silo looked full and LP was optimistic. Pinned by
+    //   `a_short_silo_lowers_the_maintenance_buffer_it_is_measured_against`.
     //
-    // # Where the deficit ENDS UP — settled: it is a RECEIVABLE, and there is nothing to fix
-    //
-    // A previous audit read the resulting negative wallet as "protocol-level bad debt that, unlike
-    // close/liquidation losses, is not routed to the Insurance Fund". It is not. `risk::tests::
-    // usdc_custody` produces the worst end state through real calls — this fill drives the wallet
-    // negative, and the position it just funded is then liquidated INSOLVENT so the fund covers
-    // what the silo could not — and asserts the custodied on-trie USDC against the sum of every
-    // internal claim. It closes EXACTLY, with the negative wallet in it as a negative claim; it is
-    // CLAMPING the wallet at 0 that breaks it, by precisely the deficit. So the protocol has not
-    // lost anything here: it holds a claim on the user, enforced because `available =
-    // perp_wallet_balance − Σ ooIM` refuses every money-out gate and every risk-increasing
-    // admission while it is under water, and netted automatically against their next deposit
-    // because the deficit is ONE signed field.
-    //
-    // Nor is it double-counted against the fund. The two are DISJOINT slices of one loss: this
-    // debit funds `pos.margin`, and the fund only ever absorbs what a realized loss exceeded that
-    // margin by (`apply_position_fill`'s insolvent branch and
-    // `settle_liquidation_residual_at_mark_price` both leave the wallet untouched — isolated
-    // margin). The test pins the split to the unit: own cash + receivable + IF == the whole loss.
-    //
-    // ⛔ Do NOT "resolve" the deficit by crediting it out of the Insurance Fund. Custody would
-    // still balance (fund down, wallet up), so no conservation gate would object — but it forgives
-    // a collectable debt, converts a receivable into a socialised write-off, and produces exactly
-    // the double count the audit feared (the fund would pay the beyond-margin shortfall AND the
-    // receivable). Two assertions in that test fail deliberately if anyone wires it up.
+    // The debit is NOT optional, and the cap does not make it so: the wallet must lose exactly what
+    // the position gains. Dropping it would fund `pos.margin` from nowhere — a mint, which the
+    // conservation fuzz catches immediately.
     //
     // Applied to `trial_wallet`, i.e. AFTER this fill's own close proceeds have landed: a flip
     // legitimately funds its opening leg out of the closing leg's released margin and profit, so
-    // most flips never go negative at all.
+    // most flips are fully funded and nothing is short at all.
+    //
+    // # What can still take the wallet negative here: the COMMISSION, and only it
+    //
+    // `fee_from_wallet` above is `maker_fee − min(maker_fee, opening_margin)`, so when the capped
+    // opening margin cannot absorb the commission the wallet pays the rest and may go under — by at
+    // most the maker fee. This is deliberate and is §3a's recommendation for the commission gap
+    // ("让 `pos.margin` 再短那一截", i.e. let the silo carry it, and do NOT open a second
+    // insurance-fund path for it); the residue that reaches the wallet is the case with no silo to
+    // carry it at all — chiefly a PURE CLOSE (`opening_qty == 0` ⇒ `opening_margin == 0`) whose own
+    // proceeds were eaten by an insolvent close. Binance's wallet goes negative in exactly this
+    // one place too, and only this one. That is why `perp_wallet_balance` stays `i64` with a
+    // clamped ABI view (`types::account`), and why the negative-wallet gates
+    // (`derived_available_balance` refusing money-out, a deposit netting against it) are still
+    // live: they are now belt and braces for a commission-sized transient rather than the primary
+    // home of a structural deficit.
     let opening_margin_i64 = checked_u64_to_i64(
         fill_outcome.opening_margin,
         "settlement: maker opening margin",
@@ -1778,8 +1786,10 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
 /// # Return value
 ///
 /// Returns the opening margin, bad debt, and gross realized PnL:
-/// - `opening_margin` — margin required to open the new position leg; the caller
-///   deducts it from the wallet (maker: from reserved MR; taker: from the wallet).
+/// - `opening_margin` — margin the new position leg was ACTUALLY funded with; the caller
+///   deducts exactly this from the wallet. Equal to the requirement `opening_value / L` under
+///   [`OpeningMarginFunding::Requirement`], and to `min(requirement, cash at hand)` under
+///   [`OpeningMarginFunding::CappedAtCashAtHand`].
 /// - `bad_debt` — isolated-margin shortfall: when a close realizes a loss that
 ///   exceeds the closed slice's collateral, the deficit is drawn from the
 ///   position's REMAINING margin first; anything still uncovered is `bad_debt`,
@@ -1792,6 +1802,28 @@ pub(super) struct PositionFillOutcome {
     pub(super) realized_pnl: i64,
 }
 
+/// How much of the opening leg's initial-margin REQUIREMENT this fill is allowed to fund —
+/// the M1/M1′ decision of `derived-ooim-plan.md` §3a.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum OpeningMarginFunding {
+    /// Fund the requirement IN FULL. For callers that have already gated the draw against
+    /// `available` and therefore KNOW the cash is there — the taker path, whose
+    /// `finalize_compute` refuses (or covers, then refuses) unless
+    /// `derived_can_afford(available, total_required)`. Inert for a pure close
+    /// (`opening_qty == 0`), so the ADL legs pass it too.
+    Requirement,
+    /// Fund `min(requirement, cash at hand)` and let `pos.margin` be SHORT by the remainder —
+    /// model **M1**, MEASURED on Binance by R11 (`derived-ooim-plan.md` §3a: silo
+    /// `63.10632800 == W0 + realized`, digit-for-digit, against an IM-implied `64.16451380`, i.e.
+    /// deliberately `1.05818580` short). Used by the maker fill, which is NOT gated at fill time:
+    /// nothing is escrowed at placement and admission was checked once, when the order rested.
+    CappedAtCashAtHand,
+}
+
+// 8 args: the fill's two legs are four of them, and `funding` (the M1 cap) has to be a parameter
+// because the requirement is computed and applied to `pos.margin` in here — a caller cannot cap it
+// after the fact without re-deriving it. Same allow as `settle_maker_fill_core` / `adl_fill`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_position_fill(
     pos: &mut crate::types::PerpPosition,
     wallet: &mut i64,
@@ -1800,6 +1832,7 @@ pub(super) fn apply_position_fill(
     opening_qty: u64,
     opening_value: u64,
     is_buy: bool,
+    funding: OpeningMarginFunding,
 ) -> Result<PositionFillOutcome, PerpError> {
     let mut bad_debt = 0u64;
     let mut realized_pnl = 0i64;
@@ -1875,7 +1908,32 @@ pub(super) fn apply_position_fill(
     }
 
     let opening_margin = if opening_qty > 0 {
-        let initial_margin = opening_value / pos.leverage.max(1);
+        let requirement = opening_value / pos.leverage.max(1);
+        // ── M1: the silo gets all the cash there is, and not a satoshi more ──
+        //
+        // "Cash at hand" is `*wallet` READ HERE, i.e. after the closing leg above has already
+        // credited `margin_release + realized_pnl` into it and before any caller-side debit. That
+        // is the right cap and not merely the convenient one:
+        //
+        // * the close's released margin and its realized PnL are THIS fill's own proceeds and
+        //   legitimately fund its opening leg — a flip is one trade, and R11's measured silo is
+        //   literally `W0 + realized` (the old silo, released, plus the loss taken on it);
+        // * it is pre-fee, which is what makes the fee land where §3a wants it: with
+        //   `fee_from_margin = min(fee, opening_margin)` the commission comes out of this capped
+        //   opening margin, so the silo is short by the commission too, and NO insurance-fund path
+        //   is opened for it. (The wallet only pays a commission the opening margin could not
+        //   absorb, which is the one narrow way it can still go negative — bounded by the fee.
+        //   Binance's wallet does exactly that, transiently, before `INSURANCE_CLEAR`.)
+        // * it is NOT `available = wallet − Σ ooIM`: ooIM is a LIEN, never a debit, and the lien
+        //   being consumed here is this very order's. Netting other resting orders' liens out of
+        //   the cap would starve the silo of money that has not left.
+        //
+        // `.max(0)`: an already-negative wallet has no cash to give, so such a fill opens a
+        // position with ZERO margin rather than deepening the deficit.
+        let initial_margin = match funding {
+            OpeningMarginFunding::Requirement => requirement,
+            OpeningMarginFunding::CappedAtCashAtHand => requirement.min((*wallet).max(0) as u64),
+        };
         let initial_margin_i64 = checked_u64_to_i64(initial_margin, "settlement: initial margin")?;
         let opening_qty_i64 = checked_u64_to_i64(opening_qty, "settlement: opening quantity")?;
         let opening_value_i64 = checked_u64_to_i64(opening_value, "settlement: opening value")?;
@@ -2003,7 +2061,7 @@ pub(super) fn absorb_bad_debt_into_insurance_fund<H: PerpHost>(
 
 #[cfg(test)]
 mod isolated_margin_tests {
-    use super::apply_position_fill;
+    use super::{apply_position_fill, OpeningMarginFunding};
     use crate::types::PerpPosition;
 
     /// Long `amount` units, entry value `-v_quote_balance`, isolated `margin`, leverage 1.
@@ -2023,7 +2081,17 @@ mod isolated_margin_tests {
         // Gross PnL is -1000 + 1200 = +200; wallet credit also returns margin 100.
         let mut p = long(10, -1000, 100);
         let mut wallet = 0i64;
-        let outcome = apply_position_fill(&mut p, &mut wallet, 10, 1200, 0, 0, false).unwrap();
+        let outcome = apply_position_fill(
+            &mut p,
+            &mut wallet,
+            10,
+            1200,
+            0,
+            0,
+            false,
+            OpeningMarginFunding::Requirement,
+        )
+        .unwrap();
         assert_eq!(outcome.opening_margin, 0);
         assert_eq!(outcome.bad_debt, 0);
         assert_eq!(outcome.realized_pnl, 200);
@@ -2037,7 +2105,17 @@ mod isolated_margin_tests {
         // Gross PnL is -1000 + 600 = -400. Margin covers 100; remaining 300 is bad debt.
         let mut p = long(10, -1000, 100);
         let mut wallet = 500i64; // free balance that MUST NOT be touched
-        let outcome = apply_position_fill(&mut p, &mut wallet, 10, 600, 0, 0, false).unwrap();
+        let outcome = apply_position_fill(
+            &mut p,
+            &mut wallet,
+            10,
+            600,
+            0,
+            0,
+            false,
+            OpeningMarginFunding::Requirement,
+        )
+        .unwrap();
         assert_eq!(outcome.opening_margin, 0);
         assert_eq!(outcome.bad_debt, 300);
         assert_eq!(outcome.realized_pnl, -400);
@@ -2056,7 +2134,17 @@ mod isolated_margin_tests {
         // remaining margin after release = 60; draw all 60; bad_debt = 60.
         let mut p = long(10, -1000, 100);
         let mut wallet = 500i64;
-        let outcome = apply_position_fill(&mut p, &mut wallet, 4, 240, 0, 0, false).unwrap();
+        let outcome = apply_position_fill(
+            &mut p,
+            &mut wallet,
+            4,
+            240,
+            0,
+            0,
+            false,
+            OpeningMarginFunding::Requirement,
+        )
+        .unwrap();
         assert_eq!(outcome.opening_margin, 0);
         assert_eq!(outcome.bad_debt, 60);
         assert_eq!(outcome.realized_pnl, -160);
@@ -2076,7 +2164,17 @@ mod isolated_margin_tests {
         // remaining margin after release = 80; draw 60; bad_debt 0; 20 margin left.
         let mut p = long(10, -1000, 100);
         let mut wallet = 500i64;
-        let outcome = apply_position_fill(&mut p, &mut wallet, 2, 120, 0, 0, false).unwrap();
+        let outcome = apply_position_fill(
+            &mut p,
+            &mut wallet,
+            2,
+            120,
+            0,
+            0,
+            false,
+            OpeningMarginFunding::Requirement,
+        )
+        .unwrap();
         assert_eq!(outcome.opening_margin, 0);
         assert_eq!(outcome.bad_debt, 0);
         assert_eq!(outcome.realized_pnl, -80);
@@ -2093,7 +2191,17 @@ mod isolated_margin_tests {
         let mut p = long(10, -1000, 100);
         let mut wallet = 0i64;
 
-        let outcome = apply_position_fill(&mut p, &mut wallet, 10, 1000, 0, 0, false).unwrap();
+        let outcome = apply_position_fill(
+            &mut p,
+            &mut wallet,
+            10,
+            1000,
+            0,
+            0,
+            false,
+            OpeningMarginFunding::Requirement,
+        )
+        .unwrap();
 
         assert_eq!(outcome.realized_pnl, 0);
         assert_eq!(outcome.bad_debt, 0);

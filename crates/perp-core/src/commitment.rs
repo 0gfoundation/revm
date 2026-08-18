@@ -57,7 +57,21 @@ use primitives::{B256, U256};
 // Both change what nodes write, so a node on 18 and a node on 19 would diverge on state — which is
 // exactly what this version guards. CHAIN change: golden re-pin (below) + a coordinated wipe on
 // deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 19;
+// M1 maker fills (the deficit lands in the SILO, not the wallet): bumped 19→20 — ONE execution-rule
+// change, no layout change. An underfunded maker fill now funds its opening leg with
+// `min(opening_value / L, cash at hand)` and lets `pos.margin` be SHORT by the rest
+// (`settlement::OpeningMarginFunding::CappedAtCashAtHand`), where 19 funded the silo in full and
+// drove `perp_wallet_balance` NEGATIVE by the shortfall (model M1′, which 19 adopted from a
+// conjecture the docs marked ~50/50). R11 measured Binance doing the former
+// (`derived-ooim-plan.md` §3a: `isolatedWallet == W0 + realized` digit-for-digit against a higher
+// IM-implied figure). The write set of such a match differs — a thinner position blob and a
+// non-negative account blob where 19 wrote a full silo and a negative wallet — and the divergence
+// PROPAGATES: the thinner silo absorbs less of a later close's loss, so a different amount reaches
+// the insurance fund. A node on 19 and a node on 20 would disagree on state, which is exactly what
+// this version guards. CHAIN change: golden re-pin (below) + a coordinated wipe on deploy. (The
+// golden SCENARIO never underfunds a maker, so its write set is byte-identical at 19 and 20 and its
+// BusinessSnapshot is unchanged; the golden value moves only because this byte is hashed into it.)
+pub const BLOCK_COMMITMENT_VERSION: u8 = 20;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

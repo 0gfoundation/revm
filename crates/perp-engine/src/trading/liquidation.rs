@@ -359,19 +359,38 @@ fn adl_fill(
     bd: u32,
     pd: u32,
 ) -> Result<Option<AdlFillOutcome>, PerpError> {
-    use super::settlement::apply_position_fill;
+    use super::settlement::{apply_position_fill, OpeningMarginFunding};
     let floor = take.saturating_sub(4); // try take, take-1, .., take-4 (dust is <=1-2)
     let mut t = take;
     while t > 0 && t > floor {
         let v = calc_value(p_b, t, bd, pd)?;
         // Trial on clones; commit only if BOTH sides are bad-debt free.
+        // Both legs are PURE CLOSES (`opening_qty == 0`), so the funding mode is inert — ADL never
+        // opens, and therefore never short-funds, a silo.
         let mut lp = loser_pos.clone();
         let mut lw = *loser_wallet;
-        let loser_outcome = apply_position_fill(&mut lp, &mut lw, t, v, 0, 0, loser_close_is_buy)?;
+        let loser_outcome = apply_position_fill(
+            &mut lp,
+            &mut lw,
+            t,
+            v,
+            0,
+            0,
+            loser_close_is_buy,
+            OpeningMarginFunding::Requirement,
+        )?;
         let mut wp = winner_pos.clone();
         let mut ww = *winner_wallet;
-        let winner_outcome =
-            apply_position_fill(&mut wp, &mut ww, t, v, 0, 0, winner_close_is_buy)?;
+        let winner_outcome = apply_position_fill(
+            &mut wp,
+            &mut ww,
+            t,
+            v,
+            0,
+            0,
+            winner_close_is_buy,
+            OpeningMarginFunding::Requirement,
+        )?;
         if loser_outcome.bad_debt == 0 && winner_outcome.bad_debt == 0 {
             *loser_pos = lp;
             *loser_wallet = lw;

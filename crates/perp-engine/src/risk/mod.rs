@@ -867,9 +867,10 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // Isolated margin: the position's loss (book leg + residual) was already contained
     // to its margin and any bad debt routed directly to the Insurance Fund by the close
     // paths (apply_position_fill / settle_liquidation_residual), so LIQUIDATION never drives
-    // the wallet negative. It may nonetheless ARRIVE here negative — a maker fill whose wallet
-    // could not cover the opening margin fills anyway and leaves a deficit
-    // (`settle_maker_fill_core`) — hence the `.max(0)` below: the clearance fee is capped at the
+    // the wallet negative. It may nonetheless ARRIVE here negative — a maker fill charges the part
+    // of its commission the (M1-capped) opening margin could not absorb to the wallet, which on a
+    // pure close is the whole fee (`settle_maker_fill_core`; a margin shortfall no longer reaches
+    // the wallet at all) — hence the `.max(0)` below: the clearance fee is capped at the
     // POSITIVE balance, so an already-negative wallet is charged nothing rather than being pushed
     // further under (and `as u64` on a negative i64 would otherwise wrap to an astronomical cap).
     // Charge the clearance fee from the liquidated user's remaining wallet (capped at the balance)
