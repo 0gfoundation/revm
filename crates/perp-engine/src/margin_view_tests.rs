@@ -395,6 +395,167 @@ fn joint_max_uses_the_signed_notional_so_a_short_charges_on_the_ask_side() {
     assert_eq!(i.openOrderInitialMargin, 300 * USD);
 }
 
+/// ⚠️ **CHARACTERISATION OF AN EXTRAPOLATION — not a Binance measurement.**
+///
+/// The full pipeline (`positionAmt` → `N` → the joint `max()` → `ooIM`) on a SHORT position, for
+/// each shape already pinned on the long side. All ten mainnet runs behind this formula used a
+/// LONG, so *none* of the numbers below has ever been observed on Binance;
+/// `misc/binance-margin-verified-model.md` §6 (「空头侧符号」) lists the short-side form of the joint
+/// `max()` as extrapolated and docs commit `8d179c0` UPGRADED it to a **BLOCKING** open item (a
+/// ~0.064 USDT three-arm probe to settle it is designed in `misc/binance-flip-and-admission.md`
+/// §3.3). A failure here means "our short side moved", NOT "we diverged from Binance".
+///
+/// The four shapes, on a SHORT 2 at mark $100 (`N = −$200`, `L = 1` ⇒ `PIM = $200`) with
+/// `lastTraded = $100` ⇒ `T = ROUND_UP($100 × 1.0015) = $100.15`:
+///
+/// ```text
+/// resting BUYS         Bid        bid branch          IM      ooIM   shape
+/// 2 @ $100           $200    |−200 + 200| =   0     $200         0   buys would CLOSE it
+/// 4 @ $100           $400    |−200 + 400| = 200     $200         0   last free unit (2|N|)
+/// 4 @ $100 + 1 @ $.01  +$0.01 |…| = 200.01       $200.01    $0.01   charging begins
+/// 6 @ $100           $600    |−200 + 600| = 400     $400      $200   buys FLIP it: residual only
+/// ```
+#[test]
+fn the_short_side_of_the_joint_max_is_an_extrapolation_pinned_shape_by_shape() {
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    // `T` must be strictly above the $100 order price so the buy side's "no markup" is a real
+    // claim and not a degenerate coincidence: at `lastTraded == 0`, `T` collapses to the mark.
+    storage::save_last_traded_price(&mut ctx, MARKET_A, P100).unwrap();
+    // SHORT 2 opened at $100 with $200 of margin at leverage 1.
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        -2,
+        200 * USD as i64,
+        200 * USD as i64,
+        1,
+    );
+
+    // ── (a) buys that would CLOSE the short: free, and priced at their OWN limit ──
+    set_orders(&mut ctx, ALICE, MARKET_A, &[entry(1, P100, 2)], &[]);
+    let close = margin_info(&mut ctx, ALICE, MARKET_A);
+    assert_eq!(close.positionAmt, -2);
+    assert_eq!(close.notional, 200 * USD, "notional itself is unsigned");
+    assert_eq!(close.positionInitialMargin, 200 * USD);
+    assert_eq!(
+        close.bidNotional,
+        200 * USD,
+        "the BUY side carries no markup even resting BELOW T — §3.8"
+    );
+    assert_eq!(close.initialMargin, 200 * USD, "|−200 + 200| = 0 < |N|");
+    assert_eq!(close.openOrderInitialMargin, 0);
+
+    // ── (b) the far endpoint of the free band: Bid == 2|N| exactly (a TIE, still free) ──
+    set_orders(&mut ctx, ALICE, MARKET_A, &[entry(1, P100, 4)], &[]);
+    let band_end = margin_info(&mut ctx, ALICE, MARKET_A);
+    assert_eq!(band_end.bidNotional, 400 * USD);
+    assert_eq!(
+        band_end.initialMargin,
+        200 * USD,
+        "|−200 + 400| == |N|: the branches tie and ooIM is still 0"
+    );
+    assert_eq!(band_end.openOrderInitialMargin, 0);
+
+    // ── (c) one tick past the band: charging begins, at the smallest representable step ──
+    set_orders(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        &[entry(1, P100, 4), entry(2, 1, 1)], // + 1 unit @ $0.01, price-DESC
+        &[],
+    );
+    let past_band = margin_info(&mut ctx, ALICE, MARKET_A);
+    assert_eq!(past_band.bidNotional, 400 * USD + 10_000);
+    assert_eq!(past_band.initialMargin, 200 * USD + 10_000);
+    assert_eq!(
+        past_band.openOrderInitialMargin, 10_000,
+        "$0.01 past 2|N| costs exactly $0.01 — the band has a hard edge"
+    );
+
+    // ── (d) buys big enough to FLIP the short: only the residual LONG exposure is charged ──
+    set_orders(&mut ctx, ALICE, MARKET_A, &[entry(1, P100, 6)], &[]);
+    let flip = margin_info(&mut ctx, ALICE, MARKET_A);
+    assert_eq!(flip.bidNotional, 600 * USD);
+    assert_eq!(flip.initialMargin, 400 * USD, "|−200 + 600| = 400");
+    assert_eq!(
+        flip.openOrderInitialMargin,
+        200 * USD,
+        "the residual after the flip, NOT the whole $600 buy leg (which would be $600 of ooIM)"
+    );
+    assert_ne!(flip.openOrderInitialMargin, 600 * USD);
+}
+
+/// The mirror BREAKS at the engine level, by exactly the Assuming-Price uplift — and that break is
+/// the one part of the short-side story that IS measured.
+///
+/// [`crate::math::open_order_margin`] itself is exactly sign-symmetric: `ooIM(N, Bid, Ask)` equals
+/// `ooIM(−N, Ask, Bid)`. But the uplift is keyed to the ORDER'S side, not the position's — a buy's
+/// Assuming Price is its own limit, a sell's is `max(T, limit)`
+/// (`misc/binance-flip-and-admission.md` §3.8: 「买单侧完全没有加成」). So mirroring a whole
+/// `(position, book)` does NOT preserve `ooIM`, and hedging a short with buys is strictly cheaper
+/// than hedging a long with sells.
+///
+/// Pinned on the flip shape at `lastTraded = $100` ⇒ `T = $100.15`:
+///
+/// ```text
+/// SHORT 2 + 6 buys  @ $100 → Bid = 6 × $100    = $600.00 → ooIM = $200.00
+/// LONG  2 + 6 sells @ $100 → Ask = 6 × $100.15 = $600.90 → ooIM = $200.90
+///                                                 difference = 6 × $0.15 = $0.90, exactly
+/// ```
+///
+/// This asymmetry is deliberate and measured. It must NOT be "made consistent" by adding a markup
+/// to the buy side (§3.8 measures there is none) or by dropping it from the sell side (R9/R10
+/// measure that there is).
+#[test]
+fn mirroring_a_short_onto_a_long_costs_exactly_the_sell_side_uplift_more() {
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    storage::save_last_traded_price(&mut ctx, MARKET_A, P100).unwrap();
+
+    // SHORT 2 with 6 buys @ $100 — the flip shape from the test above.
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        -2,
+        200 * USD as i64,
+        200 * USD as i64,
+        1,
+    );
+    set_orders(&mut ctx, ALICE, MARKET_A, &[entry(1, P100, 6)], &[]);
+    let short = margin_info(&mut ctx, ALICE, MARKET_A);
+
+    // The mirror image: LONG 2 with 6 sells @ $100.
+    set_position(
+        &mut ctx,
+        BOB,
+        MARKET_A,
+        2,
+        -(200 * USD as i64),
+        200 * USD as i64,
+        1,
+    );
+    set_orders(&mut ctx, BOB, MARKET_A, &[], &[entry(1, P100, 6)]);
+    let long = margin_info(&mut ctx, BOB, MARKET_A);
+
+    // Same |N|, same PIM, same order notional at the LIMIT price.
+    assert_eq!(short.notional, long.notional);
+    assert_eq!(short.positionInitialMargin, long.positionInitialMargin);
+    assert_eq!(short.bidNotional, 600 * USD, "buys: no markup");
+    assert_eq!(long.askNotional, 600 * USD + 900_000, "sells: 6 × $0.15");
+
+    // ...and the ooIM differs by exactly the uplift, nothing else.
+    assert_eq!(short.openOrderInitialMargin, 200 * USD);
+    assert_eq!(long.openOrderInitialMargin, 200 * USD + 900_000);
+    assert_eq!(
+        long.openOrderInitialMargin - short.openOrderInitialMargin,
+        900_000,
+        "the mirror breaks by exactly the sell-side Assuming-Price uplift and by nothing else"
+    );
+}
+
 // ── 4. ROUND_UP is really round-up ─────────────────────────────────────────
 
 #[test]

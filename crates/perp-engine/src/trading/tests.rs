@@ -1178,6 +1178,126 @@ fn taker_open_fill_charges_fee_from_margin_not_on_top_of_the_wallet() {
     );
 }
 
+/// **A silo BELOW its own IM is the NORMAL case, and nothing in the engine may treat it as an
+/// anomaly** — `misc/binance-flip-and-admission.md` §3.9, citing the formula set §1.2:
+/// 「**Binance 只连续检查 MM,不检查 IM**」, with 「逐仓仓位**天生**就低于自己的 `IM`」 as its prior.
+///
+/// The measurement behind that: run1's market open computed `PIM = 6.34041` while the silo actually
+/// received `6.30870795` — short by exactly one opening commission — and the position 「照常存活」.
+///
+/// Ours does the same thing for the same reason (`7cc26360`: the opening fill funds the trading fee
+/// out of the margin it creates), so this test produces the state through a REAL fill rather than by
+/// writing it, and then asserts the position is in every respect healthy:
+///
+/// * `positionMargin < positionInitialMargin`, by exactly the fee — the §3.9 shape;
+/// * it is NOT liquidatable (the maintenance check is the only continuous one);
+/// * it still accepts an `addPositionMargin`/`removePositionMargin` round trip (B2 — the removed IM
+///   gate used to refuse this exact no-op);
+/// * it still accepts a new order.
+///
+/// If a continuous IM check is ever reintroduced anywhere, at least one of these fails.
+#[test]
+fn a_position_naturally_below_its_own_initial_margin_survives_normally() {
+    use crate::interface::IPerpDex::{
+        addPositionMarginCall, liquidateCall, removePositionMarginCall,
+    };
+
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    // `setup()` leaves the mark at 0, which would make every derived quantity read as 0 (`N = 0`)
+    // and would also disable the maintenance guard — i.e. it would make this test vacuous.
+    storage::save_mark_price(&mut ctx, MARKET_ID, PRICE).unwrap();
+    storage::save_user_fee_rates(
+        &mut ctx,
+        ALICE,
+        UserFeeRates {
+            maker_fee_bps: 0,
+            taker_fee_bps: 100,
+        },
+    )
+    .unwrap();
+    let fee = FILL_VALUE * 100 / 10_000;
+
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // real taker open, leverage 1
+
+    // ── the §3.9 shape, produced not written ──
+    let i = crate::margin_view::compute_margin_info(&mut ctx, ALICE, MARKET_ID).unwrap();
+    assert_eq!(
+        i.position_initial_margin, INIT_MARGIN,
+        "PIM = ROUND_UP(N/1)"
+    );
+    assert_eq!(i.position_margin, (INIT_MARGIN - fee) as i64);
+    assert!(
+        i.position_margin < i.position_initial_margin as i64,
+        "the silo is BELOW its own IM: {} < {}",
+        i.position_margin,
+        i.position_initial_margin
+    );
+    assert_eq!(
+        i.position_initial_margin as i64 - i.position_margin,
+        fee as i64,
+        "short by exactly one opening commission — run1's 6.34041 vs 6.30870795"
+    );
+    // Equity is below the joint requirement too, which is the same statement at account level.
+    assert!(i.isolated_margin < i.initial_margin as i64);
+
+    // ── and it survives: MM is the only continuous check ──
+    assert!(
+        i.maint_margin < i.isolated_margin as u64,
+        "comfortably above maintenance: MM {} vs equity {}",
+        i.maint_margin,
+        i.isolated_margin
+    );
+    let liq = crate::risk::run_liquidate(
+        &liquidateCall {
+            user: ALICE,
+            marketId: MARKET_ID,
+        }
+        .abi_encode(),
+        BOB,
+        &mut ctx,
+    );
+    assert!(
+        liq.is_err(),
+        "a silo below its own IM must NOT be liquidatable — MM is the only continuous gate"
+    );
+
+    // ── B2: the add/remove no-op round trip the removed IM gate refused ──
+    let margin_before = pos(&mut ctx, ALICE).margin;
+    let wallet_before = wallet(&mut ctx, ALICE);
+    crate::risk::run_add_position_margin(
+        &addPositionMarginCall {
+            marketId: MARKET_ID,
+            amount: 100_000,
+        }
+        .abi_encode(),
+        ALICE,
+        &mut ctx,
+    )
+    .unwrap();
+    crate::risk::run_remove_position_margin(
+        &removePositionMarginCall {
+            marketId: MARKET_ID,
+            amount: 100_000,
+        }
+        .abi_encode(),
+        ALICE,
+        &mut ctx,
+    )
+    .unwrap();
+    assert_eq!(pos(&mut ctx, ALICE).margin, margin_before);
+    assert_eq!(wallet(&mut ctx, ALICE), wallet_before);
+
+    // ── and it can still trade ──
+    place(&mut ctx, ALICE, 0, PRICE / 2, QTY, 0, 0);
+    assert_eq!(
+        pos(&mut ctx, ALICE).total_buy_qty,
+        QTY,
+        "a new order is admitted on the ordinary derived basis, not refused for an IM shortfall"
+    );
+}
+
 /// PURE OPEN, maker. The highest-risk arm: this path had no wallet charge at all before (the fee
 /// was released from the `fee_reserved` escrow), so the funding had to be ADDED, not deleted.
 #[test]
@@ -9779,6 +9899,92 @@ mod assuming_price {
         assert_eq!(i.initialMargin, 33_000);
         assert_eq!(oo_im(&mut ctx, ALICE), 16_000);
         assert_eq!(available(&mut ctx, ALICE), 0);
+    }
+
+    /// **`bidNotional == Σ qty_i × P_i` EXACTLY** — the regression test
+    /// `misc/binance-flip-and-admission.md` §3.8 names for its own correction
+    /// (「`bidNotional` 应精确等于 `q_B × P_b`(与卖单侧对照,是 §3.7 那条更正的回归测试)」).
+    ///
+    /// The single-order case above cannot distinguish "no markup" from "a markup that happens to
+    /// miss", so this walks MORE THAN ONE order and straddles `T` in both directions. The easy way
+    /// to break the asymmetry is to apply the sell side's `max(T, price)` to the buy fold as well;
+    /// that would silently lift the two below-`T` orders and leave the two others alone, which is
+    /// exactly what the per-order identity below catches.
+    ///
+    /// `T = max(ROUND_UP(100_000 × 1.0015), 85_000) = 100_150`, and
+    /// `calc_value(price, qty) == price × qty / 10` on the probe market (`tick_size` is 10, so
+    /// every price below is a tick multiple):
+    ///
+    /// ```text
+    ///  price     qty   vs T       own notional    at max(T, price)   at min(T, price)
+    ///  80_000      6   BELOW            48_000          60_090             48_000
+    /// 100_140      3   BELOW (1 tick)   30_042          30_045             30_042
+    /// 100_150      4   == T             40_060          40_060             40_060
+    /// 110_000      5   ABOVE            55_000          55_000             50_075
+    ///                                 ────────        ────────           ────────
+    ///                        Bid    =  173_102         185_195            168_177
+    ///                                    ↑ the only right answer
+    /// ```
+    ///
+    /// `N = 51_000`, `L = 3` ⇒ bid branch `|51_000 + 173_102| = 224_102`,
+    /// `IM = ROUND_UP(224_102/3) = 74_701`, `ooIM = 74_701 − 17_000 = 57_701`.
+    #[test]
+    fn the_bid_notional_is_exactly_quantity_times_each_orders_own_price() {
+        let mut ctx = make_ctx();
+        alice_long_at_85k(&mut ctx);
+        fund(&mut ctx, ALICE, 1_000_000);
+
+        // Placed out of price order on purpose; the buy list is maintained price-DESCENDING.
+        let orders = [(80_000u64, 6u64), (110_000, 5), (100_150, 4), (100_140, 3)];
+        for (price, qty) in orders {
+            place(&mut ctx, ALICE, 0, price, qty, 0, 0);
+        }
+        let buys = storage::load_buy_orders(&mut ctx, ALICE, MARKET_ID).unwrap();
+        assert_eq!(
+            buys.iter().map(|e| e.price).collect::<Vec<_>>(),
+            vec![110_000, 100_150, 100_140, 80_000],
+            "the buy list is price-descending, and it straddles T = 100_150 both ways"
+        );
+
+        // The identity, recomputed here from the order terms alone — deliberately NOT by calling an
+        // engine helper, so this is a cross-check rather than a tautology.
+        let want: u64 = orders.iter().map(|&(p, q)| p * q / 10).sum();
+        assert_eq!(want, 48_000 + 55_000 + 40_060 + 30_042);
+        assert_eq!(want, 173_102);
+
+        let p = pos(&mut ctx, ALICE);
+        let i = margin_info(&mut ctx, ALICE);
+        assert_eq!(
+            i.bidNotional, want,
+            "bidNotional must be Σ qty × the order's OWN price, with no uplift anywhere"
+        );
+        assert_eq!(
+            p.total_buy_notional, i.bidNotional,
+            "for the buy side the maintained aggregate IS `Bid` — there is no second basis"
+        );
+
+        // Both plausible wrong rules are named, so a regression cannot pass by coincidence. The two
+        // orders BELOW `T` are what the sell side's `max(T, price)` would lift; the one ABOVE `T` is
+        // what a `min(T, price)` cap would lower. Neither may touch the buy fold.
+        let floored_at_t: u64 = orders.iter().map(|&(p, q)| p.max(100_150) * q / 10).sum();
+        let capped_at_t: u64 = orders.iter().map(|&(p, q)| p.min(100_150) * q / 10).sum();
+        assert_eq!(floored_at_t, 185_195);
+        assert_eq!(capped_at_t, 168_177);
+        assert_ne!(
+            i.bidNotional, floored_at_t,
+            "the sell side's max(T, price) must NOT be applied to buys"
+        );
+        assert_ne!(i.bidNotional, capped_at_t, "and neither must a cap at T");
+        assert_eq!(
+            floored_at_t - i.bidNotional,
+            12_093,
+            "the exact amount the sell-side rule would have over-charged the buy side"
+        );
+
+        // ...and the requirement that follows from it.
+        assert_eq!((i.notional, i.positionInitialMargin), (51_000, 17_000));
+        assert_eq!(i.initialMargin, 74_701);
+        assert_eq!(oo_im(&mut ctx, ALICE), 57_701);
     }
 
     /// The markup is PER ORDER — `Σ qty × max(T, price)`, not a single adjustment to the total —

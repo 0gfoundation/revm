@@ -41,6 +41,11 @@
 //! discriminating mainnet samples). Every rounding mode below cites the evidence that settled
 //! it. One behaviour of Binance's is deliberately **not** copied — see [`run_get_account_margin`]
 //! (`availableBalance` is not clamped at zero).
+//!
+//! ⚠️ **What is NOT measured:** all ten mainnet runs behind the formula used a LONG position, so the
+//! form the joint `max()` takes for a SHORT (`N < 0`) is EXTRAPOLATED — a **BLOCKING** open item per
+//! §6 (「空头侧符号」) since docs commit `8d179c0`. [`crate::math::open_order_margin`] carries the
+//! full note; [`position_derived_margin`] marks the one place the sign enters.
 
 use alloy_sol_types::SolCall;
 use primitives::{Address, Bytes};
@@ -173,11 +178,30 @@ pub struct PositionDerivedMargin {
 }
 
 /// Compute [`PositionDerivedMargin`] for one `(market, position)`. Pure function, no storage.
+///
+/// # This is where the POSITION'S SIGN enters the derived margin — and it is the ONLY place
+///
+/// The sign of `pos.amount` reaches the formula through exactly one channel, the `calc_value_i64`
+/// below, which preserves it (`i128` division truncates TOWARD ZERO, so a short yields exactly
+/// `−trunc(|amount| × mark)` — the same magnitude as the long case). Everything downstream is
+/// [`crate::math::open_order_margin`]'s three uses of it: `n + bid`, `n − ask`, and the sign-free
+/// `|n|` of `PIM`.
+///
+/// `Bid` and `Ask` are keyed to the ORDER's side and never to the position's, so the position sign
+/// does **not** enter them: `pos.total_buy_notional` is the buy fold whether the position is long,
+/// short or flat, and the Assuming-Price uplift is applied to resting SELLS on the same basis.
+///
+/// ⚠️ The short-side (`pos.amount < 0`) form of the joint `max()` is **EXTRAPOLATED**, and
+/// `misc/binance-margin-verified-model.md` §6 classifies it as a **BLOCKING** open item as of docs
+/// commit `8d179c0`. See the dedicated section on [`crate::math::open_order_margin`] before
+/// touching anything here.
 pub fn position_derived_margin(
     market: &crate::types::Market,
     priced: PricedPosition<'_>,
 ) -> Result<PositionDerivedMargin, PerpError> {
     let pos = priced.pos;
+    // ── SIGN ENTRY POINT (the only one) ──
+    // `pos.amount` is signed and its sign survives into `N`; see the doc comment above.
     let signed_notional = calc_value_i64(
         market.mark_price,
         pos.amount,
@@ -408,10 +432,18 @@ pub fn compute_margin_info<H: PerpHost>(
     // the buy quantity (|N+Bid| goes from 15.31 behind to 168.39 ahead). The two branches are the
     // exposure left if every BUY fills and if every SELL fills.
     //
-    // `N` is passed SIGNED. The doc's samples are all LONGS, where signed == the unsigned
-    // `notional` field, and it lists short-side signs as unverified (§6). The signed reading is
-    // the one the branch SEMANTICS force ("多头暴露 / 空头暴露"): for a short, unsigned `N` would
-    // make `|N − Ask|` understate the very exposure the ask branch exists to measure.
+    // `N` is passed SIGNED. ⚠️ The doc's samples are all LONGS (ten runs, every one of them), where
+    // signed == the unsigned `notional` field — so the short-side form of the joint `max()` is
+    // EXTRAPOLATED, and `binance-margin-verified-model.md` §6 (「空头侧符号」) UPGRADED it from
+    // 「低优先」 to a BLOCKING open item in docs commit `8d179c0`. The signed reading is the one the
+    // branch SEMANTICS force ("多头暴露 / 空头暴露"): for a short, unsigned `N` would make
+    // `|N − Ask|` understate the very exposure the ask branch exists to measure. It is our choice,
+    // not a measurement — see the "SHORT side is EXTRAPOLATED" section on `math::open_order_margin`
+    // and the characterisation tests it names.
+    //
+    // The `notional` field reported just above deliberately DISCARDS the sign
+    // (`signed_notional.unsigned_abs()`), matching Binance's own unsigned `notional`; only the
+    // joint `max()` below sees the sign.
     //
     // NOTE this deliberately mixes bases: `N` is at MARK, `Bid` at each buy's LIMIT price, `Ask` at
     // each sell's ASSUMING price. That is Binance's formula, and this layer reports Binance's

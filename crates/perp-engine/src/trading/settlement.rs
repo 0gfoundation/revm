@@ -144,6 +144,30 @@ impl TakerSettlement {
     /// solely on the RESTING side, where the fill price genuinely is unknown at admission
     /// (`margin_view::assuming_price_floor`). Market/IOC/FOK remainders never rest
     /// (`rest_remainder = false`), so they contribute nothing to `Bid`/`Ask` either.
+    ///
+    /// **Re-verified path by path (2026-08-18), because "matches first" is the whole argument and a
+    /// single pre-match affordability decision would break it.** The walk itself performs ZERO
+    /// storage writes (`trading::mod.rs`, the "commit-only #23 L2b" note after the match loop), so
+    /// gating after it is free of the leak that would otherwise force an earlier gate:
+    ///
+    /// ```text
+    /// path                pre-match gates                             taker affordability gate
+    /// Market              validate (qty/tick) + market-index count cap  finalize_compute, realised
+    /// IOC                 same                                          finalize_compute, realised
+    /// FOK                 same + check_fok_feasibility                   finalize_compute, realised
+    /// GTC (crossing)      same                                          finalize_compute, realised
+    /// GTC (remainder)     —                                             rest_delta, LIMIT price
+    /// PostOnly            cross test against the BBO                    no taker portion exists
+    /// ```
+    ///
+    /// `check_fok_feasibility` is the one that looks like a counterexample and is not: it walks the
+    /// book before matching, but its accumulator is a `u64` of fillable BASE QUANTITY and it reads no
+    /// account, no position and no wallet — the limit price appears only as a bound on which levels
+    /// count. It answers "can this be filled in full", never "can this be afforded". So no path
+    /// decides affordability before the fill prices are known, and there is nothing here for a
+    /// `Last × 1.0015` slippage allowance to protect. **Do not add one**: it would refuse orders
+    /// whose exact cost is already in hand, and on Binance the uplift is not even escrowed on this
+    /// path (§3.8 「过闸即消失」).
     pub(super) fn finalize_compute<H: PerpHost>(
         self,
         context: &mut H,

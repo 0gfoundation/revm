@@ -708,7 +708,12 @@ pub fn run_remove_position_margin<H: PerpHost>(
     //
     // Binance checks maintenance margin continuously and never re-checks initial margin
     // (`binance-margin-verified-model.md` §1.5: margin is validated at placement and not again;
-    // `addPositionMargin`/`removePositionMargin` are a pure transfer that "不改 IM,不改 MM").
+    // `addPositionMargin`/`removePositionMargin` are a pure transfer that "不改 IM,不改 MM"). The
+    // formula set §1.2 states it flatly — 「**Binance 只连续检查 MM,不检查 IM**」 — and
+    // `binance-flip-and-admission.md` §3.9 supplies the MEASUREMENT: run1's market open computed
+    // `PIM = 6.34041` while the silo received `6.30870795`, short by exactly one opening commission,
+    // and the position 「照常存活」. So 「silo 低于 IM」 is 「**常态,不是异常**」 — a continuous IM
+    // check here (or anywhere else) would be a divergence, not a safety net.
     // The maintenance gate is the one that matters and is strictly the right one here: it
     // accounts for unrealized PnL via `v_quote_balance`, which the initial-margin form did not,
     // so collateral still cannot be stripped from a position that is sliding underwater — and a

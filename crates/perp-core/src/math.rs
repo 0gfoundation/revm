@@ -391,6 +391,40 @@ pub struct OpenOrderMargin {
 /// the raw limit-price total. Mixing mark and order-price bases is deliberate: it is Binance's
 /// formula.
 ///
+/// # ⚠️ The SHORT side of the joint `max()` is EXTRAPOLATED, not measured — and the docs call it
+/// a BLOCKING open item
+///
+/// **Nobody has ever observed this formula on a short position.** All ten mainnet runs behind it
+/// used a LONG (`signed_notional > 0`). `misc/binance-margin-verified-model.md` §6, the
+/// 「空头侧符号」 row, is explicit and was UPGRADED to a blocker by docs commit `8d179c0`:
+///
+/// > 全部样本都是多头(十轮)…`BE = EP × (1−f)`、LP 分母符号、以及**联合 `max()` 在空头侧的形式**
+/// > 全是外推。⚠️ **已从「低优先」升级为阻塞项**
+///
+/// (A ~0.064 USDT three-arm probe that would settle it is designed in
+/// `misc/binance-flip-and-admission.md` §3.3. Until it runs, **the short side of this function is
+/// our extrapolation and nothing else.** Do not cite it as Binance-measured behaviour, and do not
+/// read the short-side tests in `open_order_margin_tests` as evidence about Binance — they are
+/// CHARACTERISATION tests over our own choice.)
+///
+/// What we chose, and why: the **exact mirror** of the measured long side. `IM` — and therefore
+/// `ooIM` — is invariant under `(N, Bid, Ask) → (−N, Ask, Bid)`, because
+/// `|−N + Ask| = |N − Ask|` and `|−N − Bid| = |N + Bid|` swap the two branches while `PIM = |N|/L`
+/// is already sign-free. So a short with resting buys is charged exactly what a long with
+/// same-notional resting sells is charged (pinned by
+/// `the_short_side_is_the_exact_mirror_of_the_long_side`). This is a decision, not a measurement:
+/// the branch SEMANTICS force it (the two branches are "the exposure left if every buy fills" and
+/// "…if every sell fills", which are sign-symmetric statements), and inventing an asymmetry with no
+/// measurement to aim it at would be strictly worse than the honest mirror. **Do not "fix" the
+/// short side until the probe reports.**
+///
+/// One asymmetry in the surrounding pipeline is NOT a sign-mirror and is deliberate: the
+/// Assuming-Price uplift is keyed to the ORDER's side, not the position's, so `Ask` carries it and
+/// `Bid` never does (`Assuming(buy) = limit` exactly — `misc/binance-flip-and-admission.md` §3.8).
+/// That one IS measured. Consequence: the full `(position, book) → ooIM` map does not mirror even
+/// though this function does, and hedging a short with buys is cheaper than hedging a long with
+/// sells. That is Binance's shape, not an accident here.
+///
 /// # Rounding
 ///
 /// `ooIM` is the DIFFERENCE OF TWO ROUND_UPs, never a single round-up of a difference: the
@@ -1238,6 +1272,172 @@ mod open_order_margin_tests {
             assert_eq!(
                 m.open_order_initial_margin == 0,
                 m.initial_margin == m.position_initial_margin
+            );
+        }
+    }
+
+    // ── SHORT side: CHARACTERISATION of an EXTRAPOLATION ────────────────────────────────────────
+    //
+    // ⚠️ Everything below pins OUR CHOICE, not a Binance measurement. All ten mainnet runs behind
+    // this formula used a LONG position, so the form the joint `max()` takes on a SHORT has never
+    // been observed; `misc/binance-margin-verified-model.md` §6 (「空头侧符号」) lists it as
+    // extrapolated and docs commit `8d179c0` UPGRADED it to a BLOCKING open item. See the
+    // corresponding section on [`open_order_margin`].
+    //
+    // A failure in this block therefore means "the short side moved", NOT "we diverged from
+    // Binance" — there is no Binance number here to diverge from. If the ~0.064 USDT three-arm
+    // probe of `misc/binance-flip-and-admission.md` §3.3 ever reports, THAT is the moment to
+    // revisit these expectations; until then they are frozen deliberately.
+
+    /// The short side is the EXACT MIRROR of the long side: `ooIM(N, Bid, Ask, L)` equals
+    /// `ooIM(−N, Ask, Bid, L)` for every input, because `|−N + Ask| = |N − Ask|` and
+    /// `|−N − Bid| = |N + Bid|` merely swap the two branches while `PIM = ROUND_UP(|N|/L)` is
+    /// already sign-free.
+    ///
+    /// This is the single strongest statement available about our short side, and it is what makes
+    /// the extrapolation *honest* rather than invented: we did not choose a short-side form at all,
+    /// we chose to have no asymmetry. Randomised over both signs plus the hand cases, so a
+    /// hand-written asymmetry anywhere in the function fails here rather than surviving as an
+    /// "accident" nobody can tell from a decision.
+    #[test]
+    fn the_short_side_is_the_exact_mirror_of_the_long_side() {
+        // Hand cases first, mirroring `long_with_bids_adds_but_long_with_asks_nets` term by term.
+        let n = 1_000_000i64;
+        for &(bid, ask, lev) in &[
+            (400_000u64, 0u64, 2u64),
+            (0, 400_000, 2),
+            (0, 3_000_000, 2),
+            (0, 1_000_000, 2),
+            (200_000, 2_200_001, 1),
+            (22, 0, 4),
+            (999_999, 7, 7),
+        ] {
+            assert_eq!(
+                at(n, bid, ask, lev),
+                at(-n, ask, bid, lev),
+                "mirror broken at bid={bid} ask={ask} lev={lev}"
+            );
+        }
+
+        let mut s: u64 = 0x00_5f_5d_e5_1d_e0_00_23;
+        let next = |s: &mut u64| {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        };
+        for _ in 0..20_000 {
+            let n = (next(&mut s) % 4_000_000_000) as i64 - 2_000_000_000;
+            let bid = next(&mut s) % 4_000_000_000;
+            let ask = next(&mut s) % 4_000_000_000;
+            let lev = next(&mut s) % 100 + 1;
+            // `-n` is always representable here (|n| <= 2e9), so the mirror is total.
+            assert_eq!(
+                at(n, bid, ask, lev),
+                at(-n, ask, bid, lev),
+                "mirror broken at n={n} bid={bid} ask={ask} lev={lev}"
+            );
+        }
+    }
+
+    /// A SHORT with resting BUYS that would CLOSE it: the buys net against the short exactly as
+    /// sells net against a long, so `ooIM == 0` for every `Bid` up to twice the position — the
+    /// short-side `ooIM == 0` BAND, with both of its endpoints.
+    ///
+    /// `N = −1_000_000`, `L = 2` ⇒ `PIM = 500_000`. The ask branch is `|−N| = 1_000_000` (constant,
+    /// `Ask = 0`); the bid branch is `|−1_000_000 + Bid|`, which stays at or below `1_000_000`
+    /// exactly while `Bid <= 2_000_000`. So:
+    ///
+    /// ```text
+    /// Bid =         0  → exposure 1_000_000 (untouched)      ooIM 0
+    /// Bid = 1_000_000  → exposure         0 (fully closed)   ooIM 0   ← cheapest point
+    /// Bid = 2_000_000  → exposure 1_000_000 (mirrored)       ooIM 0   ← last free unit
+    /// Bid = 2_000_001  → exposure 1_000_001                  ooIM 1   ← charging begins
+    /// ```
+    ///
+    /// The band's existence on the SELL side against a long is Binance-measured (R7 accepted
+    /// flipping sells at `ooIM = 0E-8`); on the BUY side against a short it is extrapolated.
+    #[test]
+    fn a_short_with_buys_that_close_it_is_free_across_the_whole_zero_band() {
+        let n = -1_000_000i64;
+        for bid in [0u64, 1, 500_000, 1_000_000, 1_500_000, 1_999_999, 2_000_000] {
+            assert_eq!(at(n, bid, 0, 2), (500_000, 500_000, 0), "bid={bid}");
+        }
+        // One unit past the band the charge starts, and it starts at ROUND_UP(1/2) = 1, not 0.
+        assert_eq!(at(n, 2_000_001, 0, 2), (500_000, 500_001, 1));
+        assert_eq!(at(n, 2_000_002, 0, 2), (500_000, 500_001, 1));
+        // At leverage 1 the same boundary is exact to the unit.
+        assert_eq!(at(n, 2_000_000, 0, 1), (1_000_000, 1_000_000, 0));
+        assert_eq!(at(n, 2_000_001, 0, 1), (1_000_000, 1_000_001, 1));
+    }
+
+    /// A SHORT whose resting BUYS FLIP it: past twice the position the buys stop hedging and start
+    /// building a LONG, and the joint `max()` charges the residual long exposure that would remain
+    /// after the flip — not the whole buy leg.
+    ///
+    /// `N = −1_000_000`, `Bid = 3_000_000`, `L = 2`: `|−1e6 + 3e6| = 2e6` ⇒ `IM = 1_000_000`,
+    /// `PIM = 500_000` ⇒ `ooIM = 500_000`. Charging the whole 3e6 buy leg would have been
+    /// `1_500_000`, i.e. 3× — the netting is the whole point of the joint form.
+    #[test]
+    fn a_short_with_buys_that_flip_it_is_charged_only_the_residual_exposure() {
+        let n = -1_000_000i64;
+        assert_eq!(at(n, 3_000_000, 0, 2), (500_000, 1_000_000, 500_000));
+        // The residual, not the leg: ooIM is 500_000, a THIRD of ROUND_UP(Bid/L) = 1_500_000.
+        assert_eq!(at(n, 3_000_000, 0, 2).2, 500_000);
+        assert_ne!(at(n, 3_000_000, 0, 2).2, 1_500_000);
+        // ...and it is the exact mirror of the long-with-flipping-sells case already pinned in
+        // `long_with_bids_adds_but_long_with_asks_nets`.
+        assert_eq!(at(n, 3_000_000, 0, 2), at(-n, 0, 3_000_000, 2));
+    }
+
+    /// A SHORT with resting SELLS: the sells COMPOUND the short, so every unit is charged from the
+    /// first — the mirror of a long with resting buys.
+    ///
+    /// `N = −1_000_000`, `L = 2`. The bid branch is `|−N| = 1_000_000` constant; the ask branch is
+    /// `|−1_000_000 − Ask| = 1_000_000 + Ask`, which wins for every `Ask > 0`. So
+    /// `ooIM = ROUND_UP((1_000_000 + Ask)/2) − 500_000`, linear with no free band at all.
+    #[test]
+    fn a_short_with_sells_compounds_from_the_very_first_unit() {
+        let n = -1_000_000i64;
+        assert_eq!(
+            at(n, 0, 0, 2),
+            (500_000, 500_000, 0),
+            "no orders, no charge"
+        );
+        // ROUND_UP: even ONE unit of extra exposure costs a whole unit of margin.
+        assert_eq!(at(n, 0, 1, 2), (500_000, 500_001, 1));
+        assert_eq!(at(n, 0, 400_000, 2), (500_000, 700_000, 200_000));
+        assert_eq!(at(n, 0, 3_000_000, 2), (500_000, 2_000_000, 1_500_000));
+        // Mirror of the long-with-buys row.
+        assert_eq!(at(n, 0, 400_000, 2), at(-n, 400_000, 0, 2));
+    }
+
+    /// The branch switch ON A SHORT — the mirror of
+    /// `the_max_switches_branch_at_the_crossing_point`, walked one unit at a time so the crossing
+    /// is pinned and not merely bracketed.
+    ///
+    /// `N = −1_000_000`, `Ask = 200_000` ⇒ the ASK branch is `|−1e6 − 2e5| = 1_200_000`, constant.
+    /// The BID branch is `|−1_000_000 + Bid|`, which reaches `1_200_000` at `Bid = 2_200_000`. So
+    /// the ask branch wins below that, they TIE there, and the bid branch takes over beyond.
+    #[test]
+    fn the_max_switches_branch_at_the_crossing_point_on_a_short() {
+        let (n, ask) = (-1_000_000i64, 200_000u64);
+        let ask_branch = 1_200_000u64;
+        for (bid, want) in [
+            (2_199_998u64, ask_branch),
+            (2_199_999, ask_branch),
+            (2_200_000, ask_branch), // tie: |−1e6 + 2.2e6| == 1.2e6
+            (2_200_001, 1_200_001),  // bid branch takes over, by exactly 1
+            (2_200_002, 1_200_002),
+        ] {
+            let m = open_order_margin(n, bid, ask, 1).unwrap();
+            assert_eq!(m.initial_margin, want, "bid={bid}");
+            let bid_branch = (n as i128 + bid as i128).unsigned_abs() as u64;
+            assert_eq!(m.initial_margin, ask_branch.max(bid_branch), "bid={bid}");
+            assert_ne!(
+                m.initial_margin,
+                ask_branch + bid_branch,
+                "the two sides must not add"
             );
         }
     }

@@ -23,7 +23,21 @@ pub struct PerpPosition {
     /// Virtual quote balance.  Entry price = -v_quote_balance / amount.
     #[serde(rename = "v")]
     pub v_quote_balance: i64,
-    /// Margin (collateral) allocated to this position.
+    /// Margin (collateral) allocated to this position — Binance's `isolatedWallet`.
+    ///
+    /// **`margin < ROUND_UP(|N| / L)` (below the position's own initial margin) is NORMAL, not an
+    /// anomaly, and nothing may assert otherwise.** Binance only checks the maintenance margin
+    /// continuously and never re-checks IM after placement
+    /// (`misc/binance-margin-verified-model.md` §1.2, and `misc/binance-flip-and-admission.md` §3.9:
+    /// 「逐仓仓位**天生**就低于自己的 `IM`」 — run1's market open computed `PIM = 6.34041` while the
+    /// silo received `6.30870795`, short by one commission, and 「照常存活」). Ours is below by the
+    /// same mechanism: the opening fill funds the trading fee out of the margin it creates
+    /// (`isolatedWallet = Ne/L − f·Ne`, see the `fee_reserved` note below). Funding charges, close
+    /// legs and ADL drain it further with no IM floor.
+    ///
+    /// The only continuous requirement gate in the engine is
+    /// [`crate::math::is_above_maintenance_margin`]. Pinned by
+    /// `a_position_naturally_below_its_own_initial_margin_survives_normally`.
     #[serde(rename = "m")]
     pub margin: i64,
     // NOTE: the former open-order margin ESCROW is GONE — the six fields "mr"

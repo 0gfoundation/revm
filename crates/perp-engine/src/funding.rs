@@ -24,6 +24,13 @@
 //! closed form `dLP = funding / (qty * (MMR - 1))`, i.e. a losing funding stream can
 //! push a position into liquidation instead of being subsidised indefinitely by a
 //! well-funded wallet that also backs every OTHER market's orders.
+//!
+//! ⚠️ That `dLP` form is a MEASURED closed form (`binance-margin-verified-model.md` §1.3: predicted
+//! `3.7878012048…` vs observed `3.78780120`, error 4.8e-9 — sub-ulp) and is unaffected by §3.7's
+//! "component form only" rule, which voids the FLIP-GAP closed forms (`x*` and friends), not this
+//! one. It is quoted here only to explain the mechanism: nothing in this module computes an `LP`.
+//! Its DENOMINATOR SIGN on a SHORT position is extrapolated, like everything short-side
+//! (§6, 「空头侧符号」 — a blocking open item since docs commit `8d179c0`); no code depends on it.
 
 use alloy_primitives::IntoLogData;
 use crate::host::PerpHost;
