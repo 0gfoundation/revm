@@ -246,8 +246,16 @@ sol! {
         ///   leverage        the position's leverage setting (never 0 — floored at 1).
         ///   bidNotional     `Bid` = Σ over the user's resting BUYS in this market of
         ///                   `qty × that order's LIMIT price` (NOT mark), each term floored to
-        ///                   quote units exactly as the engine's own reservation fold floors it.
-        ///   askNotional     `Ask`, same over resting SELLS.
+        ///                   quote units exactly as the engine's own aggregate fold floors it.
+        ///                   A LONG order's Assuming Price IS its limit price, so no markup.
+        ///   askNotional     `Ask` = Σ over resting SELLS of `qty × max(T, that order's LIMIT
+        ///                   price)`, where `T = max(ROUND_UP(lastTraded × 1.0015), markPrice)` is
+        ///                   the Assuming-Price floor. A SHORT order resting at or below `T` is
+        ///                   charged at `T`, not at its own price — Binance's vendor Cost formula,
+        ///                   measured on mainnet (run9 admission probes; R10 measured the reported
+        ///                   `askNotional / qty == limit × 1.0015` for a sell resting below `T`).
+        ///                   Consequence: this field, and every field derived from it, MOVE WITH
+        ///                   THE MARK and with the last trade even when the user does nothing.
         ///
         /// Derived (Binance formulas, Binance rounding):
         ///   notional              `trunc(|positionAmt| × markPrice)` — TRUNCATED, and every
@@ -266,9 +274,9 @@ sol! {
         ///                         `max()` (neither branch always wins). `N` is the SIGNED
         ///                         notional: the two branches are "exposure if every buy fills"
         ///                         and "exposure if every sell fills".
-        ///                         NOTE this deliberately mixes bases — `N` at mark, `Bid`/`Ask`
-        ///                         at limit price. That is Binance's formula, and this view
-        ///                         reports Binance's numbers.
+        ///                         NOTE this deliberately mixes bases — `N` at mark, `Bid` at
+        ///                         limit price, `Ask` at the Assuming Price. That is Binance's
+        ///                         formula, and this view reports Binance's numbers.
         ///   openOrderInitialMargin  `initialMargin − positionInitialMargin`. Computed as that
         ///                         DIFFERENCE OF TWO ROUND_UPs, never as a single round-up of a
         ///                         difference — the convenience form

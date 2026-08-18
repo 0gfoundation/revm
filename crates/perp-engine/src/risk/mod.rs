@@ -586,7 +586,16 @@ pub fn run_get_position<H: PerpHost>(
 
     let pos = storage::load_position_ref(context, args.user, args.marketId)?;
     let open_order_margin = match storage::load_market_ref(context, args.marketId)? {
-        Some(market) => crate::margin_view::position_open_order_margin(&market, &pos)?,
+        Some(market) => {
+            let priced = crate::margin_view::stored_priced_position(
+                context,
+                args.user,
+                args.marketId,
+                &market,
+                &pos,
+            )?;
+            crate::margin_view::position_open_order_margin(&market, priced)?
+        }
         None => 0,
     };
     Ok(Bytes::from(getPositionCall::abi_encode_returns(
@@ -852,9 +861,14 @@ pub(crate) fn liquidate_position<H: PerpHost>(
 
     // Isolated margin: the position's loss (book leg + residual) was already contained
     // to its margin and any bad debt routed directly to the Insurance Fund by the close
-    // paths (apply_position_fill / settle_liquidation_residual), so the wallet is never
-    // negative here. Charge the clearance fee from the liquidated user's remaining
-    // wallet (capped at the balance) and credit it to the Insurance Fund.
+    // paths (apply_position_fill / settle_liquidation_residual), so LIQUIDATION never drives
+    // the wallet negative. It may nonetheless ARRIVE here negative — a maker fill whose wallet
+    // could not cover the opening margin fills anyway and leaves a deficit
+    // (`settle_maker_fill_core`) — hence the `.max(0)` below: the clearance fee is capped at the
+    // POSITIVE balance, so an already-negative wallet is charged nothing rather than being pushed
+    // further under (and `as u64` on a negative i64 would otherwise wrap to an astronomical cap).
+    // Charge the clearance fee from the liquidated user's remaining wallet (capped at the balance)
+    // and credit it to the Insurance Fund.
     let mut account = storage::load_account(context, user)?;
     let clearance_fee = {
         let fee = (pre_liq_margin as u128).saturating_mul(market.liquidation_fee_rate_bps as u128)
@@ -1039,8 +1053,9 @@ fn run_liquidation_sweep<H: PerpHost>(
 ///
 /// `Bid`/`Ask`/`N` are untouched by `setLeverage` (it moves neither the position nor the book), so
 /// "before" is the stored position and "after" is the same position at `new_leverage` — the only
-/// input that differs is the divisor. Pure read + reject: zero writes on either outcome, so this
-/// may precede every write on the path (commit-only).
+/// input that differs is the divisor. In particular the Assuming-Price `Ask` is the SAME fold on
+/// both sides, resolved once from the stored sell list. Pure read + reject: zero writes on either
+/// outcome, so this may precede every write on the path (commit-only).
 fn rebalance_order_margin_for_leverage<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -1050,7 +1065,13 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
 ) -> Result<(), PerpError> {
     let mut after = pos.clone();
     after.leverage = new_leverage;
-    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
+    let ask =
+        crate::margin_view::stored_ask_assuming(context, user, market.market_id, market, pos)?;
+    let delta = crate::margin_view::derived_requirement_delta(
+        market,
+        crate::margin_view::PricedPosition::new(pos, ask),
+        crate::margin_view::PricedPosition::new(&after, ask),
+    )?;
     // The available is measured on the CURRENT (pre-change) state, which is what `delta` is the
     // increment to — with the caller's in-memory `pos` overriding storage for this market, since
     // it is not written until after this gate. A non-positive delta is free (`derived_can_afford`).
@@ -1058,7 +1079,10 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
         context,
         user,
         None,
-        Some((market.market_id, pos)),
+        Some((
+            market.market_id,
+            crate::margin_view::PricedPosition::new(pos, ask),
+        )),
     )?;
     if !crate::margin_view::derived_can_afford(available, delta) {
         return Err(perp_err(

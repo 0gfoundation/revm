@@ -48,7 +48,16 @@ use primitives::{B256, U256};
 // read (`ooIM = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) − ROUND_UP(|N| / L)`) and merely
 // subtracted at the admission gate. CHAIN change: golden re-pin (below) + a coordinated wipe on
 // deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 18;
+// Assuming-Price sell side + M1′ maker fills: bumped 18→19 — TWO execution-rule changes, no layout
+// change. (1) `Ask` is now priced at each sell's ASSUMING PRICE `max(ROUND_UP(lastTraded × 1.0015),
+// mark, limit)` instead of its limit price, so admission accepts/refuses a different set of resting
+// sells (`math::assuming_price_floor`). (2) A maker fill whose wallet cannot cover the opening margin
+// now FILLS and drives `perp_wallet_balance` negative instead of being cancelled, so the write set of
+// such a match differs (a position + a negative wallet where there used to be a cancelled order).
+// Both change what nodes write, so a node on 18 and a node on 19 would diverge on state — which is
+// exactly what this version guards. CHAIN change: golden re-pin (below) + a coordinated wipe on
+// deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 19;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

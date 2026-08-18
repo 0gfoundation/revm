@@ -58,10 +58,19 @@ pub struct PerpPosition {
     // recompute-from-list). Derivable from the lists via `math::sum_side_totals`, so a
     // genesis/default 0 is correct only for an empty book.
     //
-    // These ARE Binance's `bidNotional` / `askNotional`, proven equal to the resting-order fold
-    // after every transition by `side_aggregates_are_exactly_bid_and_ask_after_every_operation`.
-    // They are the sole inputs (with `amount`, `leverage` and the mark) to the DERIVED open-order
-    // requirement that replaced the escrow — see the note where the escrow fields used to be.
+    // `total_buy_notional` IS Binance's `bidNotional`: a LONG order's Assuming Price is its own
+    // limit price, so the limit-price fold is the requirement basis outright.
+    //
+    // ⚠️ `total_sell_notional` is NOT `askNotional`. A SHORT order is priced at
+    // `max(ROUND_UP(lastTraded × 1.0015), mark, limit)`, so this field is only the BASELINE the
+    // Assuming-Price uplift is added to; the requirement's `Ask` is re-folded from the sell LIST at
+    // the current floor on every evaluation (`margin_view::stored_ask_assuming`) and, unlike this
+    // field, moves with the mark. Both are proven equal to the resting-order fold after every
+    // transition by `side_aggregates_are_exactly_bid_and_ask_after_every_operation`.
+    //
+    // Together with `amount`, `leverage`, the mark, the last traded price and the sell list, these
+    // are the inputs to the DERIVED open-order requirement that replaced the escrow — see the note
+    // where the escrow fields used to be.
     /// Σ resting BUY order amounts (base units).
     #[serde(default, rename = "tbq")]
     pub total_buy_qty: u64,

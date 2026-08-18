@@ -572,12 +572,15 @@ fn a_resting_order_that_can_flip_the_position_is_charged_the_joint_max() {
     // The sell can flip the position's sign, which is exactly where the retired escrow and
     // Binance's formula parted company.
     //
-    //   Binance (joint requirement over position AND orders, netting the flip) — what we now do:
-    //     N   = $200,  Bid = $0,  Ask = $500
-    //     IM  = ROUND_UP(max(|200 + 0|, |200 - 500|) / 1) = $300
-    //     PIM = ROUND_UP(200 / 1)                         = $200
-    //     ooIM = IM - PIM                                 = $100
-    //     TOTAL capital tied up = positionMargin $200 + ooIM $100 = IM = $300
+    //   Binance (joint requirement over position AND orders, netting the flip) — what we now do.
+    //   The sell rests AT the last traded price, so its Assuming Price is
+    //   `T = ROUND_UP($100 × 1.0015) = $100.15` (the tick grid is cents, so `10_015` exactly),
+    //   NOT its own limit:
+    //     N   = $200,  Bid = $0,  Ask = 5 × $100.15 = $500.75
+    //     IM  = ROUND_UP(max(|200 + 0|, |200 - 500.75|) / 1) = $300.75
+    //     PIM = ROUND_UP(200 / 1)                            = $200
+    //     ooIM = IM - PIM                                    = $100.75
+    //     TOTAL capital tied up = positionMargin $200 + ooIM $100.75 = IM = $300.75
     //
     //   The retired escrow charged `c_notional = max(S + B', B + S') = $300` for the ORDERS
     //   ALONE, on top of the $200 position margin — $500 of capital, 1.67x. The $200 gap was
@@ -585,8 +588,10 @@ fn a_resting_order_that_can_flip_the_position_is_charged_the_joint_max() {
     //   long closes and its $200 of margin is released, which Binance's single joint `max()`
     //   nets by construction and a per-side reservation bucket cannot.
     //
-    //   MEASURED HERE: the account now ties up $300 total on this book instead of $500. The
-    //   loosening is deliberate and was accepted with the migration.
+    //   MEASURED HERE: the account now ties up $300.75 total on this book instead of $500. The
+    //   loosening is deliberate and was accepted with the migration; the $0.75 is the
+    //   Assuming-Price markup, which pulls back a sliver of it on any sell resting at or below
+    //   `max(lastTraded × 1.0015, mark)`.
     // ─────────────────────────────────────────────────────────────────────────────────────
     let mut ctx = make_ctx();
     setup_a(&mut ctx);
@@ -607,15 +612,17 @@ fn a_resting_order_that_can_flip_the_position_is_charged_the_joint_max() {
     assert_eq!(i.vQuoteBalance, -(200 * USD as i64));
     assert_eq!(i.leverage, 1);
     assert_eq!(i.bidNotional, 0);
-    assert_eq!(i.askNotional, 500 * USD);
+    assert_eq!(
+        i.askNotional, 500_750_000,
+        "the ASSUMING-price aggregate: 5 × ROUND_UP($100 × 1.0015), not 5 × the $100 limit"
+    );
     assert_eq!(i.notional, 200 * USD);
     assert_eq!(i.unrealizedProfit, 0, "mark == entry");
 
-    // The Binance numbers — unchanged by the migration; these were already correct as a REPORT
-    // and are now also what is enforced.
+    // The Binance numbers.
     assert_eq!(i.positionInitialMargin, 200 * USD);
-    assert_eq!(i.initialMargin, 300 * USD);
-    assert_eq!(i.openOrderInitialMargin, 100 * USD);
+    assert_eq!(i.initialMargin, 300_750_000);
+    assert_eq!(i.openOrderInitialMargin, 100_750_000);
 
     // Total capital tied up == IM, exactly. This identity is the migration: `positionMargin` is
     // physically held, `ooIM` is arithmetically withheld, and together they are the joint
@@ -626,17 +633,17 @@ fn a_resting_order_that_can_flip_the_position_is_charged_the_joint_max() {
         i.positionMargin + a.totalOpenOrderInitialMargin as i64,
         a.totalInitialMargin as i64
     );
-    assert_eq!(a.totalInitialMargin, 300 * USD);
+    assert_eq!(a.totalInitialMargin, 300_750_000);
 
-    // And in the wallet: $10 000 - $200 (the position, physically debited at open). The $100
+    // And in the wallet: $10 000 - $200 (the position, physically debited at open). The $100.75
     // ooIM is NOT debited — it is subtracted on read.
     assert_eq!(a.walletBalance, 9_800 * USD as i64);
-    assert_eq!(a.availableBalance, 9_700 * USD as i64);
+    assert_eq!(a.availableBalance, 9_800 * USD as i64 - 100_750_000);
     // The escrow basis left only $9 500 spendable on this same book (it debited $200 + $300).
     assert_eq!(
         a.availableBalance - 9_500 * USD as i64,
-        200 * USD as i64,
-        "the flip's released position margin, no longer charged twice"
+        200 * USD as i64 - 750_000,
+        "the flip's released position margin, no longer charged twice, less the $0.75 markup"
     );
 }
 

@@ -2154,15 +2154,28 @@ fn rest_in_book<H: PerpHost>(
             // `pos` overriding storage for this market (it is not written until below). Nothing is
             // debited: resting an order moves no money, it only raises the requirement.
             // A non-positive delta — a pure-reduce order — is free at any balance.
+            //
+            // The SELL side of the book is untouched by a buy, so the Assuming-Price `Ask` is the
+            // same fold on both sides of the delta — resolved once. (It is still needed: `Ask`
+            // enters `IM` through the `max()`.)
+            let ask =
+                crate::margin_view::stored_ask_assuming(context, user, market_id, market, &pos)?;
             let mut after = pos.clone();
             after.total_buy_qty = new_tbq;
             after.total_buy_notional = new_tbn;
-            let delta = crate::margin_view::derived_requirement_delta(market, &pos, &after)?;
+            let delta = crate::margin_view::derived_requirement_delta(
+                market,
+                crate::margin_view::PricedPosition::new(&pos, ask),
+                crate::margin_view::PricedPosition::new(&after, ask),
+            )?;
             let available = crate::margin_view::derived_available_balance_with(
                 context,
                 user,
                 Some(wallet),
-                Some((market_id, &pos)),
+                Some((
+                    market_id,
+                    crate::margin_view::PricedPosition::new(&pos, ask),
+                )),
             )?;
             if !crate::margin_view::derived_can_afford(available, delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
@@ -2222,15 +2235,45 @@ fn rest_in_book<H: PerpHost>(
                 .ok_or_else(|| perp_err("placeOrder: total sell notional overflow"))?;
 
             // ── Derived-ooIM admission gate ── (see the buy arm)
+            //
+            // THIS is where the Assuming Price bites: a sell resting at or below
+            // `T = max(ROUND_UP(lastTraded × 1.0015), mark)` is charged at `T`, so `ask_after` adds
+            // `calc_value(max(T, price), qty)` — not `entry_notional`. Adding the ONE term (rather
+            // than refolding) is exact: the aggregate is a sum of per-order-floored `calc_value`s.
+            //
+            // Binance additionally ESCROWS the uplift (measured, R10) and releases it at fill,
+            // which is what funds a flipping fill's new leg. We hold no escrow bucket at all, so
+            // for us the uplift manifests purely as a stricter admission — which still leaves more
+            // wallet present at fill time. It is NOT cosmetic: without it the `ooIM = 0` band
+            // (`Ask ≈ 2|N|`, a sell that would flip the position) is free AND fillable here, while
+            // on Binance the two are mutually exclusive (a sell must sit near the touch to fill,
+            // and near the touch the markup bites). See `binance-flip-and-admission.md` §1.6c/§3.4.
+            let floor = crate::margin_view::assuming_price_floor(context, market_id, market)?;
+            let ask = crate::margin_view::entries_ask_assuming(
+                market,
+                floor,
+                &sell_ref,
+                pos.total_sell_notional,
+            )?;
+            let ask_after = ask
+                .checked_add(crate::math::calc_value(price.max(floor), qty, bd, pd)?)
+                .ok_or_else(|| perp_err("placeOrder: assuming-price ask overflow"))?;
             let mut after = pos.clone();
             after.total_sell_qty = new_tsq;
             after.total_sell_notional = new_tsn;
-            let delta = crate::margin_view::derived_requirement_delta(market, &pos, &after)?;
+            let delta = crate::margin_view::derived_requirement_delta(
+                market,
+                crate::margin_view::PricedPosition::new(&pos, ask),
+                crate::margin_view::PricedPosition::new(&after, ask_after),
+            )?;
             let available = crate::margin_view::derived_available_balance_with(
                 context,
                 user,
                 Some(wallet),
-                Some((market_id, &pos)),
+                Some((
+                    market_id,
+                    crate::margin_view::PricedPosition::new(&pos, ask),
+                )),
             )?;
             if !crate::margin_view::derived_can_afford(available, delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));

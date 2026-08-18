@@ -122,7 +122,9 @@ fn pos(ctx: &mut TestCtx, user: Address) -> PerpPosition {
 fn oo_im(ctx: &mut TestCtx, user: Address) -> u64 {
     let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
     let p = storage::load_position(ctx, user, MARKET_ID).unwrap();
-    crate::margin_view::position_open_order_margin(&market, &p).unwrap()
+    let priced =
+        crate::margin_view::stored_priced_position(ctx, user, MARKET_ID, &market, &p).unwrap();
+    crate::margin_view::position_open_order_margin(&market, priced).unwrap()
 }
 
 /// `perp_wallet_balance − Σ ooIM` — the account's spendable headroom, i.e. the quantity every
@@ -904,8 +906,8 @@ fn fill_debits_init_margin_from_both_wallets() {
 /// CHANGED BY THE ESCROW REMOVAL: the fixture used to drain BOB's wallet to ZERO before the fill,
 /// because the order's own escrow was all the funding the fill needed. The MARGIN escrow is gone
 /// too, so the fill draws `INIT_MARGIN` from the wallet at fill time and a zero wallet would make
-/// it unfundable — the maker's order would be cancelled instead of filled (pinned separately in
-/// `an_unfundable_maker_fill_is_cancelled_and_the_taker_walks_on`). The fixture now leaves BOB
+/// it unfundable — the fill still happens and the wallet goes negative (pinned separately in
+/// `an_unfundable_maker_fill_still_fills_and_the_wallet_goes_negative`). The fixture now leaves BOB
 /// exactly the margin and NOT ONE UNIT MORE, which is the sharpest form of the claim under test:
 /// the fee is carved out of that margin, never charged on top of it.
 #[test]
@@ -946,12 +948,22 @@ fn maker_open_fill_funds_its_fee_from_margin_needing_no_free_wallet() {
 /// is only ever gated against `Σ ooIM` at ADMISSION, and `ooIM` (which values the position leg at
 /// mark and nets the close a fill performs) is not an upper bound on a fill's actual draw.
 ///
-/// The engine refuses to underfund: the fill returns `MakerFillOutcome::RejectedInsolvent`, the
-/// same channel the K9 maintenance guard uses, so the maker's order is CANCELLED and the taker
-/// walks on to the next maker instead of the whole match aborting. Nothing is minted, no wallet
-/// goes negative, and the taker's own order still completes against the liquidity behind it.
+/// **The fill happens anyway, and the wallet goes negative.** This test used to pin the opposite
+/// (`RejectedInsolvent` → the maker order cancelled, the taker walking on to the next maker); that
+/// is model **M2 ("don't fill")** in `misc/binance-flip-and-admission.md` §3.3, and BOTH surviving
+/// candidates for Binance's real behaviour (M1 and M1′) FILL. The measured backing for filling is
+/// independent of that open question: `binance-margin-verified-model.md` §1.6 caught an
+/// already-resting order sitting at `status = 'NEW'` while headroom was NEGATIVE
+/// (`crossWalletBalance − totalOpenOrderInitialMargin = −0.00085981`) at the same instant a NEW
+/// order was refused `-2019` — the exchange lets a lien be under-covered and never sweeps it.
+/// Admission is a one-time check; only LIQUIDATION kills an order.
+///
+/// So the maker's position is funded in full and the deficit lands in `perp_wallet_balance`, whose
+/// signed-internal / clamped-external shape is exactly Binance's true-negative-but-reported-zero
+/// `availableBalance` (working model M1′ — a CONJECTURE, see the note in
+/// `settle_maker_fill_core`). Nothing is minted: the position gains exactly what the wallet loses.
 #[test]
-fn an_unfundable_maker_fill_is_cancelled_and_the_taker_walks_on() {
+fn an_unfundable_maker_fill_still_fills_and_the_wallet_goes_negative() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
     fund(&mut ctx, CAROL, WALLET);
@@ -959,41 +971,136 @@ fn an_unfundable_maker_fill_is_cancelled_and_the_taker_walks_on() {
     // BOB rests at $100 (FIFO-first), CAROL behind him at the same price.
     let bob_sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
     let carol_sell = place(&mut ctx, CAROL, 1, PRICE, QTY, 0, 0);
-    // BOB is then drained — reachable in production via a fee, a funding charge or an adverse
-    // mark move between admission and fill.
+    // BOB is then drained to ONE UNIT SHORT of the opening margin — reachable in production via a
+    // fee, a funding charge or an adverse mark move between admission and fill.
     let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
-    bob.perp_wallet_balance = INIT_MARGIN as i64 - 1; // ONE unit short
+    bob.perp_wallet_balance = INIT_MARGIN as i64 - 1;
     storage::save_account(&mut ctx, BOB, bob).unwrap();
 
     let taker = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
-    // BOB's order is cancelled, not filled; his wallet is untouched and NOT negative.
+    // BOB's order is terminal because it FILLED, not because it was cancelled — which the position
+    // below is the evidence for (delete-on-terminal drops the record either way).
+    assert_terminal(&mut ctx, bob_sell);
+    let bob_pos = pos(&mut ctx, BOB);
+    assert_eq!(bob_pos.amount, -(QTY as i64), "the short was opened");
+    assert_eq!(
+        bob_pos.margin, INIT_MARGIN as i64,
+        "the silo is funded to the FULL requirement, not short by the deficit (M1′, not M1)"
+    );
+    assert_eq!(
+        storage::load_account(&mut ctx, BOB)
+            .unwrap()
+            .perp_wallet_balance,
+        -1,
+        "the wallet absorbs the shortfall and goes negative by exactly it"
+    );
+    assert_eq!(
+        storage::load_account(&mut ctx, BOB)
+            .unwrap()
+            .visible_perp_wallet_balance(),
+        0,
+        "clamped at the ABI boundary — Binance reports 0 for a negative true value"
+    );
+    // Conservation: BOB's wallet + position margin is unchanged by the fill (he opened at the mark,
+    // so there is no PnL and no fee here), so nothing was minted to fund the silo.
+    assert_eq!(
+        storage::load_account(&mut ctx, BOB)
+            .unwrap()
+            .perp_wallet_balance
+            + bob_pos.margin,
+        INIT_MARGIN as i64 - 1
+    );
+
+    // The taker got its FULL fill from BOB, so it never reached CAROL — the walk no longer skips
+    // an underfunded maker.
+    assert_terminal(&mut ctx, taker);
+    assert_eq!(pos(&mut ctx, ALICE).amount, QTY as i64);
+    assert_eq!(
+        get_order(&mut ctx, carol_sell).status,
+        OrderStatus::Open,
+        "CAROL is still resting behind BOB — nothing walked past him"
+    );
+    assert_eq!(pos(&mut ctx, CAROL).amount, 0);
+
+    // The deficit is a real claim, not a free lunch: it puts AVAILABLE below zero, so every
+    // money-out gate (`transferFromPerp`, `withdraw`, `addPositionMargin`, any new order with a
+    // positive requirement) refuses BOB until it is funded. Crediting the wallet nets straight
+    // against it. NOTHING in the engine ever writes a deficit off — closing the position it funded
+    // releases the margin back, and beyond that only a deposit clears it.
+    assert_eq!(available(&mut ctx, BOB), -1);
+    assert!(!crate::margin_view::derived_can_afford(
+        available(&mut ctx, BOB),
+        1
+    ));
+    fund(&mut ctx, BOB, 1);
+    assert_eq!(
+        available(&mut ctx, BOB),
+        0,
+        "a credit nets against the deficit"
+    );
+}
+
+/// The `RejectedInsolvent` channel is still LIVE — it just no longer answers "the wallet is short".
+/// Its remaining trigger is K9: a fill that would leave the maker's POSITION below maintenance
+/// margin at the current mark. A drained wallet alone must not fire it (previous test); an
+/// underwater OPEN must, and the taker must still walk past the cancelled maker to the next one —
+/// the "cancel + walk on" mechanics the wallet-shortfall case used to share.
+///
+/// BOB rests a sell at $100; the mark is then pushed to $200. Filling BOB would OPEN him a short of
+/// 1 lot at $100 against a $200 mark — equity `−2_000_000 + 1_000_000 + 1_000_000 = 0` against a
+/// maintenance requirement of `2_000_000 / 6` — so K9 refuses it. CAROL, resting behind him, is
+/// already LONG 1 lot, so her identical sell is a pure CLOSE (`opening_qty == 0`) and K9 does not
+/// gate it: she takes the fill instead.
+#[test]
+fn the_k9_maintenance_guard_still_cancels_a_maker_and_the_taker_walks_on() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    fund(&mut ctx, CAROL, WALLET);
+    // CAROL is long 1 lot at $100 (margin 1e6, vq −1e6), so her sell below is a pure close.
+    storage::save_position(
+        &mut ctx,
+        CAROL,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -(FILL_VALUE as i64),
+            margin: INIT_MARGIN as i64,
+            leverage: 1,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
+
+    let bob_sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+    let carol_sell = place(&mut ctx, CAROL, 1, PRICE, QTY, 0, 0);
+
+    // Mark to $200, with a band wide enough that the $100 fill is still executable.
+    let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    market.mark_price = 200 * TICK;
+    market.price_band_bps = 1_000_000;
+    storage::save_market(&mut ctx, &market).unwrap();
+
+    let bob_wallet_before = storage::load_account(&mut ctx, BOB)
+        .unwrap()
+        .perp_wallet_balance;
+    let taker = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    // BOB: cancelled, no position, wallet untouched (K9 rejects BEFORE the debit is adopted).
     assert_terminal(&mut ctx, bob_sell);
     assert_eq!(pos(&mut ctx, BOB).amount, 0, "no position was opened");
     assert_eq!(
         storage::load_account(&mut ctx, BOB)
             .unwrap()
             .perp_wallet_balance,
-        INIT_MARGIN as i64 - 1,
-        "the maker's wallet must not go negative funding a fill it cannot afford"
+        bob_wallet_before,
+        "a K9 reject moves no money at all"
     );
-    // The taker's order still fills — against CAROL, one place further down the queue.
+    // CAROL took the fill instead — the walk continued past the rejected maker.
     assert_terminal(&mut ctx, taker);
     assert_terminal(&mut ctx, carol_sell);
     assert_eq!(pos(&mut ctx, ALICE).amount, QTY as i64);
-    assert_eq!(pos(&mut ctx, CAROL).amount, -(QTY as i64));
-
-    // One unit more and BOB fills normally — the boundary is exactly the opening margin.
-    let mut ctx2 = make_ctx();
-    setup(&mut ctx2);
-    let bob_sell2 = place(&mut ctx2, BOB, 1, PRICE, QTY, 0, 0);
-    let mut bob2 = storage::load_account(&mut ctx2, BOB).unwrap();
-    bob2.perp_wallet_balance = INIT_MARGIN as i64;
-    storage::save_account(&mut ctx2, BOB, bob2).unwrap();
-    place(&mut ctx2, ALICE, 0, PRICE, QTY, 0, 0);
-    assert_terminal(&mut ctx2, bob_sell2);
-    assert_eq!(pos(&mut ctx2, BOB).amount, -(QTY as i64), "filled");
-    assert_eq!(wallet(&mut ctx2, BOB), 0);
+    assert_eq!(pos(&mut ctx, CAROL).amount, 0, "her long was closed out");
 }
 
 #[test]
@@ -1730,10 +1837,15 @@ fn a_cross_side_flip_fill_leaves_the_other_resting_orders_alone() {
     // The maker fill funded that 3e6 FROM THE WALLET (there is no escrow to draw on) and the
     // close returned 2.5e6 of margin + 0.5e6 of realised profit, so the wallet nets +0.5e6 ...
     assert_eq!(wallet(&mut ctx, ALICE), 17_500_000);
-    // ... and the residual book is repriced against the new SHORT: Bid 6e6, Ask 3e6, N = −2.5e6
-    // ⇒ IM = max(|−2.5+6|, |−2.5−3|) = 5.5e6, PIM = 2.5e6 ⇒ ooIM = 3e6.
-    assert_eq!(oo_im(&mut ctx, ALICE), 3_000_000);
-    assert_eq!(available(&mut ctx, ALICE), 14_500_000);
+    // ... and the residual book is repriced against the new SHORT. The fill printed at $300, so
+    // `T = ROUND_UP($300 × 1.0015) = $300.45` and ALICE's surviving sell — resting AT $300, i.e.
+    // below `T` — is charged at `T`: `Ask = 3_004_500`, not 3_000_000. (Before the fill the last
+    // print was $250, so `T = $250.375` sat BELOW the $300 sells and the markup did not bite; that
+    // is why the 6_000_000 above is unmarked.)
+    // Bid 6e6, Ask 3_004_500, N = −2.5e6 ⇒ IM = max(|−2.5+6|, |−2.5−3.0045|) = 5_504_500,
+    // PIM = 2.5e6 ⇒ ooIM = 3_004_500.
+    assert_eq!(oo_im(&mut ctx, ALICE), 3_004_500);
+    assert_eq!(available(&mut ctx, ALICE), 14_495_500);
 
     // Conservation across the flip: ALICE's wallet + position margin grew by exactly the 0.5e6
     // she realised (long opened at $250, closed at $300), and by nothing else.
@@ -3753,8 +3865,46 @@ mod golden {
     /// converted 1:1 out of the placement escrow, is now drawn from the wallet at fill time — the
     /// same net movement in two steps instead of two. Prior value
     /// 0xb6b78e299b6b96f6dcc0c667c76cc4895ae4cd1932b305fdcda9c0907e998ee0.
+    /// RE-PIN (Assuming-Price sell side + M1′ maker fills + `BLOCK_COMMITMENT_VERSION` 18→19). No
+    /// layout change; two execution-rule changes plus a deliberate scenario EXTENSION.
+    ///
+    /// 1. **`Ask` is priced at each sell's ASSUMING PRICE** `max(ROUND_UP(lastTraded × 1.0015),
+    ///    mark, limit)`, not at its limit price — the vendor Cost formula, measured twice on mainnet
+    ///    (run9's eight admission probes; R10's reported `askNotional / q == limit × 1.0015` for a
+    ///    sell resting below the floor). The buy side is untouched: a LONG order's Assuming Price IS
+    ///    its limit price.
+    /// 2. **A maker fill the wallet cannot fund now FILLS**, driving `perp_wallet_balance` negative,
+    ///    instead of being cancelled through the K9 channel. Binance leaves an under-covered lien
+    ///    alone and only kills orders at liquidation (measured); "don't fill" was model M2, and both
+    ///    surviving candidates M1/M1′ fill.
+    /// 3. **NEW Phase 9c**, because the previous snapshot was structurally BLIND to (1): its only
+    ///    surviving order was a BUY against a FLAT position, so no `Ask` term reached it. An oracle
+    ///    bump lifts the mark above the book and CAROL — short QTY — rests a sell inside it.
+    ///
+    /// BusinessSnapshot, field by field:
+    ///   * `mark_price` 70_000_000_000 → **90_000_000_000**. Phase 9c's bump: `indexPrice = 90·TICK`
+    ///     against a `lastTraded` of `80·TICK`, so `median(price1, price2, contract) = 90·TICK`.
+    ///     Mechanism: the added `updateIndexPrice` call, nothing else.
+    ///   * `carol_account.1` (availablePerpBalance) 4_200_000 → **3_300_000**, i.e. −900_000 = the
+    ///     ooIM of the sell Phase 9c rests. `N = −900_000` at the new mark, `PIM = 900_000`,
+    ///     `Ask = 1 QTY × max(80_120_000_000, 90_000_000_000) = 900_000` ⇒
+    ///     `IM = |−900_000 − 900_000| = 1_800_000` ⇒ `ooIM = 900_000`. **Priced at the order's own
+    ///     $81 limit `Ask` would be 810_000 and `ooIM` 810_000, leaving 3_390_000** — so the 90_000
+    ///     difference between 3_300_000 and 3_390_000 IS the Assuming-Price markup, now pinned in
+    ///     the snapshot rather than only in the dedicated tests.
+    ///   * `carol_ask_status` is NEW: `Open`. The sell rests (it is above the surviving 80-tick bid).
+    ///
+    /// Everything else is IDENTICAL: all three positions, `alice_account`, `bob_account`,
+    /// `bob_erc20`, `admin_perp_wallet`, `insurance_fund`, `market_fee_total`, `funding` and every
+    /// other order status. Phase 9c neither trades nor liquidates (ALICE and BOB are flat; CAROL's
+    /// equity at the new mark is 700_000 against a 150_000 maintenance requirement), and change (2)
+    /// is not reachable in this scenario at all — no maker here is ever short of its opening margin,
+    /// which is why it carries no snapshot movement and is covered by
+    /// `an_unfundable_maker_fill_still_fills_and_the_wallet_goes_negative` plus the conservation leg
+    /// `an_underfunded_maker_fill_conserves_total_system_value` instead. Prior value
+    /// 0x2c2ab72998e3f53edf5a6bcb3c7ad552f0543babf6830b8fc87ce707b213e8ac.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x2c2ab72998e3f53edf5a6bcb3c7ad552f0543babf6830b8fc87ce707b213e8ac");
+        b256!("0x4a3ed7121a77b1e482a3db667cbe90b0331aa3acd5a350c9508f53e11d33c061");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -3791,6 +3941,9 @@ mod golden {
         /// BOB's same-price tail bid surviving the sell-side matcher early-exit.
         bob_tail_bid_status: u8,
         carol_close_status: u8,
+        /// CAROL's resting ask against her SHORT — the scenario's only sell-side open-order
+        /// requirement, and the only place the Assuming-Price markup reaches the snapshot.
+        carol_ask_status: u8,
     }
 
     fn expected_snapshot() -> BusinessSnapshot {
@@ -3841,8 +3994,13 @@ mod golden {
             //   whole remaining margin, so the 400 still lands here — unchanged total,
             //   different route.
             bob_account: (U256::from(500_000_000u64), 500_428_954),
-            // CAROL perp = 5_000_000 funded − 800_000 short opening margin.
-            carol_account: (U256::from(5_000_000u64), 4_200_000),
+            // CAROL perp = 5_000_000 funded − 800_000 short opening margin − 900_000 of DERIVED
+            // ooIM for the Phase-9c resting sell. That 900_000 is the sell priced at the ASSUMING
+            // PRICE (the $90 mark, which dominates both its own $81 limit and the
+            // ROUND_UP(80·TICK × 1.0015) = $80.12 last-price term); at the limit price it would be
+            // 810_000 and this field would read 3_390_000. Nothing is debited — ooIM is subtracted
+            // on read, so her wallet is still 4_200_000.
+            carol_account: (U256::from(5_000_000u64), 3_300_000),
             // 2e9 seed − 1.5e9 deposit + 0.5e9 withdraw.
             bob_erc20: U256::from(1_000_000_000u64),
             // 100M funding − 50M IF deposit + 1M IF withdraw + 3_461 fees
@@ -3859,8 +4017,10 @@ mod golden {
             // ALICE takers 2_015 + BOB maker 806 + 480 + 160 (CAROL's taker fee
             //   is 0 bps; the liquidation close taker fee is waived — fix B).
             market_fee_total: 3_461,
-            mark_price: 70_000_000_000, // $70 post-crash
-            funding: (100, 7_215),      // rate = interest-rate clamp; next epoch ts
+            // $90: Phase 9c's oracle bump lifts the mark ABOVE the book so the `Mark` branch of the
+            // Assuming Price is reachable (a $1 tick cannot express the 15 bps `Last × 1.0015` gap).
+            mark_price: 90_000_000_000,
+            funding: (100, 7_215), // rate = interest-rate clamp; next epoch ts
             // delete-on-terminal (commit-only #23): every terminal order (Filled/Cancelled/Expired)
             // is removed from the map → getOrder reverts → DELETED sentinel. Only the still-resting
             // tail bid remains queryable (Open). Business outcomes are pinned by the position /
@@ -3875,6 +4035,7 @@ mod golden {
             bob_bid_status: DELETED,
             bob_tail_bid_status: OrderStatus::Open as u8,
             carol_close_status: DELETED,
+            carol_ask_status: OrderStatus::Open as u8,
         }
     }
 
@@ -4706,6 +4867,40 @@ mod golden {
             "tail bid must survive the sell-side early-exit"
         );
 
+        // Phase 9c — a resting SELL against a NON-FLAT position, priced at the ASSUMING PRICE.
+        //
+        // This scenario had no such shape, which is why its BusinessSnapshot was structurally blind
+        // to how `Ask` is priced: BOB's surviving tail bid is a BUY (a long order's Assuming Price IS
+        // its limit price — no markup), and everyone else ends flat. Two calls fix that:
+        //
+        //   1. an oracle bump that lifts the MARK above the book. A resting sell must sit above the
+        //      best bid, and the last print is AT the touch, so `ROUND_UP(lastTraded × 1.0015)` is
+        //      only 15 bps above it — under this market's $1 tick on an $80 asset there is no
+        //      placeable price in that gap. The `Mark` branch of `max(Last × 1.0015, Mark, limit)`
+        //      is the reachable one, and it needs a mark above the book.
+        //   2. CAROL — SHORT QTY, so a sell INCREASES her exposure and is genuinely charged — rests
+        //      a sell inside the mark.
+        //
+        // Nobody is liquidated by the bump (ALICE and BOB are flat; CAROL's equity at the new mark
+        // is far above her maintenance requirement), so the sweep is a no-op and only the mark, the
+        // index blobs and CAROL's derived requirement move.
+        dex_call(
+            &mut ctx,
+            ORACLE,
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: PRICE - 10 * TICK,
+                timestamp: 3_645,
+            }
+            .abi_encode(),
+        );
+        let carol_ask = g_place(&mut ctx, CAROL, 1, PRICE - 19 * TICK, QTY, 0, 0);
+        assert_eq!(
+            order_status(&mut ctx, carol_ask),
+            OrderStatus::Open as u8,
+            "CAROL's ask must REST (it is above the surviving 80-tick bid), not fill"
+        );
+
         // Phase 10 — solvent exit + api-key delete (empty-blob fold).
         dex_call(
             &mut ctx,
@@ -4774,6 +4969,7 @@ mod golden {
                 bob_bid,
                 bob_tail_bid,
                 carol_close,
+                carol_ask,
             },
         );
         // #16d: the commitment is folded ONCE at block end. The snapshot above was read while the
@@ -4798,6 +4994,7 @@ mod golden {
         bob_bid: [u8; 32],
         bob_tail_bid: [u8; 32],
         carol_close: [u8; 32],
+        carol_ask: [u8; 32],
     }
 
     fn take_snapshot(ctx: &mut TestCtx, ids: &ScenarioOrderIds) -> BusinessSnapshot {
@@ -4902,6 +5099,7 @@ mod golden {
             bob_bid_status: order_status(ctx, ids.bob_bid),
             bob_tail_bid_status: order_status(ctx, ids.bob_tail_bid),
             carol_close_status: order_status(ctx, ids.carol_close),
+            carol_ask_status: order_status(ctx, ids.carol_ask),
         }
     }
 
@@ -8075,9 +8273,9 @@ mod risk_reducing_admission {
     ///
     /// EXTRA SCRUTINY (this admits an order we used to refuse): the loosening is bounded and
     /// guarded. `pos.margin` still fully backs the existing 2-lot long; the sells' own opening
-    /// margin is charged at FILL time out of the wallet (and the fill is refused, and the order
-    /// cancelled, if the wallet cannot fund it); and K9 still refuses any fill that would leave
-    /// the resulting position below maintenance. What is no longer charged is margin for a
+    /// margin is charged at FILL time out of the wallet (which is allowed to go negative if it
+    /// cannot cover it — Binance never sweeps an under-covered lien); and K9 still refuses any fill
+    /// that would leave the resulting position below maintenance. What is no longer charged is a
     /// worst-case exposure SMALLER than the one already margined — which was never a risk.
     #[test]
     fn b3_case3b_same_side_resting_orders_that_stay_inside_the_long_are_free() {
@@ -9073,7 +9271,9 @@ mod derived_ooim_divergence {
     fn oo_im_alice(ctx: &mut TestCtx) -> u64 {
         let m = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
         let p = storage::load_position(ctx, ALICE, MARKET_ID).unwrap();
-        position_open_order_margin(&m, &p).unwrap()
+        let priced =
+            crate::margin_view::stored_priced_position(ctx, ALICE, MARKET_ID, &m, &p).unwrap();
+        position_open_order_margin(&m, priced).unwrap()
     }
 
     // ── 1. Cross-side orders are charged the MAX of the two terminal exposures ───────────────
@@ -9136,17 +9336,22 @@ mod derived_ooim_divergence {
     /// never revisited (it was computed in QUANTITY space at the orders' LIMIT prices; the mark
     /// was not an input to it at all), so it sat frozen at 2_200_000 across this whole walk.
     ///
-    /// Long 1 lot, resting SELL 3 lots @ $110 (`Ask = 3_300_000`), leverage 1:
+    /// Long 1 lot, resting SELL 3 lots @ $110, leverage 1. Nothing has traded in this market, so
+    /// the Assuming-Price floor is `T = max(ROUND_UP(0 × 1.0015), mark) = mark`, and the SELL side
+    /// is charged at `max(T, $110)` — which means the mark enters `Ask` as well as `N`:
     ///
-    /// | mark | `N`       | `max(\|N+Bid\|, \|N−Ask\|)` | PIM       | ooIM      | (old escrow) |
-    /// |------|-----------|---------------------------|-----------|-----------|--------------|
-    /// | $100 | 1_000_000 | 2_300_000 (ask branch)    | 1_000_000 | 1_300_000 |    2_200_000 |
-    /// | $150 | 1_500_000 | 1_800_000 (ask branch)    | 1_500_000 |   300_000 |    2_200_000 |
-    /// | $200 | 2_000_000 | 2_000_000 (bid branch)    | 2_000_000 |         0 |    2_200_000 |
+    /// | mark | `N`       | `Ask`     | `max(\|N+Bid\|, \|N−Ask\|)` | PIM       | ooIM      | (old escrow) |
+    /// |------|-----------|-----------|---------------------------|-----------|-----------|--------------|
+    /// | $100 | 1_000_000 | 3_300_000 | 2_300_000 (ask branch)    | 1_000_000 | 1_300_000 |    2_200_000 |
+    /// | $150 | 1_500_000 | 4_500_000 | 3_000_000 (ask branch)    | 1_500_000 | 1_500_000 |    2_200_000 |
+    /// | $200 | 2_000_000 | 6_000_000 | 4_000_000 (ask branch)    | 2_000_000 | 2_000_000 |    2_200_000 |
     ///
-    /// At $200 the position has grown big enough that the resting sells are pure risk REDUCTION
-    /// and nothing is charged for them. **A 2× mark move swings the requirement from 1_300_000 to
-    /// 0 with no order and no fill.**
+    /// **The `Mark` branch of the Assuming Price is what makes the last two rows what they are.**
+    /// Priced at the orders' LIMIT price this walk read `1_300_000 → 300_000 → 0`: the growing long
+    /// swallowed the sells until they were pure risk REDUCTION and free. That is wrong — the
+    /// vendor formula is `max(Last × 1.0015, Mark, order price)`, so once the mark passes the
+    /// sell's limit the sell is repriced AT THE MARK, and while `Σ sell qty > position qty` the ask
+    /// branch grows with the mark forever. A sell 3× the position never becomes free.
     #[test]
     fn a_mark_move_reprices_the_requirement_with_no_order_and_no_fill() {
         let mut ctx = make_ctx();
@@ -9161,8 +9366,8 @@ mod derived_ooim_divergence {
         }
         assert_eq!(
             seen,
-            vec![1_300_000, 300_000, 0],
-            "ooIM 1_300_000 -> 300_000 -> 0 on the mark alone"
+            vec![1_300_000, 1_500_000, 2_000_000],
+            "ooIM 1_300_000 -> 1_500_000 -> 2_000_000 on the mark alone"
         );
     }
 
@@ -9242,7 +9447,10 @@ mod derived_ooim_divergence {
             // position sign is the single independent variable.
             let mut p = storage::load_position(&mut ctx, ALICE, MARKET_ID).unwrap();
             p.amount = lots * QTY as i64;
-            walk.push(position_open_order_margin(&m, &p).unwrap());
+            let priced =
+                crate::margin_view::stored_priced_position(&mut ctx, ALICE, MARKET_ID, &m, &p)
+                    .unwrap();
+            walk.push(position_open_order_margin(&m, priced).unwrap());
         }
         assert_eq!(
             walk,
@@ -9370,5 +9578,323 @@ mod derived_ooim_divergence {
             expect
         );
         assert_eq!(expect, 5_400_000, "900_000 × (1 + 2 + 3)");
+    }
+}
+
+// ── The Assuming Price: what a resting SELL is actually charged ──────────────────────────────
+//
+// `misc/binance-flip-and-admission.md` §1.6b / §3.4 and `misc/binance-margin-verified-model.md`
+// §1.5. A SHORT order's margin is priced at
+//
+//     Assuming Price = max(Last Price × 1.0015, Mark, order price)
+//
+// not at its own limit price (a LONG order carries no markup at all). Measured on mainnet twice
+// over: run9 refused eight admission probes exactly where the plateau `q × C / L` predicts and the
+// limit-price model predicted acceptance (strongest by 17× the noise floor), and R10 read Binance's
+// own reported `askNotional / q == limit × 1.0015` for a sell resting below `C`.
+mod assuming_price {
+    use super::*;
+    use crate::interface::IPerpDex::{liquidateCall, setLeverageCall};
+
+    /// The probe market: `base_decimals 5`, `price_decimals 2`, tick 10, step 1 — so
+    /// `calc_value(price, qty) == price × qty / 10` and every number below is exact.
+    fn setup_probe(ctx: &mut TestCtx) {
+        storage::save_admin(ctx, ADMIN).unwrap();
+        storage::save_market(
+            ctx,
+            &Market {
+                market_id: MARKET_ID,
+                base_decimals: 5,
+                price_decimals: 2,
+                tick_size: 10,
+                step_size: 1,
+                min_quantity: 1,
+                max_quantity: 1_000_000,
+                max_price: 100_000_000,
+                price_update_interval: 15,
+                active: true,
+                funding_interval: 0,
+                interest_rate: 0,
+                liquidation_fee_rate_bps: 0,
+                price_band_bps: 0,
+                mark_price: 100_000,
+                tiers: MarginTiers::default(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// ALICE long 6 @ $1000 at leverage 3 (margin 20_000, wallet 0), mark then dropped to 85_000
+    /// with the position still comfortably above maintenance. Returns nothing — every caller
+    /// continues from this state.
+    fn alice_long_at_85k(ctx: &mut TestCtx) {
+        setup_probe(ctx);
+        fund(ctx, BOB, 1_000_000);
+        fund(ctx, ALICE, 20_000);
+        crate::risk::run_set_leverage(
+            &setLeverageCall {
+                marketId: MARKET_ID,
+                leverage: 3,
+            }
+            .abi_encode(),
+            ALICE,
+            ctx,
+        )
+        .unwrap();
+
+        // BOB rests the ask, ALICE lifts it. The fill PRINTS at 100_000, which is what makes
+        // `lastTraded` 100_000 for the rest of the test.
+        place(ctx, BOB, 1, 100_000, 6, 0, 0);
+        place(ctx, ALICE, 0, 100_000, 6, 0, 0);
+        let p = pos(ctx, ALICE);
+        assert_eq!(
+            (p.amount, p.margin, p.v_quote_balance),
+            (6, 20_000, -60_000)
+        );
+        assert_eq!(wallet(ctx, ALICE), 0, "the whole wallet funded the margin");
+        assert_eq!(
+            storage::load_last_traded_price(ctx, MARKET_ID).unwrap(),
+            100_000
+        );
+
+        storage::save_mark_price(ctx, MARKET_ID, 85_000).unwrap();
+        // Still ABOVE maintenance: N = 51_000, equity = 51_000 − 60_000 + 20_000 = 11_000 against
+        // a requirement of 51_000/6 = 8_500. The liquidation attempt below is the proof — the whole
+        // scenario would be vacuous if the position were liquidatable.
+        assert!(
+            crate::risk::run_liquidate(
+                &liquidateCall {
+                    user: ALICE,
+                    marketId: MARKET_ID,
+                }
+                .abi_encode(),
+                BOB,
+                ctx,
+            )
+            .is_err(),
+            "the position must still be above maintenance"
+        );
+    }
+
+    /// **THE HOLE THIS CLOSES.** Selling exactly 2× the position mirrors the exposure, so at the
+    /// LIMIT price `|N − Ask| == |N|` exactly and `IM == PIM ⇒ ooIM == 0`: a wallet of ZERO could
+    /// rest an order that flips the position, for free.
+    ///
+    /// That band exists on Binance too — R7 got flipping sells accepted at `ooIM = 0E-8` — but
+    /// there it is NOT SIMULTANEOUSLY FILLABLE: a sell has to sit near the touch to fill, and near
+    /// the touch `Last × 1.0015` takes over the pricing and the markup bites. 「两者不可兼得」
+    /// (`binance-flip-and-admission.md` §1.6c). With limit-price aggregates and no markup, ours was
+    /// free AND fillable — a state Binance closes and we had opened. This is that state.
+    ///
+    /// ```text
+    /// N = 51_000 (6 @ mark 85_000), leverage 3, PIM = ROUND_UP(51_000/3) = 17_000
+    /// T = max(ROUND_UP(100_000 × 1.0015), 85_000) = max(100_150, 85_000) = 100_150
+    ///
+    /// at the LIMIT price      Ask = 12 × 85_000 /10 = 102_000 = 2|N| ⇒ IM = 17_000 ⇒ ooIM = 0
+    /// at the ASSUMING price   Ask = 12 × 100_150/10 = 120_180        ⇒ IM = ROUND_UP(69_180/3)
+    ///                                                                    = 23_060 ⇒ ooIM = 6_060
+    /// ```
+    #[test]
+    fn a_sell_of_twice_the_position_is_no_longer_free() {
+        // ── (a) at wallet 0 the order is now REFUSED ──
+        let mut ctx = make_ctx();
+        alice_long_at_85k(&mut ctx);
+        assert_eq!(available(&mut ctx, ALICE), 0);
+        let err = place_or_err(&mut ctx, ALICE, 1, 85_000, 12).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("insufficient perp wallet for margin"),
+            "{err}"
+        );
+        assert_eq!(oo_im(&mut ctx, ALICE), 0, "nothing rested");
+
+        // ── (b) the requirement is EXACTLY 6_060: refused at 6_059, accepted at 6_060 ──
+        let mut ctx = make_ctx();
+        alice_long_at_85k(&mut ctx);
+        fund(&mut ctx, ALICE, 6_059);
+        assert!(place_or_err(&mut ctx, ALICE, 1, 85_000, 12).is_err());
+        fund(&mut ctx, ALICE, 1);
+        place(&mut ctx, ALICE, 1, 85_000, 12, 0, 0);
+
+        // ── (c) and once it rests, the reported numbers are the Assuming-Price ones ──
+        assert_eq!(oo_im(&mut ctx, ALICE), 6_060);
+        assert_eq!(available(&mut ctx, ALICE), 0, "6_060 of 6_060 committed");
+        let p = pos(&mut ctx, ALICE);
+        assert_eq!(
+            p.total_sell_notional, 102_000,
+            "the maintained aggregate stays at the LIMIT price"
+        );
+        let i = margin_info(&mut ctx, ALICE);
+        assert_eq!(
+            i.askNotional, 120_180,
+            "but `Ask` — and therefore IM — is at the Assuming Price"
+        );
+        assert_eq!((i.notional, i.positionInitialMargin), (51_000, 17_000));
+        assert_eq!(i.initialMargin, 23_060);
+        assert_eq!(i.openOrderInitialMargin, 6_060);
+    }
+
+    /// The BOUNDARY, so the interior above is not the only thing recorded: a sell resting ABOVE
+    /// `T` is its own Assuming Price, the markup contributes nothing, and `Ask` is exactly the
+    /// maintained limit-price aggregate.
+    ///
+    /// Same position, sell 12 @ 150_000 (well above `T = 100_150`):
+    /// `Ask = 180_000`, `IM = ROUND_UP(|51_000 − 180_000| / 3) = 43_000`, `ooIM = 26_000`.
+    #[test]
+    fn a_sell_resting_above_the_assuming_floor_pays_exactly_its_own_notional() {
+        let mut ctx = make_ctx();
+        alice_long_at_85k(&mut ctx);
+        fund(&mut ctx, ALICE, 26_000);
+        place(&mut ctx, ALICE, 1, 150_000, 12, 0, 0);
+
+        let p = pos(&mut ctx, ALICE);
+        let i = margin_info(&mut ctx, ALICE);
+        assert_eq!(p.total_sell_notional, 180_000);
+        assert_eq!(
+            i.askNotional, p.total_sell_notional,
+            "above T the two bases coincide — no markup term at all"
+        );
+        assert_eq!(i.initialMargin, 43_000);
+        assert_eq!(oo_im(&mut ctx, ALICE), 26_000);
+        assert_eq!(available(&mut ctx, ALICE), 0);
+    }
+
+    /// A resting BUY is never marked up (`Assuming Price = Order's Price` for a long order), so the
+    /// bid aggregate and `bidNotional` agree to the unit even with the buy resting BELOW `T` —
+    /// which is where a sell would be repriced. This is the asymmetry, pinned.
+    #[test]
+    fn the_buy_side_carries_no_markup() {
+        let mut ctx = make_ctx();
+        alice_long_at_85k(&mut ctx);
+        // 6 @ 80_000 = 48_000 of notional; at leverage 3 the bid branch |N + Bid| = 99_000 gives
+        // IM = ROUND_UP(99_000/3) = 33_000, so ooIM = 16_000. Priced at `T = 100_150` the same
+        // order would have cost 60_090 of `Bid` and 3_030 more of ooIM.
+        fund(&mut ctx, ALICE, 16_000);
+        place(&mut ctx, ALICE, 0, 80_000, 6, 0, 0);
+
+        let p = pos(&mut ctx, ALICE);
+        let i = margin_info(&mut ctx, ALICE);
+        assert_eq!(p.total_buy_notional, 48_000);
+        assert_eq!(i.bidNotional, 48_000, "no markup on the buy side");
+        assert_eq!(i.initialMargin, 33_000);
+        assert_eq!(oo_im(&mut ctx, ALICE), 16_000);
+        assert_eq!(available(&mut ctx, ALICE), 0);
+    }
+
+    /// The markup is PER ORDER — `Σ qty × max(T, price)`, not a single adjustment to the total —
+    /// and the walk that finds the affected orders relies on the sell list being ASCENDING by
+    /// price, which is the invariant `mutate_sell_orders`' `partition_point(|e| e.price < price)`
+    /// maintains. Four sells of 4 straddling `T = 100_150`:
+    ///
+    /// ```text
+    ///  90_000 → lifted to T     100_000 → lifted to T
+    /// 100_150 → exactly T, unchanged      150_000 → above T, unchanged
+    ///
+    /// Ask (assuming) = 4·(100_150 + 100_150 + 100_150 + 150_000) / 10 = 180_180
+    /// Ask (limit)    = 4·( 90_000 + 100_000 + 100_150 + 150_000) / 10 = 176_060  ← the aggregate
+    /// ooIM = ROUND_UP(|51_000 − 180_180| / 3) − 17_000 = 43_060 − 17_000 = 26_060
+    ///        (at the limit price it would have been 41_687 − 17_000 = 24_687)
+    /// ```
+    #[test]
+    fn the_markup_applies_per_order_to_the_below_floor_prefix_only() {
+        let mut ctx = make_ctx();
+        alice_long_at_85k(&mut ctx);
+        fund(&mut ctx, ALICE, 1_000_000);
+        // Placed out of order on purpose: the list must end up ascending regardless.
+        for price in [150_000u64, 90_000, 100_150, 100_000] {
+            place(&mut ctx, ALICE, 1, price, 4, 0, 0);
+        }
+        let sells = storage::load_sell_orders(&mut ctx, ALICE, MARKET_ID).unwrap();
+        assert_eq!(
+            sells.iter().map(|e| e.price).collect::<Vec<_>>(),
+            vec![90_000, 100_000, 100_150, 150_000],
+            "the walk's precondition: ascending by price"
+        );
+
+        let p = pos(&mut ctx, ALICE);
+        assert_eq!(
+            p.total_sell_notional, 176_060,
+            "the limit-price aggregate is untouched by the markup"
+        );
+        assert_eq!(margin_info(&mut ctx, ALICE).askNotional, 180_180);
+        assert_eq!(
+            oo_im(&mut ctx, ALICE),
+            26_060,
+            "1_373 more than the 24_687 the limit-price basis would charge"
+        );
+    }
+
+    /// `lastTraded == 0` (nothing has ever printed) collapses `T` to the mark — the `Mark` branch
+    /// of the vendor `max()`, so no separate fallback is needed. A sell above the mark is then
+    /// unmarked, and one below it is charged AT THE MARK.
+    #[test]
+    fn before_the_first_trade_the_floor_is_the_mark() {
+        let mut ctx = make_ctx();
+        setup_probe(&mut ctx);
+        fund(&mut ctx, ALICE, 1_000_000);
+        assert_eq!(
+            storage::load_last_traded_price(&mut ctx, MARKET_ID).unwrap(),
+            0,
+            "nothing has traded"
+        );
+
+        // Above the 100_000 mark: unmarked.
+        place(&mut ctx, ALICE, 1, 110_000, 3, 0, 0);
+        assert_eq!(margin_info(&mut ctx, ALICE).askNotional, 33_000);
+
+        // A second sell BELOW the mark is lifted to the mark: 3 × 100_000/10 = 30_000 instead of
+        // 3 × 90_000/10 = 27_000.
+        place(&mut ctx, ALICE, 1, 90_000, 3, 0, 0);
+        assert_eq!(margin_info(&mut ctx, ALICE).askNotional, 33_000 + 30_000);
+        assert_eq!(
+            pos(&mut ctx, ALICE).total_sell_notional,
+            33_000 + 27_000,
+            "the limit-price aggregate is untouched"
+        );
+    }
+
+    // ── local helpers ────────────────────────────────────────────────────────────────────────
+
+    fn place_or_err(
+        ctx: &mut TestCtx,
+        caller: Address,
+        side: u8,
+        price: u64,
+        qty: u64,
+    ) -> Result<Bytes, PerpError> {
+        let input = placeOrderCall {
+            marketId: MARKET_ID,
+            side,
+            price,
+            quantity: qty,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
+        run_place_order(&input, caller, ctx)
+    }
+
+    fn margin_info(
+        ctx: &mut TestCtx,
+        user: Address,
+    ) -> crate::interface::IPerpDex::getMarginInfoReturn {
+        let info = crate::margin_view::compute_margin_info(ctx, user, MARKET_ID).unwrap();
+        crate::interface::IPerpDex::getMarginInfoReturn {
+            markPrice: info.mark_price,
+            positionAmt: info.position_amt,
+            vQuoteBalance: info.v_quote_balance,
+            leverage: info.leverage,
+            bidNotional: info.bid_notional,
+            askNotional: info.ask_notional,
+            notional: info.notional,
+            unrealizedProfit: info.unrealized_profit,
+            isolatedMargin: info.isolated_margin,
+            positionInitialMargin: info.position_initial_margin,
+            openOrderInitialMargin: info.open_order_initial_margin,
+            initialMargin: info.initial_margin,
+            maintMargin: info.maint_margin,
+            positionMargin: info.position_margin,
+        }
     }
 }

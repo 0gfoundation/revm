@@ -127,6 +127,23 @@ impl TakerSettlement {
     /// The old step 2, "recompute `margin_reserved`", is gone with the escrow: the fill's effect
     /// on the taker's remaining open-order requirement is picked up on the next `ooIM` evaluation
     /// from the new `pos.amount`, with no stored field to reconcile.
+    ///
+    /// # Why the taker leg carries NO `Last × 1.0015` markup
+    ///
+    /// Binance gates a MARKET order at `Last Price × 1.0015` on both sides, but escrows nothing
+    /// against it: the measured debit is `Ne / L` at the FILL price, digit for digit, so the markup
+    /// 「过闸即消失」 and its only function is a SLIPPAGE ALLOWANCE
+    /// (`misc/binance-flip-and-admission.md` §3.8). It exists because their admission runs before
+    /// the match, against an unknown fill price.
+    ///
+    /// Ours does not. Every taker path — market, IOC, FOK, and a GTC's crossing portion — matches
+    /// FIRST and gates SECOND, on `core.total_required`, which is the realised draw at the realised
+    /// fill prices, inside the same call. There is no window between the gate and the fill for
+    /// slippage to open, so a 15 bps allowance on top of a number we already know exactly would only
+    /// refuse orders we can see are affordable. It is deliberately NOT implemented; the markup lives
+    /// solely on the RESTING side, where the fill price genuinely is unknown at admission
+    /// (`margin_view::assuming_price_floor`). Market/IOC/FOK remainders never rest
+    /// (`rest_remainder = false`), so they contribute nothing to `Bid`/`Ask` either.
     pub(super) fn finalize_compute<H: PerpHost>(
         self,
         context: &mut H,
@@ -157,21 +174,41 @@ impl TakerSettlement {
             // registry working copy if the walk already touched it (a self-match maker the K9 guard
             // cancelled — the flush writes exactly that copy, funding included), else storage.
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            let (pos, wallet) = match reg.user_work(self.user) {
-                Some(w) => (
-                    work_position_snapshot(w, bd, pd)?,
-                    w.account.perp_wallet_balance,
-                ),
-                None => (
-                    (*storage::load_position_ref(context, self.user, self.market_id)?).clone(),
-                    storage::load_account_ref(context, self.user)?.perp_wallet_balance,
-                ),
+            // The Assuming-Price floor for this market, resolved once and shared by every ooIM
+            // evaluation below so no two of them price the same book at a different `T`.
+            let floor = crate::margin_view::assuming_price_floor(context, self.market_id, market)?;
+            let (pos, ask, wallet) = match reg.user_work(self.user) {
+                Some(w) => {
+                    let pos = work_position_snapshot(w, bd, pd)?;
+                    let ask = crate::margin_view::entries_ask_assuming(
+                        market,
+                        floor,
+                        &w.sell_entries,
+                        pos.total_sell_notional,
+                    )?;
+                    (pos, ask, w.account.perp_wallet_balance)
+                }
+                None => {
+                    let pos =
+                        (*storage::load_position_ref(context, self.user, self.market_id)?).clone();
+                    let ask = crate::margin_view::stored_ask_assuming(
+                        context,
+                        self.user,
+                        self.market_id,
+                        market,
+                        &pos,
+                    )?;
+                    let wallet = storage::load_account_ref(context, self.user)?.perp_wallet_balance;
+                    (pos, ask, wallet)
+                }
             };
             let affordable = rest_is_affordable(
                 context,
                 self.user,
                 self.market_id,
                 &pos,
+                ask,
+                floor,
                 wallet,
                 taker_side,
                 r,
@@ -213,10 +250,25 @@ impl TakerSettlement {
         // storage after the flush, so the pre-flush decision and the post-flush one agree.
         let (bd, pd) = (market.base_decimals, market.price_decimals);
         let after_fills = work_position_snapshot(w, bd, pd)?;
+        // One `T` for every ooIM evaluation on this path (see the zero-fill arm above). `Ask` is
+        // folded from the WORKING sell list, which is the authoritative record of what the walk has
+        // consumed — and, unlike `total_sell_notional`, has to be re-priced at `T`.
+        let floor = crate::margin_view::assuming_price_floor(context, self.market_id, market)?;
+        let ask_fills = crate::margin_view::entries_ask_assuming(
+            market,
+            floor,
+            &w.sell_entries,
+            after_fills.total_sell_notional,
+        )?;
         let rest_delta = match &rest {
             Some(r) => {
-                let after_rest = with_rest_entry(&after_fills, taker_side, r, bd, pd)?;
-                crate::margin_view::derived_requirement_delta(market, &after_fills, &after_rest)?
+                let (after_rest, ask_rest) =
+                    with_rest_entry(&after_fills, ask_fills, floor, taker_side, r, bd, pd)?;
+                crate::margin_view::derived_requirement_delta(
+                    market,
+                    crate::margin_view::PricedPosition::new(&after_fills, ask_fills),
+                    crate::margin_view::PricedPosition::new(&after_rest, ask_rest),
+                )?
             }
             None => 0,
         };
@@ -228,7 +280,10 @@ impl TakerSettlement {
             context,
             self.user,
             Some(wallet),
-            Some((self.market_id, &after_fills)),
+            Some((
+                self.market_id,
+                crate::margin_view::PricedPosition::new(&after_fills, ask_fills),
+            )),
         )?;
 
         // LEVEL 1 fast path (the common case): the available already covers fills + rest with NO
@@ -246,11 +301,22 @@ impl TakerSettlement {
             let mut sim_buy = w.buy_entries.clone();
             let mut sim_sell = w.sell_entries.clone();
             loop {
+                // Re-fold `Ask` at the same `T` after every simulated cancel: a cancelled SELL
+                // takes its uplift with it.
+                let sim_ask = crate::margin_view::entries_ask_assuming(
+                    market,
+                    floor,
+                    &sim_sell,
+                    sim_pos.total_sell_notional,
+                )?;
                 let avail = crate::margin_view::derived_available_balance_with(
                     context,
                     self.user,
                     Some(wallet),
-                    Some((self.market_id, &sim_pos)),
+                    Some((
+                        self.market_id,
+                        crate::margin_view::PricedPosition::new(&sim_pos, sim_ask),
+                    )),
                 )?;
                 if crate::margin_view::derived_can_afford(avail, core.total_required as i128) {
                     break;
@@ -279,14 +345,27 @@ impl TakerSettlement {
                         "settlement: taker total required",
                     )?)
                     .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
-                let after_rest = with_rest_entry(&sim_pos, taker_side, r, bd, pd)?;
-                let delta =
-                    crate::margin_view::derived_requirement_delta(market, &sim_pos, &after_rest)?;
+                let sim_ask = crate::margin_view::entries_ask_assuming(
+                    market,
+                    floor,
+                    &sim_sell,
+                    sim_pos.total_sell_notional,
+                )?;
+                let (after_rest, ask_rest) =
+                    with_rest_entry(&sim_pos, sim_ask, floor, taker_side, r, bd, pd)?;
+                let delta = crate::margin_view::derived_requirement_delta(
+                    market,
+                    crate::margin_view::PricedPosition::new(&sim_pos, sim_ask),
+                    crate::margin_view::PricedPosition::new(&after_rest, ask_rest),
+                )?;
                 let avail = crate::margin_view::derived_available_balance_with(
                     context,
                     self.user,
                     Some(wallet_after),
-                    Some((self.market_id, &sim_pos)),
+                    Some((
+                        self.market_id,
+                        crate::margin_view::PricedPosition::new(&sim_pos, sim_ask),
+                    )),
                 )?;
                 if !crate::margin_view::derived_can_afford(avail, delta) {
                     return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
@@ -351,21 +430,40 @@ fn work_position_snapshot(
     Ok(pos)
 }
 
-/// `pos` with the taker's would-be resting remainder folded into `Bid`/`Ask` — the hypothetical
-/// the rest gate prices. No list is materialised: the requirement reads only the aggregates, and
-/// the order contributes exactly the per-order-floored `calc_value` term it would add to the fold.
+/// `(pos, Ask)` with the taker's would-be resting remainder folded in — the hypothetical the rest
+/// gate prices. No list is materialised: the requirement reads only the aggregates plus the
+/// Assuming-Price `Ask`, and the order contributes exactly the per-order-floored `calc_value` term
+/// it would add to each fold.
+///
+/// The two folds use DIFFERENT prices for a resting SELL: `total_sell_notional` grows by
+/// `calc_value(price, qty)` (it is the limit-price baseline every other maintainer keeps), while
+/// `Ask` grows by `calc_value(max(T, price), qty)` — the Assuming Price. A sell resting at or below
+/// `T` therefore requires strictly more than its own notional implies.
 fn with_rest_entry(
     pos: &crate::types::PerpPosition,
+    ask_assuming: u64,
+    assuming_floor: u64,
     taker_side: Side,
     rest: &RestReq,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<crate::types::PerpPosition, PerpError> {
+) -> Result<(crate::types::PerpPosition, u64), PerpError> {
     let notional = calc_value(rest.price, rest.qty, base_decimals, price_decimals)?;
     let mut after = pos.clone();
+    let mut ask_after = ask_assuming;
     let (qty_field, notional_field) = match taker_side {
         Side::Buy => (&mut after.total_buy_qty, &mut after.total_buy_notional),
-        Side::Sell => (&mut after.total_sell_qty, &mut after.total_sell_notional),
+        Side::Sell => {
+            ask_after = ask_after
+                .checked_add(calc_value(
+                    rest.price.max(assuming_floor),
+                    rest.qty,
+                    base_decimals,
+                    price_decimals,
+                )?)
+                .ok_or_else(|| perp_err("placeOrder: rest assuming-price ask overflow"))?;
+            (&mut after.total_sell_qty, &mut after.total_sell_notional)
+        }
     };
     *qty_field = qty_field
         .checked_add(rest.qty)
@@ -373,7 +471,7 @@ fn with_rest_entry(
     *notional_field = notional_field
         .checked_add(notional)
         .ok_or_else(|| perp_err("placeOrder: rest notional overflow"))?;
-    Ok(after)
+    Ok((after, ask_after))
 }
 
 /// Can `rest` be admitted from this state? The zero-fill arm of
@@ -383,24 +481,35 @@ fn with_rest_entry(
 /// The formula is `rest_in_book`'s own — `derived_available >= Δ ooIM`, evaluated over the same
 /// hypothetical `Bid`/`Ask` — on the same state. Being the same test on the same state is what
 /// makes the pre-flush reject sound: `rest_in_book`'s later check cannot then fire post-write.
+#[allow(clippy::too_many_arguments)]
 fn rest_is_affordable<H: PerpHost>(
     context: &mut H,
     user: Address,
     market_id: u64,
     pos: &crate::types::PerpPosition,
+    ask_assuming: u64,
+    assuming_floor: u64,
     wallet: i64,
     taker_side: Side,
     rest: &RestReq,
     market: &crate::types::Market,
 ) -> Result<bool, PerpError> {
     let (bd, pd) = (market.base_decimals, market.price_decimals);
-    let after = with_rest_entry(pos, taker_side, rest, bd, pd)?;
-    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
+    let (after, ask_after) =
+        with_rest_entry(pos, ask_assuming, assuming_floor, taker_side, rest, bd, pd)?;
+    let delta = crate::margin_view::derived_requirement_delta(
+        market,
+        crate::margin_view::PricedPosition::new(pos, ask_assuming),
+        crate::margin_view::PricedPosition::new(&after, ask_after),
+    )?;
     let available = crate::margin_view::derived_available_balance_with(
         context,
         user,
         Some(wallet),
-        Some((market_id, pos)),
+        Some((
+            market_id,
+            crate::margin_view::PricedPosition::new(pos, ask_assuming),
+        )),
     )?;
     Ok(crate::margin_view::derived_can_afford(available, delta))
 }
@@ -465,15 +574,17 @@ pub(super) fn finalize_apply<H: PerpHost>(
 pub(super) enum MakerFillOutcome {
     /// The fill was applied; carries the maker's trading fee.
     Filled { maker_fee: u64 },
-    /// The fill was NOT applied and the caller must cancel the maker order. Three triggers, all
+    /// The fill was NOT applied and the caller must cancel the maker order. TWO triggers, both
     /// meaning "this maker cannot take this fill":
     ///
     /// 1. it would open/increase the position below the maintenance-margin threshold at the
     ///    current mark (K9);
-    /// 2. it would open at a leverage the resulting size's margin tier no longer permits;
-    /// 3. **the maker's wallet cannot fund the opening margin.** New with the escrow removal —
-    ///    placement no longer withholds that capital, so it has to be there at fill time and may
-    ///    not be. See the long note in [`settle_maker_fill_core`].
+    /// 2. it would open at a leverage the resulting size's margin tier no longer permits.
+    ///
+    /// A wallet SHORTFALL is deliberately NOT in this list: the fill happens and the wallet goes
+    /// negative (Binance never sweeps an under-covered lien — see the long note in
+    /// [`settle_maker_fill_core`]). This channel is for fills that would leave an INSOLVENT
+    /// POSITION, which is a different question from an under-funded wallet.
     ///
     /// Funding accrued on the maker's position IS settled and persisted regardless (it is owed
     /// whether or not the fill happens, and may already have touched the Insurance Fund inline).
@@ -1232,7 +1343,7 @@ pub(super) fn settle_maker_fill_core(
         .checked_sub(from_wallet_i64)
         .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
 
-    // ── Opening margin now comes out of the WALLET, at fill time ──────────────────────────────
+    // ── Opening margin comes out of the WALLET at fill time, EVEN IF THE WALLET GOES NEGATIVE ──
     // Under the escrow this was free here: `apply_position_fill` added `opening_margin` to
     // `pos.margin` and the money came from `old_reserved`, the capital placement had already
     // withheld. Nothing is withheld any more, so the wallet has to fund it NOW — and the money may
@@ -1241,22 +1352,47 @@ pub(super) fn settle_maker_fill_core(
     // (which values the position leg at MARK and nets the close a fill performs) is not an upper
     // bound on the fill's actual draw in the first place.
     //
-    // A short maker is REJECTED, not underfunded: letting `trial_wallet` go negative would back
-    // real position margin with a wallet debt nothing tracks. The reject reuses the K9 channel —
-    // `RejectedInsolvent` → the caller cancels the maker order (`cancel_rejected_maker_registry`)
-    // and the taker walks on to the next maker — so one unfundable maker never aborts the match.
+    // # The fill HAPPENS. Why this is not a reject
     //
-    // Gated on `trial_wallet`, i.e. AFTER this fill's own close proceeds have landed: a flip
-    // legitimately funds its opening leg out of the closing leg's released margin and profit.
-    // A zero draw is always affordable, even from a negative wallet (the B1 invariant): a pure
-    // close opens nothing and must never be blocked.
+    // MEASURED, and it does not depend on the open modelling question below: Binance lets an
+    // open-order lien sit UNDER-COVERED and never sweeps it. At
+    // `crossWalletBalance − totalOpenOrderInitialMargin = −0.00085981` an already-resting order
+    // stayed `status = 'NEW'` for the whole observation window while, IN THE SAME INSTANT, a NEW
+    // order was refused `-2019`. The doc's verdict: 「预留是一笔留置权,交易所允许它被欠覆盖,也不做
+    // 任何清扫。订单只在清算时死。对我们的引擎:不需要实现挂单的中途拆除逻辑。」
+    // (`misc/binance-margin-verified-model.md` §1.6, "保证金只在下单那一刻校验"). Admission is
+    // checked once, at placement; after that the only thing that kills an order is LIQUIDATION.
+    //
+    // This code used to return `RejectedInsolvent` here, which cancelled the maker order and let
+    // the taker walk on. That is model **M2 ("don't fill")** in
+    // `misc/binance-flip-and-admission.md` §3.3 — and BOTH live candidates for what Binance does
+    // (M1 and M1′) FILL. So cancelling was wrong under either.
+    //
+    // # Where the deficit lands — 🔶 CONJECTURE, not measurement
+    //
+    // §3.3 marks its working model **M1′** (silo funded in full, `availableBalance`'s TRUE value
+    // goes negative, the reported value clamped at 0) an explicit conjecture pending a v4
+    // experiment, with the author ~50/50 between it and **M1** (silo funded SHORT, available stays
+    // 0). Nine rounds have produced exactly one flipping fill and it was fully funded (M0), so the
+    // underfunded case has never been observed. Do not read the code below as measured fact.
+    //
+    // We implement M1′, which for us is the code that was already here: `perp_wallet_balance` is
+    // `i64` and `visible_perp_wallet_balance()` clamps at the ABI boundary — internally signed,
+    // externally floored — the exact shape of Binance's true-negative/reported-zero
+    // `availableBalance`. If v4 lands on M1 instead, the change is a `min(available)` clamp on
+    // `opening_margin` in `apply_position_fill`; small, but semantically opposite, so it must not
+    // be pre-empted.
+    //
+    // The debit is NOT optional. Dropping it would fund `pos.margin` from nowhere — a mint, which
+    // the conservation fuzz catches immediately.
+    //
+    // Applied to `trial_wallet`, i.e. AFTER this fill's own close proceeds have landed: a flip
+    // legitimately funds its opening leg out of the closing leg's released margin and profit, so
+    // most flips never go negative at all.
     let opening_margin_i64 = checked_u64_to_i64(
         fill_outcome.opening_margin,
         "settlement: maker opening margin",
     )?;
-    if opening_margin_i64 > 0 && trial_wallet < opening_margin_i64 {
-        return Ok(MakerFillCore::RejectedInsolvent);
-    }
     trial_wallet = trial_wallet
         .checked_sub(opening_margin_i64)
         .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;

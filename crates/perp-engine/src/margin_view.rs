@@ -15,6 +15,9 @@
 //! delta — but its ANSWER now decides accept/reject.
 //!
 //! ```text
+//! T              = max(ROUND_UP(lastTraded × 1.0015), mark)      the Assuming-Price floor
+//! Bid            = Σ resting buys  qty × limit                   (longs carry no markup)
+//! Ask            = Σ resting sells qty × max(T, limit)           (shorts do)
 //! ooIM(market)   = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) − ROUND_UP(|N| / L)
 //! available      = perp_wallet_balance − Σ_markets ooIM(market)
 //! ```
@@ -22,6 +25,14 @@
 //! summed over the per-user market index (the only enumerable set of a user's markets).
 //! `perp_wallet_balance` is the analogue of Binance's `crossWalletBalance`: position margin has
 //! been physically moved out of it, the open-order requirement has NOT.
+//!
+//! # `Ask` is NOT mark-independent
+//!
+//! `T` contains the mark, so the sell-side aggregate moves with it. The earlier design note that
+//! `Bid`/`Ask` are mark-independent inputs safe to cache (`engineering/derived-ooim-plan.md` §2)
+//! is therefore FALSE for the sell side, and nothing here may rely on it: `Ask` is refolded from
+//! the resting sell list on every evaluation, at the current `T`. Only `Bid` and the maintained
+//! `total_sell_notional` baseline are mark-independent.
 //!
 //! # Formula source
 //!
@@ -40,7 +51,10 @@ use crate::{
     interface::IPerpDex::{
         getAccountMarginCall, getAccountMarginReturn, getMarginInfoCall, getMarginInfoReturn,
     },
-    math::{calc_value_i64, checked_u64_to_i64, maintenance_margin, open_order_margin},
+    math::{
+        ask_notional_at_assuming_price, calc_value_i64, checked_u64_to_i64, maintenance_margin,
+        open_order_margin,
+    },
     storage, PerpError,
 };
 
@@ -78,9 +92,13 @@ pub struct MarginInfo {
     pub v_quote_balance: i64,
     /// Position leverage, floored at 1.
     pub leverage: u64,
-    /// `Bid` — Σ `qty × LIMIT price` over the user's resting BUYS in this market.
+    /// `Bid` — Σ `qty × LIMIT price` over the user's resting BUYS in this market (a long order's
+    /// Assuming Price is its limit price, so there is no markup here).
     pub bid_notional: u64,
-    /// `Ask` — the same over resting SELLS.
+    /// `Ask` — Σ `qty × max(T, LIMIT price)` over resting SELLS, `T` =
+    /// [`crate::math::assuming_price_floor`]. The ASSUMING-price aggregate, not the limit-price one:
+    /// mainnet R10 measured Binance's own reported `askNotional / q == limit × 1.0015` for a sell
+    /// resting below `T`.
     pub ask_notional: u64,
     // ── derived, Binance formulas ──
     /// `N = trunc(|positionAmt| × markPrice)`.
@@ -101,6 +119,35 @@ pub struct MarginInfo {
     pub position_margin: i64,
 }
 
+/// A position paired with the `Ask` aggregate that prices its resting SELLS at the **Assuming
+/// Price** — the two inputs every ooIM evaluation needs.
+///
+/// `pos.total_sell_notional` is the same fold at each order's LIMIT price and is NOT usable as
+/// `Ask`: a sell resting at or below `T = max(ROUND_UP(lastTraded × 1.0015), mark)` is charged at
+/// `T`, not at its own price (mainnet-measured; see [`crate::math::assuming_price_floor`]). Pairing
+/// the two in one value is what stops a caller silently passing the cheaper aggregate — there is no
+/// entry point that takes a bare `&PerpPosition` any more.
+///
+/// Build it with [`stored_ask_assuming`] (the user's list as stored), [`entries_ask_assuming`] (a
+/// match working copy), or by adding one `Σ` term for a hypothetical extra resting sell —
+/// [`assuming_price_floor`] gives the `T` such a term must use.
+#[derive(Clone, Copy, Debug)]
+pub struct PricedPosition<'a> {
+    /// The position, whose `amount`/`leverage`/`total_buy_notional` supply `N`, `L` and `Bid`.
+    pub pos: &'a crate::types::PerpPosition,
+    /// `Ask` = `Σ_i calc_value(max(T, price_i), qty_i)` over the resting SELL list this
+    /// hypothetical implies.
+    pub ask_assuming: u64,
+}
+
+impl<'a> PricedPosition<'a> {
+    /// Pair a position with an already-computed Assuming-Price `Ask`.
+    #[inline]
+    pub fn new(pos: &'a crate::types::PerpPosition, ask_assuming: u64) -> Self {
+        Self { pos, ask_assuming }
+    }
+}
+
 /// The derived open-order requirement for ONE `(market, position)` pair, computed from
 /// IN-MEMORY values only — no storage access.
 ///
@@ -109,17 +156,17 @@ pub struct MarginInfo {
 /// the in-memory post-operation position they are about to write. Anything that needs an ooIM and
 /// does not come through here is a second implementation and must be deleted.
 ///
-/// `Bid`/`Ask` come from the maintained per-side aggregates on `pos` (proven equal to the
-/// resting-order fold; see [`compute_margin_info`]), `N` from `pos.amount` at `market.mark_price`,
-/// and `L` from `pos.leverage` — UNCAPPED by the tier table (see the "Why no tier cap" note on
-/// [`crate::math::open_order_margin`]).
+/// `Bid` comes from the maintained buy-side aggregate on `pos` (proven equal to the resting-order
+/// fold; see [`compute_margin_info`]), `Ask` from the caller's [`PricedPosition`], `N` from
+/// `pos.amount` at `market.mark_price`, and `L` from `pos.leverage` — UNCAPPED by the tier table
+/// (see the "Why no tier cap" note on [`crate::math::open_order_margin`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PositionDerivedMargin {
     /// `N` — signed position notional at MARK, truncated toward zero.
     pub signed_notional: i64,
     /// `Bid` — Σ (remaining qty × LIMIT price) over resting buys.
     pub bid_notional: u64,
-    /// `Ask` — the same over resting sells.
+    /// `Ask` — Σ (remaining qty × max(T, LIMIT price)) over resting sells.
     pub ask_notional: u64,
     /// PIM / IM / ooIM at the position's own leverage.
     pub margin: crate::math::OpenOrderMargin,
@@ -128,15 +175,16 @@ pub struct PositionDerivedMargin {
 /// Compute [`PositionDerivedMargin`] for one `(market, position)`. Pure function, no storage.
 pub fn position_derived_margin(
     market: &crate::types::Market,
-    pos: &crate::types::PerpPosition,
+    priced: PricedPosition<'_>,
 ) -> Result<PositionDerivedMargin, PerpError> {
+    let pos = priced.pos;
     let signed_notional = calc_value_i64(
         market.mark_price,
         pos.amount,
         market.base_decimals,
         market.price_decimals,
     )?;
-    let (bid_notional, ask_notional) = (pos.total_buy_notional, pos.total_sell_notional);
+    let (bid_notional, ask_notional) = (pos.total_buy_notional, priced.ask_assuming);
     Ok(PositionDerivedMargin {
         signed_notional,
         bid_notional,
@@ -156,11 +204,89 @@ pub fn position_derived_margin(
 #[inline]
 pub fn position_open_order_margin(
     market: &crate::types::Market,
-    pos: &crate::types::PerpPosition,
+    priced: PricedPosition<'_>,
 ) -> Result<u64, PerpError> {
-    Ok(position_derived_margin(market, pos)?
+    Ok(position_derived_margin(market, priced)?
         .margin
         .open_order_initial_margin)
+}
+
+// ── Assuming-Price resolution (the sell side's price floor and the aggregate it implies) ──────
+
+/// `T` for one market: `max(ROUND_UP(lastTraded × 1.0015), mark)`.
+///
+/// `lastTraded` is our analogue of Binance's `Last Price`: the doc is explicit that Last Price is
+/// "市场最新成交价" — the market's latest TRADED price from `/fapi/v1/ticker/price`, not the mark,
+/// not the index, and not the caller's own fill (`misc/binance-flip-and-admission.md` §1.6b, final
+/// ⚠). `MarketHot::last_traded` is exactly that: written by the match loop with the last executed
+/// price of every match, and already consumed under the name "contract price" as the third input to
+/// the mark-price median. The index price and `PriceBasisWindow` are oracle/top-of-book series, not
+/// trade prints, so neither is the right input.
+///
+/// Costs one `MarketHot` load (cache-fill, never dirty-marking, so it enters no key into the block
+/// delta). The mark comes off the already-threaded `Market`.
+pub fn assuming_price_floor<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    market: &crate::types::Market,
+) -> Result<u64, PerpError> {
+    let last_traded = storage::load_market_hot(context, market_id)?.last_traded;
+    crate::math::assuming_price_floor(last_traded, market.mark_price)
+}
+
+/// `Ask` at the Assuming Price over an IN-MEMORY sell list (a match working copy, or a simulated
+/// post-cancel list). Pure — the caller supplies both `T` and the list.
+///
+/// `total_sell_notional` must be the limit-price fold of the SAME list (the maintained aggregate),
+/// since the uplift is added on top of it.
+#[inline]
+pub fn entries_ask_assuming(
+    market: &crate::types::Market,
+    assuming_floor: u64,
+    sells_ascending: &std::collections::VecDeque<crate::types::OrderEntry>,
+    total_sell_notional: u64,
+) -> Result<u64, PerpError> {
+    ask_notional_at_assuming_price(
+        sells_ascending.iter().copied(),
+        total_sell_notional,
+        assuming_floor,
+        market.base_decimals,
+        market.price_decimals,
+    )
+}
+
+/// `Ask` at the Assuming Price over the user's STORED sell list for one market.
+///
+/// `pos` supplies the `total_sell_notional` baseline (and the `total_sell_qty == 0` shortcut that
+/// keeps a user with no resting sells from paying for a list load at all — by far the common case
+/// across the market index).
+pub fn stored_ask_assuming<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    market: &crate::types::Market,
+    pos: &crate::types::PerpPosition,
+) -> Result<u64, PerpError> {
+    if pos.total_sell_qty == 0 {
+        // No resting sells ⇒ `Ask = 0` whatever `T` is. The aggregate/list agreement this leans on
+        // is the same one `compute_margin_info`'s debug oracle checks after every transition.
+        return Ok(0);
+    }
+    let floor = assuming_price_floor(context, market_id, market)?;
+    let sells = storage::load_sell_orders_ref(context, user, market_id)?;
+    entries_ask_assuming(market, floor, &sells, pos.total_sell_notional)
+}
+
+/// [`stored_ask_assuming`] paired with the position it prices.
+pub fn stored_priced_position<'a, H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    market: &crate::types::Market,
+    pos: &'a crate::types::PerpPosition,
+) -> Result<PricedPosition<'a>, PerpError> {
+    let ask = stored_ask_assuming(context, user, market_id, market, pos)?;
+    Ok(PricedPosition::new(pos, ask))
 }
 
 /// Compute [`MarginInfo`] for one `(user, market)`. Pure: reads only, no writes.
@@ -181,19 +307,22 @@ pub fn compute_margin_info<H: PerpHost>(
     let leverage = pos.leverage.max(1);
 
     // ── Bid / Ask ────────────────────────────────────────────────────────────────────────
-    // `Bid = Σ (remaining buy qty × that order's LIMIT price)` — the LIMIT price, not the mark —
-    // and `Ask` the same over sells. Read O(1) off the maintained per-side aggregates
-    // (`total_buy_notional` / `total_sell_notional`) rather than re-folding the lists: those
-    // aggregates ARE Bid/Ask by construction (same per-order-floored `calc_value` terms), and the
-    // property test `side_aggregates_are_exactly_bid_and_ask_after_every_operation` proves it
-    // holds after every transition, with the list fold as the independent ground truth. The
-    // `debug_assert` below keeps the fold as a live oracle at zero release cost.
+    // `Bid = Σ (remaining buy qty × that order's LIMIT price)` — the LIMIT price, not the mark,
+    // because a LONG order's Assuming Price IS its limit price (no markup). Read O(1) off the
+    // maintained `total_buy_notional` aggregate rather than re-folding the list: that aggregate IS
+    // `Bid` by construction (same per-order-floored `calc_value` terms), and the property test
+    // `side_aggregates_are_exactly_bid_and_ask_after_every_operation` proves it holds after every
+    // transition, with the list fold as the independent ground truth.
+    //
+    // `Ask` is NOT the mirror image. A SHORT order is priced at `max(T, limit)`, so the sell side
+    // has to be re-folded from the list at the current `T` — `total_sell_notional` is only the
+    // baseline the uplift is added to. See `stored_ask_assuming`.
     //
     // Binance warns that its OWN `bidNotional`/`askNotional` are not reproducible from
     // `qty × price` (two arithmetic paths coexist server-side, 1e-5 apart) and must be read
     // from the response body. We have no such split: this IS the definition, evaluated once.
     let bid_notional = pos.total_buy_notional;
-    let ask_notional = pos.total_sell_notional;
+    let ask_notional = stored_ask_assuming(context, user, market_id, &market, &pos)?;
     #[cfg(debug_assertions)]
     {
         let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
@@ -203,10 +332,28 @@ pub fn compute_margin_info<H: PerpHost>(
         let (_, ask_fold) =
             sum_side_totals(sell_entries.iter().copied(), base_decimals, price_decimals)?;
         debug_assert_eq!(
-            (bid_notional, ask_notional),
+            (bid_notional, pos.total_sell_notional),
             (bid_fold, ask_fold),
-            "getMarginInfo: maintained (Bid, Ask) for {user} market {market_id} diverged from the \
-             resting-order fold"
+            "getMarginInfo: maintained (Bid, limit-price Ask) for {user} market {market_id} \
+             diverged from the resting-order fold"
+        );
+        // The Assuming-Price fold, checked against the direct `Σ max(T, price)` form the
+        // prefix-walk optimisation is supposed to equal. Catches a mis-sorted list: the walk breaks
+        // at the first entry priced >= T, so a descending or unsorted list would under-charge here.
+        let floor = assuming_price_floor(context, market_id, &market)?;
+        let mut direct: u64 = 0;
+        for e in sell_entries.iter() {
+            direct += crate::math::calc_value(
+                e.price.max(floor),
+                e.amount,
+                base_decimals,
+                price_decimals,
+            )?;
+        }
+        debug_assert_eq!(
+            ask_notional, direct,
+            "getMarginInfo: Assuming-Price Ask for {user} market {market_id} diverged from the \
+             direct max(T, price) fold — is the sell list still ascending by price?"
         );
     }
 
@@ -266,14 +413,15 @@ pub fn compute_margin_info<H: PerpHost>(
     // the one the branch SEMANTICS force ("多头暴露 / 空头暴露"): for a short, unsigned `N` would
     // make `|N − Ask|` understate the very exposure the ask branch exists to measure.
     //
-    // NOTE this deliberately mixes bases: `N` is at MARK, `Bid`/`Ask` are at each order's LIMIT
-    // price. That is Binance's formula, and this layer reports Binance's numbers.
+    // NOTE this deliberately mixes bases: `N` is at MARK, `Bid` at each buy's LIMIT price, `Ask` at
+    // each sell's ASSUMING price. That is Binance's formula, and this layer reports Binance's
+    // numbers.
     //
     // At the position's OWN leverage, UNCAPPED by the tier table: Binance derives `initialMargin`
     // from the position's `leverage` field. There is only one ooIM definition — this is the same
     // number the admission gate enforces, not a parallel "reported" one.
-    let derived =
-        position_derived_margin(&market, &pos).map_err(|e| relabel_derived(e, "getMarginInfo"))?;
+    let derived = position_derived_margin(&market, PricedPosition::new(&pos, ask_notional))
+        .map_err(|e| relabel_derived(e, "getMarginInfo"))?;
     debug_assert_eq!(
         (
             derived.signed_notional,
@@ -342,7 +490,7 @@ pub fn compute_margin_info<H: PerpHost>(
 pub fn total_open_order_initial_margin<H: PerpHost>(
     context: &mut H,
     user: Address,
-    override_market: Option<(u64, &crate::types::PerpPosition)>,
+    override_market: Option<(u64, PricedPosition<'_>)>,
 ) -> Result<u128, PerpError> {
     let markets = storage::load_user_markets_ref(context, user)?;
     let mut total: u128 = 0;
@@ -355,23 +503,24 @@ pub fn total_open_order_initial_margin<H: PerpHost>(
             ))
         })?;
         total += match override_market {
-            Some((id, pos)) if id == market_id => {
+            Some((id, priced)) if id == market_id => {
                 applied_override = true;
-                position_open_order_margin(&market, pos)?
+                position_open_order_margin(&market, priced)?
             }
             _ => {
                 let pos = storage::load_position_ref(context, user, market_id)?;
-                position_open_order_margin(&market, &pos)?
+                let priced = stored_priced_position(context, user, market_id, &market, &pos)?;
+                position_open_order_margin(&market, priced)?
             }
         } as u128;
     }
-    if let Some((id, pos)) = override_market {
+    if let Some((id, priced)) = override_market {
         if !applied_override {
             // Entering a market: the index is only written at save time, so the id the caller is
             // pricing is legitimately absent. A market that does not exist contributes nothing
             // (the placement path rejects an unknown market long before this point).
             if let Some(market) = storage::load_market_ref(context, id)? {
-                total += position_open_order_margin(&market, pos)? as u128;
+                total += position_open_order_margin(&market, priced)? as u128;
             }
         }
     }
@@ -406,7 +555,7 @@ pub fn derived_available_balance_with<H: PerpHost>(
     context: &mut H,
     user: Address,
     wallet_override: Option<i64>,
-    override_market: Option<(u64, &crate::types::PerpPosition)>,
+    override_market: Option<(u64, PricedPosition<'_>)>,
 ) -> Result<i128, PerpError> {
     let wallet = match wallet_override {
         Some(w) => w,
@@ -436,10 +585,13 @@ pub fn derived_can_afford(available: i128, requirement: i128) -> bool {
 /// Signed: an order that reduces net exposure lowers ooIM, and a fill that grows the position can
 /// lower it too (a resting sell against a bigger long nets further). A non-positive delta is free
 /// (see [`derived_can_afford`]).
+///
+/// Both sides must be priced at the SAME Assuming-Price floor `T` — otherwise the difference picks
+/// up a mark/last-price move that no user action caused.
 pub fn derived_requirement_delta(
     market: &crate::types::Market,
-    before: &crate::types::PerpPosition,
-    after: &crate::types::PerpPosition,
+    before: PricedPosition<'_>,
+    after: PricedPosition<'_>,
 ) -> Result<i128, PerpError> {
     Ok(position_open_order_margin(market, after)? as i128
         - position_open_order_margin(market, before)? as i128)

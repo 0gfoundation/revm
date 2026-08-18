@@ -40,8 +40,24 @@ pub struct UserAccount {
     #[serde(rename = "UB")]
     pub usdc_balance: AsBinStr,
 
-    /// Perp trading wallet. Internally signed so maker settlement can carry a
-    /// temporary deficit until liquidation/bankruptcy handling is added.
+    /// Perp trading wallet — the CROSS wallet (Binance's `crossWalletBalance`): position margin has
+    /// been physically moved out of it, the derived open-order requirement has NOT.
+    ///
+    /// **Signed on purpose, as the Binance-aligned representation** — not as a placeholder awaiting
+    /// bankruptcy handling. Binance's `availableBalance` has a true value that goes NEGATIVE while
+    /// the reported field is clamped at 0 (measured: reported `0.00000000` against a back-solved
+    /// `−0.00088443`), and an already-resting order is left `status = 'NEW'` at negative headroom
+    /// while a NEW order is refused `-2019` in the same instant — the exchange lets a lien be
+    /// under-covered and never sweeps it. `perp_wallet_balance: i64` plus
+    /// [`UserAccount::visible_perp_wallet_balance`] (clamped at the ABI boundary) is that structure
+    /// exactly, and is the working model **M1′** of `misc/binance-flip-and-admission.md` §3.3, whose
+    /// instruction to implementers is literally "do not change it".
+    ///
+    /// 🔶 §3.3 marks M1′ a CONJECTURE (the author is ~50/50 between it and M1, where the position
+    /// silo is funded short and the wallet stays at 0), pending a v4 experiment. What is MEASURED is
+    /// only that a negative true value is representable and that under-coverage is never swept. A
+    /// maker fill whose wallet cannot cover the opening margin therefore fills and drives this
+    /// negative (`trading::settlement::settle_maker_fill_core`).
     #[serde(rename = "PB")]
     pub perp_wallet_balance: i64,
 

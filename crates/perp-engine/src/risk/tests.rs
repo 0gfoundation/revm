@@ -535,8 +535,16 @@ fn adl_skips_opposite_holder_whose_only_order_reserves_no_margin() {
     place_order(&mut ctx, KEEPER, 0, 8_000, QTY as u64);
     let keeper_pos = position(&mut ctx, KEEPER);
     let keeper_market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    let keeper_priced = crate::margin_view::stored_priced_position(
+        &mut ctx,
+        KEEPER,
+        MARKET_ID,
+        &keeper_market,
+        &keeper_pos,
+    )
+    .unwrap();
     assert_eq!(
-        crate::margin_view::position_open_order_margin(&keeper_market, &keeper_pos).unwrap(),
+        crate::margin_view::position_open_order_margin(&keeper_market, keeper_priced).unwrap(),
         0,
         "pure-reduce order requires no open-order margin — this is what makes any \
          `requirement != 0` proxy insufficient for 'has resting orders'"
@@ -1199,8 +1207,11 @@ fn funding_on_one_market_leaves_another_markets_headroom_intact() {
         .unwrap()
         .unwrap();
     let pos2 = storage::load_position(&mut ctx, ALICE, OTHER_MARKET).unwrap();
+    let priced2 =
+        crate::margin_view::stored_priced_position(&mut ctx, ALICE, OTHER_MARKET, &market2, &pos2)
+            .unwrap();
     assert_eq!(
-        crate::margin_view::position_open_order_margin(&market2, &pos2).unwrap(),
+        crate::margin_view::position_open_order_margin(&market2, priced2).unwrap(),
         USER_WALLET,
         "the whole wallet is committable on market 2"
     );
@@ -1652,7 +1663,9 @@ fn position(ctx: &mut TestCtx, user: Address) -> PerpPosition {
 fn oo_im(ctx: &mut TestCtx, user: Address) -> u64 {
     let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
     let pos = storage::load_position(ctx, user, MARKET_ID).unwrap();
-    crate::margin_view::position_open_order_margin(&market, &pos).unwrap()
+    let priced =
+        crate::margin_view::stored_priced_position(ctx, user, MARKET_ID, &market, &pos).unwrap();
+    crate::margin_view::position_open_order_margin(&market, priced).unwrap()
 }
 
 fn save_position(ctx: &mut TestCtx, amount: i64, v_quote_balance: i64) {
@@ -2905,11 +2918,16 @@ mod value_conservation {
         let mut ts: u64 = 100;
         let mut liquidations = 0u32;
         let mut fills = 0u32;
+        // Wallets that were negative going INTO this step, so a NEW negative can be attributed to
+        // the step that produced it (see the gate below).
+        let mut was_negative: Vec<bool> = vec![false; N as usize];
+        let mut negative_wallet_steps = 0u32;
 
         for op in 0..1200u32 {
             let i = (rng() % N) as usize;
             let who = user(i as u64);
             let roll = rng() % 100;
+            let step_can_debit_a_wallet = (20..90).contains(&roll);
 
             if roll < 12 {
                 if let Some(id) = resting[i].take() {
@@ -3024,21 +3042,47 @@ mod value_conservation {
                 storage::load_insurance_fund(&mut ctx).unwrap() > 0,
                 "insurance fund exhausted at op {op} — E is no longer comparable"
             );
-            // Never a negative wallet: with the escrow gone, position margin is funded from the
-            // wallet at fill time, and an underfunded maker must be REFUSED (its order cancelled),
-            // never allowed to back real margin with untracked debt.
+            // ── A negative wallet is NO LONGER an invariant violation ──
+            // This used to assert `w >= 0` on the grounds that an underfunded maker fill was
+            // REFUSED. It is not any more: the fill happens and the wallet absorbs the shortfall
+            // (Binance never sweeps an under-covered lien; see `settle_maker_fill_core`). So the
+            // blanket assertion would now be asserting the OLD behaviour.
+            //
+            // What replaces it is the attribution: a wallet may only CROSS into negative on a step
+            // that actually debits one, i.e. a place/fill. Nothing else in the system may produce a
+            // deficit — a cancel moves no money, `setLeverage` moves no money, funding settles
+            // against `pos.margin` (A1 isolated funding), and liquidation only ever CREDITS the
+            // wallet (`settle_liquidation_residual_at_mark_price`: an insolvent residual routes its
+            // shortfall to the Insurance Fund and never debits the user). If a mark move or a
+            // liquidation sweep ever produced a negative wallet, that would be a real bug, and this
+            // catches it while the relaxed assertion above no longer would.
+            //
+            // Value conservation itself is unaffected and is still the primary gate above: the
+            // deficit is a TRANSFER (wallet down, `pos.margin` up), never a mint.
             for k in 0..N {
                 let w = storage::load_account(&mut ctx, user(k))
                     .unwrap()
                     .perp_wallet_balance;
-                assert!(w >= 0, "user {k} wallet went negative ({w}) at op {op}");
+                let idx = k as usize;
+                if w < 0 && !was_negative[idx] {
+                    negative_wallet_steps += 1;
+                    assert!(
+                        step_can_debit_a_wallet,
+                        "user {k} wallet went negative ({w}) at op {op} on a step that debits no \
+                         wallet (roll {roll}: cancel / setLeverage / oracle+liquidation)"
+                    );
+                }
+                was_negative[idx] = w < 0;
             }
             c0 = c1;
             a0 = a1;
         }
 
         // The scenario has to actually reach the interesting paths, or it proves nothing.
-        println!("conservation scenario: {fills} fills, {liquidations} liquidations");
+        println!(
+            "conservation scenario: {fills} fills, {liquidations} liquidations, \
+             {negative_wallet_steps} wallet-goes-negative steps"
+        );
         assert!(fills > 100, "too few fills: {fills}");
         assert!(liquidations > 0, "no position was ever liquidated");
         // ADL is deliberately NOT asserted here: it needs an insolvent residual the book could not
@@ -3142,6 +3186,81 @@ mod value_conservation {
                 .amount,
             0,
             "the insolvent residual was fully deleveraged"
+        );
+    }
+
+    /// The UNDERFUNDED MAKER FILL leg of the same identity. A maker whose wallet cannot cover the
+    /// opening margin now FILLS anyway and goes negative (`settle_maker_fill_core`), which is the
+    /// one new way to reach a negative wallet — and the one place a missing debit would MINT.
+    ///
+    /// Deterministic, because the fuzz above cannot reliably reach it: its users start with $400
+    /// each at leverage <= 3, and draining one to within a hair of an opening margin by chance is
+    /// not something 1200 random ops produce.
+    ///
+    /// MUTATION-CHECKED: deleting the `trial_wallet -= opening_margin` line in
+    /// `settle_maker_fill_core` (which is what "just let the fill through" naively looks like)
+    /// breaks the assertion below by exactly the opening margin — the silo would be funded from
+    /// nowhere.
+    #[test]
+    fn an_underfunded_maker_fill_conserves_total_system_value() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        storage::save_insurance_fund(&mut ctx, SEED_IF).unwrap();
+
+        let maker = user(0);
+        let taker = user(1);
+        // Short 10 @ $100 at leverage 1 needs exactly $1 000 of opening margin.
+        let opening_margin: i64 = 1_000_000_000;
+        for (u, w) in [(maker, 2 * opening_margin), (taker, 2 * opening_margin)] {
+            storage::save_account(
+                &mut ctx,
+                u,
+                UserAccount {
+                    perp_wallet_balance: w,
+                    ..UserAccount::default()
+                },
+            )
+            .unwrap();
+        }
+
+        // The sell is admitted while the maker CAN afford it, then the wallet is drained to ONE
+        // UNIT short — the production shape (a fee, a funding charge or an adverse mark move
+        // between admission and fill).
+        place_order(&mut ctx, maker, 1, ENTRY_PRICE, QTY as u64);
+        let mut acc = storage::load_account(&mut ctx, maker).unwrap();
+        acc.perp_wallet_balance = opening_margin - 1;
+        storage::save_account(&mut ctx, maker, acc).unwrap();
+
+        let mark = storage::load_mark_price(&mut ctx, MARKET_ID).unwrap();
+        let (c0, a0) = state(&mut ctx);
+
+        place_order(&mut ctx, taker, 0, ENTRY_PRICE, QTY as u64);
+
+        // The fill happened, the silo is funded IN FULL, and the wallet carries the deficit.
+        let maker_pos = storage::load_position(&mut ctx, maker, MARKET_ID).unwrap();
+        assert_eq!(maker_pos.amount, -QTY, "the short was opened");
+        assert_eq!(maker_pos.margin, opening_margin, "silo funded in full");
+        assert_eq!(
+            storage::load_account(&mut ctx, maker)
+                .unwrap()
+                .perp_wallet_balance,
+            -1,
+            "the wallet absorbed the shortfall"
+        );
+
+        // ── The gate: a deficit is a TRANSFER, not a mint ──
+        let (c1, a1) = state(&mut ctx);
+        assert_eq!(
+            equity(c1, a1, mark),
+            equity(c0, a0, mark),
+            "underfunded maker fill leaked {}",
+            equity(c1, a1, mark) - equity(c0, a0, mark)
+        );
+        assert_eq!(a1, a0, "a fill must not mint or burn open interest");
+        assert_eq!(
+            storage::load_insurance_fund(&mut ctx).unwrap(),
+            SEED_IF,
+            "the deficit is NOT socialised — it stays on the user's wallet"
         );
     }
 }

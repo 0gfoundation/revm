@@ -226,13 +226,111 @@ pub fn max_leverage_for_notional(tiers: &MarginTiers, abs_notional: i64) -> u32 
 //     IM   = ROUND_UP( max(|N + Bid|, |N − Ask|) / L )  joint requirement
 //     ooIM = IM − PIM
 //
-// with `N` the SIGNED position notional at MARK, `Bid` = Σ (remaining qty × LIMIT price) over
-// resting buys, `Ask` the same over sells, and `L` the position leverage. The two branches are
-// the exposure left if every buy fills and if every sell fills.
+// with `N` the SIGNED position notional at MARK, `L` the position leverage, and `Bid`/`Ask` the
+// per-side resting-order aggregates priced at each order's **Assuming Price** — the limit price for
+// a BUY, `max(Last × 1.0015, Mark, limit)` for a SELL (see [`assuming_price_floor`] and
+// [`ask_notional_at_assuming_price`]). The two branches are the exposure left if every buy fills
+// and if every sell fills.
 //
-// Formula source: `misc/binance-margin-verified-model.md` §1.1 (formula set) and §2 (rounding),
-// plus `misc/binance-v3-account-balance-field-reference.md` §2/§4. Every rounding decision below
-// is the one those documents settled against mainnet samples; see the doc comments.
+// Formula source: `misc/binance-margin-verified-model.md` §1.1 (formula set), §1.5 (the
+// Assuming-Price basis) and §2 (rounding), plus
+// `misc/binance-v3-account-balance-field-reference.md` §2/§4. Every rounding decision below is the
+// one those documents settled against mainnet samples; see the doc comments.
+
+/// Numerator of Binance's Assuming-Price markup, `1.0015` as an exact rational.
+///
+/// Applies to SHORT (sell) orders and to market orders on both sides. Bounded from below by
+/// mainnet run9 at `>= ~1.00135` (`misc/evidence/binance-run9-assuming-price-analysis.md` §5); the
+/// exact coefficient comes from the vendor's own Cost FAQ, quoted verbatim in
+/// `misc/binance-flip-and-admission.md` §1.6b.
+pub const ASSUMING_PRICE_MARKUP_NUM: u128 = 10_015;
+/// Denominator of [`ASSUMING_PRICE_MARKUP_NUM`].
+pub const ASSUMING_PRICE_MARKUP_DEN: u128 = 10_000;
+
+/// `T = max(ROUND_UP(lastTraded × 1.0015), mark)` — the price floor every resting SELL is charged
+/// at, whatever its own limit price.
+///
+/// # The vendor formula this implements
+///
+/// ```text
+/// Initial Margin = (Assuming Price × Order Quantity) / Leverage
+///   Long  order : Assuming Price = order price                              (no markup)
+///   Short order : Assuming Price = max(Last Price × 1.0015, Mark, order price)
+///   Market order: both sides at Last Price × 1.0015
+/// ```
+///
+/// so a sell's Assuming Price is `max(T, limit)` with `T` as returned here, and a buy's is its
+/// limit price — the buy side carries no markup at all. MEASURED: mainnet run9 (20 post-only
+/// probes, 8 discriminating, all refused where the limit-price model predicted acceptance, the
+/// strongest by 17× the noise floor) plus the vendor Cost FAQ; and mainnet R10 showed the
+/// **escrow itself** is priced this way, not merely the admission predicate (reported
+/// `askNotional / q = limit × 1.0015` to 1e-5). See `misc/binance-flip-and-admission.md` §1.6b and
+/// §3.4, and `misc/evidence/binance-run10-flip-fill-analysis.md` §3(a).
+///
+/// # Rounding
+///
+/// ROUND_UP, matching the direction the doc measured for every REQUIREMENT-class field
+/// (`initialMargin` / `positionInitialMargin`, 14/14 discriminating samples,
+/// `binance-margin-verified-model.md` §2: "要求类字段向上取整偏交易所"). The docs do not resolve the
+/// rounding of the `× 1.0015` product itself — it is far below their 1e-8 resolution — so the
+/// conservative direction (a higher requirement) is chosen deliberately.
+///
+/// `last_traded == 0` means no trade has ever printed in this market; the term vanishes and `T`
+/// degenerates to `mark`, which is exactly the `Mark` branch of the vendor's own `max()` and needs
+/// no separate fallback.
+#[inline]
+pub fn assuming_price_floor(last_traded: u64, mark_price: u64) -> Result<u64, PerpError> {
+    let bumped = (last_traded as u128)
+        .checked_mul(ASSUMING_PRICE_MARKUP_NUM)
+        .ok_or_else(|| perp_err("math: assuming price numerator overflow"))?
+        .div_ceil(ASSUMING_PRICE_MARKUP_DEN);
+    let bumped = u64::try_from(bumped).map_err(|_| perp_err("math: assuming price exceeds u64"))?;
+    Ok(bumped.max(mark_price))
+}
+
+/// `Ask` priced at the Assuming Price: `Σ_i calc_value(max(T, price_i), qty_i)` over the user's
+/// resting SELLS, where `T` is [`assuming_price_floor`].
+///
+/// Evaluated as `total_sell_notional + Σ_{price_i < T} (calc_value(T, qty_i) − calc_value(price_i,
+/// qty_i))`, which is the SAME number as the direct fold (each term is one per-order-floored
+/// `calc_value`, exactly as `total_sell_notional` is maintained) but only touches the orders the
+/// markup actually moves.
+///
+/// `sells_ascending` MUST be the per-`(user, market)` sell list in its stored order, which is
+/// ASCENDING by price (placement inserts at `partition_point(|e| e.price < price)`; every removal
+/// preserves it). That makes the below-`T` orders a contiguous FRONT PREFIX, so the walk breaks at
+/// the first entry priced at or above `T` — normally after zero or a handful of entries, never the
+/// whole list. Feeding a differently-ordered list would silently under-charge.
+///
+/// The BUY side has no analogue: `Assuming Price = order price` for a long order, so
+/// `Bid == total_buy_notional` exactly.
+#[inline]
+pub fn ask_notional_at_assuming_price(
+    sells_ascending: impl Iterator<Item = OrderEntry>,
+    total_sell_notional: u64,
+    assuming_floor: u64,
+    base_decimals: u32,
+    price_decimals: u32,
+) -> Result<u64, PerpError> {
+    let mut ask = total_sell_notional;
+    for e in sells_ascending {
+        if e.price >= assuming_floor {
+            break;
+        }
+        let uplift = calc_value(assuming_floor, e.amount, base_decimals, price_decimals)?
+            .checked_sub(calc_value(
+                e.price,
+                e.amount,
+                base_decimals,
+                price_decimals,
+            )?)
+            .ok_or_else(|| perp_err("math: assuming-price uplift underflow"))?;
+        ask = ask
+            .checked_add(uplift)
+            .ok_or_else(|| perp_err("math: assuming-price ask notional overflow"))?;
+    }
+    Ok(ask)
+}
 
 /// `ROUND_UP(numerator / divisor)` — the rounding Binance uses for `initialMargin` and
 /// `positionInitialMargin`.
@@ -287,8 +385,11 @@ pub struct OpenOrderMargin {
 /// reintroduce a second definition here.
 ///
 /// Pure integer arithmetic over `(signed_notional, bid, ask, leverage)`; no storage, no floats.
-/// `signed_notional` is `N` at MARK (negative for a short); `bid`/`ask` are at each order's LIMIT
-/// price. Mixing the two bases is deliberate — it is Binance's formula.
+/// `signed_notional` is `N` at MARK (negative for a short); `bid` is Σ (qty × LIMIT price) over
+/// resting buys (a long order's Assuming Price IS its limit price) and `ask` must already be the
+/// ASSUMING-PRICE aggregate `Σ qty × max(T, limit)` from [`ask_notional_at_assuming_price`] — NOT
+/// the raw limit-price total. Mixing mark and order-price bases is deliberate: it is Binance's
+/// formula.
 ///
 /// # Rounding
 ///
