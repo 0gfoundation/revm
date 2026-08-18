@@ -953,6 +953,86 @@ pub fn run_get_account_margin<H: PerpHost>(
     )))
 }
 
+// ── The index-driven account view (ONE producer, two consumers) ──────────────────────────────
+
+/// Every account-level number the precompile publishes for one user, folded over the PER-USER
+/// MARKET INDEX — so every total is COMPLETE by construction.
+///
+/// **This is the single producer for BOTH published surfaces**: the `getAccount(address)` return
+/// ([`crate::account::run_get_account`]) and the `AccountBalanceChanged` after-image
+/// (`storage::emit_account_balance_changed`). Neither holds arithmetic of its own — each takes
+/// this struct and encodes a subset of it — so the event and the view cannot report different
+/// numbers for the same state. That equality is pinned by
+/// `margin_view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state` and
+/// `trading::tests::matched_call_emits_a_balance_event_at_each_balance_moving_write`, and by the
+/// `debug_assertions` gate-agreement check inside [`index_account_view`] itself.
+#[derive(Clone, Debug)]
+pub struct IndexAccountView {
+    /// The market ids folded — the per-user index (`umkt`) verbatim, echoed so a caller can
+    /// re-derive every total. Held as the stored `Arc` (no clone).
+    pub market_ids: std::sync::Arc<Vec<u64>>,
+    /// Spot / withdrawal-layer USDC held inside the DEX. NOT part of any total below.
+    pub usdc_balance: primitives::U256,
+    /// The account-level margin scalars, all signed-and-unclamped where the quantity can be
+    /// negative.
+    pub scalars: AccountMarginScalars,
+}
+
+/// Fold [`account_margin_scalars`] over the user's whole market index and pair it with the spot
+/// USDC balance — the complete published account view.
+///
+/// Pure read: every loader it reaches is a `_ref`/cache-fill reader, so it enters no key into the
+/// block delta and cannot move the block commitment. It is therefore safe to call from a WRITE
+/// path (the event does exactly that) — it observes state, it does not touch it.
+///
+/// Cost: one index load plus, per member market, `{market, position, MarketHot, sell list}` — at
+/// most 4 loads, and only 2 when the user has no resting sells in that market
+/// (`pos.total_sell_qty == 0` short-circuits [`stored_ask_assuming`] before the `MarketHot` and
+/// list loads). Bounded by `MAX_USER_MARKETS` (16) ⇒ ≤ 65 `_ref` loads worst case.
+pub fn index_account_view<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    who: &str,
+) -> Result<IndexAccountView, PerpError> {
+    // The index is the support of every sum: a market the user has left contributes
+    // `N = Bid = Ask = 0`. Held as an owned `Arc` so it can be iterated while `context` is borrowed
+    // mutably by the walk.
+    let market_ids = storage::load_user_markets_ref(context, user)?;
+    let scalars = account_margin_scalars(
+        context,
+        user,
+        market_ids.iter().copied(),
+        MarketSetSource::UserIndex,
+        who,
+    )?;
+
+    // The roll-up's `Σ ooIM` and the hot admission gate's must be the SAME number over the same
+    // market set — they share `position_open_order_margin` per market but fold in two places (the
+    // gate's walk stays lean on purpose: no maintenance-margin tier walk, no unrealized PnL,
+    // because it runs on every placeOrder). Pin the agreement here rather than trusting it, on
+    // EVERY produced view — which now includes every emitted event. Compiled out in release, so
+    // the second walk costs production nothing.
+    #[cfg(debug_assertions)]
+    {
+        let gate = derived_available_balance(context, user)?;
+        debug_assert_eq!(
+            gate, scalars.available_balance as i128,
+            "{who}: availableBalance must equal the admission gate's own basis"
+        );
+    }
+
+    let usdc_balance: primitives::U256 = storage::load_account_ref(context, user)?
+        .usdc_balance
+        .clone()
+        .into();
+
+    Ok(IndexAccountView {
+        market_ids,
+        usdc_balance,
+        scalars,
+    })
+}
+
 /// Re-label a per-market reject so the caller can tell WHICH id in the market set failed
 /// (`compute_margin_info` only knows it is "getMarginInfo: unknown market"). Fatals and the
 /// shell-level variants propagate verbatim — they are not business rejects and must not be

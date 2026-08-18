@@ -202,6 +202,11 @@ pub fn run_transfer_from_perp<H: PerpHost>(
 /// [`crate::margin_view::account_margin_scalars`] walkers, so the arithmetic cannot drift between
 /// them.
 ///
+/// This function contains NO arithmetic: it decodes, calls
+/// [`crate::margin_view::index_account_view`], and ABI-encodes. The `AccountBalanceChanged` event
+/// calls the same producer and encodes the same fields into a log, which is why the two surfaces
+/// cannot report different numbers for the same state.
+///
 /// Pure read. Every loader below is a `_ref` (cache-fill, never dirty-mark) reader, so this call
 /// enters no key into the block delta and cannot move the block commitment.
 pub fn run_get_account<H: PerpHost>(
@@ -211,40 +216,12 @@ pub fn run_get_account<H: PerpHost>(
     let args = getAccountCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getAccount: invalid calldata"))?;
 
-    // The index is the support of every sum: a market the user has left contributes
-    // `N = Bid = Ask = 0`. Held as an owned `Arc` so it can be iterated while `context` is borrowed
-    // mutably by the walk, and echoed in the return so the totals are self-checkable.
-    let market_ids = storage::load_user_markets_ref(context, args.user)?;
-    let s = crate::margin_view::account_margin_scalars(
-        context,
-        args.user,
-        market_ids.iter().copied(),
-        crate::margin_view::MarketSetSource::UserIndex,
-        "getAccount",
-    )?;
-
-    // The account roll-up's `Σ ooIM` and the hot admission gate's must be the SAME number over the
-    // same market set — they share `position_open_order_margin` per market but fold in two places
-    // (the gate's walk stays lean on purpose: no maintenance-margin tier walk, no unrealized PnL,
-    // because it runs on every placeOrder). Pin the agreement here rather than trusting it. Compiled
-    // out in release, so the second walk costs production nothing.
-    #[cfg(debug_assertions)]
-    {
-        let gate = crate::margin_view::derived_available_balance(context, args.user)?;
-        debug_assert_eq!(
-            gate, s.available_balance as i128,
-            "getAccount's availableBalance must equal the admission gate's own basis"
-        );
-    }
-
-    let usdc_balance: U256 = storage::load_account_ref(context, args.user)?
-        .usdc_balance
-        .clone()
-        .into();
+    let view = crate::margin_view::index_account_view(context, args.user, "getAccount")?;
+    let s = view.scalars;
 
     Ok(Bytes::from(getAccountCall::abi_encode_returns(
         &getAccountReturn {
-            usdcBalance: usdc_balance,
+            usdcBalance: view.usdc_balance,
             totalWalletBalance: s.total_wallet_balance,
             totalCrossWalletBalance: s.total_cross_wallet_balance,
             totalMarginBalance: s.total_margin_balance,
@@ -254,7 +231,8 @@ pub fn run_get_account<H: PerpHost>(
             totalOpenOrderInitialMargin: s.total_open_order_initial_margin,
             totalMaintMargin: s.total_maint_margin,
             availableBalance: s.available_balance,
-            marketIds: market_ids.to_vec(),
+            // Echoed so the totals are self-checkable against `getMarginInfo` per id.
+            marketIds: view.market_ids.to_vec(),
         },
     )))
 }

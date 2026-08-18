@@ -655,8 +655,15 @@ pub fn run_add_position_margin<H: PerpHost>(
     if let Some(p) = pending_funding {
         apply_funding_settlement(context, p)?;
     }
-    storage::save_account(context, caller, account)?;
+    // Position BEFORE account: the account write emits the account-level `AccountBalanceChanged`
+    // roll-up, whose `totalWalletBalance` is `cross + Σ positionMargin`. Written the other way round
+    // the one event this call emits would report the debited wallet against the OLD silo and
+    // under-state the gross wallet by exactly `amount` — an intermediate snapshot for no reason,
+    // since both writes are unconditional here. Delta order is irrelevant to the commitment (the
+    // block delta is a net key→value map), and `pos.amount` is unchanged so no registry/index hook
+    // behaves differently.
     storage::save_position(context, caller, args.marketId, &pos)?;
+    storage::save_account(context, caller, account)?;
     emit_position_margin_adjusted(context, caller, args.marketId, amount, &pos);
     emit_position_changed(context, caller, args.marketId, &pos);
     Ok(Bytes::new())
@@ -739,8 +746,9 @@ pub fn run_remove_position_margin<H: PerpHost>(
     if let Some(p) = pending_funding {
         apply_funding_settlement(context, p)?;
     }
-    storage::save_account(context, caller, account)?;
+    // Position BEFORE account — see `run_add_position_margin` for why.
     storage::save_position(context, caller, args.marketId, &pos)?;
+    storage::save_account(context, caller, account)?;
     emit_position_margin_adjusted(context, caller, args.marketId, -amount, &pos);
     emit_position_changed(context, caller, args.marketId, &pos);
     Ok(Bytes::new())

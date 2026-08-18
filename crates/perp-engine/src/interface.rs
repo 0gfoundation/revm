@@ -509,9 +509,11 @@ sol! {
         /// derivation, the no-double-count argument, and why absorbing it from the Insurance Fund
         /// would be strictly worse.
         ///
-        /// ⚠️ `AccountBalanceChanged`'s `perpWalletBalance` is `uint64` and floors at 0, so an
-        /// operator watching only the EVENT stream cannot see a deficit accumulate. Both signed
-        /// views — this selector and `getAccount` — expose it; polling either is enough.
+        /// There is no longer any clamped surface to work around: `AccountBalanceChanged` used to
+        /// project the cross wallet through a `uint64` floored at 0, which hid a deficit from anyone
+        /// watching only the event stream. That field is now `int64 totalCrossWalletBalance` and the
+        /// event carries this whole scalar set, so the event stream, this selector and `getAccount`
+        /// all report the same signed numbers.
         ///
         /// Like `getMarginInfo` this is a pure read: it stores nothing and moves no money.
         function getAccountMargin(address user, uint64[] marketIds) external view returns (
@@ -697,16 +699,60 @@ sol! {
         // Feeds: internal wallet movement history
         event TransferToPerp(address indexed user, uint64 amount);
         event TransferFromPerp(address indexed user, uint64 amount);
-        /// Balance after-image, emitted by each account write that moves money.
+        /// Account after-image, emitted by each account write that moves money.
         ///
-        /// `perpWalletBalance` is the CROSS wallet (Binance's `crossWalletBalance`), clamped at 0
-        /// — NOT spendable headroom. The open-order requirement is derived and never debited, so
-        /// it is still inside this number; subtract `getAccountMargin`'s
-        /// `totalOpenOrderInitialMargin`, or read either account view's `availableBalance`, to get
-        /// what the engine will actually let the user spend. The event carries the stored balance
-        /// on purpose: it fires at the account write site, mid-call, where a derived figure would
-        /// be measured against half-updated positions.
-        event AccountBalanceChanged(address indexed user, uint256 usdcBalance, uint64 perpWalletBalance);
+        /// **Field-for-field the account-level scalar set `getAccount(address)` returns** (less the
+        /// `marketIds` echo), produced by the SAME code over the SAME market set — the per-user
+        /// market index — via `margin_view::index_account_view`. Neither surface holds arithmetic of
+        /// its own, so the event and the view cannot disagree for the same state.
+        ///
+        /// ⚠️ `perpWalletBalance` (`uint64`, floored at 0) is GONE. It is now
+        /// `int64 totalCrossWalletBalance`: the same quantity, SIGNED and UNCLAMPED, and named the
+        /// way `getAccount`/`getAccountMargin` name it. The floor was a real blind spot rather than a
+        /// cosmetic one — a negative cross wallet IS reachable (a maker close fee the M1-capped
+        /// opening margin could not absorb; see
+        /// `types::UserAccount::perp_wallet_balance` and
+        /// `trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet`), so an
+        /// operator watching only the event stream could not see a deficit accumulate and had to poll
+        /// an account view to find one. Every balance-like field below is now `int64` and reports its
+        /// sign; nothing on this event is clamped.
+        ///
+        /// See `getAccount` for the field-by-field contract of the nine totals. In brief:
+        ///
+        ///   usdcBalance                 spot / withdrawal-layer USDC. NOT part of any total.
+        ///   totalWalletBalance          GROSS perp wallet = cross + Σ positionMargin.
+        ///   totalCrossWalletBalance     the STORED `perp_wallet_balance`, verbatim and signed.
+        ///   totalMarginBalance          totalWalletBalance + totalUnrealizedProfit (equity).
+        ///   totalUnrealizedProfit       Σ unrealizedProfit at mark.
+        ///   totalInitialMargin          Σ initialMargin (== the next two, summed).
+        ///   totalPositionInitialMargin  Σ positionInitialMargin.
+        ///   totalOpenOrderInitialMargin Σ openOrderInitialMargin — derived, escrowed nowhere.
+        ///   totalMaintMargin            Σ maintMargin.
+        ///   availableBalance            cross − totalOpenOrderInitialMargin: what the engine's own
+        ///                               admission gates will actually let the user spend.
+        ///
+        /// ⚠️ WRITE GRANULARITY: this fires at each balance-moving account WRITE, with no
+        /// de-duplication and no change detection, while the totals above are ACCOUNT-level. So in a
+        /// call that touches several of one user's markets (a match, a liquidation), only the LAST
+        /// event for that user is a consistent account state; the earlier ones are honest
+        /// after-images of a half-updated account — the wallet leg has landed, a position or
+        /// order-list leg of the same call may not have. Consumers that need a settled account state
+        /// must take the last event per (user, transaction), or poll `getAccount`. This is the
+        /// existing documented design of the event (see `storage::emit_account_balance_changed`);
+        /// aggregating to one event per user per transaction is a planned follow-up.
+        event AccountBalanceChanged(
+            address indexed user,
+            uint256 usdcBalance,
+            int64   totalWalletBalance,
+            int64   totalCrossWalletBalance,
+            int64   totalMarginBalance,
+            int64   totalUnrealizedProfit,
+            uint64  totalInitialMargin,
+            uint64  totalPositionInitialMargin,
+            uint64  totalOpenOrderInitialMargin,
+            uint64  totalMaintMargin,
+            int64   availableBalance
+        );
         event UserFeeRatesUpdated(address indexed user, uint64 makerFeeBps, uint64 takerFeeBps);
 
         // Emitted once per accepted placeOrder / placeOrderSigned call, before any matching.

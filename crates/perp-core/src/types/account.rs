@@ -1,5 +1,4 @@
 //! User account stored in the PerpDEX precompile.
-use primitives::U256;
 use serde::{Deserialize, Serialize};
 
 use crate::{as_bin::AsBinStr, error::{perp_err, PerpError}};
@@ -49,8 +48,9 @@ pub struct UserAccount {
     /// ⚠️ **This used to be documented as "the Binance-aligned representation". That claim was too
     /// strong and has been withdrawn.** Binance's `availableBalance` does have a true value that
     /// goes negative while the reported field is clamped at 0 (measured: reported `0.00000000`
-    /// against a back-solved `−0.00088443`), so the SHAPE — signed internally, floored at the ABI
-    /// via [`UserAccount::visible_perp_wallet_balance`] — is real. What is not aligned is what the
+    /// against a back-solved `−0.00088443`), so the SHAPE — a genuinely signed internal balance —
+    /// is real. (We no longer copy the ABI-side floor at all; see the Observability section below.)
+    /// What is not aligned is what the
     /// negative MEANS. R11 measured Binance's negative appearing only when the fill COMMISSION could
     /// not be paid, at exactly the commission (`−0.25717240`), and cleared by the insurance fund
     /// three seconds later (`derived-ooim-plan.md` §3a). This field used to represent something else
@@ -114,16 +114,19 @@ pub struct UserAccount {
     ///
     /// ## Observability
     ///
-    /// The true signed value IS readable through the ABI: BOTH account views —
-    /// `getAccount(address)` (index-driven) and `getAccountMargin(address, uint64[])` — return
-    /// `int64 totalCrossWalletBalance` and `int64 availableBalance` unclamped. The only remaining
-    /// `uint64` surface is the `AccountBalanceChanged` after-image, via
-    /// [`UserAccount::visible_perp_wallet_balance`], which floors at 0 the way Binance's own clamped
-    /// `availableBalance` does (`misc/binance-v3-account-balance-field-reference.md`, the
-    /// `availableBalance` row / R5: computed `−0.00085981`, reported `0.00000000`). An operator
-    /// watching only the EVENT stream therefore cannot see a deficit and must poll either view.
-    /// (`getAccount` used to floor too, under the name `availablePerpBalance`; that blind spot was
-    /// removed when it became the full account-level roll-up.)
+    /// The true signed value is readable through EVERY published surface — there is no clamped one
+    /// left. Both account views (`getAccount(address)`, index-driven, and
+    /// `getAccountMargin(address, uint64[])`) return `int64 totalCrossWalletBalance` and
+    /// `int64 availableBalance` unclamped, AND so does the `AccountBalanceChanged` event, which
+    /// carries the same account-level scalar set as `getAccount` (same producer,
+    /// `margin_view::index_account_view`). An operator watching only the EVENT stream can therefore
+    /// see a deficit appear, which used not to be true: the event projected the wallet through a
+    /// `uint64` floored at 0 (via [`UserAccount::visible_perp_wallet_balance`], now test-only), the
+    /// way Binance's own clamped `availableBalance` does
+    /// (`misc/binance-v3-account-balance-field-reference.md`, the `availableBalance` row / R5:
+    /// computed `−0.00085981`, reported `0.00000000`). (`getAccount` used to floor too, under the
+    /// name `availablePerpBalance`; that blind spot went when it became the full account-level
+    /// roll-up. The event's went with this change.)
     #[serde(rename = "PB")]
     pub perp_wallet_balance: i64,
 
@@ -160,55 +163,33 @@ impl Default for UserAccount {
     }
 }
 
-/// Public account values emitted by the precompile in `AccountBalanceChanged`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PublicAccountBalance {
-    /// Spot USDC held inside the DEX.
-    pub usdc_balance: U256,
-    /// The CROSS perp wallet, clamped at 0 — Binance's `crossWalletBalance`.
-    ///
-    /// NOT spendable headroom: the open-order requirement (`Σ ooIM`) is derived, never debited,
-    /// so it is still sitting inside this number. The spendable figure is
-    /// `getAccount().availableBalance`. This after-image deliberately reports the STORED
-    /// balance rather than the derived available, because it is emitted at the account write
-    /// site — mid-operation, before the position and order-list writes of the same call — where a
-    /// derived number would be computed against half-updated state and would also cost a
-    /// `Σ ooIM` walk on the hottest write path.
-    pub perp_wallet_balance: u64,
-}
-
 impl UserAccount {
-    /// The CROSS perp wallet clamped at 0, as exposed in `AccountBalanceChanged`.
+    /// The CROSS perp wallet clamped at 0 — **a test/diagnostic contrast only; NO published surface
+    /// uses it any more.**
     ///
-    /// The clamp exists because the ABI field is `uint64`, NOT because a negative balance is an
-    /// unfinished state awaiting a bankruptcy subsystem: a negative
-    /// [`UserAccount::perp_wallet_balance`] is a settled, self-consistent RECEIVABLE (see that
-    /// field's docs). Binance clamps the analogous `availableBalance` the same way — measured
-    /// reporting `0.00000000` against a true `−0.00085981`
-    /// (`misc/binance-v3-account-balance-field-reference.md`, the `availableBalance` row / R5).
+    /// It used to be the projection behind `AccountBalanceChanged.perpWalletBalance` (a `uint64`).
+    /// That field is now `int64 totalCrossWalletBalance`, so nothing the precompile publishes
+    /// clamps: both account views and the event all report the signed value. Binance clamps its
+    /// analogous `availableBalance` — measured reporting `0.00000000` against a true `−0.00085981`
+    /// (`misc/binance-v3-account-balance-field-reference.md`, the `availableBalance` row / R5) — and
+    /// its own reference doc's verdict is that the field therefore cannot be used to detect
+    /// under-coverage. We deliberately did not keep that.
     ///
-    /// ⚠️ Do NOT reach for this in engine logic. It is a REPORTING projection only, and the
-    /// clamped view is exactly what breaks the custody identity: summing wallets through this
-    /// function over-states the protocol's liabilities by the size of every deficit
+    /// ⚠️ Do NOT reach for this in engine logic. The clamped view is exactly what breaks the custody
+    /// identity: summing wallets through this function over-states the protocol's liabilities by the
+    /// size of every deficit
     /// (`trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet` produces
     /// the one state where that still bites; `risk::tests::usdc_custody` asserts the two views now
     /// AGREE on the maker-fill path, which is what the M1 switch bought). Gates use
-    /// `margin_view::derived_available_balance`, which is signed.
+    /// `margin_view::derived_available_balance`, which is signed. What it is still FOR is pinning
+    /// that contrast in tests — asserting that a clamped reading would have reported 0 where the
+    /// honest surfaces report the deficit.
     #[inline]
     pub fn visible_perp_wallet_balance(&self) -> u64 {
         if self.perp_wallet_balance <= 0 {
             0
         } else {
             self.perp_wallet_balance as u64
-        }
-    }
-
-    /// Returns the clamped public balance after-image for this account.
-    #[inline]
-    pub fn public_balance(&self) -> PublicAccountBalance {
-        PublicAccountBalance {
-            usdc_balance: self.usdc_balance.clone().into(),
-            perp_wallet_balance: self.visible_perp_wallet_balance(),
         }
     }
 

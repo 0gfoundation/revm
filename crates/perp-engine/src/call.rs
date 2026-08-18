@@ -95,10 +95,30 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(transferAdminCall::SELECTOR, (30_000, false));
         m.insert(getAdminCall::SELECTOR, (5_000, true));
         // Account
-        m.insert(depositCall::SELECTOR, (50_000, false));
-        m.insert(withdrawCall::SELECTOR, (50_000, false));
-        m.insert(transferToPerpCall::SELECTOR, (20_000, false));
-        m.insert(transferFromPerpCall::SELECTOR, (20_000, false));
+        //
+        // ── THE `+20_000` ON EVERY SELECTOR THAT EMITS `AccountBalanceChanged` EXACTLY ONCE ──
+        //
+        // `AccountBalanceChanged` carries the whole account-level roll-up, so each emitting write
+        // now folds `margin_view::index_account_view` over the user's market index — the SAME unit of
+        // work `getAccount` is priced at 20_000 for (see the note on that selector below). Charging
+        // nothing for it would leave these selectors buying a fold PLUS their writes for what
+        // `getAccount` charges for the fold alone, which is the pricing gap the `getAccount`
+        // re-pricing exists to close — and `transferToPerp(1)` / `transferFromPerp(1)` are freely
+        // spammable, so the brake really would weaken. So: one `getAccount`-equivalent added to each
+        // selector whose emission count is exactly 1.
+        //
+        // `deposit` 50_000 → 70_000, `withdraw` 50_000 → 70_000, `transferToPerp` and
+        // `transferFromPerp` 20_000 → 40_000, `addPositionMargin` / `removePositionMargin` /
+        // `depositInsuranceFund` / `withdrawInsuranceFund` 30_000 → 50_000.
+        //
+        // ⚠️ DELIBERATELY NOT RAISED: `placeOrder` / `cancelOrder` (and therefore the batch per-item
+        // units, which are defined as those constants so they cannot drift), `liquidate`,
+        // `updateIndexPrice`. Reasons, per selector, are on those entries. FLAT per selector
+        // throughout — dynamic or per-event metering for this precompile was rejected outright.
+        m.insert(depositCall::SELECTOR, (70_000, false));
+        m.insert(withdrawCall::SELECTOR, (70_000, false));
+        m.insert(transferToPerpCall::SELECTOR, (40_000, false));
+        m.insert(transferFromPerpCall::SELECTOR, (40_000, false));
         // `getAccount` is the account-level margin roll-up over the per-user market index, so it is
         // priced in the "walks a per-user list" tier (20_000) alongside `getMarginInfo` /
         // `getOpenOrders`, NOT the 5_000 scalar-getter tier it used to sit in.
@@ -135,6 +155,25 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(setLeverageCall::SELECTOR, (20_000, false));
         m.insert(setLeverageSignedCall::SELECTOR, (20_000, false));
         // Trading
+        //
+        // NOT raised for the `AccountBalanceChanged` roll-up, on purpose:
+        //
+        // * `cancelOrder` emits NOTHING. A cancel moves no money now that the escrow is gone, so it
+        //   writes no account — `trading/mod.rs` contains no `save_account` / `mutate_account_balance`
+        //   call at all. By inspection, not by omission.
+        // * `placeOrder` emits NOTHING on a non-crossing placement either (`rest_in_book` reads the
+        //   account through `load_account_ref` and never writes it), which is the majority case —
+        //   raising the flat price would tax it for work it does not do. A CROSSING placement emits
+        //   `N + 3` (admin fee credit, N makers, the taker's flush write, the taker's debit), but each
+        //   of those folds runs against state the match has ALREADY made resident:
+        //   `MatchRegistry::get_or_load` loaded that user's position, account and both order lists,
+        //   and the walk loaded the `Market` and `MarketHot`. The marginal cost per maker is therefore
+        //   ~1 cold read (their `umkt` index blob) + ~4 warm probes + a ≤8-band tier walk, NOT a fresh
+        //   65-load fold. And `PLACE_ORDER_GAS` has always been flat over an unbounded-in-N match
+        //   (N settlements, N `Trade` + N `PositionChanged` logs, N position + N account writes): the
+        //   fold is a constant factor on a term this price already under-models, and a +30% bump
+        //   would not fix that structure while it WOULD raise the floor on every resting order. If
+        //   the flat-vs-N mismatch is to be priced, it should be priced as such, not here.
         m.insert(placeOrderCall::SELECTOR, (PLACE_ORDER_GAS, false));
         m.insert(cancelOrderCall::SELECTOR, (CANCEL_ORDER_GAS, false));
         // Batch place / cancel: floor only — see the doc comment on SELECTORS.
@@ -158,9 +197,15 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // `margin_view::MAX_MARGIN_INFO_MARKETS`.
         m.insert(getMarginInfoCall::SELECTOR, (20_000, true));
         m.insert(getAccountMarginCall::SELECTOR, (50_000, true));
-        m.insert(addPositionMarginCall::SELECTOR, (30_000, false));
-        m.insert(removePositionMarginCall::SELECTOR, (30_000, false));
+        // +20_000 each for the single `AccountBalanceChanged` roll-up they emit (see "Account").
+        m.insert(addPositionMarginCall::SELECTOR, (50_000, false));
+        m.insert(removePositionMarginCall::SELECTOR, (50_000, false));
         // Liquidation
+        //
+        // NOT raised: a liquidation emits up to `3 + 2 × adl_fills` roll-ups (residual, clearance
+        // fee, each ADL leg), but it is protocol-driven risk work whose flat price already spans an
+        // orderbook close plus an unbounded ADL loop bounded only by `adl_budget` — the same
+        // flat-vs-unbounded structure as `placeOrder`, and this change does not move it.
         m.insert(liquidateCall::SELECTOR, (150_000, false));
         // API key management
         m.insert(registerApiKeyCall::SELECTOR, (30_000, false));
@@ -180,10 +225,16 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
             (batch::BASE_BATCH_GAS, false),
         );
         // Insurance Fund
-        m.insert(depositInsuranceFundCall::SELECTOR, (30_000, false));
-        m.insert(withdrawInsuranceFundCall::SELECTOR, (30_000, false));
+        // +20_000 each for the single `AccountBalanceChanged` roll-up they emit (see "Account").
+        m.insert(depositInsuranceFundCall::SELECTOR, (50_000, false));
+        m.insert(withdrawInsuranceFundCall::SELECTOR, (50_000, false));
         m.insert(getInsuranceFundCall::SELECTOR, (5_000, true));
         // Index price
+        //
+        // NOT raised: the in-process liquidation sweep here can emit many roll-ups (up to the
+        // cap-50 sweep × per-liquidation events), and this selector was ALREADY the largest
+        // flat-price-vs-work gap in the table for exactly that reason. It is oracle/admin-only, not
+        // user-spammable, and pricing the sweep is a separate decision from this event.
         m.insert(updateIndexPriceCall::SELECTOR, (50_000, false));
         m.insert(getIndexPriceCall::SELECTOR, (5_000, true));
         m.insert(getFundingStateCall::SELECTOR, (5_000, true));

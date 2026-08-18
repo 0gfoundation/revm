@@ -116,6 +116,63 @@ fn pos(ctx: &mut TestCtx, user: Address) -> PerpPosition {
     storage::load_position(ctx, user, MARKET_ID).unwrap()
 }
 
+/// Read `getAccount(user)` through the full call shell.
+fn get_account(ctx: &mut TestCtx, user: Address) -> crate::interface::IPerpDex::getAccountReturn {
+    use crate::interface::IPerpDex::getAccountCall;
+    let out = run_perp_dex_call(
+        &getAccountCall { user }.abi_encode(),
+        1_000_000,
+        user,
+        U256::ZERO,
+        true,
+        ctx,
+    )
+    .unwrap();
+    assert!(!out.reverted, "getAccount reverted: {:?}", out.bytes);
+    getAccountCall::abi_decode_returns(&out.bytes).unwrap()
+}
+
+/// **Every field of an `AccountBalanceChanged` payload against `getAccount` for the same user in the
+/// CURRENT state.** This is the anti-divergence pin the shared producer exists for: the event and
+/// `getAccount` both encode `margin_view::index_account_view`, so a second implementation of any of
+/// these ten numbers — or one surface folding a different market set, or clamping where the other
+/// does not — fails here.
+///
+/// Only meaningful for a user's LAST event of a call (earlier ones are intermediate after-images by
+/// design), which is exactly how the callers use it.
+fn assert_event_matches_get_account(ctx: &mut TestCtx, event: &AccountBalanceChanged) {
+    let a = get_account(ctx, event.user);
+    let got = (
+        event.usdcBalance,
+        event.totalWalletBalance,
+        event.totalCrossWalletBalance,
+        event.totalMarginBalance,
+        event.totalUnrealizedProfit,
+        event.totalInitialMargin,
+        event.totalPositionInitialMargin,
+        event.totalOpenOrderInitialMargin,
+        event.totalMaintMargin,
+        event.availableBalance,
+    );
+    let want = (
+        a.usdcBalance,
+        a.totalWalletBalance,
+        a.totalCrossWalletBalance,
+        a.totalMarginBalance,
+        a.totalUnrealizedProfit,
+        a.totalInitialMargin,
+        a.totalPositionInitialMargin,
+        a.totalOpenOrderInitialMargin,
+        a.totalMaintMargin,
+        a.availableBalance,
+    );
+    assert_eq!(
+        got, want,
+        "AccountBalanceChanged and getAccount disagree for {:?}",
+        event.user
+    );
+}
+
 /// The DERIVED open-order requirement `ooIM` for `user` in the test market — the replacement for
 /// the deleted `pos.margin_reserved` field in every assertion that used to read it. Unlike that
 /// field this is not stored: it is recomputed from `(N, Bid, Ask, L)` and moves with the mark.
@@ -826,22 +883,75 @@ fn matched_call_emits_a_balance_event_at_each_balance_moving_write() {
         events.iter().map(|e| e.user).collect::<Vec<_>>(),
         vec![ADMIN, BOB, ALICE, ALICE]
     );
+
+    // ── The ACCEPTED intermediate snapshot, pinned rather than merely documented ──────────────
+    //
+    // ALICE emits TWICE: the registry flush writes her position + account, and `finalize_apply`
+    // then debits `total_required` from her wallet. The event's totals are ACCOUNT-level while the
+    // writes are per-(user, market), so her FIRST event is a real half-updated state: the position
+    // silo has been funded (`Σ positionMargin` already carries INIT_MARGIN) but the wallet has not
+    // yet paid for it, so `totalWalletBalance = cross + Σ positionMargin` counts the same money
+    // twice — over-stated by exactly `total_required`.
+    //
+    // This is the ACCEPTED behaviour of the multi-emit design, not a defect to paper over: what
+    // the event promises is an after-image of ITS OWN write, and consumers needing a settled
+    // account state take the LAST event per (user, tx) or poll `getAccount`. Pinning the arithmetic
+    // here is what makes the promise checkable — and what a future one-event-per-tx aggregation
+    // would have to change.
+    let alice_first = &events[2];
+    let alice_last = &events[3];
+    assert_eq!(
+        alice_first.totalCrossWalletBalance, WALLET as i64,
+        "pre-debit: the wallet is untouched"
+    );
+    assert_eq!(
+        alice_first.totalWalletBalance,
+        (WALLET + INIT_MARGIN) as i64,
+        "pre-debit gross wallet double-counts the silo the wallet has not funded yet"
+    );
+    assert_eq!(
+        alice_last.totalWalletBalance,
+        alice_first.totalWalletBalance - INIT_MARGIN as i64,
+        "the second event is the settled state: the phantom is exactly `total_required`"
+    );
+    assert_eq!(
+        alice_last.totalCrossWalletBalance,
+        (WALLET - INIT_MARGIN) as i64
+    );
+    // `Σ positionMargin` is the term that carries the silo into `totalWalletBalance`; it is what
+    // makes the intermediate event distinguishable, and it moves with the position write, not the
+    // wallet write. (This market's `mark_price` is 0, so the mark-derived totals — PIM, MM — are 0
+    // here by construction; `margin_view_tests` covers them at a live mark.)
+    assert_eq!(alice_last.totalWalletBalance, WALLET as i64);
+
     // Every event carries that account's values AS OF its write, so the LAST event for a user is its
-    // final state. Each user's final event is checked against the stored account below.
+    // final state. Each user's final event must agree with `getAccount` FIELD FOR FIELD — the event
+    // now carries the same account-level roll-up, from the same producer.
     let mut last: std::collections::BTreeMap<Address, _> = std::collections::BTreeMap::new();
-    for event in events {
+    for event in events.iter() {
         last.insert(event.user, event);
     }
-    for (user, event) in last {
-        let acct = storage::load_account(&mut ctx, user).unwrap();
+    for (user, event) in &last {
+        let acct = storage::load_account(&mut ctx, *user).unwrap();
         let usdc: U256 = acct.usdc_balance.clone().into();
         assert_eq!(event.usdcBalance, usdc, "final event for {user:?}");
+        // The wallet field is SIGNED and unclamped now: it is the stored value verbatim, not
+        // `visible_perp_wallet_balance()`.
         assert_eq!(
-            event.perpWalletBalance,
-            acct.visible_perp_wallet_balance(),
+            event.totalCrossWalletBalance, acct.perp_wallet_balance,
             "final event for {user:?}"
         );
+        assert_event_matches_get_account(&mut ctx, event);
     }
+    // ...and the intermediate one does NOT agree — the assertion above would be vacuous if every
+    // event happened to be consistent, so pin that the earlier ALICE event is genuinely a different
+    // state from the one `getAccount` reports now.
+    assert_ne!(
+        alice_first.totalWalletBalance,
+        get_account(&mut ctx, ALICE).totalWalletBalance,
+        "if this ever passes, the multi-emit design stopped producing intermediate snapshots and \
+         the ACCEPTED-intermediate contract above is stale"
+    );
 }
 
 #[test]
@@ -1163,7 +1273,14 @@ fn a_short_silo_lowers_the_maintenance_buffer_it_is_measured_against() {
 /// where there is a position to carry it, and do NOT open a second insurance-fund path), and it is
 /// bounded by the fee. It is also the one place Binance's own wallet goes negative: R11 measured
 /// `−0.25717240`, exactly the fill commission, cleared by `INSURANCE_CLEAR` seconds later. Ours is
-/// not cleared, so `perp_wallet_balance: i64` and its clamped ABI view stay.
+/// not cleared, so `perp_wallet_balance: i64` stays.
+///
+/// **This state is the reason `AccountBalanceChanged` had to become signed.** The event's wallet
+/// field used to be `uint64 perpWalletBalance` and floored at 0, so the very deficit this test
+/// produces was invisible to anyone watching only the event stream — the field reported `0` while
+/// the ledger held `−12_000`. The assertions below pin the fixed behaviour: the event reports
+/// `totalCrossWalletBalance == −12_000` unclamped, and a hypothetical clamped reading would have
+/// said `0`.
 ///
 /// Arithmetic: BOB is long QTY at entry $100 with a leverage-3 silo of 333_333 and an EMPTY wallet,
 /// and rests a sell at the $60 mark (a pure reduce, so `ooIM = 0` admits it for free). The close
@@ -1210,6 +1327,8 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
     assert_eq!(oo_im(&mut ctx, BOB), 0, "still free once it is resting");
 
     let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    // Drain the setup's own events so the balance after-images below belong to the fill alone.
+    let _ = JournalTr::take_logs(ctx.journal_mut());
     place(&mut ctx, ALICE, 0, 60 * TICK, QTY, 0, 0); // taker buy fills BOB
     assert_terminal(&mut ctx, bob_sell);
 
@@ -1228,13 +1347,37 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
         "the wallet went negative by EXACTLY the commission and no more — no margin shortfall \
          reaches it any more (that is the M1 cap), only a fee with nothing left to absorb it"
     );
+    // ── THE TASK-A PIN: the deficit reaches the EVENT STREAM, unclamped ──────────────────────
+    let bob_events = JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
+        .map(|log| {
+            AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+        })
+        .filter(|e| e.user == BOB)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bob_events.len(),
+        1,
+        "one write moved BOB's wallet: the flush"
+    );
+    assert_eq!(
+        bob_events[0].totalCrossWalletBalance, -maker_fee,
+        "the event reports the DEFICIT. Under the retired `uint64 perpWalletBalance` this read 0 \
+         and an operator watching only the event stream could not see it accumulate."
+    );
     assert_eq!(
         storage::load_account(&mut ctx, BOB)
             .unwrap()
             .visible_perp_wallet_balance(),
         0,
-        "clamped at the ABI boundary; `getAccountMargin`'s int64 surface reports the true value"
+        "what a CLAMPED reading would have said — kept as the contrast, used by no published surface"
     );
+    // BOB is flat with no orders, so he has left the market index entirely: the event's totals are
+    // an EMPTY fold plus the raw wallet, and it still agrees with `getAccount` field for field.
+    assert_eq!(bob_events[0].totalWalletBalance, -maker_fee, "no silos left");
+    assert_eq!(bob_events[0].availableBalance, -maker_fee, "no ooIM left");
+    assert_event_matches_get_account(&mut ctx, &bob_events[0]);
     // Not a mint: the fee recipient really was paid, and the insolvent close's beyond-margin slice
     // really did reach the fund. The negative is the funding gap between the two.
     assert_eq!(wallet(&mut ctx, ADMIN), maker_fee as u64);

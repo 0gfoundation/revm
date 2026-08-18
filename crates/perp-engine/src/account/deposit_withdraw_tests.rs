@@ -303,13 +303,19 @@ fn get_account_returns_zero_for_new_user() {
 /// `availableBalance` (reported `0.00000000` against a true `-0.00085981`). Every balance-like
 /// field is now `int64` and reports the sign.
 ///
-/// `AccountBalanceChanged.perpWalletBalance` still floors at 0 (it is `uint64`), so this is now the
-/// cheap way for an operator to see a deficit without polling `getAccountMargin`.
+/// The EVENT reports it too, and this test pins that: `AccountBalanceChanged` used to project the
+/// wallet through a `uint64` floored at 0, so a deficit never reached the log stream at all.
+///
+/// Doubles as the **empty-market-index** case: ALICE holds no position and no order, so `umkt` is
+/// empty and every Σ folds over nothing. That must produce all-zero totals and NOT revert — on both
+/// surfaces, including the one now reached from a WRITE path.
 #[test]
 fn get_account_on_a_bare_account_reports_a_negative_cross_wallet_unclamped() {
     let mut ctx = make_ctx(U256::ZERO);
     let mut account = storage::load_account(&mut ctx, ALICE).unwrap();
     account.perp_wallet_balance = -1_000_000;
+    // This write EMITS, and the emission itself folds the (empty) index — so an empty index that
+    // reverted would take the write down with it.
     storage::save_account(&mut ctx, ALICE, account).unwrap();
 
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
@@ -323,13 +329,71 @@ fn get_account_on_a_bare_account_reports_a_negative_cross_wallet_unclamped() {
     assert_eq!(a.totalWalletBalance, -1_000_000);
     assert_eq!(a.totalMarginBalance, -1_000_000);
     assert!(a.marketIds.is_empty());
-    // The clamped surface still floors — that is the contrast this pins.
+
+    // ── The same numbers on the EVENT, unclamped, from the write above ───────────────────────
+    let events = JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
+        .map(|log| {
+            AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    let e = &events[0];
+    assert_eq!(
+        (
+            e.totalCrossWalletBalance,
+            e.totalWalletBalance,
+            e.totalMarginBalance,
+            e.availableBalance
+        ),
+        (-1_000_000, -1_000_000, -1_000_000, -1_000_000),
+        "the deficit reaches the LOG STREAM now; the retired uint64 field reported 0 here"
+    );
+    // Empty index ⇒ every fold is over nothing.
+    assert_eq!(
+        (
+            e.totalUnrealizedProfit,
+            e.totalInitialMargin,
+            e.totalPositionInitialMargin,
+            e.totalOpenOrderInitialMargin,
+            e.totalMaintMargin
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    // ...and it matches `getAccount` field for field, which is the anti-divergence pin.
+    assert_eq!(
+        (
+            e.usdcBalance,
+            e.totalWalletBalance,
+            e.totalCrossWalletBalance,
+            e.totalMarginBalance,
+            e.totalUnrealizedProfit,
+            e.totalInitialMargin,
+            e.totalPositionInitialMargin,
+            e.totalOpenOrderInitialMargin,
+            e.totalMaintMargin,
+            e.availableBalance
+        ),
+        (
+            a.usdcBalance,
+            a.totalWalletBalance,
+            a.totalCrossWalletBalance,
+            a.totalMarginBalance,
+            a.totalUnrealizedProfit,
+            a.totalInitialMargin,
+            a.totalPositionInitialMargin,
+            a.totalOpenOrderInitialMargin,
+            a.totalMaintMargin,
+            a.availableBalance
+        )
+    );
+    // What a CLAMPED reading would have said — no published surface uses it any more.
     assert_eq!(
         storage::load_account_ref(&mut ctx, ALICE)
             .unwrap()
             .visible_perp_wallet_balance(),
-        0,
-        "the uint64 event projection still floors; only the ABI view is honest"
+        0
     );
 }
 
@@ -412,8 +476,12 @@ fn successful_call_emits_one_final_balance_after_image() {
     )
     .unwrap();
     assert!(!output.reverted);
-    // Balance after-image events are free: the call is charged only the flat deposit gas.
-    assert_eq!(output.gas_used, 50_000);
+    // Gas is FLAT per selector — one number for the whole call regardless of how many events it
+    // emits (per-event metering is rejected outright). The number went 50_000 → 70_000 when the
+    // event grew into the account-level roll-up: the emission now folds the user's market index,
+    // which is exactly the work `getAccount` is priced at 20_000 for, so the flat constant absorbs
+    // one `getAccount`-equivalent. See the note on the `SELECTORS` account block.
+    assert_eq!(output.gas_used, 70_000);
 
     let events = JournalTr::take_logs(ctx.journal_mut())
         .into_iter()
@@ -425,9 +493,17 @@ fn successful_call_emits_one_final_balance_after_image() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].user, ALICE);
     assert_eq!(events[0].usdcBalance, amount);
-    // The event carries the CROSS wallet (renamed from `availablePerpBalance` with the escrow
-    // removal): a deposit only moves spot USDC, so the perp wallet is still 0.
-    assert_eq!(events[0].perpWalletBalance, 0);
+    // A deposit only moves SPOT USDC, so every perp-side total is still 0 — and the account has no
+    // market index at all, which is the "empty index folds to all zeros, no revert" case.
+    assert_eq!(events[0].totalCrossWalletBalance, 0);
+    assert_eq!(events[0].totalWalletBalance, 0);
+    assert_eq!(events[0].totalMarginBalance, 0);
+    assert_eq!(events[0].totalUnrealizedProfit, 0);
+    assert_eq!(events[0].totalInitialMargin, 0);
+    assert_eq!(events[0].totalPositionInitialMargin, 0);
+    assert_eq!(events[0].totalOpenOrderInitialMargin, 0);
+    assert_eq!(events[0].totalMaintMargin, 0);
+    assert_eq!(events[0].availableBalance, 0);
 }
 
 #[test]
@@ -443,7 +519,8 @@ fn reverted_call_emits_no_balance_after_image() {
     )
     .unwrap();
     assert!(output.reverted);
-    assert_eq!(output.gas_used, 50_000);
+    // A reverted call still pays the flat selector price (70_000 post-roll-up), and emits nothing.
+    assert_eq!(output.gas_used, 70_000);
     assert!(JournalTr::take_logs(ctx.journal_mut())
         .iter()
         .all(|log| log.data.topics().first() != Some(&AccountBalanceChanged::SIGNATURE_HASH)));

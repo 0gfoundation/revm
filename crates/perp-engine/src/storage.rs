@@ -13,8 +13,8 @@ use crate::{
         errors::{perp_err, perp_invariant_err},
     types::{
         ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, MarketHot, Order,
-        OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
-        PublicAccountBalance, UserAccount, UserFeeRates, MAX_USER_MARKETS,
+        OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount,
+        UserFeeRates, MAX_USER_MARKETS,
     },
     PerpError,
 };
@@ -349,7 +349,8 @@ pub fn load_account_ref<H: PerpHost>(
         .unwrap_or_else(|| std::sync::Arc::new(UserAccount::default())))
 }
 
-/// Emits `AccountBalanceChanged` for `user` right here, at the write site.
+/// Emits `AccountBalanceChanged` for `user` right here, at the write site — **after** the write, so
+/// the event is a true after-image of everything the store now holds.
 ///
 /// One event per balance-moving write, emitted by the write site itself — no de-duplication, no
 /// coalescing, no call-scoped state, and no change DETECTION: the caller picks the emitting entry
@@ -359,7 +360,7 @@ pub fn load_account_ref<H: PerpHost>(
 /// It replaces the former call-scoped after-image tracker (a `BTreeMap` baseline per touched
 /// account, drained and re-read at the end of the top-level call to emit one coalesced event per
 /// user). That machinery cost, per account write, a pre-write account read plus two
-/// `PublicAccountBalance` constructions — each cloning the decimal `usdc_balance` String and
+/// after-image constructions — each cloning the decimal `usdc_balance` String and
 /// parsing it to `U256` — plus a third construction at drain time, to suppress events that a
 /// consumer can just as easily ignore. Emitting directly is one construction, no baseline read, no
 /// map, and no drain.
@@ -368,27 +369,110 @@ pub fn load_account_ref<H: PerpHost>(
 /// each maker fill it takes part in), an account whose balance nets back to its starting value still
 /// reports the intermediate writes, and events appear interleaved with `Trade`/`PositionChanged` in
 /// write order rather than appended in address order at the end of the call.
+///
+/// # What it costs, and why it is NOT free any more
+///
+/// The event carries the whole account-level scalar set (`totalWalletBalance`, `Σ IM/PIM/ooIM/MM`,
+/// `Σ uPnL`, `availableBalance`), which only exists as a fold over the user's market index. So this
+/// pays one [`crate::margin_view::index_account_view`] walk per emission: ≤ `MAX_USER_MARKETS` (16)
+/// markets × ≤ 4 `_ref` loads (2 when the user has no resting sells in that market — the
+/// `total_sell_qty == 0` short-circuit), i.e. ≤ 65 loads, all cache-fill and none entering the block
+/// delta. The realistic single-market case is 3 loads (index + market + position), 5 with resting
+/// sells.
+///
+/// Gas stays FLAT PER SELECTOR — never per event, never dynamic. The eight selectors that emit
+/// exactly one of these were each raised by one `getAccount`-equivalent (20_000) to pay for the
+/// fold; `placeOrder`/`cancelOrder`/`liquidate`/`updateIndexPrice` deliberately were not. The
+/// per-selector reasoning is on the `SELECTORS` table in [`crate::call`].
+///
+/// ## Why the walk is not reused from a gate walk that already happened
+///
+/// Several of the emitting call paths DO evaluate `derived_available_balance` nearby (the taker
+/// debit, `transferFromPerp`, `addPositionMargin`, `depositInsuranceFund`), and it is tempting to
+/// hand that result to the event. Two things stop it:
+///
+/// * **No existing walk is over the post-write state.** Every one of them runs BEFORE its write (it
+///   is an admission gate), so reusing it means patching its result by the write's own delta — a
+///   second, per-site route to the nine published numbers. That is exactly the divergence risk the
+///   single producer exists to remove, and `getAccount` would no longer be the only other consumer.
+/// * **The lean gate returns one number.** `total_open_order_initial_margin` folds only `Σ ooIM` and
+///   discards the per-market `PIM`/`maintMargin`/`uPnL`/`Σ isolatedWallet` accumulators the event
+///   needs. Widening it to the full fold ([`crate::margin_view::fold_account_margin`]) would cost no
+///   extra LOADS — same `market`/`position`/`MarketHot`/sell-list reads, the tier table is already in
+///   the loaded `Market` — only extra arithmetic. But the hottest walk it would widen is
+///   `trading::rest_in_book`'s, and **the rest path writes no account and therefore emits nothing**,
+///   so widening it buys the event nothing at all. The one hot site where reuse could pay is the
+///   taker debit, worth exactly ONE walk out of the `N + 3` an N-maker match emits.
+///
+/// The O(N) term is the maker flush, which has no gate walk to reuse under any variant (M1 gates
+/// makers on the raw cross wallet, not the derived available), so no reuse scheme moves the number
+/// that matters. Aggregation does — see below.
+///
+/// # 🔜 WHERE THE PLANNED AGGREGATION HOOKS
+///
+/// The follow-up is **one event per user per TRANSACTION, emitted last** — which is also the only
+/// version whose numbers are always a consistent account state (see the ⚠️ on the ABI event). It
+/// hooks HERE and nowhere else: this function stops logging and instead records `user` in a
+/// call-scoped touched-set (the natural home is `TypedPerpStore`, which is already call-scoped and
+/// already keyed by `Address`), and `call::run_perp_dex_call` drains that set on the SUCCESS path
+/// only — after the dispatch returns Ok, before the gas is reported — emitting one
+/// `index_account_view` per distinct user in address order. Nothing else moves: the event shape is
+/// already an account-level snapshot rather than a per-write delta, precisely so that collapsing N
+/// emissions to 1 changes only WHEN it fires.
+///
+/// What it would save, measured in walks. A taker match against N makers emits
+/// **N + 3** events today, one walk each:
+///
+/// ```text
+///   1   admin fee credit            (MatchRegistry::flush, admin_credit_pending)
+///   N   maker accounts              (the flush's per-user save_position + save_account loop)
+///   1   the TAKER's account         (same loop — the taker is a registry member too)
+///   1   the taker's margin+fee debit (finalize_apply → mutate_account_balance)
+/// ```
+///
+/// Pinned by `trading::tests::matched_call_emits_a_balance_event_at_each_balance_moving_write`
+/// (N = 1 ⇒ `[ADMIN, BOB, ALICE, ALICE]`, four events). N is bounded by book depth and gas; the
+/// registry's own ceiling is `MAX_LIQUIDATION_MAKER_ACCOUNTS` = 128 on the liquidation path, so the
+/// worst case is ~131 walks ≈ 8 500 loads, and the realistic single-market case is ~4 walks ≈ 12
+/// loads for N = 1.
+///
+/// Aggregation makes it **one walk per DISTINCT user**, so it does NOT help the maker side (all
+/// parties distinct ⇒ still N + 2). What it removes is the REPEAT emitters:
+/// * the TAKER, which appears twice above (flush + debit) ⇒ N + 3 → N + 2 for every match;
+/// * a liquidation, which emits for the same user at the residual, the clearance fee, and each ADL
+///   leg (up to 3 + `adl_budget` walks for one address collapsing to 1);
+/// * a batch of K items, which emits up to K times for the SAME initiator ⇒ K → 1, i.e. −(K−1)
+///   walks, up to −63 walks ≈ −4 000 loads at `MAX_BATCH_PLACE` = 64.
+///
+/// It also removes every intermediate half-updated snapshot from the stream, which is the
+/// correctness reason to do it and the bigger prize.
 fn emit_account_balance_changed<H: PerpHost>(
     context: &mut H,
     user: Address,
-    account: &UserAccount,
-) {
-    let PublicAccountBalance {
-        usdc_balance,
-        perp_wallet_balance,
-    } = account.public_balance();
+) -> Result<(), PerpError> {
+    let view = crate::margin_view::index_account_view(context, user, "AccountBalanceChanged")?;
+    let s = view.scalars;
     context.log(primitives::Log {
         address: PERP_DEX_ADDRESS,
         data: {
             use alloy_primitives::IntoLogData;
             crate::interface::IPerpDex::AccountBalanceChanged {
                 user,
-                usdcBalance: usdc_balance,
-                perpWalletBalance: perp_wallet_balance,
+                usdcBalance: view.usdc_balance,
+                totalWalletBalance: s.total_wallet_balance,
+                totalCrossWalletBalance: s.total_cross_wallet_balance,
+                totalMarginBalance: s.total_margin_balance,
+                totalUnrealizedProfit: s.total_unrealized_profit,
+                totalInitialMargin: s.total_initial_margin,
+                totalPositionInitialMargin: s.total_position_initial_margin,
+                totalOpenOrderInitialMargin: s.total_open_order_initial_margin,
+                totalMaintMargin: s.total_maint_margin,
+                availableBalance: s.available_balance,
             }
             .to_log_data()
         },
     });
+    Ok(())
 }
 
 pub fn save_account<H: PerpHost>(
@@ -396,9 +480,11 @@ pub fn save_account<H: PerpHost>(
     user: Address,
     account: UserAccount,
 ) -> Result<(), PerpError> {
-    emit_account_balance_changed(context, user, &account);
+    // Write FIRST: the event is folded from the store (so it cannot drift from `getAccount`), so it
+    // has to see this write. It used to be emitted before `set_account` — harmless when the payload
+    // was the by-value `account` itself, wrong now.
     typed_store_mut(context).set_account(user, account);
-    Ok(())
+    emit_account_balance_changed(context, user)
 }
 
 pub fn save_position_reservation_only<H: PerpHost>(
@@ -468,22 +554,21 @@ pub fn mutate_account_balance<H: PerpHost, R>(
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,
 ) -> Result<R, PerpError> {
-    let (r, after) = if let Some(a) = typed_store_mut(context).account_mut(user) {
-        let r = f(a);
-        (r, a.clone())
+    // No after-image is carried out of here: the emitter re-reads the (now-written) store, which is
+    // what makes the event byte-identical to `getAccount`. That also removed the `a.clone()` the
+    // fast path used to pay purely to hand the emitter a payload — a full `UserAccount` deep clone,
+    // `usdc_balance` String allocation included, on every credit/debit.
+    let r = if let Some(a) = typed_store_mut(context).account_mut(user) {
+        f(a)
     } else {
         let mut a = load_account(context, user)?;
         let r = f(&mut a);
-        typed_store_mut(context).set_account(user, a.clone());
-        (r, a)
+        typed_store_mut(context).set_account(user, a);
+        r
     };
-    emit_account_balance_changed(context, user, &after);
+    emit_account_balance_changed(context, user)?;
     Ok(r)
 }
-
-/// Starts balance tracking for a top-level call. Balance after-image events are free (flat
-
-
 
 /// Attaches the batch single-initiator working-set for `owner` (see
 /// [`crate::typed_store::TypedPerpStore::begin_batch`]). Called by `drive_batch` before

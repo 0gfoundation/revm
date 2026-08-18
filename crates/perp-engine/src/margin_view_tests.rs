@@ -734,12 +734,13 @@ fn available_balance_is_reported_negative_not_clamped() {
     assert!(a2.availableBalance < 0, "must not be clamped at zero");
 }
 
-/// Every balance-like field on `getAccountMargin` is `int64` and passes a negative through. The
-/// remaining CLAMPED surface is `AccountBalanceChanged.perpWalletBalance` (a `uint64` event field),
-/// reached here through `visible_perp_wallet_balance` for contrast — `getAccount` used to clamp too
-/// and no longer does.
+/// Every balance-like field on `getAccountMargin` is `int64` and passes a negative through. There is
+/// no CLAMPED surface left: `getAccount` used to clamp (as `availablePerpBalance`) and
+/// `AccountBalanceChanged` used to clamp (as `uint64 perpWalletBalance`); neither does now.
+/// `visible_perp_wallet_balance` survives only as the contrast asserted below — what a clamped
+/// reading WOULD have said.
 #[test]
-fn cross_wallet_and_margin_balance_are_signed_where_the_event_projection_clamps() {
+fn cross_wallet_and_margin_balance_are_signed_where_a_clamped_reading_would_not_be() {
     let mut ctx = make_ctx();
     setup_a(&mut ctx);
     storage::save_account(
@@ -761,7 +762,7 @@ fn cross_wallet_and_margin_balance_are_signed_where_the_event_projection_clamps(
             .unwrap()
             .visible_perp_wallet_balance(),
         0,
-        "the AccountBalanceChanged uint64 projection, for contrast"
+        "what a clamped reading would report, for contrast — no published surface does this"
     );
 }
 
@@ -1305,6 +1306,118 @@ fn get_account_totals_equal_the_sum_of_per_market_get_margin_info() {
     );
 }
 
+/// ONE IMPLEMENTATION, NOT TWO — **the `AccountBalanceChanged` leg.** The event carries the same
+/// account-level scalar set `getAccount` returns, and this is the test that fails if they ever
+/// diverge for the SAME state.
+///
+/// Method: take the rich two-market fixture (a long with resting orders on both sides so the joint
+/// `max()` and the Assuming-Price uplift are both live, plus a short on a fractional grid with an
+/// under-funded silo, at live marks so `PIM`/`maintMargin`/`uPnL` are all non-zero), then force an
+/// account write whose net effect on the ledger is ZERO — `credit_perp(0)`. The emitted after-image
+/// is therefore an after-image of *exactly* the state `getAccount` is then asked about, so the two
+/// must agree on all ten fields with no reasoning about intermediate snapshots at all.
+///
+/// A zero-delta write is not a path the engine takes; it is the cleanest way to isolate the
+/// PRODUCER. `trading::tests::matched_call_emits_a_balance_event_at_each_balance_moving_write`
+/// covers the same agreement on a real money-moving call.
+#[test]
+fn the_event_and_get_account_agree_field_for_field_on_the_same_state() {
+    use crate::interface::IPerpDex::AccountBalanceChanged;
+    use alloy_sol_types::SolEvent;
+
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    add_market(
+        &mut ctx,
+        MARKET_B,
+        B_BASE_DECIMALS,
+        B_PRICE_DECIMALS,
+        12_345,
+    );
+    fund(&mut ctx, ALICE, 5_000 * USD);
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        3,
+        -(300 * USD as i64),
+        300 * USD as i64,
+        2,
+    );
+    set_orders(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        &[entry(1, P100, 2), entry(2, P60, 5)],
+        &[entry(3, P100, 4), entry(4, 12_000, 3)],
+    );
+    set_position(&mut ctx, ALICE, MARKET_B, -3, 300, 200, 1);
+
+    // A write that moves nothing: the after-image is the state as it stands.
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    storage::mutate_account_balance(&mut ctx, ALICE, |a| a.credit_perp(0))
+        .unwrap()
+        .unwrap();
+    let events = JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
+        .map(|log| {
+            AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    let e = &events[0];
+
+    let a = get_account(&mut ctx, ALICE);
+    assert_eq!(
+        (
+            e.user,
+            e.usdcBalance,
+            e.totalWalletBalance,
+            e.totalCrossWalletBalance,
+            e.totalMarginBalance,
+            e.totalUnrealizedProfit,
+            e.totalInitialMargin,
+            e.totalPositionInitialMargin,
+            e.totalOpenOrderInitialMargin,
+            e.totalMaintMargin,
+            e.availableBalance,
+        ),
+        (
+            ALICE,
+            a.usdcBalance,
+            a.totalWalletBalance,
+            a.totalCrossWalletBalance,
+            a.totalMarginBalance,
+            a.totalUnrealizedProfit,
+            a.totalInitialMargin,
+            a.totalPositionInitialMargin,
+            a.totalOpenOrderInitialMargin,
+            a.totalMaintMargin,
+            a.availableBalance,
+        ),
+        "the event and getAccount must be the same numbers — they share one producer, \
+         `margin_view::index_account_view`, over one market set (the per-user index)"
+    );
+    // The fixture has to exercise every term, or the equality above proves little.
+    assert!(
+        e.totalOpenOrderInitialMargin > 0
+            && e.totalPositionInitialMargin > 0
+            && e.totalMaintMargin > 0
+            && e.totalUnrealizedProfit != 0
+            && e.totalWalletBalance != e.totalCrossWalletBalance,
+        "fixture must make every scalar non-trivial: {:?}",
+        (
+            e.totalOpenOrderInitialMargin,
+            e.totalPositionInitialMargin,
+            e.totalMaintMargin,
+            e.totalUnrealizedProfit,
+            e.totalWalletBalance,
+            e.totalCrossWalletBalance
+        )
+    );
+}
+
 /// ONE IMPLEMENTATION, NOT TWO: handed the same market set, the index-driven and list-driven views
 /// agree on every shared field, bit for bit.
 ///
@@ -1535,5 +1648,26 @@ fn the_views_write_nothing() {
         before,
         "the derived margin views must not dirty a single key — a write here would move the \
          block commitment"
+    );
+
+    // ── ...AND the same fold reached from the EVENT path adds no key either ───────────────────
+    //
+    // `AccountBalanceChanged` now carries this whole roll-up, so `index_account_view` runs on every
+    // balance-moving account WRITE. If any loader it reaches were not a `_ref`/cache-fill reader it
+    // would dirty extra keys, and the perp block commitment — whose input is exactly the block's net
+    // key→value delta (`perp_core::compute_block_commitment`) — would move for a reason that has
+    // nothing to do with what the call actually changed. This is the mechanical confirmation that the
+    // golden commitment cannot shift because of the event: the WRITE contributes its one account key
+    // (counted here), the fold behind the log contributes none, and log data is EVM-journaled and
+    // never enters the perp delta at all.
+    let before_write = PerpHost::perp_write_count(&ctx);
+    storage::mutate_account_balance(&mut ctx, ALICE, |a| a.credit_perp(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        PerpHost::perp_write_count(&ctx),
+        before_write + 1,
+        "the account write dirties exactly ONE key; the event's Σ-over-markets fold behind it adds \
+         none. More than one here means a loader on the emit path stopped being a `_ref` reader."
     );
 }
