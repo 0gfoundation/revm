@@ -232,8 +232,8 @@ pub fn max_leverage_for_notional(tiers: &MarginTiers, abs_notional: i64) -> u32 
 // [`ask_notional_at_assuming_price`]). The two branches are the exposure left if every buy fills
 // and if every sell fills.
 //
-// Formula source: `misc/binance-margin-verified-model.md` §1.1 (formula set), §1.5 (the
-// Assuming-Price basis) and §2 (rounding), plus
+// Formula source: `misc/binance-margin-verified-model.md` §1.1 (formula set), its §1.6 /
+// 2026-08-18 correction block (the Assuming-Price basis) and §2 (rounding), plus
 // `misc/binance-v3-account-balance-field-reference.md` §2/§4. Every rounding decision below is the
 // one those documents settled against mainnet samples; see the doc comments.
 

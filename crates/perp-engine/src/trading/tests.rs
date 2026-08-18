@@ -9703,8 +9703,16 @@ mod derived_ooim_divergence {
 
 // ── The Assuming Price: what a resting SELL is actually charged ──────────────────────────────
 //
-// `misc/binance-flip-and-admission.md` §1.6b / §3.4 and `misc/binance-margin-verified-model.md`
-// §1.5. A SHORT order's margin is priced at
+// `misc/binance-flip-and-admission.md` §1.6b / §3.4 / §3.7 and `misc/binance-margin-verified-model.md`
+// §1.6 (its 2026-08-18 correction block, lines ~38-55).
+//
+// ⚠️ Do NOT cite that file's §1.5 for this. Its ⚠ still asserts the OPPOSITE — that
+// `openOrderInitialMargin` is priced at the limit price, "实测逐位相等". That measurement was taken
+// with the sells resting 4.3% ABOVE mark, where `limit == Assuming`, so it does not discriminate
+// between the two rules; the §1.6 correction block supersedes it. The two sections of that file
+// currently disagree, and a reader who follows the stale one will conclude this code is wrong.
+//
+// A SHORT order's margin is priced at
 //
 //     Assuming Price = max(Last Price × 1.0015, Mark, order price)
 //

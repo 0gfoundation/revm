@@ -58,6 +58,66 @@ pub struct UserAccount {
     /// only that a negative true value is representable and that under-coverage is never swept. A
     /// maker fill whose wallet cannot cover the opening margin therefore fills and drives this
     /// negative (`trading::settlement::settle_maker_fill_core`).
+    ///
+    /// # A negative value is a RECEIVABLE, not a loss — and NOT protocol bad debt
+    ///
+    /// This has been settled by construction, not by argument. `risk::tests::usdc_custody` builds
+    /// the worst end state through real calls — an underfunded maker fill drives this field
+    /// negative, and the position it funded is then liquidated INSOLVENT so the Insurance Fund
+    /// covers the part the silo could not — and asserts the full custody identity against the
+    /// on-trie ERC-20 USDC the precompile really holds:
+    ///
+    /// ```text
+    /// erc20(USDC, PERP_DEX) == Σ usdc_balance + Σ perp_wallet_balance + Σ position.margin
+    ///                          + insurance_fund + Σ (v_quote + signed_value(mark, amount))
+    /// ```
+    ///
+    /// It closes EXACTLY with the negative term in it. Three consequences, each pinned by that
+    /// test:
+    ///
+    /// * **Nothing is over-promised.** The deficit enters the identity as a NEGATIVE claim, so the
+    ///   sum of what everyone can withdraw is still ≤ what the DEX custodies. Clamping the field
+    ///   at 0 is what breaks the identity — by exactly the deficit. The negative sign is
+    ///   load-bearing accounting, not a placeholder.
+    /// * **It cannot be walked away from through the perp layer.** `available` is
+    ///   `perp_wallet_balance − Σ ooIM`, so a negative wallet refuses every money-out gate that
+    ///   reads it (`transferFromPerp`, `addPositionMargin`, `depositInsuranceFund`) and every
+    ///   risk-increasing admission; and because the deficit is ONE signed field, the next deposit
+    ///   NETS against it automatically rather than landing in a fresh spendable bucket.
+    /// * **The deficit is NOT double-counted with the Insurance Fund.** They are disjoint slices of
+    ///   one loss: the wallet went negative to FUND `position.margin`, and the fund absorbs only
+    ///   what the realized loss exceeded that margin by (`apply_position_fill` /
+    ///   `settle_liquidation_residual_at_mark_price` never debit a wallet — isolated margin). The
+    ///   test pins the exact split: own deposited cash + receivable + IF absorption ==
+    ///   the whole realized loss, to the unit.
+    ///
+    /// ## ⛔ Do NOT "fix" this by absorbing the deficit from the Insurance Fund
+    ///
+    /// It is the change this shape invites, and it is strictly worse than leaving the deficit
+    /// alone. Custody would still balance (the fund falls, the wallet rises), so the conservation
+    /// gates would not object — but it FORGIVES a debt the protocol can still collect, turning a
+    /// receivable into a socialised write-off and letting a user go negative and walk away with the
+    /// fund eating it. It also creates the very double count the audit worried about: with that fix
+    /// wired up, the test above measures the fund absorbing the beyond-margin shortfall PLUS the
+    /// receivable. Two assertions there fail on purpose if anyone adds it. Leave them failing.
+    ///
+    /// Binance's behaviour is the same: an under-covered lien is left under-covered and never
+    /// swept (`misc/binance-margin-verified-model.md` §1.6 — at
+    /// `crossWalletBalance − totalOpenOrderInitialMargin = −0.00085981` an already-resting order
+    /// stayed `status = 'NEW'` for the whole observation window while a NEW order was refused
+    /// `-2019` in the same instant; the doc's instruction to implementers is that no mid-life
+    /// teardown logic is needed).
+    ///
+    /// ## Observability
+    ///
+    /// The true signed value IS readable through the ABI: `getAccountMargin` returns
+    /// `int64 walletBalance` and `int64 availableBalance` unclamped. Only the `uint64` surfaces —
+    /// `getAccount().availablePerpBalance` and the `AccountBalanceChanged` after-image, both via
+    /// [`UserAccount::visible_perp_wallet_balance`] — floor at 0, matching Binance's own clamped
+    /// `availableBalance` (`misc/binance-v3-account-balance-field-reference.md`, the
+    /// `availableBalance` row / R5: computed `−0.00085981`, reported `0.00000000`). An operator
+    /// watching only the EVENT stream therefore cannot see an accumulating deficit and must poll
+    /// `getAccountMargin`.
     #[serde(rename = "PB")]
     pub perp_wallet_balance: i64,
 
@@ -112,8 +172,20 @@ pub struct PublicAccountBalance {
 }
 
 impl UserAccount {
-    /// The CROSS perp wallet clamped at 0, as exposed in `AccountBalanceChanged`. Negative
-    /// internal balances are reported as zero until liquidation/bankruptcy handling is wired.
+    /// The CROSS perp wallet clamped at 0, as exposed in `AccountBalanceChanged`.
+    ///
+    /// The clamp exists because the ABI field is `uint64`, NOT because a negative balance is an
+    /// unfinished state awaiting a bankruptcy subsystem: a negative
+    /// [`UserAccount::perp_wallet_balance`] is a settled, self-consistent RECEIVABLE (see that
+    /// field's docs). Binance clamps the analogous `availableBalance` the same way — measured
+    /// reporting `0.00000000` against a true `−0.00085981`
+    /// (`misc/binance-v3-account-balance-field-reference.md`, the `availableBalance` row / R5).
+    ///
+    /// ⚠️ Do NOT reach for this in engine logic. It is a REPORTING projection only, and the
+    /// clamped view is exactly what breaks the custody identity: summing wallets through this
+    /// function over-states the protocol's liabilities by the size of every deficit
+    /// (`risk::tests::usdc_custody` measures that directly). Gates use
+    /// `margin_view::derived_available_balance`, which is signed.
     #[inline]
     pub fn visible_perp_wallet_balance(&self) -> u64 {
         if self.perp_wallet_balance <= 0 {

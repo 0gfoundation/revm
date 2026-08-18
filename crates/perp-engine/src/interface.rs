@@ -366,9 +366,21 @@ sol! {
         /// field to tell whether an account is under-covered. Ours is `int64` and may go
         /// negative. That is not by itself a distress signal: a mark move alone can push it
         /// there, and like Binance we do not tear resting orders down mid-life for it. What it
-        /// does mean is that new risk-INCREASING actions are refused until it recovers, and that
-        /// a resting order which fills while the wallet cannot fund its margin will be cancelled
-        /// at fill time rather than filled.
+        /// does mean is that new risk-INCREASING actions are refused until it recovers.
+        ///
+        /// A resting order that fills while the wallet cannot fund its margin still FILLS — the
+        /// shortfall lands on `walletBalance`, which is why that field is `int64` too. (This
+        /// comment previously said such a fill "will be cancelled at fill time"; that was the
+        /// pre-escrow-removal behaviour and it is gone. §1.6 measured Binance leaving an
+        /// under-covered lien alone and never sweeping it.) A NEGATIVE `walletBalance` is a
+        /// RECEIVABLE, not protocol bad debt: it is a negative claim inside the custody identity,
+        /// it blocks every money-out gate, and it nets against the user's next deposit. See
+        /// `types::UserAccount::perp_wallet_balance` for the derivation, the no-double-count
+        /// argument, and why absorbing it from the Insurance Fund would be strictly worse.
+        ///
+        /// ⚠️ These two `int64`s are the ONLY ABI surface that exposes a deficit: `getAccount`'s
+        /// `availablePerpBalance` and `AccountBalanceChanged`'s `perpWalletBalance` are `uint64`
+        /// and floor at 0, so an operator watching only events cannot see one accumulate.
         ///
         /// Like `getMarginInfo` this is a pure read: it stores nothing and moves no money.
         function getAccountMargin(address user, uint64[] marketIds) external view returns (

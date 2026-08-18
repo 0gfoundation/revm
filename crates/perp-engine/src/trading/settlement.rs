@@ -1410,6 +1410,32 @@ pub(super) fn settle_maker_fill_core(
     // The debit is NOT optional. Dropping it would fund `pos.margin` from nowhere — a mint, which
     // the conservation fuzz catches immediately.
     //
+    // # Where the deficit ENDS UP — settled: it is a RECEIVABLE, and there is nothing to fix
+    //
+    // A previous audit read the resulting negative wallet as "protocol-level bad debt that, unlike
+    // close/liquidation losses, is not routed to the Insurance Fund". It is not. `risk::tests::
+    // usdc_custody` produces the worst end state through real calls — this fill drives the wallet
+    // negative, and the position it just funded is then liquidated INSOLVENT so the fund covers
+    // what the silo could not — and asserts the custodied on-trie USDC against the sum of every
+    // internal claim. It closes EXACTLY, with the negative wallet in it as a negative claim; it is
+    // CLAMPING the wallet at 0 that breaks it, by precisely the deficit. So the protocol has not
+    // lost anything here: it holds a claim on the user, enforced because `available =
+    // perp_wallet_balance − Σ ooIM` refuses every money-out gate and every risk-increasing
+    // admission while it is under water, and netted automatically against their next deposit
+    // because the deficit is ONE signed field.
+    //
+    // Nor is it double-counted against the fund. The two are DISJOINT slices of one loss: this
+    // debit funds `pos.margin`, and the fund only ever absorbs what a realized loss exceeded that
+    // margin by (`apply_position_fill`'s insolvent branch and
+    // `settle_liquidation_residual_at_mark_price` both leave the wallet untouched — isolated
+    // margin). The test pins the split to the unit: own cash + receivable + IF == the whole loss.
+    //
+    // ⛔ Do NOT "resolve" the deficit by crediting it out of the Insurance Fund. Custody would
+    // still balance (fund down, wallet up), so no conservation gate would object — but it forgives
+    // a collectable debt, converts a receivable into a socialised write-off, and produces exactly
+    // the double count the audit feared (the fund would pay the beyond-margin shortfall AND the
+    // receivable). Two assertions in that test fail deliberately if anyone wires it up.
+    //
     // Applied to `trial_wallet`, i.e. AFTER this fill's own close proceeds have landed: a flip
     // legitimately funds its opening leg out of the closing leg's released margin and profit, so
     // most flips never go negative at all.

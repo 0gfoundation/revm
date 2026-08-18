@@ -3264,3 +3264,577 @@ mod value_conservation {
         );
     }
 }
+
+// ── USDC CUSTODY — the EXTERNAL leg of conservation ────────────────────────────────────────────
+//
+// `mod value_conservation` above proves that an INTERNAL sum is conserved by every operation. That
+// is necessary but NOT sufficient to answer "is a persistent negative `perp_wallet_balance` a
+// receivable or a leak?", because the negative wallet is one of the terms of that sum: a
+// self-consistent ledger stays self-consistent whether the number in it is collectable or fiction.
+// The question that CAN tell them apart is whether the ledger still matches the real, on-trie USDC
+// the precompile actually custodies.
+//
+// # The custody identity, derived from the write sites
+//
+// The DEX's ERC-20 USDC balance is written in exactly TWO places in the whole engine —
+// `account::deposit_withdraw::run_deposit` (credit) and `run_withdraw` (debit); `grep
+// save_erc20_balance` finds no third. So custody moves only on genuine external flows, and
+// everything else in the engine can only ever REDISTRIBUTE it between internal buckets:
+//
+// ```text
+// D  = erc20_balance(USDC, PERP_DEX_ADDRESS)             deposit_withdraw.rs:52 / :101
+//
+// D == Σ_users usdc_balance                              spot leg   (deposit_withdraw.rs:53/:99,
+//                                                                    :136/:180)
+//   +  Σ_users perp_wallet_balance     ← SIGNED          cross wallet (types/account.rs:62)
+//   +  Σ_positions margin                                isolated silo (types/position.rs)
+//   +  insurance_fund                                    mutualised buffer (storage.rs:2015)
+//   +  Σ_positions (v_quote_balance + signed_value(p, amount))    mark-to-market
+// ```
+//
+// with two things worth naming:
+//
+// * **`Σ_users` must include ADMIN** — trading fees are credited to the admin's own
+//   `perp_wallet_balance` (`credit_fee_recipient`), and the insurance fund is seeded out of it
+//   (`run_deposit_insurance_fund` debits the admin's wallet), so the admin is a user like any
+//   other. `market_fee_total` is a COUNTER, not a bucket; adding it would double-count.
+// * **The mark-to-market term is evaluated at ONE price** and vanishes whenever net open interest
+//   `Σ amount` is zero, which is the case at every checkpoint below (every position change here is
+//   half of a real two-sided trade). The scenario therefore checks a PRICE-INDEPENDENT identity,
+//   and asserts `Σ amount == 0` so that claim is not taken on trust.
+//
+// The one legitimate way to break it is a socialised write-off (`InsuranceFundDepleted`), where the
+// fund could not cover a loss and the excess is forgiven; the scenario asserts that never fires.
+#[cfg(test)]
+mod usdc_custody {
+    use super::*;
+    use crate::{
+        account::{
+            run_deposit, run_get_account, run_transfer_from_perp, run_transfer_to_perp,
+            run_withdraw,
+        },
+        interface::IPerpDex::{
+            depositCall, getAccountCall, getAccountMarginCall, transferFromPerpCall,
+            transferToPerpCall, withdrawCall,
+        },
+        margin_view::run_get_account_margin,
+        storage::keys::erc20_balance_slot,
+    };
+
+    /// The maker that ends up carrying the deficit.
+    const MK: Address = address!("00000000000000000000000000000000000000d1");
+    /// Taker of MK's opening sell.
+    const T1: Address = address!("00000000000000000000000000000000000000d2");
+    /// Taker of MK's flipping buy — the fill that drives MK's wallet negative.
+    const T2: Address = address!("00000000000000000000000000000000000000d3");
+    /// Rests the punitive bid MK's liquidation is forced to close into.
+    const LQ: Address = address!("00000000000000000000000000000000000000d4");
+
+    /// Every account whose claims are part of the closed system. ADMIN is in it: it is the fee sink
+    /// and the source of the insurance-fund seed.
+    const HOLDERS: [Address; 5] = [MK, T1, T2, LQ, ADMIN];
+
+    const MK_DEPOSIT: u64 = 400_000_000; // $400 — all of MK's own money, ever
+    const MK_TOP_UP: u64 = 20_000_000; //   $20 deposited AFTER the deficit exists
+    const T1_DEPOSIT: u64 = 2_000_000_000;
+    const T2_DEPOSIT: u64 = 3_000_000_000;
+    const LQ_DEPOSIT: u64 = 1_000_000_000;
+    const IF_SEED: u64 = 1_000_000_000;
+
+    const BUY: u8 = 0;
+    const SELL: u8 = 1;
+
+    /// Total USDC that ever enters the DEX in this scenario.
+    const TOTAL_DEPOSITED: i128 =
+        (MK_DEPOSIT + MK_TOP_UP + T1_DEPOSIT + T2_DEPOSIT + LQ_DEPOSIT + IF_SEED) as i128;
+
+    fn make_ctx_with_usdc(seeds: &[(Address, u64)]) -> TestCtx {
+        let mut db = InMemoryDB::default();
+        for (addr, amount) in seeds {
+            db.insert_account_storage(
+                USDC_ADDRESS,
+                erc20_balance_slot(*addr).into(),
+                U256::from(*amount),
+            )
+            .unwrap();
+        }
+        let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
+        for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS]
+            .iter()
+            .copied()
+            .chain(HOLDERS)
+        {
+            JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
+        }
+        ctx
+    }
+
+    /// The test market. Deliberately NOT `setup_market`: that one seeds two wallets by direct
+    /// write, which is money from nowhere and would make the custody identity meaningless. Here
+    /// every unit of collateral arrives through `deposit`.
+    fn setup_market_no_funding(ctx: &mut TestCtx) {
+        storage::save_admin(ctx, ADMIN).unwrap();
+        storage::save_market(
+            ctx,
+            &Market {
+                market_id: MARKET_ID,
+                base_decimals: 0,
+                price_decimals: PRICE_DECIMALS,
+                tick_size: 1,
+                step_size: 1,
+                min_quantity: 1,
+                max_quantity: 1_000_000,
+                max_price: 1_000_000,
+                price_update_interval: 15,
+                active: true,
+                // Funding OFF: it is not a zero-sum transfer inside the identity (it settles each
+                // position against the index and spills into the insurance fund), and it is not
+                // what is under test here.
+                funding_interval: 0,
+                interest_rate: 0,
+                // LIVE clearance fee, so the liquidation charges one. It also pins `risk/mod.rs`'s
+                // `.min(account.perp_wallet_balance.max(0))`: an ALREADY-negative wallet must be
+                // charged nothing rather than pushed further under.
+                liquidation_fee_rate_bps: 50,
+                // ±50%. Wide, and it has to be: the liquidation close below must reach a bid
+                // well under the new mark. Note WHY the default (`0` → ±10%) is not enough —
+                // `run_update_index_price` threads the `Market` it loaded BEFORE `save_mark_price`
+                // into `run_liquidation_sweep`, so the close's fill-time band is centred on the
+                // PRE-update mark, not the one that just triggered the liquidation. At ±10% that
+                // makes an in-band bid unreachable after any large move and every close lands in
+                // ADL (which never touches the insurance fund), so the IF leg would go untested.
+                price_band_bps: 5_000,
+                mark_price: 0,
+                tiers: MarginTiers::default(), // one tier, max leverage 3, mmr 1/6
+            },
+        )
+        .unwrap();
+        storage::save_mark_price(ctx, MARKET_ID, ENTRY_PRICE).unwrap();
+    }
+
+    /// `deposit` then `transferToPerp` — the only route collateral has into the perp layer.
+    fn fund_perp_wallet(ctx: &mut TestCtx, user: Address, amount: u64) {
+        run_deposit(
+            &depositCall {
+                amount: U256::from(amount),
+            }
+            .abi_encode(),
+            user,
+            ctx,
+        )
+        .unwrap();
+        run_transfer_to_perp(&transferToPerpCall { amount }.abi_encode(), user, ctx).unwrap();
+    }
+
+    /// The protocol's whole liability side, bucket by bucket.
+    #[derive(Debug, Default, Clone, Copy, PartialEq)]
+    struct Claims {
+        /// Σ `UserAccount::usdc_balance` — the spot/withdrawal leg.
+        spot: i128,
+        /// Σ `UserAccount::perp_wallet_balance`, **SIGNED**. This is where a receivable lives.
+        wallet: i128,
+        /// Σ `PerpPosition::margin` — collateral allocated to open positions.
+        margin: i128,
+        /// The insurance fund.
+        insurance: i128,
+        /// Σ `PerpPosition::v_quote_balance` — the mark-to-market term's cash half.
+        v_quote: i128,
+        /// Σ `PerpPosition::amount` — NET open interest.
+        amount: i128,
+    }
+
+    impl Claims {
+        fn total_at(&self, mark: u64) -> i128 {
+            let v =
+                crate::math::calc_value(mark, self.amount.unsigned_abs() as u64, 0, PRICE_DECIMALS)
+                    .unwrap() as i128;
+            self.spot
+                + self.wallet
+                + self.margin
+                + self.insurance
+                + self.v_quote
+                + if self.amount >= 0 { v } else { -v }
+        }
+    }
+
+    /// `clamp_wallets` reads each wallet through `visible_perp_wallet_balance()` instead of the
+    /// stored signed value — i.e. exactly what every `uint64` ABI surface reports.
+    fn claims(ctx: &mut TestCtx, clamp_wallets: bool) -> Claims {
+        let mut c = Claims {
+            insurance: storage::load_insurance_fund(ctx).unwrap() as i128,
+            ..Claims::default()
+        };
+        for user in HOLDERS {
+            let acc = storage::load_account(ctx, user).unwrap();
+            let pos = storage::load_position(ctx, user, MARKET_ID).unwrap();
+            let spot: U256 = acc.usdc_balance.clone().into();
+            c.spot += spot.to::<u128>() as i128;
+            c.wallet += if clamp_wallets {
+                acc.visible_perp_wallet_balance() as i128
+            } else {
+                acc.perp_wallet_balance as i128
+            };
+            c.margin += pos.margin as i128;
+            c.v_quote += pos.v_quote_balance as i128;
+            c.amount += pos.amount as i128;
+        }
+        c
+    }
+
+    /// The USDC the precompile really holds, on-trie.
+    fn custodied_usdc(ctx: &mut TestCtx) -> i128 {
+        storage::load_erc20_balance(ctx, USDC_ADDRESS, PERP_DEX_ADDRESS)
+            .unwrap()
+            .to::<u128>() as i128
+    }
+
+    /// Assert the custody identity at the current mark, and return the buckets.
+    fn assert_custody_closes(ctx: &mut TestCtx, expected_custody: i128, at: &str) -> Claims {
+        let mark = storage::load_mark_price(ctx, MARKET_ID).unwrap();
+        let c = claims(ctx, false);
+        let d = custodied_usdc(ctx);
+        assert_eq!(
+            d, expected_custody,
+            "custodied USDC moved unexpectedly at {at}"
+        );
+        assert_eq!(
+            c.amount, 0,
+            "net open interest must be flat at {at} (every fill here is two-sided), \
+             otherwise the mark-to-market term is not price-independent"
+        );
+        assert_eq!(
+            c.total_at(mark),
+            d,
+            "CUSTODY BROKEN at {at}: claims {c:?} total {} vs custodied {d} (mark {mark})",
+            c.total_at(mark)
+        );
+        c
+    }
+
+    fn update_index(ctx: &mut TestCtx, index: u64, ts: u64) {
+        run_update_index_price(
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: index,
+                timestamp: ts,
+            }
+            .abi_encode(),
+            ADMIN,
+            ctx,
+        )
+        .unwrap();
+    }
+
+    fn mk_realized_pnl(ctx: &mut TestCtx) -> i128 {
+        take_position_changes(ctx)
+            .into_iter()
+            .filter(|e| e.user == MK)
+            .map(|e| e.realizedPnl as i128)
+            .sum()
+    }
+
+    /// A maker fill that the wallet cannot fund drives `perp_wallet_balance` NEGATIVE, and the
+    /// position it funded is then liquidated INSOLVENT so the Insurance Fund covers the part the
+    /// margin could not. The end state is exactly the one a previous audit called "protocol-level
+    /// bad debt that is not routed to the IF". This produces it through real calls and then asks
+    /// the only question that can settle it: **does the custodied USDC still equal the sum of
+    /// everyone's claims?**
+    ///
+    /// It does. Which makes the negative balance a RECEIVABLE, not a loss:
+    ///
+    /// * it is inside the identity as a NEGATIVE claim, so the protocol has not over-promised;
+    /// * clamping it at 0 (what every `uint64` ABI surface reports) is what breaks the identity,
+    ///   by exactly the deficit — the assertion below measures that directly;
+    /// * it blocks every money-out gate and nets against the next deposit, both exercised here;
+    /// * Binance does the same thing: a lien is allowed to sit under-covered and is never swept
+    ///   (`misc/binance-margin-verified-model.md` §1.6 — at
+    ///   `crossWalletBalance − totalOpenOrderInitialMargin = −0.00085981` a resting order stayed
+    ///   `status='NEW'` while a NEW order was refused `-2019` in the same instant).
+    ///
+    /// # ⚠️ This test is deliberately hostile to the "absorb it from the Insurance Fund" fix
+    ///
+    /// Crediting MK's deficit out of the IF keeps the SUM unchanged (IF down, wallet up) — so the
+    /// identity alone would not notice. It is nonetheless strictly worse than leaving it: it
+    /// FORGIVES a debt the protocol can still collect, letting a user go negative and walk away
+    /// with the fund eating it. The two pinned assertions at the end — MK's wallet is exactly the
+    /// unforgiven deficit, and the IF absorbed exactly the beyond-margin slice and nothing more —
+    /// both fail if anyone wires that up. That is on purpose. Do not "fix" them.
+    #[test]
+    fn custodied_usdc_still_equals_all_claims_when_an_underfunded_makers_position_is_liquidated_insolvent(
+    ) {
+        let mut ctx = make_ctx_with_usdc(&[
+            (MK, MK_DEPOSIT + MK_TOP_UP),
+            (T1, T1_DEPOSIT),
+            (T2, T2_DEPOSIT),
+            (LQ, LQ_DEPOSIT),
+            (ADMIN, IF_SEED),
+        ]);
+        setup_market_no_funding(&mut ctx);
+
+        // ── 1. All collateral enters through `deposit`, so custody is a MEASURED number ──
+        for (user, amount) in [
+            (MK, MK_DEPOSIT),
+            (T1, T1_DEPOSIT),
+            (T2, T2_DEPOSIT),
+            (LQ, LQ_DEPOSIT),
+            (ADMIN, IF_SEED),
+        ] {
+            fund_perp_wallet(&mut ctx, user, amount);
+        }
+        // The insurance fund is NOT written directly (that would be a mint): it is seeded out of
+        // the admin's own perp wallet, which is where `run_deposit_insurance_fund` takes it from.
+        run_deposit_insurance_fund(
+            &depositInsuranceFundCall { amount: IF_SEED }.abi_encode(),
+            ADMIN,
+            &mut ctx,
+        )
+        .unwrap();
+        let custody_before_top_up = TOTAL_DEPOSITED - MK_TOP_UP as i128;
+        assert_custody_closes(&mut ctx, custody_before_top_up, "after funding");
+
+        // ── 2. MK opens a SHORT 10 @ $100 at leverage 3, as the maker ──
+        run_set_leverage(
+            &setLeverageCall {
+                marketId: MARKET_ID,
+                leverage: 3,
+            }
+            .abi_encode(),
+            MK,
+            &mut ctx,
+        )
+        .unwrap();
+        place_order(&mut ctx, MK, SELL, ENTRY_PRICE, QTY as u64);
+        place_order(&mut ctx, T1, BUY, ENTRY_PRICE, QTY as u64);
+        let mk_short = storage::load_position(&mut ctx, MK, MARKET_ID).unwrap();
+        assert_eq!((mk_short.amount, mk_short.margin), (-QTY, 333_333_333));
+        assert_eq!(
+            storage::load_account(&mut ctx, MK)
+                .unwrap()
+                .perp_wallet_balance,
+            66_666_667,
+            "MK has spent all but $66.67 of its deposit on the short's own margin"
+        );
+        assert_custody_closes(&mut ctx, custody_before_top_up, "after MK's short opens");
+
+        // ── 3. Mark to $110 — MK's short is underwater but still above maintenance ──
+        update_index(&mut ctx, 11_000, 31);
+        let mark = storage::load_mark_price(&mut ctx, MARKET_ID).unwrap();
+        assert_eq!(
+            mark, 11_000,
+            "median(price1, price2, lastTraded) must land on the index"
+        );
+        assert_custody_closes(
+            &mut ctx,
+            custody_before_top_up,
+            "after the mark rises to $110",
+        );
+
+        // ── 4. The FLIP: a resting buy of 2× the short costs ooIM = 0, and fills for $366.67 ──
+        // This is the production shape of an underfunded maker fill, and it needs no hand-written
+        // state at all. `ooIM = IM − PIM` nets the close a fill would perform, so at
+        // `Bid ≈ 2|N|` the two branches of the joint `max()` tie and the order is admitted FREE
+        // (`trading/mod.rs`'s buy arm even documents this band: unlike a sell, a resting BUY gets
+        // no Assuming-Price uplift, so for us the `ooIM = 0` band is both free AND fillable).
+        // The fill then closes the short at a LOSS — so the margin it releases is less than the
+        // margin the new long leg needs — and the shortfall lands on the wallet.
+        assert_eq!(
+            oo_im(&mut ctx, MK),
+            0,
+            "the flipping buy must be admitted free"
+        );
+        place_order(&mut ctx, MK, BUY, 11_000, 2 * QTY as u64);
+        assert_eq!(oo_im(&mut ctx, MK), 0);
+        place_order(&mut ctx, T2, SELL, 11_000, 2 * QTY as u64);
+
+        let mk_long = storage::load_position(&mut ctx, MK, MARKET_ID).unwrap();
+        assert_eq!(
+            (mk_long.amount, mk_long.v_quote_balance, mk_long.margin),
+            (QTY, -1_100_000_000, 366_666_666),
+            "the flip filled: short closed, long 10 @ $110 opened, silo funded IN FULL"
+        );
+        let deficit_after_flip = storage::load_account(&mut ctx, MK)
+            .unwrap()
+            .perp_wallet_balance;
+        assert_eq!(
+            deficit_after_flip, -66_666_666,
+            "the wallet funded the opening leg and went NEGATIVE — no cancel, no clamp"
+        );
+        assert_custody_closes(
+            &mut ctx,
+            custody_before_top_up,
+            "after the underfunded flip fill",
+        );
+
+        // ── 5. A punitive resting bid at $64, then crash the mark to $70 ──
+        // MK's long is insolvent below $73.33 (its bankruptcy price), so a forced close into a $64
+        // bid realizes a loss the margin cannot cover and the Insurance Fund pays the remainder.
+        // Closing through the BOOK is what reaches the fund at all — a residual the book cannot
+        // absorb goes to ADL instead, which never touches it. $64 is chosen to sit INSIDE the
+        // close's fill-time price band (see `price_band_bps` in the market fixture above): a bid
+        // outside it is skipped and the close would land in ADL.
+        place_order(&mut ctx, LQ, BUY, 6_400, QTY as u64);
+        assert_custody_closes(&mut ctx, custody_before_top_up, "after LQ's bid rests");
+
+        let if_before_liq = storage::load_insurance_fund(&mut ctx).unwrap();
+        let _ = mk_realized_pnl(&mut ctx); // drain: only the liquidation's own PnL is read below
+        update_index(&mut ctx, 7_000, 60);
+        assert_eq!(
+            storage::load_mark_price(&mut ctx, MARKET_ID).unwrap(),
+            7_000
+        );
+
+        let mk_after = storage::load_position(&mut ctx, MK, MARKET_ID).unwrap();
+        assert_eq!(
+            (mk_after.amount, mk_after.margin, mk_after.v_quote_balance),
+            (0, 0, 0),
+            "the sweep liquidated MK's insolvent long through LQ's bid"
+        );
+        let liq_realized = mk_realized_pnl(&mut ctx);
+        assert_eq!(
+            liq_realized, -460_000_000,
+            "closed 10 @ $110 entry into a $64 bid"
+        );
+        let if_after_liq = storage::load_insurance_fund(&mut ctx).unwrap();
+        let if_absorbed = (if_before_liq - if_after_liq) as i128;
+        assert_eq!(
+            if_absorbed, 93_333_334,
+            "the IF covers the loss BEYOND the position's margin — and only that: the close's \
+             $460 loss met a $366.67 silo, so $93.33 reached the fund"
+        );
+        assert!(
+            if_after_liq > 0,
+            "no socialised write-off: the identity must stay comparable"
+        );
+
+        // The wallet is untouched by the liquidation: isolated margin never debits it, and the
+        // clearance fee is capped at `perp_wallet_balance.max(0)` — 0 here (risk/mod.rs).
+        assert_eq!(
+            storage::load_account(&mut ctx, MK)
+                .unwrap()
+                .perp_wallet_balance,
+            deficit_after_flip,
+            "liquidation neither charged nor forgave the deficit"
+        );
+
+        // ── 6. THE VERDICT: custody still equals the sum of all claims ──
+        let c = assert_custody_closes(
+            &mut ctx,
+            custody_before_top_up,
+            "after the insolvent liquidation",
+        );
+
+        // ...and it is the CLAMPED view that breaks it, by exactly the deficit. This is the
+        // mechanical statement of "receivable, not leak": the identity DEPENDS on the negative
+        // term being negative. Read the wallets as `uint64` (what `getAccount` and
+        // `AccountBalanceChanged` report) and the protocol appears to owe $66.67 more than it
+        // holds — which is the deficit, seen from the other side.
+        let clamped = claims(&mut ctx, true);
+        assert_eq!(
+            clamped.total_at(7_000) - custody_before_top_up,
+            -deficit_after_flip as i128,
+            "clamping the wallet at 0 must over-state claims by exactly the deficit"
+        );
+
+        // ── 7. NO DOUBLE COUNT — the loss splits into three DISJOINT slices ──
+        // MK's whole realized loss over both fills, funded by: MK's own deposited cash, the
+        // receivable (the negative wallet), and the Insurance Fund. If the IF had absorbed the
+        // same economic loss the negative wallet already represents, this would over-shoot by the
+        // overlap. It is exact, so there is no overlap. (Fees are 0 and funding is off in this
+        // market, so realized PnL is MK's entire P&L.)
+        let mk_total_realized = liq_realized + -100_000_000; // flip close: short @ $100 → $110
+        assert_eq!(
+            MK_DEPOSIT as i128 + (-deficit_after_flip as i128) + if_absorbed,
+            -mk_total_realized,
+            "MK's loss must decompose EXACTLY into own-cash + receivable + IF"
+        );
+        assert!(
+            if_absorbed < -mk_total_realized,
+            "the IF must cover strictly less than the whole loss"
+        );
+        assert_eq!(
+            c.margin,
+            claims(&mut ctx, false).margin,
+            "sanity: `claims` is a pure read"
+        );
+
+        // ── 8. Receivable semantics: blocks money-out, nets against the next deposit ──
+        for (label, r) in [
+            (
+                "transferFromPerp",
+                run_transfer_from_perp(
+                    &transferFromPerpCall { amount: 1 }.abi_encode(),
+                    MK,
+                    &mut ctx,
+                ),
+            ),
+            (
+                "withdraw",
+                run_withdraw(
+                    &withdrawCall {
+                        amount: U256::from(1u64),
+                    }
+                    .abi_encode(),
+                    MK,
+                    &mut ctx,
+                ),
+            ),
+        ] {
+            assert!(
+                r.is_err(),
+                "{label} must refuse a user whose perp wallet is under water"
+            );
+        }
+
+        fund_perp_wallet(&mut ctx, MK, MK_TOP_UP);
+        assert_eq!(
+            storage::load_account(&mut ctx, MK)
+                .unwrap()
+                .perp_wallet_balance,
+            deficit_after_flip + MK_TOP_UP as i64,
+            "a later deposit NETS against the deficit — it is not credited to a fresh bucket"
+        );
+        assert!(
+            run_transfer_from_perp(
+                &transferFromPerpCall { amount: 1 }.abi_encode(),
+                MK,
+                &mut ctx,
+            )
+            .is_err(),
+            "still under water, so money-out is still refused"
+        );
+        assert_custody_closes(&mut ctx, TOTAL_DEPOSITED, "after MK tops up");
+
+        // ── 9. Is the deficit visible to an operator? ──
+        // `getAccount` clamps (it returns `uint64`), but `getAccountMargin` returns `int64
+        // walletBalance` / `int64 availableBalance` unclamped, so the true signed value IS
+        // readable through the ABI. Pinned here because it is the whole difference between "we
+        // carry a receivable" and "we carry an invisible receivable".
+        let clamped_view =
+            run_get_account(&getAccountCall { user: MK }.abi_encode(), &mut ctx).unwrap();
+        assert_eq!(
+            U256::from_be_slice(&clamped_view[32..64]).to::<u64>(),
+            0,
+            "getAccount floors availablePerpBalance at 0"
+        );
+        let signed_view = getAccountMarginCall::abi_decode_returns(
+            &run_get_account_margin(
+                &getAccountMarginCall {
+                    user: MK,
+                    marketIds: vec![MARKET_ID],
+                }
+                .abi_encode(),
+                &mut ctx,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (signed_view.walletBalance, signed_view.availableBalance),
+            (
+                deficit_after_flip + MK_TOP_UP as i64,
+                deficit_after_flip + MK_TOP_UP as i64
+            ),
+            "getAccountMargin reports the true SIGNED deficit (no resting orders, so ooIM = 0)"
+        );
+    }
+}
