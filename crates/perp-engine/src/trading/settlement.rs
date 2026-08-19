@@ -198,32 +198,20 @@ impl TakerSettlement {
             // registry working copy if the walk already touched it (a self-match maker the K9 guard
             // cancelled — the flush writes exactly that copy, funding included), else storage.
             let (bd, pd) = (market.base_decimals, market.price_decimals);
-            // The Assuming-Price floor for this market, resolved once and shared by every ooIM
-            // evaluation below so no two of them price the same book at a different `T`.
+            // The Assuming-Price floor the REMAINDER about to rest would freeze against — the only
+            // reason this path resolves `T` at all. Already-resting orders carry their own frozen
+            // price in their entries.
             let floor = crate::margin_view::assuming_price_floor(context, self.market_id, market)?;
-            let (pos, ask, wallet) = match reg.user_work(self.user) {
-                Some(w) => {
-                    let pos = work_position_snapshot(w, bd, pd)?;
-                    let ask = crate::margin_view::entries_ask_assuming(
-                        market,
-                        floor,
-                        &w.sell_entries,
-                        pos.total_sell_notional,
-                    )?;
-                    (pos, ask, w.account.perp_wallet_balance)
-                }
+            let (pos, wallet) = match reg.user_work(self.user) {
+                Some(w) => (
+                    work_position_snapshot(w, bd, pd)?,
+                    w.account.perp_wallet_balance,
+                ),
                 None => {
                     let pos =
                         (*storage::load_position_ref(context, self.user, self.market_id)?).clone();
-                    let ask = crate::margin_view::stored_ask_assuming(
-                        context,
-                        self.user,
-                        self.market_id,
-                        market,
-                        &pos,
-                    )?;
                     let wallet = storage::load_account_ref(context, self.user)?.perp_wallet_balance;
-                    (pos, ask, wallet)
+                    (pos, wallet)
                 }
             };
             let affordable = rest_is_affordable(
@@ -231,7 +219,6 @@ impl TakerSettlement {
                 self.user,
                 self.market_id,
                 &pos,
-                ask,
                 floor,
                 wallet,
                 taker_side,
@@ -273,26 +260,18 @@ impl TakerSettlement {
         // this fill's close proceeds. That is exactly what `finalize_apply` will re-derive from
         // storage after the flush, so the pre-flush decision and the post-flush one agree.
         let (bd, pd) = (market.base_decimals, market.price_decimals);
+        // `Bid`/`Ask` come off the WORKING order lists, which are the authoritative record of what
+        // the walk has consumed — each surviving entry still at its own frozen assuming price.
         let after_fills = work_position_snapshot(w, bd, pd)?;
-        // One `T` for every ooIM evaluation on this path (see the zero-fill arm above). `Ask` is
-        // folded from the WORKING sell list, which is the authoritative record of what the walk has
-        // consumed — and, unlike `total_sell_notional`, has to be re-priced at `T`.
+        // `T` for the remainder ABOUT TO REST — the only thing on this path that needs it (see the
+        // zero-fill arm above). Every order already in the working lists carries its own frozen
+        // price, so nothing here re-resolves theirs. Resolved before the two `rest` arms below
+        // because both want it, off a `MarketHot` the match walk has already made warm.
         let floor = crate::margin_view::assuming_price_floor(context, self.market_id, market)?;
-        let ask_fills = crate::margin_view::entries_ask_assuming(
-            market,
-            floor,
-            &w.sell_entries,
-            after_fills.total_sell_notional,
-        )?;
         let rest_delta = match &rest {
             Some(r) => {
-                let (after_rest, ask_rest) =
-                    with_rest_entry(&after_fills, ask_fills, floor, taker_side, r, bd, pd)?;
-                crate::margin_view::derived_requirement_delta(
-                    market,
-                    crate::margin_view::PricedPosition::new(&after_fills, ask_fills),
-                    crate::margin_view::PricedPosition::new(&after_rest, ask_rest),
-                )?
+                let after_rest = with_rest_entry(&after_fills, floor, taker_side, r, bd, pd)?;
+                crate::margin_view::derived_requirement_delta(market, &after_fills, &after_rest)?
             }
             None => 0,
         };
@@ -304,10 +283,7 @@ impl TakerSettlement {
             context,
             self.user,
             Some(wallet),
-            Some((
-                self.market_id,
-                crate::margin_view::PricedPosition::new(&after_fills, ask_fills),
-            )),
+            Some((self.market_id, &after_fills)),
         )?;
 
         // LEVEL 1 fast path (the common case): the available already covers fills + rest with NO
@@ -325,22 +301,13 @@ impl TakerSettlement {
             let mut sim_buy = w.buy_entries.clone();
             let mut sim_sell = w.sell_entries.clone();
             loop {
-                // Re-fold `Ask` at the same `T` after every simulated cancel: a cancelled SELL
-                // takes its uplift with it.
-                let sim_ask = crate::margin_view::entries_ask_assuming(
-                    market,
-                    floor,
-                    &sim_sell,
-                    sim_pos.total_sell_notional,
-                )?;
+                // No re-fold: `release_margin_core` below subtracts each cancelled entry's frozen
+                // term from `sim_pos`, so its aggregates ARE `Bid`/`Ask` for the simulated book.
                 let avail = crate::margin_view::derived_available_balance_with(
                     context,
                     self.user,
                     Some(wallet),
-                    Some((
-                        self.market_id,
-                        crate::margin_view::PricedPosition::new(&sim_pos, sim_ask),
-                    )),
+                    Some((self.market_id, &sim_pos)),
                 )?;
                 if crate::margin_view::derived_can_afford(avail, core.total_required as i128) {
                     break;
@@ -369,27 +336,14 @@ impl TakerSettlement {
                         "settlement: taker total required",
                     )?)
                     .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
-                let sim_ask = crate::margin_view::entries_ask_assuming(
-                    market,
-                    floor,
-                    &sim_sell,
-                    sim_pos.total_sell_notional,
-                )?;
-                let (after_rest, ask_rest) =
-                    with_rest_entry(&sim_pos, sim_ask, floor, taker_side, r, bd, pd)?;
-                let delta = crate::margin_view::derived_requirement_delta(
-                    market,
-                    crate::margin_view::PricedPosition::new(&sim_pos, sim_ask),
-                    crate::margin_view::PricedPosition::new(&after_rest, ask_rest),
-                )?;
+                let after_rest = with_rest_entry(&sim_pos, floor, taker_side, r, bd, pd)?;
+                let delta =
+                    crate::margin_view::derived_requirement_delta(market, &sim_pos, &after_rest)?;
                 let avail = crate::margin_view::derived_available_balance_with(
                     context,
                     self.user,
                     Some(wallet_after),
-                    Some((
-                        self.market_id,
-                        crate::margin_view::PricedPosition::new(&sim_pos, sim_ask),
-                    )),
+                    Some((self.market_id, &sim_pos)),
                 )?;
                 if !crate::margin_view::derived_can_afford(avail, delta) {
                     return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
@@ -433,7 +387,9 @@ pub(super) struct RestReq {
 /// mid-match has to see the walk's effect on them. `settle_maker_fill_core` and
 /// `release_margin_core` maintain them incrementally as they mutate the lists; this recomputes
 /// from the lists so a gate can never be decided on a stale aggregate, and the flush asserts the
-/// two agree.
+/// two agree. The recompute values each surviving entry at its own FROZEN `assuming_price`
+/// (`math::sum_side_totals`), so it reproduces the incremental result exactly — a partially filled
+/// sell keeps the basis it was placed at.
 fn work_position_snapshot(
     w: &UserWork,
     base_decimals: u32,
@@ -454,48 +410,43 @@ fn work_position_snapshot(
     Ok(pos)
 }
 
-/// `(pos, Ask)` with the taker's would-be resting remainder folded in — the hypothetical the rest
-/// gate prices. No list is materialised: the requirement reads only the aggregates plus the
-/// Assuming-Price `Ask`, and the order contributes exactly the per-order-floored `calc_value` term
-/// it would add to each fold.
+/// `pos` with the taker's would-be resting remainder folded in — the hypothetical the rest gate
+/// prices. No list is materialised: the requirement reads only the aggregates, and the order
+/// contributes exactly the per-order-floored term `rest_in_book` will add when it really rests.
 ///
-/// The two folds use DIFFERENT prices for a resting SELL: `total_sell_notional` grows by
-/// `calc_value(price, qty)` (it is the limit-price baseline every other maintainer keeps), while
-/// `Ask` grows by `calc_value(max(T, price), qty)` — the Assuming Price. A sell resting at or below
-/// `T` therefore requires strictly more than its own notional implies.
+/// The remainder's Assuming Price is resolved HERE, from `assuming_floor`, because this is the same
+/// instant it would be frozen at (`assuming_price = max(T, price)` on a sell, `price` on a buy). So a
+/// sell resting at or below `T` requires strictly more than its own notional implies, and the gate
+/// measures exactly what the entry will carry.
 fn with_rest_entry(
     pos: &crate::types::PerpPosition,
-    ask_assuming: u64,
     assuming_floor: u64,
     taker_side: Side,
     rest: &RestReq,
     base_decimals: u32,
     price_decimals: u32,
-) -> Result<(crate::types::PerpPosition, u64), PerpError> {
-    let notional = calc_value(rest.price, rest.qty, base_decimals, price_decimals)?;
+) -> Result<crate::types::PerpPosition, PerpError> {
     let mut after = pos.clone();
-    let mut ask_after = ask_assuming;
-    let (qty_field, notional_field) = match taker_side {
-        Side::Buy => (&mut after.total_buy_qty, &mut after.total_buy_notional),
-        Side::Sell => {
-            ask_after = ask_after
-                .checked_add(calc_value(
-                    rest.price.max(assuming_floor),
-                    rest.qty,
-                    base_decimals,
-                    price_decimals,
-                )?)
-                .ok_or_else(|| perp_err("placeOrder: rest assuming-price ask overflow"))?;
-            (&mut after.total_sell_qty, &mut after.total_sell_notional)
-        }
+    let (qty_field, notional_field, assuming_price) = match taker_side {
+        Side::Buy => (
+            &mut after.total_buy_qty,
+            &mut after.total_buy_notional,
+            rest.price,
+        ),
+        Side::Sell => (
+            &mut after.total_sell_qty,
+            &mut after.total_sell_notional,
+            rest.price.max(assuming_floor),
+        ),
     };
+    let notional = calc_value(assuming_price, rest.qty, base_decimals, price_decimals)?;
     *qty_field = qty_field
         .checked_add(rest.qty)
         .ok_or_else(|| perp_err("placeOrder: rest qty overflow"))?;
     *notional_field = notional_field
         .checked_add(notional)
         .ok_or_else(|| perp_err("placeOrder: rest notional overflow"))?;
-    Ok((after, ask_after))
+    Ok(after)
 }
 
 /// Can `rest` be admitted from this state? The zero-fill arm of
@@ -511,7 +462,6 @@ fn rest_is_affordable<H: PerpHost>(
     user: Address,
     market_id: u64,
     pos: &crate::types::PerpPosition,
-    ask_assuming: u64,
     assuming_floor: u64,
     wallet: i64,
     taker_side: Side,
@@ -519,21 +469,13 @@ fn rest_is_affordable<H: PerpHost>(
     market: &crate::types::Market,
 ) -> Result<bool, PerpError> {
     let (bd, pd) = (market.base_decimals, market.price_decimals);
-    let (after, ask_after) =
-        with_rest_entry(pos, ask_assuming, assuming_floor, taker_side, rest, bd, pd)?;
-    let delta = crate::margin_view::derived_requirement_delta(
-        market,
-        crate::margin_view::PricedPosition::new(pos, ask_assuming),
-        crate::margin_view::PricedPosition::new(&after, ask_after),
-    )?;
+    let after = with_rest_entry(pos, assuming_floor, taker_side, rest, bd, pd)?;
+    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
     let available = crate::margin_view::derived_available_balance_with(
         context,
         user,
         Some(wallet),
-        Some((
-            market_id,
-            crate::margin_view::PricedPosition::new(pos, ask_assuming),
-        )),
+        Some((market_id, pos)),
     )?;
     Ok(crate::margin_view::derived_can_afford(available, delta))
 }
@@ -1497,10 +1439,13 @@ pub(super) fn settle_maker_fill_core(
     account.perp_wallet_balance = trial_wallet;
 
     // Apply the entry reduce planned above (the lists were untouched in between, so `entry_idx`
-    // is still valid), and shrink `Bid`/`Ask` by exactly the term the reduce removes. Using the
-    // DIFFERENCE of the two per-order-floored `calc_value`s (not `calc_value(price, fill_qty)`)
-    // is what keeps the aggregate byte-identical to a fresh fold over the reduced list, which the
-    // registry flush asserts.
+    // is still valid), and shrink `Bid`/`Ask` by exactly the term the reduce removes. Two points:
+    //   * at the entry's FROZEN `assuming_price`, not its limit price — the order's margin basis
+    //     does not change because it partially filled, only its `amount` does. This is the site that
+    //     makes "freeze the PRICE, not the contribution" work;
+    //   * as the DIFFERENCE of the two per-order-floored `calc_value`s (not one call on `fill_qty`),
+    //     which is what keeps the aggregate byte-identical to a fresh fold over the reduced list —
+    //     the equality the registry flush asserts.
     {
         let entries = match maker_side {
             Side::Buy => &mut *buy_entries,
@@ -1508,8 +1453,9 @@ pub(super) fn settle_maker_fill_core(
         };
         let e = entries[entry_idx];
         let (bd, pd) = (market.base_decimals, market.price_decimals);
-        let notional_delta = calc_value(e.price, e.amount, bd, pd)?
-            .checked_sub(calc_value(e.price, entry_new_amount, bd, pd)?)
+        let notional_delta = e
+            .margin_notional(bd, pd)?
+            .checked_sub(calc_value(e.assuming_price, entry_new_amount, bd, pd)?)
             .ok_or_else(|| {
                 perp_invariant_err("settlement: maker entry notional delta underflow")
             })?;

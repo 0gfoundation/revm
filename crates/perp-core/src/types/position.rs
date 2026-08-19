@@ -76,35 +76,40 @@ pub struct PerpPosition {
     pub last_funding_index: i128,
     // ── Per-side resting-order aggregates = Binance's `Bid` / `Ask` (catalog #A) ─────────────
     // Maintained mirrors of the resting-order lists. `*_notional` is the SUM OF PER-ORDER
-    // `calc_value(price, amount)` at each order's LIMIT price (each floored exactly as a fold
-    // over the list produces it) → maintainable ± one term with zero floor-composition error.
-    // Kept in sync at every order-list mutation (place/cancel incrementally; fills/liquidation by
-    // recompute-from-list). Derivable from the lists via `math::sum_side_totals`, so a
-    // genesis/default 0 is correct only for an empty book.
+    // `OrderEntry::margin_notional()` — `calc_value(assuming_price, amount)` at each order's FROZEN
+    // Assuming Price (each floored exactly as a fold over the list produces it) → maintainable
+    // ± one term with zero floor-composition error. Kept in sync at every order-list mutation
+    // (place/cancel incrementally; fills/liquidation by recompute-from-list). Derivable from the
+    // lists via `math::sum_side_totals`, so a genesis/default 0 is correct only for an empty book.
     //
-    // `total_buy_notional` IS Binance's `bidNotional`: a LONG order's Assuming Price is its own
-    // limit price, so the limit-price fold is the requirement basis outright.
+    // **These two ARE Binance's `bidNotional` / `askNotional`, outright.** ONE rule covers both
+    // sides — `Σ calc_value(entry.assuming_price, entry.amount)` — because the per-order Assuming
+    // Price already carries the side asymmetry: a BUY's is its own limit price (no markup), a SELL's
+    // is `max(max(⌈last × 1.0015⌉, mark), limit)` resolved AT PLACEMENT. There is no second basis
+    // and no read-time re-pricing pass; a resting order's contribution never moves again except by
+    // being partially filled (which shrinks `amount`, and the term with it). Measured: R12,
+    // `misc/binance-flip-and-admission.md` §3.13 — see `OrderEntry::assuming_price`.
     //
-    // ⚠️ `total_sell_notional` is NOT `askNotional`. A SHORT order is priced at
-    // `max(ROUND_UP(lastTraded × 1.0015), mark, limit)`, so this field is only the BASELINE the
-    // Assuming-Price uplift is added to; the requirement's `Ask` is re-folded from the sell LIST at
-    // the current floor on every evaluation (`margin_view::stored_ask_assuming`) and, unlike this
-    // field, moves with the mark. Both are proven equal to the resting-order fold after every
-    // transition by `side_aggregates_are_exactly_bid_and_ask_after_every_operation`.
+    // Both are proven equal to the resting-order fold after every transition by
+    // `side_aggregates_are_exactly_bid_and_ask_after_every_operation`.
     //
-    // Together with `amount`, `leverage`, the mark, the last traded price and the sell list, these
-    // are the inputs to the DERIVED open-order requirement that replaced the escrow — see the note
-    // where the escrow fields used to be.
+    // ⚠️ FROZEN aggregates do NOT make `ooIM` frozen. It also contains `N = |amount| × mark`, which
+    // is recomputed at every read, so the requirement still moves with the mark whenever the
+    // position is non-flat (R10). Only at `N = 0` does `ooIM` degenerate to a pure constant.
+    //
+    // Together with `amount`, `leverage` and the mark, these are the inputs to the DERIVED
+    // open-order requirement that replaced the escrow — see the note where the escrow fields used
+    // to be.
     /// Σ resting BUY order amounts (base units).
     #[serde(default, rename = "tbq")]
     pub total_buy_qty: u64,
-    /// Σ `calc_value(price, amount)` over resting BUY orders (quote units).
+    /// `Bid` — Σ `calc_value(assuming_price, amount)` over resting BUY orders (quote units).
     #[serde(default, rename = "tbn")]
     pub total_buy_notional: u64,
     /// Σ resting SELL order amounts (base units).
     #[serde(default, rename = "tsq")]
     pub total_sell_qty: u64,
-    /// Σ `calc_value(price, amount)` over resting SELL orders (quote units).
+    /// `Ask` — Σ `calc_value(assuming_price, amount)` over resting SELL orders (quote units).
     #[serde(default, rename = "tsn")]
     pub total_sell_notional: u64,
 }

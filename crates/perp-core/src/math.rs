@@ -228,9 +228,12 @@ pub fn max_leverage_for_notional(tiers: &MarginTiers, abs_notional: i64) -> u32 
 //
 // with `N` the SIGNED position notional at MARK, `L` the position leverage, and `Bid`/`Ask` the
 // per-side resting-order aggregates priced at each order's **Assuming Price** — the limit price for
-// a BUY, `max(Last × 1.0015, Mark, limit)` for a SELL (see [`assuming_price_floor`] and
-// [`ask_notional_at_assuming_price`]). The two branches are the exposure left if every buy fills
-// and if every sell fills.
+// a BUY, `max(Last × 1.0015, Mark, limit)` for a SELL, in both cases FROZEN when the order was
+// placed (see [`crate::types::OrderEntry::assuming_price`]). The two branches are the exposure left
+// if every buy fills and if every sell fills.
+//
+// ⚠️ `N` is the only LIVE input: `Bid`/`Ask` are frozen per order, but `N` is recomputed from the
+// current mark at every evaluation, so `ooIM` still moves with the mark whenever `N != 0` (R10).
 //
 // Formula source: `misc/binance-margin-verified-model.md` §1.1 (formula set), its §1.6 /
 // 2026-08-18 correction block (the Assuming-Price basis) and §2 (rounding), plus
@@ -247,8 +250,14 @@ pub const ASSUMING_PRICE_MARKUP_NUM: u128 = 10_015;
 /// Denominator of [`ASSUMING_PRICE_MARKUP_NUM`].
 pub const ASSUMING_PRICE_MARKUP_DEN: u128 = 10_000;
 
-/// `T = max(ROUND_UP(lastTraded × 1.0015), mark)` — the price floor every resting SELL is charged
-/// at, whatever its own limit price.
+/// `T = max(ROUND_UP(lastTraded × 1.0015), mark)` — the price floor a SELL's margin basis is
+/// FROZEN against **at placement**, whatever its own limit price.
+///
+/// Resolved once, when the order starts resting, and stored in
+/// [`OrderEntry::assuming_price`](crate::types::OrderEntry::assuming_price) as `max(T, limit)`;
+/// never re-resolved for an order that is already resting (R12 — see that field's doc comment).
+/// The only other caller is the admission gate's hypothetical for an order about to rest, which is
+/// the same instant.
 ///
 /// # The vendor formula this implements
 ///
@@ -286,50 +295,6 @@ pub fn assuming_price_floor(last_traded: u64, mark_price: u64) -> Result<u64, Pe
         .div_ceil(ASSUMING_PRICE_MARKUP_DEN);
     let bumped = u64::try_from(bumped).map_err(|_| perp_err("math: assuming price exceeds u64"))?;
     Ok(bumped.max(mark_price))
-}
-
-/// `Ask` priced at the Assuming Price: `Σ_i calc_value(max(T, price_i), qty_i)` over the user's
-/// resting SELLS, where `T` is [`assuming_price_floor`].
-///
-/// Evaluated as `total_sell_notional + Σ_{price_i < T} (calc_value(T, qty_i) − calc_value(price_i,
-/// qty_i))`, which is the SAME number as the direct fold (each term is one per-order-floored
-/// `calc_value`, exactly as `total_sell_notional` is maintained) but only touches the orders the
-/// markup actually moves.
-///
-/// `sells_ascending` MUST be the per-`(user, market)` sell list in its stored order, which is
-/// ASCENDING by price (placement inserts at `partition_point(|e| e.price < price)`; every removal
-/// preserves it). That makes the below-`T` orders a contiguous FRONT PREFIX, so the walk breaks at
-/// the first entry priced at or above `T` — normally after zero or a handful of entries, never the
-/// whole list. Feeding a differently-ordered list would silently under-charge.
-///
-/// The BUY side has no analogue: `Assuming Price = order price` for a long order, so
-/// `Bid == total_buy_notional` exactly.
-#[inline]
-pub fn ask_notional_at_assuming_price(
-    sells_ascending: impl Iterator<Item = OrderEntry>,
-    total_sell_notional: u64,
-    assuming_floor: u64,
-    base_decimals: u32,
-    price_decimals: u32,
-) -> Result<u64, PerpError> {
-    let mut ask = total_sell_notional;
-    for e in sells_ascending {
-        if e.price >= assuming_floor {
-            break;
-        }
-        let uplift = calc_value(assuming_floor, e.amount, base_decimals, price_decimals)?
-            .checked_sub(calc_value(
-                e.price,
-                e.amount,
-                base_decimals,
-                price_decimals,
-            )?)
-            .ok_or_else(|| perp_err("math: assuming-price uplift underflow"))?;
-        ask = ask
-            .checked_add(uplift)
-            .ok_or_else(|| perp_err("math: assuming-price ask notional overflow"))?;
-    }
-    Ok(ask)
 }
 
 /// `ROUND_UP(numerator / divisor)` — the rounding Binance uses for `initialMargin` and
@@ -385,11 +350,9 @@ pub struct OpenOrderMargin {
 /// reintroduce a second definition here.
 ///
 /// Pure integer arithmetic over `(signed_notional, bid, ask, leverage)`; no storage, no floats.
-/// `signed_notional` is `N` at MARK (negative for a short); `bid` is Σ (qty × LIMIT price) over
-/// resting buys (a long order's Assuming Price IS its limit price) and `ask` must already be the
-/// ASSUMING-PRICE aggregate `Σ qty × max(T, limit)` from [`ask_notional_at_assuming_price`] — NOT
-/// the raw limit-price total. Mixing mark and order-price bases is deliberate: it is Binance's
-/// formula.
+/// `signed_notional` is `N` at MARK (negative for a short); `bid`/`ask` are the per-side
+/// `Σ` [`crate::types::OrderEntry::margin_notional`] aggregates, i.e. each resting order at its
+/// FROZEN Assuming Price. Mixing mark and order-price bases is deliberate: it is Binance's formula.
 ///
 /// # ⚠️ The SHORT side of the joint `max()` is EXTRAPOLATED, not measured — and the docs call it
 /// a BLOCKING open item
@@ -660,13 +623,18 @@ pub fn calc_funding_payment(
 // The flip-aware escrow reservation these primitives used to feed is GONE (derived-ooIM Phase 2):
 // the open-order requirement is now derived on demand from `(N, Bid, Ask, L)` by
 // [`open_order_margin`], so the only thing still needed off the order lists is each side's
-// `(Σ qty, Σ notional)` — which IS `(·, Bid)` / `(·, Ask)`. The cover-prefix leg reconstruction
-// (`side_leg_from_total`), the four-leg `max(S + B', B + S')` fold and their per-side helpers were
-// deleted with the escrow; nothing computes an opening notional per side any more.
+// `(Σ qty, Σ margin notional)` — which IS `(·, Bid)` / `(·, Ask)`. The cover-prefix leg
+// reconstruction (`side_leg_from_total`), the four-leg `max(S + B', B + S')` fold and their per-side
+// helpers were deleted with the escrow; nothing computes an opening notional per side any more.
 
-/// `(Σ amount, Σ calc_value(price, amount))` over a side's order list — the maintained aggregate
-/// the leg reconstruction below consumes. Cold-rebuild / test helper; production maintains these
-/// incrementally so this full pass runs only on a cold first-touch.
+/// `(Σ amount, Σ` [`OrderEntry::margin_notional`]`)` over a side's order list — the ground-truth
+/// fold the maintained `(total_*_qty, total_*_notional)` aggregates mirror.
+///
+/// The notional is at each entry's FROZEN [`assuming_price`](OrderEntry::assuming_price), not at its
+/// limit price, so this is `Bid` on the buy side and `Ask` on the sell side outright — there is no
+/// second basis and no re-pricing pass. Cold-rebuild / oracle helper; production maintains the
+/// aggregates incrementally, so this full pass runs only on a cold first-touch or in a
+/// `debug_assertions` check.
 #[inline]
 pub fn sum_side_totals(
     entries: impl Iterator<Item = OrderEntry>,
@@ -679,7 +647,7 @@ pub fn sum_side_totals(
         qty = qty
             .checked_add(e.amount)
             .ok_or_else(|| perp_err("math: side total qty overflow"))?;
-        let v = calc_value(e.price, e.amount, base_decimals, price_decimals)?;
+        let v = e.margin_notional(base_decimals, price_decimals)?;
         notional = notional
             .checked_add(v)
             .ok_or_else(|| perp_err("math: side total notional overflow"))?;

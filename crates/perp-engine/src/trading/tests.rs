@@ -179,9 +179,7 @@ fn assert_event_matches_get_account(ctx: &mut TestCtx, event: &AccountBalanceCha
 fn oo_im(ctx: &mut TestCtx, user: Address) -> u64 {
     let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
     let p = storage::load_position(ctx, user, MARKET_ID).unwrap();
-    let priced =
-        crate::margin_view::stored_priced_position(ctx, user, MARKET_ID, &market, &p).unwrap();
-    crate::margin_view::position_open_order_margin(&market, priced).unwrap()
+    crate::margin_view::position_open_order_margin(&market, &p).unwrap()
 }
 
 /// `perp_wallet_balance − Σ ooIM` — the account's spendable headroom, i.e. the quantity every
@@ -2312,15 +2310,24 @@ fn a_cross_side_flip_fill_leaves_the_other_resting_orders_alone() {
     // The maker fill funded that 3e6 FROM THE WALLET (there is no escrow to draw on) and the
     // close returned 2.5e6 of margin + 0.5e6 of realised profit, so the wallet nets +0.5e6 ...
     assert_eq!(wallet(&mut ctx, ALICE), 17_500_000);
-    // ... and the residual book is repriced against the new SHORT. The fill printed at $300, so
-    // `T = ROUND_UP($300 × 1.0015) = $300.45` and ALICE's surviving sell — resting AT $300, i.e.
-    // below `T` — is charged at `T`: `Ask = 3_004_500`, not 3_000_000. (Before the fill the last
-    // print was $250, so `T = $250.375` sat BELOW the $300 sells and the markup did not bite; that
-    // is why the 6_000_000 above is unmarked.)
-    // Bid 6e6, Ask 3_004_500, N = −2.5e6 ⇒ IM = max(|−2.5+6|, |−2.5−3.0045|) = 5_504_500,
-    // PIM = 2.5e6 ⇒ ooIM = 3_004_500.
-    assert_eq!(oo_im(&mut ctx, ALICE), 3_004_500);
-    assert_eq!(available(&mut ctx, ALICE), 14_495_500);
+    // ... and the residual book is repriced against the new SHORT — through `N`, and ONLY through
+    // `N`.
+    //
+    // **This is the R12 freeze, on a real match.** The fill PRINTED at $300, which lifts the
+    // Assuming-Price floor to `T = ROUND_UP($300 × 1.0015) = $300.45` — above the $300 limit of
+    // ALICE's surviving sell. Under the refuted `H_live` reading the read path would re-resolve `T`
+    // and charge that sell 3_004_500. It does not: the sell was placed when the last print was $250
+    // (`T = $250.375`, below $300), so its `assuming_price` is frozen at its own $300 limit and its
+    // term stays 3_000_000 no matter what prints afterwards.
+    // Bid 6e6, Ask 3_000_000, N = −2.5e6 ⇒ IM = max(|−2.5+6|, |−2.5−3.0|) = 5_500_000,
+    // PIM = 2.5e6 ⇒ ooIM = 3_000_000.
+    assert_eq!(oo_im(&mut ctx, ALICE), 3_000_000);
+    assert_ne!(
+        oo_im(&mut ctx, ALICE),
+        3_004_500,
+        "a print AFTER the order rested must not reprice it (R12)"
+    );
+    assert_eq!(available(&mut ctx, ALICE), 14_500_000);
 
     // Conservation across the flip: ALICE's wallet + position margin grew by exactly the 0.5e6
     // she realised (long opened at $250, closed at $300), and by nothing else.
@@ -4395,8 +4402,36 @@ mod golden {
     /// `an_underfunded_maker_fill_conserves_total_system_value` and
     /// `risk::tests::usdc_custody`. Prior value
     /// 0x4a3ed7121a77b1e482a3db667cbe90b0331aa3acd5a350c9508f53e11d33c061.
+    /// RE-PIN (frozen per-order Assuming Price, R12 + `BLOCK_COMMITMENT_VERSION` 20→21). BOTH a
+    /// layout and an execution-rule change:
+    ///
+    /// 1. **`OrderEntry` gains a trailing `assuming_price` ("ap") field**, so every per-user
+    ///    order-list blob grows by one integer. This scenario writes those lists on every
+    ///    place/cancel/fill, so the delta's bytes move on this ground alone.
+    /// 2. **A resting order's contribution to `Bid`/`Ask` is FROZEN at placement** instead of being
+    ///    re-derived at each read from the CURRENT `T = max(ROUND_UP(lastTraded × 1.0015), mark)`.
+    ///    `total_sell_notional` consequently CARRIES the markup (it was the limit-price baseline
+    ///    before), so the position blob's value changes for any user holding a marked-up resting
+    ///    sell — CAROL's Phase-9c ask is exactly that, at 900_000 rather than 810_000.
+    ///    MEASURED: R12, `misc/binance-flip-and-admission.md` §3.13 — 90 frames, the reported
+    ///    `askNotional` never moved; `H_live` refused by 1939 quanta.
+    ///
+    /// **The BusinessSnapshot below is UNCHANGED, field for field.** That is not a general property
+    /// of this change — the frozen and live bases disagree on any book read after a market move —
+    /// and it holds here for a specific, checkable reason: the scenario has exactly ONE marked-up
+    /// resting sell (CAROL's Phase-9c ask), it is placed AFTER the last mark/oracle move, and it is
+    /// read back at that same mark. So the frozen value and the re-derived value coincide: `T` at
+    /// placement was `max(⌈80·TICK × 1.0015⌉, 90·TICK) = 90·TICK`, dominating its own $81 limit, and
+    /// `carol_account.1` stays 3_300_000 = 5_000_000 − 800_000 − 900_000 by both routes. Nothing
+    /// else in the scenario holds a resting sell at all, so `Ask` is 0 for ALICE and BOB either way,
+    /// and the buy side is definitionally unaffected (a long order's Assuming Price IS its limit
+    /// price, so `assuming_price == price` on every buy entry ever written). VERIFIED, not assumed:
+    /// the snapshot assertion passes unchanged, and the value below was captured with the version
+    /// byte already at 21. Prior value
+    /// 0x88dc1d5927c36e45585ce99ed8453bf7665a57c89ceb29ee10165fa4ccf41319 (and 0x68a881f4… is the
+    /// same write set at version byte 20, recorded to separate the two contributions to the move).
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x88dc1d5927c36e45585ce99ed8453bf7665a57c89ceb29ee10165fa4ccf41319");
+        b256!("0xc84dfc3ed57226c907fbac53e64dfc011e64be2254b092edffb4758a8eef6ba5");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -9009,15 +9044,22 @@ mod user_market_index {
     // The derived open-order requirement is
     //     ooIM = ROUND_UP(max(|N + Bid|, |N − Ask|) / L) − ROUND_UP(|N| / L)
     // where Binance defines `Bid` as Σ over the user's CURRENTLY RESTING buy orders of
-    // (REMAINING quantity × that order's LIMIT price), and `Ask` the same over sells. The whole
-    // migration rests on `PerpPosition::total_buy_notional` / `total_sell_notional` being
-    // EXACTLY those two quantities, maintained incrementally.
+    // (REMAINING quantity × that order's ASSUMING PRICE, frozen at placement), and `Ask` the same
+    // over sells. The whole migration rests on `PerpPosition::total_buy_notional` /
+    // `total_sell_notional` being EXACTLY those two quantities, maintained incrementally.
     //
     // `assert_side_totals_are_bid_and_ask` below is the proof obligation. It does not reuse
     // `math::sum_side_totals` (the engine's own fold — reusing it would only prove the engine
     // agrees with itself); it re-derives the sum inline, and additionally re-derives each term
     // from the authoritative `Order` record so that "remaining quantity" and "LIMIT price" are
     // checked as CLAIMS about the order, not just as fields of the mirror.
+    //
+    // ⚠️ A sell's FROZEN assuming price deliberately cannot be re-derived from current state — that
+    // is what freezing means, and it is why the mark moves freely in the sweep below without the
+    // ground truth having to track it. What the fold pins instead is that the maintained total is
+    // the Σ of exactly the per-entry terms present in the list, at whatever price each entry
+    // carries; the freeze RULE (buy: `assuming_price == price`; sell: `>= price`, and `== price`
+    // above the floor) is asserted per entry alongside it.
 
     /// The test market's fixed-point widths (see [`market_at`]).
     const BD: u32 = 8;
@@ -9027,20 +9069,28 @@ mod user_market_index {
     /// ground truth recomputed independently from the user's actual resting orders, AND that
     /// each resting entry really is `(remaining qty, limit price)` of a live order.
     ///
-    /// Four distinct claims, each of which a maintenance bug breaks differently:
+    /// Five distinct claims, each of which a maintenance bug breaks differently:
     /// 1. every entry in an order LIST is backed by an `Order` that is still resting
     ///    (`Open`/`PartiallyFilled`) — so the list is "currently resting orders", not a graveyard;
-    /// 2. `entry.price` is that order's LIMIT price (so the notional is at the limit, not at a
-    ///    fill/mark price);
+    /// 2. `entry.price` is that order's LIMIT price, untouched — the margin freeze may not leak
+    ///    into the field matching, sorting and the fill price all key on;
     /// 3. `entry.amount` is `quantity − filled`, the REMAINING quantity (so a partial fill really
     ///    does shrink the term);
-    /// 4. the stored aggregates equal the inline Σ over those entries.
+    /// 4. the freeze RULE holds per entry: a BUY's assuming price IS its limit price (no markup,
+    ///    measured), a SELL's is at least its limit price and exactly it when the order rests above
+    ///    the floor;
+    /// 5. the stored aggregates equal the inline Σ over those entries, at each entry's assuming
+    ///    price.
     fn assert_side_totals_are_bid_and_ask(
         ctx: &mut TestCtx,
         users: &[Address],
         markets: &[u64],
         step: &str,
-    ) {
+    ) -> u32 {
+        // Sell entries whose FROZEN assuming price sits strictly above their own limit — the shape
+        // that makes this whole assertion discriminating (with none of them, folding at the limit
+        // price would pass too). Returned so the driving test can assert the sweep reaches them.
+        let mut marked_up_sells = 0u32;
         for &u in users {
             for &m in markets {
                 let mut truth = [0u64; 4]; // tbq, tbn, tsq, tsn
@@ -9074,7 +9124,10 @@ mod user_market_index {
                             "{step}: entry {:?} filed under the wrong (market, side)",
                             e.order_id
                         );
-                        // (2) the notional basis is the order's LIMIT price.
+                        // (2) `entry.price` is still the order's LIMIT price. This is the guard
+                        // against `assuming_price` leaking into the execution field: matching,
+                        // price priority, the sorted insert, the book level and the fill price all
+                        // read `entry.price`, so a markup landing here would be silent corruption.
                         assert_eq!(
                             e.price, o.price,
                             "{step}: user {u} market {m} entry {:?} price {} is not the order's \
@@ -9092,10 +9145,34 @@ mod user_market_index {
                             o.quantity,
                             o.filled
                         );
-                        // (4) fold, inline — deliberately NOT `math::sum_side_totals`.
+                        // (4) the freeze rule, per entry.
+                        if buy {
+                            assert_eq!(
+                                e.assuming_price, e.price,
+                                "{step}: user {u} market {m} BUY entry {:?} carries a marked-up \
+                                 assuming price {} over limit {} — the buy side has NO markup",
+                                e.order_id, e.assuming_price, e.price
+                            );
+                        } else {
+                            assert!(
+                                e.assuming_price >= e.price,
+                                "{step}: user {u} market {m} SELL entry {:?} assuming price {} is \
+                                 BELOW its limit {} — max(T, limit) can never be",
+                                e.order_id,
+                                e.assuming_price,
+                                e.price
+                            );
+                            if e.assuming_price > e.price {
+                                marked_up_sells += 1;
+                            }
+                        }
+                        // (5) fold, inline — deliberately NOT `math::sum_side_totals`, and at the
+                        // entry's FROZEN assuming price, which is the basis every maintenance site
+                        // adds and subtracts.
                         let i = if buy { 0 } else { 2 };
                         truth[i] += e.amount;
-                        truth[i + 1] += crate::math::calc_value(e.price, e.amount, BD, PD).unwrap();
+                        truth[i + 1] +=
+                            crate::math::calc_value(e.assuming_price, e.amount, BD, PD).unwrap();
                     }
                 }
                 let p = storage::load_position(ctx, u, m).unwrap();
@@ -9108,10 +9185,11 @@ mod user_market_index {
                     ),
                     (truth[0], truth[1], truth[2], truth[3]),
                     "{step}: user {u} market {m}: maintained (tbq, tbn=Bid, tsq, tsn=Ask) diverged \
-                     from the resting-order ground truth"
+                     from the resting-order ground truth (Σ at each entry's FROZEN assuming price)"
                 );
             }
         }
+        marked_up_sells
     }
 
     /// Deterministic xorshift (same generator as the settlement conservation fuzz).
@@ -9133,6 +9211,10 @@ mod user_market_index {
         leaves: u32,
         liquidations: u32,
         flips: u32,
+        /// Max number of resting SELLS seen in one sweep whose FROZEN assuming price is strictly
+        /// above their own limit price. Zero would make the Bid/Ask fold non-discriminating: with no
+        /// marked-up sell anywhere, folding at the limit price would agree too.
+        marked_up_sells: u32,
     }
 
     /// One randomised pass: a mix of place / cancel / fill / partial fill / close / flip /
@@ -9269,7 +9351,9 @@ mod user_market_index {
             // invariants — the op mix (rest / partial fill / full fill / flip / cancel /
             // mid-match auto-cancel / liquidation cancel-all / reject) is precisely the set of
             // transitions that can desynchronise them.
-            assert_side_totals_are_bid_and_ask(&mut ctx, &users, &MARKETS, &where_);
+            cov.marked_up_sells = cov.marked_up_sells.max(assert_side_totals_are_bid_and_ask(
+                &mut ctx, &users, &MARKETS, &where_,
+            ));
             // The index is a SET, always ascending, and never exceeds the cap.
             for &u in &users {
                 let ix = index(&mut ctx, u);
@@ -9313,10 +9397,11 @@ mod user_market_index {
         assert!(deep.flips >= 1, "no position ever flipped sign");
     }
 
-    /// **Derived-ooIM Step 0 deliverable.** The maintained per-side aggregates
-    /// `total_buy_notional` / `total_sell_notional` ARE Binance's `Bid` / `Ask` — Σ over the
-    /// user's currently resting orders of (remaining quantity × LIMIT price) — and the two qty
-    /// aggregates are the matching Σ quantity, after EVERY step of a randomised sequence.
+    /// **Derived-ooIM Step 0 deliverable, on the FROZEN basis.** The maintained per-side aggregates
+    /// `total_buy_notional` / `total_sell_notional` ARE Binance's `Bid` / `Ask` — Σ over the user's
+    /// currently resting orders of (remaining quantity × that order's ASSUMING PRICE, frozen when it
+    /// was placed) — and the two qty aggregates are the matching Σ quantity, after EVERY step of a
+    /// randomised sequence.
     ///
     /// The per-step assertion lives inside [`run_fuzz`] (see
     /// [`assert_side_totals_are_bid_and_ask`]); this test drives it over its own seeds so the
@@ -9326,10 +9411,35 @@ mod user_market_index {
     /// cancel cascade and the mid-match order-list rewrite, which are the two paths that resync
     /// the aggregates by RECOMPUTE rather than incrementally.
     ///
-    /// Mutation-tested: deleting any one of the five maintenance sites — the place-path
-    /// increment (`trading/mod.rs` buy/sell arms), the cancel-path decrement, the match-flush
-    /// recompute (`settlement.rs`), or the liquidation cancel-all zeroing (`risk/mod.rs`) —
-    /// fails this test.
+    /// `marked_up_sells` is the coverage floor the freeze added: the sweep's sells straddle the
+    /// Assuming-Price floor implied by the last print, so entries with `assuming_price > price`
+    /// really do occur. Without one, folding at the LIMIT price would satisfy the assertion too and
+    /// the whole property would be blind to the change.
+    ///
+    /// Mutation-tested on the frozen basis. **Four maintenance sites, each killed:**
+    ///
+    /// | site | mutation | result |
+    /// |---|---|---|
+    /// | placement increment, BUY arm (`trading/mod.rs`) | drop the `checked_add` | FAILS |
+    /// | placement increment, SELL arm (`trading/mod.rs`) | drop the `checked_add` | FAILS |
+    /// | the shared decrement (`remove_entry_from_side_aggregates`) — cancel, partial fill, LIFO cover | no-op the `checked_sub` | FAILS |
+    /// | partial-fill delta feeding it (`settle_maker_fill_core`) | pass 0 instead of the delta | FAILS |
+    /// | liquidation cancel-all zeroing (`risk/mod.rs`, `clear_side_aggregates`) | drop the call | FAILS |
+    ///
+    /// …and mutation-tested against the FREEZE specifically: maintaining any one site at
+    /// `entry.price` instead of `entry.assuming_price` also FAILS, because the sites then disagree
+    /// with each other on a marked-up sell (tried on the cancel decrement and on
+    /// `math::sum_side_totals`).
+    ///
+    /// ⚠️ **One thing this test does NOT prove, and an earlier version of this comment wrongly
+    /// claimed it did:** the match flush's `w.pos.total_* = t*` RESYNC (`settlement.rs::flush`)
+    /// SURVIVES deletion. It is redundant by construction — the walk already maintains the
+    /// aggregates incrementally, and the `debug_assert_eq!` two lines above the assignment is
+    /// exactly the statement that the recompute equals what is already there. So the assignment can
+    /// only matter if the incremental maintenance is wrong, and in that case the debug assert fires
+    /// first: zeroing the partial-fill delta (row 4) panics AT that assert, not at this test's own
+    /// fold. The resync is a release-build backstop, not an independently observable site. This
+    /// survival is pre-existing (that block is untouched by the freeze), not a regression.
     #[test]
     fn side_aggregates_are_exactly_bid_and_ask_after_every_operation() {
         let deep = run_fuzz(0x00_1f_bd_a5_c0_de_00_11, RICH, 800);
@@ -9340,6 +9450,11 @@ mod user_market_index {
         for (name, cov) in [("deep", &deep), ("thin", &thin)] {
             assert!(cov.enters >= 20, "{name}: too few market entries");
             assert!(cov.leaves >= 20, "{name}: too few market exits");
+            assert!(
+                cov.marked_up_sells >= 1,
+                "{name}: no resting sell ever carried a marked-up assuming price, so the fold \
+                 cannot tell the frozen basis from the limit-price one"
+            );
         }
         assert!(
             deep.liquidations >= 1,
@@ -9769,9 +9884,7 @@ mod derived_ooim_divergence {
     fn oo_im_alice(ctx: &mut TestCtx) -> u64 {
         let m = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
         let p = storage::load_position(ctx, ALICE, MARKET_ID).unwrap();
-        let priced =
-            crate::margin_view::stored_priced_position(ctx, ALICE, MARKET_ID, &m, &p).unwrap();
-        position_open_order_margin(&m, priced).unwrap()
+        position_open_order_margin(&m, &p).unwrap()
     }
 
     // ── 1. Cross-side orders are charged the MAX of the two terminal exposures ───────────────
@@ -9834,28 +9947,48 @@ mod derived_ooim_divergence {
     /// never revisited (it was computed in QUANTITY space at the orders' LIMIT prices; the mark
     /// was not an input to it at all), so it sat frozen at 2_200_000 across this whole walk.
     ///
-    /// Long 1 lot, resting SELL 3 lots @ $110, leverage 1. Nothing has traded in this market, so
-    /// the Assuming-Price floor is `T = max(ROUND_UP(0 × 1.0015), mark) = mark`, and the SELL side
-    /// is charged at `max(T, $110)` — which means the mark enters `Ask` as well as `N`:
+    /// Long 1 lot, resting SELL 3 lots @ $110, leverage 1. Nothing has traded in this market, so the
+    /// Assuming-Price floor at PLACEMENT was `T = max(ROUND_UP(0 × 1.0015), $100) = $100`, below the
+    /// $110 limit — so each sell froze at its own $110 and `Ask = 3_300_000` for the whole walk.
+    /// **Only `N` moves:**
     ///
-    /// | mark | `N`       | `Ask`     | `max(\|N+Bid\|, \|N−Ask\|)` | PIM       | ooIM      | (old escrow) |
-    /// |------|-----------|-----------|---------------------------|-----------|-----------|--------------|
-    /// | $100 | 1_000_000 | 3_300_000 | 2_300_000 (ask branch)    | 1_000_000 | 1_300_000 |    2_200_000 |
-    /// | $150 | 1_500_000 | 4_500_000 | 3_000_000 (ask branch)    | 1_500_000 | 1_500_000 |    2_200_000 |
-    /// | $200 | 2_000_000 | 6_000_000 | 4_000_000 (ask branch)    | 2_000_000 | 2_000_000 |    2_200_000 |
+    /// | mark | `N`       | `Ask` (frozen) | `max(\|N+Bid\|, \|N−Ask\|)` | PIM       | ooIM      | (old escrow) |
+    /// |------|-----------|----------------|---------------------------|-----------|-----------|--------------|
+    /// | $100 | 1_000_000 |      3_300_000 | 2_300_000 (ask branch)    | 1_000_000 | 1_300_000 |    2_200_000 |
+    /// | $150 | 1_500_000 |      3_300_000 | 1_800_000 (ask branch)    | 1_500_000 |   300_000 |    2_200_000 |
+    /// | $200 | 2_000_000 |      3_300_000 | 2_000_000 (BID branch)    | 2_000_000 |         0 |    2_200_000 |
     ///
-    /// **The `Mark` branch of the Assuming Price is what makes the last two rows what they are.**
-    /// Priced at the orders' LIMIT price this walk read `1_300_000 → 300_000 → 0`: the growing long
-    /// swallowed the sells until they were pure risk REDUCTION and free. That is wrong — the
-    /// vendor formula is `max(Last × 1.0015, Mark, order price)`, so once the mark passes the
-    /// sell's limit the sell is repriced AT THE MARK, and while `Σ sell qty > position qty` the ask
-    /// branch grows with the mark forever. A sell 3× the position never becomes free.
+    /// ⚠️ **RE-DERIVED for R12 (was `1_300_000 → 1_500_000 → 2_000_000`).** The old numbers came
+    /// from re-resolving `T` on every read, so as the mark rose past $110 the sells were repriced AT
+    /// THE MARK and the ask branch grew with it forever —「a sell 3× the position never becomes
+    /// free」. R12 measured that a resting order is NOT repriced (90 frames, 1939 quanta), so the
+    /// growing long now does swallow the frozen sells until they are pure risk reduction and free.
+    /// The walk that this file previously called "wrong" is the measured one.
+    ///
+    /// That staleness is the exposure the docs name and accept: 「托管会变陈旧」 — rest a sell, let
+    /// the market run, and its term still reflects the old print. Note the shape's own limit: a sell
+    /// resting at $110 with the mark at $200 is deep inside the book and would not survive as a
+    /// resting order in a live market; this fixture reaches it only because `save_mark_price` moves
+    /// the mark without running the matcher.
+    ///
+    /// **The property under test is unchanged and is the point of the test: ooIM moves on the mark
+    /// alone.** It just moves DOWN here rather than up, and the row-to-row differences are what the
+    /// assertion pins.
     #[test]
     fn a_mark_move_reprices_the_requirement_with_no_order_and_no_fill() {
         let mut ctx = make_ctx();
         setup_marked(&mut ctx, PRICE);
         seed_position(&mut ctx, ALICE, 1, 1);
         place(&mut ctx, ALICE, 1, P_HIGH, 3);
+
+        // The frozen basis, stated once: nothing below re-derives it.
+        assert_eq!(
+            storage::load_position(&mut ctx, ALICE, MARKET_ID)
+                .unwrap()
+                .total_sell_notional,
+            3_300_000,
+            "3 lots frozen at their own $110 limit (T was $100 at placement)"
+        );
 
         let mut seen = Vec::new();
         for mark in [PRICE, 150 * TICK, 200 * TICK] {
@@ -9864,8 +9997,20 @@ mod derived_ooim_divergence {
         }
         assert_eq!(
             seen,
-            vec![1_300_000, 1_500_000, 2_000_000],
-            "ooIM 1_300_000 -> 1_500_000 -> 2_000_000 on the mark alone"
+            vec![1_300_000, 300_000, 0],
+            "ooIM 1_300_000 -> 300_000 -> 0 on the mark alone: `N` is live even though `Ask` is not"
+        );
+        assert!(
+            seen[0] != seen[1] && seen[1] != seen[2],
+            "the requirement must genuinely MOVE with the mark — a frozen `Ask` must not have \
+             frozen `ooIM` (R10)"
+        );
+        assert_eq!(
+            storage::load_position(&mut ctx, ALICE, MARKET_ID)
+                .unwrap()
+                .total_sell_notional,
+            3_300_000,
+            "and `Ask` is byte-identical after the whole walk"
         );
     }
 
@@ -9945,10 +10090,7 @@ mod derived_ooim_divergence {
             // position sign is the single independent variable.
             let mut p = storage::load_position(&mut ctx, ALICE, MARKET_ID).unwrap();
             p.amount = lots * QTY as i64;
-            let priced =
-                crate::margin_view::stored_priced_position(&mut ctx, ALICE, MARKET_ID, &m, &p)
-                    .unwrap();
-            walk.push(position_open_order_margin(&m, priced).unwrap());
+            walk.push(position_open_order_margin(&m, &p).unwrap());
         }
         assert_eq!(
             walk,
@@ -10227,13 +10369,21 @@ mod assuming_price {
         assert_eq!(available(&mut ctx, ALICE), 0, "6_060 of 6_060 committed");
         let p = pos(&mut ctx, ALICE);
         assert_eq!(
-            p.total_sell_notional, 102_000,
-            "the maintained aggregate stays at the LIMIT price"
+            p.total_sell_notional, 120_180,
+            "the maintained aggregate IS `Ask`: the markup is frozen INTO the entry at placement, \
+             so there is no second (limit-price) basis to keep"
         );
         let i = margin_info(&mut ctx, ALICE);
         assert_eq!(
-            i.askNotional, 120_180,
-            "but `Ask` — and therefore IM — is at the Assuming Price"
+            i.askNotional, p.total_sell_notional,
+            "and the reported `Ask` is that aggregate read back, not a re-fold"
+        );
+        assert_eq!(i.askNotional, 120_180);
+        assert_eq!(
+            storage::load_sell_orders(&mut ctx, ALICE, MARKET_ID).unwrap()[0].price,
+            85_000,
+            "while the entry's LIMIT price — what matching, sorting and the fee key on — is \
+             untouched at 85_000"
         );
         assert_eq!((i.notional, i.positionInitialMargin), (51_000, 17_000));
         assert_eq!(i.initialMargin, 23_060);
@@ -10241,8 +10391,8 @@ mod assuming_price {
     }
 
     /// The BOUNDARY, so the interior above is not the only thing recorded: a sell resting ABOVE
-    /// `T` is its own Assuming Price, the markup contributes nothing, and `Ask` is exactly the
-    /// maintained limit-price aggregate.
+    /// `T` freezes at its own limit price, the markup contributes nothing, and `Ask` equals the
+    /// limit-price fold — the one case where the two bases coincide.
     ///
     /// Same position, sell 12 @ 150_000 (well above `T = 100_150`):
     /// `Ask = 180_000`, `IM = ROUND_UP(|51_000 − 180_000| / 3) = 43_000`, `ooIM = 26_000`.
@@ -10258,7 +10408,12 @@ mod assuming_price {
         assert_eq!(p.total_sell_notional, 180_000);
         assert_eq!(
             i.askNotional, p.total_sell_notional,
-            "above T the two bases coincide — no markup term at all"
+            "above T the frozen price IS the limit price — no markup term at all"
+        );
+        assert_eq!(
+            storage::load_sell_orders(&mut ctx, ALICE, MARKET_ID).unwrap()[0].assuming_price,
+            150_000,
+            "and the frozen field records exactly that"
         );
         assert_eq!(i.initialMargin, 43_000);
         assert_eq!(oo_im(&mut ctx, ALICE), 26_000);
@@ -10373,22 +10528,28 @@ mod assuming_price {
         assert_eq!(oo_im(&mut ctx, ALICE), 57_701);
     }
 
-    /// The markup is PER ORDER — `Σ qty × max(T, price)`, not a single adjustment to the total —
-    /// and the walk that finds the affected orders relies on the sell list being ASCENDING by
-    /// price, which is the invariant `mutate_sell_orders`' `partition_point(|e| e.price < price)`
-    /// maintains. Four sells of 4 straddling `T = 100_150`:
+    /// The markup is PER ORDER — each entry freezes its own `max(T, price)`, not a single adjustment
+    /// to the total — and the sell list stays ASCENDING BY LIMIT PRICE, which is what the insert
+    /// predicate `partition_point(|e| e.price < price)` maintains and what matching, price priority
+    /// and `cancel_same_side_orders_until_wallet_covers`' `.back()` depend on. The markup no longer
+    /// walks that order (it is frozen per entry at placement), so this test also pins that the sort
+    /// is keyed on `price` and NOT on the marked-up `assuming_price` — under which the list below
+    /// would come out `[100_150, 100_150, 100_150, 150_000]` and the first three would be
+    /// interchangeable.
+    ///
+    /// Four sells of 4 straddling `T = 100_150`:
     ///
     /// ```text
-    ///  90_000 → lifted to T     100_000 → lifted to T
-    /// 100_150 → exactly T, unchanged      150_000 → above T, unchanged
+    ///  limit    frozen assuming price
+    ///  90_000 → 100_150 (lifted to T)     100_000 → 100_150 (lifted to T)
+    /// 100_150 → 100_150 (exactly T)       150_000 → 150_000 (above T)
     ///
-    /// Ask (assuming) = 4·(100_150 + 100_150 + 100_150 + 150_000) / 10 = 180_180
-    /// Ask (limit)    = 4·( 90_000 + 100_000 + 100_150 + 150_000) / 10 = 176_060  ← the aggregate
+    /// Ask = 4·(100_150 + 100_150 + 100_150 + 150_000) / 10 = 180_180   ← the aggregate, frozen
     /// ooIM = ROUND_UP(|51_000 − 180_180| / 3) − 17_000 = 43_060 − 17_000 = 26_060
     ///        (at the limit price it would have been 41_687 − 17_000 = 24_687)
     /// ```
     #[test]
-    fn the_markup_applies_per_order_to_the_below_floor_prefix_only() {
+    fn the_markup_is_frozen_per_order_and_never_reorders_the_list() {
         let mut ctx = make_ctx();
         alice_long_at_85k(&mut ctx);
         fund(&mut ctx, ALICE, 1_000_000);
@@ -10400,13 +10561,19 @@ mod assuming_price {
         assert_eq!(
             sells.iter().map(|e| e.price).collect::<Vec<_>>(),
             vec![90_000, 100_000, 100_150, 150_000],
-            "the walk's precondition: ascending by price"
+            "ascending by LIMIT price — the sort matching and `.back()` rely on"
+        );
+        assert_eq!(
+            sells.iter().map(|e| e.assuming_price).collect::<Vec<_>>(),
+            vec![100_150, 100_150, 100_150, 150_000],
+            "each entry froze its own max(T, limit) — three of them collide, which is exactly why \
+             the sort must not key on this field"
         );
 
         let p = pos(&mut ctx, ALICE);
         assert_eq!(
-            p.total_sell_notional, 176_060,
-            "the limit-price aggregate is untouched by the markup"
+            p.total_sell_notional, 180_180,
+            "the aggregate IS `Ask`, at the frozen prices"
         );
         assert_eq!(margin_info(&mut ctx, ALICE).askNotional, 180_180);
         assert_eq!(
@@ -10440,8 +10607,96 @@ mod assuming_price {
         assert_eq!(margin_info(&mut ctx, ALICE).askNotional, 33_000 + 30_000);
         assert_eq!(
             pos(&mut ctx, ALICE).total_sell_notional,
-            33_000 + 27_000,
-            "the limit-price aggregate is untouched"
+            33_000 + 30_000,
+            "the aggregate carries the frozen lift, and is `Ask` itself"
+        );
+        assert_eq!(
+            storage::load_sell_orders(&mut ctx, ALICE, MARKET_ID)
+                .unwrap()
+                .iter()
+                .map(|e| (e.price, e.assuming_price))
+                .collect::<Vec<_>>(),
+            vec![(90_000, 100_000), (110_000, 110_000)],
+            "the below-mark sell froze at the mark; the above-mark one at its own limit"
+        );
+    }
+
+    /// **R12, the freeze itself.** Once a sell rests, its `Ask` term never moves again — not when
+    /// the mark walks, not when a later trade prints, not when the floor crosses its own limit
+    /// price. `misc/binance-flip-and-admission.md` §3.13: 3 trials × 30 frames × 2 s, the reported
+    /// `askNotional` never moved while `Last` walked 32.80 USD, with **9 consecutive frames below
+    /// the `P_s / 1.0015` kink** where a recomputed-at-read value has to plateau at `q × P_s`.
+    /// `H_live` was refused by 1939 quanta — a SHAPE-level refutation, not a slope-level one.
+    ///
+    /// This is the on-chain analogue of that walk, and it is built to be discriminating in the same
+    /// way: a sell rests at 85_000 with `T = 100_150`, freezing at 100_150, and then the mark is
+    /// walked from 85_000 all the way to 200_000 — right through and far past the frozen price. A
+    /// re-resolving implementation would report `Ask = 12 × mark / 10` on the later frames
+    /// (240_000 at mark 200_000); the frozen one reports 120_180 on every frame.
+    ///
+    /// ⚠️ And the other half, which must NOT be broken by the freeze: `ooIM` still MOVES, because
+    /// `N = |qty| × mark` is live. Both are asserted here so neither can be "fixed" into the other.
+    #[test]
+    fn a_resting_sells_ask_term_is_frozen_while_ooim_still_moves_with_the_mark() {
+        let mut ctx = make_ctx();
+        alice_long_at_85k(&mut ctx);
+        fund(&mut ctx, ALICE, 6_060);
+        place(&mut ctx, ALICE, 1, 85_000, 12, 0, 0);
+        // Frozen at T = max(ROUND_UP(100_000 × 1.0015), 85_000) = 100_150 ⇒ 12 × 100_150/10.
+        assert_eq!(margin_info(&mut ctx, ALICE).askNotional, 120_180);
+
+        // Fund the walk so a rising requirement is never the thing that reverts (nothing writes
+        // here anyway — `save_mark_price` is the only mutation).
+        fund(&mut ctx, ALICE, 10_000_000);
+
+        let mut asks = Vec::new();
+        let mut oo_ims = Vec::new();
+        for mark in [85_000u64, 95_000, 100_150, 120_000, 200_000] {
+            storage::save_mark_price(&mut ctx, MARKET_ID, mark).unwrap();
+            asks.push(margin_info(&mut ctx, ALICE).askNotional);
+            oo_ims.push(oo_im(&mut ctx, ALICE));
+        }
+
+        // (a) THE FREEZE: byte-identical on every frame, including the three where the mark is at or
+        //     above the frozen 100_150 and a live rule would have taken over.
+        assert_eq!(
+            asks,
+            vec![120_180; 5],
+            "a resting sell's Ask term must not move with the mark (R12)"
+        );
+        assert_ne!(
+            asks.last(),
+            Some(&240_000),
+            "…and specifically not to 12 × mark / 10, which is what re-resolving T would give"
+        );
+        // Also unmoved by a fresh PRINT that lifts the floor past the frozen price: BOB and CAROL
+        // trade at 200_000, so `T` becomes 200_300 — nothing to do with ALICE's resting order.
+        fund(&mut ctx, CAROL, 10_000_000);
+        place(&mut ctx, BOB, 0, 200_000, 1, 0, 0);
+        place(&mut ctx, CAROL, 1, 200_000, 1, 0, 0);
+        assert_eq!(
+            storage::load_last_traded_price(&mut ctx, MARKET_ID).unwrap(),
+            200_000,
+            "the print landed"
+        );
+        assert_eq!(
+            margin_info(&mut ctx, ALICE).askNotional,
+            120_180,
+            "a later print does not re-freeze an already-resting order"
+        );
+
+        // (b) `N` IS STILL LIVE, so ooIM moves — the frozen aggregate did not freeze the
+        //     requirement. Long 6 at leverage 3 against a frozen Ask of 120_180:
+        //       mark  85_000: N = 51_000, IM = ⌈(120_180−51_000)/3⌉ = 23_060, PIM = 17_000 ⇒  6_060
+        //       mark  95_000: N = 57_000, IM = ⌈(120_180−57_000)/3⌉ = 21_060, PIM = 19_000 ⇒  2_060
+        //       mark 100_150: N = 60_090, IM = ⌈(120_180−60_090)/3⌉ = 20_030, PIM = 20_030 ⇒      0
+        //       mark 120_000: N = 72_000, bid branch |72_000| wins ⇒ IM = PIM              ⇒      0
+        //       mark 200_000: N = 120_000, same                                            ⇒      0
+        assert_eq!(oo_ims, vec![6_060, 2_060, 0, 0, 0]);
+        assert!(
+            oo_ims[0] != oo_ims[1],
+            "ooIM must still re-value on a mark move with no user action (R10) — the freeze is \
+             per-order, it is NOT 'the escrow is a constant' (that holds only at N = 0)"
         );
     }
 

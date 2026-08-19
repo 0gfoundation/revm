@@ -2393,6 +2393,7 @@ mod size_probe_tests {
             price: 65_432_10,
             amount: 150_000_000,
             maker_fee_bps: 2,
+            assuming_price: 6_550_000,
         };
         println!(
             "OrderEntry x1 (in vec): {} bytes",
@@ -2634,6 +2635,7 @@ mod encoding_roundtrip_tests {
                 price: u64::MAX,
                 amount: u64::MAX,
                 maker_fee_bps: 12_345,
+                assuming_price: u64::MAX,
             },
         );
         rt(

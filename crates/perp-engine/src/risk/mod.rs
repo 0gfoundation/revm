@@ -586,16 +586,7 @@ pub fn run_get_position<H: PerpHost>(
 
     let pos = storage::load_position_ref(context, args.user, args.marketId)?;
     let open_order_margin = match storage::load_market_ref(context, args.marketId)? {
-        Some(market) => {
-            let priced = crate::margin_view::stored_priced_position(
-                context,
-                args.user,
-                args.marketId,
-                &market,
-                &pos,
-            )?;
-            crate::margin_view::position_open_order_margin(&market, priced)?
-        }
+        Some(market) => crate::margin_view::position_open_order_margin(&market, &pos)?,
         None => 0,
     };
     Ok(Bytes::from(getPositionCall::abi_encode_returns(
@@ -1067,9 +1058,11 @@ fn run_liquidation_sweep<H: PerpHost>(
 ///
 /// `Bid`/`Ask`/`N` are untouched by `setLeverage` (it moves neither the position nor the book), so
 /// "before" is the stored position and "after" is the same position at `new_leverage` — the only
-/// input that differs is the divisor. In particular the Assuming-Price `Ask` is the SAME fold on
-/// both sides, resolved once from the stored sell list. Pure read + reject: zero writes on either
-/// outcome, so this may precede every write on the path (commit-only).
+/// input that differs is the divisor. It does **not** maintain the aggregates and must not: an
+/// order's Assuming Price is frozen at PLACEMENT, and a leverage change is not a placement, so
+/// re-freezing here would silently re-price the whole resting book at the current mark. Pure read +
+/// reject: zero writes on either outcome, so this may precede every write on the path
+/// (commit-only).
 fn rebalance_order_margin_for_leverage<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -1079,13 +1072,7 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
 ) -> Result<(), PerpError> {
     let mut after = pos.clone();
     after.leverage = new_leverage;
-    let ask =
-        crate::margin_view::stored_ask_assuming(context, user, market.market_id, market, pos)?;
-    let delta = crate::margin_view::derived_requirement_delta(
-        market,
-        crate::margin_view::PricedPosition::new(pos, ask),
-        crate::margin_view::PricedPosition::new(&after, ask),
-    )?;
+    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
     // The available is measured on the CURRENT (pre-change) state, which is what `delta` is the
     // increment to — with the caller's in-memory `pos` overriding storage for this market, since
     // it is not written until after this gate. A non-positive delta is free (`derived_can_afford`).
@@ -1093,10 +1080,7 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
         context,
         user,
         None,
-        Some((
-            market.market_id,
-            crate::margin_view::PricedPosition::new(pos, ask),
-        )),
+        Some((market.market_id, pos)),
     )?;
     if !crate::margin_view::derived_can_afford(available, delta) {
         return Err(perp_err(

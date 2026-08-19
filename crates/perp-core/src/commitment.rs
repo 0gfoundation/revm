@@ -71,7 +71,20 @@ use primitives::{B256, U256};
 // this version guards. CHAIN change: golden re-pin (below) + a coordinated wipe on deploy. (The
 // golden SCENARIO never underfunds a maker, so its write set is byte-identical at 19 and 20 and its
 // BusinessSnapshot is unchanged; the golden value moves only because this byte is hashed into it.)
-pub const BLOCK_COMMITMENT_VERSION: u8 = 20;
+// Frozen per-order Assuming Price (R12): bumped 20→21 — BOTH a layout and an execution-rule change.
+// `OrderEntry` gains a trailing "ap" field (`assuming_price`), so EVERY per-user order-list blob
+// grows by one integer; and a resting order's contribution to `Bid`/`Ask` is now the value frozen
+// when it was placed instead of being re-derived at every read from the CURRENT
+// `T = max(ROUND_UP(lastTraded × 1.0015), mark)`. `total_sell_notional` therefore carries the
+// markup (it was the limit-price baseline before), which changes the value written for any user with
+// a marked-up resting sell, and changes admission arithmetic: a later print or mark move no longer
+// re-prices an order that is already resting. MEASURED — `misc/binance-flip-and-admission.md` §3.13
+// (R12): 90 frames, the reported `askNotional` never moved, `H_live` refused by 1939 quanta with 9
+// consecutive frames below the kink. `N = |position| × mark` stays LIVE, so `ooIM` still moves with
+// the mark (R10) — only the per-order terms froze. A node on 20 and a node on 21 would disagree on
+// both the blob bytes and the admission verdict, which is exactly what this version guards. CHAIN
+// change: golden re-pin (below) + a coordinated wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 21;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

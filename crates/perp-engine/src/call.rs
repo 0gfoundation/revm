@@ -124,9 +124,10 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // `getOpenOrders`, NOT the 5_000 scalar-getter tier it used to sit in.
         //
         // The LOADS did not change: at 5_000 it already walked the index through
-        // `derived_available_balance` (≤ MAX_USER_MARKETS = 16 markets × {market, position,
-        // MarketHot, sell list} = ≤ 66 `_ref` loads worst case), and the index-driven roll-up
-        // reaches exactly the same set — the added work is pure arithmetic (a ≤8-band maintenance
+        // `derived_available_balance` (≤ MAX_USER_MARKETS = 16 markets × {market, position} = ≤ 33
+        // `_ref` loads — it was ≤ 66 with the `+ {MarketHot, sell list}` the read-time `Ask` re-fold
+        // needed, before the R12 freeze put both aggregates in the position blob), and the
+        // index-driven roll-up reaches exactly the same set — the added work is pure arithmetic (a ≤8-band maintenance
         // tier walk and `Σ positionMargin`, both off values already in hand). What changed is what
         // the selector BUYS: it now returns everything `getAccountMargin` returns, which is priced
         // at 50_000 for ≤64 ids, i.e. ~781/market. Leaving `getAccount` at 5_000 would make it the

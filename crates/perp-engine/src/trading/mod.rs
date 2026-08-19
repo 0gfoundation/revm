@@ -2028,6 +2028,10 @@ pub(super) fn match_order<H: PerpHost>(
 /// #A oracle (debug builds only): assert the maintained per-side aggregates on `pos` equal a fresh
 /// recompute from the actual order lists. A divergence means a mutation site failed to keep the
 /// totals in sync — caught loudly in tests / the correctness gate, compiled out in release.
+///
+/// The fold is `math::sum_side_totals`, which values each entry at its FROZEN
+/// `assuming_price` — the same basis every maintenance site adds and subtracts. Folding at the LIMIT
+/// price here would fire spuriously on any sell that was marked up at placement.
 #[inline]
 fn debug_assert_totals(
     buy: impl Iterator<Item = OrderEntry>,
@@ -2119,6 +2123,11 @@ fn rest_in_book<H: PerpHost>(
                 price,
                 amount: qty,
                 maker_fee_bps,
+                // A LONG order's Assuming Price IS its own limit price — MEASURED, no markup on the
+                // buy side (R11's `bidNotional == q_B × P_b` digit-for-digit). Setting the field
+                // rather than leaving it side-conditional is what lets ONE rule
+                // (`Σ calc_value(assuming_price, amount)`) serve both aggregates.
+                assuming_price: price,
             };
             let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
             #[cfg(debug_assertions)]
@@ -2135,10 +2144,10 @@ fn rest_in_book<H: PerpHost>(
                     price_decimals,
                 );
             }
-            // `Bid` grows by this order's notional at its LIMIT price — the same per-order-floored
-            // `calc_value` term the fold would contribute, so the aggregate stays exactly Binance's
-            // `bidNotional`.
-            let entry_notional = crate::math::calc_value(price, qty, base_decimals, price_decimals)?;
+            // `Bid` grows by this order's notional at its FROZEN Assuming Price (== its limit price
+            // on this side) — the same per-order-floored `calc_value` term the fold would
+            // contribute, so the aggregate stays exactly Binance's `bidNotional`.
+            let entry_notional = new_entry.margin_notional(base_decimals, price_decimals)?;
             let new_total_buy_qty = pos
                 .total_buy_qty
                 .checked_add(qty)
@@ -2155,27 +2164,19 @@ fn rest_in_book<H: PerpHost>(
             // debited: resting an order moves no money, it only raises the requirement.
             // A non-positive delta — a pure-reduce order — is free at any balance.
             //
-            // The SELL side of the book is untouched by a buy, so the Assuming-Price `Ask` is the
-            // same fold on both sides of the delta — resolved once. (It is still needed: `Ask`
-            // enters `IM` through the `max()`.)
-            let ask =
-                crate::margin_view::stored_ask_assuming(context, user, market_id, market, &pos)?;
+            // Both aggregates ride on the positions themselves, so the delta is exactly this
+            // order's frozen term (every already-resting order contributes identically to both
+            // sides). `Ask` still matters: it enters `IM` through the `max()`.
             let mut pos_after = pos.clone();
             pos_after.total_buy_qty = new_total_buy_qty;
             pos_after.total_buy_notional = new_total_buy_notional;
-            let delta = crate::margin_view::derived_requirement_delta(
-                market,
-                crate::margin_view::PricedPosition::new(&pos, ask),
-                crate::margin_view::PricedPosition::new(&pos_after, ask),
-            )?;
+            let delta =
+                crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
             let available = crate::margin_view::derived_available_balance_with(
                 context,
                 user,
                 Some(wallet),
-                Some((
-                    market_id,
-                    crate::margin_view::PricedPosition::new(&pos, ask),
-                )),
+                Some((market_id, &pos)),
             )?;
             if !crate::margin_view::derived_can_afford(available, delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
@@ -2206,11 +2207,30 @@ fn rest_in_book<H: PerpHost>(
         Side::Sell => {
             // commit-only #23 CLONE-FREE probe (mirror of the buy arm).
             let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
+            // ── THE FREEZE ── The one place `T` is resolved for this order, ever. A SHORT order's
+            // Assuming Price is `max(T, limit)` with `T = max(ROUND_UP(lastTraded × 1.0015), mark)`,
+            // and it is stored on the entry: from here on the order's margin term is
+            // `calc_value(assuming_price, amount)` and no later read re-derives it (R12 — 90 frames,
+            // the reported value never moved; `H_live` refused by 1939 quanta).
+            //
+            // Binance additionally ESCROWS the uplift (measured, R10) and releases it at fill, which
+            // is what funds a flipping fill's new leg. We hold no escrow bucket at all, so for us the
+            // uplift manifests purely as a stricter admission — which still leaves more wallet
+            // present at fill time. It is NOT cosmetic: without it the `ooIM = 0` band (`Ask ≈ 2|N|`,
+            // a sell that would flip the position) is free AND fillable here, while on Binance the
+            // two are mutually exclusive (a sell must sit near the touch to fill, and near the touch
+            // the markup bites). See `binance-flip-and-admission.md` §1.6c/§3.4.
+            //
+            // ⚠️ `assuming_price` is a MARGIN BASIS ONLY. The insert position, the book level, the
+            // fill price and the fee below all key on `price`.
+            let assuming_floor =
+                crate::margin_view::assuming_price_floor(context, market_id, market)?;
             let new_entry = OrderEntry {
                 order_id: *order_id,
                 price,
                 amount: qty,
                 maker_fee_bps,
+                assuming_price: price.max(assuming_floor),
             };
             let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
             #[cfg(debug_assertions)]
@@ -2224,7 +2244,9 @@ fn rest_in_book<H: PerpHost>(
                     price_decimals,
                 );
             }
-            let entry_notional = crate::math::calc_value(price, qty, base_decimals, price_decimals)?;
+            // `Ask` grows by the ONE frozen term (rather than refolding): exact, because the
+            // aggregate is a sum of per-order-floored `calc_value`s.
+            let entry_notional = new_entry.margin_notional(base_decimals, price_decimals)?;
             let new_total_sell_qty = pos
                 .total_sell_qty
                 .checked_add(qty)
@@ -2235,45 +2257,16 @@ fn rest_in_book<H: PerpHost>(
                 .ok_or_else(|| perp_err("placeOrder: total sell notional overflow"))?;
 
             // ── Derived-ooIM admission gate ── (see the buy arm)
-            //
-            // THIS is where the Assuming Price bites: a sell resting at or below
-            // `T = max(ROUND_UP(lastTraded × 1.0015), mark)` is charged at `T`, so `ask_after` adds
-            // `calc_value(max(T, price), qty)` — not `entry_notional`. Adding the ONE term (rather
-            // than refolding) is exact: the aggregate is a sum of per-order-floored `calc_value`s.
-            //
-            // Binance additionally ESCROWS the uplift (measured, R10) and releases it at fill,
-            // which is what funds a flipping fill's new leg. We hold no escrow bucket at all, so
-            // for us the uplift manifests purely as a stricter admission — which still leaves more
-            // wallet present at fill time. It is NOT cosmetic: without it the `ooIM = 0` band
-            // (`Ask ≈ 2|N|`, a sell that would flip the position) is free AND fillable here, while
-            // on Binance the two are mutually exclusive (a sell must sit near the touch to fill,
-            // and near the touch the markup bites). See `binance-flip-and-admission.md` §1.6c/§3.4.
-            let assuming_floor = crate::margin_view::assuming_price_floor(context, market_id, market)?;
-            let ask = crate::margin_view::entries_ask_assuming(
-                market,
-                assuming_floor,
-                &sell_ref,
-                pos.total_sell_notional,
-            )?;
-            let ask_after = ask
-                .checked_add(crate::math::calc_value(price.max(assuming_floor), qty, base_decimals, price_decimals)?)
-                .ok_or_else(|| perp_err("placeOrder: assuming-price ask overflow"))?;
             let mut pos_after = pos.clone();
             pos_after.total_sell_qty = new_total_sell_qty;
             pos_after.total_sell_notional = new_total_sell_notional;
-            let delta = crate::margin_view::derived_requirement_delta(
-                market,
-                crate::margin_view::PricedPosition::new(&pos, ask),
-                crate::margin_view::PricedPosition::new(&pos_after, ask_after),
-            )?;
+            let delta =
+                crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
             let available = crate::margin_view::derived_available_balance_with(
                 context,
                 user,
                 Some(wallet),
-                Some((
-                    market_id,
-                    crate::margin_view::PricedPosition::new(&pos, ask),
-                )),
+                Some((market_id, &pos)),
             )?;
             if !crate::margin_view::derived_can_afford(available, delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
@@ -2546,10 +2539,11 @@ pub(super) fn release_margin_for_cancelled_order<H: PerpHost>(
         })??,
     };
 
-    // Subtract exactly the per-order-floored term this entry contributed, so the aggregate stays
-    // byte-identical to a fresh fold over the remaining list (asserted below in debug).
-    let entry_notional =
-        crate::math::calc_value(cancelled_entry.price, cancelled_entry.amount, bd, pd)?;
+    // Subtract exactly the per-order-floored term this entry contributed — at its FROZEN
+    // `assuming_price`, the same basis placement added, so the aggregate stays byte-identical to a
+    // fresh fold over the remaining list (asserted below in debug). Using the limit price here would
+    // leave a marked-up sell's uplift stranded in the aggregate forever.
+    let entry_notional = cancelled_entry.margin_notional(bd, pd)?;
     remove_entry_from_side_aggregates(&mut pos, side, cancelled_entry.amount, entry_notional)?;
     #[cfg(debug_assertions)]
     {
@@ -2617,12 +2611,7 @@ pub(super) fn release_margin_core(
         };
         remove_order_entry(entries, order_id, label)?
     };
-    let notional = crate::math::calc_value(
-        removed.price,
-        removed.amount,
-        market.base_decimals,
-        market.price_decimals,
-    )?;
+    let notional = removed.margin_notional(market.base_decimals, market.price_decimals)?;
     remove_entry_from_side_aggregates(pos, side, removed.amount, notional)
 }
 

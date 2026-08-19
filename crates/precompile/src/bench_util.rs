@@ -210,6 +210,7 @@ pub fn make_order_entries(n: u64) -> Vec<OrderEntry> {
             price: BASE + i * TICK,
             amount: QTY,
             maker_fee_bps: 0,
+            assuming_price: BASE + i * TICK,
         })
         .collect()
 }

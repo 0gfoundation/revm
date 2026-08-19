@@ -135,10 +135,72 @@ pub struct OrderEntry {
     /// 32-byte order ID. `serde_bytes` → msgpack bin instead of a 32-integer array (P4/#20).
     #[serde(with = "serde_bytes")]
     pub order_id: [u8; 32],
+    /// The order's LIMIT price, in the market's `price_decimals` units.
+    ///
+    /// **Everything execution touches keys on this field**: matching, price priority, the sorted
+    /// insert position (buys DESC / sells ASC), the book's price levels, the fill price, the maker
+    /// fee, and `find_entry_by_price_id`'s binary search. See [`Self::assuming_price`] for the one
+    /// thing that does not.
     pub price: u64,
     /// Remaining (unfilled) amount tracked for margin purposes.
     pub amount: u64,
     /// Maker fee rate snapshotted when the order started resting.
     #[serde(default, rename = "MFB")]
     pub maker_fee_bps: u64,
+    /// The order's **Assuming Price**, FROZEN at the instant it was placed — the price this entry's
+    /// contribution to its side's margin aggregate (`Bid`/`Ask`) is valued at for as long as it
+    /// rests. ONE rule covers both sides:
+    ///
+    /// ```text
+    /// BUY   assuming_price = limit price                                  (no markup, measured)
+    /// SELL  assuming_price = max(T, limit),  T = max(⌈last × 1.0015⌉, mark)   AT PLACEMENT TIME
+    /// contribution         = calc_value(assuming_price, amount)
+    /// ```
+    ///
+    /// The PRICE is frozen, not the contribution: a partial fill shrinks `amount`, so the term has
+    /// to scale with what is left.
+    ///
+    /// # ⚠️ NEVER use this for matching, price priority, sorting, price levels or the fill price
+    ///
+    /// It is a MARGIN BASIS and nothing else. A sell resting below `T` carries an `assuming_price`
+    /// ABOVE its own limit; keying the book on it would refuse fills the limit price accepts, put
+    /// the entry at the wrong sorted position, and charge the wrong fee. Every one of those reads
+    /// [`Self::price`], with no exception.
+    ///
+    /// # Why frozen, and not recomputed at read
+    ///
+    /// MEASURED. `misc/binance-flip-and-admission.md` §3.13 (R12): 3 trials × 30 frames, the
+    /// reported `askNotional` of a resting sell never moved while `Last` walked 32.80 USD, with
+    /// 9 consecutive frames below the `P_s / 1.0015` kink where a recomputed-at-read value has to
+    /// plateau. `H_live` was refused by 1939 quanta — a shape-level refutation, not a slope-level
+    /// one. The doc's instruction is explicit: 「我们自己的账必须存下单时的值,不能每次重算。」
+    ///
+    /// ⚠️ Scope. What is frozen is each RESTING ORDER's contribution. `ooIM` as a whole is NOT
+    /// frozen: it still contains `N = |position| × mark`, recomputed at every read
+    /// (`crate::math::open_order_margin`), independently measured by R10's 15 dense snapshots. The
+    /// stronger-sounding claim「挂单的托管是个常数」holds only at `N = 0`, which is the branch R12
+    /// measured — do not extrapolate it.
+    #[serde(default, rename = "ap")]
+    pub assuming_price: u64,
+}
+
+impl OrderEntry {
+    /// This entry's contribution to its side's margin aggregate: `calc_value(assuming_price,
+    /// amount)`. **The single definition of a resting order's margin term**, for both sides — the
+    /// aggregate is exactly `Σ` of this over the side's list, and every maintenance site adds or
+    /// subtracts this same per-order-floored value, so the maintained total stays byte-identical to
+    /// a fresh fold.
+    #[inline]
+    pub fn margin_notional(
+        &self,
+        base_decimals: u32,
+        price_decimals: u32,
+    ) -> Result<u64, crate::error::PerpError> {
+        crate::math::calc_value(
+            self.assuming_price,
+            self.amount,
+            base_decimals,
+            price_decimals,
+        )
+    }
 }

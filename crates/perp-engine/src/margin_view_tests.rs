@@ -133,6 +133,9 @@ fn set_position(
     .unwrap();
 }
 
+/// A resting entry at `price`. `assuming_price` is left at the BUY rule (== the limit price);
+/// [`set_orders`] re-freezes it for whichever side the entry is installed on, so a caller does not
+/// have to know `T`.
 fn entry(order_id: u8, price: u64, amount: u64) -> OrderEntry {
     let mut id = [0u8; 32];
     id[31] = order_id;
@@ -141,12 +144,18 @@ fn entry(order_id: u8, price: u64, amount: u64) -> OrderEntry {
         price,
         amount,
         maker_fee_bps: 0,
+        assuming_price: price,
     }
 }
 
 /// Install resting order lists AND the maintained per-side aggregates exactly the way the engine
 /// does, so the state a test reads back is the state a real place/cancel sequence would have
 /// left. `buys` must be price-DESC and `sells` price-ASC, the engine's own list invariant.
+///
+/// This includes FREEZING each entry's Assuming Price the way `rest_in_book` would have: the limit
+/// price on a buy, `max(T, limit)` on a sell with `T` resolved from the market's CURRENT mark and
+/// last-traded price. A test that then moves the mark is therefore looking at genuinely frozen
+/// entries, not at values the read path re-derives.
 fn set_orders(
     ctx: &mut TestCtx,
     user: Address,
@@ -164,6 +173,22 @@ fn set_orders(
     );
     let market = storage::load_market_ref(ctx, market_id).unwrap().unwrap();
     let (bd, pd) = (market.base_decimals, market.price_decimals);
+    let floor = crate::margin_view::assuming_price_floor(ctx, market_id, &market).unwrap();
+
+    let buys: Vec<OrderEntry> = buys
+        .iter()
+        .map(|e| OrderEntry {
+            assuming_price: e.price,
+            ..*e
+        })
+        .collect();
+    let sells: Vec<OrderEntry> = sells
+        .iter()
+        .map(|e| OrderEntry {
+            assuming_price: e.price.max(floor),
+            ..*e
+        })
+        .collect();
 
     storage::save_buy_orders(ctx, user, market_id, &buys.iter().copied().collect()).unwrap();
     storage::save_sell_orders(ctx, user, market_id, &sells.iter().copied().collect()).unwrap();

@@ -535,16 +535,8 @@ fn adl_skips_opposite_holder_whose_only_order_reserves_no_margin() {
     place_order(&mut ctx, KEEPER, 0, 8_000, QTY as u64);
     let keeper_pos = position(&mut ctx, KEEPER);
     let keeper_market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
-    let keeper_priced = crate::margin_view::stored_priced_position(
-        &mut ctx,
-        KEEPER,
-        MARKET_ID,
-        &keeper_market,
-        &keeper_pos,
-    )
-    .unwrap();
     assert_eq!(
-        crate::margin_view::position_open_order_margin(&keeper_market, keeper_priced).unwrap(),
+        crate::margin_view::position_open_order_margin(&keeper_market, &keeper_pos).unwrap(),
         0,
         "pure-reduce order requires no open-order margin — this is what makes any \
          `requirement != 0` proxy insufficient for 'has resting orders'"
@@ -1207,11 +1199,8 @@ fn funding_on_one_market_leaves_another_markets_headroom_intact() {
         .unwrap()
         .unwrap();
     let pos2 = storage::load_position(&mut ctx, ALICE, OTHER_MARKET).unwrap();
-    let priced2 =
-        crate::margin_view::stored_priced_position(&mut ctx, ALICE, OTHER_MARKET, &market2, &pos2)
-            .unwrap();
     assert_eq!(
-        crate::margin_view::position_open_order_margin(&market2, priced2).unwrap(),
+        crate::margin_view::position_open_order_margin(&market2, &pos2).unwrap(),
         USER_WALLET,
         "the whole wallet is committable on market 2"
     );
@@ -1663,9 +1652,7 @@ fn position(ctx: &mut TestCtx, user: Address) -> PerpPosition {
 fn oo_im(ctx: &mut TestCtx, user: Address) -> u64 {
     let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
     let pos = storage::load_position(ctx, user, MARKET_ID).unwrap();
-    let priced =
-        crate::margin_view::stored_priced_position(ctx, user, MARKET_ID, &market, &pos).unwrap();
-    crate::margin_view::position_open_order_margin(&market, priced).unwrap()
+    crate::margin_view::position_open_order_margin(&market, &pos).unwrap()
 }
 
 fn save_position(ctx: &mut TestCtx, amount: i64, v_quote_balance: i64) {
