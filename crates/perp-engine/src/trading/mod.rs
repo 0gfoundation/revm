@@ -2102,8 +2102,8 @@ fn rest_in_book<H: PerpHost>(
     let (best_bid, best_ask) = match bbo {
         Some(b) => b,
         None => {
-            let h = storage::load_market_hot(context, market_id)?;
-            (h.best_bid, h.best_ask)
+            let hot = storage::load_market_hot(context, market_id)?;
+            (hot.best_bid, hot.best_ask)
         }
     };
 
@@ -2120,7 +2120,7 @@ fn rest_in_book<H: PerpHost>(
                 amount: qty,
                 maker_fee_bps,
             };
-            let (bd, pd) = (market.base_decimals, market.price_decimals);
+            let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
             #[cfg(debug_assertions)]
             {
                 // The aggregates ARE `Bid`/`Ask` and now feed the admission gate directly, so keep
@@ -2131,19 +2131,19 @@ fn rest_in_book<H: PerpHost>(
                     entries_iter(&buy_ref),
                     entries_iter(&sell_entries),
                     &pos,
-                    bd,
-                    pd,
+                    base_decimals,
+                    price_decimals,
                 );
             }
             // `Bid` grows by this order's notional at its LIMIT price — the same per-order-floored
             // `calc_value` term the fold would contribute, so the aggregate stays exactly Binance's
             // `bidNotional`.
-            let entry_notional = crate::math::calc_value(price, qty, bd, pd)?;
-            let new_tbq = pos
+            let entry_notional = crate::math::calc_value(price, qty, base_decimals, price_decimals)?;
+            let new_total_buy_qty = pos
                 .total_buy_qty
                 .checked_add(qty)
                 .ok_or_else(|| perp_err("placeOrder: total buy qty overflow"))?;
-            let new_tbn = pos
+            let new_total_buy_notional = pos
                 .total_buy_notional
                 .checked_add(entry_notional)
                 .ok_or_else(|| perp_err("placeOrder: total buy notional overflow"))?;
@@ -2160,13 +2160,13 @@ fn rest_in_book<H: PerpHost>(
             // enters `IM` through the `max()`.)
             let ask =
                 crate::margin_view::stored_ask_assuming(context, user, market_id, market, &pos)?;
-            let mut after = pos.clone();
-            after.total_buy_qty = new_tbq;
-            after.total_buy_notional = new_tbn;
+            let mut pos_after = pos.clone();
+            pos_after.total_buy_qty = new_total_buy_qty;
+            pos_after.total_buy_notional = new_total_buy_notional;
             let delta = crate::margin_view::derived_requirement_delta(
                 market,
                 crate::margin_view::PricedPosition::new(&pos, ask),
-                crate::margin_view::PricedPosition::new(&after, ask),
+                crate::margin_view::PricedPosition::new(&pos_after, ask),
             )?;
             let available = crate::margin_view::derived_available_balance_with(
                 context,
@@ -2181,7 +2181,7 @@ fn rest_in_book<H: PerpHost>(
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
             // Commit the maintained buy aggregates (op accepted).
-            pos = after;
+            pos = pos_after;
 
             // ── APPLY (all rejects passed) ── NOW do the real insert: in-place on a warm list
             // (zero clone), or one materialize-clone on a cold first-touch (unavoidable — it IS
@@ -2212,7 +2212,7 @@ fn rest_in_book<H: PerpHost>(
                 amount: qty,
                 maker_fee_bps,
             };
-            let (bd, pd) = (market.base_decimals, market.price_decimals);
+            let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
             #[cfg(debug_assertions)]
             {
                 let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
@@ -2220,16 +2220,16 @@ fn rest_in_book<H: PerpHost>(
                     entries_iter(&buy_entries),
                     entries_iter(&sell_ref),
                     &pos,
-                    bd,
-                    pd,
+                    base_decimals,
+                    price_decimals,
                 );
             }
-            let entry_notional = crate::math::calc_value(price, qty, bd, pd)?;
-            let new_tsq = pos
+            let entry_notional = crate::math::calc_value(price, qty, base_decimals, price_decimals)?;
+            let new_total_sell_qty = pos
                 .total_sell_qty
                 .checked_add(qty)
                 .ok_or_else(|| perp_err("placeOrder: total sell qty overflow"))?;
-            let new_tsn = pos
+            let new_total_sell_notional = pos
                 .total_sell_notional
                 .checked_add(entry_notional)
                 .ok_or_else(|| perp_err("placeOrder: total sell notional overflow"))?;
@@ -2248,23 +2248,23 @@ fn rest_in_book<H: PerpHost>(
             // (`Ask ≈ 2|N|`, a sell that would flip the position) is free AND fillable here, while
             // on Binance the two are mutually exclusive (a sell must sit near the touch to fill,
             // and near the touch the markup bites). See `binance-flip-and-admission.md` §1.6c/§3.4.
-            let floor = crate::margin_view::assuming_price_floor(context, market_id, market)?;
+            let assuming_floor = crate::margin_view::assuming_price_floor(context, market_id, market)?;
             let ask = crate::margin_view::entries_ask_assuming(
                 market,
-                floor,
+                assuming_floor,
                 &sell_ref,
                 pos.total_sell_notional,
             )?;
             let ask_after = ask
-                .checked_add(crate::math::calc_value(price.max(floor), qty, bd, pd)?)
+                .checked_add(crate::math::calc_value(price.max(assuming_floor), qty, base_decimals, price_decimals)?)
                 .ok_or_else(|| perp_err("placeOrder: assuming-price ask overflow"))?;
-            let mut after = pos.clone();
-            after.total_sell_qty = new_tsq;
-            after.total_sell_notional = new_tsn;
+            let mut pos_after = pos.clone();
+            pos_after.total_sell_qty = new_total_sell_qty;
+            pos_after.total_sell_notional = new_total_sell_notional;
             let delta = crate::margin_view::derived_requirement_delta(
                 market,
                 crate::margin_view::PricedPosition::new(&pos, ask),
-                crate::margin_view::PricedPosition::new(&after, ask_after),
+                crate::margin_view::PricedPosition::new(&pos_after, ask_after),
             )?;
             let available = crate::margin_view::derived_available_balance_with(
                 context,
@@ -2278,7 +2278,7 @@ fn rest_in_book<H: PerpHost>(
             if !crate::margin_view::derived_can_afford(available, delta) {
                 return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
             }
-            pos = after;
+            pos = pos_after;
 
             // ── APPLY (all rejects passed) ── real insert: in-place (warm) / one materialize (cold).
             emit_pending_order_placed(context, pending_placed);
