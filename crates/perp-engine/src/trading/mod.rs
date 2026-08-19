@@ -2157,29 +2157,80 @@ fn rest_in_book<H: PerpHost>(
                 .checked_add(entry_notional)
                 .ok_or_else(|| perp_err("placeOrder: total buy notional overflow"))?;
 
-            // ── Derived-ooIM admission gate ──
-            // Requirement = `ooIM(after) − ooIM(before)` for THIS market; available =
-            // `perp_wallet_balance − Σ ooIM(before)` across the user's whole market index, with
-            // `pos` overriding storage for this market (it is not written until below). Nothing is
-            // debited: resting an order moves no money, it only raises the requirement.
-            // A non-positive delta — a pure-reduce order — is free at any balance.
+            // ── Derived-ooIM admission gate (POST-STATE form, lazy delta) ──
+            // Nothing is debited: resting an order moves no money, it only raises the requirement.
+            // Both aggregates ride on the position itself, so the hypothetical is two
+            // `checked_add`s above — no order list is materialised. `Ask` still matters even on
+            // this arm: it enters `IM` through the `max()`.
             //
-            // Both aggregates ride on the positions themselves, so the delta is exactly this
-            // order's frozen term (every already-resting order contributes identically to both
-            // sides). `Ask` still matters: it enters `IM` through the `max()`.
+            // # Mapping this onto the doc's predicate — one algebraic step, and the step is MEASURED
+            //
+            // The measured admission predicate is the DELTA form,
+            // 「接受 ⟺ 该单带来的 IM 增量 ≤ availableBalance」, i.e. `Δ ooIM ≤ available(before)`.
+            // What is evaluated below is `available(after) ≥ 0`. R13 measured the identity that
+            // connects them — `availableBalance + totalOpenOrderInitialMargin ==
+            // totalCrossWalletBalance`, 73/73 observations, residual `0E-8`, while BOTH terms moved
+            // (`misc/binance-flip-and-admission.md` §3.14) — so `available = wallet − Σ_m ooIM_m` and
+            //
+            //     available(after) = wallet − (Σ_{m ≠ this} ooIM_m + ooIM_this(after))
+            //                      = available(before) − Δ ooIM
+            //     ⇒   Δ ooIM ≤ available(before)   ⟺   available(after) ≥ 0
+            //
+            // That identity is exact here, not approximate: `ooIM_m` is a pure function of market
+            // `m`'s own `(N_m, Bid_m, Ask_m, L_m)` (`margin_view::position_derived_margin` →
+            // `math::open_order_margin`, which takes nothing else), so every `m ≠ this` term is
+            // literally the same integer in both sums within one call — there is NO cross-market
+            // coupling to make the cancellation lossy. Both sides also price THIS market at the same
+            // mark: the threaded `market` and the one the Σ walk re-reads are the same blob, since
+            // the place path never writes `Market`.
+            //
+            // # The case table this is equivalent over
+            //
+            //   Δ ooIM │ available(after) │ delta form (was)              │ this form
+            //   ───────┼──────────────────┼───────────────────────────────┼────────────────────────
+            //     ≤ 0  │      ≥ 0         │ accept (`Δ ≤ 0` escape)       │ accept (1st branch)
+            //     ≤ 0  │      < 0         │ accept (`Δ ≤ 0` escape)       │ accept (escape kept)
+            //     > 0  │      ≥ 0         │ accept (`avail(before) ≥ Δ`)  │ accept (1st branch)
+            //     > 0  │      < 0         │ REJECT                        │ REJECT
+            //
+            // # ⚠️ The `Δ ≤ 0` escape is the B1 INVARIANT — do not delete it
+            //
+            // Rows 1 and 3 are the whole reason the delta is LAZY: they are the overwhelming
+            // majority and they need only `available(after)`. Row 2 is the ONLY row that needs the
+            // delta, and only its SIGN. It is **reachable and it matters**: a user rests affordable
+            // orders, the mark then moves against them so `Σ ooIM > wallet` and `available < 0` with
+            // no action of theirs (R8: an identically-priced probe accepted, then refused 4 seconds
+            // later after the mark fell `4.42 USD`), and they now want to rest a RISK-REDUCING
+            // order. Its `Δ ooIM ≤ 0`, but `available(after)` is still negative. Dropping the escape
+            // would refuse precisely the order that de-risks them and send them to liquidation
+            // instead. This is `derived_can_afford`'s "a non-positive requirement is always
+            // affordable", restated at the one site that still has to ask.
+            //
+            // (At THIS site `Δ ooIM` is in fact never negative — `max(|N + Bid|, |N − Ask|)` is
+            // non-decreasing in each of `Bid`/`Ask` at fixed `N`, `PIM` does not move, and
+            // `round_up_div`/`saturating_sub` preserve that — so the escape only ever fires at
+            // `Δ == 0`. The guard is still written as `Δ > 0` so it stays the faithful restatement
+            // of `derived_can_afford`, which other sites reach with a genuinely negative delta.)
+            //
+            // Cost: in the accepting case this market's `ooIM` is evaluated ONCE (inside the walk,
+            // via the override) instead of three times — the delta evaluated it at `before` and at
+            // `after`, and the walk evaluated `before` a second time.
             let mut pos_after = pos.clone();
             pos_after.total_buy_qty = new_total_buy_qty;
             pos_after.total_buy_notional = new_total_buy_notional;
-            let delta =
-                crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
-            let available = crate::margin_view::derived_available_balance_with(
+            // `pos_after` overrides storage for this market: it is not written until below.
+            let available_after = crate::margin_view::derived_available_balance_with(
                 context,
                 user,
                 Some(wallet),
-                Some((market_id, &pos)),
+                Some((market_id, &pos_after)),
             )?;
-            if !crate::margin_view::derived_can_afford(available, delta) {
-                return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+            if available_after < 0 {
+                let delta =
+                    crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
+                if delta > 0 {
+                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                }
             }
             // Commit the maintained buy aggregates (op accepted).
             pos = pos_after;
@@ -2256,20 +2307,25 @@ fn rest_in_book<H: PerpHost>(
                 .checked_add(entry_notional)
                 .ok_or_else(|| perp_err("placeOrder: total sell notional overflow"))?;
 
-            // ── Derived-ooIM admission gate ── (see the buy arm)
+            // ── Derived-ooIM admission gate (POST-STATE form, lazy delta) ──
+            // Mirror of the buy arm: the derivation from the doc's delta predicate, the four-case
+            // table, and ⚠️ why the `Δ > 0` guard (the B1 escape) must survive are all documented
+            // there — read it before touching this.
             let mut pos_after = pos.clone();
             pos_after.total_sell_qty = new_total_sell_qty;
             pos_after.total_sell_notional = new_total_sell_notional;
-            let delta =
-                crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
-            let available = crate::margin_view::derived_available_balance_with(
+            let available_after = crate::margin_view::derived_available_balance_with(
                 context,
                 user,
                 Some(wallet),
-                Some((market_id, &pos)),
+                Some((market_id, &pos_after)),
             )?;
-            if !crate::margin_view::derived_can_afford(available, delta) {
-                return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+            if available_after < 0 {
+                let delta =
+                    crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
+                if delta > 0 {
+                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                }
             }
             pos = pos_after;
 

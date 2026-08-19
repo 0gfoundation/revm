@@ -259,6 +259,19 @@ impl TakerSettlement {
         // already consumed entries from, and the wallet is `w.account`'s, which already carries
         // this fill's close proceeds. That is exactly what `finalize_apply` will re-derive from
         // storage after the flush, so the pre-flush decision and the post-flush one agree.
+        //
+        // ── Why this gate keeps the EXPLICIT delta shape (and `rest_in_book` does not) ──
+        // `rest_in_book` and [`rest_is_affordable`] evaluate the Σ walk at the POST state and consult
+        // the delta lazily. This one deliberately does not, because what it gates is **not a pure
+        // delta**: `need` below is `core.total_required` (real cash out) PLUS the marginal
+        // `rest_delta`. Folding the cash leg into the walk would mean overriding the wallet with
+        // `wallet − total_required`, which (a) puts a narrowing subtraction on the fast path that
+        // today lives only inside the cover branch, and (b) would decide the fast path at a DIFFERENT
+        // wallet from the cover loop below, whose soundness argument is that it re-asks
+        // `derived_can_afford(avail, total_required)` at the same wallet on the same basis. The
+        // `≤ 0` escape also means something else here (a pure close whose rest happens to be free),
+        // so the post-state restatement would be one step FURTHER from the doc's measured delta
+        // predicate rather than the one step away that `rest_in_book`'s is.
         let (bd, pd) = (market.base_decimals, market.price_decimals);
         // `Bid`/`Ask` come off the WORKING order lists, which are the authoritative record of what
         // the walk has consumed — each surviving entry still at its own frozen assuming price.
@@ -294,7 +307,11 @@ impl TakerSettlement {
             // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
             // `release_margin_core` so the sim cannot diverge from `finalize_apply`'s real loop.
             // A cancel frees no cash now — it lowers `Bid`/`Ask` and therefore `Σ ooIM`, which is
-            // what raises the available. Rest feasibility is re-checked on the POST-cover state
+            // what raises the available. The loop's own test is `available >= total_required`, a
+            // straight money-out amount and NOT a delta, so `rest_in_book`'s post-state restatement
+            // does not apply to it — `available >= amount` is already the right form (the same class
+            // as `transferFromPerp` / `addPositionMargin`). Rest feasibility is re-checked on the
+            // POST-cover state
             // (cover shrinks the taker's side, changing the rest's marginal requirement, so the
             // `rest_delta` computed above is only used for the fast-path test).
             let mut sim_pos = after_fills.clone();
@@ -330,6 +347,15 @@ impl TakerSettlement {
             }
             if let Some(r) = &rest {
                 // Post-cover, post-debit: the rest must fit in what is left.
+                //
+                // This IS a pure delta, so the post-state/lazy shape `rest_in_book` uses would apply
+                // verbatim — it is left explicit on purpose. It sits inside the rare cover branch
+                // (only a genuinely tight taker reaches it), so the "evaluate this market's ooIM once
+                // instead of three times" win is worth nothing here, while the state being priced is
+                // a SIMULATED post-cover book that exists only inside this loop. Keeping the two
+                // `ooIM(sim_pos)` / `ooIM(after_rest)` evaluations spelled out keeps the sim
+                // auditable against the real cancels `release_margin_core` performs in
+                // `finalize_apply`, which is the property this branch is here to preserve.
                 let wallet_after = wallet
                     .checked_sub(checked_u64_to_i64(
                         core.total_required,
@@ -456,6 +482,13 @@ fn with_rest_entry(
 /// The formula is `rest_in_book`'s own — `derived_available >= Δ ooIM`, evaluated over the same
 /// hypothetical `Bid`/`Ask` — on the same state. Being the same test on the same state is what
 /// makes the pre-flush reject sound: `rest_in_book`'s later check cannot then fire post-write.
+///
+/// It therefore also carries `rest_in_book`'s **SHAPE**: the Σ walk is evaluated at the POST state
+/// and the delta is LAZY, consulted only when `available(after) < 0` and only for its SIGN (the B1
+/// escape). Two shapes for one test would put that "same test" claim on trust instead of on the
+/// page. The derivation from the doc's delta predicate, the four-case table it is equivalent over,
+/// and ⚠️ why the `Δ > 0` guard must survive are all documented on `rest_in_book`'s buy arm
+/// (`trading/mod.rs`) — read it before touching this.
 #[allow(clippy::too_many_arguments)]
 fn rest_is_affordable<H: PerpHost>(
     context: &mut H,
@@ -470,14 +503,20 @@ fn rest_is_affordable<H: PerpHost>(
 ) -> Result<bool, PerpError> {
     let (bd, pd) = (market.base_decimals, market.price_decimals);
     let after = with_rest_entry(pos, assuming_floor, taker_side, rest, bd, pd)?;
-    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
-    let available = crate::margin_view::derived_available_balance_with(
+    // Both `pos` and `after` are in-memory (the registry working copy plus the hypothetical), so
+    // moving the override from one to the other reads no extra state — the Σ walk's OTHER-market
+    // terms still come from storage exactly as before, which is what keeps this equivalent.
+    let available_after = crate::margin_view::derived_available_balance_with(
         context,
         user,
         Some(wallet),
-        Some((market_id, pos)),
+        Some((market_id, &after)),
     )?;
-    Ok(crate::margin_view::derived_can_afford(available, delta))
+    if available_after >= 0 {
+        return Ok(true);
+    }
+    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
+    Ok(delta <= 0)
 }
 
 /// The taker settlement's APPLY half (commit-only #23 L2b): everything after the decision —

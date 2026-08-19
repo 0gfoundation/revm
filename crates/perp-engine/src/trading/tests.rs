@@ -8887,6 +8887,151 @@ mod risk_reducing_admission {
         // 1_100_000 — "charged at $110, more than the $105 order's own notional".
         assert_eq!(oo_im(&mut a, ALICE), 0);
     }
+
+    // ── The admission gate's case table, all four rows explicitly ──────────
+
+    /// `(Δ ooIM, available(after))` for the hypothetical "rest `qty` at `price` on `side`" — the
+    /// two quantities `rest_in_book`'s gate is a function of, computed here the way the gate
+    /// computes them (`margin_view`, same helpers, same overrides) so the table below indexes the
+    /// real inputs and not a paraphrase.
+    fn gate_inputs(
+        ctx: &mut TestCtx,
+        user: Address,
+        side: u8,
+        price: u64,
+        qty: u64,
+    ) -> (i128, i128) {
+        let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+        let before = storage::load_position(ctx, user, MARKET_ID).unwrap();
+        let mut after = before.clone();
+        // A buy's Assuming Price IS its limit price; a sell's is `max(T, limit)`, frozen now.
+        let assuming = if side == 0 {
+            price
+        } else {
+            price.max(crate::margin_view::assuming_price_floor(ctx, MARKET_ID, &market).unwrap())
+        };
+        let notional =
+            crate::math::calc_value(assuming, qty, market.base_decimals, market.price_decimals)
+                .unwrap();
+        if side == 0 {
+            after.total_buy_qty += qty;
+            after.total_buy_notional += notional;
+        } else {
+            after.total_sell_qty += qty;
+            after.total_sell_notional += notional;
+        }
+        let delta =
+            crate::margin_view::derived_requirement_delta(&market, &before, &after).unwrap();
+        let available_after = crate::margin_view::derived_available_balance_with(
+            ctx,
+            user,
+            None,
+            Some((MARKET_ID, &after)),
+        )
+        .unwrap();
+        (delta, available_after)
+    }
+
+    /// **The full case table `rest_in_book`'s admission gate is defined over**, one row per cell,
+    /// each row pinned by asserting BOTH gate inputs and then the verdict:
+    ///
+    /// ```text
+    ///   Δ ooIM │ available(after) │ verdict
+    ///   ───────┼──────────────────┼─────────
+    ///     ≤ 0  │       ≥ 0        │ ACCEPT
+    ///     ≤ 0  │       < 0        │ ACCEPT   ← the B1 escape; the ONLY row that needs Δ
+    ///     > 0  │       ≥ 0        │ ACCEPT
+    ///     > 0  │       < 0        │ REJECT
+    /// ```
+    ///
+    /// The gate evaluates `available(after) ≥ 0` first and consults `Δ ooIM`'s SIGN only on the
+    /// negative branch, so rows 1/3 must be indistinguishable to it (they are: both accept without
+    /// the delta) and rows 2/4 must be separated by the sign alone. Delete the `Δ > 0` guard and
+    /// row 2 flips to REJECT — that is the mutation this test exists to catch.
+    ///
+    /// Every row rests via PostOnly, so no matching runs and the gate under test is exactly
+    /// `rest_in_book`'s (the taker path has its own, in `settlement.rs`).
+    ///
+    /// Note `Δ ooIM < 0` is unreachable HERE — `max(|N + Bid|, |N − Ask|)` is non-decreasing in
+    /// each aggregate at fixed `N` — so the `≤ 0` rows are `Δ == 0`, asserted as such.
+    #[test]
+    fn admission_gate_case_table_over_delta_sign_and_post_availability() {
+        const POST_ONLY: u8 = 3;
+
+        // ── Row 1: Δ == 0, available(after) ≥ 0 ⇒ ACCEPT ──
+        // A 2-lot long at mark $100 (N = 2e6) and a 1-lot sell at $110 (Ask = 1.1e6):
+        // IM = max(2e6, |2e6 − 1.1e6|) = 2e6 = PIM ⇒ ooIM unchanged. Wallet is the funded 10e6.
+        {
+            let mut ctx = make_ctx();
+            setup_marked(&mut ctx);
+            seed_long(&mut ctx, ALICE, 2);
+            assert_eq!(
+                gate_inputs(&mut ctx, ALICE, 1, P_HIGH, QTY),
+                (0, 10_000_000),
+                "row 1 inputs: zero delta, positive post-availability"
+            );
+            try_place(&mut ctx, ALICE, 1, P_HIGH, QTY, 0, POST_ONLY).expect("row 1 must ACCEPT");
+            assert_eq!(oo_im(&mut ctx, ALICE), 0);
+        }
+
+        // ── Row 2: Δ == 0, available(after) < 0 ⇒ ACCEPT (the B1 escape) ──
+        // Same risk-reducing order, but the mark has already left the account under-covered
+        // (modelled by the negative wallet, which is what a close-path fee or funding charge
+        // produces). The order costs nothing yet the post-availability is still negative.
+        {
+            let mut ctx = make_ctx();
+            setup_marked(&mut ctx);
+            seed_long(&mut ctx, ALICE, 2);
+            set_raw_wallet(&mut ctx, ALICE, -5);
+            assert_eq!(
+                gate_inputs(&mut ctx, ALICE, 1, P_HIGH, QTY),
+                (0, -5),
+                "row 2 inputs: zero delta, NEGATIVE post-availability"
+            );
+            try_place(&mut ctx, ALICE, 1, P_HIGH, QTY, 0, POST_ONLY).expect(
+                "row 2 must ACCEPT — a risk-reducing order is never gated on the balance (B1)",
+            );
+            assert_eq!(oo_im(&mut ctx, ALICE), 0);
+            assert_eq!(raw_wallet(&mut ctx, ALICE), -5, "and moves no money");
+        }
+
+        // ── Row 3: Δ > 0, available(after) ≥ 0 ⇒ ACCEPT ──
+        // Flat position (N = 0), so a 1-lot buy at $100 costs its full notional at leverage 1.
+        // 10e6 wallet − 1e6 requirement leaves 9e6.
+        {
+            let mut ctx = make_ctx();
+            setup_marked(&mut ctx);
+            assert_eq!(
+                gate_inputs(&mut ctx, ALICE, 0, PRICE, QTY),
+                (INIT_MARGIN as i128, 9_000_000),
+                "row 3 inputs: positive delta, positive post-availability"
+            );
+            try_place(&mut ctx, ALICE, 0, PRICE, QTY, 0, POST_ONLY).expect("row 3 must ACCEPT");
+            assert_eq!(oo_im(&mut ctx, ALICE), INIT_MARGIN);
+            assert_eq!(super::available(&mut ctx, ALICE), 9_000_000);
+        }
+
+        // ── Row 4: Δ > 0, available(after) < 0 ⇒ REJECT ──
+        // The same buy, one unit short of affordable: post-availability is exactly −1.
+        {
+            let mut ctx = make_ctx();
+            setup_marked(&mut ctx);
+            set_raw_wallet(&mut ctx, ALICE, INIT_MARGIN as i64 - 1);
+            assert_eq!(
+                gate_inputs(&mut ctx, ALICE, 0, PRICE, QTY),
+                (INIT_MARGIN as i128, -1),
+                "row 4 inputs: positive delta, NEGATIVE post-availability"
+            );
+            let err = try_place(&mut ctx, ALICE, 0, PRICE, QTY, 0, POST_ONLY)
+                .expect_err("row 4 must REJECT");
+            assert!(
+                err.to_string()
+                    .contains("insufficient perp wallet for margin"),
+                "{err}"
+            );
+            assert_eq!(oo_im(&mut ctx, ALICE), 0, "the reject wrote nothing");
+        }
+    }
 }
 
 // ── Per-user market index (derived-ooIM Phase 0) ─────────────────────────────

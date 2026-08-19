@@ -448,6 +448,14 @@ pub fn compute_margin_info<H: PerpHost>(
 /// Pure read — every loader it reaches is a `_ref` (cache-fill, never dirty-mark) reader, so it
 /// enters no key into the block delta and cannot move the commitment. Returns `u128` so the fold
 /// cannot overflow before the caller compares it.
+///
+/// # ⚠️ DO NOT CACHE THIS, AND DO NOT INCREMENT IT — RE-WALK, EVERY TIME
+///
+/// See the same warning on [`derived_available_balance_with`]. The account-level aggregate is a
+/// LIVE quantity, not a ledger field: R13 measured `Δtotal == ΔooIM_B` on all 30 frames of a
+/// hands-off window (`misc/binance-flip-and-admission.md` §3.14), i.e. the total moved with a
+/// market's mark while the user did nothing. Any scheme that keeps a previous answer and adjusts it
+/// by a delta silently freezes every OTHER market's `N`.
 pub fn total_open_order_initial_margin<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -514,6 +522,28 @@ pub fn derived_available_balance<H: PerpHost>(
 /// [`derived_available_balance`] with in-memory overrides for the wallet and/or one market's
 /// position — the form the fill paths need, where the authoritative values live in a registry
 /// working copy that has not been flushed yet.
+///
+/// # ⚠️ DO NOT CACHE THE RESULT, AND DO NOT DERIVE IT FROM A PREVIOUS CALL BY SUBTRACTING A DELTA
+///
+/// This must be RECOMPUTED on every check. The temptation is real and the gates now invite it: the
+/// admission gate in `rest_in_book` evaluates this at the POST state and reads like incremental
+/// arithmetic, and the identity `available(after) == available(before) − Δ ooIM` genuinely holds —
+/// but **only within a single call**, where every other market's term is the same integer on both
+/// sides. Across calls it does not hold at all: `ooIM_m` contains `N_m = trunc(amount_m × mark_m)`,
+/// so every other market's term moves with ITS OWN mark, with no action by the user.
+///
+/// Measured, twice over:
+/// * **R13** — `Δtotal == ΔooIM_B` on 30/30 frames of a hands-off window, and the stronger
+///   `availableBalance + totalOpenOrderInitialMargin == totalCrossWalletBalance` closing to `0E-8`
+///   over 73 observations *while both terms moved in opposite directions and nothing was traded*:
+///   `availableBalance` is a read-time residual, not a stored balance
+///   (`misc/binance-flip-and-admission.md` §3.14).
+/// * **R8** — an identically-priced probe was ACCEPTED, then REFUSED 4 seconds later, on nothing but
+///   the mark falling `4.42 USD` (§1.6c / §3.14's calibration; `d(ooIM)/d(mark) = −2q_L/L`). A cached
+///   `available` would have accepted the second probe.
+///
+/// A cached or delta-adjusted value is therefore not a stale optimisation, it is a WRONG ANSWER —
+/// and on the permissive side, which is the side that funds an under-margined position.
 pub fn derived_available_balance_with<H: PerpHost>(
     context: &mut H,
     user: Address,

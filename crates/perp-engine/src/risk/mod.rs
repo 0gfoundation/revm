@@ -1076,6 +1076,22 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
     // The available is measured on the CURRENT (pre-change) state, which is what `delta` is the
     // increment to — with the caller's in-memory `pos` overriding storage for this market, since
     // it is not written until after this gate. A non-positive delta is free (`derived_can_afford`).
+    //
+    // ── Why this gate keeps the EXPLICIT delta shape (and `rest_in_book` does not) ──
+    // The post-state/lazy restatement `trading::rest_in_book` uses (walk at `after`, delta consulted
+    // only when `available(after) < 0`, and then only for its sign) IS valid here — this is a pure
+    // delta, `market`/`pos` are the same values the Σ walk would re-read, and setLeverage runs on no
+    // match path so there is no uncommitted registry working copy in play. It is left explicit for
+    // two reasons, neither of them compatibility:
+    //   * `setLeverage` is a cold selector, so "this market's ooIM once instead of three times" buys
+    //     nothing measurable, and
+    //   * this is the ONE gate whose delta is routinely NEGATIVE (raising leverage divides the
+    //     requirement down and releases headroom). Written out, it is the site where a reader can
+    //     see what `derived_can_afford`'s `requirement <= 0` clause is actually for; folded into
+    //     `available(after) >= 0` that disappears. `rest_in_book` cannot serve that purpose —
+    //     resting can only ever raise `max(|N + Bid|, |N − Ask|)`, so its delta is never negative.
+    // Sequencing note if that ever changes: `pos.leverage` is written by the CALLER after this
+    // returns, so an override carrying `after` here would be one step ahead of storage.
     let available = crate::margin_view::derived_available_balance_with(
         context,
         user,
