@@ -699,12 +699,17 @@ sol! {
         // Feeds: internal wallet movement history
         event TransferToPerp(address indexed user, uint64 amount);
         event TransferFromPerp(address indexed user, uint64 amount);
-        /// Account after-image, emitted by each account write that moves money.
+        /// Account after-image, emitted by each write that moves one of the fields below.
+        ///
+        /// That is *usually* an account write that moves money, and for one case it is not: an order
+        /// RESTING writes no account, but its open-order initial margin raises `Σ ooIM` and therefore
+        /// lowers `availableBalance`, so `placeOrder` publishes the snapshot too (from the same walk
+        /// its admission gate has to do anyway). A rejected placement emits nothing.
         ///
         /// **Field-for-field the account-level scalar set `getAccount(address)` returns** (less the
         /// `marketIds` echo), produced by the SAME code over the SAME market set — the per-user
-        /// market index — via `margin_view::index_account_view`. Neither surface holds arithmetic of
-        /// its own, so the event and the view cannot disagree for the same state.
+        /// market index — via `margin_view::index_account_scalars`. Neither surface holds arithmetic
+        /// of its own, so the event and the view cannot disagree for the same state.
         ///
         /// ⚠️ `perpWalletBalance` (`uint64`, floored at 0) is GONE. It is now
         /// `int64 totalCrossWalletBalance`: the same quantity, SIGNED and UNCLAMPED, and named the

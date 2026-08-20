@@ -99,7 +99,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // ── THE `+20_000` ON EVERY SELECTOR THAT EMITS `AccountBalanceChanged` EXACTLY ONCE ──
         //
         // `AccountBalanceChanged` carries the whole account-level roll-up, so each emitting write
-        // now folds `margin_view::index_account_view` over the user's market index — the SAME unit of
+        // now folds `margin_view::index_account_scalars` over the user's market index — the SAME unit of
         // work `getAccount` is priced at 20_000 for (see the note on that selector below). Charging
         // nothing for it would leave these selectors buying a fold PLUS their writes for what
         // `getAccount` charges for the fold alone, which is the pricing gap the `getAccount`
@@ -162,19 +162,41 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // * `cancelOrder` emits NOTHING. A cancel moves no money now that the escrow is gone, so it
         //   writes no account — `trading/mod.rs` contains no `save_account` / `mutate_account_balance`
         //   call at all. By inspection, not by omission.
-        // * `placeOrder` emits NOTHING on a non-crossing placement either (`rest_in_book` reads the
-        //   account through `load_account_ref` and never writes it), which is the majority case —
-        //   raising the flat price would tax it for work it does not do. A CROSSING placement emits
-        //   `N + 3` (admin fee credit, N makers, the taker's flush write, the taker's debit), but each
-        //   of those folds runs against state the match has ALREADY made resident:
-        //   `MatchRegistry::get_or_load` loaded that user's position, account and both order lists,
-        //   and the walk loaded the `Market` and `MarketHot`. The marginal cost per maker is therefore
-        //   ~1 cold read (their `umkt` index blob) + ~4 warm probes + a ≤8-band tier walk, NOT a fresh
-        //   65-load fold. And `PLACE_ORDER_GAS` has always been flat over an unbounded-in-N match
-        //   (N settlements, N `Trade` + N `PositionChanged` logs, N position + N account writes): the
-        //   fold is a constant factor on a term this price already under-models, and a +30% bump
-        //   would not fix that structure while it WOULD raise the floor on every resting order. If
-        //   the flat-vs-N mismatch is to be priced, it should be priced as such, not here.
+        // * `placeOrder` DOES emit on a non-crossing placement — `trading::rest_in_book` publishes the
+        //   account after-image, because resting raises `Σ ooIM` and therefore moves
+        //   `availableBalance` even though it writes no account. (The old reason recorded here, "a
+        //   non-crossing placement emits nothing", is dead: it described the gap that emission closed.)
+        //   It is still not raised, and now for a stronger reason — **the marginal cost is zero
+        //   LOADS**:
+        //     · The walk was already there. The rest path's admission gate has always folded the
+        //       user's whole market index; it now folds `margin_view::index_account_scalars` instead
+        //       of `Σ ooIM` alone and takes `availableBalance` out of that same result. Identical
+        //       market set, identical `{market, position}` pair per market, ≤33 `_ref` loads either
+        //       way — already inside the 200_000.
+        //     · What is new is ARITHMETIC: ≤16 markets × (two `checked_add`s + a ≤8-band tier walk +
+        //       six accumulator adds), all on values already in hand. That is verbatim the increment
+        //       `getAccount` took from 5_000 to 20_000 — and that 15_000 was NOT priced off the
+        //       arithmetic, it was priced by PARITY with `getAccountMargin` so `getAccount` could not
+        //       become the cheap way to buy 16 markets of margin math. No such hole exists here:
+        //       nobody buys margin math through a 200_000-gas state-writing selector.
+        //     · So the "+20_000 per emitting selector" rate does not apply. It buys a fold INCLUDING
+        //       its ≤33 loads; here the loads are pre-paid, so it would over-price this by ~4×.
+        //     · The genuinely new resource is ONE log — a LOG2 with ten data words, ≈3_685 gas on
+        //       Ethereum's own schedule, ≈2% of the flat price. This table has never priced a log:
+        //       `OrderPlaced`, `OrderRested`, `OrderCancelled`, and a crossing match's `N + 3`
+        //       `AccountBalanceChanged` are all free. Charging for the resting path's single log while
+        //       the crossing path's N + 3 stay free would be arbitrary.
+        //   A CROSSING placement emits `N + 4` (admin fee credit, N makers, the taker's flush write,
+        //   the taker's debit, and now the rest of the remainder), but each of those folds runs against
+        //   state the match has ALREADY made resident: `MatchRegistry::get_or_load` loaded that user's
+        //   position, account and both order lists, and the walk loaded the `Market` and `MarketHot`.
+        //   The marginal cost per maker is ~1 cold read (their `umkt` index blob) + ~4 warm probes + a
+        //   ≤8-band tier walk, NOT a fresh 33-load fold. And `PLACE_ORDER_GAS` has always been flat
+        //   over an unbounded-in-N match (N settlements, N `Trade` + N `PositionChanged` logs, N
+        //   position + N account writes): the fold is a constant factor on a term this price already
+        //   under-models, and a bump would not fix that structure while it WOULD raise the floor on
+        //   every resting order — the branch that is already the most over-priced. If the flat-vs-N
+        //   mismatch is to be priced, it should be priced as such, not here.
         m.insert(placeOrderCall::SELECTOR, (PLACE_ORDER_GAS, false));
         m.insert(cancelOrderCall::SELECTOR, (CANCEL_ORDER_GAS, false));
         // Batch place / cancel: floor only — see the doc comment on SELECTORS.

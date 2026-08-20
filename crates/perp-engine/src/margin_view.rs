@@ -250,6 +250,9 @@ pub fn assuming_price_floor<H: PerpHost>(
 ///
 /// Errors if the market does not exist (its `base_decimals` / `price_decimals` / tier table are
 /// required inputs, and fabricating a zero market would silently report zeros).
+///
+/// All the arithmetic lives in [`margin_info_of`]; this function's job is the two loads plus the
+/// debug-only order-list oracle on the maintained `Bid`/`Ask` aggregates.
 pub fn compute_margin_info<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -257,33 +260,22 @@ pub fn compute_margin_info<H: PerpHost>(
 ) -> Result<MarginInfo, PerpError> {
     let market = storage::load_market_ref(context, market_id)?
         .ok_or_else(|| perp_err("getMarginInfo: unknown market"))?;
-    let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
     let pos = storage::load_position_ref(context, user, market_id)?;
-    // Leverage is floored at 1 here as it is inside `open_order_margin`, so a defaulted or
-    // corrupt 0 divides as 1 rather than trapping.
-    let leverage = pos.leverage.max(1);
 
-    // ── Bid / Ask ────────────────────────────────────────────────────────────────────────
+    // ── Bid / Ask oracle (debug only) ────────────────────────────────────────────────────
     // ONE rule, both sides: `Σ (remaining qty × that order's FROZEN Assuming Price)`, read O(1) off
     // the two maintained aggregates rather than re-folding the lists. They ARE `Bid`/`Ask` by
     // construction (the same per-order-floored `calc_value(assuming_price, amount)` terms every
     // maintenance site adds and subtracts), and the property test
     // `side_aggregates_are_exactly_bid_and_ask_after_every_operation` proves it holds after every
-    // transition, with the list fold as the independent ground truth.
-    //
-    // The side asymmetry lives ENTIRELY in the per-order `assuming_price`: a buy's is its limit
-    // price (no markup), a sell's is `max(T, limit)` fixed when it was placed. So there is no
-    // read-time `T`, no `MarketHot` load, and no list load on this path — R12 measured that a
-    // resting order's reported contribution does not move, and re-deriving it here would be the
-    // refuted `H_live`.
-    //
-    // Binance warns that its OWN `bidNotional`/`askNotional` are not reproducible from
-    // `qty × price` (two arithmetic paths coexist server-side, 1e-5 apart) and must be read
-    // from the response body. We have no such split: this IS the definition, evaluated once.
-    let bid_notional = pos.total_buy_notional;
-    let ask_notional = pos.total_sell_notional;
+    // transition, with the list fold as the independent ground truth. Keep that fold live here as a
+    // second, per-read check — it is the only place the STORED position and the STORED lists can be
+    // compared, which is why it does not move into `margin_info_of` (that one is also handed
+    // hypothetical positions that deliberately disagree with the lists; see
+    // [`compute_margin_info_at`]).
     #[cfg(debug_assertions)]
     {
+        let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
         let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
         let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
         let (_, bid_fold) =
@@ -291,7 +283,7 @@ pub fn compute_margin_info<H: PerpHost>(
         let (_, ask_fold) =
             sum_side_totals(sell_entries.iter().copied(), base_decimals, price_decimals)?;
         debug_assert_eq!(
-            (bid_notional, ask_notional),
+            (pos.total_buy_notional, pos.total_sell_notional),
             (bid_fold, ask_fold),
             "getMarginInfo: maintained (Bid, Ask) for {user} market {market_id} diverged from the \
              resting-order fold at each entry's frozen assuming price"
@@ -309,6 +301,56 @@ pub fn compute_margin_info<H: PerpHost>(
             );
         }
     }
+
+    margin_info_of(&market, &pos)
+}
+
+/// [`compute_margin_info`] with the position supplied IN MEMORY instead of read from storage — the
+/// override arm of the account-level fold ([`fold_account_margin`]).
+///
+/// Same market load, same arithmetic, same reject shape for an unknown market. What it deliberately
+/// does NOT do is run `compute_margin_info`'s order-list oracle: the position it is handed is a
+/// HYPOTHETICAL (the post-placement aggregates of an order that is not in the list yet), so it is
+/// *supposed* to disagree with the stored lists.
+pub fn compute_margin_info_at<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    pos: &crate::types::PerpPosition,
+) -> Result<MarginInfo, PerpError> {
+    let market = storage::load_market_ref(context, market_id)?
+        .ok_or_else(|| perp_err("getMarginInfo: unknown market"))?;
+    margin_info_of(&market, pos)
+}
+
+/// Every [`MarginInfo`] field for one `(market, position)` pair, from IN-MEMORY values only — **the
+/// single implementation of the per-market margin arithmetic.** Pure function, no storage, no
+/// context.
+///
+/// Both storage-driven entry points ([`compute_margin_info`], [`compute_margin_info_at`]) end here,
+/// so a stored position and a hypothetical one are priced by the same code — which is what lets the
+/// admission gate, `getAccount` and the `AccountBalanceChanged` after-image share one set of
+/// numbers.
+pub fn margin_info_of(
+    market: &crate::types::Market,
+    pos: &crate::types::PerpPosition,
+) -> Result<MarginInfo, PerpError> {
+    let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
+    // Leverage is floored at 1 here as it is inside `open_order_margin`, so a defaulted or
+    // corrupt 0 divides as 1 rather than trapping.
+    let leverage = pos.leverage.max(1);
+
+    // ── Bid / Ask ────────────────────────────────────────────────────────────────────────
+    // The side asymmetry lives ENTIRELY in the per-order `assuming_price`: a buy's is its limit
+    // price (no markup), a sell's is `max(T, limit)` fixed when it was placed. So there is no
+    // read-time `T`, no `MarketHot` load, and no list load on this path — R12 measured that a
+    // resting order's reported contribution does not move, and re-deriving it here would be the
+    // refuted `H_live`.
+    //
+    // Binance warns that its OWN `bidNotional`/`askNotional` are not reproducible from
+    // `qty × price` (two arithmetic paths coexist server-side, 1e-5 apart) and must be read
+    // from the response body. We have no such split: this IS the definition, evaluated once.
+    let bid_notional = pos.total_buy_notional;
+    let ask_notional = pos.total_sell_notional;
 
     // ── notional ────────────────────────────────────────────────────────────────────────
     // `N = trunc(|positionAmt| × markPrice)` — TRUNCATED (mainnet: `0.001 × 63544.85745652 =
@@ -382,7 +424,7 @@ pub fn compute_margin_info<H: PerpHost>(
     // from the position's `leverage` field. There is only one ooIM definition — this is the same
     // number the admission gate enforces, not a parallel "reported" one.
     let derived =
-        position_derived_margin(&market, &pos).map_err(|e| relabel_derived(e, "getMarginInfo"))?;
+        position_derived_margin(market, pos).map_err(|e| relabel_derived(e, "getMarginInfo"))?;
     debug_assert_eq!(
         (
             derived.signed_notional,
@@ -443,7 +485,21 @@ pub fn compute_margin_info<H: PerpHost>(
 /// the state it is ABOUT to write (the hypothetical post-placement position) or the state a match
 /// is holding in its registry working copy, without touching storage. When the overridden id is
 /// not yet in the index — a user entering a market — its term is added anyway, which is exactly
-/// what the placement gate needs.
+/// what the placement gate needs. [`fold_account_margin`]'s override is the same rule, term for
+/// term, on the wide fold.
+///
+/// # Who folds THIS and who folds the wide one
+///
+/// This is the LEAN fold: one accumulator, no maintenance-margin tier walk, no unrealized PnL, no
+/// `Σ isolatedWallet`. It serves the gates that want nothing but `available` — `rest_is_affordable`,
+/// `TakerSettlement::finalize_compute`, the taker wallet-cover check, `removePositionMargin` — where
+/// the five extra accumulators would be arithmetic thrown away.
+///
+/// `trading::rest_in_book` used to be one of those and is NOT any more: it needs the whole scalar
+/// set for the `AccountBalanceChanged` it now emits, so it folds
+/// [`index_account_scalars`] once and takes its gate out of that result. Same market set, same
+/// per-market loads, same `available`; the `debug_assertions` check in `index_account_scalars` pins
+/// the two folds against each other on every call.
 ///
 /// Pure read — every loader it reaches is a `_ref` (cache-fill, never dirty-mark) reader, so it
 /// enters no key into the block delta and cannot move the commitment. Returns `u128` so the fold
@@ -525,8 +581,8 @@ pub fn derived_available_balance<H: PerpHost>(
 ///
 /// # ⚠️ DO NOT CACHE THE RESULT, AND DO NOT DERIVE IT FROM A PREVIOUS CALL BY SUBTRACTING A DELTA
 ///
-/// This must be RECOMPUTED on every check. The temptation is real and the gates now invite it: the
-/// admission gate in `rest_in_book` evaluates this at the POST state and reads like incremental
+/// This must be RECOMPUTED on every check. The temptation is real and the gates now invite it:
+/// `rest_is_affordable` and the taker gates evaluate this at the POST state and read like incremental
 /// arithmetic, and the identity `available(after) == available(before) − Δ ooIM` genuinely holds —
 /// but **only within a single call**, where every other market's term is the same integer on both
 /// sides. Across calls it does not hold at all: `ooIM_m` contains `N_m = trunc(amount_m × mark_m)`,
@@ -670,6 +726,21 @@ pub struct AccountMarginTotals {
     pub total_position_margin: i128,
 }
 
+impl AccountMarginTotals {
+    /// Add one market's [`MarginInfo`] to every accumulator. The ONLY place the six terms are
+    /// summed, so the in-index and the entering-a-new-market arms of [`fold_account_margin`] cannot
+    /// accumulate different sets of fields.
+    #[inline]
+    fn add(&mut self, info: &MarginInfo) {
+        self.total_initial_margin += info.initial_margin as u128;
+        self.total_position_initial_margin += info.position_initial_margin as u128;
+        self.total_open_order_initial_margin += info.open_order_initial_margin as u128;
+        self.total_maint_margin += info.maint_margin as u128;
+        self.total_unrealized_profit += info.unrealized_profit as i128;
+        self.total_position_margin += info.position_margin as i128;
+    }
+}
+
 /// Every account-level scalar either view reports, narrowed to the ABI's widths with the balance
 /// identities applied. Computed ONCE by [`account_margin_scalars`], so the two entry points can
 /// only differ in which of these fields they encode.
@@ -713,17 +784,29 @@ pub struct AccountMarginScalars {
 ///
 /// Pure read — every loader it reaches is a `_ref` (cache-fill, never dirty-mark) reader, so it
 /// enters no key into the block delta and cannot move the commitment.
+///
+/// # `override_market` — pricing the state a caller is ABOUT to write
+///
+/// Substitutes an IN-MEMORY position for one market id, so the placement gate can fold the
+/// hypothetical post-placement account WITHOUT touching storage. Semantics are **verbatim**
+/// [`total_open_order_initial_margin`]'s, including the case that matters most here: when the
+/// overridden id is not yet in the market set — a user ENTERING a market, whose index entry is only
+/// written at save time — its term is appended anyway, and a market id that names no market
+/// contributes nothing. Every other market's term is read from storage exactly as without the
+/// override, which is what makes the two forms comparable within one call.
 pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
     context: &mut H,
     user: Address,
     market_ids: I,
     source: MarketSetSource,
     who: &str,
+    override_market: Option<(u64, &crate::types::PerpPosition)>,
 ) -> Result<AccountMarginTotals, PerpError> {
     let market_ids = market_ids.into_iter();
     let mut totals = AccountMarginTotals::default();
     let (lower, _) = market_ids.size_hint();
     let mut seen: Vec<u64> = Vec::with_capacity(lower);
+    let mut applied_override = false;
     for market_id in market_ids {
         // O(n^2) over a set bounded by MAX_MARGIN_INFO_MARKETS (64) / MAX_USER_MARKETS (16).
         if seen.contains(&market_id) {
@@ -740,14 +823,26 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
                 "{who}: user market index holds unknown market {market_id}"
             )));
         }
-        let info = compute_margin_info(context, user, market_id)
-            .map_err(|e| relabel_market(e, who, market_id))?;
-        totals.total_initial_margin += info.initial_margin as u128;
-        totals.total_position_initial_margin += info.position_initial_margin as u128;
-        totals.total_open_order_initial_margin += info.open_order_initial_margin as u128;
-        totals.total_maint_margin += info.maint_margin as u128;
-        totals.total_unrealized_profit += info.unrealized_profit as i128;
-        totals.total_position_margin += info.position_margin as i128;
+        let info = match override_market {
+            Some((id, over)) if id == market_id => {
+                applied_override = true;
+                compute_margin_info_at(context, market_id, over)
+            }
+            _ => compute_margin_info(context, user, market_id),
+        }
+        .map_err(|e| relabel_market(e, who, market_id))?;
+        totals.add(&info);
+    }
+    if let Some((id, over)) = override_market {
+        if !applied_override {
+            // Entering a market: the index is only written at save time, so the id the caller is
+            // pricing is legitimately absent. A market that does not exist contributes nothing
+            // (the placement path rejects an unknown market long before this point).
+            if let Some(market) = storage::load_market_ref(context, id)? {
+                let info = margin_info_of(&market, over).map_err(|e| relabel_market(e, who, id))?;
+                totals.add(&info);
+            }
+        }
     }
     Ok(totals)
 }
@@ -765,14 +860,20 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
 ///
 /// Each narrowing is the point where a pathological state surfaces as a clean revert instead of
 /// wrapping.
+///
+/// `override_market` is [`fold_account_margin`]'s, unchanged. The stored cross wallet is NOT
+/// overridable and does not need to be: every caller that supplies a position override is pricing a
+/// hypothetical whose wallet leg has not moved (resting an order escrows nothing), so the stored
+/// value IS the post-state one.
 pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
     context: &mut H,
     user: Address,
     market_ids: I,
     source: MarketSetSource,
     who: &str,
+    override_market: Option<(u64, &crate::types::PerpPosition)>,
 ) -> Result<AccountMarginScalars, PerpError> {
-    let totals = fold_account_margin(context, user, market_ids, source, who)?;
+    let totals = fold_account_margin(context, user, market_ids, source, who, override_market)?;
     // Signed and unclamped: this is the CROSS wallet exactly as stored. A negative value is a
     // settled receivable (see `types::UserAccount::perp_wallet_balance`), and hiding it behind a
     // `uint64` floor is precisely the blind spot the old `availablePerpBalance` had.
@@ -899,6 +1000,7 @@ pub fn run_get_account_margin<H: PerpHost>(
         args.marketIds.iter().copied(),
         MarketSetSource::CallerList,
         "getAccountMargin",
+        None,
     )?;
 
     Ok(Bytes::from(getAccountMarginCall::abi_encode_returns(
@@ -925,9 +1027,10 @@ pub fn run_get_account_margin<H: PerpHost>(
 /// (`storage::emit_account_balance_changed`). Neither holds arithmetic of its own — each takes
 /// this struct and encodes a subset of it — so the event and the view cannot report different
 /// numbers for the same state. That equality is pinned by
-/// `margin_view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state` and
-/// `trading::tests::matched_call_emits_a_balance_event_at_each_balance_moving_write`, and by the
-/// `debug_assertions` gate-agreement check inside [`index_account_view`] itself.
+/// `margin_view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state`,
+/// `trading::tests::matched_call_emits_a_balance_event_at_each_balance_moving_write` and
+/// `trading::tests::a_resting_placement_emits_one_event_equal_to_get_account`, and by the
+/// `debug_assertions` gate-agreement check inside [`index_account_scalars`] itself.
 #[derive(Clone, Debug)]
 pub struct IndexAccountView {
     /// The market ids folded — the per-user index (`umkt`) verbatim, echoed so a caller can
@@ -940,8 +1043,8 @@ pub struct IndexAccountView {
     pub scalars: AccountMarginScalars,
 }
 
-/// Fold [`account_margin_scalars`] over the user's whole market index and pair it with the spot
-/// USDC balance — the complete published account view.
+/// Fold [`account_margin_scalars`] over the user's whole market index — the account-level scalar
+/// half of [`IndexAccountView`], and **the single producer of the `AccountBalanceChanged` payload.**
 ///
 /// Pure read: every loader it reaches is a `_ref`/cache-fill reader, so it enters no key into the
 /// block delta and cannot move the block commitment. It is therefore safe to call from a WRITE
@@ -952,11 +1055,21 @@ pub struct IndexAccountView {
 /// from the sell list at a read-time `T`; both of those disappeared with the R12 freeze, since both
 /// aggregates now sit in the position blob. Bounded by `MAX_USER_MARKETS` (16) ⇒ ≤ 33 `_ref` loads,
 /// flat.
-pub fn index_account_view<H: PerpHost>(
+///
+/// # `override_market` — the ONE walk of the placement path
+///
+/// `trading::rest_in_book` calls this with the hypothetical post-placement position, so that the
+/// walk its admission gate has to do anyway ALSO produces the event's after-image: it takes
+/// `available_balance` from the returned scalars as its gate, and carries the rest to the emit at
+/// the end of the call. See the note there for why the gate-time snapshot is provably the
+/// post-write state (every scalar input is either the overridden position or something the apply
+/// region does not write).
+pub fn index_account_scalars<H: PerpHost>(
     context: &mut H,
     user: Address,
     who: &str,
-) -> Result<IndexAccountView, PerpError> {
+    override_market: Option<(u64, &crate::types::PerpPosition)>,
+) -> Result<AccountMarginScalars, PerpError> {
     // The index is the support of every sum: a market the user has left contributes
     // `N = Bid = Ask = 0`. Held as an owned `Arc` so it can be iterated while `context` is borrowed
     // mutably by the walk.
@@ -967,23 +1080,37 @@ pub fn index_account_view<H: PerpHost>(
         market_ids.iter().copied(),
         MarketSetSource::UserIndex,
         who,
+        override_market,
     )?;
 
-    // The roll-up's `Σ ooIM` and the hot admission gate's must be the SAME number over the same
-    // market set — they share `position_open_order_margin` per market but fold in two places (the
-    // gate's walk stays lean on purpose: no maintenance-margin tier walk, no unrealized PnL,
-    // because it runs on every placeOrder). Pin the agreement here rather than trusting it, on
-    // EVERY produced view — which now includes every emitted event. Compiled out in release, so
-    // the second walk costs production nothing.
+    // The roll-up's `Σ ooIM` and the LEAN admission gate's must be the SAME number over the same
+    // market set. They share `position_open_order_margin` per market but fold in two places: this
+    // wide fold, and `total_open_order_initial_margin`, which the taker gates / `rest_is_affordable`
+    // / `finalize_compute` still use because they want only `available` and would otherwise pay for
+    // five accumulators they discard. Pin the agreement here rather than trusting it, on EVERY
+    // produced snapshot — which now includes every emitted event AND `rest_in_book`'s gate, override
+    // and all. Compiled out in release, so the second walk costs production nothing.
     #[cfg(debug_assertions)]
     {
-        let gate = derived_available_balance(context, user)?;
+        let gate = derived_available_balance_with(context, user, None, override_market)?;
         debug_assert_eq!(
             gate, scalars.available_balance as i128,
             "{who}: availableBalance must equal the admission gate's own basis"
         );
     }
 
+    Ok(scalars)
+}
+
+/// [`index_account_scalars`] paired with the spot USDC balance and the folded id list — the
+/// complete published account view, as `getAccount` returns it.
+pub fn index_account_view<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    who: &str,
+) -> Result<IndexAccountView, PerpError> {
+    let market_ids = storage::load_user_markets_ref(context, user)?;
+    let scalars = index_account_scalars(context, user, who, None)?;
     let usdc_balance: primitives::U256 = storage::load_account_ref(context, user)?
         .usdc_balance
         .clone()

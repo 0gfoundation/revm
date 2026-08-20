@@ -1422,7 +1422,7 @@ fn the_event_and_get_account_agree_field_for_field_on_the_same_state() {
             a.availableBalance,
         ),
         "the event and getAccount must be the same numbers — they share one producer, \
-         `margin_view::index_account_view`, over one market set (the per-user index)"
+         `margin_view::index_account_scalars`, over one market set (the per-user index)"
     );
     // The fixture has to exercise every term, or the equality above proves little.
     assert!(
@@ -1677,8 +1677,9 @@ fn the_views_write_nothing() {
 
     // ── ...AND the same fold reached from the EVENT path adds no key either ───────────────────
     //
-    // `AccountBalanceChanged` now carries this whole roll-up, so `index_account_view` runs on every
-    // balance-moving account WRITE. If any loader it reaches were not a `_ref`/cache-fill reader it
+    // `AccountBalanceChanged` now carries this whole roll-up, so `index_account_scalars` runs on
+    // every write that moves a published field — every balance-moving account write, and every order
+    // that RESTS (`trading::rest_in_book`, whose admission gate does the fold anyway). If any loader it reaches were not a `_ref`/cache-fill reader it
     // would dirty extra keys, and the perp block commitment — whose input is exactly the block's net
     // key→value delta (`perp_core::compute_block_commitment`) — would move for a reason that has
     // nothing to do with what the call actually changed. This is the mechanical confirmation that the

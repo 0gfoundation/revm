@@ -357,6 +357,13 @@ pub fn load_account_ref<H: PerpHost>(
 /// point ([`save_account`], [`mutate_account_balance`]) precisely because it knows it moved money.
 /// Writes that cannot move a balance (the per-placement nonce bump, fee-rate updates) go through the
 /// silent [`mutate_account`] and emit nothing.
+///
+/// ⚠️ "Balance-moving write" is not the whole trigger set any more, because it never described what
+/// the event actually reports. The payload includes `availableBalance` = `cross − Σ ooIM`, and
+/// **resting an order moves `Σ ooIM` while writing no account at all** — so `trading::rest_in_book`
+/// emits too, through [`emit_account_balance_changed_from`], off the walk its own admission gate
+/// already does. The rule is therefore "one event per write that moves a PUBLISHED FIELD", and the
+/// published fields include a derived one.
 /// It replaces the former call-scoped after-image tracker (a `BTreeMap` baseline per touched
 /// account, drained and re-read at the end of the top-level call to emit one coalesced event per
 /// user). That machinery cost, per account write, a pre-write account read plus two
@@ -374,39 +381,38 @@ pub fn load_account_ref<H: PerpHost>(
 ///
 /// The event carries the whole account-level scalar set (`totalWalletBalance`, `Σ IM/PIM/ooIM/MM`,
 /// `Σ uPnL`, `availableBalance`), which only exists as a fold over the user's market index. So this
-/// pays one [`crate::margin_view::index_account_view`] walk per emission: ≤ `MAX_USER_MARKETS` (16)
-/// markets × ≤ 4 `_ref` loads (2 when the user has no resting sells in that market — the
-/// `total_sell_qty == 0` short-circuit), i.e. ≤ 65 loads, all cache-fill and none entering the block
-/// delta. The realistic single-market case is 3 loads (index + market + position), 5 with resting
-/// sells.
+/// pays one [`crate::margin_view::index_account_scalars`] walk per emission: ≤ `MAX_USER_MARKETS`
+/// (16) markets × 2 `_ref` loads (`{market, position}` — flat, no shape-dependent worst case since
+/// the R12 freeze put both side aggregates in the position blob), i.e. ≤ 33 loads, all cache-fill and
+/// none entering the block delta. The realistic single-market case is 3 loads (index + market +
+/// position).
 ///
 /// Gas stays FLAT PER SELECTOR — never per event, never dynamic. The eight selectors that emit
 /// exactly one of these were each raised by one `getAccount`-equivalent (20_000) to pay for the
 /// fold; `placeOrder`/`cancelOrder`/`liquidate`/`updateIndexPrice` deliberately were not. The
 /// per-selector reasoning is on the `SELECTORS` table in [`crate::call`].
 ///
-/// ## Why the walk is not reused from a gate walk that already happened
+/// ## Where the walk IS reused from a gate walk, and where it is not
 ///
-/// Several of the emitting call paths DO evaluate `derived_available_balance` nearby (the taker
-/// debit, `transferFromPerp`, `addPositionMargin`, `depositInsuranceFund`), and it is tempting to
-/// hand that result to the event. Two things stop it:
+/// Several of the emitting call paths evaluate `derived_available_balance` nearby (the taker debit,
+/// `transferFromPerp`, `addPositionMargin`, `depositInsuranceFund`), and handing that result to the
+/// event is only sound where the gate's walk is over the POST state:
 ///
-/// * **No existing walk is over the post-write state.** Every one of them runs BEFORE its write (it
-///   is an admission gate), so reusing it means patching its result by the write's own delta — a
-///   second, per-site route to the nine published numbers. That is exactly the divergence risk the
-///   single producer exists to remove, and `getAccount` would no longer be the only other consumer.
-/// * **The lean gate returns one number.** `total_open_order_initial_margin` folds only `Σ ooIM` and
-///   discards the per-market `PIM`/`maintMargin`/`uPnL`/`Σ isolatedWallet` accumulators the event
-///   needs. Widening it to the full fold ([`crate::margin_view::fold_account_margin`]) would cost no
-///   extra LOADS — same `market`/`position`/`MarketHot`/sell-list reads, the tier table is already in
-///   the loaded `Market` — only extra arithmetic. But the hottest walk it would widen is
-///   `trading::rest_in_book`'s, and **the rest path writes no account and therefore emits nothing**,
-///   so widening it buys the event nothing at all. The one hot site where reuse could pay is the
-///   taker debit, worth exactly ONE walk out of the `N + 3` an N-maker match emits.
+/// * **`trading::rest_in_book` — REUSED.** Its gate is the one that already prices the post state:
+///   it walks the index with `override_market = pos_after`, i.e. the exact position it is about to
+///   write. Widening that walk from `Σ ooIM` to the full scalar set costs **no extra loads** (same
+///   `{market, position}` per market; the tier table already rides in the loaded `Market`) — only
+///   arithmetic — and it is the ONLY walk on the resting path, so the event is free of a second one.
+///   That reuse is what makes the placement emit at all: the rest path writes no account, so under
+///   the "emit at the account write" rule it emitted nothing even though `availableBalance` moved.
+/// * **Every other emitter — NOT reused.** Their gate walks run BEFORE the write (they are admission
+///   gates on a state that then changes), so reusing one means patching its result by the write's own
+///   delta — a second, per-site route to the nine published numbers, which is exactly the divergence
+///   risk the single producer exists to remove.
 ///
-/// The O(N) term is the maker flush, which has no gate walk to reuse under any variant (M1 gates
-/// makers on the raw cross wallet, not the derived available), so no reuse scheme moves the number
-/// that matters. Aggregation does — see below.
+/// The O(N) term is the maker flush, which has no post-state gate walk to reuse under any variant
+/// (M1 gates makers on the raw cross wallet, not the derived available), so no further reuse scheme
+/// moves the number that matters. Aggregation does — see below.
 ///
 /// # 🔜 WHERE THE PLANNED AGGREGATION HOOKS
 ///
@@ -416,7 +422,7 @@ pub fn load_account_ref<H: PerpHost>(
 /// call-scoped touched-set (the natural home is `TypedPerpStore`, which is already call-scoped and
 /// already keyed by `Address`), and `call::run_perp_dex_call` drains that set on the SUCCESS path
 /// only — after the dispatch returns Ok, before the gas is reported — emitting one
-/// `index_account_view` per distinct user in address order. Nothing else moves: the event shape is
+/// `index_account_scalars` per distinct user in address order. Nothing else moves: the event shape is
 /// already an account-level snapshot rather than a per-write delta, precisely so that collapsing N
 /// emissions to 1 changes only WHEN it fires.
 ///
@@ -450,15 +456,34 @@ fn emit_account_balance_changed<H: PerpHost>(
     context: &mut H,
     user: Address,
 ) -> Result<(), PerpError> {
-    let view = crate::margin_view::index_account_view(context, user, "AccountBalanceChanged")?;
-    let s = view.scalars;
+    let scalars =
+        crate::margin_view::index_account_scalars(context, user, "AccountBalanceChanged", None)?;
+    emit_account_balance_changed_from(context, user, scalars)
+}
+
+/// [`emit_account_balance_changed`] from an ALREADY-FOLDED scalar set — **the one and only site that
+/// constructs this log.**
+///
+/// It exists for the caller that has already paid for the walk: `trading::rest_in_book` folds
+/// [`crate::margin_view::index_account_scalars`] for its admission gate and hands the very same
+/// struct here, so the placement's after-image is the gate's own arithmetic rather than a second
+/// walk (and, more to the point, not a second *implementation*). The spot USDC balance is the one
+/// field not in the scalar set, and it is read here rather than plumbed through the caller so that a
+/// rejected placement never pays for the decimal-String clone and `U256` parse.
+pub(crate) fn emit_account_balance_changed_from<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    s: crate::margin_view::AccountMarginScalars,
+) -> Result<(), PerpError> {
+    let usdc_balance: primitives::U256 =
+        load_account_ref(context, user)?.usdc_balance.clone().into();
     context.log(primitives::Log {
         address: PERP_DEX_ADDRESS,
         data: {
             use alloy_primitives::IntoLogData;
             crate::interface::IPerpDex::AccountBalanceChanged {
                 user,
-                usdcBalance: view.usdc_balance,
+                usdcBalance: usdc_balance,
                 totalWalletBalance: s.total_wallet_balance,
                 totalCrossWalletBalance: s.total_cross_wallet_balance,
                 totalMarginBalance: s.total_margin_balance,

@@ -134,7 +134,7 @@ fn get_account(ctx: &mut TestCtx, user: Address) -> crate::interface::IPerpDex::
 
 /// **Every field of an `AccountBalanceChanged` payload against `getAccount` for the same user in the
 /// CURRENT state.** This is the anti-divergence pin the shared producer exists for: the event and
-/// `getAccount` both encode `margin_view::index_account_view`, so a second implementation of any of
+/// `getAccount` both encode `margin_view::index_account_scalars`, so a second implementation of any of
 /// these ten numbers — or one surface folding a different market set, or clamping where the other
 /// does not — fails here.
 ///
@@ -2880,9 +2880,10 @@ fn accepted_resting_placement_emits_exactly_one_order_placed() {
     let logs = take_event_names(&mut ctx);
     assert_eq!(
         logs,
-        vec!["OrderPlaced", "OrderRested"],
-        "a resting GTC emits OrderPlaced then OrderRested — and NO AccountBalanceChanged, \
-         because with the escrow gone resting moves no money and writes no account"
+        vec!["OrderPlaced", "OrderRested", "AccountBalanceChanged"],
+        "a resting GTC emits OrderPlaced then OrderRested then the account after-image. Resting \
+         still moves no money and writes no account — but it DOES raise `Σ ooIM`, so \
+         `availableBalance` moves and the snapshot is emitted from the admission gate's own walk"
     );
 
     // PostOnly never calls match_order → rest_in_book's apply block is the ONLY flush site.
@@ -2890,8 +2891,8 @@ fn accepted_resting_placement_emits_exactly_one_order_placed() {
     let logs = take_event_names(&mut ctx);
     assert_eq!(
         logs,
-        vec!["OrderPlaced", "OrderRested"],
-        "same for PostOnly — no balance event, no balance change"
+        vec!["OrderPlaced", "OrderRested", "AccountBalanceChanged"],
+        "same for PostOnly, which never matches: exactly one balance event, from the rest"
     );
 }
 
@@ -10888,5 +10889,278 @@ mod assuming_price {
             maintMargin: info.maint_margin,
             positionMargin: info.position_margin,
         }
+    }
+}
+
+// ── The placement's account after-image ──────────────────────────────────────
+//
+// `rest_in_book` performs ZERO account writes, so under the "emit at the account write" rule a
+// placement published no `AccountBalanceChanged` at all — while genuinely moving `availableBalance`,
+// because the new order's ooIM raises `Σ ooIM`. An indexer following only the event stream therefore
+// missed placement entirely and stayed stale until the user's next money-moving call. It now emits,
+// off the very walk its admission gate has to do anyway.
+//
+// These tests pin the four things that can go wrong: the numbers (they must be `getAccount`'s, from
+// the one shared producer), the POSITION of the emit (inside APPLY — a rejected placement emits
+// nothing), the fact that the gate-time snapshot really is the POST-write state (the
+// entering-a-new-market case is the one that catches a missing override term), and the accepted
+// multi-emit on a crossing taker.
+mod placement_balance_event {
+    use super::*;
+
+    /// Every `AccountBalanceChanged` in the journal, in emission order.
+    fn take_balance_events(ctx: &mut TestCtx) -> Vec<AccountBalanceChanged> {
+        JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
+            .map(|log| {
+                AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+            })
+            .collect()
+    }
+
+    /// A second market, so the fold has both an already-indexed term and a brand-new one.
+    const MARKET_2: u64 = 2;
+
+    fn add_market_2(ctx: &mut TestCtx) {
+        let mut m = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+        m.market_id = MARKET_2;
+        storage::save_market(ctx, &m).unwrap();
+    }
+
+    fn place_in(
+        ctx: &mut TestCtx,
+        caller: Address,
+        market: u64,
+        side: u8,
+        price: u64,
+        qty: u64,
+        tif: u8,
+    ) -> Result<Bytes, PerpError> {
+        let input = placeOrderCall {
+            marketId: market,
+            side,
+            price,
+            quantity: qty,
+            orderType: 0,
+            tif,
+            clientOrderId: FixedBytes::default(),
+        }
+        .abi_encode();
+        run_place_order(&input, caller, ctx)
+    }
+
+    /// A LONG whose mark has moved off its entry, so `Σ uPnL`, `Σ positionMargin`, `Σ PIM` and
+    /// `Σ maintMargin` are all non-zero — otherwise the field-for-field equality below would be an
+    /// equality between rows of zeros.
+    fn seed_long(ctx: &mut TestCtx, who: Address, market: u64, lots: i64) {
+        let notional = lots * FILL_VALUE as i64;
+        storage::save_position(
+            ctx,
+            who,
+            market,
+            &PerpPosition {
+                amount: lots * QTY as i64,
+                v_quote_balance: -notional,
+                margin: notional.abs(),
+                leverage: 1,
+                ..PerpPosition::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// Mark $110 against a $100 entry: `N` and therefore PIM / MM / uPnL are all live.
+    const MARK: u64 = PRICE + 10 * TICK;
+
+    /// Set up ALICE with a live long in the test market and drain the journal.
+    fn fixture(ctx: &mut TestCtx) {
+        setup(ctx);
+        storage::save_mark_price(ctx, MARKET_ID, MARK).unwrap();
+        seed_long(ctx, ALICE, MARKET_ID, 3);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+    }
+
+    /// **The headline.** A placement that only RESTS emits exactly one after-image, and every one
+    /// of its ten fields is `getAccount`'s for the state the placement left behind.
+    ///
+    /// This is the anti-divergence pin the task turns on: the event's numbers come from the same
+    /// `margin_view::account_margin_scalars` `getAccount` folds, so a second copy of the margin
+    /// arithmetic — or a snapshot taken at the wrong moment, or one that forgot the new order's own
+    /// ooIM term — fails here.
+    #[test]
+    fn a_resting_placement_emits_one_event_equal_to_get_account() {
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+
+        let available_before = get_account(&mut ctx, ALICE).availableBalance;
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        place_in(&mut ctx, ALICE, MARKET_ID, 0, PRICE, QTY, 0).expect("resting buy");
+
+        let events = take_balance_events(&mut ctx);
+        assert_eq!(
+            events.len(),
+            1,
+            "a non-crossing placement emits exactly one account after-image, got {:?}",
+            events.iter().map(|e| e.user).collect::<Vec<_>>()
+        );
+        let e = &events[0];
+        assert_eq!(e.user, ALICE);
+        assert_event_matches_get_account(&mut ctx, e);
+
+        // The event carries NEW information — this is the gap being closed. Resting escrows
+        // nothing, so the wallet is untouched; `availableBalance` moved anyway, by the order's ooIM.
+        assert_eq!(
+            e.totalCrossWalletBalance, WALLET as i64,
+            "resting moves no money"
+        );
+        assert!(
+            e.totalOpenOrderInitialMargin > 0,
+            "the resting order must contribute a real ooIM term"
+        );
+        assert_eq!(
+            e.availableBalance,
+            available_before - e.totalOpenOrderInitialMargin as i64,
+            "availableBalance fell by exactly the new order's requirement"
+        );
+        // The fixture has to exercise every accumulator, or the equality above proves little.
+        assert!(
+            e.totalPositionInitialMargin > 0
+                && e.totalMaintMargin > 0
+                && e.totalUnrealizedProfit != 0
+                && e.totalWalletBalance != e.totalCrossWalletBalance,
+            "fixture must make every scalar non-trivial: {:?}",
+            (
+                e.totalPositionInitialMargin,
+                e.totalMaintMargin,
+                e.totalUnrealizedProfit,
+                e.totalWalletBalance,
+                e.totalCrossWalletBalance,
+            )
+        );
+    }
+
+    /// PostOnly never calls `match_order`, so `rest_in_book`'s tail is the ONLY emit site on that
+    /// path: exactly one event, and it is the settled state.
+    #[test]
+    fn a_post_only_placement_emits_exactly_one_event() {
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+
+        place_in(&mut ctx, ALICE, MARKET_ID, 0, PRICE, QTY, 3).expect("post-only buy");
+
+        let events = take_balance_events(&mut ctx);
+        assert_eq!(
+            events.len(),
+            1,
+            "got {:?}",
+            events.iter().map(|e| e.user).collect::<Vec<_>>()
+        );
+        assert_eq!(events[0].user, ALICE);
+        assert_event_matches_get_account(&mut ctx, &events[0]);
+    }
+
+    /// **The emit is inside APPLY.** A placement refused by the margin gate emits NOTHING — not the
+    /// after-image, and not `OrderPlaced`/`OrderRested` either. Validate-then-apply: under
+    /// commit-only there is no undo, so a log emitted before a reject would survive in a batch (the
+    /// batch selectors catch a per-item error and return Ok, so the frame does not revert).
+    #[test]
+    fn a_rejected_placement_emits_nothing() {
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+        // Leave ALICE with no headroom at all, then ask for an order whose ooIM is strictly
+        // positive: `available(after) < 0` and `Δ ooIM > 0`, so the gate refuses.
+        set_available(&mut ctx, ALICE, 0);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        let err = place_in(&mut ctx, ALICE, MARKET_ID, 0, PRICE, QTY, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("insufficient perp wallet for margin"),
+            "{err}"
+        );
+        assert!(
+            JournalTr::take_logs(ctx.journal_mut()).is_empty(),
+            "a rejected placement must emit no logs at all"
+        );
+    }
+
+    /// **The gate-time snapshot is the POST-write state, including the market SET.**
+    ///
+    /// Entering a market the user is not yet indexed in is the case that catches a missing override
+    /// term: the index is written by the APPLY block's order-list write, so at gate time market 2 is
+    /// absent and its term exists only because `fold_account_margin` appends the override anyway. If
+    /// it did not, the event would report market 1's ooIM alone and disagree with `getAccount`.
+    #[test]
+    fn entering_a_new_market_includes_that_market_in_the_snapshot() {
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+        add_market_2(&mut ctx);
+        storage::save_mark_price(&mut ctx, MARKET_2, MARK).unwrap();
+        // Already resting in market 1, so the fold has an in-index term as well as the new one.
+        place_in(&mut ctx, ALICE, MARKET_ID, 0, PRICE, QTY, 3).expect("market 1 buy");
+        let one_market = take_balance_events(&mut ctx).pop().expect("one event");
+        assert_eq!(
+            storage::load_user_markets(&mut ctx, ALICE).unwrap(),
+            vec![MARKET_ID],
+            "market 2 is NOT in the index when its first order is priced"
+        );
+
+        place_in(&mut ctx, ALICE, MARKET_2, 0, PRICE, QTY, 3).expect("market 2 buy");
+
+        let events = take_balance_events(&mut ctx);
+        assert_eq!(
+            events.len(),
+            1,
+            "got {:?}",
+            events.iter().map(|e| e.user).collect::<Vec<_>>()
+        );
+        let e = &events[0];
+        assert_eq!(
+            storage::load_user_markets(&mut ctx, ALICE).unwrap(),
+            vec![MARKET_ID, MARKET_2],
+            "the APPLY block is what adds the id — after the snapshot was folded"
+        );
+        assert_event_matches_get_account(&mut ctx, e);
+        assert!(
+            e.totalOpenOrderInitialMargin > one_market.totalOpenOrderInitialMargin,
+            "the new market's ooIM must be in the total: {} vs {}",
+            e.totalOpenOrderInitialMargin,
+            one_market.totalOpenOrderInitialMargin
+        );
+    }
+
+    /// A CROSSING GTC that rests a remainder emits for the taker more than once: the match's own
+    /// account writes, then the rest. That is the existing multi-emit decision (one event per write
+    /// that moves a published field, no de-duplication), so it is PINNED rather than suppressed —
+    /// and the LAST event for the taker is the settled state that agrees with `getAccount`.
+    #[test]
+    fn a_crossing_gtc_that_rests_emits_the_match_events_then_the_rest_snapshot() {
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+        // One lot of liquidity: ALICE's 2-lot GTC buy fills one and rests one.
+        place_in(&mut ctx, BOB, MARKET_ID, 1, PRICE, QTY, 3).expect("maker sell");
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        place_in(&mut ctx, ALICE, MARKET_ID, 0, PRICE, 2 * QTY, 0).expect("crossing GTC");
+
+        let events = take_balance_events(&mut ctx);
+        let alice_events = events.iter().filter(|e| e.user == ALICE).count();
+        assert!(
+            alice_events >= 2,
+            "the taker emits from the match AND from the rest, got {:?}",
+            events.iter().map(|e| e.user).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            events.last().map(|e| e.user),
+            Some(ALICE),
+            "the rest's snapshot is emitted last, got {:?}",
+            events.iter().map(|e| e.user).collect::<Vec<_>>()
+        );
+        // Only the LAST event per user is a settled account state; that is the documented contract.
+        assert_event_matches_get_account(&mut ctx, events.last().unwrap());
+        let bob_last = events.iter().rev().find(|e| e.user == BOB).expect("maker");
+        assert_event_matches_get_account(&mut ctx, bob_last);
     }
 }

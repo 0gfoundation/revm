@@ -2093,14 +2093,12 @@ fn rest_in_book<H: PerpHost>(
     pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PerpError> {
     let mut pos = storage::load_position(context, user, market_id)?;
-    // Resting escrows nothing, so the account is READ-ONLY here: the fee rate (folded into the
-    // account blob) for the book entry, and the cross wallet for the derived admission gate. An
-    // `_ref` read — no owned clone, and no `save_account` at the end, so no spurious
-    // `AccountBalanceChanged` for a call that moves no money.
-    let (maker_fee_bps, wallet) = {
-        let account = storage::load_account_ref(context, user)?;
-        (account.maker_fee_bps, account.perp_wallet_balance)
-    };
+    // Resting escrows nothing, so the account is never WRITTEN here — only read, for the fee rate
+    // (folded into the account blob) that goes on the book entry. An `_ref` read: no owned clone.
+    // The cross wallet is no longer pulled out here; the admission gate below folds the whole
+    // account-level scalar set and reads `perp_wallet_balance` inside that walk, from the same
+    // (resident) blob.
+    let maker_fee_bps = storage::load_account_ref(context, user)?.maker_fee_bps;
     // ONE BBO resolve for both the best-update check and the mid-price sample (was up to two
     // separate load_best_bid/load_best_ask reads per arm).
     let (best_bid, best_ask) = match bbo {
@@ -2111,7 +2109,9 @@ fn rest_in_book<H: PerpHost>(
         }
     };
 
-    match side {
+    // The account-level after-image the accepted placement will publish, produced by the admission
+    // gate's own walk inside each arm and carried out here so there is ONE emit site at the tail.
+    let account_after = match side {
         Side::Buy => {
             // commit-only #23 CLONE-FREE probe: the hypothetical "buy-list ⊕ new_entry" is never
             // materialised — the derived requirement reads only the per-side AGGREGATES, so the
@@ -2215,17 +2215,39 @@ fn rest_in_book<H: PerpHost>(
             // Cost: in the accepting case this market's `ooIM` is evaluated ONCE (inside the walk,
             // via the override) instead of three times — the delta evaluated it at `before` and at
             // `after`, and the walk evaluated `before` a second time.
+            //
+            // # Why the WIDE fold, when the gate reads one field out of ten
+            //
+            // Because the placement has to publish an `AccountBalanceChanged` and this is the walk
+            // that can produce it. `availableBalance` MOVES here — the order's ooIM raises `Σ ooIM`
+            // — while the rest path writes no account at all, so under the old "emit at the account
+            // write" rule a placement emitted NOTHING and an indexer following the event stream
+            // stayed stale until the user's next money-moving call.
+            //
+            // Widening `Σ ooIM` → the full ten-scalar set is **arithmetic only, zero extra loads**:
+            // the same `{market, position}` pair per market, and the maintenance-margin tier table
+            // already rides inside the loaded `Market`. What it buys is that the event's numbers ARE
+            // the gate's numbers, from `margin_view::account_margin_scalars` — the same producer
+            // `getAccount` uses — so the two published surfaces cannot drift.
+            //
+            // The cost of the widening is a handful of extra narrowing guards (`Σ uPnL`, `Σ
+            // isolatedWallet`, `Σ MM` must each fit their ABI width), so a pathological account can
+            // now be refused a placement where the lean gate would have admitted it. Every such state
+            // already makes `getAccount` revert, and all of them are ≥ 9.2e12 USD sums at 6 dp.
+            //
+            // ⚠️ The scalars are read at the GATE but emitted after the writes below, and that is
+            // sound because the snapshot is provably the POST state — see the note at the emit site.
             let mut pos_after = pos.clone();
             pos_after.total_buy_qty = new_total_buy_qty;
             pos_after.total_buy_notional = new_total_buy_notional;
             // `pos_after` overrides storage for this market: it is not written until below.
-            let available_after = crate::margin_view::derived_available_balance_with(
+            let snapshot = crate::margin_view::index_account_scalars(
                 context,
                 user,
-                Some(wallet),
+                "placeOrder",
                 Some((market_id, &pos_after)),
             )?;
-            if available_after < 0 {
+            if snapshot.available_balance < 0 {
                 let delta =
                     crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
                 if delta > 0 {
@@ -2254,6 +2276,7 @@ fn rest_in_book<H: PerpHost>(
                 // best_ask from the single resolve above (post-match for GTC).
                 record_mid_price_sample_for_best_quote_change(context, market_id, price, best_ask)?;
             }
+            snapshot
         }
         Side::Sell => {
             // commit-only #23 CLONE-FREE probe (mirror of the buy arm).
@@ -2309,18 +2332,19 @@ fn rest_in_book<H: PerpHost>(
 
             // ── Derived-ooIM admission gate (POST-STATE form, lazy delta) ──
             // Mirror of the buy arm: the derivation from the doc's delta predicate, the four-case
-            // table, and ⚠️ why the `Δ > 0` guard (the B1 escape) must survive are all documented
-            // there — read it before touching this.
+            // table, ⚠️ why the `Δ > 0` guard (the B1 escape) must survive, and why this folds the
+            // WIDE scalar set rather than `Σ ooIM` alone are all documented there — read it before
+            // touching this.
             let mut pos_after = pos.clone();
             pos_after.total_sell_qty = new_total_sell_qty;
             pos_after.total_sell_notional = new_total_sell_notional;
-            let available_after = crate::margin_view::derived_available_balance_with(
+            let snapshot = crate::margin_view::index_account_scalars(
                 context,
                 user,
-                Some(wallet),
+                "placeOrder",
                 Some((market_id, &pos_after)),
             )?;
-            if available_after < 0 {
+            if snapshot.available_balance < 0 {
                 let delta =
                     crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
                 if delta > 0 {
@@ -2346,8 +2370,9 @@ fn rest_in_book<H: PerpHost>(
                 // best_bid from the single resolve above (post-match for GTC).
                 record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, price)?;
             }
+            snapshot
         }
-    }
+    };
 
     // Resting only touches the per-side aggregates, so this skips save_position's old-position
     // re-read + `amount` zero-crossing registry hooks (dead work here) and moves the position in
@@ -2368,6 +2393,48 @@ fn rest_in_book<H: PerpHost>(
         }
         .to_log_data(),
     });
+
+    // ── The placement's account after-image ───────────────────────────────────────────────────
+    //
+    // ONE emit site, serving both arms, past every reject and past every write — a rejected
+    // placement returns above and emits nothing, which is the same validate-then-apply reason
+    // `emit_pending_order_placed` is buffered rather than emitted at announce time.
+    //
+    // # Why the gate-time snapshot IS the post-state
+    //
+    // `account_after` was folded BEFORE the writes above, so it is only a legitimate after-image if
+    // nothing between there and here can move one of its inputs. The scalars are a function of
+    // exactly `market.{mark_price, base_decimals, price_decimals, tiers}` and
+    // `pos.{amount, total_buy_notional, total_sell_notional, leverage, margin, v_quote_balance}` per
+    // member market, plus the stored `perp_wallet_balance`, plus the market SET:
+    //
+    // * `pos` for this market — the fold was handed `pos_after`, and `pos_after` is precisely what
+    //   `save_position_reservation_only` just wrote. Equal by construction.
+    // * the market SET — the fold adds this market's term whether or not the index already lists it
+    //   (`fold_account_margin`'s override rule), and the `mutate_*_orders` write above is what adds
+    //   the id to the index. So both sides fold `index ∪ {market_id}`. The apply region can only
+    //   ADD to the index, never remove.
+    // * every OTHER market — untouched: this function writes nothing outside `market_id`.
+    // * the account blob — never written on this path (that is the whole gap this event closes).
+    // * `Market` — the apply region writes the per-account order list, the side's price index, the
+    //   level blob, `best_bid`/`best_ask` and the `PriceBasisWindow`. NONE of those is `Market`.
+    //   In particular `record_mid_price_sample_for_best_quote_change` only appends a mid-price
+    //   OBSERVATION to `PriceBasisWindow`; `mark_price` is written by `run_update_index_price` and
+    //   nowhere else, so no scalar input moved under us.
+    //
+    // # Ordering: after `OrderPlaced` and `OrderRested`
+    //
+    // The placement's domain events say WHAT happened; this says what the account looks like as a
+    // result, so it goes last — an indexer replaying in order has already seen the order that
+    // explains the new `availableBalance`. It is also the position the event will KEEP: the planned
+    // aggregation (`storage::emit_account_balance_changed`) is "one event per user per transaction,
+    // emitted last", so putting this one last needs no reordering later.
+    //
+    // A crossing GTC therefore emits for the taker more than once — the match's own account writes,
+    // then this one. That is the existing, documented multi-emit behaviour (the last event per
+    // (user, tx) is the settled one), pinned by
+    // `tests::a_crossing_gtc_that_rests_emits_the_match_events_then_the_rest_snapshot`.
+    storage::emit_account_balance_changed_from(context, user, account_after)?;
 
     Ok(())
 }
