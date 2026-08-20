@@ -776,7 +776,7 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
     // Signed and unclamped: this is the CROSS wallet exactly as stored. A negative value is a
     // settled receivable (see `types::UserAccount::perp_wallet_balance`), and hiding it behind a
     // `uint64` floor is precisely the blind spot the old `availablePerpBalance` had.
-    let cross = storage::load_account_ref(context, user)?.perp_wallet_balance;
+    let total_cross_wallet_balance = storage::load_account_ref(context, user)?.perp_wallet_balance;
 
     let narrow_u64 = |v: u128, what: &str| {
         u64::try_from(v).map_err(|_| perp_err(format!("{who}: {what} exceeds u64")))
@@ -792,19 +792,19 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
         "total open-order initial margin",
     )?;
     let total_wallet_balance = narrow_i64(
-        cross as i128 + totals.total_position_margin,
+        total_cross_wallet_balance as i128 + totals.total_position_margin,
         "total wallet balance",
     )?;
 
     Ok(AccountMarginScalars {
         total_wallet_balance,
-        total_cross_wallet_balance: cross,
+        total_cross_wallet_balance,
         total_margin_balance: narrow_i64(
             total_wallet_balance as i128 + total_unrealized_profit as i128,
             "total margin balance",
         )?,
         cross_margin_balance: narrow_i64(
-            cross as i128 + total_unrealized_profit as i128,
+            total_cross_wallet_balance as i128 + total_unrealized_profit as i128,
             "cross margin balance",
         )?,
         total_unrealized_profit,
@@ -816,7 +816,7 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
         total_open_order_initial_margin,
         total_maint_margin: narrow_u64(totals.total_maint_margin, "total maintenance margin")?,
         available_balance: narrow_i64(
-            cross as i128 - total_open_order_initial_margin as i128,
+            total_cross_wallet_balance as i128 - total_open_order_initial_margin as i128,
             "available balance",
         )?,
     })
