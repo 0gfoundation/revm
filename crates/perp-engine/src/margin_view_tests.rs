@@ -10,6 +10,12 @@
 //! built for; it is deliberately a first-class test rather than an incidental assertion.
 
 use super::*;
+// Imported explicitly rather than leaning on `use super::*`: the parent's import of this is
+// `#[cfg(debug_assertions)]`-gated (it feeds a debug-only oracle), so inheriting it made this file
+// — and therefore the whole test binary, INCLUDING the golden-commitment test — fail to compile
+// under `--release`. Owning the import here is what lets the commitment be checked in both
+// profiles.
+use crate::math::sum_side_totals;
 use alloy_sol_types::SolCall;
 use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
