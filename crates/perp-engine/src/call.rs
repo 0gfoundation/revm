@@ -98,23 +98,33 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         //
         // ── THE `+20_000` ON EVERY SELECTOR THAT EMITS `AccountBalanceChanged` EXACTLY ONCE ──
         //
-        // `AccountBalanceChanged` carries the whole account-level roll-up, so each emitting write
-        // now folds `margin_view::index_account_scalars` over the user's market index — the SAME unit of
-        // work `getAccount` is priced at 20_000 for (see the note on that selector below). Charging
-        // nothing for it would leave these selectors buying a fold PLUS their writes for what
-        // `getAccount` charges for the fold alone, which is the pricing gap the `getAccount`
-        // re-pricing exists to close — and `transferToPerp(1)` / `transferFromPerp(1)` are freely
-        // spammable, so the brake really would weaken. So: one `getAccount`-equivalent added to each
-        // selector whose emission count is exactly 1.
+        // `AccountBalanceChanged` carries the whole account-level roll-up, so publishing one folds
+        // `margin_view::index_account_scalars` over the user's market index — the SAME unit of work
+        // `getAccount` is priced at 20_000 for (see the note on that selector below). Charging nothing
+        // for it would leave these selectors buying a fold PLUS their writes for what `getAccount`
+        // charges for the fold alone, which is the pricing gap the `getAccount` re-pricing exists to
+        // close — and `transferToPerp(1)` / `transferFromPerp(1)` are freely spammable, so the brake
+        // really would weaken. So: one `getAccount`-equivalent added to each selector whose emission
+        // count is exactly 1.
         //
         // `deposit` 50_000 → 70_000, `withdraw` 50_000 → 70_000, `transferToPerp` and
         // `transferFromPerp` 20_000 → 40_000, `addPositionMargin` / `removePositionMargin` /
-        // `depositInsuranceFund` / `withdrawInsuranceFund` 30_000 → 50_000.
+        // `depositInsuranceFund` / `withdrawInsuranceFund` 30_000 → 50_000, `setLeverage` /
+        // `setLeverageSigned` 20_000 → 40_000.
+        //
+        // The event is now COALESCED — one snapshot per touched user per transaction, drained at the
+        // end of the call (`storage::flush_account_snapshots`) — so "emission count is exactly 1" is
+        // no longer a per-write coincidence but a property of the selector: each of these touches one
+        // account. `addPositionMargin` / `removePositionMargin` in fact went from TWO folds (position
+        // write + account write) to one, so their `+20_000` is now an over-payment rather than an
+        // under-payment; nothing is being clawed back for that.
         //
         // ⚠️ DELIBERATELY NOT RAISED: `placeOrder` / `cancelOrder` (and therefore the batch per-item
         // units, which are defined as those constants so they cannot drift), `liquidate`,
-        // `updateIndexPrice`. Reasons, per selector, are on those entries. FLAT per selector
-        // throughout — dynamic or per-event metering for this precompile was rejected outright.
+        // `updateIndexPrice`. Reasons, per selector, are on those entries — and under coalescing every
+        // one of them emits strictly FEWER events than when the price was last examined, so none of
+        // them moves DOWN either. FLAT per selector throughout — dynamic or per-event metering for
+        // this precompile was rejected outright.
         m.insert(depositCall::SELECTOR, (70_000, false));
         m.insert(withdrawCall::SELECTOR, (70_000, false));
         m.insert(transferToPerpCall::SELECTOR, (40_000, false));
@@ -153,50 +163,40 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(setMarginTiersCall::SELECTOR, (100_000, false));
         m.insert(getMarginTiersCall::SELECTOR, (5_000, true));
         // Leverage
-        m.insert(setLeverageCall::SELECTOR, (20_000, false));
-        m.insert(setLeverageSignedCall::SELECTOR, (20_000, false));
+        //
+        // +20_000 each: `setLeverage` writes the position through `save_position` (a leverage change
+        // rebalances the open-order requirement and moves the initial-margin denominator), so it now
+        // publishes exactly one `AccountBalanceChanged` where it previously published none — it
+        // performs no account write, and the old trigger was the account write alone. That is the
+        // `LeverageChanged` row of `websocket-implementation.md`'s Summary Matrix read the way it is
+        // written: `@account` "No, **unless** margin availability changes", and this changes it.
+        // Priced at the same one-`getAccount`-equivalent rate as the other single-emission selectors.
+        m.insert(setLeverageCall::SELECTOR, (40_000, false));
+        m.insert(setLeverageSignedCall::SELECTOR, (40_000, false));
         // Trading
         //
-        // NOT raised for the `AccountBalanceChanged` roll-up, on purpose:
+        // NOT raised for the `AccountBalanceChanged` roll-up, on purpose — and under the coalesced
+        // trigger both of these now emit STRICTLY FEWER events than the price was set against:
         //
-        // * `cancelOrder` emits NOTHING. A cancel moves no money now that the escrow is gone, so it
-        //   writes no account — `trading/mod.rs` contains no `save_account` / `mutate_account_balance`
-        //   call at all. By inspection, not by omission.
-        // * `placeOrder` DOES emit on a non-crossing placement — `trading::rest_in_book` publishes the
-        //   account after-image, because resting raises `Σ ooIM` and therefore moves
-        //   `availableBalance` even though it writes no account. (The old reason recorded here, "a
-        //   non-crossing placement emits nothing", is dead: it described the gap that emission closed.)
-        //   It is still not raised, and now for a stronger reason — **the marginal cost is zero
-        //   LOADS**:
-        //     · The walk was already there. The rest path's admission gate has always folded the
-        //       user's whole market index; it now folds `margin_view::index_account_scalars` instead
-        //       of `Σ ooIM` alone and takes `availableBalance` out of that same result. Identical
-        //       market set, identical `{market, position}` pair per market, ≤33 `_ref` loads either
-        //       way — already inside the 200_000.
-        //     · What is new is ARITHMETIC: ≤16 markets × (two `checked_add`s + a ≤8-band tier walk +
-        //       six accumulator adds), all on values already in hand. That is verbatim the increment
-        //       `getAccount` took from 5_000 to 20_000 — and that 15_000 was NOT priced off the
-        //       arithmetic, it was priced by PARITY with `getAccountMargin` so `getAccount` could not
-        //       become the cheap way to buy 16 markets of margin math. No such hole exists here:
-        //       nobody buys margin math through a 200_000-gas state-writing selector.
-        //     · So the "+20_000 per emitting selector" rate does not apply. It buys a fold INCLUDING
-        //       its ≤33 loads; here the loads are pre-paid, so it would over-price this by ~4×.
-        //     · The genuinely new resource is ONE log — a LOG2 with ten data words, ≈3_685 gas on
-        //       Ethereum's own schedule, ≈2% of the flat price. This table has never priced a log:
-        //       `OrderPlaced`, `OrderRested`, `OrderCancelled`, and a crossing match's `N + 3`
-        //       `AccountBalanceChanged` are all free. Charging for the resting path's single log while
-        //       the crossing path's N + 3 stay free would be arbitrary.
-        //   A CROSSING placement emits `N + 4` (admin fee credit, N makers, the taker's flush write,
-        //   the taker's debit, and now the rest of the remainder), but each of those folds runs against
-        //   state the match has ALREADY made resident: `MatchRegistry::get_or_load` loaded that user's
-        //   position, account and both order lists, and the walk loaded the `Market` and `MarketHot`.
-        //   The marginal cost per maker is ~1 cold read (their `umkt` index blob) + ~4 warm probes + a
-        //   ≤8-band tier walk, NOT a fresh 33-load fold. And `PLACE_ORDER_GAS` has always been flat
-        //   over an unbounded-in-N match (N settlements, N `Trade` + N `PositionChanged` logs, N
-        //   position + N account writes): the fold is a constant factor on a term this price already
-        //   under-models, and a bump would not fix that structure while it WOULD raise the floor on
-        //   every resting order — the branch that is already the most over-priced. If the flat-vs-N
-        //   mismatch is to be priced, it should be priced as such, not here.
+        // * `cancelOrder` emits NOTHING. A cancel moves no money (no escrow) and no position state —
+        //   it only shrinks `Bid`/`Ask` — so it writes through `save_position_reservation_only`, which
+        //   marks nobody. Binance is measured to push no `ACCOUNT_UPDATE` for a cancel either (R14).
+        // * `placeOrder` emits nothing on a NON-CROSSING placement, for the same reason: resting is an
+        //   aggregates-only write. (Two dead reasons have been recorded here before — "resting moves
+        //   no money and writes no account", then "resting DOES emit, off the gate's own walk". The
+        //   live reason is neither: resting genuinely moves `availableBalance`, and we are silent
+        //   anyway because we are matching a measured venue. See
+        //   `storage::mark_account_snapshot_dirty`.)
+        //   A CROSSING placement emits one snapshot per DISTINCT party — `N + 1` for N makers plus the
+        //   taker, down from `N + 4`, since the taker's flush write, her margin/fee debit and the
+        //   remainder's rest now collapse into one. Each fold still runs against state the match has
+        //   ALREADY made resident (`MatchRegistry::get_or_load` loaded that user's position, account
+        //   and both order lists; the walk loaded the `Market` and `MarketHot`), so the marginal cost
+        //   per maker is ~1 cold read (their `umkt` index blob) + ~4 warm probes + a ≤8-band tier walk,
+        //   NOT a fresh 33-load fold. And `PLACE_ORDER_GAS` has always been flat over an
+        //   unbounded-in-N match (N settlements, N `Trade` + N `PositionChanged` logs, N position + N
+        //   account writes): the fold is a constant factor on a term this price already under-models.
+        //   If the flat-vs-N mismatch is to be priced, it should be priced as such, not here.
         m.insert(placeOrderCall::SELECTOR, (PLACE_ORDER_GAS, false));
         m.insert(cancelOrderCall::SELECTOR, (CANCEL_ORDER_GAS, false));
         // Batch place / cancel: floor only — see the doc comment on SELECTORS.
@@ -225,8 +225,10 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(removePositionMarginCall::SELECTOR, (50_000, false));
         // Liquidation
         //
-        // NOT raised: a liquidation emits up to `3 + 2 × adl_fills` roll-ups (residual, clearance
-        // fee, each ADL leg), but it is protocol-driven risk work whose flat price already spans an
+        // NOT raised: a liquidation emits one roll-up per DISTINCT address it touches (the liquidated
+        // user, each maker it closes against, each ADL counterparty) — down from up to
+        // `3 + 2 × adl_fills`, since the liquidated user's residual, clearance fee and every ADL leg
+        // now collapse into one. It is protocol-driven risk work whose flat price already spans an
         // orderbook close plus an unbounded ADL loop bounded only by `adl_budget` — the same
         // flat-vs-unbounded structure as `placeOrder`, and this change does not move it.
         m.insert(liquidateCall::SELECTOR, (150_000, false));
@@ -254,10 +256,11 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getInsuranceFundCall::SELECTOR, (5_000, true));
         // Index price
         //
-        // NOT raised: the in-process liquidation sweep here can emit many roll-ups (up to the
-        // cap-50 sweep × per-liquidation events), and this selector was ALREADY the largest
-        // flat-price-vs-work gap in the table for exactly that reason. It is oracle/admin-only, not
-        // user-spammable, and pricing the sweep is a separate decision from this event.
+        // NOT raised: the in-process liquidation sweep here can emit many roll-ups (one per distinct
+        // address across a cap-50 sweep, down from cap-50 × per-liquidation events), and this selector
+        // was ALREADY the largest flat-price-vs-work gap in the table for exactly that reason. It is
+        // oracle/admin-only, not user-spammable, and pricing the sweep is a separate decision from
+        // this event.
         m.insert(updateIndexPriceCall::SELECTOR, (50_000, false));
         m.insert(getIndexPriceCall::SELECTOR, (5_000, true));
         m.insert(getFundingStateCall::SELECTOR, (5_000, true));
@@ -355,6 +358,12 @@ pub fn run_perp_dex_call<H: PerpHost>(
     // before dispatch. A call that ends REVERTED must not have written the overlay
     // (validate-then-apply); if it did, undo is gone and the write leaked. Diagnostic only.
     let writes_before = context.perp_write_count();
+
+    // Open the call for `AccountBalanceChanged` coalescing: drop any marks a PREVIOUS call left
+    // un-drained (it reverted, so it published nothing — see `storage::flush_account_snapshots`).
+    // This has to be here and not at a tx/block boundary: the set lives in the live typed store,
+    // which the journal keeps for the whole BLOCK.
+    crate::storage::begin_perp_call(context);
 
     // Dispatch — note: no `?` here; errors are caught below and converted to
     // clean REVERT output so ethers.js can read `e.reason`.
@@ -464,12 +473,29 @@ pub fn run_perp_dex_call<H: PerpHost>(
         _ => Err(PerpError::Fatal("perpdex: selector dispatch mismatch".into())),
     };
 
+    // ── The coalesced account snapshots: one per touched user, in address order, LAST ──
+    //
+    // SUCCESS PATH ONLY, and this is the whole reason it sits between the dispatch and the output:
+    // a reverted call must publish nothing (its perp writes are validate-then-apply, so there is
+    // nothing to report), and a snapshot taken after the dispatch is a settled account state rather
+    // than one of the half-updated intermediates the old per-write emission produced. TOP-LEVEL by
+    // construction — the depth gate above rejects `> 1`, so this entry point cannot be nested and no
+    // inner call can drain early; the liquidation sweep and the batch drivers are plain calls in this
+    // same frame and coalesce into this drain. See `storage::flush_account_snapshots`.
+    //
+    // A drain failure is folded back into `result` so it takes the same clean-revert path a dispatch
+    // error takes (and trips the same `perp_write_count` witness). Only a pathological account can
+    // get there — the same exposure the write-site emission had.
+    let result = result.and_then(|bytes| {
+        crate::storage::flush_account_snapshots(context)?;
+        Ok(bytes)
+    });
+
     match result {
         Ok(bytes) => {
-            // `AccountBalanceChanged` is emitted at each account write (see
-            // `storage::emit_account_balance_changed`), so there is nothing to flush here. Those
-            // events are FREE — the call is charged only `charged_gas` (the flat per-selector cost,
-            // or `BASE_BATCH_GAS + N * unit` for a batch selector).
+            // The snapshots are FREE — the call is charged only `charged_gas` (the flat per-selector
+            // cost, or `BASE_BATCH_GAS + N * unit` for a batch selector). Never per event, never
+            // dynamic: per-event metering for this precompile was rejected outright.
             Ok(PerpOutput::new(charged_gas, bytes))
         }
         // Fatal + shell errors propagate as-is (halt / precompile-level error, never a revert).

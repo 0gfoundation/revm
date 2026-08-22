@@ -787,13 +787,22 @@ pub struct AccountMarginScalars {
 ///
 /// # `override_market` — pricing the state a caller is ABOUT to write
 ///
-/// Substitutes an IN-MEMORY position for one market id, so the placement gate can fold the
-/// hypothetical post-placement account WITHOUT touching storage. Semantics are **verbatim**
-/// [`total_open_order_initial_margin`]'s, including the case that matters most here: when the
-/// overridden id is not yet in the market set — a user ENTERING a market, whose index entry is only
-/// written at save time — its term is appended anyway, and a market id that names no market
-/// contributes nothing. Every other market's term is read from storage exactly as without the
-/// override, which is what makes the two forms comparable within one call.
+/// Substitutes an IN-MEMORY position for one market id, so a gate can fold the hypothetical
+/// post-write account WITHOUT touching storage. Semantics are **verbatim**
+/// [`total_open_order_initial_margin`]'s, including the case that matters most: when the overridden
+/// id is not yet in the market set — a user ENTERING a market, whose index entry is only written at
+/// save time — its term is appended anyway, and a market id that names no market contributes
+/// nothing. Every other market's term is read from storage exactly as without the override, which is
+/// what makes the two forms comparable within one call.
+///
+/// ⚠️ **No live caller passes `Some` here today.** The placement gate takes the LEAN
+/// [`derived_available_balance_with`] (whose own override, on
+/// [`total_open_order_initial_margin`], IS live), and the `AccountBalanceChanged` drain folds the
+/// SETTLED store, so it passes `None`. Kept because it is the one form in which this fold can price
+/// an unwritten state, it costs a matched `None` on the live paths, and its
+/// entering-a-new-market rule is the subtle half of the pair `derived_available_balance_with`
+/// relies on — the two must stay semantically identical, and the `debug_assertions` check in
+/// [`index_account_scalars`] is what compares them.
 pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
     context: &mut H,
     user: Address,
@@ -1023,14 +1032,14 @@ pub fn run_get_account_margin<H: PerpHost>(
 /// MARKET INDEX — so every total is COMPLETE by construction.
 ///
 /// **This is the single producer for BOTH published surfaces**: the `getAccount(address)` return
-/// ([`crate::account::run_get_account`]) and the `AccountBalanceChanged` after-image
-/// (`storage::emit_account_balance_changed`). Neither holds arithmetic of its own — each takes
+/// ([`crate::account::run_get_account`]) and the `AccountBalanceChanged` snapshot
+/// (`storage::emit_account_snapshot`). Neither holds arithmetic of its own — each takes
 /// this struct and encodes a subset of it — so the event and the view cannot report different
 /// numbers for the same state. That equality is pinned by
 /// `margin_view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state`,
-/// `trading::tests::matched_call_emits_a_balance_event_at_each_balance_moving_write` and
-/// `trading::tests::a_resting_placement_emits_one_event_equal_to_get_account`, and by the
-/// `debug_assertions` gate-agreement check inside [`index_account_scalars`] itself.
+/// `trading::tests::matched_call_emits_one_settled_snapshot_per_party_in_address_order` and
+/// `trading::tests::account_snapshot_events::a_crossing_fill_publishes_one_snapshot_per_user_last`,
+/// and by the `debug_assertions` gate-agreement check inside [`index_account_scalars`] itself.
 #[derive(Clone, Debug)]
 pub struct IndexAccountView {
     /// The market ids folded — the per-user index (`umkt`) verbatim, echoed so a caller can
@@ -1056,14 +1065,10 @@ pub struct IndexAccountView {
 /// aggregates now sit in the position blob. Bounded by `MAX_USER_MARKETS` (16) ⇒ ≤ 33 `_ref` loads,
 /// flat.
 ///
-/// # `override_market` — the ONE walk of the placement path
-///
-/// `trading::rest_in_book` calls this with the hypothetical post-placement position, so that the
-/// walk its admission gate has to do anyway ALSO produces the event's after-image: it takes
-/// `available_balance` from the returned scalars as its gate, and carries the rest to the emit at
-/// the end of the call. See the note there for why the gate-time snapshot is provably the
-/// post-write state (every scalar input is either the overridden position or something the apply
-/// region does not write).
+/// Both live callers pass `override_market: None` — `getAccount` and the end-of-call
+/// `AccountBalanceChanged` drain (`storage::flush_account_snapshots`) both fold the SETTLED store,
+/// which is what makes the two surfaces trivially equal. See [`fold_account_margin`] for what the
+/// override means and why it is kept.
 pub fn index_account_scalars<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -1087,9 +1092,10 @@ pub fn index_account_scalars<H: PerpHost>(
     // market set. They share `position_open_order_margin` per market but fold in two places: this
     // wide fold, and `total_open_order_initial_margin`, which the taker gates / `rest_is_affordable`
     // / `finalize_compute` still use because they want only `available` and would otherwise pay for
-    // five accumulators they discard. Pin the agreement here rather than trusting it, on EVERY
-    // produced snapshot — which now includes every emitted event AND `rest_in_book`'s gate, override
-    // and all. Compiled out in release, so the second walk costs production nothing.
+    // five accumulators they discard. `rest_in_book`'s placement gate is one of those lean callers,
+    // so this is the check that keeps the number IT enforces equal to the number `getAccount` and
+    // `AccountBalanceChanged` report. Pinned on EVERY produced snapshot rather than trusted.
+    // Compiled out in release, so the second walk costs production nothing.
     #[cfg(debug_assertions)]
     {
         let gate = derived_available_balance_with(context, user, None, override_market)?;

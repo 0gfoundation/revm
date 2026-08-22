@@ -1286,7 +1286,12 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
     // no money at all. It only shrinks `Σ ooIM`, i.e. frees AVAILABLE, not balance.
     let mut pos = storage::load_position(context, user, market_id)?;
     pos.clear_side_aggregates();
-    storage::save_position(context, user, market_id, &pos)?;
+    // Aggregates-only (`pos.amount` untouched), so the reservation-only route: it skips
+    // `save_position`'s dead `amount` zero-crossing hooks and, per
+    // `storage::mark_account_snapshot_dirty`, does not by itself mark the user for an
+    // `AccountBalanceChanged` snapshot — cancelling publishes nothing. The liquidation that calls
+    // this marks the user anyway, at its own position and wallet writes.
+    storage::save_position_reservation_only(context, user, market_id, pos)?;
 
     Ok(())
 }

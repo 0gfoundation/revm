@@ -736,15 +736,18 @@ sol! {
         ///   availableBalance            cross − totalOpenOrderInitialMargin: what the engine's own
         ///                               admission gates will actually let the user spend.
         ///
-        /// ⚠️ WRITE GRANULARITY: this fires at each balance-moving account WRITE, with no
-        /// de-duplication and no change detection, while the totals above are ACCOUNT-level. So in a
-        /// call that touches several of one user's markets (a match, a liquidation), only the LAST
-        /// event for that user is a consistent account state; the earlier ones are honest
-        /// after-images of a half-updated account — the wallet leg has landed, a position or
-        /// order-list leg of the same call may not have. Consumers that need a settled account state
-        /// must take the last event per (user, transaction), or poll `getAccount`. This is the
-        /// existing documented design of the event (see `storage::emit_account_balance_changed`);
-        /// aggregating to one event per user per transaction is a planned follow-up.
+        /// GRANULARITY: **exactly one per affected user per transaction, emitted last**, in ascending
+        /// address order. Every published payload is therefore a SETTLED account state — the totals
+        /// are account-level, and draining after the call has finished is what keeps a half-updated
+        /// one (wallet leg landed, position leg not yet) out of the stream.
+        ///
+        /// ⚠️ TRIGGER: a user is included only if the transaction moved that user's WALLET or a
+        /// POSITION's stored state. A pure placement and a pure cancel publish NOTHING, even though
+        /// they move `availableBalance` through `Σ openOrderInitialMargin` — so a consumer tracking
+        /// `availableBalance` from this stream alone will be stale between fills, and must poll
+        /// `getAccount`. That is deliberate Binance parity (measured: no `ACCOUNT_UPDATE` for an
+        /// unfilled or cancelled order); the full citation is on
+        /// `storage::mark_account_snapshot_dirty`, which is where the filter lives.
         event AccountBalanceChanged(
             address indexed user,
             uint256 usdcBalance,

@@ -175,6 +175,27 @@ pub struct TypedPerpStore {
     /// Batch single-initiator working-set — `Some` only between [`Self::begin_batch`] and
     /// [`Self::flush_batch`] (i.e. for the duration of one batch call). See [`BatchWorkingSet`].
     batch: Option<BatchWorkingSet>,
+    /// Users whose wallet or position state a write moved during the CURRENT perp call — the
+    /// coalescing set behind the one-`AccountBalanceChanged`-per-user-per-transaction rule. Drained
+    /// by the call shell on its success path (`perp_engine::storage::flush_account_snapshots`).
+    ///
+    /// ⚠️ **CALL-scoped, in a struct whose every OTHER field is BLOCK-scoped.** This store lives in
+    /// `JournalInner.perp_live` for the whole block: `commit_tx` / `discard_tx` / `finalize` only
+    /// `reset_tx_dirty()`, the sub-maps and the dirty set survive to the end-of-block
+    /// [`Self::take_delta`] harvest. A set left behind here would therefore be re-drained by the NEXT
+    /// transaction and publish snapshots for a different transaction's users. Its call scope comes
+    /// from [`Self::begin_call`], which the shell runs before every dispatch — NOT from the journal's
+    /// tx/block boundaries, which never touch it. The precedent is `batch` above: also call-scoped,
+    /// also lifecycle-managed by an explicit begin/flush pair rather than by the journal.
+    ///
+    /// A `BTreeSet` rather than a `HashSet` so the drain order is ascending ADDRESS order
+    /// structurally — hash-map iteration order would make the log stream (and therefore every
+    /// node's receipts) non-deterministic.
+    ///
+    /// Deliberately NOT routed through [`Self::mark`]: it is not a storage key. It enters no dirty
+    /// entry, bumps no `write_count`, and sets no `tx_dirty`, so it cannot reach the block delta or
+    /// the commitment.
+    touched_accounts: std::collections::BTreeSet<Address>,
 }
 
 impl TypedPerpStore {
@@ -1135,6 +1156,33 @@ impl TypedPerpStore {
                 );
             }
         }
+    }
+
+    // ── Per-call account-snapshot coalescing set ───────────────────────────────
+    /// Opens a perp call: drops any residue in [`Self::touched_accounts`].
+    ///
+    /// This is the ONLY thing that gives that set its call scope, and it has to run on ENTRY rather
+    /// than on exit: a call that ends in a clean revert (or a `Fatal`) leaves its marks behind
+    /// un-drained by design — nothing is published for a reverted call — and the next call must not
+    /// inherit them. Resetting here covers every exit path of every previous call, including ones
+    /// that do not exist yet.
+    #[inline]
+    pub fn begin_call(&mut self) {
+        self.touched_accounts.clear();
+    }
+
+    /// Marks `user` as owing one account snapshot at the end of the current call. Idempotent — the
+    /// Nth write for the same user costs one `BTreeSet` probe and publishes nothing extra.
+    #[inline]
+    pub fn mark_account_touched(&mut self, user: Address) {
+        self.touched_accounts.insert(user);
+    }
+
+    /// Takes the call's touched set, leaving it empty. Iterating the result yields **ascending
+    /// address order** (`BTreeSet`), which is the drain order the log stream commits to.
+    #[inline]
+    pub fn take_touched_accounts(&mut self) -> std::collections::BTreeSet<Address> {
+        core::mem::take(&mut self.touched_accounts)
     }
 
     /// Number of keys written this block (dirty-set size). Diagnostic / test hook.

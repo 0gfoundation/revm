@@ -1349,7 +1349,7 @@ fn get_account_totals_equal_the_sum_of_per_market_get_margin_info() {
 /// must agree on all ten fields with no reasoning about intermediate snapshots at all.
 ///
 /// A zero-delta write is not a path the engine takes; it is the cleanest way to isolate the
-/// PRODUCER. `trading::tests::matched_call_emits_a_balance_event_at_each_balance_moving_write`
+/// PRODUCER. `trading::tests::matched_call_emits_one_settled_snapshot_per_party_in_address_order`
 /// covers the same agreement on a real money-moving call.
 #[test]
 fn the_event_and_get_account_agree_field_for_field_on_the_same_state() {
@@ -1384,11 +1384,14 @@ fn the_event_and_get_account_agree_field_for_field_on_the_same_state() {
     );
     set_position(&mut ctx, ALICE, MARKET_B, -3, 300, 200, 1);
 
-    // A write that moves nothing: the after-image is the state as it stands.
+    // A write that moves nothing: the snapshot is the state as it stands. Driven directly (no
+    // shell), so the call boundary — which is what drains the coalescing set — is explicit.
     let _ = JournalTr::take_logs(ctx.journal_mut());
+    storage::begin_perp_call(&mut ctx);
     storage::mutate_account_balance(&mut ctx, ALICE, |a| a.credit_perp(0))
         .unwrap()
         .unwrap();
+    storage::flush_account_snapshots(&mut ctx).unwrap();
     let events = JournalTr::take_logs(ctx.journal_mut())
         .into_iter()
         .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
@@ -1683,23 +1686,26 @@ fn the_views_write_nothing() {
 
     // ── ...AND the same fold reached from the EVENT path adds no key either ───────────────────
     //
-    // `AccountBalanceChanged` now carries this whole roll-up, so `index_account_scalars` runs on
-    // every write that moves a published field — every balance-moving account write, and every order
-    // that RESTS (`trading::rest_in_book`, whose admission gate does the fold anyway). If any loader it reaches were not a `_ref`/cache-fill reader it
-    // would dirty extra keys, and the perp block commitment — whose input is exactly the block's net
-    // key→value delta (`perp_core::compute_block_commitment`) — would move for a reason that has
-    // nothing to do with what the call actually changed. This is the mechanical confirmation that the
-    // golden commitment cannot shift because of the event: the WRITE contributes its one account key
-    // (counted here), the fold behind the log contributes none, and log data is EVM-journaled and
-    // never enters the perp delta at all.
+    // `AccountBalanceChanged` carries this whole roll-up, so `index_account_scalars` runs once per
+    // touched user at the end-of-call drain. If any loader it reaches were not a `_ref`/cache-fill
+    // reader it would dirty extra keys, and the perp block commitment — whose input is exactly the
+    // block's net key→value delta (`perp_core::compute_block_commitment`) — would move for a reason
+    // that has nothing to do with what the call actually changed. This is the mechanical confirmation
+    // that the golden commitment cannot shift because of the event: the WRITE contributes its one
+    // account key (counted here), the fold behind the log contributes none, the coalescing set is not
+    // a storage key at all (it never reaches `TypedPerpStore::mark`), and log data is EVM-journaled
+    // and never enters the perp delta.
     let before_write = PerpHost::perp_write_count(&ctx);
+    storage::begin_perp_call(&mut ctx);
     storage::mutate_account_balance(&mut ctx, ALICE, |a| a.credit_perp(1))
         .unwrap()
         .unwrap();
+    storage::flush_account_snapshots(&mut ctx).unwrap();
     assert_eq!(
         PerpHost::perp_write_count(&ctx),
         before_write + 1,
-        "the account write dirties exactly ONE key; the event's Σ-over-markets fold behind it adds \
-         none. More than one here means a loader on the emit path stopped being a `_ref` reader."
+        "the account write dirties exactly ONE key; the mark it leaves and the Σ-over-markets fold \
+         at the drain add none. More than one here means a loader on the emit path stopped being a \
+         `_ref` reader, or the touched-set started going through `mark`."
     );
 }

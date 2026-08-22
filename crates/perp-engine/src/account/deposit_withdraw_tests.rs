@@ -314,9 +314,12 @@ fn get_account_on_a_bare_account_reports_a_negative_cross_wallet_unclamped() {
     let mut ctx = make_ctx(U256::ZERO);
     let mut account = storage::load_account(&mut ctx, ALICE).unwrap();
     account.perp_wallet_balance = -1_000_000;
-    // This write EMITS, and the emission itself folds the (empty) index — so an empty index that
-    // reverted would take the write down with it.
+    // This write MARKS, and the end-of-call drain folds the (empty) index — so an empty index that
+    // reverted would take the call down with it. Driven directly here (no shell), so the call
+    // boundary is explicit.
+    storage::begin_perp_call(&mut ctx);
     storage::save_account(&mut ctx, ALICE, account).unwrap();
+    storage::flush_account_snapshots(&mut ctx).unwrap();
 
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
     let a = getAccountCall::abi_decode_returns(&ret).unwrap();

@@ -349,132 +349,141 @@ pub fn load_account_ref<H: PerpHost>(
         .unwrap_or_else(|| std::sync::Arc::new(UserAccount::default())))
 }
 
-/// Emits `AccountBalanceChanged` for `user` right here, at the write site — **after** the write, so
-/// the event is a true after-image of everything the store now holds.
+/// ── THE `AccountBalanceChanged` TRIGGER: WHICH WRITE HAPPENED, ONCE PER USER PER TRANSACTION ──
 ///
-/// One event per balance-moving write, emitted by the write site itself — no de-duplication, no
-/// coalescing, no call-scoped state, and no change DETECTION: the caller picks the emitting entry
-/// point ([`save_account`], [`mutate_account_balance`]) precisely because it knows it moved money.
-/// Writes that cannot move a balance (the per-placement nonce bump, fee-rate updates) go through the
-/// silent [`mutate_account`] and emit nothing.
+/// Marks `user` as owing ONE account snapshot, published at the end of the top-level call by
+/// [`flush_account_snapshots`]. Nothing is logged here.
 ///
-/// ⚠️ "Balance-moving write" is not the whole trigger set any more, because it never described what
-/// the event actually reports. The payload includes `availableBalance` = `cross − Σ ooIM`, and
-/// **resting an order moves `Σ ooIM` while writing no account at all** — so `trading::rest_in_book`
-/// emits too, through [`emit_account_balance_changed_from`], off the walk its own admission gate
-/// already does. The rule is therefore "one event per write that moves a PUBLISHED FIELD", and the
-/// published fields include a derived one.
-/// It replaces the former call-scoped after-image tracker (a `BTreeMap` baseline per touched
-/// account, drained and re-read at the end of the top-level call to emit one coalesced event per
-/// user). That machinery cost, per account write, a pre-write account read plus two
-/// after-image constructions — each cloning the decimal `usdc_balance` String and
-/// parsing it to `U256` — plus a third construction at drain time, to suppress events that a
-/// consumer can just as easily ignore. Emitting directly is one construction, no baseline read, no
-/// map, and no drain.
+/// # The trigger set (strict Binance alignment — choice A)
 ///
-/// Consequences (intended): the same account can now produce several events within one call (e.g.
-/// each maker fill it takes part in), an account whose balance nets back to its starting value still
-/// reports the intermediate writes, and events appear interleaved with `Trade`/`PositionChanged` in
-/// write order rather than appended in address order at the end of the call.
+/// A user is marked at, and only at, a write that **moved the wallet or a position's stored state**:
 ///
-/// # What it costs, and why it is NOT free any more
+/// | write | marks | why |
+/// |---|---|---|
+/// | [`save_account`] | ✅ | the wallet moved |
+/// | [`mutate_account_balance`] | ✅ | the wallet moved (`credit_perp` / `debit_perp`) |
+/// | [`save_position`] | ✅ | position state moved (`amount`, `v_quote_balance`, `margin`, `leverage`) |
+/// | [`save_position_reservation_only`] | ❌ | per-side AGGREGATES only — `Bid`/`Ask`, i.e. `Σ ooIM` |
+/// | [`mutate_account`] | ❌ | nonce bump / fee-rate update; provably cannot move a balance |
 ///
-/// The event carries the whole account-level scalar set (`totalWalletBalance`, `Σ IM/PIM/ooIM/MM`,
-/// `Σ uPnL`, `availableBalance`), which only exists as a fold over the user's market index. So this
-/// pays one [`crate::margin_view::index_account_scalars`] walk per emission: ≤ `MAX_USER_MARKETS`
-/// (16) markets × 2 `_ref` loads (`{market, position}` — flat, no shape-dependent worst case since
-/// the R12 freeze put both side aggregates in the position blob), i.e. ≤ 33 loads, all cache-fill and
-/// none entering the block delta. The realistic single-market case is 3 loads (index + market +
-/// position).
+/// The last two lines are the whole point: **a pure placement and a pure cancel publish NOTHING.**
+/// Resting and cancelling touch only `total_buy/sell_{qty,notional}`, and both routes for that go
+/// through `save_position_reservation_only`.
 ///
-/// Gas stays FLAT PER SELECTOR — never per event, never dynamic. The eight selectors that emit
-/// exactly one of these were each raised by one `getAccount`-equivalent (20_000) to pay for the
-/// fold; `placeOrder`/`cancelOrder`/`liquidate`/`updateIndexPrice` deliberately were not. The
-/// per-selector reasoning is on the `SELECTORS` table in [`crate::call`].
+/// ## Why silence is right, and why this is the THIRD time the decision moved
 ///
-/// ## Where the walk IS reused from a gate walk, and where it is not
+/// It is not that nothing observable changed — `availableBalance` = `cross − Σ ooIM` really does
+/// move when an order rests or is cancelled. It is that we are matching a measured venue:
 ///
-/// Several of the emitting call paths evaluate `derived_available_balance` nearby (the taker debit,
-/// `transferFromPerp`, `addPositionMargin`, `depositInsuranceFund`), and handing that result to the
-/// event is only sound where the gate's walk is over the POST state:
+/// * **R14, Binance mainnet, 2026-08-21** (`misc/evidence/binance-run14-user-stream.json`, 18
+///   frames): a pure placement pushes **only** `ORDER_TRADE_UPDATE x=NEW`, with **no**
+///   `ACCOUNT_UPDATE`; a pure cancel pushes only `x=CANCELED`, again with no `ACCOUNT_UPDATE`. A
+///   market fill pushes two `ORDER_TRADE_UPDATE` frames plus exactly one `ACCOUNT_UPDATE(m=ORDER)`.
+/// * **The official docs, verbatim**: *"Unfilled orders or cancelled orders will not make the event
+///   `ACCOUNT_UPDATE` pushed, since there's no change on positions."*
+/// * **Mechanically**, Binance's payload carries `B[].{wb,cw,bc}` and `P[]` — a wallet and a position
+///   array. A placement moves neither, which is exactly the condition this table encodes.
+/// * `engineering/indexer/websocket-implementation.md`'s **Summary Matrix** (updated to those
+///   measurements in docs `3067a82`) therefore reads `OrderPlaced` / `OrderRested` /
+///   `OrderCancelled` → `@account`: **No**. Its older per-event mapping table, written the day
+///   before and not revisited, still says "Yes if `availableBalance` changes"; the matrix is the
+///   newer, measurement-backed side.
 ///
-/// * **`trading::rest_in_book` — REUSED.** Its gate is the one that already prices the post state:
-///   it walks the index with `override_market = pos_after`, i.e. the exact position it is about to
-///   write. Widening that walk from `Σ ooIM` to the full scalar set costs **no extra loads** (same
-///   `{market, position}` per market; the tier table already rides in the loaded `Market`) — only
-///   arithmetic — and it is the ONLY walk on the resting path, so the event is free of a second one.
-///   That reuse is what makes the placement emit at all: the rest path writes no account, so under
-///   the "emit at the account write" rule it emitted nothing even though `availableBalance` moved.
-/// * **Every other emitter — NOT reused.** Their gate walks run BEFORE the write (they are admission
-///   gates on a state that then changes), so reusing one means patching its result by the write's own
-///   delta — a second, per-site route to the nine published numbers, which is exactly the divergence
-///   risk the single producer exists to remove.
+/// The accepted cost: between fills, a stream-only consumer's `availableBalance` goes STALE, because
+/// the `Σ ooIM` term moves with no event. `getAccount` remains the source of truth for it. That is
+/// the owner's decision, and it is deliberate — do not "fix" it by emitting on the rest/cancel path
+/// again. This is the third flip (silent → emitting in `7019fadd` → silent here), which is why the
+/// citation lives in the code next to the filter rather than in a commit message.
 ///
-/// The O(N) term is the maker flush, which has no post-state gate walk to reuse under any variant
-/// (M1 gates makers on the raw cross wallet, not the derived available), so no further reuse scheme
-/// moves the number that matters. Aggregation does — see below.
+/// ## Derived from WHICH WRITE, never from comparing values
 ///
-/// # 🔜 WHERE THE PLANNED AGGREGATION HOOKS
+/// There is no before/after comparison anywhere on this path, and there must not be. A value-diff
+/// baseline is precisely the machinery that was deleted for cost: a per-account `BTreeMap` of
+/// pre-images plus a `PublicAccountBalance` construction per side, each cloning the decimal
+/// `usdc_balance` String and parsing it to `U256`, to suppress events a consumer can ignore. The
+/// caller always knows which of the five entry points above it chose, so the trigger is free: one
+/// `BTreeSet` probe. Emitting for a write whose net effect happened to be zero is the fail-safe
+/// direction — a redundant snapshot is harmless, a missing one is not.
 ///
-/// The follow-up is **one event per user per TRANSACTION, emitted last** — which is also the only
-/// version whose numbers are always a consistent account state (see the ⚠️ on the ABI event). It
-/// hooks HERE and nowhere else: this function stops logging and instead records `user` in a
-/// call-scoped touched-set (the natural home is `TypedPerpStore`, which is already call-scoped and
-/// already keyed by `Address`), and `call::run_perp_dex_call` drains that set on the SUCCESS path
-/// only — after the dispatch returns Ok, before the gas is reported — emitting one
-/// `index_account_scalars` per distinct user in address order. Nothing else moves: the event shape is
-/// already an account-level snapshot rather than a per-write delta, precisely so that collapsing N
-/// emissions to 1 changes only WHEN it fires.
+/// # Coalescing: one event per user per transaction, emitted last
 ///
-/// What it would save, measured in walks. A taker match against N makers emits
-/// **N + 3** events today, one walk each:
+/// Rule #2 of `websocket-implementation.md`'s **Transaction-Level Coalescing**: *"Coalesce account
+/// updates to one final snapshot per affected user per transaction."* Marks accumulate in the
+/// call-scoped `TypedPerpStore::touched_accounts`; the shell drains them once, in ascending address
+/// order, after the dispatch returns `Ok`.
+///
+/// Three properties follow, and each is a requirement rather than a side effect:
+///
+/// * **Every published snapshot is a SETTLED account state.** The old write-site emission published
+///   intermediates — a taker's first event reported the funded position silo before her wallet had
+///   paid for it, so `totalWalletBalance = cross + Σ positionMargin` double-counted `total_required`.
+///   Draining after the dispatch means there is no half-updated state left to observe.
+/// * **A reverted call publishes nothing**, because the drain is on the success arm only.
+/// * **Deterministic order**, because the set is a `BTreeSet<Address>` and not a hash map.
+///
+/// What it saves, in walks. Each published snapshot costs one
+/// [`crate::margin_view::index_account_scalars`] fold: ≤ `MAX_USER_MARKETS` (16) markets × 2 `_ref`
+/// loads (`{market, position}` — flat, no shape-dependent worst case since the R12 freeze put both
+/// side aggregates in the position blob) ⇒ ≤ 33 loads, all cache-fill, none entering the block delta.
+/// Against the per-write emission this removes:
 ///
 /// ```text
-///   1   admin fee credit            (MatchRegistry::flush, admin_credit_pending)
-///   N   maker accounts              (the flush's per-user save_position + save_account loop)
-///   1   the TAKER's account         (same loop — the taker is a registry member too)
-///   1   the taker's margin+fee debit (finalize_apply → mutate_account_balance)
+///   placement / cancel        1 → 0    (the trigger filter, above)
+///   taker in an N-maker match N+3 → N+1  (the taker emitted at the flush AND at her debit;
+///                                         the makers are distinct users, so they do not collapse)
+///   one liquidation           3 + adl_budget → 1 for the liquidated address
+///   a K-item batch            up to K → 1 for the initiator (K ≤ MAX_BATCH_PLACE = 64)
 /// ```
 ///
-/// Pinned by `trading::tests::matched_call_emits_a_balance_event_at_each_balance_moving_write`
-/// (N = 1 ⇒ `[ADMIN, BOB, ALICE, ALICE]`, four events). N is bounded by book depth and gas; the
-/// registry's own ceiling is `MAX_LIQUIDATION_MAKER_ACCOUNTS` = 128 on the liquidation path, so the
-/// worst case is ~131 walks ≈ 8 500 loads, and the realistic single-market case is ~4 walks ≈ 12
-/// loads for N = 1.
-///
-/// Aggregation makes it **one walk per DISTINCT user**, so it does NOT help the maker side (all
-/// parties distinct ⇒ still N + 2). What it removes is the REPEAT emitters:
-/// * the TAKER, which appears twice above (flush + debit) ⇒ N + 3 → N + 2 for every match;
-/// * a liquidation, which emits for the same user at the residual, the clearance fee, and each ADL
-///   leg (up to 3 + `adl_budget` walks for one address collapsing to 1);
-/// * a batch of K items, which emits up to K times for the SAME initiator ⇒ K → 1, i.e. −(K−1)
-///   walks, up to −63 walks ≈ −4 000 loads at `MAX_BATCH_PLACE` = 64.
-///
-/// It also removes every intermediate half-updated snapshot from the stream, which is the
-/// correctness reason to do it and the bigger prize.
-fn emit_account_balance_changed<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-) -> Result<(), PerpError> {
-    let scalars =
-        crate::margin_view::index_account_scalars(context, user, "AccountBalanceChanged", None)?;
-    emit_account_balance_changed_from(context, user, scalars)
+/// Gas stays FLAT PER SELECTOR — never per event, never dynamic. The per-selector reasoning is on
+/// the `SELECTORS` table in [`crate::call`].
+#[inline]
+fn mark_account_snapshot_dirty<H: PerpHost>(context: &mut H, user: Address) {
+    typed_store_mut(context).mark_account_touched(user);
 }
 
-/// [`emit_account_balance_changed`] from an ALREADY-FOLDED scalar set — **the one and only site that
-/// constructs this log.**
+/// Opens a perp call: drops any un-drained marks from a previous call. See
+/// [`crate::typed_store::TypedPerpStore::begin_call`] — the set is CALL-scoped inside a store that is
+/// otherwise BLOCK-scoped, and this is what makes it so.
+pub fn begin_perp_call<H: PerpHost>(context: &mut H) {
+    typed_store_mut(context).begin_call();
+}
+
+/// Publishes one `AccountBalanceChanged` per user marked by [`mark_account_snapshot_dirty`] during
+/// this call, in **ascending address order**, and clears the set.
 ///
-/// It exists for the caller that has already paid for the walk: `trading::rest_in_book` folds
-/// [`crate::margin_view::index_account_scalars`] for its admission gate and hands the very same
-/// struct here, so the placement's after-image is the gate's own arithmetic rather than a second
-/// walk (and, more to the point, not a second *implementation*). The spot USDC balance is the one
-/// field not in the scalar set, and it is read here rather than plumbed through the caller so that a
-/// rejected placement never pays for the decimal-String clone and `U256` parse.
-pub(crate) fn emit_account_balance_changed_from<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    s: crate::margin_view::AccountMarginScalars,
-) -> Result<(), PerpError> {
+/// Called by `call::run_perp_dex_call` on the SUCCESS path only, after the dispatch returns `Ok` —
+/// so every snapshot is a settled post-transaction state and a reverted call publishes nothing.
+/// Top-level by construction: the shell rejects `call_depth() > 1` (commit-only #23, EOA-direct
+/// only), so it cannot be re-entered and there is no inner call that could drain early. The
+/// liquidation sweep inside `updateIndexPrice`, and the batch drivers, are plain function calls in
+/// this same frame — their marks coalesce into this one drain, which is exactly the intent.
+///
+/// Failure mode, unchanged from the write-site emission: the fold has narrowing guards (each `Σ` must
+/// fit its ABI width), so a pathological account — every such state already makes `getAccount` revert,
+/// and all of them are ≥ 9.2e12 USD sums at 6 dp — turns into a clean revert of a call whose perp
+/// writes have already landed. That is the same write-then-error exposure the previous design had at
+/// `save_account`, and the shell's `perp_write_count` tripwire reports it either way.
+///
+/// Tests that drive an engine handler directly (`run_place_order`, `storage::save_account`, …) rather
+/// than through the shell must call this themselves; nothing else does.
+pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpError> {
+    // Taken out of the store first: `emit_account_snapshot` borrows `context` mutably for its fold.
+    let touched = typed_store_mut(context).take_touched_accounts();
+    for user in touched {
+        emit_account_snapshot(context, user)?;
+    }
+    Ok(())
+}
+
+/// Folds and logs one `AccountBalanceChanged` — **the one and only site that constructs this log.**
+///
+/// The nine margin scalars come from [`crate::margin_view::index_account_scalars`], the same producer
+/// `getAccount` folds, so the two published surfaces cannot report different numbers for the same
+/// state. The spot USDC balance is the one field not in that set and is read here.
+fn emit_account_snapshot<H: PerpHost>(context: &mut H, user: Address) -> Result<(), PerpError> {
+    let s =
+        crate::margin_view::index_account_scalars(context, user, "AccountBalanceChanged", None)?;
     let usdc_balance: primitives::U256 =
         load_account_ref(context, user)?.usdc_balance.clone().into();
     context.log(primitives::Log {
@@ -505,13 +514,26 @@ pub fn save_account<H: PerpHost>(
     user: Address,
     account: UserAccount,
 ) -> Result<(), PerpError> {
-    // Write FIRST: the event is folded from the store (so it cannot drift from `getAccount`), so it
-    // has to see this write. It used to be emitted before `set_account` — harmless when the payload
-    // was the by-value `account` itself, wrong now.
     typed_store_mut(context).set_account(user, account);
-    emit_account_balance_changed(context, user)
+    // The wallet moved ⇒ one snapshot at the end of the call. Ordering against the write no longer
+    // matters (nothing is folded here); the drain reads the settled store.
+    mark_account_snapshot_dirty(context, user);
+    Ok(())
 }
 
+/// Position write for the paths that touch ONLY the per-side aggregates (`total_buy/sell_{qty,
+/// notional}` — the `Bid`/`Ask` that derived `ooIM` is computed from): an order resting, an order
+/// being cancelled, a cancel-all clearing both sides.
+///
+/// Two things it deliberately skips, and they are the same two facts:
+///
+/// * `save_position`'s `amount` zero-crossing hooks (open-position registry, per-user market index)
+///   are dead work here — `amount` is unchanged, asserted below.
+/// * it does **NOT** mark the user for an `AccountBalanceChanged` snapshot. Aggregates-only means no
+///   wallet moved and no position state moved, which is exactly the condition under which Binance
+///   pushes no `ACCOUNT_UPDATE` — see the trigger table on [`mark_account_snapshot_dirty`]. This is
+///   what makes a pure placement and a pure cancel silent. Routing an aggregates-only write through
+///   `save_position` instead would publish a snapshot for both.
 pub fn save_position_reservation_only<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -565,12 +587,12 @@ pub fn mutate_account<H: PerpHost, R>(
     Ok(r)
 }
 
-/// [`mutate_account`] for mutations that MOVE a balance (`credit_perp` / `debit_perp`): emits
-/// `AccountBalanceChanged` with the post-mutation values.
+/// [`mutate_account`] for mutations that MOVE a balance (`credit_perp` / `debit_perp`): marks the
+/// user for an end-of-call `AccountBalanceChanged` snapshot.
 ///
 /// Split from `mutate_account` (which stays silent) so neither path pays for change DETECTION. The
-/// caller always knows whether it moved money, and emitting unconditionally is the fail-safe
-/// direction — a duplicate event is harmless, a missing one is not. `mutate_account` therefore
+/// caller always knows whether it moved money, and marking unconditionally is the fail-safe
+/// direction — a redundant snapshot is harmless, a missing one is not. `mutate_account` therefore
 /// serves only the writes that provably cannot move a balance: the per-placement nonce bump and
 /// fee-rate updates. Detecting instead cost those a `usdc_balance` String clone per call for a
 /// comparison that could never fire.
@@ -579,9 +601,9 @@ pub fn mutate_account_balance<H: PerpHost, R>(
     user: Address,
     f: impl FnOnce(&mut UserAccount) -> R,
 ) -> Result<R, PerpError> {
-    // No after-image is carried out of here: the emitter re-reads the (now-written) store, which is
-    // what makes the event byte-identical to `getAccount`. That also removed the `a.clone()` the
-    // fast path used to pay purely to hand the emitter a payload — a full `UserAccount` deep clone,
+    // No after-image is carried out of here: the drain re-reads the settled store, which is what
+    // makes the event byte-identical to `getAccount`. That also removed the `a.clone()` the fast path
+    // used to pay purely to hand the emitter a payload — a full `UserAccount` deep clone,
     // `usdc_balance` String allocation included, on every credit/debit.
     let r = if let Some(a) = typed_store_mut(context).account_mut(user) {
         f(a)
@@ -591,7 +613,7 @@ pub fn mutate_account_balance<H: PerpHost, R>(
         typed_store_mut(context).set_account(user, a);
         r
     };
-    emit_account_balance_changed(context, user)?;
+    mark_account_snapshot_dirty(context, user);
     Ok(r)
 }
 
@@ -749,6 +771,12 @@ pub fn save_position<H: PerpHost>(
     // leave branch re-reads the position to decide whether the user still has anything here,
     // so it has to see the new `amount`.
     sync_user_market_membership(context, user, market_id, old_amount != 0, pos.amount != 0)?;
+    // Position state moved (`amount` / `v_quote_balance` / `margin` / `leverage`) ⇒ one snapshot at
+    // the end of the call. Binance's `ACCOUNT_UPDATE` carries a `P[]` array for exactly this, and its
+    // own trigger sentence is "since there's no change on positions" — so a change IS the trigger.
+    // Aggregates-only writes must NOT come through here; they have
+    // [`save_position_reservation_only`].
+    mark_account_snapshot_dirty(context, user);
     Ok(())
 }
 
