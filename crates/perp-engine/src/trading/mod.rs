@@ -2466,7 +2466,7 @@ where
     F: FnOnce(&mut H, u64, Side, u64, &[u8; 32]) -> Result<(), PerpError>,
 {
     remove(context, market_id, order.side, order.price, &order_id)?;
-    release_margin_for_cancelled_order(context, user, market_id, order.side, &order_id, market)?;
+    release_open_order_margin(context, user, market_id, order.side, &order_id, market)?;
     // delete-on-terminal: the cancelled/expired order is removed from the map. Its id may linger in
     // the level FIFO (lazy-queue) until a match walk sweeps it; `remove` already decremented the
     // level's live count. The Cancelled/Expired distinction (previously only the saved status; the
@@ -2627,13 +2627,20 @@ pub(super) fn remove_from_book_during_match<H: PerpHost>(
 /// Detach a cancelled order from the owner's per-market entry list and shrink the maintained
 /// per-side aggregates by exactly its contribution.
 ///
-/// Formerly this also RELEASED the order's escrowed margin back to the wallet. There is no escrow:
-/// a cancel moves **no money at all**. What it does is lower `Bid` (or `Ask`), which lowers this
-/// market's derived `ooIM` and therefore RAISES the account's available balance — the same effect,
-/// with nothing changing hands. The function is kept (under its call sites' name) because the
-/// "book removal, entry removal and aggregate update always happen together" invariant is still
-/// the thing worth enforcing in one place.
-pub(super) fn release_margin_for_cancelled_order<H: PerpHost>(
+/// ⚠️ The name is one level above the mechanics, deliberately: what this function TOUCHES is
+/// `Bid`/`Ask` (`total_buy_notional` / `total_sell_notional` and their qty siblings). `ooIM` is
+/// DERIVED from those downstream and is never stored, so nothing here reads or writes it — the
+/// open-order margin falls as a *consequence*.
+///
+/// And "release" does not mean money moves. It never does here: there is no escrow, so a cancel
+/// moves **no money at all** (the placement side has no `reserve_*` counterpart either — it is two
+/// inline `checked_add`s). Lowering `Bid`/`Ask` lowers this market's derived `ooIM` and therefore
+/// RAISES the account's available balance — the same effect a refund would have, with nothing
+/// changing hands. Do not reintroduce a wallet credit here.
+///
+/// The function exists as one place because the invariant worth enforcing is that book removal,
+/// entry removal and the aggregate update **always happen together**.
+pub(super) fn release_open_order_margin<H: PerpHost>(
     context: &mut H,
     user: Address,
     market_id: u64,
@@ -2710,7 +2717,7 @@ fn remove_entry_from_side_aggregates(
     Ok(())
 }
 
-/// PURE core of [`release_margin_for_cancelled_order`] (commit-only #23, tranche-4): removes the
+/// PURE core of [`release_open_order_margin`] (commit-only #23, tranche-4): removes the
 /// entry from the working-copy list and shrinks the per-side aggregates — over in-memory copies
 /// only, NO storage access. The match compute phase runs this to simulate the taker's LIFO
 /// cover-cancels (and plan them) before any write.
@@ -2719,7 +2726,7 @@ fn remove_entry_from_side_aggregates(
 /// smaller `Bid`/`Ask` it leaves behind. The book entry's `amount` is the authoritative remaining
 /// quantity (kept current by `reduce_order_entry_core`); the order's `filled` can lag it during the
 /// same matching round, so the aggregate is shrunk by the entry, not by `order.quantity - filled`.
-pub(super) fn release_margin_core(
+pub(super) fn release_open_order_margin_core(
     pos: &mut crate::types::PerpPosition,
     buy_entries: &mut std::collections::VecDeque<OrderEntry>,
     sell_entries: &mut std::collections::VecDeque<OrderEntry>,

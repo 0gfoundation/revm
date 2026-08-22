@@ -305,7 +305,7 @@ impl TakerSettlement {
         // post-debit leftover still covers the rest. Only a genuinely tight taker falls through.
         if !crate::margin_view::derived_can_afford(available, need) {
             // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
-            // `release_margin_core` so the sim cannot diverge from `finalize_apply`'s real loop.
+            // `release_open_order_margin_core` so the sim cannot diverge from `finalize_apply`'s real loop.
             // A cancel frees no cash now — it lowers `Bid`/`Ask` and therefore `Σ ooIM`, which is
             // what raises the available. The loop's own test is `available >= total_required`, a
             // straight money-out amount and NOT a delta, so `rest_in_book`'s post-state restatement
@@ -318,7 +318,7 @@ impl TakerSettlement {
             let mut sim_buy = w.buy_entries.clone();
             let mut sim_sell = w.sell_entries.clone();
             loop {
-                // No re-fold: `release_margin_core` below subtracts each cancelled entry's frozen
+                // No re-fold: `release_open_order_margin_core` below subtracts each cancelled entry's frozen
                 // term from `sim_pos`, so its aggregates ARE `Bid`/`Ask` for the simulated book.
                 let avail = crate::margin_view::derived_available_balance_with(
                     context,
@@ -336,7 +336,7 @@ impl TakerSettlement {
                 let Some(oid) = next else {
                     return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
                 };
-                super::release_margin_core(
+                super::release_open_order_margin_core(
                     &mut sim_pos,
                     &mut sim_buy,
                     &mut sim_sell,
@@ -354,7 +354,7 @@ impl TakerSettlement {
                 // instead of three times" win is worth nothing here, while the state being priced is
                 // a SIMULATED post-cover book that exists only inside this loop. Keeping the two
                 // `ooIM(sim_pos)` / `ooIM(after_rest)` evaluations spelled out keeps the sim
-                // auditable against the real cancels `release_margin_core` performs in
+                // auditable against the real cancels `release_open_order_margin_core` performs in
                 // `finalize_apply`, which is the property this branch is here to preserve.
                 let wallet_after = wallet
                     .checked_sub(checked_u64_to_i64(
@@ -411,7 +411,7 @@ pub(super) struct RestReq {
 ///
 /// The aggregates ARE `Bid`/`Ask`, and `Bid`/`Ask` are inputs to `ooIM`, so any gate evaluated
 /// mid-match has to see the walk's effect on them. `settle_maker_fill_core` and
-/// `release_margin_core` maintain them incrementally as they mutate the lists; this recomputes
+/// `release_open_order_margin_core` maintain them incrementally as they mutate the lists; this recomputes
 /// from the lists so a gate can never be decided on a stale aggregate, and the flush asserts the
 /// two agree. The recompute values each surviving entry at its own FROZEN `assuming_price`
 /// (`math::sum_side_totals`), so it reproduces the incremental result exactly — a partially filled
@@ -946,7 +946,7 @@ impl MatchRegistry {
             let (tbq, tbn) = crate::math::sum_side_totals(w.buy_entries.iter().copied(), bd, pd)?;
             let (tsq, tsn) = crate::math::sum_side_totals(w.sell_entries.iter().copied(), bd, pd)?;
             // ...and the walk maintains them INCREMENTALLY as it goes, because the gates it
-            // evaluates mid-match (and `release_margin_core`, which subtracts from them) read
+            // evaluates mid-match (and `release_open_order_margin_core`, which subtracts from them) read
             // them. Belt-and-braces: the two must agree, or a gate was decided on a stale `Bid`.
             debug_assert_eq!(
                 (
@@ -1065,7 +1065,7 @@ pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
 ) -> Result<(), PerpError> {
     let i = reg.get_or_load(context, maker, market_id, market)?;
     let w = &mut reg.users[i].1;
-    super::release_margin_core(
+    super::release_open_order_margin_core(
         &mut w.pos,
         &mut w.buy_entries,
         &mut w.sell_entries,
