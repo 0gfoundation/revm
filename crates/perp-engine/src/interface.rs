@@ -204,6 +204,18 @@ sol! {
         /// side:      0 = Buy, 1 = Sell
         /// orderType: 0 = Limit, 1 = Market
         /// tif:       0 = GTC, 1 = IOC, 2 = FOK, 3 = PostOnly
+        ///
+        /// Only SIX of the eight `(orderType, tif)` pairs are products, and the engine holds them
+        /// as ONE value internally (`types::OrderKind`):
+        ///   * LIMIT takes all four TIFs.
+        ///   * MARKET is *inherently* immediate-or-cancel, bounded by the market's price band. It
+        ///     accepts `tif = 0` (GTC — the unset placeholder; Binance's own spot response echoes
+        ///     this on a market order) or `tif = 1` (IOC, the explicit spelling), and both mean the
+        ///     same thing: match from the best price inward, discard any remainder, never rest.
+        ///   * MARKET + FOK (2) and MARKET + PostOnly (3) are REJECTED — neither names a product
+        ///     that exists. Reverts with `placeOrder: tif not allowed for market order`.
+        /// A market order always reports `tif = 1` (IOC) in `OrderPlaced`, whichever of the two
+        /// accepted bytes was sent.
         /// clientOrderId: optional caller-assigned tracking ID; pass bytes16(0) if unused.
         ///   Emitted in events but not stored or validated on-chain.
         /// Returns a unique order ID.
@@ -237,12 +249,14 @@ sol! {
             uint64  quantity;
             uint8   orderType;  // 0 = Limit, 1 = Market
             uint8   tif;        // 0 = GTC, 1 = IOC, 2 = FOK, 3 = PostOnly
+                                // Market accepts only 0/1 — see `placeOrder` for the legal matrix
             bytes16 clientOrderId;
         }
         /// Place up to MAX_BATCH_PLACE (64) orders in one call, on behalf of the caller.
         ///
         /// Atomicity is **abort-forward**, not all-or-nothing: items run in strict calldata order and
-        /// a per-item genuine reject (unknown/inactive market, bad side/orderType/tif, qty or price
+        /// a per-item genuine reject (unknown/inactive market, bad side/orderType/tif, an illegal
+        /// (orderType, tif) pair, qty or price
         /// out of range, PostOnly would cross, FOK unfillable, insufficient margin, K9
         /// open-into-insolvency) does NOT undo the items before it. The call returns Ok once the loop
         /// has begun. A rejected item is write-clean AND log-clean — it emits no `OrderPlaced`.

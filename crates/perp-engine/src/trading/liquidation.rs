@@ -11,7 +11,7 @@ use crate::{
         checked_u64_to_i64,
     },
     storage,
-    types::{Market, Order, OrderStatus, OrderType, Side, TimeInForce},
+    types::{Market, Order, OrderKind, OrderStatus, Side},
     PERP_DEX_ADDRESS,
     PerpError,
 };
@@ -30,6 +30,9 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
     quantity: u64,
 ) -> Result<u64, PerpError> {
     let (order_id, bumped_nonce) = super::peek_order_id(context, user)?;
+    // A liquidation close IS a market order: immediate-or-cancel, bounded by the price band, never
+    // resting. One `OrderKind` says so, and the record/event's two wire fields are derived from it.
+    let kind = OrderKind::Market;
     let mut order = Order {
         owner: user.0 .0,
         market_id: market.market_id,
@@ -37,8 +40,8 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         price: 0,
         quantity,
         filled: 0,
-        order_type: OrderType::Market,
-        tif: TimeInForce::Ioc,
+        order_type: kind.order_type(),
+        tif: kind.tif(),
         status: OrderStatus::Open,
     };
     // commit-only #23: the close order is persisted ONCE after matching (below); the
@@ -52,8 +55,8 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
             side: side as u8,
             price: 0,
             quantity,
-            orderType: OrderType::Market as u8,
-            tif: TimeInForce::Ioc as u8,
+            orderType: kind.order_type() as u8,
+            tif: kind.tif() as u8,
             clientOrderId: FixedBytes::default(),
         }
         .to_log_data(),
@@ -67,14 +70,12 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         side,
         0,
         quantity,
-        OrderType::Market,
-        TimeInForce::Ioc,
+        kind, // market order: never rests, never all-or-nothing
         market,
         // Liquidation close: waive the taker trading fee (the liquidated user pays
         // the clearance fee to the IF instead). Also prevents the close from
         // reverting when the underwater user cannot cover a taker fee.
         true,
-        false, // liquidation close (IOC): never rests
         &mut order,
         // The liquidation close emits its OrderPlaced itself (above), so there is nothing buffered
         // for the match apply to flush — its log behavior is unchanged.

@@ -2606,6 +2606,224 @@ fn post_only_rests_when_above_best_bid() {
     );
 }
 
+// ── (orderType, tif) legality — the OrderKind boundary ────────────────────
+//
+// The ABI carries `orderType` and `tif` as two independent `uint8`s, but only SIX of their eight
+// combinations name a product. `validate_place_order` collapses the pair into ONE
+// `types::OrderKind`, so the two that don't — `Market + Fok` (all-or-nothing at market: no exchange
+// sells it) and `Market + PostOnly` ("never take liquidity" on the one order type that only ever
+// takes it) — die at the boundary and are UNREPRESENTABLE past it. `Market + Gtc` survives as the
+// unset-tif placeholder and means exactly `Market`.
+//
+// The type-level half of this guarantee (that `OrderKind::Market` has no TIF slot at all, so no
+// future edit can reintroduce the combination) is pinned in `perp_core::types::order`.
+
+/// Place with every wire field free, returning the raw result (`Err` = reject).
+fn try_place_pair(
+    ctx: &mut TestCtx,
+    caller: Address,
+    side: u8,
+    price: u64,
+    qty: u64,
+    order_type: u8,
+    tif: u8,
+) -> Result<Bytes, PerpError> {
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side,
+        price,
+        quantity: qty,
+        orderType: order_type,
+        tif,
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    run_place_order(&input, caller, ctx)
+}
+
+/// The wire `(orderType, tif)` each `OrderPlaced` echoes, in emission order.
+fn placed_type_tif(ctx: &mut TestCtx) -> Vec<(u8, u8)> {
+    use crate::interface::IPerpDex::OrderPlaced;
+    JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .filter(|l| l.data.topics().first() == Some(&OrderPlaced::SIGNATURE_HASH))
+        .map(|l| {
+            let e = OrderPlaced::decode_raw_log(l.data.topics(), &l.data.data).unwrap();
+            (e.orderType, e.tif)
+        })
+        .collect()
+}
+
+/// **THE MATRIX.** All eight `(orderType, tif)` pairs, each attempted against a book deep enough
+/// that nothing can reject for liquidity or margin — so the only rejects left are the structural
+/// ones, and this test IS the legality table.
+#[test]
+fn the_order_type_tif_matrix_accepts_exactly_six_of_eight_pairs() {
+    const LIMIT: u8 = 0;
+    const MARKET: u8 = 1;
+    const GTC: u8 = 0;
+    const IOC: u8 = 1;
+    const FOK: u8 = 2;
+    const POST_ONLY: u8 = 3;
+    // (orderType, tif, taker price, legal?)
+    let cases: [(u8, u8, u64, bool); 8] = [
+        (LIMIT, GTC, PRICE - 10 * TICK, true), // rests below the ask
+        (LIMIT, IOC, PRICE, true),             // crosses and fills
+        (LIMIT, FOK, PRICE, true),             // crosses and fills COMPLETELY
+        (LIMIT, POST_ONLY, PRICE - 10 * TICK, true), // does not cross
+        (MARKET, GTC, 0, true),                // the unset-tif placeholder
+        (MARKET, IOC, 0, true),                // the canonical spelling
+        (MARKET, FOK, 0, false),               // all-or-nothing at market: not a product
+        (MARKET, POST_ONLY, 0, false),         // never-take on a take-only order: not a product
+    ];
+    for (order_type, tif, price, legal) in cases {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        place(&mut ctx, BOB, 1, PRICE, QTY * 4, 0, 0); // deep resting ask
+        let got = try_place_pair(&mut ctx, ALICE, 0, price, QTY, order_type, tif);
+        assert_eq!(
+            got.is_ok(),
+            legal,
+            "(orderType {order_type}, tif {tif}) legality changed; got {got:?}"
+        );
+        if !legal {
+            assert_eq!(
+                got.unwrap_err().to_string(),
+                "placeOrder: tif not allowed for market order",
+                "(orderType {order_type}, tif {tif}) must reject with the boundary message"
+            );
+        }
+    }
+}
+
+/// An illegal pair dies at the FIRST validation, so the reject is write-clean AND log-clean and
+/// does not consume the order id it would have used (commit-only #23: same contract as every other
+/// genuine reject).
+#[test]
+fn an_illegal_pair_is_rejected_before_any_write_or_log() {
+    for tif in [2u8 /* FOK */, 3 /* PostOnly */] {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let resting = place(&mut ctx, BOB, 1, PRICE, QTY * 4, 0, 0);
+        take_event_names(&mut ctx); // drain the fixture's own logs
+
+        let err = try_place_pair(&mut ctx, ALICE, 0, 0, QTY, 1, tif).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "placeOrder: tif not allowed for market order"
+        );
+
+        assert!(
+            take_event_names(&mut ctx).is_empty(),
+            "an illegal (orderType, tif) pair must emit no logs at all"
+        );
+        assert_eq!(get_order(&mut ctx, resting).filled, 0, "maker untouched");
+        assert_eq!(pos(&mut ctx, ALICE), PerpPosition::default());
+        assert_eq!(wallet(&mut ctx, ALICE), WALLET);
+        assert_eq!(
+            storage::load_user_nonce(&mut ctx, ALICE).unwrap(),
+            0,
+            "a rejected placement must not burn an order id"
+        );
+    }
+}
+
+/// `Market + Gtc` is the unset-tif placeholder, NOT a promise to rest. It must be the same order as
+/// `Market + Ioc` in every observable: the state it leaves, and the `tif` it reports.
+#[test]
+fn market_with_the_placeholder_tif_is_identical_to_market_ioc() {
+    /// Half-fill a 2×QTY market buy against QTY of ask, and report everything observable.
+    #[allow(clippy::type_complexity)]
+    fn run(tif: u8) -> (PerpPosition, u64, Vec<(u8, u8)>, bool, Vec<u64>) {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // only QTY of liquidity
+        JournalTr::take_logs(ctx.journal_mut()); // drain the fixture's logs
+        let id = place(&mut ctx, ALICE, 0, 0, QTY * 2, 1, tif);
+        (
+            pos(&mut ctx, ALICE),
+            wallet(&mut ctx, ALICE),
+            placed_type_tif(&mut ctx),
+            storage::load_order(&mut ctx, &id).unwrap().is_some(),
+            storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
+        )
+    }
+    let placeholder = run(0); // Market + Gtc
+    let canonical = run(1); // Market + Ioc
+    assert_eq!(
+        placeholder, canonical,
+        "Market + Gtc must be the very same order as Market + Ioc"
+    );
+
+    let (position, _, wire, still_stored, bids) = placeholder;
+    // Half filled …
+    assert_eq!(position.amount, QTY as i64);
+    // … and the other half DISCARDED: no record, nothing resting, despite the wire saying "GTC".
+    assert!(!still_stored, "a market remainder never rests");
+    assert!(bids.is_empty(), "a market remainder never enters the book");
+    // Reported as orderType = Market(1), tif = IOC(1): the placeholder is not echoed back as a
+    // promise the engine does not keep.
+    assert_eq!(wire, vec![(1, 1)]);
+}
+
+/// The collapse must not smear the four LIMIT time-in-forces together: each still differs in
+/// exactly what happens to the half of a 2×QTY taker that QTY of resting ask cannot fill.
+#[test]
+fn each_limit_tif_keeps_its_own_behaviour_after_the_collapse() {
+    // GTC — the unfilled half RESTS.
+    {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let id = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 0);
+        assert_eq!(
+            get_order(&mut ctx, id).status,
+            OrderStatus::PartiallyFilled,
+            "GTC rests its remainder"
+        );
+        assert_eq!(
+            storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(),
+            vec![PRICE]
+        );
+    }
+    // IOC — the unfilled half is DISCARDED.
+    {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let id = place(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 1);
+        assert_terminal(&mut ctx, id);
+        assert!(storage::load_bid_prices(&mut ctx, MARKET_ID)
+            .unwrap()
+            .is_empty());
+        assert_eq!(pos(&mut ctx, ALICE).amount, QTY as i64);
+    }
+    // FOK — all-or-nothing: the WHOLE order is rejected and the maker keeps its quantity.
+    {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let maker = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let err = try_place_pair(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("FOK order cannot be fully filled"),
+            "{err}"
+        );
+        assert_eq!(get_order(&mut ctx, maker).filled, 0);
+        assert_eq!(pos(&mut ctx, ALICE), PerpPosition::default());
+    }
+    // PostOnly — refuses to take liquidity at all.
+    {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        let err = try_place_pair(&mut ctx, ALICE, 0, PRICE, QTY * 2, 0, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("PostOnly order would match"),
+            "{err}"
+        );
+    }
+}
+
 // ── OrderPlaced emission: accepted-only (batch-trade Phase 0) ──────────────
 //
 // `OrderPlaced` is buffered by `announce_new_order` and flushed at the first APPLY point, so it is
@@ -6758,6 +6976,10 @@ mod batch_cancel {
             ("invalid orderType", PerpBatchReason::InvalidOrderType),
             ("invalid tif", PerpBatchReason::InvalidTif),
             (
+                "tif not allowed for market order",
+                PerpBatchReason::TifNotAllowedForOrderType,
+            ),
+            (
                 "quantity below minimum",
                 PerpBatchReason::QuantityBelowMinimum,
             ),
@@ -6885,13 +7107,14 @@ mod batch_cancel {
                 PerpBatchReason::InsufficientMargin as u8,
                 PerpBatchReason::OpenIntoInsolvency as u8,
                 PerpBatchReason::FeeRecipientNotSet as u8,
+                PerpBatchReason::TifNotAllowedForOrderType as u8,
                 PerpBatchReason::ArithmeticGuard as u8,
                 PerpBatchReason::Invariant as u8,
                 PerpBatchReason::Other as u8,
             ],
             [
-                0, 1, 2, 3, 4, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 253,
-                254, 255
+                0, 1, 2, 3, 4, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                253, 254, 255
             ]
         );
     }

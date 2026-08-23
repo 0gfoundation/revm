@@ -36,7 +36,7 @@ use crate::{
     },
     risk::record_mid_price_sample_for_best_quote_change,
     storage,
-    types::{ApiKey, Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce},
+    types::{ApiKey, Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side, TimeInForce},
     PERP_DEX_ADDRESS,
     PerpError,
 };
@@ -897,8 +897,11 @@ pub(super) fn commit_order_nonce<H: PerpHost>(
 struct ValidatedOrder {
     market: crate::types::Market,
     side: Side,
-    order_type: OrderType,
-    tif: TimeInForce,
+    /// The wire's `(orderType, tif)` pair, already collapsed into the ONE internal value
+    /// ([`OrderKind`]). Past this struct there is no such thing as a market order with a
+    /// time-in-force — `validate_place_order` is the only place the illegal pairs can even be
+    /// spelled, and it rejects them.
+    kind: OrderKind,
 }
 
 /// Validate → build in memory → execute → ONE final persist. Returns the taker order's FINAL status,
@@ -949,8 +952,11 @@ fn place_order_core<H: PerpHost>(
     );
     let mut pending = Some(pending);
 
-    match validated.order_type {
-        OrderType::Limit => execute_limit_order(
+    // The ONE dispatch on what the order is. `OrderKind` makes it total: there is no third case to
+    // forget, and the limit arm gets its TIF by destructuring (not by re-reading a field that a
+    // market order also has).
+    match validated.kind {
+        OrderKind::Limit(tif) => execute_limit_order(
             context,
             account,
             order_id,
@@ -958,18 +964,21 @@ fn place_order_core<H: PerpHost>(
             price,
             quantity,
             client_order_id,
-            validated,
+            validated.side,
+            tif,
+            &validated.market,
             &mut taker_order,
             &mut pending,
         )?,
-        OrderType::Market => execute_market_order(
+        OrderKind::Market => execute_market_order(
             context,
             account,
             order_id,
             market_id,
             price,
             quantity,
-            validated,
+            validated.side,
+            &validated.market,
             &mut taker_order,
             &mut pending,
         )?,
@@ -1011,6 +1020,13 @@ fn validate_place_order<H: PerpHost>(
     let order_type = OrderType::from_u8(order_type_u8)
         .ok_or_else(|| perp_err("placeOrder: invalid orderType"))?;
     let tif = TimeInForce::from_u8(tif_u8).ok_or_else(|| perp_err("placeOrder: invalid tif"))?;
+    // THE BOUNDARY. The ABI keeps its two independent `uint8`s (callers and the OrderPlaced /
+    // OrderRested events are unchanged), but their product is not a product: `Market + Fok`
+    // (all-or-nothing at market — no exchange sells it), `Market + PostOnly` ("never take
+    // liquidity" on the one order type that only takes it). Both die here; past this line the
+    // engine holds ONE `OrderKind` and the illegal states do not exist to be handled.
+    let kind = OrderKind::from_parts(order_type, tif)
+        .ok_or_else(|| perp_err("placeOrder: tif not allowed for market order"))?;
 
     if quantity < market.min_quantity {
         return Err(perp_err("placeOrder: quantity below minimum"));
@@ -1021,7 +1037,7 @@ fn validate_place_order<H: PerpHost>(
     if market.step_size > 0 && quantity % market.step_size != 0 {
         return Err(perp_err("placeOrder: quantity not multiple of step_size"));
     }
-    if order_type == OrderType::Limit {
+    if kind.is_limit() {
         if price == 0 {
             return Err(perp_err("placeOrder: limit order price must be > 0"));
         }
@@ -1039,12 +1055,7 @@ fn validate_place_order<H: PerpHost>(
         // sanity cap (`price > market.max_price`) above still prevents absurd book pollution.
     }
 
-    Ok(ValidatedOrder {
-        market,
-        side,
-        order_type,
-        tif,
-    })
+    Ok(ValidatedOrder { market, side, kind })
 }
 
 /// The `OrderPlaced` log of a placement that is not yet known-accepted.
@@ -1111,6 +1122,10 @@ fn announce_new_order(
     client_order_id: [u8; 16],
     validated: &ValidatedOrder,
 ) -> (Order, PendingOrderPlaced) {
+    // The record and the event keep the ABI's two independent fields, both DERIVED from the single
+    // `OrderKind` (`OrderKind::order_type` / `OrderKind::tif`) — so the pair they carry is
+    // reachable-by-construction, not assembled from two free-floating inputs. A market order
+    // reports `tif = Ioc`, which is what it is.
     let order = Order {
         owner: account.0 .0,
         market_id,
@@ -1118,8 +1133,8 @@ fn announce_new_order(
         price,
         quantity,
         filled: 0,
-        order_type: validated.order_type,
-        tif: validated.tif,
+        order_type: validated.kind.order_type(),
+        tif: validated.kind.tif(),
         status: OrderStatus::Open,
     };
 
@@ -1130,8 +1145,8 @@ fn announce_new_order(
         side: validated.side as u8,
         price,
         quantity,
-        order_type: validated.order_type as u8,
-        tif: validated.tif as u8,
+        order_type: validated.kind.order_type() as u8,
+        tif: validated.kind.tif() as u8,
         client_order_id,
     };
 
@@ -1271,6 +1286,7 @@ fn remove_order_entry_by_price(
         .expect("index from find_entry_by_price_id is in bounds"))
 }
 
+/// The four TIFs of a LIMIT order — the only order type that has one.
 fn execute_limit_order<H: PerpHost>(
     context: &mut H,
     account: Address,
@@ -1279,43 +1295,47 @@ fn execute_limit_order<H: PerpHost>(
     price: u64,
     quantity: u64,
     client_order_id: [u8; 16],
-    order: ValidatedOrder,
+    side: Side,
+    tif: TimeInForce,
+    market: &crate::types::Market,
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PerpError> {
-    match order.tif {
+    let kind = OrderKind::Limit(tif);
+    match tif {
         TimeInForce::PostOnly => {
             // No match runs → the do-not-cross BBO is still current at rest; thread it in.
-            let bbo = ensure_post_only_does_not_cross(context, market_id, order.side, price)?;
+            let bbo = ensure_post_only_does_not_cross(context, market_id, side, price)?;
             rest_in_book(
                 context,
                 account,
                 &order_id,
                 market_id,
-                order.side,
+                side,
                 price,
                 quantity,
-                order.tif,
+                tif,
                 client_order_id,
-                &order.market,
+                market,
                 Some(bbo),
                 pending_placed,
             )
         }
         TimeInForce::Gtc => {
+            // GTC is the ONE kind that rests its remainder, so `match_order` derives
+            // `rest_remainder` from the kind and pre-validates the rest's margin atomically with
+            // the fills (`OrderKind::rests_remainder`).
             let remaining = match_order(
                 context,
                 account,
                 &order_id,
                 market_id,
-                order.side,
+                side,
                 price,
                 quantity,
-                order.order_type,
-                order.tif,
-                &order.market,
+                kind,
+                market,
                 false,
-                true, // GTC: rest the remainder → pre-validate its margin atomically with fills
                 taker_order,
                 pending_placed,
             )?;
@@ -1325,12 +1345,12 @@ fn execute_limit_order<H: PerpHost>(
                     account,
                     &order_id,
                     market_id,
-                    order.side,
+                    side,
                     price,
                     remaining,
-                    order.tif,
+                    tif,
                     client_order_id,
-                    &order.market,
+                    market,
                     // GTC: matching ran → read the (post-match) BBO inside rest_in_book.
                     None,
                     pending_placed,
@@ -1344,14 +1364,12 @@ fn execute_limit_order<H: PerpHost>(
                 account,
                 &order_id,
                 market_id,
-                order.side,
+                side,
                 price,
                 quantity,
-                order.order_type,
-                order.tif,
-                &order.market,
+                kind, // IOC: unmatched remainder is dropped, never rested
+                market,
                 false,
-                false, // IOC: unmatched remainder is dropped, never rested
                 taker_order,
                 pending_placed,
             )?;
@@ -1359,28 +1377,18 @@ fn execute_limit_order<H: PerpHost>(
             Ok(())
         }
         TimeInForce::Fok => {
-            check_fok_feasibility(
-                context,
-                market_id,
-                order.side,
-                price,
-                quantity,
-                order.order_type,
-                &order.market,
-            )?;
+            check_fok_feasibility(context, market_id, side, price, quantity, market)?;
             let remaining = match_order(
                 context,
                 account,
                 &order_id,
                 market_id,
-                order.side,
+                side,
                 price,
                 quantity,
-                order.order_type,
-                order.tif,
-                &order.market,
+                kind, // FOK: fully filled or rejected — never rests
+                market,
                 false,
-                false, // FOK: fully filled or rejected — never rests
                 taker_order,
                 pending_placed,
             )?;
@@ -1389,6 +1397,14 @@ fn execute_limit_order<H: PerpHost>(
     }
 }
 
+/// A market order: **an immediate-or-cancel with a price band**, and nothing else. It has no TIF to
+/// branch on ([`OrderKind::Market`] carries none), so this path is straight-line — match from the
+/// best price inward until the order is filled, the band stops the walk, or the book runs out, then
+/// discard whatever is left (`Expired`). It never rests, and it has no all-or-nothing mode: the
+/// `Market + FOK` branch that used to live here was a product no exchange offers.
+///
+/// `price` is the ABI's (ignored) price field, threaded through only because `match_order` takes a
+/// limit price; `OrderKind::Market` makes it dead on this path — see `is_limit` there.
 fn execute_market_order<H: PerpHost>(
     context: &mut H,
     account: Address,
@@ -1396,43 +1412,27 @@ fn execute_market_order<H: PerpHost>(
     market_id: u64,
     price: u64,
     quantity: u64,
-    order: ValidatedOrder,
+    side: Side,
+    market: &crate::types::Market,
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PerpError> {
-    if order.tif == TimeInForce::Fok {
-        check_fok_feasibility(
-            context,
-            market_id,
-            order.side,
-            price,
-            quantity,
-            order.order_type,
-            &order.market,
-        )?;
-    }
     let remaining = match_order(
         context,
         account,
         &order_id,
         market_id,
-        order.side,
+        side,
         price,
         quantity,
-        order.order_type,
-        order.tif,
-        &order.market,
+        OrderKind::Market, // never rests, never all-or-nothing
+        market,
         false,
-        false, // market order: never rests
         taker_order,
         pending_placed,
     )?;
-    if order.tif == TimeInForce::Fok {
-        ensure_fok_filled(remaining)
-    } else {
-        cancel_unfilled_remainder(taker_order, remaining);
-        Ok(())
-    }
+    cancel_unfilled_remainder(taker_order, remaining);
+    Ok(())
 }
 
 fn cancel_order_core<H: PerpHost>(
@@ -1480,15 +1480,17 @@ pub(super) fn match_order<H: PerpHost>(
     side: Side,
     limit_price: u64,
     quantity: u64,
-    order_type: OrderType,
-    tif: TimeInForce,
+    // WHAT the taker order is, as one value. Three behaviours read off it and nothing else:
+    // `is_limit` (does `limit_price` bound the walk), `is_fok` (all-or-nothing), and
+    // `rests_remainder` (does the caller rest what is left — formerly a separate `rest_remainder`
+    // bool the caller had to keep consistent with the TIF it also passed).
+    kind: OrderKind,
     market: &crate::types::Market,
     // When true, this is a liquidation close: the taker fee is waived and the number of distinct
     // maker accounts is capped so balance after-image gas has a fixed pre-write upper bound.
+    // NOT derivable from `kind` — a liquidation close is an ordinary market order placed in a
+    // privileged ROLE, and the role is what waives the fee.
     liquidation_close: bool,
-    // When true (GTC), the caller will rest the unmatched remainder — so the rest's margin is
-    // pre-validated atomically with the fills (commit-only #23 atomic-reject).
-    rest_remainder: bool,
     // The taker's Order threaded in memory (commit-only #23): NOT yet persisted — the caller
     // performs the single final save after every genuine reject has passed, so a rejected
     // placement leaves no phantom order (and a signed order's signature is not burned).
@@ -1535,8 +1537,9 @@ pub(super) fn match_order<H: PerpHost>(
                 if (ask_price as u128) < mark_lower {
                     continue;
                 }
-                // For limit buy: only match if ask_price <= our limit.
-                if order_type == OrderType::Limit && ask_price > limit_price {
+                // For limit buy: only match if ask_price <= our limit. A market order has no
+                // limit price to respect — the band above/below is its only bound.
+                if kind.is_limit() && ask_price > limit_price {
                     break;
                 }
                 // Fill-time band (upper): asks above mark+band end matching (ascending).
@@ -1766,8 +1769,9 @@ pub(super) fn match_order<H: PerpHost>(
                 if (bid_price as u128) > mark_upper {
                     continue;
                 }
-                // For limit sell: only match if bid_price >= our limit.
-                if order_type == OrderType::Limit && bid_price < limit_price {
+                // For limit sell: only match if bid_price >= our limit. A market order has no
+                // limit price to respect — the band above/below is its only bound.
+                if kind.is_limit() && bid_price < limit_price {
                     break;
                 }
                 // Fill-time band (lower): bids below mark-band end matching (descending).
@@ -1971,7 +1975,7 @@ pub(super) fn match_order<H: PerpHost>(
 
     // 1. FOK: unfillable → reject with zero writes (previously the whole match committed and the
     //    caller's post-hoc check reverted it via undo).
-    if tif == TimeInForce::Fok && remaining > 0 {
+    if kind.is_fok() && remaining > 0 {
         return Err(perp_err("placeOrder: FOK order cannot be fully filled"));
     }
 
@@ -1980,7 +1984,7 @@ pub(super) fn match_order<H: PerpHost>(
     //    copies) and its fill effects are flushed with everyone else's below. When the caller will
     //    REST the remainder (GTC), pass the rest requirement so the fills+rest margin is validated
     //    atomically here (else the fills commit and rest_in_book could revert, leaking them).
-    let rest_req = if rest_remainder && remaining > 0 {
+    let rest_req = if kind.rests_remainder() && remaining > 0 {
         Some(settlement::RestReq {
             price: limit_price,
             qty: remaining,
@@ -2707,13 +2711,17 @@ pub(super) fn release_open_order_margin_core(
 // ── FOK / PostOnly pre-checks ─────────────────────────────────────────────────
 
 /// Check whether the book can fully fill a FOK order.  Returns error if not.
+///
+/// FOK is a LIMIT-only time-in-force ([`OrderKind`] has no market variant that carries one), so the
+/// walk always honours `limit_price` — the `order_type` parameter this used to take could only ever
+/// be `Limit`, and the dead `Market` half of it was the `Market + FOK` product that no longer
+/// exists.
 fn check_fok_feasibility<H: PerpHost>(
     context: &mut H,
     market_id: u64,
     side: Side,
     limit_price: u64,
     quantity: u64,
-    order_type: OrderType,
     market: &crate::types::Market,
 ) -> Result<(), PerpError> {
     let mut available: u64 = 0;
@@ -2730,7 +2738,7 @@ fn check_fok_feasibility<H: PerpHost>(
                 if (ask_price as u128) < mark_lower {
                     continue;
                 }
-                if order_type == OrderType::Limit && ask_price > limit_price {
+                if ask_price > limit_price {
                     break;
                 }
                 if ask_price as u128 > mark_upper {
@@ -2755,7 +2763,7 @@ fn check_fok_feasibility<H: PerpHost>(
                 if (bid_price as u128) > mark_upper {
                     continue;
                 }
-                if order_type == OrderType::Limit && bid_price < limit_price {
+                if bid_price < limit_price {
                     break;
                 }
                 if (bid_price as u128) < mark_lower {

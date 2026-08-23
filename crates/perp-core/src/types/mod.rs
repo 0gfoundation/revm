@@ -10,7 +10,7 @@ pub use oracle::{
     FundingState, IndexPriceHistory, IndexPriceState, PremiumIndexAccumulator, PriceBasisWindow,
     PRICE_BASIS_WINDOW_SIZE,
 };
-pub use order::{Order, OrderEntry, OrderStatus, OrderType, Side, TimeInForce};
+pub use order::{Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side, TimeInForce};
 pub use position::{
     MarginTier, MarginTiers, Market, MarketHot, PerpPosition, DEFAULT_MAX_LEVERAGE,
     MAX_LEVERAGE_HARD_CAP, MAX_MARGIN_TIERS,

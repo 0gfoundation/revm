@@ -297,6 +297,10 @@ pub enum PerpBatchReason {
     OpenIntoInsolvency = 30,
     /// `placeOrder: fee recipient not initialised`
     FeeRecipientNotSet = 31,
+    /// `placeOrder: tif not allowed for market order` — the `(orderType, tif)` pair is not a
+    /// product: FOK or PostOnly on a MARKET order. Distinct from [`Self::InvalidTif`], which means
+    /// the tif byte itself is out of range.
+    TifNotAllowedForOrderType = 32,
     /// A checked-arithmetic guard (`… overflow` / `… underflow` / `exceeds i64…`), matched
     /// structurally because the engine has ~30 of them and they are all
     /// unreachable-by-construction. Path-independent, hence the engine band.
@@ -355,6 +359,7 @@ fn place_reason(rest: &str) -> PerpBatchReason {
         "invalid side" => PerpBatchReason::InvalidSide,
         "invalid orderType" => PerpBatchReason::InvalidOrderType,
         "invalid tif" => PerpBatchReason::InvalidTif,
+        "tif not allowed for market order" => PerpBatchReason::TifNotAllowedForOrderType,
         "quantity below minimum" => PerpBatchReason::QuantityBelowMinimum,
         "quantity exceeds maximum" => PerpBatchReason::QuantityAboveMaximum,
         "quantity not multiple of step_size" => PerpBatchReason::QuantityStepSize,
