@@ -75,24 +75,38 @@ sol! {
         ///                               account with no positions and no resting orders, in which
         ///                               case every total is 0 and the call still succeeds.
         ///
-        /// ⚠️ TWO BINANCE FIELDS DELIBERATELY NOT IMPLEMENTED.
+        /// ⚠️ `crossUnPnl` AND `maxWithdrawAmount` ARE PRESENT BUT DEGENERATE. Read this before
+        /// using either — both were once deliberately omitted, and one of those reasons still bites.
         ///
-        /// * `totalCrossUnPnl` — we are ISOLATED-ONLY. There are no cross positions, so this is
-        ///   structurally 0 forever, not "0 right now". A field that can only ever be zero is worse
-        ///   than no field: it invites a caller to build a cross-vs-isolated split that does not
-        ///   exist here. (Binance's own samples are `0`/absent under ISOLATED too — the reference
-        ///   doc §6.2 records the correct reading as "not activated under isolated", which for us
-        ///   is permanent rather than a mode setting.)
-        /// * `maxWithdrawAmount` — two independent reasons. (1) The reference doc records
-        ///   `maxWithdrawAmount == availableBalance` as an OBSERVATION over 69 readings, **not a
-        ///   formula**: no counterexample could be constructed, and untested conditions
-        ///   (open-position risk, cross-account borrowing) are suspected. Shipping it would be
-        ///   presenting an extrapolation as a rule. (2) It would be actively misleading here even
-        ///   if the identity held: `withdraw` gates on `usdcBalance`, the SPOT side, not on the perp
-        ///   wallet, so a field named "max withdraw" sitting among the perp totals would name the
-        ///   wrong number. If you want "max transferable out of the perp wallet", that is
-        ///   `availableBalance` — the quantity `transferFromPerp` gates on — and it is already
-        ///   right there. It is not duplicated under a second name.
+        /// They are here for RESPONSE-SHAPE COMPATIBILITY: a client written against Binance's
+        /// account payload can bind to this selector without a special case. That was an explicit
+        /// product decision, taken knowing the objections below.
+        ///
+        /// * `crossUnPnl` — ALWAYS EXACTLY ZERO, and permanently so. We are isolated-only; there
+        ///   are no cross positions for it to sum. It is not "zero right now". **Do not build a
+        ///   cross-vs-isolated split on it** — that split does not exist here. All unrealised PnL
+        ///   is in `totalUnrealizedProfit`.
+        /// * `maxWithdrawAmount` — `max(0, availableBalance)`, i.e. the most that
+        ///   `transferFromPerp` will let out of the PERP wallet right now.
+        ///   ⚠️ **THE NAME IS WRONG FOR OUR TWO-LAYER MODEL AND WE KEPT IT ANYWAY.** `withdraw()`
+        ///   gates on `usdcBalance` — the SPOT layer — not on this number. So "max withdraw" here
+        ///   does NOT tell you how much you can withdraw from the protocol; it tells you how much
+        ///   you can move perp → spot. To actually withdraw you then need a second step whose
+        ///   limit is `usdcBalance`. The name is kept only because Binance uses it for the
+        ///   same-shaped field. **Prefer `availableBalance` in new code** — it is the same number
+        ///   before the clamp, and it is not lying about which layer it describes.
+        ///   The clamp matters: `availableBalance` is signed and can be negative (an
+        ///   under-covered account), but "you may withdraw a negative amount" is meaningless, so
+        ///   this field floors at zero. **The un-clamped truth stays visible in
+        ///   `availableBalance` right next to it** — that is why clamping here costs no
+        ///   information, and why it must NOT be done to `availableBalance` itself.
+        ///
+        /// One earlier objection has dissolved and is recorded so it is not re-raised: the docs
+        /// note `maxWithdrawAmount == availableBalance` on Binance as an OBSERVATION over 69
+        /// readings rather than a published formula, so mirroring it would have been presenting an
+        /// extrapolation as a rule. That applies to predicting *Binance*. Here we are not
+        /// predicting anything — we DEFINE the field as `max(0, availableBalance)`, so there is no
+        /// extrapolation left in it.
         ///
         /// ⚠️ PORTING PITFALLS FROM §7 THAT WE DO NOT REPRODUCE.
         ///
@@ -129,6 +143,8 @@ sol! {
             uint64   totalOpenOrderInitialMargin,
             uint64   totalMaintMargin,
             int64    availableBalance,
+            int64    crossUnPnl,
+            uint64   maxWithdrawAmount,
             uint64[] marketIds
         );
         /// Set per-user trading fee rates in basis points. Only callable by admin.

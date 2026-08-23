@@ -231,6 +231,14 @@ pub fn run_get_account<H: PerpHost>(
             totalOpenOrderInitialMargin: s.total_open_order_initial_margin,
             totalMaintMargin: s.total_maint_margin,
             availableBalance: s.available_balance,
+            // Structurally zero: isolated-only, so there are no cross positions to sum.
+            // Present for response-shape compatibility only — see the note on `getAccount`.
+            crossUnPnl: 0,
+            // `max(0, availableBalance)`. Floors at zero because "withdraw a negative amount" is
+            // meaningless; the un-clamped value stays visible in `availableBalance` above, so the
+            // clamp costs no information. NOTE this is the perp→spot limit, not the protocol
+            // withdrawal limit (`withdraw` gates on `usdcBalance`).
+            maxWithdrawAmount: s.available_balance.max(0) as u64,
             // Echoed so the totals are self-checkable against `getMarginInfo` per id.
             marketIds: view.market_ids.to_vec(),
         },
