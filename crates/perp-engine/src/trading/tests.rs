@@ -133,42 +133,54 @@ fn get_account(ctx: &mut TestCtx, user: Address) -> crate::interface::IPerpDex::
 }
 
 /// **Every field of an `AccountBalanceChanged` payload against `getAccount` for the same user in the
-/// CURRENT state.** This is the anti-divergence pin the shared producer exists for: the event and
-/// `getAccount` both encode `margin_view::index_account_scalars`, so a second implementation of any of
-/// these ten numbers — or one surface folding a different market set, or clamping where the other
-/// does not — fails here.
+/// CURRENT state.** The event's payload is a strict SUBSET of `getAccount`'s scalar set (three
+/// balances; the seven account-level margin totals are `getAccount`-only, the way Binance keeps them
+/// on REST rather than on `ACCOUNT_UPDATE`), so "every field of the payload" is three comparisons —
+/// but they are still the *whole* payload, and one surface folding a different market set, or
+/// clamping where the other does not, fails here.
+///
+/// It is deliberately **not** only a comparison against `getAccount`: the two folds are different
+/// walks now (`index_account_wallet_balances` vs `index_account_scalars`), so this also re-derives
+/// both non-trivial fields from RAW STORED STATE — the account blob and `Σ pos.margin` over the
+/// index — which is what keeps it from degenerating into "two calls into the same code agree".
 ///
 /// Only meaningful for a user's LAST event of a call (earlier ones are intermediate after-images by
 /// design), which is exactly how the callers use it.
 fn assert_event_matches_get_account(ctx: &mut TestCtx, event: &AccountBalanceChanged) {
     let a = get_account(ctx, event.user);
-    let got = (
-        event.usdcBalance,
-        event.totalWalletBalance,
-        event.totalCrossWalletBalance,
-        event.totalMarginBalance,
-        event.totalUnrealizedProfit,
-        event.totalInitialMargin,
-        event.totalPositionInitialMargin,
-        event.totalOpenOrderInitialMargin,
-        event.totalMaintMargin,
-        event.availableBalance,
-    );
-    let want = (
-        a.usdcBalance,
-        a.totalWalletBalance,
-        a.totalCrossWalletBalance,
-        a.totalMarginBalance,
-        a.totalUnrealizedProfit,
-        a.totalInitialMargin,
-        a.totalPositionInitialMargin,
-        a.totalOpenOrderInitialMargin,
-        a.totalMaintMargin,
-        a.availableBalance,
-    );
     assert_eq!(
-        got, want,
+        (
+            event.usdcBalance,
+            event.totalWalletBalance,
+            event.totalCrossWalletBalance,
+        ),
+        (
+            a.usdcBalance,
+            a.totalWalletBalance,
+            a.totalCrossWalletBalance,
+        ),
         "AccountBalanceChanged and getAccount disagree for {:?}",
+        event.user
+    );
+
+    // ── …and both non-trivial fields, re-derived from raw stored state ────────────────────────
+    let acct = storage::load_account(ctx, event.user).unwrap();
+    let stored_usdc: U256 = acct.usdc_balance.clone().into();
+    assert_eq!(
+        (event.usdcBalance, event.totalCrossWalletBalance),
+        (stored_usdc, acct.perp_wallet_balance),
+        "the two stored balances go out verbatim, unclamped, for {:?}",
+        event.user
+    );
+    let sigma_margin: i128 = a
+        .marketIds
+        .iter()
+        .map(|m| storage::load_position(ctx, event.user, *m).unwrap().margin as i128)
+        .sum();
+    assert_eq!(
+        event.totalWalletBalance as i128,
+        event.totalCrossWalletBalance as i128 + sigma_margin,
+        "totalWalletBalance is GROSS: cross + Σ pos.margin over the per-user index, for {:?}",
         event.user
     );
 }
@@ -1778,8 +1790,18 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
     );
     // BOB is flat with no orders, so he has left the market index entirely: the event's totals are
     // an EMPTY fold plus the raw wallet, and it still agrees with `getAccount` field for field.
-    assert_eq!(bob_events[0].totalWalletBalance, -maker_fee, "no silos left");
-    assert_eq!(bob_events[0].availableBalance, -maker_fee, "no ooIM left");
+    assert_eq!(
+        bob_events[0].totalWalletBalance, -maker_fee,
+        "no silos left"
+    );
+    // `availableBalance` left the event with the six other margin totals (they are `/fapi/v2/account`
+    // fields, not `ACCOUNT_UPDATE` fields), so it is asserted on its only remaining surface. The
+    // deficit shows through there too, which is the point of the un-clamping.
+    assert_eq!(
+        get_account(&mut ctx, BOB).availableBalance,
+        -maker_fee,
+        "no ooIM left, and getAccount reports the deficit unclamped"
+    );
     assert_event_matches_get_account(&mut ctx, &bob_events[0]);
     // Not a mint: the fee recipient really was paid, and the insolvent close's beyond-margin slice
     // really did reach the fund. The negative is the funding gap between the two.
@@ -11786,6 +11808,159 @@ mod account_snapshot_events {
         );
     }
 
+    /// **THE PAYLOAD/TRIGGER AGREEMENT.** A placement and a cancel cannot move ANY field the event
+    /// publishes — so the two tests above ("they publish nothing") are not merely Binance mimicry,
+    /// they are *consistent*: there is nothing to publish.
+    ///
+    /// This is the property the payload was narrowed for. The old eleven-field payload did NOT have
+    /// it: `totalOpenOrderInitialMargin` and `availableBalance` move on every placement and every
+    /// cancel, so the event shipped fields whose freshness its own trigger did not guarantee. The
+    /// assertions below pin both halves — the three published balances are byte-identical across a
+    /// placement and a cancel, and the numbers that DID move are `getAccount`-only.
+    ///
+    /// The order is placed in a market ALICE holds NO position in, which is the subtle leg: an
+    /// order-list transition flips per-user-market-index membership
+    /// (`storage::sync_user_market_membership`) with no snapshot mark, so the placement ADDS a market
+    /// to the set `Σ pos.margin` is summed over and the cancel DROPS it. That is only harmless
+    /// because a flat position carries no margin. If a flat position could hold margin,
+    /// `totalWalletBalance` would move here and this test is what would catch it.
+    #[test]
+    fn placement_and_cancel_cannot_move_any_published_field() {
+        // Force one snapshot for `user` and return its whole payload. `credit_perp(0)` is a write
+        // that MOVES NOTHING, so the payload is the current state verbatim — the same isolation
+        // trick `margin_view_tests::the_event_and_get_account_agree_field_for_field_on_the_same_state`
+        // uses.
+        fn published(ctx: &mut TestCtx, user: Address) -> (U256, i64, i64) {
+            let _ = JournalTr::take_logs(ctx.journal_mut());
+            start_call(ctx);
+            storage::mutate_account_balance(ctx, user, |a| a.credit_perp(0))
+                .unwrap()
+                .unwrap();
+            end_call(ctx);
+            let events = take_balance_events(ctx);
+            assert_eq!(
+                events.len(),
+                1,
+                "the probe must publish exactly one snapshot"
+            );
+            let e = &events[0];
+            assert_eq!(e.user, user);
+            (
+                e.usdcBalance,
+                e.totalWalletBalance,
+                e.totalCrossWalletBalance,
+            )
+        }
+
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+        add_market_2(&mut ctx);
+        // The fixture's long is in MARKET_ID; MARKET_2 is untouched, so the order below moves ALICE's
+        // index membership. Both non-trivial fields are live: she has a wallet AND a funded silo.
+        let before = published(&mut ctx, ALICE);
+        assert!(
+            before.1 != before.2 && before.2 != 0,
+            "fixture must make both published balances non-trivial, got {before:?}"
+        );
+        assert!(
+            !storage::load_user_markets(&mut ctx, ALICE)
+                .unwrap()
+                .contains(&MARKET_2),
+            "MARKET_2 must start OUTSIDE the index for the membership leg to be exercised"
+        );
+        let available_before = get_account(&mut ctx, ALICE).availableBalance;
+
+        // ── A placement ───────────────────────────────────────────────────────────────────────
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let out = run_perp_dex_call(
+            &placeOrderCall {
+                marketId: MARKET_2,
+                side: 0,
+                price: PRICE,
+                quantity: QTY,
+                orderType: 0,
+                tif: 0,
+                clientOrderId: FixedBytes::default(),
+            }
+            .abi_encode(),
+            10_000_000,
+            ALICE,
+            U256::ZERO,
+            false,
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(!out.reverted, "placement reverted: {:?}", out.bytes);
+        assert!(
+            take_balance_events(&mut ctx).is_empty(),
+            "placement is silent"
+        );
+        let order_id: [u8; 32] =
+            crate::interface::IPerpDex::placeOrderCall::abi_decode_returns(&out.bytes)
+                .unwrap()
+                .0;
+        assert!(
+            storage::load_user_markets(&mut ctx, ALICE)
+                .unwrap()
+                .contains(&MARKET_2),
+            "the resting order really did add MARKET_2 to the index — the membership leg is live"
+        );
+        assert_eq!(
+            published(&mut ctx, ALICE),
+            before,
+            "a placement cannot move any published field — not the two balances, and not through \
+             the index-membership change it causes"
+        );
+        // …while the numbers the OLD payload carried really did move. Without this the equality
+        // above would hold for the trivial reason that nothing happened.
+        let after_place = get_account(&mut ctx, ALICE);
+        assert!(
+            after_place.totalOpenOrderInitialMargin > 0
+                && after_place.availableBalance < available_before,
+            "the resting order must move `Σ ooIM` and `availableBalance` — the two fields the \
+             narrowing removed, which is why they are REST-only: {:?}",
+            (
+                after_place.totalOpenOrderInitialMargin,
+                after_place.availableBalance,
+                available_before
+            )
+        );
+
+        // ── …and a cancel ─────────────────────────────────────────────────────────────────────
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let out = run_perp_dex_call(
+            &cancelOrderCall {
+                orderId: order_id.into(),
+                marketId: MARKET_2,
+            }
+            .abi_encode(),
+            10_000_000,
+            ALICE,
+            U256::ZERO,
+            false,
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(!out.reverted, "cancel reverted: {:?}", out.bytes);
+        assert!(take_balance_events(&mut ctx).is_empty(), "cancel is silent");
+        assert!(
+            !storage::load_user_markets(&mut ctx, ALICE)
+                .unwrap()
+                .contains(&MARKET_2),
+            "the cancel dropped MARKET_2 back out of the index — the other direction of the same leg"
+        );
+        assert_eq!(
+            published(&mut ctx, ALICE),
+            before,
+            "a cancel cannot move any published field either"
+        );
+        assert_eq!(
+            get_account(&mut ctx, ALICE).availableBalance,
+            available_before,
+            "…while `availableBalance` came back, again unannounced"
+        );
+    }
+
     /// **The emit filter is not a revert filter.** A placement refused by the margin gate emits
     /// NOTHING at all — not the (already absent) snapshot, and not `OrderPlaced`/`OrderRested`
     /// either. Validate-then-apply: under commit-only there is no undo, so a log emitted before a
@@ -12050,9 +12225,11 @@ mod account_snapshot_events {
             "setLeverage reverted: {:?}",
             String::from_utf8_lossy(&out.bytes)
         );
-        // +20_000 over the old 20_000, at the same one-`getAccount`-equivalent rate the other
-        // single-emission selectors pay for their fold.
-        assert_eq!(out.gas_used, 40_000);
+        // +10_000 over the base 20_000, at the same one-snapshot-fold rate the other
+        // single-emission selectors pay. (It was +20_000 while the payload carried the whole
+        // eleven-field roll-up and the emit path really ran `index_account_scalars`; the fold behind
+        // the three-balance payload is about half the loads and none of the derived math.)
+        assert_eq!(out.gas_used, 30_000);
 
         let events = take_balance_events(&mut ctx);
         assert_eq!(

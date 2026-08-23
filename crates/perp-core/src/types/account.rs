@@ -117,9 +117,10 @@ pub struct UserAccount {
     /// The true signed value is readable through EVERY published surface — there is no clamped one
     /// left. Both account views (`getAccount(address)`, index-driven, and
     /// `getAccountMargin(address, uint64[])`) return `int64 totalCrossWalletBalance` and
-    /// `int64 availableBalance` unclamped, AND so does the `AccountBalanceChanged` event, which
-    /// carries the same account-level scalar set as `getAccount` (same producer,
-    /// `margin_view::index_account_view`). An operator watching only the EVENT stream can therefore
+    /// `int64 availableBalance` unclamped, AND so does the `AccountBalanceChanged` event, whose
+    /// `int64 totalCrossWalletBalance` is this field verbatim. (The event carries only the three
+    /// BALANCES — the account-level margin totals around them are `getAccount`-only, the way Binance
+    /// keeps them on REST rather than on `ACCOUNT_UPDATE`.) An operator watching only the EVENT stream can therefore
     /// see a deficit appear, which used not to be true: the event projected the wallet through a
     /// `uint64` floored at 0 (via [`UserAccount::visible_perp_wallet_balance`], now test-only), the
     /// way Binance's own clamped `availableBalance` does

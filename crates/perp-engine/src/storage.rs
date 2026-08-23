@@ -370,6 +370,26 @@ pub fn load_account_ref<H: PerpHost>(
 /// Resting and cancelling touch only `total_buy/sell_{qty,notional}`, and both routes for that go
 /// through `save_position_reservation_only`.
 ///
+/// ## The payload agrees with this trigger, field by field
+///
+/// The published payload is now exactly the set this table can guarantee — three balances:
+///
+/// * `usdcBalance` = `UserAccount::usdc_balance`, `totalCrossWalletBalance` =
+///   `UserAccount::perp_wallet_balance`. Both live on the account blob, so only an account WRITE can
+///   move them, and the only account writer that does not mark is [`mutate_account`], whose two call
+///   sites set the nonce and the fee-rate pair. Neither balance is reachable from there.
+/// * `totalWalletBalance` = `totalCrossWalletBalance + Σ pos.margin`. `pos.margin` moves only through
+///   [`save_position`] (marks); [`save_position_reservation_only`] `debug_assert`s that it does not
+///   touch it. The market SET being summed can change without a mark — an order-list leg entering or
+///   leaving flips index membership in [`sync_user_market_membership`] — but a market can only be
+///   added or dropped by that leg while the position is flat, and a flat position carries no margin
+///   (asserted per market in `margin_view::index_account_wallet_balances`), so the sum is unchanged.
+///
+/// This was NOT true of the previous eleven-field payload: `totalOpenOrderInitialMargin` and
+/// `availableBalance` move on every placement and cancel, so the event shipped fields its own trigger
+/// did not keep fresh. Those seven fields are now `getAccount`-only. The property is pinned by
+/// `trading::tests::account_snapshot_events::placement_and_cancel_cannot_move_any_published_field`.
+///
 /// ## Why silence is right, and why this is the THIRD time the decision moved
 ///
 /// It is not that nothing observable changed — `availableBalance` = `cross − Σ ooIM` really does
@@ -422,9 +442,10 @@ pub fn load_account_ref<H: PerpHost>(
 /// * **Deterministic order**, because the set is a `BTreeSet<Address>` and not a hash map.
 ///
 /// What it saves, in walks. Each published snapshot costs one
-/// [`crate::margin_view::index_account_scalars`] fold: ≤ `MAX_USER_MARKETS` (16) markets × 2 `_ref`
-/// loads (`{market, position}` — flat, no shape-dependent worst case since the R12 freeze put both
-/// side aggregates in the position blob) ⇒ ≤ 33 loads, all cache-fill, none entering the block delta.
+/// [`crate::margin_view::index_account_wallet_balances`] fold: one account load plus
+/// ≤ `MAX_USER_MARKETS` (16) markets × **1** `_ref` load (the position alone — the narrowed payload
+/// needs no `Market`, no tier walk, no mark) ⇒ ≤ 18 loads, all cache-fill, none entering the block
+/// delta. It was ≤ 33 with two loads per market while the payload carried the margin roll-up.
 /// Against the per-write emission this removes:
 ///
 /// ```text
@@ -459,11 +480,13 @@ pub fn begin_perp_call<H: PerpHost>(context: &mut H) {
 /// liquidation sweep inside `updateIndexPrice`, and the batch drivers, are plain function calls in
 /// this same frame — their marks coalesce into this one drain, which is exactly the intent.
 ///
-/// Failure mode, unchanged from the write-site emission: the fold has narrowing guards (each `Σ` must
-/// fit its ABI width), so a pathological account — every such state already makes `getAccount` revert,
-/// and all of them are ≥ 9.2e12 USD sums at 6 dp — turns into a clean revert of a call whose perp
-/// writes have already landed. That is the same write-then-error exposure the previous design had at
-/// `save_account`, and the shell's `perp_write_count` tripwire reports it either way.
+/// Failure mode, much narrower than it was: the lean fold has exactly ONE narrowing guard left
+/// (`totalWalletBalance` must fit `int64`, i.e. a ≥ 9.2e12 USD sum at 6 dp), where the wide roll-up
+/// had six of them plus every per-market reject in `compute_margin_info` and the "index holds unknown
+/// market" invariant. Such a state still turns into a clean revert of a call whose perp writes have
+/// already landed — the same write-then-error exposure the write-site emission had at `save_account`,
+/// reported either way by the shell's `perp_write_count` tripwire — but the surface is one guard on a
+/// sum of stored scalars instead of the whole derived-margin stack.
 ///
 /// Tests that drive an engine handler directly (`run_place_order`, `storage::save_account`, …) rather
 /// than through the shell must call this themselves; nothing else does.
@@ -478,30 +501,26 @@ pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpE
 
 /// Folds and logs one `AccountBalanceChanged` — **the one and only site that constructs this log.**
 ///
-/// The nine margin scalars come from [`crate::margin_view::index_account_scalars`], the same producer
-/// `getAccount` folds, so the two published surfaces cannot report different numbers for the same
-/// state. The spot USDC balance is the one field not in that set and is read here.
+/// All three balances come from [`crate::margin_view::index_account_wallet_balances`], which is the
+/// LEAN fold: one account load plus `Σ pos.margin` over the per-user market index, at **one load per
+/// market**. The wide `index_account_scalars` roll-up `getAccount` folds is not on this path any more
+/// — its seven margin totals are REST-only fields (Binance publishes them on `/fapi/v2/account`, not
+/// on `ACCOUNT_UPDATE`), and dropping them from the payload is what let the emit path drop the
+/// `Market` load, the maintenance-margin tier walk, the unrealized-PnL arithmetic and the ooIM
+/// arithmetic. The two folds must still agree on the fields they share; the `debug_assertions`
+/// cross-check inside the lean fold compares them on every published snapshot.
 fn emit_account_snapshot<H: PerpHost>(context: &mut H, user: Address) -> Result<(), PerpError> {
-    let s =
-        crate::margin_view::index_account_scalars(context, user, "AccountBalanceChanged", None)?;
-    let usdc_balance: primitives::U256 =
-        load_account_ref(context, user)?.usdc_balance.clone().into();
+    let b =
+        crate::margin_view::index_account_wallet_balances(context, user, "AccountBalanceChanged")?;
     context.log(primitives::Log {
         address: PERP_DEX_ADDRESS,
         data: {
             use alloy_primitives::IntoLogData;
             crate::interface::IPerpDex::AccountBalanceChanged {
                 user,
-                usdcBalance: usdc_balance,
-                totalWalletBalance: s.total_wallet_balance,
-                totalCrossWalletBalance: s.total_cross_wallet_balance,
-                totalMarginBalance: s.total_margin_balance,
-                totalUnrealizedProfit: s.total_unrealized_profit,
-                totalInitialMargin: s.total_initial_margin,
-                totalPositionInitialMargin: s.total_position_initial_margin,
-                totalOpenOrderInitialMargin: s.total_open_order_initial_margin,
-                totalMaintMargin: s.total_maint_margin,
-                availableBalance: s.available_balance,
+                usdcBalance: b.usdc_balance,
+                totalWalletBalance: b.total_wallet_balance,
+                totalCrossWalletBalance: b.total_cross_wallet_balance,
             }
             .to_log_data()
         },
@@ -534,6 +553,11 @@ pub fn save_account<H: PerpHost>(
 ///   pushes no `ACCOUNT_UPDATE` — see the trigger table on [`mark_account_snapshot_dirty`]. This is
 ///   what makes a pure placement and a pure cancel silent. Routing an aggregates-only write through
 ///   `save_position` instead would publish a snapshot for both.
+///
+/// `margin` is asserted unchanged alongside `amount`, and that assertion is load-bearing rather than
+/// defensive: `Σ pos.margin` is half of the `totalWalletBalance` this event publishes, so a
+/// `margin` edit slipping through this silent route would move a PUBLISHED field with no snapshot to
+/// announce it — the exact payload/trigger mismatch the narrowed payload exists to close.
 pub fn save_position_reservation_only<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -547,6 +571,12 @@ pub fn save_position_reservation_only<H: PerpHost>(
             old.amount, pos.amount,
             "save_position_reservation_only on a path that changed pos.amount — the zero-crossing \
              registry hooks + collateral re-derivation in save_position are NOT dead there"
+        );
+        debug_assert_eq!(
+            old.margin, pos.margin,
+            "save_position_reservation_only on a path that changed pos.margin — that is a PUBLISHED \
+             quantity (`Σ pos.margin` is `totalWalletBalance − totalCrossWalletBalance`), and this \
+             route marks nobody, so the move would never reach the event stream"
         );
     }
     typed_store_mut(context).set_position(user, market_id, pos);

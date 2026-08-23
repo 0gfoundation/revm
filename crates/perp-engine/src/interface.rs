@@ -541,9 +541,11 @@ sol! {
         ///
         /// There is no longer any clamped surface to work around: `AccountBalanceChanged` used to
         /// project the cross wallet through a `uint64` floored at 0, which hid a deficit from anyone
-        /// watching only the event stream. That field is now `int64 totalCrossWalletBalance` and the
-        /// event carries this whole scalar set, so the event stream, this selector and `getAccount`
-        /// all report the same signed numbers.
+        /// watching only the event stream. That field is now `int64 totalCrossWalletBalance` on all
+        /// three surfaces (the event, this selector and `getAccount`), so they report the same signed
+        /// number. The event carries ONLY the balances, though — the six margin totals below are
+        /// REST-only, on this selector and `getAccount`; see the note on `AccountBalanceChanged` for
+        /// why a stream cannot keep them fresh.
         ///
         /// Like `getMarginInfo` this is a pure read: it stores nothing and moves no money.
         function getAccountMargin(address user, uint64[] marketIds) external view returns (
@@ -729,67 +731,88 @@ sol! {
         // Feeds: internal wallet movement history
         event TransferToPerp(address indexed user, uint64 amount);
         event TransferFromPerp(address indexed user, uint64 amount);
-        /// Account after-image, emitted by each write that moves one of the fields below.
+        /// Account BALANCE after-image — our `ACCOUNT_UPDATE`'s `B[]` leg, and nothing else.
         ///
-        /// That is *usually* an account write that moves money, and for one case it is not: an order
-        /// RESTING writes no account, but its open-order initial margin raises `Σ ooIM` and therefore
-        /// lowers `availableBalance`, so `placeOrder` publishes the snapshot too (from the same walk
-        /// its admission gate has to do anyway). A rejected placement emits nothing.
+        /// # The payload is exactly what the trigger can guarantee
         ///
-        /// **Field-for-field the account-level scalar set `getAccount(address)` returns** (less the
-        /// `marketIds` echo), produced by the SAME code over the SAME market set — the per-user
-        /// market index — via `margin_view::index_account_scalars`. Neither surface holds arithmetic
-        /// of its own, so the event and the view cannot disagree for the same state.
+        /// This event used to carry ELEVEN fields: the whole account-level margin roll-up
+        /// (`totalMarginBalance`, `totalUnrealizedProfit`, `totalInitialMargin`,
+        /// `totalPositionInitialMargin`, `totalOpenOrderInitialMargin`, `totalMaintMargin`,
+        /// `availableBalance`). Seven of those are gone, because they are things Binance publishes on
+        /// **REST `/fapi/v2/account`**, not on the user stream. Binance's measured `ACCOUNT_UPDATE`
+        /// payload (R14, mainnet, 2026-08-21, `misc/evidence/binance-run14-user-stream.json`) carries
+        /// per-asset balances `B[{a, wb, cw, bc}]` and per-position `P[...]` — **no account-level
+        /// margin totals at all.**
         ///
-        /// ⚠️ `perpWalletBalance` (`uint64`, floored at 0) is GONE. It is now
-        /// `int64 totalCrossWalletBalance`: the same quantity, SIGNED and UNCLAMPED, and named the
-        /// way `getAccount`/`getAccountMargin` name it. The floor was a real blind spot rather than a
+        /// Keeping them here was not merely un-Binance-like, it was INCONSISTENT. We adopted
+        /// Binance's TRIGGER (a placement or a cancel publishes nothing — measured, and enforced by
+        /// `storage::mark_account_snapshot_dirty`) while keeping the wider payload, and a placement
+        /// DOES move `totalOpenOrderInitialMargin` and therefore `availableBalance`. So the event
+        /// shipped fields whose freshness its own trigger did not guarantee. Narrowing the payload
+        /// fixes that from the payload side: **every field below can only change at a write that
+        /// marks the user**, so a stream consumer's copy of these four is never stale.
+        ///
+        /// `getAccount(address)` is the sole source of the seven that left — and they are LIVE
+        /// quantities (they move with the mark while the user does nothing), so a stream could not
+        /// have kept them fresh under any trigger short of one that fires on every price update.
+        ///
+        ///   usdcBalance              spot / withdrawal-layer USDC. NOT part of any total below.
+        ///   totalWalletBalance       Binance `wb` — GROSS perp wallet = cross + Σ positionMargin.
+        ///   totalCrossWalletBalance  Binance `cw` — the STORED `perp_wallet_balance`, verbatim.
+        ///
+        /// ## `usdcBalance` is a deliberate EXTENSION, not a Binance field
+        ///
+        /// Binance's futures user stream carries no spot balance at all — the futures wallet is the
+        /// only asset it reports. We keep `usdcBalance` anyway because `deposit` / `withdraw` /
+        /// `transferToPerp` / `transferFromPerp` move it and every one of them is a trigger site
+        /// (they all write the account), so publishing it costs one field on a snapshot that is
+        /// already being emitted and saves the consumer a poll it would otherwise have to make on
+        /// exactly the events it cares most about. It is an addition to the Binance shape, and a
+        /// consumer porting from Binance should expect it rather than look for it in the docs.
+        ///
+        /// ## `bc` is deliberately ABSENT
+        ///
+        /// Binance's `B[].bc` is the *balance change excluding PnL and commission* — a DELTA, not a
+        /// level. Publishing it would require a per-account baseline held across the transaction:
+        /// precisely the `BTreeMap`-of-pre-images + repeated `PublicAccountBalance` construction that
+        /// was deleted for cost (see `storage::mark_account_snapshot_dirty`, "Derived from WHICH
+        /// WRITE, never from comparing values"). A stream consumer that wants a delta can diff two
+        /// consecutive snapshots for the same user, which is strictly more information than `bc`
+        /// (`bc` excludes PnL and fees; the diff of two levels includes everything).
+        ///
+        /// ## Positions are NOT here, and do not need to be
+        ///
+        /// `PositionChanged` is our `P[]` analogue, and the account snapshot is emitted **LAST** in
+        /// the transaction (see GRANULARITY below), so an indexer replaying the log in order already
+        /// holds every `PositionChanged` of that transaction before it reaches this event. Duplicating
+        /// them into an array here would be a second encoding of the same facts.
+        ///
+        /// ⚠️ `perpWalletBalance` (`uint64`, floored at 0) is GONE and has been for two revisions. It
+        /// is `int64 totalCrossWalletBalance`: the same quantity, SIGNED and UNCLAMPED, and named the
+        /// way `getAccount` / `getAccountMargin` name it. The floor was a real blind spot rather than a
         /// cosmetic one — a negative cross wallet IS reachable (a maker close fee the M1-capped
-        /// opening margin could not absorb; see
-        /// `types::UserAccount::perp_wallet_balance` and
+        /// opening margin could not absorb; see `types::UserAccount::perp_wallet_balance` and
         /// `trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet`), so an
-        /// operator watching only the event stream could not see a deficit accumulate and had to poll
-        /// an account view to find one. Every balance-like field below is now `int64` and reports its
-        /// sign; nothing on this event is clamped.
-        ///
-        /// See `getAccount` for the field-by-field contract of the nine totals. In brief:
-        ///
-        ///   usdcBalance                 spot / withdrawal-layer USDC. NOT part of any total.
-        ///   totalWalletBalance          GROSS perp wallet = cross + Σ positionMargin.
-        ///   totalCrossWalletBalance     the STORED `perp_wallet_balance`, verbatim and signed.
-        ///   totalMarginBalance          totalWalletBalance + totalUnrealizedProfit (equity).
-        ///   totalUnrealizedProfit       Σ unrealizedProfit at mark.
-        ///   totalInitialMargin          Σ initialMargin (== the next two, summed).
-        ///   totalPositionInitialMargin  Σ positionInitialMargin.
-        ///   totalOpenOrderInitialMargin Σ openOrderInitialMargin — derived, escrowed nowhere.
-        ///   totalMaintMargin            Σ maintMargin.
-        ///   availableBalance            cross − totalOpenOrderInitialMargin: what the engine's own
-        ///                               admission gates will actually let the user spend.
+        /// operator watching only the event stream could not see a deficit accumulate. Nothing on this
+        /// event is clamped.
         ///
         /// GRANULARITY: **exactly one per affected user per transaction, emitted last**, in ascending
-        /// address order. Every published payload is therefore a SETTLED account state — the totals
-        /// are account-level, and draining after the call has finished is what keeps a half-updated
-        /// one (wallet leg landed, position leg not yet) out of the stream.
+        /// address order. Every published payload is therefore a SETTLED account state — draining
+        /// after the call has finished is what keeps a half-updated one (wallet leg landed, position
+        /// leg not yet) out of the stream.
         ///
         /// ⚠️ TRIGGER: a user is included only if the transaction moved that user's WALLET or a
-        /// POSITION's stored state. A pure placement and a pure cancel publish NOTHING, even though
-        /// they move `availableBalance` through `Σ openOrderInitialMargin` — so a consumer tracking
-        /// `availableBalance` from this stream alone will be stale between fills, and must poll
-        /// `getAccount`. That is deliberate Binance parity (measured: no `ACCOUNT_UPDATE` for an
-        /// unfilled or cancelled order); the full citation is on
-        /// `storage::mark_account_snapshot_dirty`, which is where the filter lives.
+        /// POSITION's stored state. A pure placement and a pure cancel publish NOTHING — and, unlike
+        /// before, that is now a complete statement about this payload rather than a caveat on it:
+        /// neither of them can move any of the three balances above. The `Σ ooIM` term they DO move
+        /// lives on `getAccount` only. Full citation on `storage::mark_account_snapshot_dirty`, which
+        /// is where the filter lives; the agreement between this payload and that trigger is pinned by
+        /// `trading::tests::account_snapshot_events::placement_and_cancel_cannot_move_any_published_field`.
         event AccountBalanceChanged(
             address indexed user,
             uint256 usdcBalance,
             int64   totalWalletBalance,
-            int64   totalCrossWalletBalance,
-            int64   totalMarginBalance,
-            int64   totalUnrealizedProfit,
-            uint64  totalInitialMargin,
-            uint64  totalPositionInitialMargin,
-            uint64  totalOpenOrderInitialMargin,
-            uint64  totalMaintMargin,
-            int64   availableBalance
+            int64   totalCrossWalletBalance
         );
         event UserFeeRatesUpdated(address indexed user, uint64 makerFeeBps, uint64 takerFeeBps);
 

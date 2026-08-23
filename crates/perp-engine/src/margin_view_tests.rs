@@ -1337,9 +1337,18 @@ fn get_account_totals_equal_the_sum_of_per_market_get_margin_info() {
     );
 }
 
-/// ONE IMPLEMENTATION, NOT TWO — **the `AccountBalanceChanged` leg.** The event carries the same
-/// account-level scalar set `getAccount` returns, and this is the test that fails if they ever
-/// diverge for the SAME state.
+/// TWO FOLDS, ONE ANSWER — **the `AccountBalanceChanged` leg.** The event carries three balances and
+/// `getAccount` carries those three plus seven margin totals; the two are produced by DIFFERENT walks
+/// now (`index_account_wallet_balances`, one load per market, against `index_account_scalars`, two),
+/// and this is the test that fails if they ever diverge for the SAME state.
+///
+/// It also pins WHICH fields the event carries. The seven that left — `totalMarginBalance`,
+/// `totalUnrealizedProfit`, `totalInitialMargin`, `totalPositionInitialMargin`,
+/// `totalOpenOrderInitialMargin`, `totalMaintMargin`, `availableBalance` — are things Binance
+/// publishes on REST `/fapi/v2/account`, not on `ACCOUNT_UPDATE` (measured: R14's `ACCOUNT_UPDATE`
+/// carries `B[]` + `P[]` and no account-level totals at all). They are asserted below on
+/// `getAccount`, which is now their only surface; the fixture-richness check that used to read them
+/// off the event reads them from there.
 ///
 /// Method: take the rich two-market fixture (a long with resting orders on both sides so the joint
 /// `max()` and the Assuming-Price uplift are both live, plus a short on a fractional grid with an
@@ -1403,51 +1412,56 @@ fn the_event_and_get_account_agree_field_for_field_on_the_same_state() {
     let e = &events[0];
 
     let a = get_account(&mut ctx, ALICE);
+    // ── The WHOLE event payload, against getAccount ───────────────────────────────────────────
     assert_eq!(
         (
             e.user,
             e.usdcBalance,
             e.totalWalletBalance,
             e.totalCrossWalletBalance,
-            e.totalMarginBalance,
-            e.totalUnrealizedProfit,
-            e.totalInitialMargin,
-            e.totalPositionInitialMargin,
-            e.totalOpenOrderInitialMargin,
-            e.totalMaintMargin,
-            e.availableBalance,
         ),
         (
             ALICE,
             a.usdcBalance,
             a.totalWalletBalance,
             a.totalCrossWalletBalance,
-            a.totalMarginBalance,
-            a.totalUnrealizedProfit,
-            a.totalInitialMargin,
-            a.totalPositionInitialMargin,
-            a.totalOpenOrderInitialMargin,
-            a.totalMaintMargin,
-            a.availableBalance,
         ),
-        "the event and getAccount must be the same numbers — they share one producer, \
-         `margin_view::index_account_scalars`, over one market set (the per-user index)"
+        "the event and getAccount must be the same numbers on every field they share — two folds \
+         (`index_account_wallet_balances` and `index_account_scalars`) over one market set (the \
+         per-user index)"
     );
-    // The fixture has to exercise every term, or the equality above proves little.
+    // The two non-trivial fields must not be trivially equal by both being zero, and `Σ pos.margin`
+    // (the whole difference between the GROSS and CROSS wallet) has to be live, or the equality above
+    // proves little about the fold that produced it.
     assert!(
-        e.totalOpenOrderInitialMargin > 0
-            && e.totalPositionInitialMargin > 0
-            && e.totalMaintMargin > 0
-            && e.totalUnrealizedProfit != 0
-            && e.totalWalletBalance != e.totalCrossWalletBalance,
-        "fixture must make every scalar non-trivial: {:?}",
+        e.totalWalletBalance != e.totalCrossWalletBalance && e.totalCrossWalletBalance != 0,
+        "fixture must make the gross/cross split live: {:?}",
+        (e.totalWalletBalance, e.totalCrossWalletBalance)
+    );
+
+    // ── The seven fields that LEFT: asserted on their only remaining surface ───────────────────
+    //
+    // Their departure is the change, and this is what pins it: `getAccount` still reports them, all
+    // non-trivial on this fixture, and the event above carries none of them. A future pass that
+    // widens the event again has to come back through this test.
+    assert!(
+        a.totalOpenOrderInitialMargin > 0
+            && a.totalPositionInitialMargin > 0
+            && a.totalInitialMargin > 0
+            && a.totalMaintMargin > 0
+            && a.totalUnrealizedProfit != 0
+            && a.totalMarginBalance != a.totalWalletBalance
+            && a.availableBalance != a.totalCrossWalletBalance,
+        "the REST-only totals must all be non-trivial here, or their absence from the event is \
+         untested: {:?}",
         (
-            e.totalOpenOrderInitialMargin,
-            e.totalPositionInitialMargin,
-            e.totalMaintMargin,
-            e.totalUnrealizedProfit,
-            e.totalWalletBalance,
-            e.totalCrossWalletBalance
+            a.totalOpenOrderInitialMargin,
+            a.totalPositionInitialMargin,
+            a.totalInitialMargin,
+            a.totalMaintMargin,
+            a.totalUnrealizedProfit,
+            a.totalMarginBalance,
+            a.availableBalance,
         )
     );
 }
