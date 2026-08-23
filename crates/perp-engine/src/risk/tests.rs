@@ -492,6 +492,64 @@ fn adl_closes_insolvent_residual_against_opposite_holder_conserving_no_if() {
     );
 }
 
+/// REGRESSION for the stale-mark band centre: `run_update_index_price` used to hand the liquidation
+/// sweep the `Market` it loaded BEFORE `save_mark_price`, so the maintenance check ran against the
+/// NEW mark while `match_order` centred the fill-time price band on the OLD one — disagreeing by
+/// exactly the move that triggered the sweep.
+///
+/// This fixture is the discriminating one: a bid at $80 with the mark moving $100 -> $75 is INSIDE
+/// the correct band ([$67.50, $82.50]) and OUTSIDE the stale one ([$90, $110]). So the book must
+/// absorb the close here. Under the bug it absorbed nothing and the residual routed to ADL —
+/// inverting the intended book -> insurance-fund -> ADL precedence exactly when the sweep matters.
+///
+/// (Its sibling `adl_skips_opposite_holder_whose_only_order_reserves_no_margin` sits at $60, which
+/// is out of band under BOTH centres and therefore cannot detect this; that is why this test
+/// exists separately rather than as an assertion added there.)
+#[test]
+fn the_sweep_bands_the_close_on_the_post_update_mark_not_the_pre_update_one() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_position_account(
+        &mut ctx,
+        ALICE,
+        QTY,
+        -ENTRY_VALUE,
+        MARGIN,
+        5,
+        USER_WALLET as i64,
+    );
+    seed_position_account(&mut ctx, KEEPER, -QTY, ENTRY_VALUE, MARGIN, 5, 0);
+    // KEEPER bids his whole short back at $80: pure reduce, reserves nothing, and in band once the
+    // mark is $75.
+    place_order(&mut ctx, KEEPER, 0, 8_000, QTY as u64);
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: 7_500,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    // The book took it: ALICE's long is gone and KEEPER's short closed against it. Under the stale
+    // centre this bid was unreachable, ALICE would still hold `QTY`, and the residual would have
+    // gone to ADL instead.
+    assert_eq!(
+        position(&mut ctx, ALICE).amount,
+        0,
+        "the close must be absorbed by the in-band bid, not routed past it"
+    );
+    assert_eq!(
+        position(&mut ctx, KEEPER).amount,
+        0,
+        "the counterparty's short is closed by his own resting bid"
+    );
+}
+
 /// The "holder has open orders" exclusion is asked of the ORDER LISTS, not of
 /// `margin_reserved`. A PURE-REDUCE resting order (fully absorbed by the holder's own position)
 /// reserves ZERO margin, so the reservation proxy would wave such a holder through and ADL would
@@ -527,12 +585,18 @@ fn adl_skips_opposite_holder_whose_only_order_reserves_no_margin() {
     .unwrap();
 
     // A BUY of his whole short is PURE REDUCE: it opens no new exposure, so it reserves nothing.
-    // $80 is deep enough to sit below the fill-time band (the sweep bands against the pre-update
-    // mark of $100, so ±10% = [$90, $110]), which is what keeps the liquidation's market sell
-    // from simply eating this bid — the whole residual has to reach ADL for the predicate to be
-    // exercised. It does not move the mark: price1 and the contract price both stay at the index,
-    // so their median is the index regardless of the basis this bid contributes.
-    place_order(&mut ctx, KEEPER, 0, 8_000, QTY as u64);
+    // $60 is deep enough to sit below the fill-time band, which is what keeps the liquidation's
+    // market sell from simply eating this bid — the whole residual has to reach ADL for the
+    // predicate to be exercised. It does not move the mark: price1 and the contract price both
+    // stay at the index, so their median is the index regardless of the basis this bid contributes.
+    //
+    // The band is centred on the POST-update mark of $75, so ±10% = [$67.50, $82.50]. This fixture
+    // used to sit at $80 and relied on the sweep banding against the PRE-update mark of $100
+    // ([$90, $110]) — i.e. on the stale-mark bug this file's sweep no longer has. $80 is in band
+    // under the correct centre, so the bid would be eaten and ADL never reached: the assertions
+    // below would still pass while testing nothing. $60 restores the scenario rather than the
+    // expectation.
+    place_order(&mut ctx, KEEPER, 0, 6_000, QTY as u64);
     let keeper_pos = position(&mut ctx, KEEPER);
     let keeper_market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
     assert_eq!(

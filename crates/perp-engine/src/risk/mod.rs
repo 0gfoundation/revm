@@ -1640,6 +1640,21 @@ pub fn run_update_index_price<H: PerpHost>(
     // The new mark + funding are now persisted. Liquidate any position that fell
     // below maintenance, synchronously inside this oracle tx (so Liquidation logs
     // attach to this receipt, and there is zero window before the sweep runs).
+    //
+    // RE-LOAD, do not reuse the `market` captured at the top of this function: that Arc predates
+    // `save_mark_price` above, so its `mark_price` is the OLD one. The sweep threads this `Market`
+    // down to `match_order`, which centres the fill-time price band on `market.mark_price` — so
+    // reusing it would check maintenance against the NEW mark while banding the close around the
+    // OLD one, disagreeing by exactly the move that triggered the sweep. At the default band that
+    // puts the whole live book out of range after any large move: the close absorbs nothing, the
+    // residual is insolvent, and it routes to ADL instead of the book and the insurance fund —
+    // inverting the intended precedence precisely when the sweep matters most.
+    let market = storage::load_market_ref(context, args.marketId)?
+        .ok_or_else(|| crate::errors::perp_invariant_err("updateIndexPrice: market vanished before sweep"))?;
+    debug_assert_eq!(
+        market.mark_price, mark_price,
+        "liquidation sweep: the band centre must be the mark the maintenance check uses"
+    );
     run_liquidation_sweep(context, args.marketId, &market, mark_price)?;
 
     // ── 6. Emit events ────────────────────────────────────────────────────────
