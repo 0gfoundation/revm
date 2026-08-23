@@ -1309,7 +1309,7 @@ fn execute_limit_order<H: PerpHost>(
         TimeInForce::PostOnly => {
             // No match runs → the do-not-cross BBO is still current at rest; thread it in.
             let bbo = ensure_post_only_does_not_cross(context, market_id, side, price)?;
-            rest_in_book(
+            match rest_in_book(
                 context,
                 account,
                 &order_id,
@@ -1322,7 +1322,13 @@ fn execute_limit_order<H: PerpHost>(
                 market,
                 Some(bbo),
                 pending_placed,
-            )
+            )? {
+                RestOutcome::Rested => Ok(()),
+                // PostOnly never matches, so nothing has been written: a genuine reject is both
+                // safe and the better answer — the caller learns its quote was refused instead of
+                // silently getting nothing.
+                RestOutcome::RefusedTooGoodBest => Err(perp_err(TOO_GOOD_BEST_REJECT)),
+            }
         }
         TimeInForce::Gtc => {
             // GTC is the ONE kind that rests its remainder, so `match_order` derives
@@ -1343,7 +1349,7 @@ fn execute_limit_order<H: PerpHost>(
                 pending_placed,
             )?;
             if remaining > 0 {
-                rest_in_book(
+                let outcome = rest_in_book(
                     context,
                     account,
                     &order_id,
@@ -1358,6 +1364,30 @@ fn execute_limit_order<H: PerpHost>(
                     None,
                     pending_placed,
                 )?;
+                if matches!(outcome, RestOutcome::RefusedTooGoodBest) {
+                    if remaining == quantity {
+                        // Crossed nothing, so nothing is written — reject, same as PostOnly.
+                        return Err(perp_err(TOO_GOOD_BEST_REJECT));
+                    }
+                    // FILLS ARE ALREADY APPLIED AND THERE IS NO PERP UNDO. Raising here would
+                    // revert the frame while the maker's consumed order stays deleted and the
+                    // positions/wallets it moved stay moved — a write-then-error that punishes an
+                    // innocent maker for the taker's price. Expire the remainder instead: the fills
+                    // stand, and this is the same "bounded fill + expired remainder" shape a market
+                    // order gets when it reaches the band.
+                    emit_pending_order_placed(context, pending_placed);
+                    cancel_unfilled_remainder(taker_order, remaining);
+                    context.log(Log {
+                        address: PERP_DEX_ADDRESS,
+                        data: IPerpDex::OrderCancelled {
+                            user: account,
+                            orderId: FixedBytes(order_id),
+                            marketId: market_id,
+                            reason: crate::types::CancelReason::PriceBandExpiry as u8,
+                        }
+                        .to_log_data(),
+                    });
+                }
             }
             Ok(())
         }
@@ -2079,6 +2109,21 @@ fn entries_iter(
     v.iter().copied()
 }
 
+/// Whether `rest_in_book` actually rested the order, or refused it as a too-good new best.
+///
+/// Refusal is returned rather than raised because the right response DEPENDS ON THE CALLER: a
+/// PostOnly placement has written nothing, so it becomes a genuine reject; a crossing GTC has
+/// already applied its fills and there is no perp undo, so raising would revert the frame while
+/// leaving the maker's consumed order deleted — a write-then-error that harms an innocent maker.
+/// That path expires the remainder instead.
+#[must_use]
+enum RestOutcome {
+    Rested,
+    RefusedTooGoodBest,
+}
+
+const TOO_GOOD_BEST_REJECT: &str = "placeOrder: a new best quote must be inside the price band";
+
 fn rest_in_book<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -2099,7 +2144,7 @@ fn rest_in_book<H: PerpHost>(
     // lands before this order's `OrderRested`, and only once the margin rejects have passed).
     // Already-`None` on the GTC path when the match flush emitted it.
     pending_placed: &mut Option<PendingOrderPlaced>,
-) -> Result<(), PerpError> {
+) -> Result<RestOutcome, PerpError> {
     let mut pos = storage::load_position(context, user, market_id)?;
     // Resting escrows nothing, so the account is READ-ONLY here: the fee rate (folded into the
     // account blob) for the book entry, and the cross wallet for the derived admission gate. An
@@ -2119,6 +2164,52 @@ fn rest_in_book<H: PerpHost>(
             (hot.best_bid, hot.best_ask)
         }
     };
+
+    // A quote that BECOMES the best must sit inside the fill-time band. Gating on "becomes the BBO"
+    // rather than on "is out of band" is what makes this precise instead of blanket: an out-of-band
+    // level is harmful only while it is the best — that is when it poisons the PostOnly cross check
+    // (which reads the cached best with no band term) and when it feeds the mid-price sample that
+    // flows into the mark median. A level sitting behind an in-band one is invisible to both, so
+    // deep passive orders keep resting, which the fill-time band deliberately allows.
+    //
+    // This is the PLACEMENT half of a pair; the capped sweep in `run_update_index_price` is the
+    // DRIFT half (a mark move can strand a book that was in band when placed). Neither subsumes
+    // the other.
+    //
+    // It applies to EVERY resting order, not just PostOnly. A crossing GTC stops at the band and
+    // rests its remainder at its own limit price, so `best_bid = 200` with the mark at 100 is
+    // reachable without ever touching the PostOnly path — and a best_bid that high rejects nearly
+    // every PostOnly sell. Gating PostOnly alone would leave that half open.
+    //
+    // Only the TEST is hoisted here; the two cache writes it guards stay inside APPLY, because a
+    // genuine reject must not be preceded by a write (commit-only has no undo). The flag is reused
+    // there so the condition cannot drift out of step with this one.
+    let becomes_best = match side {
+        Side::Buy => best_bid == 0 || price > best_bid,
+        Side::Sell => best_ask == 0 || price < best_ask,
+    };
+    if becomes_best {
+        // ONE-SIDED, matching the sweep's scoping and the measured exchange behaviour. The harms are
+        // asymmetric: a new best that is too GOOD to be true — an ask below `mark_lower`, a bid above
+        // `mark_upper` — both mis-rejects the opposite side's PostOnly orders (the cross check rejects
+        // on `best_ask <= price` / `best_bid >= price`, so a too-low ask or too-high bid rejects MORE)
+        // and pollutes the mid-price sample. A new best on the FAR side only pollutes the sample, and
+        // it is the ordinary "thin book, deep quote" case: a live probe on the reference exchange
+        // placed a sell at 1.389x mark and it was accepted, so rejecting it here would diverge for no
+        // gain and would break the deep passive orders the fill-time band deliberately allows.
+        let (mark_upper, mark_lower) =
+            crate::math::mark_band_bounds(market.mark_price, market.price_band_bps);
+        let p = price as u128;
+        let too_good = match side {
+            Side::Sell => p < mark_lower,
+            Side::Buy => p > mark_upper,
+        };
+        if too_good {
+            // Write-clean: nothing above this point mutates. The caller turns this into a reject or
+            // an expiry depending on whether it has already applied fills.
+            return Ok(RestOutcome::RefusedTooGoodBest);
+        }
+    }
 
     match side {
         Side::Buy => {
@@ -2269,7 +2360,7 @@ fn rest_in_book<H: PerpHost>(
             storage::push_bid_order(context, market_id, price, *order_id)?;
 
             // Keep best_bid cache up to date.
-            if best_bid == 0 || price > best_bid {
+            if becomes_best {
                 storage::save_best_bid(context, market_id, price)?;
                 // best_ask from the single resolve above (post-match for GTC).
                 record_mid_price_sample_for_best_quote_change(context, market_id, price, best_ask)?;
@@ -2361,7 +2452,7 @@ fn rest_in_book<H: PerpHost>(
             storage::push_ask_order(context, market_id, price, *order_id)?;
 
             // Keep best_ask cache up to date.
-            if best_ask == 0 || price < best_ask {
+            if becomes_best {
                 storage::save_best_ask(context, market_id, price)?;
                 // best_bid from the single resolve above (post-match for GTC).
                 record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, price)?;
@@ -2396,7 +2487,7 @@ fn rest_in_book<H: PerpHost>(
         .to_log_data(),
     });
 
-    Ok(())
+    Ok(RestOutcome::Rested)
 }
 
 // ── Cancel helpers ─────────────────────────────────────────────────────────────

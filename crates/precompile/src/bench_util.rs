@@ -83,8 +83,22 @@ fn the_market() -> Market {
         funding_interval: 0,
         interest_rate: 0,
         liquidation_fee_rate_bps: 0,
-        // Wide band so Sim C's marketable fills are never rejected by the fill-time off-mark guard
-        // (there is NO placement-time band on this tip — deep passive orders always rest).
+        // Wide band so Sim C's marketable fills are never rejected by the fill-time off-mark guard.
+        //
+        // ⚠️ There IS a placement-time band now, and it is not fully disabled by this value. A quote
+        // that BECOMES the best must be inside the band when it is too GOOD to be true, and
+        // `mark_band_bounds` maps `bps >= 10_000` to `lower = 0` but only widens the UPPER edge to
+        // `mark * (10_000 + bps)/10_000` = `101 * BASE` here. Asks are therefore unconstrained
+        // (nothing is below 0), but a new best BID above `101 * BASE` is REJECTED — and `place`
+        // panics on reject.
+        //
+        // Every builder below lays bids on an ascending grid from `BASE`, so each one is a new best
+        // bid and the ceiling is a hard cap on scenario width: `BASE + i*TICK` grids break past
+        // `i = 10_000`, and the `BASE + 2*i*TICK` grids (`scenario_wide`, `build_sparse_book`) past
+        // `i = 5_000`. The module note about a 20 878-level book is ABOVE that cap. Raise
+        // `price_band_bps` (it scales the upper edge linearly) or drop `mark_price` to 0 (which
+        // returns `(u128::MAX, 0)` = no band at all, the choice the second market below makes) if a
+        // wider book is needed.
         price_band_bps: 1_000_000,
         // Mark anchored at BASE so Sim C's taker (which fills near BASE) is well inside the band.
         mark_price: BASE,

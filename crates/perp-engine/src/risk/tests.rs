@@ -4088,6 +4088,63 @@ mod band_expiry {
         )
     }
 
+    /// An **IOC** taker. Used where the fixture needs a crossing order that provably reaches an
+    /// out-of-band level but must not REST: crossing a level past the far band edge requires a limit
+    /// past that edge too, and a resting order that would become a too-good best is refused at
+    /// placement. IOC drops the remainder, so the only thing under test is the fill-time band.
+    fn ioc(ctx: &mut TestCtx, user: Address, side: u8, price: u64) -> Result<Bytes, PerpError> {
+        run_place_order(
+            &placeOrderCall {
+                marketId: MARKET_ID,
+                side,
+                price,
+                quantity: 1,
+                orderType: 0, // Limit
+                tif: 1,       // IOC
+                clientOrderId: FixedBytes::default(),
+            }
+            .abi_encode(),
+            user,
+            ctx,
+        )
+    }
+
+    /// PRECONDITION helper: `price` really is outside the band at the CURRENT mark, and really is
+    /// the cached best on `side` — the two things every fixture below silently depends on. Read from
+    /// stored state, never recomputed from a comment, so it cannot drift away from the market the
+    /// test actually runs against.
+    fn assert_out_of_band_best(ctx: &mut TestCtx, side: Side, price: u64) {
+        let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+        let (upper, lower) =
+            crate::math::mark_band_bounds(market.mark_price, market.price_band_bps);
+        let p = price as u128;
+        assert!(
+            p < lower || p > upper,
+            "precondition: {price} must be OUTSIDE the band [{lower}, {upper}] at mark {}",
+            market.mark_price
+        );
+        let best = match side {
+            Side::Buy => storage::load_best_bid(ctx, MARKET_ID),
+            Side::Sell => storage::load_best_ask(ctx, MARKET_ID),
+        }
+        .unwrap();
+        assert_eq!(
+            best, price,
+            "precondition: the out-of-band level must be the cached best — that is the entire \
+             reason it is harmful, and if it is not, every assertion below passes vacuously"
+        );
+    }
+
+    /// Move the mark WITHOUT running `updateIndexPrice`, i.e. without the band-expiry sweep.
+    ///
+    /// This is the only way to set up a stranded book now that placement refuses a too-good new
+    /// best: the level must be placed while the band contains it and then be stranded by a mark
+    /// move. Going through the oracle instead would run the very GC these fixtures are trying to
+    /// observe (or to prove has NOT yet run).
+    fn drift_mark(ctx: &mut TestCtx, mark: u64) {
+        storage::save_mark_price(ctx, MARKET_ID, mark).unwrap();
+    }
+
     /// A mark JUMP UP strands the whole cheap end of the ask book below the new lower edge. Those
     /// levels are the touch and can never fill, so they go; the level that is still in band, and the
     /// far-side level ABOVE the new upper edge, both survive.
@@ -4099,8 +4156,11 @@ mod band_expiry {
         fund_big(&mut ctx, MAKER);
         place_order(&mut ctx, MAKER, 1, 9_500, 1);
         place_order(&mut ctx, MAKER, 1, 9_600, 1);
-        // … and two that are out of band already, on OPPOSITE ends. There is no placement band, so
-        // both rest (`out_of_band_limit_orders_now_rest_at_placement`).
+        // … and two that are out of band already, ABOVE the upper edge. Placement allows these: an
+        // ask above the band is a FAR-side quote, which is exactly the deep passive liquidity the
+        // one-sided placement reject deliberately keeps
+        // (`trading::tests::a_far_side_out_of_band_quote_still_rests_even_as_the_new_best`). Note
+        // they never become the best ask either — 9_500 is already in front of them.
         place_order(&mut ctx, MAKER, 1, 14_000, 1);
         place_order(&mut ctx, MAKER, 1, 17_000, 1);
         assert_eq!(asks(&mut ctx), vec![9_500, 9_600, 14_000, 17_000]);
@@ -4135,17 +4195,46 @@ mod band_expiry {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
         fund_big(&mut ctx, MAKER);
+        // The two TOP bids are the ones this test needs stranded, and a stranded bid is only
+        // reachable by drift: a bid above the upper edge is too-good, and bids rank better-first, so
+        // it is necessarily the best bid — which placement refuses. So the whole book is built at a
+        // mark that CONTAINS the top bids ($120 ⇒ [$108, $132]) and the drop below strands them.
+        drift_mark(&mut ctx, 12_000);
         place_order(&mut ctx, MAKER, 0, 5_000, 1); // far side after the drop
         place_order(&mut ctx, MAKER, 0, 6_000, 1); // in band after the drop
         place_order(&mut ctx, MAKER, 0, 11_500, 1);
         place_order(&mut ctx, MAKER, 0, 12_000, 1);
         assert_eq!(bids(&mut ctx), vec![5_000, 6_000, 11_500, 12_000]);
+        let (upper_at_placement, _) = crate::math::mark_band_bounds(12_000, 0);
+        assert!(
+            12_000u128 <= upper_at_placement,
+            "precondition: the top bid really was INSIDE the band when it was placed"
+        );
 
-        // Mark $100 → $60 ⇒ band [$54, $66].
+        // Mark $120 → $60 ⇒ band [$54, $66].
         oracle_update(&mut ctx, 6_000, 31);
         assert_eq!(
             storage::load_mark_price(&mut ctx, MARKET_ID).unwrap(),
             6_000
+        );
+        // The three roles this fixture asserts must actually be occupied, or "the far side is
+        // spared" is a claim about nothing.
+        let (upper_new, lower_new) = crate::math::mark_band_bounds(6_000, 0);
+        for doomed in [11_500u128, 12_000] {
+            assert!(
+                doomed > upper_new,
+                "precondition: removed bid {doomed} really is in the ABOVE-band prefix vs \
+                 [{lower_new}, {upper_new}]"
+            );
+        }
+        assert!(
+            5_000u128 < lower_new,
+            "precondition: the spared bid really is on the FAR side (below the lower edge), not \
+             merely in band"
+        );
+        assert!(
+            6_000u128 >= lower_new && 6_000u128 <= upper_new,
+            "precondition: and the survivor at the touch really is in band"
         );
 
         assert_eq!(
@@ -4283,18 +4372,37 @@ mod band_expiry {
         setup_market(&mut ctx);
         fund_big(&mut ctx, MAKER);
         fund_big(&mut ctx, ALICE);
-        // A bid at $120 against an empty ask side: it rests and is instantly out of band
-        // (mark $100, upper edge $110), so no taker sell can ever fill it — the walk `continue`s
-        // past it. It is nonetheless `best_bid`.
+        // A bid at $120 against an empty ask side, placed while the band contains it ($120 mark ⇒
+        // [$108, $132]) and then stranded by a mark DRIFT back to $100 ⇒ [$90, $110]. Drift is the
+        // only route: at the $100 mark this bid is a too-good new best and placement refuses it.
+        // `drift_mark`, not the oracle, because an oracle update runs the GC — and the whole point
+        // here is to observe the state BEFORE the GC collects it.
+        drift_mark(&mut ctx, 12_000);
         place_order(&mut ctx, MAKER, 0, 12_000, 1);
-        assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), 12_000);
+        drift_mark(&mut ctx, 10_000);
+        // It is out of band and it is nonetheless `best_bid` — the two properties that make the
+        // PostOnly mis-reject below possible at all.
+        assert_out_of_band_best(&mut ctx, Side::Buy, 12_000);
 
-        // Proof the level is unmatchable: a crossing taker sell fills nothing.
-        place_order(&mut ctx, ALICE, 1, 100, 1);
+        // Proof the level is unmatchable: a crossing taker sell fills nothing. IOC, because a
+        // resting sell that crossed $120 would have to be below the lower edge and would be refused
+        // as a too-good best — which would prove nothing about the fill-time band.
+        let taker = ioc(&mut ctx, ALICE, 1, 100).unwrap();
+        let taker: [u8; 32] = taker[..32].try_into().unwrap();
         assert_eq!(
             position(&mut ctx, ALICE).amount,
             0,
             "the fill-time band already refuses this level"
+        );
+        assert!(
+            storage::load_order(&mut ctx, &taker).unwrap().is_none(),
+            "the IOC expired its whole remainder (delete-on-terminal), so it rested nothing and \
+             left the book below untouched"
+        );
+        assert_eq!(
+            bids(&mut ctx),
+            vec![12_000],
+            "and the unmatchable bid is still there, unfilled"
         );
 
         let err = post_only(&mut ctx, ALICE, 1, 11_500).unwrap_err();
@@ -4375,14 +4483,33 @@ mod band_expiry {
             0
         );
 
-        // $120 with the mark at $100 and an empty ask side: unmatchable (above the upper edge) and
-        // yet the new best bid.
+        // $120 placed while the band contains it ($120 mark), then stranded by a drift back to the
+        // $100 mark ⇒ [$90, $110]. Its own placement sample is recorded on the way in.
+        drift_mark(&mut ctx, 12_000);
         place_order(&mut ctx, MAKER, 0, 12_000, 1);
         let w = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
         assert_eq!(
             (w.count, w.last_mid_price),
             (1, 12_000),
-            "the unmatchable quote is now a mark input — this is the pollution the GC stops feeding"
+            "the quote entered the mark-input window at placement"
+        );
+        drift_mark(&mut ctx, 10_000);
+        assert_out_of_band_best(&mut ctx, Side::Buy, 12_000);
+
+        // THE POLLUTION, live and post-drift: the level can no longer trade, and it is STILL a mark
+        // input. The next best-quote change on the other side samples the MID, and the mid is
+        // dragged up by the unmatchable bid — 11_250 instead of the 10_500 the only tradeable quote
+        // in the book would give on its own. (A fresh block timestamp is required: `record_
+        // observation` takes at most one sample per timestamp, so the placement sample above would
+        // otherwise swallow this one.)
+        ctx.block.timestamp = U256::from(2);
+        place_order(&mut ctx, MAKER, 1, 10_500, 1);
+        let w = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
+        assert_eq!(
+            (w.count, w.last_mid_price),
+            (2, 11_250),
+            "an unmatchable level still steers the mark: mid = (12_000 + 10_500)/2, where the \
+             tradeable side alone says 10_500"
         );
 
         // The GC takes the level out, so it can contribute no further samples.
@@ -4390,11 +4517,16 @@ mod band_expiry {
         assert!(bids(&mut ctx).is_empty());
         assert_eq!(storage::load_best_bid(&mut ctx, MARKET_ID).unwrap(), 0);
         assert_eq!(
+            asks(&mut ctx),
+            vec![10_500],
+            "and only the unmatchable side went: the in-band ask is untouched"
+        );
+        assert_eq!(
             storage::load_price_basis_window(&mut ctx, MARKET_ID)
                 .unwrap()
                 .count,
-            1,
-            "and the removal itself adds no sample: an empty BBO records nothing"
+            2,
+            "the removal itself adds no sample (same block timestamp as the sample above)"
         );
     }
 
@@ -4525,11 +4657,32 @@ mod band_expiry {
         assert_eq!(storage::load_best_ask(&mut ctx, MARKET_ID).unwrap(), 9_500);
 
         // A crossing buy still cannot take it: 9_500 is below the new lower edge (13_500).
-        place_order(&mut ctx, ALICE, 0, 20_000, 1);
+        assert_out_of_band_best(&mut ctx, Side::Sell, 9_500);
+        // The taker's own limit sits INSIDE the new band, so nothing about the taker is out of band
+        // and it rests legitimately — the previous $200 limit is now refused as a too-good best,
+        // which would have made this a placement test rather than a fill-band one. $140 still
+        // crosses the stranded $95 ask by a wide margin, which is all the walk needs.
+        let taker_price = 14_000;
+        let (upper, lower) = crate::math::mark_band_bounds(15_000, 0);
+        assert!(
+            (taker_price as u128) >= lower && (taker_price as u128) <= upper,
+            "precondition: the taker itself is in band [{lower}, {upper}]"
+        );
+        assert!(
+            taker_price >= 9_500,
+            "precondition: and it crosses the stranded ask in PRICE, so only the band stops it"
+        );
+        place_order(&mut ctx, ALICE, 0, taker_price, 1);
         assert_eq!(
             position(&mut ctx, ALICE).amount,
             0,
             "the fill-time band is still the backstop while the GC lags"
+        );
+        assert_eq!(
+            storage::load_ask_count(&mut ctx, MARKET_ID, 9_500).unwrap(),
+            1,
+            "and the survivor really was still there to be taken — the band, not an empty level, \
+             is what stopped the fill"
         );
     }
 }
