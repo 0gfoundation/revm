@@ -261,6 +261,21 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // was ALREADY the largest flat-price-vs-work gap in the table for exactly that reason. It is
         // oracle/admin-only, not user-spammable, and pricing the sweep is a separate decision from
         // this event.
+        //
+        // STILL NOT RAISED for the out-of-band expiry sweep added alongside the liquidation sweep
+        // (`risk::run_out_of_band_expiry_sweep`), and the numbers are why. Its cap is
+        // `MAX_BAND_EXPIRIES_PER_UPDATE` = 64 orders, each costing roughly what one `cancelOrder`
+        // costs INSIDE the engine (a book detach, a per-user entry removal, an aggregates-only
+        // position write, an order delete, one log — no matching, no settlement, no account write).
+        // Priced at the `CANCEL_ORDER_GAS` rate that would be 64 × 80_000 = 5_120_000; the sweep it
+        // sits next to is already 50 liquidations, each of which does a cancel-ALL plus a full
+        // market-order close through the book plus settlement plus up to `ADL_BUDGET_PER_UPDATE`
+        // = 128 ADL fills. So the addition is a small fraction of a gap this entry already accepts
+        // deliberately, on a selector no user can call. Raising 50_000 by 5.1M to "cover" the new
+        // term while leaving the far larger existing term uncovered would be arbitrary; the honest
+        // statement is that this selector is subsidised by design and the new work does not change
+        // that. FLAT, per selector — dynamic or per-item metering for this precompile was rejected
+        // outright.
         m.insert(updateIndexPriceCall::SELECTOR, (50_000, false));
         m.insert(getIndexPriceCall::SELECTOR, (5_000, true));
         m.insert(getFundingStateCall::SELECTOR, (5_000, true));

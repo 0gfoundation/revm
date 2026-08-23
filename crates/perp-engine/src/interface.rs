@@ -787,7 +787,20 @@ sol! {
         // Feeds: /openOrders (confirm resting), /allOrders (status=NEW/PARTIALLY_FILLED)
         event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif, bytes16 clientOrderId);
         // Feeds: /openOrders (remove), /allOrders (status=CANCELED, updateTime)
-        event OrderCancelled(address indexed user, bytes32 indexed orderId, uint64 indexed marketId);
+        //
+        // `reason` is `CancelReason` (perp-core `types::order`): 0 = the owner asked (cancelOrder /
+        // cancelOrderSigned / batchCancelOrders), 1 = taker margin cover mid-match, 2 = maker fill
+        // rejected as opening-into-insolvency, 3 = the owner was liquidated, 4 = the order was
+        // stranded out of band at the touch and the mark update expired it.
+        //
+        // Without it this event was byte-identical for a user cancel and a protocol kill (three
+        // indexed fields, no data) and — under delete-on-terminal — `getOrder` answers "not found"
+        // for both, so an MM could not tell "my cancel landed" from "my order was taken away".
+        // `reason != 0` is the whole test for "I did not ask for this"; treat it as a signal to
+        // re-read `getAccount`, since a protocol cancel shrinks Bid/Ask (and therefore raises
+        // availableBalance) with no AccountBalanceChanged of its own — see the note on
+        // `storage::mark_account_snapshot_dirty`.
+        event OrderCancelled(address indexed user, bytes32 indexed orderId, uint64 indexed marketId, uint8 reason);
 
         // Feeds: /trades, /historicalTrades, /aggTrades, /klines, /ticker/24hr, /myTrades
         // tradeId: global sequential counter for fromId pagination and firstId/lastId in 24hr ticker

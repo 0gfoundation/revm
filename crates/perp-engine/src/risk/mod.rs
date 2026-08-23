@@ -29,7 +29,7 @@ use crate::{
         settle_liquidation_residual_at_mark_price, verify_ed25519,
     },
     types::{
-        FundingState, IndexPriceState, MarginTier, MarginTiers, Market,
+        CancelReason, FundingState, IndexPriceState, MarginTier, MarginTiers, Market, OrderStatus,
         PremiumIndexAccumulator, Side, MAX_LEVERAGE_HARD_CAP, MAX_MARGIN_TIERS,
     },
     PERP_DEX_ADDRESS,
@@ -1046,6 +1046,201 @@ fn run_liquidation_sweep<H: PerpHost>(
     Ok(())
 }
 
+// ── Out-of-band resting-order expiry (band GC) ─────────────────────────────────
+
+/// Max orders EXPIRED per `updateIndexPrice` by [`run_out_of_band_expiry_sweep`].
+///
+/// **Unit: orders, not levels.** Every unit of cost here is per order — one book detach, one
+/// per-user entry removal, one aggregate write, one order delete, one log — and a single price level
+/// can hold an unbounded number of them, so capping levels would cap nothing.
+///
+/// **Why a cap at all.** This runs on EVERY oracle update, i.e. every block, inside the transaction
+/// that also moves the mark, settles funding and runs the liquidation sweep. Users control the
+/// book's depth and there is no per-account order cap, so the out-of-band prefix is unbounded. If
+/// draining it could exceed the block gas limit, `updateIndexPrice` would stop landing — and with it
+/// the mark, funding and every liquidation. Cheap housekeeping must never be able to take the price
+/// feed down; this is the same reasoning that caps the neighbouring sweep at
+/// [`MAX_LIQUIDATIONS_PER_UPDATE`] and ADL at [`ADL_BUDGET_PER_UPDATE`].
+///
+/// **Why 64.** It is [`crate::batch::MAX_BATCH_PLACE`] — the number of orders the gas table already
+/// accepts one transaction may touch (and each of those may sweep the book, so 64 expiries is
+/// strictly less work than one accepted `batchPlaceOrders`). It is also small next to what this
+/// selector's budget already contains: 64 cancel-shaped removals are far cheaper than 50
+/// liquidations, so the GC never becomes the dominant term in `updateIndexPrice`.
+///
+/// **When it is hit:** the sweep STOPS and the rest of the prefix keeps resting, unchanged. It is
+/// not lost work — the sweep re-runs on the next oracle update (every block), and every unit of
+/// budget permanently removes one order, so a stranded prefix of N orders is fully drained in
+/// ⌈N/64⌉ updates. Meanwhile the fill-time band in `match_order` is still the backstop: whatever
+/// the GC has not reached yet is unmatchable exactly as before, so lagging is safe by construction
+/// and never a correctness question — only a latency one.
+const MAX_BAND_EXPIRIES_PER_UPDATE: u32 = crate::batch::MAX_BATCH_PLACE as u32;
+
+/// Expire the resting orders that a mark move has stranded OUT OF BAND **at the touch**, run
+/// synchronously at the tail of [`run_update_index_price`] once the new mark is persisted.
+///
+/// # Which orders, and why only these
+///
+/// `match_order` applies a fill-time band centred on `market.mark_price`. On the NEAR side of the
+/// walk it `continue`s past out-of-band levels; on the far side it `break`s. There is no
+/// placement-time band, so a mark move can leave a level sitting AT THE TOUCH, unmatchable,
+/// indefinitely. That is not merely dead weight — the level IS `best_bid`/`best_ask`, and three
+/// things read the best with no knowledge of the band:
+///
+/// 1. `ensure_post_only_does_not_cross` rejects a legitimate opposite-side PostOnly order as "would
+///    match" against a level that can never fill;
+/// 2. `record_mid_price_sample_for_best_quote_change` feeds the best into the price-basis window →
+///    `price2` → the mark median, so an unmatchable quote pollutes the mark itself;
+/// 3. every match walk re-skips the whole prefix.
+///
+/// So the scope is exactly the **contiguous near-side prefix**, and nothing else:
+///
+/// * asks are ASCENDING ⇒ the harmful prefix is the levels **below `mark_lower`** at the FRONT;
+/// * bids are DESCENDING ⇒ it is the levels **above `mark_upper`** at the FRONT.
+///
+/// ⚠️ The FAR ends — asks above `mark_upper`, bids below `mark_lower` — are ordinary deep passive
+/// orders that the fill-time band deliberately lets rest ("lets harmless deep passive orders rest").
+/// They are not at the touch, they do not distort the crossing test (a PostOnly buy is compared
+/// against `best_ask`, so an `best_ask` ABOVE the band can only make it more permissive, never
+/// less), and expiring them would mass-kill legitimate liquidity. Both walks therefore `take_while`
+/// and stop at the FIRST in-band level.
+///
+/// A market with the band disabled (`price_band_bps >= 10_000`, e.g. the benches' and the golden
+/// scenario's `1_000_000`) GCs nothing for free: `mark_band_bounds` returns `lower = 0` (no ask is
+/// below it) and an enormous `upper` (no bid is above it). Likewise `mark == 0` (band inactive)
+/// returns `(u128::MAX, 0)`.
+///
+/// # Placement: BEFORE the liquidation sweep
+///
+/// Chosen, not incidental. The sweep closes positions through the book with `match_order` centred on
+/// this same new mark, so every level this function removes was already unreachable to it — the GC
+/// cannot reduce what the sweep can absorb, and cannot flip a book-absorbed close into an
+/// insurance-fund or ADL one. What the GC *does* change is the BBO, and running FIRST is what makes
+/// that harmless in the direction that matters: nothing in `run_update_index_price` before this
+/// point touches the book, so the `best_bid`/`best_ask` cache is provably LIVE here, which is
+/// precisely the precondition [`crate::trading::remove_from_book_after_cancel`] documents. Running
+/// after the sweep would hand this function a cache that had just been rewritten by an arbitrary
+/// number of matches and mid-match auto-cancels.
+///
+/// That variant choice earns something beyond correctness: its invariant check ("a removal beyond
+/// the cached best is impossible") is a live assertion of this function's entire scoping claim. We
+/// only ever drain the front of a side, so each emptied level's price EQUALS the cached best; if a
+/// scoping bug ever made it remove an interior level, the guard fires instead of silently corrupting
+/// the BBO cache.
+///
+/// # Cost shape
+///
+/// Removal goes through the single door, `execute_order_cancellation`, so book removal + entry
+/// removal + aggregate update stay together, and the aggregates shrink by each entry's FROZEN
+/// `assuming_price` via `release_open_order_margin` — never by the limit price.
+///
+/// Per-order cost is O(1) writes, NOT O(k) blob rewrites, so expiring k orders of one user is not
+/// O(k²): `mutate_buy_orders`/`mutate_sell_orders` edit the resident `VecDeque` IN PLACE and
+/// `save_position_reservation_only` overwrites the resident position struct, with serialization
+/// deferred to one write per key at block end. No per-user grouping is needed to get that, which is
+/// why the loop is free to run in the deterministic order the event stream wants: price order
+/// (ascending asks / descending bids), then FIFO within a level. No hash-map iteration anywhere.
+fn run_out_of_band_expiry_sweep<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    market: &Market,
+) -> Result<(), PerpError> {
+    let (mark_upper, mark_lower) =
+        crate::math::mark_band_bounds(market.mark_price, market.price_band_bps);
+    let mut budget = MAX_BAND_EXPIRIES_PER_UPDATE;
+
+    // Asks ASCEND, so the stranded prefix is the front: everything strictly below the lower edge.
+    // Collect the doomed prices FIRST — the removals below mutate the price index in place, so the
+    // walk cannot borrow it.
+    let doomed_asks: Vec<u64> = storage::load_ask_prices_ref(context, market_id)?
+        .iter()
+        .copied()
+        .take_while(|p| (*p as u128) < mark_lower)
+        .collect();
+    for price in doomed_asks {
+        if budget == 0 {
+            break;
+        }
+        expire_level(context, market_id, Side::Sell, price, market, &mut budget)?;
+    }
+
+    // Bids DESCEND (the index is ascending, walked in reverse), so the stranded prefix is the top:
+    // everything strictly above the upper edge.
+    let doomed_bids: Vec<u64> = storage::load_bid_prices_ref(context, market_id)?
+        .iter()
+        .rev()
+        .copied()
+        .take_while(|p| (*p as u128) > mark_upper)
+        .collect();
+    for price in doomed_bids {
+        if budget == 0 {
+            break;
+        }
+        expire_level(context, market_id, Side::Buy, price, market, &mut budget)?;
+    }
+
+    Ok(())
+}
+
+/// Expire the live orders at ONE out-of-band price level, in FIFO order, until `budget` runs out.
+///
+/// Stale ids (lazy-queue leftovers whose order record is already deleted, or terminal) cost one
+/// order-map probe and **do not consume budget**. That is deliberate: charging them would let a
+/// level thick with stale ids burn the whole budget without removing anything, and the next update
+/// would re-scan the same prefix forever — the sweep would stop converging. Charging only real
+/// expiries makes every unit of budget permanent progress. The scan itself is the same sweep the
+/// match walk already performs over these queues, and it is paid at most once per level: draining
+/// the level takes its live count to 0, which deletes the blob and its stale ids with it.
+fn expire_level<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    side: Side,
+    price: u64,
+    market: &Market,
+    budget: &mut u32,
+) -> Result<(), PerpError> {
+    // Snapshot the FIFO ids: each removal below mutates this level's blob.
+    let ids: Vec<[u8; 32]> = match side {
+        Side::Buy => storage::load_bid_level_arc(context, market_id, price)?
+            .ids
+            .clone(),
+        Side::Sell => storage::load_ask_level_arc(context, market_id, price)?
+            .ids
+            .clone(),
+    };
+
+    for order_id in ids {
+        if *budget == 0 {
+            return Ok(());
+        }
+        let Some(order) = storage::load_order(context, &order_id)? else {
+            continue; // stale id, already gone
+        };
+        if !matches!(
+            order.status,
+            OrderStatus::Open | OrderStatus::PartiallyFilled
+        ) {
+            continue; // terminal but not yet swept
+        }
+        let user = Address::from(order.owner);
+        crate::trading::execute_order_cancellation(
+            context,
+            user,
+            market_id,
+            order_id,
+            order,
+            market,
+            // Nothing in this call has matched yet (this runs before the liquidation sweep), so the
+            // BBO cache is live — and its "no removal beyond the cached best" invariant doubles as
+            // an assertion that we only ever drain the front of a side. See the doc comment above.
+            crate::trading::remove_from_book_after_cancel,
+            CancelReason::PriceBandExpiry,
+        )?;
+        *budget -= 1;
+    }
+    Ok(())
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Gate a leverage change on the DERIVED open-order requirement it would create.
@@ -1247,6 +1442,8 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
                 user,
                 orderId: FixedBytes(entry.order_id),
                 marketId: market_id,
+                // The owner did not ask: liquidation clears their whole book in this market.
+                reason: CancelReason::Liquidation as u8,
             }
             .to_log_data(),
         });
@@ -1269,6 +1466,8 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
                 user,
                 orderId: FixedBytes(entry.order_id),
                 marketId: market_id,
+                // The owner did not ask: liquidation clears their whole book in this market.
+                reason: CancelReason::Liquidation as u8,
             }
             .to_log_data(),
         });
@@ -1655,6 +1854,16 @@ pub fn run_update_index_price<H: PerpHost>(
         market.mark_price, mark_price,
         "liquidation sweep: the band centre must be the mark the maintenance check uses"
     );
+
+    // ── 5c. Out-of-band resting-order expiry, BEFORE the sweep ──────────────────
+    // The band just moved, which is the only thing that strands a level at the touch, so this is
+    // where those levels are created and where they are collected. It runs FIRST because the levels
+    // it removes are unmatchable to the sweep anyway (same band, same mark), so it cannot change
+    // what the close absorbs — while the BBO cache is still provably live, which is what lets the
+    // removal use the cheap cancel-path variant and get its top-of-book invariant check for free.
+    // Capped; see MAX_BAND_EXPIRIES_PER_UPDATE.
+    run_out_of_band_expiry_sweep(context, args.marketId, &market)?;
+
     run_liquidation_sweep(context, args.marketId, &market, mark_price)?;
 
     // ── 6. Emit events ────────────────────────────────────────────────────────

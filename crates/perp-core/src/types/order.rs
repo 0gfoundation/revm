@@ -196,6 +196,38 @@ impl OrderStatus {
     }
 }
 
+/// Why an order left the book — byte 4 of `OrderCancelled`.
+///
+/// `OrderCancelled` used to be three indexed fields and NO data, which made a user cancel and a
+/// protocol kill **byte-identical**. Combined with delete-on-terminal (`getOrder` answers
+/// "not found" for both), a market maker had no way to tell "my cancel landed" from "the protocol
+/// took my order away", so any protocol-initiated removal forced every MM into polling
+/// reconciliation. This code is the attribution.
+///
+/// Numbering follows [`crate::types::OrderStatus`]/`PerpBatchReason` style — a stable `u8` wire
+/// code, never a string. `0` is the user's own cancel so the common case is the zero value; every
+/// non-zero code is protocol-initiated, i.e. `reason != 0` is the whole test a consumer needs for
+/// "I did not ask for this".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CancelReason {
+    /// The owner asked: `cancelOrder` / `cancelOrderSigned` / `batchCancelOrders`.
+    User = 0,
+    /// Mid-match cover: the taker's own resting orders are cancelled LIFO until the fills she just
+    /// took are affordable (`release_orders_until_margin_covered`).
+    TakerMarginCover = 1,
+    /// A maker fill was rejected as opening-into-insolvency (K9), so the maker order it came from is
+    /// dropped (`cancel_rejected_maker_registry`).
+    MakerInsolvent = 2,
+    /// The owner was liquidated: liquidation cancels every order they hold in that market
+    /// (`cancel_all_orders_for_market`).
+    Liquidation = 3,
+    /// The order was resting OUT OF BAND at the touch and can no longer ever fill, so the mark
+    /// update that stranded it expired it (`run_out_of_band_expiry_sweep`). Binance's "order
+    /// outside the price-band is cancelled", applied where the band actually moves.
+    PriceBandExpiry = 4,
+}
+
 // ── Structs ───────────────────────────────────────────────────────────────
 
 /// Full on-chain order record, stored keyed by `order_id`.

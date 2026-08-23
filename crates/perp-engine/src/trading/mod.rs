@@ -36,7 +36,10 @@ use crate::{
     },
     risk::record_mid_price_sample_for_best_quote_change,
     storage,
-    types::{ApiKey, Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side, TimeInForce},
+    types::{
+        ApiKey, CancelReason, Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side,
+        TimeInForce,
+    },
     PERP_DEX_ADDRESS,
     PerpError,
 };
@@ -1465,6 +1468,7 @@ fn cancel_order_core<H: PerpHost>(
         &market,
         // Explicit cancel: no matching ran in this call, so the BBO cache is live.
         remove_from_book_after_cancel,
+        CancelReason::User,
     )?;
     Ok(Bytes::new())
 }
@@ -2409,7 +2413,12 @@ fn rest_in_book<H: PerpHost>(
 /// explicit cancel path (cache live → may skip the BBO refresh), or
 /// [`remove_from_book_during_match`] from the settlement auto-cancel paths (cache
 /// stale mid-matching → must always refresh).
-pub(super) fn execute_order_cancellation<H: PerpHost, F>(
+///
+/// `reason` is the attribution stamped on the `OrderCancelled` log. It is a required argument, not
+/// a default, precisely because the two existing callers here are a USER cancel and a mid-match
+/// protocol kill and the event used to be indistinguishable between them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_order_cancellation<H: PerpHost, F>(
     context: &mut H,
     user: Address,
     market_id: u64,
@@ -2417,6 +2426,7 @@ pub(super) fn execute_order_cancellation<H: PerpHost, F>(
     order: Order,
     market: &crate::types::Market,
     remove: F,
+    reason: CancelReason,
 ) -> Result<(), PerpError>
 where
     F: FnOnce(&mut H, u64, Side, u64, &[u8; 32]) -> Result<(), PerpError>,
@@ -2426,7 +2436,8 @@ where
     // delete-on-terminal: the cancelled/expired order is removed from the map. Its id may linger in
     // the level FIFO (lazy-queue) until a match walk sweeps it; `remove` already decremented the
     // level's live count. The Cancelled/Expired distinction (previously only the saved status; the
-    // event has always been OrderCancelled) is dropped with the record — history is disposable.
+    // event has always been OrderCancelled) is dropped with the record — history is disposable, and
+    // `reason` below now carries the part of it a client actually needs.
     storage::delete_order(context, &order_id)?;
     context.log(Log {
         address: PERP_DEX_ADDRESS,
@@ -2434,6 +2445,7 @@ where
             user,
             orderId: FixedBytes(order_id),
             marketId: market_id,
+            reason: reason as u8,
         }
         .to_log_data(),
     });
@@ -2524,7 +2536,7 @@ fn refresh_best_and_sample<H: PerpHost>(
 ///   - Sell: price == best_ask → refresh; price >  best_ask → skip; price <  best_ask → invariant
 /// A removal "beyond" the cached best is impossible with a live cache, so it trips
 /// an invariant error (guards against a stale cache reaching this path).
-pub(super) fn remove_from_book_after_cancel<H: PerpHost>(
+pub(crate) fn remove_from_book_after_cancel<H: PerpHost>(
     context: &mut H,
     market_id: u64,
     side: Side,

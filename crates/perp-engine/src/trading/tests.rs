@@ -4660,8 +4660,30 @@ mod golden {
     /// byte already at 21. Prior value
     /// 0x88dc1d5927c36e45585ce99ed8453bf7665a57c89ceb29ee10165fa4ccf41319 (and 0x68a881f4… is the
     /// same write set at version byte 20, recorded to separate the two contributions to the move).
+    /// RE-PIN (out-of-band resting-order expiry + `BLOCK_COMMITMENT_VERSION` 21→22): `updateIndexPrice`
+    /// now expires the contiguous NEAR-SIDE prefix of levels the moved price band has stranded (asks
+    /// below the lower edge, bids above the upper edge), capped at `MAX_BAND_EXPIRIES_PER_UPDATE`
+    /// orders, before the liquidation sweep. `OrderCancelled` also gains a `uint8 reason` so a
+    /// protocol kill is distinguishable from the owner's own cancel.
+    ///
+    /// **This scenario's write set is BYTE-IDENTICAL across that change, and the BusinessSnapshot is
+    /// UNCHANGED, field for field**, for a mechanical reason: the scenario deliberately runs with the
+    /// band DISABLED (`priceBandBps: 1_000_000`, set when the fill-time band landed — see the 2026-07
+    /// entry above), and `mark_band_bounds` collapses a disabled band to `lower = 0` / an enormous
+    /// `upper`, so no level on either side is ever out of band and the new sweep expires nothing here.
+    /// The two oracle updates it performs (Phase 8's funding epoch and Phase 9c's bump) therefore write
+    /// exactly what they wrote at 21. The event change cannot reach the snapshot either — every field
+    /// below is read back through a VIEW call, not from logs.
+    ///
+    /// VERIFIED, not assumed: the whole suite including this pin passed at the OLD value with the new
+    /// execution rule in place and the version byte still 21. The value below therefore moves for
+    /// exactly ONE reason — the version byte is hashed into the commitment — and the underlying delta
+    /// is unmoved. The rule itself is covered by `risk::tests::band_expiry` (near-side prefix expired,
+    /// far-side deep orders spared, cap respected + second update finishes, reason codes, frozen
+    /// `assuming_price` basis, disabled band inert, fill-time band still the backstop). Prior value
+    /// 0xc84dfc3ed57226c907fbac53e64dfc011e64be2254b092edffb4758a8eef6ba5.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xc84dfc3ed57226c907fbac53e64dfc011e64be2254b092edffb4758a8eef6ba5");
+        b256!("0xea28799e35db06c71ad95e1517df8e289028b79721bcdb27c183f7d594d72f0e");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

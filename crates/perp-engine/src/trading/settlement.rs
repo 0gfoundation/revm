@@ -643,6 +643,8 @@ pub(super) enum MatchEvent {
     OrderCancelled {
         user: Address,
         order_id: [u8; 32],
+        /// Attribution stamped on the log — see `crate::types::CancelReason`.
+        reason: crate::types::CancelReason,
     },
     Trade {
         market_id: u64,
@@ -843,13 +845,18 @@ impl MatchRegistry {
                 MatchEvent::DeleteOrder { order_id } => {
                     storage::delete_order(context, &order_id)?;
                 }
-                MatchEvent::OrderCancelled { user, order_id } => {
+                MatchEvent::OrderCancelled {
+                    user,
+                    order_id,
+                    reason,
+                } => {
                     context.log(Log {
                         address: PERP_DEX_ADDRESS,
                         data: IPerpDex::OrderCancelled {
                             user,
                             orderId: primitives::FixedBytes(order_id),
                             marketId: market_id,
+                            reason: reason as u8,
                         }
                         .to_log_data(),
                     });
@@ -1087,6 +1094,8 @@ pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
     reg.push_event(MatchEvent::OrderCancelled {
         user: maker,
         order_id: *order_id,
+        // K9 reject: the protocol dropped this maker, its owner did not.
+        reason: crate::types::CancelReason::MakerInsolvent,
     });
     Ok(())
 }
@@ -1728,6 +1737,7 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
             market,
             // Runs mid-matching (taker margin-cover): the BBO cache lags the book.
             super::remove_from_book_during_match,
+            crate::types::CancelReason::TakerMarginCover,
         )?;
     }
 

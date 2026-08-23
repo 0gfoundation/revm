@@ -84,7 +84,24 @@ use primitives::{B256, U256};
 // the mark (R10) — only the per-order terms froze. A node on 20 and a node on 21 would disagree on
 // both the blob bytes and the admission verdict, which is exactly what this version guards. CHAIN
 // change: golden re-pin (below) + a coordinated wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 21;
+// Out-of-band resting-order expiry: bumped 21→22 — ONE execution-rule change, no layout change.
+// `updateIndexPrice` now, after persisting the new mark and before the liquidation sweep, EXPIRES the
+// contiguous NEAR-SIDE prefix of levels the moved band has stranded (asks below the lower edge, bids
+// above the upper edge), capped at `MAX_BAND_EXPIRIES_PER_UPDATE` orders per update. Such a level was
+// unmatchable indefinitely yet WAS `best_bid`/`best_ask`, so it made the PostOnly cross check reject
+// legitimate orders, polluted the price-basis window and therefore the mark median, and was re-skipped
+// by every match walk. The write set of an oracle update over a stranded book differs — order records
+// deleted, level counts decremented, price-index and per-user order-list blobs shrunk, position
+// aggregates lowered — and it PROPAGATES: a different BBO feeds a different `price2`, so subsequent
+// marks (and every liquidation decision taken against them) diverge. A node on 21 and a node on 22
+// would disagree on state, which is exactly what this version guards. `OrderCancelled` also gains a
+// `uint8 reason` (its topic0 moves), so a consumer keyed to the 21 event must not silently decode 22
+// logs. CHAIN change: golden re-pin (below) + a coordinated wipe on deploy. (The golden SCENARIO
+// disables the band — `priceBandBps: 1_000_000` — so no level is ever out of band in it, the sweep is
+// a no-op there, its write set is byte-identical at 21 and 22 and its BusinessSnapshot is unchanged;
+// the golden value moves only because this byte is hashed into it. VERIFIED, not assumed: the whole
+// suite including that pin passed at the OLD value with the new rule in place and this byte still 21.)
+pub const BLOCK_COMMITMENT_VERSION: u8 = 22;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
