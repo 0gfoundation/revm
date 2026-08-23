@@ -2251,7 +2251,6 @@ fn rest_in_book<H: PerpHost>(
             // ── APPLY (all rejects passed) ── NOW do the real insert: in-place on a warm list
             // (zero clone), or one materialize-clone on a cold first-touch (unavoidable — it IS
             // the write of a previously-committed list). partition_point re-derives the same idx.
-            emit_pending_order_placed(context, pending_placed);
             drop(buy_ref);
             storage::mutate_buy_orders(context, user, market_id, |list| {
                 let i = list.partition_point(|e| e.price > price);
@@ -2344,7 +2343,6 @@ fn rest_in_book<H: PerpHost>(
             pos = pos_after;
 
             // ── APPLY (all rejects passed) ── real insert: in-place (warm) / one materialize (cold).
-            emit_pending_order_placed(context, pending_placed);
             drop(sell_ref);
             storage::mutate_sell_orders(context, user, market_id, |list| {
                 let i = list.partition_point(|e| e.price < price);
@@ -2374,6 +2372,7 @@ fn rest_in_book<H: PerpHost>(
     // official-doc citation on `storage::mark_account_snapshot_dirty`.
     storage::save_position_reservation_only(context, user, market_id, pos)?;
 
+    emit_pending_order_placed(context, pending_placed);
     context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::OrderRested {
