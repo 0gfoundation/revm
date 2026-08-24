@@ -1259,18 +1259,41 @@ fn buy_taker_fully_matches_resting_ask() {
         .is_empty());
 }
 
-/// A crossing call publishes **exactly one** `AccountBalanceChanged` per distinct party, drained in
-/// ascending ADDRESS order at the end of the call, and every one of them is a SETTLED account state.
+/// A crossing call publishes **one `AccountBalanceChanged` per economic event**, in the order those
+/// events happen: the maker's at his fill, the taker's after her order settles, and the incidental
+/// fee recipient's still coalesced into the end-of-call drain.
 ///
-/// This replaces the per-write emission it is named after. The old shape was one event per
-/// balance-moving write, in write order, which for a one-maker match was `[ADMIN, BOB, ALICE, ALICE]`
-/// — four events, with ALICE's first one a genuine half-updated state (her position silo funded
-/// before her wallet had paid for it, so `totalWalletBalance` double-counted `total_required`). Under
-/// the coalescing rule — `websocket-implementation.md` **Transaction-Level Coalescing** #2, "one final
-/// snapshot per affected user per transaction" — that intermediate is unobservable and the order is
-/// no longer write order.
+/// # The three rules, on one call
+///
+/// | party | rule | where it is published |
+/// |---|---|---|
+/// | BOB, the maker | one per FILL | inside the match flush, right after his `Trade` row |
+/// | ALICE, the taker | one per ORDER | after `finalize_apply` |
+/// | ADMIN, the fee recipient | coalesced | the end-of-call drain |
+///
+/// So the emission order is BOB, ALICE, ADMIN — **not** the ascending ADDRESS order this test used to
+/// pin (`ALICE 0x11.. < BOB 0x22.. < ADMIN 0xaa..`), and not the old per-write order either. Address
+/// order still governs the DRAIN (`the_drain_order_is_ascending_address_order`), which is now only
+/// the third row here; the first two are placed by the events that caused them, which is the whole
+/// change. The stream is still deterministic — the walk order, the flush's event replay and the
+/// `BTreeSet` drain are all fixed — and that is the property that matters for consensus.
+///
+/// # What survives from the coalescing era
+///
+/// **No half-updated state reaches the stream.** The per-write emission published one event per
+/// balance-moving write, `[ADMIN, BOB, ALICE, ALICE]`, and ALICE's first was genuinely
+/// half-updated — her position silo funded before her wallet had paid for it, so
+/// `totalWalletBalance` double-counted `total_required`. That is still gone, but for a different
+/// reason in each case: ALICE's snapshot is taken after `finalize_apply` has debited her, and BOB's
+/// is derived from the registry working copy the flush is about to write, which is his settled state
+/// for that fill rather than a partial write of it. The `WALLET + INIT_MARGIN` assertion below is
+/// what pins it.
+///
+/// **Every event still agrees with `getAccount` field for field**, including BOB's, which is the
+/// interesting one: it was computed off a working copy, not off the store. That equality is the
+/// user-visible face of `MatchRegistry::flush`'s convergence guard.
 #[test]
-fn matched_call_emits_one_settled_snapshot_per_party_in_address_order() {
+fn matched_call_publishes_one_snapshot_per_economic_event() {
     let mut ctx = make_ctx();
     setup(&mut ctx);
     storage::save_user_fee_rates(
@@ -1314,14 +1337,17 @@ fn matched_call_emits_one_settled_snapshot_per_party_in_address_order() {
             AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
         })
         .collect::<Vec<_>>();
-    // Three distinct parties, three events, ASCENDING ADDRESS order — ALICE 0x11.. < BOB 0x22.. <
-    // ADMIN 0xaa.. — which is deliberately NOT the write order (ADMIN's fee credit lands first, then
-    // the flush's per-user saves, then ALICE's margin debit). Hash-map iteration order here would be
-    // a consensus bug, so the ordering is pinned, not incidental.
+    // Three parties, three events, in ECONOMIC-EVENT order: BOB at his fill (inside the flush),
+    // ALICE once her order has settled (after `finalize_apply`), ADMIN from the drain. Note this is
+    // neither ascending address order (ALICE 0x11.. < BOB 0x22.. < ADMIN 0xaa..) nor the old write
+    // order (ADMIN's fee credit lands FIRST of the three writes). Determinism is unaffected — the
+    // walk order and the flush replay are fixed and the drain is still a `BTreeSet` — and it is
+    // determinism, not any particular order, that consensus needs.
     assert_eq!(
         events.iter().map(|e| e.user).collect::<Vec<_>>(),
-        vec![ALICE, BOB, ADMIN],
-        "one snapshot per distinct party, ascending address order"
+        vec![BOB, ALICE, ADMIN],
+        "one snapshot per economic event: maker at his fill, taker after her order, fee recipient \
+         coalesced into the drain"
     );
 
     // ── Every published snapshot is a SETTLED state ───────────────────────────────────────────
@@ -1330,8 +1356,8 @@ fn matched_call_emits_one_settled_snapshot_per_party_in_address_order() {
     // `finalize_apply` debits `total_required` from her wallet), and under the old per-write emission
     // the first of those was published: `totalWalletBalance = cross + Σ positionMargin` counted the
     // funded silo while the wallet had not yet paid for it, over-stating by exactly `total_required`.
-    // Draining after the dispatch is what removes that from the stream — there is no event carrying
-    // `WALLET + INIT_MARGIN` any more.
+    // Publishing hers AFTER `finalize_apply` — rather than at the earlier of the two writes — is what
+    // keeps that intermediate out of the stream now that the drain is no longer what emits it.
     let alice = events.iter().find(|e| e.user == ALICE).unwrap();
     assert_eq!(
         alice.totalCrossWalletBalance,
@@ -1350,8 +1376,9 @@ fn matched_call_emits_one_settled_snapshot_per_party_in_address_order() {
         "the half-updated pre-debit snapshot must not reach the stream at all"
     );
 
-    // Each event must agree with `getAccount` FIELD FOR FIELD — same producer, and now also the same
-    // moment, so this is an equality with nothing to reason about.
+    // Each event must agree with `getAccount` FIELD FOR FIELD. For ALICE and ADMIN that is the same
+    // producer at the same moment; for BOB it is the working-copy producer measured against the
+    // store it converged to, which is the load-bearing half.
     for event in &events {
         let acct = storage::load_account(&mut ctx, event.user).unwrap();
         let usdc: U256 = acct.usdc_balance.clone().into();
@@ -11767,16 +11794,26 @@ mod assuming_price {
 // cancelled orders will not make the event `ACCOUNT_UPDATE` pushed, since there's no change on
 // positions."* The accepted cost is that `availableBalance` goes stale in the stream between fills.
 //
-// **The coalescing.** `websocket-implementation.md` Transaction-Level Coalescing #2: "one final
-// snapshot per affected user per transaction". Writes mark; `call::run_perp_dex_call` drains once, in
-// ascending ADDRESS order, on its success path only.
+// **The granularity.** ONE snapshot per ECONOMIC EVENT: a filled maker gets one per FILL (published
+// inside the match flush, from the registry working copy, right after that fill's `Trade`), a taker
+// gets one per ORDER (after `finalize_apply`, off the settled store), and every other path — the
+// non-trading writes plus the incidental fee recipient — keeps `websocket-implementation.md`
+// Transaction-Level Coalescing #2, "one final snapshot per affected user per transaction": writes
+// mark, `call::run_perp_dex_call` drains once, in ascending ADDRESS order, on its success path only.
+//
+// The transaction was the wrong unit for a fill because the transaction belongs to the TAKER: a
+// 64-item batch filling maker M on items 3, 17 and 40 gave M ONE row, at the end of a transaction M
+// never participated in, for three separate economic events. A direct emit therefore also CLEARS that
+// user's mark, or the drain would repeat it.
 //
 // ⚠️ This decision has now flipped three times (silent → emitting in `7019fadd` → silent). The
 // citation lives on `storage::mark_account_snapshot_dirty`; these tests are what make it enforced
 // rather than merely written down.
 mod account_snapshot_events {
     use super::*;
-    use crate::interface::IPerpDex::{batchPlaceOrdersCall, setLeverageCall, PlaceItem};
+    use crate::interface::IPerpDex::{
+        batchPlaceOrdersCall, setLeverageCall, FundingSettled, PlaceItem, PositionChanged, Trade,
+    };
 
     /// Every `AccountBalanceChanged` in the journal, in emission order.
     fn take_balance_events(ctx: &mut TestCtx) -> Vec<AccountBalanceChanged> {
@@ -11787,6 +11824,85 @@ mod account_snapshot_events {
                 AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
             })
             .collect()
+    }
+
+    /// The users a MONEY row names — the rows a snapshot is supposed to answer for.
+    ///
+    /// Only `Trade`, `PositionChanged` and `FundingSettled` count. The order-lifecycle rows
+    /// (`OrderPlaced` / `OrderRested` / `OrderCancelled`) are deliberately excluded, and that is the
+    /// same decision as the trigger filter at the top of this module: a placement or a cancel moves
+    /// no published field, so it is not a row anything owes a snapshot for. It matters mechanically
+    /// too — a GTC that fills part and rests the rest emits its `OrderRested` AFTER the taker
+    /// snapshot, because resting happens after the match returns.
+    fn money_row_users(log: &primitives::Log) -> Vec<Address> {
+        let topic = log.data.topics().first().copied();
+        let (t, d) = (log.data.topics(), &log.data.data);
+        if topic == Some(Trade::SIGNATURE_HASH) {
+            let e = Trade::decode_raw_log(t, d).unwrap();
+            vec![e.taker, e.maker]
+        } else if topic == Some(PositionChanged::SIGNATURE_HASH) {
+            vec![PositionChanged::decode_raw_log(t, d).unwrap().user]
+        } else if topic == Some(FundingSettled::SIGNATURE_HASH) {
+            vec![FundingSettled::decode_raw_log(t, d).unwrap().user]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// **THE STREAM INVARIANT, replacing "the snapshots are a contiguous SUFFIX".**
+    ///
+    /// That property was true only while every snapshot was drained at the end of the call. Snapshots
+    /// are now placed by the economic events that cause them — a maker's inside the match flush,
+    /// right after its `Trade` row — so they INTERLEAVE with the money rows, and a suffix assertion
+    /// would now be pinning the very thing this change removed.
+    ///
+    /// What replaces it is the property the suffix shape was a crude proxy for: **a snapshot for user
+    /// X closes X's pending rows.** Walking the stream in order:
+    ///
+    /// * a money row makes every user it names PENDING — something moved for them and the stream has
+    ///   not yet said what their account looks like as a result;
+    /// * an `AccountBalanceChanged` for X clears X, and a snapshot that closes NOTHING must at least
+    ///   carry news — a payload different from the last one published for X. A snapshot that closes
+    ///   no row *and* repeats the previous payload is the duplicate this change has to avoid: a
+    ///   maker who got a per-fill event and then a drain event because the mark was never cleared.
+    ///   (Closing nothing is legitimate on its own: the fee recipient's wallet moves with no `Trade`
+    ///   or `PositionChanged` naming them, and that is deliberately still one coalesced drain row.)
+    /// * at the end of the stream nobody is left pending (this is the direction that catches a LOST
+    ///   event — a mark cleared for a user whose state moved again afterwards).
+    ///
+    /// The old assertion is implied for the special case it was written against: if every snapshot
+    /// sits at the end, both directions hold trivially. This one additionally survives interleaving,
+    /// and it is strictly stronger about who each snapshot is FOR.
+    fn assert_snapshots_close_pending_rows(logs: &[primitives::Log]) {
+        let mut pending: std::collections::BTreeSet<Address> = Default::default();
+        let mut last: std::collections::BTreeMap<Address, (U256, i64, i64)> = Default::default();
+        for (i, log) in logs.iter().enumerate() {
+            if log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH) {
+                let e = AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data)
+                    .unwrap();
+                let payload = (
+                    e.usdcBalance,
+                    e.totalWalletBalance,
+                    e.totalCrossWalletBalance,
+                );
+                let closed_a_row = pending.remove(&e.user);
+                assert!(
+                    closed_a_row || last.get(&e.user) != Some(&payload),
+                    "log[{i}]: a snapshot for {} closes no money row AND repeats the previous \
+                     payload for that user — a duplicate (the drain repeating a direct emit whose \
+                     mark was not cleared)",
+                    e.user
+                );
+                last.insert(e.user, payload);
+            } else {
+                pending.extend(money_row_users(log));
+            }
+        }
+        assert!(
+            pending.is_empty(),
+            "money rows left unanswered at the end of the stream for {pending:?} — a snapshot was \
+             LOST (a mark cleared for a user whose state moved again afterwards)"
+        );
     }
 
     /// A second market, so a batch can touch one user across two of them.
@@ -11953,6 +12069,17 @@ mod account_snapshot_events {
     /// cancel, so the event shipped fields whose freshness its own trigger did not guarantee. The
     /// assertions below pin both halves — the three published balances are byte-identical across a
     /// placement and a cancel, and the numbers that DID move are `getAccount`-only.
+    ///
+    /// # Why this survives the per-event granularity intact
+    ///
+    /// It never depended on "the snapshot is emitted last" as a mechanism, only on the DRAIN existing
+    /// for a pure account write — and it still does (rule 3: non-trading paths coalesce). The
+    /// measurement is a probe in its own separate call, `mutate_account_balance(credit_perp(0))`, so
+    /// what it reads is the state at the end of that probe call, never a row emitted by the placement
+    /// or the cancel under test. The two calls under test remain PURE placement and PURE cancel — the
+    /// order rests in `MARKET_2`, which has no liquidity, so neither becomes a taker and neither can
+    /// reach the new per-fill or per-order emit points. That is what keeps "they publish nothing"
+    /// checkable: it is still a statement about a stream with no money rows in it.
     ///
     /// The order is placed in a market ALICE holds NO position in, which is the subtle leg: an
     /// order-list transition flips per-user-market-index membership
@@ -12174,12 +12301,18 @@ mod account_snapshot_events {
 
     // ── The coalescing: one settled snapshot per user, last, in address order ─────────────────
 
-    /// A crossing fill publishes exactly one snapshot per affected user, and each equals
-    /// `getAccount`. The snapshots come LAST — after every `Trade` / `PositionChanged` / `OrderRested`
-    /// the call emitted — which is what "one FINAL snapshot per transaction" means for an indexer
-    /// replaying the log in order.
+    /// A crossing fill publishes one snapshot per affected user — the maker's at his fill, the
+    /// taker's after her order settles — and each equals `getAccount`.
+    ///
+    /// The counts happen to be unchanged here (one fill, one order, so one each), which is exactly
+    /// why this is the right place to pin the STREAM SHAPE rather than the counts: what moved is
+    /// WHERE the maker's row sits. It used to be in the drain at the very end; it is now inside the
+    /// match flush, immediately after the `Trade` row it closes, with the taker's row after her own
+    /// `PositionChanged` and before the `OrderRested` of the remainder she rests. So the snapshots
+    /// are no longer a contiguous suffix, and
+    /// [`assert_snapshots_close_pending_rows`] is the property that replaces that one.
     #[test]
-    fn a_crossing_fill_publishes_one_snapshot_per_user_last() {
+    fn a_crossing_fill_publishes_a_snapshot_closing_each_party_s_rows() {
         let mut ctx = make_ctx();
         fixture(&mut ctx);
         // One lot of liquidity: ALICE's 2-lot GTC buy fills one and rests one, so the same call both
@@ -12208,6 +12341,7 @@ mod account_snapshot_events {
         assert!(!out.reverted);
 
         let logs = JournalTr::take_logs(ctx.journal_mut());
+        // The snapshots are NOT a suffix any more: BOB's sits mid-stream, inside the flush.
         let names = logs
             .iter()
             .map(|log| log.data.topics().first().copied())
@@ -12217,10 +12351,11 @@ mod account_snapshot_events {
             .find(|i| snapshot_at(*i))
             .expect("snapshots");
         assert!(
-            (first_snapshot..names.len()).all(snapshot_at),
-            "the snapshots are a contiguous SUFFIX of the log stream — the domain events say what \
-             happened, the snapshots say what the accounts look like as a result"
+            !(first_snapshot..names.len()).all(snapshot_at),
+            "the suffix shape is GONE by design — if it came back, the maker's snapshot has drifted \
+             out of the flush and back into the drain"
         );
+        assert_snapshots_close_pending_rows(&logs);
 
         let events = logs
             .into_iter()
@@ -12229,25 +12364,38 @@ mod account_snapshot_events {
                 AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
             })
             .collect::<Vec<_>>();
-        // ALICE was written twice (the flush, then her margin/fee debit) and also rested a remainder;
-        // one snapshot. ALICE 0x11.. < BOB 0x22.., and the fee rates are 0 here so ADMIN is never
-        // credited and never appears — only AFFECTED users do.
+        // BOB first (his fill, inside the flush), then ALICE (her order, after `finalize_apply`).
+        // ALICE is written twice inside the call and also rests a remainder, and still gets exactly
+        // one: her mark is cleared at her emit, and the resting leg does not re-mark her. The fee
+        // rates are 0 here so ADMIN is never credited and never appears — only AFFECTED users do.
         assert_eq!(
             events.iter().map(|e| e.user).collect::<Vec<_>>(),
-            vec![ALICE, BOB],
+            vec![BOB, ALICE],
         );
         for e in &events {
             assert_event_matches_get_account(&mut ctx, e);
         }
     }
 
-    /// A K-item batch touching ONE user across TWO markets publishes ONE snapshot for that user.
+    /// A 2-item batch, each item a crossing order into the same maker: **the initiator gets TWO and
+    /// the maker gets TWO** — one per order and one per fill respectively.
     ///
-    /// This is the case the coalescing was worth doing for: per-write emission published up to K
-    /// times for the same initiator (K ≤ `MAX_BATCH_PLACE` = 64), every one of them a fold over her
-    /// whole market index.
+    /// This is the test whose expectation the granularity change is FOR, so it is worth being
+    /// explicit about what it used to say and why that was wrong. It used to assert ONE snapshot for
+    /// the initiator, citing "one final snapshot per affected user per transaction": a K-item batch
+    /// (K ≤ `MAX_BATCH_PLACE` = 64) published a single event for the initiator. The initiator's side
+    /// of that was defensible — it is her transaction. The MAKER's was not: BOB also got one event,
+    /// at the end of a transaction he did not participate in, for two fills that were two separate
+    /// economic events for him, and the cadence of his notifications was set by how ALICE chose to
+    /// batch. Both sides are now per-event, and BOB's two rows sit at his two fills.
+    ///
+    /// The two items are in DIFFERENT markets, which is the leg that makes the maker count
+    /// non-trivial: each market runs its own `MatchRegistry`, so BOB's two snapshots come from two
+    /// different working copies, and each has to reconstruct `Σ pos.margin` over the market the other
+    /// one moved (`UserWork::other_market_position_margin`). A single-market version of this test
+    /// would leave that term at zero and prove nothing about it.
     #[test]
-    fn a_multi_market_batch_publishes_one_snapshot_for_the_initiator() {
+    fn a_two_item_batch_publishes_per_order_for_the_initiator_and_per_fill_for_the_maker() {
         let mut ctx = make_ctx();
         fixture(&mut ctx);
         add_market_2(&mut ctx);
@@ -12283,20 +12431,40 @@ mod account_snapshot_events {
             String::from_utf8_lossy(&out.bytes)
         );
 
-        let events = take_balance_events(&mut ctx);
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert_snapshots_close_pending_rows(&logs);
+        let events = logs
+            .into_iter()
+            .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
+            .map(|log| {
+                AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             events.iter().filter(|e| e.user == ALICE).count(),
-            1,
-            "the initiator gets ONE snapshot for the whole batch, got {:?}",
+            2,
+            "the initiator gets one snapshot per ORDER — two items, two orders, got {:?}",
+            events.iter().map(|e| e.user).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.user == BOB).count(),
+            2,
+            "the maker gets one snapshot per FILL — his two orders are hit once each, and his \
+             cadence no longer depends on how the taker batched, got {:?}",
             events.iter().map(|e| e.user).collect::<Vec<_>>()
         );
         assert_eq!(
             events.iter().map(|e| e.user).collect::<Vec<_>>(),
-            vec![ALICE, BOB],
-            "one per distinct party, ascending address order (fee rates are 0, so no ADMIN credit)"
+            vec![BOB, ALICE, BOB, ALICE],
+            "item by item: maker at the fill, then initiator at the end of that order (fee rates \
+             are 0, so no ADMIN credit)"
         );
-        for e in &events {
-            assert_event_matches_get_account(&mut ctx, e);
+        // The LAST event per user is the settled state an indexer keeps under last-per-user-wins.
+        // Earlier rows for the same user are earlier truths, not wrong ones, so only the last is
+        // compared against `getAccount` here.
+        for user in [ALICE, BOB] {
+            let last = events.iter().rfind(|e| e.user == user).unwrap();
+            assert_event_matches_get_account(&mut ctx, last);
         }
     }
 
@@ -12373,6 +12541,266 @@ mod account_snapshot_events {
             vec![ALICE]
         );
         assert_event_matches_get_account(&mut ctx, &events[0]);
+    }
+
+    // ── Per-fill for makers, per-order for takers ────────────────────────────────────────────
+
+    /// Drive one crossing `placeOrder` through the shell and return its whole log stream.
+    fn crossing_order(
+        ctx: &mut TestCtx,
+        caller: Address,
+        side: u8,
+        price: u64,
+        qty: u64,
+    ) -> Vec<primitives::Log> {
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let out = run_perp_dex_call(
+            &placeOrderCall {
+                marketId: MARKET_ID,
+                side,
+                price,
+                quantity: qty,
+                orderType: 0,
+                tif: 0,
+                clientOrderId: FixedBytes::default(),
+            }
+            .abi_encode(),
+            10_000_000,
+            caller,
+            U256::ZERO,
+            false,
+            ctx,
+        )
+        .unwrap();
+        assert!(
+            !out.reverted,
+            "crossing order reverted: {}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        JournalTr::take_logs(ctx.journal_mut())
+    }
+
+    fn snapshots_of(logs: &[primitives::Log]) -> Vec<AccountBalanceChanged> {
+        logs.iter()
+            .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
+            .map(|log| {
+                AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+            })
+            .collect()
+    }
+
+    /// **The headline of the granularity change.** BOB rests TWO sells in the same level; ALICE
+    /// sweeps both in ONE order. BOB gets **two** snapshots — one per fill — and ALICE gets **one**,
+    /// for her one order.
+    ///
+    /// This is precisely the asymmetry the coalescing hid. Under "one per user per transaction" BOB
+    /// got a single event, at the end of ALICE's transaction, for two distinct economic events of his
+    /// own; batch the taker side harder and BOB's two fills, or forty, still collapsed into one
+    /// notification whose timing he had no part in choosing. A maker order is consumed at most once
+    /// per taker sweep, so per fill is also exactly per maker ORDER, which is the unit a maker
+    /// actually reasons about.
+    ///
+    /// The two rows are DIFFERENT — each is BOB's state at its own fill — which is what makes the
+    /// count meaningful rather than a duplicated log. The second is his settled state and equals
+    /// `getAccount`; the first is his state after one lot, and the difference between them is exactly
+    /// the second lot's effect on `wb`.
+    #[test]
+    fn a_maker_filled_twice_in_one_sweep_gets_two_snapshots_and_the_taker_one() {
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+        // Two separate maker orders in the SAME level, so one sweep consumes both from one queue.
+        place_in(&mut ctx, BOB, MARKET_ID, 1, PRICE, QTY, 3).expect("maker sell 1");
+        place_in(&mut ctx, BOB, MARKET_ID, 1, PRICE, QTY, 3).expect("maker sell 2");
+
+        let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, 2 * QTY);
+        assert_snapshots_close_pending_rows(&logs);
+        let events = snapshots_of(&logs);
+
+        assert_eq!(
+            events.iter().map(|e| e.user).collect::<Vec<_>>(),
+            vec![BOB, BOB, ALICE],
+            "two fills for BOB → two snapshots, interleaved with his fills; ONE order for ALICE → \
+             one snapshot, after it settles"
+        );
+        // Two fills against the same maker really did happen — the counts above are not one fill
+        // reported twice.
+        assert_eq!(
+            logs.iter()
+                .filter(|l| l.data.topics().first() == Some(&Trade::SIGNATURE_HASH))
+                .count(),
+            2,
+            "fixture: the sweep must consume BOTH maker orders"
+        );
+        // BOB's two rows are two different states, and the second is the settled one.
+        assert_ne!(
+            (
+                events[0].totalWalletBalance,
+                events[0].totalCrossWalletBalance
+            ),
+            (
+                events[1].totalWalletBalance,
+                events[1].totalCrossWalletBalance
+            ),
+            "each maker row is that maker's state at ITS OWN fill, not the same row twice"
+        );
+        assert_event_matches_get_account(&mut ctx, &events[1]);
+        assert_event_matches_get_account(&mut ctx, &events[2]);
+    }
+
+    /// A SELF-TRADE publishes **both legs**: the maker-leg snapshot at the fill and the taker-leg
+    /// snapshot at the end of the order, both for the same address.
+    ///
+    /// The owner chose both over suppressing one. The alternative — recognise `maker == taker` and
+    /// emit once — would make the maker leg conditional on who the taker happens to be, i.e. a
+    /// maker's own notification would depend on a property of the counterparty. Emitting both keeps
+    /// each leg's rule unconditional and pushes the reconciliation to where it is trivial:
+    /// **consumers take the last row per user**, which is already how every after-image event on this
+    /// ABI has to be read.
+    ///
+    /// The maker-leg row is the genuinely interesting one: it is derived from the registry working
+    /// copy that the TAKER leg then goes on to reuse and evolve (`match_order`'s "self-match reuses
+    /// the evolved copies"), so it is a real intermediate — and the taker row that follows is the
+    /// settled state.
+    #[test]
+    fn a_self_trade_publishes_both_the_maker_leg_and_the_taker_leg() {
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+        place_in(&mut ctx, ALICE, MARKET_ID, 1, PRICE, QTY, 3).expect("ALICE rests a maker sell");
+
+        let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, QTY);
+        assert_snapshots_close_pending_rows(&logs);
+        let events = snapshots_of(&logs);
+
+        assert_eq!(
+            events.iter().map(|e| e.user).collect::<Vec<_>>(),
+            vec![ALICE, ALICE],
+            "both legs: the maker-leg snapshot at the fill, then the taker-leg one for the order"
+        );
+        // Last-per-user-wins: the second row is the settled account, the first is not required to be.
+        assert_event_matches_get_account(&mut ctx, &events[1]);
+    }
+
+    /// **The one branch where a bug LOSES an event: the fee recipient is also a maker.**
+    ///
+    /// ADMIN rests a sell at `PRICE`; BOB rests one a tick worse. ALICE sweeps both, so ADMIN's own
+    /// fill comes FIRST and BOB's second — and BOB's maker fee is credited to ADMIN through
+    /// `MatchRegistry::credit_admin`'s read-through, landing on ADMIN's working copy **after** ADMIN's
+    /// per-fill snapshot was already derived from it. ADMIN's state therefore moves once more, with no
+    /// further event of ADMIN's own to hang a snapshot on.
+    ///
+    /// So ADMIN gets **two** rows: the per-fill one, and a drain one carrying the later fee. That
+    /// second row exists only because `MatchRegistry::flush` gates the mark-clear on the settled
+    /// payload equalling what was published, rather than on "I emitted something for this user".
+    /// An unconditional clear passes every other test in this module and silently drops this update —
+    /// which is why this test exists, and why it asserts the DELTA rather than just the count.
+    ///
+    /// ⚠️ ALICE's taker fee is deliberately left at 0. A non-zero one would make `finalize_apply`'s
+    /// `credit_fee_recipient` mark ADMIN *after* the flush as well, so the drain row would be
+    /// explained by either cause and the branch under test would no longer be isolated.
+    #[test]
+    fn a_fee_recipient_who_is_also_a_maker_gets_a_drain_row_for_the_later_fee() {
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+        fund(&mut ctx, ADMIN, WALLET);
+        // BOB pays a maker fee; ADMIN's own fill pays none, so the only fee in this call is the one
+        // credited to ADMIN AFTER ADMIN's snapshot.
+        storage::save_user_fee_rates(
+            &mut ctx,
+            BOB,
+            UserFeeRates {
+                maker_fee_bps: 10,
+                taker_fee_bps: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            storage::load_user_fee_rates(&mut ctx, ALICE)
+                .unwrap()
+                .taker_fee_bps,
+            0,
+            "fixture: the taker must pay no fee, or the drain row is not attributable"
+        );
+
+        // ADMIN at the better price is hit FIRST; BOB's fill (and therefore BOB's fee) follows.
+        place_in(&mut ctx, ADMIN, MARKET_ID, 1, PRICE, QTY, 3).expect("ADMIN maker sell");
+        place_in(&mut ctx, BOB, MARKET_ID, 1, PRICE + TICK, QTY, 3).expect("BOB maker sell");
+
+        let logs = crossing_order(&mut ctx, ALICE, 0, PRICE + TICK, 2 * QTY);
+        assert_snapshots_close_pending_rows(&logs);
+        let events = snapshots_of(&logs);
+
+        assert_eq!(
+            events.iter().map(|e| e.user).collect::<Vec<_>>(),
+            vec![ADMIN, BOB, ALICE, ADMIN],
+            "ADMIN twice: once at ADMIN's own fill, once from the drain for BOB's fee — which \
+             arrived after that fill's snapshot had already been taken"
+        );
+
+        // The two ADMIN rows differ by exactly BOB's maker fee, which is the whole point: the second
+        // row carries information the first could not have.
+        //
+        //   calc_value(PRICE + TICK, QTY, 8, 9) = 101 * 1e9 * 1e6 * 1e6 / (1e9 * 1e8) = 1_010_000
+        //   fee = 1_010_000 * 10 bps / 10_000                                        =     1_010
+        const BOB_MAKER_FEE: i64 = 1_010;
+        let (first, second) = (&events[0], &events[3]);
+        assert_eq!(
+            second.totalCrossWalletBalance - first.totalCrossWalletBalance,
+            BOB_MAKER_FEE,
+            "the drain row must carry the later fee credit, not repeat the fill row"
+        );
+        assert_eq!(
+            second.totalWalletBalance - first.totalWalletBalance,
+            BOB_MAKER_FEE,
+            "…and it lands on the wallet, so `wb` moves with `cw`"
+        );
+        // The LAST row is the settled account. (The first is not, and must not be asserted to be.)
+        assert_event_matches_get_account(&mut ctx, second);
+    }
+
+    /// The whole snapshot stream — order, users and payloads — is **byte-for-byte reproducible**.
+    ///
+    /// Two identical scenarios built in two independent contexts must produce the same sequence.
+    /// Emission is no longer a single `BTreeSet` drain, so determinism now rests on three ordered
+    /// things instead of one: the match walk's fill order, `MatchRegistry`'s event replay (a `Vec`,
+    /// in push order), and the drain's `BTreeSet`. A `HashMap` anywhere in that chain would make
+    /// receipts differ between nodes running the same code, which is a consensus bug rather than a
+    /// cosmetic one — so this is pinned across a scenario that exercises all three: two makers, a
+    /// multi-fill sweep, a resting remainder and a fee-earning ADMIN.
+    #[test]
+    fn the_snapshot_stream_is_deterministic() {
+        fn run() -> Vec<(Address, i64, i64)> {
+            let mut ctx = make_ctx();
+            fixture(&mut ctx);
+            // Non-zero maker fee → ADMIN is credited and joins the stream through the drain.
+            storage::save_user_fee_rates(
+                &mut ctx,
+                BOB,
+                UserFeeRates {
+                    maker_fee_bps: 1,
+                    taker_fee_bps: 0,
+                },
+            )
+            .unwrap();
+            fund(&mut ctx, CAROL, WALLET);
+            place_in(&mut ctx, BOB, MARKET_ID, 1, PRICE, QTY, 3).expect("BOB sell");
+            place_in(&mut ctx, CAROL, MARKET_ID, 1, PRICE, QTY, 3).expect("CAROL sell");
+            // 3 lots: two fills, one lot rests.
+            let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, 3 * QTY);
+            assert_snapshots_close_pending_rows(&logs);
+            snapshots_of(&logs)
+                .into_iter()
+                .map(|e| (e.user, e.totalWalletBalance, e.totalCrossWalletBalance))
+                .collect()
+        }
+
+        let first = run();
+        assert_eq!(first, run(), "the snapshot stream must be reproducible");
+        // …and it is the stream this change is about, not an empty one: both makers report at their
+        // own fills (FIFO: BOB's order rested first), the taker once, ADMIN last from the drain.
+        assert_eq!(
+            first.iter().map(|(u, ..)| *u).collect::<Vec<_>>(),
+            vec![BOB, CAROL, ALICE, ADMIN]
+        );
     }
 }
 

@@ -1358,7 +1358,7 @@ fn get_account_totals_equal_the_sum_of_per_market_get_margin_info() {
 /// must agree on all ten fields with no reasoning about intermediate snapshots at all.
 ///
 /// A zero-delta write is not a path the engine takes; it is the cleanest way to isolate the
-/// PRODUCER. `trading::tests::matched_call_emits_one_settled_snapshot_per_party_in_address_order`
+/// PRODUCER. `trading::tests::matched_call_publishes_one_snapshot_per_economic_event`
 /// covers the same agreement on a real money-moving call.
 #[test]
 fn the_event_and_get_account_agree_field_for_field_on_the_same_state() {

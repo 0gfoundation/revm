@@ -49,7 +49,10 @@ sol! {
         ///                               the stored `Σ pos.margin` aggregate
         ///                               (`UserAccount::total_position_margin`) with no walk at all,
         ///                               and the two are cross-checked against each other in debug
-        ///                               builds on every published snapshot. (Not to be confused with
+        ///                               builds on every snapshot published off the store. (A maker's
+        ///                               per-fill snapshot is published off the match working copy
+        ///                               instead, and `MatchRegistry::flush` asserts THAT formula
+        ///                               converges on the same stored aggregate.) (Not to be confused with
         ///                               the deleted `total_perp_collateral` "TC" field, which also
         ///                               carried the open-order ESCROW and therefore had to be
         ///                               rewritten on every order rest and cancel; `Σ pos.margin`
@@ -800,10 +803,10 @@ sol! {
         ///
         /// ## Positions are NOT here, and do not need to be
         ///
-        /// `PositionChanged` is our `P[]` analogue, and the account snapshot is emitted **LAST** in
-        /// the transaction (see GRANULARITY below), so an indexer replaying the log in order already
-        /// holds every `PositionChanged` of that transaction before it reaches this event. Duplicating
-        /// them into an array here would be a second encoding of the same facts.
+        /// `PositionChanged` is our `P[]` analogue, and a snapshot for user X is emitted **after the
+        /// rows that caused it** (see GRANULARITY below), so an indexer replaying the log in order
+        /// already holds X's `PositionChanged` rows for the event being reported before it reaches
+        /// this one. Duplicating them into an array here would be a second encoding of the same facts.
         ///
         /// ⚠️ `perpWalletBalance` (`uint64`, floored at 0) is GONE and has been for two revisions. It
         /// is `int64 totalCrossWalletBalance`: the same quantity, SIGNED and UNCLAMPED, and named the
@@ -814,10 +817,39 @@ sol! {
         /// operator watching only the event stream could not see a deficit accumulate. Nothing on this
         /// event is clamped.
         ///
-        /// GRANULARITY: **exactly one per affected user per transaction, emitted last**, in ascending
-        /// address order. Every published payload is therefore a SETTLED account state — draining
-        /// after the call has finished is what keeps a half-updated one (wallet leg landed, position
-        /// leg not yet) out of the stream.
+        /// GRANULARITY: **one per ECONOMIC EVENT**, not one per transaction. Three rules, and a party
+        /// falls under exactly one of them per event:
+        ///
+        /// * a **MAKER** whose resting order is filled: **one per FILL.** A maker order is consumed at
+        ///   most once per taker sweep, so this is also one per maker order. The row is emitted inside
+        ///   the match, immediately after that fill's `Trade`.
+        /// * a **TAKER**: **one per ORDER**, after the order has settled (so a batch of K crossing
+        ///   items publishes K rows for the initiator, one per item).
+        /// * **everything else** — deposit / withdraw / transferToPerp / transferFromPerp, funding,
+        ///   `setLeverage`, add/removePositionMargin, liquidation, ADL, and the fee recipient —
+        ///   **one per user per transaction**, drained at the end of the call in ascending address
+        ///   order.
+        ///
+        /// A **SELF-TRADE emits BOTH** legs for the same address: the maker-leg row at the fill and
+        /// the taker-leg row at the end of the order. The maker leg is deliberately not suppressed —
+        /// that would make a maker's own notification conditional on who the counterparty turned out
+        /// to be.
+        ///
+        /// ⚠️ **Consumers must take the LAST row per user**, exactly as they already must for
+        /// `PositionChanged`. A user can legitimately appear several times in one transaction, and a
+        /// maker row for a user may PRECEDE a later taker row for that same user. Every row is a true
+        /// after-image at its own moment; the last is the settled state.
+        ///
+        /// What this replaced, and why: the unit used to be the transaction, which is the TAKER's
+        /// unit. Coalescing a maker's fills into it made a maker's notification cadence a function of
+        /// an unrelated party's batching — a 64-item batch filling maker M on items 3, 17 and 40 gave M
+        /// one row, at the end of a transaction M never participated in, for three separate economic
+        /// events of M's own.
+        ///
+        /// No row is a half-updated account. It no longer follows from "emitted last" and is instead
+        /// established per emit point: the taker's is taken after her margin/fee debit has landed, and
+        /// a maker's is the state the match is about to persist for that fill (derived from the match
+        /// working copy, whose convergence on the store is asserted in debug builds).
         ///
         /// ⚠️ TRIGGER: a user is included only if the transaction moved that user's WALLET or a
         /// POSITION's stored state. A pure placement and a pure cancel publish NOTHING — and, unlike

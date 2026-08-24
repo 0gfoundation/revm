@@ -607,6 +607,67 @@ pub(super) struct UserWork {
     sell_entries: std::collections::VecDeque<crate::types::OrderEntry>,
     dirty_buy: bool,
     dirty_sell: bool,
+    /// `Σ pos.margin` over this user's OTHER markets — the part of the stored
+    /// [`crate::types::UserAccount::total_position_margin`] this match provably cannot move (one
+    /// match settles exactly one market).
+    ///
+    /// # Why it is here, and why it is a DIFFERENCE rather than the two terms
+    ///
+    /// The maker's authoritative state during a sweep is this working copy, not storage — the walk
+    /// performs zero storage writes and the flush writes these copies. So a per-fill account
+    /// snapshot has to be derived from the copy, and `totalWalletBalance = cw + Σ_all_markets
+    /// pos.margin` needs a Σ the copy does not carry: `account.total_position_margin` is a
+    /// whole-account aggregate maintained exclusively by `storage::save_position`, and
+    /// `storage::save_account` deliberately CLOBBERS it from the store, so the field on an owned
+    /// copy is not a value anything may read.
+    ///
+    /// [`MatchRegistry::get_or_load`] holds both terms it needs in the same breath — the stored
+    /// aggregate on the freshly loaded account, and this market's stored `pos.margin` on the
+    /// freshly loaded position, BEFORE funding is folded into the latter. Their difference is
+    /// invariant for the whole match, so capturing it once turns every later snapshot into
+    /// `base + w.pos.margin` with no load and, crucially, with no dependence on *when* storage is
+    /// read (the naive form, "read the stored aggregate at fill time", is only correct while the
+    /// store is still pre-match — a property of the current walk rather than of the formula).
+    ///
+    /// Pre-funding is the right anchor precisely because the stored aggregate is pre-funding too:
+    /// `funding::compute_funding_settlement` moves `pos.margin` in MEMORY and
+    /// `apply_funding_settlement` writes only the insurance fund and its logs, so the stored
+    /// position — and therefore the stored Σ — still holds the pre-funding margin right up to the
+    /// flush's `save_position`.
+    ///
+    /// Verified rather than argued: [`MatchRegistry::flush`] cross-checks `base + w.pos.margin`
+    /// against the settled store on every flushed user in `debug_assertions` builds.
+    other_market_position_margin: i64,
+    /// The payload of the last account snapshot published for this user during the match, if any.
+    /// Kept so the flush can decide whether the end-of-call drain still owes this user an event —
+    /// see the "duplicate mark" note in [`MatchRegistry::flush`].
+    last_published: Option<crate::margin_view::AccountWalletBalances>,
+}
+
+impl UserWork {
+    /// The three balances `AccountBalanceChanged` publishes, **as the flush will write them** —
+    /// the working-copy analogue of [`crate::margin_view::index_account_wallet_balances`].
+    ///
+    /// `cw` and `usdcBalance` are read straight off the working account (the flush's `save_account`
+    /// writes exactly this struct). `wb = cw + Σ_all_markets pos.margin` reconstructs the Σ from
+    /// [`Self::other_market_position_margin`] plus this market's live working `pos.margin`, which is
+    /// the value the flush's `save_position` is going to store. The narrowing guard is the same one
+    /// (and the only one) the settled producer has.
+    fn wallet_balances(&self) -> Result<crate::margin_view::AccountWalletBalances, PerpError> {
+        let total_position_margin = self
+            .other_market_position_margin
+            .checked_add(self.pos.margin)
+            .ok_or_else(|| perp_err("account snapshot: Σ position margin overflow"))?;
+        let total_cross_wallet_balance = self.account.perp_wallet_balance;
+        let total_wallet_balance = total_cross_wallet_balance
+            .checked_add(total_position_margin)
+            .ok_or_else(|| perp_err("account snapshot: total wallet balance exceeds i64"))?;
+        Ok(crate::margin_view::AccountWalletBalances {
+            usdc_balance: self.account.usdc_balance.clone().into(),
+            total_wallet_balance,
+            total_cross_wallet_balance,
+        })
+    }
 }
 
 /// One deferred side effect of the match walk (commit-only #23, L2a). The walk pushes these in
@@ -676,6 +737,17 @@ pub(super) enum MatchEvent {
         best_bid: u64,
         best_ask: u64,
     },
+    /// One `AccountBalanceChanged` for a MAKER, at its own fill.
+    ///
+    /// The payload is carried rather than looked up: the maker's state at fill time exists only in
+    /// the `UserWork` copy (see [`UserWork::wallet_balances`]), and by the time this replays the
+    /// store has still not been written. The event exists purely to put the log at the right
+    /// STREAM POSITION — immediately after the `Trade` row for that fill, so the snapshot closes
+    /// the maker's rows for that fill instead of floating to the end of the call.
+    AccountSnapshot {
+        user: Address,
+        balances: crate::margin_view::AccountWalletBalances,
+    },
 }
 
 pub(super) struct MatchRegistry {
@@ -699,6 +771,35 @@ impl MatchRegistry {
 
     pub(super) fn push_event(&mut self, e: MatchEvent) {
         self.events.push(e);
+    }
+
+    /// Records ONE `AccountBalanceChanged` for a maker that has just been filled, derived from that
+    /// maker's working copy.
+    ///
+    /// Called from the match walk immediately after the fill's `Trade` event is pushed, which is
+    /// what makes the published stream read *"here is what happened to this maker, here is what the
+    /// maker's account looks like as a result"*. Pushing it from inside
+    /// [`settle_maker_fill_registry`] instead would put it BEFORE the `Trade` row it is meant to
+    /// close.
+    ///
+    /// One event per fill. A maker order is consumed at most once per taker sweep, so that is one
+    /// event per maker ORDER; a user resting two orders that both get filled by the same sweep gets
+    /// two, which is the point — those are two economic events, and coalescing them to the taker's
+    /// transaction boundary made a maker's notification cadence a function of an unrelated party's
+    /// batching.
+    pub(super) fn push_maker_snapshot(&mut self, user: Address) -> Result<(), PerpError> {
+        let i = self
+            .users
+            .iter()
+            .position(|(a, _)| *a == user)
+            .ok_or_else(|| {
+                perp_invariant_err("account snapshot for a maker not in the registry")
+            })?;
+        let balances = self.users[i].1.wallet_balances()?;
+        self.users[i].1.last_published = Some(balances.clone());
+        self.events
+            .push(MatchEvent::AccountSnapshot { user, balances });
+        Ok(())
     }
 
     /// The user's working copy **if they already joined this match** — never loads, never inserts.
@@ -749,6 +850,13 @@ impl MatchRegistry {
         }
         let mut pos = storage::load_position(context, user, market_id)?;
         let mut account = storage::load_account(context, user)?;
+        // `Σ pos.margin` over the user's OTHER markets. Captured HERE, from the two pre-match reads
+        // above and before funding touches `pos.margin`, because that is the only instant both terms
+        // are in hand and both are pre-match. See `UserWork::other_market_position_margin`.
+        let other_market_position_margin = account
+            .total_position_margin
+            .checked_sub(pos.margin)
+            .ok_or_else(|| perp_err("match: Σ position margin underflow"))?;
         let pending = crate::funding::compute_funding_settlement(context, user, market, &mut pos)?;
         if let Some(p) = pending {
             self.events.push(MatchEvent::ApplyFunding(p));
@@ -770,6 +878,8 @@ impl MatchRegistry {
                 sell_entries,
                 dirty_buy: false,
                 dirty_sell: false,
+                other_market_position_margin,
+                last_published: None,
             },
         ));
         Ok(self.users.len() - 1)
@@ -891,6 +1001,11 @@ impl MatchRegistry {
                         context, market_id, best_bid, best_ask,
                     )?;
                 }
+                MatchEvent::AccountSnapshot { user, balances } => {
+                    // Log only — the mark is cleared at the end of the per-user save loop below,
+                    // because it is those saves that do the marking.
+                    storage::log_account_snapshot(context, user, &balances);
+                }
                 MatchEvent::Trade {
                     market_id,
                     taker_order_id,
@@ -966,8 +1081,72 @@ impl MatchRegistry {
             w.pos.total_buy_notional = tbn;
             w.pos.total_sell_qty = tsq;
             w.pos.total_sell_notional = tsn;
+            // ── The working-copy snapshot formula CONVERGES on the settled store ──────────────
+            //
+            // Every per-fill account snapshot this match published was derived from the working copy
+            // (`UserWork::wallet_balances`), because the copy — not storage — is the authoritative
+            // record during the walk, and writing maker state through per fill would destroy that
+            // (`MatchRegistry::user_work`'s "this IS the post-flush state" contract, and with it the
+            // K9 measurement and the zero-fill rest pre-check). Derived state is only as good as its
+            // convergence, so the derivation is checked against the thing it stands in for: the FINAL
+            // working copy, put through the same formula, must equal what
+            // `margin_view::index_account_wallet_balances` reads back out of the settled store one
+            // line later. Captured before the writes because `save_account` consumes `w.account`.
+            let published = w.last_published.take();
+            // Release builds only fold it when there is a published payload to compare against —
+            // `wallet_balances` parses the decimal `usdc_balance`, and a flushed user who published
+            // nothing (an untouched maker, a K9 reject) must not pay for that. Debug builds always
+            // fold it, because the convergence guard below is the reason the derivation is trusted at
+            // all and it has to run on every flushed user, not only the ones that emitted.
+            let derived = if published.is_some() || cfg!(debug_assertions) {
+                Some(w.wallet_balances()?)
+            } else {
+                None
+            };
             storage::save_position(context, user, market_id, &w.pos)?;
             storage::save_account(context, user, w.account)?;
+            #[cfg(debug_assertions)]
+            {
+                let settled = crate::margin_view::index_account_wallet_balances(
+                    context,
+                    user,
+                    "match flush convergence",
+                )?;
+                debug_assert_eq!(
+                    derived.as_ref(),
+                    Some(&settled),
+                    "match flush: the working-copy account-snapshot formula for {user} \
+                     (Σ over other markets + working pos.margin, on the working wallet) diverged \
+                     from the settled store — every per-fill snapshot published during this match \
+                     is derived from that formula"
+                );
+            }
+            // ── The duplicate mark ───────────────────────────────────────────────────────────
+            //
+            // The two writes above MARK this user in the call-scoped touched set, so the end-of-call
+            // drain would publish a second event for a maker who already got one per fill. Clear the
+            // mark — but only when the drain would have nothing to add, i.e. when the settled state
+            // is byte-identical to the last payload published for this user. That is not the common
+            // case dressed up as a rule: a maker who is ALSO the fee recipient keeps receiving
+            // `credit_admin` read-through credits from LATER makers' fills, after their own last
+            // snapshot, and unmarking unconditionally would drop that update on the floor. Comparing
+            // payloads is exact here precisely because of the convergence checked just above.
+            //
+            // ⚠️ That branch is LIVE and its only coverage is
+            // `trading::tests::account_snapshot_events::a_fee_recipient_who_is_also_a_maker_gets_a_drain_row_for_the_later_fee`.
+            // Replacing this condition with a bare `published.is_some()` passes every other test in
+            // the suite — including `assert_snapshots_close_pending_rows`, which is structurally
+            // BLIND to it: the dropped row carries a fee credit, and a fee credit to the admin is
+            // named by no `Trade` / `PositionChanged` / `FundingSettled`, so that user is never left
+            // "pending". Do not delete that test believing the generic invariant subsumes it.
+            //
+            // The equality also does NOT hold for a self-matching taker — the taker leg evolves this
+            // same working copy past the maker-leg payload — so a self-matcher stays marked here on
+            // purpose, and `finalize_apply`'s own emit is what closes them out. See
+            // `storage::publish_account_snapshot_now`.
+            if published.is_some() && published == derived {
+                storage::clear_account_snapshot_mark(context, user);
+            }
         }
         Ok(())
     }

@@ -349,10 +349,27 @@ pub fn load_account_ref<H: PerpHost>(
         .unwrap_or_else(|| std::sync::Arc::new(UserAccount::default())))
 }
 
-/// ── THE `AccountBalanceChanged` TRIGGER: WHICH WRITE HAPPENED, ONCE PER USER PER TRANSACTION ──
+/// ── THE `AccountBalanceChanged` TRIGGER: WHICH WRITE HAPPENED ──────────────────────────────────
 ///
-/// Marks `user` as owing ONE account snapshot, published at the end of the top-level call by
-/// [`flush_account_snapshots`]. Nothing is logged here.
+/// Marks `user` as owing an account snapshot from the end-of-call drain
+/// ([`flush_account_snapshots`]). Nothing is logged here.
+///
+/// # ⚠️ The drain is now the FALLBACK, not the only emitter
+///
+/// The trading paths publish DIRECTLY, at the economic event, and clear the mark this function set
+/// (see [`clear_account_snapshot_mark`]):
+///
+/// | party | granularity | emitted by |
+/// |---|---|---|
+/// | a filled MAKER | one per FILL (= one per maker order per sweep) | the match flush, from the registry working copy |
+/// | a TAKER | one per ORDER | `trading::mod::match_order`, after `finalize_apply`, off the settled store |
+/// | everyone else | coalesced, one per user per call | THIS mark + the drain |
+///
+/// "Everyone else" is deposit/withdraw/transfer, funding, `setLeverage`, liquidation and ADL — plus
+/// the fee recipient, who is an incidental party to a fill rather than a counterparty (one row per
+/// fill for a pure fee sink is noise, and its wallet move is not named by any `Trade` or
+/// `PositionChanged`). The marking rules below are unchanged and still govern the drain; what
+/// changed is that a maker no longer waits for the end of a transaction it never participated in.
 ///
 /// # The trigger set (strict Binance alignment — choice A)
 ///
@@ -429,43 +446,119 @@ pub fn load_account_ref<H: PerpHost>(
 /// `BTreeSet` probe. Emitting for a write whose net effect happened to be zero is the fail-safe
 /// direction — a redundant snapshot is harmless, a missing one is not.
 ///
-/// # Coalescing: one event per user per transaction, emitted last
+/// # The drain: one event per marked user per call, emitted last, in address order
 ///
-/// Rule #2 of `websocket-implementation.md`'s **Transaction-Level Coalescing**: *"Coalesce account
-/// updates to one final snapshot per affected user per transaction."* Marks accumulate in the
-/// call-scoped `TypedPerpStore::touched_accounts`; the shell drains them once, in ascending address
-/// order, after the dispatch returns `Ok`.
+/// This is what remains of `websocket-implementation.md`'s **Transaction-Level Coalescing** #2
+/// (*"Coalesce account updates to one final snapshot per affected user per transaction"*). Marks
+/// accumulate in the call-scoped `TypedPerpStore::touched_accounts`; the shell drains them once,
+/// in ascending address order, after the dispatch returns `Ok`.
 ///
-/// Three properties follow, and each is a requirement rather than a side effect:
+/// It is now the FALLBACK for the non-trading paths and the fee recipient (see the table at the top).
+/// The transaction was the wrong unit for a fill: the transaction belongs to the TAKER, so coalescing
+/// a maker's fills into it made a maker's notification cadence a function of an unrelated party's
+/// batching — a 64-item batch that filled maker M on items 3, 17 and 40 gave M one row, at the end of
+/// a transaction M never participated in, for three separate economic events.
 ///
-/// * **Every published snapshot is a SETTLED account state.** The old write-site emission published
-///   intermediates — a taker's first event reported the funded position silo before her wallet had
-///   paid for it, so `totalWalletBalance = cross + Σ positionMargin` double-counted `total_required`.
-///   Draining after the dispatch means there is no half-updated state left to observe.
-/// * **A reverted call publishes nothing**, because the drain is on the success arm only.
-/// * **Deterministic order**, because the set is a `BTreeSet<Address>` and not a hash map.
+/// Of the three properties the pure-drain design bought, two are unconditional and one had to be
+/// re-established per emit point:
 ///
-/// What it saves, in walks. Each published snapshot costs one
+/// * **A reverted call publishes nothing.** Still unconditional, and for the direct emits it is
+///   stronger rather than weaker: they sit past the last genuine reject on their path (a maker's
+///   inside the match flush, a taker's after `finalize_apply`), and a revert unwinds the logs with
+///   the transaction regardless.
+/// * **Deterministic order.** Now three ordered things rather than one: the match walk's fill order,
+///   `MatchRegistry`'s `Vec` event replay, and this `BTreeSet`. None is a hash map. Pinned by
+///   `trading::tests::account_snapshot_events::the_snapshot_stream_is_deterministic`.
+/// * **No half-updated state.** This is the one that is now an argument per emit point, not a
+///   consequence of draining last. A taker's snapshot is taken after `finalize_apply` has debited
+///   her, so the intermediate that motivated the drain (the funded silo before the wallet paid for
+///   it) is still absent. A maker's is derived from the `MatchRegistry` working copy the flush is
+///   about to write — settled for that fill, and NOT a partial write of it, which is why the
+///   registry's convergence guard exists. A LATER fill for the same maker publishes again; that is
+///   a new event, not a correction, and consumers take the last row per user.
+///
+/// Cost. Each published snapshot costs one
 /// [`crate::margin_view::index_account_wallet_balances`] call: **ONE** account `_ref` load, flat, with
 /// no walk at all — all three published balances are stored scalars on that blob (`Σ pos.margin` is
 /// the maintained `UserAccount::total_position_margin`). It was ≤ 18 loads while that Σ was walked off
 /// the per-user market index at one position load per member market, and ≤ 33 before that, while the
-/// payload carried the whole margin roll-up at two loads per market. Against the per-write emission
-/// this removes:
+/// payload carried the whole margin roll-up at two loads per market. The maker emit is cheaper still:
+/// it reads NOTHING, because the working copy already holds the wallet and the Σ is reconstructed from
+/// one `i64` captured when the maker joined the registry.
 ///
-/// ```text
-///   placement / cancel        1 → 0    (the trigger filter, above)
-///   taker in an N-maker match N+3 → N+1  (the taker emitted at the flush AND at her debit;
-///                                         the makers are distinct users, so they do not collapse)
-///   one liquidation           3 + adl_budget → 1 for the liquidated address
-///   a K-item batch            up to K → 1 for the initiator (K ≤ MAX_BATCH_PLACE = 64)
-/// ```
+/// Against the old per-write emission the filter + drain still remove the placement/cancel row
+/// (1 → 0) and the taker's duplicate at her debit; what the granularity change gives back is one row
+/// per maker fill and one per taker order instead of one per user per transaction.
 ///
 /// Gas stays FLAT PER SELECTOR — never per event, never dynamic. The per-selector reasoning is on
 /// the `SELECTORS` table in [`crate::call`].
 #[inline]
 fn mark_account_snapshot_dirty<H: PerpHost>(context: &mut H, user: Address) {
     typed_store_mut(context).mark_account_touched(user);
+}
+
+/// Drops `user`'s pending mark, so [`flush_account_snapshots`] will not publish for them.
+///
+/// ⚠️ **Only for a site that already published this user's snapshot DIRECTLY** — per fill for a
+/// maker, per order for a taker — and that has established the drain would merely repeat it. The
+/// trading paths still go through [`save_position`] / [`save_account`] / [`mutate_account_balance`],
+/// so a direct emit does not stop the drain from emitting a second, redundant event; clearing the
+/// mark is what does.
+///
+/// Un-marking is the UNSAFE direction of this switch (a redundant snapshot is harmless, a missing
+/// one is not), so both callers gate it on the settled payload being identical to what they
+/// published, never on "I emitted something". A LATER economic event for the same user in the same
+/// call re-marks them and the drain covers it — which is correct, that is a new event.
+#[inline]
+pub(crate) fn clear_account_snapshot_mark<H: PerpHost>(context: &mut H, user: Address) {
+    typed_store_mut(context).unmark_account_touched(user);
+}
+
+/// Publishes ONE `AccountBalanceChanged` for `user` right now, off the SETTLED store, and clears
+/// their pending mark so the end-of-call drain does not repeat it.
+///
+/// This is the taker-side emit point (`trading::settlement::finalize_apply` has just written the
+/// last of the taker's state, so "settled" is literal here). Makers cannot use it: their state during
+/// a sweep lives in the `MatchRegistry` working copy, not in the store — see
+/// `trading::settlement::UserWork::wallet_balances`.
+///
+/// Clearing unconditionally is sound only because nothing further in the call writes this user's
+/// account *for this order*: the placement path's remaining writes are `rest_in_book`'s
+/// `save_position_reservation_only` and the nonce's `mutate_account`, neither of which marks (see the
+/// trigger table on [`mark_account_snapshot_dirty`]). A later batch item DOES write, re-marks, and is
+/// published again — one event per order, as intended.
+///
+/// # This is also what caps a SELF-MATCH at exactly two rows
+///
+/// A self-matching user is in the `MatchRegistry`, so the flush evaluates its mark-clear gate for
+/// them — and that gate does NOT fire, because the taker leg evolved the same working copy past the
+/// maker-leg payload it published. The flush's own `save_position` / `save_account` then re-mark
+/// them, and so does `finalize_apply`'s debit. Every one of those is absorbed by the unconditional
+/// clear here: the sequence is maker-leg row → (marked, marked, marked) → taker-leg row → cleared,
+/// giving **exactly two** rows and no drain row. Verified by removing this line, which makes
+/// `trading::tests::account_snapshot_events::a_self_trade_publishes_both_the_maker_leg_and_the_taker_leg`
+/// report a third, duplicate row.
+pub(crate) fn publish_account_snapshot_now<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+) -> Result<(), PerpError> {
+    emit_account_snapshot(context, user)?;
+    clear_account_snapshot_mark(context, user);
+    Ok(())
+}
+
+/// Logs one `AccountBalanceChanged` from an ALREADY-COMPUTED payload, without touching the mark.
+///
+/// The maker path's emit: the payload is derived from the `MatchRegistry` working copy at fill time
+/// (the store is not the maker's state yet), while the mark can only be cleared after the flush's
+/// writes have done their marking — so the two halves are necessarily separate, and
+/// `MatchRegistry::flush` owns the second one.
+pub(crate) fn log_account_snapshot<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    b: &crate::margin_view::AccountWalletBalances,
+) {
+    log_account_balance_changed(context, user, b);
 }
 
 /// Opens a perp call: drops any un-drained marks from a previous call. See
@@ -520,6 +613,20 @@ pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpE
 fn emit_account_snapshot<H: PerpHost>(context: &mut H, user: Address) -> Result<(), PerpError> {
     let b =
         crate::margin_view::index_account_wallet_balances(context, user, "AccountBalanceChanged")?;
+    log_account_balance_changed(context, user, &b);
+    Ok(())
+}
+
+/// **The one and only site that constructs the `AccountBalanceChanged` log.** Two producers feed it
+/// — [`crate::margin_view::index_account_wallet_balances`] off the settled store (the drain and the
+/// taker emit) and `trading::settlement::UserWork::wallet_balances` off a match working copy (the
+/// per-fill maker emit) — and both hand it the same three-field `AccountWalletBalances`, so there is
+/// exactly one definition of the wire payload no matter where the numbers came from.
+fn log_account_balance_changed<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    b: &crate::margin_view::AccountWalletBalances,
+) {
     context.log(primitives::Log {
         address: PERP_DEX_ADDRESS,
         data: {
@@ -533,7 +640,6 @@ fn emit_account_snapshot<H: PerpHost>(context: &mut H, user: Address) -> Result<
             .to_log_data()
         },
     });
-    Ok(())
 }
 
 /// Whole-blob account write — the wallet / fee-rate / nonce legs.

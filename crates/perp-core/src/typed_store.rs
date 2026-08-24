@@ -1178,6 +1178,18 @@ impl TypedPerpStore {
         self.touched_accounts.insert(user);
     }
 
+    /// Un-marks `user`: the drain at the end of the call will NOT publish for them.
+    ///
+    /// The one legitimate caller is a site that has ALREADY published this user's snapshot directly,
+    /// at its own economic event, and has established that the drain would only repeat it. It must
+    /// run AFTER the writes it is compensating for, since those writes are what did the marking.
+    /// Getting this wrong in the un-marking direction loses an update, which is why the caller in
+    /// `perp-engine` gates it on payload equality rather than on "I emitted something".
+    #[inline]
+    pub fn unmark_account_touched(&mut self, user: Address) {
+        self.touched_accounts.remove(&user);
+    }
+
     /// Takes the call's touched set, leaving it empty. Iterating the result yields **ascending
     /// address order** (`BTreeSet`), which is the drain order the log stream commits to.
     #[inline]

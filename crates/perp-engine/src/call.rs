@@ -129,9 +129,12 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         //     depositInsuranceFund  50_000 → 40_000    withdrawInsuranceFund 50_000 → 40_000
         //     setLeverage           40_000 → 30_000    setLeverageSigned    40_000 → 30_000
         //
-        // The event is COALESCED — one snapshot per touched user per transaction, drained at the end
-        // of the call (`storage::flush_account_snapshots`) — so "emission count is exactly 1" is a
-        // property of the selector, not a per-write coincidence: each of these touches one account.
+        // Every selector in this group is a NON-TRADING path, so it is still served by the coalescing
+        // drain — one snapshot per touched user per call
+        // (`storage::flush_account_snapshots`) — and "emission count is exactly 1" remains a property
+        // of the selector rather than a per-write coincidence: each of these touches one account. (The
+        // TRADING paths no longer go through the drain; they publish per fill / per order. That does
+        // not reach these entries — see the `placeOrder` note below for the one it does reach.)
         // `addPositionMargin` / `removePositionMargin` were flagged as OVER-paying even at 20_000
         // (they went from two folds to one under coalescing and nothing was clawed back); halving the
         // surcharge collects that correction in passing rather than as a separate decision.
@@ -142,10 +145,16 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         //
         // ⚠️ DELIBERATELY NOT RAISED: `placeOrder` / `cancelOrder` (and therefore the batch per-item
         // units, which are defined as those constants so they cannot drift), `liquidate`,
-        // `updateIndexPrice`. Reasons, per selector, are on those entries — and under coalescing every
-        // one of them emits strictly FEWER events than when the price was last examined, so none of
-        // them moves DOWN either. FLAT per selector throughout — dynamic or per-event metering for
-        // this precompile was rejected outright.
+        // `updateIndexPrice`. Reasons, per selector, are on those entries. Note the direction of the
+        // count changed with the per-event granularity: these used to emit strictly FEWER events than
+        // when their price was last examined (which is why none of them moved DOWN), and a
+        // fill-heavy call now emits MORE — one row per maker FILL instead of one per distinct maker.
+        // That is a constant factor on a term these prices already under-model by an unbounded factor
+        // (N settlements, N `Trade` + N `PositionChanged` logs, N position + N account writes, all at
+        // one flat price), and the marginal snapshot is the cheapest thing in a fill: it reads
+        // NOTHING, because the maker's wallet is already in the registry working copy and the
+        // `Σ pos.margin` leg is one `i64` captured when that maker joined. FLAT per selector
+        // throughout — dynamic or per-event metering for this precompile was rejected outright.
         m.insert(depositCall::SELECTOR, (60_000, false));
         m.insert(withdrawCall::SELECTOR, (60_000, false));
         m.insert(transferToPerpCall::SELECTOR, (30_000, false));
@@ -213,13 +222,14 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         //   live reason is neither: resting genuinely moves `availableBalance`, and we are silent
         //   anyway because we are matching a measured venue. See
         //   `storage::mark_account_snapshot_dirty`.)
-        //   A CROSSING placement emits one snapshot per DISTINCT party — `N + 1` for N makers plus the
-        //   taker, down from `N + 4`, since the taker's flush write, her margin/fee debit and the
-        //   remainder's rest now collapse into one. Each fold still runs against state the match has
-        //   ALREADY made resident (`MatchRegistry::get_or_load` loaded that user's position, account
-        //   and both order lists; the walk loaded the `Market` and `MarketHot`), so the marginal cost
-        //   per maker is ~1 cold read (their `umkt` index blob) + ~2 warm probes — and since the
-        //   payload narrowed to the three balances, not even a tier walk. NOT a fresh 18-load fold.
+        //   A CROSSING placement emits **one snapshot per FILL plus one for the taker's order** —
+        //   `F + 1` for F consumed maker orders, where `F ≥ N` for N distinct makers (it was `N + 1`
+        //   under per-user coalescing, and `N + 4` under the original per-write emission). The
+        //   marginal fill row costs **zero loads**: it is derived from the `MatchRegistry` working
+        //   copy that fill just mutated, with `Σ pos.margin` reconstructed from one `i64` captured at
+        //   `get_or_load`, so it is an `i64` add and a log. The taker's row is the only one that folds
+        //   anything, and that fold is the three-balance one — a single account `_ref` load against
+        //   state already resident.
         //   And `PLACE_ORDER_GAS` has always been flat over an
         //   unbounded-in-N match (N settlements, N `Trade` + N `PositionChanged` logs, N position + N
         //   account writes): the fold is a constant factor on a term this price already under-models.
@@ -252,12 +262,16 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(removePositionMarginCall::SELECTOR, (40_000, false));
         // Liquidation
         //
-        // NOT raised: a liquidation emits one snapshot per DISTINCT address it touches (the liquidated
-        // user, each maker it closes against, each ADL counterparty) — down from up to
-        // `3 + 2 × adl_fills`, since the liquidated user's residual, clearance fee and every ADL leg
-        // now collapse into one. It is protocol-driven risk work whose flat price already spans an
-        // orderbook close plus an unbounded ADL loop bounded only by `adl_budget` — the same
-        // flat-vs-unbounded structure as `placeOrder`, and this change does not move it.
+        // NOT raised: a liquidation emits one snapshot per maker FILL in the close sweep (those makers
+        // are ordinary counterparties, so they get the per-fill rule), plus one per DISTINCT other
+        // address from the drain — the liquidated user and each ADL counterparty, whose residual,
+        // clearance fee and ADL legs all still coalesce into a single settled row each. The liquidated
+        // user is deliberately NOT published at the close (`match_order` skips the taker emit when
+        // `liquidation_close`): the close is one leg of a liquidation that goes on to charge a
+        // clearance fee and possibly settle a residual, so a row there would be a half-liquidated
+        // account. It is protocol-driven risk work whose flat price already spans an orderbook close
+        // plus an ADL loop bounded only by `adl_budget` — the same flat-vs-unbounded structure as
+        // `placeOrder`, and a zero-load row per fill does not move it.
         m.insert(liquidateCall::SELECTOR, (150_000, false));
         // API key management
         m.insert(registerApiKeyCall::SELECTOR, (30_000, false));
@@ -283,8 +297,8 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getInsuranceFundCall::SELECTOR, (5_000, true));
         // Index price
         //
-        // NOT raised: the in-process liquidation sweep here can emit many snapshots (one per distinct
-        // address across a cap-50 sweep, down from cap-50 × per-liquidation events), and this selector
+        // NOT raised: the in-process liquidation sweep here can emit many snapshots (one per maker fill
+        // across a cap-50 sweep, plus one per distinct other address from the drain), and this selector
         // was ALREADY the largest flat-price-vs-work gap in the table for exactly that reason. It is
         // oracle/admin-only, not user-spammable, and pricing the sweep is a separate decision from
         // this event.
@@ -515,7 +529,7 @@ pub fn run_perp_dex_call<H: PerpHost>(
         _ => Err(PerpError::Fatal("perpdex: selector dispatch mismatch".into())),
     };
 
-    // ── The coalesced account snapshots: one per touched user, in address order, LAST ──
+    // ── The coalesced account snapshots: one per STILL-marked user, in address order, LAST ──
     //
     // SUCCESS PATH ONLY, and this is the whole reason it sits between the dispatch and the output:
     // a reverted call must publish nothing (its perp writes are validate-then-apply, so there is
@@ -524,6 +538,12 @@ pub fn run_perp_dex_call<H: PerpHost>(
     // construction — the depth gate above rejects `> 1`, so this entry point cannot be nested and no
     // inner call can drain early; the liquidation sweep and the batch drivers are plain calls in this
     // same frame and coalesce into this drain. See `storage::flush_account_snapshots`.
+    //
+    // "STILL-marked" is the granularity change: the trading paths publish at their own economic
+    // events — one per FILL for a maker, one per ORDER for a taker — and clear those users' marks
+    // (`storage::clear_account_snapshot_mark`), so what reaches this drain is the non-trading writes
+    // plus the incidental fee recipient. A user who moved AGAIN after their direct emit stays marked
+    // and is drained here too, which is the fail-safe direction.
     //
     // A drain failure is folded back into `result` so it takes the same clean-revert path a dispatch
     // error takes (and trips the same `perp_write_count` witness). Only a pathological account can

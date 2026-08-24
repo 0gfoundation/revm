@@ -1710,6 +1710,11 @@ pub(super) fn match_order<H: PerpHost>(
                         taker_fee,
                         maker_fee,
                     });
+                    // ONE account snapshot for this MAKER, at this fill, right after the `Trade`
+                    // row it closes. Derived from the maker's registry working copy — that copy,
+                    // not the store, is the maker's state until the flush. The taker's own snapshot
+                    // is published once for the whole order, after `finalize_apply`.
+                    registry.push_maker_snapshot(maker_addr)?;
 
                     // Update the maker order in place — the registry settle does not touch the
                     // maker Order struct, so the value loaded above is still current.
@@ -1927,6 +1932,8 @@ pub(super) fn match_order<H: PerpHost>(
                         taker_fee,
                         maker_fee,
                     });
+                    // Sell-side mirror of the buy walk's per-fill maker snapshot; see the note there.
+                    registry.push_maker_snapshot(maker_addr)?;
 
                     maker_order.filled += fill_qty;
                     maker_order.status = if maker_order.filled >= maker_order.quantity {
@@ -2049,6 +2056,23 @@ pub(super) fn match_order<H: PerpHost>(
     registry.flush(context, market)?;
     if let Some(plan) = taker_plan {
         settlement::finalize_apply(context, plan, side, market)?;
+        // ── ONE account snapshot for the TAKER, for this whole ORDER ──────────────────────────
+        //
+        // Off the SETTLED store, not off a working copy: `finalize_apply` has just written the last
+        // of the taker's state (the cover cancels, the margin+fee debit), so unlike a maker
+        // mid-sweep the taker's account really is final here. This lands after every `Trade` /
+        // `PositionChanged` the order produced — including its own — so it closes the taker's rows
+        // exactly the way each maker snapshot closes that maker's.
+        //
+        // A LIQUIDATION CLOSE is excluded: the liquidated user is not placing an order, and the
+        // close is one leg of a liquidation that goes on to charge a clearance fee and possibly
+        // settle a residual or run ADL. Publishing here would publish a half-liquidated account.
+        // Liquidation keeps the end-of-call drain, which is the settled end state. The MAKERS on
+        // the other side of that sweep are ordinary counterparties and do get their per-fill
+        // snapshots above.
+        if !liquidation_close {
+            storage::publish_account_snapshot_now(context, taker_addr)?;
+        }
     }
     if let Some(price) = last_trade_price {
         storage::save_last_traded_price(context, market_id, price)?;

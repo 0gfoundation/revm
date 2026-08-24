@@ -1044,8 +1044,8 @@ pub fn run_get_account_margin<H: PerpHost>(
 /// `usdcBalance`, `totalWalletBalance`, `totalCrossWalletBalance` — and must report the same numbers
 /// for them; that is pinned by
 /// `margin_view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state`,
-/// `trading::tests::matched_call_emits_one_settled_snapshot_per_party_in_address_order`,
-/// `trading::tests::account_snapshot_events::a_crossing_fill_publishes_one_snapshot_per_user_last`,
+/// `trading::tests::matched_call_publishes_one_snapshot_per_economic_event`,
+/// `trading::tests::account_snapshot_events::a_crossing_fill_publishes_a_snapshot_closing_each_party_s_rows`,
 /// and by the `debug_assertions` cross-check inside [`index_account_wallet_balances`], which compares
 /// the walk-free producer against this one on every published snapshot — plus the one inside
 /// [`index_account_scalars`], which compares this fold's `Σ pos.margin` against the stored aggregate
