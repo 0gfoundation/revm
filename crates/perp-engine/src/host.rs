@@ -127,6 +127,7 @@ impl<CTX: ContextTr> PerpHost for CTX {
     }
 
     fn log(&mut self, log: Log) {
+        crate::events::observe_log_for_group_invariant(&log);
         self.journal_mut().log(log);
     }
 
@@ -265,6 +266,7 @@ impl PerpHost for InMemoryHost {
     }
 
     fn log(&mut self, log: Log) {
+        crate::events::observe_log_for_group_invariant(&log);
         self.logs.push(log);
     }
 

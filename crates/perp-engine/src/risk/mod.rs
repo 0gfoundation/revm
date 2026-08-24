@@ -626,7 +626,8 @@ pub fn run_add_position_margin<H: PerpHost>(
     // commit-only #23: compute funding IN MEMORY (no insurance-fund write yet), so a reject below
     // leaves the IF untouched. The credit/charge lands on the in-memory `pos.margin` — funding is
     // isolated to the position and never touches the account-global wallet.
-    let pending_funding = compute_funding_settlement(context, caller, &market, &mut pos)?;
+    let pending_funding =
+        compute_funding_settlement(context, caller, &market, &mut pos, Some(&account))?;
     // Derived-ooIM gate. A CASH move (wallet → position margin), not an open-order requirement:
     // it changes neither `Bid`/`Ask` nor `N` nor `L`, so Σ ooIM is unchanged and the requirement
     // is exactly `amount`. It must come out of AVAILABLE, not the raw wallet — otherwise a user
@@ -657,6 +658,15 @@ pub fn run_add_position_margin<H: PerpHost>(
     storage::save_position(context, caller, args.marketId, &pos)?;
     storage::save_account(context, caller, account)?;
     emit_position_margin_adjusted(context, caller, args.marketId, amount, &pos);
+    // The `ACCOUNT_UPDATE` group for this margin move: header immediately before its one position
+    // row (`crate::events`). Off the SETTLED store — both writes above have landed and nothing
+    // after this line touches the account — so `publish_account_snapshot_now` also clears the mark
+    // those writes set and the end-of-call drain adds nothing.
+    //
+    // A funding settle earlier in this call published its OWN group (header + row) from
+    // `apply_funding_settlement`. Two groups for two economic events is the intent; the
+    // `PositionMarginAdjusted` row above sits between them and terminates the first.
+    storage::publish_account_snapshot_now(context, caller)?;
     // `market` is the Arc loaded at the top of this call; nothing here writes the mark, so
     // `market.mark_price` is the live mark for this transaction.
     emit_position_changed(context, caller, &market, &pos, 0, 0)?;
@@ -689,7 +699,8 @@ pub fn run_remove_position_margin<H: PerpHost>(
     let mut account = storage::load_account(context, caller)?;
     // commit-only #23: compute funding IN MEMORY first (no IF write yet) so the checks below see
     // post-funding margin, and a reject leaves the insurance fund untouched.
-    let pending_funding = compute_funding_settlement(context, caller, &market, &mut pos)?;
+    let pending_funding =
+        compute_funding_settlement(context, caller, &market, &mut pos, Some(&account))?;
     if pos.margin < amount {
         return Err(perp_err(
             "removePositionMargin: insufficient position margin",
@@ -744,6 +755,8 @@ pub fn run_remove_position_margin<H: PerpHost>(
     storage::save_position(context, caller, args.marketId, &pos)?;
     storage::save_account(context, caller, account)?;
     emit_position_margin_adjusted(context, caller, args.marketId, -amount, &pos);
+    // Group header — see `run_add_position_margin` for why it sits exactly here.
+    storage::publish_account_snapshot_now(context, caller)?;
     // `market.mark_price` IS the `mark_price` this call's maintenance gate used — both come from
     // the same `load_market_ref` Arc (`load_mark_price` is `load_market_ref(..).mark_price`).
     emit_position_changed(context, caller, &market, &pos, 0, 0)?;
@@ -800,7 +813,11 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // `save_account` below would have re-written a byte-identical blob (and emitted a spurious
     // `AccountBalanceChanged` for a balance that did not move). The liquidation's real wallet
     // movements happen inside the close legs, which write the account themselves.
-    let pending_funding = compute_funding_settlement(context, user, market, &mut pos)?;
+    // `None`: this path deliberately does NOT load the account (the load was removed when funding
+    // stopped touching the wallet — see the note above), and the header the funding group needs is
+    // only built when funding actually moved money, so the write-free healthy-candidate scan still
+    // reads no account blob.
+    let pending_funding = compute_funding_settlement(context, user, market, &mut pos, None)?;
     if is_above_maintenance_margin(
         &market.tiers,
         mark_price,

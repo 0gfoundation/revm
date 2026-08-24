@@ -11811,9 +11811,7 @@ mod assuming_price {
 // rather than merely written down.
 mod account_snapshot_events {
     use super::*;
-    use crate::interface::IPerpDex::{
-        batchPlaceOrdersCall, setLeverageCall, FundingSettled, PlaceItem, PositionChanged, Trade,
-    };
+    use crate::interface::IPerpDex::{batchPlaceOrdersCall, setLeverageCall, PlaceItem, Trade};
 
     /// Every `AccountBalanceChanged` in the journal, in emission order.
     fn take_balance_events(ctx: &mut TestCtx) -> Vec<AccountBalanceChanged> {
@@ -11826,82 +11824,162 @@ mod account_snapshot_events {
             .collect()
     }
 
-    /// The users a MONEY row names — the rows a snapshot is supposed to answer for.
+    // `assert_account_update_groups` and `stream_shape` live in `crate::events::stream_test_support`
+    // — the module that owns the invariant — because `risk::tests` needs them too (the liquidation
+    // and ADL streams are asserted there, against the fixtures that already exist there).
+    use crate::events::stream_test_support::{assert_account_update_groups, stream_shape};
+
+    // ── ORDERED-STREAM SHAPE: the assembled `ACCOUNT_UPDATE` pushes, not just counts ──────────
+    //
+    // The tests above assert WHO gets a snapshot and how many. These assert the exact ORDERED
+    // `(event, subject)` sequence, which is the only form that can catch the failure this design
+    // exists to prevent: a `PositionChanged` landing one slot too early (before its own header) or
+    // one slot too late (after a foreign header) is invisible to a count and fatal to an indexer.
+
+    /// **The two-fill sweep.** One taker crossing two DIFFERENT makers: each fill is its own
+    /// `ACCOUNT_UPDATE` for that maker (`Trade` outside the group, header then row inside), and the
+    /// taker gets one group for the whole order, last.
     ///
-    /// Only `Trade`, `PositionChanged` and `FundingSettled` count. The order-lifecycle rows
-    /// (`OrderPlaced` / `OrderRested` / `OrderCancelled`) are deliberately excluded, and that is the
-    /// same decision as the trigger filter at the top of this module: a placement or a cancel moves
-    /// no published field, so it is not a row anything owes a snapshot for. It matters mechanically
-    /// too — a GTC that fills part and rests the rest emits its `OrderRested` AFTER the taker
-    /// snapshot, because resting happens after the match returns.
-    fn money_row_users(log: &primitives::Log) -> Vec<Address> {
-        let topic = log.data.topics().first().copied();
-        let (t, d) = (log.data.topics(), &log.data.data);
-        if topic == Some(Trade::SIGNATURE_HASH) {
-            let e = Trade::decode_raw_log(t, d).unwrap();
-            vec![e.taker, e.maker]
-        } else if topic == Some(PositionChanged::SIGNATURE_HASH) {
-            vec![PositionChanged::decode_raw_log(t, d).unwrap().user]
-        } else if topic == Some(FundingSettled::SIGNATURE_HASH) {
-            vec![FundingSettled::decode_raw_log(t, d).unwrap().user]
-        } else {
-            Vec::new()
-        }
+    /// Two distinct makers rather than one maker twice, so a header/row mismatch — the row from
+    /// fill 2 sitting inside fill 1's group — is a DIFFERENT ADDRESS and not merely a duplicate.
+    #[test]
+    fn a_two_fill_sweep_publishes_one_group_per_fill_then_the_takers() {
+        let mut ctx = make_ctx();
+        fixture(&mut ctx);
+        fund(&mut ctx, CAROL, WALLET);
+        // One ask each, same level → one sweep consumes both from one queue, BOB first (FIFO).
+        place_in(&mut ctx, BOB, MARKET_ID, 1, PRICE, QTY, 3).expect("maker sell BOB");
+        place_in(&mut ctx, CAROL, MARKET_ID, 1, PRICE, QTY, 3).expect("maker sell CAROL");
+
+        let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, 2 * QTY);
+        assert_account_update_groups(&logs);
+        assert_eq!(
+            stream_shape(&logs),
+            vec![
+                ("OrderPlaced", Some(ALICE)),
+                // fill 1: BOB's group, with the `Trade` OUTSIDE it
+                ("Trade", Some(ALICE)),
+                ("AccountBalanceChanged", Some(BOB)),
+                ("PositionChanged", Some(BOB)),
+                // fill 2: CAROL's group
+                ("Trade", Some(ALICE)),
+                ("AccountBalanceChanged", Some(CAROL)),
+                ("PositionChanged", Some(CAROL)),
+                // the taker: ONE group for the whole order
+                ("AccountBalanceChanged", Some(ALICE)),
+                ("PositionChanged", Some(ALICE)),
+            ],
+            "each fill is one ACCOUNT_UPDATE for its maker; the taker gets one for the order"
+        );
     }
 
-    /// **THE STREAM INVARIANT, replacing "the snapshots are a contiguous SUFFIX".**
-    ///
-    /// That property was true only while every snapshot was drained at the end of the call. Snapshots
-    /// are now placed by the economic events that cause them — a maker's inside the match flush,
-    /// right after its `Trade` row — so they INTERLEAVE with the money rows, and a suffix assertion
-    /// would now be pinning the very thing this change removed.
-    ///
-    /// What replaces it is the property the suffix shape was a crude proxy for: **a snapshot for user
-    /// X closes X's pending rows.** Walking the stream in order:
-    ///
-    /// * a money row makes every user it names PENDING — something moved for them and the stream has
-    ///   not yet said what their account looks like as a result;
-    /// * an `AccountBalanceChanged` for X clears X, and a snapshot that closes NOTHING must at least
-    ///   carry news — a payload different from the last one published for X. A snapshot that closes
-    ///   no row *and* repeats the previous payload is the duplicate this change has to avoid: a
-    ///   maker who got a per-fill event and then a drain event because the mark was never cleared.
-    ///   (Closing nothing is legitimate on its own: the fee recipient's wallet moves with no `Trade`
-    ///   or `PositionChanged` naming them, and that is deliberately still one coalesced drain row.)
-    /// * at the end of the stream nobody is left pending (this is the direction that catches a LOST
-    ///   event — a mark cleared for a user whose state moved again afterwards).
-    ///
-    /// The old assertion is implied for the special case it was written against: if every snapshot
-    /// sits at the end, both directions hold trivially. This one additionally survives interleaving,
-    /// and it is strictly stronger about who each snapshot is FOR.
-    fn assert_snapshots_close_pending_rows(logs: &[primitives::Log]) {
-        let mut pending: std::collections::BTreeSet<Address> = Default::default();
-        let mut last: std::collections::BTreeMap<Address, (U256, i64, i64)> = Default::default();
-        for (i, log) in logs.iter().enumerate() {
-            if log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH) {
-                let e = AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data)
-                    .unwrap();
-                let payload = (
-                    e.usdcBalance,
-                    e.totalWalletBalance,
-                    e.totalCrossWalletBalance,
-                );
-                let closed_a_row = pending.remove(&e.user);
-                assert!(
-                    closed_a_row || last.get(&e.user) != Some(&payload),
-                    "log[{i}]: a snapshot for {} closes no money row AND repeats the previous \
-                     payload for that user — a duplicate (the drain repeating a direct emit whose \
-                     mark was not cleared)",
-                    e.user
-                );
-                last.insert(e.user, payload);
-            } else {
-                pending.extend(money_row_users(log));
+    /// **The funding-epoch rollover, non-registry path.** A rolled-over funding index plus an
+    /// `addPositionMargin` is TWO economic events for one user in one call, so it is two pushes:
+    /// the funding group, then the margin group. `FundingSettled` sits before the first header and
+    /// `PositionMarginAdjusted` between the two, and both are group terminators — which is exactly
+    /// why the funding header cannot be hoisted to the top of `apply_funding_settlement`.
+    #[test]
+    fn a_funding_rollover_publishes_its_own_group_before_the_margin_add_group() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        set_mark(&mut ctx, PRICE);
+
+        // ALICE: QTY long at $100.
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+        // The epoch rolled over: a funding index a LONG owes against.
+        storage::save_funding_state(
+            &mut ctx,
+            MARKET_ID,
+            &FundingState {
+                last_funding_rate: 1_000,
+                next_funding_ts: u64::MAX,
+                cumulative_funding_index: PRICE as i128 * 1_000,
+            },
+        )
+        .unwrap();
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        start_call(&mut ctx);
+        crate::risk::run_add_position_margin(
+            &crate::interface::IPerpDex::addPositionMarginCall {
+                marketId: MARKET_ID,
+                amount: 1,
             }
-        }
-        assert!(
-            pending.is_empty(),
-            "money rows left unanswered at the end of the stream for {pending:?} — a snapshot was \
-             LOST (a mark cleared for a user whose state moved again afterwards)"
+            .abi_encode(),
+            ALICE,
+            &mut ctx,
+        )
+        .unwrap();
+        end_call(&mut ctx);
+
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert_account_update_groups(&logs);
+        assert_eq!(
+            stream_shape(&logs),
+            vec![
+                ("FundingSettled", Some(ALICE)),
+                ("AccountBalanceChanged", Some(ALICE)),
+                ("PositionChanged", Some(ALICE)),
+                ("PositionMarginAdjusted", Some(ALICE)),
+                ("AccountBalanceChanged", Some(ALICE)),
+                ("PositionChanged", Some(ALICE)),
+            ],
+            "funding and the margin add are two economic events → two ACCOUNT_UPDATE pushes; the \
+             drain adds nothing (the inline emit cleared the mark)"
+        );
+    }
+
+    /// **The funding-epoch rollover, REGISTRY path — the subtle one.** A maker's funding is settled
+    /// at `MatchRegistry::get_or_load` and replayed by the flush BEFORE the flush writes the
+    /// position, so a header folded from STORAGE at that point would report the pre-match silo. The
+    /// payload is therefore captured from the working copy; this pins that it lands as its own
+    /// group, ahead of the fill's `Trade` and the fill's own group.
+    #[test]
+    fn a_funding_rollover_on_the_match_path_groups_the_makers_funding_before_its_fill() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        set_mark(&mut ctx, PRICE);
+        fund(&mut ctx, CAROL, WALLET);
+
+        // BOB ends up SHORT QTY (he sold to ALICE), so funding can bite his silo.
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+        assert_eq!(pos(&mut ctx, BOB).amount, -(QTY as i64));
+        // …and rests a bid, which CAROL will cross: BOB is the MAKER of the next fill.
+        place_in(&mut ctx, BOB, MARKET_ID, 0, PRICE, QTY, 3).expect("maker buy BOB");
+
+        // The epoch rolled over with a NEGATIVE index, so the SHORT is the side that pays.
+        storage::save_funding_state(
+            &mut ctx,
+            MARKET_ID,
+            &FundingState {
+                last_funding_rate: -1_000,
+                next_funding_ts: u64::MAX,
+                cumulative_funding_index: -(PRICE as i128) * 1_000,
+            },
+        )
+        .unwrap();
+
+        let logs = crossing_order(&mut ctx, CAROL, 1, PRICE, QTY);
+        assert_account_update_groups(&logs);
+        assert_eq!(
+            stream_shape(&logs),
+            vec![
+                ("OrderPlaced", Some(CAROL)),
+                // BOB's funding group, replayed from the registry at his first touch
+                ("FundingSettled", Some(BOB)),
+                ("AccountBalanceChanged", Some(BOB)),
+                ("PositionChanged", Some(BOB)),
+                // then the fill: `Trade` outside, BOB's fill group, then CAROL's order group
+                ("Trade", Some(CAROL)),
+                ("AccountBalanceChanged", Some(BOB)),
+                ("PositionChanged", Some(BOB)),
+                ("AccountBalanceChanged", Some(CAROL)),
+                ("PositionChanged", Some(CAROL)),
+            ],
+            "the maker's funding is its own push, ahead of the fill it was settled for"
         );
     }
 
@@ -12310,7 +12388,7 @@ mod account_snapshot_events {
     /// match flush, immediately after the `Trade` row it closes, with the taker's row after her own
     /// `PositionChanged` and before the `OrderRested` of the remainder she rests. So the snapshots
     /// are no longer a contiguous suffix, and
-    /// [`assert_snapshots_close_pending_rows`] is the property that replaces that one.
+    /// [`assert_account_update_groups`] is the property that replaces that one.
     #[test]
     fn a_crossing_fill_publishes_a_snapshot_closing_each_party_s_rows() {
         let mut ctx = make_ctx();
@@ -12355,7 +12433,7 @@ mod account_snapshot_events {
             "the suffix shape is GONE by design — if it came back, the maker's snapshot has drifted \
              out of the flush and back into the drain"
         );
-        assert_snapshots_close_pending_rows(&logs);
+        assert_account_update_groups(&logs);
 
         let events = logs
             .into_iter()
@@ -12432,7 +12510,7 @@ mod account_snapshot_events {
         );
 
         let logs = JournalTr::take_logs(ctx.journal_mut());
-        assert_snapshots_close_pending_rows(&logs);
+        assert_account_update_groups(&logs);
         let events = logs
             .into_iter()
             .filter(|log| log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
@@ -12613,7 +12691,7 @@ mod account_snapshot_events {
         place_in(&mut ctx, BOB, MARKET_ID, 1, PRICE, QTY, 3).expect("maker sell 2");
 
         let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, 2 * QTY);
-        assert_snapshots_close_pending_rows(&logs);
+        assert_account_update_groups(&logs);
         let events = snapshots_of(&logs);
 
         assert_eq!(
@@ -12668,7 +12746,7 @@ mod account_snapshot_events {
         place_in(&mut ctx, ALICE, MARKET_ID, 1, PRICE, QTY, 3).expect("ALICE rests a maker sell");
 
         let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, QTY);
-        assert_snapshots_close_pending_rows(&logs);
+        assert_account_update_groups(&logs);
         let events = snapshots_of(&logs);
 
         assert_eq!(
@@ -12726,7 +12804,7 @@ mod account_snapshot_events {
         place_in(&mut ctx, BOB, MARKET_ID, 1, PRICE + TICK, QTY, 3).expect("BOB maker sell");
 
         let logs = crossing_order(&mut ctx, ALICE, 0, PRICE + TICK, 2 * QTY);
-        assert_snapshots_close_pending_rows(&logs);
+        assert_account_update_groups(&logs);
         let events = snapshots_of(&logs);
 
         assert_eq!(
@@ -12786,7 +12864,7 @@ mod account_snapshot_events {
             place_in(&mut ctx, CAROL, MARKET_ID, 1, PRICE, QTY, 3).expect("CAROL sell");
             // 3 lots: two fills, one lot rests.
             let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, 3 * QTY);
-            assert_snapshots_close_pending_rows(&logs);
+            assert_account_update_groups(&logs);
             snapshots_of(&logs)
                 .into_iter()
                 .map(|e| (e.user, e.totalWalletBalance, e.totalCrossWalletBalance))
@@ -12855,6 +12933,10 @@ mod position_changed_derived_fields {
         set_mark(ctx, mark);
         let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
         let p = pos(ctx, ALICE);
+        // The account header the production sites emit before their position row. Without it this
+        // helper would publish an ORPHAN `PositionChanged`, which the group guard in `crate::events`
+        // rejects — correctly: the derivation under test is only ever reached from inside a group.
+        storage::publish_account_snapshot_now(ctx, ALICE).unwrap();
         crate::events::emit_position_changed(ctx, ALICE, &market, &p, 0, 0).unwrap();
         last_change(ctx, ALICE)
     }

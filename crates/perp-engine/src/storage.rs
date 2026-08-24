@@ -362,14 +362,23 @@ pub fn load_account_ref<H: PerpHost>(
 /// | party | granularity | emitted by |
 /// |---|---|---|
 /// | a filled MAKER | one per FILL (= one per maker order per sweep) | the match flush, from the registry working copy |
-/// | a TAKER | one per ORDER | `trading::mod::match_order`, after `finalize_apply`, off the settled store |
+/// | a TAKER (incl. a liquidation close) | one per ORDER | `settlement::finalize_apply`, off the settled store |
+/// | a funding settle | one per settle | `funding::apply_funding_settlement`, from the compute-time copy |
+/// | add/removePositionMargin | one per call | `risk::run_{add,remove}_position_margin`, off the settled store |
+/// | a liquidation residual close | one per close | `trading::liquidation`, off the settled store |
+/// | each ADL fill | one per PARTY per fill | `trading::liquidation::run_adl` (loser from the working copy, winner off the store) |
 /// | everyone else | coalesced, one per user per call | THIS mark + the drain |
 ///
-/// "Everyone else" is deposit/withdraw/transfer, funding, `setLeverage`, liquidation and ADL — plus
-/// the fee recipient, who is an incidental party to a fill rather than a counterparty (one row per
-/// fill for a pure fee sink is noise, and its wallet move is not named by any `Trade` or
-/// `PositionChanged`). The marking rules below are unchanged and still govern the drain; what
-/// changed is that a maker no longer waits for the end of a transaction it never participated in.
+/// **Every one of the direct emits sits immediately BEFORE the `PositionChanged` row(s) it owns** —
+/// that adjacency is the `ACCOUNT_UPDATE` group contract (see `crate::events`), and it is why those
+/// sites cannot simply leave the work to this mark: a drained header lands at the end of the call,
+/// where it owns nothing and every position row it should have carried is an orphan.
+///
+/// "Everyone else" is what genuinely publishes NO position row: deposit/withdraw/transfer,
+/// `setLeverage`, the fee recipient (an incidental party to a fill rather than a counterparty — one
+/// row per fill for a pure fee sink is noise, and its wallet move is not named by any `Trade` or
+/// `PositionChanged`), and the settled end state of a multi-leg liquidation. Those are legitimate
+/// 0-position groups. The marking rules below are unchanged and still govern the drain.
 ///
 /// # The trigger set (strict Binance alignment — choice A)
 ///
@@ -566,6 +575,8 @@ pub(crate) fn log_account_snapshot<H: PerpHost>(
 /// otherwise BLOCK-scoped, and this is what makes it so.
 pub fn begin_perp_call<H: PerpHost>(context: &mut H) {
     typed_store_mut(context).begin_call();
+    // No `ACCOUNT_UPDATE` group may span two calls — see the guard's note in `crate::events`.
+    crate::events::reset_log_group_guard();
 }
 
 /// Publishes one `AccountBalanceChanged` per user marked by [`mark_account_snapshot_dirty`] during

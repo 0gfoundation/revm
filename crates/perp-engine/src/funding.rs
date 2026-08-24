@@ -66,6 +66,35 @@ pub(crate) struct PendingFunding {
     /// can value `unrealizedProfit` without a second market load. Immutable per market.
     base_decimals: u32,
     price_decimals: u32,
+    /// The `AccountBalanceChanged` HEADER for the funding group, captured at compute time.
+    ///
+    /// # Why it has to be carried rather than read at apply time
+    ///
+    /// The funding `PositionChanged` needs an account header IMMEDIATELY before it (the
+    /// `ACCOUNT_UPDATE` group invariant — see `crate::events`), and at the instant
+    /// [`apply_funding_settlement`] runs, the store does NOT hold the post-funding position on any
+    /// caller's path: the margin credit/charge landed on the caller's in-memory `pos` and the
+    /// `save_position` that persists it comes later (later still on the match path, where the
+    /// funding replays out of `MatchRegistry::flush` before the flush writes anything). A header
+    /// folded from storage there would report the PRE-funding silo against a post-funding position
+    /// row — the exact half-updated snapshot this event's contract forbids.
+    ///
+    /// So it is derived where the post-funding state actually exists, from
+    /// `margin_view::wallet_balances_from_parts` on the compute-time account plus the post-funding
+    /// `pos.margin`. Funding touches NO wallet leg (see the module docs: it settles against
+    /// `pos.margin` only, remainder to the insurance fund), so the account half of the payload is
+    /// the caller's unmodified account either way and only the Σ leg moves.
+    snapshot: crate::margin_view::AccountWalletBalances,
+}
+
+impl PendingFunding {
+    /// The header payload this settlement will publish. Exposed for `MatchRegistry::get_or_load`,
+    /// which records it as the user's `last_published` so the flush's mark-clear gate can tell that
+    /// the end-of-call drain has nothing to add for a user whose ONLY event was this funding group
+    /// (an insolvency-rejected maker is exactly that case).
+    pub(crate) fn snapshot(&self) -> &crate::margin_view::AccountWalletBalances {
+        &self.snapshot
+    }
 }
 
 /// Pure funding computation: reads funding state, applies the funding payment to the in-memory
@@ -74,19 +103,30 @@ pub(crate) struct PendingFunding {
 /// event). Performs NO storage writes, so it is safe to call before a validation reject.
 ///
 /// Takes NO wallet: funding is isolated to the position (see the module docs). The caller's
-/// `UserAccount` is untouched by funding, so a caller that loads the account only for this call can
-/// drop the load entirely.
+/// `UserAccount` is untouched by funding — which is exactly why `account` below is only ever READ.
+///
+/// `account` is the caller's already-loaded copy, used to build the group header
+/// ([`PendingFunding::snapshot`]) without a second load; pass `None` and it is loaded lazily, and
+/// only when funding actually moved money (`payment != 0`), so a write-free scan such as the
+/// liquidation sweep's healthy-candidate path still touches no account blob. It must be the state
+/// the caller is going to PERSIST for this user (the registry path folds its pending fee credits in
+/// before calling), and `pos.margin` on entry must be this market's STORED margin — both hold on
+/// every call site, because funding is always the first thing a path settles.
 pub(crate) fn compute_funding_settlement<H: PerpHost>(
     context: &mut H,
     user: Address,
     market: &Market,
     pos: &mut PerpPosition,
+    account: Option<&crate::types::UserAccount>,
 ) -> Result<Option<PendingFunding>, PerpError> {
     let funding = storage::load_funding_state(context, market.market_id)?;
     let index = funding.cumulative_funding_index;
 
     let mut pending = None;
     if pos.amount != 0 && pos.last_funding_index != index {
+        // `pos.margin` BEFORE funding moves it — the anchor for the header's Σ leg. Pre-funding is
+        // the right anchor precisely because the stored aggregate is pre-funding too.
+        let margin_before = pos.margin;
         let delta = index
             .checked_sub(pos.last_funding_index)
             .ok_or_else(|| perp_err("funding: index delta overflow"))?;
@@ -116,12 +156,33 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
                 charge -= from_margin;
                 charge
             };
+            // The group header, off the post-funding position. Lazy account load: only reached
+            // when funding really moved money.
+            let snapshot = {
+                let loaded;
+                let account = match account {
+                    Some(a) => a,
+                    None => {
+                        loaded = storage::load_account_ref(context, user)?;
+                        &loaded
+                    }
+                };
+                crate::margin_view::wallet_balances_from_parts(
+                    account,
+                    account
+                        .total_position_margin
+                        .checked_sub(margin_before)
+                        .ok_or_else(|| perp_err("funding: Σ position margin underflow"))?,
+                    pos.margin,
+                )?
+            };
             pending = Some(PendingFunding {
                 if_charge,
                 payment,
                 funding_rate: funding.last_funding_rate,
                 user,
                 market_id: market.market_id,
+                snapshot,
                 // Post-funding snapshot. `last_funding_index` is re-anchored below and is not a
                 // field of `PositionChanged`, so taking it here loses nothing the log reports.
                 pos: pos.clone(),
@@ -210,6 +271,15 @@ pub(crate) fn apply_funding_settlement<H: PerpHost>(
     // `(user, marketId)` is already how this event has to be read.
     //
     // Valued at the same `mark_price` the `FundingSettled` above reports, so the two agree.
+    //
+    // ── The group HEADER goes here, not before `ApplyFunding` ────────────────────────────────────
+    // The `ACCOUNT_UPDATE` group invariant (`crate::events`) is an ADJACENCY rule: the header's
+    // position rows are the ones IMMEDIATELY after it, terminated by the first other event. The
+    // `InsuranceFundChanged` / `InsuranceFundDepleted` / `FundingSettled` rows above are other
+    // events, so a header emitted at the top of this function would close with ZERO positions and
+    // orphan the row below it. Emitting it right here is what makes the pair a group; the payload
+    // was captured at compute time (see `PendingFunding::snapshot`).
+    storage::log_account_snapshot(context, p.user, &p.snapshot);
     crate::events::emit_position_changed_at_mark(
         context,
         p.user,
@@ -234,7 +304,7 @@ pub(crate) fn settle_position_funding<H: PerpHost>(
     market: &Market,
     pos: &mut PerpPosition,
 ) -> Result<(), PerpError> {
-    if let Some(pending) = compute_funding_settlement(context, user, market, pos)? {
+    if let Some(pending) = compute_funding_settlement(context, user, market, pos, None)? {
         apply_funding_settlement(context, pending)?;
     }
     Ok(())

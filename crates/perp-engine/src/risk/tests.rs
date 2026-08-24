@@ -4702,3 +4702,130 @@ mod band_expiry {
         );
     }
 }
+
+// ── ORDERED `ACCOUNT_UPDATE` STREAM SHAPE: liquidation and ADL ───────────────────────────────────
+//
+// Both of these were structurally uncoverable by the old hand-attached snapshot helper (it ran only
+// in `trading::tests::account_snapshot_events`), and both are the paths where an orphan
+// `PositionChanged` is most damaging: a liquidation close and an ADL fill each move TWO users'
+// positions in one call. The invariant itself is enforced at emit time by the guard in
+// `crate::events`; these pin the exact ordered `(event, subject)` sequence, which is the only form
+// that catches a row landing one slot early or one slot late.
+mod account_update_stream {
+    use super::*;
+    use crate::events::stream_test_support::{assert_account_update_groups, stream_shape};
+
+    /// **A liquidation is SEVERAL `ACCOUNT_UPDATE` pushes, not one settled end state.**
+    ///
+    /// The liquidated user's close goes through `match_order` as a taker, so it publishes the taker
+    /// group like any other order — the header immediately before the close's own position row. That
+    /// emit used to be SUPPRESSED for a `liquidation_close` (on the grounds that the account is only
+    /// half-liquidated at that point), which under the adjacency rule left the close's
+    /// `PositionChanged` an ORPHAN trailing the MAKER's group: an indexer would have booked the
+    /// liquidated user's flattened position onto the maker's account.
+    ///
+    /// The later legs (here: nothing further moves ALICE's wallet, since
+    /// `liquidation_fee_rate_bps == 0`) re-mark the user where they exist and the drain publishes the
+    /// settled end state as a 0-position group.
+    #[test]
+    fn a_liquidation_close_publishes_the_liquidated_users_group_not_an_orphan_row() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        save_position(&mut ctx, QTY, -ENTRY_VALUE);
+        storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
+        place_maker_order(&mut ctx, Side::Buy as u8, LONG_LIQ_PRICE, QTY as u64);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        storage::begin_perp_call(&mut ctx);
+        liquidate(&mut ctx, ALICE).unwrap();
+        storage::flush_account_snapshots(&mut ctx).unwrap();
+
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert_account_update_groups(&logs);
+        assert_eq!(
+            stream_shape(&logs),
+            vec![
+                // the synthetic close order the liquidation places on ALICE's behalf
+                ("OrderPlaced", Some(ALICE)),
+                // the book leg: `Trade` outside the groups, MAKER's group, then ALICE's close group
+                ("Trade", Some(ALICE)),
+                ("AccountBalanceChanged", Some(MAKER)),
+                ("PositionChanged", Some(MAKER)),
+                ("AccountBalanceChanged", Some(ALICE)),
+                ("PositionChanged", Some(ALICE)),
+                ("Liquidation", Some(ALICE)),
+                // …and NOTHING after it. `liquidation_fee_rate_bps == 0` here, so the clearance fee
+                // writes nothing and re-marks nobody, and the book fill zeroed both position legs
+                // exactly, so `execute_liquidation_market_order`'s residual cleanup has nothing to
+                // write either. With a non-zero rate the clearance fee would add one legitimate
+                // 0-position group carrying the debited wallet.
+            ],
+            "the liquidated user's close is her OWN push — the row must not trail the maker's group"
+        );
+    }
+
+    /// **One ADL fill is TWO pushes, one per party.** The `Adl` row sits outside both groups; the
+    /// loser's header is derived from the in-memory working copies (its position/account are written
+    /// once after the fill loop) and the winner's off the settled store its own two writes just made
+    /// current.
+    ///
+    /// Merging the two was never an option: under the adjacency rule the second row would belong to
+    /// the first header, i.e. the counterparty's position booked onto the liquidated user's account.
+    /// This is the same fixture as
+    /// `adl_closes_insolvent_residual_against_opposite_holder_conserving_no_if`, asserted on the
+    /// stream instead of on the balances.
+    #[test]
+    fn an_adl_fill_publishes_two_groups_one_per_party() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(
+            &mut ctx,
+            ALICE,
+            QTY,
+            -ENTRY_VALUE,
+            MARGIN,
+            5,
+            USER_WALLET as i64,
+        );
+        seed_position_account(&mut ctx, KEEPER, -QTY, ENTRY_VALUE, MARGIN, 5, 0);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        // Crash to $75: ALICE is insolvent (bankruptcy price $80) and the book is empty, so the
+        // whole residual goes to ADL against KEEPER. `run_update_index_price` is the shell-free
+        // sweep entry, so the drain has to be driven by hand.
+        storage::begin_perp_call(&mut ctx);
+        run_update_index_price(
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: 7_500,
+                timestamp: 31,
+            }
+            .abi_encode(),
+            ADMIN,
+            &mut ctx,
+        )
+        .unwrap();
+        storage::flush_account_snapshots(&mut ctx).unwrap();
+
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert_account_update_groups(&logs);
+        assert_eq!(
+            stream_shape(&logs),
+            vec![
+                // the synthetic close order: the book is empty, so it fills nothing and the whole
+                // position becomes the insolvent residual ADL closes
+                ("OrderPlaced", Some(ALICE)),
+                ("Adl", Some(ALICE)),
+                ("AccountBalanceChanged", Some(ALICE)),
+                ("PositionChanged", Some(ALICE)),
+                ("AccountBalanceChanged", Some(KEEPER)),
+                ("PositionChanged", Some(KEEPER)),
+                ("Liquidation", Some(ALICE)),
+                // the oracle update that drove the sweep, emitted after it
+                ("IndexPriceUpdated", None),
+                ("MarkPriceUpdated", None),
+            ],
+            "one ADL fill → two pushes, each owning exactly its own party's position row"
+        );
+    }
+}

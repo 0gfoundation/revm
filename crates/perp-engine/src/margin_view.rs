@@ -1167,6 +1167,47 @@ pub struct AccountWalletBalances {
     pub total_cross_wallet_balance: i64,
 }
 
+/// [`AccountWalletBalances`] built from an IN-MEMORY working copy instead of the settled store.
+///
+/// Three emit points need this shape, and they all need it for the same reason: they publish the
+/// account header for a state the store does not hold yet, because the position/account writes that
+/// would make it true come later (or, on the match path, at the flush).
+///
+/// * `trading::settlement::UserWork::wallet_balances` — a maker mid-sweep;
+/// * `funding::compute_funding_settlement` — funding moves `pos.margin` in memory only;
+/// * `trading::liquidation::run_adl`'s LOSER leg — its position/account are written once after the
+///   fill loop.
+///
+/// The awkward term is `Σ pos.margin`. It is [`crate::types::UserAccount::total_position_margin`],
+/// owned exclusively by `storage::save_position` and deliberately CLOBBERED from the store by
+/// `storage::save_account`, so the field on an owned copy is not a value anything may read. What the
+/// callers hold instead is `other_market_position_margin` — the stored aggregate MINUS this market's
+/// stored `pos.margin`, captured in the one breath where both are in hand and both are still
+/// pre-mutation. That difference is invariant for as long as only this market's position moves, so
+/// `base + live pos.margin` is the Σ the eventual `save_position` will store.
+///
+/// Its convergence on the settled store is not argued but checked: `MatchRegistry::flush` compares
+/// this formula's output against `index_account_wallet_balances` for every flushed user in
+/// `debug_assertions` builds.
+pub(crate) fn wallet_balances_from_parts(
+    account: &crate::types::UserAccount,
+    other_market_position_margin: i64,
+    position_margin: i64,
+) -> Result<AccountWalletBalances, PerpError> {
+    let total_position_margin = other_market_position_margin
+        .checked_add(position_margin)
+        .ok_or_else(|| perp_err("account snapshot: Σ position margin overflow"))?;
+    let total_cross_wallet_balance = account.perp_wallet_balance;
+    let total_wallet_balance = total_cross_wallet_balance
+        .checked_add(total_position_margin)
+        .ok_or_else(|| perp_err("account snapshot: total wallet balance exceeds i64"))?;
+    Ok(AccountWalletBalances {
+        usdc_balance: account.usdc_balance.clone().into(),
+        total_wallet_balance,
+        total_cross_wallet_balance,
+    })
+}
+
 /// **The single producer of the `AccountBalanceChanged` payload.** ONE account load and an
 /// addition — **no index load, no position loads, no walk at all.**
 ///

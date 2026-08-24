@@ -96,9 +96,20 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
                 "liquidation market order: full fill but position not zero",
             ));
         }
-        pos.v_quote_balance = 0;
-        pos.margin = 0;
-        storage::save_position(context, user, market.market_id, &pos)?;
+        // ⚠️ Only when there is really a residual to clear. The common case — the fill zeroed both
+        // legs exactly — used to take this write anyway, and the write MARKS the user, so the
+        // end-of-call drain published a second `AccountBalanceChanged` for the liquidated user that
+        // repeated the close group's payload with zero position rows: a duplicate with no news in
+        // it. (The delta is unaffected: the match flush already wrote this position key with these
+        // same bytes, which is why the block commitment does not move.)
+        //
+        // When a residual IS cleared the write stands, the user stays marked, and the drain
+        // publishes a legitimate 0-position group whose `totalWalletBalance` differs by the residual.
+        if pos.v_quote_balance != 0 || pos.margin != 0 {
+            pos.v_quote_balance = 0;
+            pos.margin = 0;
+            storage::save_position(context, user, market.market_id, &pos)?;
+        }
     }
 
     Ok(remaining)
@@ -168,6 +179,18 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
     storage::save_account(context, user, account)?;
 
     super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
+    // ── The residual close's `ACCOUNT_UPDATE` group: header, then the one position row ──────────
+    //
+    // It has to come AFTER `absorb_bad_debt_into_insurance_fund`, whose `InsuranceFundChanged` /
+    // `InsuranceFundDepleted` rows would otherwise terminate the group and orphan the row below
+    // (`crate::events`). Off the SETTLED store: both writes above have landed, so this is literally
+    // the post-close account.
+    //
+    // The mark is cleared here, and `liquidate_position` may legitimately re-mark this user
+    // afterwards by charging its clearance fee (`save_account`) — the drain then publishes a second,
+    // 0-position group for the settled end state. Two pushes for two economic events; that is the
+    // fail-safe direction and it is what Binance does for a liquidation too.
+    storage::publish_account_snapshot_now(context, user)?;
     // `market.mark_price == mark_price` here: `liquidate_position` is the only caller and it takes
     // both from the same re-loaded `Market` (its own `debug_assert_eq!` pins that), so valuing the
     // log at `market`'s mark is valuing it at the mark this close settled against.
@@ -266,6 +289,16 @@ pub(crate) fn run_adl<H: PerpHost>(
     let loser_close_is_buy = !loser_is_long; // long closes by selling, short by buying
     let winner_close_is_buy = loser_is_long; // opposite side
     let mut loser_account = storage::load_account(context, loser)?;
+    // `Σ pos.margin` over the loser's OTHER markets, captured in the one breath where both terms are
+    // in hand and both are still pre-ADL. The loser's position/account are written ONCE after the
+    // fill loop, so each per-fill header for the loser has to be derived from the working copies —
+    // `margin_view::wallet_balances_from_parts` documents the shape and why the difference is the
+    // right thing to hold. (The WINNER needs none of this: its two writes land inside the loop,
+    // before its own header.)
+    let loser_other_market_margin = loser_account
+        .total_position_margin
+        .checked_sub(loser_pos.margin)
+        .ok_or_else(|| perp_err("adl: Σ position margin underflow"))?;
     let mut did_any = false;
 
     for (winner, _, _) in cands {
@@ -303,9 +336,28 @@ pub(crate) fn run_adl<H: PerpHost>(
             }
             .to_log_data(),
         });
+        // ── TWO `ACCOUNT_UPDATE` groups, one per party ───────────────────────────────────────────
+        //
+        // An ADL fill is one economic event for the loser and a different one for the winner, so it
+        // publishes two headers, each immediately followed by its own party's position row. Merging
+        // them is not an option and never was: the adjacency rule (`crate::events`) makes the second
+        // row belong to the first header, i.e. an indexer would book the winner's position onto the
+        // loser's account. The `Adl` row above sits outside both groups.
+        //
         // Both legs are valued at the market's CURRENT mark, not at the ADL price `p_b` the fill
         // executed at: `unrealizedProfit` is by definition mark-to-market on what is LEFT open,
         // and the fill's realised part is reported separately as `realizedPnl`.
+        //
+        // The loser's header comes off the WORKING copies (its writes are after the loop); the
+        // winner's off the settled store, which its two writes just above made current. The trailing
+        // `did_any` writes re-mark the loser, so the drain adds one 0-position group for its settled
+        // end state — correct, and the fail-safe direction.
+        let loser_balances = crate::margin_view::wallet_balances_from_parts(
+            &loser_account,
+            loser_other_market_margin,
+            loser_pos.margin,
+        )?;
+        storage::log_account_snapshot(context, loser, &loser_balances);
         emit_position_changed(
             context,
             loser,
@@ -314,6 +366,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             fill.loser_realized_pnl,
             fill.quantity,
         )?;
+        storage::publish_account_snapshot_now(context, winner)?;
         emit_position_changed(
             context,
             winner,
@@ -332,6 +385,14 @@ pub(crate) fn run_adl<H: PerpHost>(
         // hook drops it; otherwise it stays open and is re-swept next update.
         storage::save_position(context, loser, market.market_id, &loser_pos)?;
         storage::save_account(context, loser, loser_account)?;
+        // The two writes above MARK the loser — but they persist EXACTLY the working copies the
+        // LAST per-fill header was derived from, so the end-of-call drain would repeat that payload
+        // as a 0-position group with no news in it. Clear it. Unconditional is safe here in the way
+        // the flush's gate is not: `loser_pos` / `loser_account` are not touched between the last
+        // header and these writes, so equality is structural rather than incidental. A later
+        // liquidation leg (the clearance fee) writes the account again, re-marks, and the settled
+        // end state still gets published.
+        storage::clear_account_snapshot_mark(context, loser);
     }
     Ok(())
 }

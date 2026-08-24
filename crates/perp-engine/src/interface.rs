@@ -803,10 +803,30 @@ sol! {
         ///
         /// ## Positions are NOT here, and do not need to be
         ///
-        /// `PositionChanged` is our `P[]` analogue, and a snapshot for user X is emitted **after the
-        /// rows that caused it** (see GRANULARITY below), so an indexer replaying the log in order
-        /// already holds X's `PositionChanged` rows for the event being reported before it reaches
-        /// this one. Duplicating them into an array here would be a second encoding of the same facts.
+        /// `PositionChanged` is our `P[]` analogue, and it is assembled into this push by
+        /// **ADJACENCY** rather than by ABI fusion. Three rules, and they are a contract:
+        ///
+        /// 1. every `AccountBalanceChanged` is exactly ONE `ACCOUNT_UPDATE` push;
+        /// 2. it is followed by **0..N `PositionChanged` rows**, which are that push's `a.P[]`;
+        /// 3. those rows are **CONTIGUOUS**, immediately after this event, and terminated by the
+        ///    first non-`PositionChanged` event.
+        ///
+        /// So an indexer holds the header first and appends rows until the run ends — no correlation
+        /// key, no buffering, no second encoding of the same facts in an array here. Two corollaries
+        /// follow and are enforced in `debug_assertions` builds by the guard in `crate::events` (which
+        /// sits on the emit path itself, so it covers every path, not the ones a test remembered):
+        ///
+        /// * every `PositionChanged` in a group carries THIS event's `user`;
+        /// * there are no ORPHAN `PositionChanged` rows — every one sits inside some group.
+        ///
+        /// A **0-position group is legitimate**: a deposit, a withdrawal, a transfer, the fee
+        /// recipient's cut, and the settled end-state row after a multi-leg liquidation all move a
+        /// wallet without moving a position. `a.P[]` is simply empty.
+        ///
+        /// ⚠️ Rule 3 is why the header comes BEFORE its rows and not after. It used to come after
+        /// ("a snapshot closes the rows that caused it"), which reads the same to a human and is
+        /// unassemblable by adjacency: the rows would have to be buffered against a header that might
+        /// never arrive, and a trailing row from another user would be silently mis-attributed.
         ///
         /// ⚠️ `perpWalletBalance` (`uint64`, floored at 0) is GONE and has been for two revisions. It
         /// is `int64 totalCrossWalletBalance`: the same quantity, SIGNED and UNCLAMPED, and named the
@@ -822,13 +842,21 @@ sol! {
         ///
         /// * a **MAKER** whose resting order is filled: **one per FILL.** A maker order is consumed at
         ///   most once per taker sweep, so this is also one per maker order. The row is emitted inside
-        ///   the match, immediately after that fill's `Trade`.
+        ///   the match, immediately after that fill's `Trade` and immediately BEFORE that fill's
+        ///   `PositionChanged` (the `Trade` is outside the group).
         /// * a **TAKER**: **one per ORDER**, after the order has settled (so a batch of K crossing
-        ///   items publishes K rows for the initiator, one per item).
-        /// * **everything else** — deposit / withdraw / transferToPerp / transferFromPerp, funding,
-        ///   `setLeverage`, add/removePositionMargin, liquidation, ADL, and the fee recipient —
-        ///   **one per user per transaction**, drained at the end of the call in ascending address
-        ///   order.
+        ///   items publishes K rows for the initiator, one per item). This INCLUDES the taker leg of
+        ///   a liquidation close, which used to be suppressed: a liquidation is legitimately several
+        ///   pushes (the close, the clearance fee, each ADL fill), not one settled end-state, and
+        ///   suppressing the close's header orphaned the close's position row.
+        /// * **funding**, **add/removePositionMargin**, the **liquidation residual close**, and each
+        ///   **ADL** fill: **one per economic event**, inline, immediately before that event's own
+        ///   position row. A funding settle followed by a margin add is two pushes; one ADL fill is
+        ///   two pushes (one for the liquidated user, one for the counterparty).
+        /// * **everything else** — deposit / withdraw / transferToPerp / transferFromPerp,
+        ///   `setLeverage`, the fee recipient, and the settled end state after a multi-leg
+        ///   liquidation — **one per user per transaction**, drained at the end of the call in
+        ///   ascending address order, always as a 0-position group.
         ///
         /// A **SELF-TRADE emits BOTH** legs for the same address: the maker-leg row at the fill and
         /// the taker-leg row at the end of the order. The maker leg is deliberately not suppressed —

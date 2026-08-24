@@ -555,6 +555,31 @@ pub(super) fn finalize_apply<H: PerpHost>(
     storage::mutate_account_balance(context, plan.user, |a| a.debit_perp(plan.total_required))??;
     credit_fee_recipient(context, plan.market_id, plan.fee)?;
 
+    // ── ONE account snapshot for the TAKER, for this whole ORDER — the group HEADER ─────────────
+    //
+    // Off the SETTLED store, not off a working copy: the two lines above are the last of the
+    // taker's state (the cover cancels, the margin+fee debit), so unlike a maker mid-sweep the
+    // taker's account really is final here. It is emitted immediately BEFORE the taker's own
+    // `PositionChanged`, which is what makes the two an `ACCOUNT_UPDATE` group (`crate::events`);
+    // it used to be published by `match_order` AFTER this log, which orphaned that row.
+    //
+    // A LIQUIDATION CLOSE is NOT excluded. It used to be — `match_order` skipped the emit for a
+    // liquidated user on the grounds that the close is one leg of a liquidation that goes on to
+    // charge a clearance fee and possibly settle a residual or run ADL. Under the adjacency rule
+    // that skip ORPHANS the liquidated user's `PositionChanged`, which is strictly worse than
+    // publishing an intermediate: an indexer would attach that position to whatever group preceded
+    // it. A liquidation is legitimately SEVERAL `ACCOUNT_UPDATE` pushes (close, clearance fee, ADL),
+    // not one settled end-state, and Binance behaves the same way. The later legs write the account
+    // again, re-mark the user, and the end-of-call drain publishes the settled end state as a
+    // 0-position group.
+    //
+    // Clearing the mark unconditionally is sound for the same reason as before: nothing further in
+    // the call writes this user's account *for this order* (the placement path's remaining writes
+    // are `rest_in_book`'s `save_position_reservation_only` and the nonce's `mutate_account`,
+    // neither of which marks). A later batch item, or a later liquidation leg, DOES write, re-marks,
+    // and is published again.
+    storage::publish_account_snapshot_now(context, plan.user)?;
+
     // `market` is the same threaded `Market` whose `mark_price` `finalize_compute` fed to
     // `finalize_core` (`let mark = market.mark_price`), so the log values the taker's post-fill
     // position at exactly the mark this settlement was decided against.
@@ -574,8 +599,22 @@ pub(super) fn finalize_apply<H: PerpHost>(
 /// margin the fill funds (`min(fee, opening_margin)`), the remainder from the wallet — the same
 /// rule the taker path uses. There is no fee escrow.
 pub(super) enum MakerFillOutcome {
-    /// The fill was applied; carries the maker's trading fee.
-    Filled { maker_fee: u64 },
+    /// The fill was applied; carries the maker's trading fee plus the `PositionChanged` payload for
+    /// this fill.
+    ///
+    /// ⚠️ The log payload travels back out to the WALK rather than being pushed from inside
+    /// [`settle_maker_fill_registry`], and that is the whole point of it being here. The maker's
+    /// account header has to sit IMMEDIATELY before its position row (`crate::events`), and the
+    /// header is pushed by the walk (`MatchRegistry::push_maker_snapshot`) after the fill's `Trade`
+    /// row — so the position row has to be pushed after that, by the same caller. Pushed from in
+    /// here it would land BEFORE the `Trade`, one event too early, and orphan itself.
+    Filled {
+        maker_fee: u64,
+        /// The maker's position AFTER this fill (all-scalar clone).
+        pos_snapshot: crate::types::PerpPosition,
+        realized_pnl: i64,
+        closed_quantity: u64,
+    },
     /// The fill was NOT applied and the caller must cancel the maker order. TWO triggers, both
     /// meaning "this maker cannot take this fill":
     ///
@@ -654,19 +693,11 @@ impl UserWork {
     /// the value the flush's `save_position` is going to store. The narrowing guard is the same one
     /// (and the only one) the settled producer has.
     fn wallet_balances(&self) -> Result<crate::margin_view::AccountWalletBalances, PerpError> {
-        let total_position_margin = self
-            .other_market_position_margin
-            .checked_add(self.pos.margin)
-            .ok_or_else(|| perp_err("account snapshot: Σ position margin overflow"))?;
-        let total_cross_wallet_balance = self.account.perp_wallet_balance;
-        let total_wallet_balance = total_cross_wallet_balance
-            .checked_add(total_position_margin)
-            .ok_or_else(|| perp_err("account snapshot: total wallet balance exceeds i64"))?;
-        Ok(crate::margin_view::AccountWalletBalances {
-            usdc_balance: self.account.usdc_balance.clone().into(),
-            total_wallet_balance,
-            total_cross_wallet_balance,
-        })
+        crate::margin_view::wallet_balances_from_parts(
+            &self.account,
+            self.other_market_position_margin,
+            self.pos.margin,
+        )
     }
 }
 
@@ -857,18 +888,36 @@ impl MatchRegistry {
             .total_position_margin
             .checked_sub(pos.margin)
             .ok_or_else(|| perp_err("match: Σ position margin underflow"))?;
-        let pending = crate::funding::compute_funding_settlement(context, user, market, &mut pos)?;
-        if let Some(p) = pending {
-            self.events.push(MatchEvent::ApplyFunding(p));
-        }
-        let buy_entries = storage::load_buy_orders(context, user, market_id)?;
-        let sell_entries = storage::load_sell_orders(context, user, market_id)?;
         // Read-through: fees credited to the admin before they joined the registry are pending;
         // fold them into the copy so this user's wallet matches the old per-fill storage writes.
+        //
+        // ⚠️ BEFORE the funding compute below, not after. Funding never reads the account (it
+        // settles against `pos.margin` only), so the two are order-independent as far as the
+        // ARITHMETIC goes — but the funding compute now derives the `AccountBalanceChanged` header
+        // for its own group from this copy, and a header taken before the fold would publish a
+        // wallet the flush is about to overwrite.
         if self.fee_admin == Some(user) && self.admin_credit_pending > 0 {
             account.credit_perp(self.admin_credit_pending)?;
             self.admin_credit_pending = 0;
         }
+        let pending = crate::funding::compute_funding_settlement(
+            context,
+            user,
+            market,
+            &mut pos,
+            Some(&account),
+        )?;
+        // A funding settle publishes its OWN account header (`apply_funding_settlement`), so it
+        // counts as a published payload for this user: recording it lets the flush's mark-clear gate
+        // suppress a duplicate drain row for a user whose only event in this match was the funding
+        // group — an insolvency-rejected maker, whose fill never lands.
+        let mut last_published = None;
+        if let Some(p) = pending {
+            last_published = Some(p.snapshot().clone());
+            self.events.push(MatchEvent::ApplyFunding(p));
+        }
+        let buy_entries = storage::load_buy_orders(context, user, market_id)?;
+        let sell_entries = storage::load_sell_orders(context, user, market_id)?;
         self.users.push((
             user,
             UserWork {
@@ -879,7 +928,7 @@ impl MatchRegistry {
                 dirty_buy: false,
                 dirty_sell: false,
                 other_market_position_margin,
-                last_published: None,
+                last_published,
             },
         ));
         Ok(self.users.len() - 1)
@@ -1135,7 +1184,7 @@ impl MatchRegistry {
             // ⚠️ That branch is LIVE and its only coverage is
             // `trading::tests::account_snapshot_events::a_fee_recipient_who_is_also_a_maker_gets_a_drain_row_for_the_later_fee`.
             // Replacing this condition with a bare `published.is_some()` passes every other test in
-            // the suite — including `assert_snapshots_close_pending_rows`, which is structurally
+            // the suite — including `assert_account_update_groups`, which is structurally
             // BLIND to it: the dropped row carries a fee credit, and a fee credit to the admin is
             // named by no `Trade` / `PositionChanged` / `FundingSettled`, so that user is never left
             // "pending". Do not delete that test believing the generic invariant subsumes it.
@@ -1221,14 +1270,15 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
         reg.credit_admin(admin, maker_fee)?;
     }
 
-    reg.push_event(MatchEvent::PositionChanged {
-        user: maker,
-        pos: pos_snapshot,
+    // NOTE: the `PositionChanged` for this fill is NOT pushed here — it is handed back to the walk
+    // and pushed after the fill's `Trade` + the maker's `AccountSnapshot`, so header and row are
+    // adjacent. See `MakerFillOutcome::Filled`.
+    Ok(MakerFillOutcome::Filled {
+        maker_fee,
+        pos_snapshot,
         realized_pnl,
         closed_quantity,
-    });
-
-    Ok(MakerFillOutcome::Filled { maker_fee })
+    })
 }
 
 /// Registry-backed maker cancel for a `RejectedInsolvent` fill: drops the rejected order from the
