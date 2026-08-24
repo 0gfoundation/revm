@@ -5110,8 +5110,26 @@ mod golden {
     /// far-side deep orders spared, cap respected + second update finishes, reason codes, frozen
     /// `assuming_price` basis, disabled band inert, fill-time band still the backstop). Prior value
     /// 0xc84dfc3ed57226c907fbac53e64dfc011e64be2254b092edffb4758a8eef6ba5.
+    /// RE-PIN (stored `Σ pos.margin` + `BLOCK_COMMITMENT_VERSION` 22→23): `UserAccount` gains a
+    /// trailing "PM" field (`total_position_margin`), so every stored account blob grows by one
+    /// integer; and `storage::save_position` now maintains it from the delta of the position write,
+    /// which adds the ACCOUNT key to the delta of any write that MOVES `pos.margin`. So the commitment
+    /// moves for THREE mechanical reasons — longer account blobs, extra account keys, and the version
+    /// byte — none of them an execution rule.
+    ///
+    /// **BusinessSnapshot UNCHANGED, field for field**, and necessarily so: no field of it reads the
+    /// new aggregate (`alice/bob/carol_account` decode `getAccount`'s `availableBalance`, which is
+    /// `totalCrossWalletBalance − totalOpenOrderInitialMargin` and contains no `Σ pos.margin` term;
+    /// the three `*_position` triples read `getPosition`, which this change does not touch), no
+    /// existing field of any blob changes value, and nothing conditions on the new field.
+    /// `totalWalletBalance`, the field the aggregate actually serves, is not pinned by the snapshot —
+    /// it is pinned against the wide fold by
+    /// `margin_view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state` and by
+    /// the `debug_assertions` cross-check inside `margin_view::index_account_scalars`, which compares
+    /// the stored aggregate against a fresh walk on every `getAccount` and every published snapshot.
+    /// Prior value 0xea28799e35db06c71ad95e1517df8e289028b79721bcdb27c183f7d594d72f0e.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xea28799e35db06c71ad95e1517df8e289028b79721bcdb27c183f7d594d72f0e");
+        b256!("0x18acf659ad6effb859689eb2d43465c0bb8386496ce13369f3837d6455848101");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -10022,6 +10040,60 @@ mod user_market_index {
         marked_up_sells
     }
 
+    // ── The stored `Σ pos.margin` aggregate: is it exactly the sum? ─────────────────────────
+    //
+    // `AccountBalanceChanged.totalWalletBalance` is `perp_wallet_balance + Σ pos.margin`, and the Σ
+    // leg is no longer walked — it is the STORED `UserAccount::total_position_margin`, maintained
+    // incrementally by `storage::save_position` from `pos.margin − old.margin`. A stored aggregate can
+    // drift where the walked one could not, so it needs the same treatment the side aggregates got:
+    // recomputed ground truth after EVERY transition.
+    //
+    // Like `assert_side_totals_are_bid_and_ask`, this deliberately does NOT ask the engine for its own
+    // fold (`margin_view::index_account_scalars` / `fold_account_margin`) — that would only prove the
+    // engine agrees with itself. It sums `pos.margin` inline out of the position blobs, over ALL the
+    // sweep's markets rather than the per-user index, which additionally pins the identity the
+    // published surfaces depend on: `Σ_all pos.margin == Σ_index pos.margin`, i.e. no margin is ever
+    // stranded on a position outside the index (`getAccount` sums over the index, this field over
+    // everything).
+
+    /// Assert, for every user, that the stored `total_position_margin` equals `Σ pos.margin`
+    /// recomputed from the position blobs. Returns the number of users whose aggregate is currently
+    /// non-zero, so the driving test can prove the sweep is not asserting `0 == 0`.
+    fn assert_stored_total_position_margin(
+        ctx: &mut TestCtx,
+        users: &[Address],
+        markets: &[u64],
+        step: &str,
+    ) -> u32 {
+        let mut non_zero = 0u32;
+        for &u in users {
+            let mut truth: i128 = 0;
+            for &m in markets {
+                let p = storage::load_position(ctx, u, m).unwrap();
+                // The invariant that makes the index-driven `getAccount` fold and this all-markets
+                // sum the same number — and which `storage::save_position` asserts on every write.
+                assert!(
+                    p.amount != 0 || p.margin == 0,
+                    "{step}: user {u} market {m} is flat but holds margin {} — margin stranded \
+                     outside the per-user market index would make getAccount's totalWalletBalance \
+                     disagree with the event's",
+                    p.margin
+                );
+                truth += p.margin as i128;
+            }
+            let stored = storage::load_account(ctx, u).unwrap().total_position_margin;
+            assert_eq!(
+                stored as i128, truth,
+                "{step}: user {u} stored total_position_margin diverged from Σ pos.margin \
+                 recomputed from the position blobs"
+            );
+            if truth != 0 {
+                non_zero += 1;
+            }
+        }
+        non_zero
+    }
+
     /// Deterministic xorshift (same generator as the settlement conservation fuzz).
     fn next(s: &mut u64) -> u64 {
         *s ^= *s << 13;
@@ -10045,6 +10117,9 @@ mod user_market_index {
         /// above their own limit price. Zero would make the Bid/Ask fold non-discriminating: with no
         /// marked-up sell anywhere, folding at the limit price would agree too.
         marked_up_sells: u32,
+        /// Max number of users seen in one sweep whose stored `Σ pos.margin` is non-zero. Zero would
+        /// make [`assert_stored_total_position_margin`] assert `0 == 0` for the whole pass.
+        margin_bearing_users: u32,
     }
 
     /// One randomised pass: a mix of place / cancel / fill / partial fill / close / flip /
@@ -10184,6 +10259,15 @@ mod user_market_index {
             cov.marked_up_sells = cov.marked_up_sells.max(assert_side_totals_are_bid_and_ask(
                 &mut ctx, &users, &MARKETS, &where_,
             ));
+            // ...and the THIRD invariant on the same sweep: the stored `Σ pos.margin` aggregate the
+            // `AccountBalanceChanged` payload is now read from. Same op mix, and it is precisely the
+            // set of transitions that move `pos.margin` — open, partial/full fill, flip, funding,
+            // liquidation close, ADL, add/removePositionMargin.
+            cov.margin_bearing_users =
+                cov.margin_bearing_users
+                    .max(assert_stored_total_position_margin(
+                        &mut ctx, &users, &MARKETS, &where_,
+                    ));
             // The index is a SET, always ascending, and never exceeds the cap.
             for &u in &users {
                 let ix = index(&mut ctx, u);
@@ -10289,6 +10373,58 @@ mod user_market_index {
         assert!(
             deep.liquidations >= 1,
             "no liquidation cancel-all exercised"
+        );
+        assert!(deep.flips >= 1, "no position ever flipped sign");
+    }
+
+    /// **The stored `Σ pos.margin` aggregate equals a recomputed `Σ pos.margin` after EVERY
+    /// operation.** `UserAccount::total_position_margin` is what
+    /// `AccountBalanceChanged.totalWalletBalance` is now read from (`wb = cw + this`), replacing a
+    /// walk of the user's market index and a position load per member market. Stored, it can DRIFT —
+    /// this is the property that says it does not.
+    ///
+    /// The per-step assertion lives inside [`run_fuzz`] (see
+    /// [`assert_stored_total_position_margin`]); this test drives it over its own seeds so the
+    /// property has a named owner, and asserts the pass actually reached states where the aggregate is
+    /// non-zero (otherwise it would compare `0 == 0` 800 times). Two passes with deliberately
+    /// different money, exactly as its two sibling properties: the thin-wallet pass is the one that
+    /// reaches the underfunded maker fill, whose silo is short of its own IM, and the taker
+    /// wallet-cover cascade.
+    ///
+    /// Ground truth is computed INDEPENDENTLY — `Σ` over the position blobs, inline, not
+    /// `margin_view`'s own fold — for the same reason the Bid/Ask property does it: reusing the
+    /// engine's fold would only prove the engine agrees with itself. It also sums over ALL the
+    /// sweep's markets rather than the per-user index, which pins the identity the two published
+    /// surfaces depend on (`getAccount` sums over the index, the event reads this all-markets field).
+    ///
+    /// Mutation-tested on the single maintenance point in `storage::save_position`. **Each broken
+    /// variant killed:**
+    ///
+    /// | mutation | caught by |
+    /// |---|---|
+    /// | drop the increment entirely | THIS test (`step 1`), and the `debug_assertions` cross-check in `margin_view::index_account_scalars` via ~15 other tests |
+    /// | wrong sign (`old_margin − pos.margin`) | THIS test, and the same cross-check |
+    /// | `pos.margin` instead of the delta | THIS test, and the same cross-check |
+    ///
+    /// The cross-check is what makes a missed maintenance point loud everywhere rather than only
+    /// here; this test is what pins the arithmetic over a transition mix no single scenario reaches.
+    #[test]
+    fn stored_position_margin_is_exactly_the_sum_after_every_operation() {
+        let deep = run_fuzz(0x50_5f_a2_91_00_00_00_11, RICH, 800);
+        let thin = run_fuzz(0x9e_ed_5c_a4_1e_d0_00_37, WALLET, 800);
+        println!("Σ pos.margin fuzz coverage: deep={deep:?} thin={thin:?}");
+        for (name, cov) in [("deep", &deep), ("thin", &thin)] {
+            assert!(cov.enters >= 20, "{name}: too few market entries");
+            assert!(cov.leaves >= 20, "{name}: too few market exits");
+            assert!(
+                cov.margin_bearing_users >= 2,
+                "{name}: never reached a state where two users held margin at once, so the \
+                 aggregate was compared against a trivial sum"
+            );
+        }
+        assert!(
+            deep.liquidations >= 1,
+            "no liquidation ever zeroed a silo through the close path"
         );
         assert!(deep.flips >= 1, "no position ever flipped sign");
     }

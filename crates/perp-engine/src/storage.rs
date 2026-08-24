@@ -378,12 +378,16 @@ pub fn load_account_ref<H: PerpHost>(
 ///   `UserAccount::perp_wallet_balance`. Both live on the account blob, so only an account WRITE can
 ///   move them, and the only account writer that does not mark is [`mutate_account`], whose two call
 ///   sites set the nonce and the fee-rate pair. Neither balance is reachable from there.
-/// * `totalWalletBalance` = `totalCrossWalletBalance + Σ pos.margin`. `pos.margin` moves only through
-///   [`save_position`] (marks); [`save_position_reservation_only`] `debug_assert`s that it does not
-///   touch it. The market SET being summed can change without a mark — an order-list leg entering or
-///   leaving flips index membership in [`sync_user_market_membership`] — but a market can only be
-///   added or dropped by that leg while the position is flat, and a flat position carries no margin
-///   (asserted per market in `margin_view::index_account_wallet_balances`), so the sum is unchanged.
+/// * `totalWalletBalance` = `totalCrossWalletBalance + Σ pos.margin`. Both terms now live on the
+///   ACCOUNT blob (`Σ pos.margin` is the stored `UserAccount::total_position_margin`), and the only
+///   writer of the Σ leg is [`save_position`] (marks), maintaining it from the delta of the position
+///   write that moved `pos.margin`; [`save_position_reservation_only`] `debug_assert`s that it does
+///   not touch `margin` at all. The per-user market INDEX no longer enters this field, so an
+///   order-list leg flipping index membership in [`sync_user_market_membership`] cannot move it even
+///   in principle — which is what removed the subtle half of this argument (it used to rest on "a
+///   market can only be added or dropped by that leg while the position is flat, and a flat position
+///   carries no margin"; that invariant is still asserted, now in [`save_position`] itself, but
+///   nothing published depends on it any more).
 ///
 /// This was NOT true of the previous eleven-field payload: `totalOpenOrderInitialMargin` and
 /// `availableBalance` move on every placement and cancel, so the event shipped fields its own trigger
@@ -442,11 +446,12 @@ pub fn load_account_ref<H: PerpHost>(
 /// * **Deterministic order**, because the set is a `BTreeSet<Address>` and not a hash map.
 ///
 /// What it saves, in walks. Each published snapshot costs one
-/// [`crate::margin_view::index_account_wallet_balances`] fold: one account load plus
-/// ≤ `MAX_USER_MARKETS` (16) markets × **1** `_ref` load (the position alone — the narrowed payload
-/// needs no `Market`, no tier walk, no mark) ⇒ ≤ 18 loads, all cache-fill, none entering the block
-/// delta. It was ≤ 33 with two loads per market while the payload carried the margin roll-up.
-/// Against the per-write emission this removes:
+/// [`crate::margin_view::index_account_wallet_balances`] call: **ONE** account `_ref` load, flat, with
+/// no walk at all — all three published balances are stored scalars on that blob (`Σ pos.margin` is
+/// the maintained `UserAccount::total_position_margin`). It was ≤ 18 loads while that Σ was walked off
+/// the per-user market index at one position load per member market, and ≤ 33 before that, while the
+/// payload carried the whole margin roll-up at two loads per market. Against the per-write emission
+/// this removes:
 ///
 /// ```text
 ///   placement / cancel        1 → 0    (the trigger filter, above)
@@ -501,14 +506,17 @@ pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpE
 
 /// Folds and logs one `AccountBalanceChanged` — **the one and only site that constructs this log.**
 ///
-/// All three balances come from [`crate::margin_view::index_account_wallet_balances`], which is the
-/// LEAN fold: one account load plus `Σ pos.margin` over the per-user market index, at **one load per
-/// market**. The wide `index_account_scalars` roll-up `getAccount` folds is not on this path any more
-/// — its seven margin totals are REST-only fields (Binance publishes them on `/fapi/v2/account`, not
-/// on `ACCOUNT_UPDATE`), and dropping them from the payload is what let the emit path drop the
-/// `Market` load, the maintenance-margin tier walk, the unrealized-PnL arithmetic and the ooIM
-/// arithmetic. The two folds must still agree on the fields they share; the `debug_assertions`
-/// cross-check inside the lean fold compares them on every published snapshot.
+/// All three balances come from [`crate::margin_view::index_account_wallet_balances`], which is now
+/// ZERO-WALK: **one account load** and an addition, because all three are stored scalars on that blob
+/// (`Σ pos.margin` is [`crate::types::UserAccount::total_position_margin`], maintained by
+/// [`save_position`]). The wide `index_account_scalars` roll-up `getAccount` folds is not on this path
+/// any more — its seven margin totals are REST-only fields (Binance publishes them on
+/// `/fapi/v2/account`, not on `ACCOUNT_UPDATE`), and dropping them from the payload is what let the
+/// emit path drop the `Market` load, the maintenance-margin tier walk, the unrealized-PnL arithmetic
+/// and the ooIM arithmetic; storing the Σ then removed the index and the per-market position loads
+/// too. The two producers must still agree on the fields they share — and now, specifically, the
+/// STORED aggregate must equal the wide fold's WALK; the `debug_assertions` cross-check inside
+/// `index_account_scalars` compares exactly that on every published snapshot.
 fn emit_account_snapshot<H: PerpHost>(context: &mut H, user: Address) -> Result<(), PerpError> {
     let b =
         crate::margin_view::index_account_wallet_balances(context, user, "AccountBalanceChanged")?;
@@ -528,11 +536,32 @@ fn emit_account_snapshot<H: PerpHost>(context: &mut H, user: Address) -> Result<
     Ok(())
 }
 
+/// Whole-blob account write — the wallet / fee-rate / nonce legs.
+///
+/// # ⚠️ It does NOT write `total_position_margin`, and cannot
+///
+/// `UserAccount::total_position_margin` (`Σ pos.margin`) is owned exclusively by [`save_position`],
+/// and this function OVERWRITES whatever the caller's struct carries in that field with the value
+/// currently in the store. That is not defensive tidying, it closes a real hazard: several paths
+/// (`trading::settlement`'s flush, both `liquidation` legs, `addPositionMargin`,
+/// `removePositionMargin`) take an owned `UserAccount` copy, then write a POSITION, then write the
+/// account back — so a whole-blob save from a copy taken BEFORE the position write would silently
+/// revert the aggregate's increment and the published `totalWalletBalance` would go stale. Making the
+/// field un-clobberable here means the ordering of `save_account` against `save_position` does not
+/// matter anywhere, which is the only version of this that stays correct as call sites move.
+///
+/// Cost is one resident-account read (the account is already resident on every path that reaches
+/// here, and `mutate_account` / `mutate_account_balance` — which RMW in place and therefore cannot
+/// clobber anything — carry the hot paths anyway).
+///
+/// A test fixture that wants a non-zero aggregate must create it the way production does, through
+/// [`save_position`].
 pub fn save_account<H: PerpHost>(
     context: &mut H,
     user: Address,
-    account: UserAccount,
+    mut account: UserAccount,
 ) -> Result<(), PerpError> {
+    account.total_position_margin = load_account_ref(context, user)?.total_position_margin;
     typed_store_mut(context).set_account(user, account);
     // The wallet moved ⇒ one snapshot at the end of the call. Ordering against the write no longer
     // matters (nothing is folded here); the drain reads the settled store.
@@ -790,7 +819,34 @@ pub fn save_position<H: PerpHost>(
     // cannot be missed. The registry is only touched when membership changes
     // (open: 0 -> !=0, close: !=0 -> 0); every other save pays just one
     // typed-sub-map-cheap position read (the position is already resident).
-    let old_amount = load_position_ref(context, user, market_id)?.amount;
+    //
+    // The SAME already-paid read supplies `old.margin` for the `Σ pos.margin` aggregate below —
+    // which is the whole reason that aggregate is affordable here and the deleted `total_perp_collateral`
+    // was not (see `types::UserAccount::total_position_margin`).
+    let (old_amount, old_margin) = {
+        let old = load_position_ref(context, user, market_id)?;
+        (old.amount, old.margin)
+    };
+    // "A flat position holds no margin", enforced at the ONE door every `pos.margin` write comes
+    // through rather than per market at snapshot time.
+    //
+    // This assertion used to live in `margin_view::index_account_wallet_balances`, per member market
+    // of the per-user index, where it guarded the emit path's Σ walk: an order-list leg can flip index
+    // membership (a placement adds a market, a cancel drops one) WITHOUT marking the user for a
+    // snapshot, so a flat market carrying margin would have made a pure placement move
+    // `totalWalletBalance` silently. That walk is GONE — `totalWalletBalance` reads the stored
+    // aggregate and no longer depends on the index at all — so the argument is no longer
+    // load-bearing. The INVARIANT is still true and still worth stating, and it belongs here: this is
+    // where it can be violated, it is checked on every position write instead of only on markets that
+    // happen to be in an index when a snapshot is published, and it is what makes
+    // `Σ_index pos.margin == Σ_all pos.margin` (so `getAccount`'s index-driven cross-check below can
+    // validate an aggregate maintained over ALL markets).
+    debug_assert!(
+        pos.amount != 0 || pos.margin == 0,
+        "save_position: {user} market {market_id} written flat but holding margin {} — every close \
+         must zero `margin` alongside `amount`",
+        pos.margin
+    );
     if old_amount == 0 && pos.amount != 0 {
         registry_add(context, market_id, user)?;
     } else if old_amount != 0 && pos.amount == 0 {
@@ -801,6 +857,41 @@ pub fn save_position<H: PerpHost>(
     // leave branch re-reads the position to decide whether the user still has anything here,
     // so it has to see the new `amount`.
     sync_user_market_membership(context, user, market_id, old_amount != 0, pos.amount != 0)?;
+    // ── `Σ pos.margin` on the account blob — THE single maintenance point ──────────────────────
+    //
+    // `totalWalletBalance = perp_wallet_balance + Σ pos.margin` is a PUBLISHED field (both account
+    // views and `AccountBalanceChanged`), and the Σ leg is now stored rather than walked, so the emit
+    // path is one account load instead of an index load plus a position load per member market. The
+    // delta comes from the `old_margin` the registry hook already paid for, so this costs no extra
+    // read — only the account write, and only when the margin actually moved.
+    //
+    // ⚠️ This is the ONLY place the aggregate may be touched. `save_position` is the single door for
+    // every `pos.margin` write (`TypedPerpStore::set_position` / `position_mut` have no other
+    // caller — verified by grep), and `save_position_reservation_only` `debug_assert`s that it cannot
+    // change `margin`, which is precisely why the aggregate is cheap: it does NOT move on an order
+    // resting or being cancelled. A second maintenance site, or one added to the reservation-only
+    // route, re-opens exactly the drift `margin_view::index_account_scalars`' `debug_assertions`
+    // cross-check exists to catch.
+    //
+    // Conditional on a non-zero delta so the many saves that move only `amount` / `v_quote_balance` /
+    // `leverage` (e.g. `setLeverage`) do not dirty the account key for a no-op. Deterministic — the
+    // condition is a comparison of two stored integers, identical on every node.
+    if pos.margin != old_margin {
+        let delta = pos
+            .margin
+            .checked_sub(old_margin)
+            .ok_or_else(|| perp_err("save_position: position margin delta overflow"))?;
+        // `mutate_account`, not `mutate_account_balance`: this is not a WALLET move (no
+        // `credit_perp`/`debit_perp`), and `save_position` marks the snapshot itself two lines below,
+        // so marking here as well would be redundant.
+        mutate_account(context, user, |a| {
+            a.total_position_margin = a
+                .total_position_margin
+                .checked_add(delta)
+                .ok_or_else(|| perp_err("save_position: total position margin overflow"))?;
+            Ok::<(), PerpError>(())
+        })??;
+    }
     // Position state moved (`amount` / `v_quote_balance` / `margin` / `leverage`) ⇒ one snapshot at
     // the end of the call. Binance's `ACCOUNT_UPDATE` carries a `P[]` array for exactly this, and its
     // own trigger sentence is "since there's no change on positions" — so a change IS the trigger.
@@ -2539,6 +2630,7 @@ mod size_probe_tests {
             maker_fee_bps: 2,
             taker_fee_bps: 5,
             nonce: 7,
+            total_position_margin: 4_200_000,
         };
         let buf = encode(&acct).unwrap();
         println!(

@@ -1064,7 +1064,23 @@ fn settle_funding_noop_for_flat_position_but_reanchors() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     set_funding_index(&mut ctx, 75_000_000);
-    save_position(&mut ctx, 0, 0); // flat → no funding owed
+    // Flat → no funding owed. Written directly rather than through the `save_position` helper
+    // because that one always allocates `MARGIN`, and a FLAT position holding margin is a state the
+    // engine cannot produce (every close zeroes `margin` alongside `amount`) — `storage::save_position`
+    // now `debug_assert`s exactly that. The margin value is irrelevant to both assertions below.
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: 0,
+            v_quote_balance: 0,
+            margin: 0,
+            leverage: 5,
+            ..PerpPosition::default()
+        },
+    )
+    .unwrap();
 
     let (pos, account) = settle_alice_funding(&mut ctx);
 

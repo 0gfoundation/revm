@@ -704,10 +704,17 @@ pub enum MarketSetSource {
 ///
 /// `total_position_margin` is `Σ isolatedWallet` — the money physically sitting in the position
 /// silos. It is the term that separates Binance's `totalWalletBalance` (gross) from its
-/// `totalCrossWalletBalance` (our stored `perp_wallet_balance`), and it has to be WALKED: the
-/// former `total_perp_collateral` ("TC") aggregate that used to carry it was deliberately deleted
-/// (see the note at the end of `types::UserAccount`) because it was derivable state maintained on
-/// the hottest write paths. Nothing stores it now.
+/// `totalCrossWalletBalance` (our stored `perp_wallet_balance`).
+///
+/// It is ALSO a stored scalar — [`crate::types::UserAccount::total_position_margin`], maintained by
+/// `storage::save_position` — which is what makes the `AccountBalanceChanged` emit path walk-free.
+/// This fold still WALKS it, deliberately and on purpose: `getAccount` is loading every position blob
+/// anyway (it needs `amount`, `v_quote_balance`, `leverage` and both side aggregates per market), so
+/// the walked value is free here, and it is the independent ground truth the `debug_assertions`
+/// cross-check in [`index_account_scalars`] compares the stored field against. Do NOT "optimise" this
+/// accumulator into a read of the stored field — that would delete the only guard against the stored
+/// one drifting. (The since-deleted `total_perp_collateral` "TC" aggregate is a different story; see
+/// the note on the stored field for why its recorded objection does not apply to `Σ pos.margin`.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccountMarginTotals {
     /// Σ `initialMargin`.
@@ -1040,7 +1047,9 @@ pub fn run_get_account_margin<H: PerpHost>(
 /// `trading::tests::matched_call_emits_one_settled_snapshot_per_party_in_address_order`,
 /// `trading::tests::account_snapshot_events::a_crossing_fill_publishes_one_snapshot_per_user_last`,
 /// and by the `debug_assertions` cross-check inside [`index_account_wallet_balances`], which compares
-/// the lean fold against this one on every published snapshot.
+/// the walk-free producer against this one on every published snapshot — plus the one inside
+/// [`index_account_scalars`], which compares this fold's `Σ pos.margin` against the stored aggregate
+/// the event reads.
 #[derive(Clone, Debug)]
 pub struct IndexAccountView {
     /// The market ids folded — the per-user index (`umkt`) verbatim, echoed so a caller can
@@ -1067,6 +1076,10 @@ pub struct IndexAccountView {
 /// from the sell list at a read-time `T`; both of those disappeared with the R12 freeze, since both
 /// aggregates now sit in the position blob. Bounded by `MAX_USER_MARKETS` (16) ⇒ ≤ 33 `_ref` loads,
 /// flat.
+///
+/// That walk is why this is the right home for the stored-aggregate cross-check below: `getAccount`
+/// is loading every position blob regardless, so re-deriving `Σ pos.margin` from it costs nothing,
+/// and it is the only independent ground truth for the field the event is read from.
 ///
 /// Its live caller passes `override_market: None` — `getAccount` folds the SETTLED store. See
 /// [`fold_account_margin`] for what the override means and why it is kept.
@@ -1106,6 +1119,36 @@ pub fn index_account_scalars<H: PerpHost>(
         );
     }
 
+    // ── The stored `Σ pos.margin` against a FRESH WALK of the user's positions ────────────────
+    //
+    // `AccountBalanceChanged` publishes `totalWalletBalance` off the STORED
+    // `UserAccount::total_position_margin` (one account load, no walk). A stored aggregate can drift
+    // where the derived one it replaced could not, so this is where it is checked: `scalars` above came
+    // from the wide fold, which sums `info.position_margin` — i.e. `pos.margin` read back from each
+    // position blob — so `total_wallet_balance − total_cross_wallet_balance` IS the independent walk,
+    // and it must equal the field `storage::save_position` maintains.
+    //
+    // This is the natural home for the guard: `getAccount` walks anyway, so the check is free here,
+    // and `index_account_wallet_balances` calls into this function on every published snapshot, which
+    // puts the guard on the write path too. Any `pos.margin` write that ever skips the maintenance in
+    // `save_position` therefore blows up in the test suite instead of silently mis-reporting a balance.
+    //
+    // Skipped when an override is in play: `override_market` deliberately substitutes a HYPOTHETICAL
+    // position for one market, so the fold is *supposed* to disagree with what is stored. (No live
+    // caller passes `Some`; see `fold_account_margin`.) The walk is over the INDEX while the stored
+    // field is over ALL markets — equal because a market can only leave the index while its position
+    // is flat, and a flat position holds no margin (asserted at every `save_position`).
+    #[cfg(debug_assertions)]
+    if override_market.is_none() {
+        let stored = storage::load_account_ref(context, user)?.total_position_margin;
+        debug_assert_eq!(
+            stored as i128,
+            scalars.total_wallet_balance as i128 - scalars.total_cross_wallet_balance as i128,
+            "{who}: stored total_position_margin for {user} diverged from Σ pos.margin walked over \
+             the per-user market index — a pos.margin write bypassed save_position's maintenance"
+        );
+    }
+
     Ok(scalars)
 }
 
@@ -1113,7 +1156,7 @@ pub fn index_account_scalars<H: PerpHost>(
 /// whole of it.
 ///
 /// Deliberately NOT a projection of [`AccountMarginScalars`]: see
-/// [`index_account_wallet_balances`] for why the narrow payload gets a narrow fold.
+/// [`index_account_wallet_balances`] for why the narrow payload gets its own, walk-free producer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountWalletBalances {
     /// Spot / withdrawal-layer USDC held inside the DEX. Our extension; not a Binance stream field.
@@ -1124,27 +1167,30 @@ pub struct AccountWalletBalances {
     pub total_cross_wallet_balance: i64,
 }
 
-/// **The single producer of the `AccountBalanceChanged` payload.** One account load plus, per member
-/// market, `Σ pos.margin` — **1 load per market, not 2.**
+/// **The single producer of the `AccountBalanceChanged` payload.** ONE account load and an
+/// addition — **no index load, no position loads, no walk at all.**
 ///
 /// # Why this is not `index_account_scalars` with fields thrown away
 ///
-/// The event carries three balances, and both non-trivial ones are cheap for the same reason: `cw`
-/// is a STORED scalar on the account blob, and `wb − cw = Σ pos.margin` is a STORED, **mark-
-/// independent** field on each position blob. So the emit path needs neither the `Market` (no mark,
-/// no `base/price_decimals`, no tier table) nor any of the arithmetic the wide fold exists for:
+/// The event carries three balances, and all three are STORED SCALARS on the one account blob:
+/// `usdcBalance` and `cw` (`perp_wallet_balance`) directly, and `wb − cw = Σ pos.margin` as the
+/// incrementally maintained [`crate::types::UserAccount::total_position_margin`] (kept up to date by
+/// `storage::save_position`, from a delta it computes out of a position read it was already paying
+/// for). So the emit path needs neither the per-user market index, nor any position blob, nor the
+/// `Market` (no mark, no `base/price_decimals`, no tier table), nor any of the arithmetic the wide
+/// fold exists for:
 ///
 /// ```text
-///                        wide fold (getAccount)        this fold (the event)
-///   loads / market       2  {market, position}         1  {position}
+///                        wide fold (getAccount)        this producer (the event)
+///   loads                1 index + 2/market            1 account, flat
 ///   maintenance tier     ≤8-band walk                  —
 ///   unrealized PnL       calc_value_i64 + add          —
 ///   ooIM                 open_order_margin (2 divs)    —
 /// ```
 ///
-/// At `MAX_USER_MARKETS` = 16 that is ≤ 18 `_ref` loads against ≤ 33, with the per-market arithmetic
-/// gone entirely. Projecting the wide fold down would have preserved the payload and thrown the
-/// saving away, so it is implemented as its own walk.
+/// At `MAX_USER_MARKETS` = 16 that is **1** `_ref` load against ≤ 33, with the per-market arithmetic
+/// gone entirely. It was ≤ 18 while `Σ pos.margin` was walked off the index. Projecting the wide fold
+/// down would have preserved the payload and thrown all of that away.
 ///
 /// It also has strictly FEWER ways to fail than the wide fold, which matters because it runs on a
 /// WRITE path: the six narrowing guards, the per-market `compute_margin_info` rejects and the
@@ -1152,53 +1198,41 @@ pub struct AccountWalletBalances {
 /// checks every one of them). Only `total_wallet_balance` can still narrow-fail, and only at
 /// Σ ≥ 9.2e12 USD.
 ///
-/// Pure read: every loader is a `_ref`/cache-fill reader, so it enters no key into the block delta
+/// # The one thing the stored aggregate costs: it can DRIFT
+///
+/// A walked Σ cannot be wrong; a stored one can be stale if a `pos.margin` write ever skips its
+/// maintenance. Two things contain that. (1) There is exactly ONE maintenance point, because
+/// `storage::save_position` is the single door for every `pos.margin` write. (2)
+/// [`index_account_scalars`] re-walks the user's positions in `debug_assertions` builds and compares
+/// the walk against the stored field — and the cross-check just below calls into it on every
+/// published snapshot, so the guard runs on this path too, not only where a test happens to call
+/// `getAccount`.
+///
+/// Pure read: the one loader is a `_ref`/cache-fill reader, so it enters no key into the block delta
 /// and cannot move the block commitment.
 pub fn index_account_wallet_balances<H: PerpHost>(
     context: &mut H,
     user: Address,
     who: &str,
 ) -> Result<AccountWalletBalances, PerpError> {
-    let (usdc_balance, total_cross_wallet_balance) = {
+    let (usdc_balance, total_cross_wallet_balance, total_position_margin) = {
         let a = storage::load_account_ref(context, user)?;
-        // ONE account load for both fields. The wide path pays two (the fold reads the wallet, the
-        // emitter re-read the account for `usdc_balance`).
+        // ONE account load for all three. The wide path pays an index load plus two per market on top
+        // of it.
         let usdc: primitives::U256 = a.usdc_balance.clone().into();
-        (usdc, a.perp_wallet_balance)
+        (usdc, a.perp_wallet_balance, a.total_position_margin)
     };
-    // The index is the support of the sum: a market the user has left contributes `pos.margin == 0`.
-    // Held as an owned `Arc` so it can be iterated while `context` is borrowed mutably by the walk.
-    // It is already a SET (`storage::user_markets_add` is idempotent), so no dedup pass is needed —
-    // the wide fold's `seen` vector exists for its caller-supplied-list path, which this has none of.
-    let market_ids = storage::load_user_markets_ref(context, user)?;
-    let mut total_position_margin: i128 = 0;
-    for market_id in market_ids.iter().copied() {
-        let pos = storage::load_position_ref(context, user, market_id)?;
-        // The index-membership half of the payload/trigger agreement, enforced rather than trusted.
-        // An order-list leg can add a market to the index (a placement) or drop one from it (a
-        // cancel) — see `storage::sync_user_market_membership` — WITHOUT marking the user. That is
-        // only harmless because a flat position carries no margin: every close zeroes `margin`
-        // alongside `amount` (`settlement::apply_position_fill`'s full-close arm, and the explicit
-        // `pos.margin = 0` in both liquidation paths), and `add/removePositionMargin` refuse a flat
-        // position. If that ever stopped holding, a pure placement would silently move
-        // `totalWalletBalance` and this event's trigger would be wrong again.
-        debug_assert!(
-            pos.amount != 0 || pos.margin == 0,
-            "{who}: {user} market {market_id} is flat but holds margin {} — a placement/cancel that \
-             moves this market in or out of the per-user index would then move totalWalletBalance \
-             with no snapshot to announce it",
-            pos.margin
-        );
-        total_position_margin += pos.margin as i128;
-    }
-    let total_wallet_balance =
-        i64::try_from(total_cross_wallet_balance as i128 + total_position_margin)
-            .map_err(|_| perp_err(format!("{who}: total wallet balance exceeds i64")))?;
+    let total_wallet_balance = total_cross_wallet_balance
+        .checked_add(total_position_margin)
+        .ok_or_else(|| perp_err(format!("{who}: total wallet balance exceeds i64")))?;
 
     // The event and `getAccount` must report the SAME number for every field they share, and this is
-    // where two folds could drift. Compiled out in release, so the lean path costs production
-    // nothing; in debug it runs on EVERY published snapshot rather than only where a test happens to
-    // call `getAccount`.
+    // where the stored aggregate and the wide fold's WALK could drift (that is now the substance of
+    // this check: the event reads `UserAccount::total_position_margin`, `getAccount` sums
+    // `pos.margin` over the index — see the cross-check inside `index_account_scalars`, which
+    // compares the two directly). Compiled out in release, so the lean path costs production nothing;
+    // in debug it runs on EVERY published snapshot rather than only where a test happens to call
+    // `getAccount`.
     //
     // `Ok(..)` guard, not `unwrap`: the wide fold has narrowing guards and per-market rejects this
     // one does not need, and a state that trips them is exactly a state in which `getAccount` itself

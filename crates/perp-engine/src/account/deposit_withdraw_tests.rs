@@ -426,12 +426,43 @@ fn get_account_reports_available_wallet_net_of_allocations() {
         },
     )
     .unwrap();
+    // A REAL position: non-zero `amount` in a market that exists. It used to be written flat with
+    // `margin: 40`, which is a state the engine cannot produce (every close zeroes `margin` alongside
+    // `amount`) and which `storage::save_position` now `debug_assert`s against — and a flat position
+    // holding margin would additionally make the two published `totalWalletBalance` surfaces disagree,
+    // since `getAccount` sums `pos.margin` over the per-user market index while the stored
+    // `total_position_margin` aggregate covers every market. The market has to exist because the
+    // position puts ALICE into the per-user index, which `getAccount` walks.
+    storage::save_market(
+        &mut ctx,
+        &crate::types::Market {
+            market_id: 1,
+            base_decimals: 0,
+            price_decimals: 0,
+            tick_size: 1,
+            step_size: 1,
+            min_quantity: 1,
+            max_quantity: 1_000_000,
+            max_price: 100_000_000,
+            price_update_interval: 15,
+            active: true,
+            funding_interval: 0,
+            interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
+            price_band_bps: 0,
+            mark_price: 1,
+            tiers: crate::types::MarginTiers::default(),
+        },
+    )
+    .unwrap();
     storage::save_position(
         &mut ctx,
         ALICE,
         1,
         &crate::types::PerpPosition {
+            amount: 1,
             margin: 40,
+            leverage: 1,
             ..Default::default()
         },
     )

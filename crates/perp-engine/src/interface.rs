@@ -43,10 +43,17 @@ sol! {
         ///                               the SPOT side and is NOT part of any total below — it is
         ///                               also the balance `withdraw` actually gates on.
         ///   totalWalletBalance          Binance `totalWalletBalance` — the GROSS perp wallet:
-        ///                               `totalCrossWalletBalance + Σ positionMargin`. Requires the
-        ///                               index walk: no aggregate stores it (the former
-        ///                               `total_perp_collateral` "TC" field was deleted as
-        ///                               derivable state maintained on the hottest write paths).
+        ///                               `totalCrossWalletBalance + Σ positionMargin`. THIS call
+        ///                               walks the index for it (it is loading every position blob
+        ///                               anyway); `AccountBalanceChanged` reads the same number off
+        ///                               the stored `Σ pos.margin` aggregate
+        ///                               (`UserAccount::total_position_margin`) with no walk at all,
+        ///                               and the two are cross-checked against each other in debug
+        ///                               builds on every published snapshot. (Not to be confused with
+        ///                               the deleted `total_perp_collateral` "TC" field, which also
+        ///                               carried the open-order ESCROW and therefore had to be
+        ///                               rewritten on every order rest and cancel; `Σ pos.margin`
+        ///                               does not move on either.)
         ///   totalCrossWalletBalance     Binance `totalCrossWalletBalance` — our stored
         ///                               `perpWalletBalance`, verbatim and signed. Position margin
         ///                               has physically left it; the open-order requirement has not.
@@ -759,6 +766,17 @@ sol! {
         ///   usdcBalance              spot / withdrawal-layer USDC. NOT part of any total below.
         ///   totalWalletBalance       Binance `wb` — GROSS perp wallet = cross + Σ positionMargin.
         ///   totalCrossWalletBalance  Binance `cw` — the STORED `perp_wallet_balance`, verbatim.
+        ///
+        /// ## All three are STORED SCALARS, so emitting this costs ONE load
+        ///
+        /// `wb` is not walked. `Σ positionMargin` is the incrementally maintained
+        /// `UserAccount::total_position_margin` (moved only by `storage::save_position`, from a delta it
+        /// gets out of a position read it was already paying for), so `wb = cw + that` is one addition
+        /// on the same account blob `usdcBalance` and `cw` come off. The emit path used to walk the
+        /// per-user market index and load a position blob per member market — up to 17 reads per
+        /// published snapshot, on the fill path. `getAccount` still walks (it loads every position
+        /// anyway) and the two are compared in debug builds on every snapshot, so the stored aggregate
+        /// cannot drift silently.
         ///
         /// ## `usdcBalance` is a deliberate EXTENSION, not a Binance field
         ///

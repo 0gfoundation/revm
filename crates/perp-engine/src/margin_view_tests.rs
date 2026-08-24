@@ -1698,28 +1698,74 @@ fn the_views_write_nothing() {
          block commitment"
     );
 
-    // ── ...AND the same fold reached from the EVENT path adds no key either ───────────────────
+    // ── ...AND publishing a snapshot adds no key of its own, whatever triggered it ────────────
     //
-    // `AccountBalanceChanged` carries this whole roll-up, so `index_account_scalars` runs once per
-    // touched user at the end-of-call drain. If any loader it reaches were not a `_ref`/cache-fill
-    // reader it would dirty extra keys, and the perp block commitment — whose input is exactly the
-    // block's net key→value delta (`perp_core::compute_block_commitment`) — would move for a reason
-    // that has nothing to do with what the call actually changed. This is the mechanical confirmation
-    // that the golden commitment cannot shift because of the event: the WRITE contributes its one
-    // account key (counted here), the fold behind the log contributes none, the coalescing set is not
-    // a storage key at all (it never reaches `TypedPerpStore::mark`), and log data is EVM-journaled
-    // and never enters the perp delta.
-    let before_write = PerpHost::perp_write_count(&ctx);
-    storage::begin_perp_call(&mut ctx);
-    storage::mutate_account_balance(&mut ctx, ALICE, |a| a.credit_perp(1))
-        .unwrap()
-        .unwrap();
-    storage::flush_account_snapshots(&mut ctx).unwrap();
+    // `AccountBalanceChanged` is folded at the end-of-call drain, once per touched user. If any loader
+    // on that path were not a `_ref`/cache-fill reader it would dirty extra keys, and the perp block
+    // commitment — whose input is exactly the block's net key→value delta
+    // (`perp_core::compute_block_commitment`) — would move for a reason that has nothing to do with
+    // what the call actually changed. The coalescing set is not a storage key at all (it never reaches
+    // `TypedPerpStore::mark`), and log data is EVM-journaled and never enters the perp delta.
+    //
+    // # What this leg used to assert, and why its subject moved
+    //
+    // It used to say "the account write dirties exactly ONE key" over a lone
+    // `mutate_account_balance`, and that is still true — but it was chosen when the DRAIN was the
+    // suspect (it walked the per-user market index and a position blob per market to sum
+    // `Σ pos.margin`, so a non-`_ref` loader in there was a live hazard). The drain now reads ONE key,
+    // the account, off the stored `total_position_margin` aggregate — the very key the write already
+    // dirtied — so on an account-write trigger the old assertion can no longer distinguish anything.
+    //
+    // The interesting write is now the POSITION write, because `save_position` maintains that
+    // aggregate: it dirties the account key TOO, and only when `pos.margin` actually moved. So the
+    // three legs below pin the whole new rule — 2 keys for a margin-moving position write, 1 for a
+    // position write that leaves `margin` alone, 1 for an account write — and in every case the
+    // publish itself contributes ZERO.
+    let key_cost = |ctx: &mut TestCtx, f: &mut dyn FnMut(&mut TestCtx)| -> u64 {
+        let before = PerpHost::perp_write_count(ctx);
+        storage::begin_perp_call(ctx);
+        f(ctx);
+        storage::flush_account_snapshots(ctx).unwrap();
+        PerpHost::perp_write_count(ctx) - before
+    };
+
+    // (1) A position write that MOVES `pos.margin` dirties TWO keys: the position, and the account
+    //     carrying `Σ pos.margin`. `amount` is non-zero before AND after, so neither zero-crossing
+    //     hook (open-position registry, per-user market index) contributes a third.
+    set_position(&mut ctx, ALICE, MARKET_B, -3, 300, 200, 1);
     assert_eq!(
-        PerpHost::perp_write_count(&ctx),
-        before_write + 1,
-        "the account write dirties exactly ONE key; the mark it leaves and the Σ-over-markets fold \
-         at the drain add none. More than one here means a loader on the emit path stopped being a \
-         `_ref` reader, or the touched-set started going through `mark`."
+        key_cost(&mut ctx, &mut |ctx| {
+            set_position(ctx, ALICE, MARKET_B, -3, 300, 250, 1)
+        }),
+        2,
+        "a margin-moving position write dirties exactly TWO keys — the position, and the account \
+         blob that now carries `Σ pos.margin`. A third would mean the drain's fold started dirtying \
+         keys again, or a zero-crossing hook fired on a write that crossed nothing."
+    );
+
+    // (2) The same write with `margin` UNCHANGED (only `v_quote_balance` moves) dirties ONE key. The
+    //     aggregate maintenance is conditional on a non-zero delta, so a `setLeverage`-shaped save
+    //     does not touch the account blob at all.
+    assert_eq!(
+        key_cost(&mut ctx, &mut |ctx| {
+            set_position(ctx, ALICE, MARKET_B, -3, 400, 250, 1)
+        }),
+        1,
+        "a position write that leaves `pos.margin` alone must not dirty the account key — the \
+         aggregate cannot have moved, and writing it would put a no-op key in the block delta"
+    );
+
+    // (3) An account write still dirties exactly ONE key, and the snapshot it triggers adds none —
+    //     the drain reads that same account blob and nothing else.
+    assert_eq!(
+        key_cost(&mut ctx, &mut |ctx| {
+            storage::mutate_account_balance(ctx, ALICE, |a| a.credit_perp(1))
+                .unwrap()
+                .unwrap()
+        }),
+        1,
+        "the account write dirties exactly ONE key; the mark it leaves and the publish at the drain \
+         add none. More than one here means a loader on the emit path stopped being a `_ref` \
+         reader, or the touched-set started going through `mark`."
     );
 }

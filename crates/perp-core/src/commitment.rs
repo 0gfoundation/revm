@@ -101,7 +101,29 @@ use primitives::{B256, U256};
 // a no-op there, its write set is byte-identical at 21 and 22 and its BusinessSnapshot is unchanged;
 // the golden value moves only because this byte is hashed into it. VERIFIED, not assumed: the whole
 // suite including that pin passed at the OLD value with the new rule in place and this byte still 21.)
-pub const BLOCK_COMMITMENT_VERSION: u8 = 22;
+// Stored `Σ pos.margin` on the account blob: bumped 22→23 — a LAYOUT change plus a change to WHICH
+// KEYS a position write touches; no execution rule moves. `UserAccount` gains a trailing "PM" field
+// (`total_position_margin` = `Σ pos.margin` over the user's positions, i.e. Binance's
+// `totalWalletBalance − totalCrossWalletBalance`), so EVERY stored account blob grows by one integer;
+// and `storage::save_position` now maintains it from the delta of the position write, which means a
+// write that MOVES `pos.margin` (an open, a fill, a close, funding, liquidation, ADL,
+// `add/removePositionMargin`) also writes the ACCOUNT key — a key that write did not previously enter
+// into the block delta. A rest/cancel is untouched: it goes through
+// `save_position_reservation_only`, which cannot change `margin` (asserted), so a pure placement and a
+// pure cancel still write no account key.
+//
+// What this buys: `AccountBalanceChanged.totalWalletBalance` used to be WALKED — one index load plus
+// one position load per member market, up to 17 `_ref` loads at `MAX_USER_MARKETS` — on every
+// published snapshot, i.e. on the fill path. It is now one account load and one addition. The
+// increment itself is free: `save_position` already reads the old position for its zero-crossing
+// hooks, so `old.margin` costs nothing.
+//
+// No BUSINESS behaviour changes — every published number is the same quantity, and the account blob's
+// existing fields are untouched — but the block's net key→value delta differs (longer account blobs,
+// plus account keys on the margin-moving position writes), so a node on 22 and a node on 23 would
+// disagree on the commitment. CHAIN change: golden re-pin (see `trading::tests::golden`) + a
+// coordinated wipe on deploy. The golden scenario's BusinessSnapshot is UNCHANGED, field for field.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 23;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

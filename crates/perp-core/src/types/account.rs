@@ -145,11 +145,72 @@ pub struct UserAccount {
     /// Monotonic per-user nonce used to derive order ids (`keccak(account ‖ nonce)`).
     #[serde(rename = "NO", default)]
     pub nonce: u64,
+
+    /// `Σ pos.margin` over ALL of this user's positions — Binance's
+    /// `totalWalletBalance − totalCrossWalletBalance`, i.e. the money physically sitting in the
+    /// per-position silos.
+    ///
+    /// # Why this is STORED and the deleted "TC" was not
+    ///
+    /// The former `total_perp_collateral` ("TC") aggregate that used to live here was removed for a
+    /// reason recorded below the previous field: it was
+    /// `wallet + Σ_positions(margin + margin_reserved)` and cost "an extra account read + clone +
+    /// write **per order rest/cancel**". **That objection no longer applies, and the reason is the
+    /// `margin_reserved` term, not the shape.** `margin_reserved` was the open-order ESCROW, which
+    /// moved on every placement and every cancel — so TC had to be re-derived and re-written on the
+    /// two hottest paths in the engine. The escrow is GONE (see the note where the six escrow fields
+    /// used to be in [`crate::types::PerpPosition`]); the requirement it stood for is DERIVED on read
+    /// now. What is left, `Σ pos.margin`, does **not** move on a rest or a cancel — that is exactly
+    /// the invariant `storage::save_position_reservation_only` `debug_assert`s — so this field is
+    /// maintained only where `pos.margin` itself moves: opens, closes, fills, funding, liquidation,
+    /// ADL and `add/removePositionMargin`.
+    ///
+    /// And on those paths the maintenance is **free**: `storage::save_position` already reads the OLD
+    /// position (it needs `old.amount` for the registry / market-index zero-crossing hooks), so
+    /// `old.margin` costs nothing and the increment is `pos.margin − old.margin`. TC's cost was a
+    /// read it did not otherwise need, on a path that fired constantly.
+    ///
+    /// Note this stores `Σ pos.margin` and NOT `wb` itself. `wb = perp_wallet_balance + this` is one
+    /// addition at read time, and keeping the two apart means their maintenance points stay
+    /// decoupled: the wallet moves through `credit_perp`/`debit_perp` on the account, this moves
+    /// through `save_position` on a position, and neither has to know about the other.
+    ///
+    /// # What it buys
+    ///
+    /// `AccountBalanceChanged` publishes `totalWalletBalance`, which used to cost a walk of the
+    /// user's market index (1 index load + 1 position load per member market, up to 17 `_ref` loads
+    /// at [`MAX_USER_MARKETS`]). The emit path is now ONE account load and an addition — zero index
+    /// loads, zero position loads. See `margin_view::index_account_wallet_balances`.
+    ///
+    /// # The risk, and the guard
+    ///
+    /// A derived quantity cannot drift; a stored one can. `save_position` is the SINGLE door for every
+    /// `pos.margin` write (`TypedPerpStore::set_position` / `position_mut` are reached from nowhere
+    /// else in the engine), so there is exactly one maintenance point — and
+    /// `margin_view::index_account_scalars` re-walks the user's positions in `debug_assertions` builds
+    /// and compares the walk against this field on every `getAccount` and every published snapshot.
+    /// A missed maintenance point therefore panics in the test suite rather than silently mis-reporting
+    /// a balance. Independently pinned after every operation of a randomised sequence by
+    /// `trading::tests::user_market_index::stored_position_margin_is_exactly_the_sum_after_every_operation`.
+    ///
+    /// ⚠️ `#[serde(default)]` decodes a pre-existing (shorter) account blob as `0`, which is WRONG for
+    /// an account that already holds positions — it would under-report `totalWalletBalance` by the
+    /// whole silo. That is acceptable ONLY because this is a pre-production chain that is wiped on
+    /// every layout change (`BLOCK_COMMITMENT_VERSION` is bumped alongside), so no such blob ever
+    /// exists in practice. The `default` is kept for the same reason the three fields above have it:
+    /// the positional codec needs the trailing fields to be optional for the type to round-trip a
+    /// short array at all. Were such a blob ever loaded, the `debug_assertions` cross-check above WOULD
+    /// catch it on the first `getAccount` — but only in a debug build; a release node would report the
+    /// wrong balance silently.
+    #[serde(rename = "PM", default)]
+    pub total_position_margin: i64,
     // NOTE: the former "TC" (`total_perp_collateral`) aggregate is GONE. It was
     // `wallet + Σ_positions(margin + the since-deleted margin_reserved)` — fully derivable from state
     // that is already published, used by no protocol rule, yet incrementally maintained on the
     // hottest write paths (an extra account read + clone + write per order rest/cancel). Consumers
-    // that want it compute it off-chain from `getAccount` + `getPosition`.
+    // that want it compute it off-chain from `getAccount` + `getPosition`. (`total_position_margin`
+    // above is NOT that field coming back — see its own note for why the recorded objection, which
+    // was about the `margin_reserved` term, no longer applies.)
 }
 
 impl Default for UserAccount {
@@ -160,6 +221,7 @@ impl Default for UserAccount {
             maker_fee_bps: 0,
             taker_fee_bps: 0,
             nonce: 0,
+            total_position_margin: 0,
         }
     }
 }
