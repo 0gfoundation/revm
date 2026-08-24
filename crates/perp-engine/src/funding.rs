@@ -57,6 +57,15 @@ pub(crate) struct PendingFunding {
     funding_rate: i64,
     user: Address,
     market_id: u64,
+    /// The position AFTER the funding credit/charge landed on `margin`, snapshotted at compute
+    /// time. Carried so [`apply_funding_settlement`] can emit the `PositionChanged` that pairs
+    /// with `FundingSettled` — see the note there for why funding needs one at all. All-scalar
+    /// (`PerpPosition` is 9 integers), and only built when `payment != 0`.
+    pos: PerpPosition,
+    /// `market.{base_decimals, price_decimals}` from the compute-time `Market`, so the apply half
+    /// can value `unrealizedProfit` without a second market load. Immutable per market.
+    base_decimals: u32,
+    price_decimals: u32,
 }
 
 /// Pure funding computation: reads funding state, applies the funding payment to the in-memory
@@ -113,6 +122,11 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
                 funding_rate: funding.last_funding_rate,
                 user,
                 market_id: market.market_id,
+                // Post-funding snapshot. `last_funding_index` is re-anchored below and is not a
+                // field of `PositionChanged`, so taking it here loses nothing the log reports.
+                pos: pos.clone(),
+                base_decimals: market.base_decimals,
+                price_decimals: market.price_decimals,
             });
         }
     }
@@ -168,6 +182,45 @@ pub(crate) fn apply_funding_settlement<H: PerpHost>(
         }
         .to_log_data(),
     });
+
+    // ── Why funding also emits `PositionChanged` ─────────────────────────────────────────────
+    // Funding moves `pos.margin`, which is exactly `ACCOUNT_UPDATE.a.P[].iw`. The docs list
+    // `FundingSettled` as a source for `ACCOUNT_UPDATE`, and that payload now CARRIES the position
+    // array (the `@position` stream was removed), so a funding settle that emitted no position row
+    // would publish a `B[]` with no `P[]` entry for the position whose `iw` just changed —
+    // `save_position` marks the account snapshot dirty, so the account update fires either way.
+    //
+    // On most paths a later `PositionChanged` would have covered it (a fill, a margin add/remove,
+    // a liquidation close), but NOT on all of them: a maker whose fill is rejected as
+    // open-into-insolvency (`MakerFillOutcome::RejectedInsolvent`) has its funding computed at
+    // `MatchRegistry::get_or_load`, flushed to storage with the rest, and no `PositionChanged`
+    // pushed for it. Emitting from here — the ONE place that knows funding actually moved money —
+    // closes that hole for every caller at once instead of asking each of them to remember.
+    //
+    // The alternative (let the indexer derive the new `iw` by applying `amount` to its own last
+    // known value) was rejected: `amount` is the FULL payment, while the margin leg is
+    // `min(max(margin, 0), charge)` with the remainder absorbed by the insurance fund, so the
+    // consumer would have to re-implement that clamp — and the negative-margin case, where the
+    // charge takes nothing from the position at all — to get `iw` right. That is the engine rule
+    // leaking into every client.
+    //
+    // Cost: one extra log per position per funding epoch (`payment != 0` is the gate, i.e. only
+    // the first touch after an epoch boundary), and it lands immediately BEFORE the caller's own
+    // `PositionChanged` where there is one. Both are after-images; last-one-wins per
+    // `(user, marketId)` is already how this event has to be read.
+    //
+    // Valued at the same `mark_price` the `FundingSettled` above reports, so the two agree.
+    crate::events::emit_position_changed_at_mark(
+        context,
+        p.user,
+        p.market_id,
+        &p.pos,
+        mark_price,
+        p.base_decimals,
+        p.price_decimals,
+        0,
+        0,
+    )?;
     Ok(())
 }
 

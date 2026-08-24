@@ -846,10 +846,88 @@ sol! {
         // takerFee / makerFee: USDC micro-units (6-decimal) charged to each side for this fill
         event Trade(uint64 indexed marketId, uint64 tradeId, bytes32 takerOrderId, bytes32 makerOrderId, address taker, address maker, uint64 price, uint64 quantity, uint8 takerSide, uint64 takerFee, uint64 makerFee);
 
-        // Feeds: /positionRisk (history), /income (REALIZED_PNL)
-        // realizedPnl is gross close PnL and excludes released margin, fees, and funding.
-        // closedQuantity is zero for non-closing position updates.
-        event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage, int64 realizedPnl, uint64 closedQuantity);
+        /// Feeds: /positionRisk (history), /income (REALIZED_PNL), and — since the `@position`
+        /// WebSocket stream was removed — the whole of `ACCOUNT_UPDATE.a.P[]`.
+        ///
+        /// ## This event IS `a.P[]`, and is deliberately SELF-CONTAINED
+        ///
+        /// The user stream no longer has a position channel: positions ride inside the account
+        /// update. So an indexer builds a `P[]` entry from ONE of these and nothing else — it must
+        /// not have to join a mark-price feed to fill a field. Mapping, in `P[]` field order:
+        ///
+        /// ```text
+        ///   s    symbol            marketId
+        ///   pa   position amount   amount            (signed; positive = long)
+        ///   ep   entry price       entryPrice
+        ///   bep  breakeven price   breakevenPrice    ⚠️ PLACEHOLDER, always 0 — see below
+        ///   cr   cumulative rPnL   cumulativeRealizedPnl  ⚠️ PLACEHOLDER, always 0 — see below
+        ///   up   unrealised PnL    unrealizedProfit
+        ///   mt   margin type       constant "isolated" — we have no cross mode
+        ///   iw   isolated wallet   margin
+        ///   ps   position side     constant "BOTH"     — one-way mode only
+        ///   ma   margin asset      constant "USDC"     — single-collateral venue
+        /// ```
+        ///
+        /// More than one of these can fire for the same `(user, marketId)` in one transaction (one
+        /// per fill, plus one for the funding settle that precedes them). That is not new and needs
+        /// no special handling: take the LAST one per `(user, marketId)` — every field is a LEVEL
+        /// (an after-image), never a delta, except `realizedPnl` / `closedQuantity`, which are
+        /// per-event and must be summed if you want a transaction total.
+        ///
+        /// ## Field semantics
+        ///
+        ///   amount, vQuoteBalance, margin, leverage
+        ///                     the stored position, verbatim, AFTER this change.
+        ///   realizedPnl       gross close PnL FOR THIS EVENT; excludes released margin, fees and
+        ///                     funding. Zero on a non-closing update.
+        ///   closedQuantity    zero for non-closing position updates.
+        ///   entryPrice        `-vQuoteBalance / amount`, in the market's `priceDecimals`
+        ///                     fixed-point units — the same scale every other `price` field on this
+        ///                     ABI uses, NOT quote micro-units. **`0` when the position is flat**,
+        ///                     as `P[].ep` requires. Because `vQuoteBalance` accumulates
+        ///                     `-calc_value(fillPrice, qty)` per fill, this is the size-weighted
+        ///                     AVERAGE entry over everything still open — after a partial close it
+        ///                     is NOT the last fill price. Derived by `math::calc_entry_price`,
+        ///                     the algebraic inverse of the `calc_value` the fills used.
+        ///   unrealizedProfit  Binance's `positionAmt × (markPrice − entryPrice)` at the market's
+        ///                     CURRENT mark, computed as `signedNotional + vQuoteBalance` so the
+        ///                     only rounding in it is the truncation already inside
+        ///                     `signedNotional`. This is the SAME quantity, under the same
+        ///                     lowercase-`r` spelling, that `getMarginInfo` returns — there is one
+        ///                     definition of it in the engine (`margin_view::position_margin_info`)
+        ///                     and this field reuses it rather than re-deriving from `entryPrice`,
+        ///                     which would round twice.
+        ///
+        /// ## ⚠️ `cumulativeRealizedPnl` and `breakevenPrice` ARE PLACEHOLDERS. ALWAYS EXACTLY 0.
+        ///
+        /// **Do not sum them, chart them, or diff them.** They are not "0 because nothing
+        /// happened" — they are 0 because the state behind them DOES NOT EXIST. They are carried
+        /// so the `P[]` payload shape is stable and adding them later is not a breaking change,
+        /// following exactly the precedent the public docs already set for `ACCOUNT_UPDATE.a.m`
+        /// ("The field exists so the payload shape is stable, but it is not populated yet — do not
+        /// `switch` on it without a default branch"). Treat these the same way: read them as
+        /// "unavailable", never as "zero".
+        ///
+        /// What each one needs before it can be populated:
+        ///
+        /// * `cumulativeRealizedPnl` (`P[].cr`, "cumulative realised PnL for this symbol") needs a
+        ///   **per-position cumulative realised-PnL accumulator** on `PerpPosition`. `PerpPosition`
+        ///   has no such field (`amount`, `v_quote_balance`, `margin`, `leverage`,
+        ///   `last_funding_index`, `total_buy_qty`, `total_buy_notional`, `total_sell_qty`,
+        ///   `total_sell_notional` — that is all of them), and the per-event `realizedPnl` on this
+        ///   very event is a DELTA, so nothing on-chain holds the running total. Note it also has
+        ///   to survive the position going flat and being reopened, which is precisely why it
+        ///   cannot be reconstructed from the current position state.
+        /// * `breakevenPrice` (`P[].bep`, "entry adjusted for fees paid") needs **cumulative fees
+        ///   paid against the open position**. Also absent: the trading fee is charged out of the
+        ///   margin the fill funds and out of the wallet, and no running per-position total is
+        ///   kept anywhere. `entryPrice` alone cannot yield it.
+        ///
+        /// An indexer that wants either number today must accumulate it itself from the event
+        /// stream (`realizedPnl` here for `cr`; `Trade.takerFee` / `Trade.makerFee` for `bep`).
+        /// When they ARE populated the tests asserting them zero must be updated in the same
+        /// change — see `placeholder_position_fields_are_zero`.
+        event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage, int64 realizedPnl, uint64 closedQuantity, uint64 entryPrice, int64 unrealizedProfit, int64 cumulativeRealizedPnl, uint64 breakevenPrice);
         // Feeds: isolated margin adjustment history. delta > 0 means add margin; delta < 0 means remove margin.
         event PositionMarginAdjusted(address indexed user, uint64 indexed marketId, int64 delta, int64 margin);
         // Feeds: useful for debugging / audit; no direct REST endpoint
@@ -874,7 +952,18 @@ sol! {
         event MarkPriceUpdated(uint64 indexed marketId, uint64 price, address updater);
 
         // Feeds: /fundingRate (history), /income (FUNDING_FEE)
-        // NOTE: defined but not yet emitted — will be wired when funding settlement is implemented.
+        //
+        // ⚠️ The old "defined but not yet emitted" note here was STALE. `funding::apply_funding_settlement`
+        // emits this on every non-zero settlement, and funding is LAZY: it fires at the first
+        // operation that touches the position after a funding epoch boundary (a fill, a margin
+        // add/remove, a liquidation), never on a schedule of its own.
+        //
+        // `amount` is the FULL signed payment (positive = the position received). It is NOT
+        // necessarily the change in `P[].iw`: a charge is taken from `pos.margin` down to 0 and the
+        // remainder is absorbed by the insurance fund, so applying `amount` to a locally-tracked
+        // `iw` over-debits an under-collateralised position. Read the new `iw` off the
+        // `PositionChanged` this event is paired with — `apply_funding_settlement` emits one
+        // immediately after, valued at the same `markPrice`, for exactly this reason.
         event FundingSettled(uint64 indexed marketId, address indexed user, int64 fundingRate, int64 amount, uint64 markPrice);
 
         // Feeds: insurance fund balance history

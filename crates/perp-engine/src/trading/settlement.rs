@@ -555,20 +555,17 @@ pub(super) fn finalize_apply<H: PerpHost>(
     storage::mutate_account_balance(context, plan.user, |a| a.debit_perp(plan.total_required))??;
     credit_fee_recipient(context, plan.market_id, plan.fee)?;
 
-    context.log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::PositionChanged {
-            user: plan.user,
-            marketId: plan.market_id,
-            amount: plan.pos_log.amount,
-            vQuoteBalance: plan.pos_log.v_quote_balance,
-            margin: plan.pos_log.margin,
-            leverage: plan.pos_log.leverage,
-            realizedPnl: plan.realized_pnl,
-            closedQuantity: plan.closed_quantity,
-        }
-        .to_log_data(),
-    });
+    // `market` is the same threaded `Market` whose `mark_price` `finalize_compute` fed to
+    // `finalize_core` (`let mark = market.mark_price`), so the log values the taker's post-fill
+    // position at exactly the mark this settlement was decided against.
+    crate::events::emit_position_changed(
+        context,
+        plan.user,
+        market,
+        &plan.pos_log,
+        plan.realized_pnl,
+        plan.closed_quantity,
+    )?;
 
     Ok(())
 }
@@ -799,11 +796,19 @@ impl MatchRegistry {
     /// Applies the match: replays the deferred events in the EXACT order the walk recorded them
     /// (byte-identical log stream + IF/trade-counter evolution), then writes every touched user's
     /// final state (dirty lists, position + account — same key set as the old per-fill saves).
+    ///
+    /// Takes the threaded `Market` rather than a bare `market_id`: the deferred
+    /// `PositionChanged` replay needs the mark + decimals to value `unrealizedProfit`, and this is
+    /// the SAME `Market` whose `mark_price` every deferred fill was settled against
+    /// (`settle_maker_fill_registry` / `finalize_compute` both read `market.mark_price`), so no
+    /// site can drift onto a different mark. It also saves the `load_market_ref` this function
+    /// used to do for the aggregate recompute's decimals.
     pub(super) fn flush<H: PerpHost>(
         mut self,
         context: &mut H,
-        market_id: u64,
+        market: &crate::types::Market,
     ) -> Result<(), PerpError> {
+        let market_id = market.market_id;
         let events = core::mem::take(&mut self.events);
         for e in events {
             match e {
@@ -824,20 +829,14 @@ impl MatchRegistry {
                     realized_pnl,
                     closed_quantity,
                 } => {
-                    context.log(Log {
-                        address: PERP_DEX_ADDRESS,
-                        data: IPerpDex::PositionChanged {
-                            user,
-                            marketId: market_id,
-                            amount: pos.amount,
-                            vQuoteBalance: pos.v_quote_balance,
-                            margin: pos.margin,
-                            leverage: pos.leverage,
-                            realizedPnl: realized_pnl,
-                            closedQuantity: closed_quantity,
-                        }
-                        .to_log_data(),
-                    });
+                    crate::events::emit_position_changed(
+                        context,
+                        user,
+                        market,
+                        &pos,
+                        realized_pnl,
+                        closed_quantity,
+                    )?;
                 }
                 MatchEvent::SaveOrder { order_id, order } => {
                     storage::save_order(context, &order_id, &order)?;
@@ -934,12 +933,9 @@ impl MatchRegistry {
                 .ok_or_else(|| perp_invariant_err("pending admin fee credit without an admin"))?;
             storage::mutate_account_balance(context, admin, |a| a.credit_perp(self.admin_credit_pending))??;
         }
-        // #A: base/price decimals for the reservation-aggregate recompute below (load once).
-        let (bd, pd) = {
-            let m = storage::load_market_ref(context, market_id)?
-                .ok_or_else(|| perp_invariant_err("match flush: unknown market"))?;
-            (m.base_decimals, m.price_decimals)
-        };
+        // #A: base/price decimals for the reservation-aggregate recompute below — off the threaded
+        // `Market` (this used to re-`load_market_ref` for them).
+        let (bd, pd) = (market.base_decimals, market.price_decimals);
         for (user, mut w) in self.users {
             if w.dirty_buy {
                 storage::save_buy_orders(context, user, market_id, &w.buy_entries)?;

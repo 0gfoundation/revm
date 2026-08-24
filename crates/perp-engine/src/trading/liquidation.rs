@@ -5,6 +5,7 @@ use primitives::{Address, FixedBytes, Log};
 use super::match_order;
 use crate::{
         errors::{perp_err, perp_invariant_err},
+    events::emit_position_changed,
     interface::IPerpDex,
     math::{
         calc_bankruptcy_price, calc_position_equity, calc_value, calc_value_i64,
@@ -167,14 +168,10 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
     storage::save_account(context, user, account)?;
 
     super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
-    emit_position_changed(
-        context,
-        user,
-        market.market_id,
-        &pos,
-        realized_pnl,
-        closed_quantity,
-    );
+    // `market.mark_price == mark_price` here: `liquidate_position` is the only caller and it takes
+    // both from the same re-loaded `Market` (its own `debug_assert_eq!` pins that), so valuing the
+    // log at `market`'s mark is valuing it at the mark this close settled against.
+    emit_position_changed(context, user, market, &pos, realized_pnl, closed_quantity)?;
 
     Ok(())
 }
@@ -306,22 +303,25 @@ pub(crate) fn run_adl<H: PerpHost>(
             }
             .to_log_data(),
         });
+        // Both legs are valued at the market's CURRENT mark, not at the ADL price `p_b` the fill
+        // executed at: `unrealizedProfit` is by definition mark-to-market on what is LEFT open,
+        // and the fill's realised part is reported separately as `realizedPnl`.
         emit_position_changed(
             context,
             loser,
-            market.market_id,
+            market,
             &loser_pos,
             fill.loser_realized_pnl,
             fill.quantity,
-        );
+        )?;
         emit_position_changed(
             context,
             winner,
-            market.market_id,
+            market,
             &winner_pos,
             fill.winner_realized_pnl,
             fill.quantity,
-        );
+        )?;
         remaining -= fill.quantity;
         *budget -= 1;
         did_any = true;
@@ -408,26 +408,4 @@ fn adl_fill(
     Ok(None)
 }
 
-fn emit_position_changed<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    market_id: u64,
-    pos: &crate::types::PerpPosition,
-    realized_pnl: i64,
-    closed_quantity: u64,
-) {
-    context.log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::PositionChanged {
-            user,
-            marketId: market_id,
-            amount: pos.amount,
-            vQuoteBalance: pos.v_quote_balance,
-            margin: pos.margin,
-            leverage: pos.leverage,
-            realizedPnl: realized_pnl,
-            closedQuantity: closed_quantity,
-        }
-        .to_log_data(),
-    });
-}
+// `emit_position_changed` lives in `crate::events` — one derivation for all seven emit sites.

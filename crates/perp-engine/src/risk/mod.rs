@@ -7,6 +7,7 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 
 use crate::{
         errors::perp_err,
+    events::emit_position_changed,
     funding::{apply_funding_settlement, compute_funding_settlement},
     interface::IPerpDex::{
         self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
@@ -656,7 +657,9 @@ pub fn run_add_position_margin<H: PerpHost>(
     storage::save_position(context, caller, args.marketId, &pos)?;
     storage::save_account(context, caller, account)?;
     emit_position_margin_adjusted(context, caller, args.marketId, amount, &pos);
-    emit_position_changed(context, caller, args.marketId, &pos);
+    // `market` is the Arc loaded at the top of this call; nothing here writes the mark, so
+    // `market.mark_price` is the live mark for this transaction.
+    emit_position_changed(context, caller, &market, &pos, 0, 0)?;
     Ok(Bytes::new())
 }
 
@@ -741,7 +744,9 @@ pub fn run_remove_position_margin<H: PerpHost>(
     storage::save_position(context, caller, args.marketId, &pos)?;
     storage::save_account(context, caller, account)?;
     emit_position_margin_adjusted(context, caller, args.marketId, -amount, &pos);
-    emit_position_changed(context, caller, args.marketId, &pos);
+    // `market.mark_price` IS the `mark_price` this call's maintenance gate used — both come from
+    // the same `load_market_ref` Arc (`load_mark_price` is `load_market_ref(..).mark_price`).
+    emit_position_changed(context, caller, &market, &pos, 0, 0)?;
     Ok(Bytes::new())
 }
 /// Result of a single `liquidate_position` attempt.
@@ -1301,27 +1306,7 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
     Ok(())
 }
 
-fn emit_position_changed<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    market_id: u64,
-    pos: &crate::types::PerpPosition,
-) {
-    context.log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::PositionChanged {
-            user,
-            marketId: market_id,
-            amount: pos.amount,
-            vQuoteBalance: pos.v_quote_balance,
-            margin: pos.margin,
-            leverage: pos.leverage,
-            realizedPnl: 0,
-            closedQuantity: 0,
-        }
-        .to_log_data(),
-    });
-}
+// `emit_position_changed` lives in `crate::events` — one derivation for all seven emit sites.
 
 fn emit_position_margin_adjusted<H: PerpHost>(
     context: &mut H,

@@ -2046,7 +2046,7 @@ pub(super) fn match_order<H: PerpHost>(
     // and neither `initAdmin` nor `transferAdmin` can set one back to zero). Nothing a user can
     // provoke rejects after this line, so "emitted ⟺ accepted" holds with no exception.
     emit_pending_order_placed(context, pending_placed);
-    registry.flush(context, market_id)?;
+    registry.flush(context, market)?;
     if let Some(plan) = taker_plan {
         settlement::finalize_apply(context, plan, side, market)?;
     }

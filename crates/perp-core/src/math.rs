@@ -713,6 +713,99 @@ mod bankruptcy_price_tests {
     }
 }
 
+/// [`calc_entry_price`] is the notional→price inverse of [`calc_value`], and it became
+/// load-bearing when `PositionChanged` started publishing `entryPrice` (= `ACCOUNT_UPDATE.a.P[].ep`)
+/// — it had no test coverage at all before that. These pin the two properties the event depends on:
+/// the DECIMALS convention (the answer is a price in the market's `priceDecimals` scale, not quote
+/// micro-units) and the flat case.
+#[cfg(test)]
+mod entry_price_tests {
+    use super::*;
+
+    /// Hand-computed, no round trip. Market: `base_decimals = 8`, `price_decimals = 9` (so 1 unit
+    /// of price = 1e-9 dollars and 1 BTC = 1e8 base units), long 0.01 BTC bought at $100.
+    ///
+    ///   `calc_value(100e9, 1e6, 8, 9) = 100e9 · 1e6 · 1e6 / (1e9 · 1e8) = 1e6` quote units
+    ///     ($1, since QUOTE_DECIMALS = 6) → `v_quote_balance = -1e6`
+    ///   `calc_entry_price(1e6, -1e6, 8, 9) = 1e6 · 1e9 · 1e8 / (1e6 · 1e6) = 100e9`
+    ///
+    /// The answer is `100_000_000_000` — the SAME integer a `price` field on this ABI carries for
+    /// $100 — and emphatically not `100_000_000` (the value in quote micro-units).
+    #[test]
+    fn entry_price_is_a_price_in_the_markets_price_scale() {
+        let (bd, pd) = (8, 9);
+        let price = 100_000_000_000u64; // $100 at price_decimals = 9
+        let qty = 1_000_000u64; // 0.01 BTC at base_decimals = 8
+        assert_eq!(calc_value(price, qty, bd, pd).unwrap(), 1_000_000);
+        assert_eq!(
+            calc_entry_price(qty as i64, -1_000_000, bd, pd).unwrap(),
+            price
+        );
+    }
+
+    /// The exact inverse property, both signs: for any `(price, qty)` whose notional is exact,
+    /// `calc_entry_price(±qty, ∓calc_value(price, qty)) == price`. A short's `v_quote_balance` is
+    /// POSITIVE (it received the quote) and `amount` negative, so the two sign flips cancel — the
+    /// same entry price, which is what makes one helper serve both sides.
+    #[test]
+    fn entry_price_inverts_calc_value_for_both_signs() {
+        for (bd, pd, price, qty) in [
+            (8u32, 9u32, 100_000_000_000u64, 1_000_000u64), // $100, 0.01 BTC
+            (8, 9, 250_000_000_000, 4_000_000),             // $250, 0.04 BTC
+            (0, 2, 10_000, 10),                             // $100, 10 whole units
+            (6, 6, 1_500_000, 2_000_000),                   // $1.5, 2 units
+        ] {
+            let notional = calc_value(price, qty, bd, pd).unwrap() as i64;
+            assert_eq!(
+                calc_entry_price(qty as i64, -notional, bd, pd).unwrap(),
+                price,
+                "long inverse failed for ({bd},{pd},{price},{qty})"
+            );
+            assert_eq!(
+                calc_entry_price(-(qty as i64), notional, bd, pd).unwrap(),
+                price,
+                "short inverse failed for ({bd},{pd},{price},{qty})"
+            );
+        }
+    }
+
+    /// ROUNDING. `calc_value` FLOORS, so a `(price, qty)` whose exact notional is fractional in
+    /// quote units loses that fraction, and inverting the floored notional lands BELOW the true
+    /// price. This is not a bug to fix by rounding differently — it is the honest statement that
+    /// the position genuinely paid the floored notional, and it is why `unrealizedProfit` is
+    /// computed as `signedNotional + vQuoteBalance` rather than re-derived through this function
+    /// (which would round a second time).
+    ///
+    /// `base_decimals = 8`, `price_decimals = 9`, qty = 3 base units (3e-8 BTC), price =
+    /// `100_000_000_001` ($100.000000001):
+    ///   exact notional = `100_000_000_001 · 3 · 1e6 / (1e9 · 1e8) = 3.00000000003` → floors to 3.
+    ///   Inverting 3 gives `3 · 1e9 · 1e8 / (3 · 1e6) = 100e9` exactly — one sub-unit BELOW the
+    ///   $100.000000001 that was quoted. The gap is bounded by one price sub-unit per base unit.
+    #[test]
+    fn entry_price_of_a_floored_notional_lands_one_sub_unit_low() {
+        let (bd, pd) = (8u32, 9u32);
+        let price = 100_000_000_001u64;
+        let qty = 3u64;
+        let notional = calc_value(price, qty, bd, pd).unwrap();
+        assert_eq!(notional, 3, "calc_value floors 3.00000000003 to 3");
+        let recovered = calc_entry_price(qty as i64, -(notional as i64), bd, pd).unwrap();
+        assert_eq!(recovered, 100_000_000_000);
+        assert!(
+            recovered < price,
+            "inverting a floored notional must never round UP past the price actually paid"
+        );
+    }
+
+    /// A flat position has NO entry price: `P[].ep` must be `"0"`, and the early return is what
+    /// delivers that instead of a division by zero.
+    #[test]
+    fn entry_price_of_a_flat_position_is_zero() {
+        assert_eq!(calc_entry_price(0, 0, 8, 9).unwrap(), 0);
+        // Even with a (transiently) non-zero vQuote — `amount == 0` is the whole test.
+        assert_eq!(calc_entry_price(0, -1_000_000, 8, 9).unwrap(), 0);
+    }
+}
+
 #[cfg(test)]
 mod funding_payment_tests {
     use super::*;
