@@ -398,8 +398,13 @@ sol! {
         ///                   charged at `T`, not at its own price — Binance's vendor Cost formula,
         ///                   measured on mainnet (run9 admission probes; R10 measured the reported
         ///                   `askNotional / qty == limit × 1.0015` for a sell resting below `T`).
-        ///                   Consequence: this field, and every field derived from it, MOVE WITH
-        ///                   THE MARK and with the last trade even when the user does nothing.
+        ///                   `T` is resolved ONCE, when the order is placed, and the term is FROZEN
+        ///                   at `max(T, limit)` for that order's whole life — never re-resolved
+        ///                   (MEASURED, R12; `types::OrderEntry::assuming_price`, and see the
+        ///                   `margin_view` module docs). So this field does NOT move with the mark:
+        ///                   it changes only when an order of this user's is placed, cancelled or
+        ///                   filled. Fields DERIVED from it do move with the mark, but through `N`
+        ///                   (the live position notional) — never through this one.
         ///
         /// Derived (Binance formulas, Binance rounding):
         ///   notional              `trunc(|positionAmt| × markPrice)` — TRUNCATED, and every
