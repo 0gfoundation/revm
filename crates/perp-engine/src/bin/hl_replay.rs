@@ -32,7 +32,7 @@ use perp_engine::{
     interface::IPerpDex::{cancelOrderCall, placeOrderCall},
     run_perp_dex_call, storage,
     trading::{run_cancel_order, run_place_order},
-    types::{MarginTiers, Market},
+    types::{AccountUpdateReason, MarginTiers, Market},
     InMemoryHost, PerpHost,
 };
 use primitives::{address, Address, FixedBytes, U256};
@@ -248,7 +248,7 @@ impl Replayer {
             let u = user_addr(uidx);
             let mut acc = storage::load_account(&mut self.host, u).unwrap();
             acc.credit_perp(WALLET).unwrap();
-            storage::save_account(&mut self.host, u, acc).unwrap();
+            storage::save_account(&mut self.host, u, acc, AccountUpdateReason::Adjustment).unwrap();
         }
     }
 

@@ -285,6 +285,89 @@ fn transfer_to_and_from_perp_wallet() {
     assert_eq!(available2, 0);
 }
 
+/// **The four wallet-moving selectors report four different reasons**, and the split between them is
+/// the one decision on this field that needed an argument rather than a lookup.
+///
+/// Binance has two transfer-shaped values and they describe *which two pots*. `MARGIN_TRANSFER` is
+/// their isolated-position leg (their *Modify Isolated Position Margin*), and we have that operation
+/// exactly — `addPositionMargin` / `removePositionMargin` — so it is reserved for it, or the one
+/// value with a precise analogue here would be the ambiguous one. `transferToPerp` /
+/// `transferFromPerp` move the same asset between two WALLETS and touch no position, which is the
+/// `ASSET_TRANSFER` shape; that in turn leaves `DEPOSIT` / `WITHDRAW` to mean what they say — value
+/// crossing the venue boundary, in and out of ERC-20 custody.
+///
+/// Every row here is a 0-position group, which is why the reason is the ONLY thing that distinguishes
+/// four of them: an indexer watching `usdcBalance` move by 1_000_000 cannot otherwise tell a deposit
+/// from a transfer back out of the perp wallet.
+#[test]
+fn the_four_wallet_selectors_each_report_their_own_reason() {
+    use crate::events::stream_test_support::account_update_reasons;
+    use crate::types::AccountUpdateReason as R;
+
+    let amount = U256::from(2_000_000u64);
+    let mut ctx = make_ctx(amount);
+
+    /// Drives one handler inside an explicit call boundary (these tests bypass the shell, which is
+    /// what normally opens and drains the coalescing set) and returns that call's reasons.
+    fn reasons_of<F>(ctx: &mut TestCtx, f: F) -> Vec<R>
+    where
+        F: FnOnce(&mut TestCtx),
+    {
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        storage::begin_perp_call(ctx);
+        f(ctx);
+        storage::flush_account_snapshots(ctx).unwrap();
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        account_update_reasons(&logs)
+            .into_iter()
+            .map(|(u, r)| {
+                assert_eq!(u, ALICE);
+                r
+            })
+            .collect()
+    }
+
+    assert_eq!(
+        reasons_of(&mut ctx, |ctx| {
+            run_deposit(&depositCall { amount }.abi_encode(), ALICE, ctx).unwrap();
+        }),
+        vec![R::Deposit],
+        "USDC pulled into custody is value ENTERING the venue"
+    );
+    assert_eq!(
+        reasons_of(&mut ctx, |ctx| {
+            run_transfer_to_perp(
+                &transferToPerpCall { amount: 1_000_000 }.abi_encode(),
+                ALICE,
+                ctx,
+            )
+            .unwrap();
+        }),
+        vec![R::AssetTransfer],
+        "spot ledger → perp wallet is a WALLET-to-WALLET move; MARGIN_TRANSFER is the isolated \
+         position leg and belongs to add/removePositionMargin"
+    );
+    assert_eq!(
+        reasons_of(&mut ctx, |ctx| {
+            run_transfer_from_perp(
+                &transferFromPerpCall { amount: 1_000_000 }.abi_encode(),
+                ALICE,
+                ctx,
+            )
+            .unwrap();
+        }),
+        vec![R::AssetTransfer],
+        "…and the same going the other way"
+    );
+    assert_eq!(
+        reasons_of(&mut ctx, |ctx| {
+            run_withdraw(&withdrawCall { amount }.abi_encode(), ALICE, ctx).unwrap();
+        }),
+        vec![R::Withdraw],
+        "USDC returned to the caller is value LEAVING the venue"
+    );
+}
+
 #[test]
 fn get_account_returns_zero_for_new_user() {
     let mut ctx = make_ctx(U256::ZERO);
@@ -318,7 +401,7 @@ fn get_account_on_a_bare_account_reports_a_negative_cross_wallet_unclamped() {
     // reverted would take the call down with it. Driven directly here (no shell), so the call
     // boundary is explicit.
     storage::begin_perp_call(&mut ctx);
-    storage::save_account(&mut ctx, ALICE, account).unwrap();
+    storage::save_account(&mut ctx, ALICE, account, crate::types::AccountUpdateReason::Adjustment).unwrap();
     storage::flush_account_snapshots(&mut ctx).unwrap();
 
     let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), &mut ctx).unwrap();
@@ -424,6 +507,7 @@ fn get_account_reports_available_wallet_net_of_allocations() {
             perp_wallet_balance: 100,
             ..Default::default()
         },
+        crate::types::AccountUpdateReason::Adjustment,
     )
     .unwrap();
     // A REAL position: non-zero `amount` in a market that exists. It used to be written flat with
@@ -465,6 +549,7 @@ fn get_account_reports_available_wallet_net_of_allocations() {
             leverage: 1,
             ..Default::default()
         },
+        crate::types::AccountUpdateReason::Adjustment,
     )
     .unwrap();
     storage::mutate_account(&mut ctx, ALICE, |account| account.debit_perp(55))

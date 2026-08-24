@@ -25,7 +25,7 @@ use crate::perp_dex::{
     trading::{
         run_batch_cancel_orders, run_batch_place_orders, run_cancel_order, run_place_order,
     },
-    types::{MarginTiers, Market, OrderEntry},
+    types::{AccountUpdateReason, MarginTiers, Market, OrderEntry},
     PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
 
@@ -130,7 +130,7 @@ pub fn fund(ctx: &mut BenchCtx, user: Address, amount: u64) {
     JournalTr::load_account(ctx.journal_mut(), user).unwrap();
     let mut acc = storage::load_account(ctx, user).unwrap();
     acc.credit_perp(amount).unwrap();
-    storage::save_account(ctx, user, acc).unwrap();
+    storage::save_account(ctx, user, acc, AccountUpdateReason::Adjustment).unwrap();
 }
 
 fn place_input(side: u8, price: u64, qty: u64, order_type: u8, tif: u8) -> Vec<u8> {
@@ -859,7 +859,7 @@ fn fund_g<CTX: ContextTr>(ctx: &mut CTX, user: Address, amount: u64) {
     JournalTr::load_account(ctx.journal_mut(), user).unwrap();
     let mut acc = storage::load_account(ctx, user).unwrap();
     acc.credit_perp(amount).unwrap();
-    storage::save_account(ctx, user, acc).unwrap();
+    storage::save_account(ctx, user, acc, AccountUpdateReason::Adjustment).unwrap();
 }
 fn try_place_g<CTX: ContextTr>(
     ctx: &mut CTX, user: Address, side: u8, price: u64, qty: u64, ot: u8, tif: u8,

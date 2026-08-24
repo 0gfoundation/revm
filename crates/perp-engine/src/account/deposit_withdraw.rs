@@ -12,7 +12,7 @@ use crate::{
         transferToPerpCall, withdrawCall, TransferFromPerp, TransferToPerp,
     },
     storage::{self, load_erc20_balance, save_erc20_balance},
-    types::MAX_PERP_WALLET_BALANCE,
+    types::{AccountUpdateReason, MAX_PERP_WALLET_BALANCE},
     PERP_DEX_ADDRESS, USDC_ADDRESS,
     PerpError,
 };
@@ -51,7 +51,10 @@ pub fn run_deposit<H: PerpHost>(
     save_erc20_balance(context, USDC_ADDRESS, caller, user_usdc - amount)?; // 1. debit caller USDC
     save_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS, dex_usdc + amount)?; // 2. credit DEX custody
     account.usdc_balance = new_balance.into(); // 3. credit internal spot balance
-    storage::save_account(context, caller, account)?;
+    // `Deposit`: value crossed the venue boundary — ERC-20 USDC pulled into custody. This is the
+    // DEPOSIT half of the DEPOSIT/WITHDRAW pair (see `AccountUpdateReason`); the spot ↔ perp-wallet
+    // move inside the venue is `AssetTransfer`, not this.
+    storage::save_account(context, caller, account, AccountUpdateReason::Deposit)?;
 
     context.log(Log {
         address: PERP_DEX_ADDRESS,
@@ -97,7 +100,8 @@ pub fn run_withdraw<H: PerpHost>(
 
     // ── APPLY (no logic reject past this point; only DB-error `?`, which aborts the block) ──
     account.usdc_balance = (prev - amount).into(); // 1. debit internal spot balance
-    storage::save_account(context, caller, account)?;
+    // `Withdraw`: value leaves the venue (USDC returned to the caller's ERC-20 balance).
+    storage::save_account(context, caller, account, AccountUpdateReason::Withdraw)?;
     save_erc20_balance(context, USDC_ADDRESS, PERP_DEX_ADDRESS, dex_usdc - amount)?; // 2. debit DEX custody
     save_erc20_balance(context, USDC_ADDRESS, caller, user_usdc + amount)?; // 3. return USDC to caller
 
@@ -135,7 +139,11 @@ pub fn run_transfer_to_perp<H: PerpHost>(
     }
     account.usdc_balance = (spot - amount_u256).into();
     account.credit_perp(amount)?;
-    storage::save_account(context, caller, account)?;
+    // `AssetTransfer`, NOT `MarginTransfer`: this moves the same asset between two WALLETS (the spot
+    // USDC ledger and the perp wallet) and touches no position. `MarginTransfer` is Binance's
+    // isolated-position leg, and `add`/`removePositionMargin` is that operation exactly — see the
+    // `AccountUpdateReason` docs for the full argument.
+    storage::save_account(context, caller, account, AccountUpdateReason::AssetTransfer)?;
 
     context.log(Log {
         address: PERP_DEX_ADDRESS,
@@ -178,7 +186,8 @@ pub fn run_transfer_from_perp<H: PerpHost>(
     account.debit_perp(amount)?;
     let spot: U256 = account.usdc_balance.clone().into();
     account.usdc_balance = (spot + U256::from(amount)).into();
-    storage::save_account(context, caller, account)?;
+    // `AssetTransfer` — the other direction of the same wallet ↔ wallet move; see `transferToPerp`.
+    storage::save_account(context, caller, account, AccountUpdateReason::AssetTransfer)?;
 
     context.log(Log {
         address: PERP_DEX_ADDRESS,

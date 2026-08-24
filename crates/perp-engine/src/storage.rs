@@ -12,9 +12,9 @@ use crate::PERP_DEX_ADDRESS;
 use crate::{
         errors::{perp_err, perp_invariant_err},
     types::{
-        ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market, MarketHot, Order,
-        OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow, UserAccount,
-        UserFeeRates, MAX_USER_MARKETS,
+        AccountUpdateReason, ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market,
+        MarketHot, Order, OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
+        UserAccount, UserFeeRates, MAX_USER_MARKETS,
     },
     PerpError,
 };
@@ -375,7 +375,7 @@ pub fn load_account_ref<H: PerpHost>(
 /// where it owns nothing and every position row it should have carried is an orphan.
 ///
 /// "Everyone else" is what genuinely publishes NO position row: deposit/withdraw/transfer,
-/// `setLeverage`, the fee recipient (an incidental party to a fill rather than a counterparty — one
+/// the fee recipient (an incidental party to a fill rather than a counterparty — one
 /// row per fill for a pure fee sink is noise, and its wallet move is not named by any `Trade` or
 /// `PositionChanged`), and the settled end state of a multi-leg liquidation. Those are legitimate
 /// 0-position groups. The marking rules below are unchanged and still govern the drain.
@@ -388,8 +388,9 @@ pub fn load_account_ref<H: PerpHost>(
 /// |---|---|---|
 /// | [`save_account`] | ✅ | the wallet moved |
 /// | [`mutate_account_balance`] | ✅ | the wallet moved (`credit_perp` / `debit_perp`) |
-/// | [`save_position`] | ✅ | position state moved (`amount`, `v_quote_balance`, `margin`, `leverage`) |
+/// | [`save_position`] | ✅ | position state moved (`amount`, `v_quote_balance`, `margin`) |
 /// | [`save_position_reservation_only`] | ❌ | per-side AGGREGATES only — `Bid`/`Ask`, i.e. `Σ ooIM` |
+/// | [`save_position_leverage_only`] | ❌ | `leverage` only — not a field of this event, and it moves no other |
 /// | [`mutate_account`] | ❌ | nonce bump / fee-rate update; provably cannot move a balance |
 ///
 /// The last two lines are the whole point: **a pure placement and a pure cancel publish NOTHING.**
@@ -501,9 +502,53 @@ pub fn load_account_ref<H: PerpHost>(
 ///
 /// Gas stays FLAT PER SELECTOR — never per event, never dynamic. The per-selector reasoning is on
 /// the `SELECTORS` table in [`crate::call`].
+///
+/// # ── THE REASON IS RECORDED HERE, BECAUSE THE DRAIN CANNOT KNOW IT ────────────────────────────
+///
+/// `AccountBalanceChanged` carries a `reason` ([`AccountUpdateReason`], Binance's
+/// `ACCOUNT_UPDATE.a.m`). The inline publish sites each know their own — they ARE the economic event
+/// — but this mark is the drain's only input, and by the time the drain runs all it has is "this
+/// user moved". So the touched set is `user → reason`, and every one of the three writers below
+/// takes the reason as a REQUIRED parameter: a new write site cannot compile without choosing one,
+/// which is the point (there is no `Default`, no `UNKNOWN`, and no fallback anywhere in this path —
+/// a silently mislabelled reason is worse than no field, because a consumer will trust it).
+///
+/// ## A user marked TWICE in one call, by different causes
+///
+/// The drain publishes ONE row per user for the whole call, so two causes can fold into it. The rule
+/// is [`AccountUpdateReason::merge`]: same reason twice → itself, two different ones →
+/// `Multiple`. Commutative and idempotent, so the label does not depend on mark order.
+///
+/// The conflicts that are actually REACHABLE — a mark only survives to the drain if no direct emit
+/// cleared it (see [`clear_account_snapshot_mark`]), which rules most of them out:
+///
+/// * **The liquidated user, book-leg dust + clearance fee.** A full book close leaves rounding
+///   residue that `trading::liquidation::execute_liquidation_market_order` writes off
+///   (`Adjustment`), and `risk::liquidate_position` then charges the clearance fee to the insurance
+///   fund (`InsuranceClear`). Both are past the close's own emit, so both survive → `Multiple`.
+/// * **The liquidated user, funding + clearance fee.** `risk::liquidate_position` persists the
+///   post-funding position before closing (`FundingFee`). That mark is normally cleared by the
+///   close's emit — but if the book is empty AND the residual is insolvent AND ADL finds no eligible
+///   holder, nothing publishes for her, so the `FundingFee` mark meets the clearance fee's
+///   `InsuranceClear` → `Multiple`.
+/// * **The fee recipient who is also liquidated in the same sweep.** Fee credits during a
+///   `updateIndexPrice` sweep mark the admin `Order` and are never cleared (that is the branch
+///   `a_fee_recipient_who_is_also_a_maker_gets_a_drain_row_for_the_later_fee` exists for); if the
+///   admin also holds a position that the same sweep liquidates, the clearance fee adds
+///   `InsuranceClear` → `Multiple`.
+/// * **A maker who is then liquidated in the same sweep.** Same shape: an uncleared `Order` mark
+///   (the flush's payload-equality gate did not fire) plus a later liquidation leg.
+///
+/// The KNOWN live drain conflict — the fee recipient who is also a maker — is NOT one of them: both
+/// its marks are `Order` (its own fill, and the later `credit_admin` credit), so the merge is a
+/// no-op and the row keeps a truthful `Order`.
 #[inline]
-fn mark_account_snapshot_dirty<H: PerpHost>(context: &mut H, user: Address) {
-    typed_store_mut(context).mark_account_touched(user);
+fn mark_account_snapshot_dirty<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    reason: AccountUpdateReason,
+) {
+    typed_store_mut(context).mark_account_touched(user, reason);
 }
 
 /// Drops `user`'s pending mark, so [`flush_account_snapshots`] will not publish for them.
@@ -550,8 +595,9 @@ pub(crate) fn clear_account_snapshot_mark<H: PerpHost>(context: &mut H, user: Ad
 pub(crate) fn publish_account_snapshot_now<H: PerpHost>(
     context: &mut H,
     user: Address,
+    reason: AccountUpdateReason,
 ) -> Result<(), PerpError> {
-    emit_account_snapshot(context, user)?;
+    emit_account_snapshot(context, user, reason)?;
     clear_account_snapshot_mark(context, user);
     Ok(())
 }
@@ -566,8 +612,9 @@ pub(crate) fn log_account_snapshot<H: PerpHost>(
     context: &mut H,
     user: Address,
     b: &crate::margin_view::AccountWalletBalances,
+    reason: AccountUpdateReason,
 ) {
-    log_account_balance_changed(context, user, b);
+    log_account_balance_changed(context, user, b, reason);
 }
 
 /// Opens a perp call: drops any un-drained marks from a previous call. See
@@ -601,9 +648,11 @@ pub fn begin_perp_call<H: PerpHost>(context: &mut H) {
 /// than through the shell must call this themselves; nothing else does.
 pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpError> {
     // Taken out of the store first: `emit_account_snapshot` borrows `context` mutably for its fold.
+    // The `reason` comes out of the map with the user — recorded at MARKING time, because this loop
+    // has no way to know what moved (see `mark_account_snapshot_dirty`).
     let touched = typed_store_mut(context).take_touched_accounts();
-    for user in touched {
-        emit_account_snapshot(context, user)?;
+    for (user, reason) in touched {
+        emit_account_snapshot(context, user, reason)?;
     }
     Ok(())
 }
@@ -621,10 +670,14 @@ pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpE
 /// too. The two producers must still agree on the fields they share — and now, specifically, the
 /// STORED aggregate must equal the wide fold's WALK; the `debug_assertions` cross-check inside
 /// `index_account_scalars` compares exactly that on every published snapshot.
-fn emit_account_snapshot<H: PerpHost>(context: &mut H, user: Address) -> Result<(), PerpError> {
+fn emit_account_snapshot<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    reason: AccountUpdateReason,
+) -> Result<(), PerpError> {
     let b =
         crate::margin_view::index_account_wallet_balances(context, user, "AccountBalanceChanged")?;
-    log_account_balance_changed(context, user, &b);
+    log_account_balance_changed(context, user, &b, reason);
     Ok(())
 }
 
@@ -637,6 +690,7 @@ fn log_account_balance_changed<H: PerpHost>(
     context: &mut H,
     user: Address,
     b: &crate::margin_view::AccountWalletBalances,
+    reason: AccountUpdateReason,
 ) {
     context.log(primitives::Log {
         address: PERP_DEX_ADDRESS,
@@ -644,6 +698,7 @@ fn log_account_balance_changed<H: PerpHost>(
             use alloy_primitives::IntoLogData;
             crate::interface::IPerpDex::AccountBalanceChanged {
                 user,
+                reason: reason.code(),
                 usdcBalance: b.usdc_balance,
                 totalWalletBalance: b.total_wallet_balance,
                 totalCrossWalletBalance: b.total_cross_wallet_balance,
@@ -677,12 +732,13 @@ pub fn save_account<H: PerpHost>(
     context: &mut H,
     user: Address,
     mut account: UserAccount,
+    reason: AccountUpdateReason,
 ) -> Result<(), PerpError> {
     account.total_position_margin = load_account_ref(context, user)?.total_position_margin;
     typed_store_mut(context).set_account(user, account);
-    // The wallet moved ⇒ one snapshot at the end of the call. Ordering against the write no longer
-    // matters (nothing is folded here); the drain reads the settled store.
-    mark_account_snapshot_dirty(context, user);
+    // The wallet moved ⇒ one snapshot at the end of the call, carrying `reason`. Ordering against
+    // the write no longer matters (nothing is folded here); the drain reads the settled store.
+    mark_account_snapshot_dirty(context, user, reason);
     Ok(())
 }
 
@@ -775,6 +831,7 @@ pub fn mutate_account<H: PerpHost, R>(
 pub fn mutate_account_balance<H: PerpHost, R>(
     context: &mut H,
     user: Address,
+    reason: AccountUpdateReason,
     f: impl FnOnce(&mut UserAccount) -> R,
 ) -> Result<R, PerpError> {
     // No after-image is carried out of here: the drain re-reads the settled store, which is what
@@ -789,7 +846,7 @@ pub fn mutate_account_balance<H: PerpHost, R>(
         typed_store_mut(context).set_account(user, a);
         r
     };
-    mark_account_snapshot_dirty(context, user);
+    mark_account_snapshot_dirty(context, user, reason);
     Ok(r)
 }
 
@@ -930,6 +987,7 @@ pub fn save_position<H: PerpHost>(
     user: Address,
     market_id: u64,
     pos: &PerpPosition,
+    reason: AccountUpdateReason,
 ) -> Result<(), PerpError> {
     // Maintain the per-market open-position registry on an `amount` zero-crossing.
     // save_position is the single choke point for ALL position writes, so this hook
@@ -990,9 +1048,10 @@ pub fn save_position<H: PerpHost>(
     // route, re-opens exactly the drift `margin_view::index_account_scalars`' `debug_assertions`
     // cross-check exists to catch.
     //
-    // Conditional on a non-zero delta so the many saves that move only `amount` / `v_quote_balance` /
-    // `leverage` (e.g. `setLeverage`) do not dirty the account key for a no-op. Deterministic — the
-    // condition is a comparison of two stored integers, identical on every node.
+    // Conditional on a non-zero delta so the many saves that move only `amount` / `v_quote_balance`
+    // do not dirty the account key for a no-op. Deterministic — the condition is a comparison of two
+    // stored integers, identical on every node. (A leverage-only write does not reach here at all
+    // any more; it has [`save_position_leverage_only`].)
     if pos.margin != old_margin {
         let delta = pos
             .margin
@@ -1009,12 +1068,72 @@ pub fn save_position<H: PerpHost>(
             Ok::<(), PerpError>(())
         })??;
     }
-    // Position state moved (`amount` / `v_quote_balance` / `margin` / `leverage`) ⇒ one snapshot at
-    // the end of the call. Binance's `ACCOUNT_UPDATE` carries a `P[]` array for exactly this, and its
-    // own trigger sentence is "since there's no change on positions" — so a change IS the trigger.
+    // Position state moved (`amount` / `v_quote_balance` / `margin`) ⇒ one snapshot at the end of
+    // the call. Binance's `ACCOUNT_UPDATE` carries a `P[]` array for exactly this, and its own
+    // trigger sentence is "since there's no change on positions" — so a change IS the trigger.
     // Aggregates-only writes must NOT come through here; they have
-    // [`save_position_reservation_only`].
-    mark_account_snapshot_dirty(context, user);
+    // [`save_position_reservation_only`], and a leverage-only write has
+    // [`save_position_leverage_only`].
+    mark_account_snapshot_dirty(context, user, reason);
+    Ok(())
+}
+
+/// Position write for the one path that touches ONLY `leverage`: `risk::set_leverage_core`.
+///
+/// # Why this route exists — `setLeverage` moves NOTHING this event publishes
+///
+/// `AccountBalanceChanged` carries three balances: `usdcBalance`, `totalCrossWalletBalance`
+/// (= `perp_wallet_balance`) and `totalWalletBalance` (= that plus `Σ pos.margin`). A leverage
+/// change writes none of them:
+///
+/// * it performs NO account write, so neither `usdc_balance` nor `perp_wallet_balance` can move;
+/// * `risk::rebalance_order_margin_for_leverage` is a pure GATE — it takes `&PerpPosition`, writes
+///   nothing and returns only `Ok`/`Err`, so changing leverage on a LIVE position does **not**
+///   reallocate `pos.margin`; and `save_position`'s `Σ pos.margin` maintenance is conditional on
+///   `pos.margin != old_margin`, which is why it never fired on this path either;
+/// * `leverage` itself is not a field of this event (nor of Binance's `ACCOUNT_UPDATE.a.P[]`, whose
+///   ten fields carry no leverage) — it has its own `LeverageChanged` log.
+///
+/// So routing it through [`save_position`] published a row that was byte-identical to the previous
+/// state: a duplicate with no news in it. The `SELECTORS` note in [`crate::call`] already conceded
+/// as much ("this snapshot carries no CHANGED field"), justifying it as the fail-safe direction. It
+/// is not the fail-safe direction any more, because the row now has to carry a `reason`, and there is
+/// no truthful reason for "nothing changed" — `Multiple`, `ADJUSTMENT` or `ORDER` would each be a
+/// label a consumer would act on. The honest fix is the one a pure placement and a pure cancel
+/// already use: a write route that marks nobody.
+///
+/// This is a STATIC, route-based argument, exactly like [`save_position_reservation_only`]'s — never
+/// a before/after value comparison, which is the machinery `mark_account_snapshot_dirty` deleted for
+/// cost. The `debug_assert`s below are what keep it static: everything except `leverage` must be
+/// unchanged, or this route is being used by a path it does not describe.
+pub fn save_position_leverage_only<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    pos: PerpPosition,
+) -> Result<(), PerpError> {
+    #[cfg(debug_assertions)]
+    {
+        let old = load_position_ref(context, user, market_id)?;
+        let same = |p: &PerpPosition| {
+            (
+                p.amount,
+                p.v_quote_balance,
+                p.margin,
+                p.total_buy_qty,
+                p.total_buy_notional,
+                p.total_sell_qty,
+                p.total_sell_notional,
+            )
+        };
+        debug_assert_eq!(
+            same(&old),
+            same(&pos),
+            "save_position_leverage_only on a path that changed more than `leverage` — this route \
+             marks NOBODY, so any other move would never reach the event stream"
+        );
+    }
+    typed_store_mut(context).set_position(user, market_id, pos);
     Ok(())
 }
 

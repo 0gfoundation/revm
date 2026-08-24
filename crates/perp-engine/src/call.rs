@@ -194,18 +194,23 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getMarginTiersCall::SELECTOR, (5_000, true));
         // Leverage
         //
-        // +10_000 each: `setLeverage` writes the position through `save_position` (a leverage change
-        // rebalances the open-order requirement and moves the initial-margin denominator), so it now
-        // publishes exactly one `AccountBalanceChanged` where it previously published none — it
-        // performs no account write, and the old trigger was the account write alone. That is the
-        // `LeverageChanged` row of `websocket-implementation.md`'s Summary Matrix read the way it is
-        // written: `@account` "No, **unless** margin availability changes", and this changes it.
-        // Priced at the same one-snapshot-fold rate as the other single-emission selectors. NOTE the
-        // narrowed payload makes this snapshot carry no CHANGED field — a leverage change moves no
-        // balance — so it is a redundant-but-harmless publish, which is the documented fail-safe
-        // direction on `storage::mark_account_snapshot_dirty` (position state moved is the trigger;
-        // whether a published field moved with it is not asked, on purpose, because asking would
-        // reintroduce value comparison).
+        // +10_000 each, and it is NO LONGER for a snapshot: `setLeverage` publishes NO
+        // `AccountBalanceChanged` at all.
+        //
+        // The surcharge was added when the trigger widened to the position write, on the grounds that
+        // `setLeverage` "now publishes exactly one". The note added in the same breath conceded the
+        // problem — "the narrowed payload makes this snapshot carry no CHANGED field" — and it was
+        // kept as the fail-safe direction. Adding `reason` removed that option: a row with no changed
+        // field has no truthful reason, and every available label is one a consumer would act on. So
+        // the write now takes `storage::save_position_leverage_only`, which marks nobody, and the
+        // selector is silent for the same reason a pure placement and a pure cancel are — nothing it
+        // can move is in the payload. Full argument on that function.
+        //
+        // The number stays at 30_000 anyway, and not out of inertia:
+        // `risk::rebalance_order_margin_for_leverage` walks the per-user market index on its own
+        // (`margin_view::derived_available_balance_with`), which is exactly the "walks a per-user
+        // list" work this 10_000 tier prices. Dropping it back to 20_000 would weaken a spam brake to
+        // reflect the removal of work that is still being done by a different line.
         m.insert(setLeverageCall::SELECTOR, (30_000, false));
         m.insert(setLeverageSignedCall::SELECTOR, (30_000, false));
         // Trading

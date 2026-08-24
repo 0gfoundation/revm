@@ -41,7 +41,7 @@ use crate::{
     interface::IPerpDex,
     math::{calc_funding_payment, checked_u64_to_i64},
     storage,
-    types::{Market, PerpPosition},
+    types::{AccountUpdateReason, Market, PerpPosition},
     PERP_DEX_ADDRESS,
     PerpError,
 };
@@ -279,7 +279,8 @@ pub(crate) fn apply_funding_settlement<H: PerpHost>(
     // events, so a header emitted at the top of this function would close with ZERO positions and
     // orphan the row below it. Emitting it right here is what makes the pair a group; the payload
     // was captured at compute time (see `PendingFunding::snapshot`).
-    storage::log_account_snapshot(context, p.user, &p.snapshot);
+    // `FundingFee` — Binance's value for exactly this: a funding settlement moved `pos.margin`.
+    storage::log_account_snapshot(context, p.user, &p.snapshot, AccountUpdateReason::FundingFee);
     crate::events::emit_position_changed_at_mark(
         context,
         p.user,

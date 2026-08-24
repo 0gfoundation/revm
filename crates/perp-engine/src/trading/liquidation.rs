@@ -12,7 +12,7 @@ use crate::{
         checked_u64_to_i64,
     },
     storage,
-    types::{Market, Order, OrderKind, OrderStatus, Side},
+    types::{AccountUpdateReason, Market, Order, OrderKind, OrderStatus, Side},
     PERP_DEX_ADDRESS,
     PerpError,
 };
@@ -108,7 +108,19 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         if pos.v_quote_balance != 0 || pos.margin != 0 {
             pos.v_quote_balance = 0;
             pos.margin = 0;
-            storage::save_position(context, user, market.market_id, &pos)?;
+            // `Adjustment`: a protocol-side WRITE-OFF, not the order's fill. The fills themselves
+            // were published by the taker path (`Order`) and that emit cleared the mark; what is left
+            // here is rounding residue going nowhere, so the drain's 0-position group for it is a
+            // forced balance change with no order behind it. When the clearance fee also fires this
+            // merges with its `InsuranceClear` to `Multiple` — see
+            // `storage::mark_account_snapshot_dirty`.
+            storage::save_position(
+                context,
+                user,
+                market.market_id,
+                &pos,
+                AccountUpdateReason::Adjustment,
+            )?;
         }
     }
 
@@ -175,8 +187,21 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
     pos.v_quote_balance = 0;
     pos.margin = 0;
 
-    storage::save_position(context, user, market.market_id, &pos)?;
-    storage::save_account(context, user, account)?;
+    // `Adjustment`: the residual is closed at MARK with no counterparty and no order — nothing was
+    // matched, the protocol simply valued what the book could not absorb and zeroed the position.
+    // (Not `InsuranceClear`, even though the insolvent branch routes a shortfall to the fund: the
+    // solvent branch returns equity to the wallet and touches no fund at all, and one publish site
+    // reporting two different reasons for two branches of the same mechanism would make the field
+    // harder to read, not easier. The `InsuranceFundChanged` / `InsuranceFundDepleted` rows
+    // immediately before this group already say whether the fund was involved.)
+    storage::save_position(
+        context,
+        user,
+        market.market_id,
+        &pos,
+        AccountUpdateReason::Adjustment,
+    )?;
+    storage::save_account(context, user, account, AccountUpdateReason::Adjustment)?;
 
     super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
     // ── The residual close's `ACCOUNT_UPDATE` group: header, then the one position row ──────────
@@ -190,7 +215,7 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
     // afterwards by charging its clearance fee (`save_account`) — the drain then publishes a second,
     // 0-position group for the settled end state. Two pushes for two economic events; that is the
     // fail-safe direction and it is what Binance does for a liquidation too.
-    storage::publish_account_snapshot_now(context, user)?;
+    storage::publish_account_snapshot_now(context, user, AccountUpdateReason::Adjustment)?;
     // `market.mark_price == mark_price` here: `liquidate_position` is the only caller and it takes
     // both from the same re-loaded `Market` (its own `debug_assert_eq!` pins that), so valuing the
     // log at `market`'s mark is valuing it at the mark this close settled against.
@@ -323,8 +348,18 @@ pub(crate) fn run_adl<H: PerpHost>(
         else {
             continue; // no clean (bad-debt-free) fill possible — skip this winner
         };
-        storage::save_position(context, winner, market.market_id, &winner_pos)?;
-        storage::save_account(context, winner, winner_account)?;
+        // `Adjustment` for BOTH ADL legs: a forced trade at the bankruptcy price with no order on
+        // either side. The winner in particular never placed one — candidates holding ANY resting
+        // order are excluded above — and there is no `Trade` row for them either, only `Adl`, so
+        // labelling this `Order` would send a consumer looking for an order id that does not exist.
+        storage::save_position(
+            context,
+            winner,
+            market.market_id,
+            &winner_pos,
+            AccountUpdateReason::Adjustment,
+        )?;
+        storage::save_account(context, winner, winner_account, AccountUpdateReason::Adjustment)?;
         context.log(Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::Adl {
@@ -357,7 +392,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             loser_other_market_margin,
             loser_pos.margin,
         )?;
-        storage::log_account_snapshot(context, loser, &loser_balances);
+        storage::log_account_snapshot(context, loser, &loser_balances, AccountUpdateReason::Adjustment);
         emit_position_changed(
             context,
             loser,
@@ -366,7 +401,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             fill.loser_realized_pnl,
             fill.quantity,
         )?;
-        storage::publish_account_snapshot_now(context, winner)?;
+        storage::publish_account_snapshot_now(context, winner, AccountUpdateReason::Adjustment)?;
         emit_position_changed(
             context,
             winner,
@@ -383,8 +418,14 @@ pub(crate) fn run_adl<H: PerpHost>(
     if did_any {
         // Loser residual reduced by the ADL'd quantity. If fully closed the registry
         // hook drops it; otherwise it stays open and is re-swept next update.
-        storage::save_position(context, loser, market.market_id, &loser_pos)?;
-        storage::save_account(context, loser, loser_account)?;
+        storage::save_position(
+            context,
+            loser,
+            market.market_id,
+            &loser_pos,
+            AccountUpdateReason::Adjustment,
+        )?;
+        storage::save_account(context, loser, loser_account, AccountUpdateReason::Adjustment)?;
         // The two writes above MARK the loser — but they persist EXACTLY the working copies the
         // LAST per-fill header was derived from, so the end-of-call drain would repeat that payload
         // as a 0-position group with no news in it. Clear it. Unconditional is safe here in the way

@@ -14,8 +14,8 @@ use crate::{
     run_perp_dex_call,
     trading::{run_place_order, MAX_LIQUIDATION_MAKER_ACCOUNTS},
     types::{
-        FundingState, IndexPriceHistory, MarginTiers, PerpPosition, PremiumIndexAccumulator,
-        PriceBasisWindow, UserAccount, UserFeeRates,
+        AccountUpdateReason, FundingState, IndexPriceHistory, MarginTiers, PerpPosition,
+        PremiumIndexAccumulator, PriceBasisWindow, UserAccount, UserFeeRates,
     },
     USDC_ADDRESS,
 };
@@ -99,6 +99,7 @@ fn setup_market(ctx: &mut TestCtx) {
             perp_wallet_balance: USER_WALLET as i64,
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     storage::save_account(
@@ -108,6 +109,7 @@ fn setup_market(ctx: &mut TestCtx) {
             perp_wallet_balance: MAKER_WALLET as i64,
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 }
@@ -157,6 +159,7 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
             leverage: 2,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     // Both are registered as open positions (insertion order).
@@ -263,6 +266,7 @@ fn liquidation_matching_caps_distinct_maker_accounts() {
             leverage: 5,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -275,6 +279,7 @@ fn liquidation_matching_caps_distinct_maker_accounts() {
                 perp_wallet_balance: 200_000_000,
                 ..UserAccount::default()
             },
+            AccountUpdateReason::Adjustment,
         )
         .unwrap();
         place_order(&mut ctx, maker, Side::Buy as u8, LONG_LIQ_PRICE, 1);
@@ -322,6 +327,7 @@ fn sweep_liquidates_underwater_user_with_no_free_wallet_for_taker_fee() {
             perp_wallet_balance: 0,
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     storage::save_user_fee_rates(
@@ -378,6 +384,7 @@ fn seed_position_account(
             perp_wallet_balance: wallet,
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     storage::save_position(
@@ -391,6 +398,7 @@ fn seed_position_account(
             leverage,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 }
@@ -1079,6 +1087,7 @@ fn settle_funding_noop_for_flat_position_but_reanchors() {
             leverage: 5,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -1758,6 +1767,7 @@ fn save_position_with_leverage(
             leverage,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 }
@@ -2095,6 +2105,7 @@ fn stage_open_into_tier(ctx: &mut TestCtx, leverage: u64, qty: u64) {
             perp_wallet_balance: 2_000_000_000,
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     set_leverage(ctx, leverage).unwrap();
@@ -2165,6 +2176,7 @@ fn per_open_tier_guard_rejects_the_maker_leg_too() {
             perp_wallet_balance: 2_000_000_000,
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     // MAKER rests at 3x BEFORE the retune (resting itself is never tier-gated).
@@ -2222,6 +2234,7 @@ fn set_leverage_decrease_without_position_tops_up_order_margin() {
             perp_wallet_balance: 500_000_000,
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -2264,6 +2277,7 @@ fn set_leverage_decrease_without_position_rejects_when_order_margin_topup_is_unf
             perp_wallet_balance: 400_000_000,
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -2381,6 +2395,7 @@ fn remove_position_margin_round_trips_at_max_leverage() {
             leverage: 3,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     let wallet_before = wallet(&mut ctx, ALICE);
@@ -2463,6 +2478,7 @@ fn remove_position_margin_settles_pending_funding_first() {
             leverage: 5,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -2967,6 +2983,7 @@ mod value_conservation {
                     taker_fee_bps: 10,
                     ..UserAccount::default()
                 },
+                AccountUpdateReason::Adjustment,
             )
             .unwrap();
         }
@@ -3181,6 +3198,7 @@ mod value_conservation {
                     perp_wallet_balance: SEED_WALLET,
                     ..UserAccount::default()
                 },
+                AccountUpdateReason::Adjustment,
             )
             .unwrap();
             storage::save_position(
@@ -3194,6 +3212,7 @@ mod value_conservation {
                     leverage: 5,
                     ..PerpPosition::default()
                 },
+                AccountUpdateReason::Adjustment,
             )
             .unwrap();
         }
@@ -3295,6 +3314,7 @@ mod value_conservation {
                     perp_wallet_balance: w,
                     ..UserAccount::default()
                 },
+                AccountUpdateReason::Adjustment,
             )
             .unwrap();
         }
@@ -3305,7 +3325,7 @@ mod value_conservation {
         place_order(&mut ctx, maker, 1, ENTRY_PRICE, QTY as u64);
         let mut acc = storage::load_account(&mut ctx, maker).unwrap();
         acc.perp_wallet_balance = opening_margin - 1;
-        storage::save_account(&mut ctx, maker, acc).unwrap();
+        storage::save_account(&mut ctx, maker, acc, AccountUpdateReason::Adjustment).unwrap();
 
         let mark = storage::load_mark_price(&mut ctx, MARKET_ID).unwrap();
         let (c0, a0) = state(&mut ctx);
@@ -4058,6 +4078,7 @@ mod band_expiry {
                 perp_wallet_balance: 100_000_000_000_000, // $100M
                 ..UserAccount::default()
             },
+            AccountUpdateReason::Adjustment,
         )
         .unwrap();
     }
@@ -4713,7 +4734,10 @@ mod band_expiry {
 // that catches a row landing one slot early or one slot late.
 mod account_update_stream {
     use super::*;
-    use crate::events::stream_test_support::{assert_account_update_groups, stream_shape};
+    use crate::events::stream_test_support::{
+        account_update_reasons, assert_account_update_groups, stream_shape,
+    };
+    use crate::types::AccountUpdateReason as R;
 
     /// **A liquidation is SEVERAL `ACCOUNT_UPDATE` pushes, not one settled end state.**
     ///
@@ -4761,6 +4785,110 @@ mod account_update_stream {
                 // 0-position group carrying the debited wallet.
             ],
             "the liquidated user's close is her OWN push — the row must not trail the maker's group"
+        );
+        // Both rows report `ORDER`, and that is not a shortcut: the liquidation close really IS an
+        // order — `execute_liquidation_market_order` builds one and runs it through `match_order`,
+        // so the maker leg and the liquidated user's taker leg are the same code path any fill takes.
+        // Binance reports its own liquidations the same way (their liquidation engine places orders;
+        // their `a.m` vocabulary has no LIQUIDATION value at all).
+        assert_eq!(
+            account_update_reasons(&logs),
+            vec![(MAKER, R::Order), (ALICE, R::Order)],
+        );
+    }
+
+    /// **The clearance fee is `INSURANCE_CLEAR`.** Same fixture as the test above with a non-zero
+    /// `liquidation_fee_rate_bps`, which adds the one leg that test's comment predicts: a 0-position
+    /// drain group for the liquidated user carrying the fee debited to the insurance fund.
+    ///
+    /// `INSURANCE_CLEAR` is assigned by a rule that is checkable rather than a vibe — *the
+    /// counterparty of this wallet move is the insurance fund* — which is why the same value covers
+    /// both directions (`depositInsuranceFund` / `withdrawInsuranceFund` move the admin's wallet
+    /// against the same pot).
+    #[test]
+    fn the_liquidation_clearance_fee_reports_insurance_clear() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        // 5% of the pre-liquidation margin, charged out of ALICE's wallet to the fund.
+        let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+        m.liquidation_fee_rate_bps = 500;
+        storage::save_market(&mut ctx, &m).unwrap();
+        save_position(&mut ctx, QTY, -ENTRY_VALUE);
+        storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
+        place_maker_order(&mut ctx, Side::Buy as u8, LONG_LIQ_PRICE, QTY as u64);
+        let wallet_before = storage::load_account(&mut ctx, ALICE)
+            .unwrap()
+            .perp_wallet_balance;
+        let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        storage::begin_perp_call(&mut ctx);
+        liquidate(&mut ctx, ALICE).unwrap();
+        storage::flush_account_snapshots(&mut ctx).unwrap();
+
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert_account_update_groups(&logs);
+        assert_eq!(
+            account_update_reasons(&logs),
+            vec![
+                (MAKER, R::Order),
+                (ALICE, R::Order),
+                // the drain row: nothing but the clearance fee moved ALICE after her close
+                (ALICE, R::InsuranceClear),
+            ],
+            "the fee leg is its own push, and it names the insurance fund as the counterparty"
+        );
+        // …and the fee was real, so the row is not an artefact of a zero move: 5% of the $200
+        // pre-liquidation margin, capped at the positive wallet, credited to the fund.
+        assert_eq!(
+            storage::load_insurance_fund(&mut ctx).unwrap() - if_before,
+            MARGIN as u64 * 500 / 10_000,
+            "the fund really was credited the clearance fee"
+        );
+        assert!(
+            storage::load_account(&mut ctx, ALICE)
+                .unwrap()
+                .perp_wallet_balance
+                != wallet_before,
+            "…and it came out of ALICE's wallet"
+        );
+    }
+
+    /// **`ADJUSTMENT` for the residual closed at MARK.** The book absorbs half the position and the
+    /// rest is closed at the mark price with no counterparty and no order — so `ORDER` would send a
+    /// consumer looking for an order id and a `Trade` row that do not exist for this leg.
+    #[test]
+    fn a_residual_closed_at_mark_reports_adjustment() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        save_position(&mut ctx, QTY, -ENTRY_VALUE);
+        storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
+        // Only HALF the size is bid for, so the other half becomes the residual. The position is
+        // below maintenance but not bankrupt at this mark, so the residual is SOLVENT and takes the
+        // close-at-mark path rather than ADL.
+        place_maker_order(&mut ctx, Side::Buy as u8, LONG_LIQ_PRICE, QTY as u64 / 2);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        storage::begin_perp_call(&mut ctx);
+        liquidate(&mut ctx, ALICE).unwrap();
+        storage::flush_account_snapshots(&mut ctx).unwrap();
+
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert_account_update_groups(&logs);
+        assert_eq!(
+            position(&mut ctx, ALICE).amount,
+            0,
+            "fixture: the residual really did have to be settled at mark"
+        );
+        assert_eq!(
+            account_update_reasons(&logs),
+            vec![
+                // the book leg, an ordinary fill for both sides
+                (MAKER, R::Order),
+                (ALICE, R::Order),
+                // the residual: valued at mark, no counterparty, no order
+                (ALICE, R::Adjustment),
+            ],
         );
     }
 
@@ -4826,6 +4954,147 @@ mod account_update_stream {
                 ("MarkPriceUpdated", None),
             ],
             "one ADL fill → two pushes, each owning exactly its own party's position row"
+        );
+        // BOTH ADL legs are `ADJUSTMENT`. The winner is the clearer half of the argument: candidates
+        // holding ANY resting order are excluded, so KEEPER provably placed no order, and the only
+        // log naming them is `Adl` — there is no `Trade` row and no order id for a consumer to look
+        // up, which is exactly what `ORDER` would promise.
+        assert_eq!(
+            account_update_reasons(&logs),
+            vec![(ALICE, R::Adjustment), (KEEPER, R::Adjustment)],
+        );
+    }
+
+    /// The admin's own two insurance-fund selectors report `INSURANCE_CLEAR` as well — the same rule
+    /// the clearance fee is assigned by (*the counterparty of this wallet move is the fund*), just
+    /// with the admin on the other end and both directions of it.
+    ///
+    /// Driven directly rather than through the shell, so the call boundary that drains the coalescing
+    /// set is explicit; both selectors produce a plain 0-position group.
+    #[test]
+    fn the_insurance_fund_selectors_report_insurance_clear() {
+        use crate::interface::IPerpDex::{depositInsuranceFundCall, withdrawInsuranceFundCall};
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        // The fund is never written directly (that would be a mint); it is seeded out of the admin's
+        // own perp wallet, which is exactly the move under test.
+        storage::save_account(
+            &mut ctx,
+            ADMIN,
+            UserAccount {
+                perp_wallet_balance: 1_000_000,
+                ..UserAccount::default()
+            },
+            R::Adjustment,
+        )
+        .unwrap();
+
+        for (call, label) in [
+            (depositInsuranceFundCall { amount: 400_000 }.abi_encode(), "deposit"),
+            (
+                withdrawInsuranceFundCall { amount: 400_000 }.abi_encode(),
+                "withdraw",
+            ),
+        ] {
+            let _ = JournalTr::take_logs(ctx.journal_mut());
+            storage::begin_perp_call(&mut ctx);
+            if label == "deposit" {
+                run_deposit_insurance_fund(&call, ADMIN, &mut ctx).unwrap();
+            } else {
+                run_withdraw_insurance_fund(&call, ADMIN, &mut ctx).unwrap();
+            }
+            storage::flush_account_snapshots(&mut ctx).unwrap();
+            let logs = JournalTr::take_logs(ctx.journal_mut());
+            assert_account_update_groups(&logs);
+            assert_eq!(
+                account_update_reasons(&logs),
+                vec![(ADMIN, R::InsuranceClear)],
+                "{label}InsuranceFund moves the admin's wallet against the fund"
+            );
+        }
+    }
+
+    /// **The one genuinely REACHABLE `Multiple`.** The drain publishes one row per user per call, so
+    /// a user moved by two different causes with neither row published inline gets a single row that
+    /// no single label describes — and rather than pick one and lie about the other, it says
+    /// `Multiple`.
+    ///
+    /// This is the funding-plus-clearance-fee shape, and reaching it takes all four legs: ALICE is
+    /// liquidatable, the book is EMPTY (so the close publishes nothing), her residual is INSOLVENT
+    /// (so it takes the ADL path rather than the close-at-mark path, which would have published), and
+    /// no eligible opposite holder exists (so `run_adl` defers and writes nothing). Nothing publishes
+    /// for her — so the `FundingFee` mark from the write that persisted her funding settlement is
+    /// still standing when the clearance fee marks her `InsuranceClear`.
+    ///
+    /// Remove any one leg and the row becomes single-valued, which is the point: `Multiple` is what
+    /// the rule produces in a corner, not a bucket the common paths fall into.
+    #[test]
+    fn two_causes_with_no_inline_emit_collapse_to_multiple() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+        m.liquidation_fee_rate_bps = 500;
+        storage::save_market(&mut ctx, &m).unwrap();
+        // A long that is insolvent at $75 (bankruptcy price $80) with a positive wallet, so the
+        // clearance fee has something to bite. No KEEPER position at all → no ADL candidate.
+        seed_position_account(
+            &mut ctx,
+            ALICE,
+            QTY,
+            -ENTRY_VALUE,
+            MARGIN,
+            5,
+            USER_WALLET as i64,
+        );
+        // An epoch a LONG owes against, so `compute_funding_settlement` really moves `pos.margin`
+        // and `liquidate_position`'s post-funding position write marks her `FundingFee`.
+        storage::save_funding_state(
+            &mut ctx,
+            MARKET_ID,
+            &FundingState {
+                last_funding_rate: 1_000,
+                next_funding_ts: u64::MAX,
+                cumulative_funding_index: ENTRY_PRICE as i128 * 1_000,
+            },
+        )
+        .unwrap();
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        storage::begin_perp_call(&mut ctx);
+        run_update_index_price(
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: 7_500,
+                timestamp: 31,
+            }
+            .abi_encode(),
+            ADMIN,
+            &mut ctx,
+        )
+        .unwrap();
+        storage::flush_account_snapshots(&mut ctx).unwrap();
+
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert_account_update_groups(&logs);
+        assert_ne!(
+            position(&mut ctx, ALICE).amount,
+            0,
+            "fixture: the residual must be left OPEN — an ADL that found a counterparty would have              published inline and cleared the mark"
+        );
+        let reasons = account_update_reasons(&logs);
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|(u, _)| *u == ALICE)
+                .map(|(_, r)| *r)
+                .collect::<Vec<_>>(),
+            vec![
+                // the funding group, published inline by `apply_funding_settlement`…
+                R::FundingFee,
+                // …and the ONE drained row, covering both the funding write and the clearance fee
+                R::Multiple,
+            ],
+            "got {reasons:?}"
         );
     }
 }

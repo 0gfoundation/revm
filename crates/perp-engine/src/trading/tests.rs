@@ -10,7 +10,10 @@ use crate::{
         cancelOrderCall, getMarketFeeTotalCall, getOrderCall, placeOrderCall, AccountBalanceChanged,
     },
     run_perp_dex_call, storage,
-    types::{FundingState, MarginTiers, Market, OrderStatus, PerpPosition, UserFeeRates},
+    types::{
+        AccountUpdateReason, FundingState, MarginTiers, Market, OrderStatus, PerpPosition,
+        UserFeeRates,
+    },
     PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
 
@@ -103,7 +106,7 @@ fn setup(ctx: &mut TestCtx) {
 fn fund(ctx: &mut TestCtx, user: Address, amount: u64) {
     let mut acc = storage::load_account(ctx, user).unwrap();
     acc.credit_perp(amount).unwrap();
-    storage::save_account(ctx, user, acc).unwrap();
+    storage::save_account(ctx, user, acc, AccountUpdateReason::Adjustment).unwrap();
 }
 
 fn wallet(ctx: &mut TestCtx, user: Address) -> u64 {
@@ -210,7 +213,7 @@ fn set_available(ctx: &mut TestCtx, user: Address, target: i64) {
     let current = available(ctx, user);
     let mut acc = storage::load_account(ctx, user).unwrap();
     acc.perp_wallet_balance += (target as i128 - current) as i64;
-    storage::save_account(ctx, user, acc).unwrap();
+    storage::save_account(ctx, user, acc, AccountUpdateReason::Adjustment).unwrap();
     assert_eq!(available(ctx, user), target as i128);
 }
 
@@ -1043,31 +1046,31 @@ fn position_registry_tracks_open_positions() {
     };
 
     // Opening (0 -> !=0) adds to the registry.
-    storage::save_position(&mut ctx, u1, m, &open(5)).unwrap();
+    storage::save_position(&mut ctx, u1, m, &open(5), AccountUpdateReason::Adjustment).unwrap();
     assert_eq!(
         storage::load_position_registry(&mut ctx, m).unwrap(),
         vec![u1]
     );
     // A second holder appends (insertion order preserved).
-    storage::save_position(&mut ctx, u2, m, &open(-3)).unwrap();
+    storage::save_position(&mut ctx, u2, m, &open(-3), AccountUpdateReason::Adjustment).unwrap();
     assert_eq!(
         storage::load_position_registry(&mut ctx, m).unwrap(),
         vec![u1, u2]
     );
     // Same-membership save (amount changes sign but stays !=0, e.g. a flip) — no dup.
-    storage::save_position(&mut ctx, u1, m, &open(-7)).unwrap();
+    storage::save_position(&mut ctx, u1, m, &open(-7), AccountUpdateReason::Adjustment).unwrap();
     assert_eq!(
         storage::load_position_registry(&mut ctx, m).unwrap(),
         vec![u1, u2]
     );
     // Closing (!=0 -> 0) removes, preserving the order of the rest.
-    storage::save_position(&mut ctx, u1, m, &open(0)).unwrap();
+    storage::save_position(&mut ctx, u1, m, &open(0), AccountUpdateReason::Adjustment).unwrap();
     assert_eq!(
         storage::load_position_registry(&mut ctx, m).unwrap(),
         vec![u2]
     );
     // Closing the last holder empties the registry (key deleted).
-    storage::save_position(&mut ctx, u2, m, &open(0)).unwrap();
+    storage::save_position(&mut ctx, u2, m, &open(0), AccountUpdateReason::Adjustment).unwrap();
     assert!(storage::load_position_registry(&mut ctx, m)
         .unwrap()
         .is_empty());
@@ -1479,7 +1482,7 @@ fn maker_open_fill_funds_its_fee_from_margin_needing_no_free_wallet() {
                                                // Exactly the opening margin, nothing spare for a fee.
     let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
     bob.perp_wallet_balance = INIT_MARGIN as i64;
-    storage::save_account(&mut ctx, BOB, bob).unwrap();
+    storage::save_account(&mut ctx, BOB, bob, AccountUpdateReason::Adjustment).unwrap();
 
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // taker buy fills him
 
@@ -1537,7 +1540,7 @@ fn an_unfundable_maker_fill_still_fills_and_the_silo_is_short_not_the_wallet() {
     // fee, a funding charge or an adverse mark move between admission and fill.
     let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
     bob.perp_wallet_balance = INIT_MARGIN as i64 - 1;
-    storage::save_account(&mut ctx, BOB, bob).unwrap();
+    storage::save_account(&mut ctx, BOB, bob, AccountUpdateReason::Adjustment).unwrap();
 
     let taker = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
@@ -1638,7 +1641,7 @@ fn a_short_silo_lowers_the_maintenance_buffer_it_is_measured_against() {
     place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
     let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
     bob.perp_wallet_balance = (INIT_MARGIN - SHORTFALL) as i64;
-    storage::save_account(&mut ctx, BOB, bob).unwrap();
+    storage::save_account(&mut ctx, BOB, bob, AccountUpdateReason::Adjustment).unwrap();
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
     let bob_pos = pos(&mut ctx, BOB);
@@ -1754,11 +1757,12 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
             leverage: 3,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     let mut bob = storage::load_account(&mut ctx, BOB).unwrap();
     bob.perp_wallet_balance = 0;
-    storage::save_account(&mut ctx, BOB, bob).unwrap();
+    storage::save_account(&mut ctx, BOB, bob, AccountUpdateReason::Adjustment).unwrap();
 
     // A pure-reduce sell is free on the derived basis (`|N − Ask| == 0`), so an empty wallet is no
     // obstacle to RESTING it — which is why this state is reachable without any hand-written order.
@@ -1876,6 +1880,7 @@ fn the_k9_maintenance_guard_still_cancels_a_maker_and_the_taker_walks_on() {
             leverage: 1,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -2379,7 +2384,7 @@ fn fill_rejects_when_taker_wallet_cannot_cover_opening_margin() {
 
     let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
     alice.perp_wallet_balance = (INIT_MARGIN - 1) as i64;
-    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+    storage::save_account(&mut ctx, ALICE, alice, AccountUpdateReason::Adjustment).unwrap();
 
     let input = placeOrderCall {
         marketId: MARKET_ID,
@@ -2414,11 +2419,12 @@ fn taker_reverse_uses_released_close_margin_before_opening_margin_check() {
             margin: INIT_MARGIN as i64,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
     alice.perp_wallet_balance = 0;
-    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+    storage::save_account(&mut ctx, ALICE, alice, AccountUpdateReason::Adjustment).unwrap();
 
     place(&mut ctx, BOB, 1, PRICE, QTY * 2, 0, 0); // resting ask
     let market_buy = place(&mut ctx, ALICE, 0, 0, QTY * 2, 1, 1);
@@ -2453,11 +2459,12 @@ fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
             margin: INIT_MARGIN as i64,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
     alice.perp_wallet_balance = 0;
-    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+    storage::save_account(&mut ctx, ALICE, alice, AccountUpdateReason::Adjustment).unwrap();
 
     let close_price = PRICE - 10 * TICK; // $90
     let open_price = PRICE + 10 * TICK; // $110
@@ -2503,6 +2510,7 @@ fn maker_close_emits_fill_realized_pnl() {
             margin: INIT_MARGIN as i64,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -2593,7 +2601,7 @@ fn maker_fill_does_not_auto_expire_remaining_order_under_isolated_margin() {
     bob_pos.amount = QTY as i64;
     bob_pos.v_quote_balance = -(FILL_VALUE as i64);
     bob_pos.leverage = 1;
-    storage::save_position(&mut ctx, BOB, MARKET_ID, &bob_pos).unwrap();
+    storage::save_position(&mut ctx, BOB, MARKET_ID, &bob_pos, AccountUpdateReason::Adjustment).unwrap();
     // Zero wallet, kept deliberately — this is the only low-wallet maker-fill coverage in the file
     // and it is the header's actual subject ("even with a zero wallet"). The new fill-time
     // insolvency gate CANNOT fire here: ALICE's buy closes BOB's long exactly, so
@@ -2602,7 +2610,7 @@ fn maker_fill_does_not_auto_expire_remaining_order_under_isolated_margin() {
     // at any balance, including a negative one (the B1 invariant) — which is what this pins.
     let mut bob_acc = storage::load_account(&mut ctx, BOB).unwrap();
     bob_acc.perp_wallet_balance = 0;
-    storage::save_account(&mut ctx, BOB, bob_acc).unwrap();
+    storage::save_account(&mut ctx, BOB, bob_acc, AccountUpdateReason::Adjustment).unwrap();
 
     let buy_id = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
 
@@ -2641,6 +2649,7 @@ fn underwater_maker_close_routes_bad_debt_to_insurance_fund_not_wallet() {
             leverage: 1,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -3403,7 +3412,7 @@ fn rejected_taker_wallet_cover_emits_no_logs() {
 
     let mut alice = storage::load_account(&mut ctx, ALICE).unwrap();
     alice.perp_wallet_balance = (INIT_MARGIN - 1) as i64;
-    storage::save_account(&mut ctx, ALICE, alice).unwrap();
+    storage::save_account(&mut ctx, ALICE, alice, AccountUpdateReason::Adjustment).unwrap();
     take_event_names(&mut ctx);
 
     let input = placeOrderCall {
@@ -4774,6 +4783,7 @@ fn fill_settles_funding_for_taker_and_maker() {
             leverage: 1,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -9156,7 +9166,7 @@ mod risk_reducing_admission {
     fn set_raw_wallet(ctx: &mut TestCtx, user: Address, v: i64) {
         let mut a = storage::load_account(ctx, user).unwrap();
         a.perp_wallet_balance = v;
-        storage::save_account(ctx, user, a).unwrap();
+        storage::save_account(ctx, user, a, AccountUpdateReason::Adjustment).unwrap();
     }
 
     /// Seed a flat long of `lots` QTY-sized lots opened at PRICE (margin at leverage 1).
@@ -9179,6 +9189,7 @@ mod risk_reducing_admission {
                 leverage: 1,
                 ..PerpPosition::default()
             },
+            AccountUpdateReason::Adjustment,
         )
         .unwrap();
     }
@@ -10869,6 +10880,7 @@ mod derived_ooim_divergence {
                 leverage,
                 ..PerpPosition::default()
             },
+            AccountUpdateReason::Adjustment,
         )
         .unwrap();
     }
@@ -11827,7 +11839,9 @@ mod account_snapshot_events {
     // `assert_account_update_groups` and `stream_shape` live in `crate::events::stream_test_support`
     // — the module that owns the invariant — because `risk::tests` needs them too (the liquidation
     // and ADL streams are asserted there, against the fixtures that already exist there).
-    use crate::events::stream_test_support::{assert_account_update_groups, stream_shape};
+    use crate::events::stream_test_support::{
+        account_update_reasons, assert_account_update_groups, stream_shape,
+    };
 
     // ── ORDERED-STREAM SHAPE: the assembled `ACCOUNT_UPDATE` pushes, not just counts ──────────
     //
@@ -11870,6 +11884,16 @@ mod account_snapshot_events {
                 ("PositionChanged", Some(ALICE)),
             ],
             "each fill is one ACCOUNT_UPDATE for its maker; the taker gets one for the order"
+        );
+        // …and every one of them reports `ORDER`, Binance's reason for a matched order moving money.
+        // Measured R14: a market fill pushes exactly one `ACCOUNT_UPDATE(m=ORDER)`.
+        assert_eq!(
+            account_update_reasons(&logs),
+            vec![
+                (BOB, AccountUpdateReason::Order),
+                (CAROL, AccountUpdateReason::Order),
+                (ALICE, AccountUpdateReason::Order),
+            ],
         );
     }
 
@@ -11929,6 +11953,18 @@ mod account_snapshot_events {
             "funding and the margin add are two economic events → two ACCOUNT_UPDATE pushes; the \
              drain adds nothing (the inline emit cleared the mark)"
         );
+        // Two economic events, two DIFFERENT reasons — and this is the pair that shows the field
+        // earning its keep: both rows are for the same user, both carry the same three balances'
+        // shape, and only `reason` distinguishes "funding took money out of my silo" from "I moved
+        // money into it myself". `MarginTransfer` is Binance's value for their *Modify Isolated
+        // Position Margin*, which is what `addPositionMargin` is.
+        assert_eq!(
+            account_update_reasons(&logs),
+            vec![
+                (ALICE, AccountUpdateReason::FundingFee),
+                (ALICE, AccountUpdateReason::MarginTransfer),
+            ],
+        );
     }
 
     /// **The funding-epoch rollover, REGISTRY path — the subtle one.** A maker's funding is settled
@@ -11981,6 +12017,15 @@ mod account_snapshot_events {
             ],
             "the maker's funding is its own push, ahead of the fill it was settled for"
         );
+        // The maker's funding push is `FUNDING_FEE`; his fill and the taker's order are `ORDER`.
+        assert_eq!(
+            account_update_reasons(&logs),
+            vec![
+                (BOB, AccountUpdateReason::FundingFee),
+                (BOB, AccountUpdateReason::Order),
+                (CAROL, AccountUpdateReason::Order),
+            ],
+        );
     }
 
     /// A second market, so a batch can touch one user across two of them.
@@ -12031,6 +12076,7 @@ mod account_snapshot_events {
                 leverage: 1,
                 ..PerpPosition::default()
             },
+            AccountUpdateReason::Adjustment,
         )
         .unwrap();
     }
@@ -12174,7 +12220,9 @@ mod account_snapshot_events {
         fn published(ctx: &mut TestCtx, user: Address) -> (U256, i64, i64) {
             let _ = JournalTr::take_logs(ctx.journal_mut());
             start_call(ctx);
-            storage::mutate_account_balance(ctx, user, |a| a.credit_perp(0))
+            storage::mutate_account_balance(ctx, user, AccountUpdateReason::Adjustment, |a| {
+                a.credit_perp(0)
+            })
                 .unwrap()
                 .unwrap();
             end_call(ctx);
@@ -12559,10 +12607,14 @@ mod account_snapshot_events {
 
         start_call(&mut ctx);
         // BOB (0x22..) written FIRST, ALICE (0x11..) second.
-        storage::mutate_account_balance(&mut ctx, BOB, |a| a.credit_perp(1))
+        storage::mutate_account_balance(&mut ctx, BOB, AccountUpdateReason::Adjustment, |a| {
+            a.credit_perp(1)
+        })
             .unwrap()
             .unwrap();
-        storage::mutate_account_balance(&mut ctx, ALICE, |a| a.credit_perp(1))
+        storage::mutate_account_balance(&mut ctx, ALICE, AccountUpdateReason::Adjustment, |a| {
+            a.credit_perp(1)
+        })
             .unwrap()
             .unwrap();
         end_call(&mut ctx);
@@ -12577,16 +12629,38 @@ mod account_snapshot_events {
         );
     }
 
-    /// `setLeverage` writes the position (`save_position`) and no account, so under the previous
-    /// "emit at the account write" trigger it published nothing. It publishes one snapshot now — the
-    /// `LeverageChanged` row of the Summary Matrix read as written, `@account` "No, **unless** margin
-    /// availability changes", and a leverage change moves the initial-margin denominator.
+    /// **`setLeverage` publishes NOTHING — and this is the third position that decision has held.**
+    ///
+    /// It used to publish nothing (the trigger was the ACCOUNT write, and `setLeverage` writes only
+    /// the position), then one snapshot (the trigger became the position write too), and now nothing
+    /// again — but for a reason neither of the first two had: **a leverage change cannot move any
+    /// field this event carries.** The assertions below pin both halves, so "publishes nothing" is
+    /// not mimicry, it is *consistent* — exactly the shape of
+    /// [`placement_and_cancel_cannot_move_any_published_field`]:
+    ///
+    /// * no account blob is written, so `usdcBalance` / `totalCrossWalletBalance` cannot move;
+    /// * `risk::rebalance_order_margin_for_leverage` is a pure GATE (it takes `&PerpPosition`), so
+    ///   changing leverage on a LIVE position does not reallocate `pos.margin` and the
+    ///   `Σ pos.margin` half of `totalWalletBalance` is unchanged too;
+    /// * `leverage` is not a field of `AccountBalanceChanged` (nor of Binance's `a.P[]`); it has its
+    ///   own `LeverageChanged`, which IS emitted.
+    ///
+    /// What forced the third flip is `reason`: a row with no changed field has no truthful reason,
+    /// and every available label (`ADJUSTMENT`, `ORDER`, `Multiple`) is one a consumer would act on.
+    /// So the write routes through `storage::save_position_leverage_only`, which marks nobody.
+    ///
+    /// The GAS is deliberately left at 30_000. The surcharge was originally justified by the
+    /// snapshot fold, but `rebalance_order_margin_for_leverage` walks the per-user market index on
+    /// its own (`derived_available_balance_with`), which is the same "walks a per-user list" work the
+    /// surcharge prices — and lowering a DoS brake is not a side effect this change should have.
     #[test]
-    fn set_leverage_publishes_one_snapshot() {
+    fn set_leverage_publishes_no_snapshot() {
         let mut ctx = make_ctx();
         fixture(&mut ctx);
         // The seeded long is leverage 1; raising it is allowed (only REDUCING with an open position
         // is refused).
+        let margin_before = pos(&mut ctx, ALICE).margin;
+        let account_before = storage::load_account(&mut ctx, ALICE).unwrap();
         let _ = JournalTr::take_logs(ctx.journal_mut());
 
         let out = run_perp_dex_call(
@@ -12607,18 +12681,35 @@ mod account_snapshot_events {
             "setLeverage reverted: {:?}",
             String::from_utf8_lossy(&out.bytes)
         );
-        // +10_000 over the base 20_000, at the same one-snapshot-fold rate the other
-        // single-emission selectors pay. (It was +20_000 while the payload carried the whole
-        // eleven-field roll-up and the emit path really ran `index_account_scalars`; the fold behind
-        // the three-balance payload is about half the loads and none of the derived math.)
         assert_eq!(out.gas_used, 30_000);
 
-        let events = take_balance_events(&mut ctx);
-        assert_eq!(
-            events.iter().map(|e| e.user).collect::<Vec<_>>(),
-            vec![ALICE]
+        assert!(
+            take_balance_events(&mut ctx).is_empty(),
+            "a leverage change moves no published field, so it must publish no snapshot"
         );
-        assert_event_matches_get_account(&mut ctx, &events[0]);
+        // …and the call really did something: the leverage moved, and `LeverageChanged` announced it.
+        let after = pos(&mut ctx, ALICE);
+        assert_eq!(after.leverage, 2, "the leverage really did change");
+        // The three legs of "no published field moved", read off state rather than off the event.
+        assert_eq!(
+            after.margin, margin_before,
+            "changing leverage on a LIVE position must not reallocate `pos.margin` — if it ever \
+             does, `totalWalletBalance` moves and this selector owes a snapshot again"
+        );
+        let account_after = storage::load_account(&mut ctx, ALICE).unwrap();
+        assert_eq!(
+            (
+                account_after.usdc_balance.clone(),
+                account_after.perp_wallet_balance,
+                account_after.total_position_margin
+            ),
+            (
+                account_before.usdc_balance.clone(),
+                account_before.perp_wallet_balance,
+                account_before.total_position_margin
+            ),
+            "no account field behind the published payload may move"
+        );
     }
 
     // ── Per-fill for makers, per-order for takers ────────────────────────────────────────────
@@ -12813,6 +12904,24 @@ mod account_snapshot_events {
             "ADMIN twice: once at ADMIN's own fill, once from the drain for BOB's fee — which \
              arrived after that fill's snapshot had already been taken"
         );
+        // ── The KNOWN live drain conflict, and why it is NOT a `Multiple` ────────────────────────
+        //
+        // ADMIN is marked twice here by two different economic events — their own maker fill (the
+        // flush's `save_position` / `save_account`) and BOB's fee credit (`credit_admin`'s
+        // read-through, materialised at the flush) — and the drain publishes ONE row for both. Both
+        // marks carry `Order`, because a trading fee IS money moved by a matched order, so
+        // `AccountUpdateReason::merge` is a no-op and the row keeps a truthful label rather than
+        // degrading to `Multiple`. That is the case the merge rule was checked against first.
+        assert_eq!(
+            account_update_reasons(&logs),
+            vec![
+                (ADMIN, AccountUpdateReason::Order),
+                (BOB, AccountUpdateReason::Order),
+                (ALICE, AccountUpdateReason::Order),
+                (ADMIN, AccountUpdateReason::Order),
+            ],
+            "the fee recipient's drain row reports ORDER — a fee is order-driven money"
+        );
 
         // The two ADMIN rows differ by exactly BOB's maker fee, which is the whole point: the second
         // row carries information the first could not have.
@@ -12928,6 +13037,7 @@ mod position_changed_derived_fields {
                 leverage: 1,
                 ..PerpPosition::default()
             },
+            AccountUpdateReason::Adjustment,
         )
         .unwrap();
         set_mark(ctx, mark);
@@ -12936,7 +13046,7 @@ mod position_changed_derived_fields {
         // The account header the production sites emit before their position row. Without it this
         // helper would publish an ORPHAN `PositionChanged`, which the group guard in `crate::events`
         // rejects — correctly: the derivation under test is only ever reached from inside a group.
-        storage::publish_account_snapshot_now(ctx, ALICE).unwrap();
+        storage::publish_account_snapshot_now(ctx, ALICE, AccountUpdateReason::Adjustment).unwrap();
         crate::events::emit_position_changed(ctx, ALICE, &market, &p, 0, 0).unwrap();
         last_change(ctx, ALICE)
     }

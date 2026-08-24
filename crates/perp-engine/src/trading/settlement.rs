@@ -12,7 +12,7 @@ use crate::{
         max_leverage_for_notional,
     },
     storage,
-    types::{OrderStatus, Side},
+    types::{AccountUpdateReason, OrderStatus, Side},
     PERP_DEX_ADDRESS,
     PerpError,
 };
@@ -552,7 +552,10 @@ pub(super) fn finalize_apply<H: PerpHost>(
     // Debit the taker wallet in place (no UserAccount/String load+save clone pair). pos is already
     // correct in storage (registry flush); cancels saved their own pos updates and the log fields
     // are untouched by cancellations.
-    storage::mutate_account_balance(context, plan.user, |a| a.debit_perp(plan.total_required))??;
+    // `Order`: the taker's margin + fee debit for the order that just matched.
+    storage::mutate_account_balance(context, plan.user, AccountUpdateReason::Order, |a| {
+        a.debit_perp(plan.total_required)
+    })??;
     credit_fee_recipient(context, plan.market_id, plan.fee)?;
 
     // ── ONE account snapshot for the TAKER, for this whole ORDER — the group HEADER ─────────────
@@ -578,7 +581,7 @@ pub(super) fn finalize_apply<H: PerpHost>(
     // are `rest_in_book`'s `save_position_reservation_only` and the nonce's `mutate_account`,
     // neither of which marks). A later batch item, or a later liquidation leg, DOES write, re-marks,
     // and is published again.
-    storage::publish_account_snapshot_now(context, plan.user)?;
+    storage::publish_account_snapshot_now(context, plan.user, AccountUpdateReason::Order)?;
 
     // `market` is the same threaded `Market` whose `mark_price` `finalize_compute` fed to
     // `finalize_core` (`let mark = market.mark_price`), so the log values the taker's post-fill
@@ -778,6 +781,9 @@ pub(super) enum MatchEvent {
     AccountSnapshot {
         user: Address,
         balances: crate::margin_view::AccountWalletBalances,
+        /// Carried alongside the payload for the same reason: the reason belongs to the PUBLISH
+        /// SITE, and the publish site is the walk (`push_maker_snapshot`), not this replay.
+        reason: AccountUpdateReason,
     },
 }
 
@@ -828,8 +834,12 @@ impl MatchRegistry {
             })?;
         let balances = self.users[i].1.wallet_balances()?;
         self.users[i].1.last_published = Some(balances.clone());
-        self.events
-            .push(MatchEvent::AccountSnapshot { user, balances });
+        // `Order`: a maker fill is a matched order moving money, exactly Binance's `ORDER`.
+        self.events.push(MatchEvent::AccountSnapshot {
+            user,
+            balances,
+            reason: AccountUpdateReason::Order,
+        });
         Ok(())
     }
 
@@ -1050,10 +1060,14 @@ impl MatchRegistry {
                         context, market_id, best_bid, best_ask,
                     )?;
                 }
-                MatchEvent::AccountSnapshot { user, balances } => {
+                MatchEvent::AccountSnapshot {
+                    user,
+                    balances,
+                    reason,
+                } => {
                     // Log only — the mark is cleared at the end of the per-user save loop below,
                     // because it is those saves that do the marking.
-                    storage::log_account_snapshot(context, user, &balances);
+                    storage::log_account_snapshot(context, user, &balances, reason);
                 }
                 MatchEvent::Trade {
                     market_id,
@@ -1095,7 +1109,13 @@ impl MatchRegistry {
             let admin = self
                 .fee_admin
                 .ok_or_else(|| perp_invariant_err("pending admin fee credit without an admin"))?;
-            storage::mutate_account_balance(context, admin, |a| a.credit_perp(self.admin_credit_pending))??;
+            // `Order`: a trading-fee credit is money moved by a matched order, and it is the ONLY
+            // thing that moved this account. (This is the mark that survives to the drain for a fee
+            // recipient who is also a maker — both marks are `Order`, so the merge is a no-op and
+            // that row keeps a truthful label.)
+            storage::mutate_account_balance(context, admin, AccountUpdateReason::Order, |a| {
+                a.credit_perp(self.admin_credit_pending)
+            })??;
         }
         // #A: base/price decimals for the reservation-aggregate recompute below — off the threaded
         // `Market` (this used to re-`load_market_ref` for them).
@@ -1152,8 +1172,11 @@ impl MatchRegistry {
             } else {
                 None
             };
-            storage::save_position(context, user, market_id, &w.pos)?;
-            storage::save_account(context, user, w.account)?;
+            // `Order` for every flushed user: each is in this registry because a matched order
+            // touched them (a maker fill, the taker leg of a self-match, or a fill rejected as
+            // opening-into-insolvency whose order was cancelled).
+            storage::save_position(context, user, market_id, &w.pos, AccountUpdateReason::Order)?;
+            storage::save_account(context, user, w.account, AccountUpdateReason::Order)?;
             #[cfg(debug_assertions)]
             {
                 let settled = crate::margin_view::index_account_wallet_balances(
@@ -1782,7 +1805,10 @@ fn credit_fee_recipient<H: PerpHost>(
     // ── APPLY ── (fee-total then account, same order as before). The credit is an in-place mutate
     // (zero-clone on the warm path); it cannot fail now (validated above).
     storage::add_market_fee_total(context, market_id, amount)?;
-    storage::mutate_account_balance(context, admin, |a| a.credit_perp(amount))?
+    // `Order` — see `MatchRegistry::flush`'s pending-credit branch.
+    storage::mutate_account_balance(context, admin, AccountUpdateReason::Order, |a| {
+        a.credit_perp(amount)
+    })?
 }
 
 /// Output of [`split_position_fill`]: the closing and opening legs of a maker

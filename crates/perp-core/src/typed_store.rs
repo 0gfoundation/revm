@@ -30,7 +30,7 @@ use std::vec::Vec;
 use crate::codec::{encode, pack_level, LevelBlob};
 use crate::keys;
 use crate::types::{
-    Market, MarketHot, Order, OrderEntry, PerpPosition, UserAccount,
+    AccountUpdateReason, Market, MarketHot, Order, OrderEntry, PerpPosition, UserAccount,
 };
 use crate::error::PerpError;
 
@@ -188,14 +188,19 @@ pub struct TypedPerpStore {
     /// tx/block boundaries, which never touch it. The precedent is `batch` above: also call-scoped,
     /// also lifecycle-managed by an explicit begin/flush pair rather than by the journal.
     ///
-    /// A `BTreeSet` rather than a `HashSet` so the drain order is ascending ADDRESS order
+    /// A `BTreeMap` rather than a `HashMap` so the drain order is ascending ADDRESS order
     /// structurally — hash-map iteration order would make the log stream (and therefore every
     /// node's receipts) non-deterministic.
+    ///
+    /// The VALUE is the `AccountBalanceChanged.reason` the drained row will carry. It has to be
+    /// recorded HERE, at marking time, because the drain itself cannot know it: by the time it runs,
+    /// all it has is "this user moved". Two marks for one user in one call are joined by
+    /// [`AccountUpdateReason::merge`] — see [`Self::mark_account_touched`].
     ///
     /// Deliberately NOT routed through [`Self::mark`]: it is not a storage key. It enters no dirty
     /// entry, bumps no `write_count`, and sets no `tx_dirty`, so it cannot reach the block delta or
     /// the commitment.
-    touched_accounts: std::collections::BTreeSet<Address>,
+    touched_accounts: std::collections::BTreeMap<Address, AccountUpdateReason>,
 }
 
 impl TypedPerpStore {
@@ -1171,11 +1176,28 @@ impl TypedPerpStore {
         self.touched_accounts.clear();
     }
 
-    /// Marks `user` as owing one account snapshot at the end of the current call. Idempotent — the
-    /// Nth write for the same user costs one `BTreeSet` probe and publishes nothing extra.
+    /// Marks `user` as owing one account snapshot at the end of the current call, carrying the
+    /// `reason` that snapshot will publish. Idempotent in the count — the Nth write for the same
+    /// user costs one `BTreeMap` probe and publishes nothing extra.
+    ///
+    /// # The conflict rule: a commutative JOIN, not first-wins or last-wins
+    ///
+    /// One user can be marked twice in one call by DIFFERENT causes — the reachable cases are
+    /// enumerated on `perp_engine::storage::mark_account_snapshot_dirty` — and the drain publishes
+    /// only one row for them. Picking either cause's label would be a lie about the other, so a
+    /// genuine disagreement collapses to [`AccountUpdateReason::Multiple`].
+    ///
+    /// [`AccountUpdateReason::merge`] is commutative, associative and idempotent, so the label the
+    /// drain publishes does not depend on the ORDER the writes happened to mark in. That is the
+    /// property first-wins/last-wins cannot offer: under either of those, moving a `save_account`
+    /// above a `save_position` — a refactor with no other observable effect, and one this file's
+    /// history contains several of — would silently change a published field.
     #[inline]
-    pub fn mark_account_touched(&mut self, user: Address) {
-        self.touched_accounts.insert(user);
+    pub fn mark_account_touched(&mut self, user: Address, reason: AccountUpdateReason) {
+        self.touched_accounts
+            .entry(user)
+            .and_modify(|r| *r = r.merge(reason))
+            .or_insert(reason);
     }
 
     /// Un-marks `user`: the drain at the end of the call will NOT publish for them.
@@ -1191,9 +1213,12 @@ impl TypedPerpStore {
     }
 
     /// Takes the call's touched set, leaving it empty. Iterating the result yields **ascending
-    /// address order** (`BTreeSet`), which is the drain order the log stream commits to.
+    /// address order** (`BTreeMap`), which is the drain order the log stream commits to; the value
+    /// is the reason that user's drained row must carry.
     #[inline]
-    pub fn take_touched_accounts(&mut self) -> std::collections::BTreeSet<Address> {
+    pub fn take_touched_accounts(
+        &mut self,
+    ) -> std::collections::BTreeMap<Address, AccountUpdateReason> {
         core::mem::take(&mut self.touched_accounts)
     }
 

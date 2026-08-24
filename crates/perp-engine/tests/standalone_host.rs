@@ -6,7 +6,7 @@ use perp_core::compute_block_commitment;
 use perp_engine::{
     interface::IPerpDex::{cancelOrderCall, placeOrderCall},
     run_perp_dex_call, storage,
-    types::{MarginTiers, Market},
+    types::{AccountUpdateReason, MarginTiers, Market},
     InMemoryHost, PerpHost, USDC_ADDRESS,
 };
 use primitives::{address, Address, FixedBytes, U256};
@@ -40,7 +40,7 @@ fn market() -> Market {
 fn fund(host: &mut InMemoryHost, user: Address, amount: u64) {
     let mut acc = storage::load_account(host, user).unwrap();
     acc.credit_perp(amount).unwrap();
-    storage::save_account(host, user, acc).unwrap();
+    storage::save_account(host, user, acc, AccountUpdateReason::Adjustment).unwrap();
 }
 
 fn place(host: &mut InMemoryHost, user: Address, side: u8, price: u64, qty: u64) -> [u8; 32] {

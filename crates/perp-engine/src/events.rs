@@ -306,6 +306,10 @@ pub(crate) mod stream_test_support {
     /// `a_fee_recipient_who_is_also_a_maker_gets_a_drain_row_for_the_later_fee`. Do not delete that
     /// test believing this generic invariant subsumes it.
     pub(crate) fn assert_account_update_groups(logs: &[primitives::Log]) {
+        /// The three BALANCES only — `reason` is deliberately NOT part of the duplicate key, which
+        /// keeps leg 2 as strict as it was: a row that repeats a payload is a duplicate whether or
+        /// not something relabelled it. (Reasons are asserted separately, per stream, by
+        /// [`account_update_reasons`].)
         type Payload = (U256, i64, i64);
         /// One open group: `(user, header log index, its payload, rows attached so far)`.
         type Group = (Address, usize, Payload, usize);
@@ -366,6 +370,34 @@ pub(crate) mod stream_test_support {
             }
         }
         close(open.take(), &mut last);
+    }
+
+    /// The ordered `(subject, reason)` sequence of the `AccountBalanceChanged` headers in a stream —
+    /// i.e. every `ACCOUNT_UPDATE` push this call produced and WHY.
+    ///
+    /// Reasons are asserted on real streams rather than at the encoding layer on purpose: the field
+    /// is only worth anything if the value a production path actually emits is the right one, and
+    /// the drain's value comes from a mark recorded several functions away from the row it labels
+    /// (`storage::mark_account_snapshot_dirty`). `from_code` returning `Option` is load-bearing here
+    /// — a code no build defines fails the `expect` instead of being folded onto a neighbour.
+    pub(crate) fn account_update_reasons(
+        logs: &[primitives::Log],
+    ) -> Vec<(Address, crate::types::AccountUpdateReason)> {
+        logs.iter()
+            .filter(|log| {
+                log.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH)
+            })
+            .map(|log| {
+                let e =
+                    AccountBalanceChanged::decode_raw_log(log.data.topics(), &log.data.data)
+                        .unwrap();
+                (
+                    e.user,
+                    crate::types::AccountUpdateReason::from_code(e.reason)
+                        .expect("AccountBalanceChanged.reason must be a defined wire code"),
+                )
+            })
+            .collect()
     }
 
     /// The ordered `(event name, subject)` sequence of the PerpDEX log stream, for the tests that
@@ -444,6 +476,9 @@ mod group_invariant_self_tests {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::AccountBalanceChanged {
                 user,
+                // Any reason serves here: these self-tests are about the GROUPING, and the reason
+                // is not part of the grouping rule.
+                reason: crate::types::AccountUpdateReason::Order.code(),
                 usdcBalance: primitives::U256::ZERO,
                 totalWalletBalance: wb,
                 totalCrossWalletBalance: wb,

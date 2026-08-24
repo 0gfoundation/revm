@@ -28,7 +28,10 @@ use crate::{
         placeOrderCall,
     },
     run_perp_dex_call, storage,
-    types::{MarginTiers, Market, OrderEntry, PerpPosition, UserAccount, MAX_USER_MARKETS},
+    types::{
+        AccountUpdateReason, MarginTiers, Market, OrderEntry, PerpPosition, UserAccount,
+        MAX_USER_MARKETS,
+    },
     PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
 
@@ -110,7 +113,7 @@ fn setup_a(ctx: &mut TestCtx) {
 fn fund(ctx: &mut TestCtx, user: Address, amount: u64) {
     let mut acc = storage::load_account(ctx, user).unwrap();
     acc.credit_perp(amount).unwrap();
-    storage::save_account(ctx, user, acc).unwrap();
+    storage::save_account(ctx, user, acc, AccountUpdateReason::Adjustment).unwrap();
 }
 
 /// Install a synthetic position. Used where the test only cares about the derived READ; the
@@ -135,6 +138,7 @@ fn set_position(
             leverage,
             ..PerpPosition::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 }
@@ -206,7 +210,7 @@ fn set_orders(
     pos.total_buy_notional = tbn;
     pos.total_sell_qty = tsq;
     pos.total_sell_notional = tsn;
-    storage::save_position(ctx, user, market_id, &pos).unwrap();
+    storage::save_position(ctx, user, market_id, &pos, AccountUpdateReason::Adjustment).unwrap();
 }
 
 /// Read `getMarginInfo` through the FULL call shell in a STATIC context — this is also the
@@ -758,6 +762,7 @@ fn available_balance_is_reported_negative_not_clamped() {
             perp_wallet_balance: -(3 * USD as i64),
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     let a2 = account_margin(&mut ctx2, ALICE, &[MARKET_A]);
@@ -781,6 +786,7 @@ fn cross_wallet_and_margin_balance_are_signed_where_a_clamped_reading_would_not_
             perp_wallet_balance: -(7 * USD as i64),
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
 
@@ -1137,6 +1143,7 @@ fn get_account_reports_a_negative_cross_wallet_unclamped() {
             perp_wallet_balance: -(7 * USD as i64),
             ..UserAccount::default()
         },
+        AccountUpdateReason::Adjustment,
     )
     .unwrap();
     set_position(
@@ -1397,7 +1404,9 @@ fn the_event_and_get_account_agree_field_for_field_on_the_same_state() {
     // shell), so the call boundary — which is what drains the coalescing set — is explicit.
     let _ = JournalTr::take_logs(ctx.journal_mut());
     storage::begin_perp_call(&mut ctx);
-    storage::mutate_account_balance(&mut ctx, ALICE, |a| a.credit_perp(0))
+    storage::mutate_account_balance(&mut ctx, ALICE, AccountUpdateReason::Adjustment, |a| {
+        a.credit_perp(0)
+    })
         .unwrap()
         .unwrap();
     storage::flush_account_snapshots(&mut ctx).unwrap();
@@ -1759,7 +1768,9 @@ fn the_views_write_nothing() {
     //     the drain reads that same account blob and nothing else.
     assert_eq!(
         key_cost(&mut ctx, &mut |ctx| {
-            storage::mutate_account_balance(ctx, ALICE, |a| a.credit_perp(1))
+            storage::mutate_account_balance(ctx, ALICE, AccountUpdateReason::Adjustment, |a| {
+                a.credit_perp(1)
+            })
                 .unwrap()
                 .unwrap()
         }),

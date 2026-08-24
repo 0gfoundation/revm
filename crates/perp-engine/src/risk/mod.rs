@@ -30,8 +30,9 @@ use crate::{
         settle_liquidation_residual_at_mark_price, verify_ed25519,
     },
     types::{
-        CancelReason, FundingState, IndexPriceState, MarginTier, MarginTiers, Market, OrderStatus,
-        PremiumIndexAccumulator, Side, MAX_LEVERAGE_HARD_CAP, MAX_MARGIN_TIERS,
+        AccountUpdateReason, CancelReason, FundingState, IndexPriceState, MarginTier, MarginTiers,
+        Market, OrderStatus, PremiumIndexAccumulator, Side, MAX_LEVERAGE_HARD_CAP,
+        MAX_MARGIN_TIERS,
     },
     PERP_DEX_ADDRESS,
     PerpError,
@@ -553,9 +554,19 @@ fn set_leverage_core<H: PerpHost>(
         ));
     }
 
-    rebalance_order_margin_for_leverage(context, account, &market, &mut pos, leverage)?;
+    // `&pos`, not `&mut pos`: this is a pure GATE. It is why `setLeverage` cannot move `pos.margin`
+    // and therefore publishes no account snapshot — see `storage::save_position_leverage_only`.
+    rebalance_order_margin_for_leverage(context, account, &market, &pos, leverage)?;
     pos.leverage = leverage;
-    storage::save_position(context, account, market_id, &pos)?;
+    // ── `setLeverage` publishes NO `AccountBalanceChanged`, on purpose ──────────────────────────
+    //
+    // The gate above writes nothing (it takes `&PerpPosition`), so `pos.margin` is NOT reallocated
+    // by a leverage change on a live position, and no account blob is written at all — so none of
+    // the three balances this event publishes can move, and `leverage` is not one of its fields
+    // (nor one of Binance's `a.P[]` fields). Routing this through `save_position` therefore
+    // published a row byte-identical to the previous state. Full argument on
+    // `storage::save_position_leverage_only`.
+    storage::save_position_leverage_only(context, account, market_id, pos)?;
 
     context.log(Log {
         address: PERP_DEX_ADDRESS,
@@ -655,8 +666,18 @@ pub fn run_add_position_margin<H: PerpHost>(
     // since both writes are unconditional here. Delta order is irrelevant to the commitment (the
     // block delta is a net key→value map), and `pos.amount` is unchanged so no registry/index hook
     // behaves differently.
-    storage::save_position(context, caller, args.marketId, &pos)?;
-    storage::save_account(context, caller, account)?;
+    // `MarginTransfer` is Binance's value for exactly this operation — their *Modify Isolated
+    // Position Margin*, money moving between the futures wallet and one position's isolated margin.
+    // It is reserved for it: `transferToPerp`/`transferFromPerp` (wallet ↔ wallet) take
+    // `AssetTransfer`.
+    storage::save_position(
+        context,
+        caller,
+        args.marketId,
+        &pos,
+        AccountUpdateReason::MarginTransfer,
+    )?;
+    storage::save_account(context, caller, account, AccountUpdateReason::MarginTransfer)?;
     emit_position_margin_adjusted(context, caller, args.marketId, amount, &pos);
     // The `ACCOUNT_UPDATE` group for this margin move: header immediately before its one position
     // row (`crate::events`). Off the SETTLED store — both writes above have landed and nothing
@@ -666,7 +687,7 @@ pub fn run_add_position_margin<H: PerpHost>(
     // A funding settle earlier in this call published its OWN group (header + row) from
     // `apply_funding_settlement`. Two groups for two economic events is the intent; the
     // `PositionMarginAdjusted` row above sits between them and terminates the first.
-    storage::publish_account_snapshot_now(context, caller)?;
+    storage::publish_account_snapshot_now(context, caller, AccountUpdateReason::MarginTransfer)?;
     // `market` is the Arc loaded at the top of this call; nothing here writes the mark, so
     // `market.mark_price` is the live mark for this transaction.
     emit_position_changed(context, caller, &market, &pos, 0, 0)?;
@@ -752,11 +773,18 @@ pub fn run_remove_position_margin<H: PerpHost>(
         apply_funding_settlement(context, p)?;
     }
     // Position BEFORE account — see `run_add_position_margin` for why.
-    storage::save_position(context, caller, args.marketId, &pos)?;
-    storage::save_account(context, caller, account)?;
+    // `MarginTransfer` — see `run_add_position_margin`; this is the same operation, other direction.
+    storage::save_position(
+        context,
+        caller,
+        args.marketId,
+        &pos,
+        AccountUpdateReason::MarginTransfer,
+    )?;
+    storage::save_account(context, caller, account, AccountUpdateReason::MarginTransfer)?;
     emit_position_margin_adjusted(context, caller, args.marketId, -amount, &pos);
     // Group header — see `run_add_position_margin` for why it sits exactly here.
-    storage::publish_account_snapshot_now(context, caller)?;
+    storage::publish_account_snapshot_now(context, caller, AccountUpdateReason::MarginTransfer)?;
     // `market.mark_price` IS the `mark_price` this call's maintenance gate used — both come from
     // the same `load_market_ref` Arc (`load_mark_price` is `load_market_ref(..).mark_price`).
     emit_position_changed(context, caller, &market, &pos, 0, 0)?;
@@ -843,7 +871,13 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     if let Some(p) = pending_funding {
         apply_funding_settlement(context, p)?;
     }
-    storage::save_position(context, user, market_id, &pos)?;
+    // `FundingFee`: the ONLY thing this write persists is what `compute_funding_settlement` did in
+    // memory — the funding credit/charge on `pos.margin` plus the `last_funding_index` re-anchor.
+    // The close's own legs mark with their own reasons below. Normally superseded: the close
+    // publishes for this user and clears the mark. It survives to the drain only when the close
+    // publishes nothing at all (empty book AND an insolvent residual AND no eligible ADL holder),
+    // where it then meets the clearance fee's `InsuranceClear` and merges to `Multiple`.
+    storage::save_position(context, user, market_id, &pos, AccountUpdateReason::FundingFee)?;
 
     // Cancel all open orders for this user/market (emits OrderCancelled events).
     cancel_all_orders_for_market(context, user, market_id, market)?;
@@ -903,7 +937,9 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         let fee = (fee as u64).min(account.perp_wallet_balance.max(0) as u64);
         if fee > 0 {
             account.debit_perp(fee)?;
-            storage::save_account(context, user, account)?;
+            // `InsuranceClear`: the counterparty of this wallet move IS the insurance fund — the
+            // clearance fee is debited here and credited to the fund two lines below.
+            storage::save_account(context, user, account, AccountUpdateReason::InsuranceClear)?;
             let old_if = storage::load_insurance_fund(context)?;
             let new_if = old_if
                 .checked_add(fee)
@@ -1524,7 +1560,9 @@ pub fn run_deposit_insurance_fund<H: PerpHost>(
         ));
     }
     account.debit_perp(args.amount)?;
-    storage::save_account(context, caller, account)?;
+    // `InsuranceClear` — the admin wallet's counterparty is the insurance fund, same as the
+    // liquidation clearance fee. Only the direction differs.
+    storage::save_account(context, caller, account, AccountUpdateReason::InsuranceClear)?;
 
     let delta = checked_u64_to_i64(args.amount, "depositInsuranceFund: delta")?;
     let old_balance = storage::load_insurance_fund(context)?;
@@ -1573,7 +1611,8 @@ pub fn run_withdraw_insurance_fund<H: PerpHost>(
 
     let mut account = storage::load_account(context, caller)?;
     account.credit_perp(args.amount)?;
-    storage::save_account(context, caller, account)?;
+    // `InsuranceClear` — see `depositInsuranceFund`.
+    storage::save_account(context, caller, account, AccountUpdateReason::InsuranceClear)?;
 
     context.log(Log {
         address: PERP_DEX_ADDRESS,

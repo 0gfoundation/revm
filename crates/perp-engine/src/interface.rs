@@ -886,8 +886,35 @@ sol! {
         /// lives on `getAccount` only. Full citation on `storage::mark_account_snapshot_dirty`, which
         /// is where the filter lives; the agreement between this payload and that trigger is pinned by
         /// `trading::tests::account_snapshot_events::placement_and_cancel_cannot_move_any_published_field`.
+        ///
+        /// ## `reason` — Binance's `a.m`, and WHY it is indexed
+        ///
+        /// `reason` is `AccountUpdateReason` (perp-core `types::account`): 0 = `ORDER`,
+        /// 1 = `FUNDING_FEE`, 2 = `DEPOSIT`, 3 = `WITHDRAW`, 4 = `MARGIN_TRANSFER` (an isolated
+        /// position's margin against the wallet — `add`/`removePositionMargin`), 5 =
+        /// `ASSET_TRANSFER` (`transferToPerp` / `transferFromPerp`, wallet ↔ wallet), 6 =
+        /// `ADJUSTMENT` (protocol-forced, no order: the liquidation residual closed at mark, both
+        /// ADL legs, the post-close dust write-off), 7 = `INSURANCE_CLEAR` (the move settles against
+        /// the insurance fund: the liquidation clearance fee, `deposit`/`withdrawInsuranceFund`).
+        /// **255 = `Multiple`**, which is OURS and not Binance's: the end-of-call drain publishes one
+        /// row per user, so two DIFFERENT causes can fold into it, and rather than pick one label and
+        /// lie about the other the row says "several". Switch on this field with a default branch.
+        ///
+        /// Without it the header says only *that* an account moved, and a consumer had to infer the
+        /// cause from what surrounds the group — "was there a `Trade` just before it, a
+        /// `FundingSettled`, nothing at all". That inference breaks the first time a stream position
+        /// changes, and this ABI's history is largely stream positions changing.
+        ///
+        /// It is **indexed**, spending the third of four topic slots (`user` stays topic[1], so
+        /// nothing that reads the subject positionally moves). The reason is that a `reason` in the
+        /// data half is only filterable client-side, after the log has already been shipped: an
+        /// indexer that wants funding rows only, or an operator watching for `INSURANCE_CLEAR`, can
+        /// now express that as an `eth_getLogs` topic filter. It costs nothing here — this
+        /// precompile's gas is FLAT PER SELECTOR and never per event or per topic (see the
+        /// `SELECTORS` table in `crate::call`), and logs are not part of the perp block commitment.
         event AccountBalanceChanged(
             address indexed user,
+            uint8   indexed reason,
             uint256 usdcBalance,
             int64   totalWalletBalance,
             int64   totalCrossWalletBalance

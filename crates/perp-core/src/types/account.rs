@@ -281,6 +281,127 @@ impl UserAccount {
     }
 }
 
+/// **Why this account update happened** — byte 4 of `AccountBalanceChanged`, and Binance's
+/// `ACCOUNT_UPDATE.a.m`.
+///
+/// Without it the header says only *that* an account moved. A consumer had to infer the cause from
+/// what SURROUNDS the group — "was there a `Trade` just before it, a `FundingSettled`, nothing at
+/// all" — which is exactly the kind of positional inference that breaks the first time a stream
+/// position changes. This field is the attribution, and it is a REQUIRED parameter at every publish
+/// site: there is deliberately no `Default`, no `UNKNOWN`, and no fallback, so a new emit site
+/// cannot compile without choosing.
+///
+/// Numbering follows [`crate::types::CancelReason`]/[`crate::types::OrderStatus`] style — a stable
+/// `u8` wire code, never a string. The codes 0..=7 are the Binance vocabulary values we can
+/// actually produce; `255` is [`Self::Multiple`], the one value that is OURS (see below), parked at
+/// the top of the range so the Binance-aligned block stays contiguous and extensible.
+///
+/// # The mapping to Binance's `a.m` vocabulary
+///
+/// | this | Binance | what produces it here |
+/// |---|---|---|
+/// | [`Self::Order`] | `ORDER` | a matched order moved money: the taker's settlement, each maker fill, the trading fee credited to the fee recipient, and the book leg of a liquidation close (which really is an order — it goes through `match_order`). |
+/// | [`Self::FundingFee`] | `FUNDING_FEE` | a funding settlement moved `pos.margin`. |
+/// | [`Self::Deposit`] | `DEPOSIT` | value entered the venue: ERC-20 USDC pulled into custody. |
+/// | [`Self::Withdraw`] | `WITHDRAW` | value left the venue: USDC returned to the caller. |
+/// | [`Self::MarginTransfer`] | `MARGIN_TRANSFER` | an ISOLATED POSITION's margin moved against the wallet — `addPositionMargin` / `removePositionMargin`. This is what the Binance value means (their *Modify Isolated Position Margin*), and we have exactly that operation, so it is reserved for it. |
+/// | [`Self::AssetTransfer`] | `ASSET_TRANSFER` | an internal wallet-to-wallet move of the same asset that touches no position: `transferToPerp` / `transferFromPerp` (spot USDC ledger ↔ perp wallet). |
+/// | [`Self::Adjustment`] | `ADJUSTMENT` | the protocol moved a position or a balance with NO order of the user's and no transfer: the liquidation residual closed at mark, both ADL legs, and the post-close dust write-off. |
+/// | [`Self::InsuranceClear`] | `INSURANCE_CLEAR` | the counterparty of the wallet move is the INSURANCE FUND: the liquidation clearance fee, and the admin's `depositInsuranceFund` / `withdrawInsuranceFund`. |
+///
+/// `MARGIN_TYPE_CHANGE` is deliberately **absent**: this venue is isolated-margin-only (there is no
+/// cross mode and no selector that could change a margin type), so the value would be one no path
+/// can produce — a hole in the table a consumer could mistake for something meaningful.
+///
+/// ## `transferToPerp` / `transferFromPerp`: `ASSET_TRANSFER`, not `MARGIN_TRANSFER`
+///
+/// Both Binance values describe a transfer, so the question is *which two pots*. Binance's
+/// `MARGIN_TRANSFER` is the isolated-position leg — money moving between the futures wallet and one
+/// position's isolated margin. Our `addPositionMargin` / `removePositionMargin` IS that operation,
+/// field for field, so giving `transferToPerp` the same code would make the one value that has an
+/// exact analogue here ambiguous. `transferToPerp` moves between two WALLETS (the spot USDC ledger
+/// and the perp wallet) and touches no position, which is the `ASSET_TRANSFER` shape. `DEPOSIT` /
+/// `WITHDRAW` are then free to mean what they say — value crossing the venue boundary — which is
+/// the only distinction a consumer of `usdcBalance` actually needs.
+///
+/// # ⚠️ [`Self::Multiple`] is not a default, and not "unknown"
+///
+/// The end-of-call drain publishes ONE row per user for the whole call, so two DIFFERENT causes can
+/// legitimately fold into a single row (see `perp_engine::storage::mark_account_snapshot_dirty`).
+/// Labelling such a row with either cause would be a lie about the other, and a consumer will trust
+/// this field — so a genuine disagreement collapses to `Multiple` via [`Self::merge`], which reads
+/// *"more than one distinct cause moved this account in this call; the payload is the settled
+/// after-image of all of them"*. It is never chosen by a publish site, only reached by merging two
+/// different ones, and merging is COMMUTATIVE and IDEMPOTENT so the result does not depend on write
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum AccountUpdateReason {
+    /// Binance `ORDER`: a matched order moved money.
+    Order = 0,
+    /// Binance `FUNDING_FEE`: a funding settlement.
+    FundingFee = 1,
+    /// Binance `DEPOSIT`: value entered the venue.
+    Deposit = 2,
+    /// Binance `WITHDRAW`: value left the venue.
+    Withdraw = 3,
+    /// Binance `MARGIN_TRANSFER`: an isolated position's margin moved against the wallet.
+    MarginTransfer = 4,
+    /// Binance `ASSET_TRANSFER`: an internal wallet-to-wallet move touching no position.
+    AssetTransfer = 5,
+    /// Binance `ADJUSTMENT`: a protocol-forced position/balance move with no order and no transfer.
+    Adjustment = 6,
+    /// Binance `INSURANCE_CLEAR`: the move settles against the insurance fund.
+    InsuranceClear = 7,
+    /// **OURS, not Binance's.** Two or more distinct causes coalesced into one drained row. See the
+    /// type docs — never chosen by a publish site, only produced by [`Self::merge`].
+    Multiple = 255,
+}
+
+impl AccountUpdateReason {
+    /// The wire code, for the `uint8 reason` topic.
+    #[inline]
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The inverse of [`Self::code`] — a decoder's view of the topic. `None` for any code this
+    /// build does not define, deliberately: there is no catch-all variant to fall back to, and
+    /// silently mapping an unknown byte onto an existing reason is the one failure this field exists
+    /// to prevent.
+    #[inline]
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Order,
+            1 => Self::FundingFee,
+            2 => Self::Deposit,
+            3 => Self::Withdraw,
+            4 => Self::MarginTransfer,
+            5 => Self::AssetTransfer,
+            6 => Self::Adjustment,
+            7 => Self::InsuranceClear,
+            255 => Self::Multiple,
+            _ => return None,
+        })
+    }
+
+    /// Joins two reasons recorded for the SAME user in the same call: the same reason twice is
+    /// itself, two different ones are [`Self::Multiple`].
+    ///
+    /// Commutative, associative and idempotent, which is the property that matters here — the drain
+    /// must publish the same label regardless of the order the writes happened to mark in, and
+    /// "last wins" / "first wins" would both make the published label a function of write ordering
+    /// that a later refactor could silently change.
+    #[inline]
+    pub fn merge(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::Multiple
+        }
+    }
+}
+
 /// Registered ed25519 API key for a user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiKey {
@@ -322,6 +443,69 @@ mod tests {
     /// wallet and still holds the collateral backing every resting order, so the gate is
     /// `margin_view::derived_available_balance` and its `derived_can_afford`. The predicate was
     /// deleted rather than left lying around for someone to reuse.)
+    /// The wire codes are a CONTRACT (they are in an indexed log topic), so they are pinned
+    /// literally rather than derived from the declaration order they happen to have.
+    #[test]
+    fn the_account_update_reason_wire_codes_round_trip() {
+        use AccountUpdateReason::*;
+        for (r, code) in [
+            (Order, 0u8),
+            (FundingFee, 1),
+            (Deposit, 2),
+            (Withdraw, 3),
+            (MarginTransfer, 4),
+            (AssetTransfer, 5),
+            (Adjustment, 6),
+            (InsuranceClear, 7),
+            (Multiple, 255),
+        ] {
+            assert_eq!(r.code(), code, "{r:?}");
+            assert_eq!(AccountUpdateReason::from_code(code), Some(r));
+        }
+        // No catch-all: an undefined byte decodes to `None`, never onto a neighbouring reason.
+        assert_eq!(AccountUpdateReason::from_code(8), None);
+        assert_eq!(AccountUpdateReason::from_code(254), None);
+    }
+
+    /// The drain's conflict rule. The properties that matter are that it is IDEMPOTENT (the common
+    /// case — a user marked twice by the same cause — keeps its truthful label) and COMMUTATIVE (the
+    /// published label cannot depend on the order two writes happened to mark in, which is what
+    /// first-wins/last-wins could not offer).
+    #[test]
+    fn merging_two_reasons_is_a_commutative_join_that_only_collapses_on_disagreement() {
+        use AccountUpdateReason::*;
+        let all = [
+            Order,
+            FundingFee,
+            Deposit,
+            Withdraw,
+            MarginTransfer,
+            AssetTransfer,
+            Adjustment,
+            InsuranceClear,
+            Multiple,
+        ];
+        for a in all {
+            assert_eq!(a.merge(a), a, "idempotent: {a:?}");
+            for b in all {
+                assert_eq!(a.merge(b), b.merge(a), "commutative: {a:?} / {b:?}");
+                if a != b {
+                    assert_eq!(a.merge(b), Multiple, "{a:?} vs {b:?} must not pick a side");
+                }
+                // Associative, over the triples that a call can actually accumulate.
+                for c in all {
+                    assert_eq!(a.merge(b).merge(c), a.merge(b.merge(c)));
+                }
+            }
+        }
+        // The real conflict shapes, spelled out: the liquidated user's dust write-off meeting her
+        // clearance fee, and the fee recipient who is also a maker (whose two marks AGREE, so the
+        // merge is a no-op and that row keeps a truthful `Order`).
+        assert_eq!(Adjustment.merge(InsuranceClear), Multiple);
+        assert_eq!(FundingFee.merge(InsuranceClear), Multiple);
+        assert_eq!(Order.merge(Order), Order);
+    }
+
     #[test]
     fn debit_and_credit_are_pure_ledger_moves_that_allow_a_negative_balance() {
         let mut a = acct(10);
