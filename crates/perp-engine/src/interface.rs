@@ -85,17 +85,21 @@ sol! {
         ///                               account with no positions and no resting orders, in which
         ///                               case every total is 0 and the call still succeeds.
         ///
-        /// ⚠️ `crossUnPnl` AND `maxWithdrawAmount` ARE PRESENT BUT DEGENERATE. Read this before
+        /// ⚠️ `totalCrossUnPnl` AND `maxWithdrawAmount` ARE PRESENT BUT DEGENERATE. Read this before
         /// using either — both were once deliberately omitted, and one of those reasons still bites.
         ///
         /// They are here for RESPONSE-SHAPE COMPATIBILITY: a client written against Binance's
         /// account payload can bind to this selector without a special case. That was an explicit
         /// product decision, taken knowing the objections below.
         ///
-        /// * `crossUnPnl` — ALWAYS EXACTLY ZERO, and permanently so. We are isolated-only; there
-        ///   are no cross positions for it to sum. It is not "zero right now". **Do not build a
-        ///   cross-vs-isolated split on it** — that split does not exist here. All unrealised PnL
+        /// * `totalCrossUnPnl` — ALWAYS EXACTLY ZERO, and permanently so. We are isolated-only;
+        ///   there are no cross positions for it to sum. It is not "zero right now". **Do not build
+        ///   a cross-vs-isolated split on it** — that split does not exist here. All unrealised PnL
         ///   is in `totalUnrealizedProfit`.
+        ///   NAME: this was `crossUnPnl` until the rename below. Binance has BOTH spellings and
+        ///   they live at different levels — `crossUnPnl` on an `assets[]` ROW, `totalCrossUnPnl`
+        ///   as the ACCOUNT-LEVEL scalar. This is the account-level one, so the per-asset spelling
+        ///   was simply wrong. Same class of error as the `walletBalance` collision in §7.1.2.
         /// * `maxWithdrawAmount` — `max(0, availableBalance)`, i.e. the most that
         ///   `transferFromPerp` will let out of the PERP wallet right now.
         ///   ⚠️ **THE NAME IS WRONG FOR OUR TWO-LAYER MODEL AND WE KEPT IT ANYWAY.** `withdraw()`
@@ -136,6 +140,12 @@ sol! {
         ///   GROSS wallet — an error of a full position's margin for anyone comparing them. Both
         ///   selectors now say `totalCrossWalletBalance` for that one quantity, and the gross one is
         ///   only ever `totalWalletBalance`.
+        ///   **We had it a SECOND time and it survived longer:** `getAccount` returned the
+        ///   account-level cross unrealised PnL under `crossUnPnl`, which is Binance's name for the
+        ///   PER-ASSET row; the account-level scalar is `totalCrossUnPnl`. Renamed. It cost nothing
+        ///   here only because the value is structurally zero — the same mistake on a live field is
+        ///   what §7.1.2 is about. When adding a Binance-shaped field, check WHICH LEVEL the name
+        ///   belongs to, not just that Binance uses it somewhere.
         /// * §7.1.3 (v3's `positions[]` reports derived quantities while deleting every input, so a
         ///   caller cannot self-check): WE DO NOT. `marketIds` above plus `getMarginInfo` (whose
         ///   first six returns are the raw inputs `markPrice, positionAmt, vQuoteBalance, leverage,
@@ -153,7 +163,7 @@ sol! {
             uint64   totalOpenOrderInitialMargin,
             uint64   totalMaintMargin,
             int64    availableBalance,
-            int64    crossUnPnl,
+            int64    totalCrossUnPnl,
             uint64   maxWithdrawAmount,
             uint64[] marketIds
         );
