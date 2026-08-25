@@ -18,14 +18,13 @@ use crate::{
     },
     batch,
     errors,
-    margin_view::{run_get_account_margin, run_get_margin_info, run_get_position_risk},
     interface::IPerpDex::{
         addMarketCall, addPositionMarginCall, batchCancelOrdersCall,
         batchCancelOrdersSignedCall, batchPlaceOrdersCall, batchPlaceOrdersSignedCall,
         cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
         getAccountCall, getAccountMarginCall, getAdminCall, getApiKeyCall, getApiKeysCall,
         getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
-        getIndexPriceCall, getInsuranceFundCall, getMarginInfoCall, getMarginTiersCall,
+        getIndexPriceCall, getInsuranceFundCall, getMarginTiersCall,
         getMarkPriceCall, getMarketCall,
         getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
         getOracleAddressCall, getOrderCall, getPositionCall, getPositionRiskCall,
@@ -38,6 +37,7 @@ use crate::{
         transferAdminCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
         updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
     },
+    margin_view::{run_get_account_margin, run_get_position_risk},
     risk::{
         run_add_market, run_add_position_margin, run_deposit_insurance_fund, run_get_admin,
         run_get_average_premium_index, run_get_funding_state, run_get_index_price,
@@ -163,7 +163,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(transferToPerpCall::SELECTOR, (30_000, false));
         m.insert(transferFromPerpCall::SELECTOR, (30_000, false));
         // `getAccount` is the account-level margin roll-up over the per-user market index, so it is
-        // priced in the "walks a per-user list" tier (20_000) alongside `getMarginInfo` /
+        // priced in the "walks a per-user list" tier (20_000) alongside `getPositionRisk` /
         // `getOpenOrders`, NOT the 5_000 scalar-getter tier it used to sit in.
         //
         // The LOADS did not change: at 5_000 it already walked the index through
@@ -180,7 +180,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // FLAT per selector, never per-item — dynamic metering for this precompile was rejected.
         //
         // ⚠️ RE-EXAMINED AND DELIBERATELY LEFT AT 20_000 when the return grew `positions[]` — one
-        // full `getMarginInfo` row per market in place of the bare `uint64[] marketIds`. That is a
+        // full `AccountPosition` row per market in place of the bare `uint64[] marketIds`. That is a
         // real change to what the selector BUYS, so it was decided rather than inherited:
         //
         // * The WALK did not move. Same market set, same `{market, position}` per member, same
@@ -193,17 +193,16 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         //   and returndata gas for it separately, metered by the interpreter, not by us. The
         //   `MAX_USER_MARKETS` = 16 bound is what keeps it a constant rather than a lever.
         // * Raising it would push the wrong way. This shape exists so a backend stops issuing
-        //   `getAccount` + N × `getMarginInfo`; that `1 + N` costs 20_000 + 16 × 20_000 = 340_000 and
+        //   `getAccount` + N × `getPositionRisk`; that `1 + N` costs 20_000 + 16 × 20_000 = 340_000 and
         //   makes the node do ~64 loads instead of ~33 for the SAME answer. Pricing the consolidated
         //   call above the walk it actually performs would tax the cheaper access pattern and subsidise
         //   the more expensive one.
-        // * The pre-existing asymmetry — `getAccount` doing up to 16× `getMarginInfo`'s per-market
+        // * The pre-existing asymmetry — `getAccount` doing up to 16× `getPositionRisk`'s per-market
         //   work at the same flat price — is UNCHANGED by this and is not settled here. It is a
         //   question about the whole "walks a per-user list" tier (`getOpenOrders` / `getBookPrices`
         //   are flat over per-user/per-book lists too), and it should be re-tiered as a tier if it is
         //   re-tiered at all, not opportunistically on the one selector a return-shape change touched.
         //
-        // `getMarginInfo` likewise stays at 20_000: its addition is `entryPrice`, one division.
         //
         // ⚠️ RE-EXAMINED AND LEFT AT 20_000 AGAIN when every `positions[]` row grew
         // `liquidationPrice`. Same argument as the row array itself, one level down: the WALK does
@@ -215,7 +214,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // domain bound and ~64 for the bisection — bounded by MAX_USER_MARKETS = 16 rows, i.e.
         // ~2_048 such iterations worst case against ~33 storage loads. A single load is orders of
         // magnitude more expensive than all of them together, which is the same reasoning that
-        // priced `getPositionRisk` AT `getMarginInfo` rather than above it.
+        // priced `getPositionRisk` AT the tuple selector it replaced rather than above it.
         // Raising it would push the wrong way for the same reason as above, and harder: the whole
         // point of the field being on the row is that a backend rendering N markets stops issuing
         // `getAccount` + N × `getPositionRisk` (20_000 + 16 × 20_000 = 340_000 and ~64 loads) for an
@@ -310,19 +309,19 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // Positions
         m.insert(getPositionCall::SELECTOR, (5_000, true));
         // Derived margin views: pure reads (`can_be_static`). Priced like `getOpenOrders`
-        // (20_000) because `getMarginInfo` walks the same two per-user order lists; the
+        // (20_000) because the per-market row walks the same two per-user order lists; the
         // account roll-up does that once per market id and is bounded by
         // `margin_view::MAX_MARGIN_INFO_MARKETS`.
-        m.insert(getMarginInfoCall::SELECTOR, (20_000, true));
-        // `getPositionRisk` = `getMarginInfo` plus `liquidationPrice`, so it is priced AT
-        // `getMarginInfo`: the load set is identical (one market `_ref`, one position `_ref`, and
-        // in debug the same two order lists), and the liquidation search adds ZERO loads — it
+        //
+        // `getPositionRisk` INHERITED this 20_000 from `getMarginInfo`, the flat-tuple selector it
+        // replaced and which is now deleted. It is a strict superset of that call and priced at it
+        // deliberately: the load set is identical (one market `_ref`, one position `_ref`, and in
+        // debug the same two order lists), and the extra `liquidationPrice` adds ZERO loads — it
         // bisects `is_above_maintenance_margin` over ~64 iterations of a handful of `i128`
         // multiplications plus a walk of the MAX_MARGIN_TIERS = 8 table already resident in the
         // `Market` this call read, and ~64 more for its domain bound. That is orders of magnitude
-        // below the one storage load it does not perform. Pricing it above `getMarginInfo` would
-        // tax the strict superset and subsidise the call a client should be migrating off.
-        // FLAT, per selector.
+        // below one storage load. Pricing the superset above the call it supersedes would have
+        // taxed the only remaining single-market accessor. FLAT, per selector.
         m.insert(getPositionRiskCall::SELECTOR, (20_000, true));
         m.insert(getAccountMarginCall::SELECTOR, (50_000, true));
         // +10_000 each for the single `AccountBalanceChanged` snapshot they emit (see "Account").
@@ -556,7 +555,6 @@ pub fn run_perp_dex_call<H: PerpHost>(
         s if s == getBookLevelCall::SELECTOR => run_get_book_level(input_bytes, context),
         // Positions
         s if s == getPositionCall::SELECTOR => run_get_position(input_bytes, context),
-        s if s == getMarginInfoCall::SELECTOR => run_get_margin_info(input_bytes, context),
         s if s == getPositionRiskCall::SELECTOR => run_get_position_risk(input_bytes, context),
         s if s == getAccountMarginCall::SELECTOR => run_get_account_margin(input_bytes, context),
         s if s == addPositionMarginCall::SELECTOR => {

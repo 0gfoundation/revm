@@ -619,7 +619,7 @@ pub fn run_get_symbol_config<H: PerpHost>(
 
 /// `getPosition(address user, uint64 marketId) returns (int64 amount, int64 vQuoteBalance, int64 margin, uint64 openOrderMargin, uint64 leverage)`
 ///
-/// `openOrderMargin` is DERIVED (`getMarginInfo`'s `openOrderInitialMargin`), not stored: the
+/// `openOrderMargin` is DERIVED (`AccountPosition`'s `openOrderInitialMargin`), not stored: the
 /// escrow field that used to occupy this slot is gone. It needs the market's mark price and
 /// decimals, hence the extra `load_market_ref`; an unknown market yields `0` rather than a revert,
 /// preserving this view's "reads back all zeros for a user with nothing here" behaviour.

@@ -2140,7 +2140,7 @@ fn get_symbol_config_reports_the_band_edge_at_each_leverage() {
 
 /// The tier table is a required input, so an unknown market REVERTS rather than reporting `0` —
 /// which would read as "unbounded" for a market that does not exist. Same shape as
-/// `getMarginTiers` and `getMarginInfo`, deliberately NOT `getPosition`'s all-zeros.
+/// `getMarginTiers` and `getPositionRisk`, deliberately NOT `getPosition`'s all-zeros.
 #[test]
 fn get_symbol_config_rejects_unknown_market() {
     let mut ctx = make_ctx();

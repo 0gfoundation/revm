@@ -20,34 +20,160 @@ sol! {
         function transferToPerp(uint64 amount) external;
         /// Move USDC from the perp trading wallet back to spot balance.
         function transferFromPerp(uint64 amount) external;
-        /// One row of `getAccount`'s `positions[]`: a market id plus the COMPLETE `getMarginInfo`
-        /// for that `(user, marketId)`, `liquidationPrice` included.
+        /// **THE per-market margin row, and the ONLY one.** Binance-shaped, computed on demand,
+        /// stores nothing.
         ///
-        /// Field for field identical to `getMarginInfo`'s return tuple, in the same order, with
-        /// `marketId` prepended and `liquidationPrice` appended — because it IS that value. Both are
-        /// built from the same `margin_view::MarginInfo`, produced by `margin_view::margin_info_of`,
-        /// the single implementation of the per-market margin arithmetic. There is no second
-        /// derivation to drift from, and
-        /// `margin_view_tests::get_account_positions_agree_with_get_margin_info_field_for_field`
-        /// asserts the equality over every market of a live multi-market index rather than trusting
-        /// it.
+        /// # THIS COMMENT IS THE FIELD-BY-FIELD CONTRACT — every surface points here
         ///
-        /// See `getMarginInfo` for the field-by-field contract, the rounding mode of each derived
-        /// value, and the mainnet sample that settled it. `marketId` is the only field with no
-        /// `getMarginInfo` counterpart; `entryPrice` is the field `getMarginInfo` GAINED alongside
-        /// this struct, so that the single-market accessor is not missing something the bulk one has.
+        /// Two selectors return this struct and there is exactly ONE encoder behind both
+        /// (`margin_view::AccountPositionRow::to_abi`), so it is also the one place the fields are
+        /// specified:
         ///
-        /// ⚠️ `liquidationPrice` IS ON THIS ROW ON PURPOSE, AND CLOSES A RACE. See `getPositionRisk`
-        /// for the full contract of the number (it is a SEARCH on the predicate `liquidate()`
-        /// enforces, `0` is the ABSENCE of a price, and the three states `0` collapses). It was
-        /// briefly available ONLY through that per-market selector — which put a backend rendering
-        /// several markets straight back into the `1 + N` straddle this array exists to remove: the
-        /// totals and silos from one block, each market's liquidation price from another. Carrying it
-        /// here makes the whole risk picture ONE read of ONE state. It costs nothing extra: the
-        /// search runs on the tier table and position triple `margin_view::margin_info_of` is
-        /// already holding, so it adds ZERO storage loads to a walk that does not move — only the
-        /// encoded output grows, exactly as when this array replaced `uint64[] marketIds`.
-        /// `getAccount`'s gas is therefore UNCHANGED and still flat.
+        /// * `getPositionRisk(user, marketId)` — ONE row. The single-market accessor, the analogue
+        ///   of Binance's `/positionRisk`.
+        /// * `getAccount(user).positions[]` — one row PER MARKET in the user's index, in ONE call
+        ///   and ONE state. **Prefer it** over `1 + N` reads; see `getAccount` for why `1 + N`
+        ///   cannot be made consistent.
+        ///
+        /// Every field of every row comes from one `margin_view::MarginInfo`, produced by
+        /// `margin_view::margin_info_of` — the single implementation of the per-market margin
+        /// arithmetic. There is no second derivation to drift from and no second encoder to drop a
+        /// field, and `margin_view_tests::get_account_positions_agree_with_get_position_risk_field_for_field`
+        /// asserts the two ACCESS PATHS agree positionally over all 17 numbers, on a live
+        /// multi-market index, rather than trusting it.
+        ///
+        /// ⚠️ **REPLACES `getMarginInfo`**, which returned these same numbers minus `marketId` and
+        /// `liquidationPrice` as a flat tuple, through a second ABI encoder. It is DELETED, not
+        /// deprecated. Migration: `getPositionRisk` for one market, `getAccount` for an account.
+        ///
+        /// Unlike Binance's own `v3 account.positions[]` — which reports `notional`,
+        /// `initialMargin` and `maintMargin` while omitting every input needed to check them (no
+        /// mark, no entry, no leverage, no bid/ask notional), forcing two more endpoint calls — the
+        /// six INPUT fields are returned, so a client can recompute every derived value locally and
+        /// byte-exactly.
+        ///
+        /// Formula source: `misc/binance-margin-verified-model.md` §1.1/§2 and
+        /// `misc/binance-v3-account-balance-field-reference.md` §4 (Binance USDⓈ-M mainnet,
+        /// ISOLATED + ONE-WAY, measured to 8 decimals).
+        ///
+        /// Identity:
+        ///   marketId        which market this row is for. On `getPositionRisk` it echoes the
+        ///                   argument, which is not redundancy: it makes the row SELF-DESCRIBING, so
+        ///                   one row and a row out of `positions[]` are interchangeable to the code
+        ///                   that consumes them.
+        ///
+        /// Inputs:
+        ///   markPrice       market's current mark, in `priceDecimals` fixed-point units.
+        ///   positionAmt     signed net position (base units). Positive = long.
+        ///   vQuoteBalance   virtual quote balance; `entryPrice = -vQuoteBalance / positionAmt`,
+        ///                   and that quotient is also returned outright as `entryPrice` below.
+        ///   leverage        the position's leverage setting (never 0 — floored at 1).
+        ///   bidNotional     `Bid` = Σ over the user's resting BUYS in this market of
+        ///                   `qty × that order's LIMIT price` (NOT mark), each term floored to
+        ///                   quote units exactly as the engine's own aggregate fold floors it.
+        ///                   A LONG order's Assuming Price IS its limit price, so no markup.
+        ///   askNotional     `Ask` = Σ over resting SELLS of `qty × max(T, that order's LIMIT
+        ///                   price)`, where `T = max(ROUND_UP(lastTraded × 1.0015), markPrice)` is
+        ///                   the Assuming-Price floor. A SHORT order resting at or below `T` is
+        ///                   charged at `T`, not at its own price — Binance's vendor Cost formula,
+        ///                   measured on mainnet (run9 admission probes; R10 measured the reported
+        ///                   `askNotional / qty == limit × 1.0015` for a sell resting below `T`).
+        ///                   `T` is resolved ONCE, when the order is placed, and the term is FROZEN
+        ///                   at `max(T, limit)` for that order's whole life — never re-resolved
+        ///                   (MEASURED, R12; `types::OrderEntry::assuming_price`, and see the
+        ///                   `margin_view` module docs). So this field does NOT move with the mark:
+        ///                   it changes only when an order of this user's is placed, cancelled or
+        ///                   filled. Fields DERIVED from it do move with the mark, but through `N`
+        ///                   (the live position notional) — never through this one.
+        ///
+        /// Derived (Binance formulas, Binance rounding):
+        ///   entryPrice            Binance `entryPrice` — the position's volume-weighted average
+        ///                         entry, `-vQuoteBalance / positionAmt` scaled into
+        ///                         `priceDecimals` units. **0 when `positionAmt == 0`** (a flat
+        ///                         position has no entry; it is not a price of zero). Derived, not
+        ///                         stored: `vQuoteBalance` is the accumulated `-(qty × price)` and
+        ///                         this is its per-unit inverse, so the two are consistent by
+        ///                         construction. It comes from `math::calc_entry_price` — the SAME
+        ///                         function the `PositionChanged` event uses for its own
+        ///                         `entryPrice`, so the event and the row agree digit for digit and
+        ///                         there is no second derivation to drift.
+        ///   notional              `trunc(|positionAmt| × markPrice)` — TRUNCATED, and every
+        ///                         field below uses this truncated value, not raw mark.
+        ///   unrealizedProfit      `positionAmt × (markPrice − entryPrice)`, TRUNCATED TOWARD
+        ///                         ZERO (not floor). Computed here as
+        ///                         `signedNotional + vQuoteBalance`, where `signedNotional` is
+        ///                         `notional` carrying `positionAmt`'s sign.
+        ///   isolatedMargin        `isolatedWallet + unrealizedProfit`, where `isolatedWallet` is
+        ///                         the field two below. This is position EQUITY at mark, not a
+        ///                         balance: it may sit below `isolatedWallet`, and it may go
+        ///                         negative.
+        ///   positionInitialMargin `ROUND_UP(notional / leverage)` — ROUND_UP, not truncate.
+        ///   initialMargin         `ROUND_UP( max(|N + Bid|, |N − Ask|) / leverage )` — the
+        ///                         JOINT requirement over position AND resting orders, a genuine
+        ///                         `max()` (neither branch always wins). `N` is the SIGNED
+        ///                         notional: the two branches are "exposure if every buy fills"
+        ///                         and "exposure if every sell fills".
+        ///                         NOTE this deliberately mixes bases — `N` at mark, `Bid` at
+        ///                         limit price, `Ask` at the Assuming Price. That is Binance's
+        ///                         formula, and this row reports Binance's numbers.
+        ///   openOrderInitialMargin  `initialMargin − positionInitialMargin`. Computed as that
+        ///                         DIFFERENCE OF TWO ROUND_UPs, never as a single round-up of a
+        ///                         difference — the convenience form
+        ///                         `ROUND_UP(max(0, Bid, Ask − 2N) / L)` is not equivalent at
+        ///                         1 ulp, because `ceil(a) − ceil(b) != ceil(a − b)`.
+        ///   maintMargin           maintenance margin at `notional` under this market's tier
+        ///                         table (`getMarginTiers`). The tier table affects THIS field
+        ///                         and `liquidationPrice` only — it is NOT an input to
+        ///                         `initialMargin`, which divides by the position's own `leverage`,
+        ///                         uncapped.
+        ///   isolatedWallet        the position's own allocated margin BALANCE — `isolatedMargin`
+        ///                         one level down, before unrealised PnL. The only margin quantity
+        ///                         physically held anywhere: it was moved out of the perp wallet
+        ///                         when the position opened, and it moves only on open /
+        ///                         add-or-remove-margin / close, never with the mark.
+        ///                         `openOrderInitialMargin` by contrast is escrowed NOWHERE — it
+        ///                         is subtracted arithmetically at the admission gate.
+        ///                         WAS named `positionMargin` (ours) until it took Binance's name;
+        ///                         bindings generated before that are looking for the old one.
+        ///   liquidationPrice      the mark price at which this position **IS** liquidatable — for a
+        ///                         LONG the GREATEST such price, for a SHORT the LEAST.
+        ///                         **Conservative by construction: at this price liquidation
+        ///                         FIRES**, and one tick the other way (`+1` for a long, `−1` for a
+        ///                         short) it does not. `0` when there is no such price, which covers
+        ///                         three states — a FLAT position, a fully-funded LONG
+        ///                         (`vQuoteBalance + margin >= 0`, i.e. 1× or lower: as the price
+        ///                         falls both notional and requirement go to zero together, so it
+        ///                         never becomes liquidatable), and a SHORT so small that its
+        ///                         notional cannot outgrow its funding anywhere in the representable
+        ///                         price range. `0` is the ABSENCE of a price, not a price of zero;
+        ///                         `positionAmt` in the same row separates the flat case.
+        ///                         ⚠️ IT IS A SEARCH, NOT A FORMULA, AND THAT IS DELIBERATE.
+        ///                         `math::calc_liquidation_price` bisects
+        ///                         `math::is_above_maintenance_margin` — the predicate `liquidate()`
+        ///                         and the auto-liquidation sweep actually enforce — over the mark
+        ///                         price, which is exact by construction and needs no closed form. A
+        ///                         closed form would have to solve a FIXED POINT (the maintenance
+        ///                         rate depends on the tier, the tier on the notional, the notional
+        ///                         on the price being solved for), reproduce `maintenance_margin`'s
+        ///                         integer SLICE form (whose subtractive twin is off by one at 53.1%
+        ///                         of tier boundaries), and get both signs of a truncate-toward-zero
+        ///                         right. See that function for the monotonicity argument the
+        ///                         bisection rests on.
+        ///                         ⚠️ WHY IT IS ON-CHAIN. It was computed OFF-chain against a flat
+        ///                         1% maintenance ratio while this chain liquidates off the market's
+        ///                         margin-tier table — `1/6` on today's default tier, sixteen times
+        ///                         that rate. Real liquidation therefore fired far earlier than
+        ///                         users were shown. Deriving it here kills the whole class, because
+        ///                         it now comes from the same code path `liquidate()` enforces.
+        ///                         It costs ZERO storage loads: the search runs on the tier table
+        ///                         and the `(amount, vQuote, margin)` triple `margin_info_of` is
+        ///                         already holding, which is why carrying it on every row of the
+        ///                         bulk path left `getAccount`'s flat gas unchanged.
+        ///
+        /// A user with no position and no orders reads back all zeros with `leverage = 1`. Both
+        /// selectors REVERT if the market does not exist — the decimals and the tier table are
+        /// required INPUTS, so a fabricated zero market would report a full row of plausible zeros.
+        /// (`getPosition` differs here on purpose; see it.)
         struct AccountPosition {
             uint64 marketId;         // which market this row is for
             // ── inputs: every field below is recomputable from these six ──
@@ -114,7 +240,7 @@ sol! {
         ///                               `totalWalletBalance + totalUnrealizedProfit`. Total account
         ///                               EQUITY. GROSS-based, so it is NOT
         ///                               `totalCrossWalletBalance + totalUnrealizedProfit`.
-        ///   totalUnrealizedProfit       Σ `getMarginInfo.unrealizedProfit`.
+        ///   totalUnrealizedProfit       Σ `positions[].unrealizedProfit`.
         ///   totalInitialMargin          Σ `initialMargin` (== the next two, summed).
         ///   totalPositionInitialMargin  Σ `positionInitialMargin`.
         ///   totalOpenOrderInitialMargin Σ `openOrderInitialMargin`. Escrowed NOWHERE — derived.
@@ -149,7 +275,7 @@ sol! {
         ///                               name and will not find it.
         ///
         /// ⚠️ WHY THE ROWS ARE IN HERE AND NOT FETCHED PER MARKET: **`1 + N` READS CANNOT BE MADE
-        /// CONSISTENT.** `getAccount` for the totals followed by one `getMarginInfo` per id was the
+        /// CONSISTENT.** `getAccount` for the totals followed by one per-market row call per id was the
         /// only way to assemble a full account picture, and those `N + 1` calls are `N + 1` separate
         /// `eth_call`s that can land on DIFFERENT BLOCKS. The identity
         /// `totalWalletBalance == totalCrossWalletBalance + Σ isolatedWallet` then fails for a
@@ -242,9 +368,9 @@ sol! {
         ///   (`markPrice, positionAmt, vQuoteBalance, leverage, bidNotional, askNotional`), so every
         ///   derived field in the row AND every total above it can be recomputed from this ONE
         ///   response, byte-exactly, with no second call. That round-trip is pinned by
-        ///   `margin_view_tests::get_account_totals_equal_the_sum_of_per_market_get_margin_info`,
+        ///   `margin_view_tests::get_account_totals_equal_the_sum_of_per_market_position_risk`,
         ///   and the rows' agreement with the single-market accessor by
-        ///   `margin_view_tests::get_account_positions_agree_with_get_margin_info_field_for_field`.
+        ///   `margin_view_tests::get_account_positions_agree_with_get_position_risk_field_for_field`.
         function getAccount(address user) external view returns (
             uint256  usdcBalance,
             int64    totalWalletBalance,
@@ -332,11 +458,10 @@ sol! {
         /// constants. Reverts if the market does not exist.
         ///
         ///   leverage          the position's `leverage` setting, `1` when unset — the same
-        ///                     floored value `getPosition`, `getMarginInfo` and
-        ///                     `getAccount().positions[]` report, so this selector cannot disagree
+        ///                     floored value `getPosition` and every `AccountPosition` row report, so this selector cannot disagree
         ///                     with them about which leverage is in force.
         ///   maxNotionalValue  the largest `|notional|` (quote units, at MARK, the same basis
-        ///                     `getMarginInfo.notional` reports) the tier table admits while
+        ///                     `AccountPosition.notional` reports) the tier table admits while
         ///                     `leverage` is in force: the upper bound of the highest tier whose
         ///                     `maxLeverage` is still `>= leverage`. **`0` MEANS UNBOUNDED** — that
         ///                     tier is the last one and its band runs to infinity. Every market
@@ -486,7 +611,7 @@ sol! {
         /// Query a user's perpetual position in a market.
         ///
         /// `openOrderMargin` is the DERIVED open-order requirement this position's resting orders
-        /// add — `getMarginInfo`'s `openOrderInitialMargin`, repeated here so the common
+        /// add — `AccountPosition`'s `openOrderInitialMargin`, repeated here so the common
         /// "position + what its orders cost me" query is one call. It occupies the slot the old
         /// `marginReserved` escrow field had, and answers the same question, but nothing is
         /// escrowed: it is recomputed from `(N, Bid, Ask, L)` on every read and moves when the
@@ -508,122 +633,14 @@ sol! {
         // `buy/sell_side_reserved_notional`) are deleted, and nothing is debited from the wallet
         // when an order rests.
         //
-        // These two views therefore report the numbers the ENGINE ITSELF enforces — there is one
+        // These views therefore report the numbers the ENGINE ITSELF enforces — there is one
         // ooIM definition, not a reported one and an enforced one. They move no money and write
         // no storage.
         //
-        // Formula source: `misc/binance-margin-verified-model.md` §1.1/§2 and
-        // `misc/binance-v3-account-balance-field-reference.md` §4 (Binance USDⓈ-M mainnet,
-        // ISOLATED + ONE-WAY, measured to 8 decimals).
-
-        /// Binance-shaped margin report for one `(user, marketId)`, computed on demand.
-        ///
-        /// Unlike Binance's own `v3 account.positions[]` — which reports `notional`,
-        /// `initialMargin` and `maintMargin` while omitting every input needed to check them
-        /// (no mark, no entry, no leverage, no bid/ask notional), forcing two more endpoint
-        /// calls — the first six returns are the INPUTS, so a client can recompute all eight
-        /// derived values locally and byte-exactly.
-        ///
-        /// This is the SINGLE-MARKET accessor — the analogue of Binance's `/positionRisk`. For a
-        /// whole account, `getAccount` returns one `AccountPosition` row per market with exactly
-        /// these fields (plus `marketId`) in ONE call and ONE state; prefer it over `1 + N` reads.
-        /// Both are built from the same `margin_view::MarginInfo`, so they cannot disagree.
-        ///
-        /// Inputs:
-        ///   markPrice       market's current mark, in `priceDecimals` fixed-point units.
-        ///   positionAmt     signed net position (base units). Positive = long.
-        ///   vQuoteBalance   virtual quote balance; `entryPrice = -vQuoteBalance / positionAmt`,
-        ///                   and that quotient is now returned outright as `entryPrice` below.
-        ///   leverage        the position's leverage setting (never 0 — floored at 1).
-        ///   bidNotional     `Bid` = Σ over the user's resting BUYS in this market of
-        ///                   `qty × that order's LIMIT price` (NOT mark), each term floored to
-        ///                   quote units exactly as the engine's own aggregate fold floors it.
-        ///                   A LONG order's Assuming Price IS its limit price, so no markup.
-        ///   askNotional     `Ask` = Σ over resting SELLS of `qty × max(T, that order's LIMIT
-        ///                   price)`, where `T = max(ROUND_UP(lastTraded × 1.0015), markPrice)` is
-        ///                   the Assuming-Price floor. A SHORT order resting at or below `T` is
-        ///                   charged at `T`, not at its own price — Binance's vendor Cost formula,
-        ///                   measured on mainnet (run9 admission probes; R10 measured the reported
-        ///                   `askNotional / qty == limit × 1.0015` for a sell resting below `T`).
-        ///                   `T` is resolved ONCE, when the order is placed, and the term is FROZEN
-        ///                   at `max(T, limit)` for that order's whole life — never re-resolved
-        ///                   (MEASURED, R12; `types::OrderEntry::assuming_price`, and see the
-        ///                   `margin_view` module docs). So this field does NOT move with the mark:
-        ///                   it changes only when an order of this user's is placed, cancelled or
-        ///                   filled. Fields DERIVED from it do move with the mark, but through `N`
-        ///                   (the live position notional) — never through this one.
-        ///
-        /// Derived (Binance formulas, Binance rounding):
-        ///   entryPrice            Binance `entryPrice` — the position's volume-weighted average
-        ///                         entry, `-vQuoteBalance / positionAmt` scaled into
-        ///                         `priceDecimals` units. **0 when `positionAmt == 0`** (a flat
-        ///                         position has no entry; it is not a price of zero). Derived, not
-        ///                         stored: `vQuoteBalance` is the accumulated `-(qty × price)` and
-        ///                         this is its per-unit inverse, so the two are consistent by
-        ///                         construction. It comes from `math::calc_entry_price` — the SAME
-        ///                         function the `PositionChanged` event uses for its own
-        ///                         `entryPrice`, so the event and both views agree digit for digit
-        ///                         and there is no second derivation to drift.
-        ///                         ADDED with `getAccount`'s `positions[]`, which carries this field
-        ///                         per row: leaving it off the single-market accessor would have
-        ///                         made the bulk call the only way to read it.
-        ///   notional              `trunc(|positionAmt| × markPrice)` — TRUNCATED, and every
-        ///                         field below uses this truncated value, not raw mark.
-        ///   unrealizedProfit      `positionAmt × (markPrice − entryPrice)`, TRUNCATED TOWARD
-        ///                         ZERO (not floor). Computed here as
-        ///                         `signedNotional + vQuoteBalance`, where `signedNotional` is
-        ///                         `notional` carrying `positionAmt`'s sign.
-        ///   isolatedMargin        `isolatedWallet + unrealizedProfit`, where `isolatedWallet` is
-        ///                         the last return below. This is position EQUITY at mark, not a
-        ///                         balance: it may sit below `isolatedWallet`, and it may go
-        ///                         negative.
-        ///   positionInitialMargin `ROUND_UP(notional / leverage)` — ROUND_UP, not truncate.
-        ///   initialMargin         `ROUND_UP( max(|N + Bid|, |N − Ask|) / leverage )` — the
-        ///                         JOINT requirement over position AND resting orders, a genuine
-        ///                         `max()` (neither branch always wins). `N` is the SIGNED
-        ///                         notional: the two branches are "exposure if every buy fills"
-        ///                         and "exposure if every sell fills".
-        ///                         NOTE this deliberately mixes bases — `N` at mark, `Bid` at
-        ///                         limit price, `Ask` at the Assuming Price. That is Binance's
-        ///                         formula, and this view reports Binance's numbers.
-        ///   openOrderInitialMargin  `initialMargin − positionInitialMargin`. Computed as that
-        ///                         DIFFERENCE OF TWO ROUND_UPs, never as a single round-up of a
-        ///                         difference — the convenience form
-        ///                         `ROUND_UP(max(0, Bid, Ask − 2N) / L)` is not equivalent at
-        ///                         1 ulp, because `ceil(a) − ceil(b) != ceil(a − b)`.
-        ///   maintMargin           maintenance margin at `notional` under this market's tier
-        ///                         table (`getMarginTiers`). The tier table affects THIS field
-        ///                         only — it is NOT an input to `initialMargin`, which divides
-        ///                         by the position's own `leverage`, uncapped.
-        ///   isolatedWallet        the position's own allocated margin BALANCE — `isolatedMargin`
-        ///                         one level down, before unrealised PnL. The only margin quantity
-        ///                         physically held anywhere: it was moved out of the perp wallet
-        ///                         when the position opened, and it moves only on open /
-        ///                         add-or-remove-margin / close, never with the mark.
-        ///                         `openOrderInitialMargin` by contrast is escrowed NOWHERE — it
-        ///                         is subtracted arithmetically at the admission gate.
-        ///                         WAS named `positionMargin` (ours) until it took Binance's name;
-        ///                         bindings generated before that are looking for the old one.
-        ///
-        /// Reverts if the market does not exist. A user with no position and no orders reads
-        /// back all zeros with `leverage = 1`.
-        function getMarginInfo(address user, uint64 marketId) external view returns (
-            uint64 markPrice,
-            int64  positionAmt,
-            int64  vQuoteBalance,
-            uint64 leverage,
-            uint64 bidNotional,
-            uint64 askNotional,
-            uint64 entryPrice,
-            uint64 notional,
-            int64  unrealizedProfit,
-            int64  isolatedMargin,
-            uint64 positionInitialMargin,
-            uint64 openOrderInitialMargin,
-            uint64 initialMargin,
-            uint64 maintMargin,
-            int64  isolatedWallet
-        );
+        // The per-market row they report is `AccountPosition`, and ITS doc comment is the
+        // field-by-field contract (formula source included) for every field in this section.
+        // `getPositionRisk` returns one row; `getAccount` returns one per market. `getMarginInfo`
+        // used to return the same numbers as a flat tuple through a second encoder and is DELETED.
 
         /// The full Binance `/positionRisk` row for one `(user, marketId)` — returned as ONE
         /// [`AccountPosition`], the very struct `getAccount().positions[]` is an array of.
@@ -636,10 +653,10 @@ sol! {
         /// There is now exactly one — `margin_view::AccountPositionRow::to_abi` — reached by both
         /// the single-market and the bulk path.
         ///
-        /// So read [`AccountPosition`] for the field list, and `getMarginInfo` for the field-by-field
-        /// contract and the rounding mode of each derived value. Nothing is recomputed per surface:
-        /// every field comes from ONE `margin_view::MarginInfo` produced by ONE
-        /// `margin_view::margin_info_of` call, `liquidationPrice` included.
+        /// So read [`AccountPosition`] — that comment IS the field-by-field contract, including the
+        /// rounding mode of every derived value. Nothing is recomputed per surface: every field comes
+        /// from ONE `margin_view::MarginInfo` produced by ONE `margin_view::margin_info_of` call,
+        /// `liquidationPrice` included.
         ///
         /// `marketId` is now returned, and it is deliberately not "redundant with the argument": it
         /// makes the row SELF-DESCRIBING, so a caller can hand it to the same code that consumes a
@@ -677,21 +694,20 @@ sol! {
         /// It costs no storage loads at all — the whole search runs on values this call already
         /// read.
         ///
-        /// Reverts if the market does not exist, exactly as `getMarginInfo` does. Note this is
-        /// UNLIKE `getPosition`, which reports all-zeros for an unknown market: the decimals and the
-        /// tier table are required INPUTS here, so a fabricated zero market would report a full row
-        /// of plausible zeros.
+        /// Reverts if the market does not exist. Note this is UNLIKE `getPosition`, which reports
+        /// all-zeros for an unknown market: the decimals and the tier table are required INPUTS here,
+        /// so a fabricated zero market would report a full row of plausible zeros.
         ///
-        /// ⚠️ `getMarginInfo` IS NOT DELETED and keeps working unchanged. This is a strict
-        /// superset of it, so new code should prefer THIS selector. A backend rendering SEVERAL
-        /// markets should prefer neither: `getAccount().positions[]` now carries `liquidationPrice`
-        /// on every row, so the whole risk picture is one read of one state and this selector is for
-        /// the genuinely single-market query.
+        /// ⚠️ **THIS SELECTOR REPLACED `getMarginInfo`, WHICH IS DELETED.** It is a strict superset:
+        /// the same fifteen numbers, plus `marketId` and `liquidationPrice`, in a struct instead of a
+        /// tuple. A backend rendering SEVERAL markets should use neither — `getAccount().positions[]`
+        /// carries this identical row for every market in ONE state, so this selector is for the
+        /// genuinely single-market query.
         function getPositionRisk(address user, uint64 marketId) external view returns (
             AccountPosition position
         );
 
-        /// Account-level roll-up of [`getMarginInfo`] over an EXPLICIT list of markets.
+        /// Account-level roll-up of [`AccountPosition`] over an EXPLICIT list of markets.
         ///
         /// **Prefer `getAccount`** unless you specifically want a SUBSET: it takes no list, walks
         /// the per-user market index itself, and its totals are therefore complete. This selector
@@ -791,7 +807,7 @@ sol! {
         /// REST-only, on this selector and `getAccount`; see the note on `AccountBalanceChanged` for
         /// why a stream cannot keep them fresh.
         ///
-        /// Like `getMarginInfo` this is a pure read: it stores nothing and moves no money.
+        /// Like every selector in this section this is a pure read: it stores nothing and moves no money.
         function getAccountMargin(address user, uint64[] marketIds) external view returns (
             int64  totalCrossWalletBalance,
             int64  crossMarginBalance,
@@ -1232,7 +1248,7 @@ sol! {
         ///                     CURRENT mark, computed as `signedNotional + vQuoteBalance` so the
         ///                     only rounding in it is the truncation already inside
         ///                     `signedNotional`. This is the SAME quantity, under the same
-        ///                     lowercase-`r` spelling, that `getMarginInfo` returns — there is one
+        ///                     lowercase-`r` spelling, that an `AccountPosition` row carries — there is one
         ///                     definition of it in the engine (`margin_view::position_margin_info`)
         ///                     and this field reuses it rather than re-deriving from `entryPrice`,
         ///                     which would round twice.

@@ -11772,28 +11772,21 @@ mod assuming_price {
         run_place_order(&input, caller, ctx)
     }
 
+    /// The reported margin row for `(user, MARKET_ID)`, in ABI form.
+    ///
+    /// Goes through `AccountPositionRow::to_abi` — the ONE row encoder both `getPositionRisk` and
+    /// `getAccount().positions[]` use. It used to hand-fill a `getMarginInfoReturn` field by field,
+    /// which made it a fourth encoder of the same numbers living in a test module; when
+    /// `getMarginInfo` was deleted that literal was the only thing still naming it.
     fn margin_info(
         ctx: &mut TestCtx,
         user: Address,
-    ) -> crate::interface::IPerpDex::getMarginInfoReturn {
-        let info = crate::margin_view::compute_margin_info(ctx, user, MARKET_ID).unwrap();
-        crate::interface::IPerpDex::getMarginInfoReturn {
-            markPrice: info.mark_price,
-            positionAmt: info.position_amt,
-            vQuoteBalance: info.v_quote_balance,
-            leverage: info.leverage,
-            bidNotional: info.bid_notional,
-            askNotional: info.ask_notional,
-            entryPrice: info.entry_price,
-            notional: info.notional,
-            unrealizedProfit: info.unrealized_profit,
-            isolatedMargin: info.isolated_margin,
-            positionInitialMargin: info.position_initial_margin,
-            openOrderInitialMargin: info.open_order_initial_margin,
-            initialMargin: info.initial_margin,
-            maintMargin: info.maint_margin,
-            isolatedWallet: info.position_margin,
+    ) -> crate::interface::IPerpDex::AccountPosition {
+        crate::margin_view::AccountPositionRow {
+            market_id: MARKET_ID,
+            info: crate::margin_view::compute_margin_info(ctx, user, MARKET_ID).unwrap(),
         }
+        .to_abi()
     }
 }
 

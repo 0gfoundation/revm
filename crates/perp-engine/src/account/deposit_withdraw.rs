@@ -218,10 +218,10 @@ pub fn run_transfer_from_perp<H: PerpHost>(
 ///
 /// # ONE CALL, ONE STATE
 ///
-/// The return carries `positions[]` — the full per-market `getMarginInfo` for every market in the
+/// The return carries `positions[]` — the full per-market `AccountPosition` for every market in the
 /// index — because the walk behind the totals already computes exactly that and used to discard it.
 /// The reason to publish it is not brevity but CONSISTENCY: assembling this from
-/// `getAccount` + N × `getMarginInfo` is `N + 1` `eth_call`s that can straddle blocks, so
+/// `getAccount` + N × `getPositionRisk` is `N + 1` `eth_call`s that can straddle blocks, so
 /// `totalWalletBalance == totalCrossWalletBalance + Σ isolatedWallet` can fail for a healthy
 /// account and the caller cannot distinguish that race from a bug in this precompile. Read together,
 /// the identity holds by construction.

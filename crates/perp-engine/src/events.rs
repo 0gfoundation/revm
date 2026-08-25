@@ -14,7 +14,8 @@
 //!
 //! Nothing in this module writes storage. Both derived fields come from `perp_core::math`
 //! (`calc_entry_price`, `calc_value_i64`) so the log agrees digit-for-digit with what
-//! `getPosition` / `getMarginInfo` report for the same state — there is no second definition of
+//! `getPosition` and every `AccountPosition` row report for the same state — there is no second
+//! definition of
 //! either quantity in the engine.
 //!
 //! [`PositionChanged`]: crate::interface::IPerpDex::PositionChanged
@@ -75,7 +76,7 @@ pub(crate) fn emit_position_changed<H: PerpHost>(
 ///   fill price. Its `amount == 0` early return is what makes the flat case a hard 0 rather than
 ///   a division.
 /// * `unrealizedProfit` = `signedNotional + vQuoteBalance` — the SAME definition, byte for byte,
-///   that `margin_view::position_margin_info` reports as `unrealizedProfit` on `getMarginInfo`
+///   that `margin_view::margin_info_of` reports as `unrealizedProfit` on every `AccountPosition` row
 ///   (see its "── unrealizedProfit ──" block: Binance's `positionAmt × (markPrice − entryPrice)`
 ///   with the only rounding being the truncation already inside `signedNotional`). It is NOT
 ///   re-derived from `entryPrice`, which would round twice. Sign follows from that: a long

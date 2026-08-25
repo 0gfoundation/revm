@@ -65,10 +65,7 @@ use primitives::{Address, Bytes};
 use crate::host::PerpHost;
 use crate::{
     errors::{perp_err, perp_invariant_err},
-    interface::IPerpDex::{
-        getAccountMarginCall, getAccountMarginReturn, getMarginInfoCall, getMarginInfoReturn,
-        getPositionRiskCall,
-    },
+    interface::IPerpDex::{getAccountMarginCall, getAccountMarginReturn, getPositionRiskCall},
     math::{calc_value_i64, checked_u64_to_i64, maintenance_margin, open_order_margin},
     storage, PerpError,
 };
@@ -79,7 +76,7 @@ use crate::{
 use crate::math::sum_side_totals;
 
 /// Prefix a `math::` error from the shared ooIM helper with the caller that hit it, so the two
-/// call sites (`getMarginInfo` and the admission-path Σ walk) stay distinguishable in a revert
+/// call sites (the `marginInfo` read path and the admission-path Σ walk) stay distinguishable in a revert
 /// string. Fatals propagate verbatim — only business rejects are reshaped.
 fn relabel_derived(e: PerpError, who: &str) -> PerpError {
     match e {
@@ -94,8 +91,10 @@ fn relabel_derived(e: PerpError, who: &str) -> PerpError {
 /// same order as `MAX_BATCH_PLACE`; a client with more markets than this pages the call.
 pub const MAX_MARGIN_INFO_MARKETS: usize = 64;
 
-/// Every Binance-shaped margin quantity for one `(user, market)`, plus the two of ours the
-/// caller compares them against. Field-for-field the return of `getMarginInfo`.
+/// Every Binance-shaped margin quantity for one `(user, market)`, plus the three of ours the
+/// caller compares them against. Field-for-field the payload of
+/// [`crate::interface::IPerpDex::AccountPosition`] minus its `marketId` — the row `getPositionRisk`
+/// and every element of `getAccount`'s `positions[]` encode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MarginInfo {
     // ── inputs (returned so the caller can recompute every derived field locally) ──
@@ -122,8 +121,8 @@ pub struct MarginInfo {
     /// position is flat.
     ///
     /// Produced by [`crate::math::calc_entry_price`], which is also what the `PositionChanged`
-    /// event calls: one derivation, so the event, `getMarginInfo` and `getAccount`'s `positions[]`
-    /// agree digit for digit.
+    /// event calls: one derivation, so the event and every `AccountPosition` row agree digit for
+    /// digit.
     pub entry_price: u64,
     /// `N = trunc(|positionAmt| × markPrice)`.
     pub notional: u64,
@@ -169,7 +168,7 @@ pub struct MarginInfo {
 /// IN-MEMORY values only — no storage access.
 ///
 /// This is the single entry point through which every ooIM number in the engine is produced: the
-/// `getMarginInfo` read path calls it on a stored position, and the admission gates call it on
+/// row read path calls it on a stored position, and the admission gates call it on
 /// the in-memory post-operation position they are about to write. Anything that needs an ooIM and
 /// does not come through here is a second implementation and must be deleted.
 ///
@@ -291,7 +290,7 @@ pub fn compute_margin_info<H: PerpHost>(
     market_id: u64,
 ) -> Result<MarginInfo, PerpError> {
     let market = storage::load_market_ref(context, market_id)?
-        .ok_or_else(|| perp_err("getMarginInfo: unknown market"))?;
+        .ok_or_else(|| perp_err("marginInfo: unknown market"))?;
     let pos = storage::load_position_ref(context, user, market_id)?;
 
     // ── Bid / Ask oracle (debug only) ────────────────────────────────────────────────────
@@ -317,7 +316,7 @@ pub fn compute_margin_info<H: PerpHost>(
         debug_assert_eq!(
             (pos.total_buy_notional, pos.total_sell_notional),
             (bid_fold, ask_fold),
-            "getMarginInfo: maintained (Bid, Ask) for {user} market {market_id} diverged from the \
+            "marginInfo: maintained (Bid, Ask) for {user} market {market_id} diverged from the \
              resting-order fold at each entry's frozen assuming price"
         );
         // The FREEZE itself, on the buy side where it is checkable from current state: a buy's
@@ -328,7 +327,7 @@ pub fn compute_margin_info<H: PerpHost>(
         for e in buy_entries.iter() {
             debug_assert_eq!(
                 e.assuming_price, e.price,
-                "getMarginInfo: buy entry {:?} of {user} carries a marked-up assuming price",
+                "marginInfo: buy entry {:?} of {user} carries a marked-up assuming price",
                 e.order_id
             );
         }
@@ -350,7 +349,7 @@ pub fn compute_margin_info_at<H: PerpHost>(
     pos: &crate::types::PerpPosition,
 ) -> Result<MarginInfo, PerpError> {
     let market = storage::load_market_ref(context, market_id)?
-        .ok_or_else(|| perp_err("getMarginInfo: unknown market"))?;
+        .ok_or_else(|| perp_err("marginInfo: unknown market"))?;
     margin_info_of(&market, pos)
 }
 
@@ -424,7 +423,7 @@ pub fn margin_info_of(
     // ONLY rounding in it is the truncation already inside `signedNotional`.
     let unrealized_profit = signed_notional
         .checked_add(pos.v_quote_balance)
-        .ok_or_else(|| perp_err("getMarginInfo: unrealized profit overflow"))?;
+        .ok_or_else(|| perp_err("marginInfo: unrealized profit overflow"))?;
 
     // ── isolatedMargin ──────────────────────────────────────────────────────────────────
     // `isolatedWallet + unrealizedProfit`, where `isolatedWallet` is `pos.margin`.
@@ -432,7 +431,7 @@ pub fn margin_info_of(
     let isolated_margin = pos
         .margin
         .checked_add(unrealized_profit)
-        .ok_or_else(|| perp_err("getMarginInfo: isolated margin overflow"))?;
+        .ok_or_else(|| perp_err("marginInfo: isolated margin overflow"))?;
 
     // ── positionInitialMargin / initialMargin / openOrderInitialMargin ──────────────────
     // The formula itself lives in `math::open_order_margin` — ONE implementation, shared
@@ -469,7 +468,7 @@ pub fn margin_info_of(
     // from the position's `leverage` field. There is only one ooIM definition — this is the same
     // number the admission gate enforces, not a parallel "reported" one.
     let derived =
-        position_derived_margin(market, pos).map_err(|e| relabel_derived(e, "getMarginInfo"))?;
+        position_derived_margin(market, pos).map_err(|e| relabel_derived(e, "marginInfo"))?;
     debug_assert_eq!(
         (
             derived.signed_notional,
@@ -493,9 +492,9 @@ pub fn margin_info_of(
     // `math::maintenance_margin`.
     let maint_margin = u64::try_from(maintenance_margin(
         &market.tiers,
-        checked_u64_to_i64(notional, "getMarginInfo: notional")?,
+        checked_u64_to_i64(notional, "marginInfo: notional")?,
     )?)
-    .map_err(|_| perp_err("getMarginInfo: maintenance margin negative"))?;
+    .map_err(|_| perp_err("marginInfo: maintenance margin negative"))?;
 
     // ── liquidationPrice ────────────────────────────────────────────────────────────────
     // A SEARCH, not a formula: `calc_liquidation_price` bisects `is_above_maintenance_margin` —
@@ -519,7 +518,7 @@ pub fn margin_info_of(
         base_decimals,
         price_decimals,
     )
-    .map_err(|e| relabel_derived(e, "getMarginInfo"))?;
+    .map_err(|e| relabel_derived(e, "marginInfo"))?;
 
     Ok(MarginInfo {
         mark_price: market.mark_price,
@@ -717,38 +716,6 @@ pub fn derived_requirement_delta(
         - position_open_order_margin(market, before)? as i128)
 }
 
-/// `getMarginInfo(address user, uint64 marketId) returns (...)` — see the ABI doc comment in
-/// [`crate::interface`] for the field-by-field contract.
-pub fn run_get_margin_info<H: PerpHost>(
-    input_bytes: &[u8],
-    context: &mut H,
-) -> Result<Bytes, PerpError> {
-    let args = getMarginInfoCall::abi_decode_validate(input_bytes)
-        .map_err(|_| perp_err("getMarginInfo: invalid calldata"))?;
-
-    let info = compute_margin_info(context, args.user, args.marketId)?;
-
-    Ok(Bytes::from(getMarginInfoCall::abi_encode_returns(
-        &getMarginInfoReturn {
-            markPrice: info.mark_price,
-            positionAmt: info.position_amt,
-            vQuoteBalance: info.v_quote_balance,
-            leverage: info.leverage,
-            bidNotional: info.bid_notional,
-            askNotional: info.ask_notional,
-            entryPrice: info.entry_price,
-            notional: info.notional,
-            unrealizedProfit: info.unrealized_profit,
-            isolatedMargin: info.isolated_margin,
-            positionInitialMargin: info.position_initial_margin,
-            openOrderInitialMargin: info.open_order_initial_margin,
-            initialMargin: info.initial_margin,
-            maintMargin: info.maint_margin,
-            isolatedWallet: info.position_margin,
-        },
-    )))
-}
-
 /// `getPositionRisk(address user, uint64 marketId) returns (AccountPosition)` — ONE
 /// [`AccountPositionRow`] for one `(user, market)`. See the ABI doc comment in [`crate::interface`].
 ///
@@ -794,8 +761,8 @@ pub fn run_get_position_risk<H: PerpHost>(
 /// **Captured, never recomputed.** [`fold_account_margin`] already builds a full `MarginInfo` per
 /// market and used to discard everything but the six Σ terms; a row is that same value kept. So
 /// `getAccount` returning the rows costs no additional load, no second walk and no second
-/// derivation — which is also what makes the row and `getMarginInfo` incapable of disagreeing:
-/// they are the same `margin_info_of` output, encoded twice.
+/// derivation — which is also what makes a bulk row and the one `getPositionRisk` returns incapable
+/// of disagreeing: they are the same `margin_info_of` output through the same encoder.
 ///
 /// Bounded by [`crate::types::MAX_USER_MARKETS`] (16) on the index-driven path and by
 /// [`MAX_MARGIN_INFO_MARKETS`] (64) on the caller-list one, so the array cannot grow unbounded
@@ -804,23 +771,25 @@ pub fn run_get_position_risk<H: PerpHost>(
 pub struct AccountPositionRow {
     /// The market this row is for.
     pub market_id: u64,
-    /// Everything `getMarginInfo(user, market_id)` returns, for the same `(user, market_id)`.
+    /// Every reported margin quantity for this `(user, market_id)` — the whole row bar its id.
     pub info: MarginInfo,
 }
 
 impl AccountPositionRow {
     /// ABI form of this row.
     ///
-    /// Deliberately adjacent to [`run_get_margin_info`]'s encoding: the two write out the same 15
-    /// numbers into two `sol!`-generated types, and keeping them in one field of view is how a
-    /// field added to one and forgotten in the other stays visible. (The VALUES cannot drift — one
-    /// [`MarginInfo`] — but a field could still be dropped on the way out, which is what
-    /// `margin_view_tests::get_account_positions_agree_with_get_margin_info_field_for_field`
-    /// checks.)
+    /// **THE ONLY PLACE A ROW IS WRITTEN OUT.** Both surfaces that report one — the bulk
+    /// `getAccount().positions[]` and the single-market [`run_get_position_risk`] — end here, so a
+    /// field added to `AccountPosition` reaches both or neither. There is no second encoder to keep
+    /// in step; there used to be two, and `liquidation_price` had already gone missing from one.
     ///
-    /// `liquidationPrice` is the one field with no `getMarginInfo` counterpart. It is read off the
-    /// same [`MarginInfo`] as everything else, so the bulk path carries it for zero extra loads and
-    /// a multi-market backend no longer needs `1 + N` calls to assemble it.
+    /// The VALUES could not drift even then (one [`MarginInfo`] per row), but a field could still be
+    /// dropped on the way out, which is what
+    /// `margin_view_tests::get_account_positions_agree_with_get_position_risk_field_for_field`
+    /// checks — over both CALL PATHS, since the encoder is now shared and only the path differs.
+    ///
+    /// `liquidationPrice` is read off the same [`MarginInfo`] as everything else, so the bulk path
+    /// carries it for zero extra loads and a multi-market backend needs no `1 + N` calls for it.
     pub fn to_abi(&self) -> crate::interface::IPerpDex::AccountPosition {
         let i = &self.info;
         crate::interface::IPerpDex::AccountPosition {
@@ -1271,7 +1240,7 @@ pub struct IndexAccountView {
     /// These are the fold's own `MarginInfo`s, kept rather than recomputed, so they are the same
     /// state as the scalars beside them by construction — not by a second traversal happening to
     /// land on the same block. That is the point of the shape: a backend assembling a Binance-style
-    /// `/account` from `getAccount` + N × `getMarginInfo` was reading `N + 1` states, and
+    /// `/account` from `getAccount` + N × `getPositionRisk` was reading `N + 1` states, and
     /// `totalWalletBalance == totalCrossWalletBalance + Σ isolatedWallet` could then fail on a
     /// healthy account with no way to tell a race from a bug.
     ///
@@ -1546,7 +1515,7 @@ pub fn index_account_view<H: PerpHost>(
 }
 
 /// Re-label a per-market reject so the caller can tell WHICH id in the market set failed
-/// (`compute_margin_info` only knows it is "getMarginInfo: unknown market"). Fatals and the
+/// (`compute_margin_info` only knows it is "marginInfo: unknown market"). Fatals and the
 /// shell-level variants propagate verbatim — they are not business rejects and must not be
 /// reshaped into one.
 fn relabel_market(e: PerpError, who: &str, market_id: u64) -> PerpError {
