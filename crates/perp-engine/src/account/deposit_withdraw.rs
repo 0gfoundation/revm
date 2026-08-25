@@ -216,6 +216,16 @@ pub fn run_transfer_from_perp<H: PerpHost>(
 /// calls the same producer and encodes the same fields into a log, which is why the two surfaces
 /// cannot report different numbers for the same state.
 ///
+/// # ONE CALL, ONE STATE
+///
+/// The return carries `positions[]` — the full per-market `getMarginInfo` for every market in the
+/// index — because the walk behind the totals already computes exactly that and used to discard it.
+/// The reason to publish it is not brevity but CONSISTENCY: assembling this from
+/// `getAccount` + N × `getMarginInfo` is `N + 1` `eth_call`s that can straddle blocks, so
+/// `totalWalletBalance == totalCrossWalletBalance + Σ isolatedWallet` can fail for a healthy
+/// account and the caller cannot distinguish that race from a bug in this precompile. Read together,
+/// the identity holds by construction.
+///
 /// Pure read. Every loader below is a `_ref` (cache-fill, never dirty-mark) reader, so this call
 /// enters no key into the block delta and cannot move the block commitment.
 pub fn run_get_account<H: PerpHost>(
@@ -248,8 +258,12 @@ pub fn run_get_account<H: PerpHost>(
             // clamp costs no information. NOTE this is the perp→spot limit, not the protocol
             // withdrawal limit (`withdraw` gates on `usdcBalance`).
             maxWithdrawAmount: s.available_balance.max(0) as u64,
-            // Echoed so the totals are self-checkable against `getMarginInfo` per id.
-            marketIds: view.market_ids.to_vec(),
+            // The per-market detail behind every total above, one row per market in the index, from
+            // the SAME walk that produced them — so the totals are self-checkable against the rows
+            // with no second call, and the balance identities hold within this one response. See
+            // `margin_view::AccountPositionRow`; the rows subsume the `marketIds` array this
+            // replaced (each carries its own `marketId`).
+            positions: view.positions.iter().map(|r| r.to_abi()).collect(),
         },
     )))
 }

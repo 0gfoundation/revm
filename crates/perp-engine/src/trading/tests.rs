@@ -176,9 +176,13 @@ fn assert_event_matches_get_account(ctx: &mut TestCtx, event: &AccountBalanceCha
         event.user
     );
     let sigma_margin: i128 = a
-        .marketIds
+        .positions
         .iter()
-        .map(|m| storage::load_position(ctx, event.user, *m).unwrap().margin as i128)
+        .map(|p| {
+            storage::load_position(ctx, event.user, p.marketId)
+                .unwrap()
+                .margin as i128
+        })
         .sum();
     assert_eq!(
         event.totalWalletBalance as i128,
@@ -11780,6 +11784,7 @@ mod assuming_price {
             leverage: info.leverage,
             bidNotional: info.bid_notional,
             askNotional: info.ask_notional,
+            entryPrice: info.entry_price,
             notional: info.notional,
             unrealizedProfit: info.unrealized_profit,
             isolatedMargin: info.isolated_margin,

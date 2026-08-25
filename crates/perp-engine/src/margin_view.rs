@@ -102,7 +102,8 @@ pub struct MarginInfo {
     pub mark_price: u64,
     /// Signed net position in base units (positive = long).
     pub position_amt: i64,
-    /// Virtual quote balance; `entry = -v_quote_balance / position_amt`.
+    /// Virtual quote balance; `entry = -v_quote_balance / position_amt`, returned decoded as
+    /// [`Self::entry_price`].
     pub v_quote_balance: i64,
     /// Position leverage, floored at 1.
     pub leverage: u64,
@@ -115,6 +116,14 @@ pub struct MarginInfo {
     /// `T`, and R12 measured that the value then does not move.
     pub ask_notional: u64,
     // ── derived, Binance formulas ──
+    /// Binance `entryPrice` — the position's volume-weighted average entry,
+    /// `-v_quote_balance / position_amt` in the market's `price_decimals` units. `0` when the
+    /// position is flat.
+    ///
+    /// Produced by [`crate::math::calc_entry_price`], which is also what the `PositionChanged`
+    /// event calls: one derivation, so the event, `getMarginInfo` and `getAccount`'s `positions[]`
+    /// agree digit for digit.
+    pub entry_price: u64,
     /// `N = trunc(|positionAmt| × markPrice)`.
     pub notional: u64,
     /// `positionAmt × (markPrice − entryPrice)`, truncated toward zero.
@@ -372,6 +381,19 @@ pub fn margin_info_of(
     )?;
     let notional = signed_notional.unsigned_abs();
 
+    // ── entryPrice ──────────────────────────────────────────────────────────────────────
+    // `-v_quote_balance / position_amt`, i.e. the per-unit inverse of the accumulated
+    // `-(qty × price)`. From `math::calc_entry_price`, which is ALSO what `PositionChanged`
+    // calls — one derivation, so the event and both views cannot report different entries for
+    // the same position. Zero for a flat position (no entry exists; that is the function's own
+    // early return, not a price of zero). Pure arithmetic on values already in hand: no load.
+    let entry_price = crate::math::calc_entry_price(
+        pos.amount,
+        pos.v_quote_balance,
+        base_decimals,
+        price_decimals,
+    )?;
+
     // ── unrealizedProfit ────────────────────────────────────────────────────────────────
     // Binance: `positionAmt × (markPrice − entryPrice)`. Our `v_quote_balance` is
     // `−(positionAmt × entryPrice)` accumulated exactly at fill time, so
@@ -459,6 +481,7 @@ pub fn margin_info_of(
         leverage,
         bid_notional,
         ask_notional,
+        entry_price,
         notional,
         unrealized_profit,
         isolated_margin,
@@ -665,6 +688,7 @@ pub fn run_get_margin_info<H: PerpHost>(
             leverage: info.leverage,
             bidNotional: info.bid_notional,
             askNotional: info.ask_notional,
+            entryPrice: info.entry_price,
             notional: info.notional,
             unrealizedProfit: info.unrealized_profit,
             isolatedMargin: info.isolated_margin,
@@ -675,6 +699,57 @@ pub fn run_get_margin_info<H: PerpHost>(
             isolatedWallet: info.position_margin,
         },
     )))
+}
+
+/// One row of `getAccount`'s `positions[]`: a market id and the [`MarginInfo`] for it.
+///
+/// **Captured, never recomputed.** [`fold_account_margin`] already builds a full `MarginInfo` per
+/// market and used to discard everything but the six Σ terms; a row is that same value kept. So
+/// `getAccount` returning the rows costs no additional load, no second walk and no second
+/// derivation — which is also what makes the row and `getMarginInfo` incapable of disagreeing:
+/// they are the same `margin_info_of` output, encoded twice.
+///
+/// Bounded by [`crate::types::MAX_USER_MARKETS`] (16) on the index-driven path and by
+/// [`MAX_MARGIN_INFO_MARKETS`] (64) on the caller-list one, so the array cannot grow unbounded
+/// under a flat gas price.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AccountPositionRow {
+    /// The market this row is for.
+    pub market_id: u64,
+    /// Everything `getMarginInfo(user, market_id)` returns, for the same `(user, market_id)`.
+    pub info: MarginInfo,
+}
+
+impl AccountPositionRow {
+    /// ABI form of this row.
+    ///
+    /// Deliberately adjacent to [`run_get_margin_info`]'s encoding: the two write out the same 14
+    /// numbers into two `sol!`-generated types, and keeping them in one field of view is how a
+    /// field added to one and forgotten in the other stays visible. (The VALUES cannot drift — one
+    /// [`MarginInfo`] — but a field could still be dropped on the way out, which is what
+    /// `margin_view_tests::get_account_positions_agree_with_get_margin_info_field_for_field`
+    /// checks.)
+    pub fn to_abi(&self) -> crate::interface::IPerpDex::AccountPosition {
+        let i = &self.info;
+        crate::interface::IPerpDex::AccountPosition {
+            marketId: self.market_id,
+            markPrice: i.mark_price,
+            positionAmt: i.position_amt,
+            vQuoteBalance: i.v_quote_balance,
+            leverage: i.leverage,
+            bidNotional: i.bid_notional,
+            askNotional: i.ask_notional,
+            entryPrice: i.entry_price,
+            notional: i.notional,
+            unrealizedProfit: i.unrealized_profit,
+            isolatedMargin: i.isolated_margin,
+            positionInitialMargin: i.position_initial_margin,
+            openOrderInitialMargin: i.open_order_initial_margin,
+            initialMargin: i.initial_margin,
+            maintMargin: i.maint_margin,
+            isolatedWallet: i.position_margin,
+        }
+    }
 }
 
 // ── Account-level Σ walkers (ONE implementation, two ABI entry points) ───────────────────────
@@ -809,6 +884,18 @@ pub struct AccountMarginScalars {
 /// entering-a-new-market rule is the subtle half of the pair `derived_available_balance_with`
 /// relies on — the two must stay semantically identical, and the `debug_assertions` check in
 /// [`index_account_scalars`] is what compares them.
+///
+/// # `rows` — KEEPING what the fold already computed
+///
+/// Every iteration builds a complete [`MarginInfo`] and, historically, threw all but six numbers of
+/// it away. `Some(sink)` pushes one [`AccountPositionRow`] per folded market instead, in the same
+/// order the ids were consumed, so `getAccount` can publish the per-market detail behind its totals
+/// for **zero extra loads and zero extra arithmetic** — it is the value that was already in hand.
+/// `None` keeps the discard for the callers that only want the sums.
+///
+/// This is the ONLY sanctioned way to obtain those rows. A second walk that re-derives them would
+/// re-open the exact `1 + N` inconsistency `getAccount`'s one-call shape exists to close: two
+/// traversals can only be guaranteed to see one state by accident.
 pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
     context: &mut H,
     user: Address,
@@ -816,6 +903,7 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
     source: MarketSetSource,
     who: &str,
     override_market: Option<(u64, &crate::types::PerpPosition)>,
+    mut rows: Option<&mut Vec<AccountPositionRow>>,
 ) -> Result<AccountMarginTotals, PerpError> {
     let market_ids = market_ids.into_iter();
     let mut totals = AccountMarginTotals::default();
@@ -847,6 +935,10 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
         }
         .map_err(|e| relabel_market(e, who, market_id))?;
         totals.add(&info);
+        // Kept, not recomputed: `info` is the value the six Σ terms above were just taken from.
+        if let Some(rows) = rows.as_mut() {
+            rows.push(AccountPositionRow { market_id, info });
+        }
     }
     if let Some((id, over)) = override_market {
         if !applied_override {
@@ -856,6 +948,14 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
             if let Some(market) = storage::load_market_ref(context, id)? {
                 let info = margin_info_of(&market, over).map_err(|e| relabel_market(e, who, id))?;
                 totals.add(&info);
+                // Appended for the same reason its term is: the row set must name exactly the
+                // market set the totals were summed over, override arm included.
+                if let Some(rows) = rows.as_mut() {
+                    rows.push(AccountPositionRow {
+                        market_id: id,
+                        info,
+                    });
+                }
             }
         }
     }
@@ -880,6 +980,10 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
 /// overridable and does not need to be: every caller that supplies a position override is pricing a
 /// hypothetical whose wallet leg has not moved (resting an order escrows nothing), so the stored
 /// value IS the post-state one.
+///
+/// `rows` is [`fold_account_margin`]'s, passed straight through: the scalars and the per-market rows
+/// come out of ONE walk, at one state, which is the property `getAccount`'s single-call shape rests
+/// on.
 pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
     context: &mut H,
     user: Address,
@@ -887,8 +991,17 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
     source: MarketSetSource,
     who: &str,
     override_market: Option<(u64, &crate::types::PerpPosition)>,
+    rows: Option<&mut Vec<AccountPositionRow>>,
 ) -> Result<AccountMarginScalars, PerpError> {
-    let totals = fold_account_margin(context, user, market_ids, source, who, override_market)?;
+    let totals = fold_account_margin(
+        context,
+        user,
+        market_ids,
+        source,
+        who,
+        override_market,
+        rows,
+    )?;
     // Signed and unclamped: this is the CROSS wallet exactly as stored. A negative value is a
     // settled receivable (see `types::UserAccount::perp_wallet_balance`), and hiding it behind a
     // `uint64` floor is precisely the blind spot the old `availablePerpBalance` had.
@@ -1016,6 +1129,8 @@ pub fn run_get_account_margin<H: PerpHost>(
         MarketSetSource::CallerList,
         "getAccountMargin",
         None,
+        // Scalars only: this selector's return shape is the account block, with no per-market rows.
+        None,
     )?;
 
     Ok(Bytes::from(getAccountMarginCall::abi_encode_returns(
@@ -1052,14 +1167,24 @@ pub fn run_get_account_margin<H: PerpHost>(
 /// the event reads.
 #[derive(Clone, Debug)]
 pub struct IndexAccountView {
-    /// The market ids folded — the per-user index (`umkt`) verbatim, echoed so a caller can
-    /// re-derive every total. Held as the stored `Arc` (no clone).
-    pub market_ids: std::sync::Arc<Vec<u64>>,
     /// Spot / withdrawal-layer USDC held inside the DEX. NOT part of any total below.
     pub usdc_balance: primitives::U256,
     /// The account-level margin scalars, all signed-and-unclamped where the quantity can be
     /// negative.
     pub scalars: AccountMarginScalars,
+    /// One row per market in the per-user index (`umkt`), in index order — the market set
+    /// [`Self::scalars`] was summed over, together with the per-market numbers it was summed FROM.
+    ///
+    /// These are the fold's own `MarginInfo`s, kept rather than recomputed, so they are the same
+    /// state as the scalars beside them by construction — not by a second traversal happening to
+    /// land on the same block. That is the point of the shape: a backend assembling a Binance-style
+    /// `/account` from `getAccount` + N × `getMarginInfo` was reading `N + 1` states, and
+    /// `totalWalletBalance == totalCrossWalletBalance + Σ isolatedWallet` could then fail on a
+    /// healthy account with no way to tell a race from a bug.
+    ///
+    /// SUPERSEDES the `market_ids` field this struct used to carry (and the `uint64[] marketIds`
+    /// return it fed): each row names its own market, so the id list is a projection of this one.
+    pub positions: Vec<AccountPositionRow>,
 }
 
 /// Fold [`account_margin_scalars`] over the user's whole market index — the account-level scalar
@@ -1083,11 +1208,16 @@ pub struct IndexAccountView {
 ///
 /// Its live caller passes `override_market: None` — `getAccount` folds the SETTLED store. See
 /// [`fold_account_margin`] for what the override means and why it is kept.
+///
+/// `rows` is that same fold's row sink, threaded through unchanged. `getAccount` passes `Some`, and
+/// that is the whole of how `positions[]` is produced: the rows and the scalars leave this ONE walk
+/// together, so they are necessarily the same state.
 pub fn index_account_scalars<H: PerpHost>(
     context: &mut H,
     user: Address,
     who: &str,
     override_market: Option<(u64, &crate::types::PerpPosition)>,
+    rows: Option<&mut Vec<AccountPositionRow>>,
 ) -> Result<AccountMarginScalars, PerpError> {
     // The index is the support of every sum: a market the user has left contributes
     // `N = Bid = Ask = 0`. Held as an owned `Arc` so it can be iterated while `context` is borrowed
@@ -1100,6 +1230,7 @@ pub fn index_account_scalars<H: PerpHost>(
         MarketSetSource::UserIndex,
         who,
         override_market,
+        rows,
     )?;
 
     // The roll-up's `Σ ooIM` and the LEAN admission gate's must be the SAME number over the same
@@ -1279,7 +1410,7 @@ pub fn index_account_wallet_balances<H: PerpHost>(
     // one does not need, and a state that trips them is exactly a state in which `getAccount` itself
     // reverts — there is then no published number to disagree with.
     #[cfg(debug_assertions)]
-    if let Ok(wide) = index_account_scalars(context, user, who, None) {
+    if let Ok(wide) = index_account_scalars(context, user, who, None, None) {
         debug_assert_eq!(
             (total_wallet_balance, total_cross_wallet_balance),
             (wide.total_wallet_balance, wide.total_cross_wallet_balance),
@@ -1294,24 +1425,30 @@ pub fn index_account_wallet_balances<H: PerpHost>(
     })
 }
 
-/// [`index_account_scalars`] paired with the spot USDC balance and the folded id list — the
+/// [`index_account_scalars`] paired with the spot USDC balance and the fold's per-market rows — the
 /// complete published account view, as `getAccount` returns it.
+///
+/// **ONE walk.** The rows are captured by that same [`index_account_scalars`] call, not gathered by
+/// a second pass, so this function adds no load over the scalars alone. (It also no longer loads the
+/// user market index for itself: the id list it used to echo is now carried by the rows, one id per
+/// row, so that read went away with the field.)
 pub fn index_account_view<H: PerpHost>(
     context: &mut H,
     user: Address,
     who: &str,
 ) -> Result<IndexAccountView, PerpError> {
-    let market_ids = storage::load_user_markets_ref(context, user)?;
-    let scalars = index_account_scalars(context, user, who, None)?;
+    // `MAX_USER_MARKETS` is the hard bound on the index, so this allocates exactly once.
+    let mut positions = Vec::with_capacity(crate::types::MAX_USER_MARKETS);
+    let scalars = index_account_scalars(context, user, who, None, Some(&mut positions))?;
     let usdc_balance: primitives::U256 = storage::load_account_ref(context, user)?
         .usdc_balance
         .clone()
         .into();
 
     Ok(IndexAccountView {
-        market_ids,
         usdc_balance,
         scalars,
+        positions,
     })
 }
 

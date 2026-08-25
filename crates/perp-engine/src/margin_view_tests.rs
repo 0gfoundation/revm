@@ -25,7 +25,7 @@ use crate::{
     host::PerpHost,
     interface::IPerpDex::{
         getAccountCall, getAccountMarginReturn, getAccountReturn, getMarginInfoReturn,
-        placeOrderCall,
+        placeOrderCall, AccountPosition,
     },
     run_perp_dex_call, storage,
     types::{
@@ -61,6 +61,10 @@ const P60: u64 = 6_000;
 const MARKET_B: u64 = 2;
 const B_BASE_DECIMALS: u32 = 0;
 const B_PRICE_DECIMALS: u32 = 8;
+
+/// Market C — market A's grid at a DIFFERENT mark, so a multi-market fixture can carry two
+/// same-shaped markets whose derived numbers still differ (and unrealised PnL of both signs).
+const MARKET_C: u64 = 3;
 
 type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
 
@@ -242,6 +246,11 @@ fn account_margin(ctx: &mut TestCtx, user: Address, market_ids: &[u64]) -> getAc
 /// the selector is registered `can_be_static = true` and that its FLAT gas is the 20_000 the
 /// index-driven roll-up was re-priced to (it walks up to MAX_USER_MARKETS markets, so it sits in
 /// the `getMarginInfo` / `getOpenOrders` tier, not the 5_000 scalar-getter tier it used to).
+///
+/// The 20_000 was RE-EXAMINED and kept when the return grew `positions[]` — the walk did not change,
+/// only the encoded output did, and the rows are the fold's own values kept rather than recomputed.
+/// The reasoning is on the `getAccountCall` entry in `call.rs`; this assertion is what makes a silent
+/// drift away from it fail.
 fn get_account(ctx: &mut TestCtx, user: Address) -> getAccountReturn {
     let input = getAccountCall { user }.abi_encode();
     let out = run_perp_dex_call(&input, 1_000_000, user, U256::ZERO, true, ctx).unwrap();
@@ -251,6 +260,69 @@ fn get_account(ctx: &mut TestCtx, user: Address) -> getAccountReturn {
         "getAccount's gas must stay FLAT per selector — never per-item or dynamic"
     );
     getAccountCall::abi_decode_returns(&out.bytes).unwrap()
+}
+
+/// One `getAccount` `positions[]` row flattened to its 16 numbers, in DECLARATION ORDER, widened to
+/// `i128` so the signed and unsigned fields sit in one comparable, `Debug`-printable array.
+///
+/// An array rather than a tuple because 16 fields is past the arity std implements `PartialEq` for —
+/// and positional over ALL of them on purpose: a comparison field-by-field by name would still pass
+/// if two same-typed fields were swapped on one side.
+fn row_fields(p: &AccountPosition) -> [i128; 16] {
+    [
+        p.marketId as i128,
+        p.markPrice as i128,
+        p.positionAmt as i128,
+        p.vQuoteBalance as i128,
+        p.leverage as i128,
+        p.bidNotional as i128,
+        p.askNotional as i128,
+        p.entryPrice as i128,
+        p.notional as i128,
+        p.unrealizedProfit as i128,
+        p.isolatedMargin as i128,
+        p.positionInitialMargin as i128,
+        p.openOrderInitialMargin as i128,
+        p.initialMargin as i128,
+        p.maintMargin as i128,
+        p.isolatedWallet as i128,
+    ]
+}
+
+/// `getMarginInfo`'s 14 returns flattened exactly as [`row_fields`] flattens a row, with the
+/// `marketId` the call was made for prepended — so the two arrays are directly comparable and the
+/// row struct's "`getMarginInfo`'s tuple with `marketId` in front" claim is what is being checked.
+///
+/// Written out independently of `row_fields` on purpose: sharing a converter would make the two
+/// sides agree by construction and test nothing.
+fn margin_info_fields(market_id: u64, i: &getMarginInfoReturn) -> [i128; 16] {
+    [
+        market_id as i128,
+        i.markPrice as i128,
+        i.positionAmt as i128,
+        i.vQuoteBalance as i128,
+        i.leverage as i128,
+        i.bidNotional as i128,
+        i.askNotional as i128,
+        i.entryPrice as i128,
+        i.notional as i128,
+        i.unrealizedProfit as i128,
+        i.isolatedMargin as i128,
+        i.positionInitialMargin as i128,
+        i.openOrderInitialMargin as i128,
+        i.initialMargin as i128,
+        i.maintMargin as i128,
+        i.isolatedWallet as i128,
+    ]
+}
+
+/// The market ids `getAccount` folded, projected out of `positions[]`.
+///
+/// This is exactly the `uint64[] marketIds` array the selector used to return outright — each row
+/// now carries its own `marketId`, so the old field is a projection of the new one and every
+/// assertion that used to read it reads this instead.
+fn market_ids(a: &getAccountReturn) -> Vec<u64> {
+    a.positions.iter().map(|p| p.marketId).collect()
 }
 
 /// `getAccountMarginReturn` as a comparable tuple (the `sol!`-generated struct derives neither
@@ -1035,7 +1107,7 @@ fn outputs_are_recomputable_from_the_reported_inputs() {
 ///
 /// The empty index is the common case (a funded account that has not traded), so it must not be an
 /// error path. It also has to be distinguishable from a market set that happened to sum to zero —
-/// `marketIds` empty is that signal.
+/// an EMPTY `positions[]` is that signal, and it must be an empty array rather than a revert.
 #[test]
 fn get_account_on_an_empty_index_is_all_zero_and_does_not_revert() {
     let mut ctx = make_ctx();
@@ -1043,7 +1115,7 @@ fn get_account_on_an_empty_index_is_all_zero_and_does_not_revert() {
     fund(&mut ctx, ALICE, 500 * USD);
 
     let a = get_account(&mut ctx, ALICE);
-    assert!(a.marketIds.is_empty(), "no positions, no resting orders");
+    assert!(a.positions.is_empty(), "no positions, no resting orders");
     // The wallet is the only non-zero thing, and gross == cross with no silos.
     assert_eq!(a.totalCrossWalletBalance, (500 * USD) as i64);
     assert_eq!(a.totalWalletBalance, (500 * USD) as i64);
@@ -1057,7 +1129,7 @@ fn get_account_on_an_empty_index_is_all_zero_and_does_not_revert() {
 
     // A never-seen user is the same shape, and still not an error.
     let never = get_account(&mut ctx, BOB);
-    assert!(never.marketIds.is_empty());
+    assert!(never.positions.is_empty());
     assert_eq!(never.usdcBalance, U256::ZERO);
     assert_eq!(never.totalWalletBalance, 0);
     assert_eq!(never.totalMarginBalance, 0);
@@ -1066,7 +1138,8 @@ fn get_account_on_an_empty_index_is_all_zero_and_does_not_revert() {
 
 /// An account at the `MAX_USER_MARKETS` (16) cap. The walk is bounded by the index, so this is the
 /// worst case the flat gas has to cover — and every total must still be the full 16-market sum,
-/// with `marketIds` reporting all 16 ascending.
+/// with `positions[]` reporting all 16 rows ascending. That row count is also the widest return this
+/// selector can ever encode, which is the case the flat 20_000 has to price.
 #[test]
 fn get_account_walks_the_index_at_the_sixteen_market_cap() {
     let mut ctx = make_ctx();
@@ -1094,7 +1167,12 @@ fn get_account_walks_the_index_at_the_sixteen_market_cap() {
     );
 
     let a = get_account(&mut ctx, ALICE);
-    assert_eq!(a.marketIds, ids, "all 16 markets, in index order");
+    assert_eq!(market_ids(&a), ids, "all 16 markets, in index order");
+    assert_eq!(
+        a.positions.len(),
+        MAX_USER_MARKETS,
+        "the array is bounded by MAX_USER_MARKETS and this is that bound"
+    );
     let n = MAX_USER_MARKETS as i64;
     // Σ over 16 identical markets: silo $100 each, mark == entry so no uPnL.
     assert_eq!(a.totalUnrealizedProfit, 0);
@@ -1213,7 +1291,7 @@ fn get_account_reflects_a_short_under_funded_silo_at_its_actual_value() {
     );
 
     let a = get_account(&mut ctx, ALICE);
-    assert_eq!(a.marketIds, vec![MARKET_A]);
+    assert_eq!(market_ids(&a), vec![MARKET_A]);
     assert_eq!(a.totalCrossWalletBalance, 500 * USD as i64);
     // Gross wallet carries the short's ACTUAL silo ($100), not its requirement ($120) — using the
     // requirement would mint $20 in the view.
@@ -1276,7 +1354,7 @@ fn get_account_totals_equal_the_sum_of_per_market_get_margin_info() {
 
     let a = get_account(&mut ctx, ALICE);
     assert_eq!(
-        a.marketIds,
+        market_ids(&a),
         vec![MARKET_A, MARKET_B],
         "the index names the market set the totals were summed over"
     );
@@ -1289,7 +1367,7 @@ fn get_account_totals_equal_the_sum_of_per_market_get_margin_info() {
     let mut sum_upnl = 0i64;
     let mut sum_silo = 0i64;
     let mut sum_isolated_margin = 0i64;
-    for &m in &a.marketIds {
+    for &m in &market_ids(&a) {
         let i = margin_info(&mut ctx, ALICE, m);
         sum_initial += i.initialMargin;
         sum_position_initial += i.positionInitialMargin;
@@ -1341,6 +1419,285 @@ fn get_account_totals_equal_the_sum_of_per_market_get_margin_info() {
         derived_available_balance(&mut ctx, ALICE).unwrap(),
         a.availableBalance as i128,
         "the reported headroom IS the one the engine's gates enforce"
+    );
+
+    // ── the same round-trip WITHOUT the N extra calls ──
+    // Every Σ above was re-derived from `N` separate `getMarginInfo` calls. `positions[]` carries the
+    // same per-market numbers inside THIS response, so the identical fold must close against the rows
+    // alone — which is what makes the totals self-checkable at one state instead of `N + 1`.
+    assert_eq!(
+        (
+            a.positions.iter().map(|p| p.initialMargin).sum::<u64>(),
+            a.positions
+                .iter()
+                .map(|p| p.positionInitialMargin)
+                .sum::<u64>(),
+            a.positions
+                .iter()
+                .map(|p| p.openOrderInitialMargin)
+                .sum::<u64>(),
+            a.positions.iter().map(|p| p.maintMargin).sum::<u64>(),
+            a.positions.iter().map(|p| p.unrealizedProfit).sum::<i64>(),
+            a.positions.iter().map(|p| p.isolatedWallet).sum::<i64>(),
+        ),
+        (
+            sum_initial,
+            sum_position_initial,
+            sum_open_order_initial,
+            sum_maint,
+            sum_upnl,
+            sum_silo,
+        ),
+        "the rows must fold to the same Σ the N separate getMarginInfo calls do"
+    );
+}
+
+/// **THE ANTI-DIVERGENCE TEST.** Every `positions[]` row must equal
+/// `getMarginInfo(user, row.marketId)` FIELD FOR FIELD, on the same state, for every market in the
+/// index.
+///
+/// This is the property the whole reshape rests on. `getAccount` gaining per-market rows is only
+/// safe if those rows are the single-market accessor's own answer; the moment they can differ, we
+/// have shipped the second source of truth the change exists to avoid, and a backend reading the
+/// bulk call gets different numbers from one reading the per-market call for no reason it can see.
+///
+/// The VALUES cannot drift by construction — both encoders are handed one
+/// `margin_view::margin_info_of` output, and `fold_account_margin` keeps that value rather than
+/// recomputing it. What this test actually catches is everything AROUND that: a field dropped or
+/// mis-assigned in one of the two `sol!` encoders (they are separate code writing out the same 14
+/// numbers), a row paired with the wrong `marketId`, rows built from a different market set than the
+/// totals, and — the one that would be silent — a future field added to `getMarginInfo` and
+/// forgotten on the row, or vice versa. Comparison is positional over all 16 numbers, so a swap of
+/// two same-typed fields on one side fails too.
+///
+/// The fixture is deliberately NOT a zeros case: three markets with live marks, a long and a short,
+/// unrealised PnL of both signs, resting orders on both sides of one market and one side of another,
+/// and a genuinely under-funded silo — so every field in the row is a distinct non-trivial number
+/// and an all-zero row could not pass by accident.
+#[test]
+fn get_account_positions_agree_with_get_margin_info_field_for_field() {
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    add_market(
+        &mut ctx,
+        MARKET_B,
+        B_BASE_DECIMALS,
+        B_PRICE_DECIMALS,
+        12_345,
+    );
+    add_market(&mut ctx, MARKET_C, A_BASE_DECIMALS, A_PRICE_DECIMALS, P60);
+    fund(&mut ctx, ALICE, 5_000 * USD);
+
+    // Market A: LONG 3 entered at $90 with the mark now $100 ⇒ +$30 unrealised, and resting orders
+    // on BOTH sides so the joint max() and the Assuming-Price uplift are both live.
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        3,
+        -(270 * USD as i64),
+        300 * USD as i64,
+        2,
+    );
+    set_orders(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        &[entry(1, P100, 2), entry(2, P60, 5)],
+        &[entry(3, P100, 4), entry(4, 12_000, 3)],
+    );
+    // Market B: SHORT on the fractional grid with an under-funded silo and NEGATIVE unrealised PnL.
+    set_position(&mut ctx, ALICE, MARKET_B, -3, 300, 200, 1);
+    // Market C: LONG entered at $100 with the mark down at $60 ⇒ −$40 unrealised, sell side only.
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_C,
+        1,
+        -(100 * USD as i64),
+        100 * USD as i64,
+        3,
+    );
+    set_orders(&mut ctx, ALICE, MARKET_C, &[], &[entry(5, P100, 2)]);
+
+    let a = get_account(&mut ctx, ALICE);
+    assert_eq!(
+        market_ids(&a),
+        vec![MARKET_A, MARKET_B, MARKET_C],
+        "one row per market in the index, in index order"
+    );
+
+    for p in &a.positions {
+        let i = margin_info(&mut ctx, ALICE, p.marketId);
+        assert_eq!(
+            row_fields(p),
+            margin_info_fields(p.marketId, &i),
+            "getAccount's positions[] row for market {} disagrees with getMarginInfo on the same \
+             state — the bulk and single-market accessors have forked",
+            p.marketId
+        );
+    }
+
+    // ── the fixture really does exercise every field ──
+    // Without this the loop above could pass on three rows of zeros, which would prove nothing about
+    // the encoders. Each of the 15 non-id numbers has to be non-trivial SOMEWHERE in the row set.
+    let nonzero = |f: fn(&AccountPosition) -> i128| a.positions.iter().any(|p| f(p) != 0);
+    assert!(
+        nonzero(|p| p.markPrice as i128)
+            && nonzero(|p| p.positionAmt as i128)
+            && nonzero(|p| p.vQuoteBalance as i128)
+            && nonzero(|p| p.leverage as i128)
+            && nonzero(|p| p.bidNotional as i128)
+            && nonzero(|p| p.askNotional as i128)
+            && nonzero(|p| p.entryPrice as i128)
+            && nonzero(|p| p.notional as i128)
+            && nonzero(|p| p.unrealizedProfit as i128)
+            && nonzero(|p| p.isolatedMargin as i128)
+            && nonzero(|p| p.positionInitialMargin as i128)
+            && nonzero(|p| p.openOrderInitialMargin as i128)
+            && nonzero(|p| p.initialMargin as i128)
+            && nonzero(|p| p.maintMargin as i128)
+            && nonzero(|p| p.isolatedWallet as i128),
+        "every row field must be non-trivial somewhere in the fixture, or the agreement above is \
+         an agreement about zeros: {:?}",
+        a.positions.iter().map(row_fields).collect::<Vec<_>>()
+    );
+    // Both SIGNS of unrealised PnL are present, and a genuinely under-funded silo — the states where
+    // a sign or a clamp slipping into one encoder and not the other would show.
+    assert!(
+        a.positions.iter().any(|p| p.unrealizedProfit > 0)
+            && a.positions.iter().any(|p| p.unrealizedProfit < 0),
+        "the fixture must carry unrealised PnL of BOTH signs"
+    );
+    assert!(
+        a.positions
+            .iter()
+            .any(|p| p.isolatedWallet < p.positionInitialMargin as i64),
+        "the fixture must carry an under-funded silo"
+    );
+    // And `entryPrice` is the field this reshape ADDED to both surfaces — pin the value, not just
+    // the agreement, so a broken derivation that is broken identically on both sides still fails.
+    let row_a = &a.positions[0];
+    assert_eq!(
+        (row_a.marketId, row_a.entryPrice, row_a.markPrice),
+        (MARKET_A, 9_000, P100),
+        "market A: long 3 with vQuoteBalance −$270 entered at $90.00 (9_000 in 2-decimal units)"
+    );
+    assert_eq!(
+        row_a.entryPrice,
+        crate::math::calc_entry_price(
+            row_a.positionAmt,
+            row_a.vQuoteBalance,
+            A_BASE_DECIMALS,
+            A_PRICE_DECIMALS
+        )
+        .unwrap(),
+        "entryPrice is math::calc_entry_price of the two inputs in the same row — the function \
+         PositionChanged uses, not a second derivation"
+    );
+}
+
+/// `totalWalletBalance == totalCrossWalletBalance + Σ positions[i].isolatedWallet`, closed **inside
+/// one response** — the consistency property this reshape exists for.
+///
+/// The identity was already true before; what it was not was CHECKABLE at one state. A backend had
+/// to read `totalWalletBalance` from `getAccount` and each `isolatedWallet` from its own
+/// `getMarginInfo`, i.e. `1 + N` `eth_call`s that can land on different blocks. One fill between the
+/// first and the last breaks the sum for a perfectly healthy account, and the backend cannot tell
+/// that race from a bug in this precompile — so it either pins a block tag (and serves stale
+/// balances) or retries until the numbers agree (and stalls on an active account). Read together,
+/// both sides come from one walk of one store and the identity holds by construction.
+///
+/// Asserted on a fixture where every term is live — a non-zero cross wallet, three silos of
+/// different sizes, and unrealised PnL of both signs so `totalMarginBalance` is not just the gross
+/// wallet again.
+#[test]
+fn the_wallet_balance_identity_closes_inside_one_get_account_response() {
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    add_market(&mut ctx, MARKET_C, A_BASE_DECIMALS, A_PRICE_DECIMALS, P60);
+    add_market(
+        &mut ctx,
+        MARKET_B,
+        B_BASE_DECIMALS,
+        B_PRICE_DECIMALS,
+        12_345,
+    );
+    fund(&mut ctx, ALICE, 5_000 * USD);
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        3,
+        -(270 * USD as i64),
+        300 * USD as i64,
+        2,
+    );
+    set_orders(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        &[entry(1, P100, 2)],
+        &[entry(3, P100, 4)],
+    );
+    set_position(&mut ctx, ALICE, MARKET_B, -3, 300, 200, 1);
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_C,
+        1,
+        -(100 * USD as i64),
+        100 * USD as i64,
+        3,
+    );
+
+    let a = get_account(&mut ctx, ALICE);
+    let sigma_silo: i64 = a.positions.iter().map(|p| p.isolatedWallet).sum();
+    let sigma_isolated_margin: i64 = a.positions.iter().map(|p| p.isolatedMargin).sum();
+
+    assert_eq!(
+        a.totalWalletBalance,
+        a.totalCrossWalletBalance + sigma_silo,
+        "totalWalletBalance == totalCrossWalletBalance + Σ row.isolatedWallet, WITHIN one response"
+    );
+    assert_eq!(
+        a.totalMarginBalance,
+        a.totalCrossWalletBalance + sigma_isolated_margin,
+        "…and equity reached the other way: cross + Σ row.isolatedMargin (silo + row uPnL)"
+    );
+    assert_eq!(
+        a.totalUnrealizedProfit,
+        a.positions.iter().map(|p| p.unrealizedProfit).sum::<i64>(),
+        "totalUnrealizedProfit == Σ row.unrealizedProfit"
+    );
+    assert_eq!(
+        a.availableBalance,
+        a.totalCrossWalletBalance
+            - a.positions
+                .iter()
+                .map(|p| p.openOrderInitialMargin)
+                .sum::<u64>() as i64,
+        "availableBalance == cross − Σ row.openOrderInitialMargin, unclamped"
+    );
+
+    // None of the four identities may hold trivially: three distinct silos, both PnL signs, a live
+    // ooIM term, and a cross wallet that is not the gross one.
+    assert_eq!(a.positions.len(), 3);
+    assert!(
+        sigma_silo > 0
+            && a.totalWalletBalance != a.totalCrossWalletBalance
+            && a.totalMarginBalance != a.totalWalletBalance
+            && a.availableBalance != a.totalCrossWalletBalance
+            && a.positions.iter().any(|p| p.unrealizedProfit > 0)
+            && a.positions.iter().any(|p| p.unrealizedProfit < 0),
+        "every term of the identities must be live: {:?}",
+        (
+            sigma_silo,
+            a.totalWalletBalance,
+            a.totalCrossWalletBalance,
+            a.totalMarginBalance,
+            a.availableBalance,
+        )
     );
 }
 
@@ -1498,7 +1855,7 @@ fn get_account_and_get_account_margin_agree_on_the_same_market_set() {
     set_position(&mut ctx, ALICE, MARKET_B, -3, 300, 200, 1);
 
     let idx = get_account(&mut ctx, ALICE);
-    let list = account_margin(&mut ctx, ALICE, &idx.marketIds);
+    let list = account_margin(&mut ctx, ALICE, &market_ids(&idx));
     assert_eq!(
         (
             idx.totalCrossWalletBalance,

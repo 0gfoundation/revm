@@ -35,8 +35,9 @@ fn make_ctx(alice_usdc: U256) -> TestCtx {
 /// `(usdcBalance, availableBalance)` — the two fields these deposit/withdraw/transfer tests care
 /// about, decoded through the real ABI decoder rather than by slicing words. It used to slice
 /// `bytes[32..64]` for the (then-second, then-`uint64`) available balance; `getAccount` now returns
-/// ten scalars plus `marketIds`, so word 1 is `totalWalletBalance` and hand-slicing would silently
-/// read the wrong field. The full roll-up is exercised in `margin_view_tests`.
+/// twelve scalars plus `positions[]` (which replaced the `marketIds` array), so word 1 is
+/// `totalWalletBalance` and hand-slicing would silently read the wrong field. The full roll-up is
+/// exercised in `margin_view_tests`.
 fn decode_get_account(bytes: &Bytes) -> (U256, i64) {
     let ret = getAccountCall::abi_decode_returns(bytes).expect("getAccount returns must decode");
     (ret.usdcBalance, ret.availableBalance)
@@ -414,7 +415,7 @@ fn get_account_on_a_bare_account_reports_a_negative_cross_wallet_unclamped() {
     // No markets, so no silos and no unrealized PnL: gross == cross, and equity == gross.
     assert_eq!(a.totalWalletBalance, -1_000_000);
     assert_eq!(a.totalMarginBalance, -1_000_000);
-    assert!(a.marketIds.is_empty());
+    assert!(a.positions.is_empty());
 
     // ── The same numbers on the EVENT, unclamped, from the write above ───────────────────────
     let events = JournalTr::take_logs(ctx.journal_mut())

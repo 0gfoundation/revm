@@ -175,6 +175,33 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // selectors doing identical per-market work. 20_000 closes it with margin: it is 1.6× the
         // rate `getAccountMargin` charges for the same 16 markets (50_000 × 16/64 = 12_500).
         // FLAT per selector, never per-item — dynamic metering for this precompile was rejected.
+        //
+        // ⚠️ RE-EXAMINED AND DELIBERATELY LEFT AT 20_000 when the return grew `positions[]` — one
+        // full `getMarginInfo` row per market in place of the bare `uint64[] marketIds`. That is a
+        // real change to what the selector BUYS, so it was decided rather than inherited:
+        //
+        // * The WALK did not move. Same market set, same `{market, position}` per member, same
+        //   `≤ 33 _ref` loads. The rows are the fold's own `MarginInfo`s KEPT instead of discarded
+        //   (`margin_view::fold_account_margin`) — no extra load, no second pass, no extra
+        //   arithmetic. The dominant cost of this selector is untouched.
+        // * What DID grow is the encoded output: 960 → 8_640 bytes at the 16-market cap (MEASURED),
+        //   exactly 9×. That is one bounded allocation and ~8.6 KB of ABI encoding, orders of
+        //   magnitude below a single storage load — and the caller pays the EVM's own memory-expansion
+        //   and returndata gas for it separately, metered by the interpreter, not by us. The
+        //   `MAX_USER_MARKETS` = 16 bound is what keeps it a constant rather than a lever.
+        // * Raising it would push the wrong way. This shape exists so a backend stops issuing
+        //   `getAccount` + N × `getMarginInfo`; that `1 + N` costs 20_000 + 16 × 20_000 = 340_000 and
+        //   makes the node do ~64 loads instead of ~33 for the SAME answer. Pricing the consolidated
+        //   call above the walk it actually performs would tax the cheaper access pattern and subsidise
+        //   the more expensive one.
+        // * The pre-existing asymmetry — `getAccount` doing up to 16× `getMarginInfo`'s per-market
+        //   work at the same flat price — is UNCHANGED by this and is not settled here. It is a
+        //   question about the whole "walks a per-user list" tier (`getOpenOrders` / `getBookPrices`
+        //   are flat over per-user/per-book lists too), and it should be re-tiered as a tier if it is
+        //   re-tiered at all, not opportunistically on the one selector a return-shape change touched.
+        //
+        // `getMarginInfo` likewise stays at 20_000: its addition is `entryPrice`, one division.
+        // The 20_000 is asserted by `margin_view_tests::get_account`, so a silent drift fails.
         m.insert(getAccountCall::SELECTOR, (20_000, true));
         m.insert(setUserFeeRatesCall::SELECTOR, (30_000, false));
         m.insert(getUserFeeRatesCall::SELECTOR, (5_000, true));

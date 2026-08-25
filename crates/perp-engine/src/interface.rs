@@ -20,6 +20,42 @@ sol! {
         function transferToPerp(uint64 amount) external;
         /// Move USDC from the perp trading wallet back to spot balance.
         function transferFromPerp(uint64 amount) external;
+        /// One row of `getAccount`'s `positions[]`: a market id plus the COMPLETE `getMarginInfo`
+        /// for that `(user, marketId)`.
+        ///
+        /// Field for field identical to `getMarginInfo`'s return tuple, in the same order, with
+        /// `marketId` prepended — because it IS that value. Both are built from the same
+        /// `margin_view::MarginInfo`, produced by `margin_view::margin_info_of`, the single
+        /// implementation of the per-market margin arithmetic. There is no second derivation to
+        /// drift from, and
+        /// `margin_view_tests::get_account_positions_agree_with_get_margin_info_field_for_field`
+        /// asserts the equality over every market of a live multi-market index rather than trusting
+        /// it.
+        ///
+        /// See `getMarginInfo` for the field-by-field contract, the rounding mode of each derived
+        /// value, and the mainnet sample that settled it. `marketId` is the only field with no
+        /// `getMarginInfo` counterpart; `entryPrice` is the field `getMarginInfo` GAINED alongside
+        /// this struct, so that the single-market accessor is not missing something the bulk one has.
+        struct AccountPosition {
+            uint64 marketId;         // which market this row is for
+            // ── inputs: every field below is recomputable from these six ──
+            uint64 markPrice;
+            int64  positionAmt;
+            int64  vQuoteBalance;
+            uint64 leverage;
+            uint64 bidNotional;
+            uint64 askNotional;
+            // ── derived ──
+            uint64 entryPrice;       // `-vQuoteBalance / positionAmt`; 0 when flat
+            uint64 notional;
+            int64  unrealizedProfit;
+            int64  isolatedMargin;
+            uint64 positionInitialMargin;
+            uint64 openOrderInitialMargin;
+            uint64 initialMargin;
+            uint64 maintMargin;
+            int64  isolatedWallet;
+        }
         /// Query a user's spot USDC plus the full account-level margin roll-up, over the markets
         /// the user is actually active in. **INDEX-DRIVEN**: the caller passes no market list —
         /// this walks the per-user market index (`umkt`, at most MAX_USER_MARKETS = 16 ids), which
@@ -78,12 +114,50 @@ sol! {
         ///                               alone reaches it, and resting orders are not torn down for
         ///                               it — but new risk-INCREASING actions are refused until it
         ///                               recovers.
-        ///   marketIds                   the index contents, ascending: the exact market set every
-        ///                               total above was summed over. Returned so the totals are
-        ///                               SELF-CHECKABLE — `Σ getMarginInfo(user, id)` over this
-        ///                               array must reproduce them field for field. Empty for an
-        ///                               account with no positions and no resting orders, in which
-        ///                               case every total is 0 and the call still succeeds.
+        ///   positions                   one row PER MARKET in the index, ascending — the exact
+        ///                               market set every total above was summed over, carrying the
+        ///                               per-market numbers those totals are made OF. At most
+        ///                               MAX_USER_MARKETS = 16 rows, so the array is bounded by the
+        ///                               same constant that bounds the walk. Empty for an account
+        ///                               with no positions and no resting orders, in which case
+        ///                               every total is 0 and the call still succeeds — an empty
+        ///                               array is the "no markets" signal, distinguishable from a
+        ///                               market set that happened to sum to zero.
+        ///                               Every total above is SELF-CHECKABLE against it without a
+        ///                               second call: `Σ positions[i].<field>` must reproduce the
+        ///                               matching `total…` field exactly.
+        ///                               ⚠️ **REPLACES `uint64[] marketIds`.** That array was this
+        ///                               same set with every per-market number deleted, so it is a
+        ///                               projection of this one —
+        ///                               `marketIds == [r.marketId for r in positions]` — and a
+        ///                               caller that only wants the ids can still take it from here.
+        ///                               Bindings generated before this are looking for the old
+        ///                               name and will not find it.
+        ///
+        /// ⚠️ WHY THE ROWS ARE IN HERE AND NOT FETCHED PER MARKET: **`1 + N` READS CANNOT BE MADE
+        /// CONSISTENT.** `getAccount` for the totals followed by one `getMarginInfo` per id was the
+        /// only way to assemble a full account picture, and those `N + 1` calls are `N + 1` separate
+        /// `eth_call`s that can land on DIFFERENT BLOCKS. The identity
+        /// `totalWalletBalance == totalCrossWalletBalance + Σ isolatedWallet` then fails for a
+        /// perfectly healthy account — the left side was read at block `n`, the silos at `n+k`, and a
+        /// fill in between moved one of them. A backend seeing that mismatch cannot tell a race from
+        /// a bug in this precompile, and the only fixes available to it are wrong (pin a block tag,
+        /// and it serves stale balances; retry until the numbers agree, and it stalls on an active
+        /// account). One call is ONE STATE: every field here, scalar and row, is read from the same
+        /// store at the same block, so the identities hold by construction and a mismatch is
+        /// unambiguously our bug.
+        ///
+        /// This costs nothing: the walk behind the totals ALREADY computes each row in full and
+        /// discarded everything but the sums. No extra load, no second pass — see
+        /// `margin_view::fold_account_margin`.
+        ///
+        /// ⚠️ NUMBERS ONLY — the rows deliberately do NOT mirror Binance's `positions[]` JSON
+        /// literally, and three of its fields are absent on purpose. `symbol`: we key by
+        /// `marketId`, and the backend maps id → symbol itself from the `MarketAdded` log (a string
+        /// repeated in 16 rows is calldata spent on data the caller already has). `isolated`:
+        /// always `true` — this venue has no cross mode. `positionSide`: always `BOTH` — one-way
+        /// mode only. A backend serving a Binance-shaped `/account` fills those three in itself,
+        /// from constants and its own market table.
         ///
         /// ⚠️ `totalCrossUnPnl` AND `maxWithdrawAmount` ARE PRESENT BUT DEGENERATE. Read this before
         /// using either — both were once deliberately omitted, and one of those reasons still bites.
@@ -147,11 +221,14 @@ sol! {
         ///   what §7.1.2 is about. When adding a Binance-shaped field, check WHICH LEVEL the name
         ///   belongs to, not just that Binance uses it somewhere.
         /// * §7.1.3 (v3's `positions[]` reports derived quantities while deleting every input, so a
-        ///   caller cannot self-check): WE DO NOT. `marketIds` above plus `getMarginInfo` (whose
-        ///   first six returns are the raw inputs `markPrice, positionAmt, vQuoteBalance, leverage,
-        ///   bidNotional, askNotional`) let a caller recompute every total here from scratch and
-        ///   byte-exactly. That round-trip is pinned by
-        ///   `margin_view_tests::get_account_totals_equal_the_sum_of_per_market_get_margin_info`.
+        ///   caller cannot self-check): WE DO NOT — and `positions[]` is now where we most visibly
+        ///   do not. Each row's first six numbers after `marketId` are the raw INPUTS
+        ///   (`markPrice, positionAmt, vQuoteBalance, leverage, bidNotional, askNotional`), so every
+        ///   derived field in the row AND every total above it can be recomputed from this ONE
+        ///   response, byte-exactly, with no second call. That round-trip is pinned by
+        ///   `margin_view_tests::get_account_totals_equal_the_sum_of_per_market_get_margin_info`,
+        ///   and the rows' agreement with the single-market accessor by
+        ///   `margin_view_tests::get_account_positions_agree_with_get_margin_info_field_for_field`.
         function getAccount(address user) external view returns (
             uint256  usdcBalance,
             int64    totalWalletBalance,
@@ -165,7 +242,7 @@ sol! {
             int64    availableBalance,
             int64    totalCrossUnPnl,
             uint64   maxWithdrawAmount,
-            uint64[] marketIds
+            AccountPosition[] positions
         );
         /// Set per-user trading fee rates in basis points. Only callable by admin.
         function setUserFeeRates(address user, uint64 makerFeeBps, uint64 takerFeeBps) external;
@@ -390,13 +467,19 @@ sol! {
         /// Unlike Binance's own `v3 account.positions[]` — which reports `notional`,
         /// `initialMargin` and `maintMargin` while omitting every input needed to check them
         /// (no mark, no entry, no leverage, no bid/ask notional), forcing two more endpoint
-        /// calls — the first six returns are the INPUTS, so a client can recompute all seven
+        /// calls — the first six returns are the INPUTS, so a client can recompute all eight
         /// derived values locally and byte-exactly.
+        ///
+        /// This is the SINGLE-MARKET accessor — the analogue of Binance's `/positionRisk`. For a
+        /// whole account, `getAccount` returns one `AccountPosition` row per market with exactly
+        /// these fields (plus `marketId`) in ONE call and ONE state; prefer it over `1 + N` reads.
+        /// Both are built from the same `margin_view::MarginInfo`, so they cannot disagree.
         ///
         /// Inputs:
         ///   markPrice       market's current mark, in `priceDecimals` fixed-point units.
         ///   positionAmt     signed net position (base units). Positive = long.
-        ///   vQuoteBalance   virtual quote balance; `entryPrice = -vQuoteBalance / positionAmt`.
+        ///   vQuoteBalance   virtual quote balance; `entryPrice = -vQuoteBalance / positionAmt`,
+        ///                   and that quotient is now returned outright as `entryPrice` below.
         ///   leverage        the position's leverage setting (never 0 — floored at 1).
         ///   bidNotional     `Bid` = Σ over the user's resting BUYS in this market of
         ///                   `qty × that order's LIMIT price` (NOT mark), each term floored to
@@ -417,6 +500,19 @@ sol! {
         ///                   (the live position notional) — never through this one.
         ///
         /// Derived (Binance formulas, Binance rounding):
+        ///   entryPrice            Binance `entryPrice` — the position's volume-weighted average
+        ///                         entry, `-vQuoteBalance / positionAmt` scaled into
+        ///                         `priceDecimals` units. **0 when `positionAmt == 0`** (a flat
+        ///                         position has no entry; it is not a price of zero). Derived, not
+        ///                         stored: `vQuoteBalance` is the accumulated `-(qty × price)` and
+        ///                         this is its per-unit inverse, so the two are consistent by
+        ///                         construction. It comes from `math::calc_entry_price` — the SAME
+        ///                         function the `PositionChanged` event uses for its own
+        ///                         `entryPrice`, so the event and both views agree digit for digit
+        ///                         and there is no second derivation to drift.
+        ///                         ADDED with `getAccount`'s `positions[]`, which carries this field
+        ///                         per row: leaving it off the single-market accessor would have
+        ///                         made the bulk call the only way to read it.
         ///   notional              `trunc(|positionAmt| × markPrice)` — TRUNCATED, and every
         ///                         field below uses this truncated value, not raw mark.
         ///   unrealizedProfit      `positionAmt × (markPrice − entryPrice)`, TRUNCATED TOWARD
@@ -464,6 +560,7 @@ sol! {
             uint64 leverage,
             uint64 bidNotional,
             uint64 askNotional,
+            uint64 entryPrice,
             uint64 notional,
             int64  unrealizedProfit,
             int64  isolatedMargin,
