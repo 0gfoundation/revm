@@ -141,6 +141,28 @@ pub struct MarginInfo {
     pub maint_margin: u64,
     /// The position's own allocated margin — our `isolatedWallet`.
     pub position_margin: i64,
+    /// The mark price at which this position **IS** liquidatable (greatest such price for a long,
+    /// least for a short); `0` when there is none.
+    ///
+    /// From [`crate::math::calc_liquidation_price`], which BISECTS the very predicate `liquidate()`
+    /// enforces ([`crate::math::is_above_maintenance_margin`]) rather than restating it as a
+    /// formula — see that function for the monotonicity argument, the conservative rounding, and
+    /// the three distinct states `0` collapses.
+    ///
+    /// # Why it lives IN `MarginInfo` and not in a wrapper beside it
+    ///
+    /// It was briefly a sixteenth number held OUTSIDE this struct, on the theory that `MarginInfo`
+    /// should stay exactly the set two surfaces share. That inverted: `MarginInfo` is now exactly
+    /// the set the ONE surface encodes (`interface::IPerpDex::AccountPosition`, which
+    /// `getPositionRisk` and `getAccount`'s `positions[]` both return), so a number reported on that
+    /// row belongs here or it is plumbed by hand to every construction site — which is a second
+    /// derivation waiting to happen.
+    ///
+    /// It is also the only home where it costs NOTHING to obtain: [`margin_info_of`] already holds
+    /// the market's tier table and the position's `(amount, v_quote_balance, margin)` triple, so the
+    /// search adds **zero storage loads** and cannot describe a different position than the row it
+    /// sits in.
+    pub liquidation_price: u64,
 }
 
 /// The derived open-order requirement for ONE `(market, position)` pair, computed from
@@ -475,6 +497,30 @@ pub fn margin_info_of(
     )?)
     .map_err(|_| perp_err("getMarginInfo: maintenance margin negative"))?;
 
+    // ── liquidationPrice ────────────────────────────────────────────────────────────────
+    // A SEARCH, not a formula: `calc_liquidation_price` bisects `is_above_maintenance_margin` —
+    // the exact predicate `liquidate()` and the auto-liquidation sweep enforce — so the reported
+    // price is by construction the flip point of the real rule and not an algebraic restatement of
+    // it that can drift from the code. Do NOT re-derive it anywhere: this is the single call site
+    // in the reporting layer, and every surface reads THIS field.
+    //
+    // ZERO LOADS. Every input is already in hand at this point in the function: `market.tiers` and
+    // the two decimal grids off the `Market` this function was handed, and the position's
+    // `(amount, v_quote_balance, margin)` triple off the same `pos` every field above was built
+    // from — which is also why the price cannot describe a different position than its own row.
+    // The cost is arithmetic only: ~64 iterations for the domain bound plus ~64 for the search,
+    // each a handful of `i128` multiplications and a walk of the ≤ MAX_MARGIN_TIERS = 8 table
+    // already resident in `market`.
+    let liquidation_price = crate::math::calc_liquidation_price(
+        &market.tiers,
+        pos.amount,
+        pos.v_quote_balance,
+        pos.margin,
+        base_decimals,
+        price_decimals,
+    )
+    .map_err(|e| relabel_derived(e, "getMarginInfo"))?;
+
     Ok(MarginInfo {
         mark_price: market.mark_price,
         position_amt: pos.amount,
@@ -491,6 +537,7 @@ pub fn margin_info_of(
         initial_margin,
         maint_margin,
         position_margin: pos.margin,
+        liquidation_price,
     })
 }
 
@@ -702,69 +749,17 @@ pub fn run_get_margin_info<H: PerpHost>(
     )))
 }
 
-/// [`MarginInfo`] plus the position's liquidation price — field for field the return of
-/// `getPositionRisk`.
+/// `getPositionRisk(address user, uint64 marketId) returns (...)` — the [`MarginInfo`] for one
+/// `(user, market)`, `liquidationPrice` included. See the ABI doc comment in [`crate::interface`].
 ///
-/// A wrapper rather than a sixteenth [`MarginInfo`] field ON PURPOSE. `MarginInfo` is the value
-/// `getMarginInfo` and `getAccount`'s `positions[]` rows BOTH encode, so a field added there lands
-/// in the `AccountPosition` struct too — an ABI change to the bulk path, and a separate decision
-/// from adding this selector (see the `getPositionRisk` ABI comment). Keeping the extra number
-/// outside `MarginInfo` is what lets the three surfaces stay field-for-field comparable.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PositionRisk {
-    /// Everything `getMarginInfo(user, market_id)` returns, for the same `(user, market_id)` and
-    /// from the same [`margin_info_of`] call — not a second derivation.
-    pub info: MarginInfo,
-    /// The mark price at which this position IS liquidatable (greatest such price for a long, least
-    /// for a short); `0` when there is none. From [`crate::math::calc_liquidation_price`], which
-    /// bisects the very predicate `liquidate()` enforces — see that function for the definition,
-    /// the monotonicity argument, and what `0` does not distinguish.
-    pub liquidation_price: u64,
-}
-
-/// Compute [`PositionRisk`] for one `(user, market)`. Pure: reads only, no writes.
+/// # No `PositionRisk` type, and no second derivation
 ///
-/// Deliberately routed through [`compute_margin_info`] rather than re-deriving anything: that is
-/// what makes `getPositionRisk`'s shared fields the SAME VALUES `getMarginInfo` returns, and it
-/// keeps the debug-only Bid/Ask order-list oracle live on this path too. The extra `Market` read is
-/// a `_ref` load of the blob `compute_margin_info` just brought resident, and the liquidation
-/// search itself touches no storage at all.
-pub fn compute_position_risk<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    market_id: u64,
-) -> Result<PositionRisk, PerpError> {
-    // Market FIRST, so an unknown market rejects under THIS selector's name rather than under
-    // `compute_margin_info`'s. The load below then hits the resident blob.
-    let market = storage::load_market_ref(context, market_id)?
-        .ok_or_else(|| perp_err("getPositionRisk: unknown market"))?;
-    let info = compute_margin_info(context, user, market_id)?;
-
-    // The three position terms come out of `info`, not out of a second position load: they are the
-    // same `(amount, v_quote_balance, margin)` triple the reported margin numbers were built from,
-    // so the liquidation price cannot describe a different position than the row it sits in.
-    let liquidation_price = crate::math::calc_liquidation_price(
-        &market.tiers,
-        info.position_amt,
-        info.v_quote_balance,
-        info.position_margin,
-        market.base_decimals,
-        market.price_decimals,
-    )
-    .map_err(|e| relabel_derived(e, "getPositionRisk"))?;
-
-    Ok(PositionRisk {
-        info,
-        liquidation_price,
-    })
-}
-
-/// `getPositionRisk(address user, uint64 marketId) returns (...)` — [`run_get_margin_info`]'s
-/// fifteen numbers plus `liquidationPrice`. See the ABI doc comment in [`crate::interface`].
-///
-/// Deliberately adjacent to [`run_get_margin_info`] and [`AccountPositionRow::to_abi`]: three
-/// encoders now write out the same [`MarginInfo`], and keeping them in one field of view is how a
-/// field added to one and forgotten in the others stays visible.
+/// This used to compute the liquidation price itself, into a `PositionRisk` wrapper that held a
+/// `MarginInfo` plus that one extra number. Both are gone: `liquidation_price` is a
+/// [`MarginInfo`] FIELD, produced by [`margin_info_of`] alongside the other fifteen, so there is
+/// exactly one derivation of it in the engine and this selector reads it rather than re-running the
+/// search. The market's own reject wording is preserved by the load below, which is otherwise a
+/// `_ref` hit on the blob [`compute_margin_info`] is about to bring resident.
 pub fn run_get_position_risk<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -772,8 +767,12 @@ pub fn run_get_position_risk<H: PerpHost>(
     let args = getPositionRiskCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getPositionRisk: invalid calldata"))?;
 
-    let risk = compute_position_risk(context, args.user, args.marketId)?;
-    let info = &risk.info;
+    // Market FIRST, so an unknown market rejects under THIS selector's name rather than under
+    // `compute_margin_info`'s. The load inside `compute_margin_info` then hits the resident blob.
+    if storage::load_market_ref(context, args.marketId)?.is_none() {
+        return Err(perp_err("getPositionRisk: unknown market"));
+    }
+    let info = compute_margin_info(context, args.user, args.marketId)?;
 
     Ok(Bytes::from(getPositionRiskCall::abi_encode_returns(
         &getPositionRiskReturn {
@@ -792,7 +791,7 @@ pub fn run_get_position_risk<H: PerpHost>(
             initialMargin: info.initial_margin,
             maintMargin: info.maint_margin,
             isolatedWallet: info.position_margin,
-            liquidationPrice: risk.liquidation_price,
+            liquidationPrice: info.liquidation_price,
         },
     )))
 }
@@ -819,12 +818,16 @@ pub struct AccountPositionRow {
 impl AccountPositionRow {
     /// ABI form of this row.
     ///
-    /// Deliberately adjacent to [`run_get_margin_info`]'s encoding: the two write out the same 14
+    /// Deliberately adjacent to [`run_get_margin_info`]'s encoding: the two write out the same 15
     /// numbers into two `sol!`-generated types, and keeping them in one field of view is how a
     /// field added to one and forgotten in the other stays visible. (The VALUES cannot drift — one
     /// [`MarginInfo`] — but a field could still be dropped on the way out, which is what
     /// `margin_view_tests::get_account_positions_agree_with_get_margin_info_field_for_field`
     /// checks.)
+    ///
+    /// `liquidationPrice` is the one field with no `getMarginInfo` counterpart. It is read off the
+    /// same [`MarginInfo`] as everything else, so the bulk path carries it for zero extra loads and
+    /// a multi-market backend no longer needs `1 + N` calls to assemble it.
     pub fn to_abi(&self) -> crate::interface::IPerpDex::AccountPosition {
         let i = &self.info;
         crate::interface::IPerpDex::AccountPosition {
@@ -844,6 +847,7 @@ impl AccountPositionRow {
             initialMargin: i.initial_margin,
             maintMargin: i.maint_margin,
             isolatedWallet: i.position_margin,
+            liquidationPrice: i.liquidation_price,
         }
     }
 }

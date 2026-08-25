@@ -21,13 +21,13 @@ sol! {
         /// Move USDC from the perp trading wallet back to spot balance.
         function transferFromPerp(uint64 amount) external;
         /// One row of `getAccount`'s `positions[]`: a market id plus the COMPLETE `getMarginInfo`
-        /// for that `(user, marketId)`.
+        /// for that `(user, marketId)`, `liquidationPrice` included.
         ///
         /// Field for field identical to `getMarginInfo`'s return tuple, in the same order, with
-        /// `marketId` prepended — because it IS that value. Both are built from the same
-        /// `margin_view::MarginInfo`, produced by `margin_view::margin_info_of`, the single
-        /// implementation of the per-market margin arithmetic. There is no second derivation to
-        /// drift from, and
+        /// `marketId` prepended and `liquidationPrice` appended — because it IS that value. Both are
+        /// built from the same `margin_view::MarginInfo`, produced by `margin_view::margin_info_of`,
+        /// the single implementation of the per-market margin arithmetic. There is no second
+        /// derivation to drift from, and
         /// `margin_view_tests::get_account_positions_agree_with_get_margin_info_field_for_field`
         /// asserts the equality over every market of a live multi-market index rather than trusting
         /// it.
@@ -36,6 +36,18 @@ sol! {
         /// value, and the mainnet sample that settled it. `marketId` is the only field with no
         /// `getMarginInfo` counterpart; `entryPrice` is the field `getMarginInfo` GAINED alongside
         /// this struct, so that the single-market accessor is not missing something the bulk one has.
+        ///
+        /// ⚠️ `liquidationPrice` IS ON THIS ROW ON PURPOSE, AND CLOSES A RACE. See `getPositionRisk`
+        /// for the full contract of the number (it is a SEARCH on the predicate `liquidate()`
+        /// enforces, `0` is the ABSENCE of a price, and the three states `0` collapses). It was
+        /// briefly available ONLY through that per-market selector — which put a backend rendering
+        /// several markets straight back into the `1 + N` straddle this array exists to remove: the
+        /// totals and silos from one block, each market's liquidation price from another. Carrying it
+        /// here makes the whole risk picture ONE read of ONE state. It costs nothing extra: the
+        /// search runs on the tier table and position triple `margin_view::margin_info_of` is
+        /// already holding, so it adds ZERO storage loads to a walk that does not move — only the
+        /// encoded output grows, exactly as when this array replaced `uint64[] marketIds`.
+        /// `getAccount`'s gas is therefore UNCHANGED and still flat.
         struct AccountPosition {
             uint64 marketId;         // which market this row is for
             // ── inputs: every field below is recomputable from these six ──
@@ -55,6 +67,8 @@ sol! {
             uint64 initialMargin;
             uint64 maintMargin;
             int64  isolatedWallet;
+            // ── derived, ours ──
+            uint64 liquidationPrice;
         }
         /// Query a user's spot USDC plus the full account-level margin roll-up, over the markets
         /// the user is actually active in. **INDEX-DRIVEN**: the caller passes no market list —
@@ -149,7 +163,9 @@ sol! {
         ///
         /// This costs nothing: the walk behind the totals ALREADY computes each row in full and
         /// discarded everything but the sums. No extra load, no second pass — see
-        /// `margin_view::fold_account_margin`.
+        /// `margin_view::fold_account_margin`. The same holds for `liquidationPrice`, the one row
+        /// field with no `total…` counterpart: its search consumes only the tier table and position
+        /// triple that walk is already holding.
         ///
         /// ⚠️ NUMBERS ONLY — the rows deliberately do NOT mirror Binance's `positions[]` JSON
         /// literally, and three of its fields are absent on purpose. `symbol`: we key by
@@ -653,10 +669,10 @@ sol! {
         /// Reverts if the market does not exist, exactly as `getMarginInfo` does.
         ///
         /// ⚠️ `getMarginInfo` IS NOT DELETED and keeps working unchanged. This is a strict
-        /// superset of it, so new code should prefer THIS selector — but there is no per-market
-        /// call this replaces outright until `liquidationPrice` also reaches
-        /// `getAccount().positions[]`, since only the bulk path avoids the `1 + N` straddle for a
-        /// backend rendering several markets.
+        /// superset of it, so new code should prefer THIS selector. A backend rendering SEVERAL
+        /// markets should prefer neither: `getAccount().positions[]` now carries `liquidationPrice`
+        /// on every row, so the whole risk picture is one read of one state and this selector is for
+        /// the genuinely single-market query.
         function getPositionRisk(address user, uint64 marketId) external view returns (
             uint64 markPrice,
             int64  positionAmt,

@@ -204,6 +204,22 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         //   re-tiered at all, not opportunistically on the one selector a return-shape change touched.
         //
         // `getMarginInfo` likewise stays at 20_000: its addition is `entryPrice`, one division.
+        //
+        // ⚠️ RE-EXAMINED AND LEFT AT 20_000 AGAIN when every `positions[]` row grew
+        // `liquidationPrice`. Same argument as the row array itself, one level down: the WALK does
+        // not move, only the encoded output grows. The added work is a liquidation SEARCH per row,
+        // and it performs ZERO storage loads — `margin_view::margin_info_of` runs it on the tier
+        // table and the `(amount, vQuote, margin)` triple it is already holding, so the ≤ 33 `_ref`
+        // loads that dominate this selector are untouched. What it costs is ~128 iterations of a
+        // handful of `i128` multiplications plus a ≤ MAX_MARGIN_TIERS = 8 band walk — ~64 for the
+        // domain bound and ~64 for the bisection — bounded by MAX_USER_MARKETS = 16 rows, i.e.
+        // ~2_048 such iterations worst case against ~33 storage loads. A single load is orders of
+        // magnitude more expensive than all of them together, which is the same reasoning that
+        // priced `getPositionRisk` AT `getMarginInfo` rather than above it.
+        // Raising it would push the wrong way for the same reason as above, and harder: the whole
+        // point of the field being on the row is that a backend rendering N markets stops issuing
+        // `getAccount` + N × `getPositionRisk` (20_000 + 16 × 20_000 = 340_000 and ~64 loads) for an
+        // answer this one call already holds — and, unlike the `1 + N` shape, holds CONSISTENTLY.
         // The 20_000 is asserted by `margin_view_tests::get_account`, so a silent drift fails.
         m.insert(getAccountCall::SELECTOR, (20_000, true));
         m.insert(setUserFeeRatesCall::SELECTOR, (30_000, false));

@@ -299,13 +299,14 @@ fn get_account(ctx: &mut TestCtx, user: Address) -> getAccountReturn {
     getAccountCall::abi_decode_returns(&out.bytes).unwrap()
 }
 
-/// One `getAccount` `positions[]` row flattened to its 16 numbers, in DECLARATION ORDER, widened to
-/// `i128` so the signed and unsigned fields sit in one comparable, `Debug`-printable array.
+/// One `getAccount` `positions[]` row flattened to ALL 17 of its numbers, in DECLARATION ORDER,
+/// widened to `i128` so the signed and unsigned fields sit in one comparable, `Debug`-printable
+/// array.
 ///
-/// An array rather than a tuple because 16 fields is past the arity std implements `PartialEq` for —
+/// An array rather than a tuple because 17 fields is past the arity std implements `PartialEq` for —
 /// and positional over ALL of them on purpose: a comparison field-by-field by name would still pass
 /// if two same-typed fields were swapped on one side.
-fn row_fields(p: &AccountPosition) -> [i128; 16] {
+fn row_fields(p: &AccountPosition) -> [i128; 17] {
     [
         p.marketId as i128,
         p.markPrice as i128,
@@ -323,7 +324,15 @@ fn row_fields(p: &AccountPosition) -> [i128; 16] {
         p.initialMargin as i128,
         p.maintMargin as i128,
         p.isolatedWallet as i128,
+        p.liquidationPrice as i128,
     ]
+}
+
+/// The 16 row fields that have a `getMarginInfo` counterpart — [`row_fields`] without
+/// `liquidationPrice`, which that selector does not return. Lines up with [`margin_info_fields`].
+fn row_shared_fields(p: &AccountPosition) -> [i128; 16] {
+    let all = row_fields(p);
+    core::array::from_fn(|k| all[k])
 }
 
 /// `getPositionRisk`'s SHARED 15 returns — everything except `liquidationPrice` — flattened in
@@ -1548,16 +1557,20 @@ fn get_account_totals_equal_the_sum_of_per_market_get_margin_info() {
 /// The VALUES cannot drift by construction — both encoders are handed one
 /// `margin_view::margin_info_of` output, and `fold_account_margin` keeps that value rather than
 /// recomputing it. What this test actually catches is everything AROUND that: a field dropped or
-/// mis-assigned in one of the two `sol!` encoders (they are separate code writing out the same 14
+/// mis-assigned in one of the two `sol!` encoders (they are separate code writing out the same 15
 /// numbers), a row paired with the wrong `marketId`, rows built from a different market set than the
 /// totals, and — the one that would be silent — a future field added to `getMarginInfo` and
-/// forgotten on the row, or vice versa. Comparison is positional over all 16 numbers, so a swap of
-/// two same-typed fields on one side fails too.
+/// forgotten on the row, or vice versa. Comparison is positional over all 16 shared numbers, so a
+/// swap of two same-typed fields on one side fails too.
+///
+/// `liquidationPrice` is the row's seventeenth number and has no `getMarginInfo` counterpart, so it
+/// is checked separately in the same loop, against `getPositionRisk` on the same state.
 ///
 /// The fixture is deliberately NOT a zeros case: three markets with live marks, a long and a short,
 /// unrealised PnL of both signs, resting orders on both sides of one market and one side of another,
 /// and a genuinely under-funded silo — so every field in the row is a distinct non-trivial number
-/// and an all-zero row could not pass by accident.
+/// and an all-zero row could not pass by accident. The long/short mix matters twice over now: the
+/// liquidation search is not symmetric in the position sign.
 #[test]
 fn get_account_positions_agree_with_get_margin_info_field_for_field() {
     let mut ctx = make_ctx();
@@ -1614,10 +1627,22 @@ fn get_account_positions_agree_with_get_margin_info_field_for_field() {
     for p in &a.positions {
         let i = margin_info(&mut ctx, ALICE, p.marketId);
         assert_eq!(
-            row_fields(p),
+            row_shared_fields(p),
             margin_info_fields(p.marketId, &i),
             "getAccount's positions[] row for market {} disagrees with getMarginInfo on the same \
              state — the bulk and single-market accessors have forked",
+            p.marketId
+        );
+        // `liquidationPrice` is the one row field `getMarginInfo` does not return, so the agreement
+        // above cannot reach it. Check it against the per-market selector that DOES carry it, on the
+        // same state — the whole point of putting it on the row is that a backend no longer needs
+        // this second call, so the two must not be able to disagree.
+        let r = position_risk(&mut ctx, ALICE, p.marketId);
+        assert_eq!(
+            p.liquidationPrice, r.liquidationPrice,
+            "getAccount's positions[] row for market {} disagrees with getPositionRisk on \
+             liquidationPrice — the bulk path is reporting a different liquidation price than the \
+             per-market one for the same state",
             p.marketId
         );
     }
@@ -1641,7 +1666,8 @@ fn get_account_positions_agree_with_get_margin_info_field_for_field() {
             && nonzero(|p| p.openOrderInitialMargin as i128)
             && nonzero(|p| p.initialMargin as i128)
             && nonzero(|p| p.maintMargin as i128)
-            && nonzero(|p| p.isolatedWallet as i128),
+            && nonzero(|p| p.isolatedWallet as i128)
+            && nonzero(|p| p.liquidationPrice as i128),
         "every row field must be non-trivial somewhere in the fixture, or the agreement above is \
          an agreement about zeros: {:?}",
         a.positions.iter().map(row_fields).collect::<Vec<_>>()
@@ -1658,6 +1684,12 @@ fn get_account_positions_agree_with_get_margin_info_field_for_field() {
             .iter()
             .any(|p| p.isolatedWallet < p.positionInitialMargin as i64),
         "the fixture must carry an under-funded silo"
+    );
+    // Both position SIGNS, since the liquidation search is not symmetric in them.
+    assert!(
+        a.positions.iter().any(|p| p.positionAmt > 0)
+            && a.positions.iter().any(|p| p.positionAmt < 0),
+        "the fixture must carry a LONG and a SHORT"
     );
     // And `entryPrice` is the field this reshape ADDED to both surfaces — pin the value, not just
     // the agreement, so a broken derivation that is broken identically on both sides still fails.
