@@ -18,7 +18,7 @@ use crate::{
     },
     batch,
     errors,
-    margin_view::{run_get_account_margin, run_get_margin_info},
+    margin_view::{run_get_account_margin, run_get_margin_info, run_get_position_risk},
     interface::IPerpDex::{
         addMarketCall, addPositionMarginCall, batchCancelOrdersCall,
         batchCancelOrdersSignedCall, batchPlaceOrdersCall, batchPlaceOrdersSignedCall,
@@ -28,7 +28,8 @@ use crate::{
         getIndexPriceCall, getInsuranceFundCall, getMarginInfoCall, getMarginTiersCall,
         getMarkPriceCall, getMarketCall,
         getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
-        getOracleAddressCall, getOrderCall, getPositionCall, getSymbolConfigCall,
+        getOracleAddressCall, getOrderCall, getPositionCall, getPositionRiskCall,
+        getSymbolConfigCall,
         getUserFeeRatesCall,
         initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
         removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
@@ -297,6 +298,16 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // account roll-up does that once per market id and is bounded by
         // `margin_view::MAX_MARGIN_INFO_MARKETS`.
         m.insert(getMarginInfoCall::SELECTOR, (20_000, true));
+        // `getPositionRisk` = `getMarginInfo` plus `liquidationPrice`, so it is priced AT
+        // `getMarginInfo`: the load set is identical (one market `_ref`, one position `_ref`, and
+        // in debug the same two order lists), and the liquidation search adds ZERO loads — it
+        // bisects `is_above_maintenance_margin` over ~64 iterations of a handful of `i128`
+        // multiplications plus a walk of the MAX_MARGIN_TIERS = 8 table already resident in the
+        // `Market` this call read, and ~64 more for its domain bound. That is orders of magnitude
+        // below the one storage load it does not perform. Pricing it above `getMarginInfo` would
+        // tax the strict superset and subsidise the call a client should be migrating off.
+        // FLAT, per selector.
+        m.insert(getPositionRiskCall::SELECTOR, (20_000, true));
         m.insert(getAccountMarginCall::SELECTOR, (50_000, true));
         // +10_000 each for the single `AccountBalanceChanged` snapshot they emit (see "Account").
         m.insert(addPositionMarginCall::SELECTOR, (40_000, false));
@@ -530,6 +541,7 @@ pub fn run_perp_dex_call<H: PerpHost>(
         // Positions
         s if s == getPositionCall::SELECTOR => run_get_position(input_bytes, context),
         s if s == getMarginInfoCall::SELECTOR => run_get_margin_info(input_bytes, context),
+        s if s == getPositionRiskCall::SELECTOR => run_get_position_risk(input_bytes, context),
         s if s == getAccountMarginCall::SELECTOR => run_get_account_margin(input_bytes, context),
         s if s == addPositionMarginCall::SELECTOR => {
             run_add_position_margin(input_bytes, caller, context)

@@ -25,7 +25,7 @@ use crate::{
     host::PerpHost,
     interface::IPerpDex::{
         getAccountCall, getAccountMarginReturn, getAccountReturn, getMarginInfoReturn,
-        placeOrderCall, AccountPosition,
+        getPositionRiskCall, getPositionRiskReturn, placeOrderCall, AccountPosition,
     },
     run_perp_dex_call, storage,
     types::{
@@ -230,6 +230,43 @@ fn margin_info(ctx: &mut TestCtx, user: Address, market_id: u64) -> getMarginInf
     getMarginInfoCall::abi_decode_returns(&out.bytes).unwrap()
 }
 
+/// Read `getPositionRisk` through the FULL call shell in a STATIC context — which is also the
+/// assertion that the selector is registered `can_be_static = true` and priced AT `getMarginInfo`'s
+/// flat 20_000, the tier it shares its whole load set with. The liquidation search adds no loads,
+/// so it must not move the price.
+fn position_risk(ctx: &mut TestCtx, user: Address, market_id: u64) -> getPositionRiskReturn {
+    let input = getPositionRiskCall {
+        user,
+        marketId: market_id,
+    }
+    .abi_encode();
+    let out = run_perp_dex_call(&input, 1_000_000, user, U256::ZERO, true, ctx).unwrap();
+    assert!(!out.reverted, "getPositionRisk reverted: {:?}", out.bytes);
+    assert_eq!(
+        out.gas_used, 20_000,
+        "getPositionRisk's gas must stay FLAT per selector — never per-iteration or dynamic"
+    );
+    getPositionRiskCall::abi_decode_returns(&out.bytes).unwrap()
+}
+
+/// Replace a market's margin-tier table directly in storage. The engine's own `setMarginTiers`
+/// would do, but these are read-path tests and the admin plumbing is exercised in
+/// `risk::tests`; going straight at the blob keeps the fixture to one statement.
+fn set_tiers(ctx: &mut TestCtx, market_id: u64, rows: &[(u64, u32)]) {
+    let mut market = storage::load_market(ctx, market_id).unwrap().unwrap();
+    let tiers: Vec<crate::types::MarginTier> = rows
+        .iter()
+        .map(
+            |&(lower_bound_notional, max_leverage)| crate::types::MarginTier {
+                lower_bound_notional,
+                max_leverage,
+            },
+        )
+        .collect();
+    market.tiers = MarginTiers::from_tiers(&tiers).unwrap();
+    storage::save_market(ctx, &market).unwrap();
+}
+
 /// Read `getAccountMargin` through the full call shell in a static context.
 fn account_margin(ctx: &mut TestCtx, user: Address, market_ids: &[u64]) -> getAccountMarginReturn {
     let input = getAccountMarginCall {
@@ -286,6 +323,53 @@ fn row_fields(p: &AccountPosition) -> [i128; 16] {
         p.initialMargin as i128,
         p.maintMargin as i128,
         p.isolatedWallet as i128,
+    ]
+}
+
+/// `getPositionRisk`'s SHARED 15 returns — everything except `liquidationPrice` — flattened in
+/// declaration order and widened to `i128`, so it lines up with [`margin_info_only_fields`].
+///
+/// Written out independently of the `getMarginInfo` flattener on purpose: sharing a converter would
+/// make the two sides agree by construction and test nothing.
+fn risk_shared_fields(r: &getPositionRiskReturn) -> [i128; 15] {
+    [
+        r.markPrice as i128,
+        r.positionAmt as i128,
+        r.vQuoteBalance as i128,
+        r.leverage as i128,
+        r.bidNotional as i128,
+        r.askNotional as i128,
+        r.entryPrice as i128,
+        r.notional as i128,
+        r.unrealizedProfit as i128,
+        r.isolatedMargin as i128,
+        r.positionInitialMargin as i128,
+        r.openOrderInitialMargin as i128,
+        r.initialMargin as i128,
+        r.maintMargin as i128,
+        r.isolatedWallet as i128,
+    ]
+}
+
+/// `getMarginInfo`'s 15 returns flattened the same way, for comparison against
+/// [`risk_shared_fields`]. This is [`margin_info_fields`] without the prepended `marketId`.
+fn margin_info_only_fields(i: &getMarginInfoReturn) -> [i128; 15] {
+    [
+        i.markPrice as i128,
+        i.positionAmt as i128,
+        i.vQuoteBalance as i128,
+        i.leverage as i128,
+        i.bidNotional as i128,
+        i.askNotional as i128,
+        i.entryPrice as i128,
+        i.notional as i128,
+        i.unrealizedProfit as i128,
+        i.isolatedMargin as i128,
+        i.positionInitialMargin as i128,
+        i.openOrderInitialMargin as i128,
+        i.initialMargin as i128,
+        i.maintMargin as i128,
+        i.isolatedWallet as i128,
     ]
 }
 
@@ -1595,6 +1679,265 @@ fn get_account_positions_agree_with_get_margin_info_field_for_field() {
         "entryPrice is math::calc_entry_price of the two inputs in the same row — the function \
          PositionChanged uses, not a second derivation"
     );
+}
+
+/// `getPositionRisk`'s first fifteen returns must equal `getMarginInfo`'s fifteen on the same
+/// state, POSITIONALLY over all of them — `getPositionRisk` claims to be a strict superset, and this
+/// is that claim under test rather than under assertion in a comment.
+///
+/// Same shape as `get_account_positions_agree_with_get_margin_info_field_for_field`, including its
+/// "every field is non-trivial SOMEWHERE" guard: without that this could pass as an agreement about
+/// zeros and would prove nothing about either encoder. The VALUES cannot drift (both selectors
+/// encode one `margin_info_of` output); what this catches is everything around that — a field
+/// dropped or mis-assigned in the third `sol!` encoder, and the silent one, a future field added to
+/// one surface and forgotten on the other.
+#[test]
+fn get_position_risk_agrees_with_get_margin_info_field_for_field() {
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    add_market(
+        &mut ctx,
+        MARKET_B,
+        B_BASE_DECIMALS,
+        B_PRICE_DECIMALS,
+        12_345,
+    );
+    add_market(&mut ctx, MARKET_C, A_BASE_DECIMALS, A_PRICE_DECIMALS, P60);
+    fund(&mut ctx, ALICE, 5_000 * USD);
+
+    // The same three-market fixture the bulk-path agreement test uses: market A a LONG with +$30
+    // unrealised and resting orders on BOTH sides (so the joint max() and the Assuming-Price uplift
+    // are live), market B a SHORT on a fractional grid with an under-funded silo and NEGATIVE
+    // unrealised PnL, market C a LONG under water with sells only.
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        3,
+        -(270 * USD as i64),
+        300 * USD as i64,
+        2,
+    );
+    set_orders(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        &[entry(1, P100, 2), entry(2, P60, 5)],
+        &[entry(3, P100, 4), entry(4, 12_000, 3)],
+    );
+    set_position(&mut ctx, ALICE, MARKET_B, -3, 300, 200, 1);
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_C,
+        1,
+        -(100 * USD as i64),
+        100 * USD as i64,
+        3,
+    );
+    set_orders(&mut ctx, ALICE, MARKET_C, &[], &[entry(5, P100, 2)]);
+
+    let risks: Vec<getPositionRiskReturn> = [MARKET_A, MARKET_B, MARKET_C]
+        .into_iter()
+        .map(|m| position_risk(&mut ctx, ALICE, m))
+        .collect();
+
+    for (m, r) in [MARKET_A, MARKET_B, MARKET_C].into_iter().zip(&risks) {
+        let i = margin_info(&mut ctx, ALICE, m);
+        assert_eq!(
+            risk_shared_fields(r),
+            margin_info_only_fields(&i),
+            "getPositionRisk for market {m} disagrees with getMarginInfo on the same state — the \
+             superset has forked from the call it supersedes"
+        );
+    }
+
+    // ── the fixture really does exercise every field ──
+    // Without this the loop above could pass on three responses of zeros.
+    let nonzero = |f: fn(&getPositionRiskReturn) -> i128| risks.iter().any(|r| f(r) != 0);
+    assert!(
+        nonzero(|r| r.markPrice as i128)
+            && nonzero(|r| r.positionAmt as i128)
+            && nonzero(|r| r.vQuoteBalance as i128)
+            && nonzero(|r| r.leverage as i128)
+            && nonzero(|r| r.bidNotional as i128)
+            && nonzero(|r| r.askNotional as i128)
+            && nonzero(|r| r.entryPrice as i128)
+            && nonzero(|r| r.notional as i128)
+            && nonzero(|r| r.unrealizedProfit as i128)
+            && nonzero(|r| r.isolatedMargin as i128)
+            && nonzero(|r| r.positionInitialMargin as i128)
+            && nonzero(|r| r.openOrderInitialMargin as i128)
+            && nonzero(|r| r.initialMargin as i128)
+            && nonzero(|r| r.maintMargin as i128)
+            && nonzero(|r| r.isolatedWallet as i128)
+            && nonzero(|r| r.liquidationPrice as i128),
+        "every field must be non-trivial somewhere in the fixture, or the agreement above is an \
+         agreement about zeros: {:?}",
+        risks.iter().map(risk_shared_fields).collect::<Vec<_>>()
+    );
+    assert!(
+        risks.iter().any(|r| r.unrealizedProfit > 0)
+            && risks.iter().any(|r| r.unrealizedProfit < 0),
+        "the fixture must carry unrealised PnL of BOTH signs"
+    );
+    assert!(
+        risks
+            .iter()
+            .any(|r| r.isolatedWallet < r.positionInitialMargin as i64),
+        "the fixture must carry an under-funded silo"
+    );
+    // Both position SIGNS, since the liquidation search is not symmetric in them.
+    assert!(
+        risks.iter().any(|r| r.positionAmt > 0) && risks.iter().any(|r| r.positionAmt < 0),
+        "the fixture must carry a LONG and a SHORT"
+    );
+}
+
+/// `liquidationPrice` is computed against the MARKET'S OWN tier table, on a table whose answer
+/// lands strictly inside a non-zero band. Under the single default tier every market ships today
+/// the piecewise structure collapses, so this is the test that a wiring bug — passing
+/// `MarginTiers::default()`, or reading a different market's table — cannot pass.
+///
+/// Market A's grid is `base_decimals = 0`, `price_decimals = 2`, so `notional = P · qty · 10^4`
+/// exactly. Table `[{$0, 3x}, {$200, 2x}, {$400, 1x}]`, LONG 3 @ $100 with a $100 silo:
+///
+/// ```text
+///     mm(n) = 33_333_333 + ⌊(n − 200e6)/4⌋   for 200e6 <= n < 400e6
+///     g(P)  = 30_000P − 300e6 + 100e6 − 33_333_333 − (7_500P − 50e6) = 22_500P − 183_333_333
+///     g < 0 <=> P < 8148.148…   =>  greatest liquidatable P = 8148   (n = 244_440_000, band 1 ✓)
+/// ```
+///
+/// and the mirror SHORT gives `−37_500P + 416_666_667 < 0 <=> P > 11111.111…`, i.e. 11112. The
+/// full arithmetic, including both `g` evaluations at the flip, is in
+/// `perp_core::math::liquidation_price_tests::liquidation_price_on_a_multi_tier_table_matches_the_hand_computed_band`;
+/// the values a TIER-BLIND implementation would report are 7999 and 11429, asserted here as the
+/// values this selector must not return.
+#[test]
+fn get_position_risk_liquidation_price_uses_the_markets_own_tier_table() {
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    add_market(&mut ctx, MARKET_C, A_BASE_DECIMALS, A_PRICE_DECIMALS, P100);
+    set_tiers(
+        &mut ctx,
+        MARKET_A,
+        &[(0, 3), (200 * USD, 2), (400 * USD, 1)],
+    );
+    // MARKET_C keeps the DEFAULT single tier, on the identical grid and mark — so the two markets
+    // differ in nothing but the risk table, and any answer that ignores the table makes them equal.
+    fund(&mut ctx, ALICE, 5_000 * USD);
+
+    for (market, expected_long, expected_short) in
+        [(MARKET_A, 8_148u64, 11_112u64), (MARKET_C, 7_999, 11_429)]
+    {
+        set_position(
+            &mut ctx,
+            ALICE,
+            market,
+            3,
+            -(300 * USD as i64),
+            100 * USD as i64,
+            3,
+        );
+        assert_eq!(
+            position_risk(&mut ctx, ALICE, market).liquidationPrice,
+            expected_long,
+            "LONG in market {market}"
+        );
+
+        set_position(
+            &mut ctx,
+            ALICE,
+            market,
+            -3,
+            300 * USD as i64,
+            100 * USD as i64,
+            3,
+        );
+        assert_eq!(
+            position_risk(&mut ctx, ALICE, market).liquidationPrice,
+            expected_short,
+            "SHORT in market {market}"
+        );
+    }
+}
+
+/// The two states with NO liquidation price both report `0`, and `positionAmt` in the same response
+/// is what separates them.
+///
+/// * FLAT — nothing to liquidate.
+/// * A FULLY-FUNDED LONG (`vQuoteBalance + margin >= 0`, i.e. 1× or lower): as the mark falls, the
+///   notional and the maintenance requirement go to zero together, so it never becomes
+///   liquidatable.
+#[test]
+fn get_position_risk_reports_zero_liquidation_price_when_there_is_none() {
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    fund(&mut ctx, ALICE, 5_000 * USD);
+
+    // Flat, and never touched: no position blob at all.
+    let flat = position_risk(&mut ctx, ALICE, MARKET_A);
+    assert_eq!((flat.positionAmt, flat.liquidationPrice), (0, 0));
+
+    // Flat but with a leverage of record — a market this user has entered and left. (A flat
+    // position CANNOT carry a silo: `storage::save_position` asserts that every close zeroes
+    // `margin` alongside `amount`, so "flat with a residual" is not a reachable state to test.)
+    set_position(&mut ctx, ALICE, MARKET_A, 0, 0, 0, 3);
+    let left = position_risk(&mut ctx, ALICE, MARKET_A);
+    assert_eq!(
+        (left.positionAmt, left.leverage, left.liquidationPrice),
+        (0, 3, 0)
+    );
+
+    // 1x LONG: the whole $300 entry cost sits in the silo.
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        3,
+        -(300 * USD as i64),
+        300 * USD as i64,
+        1,
+    );
+    let funded = position_risk(&mut ctx, ALICE, MARKET_A);
+    assert_eq!(
+        (funded.positionAmt, funded.liquidationPrice),
+        (3, 0),
+        "a fully-funded long has no liquidation price — the 0 is the ABSENCE of one, and \
+         positionAmt is what tells it apart from the flat case above"
+    );
+
+    // 3x on the same position DOES have one, so the zeros above are a property of full funding.
+    set_position(
+        &mut ctx,
+        ALICE,
+        MARKET_A,
+        3,
+        -(300 * USD as i64),
+        100 * USD as i64,
+        3,
+    );
+    assert!(position_risk(&mut ctx, ALICE, MARKET_A).liquidationPrice > 0);
+}
+
+/// Unknown market REVERTS, under this selector's own name — the market's decimals and tier table are
+/// required inputs and fabricating a zero market would report a full row of plausible zeros.
+#[test]
+fn get_position_risk_rejects_unknown_market() {
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    let err = crate::margin_view::run_get_position_risk(
+        &getPositionRiskCall {
+            user: ALICE,
+            marketId: 999,
+        }
+        .abi_encode(),
+        &mut ctx,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("getPositionRisk"), "{msg}");
+    assert!(msg.contains("unknown market"), "{msg}");
 }
 
 /// `totalWalletBalance == totalCrossWalletBalance + Σ positions[i].isolatedWallet`, closed **inside

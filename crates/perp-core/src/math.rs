@@ -621,6 +621,228 @@ pub fn calc_bankruptcy_price(
     u64::try_from(price).map_err(|_| perp_err("math: bankruptcy price exceeds u64"))
 }
 
+/// Upper end of the mark-price domain [`calc_liquidation_price`] searches: the largest `P` at
+/// which [`is_above_maintenance_margin`] is guaranteed to EVALUATE, not to hold.
+///
+/// `calc_value_i64` errors on a large enough `P` (an `i128` numerator overflow, then an `i64`
+/// narrowing), so the search domain is NOT all of `u64` and an `Err` must never be silently read as
+/// one side of the predicate. This bounds the domain from below the first failure instead.
+///
+/// The bound is `|notional(P)| <= cap`, with
+/// `cap = i64::MAX − |v_quote_balance| − |margin|` evaluated in `i128`. That single inequality
+/// discharges every failure mode inside the predicate at once:
+///
+/// * `calc_value_i64` itself — Ok by construction, since the search only accepts prices where it
+///   returned a value.
+/// * `notional + v_quote_balance + margin` — `|notional| + |vq| + |margin| <= i64::MAX`, so
+///   neither `checked_add` can overflow.
+/// * `notional.checked_abs()` — `|notional| <= cap < i64::MAX`, so `notional != i64::MIN`.
+/// * `maintenance_margin` — its accumulator is bounded by `|notional| / 2`.
+///
+/// So the whole predicate is total on `[1, hi]`, and an `Err` from it inside the search is a
+/// genuine bug rather than a domain edge.
+///
+/// The search is sound because "evaluable" is a PREFIX property of `P`: `|notional(P)|` is
+/// non-decreasing in `P` (it is `⌊P·|amount|·10^6 / D⌋`), and every condition above is a threshold
+/// on that magnitude, so once a price fails no larger price succeeds.
+///
+/// `P = 0` is deliberately NOT in the domain. A mark of zero is not a state this engine can be in
+/// (`addMarket` rejects it and every mark component is floored at 1), so a liquidation price
+/// reachable only at `P = 0` is not reachable at all.
+fn liquidation_price_domain_hi(
+    amount: i64,
+    v_quote_balance: i64,
+    margin: i64,
+    base_decimals: u32,
+    price_decimals: u32,
+) -> Result<u64, PerpError> {
+    let cap = (i64::MAX as i128) - (v_quote_balance as i128).abs() - (margin as i128).abs();
+    if cap < 0 {
+        return Err(perp_err("math: liquidation price domain empty"));
+    }
+    let evaluable = |p: u64| {
+        matches!(
+            calc_value_i64(p, amount, base_decimals, price_decimals),
+            Ok(v) if (v as i128).abs() <= cap
+        )
+    };
+    if !evaluable(1) {
+        return Err(perp_err("math: liquidation price domain empty"));
+    }
+    if evaluable(u64::MAX) {
+        return Ok(u64::MAX);
+    }
+    // Invariant: `evaluable(lo)`, `!evaluable(hi)`. ~64 iterations, zero storage access.
+    let (mut lo, mut hi) = (1u64, u64::MAX);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if evaluable(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// The mark price at which this position **IS** liquidatable — for a LONG the GREATEST such price,
+/// for a SHORT the LEAST. `0` when there is none (see the two cases at the end).
+///
+/// Conservative by construction: at the returned price [`is_above_maintenance_margin`] is already
+/// false, so liquidation FIRES there. One tick the other way (`P + 1` for a long, `P − 1` for a
+/// short) it does not. `liquidation_price_is_the_exact_flip_of_the_predicate` pins both directions
+/// for both signs.
+///
+/// # Found by EXACT SEARCH on the real predicate, never by algebra
+///
+/// The rule `liquidate()` enforces is [`is_above_maintenance_margin`]:
+///
+/// ```text
+/// notional       = calc_value_i64(P, amount)              // SIGNED
+/// position_value = notional + v_quote_balance + margin
+/// threshold      = maintenance_margin(tiers, |notional|)
+/// liquidatable  <=>  position_value < threshold
+/// ```
+///
+/// Three separate things make a closed-form inversion of that treacherous, and all three are
+/// properties of the code, not of the model:
+///
+/// 1. **It is a fixed point, not a formula.** `mmr` depends on the tier, the tier depends on
+///    `|notional|`, and `|notional|` depends on the very price being solved for. The general rate is
+///    `mmr = 1 / (2 · max_leverage(tier))`; the published `5/6` and `7/6` shortcuts are only the
+///    `mmr = 1/6` case, i.e. the default single tier.
+/// 2. **[`maintenance_margin`] is the integer SLICE form**, floored once per crossed band. Its own
+///    doc comment records that the algebraically-equivalent `N·mmr − cum` is integer-discontinuous
+///    at 53.1% of two-tier boundaries, deterministically — so a re-derivation would agree on every
+///    node and never surface as a consensus fault.
+/// 3. **`calc_value_i64` truncates toward ZERO, not floor**, so the sign of `amount` reaches the
+///    arithmetic and a hand-rolled inversion has two cases to get right rather than one.
+///
+/// The search has none of those exposures. `g(P) = position_value(P) − threshold(P)` is MONOTONE in
+/// `P`, so it flips sign exactly once and the flip can be bisected using
+/// `is_above_maintenance_margin` ITSELF as the oracle. The reported price is then literally the
+/// flip point of the function `liquidate()` calls, not an algebraic model of it: exact by
+/// construction, no rounding decision to make, no per-band case analysis, and correct for any tier
+/// count. Cost is ~64 iterations of a few multiplications and a walk of a table bounded by
+/// `MAX_MARGIN_TIERS = 8`, plus ~64 for the domain bound — with **zero storage loads**.
+///
+/// ## Why `g` is monotone
+///
+/// Let `Δ` be the change in `|notional|` produced by one step of `P`.
+///
+/// * `position_value` moves by exactly `±Δ` (`notional` is its only `P`-dependent term).
+/// * `threshold` moves by at most `Δ`, and never the other way: `maintenance_margin` is
+///   non-decreasing in `|notional|`, and one UNIT of `|notional|` moves it by 0 or 1 — inside a band
+///   because `⌊(m+1)/(2L)⌋ − ⌊m/(2L)⌋ ∈ {0, 1}`, and ACROSS a band because the slice form's crossed
+///   terms are shared verbatim by both sides of a boundary (that is
+///   `tier_boundaries_are_continuous`). Telescoping unit steps gives `Δthreshold <= Δ`.
+///
+/// So for a LONG (`amount > 0`) `notional` is non-decreasing in `P`, `position_value` rises by `Δ`,
+/// `threshold` by at most `Δ`, and `g` is non-DEcreasing. For a SHORT `notional` is non-increasing,
+/// so `position_value` falls while `|notional|` and therefore `threshold` rise, and `g` is
+/// non-INcreasing. Either way one flip.
+///
+/// The `<= Δ` step needs `mmr <= 1/2`, i.e. every tier's effective `max_leverage >= 1`.
+/// `maintenance_margin` floors `max_leverage` at 1 for exactly that reason, so `mmr` can never
+/// reach 1 and the argument holds even on a corrupt blob; the `debug_assert!` below surfaces such a
+/// blob rather than protecting the search from it. `liquidation_predicate_is_monotone_in_price`
+/// pins the property itself over randomised positions and tables rather than trusting this
+/// paragraph.
+///
+/// # The two ways there is NO liquidation price
+///
+/// * **Flat** (`amount == 0`) — nothing to liquidate.
+/// * **A fully-funded LONG.** As `P → 0` both `notional` and `threshold → 0`, so the position stays
+///   solvent at every price iff `v_quote_balance + margin >= 0` — precisely a long whose silo
+///   covers its entire entry cost, i.e. 1× or lower. (A short is the mirror case: it can outrun the
+///   domain bound instead, when `|amount|` is small enough that `|notional|` stays below the
+///   requirement across all of `[1, hi]`.)
+///
+/// ⚠️ **BOTH RETURN `0`, AND SO DOES THE FLAT CASE.** `0` is not a price here, it is the absence of
+/// one, and it does not distinguish "flat" from "never liquidatable". A caller that needs them
+/// apart has `positionAmt` in the same response (`getPositionRisk` returns it), which separates the
+/// flat case; separating "never liquidatable" from "flat" any further would need a sentinel this
+/// return type does not have.
+pub fn calc_liquidation_price(
+    tiers: &MarginTiers,
+    amount: i64,
+    v_quote_balance: i64,
+    margin: i64,
+    base_decimals: u32,
+    price_decimals: u32,
+) -> Result<u64, PerpError> {
+    if amount == 0 {
+        return Ok(0);
+    }
+    debug_assert!(
+        tiers.as_slice().iter().all(|t| t.max_leverage >= 1),
+        "a tier with max_leverage 0 is a corrupt blob: {:?}",
+        tiers.as_slice()
+    );
+
+    let hi = liquidation_price_domain_hi(
+        amount,
+        v_quote_balance,
+        margin,
+        base_decimals,
+        price_decimals,
+    )?;
+    // The ORACLE — the exact predicate `liquidate()` and the sweep enforce, not a restatement of
+    // it. Total on `[1, hi]` (see `liquidation_price_domain_hi`), so an `Err` here is a bug and is
+    // propagated rather than folded into either side of the comparison.
+    let above = |p: u64| {
+        is_above_maintenance_margin(
+            tiers,
+            p,
+            amount,
+            v_quote_balance,
+            margin,
+            base_decimals,
+            price_decimals,
+        )
+    };
+
+    if amount > 0 {
+        // LONG: `above` is monotone false → true. Want the LAST false.
+        if above(1)? {
+            return Ok(0); // solvent across the whole domain — no liquidation price
+        }
+        if !above(hi)? {
+            return Ok(hi); // liquidatable across the whole domain
+        }
+        // Invariant: `!above(lo)`, `above(hi)`.
+        let (mut lo, mut hi) = (1u64, hi);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if above(mid)? {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Ok(lo)
+    } else {
+        // SHORT: `above` is monotone true → false. Want the FIRST false.
+        if !above(1)? {
+            return Ok(1); // liquidatable across the whole domain
+        }
+        if above(hi)? {
+            return Ok(0); // solvent across the whole domain — no liquidation price
+        }
+        // Invariant: `above(lo)`, `!above(hi)`.
+        let (mut lo, mut hi) = (1u64, hi);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if above(mid)? {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(hi)
+    }
+}
+
 /// Compute the funding rate using Binance's formula:
 ///   F = P + clamp(interest_rate − P, CLAMP_LOWER_BOUND, CLAMP_UPPER_BOUND)
 ///   F_final = clamp(F, MIN_FUNDING_RATE, MAX_FUNDING_RATE)
@@ -1240,6 +1462,471 @@ mod margin_tier_tests {
             let want = notional + vq + margin >= notional.abs() / 6;
             assert_eq!(got, want, "mark={mark} a={amount} vq={vq} m={margin}");
         }
+    }
+}
+
+// ── Liquidation price ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod liquidation_price_tests {
+    use super::*;
+    use crate::types::{MarginTier, MarginTiers};
+
+    /// Deterministic xorshift (no rng dependency in this crate).
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    fn table(rows: &[(u64, u32)]) -> MarginTiers {
+        let v: Vec<MarginTier> = rows
+            .iter()
+            .map(|&(lower_bound_notional, max_leverage)| MarginTier {
+                lower_bound_notional,
+                max_leverage,
+            })
+            .collect();
+        MarginTiers::from_tiers(&v).expect("valid tier count")
+    }
+
+    /// The EXACT grid: `base_decimals = 0`, `price_decimals = 2`, so
+    /// `calc_value_i64(P, A) = P · A · 10^4` with no truncation at all. Every hand-computed
+    /// expectation below is therefore unambiguous arithmetic rather than a rounding claim.
+    const EXACT_BD: u32 = 0;
+    const EXACT_PD: u32 = 2;
+
+    /// A FRACTIONAL grid: `calc_value_i64(P, A) = P · A / 100`, so the notional truncates and the
+    /// sign of `A` reaches the arithmetic.
+    const FRAC_BD: u32 = 0;
+    const FRAC_PD: u32 = 8;
+
+    /// The three-tier table both hand-computed cases use. Quote units, `1e6` per dollar:
+    /// `[{$0, 3x}, {$200, 2x}, {$400, 1x}]`.
+    fn three_tiers() -> MarginTiers {
+        table(&[(0, 3), (200_000_000, 2), (400_000_000, 1)])
+    }
+
+    fn above(
+        tiers: &MarginTiers,
+        p: u64,
+        amount: i64,
+        vq: i64,
+        margin: i64,
+        bd: u32,
+        pd: u32,
+    ) -> bool {
+        is_above_maintenance_margin(tiers, p, amount, vq, margin, bd, pd).unwrap()
+    }
+
+    /// Assert the returned price is the EXACT FLIP of the predicate: liquidatable AT it, solvent one
+    /// tick the other way. This is the conservatism claim in the doc comment — at the reported
+    /// price, liquidation fires.
+    fn assert_is_the_flip(
+        tiers: &MarginTiers,
+        amount: i64,
+        vq: i64,
+        margin: i64,
+        bd: u32,
+        pd: u32,
+        p: u64,
+    ) {
+        assert!(
+            !above(tiers, p, amount, vq, margin, bd, pd),
+            "reported liquidation price {p} is NOT liquidatable (a={amount} vq={vq} m={margin})"
+        );
+        // A long is liquidatable BELOW its price, a short ABOVE it, so "one tick the other way" is
+        // `+1` for a long and `-1` for a short. They are not symmetric and are asserted separately.
+        let other = if amount > 0 { p + 1 } else { p - 1 };
+        assert!(
+            above(tiers, other, amount, vq, margin, bd, pd),
+            "price {other}, one tick past the reported {p}, is ALSO liquidatable — the reported \
+             price is not the flip (a={amount} vq={vq} m={margin})"
+        );
+    }
+
+    /// THE MULTI-TIER TEST. With today's single-tier tables the piecewise structure collapses and a
+    /// tier-blind implementation passes every case written against the current config, so the
+    /// expectation here is hand-computed on a table whose answer lands strictly INSIDE a non-zero
+    /// band.
+    ///
+    /// Table `[{$0, 3x}, {$200, 2x}, {$400, 1x}]`, i.e. `2·L` of 6, 4, 2. The integer SLICE form of
+    /// `maintenance_margin` is then, in quote units:
+    ///
+    /// ```text
+    ///                n <  200e6 :  mm = ⌊n/6⌋
+    ///     200e6  <=  n <  400e6 :  mm = ⌊200e6/6⌋ + ⌊(n − 200e6)/4⌋ = 33_333_333 + ⌊(n−200e6)/4⌋
+    ///     400e6  <=  n          :  mm = 33_333_333 + 50_000_000     + ⌊(n−400e6)/2⌋
+    /// ```
+    ///
+    /// LONG 3 @ $100 (`vq = −3e8`) with a $100 silo, on the exact grid so `n(P) = 30_000·P` and
+    /// `30_000·P − 200e6` is divisible by 4 (`30_000 = 4·7_500`, `200e6 = 4·50e6`) — the middle
+    /// band's floor is exact, `⌊(n−200e6)/4⌋ = 7_500·P − 50e6`:
+    ///
+    /// ```text
+    ///     g(P) = n + vq + margin − mm
+    ///          = 30_000P − 300e6 + 100e6 − 33_333_333 − (7_500P − 50e6)
+    ///          = 22_500P − 183_333_333
+    ///     g(P) < 0  <=>  P < 183_333_333 / 22_500 = 8148.148…
+    ///  => greatest liquidatable P = 8148   (n = 244_440_000, inside [200e6, 400e6) ✓)
+    ///     g(8148) = 183_330_000 − 183_333_333 = −3_333  < 0   liquidatable
+    ///     g(8149) = 183_352_500 − 183_333_333 = +19_167 >= 0  solvent
+    /// ```
+    ///
+    /// SHORT 3 @ $100 (`vq = +3e8`), same silo, `|n(P)| = 30_000·P`:
+    ///
+    /// ```text
+    ///     g(P) = −30_000P + 300e6 + 100e6 − 33_333_333 − (7_500P − 50e6)
+    ///          = −37_500P + 416_666_667
+    ///     g(P) < 0  <=>  P > 416_666_667 / 37_500 = 11111.111…
+    ///  => least liquidatable P = 11112     (n = 333_360_000, inside [200e6, 400e6) ✓)
+    ///     g(11112) = −416_700_000 + 416_666_667 = −33_333 < 0   liquidatable
+    ///     g(11111) = −416_662_500 + 416_666_667 =  +4_167 >= 0  solvent
+    /// ```
+    ///
+    /// The tier-BLIND answers are 7999 and 11429 (`mm = ⌊n/6⌋` everywhere, i.e. tier 0's rate
+    /// applied to a position sitting in tier 1), asserted below as the values this test rules out.
+    #[test]
+    fn liquidation_price_on_a_multi_tier_table_matches_the_hand_computed_band() {
+        let t = three_tiers();
+        let (bd, pd) = (EXACT_BD, EXACT_PD);
+        let margin = 100_000_000i64;
+
+        let long = calc_liquidation_price(&t, 3, -300_000_000, margin, bd, pd).unwrap();
+        assert_eq!(
+            long, 8148,
+            "long: see the arithmetic in this test's doc comment"
+        );
+        assert_is_the_flip(&t, 3, -300_000_000, margin, bd, pd, long);
+        assert_eq!(
+            30_000 * long as i64,
+            244_440_000,
+            "the answer must land INSIDE the middle band, or the table is not being exercised"
+        );
+
+        let short = calc_liquidation_price(&t, -3, 300_000_000, margin, bd, pd).unwrap();
+        assert_eq!(
+            short, 11112,
+            "short: see the arithmetic in this test's doc comment"
+        );
+        assert_is_the_flip(&t, -3, 300_000_000, margin, bd, pd, short);
+        assert_eq!(30_000 * short as i64, 333_360_000, "inside the middle band");
+
+        // What a tier-blind implementation would return — flooring the WHOLE notional at tier 0's
+        // 1/6 instead of walking the bands. These are the values the assertions above rule out.
+        let flat = MarginTiers::default();
+        assert_eq!(
+            calc_liquidation_price(&flat, 3, -300_000_000, margin, bd, pd).unwrap(),
+            7999
+        );
+        assert_eq!(
+            calc_liquidation_price(&flat, -3, 300_000_000, margin, bd, pd).unwrap(),
+            11429
+        );
+    }
+
+    /// The boundary on a FRACTIONAL grid, both signs. `calc_value_i64(P, A) = P·A/100` truncated
+    /// toward zero, so the notional no longer moves one-for-one with the price and the flip sits at
+    /// a price whose notional is not on a band edge.
+    ///
+    /// Default single tier, so `mm = ⌊|n|/6⌋`, and with `A = ±3`, `N = ⌊3P/100⌋`:
+    ///
+    /// ```text
+    ///  LONG  (vq = −370, margin = 100):  g = N − 270 − ⌊N/6⌋
+    ///        N = 322 -> 322 − 270 − 53 = −1  < 0   liquidatable
+    ///        N = 323 -> 323 − 270 − 53 =  0 >= 0   solvent
+    ///        greatest P with N <= 322 : 3P < 32_300  =>  P = 10_766  (3·10_766/100 = 322.98 -> 322)
+    ///                                                    P = 10_767 -> 323.01 -> 323  solvent
+    ///  SHORT (vq = +370, margin = 100):  g = 470 − N − ⌊N/6⌋
+    ///        N = 403 -> 470 − 403 − 67 =  0 >= 0   solvent
+    ///        N = 404 -> 470 − 404 − 67 = −1  < 0   liquidatable
+    ///        least P with N >= 404    : 3P >= 40_400 =>  P = 13_467  (3·13_467/100 = 404.01 -> 404)
+    ///                                                    P = 13_466 -> 403.98 -> 403  solvent
+    /// ```
+    #[test]
+    fn liquidation_price_is_the_exact_flip_of_the_predicate() {
+        let t = MarginTiers::default();
+        let (bd, pd) = (FRAC_BD, FRAC_PD);
+
+        let long = calc_liquidation_price(&t, 3, -370, 100, bd, pd).unwrap();
+        assert_eq!(long, 10_766);
+        assert_is_the_flip(&t, 3, -370, 100, bd, pd, long);
+
+        let short = calc_liquidation_price(&t, -3, 370, 100, bd, pd).unwrap();
+        assert_eq!(short, 13_467);
+        assert_is_the_flip(&t, -3, 370, 100, bd, pd, short);
+    }
+
+    /// A FLAT position has no liquidation price. `0`, not an error, and not a price.
+    #[test]
+    fn liquidation_price_is_zero_for_a_flat_position() {
+        for tiers in [MarginTiers::default(), three_tiers()] {
+            assert_eq!(
+                calc_liquidation_price(&tiers, 0, 0, 0, EXACT_BD, EXACT_PD).unwrap(),
+                0
+            );
+            // Non-zero vq/margin on a flat position (a residual, or a silo not yet swept) still has
+            // nothing to liquidate.
+            assert_eq!(
+                calc_liquidation_price(&tiers, 0, -500, 1_000, EXACT_BD, EXACT_PD).unwrap(),
+                0
+            );
+        }
+    }
+
+    /// A FULLY-FUNDED LONG has NO liquidation price, and this is the case a closed-form inversion
+    /// most easily reports as a spurious positive number.
+    ///
+    /// Long 3 @ $100 with the whole $300 entry cost in the silo: `vq + margin = 0`. As the price
+    /// falls, `notional` and the maintenance requirement go to zero TOGETHER — `mm(0) = 0` — so
+    /// `position_value = notional >= 0 >= mm` at every price and the position is never liquidatable.
+    /// `1×` or lower is exactly this condition.
+    ///
+    /// ⚠️ It shares the `0` return with the flat case above. `0` is the ABSENCE of a liquidation
+    /// price, and `amount` is what separates the two.
+    ///
+    /// The test also pins where the never-liquidatable region actually ENDS, which is NOT at
+    /// `vq + margin == 0`. The searched domain starts at `P = 1` (a mark of 0 is not a state this
+    /// engine can be in), so the real condition is "solvent at `P = 1`". On this fixture
+    /// `g(1) = 30_000 − 300e6 + M − ⌊30_000/6⌋ = M − 299_975_000`, so the last silo with no
+    /// liquidation price is `M = 299_975_000` — twenty-five thousand quote units BELOW fully
+    /// funded — and one unit less than that flips at `P = 1` exactly.
+    #[test]
+    fn a_fully_funded_long_has_no_liquidation_price() {
+        for tiers in [MarginTiers::default(), three_tiers()] {
+            let price = |margin: i64| {
+                calc_liquidation_price(&tiers, 3, -300_000_000, margin, EXACT_BD, EXACT_PD).unwrap()
+            };
+            assert_eq!(
+                price(300_000_000),
+                0,
+                "vq + margin == 0: never liquidatable"
+            );
+            assert_eq!(price(400_000_000), 0, "over-funded: same story");
+
+            // A 3x long (silo = one third of the entry cost) DOES have a price — so the zeros above
+            // are a property of full funding, not of this fixture.
+            assert!(price(100_000_000) > 0);
+
+            // The exact edge of the never-liquidatable region, which is the DOMAIN edge `P = 1`:
+            assert_eq!(
+                price(299_975_000),
+                0,
+                "g(1) == 0 — solvent at every reachable mark"
+            );
+            assert_eq!(
+                price(299_974_999),
+                1,
+                "g(1) == −1 — liquidatable at the lowest mark"
+            );
+            assert!(
+                above(&tiers, 1, 3, -300_000_000, 299_975_000, EXACT_BD, EXACT_PD),
+                "the 0 above must mean SOLVENT AT P=1, not a flip hiding below the domain"
+            );
+        }
+    }
+
+    /// THE ASSUMPTION THE WHOLE SEARCH RESTS ON: `above(P)` flips at most once over the price
+    /// domain — monotone false→true for a long, true→false for a short. Pinned rather than trusted,
+    /// over randomised tables, decimals and positions.
+    ///
+    /// Two sweeps per case, because a violation can hide at either scale: a COARSE geometric sweep
+    /// over the whole domain `[1, hi]`, and a DENSE unit sweep of consecutive prices centred on the
+    /// reported liquidation price, which is where an off-by-one non-monotonicity (a `mm` step of 2
+    /// for a `notional` step of 1, say) would live.
+    #[test]
+    fn liquidation_predicate_is_monotone_in_price() {
+        let mut s: u64 = 0x1234_5678_9abc_def1;
+        for _ in 0..2_000 {
+            let n_tiers = 1 + (next(&mut s) % 4) as usize; // 1..=4
+            let mut rows: Vec<(u64, u32)> = Vec::with_capacity(n_tiers);
+            let mut bound = 0u64;
+            let mut lev = 1 + (next(&mut s) % 10) as u32;
+            rows.push((0, lev));
+            for _ in 1..n_tiers {
+                bound += 1 + next(&mut s) % 500_000_000;
+                lev = 1 + next(&mut s) as u32 % lev;
+                rows.push((bound, lev));
+            }
+            let t = table(&rows);
+            let bd = (next(&mut s) % 5) as u32;
+            let pd = (next(&mut s) % 5) as u32;
+            let qty = (next(&mut s) % 1_000 + 1) as i64;
+            let is_long = next(&mut s) & 1 == 0;
+            let amount = if is_long { qty } else { -qty };
+            let vq = (next(&mut s) % 1_000_000_000) as i64 - 500_000_000;
+            let margin = (next(&mut s) % 500_000_000) as i64;
+
+            let hi = match liquidation_price_domain_hi(amount, vq, margin, bd, pd) {
+                Ok(h) => h,
+                Err(_) => continue, // no evaluable domain for this draw
+            };
+            let p_liq = calc_liquidation_price(&t, amount, vq, margin, bd, pd).unwrap();
+
+            // A tiny closure so both sweeps assert the identical rule.
+            let check = |prices: &mut dyn Iterator<Item = u64>| {
+                let mut prev: Option<bool> = None;
+                for p in prices {
+                    let a = above(&t, p, amount, vq, margin, bd, pd);
+                    if let Some(pv) = prev {
+                        if is_long {
+                            assert!(
+                                !pv || a,
+                                "LONG: solvent then liquidatable again at P={p} — not monotone \
+                                 (a={amount} vq={vq} m={margin} bd={bd} pd={pd} {rows:?})"
+                            );
+                        } else {
+                            assert!(
+                                pv || !a,
+                                "SHORT: liquidatable then solvent again at P={p} — not monotone \
+                                 (a={amount} vq={vq} m={margin} bd={bd} pd={pd} {rows:?})"
+                            );
+                        }
+                    }
+                    prev = Some(a);
+                }
+            };
+
+            // Coarse: 128 points spread geometrically over the whole domain.
+            let mut coarse = (0..128u32).map(|k| {
+                let num = hi as u128 * (k as u128 + 1);
+                (num / 128).max(1) as u64
+            });
+            check(&mut coarse);
+
+            // Dense: 200 consecutive prices around the reported flip (or around 1 when there is no
+            // flip, which is still a stretch of the domain worth checking).
+            let centre = if p_liq == 0 { 1 } else { p_liq };
+            let lo = centre.saturating_sub(100).max(1);
+            let mut dense = (lo..=lo.saturating_add(200).min(hi)).chain(core::iter::empty());
+            check(&mut dense);
+        }
+    }
+
+    /// An INDEPENDENT ORACLE for the search: a linear scan of the predicate.
+    ///
+    /// `base_decimals = 6, price_decimals = 0` makes `calc_value_i64(P, A) = P · A` exactly, so a
+    /// realistic case has its flip at a small price and the whole `1..=SCAN` prefix can be walked
+    /// one price at a time. The bisection must agree with that scan on every draw — same value, not
+    /// merely the same side of it.
+    #[test]
+    fn liquidation_price_agrees_with_a_linear_scan_of_the_predicate() {
+        const SCAN: u64 = 6_000;
+        let mut s: u64 = 0x0fed_cba9_8765_4321;
+        let (bd, pd) = (6u32, 0u32);
+        let mut checked_long = 0usize;
+        let mut checked_short = 0usize;
+        for _ in 0..1_200 {
+            let n_tiers = 1 + (next(&mut s) % 4) as usize;
+            let mut rows: Vec<(u64, u32)> = Vec::with_capacity(n_tiers);
+            let mut bound = 0u64;
+            let mut lev = 1 + (next(&mut s) % 8) as u32;
+            rows.push((0, lev));
+            for _ in 1..n_tiers {
+                bound += 1 + next(&mut s) % 8_000;
+                lev = 1 + next(&mut s) as u32 % lev;
+                rows.push((bound, lev));
+            }
+            let t = table(&rows);
+            let qty = (next(&mut s) % 10 + 1) as i64;
+            let is_long = next(&mut s) & 1 == 0;
+            let amount = if is_long { qty } else { -qty };
+            let vq = (next(&mut s) % 12_000) as i64 - 6_000;
+            let margin = (next(&mut s) % 6_000) as i64;
+
+            let got = calc_liquidation_price(&t, amount, vq, margin, bd, pd).unwrap();
+
+            // Brute force over the scanned prefix: for a long the LAST liquidatable price, for a
+            // short the FIRST.
+            let liquidatable: Vec<u64> = (1..=SCAN)
+                .filter(|&p| !above(&t, p, amount, vq, margin, bd, pd))
+                .collect();
+            if is_long {
+                match liquidatable.last() {
+                    // The whole prefix is liquidatable — the true answer may lie past SCAN, so this
+                    // draw says nothing.
+                    Some(&last) if last == SCAN => continue,
+                    Some(&last) => {
+                        assert_eq!(got, last, "LONG a={amount} vq={vq} m={margin} {rows:?}");
+                        checked_long += 1;
+                    }
+                    None => {
+                        assert_eq!(
+                            got, 0,
+                            "LONG solvent across 1..={SCAN} must report 0 (or a price above it, \
+                             which cannot happen: the set is a prefix) \
+                             a={amount} vq={vq} m={margin} {rows:?}"
+                        );
+                        checked_long += 1;
+                    }
+                }
+            } else {
+                match liquidatable.first() {
+                    Some(&first) => {
+                        assert_eq!(got, first, "SHORT a={amount} vq={vq} m={margin} {rows:?}");
+                        checked_short += 1;
+                    }
+                    // Nothing in the prefix is liquidatable; the flip is past SCAN.
+                    None => continue,
+                }
+            }
+        }
+        // The draws must actually have reached both arms, or the assertions above proved nothing.
+        assert!(
+            checked_long > 100 && checked_short > 100,
+            "scan oracle exercised too few cases: long={checked_long} short={checked_short}"
+        );
+    }
+
+    /// The domain bound is a real bound: `is_above_maintenance_margin` EVALUATES everywhere in
+    /// `[1, hi]` and the search never has to read an `Err` as a predicate value. Checked at the two
+    /// ends plus a geometric sweep, on positions large enough that `hi` is genuinely below
+    /// `u64::MAX`.
+    #[test]
+    fn the_search_domain_is_total_for_the_predicate() {
+        let t = three_tiers();
+        let mut s: u64 = 0xfeed_face_cafe_babe;
+        let mut bounded = 0usize;
+        for _ in 0..2_000 {
+            let bd = (next(&mut s) % 3) as u32;
+            let pd = (next(&mut s) % 3) as u32;
+            let qty = (next(&mut s) % 1_000_000_000 + 1) as i64;
+            let amount = if next(&mut s) & 1 == 0 { qty } else { -qty };
+            let vq = (next(&mut s) % 2_000_000_000) as i64 - 1_000_000_000;
+            let margin = (next(&mut s) % 1_000_000_000) as i64;
+            let Ok(hi) = liquidation_price_domain_hi(amount, vq, margin, bd, pd) else {
+                continue;
+            };
+            if hi < u64::MAX {
+                bounded += 1;
+                // `hi + 1` is past the bound. It is allowed to still evaluate (the bound is
+                // conservative — it also reserves room for `vq + margin`), but it must not be the
+                // case that `hi` itself fails.
+                assert!(
+                    is_above_maintenance_margin(&t, hi, amount, vq, margin, bd, pd).is_ok(),
+                    "predicate failed AT the domain bound {hi}"
+                );
+            }
+            for p in [1u64, hi] {
+                assert!(
+                    is_above_maintenance_margin(&t, p, amount, vq, margin, bd, pd).is_ok(),
+                    "predicate failed at P={p} inside [1, {hi}]"
+                );
+            }
+            for k in 1..32u128 {
+                let p = ((hi as u128 * k) / 32).max(1) as u64;
+                assert!(
+                    is_above_maintenance_margin(&t, p, amount, vq, margin, bd, pd).is_ok(),
+                    "predicate failed at P={p} inside [1, {hi}]"
+                );
+            }
+        }
+        assert!(
+            bounded > 100,
+            "the fixture never produced a domain strictly below u64::MAX, so the bound was never \
+             exercised ({bounded} cases)"
+        );
     }
 }
 

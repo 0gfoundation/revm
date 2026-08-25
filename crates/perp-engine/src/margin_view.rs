@@ -67,6 +67,7 @@ use crate::{
     errors::{perp_err, perp_invariant_err},
     interface::IPerpDex::{
         getAccountMarginCall, getAccountMarginReturn, getMarginInfoCall, getMarginInfoReturn,
+        getPositionRiskCall, getPositionRiskReturn,
     },
     math::{calc_value_i64, checked_u64_to_i64, maintenance_margin, open_order_margin},
     storage, PerpError,
@@ -697,6 +698,101 @@ pub fn run_get_margin_info<H: PerpHost>(
             initialMargin: info.initial_margin,
             maintMargin: info.maint_margin,
             isolatedWallet: info.position_margin,
+        },
+    )))
+}
+
+/// [`MarginInfo`] plus the position's liquidation price — field for field the return of
+/// `getPositionRisk`.
+///
+/// A wrapper rather than a sixteenth [`MarginInfo`] field ON PURPOSE. `MarginInfo` is the value
+/// `getMarginInfo` and `getAccount`'s `positions[]` rows BOTH encode, so a field added there lands
+/// in the `AccountPosition` struct too — an ABI change to the bulk path, and a separate decision
+/// from adding this selector (see the `getPositionRisk` ABI comment). Keeping the extra number
+/// outside `MarginInfo` is what lets the three surfaces stay field-for-field comparable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PositionRisk {
+    /// Everything `getMarginInfo(user, market_id)` returns, for the same `(user, market_id)` and
+    /// from the same [`margin_info_of`] call — not a second derivation.
+    pub info: MarginInfo,
+    /// The mark price at which this position IS liquidatable (greatest such price for a long, least
+    /// for a short); `0` when there is none. From [`crate::math::calc_liquidation_price`], which
+    /// bisects the very predicate `liquidate()` enforces — see that function for the definition,
+    /// the monotonicity argument, and what `0` does not distinguish.
+    pub liquidation_price: u64,
+}
+
+/// Compute [`PositionRisk`] for one `(user, market)`. Pure: reads only, no writes.
+///
+/// Deliberately routed through [`compute_margin_info`] rather than re-deriving anything: that is
+/// what makes `getPositionRisk`'s shared fields the SAME VALUES `getMarginInfo` returns, and it
+/// keeps the debug-only Bid/Ask order-list oracle live on this path too. The extra `Market` read is
+/// a `_ref` load of the blob `compute_margin_info` just brought resident, and the liquidation
+/// search itself touches no storage at all.
+pub fn compute_position_risk<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<PositionRisk, PerpError> {
+    // Market FIRST, so an unknown market rejects under THIS selector's name rather than under
+    // `compute_margin_info`'s. The load below then hits the resident blob.
+    let market = storage::load_market_ref(context, market_id)?
+        .ok_or_else(|| perp_err("getPositionRisk: unknown market"))?;
+    let info = compute_margin_info(context, user, market_id)?;
+
+    // The three position terms come out of `info`, not out of a second position load: they are the
+    // same `(amount, v_quote_balance, margin)` triple the reported margin numbers were built from,
+    // so the liquidation price cannot describe a different position than the row it sits in.
+    let liquidation_price = crate::math::calc_liquidation_price(
+        &market.tiers,
+        info.position_amt,
+        info.v_quote_balance,
+        info.position_margin,
+        market.base_decimals,
+        market.price_decimals,
+    )
+    .map_err(|e| relabel_derived(e, "getPositionRisk"))?;
+
+    Ok(PositionRisk {
+        info,
+        liquidation_price,
+    })
+}
+
+/// `getPositionRisk(address user, uint64 marketId) returns (...)` — [`run_get_margin_info`]'s
+/// fifteen numbers plus `liquidationPrice`. See the ABI doc comment in [`crate::interface`].
+///
+/// Deliberately adjacent to [`run_get_margin_info`] and [`AccountPositionRow::to_abi`]: three
+/// encoders now write out the same [`MarginInfo`], and keeping them in one field of view is how a
+/// field added to one and forgotten in the others stays visible.
+pub fn run_get_position_risk<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = getPositionRiskCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getPositionRisk: invalid calldata"))?;
+
+    let risk = compute_position_risk(context, args.user, args.marketId)?;
+    let info = &risk.info;
+
+    Ok(Bytes::from(getPositionRiskCall::abi_encode_returns(
+        &getPositionRiskReturn {
+            markPrice: info.mark_price,
+            positionAmt: info.position_amt,
+            vQuoteBalance: info.v_quote_balance,
+            leverage: info.leverage,
+            bidNotional: info.bid_notional,
+            askNotional: info.ask_notional,
+            entryPrice: info.entry_price,
+            notional: info.notional,
+            unrealizedProfit: info.unrealized_profit,
+            isolatedMargin: info.isolated_margin,
+            positionInitialMargin: info.position_initial_margin,
+            openOrderInitialMargin: info.open_order_initial_margin,
+            initialMargin: info.initial_margin,
+            maintMargin: info.maint_margin,
+            isolatedWallet: info.position_margin,
+            liquidationPrice: risk.liquidation_price,
         },
     )))
 }

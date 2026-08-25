@@ -609,6 +609,73 @@ sol! {
             int64  isolatedWallet
         );
 
+        /// [`getMarginInfo`] plus `liquidationPrice` — the full Binance `/positionRisk` row for one
+        /// `(user, marketId)`.
+        ///
+        /// The first fifteen returns are `getMarginInfo`'s, in the same order, with the same
+        /// contracts and the same rounding modes; read that comment for the field-by-field detail.
+        /// They are not recomputed — both selectors encode ONE `margin_view::MarginInfo` from ONE
+        /// `margin_view::margin_info_of` call, so they cannot disagree, and
+        /// `margin_view_tests::get_position_risk_agrees_with_get_margin_info_field_for_field`
+        /// asserts the equality positionally over all fifteen rather than trusting it.
+        ///
+        ///   liquidationPrice  the mark price at which this position **IS** liquidatable — for a
+        ///                     LONG the GREATEST such price, for a SHORT the LEAST. **Conservative
+        ///                     by construction: at this price liquidation FIRES**, and one tick the
+        ///                     other way (`+1` for a long, `−1` for a short) it does not. `0` when
+        ///                     there is no such price, which covers three states —
+        ///                     a FLAT position, a fully-funded LONG (`vQuoteBalance + margin >= 0`,
+        ///                     i.e. 1× or lower: as the price falls both notional and requirement
+        ///                     go to zero together, so it never becomes liquidatable), and a SHORT
+        ///                     so small that its notional cannot outgrow its funding anywhere in
+        ///                     the representable price range. `0` is the ABSENCE of a price, not a
+        ///                     price of zero; `positionAmt` in the same response separates the flat
+        ///                     case.
+        ///
+        /// ⚠️ WHY THIS IS ON-CHAIN NOW. `liquidationPrice` was being computed OFF-chain against a
+        /// flat 1% maintenance ratio, while this chain liquidates off the market's margin-tier
+        /// table — `1/6` on today's default tier, sixteen times that rate. Real liquidation
+        /// therefore fired far earlier than users were shown. Moving the number here kills the
+        /// whole class, because it now comes from the same code path `liquidate()` and the
+        /// liquidation sweep enforce.
+        ///
+        /// ⚠️ IT IS A SEARCH, NOT A FORMULA, AND THAT IS DELIBERATE. `math::calc_liquidation_price`
+        /// bisects `math::is_above_maintenance_margin` — the predicate itself — over the mark price,
+        /// which is exact by construction and needs no closed form. A closed form would have to
+        /// solve a FIXED POINT (the maintenance rate depends on the tier, the tier on the notional,
+        /// the notional on the price being solved for), reproduce `maintenance_margin`'s integer
+        /// SLICE form (whose subtractive twin is off by one at 53.1% of tier boundaries), and get
+        /// both signs of a truncate-toward-zero right. See that function for the monotonicity
+        /// argument the bisection rests on, and for what `0` does and does not distinguish.
+        /// It costs no storage loads at all — the whole search runs on values this call already
+        /// read.
+        ///
+        /// Reverts if the market does not exist, exactly as `getMarginInfo` does.
+        ///
+        /// ⚠️ `getMarginInfo` IS NOT DELETED and keeps working unchanged. This is a strict
+        /// superset of it, so new code should prefer THIS selector — but there is no per-market
+        /// call this replaces outright until `liquidationPrice` also reaches
+        /// `getAccount().positions[]`, since only the bulk path avoids the `1 + N` straddle for a
+        /// backend rendering several markets.
+        function getPositionRisk(address user, uint64 marketId) external view returns (
+            uint64 markPrice,
+            int64  positionAmt,
+            int64  vQuoteBalance,
+            uint64 leverage,
+            uint64 bidNotional,
+            uint64 askNotional,
+            uint64 entryPrice,
+            uint64 notional,
+            int64  unrealizedProfit,
+            int64  isolatedMargin,
+            uint64 positionInitialMargin,
+            uint64 openOrderInitialMargin,
+            uint64 initialMargin,
+            uint64 maintMargin,
+            int64  isolatedWallet,
+            uint64 liquidationPrice
+        );
+
         /// Account-level roll-up of [`getMarginInfo`] over an EXPLICIT list of markets.
         ///
         /// **Prefer `getAccount`** unless you specifically want a SUBSET: it takes no list, walks
