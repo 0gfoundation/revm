@@ -382,7 +382,7 @@ pub fn margin_info_of(
         .ok_or_else(|| perp_err("getMarginInfo: unrealized profit overflow"))?;
 
     // ── isolatedMargin ──────────────────────────────────────────────────────────────────
-    // `isolatedWallet + unrealizedProfit`, where our `isolatedWallet` is `pos.margin`.
+    // `isolatedWallet + unrealizedProfit`, where `isolatedWallet` is `pos.margin`.
     // Market-valued EQUITY, not a balance: it can sit below `pos.margin`, and can go negative.
     let isolated_margin = pos
         .margin
@@ -672,7 +672,7 @@ pub fn run_get_margin_info<H: PerpHost>(
             openOrderInitialMargin: info.open_order_initial_margin,
             initialMargin: info.initial_margin,
             maintMargin: info.maint_margin,
-            positionMargin: info.position_margin,
+            isolatedWallet: info.position_margin,
         },
     )))
 }
@@ -728,7 +728,7 @@ pub struct AccountMarginTotals {
     pub total_maint_margin: u128,
     /// Σ `unrealizedProfit`.
     pub total_unrealized_profit: i128,
-    /// Σ `positionMargin` (`isolatedWallet`) — the silos.
+    /// Σ `isolatedWallet` — the silos.
     pub total_position_margin: i128,
 }
 
@@ -965,7 +965,7 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
 /// ```text
 /// our totalCrossWalletBalance == Binance totalCrossWalletBalance
 /// our availableBalance        == Binance availableBalance  == cross − Σ ooIM
-/// Binance totalWalletBalance  == our cross + Σ positionMargin   ← `getAccount` returns this
+/// Binance totalWalletBalance  == our cross + Σ isolatedWallet   ← `getAccount` returns this
 /// ```
 ///
 /// and `availableBalance` here is genuinely spendable headroom — the SAME quantity the engine's

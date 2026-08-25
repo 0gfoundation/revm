@@ -1357,7 +1357,7 @@ fn matched_call_publishes_one_snapshot_per_economic_event() {
     //
     // ALICE is written TWICE inside the call (the registry flush saves her position + account, then
     // `finalize_apply` debits `total_required` from her wallet), and under the old per-write emission
-    // the first of those was published: `totalWalletBalance = cross + Σ positionMargin` counted the
+    // the first of those was published: `totalWalletBalance = cross + Σ isolatedWallet` counted the
     // funded silo while the wallet had not yet paid for it, over-stating by exactly `total_required`.
     // Publishing hers AFTER `finalize_apply` — rather than at the earlier of the two writes — is what
     // keeps that intermediate out of the stream now that the drain is no longer what emits it.
@@ -1367,7 +1367,7 @@ fn matched_call_publishes_one_snapshot_per_economic_event() {
         (WALLET - INIT_MARGIN) as i64,
         "the debit has landed"
     );
-    // `Σ positionMargin` carries the silo into `totalWalletBalance`, so the settled gross wallet is
+    // `Σ isolatedWallet` carries the silo into `totalWalletBalance`, so the settled gross wallet is
     // back to `WALLET`: the money is in the silo instead of the wallet, counted once.
     // (This market's `mark_price` is 0, so the mark-derived totals — PIM, MM — are 0 here by
     // construction; `margin_view_tests` covers them at a live mark.)
@@ -1564,7 +1564,7 @@ fn an_unfundable_maker_fill_still_fills_and_the_silo_is_short_not_the_wallet() {
          attached to the position, not decoupled from it"
     );
     // The requirement itself is unchanged — it is the FUNDING that fell short, and the gap is
-    // visible as `positionInitialMargin > positionMargin` (the §3.9 shape, which
+    // visible as `positionInitialMargin > isolatedWallet` (the §3.9 shape, which
     // `a_position_naturally_below_its_own_initial_margin_survives_normally` proves is normal).
     let info = crate::margin_view::compute_margin_info(&mut ctx, BOB, MARKET_ID).unwrap();
     assert_eq!(info.position_initial_margin, INIT_MARGIN);
@@ -2001,7 +2001,7 @@ fn taker_open_fill_charges_fee_from_margin_not_on_top_of_the_wallet() {
 /// out of the margin it creates), so this test produces the state through a REAL fill rather than by
 /// writing it, and then asserts the position is in every respect healthy:
 ///
-/// * `positionMargin < positionInitialMargin`, by exactly the fee — the §3.9 shape;
+/// * `isolatedWallet < positionInitialMargin`, by exactly the fee — the §3.9 shape;
 /// * it is NOT liquidatable (the maintenance check is the only continuous one);
 /// * it still accepts an `addPositionMargin`/`removePositionMargin` round trip (B2 — the removed IM
 ///   gate used to refuse this exact no-op);
@@ -11787,7 +11787,7 @@ mod assuming_price {
             openOrderInitialMargin: info.open_order_initial_margin,
             initialMargin: info.initial_margin,
             maintMargin: info.maint_margin,
-            positionMargin: info.position_margin,
+            isolatedWallet: info.position_margin,
         }
     }
 }
@@ -12060,7 +12060,7 @@ mod account_snapshot_events {
         run_place_order(&input, caller, ctx)
     }
 
-    /// A LONG whose mark has moved off its entry, so `Σ uPnL`, `Σ positionMargin`, `Σ PIM` and
+    /// A LONG whose mark has moved off its entry, so `Σ uPnL`, `Σ isolatedWallet`, `Σ PIM` and
     /// `Σ maintMargin` are all non-zero — otherwise a field-for-field equality against `getAccount`
     /// would be an equality between rows of zeros.
     fn seed_long(ctx: &mut TestCtx, who: Address, market: u64, lots: i64) {

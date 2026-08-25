@@ -43,7 +43,7 @@ sol! {
         ///                               the SPOT side and is NOT part of any total below — it is
         ///                               also the balance `withdraw` actually gates on.
         ///   totalWalletBalance          Binance `totalWalletBalance` — the GROSS perp wallet:
-        ///                               `totalCrossWalletBalance + Σ positionMargin`. THIS call
+        ///                               `totalCrossWalletBalance + Σ isolatedWallet`. THIS call
         ///                               walks the index for it (it is loading every position blob
         ///                               anyway); `AccountBalanceChanged` reads the same number off
         ///                               the stored `Σ pos.margin` aggregate
@@ -423,10 +423,10 @@ sol! {
         ///                         ZERO (not floor). Computed here as
         ///                         `signedNotional + vQuoteBalance`, where `signedNotional` is
         ///                         `notional` carrying `positionAmt`'s sign.
-        ///   isolatedMargin        `isolatedWallet + unrealizedProfit`. Our `isolatedWallet` is
-        ///                         the position's own margin, returned as `positionMargin`.
-        ///                         This is position EQUITY at mark, not a balance: it may sit
-        ///                         below `positionMargin`, and it may go negative.
+        ///   isolatedMargin        `isolatedWallet + unrealizedProfit`, where `isolatedWallet` is
+        ///                         the last return below. This is position EQUITY at mark, not a
+        ///                         balance: it may sit below `isolatedWallet`, and it may go
+        ///                         negative.
         ///   positionInitialMargin `ROUND_UP(notional / leverage)` — ROUND_UP, not truncate.
         ///   initialMargin         `ROUND_UP( max(|N + Bid|, |N − Ask|) / leverage )` — the
         ///                         JOINT requirement over position AND resting orders, a genuine
@@ -445,13 +445,15 @@ sol! {
         ///                         table (`getMarginTiers`). The tier table affects THIS field
         ///                         only — it is NOT an input to `initialMargin`, which divides
         ///                         by the position's own `leverage`, uncapped.
-        ///
-        /// Ours:
-        ///   positionMargin        the position's own allocated margin (`isolatedWallet`). The
-        ///                         only margin quantity that is physically held anywhere: it was
-        ///                         moved out of the perp wallet when the position opened.
+        ///   isolatedWallet        the position's own allocated margin BALANCE — `isolatedMargin`
+        ///                         one level down, before unrealised PnL. The only margin quantity
+        ///                         physically held anywhere: it was moved out of the perp wallet
+        ///                         when the position opened, and it moves only on open /
+        ///                         add-or-remove-margin / close, never with the mark.
         ///                         `openOrderInitialMargin` by contrast is escrowed NOWHERE — it
         ///                         is subtracted arithmetically at the admission gate.
+        ///                         WAS named `positionMargin` (ours) until it took Binance's name;
+        ///                         bindings generated before that are looking for the old one.
         ///
         /// Reverts if the market does not exist. A user with no position and no orders reads
         /// back all zeros with `leverage = 1`.
@@ -469,7 +471,7 @@ sol! {
             uint64 openOrderInitialMargin,
             uint64 initialMargin,
             uint64 maintMargin,
-            int64  positionMargin
+            int64  isolatedWallet
         );
 
         /// Account-level roll-up of [`getMarginInfo`] over an EXPLICIT list of markets.
@@ -499,7 +501,7 @@ sol! {
         ///   totalUnrealizedProfit     Σ `unrealizedProfit`.
         ///   availableBalance          `totalCrossWalletBalance − totalOpenOrderInitialMargin`.
         ///
-        /// `totalWalletBalance` is deliberately absent here: `Σ positionMargin` over a PARTIAL list
+        /// `totalWalletBalance` is deliberately absent here: `Σ isolatedWallet` over a PARTIAL list
         /// under-counts the silos, so the gross wallet it implies would be a "total" that is not
         /// total. `getAccount` walks the whole index and can name it honestly.
         ///
@@ -530,7 +532,7 @@ sol! {
         /// ```text
         /// our     totalCrossWalletBalance == Binance totalCrossWalletBalance
         /// our     availableBalance        == Binance availableBalance   (both spendable headroom)
-        /// Binance totalWalletBalance      == our cross + SUM positionMargin
+        /// Binance totalWalletBalance      == our cross + SUM isolatedWallet
         ///                                    ^ getAccount returns this, over the whole index
         /// ```
         ///
@@ -547,10 +549,10 @@ sol! {
         /// does mean is that new risk-INCREASING actions are refused until it recovers.
         ///
         /// A resting order that fills while the wallet cannot fund its margin still FILLS — and the
-        /// shortfall lands on the POSITION, not here: `positionMargin` / `isolatedWallet` is funded
+        /// shortfall lands on the POSITION, not here: `isolatedWallet` is funded
         /// with `min(requirement, cash at hand)` and left short by the rest (model **M1**, measured
         /// on Binance by R11 — `derived-ooim-plan.md` §3a). Consumers must therefore expect
-        /// `positionMargin < positionInitialMargin` after such a fill, and must not read the gap as
+        /// `isolatedWallet < positionInitialMargin` after such a fill, and must not read the gap as
         /// an error: the position's liquidation price is computed from the SHORT margin, which is the
         /// honest one. (Two earlier versions of this comment were wrong: one said such a fill "will be
         /// cancelled at fill time" (pre-escrow-removal behaviour), the next said the shortfall lands
@@ -782,12 +784,12 @@ sol! {
         /// have kept them fresh under any trigger short of one that fires on every price update.
         ///
         ///   usdcBalance              spot / withdrawal-layer USDC. NOT part of any total below.
-        ///   totalWalletBalance       Binance `wb` — GROSS perp wallet = cross + Σ positionMargin.
+        ///   totalWalletBalance       Binance `wb` — GROSS perp wallet = cross + Σ isolatedWallet.
         ///   totalCrossWalletBalance  Binance `cw` — the STORED `perp_wallet_balance`, verbatim.
         ///
         /// ## All three are STORED SCALARS, so emitting this costs ONE load
         ///
-        /// `wb` is not walked. `Σ positionMargin` is the incrementally maintained
+        /// `wb` is not walked. `Σ isolatedWallet` is the incrementally maintained
         /// `UserAccount::total_position_margin` (moved only by `storage::save_position`, from a delta it
         /// gets out of a position read it was already paying for), so `wb = cw + that` is one addition
         /// on the same account blob `usdcBalance` and `cw` come off. The emit path used to walk the

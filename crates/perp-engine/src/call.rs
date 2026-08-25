@@ -168,7 +168,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // `_ref` loads — it was ≤ 66 with the `+ {MarketHot, sell list}` the read-time `Ask` re-fold
         // needed, before the R12 freeze put both aggregates in the position blob), and the
         // index-driven roll-up reaches exactly the same set — the added work is pure arithmetic (a ≤8-band maintenance
-        // tier walk and `Σ positionMargin`, both off values already in hand). What changed is what
+        // tier walk and `Σ isolatedWallet`, both off values already in hand). What changed is what
         // the selector BUYS: it now returns everything `getAccountMargin` returns, which is priced
         // at 50_000 for ≤64 ids, i.e. ~781/market. Leaving `getAccount` at 5_000 would make it the
         // cheap way to buy 16 markets of the same margin math — a 16× pricing gap between two

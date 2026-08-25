@@ -660,7 +660,7 @@ pub fn run_add_position_margin<H: PerpHost>(
         apply_funding_settlement(context, p)?;
     }
     // Position BEFORE account: the account write emits the account-level `AccountBalanceChanged`
-    // roll-up, whose `totalWalletBalance` is `cross + Σ positionMargin`. Written the other way round
+    // roll-up, whose `totalWalletBalance` is `cross + Σ isolatedWallet`. Written the other way round
     // the one event this call emits would report the debited wallet against the OLD silo and
     // under-state the gross wallet by exactly `amount` — an intermediate snapshot for no reason,
     // since both writes are unconditional here. Delta order is irrelevant to the commitment (the

@@ -315,7 +315,7 @@ fn flat_account_reads_back_zero_and_sane() {
     assert_eq!(i.openOrderInitialMargin, 0);
     assert_eq!(i.initialMargin, 0);
     assert_eq!(i.maintMargin, 0);
-    assert_eq!(i.positionMargin, 0);
+    assert_eq!(i.isolatedWallet, 0);
 
     let a = account_margin(&mut ctx, ALICE, &[MARKET_A]);
     assert_eq!(a.totalCrossWalletBalance, (500 * USD) as i64);
@@ -362,7 +362,7 @@ fn long_without_orders_has_im_equal_pim_and_no_open_order_margin() {
     assert_eq!(i.unrealizedProfit, 20 * USD as i64, "2 * ($110 - $100)");
     assert_eq!(
         i.isolatedMargin,
-        i.positionMargin + i.unrealizedProfit,
+        i.isolatedWallet + i.unrealizedProfit,
         "isolatedMargin = isolatedWallet + uPnL"
     );
     assert_eq!(i.isolatedMargin, 220 * USD as i64);
@@ -823,11 +823,11 @@ fn a_resting_order_that_can_flip_the_position_is_charged_the_joint_max() {
     //     IM  = ROUND_UP(max(|200 + 0|, |200 - 500.75|) / 1) = $300.75
     //     PIM = ROUND_UP(200 / 1)                            = $200
     //     ooIM = IM - PIM                                    = $100.75
-    //     TOTAL capital tied up = positionMargin $200 + ooIM $100.75 = IM = $300.75
+    //     TOTAL capital tied up = isolatedWallet $200 + ooIM $100.75 = IM = $300.75
     //
     //   The retired escrow charged `c_notional = max(S + B', B + S') = $300` for the ORDERS
     //   ALONE, on top of the $200 position margin — $500 of capital, 1.67x. The $200 gap was
-    //   exactly `positionMargin`, and it was structural, not rounding: when the sell fills the
+    //   exactly `isolatedWallet`, and it was structural, not rounding: when the sell fills the
     //   long closes and its $200 of margin is released, which Binance's single joint `max()`
     //   nets by construction and a per-side reservation bucket cannot.
     //
@@ -867,13 +867,13 @@ fn a_resting_order_that_can_flip_the_position_is_charged_the_joint_max() {
     assert_eq!(i.initialMargin, 300_750_000);
     assert_eq!(i.openOrderInitialMargin, 100_750_000);
 
-    // Total capital tied up == IM, exactly. This identity is the migration: `positionMargin` is
+    // Total capital tied up == IM, exactly. This identity is the migration: `isolatedWallet` is
     // physically held, `ooIM` is arithmetically withheld, and together they are the joint
     // requirement — no third bucket, no double count.
-    assert_eq!(i.positionMargin, 200 * USD as i64);
+    assert_eq!(i.isolatedWallet, 200 * USD as i64);
     let a = account_margin(&mut ctx, ALICE, &[MARKET_A]);
     assert_eq!(
-        i.positionMargin + a.totalOpenOrderInitialMargin as i64,
+        i.isolatedWallet + a.totalOpenOrderInitialMargin as i64,
         a.totalInitialMargin as i64
     );
     assert_eq!(a.totalInitialMargin, 300_750_000);
@@ -964,7 +964,7 @@ fn outputs_are_recomputable_from_the_reported_inputs() {
         let (notional, upnl, im, pim, oo_im, maint) = recompute(info, bd, pd);
         assert_eq!(info.notional, notional);
         assert_eq!(info.unrealizedProfit, upnl);
-        assert_eq!(info.isolatedMargin, info.positionMargin + upnl);
+        assert_eq!(info.isolatedMargin, info.isolatedWallet + upnl);
         assert_eq!(info.initialMargin as i64, im);
         assert_eq!(info.positionInitialMargin, pim);
         assert_eq!(info.openOrderInitialMargin, oo_im);
@@ -1181,7 +1181,7 @@ fn get_account_reports_a_negative_cross_wallet_unclamped() {
 /// ACTUAL silo, not the requirement.
 ///
 /// Reporting the requirement instead would overstate the account's wallet by the shortfall, i.e.
-/// mint money in the view. `positionMargin < positionInitialMargin` is a legitimate post-fill state
+/// mint money in the view. `isolatedWallet < positionInitialMargin` is a legitimate post-fill state
 /// and must not be read as an error.
 #[test]
 fn get_account_reflects_a_short_under_funded_silo_at_its_actual_value() {
@@ -1206,9 +1206,9 @@ fn get_account_reflects_a_short_under_funded_silo_at_its_actual_value() {
     assert_eq!(i.notional, 120 * USD, "trunc(|−2| × $60)");
     assert_eq!(i.unrealizedProfit, 80 * USD as i64, "−$120 + $200");
     assert_eq!(i.positionInitialMargin, 120 * USD, "ROUND_UP($120 / 1)");
-    assert_eq!(i.positionMargin, 100 * USD as i64);
+    assert_eq!(i.isolatedWallet, 100 * USD as i64);
     assert!(
-        i.positionMargin < i.positionInitialMargin as i64,
+        i.isolatedWallet < i.positionInitialMargin as i64,
         "the silo is UNDER-FUNDED: reported as the ACTUAL allocation, never as the requirement"
     );
 
@@ -1296,7 +1296,7 @@ fn get_account_totals_equal_the_sum_of_per_market_get_margin_info() {
         sum_open_order_initial += i.openOrderInitialMargin;
         sum_maint += i.maintMargin;
         sum_upnl += i.unrealizedProfit;
-        sum_silo += i.positionMargin;
+        sum_silo += i.isolatedWallet;
         sum_isolated_margin += i.isolatedMargin;
     }
     assert!(
