@@ -28,7 +28,8 @@ use crate::{
         getIndexPriceCall, getInsuranceFundCall, getMarginInfoCall, getMarginTiersCall,
         getMarkPriceCall, getMarketCall,
         getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
-        getOracleAddressCall, getOrderCall, getPositionCall, getUserFeeRatesCall,
+        getOracleAddressCall, getOrderCall, getPositionCall, getSymbolConfigCall,
+        getUserFeeRatesCall,
         initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
         removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
         setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall,
@@ -40,10 +41,11 @@ use crate::{
         run_add_market, run_add_position_margin, run_deposit_insurance_fund, run_get_admin,
         run_get_average_premium_index, run_get_funding_state, run_get_index_price,
         run_get_insurance_fund, run_get_margin_tiers, run_get_mark_price, run_get_market,
-        run_get_market_manager, run_get_oracle_address, run_get_position, run_init_admin,
-        run_liquidate, run_remove_position_margin, run_set_leverage, run_set_leverage_signed,
-        run_set_margin_tiers, run_set_market_manager, run_set_oracle_address, run_transfer_admin,
-        run_update_index_price, run_update_market, run_withdraw_insurance_fund,
+        run_get_market_manager, run_get_oracle_address, run_get_position, run_get_symbol_config,
+        run_init_admin, run_liquidate, run_remove_position_margin, run_set_leverage,
+        run_set_leverage_signed, run_set_margin_tiers, run_set_market_manager,
+        run_set_oracle_address, run_transfer_admin, run_update_index_price, run_update_market,
+        run_withdraw_insurance_fund,
     },
     trading::{
         run_batch_cancel_orders, run_batch_cancel_orders_signed, run_batch_place_orders,
@@ -240,6 +242,13 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // reflect the removal of work that is still being done by a different line.
         m.insert(setLeverageCall::SELECTOR, (30_000, false));
         m.insert(setLeverageSignedCall::SELECTOR, (30_000, false));
+        // `getSymbolConfig`: priced with `getPosition` (5_000), not with the derived margin views.
+        // It is the same load set as `getPosition` — one position `_ref` and one market `_ref`, both
+        // scalar blobs — and then pure in-register arithmetic: a walk of a table bounded by
+        // MAX_MARGIN_TIERS = 8 that is already resident inside the `Market` it just read. No
+        // per-user list, no order lists, no per-market walk, so none of the work the 20_000 tier
+        // prices is present. FLAT, per selector.
+        m.insert(getSymbolConfigCall::SELECTOR, (5_000, true));
         // Trading
         //
         // NOT raised for the `AccountBalanceChanged` snapshot, on purpose — and under the coalesced
@@ -498,6 +507,7 @@ pub fn run_perp_dex_call<H: PerpHost>(
         // Leverage
         s if s == setLeverageCall::SELECTOR => run_set_leverage(input_bytes, caller, context),
         s if s == setLeverageSignedCall::SELECTOR => run_set_leverage_signed(input_bytes, context),
+        s if s == getSymbolConfigCall::SELECTOR => run_get_symbol_config(input_bytes, context),
         // Trading
         s if s == placeOrderCall::SELECTOR => run_place_order(input_bytes, caller, context),
         s if s == cancelOrderCall::SELECTOR => run_cancel_order(input_bytes, caller, context),

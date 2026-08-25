@@ -311,6 +311,44 @@ sol! {
             uint8 keyId,
             bytes calldata signature
         ) external;
+        /// A user's leverage in one market, together with the largest position the market's risk
+        /// table permits AT that leverage. Binance's `/fapi/v1/symbolConfig` row, less the
+        /// constants. Reverts if the market does not exist.
+        ///
+        ///   leverage          the position's `leverage` setting, `1` when unset — the same
+        ///                     floored value `getPosition`, `getMarginInfo` and
+        ///                     `getAccount().positions[]` report, so this selector cannot disagree
+        ///                     with them about which leverage is in force.
+        ///   maxNotionalValue  the largest `|notional|` (quote units, at MARK, the same basis
+        ///                     `getMarginInfo.notional` reports) the tier table admits while
+        ///                     `leverage` is in force: the upper bound of the highest tier whose
+        ///                     `maxLeverage` is still `>= leverage`. **`0` MEANS UNBOUNDED** — that
+        ///                     tier is the last one and its band runs to infinity. Every market
+        ///                     today ships the single default tier `{0, 3}`, so every market today
+        ///                     returns `0` at every legal leverage; the field only becomes
+        ///                     informative once `setMarginTiers` installs a real table.
+        ///
+        /// ⚠️ WHY THIS IS A SELECTOR AND NOT `getMarginTiers` PLUS CLIENT ARITHMETIC. The chain
+        /// enforces the tier table in ONE direction — given a notional, which leverage is still
+        /// allowed (`math::max_leverage_for_notional`, the quantity `setLeverage` and every
+        /// per-open guard compare against). `maxNotionalValue` is that table read BACKWARDS, and
+        /// nothing in the engine needs the inverse, so a consumer wanting it had to reimplement the
+        /// band walk from `getMarginTiers`. That is a second implementation of a rule this engine
+        /// enforces, in a language the engine cannot test, and it drifts silently: the failure is a
+        /// user shown a position size the chain will refuse (or worse, not shown one it will).
+        /// `math::max_notional_for_leverage` is the inversion, it lives next to the forward lookup
+        /// it inverts, and this selector is how it gets out.
+        ///
+        /// ⚠️ NUMBERS ONLY — `marginType` and `isAutoAddMargin` are deliberately ABSENT. Binance's
+        /// row carries both; ours would be the constants `"ISOLATED"` and `false` for every user in
+        /// every market forever (this venue has no cross mode and no auto-margin-add), and encoding
+        /// a constant into a return value spends calldata on data the caller already has. The
+        /// `AccountPosition` comment states the same rule for `symbol` / `isolated` /
+        /// `positionSide`. A backend serving a Binance-shaped `/symbolConfig` fills them in itself.
+        function getSymbolConfig(address user, uint64 marketId) external view returns (
+            uint64 leverage,
+            uint64 maxNotionalValue
+        );
 
         // ── Trading ────────────────────────────────────────────────────────
         /// Place a limit or market order.

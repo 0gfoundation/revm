@@ -8,8 +8,9 @@ use primitives::{address, hardfork::SpecId, U256};
 use crate::{
     funding::settle_position_funding,
     interface::IPerpDex::{
-        addPositionMarginCall, getMarginTiersCall, liquidateCall, placeOrderCall,
-        removePositionMarginCall, setLeverageCall, setMarginTiersCall, updateIndexPriceCall,
+        addPositionMarginCall, getMarginTiersCall, getSymbolConfigCall, liquidateCall,
+        placeOrderCall, removePositionMarginCall, setLeverageCall, setMarginTiersCall,
+        updateIndexPriceCall,
     },
     run_perp_dex_call,
     trading::{run_place_order, MAX_LIQUIDATION_MAKER_ACCOUNTS},
@@ -2058,6 +2059,101 @@ fn set_margin_tiers_rejects_unknown_market() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     let err = set_margin_tiers(&mut ctx, ADMIN, 999, &[0], &[2]).unwrap_err();
+    assert!(err.to_string().contains("unknown market"), "{err}");
+}
+
+/// `getSymbolConfig` through the FULL call shell in a STATIC context — which is also the assertion
+/// that the selector is registered `can_be_static = true` and priced at the flat `getPosition`
+/// tier (5_000), not at the derived-margin-view tier.
+fn symbol_config(ctx: &mut TestCtx, user: Address, market_id: u64) -> (u64, u64) {
+    let input = getSymbolConfigCall {
+        user,
+        marketId: market_id,
+    }
+    .abi_encode();
+    let out = run_perp_dex_call(&input, 1_000_000, user, U256::ZERO, true, ctx).unwrap();
+    assert!(!out.reverted, "getSymbolConfig reverted: {:?}", out.bytes);
+    assert_eq!(
+        out.gas_used, 5_000,
+        "getSymbolConfig's gas must stay FLAT per selector — never per-tier or dynamic"
+    );
+    let d = getSymbolConfigCall::abi_decode_returns(&out.bytes).unwrap();
+    (d.leverage, d.maxNotionalValue)
+}
+
+/// The DEFAULT configuration: one tier `{0, 3}`, whose band runs to infinity, so
+/// `maxNotionalValue` is `0` (UNBOUNDED) at every leverage — including for a user who has never
+/// touched this market and reads back the unset `leverage = 1`.
+#[test]
+fn get_symbol_config_is_unbounded_on_the_default_single_tier_table() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+
+    assert_eq!(
+        symbol_config(&mut ctx, ALICE, MARKET_ID),
+        (1, 0),
+        "no position: leverage reads back the unset 1, and the single tier is unbounded"
+    );
+
+    for leverage in 1..=3 {
+        set_leverage(&mut ctx, leverage).unwrap();
+        assert_eq!(
+            symbol_config(&mut ctx, ALICE, MARKET_ID),
+            (leverage, 0),
+            "single-tier table is unbounded at leverage {leverage}"
+        );
+    }
+}
+
+/// The BOUNDED configuration — the one that separates this selector from a client re-deriving the
+/// bound out of `getMarginTiers`. `[{0, 3}, {$200, 2}, {$400, 1}]`, checked at every leverage in
+/// `1..=3`: the reported bound is the upper edge of the LAST tier whose `maxLeverage` still admits
+/// the leverage in force, and `0` when that tier is the final one.
+///
+/// ```text
+/// leverage 3 -> only tier 0 admits it   -> table[1].lower = $200 = 200_000_000
+/// leverage 2 -> tiers 0,1 admit it      -> table[2].lower = $400 = 400_000_000
+/// leverage 1 -> all three admit it; tier 2 is FINAL -> 0 (unbounded)
+/// ```
+#[test]
+fn get_symbol_config_reports_the_band_edge_at_each_leverage() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_margin_tiers(
+        &mut ctx,
+        ADMIN,
+        MARKET_ID,
+        &[0, 200_000_000, 400_000_000],
+        &[3, 2, 1],
+    )
+    .unwrap();
+
+    for (leverage, expected) in [(1u64, 0u64), (2, 400_000_000), (3, 200_000_000)] {
+        set_leverage(&mut ctx, leverage).unwrap();
+        assert_eq!(
+            symbol_config(&mut ctx, ALICE, MARKET_ID),
+            (leverage, expected),
+            "leverage {leverage}"
+        );
+    }
+}
+
+/// The tier table is a required input, so an unknown market REVERTS rather than reporting `0` —
+/// which would read as "unbounded" for a market that does not exist. Same shape as
+/// `getMarginTiers` and `getMarginInfo`, deliberately NOT `getPosition`'s all-zeros.
+#[test]
+fn get_symbol_config_rejects_unknown_market() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let err = run_get_symbol_config(
+        &getSymbolConfigCall {
+            user: ALICE,
+            marketId: 999,
+        }
+        .abi_encode(),
+        &mut ctx,
+    )
+    .unwrap_err();
     assert!(err.to_string().contains("unknown market"), "{err}");
 }
 

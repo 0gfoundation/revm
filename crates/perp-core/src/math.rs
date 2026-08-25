@@ -216,6 +216,54 @@ pub fn max_leverage_for_notional(tiers: &MarginTiers, abs_notional: i64) -> u32 
     lev
 }
 
+/// Largest `|notional|` a market's tier table permits AT `leverage` — the notional↔leverage
+/// inversion of [`max_leverage_for_notional`]. **`0` means UNBOUNDED.**
+///
+/// The chain enforces the table in the FORWARD direction: given a notional, which leverage is
+/// still allowed (`max_leverage_for_notional`, the quantity `setLeverage` and every per-open guard
+/// compare against). This is the same table read BACKWARDS: given a leverage, how large may the
+/// position grow before the table itself refuses it. Nothing in the engine needs the inverse — it
+/// exists so `getSymbolConfig` can report it from the code that owns the table instead of a
+/// consumer re-deriving it from `getMarginTiers` and drifting.
+///
+/// `leverage` is admissible in tier `i` iff `table[i].max_leverage >= leverage`; the answer is the
+/// upper bound of the LAST such tier, i.e. `table[i+1].lower_bound_notional`, and `0` when tier `i`
+/// is the final tier (its band runs to infinity). `max_leverage` is non-increasing across the table,
+/// so the admissible tiers are a prefix and "the last one" is well defined.
+///
+/// # What is asserted, and the one state that breaks it
+///
+/// Every writer of a position's `leverage` caps it at `max_leverage_for_notional` of that
+/// position's own notional, which is `<= table[0].max_leverage`. So tier 0 always admits a
+/// leverage that came from `setLeverage`, index `i` always exists, and the `debug_assert!` below
+/// says exactly that.
+///
+/// It is nevertheless reachable, by ONE route: `setMarginTiers` replaces the table wholesale and
+/// deliberately does NOT re-check live positions (an over-levered position keeps running and is
+/// only refused when it next tries to OPEN — see that selector's ABI doc). Lower every
+/// `max_leverage` under a position sitting above the new ceiling and no tier admits its leverage.
+/// The table then permits NO notional at all at that leverage, which `0` cannot express — `0` is
+/// already spoken for by "unbounded". So the release fallback is `i = 0`: report the bound as if
+/// the position were held to the table's OWN maximum leverage, the most restrictive band edge the
+/// table has. It over-reports (at that leverage nothing is permitted), and it is the same direction
+/// the alternative errs in, but it never claims "unbounded" for a table that has a ceiling.
+#[inline]
+pub fn max_notional_for_leverage(tiers: &MarginTiers, leverage: u64) -> u64 {
+    let table = tiers.as_slice();
+    let last = table
+        .iter()
+        .rposition(|t| t.max_leverage as u64 >= leverage);
+    debug_assert!(
+        last.is_some(),
+        "no tier admits leverage {leverage} (tier 0 caps at {}) — only reachable by setMarginTiers \
+         lowering the table under a live position",
+        table[0].max_leverage
+    );
+    table
+        .get(last.unwrap_or(0) + 1)
+        .map_or(0, |t| t.lower_bound_notional)
+}
+
 // ── Derived open-order initial margin (ooIM) ─────────────────────────────────────────────────
 //
 // The requirement a set of RESTING orders imposes, DERIVED from the position and the book
@@ -904,7 +952,7 @@ mod mark_band_bounds_tests {
 #[cfg(test)]
 mod margin_tier_tests {
     use super::*;
-    use crate::types::{MarginTier, MarginTiers};
+    use crate::types::{MarginTier, MarginTiers, DEFAULT_MAX_LEVERAGE};
 
     fn table(rows: &[(u64, u32)]) -> MarginTiers {
         let v: Vec<MarginTier> = rows
@@ -1093,6 +1141,86 @@ mod margin_tier_tests {
         let d = MarginTiers::default();
         assert_eq!(max_leverage_for_notional(&d, 0), 3);
         assert_eq!(max_leverage_for_notional(&d, i64::MAX), 3);
+    }
+
+    /// Every market TODAY ships the single default tier `{0, DEFAULT_MAX_LEVERAGE}`, whose band
+    /// runs to infinity — so `maxNotionalValue` is `0` (UNBOUNDED) at every leverage the table
+    /// admits. The piecewise structure this function exists for is invisible in that
+    /// configuration, which is exactly why the bounded case below is a separate test.
+    #[test]
+    fn max_notional_for_leverage_is_unbounded_on_a_single_tier_table() {
+        let d = MarginTiers::default();
+        for leverage in 1..=u64::from(DEFAULT_MAX_LEVERAGE) {
+            assert_eq!(
+                max_notional_for_leverage(&d, leverage),
+                0,
+                "single-tier table has no upper band edge at leverage {leverage}"
+            );
+        }
+    }
+
+    /// The BOUNDED case: a real three-tier table, checked at every leverage in `1..=3`.
+    ///
+    /// `[{0, 3}, {$200, 2}, {$400, 1}]` (quote units, `1e6` per dollar). "Admissible at
+    /// `leverage`" is `max_leverage >= leverage`, so the admissible prefix shrinks as the
+    /// leverage rises and the reported bound is the upper edge of the LAST admissible tier:
+    ///
+    /// ```text
+    /// leverage 1 -> tiers 0,1,2 admit it; tier 2 is the last, and it is FINAL -> 0 (unbounded)
+    /// leverage 2 -> tiers 0,1   admit it; tier 1 is the last  -> table[2].lower = $400 = 400e6
+    /// leverage 3 -> tier  0     admits it; tier 0 is the last -> table[1].lower = $200 = 200e6
+    /// ```
+    #[test]
+    fn max_notional_for_leverage_reports_the_band_edge_on_a_bounded_table() {
+        let t = table(&[(0, 3), (200_000_000, 2), (400_000_000, 1)]);
+        assert_eq!(max_notional_for_leverage(&t, 3), 200_000_000);
+        assert_eq!(max_notional_for_leverage(&t, 2), 400_000_000);
+        assert_eq!(max_notional_for_leverage(&t, 1), 0);
+    }
+
+    /// The inversion agrees with the FORWARD lookup it inverts, which is the property that makes it
+    /// safe for a consumer to stop re-deriving one from the other: at any notional strictly below
+    /// the reported bound the forward lookup must still permit `leverage`, and AT the bound it must
+    /// not. Randomised over `2..=8`-tier tables.
+    #[test]
+    fn max_notional_for_leverage_inverts_max_leverage_for_notional() {
+        let mut s: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..4_000 {
+            let n_tiers = 2 + (next(&mut s) % 7) as usize; // 2..=8
+            let mut rows: Vec<(u64, u32)> = Vec::with_capacity(n_tiers);
+            let mut bound = 0u64;
+            let mut lev = 1 + (next(&mut s) % 20) as u32;
+            rows.push((0, lev));
+            for _ in 1..n_tiers {
+                bound += 1 + next(&mut s) % 1_000_000_000;
+                lev = 1 + next(&mut s) as u32 % lev;
+                rows.push((bound, lev));
+            }
+            let t = table(&rows);
+            // Only leverages `setLeverage` could actually have written — i.e. `<=` tier 0's cap,
+            // the precondition `max_notional_for_leverage` asserts.
+            for leverage in 1..=u64::from(rows[0].1) {
+                let max_notional = max_notional_for_leverage(&t, leverage);
+                if max_notional == 0 {
+                    // Unbounded: the forward lookup must permit `leverage` everywhere, including
+                    // at the largest notional the table can be asked about.
+                    assert!(
+                        u64::from(max_leverage_for_notional(&t, i64::MAX)) >= leverage,
+                        "unbounded at leverage {leverage} but the top tier refuses it: {rows:?}"
+                    );
+                    continue;
+                }
+                assert!(
+                    u64::from(max_leverage_for_notional(&t, max_notional as i64 - 1)) >= leverage,
+                    "leverage {leverage} refused one unit BELOW its own bound {max_notional}: \
+                     {rows:?}"
+                );
+                assert!(
+                    u64::from(max_leverage_for_notional(&t, max_notional as i64)) < leverage,
+                    "leverage {leverage} still permitted AT its own bound {max_notional}: {rows:?}"
+                );
+            }
+        }
     }
 
     /// `is_above_maintenance_margin` under the default table must reproduce the pre-tier

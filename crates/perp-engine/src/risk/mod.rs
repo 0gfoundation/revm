@@ -15,14 +15,15 @@ use crate::{
         getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn, getInsuranceFundCall,
         getMarginTiersCall, getMarginTiersReturn, getMarkPriceCall, getMarketCall,
         getMarketManagerAddressCall, getMarketReturn, getOracleAddressCall, getPositionCall,
-        getPositionReturn, initAdminCall, liquidateCall, removePositionMarginCall,
-        setLeverageCall, setLeverageSignedCall, setMarginTiersCall,
-        setMarketManagerAddressCall, setOracleAddressCall, transferAdminCall,
+        getPositionReturn, getSymbolConfigCall, getSymbolConfigReturn, initAdminCall,
+        liquidateCall, removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
+        setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall, transferAdminCall,
         updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
     },
     math::{
         calc_funding_rate, calc_position_equity, calc_value, calc_value_i64, checked_u64_to_i64,
-        is_above_maintenance_margin, max_leverage_for_notional, FUNDING_RATE_ONE,
+        is_above_maintenance_margin, max_leverage_for_notional, max_notional_for_leverage,
+        FUNDING_RATE_ONE,
     },
     storage,
     trading::{
@@ -579,6 +580,39 @@ fn set_leverage_core<H: PerpHost>(
     });
 
     Ok(Bytes::new())
+}
+
+/// `getSymbolConfig(address user, uint64 marketId) returns (uint64 leverage, uint64 maxNotionalValue)`
+///
+/// `leverage` is `pos.leverage.max(1)` — the SAME floor `margin_view::margin_info_of` and
+/// `math::open_order_margin` apply, so this selector reports the leverage that is actually in
+/// force rather than a raw blob field that may still read 0 on a defaulted position.
+///
+/// `maxNotionalValue` is [`max_notional_for_leverage`] — the tier table read backwards, `0` for
+/// unbounded. Kept in `math::` next to the forward lookup it inverts so the two cannot disagree
+/// about the band structure; see that function for the `setMarginTiers`-under-a-live-position
+/// state its assertion covers, and the ABI doc for why this is a selector at all.
+///
+/// Reverts on an unknown market: the tier table is a required input, and fabricating an empty one
+/// would report `0` — "unbounded" — for a market that does not exist.
+pub fn run_get_symbol_config<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = getSymbolConfigCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getSymbolConfig: invalid calldata"))?;
+
+    let market = storage::load_market_ref(context, args.marketId)?
+        .ok_or_else(|| perp_err("getSymbolConfig: unknown market"))?;
+    let pos = storage::load_position_ref(context, args.user, args.marketId)?;
+
+    let leverage = pos.leverage.max(1);
+    Ok(Bytes::from(getSymbolConfigCall::abi_encode_returns(
+        &getSymbolConfigReturn {
+            leverage,
+            maxNotionalValue: max_notional_for_leverage(&market.tiers, leverage),
+        },
+    )))
 }
 
 // ── Positions ─────────────────────────────────────────────────────────────────
