@@ -67,7 +67,7 @@ use crate::{
     errors::{perp_err, perp_invariant_err},
     interface::IPerpDex::{
         getAccountMarginCall, getAccountMarginReturn, getMarginInfoCall, getMarginInfoReturn,
-        getPositionRiskCall, getPositionRiskReturn,
+        getPositionRiskCall,
     },
     math::{calc_value_i64, checked_u64_to_i64, maintenance_margin, open_order_margin},
     storage, PerpError,
@@ -749,17 +749,22 @@ pub fn run_get_margin_info<H: PerpHost>(
     )))
 }
 
-/// `getPositionRisk(address user, uint64 marketId) returns (...)` — the [`MarginInfo`] for one
-/// `(user, market)`, `liquidationPrice` included. See the ABI doc comment in [`crate::interface`].
+/// `getPositionRisk(address user, uint64 marketId) returns (AccountPosition)` — ONE
+/// [`AccountPositionRow`] for one `(user, market)`. See the ABI doc comment in [`crate::interface`].
 ///
-/// # No `PositionRisk` type, and no second derivation
+/// # ONE ROW TYPE, ONE ENCODER, TWO CALL PATHS
 ///
-/// This used to compute the liquidation price itself, into a `PositionRisk` wrapper that held a
-/// `MarginInfo` plus that one extra number. Both are gone: `liquidation_price` is a
-/// [`MarginInfo`] FIELD, produced by [`margin_info_of`] alongside the other fifteen, so there is
-/// exactly one derivation of it in the engine and this selector reads it rather than re-running the
-/// search. The market's own reject wording is preserved by the load below, which is otherwise a
-/// `_ref` hit on the blob [`compute_margin_info`] is about to bring resident.
+/// There is no per-selector encoding here at all: this builds the same [`AccountPositionRow`]
+/// [`fold_account_margin`] pushes and hands it to the same [`AccountPositionRow::to_abi`]
+/// `getAccount` uses. That is the whole point of the selector returning the struct rather than a
+/// flat tuple — the single-market and bulk paths cannot report a different row for the same state
+/// because there is only one function that writes a row out.
+///
+/// It replaced a hand-written `sol!` encoder listing all seventeen fields, which was a second
+/// implementation of `to_abi` differing only in the type it filled. The row's VALUES could not drift
+/// (one [`MarginInfo`], one [`margin_info_of`] call), but a field could still be dropped on the way
+/// out of one encoder and not the other, and `liquidation_price` had already been a hand-plumbed
+/// sixteenth number once. Now a field added to `AccountPosition` reaches both surfaces or neither.
 pub fn run_get_position_risk<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -772,27 +777,15 @@ pub fn run_get_position_risk<H: PerpHost>(
     if storage::load_market_ref(context, args.marketId)?.is_none() {
         return Err(perp_err("getPositionRisk: unknown market"));
     }
-    let info = compute_margin_info(context, args.user, args.marketId)?;
+    let row = AccountPositionRow {
+        market_id: args.marketId,
+        info: compute_margin_info(context, args.user, args.marketId)?,
+    };
 
+    // `sol!` collapses a single-struct return to the struct itself, so `getPositionRiskReturn` IS
+    // `IPerpDex::AccountPosition` — there is not even a per-selector wrapper type left to fill.
     Ok(Bytes::from(getPositionRiskCall::abi_encode_returns(
-        &getPositionRiskReturn {
-            markPrice: info.mark_price,
-            positionAmt: info.position_amt,
-            vQuoteBalance: info.v_quote_balance,
-            leverage: info.leverage,
-            bidNotional: info.bid_notional,
-            askNotional: info.ask_notional,
-            entryPrice: info.entry_price,
-            notional: info.notional,
-            unrealizedProfit: info.unrealized_profit,
-            isolatedMargin: info.isolated_margin,
-            positionInitialMargin: info.position_initial_margin,
-            openOrderInitialMargin: info.open_order_initial_margin,
-            initialMargin: info.initial_margin,
-            maintMargin: info.maint_margin,
-            isolatedWallet: info.position_margin,
-            liquidationPrice: info.liquidation_price,
-        },
+        &row.to_abi(),
     )))
 }
 

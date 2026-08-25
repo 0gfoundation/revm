@@ -25,7 +25,7 @@ use crate::{
     host::PerpHost,
     interface::IPerpDex::{
         getAccountCall, getAccountMarginReturn, getAccountReturn, getMarginInfoReturn,
-        getPositionRiskCall, getPositionRiskReturn, placeOrderCall, AccountPosition,
+        getPositionRiskCall, placeOrderCall, AccountPosition,
     },
     run_perp_dex_call, storage,
     types::{
@@ -234,7 +234,12 @@ fn margin_info(ctx: &mut TestCtx, user: Address, market_id: u64) -> getMarginInf
 /// assertion that the selector is registered `can_be_static = true` and priced AT `getMarginInfo`'s
 /// flat 20_000, the tier it shares its whole load set with. The liquidation search adds no loads,
 /// so it must not move the price.
-fn position_risk(ctx: &mut TestCtx, user: Address, market_id: u64) -> getPositionRiskReturn {
+///
+/// Returns an `AccountPosition` — the SAME type a `getAccount().positions[]` row decodes to, because
+/// this selector returns that struct rather than a flat tuple of its fields. The `marketId` echo is
+/// asserted here so every caller of this helper gets it for free: a row that named the wrong market
+/// would be worse than no row at all.
+fn position_risk(ctx: &mut TestCtx, user: Address, market_id: u64) -> AccountPosition {
     let input = getPositionRiskCall {
         user,
         marketId: market_id,
@@ -246,7 +251,13 @@ fn position_risk(ctx: &mut TestCtx, user: Address, market_id: u64) -> getPositio
         out.gas_used, 20_000,
         "getPositionRisk's gas must stay FLAT per selector — never per-iteration or dynamic"
     );
-    getPositionRiskCall::abi_decode_returns(&out.bytes).unwrap()
+    let row = getPositionRiskCall::abi_decode_returns(&out.bytes).unwrap();
+    assert_eq!(
+        row.marketId, market_id,
+        "getPositionRisk's row must name the market it was asked for — the id is what makes the row \
+         self-describing when it is handed to code that also consumes getAccount rows"
+    );
+    row
 }
 
 /// Replace a market's margin-tier table directly in storage. The engine's own `setMarginTiers`
@@ -335,29 +346,16 @@ fn row_shared_fields(p: &AccountPosition) -> [i128; 16] {
     core::array::from_fn(|k| all[k])
 }
 
-/// `getPositionRisk`'s SHARED 15 returns — everything except `liquidationPrice` — flattened in
-/// declaration order and widened to `i128`, so it lines up with [`margin_info_only_fields`].
+/// The 15 fields of a row that `getMarginInfo` also returns — [`row_shared_fields`] without the
+/// leading `marketId` — flattened in declaration order and widened to `i128`, so it lines up with
+/// [`margin_info_only_fields`].
 ///
-/// Written out independently of the `getMarginInfo` flattener on purpose: sharing a converter would
-/// make the two sides agree by construction and test nothing.
-fn risk_shared_fields(r: &getPositionRiskReturn) -> [i128; 15] {
-    [
-        r.markPrice as i128,
-        r.positionAmt as i128,
-        r.vQuoteBalance as i128,
-        r.leverage as i128,
-        r.bidNotional as i128,
-        r.askNotional as i128,
-        r.entryPrice as i128,
-        r.notional as i128,
-        r.unrealizedProfit as i128,
-        r.isolatedMargin as i128,
-        r.positionInitialMargin as i128,
-        r.openOrderInitialMargin as i128,
-        r.initialMargin as i128,
-        r.maintMargin as i128,
-        r.isolatedWallet as i128,
-    ]
+/// Takes an `AccountPosition` because that is what `getPositionRisk` now returns; a row obtained
+/// through EITHER call path flattens the same way here, which is the property that made the second
+/// ABI encoder redundant.
+fn risk_shared_fields(r: &AccountPosition) -> [i128; 15] {
+    let all = row_shared_fields(r);
+    core::array::from_fn(|k| all[k + 1])
 }
 
 /// `getMarginInfo`'s 15 returns flattened the same way, for comparison against
@@ -1713,16 +1711,24 @@ fn get_account_positions_agree_with_get_margin_info_field_for_field() {
     );
 }
 
-/// `getPositionRisk`'s first fifteen returns must equal `getMarginInfo`'s fifteen on the same
-/// state, POSITIONALLY over all of them — `getPositionRisk` claims to be a strict superset, and this
-/// is that claim under test rather than under assertion in a comment.
+/// The fifteen fields of `getPositionRisk`'s row that `getMarginInfo` also returns must equal
+/// `getMarginInfo`'s fifteen on the same state, POSITIONALLY over all of them — `getPositionRisk`
+/// claims to be a strict superset, and this is that claim under test rather than under assertion in
+/// a comment.
 ///
 /// Same shape as `get_account_positions_agree_with_get_margin_info_field_for_field`, including its
 /// "every field is non-trivial SOMEWHERE" guard: without that this could pass as an agreement about
 /// zeros and would prove nothing about either encoder. The VALUES cannot drift (both selectors
 /// encode one `margin_info_of` output); what this catches is everything around that — a field
-/// dropped or mis-assigned in the third `sol!` encoder, and the silent one, a future field added to
-/// one surface and forgotten on the other.
+/// dropped or mis-assigned in the `AccountPosition` encoder, and the silent one, a future field
+/// added to one surface and forgotten on the other.
+///
+/// ⚠️ `getPositionRisk` now returns an `AccountPosition`, the same struct through the same
+/// `AccountPositionRow::to_abi` the bulk path uses — so the encoder this checks against
+/// `getMarginInfo` is the row encoder, reached by a different call path. The two agreement tests are
+/// therefore converging: they differ only in HOW the row was fetched. What still has content is the
+/// comparison against `getMarginInfo`'s independent tuple encoder, and that is exactly what
+/// disappears when `getMarginInfo` does.
 #[test]
 fn get_position_risk_agrees_with_get_margin_info_field_for_field() {
     let mut ctx = make_ctx();
@@ -1769,7 +1775,7 @@ fn get_position_risk_agrees_with_get_margin_info_field_for_field() {
     );
     set_orders(&mut ctx, ALICE, MARKET_C, &[], &[entry(5, P100, 2)]);
 
-    let risks: Vec<getPositionRiskReturn> = [MARKET_A, MARKET_B, MARKET_C]
+    let risks: Vec<AccountPosition> = [MARKET_A, MARKET_B, MARKET_C]
         .into_iter()
         .map(|m| position_risk(&mut ctx, ALICE, m))
         .collect();
@@ -1786,7 +1792,7 @@ fn get_position_risk_agrees_with_get_margin_info_field_for_field() {
 
     // ── the fixture really does exercise every field ──
     // Without this the loop above could pass on three responses of zeros.
-    let nonzero = |f: fn(&getPositionRiskReturn) -> i128| risks.iter().any(|r| f(r) != 0);
+    let nonzero = |f: fn(&AccountPosition) -> i128| risks.iter().any(|r| f(r) != 0);
     assert!(
         nonzero(|r| r.markPrice as i128)
             && nonzero(|r| r.positionAmt as i128)

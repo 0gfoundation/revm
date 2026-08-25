@@ -625,15 +625,26 @@ sol! {
             int64  isolatedWallet
         );
 
-        /// [`getMarginInfo`] plus `liquidationPrice` — the full Binance `/positionRisk` row for one
-        /// `(user, marketId)`.
+        /// The full Binance `/positionRisk` row for one `(user, marketId)` — returned as ONE
+        /// [`AccountPosition`], the very struct `getAccount().positions[]` is an array of.
         ///
-        /// The first fifteen returns are `getMarginInfo`'s, in the same order, with the same
-        /// contracts and the same rounding modes; read that comment for the field-by-field detail.
-        /// They are not recomputed — both selectors encode ONE `margin_view::MarginInfo` from ONE
-        /// `margin_view::margin_info_of` call, so they cannot disagree, and
-        /// `margin_view_tests::get_position_risk_agrees_with_get_margin_info_field_for_field`
-        /// asserts the equality positionally over all fifteen rather than trusting it.
+        /// ⚠️ **THE RETURN IS A STRUCT, NOT A FLAT TUPLE.** It used to be fifteen loose returns plus
+        /// `liquidationPrice`, i.e. an `AccountPosition`'s numbers with the `marketId` dropped and
+        /// the braces removed. That was a SECOND ABI ENCODER for a row this interface already had a
+        /// type for, and the duplication is what §7.1.2 exists to fight: two encoders writing the
+        /// same seventeen numbers is a field silently dropped from one of them, waiting to happen.
+        /// There is now exactly one — `margin_view::AccountPositionRow::to_abi` — reached by both
+        /// the single-market and the bulk path.
+        ///
+        /// So read [`AccountPosition`] for the field list, and `getMarginInfo` for the field-by-field
+        /// contract and the rounding mode of each derived value. Nothing is recomputed per surface:
+        /// every field comes from ONE `margin_view::MarginInfo` produced by ONE
+        /// `margin_view::margin_info_of` call, `liquidationPrice` included.
+        ///
+        /// `marketId` is now returned, and it is deliberately not "redundant with the argument": it
+        /// makes the row SELF-DESCRIBING, so a caller can hand it to the same code that consumes a
+        /// `getAccount()` row without carrying the id alongside it — which is the point of the two
+        /// paths sharing a type at all.
         ///
         ///   liquidationPrice  the mark price at which this position **IS** liquidatable — for a
         ///                     LONG the GREATEST such price, for a SHORT the LEAST. **Conservative
@@ -666,7 +677,10 @@ sol! {
         /// It costs no storage loads at all — the whole search runs on values this call already
         /// read.
         ///
-        /// Reverts if the market does not exist, exactly as `getMarginInfo` does.
+        /// Reverts if the market does not exist, exactly as `getMarginInfo` does. Note this is
+        /// UNLIKE `getPosition`, which reports all-zeros for an unknown market: the decimals and the
+        /// tier table are required INPUTS here, so a fabricated zero market would report a full row
+        /// of plausible zeros.
         ///
         /// ⚠️ `getMarginInfo` IS NOT DELETED and keeps working unchanged. This is a strict
         /// superset of it, so new code should prefer THIS selector. A backend rendering SEVERAL
@@ -674,22 +688,7 @@ sol! {
         /// on every row, so the whole risk picture is one read of one state and this selector is for
         /// the genuinely single-market query.
         function getPositionRisk(address user, uint64 marketId) external view returns (
-            uint64 markPrice,
-            int64  positionAmt,
-            int64  vQuoteBalance,
-            uint64 leverage,
-            uint64 bidNotional,
-            uint64 askNotional,
-            uint64 entryPrice,
-            uint64 notional,
-            int64  unrealizedProfit,
-            int64  isolatedMargin,
-            uint64 positionInitialMargin,
-            uint64 openOrderInitialMargin,
-            uint64 initialMargin,
-            uint64 maintMargin,
-            int64  isolatedWallet,
-            uint64 liquidationPrice
+            AccountPosition position
         );
 
         /// Account-level roll-up of [`getMarginInfo`] over an EXPLICIT list of markets.
