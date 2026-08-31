@@ -1877,8 +1877,33 @@ fn split_position_fill(
 ///
 /// Runs POST-FLUSH, so storage is authoritative: the registry has already written the fills'
 /// positions/accounts and the consumed order entries, hence `Σ ooIM` here is already the POST-fill
-/// value. `finalize_compute` simulated exactly this loop on the same state pre-flush, so reaching
-/// the final reject below would mean the two diverged.
+/// value.
+///
+/// # Why the final reject is UNREACHABLE (and therefore raises `perp_invariant_err`)
+///
+/// Re-verified 2026-08-31 while fixing the val0 leak, because this is the other post-flush reject on
+/// the place path and "it is unreachable" was asserted rather than argued. Two legs, matching
+/// `finalize_compute`'s two branches:
+///
+/// 1. **Fast path** (`available >= total_required + rest_delta`, so the cover simulation is
+///    skipped): `rest_delta >= 0` always, so this already implies `available >= total_required` and
+///    the FIRST `taker_margin_is_covered` below returns early. `rest_delta` is
+///    `ooIM(after_rest) − ooIM(after_fills)` and the rest only ADDS to one side's aggregate, while
+///    `ooIM = max(|N + Bid|, |N − Ask|)/L − |N|/L` is monotone non-decreasing in `Bid` and in `Ask`
+///    separately: the branch that shares `N`'s sign dominates `|N|` (see `math::open_order_margin`),
+///    so whenever the other branch would shrink, the `max` is pinned by the dominating one and the
+///    delta is 0 rather than negative.
+/// 2. **Cover path**: `finalize_compute` already ran this LIFO loop, on the same state, with the
+///    same predicate (`derived_can_afford(available, total_required)`) and the same per-cancel
+///    arithmetic — its `sim` calls `release_open_order_margin_core`, and the real cancel below routes
+///    through `release_open_order_margin`, which ends in the same
+///    `remove_entry_from_side_aggregates(pos, side, entry.amount, entry.margin_notional(..))`. It
+///    raises pre-flush if the loop runs out of orders, so a survivor is covered by construction.
+///
+/// ⚠️ The two legs above are load-bearing for the commit-only #23 discipline, not commentary: if
+/// either ever stops holding, this becomes a genuine second leak of the same shape as the val0 one
+/// (the fills are already flushed by the time it raises). Keep them true, or convert this site to
+/// the same expire-the-remainder resolution `execute_limit_order`'s GTC arm uses.
 ///
 /// # What a cancel frees, now that nothing is escrowed
 ///
@@ -1917,7 +1942,21 @@ fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
     )?;
 
     if !taker_margin_is_covered(context, user, required_margin)? {
-        return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+        // INVARIANT, not a user error — and labelled as one now (it used to raise `perp_err`).
+        //
+        // This sits inside `finalize_apply`, i.e. AFTER `registry.flush`, so it is structurally a
+        // write-then-reject site: reaching it leaks the fills exactly the way the val0 leak at block
+        // 1,098,719 did. The difference is that this one is provably out of reach (see the two-leg
+        // argument on the doc comment above), so the right response to reaching it is "a supposedly
+        // exact simulation diverged from the real loop — that is a BUG", not "the user is short of
+        // margin". `perp_err` said the latter, which both mislabelled it and hid it from every test
+        // that greps for the `[INVARIANT] ` prefix.
+        //
+        // Genuine insufficiency is refused in the COMPUTE phase, pre-flush and write-clean: the
+        // fills+rest gate in `finalize_compute` and its cover-loop `Err` above it.
+        return Err(perp_invariant_err(
+            "taker margin cover diverged from the compute-phase simulation",
+        ));
     }
     Ok(())
 }
