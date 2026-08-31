@@ -641,12 +641,47 @@ pub fn run_perp_dex_call<H: PerpHost>(
             // Tripwire: a reverting call that WROTE the overlay is a residual write-then-error
             // (commit-only #23 — the write leaks with no undo). Record the offending selector +
             // count into a global so the exact path can be surfaced (read via
-            // [`last_perp_write_then_revert`]); diagnostic only, not a halt.
+            // [`last_perp_write_then_revert`]).
             let writes_after = context.perp_write_count();
             if writes_after != writes_before {
                 let sel = u32::from_be_bytes(selector);
                 LAST_WRITE_THEN_REVERT_SELECTOR.store(sel, core::sync::atomic::Ordering::Relaxed);
                 PERP_WRITE_THEN_REVERT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // ── STRUCTURAL GUARD (debug builds only; zero release cost) ──────────────────
+                //
+                // This counter existed before and was DIAGNOSTIC ONLY, which is precisely how the
+                // val0 leak at block 1,098,719 shipped: `rest_in_book`'s rest-margin reject fired
+                // after `match_order` had flushed, the counter ticked, and nothing failed. A
+                // silent witness is not a guard.
+                //
+                // Why an assertion here and not a test per reject path: the class is "ANY reject
+                // reachable after ANY perp write", and enumerating reject paths can only ever pin
+                // the ones already known. This is the fixed point every path funnels through, and
+                // `perp_write_count` is monotonic and revert-blind (commit-only — a revert does
+                // not decrement it), so "wrote, then reverted" is exactly `writes_after !=
+                // writes_before` with no bookkeeping of our own.
+                //
+                // ⚠️ NOT a release halt, deliberately. Every node running the same code takes the
+                // same branch, so a leak is deterministic and consensus-safe; promoting it to a
+                // chain halt would convert one user's stuck order into a liveness failure. The
+                // release build keeps the counter, which the correctness gate reads.
+                //
+                // ⚠️ Blind spot to keep in mind: it only sees calls routed through THIS shell.
+                // Unit tests that invoke `run_place_order` / `run_cancel_order` directly are below
+                // it and are not covered — those need the state-snapshot assertions in
+                // `trading::tests` instead.
+                debug_assert!(
+                    false,
+                    "commit-only #23 VIOLATED: selector {sel:#010x} reverted with \
+                     {} perp write(s) already committed (error: {error}). Perp writes have NO undo, \
+                     so this leaks off-trie state under a failed receipt — and because logs ARE \
+                     EVM-journaled, on-chain it appears as status 0x0 with zero logs and silently \
+                     mutated state. Fix the PATH, not this assertion: either move the check before \
+                     the first write (validate-then-apply), or, if writes have legitimately \
+                     happened, make the outcome a success with the unaffordable part \
+                     cancelled/expired (see `RestOutcome::RefusedUnaffordable`).",
+                    writes_after - writes_before,
+                );
             }
             Ok(PerpOutput::new_reverted(
                 charged_gas,
