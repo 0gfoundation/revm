@@ -248,11 +248,9 @@ impl TakerSettlement {
             market,
         )?;
 
-        // ── Derived-ooIM gate for "these fills, then rest the remainder" ─────────────────────
-        // Two things must come out of the same available balance: `core.total_required` (real
-        // cash — the opening margin plus the part of the fee margin could not absorb) and the
-        // marginal `ooIM` of the order about to rest. Neither is escrowed; the second is not even
-        // a debit, it just raises the requirement.
+        // ── Derived-ooIM gate for the FILLS, and the basis the REST will be decided against ──
+        // `core.total_required` (real cash — the opening margin plus the part of the fee margin
+        // could not absorb) must come out of the available balance. Nothing is escrowed.
         //
         // Everything is measured on the POST-FILL state the flush is about to write:
         // `after_fills` is `w.pos` with `Bid`/`Ask` taken from the working lists the walk has
@@ -260,37 +258,21 @@ impl TakerSettlement {
         // this fill's close proceeds. That is exactly what `finalize_apply` will re-derive from
         // storage after the flush, so the pre-flush decision and the post-flush one agree.
         //
-        // ── Why this gate keeps the EXPLICIT delta shape (and `rest_in_book` does not) ──
-        // `rest_in_book` and [`rest_is_affordable`] evaluate the Σ walk at the POST state and consult
-        // the delta lazily. This one deliberately does not, because what it gates is **not a pure
-        // delta**: `need` below is `core.total_required` (real cash out) PLUS the marginal
-        // `rest_delta`. Folding the cash leg into the walk would mean overriding the wallet with
-        // `wallet − total_required`, which (a) puts a narrowing subtraction on the fast path that
-        // today lives only inside the cover branch, and (b) would decide the fast path at a DIFFERENT
-        // wallet from the cover loop below, whose soundness argument is that it re-asks
-        // `derived_can_afford(avail, total_required)` at the same wallet on the same basis. The
-        // `≤ 0` escape also means something else here (a pure close whose rest happens to be free),
-        // so the post-state restatement would be one step FURTHER from the doc's measured delta
-        // predicate rather than the one step away that `rest_in_book`'s is.
+        // ── The REST is NOT gated here any more (atomic match+rest) ───────────────────────────
+        // This function used to take a `RestReq` and add the remainder's marginal `ooIM` to `need`,
+        // because `rest_in_book` ran AFTER the flush and its own refusal would therefore have
+        // leaked the fills (val0 block 1,098,719). It no longer does: `match_order` returns the
+        // UNFLUSHED registry and this plan, and the caller lets `rest_in_book` DECIDE before the
+        // write barrier. So there is exactly ONE evaluation of the rest's affordability, which is
+        // the property the val0 leak was the absence of — two algebraically identical checks
+        // diverged because `save_last_traded_price` ran between them and moved the Assuming-Price
+        // floor `T`. What this function owes the rest decision is not a second opinion but the
+        // STATE to decide on: [`RestBasis`], the taker's position + wallet exactly as the flush and
+        // `finalize_apply` will leave them.
         let (bd, pd) = (market.base_decimals, market.price_decimals);
         // `Bid`/`Ask` come off the WORKING order lists, which are the authoritative record of what
         // the walk has consumed — each surviving entry still at its own frozen assuming price.
         let after_fills = work_position_snapshot(w, bd, pd)?;
-        // `T` for the remainder ABOUT TO REST — the only thing on this path that needs it (see the
-        // zero-fill arm above). Every order already in the working lists carries its own frozen
-        // price, so nothing here re-resolves theirs. Resolved before the two `rest` arms below
-        // because both want it, off a `MarketHot` the match walk has already made warm.
-        let floor = crate::margin_view::assuming_price_floor(context, self.market_id, market)?;
-        let rest_delta = match &rest {
-            Some(r) => {
-                let after_rest = with_rest_entry(&after_fills, floor, taker_side, r, bd, pd)?;
-                crate::margin_view::derived_requirement_delta(market, &after_fills, &after_rest)?
-            }
-            None => 0,
-        };
-        let need = (core.total_required as i128)
-            .checked_add(rest_delta)
-            .ok_or_else(|| perp_err("placeOrder: fills+rest requirement overflow"))?;
         let wallet = w.account.perp_wallet_balance;
         let available = crate::margin_view::derived_available_balance_with(
             context,
@@ -299,83 +281,75 @@ impl TakerSettlement {
             Some((self.market_id, &after_fills)),
         )?;
 
-        // LEVEL 1 fast path (the common case): the available already covers fills + rest with NO
-        // cover cancels → produce the plan with ZERO order-list clones. Correct because covering
-        // `total_required + rest_delta` implies `finalize_apply`'s cover loop does nothing AND the
-        // post-debit leftover still covers the rest. Only a genuinely tight taker falls through.
-        if !crate::margin_view::derived_can_afford(available, need) {
-            // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
-            // `release_open_order_margin_core` so the sim cannot diverge from `finalize_apply`'s real loop.
-            // A cancel frees no cash now — it lowers `Bid`/`Ask` and therefore `Σ ooIM`, which is
-            // what raises the available. The loop's own test is `available >= total_required`, a
-            // straight money-out amount and NOT a delta, so `rest_in_book`'s post-state restatement
-            // does not apply to it — `available >= amount` is already the right form (the same class
-            // as `transferFromPerp` / `addPositionMargin`). Rest feasibility is re-checked on the
-            // POST-cover state
-            // (cover shrinks the taker's side, changing the rest's marginal requirement, so the
-            // `rest_delta` computed above is only used for the fast-path test).
-            let mut sim_pos = after_fills.clone();
-            let mut sim_buy = w.buy_entries.clone();
-            let mut sim_sell = w.sell_entries.clone();
-            loop {
-                // No re-fold: `release_open_order_margin_core` below subtracts each cancelled entry's frozen
-                // term from `sim_pos`, so its aggregates ARE `Bid`/`Ask` for the simulated book.
-                let avail = crate::margin_view::derived_available_balance_with(
-                    context,
-                    self.user,
-                    Some(wallet),
-                    Some((self.market_id, &sim_pos)),
-                )?;
-                if crate::margin_view::derived_can_afford(avail, core.total_required as i128) {
-                    break;
-                }
-                let next = match taker_side {
-                    Side::Buy => sim_buy.back().map(|e| e.order_id),
-                    Side::Sell => sim_sell.back().map(|e| e.order_id),
-                };
-                let Some(oid) = next else {
-                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
-                };
-                super::release_open_order_margin_core(
-                    &mut sim_pos,
-                    &mut sim_buy,
-                    &mut sim_sell,
-                    taker_side,
-                    &oid,
-                    market,
-                )?;
-            }
-            if let Some(r) = &rest {
-                // Post-cover, post-debit: the rest must fit in what is left.
+        // LEVEL 1 fast path (the common case): the available already covers the fills with NO
+        // cover cancels → produce the plan with ZERO order-list clones. Only a genuinely tight
+        // taker falls through.
+        let (rest_pos, cover_cancelled) =
+            if crate::margin_view::derived_can_afford(available, core.total_required as i128) {
+                (after_fills, false)
+            } else {
+                // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
+                // `release_open_order_margin_core` so the sim cannot diverge from `finalize_apply`'s
+                // real loop. A cancel frees no cash now — it lowers `Bid`/`Ask` and therefore
+                // `Σ ooIM`, which is what raises the available. The loop's own test is
+                // `available >= total_required`, a straight money-out amount and NOT a delta, so
+                // `rest_in_book`'s post-state restatement does not apply to it — `available >=
+                // amount` is already the right form (the same class as `transferFromPerp` /
+                // `addPositionMargin`).
                 //
-                // This IS a pure delta, so the post-state/lazy shape `rest_in_book` uses would apply
-                // verbatim — it is left explicit on purpose. It sits inside the rare cover branch
-                // (only a genuinely tight taker reaches it), so the "evaluate this market's ooIM once
-                // instead of three times" win is worth nothing here, while the state being priced is
-                // a SIMULATED post-cover book that exists only inside this loop. Keeping the two
-                // `ooIM(sim_pos)` / `ooIM(after_rest)` evaluations spelled out keeps the sim
-                // auditable against the real cancels `release_open_order_margin_core` performs in
-                // `finalize_apply`, which is the property this branch is here to preserve.
-                let wallet_after = wallet
-                    .checked_sub(checked_u64_to_i64(
-                        core.total_required,
-                        "settlement: taker total required",
-                    )?)
-                    .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
-                let after_rest = with_rest_entry(&sim_pos, floor, taker_side, r, bd, pd)?;
-                let delta =
-                    crate::margin_view::derived_requirement_delta(market, &sim_pos, &after_rest)?;
-                let avail = crate::margin_view::derived_available_balance_with(
-                    context,
-                    self.user,
-                    Some(wallet_after),
-                    Some((self.market_id, &sim_pos)),
-                )?;
-                if !crate::margin_view::derived_can_afford(avail, delta) {
-                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                // ⚠️ The loop's break condition covers `total_required` ONLY, and always did: it
+                // has never cancelled orders to make room for a REST (whenever the fills alone were
+                // affordable it broke on the first iteration with zero cancels). So dropping the
+                // rest term from the fast-path test above changes WHICH branch a fills-affordable /
+                // rest-unaffordable taker takes, and nothing about how many of its orders are
+                // cancelled — that taker now reaches `rest_in_book`, which refuses, and the whole
+                // order rejects cleanly pre-flush instead of rejecting from in here.
+                let mut sim_pos = after_fills.clone();
+                let mut sim_buy = w.buy_entries.clone();
+                let mut sim_sell = w.sell_entries.clone();
+                let mut cancelled_any = false;
+                loop {
+                    // No re-fold: `release_open_order_margin_core` below subtracts each cancelled
+                    // entry's frozen term from `sim_pos`, so its aggregates ARE `Bid`/`Ask` for the
+                    // simulated book.
+                    let avail = crate::margin_view::derived_available_balance_with(
+                        context,
+                        self.user,
+                        Some(wallet),
+                        Some((self.market_id, &sim_pos)),
+                    )?;
+                    if crate::margin_view::derived_can_afford(avail, core.total_required as i128) {
+                        break;
+                    }
+                    let next = match taker_side {
+                        Side::Buy => sim_buy.back().map(|e| e.order_id),
+                        Side::Sell => sim_sell.back().map(|e| e.order_id),
+                    };
+                    let Some(oid) = next else {
+                        return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                    };
+                    super::release_open_order_margin_core(
+                        &mut sim_pos,
+                        &mut sim_buy,
+                        &mut sim_sell,
+                        taker_side,
+                        &oid,
+                        market,
+                    )?;
+                    cancelled_any = true;
                 }
-            }
-        }
+                (sim_pos, cancelled_any)
+            };
+
+        // The wallet `finalize_apply`'s debit will leave. Cannot underflow: both branches above
+        // exit with `derived_can_afford(available, total_required)` true, and
+        // `available = wallet − Σ ooIM ≤ wallet` because `Σ ooIM ≥ 0`.
+        let rest_wallet = wallet
+            .checked_sub(checked_u64_to_i64(
+                core.total_required,
+                "settlement: taker total required",
+            )?)
+            .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
 
         let pos_log = w.pos.clone();
         reg.push_event(MatchEvent::AbsorbBadDebt {
@@ -391,8 +365,42 @@ impl TakerSettlement {
             pos_log,
             realized_pnl: core.realized_pnl,
             closed_quantity: core.closed_quantity,
+            rest_basis: RestBasis {
+                pos: rest_pos,
+                wallet: rest_wallet,
+                cover_cancelled,
+            },
         }))
     }
+}
+
+/// The taker's state **as the registry flush and [`finalize_apply`] will leave it** — the basis the
+/// GTC remainder's rest decision is taken against, handed forward instead of re-derived.
+///
+/// # Why this exists
+///
+/// `rest_in_book` used to run after the flush and read the settled store. That is what made the
+/// val0 leak at block 1,098,719 possible: its refusal fired with the fills already committed and no
+/// perp undo to roll them back. Now the flush is deferred until after the rest decision, so
+/// `rest_in_book` runs BEFORE the store holds any of this — and it must still measure the same
+/// numbers. They live here.
+///
+/// Every field is the *post* value, not a delta:
+/// * `pos` — `w.pos` with `Bid`/`Ask` resynced from the working order lists
+///   ([`work_position_snapshot`]), then with the cover loop's simulated cancels applied. The flush
+///   writes those same working copies and `finalize_apply` performs those same cancels, so this IS
+///   the position the store will hold.
+/// * `wallet` — post-fill (close proceeds already credited by `finalize_core`) and post-debit
+///   (`− total_required`, which `finalize_apply` takes).
+/// * `cover_cancelled` — whether the cover loop will really cancel at least one of the taker's own
+///   SAME-SIDE resting orders. The rest decision needs it because such a cancel can lower the
+///   taker's own side of the BBO, and `rest_in_book`'s new-best band gate reads the BBO pre-flush.
+///   See the `may_become_best` note there.
+#[derive(Clone)]
+pub(super) struct RestBasis {
+    pub(super) pos: crate::types::PerpPosition,
+    pub(super) wallet: i64,
+    pub(super) cover_cancelled: bool,
 }
 
 /// The taker's intent to rest its unmatched remainder (commit-only #23 atomic-reject): the
@@ -532,6 +540,16 @@ pub(super) struct TakerPlan {
     pos_log: crate::types::PerpPosition,
     realized_pnl: i64,
     closed_quantity: u64,
+    /// The state this plan's APPLY will leave behind, for the rest decision that runs BEFORE it.
+    /// See [`RestBasis`].
+    rest_basis: RestBasis,
+}
+
+impl TakerPlan {
+    /// The post-fill / post-cover / post-debit basis for a GTC remainder's rest decision.
+    pub(super) fn rest_basis(&self) -> RestBasis {
+        self.rest_basis.clone()
+    }
 }
 
 pub(super) fn finalize_apply<H: PerpHost>(
@@ -849,6 +867,31 @@ impl MatchRegistry {
     /// pre-check must measure against on a self-match.
     fn user_work(&self, user: Address) -> Option<&UserWork> {
         self.users.iter().find(|(a, _)| *a == user).map(|(_, w)| w)
+    }
+
+    /// The taker's [`RestBasis`] when the walk touched it but produced **no fill** — a self-match
+    /// maker the K9 guard cancelled, which evolves the taker's own working copy (and its order
+    /// lists) without ever reaching `finalize_compute`'s fill arm.
+    ///
+    /// `None` = the taker never joined this match, so the store is already the post-flush state for
+    /// it and `rest_in_book` reads storage.
+    ///
+    /// No debit and no cover: with zero fills there is no `TakerPlan`, so `finalize_apply` does not
+    /// run at all.
+    pub(super) fn taker_rest_basis(
+        &self,
+        user: Address,
+        base_decimals: u32,
+        price_decimals: u32,
+    ) -> Result<Option<RestBasis>, PerpError> {
+        match self.user_work(user) {
+            Some(w) => Ok(Some(RestBasis {
+                pos: work_position_snapshot(w, base_decimals, price_decimals)?,
+                wallet: w.account.perp_wallet_balance,
+                cover_cancelled: false,
+            })),
+            None => Ok(None),
+        }
     }
 
     pub(super) fn can_touch_user(&self, user: Address, limit: usize) -> bool {
@@ -1885,14 +1928,11 @@ fn split_position_fill(
 /// the place path and "it is unreachable" was asserted rather than argued. Two legs, matching
 /// `finalize_compute`'s two branches:
 ///
-/// 1. **Fast path** (`available >= total_required + rest_delta`, so the cover simulation is
-///    skipped): `rest_delta >= 0` always, so this already implies `available >= total_required` and
-///    the FIRST `taker_margin_is_covered` below returns early. `rest_delta` is
-///    `ooIM(after_rest) − ooIM(after_fills)` and the rest only ADDS to one side's aggregate, while
-///    `ooIM = max(|N + Bid|, |N − Ask|)/L − |N|/L` is monotone non-decreasing in `Bid` and in `Ask`
-///    separately: the branch that shares `N`'s sign dominates `|N|` (see `math::open_order_margin`),
-///    so whenever the other branch would shrink, the `max` is pinned by the dominating one and the
-///    delta is 0 rather than negative.
+/// 1. **Fast path** (`available >= total_required`, so the cover simulation is skipped): that is
+///    literally the predicate the FIRST `taker_margin_is_covered` below re-asks, on the same state
+///    and at the same wallet, so it returns early. (It used to be `available >= total_required +
+///    rest_delta`, which needed an extra `rest_delta >= 0` step; the rest is no longer gated here at
+///    all — `rest_in_book` decides it once, pre-flush.)
 /// 2. **Cover path**: `finalize_compute` already ran this LIFO loop, on the same state, with the
 ///    same predicate (`derived_can_afford(available, total_required)`) and the same per-cancel
 ///    arithmetic — its `sim` calls `release_open_order_margin_core`, and the real cancel below routes
@@ -1902,8 +1942,8 @@ fn split_position_fill(
 ///
 /// ⚠️ The two legs above are load-bearing for the commit-only #23 discipline, not commentary: if
 /// either ever stops holding, this becomes a genuine second leak of the same shape as the val0 one
-/// (the fills are already flushed by the time it raises). Keep them true, or convert this site to
-/// the same expire-the-remainder resolution `execute_limit_order`'s GTC arm uses.
+/// (the fills are already flushed by the time it raises). Keep them true — or move the cover loop
+/// itself in front of the write barrier, which is the resolution `rest_in_book` now uses.
 ///
 /// # What a cancel frees, now that nothing is escrowed
 ///
@@ -1953,7 +1993,8 @@ fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
         // that greps for the `[INVARIANT] ` prefix.
         //
         // Genuine insufficiency is refused in the COMPUTE phase, pre-flush and write-clean: the
-        // fills+rest gate in `finalize_compute` and its cover-loop `Err` above it.
+        // fills gate in `finalize_compute` and its cover-loop `Err` above it. (The REST's own
+        // insufficiency is refused by `rest_in_book`, also pre-flush now.)
         return Err(perp_invariant_err(
             "taker margin cover diverged from the compute-phase simulation",
         ));

@@ -63,7 +63,7 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         .to_log_data(),
     });
 
-    let remaining = match_order(
+    let outcome = match_order(
         context,
         user,
         &order_id,
@@ -78,10 +78,18 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         // reverting when the underwater user cannot cover a taker fee.
         true,
         &mut order,
-        // The liquidation close emits its OrderPlaced itself (above), so there is nothing buffered
-        // for the match apply to flush — its log behavior is unchanged.
-        &mut None,
     )?;
+    // ── ⚠️ A LIQUIDATION MUST NEVER BECOME REJECTABLE ──────────────────────────────────────────
+    // A liquidation that cannot complete is a LIVENESS failure, not a user error, so the write
+    // barrier is hoisted by exactly ZERO statements here: `apply` is the next thing that runs.
+    //
+    // Structurally, not by convention: this close is `OrderKind::Market`, and `Market` has
+    // `rests_remainder() == false`, so `match_order` never builds a `rest_basis`, no caller of this
+    // function ever calls `rest_in_book`, and neither `RestOutcome` refusal is reachable from this
+    // path at all. The set of rejects between the match and the flush is empty, which is the same
+    // set it was before the hoist — the liquidation path's reject surface is unchanged.
+    let remaining = outcome.remaining;
+    outcome.apply(context, side, market, &mut None)?;
     // delete-on-terminal: the liquidation close is an IOC that never rests — it exists only to
     // drive the match + emit OrderPlaced/Trade. Its record is dropped (never a live/queryable
     // resting order; any residual is settled at mark price by the caller).

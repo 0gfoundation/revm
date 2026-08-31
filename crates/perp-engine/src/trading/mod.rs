@@ -1309,7 +1309,7 @@ fn execute_limit_order<H: PerpHost>(
         TimeInForce::PostOnly => {
             // No match runs → the do-not-cross BBO is still current at rest; thread it in.
             let bbo = ensure_post_only_does_not_cross(context, market_id, side, price)?;
-            match rest_in_book(
+            raise_rest_refusal(rest_in_book(
                 context,
                 account,
                 &order_id,
@@ -1321,21 +1321,19 @@ fn execute_limit_order<H: PerpHost>(
                 client_order_id,
                 market,
                 Some(bbo),
+                // PostOnly never matches, so there is nothing deferred to flush.
+                None,
                 pending_placed,
-            )? {
-                RestOutcome::Rested => Ok(()),
-                // PostOnly never matches, so nothing has been written: a genuine reject is both
-                // safe and the better answer — the caller learns its quote was refused instead of
-                // silently getting nothing. Both refusals qualify, for the same reason.
-                RestOutcome::RefusedTooGoodBest => Err(perp_err(TOO_GOOD_BEST_REJECT)),
-                RestOutcome::RefusedUnaffordable => Err(perp_err(INSUFFICIENT_MARGIN_REJECT)),
-            }
+            )?)
         }
         TimeInForce::Gtc => {
-            // GTC is the ONE kind that rests its remainder, so `match_order` derives
-            // `rest_remainder` from the kind and pre-validates the rest's margin atomically with
-            // the fills (`OrderKind::rests_remainder`).
-            let remaining = match_order(
+            // ── ATOMIC MATCH + REST ──────────────────────────────────────────────────────────
+            // GTC is the ONE kind that rests its remainder, so it is the one kind with a decision
+            // AFTER the match. `match_order` therefore writes nothing: the decided-but-unwritten
+            // `MatchOutcome` is handed to `rest_in_book`, which resolves the rest FIRST and flushes
+            // it only once the answer is "rested". Either both happen or neither does, and a
+            // refusal is a clean whole-order reject with zero writes — see [`MatchOutcome`].
+            let outcome = match_order(
                 context,
                 account,
                 &order_id,
@@ -1347,73 +1345,32 @@ fn execute_limit_order<H: PerpHost>(
                 market,
                 false,
                 taker_order,
-                pending_placed,
             )?;
-            if remaining > 0 {
-                let outcome = rest_in_book(
-                    context,
-                    account,
-                    &order_id,
-                    market_id,
-                    side,
-                    price,
-                    remaining,
-                    tif,
-                    client_order_id,
-                    market,
-                    // GTC: matching ran → read the (post-match) BBO inside rest_in_book.
-                    None,
-                    pending_placed,
-                )?;
-                // ── The refusal fork, ONE shape for BOTH refusals ────────────────────────────
-                // `rest_in_book` decides both write-clean, and past this line the only thing that
-                // differs between them is the attribution. Keeping one fork is deliberate: it is
-                // what stops the next refusal added to `RestOutcome` from re-opening the leak by
-                // being handled as "just raise it".
-                let refusal = match outcome {
-                    RestOutcome::Rested => None,
-                    RestOutcome::RefusedTooGoodBest => {
-                        Some((TOO_GOOD_BEST_REJECT, CancelReason::PriceBandExpiry))
-                    }
-                    // The val0 leak. `CancelReason::TakerMarginCover` and not a new variant: this
-                    // IS that reason's meaning — the taker's own order shed because the fills it
-                    // just took do not leave enough available balance — and `finalize_apply`'s
-                    // cover loop can already cancel this same taker's OTHER orders under it in
-                    // this same call. Splitting one client-visible cause across two codes would
-                    // make the remainder look like a different event from its own siblings.
-                    RestOutcome::RefusedUnaffordable => {
-                        Some((INSUFFICIENT_MARGIN_REJECT, CancelReason::TakerMarginCover))
-                    }
-                };
-                if let Some((reject, reason)) = refusal {
-                    if remaining == quantity {
-                        // Crossed nothing, so nothing is written — reject, same as PostOnly.
-                        return Err(perp_err(reject));
-                    }
-                    // FILLS ARE ALREADY APPLIED AND THERE IS NO PERP UNDO. Raising here would
-                    // revert the frame while the maker's consumed order stays deleted and the
-                    // positions/wallets it moved stay moved — a write-then-error that punishes an
-                    // innocent maker for the taker's price. Expire the remainder instead: the fills
-                    // stand, and this is the same "bounded fill + expired remainder" shape a market
-                    // order gets when it reaches the band.
-                    emit_pending_order_placed(context, pending_placed);
-                    cancel_unfilled_remainder(taker_order, remaining);
-                    context.log(Log {
-                        address: PERP_DEX_ADDRESS,
-                        data: IPerpDex::OrderCancelled {
-                            user: account,
-                            orderId: FixedBytes(order_id),
-                            marketId: market_id,
-                            reason: reason as u8,
-                        }
-                        .to_log_data(),
-                    });
-                }
+            if outcome.remaining == 0 {
+                // Fully filled: no rest phase, so the barrier is right here.
+                return outcome.apply(context, side, market, pending_placed);
             }
-            Ok(())
+            let remaining = outcome.remaining;
+            raise_rest_refusal(rest_in_book(
+                context,
+                account,
+                &order_id,
+                market_id,
+                side,
+                price,
+                remaining,
+                tif,
+                client_order_id,
+                market,
+                // GTC: matching ran, so the BBO is read inside `rest_in_book` — pre-flush for the
+                // band gate, and again post-flush for the cache write. See the notes there.
+                None,
+                Some(outcome),
+                pending_placed,
+            )?)
         }
         TimeInForce::Ioc => {
-            let remaining = match_order(
+            let outcome = match_order(
                 context,
                 account,
                 &order_id,
@@ -1425,14 +1382,14 @@ fn execute_limit_order<H: PerpHost>(
                 market,
                 false,
                 taker_order,
-                pending_placed,
             )?;
-            cancel_unfilled_remainder(taker_order, remaining);
-            Ok(())
+            // No rest phase → nothing can refuse after the match, so the barrier is immediate.
+            cancel_unfilled_remainder(taker_order, outcome.remaining);
+            outcome.apply(context, side, market, pending_placed)
         }
         TimeInForce::Fok => {
             check_fok_feasibility(context, market_id, side, price, quantity, market)?;
-            let remaining = match_order(
+            let outcome = match_order(
                 context,
                 account,
                 &order_id,
@@ -1444,10 +1401,29 @@ fn execute_limit_order<H: PerpHost>(
                 market,
                 false,
                 taker_order,
-                pending_placed,
             )?;
-            ensure_fok_filled(remaining)
+            // BEFORE the barrier, not after: `match_order` already rejects an unfillable FOK
+            // pre-write, so this is a belt-and-braces restatement — and a restatement of a REJECT
+            // belongs on the write-clean side of the barrier, not behind it.
+            ensure_fok_filled(outcome.remaining)?;
+            outcome.apply(context, side, market, pending_placed)
         }
+    }
+}
+
+/// Both `RestOutcome` refusals, raised as the clean whole-order reject they now are.
+///
+/// ONE shape for both, and for every caller. `rest_in_book` decides both write-clean and flushes
+/// nothing when it refuses, so there is no longer a caller for which "raise it" is unsafe — the
+/// split that used to live here (PostOnly rejects / a crossing GTC expires its remainder) existed
+/// only because the GTC path had already written by the time it asked. Keeping one funnel is
+/// deliberate: it is what stops the next refusal added to `RestOutcome` from being handled
+/// differently by one caller than another.
+fn raise_rest_refusal(outcome: RestOutcome) -> Result<(), PerpError> {
+    match outcome {
+        RestOutcome::Rested => Ok(()),
+        RestOutcome::RefusedTooGoodBest => Err(perp_err(TOO_GOOD_BEST_REJECT)),
+        RestOutcome::RefusedUnaffordable => Err(perp_err(INSUFFICIENT_MARGIN_REJECT)),
     }
 }
 
@@ -1471,7 +1447,7 @@ fn execute_market_order<H: PerpHost>(
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PerpError> {
-    let remaining = match_order(
+    let outcome = match_order(
         context,
         account,
         &order_id,
@@ -1483,10 +1459,11 @@ fn execute_market_order<H: PerpHost>(
         market,
         false,
         taker_order,
-        pending_placed,
     )?;
-    cancel_unfilled_remainder(taker_order, remaining);
-    Ok(())
+    // A market order has NO rest phase, so nothing can refuse after the match: the barrier is
+    // immediate and this path is byte-identical to the pre-hoist code.
+    cancel_unfilled_remainder(taker_order, outcome.remaining);
+    outcome.apply(context, side, market, pending_placed)
 }
 
 fn cancel_order_core<H: PerpHost>(
@@ -1526,7 +1503,8 @@ fn cancel_order_core<H: PerpHost>(
 
 // ── Matching engine ───────────────────────────────────────────────────────────
 
-/// Core matching loop.  Returns the unfilled quantity after matching.
+/// Core matching loop. Performs **zero storage writes** and returns the decided-but-unwritten
+/// [`MatchOutcome`]; the CALLER owns the write barrier ([`MatchOutcome::apply`]).
 pub(super) fn match_order<H: PerpHost>(
     context: &mut H,
     taker_addr: Address,
@@ -1550,11 +1528,7 @@ pub(super) fn match_order<H: PerpHost>(
     // performs the single final save after every genuine reject has passed, so a rejected
     // placement leaves no phantom order (and a signed order's signature is not burned).
     taker_order: &mut Order,
-    // The place path's buffered `OrderPlaced`, flushed at the APPLY below so it precedes this
-    // order's own Trade/PositionChanged/OrderCancelled events. `&mut None` for callers that emit
-    // their own OrderPlaced (the liquidation close).
-    pending_placed: &mut Option<PendingOrderPlaced>,
-) -> Result<u64, PerpError> {
+) -> Result<MatchOutcome, PerpError> {
     let mut remaining = quantity;
     let mut last_trade_price = None;
     let mut taker_settlement =
@@ -2086,36 +2060,114 @@ pub(super) fn match_order<H: PerpHost>(
     let taker_plan =
         taker_settlement.finalize_compute(context, &mut registry, side, market, rest_req)?;
 
-    // ── APPLY (no genuine rejects past this point) ──
-    // Flush the buffered OrderPlaced FIRST so it precedes this order's own Trade /
-    // PositionChanged events, which the flush below emits (log order preserved).
-    //
-    // UNCONDITIONAL, and provably so: `finalize_compute` validates the GTC rest even when the fill
-    // set is EMPTY, so every genuine reject of this placement — PostOnly-cross, FOK-unfillable, the
-    // taker K9 / wallet-cover / fills+rest margin rejects, and now the zero-fill rest-margin reject
-    // that used to surface only later in `rest_in_book` — has already fired above, pre-flush and
-    // write-clean. `rest_in_book` re-checks the same formula on the same post-flush state, so its
-    // reject can no longer be reached from here. What is left past this point is invariant /
-    // arithmetic guards, plus `finalize_apply`'s two residuals: the wallet-cover check (an
-    // unreachable invariant — the compute phase simulated the same cancel loop) and
-    // `credit_fee_recipient`'s "fee recipient not initialised", which needs an UNSET admin and is
-    // therefore unreachable on any live chain (a market cannot be added without a non-zero admin,
-    // and neither `initAdmin` nor `transferAdmin` can set one back to zero). Nothing a user can
-    // provoke rejects after this line, so "emitted ⟺ accepted" holds with no exception.
-    emit_pending_order_placed(context, pending_placed);
-    registry.flush(context, market)?;
-    if let Some(plan) = taker_plan {
-        // The taker's own `AccountBalanceChanged` is published INSIDE `finalize_apply`, immediately
-        // before the taker's `PositionChanged`, so the two form one `ACCOUNT_UPDATE` group. It used
-        // to be published here, after that row — which orphaned it under the adjacency rule — and
-        // it used to be skipped for a `liquidation_close`, which orphaned it outright. See
-        // `settlement::finalize_apply`.
-        settlement::finalize_apply(context, plan, side, market)?;
+    // ── THE MATCH IS DECIDED, AND NOTHING IS WRITTEN ──
+    // The registry, the taker plan and the last trade price are handed BACK, unflushed. The caller
+    // owns the write barrier ([`MatchOutcome::apply`]) — see the type's doc comment for why that
+    // is not a cosmetic refactor.
+    let rest_basis = match &taker_plan {
+        Some(plan) => Some(plan.rest_basis()),
+        // Zero fills. The taker may still have a working copy (a self-match maker the K9 guard
+        // cancelled); `None` means it never joined, so storage is already its post-flush state.
+        None => {
+            registry.taker_rest_basis(taker_addr, market.base_decimals, market.price_decimals)?
+        }
+    };
+    Ok(MatchOutcome {
+        remaining,
+        registry,
+        taker_plan,
+        last_trade_price,
+        rest_basis,
+    })
+}
+
+/// A DECIDED but UNWRITTEN match: everything the walk and the taker-settlement compute phase
+/// produced, with not one byte of it committed yet.
+///
+/// # Why `match_order` no longer flushes
+///
+/// It used to end with the APPLY block that is now [`Self::apply`]. For a market/IOC/FOK order or a
+/// liquidation close that is fine — there is nothing after the match, so the caller flushes
+/// immediately and the behaviour is identical. For a **crossing GTC** it was the val0 leak at block
+/// 1,098,719: `rest_in_book` runs after the match, it can REFUSE, and off-trie perp writes are
+/// commit-only (#23 — there is no `PerpUndo`) while `context.log` is EVM-journaled and truncates on
+/// revert. So a refusal after the flush produced a failed receipt with zero logs over silently
+/// mutated positions.
+///
+/// The previous fix expired the remainder so the call succeeded. This one removes the ordering that
+/// created the choice: the rest DECISION is write-free (it always was — `rest_in_book`'s two
+/// refusals sit above every write in their arms), so hoisting the barrier past it makes a refusal a
+/// clean whole-order reject, which is what Binance does (`-2019`) and what the order-lifecycle
+/// contract requires (an `OrderCancelled` with no `OrderRested` before it is not a state a
+/// projector can reconstruct).
+///
+/// # What that puts on the deferred side of the barrier
+///
+/// * `MatchRegistry::flush` — every maker's position/account/order-list write, the book levels, the
+///   price index, the best caches, the insurance-fund legs, and the whole deferred LOG stream.
+/// * `settlement::finalize_apply` — the taker's cover cancels, its margin+fee debit, the fee
+///   credit, its account snapshot and its `PositionChanged`.
+/// * `storage::save_last_traded_price` — and this one is the real prize. It is the single input the
+///   old pre-check and `rest_in_book` disagreed on: both resolve the Assuming-Price floor
+///   `T = max(⌈lastTraded × 1.0015⌉, mark)`, and this write ran BETWEEN them, so the pre-check was
+///   systematically optimistic for a crossing SELL. With the write deferred past the decision there
+///   is only one evaluation point left, so the divergence is not fixed, it is **structurally
+///   impossible**.
+///
+/// Dropping a `MatchOutcome` without calling [`Self::apply`] discards the whole match. That is
+/// exactly what a clean reject wants, and it is safe because the walk performs zero storage writes
+/// (see the "commit-only #23 L2b" note above) — there is nothing outside this value to undo.
+#[must_use]
+pub(super) struct MatchOutcome {
+    /// Unfilled quantity after matching.
+    pub(super) remaining: u64,
+    registry: settlement::MatchRegistry,
+    taker_plan: Option<settlement::TakerPlan>,
+    last_trade_price: Option<u64>,
+    /// The taker's post-match position + wallet, for a caller that still has to decide whether the
+    /// remainder may rest. `None` = the taker was never touched by this match, so storage already
+    /// holds its post-flush state.
+    rest_basis: Option<settlement::RestBasis>,
+}
+
+impl MatchOutcome {
+    /// ── THE WRITE BARRIER (no genuine rejects past this point) ──
+    ///
+    /// Flushes the buffered `OrderPlaced` FIRST so it precedes this order's own Trade /
+    /// PositionChanged events, which the registry flush emits — the log stream is byte-identical to
+    /// the pre-barrier code, because this is the same four steps in the same order, just called from
+    /// one level up.
+    ///
+    /// Reaching this line means every genuine reject of the placement has already fired, pre-write:
+    /// PostOnly-cross, FOK-unfillable, the taker K9 / wallet-cover / tier rejects in
+    /// `finalize_compute`, and — new — BOTH of `rest_in_book`'s refusals, which the GTC caller now
+    /// resolves before calling this. What is left past this point is invariant / arithmetic guards,
+    /// plus `finalize_apply`'s two residuals: the wallet-cover check (an unreachable invariant — the
+    /// compute phase simulated the same cancel loop) and `credit_fee_recipient`'s "fee recipient not
+    /// initialised", which needs an UNSET admin and is therefore unreachable on any live chain (a
+    /// market cannot be added without a non-zero admin, and neither `initAdmin` nor `transferAdmin`
+    /// can set one back to zero). Nothing a user can provoke rejects after this line, so
+    /// "emitted ⟺ accepted" holds with no exception.
+    fn apply<H: PerpHost>(
+        self,
+        context: &mut H,
+        side: Side,
+        market: &crate::types::Market,
+        pending_placed: &mut Option<PendingOrderPlaced>,
+    ) -> Result<(), PerpError> {
+        emit_pending_order_placed(context, pending_placed);
+        self.registry.flush(context, market)?;
+        if let Some(plan) = self.taker_plan {
+            // The taker's own `AccountBalanceChanged` is published INSIDE `finalize_apply`,
+            // immediately before the taker's `PositionChanged`, so the two form one
+            // `ACCOUNT_UPDATE` group. See `settlement::finalize_apply`.
+            settlement::finalize_apply(context, plan, side, market)?;
+        }
+        if let Some(price) = self.last_trade_price {
+            storage::save_last_traded_price(context, market.market_id, price)?;
+        }
+        Ok(())
     }
-    if let Some(price) = last_trade_price {
-        storage::save_last_traded_price(context, market_id, price)?;
-    }
-    Ok(remaining)
 }
 
 // ── Resting in book ───────────────────────────────────────────────────────────
@@ -2163,6 +2215,23 @@ fn debug_assert_totals(
     }
 }
 
+/// One of PHASE 2's four aggregate adds — the mechanical restatement of a sum PHASE 1 already
+/// checked, on the same two integers.
+///
+/// `perp_invariant_err` and not `perp_err`: this runs BEHIND the write barrier, so reaching it at
+/// all is the write-then-error shape commit-only #23 forbids. It is out of reach by construction —
+/// PHASE 1 performed the identical `checked_add` on the identical values (the `debug_assert_eq!`
+/// against the basis is what holds "identical" to account), so an overflow here means the basis
+/// diverged from the flushed state, which is a BUG and not a user's arithmetic.
+#[inline]
+fn add_decided_aggregate(current: u64, addend: u64, field: &str) -> Result<u64, PerpError> {
+    current.checked_add(addend).ok_or_else(|| {
+        perp_invariant_err(format!(
+            "rest apply: total {field} overflowed a sum the decision phase had already checked"
+        ))
+    })
+}
+
 /// Consuming a Deque-or-slice as an OrderEntry iterator for the reservation calls / oracle.
 #[inline]
 fn entries_iter(
@@ -2173,28 +2242,32 @@ fn entries_iter(
 
 /// Whether `rest_in_book` actually rested the order, or refused it as a too-good new best.
 ///
-/// Refusal is returned rather than raised because the right response DEPENDS ON THE CALLER: a
-/// PostOnly placement has written nothing, so it becomes a genuine reject; a crossing GTC has
-/// already applied its fills and there is no perp undo, so raising would revert the frame while
-/// leaving the maker's consumed order deleted — a write-then-error that harms an innocent maker.
-/// That path expires the remainder instead.
+/// Both refusals are decided in PHASE 1, above the write barrier, so both are clean whole-order
+/// rejects for every caller ([`raise_rest_refusal`]). Returning them rather than raising them in
+/// place is still the right shape: it keeps the two refusal points inside the arms from having to
+/// know whether a barrier is pending, and it keeps the funnel single.
+///
+/// ⚠️ A new variant must be decided in PHASE 1 too. Returning one from PHASE 2 would put a reject
+/// behind the barrier and re-open the val0 leak.
 #[must_use]
 enum RestOutcome {
     Rested,
     RefusedTooGoodBest,
     /// The rest's marginal `ooIM` does not fit in the available balance.
     ///
-    /// This used to be raised in place (two `return Err`s, one per side arm), which was the val0
-    /// leak: for a crossing GTC `rest_in_book` runs AFTER `match_order`'s APPLY block, so raising
-    /// committed the fills and reverted the frame. Returned instead, for exactly the reason the
-    /// enum's own doc comment gives — the right response depends on whether the caller has already
-    /// applied fills.
+    /// This used to be raised in place (two `return Err`s, one per side arm) while a crossing GTC's
+    /// fills were already flushed, which was the val0 leak at block 1,098,719. It was then made a
+    /// remainder EXPIRY, which stopped the leak but broke the order-lifecycle contract (an
+    /// `OrderCancelled` with no `OrderRested` before it) and diverged from Binance, which rejects
+    /// the whole order (`-2019`). Now the barrier sits below the decision, so it is simply a reject.
     RefusedUnaffordable,
 }
 
 const TOO_GOOD_BEST_REJECT: &str = "placeOrder: a new best quote must be inside the price band";
-/// The rest-margin refusal, as the caller raises it on the write-clean (zero-fill) paths.
-const INSUFFICIENT_MARGIN_REJECT: &str = "placeOrder: insufficient perp wallet for margin";
+/// The rest-margin refusal. Also the reject the pre-walk early-out raises, deliberately: it is the
+/// same cause, so a client cannot tell "refused before the walk" from "refused after it".
+pub(super) const INSUFFICIENT_MARGIN_REJECT: &str =
+    "placeOrder: insufficient perp wallet for margin";
 
 fn rest_in_book<H: PerpHost>(
     context: &mut H,
@@ -2208,27 +2281,51 @@ fn rest_in_book<H: PerpHost>(
     client_order_id: [u8; 16],
     market: &crate::types::Market,
     // 2b resolve-once: (best_bid, best_ask). `Some` = the caller already read the BBO (PostOnly
-    // threads its do-not-cross read — no match ran, so it is still current). `None` = read it here
-    // once. rest runs AFTER matching (GTC), and matching only moves the OPPOSITE side from the one
-    // we rest on, so a rest-time read yields both bests current — no staleness.
+    // threads its do-not-cross read — no match ran, so it is still current). `None` = read it here.
     bbo: Option<(u64, u64)>,
-    // The place path's buffered `OrderPlaced`, flushed at the top of the APPLY block below (so it
-    // lands before this order's `OrderRested`, and only once the margin rejects have passed).
-    // Already-`None` on the GTC path when the match flush emitted it.
+    // ── THE DEFERRED MATCH, if any ──
+    // `Some` = a crossing GTC whose match is DECIDED BUT UNWRITTEN. PHASE 1 below reads its
+    // [`settlement::RestBasis`] instead of the store, decides, and only then does PHASE 1's tail
+    // flush it. Dropping it (a refusal) discards the whole match, which is exactly what a clean
+    // reject wants — see [`MatchOutcome`]. `None` = PostOnly, where no match ran.
+    mut deferred: Option<MatchOutcome>,
+    // The place path's buffered `OrderPlaced`. On the deferred path `MatchOutcome::apply` flushes it
+    // at the barrier (so it precedes the match's own Trade/PositionChanged rows, unchanged); on the
+    // PostOnly path the tail below flushes it, before this order's `OrderRested`. Either way it is
+    // emitted only once every refusal has passed.
     pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<RestOutcome, PerpError> {
-    let mut pos = storage::load_position(context, user, market_id)?;
-    // Resting escrows nothing, so the account is READ-ONLY here: the fee rate (folded into the
-    // account blob) for the book entry, and the cross wallet for the derived admission gate. An
-    // `_ref` read — no owned clone, and no `save_account` at the end, so nothing marks this user for
-    // an `AccountBalanceChanged` snapshot (see `storage::mark_account_snapshot_dirty`: a pure
-    // placement publishes nothing, by measurement).
-    let (maker_fee_bps, wallet) = {
-        let account = storage::load_account_ref(context, user)?;
-        (account.maker_fee_bps, account.perp_wallet_balance)
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // PHASE 1 — DECIDE. Zero storage writes, here or inside `deferred`.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
+    // The position + wallet the rest is admitted against. On the deferred path these are the values
+    // the barrier is ABOUT to write (post-fill, post-cover, post-debit) rather than the values the
+    // store still holds — that is the whole point of `RestBasis`, and it is why this decision needs
+    // no second opinion from the settlement side. `None` = the taker was never touched by the match
+    // (or there was no match), so the store already IS the post-flush state.
+    let basis = deferred.as_mut().and_then(|d| d.rest_basis.take());
+    // Resting escrows nothing, so the account is READ-ONLY on this path: the fee rate for the book
+    // entry, and (in the no-basis case) the cross wallet for the derived admission gate. An `_ref`
+    // read — no owned clone, and no `save_account` at the end, so nothing marks this user for an
+    // `AccountBalanceChanged` snapshot (see `storage::mark_account_snapshot_dirty`: a pure placement
+    // publishes nothing, by measurement).
+    //
+    // The FEE RATE is read from the store on BOTH paths, deliberately: it is not a settlement
+    // output. Only `setUserFeeRates` moves it, the flush cannot, so the pre-barrier read is the same
+    // integer the post-barrier one would give.
+    let maker_fee_bps = storage::load_account_ref(context, user)?.maker_fee_bps;
+    let (pos_basis, wallet, cover_cancelled) = match basis {
+        Some(b) => (b.pos, b.wallet, b.cover_cancelled),
+        None => (
+            storage::load_position(context, user, market_id)?,
+            storage::load_account_ref(context, user)?.perp_wallet_balance,
+            false,
+        ),
     };
-    // ONE BBO resolve for both the best-update check and the mid-price sample (was up to two
-    // separate load_best_bid/load_best_ask reads per arm).
+    // ONE BBO resolve for the band gate. On the deferred path this is the PRE-barrier BBO; see
+    // `may_become_best` for why that is sound, and PHASE 2 for the post-barrier re-read the two
+    // cache writes use.
     let (best_bid, best_ask) = match bbo {
         Some(b) => b,
         None => {
@@ -2253,14 +2350,29 @@ fn rest_in_book<H: PerpHost>(
     // reachable without ever touching the PostOnly path — and a best_bid that high rejects nearly
     // every PostOnly sell. Gating PostOnly alone would leave that half open.
     //
-    // Only the TEST is hoisted here; the two cache writes it guards stay inside APPLY, because a
-    // genuine reject must not be preceded by a write (commit-only has no undo). The flag is reused
-    // there so the condition cannot drift out of step with this one.
-    let becomes_best = match side {
-        Side::Buy => best_bid == 0 || price > best_bid,
-        Side::Sell => best_ask == 0 || price < best_ask,
-    };
-    if becomes_best {
+    // ── Why the gate tests `may_become_best` and PHASE 2 recomputes `becomes_best` ──────────────
+    //
+    // The gate is a DECISION and must therefore be taken pre-barrier, off the BBO the store holds
+    // now. The two cache writes it guards are WRITES and must therefore be taken post-barrier, off
+    // the BBO the flush leaves. Those two BBOs can differ, so the flag cannot be shared any more —
+    // what is shared instead is an implication: `becomes_best(post) ⟹ may_become_best(pre)`, so the
+    // band is never skipped for an order that really does become the best.
+    //
+    // The pre-BBO is exact on our OWN side except for one narrow case:
+    // * the match consumes the OPPOSITE side only, so it cannot move our side's best at all;
+    // * `finalize_apply`'s cover loop cancels the taker's OWN same-side orders, which CAN lower a
+    //   bid / raise an ask and hand the best to this very order.
+    //
+    // Hence the `cover_cancelled` disjunct: when the cover loop will really cancel, treat the order
+    // as possibly-best and band-check it. That over-checks (never under-checks) in a corner that is
+    // already all but unreachable — a crossing order's remainder sits at or past the touch it just
+    // crossed, so it is the new best on its own side anyway.
+    let may_become_best = cover_cancelled
+        || match side {
+            Side::Buy => best_bid == 0 || price > best_bid,
+            Side::Sell => best_ask == 0 || price < best_ask,
+        };
+    if may_become_best {
         // ONE-SIDED, matching the sweep's scoping and the measured exchange behaviour. The harms are
         // asymmetric: a new best that is too GOOD to be true — an ask below `mark_lower`, a bid above
         // `mark_upper` — both mis-rejects the opposite side's PostOnly orders (the cross check rejects
@@ -2277,155 +2389,250 @@ fn rest_in_book<H: PerpHost>(
             Side::Buy => p > mark_upper,
         };
         if too_good {
-            // Write-clean: nothing above this point mutates. The caller turns this into a reject or
-            // an expiry depending on whether it has already applied fills.
+            // Write-clean: nothing above this point mutates, and `deferred` is dropped unflushed on
+            // the way out. A clean whole-order reject.
             return Ok(RestOutcome::RefusedTooGoodBest);
         }
     }
 
+    // ── THE FREEZE ── The one place a SHORT order's `T` is resolved, ever, and it happens HERE:
+    // pre-barrier, i.e. before `save_last_traded_price`. A SHORT order's Assuming Price is
+    // `max(T, limit)` with `T = max(ROUND_UP(lastTraded × 1.0015), mark)`, and it is stored on the
+    // entry: from here on the order's margin term is `calc_value(assuming_price, amount)` and no
+    // later read re-derives it (R12 — 90 frames, the reported value never moved; `H_live` refused by
+    // 1939 quanta).
+    //
+    // ⚠️ THIS IS THE VAL0 BUG'S ROOT, AND ITS FIX. There used to be a second resolution of `T` (the
+    // pre-check in `finalize_compute`) with `save_last_traded_price` running BETWEEN the two. A
+    // crossing SELL always drags `last_traded` to at least its own limit price, so the second read
+    // was always ≥ the first and the pre-check was systematically optimistic — it vouched for a rest
+    // the real check then refused, after the fills had committed. With the write deferred past this
+    // point there is exactly ONE evaluation, so the divergence is not merely fixed, it has nowhere
+    // left to live. Do not add a second call site.
+    //
+    // Binance additionally ESCROWS the uplift (measured, R10) and releases it at fill, which is what
+    // funds a flipping fill's new leg. We hold no escrow bucket at all, so for us the uplift
+    // manifests purely as a stricter admission — which still leaves more wallet present at fill
+    // time. It is NOT cosmetic: without it the `ooIM = 0` band (`Ask ≈ 2|N|`, a sell that would flip
+    // the position) is free AND fillable here, while on Binance the two are mutually exclusive (a
+    // sell must sit near the touch to fill, and near the touch the markup bites). See
+    // `binance-flip-and-admission.md` §1.6c/§3.4.
+    //
+    // ⚠️ `assuming_price` is a MARGIN BASIS ONLY. The insert position, the book level, the fill price
+    // and the fee all key on `price`.
+    let assuming_price = match side {
+        // A LONG order's Assuming Price IS its own limit price — MEASURED, no markup on the buy side
+        // (R11's `bidNotional == q_B × P_b` digit-for-digit). Setting the field rather than leaving
+        // it side-conditional is what lets ONE rule (`Σ calc_value(assuming_price, amount)`) serve
+        // both aggregates.
+        Side::Buy => price,
+        Side::Sell => price.max(crate::margin_view::assuming_price_floor(
+            context, market_id, market,
+        )?),
+    };
+    let new_entry = OrderEntry {
+        order_id: *order_id,
+        price,
+        amount: qty,
+        maker_fee_bps,
+        assuming_price,
+    };
+    // `Bid`/`Ask` grow by this order's notional at its FROZEN Assuming Price — the same
+    // per-order-floored `calc_value` term the raw-list fold would contribute, so the aggregates stay
+    // exactly Binance's `bidNotional`/`askNotional`.
+    let entry_notional = new_entry.margin_notional(base_decimals, price_decimals)?;
+
+    // ── Derived-ooIM admission gate (POST-STATE form, lazy delta) ──
+    //
+    // commit-only #23 CLONE-FREE probe: the hypothetical "own-side list ⊕ new_entry" is never
+    // materialised — the derived requirement reads only the per-side AGGREGATES, so the whole probe
+    // is two `checked_add`s. Nothing is debited either: resting an order moves no money, it only
+    // raises the requirement. The OTHER side still matters, through the `max()` inside `ooIM`.
+    //
+    // ONE arm for both sides. The buy and sell paths used to be ~165 lines of verbatim duplication
+    // apiece — same probe, same gate, same four-case table, same ⚠️ notes — differing only in WHICH
+    // aggregate pair moves and in the Assuming Price resolved above. An asymmetry between them would
+    // have been silent (most tests drive one side), so the duplication is gone rather than mirrored.
+    //
+    // # Mapping this onto the doc's predicate — one algebraic step, and the step is MEASURED
+    //
+    // The measured admission predicate is the DELTA form,
+    // 「接受 ⟺ 该单带来的 IM 增量 ≤ availableBalance」, i.e. `Δ ooIM ≤ available(before)`. What is
+    // evaluated below is `available(after) ≥ 0`. R13 measured the identity that connects them —
+    // `availableBalance + totalOpenOrderInitialMargin == totalCrossWalletBalance`, 73/73
+    // observations, residual `0E-8`, while BOTH terms moved (`misc/binance-flip-and-admission.md`
+    // §3.14) — so `available = wallet − Σ_m ooIM_m` and
+    //
+    //     available(after) = wallet − (Σ_{m ≠ this} ooIM_m + ooIM_this(after))
+    //                      = available(before) − Δ ooIM
+    //     ⇒   Δ ooIM ≤ available(before)   ⟺   available(after) ≥ 0
+    //
+    // That identity is exact here, not approximate: `ooIM_m` is a pure function of market `m`'s own
+    // `(N_m, Bid_m, Ask_m, L_m)` (`margin_view::position_derived_margin` → `math::open_order_margin`,
+    // which takes nothing else), so every `m ≠ this` term is literally the same integer in both sums
+    // within one call — there is NO cross-market coupling to make the cancellation lossy. Both sides
+    // also price THIS market at the same mark: the threaded `market` and the one the Σ walk re-reads
+    // are the same blob, since the place path never writes `Market`.
+    //
+    // # The case table this is equivalent over
+    //
+    //   Δ ooIM │ available(after) │ delta form (was)              │ this form
+    //   ───────┼──────────────────┼───────────────────────────────┼────────────────────────
+    //     ≤ 0  │      ≥ 0         │ accept (`Δ ≤ 0` escape)       │ accept (1st branch)
+    //     ≤ 0  │      < 0         │ accept (`Δ ≤ 0` escape)       │ accept (escape kept)
+    //     > 0  │      ≥ 0         │ accept (`avail(before) ≥ Δ`)  │ accept (1st branch)
+    //     > 0  │      < 0         │ REJECT                        │ REJECT
+    //
+    // # ⚠️ The `Δ ≤ 0` escape is the B1 INVARIANT — do not delete it
+    //
+    // Rows 1 and 3 are the whole reason the delta is LAZY: they are the overwhelming majority and
+    // they need only `available(after)`. Row 2 is the ONLY row that needs the delta, and only its
+    // SIGN. It is **reachable and it matters**: a user rests affordable orders, the mark then moves
+    // against them so `Σ ooIM > wallet` and `available < 0` with no action of theirs (R8: an
+    // identically-priced probe accepted, then refused 4 seconds later after the mark fell
+    // `4.42 USD`), and they now want to rest a RISK-REDUCING order. Its `Δ ooIM ≤ 0`, but
+    // `available(after)` is still negative. Dropping the escape would refuse precisely the order
+    // that de-risks them and send them to liquidation instead. This is `derived_can_afford`'s "a
+    // non-positive requirement is always affordable", restated at the one site that still has to ask.
+    //
+    // (At THIS site `Δ ooIM` is in fact never negative — `max(|N + Bid|, |N − Ask|)` is
+    // non-decreasing in each of `Bid`/`Ask` at fixed `N`, `PIM` does not move, and
+    // `round_up_div`/`saturating_sub` preserve that — so the escape only ever fires at `Δ == 0`. The
+    // guard is still written as `Δ > 0` so it stays the faithful restatement of `derived_can_afford`,
+    // which other sites reach with a genuinely negative delta.)
+    //
+    // Cost: in the accepting case this market's `ooIM` is evaluated ONCE (inside the walk, via the
+    // override) instead of three times.
+    //
+    // # Why the LEAN fold — `Σ ooIM` alone, not the ten-scalar roll-up
+    //
+    // The gate needs one number, `available(after)`, and that is all this walk produces. A previous
+    // pass widened it to `margin_view::index_account_scalars` so the placement could publish an
+    // `AccountBalanceChanged` off the same walk; that event is gone (a pure placement is deliberately
+    // silent — R14 measurement + the official trigger sentence, see
+    // `storage::mark_account_snapshot_dirty`), so the widening has no consumer again and the five
+    // accumulators it folded would be discarded arithmetic on the hottest path.
+    let mut pos_after = pos_basis.clone();
+    {
+        let (qty_field, notional_field, label) = match side {
+            Side::Buy => (
+                &mut pos_after.total_buy_qty,
+                &mut pos_after.total_buy_notional,
+                "buy",
+            ),
+            Side::Sell => (
+                &mut pos_after.total_sell_qty,
+                &mut pos_after.total_sell_notional,
+                "sell",
+            ),
+        };
+        *qty_field = qty_field
+            .checked_add(qty)
+            .ok_or_else(|| perp_err(format!("placeOrder: total {label} qty overflow")))?;
+        *notional_field = notional_field
+            .checked_add(entry_notional)
+            .ok_or_else(|| perp_err(format!("placeOrder: total {label} notional overflow")))?;
+    }
+    // `pos_after` overrides storage for this market: it is not written until PHASE 2.
+    let available_after = crate::margin_view::derived_available_balance_with(
+        context,
+        user,
+        Some(wallet),
+        Some((market_id, &pos_after)),
+    )?;
+    if available_after < 0 {
+        let delta = crate::margin_view::derived_requirement_delta(market, &pos_basis, &pos_after)?;
+        if delta > 0 {
+            // Write-clean (validate-then-apply: the probe above materialised nothing, and
+            // `deferred` is dropped unflushed). A clean whole-order reject.
+            return Ok(RestOutcome::RefusedUnaffordable);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // ── THE WRITE BARRIER ── every refusal has passed; from here the placement is ACCEPTED.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    let flushed = deferred.is_some();
+    if let Some(d) = deferred {
+        d.apply(context, side, market, pending_placed)?;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // PHASE 2 — APPLY. Mechanical: it writes what PHASE 1 decided and decides nothing itself.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    // Post-barrier BBO for the two CACHE writes only. Re-resolved when something was flushed,
+    // because the match consumed the opposite side and a cover cancel may have moved our own.
+    let (best_bid, best_ask) = if flushed {
+        let hot = storage::load_market_hot(context, market_id)?;
+        (hot.best_bid, hot.best_ask)
+    } else {
+        (best_bid, best_ask)
+    };
+    let becomes_best = match side {
+        Side::Buy => best_bid == 0 || price > best_bid,
+        Side::Sell => best_ask == 0 || price < best_ask,
+    };
+    debug_assert!(
+        !becomes_best || may_become_best,
+        "an order that BECAME the best was not band-checked — `may_become_best` must be a \
+         superset of the post-barrier `becomes_best` (see the note on the band gate)"
+    );
+
+    // The store is now the state PHASE 1 measured, so the aggregates are re-derived from it rather
+    // than carried over from `pos_after`: the add is the same two `checked_add`s on the same two
+    // integers, and doing it here means PHASE 2 can never clobber a field the flush wrote.
+    let mut pos = storage::load_position(context, user, market_id)?;
+    debug_assert_eq!(
+        (
+            pos.total_buy_qty,
+            pos.total_buy_notional,
+            pos.total_sell_qty,
+            pos.total_sell_notional
+        ),
+        (
+            pos_basis.total_buy_qty,
+            pos_basis.total_buy_notional,
+            pos_basis.total_sell_qty,
+            pos_basis.total_sell_notional
+        ),
+        "the rest basis diverged from what the flush actually wrote — the PHASE 1 decision was \
+         taken on the wrong state (`settlement::RestBasis`)"
+    );
+    #[cfg(debug_assertions)]
+    {
+        // The aggregates ARE `Bid`/`Ask` and feed the admission gate directly, so keep the raw-list
+        // fold as a live oracle on them. Both lists are read POST-barrier, against the POST-barrier
+        // position, so a flush that moved one without the other fails here. (Debug-only: the two
+        // list loads exist for this check alone.)
+        let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
+        let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
+        debug_assert_totals(
+            entries_iter(&buy_entries),
+            entries_iter(&sell_entries),
+            &pos,
+            base_decimals,
+            price_decimals,
+        );
+    }
     match side {
         Side::Buy => {
-            // commit-only #23 CLONE-FREE probe: the hypothetical "buy-list ⊕ new_entry" is never
-            // materialised — the derived requirement reads only the per-side AGGREGATES, so the
-            // whole probe is two `checked_add`s. A reject below therefore leaves the overlay
-            // untouched (validate-then-apply: check first, insert after).
-            let buy_ref = storage::load_buy_orders_ref(context, user, market_id)?;
-            let new_entry = OrderEntry {
-                order_id: *order_id,
-                price,
-                amount: qty,
-                maker_fee_bps,
-                // A LONG order's Assuming Price IS its own limit price — MEASURED, no markup on the
-                // buy side (R11's `bidNotional == q_B × P_b` digit-for-digit). Setting the field
-                // rather than leaving it side-conditional is what lets ONE rule
-                // (`Σ calc_value(assuming_price, amount)`) serve both aggregates.
-                assuming_price: price,
-            };
-            let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
-            #[cfg(debug_assertions)]
-            {
-                // The aggregates ARE `Bid`/`Ask` and now feed the admission gate directly, so keep
-                // the raw-list fold as a live oracle on them (debug-only: the two list loads exist
-                // for this check alone).
-                let sell_entries = storage::load_sell_orders_ref(context, user, market_id)?;
-                debug_assert_totals(
-                    entries_iter(&buy_ref),
-                    entries_iter(&sell_entries),
-                    &pos,
-                    base_decimals,
-                    price_decimals,
-                );
-            }
-            // `Bid` grows by this order's notional at its FROZEN Assuming Price (== its limit price
-            // on this side) — the same per-order-floored `calc_value` term the fold would
-            // contribute, so the aggregate stays exactly Binance's `bidNotional`.
-            let entry_notional = new_entry.margin_notional(base_decimals, price_decimals)?;
-            let new_total_buy_qty = pos
-                .total_buy_qty
-                .checked_add(qty)
-                .ok_or_else(|| perp_err("placeOrder: total buy qty overflow"))?;
-            let new_total_buy_notional = pos
-                .total_buy_notional
-                .checked_add(entry_notional)
-                .ok_or_else(|| perp_err("placeOrder: total buy notional overflow"))?;
+            pos.total_buy_qty = add_decided_aggregate(pos.total_buy_qty, qty, "buy qty")?;
+            pos.total_buy_notional =
+                add_decided_aggregate(pos.total_buy_notional, entry_notional, "buy notional")?;
+        }
+        Side::Sell => {
+            pos.total_sell_qty = add_decided_aggregate(pos.total_sell_qty, qty, "sell qty")?;
+            pos.total_sell_notional =
+                add_decided_aggregate(pos.total_sell_notional, entry_notional, "sell notional")?;
+        }
+    }
 
-            // ── Derived-ooIM admission gate (POST-STATE form, lazy delta) ──
-            // Nothing is debited: resting an order moves no money, it only raises the requirement.
-            // Both aggregates ride on the position itself, so the hypothetical is two
-            // `checked_add`s above — no order list is materialised. `Ask` still matters even on
-            // this arm: it enters `IM` through the `max()`.
-            //
-            // # Mapping this onto the doc's predicate — one algebraic step, and the step is MEASURED
-            //
-            // The measured admission predicate is the DELTA form,
-            // 「接受 ⟺ 该单带来的 IM 增量 ≤ availableBalance」, i.e. `Δ ooIM ≤ available(before)`.
-            // What is evaluated below is `available(after) ≥ 0`. R13 measured the identity that
-            // connects them — `availableBalance + totalOpenOrderInitialMargin ==
-            // totalCrossWalletBalance`, 73/73 observations, residual `0E-8`, while BOTH terms moved
-            // (`misc/binance-flip-and-admission.md` §3.14) — so `available = wallet − Σ_m ooIM_m` and
-            //
-            //     available(after) = wallet − (Σ_{m ≠ this} ooIM_m + ooIM_this(after))
-            //                      = available(before) − Δ ooIM
-            //     ⇒   Δ ooIM ≤ available(before)   ⟺   available(after) ≥ 0
-            //
-            // That identity is exact here, not approximate: `ooIM_m` is a pure function of market
-            // `m`'s own `(N_m, Bid_m, Ask_m, L_m)` (`margin_view::position_derived_margin` →
-            // `math::open_order_margin`, which takes nothing else), so every `m ≠ this` term is
-            // literally the same integer in both sums within one call — there is NO cross-market
-            // coupling to make the cancellation lossy. Both sides also price THIS market at the same
-            // mark: the threaded `market` and the one the Σ walk re-reads are the same blob, since
-            // the place path never writes `Market`.
-            //
-            // # The case table this is equivalent over
-            //
-            //   Δ ooIM │ available(after) │ delta form (was)              │ this form
-            //   ───────┼──────────────────┼───────────────────────────────┼────────────────────────
-            //     ≤ 0  │      ≥ 0         │ accept (`Δ ≤ 0` escape)       │ accept (1st branch)
-            //     ≤ 0  │      < 0         │ accept (`Δ ≤ 0` escape)       │ accept (escape kept)
-            //     > 0  │      ≥ 0         │ accept (`avail(before) ≥ Δ`)  │ accept (1st branch)
-            //     > 0  │      < 0         │ REJECT                        │ REJECT
-            //
-            // # ⚠️ The `Δ ≤ 0` escape is the B1 INVARIANT — do not delete it
-            //
-            // Rows 1 and 3 are the whole reason the delta is LAZY: they are the overwhelming
-            // majority and they need only `available(after)`. Row 2 is the ONLY row that needs the
-            // delta, and only its SIGN. It is **reachable and it matters**: a user rests affordable
-            // orders, the mark then moves against them so `Σ ooIM > wallet` and `available < 0` with
-            // no action of theirs (R8: an identically-priced probe accepted, then refused 4 seconds
-            // later after the mark fell `4.42 USD`), and they now want to rest a RISK-REDUCING
-            // order. Its `Δ ooIM ≤ 0`, but `available(after)` is still negative. Dropping the escape
-            // would refuse precisely the order that de-risks them and send them to liquidation
-            // instead. This is `derived_can_afford`'s "a non-positive requirement is always
-            // affordable", restated at the one site that still has to ask.
-            //
-            // (At THIS site `Δ ooIM` is in fact never negative — `max(|N + Bid|, |N − Ask|)` is
-            // non-decreasing in each of `Bid`/`Ask` at fixed `N`, `PIM` does not move, and
-            // `round_up_div`/`saturating_sub` preserve that — so the escape only ever fires at
-            // `Δ == 0`. The guard is still written as `Δ > 0` so it stays the faithful restatement
-            // of `derived_can_afford`, which other sites reach with a genuinely negative delta.)
-            //
-            // Cost: in the accepting case this market's `ooIM` is evaluated ONCE (inside the walk,
-            // via the override) instead of three times — the delta evaluated it at `before` and at
-            // `after`, and the walk evaluated `before` a second time.
-            //
-            // # Why the LEAN fold — `Σ ooIM` alone, not the ten-scalar roll-up
-            //
-            // The gate needs one number, `available(after)`, and that is all this walk produces. A
-            // previous pass widened it to `margin_view::index_account_scalars` so the placement could
-            // publish an `AccountBalanceChanged` off the same walk; that event is gone (a pure
-            // placement is deliberately silent — R14 measurement + the official trigger sentence, see
-            // `storage::mark_account_snapshot_dirty`), so the widening has no consumer again and the
-            // five accumulators it folded would be discarded arithmetic on the hottest path. Reverted
-            // to the lean form, which also puts the extra narrowing guards back out of the placement
-            // path: `Σ uPnL` / `Σ isolatedWallet` / `Σ MM` no longer have to fit their ABI widths for
-            // an order to be accepted.
-            let mut pos_after = pos.clone();
-            pos_after.total_buy_qty = new_total_buy_qty;
-            pos_after.total_buy_notional = new_total_buy_notional;
-            // `pos_after` overrides storage for this market: it is not written until below.
-            let available_after = crate::margin_view::derived_available_balance_with(
-                context,
-                user,
-                Some(wallet),
-                Some((market_id, &pos_after)),
-            )?;
-            if available_after < 0 {
-                let delta =
-                    crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
-                if delta > 0 {
-                    // Write-clean (validate-then-apply: the probe above materialised nothing), so
-                    // the caller decides — reject if it has written nothing, expire the remainder
-                    // if it has already applied fills. See [`RestOutcome::RefusedUnaffordable`].
-                    return Ok(RestOutcome::RefusedUnaffordable);
-                }
-            }
-            // Commit the maintained buy aggregates (op accepted).
-            pos = pos_after;
-
-            // ── APPLY (all rejects passed) ── NOW do the real insert: in-place on a warm list
-            // (zero clone), or one materialize-clone on a cold first-touch (unavoidable — it IS
-            // the write of a previously-committed list). partition_point re-derives the same idx.
-            drop(buy_ref);
+    // The real insert: in-place on a warm list (zero clone), or one materialize-clone on a cold
+    // first-touch (unavoidable — it IS the write of a previously-committed list). `partition_point`
+    // re-derives the same index the probe would have.
+    match side {
+        Side::Buy => {
             storage::mutate_buy_orders(context, user, market_id, |list| {
                 let i = list.partition_point(|e| e.price > price);
                 list.insert(i, new_entry);
@@ -2437,90 +2644,11 @@ fn rest_in_book<H: PerpHost>(
             // Keep best_bid cache up to date.
             if becomes_best {
                 storage::save_best_bid(context, market_id, price)?;
-                // best_ask from the single resolve above (post-match for GTC).
+                // best_ask from the POST-barrier resolve above — the match consumed that side.
                 record_mid_price_sample_for_best_quote_change(context, market_id, price, best_ask)?;
             }
         }
         Side::Sell => {
-            // commit-only #23 CLONE-FREE probe (mirror of the buy arm).
-            let sell_ref = storage::load_sell_orders_ref(context, user, market_id)?;
-            // ── THE FREEZE ── The one place `T` is resolved for this order, ever. A SHORT order's
-            // Assuming Price is `max(T, limit)` with `T = max(ROUND_UP(lastTraded × 1.0015), mark)`,
-            // and it is stored on the entry: from here on the order's margin term is
-            // `calc_value(assuming_price, amount)` and no later read re-derives it (R12 — 90 frames,
-            // the reported value never moved; `H_live` refused by 1939 quanta).
-            //
-            // Binance additionally ESCROWS the uplift (measured, R10) and releases it at fill, which
-            // is what funds a flipping fill's new leg. We hold no escrow bucket at all, so for us the
-            // uplift manifests purely as a stricter admission — which still leaves more wallet
-            // present at fill time. It is NOT cosmetic: without it the `ooIM = 0` band (`Ask ≈ 2|N|`,
-            // a sell that would flip the position) is free AND fillable here, while on Binance the
-            // two are mutually exclusive (a sell must sit near the touch to fill, and near the touch
-            // the markup bites). See `binance-flip-and-admission.md` §1.6c/§3.4.
-            //
-            // ⚠️ `assuming_price` is a MARGIN BASIS ONLY. The insert position, the book level, the
-            // fill price and the fee below all key on `price`.
-            let assuming_floor =
-                crate::margin_view::assuming_price_floor(context, market_id, market)?;
-            let new_entry = OrderEntry {
-                order_id: *order_id,
-                price,
-                amount: qty,
-                maker_fee_bps,
-                assuming_price: price.max(assuming_floor),
-            };
-            let (base_decimals, price_decimals) = (market.base_decimals, market.price_decimals);
-            #[cfg(debug_assertions)]
-            {
-                let buy_entries = storage::load_buy_orders_ref(context, user, market_id)?;
-                debug_assert_totals(
-                    entries_iter(&buy_entries),
-                    entries_iter(&sell_ref),
-                    &pos,
-                    base_decimals,
-                    price_decimals,
-                );
-            }
-            // `Ask` grows by the ONE frozen term (rather than refolding): exact, because the
-            // aggregate is a sum of per-order-floored `calc_value`s.
-            let entry_notional = new_entry.margin_notional(base_decimals, price_decimals)?;
-            let new_total_sell_qty = pos
-                .total_sell_qty
-                .checked_add(qty)
-                .ok_or_else(|| perp_err("placeOrder: total sell qty overflow"))?;
-            let new_total_sell_notional = pos
-                .total_sell_notional
-                .checked_add(entry_notional)
-                .ok_or_else(|| perp_err("placeOrder: total sell notional overflow"))?;
-
-            // ── Derived-ooIM admission gate (POST-STATE form, lazy delta) ──
-            // Mirror of the buy arm: the derivation from the doc's delta predicate, the four-case
-            // table, ⚠️ why the `Δ > 0` guard (the B1 escape) must survive, and why this folds the
-            // LEAN `Σ ooIM` rather than the ten-scalar roll-up are all documented there — read it
-            // before touching this.
-            let mut pos_after = pos.clone();
-            pos_after.total_sell_qty = new_total_sell_qty;
-            pos_after.total_sell_notional = new_total_sell_notional;
-            let available_after = crate::margin_view::derived_available_balance_with(
-                context,
-                user,
-                Some(wallet),
-                Some((market_id, &pos_after)),
-            )?;
-            if available_after < 0 {
-                let delta =
-                    crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
-                if delta > 0 {
-                    // Mirror of the buy arm: refusal is RETURNED, not raised. This is the arm the
-                    // val0 leak actually came out of (the Assuming-Price floor applies to SELLs
-                    // only, so the pre-check/real-check divergence is one-sided).
-                    return Ok(RestOutcome::RefusedUnaffordable);
-                }
-            }
-            pos = pos_after;
-
-            // ── APPLY (all rejects passed) ── real insert: in-place (warm) / one materialize (cold).
-            drop(sell_ref);
             storage::mutate_sell_orders(context, user, market_id, |list| {
                 let i = list.partition_point(|e| e.price < price);
                 list.insert(i, new_entry);
@@ -2532,7 +2660,7 @@ fn rest_in_book<H: PerpHost>(
             // Keep best_ask cache up to date.
             if becomes_best {
                 storage::save_best_ask(context, market_id, price)?;
-                // best_bid from the single resolve above (post-match for GTC).
+                // best_bid from the POST-barrier resolve above — the match consumed that side.
                 record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, price)?;
             }
         }
