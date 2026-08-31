@@ -676,10 +676,13 @@ pub fn run_perp_dex_call<H: PerpHost>(
                      {} perp write(s) already committed (error: {error}). Perp writes have NO undo, \
                      so this leaks off-trie state under a failed receipt — and because logs ARE \
                      EVM-journaled, on-chain it appears as status 0x0 with zero logs and silently \
-                     mutated state. Fix the PATH, not this assertion: either move the check before \
-                     the first write (validate-then-apply), or, if writes have legitimately \
-                     happened, make the outcome a success with the unaffordable part \
-                     cancelled/expired (see `RestOutcome::RefusedUnaffordable`).",
+                     mutated state. Fix the PATH, not this assertion: move the DECISION above the \
+                     first write. That is usually cheaper than it looks — the val0 leak was fixed \
+                     by hoisting the write barrier past a rest decision that was already \
+                     write-clean (see `trading::MatchOutcome`), not by rewriting the path. \
+                     Making the outcome a partial success instead is a LAST resort: it has to be \
+                     an outcome the order-lifecycle contract can express, which \
+                     'expire a remainder that never rested' was not.",
                     writes_after - writes_before,
                 );
             }

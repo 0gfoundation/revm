@@ -174,60 +174,27 @@ impl TakerSettlement {
         reg: &mut MatchRegistry,
         taker_side: Side,
         market: &crate::types::Market,
-        // commit-only #23 (atomic-reject, Harry 2026-07-20): when the caller will REST the taker's
-        // remainder (GTC), the resting order's margin must be affordable from the post-fill wallet
-        // TOO — otherwise the fills would commit and the subsequent rest_in_book would revert,
-        // leaking the fills. Validated here, pre-flush, so an unaffordable fills+rest order rejects
-        // atomically with zero writes (matching the pre-commit-only whole-order revert).
-        rest: Option<RestReq>,
     ) -> Result<Option<TakerPlan>, PerpError> {
-        // An EMPTY fill set must NOT skip the rest validation. `match_order` flushes the registry
-        // immediately after this call, and the walk records writes even when nothing filled (a
-        // `SaveLevel` for every level it entered, plus the `DeleteOrder`/`OrderCancelled`/
-        // `RemovePrice`/`SaveBest` of a maker the K9 guard rejected). So a rest that `rest_in_book`
-        // would later refuse has to be refused HERE, pre-flush — otherwise those writes commit
-        // under an order the caller then rejects (a leak in the single-order path, a spurious
-        // `Aborted` in a batch). NOTHING fill-specific runs on this path: no fee, no position
-        // change, no registry join — only the rest's affordability is measured, and the affordable
-        // case still returns `Ok(None)` (there is no fill to plan).
+        // ── An EMPTY fill set has nothing to gate, and no longer pre-validates the REST ─────────
+        //
+        // It used to. `match_order` flushed immediately after this call and the walk records writes
+        // even when nothing filled (a `SaveLevel` for every level it entered, plus the
+        // `DeleteOrder`/`OrderCancelled`/`RemovePrice`/`SaveBest` of a maker the K9 guard rejected),
+        // so a rest that `rest_in_book` would later refuse HAD to be refused here — with
+        // `rest_is_affordable`, which was written to be `rest_in_book`'s own formula on the same
+        // state, precisely so it could not diverge.
+        //
+        // It diverged anyway (val0 block 1,098,719), and the reason is instructive: the two were
+        // algebraically identical and differed in ONE INPUT, because `save_last_traded_price` ran
+        // between them and moved the Assuming-Price floor `T`. **An exact second evaluation is the
+        // bug, not the fix** — it can only ever be as correct as the state it reads, and there is no
+        // way to keep two read points in step by inspection.
+        //
+        // So it is gone, and with it `RestReq`, `with_rest_entry` and `rest_is_affordable`. The
+        // caller no longer flushes after this call: it hands the unwritten `MatchOutcome` to
+        // `rest_in_book`, which decides ONCE, above the barrier. There is nothing here for a second
+        // opinion to be right or wrong about.
         if self.fills.is_empty() {
-            let Some(r) = &rest else {
-                return Ok(None);
-            };
-            // Measure against the state `rest_in_book` will see AFTER the flush: the taker's
-            // registry working copy if the walk already touched it (a self-match maker the K9 guard
-            // cancelled — the flush writes exactly that copy, funding included), else storage.
-            let (bd, pd) = (market.base_decimals, market.price_decimals);
-            // The Assuming-Price floor the REMAINDER about to rest would freeze against — the only
-            // reason this path resolves `T` at all. Already-resting orders carry their own frozen
-            // price in their entries.
-            let floor = crate::margin_view::assuming_price_floor(context, self.market_id, market)?;
-            let (pos, wallet) = match reg.user_work(self.user) {
-                Some(w) => (
-                    work_position_snapshot(w, bd, pd)?,
-                    w.account.perp_wallet_balance,
-                ),
-                None => {
-                    let pos =
-                        (*storage::load_position_ref(context, self.user, self.market_id)?).clone();
-                    let wallet = storage::load_account_ref(context, self.user)?.perp_wallet_balance;
-                    (pos, wallet)
-                }
-            };
-            let affordable = rest_is_affordable(
-                context,
-                self.user,
-                self.market_id,
-                &pos,
-                floor,
-                wallet,
-                taker_side,
-                r,
-                market,
-            )?;
-            if !affordable {
-                return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
-            }
             return Ok(None);
         }
 
@@ -403,16 +370,6 @@ pub(super) struct RestBasis {
     pub(super) cover_cancelled: bool,
 }
 
-/// The taker's intent to rest its unmatched remainder (commit-only #23 atomic-reject): the
-/// resting order's price and quantity — enough for [`finalize_compute`] to pre-validate the
-/// rest's derived requirement against the post-fill available balance. (The taker's maker-fee bps
-/// used to ride along too, for the escrow probe's `OrderEntry`; the requirement is a function of
-/// `(price, qty)` alone, so it is gone.)
-pub(super) struct RestReq {
-    pub(super) price: u64,
-    pub(super) qty: u64,
-}
-
 /// The registry working copy's position AS THE FLUSH WILL WRITE IT: `w.pos` with the per-side
 /// aggregates resynced from the working order lists, which are the authoritative record of what
 /// the match walk has consumed so far.
@@ -442,89 +399,6 @@ fn work_position_snapshot(
     pos.total_sell_qty = tsq;
     pos.total_sell_notional = tsn;
     Ok(pos)
-}
-
-/// `pos` with the taker's would-be resting remainder folded in — the hypothetical the rest gate
-/// prices. No list is materialised: the requirement reads only the aggregates, and the order
-/// contributes exactly the per-order-floored term `rest_in_book` will add when it really rests.
-///
-/// The remainder's Assuming Price is resolved HERE, from `assuming_floor`, because this is the same
-/// instant it would be frozen at (`assuming_price = max(T, price)` on a sell, `price` on a buy). So a
-/// sell resting at or below `T` requires strictly more than its own notional implies, and the gate
-/// measures exactly what the entry will carry.
-fn with_rest_entry(
-    pos: &crate::types::PerpPosition,
-    assuming_floor: u64,
-    taker_side: Side,
-    rest: &RestReq,
-    base_decimals: u32,
-    price_decimals: u32,
-) -> Result<crate::types::PerpPosition, PerpError> {
-    let mut after = pos.clone();
-    let (qty_field, notional_field, assuming_price) = match taker_side {
-        Side::Buy => (
-            &mut after.total_buy_qty,
-            &mut after.total_buy_notional,
-            rest.price,
-        ),
-        Side::Sell => (
-            &mut after.total_sell_qty,
-            &mut after.total_sell_notional,
-            rest.price.max(assuming_floor),
-        ),
-    };
-    let notional = calc_value(assuming_price, rest.qty, base_decimals, price_decimals)?;
-    *qty_field = qty_field
-        .checked_add(rest.qty)
-        .ok_or_else(|| perp_err("placeOrder: rest qty overflow"))?;
-    *notional_field = notional_field
-        .checked_add(notional)
-        .ok_or_else(|| perp_err("placeOrder: rest notional overflow"))?;
-    Ok(after)
-}
-
-/// Can `rest` be admitted from this state? The zero-fill arm of
-/// [`TakerSettlement::finalize_compute`] uses this to raise the rest-margin reject BEFORE the
-/// registry flush, so the walk's writes never commit under an order that is about to be refused.
-///
-/// The formula is `rest_in_book`'s own — `derived_available >= Δ ooIM`, evaluated over the same
-/// hypothetical `Bid`/`Ask` — on the same state. Being the same test on the same state is what
-/// makes the pre-flush reject sound: `rest_in_book`'s later check cannot then fire post-write.
-///
-/// It therefore also carries `rest_in_book`'s **SHAPE**: the Σ walk is evaluated at the POST state
-/// and the delta is LAZY, consulted only when `available(after) < 0` and only for its SIGN (the B1
-/// escape). Two shapes for one test would put that "same test" claim on trust instead of on the
-/// page. The derivation from the doc's delta predicate, the four-case table it is equivalent over,
-/// and ⚠️ why the `Δ > 0` guard must survive are all documented on `rest_in_book`'s buy arm
-/// (`trading/mod.rs`) — read it before touching this.
-#[allow(clippy::too_many_arguments)]
-fn rest_is_affordable<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    market_id: u64,
-    pos: &crate::types::PerpPosition,
-    assuming_floor: u64,
-    wallet: i64,
-    taker_side: Side,
-    rest: &RestReq,
-    market: &crate::types::Market,
-) -> Result<bool, PerpError> {
-    let (bd, pd) = (market.base_decimals, market.price_decimals);
-    let after = with_rest_entry(pos, assuming_floor, taker_side, rest, bd, pd)?;
-    // Both `pos` and `after` are in-memory (the registry working copy plus the hypothetical), so
-    // moving the override from one to the other reads no extra state — the Σ walk's OTHER-market
-    // terms still come from storage exactly as before, which is what keeps this equivalent.
-    let available_after = crate::margin_view::derived_available_balance_with(
-        context,
-        user,
-        Some(wallet),
-        Some((market_id, &after)),
-    )?;
-    if available_after >= 0 {
-        return Ok(true);
-    }
-    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
-    Ok(delta <= 0)
 }
 
 /// The taker settlement's APPLY half (commit-only #23 L2b): everything after the decision —

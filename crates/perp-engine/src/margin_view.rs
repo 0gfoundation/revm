@@ -561,9 +561,10 @@ pub fn margin_info_of(
 /// # Who folds THIS and who folds the wide one
 ///
 /// This is the LEAN fold: one accumulator, no maintenance-margin tier walk, no unrealized PnL, no
-/// `Σ isolatedWallet`. It serves the gates that want nothing but `available` — `rest_is_affordable`,
-/// `TakerSettlement::finalize_compute`, the taker wallet-cover check, `removePositionMargin` — where
-/// the five extra accumulators would be arithmetic thrown away.
+/// `Σ isolatedWallet`. It serves the gates that want nothing but `available` —
+/// `TakerSettlement::finalize_compute`, `trading::rest_in_book`'s admission gate, its pre-walk
+/// early-out, the taker wallet-cover check, `removePositionMargin` — where the five extra
+/// accumulators would be arithmetic thrown away.
 ///
 /// The WIDE fold ([`account_margin_scalars`]) is now REST-only: `getAccount` and `getAccountMargin`
 /// are its only callers. Both other consumers it once had are gone — `trading::rest_in_book` reverted
@@ -651,8 +652,8 @@ pub fn derived_available_balance<H: PerpHost>(
 /// # ⚠️ DO NOT CACHE THE RESULT, AND DO NOT DERIVE IT FROM A PREVIOUS CALL BY SUBTRACTING A DELTA
 ///
 /// This must be RECOMPUTED on every check. The temptation is real and the gates now invite it:
-/// `rest_is_affordable` and the taker gates evaluate this at the POST state and read like incremental
-/// arithmetic, and the identity `available(after) == available(before) − Δ ooIM` genuinely holds —
+/// `rest_in_book`'s gate and the taker gates evaluate this at the POST state and read like
+/// incremental arithmetic, and the identity `available(after) == available(before) − Δ ooIM` genuinely holds —
 /// but **only within a single call**, where every other market's term is the same integer on both
 /// sides. Across calls it does not hold at all: `ooIM_m` contains `N_m = trunc(amount_m × mark_m)`,
 /// so every other market's term moves with ITS OWN mark, with no action by the user.
@@ -1297,9 +1298,9 @@ pub fn index_account_scalars<H: PerpHost>(
 
     // The roll-up's `Σ ooIM` and the LEAN admission gate's must be the SAME number over the same
     // market set. They share `position_open_order_margin` per market but fold in two places: this
-    // wide fold, and `total_open_order_initial_margin`, which the taker gates / `rest_is_affordable`
-    // / `finalize_compute` still use because they want only `available` and would otherwise pay for
-    // five accumulators they discard. `rest_in_book`'s placement gate is one of those lean callers,
+    // wide fold, and `total_open_order_initial_margin`, which the taker gates / `finalize_compute`
+    // still use because they want only `available` and would otherwise pay for five accumulators
+    // they discard. `rest_in_book`'s placement gate is one of those lean callers,
     // so this is the check that keeps the number IT enforces equal to the number `getAccount` and
     // `AccountBalanceChanged` report. Pinned on EVERY produced snapshot rather than trusted.
     // Compiled out in release, so the second walk costs production nothing.

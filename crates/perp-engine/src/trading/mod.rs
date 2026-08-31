@@ -1289,6 +1289,152 @@ fn remove_order_entry_by_price(
         .expect("index from find_entry_by_price_id is in bounds"))
 }
 
+/// A **rough, conservative, pre-walk** filter that refuses limit orders which cannot POSSIBLY be
+/// afforded — so the node does not walk a large book to arrive at a certain rejection.
+///
+/// # Why it exists
+///
+/// `placeOrder` is charged a FLAT `PLACE_ORDER_GAS` and the match walk has no cap — no `MAX_WALK`,
+/// no `MAX_FILLS`, no `MAX_LEVELS`. An attacker therefore pays a fixed price for unbounded CPU by
+/// crossing a deep book with an order they can never fund. The authoritative gates all sit AFTER the
+/// walk, by design (`finalize_compute` prices realised fills, `rest_in_book` prices the real rest),
+/// and that is right — this does not replace them.
+///
+/// # It is a FILTER, not a DECISION
+///
+/// The one thing it must satisfy is
+///
+/// ```text
+///     bound <= true_requirement            (unconditionally)
+/// ```
+///
+/// because then `available < bound  ⟹  available < true_requirement`, and the early reject can
+/// never be wrong. Being LOOSE is harmless: a bound of 0 simply means no filtering. Nothing may ever
+/// treat this as authoritative — accepting here says nothing at all.
+///
+/// # ⚠️ THE TRAP: a REDUCING order's true requirement can be zero or NEGATIVE
+///
+/// A sell that closes a long frees margin and realises PnL into the wallet, so its requirement is
+/// ≤ 0 and `derived_can_afford` admits it at any balance (the B1 invariant). A positive lower bound
+/// applied to such an order would falsely reject a POSITION-CLOSING order — far worse than a wasted
+/// walk, because it blocks someone from reducing risk exactly when they most need to. Worse, the
+/// magnitude of what a close frees is `pos.margin`, which `addPositionMargin` can make arbitrarily
+/// large, so there is no fixed credit that bounds it.
+///
+/// So the filter simply DOES NOT APPLY unless the order is unambiguously exposure-increasing.
+/// Two guards, both cheap, both read off the position blob:
+///
+/// 1. **The position must not offset the order** (`buy ⟹ amount ≥ 0`, `sell ⟹ amount ≤ 0`). No fill
+///    can then have a closing leg, so nothing is released, `apply_position_fill`'s `closing_qty` is
+///    0, and the moved `ooIM` branch is monotone increasing.
+/// 2. **No resting order of the user's own on the order's side** in this market. The cover loop in
+///    `finalize_compute` cancels SAME-SIDE orders only, so with none to cancel it cannot shrink the
+///    baseline this bound is measured against — and if cover were ever needed the loop would run out
+///    of orders and reject anyway.
+///
+/// # The bound
+///
+/// Every unit of the order must be funded either as fill margin or as `ooIM`, and both are priced
+/// off a notional. `p_min` is a per-unit price that is `≤` every price any unit can be valued at:
+///
+/// * **SELL @ P** — fills land on bids `≥ P`; the remainder rests at `max(P, T) ≥ P`. So `≥ P`.
+/// * **BUY @ P** — fills land on asks `≤ P` but `≥ best_ask`; the remainder rests at `P ≥ best_ask`.
+///   So `≥ best_ask`, or `P` when the book is empty / `best_ask > P`.
+/// * both are then clamped to `≤ mark`, because the FILL leg's contribution to the position notional
+///   `N` is valued at the MARK while its cash cost is valued at the fill price, and the bound has to
+///   be below both.
+///
+/// The bound itself is not hand-rolled: it is [`crate::margin_view::derived_requirement_delta`] —
+/// the production `ooIM` delta — evaluated on a hypothetical where the WHOLE order rests at `p_min`.
+/// Under guards 1+2 the moved branch is monotone in that notional, so the real requirement (any
+/// fill/rest split) is at least this. Using the real function is deliberate: it inherits the `max()`
+/// hedging rule and the leverage/tier handling for free, so a hedged order that is genuinely FREE
+/// gets a bound of 0 and is not filtered.
+///
+/// `slack` covers integer flooring, which is the only place the inequality is tight: `calc_value`
+/// floors once per FILL (`opening_value` is a per-fill sum, so ≤ one quantum lost per fill, and the
+/// fill count is bounded by `quantity / min_quantity`), the fill/rest split floors once more, and
+/// `ooIM`'s `round_up_div` plus `opening_margin`'s truncating division contribute a constant.
+///
+/// # Cost
+///
+/// One `MarketHot` read (buy side only, already warm), the position blob, and — only when the bound
+/// comes out positive — one `derived_available_balance` fold over the per-user market index, bounded
+/// by `MAX_USER_MARKETS = 16`. Never the book.
+fn reject_provably_unaffordable_limit_order<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    side: Side,
+    price: u64,
+    quantity: u64,
+    market: &crate::types::Market,
+) -> Result<(), PerpError> {
+    let pos = storage::load_position_ref(context, user, market_id)?;
+
+    // ── Guard 1: the order must not be offset by the position (see ⚠️ above). ──
+    // ── Guard 2: nor may the user hold resting orders on this side of this market. ──
+    let inapplicable = match side {
+        Side::Buy => pos.amount < 0 || pos.total_buy_notional != 0,
+        Side::Sell => pos.amount > 0 || pos.total_sell_notional != 0,
+    };
+    if inapplicable {
+        return Ok(());
+    }
+
+    // `p_min`: a per-unit price no unit of this order can be valued below.
+    let side_min = match side {
+        Side::Sell => price,
+        Side::Buy => {
+            let best_ask = storage::load_market_hot(context, market_id)?.best_ask;
+            if best_ask != 0 && best_ask < price {
+                best_ask
+            } else {
+                price
+            }
+        }
+    };
+    let p_min = side_min.min(market.mark_price);
+
+    // Every arithmetic failure below means "cannot bound it" and therefore "do not filter". The
+    // authoritative gates will raise the real error if there is one; turning an overflow in a
+    // heuristic into a user-visible reject would be exactly the over-reach this function must not
+    // commit.
+    let Ok(min_notional) = calc_value(p_min, quantity, market.base_decimals, market.price_decimals)
+    else {
+        return Ok(());
+    };
+    let mut hypothetical = (*pos).clone();
+    let own_notional = match side {
+        Side::Buy => &mut hypothetical.total_buy_notional,
+        Side::Sell => &mut hypothetical.total_sell_notional,
+    };
+    let Some(sum) = own_notional.checked_add(min_notional) else {
+        return Ok(());
+    };
+    *own_notional = sum;
+    let Ok(raw_bound) = crate::margin_view::derived_requirement_delta(market, &pos, &hypothetical)
+    else {
+        return Ok(());
+    };
+
+    // Flooring slack (see the doc comment). `fills_max` bounds the per-fill `calc_value` losses;
+    // the `+ 4` covers the split floor plus the round-up/truncating divisions. Unscaled by leverage
+    // on purpose — `L >= 1`, so the unscaled figure is never smaller than the scaled one.
+    let fills_max = quantity / market.min_quantity.max(1);
+    let slack = (fills_max as i128).saturating_add(4);
+    let bound = raw_bound.saturating_sub(slack);
+    if bound <= 0 {
+        return Ok(());
+    }
+
+    let available = crate::margin_view::derived_available_balance(context, user)?;
+    if available < bound {
+        return Err(perp_err(INSUFFICIENT_MARGIN_REJECT));
+    }
+    Ok(())
+}
+
 /// The four TIFs of a LIMIT order — the only order type that has one.
 fn execute_limit_order<H: PerpHost>(
     context: &mut H,
@@ -1304,6 +1450,13 @@ fn execute_limit_order<H: PerpHost>(
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
 ) -> Result<(), PerpError> {
+    // BEFORE the walk, and before `check_fok_feasibility`'s walk too — that is the entire point.
+    // Applies to all four TIFs: PostOnly does not walk, but the filter is sound for it as well and
+    // raises the identical reject its own gate would, so scoping it would only add a case to reason
+    // about.
+    reject_provably_unaffordable_limit_order(
+        context, account, market_id, side, price, quantity, market,
+    )?;
     let kind = OrderKind::Limit(tif);
     match tif {
         TimeInForce::PostOnly => {
@@ -2044,21 +2197,12 @@ pub(super) fn match_order<H: PerpHost>(
         return Err(perp_err("placeOrder: FOK order cannot be fully filled"));
     }
 
-    // 2. Taker settlement compute: K9 open-into-insolvency / wallet-cover / checked-arithmetic
-    //    rejects — all pre-write. The taker joins the registry (self-match reuses the evolved
-    //    copies) and its fill effects are flushed with everyone else's below. When the caller will
-    //    REST the remainder (GTC), pass the rest requirement so the fills+rest margin is validated
-    //    atomically here (else the fills commit and rest_in_book could revert, leaking them).
-    let rest_req = if kind.rests_remainder() && remaining > 0 {
-        Some(settlement::RestReq {
-            price: limit_price,
-            qty: remaining,
-        })
-    } else {
-        None
-    };
-    let taker_plan =
-        taker_settlement.finalize_compute(context, &mut registry, side, market, rest_req)?;
+    // 2. Taker settlement compute: K9 open-into-insolvency / wallet-cover / tier /
+    //    checked-arithmetic rejects — all pre-write. The taker joins the registry (a self-match
+    //    reuses the evolved copies) and its fill effects are flushed with everyone else's, by the
+    //    caller. It no longer takes a `RestReq`: the REST is decided once, by `rest_in_book`, also
+    //    above the barrier.
+    let taker_plan = taker_settlement.finalize_compute(context, &mut registry, side, market)?;
 
     // ── THE MATCH IS DECIDED, AND NOTHING IS WRITTEN ──
     // The registry, the taker plan and the last trade price are handed BACK, unflushed. The caller
