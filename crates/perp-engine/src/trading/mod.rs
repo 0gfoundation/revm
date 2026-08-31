@@ -1326,8 +1326,9 @@ fn execute_limit_order<H: PerpHost>(
                 RestOutcome::Rested => Ok(()),
                 // PostOnly never matches, so nothing has been written: a genuine reject is both
                 // safe and the better answer — the caller learns its quote was refused instead of
-                // silently getting nothing.
+                // silently getting nothing. Both refusals qualify, for the same reason.
                 RestOutcome::RefusedTooGoodBest => Err(perp_err(TOO_GOOD_BEST_REJECT)),
+                RestOutcome::RefusedUnaffordable => Err(perp_err(INSUFFICIENT_MARGIN_REJECT)),
             }
         }
         TimeInForce::Gtc => {
@@ -1364,10 +1365,30 @@ fn execute_limit_order<H: PerpHost>(
                     None,
                     pending_placed,
                 )?;
-                if matches!(outcome, RestOutcome::RefusedTooGoodBest) {
+                // ── The refusal fork, ONE shape for BOTH refusals ────────────────────────────
+                // `rest_in_book` decides both write-clean, and past this line the only thing that
+                // differs between them is the attribution. Keeping one fork is deliberate: it is
+                // what stops the next refusal added to `RestOutcome` from re-opening the leak by
+                // being handled as "just raise it".
+                let refusal = match outcome {
+                    RestOutcome::Rested => None,
+                    RestOutcome::RefusedTooGoodBest => {
+                        Some((TOO_GOOD_BEST_REJECT, CancelReason::PriceBandExpiry))
+                    }
+                    // The val0 leak. `CancelReason::TakerMarginCover` and not a new variant: this
+                    // IS that reason's meaning — the taker's own order shed because the fills it
+                    // just took do not leave enough available balance — and `finalize_apply`'s
+                    // cover loop can already cancel this same taker's OTHER orders under it in
+                    // this same call. Splitting one client-visible cause across two codes would
+                    // make the remainder look like a different event from its own siblings.
+                    RestOutcome::RefusedUnaffordable => {
+                        Some((INSUFFICIENT_MARGIN_REJECT, CancelReason::TakerMarginCover))
+                    }
+                };
+                if let Some((reject, reason)) = refusal {
                     if remaining == quantity {
                         // Crossed nothing, so nothing is written — reject, same as PostOnly.
-                        return Err(perp_err(TOO_GOOD_BEST_REJECT));
+                        return Err(perp_err(reject));
                     }
                     // FILLS ARE ALREADY APPLIED AND THERE IS NO PERP UNDO. Raising here would
                     // revert the frame while the maker's consumed order stays deleted and the
@@ -1383,7 +1404,7 @@ fn execute_limit_order<H: PerpHost>(
                             user: account,
                             orderId: FixedBytes(order_id),
                             marketId: market_id,
-                            reason: crate::types::CancelReason::PriceBandExpiry as u8,
+                            reason: reason as u8,
                         }
                         .to_log_data(),
                     });
@@ -2161,9 +2182,19 @@ fn entries_iter(
 enum RestOutcome {
     Rested,
     RefusedTooGoodBest,
+    /// The rest's marginal `ooIM` does not fit in the available balance.
+    ///
+    /// This used to be raised in place (two `return Err`s, one per side arm), which was the val0
+    /// leak: for a crossing GTC `rest_in_book` runs AFTER `match_order`'s APPLY block, so raising
+    /// committed the fills and reverted the frame. Returned instead, for exactly the reason the
+    /// enum's own doc comment gives — the right response depends on whether the caller has already
+    /// applied fills.
+    RefusedUnaffordable,
 }
 
 const TOO_GOOD_BEST_REJECT: &str = "placeOrder: a new best quote must be inside the price band";
+/// The rest-margin refusal, as the caller raises it on the write-clean (zero-fill) paths.
+const INSUFFICIENT_MARGIN_REJECT: &str = "placeOrder: insufficient perp wallet for margin";
 
 fn rest_in_book<H: PerpHost>(
     context: &mut H,
@@ -2382,7 +2413,10 @@ fn rest_in_book<H: PerpHost>(
                 let delta =
                     crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
                 if delta > 0 {
-                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                    // Write-clean (validate-then-apply: the probe above materialised nothing), so
+                    // the caller decides — reject if it has written nothing, expire the remainder
+                    // if it has already applied fills. See [`RestOutcome::RefusedUnaffordable`].
+                    return Ok(RestOutcome::RefusedUnaffordable);
                 }
             }
             // Commit the maintained buy aggregates (op accepted).
@@ -2477,7 +2511,10 @@ fn rest_in_book<H: PerpHost>(
                 let delta =
                     crate::margin_view::derived_requirement_delta(market, &pos, &pos_after)?;
                 if delta > 0 {
-                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                    // Mirror of the buy arm: refusal is RETURNED, not raised. This is the arm the
+                    // val0 leak actually came out of (the Assuming-Price floor applies to SELLs
+                    // only, so the pre-check/real-check divergence is one-sided).
+                    return Ok(RestOutcome::RefusedUnaffordable);
                 }
             }
             pos = pos_after;

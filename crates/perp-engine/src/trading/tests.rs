@@ -771,6 +771,355 @@ fn a_crossing_gtc_remainder_expiry_keeps_the_fills_it_already_applied() {
     );
 }
 
+// ── commit-only #23: a rejected placement must not leave perp writes behind ───────────────────
+//
+// The class, stated once: off-trie perp writes are COMMIT-ONLY (there is no `PerpUndo`), while
+// `context.log` is EVM-journaled and truncates on revert. So any `perp_err` raised AFTER the
+// registry flush produces the exact signature observed on val0 at block 1,098,719 — a failed
+// receipt, ZERO logs, and mutated positions/wallets. `match_order`'s APPLY comment asserts
+// "nothing a user can provoke rejects after this line"; these tests are what holds it to that.
+
+/// The slice of off-trie perp state a placement can move, for the two counterparties plus the book.
+///
+/// Deliberately NOT the on-trie commitment hash: `place_order_core` bumps the caller's orderId
+/// nonce before any of this, so even a perfectly clean reject moves the commitment. What must be
+/// invariant across a reject is the *economic* state — positions, wallets, the book and the order
+/// map — which is exactly what the val0 projector observed moving.
+#[derive(Debug, PartialEq)]
+struct PerpStateSnapshot {
+    positions: Vec<(Address, PerpPosition)>,
+    wallets: Vec<(Address, i64)>,
+    buy_entries: Vec<(Address, Vec<OrderEntry>)>,
+    sell_entries: Vec<(Address, Vec<OrderEntry>)>,
+    bid_prices: Vec<u64>,
+    ask_prices: Vec<u64>,
+    best: (u64, u64),
+    last_traded: u64,
+    orders_present: Vec<([u8; 32], bool)>,
+}
+
+fn snapshot_perp_state(
+    ctx: &mut TestCtx,
+    users: &[Address],
+    order_ids: &[[u8; 32]],
+) -> PerpStateSnapshot {
+    let hot = storage::load_market_hot(ctx, MARKET_ID).unwrap();
+    PerpStateSnapshot {
+        positions: users
+            .iter()
+            .map(|&u| (u, storage::load_position(ctx, u, MARKET_ID).unwrap()))
+            .collect(),
+        wallets: users
+            .iter()
+            .map(|&u| {
+                (
+                    u,
+                    storage::load_account(ctx, u).unwrap().perp_wallet_balance,
+                )
+            })
+            .collect(),
+        buy_entries: users
+            .iter()
+            .map(|&u| {
+                (
+                    u,
+                    storage::load_buy_orders(ctx, u, MARKET_ID)
+                        .unwrap()
+                        .into_iter()
+                        .collect(),
+                )
+            })
+            .collect(),
+        sell_entries: users
+            .iter()
+            .map(|&u| {
+                (
+                    u,
+                    storage::load_sell_orders(ctx, u, MARKET_ID)
+                        .unwrap()
+                        .into_iter()
+                        .collect(),
+                )
+            })
+            .collect(),
+        bid_prices: storage::load_bid_prices(ctx, MARKET_ID).unwrap(),
+        ask_prices: storage::load_ask_prices(ctx, MARKET_ID).unwrap(),
+        best: (hot.best_bid, hot.best_ask),
+        last_traded: hot.last_traded,
+        orders_present: order_ids
+            .iter()
+            .map(|id| (*id, storage::load_order(ctx, id).unwrap().is_some()))
+            .collect(),
+    }
+}
+
+/// The val0 fixture, parameterised on the taker's starting wallet.
+///
+/// A SELL GTC for 2 lots against a single resting bid of 1 lot: 1 lot fills at $100 and the
+/// remainder wants to rest at $100. The taker ends SHORT, which is what makes the
+/// Assuming-Price floor bite — it applies to the SELL side only (`with_rest_entry` /
+/// `rest_in_book`'s sell arm take `price.max(assuming_floor)`; the buy arms use `rest.price`
+/// verbatim), matching the SELL in the on-chain report.
+///
+/// Returns `(result, snapshot_before, snapshot_after, maker_order_id)`.
+fn sell_gtc_partial_fill_then_rest(
+    ctx: &mut TestCtx,
+    taker_available: i64,
+) -> (
+    Result<Bytes, PerpError>,
+    PerpStateSnapshot,
+    PerpStateSnapshot,
+    [u8; 32],
+) {
+    setup(ctx);
+    // A real mark is mandatory here, not decoration: `assuming_price_floor` is
+    // `max(ROUND_UP(lastTraded x 1.0015), mark)`, so with mark = 0 the pre-fill floor would be 0
+    // and the fixture would be measuring a zero-mark artefact instead of the divergence.
+    set_mark(ctx, PRICE);
+
+    // Maker: one bid lot at $100 for the taker to cross.
+    let bid = place(ctx, ALICE, 0, PRICE, QTY, 0, 0);
+
+    // PRECONDITION: no trade has happened in this market yet, so the pre-fill floor is the MARK...
+    assert_eq!(
+        storage::load_market_hot(ctx, MARKET_ID)
+            .unwrap()
+            .last_traded,
+        0,
+        "precondition: last_traded must be unset, so the pre-check's floor is the mark"
+    );
+    let floor_before = crate::math::assuming_price_floor(0, PRICE).unwrap();
+    assert_eq!(
+        floor_before, PRICE,
+        "precondition: pre-fill floor == the limit price, so the pre-check values the rest at $100"
+    );
+    // ...and the post-fill floor is STRICTLY above it, because a crossing sell always drags
+    // last_traded to at least its own limit price and the markup is then applied on top. This is
+    // the whole divergence: same formula, two different `last_traded` reads.
+    let floor_after = crate::math::assuming_price_floor(PRICE, PRICE).unwrap();
+    assert!(
+        floor_after > floor_before,
+        "precondition: the post-fill floor ({floor_after}) must exceed the pre-fill one \
+         ({floor_before}) or there is no divergence to reproduce"
+    );
+
+    set_available(ctx, BOB, taker_available);
+
+    let before = snapshot_perp_state(ctx, &[ALICE, BOB], &[bid]);
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side: 1, // SELL
+        price: PRICE,
+        quantity: QTY * 2,
+        orderType: 0, // Limit
+        tif: 0,       // GTC — the remainder rests, so `rest_in_book` runs AFTER the flush
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    let result = run_place_order(&input, BOB, ctx);
+    let after = snapshot_perp_state(ctx, &[ALICE, BOB], &[bid]);
+    (result, before, after, bid)
+}
+
+/// **The val0 leak, reproduced.**
+///
+/// The taker's wallet is set to exactly what the PRE-check demands and 1500 units less than what
+/// `rest_in_book` demands, so the two disagree and the reject lands after the flush:
+///
+/// * pre-check (`finalize_compute`, settlement.rs): `need = total_required + rest_delta`
+///   `= 1_000_000 + calc_value($100.00, QTY) = 2 x FILL_VALUE`, because it resolves the floor
+///   from the PRE-fill `last_traded` (= 0 → floor = mark = $100).
+/// * real check (`rest_in_book`, trading/mod.rs sell arm): the same formula over
+///   `calc_value($100.15, QTY)`, because `save_last_traded_price` ran in between.
+///
+/// Whatever the fix, the assertion is the invariant and not the mechanism: **`Err` ⇒ no perp
+/// state moved.**
+#[test]
+fn a_rejected_placement_must_not_move_perp_state() {
+    let mut ctx = make_ctx();
+    // The pre-check's exact requirement: the filled lot's opening margin, plus the marginal ooIM
+    // of a rest valued at the LIMIT price (`|N| + Ask` at leverage 1, minus `|N|`).
+    let precheck_need = (2 * FILL_VALUE) as i64;
+    let (result, before, after, _bid) = sell_gtc_partial_fill_then_rest(&mut ctx, precheck_need);
+
+    if let Err(e) = &result {
+        assert_eq!(
+            after, before,
+            "commit-only #23 VIOLATED: placeOrder returned Err({e:?}) but perp state MOVED. \
+             Logs are EVM-journaled and truncate on revert, so on-chain this is a failed receipt \
+             with zero logs and a silently mutated position — exactly val0 block 1,098,719."
+        );
+    }
+}
+
+/// The same invariant swept across the whole divergence window, so the fixture cannot go vacuous
+/// if a constant drifts and `precheck_need` stops landing inside it. Every wallet value that
+/// rejects must reject cleanly; the ones that succeed are checked by the sibling test.
+#[test]
+fn no_wallet_value_lets_a_rejected_placement_move_perp_state() {
+    // The window is `[precheck_need, rest_in_book_need)`, i.e. the 0.15% markup on one lot; sweep
+    // a margin either side of it.
+    let base = (2 * FILL_VALUE) as i64;
+    let markup = calc_value(
+        crate::math::assuming_price_floor(PRICE, PRICE).unwrap(),
+        QTY,
+        8,
+        9,
+    )
+    .unwrap() as i64
+        - FILL_VALUE as i64;
+    assert!(markup > 0, "the markup must be a real gap");
+    for target in [
+        base - 1,
+        base,
+        base + 1,
+        base + markup - 1,
+        base + markup,
+        base + markup + 1,
+    ] {
+        let mut ctx = make_ctx();
+        let (result, before, after, _bid) = sell_gtc_partial_fill_then_rest(&mut ctx, target);
+        if let Err(e) = &result {
+            assert_eq!(
+                after, before,
+                "commit-only #23 VIOLATED at available={target}: Err({e:?}) with moved perp state"
+            );
+        }
+    }
+}
+
+/// What a client observes INSTEAD of the revert: the call succeeds, the fills stand, and the
+/// remainder is expired and attributed.
+///
+/// This is the half that keeps the two sibling tests honest — they only require `Err ⇒ no writes`,
+/// which a "reject earlier and more strictly" fix would also satisfy while silently killing
+/// affordable orders. The chosen resolution is the one the owner already applied to the price band:
+/// once fills have happened, expire the remainder.
+#[test]
+fn an_unaffordable_gtc_remainder_expires_and_keeps_its_fills() {
+    let mut ctx = make_ctx();
+    let (result, _before, after, bid) =
+        sell_gtc_partial_fill_then_rest(&mut ctx, (2 * FILL_VALUE) as i64);
+    let ret = result.expect(
+        "a crossing GTC whose remainder cannot afford its margin must SUCCEED with the remainder \
+         expired — raising would revert the frame while the fills it already applied survive",
+    );
+    let order_id: [u8; 32] = ret[..32].try_into().unwrap();
+
+    // The fills stand, on BOTH sides.
+    assert_eq!(
+        after.positions[1].1.amount,
+        -(QTY as i64),
+        "the taker keeps the lot it actually filled"
+    );
+    assert_eq!(
+        after.positions[0].1.amount, QTY as i64,
+        "and so does the maker — the trade really happened, which is why the reject was wrong"
+    );
+    assert!(
+        !after.orders_present[0].1,
+        "the maker's bid was legitimately consumed by a trade that COMMITTED"
+    );
+    let _ = bid;
+
+    // The remainder is NOT in the book, and left no aggregate behind either.
+    assert!(
+        after.ask_prices.is_empty() && after.best.1 == 0,
+        "the expired remainder must not rest, nor reach the BBO cache"
+    );
+    assert_eq!(
+        (
+            after.positions[1].1.total_sell_qty,
+            after.positions[1].1.total_sell_notional
+        ),
+        (0, 0),
+        "an expired remainder contributes nothing to `Ask` — `rest_in_book` refused before APPLY"
+    );
+    assert!(
+        after.sell_entries[1].1.is_empty(),
+        "and nothing landed on the taker's own order list"
+    );
+
+    // …and it is attributed, so a market maker can tell it from a user cancel.
+    assert_eq!(
+        band_cancel_reasons(&mut ctx),
+        vec![crate::types::CancelReason::TakerMarginCover as u8],
+        "the margin-driven expiry reuses TakerMarginCover — the same cause `finalize_apply`'s \
+         cover loop cancels this taker's OTHER orders under, in this same call"
+    );
+    assert_terminal(&mut ctx, order_id);
+}
+
+/// The same scenario driven through the FULL CALL SHELL (`run_perp_dex_call`) rather than the
+/// handler, which is the only way to exercise the structural guard in `call.rs`.
+///
+/// Two things are asserted, and the second is the point: the call does not revert, AND the
+/// process-wide write-then-revert tripwire did not tick. The tripwire has existed all along and was
+/// diagnostic-only — that is exactly how this bug reached val0 — so it is now also a
+/// `debug_assert!`, meaning a regression here fails inside the shell with the offending selector
+/// rather than passing quietly.
+#[test]
+fn the_val0_scenario_through_the_call_shell_neither_reverts_nor_trips_the_tripwire() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    set_mark(&mut ctx, PRICE);
+    let _bid = place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+    set_available(&mut ctx, BOB, (2 * FILL_VALUE) as i64);
+
+    let (trips_before, _) = crate::call::last_perp_write_then_revert();
+    let input = placeOrderCall {
+        marketId: MARKET_ID,
+        side: 1,
+        price: PRICE,
+        quantity: QTY * 2,
+        orderType: 0,
+        tif: 0,
+        clientOrderId: FixedBytes::default(),
+    }
+    .abi_encode();
+    let out = run_perp_dex_call(&input, 1_000_000, BOB, U256::ZERO, false, &mut ctx).unwrap();
+
+    assert!(
+        !out.reverted,
+        "the shell must not revert: reason = {:?}",
+        String::from_utf8_lossy(&out.bytes)
+    );
+    let (trips_after, sel) = crate::call::last_perp_write_then_revert();
+    assert_eq!(
+        trips_after, trips_before,
+        "commit-only #23 tripwire ticked (last selector {sel:#010x}) — a reverting call committed \
+         perp writes"
+    );
+}
+
+/// The zero-fill half of the same fork STILL rejects, and must: `match_order` never flushed, so a
+/// reject there is write-clean and is the better answer (the client learns the order was refused
+/// rather than silently getting nothing back). Pins that the fix did not convert clean rejects into
+/// silent expiries.
+#[test]
+fn a_zero_fill_unaffordable_rest_still_rejects() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    set_mark(&mut ctx, PRICE);
+    // No maker, so nothing crosses: the whole order wants to rest.
+    set_available(&mut ctx, BOB, 0);
+    let before = snapshot_perp_state(&mut ctx, &[ALICE, BOB], &[]);
+    let err = try_place_limit(&mut ctx, BOB, 1, PRICE).expect_err(
+        "a rest that cannot afford its own margin, with zero fills behind it, must still reject",
+    );
+    assert!(
+        err.to_string()
+            .contains("insufficient perp wallet for margin"),
+        "unexpected reject reason: {err}"
+    );
+    assert!(
+        !err.to_string().contains("[INVARIANT] "),
+        "this is a user error, not an invariant breach: {err}"
+    );
+    let after = snapshot_perp_state(&mut ctx, &[ALICE, BOB], &[]);
+    assert_eq!(after, before, "and it must still be write-clean");
+}
+
 #[test]
 fn fill_band_blocks_buy_against_ask_above_band() {
     // mark 100, default +-10% -> upper edge 110. An ask at 120 rests (FAR side, so placement lets
