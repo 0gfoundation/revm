@@ -1196,8 +1196,33 @@ sol! {
 
         // Emitted when a limit order rests in the book (after any immediate fills).
         // quantity = the resting quantity (original qty minus any fills that happened first).
-        // Feeds: /openOrders (confirm resting), /allOrders (status=NEW/PARTIALLY_FILLED)
-        event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif, bytes16 clientOrderId);
+        // Feeds: /openOrders (confirm resting), /allOrders (status=NEW/PARTIALLY_FILLED),
+        //        and the `@order` websocket stream's `b`/`a` (see `assumingPrice`).
+        //
+        // `assumingPrice` — this order's FROZEN Assuming Price, the margin basis its resting
+        // notional is charged at. `quantity × assumingPrice` (floored to quote units by
+        // `calc_value`) IS this order's contribution to the user's `bidNotional` / `askNotional`,
+        // i.e. the `@order` stream's `b` / `a` fields, and Σ over the user's resting orders on a
+        // side equals `getPositionRisk`'s aggregate for that side exactly.
+        //
+        // IT IS EMITTED BECAUSE IT IS NOT DERIVABLE ANYWHERE ELSE. For a SELL it is
+        // `max(⌈lastTraded × 1.0015⌉, markPrice, limit)` evaluated AT THE INSTANT OF PLACEMENT and
+        // then frozen for the order's whole life (R12). An indexer without this field would have to
+        // reimplement that rule AND snapshot it at the right moment against a mark and a
+        // last-traded price it only sees through other logs. The EVALUATION TIMING of exactly this
+        // rule caused a live state leak on val0 (there used to be a second resolution of `T` with
+        // `save_last_traded_price` between the two — see THE FREEZE in `trading::rest_in_book`), so
+        // it is precisely the kind of rule that must have ONE evaluation, on chain, published.
+        //
+        // EMITTED UNCONDITIONALLY, on both sides, even though a BUY's Assuming Price is always its
+        // own `price` (no markup on the buy side — MEASURED, R11). Suppressing it for buys, or
+        // documenting it as "sells only", would make a consumer remember an asymmetry to compute
+        // `b` the same way it computes `a`. One rule, `quantity × assumingPrice`, serves both.
+        //
+        // It is a MARGIN BASIS AND NOTHING ELSE: the book level, the insert position, the fill
+        // price and the fee all key on `price`. `assumingPrice >= price` for a sell and
+        // `== price` for a buy, so it must NOT be shown to a user as the order's price.
+        event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif, bytes16 clientOrderId, uint64 assumingPrice);
         // Feeds: /openOrders (remove), /allOrders (status=CANCELED, updateTime)
         //
         // `reason` is `CancelReason` (perp-core `types::order`): 0 = the owner asked (cancelOrder /

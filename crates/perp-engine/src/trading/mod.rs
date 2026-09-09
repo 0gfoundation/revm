@@ -2833,6 +2833,13 @@ fn rest_in_book<H: PerpHost>(
             quantity: qty,
             tif: tif as u8,
             clientOrderId: FixedBytes(client_order_id),
+            // The FROZEN margin basis, straight off the entry this call just inserted — the same
+            // integer `new_entry.margin_notional` was folded into `total_buy/sell_notional` with,
+            // so `quantity × assumingPrice` reproduces this order's contribution to
+            // `getPositionRisk`'s `bidNotional`/`askNotional` with no re-derivation. It is
+            // published because it is un-derivable off-chain: for a sell it is `max(T, limit)` with
+            // `T` resolved ONCE, above, and never again (see THE FREEZE).
+            assumingPrice: assuming_price,
         }
         .to_log_data(),
     });
