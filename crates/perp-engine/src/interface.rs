@@ -1239,6 +1239,72 @@ sol! {
         // `storage::mark_account_snapshot_dirty`.
         event OrderCancelled(address indexed user, bytes32 indexed orderId, uint64 indexed marketId, uint8 reason);
 
+        // Feeds: /allOrders (status=EXPIRED, updateTime), and the `@order` stream's terminal frame
+        //        for a TIF expiry.
+        //
+        // THE TERMINAL EVENT OF AN IOC / MARKET ORDER THAT DID NOT FULLY FILL. Before it, such an
+        // order ended with NO terminal event at all: `cancel_unfilled_remainder` set
+        // `OrderStatus::Expired` in memory, delete-on-terminal then removed the record so `getOrder`
+        // answered "not found", and the stream read `OrderPlaced → Trade × N → (nothing)`.
+        //
+        // `filledQuantity` — how much of the order executed, `quantity − expiredQuantity`. It lets a
+        //                    consumer reconcile the stream's cumulative `z` against a number the
+        //                    engine computed rather than one summed from `Trade` logs it hopes it
+        //                    received all of.
+        // `expiredQuantity` — the remainder that was discarded. Always > 0: a fully filled order has
+        //                    no remainder and is not an expiry (see below).
+        //
+        // ── WHY A SEPARATE EVENT AND NOT `OrderCancelled` ───────────────────────────────────────
+        //
+        // ⚠️ DO NOT MERGE THIS INTO `OrderCancelled`, with or without a new `CancelReason`. The
+        // invariant that EVERY `OrderCancelled` names an order that ACTUALLY RESTED is load-bearing:
+        // a downstream projector keys its open-order map on `OrderRested` and broke with "cancelled
+        // order not found" the last time an expiry was reported as a cancel. An IOC remainder never
+        // rested — there is no book entry, no `OrderRested`, nothing for a projector to remove — so
+        // it cannot go on that event. That invariant now has a runtime guard (`events.rs`,
+        // `rested_guard`), so re-merging them will fail tests rather than reach a projector.
+        //
+        // ── WHY EMIT IT AT ALL, GIVEN IT IS DERIVABLE ───────────────────────────────────────────
+        //
+        // It IS derivable: a consumer knows `tif`/`orderType` from `OrderPlaced` and can reason "an
+        // IOC never rests, so any unfilled remainder is dead". This is therefore not an information
+        // gap, and it is emitted anyway for three reasons.
+        //
+        // 1. THAT DERIVATION IS ENGINE POLICY, NOT ARITHMETIC. It hardcodes *which TIFs rest* into
+        //    every consumer. Add a TIF that rests conditionally and every one of them is silently
+        //    wrong — no error, just orders that never close.
+        // 2. ABSENCE IS A FRAGILE SIGNAL TO SCOPE. "No `OrderRested` followed this `OrderPlaced`"
+        //    requires knowing where the following-window ENDS. Inside a 64-item batch one
+        //    transaction carries dozens of interleaved order lifecycles; getting that window wrong
+        //    is invisible until it is wrong.
+        // 3. BINANCE EMITS IT EXPLICITLY, so without it the backend must SYNTHESISE the frame — and
+        //    thereby decide, off chain, the moment an order died. Measured (internal R15, mainnet):
+        //    the last fill still reports `PARTIALLY_FILLED`, and the terminal state arrives as a
+        //    separate, FILL-LESS frame with `l = 0` and `z` unchanged. The terminal frame is a
+        //    genuinely distinct event, not an annotation on the last fill — which is why this is an
+        //    event of its own and why it is emitted AFTER the last `Trade`.
+        //
+        // ── THE EXACT FIRING SET ────────────────────────────────────────────────────────────────
+        //
+        // Emitted iff the taker order's final status is `OrderStatus::Expired`, which
+        // `cancel_unfilled_remainder` is the ONLY producer of, and only when `remaining > 0`. It has
+        // exactly two call sites, so the firing set is exactly two paths:
+        //
+        // * `execute_limit_order`'s `TimeInForce::Ioc` branch — a partial fill, or no fill at all.
+        // * `execute_market_order` — same, plus the case where the price band stops the walk.
+        //
+        // NOT emitted for:
+        // * FOK — `ensure_fok_filled` returns `Err` on any remainder, so the whole order reverts and
+        //   there is no partially-filled FOK to report a remainder for.
+        // * GTC / PostOnly — a remainder RESTS (`OrderRested`), and if the rest is refused
+        //   `raise_rest_refusal` reverts the whole order. Neither reaches an expiry.
+        // * A FULLY FILLED order of any kind — no remainder, and its terminal state is already
+        //   unambiguous from `z == q`.
+        // * A resting order killed by the protocol (out-of-band sweep, liquidation, maker-cover) —
+        //   that IS a cancel of something that rested, and stays on `OrderCancelled` with its
+        //   `reason`.
+        event OrderExpired(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint64 filledQuantity, uint64 expiredQuantity);
+
         // Feeds: /trades, /historicalTrades, /aggTrades, /klines, /ticker/24hr, /myTrades
         // tradeId: global sequential counter for fromId pagination and firstId/lastId in 24hr ticker
         // takerFee / makerFee: USDC micro-units (6-decimal) charged to each side for this fill

@@ -181,21 +181,27 @@ pub(crate) fn emit_position_changed_at_mark<H: PerpHost>(
 // Non-PerpDEX logs are ignored entirely rather than treated as terminators: an indexer filters this
 // stream by address, so a foreign log cannot end a group it cannot see.
 
-/// Resets the group-invariant guard at a call boundary. Called by `storage::begin_perp_call`.
+/// Resets the streaming log guards at a call boundary. Called by `storage::begin_perp_call`.
 #[inline]
 pub(crate) fn reset_log_group_guard() {
     #[cfg(debug_assertions)]
-    group_guard::reset();
+    {
+        group_guard::reset();
+        rested_guard::reset();
+    }
 }
 
-/// Feeds one emitted log to the group-invariant guard. Called by both `PerpHost::log` impls.
+/// Feeds one emitted log to the streaming log guards. Called by both `PerpHost::log` impls.
 ///
 /// `_log` is deliberately underscored: with `debug_assertions` off this is an empty `#[inline]`
 /// function and the parameter is genuinely unused, which must not add a warning to a release build.
 #[inline]
 pub(crate) fn observe_log_for_group_invariant(_log: &Log) {
     #[cfg(debug_assertions)]
-    group_guard::observe(_log);
+    {
+        group_guard::observe(_log);
+        rested_guard::observe(_log);
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -257,6 +263,137 @@ mod group_guard {
             }
         } else {
             OPEN_GROUP.with(|g| g.set(None));
+        }
+    }
+}
+
+// ── THE `OrderCancelled` ⇒ PRIOR `OrderRested` INVARIANT (debug builds only) ─────────────────────
+//
+// EVERY `OrderCancelled` MUST NAME AN ORDER THAT ACTUALLY RESTED.
+//
+// A downstream projector keys its open-order map on `OrderRested` — that is the event that says "a
+// book entry exists" — and removes on `OrderCancelled`. So a cancel for an order that never rested
+// is a removal of a key that was never inserted, and the projector broke with exactly that:
+// "cancelled order not found". The cause was a TIF EXPIRY reported as a cancel (an IOC remainder
+// never rests), which is why expiries now have their own `OrderExpired` and why the two must never
+// be merged back. Until this guard there was NO test protecting the property, and it had already
+// been broken once in production.
+//
+// ## Why the check is per-CALL, and why that is COMPLETE rather than a compromise
+//
+// The property spans the whole chain: an order rests in one transaction and is cancelled in a later
+// block, so the `OrderRested` this cancel refers to is usually in a stream this process is not
+// looking at. A guard that simply remembered every id it ever saw rest would have to accumulate
+// without bound for the life of the thread, and would still be blind across restarts.
+//
+// It does not need to. Track, per call, which ids were BORN here (`OrderPlaced`) and which RESTED
+// here, and check only the intersection case:
+//
+// | emitted             | effect                                                        |
+// |---------------------|---------------------------------------------------------------|
+// | `OrderPlaced(id)`   | remember `id` as born in this call                            |
+// | `OrderRested(id)`   | remember `id` as rested                                       |
+// | `OrderCancelled(id)`| if `id` was born here and did NOT rest here → PANIC           |
+//
+// That is complete, because an order cancelled WITHOUT having been born in this call must have
+// rested in an earlier one:
+//
+// * a cancel is only reachable through a live order record or a live book entry — `cancel_order_core`
+//   rejects a missing record with "order not found", and the protocol cancel paths (out-of-band
+//   sweep, liquidation, maker-cover) walk the BOOK, which only `rest_in_book` writes to;
+// * an order that never rests is terminal in the call that created it (`Filled` or `Expired`) and
+//   delete-on-terminal removes its record, so it cannot be cancelled later.
+//
+// So "never rested AND cancelled" is only expressible inside the one call that placed the order —
+// which is exactly the window this guard watches. The bounded per-call form is not a weaker
+// approximation of the durable property; it is the only place the property can be violated.
+//
+// ## Why at the emit site rather than as a walk at the drain
+//
+// Same reason as the group invariant above, and the same choke point: hooking
+// [`crate::host::PerpHost::log`] covers every path on both host impls, including the several hundred
+// tests that drive an engine handler DIRECTLY and never open or close a call. A hand-attached helper
+// covers only the tests someone remembered to attach it to — and the paths most likely to get this
+// wrong (the expiry paths, the protocol cancels) are exactly the ones a reviewer would not think to
+// annotate.
+//
+// Not resetting between calls would be STRICTER, not looser (a larger born-set means more cancels
+// get checked, and the rested-set grows in lock-step), so the `begin_perp_call` reset is a
+// convenience for bounding memory, not a correctness requirement. A direct-handler test that never
+// opens a call therefore accumulates across the whole test and is checked throughout.
+//
+// ## Log truncation is not a hazard
+//
+// `checkpoint_revert` truncates a SUFFIX of the log vector. A surviving `OrderCancelled` keeps every
+// log emitted before it, so its `OrderRested` survives too; a reverted range can only leave this
+// guard holding ids for logs that no longer exist, which makes it more permissive, never wrong.
+#[cfg(debug_assertions)]
+mod rested_guard {
+    use alloy_sol_types::SolEvent;
+    use primitives::{Log, B256};
+
+    use crate::{interface::IPerpDex, PERP_DEX_ADDRESS};
+
+    std::thread_local! {
+        /// Order ids whose `OrderPlaced` was emitted in this call, and the subset that then rested.
+        /// Per LOG STREAM, and a log stream belongs to one transaction on one thread.
+        static SEEN: core::cell::RefCell<Seen> = core::cell::RefCell::new(Seen::default());
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        born: std::collections::BTreeSet<B256>,
+        rested: std::collections::BTreeSet<B256>,
+    }
+
+    pub(super) fn reset() {
+        SEEN.with(|s| {
+            let mut s = s.borrow_mut();
+            s.born.clear();
+            s.rested.clear();
+        });
+    }
+
+    pub(super) fn observe(log: &Log) {
+        if log.address != PERP_DEX_ADDRESS {
+            return;
+        }
+        let topics = log.data.topics();
+        let Some(topic0) = topics.first().copied() else {
+            return;
+        };
+
+        // ⚠️ THE ORDER-ID TOPIC INDEX IS NOT THE SAME ON ALL THREE EVENTS.
+        //   OrderPlaced / OrderRested: (user, marketId, orderId) -> topic[3]
+        //   OrderCancelled:            (user, orderId, marketId) -> topic[2]
+        // Reading the wrong slot would compare an order id against a market id and this guard would
+        // fire on everything, so the index is taken from each event's own declaration.
+        let topic = |i: usize| -> B256 {
+            *topics
+                .get(i)
+                .expect("the order events declare three indexed fields")
+        };
+
+        if topic0 == IPerpDex::OrderPlaced::SIGNATURE_HASH {
+            let id = topic(3);
+            SEEN.with(|s| s.borrow_mut().born.insert(id));
+        } else if topic0 == IPerpDex::OrderRested::SIGNATURE_HASH {
+            let id = topic(3);
+            SEEN.with(|s| s.borrow_mut().rested.insert(id));
+        } else if topic0 == IPerpDex::OrderCancelled::SIGNATURE_HASH {
+            let id = topic(2);
+            let violated = SEEN.with(|s| {
+                let s = s.borrow();
+                s.born.contains(&id) && !s.rested.contains(&id)
+            });
+            assert!(
+                !violated,
+                "OrderCancelled ⇒ prior OrderRested invariant: order {id} was PLACED in this call \
+                 and CANCELLED without ever having RESTED. A projector keys its open-order map on \
+                 OrderRested, so this is a removal of a key that was never inserted — it fails \
+                 downstream with \"cancelled order not found\". If this is a TIF expiry (an IOC or \
+                 market remainder, which never rests), it belongs on OrderExpired, NOT here."
+            );
         }
     }
 }
@@ -407,7 +544,8 @@ pub(crate) mod stream_test_support {
     pub(crate) fn stream_shape(logs: &[primitives::Log]) -> Vec<(&'static str, Option<Address>)> {
         use crate::interface::IPerpDex::{
             Adl, FundingRateComputed, InsuranceFundChanged, InsuranceFundDepleted, Liquidation,
-            MarkPriceUpdated, OrderCancelled, OrderPlaced, OrderRested, PositionMarginAdjusted,
+            MarkPriceUpdated, OrderCancelled, OrderExpired, OrderPlaced, OrderRested,
+            PositionMarginAdjusted,
         };
         logs.iter()
             .filter_map(|log| {
@@ -436,6 +574,8 @@ pub(crate) mod stream_test_support {
                     named("OrderRested")
                 } else if topic == OrderCancelled::SIGNATURE_HASH {
                     named("OrderCancelled")
+                } else if topic == OrderExpired::SIGNATURE_HASH {
+                    named("OrderExpired")
                 } else if topic == PositionMarginAdjusted::SIGNATURE_HASH {
                     named("PositionMarginAdjusted")
                 } else if topic == InsuranceFundChanged::SIGNATURE_HASH {
@@ -544,5 +684,192 @@ mod group_invariant_self_tests {
     #[should_panic(expected = "a duplicate")]
     fn a_zero_position_group_repeating_the_previous_payload_is_rejected() {
         assert_account_update_groups(&[header(X, 1), row(X), terminator(), header(X, 1)]);
+    }
+}
+
+/// Self-tests for the `OrderCancelled` ⇒ prior `OrderRested` guard.
+///
+/// These drive [`rested_guard::observe`] DIRECTLY with synthetic logs, because the property is
+/// about the guard's own decision procedure and a fixture that had to reach it through the matching
+/// engine could only express the shapes the engine currently produces — which is the opposite of
+/// what a regression guard needs to be pinned against.
+///
+/// The guard's coverage of the REAL streams is pinned separately and much more bluntly: reporting a
+/// TIF expiry as an `OrderCancelled` (the exact production regression) fails FIFTEEN tests across
+/// `trading::tests`, because the hook sits in `PerpHost::log` and therefore sees every path.
+#[cfg(all(test, debug_assertions))]
+mod rested_invariant_self_tests {
+    use alloy_primitives::IntoLogData;
+    use primitives::{address, Address, FixedBytes, Log};
+
+    use crate::{interface::IPerpDex, PERP_DEX_ADDRESS};
+
+    const X: Address = address!("1111111111111111111111111111111111111111");
+    /// Deliberately NOT 1, so a guard reading `OrderCancelled`'s order id out of the wrong topic
+    /// slot would pick up this market id instead and the reject cases below would stop failing.
+    const MARKET: u64 = 7;
+
+    fn id(n: u8) -> FixedBytes<32> {
+        let mut b = [0u8; 32];
+        b[31] = n;
+        FixedBytes(b)
+    }
+
+    fn placed(n: u8) -> Log {
+        Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::OrderPlaced {
+                user: X,
+                marketId: MARKET,
+                orderId: id(n),
+                side: 0,
+                price: 1,
+                quantity: 1,
+                orderType: 0,
+                tif: 0,
+                clientOrderId: FixedBytes::default(),
+            }
+            .to_log_data(),
+        }
+    }
+
+    fn rested(n: u8) -> Log {
+        Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::OrderRested {
+                user: X,
+                marketId: MARKET,
+                orderId: id(n),
+                side: 0,
+                price: 1,
+                quantity: 1,
+                tif: 0,
+                clientOrderId: FixedBytes::default(),
+                assumingPrice: 1,
+            }
+            .to_log_data(),
+        }
+    }
+
+    fn cancelled(n: u8) -> Log {
+        Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::OrderCancelled {
+                user: X,
+                orderId: id(n),
+                marketId: MARKET,
+                reason: 0,
+            }
+            .to_log_data(),
+        }
+    }
+
+    fn expired(n: u8) -> Log {
+        Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::OrderExpired {
+                user: X,
+                marketId: MARKET,
+                orderId: id(n),
+                filledQuantity: 0,
+                expiredQuantity: 1,
+            }
+            .to_log_data(),
+        }
+    }
+
+    /// Replay a stream through the guard exactly as `PerpHost::log` would.
+    fn feed(logs: &[Log]) {
+        super::rested_guard::reset();
+        for log in logs {
+            super::rested_guard::observe(log);
+        }
+    }
+
+    #[test]
+    fn a_placed_then_rested_order_may_be_cancelled() {
+        feed(&[placed(1), rested(1), cancelled(1)]);
+    }
+
+    /// The cross-call case, which is the overwhelming majority in production: a GTC placed in an
+    /// earlier block is cancelled here, so this call's stream contains the cancel and NOTHING else
+    /// about that order. It must be accepted — an order can only be in the book because it rested.
+    #[test]
+    fn a_cancel_of_an_order_not_placed_in_this_call_is_accepted() {
+        feed(&[cancelled(1)]);
+    }
+
+    /// A partial fill on placement still rests, so the cancel is legitimate even though the order
+    /// was born in this call.
+    #[test]
+    fn a_partially_filled_order_that_rested_may_be_cancelled() {
+        feed(&[placed(1), rested(1), cancelled(1)]);
+    }
+
+    /// Several lifecycles interleaved in one call (the batch shape): only the one that never rested
+    /// is a violation, and it is found among the others.
+    #[test]
+    #[should_panic(expected = "without ever having RESTED")]
+    fn the_one_unrested_cancel_in_a_batch_is_found() {
+        feed(&[
+            placed(1),
+            rested(1),
+            placed(2),
+            rested(2),
+            placed(3), // never rests
+            cancelled(1),
+            cancelled(3),
+        ]);
+    }
+
+    /// THE PRODUCTION REGRESSION: an order placed and cancelled in the same call with no rest in
+    /// between. This is the shape a TIF expiry took when it was reported as a cancel, and the shape
+    /// that broke a downstream projector with "cancelled order not found".
+    #[test]
+    #[should_panic(expected = "without ever having RESTED")]
+    fn placing_then_cancelling_without_resting_is_rejected() {
+        feed(&[placed(1), cancelled(1)]);
+    }
+
+    /// And the fix, which must be accepted: the same never-rested order reported as an EXPIRY.
+    /// `OrderExpired` carries no claim that a book entry existed, so it is not the projector's
+    /// removal path and the guard does not police it.
+    #[test]
+    fn reporting_the_same_unrested_order_as_expired_is_accepted() {
+        feed(&[placed(1), expired(1)]);
+    }
+
+    /// Resting a DIFFERENT order does not license the cancel — the guard keys on the id, so it
+    /// cannot be satisfied by an unrelated rest earlier in the stream.
+    #[test]
+    #[should_panic(expected = "without ever having RESTED")]
+    fn a_rest_of_another_order_does_not_license_the_cancel() {
+        feed(&[placed(1), placed(2), rested(2), cancelled(1)]);
+    }
+
+    /// Order matters: a rest AFTER the cancel is not a prior rest.
+    #[test]
+    #[should_panic(expected = "without ever having RESTED")]
+    fn a_rest_after_the_cancel_does_not_count() {
+        feed(&[placed(1), cancelled(1), rested(1)]);
+    }
+
+    /// The reset really does clear both sets, so a call boundary cannot leave a stale `born` entry
+    /// that makes the NEXT call's legitimate cross-call cancel fail.
+    #[test]
+    fn the_call_boundary_reset_clears_the_born_set() {
+        feed(&[placed(1)]); // born, never rested — a violation is now one cancel away
+        feed(&[cancelled(1)]); // ...but `feed` resets first, so this is a cross-call cancel
+    }
+
+    /// Foreign logs are ignored entirely, so another contract's event cannot be mistaken for one of
+    /// ours on the strength of a colliding topic0.
+    #[test]
+    fn logs_from_another_address_are_ignored() {
+        let mut foreign = placed(1);
+        foreign.address = X;
+        let mut foreign_cancel = cancelled(1);
+        foreign_cancel.address = X;
+        feed(&[foreign, foreign_cancel]);
     }
 }

@@ -990,6 +990,44 @@ fn place_order_core<H: PerpHost>(
     // other apply site — an IOC/market order that expired against an empty book matches nothing and
     // rests nothing, yet legitimately emits OrderPlaced. No-op when an apply already flushed it.
     emit_pending_order_placed(context, &mut pending);
+    // ── THE TIF EXPIRY'S TERMINAL EVENT ──────────────────────────────────────────────────────────
+    // `OrderStatus::Expired` is set in exactly one place (`cancel_unfilled_remainder`, and only when
+    // `remaining > 0`), so testing the FINAL STATUS here is the same predicate as "an IOC or market
+    // order discarded a remainder" — without re-deriving which TIFs rest, which is precisely the
+    // reasoning this event exists to stop a CONSUMER from having to do. FOK reverts instead
+    // (`ensure_fok_filled`), a refused GTC rest reverts (`raise_rest_refusal`), and a full fill has
+    // no remainder, so none of them land here.
+    //
+    // ⚠️ THIS SITE, NOT THE TWO `cancel_unfilled_remainder` CALL SITES. Both of those sit before the
+    // `emit_pending_order_placed` fallback above, and an IOC that matches NOTHING reaches no other
+    // apply site — so emitting there would put the terminal event BEFORE this order's own
+    // `OrderPlaced`. Here it is after `OrderPlaced` and after every `Trade` the match flushed, which
+    // is also the measured Binance frame order (R15: the last fill still says `PARTIALLY_FILLED`,
+    // the terminal state arrives as a separate fill-less frame).
+    //
+    // It is emitted BEFORE the persist below only because the persist is a delete; nothing here
+    // reads the store.
+    if taker_order.status == OrderStatus::Expired {
+        // Derived from the two quantities the order itself carries, so `filled + expired == quantity`
+        // holds by construction rather than by a second count of the `Trade` logs.
+        let expired_quantity = taker_order.quantity.saturating_sub(taker_order.filled);
+        debug_assert!(
+            expired_quantity > 0,
+            "Expired implies a discarded remainder: cancel_unfilled_remainder sets this status \
+             only when remaining > 0"
+        );
+        context.log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::OrderExpired {
+                user: account,
+                marketId: market_id,
+                orderId: FixedBytes(order_id),
+                filledQuantity: taker_order.filled,
+                expiredQuantity: expired_quantity,
+            }
+            .to_log_data(),
+        });
+    }
     // Single final persist of the taker order. delete-on-terminal: a Filled/Expired taker leaves
     // NO record (it fully filled or its IOC/FOK/market remainder expired — never resting); an
     // Open/PartiallyFilled taker rested, so it is saved live (its book entry / level FIFO / live
