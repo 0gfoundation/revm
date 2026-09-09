@@ -39,6 +39,16 @@ struct RecordedFill {
     price: u64,
     quantity: u64,
     taker_side: Side,
+    /// OUTPUT, not input: this fill's share of the taker's close PnL, written by
+    /// [`finalize_core`]'s apportionment and read by
+    /// [`MatchRegistry::backfill_taker_realized_pnl`] to fill in `Trade.takerRealizedPnl`.
+    ///
+    /// It lives on the recorded fill rather than in a returned `Vec<i64>` so the apportionment
+    /// costs ZERO extra allocation — this vector already exists, one slot per fill.
+    ///
+    /// `0` until `finalize_core` runs, and legitimately `0` afterwards for any fill whose leg was
+    /// purely opening (see the apportionment note).
+    realized_pnl: i64,
 }
 
 impl TakerSettlement {
@@ -103,6 +113,8 @@ impl TakerSettlement {
             price: fill_price,
             quantity: fill_qty,
             taker_side,
+            // Apportioned later, in `finalize_core` — nothing here knows the entry basis yet.
+            realized_pnl: 0,
         });
         Ok(())
     }
@@ -169,7 +181,7 @@ impl TakerSettlement {
     /// whose exact cost is already in hand, and on Binance the uplift is not even escrowed on this
     /// path (§3.8 「过闸即消失」).
     pub(super) fn finalize_compute<H: PerpHost>(
-        self,
+        mut self,
         context: &mut H,
         reg: &mut MatchRegistry,
         taker_side: Side,
@@ -208,12 +220,20 @@ impl TakerSettlement {
         let core = finalize_core(
             &mut w.pos,
             &mut w.account,
-            &self.fills,
+            &mut self.fills,
             taker_side,
             mark,
             self.taker_fee_bps,
             market,
         )?;
+
+        // `finalize_core` has apportioned each fill's share of the taker's close PnL; stamp it onto
+        // the `Trade` rows the walk queued with a `0` placeholder. Done HERE, at the first point
+        // where both the apportionment and the event queue are in hand, and still comfortably
+        // before `apply` replays the queue. `w` is re-borrowed below because this needs `reg`
+        // whole.
+        reg.backfill_taker_realized_pnl(&self.fills)?;
+        let w = &mut reg.users[i].1;
 
         // ── Derived-ooIM gate for the FILLS, and the basis the REST will be decided against ──
         // `core.total_required` (real cash — the opening margin plus the part of the fee margin
@@ -641,6 +661,16 @@ pub(super) enum MatchEvent {
         taker_side: Side,
         taker_fee: u64,
         maker_fee: u64,
+        /// This fill's share of the TAKER's close PnL (`Trade.takerRealizedPnl`).
+        ///
+        /// ⚠️ Pushed as a PLACEHOLDER `0` by the walk and backfilled later by
+        /// [`MatchRegistry::backfill_taker_realized_pnl`]. It cannot be known at push time: the
+        /// taker settles ONCE for the whole order, in `finalize_core`, after the walk has ended.
+        /// The maker's is known immediately (it settles per fill) and is filled in at push time.
+        taker_realized_pnl: i64,
+        /// This fill's MAKER close PnL (`Trade.makerRealizedPnl`) — verbatim from this fill's own
+        /// `settle_maker_fill_registry`, not apportioned.
+        maker_realized_pnl: i64,
     },
     /// Writes a level blob: its FIFO `queue` (ids) AND the post-walk LIVE `count` (Obs-1 merge —
     /// count lives in the level blob, so one event, not a separate SaveCount). `count == 0` deletes
@@ -700,6 +730,49 @@ impl MatchRegistry {
 
     pub(super) fn push_event(&mut self, e: MatchEvent) {
         self.events.push(e);
+    }
+
+    /// Stamps the apportioned `Trade.takerRealizedPnl` onto the `Trade` events the walk already
+    /// queued with a `0` placeholder.
+    ///
+    /// The walk cannot fill it in: the taker settles once, in [`finalize_core`], after the last
+    /// fill. So the events are pushed incomplete and completed here, which is safe because NOTHING
+    /// has been emitted yet — the queue is only replayed by [`Self::apply`], strictly after
+    /// `finalize_compute` (and if the taker is refused, the queue is dropped unemitted).
+    ///
+    /// PAIRING. The k-th queued `Trade` is the k-th recorded fill, by two facts that must hold
+    /// together:
+    ///
+    /// 1. The registry is created FRESH per `match_order` call (`trading::mod.rs`), so every
+    ///    `Trade` in this queue belongs to this one taker order. There is no need — and no way —
+    ///    to filter by `taker_order_id`.
+    /// 2. Both walks call `taker_settlement.record_fill` IMMEDIATELY before pushing the fill's
+    ///    `Trade`, with no early exit between them, so the two sequences advance in lockstep. A
+    ///    K9-rejected maker `continue`s BEFORE both, so it perturbs neither.
+    ///
+    /// Both are load-bearing, so the count mismatch is a hard invariant error rather than a
+    /// silent truncation: if a future walk ever pushes a `Trade` without recording a fill (or the
+    /// registry is hoisted to span several orders), this fails loudly instead of shifting every
+    /// subsequent fill's PnL onto the wrong trade.
+    fn backfill_taker_realized_pnl(&mut self, fills: &[RecordedFill]) -> Result<(), PerpError> {
+        let mut fills = fills.iter();
+        for e in &mut self.events {
+            if let MatchEvent::Trade {
+                taker_realized_pnl, ..
+            } = e
+            {
+                let fill = fills.next().ok_or_else(|| {
+                    perp_invariant_err("more queued Trade events than recorded taker fills")
+                })?;
+                *taker_realized_pnl = fill.realized_pnl;
+            }
+        }
+        if fills.next().is_some() {
+            return Err(perp_invariant_err(
+                "fewer queued Trade events than recorded taker fills",
+            ));
+        }
+        Ok(())
     }
 
     /// Records ONE `AccountBalanceChanged` for a maker that has just been filled, derived from that
@@ -997,6 +1070,8 @@ impl MatchRegistry {
                     taker_side,
                     taker_fee,
                     maker_fee,
+                    taker_realized_pnl,
+                    maker_realized_pnl,
                 } => {
                     let trade_id = storage::next_trade_id(context, market_id)?;
                     context.log(Log {
@@ -1013,6 +1088,8 @@ impl MatchRegistry {
                             takerSide: taker_side as u8,
                             takerFee: taker_fee,
                             makerFee: maker_fee,
+                            takerRealizedPnl: taker_realized_pnl,
+                            makerRealizedPnl: maker_realized_pnl,
                         }
                         .to_log_data(),
                     });
@@ -1286,7 +1363,7 @@ pub(super) struct TakerFillCore {
 fn finalize_core(
     pos: &mut crate::types::PerpPosition,
     account: &mut crate::types::UserAccount,
-    fills: &[RecordedFill],
+    fills: &mut [RecordedFill],
     taker_side: Side,
     mark_price: u64,
     taker_fee_bps: u64,
@@ -1299,7 +1376,53 @@ fn finalize_core(
     let mut opening_value = 0u64;
     let is_buy = taker_side == Side::Buy;
 
-    for fill in fills {
+    // ── Per-fill realized-PnL apportionment, for `Trade.takerRealizedPnl` (LOGGING ONLY) ────────
+    //
+    // The taker settles ONCE, below, on the summed legs: `apply_position_fill` is the only thing
+    // that mutates state and it sees only the totals. But the `@order` stream's `o.rp` is a
+    // PER-FILL figure (measured Binance, internal R15: apportioned per fill, never accumulated
+    // onto the last one), so the aggregate has to be split N ways. These two lines are the entry
+    // basis that split is taken against.
+    //
+    // ⚠️⚠️ THE SPLIT IS BY TELESCOPING DIFFERENCES OF THE AGGREGATE FORMULA. DO NOT "SIMPLIFY" IT
+    // INTO AN INDEPENDENT PER-FILL COMPUTATION. ⚠️⚠️
+    //
+    // `apply_position_fill`'s closing leg is, for a position of `pos_abs` at basis `vq`:
+    //
+    //     remaining_qty = pos_abs − closing_qty
+    //     remaining_vq  = vq × remaining_qty / pos_abs        ← ONE truncating division
+    //     vq_fraction   = vq − remaining_vq
+    //     realized_pnl  = vq_fraction + (is_buy ? −closing_value : +closing_value)
+    //
+    // We walk `remaining_closing_qty` down fill by fill and evaluate `remaining_vq` at each step
+    // AGAINST THE ORIGINAL `pos_abs`, then take successive differences:
+    //
+    //     fill 1: rem_q₁ = pos_abs − q₁   rem_vq₁ = vq × rem_q₁ / pos_abs   vqf₁ = vq      − rem_vq₁
+    //     fill 2: rem_q₂ = rem_q₁  − q₂   rem_vq₂ = vq × rem_q₂ / pos_abs   vqf₂ = rem_vq₁ − rem_vq₂
+    //     …
+    //     Σ vqf = vq − rem_vqₙ  ≡  the aggregate `vq_fraction`
+    //
+    // Every intermediate `rem_vq` term is shared VERBATIM by two adjacent steps, so the sum
+    // telescopes to the aggregate with ZERO RESIDUAL no matter how any individual division
+    // truncates — the cancellation is exact because it is literally the same value subtracted and
+    // added back, not two roundings that happen to agree. Computing each fill's PnL independently
+    // (its own `vq × q_k / pos_abs`) would re-floor N times, and the N floors would NOT sum to the
+    // aggregate's single floor: that is precisely the ±1 phantom mint/burn class this repo has
+    // already been bitten by, and exactly what the "floor the WHOLE matched quantity ONCE" comment
+    // in the loop below is warning about for the closing/opening split. Same technique, same
+    // reason, as the slice form in `math::maintenance_margin`.
+    //
+    // The cash leg needs nothing: the loop already accumulates `closing_value` from the same
+    // `fill_closing_value` terms, so `Σ fill_closing_value == closing_value` by construction.
+    //
+    // `pos` is NOT mutated by this loop (only read, for `pos.amount`'s sign and size) — the sole
+    // mutation is `apply_position_fill` after it. So every closing leg is priced off the ONE
+    // pre-order basis they all genuinely share, which is what makes the telescoping legitimate.
+    let pos_abs = pos.amount.unsigned_abs();
+    let entry_vq = pos.v_quote_balance as i128;
+    let mut prev_remaining_vq = entry_vq;
+
+    for fill in fills.iter_mut() {
         if fill.taker_side != taker_side {
             return Err(perp_invariant_err("taker settlement mixed fill sides"));
         }
@@ -1341,6 +1464,36 @@ fn finalize_core(
         opening_value = opening_value
             .checked_add(fill_opening_value)
             .ok_or_else(|| perp_err("placeOrder: opening value overflow"))?;
+
+        // ── This fill's step of the telescoping split (see the note above the loop) ─────────────
+        //
+        // `remaining_closing_qty` has ALREADY been decremented by this fill's closing leg, so it
+        // is `rem_qₖ`. Evaluate the aggregate's `remaining_vq` at it — against the ORIGINAL
+        // `pos_abs`, never against a running position — and difference against the previous step.
+        //
+        // `pos_abs == 0` is a flat position: no fill can close (the `fill_closing_qty` test above
+        // is false for `pos.amount == 0`), the aggregate skips its closing leg entirely, and the
+        // division would be by zero. So every fill's share is 0, which is also what the formula
+        // would say.
+        //
+        // A purely OPENING leg falls out as 0 for free and needs no special case:
+        // `fill_closing_qty == 0` leaves `remaining_closing_qty` untouched, so `remaining_vq` is
+        // bit-identical to `prev_remaining_vq`, `vq_fraction` is 0, and `fill_closing_value` is 0.
+        // That is the flip behaviour R15 measured — `rp` covers only the closing leg.
+        fill.realized_pnl = if pos_abs == 0 {
+            0
+        } else {
+            let remaining_vq = entry_vq * remaining_closing_qty as i128 / pos_abs as i128;
+            let vq_fraction = prev_remaining_vq - remaining_vq;
+            prev_remaining_vq = remaining_vq;
+            let fill_close_quote_delta = if is_buy {
+                -(fill_closing_value as i128)
+            } else {
+                fill_closing_value as i128
+            };
+            i64::try_from(vq_fraction + fill_close_quote_delta)
+                .map_err(|_| perp_err("settlement: per-fill realized PnL exceeds i64 range"))?
+        };
     }
 
     let fill_outcome = apply_position_fill(
@@ -1357,6 +1510,25 @@ fn finalize_core(
         // here would silently short-fund a taker the gate already vouched for.
         OpeningMarginFunding::Requirement,
     )?;
+
+    // ── THE PROOF THAT THE APPORTIONMENT IS EXACT ───────────────────────────────────────────────
+    //
+    // The per-fill values are DERIVED FOR LOGGING ONLY; the call above is the sole mutation of
+    // state and it saw only the totals. This assertion is what pins the two together: the split
+    // must sum to the very number that moved the money, with no residual. It is the runtime
+    // statement of the telescoping argument above — if someone rewrites the split as an
+    // independent per-fill computation, the re-flooring shows up here rather than as a ±1 drift in
+    // a consumer's `cr` weeks later.
+    //
+    // Deliberately on the PRODUCTION taker path, not in a test: it then runs under every debug
+    // build — the whole test suite, and every dev/devnet node — against real traffic, instead of
+    // only the fill shapes a test author thought of. `debug_assert_eq!` puts both the comparison
+    // and the fold behind `cfg(debug_assertions)`, so a release node pays nothing for it.
+    debug_assert_eq!(
+        fills.iter().map(|f| f.realized_pnl as i128).sum::<i128>(),
+        fill_outcome.realized_pnl as i128,
+        "per-fill realized PnL must telescope EXACTLY to the aggregate that mutated state"
+    );
 
     // ── Trading fee: charged from the margin this fill just funded (Binance parity) ──
     // Computed HERE, before K9, because the fee must have LEFT the position margin by the time

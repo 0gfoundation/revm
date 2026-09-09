@@ -3456,6 +3456,447 @@ fn maker_close_emits_fill_realized_pnl() {
     assert_eq!(maker_change.closedQuantity, QTY);
 }
 
+// ── `Trade.takerRealizedPnl` / `Trade.makerRealizedPnl` — the `@order` stream's `o.rp` ──────────
+//
+// See the ABI note on `Trade` in `crate::interface` for what these fields are and why they are on
+// this event. What the tests below pin is the arithmetic:
+//
+//   * the TAKER's aggregate is split N ways by telescoping differences and the split has ZERO
+//     residual — on a fixture where the naive independent-per-fill split would be off by +1;
+//   * the acceptance identity `Δwb == rp − n`, at the granularity each side actually publishes:
+//     PER FILL for the maker (one account group per fill), PER ORDER for the taker (one group per
+//     order), measured on the GROSS wallet `wb = cross + Σ isolatedWallet` so margin moving
+//     cross→silo is invisible to it and only money entering/leaving the account moves it;
+//   * the flip case, where the opening legs must report 0;
+//   * the insolvent case, where the identity acquires its ONE correction term.
+
+/// Every `Trade` in `logs`, in emission order.
+///
+/// Takes a SNAPSHOT rather than draining the journal, because these tests need the `Trade` rows and
+/// the `PositionChanged` rows of the SAME call — `take_logs` empties the buffer, so calling two
+/// draining helpers in a row silently hands the second an empty stream.
+fn decode_trades(logs: &[primitives::Log]) -> Vec<crate::interface::IPerpDex::Trade> {
+    logs.iter()
+        .filter(|log| {
+            log.data.topics().first() == Some(&crate::interface::IPerpDex::Trade::SIGNATURE_HASH)
+        })
+        .map(|log| {
+            crate::interface::IPerpDex::Trade::decode_raw_log(log.data.topics(), &log.data.data)
+                .unwrap()
+        })
+        .collect()
+}
+
+/// `PositionChanged` counterpart of [`decode_trades`], over the same snapshot.
+fn decode_position_changes(
+    logs: &[primitives::Log],
+) -> Vec<crate::interface::IPerpDex::PositionChanged> {
+    logs.iter()
+        .filter(|log| {
+            log.data.topics().first()
+                == Some(&crate::interface::IPerpDex::PositionChanged::SIGNATURE_HASH)
+        })
+        .map(|log| {
+            crate::interface::IPerpDex::PositionChanged::decode_raw_log(
+                log.data.topics(),
+                &log.data.data,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// `AccountBalanceChanged.totalWalletBalance` for `user`, re-derived from RAW STORED STATE rather
+/// than read off an event: Binance's `wb`, the GROSS perp wallet, `cross + Σ isolatedWallet`.
+///
+/// Single-market tests only — `Σ isolatedWallet` is this market's `pos.margin`. The callers below
+/// cross-check it against the emitted event, so a divergence between this and the real producer
+/// (`margin_view::index_account_wallet_balances`) cannot hide.
+fn wb(ctx: &mut TestCtx, user: Address) -> i64 {
+    storage::load_account(ctx, user)
+        .unwrap()
+        .perp_wallet_balance
+        + storage::load_position(ctx, user, MARKET_ID).unwrap().margin
+}
+
+/// THE APPORTIONMENT, on a fixture built so that the division actually truncates.
+///
+/// ALICE is long 3 lots at a NON-UNIFORM basis — `v_quote_balance = −3_010_000` over
+/// `pos_abs = 3_000_000`, i.e. `−1_003_333.33…` per lot — and closes all three in one market sell
+/// that sweeps three separate resting bids at $102 / $101 / $100.
+///
+/// That basis is the whole point: `vq / pos_abs` is not an integer, so `vq × rem_q / pos_abs`
+/// genuinely floors at every step, and the naive split (each fill computing its own
+/// `vq × q_k / pos_abs`) floors THREE TIMES to a sum that is +1 away from the aggregate. This
+/// fixture therefore DISCRIMINATES between the two implementations rather than merely agreeing
+/// with both — the test asserts that explicitly below, so a later edit that makes the fixture
+/// uniform (and the residual vacuously zero) fails here.
+#[test]
+fn trade_apportions_taker_realized_pnl_by_telescoping_with_zero_residual() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    fund(&mut ctx, CAROL, WALLET);
+
+    // 10 bps taker / 5 bps maker, so the `n` in `Δwb == rp − n` is a real number and not 0.
+    // Maker rates are snapshotted onto the order entry AT PLACEMENT, so they must be set before
+    // the resting orders go in.
+    storage::save_user_fee_rates(
+        &mut ctx,
+        ALICE,
+        UserFeeRates {
+            maker_fee_bps: 0,
+            taker_fee_bps: 10,
+        },
+    )
+    .unwrap();
+    for maker in [BOB, CAROL] {
+        storage::save_user_fee_rates(
+            &mut ctx,
+            maker,
+            UserFeeRates {
+                maker_fee_bps: 5,
+                taker_fee_bps: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    // ALICE: long 3 lots at an average basis of $100.333…, which is what makes the division bite.
+    let alice_vq: i64 = -3_010_000;
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: 3 * QTY as i64,
+            v_quote_balance: alice_vq,
+            margin: -alice_vq,
+            leverage: 1,
+            ..PerpPosition::default()
+        },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+    // BOB short 2 lots, CAROL short 1, both entered at exactly $100 — so their closes are the
+    // simple leg and ALICE's is the one carrying the awkward basis.
+    storage::save_position(
+        &mut ctx,
+        BOB,
+        MARKET_ID,
+        &PerpPosition {
+            amount: -(2 * QTY as i64),
+            v_quote_balance: 2 * FILL_VALUE as i64,
+            margin: 2 * FILL_VALUE as i64,
+            leverage: 1,
+            ..PerpPosition::default()
+        },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+    storage::save_position(
+        &mut ctx,
+        CAROL,
+        MARKET_ID,
+        &PerpPosition {
+            amount: -(QTY as i64),
+            v_quote_balance: FILL_VALUE as i64,
+            margin: FILL_VALUE as i64,
+            leverage: 1,
+            ..PerpPosition::default()
+        },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+
+    // Three resting bids. A sell taker takes the HIGHEST bid first, so the fill order is
+    // $102 (BOB) → $101 (CAROL) → $100 (BOB). BOB deliberately takes TWO of the three fills: his
+    // two account groups must each move by their OWN fill, which is what "per fill, not
+    // accumulated onto the last one" means on the maker side.
+    place(&mut ctx, BOB, 0, PRICE + 2 * TICK, QTY, 0, 0);
+    place(&mut ctx, CAROL, 0, PRICE + TICK, QTY, 0, 0);
+    place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let wb_before: Vec<(Address, i64)> = [ALICE, BOB, CAROL]
+        .into_iter()
+        .map(|u| (u, wb(&mut ctx, u)))
+        .collect();
+
+    place(&mut ctx, ALICE, 1, 0, 3 * QTY, 1, 1); // market sell 3 lots
+    end_call(&mut ctx);
+
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    let trades = decode_trades(&logs);
+    assert_eq!(trades.len(), 3, "the fixture must produce exactly 3 fills");
+    assert_eq!(
+        trades.iter().map(|t| t.price).collect::<Vec<_>>(),
+        vec![PRICE + 2 * TICK, PRICE + TICK, PRICE],
+        "sell taker sweeps the book from the top"
+    );
+
+    // ── The taker split, value by value ───────────────────────────────────────────────────────
+    //
+    //   pos_abs = 3_000_000   vq = −3_010_000
+    //   fill 1: rem_q = 2_000_000  rem_vq = −2_006_666  vqf = −1_003_334  +1_020_000 →  16_666
+    //   fill 2: rem_q = 1_000_000  rem_vq = −1_003_333  vqf = −1_003_333  +1_010_000 →   6_667
+    //   fill 3: rem_q =         0  rem_vq =         0   vqf = −1_003_333  +1_000_000 →  −3_333
+    //                                                                          Σ  =    20_000
+    //
+    // Note fill 1's `vqf` is −1_003_334 while fills 2 and 3 are −1_003_333: the telescoping puts
+    // the odd unit on ONE fill instead of losing it. That asymmetry IS the fix.
+    assert_eq!(
+        trades
+            .iter()
+            .map(|t| t.takerRealizedPnl)
+            .collect::<Vec<_>>(),
+        vec![16_666, 6_667, -3_333],
+    );
+    let taker_rp_sum: i64 = trades.iter().map(|t| t.takerRealizedPnl).sum();
+
+    // ZERO RESIDUAL against the number that actually mutated state. `PositionChanged.realizedPnl`
+    // is emitted from the aggregate `apply_position_fill` return, so this is the split measured
+    // against the mutation, not against a second copy of the split.
+    let position_changes = decode_position_changes(&logs);
+    let taker_change = position_changes
+        .iter()
+        .find(|c| c.user == ALICE)
+        .expect("taker PositionChanged");
+    assert_eq!(taker_change.realizedPnl, 20_000);
+    assert_eq!(
+        taker_rp_sum, taker_change.realizedPnl,
+        "Σ per-fill takerRealizedPnl must equal the aggregate that moved the money, EXACTLY"
+    );
+
+    // ── The fixture really does discriminate ──────────────────────────────────────────────────
+    //
+    // What an independent per-fill computation would have produced: each fill floors its own
+    // `vq × q_k / pos_abs` = −1_003_333.33… → −1_003_333, so the three floors sum to −3_009_999
+    // instead of −3_010_000 and the reported PnL totals 20_001 — a +1 phantom MINT. If this ever
+    // stops differing from the aggregate, the fixture has gone uniform and the test above has
+    // become vacuous.
+    let naive_sum: i64 = trades
+        .iter()
+        .map(|t| {
+            let vqf = alice_vq as i128 * QTY as i128 / (3 * QTY) as i128;
+            let closing_value = t.price as i128 / 100_000; // calc_value(price, QTY, 8, 9)
+            (vqf + closing_value) as i64
+        })
+        .sum();
+    assert_eq!(naive_sum, 20_001, "the naive split's value, for the record");
+    assert_ne!(
+        naive_sum, taker_change.realizedPnl,
+        "fixture no longer discriminates telescoping from independent flooring"
+    );
+
+    // ── `Δwb == Σrp − Σn` for the TAKER, at ORDER granularity ─────────────────────────────────
+    //
+    // The taker publishes ONE account group per order, so the order-level form is the only one its
+    // stream can state. (The per-fill split is covered by the equality above and by the
+    // `debug_assert` inside `finalize_core`, which is live in this very test run.)
+    let alice_before = wb_before.iter().find(|(u, _)| *u == ALICE).unwrap().1;
+    let taker_fee_sum: i64 = trades.iter().map(|t| t.takerFee as i64).sum();
+    assert_eq!(taker_fee_sum, 3_030, "10 bps on 3_030_000 of notional");
+    assert_eq!(
+        wb(&mut ctx, ALICE) - alice_before,
+        taker_rp_sum - taker_fee_sum,
+        "taker: Δwb == Σrp − Σn"
+    );
+
+    // ── `Δwb == rp − n` for the MAKERS, at FILL granularity ───────────────────────────────────
+    //
+    // Each maker settles once per fill, so this is the per-fill statement the brief calls for.
+    // CAROL has one fill, so her call-level delta IS her fill-level delta. BOB has two, and they
+    // are checked as a pair against the sum of his two fills — his intermediate after-image is
+    // pinned separately, below, so "his two fills" is not being allowed to hide a mis-split.
+    for maker in [BOB, CAROL] {
+        let before = wb_before.iter().find(|(u, _)| *u == maker).unwrap().1;
+        let rp: i64 = trades
+            .iter()
+            .filter(|t| t.maker == maker)
+            .map(|t| t.makerRealizedPnl)
+            .sum();
+        let n: i64 = trades
+            .iter()
+            .filter(|t| t.maker == maker)
+            .map(|t| t.makerFee as i64)
+            .sum();
+        assert_eq!(
+            wb(&mut ctx, maker) - before,
+            rp - n,
+            "maker {maker:?}: Δwb == Σ(rp − n) over its fills"
+        );
+    }
+
+    // The individual per-fill maker values, so the sum above cannot pass on a compensating error.
+    // BOB closes 1 of 2 lots at $102 (basis $100) → −20_000, then his last lot at $100 → exactly 0.
+    // CAROL closes her only lot at $101 → −10_000.
+    assert_eq!(
+        trades
+            .iter()
+            .map(|t| (t.maker, t.makerRealizedPnl, t.makerFee))
+            .collect::<Vec<_>>(),
+        vec![(BOB, -20_000, 510), (CAROL, -10_000, 505), (BOB, 0, 500)],
+    );
+
+    // Each fill's `makerRealizedPnl` is the SAME number as that fill's maker `PositionChanged`
+    // (the maker settles per fill, so no apportionment is involved on that side — this is the
+    // plumbing check).
+    let maker_rps: Vec<i64> = position_changes
+        .iter()
+        .filter(|c| c.user != ALICE)
+        .map(|c| c.realizedPnl)
+        .collect();
+    assert_eq!(maker_rps, vec![-20_000, -10_000, 0]);
+}
+
+/// A FLIP: the closing legs earn `rp`, the opening legs report exactly 0 — matching R15's
+/// "`rp` covers only the closing leg". This is the case that would break if the apportionment
+/// walked a running position instead of `remaining_closing_qty` against the original `pos_abs`.
+#[test]
+fn trade_taker_realized_pnl_is_zero_on_the_opening_legs_of_a_flip() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    fund(&mut ctx, CAROL, WALLET);
+
+    // ALICE is long 1 lot and sells 3 — one lot closes, two open a short.
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -(FILL_VALUE as i64),
+            margin: FILL_VALUE as i64,
+            leverage: 1,
+            ..PerpPosition::default()
+        },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+
+    // Three bids, one lot each, so the closing leg is fill 1 and fills 2-3 are pure opens.
+    place(&mut ctx, BOB, 0, PRICE + 2 * TICK, QTY, 0, 0);
+    place(&mut ctx, CAROL, 0, PRICE + TICK, QTY, 0, 0);
+    place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    place(&mut ctx, ALICE, 1, 0, 3 * QTY, 1, 1);
+    end_call(&mut ctx);
+
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    let trades = decode_trades(&logs);
+    assert_eq!(trades.len(), 3);
+    // Fill 1 closes the long at $102 against a $100 basis → +20_000. Fills 2 and 3 open the new
+    // short and realise NOTHING, even though they trade at prices that would show a "profit"
+    // against the old basis if the apportionment had let the entry basis follow the position.
+    assert_eq!(
+        trades
+            .iter()
+            .map(|t| t.takerRealizedPnl)
+            .collect::<Vec<_>>(),
+        vec![20_000, 0, 0],
+    );
+    let position_changes = decode_position_changes(&logs);
+    let taker_change = position_changes.iter().find(|c| c.user == ALICE).unwrap();
+    assert_eq!(taker_change.realizedPnl, 20_000);
+    assert_eq!(taker_change.closedQuantity, QTY);
+    assert_eq!(
+        trades.iter().map(|t| t.takerRealizedPnl).sum::<i64>(),
+        taker_change.realizedPnl,
+    );
+    // The makers were all flat and are pure opens: no `rp` on their side either.
+    assert!(trades.iter().all(|t| t.makerRealizedPnl == 0));
+}
+
+/// AN INSOLVENT CLOSE — the one case where `Δwb == rp − n` does NOT hold, and the correct
+/// statement.
+///
+/// The identity was written here with NO exemption first, and this is what the engine said: it
+/// fails, and it fails by EXACTLY the bad debt. The reason is structural rather than a rounding
+/// artefact. `rp` is the GROSS close PnL; `wb` is money actually in the account. Under isolated
+/// margin a realized loss can only be paid out of the closed slice's own collateral — never the
+/// wallet, never another position (`apply_position_fill`'s insolvent branch) — so the part of the
+/// loss that exceeds that collateral never leaves `wb` at all. It leaves the INSURANCE FUND. So:
+///
+/// ```text
+///     Δwb == rp − n + bad_debt
+/// ```
+///
+/// with `bad_debt == 0` on every solvent fill, which is why R15 measured the plain form 10/10 on
+/// mainnet: its sample contained no insolvent close. The plain identity is therefore correct as an
+/// acceptance test for solvent flow and must NOT be applied blind — a backend reconciling `wb`
+/// against `Σ rp` has to source the correction.
+///
+/// ⚠️ AND IT CANNOT SOURCE IT FROM `Trade`. Bad debt is not on this event, and the insurance-fund
+/// events that carry it (`InsuranceFundChanged`, `InsuranceFundDepleted`) name NO user — so a
+/// per-account `wb` reconciliation cannot attribute the correction from the log stream today. That
+/// is a REAL remaining gap in the `@order`/`ACCOUNT_UPDATE` reconstruction, but it is a different
+/// field on a different event and is deliberately NOT fixed here; it is recorded rather than
+/// papered over. (Binance has the same shape: the shortfall shows up as a separate
+/// `INSURANCE_CLEAR` income row, not as an adjustment to `rp`.)
+#[test]
+fn insolvent_close_breaks_the_wallet_identity_by_exactly_the_bad_debt() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    // Fund the IF so the bad debt is ABSORBED (a visible debit) rather than merely reported as
+    // `InsuranceFundDepleted` against an empty fund — this test measures the correction term, so
+    // the term has to actually move somewhere.
+    storage::save_insurance_fund(&mut ctx, 10_000_000).unwrap();
+
+    // ALICE: long 1 lot at $100 on 10x — only 100_000 of collateral behind a 1_000_000 notional.
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: QTY as i64,
+            v_quote_balance: -(FILL_VALUE as i64),
+            margin: (FILL_VALUE / 10) as i64,
+            leverage: 10,
+            ..PerpPosition::default()
+        },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+
+    // She closes at $50: a 500_000 loss against 100_000 of margin → 400_000 of bad debt.
+    let crash = PRICE / 2;
+    place(&mut ctx, BOB, 0, crash, QTY, 0, 0);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let alice_before = wb(&mut ctx, ALICE);
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    place(&mut ctx, ALICE, 1, 0, QTY, 1, 1);
+    end_call(&mut ctx);
+
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    let trades = decode_trades(&logs);
+    assert_eq!(trades.len(), 1);
+    let t = &trades[0];
+    assert_eq!(
+        t.takerRealizedPnl, -500_000,
+        "bad debt changes where the money comes from, NOT the realized PnL"
+    );
+
+    // The bad debt is real and went to the insurance fund.
+    let bad_debt = if_before as i64 - storage::load_insurance_fund(&mut ctx).unwrap() as i64;
+    assert_eq!(bad_debt, 400_000);
+
+    let delta_wb = wb(&mut ctx, ALICE) - alice_before;
+    let rp_minus_n = t.takerRealizedPnl - t.takerFee as i64;
+
+    // The unexempted identity FAILS here — asserted as a fact, so that if the engine ever starts
+    // routing an insolvent close through the wallet this test notices.
+    assert_ne!(
+        delta_wb, rp_minus_n,
+        "an insolvent close is exactly where the plain identity must fail"
+    );
+    // …and the corrected one holds, exactly.
+    assert_eq!(delta_wb, rp_minus_n + bad_debt, "Δwb == rp − n + bad_debt");
+    // Concretely: only the 100_000 that was actually in the silo left the account.
+    assert_eq!(delta_wb, -100_000 - t.takerFee as i64);
+}
+
 #[test]
 fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
     let mut ctx = make_ctx();

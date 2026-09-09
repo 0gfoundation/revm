@@ -1901,6 +1901,11 @@ pub(super) fn match_order<H: PerpHost>(
                         taker_side: Side::Buy,
                         taker_fee,
                         maker_fee,
+                        // The maker settled just above, per fill, so its `rp` is final here. The
+                        // taker's is not knowable yet (one settlement for the whole order, after
+                        // the walk) — `finalize_compute` backfills this `0`.
+                        taker_realized_pnl: 0,
+                        maker_realized_pnl,
                     });
                     // ── This fill's `ACCOUNT_UPDATE` group for the MAKER ──────────────────────
                     //
@@ -2139,6 +2144,9 @@ pub(super) fn match_order<H: PerpHost>(
                         taker_side: Side::Sell,
                         taker_fee,
                         maker_fee,
+                        // Sell-side mirror; see the note on the Buy walk.
+                        taker_realized_pnl: 0,
+                        maker_realized_pnl,
                     });
                     // Sell-side mirror of the buy walk's per-fill maker group (header then row); see
                     // the note there.

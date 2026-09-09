@@ -1305,10 +1305,43 @@ sol! {
         //   `reason`.
         event OrderExpired(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint64 filledQuantity, uint64 expiredQuantity);
 
-        // Feeds: /trades, /historicalTrades, /aggTrades, /klines, /ticker/24hr, /myTrades
+        // Feeds: /trades, /historicalTrades, /aggTrades, /klines, /ticker/24hr, /myTrades, and the
+        //        `@order` stream's per-fill `o.rp`.
         // tradeId: global sequential counter for fromId pagination and firstId/lastId in 24hr ticker
         // takerFee / makerFee: USDC micro-units (6-decimal) charged to each side for this fill
-        event Trade(uint64 indexed marketId, uint64 tradeId, bytes32 takerOrderId, bytes32 makerOrderId, address taker, address maker, uint64 price, uint64 quantity, uint8 takerSide, uint64 takerFee, uint64 makerFee);
+        //
+        // ── takerRealizedPnl / makerRealizedPnl — the `@order` stream's `o.rp` ──────────────────
+        //
+        // Gross close PnL FOR THIS ONE FILL, for each side, in USDC micro-units; signed. EXCLUDES
+        // released margin, fees and funding — the same quantity, with the same exclusions, that
+        // `PositionChanged.realizedPnl` carries, only apportioned to the individual fill instead of
+        // to the position update. Zero when that side's leg of the fill opened or increased rather
+        // than reduced: on a FLIP only the closing leg earns `rp`, matching measured Binance
+        // (internal R15).
+        //
+        // WHY THIS PAIR LIVES HERE. `Trade` is already the canonical "one fill" record, already
+        // names both parties, and already carries a per-side scalar pair (`takerFee`/`makerFee`);
+        // a second such pair needs no new concept. It is a genuine information gap and NOT
+        // derivable downstream: `rp` depends on the position's average entry basis at the instant
+        // of the fill, which no other log exposes per fill. `PositionChanged.realizedPnl` gives
+        // the maker's (one position update per fill) but the taker's is aggregated over the WHOLE
+        // order — so a backend could not split a multi-fill taker order without reimplementing
+        // engine arithmetic, and reimplementing it is exactly what re-opens the ±1 phantom
+        // mint/burn class (see `settlement::finalize_core`'s apportionment note).
+        //
+        // Measured Binance behaviour (internal R15, mainnet, 10 fills): `rp` is apportioned PER
+        // FILL, not accumulated onto the last one, and `ACCOUNT_UPDATE.a.P[].cr` is exactly the
+        // rolling sum of it (10/10 exact). So a consumer sums these to get `cr`.
+        //
+        // ⚠️ THESE ARE PER-EVENT DELTAS, NOT LEVELS. Sum them; never take the last.
+        //
+        // The per-fill taker values are apportioned from the SAME aggregate the state mutation
+        // used, by telescoping differences, so `Σ takerRealizedPnl` over an order's fills is
+        // EXACTLY the `PositionChanged.realizedPnl` emitted for that order — bit for bit, with no
+        // rounding residual. `makerRealizedPnl` is not apportioned at all: the maker settles once
+        // per fill, so it is that fill's own value verbatim, and equals the `realizedPnl` on the
+        // maker's `PositionChanged` for the same fill.
+        event Trade(uint64 indexed marketId, uint64 tradeId, bytes32 takerOrderId, bytes32 makerOrderId, address taker, address maker, uint64 price, uint64 quantity, uint8 takerSide, uint64 takerFee, uint64 makerFee, int64 takerRealizedPnl, int64 makerRealizedPnl);
 
         /// Feeds: /positionRisk (history), /income (REALIZED_PNL), and — since the `@position`
         /// WebSocket stream was removed — the whole of `ACCOUNT_UPDATE.a.P[]`.
