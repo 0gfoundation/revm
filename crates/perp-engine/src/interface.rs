@@ -852,7 +852,7 @@ sol! {
 
         /// Push a new index price and recompute the mark price using:
         ///   Mark Price = Median(Price1, Price2, ContractPrice)
-        ///   Price1 = indexPrice * [1 + lastFundingRate * (timeUntilNext / fundingInterval)]
+        ///   Price1 = indexPrice * [1 + fundingRate * (timeUntilNext / fundingInterval)]
         ///   Price2 = indexPrice + MovingAverage30s(midPrice - indexPrice)
         ///   ContractPrice = last on-chain fill price (falls back to indexPrice if no trades yet)
         ///
@@ -869,7 +869,25 @@ sol! {
 
         /// Query the current funding state for a market.
         /// interestRate is in getMarket.
-        function getFundingState(uint64 marketId) external view returns (int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs);
+        ///
+        /// ⚠️ RETURN NAMES CHANGED (metadata only — the selector is unchanged, return names are not
+        /// hashed, so a name-bound decoder sees a field vanish rather than a wrong value):
+        /// `lastFundingRate` → `fundingRate` and `nextFundingTs` → `nextFundingTime`.
+        ///
+        /// This is §7.1.2 enforcement, not cosmetics. The market's funding rate was spelled two
+        /// ways across the ABI — `fundingRate` on `FundingSettled` and `FundingRateComputed`,
+        /// `lastFundingRate` only here — which is the exact failure mode (one quantity, several
+        /// names) that §7.1.2 exists to prevent, and the majority spelling also matches the
+        /// published `@markPrice` stream's documented "Funding rate". `nextFundingTime` likewise
+        /// matches the published "Next funding time". Each quantity now has ONE spelling across
+        /// events, selectors and the docs.
+        ///
+        /// SUFFIX NOTE: `nextFundingTime` sits next to `MarkPriceUpdated.priceWindowTs`, which keeps
+        /// `Ts`, and that difference is deliberate — see that event's `priceWindowTs` entry. `Time`
+        /// marks a wall-clock instant a consumer publishes; `Ts` marks an internal timestamp-derived
+        /// key that must NOT be published as a time. Different quantities, so different names is
+        /// correct; §7.1.2 is one name per QUANTITY, not one suffix per type.
+        function getFundingState(uint64 marketId) external view returns (int64 fundingRate, uint64 fundingInterval, uint64 nextFundingTime);
 
         // ── API key management (ed25519 signed orders) ────────────────────
         /// Register an ed25519 public key in slot `keyId` for the caller.
@@ -1303,8 +1321,77 @@ sol! {
         event MarginTiersUpdated(uint64 indexed marketId, uint64[] lowerBounds, uint32[] maxLeverages);
         // Feeds: market metadata updates for indexer
         event MarketUpdated(uint64 indexed marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps);
-        // Feeds: /premiumIndex (mark price history), /fundingRate (markPrice field)
-        event MarkPriceUpdated(uint64 indexed marketId, uint64 price, address updater);
+        // Feeds: /premiumIndex (mark + index price history), /fundingRate (markPrice field),
+        //        and the `@markPrice` websocket stream — this is its ONLY streaming source, and
+        //        EVERY instance of it is uniformly valid: there is no seeding/creation special case
+        //        in which some fields are meaningless (see the `addMarket` note at the bottom).
+        //
+        // ── This event ate `IndexPriceUpdated`. ──────────────────────────────────────────────
+        // There used to be two events for one thing: `IndexPriceUpdated` (index, mark, price1,
+        // price2, ts) fired immediately before `MarkPriceUpdated` (mark, updater) in the SAME
+        // `updateIndexPrice` call. `IndexPriceUpdated.markPrice` and `MarkPriceUpdated.price` were
+        // the same quantity under two names in two logs — a §7.1.2 collision that also forced every
+        // consumer to de-duplicate. `IndexPriceUpdated` is deleted; this event carries its payload.
+        //
+        // NAME KEPT DELIBERATELY. The payload is entirely new, which is normally the "same name,
+        // different meaning" pattern §7.1.2 exists to prevent — but the merge REMOVES a name
+        // collision rather than creating one (the mark now has exactly one event and one field name
+        // in the streaming path), and the field-list change moves `topic0`, so a stale consumer
+        // matches nothing instead of mis-decoding. Renaming would have given a quantity that already
+        // had a good name a second one, which is the actual §7.1.2 failure mode.
+        //
+        // FIELD NAMES: one spelling per quantity across events, selectors and the published stream
+        // docs. `fundingRate`/`nextFundingTime` are the majority ABI spelling (`FundingSettled`,
+        // `FundingRateComputed`) AND the documented stream names, and `getFundingState`'s returns
+        // were RENAMED to them in this change so the split is gone — see that selector. `indexPrice`
+        // as `getIndexPrice`, `markPrice` as every other event carrying a mark.
+        //
+        // * `markPrice`       — the tick-snapped median result. `getMarkPrice(marketId)` after this
+        //                       call returns this exact value.
+        // * `indexPrice`      — the oracle input for this update. Always a real oracle price:
+        //                       `updateIndexPrice` rejects 0, and this event only fires from there.
+        // * `fundingRate`     — `FundingState.last_funding_rate` AFTER this call, i.e. the rate in
+        //                       force right now, in FUNDING_RATE_ONE (1e6) units. Equal to
+        //                       `getFundingState().fundingRate` on the same state, and to the most
+        //                       recent `FundingRateComputed.fundingRate`. It is carried HERE, on
+        //                       every push, precisely because `FundingRateComputed` only fires at
+        //                       epoch boundaries while this fires every `priceUpdateInterval` — a
+        //                       consumer no longer has to cache a rate across pushes. 0 only if no
+        //                       epoch has closed yet, which is a true statement about the market.
+        // * `nextFundingTime` — `FundingState.next_funding_ts` AFTER this call, i.e.
+        //                       `getFundingState().nextFundingTime`.
+        // * `price1`/`price2` — the two intermediate components of the median, diagnostic only.
+        //                       `price2` is `index + MA30s(mid − index)`, i.e. a moving average of
+        //                       the BASIS, NOT of the mark. It is therefore **not** the `@markPrice`
+        //                       stream's `ap` field; do not wire it there.
+        // * `priceWindowTs`   — ⚠️ **NOT A DELIVERY TIME.** The oracle-supplied timestamp FLOORED to
+        //                       `priceUpdateInterval`; it identifies WHICH price window this update
+        //                       belongs to and is the value stored in `IndexPriceState.timestamp`
+        //                       (so it is the same quantity `getIndexPrice` returns as
+        //                       `lastTimestamp` — that selector's older name is left alone here).
+        //                       The `@markPrice` stream's `E` is BLOCK TIME, which a consumer
+        //                       already has from the receipt. Do not wire this to `E`.
+        //                       THE `Ts` SUFFIX IS LOAD-BEARING: `Time` in this ABI marks a
+        //                       wall-clock instant meant to be published (`nextFundingTime`), `Ts` a
+        //                       window key that must not be. Naming this `...Time` would invite
+        //                       exactly the `E` mis-wiring the paragraph above forbids.
+        // * `updater`         — the admin/oracle address that made the call.
+        //
+        // NOT CARRIED, deliberately: the stream's `ap` (see `price2` above), `P` (estimated settle
+        // price — meaningless for a perpetual) and `E` (block time). Nothing here is a placeholder
+        // standing in for them.
+        //
+        // ⚠️ `addMarket` DOES NOT EMIT THIS, deliberately, and reinstating it is a regression
+        // (`risk::tests::add_market_emits_no_price_event`). At market creation there is no index
+        // price, no median components and no funding epoch, so five of the nine fields would be 0 —
+        // true zeros, but that is not the point: it would make this event's fields only
+        // CONDITIONALLY meaningful, and a backend that treats every instance uniformly would
+        // publish `i = 0, r = 0, T = 0` once per market and get no error. The initial mark is
+        // published by `MarketAdded.initialMarkPrice` instead, which a consumer must read anyway
+        // for symbol/decimals/tick. Mark price therefore has two sources — one seeding, one
+        // streaming — in exchange for every `MarkPriceUpdated` being valid with no hot-path special
+        // case. That is the better trade.
+        event MarkPriceUpdated(uint64 indexed marketId, uint64 markPrice, uint64 indexPrice, int64 fundingRate, uint64 nextFundingTime, uint64 price1, uint64 price2, uint64 priceWindowTs, address updater);
 
         // Feeds: /fundingRate (history), /income (FUNDING_FEE)
         //
@@ -1332,9 +1419,9 @@ sol! {
         event MarketManagerUpdated(address indexed previousManager, address indexed newManager);
         event OracleAddressUpdated(address indexed previousOracle, address indexed newOracle);
 
-        // Feeds: /premiumIndex (index price history), /markPrice websocket
-        // price1/price2 are the two intermediate components; markPrice is the median result.
-        event IndexPriceUpdated(uint64 indexed marketId, uint64 indexPrice, uint64 markPrice, uint64 price1, uint64 price2, uint64 timestamp);
+        // (`IndexPriceUpdated` used to live here. It was merged into `MarkPriceUpdated` above —
+        //  index price, mark price, price1, price2 and the floored window timestamp are all fields
+        //  of that one event now. Do not re-add a second price event.)
 
         // Feeds: /fundingRate — emitted at end of each epoch when a new rate is computed on-chain.
         // avgPremiumIndex: linearly-weighted average PI in FUNDING_RATE_ONE (1e6) units.

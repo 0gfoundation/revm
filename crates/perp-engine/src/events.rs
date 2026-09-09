@@ -406,9 +406,8 @@ pub(crate) mod stream_test_support {
     /// address (`user` / `taker`), `None` where the event has no single natural subject.
     pub(crate) fn stream_shape(logs: &[primitives::Log]) -> Vec<(&'static str, Option<Address>)> {
         use crate::interface::IPerpDex::{
-            Adl, FundingRateComputed, IndexPriceUpdated, InsuranceFundChanged,
-            InsuranceFundDepleted, Liquidation, MarkPriceUpdated, OrderCancelled, OrderPlaced,
-            OrderRested, PositionMarginAdjusted,
+            Adl, FundingRateComputed, InsuranceFundChanged, InsuranceFundDepleted, Liquidation,
+            MarkPriceUpdated, OrderCancelled, OrderPlaced, OrderRested, PositionMarginAdjusted,
         };
         logs.iter()
             .filter_map(|log| {
@@ -445,8 +444,6 @@ pub(crate) mod stream_test_support {
                     Some(("InsuranceFundDepleted", None))
                 } else if topic == FundingRateComputed::SIGNATURE_HASH {
                     Some(("FundingRateComputed", None))
-                } else if topic == IndexPriceUpdated::SIGNATURE_HASH {
-                    Some(("IndexPriceUpdated", None))
                 } else if topic == MarkPriceUpdated::SIGNATURE_HASH {
                     Some(("MarkPriceUpdated", None))
                 } else {

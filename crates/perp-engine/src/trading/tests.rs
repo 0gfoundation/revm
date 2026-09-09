@@ -6121,7 +6121,7 @@ mod golden {
         insurance_fund: u64,
         market_fee_total: u64,
         mark_price: u64,
-        /// (lastFundingRate, nextFundingTs)
+        /// (fundingRate, nextFundingTime)
         funding: (i64, u64),
         signed_buy_status: u8,
         gtc_cancelled_status: u8,
@@ -7285,7 +7285,7 @@ mod golden {
             insurance_fund,
             market_fee_total,
             mark_price,
-            funding: (funding.lastFundingRate, funding.nextFundingTs),
+            funding: (funding.fundingRate, funding.nextFundingTime),
             signed_buy_status: order_status(ctx, ids.signed_buy),
             gtc_cancelled_status: order_status(ctx, ids.gtc),
             ioc_status: order_status(ctx, ids.ioc),

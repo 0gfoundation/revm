@@ -751,6 +751,183 @@ fn update_index_price_discards_same_or_older_aligned_timestamp() {
     assert_eq!(state.timestamp, 45);
 }
 
+// ── The merged price event ──────────────────────────────────────────────────
+//
+// `MarkPriceUpdated` absorbed `IndexPriceUpdated`. These pin the two properties the merge exists
+// for: exactly ONE price log per update (the duplication that is gone), and a self-contained
+// funding payload on EVERY push (the caching a `@markPrice` consumer no longer has to do).
+
+/// Every `MarkPriceUpdated` in `logs`, decoded.
+fn mark_price_events(
+    logs: &[primitives::Log],
+) -> Vec<crate::interface::IPerpDex::MarkPriceUpdated> {
+    logs.iter()
+        .filter(|log| {
+            log.data.topics().first()
+                == Some(&crate::interface::IPerpDex::MarkPriceUpdated::SIGNATURE_HASH)
+        })
+        .map(|log| {
+            crate::interface::IPerpDex::MarkPriceUpdated::decode_raw_log(
+                log.data.topics(),
+                &log.data.data,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// `getFundingState`'s `(fundingRate, nextFundingTime)` read through the real selector, so the
+/// event is compared against the ABI a consumer would actually poll — not against the struct the
+/// emitter already had in hand.
+fn get_funding_state_rate_and_next_time(ctx: &mut TestCtx, market_id: u64) -> (i64, u64) {
+    let out = run_get_funding_state(
+        &crate::interface::IPerpDex::getFundingStateCall {
+            marketId: market_id,
+        }
+        .abi_encode(),
+        ctx,
+    )
+    .unwrap();
+    let decoded =
+        crate::interface::IPerpDex::getFundingStateCall::abi_decode_returns(&out).unwrap();
+    (decoded.fundingRate, decoded.nextFundingTime)
+}
+
+/// ANTI-REGRESSION for the duplication the merge removed: `updateIndexPrice` used to emit
+/// `IndexPriceUpdated` and then `MarkPriceUpdated` describing the same mark, and a consumer had to
+/// de-duplicate. There is now exactly one price log, and it carries the whole payload.
+#[test]
+fn update_index_price_emits_exactly_one_price_event() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    assert_eq!(
+        logs.len(),
+        1,
+        "the oracle push emits ONE log on a quiet market, not a price pair"
+    );
+    let events = mark_price_events(&logs);
+    assert_eq!(events.len(), 1, "exactly one MarkPriceUpdated");
+    let e = &events[0];
+
+    // Every field is the state this call just wrote, read back independently.
+    let state = storage::load_index_price_state(&mut ctx, MARKET_ID).unwrap();
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    assert_eq!(e.marketId, MARKET_ID);
+    assert_eq!(e.markPrice, market.mark_price);
+    assert_eq!(e.indexPrice, ENTRY_PRICE);
+    assert_eq!(e.indexPrice, state.index_price);
+    // The FLOORED window timestamp (31 -> 30 at a 15s interval), i.e. what got persisted — NOT the
+    // caller's 31, and not a delivery time.
+    assert_eq!(e.priceWindowTs, 30);
+    assert_eq!(e.priceWindowTs, state.timestamp);
+    // Quiet market: no funding configured, no trades, empty basis window -> both components are
+    // the index and the median with them is the index.
+    assert_eq!(e.price1, ENTRY_PRICE);
+    assert_eq!(e.price2, ENTRY_PRICE);
+    assert_eq!(e.markPrice, ENTRY_PRICE);
+    assert_eq!(e.updater, ADMIN);
+
+    let (rate, next_ts) = get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID);
+    assert_eq!(e.fundingRate, rate);
+    assert_eq!(e.nextFundingTime, next_ts);
+}
+
+/// THE REASON FOR THE MERGE. `FundingRateComputed` fires only at an epoch boundary, while the mark
+/// updates every `priceUpdateInterval` — so a stream consumer used to have to cache the last rate
+/// across pushes. Pin that a push BETWEEN epochs (no `FundingRateComputed` in its logs) still
+/// carries the rate and next-funding time that `getFundingState` reports on the same state.
+#[test]
+fn mark_price_event_carries_current_funding_state_between_epochs() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    // 4 price-update slots per epoch.
+    market.funding_interval = 60;
+    // A non-zero interest rate is what makes the computed rate non-zero on a market whose mark
+    // never leaves the index: rate = avgPI + clamp(interest - avgPI) = 0 + 100.
+    market.interest_rate = 100;
+    storage::save_market(&mut ctx, &market).unwrap();
+
+    let push = |ctx: &mut TestCtx, ts: u64| {
+        run_update_index_price(
+            &updateIndexPriceCall {
+                marketId: MARKET_ID,
+                indexPrice: ENTRY_PRICE,
+                timestamp: ts,
+            }
+            .abi_encode(),
+            ADMIN,
+            ctx,
+        )
+        .unwrap();
+        JournalTr::take_logs(ctx.journal_mut())
+    };
+
+    // 1. Epoch initialisation: no rate yet.
+    let logs = push(&mut ctx, 16); // -> window 15, next funding at 75
+    let e = mark_price_events(&logs).pop().unwrap();
+    assert_eq!(e.fundingRate, 0);
+    assert_eq!(e.nextFundingTime, 75);
+    assert_eq!(
+        get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID),
+        (e.fundingRate, e.nextFundingTime)
+    );
+
+    // 2. The epoch boundary: a rate is computed, `FundingRateComputed` fires, and the merged event
+    //    already carries the NEW rate (it is emitted after the funding state is written).
+    let logs = push(&mut ctx, 76); // -> window 75 == next_funding_ts
+    assert!(
+        logs.iter().any(|log| log.data.topics().first()
+            == Some(&crate::interface::IPerpDex::FundingRateComputed::SIGNATURE_HASH)),
+        "the boundary push must still emit FundingRateComputed"
+    );
+    let boundary = mark_price_events(&logs).pop().unwrap();
+    assert_eq!(boundary.fundingRate, 100, "avgPI 0 + clamp(100 - 0)");
+    assert_eq!(boundary.nextFundingTime, 135);
+    assert_eq!(
+        get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID),
+        (boundary.fundingRate, boundary.nextFundingTime)
+    );
+
+    // 3. BETWEEN epochs — the case the merge exists for. No `FundingRateComputed`, but the price
+    //    event is still self-contained.
+    let logs = push(&mut ctx, 91); // -> window 90, well short of 135
+    assert!(
+        !logs.iter().any(|log| log.data.topics().first()
+            == Some(&crate::interface::IPerpDex::FundingRateComputed::SIGNATURE_HASH)),
+        "a mid-epoch push must NOT emit FundingRateComputed — that is the whole premise"
+    );
+    let mid = mark_price_events(&logs);
+    assert_eq!(mid.len(), 1, "still exactly one price event mid-epoch");
+    let mid = &mid[0];
+    assert_eq!(mid.priceWindowTs, 90);
+    assert_eq!(
+        (mid.fundingRate, mid.nextFundingTime),
+        get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID),
+        "a mid-epoch push carries the live funding state, so no consumer has to cache it"
+    );
+    assert_eq!(
+        (mid.fundingRate, mid.nextFundingTime),
+        (100, 135),
+        "and it is the rate the last boundary set, not a zero"
+    );
+}
+
 #[test]
 fn funding_epoch_jump_computes_once_and_advances_next_ts_to_future() {
     let mut ctx = make_ctx();
@@ -2850,6 +3027,83 @@ fn add_market_stores_a_nonzero_mark_price() {
         ENTRY_PRICE,
         "the initial mark must be the market's mark from creation"
     );
+}
+
+/// `addMarket` emits NO price event, and this test exists so nobody reinstates one.
+///
+/// It used to. The seeding emission looked harmless — the intuition was that every component
+/// genuinely equals `initialMarkPrice` ("funding is 0 so price1 = index, no trades so
+/// contractPrice = index, empty basis window so price2 = index, hence median = index"). That
+/// silently assumes an index price EXISTS and equals the initial mark. It does not: `addMarket`
+/// writes no `IndexPriceState`, so `getIndexPrice` returns 0 and five of the nine fields would be
+/// 0. Reporting them as `initialMarkPrice` would contradict the view selectors; reporting them as
+/// the true 0 makes `MarkPriceUpdated`'s fields only CONDITIONALLY meaningful, and a backend that
+/// handles every instance uniformly then publishes `i = 0, r = 0, T = 0` once per market with no
+/// error raised anywhere. Both options are bad, so the event does not fire here at all: the initial
+/// mark is published by `MarketAdded.initialMarkPrice`, which a consumer reads anyway.
+///
+/// The property being bought is that EVERY `MarkPriceUpdated` is uniformly valid — so the second
+/// half of this test pins the other side of it: the first real oracle push does emit one, with
+/// every component populated.
+#[test]
+fn add_market_emits_no_price_event() {
+    let mut ctx = make_ctx();
+    storage::save_admin(&mut ctx, ADMIN).unwrap();
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    call_add_market(&mut ctx, 7, ENTRY_PRICE);
+
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    assert!(
+        mark_price_events(&logs).is_empty(),
+        "addMarket must not emit MarkPriceUpdated — see this test's doc comment before changing it"
+    );
+    // The mark IS set, and IS published — by `MarketAdded`, the event a consumer must read anyway
+    // for symbol/decimals/tick.
+    assert_eq!(storage::load_mark_price(&mut ctx, 7).unwrap(), ENTRY_PRICE);
+    let added: Vec<_> = logs
+        .iter()
+        .filter(|log| {
+            log.data.topics().first()
+                == Some(&crate::interface::IPerpDex::MarketAdded::SIGNATURE_HASH)
+        })
+        .map(|log| {
+            crate::interface::IPerpDex::MarketAdded::decode_raw_log(
+                log.data.topics(),
+                &log.data.data,
+            )
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0].initialMarkPrice, ENTRY_PRICE);
+
+    // And the first real oracle push is where the stream starts — fully populated, no special case.
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: 7,
+            indexPrice: ENTRY_PRICE,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+    let first = mark_price_events(&JournalTr::take_logs(ctx.journal_mut()))
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (
+            first.indexPrice,
+            first.price1,
+            first.price2,
+            first.markPrice
+        ),
+        (ENTRY_PRICE, ENTRY_PRICE, ENTRY_PRICE, ENTRY_PRICE),
+        "once an index exists, every component IS the index"
+    );
+    assert_eq!(first.priceWindowTs, 30);
 }
 
 #[test]
@@ -5045,8 +5299,8 @@ mod account_update_stream {
                 ("AccountBalanceChanged", Some(KEEPER)),
                 ("PositionChanged", Some(KEEPER)),
                 ("Liquidation", Some(ALICE)),
-                // the oracle update that drove the sweep, emitted after it
-                ("IndexPriceUpdated", None),
+                // the oracle update that drove the sweep, emitted after it — ONE price event,
+                // not the `IndexPriceUpdated` + `MarkPriceUpdated` pair it used to be
                 ("MarkPriceUpdated", None),
             ],
             "one ADL fill → two pushes, each owning exactly its own party's position row"

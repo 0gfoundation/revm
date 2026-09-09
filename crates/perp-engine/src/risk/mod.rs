@@ -216,15 +216,20 @@ pub fn run_add_market<H: PerpHost>(
         }
         .to_log_data(),
     });
-    context.log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::MarkPriceUpdated {
-            marketId: args.marketId,
-            price: args.initialMarkPrice,
-            updater: caller,
-        }
-        .to_log_data(),
-    });
+    // ── NO `MarkPriceUpdated` HERE. DO NOT REINSTATE IT. ────────────────────────────────────────
+    // The initial mark is published by `MarketAdded` above (`initialMarkPrice`), and a consumer has
+    // to read `MarketAdded` anyway for symbol/decimals/tick, so the seed is free there.
+    //
+    // It used to emit one, on the theory that mark price should have a single event source for a
+    // market's whole lifetime. It cannot, honestly: `addMarket` writes no `IndexPriceState`, so at
+    // this point there is no index price, no `price1`/`price2` and no funding epoch — five of the
+    // nine fields would be 0. They would be TRUE zeros, not placeholders, but that is not the
+    // problem: it would make `MarkPriceUpdated` a type whose fields are only conditionally
+    // meaningful, and a backend that handles every one of them uniformly would publish
+    // `index = 0, rate = 0, nextFundingTime = 0` once per market with no error raised anywhere.
+    // A silent special case on the hot path is worse than a second, obvious seeding source.
+    //
+    // Pinned by `risk::tests::add_market_emits_no_price_event`.
 
     Ok(Bytes::new())
 }
@@ -1763,7 +1768,7 @@ pub fn run_get_oracle_address<H: PerpHost>(
 /// 1. Compute Price1, Price2, ContractPrice and take their median as mark price.
 /// 2. Save the new index price state.
 /// 4. Snap mark price to tick_size and persist it.
-/// 5. Emit IndexPriceUpdated + MarkPriceUpdated.
+/// 5. Emit the single merged `MarkPriceUpdated` (index + mark + components + funding state).
 pub fn run_update_index_price<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
@@ -1942,23 +1947,29 @@ pub fn run_update_index_price<H: PerpHost>(
     run_liquidation_sweep(context, args.marketId, &market, mark_price)?;
 
     // ── 6. Emit events ────────────────────────────────────────────────────────
-    context.log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::IndexPriceUpdated {
-            marketId: args.marketId,
-            indexPrice: args.indexPrice,
-            markPrice: mark_price,
-            price1,
-            price2,
-            timestamp: effective_timestamp,
-        }
-        .to_log_data(),
-    });
+    // ONE price event per update. This used to be `IndexPriceUpdated` immediately followed by
+    // `MarkPriceUpdated` describing the same mark under a different field name, which every
+    // consumer then had to de-duplicate; the two are merged.
+    //
+    // `fundingRate`/`nextFundingTime` are read off the `funding` local, which is the SAME
+    // `FundingState` loaded at the top of this function for `compute_price1` and is post-update
+    // (the epoch branch above assigns and saves through it; nothing between here and there writes
+    // funding state). So it costs zero extra reads and it agrees with `getFundingState` — including
+    // BETWEEN epochs, where no `FundingRateComputed` fires and a consumer previously had to cache
+    // the last rate across pushes.
     context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::MarkPriceUpdated {
             marketId: args.marketId,
-            price: mark_price,
+            markPrice: mark_price,
+            indexPrice: args.indexPrice,
+            fundingRate: funding.last_funding_rate,
+            nextFundingTime: funding.next_funding_ts,
+            price1,
+            price2,
+            // The FLOORED oracle timestamp: which price window this update belongs to, NOT when it
+            // was delivered. A `@markPrice` stream's `E` is block time, not this.
+            priceWindowTs: effective_timestamp,
             updater: caller,
         }
         .to_log_data(),
@@ -1998,7 +2009,7 @@ pub fn run_get_index_price<H: PerpHost>(
 
 // ── Funding state ─────────────────────────────────────────────────────────────
 
-/// `getFundingState(uint64 marketId) returns (int64 lastFundingRate, uint64 fundingInterval, uint64 nextFundingTs)`
+/// `getFundingState(uint64 marketId) returns (int64 fundingRate, uint64 fundingInterval, uint64 nextFundingTime)`
 pub fn run_get_funding_state<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -2010,9 +2021,9 @@ pub fn run_get_funding_state<H: PerpHost>(
         .ok_or_else(|| perp_err("getFundingState: unknown market"))?;
     Ok(Bytes::from(getFundingStateCall::abi_encode_returns(
         &getFundingStateReturn {
-            lastFundingRate: state.last_funding_rate,
+            fundingRate: state.last_funding_rate,
             fundingInterval: market.funding_interval,
-            nextFundingTs: state.next_funding_ts,
+            nextFundingTime: state.next_funding_ts,
         },
     )))
 }
