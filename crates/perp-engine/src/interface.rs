@@ -39,7 +39,7 @@ sol! {
         /// `margin_view::margin_info_of` — the single implementation of the per-market margin
         /// arithmetic. There is no second derivation to drift from and no second encoder to drop a
         /// field, and `margin_view_tests::get_account_positions_agree_with_get_position_risk_field_for_field`
-        /// asserts the two ACCESS PATHS agree positionally over all 17 numbers, on a live
+        /// asserts the two ACCESS PATHS agree positionally over all 18 numbers, on a live
         /// multi-market index, rather than trusting it.
         ///
         /// ⚠️ **REPLACES `getMarginInfo`**, which returned these same numbers minus `marketId` and
@@ -170,6 +170,23 @@ sol! {
         ///                         already holding, which is why carrying it on every row of the
         ///                         bulk path left `getAccount`'s flat gas unchanged.
         ///
+        /// Derived, ours (continued):
+        ///   cumulativeRealizedPnl the LIFETIME realised PnL for this `(user, marketId)` — the same
+        ///                         `ACCOUNT_UPDATE.a.P[].cr` the `PositionChanged` event carries,
+        ///                         read off the same stored field, so the row and the event agree by
+        ///                         construction. **The one field in this row that is NOT a statement
+        ///                         about the position open right now**: it is a lifetime total and is
+        ///                         deliberately not reset when the position goes flat, so a row
+        ///                         reporting `positionAmt == 0` with a non-zero value here is the
+        ///                         intended state, not stale data. Excludes released margin, trading
+        ///                         fees and funding (exactly as `PositionChanged.realizedPnl` does).
+        ///                         ⚠️ It is readable here indefinitely after a close — the position
+        ///                         blob is never deleted — but a flat market with no resting orders
+        ///                         LEAVES the per-user index, so it stops appearing in
+        ///                         `getAccount().positions[]` and the SET of markets a user has
+        ///                         history in is not enumerable on chain. See the note on
+        ///                         `PositionChanged`; a consumer wanting that set must keep its own.
+        ///
         /// A user with no position and no orders reads back all zeros with `leverage = 1`. Both
         /// selectors REVERT if the market does not exist — the decimals and the tier table are
         /// required INPUTS, so a fabricated zero market would report a full row of plausible zeros.
@@ -195,6 +212,7 @@ sol! {
             int64  isolatedWallet;
             // ── derived, ours ──
             uint64 liquidationPrice;
+            int64  cumulativeRealizedPnl;
         }
         /// Query a user's spot USDC plus the full account-level margin roll-up, over the markets
         /// the user is actually active in. **INDEX-DRIVEN**: the caller passes no market list —
@@ -1357,7 +1375,7 @@ sol! {
         ///   pa   position amount   amount            (signed; positive = long)
         ///   ep   entry price       entryPrice
         ///   bep  breakeven price   breakevenPrice    ⚠️ PLACEHOLDER, always 0 — see below
-        ///   cr   cumulative rPnL   cumulativeRealizedPnl  ⚠️ PLACEHOLDER, always 0 — see below
+        ///   cr   cumulative rPnL   cumulativeRealizedPnl  POPULATED. A LEVEL, not a delta.
         ///   up   unrealised PnL    unrealizedProfit
         ///   mt   margin type       constant "isolated" — we have no cross mode
         ///   iw   isolated wallet   margin
@@ -1370,6 +1388,11 @@ sol! {
         /// no special handling: take the LAST one per `(user, marketId)` — every field is a LEVEL
         /// (an after-image), never a delta, except `realizedPnl` / `closedQuantity`, which are
         /// per-event and must be summed if you want a transaction total.
+        ///
+        /// ⚠️ `realizedPnl` and `cumulativeRealizedPnl` are the SAME quantity at two different
+        /// altitudes and must not be confused: the former is this event's own delta, the latter the
+        /// lifetime total INCLUDING it. Summing the latter, or taking the last of the former, are
+        /// both wrong.
         ///
         /// ## Field semantics
         ///
@@ -1395,35 +1418,54 @@ sol! {
         ///                     and this field reuses it rather than re-deriving from `entryPrice`,
         ///                     which would round twice.
         ///
-        /// ## ⚠️ `cumulativeRealizedPnl` and `breakevenPrice` ARE PLACEHOLDERS. ALWAYS EXACTLY 0.
+        /// ## `cumulativeRealizedPnl` (`P[].cr`) — POPULATED, and the reason it is worth having
         ///
-        /// **Do not sum them, chart them, or diff them.** They are not "0 because nothing
-        /// happened" — they are 0 because the state behind them DOES NOT EXIST. They are carried
-        /// so the `P[]` payload shape is stable and adding them later is not a breaking change,
+        /// The LIFETIME realised PnL for this `(user, marketId)`: the running total of the very
+        /// `realizedPnl` this event reports per closing leg, INCLUDING this event's own. It is a
+        /// LEVEL — take the last one, never sum them.
+        ///
+        /// Measured Binance behaviour (internal R15, mainnet): `cr` is exactly the rolling sum of
+        /// the per-fill `rp`, 10/10 with no residual. Ours is that sum computed ON CHAIN, held as
+        /// `PerpPosition::cumulative_realized_pnl` and incremented at the two places a closing
+        /// leg's PnL is produced — so a consumer keeps the last value instead of accumulating a
+        /// stream it must never miss an event of. Excludes released margin, trading fees and
+        /// funding, exactly as `realizedPnl` does; an OPENING leg contributes 0, so a flip accrues
+        /// only its closing half.
+        ///
+        /// It is deliberately NOT reset when the position goes flat, and that is the whole point:
+        /// closing, reopening and closing again reports the total across both rounds. This is also
+        /// why it could not be derived — nothing in `(amount, vQuoteBalance, margin)` retains a
+        /// closed round's PnL.
+        ///
+        /// ⚠️ **A MARKET THE USER HAS LEFT IS NOT ENUMERABLE ON CHAIN.** The value survives the
+        /// close, but the market does not stay in the user's index: a flat position with no resting
+        /// orders LEAVES it, so that market is absent from `getAccount().positions[]` (pinned by
+        /// `a_market_the_user_is_not_in_is_absent_from_positions_but_readable_singly`). Keeping such
+        /// markets indexed would make the index unbounded against `MAX_USER_MARKETS = 16`, so this
+        /// is accepted, not a bug. Consequences, exactly:
+        ///
+        /// * `cr` for a specific market remains readable AFTER the close, indefinitely, via
+        ///   `getPositionRisk(user, marketId)` — the position blob is never deleted;
+        /// * but the SET of markets in which a user has trading history is not obtainable from this
+        ///   contract. A consumer that wants that set must keep its own, from these events.
+        ///
+        /// ## ⚠️ `breakevenPrice` IS STILL A PLACEHOLDER. ALWAYS EXACTLY 0.
+        ///
+        /// **Do not chart it, diff it, or treat 0 as a price.** It is not "0 because nothing
+        /// happened" — it is 0 because the state behind it DOES NOT EXIST. It is carried so the
+        /// `P[]` payload shape is stable and populating it later is not a breaking change,
         /// following exactly the precedent the public docs already set for `ACCOUNT_UPDATE.a.m`
         /// ("The field exists so the payload shape is stable, but it is not populated yet — do not
-        /// `switch` on it without a default branch"). Treat these the same way: read them as
-        /// "unavailable", never as "zero".
+        /// `switch` on it without a default branch"). Read it as "unavailable", never as "zero".
         ///
-        /// What each one needs before it can be populated:
-        ///
-        /// * `cumulativeRealizedPnl` (`P[].cr`, "cumulative realised PnL for this symbol") needs a
-        ///   **per-position cumulative realised-PnL accumulator** on `PerpPosition`. `PerpPosition`
-        ///   has no such field (`amount`, `v_quote_balance`, `margin`, `leverage`,
-        ///   `last_funding_index`, `total_buy_qty`, `total_buy_notional`, `total_sell_qty`,
-        ///   `total_sell_notional` — that is all of them), and the per-event `realizedPnl` on this
-        ///   very event is a DELTA, so nothing on-chain holds the running total. Note it also has
-        ///   to survive the position going flat and being reopened, which is precisely why it
-        ///   cannot be reconstructed from the current position state.
-        /// * `breakevenPrice` (`P[].bep`, "entry adjusted for fees paid") needs **cumulative fees
-        ///   paid against the open position**. Also absent: the trading fee is charged out of the
-        ///   margin the fill funds and out of the wallet, and no running per-position total is
-        ///   kept anywhere. `entryPrice` alone cannot yield it.
-        ///
-        /// An indexer that wants either number today must accumulate it itself from the event
-        /// stream (`realizedPnl` here for `cr`; `Trade.takerFee` / `Trade.makerFee` for `bep`).
-        /// When they ARE populated the tests asserting them zero must be updated in the same
-        /// change — see `placeholder_position_fields_are_zero`.
+        /// What it needs before it can be populated: `breakevenPrice` (`P[].bep`, "entry adjusted
+        /// for fees paid") needs **cumulative fees paid against the open position**. That is
+        /// absent — the trading fee is charged out of the margin the fill funds and out of the
+        /// wallet, and no running per-position total is kept anywhere. `entryPrice` alone cannot
+        /// yield it. An indexer that wants the number today must accumulate it itself from
+        /// `Trade.takerFee` / `Trade.makerFee`. When it IS populated the test asserting it zero
+        /// must be updated in the same change — see
+        /// `the_breakeven_price_placeholder_is_zero`.
         event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage, int64 realizedPnl, uint64 closedQuantity, uint64 entryPrice, int64 unrealizedProfit, int64 cumulativeRealizedPnl, uint64 breakevenPrice);
         // Feeds: isolated margin adjustment history. delta > 0 means add margin; delta < 0 means remove margin.
         event PositionMarginAdjusted(address indexed user, uint64 indexed marketId, int64 delta, int64 margin);

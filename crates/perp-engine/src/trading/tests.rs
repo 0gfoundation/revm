@@ -3419,6 +3419,11 @@ fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
             v_quote_balance: -(open_value as i64),
             margin: (open_value - taker_fee) as i64,
             leverage: 1,
+            // The FLIP's accumulator: exactly the closing leg's PnL asserted above, and nothing
+            // for the opening leg — which is the apportionment R15 measured (`rp` covers only the
+            // close). This position is a fresh LONG whose `v_quote_balance` carries no trace of the
+            // short it replaced, so a `cr` of 0 here would be a lost round.
+            cumulative_realized_pnl: 100_000,
             ..PerpPosition::default()
         }
     );
@@ -6724,8 +6729,27 @@ mod golden {
     /// the `debug_assertions` cross-check inside `margin_view::index_account_scalars`, which compares
     /// the stored aggregate against a fresh walk on every `getAccount` and every published snapshot.
     /// Prior value 0xea28799e35db06c71ad95e1517df8e289028b79721bcdb27c183f7d594d72f0e.
+    /// RE-PIN (per-position cumulative realised PnL + `BLOCK_COMMITMENT_VERSION` 23→24): a LAYOUT
+    /// change only. `PerpPosition` gains a trailing "cr" field
+    /// (`cumulative_realized_pnl` = `ACCOUNT_UPDATE.a.P[].cr`), so every stored position blob grows
+    /// by one integer, and every blob written after a CLOSE carries a different trailing value. So
+    /// the commitment moves for TWO mechanical reasons — longer position blobs and the version byte
+    /// — and no execution rule moves with it: nothing reads the field back to make a decision, no
+    /// balance identity contains it, no gate conditions on it, and the set of keys a write touches
+    /// is unchanged.
+    ///
+    /// **BusinessSnapshot UNCHANGED, field for field**, and necessarily so: the three `*_position`
+    /// triples read `getPosition`, whose five returns do not include the new field; the three
+    /// `*_account` pairs read spot USDC and `getAccount().availableBalance`
+    /// (`totalCrossWalletBalance − totalOpenOrderInitialMargin`), neither of which has a `cr` term;
+    /// and no money is routed differently, so `admin_perp_wallet`, `insurance_fund`,
+    /// `market_fee_total`, `mark_price`, `funding` and all eleven order statuses are untouched. The
+    /// field's own values are pinned separately and much more sharply by
+    /// `trading::tests::position_changed_derived_fields` (the survival test across a close and a
+    /// reopen, and the Σ-per-fill identity on both sides).
+    /// Prior value 0x18acf659ad6effb859689eb2d43465c0bb8386496ce13369f3837d6455848101.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x18acf659ad6effb859689eb2d43465c0bb8386496ce13369f3837d6455848101");
+        b256!("0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -15079,23 +15103,378 @@ mod position_changed_derived_fields {
         );
     }
 
-    // ── the two placeholders ─────────────────────────────────────────────────────────────────
+    // ── `cumulativeRealizedPnl` (`P[].cr`) ───────────────────────────────────────────────────
 
-    /// ⚠️ **THIS TEST MUST BE UPDATED — not deleted — WHEN EITHER FIELD IS POPULATED.**
+    /// `cr` on its simplest shape: ONE close, so the lifetime total is that close's own
+    /// `realizedPnl` — the level and the delta coincide exactly once in a position's life and this
+    /// is that moment. Every test below is about the cases where they do NOT.
     ///
-    /// `cumulativeRealizedPnl` (`P[].cr`) and `breakevenPrice` (`P[].bep`) are carried so the
-    /// payload shape is stable (the precedent the public docs set for `ACCOUNT_UPDATE.a.m`) and
-    /// are hardcoded 0 because the state they need does not exist: a per-position cumulative
-    /// realised-PnL accumulator, and cumulative fees paid. See the ABI comment on
+    /// The fixture pays non-zero commissions on both sides on purpose: `cr` excludes fees (as
+    /// `realizedPnl` does), so a `cr` that quietly netted them would fail here rather than as a
+    /// drift in a consumer's chart.
+    #[test]
+    fn cumulative_realized_pnl_equals_the_single_close_that_produced_it() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        fund(&mut ctx, CAROL, WALLET);
+        for user in [ALICE, BOB, CAROL] {
+            storage::save_user_fee_rates(
+                &mut ctx,
+                user,
+                UserFeeRates {
+                    maker_fee_bps: 2,
+                    taker_fee_bps: 5,
+                },
+            )
+            .unwrap();
+        }
+
+        // Open QTY long at $100, then close HALF at $200 → a realised profit plus four fee legs.
+        place(&mut ctx, BOB, 1, PRICE, 2 * QTY, 0, 0);
+        place(&mut ctx, ALICE, 0, PRICE, 2 * QTY, 0, 0);
+        place(&mut ctx, CAROL, 0, 200 * TICK, QTY, 0, 0);
+        place(&mut ctx, ALICE, 1, 200 * TICK, QTY, 0, 0);
+
+        let e = last_change(&mut ctx, ALICE);
+        assert!(
+            e.realizedPnl > 0 && e.closedQuantity == QTY,
+            "fixture must actually realise PnL, else this proves nothing: realizedPnl={} \
+             closedQuantity={}",
+            e.realizedPnl,
+            e.closedQuantity
+        );
+        assert!(market_fee_total(&mut ctx) > 0, "fixture must pay fees");
+        assert_eq!(
+            e.cumulativeRealizedPnl, e.realizedPnl,
+            "one close ⇒ the lifetime total IS that close's PnL"
+        );
+        // The value, not just the relation — closing QTY of a $100 long at $200 realises $1.
+        assert_eq!(e.cumulativeRealizedPnl, 1_000_000);
+        // …and it is the STORED field, not something the emit site computed on the way past.
+        assert_eq!(pos(&mut ctx, ALICE).cumulative_realized_pnl, 1_000_000);
+    }
+
+    /// **THE PROPERTY `cr` EXISTS FOR: it survives the position going FLAT and being REOPENED.**
+    ///
+    /// This is the whole reason the number has to be stored rather than derived. A reopened
+    /// position's `(amount, vQuoteBalance, margin)` carry no trace of the round before it — that is
+    /// what "flat" means — so a `cr` reconstructed from current state would restart at 0 on every
+    /// reopen, and a consumer that missed one `PositionChanged` could never recover the total.
+    ///
+    /// Two rounds, deliberately of DIFFERENT magnitudes and OPPOSITE signs, so the final value is
+    /// distinguishable from every wrong answer:
+    ///
+    /// ```text
+    ///                              ALICE (taker)          BOB (maker)
+    ///   round 1  open  @ $100        cr = 0                 cr = 0        (opening ⇒ 0)
+    ///            close @ $110        cr = +100_000          cr = −100_000
+    ///            ── FLAT ──          cr = +100_000          cr = −100_000  ← must NOT reset
+    ///   round 2  open  @ $100        cr = +100_000          cr = −100_000  (opening ⇒ 0)
+    ///            close @  $85        cr =  −50_000          cr = +50_000
+    /// ```
+    ///
+    /// A `cr` zeroed on close would report `−150_000` / `+150_000` at the end; one zeroed on reopen
+    /// the same; one that saturated or took an absolute value would differ too. And the flat-interval
+    /// assertion is read off STORED STATE, not off the event, so it pins the field surviving in the
+    /// blob rather than merely being echoed once.
+    ///
+    /// Both parties are checked because they exercise different accumulation paths for the same
+    /// arithmetic: ALICE closes as the TAKER (`finalize_core` on the summed legs), BOB as the MAKER
+    /// (`settle_maker_fill_core`, per fill).
+    #[test]
+    fn cumulative_realized_pnl_survives_a_close_and_a_reopen() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+
+        // ── round 1: open QTY long at $100, close it at $110 ──
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+        assert_eq!(
+            (
+                pos(&mut ctx, ALICE).cumulative_realized_pnl,
+                pos(&mut ctx, BOB).cumulative_realized_pnl
+            ),
+            (0, 0),
+            "an OPENING fill realises nothing"
+        );
+
+        place(&mut ctx, BOB, 0, 110 * TICK, QTY, 0, 0);
+        place(&mut ctx, ALICE, 1, 110 * TICK, QTY, 0, 0);
+        let (alice_flat, bob_flat) = (pos(&mut ctx, ALICE), pos(&mut ctx, BOB));
+        assert_eq!(
+            (alice_flat.amount, bob_flat.amount),
+            (0, 0),
+            "the fixture must actually go FLAT, or the survival claim below is untested"
+        );
+        assert_eq!(
+            (alice_flat.margin, bob_flat.margin),
+            (0, 0),
+            "and a flat position holds no margin (save_position's own invariant)"
+        );
+        // ⚠️ THE FLAT INTERVAL. Read off the STORED position, so this is the blob keeping the value
+        // and not the event echoing it.
+        assert_eq!(
+            (
+                alice_flat.cumulative_realized_pnl,
+                bob_flat.cumulative_realized_pnl
+            ),
+            (100_000, -100_000),
+            "`cr` is deliberately NOT zeroed with `amount`/`margin` — a flat position carrying a \
+             non-zero lifetime total is the FEATURE"
+        );
+
+        // ── round 2: reopen QTY long at $100, close it at $85 (a bigger LOSS) ──
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0);
+        assert_eq!(
+            (
+                pos(&mut ctx, ALICE).cumulative_realized_pnl,
+                pos(&mut ctx, BOB).cumulative_realized_pnl
+            ),
+            (100_000, -100_000),
+            "reopening carries round 1's total forward — it does not restart"
+        );
+
+        place(&mut ctx, BOB, 0, 85 * TICK, QTY, 0, 0);
+        place(&mut ctx, ALICE, 1, 85 * TICK, QTY, 0, 0);
+
+        // ── the running total across BOTH rounds ──
+        // ALICE: +100_000 (round 1) − 150_000 (round 2) = −50_000.
+        // BOB:   −100_000 (round 1) + 150_000 (round 2) = +50_000.
+        assert_eq!(
+            (
+                pos(&mut ctx, ALICE).cumulative_realized_pnl,
+                pos(&mut ctx, BOB).cumulative_realized_pnl
+            ),
+            (-50_000, 50_000),
+            "the total spans the flat interval; neither round's value alone is right"
+        );
+        // The last `PositionChanged` each party got must publish the same number — the event and
+        // the state are one field, not two.
+        assert_eq!(
+            last_change(&mut ctx, ALICE).cumulativeRealizedPnl,
+            -50_000,
+            "the event publishes the stored total"
+        );
+    }
+
+    /// **THE ACCEPTANCE IDENTITY, for BOTH sides:**
+    ///
+    /// ```text
+    ///   Σ (that user's per-fill realizedPnl from `Trade`)  ==  PositionChanged.cumulativeRealizedPnl
+    /// ```
+    ///
+    /// Two INDEPENDENTLY produced fields have to agree — the per-fill split is apportioned for
+    /// logging by `finalize_core`'s telescoping loop (taker) or is the fill's own value
+    /// (`makerRealizedPnl`), while `cr` is folded onto the position by `apply_position_fill` from
+    /// the AGGREGATE. Nothing computes one from the other. This is the technique R15 used to
+    /// confirm on mainnet that the per-fill split was real rather than a formatting artefact
+    /// (`cr` was the rolling sum of `rp`, 10/10 exact), applied to our own stream.
+    ///
+    /// # The scenario is built so the agreement cannot be about one positive number
+    ///
+    /// ```text
+    ///   phase A   BOB rests SELL 1@$102, 1@$100;  CAROL rests SELL 1@$101
+    ///             ALICE market BUY 3   → three fills, all PURE OPENING on every party ⇒ rp = 0
+    ///   phase B   BOB rests BUY 1@$103, 1@$95;    CAROL rests BUY 3@$98
+    ///             ALICE market SELL 5  → sweeps $103(1), $98(3), $95(1)
+    /// ```
+    ///
+    /// What each party's Σ therefore contains:
+    ///
+    /// * **ALICE (taker)** — long 3 at `vq = −3_030_000`, sells 5: closes 3 and FLIPS to short 2.
+    ///   Per-fill `+20_000`, `−60_000`, `0` — BOTH SIGNS, plus a fill that is pure opening and must
+    ///   report exactly 0. Σ = `−40_000`, a NEGATIVE lifetime total.
+    /// * **BOB (maker)** — short 2 at `vq = +2_020_000`, bought back one lot ABOVE his basis
+    ///   ($103, a `−20_000` LOSS) and one well below ($95, a `+60_000` gain). Σ = `+40_000`, so
+    ///   neither of his two fills' values is the answer and a sign error on either fails.
+    /// * **CAROL (maker)** — short 1 at $101, her single 3-lot fill closes that lot at $98
+    ///   (`+30_000`) and opens 2 LONG in the same fill: **a maker-side FLIP**, whose opening leg
+    ///   must contribute nothing.
+    ///
+    /// Commissions are non-zero on every party, so the identity also pins that `cr` is FEE-FREE:
+    /// fees are charged out of the same fills and appear in neither side of the equation.
+    #[test]
+    fn per_fill_trade_realized_pnl_sums_to_cumulative_realized_pnl_on_both_sides() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        fund(&mut ctx, CAROL, WALLET);
+        // Maker rates are snapshotted onto the order entry AT PLACEMENT, so they go in first.
+        for user in [ALICE, BOB, CAROL] {
+            storage::save_user_fee_rates(
+                &mut ctx,
+                user,
+                UserFeeRates {
+                    maker_fee_bps: 5,
+                    taker_fee_bps: 10,
+                },
+            )
+            .unwrap();
+        }
+
+        // Accumulate the logs of EVERY call: `take_logs` drains, so a per-call snapshot appended
+        // here is the only way to see phase A's fills and phase B's together.
+        let mut logs: Vec<primitives::Log> = Vec::new();
+        macro_rules! collect {
+            () => {
+                logs.extend(JournalTr::take_logs(ctx.journal_mut()))
+            };
+        }
+
+        // ── phase A: everyone opens (rp = 0 on every leg of every party) ──
+        place(&mut ctx, BOB, 1, 102 * TICK, QTY, 0, 0);
+        place(&mut ctx, CAROL, 1, 101 * TICK, QTY, 0, 0);
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        collect!();
+        place(&mut ctx, ALICE, 0, 0, 3 * QTY, 1, 1); // market buy 3
+        end_call(&mut ctx);
+        collect!();
+
+        // ── phase B: ALICE closes 3 and flips to short 2; the makers close (and CAROL flips) ──
+        place(&mut ctx, BOB, 0, 103 * TICK, QTY, 0, 0);
+        place(&mut ctx, BOB, 0, 95 * TICK, QTY, 0, 0);
+        place(&mut ctx, CAROL, 0, 98 * TICK, 3 * QTY, 0, 0);
+        collect!();
+        place(&mut ctx, ALICE, 1, 0, 5 * QTY, 1, 1); // market sell 5
+        end_call(&mut ctx);
+        collect!();
+
+        let trades = decode_trades(&logs);
+        assert_eq!(
+            trades.len(),
+            6,
+            "3 opening fills + 3 closing fills; got {:?}",
+            trades.iter().map(|t| t.price).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            trades.iter().map(|t| t.price).collect::<Vec<_>>(),
+            vec![
+                PRICE,
+                101 * TICK,
+                102 * TICK, // buy taker sweeps the book from the BOTTOM
+                103 * TICK,
+                98 * TICK,
+                95 * TICK, // sell taker sweeps it from the TOP
+            ],
+            "the sweep order is what makes the per-fill values below the ones they are"
+        );
+
+        /// `Σ` of a user's own per-fill realised PnL over the whole stream: the TAKER column where
+        /// they took, the MAKER column where they were hit. One user can appear in both, which is
+        /// exactly why the projection has to be per-row rather than per-event.
+        fn sum_fill_rp(trades: &[crate::interface::IPerpDex::Trade], user: Address) -> i64 {
+            trades
+                .iter()
+                .map(|t| {
+                    (if t.taker == user {
+                        t.takerRealizedPnl
+                    } else {
+                        0
+                    }) + (if t.maker == user {
+                        t.makerRealizedPnl
+                    } else {
+                        0
+                    })
+                })
+                .sum()
+        }
+
+        // ── the per-fill values, pinned ────────────────────────────────────────────────────────
+        //
+        // ALICE, long 3 at vq = −3_030_000 (= −(1_000_000 + 1_010_000 + 1_020_000)), selling 5:
+        //   pos_abs = 3_000_000, closing_qty = 3_000_000
+        //   $103 q1  rem_q 2_000_000  rem_vq −2_020_000  vqf −1_010_000  +1_030_000 →  +20_000
+        //   $98  q3  rem_q         0  rem_vq          0  vqf −2_020_000  +1_960_000 →  −60_000
+        //   $95  q1  pure OPENING (remaining_closing_qty already 0)               →        0
+        assert_eq!(
+            trades
+                .iter()
+                .map(|t| t.takerRealizedPnl)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0, 20_000, -60_000, 0],
+            "taker column: phase A is all opening; phase B mixes signs and ends on a pure open"
+        );
+        // BOB's two closing fills ($103 a loss, $95 a gain) and CAROL's flip fill ($98).
+        assert_eq!(
+            trades
+                .iter()
+                .map(|t| t.makerRealizedPnl)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0, -20_000, 30_000, 60_000],
+            "maker column: BOB loses on the $103 buy-back and gains on the $95 one"
+        );
+
+        // ── THE IDENTITY, per party ────────────────────────────────────────────────────────────
+        let changes = decode_position_changes(&logs);
+        for (user, label, expected) in [
+            (
+                ALICE,
+                "ALICE (taker, flips short, NEGATIVE total)",
+                -40_000i64,
+            ),
+            (BOB, "BOB (maker, one losing + one winning close)", 40_000),
+            (CAROL, "CAROL (maker, flips long in a single fill)", 30_000),
+        ] {
+            let last = changes
+                .iter()
+                .rfind(|c| c.user == user)
+                .unwrap_or_else(|| panic!("{label}: expected a PositionChanged"));
+            assert_eq!(
+                sum_fill_rp(&trades, user),
+                last.cumulativeRealizedPnl,
+                "{label}: Σ per-fill Trade realizedPnl must equal the published lifetime total"
+            );
+            // The VALUE too, so a derivation broken IDENTICALLY on both sides still fails.
+            assert_eq!(last.cumulativeRealizedPnl, expected, "{label}");
+            // And the event agrees with what is in the blob.
+            assert_eq!(
+                storage::load_position(&mut ctx, user, MARKET_ID)
+                    .unwrap()
+                    .cumulative_realized_pnl,
+                expected,
+                "{label}: stored"
+            );
+        }
+
+        // ── the fixture really is non-trivial ──────────────────────────────────────────────────
+        assert!(
+            trades.iter().any(|t| t.takerRealizedPnl < 0)
+                && trades.iter().any(|t| t.makerRealizedPnl < 0),
+            "a NEGATIVE close must be present on both columns"
+        );
+        // The flips: ALICE ends SHORT having been long, CAROL ends LONG having been short.
+        let (alice, carol) = (pos(&mut ctx, ALICE), pos(&mut ctx, CAROL));
+        assert!(
+            alice.amount < 0 && carol.amount > 0,
+            "both flips must have happened: alice {} carol {}",
+            alice.amount,
+            carol.amount
+        );
+        assert!(
+            market_fee_total(&mut ctx) > 0,
+            "fees must be non-zero, so the identity also says `cr` is fee-free"
+        );
+    }
+
+    // ── the remaining placeholder ────────────────────────────────────────────────────────────
+
+    /// ⚠️ **THIS TEST MUST BE UPDATED — not deleted — WHEN `breakevenPrice` IS POPULATED.**
+    ///
+    /// `breakevenPrice` (`P[].bep`) is carried so the payload shape is stable (the precedent the
+    /// public docs set for `ACCOUNT_UPDATE.a.m`) and is hardcoded 0 because the state it needs does
+    /// not exist: cumulative fees paid against the position. See the ABI comment on
     /// `PositionChanged`.
     ///
-    /// The scenario below deliberately GENERATES both quantities — a realised profit and paid
-    /// commissions on both sides — so the assertion is "zero even though there is something real
-    /// to report", not "zero because nothing happened". When the fields are wired, replace these
-    /// two `assert_eq!(.., 0)` with the true values; a green run here after that change means the
-    /// wiring never reached the event.
+    /// (`cumulativeRealizedPnl` used to be asserted zero alongside it and is now POPULATED — see
+    /// the three tests above. It is asserted non-zero here so this test also witnesses that the
+    /// two fields are independent: `bep` being 0 is not a symptom of the payload being unwired.)
+    ///
+    /// The fixture deliberately GENERATES the quantity — paid commissions on both sides — so the
+    /// assertion is "zero even though there is something real to report", not "zero because nothing
+    /// happened". When the field is wired, replace the `assert_eq!(.., 0)` with the true value; a
+    /// green run here after that change means the wiring never reached the event.
     #[test]
-    fn the_placeholder_position_fields_are_zero() {
+    fn the_breakeven_price_placeholder_is_zero() {
         let mut ctx = make_ctx();
         setup(&mut ctx);
         fund(&mut ctx, CAROL, WALLET);
@@ -15119,17 +15498,14 @@ mod position_changed_derived_fields {
         place(&mut ctx, ALICE, 1, 200 * TICK, QTY, 0, 0);
 
         let e = last_change(&mut ctx, ALICE);
-        assert!(
-            e.realizedPnl > 0 && e.closedQuantity == QTY,
-            "fixture must actually realise PnL, else the zeros below prove nothing:                  realizedPnl={} closedQuantity={}",
-            e.realizedPnl,
-            e.closedQuantity
-        );
         assert!(market_fee_total(&mut ctx) > 0, "fixture must pay fees");
-
-        assert_eq!(
+        assert!(
+            e.entryPrice > 0,
+            "there must be an entry price for `bep` to be an adjustment OF"
+        );
+        assert_ne!(
             e.cumulativeRealizedPnl, 0,
-            "PLACEHOLDER: needs a per-position cumulative realised-PnL field on PerpPosition"
+            "the sibling field is populated — the zero below is `bep`'s own, not a dead payload"
         );
         assert_eq!(
             e.breakevenPrice, 0,

@@ -114,6 +114,11 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         // When a residual IS cleared the write stands, the user stays marked, and the drain
         // publishes a legitimate 0-position group whose `totalWalletBalance` differs by the residual.
         if pos.v_quote_balance != 0 || pos.margin != 0 {
+            // A rounding-residue WRITE-OFF, not a close: the PnL of this liquidation's fills was
+            // already realised (and accumulated into `cumulative_realized_pnl`) by
+            // `settlement::apply_position_fill` on the taker path. So nothing is added to `cr`
+            // here — and, just as importantly, nothing RESETS it: `pos` is the loaded position and
+            // only these two fields are overwritten.
             pos.v_quote_balance = 0;
             pos.margin = 0;
             // `Adjustment`: a protocol-side WRITE-OFF, not the order's fill. The fills themselves
@@ -191,6 +196,19 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
         settlement_credit.unsigned_abs()
     };
 
+    // `cr`: the second and last accumulation site (the first is
+    // `settlement::apply_position_fill`, which every counterparty-matched close goes through).
+    // This close has no counterparty — the protocol values what the book could not absorb at mark
+    // — so it computes its own `realized_pnl` above and must credit it here or a liquidated
+    // user's lifetime total would silently omit its residual. `checked_add` for the same reason as
+    // there: a clamped total is worse than a revert.
+    pos.cumulative_realized_pnl = pos
+        .cumulative_realized_pnl
+        .checked_add(realized_pnl)
+        .ok_or_else(|| perp_err("liquidation: cumulative realized PnL overflow"))?;
+    // ⚠️ `amount`/`v_quote_balance`/`margin` go to zero; `cumulative_realized_pnl` deliberately
+    // does NOT. It is a lifetime statistic that has to survive the position being reopened — see
+    // the field's own note in `types::PerpPosition`.
     pos.amount = 0;
     pos.v_quote_balance = 0;
     pos.margin = 0;

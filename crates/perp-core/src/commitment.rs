@@ -123,7 +123,30 @@ use primitives::{B256, U256};
 // plus account keys on the margin-moving position writes), so a node on 22 and a node on 23 would
 // disagree on the commitment. CHAIN change: golden re-pin (see `trading::tests::golden`) + a
 // coordinated wipe on deploy. The golden scenario's BusinessSnapshot is UNCHANGED, field for field.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 23;
+// Cumulative realised PnL per position (`ACCOUNT_UPDATE.a.P[].cr`): bumped 23→24 — a LAYOUT change
+// only; NO execution rule moves and no money is routed differently. `PerpPosition` gains a trailing
+// "cr" field (`cumulative_realized_pnl`), so EVERY stored position blob grows by one integer, and
+// every close now writes a position key with a different trailing value than it used to. Positional
+// msgpack means a trailing field is the only safe place to add one (`codec::encode`), and it is
+// where this one is.
+//
+// Why it has to be STORED rather than derived: it is the running sum of the per-closing-leg
+// `realized_pnl` that `PositionChanged` already publishes as a per-event DELTA, and it must SURVIVE
+// the position going flat and being reopened. Nothing in `(amount, v_quote_balance, margin)` retains
+// a closed round's PnL, so there is no state to reconstruct it from — which is precisely the reason
+// the field was carried as a hardcoded `0` placeholder on the event until now.
+//
+// Two accumulation sites, both places a closing leg's PnL is computed:
+// `settlement::apply_position_fill` (taker, maker, both ADL legs) and
+// `liquidation::settle_liquidation_residual_at_mark_price`. `checked_add`, never saturating.
+//
+// No BUSINESS behaviour changes — nothing reads the field back to make a decision, no balance
+// identity contains it, and no gate conditions on it — but every position blob's bytes differ, so a
+// node on 23 and a node on 24 would disagree on the commitment. CHAIN change: golden re-pin (see
+// `trading::tests::golden`) + a coordinated wipe on deploy. The golden scenario's BusinessSnapshot is
+// UNCHANGED, field for field (it pins `getPosition`'s `(amount, vQuoteBalance, margin)` triples and
+// `getAccount`'s `availableBalance`, none of which carries this field).
+pub const BLOCK_COMMITMENT_VERSION: u8 = 24;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

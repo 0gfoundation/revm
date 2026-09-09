@@ -1016,6 +1016,12 @@ pub fn save_position<H: PerpHost>(
     // happen to be in an index when a snapshot is published, and it is what makes
     // `Σ_index pos.margin == Σ_all pos.margin` (so `getAccount`'s index-driven cross-check below can
     // validate an aggregate maintained over ALL markets).
+    //
+    // ⚠️ IT COVERS `margin` AND NOTHING ELSE, and in particular NOT
+    // `pos.cumulative_realized_pnl`. A flat position carrying a non-zero `cr` is the intended
+    // state — that field is a lifetime statistic that has to survive a close and a reopen, which
+    // is the whole reason it is stored (see `types::PerpPosition`). The argument above is about
+    // MONEY: `Σ pos.margin` is half of a published balance, and `cr` is in no balance identity.
     debug_assert!(
         pos.amount != 0 || pos.margin == 0,
         "save_position: {user} market {market_id} written flat but holding margin {} — every close \
@@ -1124,6 +1130,10 @@ pub fn save_position_leverage_only<H: PerpHost>(
                 p.total_buy_notional,
                 p.total_sell_qty,
                 p.total_sell_notional,
+                // `cumulative_realized_pnl` too: nothing but a CLOSE may move it, and a leverage
+                // change closes nothing. It is not a balance, so unlike the fields above it would
+                // not desync a published total — it would corrupt a lifetime statistic, silently.
+                p.cumulative_realized_pnl,
             )
         };
         debug_assert_eq!(
@@ -2848,6 +2858,7 @@ mod size_probe_tests {
             total_buy_notional: 50_000_000,
             total_sell_qty: 12_000_000,
             total_sell_notional: 10_000_000,
+            cumulative_realized_pnl: -4_200_000,
         };
         let buf = encode(&pos).unwrap();
         println!(
@@ -3079,6 +3090,10 @@ mod encoding_roundtrip_tests {
                 total_buy_notional: u64::MAX,
                 total_sell_qty: 0,
                 total_sell_notional: u64::MAX,
+                // The signed extreme on the accumulator too: it is the one field that grows
+                // monotonically over a position's whole life, so its round-trip at `i64::MIN`
+                // matters more than most.
+                cumulative_realized_pnl: i64::MIN,
             },
         );
         rt(

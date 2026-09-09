@@ -147,6 +147,18 @@ fn set_position(
     .unwrap();
 }
 
+/// Stamp a lifetime realised-PnL total onto an existing position.
+///
+/// Separate from [`set_position`] rather than a seventh parameter: `cumulative_realized_pnl` is the
+/// one field of a row that is NOT a function of the current position (it deliberately survives a
+/// close), so the tests that care about it are few and the ones that do not should not have to name
+/// it. Writes through `save_position` like everything else here.
+fn set_cumulative_realized_pnl(ctx: &mut TestCtx, user: Address, market_id: u64, cr: i64) {
+    let mut pos = storage::load_position(ctx, user, market_id).unwrap();
+    pos.cumulative_realized_pnl = cr;
+    storage::save_position(ctx, user, market_id, &pos, AccountUpdateReason::Adjustment).unwrap();
+}
+
 /// A resting entry at `price`. `assuming_price` is left at the BUY rule (== the limit price);
 /// [`set_orders`] re-freezes it for whichever side the entry is installed on, so a caller does not
 /// have to know `T`.
@@ -304,7 +316,7 @@ fn get_account(ctx: &mut TestCtx, user: Address) -> getAccountReturn {
 /// An array rather than a tuple because 17 fields is past the arity std implements `PartialEq` for —
 /// and positional over ALL of them on purpose: a comparison field-by-field by name would still pass
 /// if two same-typed fields were swapped on one side.
-fn row_fields(p: &AccountPosition) -> [i128; 17] {
+fn row_fields(p: &AccountPosition) -> [i128; 18] {
     [
         p.marketId as i128,
         p.markPrice as i128,
@@ -323,6 +335,7 @@ fn row_fields(p: &AccountPosition) -> [i128; 17] {
         p.maintMargin as i128,
         p.isolatedWallet as i128,
         p.liquidationPrice as i128,
+        p.cumulativeRealizedPnl as i128,
     ]
 }
 
@@ -1488,7 +1501,7 @@ fn get_account_totals_equal_the_sum_of_per_market_position_risk() {
 /// `fold_account_margin` rather than recomputed): a row paired with the wrong `marketId`, rows built
 /// from a different market set than the totals, one path reaching a different `MarginInfo` than the
 /// other, and any future re-introduction of a second encoder that drops or mis-assigns a field.
-/// Comparison is positional over ALL SEVENTEEN numbers — no shared-subset carve-out any more, since
+/// Comparison is positional over ALL EIGHTEEN numbers — no shared-subset carve-out any more, since
 /// there is no longer a surface that carries fewer — so a swap of two same-typed fields on one side
 /// fails too.
 ///
@@ -1532,6 +1545,11 @@ fn get_account_positions_agree_with_get_position_risk_field_for_field() {
     );
     // Market B: SHORT on the fractional grid with an under-funded silo and NEGATIVE unrealised PnL.
     set_position(&mut ctx, ALICE, MARKET_B, -3, 300, 200, 1);
+    // A lifetime realised total on ONE market and not the others, of the sign the others' derived
+    // fields never take — so a row paired with the wrong market, or a `cr` plumbed from the wrong
+    // position, cannot pass by looking like everything else. It is the one row field that is not a
+    // function of the current position, hence the separate write.
+    set_cumulative_realized_pnl(&mut ctx, ALICE, MARKET_B, -12_345);
     // Market C: LONG entered at $100 with the mark down at $60 ⇒ −$40 unrealised, sell side only.
     set_position(
         &mut ctx,
@@ -1564,7 +1582,7 @@ fn get_account_positions_agree_with_get_position_risk_field_for_field() {
 
     // ── the fixture really does exercise every field ──
     // Without this the loop above could pass on three rows of zeros, which would prove nothing about
-    // the encoders. Each of the 15 non-id numbers has to be non-trivial SOMEWHERE in the row set.
+    // the encoders. Each of the 16 non-id numbers has to be non-trivial SOMEWHERE in the row set.
     let nonzero = |f: fn(&AccountPosition) -> i128| a.positions.iter().any(|p| f(p) != 0);
     assert!(
         nonzero(|p| p.markPrice as i128)
@@ -1582,7 +1600,8 @@ fn get_account_positions_agree_with_get_position_risk_field_for_field() {
             && nonzero(|p| p.initialMargin as i128)
             && nonzero(|p| p.maintMargin as i128)
             && nonzero(|p| p.isolatedWallet as i128)
-            && nonzero(|p| p.liquidationPrice as i128),
+            && nonzero(|p| p.liquidationPrice as i128)
+            && nonzero(|p| p.cumulativeRealizedPnl as i128),
         "every row field must be non-trivial somewhere in the fixture, or the agreement above is \
          an agreement about zeros: {:?}",
         a.positions.iter().map(row_fields).collect::<Vec<_>>()
@@ -1702,9 +1721,35 @@ fn a_market_the_user_is_not_in_is_absent_from_positions_but_readable_singly() {
             0,
             0,
             0, // liquidationPrice: nothing to liquidate
+            0, // cumulativeRealizedPnl: never traded here
         ],
         "a market the user holds nothing in reads back as a zero row at the market's live mark, \
          with leverage floored to 1 — not a revert, and not absent"
+    );
+
+    // ── THE ACCEPTED LIMITATION ON `cr`, stated as a test ──────────────────────────────────────
+    //
+    // `cumulativeRealizedPnl` is a LIFETIME total that deliberately survives a close, but the
+    // market does NOT survive in the index: a flat position with no resting orders leaves it. So
+    // the two halves of the asymmetry above have a consequence specific to this one field, and it
+    // is the whole reason the ABI comment on `PositionChanged` documents a limitation —
+    //
+    //   * the value stays readable per-market, indefinitely, through `getPositionRisk`; but
+    //   * the SET of markets a user has history in is NOT enumerable on chain.
+    //
+    // Keeping such markets indexed was rejected: the index would grow without bound against
+    // `MAX_USER_MARKETS`. A consumer that wants that set keeps its own, from the event stream.
+    set_cumulative_realized_pnl(&mut ctx, ALICE, MARKET_C, -777);
+    assert_eq!(
+        market_ids(&get_account(&mut ctx, ALICE)),
+        vec![MARKET_A],
+        "a lifetime realised total does NOT put a flat, order-less market back into the index — \
+         if it did, the index would be unbounded"
+    );
+    assert_eq!(
+        position_risk(&mut ctx, ALICE, MARKET_C).cumulativeRealizedPnl,
+        -777,
+        "…and it is still readable for that market on request: the position blob is never deleted"
     );
 }
 

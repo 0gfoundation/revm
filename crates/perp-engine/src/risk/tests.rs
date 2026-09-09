@@ -465,6 +465,19 @@ fn adl_closes_insolvent_residual_against_opposite_holder_conserving_no_if() {
     assert_eq!(position_changes[1].user, KEEPER);
     assert_eq!(position_changes[1].realizedPnl, 200_000_000);
     assert_eq!(position_changes[1].closedQuantity, QTY as u64);
+    // `cr` on BOTH ADL legs. The legs reach `apply_position_fill` through `adl_fill`'s
+    // TRIAL-then-commit dance (each side is filled on a CLONE and kept only if both come out
+    // bad-debt free), so this is also the assertion that the accumulation is not lost with a
+    // discarded trial — and, on the loser side, that it is not lost when the position is written
+    // FLAT after the fill loop.
+    assert_eq!(
+        (
+            position_changes[0].cumulativeRealizedPnl,
+            position_changes[1].cumulativeRealizedPnl
+        ),
+        (-200_000_000, 200_000_000),
+        "each ADL leg's lifetime total is its own realised PnL — this is each party's first close"
+    );
 
     assert_eq!(
         position(&mut ctx, ALICE).amount,
@@ -475,6 +488,16 @@ fn adl_closes_insolvent_residual_against_opposite_holder_conserving_no_if() {
         position(&mut ctx, KEEPER).amount,
         0,
         "opposite short absorbed the residual"
+    );
+    // …and it is still there on the FLAT positions both legs left behind, in the blob rather than
+    // only in the event.
+    assert_eq!(
+        (
+            position(&mut ctx, ALICE).cumulative_realized_pnl,
+            position(&mut ctx, KEEPER).cumulative_realized_pnl
+        ),
+        (-200_000_000, 200_000_000),
+        "`cr` survives the ADL close on both sides"
     );
     assert!(storage::load_position_registry(&mut ctx, MARKET_ID)
         .unwrap()
@@ -2879,6 +2902,52 @@ fn liquidate_settles_residual_at_mark_when_orderbook_cannot_fully_close() {
         "position fully closed via book + residual-at-mark"
     );
     assert_eq!(alice.v_quote_balance, 0);
+
+    // ── `cr` ACROSS THE TWO-LEG CLOSE ──────────────────────────────────────────────────────────
+    //
+    // This liquidation closes through BOTH accumulation sites: the book absorbs `QTY − 1` via
+    // `settlement::apply_position_fill` (the taker path) and the 1-unit residual is settled at
+    // MARK against no counterparty by `settle_liquidation_residual_at_mark_price`, which computes
+    // its own `realized_pnl` and therefore has to credit it itself. The residual site has no other
+    // coverage of this field, and a `cr` that omitted it would be short by a silent, arbitrary
+    // fraction of the position rather than by something a reader would notice.
+    //
+    // So the total must equal the WHOLE position's realised loss, split over the two legs exactly
+    // as the emitted events split it — checked against the events rather than restated, and pinned
+    // to a literal so a derivation broken identically on both sides still fails.
+    let changes = take_position_changes(&mut ctx);
+    let legs: Vec<i64> = changes
+        .iter()
+        .filter(|c| c.user == ALICE)
+        .map(|c| c.realizedPnl)
+        .collect();
+    assert_eq!(
+        legs.len(),
+        2,
+        "the fixture must close in TWO legs (book + residual), else the residual site is untested"
+    );
+    assert!(
+        legs.iter().all(|&l| l != 0),
+        "both legs must realise something: {legs:?}"
+    );
+    assert_eq!(
+        alice.cumulative_realized_pnl,
+        legs.iter().sum::<i64>(),
+        "`cr` is the sum of BOTH legs — the book fill and the residual settled at mark"
+    );
+    assert_eq!(
+        alice.cumulative_realized_pnl, -100_000_000,
+        "the whole long realised −$100 closing at the $90 mark from a $100 entry"
+    );
+    // The LAST event ALICE got is the residual's, and it publishes the completed total.
+    assert_eq!(
+        changes
+            .iter()
+            .rfind(|c| c.user == ALICE)
+            .unwrap()
+            .cumulativeRealizedPnl,
+        -100_000_000
+    );
 }
 
 /// CHANGED BY THE ESCROW REMOVAL (mechanism, not outcome). This used to assert that liquidation

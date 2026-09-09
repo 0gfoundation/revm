@@ -2228,6 +2228,34 @@ pub(super) fn apply_position_fill(
         realized_pnl = vq_fraction
             .checked_add(close_quote_delta)
             .ok_or_else(|| perp_err("settlement: realized PnL overflow"))?;
+        // ── `cr`: the LIFETIME accumulator, incremented HERE and at one other place ─────────────
+        //
+        // This is the choke point for close PnL on every ordinary path — the taker settlement
+        // (`finalize_core`, on the summed legs), the deferred maker settlement
+        // (`settle_maker_fill_core`) and BOTH ADL legs (`liquidation::adl_fill`) all reach a
+        // closing leg only through here — so accumulating at this line covers them at once
+        // instead of asking four call sites to remember. The only close that does NOT come
+        // through here is the liquidation residual settled at mark with no counterparty
+        // (`liquidation::settle_liquidation_residual_at_mark_price`), which accumulates its own.
+        //
+        // A purely OPENING leg (`closing_qty == 0`) never enters this block, so a flip accrues
+        // only its closing half — exactly the apportionment R15 measured (`rp` covers the close).
+        //
+        // `checked_add`, NOT saturating. Saturating would publish a number that still reads as a
+        // lifetime total and silently is not; a revert is the honest failure, and it is
+        // unreachable in practice: each term is a `realized_pnl` bounded by the `i64` quote
+        // universe, and the accumulator would have to be driven to `±9.2e18` quote micro-units
+        // (≈ ±9.2e12 USDC of NET realised PnL on ONE market for ONE user) to trip. The per-fill
+        // terms cannot be inflated to get there either — a profit is paid out of some
+        // counterparty's collateral, so the sum is bounded by real money that has moved.
+        //
+        // ⚠️ Accumulating on the WORKING `pos` is what makes the ADL trial/commit dance correct:
+        // `adl_fill` runs this on CLONES and keeps them only if both sides come out bad-debt
+        // free, so a rejected trial's increment is discarded with the clone.
+        pos.cumulative_realized_pnl = pos
+            .cumulative_realized_pnl
+            .checked_add(realized_pnl)
+            .ok_or_else(|| perp_err("settlement: cumulative realized PnL overflow"))?;
         let settlement_credit = margin_release
             .checked_add(realized_pnl)
             .ok_or_else(|| perp_err("settlement: close credit overflow"))?;

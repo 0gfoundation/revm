@@ -162,6 +162,20 @@ pub struct MarginInfo {
     /// search adds **zero storage loads** and cannot describe a different position than the row it
     /// sits in.
     pub liquidation_price: u64,
+    /// `cr` — the LIFETIME realised PnL for this `(user, market)`, read verbatim off
+    /// [`crate::types::PerpPosition::cumulative_realized_pnl`].
+    ///
+    /// It is here for the same reason `liquidation_price` is (see the note above it): `MarginInfo`
+    /// is exactly the set [`crate::interface::IPerpDex::AccountPosition`] encodes, and a number
+    /// reported on that row belongs here or it gets plumbed by hand to every construction site.
+    ///
+    /// **The only field in this struct that is not a function of the CURRENT position.** Everything
+    /// else is recomputed from `(mark, amount, vQuote, margin, leverage, Bid, Ask)` and goes to zero
+    /// when the position does; this one is a stored lifetime total that deliberately survives the
+    /// close, so a flat row can legitimately carry a non-zero value. Nothing derives from it and it
+    /// enters no Σ — the account-level fold has no `cr` term, because summing lifetime PnL across
+    /// markets is not a quantity Binance's account payload reports.
+    pub cumulative_realized_pnl: i64,
 }
 
 /// The derived open-order requirement for ONE `(market, position)` pair, computed from
@@ -537,6 +551,9 @@ pub fn margin_info_of(
         maint_margin,
         position_margin: pos.margin,
         liquidation_price,
+        // Verbatim, not derived: this is a stored lifetime total, so the row and the
+        // `PositionChanged` event report the same field rather than two derivations of it.
+        cumulative_realized_pnl: pos.cumulative_realized_pnl,
     })
 }
 
@@ -811,6 +828,7 @@ impl AccountPositionRow {
             maintMargin: i.maint_margin,
             isolatedWallet: i.position_margin,
             liquidationPrice: i.liquidation_price,
+            cumulativeRealizedPnl: i.cumulative_realized_pnl,
         }
     }
 }

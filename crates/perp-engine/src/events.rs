@@ -12,6 +12,10 @@
 //! an entry-price division is the drift this codebase keeps deleting, so the derivation exists
 //! once, here, and every site calls [`emit_position_changed`].
 //!
+//! `cumulativeRealizedPnl` (`cr`) is the mirror-image case and is why the two belong in one helper:
+//! it is a stored LEVEL read straight off the position, so it is right on every emit site without
+//! any site knowing about it — including the ones that pass `realized_pnl = 0`.
+//!
 //! Nothing in this module writes storage. Both derived fields come from `perp_core::math`
 //! (`calc_entry_price`, `calc_value_i64`) so the log agrees digit-for-digit with what
 //! `getPosition` and every `AccountPosition` row report for the same state — there is no second
@@ -118,9 +122,16 @@ pub(crate) fn emit_position_changed_at_mark<H: PerpHost>(
             closedQuantity: closed_quantity,
             entryPrice: entry_price,
             unrealizedProfit: unrealized_profit,
-            // PLACEHOLDERS — always zero. See the ABI comment on `PositionChanged`; do not read
-            // these as data and do not populate them from here without adding the state they need.
-            cumulativeRealizedPnl: 0,
+            // `cr` — READ OFF THE POSITION, never derived and never accumulated here. It is a
+            // stored LEVEL (`PerpPosition::cumulative_realized_pnl`), maintained at the two places
+            // a closing leg's PnL is computed, so every one of the seven emit sites publishes the
+            // authoritative running total for free — including the ones whose own `realized_pnl`
+            // argument is 0 (funding, add/remove margin), which are after-images of a history that
+            // did not change rather than reports of nothing having happened.
+            cumulativeRealizedPnl: pos.cumulative_realized_pnl,
+            // STILL A PLACEHOLDER — always zero. It needs cumulative fees paid against the
+            // position, which nothing stores. See the ABI comment on `PositionChanged`; do not read
+            // it as data and do not populate it from here without adding that state.
             breakevenPrice: 0,
         }
         .to_log_data(),

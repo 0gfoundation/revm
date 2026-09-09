@@ -112,6 +112,40 @@ pub struct PerpPosition {
     /// `Ask` — Σ `calc_value(assuming_price, amount)` over resting SELL orders (quote units).
     #[serde(default, rename = "tsn")]
     pub total_sell_notional: u64,
+    /// `cr` — **LIFETIME** cumulative realised PnL for this `(user, market)`: the running sum of
+    /// every closing leg's `realized_pnl`, i.e. Binance's `ACCOUNT_UPDATE.a.P[].cr`.
+    ///
+    /// # It is a LEVEL, and it is the one field that OUTLIVES the position
+    ///
+    /// Every other field here describes the position that is open right now. This one describes
+    /// its whole history, so **it is deliberately NOT zeroed when the position closes** and must
+    /// survive the position going flat and being reopened. That is the entire reason it has to be
+    /// stored: `realized_pnl` on `PositionChanged` is a per-event DELTA, and nothing else in
+    /// `(amount, v_quote_balance, margin)` retains a closed round's PnL — a consumer that missed
+    /// one event could never recover the total from state.
+    ///
+    /// ⚠️ **Do NOT add it to `storage::save_position`'s `pos.amount != 0 || pos.margin == 0`
+    /// `debug_assert`.** A flat position carrying a non-zero `cr` is the FEATURE, not a leak; that
+    /// assertion is about MONEY (`Σ pos.margin` is a published balance) and this field is not
+    /// money — it is a statistic and no balance identity reads it. Pinned by
+    /// `trading::tests::position_changed_derived_fields::cumulative_realized_pnl_survives_a_close_and_a_reopen`.
+    ///
+    /// # What is and is not in it
+    ///
+    /// The sum of exactly the quantity `PositionChanged.realizedPnl` reports — gross close PnL,
+    /// **excluding** released margin, trading fees and funding, matching what R15 measured on
+    /// mainnet (`cr` was the rolling sum of `rp` over 10 fills with no residual). Every accumulation
+    /// site is therefore a place a closing leg's PnL is computed, and there are exactly two:
+    /// `trading::settlement::apply_position_fill` (taker, maker, and both ADL legs) and
+    /// `trading::liquidation::settle_liquidation_residual_at_mark_price` (the residual closed at
+    /// mark with no counterparty). An opening leg contributes 0, so a flip only accrues its closing
+    /// half.
+    ///
+    /// Accumulated with `checked_add`, never saturating: a silently clamped lifetime total is a
+    /// number that reads as data and is not, and reverting is the honest failure. `i64` is ample —
+    /// see the overflow note in `apply_position_fill`.
+    #[serde(default, rename = "cr")]
+    pub cumulative_realized_pnl: i64,
 }
 
 impl PerpPosition {
@@ -139,6 +173,9 @@ impl Default for PerpPosition {
             total_buy_notional: 0,
             total_sell_qty: 0,
             total_sell_notional: 0,
+            // A position that never existed has realised nothing. The only default that is NOT
+            // trivially right is `leverage`, which is 1 rather than 0.
+            cumulative_realized_pnl: 0,
         }
     }
 }
