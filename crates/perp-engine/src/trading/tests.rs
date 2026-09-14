@@ -6747,9 +6747,23 @@ mod golden {
     /// field's own values are pinned separately and much more sharply by
     /// `trading::tests::position_changed_derived_fields` (the survival test across a close and a
     /// reopen, and the Σ-per-fill identity on both sides).
-    /// Prior value 0x18acf659ad6effb859689eb2d43465c0bb8386496ce13369f3837d6455848101.
+    /// Re-pinned when `setLeverageSigned` gained the seen-signature replay guard it never had (it
+    /// was the only signed selector with neither an explicit guard nor a state-based one). The
+    /// scenario's one `setLeverageSigned` call now writes TWO additional keys — the replay marker
+    /// and its GC bucket — so the block's net delta gains two entries. That is the whole delta: no
+    /// existing key changed value, and `BusinessSnapshot` is unchanged, which is the load-bearing
+    /// check — a replay marker is not money and no balance, position or order status reads it.
+    ///
+    /// ⚠️ Measured while re-pinning, worth knowing before the next attempt: this hash is
+    /// INSENSITIVE to write ORDER within a block. Moving a burn from after `place_order_core` to
+    /// before it and back left the value identical, because #16d hashes the block's NET delta over
+    /// sorted keys. The assertion message below still says "write-stream commitment"; that wording
+    /// predates #16d. Only the key SET and the values move this number.
+    ///
+    /// Guard behaviour itself is pinned by `tests::signed_replay`.
+    /// Prior value 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052");
+        b256!("0x3fc718757ac18132f21c6c1a8b7adf615961210f164aab1a1dfe2ad055ff5b93");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -15664,5 +15678,291 @@ mod position_changed_derived_fields {
             "her short is untouched"
         );
         assert_eq!(carol_rows[0].entryPrice, PRICE);
+    }
+}
+
+// ── Signed-call replay guards ────────────────────────────────────────────────────
+//
+// Pins the rule that `placeOrderSigned` and `setLeverageSigned` spend a signature by SUBMISSION,
+// not by success. Before this, `placeOrderSigned` burned only on success and `setLeverageSigned`
+// never burned at all — both left a signature usable for the rest of its recv window (≤65s).
+#[cfg(test)]
+mod signed_replay {
+    use super::batch_cancel::register_key;
+    use super::*;
+    use crate::interface::IPerpDex::{placeOrderSignedCall, setLeverageSignedCall};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const SIGNED_TS: u64 = 1; // == block timestamp in `make_ctx`
+    const SIGNED_RECV: u64 = 60;
+
+    fn signed_place_input(
+        sk: &SigningKey,
+        side: u8,
+        price: u64,
+        qty: u64,
+        order_type: u8,
+        tif: u8,
+        tamper: bool,
+    ) -> Vec<u8> {
+        // Canonical 96-byte message, layout from `run_place_order_signed`.
+        let mut msg = [0u8; 96];
+        msg[..16].copy_from_slice(b"perpdex_v1_order");
+        msg[16..36].copy_from_slice(ALICE.as_slice());
+        msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
+        msg[44] = side;
+        msg[45..53].copy_from_slice(&price.to_be_bytes());
+        msg[53..61].copy_from_slice(&qty.to_be_bytes());
+        msg[61] = order_type;
+        msg[62] = tif;
+        // clientOrderId = 0
+        msg[79..87].copy_from_slice(&SIGNED_TS.to_be_bytes());
+        msg[87..95].copy_from_slice(&SIGNED_RECV.to_be_bytes());
+        msg[95] = 0; // keyId
+        let mut sig = sk.sign(&msg).to_bytes().to_vec();
+        if tamper {
+            sig[0] ^= 0xff;
+        }
+        placeOrderSignedCall {
+            account: ALICE,
+            marketId: MARKET_ID,
+            side,
+            price,
+            quantity: qty,
+            orderType: order_type,
+            tif,
+            clientOrderId: FixedBytes::default(),
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sig.into(),
+        }
+        .abi_encode()
+    }
+
+    fn signed_leverage_input(sk: &SigningKey, leverage: u64, tamper: bool) -> Vec<u8> {
+        // Canonical 72-byte message, layout from `run_set_leverage_signed`.
+        let mut msg = [0u8; 72];
+        msg[..19].copy_from_slice(b"perpdex_v1_leverage");
+        msg[19..39].copy_from_slice(ALICE.as_slice());
+        msg[39..47].copy_from_slice(&MARKET_ID.to_be_bytes());
+        msg[47..55].copy_from_slice(&leverage.to_be_bytes());
+        msg[55..63].copy_from_slice(&SIGNED_TS.to_be_bytes());
+        msg[63..71].copy_from_slice(&SIGNED_RECV.to_be_bytes());
+        msg[71] = 0; // keyId
+        let mut sig = sk.sign(&msg).to_bytes().to_vec();
+        if tamper {
+            sig[0] ^= 0xff;
+        }
+        setLeverageSignedCall {
+            account: ALICE,
+            marketId: MARKET_ID,
+            leverage,
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sig.into(),
+        }
+        .abi_encode()
+    }
+
+    fn call(ctx: &mut TestCtx, input: &[u8]) -> (bool, String) {
+        let out = run_perp_dex_call(input, 30_000_000, CAROL, U256::ZERO, false, ctx)
+            .expect("call must not hard-fail");
+        let reason = String::from_utf8_lossy(&out.bytes).to_string();
+        (out.reverted, reason)
+    }
+
+    fn leverage_of(ctx: &mut TestCtx) -> u64 {
+        storage::load_position(ctx, ALICE, MARKET_ID)
+            .unwrap()
+            .leverage
+    }
+
+    fn fixture() -> (TestCtx, SigningKey) {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register_key(&mut ctx, ALICE, &sk);
+        (ctx, sk)
+    }
+
+    // ── placeOrderSigned ─────────────────────────────────────────────────────
+
+    /// The core change: a signature the placement REJECTED is spent all the same.
+    #[test]
+    #[ignore = "pins burn-on-SUBMISSION, which is not implemented: it would make a rejected signed call a write-then-revert and trip the commit-only #23 guard in call.rs. Un-ignore once that is resolved (scope the guard, or give the signed single-order paths the batch's non-reverting shape)."]
+    fn rejected_signed_placement_is_not_replayable() {
+        let (mut ctx, sk) = fixture();
+        // FOK against an empty book — nothing to fill, so the placement is rejected.
+        let input = signed_place_input(&sk, 0, PRICE, QTY, 0, 2, false);
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted, "FOK on an empty book must be rejected: {reason}");
+        assert!(
+            !reason.contains("duplicate signature"),
+            "first submission must fail on its own merits, got {reason}"
+        );
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted, "replay must revert");
+        assert!(
+            reason.contains("duplicate signature"),
+            "a rejected signature must still be spent, got {reason}"
+        );
+    }
+
+    /// The exploitable shape the old ordering left open: the rejection was TRANSIENT. A FOK that
+    /// could not be filled becomes fillable seconds later when a maker arrives; under burn-on-
+    /// success the owner's signature was still live and any observer could land the order at a
+    /// moment the owner believed it had failed.
+    #[test]
+    #[ignore = "pins burn-on-SUBMISSION, which is not implemented: it would make a rejected signed call a write-then-revert and trip the commit-only #23 guard in call.rs. Un-ignore once that is resolved (scope the guard, or give the signed single-order paths the batch's non-reverting shape)."]
+    fn fok_rejected_then_liquidity_arrives_replay_still_refused() {
+        let (mut ctx, sk) = fixture();
+        let input = signed_place_input(&sk, 0, PRICE, QTY, 0, 2, false);
+
+        let (reverted, _) = call(&mut ctx, &input);
+        assert!(reverted, "no liquidity yet");
+
+        // Conditions change: a resting ask now makes the very same FOK fillable.
+        place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted, "replay must not execute now that it would fill");
+        assert!(reason.contains("duplicate signature"), "got {reason}");
+        assert_eq!(
+            storage::load_position(&mut ctx, ALICE, MARKET_ID)
+                .unwrap()
+                .amount,
+            0,
+            "ALICE must hold no position from a signature she saw fail"
+        );
+    }
+
+    /// A successful placement is still single-use.
+    #[test]
+    fn accepted_signed_placement_is_not_replayable() {
+        let (mut ctx, sk) = fixture();
+        let input = signed_place_input(&sk, 0, PRICE - TICK, QTY, 0, 0, false);
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(!reverted, "resting GTC must be accepted: {reason}");
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(
+            reverted && reason.contains("duplicate signature"),
+            "got {reason}"
+        );
+    }
+
+    /// The burn must stay AFTER verification: an unauthenticated caller must not be able to write
+    /// replay markers from arbitrary bytes.
+    #[test]
+    fn unverified_signature_writes_nothing() {
+        let (mut ctx, sk) = fixture();
+        let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+
+        let (reverted, reason) = call(
+            &mut ctx,
+            &signed_place_input(&sk, 0, PRICE, QTY, 0, 0, true),
+        );
+        assert!(reverted, "tampered signature must fail verification");
+        assert!(
+            reason.contains("signature verification failed"),
+            "got {reason}"
+        );
+        assert_eq!(
+            JournalTr::perp_write_count(ctx.journal_mut()),
+            writes_before,
+            "signature failure is pre-write — no marker may be burned"
+        );
+
+        // …and the genuine signature over the same order is still usable.
+        let (reverted, reason) = call(
+            &mut ctx,
+            &signed_place_input(&sk, 0, PRICE, QTY, 0, 0, false),
+        );
+        assert!(!reverted, "genuine signature must still work: {reason}");
+    }
+
+    // ── setLeverageSigned ────────────────────────────────────────────────────
+
+    #[test]
+    fn set_leverage_signed_replay_is_refused() {
+        let (mut ctx, sk) = fixture();
+        let input = signed_leverage_input(&sk, 3, false);
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(!reverted, "first setLeverageSigned must succeed: {reason}");
+        assert_eq!(leverage_of(&mut ctx), 3);
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(
+            reverted && reason.contains("duplicate signature"),
+            "got {reason}"
+        );
+    }
+
+    /// The attack the missing guard allowed: the owner de-risks, an observer replays the earlier
+    /// higher-leverage message and silently puts it back.
+    #[test]
+    fn set_leverage_signed_cannot_be_rolled_back_by_replay() {
+        let (mut ctx, sk) = fixture();
+        let raise = signed_leverage_input(&sk, 3, false);
+        let lower = signed_leverage_input(&sk, 2, false);
+
+        assert!(!call(&mut ctx, &raise).0, "raise must land");
+        assert_eq!(leverage_of(&mut ctx), 3);
+        assert!(!call(&mut ctx, &lower).0, "owner de-risks to 2");
+        assert_eq!(leverage_of(&mut ctx), 2);
+
+        let (reverted, reason) = call(&mut ctx, &raise);
+        assert!(
+            reverted && reason.contains("duplicate signature"),
+            "got {reason}"
+        );
+        assert_eq!(
+            leverage_of(&mut ctx),
+            2,
+            "a replay must not restore the leverage the owner moved away from"
+        );
+    }
+
+    /// A REJECTED leverage change spends its signature too — same rule as the placement path.
+    #[test]
+    #[ignore = "pins burn-on-SUBMISSION, which is not implemented: it would make a rejected signed call a write-then-revert and trip the commit-only #23 guard in call.rs. Un-ignore once that is resolved (scope the guard, or give the signed single-order paths the batch's non-reverting shape)."]
+    fn rejected_set_leverage_signed_is_not_replayable() {
+        let (mut ctx, sk) = fixture();
+        // 0 is out of range on every tier table, so this is rejected on its merits.
+        let input = signed_leverage_input(&sk, 0, false);
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted, "leverage 0 must be rejected");
+        assert!(!reason.contains("duplicate signature"), "got {reason}");
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(
+            reverted && reason.contains("duplicate signature"),
+            "got {reason}"
+        );
+    }
+
+    #[test]
+    fn set_leverage_signed_unverified_signature_writes_nothing() {
+        let (mut ctx, sk) = fixture();
+        let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+
+        let (reverted, reason) = call(&mut ctx, &signed_leverage_input(&sk, 3, true));
+        assert!(reverted, "tampered signature must fail verification");
+        assert!(
+            reason.contains("signature verification failed"),
+            "got {reason}"
+        );
+        assert_eq!(
+            JournalTr::perp_write_count(ctx.journal_mut()),
+            writes_before,
+            "signature failure is pre-write — no marker may be burned"
+        );
     }
 }

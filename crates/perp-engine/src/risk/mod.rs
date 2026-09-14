@@ -3,7 +3,7 @@
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
 use crate::host::PerpHost;
-use primitives::{Address, Bytes, FixedBytes, Log};
+use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 
 use crate::{
         errors::perp_err,
@@ -27,8 +27,9 @@ use crate::{
     },
     storage,
     trading::{
-        check_api_key_expiry, check_recv_window, execute_liquidation_market_order, run_adl,
-        settle_liquidation_residual_at_mark_price, verify_ed25519,
+        check_api_key_expiry, check_recv_window, execute_liquidation_market_order,
+        gc_seen_buckets_best_effort, run_adl, settle_liquidation_residual_at_mark_price,
+        verify_ed25519,
     },
     types::{
         AccountUpdateReason, CancelReason, FundingState, IndexPriceState, MarginTier, MarginTiers,
@@ -512,7 +513,52 @@ pub fn run_set_leverage_signed<H: PerpHost>(
     verify_ed25519(&api_key.pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("setLeverageSigned: {e}")))?;
 
-    set_leverage_core(context, args.account, args.marketId, args.leverage)
+    // ── Replay guard ──────────────────────────────────────────────────────────────────────────
+    //
+    // This entrypoint had NONE. It was the only signed selector with neither an explicit guard nor
+    // a state-based one: `placeOrderSigned` / `batchPlaceOrdersSigned` / `batchCancelOrdersSigned`
+    // all burn the signature, and `cancelOrderSigned` is covered by terminal-status idempotence (a
+    // cancelled order cannot be cancelled twice). `set_leverage_core` offers no such backstop —
+    // re-applying the same leverage simply succeeds again.
+    //
+    // `check_recv_window` alone only bounds the exposure to ≤65s (60s cap + 5s skew). Inside that
+    // window the signature was a bearer token any observer could resubmit without limit, and the
+    // harm is ORDERING, not accumulation:
+    //
+    //     t0  owner signs A = "leverage 10", it lands           -> 10
+    //     t1  owner signs B = "leverage 3"  (de-risking), lands -> 3
+    //     t2  anyone replays A, still in window                 -> 10, silently
+    //
+    // The next position then opens at a leverage the owner had deliberately moved away from, with
+    // a nearer liquidation price. The ceiling is bounded and worth stating: an attacker can only
+    // replay a value the OWNER signed in the last ~65s, and `set_leverage_core` refuses to LOWER
+    // leverage on an open position, so against a live position a replay can only push leverage up.
+    // No fund path — this is risk-control integrity.
+    //
+    // Burned after success, mirroring `trading::run_place_order_signed`. That closes the sequence
+    // above completely: A and B both succeed, so both are burned and neither can be resubmitted.
+    //
+    // ⚠️ Two things it does NOT close, both shared with the placement path:
+    //   * a REJECTED leverage change stays replayable in-window (e.g. "set 3" refused while a
+    //     position is open at 10, then the position closes and a replay lands it). See the note at
+    //     the placement burn site for why burn-on-submission is not applied yet.
+    //   * ORDERING. Two in-flight leverage signatures have no defined order — a timestamp is a
+    //     freshness bound, not a sequence. Only a per-key nonce lets the owner say "this
+    //     supersedes that".
+    let sig_hash: [u8; 32] = keccak256(args.signature.as_ref()).0;
+    if storage::is_signature_seen(context, &sig_hash)? {
+        return Err(perp_err(
+            "setLeverageSigned: duplicate signature (already submitted)",
+        ));
+    }
+
+    let out = set_leverage_core(context, args.account, args.marketId, args.leverage)?;
+
+    let block_ts: u64 = context.timestamp();
+    storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
+    gc_seen_buckets_best_effort(context, block_ts)?;
+
+    Ok(out)
 }
 
 fn set_leverage_core<H: PerpHost>(
