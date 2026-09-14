@@ -1112,6 +1112,21 @@ fn place_order_core<H: PerpHost>(
     );
     let mut pending = Some(pending);
 
+    // ── reduce-only watchdog (taker side) ────────────────────────────────────────────────────
+    //
+    // The taker's own fills are bounded by the admission capacity computed a few statements above,
+    // so they can only ever close. Asserted as an OUTCOME rather than per-fill — "|position| did
+    // not grow" is mechanism-independent, so it survives a refactor of how the split is computed,
+    // and it needs nothing threaded through `finalize_core`.
+    #[cfg(debug_assertions)]
+    let abs_position_before = if validated.reduce_only {
+        storage::load_position_ref(context, account, market_id)?
+            .amount
+            .unsigned_abs()
+    } else {
+        0
+    };
+
     // The ONE dispatch on what the order is. `OrderKind` makes it total: there is no third case to
     // forget, and the limit arm gets its TIF by destructuring (not by re-reading a field that a
     // market order also has).
@@ -1143,6 +1158,17 @@ fn place_order_core<H: PerpHost>(
             &mut pending,
         )?,
     }
+    #[cfg(debug_assertions)]
+    if validated.reduce_only {
+        let after = storage::load_position_ref(context, account, market_id)?
+            .amount
+            .unsigned_abs();
+        debug_assert!(
+            after <= abs_position_before,
+            "reduce-only taker order grew the position from {abs_position_before} to {after}"
+        );
+    }
+
     // Fallback flush: the order is accepted (every genuine reject returned above) but reached no
     // other apply site — an IOC/market order that expired against an empty book matches nothing and
     // rests nothing, yet legitimately emits OrderPlaced. No-op when an apply already flushed it.

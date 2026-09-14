@@ -1692,6 +1692,31 @@ pub(super) fn settle_maker_fill_core(
 
     // Compute the fill on a TRIAL clone first (single computation — adopted verbatim on accept).
     let fill = split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market)?;
+    // ── reduce-only watchdog (maker side) ────────────────────────────────────────────────────
+    //
+    // NOT a clamp. `crate::reduce_only`'s prefix condition at ADMISSION is what guarantees this,
+    // and the whole design rests on that guarantee: it is why the fill path needs no per-fill
+    // clamp and why eviction does not have to run mid-walk. If this ever fires, the predicate or
+    // one of its evaluation points is wrong, and clamping here would hide that.
+    //
+    // Debug-only, so a release build will NOT catch a wrong position — which is precisely why the
+    // predicate is not allowed to be approximately right.
+    #[cfg(debug_assertions)]
+    {
+        let entry_is_reduce_only = match maker_side {
+            Side::Buy => &*buy_entries,
+            Side::Sell => &*sell_entries,
+        }
+        .iter()
+        .find(|e| &e.order_id == maker_order_id)
+        .is_some_and(|e| e.reduce_only);
+        debug_assert!(
+            !entry_is_reduce_only || fill.opening_qty == 0,
+            "reduce-only maker order {maker_order_id:?} produced an OPENING fill of {}              (position {}, fill {fill_qty} @ {fill_price})",
+            fill.opening_qty,
+            pos.amount,
+        );
+    }
     let mut trial_pos = pos.clone();
     let mut trial_wallet = account.perp_wallet_balance;
     let fill_outcome = apply_position_fill(

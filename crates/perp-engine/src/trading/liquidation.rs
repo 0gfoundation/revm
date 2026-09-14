@@ -464,6 +464,22 @@ pub(crate) fn run_adl<H: PerpHost>(
         // end state still gets published.
         storage::clear_account_snapshot_mark(context, loser);
     }
+
+    // ── reduce-only: ADL shrank (or flipped) the loser's position ────────────────────────────
+    //
+    // ADL is the ONE position-shrinking path that does not cancel the owner's orders — liquidation
+    // clears their whole book in the market, and a match-driven shrink is handled at the registry
+    // flush. So without this the loser's reduce-only orders would be left over-committed against a
+    // position that no longer covers them, with nothing to restore the prefix condition.
+    //
+    // The LOSER only: ADL candidates holding ANY resting order are excluded from the winner set
+    // above, so a winner cannot be holding a reduce-only order to evict.
+    crate::reduce_only::restore_both_sides(
+        context,
+        loser,
+        market,
+        crate::types::CancelReason::ReduceOnlyPositionShrank,
+    )?;
     Ok(())
 }
 

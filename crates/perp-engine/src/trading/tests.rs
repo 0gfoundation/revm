@@ -16505,6 +16505,107 @@ mod reduce_only_e2e {
         );
     }
 
+    fn placed_quantities(ctx: &mut TestCtx) -> Vec<u64> {
+        use crate::interface::IPerpDex::OrderPlaced;
+        JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .filter(|l| l.data.topics().first() == Some(&OrderPlaced::SIGNATURE_HASH))
+            .map(|l| {
+                OrderPlaced::decode_raw_log(l.data.topics(), &l.data.data)
+                    .unwrap()
+                    .quantity
+            })
+            .collect()
+    }
+
+    fn amount_of(ctx: &mut TestCtx, who: Address) -> i64 {
+        storage::load_position(ctx, who, MARKET_ID).unwrap().amount
+    }
+
+    /// The truncated size has to be readable from the EVENT, not just from storage — that is the
+    /// on-chain analogue of Binance's rewritten `origQty`, and `OrderPlaced` is the only event that
+    /// fires on EVERY accepted order (`OrderRested` is absent for an IOC or a full fill).
+    #[test]
+    fn order_placed_carries_the_truncated_quantity() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+        let _ = placed_quantities(&mut ctx); // drain
+
+        place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY * 10, RO).unwrap();
+        assert_eq!(
+            placed_quantities(&mut ctx),
+            vec![QTY * 3],
+            "the event must publish the ACCEPTED size, not the request"
+        );
+    }
+
+    /// A reduce-only order actually being MATCHED, which every other test here stops short of.
+    /// Closes the position exactly and leaves nothing behind.
+    #[test]
+    fn a_reduce_only_order_closes_the_position_when_it_fills() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+        let ro = place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY * 3, RO).unwrap();
+
+        // BOB lifts it.
+        place_flagged(&mut ctx, BOB, 0, PRICE + TICK, QTY * 3, 0).unwrap();
+
+        assert_eq!(amount_of(&mut ctx, ALICE), 0, "closed, not flipped");
+        assert!(storage::load_order(&mut ctx, &ro).unwrap().is_none());
+    }
+
+    /// ⚠️ THE test for the claim that mid-walk eviction is unnecessary.
+    ///
+    /// One sweep crosses a NORMAL sell and then a reduce-only sell behind it. Admission priced the
+    /// reduce-only order against the normal one already being ahead (capacity 3 − 1 = 2), so when
+    /// the walk reaches it the position still covers it in full and no clamp is needed. Without
+    /// the "count normal orders ahead" half of the prefix condition, the reduce-only order would
+    /// have been admitted at 3 and this sweep would leave ALICE SHORT.
+    #[test]
+    fn a_sweep_over_a_normal_order_and_then_a_reduce_only_one_never_opens() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+
+        // Nearer the touch (lower price) fills first.
+        place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY, 0).unwrap();
+        let ro = place_flagged(&mut ctx, ALICE, 1, PRICE + 2 * TICK, QTY * 3, RO).unwrap();
+        assert_eq!(
+            storage::load_order(&mut ctx, &ro).unwrap().unwrap().quantity,
+            QTY * 2,
+            "truncated to 3 − 1 ahead"
+        );
+
+        // One sweep takes both levels.
+        place_flagged(&mut ctx, BOB, 0, PRICE + 2 * TICK, QTY * 3, 0).unwrap();
+
+        assert_eq!(
+            amount_of(&mut ctx, ALICE),
+            0,
+            "1 + 2 closes exactly 3 — never short"
+        );
+    }
+
+    /// A partial fill leaves the remainder resting, and the prefix condition still holds against
+    /// the smaller position (1 of 3 left, 1 lot still committed). ⚠️ Whether Binance keeps the
+    /// remainder alive is UNMEASURED — five rounds never partially filled a reduce-only order — so
+    /// this pins OUR reading (it survives), not an observed behaviour.
+    #[test]
+    fn a_partially_filled_reduce_only_order_keeps_its_remainder() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+        let ro = place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY * 3, RO).unwrap();
+
+        place_flagged(&mut ctx, BOB, 0, PRICE + TICK, QTY * 2, 0).unwrap();
+
+        assert_eq!(amount_of(&mut ctx, ALICE), QTY as i64, "1 lot left");
+        let order = storage::load_order(&mut ctx, &ro).unwrap().expect("remainder survives");
+        assert_eq!(order.quantity - order.filled, QTY, "1 lot still committed");
+    }
+
     /// MEASURED exemption (§1.6): a one-step reduce-only order below the market minimum is
     /// accepted. It has to be — truncation routinely lands below any sane floor, and closing the
     /// last sliver of a position is the order a trader most needs.
