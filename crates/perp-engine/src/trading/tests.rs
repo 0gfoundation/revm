@@ -16027,6 +16027,48 @@ mod signed_replay {
         );
     }
 
+
+    // ── Domain separation across ALL signed selectors ────────────────────────
+
+    /// Every signed entrypoint opens its message with a domain prefix, and the messages that follow
+    /// are similar enough that the prefix is the only thing keeping them apart. `transferToPerp` and
+    /// `transferFromPerp` are the sharpest case — identical layout after the prefix, opposite
+    /// meaning — but the rest are one field away from each other too.
+    ///
+    /// Two properties, and DISTINCTNESS ALONE IS NOT ENOUGH. If prefix A were a proper prefix of B,
+    /// a message of kind B could be read as one of kind A with B's tail absorbed into A's first
+    /// field, so an A-verifier would accept bytes the owner signed as a B. Checking only
+    /// `a != b` would pass that and still be exploitable.
+    ///
+    /// Anything added to this list must be added here too.
+    #[test]
+    fn signed_domain_prefixes_are_pairwise_distinct_and_non_nesting() {
+        let prefixes: &[&[u8]] = &[
+            b"perpdex_v1_order",
+            b"perpdex_v1_cancel",
+            b"perpdex_v1_leverage",
+            b"perpdex_v1_batch_cancel",
+            b"perpdex_v1_batch_order",
+            b"perpdex_v1_xfer_to",
+            b"perpdex_v1_xfer_from",
+        ];
+        for (i, a) in prefixes.iter().enumerate() {
+            for (j, b) in prefixes.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert!(
+                    !b.starts_with(a),
+                    "{} is a prefix of {} — a {} message could be read as a {}",
+                    String::from_utf8_lossy(a),
+                    String::from_utf8_lossy(b),
+                    String::from_utf8_lossy(b),
+                    String::from_utf8_lossy(a),
+                );
+            }
+        }
+    }
+
     // ── cancelOrderSigned ────────────────────────────────────────────────────
 
     /// It used to rely on terminal-status idempotence alone. This is the gap that left: a cancel

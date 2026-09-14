@@ -674,3 +674,216 @@ fn metadata_only_call_emits_no_balance_after_image() {
         .iter()
         .all(|log| log.data.topics().first() != Some(&AccountBalanceChanged::SIGNATURE_HASH)));
 }
+
+// ── Signed inter-wallet transfers ────────────────────────────────────────────────
+//
+// `transferToPerpSigned` / `transferFromPerpSigned` let an API key fund and defund its own perp
+// wallet. They follow the shape every signed entrypoint shares — verify, seen-check, burn
+// unconditionally, measure the burn, tag the core's reject with that allowance — so these pin the
+// two things specific to THIS pair: the shared core cannot drift from the direct path, and the two
+// directions cannot be confused for one another.
+mod signed_transfers {
+    use super::*;
+    use crate::interface::IPerpDex::{transferFromPerpSignedCall, transferToPerpSignedCall};
+    use crate::types::ApiKey;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const SIGNED_TS: u64 = 1; // == block timestamp
+    const SIGNED_RECV: u64 = 60;
+    /// Anyone may relay a signed call; the authority is the signature, not the sender.
+    const RELAYER: Address = address!("3333333333333333333333333333333333333333");
+
+    fn signed_msg(prefix: &[u8], amount: u64) -> Vec<u8> {
+        let mut msg = prefix.to_vec();
+        msg.extend_from_slice(ALICE.as_slice());
+        msg.extend_from_slice(&amount.to_be_bytes());
+        msg.extend_from_slice(&SIGNED_TS.to_be_bytes());
+        msg.extend_from_slice(&SIGNED_RECV.to_be_bytes());
+        msg.push(0); // keyId
+        msg
+    }
+
+    /// `sign_prefix` is what gets SIGNED; the calldata is always built for `to`/`from` as named.
+    /// Splitting them is what lets the cross-direction confusion test exist at all.
+    fn to_input(sk: &SigningKey, amount: u64, sign_prefix: &[u8], tamper: bool) -> Vec<u8> {
+        let mut sig = sk.sign(&signed_msg(sign_prefix, amount)).to_bytes().to_vec();
+        if tamper {
+            sig[0] ^= 0xff;
+        }
+        transferToPerpSignedCall {
+            account: ALICE,
+            amount,
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sig.into(),
+        }
+        .abi_encode()
+    }
+
+    fn from_input(sk: &SigningKey, amount: u64, sign_prefix: &[u8], tamper: bool) -> Vec<u8> {
+        let mut sig = sk.sign(&signed_msg(sign_prefix, amount)).to_bytes().to_vec();
+        if tamper {
+            sig[0] ^= 0xff;
+        }
+        transferFromPerpSignedCall {
+            account: ALICE,
+            amount,
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sig.into(),
+        }
+        .abi_encode()
+    }
+
+    const TO: &[u8] = b"perpdex_v1_xfer_to";
+    const FROM: &[u8] = b"perpdex_v1_xfer_from";
+
+    fn call(ctx: &mut TestCtx, input: &[u8]) -> (bool, String) {
+        let out = crate::run_perp_dex_call(input, 1_000_000, RELAYER, U256::ZERO, false, ctx)
+            .expect("call must not hard-fail");
+        (out.reverted, String::from_utf8_lossy(&out.bytes).to_string())
+    }
+
+    /// ALICE with `spot` USDC already inside the DEX and a registered ed25519 key.
+    fn fixture(spot: u64) -> (TestCtx, SigningKey) {
+        let amount = U256::from(spot);
+        let mut ctx = make_ctx(amount);
+        run_deposit(&depositCall { amount }.abi_encode(), ALICE, &mut ctx).unwrap();
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        storage::save_api_key(
+            &mut ctx,
+            ALICE,
+            0,
+            ApiKey {
+                pubkey: sk.verifying_key().to_bytes(),
+                expiry: 0,
+            },
+        )
+        .unwrap();
+        (ctx, sk)
+    }
+
+    fn balances(ctx: &mut TestCtx) -> (U256, i64) {
+        let ret = run_get_account(&getAccountCall { user: ALICE }.abi_encode(), ctx).unwrap();
+        decode_get_account(&ret)
+    }
+
+    #[test]
+    fn a_relayer_can_move_funds_both_ways_for_the_key_owner() {
+        let (mut ctx, sk) = fixture(2_000_000);
+
+        let (reverted, reason) = call(&mut ctx, &to_input(&sk, 1_000_000, TO, false));
+        assert!(!reverted, "transferToPerpSigned must succeed: {reason}");
+        let (usdc, available) = balances(&mut ctx);
+        assert_eq!(usdc, U256::from(1_000_000u64), "spot debited");
+        assert_eq!(available, 1_000_000, "perp credited");
+
+        let (reverted, reason) = call(&mut ctx, &from_input(&sk, 400_000, FROM, false));
+        assert!(!reverted, "transferFromPerpSigned must succeed: {reason}");
+        let (usdc, available) = balances(&mut ctx);
+        assert_eq!(usdc, U256::from(1_400_000u64), "spot credited back");
+        assert_eq!(available, 600_000, "perp debited");
+    }
+
+    /// ⚠️ The reason the two directions carry different domain prefixes. Everything after the
+    /// prefix is byte-identical in layout, so a shared prefix would make "move 100 IN" and
+    /// "move 100 OUT" the same signed bytes, and a relayer could pick the selector.
+    #[test]
+    fn a_signature_for_one_direction_cannot_drive_the_other() {
+        let (mut ctx, sk) = fixture(2_000_000);
+        call(&mut ctx, &to_input(&sk, 1_000_000, TO, false));
+        let before = balances(&mut ctx);
+
+        // A genuine "move 500_000 OUT" signature, replayed against the IN selector…
+        let (reverted, reason) = call(&mut ctx, &to_input(&sk, 500_000, FROM, false));
+        assert!(reverted, "cross-direction reuse must fail: {reason}");
+        assert!(reason.contains("signature verification failed"), "got {reason}");
+
+        // …and the mirror image.
+        let (reverted, reason) = call(&mut ctx, &from_input(&sk, 500_000, TO, false));
+        assert!(reverted, "cross-direction reuse must fail: {reason}");
+        assert!(reason.contains("signature verification failed"), "got {reason}");
+
+        assert_eq!(balances(&mut ctx), before, "no balance may have moved");
+    }
+
+    #[test]
+    fn signatures_are_single_use_in_both_directions() {
+        let (mut ctx, sk) = fixture(2_000_000);
+
+        let input = to_input(&sk, 1_000_000, TO, false);
+        assert!(!call(&mut ctx, &input).0);
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted && reason.contains("duplicate signature"), "got {reason}");
+        assert_eq!(balances(&mut ctx).1, 1_000_000, "replay must not double-credit");
+
+        let input = from_input(&sk, 100_000, FROM, false);
+        assert!(!call(&mut ctx, &input).0);
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted && reason.contains("duplicate signature"), "got {reason}");
+        assert_eq!(balances(&mut ctx).1, 900_000, "replay must not double-debit");
+    }
+
+    /// Spending by SUBMISSION, not by success — the property that makes a transient rejection
+    /// un-exploitable. `transferFromPerp`'s rejection is exactly that kind: it is gated on derived
+    /// `available`, which moves as orders rest and positions open.
+    #[test]
+    fn a_rejected_transfer_still_spends_its_signature() {
+        let (mut ctx, sk) = fixture(1_000_000);
+        // Nothing in the perp wallet yet, so the money-out gate refuses.
+        let input = from_input(&sk, 500_000, FROM, false);
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted, "must be rejected on its merits");
+        assert!(reason.contains("insufficient perp wallet balance"), "got {reason}");
+
+        // Conditions change — the wallet is funded — and the same signature must STILL be refused.
+        assert!(!call(&mut ctx, &to_input(&sk, 1_000_000, TO, false)).0);
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted && reason.contains("duplicate signature"), "got {reason}");
+        assert_eq!(
+            balances(&mut ctx).1,
+            1_000_000,
+            "a spent signature must not move money once it would succeed"
+        );
+    }
+
+    /// The burn must stay after `verify_ed25519`, or anyone could write replay markers from
+    /// arbitrary bytes.
+    #[test]
+    fn an_unverified_signature_writes_nothing() {
+        let (mut ctx, sk) = fixture(1_000_000);
+        let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+
+        for input in [
+            to_input(&sk, 1, TO, true),
+            from_input(&sk, 1, FROM, true),
+        ] {
+            let (reverted, reason) = call(&mut ctx, &input);
+            assert!(reverted, "tampered signature must fail verification");
+            assert!(reason.contains("signature verification failed"), "got {reason}");
+        }
+        assert_eq!(
+            JournalTr::perp_write_count(ctx.journal_mut()),
+            writes_before,
+            "signature failure is pre-write — no marker may be burned"
+        );
+    }
+
+    /// The signed path must reject for the same reasons and with the same words as the direct one —
+    /// they share a core precisely so they cannot drift.
+    #[test]
+    fn signed_and_direct_paths_reject_identically() {
+        let (mut ctx, sk) = fixture(1_000_000);
+
+        let (reverted, reason) = call(&mut ctx, &to_input(&sk, 0, TO, false));
+        assert!(reverted && reason.contains("transferToPerp: amount must be > 0"), "got {reason}");
+
+        let (reverted, reason) = call(&mut ctx, &to_input(&sk, 9_999_999, TO, false));
+        assert!(
+            reverted && reason.contains("transferToPerp: insufficient spot balance"),
+            "got {reason}"
+        );
+    }
+}

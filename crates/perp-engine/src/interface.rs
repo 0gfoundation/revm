@@ -20,6 +20,50 @@ sol! {
         function transferToPerp(uint64 amount) external;
         /// Move USDC from the perp trading wallet back to spot balance.
         function transferFromPerp(uint64 amount) external;
+        /// Move USDC from spot balance into `account`'s perp trading wallet, authenticated by
+        /// ed25519 signature.
+        /// Message: "perpdex_v1_xfer_to"(18) || account(20) || amount(8)
+        ///          || timestamp(8) || recvWindow(8) || keyId(1)
+        /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
+        /// keyId: which API key slot to verify against.
+        /// A signature is single-use and is spent by SUBMISSION, not by success: once this call has
+        /// been included, resubmitting the same signature reverts with "duplicate signature" EVEN IF
+        /// this call was rejected. Re-sign with a fresh timestamp to retry.
+        function transferToPerpSigned(
+            address account,
+            uint64 amount,
+            uint64 timestamp,
+            uint64 recvWindow,
+            uint8 keyId,
+            bytes calldata signature
+        ) external;
+        /// Move USDC from `account`'s perp trading wallet back to spot balance, authenticated by
+        /// ed25519 signature.
+        /// Message: "perpdex_v1_xfer_from"(20) || account(20) || amount(8)
+        ///          || timestamp(8) || recvWindow(8) || keyId(1)
+        ///
+        /// ⚠️ The two transfer directions carry DIFFERENT domain prefixes on purpose. A shared
+        /// prefix would make a signature over "move 100 in" byte-identical to one over
+        /// "move 100 out", so a relayer could submit either against whichever selector it liked.
+        /// Any future signed selector must keep its prefix distinct from all of these, and must not
+        /// be a proper prefix of another.
+        ///
+        /// This is the money-OUT direction of the pair: it is gated on derived `available`
+        /// (`perp_wallet_balance − Σ ooIM`), so an API key holding this signature can pull
+        /// collateral out from under nothing — resting orders keep their requirement — but it CAN
+        /// move the free balance back to spot. Scope API keys accordingly.
+        ///
+        /// A signature is single-use and is spent by SUBMISSION, not by success: once this call has
+        /// been included, resubmitting the same signature reverts with "duplicate signature" EVEN IF
+        /// this call was rejected. Re-sign with a fresh timestamp to retry.
+        function transferFromPerpSigned(
+            address account,
+            uint64 amount,
+            uint64 timestamp,
+            uint64 recvWindow,
+            uint8 keyId,
+            bytes calldata signature
+        ) external;
         /// **THE per-market margin row, and the ONLY one.** Binance-shaped, computed on demand,
         /// stores nothing.
         ///

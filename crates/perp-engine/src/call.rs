@@ -14,7 +14,8 @@ use crate::{
     account::{
         run_deposit, run_get_account, run_get_api_key, run_get_api_keys,
         run_get_user_fee_rates, run_register_api_key, run_revoke_api_key,
-        run_set_user_fee_rates, run_transfer_from_perp, run_transfer_to_perp, run_withdraw,
+        run_set_user_fee_rates, run_transfer_from_perp, run_transfer_from_perp_signed,
+        run_transfer_to_perp, run_transfer_to_perp_signed, run_withdraw,
     },
     batch,
     errors,
@@ -34,7 +35,8 @@ use crate::{
         removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
         setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall,
         setUserFeeRatesCall,
-        transferAdminCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
+        transferAdminCall, transferFromPerpCall, transferFromPerpSignedCall, transferToPerpCall,
+        transferToPerpSignedCall, updateIndexPriceCall,
         updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
     },
     margin_view::{run_get_account_margin, run_get_position_risk},
@@ -162,6 +164,16 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(withdrawCall::SELECTOR, (60_000, false));
         m.insert(transferToPerpCall::SELECTOR, (30_000, false));
         m.insert(transferFromPerpCall::SELECTOR, (30_000, false));
+        // The signed variants are priced AT PARITY with their direct siblings, which is the
+        // convention every other signed selector already follows (`setLeverage` /
+        // `setLeverageSigned` are both 30_000; `placeOrderSigned` reuses `PLACE_ORDER_GAS`). They do
+        // strictly more work — one ed25519 `verify_strict` plus the two seen-signature writes — so
+        // parity is a standing under-charge across the whole signed surface, not something these two
+        // introduce. Worth revisiting as one decision for all seven signed selectors rather than
+        // diverging here; the note at `transferToPerp` about `(1)`-sized calls being freely
+        // spammable applies to these too.
+        m.insert(transferToPerpSignedCall::SELECTOR, (30_000, false));
+        m.insert(transferFromPerpSignedCall::SELECTOR, (30_000, false));
         // `getAccount` is the account-level margin roll-up over the per-user market index, so it is
         // priced in the "walks a per-user list" tier (20_000) alongside `getPositionRisk` /
         // `getOpenOrders`, NOT the 5_000 scalar-getter tier it used to sit in.
@@ -503,6 +515,12 @@ pub fn run_perp_dex_call<H: PerpHost>(
         }
         s if s == transferFromPerpCall::SELECTOR => {
             run_transfer_from_perp(input_bytes, caller, context)
+        }
+        s if s == transferToPerpSignedCall::SELECTOR => {
+            run_transfer_to_perp_signed(input_bytes, context)
+        }
+        s if s == transferFromPerpSignedCall::SELECTOR => {
+            run_transfer_from_perp_signed(input_bytes, context)
         }
         s if s == getAccountCall::SELECTOR => run_get_account(input_bytes, context),
         s if s == setUserFeeRatesCall::SELECTOR => {

@@ -3,15 +3,17 @@
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
 use crate::host::PerpHost;
-use primitives::{Address, Bytes, Log, U256};
+use primitives::{keccak256, Address, Bytes, Log, U256};
 
 use crate::{
         errors::{perp_err, perp_invariant_err},
     interface::IPerpDex::{
         self, depositCall, getAccountCall, getAccountReturn, transferFromPerpCall,
-        transferToPerpCall, withdrawCall, TransferFromPerp, TransferToPerp,
+        transferFromPerpSignedCall, transferToPerpCall, transferToPerpSignedCall, withdrawCall,
+        TransferFromPerp, TransferToPerp,
     },
     storage::{self, load_erc20_balance, save_erc20_balance},
+    trading::{check_api_key_expiry, check_recv_window, gc_seen_buckets_best_effort, verify_ed25519},
     types::{AccountUpdateReason, MAX_PERP_WALLET_BALANCE},
     PERP_DEX_ADDRESS, USDC_ADDRESS,
     PerpError,
@@ -125,13 +127,21 @@ pub fn run_transfer_to_perp<H: PerpHost>(
 ) -> Result<Bytes, PerpError> {
     let args = transferToPerpCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("transferToPerp: invalid calldata"))?;
-    let amount = args.amount;
+    transfer_to_perp_core(context, caller, args.amount)
+}
 
+/// Shared body of `transferToPerp` / `transferToPerpSigned`. One implementation so the direct and
+/// signed paths cannot drift on the balance check, the event, or the update reason.
+fn transfer_to_perp_core<H: PerpHost>(
+    context: &mut H,
+    account_addr: Address,
+    amount: u64,
+) -> Result<Bytes, PerpError> {
     if amount == 0 {
         return Err(perp_err("transferToPerp: amount must be > 0"));
     }
 
-    let mut account = storage::load_account(context, caller)?;
+    let mut account = storage::load_account(context, account_addr)?;
     let spot: U256 = account.usdc_balance.clone().into();
     let amount_u256 = U256::from(amount);
     if spot < amount_u256 {
@@ -143,12 +153,17 @@ pub fn run_transfer_to_perp<H: PerpHost>(
     // USDC ledger and the perp wallet) and touches no position. `MarginTransfer` is Binance's
     // isolated-position leg, and `add`/`removePositionMargin` is that operation exactly — see the
     // `AccountUpdateReason` docs for the full argument.
-    storage::save_account(context, caller, account, AccountUpdateReason::AssetTransfer)?;
+    storage::save_account(
+        context,
+        account_addr,
+        account,
+        AccountUpdateReason::AssetTransfer,
+    )?;
 
     context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: TransferToPerp {
-            user: caller,
+            user: account_addr,
             amount,
         }
         .to_log_data(),
@@ -165,19 +180,27 @@ pub fn run_transfer_from_perp<H: PerpHost>(
 ) -> Result<Bytes, PerpError> {
     let args = transferFromPerpCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("transferFromPerp: invalid calldata"))?;
-    let amount = args.amount;
+    transfer_from_perp_core(context, caller, args.amount)
+}
 
+/// Shared body of `transferFromPerp` / `transferFromPerpSigned`. See [`transfer_to_perp_core`] for
+/// why both directions route through one implementation.
+fn transfer_from_perp_core<H: PerpHost>(
+    context: &mut H,
+    account_addr: Address,
+    amount: u64,
+) -> Result<Bytes, PerpError> {
     if amount == 0 {
         return Err(perp_err("transferFromPerp: amount must be > 0"));
     }
 
-    let mut account = storage::load_account(context, caller)?;
+    let mut account = storage::load_account(context, account_addr)?;
     // Derived-ooIM gate. Cash leaving the perp wallet entirely: `Σ ooIM` is untouched (neither
     // the book nor any position moves), so the requirement is exactly `amount` and it must come
     // out of AVAILABLE. This is THE money-out gate — the one place where getting the basis wrong
     // lets a user strip the collateral out from under their own resting orders — so it reads
     // `perp_wallet_balance − Σ ooIM`, never the raw wallet.
-    let available = crate::margin_view::derived_available_balance(context, caller)?;
+    let available = crate::margin_view::derived_available_balance(context, account_addr)?;
     if !crate::margin_view::derived_can_afford(available, amount as i128) {
         return Err(perp_err(
             "transferFromPerp: insufficient perp wallet balance",
@@ -187,18 +210,160 @@ pub fn run_transfer_from_perp<H: PerpHost>(
     let spot: U256 = account.usdc_balance.clone().into();
     account.usdc_balance = (spot + U256::from(amount)).into();
     // `AssetTransfer` — the other direction of the same wallet ↔ wallet move; see `transferToPerp`.
-    storage::save_account(context, caller, account, AccountUpdateReason::AssetTransfer)?;
+    storage::save_account(
+        context,
+        account_addr,
+        account,
+        AccountUpdateReason::AssetTransfer,
+    )?;
 
     context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: TransferFromPerp {
-            user: caller,
+            user: account_addr,
             amount,
         }
         .to_log_data(),
     });
 
     Ok(Bytes::new())
+}
+
+/// `transferToPerpSigned(...)` / `transferFromPerpSigned(...)` — the ed25519-authenticated
+/// versions of the two inter-wallet transfers, so an API key can fund and defund its own perp
+/// wallet without the owner reaching for the master key.
+///
+/// Both follow the shape every signed entrypoint now shares: decode → load key → recv window →
+/// key expiry → verify → seen-check → **burn unconditionally** → measure the burn → core, with the
+/// core's reject tagged by that measurement so the commit-only #23 guard exempts the burn and
+/// nothing else. See `trading::run_place_order_signed`'s burn site for the full argument.
+///
+/// # The two directions MUST NOT share a domain prefix
+///
+/// `"perpdex_v1_xfer_to"` and `"perpdex_v1_xfer_from"` differ, and that is load-bearing rather than
+/// cosmetic: the rest of the two messages is byte-identical in layout, so a shared prefix would
+/// make a signature authorising "move 100 IN" indistinguishable from one authorising "move 100
+/// OUT", and a relayer could submit either against whichever selector it preferred. Neither string
+/// is a proper prefix of the other, and their lengths differ, so no message of one kind can be
+/// reinterpreted as the other.
+fn transfer_signed_message<const N: usize>(
+    prefix: &[u8],
+    account: Address,
+    amount: u64,
+    timestamp: u64,
+    recv_window: u64,
+    key_id: u8,
+) -> [u8; N] {
+    let mut msg = [0u8; N];
+    let p = prefix.len();
+    msg[..p].copy_from_slice(prefix);
+    msg[p..p + 20].copy_from_slice(account.as_slice());
+    msg[p + 20..p + 28].copy_from_slice(&amount.to_be_bytes());
+    msg[p + 28..p + 36].copy_from_slice(&timestamp.to_be_bytes());
+    msg[p + 36..p + 44].copy_from_slice(&recv_window.to_be_bytes());
+    msg[p + 44] = key_id;
+    debug_assert_eq!(p + 45, N, "message layout and length must agree");
+    msg
+}
+
+/// `transferToPerpSigned(address account, uint64 amount, uint64 timestamp, uint64 recvWindow,
+/// uint8 keyId, bytes signature)` — see [`transfer_signed_message`].
+pub fn run_transfer_to_perp_signed<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = transferToPerpSignedCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("transferToPerpSigned: invalid calldata"))?;
+
+    let api_key = storage::load_api_key(context, args.account, args.keyId)?
+        .ok_or_else(|| perp_err("transferToPerpSigned: no api key registered for account"))?;
+
+    check_recv_window(context, args.timestamp, args.recvWindow)
+        .map_err(|e| perp_err(&format!("transferToPerpSigned: {e}")))?;
+
+    check_api_key_expiry(context, &api_key)
+        .map_err(|e| perp_err(&format!("transferToPerpSigned: {e}")))?;
+
+    // "perpdex_v1_xfer_to"(18) || account(20) || amount(8) || timestamp(8) || recvWindow(8)
+    //   || keyId(1) = 63 bytes
+    let msg = transfer_signed_message::<63>(
+        b"perpdex_v1_xfer_to",
+        args.account,
+        args.amount,
+        args.timestamp,
+        args.recvWindow,
+        args.keyId,
+    );
+
+    verify_ed25519(&api_key.pubkey, &msg, &args.signature)
+        .map_err(|e| perp_err(&format!("transferToPerpSigned: {e}")))?;
+
+    let sig_hash: [u8; 32] = keccak256(args.signature.as_ref()).0;
+    if storage::is_signature_seen(context, &sig_hash)? {
+        return Err(perp_err(
+            "transferToPerpSigned: duplicate signature (already submitted)",
+        ));
+    }
+
+    // ── last pre-write fault has passed; the first write happens here ──
+    let block_ts: u64 = context.timestamp();
+    let writes_before_burn = context.perp_write_count();
+    storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
+    gc_seen_buckets_best_effort(context, block_ts)?;
+    let burn_writes = context.perp_write_count().saturating_sub(writes_before_burn);
+
+    transfer_to_perp_core(context, args.account, args.amount)
+        .map_err(|e| e.after_retained_writes(burn_writes))
+}
+
+/// `transferFromPerpSigned(address account, uint64 amount, uint64 timestamp, uint64 recvWindow,
+/// uint8 keyId, bytes signature)` — the money-OUT direction; see [`transfer_signed_message`].
+pub fn run_transfer_from_perp_signed<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = transferFromPerpSignedCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("transferFromPerpSigned: invalid calldata"))?;
+
+    let api_key = storage::load_api_key(context, args.account, args.keyId)?
+        .ok_or_else(|| perp_err("transferFromPerpSigned: no api key registered for account"))?;
+
+    check_recv_window(context, args.timestamp, args.recvWindow)
+        .map_err(|e| perp_err(&format!("transferFromPerpSigned: {e}")))?;
+
+    check_api_key_expiry(context, &api_key)
+        .map_err(|e| perp_err(&format!("transferFromPerpSigned: {e}")))?;
+
+    // "perpdex_v1_xfer_from"(20) || account(20) || amount(8) || timestamp(8) || recvWindow(8)
+    //   || keyId(1) = 65 bytes
+    let msg = transfer_signed_message::<65>(
+        b"perpdex_v1_xfer_from",
+        args.account,
+        args.amount,
+        args.timestamp,
+        args.recvWindow,
+        args.keyId,
+    );
+
+    verify_ed25519(&api_key.pubkey, &msg, &args.signature)
+        .map_err(|e| perp_err(&format!("transferFromPerpSigned: {e}")))?;
+
+    let sig_hash: [u8; 32] = keccak256(args.signature.as_ref()).0;
+    if storage::is_signature_seen(context, &sig_hash)? {
+        return Err(perp_err(
+            "transferFromPerpSigned: duplicate signature (already submitted)",
+        ));
+    }
+
+    // ── last pre-write fault has passed; the first write happens here ──
+    let block_ts: u64 = context.timestamp();
+    let writes_before_burn = context.perp_write_count();
+    storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
+    gc_seen_buckets_best_effort(context, block_ts)?;
+    let burn_writes = context.perp_write_count().saturating_sub(writes_before_burn);
+
+    transfer_from_perp_core(context, args.account, args.amount)
+        .map_err(|e| e.after_retained_writes(burn_writes))
 }
 
 /// `getAccount(address user)` — spot USDC plus the whole account-level margin roll-up, driven by
