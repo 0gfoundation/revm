@@ -191,8 +191,16 @@ pub fn run_place_order_signed<H: PerpHost>(
 
 /// `cancelOrderSigned(address account, bytes32 orderId, uint64 timestamp, bytes signature)`
 ///
-/// Replay protection is implicit: cancelling an already-cancelled order is rejected by
-/// cancel_order_core ("order not cancellable").
+/// Replay protection is the seen-signature set, same as every other signed entrypoint: the
+/// signature is spent by SUBMISSION, so a resubmission is refused before `cancel_order_core` runs.
+///
+/// It used to rely on terminal-status idempotence alone — "an already-cancelled order cannot be
+/// cancelled again". That held, but it was the ONE signed path whose safety came from a property
+/// of the target rather than from the signature, so it read differently from its four siblings and
+/// broke for a different reason than they would. It also left a genuine gap: a cancel signed for
+/// an order that does not exist YET is rejected, and the signature stayed live, so the same
+/// signature could cancel that order the moment it appeared. Explicit burn closes it and makes all
+/// five paths one shape.
 pub fn run_cancel_order_signed<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -226,7 +234,29 @@ pub fn run_cancel_order_signed<H: PerpHost>(
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;
 
+    // Burned unconditionally, after verification and before the cancel — see the long note at
+    // `run_place_order_signed`'s burn site for why submission (not success) spends a signed
+    // authorization, and why the reject carries the MEASURED burn write count.
+    //
+    // Keyed on `keccak256(signature)` like the others. Note this is NOT the orderId here: the
+    // cancel takes its target as an argument rather than deriving it, so the two namespaces are
+    // unrelated and the `PFX_SEEN_SIG` prefix keeps them from aliasing.
+    let sig_hash: [u8; 32] = keccak256(args.signature.as_ref()).0;
+    if storage::is_signature_seen(context, &sig_hash)? {
+        return Err(perp_err(
+            "cancelOrderSigned: duplicate signature (already submitted)",
+        ));
+    }
+
+    // ── last pre-write fault has passed; the first write happens here ──
+    let block_ts: u64 = context.timestamp();
+    let writes_before_burn = context.perp_write_count();
+    storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
+    gc_seen_buckets_best_effort(context, block_ts)?;
+    let burn_writes = context.perp_write_count().saturating_sub(writes_before_burn);
+
     cancel_order_core(args.account, args.orderId.0, context)
+        .map_err(|e| e.after_retained_writes(burn_writes))
 }
 
 /// `cancelOrder(bytes32 orderId, uint64 marketId)`
@@ -874,6 +904,17 @@ pub(crate) fn check_recv_window<H: PerpHost>(
 
 // ── ed25519 helpers ───────────────────────────────────────────────────────────
 
+/// ⚠️ `verify_strict`, not `verify`, and the seen-signature replay guard DEPENDS on that.
+///
+/// Every signed entrypoint keys its replay marker on `keccak256(signature)` — the signature BYTES,
+/// not the message. So the guard is only sound while an observed valid signature cannot be
+/// transformed into a different signature that is also valid over the same message: a malleated
+/// copy would hash differently, miss the seen marker, and (for `placeOrderSigned`) derive a fresh
+/// orderId as well, walking straight past the guard.
+///
+/// `verify_strict` is what rules that out — it rejects non-canonical encodings and small-order
+/// public keys. Downgrading it to `verify` would weaken the replay guards at a distance, from a
+/// change site that looks unrelated to replay.
 pub(crate) fn verify_ed25519(
     pubkey_bytes: &[u8; 32],
     message: &[u8],

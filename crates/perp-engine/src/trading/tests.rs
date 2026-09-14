@@ -6747,12 +6747,13 @@ mod golden {
     /// field's own values are pinned separately and much more sharply by
     /// `trading::tests::position_changed_derived_fields` (the survival test across a close and a
     /// reopen, and the Σ-per-fill identity on both sides).
-    /// Re-pinned when `setLeverageSigned` gained the seen-signature replay guard it never had (it
-    /// was the only signed selector with neither an explicit guard nor a state-based one). The
-    /// scenario's one `setLeverageSigned` call now writes TWO additional keys — the replay marker
-    /// and its GC bucket — so the block's net delta gains two entries. That is the whole delta: no
-    /// existing key changed value, and `BusinessSnapshot` is unchanged, which is the load-bearing
-    /// check — a replay marker is not money and no balance, position or order status reads it.
+    /// Re-pinned when the signed entrypoints were brought onto one replay model. `setLeverageSigned`
+    /// gained the seen-signature guard it never had, and `cancelOrderSigned` traded terminal-status
+    /// idempotence for the same explicit burn. The scenario makes one call of each, so the block's
+    /// net delta gains FOUR entries — a replay marker and a GC bucket per call. That is the whole
+    /// delta: no existing key changed value, and `BusinessSnapshot` is unchanged, which is the
+    /// load-bearing check — a replay marker is not money and no balance, position or order status
+    /// reads it.
     ///
     /// ⚠️ Measured while re-pinning, worth knowing before the next attempt: this hash is
     /// INSENSITIVE to write ORDER within a block. Moving a burn from after `place_order_core` to
@@ -6763,7 +6764,7 @@ mod golden {
     /// Guard behaviour itself is pinned by `tests::signed_replay`.
     /// Prior value 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x3fc718757ac18132f21c6c1a8b7adf615961210f164aab1a1dfe2ad055ff5b93");
+        b256!("0x38ca0434996ba2e636a05ff1c69c46c9ff93d343e4cde19e8223968a6a03d733");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -15690,7 +15691,9 @@ mod position_changed_derived_fields {
 mod signed_replay {
     use super::batch_cancel::register_key;
     use super::*;
-    use crate::interface::IPerpDex::{placeOrderSignedCall, setLeverageSignedCall};
+    use crate::interface::IPerpDex::{
+        cancelOrderSignedCall, placeOrderSignedCall, setLeverageSignedCall,
+    };
     use ed25519_dalek::{Signer, SigningKey};
 
     const SIGNED_TS: u64 = 1; // == block timestamp in `make_ctx`
@@ -15764,6 +15767,40 @@ mod signed_replay {
             signature: sig.into(),
         }
         .abi_encode()
+    }
+
+    fn signed_cancel_bytes(sk: &SigningKey, order_id: [u8; 32], tamper: bool) -> Vec<u8> {
+        // Canonical 94-byte message, layout from `run_cancel_order_signed`.
+        let mut msg = [0u8; 94];
+        msg[..17].copy_from_slice(b"perpdex_v1_cancel");
+        msg[17..37].copy_from_slice(ALICE.as_slice());
+        msg[37..69].copy_from_slice(&order_id);
+        msg[69..77].copy_from_slice(&MARKET_ID.to_be_bytes());
+        msg[77..85].copy_from_slice(&SIGNED_TS.to_be_bytes());
+        msg[85..93].copy_from_slice(&SIGNED_RECV.to_be_bytes());
+        msg[93] = 0; // keyId
+        let mut sig = sk.sign(&msg).to_bytes().to_vec();
+        if tamper {
+            sig[0] ^= 0xff;
+        }
+        cancelOrderSignedCall {
+            account: ALICE,
+            orderId: order_id.into(),
+            marketId: MARKET_ID,
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sig.into(),
+        }
+        .abi_encode()
+    }
+
+    fn signed_cancel_input(sk: &SigningKey, order_id: [u8; 32]) -> Vec<u8> {
+        signed_cancel_bytes(sk, order_id, false)
+    }
+
+    fn signed_cancel_input_tampered(sk: &SigningKey, order_id: [u8; 32]) -> Vec<u8> {
+        signed_cancel_bytes(sk, order_id, true)
     }
 
     fn call(ctx: &mut TestCtx, input: &[u8]) -> (bool, String) {
@@ -15983,6 +16020,70 @@ mod signed_replay {
             reason.contains("signature verification failed"),
             "got {reason}"
         );
+        assert_eq!(
+            JournalTr::perp_write_count(ctx.journal_mut()),
+            writes_before,
+            "signature failure is pre-write — no marker may be burned"
+        );
+    }
+
+    // ── cancelOrderSigned ────────────────────────────────────────────────────
+
+    /// It used to rely on terminal-status idempotence alone. This is the gap that left: a cancel
+    /// signed for an order that does not exist YET is rejected, and under the old scheme the
+    /// signature stayed live — so the same signature could cancel that order the moment it
+    /// appeared.
+    #[test]
+    fn cancel_signed_for_a_future_order_cannot_be_held_and_fired_later() {
+        let (mut ctx, sk) = fixture();
+        // ALICE's next direct order id is deterministic (keccak(account || nonce)), so a cancel can
+        // be signed for it before it exists.
+        let (future_id, _) = crate::trading::peek_order_id(&mut ctx, ALICE).unwrap();
+
+        let input = signed_cancel_input(&sk, future_id);
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted, "nothing to cancel yet: {reason}");
+        assert!(!reason.contains("duplicate signature"), "got {reason}");
+
+        // The order now exists.
+        let placed = place(&mut ctx, ALICE, 0, PRICE - TICK, QTY, 0, 0);
+        assert_eq!(placed, future_id, "id derivation must be the one we signed for");
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted && reason.contains("duplicate signature"), "got {reason}");
+        assert_eq!(
+            storage::load_order(&mut ctx, &placed).unwrap().unwrap().status,
+            OrderStatus::Open,
+            "a spent cancel signature must not reach the order"
+        );
+    }
+
+    #[test]
+    fn cancel_signed_replay_is_refused_by_the_guard_not_by_the_order_status() {
+        let (mut ctx, sk) = fixture();
+        let id = place(&mut ctx, ALICE, 0, PRICE - TICK, QTY, 0, 0);
+        let input = signed_cancel_input(&sk, id);
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(!reverted, "first cancel must succeed: {reason}");
+
+        let (reverted, reason) = call(&mut ctx, &input);
+        assert!(reverted, "replay must revert");
+        assert!(
+            reason.contains("duplicate signature"),
+            "must be refused by the replay guard, not by order status: {reason}"
+        );
+    }
+
+    #[test]
+    fn cancel_signed_unverified_signature_writes_nothing() {
+        let (mut ctx, sk) = fixture();
+        let id = place(&mut ctx, ALICE, 0, PRICE - TICK, QTY, 0, 0);
+        let writes_before = JournalTr::perp_write_count(ctx.journal_mut());
+
+        let (reverted, reason) = call(&mut ctx, &signed_cancel_input_tampered(&sk, id));
+        assert!(reverted, "tampered signature must fail verification");
+        assert!(reason.contains("signature verification failed"), "got {reason}");
         assert_eq!(
             JournalTr::perp_write_count(ctx.journal_mut()),
             writes_before,
