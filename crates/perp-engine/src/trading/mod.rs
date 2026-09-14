@@ -84,6 +84,9 @@ pub fn run_place_order<H: PerpHost>(
 /// hits the same seen marker and is rejected. The marker is time-bucketed and reclaimed once the
 /// signature's recv window has fully elapsed (a stale replay is rejected by `check_recv_window`
 /// first, so reclaiming the marker is safe).
+///
+/// ⚠️ The burn is on SUCCESS, so a REJECTED placement is still replayable in-window. See the note
+/// at the burn site for why, and what it would take to change.
 pub fn run_place_order_signed<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -144,13 +147,35 @@ pub fn run_place_order_signed<H: PerpHost>(
         context,
     )?;
 
-    // Placement succeeded — burn the signature (commit-only: a REJECTED placement above returned
-    // early WITHOUT marking, so it stays replayable within its recv window, exactly as the old
-    // order-map guard behaved). Index it under its signed timestamp for time-bucketed GC, then
-    // sweep one expired bucket.
+    // Placement succeeded — burn the signature. Index it under its signed timestamp for
+    // time-bucketed GC, then sweep one expired bucket.
+    //
+    // ⚠️ OPEN HAZARD — this is burn-on-SUCCESS, not burn-on-SUBMISSION. A REJECTED placement
+    // returns above WITHOUT marking, so its signature stays replayable for the rest of its recv
+    // window (≤65s). That is exploitable whenever the rejection is TRANSIENT, and several are: a
+    // FOK that could not be filled, a PostOnly that would have crossed, and an insufficient-
+    // `available` reject all flip within seconds as the book moves or margin frees. An observer
+    // then lands the order at a moment the owner believed it had failed. It also makes a relayer's
+    // idempotent re-send genuinely re-execute instead of bouncing off this guard.
+    //
+    // The ordering is INHERITED, not chosen: before delete-on-terminal the order map was the
+    // replay witness and a rejected placement wrote no order, so the id stayed free. That side
+    // effect was carried over verbatim when the guard moved into its own namespace.
+    //
+    // The fix is to burn before `place_order_core` — commit-only supports it, since the marker
+    // surviving the reject's frame revert is exactly the point. NOT applied here because it would
+    // make every rejected signed placement a write-then-revert and trip the commit-only #23 guard
+    // in `call.rs`, whose release-build counter the val0 correctness gate reads. The two signed
+    // BATCH entrypoints do burn unconditionally and stay clean only because they return `Ok` with
+    // per-item statuses instead of reverting. Resolving this means either scoping the #23 guard to
+    // exclude the replay marker, or giving the single-order signed paths the batch's non-reverting
+    // shape. Pinned by the `#[ignore]`d cases in `tests::signed_replay`.
+    //
+    // The GC is best-effort — see `gc_seen_buckets_best_effort`: it is a fallible write running
+    // after a committed burn, so surfacing its `Err` would revert a call whose signature is spent.
     let block_ts: u64 = context.timestamp();
     storage::mark_signature_seen(context, &order_id, args.timestamp)?;
-    storage::gc_seen_buckets(context, block_ts)?;
+    gc_seen_buckets_best_effort(context, block_ts)?;
 
     Ok(Bytes::from(placeOrderSignedCall::abi_encode_returns(
         &FixedBytes(order_id),
@@ -352,7 +377,7 @@ pub fn run_batch_cancel_orders_signed<H: PerpHost>(
 ///
 /// A [`PerpError::Fatal`] still propagates — that is a node/DB fault, not a housekeeping
 /// failure, and it must not be masked (same rule `drive_batch` applies to per-item errors).
-fn gc_seen_buckets_best_effort<H: PerpHost>(
+pub(crate) fn gc_seen_buckets_best_effort<H: PerpHost>(
     context: &mut H,
     block_ts: u64,
 ) -> Result<(), PerpError> {
