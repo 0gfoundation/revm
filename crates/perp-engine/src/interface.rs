@@ -462,8 +462,9 @@ sol! {
         /// Set leverage for `account`, authenticated by ed25519 signature.
         /// Message: "perpdex_v1_leverage"(19) || account(20) || marketId(8) || leverage(8)
         ///          || timestamp(8) || recvWindow(8) || keyId(1)
-        /// A signature is single-use: once this call has been included, resubmitting the same
-        /// signature reverts with "duplicate signature". Re-sign with a fresh timestamp to retry.
+        /// A signature is single-use and is spent by SUBMISSION, not by success: once this call has
+        /// been included, resubmitting the same signature reverts with "duplicate signature" EVEN IF
+        /// this call was rejected. Re-sign with a fresh timestamp to retry.
         function setLeverageSigned(
             address account,
             uint64 marketId,
@@ -930,8 +931,9 @@ sol! {
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         /// keyId: which API key slot to verify against.
         /// orderId = keccak256(signature) — replay protection via the seen-signature set.
-        /// A signature is single-use: once this call has been included, resubmitting the same
-        /// signature reverts with "duplicate signature". Re-sign with a fresh timestamp to retry.
+        /// A signature is single-use and is spent by SUBMISSION, not by success: once this call has
+        /// been included, resubmitting the same signature reverts with "duplicate signature" EVEN IF
+        /// this call was rejected. Re-sign with a fresh timestamp to retry.
         function placeOrderSigned(
             address account,
             uint64 marketId,

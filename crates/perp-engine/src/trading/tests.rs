@@ -15791,7 +15791,6 @@ mod signed_replay {
 
     /// The core change: a signature the placement REJECTED is spent all the same.
     #[test]
-    #[ignore = "pins burn-on-SUBMISSION, which is not implemented: it would make a rejected signed call a write-then-revert and trip the commit-only #23 guard in call.rs. Un-ignore once that is resolved (scope the guard, or give the signed single-order paths the batch's non-reverting shape)."]
     fn rejected_signed_placement_is_not_replayable() {
         let (mut ctx, sk) = fixture();
         // FOK against an empty book — nothing to fill, so the placement is rejected.
@@ -15817,7 +15816,6 @@ mod signed_replay {
     /// success the owner's signature was still live and any observer could land the order at a
     /// moment the owner believed it had failed.
     #[test]
-    #[ignore = "pins burn-on-SUBMISSION, which is not implemented: it would make a rejected signed call a write-then-revert and trip the commit-only #23 guard in call.rs. Un-ignore once that is resolved (scope the guard, or give the signed single-order paths the batch's non-reverting shape)."]
     fn fok_rejected_then_liquidity_arrives_replay_still_refused() {
         let (mut ctx, sk) = fixture();
         let input = signed_place_input(&sk, 0, PRICE, QTY, 0, 2, false);
@@ -15886,6 +15884,33 @@ mod signed_replay {
         assert!(!reverted, "genuine signature must still work: {reason}");
     }
 
+
+    /// The #23 allowance must stay NARROW. A rejected signed placement is now a deliberate
+    /// write-then-revert, so the guard has to exempt the burn — but only the burn. If the exemption
+    /// were per-call rather than per-write-count, a genuine leak inside `place_order_core` (the val0
+    /// bug class) would be masked on exactly this path. `perp_write_count` is monotonic and
+    /// revert-blind, so the burn's cost is observable from outside: it must be the WHOLE delta of a
+    /// rejected call, with nothing added by the rejecting code.
+    #[test]
+    fn rejected_signed_placement_writes_only_the_burn() {
+        let (mut ctx, sk) = fixture();
+
+        // Measure what a burn costs, using a placement that succeeds and then subtracting nothing:
+        // a second, distinct signature is rejected, and the delta of THAT call is the burn alone.
+        let before = JournalTr::perp_write_count(ctx.journal_mut());
+        let (reverted, reason) = call(&mut ctx, &signed_place_input(&sk, 0, PRICE, QTY, 0, 2, false));
+        assert!(reverted, "FOK on an empty book must be rejected: {reason}");
+        let delta = JournalTr::perp_write_count(ctx.journal_mut()) - before;
+
+        // 2 = the seen marker + its GC bucket. The sweep writes nothing at this block timestamp
+        // (`cur < SEEN_RETENTION_BUCKETS`), and a rejected FOK must not have written anything of
+        // its own. If this number grows, find out WHICH write grew before widening it.
+        assert_eq!(
+            delta, 2,
+            "a rejected signed placement must write the replay burn and nothing else"
+        );
+    }
+
     // ── setLeverageSigned ────────────────────────────────────────────────────
 
     #[test]
@@ -15931,7 +15956,6 @@ mod signed_replay {
 
     /// A REJECTED leverage change spends its signature too — same rule as the placement path.
     #[test]
-    #[ignore = "pins burn-on-SUBMISSION, which is not implemented: it would make a rejected signed call a write-then-revert and trip the commit-only #23 guard in call.rs. Un-ignore once that is resolved (scope the guard, or give the signed single-order paths the batch's non-reverting shape)."]
     fn rejected_set_leverage_signed_is_not_replayable() {
         let (mut ctx, sk) = fixture();
         // 0 is out of range on every tier table, so this is rejected on its merits.

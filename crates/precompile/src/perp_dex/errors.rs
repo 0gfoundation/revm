@@ -25,6 +25,11 @@ impl From<perp_core::PerpError> for crate::PrecompileError {
     fn from(e: perp_core::PerpError) -> Self {
         match e {
             perp_core::PerpError::Reject(m) => crate::PrecompileError::Other(m),
+            // The sanctioned-write tag is for the engine's own commit-only #23 guard and has no
+            // meaning past this boundary: the caller sees the identical revert either way.
+            perp_core::PerpError::RejectAfterRetainedWrite { message, .. } => {
+                crate::PrecompileError::Other(message)
+            }
             perp_core::PerpError::Fatal(m) => crate::PrecompileError::Fatal(m),
             perp_core::PerpError::OutOfGas => crate::PrecompileError::OutOfGas,
             perp_core::PerpError::StaticRestrictionViolation => {

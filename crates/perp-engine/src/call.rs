@@ -642,8 +642,24 @@ pub fn run_perp_dex_call<H: PerpHost>(
             // (commit-only #23 — the write leaks with no undo). Record the offending selector +
             // count into a global so the exact path can be surfaced (read via
             // [`last_perp_write_then_revert`]).
+            //
+            // ── The one sanctioned exception ─────────────────────────────────────────────────
+            // A path may deliberately retain writes across its own reject, but it has to SAY SO,
+            // per write, by returning `PerpError::RejectAfterRetainedWrite` with a count it
+            // measured around those writes. Today the only user is the signed-call replay burn:
+            // spending a signature has to outlive the reject it is spent on, or a rejected
+            // signature stays replayable for the rest of its recv window. Subtracting an ALLOWANCE
+            // rather than skipping the check keeps the guard live on the same call — anything the
+            // rejecting code wrote on TOP of the sanctioned writes still trips it, which is the
+            // property that matters, since `place_order_core` is where the val0 leak lived.
             let writes_after = context.perp_write_count();
-            if writes_after != writes_before {
+            let sanctioned = match &error {
+                PerpError::RejectAfterRetainedWrite {
+                    sanctioned_writes, ..
+                } => *sanctioned_writes,
+                _ => 0,
+            };
+            if writes_after.saturating_sub(writes_before) > sanctioned {
                 let sel = u32::from_be_bytes(selector);
                 LAST_WRITE_THEN_REVERT_SELECTOR.store(sel, core::sync::atomic::Ordering::Relaxed);
                 PERP_WRITE_THEN_REVERT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -673,7 +689,8 @@ pub fn run_perp_dex_call<H: PerpHost>(
                 debug_assert!(
                     false,
                     "commit-only #23 VIOLATED: selector {sel:#010x} reverted with \
-                     {} perp write(s) already committed (error: {error}). Perp writes have NO undo, \
+                     {} unsanctioned perp write(s) already committed ({sanctioned} sanctioned) \
+                     (error: {error}). Perp writes have NO undo, \
                      so this leaks off-trie state under a failed receipt — and because logs ARE \
                      EVM-journaled, on-chain it appears as status 0x0 with zero logs and silently \
                      mutated state. Fix the PATH, not this assertion: move the DECISION above the \
@@ -682,8 +699,11 @@ pub fn run_perp_dex_call<H: PerpHost>(
                      write-clean (see `trading::MatchOutcome`), not by rewriting the path. \
                      Making the outcome a partial success instead is a LAST resort: it has to be \
                      an outcome the order-lifecycle contract can express, which \
-                     'expire a remainder that never rested' was not.",
-                    writes_after - writes_before,
+                     'expire a remainder that never rested' was not. \
+                     `PerpError::RejectAfterRetainedWrite` is NOT a way out of this: it sanctions \
+                     writes whose survival is what the caller should observe (a spent signature), \
+                     not writes that merely happen to have run first.",
+                    writes_after - writes_before - sanctioned,
                 );
             }
             Ok(PerpOutput::new_reverted(

@@ -535,16 +535,14 @@ pub fn run_set_leverage_signed<H: PerpHost>(
     // leverage on an open position, so against a live position a replay can only push leverage up.
     // No fund path — this is risk-control integrity.
     //
-    // Burned after success, mirroring `trading::run_place_order_signed`. That closes the sequence
-    // above completely: A and B both succeed, so both are burned and neither can be resubmitted.
+    // Burned unconditionally, after verification and BEFORE `set_leverage_core` — a signed
+    // authorization is spent by submission, not by success. See the long note at
+    // `trading::run_place_order_signed`'s burn site for the full argument and for why the reject
+    // has to carry the measured write count.
     //
-    // ⚠️ Two things it does NOT close, both shared with the placement path:
-    //   * a REJECTED leverage change stays replayable in-window (e.g. "set 3" refused while a
-    //     position is open at 10, then the position closes and a replay lands it). See the note at
-    //     the placement burn site for why burn-on-submission is not applied yet.
-    //   * ORDERING. Two in-flight leverage signatures have no defined order — a timestamp is a
-    //     freshness bound, not a sequence. Only a per-key nonce lets the owner say "this
-    //     supersedes that".
+    // ⚠️ NOT closed by this: ORDERING. Two in-flight leverage signatures still have no defined
+    // order, because a timestamp is a freshness bound and not a sequence. Only a per-key nonce
+    // would let the owner say "this supersedes that".
     let sig_hash: [u8; 32] = keccak256(args.signature.as_ref()).0;
     if storage::is_signature_seen(context, &sig_hash)? {
         return Err(perp_err(
@@ -552,13 +550,15 @@ pub fn run_set_leverage_signed<H: PerpHost>(
         ));
     }
 
-    let out = set_leverage_core(context, args.account, args.marketId, args.leverage)?;
-
+    // ── last pre-write fault has passed; the first write happens here ──
     let block_ts: u64 = context.timestamp();
+    let writes_before_burn = context.perp_write_count();
     storage::mark_signature_seen(context, &sig_hash, args.timestamp)?;
     gc_seen_buckets_best_effort(context, block_ts)?;
+    let burn_writes = context.perp_write_count().saturating_sub(writes_before_burn);
 
-    Ok(out)
+    set_leverage_core(context, args.account, args.marketId, args.leverage)
+        .map_err(|e| e.after_retained_writes(burn_writes))
 }
 
 fn set_leverage_core<H: PerpHost>(
