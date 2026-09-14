@@ -66,6 +66,7 @@ pub fn run_place_order<H: PerpHost>(
         args.orderType,
         args.tif,
         args.clientOrderId.0,
+        args.flags,
         context,
     )?;
     // Placement succeeded — persist the nonce bump (commit-only: rejected placements above
@@ -108,8 +109,10 @@ pub fn run_place_order_signed<H: PerpHost>(
     // Canonical message (fixed-layout, 96 bytes):
     //   "perpdex_v1_order"(16) || account(20) || marketId(8) || side(1)
     //   || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16)
-    //   || timestamp(8) || recvWindow(8) || keyId(1)
-    let mut msg = [0u8; 96];
+    //   || timestamp(8) || recvWindow(8) || keyId(1) || flags(1)
+    // `flags` is signed for the reason on the ABI: a signature that did not cover it could be
+    // resubmitted with the reduce-only bit flipped either way.
+    let mut msg = [0u8; 97];
     msg[..16].copy_from_slice(b"perpdex_v1_order");
     msg[16..36].copy_from_slice(args.account.as_slice());
     msg[36..44].copy_from_slice(&args.marketId.to_be_bytes());
@@ -122,6 +125,7 @@ pub fn run_place_order_signed<H: PerpHost>(
     msg[79..87].copy_from_slice(&args.timestamp.to_be_bytes());
     msg[87..95].copy_from_slice(&args.recvWindow.to_be_bytes());
     msg[95] = args.keyId;
+    msg[96] = args.flags;
 
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
@@ -180,6 +184,7 @@ pub fn run_place_order_signed<H: PerpHost>(
         args.orderType,
         args.tif,
         args.clientOrderId.0,
+        args.flags,
         context,
     )
     .map_err(|e| e.after_retained_writes(burn_writes))?;
@@ -649,6 +654,7 @@ fn place_batch_item<H: PerpHost>(
         item.orderType,
         item.tif,
         item.clientOrderId.0,
+        item.flags,
         context,
     )?;
     Ok(if status.is_terminal() {
@@ -703,7 +709,7 @@ fn signed_batch_order_id(signature: &[u8; 64], k: u32) -> [u8; 32] {
 /// Canonical batch-place digest preimage (63-byte header + 43 bytes per item):
 /// `"perpdex_v1_batch_order"(22) || account(20) || keyId(1) || timestamp(8) || recvWindow(8) || N(4)
 ///  || N x [ marketId(8) || side(1) || price(8) || quantity(8) || orderType(1) || tif(1)
-///           || clientOrderId(16) ]`, all integers big-endian.
+///           || clientOrderId(16) || flags(1) ]`, all integers big-endian.
 ///
 /// `N` is the DECODED item count, so neither the length nor any field of any item can be tampered
 /// with. Note the digest packs the items TIGHTLY (43 bytes each) — it is not the ABI encoding
@@ -718,7 +724,8 @@ pub(crate) fn batch_place_message(
     const TAG: &[u8; 22] = b"perpdex_v1_batch_order";
     const HEADER: usize = 22 + 20 + 1 + 8 + 8 + 4;
     /// marketId(8) + side(1) + price(8) + quantity(8) + orderType(1) + tif(1) + clientOrderId(16)
-    const ITEM: usize = 43;
+    /// + flags(1)
+    const ITEM: usize = 44;
     let mut msg = Vec::with_capacity(HEADER + orders.len() * ITEM);
     msg.extend_from_slice(TAG);
     msg.extend_from_slice(account.as_slice());
@@ -734,6 +741,7 @@ pub(crate) fn batch_place_message(
         msg.push(o.orderType);
         msg.push(o.tif);
         msg.extend_from_slice(&o.clientOrderId.0);
+        msg.push(o.flags);
     }
     debug_assert_eq!(msg.len(), HEADER + orders.len() * ITEM);
     msg
@@ -933,6 +941,33 @@ pub(crate) fn verify_ed25519(
 
 // ── Core order logic (shared by direct and signed paths) ─────────────────────
 
+/// `placeOrder`'s `flags` bitfield.
+///
+/// Unknown bits are REJECTED, not ignored. Ignoring them would let a caller ask for a modifier this
+/// build does not implement and receive a plain order that looks accepted — the failure would then
+/// surface as unexpected fills, not as an error. Rejecting makes the version mismatch loud at the
+/// call that caused it.
+pub(crate) const ORDER_FLAG_REDUCE_ONLY: u8 = 1 << 0;
+const ORDER_FLAGS_KNOWN: u8 = ORDER_FLAG_REDUCE_ONLY;
+
+/// Decodes `flags` into the per-order modifiers, rejecting anything unrecognised. Returns
+/// `reduce_only`. Kept beside the constants so a new bit cannot be added to one without the other.
+pub(crate) fn decode_order_flags(flags: u8, sel: &str) -> Result<bool, PerpError> {
+    let unknown = flags & !ORDER_FLAGS_KNOWN;
+    if unknown != 0 {
+        return Err(perp_err(format!("{sel}: unknown order flags 0x{unknown:02x}")));
+    }
+    let reduce_only = flags & ORDER_FLAG_REDUCE_ONLY != 0;
+    if reduce_only {
+        // This step lands the storage and ABI shape; the admission predicate and the three eviction
+        // triggers are the next one. Until they exist the bit is refused outright rather than
+        // accepted-and-ignored — an order the caller believes can only reduce, which in fact can
+        // open and flip their position, is worse than a rejected call.
+        return Err(perp_err(format!("{sel}: reduce-only not yet enabled")));
+    }
+    Ok(reduce_only)
+}
+
 /// Allocate the next order ID for `account` using the per-user nonce counter.
 /// Derives the next order id from the CURRENT nonce WITHOUT bumping it (commit-only #23: the
 /// nonce write happens only after the placement fully succeeds — a rejected placement leaves the
@@ -978,6 +1013,9 @@ struct ValidatedOrder {
     /// time-in-force — `validate_place_order` is the only place the illegal pairs can even be
     /// spelled, and it rejects them.
     kind: OrderKind,
+    /// `flags` bit 0, decoded once here so nothing downstream re-parses the bitfield. Reaches the
+    /// stored `Order` via `announce_new_order` and the `OrderEntry` via `rest_in_book`.
+    reduce_only: bool,
 }
 
 /// Validate → build in memory → execute → ONE final persist. Returns the taker order's FINAL status,
@@ -995,6 +1033,7 @@ fn place_order_core<H: PerpHost>(
     order_type_u8: u8,
     tif_u8: u8,
     client_order_id: [u8; 16],
+    flags: u8,
     context: &mut H,
 ) -> Result<OrderStatus, PerpError> {
     let validated = validate_place_order(
@@ -1005,6 +1044,7 @@ fn place_order_core<H: PerpHost>(
         quantity,
         order_type_u8,
         tif_u8,
+        flags,
     )?;
     // Per-user market-index cap. This is the ONLY way into a market the user is not already
     // active in — a position can only appear through a fill of an order they placed, and every
@@ -1123,7 +1163,9 @@ fn validate_place_order<H: PerpHost>(
     quantity: u64,
     order_type_u8: u8,
     tif_u8: u8,
+    flags: u8,
 ) -> Result<ValidatedOrder, PerpError> {
+    let reduce_only = decode_order_flags(flags, "placeOrder")?;
     let market = storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("placeOrder: unknown market"))?;
     if !market.active {
@@ -1169,7 +1211,7 @@ fn validate_place_order<H: PerpHost>(
         // sanity cap (`price > market.max_price`) above still prevents absurd book pollution.
     }
 
-    Ok(ValidatedOrder { market, side, kind })
+    Ok(ValidatedOrder { market, side, kind, reduce_only })
 }
 
 /// The `OrderPlaced` log of a placement that is not yet known-accepted.
@@ -1250,6 +1292,7 @@ fn announce_new_order(
         order_type: validated.kind.order_type(),
         tif: validated.kind.tif(),
         status: OrderStatus::Open,
+        reduce_only: validated.reduce_only,
     };
 
     let pending = PendingOrderPlaced {
@@ -1583,6 +1626,7 @@ fn execute_limit_order<H: PerpHost>(
                 quantity,
                 tif,
                 client_order_id,
+                taker_order.reduce_only,
                 market,
                 Some(bbo),
                 // PostOnly never matches, so there is nothing deferred to flush.
@@ -1625,6 +1669,7 @@ fn execute_limit_order<H: PerpHost>(
                 remaining,
                 tif,
                 client_order_id,
+                taker_order.reduce_only,
                 market,
                 // GTC: matching ran, so the BBO is read inside `rest_in_book` — pre-flush for the
                 // band gate, and again post-flush for the cache write. See the notes there.
@@ -2542,6 +2587,9 @@ fn rest_in_book<H: PerpHost>(
     qty: u64,
     tif: TimeInForce,
     client_order_id: [u8; 16],
+    // Threaded rather than re-read: the `OrderEntry` this builds is what the admission predicate and
+    // all three eviction triggers walk, so the flag has to be ON the entry.
+    reduce_only: bool,
     market: &crate::types::Market,
     // 2b resolve-once: (best_bid, best_ask). `Some` = the caller already read the BBO (PostOnly
     // threads its do-not-cross read — no match ran, so it is still current). `None` = read it here.
@@ -2699,6 +2747,7 @@ fn rest_in_book<H: PerpHost>(
         amount: qty,
         maker_fee_bps,
         assuming_price,
+        reduce_only,
     };
     // `Bid`/`Ask` grow by this order's notional at its FROZEN Assuming Price — the same
     // per-order-floored `calc_value` term the raw-list fold would contribute, so the aggregates stay

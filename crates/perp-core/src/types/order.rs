@@ -249,6 +249,17 @@ pub struct Order {
     pub order_type: OrderType,
     pub tif: TimeInForce,
     pub status: OrderStatus,
+    /// `reduceOnly` — this order may only ever REDUCE the owner's position in `market_id`, never
+    /// open or flip it. Set from `placeOrder`'s `flags` bit 0 and never changed afterwards.
+    ///
+    /// Enforced at ADMISSION, not at fill time: a reduce-only order is accepted only if the whole
+    /// prefix of the owner's same-side book ahead of it (normal orders AND reduce-only orders,
+    /// since both consume the position when they fill) plus its own quantity fits inside
+    /// `|position|`, and the request is silently TRUNCATED to whatever does fit. An order that
+    /// clears that gate can never produce an opening fill, so the fill path needs no clamp — only
+    /// the `fill_opening_qty == 0` watchdog.
+    #[serde(default, rename = "ro")]
+    pub reduce_only: bool,
 }
 
 /// Lightweight per-user per-market order entry used for margin-reserve calculation.
@@ -307,6 +318,14 @@ pub struct OrderEntry {
     /// measured — do not extrapolate it.
     #[serde(default, rename = "ap")]
     pub assuming_price: u64,
+    /// Mirror of [`Order::reduce_only`], carried on the ENTRY as well as the order.
+    ///
+    /// Not redundant: the admission predicate and all three eviction triggers walk this per-(user,
+    /// market, side) list and need to tell reduce-only entries from normal ones. Reading the flag
+    /// off the list costs nothing; reaching for it would otherwise mean a `load_order` per entry on
+    /// a path that runs on every placement.
+    #[serde(default, rename = "ro")]
+    pub reduce_only: bool,
 }
 
 impl OrderEntry {

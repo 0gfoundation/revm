@@ -52,6 +52,7 @@ fn place(host: &mut InMemoryHost, user: Address, side: u8, price: u64, qty: u64)
         orderType: 0, // limit
         tif: 0,       // GTC
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let out = run_perp_dex_call(&input, u64::MAX, user, U256::ZERO, false, host).unwrap();

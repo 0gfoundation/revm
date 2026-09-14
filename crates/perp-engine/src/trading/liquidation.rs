@@ -44,6 +44,9 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         order_type: kind.order_type(),
         tif: kind.tif(),
         status: OrderStatus::Open,
+        // A liquidation close is a protocol action, not a user order: it never rests (Market/IOC),
+        // so no admission predicate applies and the flag would carry no meaning.
+        reduce_only: false,
     };
     // commit-only #23: the close order is persisted ONCE after matching (below); the
     // OrderPlaced log keeps its original position (logs are EVM-journaled).

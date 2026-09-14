@@ -576,7 +576,19 @@ sol! {
         /// clientOrderId: optional caller-assigned tracking ID; pass bytes16(0) if unused.
         ///   Emitted in events but not stored or validated on-chain.
         /// Returns a unique order ID.
-        function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId) external returns (bytes32 orderId);
+        /// flags: bitfield of per-order modifiers. Unknown bits are REJECTED rather than ignored,
+        ///   so a caller that sets a bit this build does not implement finds out immediately
+        ///   instead of silently getting a plain order.
+        ///     bit 0  reduceOnly — the order may only REDUCE the caller's position in this market.
+        ///            Admission is gated on the whole prefix of the caller's same-side book ahead
+        ///            of this order (normal AND reduce-only, since both consume the position when
+        ///            they fill) plus this order's own quantity fitting inside |position|, and the
+        ///            request is SILENTLY TRUNCATED to whatever fits — `quantity` is a request, not
+        ///            a promise. Read the accepted size from `OrderPlaced.quantity`, which fires on
+        ///            every accepted order; `OrderRested` only fires when a remainder rests, so an
+        ///            IOC or a fully-filled order has no `OrderRested` to read.
+        ///     bits 1-7  reserved (closePosition, priceProtect, ...); must be 0.
+        function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
         function cancelOrder(bytes32 orderId, uint64 marketId) external;
@@ -608,7 +620,8 @@ sol! {
             uint8   tif;        // 0 = GTC, 1 = IOC, 2 = FOK, 3 = PostOnly
                                 // Market accepts only 0/1 — see `placeOrder` for the legal matrix
             bytes16 clientOrderId;
-        }
+            uint8   flags;      // see `placeOrder`; unknown bits are rejected per item
+    }
         /// Place up to MAX_BATCH_PLACE (64) orders in one call, on behalf of the caller.
         ///
         /// Atomicity is **abort-forward**, not all-or-nothing: items run in strict calldata order and
@@ -971,7 +984,10 @@ sol! {
         /// Place an order for `account`, authenticated by ed25519 signature.
         /// Message: "perpdex_v1_order" || account(20) || marketId(8) || side(1)
         ///          || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16)
-        ///          || timestamp(8) || recvWindow(8) || keyId(1)
+        ///          || timestamp(8) || recvWindow(8) || keyId(1) || flags(1)
+        /// ⚠️ `flags` IS part of the signed message. It must be: a signature that did not cover it
+        /// could be resubmitted with the bit flipped, turning a reduce-only order into one that can
+        /// open, or the reverse.
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         /// keyId: which API key slot to verify against.
         /// orderId = keccak256(signature) — replay protection via the seen-signature set.
@@ -990,6 +1006,7 @@ sol! {
             uint64 timestamp,
             uint64 recvWindow,
             uint8 keyId,
+            uint8 flags,
             bytes calldata signature
         ) external returns (bytes32 orderId);
 

@@ -171,6 +171,7 @@ fn entry(order_id: u8, price: u64, amount: u64) -> OrderEntry {
         amount,
         maker_fee_bps: 0,
         assuming_price: price,
+            reduce_only: false,
     }
 }
 
@@ -383,6 +384,7 @@ fn place(ctx: &mut TestCtx, caller: Address, side: u8, price: u64, qty: u64) {
         orderType: 0, // Limit
         tif: 0,       // GTC
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     crate::trading::run_place_order(&input, caller, ctx).unwrap();

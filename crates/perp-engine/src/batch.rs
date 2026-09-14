@@ -103,7 +103,7 @@ pub const CANCEL_SIGNED_LAYOUT: BatchArrayLayout = BatchArrayLayout {
 
 /// Encoded width of one `PlaceItem`: `marketId, side, price, quantity, orderType, tif,
 /// clientOrderId` — seven **static** fields, so it encodes as 7 words inline with no offset table.
-pub const PLACE_ITEM_ENCODED_LEN: usize = 7 * 32;
+pub const PLACE_ITEM_ENCODED_LEN: usize = 8 * 32;
 
 /// `batchPlaceOrders(PlaceItem[])` — one head word, tail immediately after it, 224-byte stride.
 pub const PLACE_DIRECT_LAYOUT: BatchArrayLayout = BatchArrayLayout {

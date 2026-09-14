@@ -2800,6 +2800,7 @@ mod size_probe_tests {
             order_type: OrderType::Limit,
             tif: TimeInForce::Gtc,
             status: OrderStatus::PartiallyFilled,
+                    reduce_only: false,
         };
         let buf = encode(&order).unwrap();
         println!(
@@ -2814,6 +2815,7 @@ mod size_probe_tests {
             amount: 150_000_000,
             maker_fee_bps: 2,
             assuming_price: 6_550_000,
+                    reduce_only: false,
         };
         println!(
             "OrderEntry x1 (in vec): {} bytes",
@@ -2859,6 +2861,7 @@ mod size_probe_tests {
             total_sell_qty: 12_000_000,
             total_sell_notional: 10_000_000,
             cumulative_realized_pnl: -4_200_000,
+                    reduce_only_qty: 0,
         };
         let buf = encode(&pos).unwrap();
         println!(
@@ -3039,6 +3042,7 @@ mod encoding_roundtrip_tests {
                                 order_type: ot,
                                 tif,
                                 status,
+                                                            reduce_only: false,
                             },
                         );
                     }
@@ -3058,6 +3062,7 @@ mod encoding_roundtrip_tests {
                 amount: u64::MAX,
                 maker_fee_bps: 12_345,
                 assuming_price: u64::MAX,
+                            reduce_only: false,
             },
         );
         rt(
@@ -3094,6 +3099,7 @@ mod encoding_roundtrip_tests {
                 // monotonically over a position's whole life, so its round-trip at `i64::MIN`
                 // matters more than most.
                 cumulative_realized_pnl: i64::MIN,
+                            reduce_only_qty: 0,
             },
         );
         rt(

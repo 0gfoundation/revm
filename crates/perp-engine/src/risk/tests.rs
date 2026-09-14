@@ -1476,6 +1476,7 @@ fn funding_on_one_market_leaves_another_markets_headroom_intact() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     run_place_order(&input, ALICE, &mut ctx)
@@ -1858,6 +1859,7 @@ fn place_order(ctx: &mut TestCtx, user: Address, side: u8, price: u64, qty: u64)
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     run_place_order(&input, user, ctx).unwrap();
@@ -1878,6 +1880,7 @@ fn try_place_order(
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     run_place_order(&input, user, ctx)
@@ -4537,6 +4540,7 @@ mod band_expiry {
                 orderType: 0, // Limit
                 tif: 3,       // PostOnly
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode(),
             user,
@@ -4558,6 +4562,7 @@ mod band_expiry {
                 orderType: 0, // Limit
                 tif: 1,       // IOC
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode(),
             user,

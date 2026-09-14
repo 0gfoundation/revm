@@ -122,6 +122,7 @@ fn place_input(side: u8, price: u64, qty: u64, ot: u8, tif: u8) -> Vec<u8> {
         orderType: ot,
         tif,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode()
 }

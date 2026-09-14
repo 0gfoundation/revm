@@ -275,6 +275,7 @@ fn place(
         orderType: order_type,
         tif,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let ret = run_place_order(&input, caller, ctx).unwrap();
@@ -321,6 +322,7 @@ fn rejects_unknown_market() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -339,6 +341,7 @@ fn rejects_quantity_above_maximum() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -357,6 +360,7 @@ fn rejects_price_above_maximum() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -375,6 +379,7 @@ fn rejects_quantity_below_minimum() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -444,6 +449,7 @@ fn try_place_limit_tif(
         orderType: 0, // Limit
         tif,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     run_place_order(&input, caller, ctx)
@@ -709,6 +715,7 @@ fn crossing_gtc_over_an_in_band_maker(ctx: &mut TestCtx) -> ([u8; 32], Result<By
         orderType: 0,
         tif: 0, // GTC — the remainder rests
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let result = run_place_order(&input, BOB, ctx);
@@ -942,6 +949,7 @@ fn sell_gtc_partial_fill_then_rest(
         orderType: 0, // Limit
         tif: 0,       // GTC — the remainder rests, so `rest_in_book` runs AFTER the flush
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let result = run_place_order(&input, BOB, ctx);
@@ -1169,6 +1177,7 @@ fn the_val0_scenario_through_the_call_shell_never_trips_the_tripwire() {
             orderType: 0,
             tif: 0,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode();
         let out = run_perp_dex_call(&input, 1_000_000, BOB, U256::ZERO, false, &mut ctx).unwrap();
@@ -1252,6 +1261,7 @@ fn mirror_leg(taker_side: u8, available: i64) -> MirrorRecord {
         orderType: 0,
         tif: 0, // GTC — the one kind with a rest phase
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let result = run_place_order(&input, BOB, &mut ctx);
@@ -1430,6 +1440,7 @@ mod pre_walk_early_out {
             orderType: 0, // Limit
             tif,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode();
         run_place_order(&input, caller, ctx)
@@ -1663,6 +1674,7 @@ fn the_tripwire_still_bites_on_a_real_write_then_revert() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let _ = run_perp_dex_call(&input, 1_000_000, ALICE, U256::ZERO, false, &mut ctx);
@@ -2017,6 +2029,7 @@ fn rejects_quantity_not_multiple_of_step_size() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -2035,6 +2048,7 @@ fn rejects_limit_order_with_zero_price() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -2056,6 +2070,7 @@ fn rejects_price_not_multiple_of_tick_size() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -2249,6 +2264,7 @@ fn matched_call_publishes_one_snapshot_per_economic_event() {
             orderType: 0,
             tif: 0,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode(),
         10_000_000,
@@ -3323,6 +3339,7 @@ fn fill_rejects_when_taker_wallet_cannot_cover_opening_margin() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -4379,6 +4396,7 @@ fn fok_rejected_when_insufficient_liquidity() {
         orderType: 0,
         tif: 2, // FOK
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -4419,6 +4437,7 @@ fn post_only_rejected_if_would_immediately_match() {
         orderType: 0,
         tif: 3, // PostOnly
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -4475,6 +4494,7 @@ fn try_place_pair(
         orderType: order_type,
         tif,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     run_place_order(&input, caller, ctx)
@@ -4730,6 +4750,7 @@ fn rejected_post_only_placement_emits_no_logs() {
         orderType: 0,
         tif: 3, // PostOnly
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -4762,6 +4783,7 @@ fn rejected_fok_placement_emits_no_logs() {
         orderType: 0,
         tif: 2, // FOK
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -4799,6 +4821,7 @@ fn rejected_taker_wallet_cover_emits_no_logs() {
         orderType: 0,
         tif: 0,
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -4833,6 +4856,7 @@ fn rejected_rest_in_book_margin_emits_no_logs() {
         orderType: 0,
         tif: 0, // GTC
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -4878,6 +4902,7 @@ fn zero_fill_rest_margin_reject_is_write_clean() {
         orderType: 0,
         tif: 0, // GTC
         clientOrderId: FixedBytes::default(),
+            flags: 0,
     }
     .abi_encode();
     let err = run_place_order(&input, ALICE, &mut ctx).unwrap_err();
@@ -5169,6 +5194,7 @@ mod order_expired {
                 orderType: 0,
                 tif: 2, // FOK
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode(),
             ALICE,
@@ -5719,6 +5745,7 @@ mod perf {
             orderType: order_type,
             tif,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode()
     }
@@ -6154,7 +6181,7 @@ mod perf {
                 let mut client_id = [0u8; 16];
                 client_id[8..].copy_from_slice(&i.to_be_bytes());
                 // Canonical 96-byte message, layout from run_place_order_signed.
-                let mut msg = [0u8; 96];
+                let mut msg = [0u8; 97];
                 msg[..16].copy_from_slice(b"perpdex_v1_order");
                 msg[16..36].copy_from_slice(ALICE.as_slice());
                 msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
@@ -6167,6 +6194,8 @@ mod perf {
                 msg[79..87].copy_from_slice(&block_ts.to_be_bytes());
                 msg[87..95].copy_from_slice(&recv_window.to_be_bytes());
                 msg[95] = 0; // keyId
+        msg[96] = 0; // flags
+                msg[96] = 0; // flags
                 let sig = sk.sign(&msg);
                 placeOrderSignedCall {
                     account: ALICE,
@@ -6181,6 +6210,7 @@ mod perf {
                     recvWindow: recv_window,
                     keyId: 0,
                     signature: sig.to_bytes().to_vec().into(),
+                                    flags: 0,
                 }
                 .abi_encode()
             })
@@ -6762,9 +6792,30 @@ mod golden {
     /// predates #16d. Only the key SET and the values move this number.
     ///
     /// Guard behaviour itself is pinned by `tests::signed_replay`.
-    /// Prior value 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052.
+    ///
+    /// ── Re-pinned again for the reduce-only groundwork ──────────────────────────────────────
+    /// A CHAIN change: `BLOCK_COMMITMENT_VERSION` 24 → 25, devnet wiped. Three things moved, none
+    /// of them behaviour:
+    ///
+    ///   * the VERSION byte is hashed into every block commitment, so the bump alone re-pins this;
+    ///   * `PerpPosition` gained `reduce_only_qty`, and `Order` / `OrderEntry` gained
+    ///     `reduce_only`. The codec is POSITIONAL msgpack (field names are not serialised), so an
+    ///     appended field costs its encoded width — one byte each for a zero `u64` and a `false`
+    ///     bool — on EVERY position and order blob. It is not free, and it is not skippable:
+    ///     `skip_serializing_if` would shift every later field's position and break decoding.
+    ///     Append only; never insert or reorder.
+    ///   * `placeOrder` / `placeOrderSigned` / `PlaceItem` gained `flags`, widening the signed
+    ///     message to 97 bytes and the batch digest item to 44. Neither is hashed here, but the
+    ///     scenario's signed order re-signs over the new layout.
+    ///
+    /// `BusinessSnapshot` is unchanged, which is the load-bearing check: `flags = 0` is the only
+    /// value this build accepts (`decode_order_flags` refuses the reduce-only bit until the
+    /// admission predicate lands), so no order, position, balance or status can have moved.
+    ///
+    /// Prior values 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052,
+    /// 0x38ca0434996ba2e636a05ff1c69c46c9ff93d343e4cde19e8223968a6a03d733.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x38ca0434996ba2e636a05ff1c69c46c9ff93d343e4cde19e8223968a6a03d733");
+        b256!("0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -7048,6 +7099,7 @@ mod golden {
             orderType: order_type,
             tif,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode();
         let ret = dex_call(ctx, caller, &input);
@@ -7096,7 +7148,7 @@ mod golden {
         client_id: [u8; 16],
     ) -> Vec<u8> {
         // Canonical 96-byte message, layout from run_place_order_signed.
-        let mut msg = [0u8; 96];
+        let mut msg = [0u8; 97];
         msg[..16].copy_from_slice(b"perpdex_v1_order");
         msg[16..36].copy_from_slice(ALICE.as_slice());
         msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
@@ -7109,6 +7161,7 @@ mod golden {
         msg[79..87].copy_from_slice(&SIGNED_TS.to_be_bytes());
         msg[87..95].copy_from_slice(&SIGNED_RECV.to_be_bytes());
         msg[95] = 0; // keyId
+        msg[96] = 0; // flags
         let sig = sk.sign(&msg);
         placeOrderSignedCall {
             account: ALICE,
@@ -7123,6 +7176,7 @@ mod golden {
             recvWindow: SIGNED_RECV,
             keyId: 0,
             signature: sig.to_bytes().to_vec().into(),
+                    flags: 0,
         }
         .abi_encode()
     }
@@ -7484,6 +7538,7 @@ mod golden {
                 orderType: 0,
                 tif: 2, // FOK
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode(),
             "FOK order cannot be fully filled",
@@ -7499,6 +7554,7 @@ mod golden {
                 orderType: 0,
                 tif: 3, // PostOnly
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode(),
             "PostOnly order would match",
@@ -8058,6 +8114,7 @@ mod commit_only_conservation {
             orderType: 0,
             tif,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode();
         let cp = ctx.journal_mut().checkpoint();
@@ -8302,6 +8359,7 @@ mod batch_cancel {
                 order_type: OrderType::Limit,
                 tif: TimeInForce::Gtc,
                 status,
+                            reduce_only: false,
             },
         )
         .unwrap();
@@ -9293,6 +9351,7 @@ mod batch_place {
             orderType: order_type,
             tif,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
     }
 
@@ -9887,10 +9946,11 @@ mod batch_place {
 
     /// The 224-byte element stride must be what backs the pre-decode length bound. The decisive case
     /// is `stride confusion`: a declared length that a 32-byte-per-element bound would accept and a
-    /// 224-byte-per-element bound must reject.
+    /// 256-byte-per-element bound must reject.
     #[test]
     fn hostile_length_word_reverts_without_allocating() {
-        assert_eq!(PLACE_ITEM_ENCODED_LEN, 224);
+        // 8 words: marketId, side, price, quantity, orderType, tif, clientOrderId, flags.
+        assert_eq!(PLACE_ITEM_ENCODED_LEN, 256);
         // selector || offset(0x20) || length || <body>
         let head = |len: u32, body: usize| {
             let mut v = vec![0u8; 4 + 64 + body];
@@ -9905,16 +9965,16 @@ mod batch_place {
         huge_u256[36..68].fill(0xff);
         let mut bad_offset = head(1, PLACE_ITEM_ENCODED_LEN);
         bad_offset[35] = 0x40;
-        // 7 items declared, 7*32 bytes of body: enough for a bytes32[] of 7, 7× short for PlaceItem[].
-        let stride_confusion = head(7, 7 * 32);
-        // One item declared, one word short of its 224 bytes.
+        // 8 items declared, 8*32 bytes of body: enough for a bytes32[] of 8, 8× short for PlaceItem[].
+        let stride_confusion = head(8, 8 * 32);
+        // One item declared, one word short of its 256 bytes.
         let truncated = head(1, PLACE_ITEM_ENCODED_LEN - 32);
 
         for (name, input) in [
             ("u32::MAX length", huge_u32),
             ("u256 length", huge_u256),
             ("non-canonical offset", bad_offset),
-            ("32-byte-stride body for a 224-byte item", stride_confusion),
+            ("32-byte-stride body for a 256-byte item", stride_confusion),
             ("truncated final item", truncated),
         ] {
             let mut ctx = make_ctx();
@@ -10174,7 +10234,7 @@ mod batch_place {
     fn signed_digest_layout_is_pinned() {
         let items = [gtc(0, PRICE, QTY), gtc(1, PRICE + TICK, QTY * 2)];
         let msg = batch_place_message(ALICE, 3, 111, 22, &items);
-        assert_eq!(msg.len(), 22 + 20 + 1 + 8 + 8 + 4 + 2 * 43);
+        assert_eq!(msg.len(), 22 + 20 + 1 + 8 + 8 + 4 + 2 * 44);
         assert_eq!(&msg[..22], b"perpdex_v1_batch_order");
         assert_eq!(&msg[22..42], ALICE.as_slice());
         assert_eq!(msg[42], 3);
@@ -10189,9 +10249,10 @@ mod batch_place {
         assert_eq!(msg[88], 0);
         assert_eq!(msg[89], 0);
         assert_eq!(&msg[90..106], &[0u8; 16]);
+        assert_eq!(msg[106], 0, "flags");
         // Second item starts right after.
-        assert_eq!(&msg[106..114], &MARKET_ID.to_be_bytes());
-        assert_eq!(msg[114], 1);
+        assert_eq!(&msg[107..115], &MARKET_ID.to_be_bytes());
+        assert_eq!(msg[115], 1);
     }
 
     #[test]
@@ -10516,6 +10577,7 @@ mod batch_place {
             orderType: item.orderType,
             tif: item.tif,
             clientOrderId: item.clientOrderId,
+                    flags: 0,
         }
         .abi_encode();
         let out = run_perp_dex_call(&input, 30_000_000, caller, U256::ZERO, false, ctx)
@@ -10809,6 +10871,7 @@ mod risk_reducing_admission {
             orderType: order_type,
             tif,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode();
         run_place_order(&input, caller, ctx)
@@ -11409,6 +11472,7 @@ mod user_market_index {
             orderType: order_type,
             tif,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
     }
 
@@ -11469,6 +11533,7 @@ mod user_market_index {
             orderType: order_type,
             tif,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode();
         run_place_order(&input, caller, ctx)
@@ -12459,6 +12524,7 @@ mod derived_ooim_divergence {
             orderType: 0,
             tif: 3, // PostOnly: rest without matching, so the book state is exactly as written
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode();
         let ret = run_place_order(&input, who, ctx).expect("placement");
@@ -12807,6 +12873,7 @@ mod derived_ooim_divergence {
                 orderType: 0,
                 tif: 3,
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode();
             run_place_order(&input, ALICE, &mut ctx).unwrap();
@@ -13361,6 +13428,7 @@ mod assuming_price {
             orderType: 0,
             tif: 0,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode();
         run_place_order(&input, caller, ctx)
@@ -13956,6 +14024,7 @@ mod account_snapshot_events {
             orderType: 0,
             tif,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         }
         .abi_encode();
         run_place_order(&input, caller, ctx)
@@ -14171,6 +14240,7 @@ mod account_snapshot_events {
                 orderType: 0,
                 tif: 0,
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode(),
             10_000_000,
@@ -14294,6 +14364,7 @@ mod account_snapshot_events {
                 orderType: 0,
                 tif: 0,
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode(),
             10_000_000,
@@ -14356,6 +14427,7 @@ mod account_snapshot_events {
                 orderType: 0,
                 tif: 0,
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode(),
             10_000_000,
@@ -14439,6 +14511,7 @@ mod account_snapshot_events {
             orderType: 0,
             tif: 0,
             clientOrderId: FixedBytes::default(),
+                    flags: 0,
         };
         let out = run_perp_dex_call(
             &batchPlaceOrdersCall {
@@ -14633,6 +14706,7 @@ mod account_snapshot_events {
                 orderType: 0,
                 tif: 0,
                 clientOrderId: FixedBytes::default(),
+                            flags: 0,
             }
             .abi_encode(),
             10_000_000,
@@ -15709,7 +15783,7 @@ mod signed_replay {
         tamper: bool,
     ) -> Vec<u8> {
         // Canonical 96-byte message, layout from `run_place_order_signed`.
-        let mut msg = [0u8; 96];
+        let mut msg = [0u8; 97];
         msg[..16].copy_from_slice(b"perpdex_v1_order");
         msg[16..36].copy_from_slice(ALICE.as_slice());
         msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
@@ -15722,6 +15796,7 @@ mod signed_replay {
         msg[79..87].copy_from_slice(&SIGNED_TS.to_be_bytes());
         msg[87..95].copy_from_slice(&SIGNED_RECV.to_be_bytes());
         msg[95] = 0; // keyId
+        msg[96] = 0; // flags
         let mut sig = sk.sign(&msg).to_bytes().to_vec();
         if tamper {
             sig[0] ^= 0xff;
@@ -15739,6 +15814,7 @@ mod signed_replay {
             recvWindow: SIGNED_RECV,
             keyId: 0,
             signature: sig.into(),
+                    flags: 0,
         }
         .abi_encode()
     }
@@ -16027,6 +16103,118 @@ mod signed_replay {
         );
     }
 
+
+
+    // ── placeOrder flags ─────────────────────────────────────────────────────
+
+    /// Signs over `sign_flags` but puts `wire_flags` in the calldata. Equal values = an honest
+    /// call; different = the tamper the signed layout has to catch.
+    fn signed_place_input_flags(sk: &SigningKey, sign_flags: u8, wire_flags: u8) -> Vec<u8> {
+        let mut msg = [0u8; 97];
+        msg[..16].copy_from_slice(b"perpdex_v1_order");
+        msg[16..36].copy_from_slice(ALICE.as_slice());
+        msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
+        msg[44] = 0; // side = Buy
+        msg[45..53].copy_from_slice(&(PRICE - TICK).to_be_bytes());
+        msg[53..61].copy_from_slice(&QTY.to_be_bytes());
+        msg[61] = 0; // Limit
+        msg[62] = 0; // GTC
+        msg[79..87].copy_from_slice(&SIGNED_TS.to_be_bytes());
+        msg[87..95].copy_from_slice(&SIGNED_RECV.to_be_bytes());
+        msg[95] = 0; // keyId
+        msg[96] = sign_flags;
+        placeOrderSignedCall {
+            account: ALICE,
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE - TICK,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            flags: wire_flags,
+            signature: sk.sign(&msg).to_bytes().to_vec().into(),
+        }
+        .abi_encode()
+    }
+
+    /// ⚠️ The reason `flags` is inside the signed message. If it were not, a relayer could take a
+    /// plain order's signature and resubmit it with the reduce-only bit set — or take a reduce-only
+    /// order's signature and clear the bit, turning a position-closing order into one that can open
+    /// and flip. Both directions are tested because the tamper is symmetric.
+    #[test]
+    fn flags_are_covered_by_the_signature() {
+        for (name, sign_flags, wire_flags) in [
+            ("bit set on the wire", 0u8, 1u8),
+            ("bit cleared on the wire", 1u8, 0u8),
+        ] {
+            let (mut ctx, sk) = fixture();
+            let (reverted, reason) =
+                call(&mut ctx, &signed_place_input_flags(&sk, sign_flags, wire_flags));
+            assert!(reverted, "{name}: tampered flags must not verify");
+            assert!(
+                reason.contains("signature verification failed"),
+                "{name}: got {reason}"
+            );
+        }
+    }
+
+    /// Unknown bits are REJECTED, not ignored. Ignoring them would hand back a plain order to a
+    /// caller who asked for a modifier this build does not have — the failure would surface as
+    /// unexpected fills rather than as an error.
+    #[test]
+    fn unknown_flag_bits_are_rejected() {
+        let (mut ctx, sk) = fixture();
+        for bit in 1..8u8 {
+            let flags = 1u8 << bit;
+            let (reverted, reason) =
+                call(&mut ctx, &signed_place_input_flags(&sk, flags, flags));
+            assert!(reverted, "flags 0x{flags:02x} must be rejected");
+            assert!(
+                reason.contains(&format!("unknown order flags 0x{flags:02x}")),
+                "got {reason}"
+            );
+        }
+    }
+
+    /// The reduce-only bit is refused outright until the admission predicate and the three eviction
+    /// triggers exist. Accepted-and-ignored would be worse than rejected: the caller believes the
+    /// order can only reduce, and it can in fact open and flip their position.
+    #[test]
+    fn reduce_only_bit_is_refused_until_the_predicate_lands() {
+        let (mut ctx, sk) = fixture();
+        let (reverted, reason) = call(&mut ctx, &signed_place_input_flags(&sk, 1, 1));
+        assert!(reverted);
+        assert!(reason.contains("reduce-only not yet enabled"), "got {reason}");
+    }
+
+    /// The direct path shares `decode_order_flags`, so it must refuse identically.
+    #[test]
+    fn the_direct_path_refuses_the_same_flags() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        for (flags, want) in [(1u8, "reduce-only not yet enabled"), (2u8, "unknown order flags 0x02")] {
+            let input = placeOrderCall {
+                marketId: MARKET_ID,
+                side: 0,
+                price: PRICE - TICK,
+                quantity: QTY,
+                orderType: 0,
+                tif: 0,
+                clientOrderId: FixedBytes::default(),
+                flags,
+            }
+            .abi_encode();
+            let out = run_perp_dex_call(&input, 30_000_000, ALICE, U256::ZERO, false, &mut ctx)
+                .expect("must not hard-fail");
+            assert!(out.reverted, "flags 0x{flags:02x} must be rejected");
+            let reason = String::from_utf8_lossy(&out.bytes).to_string();
+            assert!(reason.contains(want), "got {reason}");
+        }
+    }
 
     // ── Domain separation across ALL signed selectors ────────────────────────
 
