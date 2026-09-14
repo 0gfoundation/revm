@@ -948,6 +948,31 @@ pub(crate) fn verify_ed25519(
 /// surface as unexpected fills, not as an error. Rejecting makes the version mismatch loud at the
 /// call that caused it.
 pub(crate) const ORDER_FLAG_REDUCE_ONLY: u8 = 1 << 0;
+
+/// Whether the reduce-only bit is reachable at all.
+///
+/// # Why this is still `false` even though admission is implemented
+///
+/// [`crate::reduce_only::admit`] establishes the prefix condition at PLACEMENT, but two things can
+/// break it afterwards, and each needs its own evaluation point before the flag is safe to expose:
+///
+/// ```text
+/// a normal same-side order placed AHEAD of a resting reduce-only order
+///     long 10, reduce-only SELL 10 resting at 105; a normal SELL 10 goes in at 101.
+///     Nothing refuses the normal order — it has no reduce-only predicate of its own — and the
+///     prefix is now 10 + 10 = 20 > 10. A sweep fills the normal (position -> 0), then the
+///     reduce-only OPENS 10 the other way.
+///
+/// a position that shrinks without its orders being cancelled
+///     liquidation cancels every order in the market, so it is covered. ADL does NOT, so an ADL'd
+///     position leaves its reduce-only orders over-committed against a smaller |position|.
+/// ```
+///
+/// Both are load-bearing, so the flag stays refused until the eviction pass exists. An order the
+/// caller believes can only reduce, which in fact opens and flips their position, is worse than a
+/// rejected call — and in a release build the `fill_opening_qty == 0` watchdog is compiled out, so
+/// it would be a SILENT wrong position rather than a loud one.
+const REDUCE_ONLY_ENABLED: bool = false;
 const ORDER_FLAGS_KNOWN: u8 = ORDER_FLAG_REDUCE_ONLY;
 
 /// Decodes `flags` into the per-order modifiers, rejecting anything unrecognised. Returns
@@ -958,11 +983,7 @@ pub(crate) fn decode_order_flags(flags: u8, sel: &str) -> Result<bool, PerpError
         return Err(perp_err(format!("{sel}: unknown order flags 0x{unknown:02x}")));
     }
     let reduce_only = flags & ORDER_FLAG_REDUCE_ONLY != 0;
-    if reduce_only {
-        // This step lands the storage and ABI shape; the admission predicate and the three eviction
-        // triggers are the next one. Until they exist the bit is refused outright rather than
-        // accepted-and-ignored — an order the caller believes can only reduce, which in fact can
-        // open and flip their position, is worse than a rejected call.
+    if reduce_only && !REDUCE_ONLY_ENABLED {
         return Err(perp_err(format!("{sel}: reduce-only not yet enabled")));
     }
     Ok(reduce_only)
@@ -1052,6 +1073,29 @@ fn place_order_core<H: PerpHost>(
     // user already holds a position or a resting order. Placed with the other genuine rejects,
     // BEFORE any write, so the commit-only "no reject after a write" rule holds.
     storage::ensure_user_market_admission(context, account, market_id)?;
+
+    // ── reduce-only admission: the ONE place the invariant is enforced ────────────────────────
+    //
+    // Runs here, after validation and the market-index cap and before ANY write, so a refusal is a
+    // clean pre-write reject. `quantity` is rebound because an over-sized request is accepted and
+    // SILENTLY TRUNCATED — the accepted size is what the stored order, the match walk and
+    // `OrderPlaced` all carry from this point on.
+    //
+    // An order that clears this gate can never produce an opening fill, which is why the fill path
+    // carries only a watchdog and no clamp. See `crate::reduce_only`.
+    let quantity = if validated.reduce_only {
+        crate::reduce_only::admit(
+            context,
+            account,
+            market_id,
+            validated.side,
+            price,
+            quantity,
+            validated.market.step_size,
+        )?
+    } else {
+        quantity
+    };
 
     // commit-only #23: build the Order in memory. The OrderPlaced log is BUFFERED (not emitted):
     // every genuine reject still lies ahead, and the batch selectors catch a per-item error without
@@ -1184,7 +1228,11 @@ fn validate_place_order<H: PerpHost>(
     let kind = OrderKind::from_parts(order_type, tif)
         .ok_or_else(|| perp_err("placeOrder: tif not allowed for market order"))?;
 
-    if quantity < market.min_quantity {
+    // reduce-only is EXEMPT from the minimum size. MEASURED (§1.6): a one-step reduce-only order,
+    // 0.0037 USDT against a 5 USDT floor, was accepted. It has to be: silent truncation can shrink a
+    // request to whatever is left of the position, which is routinely below any sane minimum, and an
+    // order that closes the last sliver of a position is exactly the one a trader most needs.
+    if !reduce_only && quantity < market.min_quantity {
         return Err(perp_err("placeOrder: quantity below minimum"));
     }
     if quantity > market.max_quantity {

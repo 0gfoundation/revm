@@ -26,6 +26,7 @@ mod events;
 pub mod funding;
 pub mod host;
 pub mod interface;
+pub mod reduce_only;
 pub mod margin_view;
 pub mod risk;
 pub mod storage;
