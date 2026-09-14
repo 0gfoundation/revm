@@ -664,7 +664,10 @@ sol! {
             uint64  price,
             uint64  quantity,
             uint64  filled,
-            uint8   status
+            uint8   status,
+            /// The accepted modifier bitfield (bit 0 = reduceOnly). Binance's `/fapi/v1/order`
+            /// returns `reduceOnly`, so this is REST-facing, not engine internals.
+            uint8   flags
         );
         /// Query a user's open order entries in one market.
         /// Buy orders are returned first, sorted by price descending; sell orders follow, sorted by price ascending.
@@ -672,7 +675,10 @@ sol! {
             bytes32[] orderIds,
             uint8[]   sides,
             uint64[]  prices,
-            uint64[]  remainingQuantities
+            uint64[]  remainingQuantities,
+            /// Index-aligned modifier bitfields (bit 0 = reduceOnly), for
+            /// `/fapi/v1/openOrders`'s `reduceOnly`.
+            uint8[]   flags
         );
         /// Query one side's active price levels in matching priority order.
         /// side: 0 = Buy returns bid prices descending; 1 = Sell returns ask prices ascending.
@@ -1277,7 +1283,11 @@ sol! {
         // Emitted once per accepted placeOrder / placeOrderSigned call, before any matching.
         // Fires only when validation passes; a reverted tx emits nothing.
         // Feeds: /allOrders (initial record), /openOrders (pending state)
-        event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId);
+        /// flags: the accepted modifier bitfield (bit 0 = reduceOnly), echoed so the flag is
+        ///   recoverable from the EVENT STREAM. Without it the only off-chain route is decoding
+        ///   `placeOrder` calldata and re-deriving order ids per batch item, which is not something
+        ///   an indexer can do. `uint8` rather than `bool` so a later bit costs no ABI round.
+        event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags);
 
         // Emitted when a limit order rests in the book (after any immediate fills).
         // quantity = the resting quantity (original qty minus any fills that happened first).
@@ -1307,7 +1317,7 @@ sol! {
         // It is a MARGIN BASIS AND NOTHING ELSE: the book level, the insert position, the fill
         // price and the fee all key on `price`. `assumingPrice >= price` for a sell and
         // `== price` for a buy, so it must NOT be shown to a user as the order's price.
-        event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif, bytes16 clientOrderId, uint64 assumingPrice);
+        event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif, bytes16 clientOrderId, uint64 assumingPrice, uint8 flags);
         // Feeds: /openOrders (remove), /allOrders (status=CANCELED, updateTime)
         //
         // `reason` is `CancelReason` (perp-core `types::order`): 0 = the owner asked (cancelOrder /

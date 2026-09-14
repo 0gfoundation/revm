@@ -739,6 +739,7 @@ mod rested_invariant_self_tests {
                 orderType: 0,
                 tif: 0,
                 clientOrderId: FixedBytes::default(),
+                flags: 0,
             }
             .to_log_data(),
         }
@@ -757,6 +758,7 @@ mod rested_invariant_self_tests {
                 tif: 0,
                 clientOrderId: FixedBytes::default(),
                 assumingPrice: 1,
+                flags: 0,
             }
             .to_log_data(),
         }

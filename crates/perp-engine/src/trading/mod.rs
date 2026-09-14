@@ -772,6 +772,7 @@ pub fn run_get_order<H: PerpHost>(
             quantity: order.quantity,
             filled: order.filled,
             status: order.status as u8,
+            flags: encode_order_flags(order.reduce_only),
         },
     )))
 }
@@ -792,18 +793,21 @@ pub fn run_get_open_orders<H: PerpHost>(
     let mut sides = Vec::with_capacity(total);
     let mut prices = Vec::with_capacity(total);
     let mut remaining_quantities = Vec::with_capacity(total);
+    let mut flags = Vec::with_capacity(total);
 
     for entry in buy_entries.iter() {
         order_ids.push(FixedBytes(entry.order_id));
         sides.push(Side::Buy as u8);
         prices.push(entry.price);
         remaining_quantities.push(entry.amount);
+        flags.push(encode_order_flags(entry.reduce_only));
     }
     for entry in sell_entries.iter() {
         order_ids.push(FixedBytes(entry.order_id));
         sides.push(Side::Sell as u8);
         prices.push(entry.price);
         remaining_quantities.push(entry.amount);
+        flags.push(encode_order_flags(entry.reduce_only));
     }
 
     Ok(Bytes::from(getOpenOrdersCall::abi_encode_returns(
@@ -812,6 +816,7 @@ pub fn run_get_open_orders<H: PerpHost>(
             sides,
             prices,
             remainingQuantities: remaining_quantities,
+            flags,
         },
     )))
 }
@@ -974,6 +979,20 @@ pub(crate) const ORDER_FLAG_REDUCE_ONLY: u8 = 1 << 0;
 /// it would be a SILENT wrong position rather than a loud one.
 const REDUCE_ONLY_ENABLED: bool = true;
 const ORDER_FLAGS_KNOWN: u8 = ORDER_FLAG_REDUCE_ONLY;
+
+/// The wire `flags` byte for an order's stored modifiers — the inverse of [`decode_order_flags`].
+///
+/// Exists so the events and the two order views publish the flag rather than leaving it
+/// recoverable only by decoding `placeOrder` calldata (which an indexer cannot do: it would have
+/// to re-derive each batch item's order id to attribute the flag).
+#[inline]
+pub(crate) fn encode_order_flags(reduce_only: bool) -> u8 {
+    if reduce_only {
+        ORDER_FLAG_REDUCE_ONLY
+    } else {
+        0
+    }
+}
 
 /// Decodes `flags` into the per-order modifiers, rejecting anything unrecognised. Returns
 /// `reduce_only`. Kept beside the constants so a new bit cannot be added to one without the other.
@@ -1312,6 +1331,7 @@ pub(super) struct PendingOrderPlaced {
     order_type: u8,
     tif: u8,
     client_order_id: [u8; 16],
+    flags: u8,
 }
 
 /// Flushes the buffered `OrderPlaced` — **exactly once**: the `take()` makes every later call a
@@ -1336,6 +1356,7 @@ pub(super) fn emit_pending_order_placed<H: PerpHost>(
             orderType: p.order_type,
             tif: p.tif,
             clientOrderId: FixedBytes(p.client_order_id),
+            flags: p.flags,
         }
         .to_log_data(),
     });
@@ -1370,6 +1391,7 @@ fn announce_new_order(
     };
 
     let pending = PendingOrderPlaced {
+        flags: encode_order_flags(validated.reduce_only),
         user: account,
         market_id,
         order_id: *order_id,
@@ -3082,6 +3104,7 @@ fn rest_in_book<H: PerpHost>(
             // published because it is un-derivable off-chain: for a sell it is `max(T, limit)` with
             // `T` resolved ONCE, above, and never again (see THE FREEZE).
             assumingPrice: assuming_price,
+            flags: encode_order_flags(reduce_only),
         }
         .to_log_data(),
     });

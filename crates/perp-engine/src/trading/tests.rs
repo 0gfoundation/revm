@@ -16606,6 +16606,78 @@ mod reduce_only_e2e {
         assert_eq!(order.quantity - order.filled, QTY, "1 lot still committed");
     }
 
+    /// The flag has to be recoverable OFF-CHAIN, from all four surfaces an indexer or a REST
+    /// gateway actually reads. Without this the only route is decoding `placeOrder` calldata and
+    /// re-deriving each batch item's order id to attribute it — not something an indexer can do —
+    /// and three already-published docs promise the field (`@order`'s `R`, the indexer's order
+    /// projection, and Binance parity for `/fapi/v1/order` + `/fapi/v1/openOrders`).
+    #[test]
+    fn the_reduce_only_flag_is_published_on_every_surface() {
+        use crate::interface::IPerpDex::{
+            getOpenOrdersCall, getOrderCall, OrderPlaced, OrderRested,
+        };
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        let ro = place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY, RO).unwrap();
+        let plain = place_flagged(&mut ctx, ALICE, 1, PRICE + 5 * TICK, QTY, 0).unwrap();
+
+        // ── the event stream ────────────────────────────────────────────────
+        let mut placed = Vec::new();
+        let mut rested = Vec::new();
+        for l in JournalTr::take_logs(ctx.journal_mut()) {
+            let t = l.data.topics().first().copied();
+            if t == Some(OrderPlaced::SIGNATURE_HASH) {
+                let e = OrderPlaced::decode_raw_log(l.data.topics(), &l.data.data).unwrap();
+                placed.push((e.orderId.0, e.flags));
+            } else if t == Some(OrderRested::SIGNATURE_HASH) {
+                let e = OrderRested::decode_raw_log(l.data.topics(), &l.data.data).unwrap();
+                rested.push((e.orderId.0, e.flags));
+            }
+        }
+        assert_eq!(placed.iter().find(|(id, _)| *id == ro).unwrap().1, RO);
+        assert_eq!(placed.iter().find(|(id, _)| *id == plain).unwrap().1, 0);
+        assert_eq!(rested.iter().find(|(id, _)| *id == ro).unwrap().1, RO);
+        assert_eq!(rested.iter().find(|(id, _)| *id == plain).unwrap().1, 0);
+
+        // ── getOrder ────────────────────────────────────────────────────────
+        let read = |ctx: &mut TestCtx, id: [u8; 32]| {
+            let out = run_perp_dex_call(
+                &getOrderCall { orderId: id.into(), marketId: MARKET_ID }.abi_encode(),
+                10_000_000,
+                ALICE,
+                U256::ZERO,
+                true,
+                ctx,
+            )
+            .unwrap();
+            getOrderCall::abi_decode_returns(&out.bytes).unwrap().flags
+        };
+        assert_eq!(read(&mut ctx, ro), RO);
+        assert_eq!(read(&mut ctx, plain), 0);
+
+        // ── getOpenOrders: index-aligned with orderIds ──────────────────────
+        let out = run_perp_dex_call(
+            &getOpenOrdersCall { user: ALICE, marketId: MARKET_ID }.abi_encode(),
+            10_000_000,
+            ALICE,
+            U256::ZERO,
+            true,
+            &mut ctx,
+        )
+        .unwrap();
+        let open = getOpenOrdersCall::abi_decode_returns(&out.bytes).unwrap();
+        assert_eq!(open.flags.len(), open.orderIds.len(), "index-aligned");
+        let flag_of = |id: [u8; 32]| {
+            let i = open.orderIds.iter().position(|o| o.0 == id).unwrap();
+            open.flags[i]
+        };
+        assert_eq!(flag_of(ro), RO);
+        assert_eq!(flag_of(plain), 0);
+    }
+
     /// MEASURED exemption (§1.6): a one-step reduce-only order below the market minimum is
     /// accepted. It has to be — truncation routinely lands below any sane floor, and closing the
     /// last sliver of a position is the order a trader most needs.

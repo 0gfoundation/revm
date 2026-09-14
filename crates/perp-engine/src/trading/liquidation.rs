@@ -62,6 +62,8 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
             orderType: kind.order_type() as u8,
             tif: kind.tif() as u8,
             clientOrderId: FixedBytes::default(),
+            // A liquidation close is a protocol action, not a user order — no modifiers apply.
+            flags: 0,
         }
         .to_log_data(),
     });
