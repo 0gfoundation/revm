@@ -1114,6 +1114,7 @@ impl MatchRegistry {
         // #A: base/price decimals for the reservation-aggregate recompute below — off the threaded
         // `Market` (this used to re-`load_market_ref` for them).
         let (bd, pd) = (market.base_decimals, market.price_decimals);
+        let mut touched: Vec<Address> = Vec::with_capacity(self.users.len());
         for (user, mut w) in self.users {
             if w.dirty_buy {
                 storage::save_buy_orders(context, user, market_id, &w.buy_entries)?;
@@ -1213,6 +1214,28 @@ impl MatchRegistry {
             if published.is_some() && published == derived {
                 storage::clear_account_snapshot_mark(context, user);
             }
+            touched.push(user);
+        }
+
+        // ── reduce-only: put the book back in shape for the NEXT transaction ─────────────────
+        //
+        // A fill can shrink or FLIP any of these users' positions, which is one of the three ways
+        // the reduce-only prefix condition breaks. Runs here, after every working copy has been
+        // saved, so it reads settled state rather than a half-written mix.
+        //
+        // ⚠️ Both sides, not just the current closing side: a flip MOVES the closing side, so the
+        // reduce-only orders that need evicting are precisely the ones now sitting on the opening
+        // side.
+        //
+        // Not mid-walk, on purpose — admission already guarantees a reduce-only order is fully
+        // coverable at the moment the walk reaches it. See `crate::reduce_only::restore`.
+        for user in touched {
+            crate::reduce_only::restore_both_sides(
+                context,
+                user,
+                market,
+                crate::types::CancelReason::ReduceOnlyPositionShrank,
+            )?;
         }
         Ok(())
     }

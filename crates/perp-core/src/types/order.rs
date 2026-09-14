@@ -226,6 +226,29 @@ pub enum CancelReason {
     /// update that stranded it expired it (`run_out_of_band_expiry_sweep`). Binance's "order
     /// outside the price-band is cancelled", applied where the band actually moves.
     PriceBandExpiry = 4,
+    // ── reduce-only eviction: three causes, three codes ──────────────────────────────────────
+    //
+    // Binance makes all three look IDENTICAL on the wire (`X=EXPIRED`, `er=4`), leaving a consumer
+    // to reconstruct the cause from position and order history. We split them, which is a
+    // DELIBERATE SUPERSET rather than parity: the eviction site already knows why it fired, so the
+    // codes cost nothing, and the alternative is asking every downstream to replay history to
+    // recover something we had in hand.
+    //
+    // They ride `OrderCancelled.reason` and not a new field on `OrderExpired`, because every other
+    // exchange-initiated removal already goes through `OrderCancelled(reason)` — user cancel,
+    // liquidation, price-band expiry. Making reduce-only the one exception would split the event
+    // vocabulary on a distinction this engine does not otherwise make, and `reason` is already a
+    // `uint8`, so none of this is an ABI change.
+    /// The owner's position SHRANK (a fill, or ADL) and this order no longer fits inside what is
+    /// left. Evicted farthest-from-the-touch first, only as far as needed.
+    ReduceOnlyPositionShrank = 5,
+    /// The owner's position went FLAT or FLIPPED, so this side is now the OPENING side and the
+    /// order could only ever increase exposure. Sufficient on its own — it does not matter whether
+    /// `|position|` still covers the quantity.
+    ReduceOnlyWouldOpen = 6,
+    /// A NORMAL same-side order was placed AHEAD of this one (nearer the touch, so it fills first)
+    /// and would consume the position before this order could reduce it.
+    ReduceOnlyOvertaken = 7,
 }
 
 // ── Structs ───────────────────────────────────────────────────────────────

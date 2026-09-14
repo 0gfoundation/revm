@@ -972,7 +972,7 @@ pub(crate) const ORDER_FLAG_REDUCE_ONLY: u8 = 1 << 0;
 /// caller believes can only reduce, which in fact opens and flips their position, is worse than a
 /// rejected call — and in a release build the `fill_opening_qty == 0` watchdog is compiled out, so
 /// it would be a SILENT wrong position rather than a loud one.
-const REDUCE_ONLY_ENABLED: bool = false;
+const REDUCE_ONLY_ENABLED: bool = true;
 const ORDER_FLAGS_KNOWN: u8 = ORDER_FLAG_REDUCE_ONLY;
 
 /// Decodes `flags` into the per-order modifiers, rejecting anything unrecognised. Returns
@@ -3059,6 +3059,30 @@ fn rest_in_book<H: PerpHost>(
         }
         .to_log_data(),
     });
+
+    // ── reduce-only: this order may have OVERTAKEN the owner's reduce-only orders ────────────
+    //
+    // The third way the prefix condition breaks, and the one that is not about the position at all:
+    // a NORMAL order nearer the touch fills FIRST, so it grows the "ahead" term of every
+    // reduce-only order behind it. Nothing refuses the normal order — it carries no reduce-only
+    // predicate of its own, and §1.6's R20 measured Binance accepting it and killing the
+    // reduce-only order instead. Normal orders are first-class; reduce-only ones are not.
+    //
+    // Skipped for a reduce-only order resting: `admit` already priced it against this same
+    // condition, so re-running the pass here could only evict the order that just passed.
+    //
+    // The whole cost when the owner holds no reduce-only order on this side — the overwhelmingly
+    // common case — is one scan of the list this call already had warm. The heavy part (loading the
+    // position, folding the prefix) is behind that check.
+    if !reduce_only {
+        crate::reduce_only::restore(
+            context,
+            user,
+            market,
+            side,
+            crate::types::CancelReason::ReduceOnlyOvertaken,
+        )?;
+    }
 
     Ok(RestOutcome::Rested)
 }

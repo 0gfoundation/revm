@@ -146,7 +146,7 @@ use primitives::{B256, U256};
 // `trading::tests::golden`) + a coordinated wipe on deploy. The golden scenario's BusinessSnapshot is
 // UNCHANGED, field for field (it pins `getPosition`'s `(amount, vQuoteBalance, margin)` triples and
 // `getAccount`'s `availableBalance`, none of which carries this field).
-pub const BLOCK_COMMITMENT_VERSION: u8 = 25;
+pub const BLOCK_COMMITMENT_VERSION: u8 = 26;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

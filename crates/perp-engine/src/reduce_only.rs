@@ -108,10 +108,13 @@ pub fn distance_from_touch(side: Side, price: u64) -> u64 {
 /// ahead. Whether Binance counts same-price as ahead, and whether it breaks the tie by time, is
 /// unmeasured (every R20 rung used strictly distinct prices). Counting it is the conservative
 /// choice — it can only reject more — and it is OUR choice, not an observed behaviour.
-pub fn prefix_terms(entries: &[&OrderEntry], side: Side, extra: Option<u64>) -> (u64, u64) {
+pub fn prefix_terms<'a, I>(entries: I, side: Side, extra: Option<u64>) -> (u64, u64)
+where
+    I: IntoIterator<Item = &'a OrderEntry> + Clone,
+{
     let mut sigma_ro: u64 = 0;
     let mut cut: Option<u64> = extra.map(|p| distance_from_touch(side, p));
-    for e in entries {
+    for e in entries.clone() {
         if e.reduce_only {
             sigma_ro = sigma_ro.saturating_add(e.amount);
             let d = distance_from_touch(side, e.price);
@@ -122,7 +125,7 @@ pub fn prefix_terms(entries: &[&OrderEntry], side: Side, extra: Option<u64>) -> 
         return (0, 0);
     };
     let normals_ahead = entries
-        .iter()
+        .into_iter()
         .filter(|e| !e.reduce_only && distance_from_touch(side, e.price) <= cut)
         .fold(0u64, |acc, e| acc.saturating_add(e.amount));
     (normals_ahead, sigma_ro)
@@ -134,7 +137,10 @@ pub fn prefix_terms(entries: &[&OrderEntry], side: Side, extra: Option<u64>) -> 
 /// checked on purpose: between a fill that shrinks the position and the eviction that restores the
 /// condition, the terms can legitimately exceed `|position|` for an instant, and the honest answer
 /// then is "no room", not an invariant panic.
-fn capacity_for_new(pos: &PerpPosition, entries: &[&OrderEntry], side: Side, price: u64) -> u64 {
+fn capacity_for_new<'a, I>(pos: &PerpPosition, entries: I, side: Side, price: u64) -> u64
+where
+    I: IntoIterator<Item = &'a OrderEntry> + Clone,
+{
     let (normals_ahead, sigma_ro) = prefix_terms(entries, side, Some(price));
     pos.amount
         .unsigned_abs()
@@ -185,15 +191,14 @@ pub fn admit<H: PerpHost>(
     }
 
     let entries = load_side_entries(context, user, market_id, side)?;
-    let refs: Vec<&OrderEntry> = entries.iter().collect();
-    let capacity = capacity_for_new(&pos, &refs, side, price);
+    let capacity = capacity_for_new(&pos, &entries, side, price);
 
     let mut accepted = request.min(capacity);
     if step_size > 0 {
         accepted -= accepted % step_size;
     }
     if accepted == 0 {
-        let (normals_ahead, sigma_ro) = prefix_terms(&refs, side, Some(price));
+        let (normals_ahead, sigma_ro) = prefix_terms(&entries, side, Some(price));
         // One message carrying all three terms rather than a separate string per cause: Binance
         // collapses every reduce-only refusal into one code with identical text anyway, and the
         // numbers are the part that is actually diagnosable from a receipt.
@@ -204,6 +209,117 @@ pub fn admit<H: PerpHost>(
         )));
     }
     Ok(accepted)
+}
+
+/// Restores the prefix condition on one `(user, market, side)`, evicting reduce-only orders
+/// FARTHEST-FROM-THE-TOUCH FIRST until it holds — and no further.
+///
+/// Call it after anything that can break the condition. There are exactly three such things, and
+/// they are the same predicate evaluated at three moments rather than three rules:
+///
+/// ```text
+/// after a fill / ADL          |position| shrank or flipped      ReduceOnlyPositionShrank
+///                                                               ReduceOnlyWouldOpen
+/// after a NORMAL order rests  the "ahead" term grew             ReduceOnlyOvertaken
+/// at reduce-only admission    Σ reduce-only would grow          (refused instead — see `admit`)
+/// ```
+///
+/// # Why farthest-first, and what that claim is worth
+///
+/// Evicting the farthest is the only choice that can also drop NORMAL orders out of the counted
+/// prefix — everything between the old farthest and the new one stops being "ahead of a
+/// reduce-only order" — so it makes progress no smaller than removing any other single entry of
+/// the same size. It is also what R20 measured, using two configurations whose intersection
+/// excludes both `H_largest` and `H_smart`.
+///
+/// ⚠️ It is NOT derived: a larger non-farthest order can reduce the total by more (that is
+/// `H_largest`, which R20 excluded by observation, not by argument). Farthest-first is *consistent
+/// with* the condition and *measured*; do not present it as a theorem.
+///
+/// # Mid-walk eviction is deliberately NOT a thing
+///
+/// A tempting reading of this is "re-check after every fill inside the match walk". It is not
+/// needed, and the reason is the whole point of the prefix condition: admission guarantees that
+/// everything nearer the touch than a reduce-only order, PLUS that order's own quantity, fits
+/// inside `|position|`. Orders fill in distance order, so when the walk reaches a reduce-only
+/// order the position still covers it in full. This pass only has to put the book back in shape
+/// for the NEXT transaction. The `fill_opening_qty == 0` watchdog is what would catch that
+/// reasoning being wrong.
+pub fn restore<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market: &crate::types::Market,
+    side: Side,
+    reason: crate::types::CancelReason,
+) -> Result<(), PerpError> {
+    let market_id = market.market_id;
+    loop {
+        let entries = load_side_entries(context, user, market_id, side)?;
+        // Fast exit, and the reason this is affordable on the fill path: no reduce-only entry on
+        // this side means nothing to check. One scan of a list the caller already had warm.
+        if !entries.iter().any(|e| e.reduce_only) {
+            return Ok(());
+        }
+
+        let pos = storage::load_position_ref(context, user, market_id)?;
+        let side_is_closing = closing_side(&pos) == Some(side);
+        let (normals_ahead, sigma_ro) = prefix_terms(&entries, side, None);
+        if side_is_closing && normals_ahead.saturating_add(sigma_ro) <= pos.amount.unsigned_abs() {
+            return Ok(());
+        }
+        // A side that is no longer the closing side is reported as such whatever the caller's
+        // trigger was: "the position flipped or went flat" is the true cause, and it is sufficient
+        // on its own — R19 ② separated it from the size condition by flipping a position while
+        // `|position|` still exceeded the resting quantity, and the order died anyway.
+        let reason = if side_is_closing {
+            reason
+        } else {
+            crate::types::CancelReason::ReduceOnlyWouldOpen
+        };
+
+        // The farthest reduce-only entry. `max_by_key` returns the LAST maximum, so equal-distance
+        // (same-price) entries are evicted in list order — which is insertion order, i.e. FIFO,
+        // taking the earliest first. §1.6 records FIFO and orderId-ascending as indistinguishable
+        // in the evidence; FIFO is the one that can be explained to a user, and our order ids are
+        // `keccak(account ‖ nonce)`, so ascending-id would be pseudorandom.
+        let victim = entries
+            .iter()
+            .filter(|e| e.reduce_only)
+            .min_by_key(|e| std::cmp::Reverse(distance_from_touch(side, e.price)))
+            .map(|e| e.order_id)
+            .expect("a reduce-only entry exists — checked above");
+
+        let order = storage::load_order(context, &victim)?.ok_or_else(|| {
+            crate::errors::perp_invariant_err(
+                "reduce-only eviction: entry has no order record",
+            )
+        })?;
+        crate::trading::execute_order_cancellation(
+            context,
+            user,
+            market_id,
+            victim,
+            order,
+            market,
+            crate::trading::remove_from_book_after_cancel,
+            reason,
+        )?;
+    }
+}
+
+/// [`restore`] on BOTH sides.
+///
+/// After a fill the position may have FLIPPED, which moves the closing side — so reduce-only orders
+/// that were legitimately on the old closing side are now on the opening side. Checking only the
+/// current closing side would leave exactly those behind.
+pub fn restore_both_sides<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market: &crate::types::Market,
+    reason: crate::types::CancelReason,
+) -> Result<(), PerpError> {
+    restore(context, user, market, Side::Buy, reason)?;
+    restore(context, user, market, Side::Sell, reason)
 }
 
 /// Snapshot of one side's entry list. Read through the `_ref` loader: cache-fill only, never
@@ -244,13 +360,11 @@ mod tests {
     }
 
     fn terms(entries: &[OrderEntry], side: Side, extra: Option<u64>) -> (u64, u64) {
-        let refs: Vec<&OrderEntry> = entries.iter().collect();
-        prefix_terms(&refs, side, extra)
+        prefix_terms(entries, side, extra)
     }
 
     fn cap(p: &PerpPosition, entries: &[OrderEntry], side: Side, price: u64) -> u64 {
-        let refs: Vec<&OrderEntry> = entries.iter().collect();
-        capacity_for_new(p, &refs, side, price)
+        capacity_for_new(p, entries, side, price)
     }
 
     /// A list with no reduce-only entry constrains nothing, and — the part that matters for the hot

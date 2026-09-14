@@ -2861,7 +2861,6 @@ mod size_probe_tests {
             total_sell_qty: 12_000_000,
             total_sell_notional: 10_000_000,
             cumulative_realized_pnl: -4_200_000,
-                    reduce_only_qty: 0,
         };
         let buf = encode(&pos).unwrap();
         println!(
@@ -3099,7 +3098,6 @@ mod encoding_roundtrip_tests {
                 // monotonically over a position's whole life, so its round-trip at `i64::MIN`
                 // matters more than most.
                 cumulative_realized_pnl: i64::MIN,
-                            reduce_only_qty: 0,
             },
         );
         rt(

@@ -146,22 +146,6 @@ pub struct PerpPosition {
     /// see the overflow note in `apply_position_fill`.
     #[serde(default, rename = "cr")]
     pub cumulative_realized_pnl: i64,
-    /// Σ remaining quantity over this `(user, market)`'s resting **reduce-only** orders.
-    ///
-    /// The O(1) input to the reduce-only admission predicate, and — more importantly — the O(1)
-    /// gate that keeps that predicate off the hot path: `reduce_only_qty == 0` means this market
-    /// has no reduce-only orders at all, so a normal placement can skip the prefix walk entirely.
-    ///
-    /// ONE counter suffices for both sides because a reduce-only order is always on the position's
-    /// CLOSING side (same-side placement is rejected), and the position's sign says which that is.
-    ///
-    /// ⚠️ It is **not** margin and does not enter `ooIM`. A reduce-only order folds into
-    /// `total_{buy,sell}_{qty,notional}` exactly like any other resting order — its requirement
-    /// coming out at zero is DERIVED (truncation bounds `qty ≤ |amount|`, the price band bounds
-    /// `Ask ≤ 1.1 N < 2 N`, so the joint `max()` never switches to the `Ask` arm), not asserted.
-    /// See `margin_view`.
-    #[serde(default, rename = "roq")]
-    pub reduce_only_qty: u64,
 }
 
 impl PerpPosition {
@@ -192,7 +176,6 @@ impl Default for PerpPosition {
             // A position that never existed has realised nothing. The only default that is NOT
             // trivially right is `leverage`, which is 1 rather than 0.
             cumulative_realized_pnl: 0,
-            reduce_only_qty: 0,
         }
     }
 }

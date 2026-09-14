@@ -6794,28 +6794,36 @@ mod golden {
     /// Guard behaviour itself is pinned by `tests::signed_replay`.
     ///
     /// ── Re-pinned again for the reduce-only groundwork ──────────────────────────────────────
-    /// A CHAIN change: `BLOCK_COMMITMENT_VERSION` 24 → 25, devnet wiped. Three things moved, none
+    /// A CHAIN change: `BLOCK_COMMITMENT_VERSION` 24 → 26, devnet wiped. Three things moved, none
     /// of them behaviour:
     ///
     ///   * the VERSION byte is hashed into every block commitment, so the bump alone re-pins this;
-    ///   * `PerpPosition` gained `reduce_only_qty`, and `Order` / `OrderEntry` gained
-    ///     `reduce_only`. The codec is POSITIONAL msgpack (field names are not serialised), so an
-    ///     appended field costs its encoded width — one byte each for a zero `u64` and a `false`
-    ///     bool — on EVERY position and order blob. It is not free, and it is not skippable:
+    ///   * `Order` / `OrderEntry` gained `reduce_only`. The codec is POSITIONAL msgpack (field
+    ///     names are not serialised), so an appended field costs its encoded width — one byte for
+    ///     a `false` bool — on EVERY order blob. It is not free, and it is not skippable:
     ///     `skip_serializing_if` would shift every later field's position and break decoding.
     ///     Append only; never insert or reorder.
+    ///   * `PerpPosition::reduce_only_qty` was added and then REMOVED again (VERSION 25 → 26). It
+    ///     was meant as the O(1) `Σ reduce-only` term and fast-path gate, but it would have needed
+    ///     maintaining at five sites — rest, cancel, evict, maker fill, liquidation's cancel-all —
+    ///     each one a place to forget, and a stale counter mis-prices admission silently. It is
+    ///     DERIVED from the entry list instead. The list is already warm on every path that needs
+    ///     it (placement loads it to insert; the match flush holds it in the working copy), so the
+    ///     "keeps the predicate off the hot path" argument for storing it was weaker than it
+    ///     looked: the saving was one hashbrown probe, against a whole class of drift.
     ///   * `placeOrder` / `placeOrderSigned` / `PlaceItem` gained `flags`, widening the signed
     ///     message to 97 bytes and the batch digest item to 44. Neither is hashed here, but the
     ///     scenario's signed order re-signs over the new layout.
     ///
-    /// `BusinessSnapshot` is unchanged, which is the load-bearing check: `flags = 0` is the only
-    /// value this build accepts (`decode_order_flags` refuses the reduce-only bit until the
-    /// admission predicate lands), so no order, position, balance or status can have moved.
+    /// `BusinessSnapshot` is unchanged, which is the load-bearing check. reduce-only is now fully
+    /// enabled, but the golden scenario places no reduce-only order, and the eviction pass exits on
+    /// its first check when a user holds none — so no order, position, balance or status moved.
     ///
     /// Prior values 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052,
-    /// 0x38ca0434996ba2e636a05ff1c69c46c9ff93d343e4cde19e8223968a6a03d733.
+    /// 0x38ca0434996ba2e636a05ff1c69c46c9ff93d343e4cde19e8223968a6a03d733,
+    /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe");
+        b256!("0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -16180,15 +16188,17 @@ mod signed_replay {
         }
     }
 
-    /// The reduce-only bit is refused outright until the admission predicate and the three eviction
-    /// triggers exist. Accepted-and-ignored would be worse than rejected: the caller believes the
-    /// order can only reduce, and it can in fact open and flip their position.
+    /// The signed path reaches the same admission predicate as the direct one. A flat position has
+    /// nothing to reduce, so there is no side a reduce-only order could legally take.
     #[test]
-    fn reduce_only_bit_is_refused_until_the_predicate_lands() {
+    fn the_signed_path_reaches_the_reduce_only_predicate() {
         let (mut ctx, sk) = fixture();
         let (reverted, reason) = call(&mut ctx, &signed_place_input_flags(&sk, 1, 1));
         assert!(reverted);
-        assert!(reason.contains("reduce-only not yet enabled"), "got {reason}");
+        assert!(
+            reason.contains("reduce-only requires an open position"),
+            "got {reason}"
+        );
     }
 
     /// The direct path shares `decode_order_flags`, so it must refuse identically.
@@ -16196,7 +16206,10 @@ mod signed_replay {
     fn the_direct_path_refuses_the_same_flags() {
         let mut ctx = make_ctx();
         setup(&mut ctx);
-        for (flags, want) in [(1u8, "reduce-only not yet enabled"), (2u8, "unknown order flags 0x02")] {
+        for (flags, want) in [
+            (1u8, "reduce-only requires an open position"),
+            (2u8, "unknown order flags 0x02"),
+        ] {
             let input = placeOrderCall {
                 marketId: MARKET_ID,
                 side: 0,
@@ -16319,5 +16332,195 @@ mod signed_replay {
             writes_before,
             "signature failure is pre-write — no marker may be burned"
         );
+    }
+}
+
+// ── reduce-only, end to end ──────────────────────────────────────────────────────
+//
+// The unit tests in `crate::reduce_only` pin the predicate as arithmetic. These drive it through
+// the real selector: admission, silent truncation, and the eviction trigger that has nothing to do
+// with the position (a normal order resting AHEAD).
+#[cfg(test)]
+mod reduce_only_e2e {
+    use super::*;
+    use crate::interface::IPerpDex::OrderCancelled;
+    use crate::types::{CancelReason, PerpPosition};
+    use alloy_sol_types::SolEvent;
+
+    const RO: u8 = 1; // flags bit 0
+
+    /// Gives `who` a long of `lots` (each `QTY`), funded so the margin maths is never the reason a
+    /// placement is refused.
+    fn seed_long(ctx: &mut TestCtx, who: Address, lots: i64) {
+        let notional = lots * FILL_VALUE as i64;
+        storage::save_position(
+            ctx,
+            who,
+            MARKET_ID,
+            &PerpPosition {
+                amount: lots * QTY as i64,
+                v_quote_balance: -notional,
+                margin: notional.abs(),
+                leverage: 1,
+                ..PerpPosition::default()
+            },
+            AccountUpdateReason::Adjustment,
+        )
+        .unwrap();
+    }
+
+    fn place_flagged(
+        ctx: &mut TestCtx,
+        who: Address,
+        side: u8,
+        price: u64,
+        qty: u64,
+        flags: u8,
+    ) -> Result<[u8; 32], String> {
+        let input = placeOrderCall {
+            marketId: MARKET_ID,
+            side,
+            price,
+            quantity: qty,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+            flags,
+        }
+        .abi_encode();
+        let (id, _) = crate::trading::peek_order_id(ctx, who).unwrap();
+        let out = run_perp_dex_call(&input, 30_000_000, who, U256::ZERO, false, ctx)
+            .expect("must not hard-fail");
+        if out.reverted {
+            Err(String::from_utf8_lossy(&out.bytes).to_string())
+        } else {
+            Ok(id)
+        }
+    }
+
+    fn cancel_reasons(ctx: &mut TestCtx) -> Vec<u8> {
+        JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .filter(|l| l.data.topics().first() == Some(&OrderCancelled::SIGNATURE_HASH))
+            .map(|l| {
+                OrderCancelled::decode_raw_log(l.data.topics(), &l.data.data)
+                    .unwrap()
+                    .reason
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_flat_position_has_nothing_to_reduce() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let err = place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY, RO).unwrap_err();
+        assert!(err.contains("reduce-only requires an open position"), "got {err}");
+    }
+
+    /// A reduce-only BUY against a LONG would increase it. The side is not a preference — it is
+    /// determined by the position's sign.
+    #[test]
+    fn the_opening_side_is_refused() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+        let err = place_flagged(&mut ctx, ALICE, 0, PRICE - TICK, QTY, RO).unwrap_err();
+        assert!(
+            err.contains("reduce-only order is on the position's opening side"),
+            "got {err}"
+        );
+    }
+
+    /// SILENT truncation: over-sized is accepted, not rejected, and the stored order carries the
+    /// SHRUNK quantity. `quantity` is a request, not a promise.
+    #[test]
+    fn an_oversized_request_is_silently_truncated() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+        let id = place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY * 10, RO)
+            .expect("must be ACCEPTED, not rejected");
+        let order = storage::load_order(&mut ctx, &id).unwrap().unwrap();
+        assert_eq!(order.quantity, QTY * 3, "truncated to the position");
+        assert!(order.reduce_only);
+    }
+
+    /// The first reduce-only order commits the position; a second gets only the remainder. This is
+    /// the case a predicate that only counted NORMAL orders ahead would miss entirely.
+    #[test]
+    fn a_second_reduce_only_order_gets_only_the_remainder() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+        place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY * 2, RO).unwrap();
+        let id = place_flagged(&mut ctx, ALICE, 1, PRICE + 2 * TICK, QTY * 5, RO).unwrap();
+        let order = storage::load_order(&mut ctx, &id).unwrap().unwrap();
+        assert_eq!(order.quantity, QTY, "2 of 3 lots already committed");
+
+        // And a third has nothing left.
+        let err = place_flagged(&mut ctx, ALICE, 1, PRICE + 3 * TICK, QTY, RO).unwrap_err();
+        assert!(err.contains("reduce-only capacity exhausted"), "got {err}");
+    }
+
+    /// The eviction trigger that is not about the position at all. A NORMAL sell nearer the touch
+    /// fills FIRST, so it would consume the long before the reduce-only order could reduce it.
+    /// Binance accepts the normal order and kills the reduce-only one — normal orders are
+    /// first-class.
+    #[test]
+    fn a_normal_order_resting_ahead_evicts_the_reduce_only_order() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+        let ro = place_flagged(&mut ctx, ALICE, 1, PRICE + 5 * TICK, QTY * 3, RO).unwrap();
+        assert!(storage::load_order(&mut ctx, &ro).unwrap().is_some());
+        let _ = cancel_reasons(&mut ctx); // drain
+
+        // A sell is NEARER the touch the lower its price, so this one fills first.
+        place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY * 3, 0).unwrap();
+
+        assert!(
+            storage::load_order(&mut ctx, &ro).unwrap().is_none(),
+            "delete-on-terminal: the evicted order is gone"
+        );
+        assert!(
+            cancel_reasons(&mut ctx).contains(&(CancelReason::ReduceOnlyOvertaken as u8)),
+            "must report WHY it died"
+        );
+    }
+
+    /// The negative control for the test above: a normal order resting BEHIND fills after, so it
+    /// cannot consume the position first and must leave the reduce-only order alone. Without this,
+    /// "evict whenever any normal order rests" would pass.
+    #[test]
+    fn a_normal_order_resting_behind_leaves_it_alone() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+        let ro = place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY * 3, RO).unwrap();
+        place_flagged(&mut ctx, ALICE, 1, PRICE + 5 * TICK, QTY * 3, 0).unwrap();
+        assert!(
+            storage::load_order(&mut ctx, &ro).unwrap().is_some(),
+            "an order that fills LATER cannot starve this one"
+        );
+    }
+
+    /// MEASURED exemption (§1.6): a one-step reduce-only order below the market minimum is
+    /// accepted. It has to be — truncation routinely lands below any sane floor, and closing the
+    /// last sliver of a position is the order a trader most needs.
+    #[test]
+    fn the_minimum_size_does_not_apply_to_reduce_only() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+        market.min_quantity = QTY * 2;
+        storage::save_market(&mut ctx, &market).unwrap();
+        seed_long(&mut ctx, ALICE, 3);
+
+        let err = place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY, 0).unwrap_err();
+        assert!(err.contains("quantity below minimum"), "normal order: got {err}");
+
+        place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY, RO)
+            .expect("reduce-only is exempt");
     }
 }
