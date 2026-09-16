@@ -865,17 +865,27 @@ fn update_index_price_emits_exactly_one_price_event() {
     assert_eq!(e.markPrice, ENTRY_PRICE);
     assert_eq!(e.updater, ADMIN);
 
-    let (rate, next_ts) = get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID);
-    assert_eq!(e.fundingRate, rate);
+    let (settled, next_ts) = get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID);
+    // Both 0 here, but for DIFFERENT reasons, and they are no longer the same quantity: with
+    // `funding_interval == 0` there is no accumulator and no epoch, so the event falls back to the
+    // settled rate (also 0). The predicted-vs-settled distinction is exercised by
+    // `mark_price_event_carries_the_predicted_rate_not_the_settled_one`.
+    assert_eq!(e.fundingRate, 0);
+    assert_eq!(settled, 0);
     assert_eq!(e.nextFundingTime, next_ts);
 }
 
-/// THE REASON FOR THE MERGE. `FundingRateComputed` fires only at an epoch boundary, while the mark
-/// updates every `priceUpdateInterval` — so a stream consumer used to have to cache the last rate
-/// across pushes. Pin that a push BETWEEN epochs (no `FundingRateComputed` in its logs) still
-/// carries the rate and next-funding time that `getFundingState` reports on the same state.
+/// `MarkPriceUpdated.fundingRate` is the PREDICTED rate — what this epoch would settle at if it
+/// ended now — not the rate already settled at the previous boundary.
+///
+/// ⚠️ This test used to assert the opposite, and that is the point: it pinned
+/// `getFundingState`'s SETTLED rate as the event's value, which was the bug. The discriminator is
+/// step 1 — on the very first push the prediction already exists while nothing has settled, so the
+/// two numbers DIVERGE. An implementation that publishes the settled rate reports 0 there.
+///
+/// `nextFundingTime` is unaffected and still tracks the funding state.
 #[test]
-fn mark_price_event_carries_current_funding_state_between_epochs() {
+fn mark_price_event_carries_the_predicted_rate_not_the_settled_one() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
@@ -901,15 +911,20 @@ fn mark_price_event_carries_current_funding_state_between_epochs() {
         JournalTr::take_logs(ctx.journal_mut())
     };
 
-    // 1. Epoch initialisation: no rate yet.
+    // 1. ★ THE DISCRIMINATOR. First push of the first epoch: nothing has settled yet, but the
+    //    prediction is already defined off this one sample — avgPI 0 (mark never leaves the index)
+    //    + clamp(100 - 0) = 100. The settled rate is still 0, so the two DIVERGE here.
     let logs = push(&mut ctx, 16); // -> window 15, next funding at 75
     let e = mark_price_events(&logs).pop().unwrap();
-    assert_eq!(e.fundingRate, 0);
-    assert_eq!(e.nextFundingTime, 75);
-    assert_eq!(
-        get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID),
-        (e.fundingRate, e.nextFundingTime)
+    assert_eq!(e.fundingRate, 100, "prediction off the first sample");
+    let (settled, next_ts) = get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID);
+    assert_eq!(settled, 0, "nothing has settled yet");
+    assert_ne!(
+        e.fundingRate, settled,
+        "the event must NOT be republishing the settled rate — that was the bug"
     );
+    assert_eq!(e.nextFundingTime, 75);
+    assert_eq!(e.nextFundingTime, next_ts, "nextFundingTime is unaffected");
 
     // 2. The epoch boundary: a rate is computed, `FundingRateComputed` fires, and the merged event
     //    already carries the NEW rate (it is emitted after the funding state is written).
@@ -920,11 +935,16 @@ fn mark_price_event_carries_current_funding_state_between_epochs() {
         "the boundary push must still emit FundingRateComputed"
     );
     let boundary = mark_price_events(&logs).pop().unwrap();
-    assert_eq!(boundary.fundingRate, 100, "avgPI 0 + clamp(100 - 0)");
+    // The accumulator was just reset and re-seeded with THIS sample, so the event carries the
+    // prediction for the NEW epoch. It happens to equal the rate that just settled here only
+    // because this market's mark never leaves the index — see the reproducibility check below for
+    // the version that does not depend on that coincidence.
+    assert_eq!(boundary.fundingRate, 100);
     assert_eq!(boundary.nextFundingTime, 135);
     assert_eq!(
-        get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID),
-        (boundary.fundingRate, boundary.nextFundingTime)
+        get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID).0,
+        100,
+        "and the boundary DID settle 100"
     );
 
     // 3. BETWEEN epochs — the case the merge exists for. No `FundingRateComputed`, but the price
@@ -939,15 +959,22 @@ fn mark_price_event_carries_current_funding_state_between_epochs() {
     assert_eq!(mid.len(), 1, "still exactly one price event mid-epoch");
     let mid = &mid[0];
     assert_eq!(mid.priceWindowTs, 90);
+    assert_eq!(mid.nextFundingTime, 135);
+
+    // ★ Reproducibility, which is what makes the field usable: the published number must be exactly
+    // what a consumer gets by applying the SAME formula to the SAME published inputs —
+    // `getAveragePremiumIndex` and `getMarket.interestRate`. This holds whatever the premium index
+    // happens to be, so it does not lean on this market's mark sitting on the index.
+    let avg = run_get_average_premium_index(
+        &getAveragePremiumIndexCall { marketId: MARKET_ID }.abi_encode(),
+        &mut ctx,
+    )
+    .unwrap();
+    let avg = getAveragePremiumIndexCall::abi_decode_returns(&avg).unwrap();
     assert_eq!(
-        (mid.fundingRate, mid.nextFundingTime),
-        get_funding_state_rate_and_next_time(&mut ctx, MARKET_ID),
-        "a mid-epoch push carries the live funding state, so no consumer has to cache it"
-    );
-    assert_eq!(
-        (mid.fundingRate, mid.nextFundingTime),
-        (100, 135),
-        "and it is the rate the last boundary set, not a zero"
+        mid.fundingRate,
+        crate::math::calc_funding_rate(avg.avgPremiumIndex, 100),
+        "the event's rate must be reproducible from the published average premium index"
     );
 }
 

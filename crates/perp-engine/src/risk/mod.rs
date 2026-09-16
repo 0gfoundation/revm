@@ -1895,6 +1895,10 @@ pub fn run_update_index_price<H: PerpHost>(
 
     // ── 5. Accumulate premium index for funding rate calculation ──────────────
     let mut computed_rate: Option<(i64, i64, u64)> = None; // (rate, avg_pi, sample_count)
+    // What `MarkPriceUpdated` publishes: the rate THIS epoch would settle at if it ended now.
+    // Seeded with the last settled rate so a market with funding disabled (`funding_interval == 0`,
+    // the block below never runs) still reports something meaningful rather than zero.
+    let mut predicted_rate = funding.last_funding_rate;
     if market.funding_interval > 0 {
         let mut acc = storage::load_premium_accumulator(context, args.marketId)?;
 
@@ -1958,6 +1962,11 @@ pub fn run_update_index_price<H: PerpHost>(
             storage::save_funding_state(context, args.marketId, &funding)?;
         }
 
+        // Recomputed on EVERY push, from the accumulator as it now stands — after this sample was
+        // folded in (`fill_slots_until`), or after the boundary reset re-seeded it with this sample.
+        // One i128 division; no new storage, and `market.interest_rate` is already loaded.
+        predicted_rate = calc_funding_rate(acc.average()?, market.interest_rate);
+
         storage::save_premium_accumulator(context, args.marketId, &acc)?;
     }
 
@@ -2009,7 +2018,7 @@ pub fn run_update_index_price<H: PerpHost>(
             marketId: args.marketId,
             markPrice: mark_price,
             indexPrice: args.indexPrice,
-            fundingRate: funding.last_funding_rate,
+            fundingRate: predicted_rate,
             nextFundingTime: funding.next_funding_ts,
             price1,
             price2,

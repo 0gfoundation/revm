@@ -1634,6 +1634,29 @@ sol! {
         // for symbol/decimals/tick. Mark price therefore has two sources — one seeding, one
         // streaming — in exchange for every `MarkPriceUpdated` being valid with no hot-path special
         // case. That is the better trade.
+        /// fundingRate: the rate the CURRENT epoch would settle at if it ended now —
+        ///   `calc_funding_rate(average premium index so far, interestRate)`, recomputed on every
+        ///   push and therefore moving continuously as samples accumulate. This is the
+        ///   `@markPrice` stream's `r`.
+        ///
+        ///   ⚠️ It previously carried `last_funding_rate` — the rate ALREADY SETTLED at the previous
+        ///   epoch boundary, piecewise-constant and changing once per `fundingInterval`. That was a
+        ///   BUG, not a different convention: this field has always been the stream's `r`, and `r`
+        ///   is the predicted rate. Fixed under the same name for exactly that reason — renaming
+        ///   would have implied the old value was a legitimate alternative reading.
+        ///
+        ///   ⚠️ But note HOW it fails for a stale consumer: `topic0` is computed from TYPES, so
+        ///   nothing about this decodes differently. An indexer that was writing this value into a
+        ///   settled-funding history will keep working and start recording predictions — and that
+        ///   history is a record of money moved. This needs to be loud in the changelog, because
+        ///   the chain cannot make it loud.
+        ///
+        ///   The SETTLED rate is still published by `FundingRateComputed` at each epoch boundary,
+        ///   which is now its ONLY source and is where a funding-history consumer belongs.
+        ///
+        ///   Early in an epoch the average is over few samples, so the prediction is noisy by
+        ///   construction and tightens as the epoch fills. At a boundary the accumulator has just
+        ///   been reset, so this is the prediction for the NEW epoch off its first sample.
         event MarkPriceUpdated(uint64 indexed marketId, uint64 markPrice, uint64 indexPrice, int64 fundingRate, uint64 nextFundingTime, uint64 price1, uint64 price2, uint64 priceWindowTs, address updater);
 
         // Feeds: /fundingRate (history), /income (FUNDING_FEE)
