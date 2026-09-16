@@ -1593,14 +1593,42 @@ sol! {
         //                       call returns this exact value.
         // * `indexPrice`      — the oracle input for this update. Always a real oracle price:
         //                       `updateIndexPrice` rejects 0, and this event only fires from there.
-        // * `fundingRate`     — `FundingState.last_funding_rate` AFTER this call, i.e. the rate in
-        //                       force right now, in FUNDING_RATE_ONE (1e6) units. Equal to
-        //                       `getFundingState().fundingRate` on the same state, and to the most
-        //                       recent `FundingRateComputed.fundingRate`. It is carried HERE, on
-        //                       every push, precisely because `FundingRateComputed` only fires at
-        //                       epoch boundaries while this fires every `priceUpdateInterval` — a
-        //                       consumer no longer has to cache a rate across pushes. 0 only if no
-        //                       epoch has closed yet, which is a true statement about the market.
+        // * `fundingRate`     — the PREDICTED rate: what the CURRENT epoch would settle at if it
+        //                       ended now, `calc_funding_rate(average premium index so far,
+        //                       interestRate)` in FUNDING_RATE_ONE (1e6) units. Recomputed on every
+        //                       push, so it MOVES continuously as the epoch fills. This is the
+        //                       `@markPrice` stream's `r`.
+        //                       ⚠️ It is NOT `getFundingState().fundingRate` and NOT the most recent
+        //                       `FundingRateComputed.fundingRate` — those are the rate already
+        //                       SETTLED at the previous boundary, and they DIVERGE from this field
+        //                       (on the very first push nothing has settled, yet a prediction
+        //                       exists). It used to carry `last_funding_rate`; that was a BUG, not
+        //                       a different convention, and it was fixed under the same name for
+        //                       that reason.
+        //                       ⚠️ The fix is INVISIBLE to consumers: `topic0` comes from TYPES, so
+        //                       nothing decodes differently and even `abi_diff_interface.js`
+        //                       reports IDENTICAL. Anything that fed this into a settled-funding
+        //                       history keeps working and silently starts recording predictions.
+        //                       The SETTLED rate is still published by `FundingRateComputed` at
+        //                       each boundary — now its ONLY source, and where a funding-history
+        //                       consumer belongs.
+        //                       Early in an epoch the average is over few samples, so the
+        //                       prediction is noisy by construction and tightens as the epoch
+        //                       fills. At a boundary the accumulator has just been reset, so this
+        //                       is the prediction for the NEW epoch off its first sample. Falls
+        //                       back to the last settled rate on a market with funding disabled
+        //                       (`fundingInterval == 0`), where no accumulator exists.
+        // * `estimatedSettlePrice`
+        //                     — the `@markPrice` stream's `P`: `mark / (1 + fundingRate)`, the mark
+        //                       with one funding period's predicted premium discounted out
+        //                       (`math::calc_estimated_settle_price`).
+        //                       ⚠️ The FORMULA IS OURS. `P` is documented as "only useful in the
+        //                       last hour before settlement", which is a DELIVERY-contract field,
+        //                       and a perpetual has no settlement; the evidence base holds no
+        //                       captured `markPrice` payload to say what a venue puts there for a
+        //                       perp. Do not cite it as Binance behaviour.
+        //                       It is a function of `markPrice` and `fundingRate`, both in THIS
+        //                       event, so a consumer can verify ours or compute its own.
         // * `nextFundingTime` — `FundingState.next_funding_ts` AFTER this call, i.e.
         //                       `getFundingState().nextFundingTime`.
         // * `price1`/`price2` — the two intermediate components of the median, diagnostic only.
@@ -1634,41 +1662,6 @@ sol! {
         // for symbol/decimals/tick. Mark price therefore has two sources — one seeding, one
         // streaming — in exchange for every `MarkPriceUpdated` being valid with no hot-path special
         // case. That is the better trade.
-        /// fundingRate: the rate the CURRENT epoch would settle at if it ended now —
-        ///   `calc_funding_rate(average premium index so far, interestRate)`, recomputed on every
-        ///   push and therefore moving continuously as samples accumulate. This is the
-        ///   `@markPrice` stream's `r`.
-        ///
-        ///   ⚠️ It previously carried `last_funding_rate` — the rate ALREADY SETTLED at the previous
-        ///   epoch boundary, piecewise-constant and changing once per `fundingInterval`. That was a
-        ///   BUG, not a different convention: this field has always been the stream's `r`, and `r`
-        ///   is the predicted rate. Fixed under the same name for exactly that reason — renaming
-        ///   would have implied the old value was a legitimate alternative reading.
-        ///
-        ///   ⚠️ But note HOW it fails for a stale consumer: `topic0` is computed from TYPES, so
-        ///   nothing about this decodes differently. An indexer that was writing this value into a
-        ///   settled-funding history will keep working and start recording predictions — and that
-        ///   history is a record of money moved. This needs to be loud in the changelog, because
-        ///   the chain cannot make it loud.
-        ///
-        ///   The SETTLED rate is still published by `FundingRateComputed` at each epoch boundary,
-        ///   which is now its ONLY source and is where a funding-history consumer belongs.
-        ///
-        ///   Early in an epoch the average is over few samples, so the prediction is noisy by
-        ///   construction and tightens as the epoch fills. At a boundary the accumulator has just
-        ///   been reset, so this is the prediction for the NEW epoch off its first sample.
-        /// estimatedSettlePrice: the `@markPrice` stream's `P`. `mark / (1 + fundingRate)` — the
-        ///   mark with one funding period's predicted premium discounted out
-        ///   (`math::calc_estimated_settle_price`).
-        ///
-        ///   ⚠️ The formula is OUR definition. `P` is documented as "only useful in the last hour
-        ///   before settlement", which is a DELIVERY-contract field, and a perpetual has no
-        ///   settlement; no captured `markPrice` payload exists in the evidence base to say what a
-        ///   venue puts there for a perp. Published so a consumer has one number instead of
-        ///   reimplementing the arithmetic, not as a parity claim.
-        ///
-        ///   Derivable from `markPrice` and `fundingRate`, both in this same event, so a consumer
-        ///   that disagrees with the definition can compute its own.
         event MarkPriceUpdated(uint64 indexed marketId, uint64 markPrice, uint64 indexPrice, int64 fundingRate, uint64 estimatedSettlePrice, uint64 nextFundingTime, uint64 price1, uint64 price2, uint64 priceWindowTs, address updater);
 
         // Feeds: /fundingRate (history), /income (FUNDING_FEE)
