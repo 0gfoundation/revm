@@ -1657,7 +1657,19 @@ sol! {
         ///   Early in an epoch the average is over few samples, so the prediction is noisy by
         ///   construction and tightens as the epoch fills. At a boundary the accumulator has just
         ///   been reset, so this is the prediction for the NEW epoch off its first sample.
-        event MarkPriceUpdated(uint64 indexed marketId, uint64 markPrice, uint64 indexPrice, int64 fundingRate, uint64 nextFundingTime, uint64 price1, uint64 price2, uint64 priceWindowTs, address updater);
+        /// estimatedSettlePrice: the `@markPrice` stream's `P`. `mark / (1 + fundingRate)` — the
+        ///   mark with one funding period's predicted premium discounted out
+        ///   (`math::calc_estimated_settle_price`).
+        ///
+        ///   ⚠️ The formula is OUR definition. `P` is documented as "only useful in the last hour
+        ///   before settlement", which is a DELIVERY-contract field, and a perpetual has no
+        ///   settlement; no captured `markPrice` payload exists in the evidence base to say what a
+        ///   venue puts there for a perp. Published so a consumer has one number instead of
+        ///   reimplementing the arithmetic, not as a parity claim.
+        ///
+        ///   Derivable from `markPrice` and `fundingRate`, both in this same event, so a consumer
+        ///   that disagrees with the definition can compute its own.
+        event MarkPriceUpdated(uint64 indexed marketId, uint64 markPrice, uint64 indexPrice, int64 fundingRate, uint64 estimatedSettlePrice, uint64 nextFundingTime, uint64 price1, uint64 price2, uint64 priceWindowTs, address updater);
 
         // Feeds: /fundingRate (history), /income (FUNDING_FEE)
         //

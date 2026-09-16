@@ -976,6 +976,24 @@ fn mark_price_event_carries_the_predicted_rate_not_the_settled_one() {
         crate::math::calc_funding_rate(avg.avgPremiumIndex, 100),
         "the event's rate must be reproducible from the published average premium index"
     );
+
+    // ★ The published triple is SELF-CONSISTENT: `P` is a function of the other two fields in the
+    // same event, so a consumer can verify it without any second call — and one that disagrees
+    // with our definition of `P` can recompute its own from `markPrice` and `fundingRate`.
+    for e in [&e, &boundary, mid] {
+        assert_eq!(
+            e.estimatedSettlePrice,
+            crate::math::calc_estimated_settle_price(e.markPrice, e.fundingRate),
+            "P must equal mark / (1 + r) from this same event's fields"
+        );
+    }
+    // And it is not a copy of the mark: r = 100 (0.01%) here, so it sits just below.
+    assert!(
+        mid.estimatedSettlePrice < mid.markPrice,
+        "a positive rate must discount the mark DOWN, got P {} vs mark {}",
+        mid.estimatedSettlePrice,
+        mid.markPrice
+    );
 }
 
 #[test]

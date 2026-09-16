@@ -2019,6 +2019,10 @@ pub fn run_update_index_price<H: PerpHost>(
             markPrice: mark_price,
             indexPrice: args.indexPrice,
             fundingRate: predicted_rate,
+            estimatedSettlePrice: crate::math::calc_estimated_settle_price(
+                mark_price,
+                predicted_rate,
+            ),
             nextFundingTime: funding.next_funding_ts,
             price1,
             price2,

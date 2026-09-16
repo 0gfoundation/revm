@@ -853,6 +853,49 @@ pub fn calc_funding_rate(average_premium_index: i64, interest_rate: i64) -> i64 
     (average_premium_index + clamped).clamp(MIN_FUNDING_RATE, MAX_FUNDING_RATE)
 }
 
+/// Estimated settle price: the mark with one funding period's premium discounted out.
+///
+/// ```text
+/// P = mark / (1 + r)  =  mark × FUNDING_RATE_ONE / (FUNDING_RATE_ONE + r)
+/// ```
+///
+/// `r` is the PREDICTED rate for the current epoch (`MarkPriceUpdated.fundingRate`). A perp
+/// trading at a premium has `r > 0`, and this backs that premium out — at settlement the premium
+/// is what changes hands, so the ex-funding level is the estimate.
+///
+/// ⚠️ **The formula is OUR definition, not measured parity.** The `@markPrice` stream's `P` is
+/// documented as "estimated settle price, only useful in the last hour before settlement", which is
+/// a DELIVERY-contract field — a perpetual has no settlement — and the evidence base holds no
+/// captured `markPrice` payload to say what a venue actually puts there. Do not cite this as
+/// Binance behaviour.
+///
+/// # No division by zero, and no sign flip — structurally
+///
+/// `r` is clamped to ±[`MAX_FUNDING_RATE`] (±0.75%) by [`calc_funding_rate`], so the denominator
+/// lives in `[992_500, 1_007_500]`: always positive, never zero, and never close to either. That is
+/// a property of the clamp, so widening `MAX_FUNDING_RATE` past ±100% would break it — hence the
+/// debug assertion rather than a silent trust.
+#[inline]
+pub fn calc_estimated_settle_price(mark_price: u64, funding_rate: i64) -> u64 {
+    let denom = FUNDING_RATE_ONE as i128 + funding_rate as i128;
+    debug_assert!(
+        denom > 0,
+        "estimated settle price: funding rate {funding_rate} inverted the denominator — the \
+         ±MAX_FUNDING_RATE clamp is what keeps this positive"
+    );
+    if denom <= 0 {
+        return mark_price;
+    }
+    let scaled = mark_price as u128 * FUNDING_RATE_ONE as u128;
+    // Saturating, NOT checked: this feeds a LOG field on the oracle path, and that path also drives
+    // the liquidation sweep. Reverting a price update over a display value would trade a real
+    // failure for a cosmetic one. Only reachable at a mark within ~0.76% of `u64::MAX`, which is not
+    // a market — so it is a debug assertion plus a floor, not a live branch.
+    let out = scaled / denom as u128;
+    debug_assert!(out <= u64::MAX as u128, "estimated settle price overflows u64");
+    u64::try_from(out).unwrap_or(u64::MAX)
+}
+
 /// Funding payment (signed, quote units) accrued by a position between two
 /// cumulative-funding-index checkpoints.
 ///
@@ -1932,6 +1975,7 @@ mod liquidation_price_tests {
 
 #[cfg(test)]
 mod open_order_margin_tests {
+
     use super::*;
 
     /// `(PIM, IM, ooIM)` at an explicit leverage.
@@ -2318,3 +2362,54 @@ mod open_order_margin_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod estimated_settle_price_tests {
+    use super::*;
+
+    // ── estimated settle price ───────────────────────────────────────────────
+
+    /// `r = 0` is the identity: nothing to discount out.
+    #[test]
+    fn a_zero_funding_rate_leaves_the_mark_alone() {
+        assert_eq!(calc_estimated_settle_price(90_000_000_000, 0), 90_000_000_000);
+    }
+
+    /// A premium (`r > 0`) discounts DOWN, a discount (`r < 0`) lifts UP — and the two are not
+    /// symmetric, because `1/(1+r)` is not `1−r`. Asserting the exact integers rather than a
+    /// direction catches a sign error AND an `× (1−r)` approximation.
+    #[test]
+    fn the_premium_is_divided_out_not_subtracted() {
+        // 1_000_000 × 1e6 / 1_007_500 = 992_555 (trunc)
+        assert_eq!(calc_estimated_settle_price(1_000_000, 7_500), 992_555);
+        // 1_000_000 × 1e6 / 992_500 = 1_007_556 (trunc)
+        assert_eq!(calc_estimated_settle_price(1_000_000, -7_500), 1_007_556);
+        // × (1 − r) would have given 992_500 / 1_007_500 — both off by ~55.
+        assert_ne!(calc_estimated_settle_price(1_000_000, 7_500), 992_500);
+    }
+
+    /// The denominator cannot vanish or invert at any rate the clamp admits — that is what makes
+    /// the division safe without a runtime guard on the hot path.
+    #[test]
+    fn the_denominator_is_positive_across_the_whole_clamped_range() {
+        for r in [MIN_FUNDING_RATE, -1, 0, 1, MAX_FUNDING_RATE] {
+            let p = calc_estimated_settle_price(50_000_000_000, r);
+            assert!(p > 0, "r = {r} produced {p}");
+            // Within 1% of the mark for any admissible rate.
+            assert!(p.abs_diff(50_000_000_000) < 500_000_000, "r = {r} moved it too far");
+        }
+    }
+
+    /// The guard is LIVE, not decoration: a rate outside the clamp zeroes or inverts the
+    /// denominator, and this proves the debug assertion fires rather than the division proceeding.
+    ///
+    /// Unreachable through `calc_funding_rate` — which is why release keeps a silent floor
+    /// (returns the mark) instead of panicking on the oracle path. That floor is unobservable from
+    /// a test build, since `debug_assertions` are on here; the assertion IS the debug contract.
+    #[test]
+    #[should_panic(expected = "inverted the denominator")]
+    fn an_out_of_clamp_rate_trips_the_denominator_guard() {
+        calc_estimated_settle_price(1_000_000, -(FUNDING_RATE_ONE as i64));
+    }
+}
+
