@@ -167,6 +167,33 @@ impl OrderKind {
     pub fn rests_remainder(self) -> bool {
         matches!(self, OrderKind::Limit(TimeInForce::Gtc))
     }
+
+    /// Does this order have a POSITION IN THE OWNER'S OWN RESTING QUEUE — i.e. is its limit price
+    /// meaningful as "when do I fill relative to my other orders"?
+    ///
+    /// True only for GTC and PostOnly. A market, IOC or FOK order takes liquidity IMMEDIATELY, so
+    /// nothing the owner has resting can precede it and its price says nothing about ordering — a
+    /// market order's price is not even set (`placeOrder` ignores it, callers send 0).
+    ///
+    /// # Why reduce-only admission needs exactly this distinction
+    ///
+    /// The prefix condition ranks an order against the owner's same-side book by distance from the
+    /// touch. Feeding it the price of an order that does not queue produces nonsense, and on the BUY
+    /// side the nonsense is catastrophic: `distance_from_touch(Buy, 0)` is `u64::MAX`, the FARTHEST
+    /// possible, so a market reduce-only buy was ranked behind every one of the owner's resting buys
+    /// and refused for "capacity exhausted" — it BLOCKED closing a position, which is the one thing
+    /// reduce-only exists to do.
+    ///
+    /// ⚠️ A crossing GTC is deliberately treated as resting for its WHOLE quantity even though part
+    /// of it fills immediately. That is conservative — it can only reject more, never admit an order
+    /// that could open — and it avoids splitting one order across two rankings.
+    #[inline]
+    pub fn has_resting_queue_position(self) -> bool {
+        matches!(
+            self,
+            OrderKind::Limit(TimeInForce::Gtc) | OrderKind::Limit(TimeInForce::PostOnly)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]

@@ -16377,13 +16377,39 @@ mod reduce_only_e2e {
         qty: u64,
         flags: u8,
     ) -> Result<[u8; 32], String> {
+        place_typed(ctx, who, side, price, qty, 0, 0, flags)
+    }
+
+    /// A MARKET order: `orderType = 1`, `tif = IOC`, and `price` is IGNORED — callers send 0, which
+    /// is exactly what the priority bug fed into the admission predicate.
+    fn place_market(
+        ctx: &mut TestCtx,
+        who: Address,
+        side: u8,
+        qty: u64,
+        flags: u8,
+    ) -> Result<[u8; 32], String> {
+        place_typed(ctx, who, side, 0, qty, 1, 1, flags)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_typed(
+        ctx: &mut TestCtx,
+        who: Address,
+        side: u8,
+        price: u64,
+        qty: u64,
+        order_type: u8,
+        tif: u8,
+        flags: u8,
+    ) -> Result<[u8; 32], String> {
         let input = placeOrderCall {
             marketId: MARKET_ID,
             side,
             price,
             quantity: qty,
-            orderType: 0,
-            tif: 0,
+            orderType: order_type,
+            tif,
             clientOrderId: FixedBytes::default(),
             flags,
         }
@@ -16676,6 +16702,111 @@ mod reduce_only_e2e {
         };
         assert_eq!(flag_of(ro), RO);
         assert_eq!(flag_of(plain), 0);
+    }
+
+    // ── MARKET reduce-only: a market order has NO book position ──────────────
+
+    /// ⚠️ REGRESSION. A market order's `price` is IGNORED (callers send 0), but admission fed it
+    /// into `distance_from_touch` as if it were a book position. On the BUY side
+    /// `distance_from_touch(Buy, 0) = u64::MAX` — the FARTHEST possible — so every one of the
+    /// owner's resting normal buys counted as being "ahead" of an order that in fact fills
+    /// IMMEDIATELY, before all of them.
+    ///
+    /// Consequence: a market reduce-only BUY was refused, or silently truncated, because of resting
+    /// orders that could not possibly fill first. That is the worst failure this feature can have —
+    /// the whole point of reduce-only is closing, and this BLOCKED closing.
+    ///
+    /// Reported from the API repo against the pinned engine; reproduced here.
+    #[test]
+    fn a_market_reduce_only_buy_is_not_ranked_behind_the_owners_resting_buys() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, -3); // short 3
+
+        // A resting normal BUY, far from the touch. It cannot fill before a market order.
+        place_flagged(&mut ctx, ALICE, 0, PRICE - TICK, QTY * 3, 0).unwrap();
+        // Liquidity for the market order to take.
+        place_flagged(&mut ctx, BOB, 1, PRICE, QTY * 3, 0).unwrap();
+
+        let id = place_market(&mut ctx, ALICE, 0, QTY * 3, RO)
+            .expect("a market reduce-only BUY must not be refused by RESTING orders");
+        let _ = id;
+        assert_eq!(
+            amount_of(&mut ctx, ALICE),
+            0,
+            "the short must be closed in full"
+        );
+    }
+
+    /// The truncation half of the same defect: with a smaller resting buy the order was accepted but
+    /// SHRUNK, leaving exposure open — a quieter failure than the outright reject and a worse one,
+    /// because the caller believes the position is closed.
+    #[test]
+    fn a_market_reduce_only_buy_is_not_truncated_by_the_owners_resting_buys() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, -3);
+
+        place_flagged(&mut ctx, ALICE, 0, PRICE - TICK, QTY, 0).unwrap();
+        place_flagged(&mut ctx, BOB, 1, PRICE, QTY * 3, 0).unwrap();
+
+        place_market(&mut ctx, ALICE, 0, QTY * 3, RO).unwrap();
+        assert_eq!(
+            amount_of(&mut ctx, ALICE),
+            0,
+            "truncated to 3 - 1 = 2 would leave 1 lot of exposure open"
+        );
+    }
+
+    /// The SELL side happened to escape: `distance_from_touch(Sell, 0) = 0`, the NEAREST value, so a
+    /// market sell was ranked in front rather than behind. Pinned so the fix does not "correct" the
+    /// side that was already right, and so the asymmetry cannot come back.
+    #[test]
+    fn a_market_reduce_only_sell_closes_a_long_past_resting_sells() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, 3);
+
+        place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY * 3, 0).unwrap();
+        place_flagged(&mut ctx, BOB, 0, PRICE, QTY * 3, 0).unwrap();
+
+        place_market(&mut ctx, ALICE, 1, QTY * 3, RO).unwrap();
+        assert_eq!(amount_of(&mut ctx, ALICE), 0);
+    }
+
+    /// A market reduce-only order is still bounded by the POSITION — that is the invariant, and the
+    /// fix must not trade the priority bug for an unbounded one.
+    #[test]
+    fn a_market_reduce_only_order_is_still_truncated_to_the_position() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, -2);
+        place_flagged(&mut ctx, BOB, 1, PRICE, QTY * 10, 0).unwrap();
+
+        place_market(&mut ctx, ALICE, 0, QTY * 10, RO).unwrap();
+        assert_eq!(
+            amount_of(&mut ctx, ALICE),
+            0,
+            "closed exactly, never flipped long"
+        );
+    }
+
+    /// The same defect reached IOC and FOK, not just MARKET — those also take liquidity
+    /// immediately, so the owner's resting orders cannot precede them either. It needed a specific
+    /// price ordering to trigger (an IOC priced FARTHER from the touch than a resting order), which
+    /// is why the market case surfaced first: a market order's price of 0 is the farthest possible
+    /// on the buy side, so it triggered unconditionally.
+    #[test]
+    fn an_ioc_reduce_only_buy_priced_behind_a_resting_buy_is_still_admitted() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        seed_long(&mut ctx, ALICE, -3);
+        // NEARER the touch for a buy (higher price) than the IOC below.
+        place_flagged(&mut ctx, ALICE, 0, PRICE + TICK, QTY * 3, 0).unwrap();
+
+        // No asks, so this fills nothing and expires — the assertion is about ADMISSION.
+        place_typed(&mut ctx, ALICE, 0, PRICE, QTY * 3, 0, 1, RO)
+            .expect("an IOC reduce-only order has no queue position either");
     }
 
     /// MEASURED exemption (§1.6): a one-step reduce-only order below the market minimum is

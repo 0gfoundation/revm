@@ -159,6 +159,23 @@ pub fn closing_side(pos: &PerpPosition) -> Option<Side> {
     }
 }
 
+/// Where a new order sits in the owner's own fill queue — the only thing the prefix condition
+/// needs to know about it, and a type rather than a `u64` so the market-order case cannot be
+/// spelled wrong.
+///
+/// It used to be a bare `price`, and a market order's price is IGNORED by `placeOrder` (callers
+/// send 0). On the BUY side `distance_from_touch(Buy, 0)` is `u64::MAX` — the FARTHEST possible —
+/// so a market reduce-only buy was ranked behind every resting buy the owner had and refused. See
+/// [`crate::types::OrderKind::has_resting_queue_position`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuePosition {
+    /// A GTC or PostOnly order: its limit price IS its place in the queue.
+    Resting { price: u64 },
+    /// A market, IOC or FOK order: fills immediately, so nothing the owner has resting can precede
+    /// it, and it never joins the resting set itself.
+    Immediate,
+}
+
 /// Admits a reduce-only order, returning the quantity that is actually accepted.
 ///
 /// Rejects a flat position and a same-side (would-open) request outright; otherwise TRUNCATES the
@@ -173,7 +190,7 @@ pub fn admit<H: PerpHost>(
     user: Address,
     market_id: u64,
     side: Side,
-    price: u64,
+    queue: QueuePosition,
     request: u64,
     step_size: u64,
 ) -> Result<u64, PerpError> {
@@ -190,15 +207,34 @@ pub fn admit<H: PerpHost>(
         ));
     }
 
-    let entries = load_side_entries(context, user, market_id, side)?;
-    let capacity = capacity_for_new(&pos, &entries, side, price);
+    // ── An immediate order is bounded by the POSITION and by nothing else ────────────────────
+    //
+    // It fills before every resting order, so no `normals_ahead` term applies. `Σ reduce-only` does
+    // not apply either: those orders fill LATER, and the post-fill eviction pass trims them against
+    // whatever position is left. Subtracting them here would refuse a close on account of orders
+    // that cannot precede it — the same class of defect as the priority bug, just milder.
+    //
+    // Also skips the list load entirely, which is the cheap path for the common close.
+    let capacity = match queue {
+        QueuePosition::Immediate => pos.amount.unsigned_abs(),
+        QueuePosition::Resting { price } => {
+            let entries = load_side_entries(context, user, market_id, side)?;
+            capacity_for_new(&pos, &entries, side, price)
+        }
+    };
 
     let mut accepted = request.min(capacity);
     if step_size > 0 {
         accepted -= accepted % step_size;
     }
     if accepted == 0 {
-        let (normals_ahead, sigma_ro) = prefix_terms(&entries, side, Some(price));
+        let (normals_ahead, sigma_ro) = match queue {
+            QueuePosition::Immediate => (0, 0),
+            QueuePosition::Resting { price } => {
+                let entries = load_side_entries(context, user, market_id, side)?;
+                prefix_terms(&entries, side, Some(price))
+            }
+        };
         // One message carrying all three terms rather than a separate string per cause: Binance
         // collapses every reduce-only refusal into one code with identical text anyway, and the
         // numbers are the part that is actually diagnosable from a receipt.
