@@ -498,8 +498,8 @@ pub fn run_set_leverage_signed<H: PerpHost>(
     check_api_key_expiry(context, &api_key)
         .map_err(|e| perp_err(&format!("setLeverageSigned: {e}")))?;
 
-    // Canonical message (fixed-layout, 72 bytes):
-    //   "perpdex_v1_leverage"(19) || account(20) || marketId(8) || leverage(8)
+    // Canonical fixed-layout message; the array literal and the closing assert carry the length.
+    //   "perpdex_v1_leverage" || chainId(8) || account(20) || marketId(8) || leverage(8)
     //   || timestamp(8) || recvWindow(8) || keyId(1)
     let mut msg = [0u8; 80];
     let mut c = crate::trading::write_signed_header(

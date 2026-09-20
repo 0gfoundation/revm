@@ -106,8 +106,11 @@ pub fn run_place_order_signed<H: PerpHost>(
 
     let pubkey = api_key.pubkey;
 
-    // Canonical message (fixed-layout, 96 bytes):
-    //   "perpdex_v1_order"(16) || account(20) || marketId(8) || side(1)
+    // Canonical fixed-layout message. ⚠️ No total is quoted here on purpose: the array literal
+    // below IS the length and the closing `debug_assert_eq!` enforces it, so a number in this
+    // comment would be a second source of truth that nothing checks. It went stale three times —
+    // once per field added — before it was removed.
+    //   "perpdex_v1_order" || chainId(8) || account(20) || marketId(8) || side(1)
     //   || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16)
     //   || timestamp(8) || recvWindow(8) || keyId(1) || flags(1)
     // `flags` is signed for the reason on the ABI: a signature that did not cover it could be
@@ -223,8 +226,9 @@ pub fn run_cancel_order_signed<H: PerpHost>(
 
     let pubkey = api_key.pubkey;
 
-    // Canonical message (fixed-layout, 94 bytes):
-    //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || marketId(8) || timestamp(8) || recvWindow(8) || keyId(1)
+    // Canonical fixed-layout message; the array literal and the closing assert carry the length.
+    //   "perpdex_v1_cancel" || chainId(8) || account(20) || orderId(32) || marketId(8)
+    //   || timestamp(8) || recvWindow(8) || keyId(1)
     // marketId is part of the signed message for ABI compatibility but otherwise ignored.
     let mut msg = [0u8; 102];
     let mut c = write_signed_header(&mut msg, b"perpdex_v1_cancel", context.chain_id());
@@ -430,9 +434,10 @@ pub(crate) fn gc_seen_buckets_best_effort<H: PerpHost>(
     }
 }
 
-/// Canonical batch-cancel digest preimage (64-byte header + 32 bytes per id):
-/// `"perpdex_v1_batch_cancel"(23) || chainId(8) || account(20) || keyId(1) || timestamp(8) || recvWindow(8)
-///  || N(4) || N x orderId(32)`, all integers big-endian.
+/// Canonical batch-cancel digest preimage — `HEADER` below is the header width, and the closing
+/// `debug_assert_eq!` ties the total to it, so neither size is restated here:
+/// `"perpdex_v1_batch_cancel" || chainId(8) || account(20) || keyId(1) || timestamp(8)
+///  || recvWindow(8) || N(4) || N x orderId(32)`, all integers big-endian.
 ///
 /// `N` is the DECODED id count, so a tampered length cannot be made to verify.
 pub(crate) fn batch_cancel_message(
@@ -710,14 +715,17 @@ fn signed_batch_order_id(signature: &[u8; 64], k: u32) -> [u8; 32] {
     keccak256(buf).0
 }
 
-/// Canonical batch-place digest preimage (63-byte header + 43 bytes per item):
-/// `"perpdex_v1_batch_order"(22) || chainId(8) || account(20) || keyId(1) || timestamp(8) || recvWindow(8) || N(4)
+/// Canonical batch-place digest preimage — `HEADER` and `ITEM` below are the widths, and the
+/// closing `debug_assert_eq!` ties the total to them, so neither is restated here:
+/// `"perpdex_v1_batch_order" || chainId(8) || account(20) || keyId(1) || timestamp(8)
+///  || recvWindow(8) || N(4)
 ///  || N x [ marketId(8) || side(1) || price(8) || quantity(8) || orderType(1) || tif(1)
 ///           || clientOrderId(16) || flags(1) ]`, all integers big-endian.
 ///
 /// `N` is the DECODED item count, so neither the length nor any field of any item can be tampered
-/// with. Note the digest packs the items TIGHTLY (43 bytes each) — it is not the ABI encoding
-/// (224 bytes each).
+/// with. The digest packs the items TIGHTLY — it is NOT the ABI encoding, which pads every field
+/// to a word (`batch::PLACE_ITEM_ENCODED_LEN`). That contrast is the point of saying so; the two
+/// numbers live on `ITEM` and that constant.
 pub(crate) fn batch_place_message(
     chain_id: u64,
     account: Address,
