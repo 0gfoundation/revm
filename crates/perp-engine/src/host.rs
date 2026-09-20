@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use context_interface::{
     journaled_state::{JournalCheckpoint, PerpBlob, PerpDelta, PerpDeltaEntry},
-    Block, ContextTr, JournalTr,
+    Block, Cfg, ContextTr, JournalTr,
 };
 use perp_core::{
     error::{perp_err, PerpError},
@@ -60,6 +60,13 @@ pub trait PerpHost {
 
     /// Current block timestamp (seconds).
     fn timestamp(&self) -> u64;
+
+    /// The EVM chain id of THIS deployment.
+    ///
+    /// Read for exactly one purpose: it goes into every signed-call message so a signature is
+    /// bound to the chain it was signed for. Without it a payload valid on one deployment is
+    /// byte-identically valid on every other — see `trading::signed_message_header`.
+    fn chain_id(&self) -> u64;
 
     /// External (ERC20) balance read for the deposit/withdraw bridge.
     fn external_balance(&mut self, token: Address, owner: Address) -> Result<U256, PerpError>;
@@ -135,6 +142,10 @@ impl<CTX: ContextTr> PerpHost for CTX {
         self.block().timestamp().saturating_to()
     }
 
+    fn chain_id(&self) -> u64 {
+        self.cfg().chain_id()
+    }
+
     fn external_balance(&mut self, token: Address, owner: Address) -> Result<U256, PerpError> {
         let slot = erc20_balance_slot(owner);
         // Warm the token account first — sload panics on a journal-absent account.
@@ -204,6 +215,8 @@ pub struct InMemoryHost {
     pub logs: Vec<Log>,
     /// Block timestamp returned by [`PerpHost::timestamp`].
     pub now: u64,
+    /// Chain id returned by [`PerpHost::chain_id`] — the domain a signed message is bound to.
+    pub chain_id: u64,
     /// Running perp-write witness (overlay writes; the typed store keeps its own count).
     overlay_writes: u64,
 }
@@ -212,6 +225,13 @@ impl InMemoryHost {
     /// Fresh host with the given block timestamp.
     pub fn new(now: u64) -> Self {
         Self { now, ..Self::default() }
+    }
+
+    /// Sets the chain id this host reports — the domain every signed message is bound to.
+    /// Defaults to 0, which is honest for a host that is not standing in for any chain.
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = chain_id;
+        self
     }
 
     /// Ends the simulated block: harvests the net perp delta (typed-store dirty set +
@@ -272,6 +292,10 @@ impl PerpHost for InMemoryHost {
 
     fn timestamp(&self) -> u64 {
         self.now
+    }
+
+    fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     fn external_balance(&mut self, token: Address, owner: Address) -> Result<U256, PerpError> {

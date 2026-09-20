@@ -246,23 +246,25 @@ fn transfer_from_perp_core<H: PerpHost>(
 /// OUT", and a relayer could submit either against whichever selector it preferred. Neither string
 /// is a proper prefix of the other, and their lengths differ, so no message of one kind can be
 /// reinterpreted as the other.
+#[allow(clippy::too_many_arguments)]
 fn transfer_signed_message<const N: usize>(
     prefix: &[u8],
+    chain_id: u64,
     account: Address,
     amount: u64,
     timestamp: u64,
     recv_window: u64,
     key_id: u8,
 ) -> [u8; N] {
+    use crate::trading::{put, write_signed_header};
     let mut msg = [0u8; N];
-    let p = prefix.len();
-    msg[..p].copy_from_slice(prefix);
-    msg[p..p + 20].copy_from_slice(account.as_slice());
-    msg[p + 20..p + 28].copy_from_slice(&amount.to_be_bytes());
-    msg[p + 28..p + 36].copy_from_slice(&timestamp.to_be_bytes());
-    msg[p + 36..p + 44].copy_from_slice(&recv_window.to_be_bytes());
-    msg[p + 44] = key_id;
-    debug_assert_eq!(p + 45, N, "message layout and length must agree");
+    let mut c = write_signed_header(&mut msg, prefix, chain_id);
+    c = put(&mut msg, c, account.as_slice());
+    c = put(&mut msg, c, &amount.to_be_bytes());
+    c = put(&mut msg, c, &timestamp.to_be_bytes());
+    c = put(&mut msg, c, &recv_window.to_be_bytes());
+    c = put(&mut msg, c, &[key_id]);
+    debug_assert_eq!(c, N, "message layout and length must agree");
     msg
 }
 
@@ -285,9 +287,10 @@ pub fn run_transfer_to_perp_signed<H: PerpHost>(
         .map_err(|e| perp_err(&format!("transferToPerpSigned: {e}")))?;
 
     // "perpdex_v1_xfer_to"(18) || account(20) || amount(8) || timestamp(8) || recvWindow(8)
-    //   || keyId(1) = 63 bytes
-    let msg = transfer_signed_message::<63>(
+    //   || keyId(1) = 71 bytes  (chainId sits right after the prefix)
+    let msg = transfer_signed_message::<71>(
         b"perpdex_v1_xfer_to",
+        context.chain_id(),
         args.account,
         args.amount,
         args.timestamp,
@@ -335,9 +338,10 @@ pub fn run_transfer_from_perp_signed<H: PerpHost>(
         .map_err(|e| perp_err(&format!("transferFromPerpSigned: {e}")))?;
 
     // "perpdex_v1_xfer_from"(20) || account(20) || amount(8) || timestamp(8) || recvWindow(8)
-    //   || keyId(1) = 65 bytes
-    let msg = transfer_signed_message::<65>(
+    //   || keyId(1) = 73 bytes  (chainId sits right after the prefix)
+    let msg = transfer_signed_message::<73>(
         b"perpdex_v1_xfer_from",
+        context.chain_id(),
         args.account,
         args.amount,
         args.timestamp,

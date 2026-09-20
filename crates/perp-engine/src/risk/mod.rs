@@ -501,14 +501,19 @@ pub fn run_set_leverage_signed<H: PerpHost>(
     // Canonical message (fixed-layout, 72 bytes):
     //   "perpdex_v1_leverage"(19) || account(20) || marketId(8) || leverage(8)
     //   || timestamp(8) || recvWindow(8) || keyId(1)
-    let mut msg = [0u8; 72];
-    msg[..19].copy_from_slice(b"perpdex_v1_leverage");
-    msg[19..39].copy_from_slice(args.account.as_slice());
-    msg[39..47].copy_from_slice(&args.marketId.to_be_bytes());
-    msg[47..55].copy_from_slice(&args.leverage.to_be_bytes());
-    msg[55..63].copy_from_slice(&args.timestamp.to_be_bytes());
-    msg[63..71].copy_from_slice(&args.recvWindow.to_be_bytes());
-    msg[71] = args.keyId;
+    let mut msg = [0u8; 80];
+    let mut c = crate::trading::write_signed_header(
+        &mut msg,
+        b"perpdex_v1_leverage",
+        context.chain_id(),
+    );
+    c = crate::trading::put(&mut msg, c, args.account.as_slice());
+    c = crate::trading::put(&mut msg, c, &args.marketId.to_be_bytes());
+    c = crate::trading::put(&mut msg, c, &args.leverage.to_be_bytes());
+    c = crate::trading::put(&mut msg, c, &args.timestamp.to_be_bytes());
+    c = crate::trading::put(&mut msg, c, &args.recvWindow.to_be_bytes());
+    c = crate::trading::put(&mut msg, c, &[args.keyId]);
+    debug_assert_eq!(c, msg.len(), "setLeverageSigned message layout");
 
     verify_ed25519(&api_key.pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("setLeverageSigned: {e}")))?;

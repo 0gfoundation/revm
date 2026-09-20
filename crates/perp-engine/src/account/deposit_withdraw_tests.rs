@@ -693,8 +693,12 @@ mod signed_transfers {
     /// Anyone may relay a signed call; the authority is the signature, not the sender.
     const RELAYER: Address = address!("3333333333333333333333333333333333333333");
 
+    /// The chain id `make_ctx` reports — every signed message is bound to it.
+    const TEST_CHAIN_ID: u64 = 1;
+
     fn signed_msg(prefix: &[u8], amount: u64) -> Vec<u8> {
         let mut msg = prefix.to_vec();
+        msg.extend_from_slice(&TEST_CHAIN_ID.to_be_bytes());
         msg.extend_from_slice(ALICE.as_slice());
         msg.extend_from_slice(&amount.to_be_bytes());
         msg.extend_from_slice(&SIGNED_TS.to_be_bytes());

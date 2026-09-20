@@ -112,20 +112,19 @@ pub fn run_place_order_signed<H: PerpHost>(
     //   || timestamp(8) || recvWindow(8) || keyId(1) || flags(1)
     // `flags` is signed for the reason on the ABI: a signature that did not cover it could be
     // resubmitted with the reduce-only bit flipped either way.
-    let mut msg = [0u8; 97];
-    msg[..16].copy_from_slice(b"perpdex_v1_order");
-    msg[16..36].copy_from_slice(args.account.as_slice());
-    msg[36..44].copy_from_slice(&args.marketId.to_be_bytes());
-    msg[44] = args.side;
-    msg[45..53].copy_from_slice(&args.price.to_be_bytes());
-    msg[53..61].copy_from_slice(&args.quantity.to_be_bytes());
-    msg[61] = args.orderType;
-    msg[62] = args.tif;
-    msg[63..79].copy_from_slice(&args.clientOrderId.0);
-    msg[79..87].copy_from_slice(&args.timestamp.to_be_bytes());
-    msg[87..95].copy_from_slice(&args.recvWindow.to_be_bytes());
-    msg[95] = args.keyId;
-    msg[96] = args.flags;
+    let mut msg = [0u8; 105];
+    let mut c = write_signed_header(&mut msg, b"perpdex_v1_order", context.chain_id());
+    c = put(&mut msg, c, args.account.as_slice());
+    c = put(&mut msg, c, &args.marketId.to_be_bytes());
+    c = put(&mut msg, c, &[args.side]);
+    c = put(&mut msg, c, &args.price.to_be_bytes());
+    c = put(&mut msg, c, &args.quantity.to_be_bytes());
+    c = put(&mut msg, c, &[args.orderType, args.tif]);
+    c = put(&mut msg, c, &args.clientOrderId.0);
+    c = put(&mut msg, c, &args.timestamp.to_be_bytes());
+    c = put(&mut msg, c, &args.recvWindow.to_be_bytes());
+    c = put(&mut msg, c, &[args.keyId, args.flags]);
+    debug_assert_eq!(c, msg.len(), "placeOrderSigned message layout");
 
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("placeOrderSigned: {e}")))?;
@@ -227,14 +226,15 @@ pub fn run_cancel_order_signed<H: PerpHost>(
     // Canonical message (fixed-layout, 94 bytes):
     //   "perpdex_v1_cancel"(17) || account(20) || orderId(32) || marketId(8) || timestamp(8) || recvWindow(8) || keyId(1)
     // marketId is part of the signed message for ABI compatibility but otherwise ignored.
-    let mut msg = [0u8; 94];
-    msg[..17].copy_from_slice(b"perpdex_v1_cancel");
-    msg[17..37].copy_from_slice(args.account.as_slice());
-    msg[37..69].copy_from_slice(args.orderId.as_slice());
-    msg[69..77].copy_from_slice(&args.marketId.to_be_bytes());
-    msg[77..85].copy_from_slice(&args.timestamp.to_be_bytes());
-    msg[85..93].copy_from_slice(&args.recvWindow.to_be_bytes());
-    msg[93] = args.keyId;
+    let mut msg = [0u8; 102];
+    let mut c = write_signed_header(&mut msg, b"perpdex_v1_cancel", context.chain_id());
+    c = put(&mut msg, c, args.account.as_slice());
+    c = put(&mut msg, c, args.orderId.as_slice());
+    c = put(&mut msg, c, &args.marketId.to_be_bytes());
+    c = put(&mut msg, c, &args.timestamp.to_be_bytes());
+    c = put(&mut msg, c, &args.recvWindow.to_be_bytes());
+    c = put(&mut msg, c, &[args.keyId]);
+    debug_assert_eq!(c, msg.len(), "cancelOrderSigned message layout");
 
     verify_ed25519(&pubkey, &msg, &args.signature)
         .map_err(|e| perp_err(&format!("cancelOrderSigned: {e}")))?;
@@ -367,6 +367,7 @@ pub fn run_batch_cancel_orders_signed<H: PerpHost>(
 
     let pubkey = api_key.pubkey;
     let msg = batch_cancel_message(
+        context.chain_id(),
         args.account,
         args.keyId,
         args.timestamp,
@@ -430,11 +431,12 @@ pub(crate) fn gc_seen_buckets_best_effort<H: PerpHost>(
 }
 
 /// Canonical batch-cancel digest preimage (64-byte header + 32 bytes per id):
-/// `"perpdex_v1_batch_cancel"(23) || account(20) || keyId(1) || timestamp(8) || recvWindow(8)
+/// `"perpdex_v1_batch_cancel"(23) || chainId(8) || account(20) || keyId(1) || timestamp(8) || recvWindow(8)
 ///  || N(4) || N x orderId(32)`, all integers big-endian.
 ///
 /// `N` is the DECODED id count, so a tampered length cannot be made to verify.
 pub(crate) fn batch_cancel_message(
+    chain_id: u64,
     account: Address,
     key_id: u8,
     timestamp: u64,
@@ -442,9 +444,10 @@ pub(crate) fn batch_cancel_message(
     ids: &[FixedBytes<32>],
 ) -> Vec<u8> {
     const TAG: &[u8; 23] = b"perpdex_v1_batch_cancel";
-    const HEADER: usize = 23 + 20 + 1 + 8 + 8 + 4;
+    const HEADER: usize = 23 + 8 + 20 + 1 + 8 + 8 + 4; // + chainId(8)
     let mut msg = Vec::with_capacity(HEADER + ids.len() * 32);
     msg.extend_from_slice(TAG);
+    msg.extend_from_slice(&chain_id.to_be_bytes());
     msg.extend_from_slice(account.as_slice());
     msg.push(key_id);
     msg.extend_from_slice(&timestamp.to_be_bytes());
@@ -584,6 +587,7 @@ pub fn run_batch_place_orders_signed<H: PerpHost>(
 
     let pubkey = api_key.pubkey;
     let msg = batch_place_message(
+        context.chain_id(),
         args.account,
         args.keyId,
         args.timestamp,
@@ -707,7 +711,7 @@ fn signed_batch_order_id(signature: &[u8; 64], k: u32) -> [u8; 32] {
 }
 
 /// Canonical batch-place digest preimage (63-byte header + 43 bytes per item):
-/// `"perpdex_v1_batch_order"(22) || account(20) || keyId(1) || timestamp(8) || recvWindow(8) || N(4)
+/// `"perpdex_v1_batch_order"(22) || chainId(8) || account(20) || keyId(1) || timestamp(8) || recvWindow(8) || N(4)
 ///  || N x [ marketId(8) || side(1) || price(8) || quantity(8) || orderType(1) || tif(1)
 ///           || clientOrderId(16) || flags(1) ]`, all integers big-endian.
 ///
@@ -715,6 +719,7 @@ fn signed_batch_order_id(signature: &[u8; 64], k: u32) -> [u8; 32] {
 /// with. Note the digest packs the items TIGHTLY (43 bytes each) — it is not the ABI encoding
 /// (224 bytes each).
 pub(crate) fn batch_place_message(
+    chain_id: u64,
     account: Address,
     key_id: u8,
     timestamp: u64,
@@ -722,12 +727,13 @@ pub(crate) fn batch_place_message(
     orders: &[PlaceItem],
 ) -> Vec<u8> {
     const TAG: &[u8; 22] = b"perpdex_v1_batch_order";
-    const HEADER: usize = 22 + 20 + 1 + 8 + 8 + 4;
+    const HEADER: usize = 22 + 8 + 20 + 1 + 8 + 8 + 4; // + chainId(8)
     /// marketId(8) + side(1) + price(8) + quantity(8) + orderType(1) + tif(1) + clientOrderId(16)
     /// + flags(1)
     const ITEM: usize = 44;
     let mut msg = Vec::with_capacity(HEADER + orders.len() * ITEM);
     msg.extend_from_slice(TAG);
+    msg.extend_from_slice(&chain_id.to_be_bytes());
     msg.extend_from_slice(account.as_slice());
     msg.push(key_id);
     msg.extend_from_slice(&timestamp.to_be_bytes());
@@ -913,6 +919,44 @@ pub(crate) fn check_recv_window<H: PerpHost>(
         return Err("timestamp expired (outside recvWindow)");
     }
     Ok(())
+}
+
+// ── Signed-message domain ─────────────────────────────────────────────────────
+
+/// Writes `prefix || chainId(8 BE)` at the head of a signed message; returns the offset just past
+/// it. Every signed entrypoint starts here, so the domain is defined once rather than seven times.
+///
+/// # Why the chain id is in the message
+///
+/// Without it a signed payload is valid on EVERY deployment that shares the `perpdex_v1_*` prefix:
+/// testnet, mainnet, and both sides of any fork. The seen-signature replay guard does not help —
+/// it is per-chain state, so burning a signature on one chain leaves it live on the others. An
+/// observer only needs the owner to have registered the same ed25519 key on both (routine — the
+/// same key management usually spans environments) and the ~65s recv window to still be open.
+/// `transferFromPerpSigned` is the sharpest case: a legitimate withdrawal on A replays as an
+/// unauthorised one on B.
+///
+/// This is EIP-155 / EIP-712's `chainId`, with the prefix playing `name` + `version`. We do NOT
+/// bind the contract address: there is exactly one PerpDEX precompile address and it is the same
+/// on every deployment, so it would separate nothing.
+///
+/// ⚠️ Callers write the rest of the message with a CURSOR, not hardcoded offsets. The offsets used
+/// to be literals, and adding this field shifted every one of them — exactly the edit where a
+/// silent off-by-one produces a message that still verifies against itself and against nothing
+/// else. Each site ends with a `debug_assert_eq!` on the final cursor.
+#[inline]
+pub(crate) fn write_signed_header(buf: &mut [u8], prefix: &[u8], chain_id: u64) -> usize {
+    let p = prefix.len();
+    buf[..p].copy_from_slice(prefix);
+    buf[p..p + 8].copy_from_slice(&chain_id.to_be_bytes());
+    p + 8
+}
+
+/// Appends `bytes` at `cursor`, returning the new cursor.
+#[inline]
+pub(crate) fn put(buf: &mut [u8], cursor: usize, bytes: &[u8]) -> usize {
+    buf[cursor..cursor + bytes.len()].copy_from_slice(bytes);
+    cursor + bytes.len()
 }
 
 // ── ed25519 helpers ───────────────────────────────────────────────────────────

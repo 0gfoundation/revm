@@ -19,6 +19,12 @@ use crate::{
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
+/// The chain id `make_ctx`'s `CfgEnv::default()` reports. Every signed message is bound to it,
+/// so a test that signs with a different value verifies against nothing — which is the POINT of
+/// the binding, but a confusing way to learn it. `the_signed_domain_is_bound_to_the_chain_id`
+/// asserts this constant still matches the context.
+const TEST_CHAIN_ID: u64 = 1;
+
 const ALICE: Address = address!("1111111111111111111111111111111111111111");
 const BOB: Address = address!("2222222222222222222222222222222222222222");
 const CAROL: Address = address!("3333333333333333333333333333333333333333");
@@ -6181,21 +6187,22 @@ mod perf {
                 let mut client_id = [0u8; 16];
                 client_id[8..].copy_from_slice(&i.to_be_bytes());
                 // Canonical 96-byte message, layout from run_place_order_signed.
-                let mut msg = [0u8; 97];
-                msg[..16].copy_from_slice(b"perpdex_v1_order");
-                msg[16..36].copy_from_slice(ALICE.as_slice());
-                msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
-                msg[44] = 0; // side = Buy
-                msg[45..53].copy_from_slice(&PRICE.to_be_bytes());
-                msg[53..61].copy_from_slice(&QTY.to_be_bytes());
-                msg[61] = 0; // orderType = Limit
-                msg[62] = 0; // tif = GTC
-                msg[63..79].copy_from_slice(&client_id);
-                msg[79..87].copy_from_slice(&block_ts.to_be_bytes());
-                msg[87..95].copy_from_slice(&recv_window.to_be_bytes());
-                msg[95] = 0; // keyId
-        msg[96] = 0; // flags
-                msg[96] = 0; // flags
+                let mut msg = [0u8; 105];
+                let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_order", TEST_CHAIN_ID);
+                c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
+                c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+                c = crate::trading::put(&mut msg, c, &[0]);
+                c = crate::trading::put(&mut msg, c, &PRICE.to_be_bytes());
+                c = crate::trading::put(&mut msg, c, &QTY.to_be_bytes());
+                c = crate::trading::put(&mut msg, c, &[0]);
+                c = crate::trading::put(&mut msg, c, &[0]);
+                c = crate::trading::put(&mut msg, c, &client_id);
+                c = crate::trading::put(&mut msg, c, &block_ts.to_be_bytes());
+                c = crate::trading::put(&mut msg, c, &recv_window.to_be_bytes());
+                c = crate::trading::put(&mut msg, c, &[0]);
+                c = crate::trading::put(&mut msg, c, &[0]);
+                c = crate::trading::put(&mut msg, c, &[0]);
+                debug_assert_eq!(c, msg.len());
                 let sig = sk.sign(&msg);
                 placeOrderSignedCall {
                     account: ALICE,
@@ -6819,11 +6826,20 @@ mod golden {
     /// enabled, but the golden scenario places no reduce-only order, and the eviction pass exits on
     /// its first check when a user holds none — so no order, position, balance or status moved.
     ///
+    /// Re-pinned again for the signed-message chain-id binding. Every signed message now starts
+    /// `prefix || chainId(8)`, so the scenario's signed order and signed cancel produce DIFFERENT
+    /// SIGNATURE BYTES — and `orderId = keccak256(signature)`, so the order's storage key moves and
+    /// the seen-signature marker with it. Nothing about the stored FORMAT changed, which is why
+    /// this needs no `BLOCK_COMMITMENT_VERSION` bump: the key VALUES moved, not the layout.
+    ///
+    /// `BusinessSnapshot` is unchanged — the ids are opaque to it, only statuses are read.
+    ///
     /// Prior values 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052,
     /// 0x38ca0434996ba2e636a05ff1c69c46c9ff93d343e4cde19e8223968a6a03d733,
-    /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe.
+    /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
+    /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875");
+        b256!("0x2b4f748275a1ccc669d0556a4d997a652fb8a66f85dcf755055d65f6708d40ba");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -7155,21 +7171,19 @@ mod golden {
         tif: u8,
         client_id: [u8; 16],
     ) -> Vec<u8> {
-        // Canonical 96-byte message, layout from run_place_order_signed.
-        let mut msg = [0u8; 97];
-        msg[..16].copy_from_slice(b"perpdex_v1_order");
-        msg[16..36].copy_from_slice(ALICE.as_slice());
-        msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
-        msg[44] = side;
-        msg[45..53].copy_from_slice(&price.to_be_bytes());
-        msg[53..61].copy_from_slice(&qty.to_be_bytes());
-        msg[61] = order_type;
-        msg[62] = tif;
-        msg[63..79].copy_from_slice(&client_id);
-        msg[79..87].copy_from_slice(&SIGNED_TS.to_be_bytes());
-        msg[87..95].copy_from_slice(&SIGNED_RECV.to_be_bytes());
-        msg[95] = 0; // keyId
-        msg[96] = 0; // flags
+        let mut msg = [0u8; 105];
+        let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_order", TEST_CHAIN_ID);
+        c = crate::trading::put(&mut msg, c, ALICE.as_slice());
+        c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[side]);
+        c = crate::trading::put(&mut msg, c, &price.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &qty.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[order_type, tif]);
+        c = crate::trading::put(&mut msg, c, &client_id);
+        c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[0, 0]);
+        debug_assert_eq!(c, msg.len());
         let sig = sk.sign(&msg);
         placeOrderSignedCall {
             account: ALICE,
@@ -7191,14 +7205,15 @@ mod golden {
 
     fn signed_cancel_input(sk: &SigningKey, order_id: [u8; 32]) -> Vec<u8> {
         // Canonical 94-byte message, layout from run_cancel_order_signed.
-        let mut msg = [0u8; 94];
-        msg[..17].copy_from_slice(b"perpdex_v1_cancel");
-        msg[17..37].copy_from_slice(ALICE.as_slice());
-        msg[37..69].copy_from_slice(&order_id);
-        msg[69..77].copy_from_slice(&MARKET_ID.to_be_bytes());
-        msg[77..85].copy_from_slice(&SIGNED_TS.to_be_bytes());
-        msg[85..93].copy_from_slice(&SIGNED_RECV.to_be_bytes());
-        msg[93] = 0; // keyId
+        let mut msg = [0u8; 102];
+        let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_cancel", TEST_CHAIN_ID);
+        c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
+        c = crate::trading::put(&mut msg, c, &order_id);
+        c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[0]);
+        debug_assert_eq!(c, msg.len());
         let sig = sk.sign(&msg);
         cancelOrderSignedCall {
             account: ALICE,
@@ -7214,14 +7229,15 @@ mod golden {
 
     fn signed_leverage_input(sk: &SigningKey, leverage: u64) -> Vec<u8> {
         // Canonical 72-byte message, layout from run_set_leverage_signed.
-        let mut msg = [0u8; 72];
-        msg[..19].copy_from_slice(b"perpdex_v1_leverage");
-        msg[19..39].copy_from_slice(ALICE.as_slice());
-        msg[39..47].copy_from_slice(&MARKET_ID.to_be_bytes());
-        msg[47..55].copy_from_slice(&leverage.to_be_bytes());
-        msg[55..63].copy_from_slice(&SIGNED_TS.to_be_bytes());
-        msg[63..71].copy_from_slice(&SIGNED_RECV.to_be_bytes());
-        msg[71] = 0; // keyId
+        let mut msg = [0u8; 80];
+        let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_leverage", TEST_CHAIN_ID);
+        c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
+        c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &leverage.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[0]);
+        debug_assert_eq!(c, msg.len());
         let sig = sk.sign(&msg);
         setLeverageSignedCall {
             account: ALICE,
@@ -8891,7 +8907,7 @@ mod batch_cancel {
         wire_ids: Option<&[[u8; 32]]>,
     ) -> Vec<u8> {
         let signed: Vec<FixedBytes<32>> = ids.iter().map(|i| FixedBytes(*i)).collect();
-        let msg = batch_cancel_message(account, key_id, timestamp, recv_window, &signed);
+        let msg = batch_cancel_message(TEST_CHAIN_ID, account, key_id, timestamp, recv_window, &signed);
         let sig = sk.sign(&msg);
         batchCancelOrdersSignedCall {
             account,
@@ -10036,7 +10052,7 @@ mod batch_place {
         ts: u64,
         recv: u64,
     ) -> [u8; 64] {
-        let msg = batch_place_message(account, 0, ts, recv, items);
+        let msg = batch_place_message(TEST_CHAIN_ID, account, 0, ts, recv, items);
         sk.sign(&msg).to_bytes()
     }
 
@@ -10241,26 +10257,31 @@ mod batch_place {
     #[test]
     fn signed_digest_layout_is_pinned() {
         let items = [gtc(0, PRICE, QTY), gtc(1, PRICE + TICK, QTY * 2)];
-        let msg = batch_place_message(ALICE, 3, 111, 22, &items);
-        assert_eq!(msg.len(), 22 + 20 + 1 + 8 + 8 + 4 + 2 * 44);
+        let msg = batch_place_message(TEST_CHAIN_ID, ALICE, 3, 111, 22, &items);
+        // ⚠️ Deliberately LITERAL offsets. This test's job is to pin the wire layout, so it must
+        // not be rewritten in terms of the production cursor helpers — it would then agree with
+        // whatever the production code does, including a mistake. Every other signed-message
+        // builder in this file DOES reuse those helpers, because their job is behaviour.
+        assert_eq!(msg.len(), 22 + 8 + 20 + 1 + 8 + 8 + 4 + 2 * 44);
         assert_eq!(&msg[..22], b"perpdex_v1_batch_order");
-        assert_eq!(&msg[22..42], ALICE.as_slice());
-        assert_eq!(msg[42], 3);
-        assert_eq!(&msg[43..51], &111u64.to_be_bytes());
-        assert_eq!(&msg[51..59], &22u64.to_be_bytes());
-        assert_eq!(&msg[59..63], &2u32.to_be_bytes());
+        assert_eq!(&msg[22..30], &TEST_CHAIN_ID.to_be_bytes(), "chainId follows the prefix");
+        assert_eq!(&msg[30..50], ALICE.as_slice());
+        assert_eq!(msg[50], 3);
+        assert_eq!(&msg[51..59], &111u64.to_be_bytes());
+        assert_eq!(&msg[59..67], &22u64.to_be_bytes());
+        assert_eq!(&msg[67..71], &2u32.to_be_bytes());
         // First item, tightly packed.
-        assert_eq!(&msg[63..71], &MARKET_ID.to_be_bytes());
-        assert_eq!(msg[71], 0);
-        assert_eq!(&msg[72..80], &PRICE.to_be_bytes());
-        assert_eq!(&msg[80..88], &QTY.to_be_bytes());
-        assert_eq!(msg[88], 0);
-        assert_eq!(msg[89], 0);
-        assert_eq!(&msg[90..106], &[0u8; 16]);
-        assert_eq!(msg[106], 0, "flags");
+        assert_eq!(&msg[71..79], &MARKET_ID.to_be_bytes());
+        assert_eq!(msg[79], 0);
+        assert_eq!(&msg[80..88], &PRICE.to_be_bytes());
+        assert_eq!(&msg[88..96], &QTY.to_be_bytes());
+        assert_eq!(msg[96], 0);
+        assert_eq!(msg[97], 0);
+        assert_eq!(&msg[98..114], &[0u8; 16]);
+        assert_eq!(msg[114], 0, "flags");
         // Second item starts right after.
-        assert_eq!(&msg[107..115], &MARKET_ID.to_be_bytes());
-        assert_eq!(msg[115], 1);
+        assert_eq!(&msg[115..123], &MARKET_ID.to_be_bytes());
+        assert_eq!(msg[123], 1);
     }
 
     #[test]
@@ -15791,20 +15812,21 @@ mod signed_replay {
         tamper: bool,
     ) -> Vec<u8> {
         // Canonical 96-byte message, layout from `run_place_order_signed`.
-        let mut msg = [0u8; 97];
-        msg[..16].copy_from_slice(b"perpdex_v1_order");
-        msg[16..36].copy_from_slice(ALICE.as_slice());
-        msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
-        msg[44] = side;
-        msg[45..53].copy_from_slice(&price.to_be_bytes());
-        msg[53..61].copy_from_slice(&qty.to_be_bytes());
-        msg[61] = order_type;
-        msg[62] = tif;
-        // clientOrderId = 0
-        msg[79..87].copy_from_slice(&SIGNED_TS.to_be_bytes());
-        msg[87..95].copy_from_slice(&SIGNED_RECV.to_be_bytes());
-        msg[95] = 0; // keyId
-        msg[96] = 0; // flags
+        let mut msg = [0u8; 105];
+        let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_order", TEST_CHAIN_ID);
+        c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
+        c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[side]);
+        c = crate::trading::put(&mut msg, c, &price.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &qty.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[order_type]);
+        c = crate::trading::put(&mut msg, c, &[tif]);
+        c = crate::trading::put(&mut msg, c, &[0u8; 16]); // clientOrderId
+        c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[0]); // keyId
+        c = crate::trading::put(&mut msg, c, &[0]); // flags
+        debug_assert_eq!(c, msg.len());
         let mut sig = sk.sign(&msg).to_bytes().to_vec();
         if tamper {
             sig[0] ^= 0xff;
@@ -15829,14 +15851,15 @@ mod signed_replay {
 
     fn signed_leverage_input(sk: &SigningKey, leverage: u64, tamper: bool) -> Vec<u8> {
         // Canonical 72-byte message, layout from `run_set_leverage_signed`.
-        let mut msg = [0u8; 72];
-        msg[..19].copy_from_slice(b"perpdex_v1_leverage");
-        msg[19..39].copy_from_slice(ALICE.as_slice());
-        msg[39..47].copy_from_slice(&MARKET_ID.to_be_bytes());
-        msg[47..55].copy_from_slice(&leverage.to_be_bytes());
-        msg[55..63].copy_from_slice(&SIGNED_TS.to_be_bytes());
-        msg[63..71].copy_from_slice(&SIGNED_RECV.to_be_bytes());
-        msg[71] = 0; // keyId
+        let mut msg = [0u8; 80];
+        let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_leverage", TEST_CHAIN_ID);
+        c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
+        c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &leverage.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[0]);
+        debug_assert_eq!(c, msg.len());
         let mut sig = sk.sign(&msg).to_bytes().to_vec();
         if tamper {
             sig[0] ^= 0xff;
@@ -15855,14 +15878,15 @@ mod signed_replay {
 
     fn signed_cancel_bytes(sk: &SigningKey, order_id: [u8; 32], tamper: bool) -> Vec<u8> {
         // Canonical 94-byte message, layout from `run_cancel_order_signed`.
-        let mut msg = [0u8; 94];
-        msg[..17].copy_from_slice(b"perpdex_v1_cancel");
-        msg[17..37].copy_from_slice(ALICE.as_slice());
-        msg[37..69].copy_from_slice(&order_id);
-        msg[69..77].copy_from_slice(&MARKET_ID.to_be_bytes());
-        msg[77..85].copy_from_slice(&SIGNED_TS.to_be_bytes());
-        msg[85..93].copy_from_slice(&SIGNED_RECV.to_be_bytes());
-        msg[93] = 0; // keyId
+        let mut msg = [0u8; 102];
+        let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_cancel", TEST_CHAIN_ID);
+        c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
+        c = crate::trading::put(&mut msg, c, &order_id);
+        c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[0]);
+        debug_assert_eq!(c, msg.len());
         let mut sig = sk.sign(&msg).to_bytes().to_vec();
         if tamper {
             sig[0] ^= 0xff;
@@ -16118,19 +16142,21 @@ mod signed_replay {
     /// Signs over `sign_flags` but puts `wire_flags` in the calldata. Equal values = an honest
     /// call; different = the tamper the signed layout has to catch.
     fn signed_place_input_flags(sk: &SigningKey, sign_flags: u8, wire_flags: u8) -> Vec<u8> {
-        let mut msg = [0u8; 97];
-        msg[..16].copy_from_slice(b"perpdex_v1_order");
-        msg[16..36].copy_from_slice(ALICE.as_slice());
-        msg[36..44].copy_from_slice(&MARKET_ID.to_be_bytes());
-        msg[44] = 0; // side = Buy
-        msg[45..53].copy_from_slice(&(PRICE - TICK).to_be_bytes());
-        msg[53..61].copy_from_slice(&QTY.to_be_bytes());
-        msg[61] = 0; // Limit
-        msg[62] = 0; // GTC
-        msg[79..87].copy_from_slice(&SIGNED_TS.to_be_bytes());
-        msg[87..95].copy_from_slice(&SIGNED_RECV.to_be_bytes());
-        msg[95] = 0; // keyId
-        msg[96] = sign_flags;
+        let mut msg = [0u8; 105];
+        let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_order", TEST_CHAIN_ID);
+        c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
+        c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[0]);
+        c = crate::trading::put(&mut msg, c, &(PRICE - TICK).to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &QTY.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[0]);
+        c = crate::trading::put(&mut msg, c, &[0]);
+        c = crate::trading::put(&mut msg, c, &[0u8; 16]); // clientOrderId
+        c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+        c = crate::trading::put(&mut msg, c, &[0]);
+        c = crate::trading::put(&mut msg, c, &[sign_flags]);
+        debug_assert_eq!(c, msg.len());
         placeOrderSignedCall {
             account: ALICE,
             marketId: MARKET_ID,
@@ -16226,6 +16252,134 @@ mod signed_replay {
             assert!(out.reverted, "flags 0x{flags:02x} must be rejected");
             let reason = String::from_utf8_lossy(&out.bytes).to_string();
             assert!(reason.contains(want), "got {reason}");
+        }
+    }
+
+    // ── Cross-chain replay ───────────────────────────────────────────────────
+
+    /// ★ THE test for the chain-id binding. A payload signed for a DIFFERENT chain must not verify
+    /// here, in either direction.
+    ///
+    /// Without the binding a signature is valid on every deployment sharing the `perpdex_v1_*`
+    /// prefix — testnet, mainnet, and both sides of any fork — and the replay guard does not help:
+    /// its seen-signature set is per-chain, so burning a signature on one chain leaves it live on
+    /// the others. An observer needs only the owner to have registered the same ed25519 key on both
+    /// (routine: key management usually spans environments) and the ≤65s recv window still open.
+    /// `transferFromPerpSigned` is the sharpest case — a legitimate withdrawal on A replays as an
+    /// unauthorised one on B.
+    ///
+    /// Asserted for ALL FIVE single-call signed entrypoints, not just one: they each build their
+    /// own message, so one of them forgetting the header is exactly the shape this has to catch.
+    #[test]
+    fn a_signature_from_another_chain_does_not_verify() {
+        const FOREIGN: u64 = TEST_CHAIN_ID + 1;
+
+        // Same builders, one constant swapped — so the ONLY difference is the domain.
+        fn order_for(sk: &SigningKey, chain: u64) -> Vec<u8> {
+            let mut msg = [0u8; 105];
+            let mut c =
+                crate::trading::write_signed_header(&mut msg, b"perpdex_v1_order", chain);
+            c = crate::trading::put(&mut msg, c, ALICE.as_slice());
+            c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+            c = crate::trading::put(&mut msg, c, &[0]);
+            c = crate::trading::put(&mut msg, c, &(PRICE - TICK).to_be_bytes());
+            c = crate::trading::put(&mut msg, c, &QTY.to_be_bytes());
+            c = crate::trading::put(&mut msg, c, &[0, 0]);
+            c = crate::trading::put(&mut msg, c, &[0u8; 16]);
+            c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+            c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+            c = crate::trading::put(&mut msg, c, &[0, 0]);
+            debug_assert_eq!(c, msg.len());
+            placeOrderSignedCall {
+                account: ALICE,
+                marketId: MARKET_ID,
+                side: 0,
+                price: PRICE - TICK,
+                quantity: QTY,
+                orderType: 0,
+                tif: 0,
+                clientOrderId: FixedBytes::default(),
+                timestamp: SIGNED_TS,
+                recvWindow: SIGNED_RECV,
+                keyId: 0,
+                flags: 0,
+                signature: sk.sign(&msg).to_bytes().to_vec().into(),
+            }
+            .abi_encode()
+        }
+
+        let (mut ctx, sk) = fixture();
+
+        // Signed for a foreign chain -> refused here.
+        let (reverted, reason) = call(&mut ctx, &order_for(&sk, FOREIGN));
+        assert!(reverted, "a foreign-chain signature must not verify");
+        assert!(
+            reason.contains("signature verification failed"),
+            "and it must fail at VERIFICATION, not on some later business rule: {reason}"
+        );
+
+        // The identical payload signed for THIS chain is accepted — so the refusal above is the
+        // domain and nothing else.
+        let (reverted, reason) = call(&mut ctx, &order_for(&sk, TEST_CHAIN_ID));
+        assert!(!reverted, "the same order for this chain must work: {reason}");
+    }
+
+    /// The other four single-call entrypoints build their own messages, so each needs its own
+    /// proof that the header is in there. Signed for a foreign chain, all must fail verification.
+    #[test]
+    fn every_signed_entrypoint_binds_the_chain_id() {
+        const FOREIGN: u64 = TEST_CHAIN_ID + 1;
+        let (mut ctx, sk) = fixture();
+
+        // cancel
+        let mut m = [0u8; 102];
+        let mut c = crate::trading::write_signed_header(&mut m, b"perpdex_v1_cancel", FOREIGN);
+        c = crate::trading::put(&mut m, c, ALICE.as_slice());
+        c = crate::trading::put(&mut m, c, &[0u8; 32]);
+        c = crate::trading::put(&mut m, c, &MARKET_ID.to_be_bytes());
+        c = crate::trading::put(&mut m, c, &SIGNED_TS.to_be_bytes());
+        c = crate::trading::put(&mut m, c, &SIGNED_RECV.to_be_bytes());
+        c = crate::trading::put(&mut m, c, &[0]);
+        debug_assert_eq!(c, m.len());
+        let cancel = cancelOrderSignedCall {
+            account: ALICE,
+            orderId: [0u8; 32].into(),
+            marketId: MARKET_ID,
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sk.sign(&m).to_bytes().to_vec().into(),
+        }
+        .abi_encode();
+
+        // leverage
+        let mut m = [0u8; 80];
+        let mut c = crate::trading::write_signed_header(&mut m, b"perpdex_v1_leverage", FOREIGN);
+        c = crate::trading::put(&mut m, c, ALICE.as_slice());
+        c = crate::trading::put(&mut m, c, &MARKET_ID.to_be_bytes());
+        c = crate::trading::put(&mut m, c, &3u64.to_be_bytes());
+        c = crate::trading::put(&mut m, c, &SIGNED_TS.to_be_bytes());
+        c = crate::trading::put(&mut m, c, &SIGNED_RECV.to_be_bytes());
+        c = crate::trading::put(&mut m, c, &[0]);
+        debug_assert_eq!(c, m.len());
+        let leverage = setLeverageSignedCall {
+            account: ALICE,
+            marketId: MARKET_ID,
+            leverage: 3,
+            timestamp: SIGNED_TS,
+            recvWindow: SIGNED_RECV,
+            keyId: 0,
+            signature: sk.sign(&m).to_bytes().to_vec().into(),
+        }
+        .abi_encode();
+
+        for (name, input) in [("cancelOrderSigned", cancel), ("setLeverageSigned", leverage)] {
+            let (reverted, reason) = call(&mut ctx, &input);
+            assert!(reverted, "{name}: a foreign-chain signature must not verify");
+            assert!(
+                reason.contains("signature verification failed"),
+                "{name}: got {reason}"
+            );
         }
     }
 

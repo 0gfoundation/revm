@@ -22,7 +22,7 @@ sol! {
         function transferFromPerp(uint64 amount) external;
         /// Move USDC from spot balance into `account`'s perp trading wallet, authenticated by
         /// ed25519 signature.
-        /// Message: "perpdex_v1_xfer_to"(18) || account(20) || amount(8)
+        /// Message: "perpdex_v1_xfer_to"(18) || chainId(8) || account(20) || amount(8)
         ///          || timestamp(8) || recvWindow(8) || keyId(1)
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         /// keyId: which API key slot to verify against.
@@ -39,7 +39,7 @@ sol! {
         ) external;
         /// Move USDC from `account`'s perp trading wallet back to spot balance, authenticated by
         /// ed25519 signature.
-        /// Message: "perpdex_v1_xfer_from"(20) || account(20) || amount(8)
+        /// Message: "perpdex_v1_xfer_from"(20) || chainId(8) || account(20) || amount(8)
         ///          || timestamp(8) || recvWindow(8) || keyId(1)
         ///
         /// ⚠️ The two transfer directions carry DIFFERENT domain prefixes on purpose. A shared
@@ -504,7 +504,7 @@ sol! {
         /// Set the leverage for the caller's position in a market.
         function setLeverage(uint64 marketId, uint64 leverage) external;
         /// Set leverage for `account`, authenticated by ed25519 signature.
-        /// Message: "perpdex_v1_leverage"(19) || account(20) || marketId(8) || leverage(8)
+        /// Message: "perpdex_v1_leverage"(19) || chainId(8) || account(20) || marketId(8) || leverage(8)
         ///          || timestamp(8) || recvWindow(8) || keyId(1)
         /// A signature is single-use and is spent by SUBMISSION, not by success: once this call has
         /// been included, resubmitting the same signature reverts with "duplicate signature" EVEN IF
@@ -988,9 +988,17 @@ sol! {
 
         // ── Signed order submission ───────────────────────────────────────
         /// Place an order for `account`, authenticated by ed25519 signature.
-        /// Message: "perpdex_v1_order" || account(20) || marketId(8) || side(1)
+        /// Message: "perpdex_v1_order"(16) || chainId(8) || account(20) || marketId(8) || side(1)
         ///          || price(8) || quantity(8) || orderType(1) || tif(1) || clientOrderId(16)
         ///          || timestamp(8) || recvWindow(8) || keyId(1) || flags(1)
+        /// ⚠️ EVERY signed message begins `prefix || chainId(8 BE)`. The chain id BINDS the
+        /// signature to this deployment: without it a payload valid here is byte-identically valid
+        /// on testnet, on mainnet and on both sides of any fork, and the replay guard does not help
+        /// because its seen-signature set is per-chain — burning a signature on one chain leaves it
+        /// live on the others. This is EIP-155 / EIP-712's `chainId`, with the prefix playing
+        /// `name` + `version`. The contract address is deliberately NOT bound: there is one PerpDEX
+        /// precompile address and it is identical on every deployment, so it would separate nothing.
+        ///
         /// ⚠️ `flags` IS part of the signed message. It must be: a signature that did not cover it
         /// could be resubmitted with the bit flipped, turning a reduce-only order into one that can
         /// open, or the reverse.
@@ -1017,7 +1025,8 @@ sol! {
         ) external returns (bytes32 orderId);
 
         /// Cancel an order for `account`, authenticated by ed25519 signature.
-        /// Message: "perpdex_v1_cancel"(17) || account(20) || orderId(32) || marketId(8) || timestamp(8) || recvWindow(8) || keyId(1)
+        /// Message: "perpdex_v1_cancel"(17) || chainId(8) || account(20) || orderId(32) || marketId(8)
+        ///          || timestamp(8) || recvWindow(8) || keyId(1)
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         /// keyId: which API key slot to verify against.
         /// marketId is part of the signed message for ABI compatibility but ignored by the cancel logic.
@@ -1035,7 +1044,7 @@ sol! {
         /// Cancel up to MAX_BATCH_CANCEL (256) orders for `account`, authenticated by ONE
         /// ed25519 signature covering the whole batch.
         ///
-        /// Message: "perpdex_v1_batch_cancel"(23) || account(20) || keyId(1) || timestamp(8)
+        /// Message: "perpdex_v1_batch_cancel"(23) || chainId(8) || account(20) || keyId(1) || timestamp(8)
         ///          || recvWindow(8) || N(4, big-endian) || N x orderId(32)
         /// N is inside the digest, so the batch's size, content and order cannot be tampered with.
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
@@ -1058,10 +1067,10 @@ sol! {
         /// Place up to MAX_BATCH_PLACE (64) orders for `account`, authenticated by ONE ed25519
         /// signature covering the whole batch.
         ///
-        /// Message: "perpdex_v1_batch_order"(22) || account(20) || keyId(1) || timestamp(8)
+        /// Message: "perpdex_v1_batch_order"(22) || chainId(8) || account(20) || keyId(1) || timestamp(8)
         ///          || recvWindow(8) || N(4, big-endian)
         ///          || N x [ marketId(8) || side(1) || price(8) || quantity(8) || orderType(1)
-        ///                   || tif(1) || clientOrderId(16) ]        // 43 bytes per item
+        ///                   || tif(1) || clientOrderId(16) || flags(1) ]   // 44 bytes per item
         /// N is inside the digest, so the batch's size, content and order cannot be tampered with.
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         ///
