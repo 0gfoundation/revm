@@ -12,13 +12,15 @@ use crate::{
     interface::IPerpDex::{
         self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
         getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
-        getFundingStateReturn, getIndexPriceCall, getIndexPriceReturn, getInsuranceFundCall,
+        getFundingStateReturn, getIndexModeCall, getIndexModeReturn, getIndexPriceCall,
+        getIndexPriceReturn, getInsuranceFundCall,
         getMarginTiersCall, getMarginTiersReturn, getMarkPriceCall, getMarketCall,
         getMarketManagerAddressCall, getMarketReturn, getOracleAddressCall, getPositionCall,
         getPositionReturn, getSymbolConfigCall, getSymbolConfigReturn, initAdminCall,
         liquidateCall, removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
         setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall, transferAdminCall,
-        updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
+        updateIndexPriceCall, updateIndexPriceFromBookCall, updateMarketCall,
+        withdrawInsuranceFundCall,
     },
     math::{
         calc_funding_rate, calc_position_equity, calc_value, calc_value_i64, checked_u64_to_i64,
@@ -32,7 +34,8 @@ use crate::{
         verify_ed25519,
     },
     types::{
-        AccountUpdateReason, CancelReason, FundingState, IndexPriceState, MarginTier, MarginTiers,
+        AccountUpdateReason, CancelReason, FundingState, IndexModeState, IndexPriceState,
+        MarginTier, MarginTiers,
         Market, OrderStatus, PremiumIndexAccumulator, Side, MAX_LEVERAGE_HARD_CAP,
         MAX_MARGIN_TIERS,
     },
@@ -1842,29 +1845,181 @@ pub fn run_update_index_price<H: PerpHost>(
     }
     let effective_timestamp =
         align_price_update_timestamp(args.timestamp, market.price_update_interval);
-    let current_index_state = storage::load_index_price_state(context, args.marketId)?;
-    if effective_timestamp <= current_index_state.timestamp {
+    let prev_index_state = storage::load_index_price_state(context, args.marketId)?;
+    if effective_timestamp <= prev_index_state.timestamp {
         return Ok(Bytes::new());
     }
 
+    // ── Handover from the book-derived index ─────────────────────────────────
+    // The external feed is authoritative again, but jumping straight to it would move the
+    // mark — and therefore every maintenance check — by the whole accumulated difference in
+    // one update. Blend linearly to it over INDEX_RAMP_SECS instead. The ramp always LANDS on
+    // the external price (see `index_ramp_blend`), so this delays the handover, it does not
+    // dilute it.
+    let mut mode = storage::load_index_mode_state(context, args.marketId)?;
+    if mode.from_book {
+        // First external update after a book-driven stretch: anchor the ramp where the book
+        // left the index.
+        mode.ramp_from = prev_index_state.index_price;
+        mode.ramp_start_ts = effective_timestamp;
+        mode.from_book = false;
+    }
+    let index_price = if mode.ramp_from != 0 {
+        let elapsed = effective_timestamp.saturating_sub(mode.ramp_start_ts);
+        let blended = crate::math::index_ramp_blend(
+            mode.ramp_from,
+            args.indexPrice,
+            elapsed,
+            crate::math::INDEX_RAMP_SECS,
+        );
+        if elapsed >= crate::math::INDEX_RAMP_SECS {
+            mode.ramp_from = 0;
+            mode.ramp_start_ts = 0;
+        }
+        blended.clamp(1, market.max_price)
+    } else {
+        args.indexPrice
+    };
+    // Keep the accumulator in step with the exposed index on THIS path too, so the book path
+    // never needs a seeding special case.
+    mode.index_scaled = crate::math::scaled_from_index(index_price);
+
+    apply_index_price_update(
+        context,
+        args.marketId,
+        market,
+        index_price,
+        effective_timestamp,
+        caller,
+        prev_index_state,
+        &mode,
+    )
+}
+
+/// `updateIndexPriceFromBook(uint64 marketId)` — advance the index from this market's own book
+/// while the external feed has nothing to publish.
+///
+/// Takes no timestamp on purpose. There is no external observation to stamp, and a
+/// caller-supplied one would be doubly unsafe here: it reopens the future-dated freeze (the
+/// staleness gate is the only bound on it), and because `alpha` is derived from the elapsed
+/// time, a caller could submit many updates in ONE block with hand-rolled timestamps and walk
+/// the EWMA to convergence — the per-update cap bounds the step, not the number of steps.
+pub fn run_update_index_price_from_book<H: PerpHost>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = updateIndexPriceFromBookCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("updateIndexPriceFromBook: invalid calldata"))?;
+
+    require_admin_or_oracle(caller, context)?;
+
+    let market = storage::load_market_ref(context, args.marketId)?
+        .ok_or_else(|| perp_err("updateIndexPriceFromBook: unknown market"))?;
+
+    let effective_timestamp =
+        align_price_update_timestamp(context.timestamp(), market.price_update_interval);
+    let prev_index_state = storage::load_index_price_state(context, args.marketId)?;
+    if effective_timestamp <= prev_index_state.timestamp {
+        return Ok(Bytes::new());
+    }
+    // A closed-session oracle needs the session to have been open once: with no prior index
+    // there is nothing to walk away from, and the mark would derive from the book alone.
+    if prev_index_state.index_price == 0 {
+        return Err(perp_err(
+            "updateIndexPriceFromBook: market has no index price yet",
+        ));
+    }
+
+    let mut mode = storage::load_index_mode_state(context, args.marketId)?;
+    if mode.index_scaled == 0 {
+        // Market last updated before this field existed, or never through the external path.
+        mode.index_scaled = crate::math::scaled_from_index(prev_index_state.index_price);
+    }
+
+    // Everything below is pure arithmetic on values already loaded — no fallible step sits
+    // between here and the first write, which is what the commit-only model requires.
+    let dt = effective_timestamp.saturating_sub(prev_index_state.timestamp);
+    let alpha = crate::math::ewma_alpha(dt);
+    let hot = storage::load_market_hot(context, args.marketId)?;
+    let ipd =
+        crate::math::book_impact_delta(hot.best_bid, hot.best_ask, prev_index_state.index_price);
+    mode.index_scaled =
+        crate::math::ewma_index_step(mode.index_scaled, alpha, ipd, market.max_price);
+    mode.from_book = true;
+    // A book update supersedes any ramp still in flight (the feed went away again).
+    mode.ramp_from = 0;
+    mode.ramp_start_ts = 0;
+
+    let index_price = crate::math::index_from_scaled(mode.index_scaled).clamp(1, market.max_price);
+
+    apply_index_price_update(
+        context,
+        args.marketId,
+        market,
+        index_price,
+        effective_timestamp,
+        caller,
+        prev_index_state,
+        &mode,
+    )
+}
+
+/// The half of an index-price update that does not care where the price came from.
+///
+/// Split out so `updateIndexPrice` and `updateIndexPriceFromBook` cannot drift: mark
+/// recomputation, the index-history checkpoints, the premium accumulator, funding epoch
+/// rollover, the out-of-band expiry sweep, the liquidation sweep and the events are one code
+/// path with one write set, reached by two different ways of deriving `index_price`.
+///
+/// CONTRACT — the caller owns all of this, because it is selector-specific: authorisation,
+/// calldata decoding, loading `market`, bounding `index_price` into `1..=market.max_price`,
+/// flooring the timestamp, and the `effective_timestamp <= prev_index_state.timestamp`
+/// staleness gate. `prev_index_state` is the state that gate read — it is consumed here as the
+/// history checkpoint closing the previous interval, so re-loading it would cost a second
+/// probe for a value the caller already holds.
+///
+/// Everything above the first `storage::save_*` is read-only, which is what lets a caller
+/// validate-then-apply under the commit-only write model (#23).
+#[allow(clippy::too_many_arguments)]
+fn apply_index_price_update<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    market: std::sync::Arc<Market>,
+    index_price: u64,
+    effective_timestamp: u64,
+    updater: Address,
+    prev_index_state: IndexPriceState,
+    mode: &IndexModeState,
+) -> Result<Bytes, PerpError> {
+    // Enforced once, for both paths. NOT a debug_assert: the premium index at
+    // `(mark - index) * FUNDING_RATE_ONE / index` below divides with a plain `/`, and the
+    // release profile is `panic = "abort"` — a zero here would take the NODE down rather than
+    // revert the transaction.
+    if index_price == 0 {
+        return Err(crate::errors::perp_invariant_err(
+            "index price update: index price must be > 0",
+        ));
+    }
+
     // ── 1. Compute mark price components ─────────────────────────────────────
-    let mut funding = storage::load_funding_state(context, args.marketId)?;
+    let mut funding = storage::load_funding_state(context, market_id)?;
     // Price1: index adjusted by funding basis.
-    let price1 = compute_price1(args.indexPrice, &funding, &market, effective_timestamp);
+    let price1 = compute_price1(index_price, &funding, &market, effective_timestamp);
 
     // Price2: index adjusted by time-weighted top-of-book basis.
-    let window = storage::load_price_basis_window(context, args.marketId)?;
+    let window = storage::load_price_basis_window(context, market_id)?;
     let max_index_checkpoints = max_index_price_checkpoints(market.price_update_interval);
-    let mut index_history = storage::load_index_price_history(context, args.marketId)?;
-    index_history.push(current_index_state, max_index_checkpoints);
+    let mut index_history = storage::load_index_price_history(context, market_id)?;
+    index_history.push(prev_index_state, max_index_checkpoints);
     let ma_basis = window.moving_average_basis(&index_history, effective_timestamp)?;
-    let index_price_i64 = checked_u64_to_i64(args.indexPrice, "updateIndexPrice: indexPrice")?;
+    let index_price_i64 = checked_u64_to_i64(index_price, "index price update: indexPrice")?;
     let price2 = index_price_i64.saturating_add(ma_basis).max(1) as u64;
 
     // Contract price: latest traded price, falling back to index before any trade.
-    let last_traded = storage::load_last_traded_price(context, args.marketId)?;
+    let last_traded = storage::load_last_traded_price(context, market_id)?;
     let contract_price = if last_traded == 0 {
-        args.indexPrice
+        index_price
     } else {
         last_traded
     };
@@ -1882,21 +2037,22 @@ pub fn run_update_index_price<H: PerpHost>(
     // ── 4. Persist index price + mark price ──────────────────────────────────
     storage::save_index_price_state(
         context,
-        args.marketId,
+        market_id,
         &IndexPriceState {
-            index_price: args.indexPrice,
+            index_price: index_price,
             timestamp: effective_timestamp,
         },
     )?;
     index_history.push(
         IndexPriceState {
-            index_price: args.indexPrice,
+            index_price: index_price,
             timestamp: effective_timestamp,
         },
         max_index_checkpoints,
     );
-    storage::save_index_price_history(context, args.marketId, &index_history)?;
-    storage::save_mark_price(context, args.marketId, mark_price)?;
+    storage::save_index_price_history(context, market_id, &index_history)?;
+    storage::save_index_mode_state(context, market_id, mode)?;
+    storage::save_mark_price(context, market_id, mark_price)?;
 
     // ── 5. Accumulate premium index for funding rate calculation ──────────────
     let mut computed_rate: Option<(i64, i64, u64)> = None; // (rate, avg_pi, sample_count)
@@ -1905,15 +2061,15 @@ pub fn run_update_index_price<H: PerpHost>(
     // the block below never runs) still reports something meaningful rather than zero.
     let mut predicted_rate = funding.last_funding_rate;
     if market.funding_interval > 0 {
-        let mut acc = storage::load_premium_accumulator(context, args.marketId)?;
+        let mut acc = storage::load_premium_accumulator(context, market_id)?;
 
         // PI = (mark_price − index_price) × FUNDING_RATE_ONE / index_price
-        let pi = ((mark_price as i128 - args.indexPrice as i128)
+        let pi = ((mark_price as i128 - index_price as i128)
             .checked_mul(FUNDING_RATE_ONE as i128)
-            .ok_or_else(|| perp_err("updateIndexPrice: premium index overflow"))?
-            / args.indexPrice as i128)
+            .ok_or_else(|| perp_err("index price update: premium index overflow"))?
+            / index_price as i128)
             .try_into()
-            .map_err(|_| perp_err("updateIndexPrice: premium index exceeds i64::MAX"))?;
+            .map_err(|_| perp_err("index price update: premium index exceeds i64::MAX"))?;
 
         // Initialize epoch on first oracle update. The first observed PI is the
         // first theoretical sample slot for this funding epoch.
@@ -1922,7 +2078,7 @@ pub fn run_update_index_price<H: PerpHost>(
             if funding.next_funding_ts == 0 {
                 funding.next_funding_ts = effective_timestamp
                     .checked_add(market.funding_interval)
-                    .ok_or_else(|| perp_err("updateIndexPrice: next funding timestamp overflow"))?;
+                    .ok_or_else(|| perp_err("index price update: next funding timestamp overflow"))?;
             }
         }
 
@@ -1941,18 +2097,18 @@ pub fn run_update_index_price<H: PerpHost>(
             // can settle lazily against the delta since their last touch.
             let index_step = (mark_price as i128)
                 .checked_mul(rate as i128)
-                .ok_or_else(|| perp_err("updateIndexPrice: funding index step overflow"))?;
+                .ok_or_else(|| perp_err("index price update: funding index step overflow"))?;
             funding.cumulative_funding_index = funding
                 .cumulative_funding_index
                 .checked_add(index_step)
-                .ok_or_else(|| perp_err("updateIndexPrice: funding index overflow"))?;
+                .ok_or_else(|| perp_err("index price update: funding index overflow"))?;
             while funding.next_funding_ts <= effective_timestamp {
                 funding.next_funding_ts = funding
                     .next_funding_ts
                     .checked_add(market.funding_interval)
-                    .ok_or_else(|| perp_err("updateIndexPrice: next funding timestamp overflow"))?;
+                    .ok_or_else(|| perp_err("index price update: next funding timestamp overflow"))?;
             }
-            storage::save_funding_state(context, args.marketId, &funding)?;
+            storage::save_funding_state(context, market_id, &funding)?;
 
             acc = PremiumIndexAccumulator::default();
             acc.start_epoch(
@@ -1964,7 +2120,7 @@ pub fn run_update_index_price<H: PerpHost>(
         } else if acc.epoch_start_ts > 0 || funding.next_funding_ts > 0 {
             acc.fill_slots_until(effective_timestamp, market.price_update_interval, Some(pi))?;
             // Save updated next_funding_ts if it was just initialized.
-            storage::save_funding_state(context, args.marketId, &funding)?;
+            storage::save_funding_state(context, market_id, &funding)?;
         }
 
         // Recomputed on EVERY push, from the accumulator as it now stands — after this sample was
@@ -1972,7 +2128,7 @@ pub fn run_update_index_price<H: PerpHost>(
         // One i128 division; no new storage, and `market.interest_rate` is already loaded.
         predicted_rate = calc_funding_rate(acc.average()?, market.interest_rate);
 
-        storage::save_premium_accumulator(context, args.marketId, &acc)?;
+        storage::save_premium_accumulator(context, market_id, &acc)?;
     }
 
     // ── 5b. Protocol-automatic liquidation sweep ────────────────────────────────
@@ -1988,8 +2144,8 @@ pub fn run_update_index_price<H: PerpHost>(
     // puts the whole live book out of range after any large move: the close absorbs nothing, the
     // residual is insolvent, and it routes to ADL instead of the book and the insurance fund —
     // inverting the intended precedence precisely when the sweep matters most.
-    let market = storage::load_market_ref(context, args.marketId)?
-        .ok_or_else(|| crate::errors::perp_invariant_err("updateIndexPrice: market vanished before sweep"))?;
+    let market = storage::load_market_ref(context, market_id)?
+        .ok_or_else(|| crate::errors::perp_invariant_err("index price update: market vanished before sweep"))?;
     debug_assert_eq!(
         market.mark_price, mark_price,
         "liquidation sweep: the band centre must be the mark the maintenance check uses"
@@ -2002,9 +2158,9 @@ pub fn run_update_index_price<H: PerpHost>(
     // what the close absorbs — while the BBO cache is still provably live, which is what lets the
     // removal use the cheap cancel-path variant and get its top-of-book invariant check for free.
     // Capped; see MAX_BAND_EXPIRIES_PER_UPDATE.
-    run_out_of_band_expiry_sweep(context, args.marketId, &market)?;
+    run_out_of_band_expiry_sweep(context, market_id, &market)?;
 
-    run_liquidation_sweep(context, args.marketId, &market, mark_price)?;
+    run_liquidation_sweep(context, market_id, &market, mark_price)?;
 
     // ── 6. Emit events ────────────────────────────────────────────────────────
     // ONE price event per update. This used to be `IndexPriceUpdated` immediately followed by
@@ -2020,9 +2176,9 @@ pub fn run_update_index_price<H: PerpHost>(
     context.log(Log {
         address: PERP_DEX_ADDRESS,
         data: IPerpDex::MarkPriceUpdated {
-            marketId: args.marketId,
+            marketId: market_id,
             markPrice: mark_price,
-            indexPrice: args.indexPrice,
+            indexPrice: index_price,
             fundingRate: predicted_rate,
             estimatedSettlePrice: crate::math::calc_estimated_settle_price(
                 mark_price,
@@ -2034,7 +2190,7 @@ pub fn run_update_index_price<H: PerpHost>(
             // The FLOORED oracle timestamp: which price window this update belongs to, NOT when it
             // was delivered. A `@markPrice` stream's `E` is block time, not this.
             priceWindowTs: effective_timestamp,
-            updater: caller,
+            updater,
         }
         .to_log_data(),
     });
@@ -2042,7 +2198,7 @@ pub fn run_update_index_price<H: PerpHost>(
         context.log(Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::FundingRateComputed {
-                marketId: args.marketId,
+                marketId: market_id,
                 fundingRate: rate,
                 avgPremiumIndex: avg_pi,
                 sampleCount: sample_count,
@@ -2053,6 +2209,25 @@ pub fn run_update_index_price<H: PerpHost>(
     }
 
     Ok(Bytes::new())
+}
+
+
+/// `getIndexMode(uint64 marketId) returns (bool fromBook, uint128 indexScaled, uint64 rampFrom, uint64 rampStartTs)`
+pub fn run_get_index_mode<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = getIndexModeCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getIndexMode: invalid calldata"))?;
+    let mode = storage::load_index_mode_state(context, args.marketId)?;
+    Ok(Bytes::from(getIndexModeCall::abi_encode_returns(
+        &getIndexModeReturn {
+            fromBook: mode.from_book,
+            indexScaled: mode.index_scaled,
+            rampFrom: mode.ramp_from,
+            rampStartTs: mode.ramp_start_ts,
+        },
+    )))
 }
 
 /// `getIndexPrice(uint64 marketId) returns (uint64 indexPrice, uint64 lastTimestamp)`

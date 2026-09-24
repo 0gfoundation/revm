@@ -6839,7 +6839,7 @@ mod golden {
     /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
     /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x2b4f748275a1ccc669d0556a4d997a652fb8a66f85dcf755055d65f6708d40ba");
+        b256!("0xd01f49253f0e26bfee1ba80af9cff68b19048912ccbec54684ae747a2a5b5e45");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

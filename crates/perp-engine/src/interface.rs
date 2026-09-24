@@ -948,8 +948,35 @@ sol! {
         /// Callable by admin or the configured oracle address.
         function updateIndexPrice(uint64 marketId, uint64 indexPrice, uint64 timestamp) external;
 
+        /// Advance the index price from THIS MARKET'S OWN BOOK, for use while the external
+        /// price feed has nothing to publish (a US-equity weekend, say).
+        ///
+        ///   IPD = max(bestBid - index, 0) - max(index - bestAsk, 0)
+        ///   index += alpha * IPD,   alpha = 1 - exp(-dt/1800s), capped at 9.5% per update
+        ///
+        /// IPD is zero while the index sits inside the spread, so moving the index requires
+        /// pushing an entire best quote past it. An empty side collapses to the side that
+        /// exists; a book with no quotes leaves the index untouched.
+        ///
+        /// Takes NO timestamp: there is no external observation to stamp, so the block
+        /// timestamp is used (floored to the market's priceUpdateInterval, like
+        /// `updateIndexPrice`). A caller-supplied timestamp would reopen both the
+        /// future-dated-freeze trap and, because alpha is derived from the elapsed time,
+        /// let one caller apply many EWMA steps inside a single block.
+        ///
+        /// When the external feed returns, `updateIndexPrice` blends linearly from the last
+        /// book-derived value to the external price over 300 seconds rather than jumping.
+        ///
+        /// Callable by admin or the configured oracle address.
+        function updateIndexPriceFromBook(uint64 marketId) external;
+
         /// Query the latest oracle index price and its timestamp for a market.
         function getIndexPrice(uint64 marketId) external view returns (uint64 indexPrice, uint64 lastTimestamp);
+
+        /// Query the index-price mode for a market: whether the last accepted update came from
+        /// the book, the sub-unit-resolution accumulator behind `getIndexPrice`, and the
+        /// handover ramp (`rampFrom` is 0 when no ramp is in flight).
+        function getIndexMode(uint64 marketId) external view returns (bool fromBook, uint128 indexScaled, uint64 rampFrom, uint64 rampStartTs);
 
         /// Query the current funding state for a market.
         /// interestRate is in getMarket.

@@ -146,7 +146,20 @@ use primitives::{B256, U256};
 // `trading::tests::golden`) + a coordinated wipe on deploy. The golden scenario's BusinessSnapshot is
 // UNCHANGED, field for field (it pins `getPosition`'s `(amount, vQuoteBalance, margin)` triples and
 // `getAccount`'s `availableBalance`, none of which carries this field).
-pub const BLOCK_COMMITMENT_VERSION: u8 = 26;
+// ── 27 ───────────────────────────────────────────────────────────────────────────────────
+// New per-market off-trie key `idxm` ([`crate::types::IndexModeState`]): the book-derived index
+// EWMA accumulator plus the external-feed handover ramp, added for `updateIndexPriceFromBook`.
+//
+// It lands in the delta of EXISTING scenarios, not only new ones: `updateIndexPrice` writes the
+// accumulator too (`index_scaled = index_price * INDEX_SCALE`) so that the book path never needs
+// a seeding special case, so every block containing an oracle push now carries one more key.
+//
+// No BUSINESS behaviour changes on the external path — the exposed `index_price` is still exactly
+// the oracle's argument (the accumulator is derived FROM it, never the reverse) unless a handover
+// ramp is in flight, which requires a prior `updateIndexPriceFromBook`. CHAIN change: golden
+// re-pin + a coordinated wipe on deploy. The golden scenario's BusinessSnapshot is UNCHANGED,
+// field for field.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 27;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
@@ -173,4 +186,3 @@ pub fn compute_block_commitment(prev: U256, delta: &PerpDelta) -> U256 {
     }
     U256::from_be_bytes(*hasher.finalize().as_bytes())
 }
-
