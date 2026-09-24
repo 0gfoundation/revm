@@ -25,7 +25,7 @@ use crate::{
         cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
         getAccountCall, getAccountMarginCall, getAdminCall, getApiKeyCall, getApiKeysCall,
         getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
-        getIndexPriceCall, getInsuranceFundCall, getMarginTiersCall,
+        getIndexModeCall, getIndexPriceCall, getInsuranceFundCall, getMarginTiersCall,
         getMarkPriceCall, getMarketCall,
         getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
         getOracleAddressCall, getOrderCall, getPositionCall, getPositionRiskCall,
@@ -36,18 +36,20 @@ use crate::{
         setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall,
         setUserFeeRatesCall,
         transferAdminCall, transferFromPerpCall, transferFromPerpSignedCall, transferToPerpCall,
-        transferToPerpSignedCall, updateIndexPriceCall,
+        transferToPerpSignedCall, updateIndexPriceCall, updateIndexPriceFromBookCall,
         updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
     },
     margin_view::{run_get_account_margin, run_get_position_risk},
     risk::{
         run_add_market, run_add_position_margin, run_deposit_insurance_fund, run_get_admin,
-        run_get_average_premium_index, run_get_funding_state, run_get_index_price,
+        run_get_average_premium_index, run_get_funding_state, run_get_index_mode,
+        run_get_index_price,
         run_get_insurance_fund, run_get_margin_tiers, run_get_mark_price, run_get_market,
         run_get_market_manager, run_get_oracle_address, run_get_position, run_get_symbol_config,
         run_init_admin, run_liquidate, run_remove_position_margin, run_set_leverage,
         run_set_leverage_signed, run_set_margin_tiers, run_set_market_manager,
-        run_set_oracle_address, run_transfer_admin, run_update_index_price, run_update_market,
+        run_set_oracle_address, run_transfer_admin, run_update_index_price,
+        run_update_index_price_from_book, run_update_market,
         run_withdraw_insurance_fund,
     },
     trading::{
@@ -397,7 +399,12 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // that. FLAT, per selector — dynamic or per-item metering for this precompile was rejected
         // outright.
         m.insert(updateIndexPriceCall::SELECTOR, (50_000, false));
+        // Same 50_000 as `updateIndexPrice`: the two run the IDENTICAL downstream tail (mark
+        // recompute, premium accumulation, band expiry, liquidation sweep), and the book path
+        // trades one external-price validation for one MarketHot read plus one small blob.
+        m.insert(updateIndexPriceFromBookCall::SELECTOR, (50_000, false));
         m.insert(getIndexPriceCall::SELECTOR, (5_000, true));
+        m.insert(getIndexModeCall::SELECTOR, (5_000, true));
         m.insert(getFundingStateCall::SELECTOR, (5_000, true));
         m.insert(getAveragePremiumIndexCall::SELECTOR, (5_000, true));
         m
@@ -605,7 +612,11 @@ pub fn run_perp_dex_call<H: PerpHost>(
         s if s == updateIndexPriceCall::SELECTOR => {
             run_update_index_price(input_bytes, caller, context)
         }
+        s if s == updateIndexPriceFromBookCall::SELECTOR => {
+            run_update_index_price_from_book(input_bytes, caller, context)
+        }
         s if s == getIndexPriceCall::SELECTOR => run_get_index_price(input_bytes, context),
+        s if s == getIndexModeCall::SELECTOR => run_get_index_mode(input_bytes, context),
         s if s == getFundingStateCall::SELECTOR => run_get_funding_state(input_bytes, context),
         s if s == getAveragePremiumIndexCall::SELECTOR => {
             run_get_average_premium_index(input_bytes, context)
