@@ -5567,3 +5567,297 @@ mod account_update_stream {
         );
     }
 }
+
+// ── updateIndexPriceFromBook: the closed-external-session index ───────────────
+
+/// Seed the market with an external index price, as a live feed would before it went away.
+fn seed_external_index(ctx: &mut TestCtx, price: u64, ts: u64) {
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: price,
+            timestamp: ts,
+        }
+        .abi_encode(),
+        ADMIN,
+        ctx,
+    )
+    .unwrap();
+}
+
+fn call_from_book(ctx: &mut TestCtx, block_ts: u64, caller: Address) -> Result<Bytes, PerpError> {
+    ctx.block.timestamp = U256::from(block_ts);
+    run_update_index_price_from_book(
+        &updateIndexPriceFromBookCall {
+            marketId: MARKET_ID,
+        }
+        .abi_encode(),
+        caller,
+        ctx,
+    )
+}
+
+fn index_now(ctx: &mut TestCtx) -> u64 {
+    storage::load_index_price_state(ctx, MARKET_ID)
+        .unwrap()
+        .index_price
+}
+
+#[test]
+fn from_book_walks_the_index_toward_a_book_above_it() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+
+    // Whole book above the index: bid 101.00 / ask 101.10.
+    storage::save_best_bid(&mut ctx, MARKET_ID, 10_100).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, 10_110).unwrap();
+
+    // Many ticks, because one 15s step moves a fraction of a cent.
+    let mut ts = 30;
+    for _ in 0..600 {
+        ts += 15;
+        call_from_book(&mut ctx, ts, ADMIN).unwrap();
+    }
+    let got = index_now(&mut ctx);
+    assert!(
+        got > ENTRY_PRICE && got <= 10_100,
+        "index should climb toward the bid, got {got}"
+    );
+}
+
+#[test]
+fn from_book_walks_the_index_down_toward_a_book_below_it() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+
+    storage::save_best_bid(&mut ctx, MARKET_ID, 9_890).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, 9_900).unwrap();
+
+    let mut ts = 30;
+    for _ in 0..600 {
+        ts += 15;
+        call_from_book(&mut ctx, ts, ADMIN).unwrap();
+    }
+    let got = index_now(&mut ctx);
+    assert!(
+        got < ENTRY_PRICE && got >= 9_900,
+        "index should fall toward the ask, got {got}"
+    );
+}
+
+#[test]
+fn from_book_does_not_move_the_index_on_an_empty_book() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+    // best_bid/best_ask are both 0 — no quotes at all.
+
+    let mut ts = 30;
+    for _ in 0..50 {
+        ts += 15;
+        call_from_book(&mut ctx, ts, ADMIN).unwrap();
+    }
+    assert_eq!(
+        index_now(&mut ctx),
+        ENTRY_PRICE,
+        "an empty book must leave the index exactly where it was"
+    );
+}
+
+#[test]
+fn from_book_is_a_deadband_while_the_index_sits_inside_the_spread() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+
+    storage::save_best_bid(&mut ctx, MARKET_ID, ENTRY_PRICE - 10).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, ENTRY_PRICE + 10).unwrap();
+
+    let mut ts = 30;
+    for _ in 0..200 {
+        ts += 15;
+        call_from_book(&mut ctx, ts, ADMIN).unwrap();
+    }
+    assert_eq!(
+        index_now(&mut ctx),
+        ENTRY_PRICE,
+        "straddled index must not drift — moving it requires a quote past it"
+    );
+}
+
+#[test]
+fn from_book_tracks_the_only_side_quoted() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+
+    // Ask-only book. A zero best_bid must NOT be read as a zero-priced bid.
+    storage::save_best_ask(&mut ctx, MARKET_ID, 9_900).unwrap();
+
+    let mut ts = 30;
+    for _ in 0..600 {
+        ts += 15;
+        call_from_book(&mut ctx, ts, ADMIN).unwrap();
+    }
+    let got = index_now(&mut ctx);
+    assert!(
+        got < ENTRY_PRICE && got >= 9_900,
+        "tracks the ask, got {got}"
+    );
+}
+
+#[test]
+fn from_book_rejects_a_market_that_never_had_an_index() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_best_bid(&mut ctx, MARKET_ID, 10_100).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, 10_110).unwrap();
+
+    let err = call_from_book(&mut ctx, 45, ADMIN).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("no index price yet"),
+        "a closed-session oracle needs an open session first, got {err:?}"
+    );
+}
+
+#[test]
+fn from_book_requires_the_oracle_or_admin_role() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+
+    let err = call_from_book(&mut ctx, 45, ALICE).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("not authorised"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn from_book_is_a_no_op_inside_one_price_bucket() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+    storage::save_best_bid(&mut ctx, MARKET_ID, 20_000).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, 20_010).unwrap();
+
+    call_from_book(&mut ctx, 45, ADMIN).unwrap();
+    let after_first = storage::load_index_mode_state(&mut ctx, MARKET_ID)
+        .unwrap()
+        .index_scaled;
+
+    // Same 15s bucket: the staleness gate must swallow these, so the accumulator cannot be
+    // advanced many times within one block by repeating the call.
+    for ts in [45, 50, 59] {
+        call_from_book(&mut ctx, ts, ADMIN).unwrap();
+    }
+    assert_eq!(
+        storage::load_index_mode_state(&mut ctx, MARKET_ID)
+            .unwrap()
+            .index_scaled,
+        after_first,
+        "repeat calls inside one bucket must not each apply an EWMA step"
+    );
+}
+
+#[test]
+fn the_external_path_is_unchanged_when_no_ramp_is_in_flight() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+
+    // Plain weekday pushes: the exposed index must be the oracle's argument, bit for bit.
+    for (px, ts) in [(ENTRY_PRICE, 30u64), (10_250, 45), (9_875, 60)] {
+        seed_external_index(&mut ctx, px, ts);
+        assert_eq!(index_now(&mut ctx), px, "external index must pass through");
+    }
+    let mode = storage::load_index_mode_state(&mut ctx, MARKET_ID).unwrap();
+    assert!(!mode.from_book);
+    assert_eq!(mode.ramp_from, 0, "no ramp without a prior book update");
+    assert_eq!(
+        crate::math::index_from_scaled(mode.index_scaled),
+        9_875,
+        "accumulator tracks the exposed index"
+    );
+}
+
+#[test]
+fn the_feed_returning_ramps_instead_of_jumping_and_lands_exactly() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+
+    // Drive the index away from the feed with a book well below it.
+    storage::save_best_bid(&mut ctx, MARKET_ID, 9_000).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, 9_010).unwrap();
+    let mut ts = 30;
+    for _ in 0..400 {
+        ts += 15;
+        call_from_book(&mut ctx, ts, ADMIN).unwrap();
+    }
+    let weekend_index = index_now(&mut ctx);
+    assert!(weekend_index < ENTRY_PRICE, "book drove the index down");
+
+    // Feed returns, far above where the book left it.
+    let external = 10_500;
+    ts += 15;
+    seed_external_index(&mut ctx, external, ts);
+    let first = index_now(&mut ctx);
+    assert_eq!(
+        first, weekend_index,
+        "handover is continuous: the first external push publishes where the book left off"
+    );
+
+    // Partway through the ramp it is strictly between the two.
+    ts += crate::math::INDEX_RAMP_SECS / 2;
+    seed_external_index(&mut ctx, external, ts);
+    let mid = index_now(&mut ctx);
+    assert!(
+        mid > weekend_index && mid < external,
+        "mid-ramp should be between {weekend_index} and {external}, got {mid}"
+    );
+
+    // Past the window it lands exactly on the feed and the ramp is cleared.
+    ts += crate::math::INDEX_RAMP_SECS;
+    seed_external_index(&mut ctx, external, ts);
+    assert_eq!(index_now(&mut ctx), external, "ramp must land on the feed");
+    let mode = storage::load_index_mode_state(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(mode.ramp_from, 0, "ramp cleared once complete");
+    assert!(!mode.from_book);
+
+    // And a later push is pass-through again.
+    ts += 15;
+    seed_external_index(&mut ctx, 10_600, ts);
+    assert_eq!(index_now(&mut ctx), 10_600);
+}
+
+#[test]
+fn a_book_update_mid_ramp_cancels_the_ramp() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+    storage::save_best_bid(&mut ctx, MARKET_ID, 9_000).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, 9_010).unwrap();
+
+    let mut ts = 45;
+    call_from_book(&mut ctx, ts, ADMIN).unwrap();
+    ts += 15;
+    seed_external_index(&mut ctx, 10_500, ts); // opens a ramp
+    assert_ne!(
+        storage::load_index_mode_state(&mut ctx, MARKET_ID)
+            .unwrap()
+            .ramp_from,
+        0
+    );
+
+    // The feed drops out again before the ramp finished.
+    ts += 15;
+    call_from_book(&mut ctx, ts, ADMIN).unwrap();
+    let mode = storage::load_index_mode_state(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(
+        mode.ramp_from, 0,
+        "book update supersedes an in-flight ramp"
+    );
+    assert!(mode.from_book);
+}
