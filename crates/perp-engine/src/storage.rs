@@ -12,7 +12,8 @@ use crate::PERP_DEX_ADDRESS;
 use crate::{
         errors::{perp_err, perp_invariant_err},
     types::{
-        AccountUpdateReason, ApiKey, FundingState, IndexPriceHistory, IndexPriceState, Market,
+        AccountUpdateReason, ApiKey, FundingState, IndexModeState, IndexPriceHistory,
+        IndexPriceState, Market,
         MarketHot, Order, OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
         UserAccount, UserFeeRates, MAX_USER_MARKETS,
     },
@@ -22,7 +23,8 @@ use crate::{
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
     bid_level_key, bid_prices_key, commitment_slot, funding_state_key,
-    index_price_history_key, index_price_state_key, insurance_fund_key, market_fee_total_key,
+    index_mode_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
+    market_fee_total_key,
     market_hot_key, market_key, market_manager_key, oracle_key, order_key, position_key,
     position_registry_key, premium_accumulator_key, price_basis_window_key, seen_bucket_key,
     seen_sig_key, trade_count_key, user_buy_orders_key, user_markets_key, user_sell_orders_key,
@@ -2431,6 +2433,28 @@ pub fn save_index_price_state<H: PerpHost>(
 ) -> Result<(), PerpError> {
     let buf = encode(state)?;
     store_blob(context, index_price_state_key(market_id), &buf)
+}
+
+// ── Index mode state (book-EWMA accumulator + handover ramp) ──────────────────
+
+pub fn load_index_mode_state<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+) -> Result<IndexModeState, PerpError> {
+    let buf = load_blob(context, index_mode_state_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(IndexModeState::default());
+    }
+    decode(&buf)
+}
+
+pub fn save_index_mode_state<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    state: &IndexModeState,
+) -> Result<(), PerpError> {
+    let buf = encode(state)?;
+    store_blob(context, index_mode_state_key(market_id), &buf)
 }
 
 // ── Price mid window (30s MA basis input) ─────────────────────────────────────
