@@ -341,3 +341,29 @@ pub struct IndexPriceState {
     pub index_price: u64,
     pub timestamp: u64,
 }
+
+/// Per-market state for the two non-default index paths: the book-derived EWMA used while
+/// there is no external feed, and the ramp that hands control back when the feed returns.
+///
+/// Positional msgpack — fields may only ever be APPENDED.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct IndexModeState {
+    /// The index price carried at `INDEX_SCALE` times the market's own price resolution.
+    ///
+    /// This exists because one EWMA step moves the index by a FRACTION of a price unit:
+    /// at `price_decimals = 2` and a 15 s tick, a book displacement under ~$1.21 rounds to
+    /// zero, and because the truncated value is fed back as the next tick's input the oracle
+    /// then never moves at all. Carrying the state six decimals finer makes the accumulation
+    /// exact — `index_scaled += alpha * ipd` is an integer add — and truncation happens once,
+    /// at the point the value is exposed.
+    ///
+    /// Maintained on BOTH paths (the external path writes `index_price * INDEX_SCALE`), so the
+    /// book path never needs a seeding special case.
+    pub index_scaled: u128,
+    /// Whether the last accepted update came from the book path. Drives ramp entry.
+    pub from_book: bool,
+    /// Index price the handover ramp interpolates FROM. `0` = no ramp in flight.
+    pub ramp_from: u64,
+    /// Timestamp the handover ramp started at.
+    pub ramp_start_ts: u64,
+}

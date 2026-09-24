@@ -42,6 +42,7 @@ const PFX_ORACLE: [u8; 4] = *b"orcl"; // authorized oracle address (updateIndexP
 const PFX_MARKET_MANAGER: [u8; 4] = *b"mkgr"; // authorized market manager address (addMarket/updateMarket role)
 const PFX_INDEX_PRICE: [u8; 4] = *b"idxp"; // per-market IndexPriceState
 const PFX_INDEX_HISTORY: [u8; 4] = *b"idxh"; // per-market IndexPriceHistory
+const PFX_INDEX_MODE: [u8; 4] = *b"idxm"; // per-market IndexModeState (book-EWMA accumulator + handover ramp)
 const PFX_BASIS_WINDOW: [u8; 4] = *b"bswn"; // per-market PriceBasisWindow (30s mid samples)
 const PFX_FUNDING_STATE: [u8; 4] = *b"fund"; // per-market FundingState
 const PFX_PREMIUM_ACCUMULATOR: [u8; 4] = *b"pacc"; // per-market PremiumIndexAccumulator
@@ -332,6 +333,15 @@ pub fn index_price_state_key(market_id: u64) -> B256 {
 #[inline]
 pub fn index_price_history_key(market_id: u64) -> B256 {
     pack_market(PFX_INDEX_HISTORY, market_id)
+}
+
+/// Per-market [`crate::types::IndexModeState`] — the book-derived EWMA accumulator and the
+/// external-feed handover ramp. Separate from [`index_price_state_key`] on purpose:
+/// `IndexPriceState` is copied into every `IndexPriceHistory` checkpoint, so widening it
+/// would multiply the history blob.
+#[inline]
+pub fn index_mode_state_key(market_id: u64) -> B256 {
+    pack_market(PFX_INDEX_MODE, market_id)
 }
 
 /// Per-market PriceBasisWindow (30-second mid-price ring buffer).

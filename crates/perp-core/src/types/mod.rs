@@ -9,8 +9,8 @@ pub use account::{
 };
 pub use fee::UserFeeRates;
 pub use oracle::{
-    FundingState, IndexPriceHistory, IndexPriceState, PremiumIndexAccumulator, PriceBasisWindow,
-    PRICE_BASIS_WINDOW_SIZE,
+    FundingState, IndexModeState, IndexPriceHistory, IndexPriceState, PremiumIndexAccumulator,
+    PriceBasisWindow, PRICE_BASIS_WINDOW_SIZE,
 };
 pub use order::{
     CancelReason, Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side, TimeInForce,

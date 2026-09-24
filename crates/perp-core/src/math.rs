@@ -33,6 +33,127 @@ pub const MAX_USER_FEE_BPS: u64 = 1_000;
 /// `price_band_bps` is left at `0`. 1_000 bps = ±10%.
 pub const DEFAULT_PRICE_BAND_BPS: u32 = 1_000;
 
+// ── Book-derived index (closed external session) ──────────────────────────────
+//
+// When the external price feed has nothing to publish — a US-equity weekend, say — the index
+// is instead walked toward this market's OWN book by a continuous-time EWMA, following
+// trade.xyz's closed-session oracle:
+//
+//     IPD   = max(best_bid − S, 0) − max(S − best_ask, 0)
+//     S_t   = β·S_{t⁻} + (1−β)·(S_{t⁻} + IPD)  =  S_{t⁻} + α·IPD      where α = 1 − β
+//     β     = exp(−Δt/τ)
+//
+// Two properties of IPD carry the design. It is ZERO while `best_bid ≤ S ≤ best_ask` — the
+// oracle sits inside the spread and does not move, so moving it requires pushing an entire
+// best quote past it, not nudging a mid. And when the book is crossed the two terms cancel,
+// so a crossed touch contributes nothing rather than something arbitrary.
+
+/// Fixed-point base for the EWMA weight `alpha`: `1_000_000` = 1.0.
+pub const ALPHA_ONE: i128 = 1_000_000;
+
+/// EWMA time constant in seconds (trade.xyz's closed-session oracle τ = 30 min).
+///
+/// Sets how fast the index tracks the book: half the gap in `τ·ln2` ≈ 21 min, 95% in
+/// `τ·ln20` ≈ 90 min.
+pub const EWMA_TAU_SECS: i128 = 1_800;
+
+/// Per-update ceiling on `alpha` (9.5%).
+///
+/// Binds only after a FEED OUTAGE: at the 15 s oracle cadence `alpha` is ~0.83%, and the cap
+/// is not reached until `Δt ≥ 171 s`. Its job is to stop a long gap from being "caught up" in
+/// one jump — it bounds the per-update rate, NOT the total distance travelled over a session.
+pub const ALPHA_CAP: i128 = 95_000;
+
+/// Resolution the index accumulator carries BEYOND the market's own price units.
+///
+/// See [`crate::types::IndexModeState`] for why this is not optional: without it the per-tick
+/// movement truncates to zero and, because the truncated value feeds the next tick, the EWMA
+/// stalls permanently rather than merely rounding.
+pub const INDEX_SCALE: u128 = 1_000_000;
+
+/// Seconds over which a returning external feed is blended back in ([`index_ramp_blend`]).
+pub const INDEX_RAMP_SECS: u64 = 300;
+
+/// EWMA weight for a gap of `dt_secs`: `1 − exp(−Δt/τ)`, linearised and capped.
+///
+/// `1 − e^(−x) ≈ x` for small `x`. At the 15 s cadence that is `8_333` against a true
+/// `8_299` — 0.41% relative, and deterministic, which a floating-point `exp` would NOT be:
+/// the index is consensus state, so every node must produce the same bits.
+#[inline]
+pub fn ewma_alpha(dt_secs: u64) -> i128 {
+    let linear = (dt_secs as i128).saturating_mul(ALPHA_ONE) / EWMA_TAU_SECS;
+    linear.clamp(0, ALPHA_CAP)
+}
+
+/// trade.xyz's impact-price difference, in the market's price units.
+///
+/// `best_bid`/`best_ask` of `0` mean that side of the book is EMPTY (a resting order can never
+/// be priced 0), which must be special-cased or the `max(S − 0, 0)` term would read an empty
+/// ask side as an infinitely low offer and drag the index to the floor. A one-sided book
+/// collapses to that side's quote — the only price anyone is showing — and a book with no
+/// quotes at all yields `0`, leaving the index exactly where it was.
+#[inline]
+pub fn book_impact_delta(best_bid: u64, best_ask: u64, index_price: u64) -> i128 {
+    let (bid, ask) = match (best_bid, best_ask) {
+        (0, 0) => return 0,
+        (0, ask) => (ask, ask),
+        (bid, 0) => (bid, bid),
+        (bid, ask) => (bid, ask),
+    };
+    let s = index_price as i128;
+    let above = (bid as i128 - s).max(0);
+    let below = (s - ask as i128).max(0);
+    above - below
+}
+
+/// One EWMA step on the scaled accumulator, clamped into `[1, max_price]` price units.
+///
+/// `alpha` is `ALPHA_ONE`-based and the accumulator is `INDEX_SCALE`-based, so the two bases
+/// cancel and the arithmetic below folds to `index_scaled + alpha * ipd`. It is written out in
+/// full anyway: the cancellation is an accident of the two constants being equal, and a future
+/// change to either would otherwise silently rescale the oracle.
+///
+/// All of it runs in `i128` — `ipd` is SIGNED (a falling book gives a negative step, which
+/// would wrap a `u128` straight to its ceiling), and `[profile.release]` sets no
+/// `overflow-checks`, so a wrap here would be silent.
+#[inline]
+pub fn ewma_index_step(index_scaled: u128, alpha: i128, ipd: i128, max_price: u64) -> u128 {
+    let delta = alpha
+        .saturating_mul(ipd)
+        .saturating_mul(INDEX_SCALE as i128)
+        / ALPHA_ONE;
+    let next = (index_scaled as i128).saturating_add(delta);
+    let floor = INDEX_SCALE as i128;
+    let ceiling = (max_price as i128).saturating_mul(INDEX_SCALE as i128);
+    next.clamp(floor, ceiling.max(floor)) as u128
+}
+
+/// The index price a scaled accumulator exposes: truncate ONCE, at the boundary.
+#[inline]
+pub fn index_from_scaled(index_scaled: u128) -> u64 {
+    (index_scaled / INDEX_SCALE).min(u64::MAX as u128) as u64
+}
+
+/// Scaled accumulator for an index price arriving from outside.
+#[inline]
+pub fn scaled_from_index(index_price: u64) -> u128 {
+    (index_price as u128).saturating_mul(INDEX_SCALE)
+}
+
+/// Linear handover blend from the book-derived index back to the external feed.
+///
+/// `elapsed >= window` (or a zero window) yields `to` exactly, so the ramp always LANDS on the
+/// external price rather than approaching it asymptotically.
+#[inline]
+pub fn index_ramp_blend(from: u64, to: u64, elapsed: u64, window: u64) -> u64 {
+    if window == 0 || elapsed >= window {
+        return to;
+    }
+    let from_i = from as i128;
+    let delta = (to as i128 - from_i).saturating_mul(elapsed as i128) / window as i128;
+    from_i.saturating_add(delta).max(0) as u64
+}
+
 /// Resolve a market's stored `price_band_bps` to the effective value:
 /// `0` maps to [`DEFAULT_PRICE_BAND_BPS`], any other value is used verbatim
 /// (a large value such as `>= 10_000` effectively disables the band).
@@ -2413,3 +2534,223 @@ mod estimated_settle_price_tests {
     }
 }
 
+
+#[cfg(test)]
+mod book_index_ewma_tests {
+    use super::*;
+
+    // TSLA-shaped market: price_decimals = 2, so one price unit is $0.01.
+    const MAX_PRICE: u64 = 10_000_000; // $100,000.00
+    const TICK: u64 = 15; // the oracle cadence these markets run at
+
+    fn usd(dollars: f64) -> u64 {
+        (dollars * 100.0).round() as u64
+    }
+
+    #[test]
+    fn alpha_at_the_oracle_cadence_tracks_the_true_exponential() {
+        // 1 - e^(-15/1800) = 0.0082986... -> 8_299 in ALPHA_ONE units.
+        let a = ewma_alpha(TICK);
+        assert_eq!(a, 8_333, "linearised alpha at a 15s tick");
+        let err = (a - 8_299).abs() as f64 / 8_299.0;
+        assert!(err < 0.005, "within 0.5% of the true exponential, got {err}");
+    }
+
+    #[test]
+    fn alpha_is_capped_only_after_an_outage_and_never_negative() {
+        assert_eq!(ewma_alpha(0), 0, "no elapsed time, no movement");
+        assert!(
+            ewma_alpha(170) < ALPHA_CAP,
+            "cap must not bind at the normal cadence"
+        );
+        assert_eq!(ewma_alpha(171), ALPHA_CAP, "cap binds at ~171s");
+        assert_eq!(
+            ewma_alpha(86_400),
+            ALPHA_CAP,
+            "a day-long gap still moves at most one cap step"
+        );
+        assert_eq!(ewma_alpha(u64::MAX), ALPHA_CAP, "no overflow on an absurd gap");
+    }
+
+    #[test]
+    fn index_inside_the_spread_is_a_deadband() {
+        let s = usd(366.00);
+        assert_eq!(
+            book_impact_delta(usd(365.90), usd(366.10), s),
+            0,
+            "strictly inside"
+        );
+        assert_eq!(book_impact_delta(s, usd(366.10), s), 0, "sitting on the bid");
+        assert_eq!(book_impact_delta(usd(365.90), s, s), 0, "sitting on the ask");
+    }
+
+    #[test]
+    fn a_book_entirely_past_the_index_drags_it_that_way() {
+        let s = usd(366.00);
+        assert_eq!(book_impact_delta(usd(366.50), usd(366.60), s), 50);
+        assert_eq!(book_impact_delta(usd(365.40), usd(365.50), s), -50);
+    }
+
+    #[test]
+    fn an_empty_side_collapses_to_the_side_that_exists() {
+        let s = usd(366.00);
+        // Empty bid must NOT be read as a zero-priced bid, and empty ask must NOT be read as a
+        // zero-priced offer — the latter would drag the index to the floor every tick.
+        assert_eq!(book_impact_delta(0, usd(366.50), s), 50, "ask-only tracks the ask");
+        assert_eq!(book_impact_delta(0, usd(365.50), s), -50, "ask-only, below");
+        assert_eq!(book_impact_delta(usd(366.50), 0, s), 50, "bid-only tracks the bid");
+        assert_eq!(book_impact_delta(usd(365.50), 0, s), -50, "bid-only, below");
+        assert_eq!(book_impact_delta(0, 0, s), 0, "no quotes at all: do not move");
+    }
+
+    #[test]
+    fn a_crossed_book_contributes_nothing_rather_than_something_arbitrary() {
+        let s = usd(366.00);
+        assert_eq!(book_impact_delta(usd(367.00), usd(365.00), s), 0);
+    }
+
+    /// REGRESSION. Updating the index in its own units truncates every sub-unit step to zero,
+    /// and because the truncated value is the next tick's input the oracle stalls FOREVER
+    /// rather than merely rounding. It fails silently — no error, no panic, the feed simply
+    /// appears not to work. The scaled accumulator is the fix; this pins that it is needed.
+    #[test]
+    fn a_sub_unit_step_stalls_without_the_scaled_accumulator() {
+        let bid = usd(366.50);
+        let start = usd(366.00);
+        let alpha = ewma_alpha(TICK);
+
+        let mut naive = start;
+        for _ in 0..8 {
+            let ipd = book_impact_delta(bid, bid, naive);
+            naive = (naive as i128 + alpha * ipd / ALPHA_ONE) as u64;
+        }
+        assert_eq!(
+            naive, start,
+            "naive form is frozen — this is the bug being prevented"
+        );
+
+        let mut scaled = scaled_from_index(start);
+        for _ in 0..8 {
+            let ipd = book_impact_delta(bid, bid, index_from_scaled(scaled));
+            scaled = ewma_index_step(scaled, alpha, ipd, MAX_PRICE);
+        }
+        assert!(
+            index_from_scaled(scaled) > start,
+            "scaled form advances: {} -> {}",
+            start,
+            index_from_scaled(scaled)
+        );
+    }
+
+    #[test]
+    fn a_falling_book_does_not_underflow_the_accumulator() {
+        // ipd is signed; a u128 accumulator would wrap to its ceiling instead of going down.
+        let ask = usd(300.00);
+        let mut scaled = scaled_from_index(usd(366.00));
+        for _ in 0..200 {
+            let ipd = book_impact_delta(ask, ask, index_from_scaled(scaled));
+            scaled = ewma_index_step(scaled, ewma_alpha(TICK), ipd, MAX_PRICE);
+        }
+        let got = index_from_scaled(scaled);
+        assert!(
+            got < usd(366.00) && got > usd(299.00),
+            "descends toward the ask, got {got}"
+        );
+    }
+
+    #[test]
+    fn the_step_is_clamped_into_the_markets_legal_price_range() {
+        let hi = ewma_index_step(scaled_from_index(MAX_PRICE), ALPHA_CAP, i128::MAX, MAX_PRICE);
+        assert_eq!(index_from_scaled(hi), MAX_PRICE);
+        // 0 would divide-by-zero the premium index, which panics the node in release.
+        let lo = ewma_index_step(scaled_from_index(1), ALPHA_CAP, i128::MIN, MAX_PRICE);
+        assert!(index_from_scaled(lo) >= 1, "index must never reach 0");
+    }
+
+    #[test]
+    fn convergence_is_monotone_and_lands_on_the_book() {
+        let target = usd(370.00);
+        let mut scaled = scaled_from_index(usd(366.00));
+        let mut prev = index_from_scaled(scaled);
+        for _ in 0..4_000 {
+            let ipd = book_impact_delta(target, target, index_from_scaled(scaled));
+            scaled = ewma_index_step(scaled, ewma_alpha(TICK), ipd, MAX_PRICE);
+            let now = index_from_scaled(scaled);
+            assert!(now >= prev, "monotone toward the target");
+            prev = now;
+        }
+        assert_eq!(prev, target, "settles exactly on the quote, no permanent residual");
+    }
+
+    #[test]
+    fn half_the_gap_is_covered_in_roughly_the_time_constant() {
+        // tau*ln2 = 1800*0.693 = ~1248s = ~83 ticks of 15s.
+        let target = usd(376.00);
+        let start = usd(366.00);
+        let mut scaled = scaled_from_index(start);
+        for _ in 0..83 {
+            let ipd = book_impact_delta(target, target, index_from_scaled(scaled));
+            scaled = ewma_index_step(scaled, ewma_alpha(TICK), ipd, MAX_PRICE);
+        }
+        let covered = (index_from_scaled(scaled) - start) as f64 / (target - start) as f64;
+        assert!(
+            (0.45..0.55).contains(&covered),
+            "half-life sanity, covered {covered}"
+        );
+    }
+
+    #[test]
+    fn scaling_round_trips_and_truncates_only_at_the_boundary() {
+        for px in [1u64, 2, usd(0.07), usd(366.00), usd(99_999.99), MAX_PRICE] {
+            assert_eq!(index_from_scaled(scaled_from_index(px)), px);
+        }
+        let s = scaled_from_index(usd(366.00)) + INDEX_SCALE / 2;
+        assert_eq!(index_from_scaled(s), usd(366.00));
+    }
+
+    #[test]
+    fn the_ramp_starts_at_the_book_price_and_lands_exactly_on_the_feed() {
+        let (from, to) = (usd(350.00), usd(380.00));
+        assert_eq!(
+            index_ramp_blend(from, to, 0, INDEX_RAMP_SECS),
+            from,
+            "continuous at handover"
+        );
+        assert_eq!(
+            index_ramp_blend(from, to, INDEX_RAMP_SECS, INDEX_RAMP_SECS),
+            to,
+            "lands exactly"
+        );
+        assert_eq!(
+            index_ramp_blend(from, to, 10_000, INDEX_RAMP_SECS),
+            to,
+            "past the window"
+        );
+        assert_eq!(index_ramp_blend(from, to, 0, 0), to, "zero window snaps");
+        let mid = index_ramp_blend(from, to, INDEX_RAMP_SECS / 2, INDEX_RAMP_SECS);
+        assert_eq!(mid, usd(365.00), "linear midpoint");
+    }
+
+    #[test]
+    fn the_ramp_is_monotone_downward_too_and_never_underflows() {
+        let (from, to) = (usd(380.00), usd(350.00));
+        let mut prev = index_ramp_blend(from, to, 0, INDEX_RAMP_SECS);
+        for t in 1..=INDEX_RAMP_SECS {
+            let now = index_ramp_blend(from, to, t, INDEX_RAMP_SECS);
+            assert!(now <= prev, "monotone down");
+            prev = now;
+        }
+        assert_eq!(prev, to);
+
+        // The delta truncates toward zero, so a sub-unit step leaves the value at `from`
+        // rather than stepping early — it still LANDS on `to` at the window edge.
+        assert_eq!(index_ramp_blend(1, 0, 1, 2), 1, "sub-unit step holds at from");
+        assert_eq!(index_ramp_blend(1, 0, 2, 2), 0, "and lands at to");
+
+        // |delta| <= |to - from| because elapsed <= window, so the blend can never leave the
+        // interval — pin that at the boundary where an underflow would show up.
+        for t in 0..=4u64 {
+            assert!(index_ramp_blend(2, 0, t, 4) <= 2, "never above from");
+        }
+    }
+}
