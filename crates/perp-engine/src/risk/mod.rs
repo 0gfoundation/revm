@@ -18,7 +18,7 @@ use crate::{
         getMarketManagerAddressCall, getMarketReturn, getOracleAddressCall, getPositionCall,
         getPositionReturn, getSymbolConfigCall, getSymbolConfigReturn, initAdminCall,
         liquidateCall, removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
-        setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall, transferAdminCall,
+        setBasisModeCall, setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall, transferAdminCall,
         updateIndexPriceCall, updateIndexPriceFromBookCall, updateMarketCall,
         withdrawInsuranceFundCall,
     },
@@ -192,6 +192,10 @@ pub fn run_add_market<H: PerpHost>(
         price_band_bps: args.priceBandBps,
         // mark_price now lives in the Market blob (was a separate save_mark_price call).
         mark_price: args.initialMarkPrice,
+        // Born on the legacy window basis, like every market that already exists. A market is
+        // opted into the EWMA basis afterwards by `setBasisMode`, for the same reason the tier
+        // table is set by `setMarginTiers`: `addMarket` is already 14 args.
+        basis_mode: crate::types::BASIS_MODE_WINDOW,
         // `addMarket` is deliberately NOT grown to carry the tier table (it is already
         // 14 args with a fixed-offset signed layout). Every market is born single-tier
         // `[{0, DEFAULT_MAX_LEVERAGE}]` — maintenance rate 1/6, leverage cap 3 — and is
@@ -2007,12 +2011,45 @@ fn apply_index_price_update<H: PerpHost>(
     // Price1: index adjusted by funding basis.
     let price1 = compute_price1(index_price, &funding, &market, effective_timestamp);
 
-    // Price2: index adjusted by time-weighted top-of-book basis.
-    let window = storage::load_price_basis_window(context, market_id)?;
-    let max_index_checkpoints = max_index_price_checkpoints(market.price_update_interval);
-    let mut index_history = storage::load_index_price_history(context, market_id)?;
-    index_history.push(prev_index_state, max_index_checkpoints);
-    let ma_basis = window.moving_average_basis(&index_history, effective_timestamp)?;
+    // Price2: index plus the top-of-book basis. WHICH basis is per market — see
+    // `Market::basis_mode`. The USD-M markets stay on the window form and are not touched by
+    // the EWMA branch at all; the two mechanisms coexist rather than one replacing the other.
+    let mut legacy_history: Option<(crate::types::IndexPriceHistory, usize)> = None;
+    let mut ewma_basis: Option<crate::types::PriceBasisEwma> = None;
+    let ma_basis = if market.basis_mode == crate::types::BASIS_MODE_EWMA {
+        // Sampled HERE — at oracle cadence, against the index being published — rather than on
+        // every best-quote change against a historical index. Measuring contemporaneously is
+        // what keeps this a basis rather than a lagged mid, and this cadence means a quote has
+        // to survive an oracle tick before it can reach the mark at all.
+        let mut basis = storage::load_price_basis_ewma(context, market_id)?;
+        let hot = storage::load_market_hot(context, market_id)?;
+        let mid = crate::math::top_of_book_mid(hot.best_bid, hot.best_ask);
+        if mid != 0 {
+            if basis.last_sample_ts == 0 {
+                // Seed, rather than letting the first sample decay in from a basis of zero.
+                basis.basis_scaled = (mid as i128 - index_price as i128)
+                    .saturating_mul(crate::math::INDEX_SCALE as i128);
+            } else {
+                let dt = effective_timestamp.saturating_sub(basis.last_sample_ts);
+                basis.basis_scaled =
+                    crate::math::step_price_basis(basis.basis_scaled, dt, mid, index_price);
+            }
+            basis.last_sample_ts = effective_timestamp;
+        }
+        // Clamp price2's INPUT, never the mark's output: `contract_price` stays free, so the
+        // mark still follows real trades at the real price.
+        let b = crate::math::effective_basis(basis.basis_scaled, index_price);
+        ewma_basis = Some(basis);
+        b
+    } else {
+        let window = storage::load_price_basis_window(context, market_id)?;
+        let max_index_checkpoints = max_index_price_checkpoints(market.price_update_interval);
+        let mut index_history = storage::load_index_price_history(context, market_id)?;
+        index_history.push(prev_index_state, max_index_checkpoints);
+        let b = window.moving_average_basis(&index_history, effective_timestamp)?;
+        legacy_history = Some((index_history, max_index_checkpoints));
+        b
+    };
     let index_price_i64 = checked_u64_to_i64(index_price, "index price update: indexPrice")?;
     let price2 = index_price_i64.saturating_add(ma_basis).max(1) as u64;
 
@@ -2043,14 +2080,19 @@ fn apply_index_price_update<H: PerpHost>(
             timestamp: effective_timestamp,
         },
     )?;
-    index_history.push(
-        IndexPriceState {
-            index_price: index_price,
-            timestamp: effective_timestamp,
-        },
-        max_index_checkpoints,
-    );
-    storage::save_index_price_history(context, market_id, &index_history)?;
+    if let Some((mut index_history, max_index_checkpoints)) = legacy_history {
+        index_history.push(
+            IndexPriceState {
+                index_price: index_price,
+                timestamp: effective_timestamp,
+            },
+            max_index_checkpoints,
+        );
+        storage::save_index_price_history(context, market_id, &index_history)?;
+    }
+    if let Some(basis) = &ewma_basis {
+        storage::save_price_basis_ewma(context, market_id, basis)?;
+    }
     storage::save_index_mode_state(context, market_id, mode)?;
     storage::save_mark_price(context, market_id, mark_price)?;
 
@@ -2212,6 +2254,27 @@ fn apply_index_price_update<H: PerpHost>(
 }
 
 
+/// `setBasisMode(uint64 marketId, uint8 mode)`
+pub fn run_set_basis_mode<H: PerpHost>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = setBasisModeCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("setBasisMode: invalid calldata"))?;
+
+    require_admin_or_market_manager(caller, context)?;
+
+    if args.mode > crate::types::BASIS_MODE_EWMA {
+        return Err(perp_err("setBasisMode: unknown mode"));
+    }
+    let mut market = storage::load_market(context, args.marketId)?
+        .ok_or_else(|| perp_err("setBasisMode: unknown market"))?;
+    market.basis_mode = args.mode;
+    storage::save_market(context, &market)?;
+    Ok(Bytes::new())
+}
+
 /// `getIndexMode(uint64 marketId) returns (bool fromBook, uint128 indexScaled, uint64 rampFrom, uint64 rampStartTs)`
 pub fn run_get_index_mode<H: PerpHost>(
     input_bytes: &[u8],
@@ -2226,6 +2289,9 @@ pub fn run_get_index_mode<H: PerpHost>(
             indexScaled: mode.index_scaled,
             rampFrom: mode.ramp_from,
             rampStartTs: mode.ramp_start_ts,
+            basisMode: storage::load_market_ref(context, args.marketId)?
+                .map(|m| m.basis_mode)
+                .unwrap_or(0),
         },
     )))
 }

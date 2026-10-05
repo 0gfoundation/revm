@@ -2683,6 +2683,7 @@ mod split_floor_conservation_tests {
             price_band_bps: 0,
             mark_price: 0,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         }
     }
 

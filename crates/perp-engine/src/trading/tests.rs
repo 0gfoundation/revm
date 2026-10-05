@@ -101,6 +101,7 @@ fn setup(ctx: &mut TestCtx) {
             price_band_bps: 0,
             mark_price: 0,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         },
     )
     .unwrap();
@@ -419,6 +420,7 @@ fn setup_banded(ctx: &mut TestCtx, band_bps: u32) {
             price_band_bps: band_bps,
             mark_price: 0,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         },
     )
     .unwrap();
@@ -2166,6 +2168,7 @@ fn margin_uses_market_price_decimals() {
             price_band_bps: 0,
             mark_price: 0,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         },
     )
     .unwrap();
@@ -6277,6 +6280,7 @@ mod perf {
                 price_band_bps: 0,
                 mark_price: 0,
                 tiers: MarginTiers::default(),
+                basis_mode: 0,
             },
         )
         .unwrap();
@@ -6839,7 +6843,7 @@ mod golden {
     /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
     /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xd01f49253f0e26bfee1ba80af9cff68b19048912ccbec54684ae747a2a5b5e45");
+        b256!("0xac26f7a55b60e4778aef2f0f499885dbbdb20a3b52617c4b4b55cbec4ae3f51c");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -11530,6 +11534,7 @@ mod user_market_index {
             price_band_bps: 0,
             mark_price: 0,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         }
     }
 
@@ -12530,6 +12535,7 @@ mod derived_ooim_divergence {
             price_band_bps: 0,
             mark_price: mark,
             tiers,
+            basis_mode: 0,
         }
     }
 
@@ -12966,6 +12972,7 @@ mod assuming_price {
                 price_band_bps: 0,
                 mark_price: 100_000,
                 tiers: MarginTiers::default(),
+                basis_mode: 0,
             },
         )
         .unwrap();
@@ -13547,6 +13554,7 @@ mod resting_notional_stream {
                 price_band_bps: 10_000,
                 mark_price: 100_000,
                 tiers: MarginTiers::default(),
+                basis_mode: 0,
             },
         )
         .unwrap();

@@ -404,7 +404,27 @@ pub struct Market {
     /// delta on every fill, and this is write-rare config.
     #[serde(default, rename = "mt")]
     pub tiers: MarginTiers,
+    /// Which basis mechanism feeds Price 2 of the mark. APPENDED LAST — positional msgpack.
+    ///
+    /// [`BASIS_MODE_WINDOW`] (the default, and what every existing market keeps) is the
+    /// 30-second time-weighted average over [`crate::types::PriceBasisWindow`], sampled on every
+    /// best-quote change. The USD-M markets are aligned to Binance on this and do not move.
+    ///
+    /// [`BASIS_MODE_EWMA`] is the oracle-cadence EWMA of `mid − index`. It exists for markets
+    /// whose index can be derived from their own book (`updateIndexPriceFromBook`), where the
+    /// window form's index-velocity bias and 30-second reach are both wrong.
+    ///
+    /// Per MARKET, deliberately not per selector: an equity market uses the external path on a
+    /// weekday and the book path at the weekend, and switching basis formula between them would
+    /// jump price2 at exactly the handover the index ramp exists to smooth.
+    #[serde(default, rename = "bm")]
+    pub basis_mode: u8,
 }
+
+/// [`Market::basis_mode`]: the legacy 30-second time-weighted window. Default.
+pub const BASIS_MODE_WINDOW: u8 = 0;
+/// [`Market::basis_mode`]: oracle-cadence EWMA of `mid − index`.
+pub const BASIS_MODE_EWMA: u8 = 1;
 
 /// Per-market HOT scalars that change PER-TRADE, grouped into ONE off-trie blob so co-accessing
 /// them costs a SINGLE probe/decode/Arc sharing one cache line (was four separate keys). All `Copy`
@@ -541,6 +561,7 @@ mod tests {
             price_band_bps: 0,
             mark_price: 100,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         };
         m.tiers =
             MarginTiers::from_tiers(&[tier(0, 3), tier(50_000, 2), tier(250_000, 1)]).unwrap();

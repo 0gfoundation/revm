@@ -537,6 +537,7 @@ fn get_account_reports_available_wallet_net_of_allocations() {
             price_band_bps: 0,
             mark_price: 1,
             tiers: crate::types::MarginTiers::default(),
+            basis_mode: 0,
         },
     )
     .unwrap();

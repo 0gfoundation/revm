@@ -1412,6 +1412,7 @@ mod tests {
             price_band_bps: 500,
             mark_price: 65_000_00,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         }
     }
 

@@ -335,6 +335,24 @@ impl PremiumIndexAccumulator {
     }
 }
 
+/// EWMA of the top-of-book basis `mid − index`, for markets on [`Market::basis_mode`]
+/// `BASIS_MODE_EWMA`. Coexists with [`PriceBasisWindow`], which the USD-M markets keep.
+///
+/// Sampled at ORACLE cadence against the index being published, not on every best-quote change
+/// against a historical index. Measuring contemporaneously is what keeps this a basis rather
+/// than a lagged mid: averaging `mid(t) − index(t)` leaves a term proportional to index
+/// VELOCITY, so a steadily-moving index biases price2 even with the book glued to it.
+///
+/// Positional msgpack — fields may only ever be APPENDED.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct PriceBasisEwma {
+    /// `mid − index` carried at [`crate::math::INDEX_SCALE`] resolution, so a sub-unit step
+    /// accumulates instead of truncating to nothing.
+    pub basis_scaled: i128,
+    /// Oracle timestamp of the last sample. `0` = never sampled, so the next sample seeds.
+    pub last_sample_ts: u64,
+}
+
 /// Per-market index price state written by the oracle.
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct IndexPriceState {

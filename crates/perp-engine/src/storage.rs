@@ -14,7 +14,7 @@ use crate::{
     types::{
         AccountUpdateReason, ApiKey, FundingState, IndexModeState, IndexPriceHistory,
         IndexPriceState, Market,
-        MarketHot, Order, OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisWindow,
+        MarketHot, Order, OrderEntry, PerpPosition, PremiumIndexAccumulator, PriceBasisEwma, PriceBasisWindow,
         UserAccount, UserFeeRates, MAX_USER_MARKETS,
     },
     PerpError,
@@ -26,7 +26,8 @@ use keys::{
     index_mode_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
     market_fee_total_key,
     market_hot_key, market_key, market_manager_key, oracle_key, order_key, position_key,
-    position_registry_key, premium_accumulator_key, price_basis_window_key, seen_bucket_key,
+    position_registry_key, premium_accumulator_key, price_basis_ewma_key, price_basis_window_key,
+    seen_bucket_key,
     seen_sig_key, trade_count_key, user_buy_orders_key, user_markets_key, user_sell_orders_key,
 };
 
@@ -2479,6 +2480,26 @@ pub fn save_index_price_history<H: PerpHost>(
     store_blob(context, index_price_history_key(market_id), &buf)
 }
 
+pub fn load_price_basis_ewma<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+) -> Result<PriceBasisEwma, PerpError> {
+    let buf = load_blob(context, price_basis_ewma_key(market_id))?;
+    if buf.is_empty() {
+        return Ok(PriceBasisEwma::default());
+    }
+    decode(&buf)
+}
+
+pub fn save_price_basis_ewma<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    state: &PriceBasisEwma,
+) -> Result<(), PerpError> {
+    let buf = encode(state)?;
+    store_blob(context, price_basis_ewma_key(market_id), &buf)
+}
+
 pub fn load_price_basis_window<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -2929,6 +2950,7 @@ mod size_probe_tests {
             price_band_bps: 0,
             mark_price: 0,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         };
         let buf = encode(&market).unwrap();
         println!("Market: {} bytes", buf.len());
@@ -3154,6 +3176,7 @@ mod encoding_roundtrip_tests {
                 price_band_bps: 0,
                 mark_price: u64::MAX,
                 tiers: MarginTiers::default(),
+                basis_mode: 0,
             },
         );
     }

@@ -159,7 +159,16 @@ use primitives::{B256, U256};
 // ramp is in flight, which requires a prior `updateIndexPriceFromBook`. CHAIN change: golden
 // re-pin + a coordinated wipe on deploy. The golden scenario's BusinessSnapshot is UNCHANGED,
 // field for field.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 27;
+// ── 28 ───────────────────────────────────────────────────────────────────────────────────
+// `Market` gains `basis_mode` (positional msgpack, appended), selecting which mechanism feeds
+// price2 of the mark. Every existing market defaults to `BASIS_MODE_WINDOW` — the 30-second
+// time-weighted window it already used — so the USD-M markets, which are aligned to Binance on
+// this, are byte-identical in behaviour. Only the Market blob's SERIALISATION changed, by one
+// trailing field, which is why the commitment moves at all.
+//
+// No BUSINESS behaviour changes: the golden scenario's BusinessSnapshot is UNCHANGED, field for
+// field. CHAIN change: golden re-pin + wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 28;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

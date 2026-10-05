@@ -103,6 +103,7 @@ fn the_market() -> Market {
         // Mark anchored at BASE so Sim C's taker (which fills near BASE) is well inside the band.
         mark_price: BASE,
         tiers: MarginTiers::default(),
+        basis_mode: 0,
     }
 }
 
@@ -460,6 +461,7 @@ fn faithful_market() -> Market {
         price_band_bps: 1_000_000, // disabled
         mark_price: 0,
         tiers: MarginTiers::default(),
+        basis_mode: 0,
     }
 }
 pub fn hl_ctx_faithful() -> BenchCtx {

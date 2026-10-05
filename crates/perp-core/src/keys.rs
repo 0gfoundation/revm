@@ -44,6 +44,7 @@ const PFX_INDEX_PRICE: [u8; 4] = *b"idxp"; // per-market IndexPriceState
 const PFX_INDEX_HISTORY: [u8; 4] = *b"idxh"; // per-market IndexPriceHistory
 const PFX_INDEX_MODE: [u8; 4] = *b"idxm"; // per-market IndexModeState (book-EWMA accumulator + handover ramp)
 const PFX_BASIS_WINDOW: [u8; 4] = *b"bswn"; // per-market PriceBasisWindow (30s mid samples)
+const PFX_BASIS_EWMA: [u8; 4] = *b"bsew"; // per-market PriceBasisEwma (oracle-cadence basis)
 const PFX_FUNDING_STATE: [u8; 4] = *b"fund"; // per-market FundingState
 const PFX_PREMIUM_ACCUMULATOR: [u8; 4] = *b"pacc"; // per-market PremiumIndexAccumulator
 const PFX_INSURANCE_FUND: [u8; 4] = *b"infd"; // global insurance fund balance
@@ -350,6 +351,12 @@ pub fn price_basis_window_key(market_id: u64) -> B256 {
     pack_market(PFX_BASIS_WINDOW, market_id)
 }
 
+/// Per-market [`crate::types::PriceBasisEwma`].
+#[inline]
+pub fn price_basis_ewma_key(market_id: u64) -> B256 {
+    pack_market(PFX_BASIS_EWMA, market_id)
+}
+
 /// Per-market FundingState (last rate, interval, next timestamp).
 #[inline]
 pub fn funding_state_key(market_id: u64) -> B256 {
@@ -428,6 +435,7 @@ mod const_key_tests {
             PFX_INDEX_PRICE,
             PFX_INDEX_HISTORY,
             PFX_BASIS_WINDOW,
+            PFX_BASIS_EWMA,
             PFX_FUNDING_STATE,
             PFX_PREMIUM_ACCUMULATOR,
             PFX_INSURANCE_FUND,

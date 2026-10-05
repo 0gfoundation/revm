@@ -104,6 +104,7 @@ fn add_market(
             price_band_bps: 0,
             mark_price,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         },
     )
     .unwrap();

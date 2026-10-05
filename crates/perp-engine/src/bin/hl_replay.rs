@@ -74,6 +74,7 @@ fn market() -> Market {
         price_band_bps: 1_000_000, // disabled
         mark_price: 0,
         tiers: MarginTiers::default(),
+        basis_mode: 0,
     }
 }
 

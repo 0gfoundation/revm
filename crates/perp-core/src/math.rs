@@ -74,6 +74,82 @@ pub const INDEX_SCALE: u128 = 1_000_000;
 /// Seconds over which a returning external feed is blended back in ([`index_ramp_blend`]).
 pub const INDEX_RAMP_SECS: u64 = 300;
 
+// ── Price-2 basis EWMA (markets on BASIS_MODE_EWMA only) ──────────────────────
+//
+// For markets whose index can come from their own book. The USD-M markets stay on the
+// 30-second time-weighted window (`PriceBasisWindow::moving_average_basis`) and are not
+// touched by anything below.
+
+/// Basis EWMA time constant in seconds.
+///
+/// Both reference designs converge here — Binance's TradFi basis MA is a 2.5-minute window and
+/// trade.xyz's mark basis EWMA is τ = 150 s.
+pub const BASIS_TAU_SECS: i128 = 150;
+
+/// Ceiling on |basis| as a fraction of the index, in basis points.
+///
+/// This clamps price2's INPUT, deliberately not the mark's output. `contract_price` stays
+/// unclamped, so the mark still follows real trades at the real price — the vote that costs an
+/// attacker a fee, a position and the fill-time band. Clamping the mark instead would compose
+/// with that band and the out-of-band expiry sweep into a standing trading ceiling: every order
+/// at the true price force-cancelled each block, freezing the market exactly when a gap made it
+/// most necessary.
+pub const MAX_BASIS_BPS: u32 = 300;
+
+/// EWMA weight for the basis over `dt_secs`, linearised like [`ewma_alpha`] but against
+/// [`BASIS_TAU_SECS`] and saturating at 1.0 rather than at [`ALPHA_CAP`].
+///
+/// A long gap SHOULD snap the basis to the current observation: unlike the index, a stale basis
+/// has no claim to authority — the quotes it was measured against are long gone.
+#[inline]
+pub fn basis_alpha(dt_secs: u64) -> i128 {
+    let linear = (dt_secs as i128).saturating_mul(ALPHA_ONE) / BASIS_TAU_SECS;
+    linear.clamp(0, ALPHA_ONE)
+}
+
+/// Top-of-book mid, with the same empty-side rule as [`book_impact_delta`]: `0` marks an empty
+/// side, a one-sided book collapses to the side that exists, and an empty book yields `0`
+/// meaning "no observation" — never a zero-valued price.
+#[inline]
+pub fn top_of_book_mid(best_bid: u64, best_ask: u64) -> u64 {
+    match (best_bid, best_ask) {
+        (0, 0) => 0,
+        (0, ask) => ask,
+        (bid, 0) => bid,
+        (bid, ask) => ((bid as u128 + ask as u128) / 2) as u64,
+    }
+}
+
+/// Advance the basis EWMA toward `mid − index`, carried at [`INDEX_SCALE`] resolution so a
+/// sub-unit step accumulates instead of truncating away.
+#[inline]
+pub fn step_price_basis(basis_scaled: i128, dt_secs: u64, mid: u64, index_price: u64) -> i128 {
+    let target = (mid as i128 - index_price as i128).saturating_mul(INDEX_SCALE as i128);
+    let alpha = basis_alpha(dt_secs);
+    let delta = alpha.saturating_mul(target.saturating_sub(basis_scaled)) / ALPHA_ONE;
+    basis_scaled.saturating_add(delta)
+}
+
+/// The basis price2 uses: de-scaled and bounded to ±[`MAX_BASIS_BPS`] of the index.
+///
+/// De-scaling ROUNDS half away from zero rather than truncating. Integer division in Rust
+/// truncates toward zero, which is not symmetric about it: an EWMA converging on −100 sits at
+/// −99.9999… and would report −99, while one converging on +50 reports +50. That would bias
+/// every discount basis one unit toward zero and leave premiums untouched — a systematic tilt
+/// in price2, not a rounding detail.
+#[inline]
+pub fn effective_basis(basis_scaled: i128, index_price: u64) -> i64 {
+    let scale = INDEX_SCALE as i128;
+    let half = scale / 2;
+    let basis = if basis_scaled >= 0 {
+        (basis_scaled + half) / scale
+    } else {
+        (basis_scaled - half) / scale
+    };
+    let bound = (index_price as i128).saturating_mul(MAX_BASIS_BPS as i128) / 10_000;
+    basis.clamp(-bound, bound).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 /// EWMA weight for a gap of `dt_secs`: `1 − exp(−Δt/τ)`, linearised and capped.
 ///
 /// `1 − e^(−x) ≈ x` for small `x`. At the 15 s cadence that is `8_333` against a true
@@ -2752,5 +2828,107 @@ mod book_index_ewma_tests {
         for t in 0..=4u64 {
             assert!(index_ramp_blend(2, 0, t, 4) <= 2, "never above from");
         }
+    }
+}
+
+#[cfg(test)]
+mod price_basis_ewma_tests {
+    use super::*;
+
+    const INDEX: u64 = 36_600; // $366.00 at price_decimals = 2
+    const TICK: u64 = 15;
+
+    #[test]
+    fn basis_alpha_uses_its_own_time_constant_and_saturates_at_one() {
+        assert_eq!(basis_alpha(0), 0);
+        assert_eq!(basis_alpha(TICK), 100_000, "15s against tau=150s is 10%");
+        assert_eq!(basis_alpha(150), ALPHA_ONE, "one tau linearises to a full step");
+        assert_eq!(
+            basis_alpha(86_400),
+            ALPHA_ONE,
+            "a long gap snaps: a stale basis has no claim to authority"
+        );
+        assert_eq!(basis_alpha(u64::MAX), ALPHA_ONE, "no overflow");
+    }
+
+    #[test]
+    fn top_of_book_mid_never_treats_an_empty_side_as_a_price() {
+        assert_eq!(top_of_book_mid(0, 0), 0, "no quotes = no observation");
+        assert_eq!(top_of_book_mid(0, 36_700), 36_700, "ask-only");
+        assert_eq!(top_of_book_mid(36_500, 0), 36_500, "bid-only");
+        assert_eq!(top_of_book_mid(36_500, 36_700), 36_600, "two-sided mid");
+        // Matches book_impact_delta's rule exactly, so index and mark cannot disagree about
+        // what the book is saying.
+        assert_eq!(top_of_book_mid(0, 1), 1);
+    }
+
+    #[test]
+    fn the_basis_converges_on_a_persistent_book_offset() {
+        // Book sits 50 units (=$0.50) above the index and stays there.
+        let mid = INDEX + 50;
+        let mut b = (mid as i128 - INDEX as i128) * INDEX_SCALE as i128; // seeded
+        for _ in 0..200 {
+            b = step_price_basis(b, TICK, mid, INDEX);
+        }
+        assert_eq!(effective_basis(b, INDEX), 50, "settles on the real offset");
+    }
+
+    #[test]
+    fn the_basis_decays_toward_a_new_offset_rather_than_jumping() {
+        let mut b = 0i128;
+        b = step_price_basis(b, TICK, INDEX + 1_000, INDEX);
+        let first = effective_basis(b, INDEX);
+        assert!(
+            first > 0 && first < 1_000,
+            "one 10% step moves part of the way, not all: got {first}"
+        );
+        assert_eq!(first, 100, "10% of a 1000-unit gap");
+    }
+
+    #[test]
+    fn a_sub_unit_basis_step_accumulates_instead_of_stalling() {
+        // 10% of a 5-unit gap is 0.5 units — would truncate to zero without the scaling.
+        let mid = INDEX + 5;
+        let mut b = 0i128;
+        for _ in 0..3 {
+            b = step_price_basis(b, TICK, mid, INDEX);
+        }
+        assert!(effective_basis(b, INDEX) > 0, "must not stall on a sub-unit step");
+    }
+
+    #[test]
+    fn the_basis_is_bounded_by_max_basis_bps_in_both_directions() {
+        let bound = (INDEX as i64) * MAX_BASIS_BPS as i64 / 10_000;
+        // A book 10x the index away cannot pull price2 further than the clamp.
+        let mut up = 0i128;
+        let mut down = 0i128;
+        for _ in 0..500 {
+            up = step_price_basis(up, TICK, INDEX * 10, INDEX);
+            down = step_price_basis(down, TICK, 1, INDEX);
+        }
+        assert_eq!(effective_basis(up, INDEX), bound, "clamped above");
+        assert_eq!(effective_basis(down, INDEX), -bound, "clamped below");
+    }
+
+    #[test]
+    fn a_negative_basis_does_not_wrap() {
+        // The accumulator is signed; a book below the index must go negative, not to a ceiling.
+        let mid = INDEX - 100;
+        let mut b = 0i128;
+        for _ in 0..200 {
+            b = step_price_basis(b, TICK, mid, INDEX);
+        }
+        assert_eq!(effective_basis(b, INDEX), -100);
+    }
+
+    #[test]
+    fn a_long_gap_snaps_the_basis_to_the_current_observation() {
+        let mut b = (500i128) * INDEX_SCALE as i128; // stale +500 basis
+        b = step_price_basis(b, 86_400, INDEX - 20, INDEX); // a day later, book is 20 below
+        assert_eq!(
+            effective_basis(b, INDEX),
+            -20,
+            "a day-old basis is discarded, not averaged in"
+        );
     }
 }

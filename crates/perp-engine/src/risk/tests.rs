@@ -89,6 +89,7 @@ fn setup_market(ctx: &mut TestCtx) {
             price_band_bps: 0,
             mark_price: 0,
             tiers: MarginTiers::default(),
+            basis_mode: 0,
         },
     )
     .unwrap();
@@ -3979,6 +3980,7 @@ mod usdc_custody {
                 price_band_bps: 5_000,
                 mark_price: 0,
                 tiers: MarginTiers::default(), // one tier, max leverage 3, mmr 1/6
+                basis_mode: 0,
             },
         )
         .unwrap();
@@ -5860,4 +5862,134 @@ fn a_book_update_mid_ramp_cancels_the_ramp() {
         "book update supersedes an in-flight ramp"
     );
     assert!(mode.from_book);
+}
+
+// ── basis_mode: the per-market price2 split ──────────────────────────────────
+
+fn set_basis_mode(ctx: &mut TestCtx, mode: u8, caller: Address) -> Result<Bytes, PerpError> {
+    run_set_basis_mode(
+        &setBasisModeCall {
+            marketId: MARKET_ID,
+            mode,
+        }
+        .abi_encode(),
+        caller,
+        ctx,
+    )
+}
+
+#[test]
+fn a_market_is_born_on_the_legacy_window_basis() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    assert_eq!(
+        m.basis_mode,
+        crate::types::BASIS_MODE_WINDOW,
+        "every market, including every USD-M market, defaults to the mechanism it already had"
+    );
+}
+
+#[test]
+fn set_basis_mode_is_gated_and_validated() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+
+    let err = set_basis_mode(&mut ctx, crate::types::BASIS_MODE_EWMA, ALICE).unwrap_err();
+    assert!(format!("{err:?}").contains("not authorised"), "{err:?}");
+
+    let err = set_basis_mode(&mut ctx, 9, ADMIN).unwrap_err();
+    assert!(format!("{err:?}").contains("unknown mode"), "{err:?}");
+
+    set_basis_mode(&mut ctx, crate::types::BASIS_MODE_EWMA, ADMIN).unwrap();
+    assert_eq!(
+        storage::load_market(&mut ctx, MARKET_ID)
+            .unwrap()
+            .unwrap()
+            .basis_mode,
+        crate::types::BASIS_MODE_EWMA
+    );
+}
+
+/// The USD-M guarantee, executable: a market left on the window basis touches NEITHER the EWMA
+/// blob nor any of the new code. If this ever fails, the split has leaked.
+#[test]
+fn the_window_basis_market_never_touches_the_ewma_state() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // REAL quotes, so the per-best-quote-change sampler that feeds the legacy window runs.
+    place_order(&mut ctx, MAKER, 0, ENTRY_PRICE - 10, 1);
+    place_order(&mut ctx, MAKER, 1, ENTRY_PRICE + 10, 1);
+
+    let mut ts = 30;
+    for _ in 0..40 {
+        seed_external_index(&mut ctx, ENTRY_PRICE, ts);
+        ts += 15;
+    }
+    let ewma = storage::load_price_basis_ewma(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(ewma.last_sample_ts, 0, "EWMA state must stay untouched");
+    assert_eq!(ewma.basis_scaled, 0);
+    // And the legacy window IS still being maintained for it.
+    let window = storage::load_price_basis_window(&mut ctx, MARKET_ID).unwrap();
+    assert!(window.count > 0, "the window mechanism must still run");
+}
+
+#[test]
+fn the_ewma_basis_market_uses_the_new_mechanism_instead() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_basis_mode(&mut ctx, crate::types::BASIS_MODE_EWMA, ADMIN).unwrap();
+    storage::save_best_bid(&mut ctx, MARKET_ID, ENTRY_PRICE + 90).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, ENTRY_PRICE + 110).unwrap();
+
+    seed_external_index(&mut ctx, ENTRY_PRICE, 30);
+
+    let ewma = storage::load_price_basis_ewma(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(ewma.last_sample_ts, 30, "sampled at oracle cadence");
+    assert_eq!(
+        crate::math::effective_basis(ewma.basis_scaled, ENTRY_PRICE),
+        100,
+        "seeded at the real offset rather than decaying in from zero"
+    );
+    // The legacy index history is NOT written for this market — that blob exists only for the
+    // window mechanism, and writing it here would be state nothing reads.
+    let hist = storage::load_index_price_history(&mut ctx, MARKET_ID).unwrap();
+    assert!(hist.checkpoints.is_empty(), "no legacy history for an EWMA market");
+}
+
+#[test]
+fn an_ewma_market_with_an_empty_book_never_samples() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_basis_mode(&mut ctx, crate::types::BASIS_MODE_EWMA, ADMIN).unwrap();
+
+    let mut ts = 30;
+    for _ in 0..5 {
+        seed_external_index(&mut ctx, ENTRY_PRICE, ts);
+        ts += 15;
+    }
+    let ewma = storage::load_price_basis_ewma(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(ewma.last_sample_ts, 0, "no observation, no sample");
+}
+
+#[test]
+fn an_ewma_markets_basis_cannot_exceed_the_clamp() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_basis_mode(&mut ctx, crate::types::BASIS_MODE_EWMA, ADMIN).unwrap();
+    storage::save_best_bid(&mut ctx, MARKET_ID, ENTRY_PRICE * 5).unwrap();
+    storage::save_best_ask(&mut ctx, MARKET_ID, ENTRY_PRICE * 5 + 10).unwrap();
+
+    let mut ts = 30;
+    for _ in 0..400 {
+        seed_external_index(&mut ctx, ENTRY_PRICE, ts);
+        ts += 15;
+    }
+    let ewma = storage::load_price_basis_ewma(&mut ctx, MARKET_ID).unwrap();
+    let bound = ENTRY_PRICE as i64 * crate::math::MAX_BASIS_BPS as i64 / 10_000;
+    assert_eq!(
+        crate::math::effective_basis(ewma.basis_scaled, ENTRY_PRICE),
+        bound,
+        "price2's input is bounded however far the book goes"
+    );
 }

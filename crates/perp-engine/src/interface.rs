@@ -496,6 +496,25 @@ sol! {
         /// are NOT re-checked: an over-levered position keeps running and is only refused
         /// when it next tries to OPEN.
         function setMarginTiers(uint64 marketId, uint64[] lowerBounds, uint32[] maxLeverages) external;
+
+        /// Select which basis mechanism feeds Price 2 of this market's mark.
+        ///
+        ///   0 = the 30-second time-weighted window, sampled on every best-quote change.
+        ///       Every market is created on this and the USD-M markets stay on it — they are
+        ///       aligned to Binance here and do not move.
+        ///   1 = an oracle-cadence EWMA of `mid - index` (tau 150s, clamped to +/-300bps of the
+        ///       index). For markets whose index can come from their own book, where the window
+        ///       form's index-velocity bias and 30-second reach are both wrong.
+        ///
+        /// Per MARKET, not per selector: an equity market uses the external path on a weekday
+        /// and `updateIndexPriceFromBook` at the weekend, and switching basis formula between
+        /// them would jump price2 at exactly the handover the index ramp exists to smooth.
+        ///
+        /// Changing this on a live market is a DISCONTINUITY in price2 — the two mechanisms
+        /// carry independent state. Set it at listing time.
+        ///
+        /// Callable by admin or the market manager.
+        function setBasisMode(uint64 marketId, uint8 mode) external;
         /// Read a market's margin-tier table as the same two index-aligned arrays
         /// `setMarginTiers` takes. Reverts if the market does not exist.
         function getMarginTiers(uint64 marketId) external view returns (uint64[] lowerBounds, uint32[] maxLeverages);
@@ -976,7 +995,7 @@ sol! {
         /// Query the index-price mode for a market: whether the last accepted update came from
         /// the book, the sub-unit-resolution accumulator behind `getIndexPrice`, and the
         /// handover ramp (`rampFrom` is 0 when no ramp is in flight).
-        function getIndexMode(uint64 marketId) external view returns (bool fromBook, uint128 indexScaled, uint64 rampFrom, uint64 rampStartTs);
+        function getIndexMode(uint64 marketId) external view returns (bool fromBook, uint128 indexScaled, uint64 rampFrom, uint64 rampStartTs, uint8 basisMode);
 
         /// Query the current funding state for a market.
         /// interestRate is in getMarket.

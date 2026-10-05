@@ -10,12 +10,14 @@ pub use account::{
 pub use fee::UserFeeRates;
 pub use oracle::{
     FundingState, IndexModeState, IndexPriceHistory, IndexPriceState, PremiumIndexAccumulator,
+    PriceBasisEwma,
     PriceBasisWindow, PRICE_BASIS_WINDOW_SIZE,
 };
 pub use order::{
     CancelReason, Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side, TimeInForce,
 };
 pub use position::{
-    MarginTier, MarginTiers, Market, MarketHot, PerpPosition, DEFAULT_MAX_LEVERAGE,
+    MarginTier, MarginTiers, Market, MarketHot, PerpPosition, BASIS_MODE_EWMA,
+    BASIS_MODE_WINDOW, DEFAULT_MAX_LEVERAGE,
     MAX_LEVERAGE_HARD_CAP, MAX_MARGIN_TIERS,
 };

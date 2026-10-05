@@ -33,7 +33,7 @@ use crate::{
         getUserFeeRatesCall,
         initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
         removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
-        setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall,
+        setBasisModeCall, setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall,
         setUserFeeRatesCall,
         transferAdminCall, transferFromPerpCall, transferFromPerpSignedCall, transferToPerpCall,
         transferToPerpSignedCall, updateIndexPriceCall, updateIndexPriceFromBookCall,
@@ -48,7 +48,7 @@ use crate::{
         run_get_market_manager, run_get_oracle_address, run_get_position, run_get_symbol_config,
         run_init_admin, run_liquidate, run_remove_position_margin, run_set_leverage,
         run_set_leverage_signed, run_set_margin_tiers, run_set_market_manager,
-        run_set_oracle_address, run_transfer_admin, run_update_index_price,
+        run_set_basis_mode, run_set_oracle_address, run_transfer_admin, run_update_index_price,
         run_update_index_price_from_book, run_update_market,
         run_withdraw_insurance_fund,
     },
@@ -250,6 +250,8 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(getMarketCall::SELECTOR, (5_000, true));
         // Risk table: setter mirrors addMarket's admin-write cost; getter is a plain view.
         m.insert(setMarginTiersCall::SELECTOR, (100_000, false));
+        // Mirrors setMarginTiers: an admin load-modify-save of one Market blob.
+        m.insert(setBasisModeCall::SELECTOR, (100_000, false));
         m.insert(getMarginTiersCall::SELECTOR, (5_000, true));
         // Leverage
         //
@@ -617,6 +619,7 @@ pub fn run_perp_dex_call<H: PerpHost>(
         }
         s if s == getIndexPriceCall::SELECTOR => run_get_index_price(input_bytes, context),
         s if s == getIndexModeCall::SELECTOR => run_get_index_mode(input_bytes, context),
+        s if s == setBasisModeCall::SELECTOR => run_set_basis_mode(input_bytes, caller, context),
         s if s == getFundingStateCall::SELECTOR => run_get_funding_state(input_bytes, context),
         s if s == getAveragePremiumIndexCall::SELECTOR => {
             run_get_average_premium_index(input_bytes, context)
