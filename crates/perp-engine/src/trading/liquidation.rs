@@ -311,12 +311,23 @@ pub(crate) fn run_adl<H: PerpHost>(
         }
         // v1: skip holders with ANY resting order — an ADL fill moves their position, which
         // re-prices every order they have resting, and v1 does not want to reason about that.
-        // Asked DIRECTLY of the order lists, never proxied through "their open-order requirement
-        // is non-zero": a PURE-REDUCE order (fully absorbed by the position) requires ZERO margin,
-        // so a requirement-based proxy would let such a holder through.
-        if !storage::load_buy_orders_ref(context, user, market.market_id)?.is_empty()
-            || !storage::load_sell_orders_ref(context, user, market.market_id)?.is_empty()
-        {
+        //
+        // Read off the position we JUST loaded instead of loading both order lists. These are
+        // `Σ resting order amounts` per side, not a margin requirement — a resting entry always
+        // carries a non-zero remaining amount, so `both == 0` is EXACTLY "no resting orders", not a
+        // proxy for it. The aggregates are proven equal to a fold over the lists after every
+        // transition by `side_aggregates_are_exactly_bid_and_ask_after_every_operation`.
+        //
+        // ⚠️ The requirement-based proxy this previously warned against is a DIFFERENT quantity:
+        // `ooIM` is zero for a PURE-REDUCE order (fully absorbed by the position), so keying on it
+        // would let such a holder through. `total_*_qty` counts that order's amount like any other.
+        // `adl_skips_opposite_holder_whose_only_order_reserves_no_margin` is the discriminating
+        // test and must stay green.
+        //
+        // Saves TWO storage loads per candidate, and `run_adl` walks the whole registry once per
+        // insolvent-residual victim — so this is 2/3 of the per-candidate cost of the scan that
+        // repeats most in exactly the cascade where the sweep is already heaviest.
+        if wp.total_buy_qty != 0 || wp.total_sell_qty != 0 {
             continue;
         }
         let eq_mark =
