@@ -168,7 +168,7 @@ use primitives::{B256, U256};
 //
 // No BUSINESS behaviour changes: the golden scenario's BusinessSnapshot is UNCHANGED, field for
 // field. CHAIN change: golden re-pin + wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 28;
+pub const BLOCK_COMMITMENT_VERSION: u8 = 29;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

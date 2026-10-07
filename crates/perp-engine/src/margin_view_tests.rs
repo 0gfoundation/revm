@@ -105,6 +105,7 @@ fn add_market(
             mark_price,
             tiers: MarginTiers::default(),
             basis_mode: 0,
+            deferred_work: 0,
         },
     )
     .unwrap();

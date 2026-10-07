@@ -419,6 +419,33 @@ pub struct Market {
     /// jump price2 at exactly the handover the index ramp exists to smooth.
     #[serde(default, rename = "bm")]
     pub basis_mode: u8,
+    /// `1` when the last sweep over this market STOPPED ON A BUDGET and left work behind.
+    /// APPENDED LAST — positional msgpack.
+    ///
+    /// It is a hint for `drainDeferredWork`, not a ledger. Nothing is enqueued anywhere: both
+    /// sweeps re-derive their candidates from scratch every run (the position registry, the
+    /// out-of-band price prefix), so this bit only answers "is it worth looking", never "look
+    /// here".
+    ///
+    /// # It is deliberately CONSERVATIVE IN ONE DIRECTION ONLY
+    ///
+    /// `1` can be stale-high: a budget consumed exactly as the work finished sets it, and the next
+    /// drain finds nothing and clears it. One wasted call, no harm.
+    ///
+    /// `0` can be stale-low, and that is the case that matters. Work appears WITHOUT any budget
+    /// break — funding accrual alone pushes a position under maintenance between oracle ticks, with
+    /// no mark move anywhere. So a `0` is NOT a proof that there is nothing to do.
+    ///
+    /// That asymmetry is only acceptable because the drain is ADDITIVE: the sweeps still run inside
+    /// every `updateIndexPrice`, so a false `0` degrades to exactly today's behaviour — the work
+    /// waits for the next oracle tick — rather than being dropped. **Do not make this bit the sole
+    /// trigger.**
+    ///
+    /// Written ONLY on transition. The oracle path rewrites `Market` every update anyway
+    /// (`save_mark_price` goes through `mutate_market`), so the saving is on the drain path, where
+    /// a no-op call must cost one read and nothing else.
+    #[serde(default, rename = "dw")]
+    pub deferred_work: u8,
 }
 
 /// [`Market::basis_mode`]: the legacy 30-second time-weighted window. Default.
@@ -562,6 +589,9 @@ mod tests {
             mark_price: 100,
             tiers: MarginTiers::default(),
             basis_mode: 0,
+            // Non-zero deliberately: the positional codec appends this LAST, and a `0` here would
+            // round-trip even if the field were dropped from the encoding entirely.
+            deferred_work: 1,
         };
         m.tiers =
             MarginTiers::from_tiers(&[tier(0, 3), tier(50_000, 2), tier(250_000, 1)]).unwrap();

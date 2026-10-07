@@ -1413,6 +1413,7 @@ mod tests {
             mark_price: 65_000_00,
             tiers: MarginTiers::default(),
             basis_mode: 0,
+            deferred_work: 0,
         }
     }
 

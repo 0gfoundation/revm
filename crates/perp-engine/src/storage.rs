@@ -1762,6 +1762,21 @@ pub fn save_mark_price<H: PerpHost>(
     mutate_market(context, market_id, |m| m.mark_price = price)
 }
 
+/// Set [`crate::types::Market::deferred_work`] — the "a sweep stopped on its budget" hint.
+///
+/// A named setter rather than exposing `mutate_market`, matching `save_mark_price`: the field is a
+/// one-byte flag with one writer (`risk::run_deferred_sweeps`), and that writer is responsible for
+/// calling this ONLY when the value actually changes. Writing `0` over `0` would turn a no-op
+/// `drainDeferredWork` poll — the common case for a keeper — into a storage write per call.
+pub fn save_deferred_work<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    deferred: bool,
+) -> Result<(), PerpError> {
+    let v = u8::from(deferred);
+    mutate_market(context, market_id, |m| m.deferred_work = v)
+}
+
 // ── Open interest ─────────────────────────────────────────────────────────────
 
 pub fn load_open_interest<H: PerpHost>(
@@ -2951,6 +2966,7 @@ mod size_probe_tests {
             mark_price: 0,
             tiers: MarginTiers::default(),
             basis_mode: 0,
+            deferred_work: 0,
         };
         let buf = encode(&market).unwrap();
         println!("Market: {} bytes", buf.len());
@@ -3177,6 +3193,7 @@ mod encoding_roundtrip_tests {
                 mark_price: u64::MAX,
                 tiers: MarginTiers::default(),
                 basis_mode: 0,
+                deferred_work: 0,
             },
         );
     }

@@ -14,7 +14,7 @@ use crate::{
         getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
         getFundingStateReturn, getIndexModeCall, getIndexModeReturn, getIndexPriceCall,
         getIndexPriceReturn, getInsuranceFundCall,
-        getMarginTiersCall, getMarginTiersReturn, getMarkPriceCall, getMarketCall,
+        drainDeferredWorkCall, getMarginTiersCall, getMarginTiersReturn, getMarkPriceCall, getMarketCall,
         getMarketManagerAddressCall, getMarketReturn, getOracleAddressCall, getPositionCall,
         getPositionReturn, getSymbolConfigCall, getSymbolConfigReturn, initAdminCall,
         liquidateCall, removePositionMarginCall, setLeverageCall, setLeverageSignedCall,
@@ -196,6 +196,8 @@ pub fn run_add_market<H: PerpHost>(
         // opted into the EWMA basis afterwards by `setBasisMode`, for the same reason the tier
         // table is set by `setMarginTiers`: `addMarket` is already 14 args.
         basis_mode: crate::types::BASIS_MODE_WINDOW,
+        // A brand-new market has no book and no positions, so no sweep has anything to defer.
+        deferred_work: 0,
         // `addMarket` is deliberately NOT grown to carry the tier table (it is already
         // 14 args with a fixed-offset signed layout). Every market is born single-tier
         // `[{0, DEFAULT_MAX_LEVERAGE}]` — maintenance rate 1/6, leverage cap 3 — and is
@@ -1155,7 +1157,7 @@ fn run_liquidation_sweep<H: PerpHost>(
     market_id: u64,
     market: &crate::types::Market,
     mark_price: u64,
-) -> Result<(), PerpError> {
+) -> Result<bool, PerpError> {
     // Snapshot the registry (owned Vec, deterministic insertion order). Liquidations
     // mutate the live registry via save_position, but iterating the snapshot is stable;
     // a candidate already closed by an earlier cascade in this sweep resolves to
@@ -1167,7 +1169,11 @@ fn run_liquidation_sweep<H: PerpHost>(
     let mut adl_budget = ADL_BUDGET_PER_UPDATE;
     for user in candidates {
         if liquidated >= MAX_LIQUIDATIONS_PER_UPDATE {
-            break;
+            // Stopped on the cap with at least one candidate unexamined. Conservative: that
+            // candidate may well be healthy, so this can report deferral where none exists — the
+            // drain then finds nothing and clears the bit. Reporting a FALSE NEGATIVE here would be
+            // the harmful direction, and the `break` cannot produce one.
+            return Ok(true);
         }
         // commit-only (#23): healthy candidates are write-free (funding is computed in memory
         // and only applied when liquidatable), so the checkpoint only balances EVM-side state.
@@ -1198,7 +1204,53 @@ fn run_liquidation_sweep<H: PerpHost>(
             }
         }
     }
-    Ok(())
+    // Walked every candidate without hitting the cap.
+    //
+    // ⚠️ That is NOT "there is nothing liquidatable" — a victim whose ADL budget ran out keeps an
+    // open position and still returns `Liquidated`, so it consumed a slot without being resolved
+    // and will be back next sweep. This function reports CAP PRESSURE, which is what the drain bit
+    // is for; it does not certify the market is clean.
+    Ok(false)
+}
+
+/// The two capped sweeps, in order, plus the `Market::deferred_work` bookkeeping they share.
+///
+/// Both the oracle path and [`run_drain_deferred_work`] go through here, so the ORDER and the bit's
+/// meaning are defined once. Returns whether work was left behind.
+///
+/// # The order is not arbitrary
+///
+/// The band GC runs FIRST. Every level it removes was already unmatchable to a liquidation close
+/// banded on the same mark, so it cannot reduce what the close absorbs or flip a book-absorbed
+/// close into an insurance-fund or ADL one. What it does change is the BBO — and running first is
+/// what makes that safe: nothing has touched the book yet in this call, so the `best_bid`/`best_ask`
+/// cache is provably live, which is the documented precondition of the cheap
+/// [`crate::trading::remove_from_book_after_cancel`] variant. Running after the sweep would hand it
+/// a cache rewritten by an arbitrary number of matches and mid-match auto-cancels.
+///
+/// That holds identically on the drain path, which is why the drain can reuse this wholesale: a
+/// drain transaction has touched nothing either.
+///
+/// # The bit is written ONLY on transition
+///
+/// A no-op drain (bit already `0`, both sweeps clean) must cost one `Market` read and NOTHING else;
+/// writing `0` over `0` would turn the cheap keeper poll into a per-call storage write. On the
+/// oracle path the saving is nominal — `save_mark_price` re-emits the `Market` blob every update
+/// anyway — but the rule belongs here rather than at one call site.
+fn run_deferred_sweeps<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    market: &Market,
+    mark_price: u64,
+) -> Result<bool, PerpError> {
+    let gc_deferred = run_out_of_band_expiry_sweep(context, market_id, market)?;
+    let sweep_deferred = run_liquidation_sweep(context, market_id, market, mark_price)?;
+    let deferred = gc_deferred || sweep_deferred;
+
+    if (market.deferred_work != 0) != deferred {
+        storage::save_deferred_work(context, market_id, deferred)?;
+    }
+    Ok(deferred)
 }
 
 // ── Out-of-band resting-order expiry (band GC) ─────────────────────────────────
@@ -1299,7 +1351,7 @@ fn run_out_of_band_expiry_sweep<H: PerpHost>(
     context: &mut H,
     market_id: u64,
     market: &Market,
-) -> Result<(), PerpError> {
+) -> Result<bool, PerpError> {
     let (mark_upper, mark_lower) =
         crate::math::mark_band_bounds(market.mark_price, market.price_band_bps);
     let mut budget = MAX_BAND_EXPIRIES_PER_UPDATE;
@@ -1330,6 +1382,10 @@ fn run_out_of_band_expiry_sweep<H: PerpHost>(
         }
         expire_level(context, market_id, Side::Sell, price, market, &mut budget)?;
     }
+    // Remember whether the ASK side exhausted the budget: the bid collect below reads the budget
+    // that is left, so a bid prefix that exists but was never collected would otherwise look like
+    // "no bid work" at the end.
+    let asks_exhausted_budget = budget == 0;
 
     // Bids DESCEND (the index is ascending, walked in reverse), so the stranded prefix is the top:
     // everything strictly above the upper edge.
@@ -1350,7 +1406,16 @@ fn run_out_of_band_expiry_sweep<H: PerpHost>(
         expire_level(context, market_id, Side::Buy, price, market, &mut budget)?;
     }
 
-    Ok(())
+    // Budget gone ⇒ at least one side was cut short. Conservative in the same direction as the
+    // liquidation sweep: a budget spent exactly as the last stranded order went sets this, and the
+    // next drain finds nothing and clears the bit.
+    //
+    // ⚠️ `asks_exhausted_budget` is why this is not just `budget == 0` evaluated once at the end:
+    // the ask side can consume everything, leaving the bid prefix uncollected AND the bid loop
+    // never entered. Both roads lead to `budget == 0` here, which is the point — but the variable
+    // records that the bid side was never even LOOKED at, which is the starvation shape worth
+    // keeping visible in the code rather than only in a comment.
+    Ok(budget == 0 || asks_exhausted_budget)
 }
 
 /// Expire the live orders at ONE out-of-band price level, in FIFO order, until `budget` runs out.
@@ -2223,9 +2288,7 @@ fn apply_index_price_update<H: PerpHost>(
     // what the close absorbs — while the BBO cache is still provably live, which is what lets the
     // removal use the cheap cancel-path variant and get its top-of-book invariant check for free.
     // Capped; see MAX_BAND_EXPIRIES_PER_UPDATE.
-    run_out_of_band_expiry_sweep(context, market_id, &market)?;
-
-    run_liquidation_sweep(context, market_id, &market, mark_price)?;
+    run_deferred_sweeps(context, market_id, &market, mark_price)?;
 
     // ── 6. Emit events ────────────────────────────────────────────────────────
     // ONE price event per update. This used to be `IndexPriceUpdated` immediately followed by
@@ -2357,6 +2420,39 @@ pub fn run_get_funding_state<H: PerpHost>(
 }
 
 /// `getAveragePremiumIndex(uint64 marketId) returns (int64 avgPremiumIndex, uint64 sampleCount)`
+/// `drainDeferredWork(uint64 marketId) returns (bool moreRemaining)`
+///
+/// PERMISSIONLESS. See the ABI doc for why it exists and what it deliberately does not do.
+///
+/// The fast path — `Market.deferred_work == 0` — is one market read and a return, which is what
+/// makes a per-block keeper poll affordable. It is NOT gated on a timestamp: being able to run more
+/// often than `priceUpdateInterval` is the entire point.
+pub fn run_drain_deferred_work<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = drainDeferredWorkCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("drainDeferredWork: invalid calldata"))?;
+
+    let market = storage::load_market_ref(context, args.marketId)?
+        .ok_or_else(|| perp_err("drainDeferredWork: unknown market"))?;
+
+    if market.deferred_work == 0 {
+        return Ok(Bytes::from(drainDeferredWorkCall::abi_encode_returns(
+            &false,
+        )));
+    }
+
+    // `market.mark_price` is the mark the last oracle tick stored and nothing since has moved it,
+    // so the band centre and the maintenance check are the ones the interrupted sweep was using.
+    // No re-load dance is needed here, unlike `apply_index_price_update`, precisely because this
+    // call does not write a new mark first.
+    let mark_price = market.mark_price;
+    let more = run_deferred_sweeps(context, args.marketId, &market, mark_price)?;
+
+    Ok(Bytes::from(drainDeferredWorkCall::abi_encode_returns(&more)))
+}
+
 pub fn run_get_average_premium_index<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,

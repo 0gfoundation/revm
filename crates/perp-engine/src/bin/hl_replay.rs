@@ -75,6 +75,7 @@ fn market() -> Market {
         mark_price: 0,
         tiers: MarginTiers::default(),
         basis_mode: 0,
+        deferred_work: 0,
     }
 }
 

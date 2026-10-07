@@ -102,6 +102,7 @@ fn setup(ctx: &mut TestCtx) {
             mark_price: 0,
             tiers: MarginTiers::default(),
             basis_mode: 0,
+            deferred_work: 0,
         },
     )
     .unwrap();
@@ -421,6 +422,7 @@ fn setup_banded(ctx: &mut TestCtx, band_bps: u32) {
             mark_price: 0,
             tiers: MarginTiers::default(),
             basis_mode: 0,
+            deferred_work: 0,
         },
     )
     .unwrap();
@@ -2169,6 +2171,7 @@ fn margin_uses_market_price_decimals() {
             mark_price: 0,
             tiers: MarginTiers::default(),
             basis_mode: 0,
+            deferred_work: 0,
         },
     )
     .unwrap();
@@ -6281,6 +6284,7 @@ mod perf {
                 mark_price: 0,
                 tiers: MarginTiers::default(),
                 basis_mode: 0,
+                deferred_work: 0,
             },
         )
         .unwrap();
@@ -6843,7 +6847,7 @@ mod golden {
     /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
     /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xac26f7a55b60e4778aef2f0f499885dbbdb20a3b52617c4b4b55cbec4ae3f51c");
+        b256!("0x64c0882dad7b59569090d886b64c10b537eb1df278f4b0d22ba6ecfe94728c75");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -11535,6 +11539,7 @@ mod user_market_index {
             mark_price: 0,
             tiers: MarginTiers::default(),
             basis_mode: 0,
+            deferred_work: 0,
         }
     }
 
@@ -12536,6 +12541,7 @@ mod derived_ooim_divergence {
             mark_price: mark,
             tiers,
             basis_mode: 0,
+            deferred_work: 0,
         }
     }
 
@@ -12973,6 +12979,7 @@ mod assuming_price {
                 mark_price: 100_000,
                 tiers: MarginTiers::default(),
                 basis_mode: 0,
+                deferred_work: 0,
             },
         )
         .unwrap();
@@ -13555,6 +13562,7 @@ mod resting_notional_stream {
                 mark_price: 100_000,
                 tiers: MarginTiers::default(),
                 basis_mode: 0,
+                deferred_work: 0,
             },
         )
         .unwrap();

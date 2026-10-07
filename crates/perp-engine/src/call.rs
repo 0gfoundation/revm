@@ -24,7 +24,8 @@ use crate::{
         batchCancelOrdersSignedCall, batchPlaceOrdersCall, batchPlaceOrdersSignedCall,
         cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
         getAccountCall, getAccountMarginCall, getAdminCall, getApiKeyCall, getApiKeysCall,
-        getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall, getFundingStateCall,
+        drainDeferredWorkCall, getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall,
+        getFundingStateCall,
         getIndexModeCall, getIndexPriceCall, getInsuranceFundCall, getMarginTiersCall,
         getMarkPriceCall, getMarketCall,
         getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
@@ -41,7 +42,8 @@ use crate::{
     },
     margin_view::{run_get_account_margin, run_get_position_risk},
     risk::{
-        run_add_market, run_add_position_margin, run_deposit_insurance_fund, run_get_admin,
+        run_add_market, run_add_position_margin, run_deposit_insurance_fund,
+        run_drain_deferred_work, run_get_admin,
         run_get_average_premium_index, run_get_funding_state, run_get_index_mode,
         run_get_index_price,
         run_get_insurance_fund, run_get_margin_tiers, run_get_mark_price, run_get_market,
@@ -405,6 +407,12 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // recompute, premium accumulation, band expiry, liquidation sweep), and the book path
         // trades one external-price validation for one MarketHot read plus one small blob.
         m.insert(updateIndexPriceFromBookCall::SELECTOR, (50_000, false));
+        // Same 50_000 as `updateIndexPrice`, for the same reason: it runs the SAME two sweeps and
+        // nothing else, so it cannot cost more than the call it is draining after. Permissionless,
+        // so the subsidy is open to anyone — bounded because the work is bounded (the sweep caps)
+        // AND because every unit of it is permanent progress: a spammer calling it in a loop drains
+        // the backlog and then pays 50_000 for a market read and a `false`.
+        m.insert(drainDeferredWorkCall::SELECTOR, (50_000, false));
         m.insert(getIndexPriceCall::SELECTOR, (5_000, true));
         m.insert(getIndexModeCall::SELECTOR, (5_000, true));
         m.insert(getFundingStateCall::SELECTOR, (5_000, true));
@@ -617,6 +625,7 @@ pub fn run_perp_dex_call<H: PerpHost>(
         s if s == updateIndexPriceFromBookCall::SELECTOR => {
             run_update_index_price_from_book(input_bytes, caller, context)
         }
+        s if s == drainDeferredWorkCall::SELECTOR => run_drain_deferred_work(input_bytes, context),
         s if s == getIndexPriceCall::SELECTOR => run_get_index_price(input_bytes, context),
         s if s == getIndexModeCall::SELECTOR => run_get_index_mode(input_bytes, context),
         s if s == setBasisModeCall::SELECTOR => run_set_basis_mode(input_bytes, caller, context),

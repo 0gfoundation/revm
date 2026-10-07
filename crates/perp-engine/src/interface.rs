@@ -478,6 +478,45 @@ sol! {
             int64  interestRate,
             uint32 liquidationFeeRateBps
         );
+        /// Drain the work a previous sweep left behind — the band GC and the liquidation sweep,
+        /// nothing else. **PERMISSIONLESS**: any caller, no admin or oracle role.
+        ///
+        /// # Why it exists
+        ///
+        /// Both sweeps are capped per run (50 liquidations, 128 ADL fills, 64 band expiries) and
+        /// their overflow is deferred, not recorded — the next run re-derives its candidates from
+        /// scratch. But they only run inside `updateIndexPrice`, which is itself rate-limited to one
+        /// effective call per `priceUpdateInterval`, so a backlog drained at most once per interval
+        /// however deep it was. This decouples the two: the backlog can be drained every block.
+        ///
+        /// # What it does NOT do
+        ///
+        /// No index price, no mark recompute, no premium-index sample, no funding, no
+        /// `MarkPriceUpdated`. Running those a second time between oracle ticks would double-count
+        /// the funding epoch. It reuses the mark already stored, which has not moved since the tick
+        /// that set it — so the band centre and the maintenance check are the same ones the sweep
+        /// would have used had it not run out of budget.
+        ///
+        /// # Returns
+        ///
+        /// `moreRemaining` — true when a sweep stopped on its budget again, i.e. call again. A
+        /// keeper can loop on this without re-reading state.
+        ///
+        /// # Cost
+        ///
+        /// When `Market.deferred_work` is 0 this is one market read and a return — that is the
+        /// common case and what makes polling it per block affordable. When it is 1 the call does
+        /// the same bounded work a sweep does, and because every unit of that budget is permanent
+        /// progress, repeated calls cannot be spun for unbounded work: they drain the backlog and
+        /// then become no-ops.
+        ///
+        /// ⚠️ A `false` return is NOT a proof the market is clean. The flag only records that a
+        /// sweep hit a CAP; work can appear with no cap ever being hit — funding accrual alone
+        /// pushes a position under maintenance between oracle ticks. That is safe only because this
+        /// is ADDITIVE: the sweeps still run inside every `updateIndexPrice`, so anything this
+        /// misses waits for the next tick exactly as it does today.
+        function drainDeferredWork(uint64 marketId) external returns (bool moreRemaining);
+
         /// Query the current average premium index for the active funding epoch.
         function getAveragePremiumIndex(uint64 marketId) external view returns (int64 avgPremiumIndex, uint64 sampleCount);
 
