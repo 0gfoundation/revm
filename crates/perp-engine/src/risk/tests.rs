@@ -5993,3 +5993,108 @@ fn an_ewma_markets_basis_cannot_exceed_the_clamp() {
         "price2's input is bounded however far the book goes"
     );
 }
+
+
+// ── MAX_LIQUIDATIONS_PER_UPDATE ──────────────────────────────────────────────
+//
+// The 50-cap had NO test at all: `grep MAX_LIQUIDATIONS_PER_UPDATE crates/` found only its
+// definition, its use, and a doc link. Its two siblings are covered
+// (`MAX_BAND_EXPIRIES_PER_UPDATE` by `the_cap_is_on_orders_and_a_second_update_finishes_the_job`,
+// the distinct-maker cap by `liquidation_close_stops_at_the_maker_account_cap`), and the whole
+// deferral story — "overflow defers to the next update, nothing is permanently missed" — rests on
+// behaviour nothing exercised.
+#[cfg(test)]
+mod liquidation_cap {
+    use super::*;
+
+    /// 55 identical 5x longs, each its own address so each is its own registry entry. Seeded in a
+    /// deterministic order so the test can also speak about WHICH ones get done.
+    fn seed_underwater_longs(ctx: &mut TestCtx, n: u8) -> Vec<Address> {
+        (1..=n)
+            .map(|i| {
+                let user = Address::from([i; 20]);
+                seed_position_account(ctx, user, QTY, -ENTRY_VALUE, MARGIN, 5, 0);
+                user
+            })
+            .collect()
+    }
+
+    fn still_open(ctx: &mut TestCtx, users: &[Address]) -> usize {
+        users
+            .iter()
+            .filter(|u| storage::load_position(ctx, **u, MARKET_ID).unwrap().amount != 0)
+            .count()
+    }
+
+    /// ONE update liquidates exactly 50 and leaves the rest untouched; a SECOND update finishes
+    /// them. The deferral is the documented behaviour and it had no coverage.
+    #[test]
+    fn the_cap_defers_the_overflow_to_the_next_update() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let users = seed_underwater_longs(&mut ctx, 55);
+        assert_eq!(still_open(&mut ctx, &users), 55);
+
+        // $100 -> $85: every one of them is below maintenance but still solvent.
+        oracle_update_at(&mut ctx, 8_500, 31);
+        assert_eq!(
+            still_open(&mut ctx, &users),
+            5,
+            "exactly MAX_LIQUIDATIONS_PER_UPDATE (50) liquidated in one update"
+        );
+
+        // A second update at the SAME price — the mark does not have to move again. This is the
+        // part worth pinning: nothing was stored as pending, the registry is simply re-scanned.
+        oracle_update_at(&mut ctx, 8_500, 61);
+        assert_eq!(still_open(&mut ctx, &users), 0, "the overflow is drained, not lost");
+    }
+
+    /// ⚠️ WHICH 50 is POSITIONAL, not severity-ranked: the sweep snapshots the registry and walks
+    /// it in INSERTION order from index 0 every update, with no cursor and no rotation. Pinned
+    /// because it is a fairness property nothing else states, and because any future rotation /
+    /// severity ordering must consciously break this test rather than silently change behaviour.
+    #[test]
+    fn the_first_fifty_by_registry_order_are_the_ones_liquidated() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let users = seed_underwater_longs(&mut ctx, 55);
+        assert_eq!(
+            storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
+            users,
+            "registry is insertion-ordered — the premise of this test"
+        );
+
+        oracle_update_at(&mut ctx, 8_500, 31);
+
+        for (i, u) in users.iter().enumerate() {
+            let open = storage::load_position(&mut ctx, *u, MARKET_ID).unwrap().amount != 0;
+            assert_eq!(
+                open,
+                i >= 50,
+                "registry index {i} should {} be open",
+                if i >= 50 { "" } else { "NOT" }
+            );
+        }
+    }
+
+    /// Under the cap, nothing is deferred — guards against a future change that defers work it did
+    /// not need to, which the test above could not distinguish from correct behaviour.
+    #[test]
+    fn under_the_cap_one_update_clears_everything() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let users = seed_underwater_longs(&mut ctx, 49);
+        oracle_update_at(&mut ctx, 8_500, 31);
+        assert_eq!(still_open(&mut ctx, &users), 0);
+    }
+
+    fn oracle_update_at(ctx: &mut TestCtx, index: u64, ts: u64) {
+        run_update_index_price(
+            &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: index, timestamp: ts }
+                .abi_encode(),
+            ADMIN,
+            ctx,
+        )
+        .unwrap();
+    }
+}
