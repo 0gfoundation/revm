@@ -1311,6 +1311,18 @@ fn run_out_of_band_expiry_sweep<H: PerpHost>(
         .iter()
         .copied()
         .take_while(|p| (*p as u128) < mark_lower)
+        // Bounded by the BUDGET, not by the prefix length. Without it a mark gap that strands
+        // 10_000 levels walks and allocates all 10_000 on EVERY update, forever, to remove 64.
+        //
+        // ⚠️ This is only EXACT — never under-using the budget — because a price in the index
+        // always has at least one LIVE order: `detach_order_from_level` reports `emptied` and
+        // `remove_from_book_after_cancel` drops the price on that signal, so a level whose live
+        // count reached 0 is gone from the index entirely (its stale ids go with the blob,
+        // `decr_level_count` at storage.rs:2251). Each collected level therefore expires >= 1
+        // order and consumes >= 1 budget, so `budget` levels is a true upper bound on how many can
+        // be useful. If that invariant were ever relaxed — a price left in the index with zero live
+        // orders — this `take` would start leaving budget unspent on a stale-heavy prefix.
+        .take(budget as usize)
         .collect();
     for price in doomed_asks {
         if budget == 0 {
@@ -1326,6 +1338,10 @@ fn run_out_of_band_expiry_sweep<H: PerpHost>(
         .rev()
         .copied()
         .take_while(|p| (*p as u128) > mark_upper)
+        // Same bound, and it reads the budget REMAINING after the ask side — so when the asks
+        // consumed everything this collects nothing at all rather than materialising a bid prefix
+        // the loop below would immediately `break` out of.
+        .take(budget as usize)
         .collect();
     for price in doomed_bids {
         if budget == 0 {
@@ -1355,6 +1371,13 @@ fn expire_level<H: PerpHost>(
     budget: &mut u32,
 ) -> Result<(), PerpError> {
     // Snapshot the FIFO ids: each removal below mutates this level's blob.
+    //
+    // ⚠️ NOT bounded by `budget`, deliberately — unlike the price-prefix collects in the caller.
+    // Stale and terminal ids are skipped WITHOUT consuming budget (see the doc above), so the
+    // number of ids this loop must walk to spend one unit of budget is unbounded by the budget
+    // itself. Truncating here to `budget` would silently stop at the first `budget` ids and leave a
+    // level whose front is all stale permanently un-drained — the exact non-convergence the
+    // free-stale-skip rule exists to prevent.
     let ids: Vec<[u8; 32]> = match side {
         Side::Buy => storage::load_bid_level_arc(context, market_id, price)?
             .ids
