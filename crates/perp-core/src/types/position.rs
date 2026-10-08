@@ -135,11 +135,11 @@ pub struct PerpPosition {
     /// The sum of exactly the quantity `PositionChanged.realizedPnl` reports — gross close PnL,
     /// **excluding** released margin, trading fees and funding, matching what R15 measured on
     /// mainnet (`cr` was the rolling sum of `rp` over 10 fills with no residual). Every accumulation
-    /// site is therefore a place a closing leg's PnL is computed, and there are exactly two:
-    /// `trading::settlement::apply_position_fill` (taker, maker, and both ADL legs) and
-    /// `trading::liquidation::settle_liquidation_residual_at_mark_price` (the residual closed at
-    /// mark with no counterparty). An opening leg contributes 0, so a flip only accrues its closing
-    /// half.
+    /// site is therefore a place a closing leg's PnL is computed, and there is exactly ONE:
+    /// `trading::settlement::apply_position_fill` (taker, maker, and both ADL legs). An opening leg
+    /// contributes 0, so a flip only accrues its closing half. (A second site existed while a
+    /// solvent residual could be closed at mark with no counterparty; every residual is an ADL fill
+    /// now, so it is gone.)
     ///
     /// Accumulated with `checked_add`, never saturating: a silently clamped lifetime total is a
     /// number that reads as data and is not, and reverting is the honest failure. `i64` is ample —

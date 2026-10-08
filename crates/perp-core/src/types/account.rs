@@ -86,8 +86,8 @@ pub struct UserAccount {
     ///   NETS against it automatically rather than landing in a fresh spendable bucket.
     /// * **It is NOT double-counted with the Insurance Fund.** Disjoint slices: the wallet only ever
     ///   goes negative to pay the FEE RECIPIENT, and the fund absorbs only what a realized loss
-    ///   exceeded the position's margin by (`apply_position_fill` /
-    ///   `settle_liquidation_residual_at_mark_price` never debit a wallet — isolated margin).
+    ///   exceeded the position's margin by (`apply_position_fill` never debits a wallet —
+    ///   isolated margin).
     ///
     /// # The custody identity
     ///

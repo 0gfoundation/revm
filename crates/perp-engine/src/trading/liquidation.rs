@@ -3,6 +3,7 @@ use crate::host::PerpHost;
 use primitives::{Address, FixedBytes, Log};
 
 use super::match_order;
+use crate::types::CancelReason;
 use crate::{
         errors::{perp_err, perp_invariant_err},
     events::emit_position_changed,
@@ -145,121 +146,13 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
     Ok(remaining)
 }
 
-/// Closes the residual position (the part the orderbook could not absorb) at mark price.
-///
-/// Called when `execute_liquidation_market_order` returns `remaining > 0`. The position
-/// still holds the proportional `margin` and `v_quote_balance` for the residual. This
-/// function applies those to the wallet and zeroes the position.
-///
-/// Isolated margin: the loss is contained to the position's margin; any shortfall
-/// beyond it is bad debt routed directly to the Insurance Fund here. The wallet is
-/// never debited by the residual loss (only credited if the residual is solvent).
-pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
-    context: &mut H,
-    user: Address,
-    market: &Market,
-    liquidation_side: Side,
-    mark_price: u64,
-) -> Result<(), PerpError> {
-    let mut pos = storage::load_position(context, user, market.market_id)?;
-    let mut account = storage::load_account(context, user)?;
-
-    let residual_value = calc_value(
-        mark_price,
-        pos.amount.unsigned_abs(),
-        market.base_decimals,
-        market.price_decimals,
-    )?;
-    let residual_value_i64 = checked_u64_to_i64(residual_value, "liquidation: residual value")?;
-
-    // Selling a long → receive quote (+); buying a short → pay quote (-).
-    let close_quote_delta = if liquidation_side == Side::Sell {
-        residual_value_i64
-    } else {
-        -residual_value_i64
-    };
-
-    let closed_quantity = pos.amount.unsigned_abs();
-    let realized_pnl = pos
-        .v_quote_balance
-        .checked_add(close_quote_delta)
-        .ok_or_else(|| perp_err("liquidation: residual realized PnL overflow"))?;
-    let settlement_credit = pos
-        .margin
-        .checked_add(realized_pnl)
-        .ok_or_else(|| perp_err("liquidation: residual close credit overflow"))?;
-
-    // Isolated margin: a profitable/solvent residual returns equity to the wallet; an
-    // insolvent residual (loss exceeds the position's remaining margin) does NOT debit
-    // the wallet — the shortfall is bad debt routed directly to the Insurance Fund.
-    let bad_debt = if settlement_credit >= 0 {
-        account.perp_wallet_balance = account
-            .perp_wallet_balance
-            .saturating_add(settlement_credit);
-        0u64
-    } else {
-        settlement_credit.unsigned_abs()
-    };
-
-    // `cr`: the second and last accumulation site (the first is
-    // `settlement::apply_position_fill`, which every counterparty-matched close goes through).
-    // This close has no counterparty — the protocol values what the book could not absorb at mark
-    // — so it computes its own `realized_pnl` above and must credit it here or a liquidated
-    // user's lifetime total would silently omit its residual. `checked_add` for the same reason as
-    // there: a clamped total is worse than a revert.
-    pos.cumulative_realized_pnl = pos
-        .cumulative_realized_pnl
-        .checked_add(realized_pnl)
-        .ok_or_else(|| perp_err("liquidation: cumulative realized PnL overflow"))?;
-    // ⚠️ `amount`/`v_quote_balance`/`margin` go to zero; `cumulative_realized_pnl` deliberately
-    // does NOT. It is a lifetime statistic that has to survive the position being reopened — see
-    // the field's own note in `types::PerpPosition`.
-    pos.amount = 0;
-    pos.v_quote_balance = 0;
-    pos.margin = 0;
-
-    // `Adjustment`: the residual is closed at MARK with no counterparty and no order — nothing was
-    // matched, the protocol simply valued what the book could not absorb and zeroed the position.
-    // (Not `InsuranceClear`, even though the insolvent branch routes a shortfall to the fund: the
-    // solvent branch returns equity to the wallet and touches no fund at all, and one publish site
-    // reporting two different reasons for two branches of the same mechanism would make the field
-    // harder to read, not easier. The `InsuranceFundChanged` / `InsuranceFundDepleted` rows
-    // immediately before this group already say whether the fund was involved.)
-    storage::save_position(
-        context,
-        user,
-        market.market_id,
-        &pos,
-        AccountUpdateReason::Adjustment,
-    )?;
-    storage::save_account(context, user, account, AccountUpdateReason::Adjustment)?;
-
-    super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
-    // ── The residual close's `ACCOUNT_UPDATE` group: header, then the one position row ──────────
-    //
-    // It has to come AFTER `absorb_bad_debt_into_insurance_fund`, whose `InsuranceFundChanged` /
-    // `InsuranceFundDepleted` rows would otherwise terminate the group and orphan the row below
-    // (`crate::events`). Off the SETTLED store: both writes above have landed, so this is literally
-    // the post-close account.
-    //
-    // The mark is cleared here, and `liquidate_position` may legitimately re-mark this user
-    // afterwards by charging its clearance fee (`save_account`) — the drain then publishes a second,
-    // 0-position group for the settled end state. Two pushes for two economic events; that is the
-    // fail-safe direction and it is what Binance does for a liquidation too.
-    storage::publish_account_snapshot_now(context, user, AccountUpdateReason::Adjustment)?;
-    // `market.mark_price == mark_price` here: `liquidate_position` is the only caller and it takes
-    // both from the same re-loaded `Market` (its own `debug_assert_eq!` pins that), so valuing the
-    // log at `market`'s mark is valuing it at the mark this close settled against.
-    emit_position_changed(context, user, market, &pos, realized_pnl, closed_quantity)?;
-
-    Ok(())
-}
-
-/// Auto-deleveraging (ADL, scheme X): close a liquidated position's INSOLVENT
-/// book-unfillable residual as a forced trade against opposite-side holders at the
-/// residual's bankruptcy price `P_b`. No Insurance Fund, no mint: the loser closes at
-/// the price where its own equity is exactly 0 (no bad debt), and each opposite holder
-/// that can absorb at `P_b` without going insolvent gives up exactly its share of the
+/// Auto-deleveraging (ADL, scheme X): close a liquidated position's book-unfillable
+/// residual as a forced trade against opposite-side holders. **Every** residual comes
+/// here, solvent or not — only the price differs (mark vs the bankruptcy price `P_b`),
+/// which is what makes "a position is only ever closed against another position" an
+/// unconditional invariant. No Insurance Fund, no mint: the loser closes at a price
+/// where it realizes no bad debt, and each opposite holder that can absorb at that
+/// price without going insolvent gives up exactly its share of the
 /// shortfall. Both legs of every fill use the SAME single-floored `calc_value(P_b,
 /// take)`, so Σ vQuote and Σ amount are conserved (a real trade, not a synthetic close).
 ///
@@ -267,10 +160,11 @@ pub(crate) fn settle_liquidation_residual_at_mark_price<H: PerpHost>(
 /// for the whole `updateIndexPrice`). Any residual left unclosed (budget exhausted, or
 /// not enough deeply-in-profit opposite holders) stays open and is re-swept next update.
 ///
-/// v1 simplifications: (a) opposite holders holding ANY resting order (asked of the order
-/// lists directly) are excluded, so no flip-aware reservation recompute / order
-/// auto-cancel is needed — the residual's natural counterparties are the off-book
-/// holders anyway; (b) opposite holders that are themselves below water are skipped
+/// Opposite holders with resting orders ARE eligible; their open orders in this market are
+/// cancelled as part of the fill, which is both what Binance does and what removes the
+/// need for any flip-aware reservation recompute (there is nothing left to re-price).
+///
+/// v1 simplification: opposite holders that are themselves below water are skipped
 /// (the sweep liquidates them), never forced into bad debt; cascades from ADL'ing a
 /// thin winner resolve on a later sweep, not by in-`run_adl` recursion.
 pub(crate) fn run_adl<H: PerpHost>(
@@ -286,16 +180,47 @@ pub(crate) fn run_adl<H: PerpHost>(
     }
     let bd = market.base_decimals;
     let pd = market.price_decimals;
-    let p_b = calc_bankruptcy_price(
+
+    // ── The fill price: MARK for a solvent residual, BANKRUPTCY PRICE for an insolvent one ──────
+    //
+    // Both kinds of residual come here, and the only thing that differs is the price. Using `p_b`
+    // for a solvent residual would CONFISCATE the equity it still has (`p_b` is below mark for a
+    // long, above it for a short — by construction the price at which equity reaches zero), which
+    // is strictly harsher than the synthetic mark-price close this replaced. Using `mark` for an
+    // insolvent one would hand the winner a position already past bankruptcy and route the
+    // difference to bad debt — which `adl_fill` refuses outright, so it would simply never fill.
+    //
+    // At mark the fill is economically NEUTRAL for the winner: its position is closed at exactly
+    // the price it is already marked at, so its equity does not move. It loses the exposure, not
+    // money. That is the whole reason routing solvent residuals here is acceptable at all.
+    let residual_equity = calc_position_equity(
+        mark_price,
         loser_pos.amount,
         loser_pos.v_quote_balance,
         loser_pos.margin,
         bd,
         pd,
     )?;
-    if p_b == 0 {
-        return Ok(()); // <=1x residual is never insolvent — nothing to ADL
-    }
+    let fill_price = if residual_equity >= 0 {
+        // `mark_price > 0` is a market invariant (`addMarket` rejects 0 and every mark component
+        // is floored at 1), so the solvent branch needs no zero guard.
+        mark_price
+    } else {
+        let p_b = calc_bankruptcy_price(
+            loser_pos.amount,
+            loser_pos.v_quote_balance,
+            loser_pos.margin,
+            bd,
+            pd,
+        )?;
+        if p_b == 0 {
+            // Only reachable for a short whose bankruptcy price rounds below one price unit
+            // (`calc_bankruptcy_price` floors for shorts). Filling at 0 would hand the winner the
+            // position for free, so defer instead — the position stays open and registered.
+            return Ok(());
+        }
+        p_b
+    };
     let loser_is_long = loser_pos.amount > 0;
 
     // Enumerate + rank opposite-side candidates ONCE (rank stable within this call).
@@ -309,35 +234,25 @@ pub(crate) fn run_adl<H: PerpHost>(
         if wp.amount == 0 || (wp.amount > 0) == loser_is_long {
             continue; // flat or same side as the loser
         }
-        // v1: skip holders with ANY resting order — an ADL fill moves their position, which
-        // re-prices every order they have resting, and v1 does not want to reason about that.
+        // ⚠️ Holders with resting orders are NOT excluded. v1 skipped them — an ADL fill moves the
+        // position, which re-prices every order resting against it, and v1 did not want to reason
+        // about that. The exclusion turned out to be the binding constraint on ADL in practice:
+        // the deeply-in-profit holders ADL ranks first are precisely the ones most likely to be
+        // sitting on a take-profit, so in a real cascade the candidate list came back empty and
+        // every residual deferred. The golden scenario demonstrated exactly this.
         //
-        // Read off the position we JUST loaded instead of loading both order lists. These are
-        // `Σ resting order amounts` per side, not a margin requirement — a resting entry always
-        // carries a non-zero remaining amount, so `both == 0` is EXACTLY "no resting orders", not a
-        // proxy for it. The aggregates are proven equal to a fold over the lists after every
-        // transition by `side_aggregates_are_exactly_bid_and_ask_after_every_operation`.
-        //
-        // ⚠️ The requirement-based proxy this previously warned against is a DIFFERENT quantity:
-        // `ooIM` is zero for a PURE-REDUCE order (fully absorbed by the position), so keying on it
-        // would let such a holder through. `total_*_qty` counts that order's amount like any other.
-        // `adl_skips_opposite_holder_whose_only_order_reserves_no_margin` is the discriminating
-        // test and must stay green.
-        //
-        // Saves TWO storage loads per candidate, and `run_adl` walks the whole registry once per
-        // insolvent-residual victim — so this is 2/3 of the per-candidate cost of the scan that
-        // repeats most in exactly the cascade where the sweep is already heaviest.
-        if wp.total_buy_qty != 0 || wp.total_sell_qty != 0 {
-            continue;
-        }
+        // Binance does not exclude them either — it selects them and CANCELS their open orders.
+        // That is what the fill loop below does, and it sidesteps the re-pricing question entirely
+        // rather than solving it: after the cancel there are no orders left to re-price.
         let eq_mark =
             calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
         if eq_mark <= 0 {
             continue; // itself liquidatable — leave to the sweep
         }
-        let eq_pb = calc_position_equity(p_b, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
-        if eq_pb < 0 {
-            continue; // cannot absorb at P_b without going insolvent
+        let eq_fill =
+            calc_position_equity(fill_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
+        if eq_fill < 0 {
+            continue; // cannot absorb at the fill price without going insolvent
         }
         let notional = calc_value_i64(mark_price, wp.amount, bd, pd)? as i128;
         cands.push((user, notional + wp.v_quote_balance as i128, eq_mark as i128));
@@ -383,13 +298,33 @@ pub(crate) fn run_adl<H: PerpHost>(
             &mut winner_account.perp_wallet_balance,
             winner_close_is_buy,
             take,
-            p_b,
+            fill_price,
             bd,
             pd,
         )?
         else {
             continue; // no clean (bad-debt-free) fill possible — skip this winner
         };
+        // ── Binance parity: an ADL'd account's open orders are cancelled ─────────────────────────
+        //
+        // AFTER the trial fill, never before: `adl_fill` works on clones and commits only if both
+        // legs come out bad-debt-free, so a winner it rejects must not lose their book for nothing.
+        //
+        // The call reloads the winner's STORED (pre-fill) position to clear its side aggregates and
+        // writes it; the `save_position` below then overwrites that with the post-fill position,
+        // whose aggregates we clear here to match. Two writes to one key — the second is the one
+        // that lands, and under #16d a repeated key is still a single commitment entry.
+        //
+        // Reason `Adl`, not `Liquidation`: this owner was profitable and was selected for that
+        // reason. They are not being liquidated.
+        crate::risk::cancel_all_orders_for_market(
+            context,
+            winner,
+            market.market_id,
+            market,
+            CancelReason::Adl,
+        )?;
+        winner_pos.clear_side_aggregates();
         // `Adjustment` for BOTH ADL legs: a forced trade at the bankruptcy price with no order on
         // either side. The winner in particular never placed one — candidates holding ANY resting
         // order are excluded above — and there is no `Trade` row for them either, only `Adl`, so
@@ -409,7 +344,7 @@ pub(crate) fn run_adl<H: PerpHost>(
                 adlUser: winner,
                 marketId: market.market_id,
                 qty: fill.quantity,
-                price: p_b,
+                price: fill_price,
             }
             .to_log_data(),
         });
@@ -421,7 +356,7 @@ pub(crate) fn run_adl<H: PerpHost>(
         // row belong to the first header, i.e. an indexer would book the winner's position onto the
         // loser's account. The `Adl` row above sits outside both groups.
         //
-        // Both legs are valued at the market's CURRENT mark, not at the ADL price `p_b` the fill
+        // Both legs are valued at the market's CURRENT mark, not at the `fill_price` the fill
         // executed at: `unrealizedProfit` is by definition mark-to-market on what is LEFT open,
         // and the fill's realised part is reported separately as `realizedPnl`.
         //
@@ -497,8 +432,8 @@ pub(crate) fn run_adl<H: PerpHost>(
 }
 
 /// One ADL forced trade: close `take` of both the loser and one opposite holder at
-/// `p_b`, shrinking `take` (bounded) so NEITHER side realizes bad debt from sub-unit
-/// flooring. Both legs use the SAME single-floored `calc_value(p_b, take)`. Returns the
+/// `fill_price`, shrinking `take` (bounded) so NEITHER side realizes bad debt from sub-unit
+/// flooring. Both legs use the SAME single-floored `calc_value(fill_price, take)`. Returns the
 /// the committed quantity and each participant's realized PnL, or `None` if no
 /// clean fill is possible near `take`.
 struct AdlFillOutcome {
@@ -516,7 +451,7 @@ fn adl_fill(
     winner_wallet: &mut i64,
     winner_close_is_buy: bool,
     take: u64,
-    p_b: u64,
+    fill_price: u64,
     bd: u32,
     pd: u32,
 ) -> Result<Option<AdlFillOutcome>, PerpError> {
@@ -524,7 +459,7 @@ fn adl_fill(
     let floor = take.saturating_sub(4); // try take, take-1, .., take-4 (dust is <=1-2)
     let mut t = take;
     while t > 0 && t > floor {
-        let v = calc_value(p_b, t, bd, pd)?;
+        let v = calc_value(fill_price, t, bd, pd)?;
         // Trial on clones; commit only if BOTH sides are bad-debt free.
         // Both legs are PURE CLOSES (`opening_qty == 0`), so the funding mode is inert — ADL never
         // opens, and therefore never short-funds, a silo.

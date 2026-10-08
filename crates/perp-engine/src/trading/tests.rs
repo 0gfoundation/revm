@@ -6847,7 +6847,7 @@ mod golden {
     /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
     /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x64c0882dad7b59569090d886b64c10b537eb1df278f4b0d22ba6ecfe94728c75");
+        b256!("0x25bfb280fd657756ad353e505c5c848e0aee71a8ba90c659bc13f2848f7c4239");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -6897,10 +6897,20 @@ mod golden {
 
     fn expected_snapshot() -> BusinessSnapshot {
         BusinessSnapshot {
-            // ALICE fully closed by the liquidation round-trip; BOB flat after
-            // CAROL's taker sell closes his last short QTY.
+            // ALICE fully closed by the liquidation round-trip.
             alice_position: (0, 0, 0),
-            bob_position: (0, 0, 0),
+            // ⚠️ BOB IS NO LONGER FLAT, and the reason is the whole point of the residual rework.
+            // ALICE's liquidation residual used to be closed at the mark against NO COUNTERPARTY —
+            // it simply evaporated. It is now a real ADL trade, and BOB is the opposite side: one
+            // `Adl` event, loser ALICE, adlUser BOB, 0.01 @ the $70 mark (solvent residual, so the
+            // mark and not the bankruptcy price). That consumed 0.01 of BOB's short at that point
+            // in the scenario, so CAROL's later taker sell into his resting bid leaves him LONG
+            // 0.01 where it used to leave him flat.
+            //
+            // He is ABOVE MAINTENANCE here — an ordinary healthy open position, NOT a deferred
+            // liquidation. Σ amount is still conserved; ALICE's exposure MOVED to BOB instead of
+            // vanishing, which is exactly what `liquidation_conserves_sigma_amount` asserts.
+            bob_position: (1_000_000, -800_000, 399_840),
             // CAROL short QTY @ $80 at default leverage 1 (full-notional margin).
             // Her position is untouched by the leverage retune, but the deeper crash
             // leaves her holding 100_000 of UNREALISED gain (1e6 base × $10 of extra
@@ -6942,7 +6952,10 @@ mod golden {
             //   straight into the wallet. He ends flat, and closing to zero releases the
             //   whole remaining margin, so the 400 still lands here — unchanged total,
             //   different route.
-            bob_account: (U256::from(500_000_000u64), 500_428_954),
+            // Lower than before (500_428_954) because he ends HOLDING a position instead of flat:
+            // its margin is still locked and its PnL still unrealised. Nothing is lost — available
+            // is not balance.
+            bob_account: (U256::from(500_000_000u64), 500_129_114),
             // CAROL perp = 5_000_000 funded − 800_000 short opening margin − 900_000 of DERIVED
             // ooIM for the Phase-9c resting sell. That 900_000 is the sell priced at the ASSUMING
             // PRICE (the $90 mark, which dominates both its own $81 limit and the
@@ -12096,7 +12109,10 @@ mod user_market_index {
     /// survival is pre-existing (that block is untouched by the freeze), not a regression.
     #[test]
     fn side_aggregates_are_exactly_bid_and_ask_after_every_operation() {
-        let deep = run_fuzz(0x00_1f_bd_a5_c0_de_00_11, RICH, 800);
+        // 1_200 rather than 800 only for THIS seed: ADL now cancels the counterparty's resting
+        // orders, which perturbs the walk enough that this seed's first sign flip moved past step
+        // 800. Lengthening the run restores the coverage floor below without weakening it.
+        let deep = run_fuzz(0x00_1f_bd_a5_c0_de_00_11, RICH, 1_200);
         let thin = run_fuzz(0x7a_51_de_ad_be_ef_00_29, WALLET, 800);
         println!("ooIM Bid/Ask fuzz coverage: deep={deep:?} thin={thin:?}");
         // A pass that never rests, never partially fills and never liquidates would assert

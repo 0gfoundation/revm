@@ -25,6 +25,13 @@ const ALICE: Address = address!("1111111111111111111111111111111111111111");
 const KEEPER: Address = address!("2222222222222222222222222222222222222222");
 const MAKER: Address = address!("3333333333333333333333333333333333333333");
 const ADMIN: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+/// An off-book opposite-side holder, used as the ADL counterparty wherever a fixture needs a
+/// liquidation to actually COMPLETE. Every residual the book cannot absorb is now a forced trade
+/// against a real position (there is no counterparty-free close any more), so a one-sided fixture
+/// liquidates nothing — it defers. See `seed_absorbing_short`.
+// `0xEE..` deliberately: `liquidation_cap` seeds its losers at `Address::from([i; 20])`
+// for i in 1..=n, so anything in that range would COLLIDE and silently overwrite a loser.
+const WHALE: Address = address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 const MARKET_ID: u64 = 1;
 const PRICE_DECIMALS: u32 = 2;
 const ENTRY_PRICE: u64 = 10_000; // $100.00
@@ -165,16 +172,20 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
         AccountUpdateReason::Adjustment,
     )
     .unwrap();
-    // Both are registered as open positions (insertion order).
+    // WHALE: the opposite side, so ALICE's book-unfillable residual has something to close
+    // AGAINST. MAKER is a LONG, i.e. the same side as ALICE, so it is never an ADL candidate and
+    // its "untouched" assertion below still measures what it did before.
+    seed_absorbing_short(&mut ctx, 1);
+    // All three are registered as open positions (insertion order).
     assert_eq!(
         storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
-        vec![ALICE, MAKER]
+        vec![ALICE, MAKER, WHALE]
     );
 
-    // Crash the mark to $85 via updateIndexPrice (admin) — runs the sweep. At $85 the
-    // 5x long is BELOW maintenance but still SOLVENT (equity >= 0), so its empty-book
-    // residual closes at mark (no ADL, no IF); an insolvent residual would instead go
-    // to ADL (see `adl_*` tests).
+    // Crash the mark to $85 via updateIndexPrice (admin) — runs the sweep. At $85 the 5x long is
+    // BELOW maintenance but still SOLVENT (equity >= 0), so its empty-book residual is ADL'd
+    // AT MARK against WHALE — a real trade. (An insolvent residual takes the same path at the
+    // bankruptcy price instead; see `adl_*` tests.)
     run_update_index_price(
         &updateIndexPriceCall {
             marketId: MARKET_ID,
@@ -187,14 +198,23 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
     )
     .unwrap();
 
+    // TWO legs now, one per party — the close has a counterparty. ALICE's own economics are
+    // unchanged from the counterparty-free settle this replaced (both value the residual at the
+    // same mark), which is why `realizedPnl` is still exactly -$150.
     let position_changes = take_position_changes(&mut ctx);
-    assert_eq!(position_changes.len(), 1);
+    assert_eq!(position_changes.len(), 2);
     assert_eq!(position_changes[0].user, ALICE);
     assert_eq!(position_changes[0].realizedPnl, -150_000_000);
     assert_eq!(position_changes[0].closedQuantity, QTY as u64);
+    assert_eq!(position_changes[1].user, WHALE);
+    assert_eq!(
+        position_changes[1].realizedPnl, 150_000_000,
+        "a fill at MARK is zero-sum and economically neutral for the absorbing side"
+    );
+    assert_eq!(position_changes[1].closedQuantity, QTY as u64);
 
-    // ALICE was under maintenance -> swept (solvent residual closed at mark, empty book);
-    // MAKER stayed healthy -> untouched. Registry now holds only MAKER.
+    // ALICE was under maintenance -> swept; MAKER stayed healthy -> untouched; WHALE absorbed
+    // ALICE's whole residual and is now flat, so the registry holds only MAKER.
     assert_eq!(
         position(&mut ctx, ALICE).amount,
         0,
@@ -406,6 +426,25 @@ fn seed_position_account(
     .unwrap();
 }
 
+/// Seeds [`WHALE`] as a 5x SHORT of `contracts` @ $100, off-book and with no resting orders — the
+/// mirror image of the `QTY`/`ENTRY_VALUE`/`MARGIN` long every fixture here uses, scaled up.
+///
+/// It exists because ADL is now the ONLY way a book-unfillable residual gets closed: there is no
+/// counterparty-free settle left, so without an eligible opposite holder a liquidation defers and
+/// the position stays open. Any mark below $100 leaves this short in profit and above maintenance,
+/// so it qualifies as a candidate and stays healthy while absorbing.
+fn seed_absorbing_short(ctx: &mut TestCtx, contracts: i64) {
+    seed_position_account(
+        ctx,
+        WHALE,
+        -(QTY * contracts),
+        ENTRY_VALUE * contracts,
+        MARGIN * contracts,
+        5,
+        0,
+    );
+}
+
 // Σ(perp_wallet + margin + vQuote) over `users`, plus the global insurance fund.
 fn conservation_sum(ctx: &mut TestCtx, users: &[Address]) -> i128 {
     let mut s = storage::load_insurance_fund(ctx).unwrap() as i128;
@@ -415,6 +454,97 @@ fn conservation_sum(ctx: &mut TestCtx, users: &[Address]) -> i128 {
         s += a.perp_wallet_balance as i128 + p.margin as i128 + p.v_quote_balance as i128;
     }
     s
+}
+
+/// **Σ amount is conserved across a liquidation — unconditionally.**
+///
+/// This is the invariant the solvent-residual rework exists for. A perp position can only ever be
+/// closed against ANOTHER position: through the book, or through ADL. There is no longer any path
+/// that zeroes a position with nothing on the other side.
+///
+/// It used to have one. A SOLVENT book-unfillable residual was "closed at mark against no
+/// counterparty" — the protocol valued it and zeroed it. Money balanced at that instant (the
+/// residual was valued at the same mark everyone else is marked at), which is why the
+/// `conservation_sum` checks elsewhere never caught it, but Σ amount did not: afterwards
+/// `Σ long != Σ short` and every later price move created or destroyed money system-wide with no
+/// position on the other side to absorb it. Nothing recorded the imbalance either — `open_interest`
+/// has no production writer.
+///
+/// So this asserts the thing the money check cannot see. The fixture is deliberately the SOLVENT
+/// case (equity +$50 at the $85 mark), i.e. precisely the one that used to take the synthetic path.
+#[test]
+fn liquidation_conserves_sigma_amount() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+    seed_absorbing_short(&mut ctx, 1);
+
+    let users = [ALICE, WHALE];
+    let value_before = conservation_sum(&mut ctx, &users);
+    let amount_before: i64 = users.iter().map(|&u| position(&mut ctx, u).amount).sum();
+    assert_eq!(amount_before, 0, "a market is zero-sum by construction");
+
+    // $100 -> $85: ALICE is below maintenance but still SOLVENT (equity +$50). Empty book, so the
+    // whole position is a residual.
+    run_update_index_price(
+        &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: 8_500, timestamp: 31 }.abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    assert_eq!(position(&mut ctx, ALICE).amount, 0, "liquidated");
+    assert_eq!(
+        users.iter().map(|&u| position(&mut ctx, u).amount).sum::<i64>(),
+        0,
+        "Σ amount conserved — the residual was ABSORBED by a real position, not zeroed"
+    );
+    assert_eq!(
+        position(&mut ctx, WHALE).amount,
+        0,
+        "WHALE took all 10 and is flat"
+    );
+    assert_eq!(conservation_sum(&mut ctx, &users), value_before, "and value conserved");
+}
+
+/// The fallback when there is nobody to absorb: the position STAYS OPEN. Accepted deliberately —
+/// conserving Σ amount means a residual cannot be force-closed into thin air, so when ADL finds no
+/// eligible counterparty the only honest outcome is to defer and re-sweep.
+///
+/// ⚠️ This is a real behaviour change for SOLVENT residuals, which previously always resolved. A
+/// deferred position keeps accruing funding and can drift solvent -> insolvent, at which point the
+/// ADL filter is STRICTER (it must absorb at the bankruptcy price, not at mark). The sibling test
+/// above this one pins the same deferral for the insolvent case, which was already the behaviour.
+#[test]
+fn a_solvent_residual_with_no_counterparty_defers_instead_of_closing_into_thin_air() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+    // No opposite side at all, and no book.
+    let value_before = conservation_sum(&mut ctx, &[ALICE]);
+
+    run_update_index_price(
+        &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: 8_500, timestamp: 31 }.abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+
+    assert_eq!(
+        position(&mut ctx, ALICE).amount,
+        QTY,
+        "solvent residual DEFERRED, not force-closed against nobody"
+    );
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
+        vec![ALICE],
+        "and it stays registered for the next sweep"
+    );
+    assert_eq!(
+        conservation_sum(&mut ctx, &[ALICE]),
+        value_before,
+        "nothing moved on defer"
+    );
 }
 
 #[test]
@@ -584,15 +714,20 @@ fn the_sweep_bands_the_close_on_the_post_update_mark_not_the_pre_update_one() {
     );
 }
 
-/// The "holder has open orders" exclusion is asked of the ORDER LISTS, not of
-/// `margin_reserved`. A PURE-REDUCE resting order (fully absorbed by the holder's own position)
-/// reserves ZERO margin, so the reservation proxy would wave such a holder through and ADL would
-/// fill against him without the flip-aware reservation recompute / auto-cancel that v1 exists to
-/// avoid. Before the `fee_reserved` escrow was removed, the ONLY thing catching this case was the
-/// `fee_reserved != 0` half of the old predicate — deleting it without a replacement would have
-/// silently regressed here.
+/// **INVERTED, deliberately.** This used to pin the opposite claim: a holder with ANY resting
+/// order was EXCLUDED from ADL, and the fixture existed to prove the exclusion was asked of the
+/// order lists rather than of a margin proxy (a PURE-REDUCE order reserves zero margin, so a
+/// requirement-based proxy would have waved this holder through).
+///
+/// The exclusion is gone. It was the binding constraint on ADL in practice — the deeply-in-profit
+/// holders ADL ranks first are exactly the ones sitting on a take-profit — and Binance does not
+/// have it either: it selects such a holder and CANCELS their open orders. So does this engine now,
+/// which is what removes the need for any flip-aware recompute: there is nothing left to re-price.
+///
+/// The fixture is kept verbatim because it is still the sharpest one — a pure-reduce order is the
+/// hardest "has resting orders" case to detect — only the expectations are flipped.
 #[test]
-fn adl_skips_opposite_holder_whose_only_order_reserves_no_margin() {
+fn adl_fills_against_an_order_holder_and_cancels_their_orders() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     seed_position_account(
@@ -656,19 +791,47 @@ fn adl_skips_opposite_holder_whose_only_order_reserves_no_margin() {
     )
     .unwrap();
 
-    // The only opposite holder is excluded → the insolvent residual DEFERS, exactly as if no
-    // counterparty existed. Nothing moved on either side.
+    // KEEPER is eligible despite the resting bid: the insolvent residual is ADL'd against him and
+    // his book in this market is cleared as part of the fill.
     assert_eq!(
         position(&mut ctx, ALICE).amount,
-        QTY,
-        "residual must defer — the order-holding counterparty is not eligible"
+        0,
+        "the residual is absorbed, not deferred"
     );
     assert_eq!(
         position(&mut ctx, KEEPER).amount,
-        -QTY,
-        "order-holding holder must not be ADL'd"
+        0,
+        "the order-holding holder IS the ADL counterparty"
     );
-    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), if_before);
+    let keeper_after = position(&mut ctx, KEEPER);
+    assert_eq!(
+        (keeper_after.total_buy_qty, keeper_after.total_sell_qty),
+        (0, 0),
+        "his resting bid is gone — this is the cancel that replaces the old exclusion"
+    );
+    assert!(
+        storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap().is_empty(),
+        "and it left the book, not just his per-user list"
+    );
+    // `Adl`, NOT `Liquidation`: KEEPER was profitable and was picked for that reason. Reporting a
+    // liquidation here would tell every downstream consumer the opposite of what happened.
+    assert!(
+        JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .filter(|l| l.data.topics().first() == Some(&crate::interface::IPerpDex::OrderCancelled::SIGNATURE_HASH))
+            .any(|l| {
+                crate::interface::IPerpDex::OrderCancelled::decode_raw_log(l.data.topics(), &l.data.data)
+                    .unwrap()
+                    .reason
+                    == CancelReason::Adl as u8
+            }),
+        "the cancel must be attributed to ADL"
+    );
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        if_before,
+        "scheme X: ADL never touches the fund"
+    );
     assert_eq!(conservation_sum(&mut ctx, &[ALICE, KEEPER]), value_before);
 }
 
@@ -1666,6 +1829,11 @@ fn funding_alone_pushes_a_position_into_the_sweep() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    // The counterparty the empty-book residual is closed against — without one the liquidation
+    // defers and this test would measure deferral instead of "funding alone can trigger a sweep".
+    // At the unchanged $100 mark this short has equity $200 against a $166.67 requirement, so it
+    // is itself above maintenance, and a positive funding index CREDITS a short.
+    seed_absorbing_short(&mut ctx, 1);
     set_funding_index(&mut ctx, 400_000_000); // charge = 40_000_000
 
     run_update_index_price(
@@ -2934,37 +3102,41 @@ fn liquidate_short_buys_full_position_from_asks() {
 }
 
 #[test]
-fn liquidate_settles_residual_at_mark_when_orderbook_cannot_fully_close() {
+fn liquidate_closes_the_book_unfillable_residual_by_adl_at_mark() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
     storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
     // Book only provides QTY-1 of closing liquidity.
     place_maker_order(&mut ctx, Side::Buy as u8, LONG_LIQ_PRICE, (QTY as u64) - 1);
+    // ...and WHALE absorbs the 1-unit remainder. The book maker ends up LONG once ALICE sells into
+    // its bid, i.e. the same side as ALICE, so it is never an ADL candidate — the residual has no
+    // counterparty without this and the liquidation would leave 1 unit open.
+    seed_absorbing_short(&mut ctx, 1);
 
-    // New behaviour: close what the book can absorb, then settle the 1-unit
-    // residual directly at mark price. The position is fully closed, not rejected.
+    // Close what the book can absorb, then ADL the 1-unit residual at MARK. At the $90 mark the
+    // residual is still solvent (equity +$100), which is what selects mark over the bankruptcy
+    // price. The position ends fully closed, not rejected and not deferred.
     liquidate(&mut ctx, ALICE).unwrap();
 
     let alice = position(&mut ctx, ALICE);
     assert_eq!(
         alice.amount, 0,
-        "position fully closed via book + residual-at-mark"
+        "position fully closed via book + residual-by-ADL"
     );
     assert_eq!(alice.v_quote_balance, 0);
 
     // ── `cr` ACROSS THE TWO-LEG CLOSE ──────────────────────────────────────────────────────────
     //
-    // This liquidation closes through BOTH accumulation sites: the book absorbs `QTY − 1` via
-    // `settlement::apply_position_fill` (the taker path) and the 1-unit residual is settled at
-    // MARK against no counterparty by `settle_liquidation_residual_at_mark_price`, which computes
-    // its own `realized_pnl` and therefore has to credit it itself. The residual site has no other
-    // coverage of this field, and a `cr` that omitted it would be short by a silent, arbitrary
-    // fraction of the position rather than by something a reader would notice.
+    // Both legs now reach `settlement::apply_position_fill` — the book absorbs `QTY − 1` through
+    // the taker path and the 1-unit residual through `adl_fill` — so `cr` has a single
+    // accumulation site and cannot disagree with itself. (It used to have two: the residual was
+    // settled at mark against NO counterparty by a function that computed and credited its own
+    // `realized_pnl`. That function is gone.)
     //
-    // So the total must equal the WHOLE position's realised loss, split over the two legs exactly
-    // as the emitted events split it — checked against the events rather than restated, and pinned
-    // to a literal so a derivation broken identically on both sides still fails.
+    // The total must equal the WHOLE position's realised loss, split over the two legs exactly as
+    // the emitted events split it — checked against the events rather than restated, and pinned to
+    // a literal so a derivation broken identically on both sides still fails.
     let changes = take_position_changes(&mut ctx);
     let legs: Vec<i64> = changes
         .iter()
@@ -3605,8 +3777,8 @@ mod value_conservation {
             // that actually debits one, i.e. a place/fill. Nothing else in the system may produce a
             // deficit — a cancel moves no money, `setLeverage` moves no money, funding settles
             // against `pos.margin` (A1 isolated funding), and liquidation only ever CREDITS the
-            // wallet (`settle_liquidation_residual_at_mark_price`: an insolvent residual routes its
-            // shortfall to the Insurance Fund and never debits the user). If a mark move or a
+            // wallet (`apply_position_fill`: a loss beyond the position's own margin routes to the
+            // Insurance Fund as bad debt and never debits the user). If a mark move or a
             // liquidation sweep ever produced a negative wallet, that would be a real bug, and this
             // catches it while the relaxed assertion above no longer would.
             //
@@ -4565,9 +4737,9 @@ mod band_expiry {
     fn cancel_reasons(ctx: &mut TestCtx) -> Vec<u8> {
         JournalTr::take_logs(ctx.journal_mut())
             .into_iter()
-            .filter(|l| l.data.topics().first() == Some(&OrderCancelled::SIGNATURE_HASH))
+            .filter(|l| l.data.topics().first() == Some(&crate::interface::IPerpDex::OrderCancelled::SIGNATURE_HASH))
             .map(|l| {
-                OrderCancelled::decode_raw_log(l.data.topics(), &l.data.data)
+                crate::interface::IPerpDex::OrderCancelled::decode_raw_log(l.data.topics(), &l.data.data)
                     .unwrap()
                     .reason
             })
@@ -5140,7 +5312,7 @@ mod band_expiry {
         );
         let expiries = logs
             .iter()
-            .filter(|l| l.data.topics().first() == Some(&OrderCancelled::SIGNATURE_HASH))
+            .filter(|l| l.data.topics().first() == Some(&crate::interface::IPerpDex::OrderCancelled::SIGNATURE_HASH))
             .count();
         assert_eq!(expiries, 12, "four levels x three owners");
     }
@@ -5327,19 +5499,25 @@ mod account_update_stream {
         );
     }
 
-    /// **`ADJUSTMENT` for the residual closed at MARK.** The book absorbs half the position and the
-    /// rest is closed at the mark price with no counterparty and no order — so `ORDER` would send a
-    /// consumer looking for an order id and a `Trade` row that do not exist for this leg.
+    /// **`ADJUSTMENT` for a SOLVENT residual ADL'd at MARK.** The book absorbs half the position and
+    /// the rest is a forced trade at the mark price — a real counterparty, but no order on either
+    /// side, so `ORDER` would send a consumer looking for an order id and a `Trade` row that do not
+    /// exist for this leg.
+    ///
+    /// The sibling below pins the same two-group shape for an INSOLVENT residual (filled at the
+    /// bankruptcy price). The two differ only in price, which is exactly the claim worth pinning
+    /// twice: solvent residuals used to take a completely separate, counterparty-free code path.
     #[test]
-    fn a_residual_closed_at_mark_reports_adjustment() {
+    fn a_solvent_residual_adld_at_mark_reports_adjustment() {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
         save_position(&mut ctx, QTY, -ENTRY_VALUE);
         storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
         // Only HALF the size is bid for, so the other half becomes the residual. The position is
-        // below maintenance but not bankrupt at this mark, so the residual is SOLVENT and takes the
-        // close-at-mark path rather than ADL.
+        // below maintenance but not bankrupt at this mark, so the residual is SOLVENT and fills at
+        // mark rather than at the bankruptcy price.
         place_maker_order(&mut ctx, Side::Buy as u8, LONG_LIQ_PRICE, QTY as u64 / 2);
+        seed_absorbing_short(&mut ctx, 1);
         let _ = JournalTr::take_logs(ctx.journal_mut());
 
         storage::begin_perp_call(&mut ctx);
@@ -5351,7 +5529,7 @@ mod account_update_stream {
         assert_eq!(
             position(&mut ctx, ALICE).amount,
             0,
-            "fixture: the residual really did have to be settled at mark"
+            "fixture: the residual really did have to be ADL'd"
         );
         assert_eq!(
             account_update_reasons(&logs),
@@ -5359,8 +5537,9 @@ mod account_update_stream {
                 // the book leg, an ordinary fill for both sides
                 (MAKER, R::Order),
                 (ALICE, R::Order),
-                // the residual: valued at mark, no counterparty, no order
+                // the residual: a forced trade at mark — one group per party, no order
                 (ALICE, R::Adjustment),
+                (WHALE, R::Adjustment),
             ],
         );
     }
@@ -6012,13 +6191,19 @@ mod liquidation_cap {
     /// 55 identical 5x longs, each its own address so each is its own registry entry. Seeded in a
     /// deterministic order so the test can also speak about WHICH ones get done.
     pub(super) fn seed_underwater_longs(ctx: &mut TestCtx, n: u8) -> Vec<Address> {
-        (1..=n)
+        let users: Vec<Address> = (1..=n)
             .map(|i| {
                 let user = Address::from([i; 20]);
                 seed_position_account(ctx, user, QTY, -ENTRY_VALUE, MARGIN, 5, 0);
                 user
             })
-            .collect()
+            .collect();
+        // LAST, so the losers keep registry indices 0..n and the order-sensitive test below still
+        // reads straightforwardly. Sized to absorb every one of them: without a counterparty each
+        // liquidation would defer instead of completing, and these tests would be measuring
+        // deferral rather than the cap.
+        seed_absorbing_short(ctx, n as i64);
+        users
     }
 
     pub(super) fn still_open(ctx: &mut TestCtx, users: &[Address]) -> usize {
@@ -6060,9 +6245,11 @@ mod liquidation_cap {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
         let users = seed_underwater_longs(&mut ctx, 55);
+        let mut expected = users.clone();
+        expected.push(WHALE); // seeded last by `seed_underwater_longs`
         assert_eq!(
             storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
-            users,
+            expected,
             "registry is insertion-ordered — the premise of this test"
         );
 

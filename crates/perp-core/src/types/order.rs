@@ -276,6 +276,11 @@ pub enum CancelReason {
     /// A NORMAL same-side order was placed AHEAD of this one (nearer the touch, so it fills first)
     /// and would consume the position before this order could reduce it.
     ReduceOnlyOvertaken = 7,
+    /// The owner was picked as an ADL counterparty, and an ADL'd account's open orders are
+    /// cancelled (Binance parity). DISTINCT from `Liquidation` on purpose: this owner was not
+    /// liquidated — their position was profitable, which is exactly why it was selected — and
+    /// reporting `Liquidation` would tell every downstream consumer the opposite of what happened.
+    Adl = 8,
 }
 
 // ── Structs ───────────────────────────────────────────────────────────────

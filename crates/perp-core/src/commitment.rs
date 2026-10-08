@@ -136,9 +136,10 @@ use primitives::{B256, U256};
 // a closed round's PnL, so there is no state to reconstruct it from — which is precisely the reason
 // the field was carried as a hardcoded `0` placeholder on the event until now.
 //
-// Two accumulation sites, both places a closing leg's PnL is computed:
-// `settlement::apply_position_fill` (taker, maker, both ADL legs) and
-// `liquidation::settle_liquidation_residual_at_mark_price`. `checked_add`, never saturating.
+// ONE accumulation site, the single place a closing leg's PnL is computed:
+// `settlement::apply_position_fill` (taker, maker, both ADL legs). `checked_add`, never saturating.
+// There used to be a second — a liquidation residual closed at mark against no counterparty — but
+// every residual is now an ADL fill and goes through the one site.
 //
 // No BUSINESS behaviour changes — nothing reads the field back to make a decision, no balance
 // identity contains it, and no gate conditions on it — but every position blob's bytes differ, so a
@@ -168,7 +169,7 @@ use primitives::{B256, U256};
 //
 // No BUSINESS behaviour changes: the golden scenario's BusinessSnapshot is UNCHANGED, field for
 // field. CHAIN change: golden re-pin + wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 29;
+pub const BLOCK_COMMITMENT_VERSION: u8 = 30;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

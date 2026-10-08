@@ -23,14 +23,14 @@ use crate::{
         withdrawInsuranceFundCall,
     },
     math::{
-        calc_funding_rate, calc_position_equity, calc_value, calc_value_i64, checked_u64_to_i64,
+        calc_funding_rate, calc_value, calc_value_i64, checked_u64_to_i64,
         is_above_maintenance_margin, max_leverage_for_notional, max_notional_for_leverage,
         FUNDING_RATE_ONE,
     },
     storage,
     trading::{
         check_api_key_expiry, check_recv_window, execute_liquidation_market_order,
-        gc_seen_buckets_best_effort, run_adl, settle_liquidation_residual_at_mark_price,
+        gc_seen_buckets_best_effort, run_adl,
         verify_ed25519,
     },
     types::{
@@ -979,7 +979,7 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     storage::save_position(context, user, market_id, &pos, AccountUpdateReason::FundingFee)?;
 
     // Cancel all open orders for this user/market (emits OrderCancelled events).
-    cancel_all_orders_for_market(context, user, market_id, market)?;
+    cancel_all_orders_for_market(context, user, market_id, market, CancelReason::Liquidation)?;
 
     // Try to close through the orderbook; settle any residual at mark price.
     let remaining = execute_liquidation_market_order(
@@ -990,32 +990,27 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         liquidation_quantity,
     )?;
     if remaining > 0 {
-        // Residual: a SOLVENT residual (equity >= 0 at mark — the position is below
-        // maintenance but not yet bankrupt) is returned to the loser by closing at mark
-        // (no bad debt, no ADL, no IF). An INSOLVENT residual (equity < 0) is closed as
-        // a forced trade against opposite-side holders at the bankruptcy price via ADL
-        // (scheme X: no IF). ADL leftover (budget exhausted / not enough deeply-in-profit
-        // opposite holders) stays open and is re-swept next update.
-        let residual = storage::load_position(context, user, market_id)?;
-        let residual_equity = calc_position_equity(
-            mark_price,
-            residual.amount,
-            residual.v_quote_balance,
-            residual.margin,
-            market.base_decimals,
-            market.price_decimals,
-        )?;
-        if residual_equity >= 0 {
-            settle_liquidation_residual_at_mark_price(
-                context,
-                user,
-                market,
-                liquidation_side,
-                mark_price,
-            )?;
-        } else {
-            run_adl(context, user, market, mark_price, adl_budget)?;
-        }
+        // EVERY residual — solvent or not — is closed as a REAL forced trade against opposite-side
+        // holders via ADL, which picks its own price (mark when the residual is still solvent, the
+        // bankruptcy price when it is not). ADL leftover (budget exhausted / no eligible opposite
+        // holder) stays open and is re-swept next update.
+        //
+        // ⚠️ This used to fork: a solvent residual was closed at mark against NO COUNTERPARTY — the
+        // protocol simply valued it and zeroed it. That was the one and only place `Σ amount`
+        // stopped being conserved, and it leaked permanently: after such a close `Σ long != Σ
+        // short`, so every subsequent price move creates or destroys money system-wide with no
+        // position on the other side to absorb it, and nothing even recorded the imbalance
+        // (`open_interest` has no production writer). Routing it through ADL makes "a position is
+        // only ever closed against another position" an UNCONDITIONAL invariant — see
+        // `liquidation_conserves_sigma_amount`.
+        //
+        // The accepted cost is that ADL now fires in any move fast enough to put the book outside
+        // the fill-time band, i.e. routinely rather than exceptionally, and that a residual with no
+        // eligible counterparty stays open below maintenance instead of being force-closed. Both
+        // are deliberate: the frequency is held down by capping leverage and shortening the price
+        // update interval, and a deferred position was already the behaviour for insolvent
+        // residuals.
+        run_adl(context, user, market, mark_price, adl_budget)?;
     }
 
     // Isolated margin: the position's loss (book leg + residual) was already contained
@@ -1635,13 +1630,18 @@ fn validate_funding_config(
     Ok(())
 }
 
-/// Cancel every open order for `user` in `market`, returning reserved margin
-/// back to their perp wallet.
+/// Cancel every open order for `user` in `market`. Moves no money — a resting order escrows
+/// nothing — so this only drops the owner's derived open-order requirement to zero.
+///
+/// `reason` rides every `OrderCancelled` this emits, and the two callers are NOT interchangeable:
+/// a liquidation clears the LIQUIDATED owner's book (`Liquidation`), and an ADL fill clears the
+/// selected COUNTERPARTY's book (`Adl`) — that owner was profitable, not liquidated.
 pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
     context: &mut H,
     user: Address,
     market_id: u64,
     _market: &Market,
+    reason: CancelReason,
 ) -> Result<(), PerpError> {
     let old_best_bid = storage::load_best_bid(context, market_id)?;
     let old_best_ask = storage::load_best_ask(context, market_id)?;
@@ -1665,8 +1665,8 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
                 user,
                 orderId: FixedBytes(entry.order_id),
                 marketId: market_id,
-                // The owner did not ask: liquidation clears their whole book in this market.
-                reason: CancelReason::Liquidation as u8,
+                // The owner did not ask; see this function's `reason` doc.
+                reason: reason as u8,
             }
             .to_log_data(),
         });
@@ -1689,8 +1689,8 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
                 user,
                 orderId: FixedBytes(entry.order_id),
                 marketId: market_id,
-                // The owner did not ask: liquidation clears their whole book in this market.
-                reason: CancelReason::Liquidation as u8,
+                // The owner did not ask; see this function's `reason` doc.
+                reason: reason as u8,
             }
             .to_log_data(),
         });

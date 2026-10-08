@@ -2282,9 +2282,9 @@ pub(super) fn apply_position_fill(
         // (`finalize_core`, on the summed legs), the deferred maker settlement
         // (`settle_maker_fill_core`) and BOTH ADL legs (`liquidation::adl_fill`) all reach a
         // closing leg only through here — so accumulating at this line covers them at once
-        // instead of asking four call sites to remember. The only close that does NOT come
-        // through here is the liquidation residual settled at mark with no counterparty
-        // (`liquidation::settle_liquidation_residual_at_mark_price`), which accumulates its own.
+        // instead of asking four call sites to remember. EVERY close comes through here now,
+        // including a liquidation's book-unfillable residual: that used to be settled at mark with
+        // no counterparty and accumulate its own, and is an ADL fill today.
         //
         // A purely OPENING leg (`closing_qty == 0`) never enters this block, so a flip accrues
         // only its closing half — exactly the apportionment R15 measured (`rp` covers the close).
