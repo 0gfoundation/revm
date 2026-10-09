@@ -2583,6 +2583,7 @@ pub(super) fn match_order<H: PerpHost>(
 pub(super) struct MatchOutcome {
     /// Unfilled quantity after matching.
     pub(super) remaining: u64,
+
     registry: settlement::MatchRegistry,
     taker_plan: Option<settlement::TakerPlan>,
     last_trade_price: Option<u64>,
@@ -2593,6 +2594,12 @@ pub(super) struct MatchOutcome {
 }
 
 impl MatchOutcome {
+    /// Whether a liquidation close stopped on the distinct-maker cap rather than on the book or
+    /// the band. Read BEFORE `apply` consumes the outcome.
+    pub(super) fn maker_cap_deferred(&self) -> bool {
+        self.registry.maker_cap_deferred()
+    }
+
     /// ── THE WRITE BARRIER (no genuine rejects past this point) ──
     ///
     /// Flushes the buffered `OrderPlaced` FIRST so it precedes this order's own Trade /

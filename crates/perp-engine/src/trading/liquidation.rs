@@ -24,13 +24,23 @@ use crate::{
 /// book absorbs the entire position (`remaining == 0`) the position storage is
 /// cleaned up here. If the book can only partially fill, the caller is
 /// responsible for settling the residual (see `settle_liquidation_residual_at_mark_price`).
+/// What a liquidation's book leg left behind.
+pub(crate) struct LiquidationCloseOutcome {
+    /// Unfilled quantity — the residual that goes to ADL.
+    pub(crate) remaining: u64,
+    /// The walk stopped on the distinct-maker cap, NOT on the book or the band. The cap is per
+    /// match, so retrying gets a fresh allowance and can absorb more from the SAME book: this is
+    /// same-block recoverable and must set `Market::deferred_work`.
+    pub(crate) maker_cap_deferred: bool,
+}
+
 pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
     context: &mut H,
     user: Address,
     market: &Market,
     side: Side,
     quantity: u64,
-) -> Result<u64, PerpError> {
+) -> Result<LiquidationCloseOutcome, PerpError> {
     let (order_id, bumped_nonce) = super::peek_order_id(context, user)?;
     // A liquidation close IS a market order: immediate-or-cancel, bounded by the price band, never
     // resting. One `OrderKind` says so, and the record/event's two wire fields are derived from it.
@@ -95,6 +105,8 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
     // path at all. The set of rejects between the match and the flush is empty, which is the same
     // set it was before the hoist — the liquidation path's reject surface is unchanged.
     let remaining = outcome.remaining;
+    // Read BEFORE `apply` consumes the outcome.
+    let maker_cap_deferred = outcome.maker_cap_deferred();
     outcome.apply(context, side, market, &mut None)?;
     // delete-on-terminal: the liquidation close is an IOC that never rests — it exists only to
     // drive the match + emit OrderPlaced/Trade. Its record is dropped (never a live/queryable
@@ -143,7 +155,10 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         }
     }
 
-    Ok(remaining)
+    Ok(LiquidationCloseOutcome {
+        remaining,
+        maker_cap_deferred,
+    })
 }
 
 /// Auto-deleveraging (ADL, scheme X): close a liquidated position's book-unfillable

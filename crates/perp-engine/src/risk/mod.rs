@@ -923,6 +923,11 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     mark_price: u64,
     liquidator: Address,
     adl_budget: &mut u32,
+    // `deferred`: OR-ed with `true` when this liquidation left work a LATER ATTEMPT IN THE SAME
+    // BLOCK could finish — i.e. it stopped on a per-call budget, not on the market's actual state.
+    // Threaded like `adl_budget` rather than returned, because `LiquidationOutcome` is also the
+    // AboveMaintenance/NoPosition answer and neither of those says anything about deferral.
+    deferred: &mut bool,
 ) -> Result<LiquidationOutcome, PerpError> {
     let mut pos = storage::load_position(context, user, market_id)?;
 
@@ -981,14 +986,18 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // Cancel all open orders for this user/market (emits OrderCancelled events).
     cancel_all_orders_for_market(context, user, market_id, market, CancelReason::Liquidation)?;
 
-    // Try to close through the orderbook; settle any residual at mark price.
-    let remaining = execute_liquidation_market_order(
+    // Try to close through the orderbook; ADL any residual.
+    let close = execute_liquidation_market_order(
         context,
         user,
         market,
         liquidation_side,
         liquidation_quantity,
     )?;
+    let remaining = close.remaining;
+    // The book leg stopped on the distinct-maker cap, which is per MATCH: a retry gets a fresh
+    // allowance against the same book. Same-block recoverable, so the drain must see it.
+    *deferred |= close.maker_cap_deferred;
     if remaining > 0 {
         // EVERY residual — solvent or not — is closed as a REAL forced trade against opposite-side
         // holders via ADL, which picks its own price (mark when the residual is still solvent, the
@@ -1097,6 +1106,10 @@ pub fn run_liquidate<H: PerpHost>(
     }
 
     let mut adl_budget = ADL_BUDGET_PER_UPDATE;
+    // The manual entrypoint resolves one position on demand; it is not a sweep and does not own
+    // the market's drain bit, so its deferral signal is discarded. Anything it leaves behind is
+    // picked up by the next sweep exactly as before.
+    let mut deferred = false;
     match liquidate_position(
         context,
         args.user,
@@ -1105,6 +1118,7 @@ pub fn run_liquidate<H: PerpHost>(
         mark_price,
         caller,
         &mut adl_budget,
+        &mut deferred,
     )? {
         LiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
         LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
@@ -1162,6 +1176,10 @@ fn run_liquidation_sweep<H: PerpHost>(
     // One ADL-fill budget shared across every liquidation in this sweep (bounds per-tx
     // ADL work regardless of how many positions liquidate).
     let mut adl_budget = ADL_BUDGET_PER_UPDATE;
+    // Set by any liquidation that stopped on a PER-CALL budget rather than on the market's state.
+    // Today that is the distinct-maker cap inside the book leg; the shared ADL budget is read
+    // directly below, since it lives here.
+    let mut deferred = false;
     for user in candidates {
         if liquidated >= MAX_LIQUIDATIONS_PER_UPDATE {
             // Stopped on the cap with at least one candidate unexamined. Conservative: that
@@ -1183,6 +1201,7 @@ fn run_liquidation_sweep<H: PerpHost>(
             mark_price,
             Address::ZERO,
             &mut adl_budget,
+            &mut deferred,
         ) {
             Ok(LiquidationOutcome::Liquidated { .. }) => {
                 context.checkpoint_commit();
@@ -1201,11 +1220,22 @@ fn run_liquidation_sweep<H: PerpHost>(
     }
     // Walked every candidate without hitting the cap.
     //
-    // ⚠️ That is NOT "there is nothing liquidatable" — a victim whose ADL budget ran out keeps an
-    // open position and still returns `Liquidated`, so it consumed a slot without being resolved
-    // and will be back next sweep. This function reports CAP PRESSURE, which is what the drain bit
-    // is for; it does not certify the market is clean.
-    Ok(false)
+    // ⚠️ That is NOT "there is nothing liquidatable". This function reports CAP PRESSURE — work a
+    // LATER ATTEMPT IN THE SAME BLOCK could finish because a budget, not the market, stopped it:
+    //
+    //   * the 50 liquidation slots           -> the early `return Ok(true)` above
+    //   * the shared ADL fill budget         -> `adl_budget == 0` here
+    //   * the per-match distinct-maker cap   -> `deferred`, set by the book leg
+    //
+    // All three reset on the next call, so `drainDeferredWork` genuinely makes progress on each.
+    // What this does NOT report, deliberately, is a residual with no eligible counterparty: that
+    // outcome is identical until the mark, the book or the position set changes, so flagging it
+    // would spin a keeper's `while (drain())` forever for nothing.
+    //
+    // `adl_budget == 0` can be a false POSITIVE (the last fill may have been the last one needed);
+    // the drain then finds nothing and clears the bit. A false NEGATIVE would be the harmful
+    // direction and neither term can produce one.
+    Ok(adl_budget == 0 || deferred)
 }
 
 /// The two capped sweeps, in order, plus the `Market::deferred_work` bookkeeping they share.

@@ -311,10 +311,18 @@ fn liquidation_matching_caps_distinct_maker_accounts() {
     let market = storage::load_market_ref(&mut ctx, MARKET_ID)
         .unwrap()
         .unwrap();
-    let remaining =
+    let close =
         execute_liquidation_market_order(&mut ctx, ALICE, &market, Side::Sell, quantity).unwrap();
 
-    assert_eq!(remaining, 1);
+    assert_eq!(close.remaining, 1);
+    // The 1 unit left over is NOT "the book ran out" — there is a 129th maker sitting right there
+    // with a live bid. The walk stopped on the cap, and because that cap is per MATCH, retrying in
+    // the same block gets a fresh allowance and eats it. That distinction is what the drain bit
+    // needs, so it is reported rather than inferred from `remaining`.
+    assert!(
+        close.maker_cap_deferred,
+        "the distinct-maker cap, not the book, is what stopped this walk"
+    );
     assert_eq!(
         position(&mut ctx, ALICE).amount,
         1,
@@ -1390,6 +1398,7 @@ fn healthy_candidate_scan_is_write_free_even_with_accrued_funding() {
         ENTRY_PRICE,
         KEEPER,
         &mut adl_budget,
+        &mut false,
     )
     .unwrap();
     assert!(
@@ -6190,6 +6199,32 @@ mod liquidation_cap {
 
     /// 55 identical 5x longs, each its own address so each is its own registry entry. Seeded in a
     /// deterministic order so the test can also speak about WHICH ones get done.
+    /// `losers` underwater longs of `QTY`, against `QTY * losers` counterparties holding ONE unit
+    /// each.
+    ///
+    /// The shape matters: one fill per counterparty means a single loser costs `QTY` fills, so the
+    /// shared 128-fill ADL budget runs out after ~12 liquidations — long before the 50-slot cap.
+    /// A shared whale would absorb each loser in ONE fill and the slot cap would bind first, which
+    /// is a different test.
+    pub(super) fn seed_underwater_longs_fragmented(ctx: &mut TestCtx, losers: u8) -> Vec<Address> {
+        let users: Vec<Address> = (1..=losers)
+            .map(|i| {
+                let user = Address::from([i; 20]);
+                seed_position_account(ctx, user, QTY, -ENTRY_VALUE, MARGIN, 5, 0);
+                user
+            })
+            .collect();
+        for k in 0..(losers as u16) * (QTY as u16) {
+            let mut b = [0xC0u8; 20];
+            b[18] = (k >> 8) as u8;
+            b[19] = k as u8;
+            // One unit, same $100 entry and same 5x as the longs, so it is deeply in profit at any
+            // mark below $100 and stays an eligible candidate throughout.
+            seed_position_account(ctx, Address::from(b), -1, ENTRY_VALUE / QTY, MARGIN / QTY, 5, 0);
+        }
+        users
+    }
+
     pub(super) fn seed_underwater_longs(ctx: &mut TestCtx, n: u8) -> Vec<Address> {
         let users: Vec<Address> = (1..=n)
             .map(|i| {
@@ -6421,6 +6456,39 @@ mod deferred_work_drain {
             storage::load_premium_accumulator(&mut ctx, MARKET_ID).unwrap(),
             acc,
             "no extra premium sample — a permissionless rate skew"
+        );
+    }
+
+    /// **The ADL fill budget reaches the drain.** The fixture is built so the SLOT cap provably
+    /// cannot be the thing that fires: 20 losers is well under 50, but each needs `QTY` separate
+    /// counterparties, so the shared 128-fill budget runs out around the 13th liquidation.
+    ///
+    /// Before this signal existed the sweep returned `Ok(false)` whenever it completed its walk,
+    /// so an ADL-starved backlog left the bit at `0` and `drainDeferredWork` returned on the fast
+    /// path without sweeping anything — the whole backlog waited for the next oracle tick. This
+    /// pins that it no longer does.
+    #[test]
+    fn the_adl_fill_budget_also_sets_the_bit() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        // 20 losers x QTY fills each = 200 fills needed against only 20 slots: the 128-fill ADL
+        // budget is provably what stops this, not the 50-slot cap.
+        let users = seed_underwater_longs_fragmented(&mut ctx, 20);
+
+        oracle_update_at(&mut ctx, 8_500, 31);
+        let open_after_tick = still_open(&mut ctx, &users);
+        assert!(open_after_tick > 0, "the fixture must leave a backlog");
+        assert!(
+            20 - open_after_tick < MAX_LIQUIDATIONS_PER_UPDATE as usize,
+            "fixture: the slot cap must NOT be what stopped this, or the test proves nothing"
+        );
+        assert_eq!(flag(&mut ctx), 1, "a budget, not the market, stopped it");
+
+        // The drain gets fresh budgets and makes real progress — the thing the bit buys.
+        drain(&mut ctx);
+        assert!(
+            still_open(&mut ctx, &users) < open_after_tick,
+            "the drain must actually reduce the backlog"
         );
     }
 

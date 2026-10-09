@@ -716,11 +716,18 @@ pub(super) struct MatchRegistry {
     /// (see [`Self::credit_admin`]).
     fee_admin: Option<Address>,
     admin_credit_pending: u64,
+    /// Set when the walk stopped early because a LIQUIDATION close had already touched
+    /// [`MAX_LIQUIDATION_MAKER_ACCOUNTS`](super::MAX_LIQUIDATION_MAKER_ACCOUNTS) distinct makers.
+    /// That cap is per MATCH, not per sweep, so a later attempt gets a fresh allowance and can
+    /// absorb more of the same position from the same book — which makes this same-block
+    /// recoverable work and therefore something `deferred_work` must report.
+    maker_cap_deferred: bool,
 }
 
 impl MatchRegistry {
     pub(super) fn new() -> Self {
         Self {
+            maker_cap_deferred: false,
             users: Vec::new(),
             events: Vec::new(),
             fee_admin: None,
@@ -845,6 +852,10 @@ impl MatchRegistry {
         self.users.len() < limit || self.users.iter().any(|(address, _)| *address == user)
     }
 
+    pub(super) fn maker_cap_deferred(&self) -> bool {
+        self.maker_cap_deferred
+    }
+
     pub(super) fn defer_maker_level(
         &mut self,
         is_bid: bool,
@@ -852,6 +863,9 @@ impl MatchRegistry {
         queue: Vec<[u8; 32]>,
         count: u64,
     ) -> Result<(), PerpError> {
+        // The ONLY two call sites are the maker-cap breaks in `match_order`, so this is exactly
+        // "the cap stopped the walk" and not a general deferral.
+        self.maker_cap_deferred = true;
         if count == 0 {
             return Err(perp_invariant_err(
                 "liquidation maker cap reached with zero live level count",
