@@ -846,6 +846,72 @@ fn adl_fills_against_an_order_holder_and_cancels_their_orders() {
     assert_eq!(conservation_sum(&mut ctx, &[ALICE, KEEPER]), value_before);
 }
 
+/// **The sub-unit bankruptcy regime: fill at one price unit, insurance fund takes the shortfall.**
+///
+/// `calc_bankruptcy_price` floors to 0 when a position's whole remaining credit is worth less than
+/// ONE price unit spread over its size — `perp_core::math`'s
+/// `bankruptcy_price_floors_to_zero_for_a_sub_unit_short` pins exactly when, and that it is
+/// reachable rather than theoretical. ADL used to give up there, because filling at 0 would hand
+/// the position to the winner for free. That stranded a position no price move can ever rescue: it
+/// came back every tick, returned `Liquidated`, and burned one of the 50 slots, forever.
+///
+/// It now fills at ONE price unit — the closest representable price above the true bankruptcy
+/// price, hence the one that minimises the shortfall — and routes the shortfall to the insurance
+/// fund. ADL is bad-debt-free everywhere else ("scheme X: no IF"); this is the one deliberate
+/// exception, and it is a QUOTE claim only: the position is TRANSFERRED, so Σ amount is conserved
+/// exactly as on every other ADL path.
+///
+/// The bound is what makes it safe to grant: the shortfall cannot exceed the position's notional
+/// at one price unit, and the regime's defining inequality says the position's entire credit is
+/// below that same number. Dust by construction, not an open-ended claim on the fund.
+///
+/// ⚠️ This market has `base_decimals = 0`, `price_decimals = 2`, where `calc_value(1, q)` is exact
+/// — so `p_b == 0` and "price 1 leaves a shortfall" are the SAME condition here and every case is
+/// this one. Under decimals that leave flooring slack (the golden market's 8/9) the two separate,
+/// and price 1 can come out exactly clean; that sub-case is the one pinned in `perp_core::math`.
+#[test]
+fn a_sub_unit_bankrupt_short_closes_at_one_price_unit_with_the_fund_covering_the_gap() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // vQuote 1 against QTY units: the exact bankruptcy price is 1e-5 of a price unit → floors to 0.
+    seed_position_account(&mut ctx, ALICE, -QTY, 1, 0, 5, USER_WALLET as i64);
+    // A healthy, order-free LONG on the other side — a perfectly eligible counterparty, which is
+    // what makes "it still did not move" the sharp version of the old failure.
+    seed_position_account(&mut ctx, KEEPER, QTY, -1, 1_000_000, 5, 0);
+    storage::save_insurance_fund(&mut ctx, 1_000_000).unwrap();
+
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let value_before = conservation_sum(&mut ctx, &[ALICE, KEEPER]);
+    // Mark 2: insolvent, so the bankruptcy-price branch is the one taken.
+    storage::save_mark_price(&mut ctx, MARKET_ID, 2).unwrap();
+
+    liquidate(&mut ctx, ALICE).unwrap();
+
+    assert_eq!(position(&mut ctx, ALICE).amount, 0, "closed, not stranded");
+    assert_eq!(
+        position(&mut ctx, ALICE).amount + position(&mut ctx, KEEPER).amount,
+        0,
+        "Σ amount conserved — the position was TRANSFERRED, which is the whole point"
+    );
+
+    let notional_at_one_unit = calc_value(1, QTY as u64, 0, PRICE_DECIMALS).unwrap();
+    let shortfall = if_before - storage::load_insurance_fund(&mut ctx).unwrap();
+    assert_eq!(
+        shortfall,
+        notional_at_one_unit - 1,
+        "the fund absorbed exactly the loser's gap at price 1 (notional minus its 1 unit of credit)"
+    );
+    assert!(
+        shortfall < notional_at_one_unit,
+        "and it is bounded by the notional at one price unit"
+    );
+    assert_eq!(
+        conservation_sum(&mut ctx, &[ALICE, KEEPER]),
+        value_before,
+        "value conserved: what the winner gained is what the fund paid"
+    );
+}
+
 #[test]
 fn adl_defers_insolvent_residual_when_no_eligible_opposite_holder() {
     let mut ctx = make_ctx();

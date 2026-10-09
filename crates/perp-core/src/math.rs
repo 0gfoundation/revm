@@ -1685,6 +1685,54 @@ mod margin_tier_tests {
         }
     }
 
+    /// **When `calc_bankruptcy_price` returns 0, and that it is REACHABLE.**
+    ///
+    /// A `0` means no representable price makes this position's equity zero, so `run_adl` cannot
+    /// fill at the bankruptcy price and falls back to ONE price unit with the shortfall going to
+    /// the insurance fund. That guard was documented as probably-unreachable speculation. It is
+    /// not:
+    ///
+    /// `p_b = floor((vQuote + margin) * 10^(pd+bd) / (|amount| * 10^6))` for a short, so it floors
+    /// to 0 exactly when the position's whole remaining credit is worth less than ONE price unit
+    /// spread over its size. Two ways in:
+    ///
+    ///   * opened at the smallest representable price, with funding having clamped `margin` to 0
+    ///     (`funding.rs`: a charge is taken "down to 0", never negative) — the case below;
+    ///   * whittled down until the REMAINING notional floors `vQuote` to literally 0, which lands
+    ///     here at any entry price once the residual is small enough.
+    ///
+    /// ⚠️ What does NOT get you here, and an earlier version of this comment wrongly said did: a
+    /// PROPORTIONAL partial close. `p_b` is the per-unit credit, so halving both `vQuote` and
+    /// `|amount|` leaves it unchanged — it tracks the entry price. Only the flooring of `vQuote`
+    /// all the way to 0 breaks that invariance.
+    ///
+    /// ⚠️ The position is simultaneously INSOLVENT at any mark >= 2, which is what routes it to
+    /// the bankruptcy-price branch in the first place. Equity is exactly 0 at mark 1 (solvent,
+    /// fills at mark) and negative above — so the window where both hold is real, not vacuous.
+    #[test]
+    fn bankruptcy_price_floors_to_zero_for_a_sub_unit_short() {
+        const BD: u32 = 8;
+        const PD: u32 = 9;
+        let q: i64 = 150_000_000_000;
+        let v_quote = calc_value(1, q as u64, BD, PD).unwrap() as i64;
+        assert_eq!(v_quote, 1, "the open floors to one quote unit — the slack this depends on");
+
+        assert_eq!(
+            calc_bankruptcy_price(-q, v_quote, 0, BD, PD).unwrap(),
+            0,
+            "no representable price zeroes this position's equity"
+        );
+        // Solvent exactly at the floor, insolvent above it: the bankruptcy-price branch IS reached.
+        assert_eq!(
+            calc_position_equity(1, -q, v_quote, 0, BD, PD).unwrap(),
+            0
+        );
+        assert!(calc_position_equity(2, -q, v_quote, 0, BD, PD).unwrap() < 0);
+
+        // One unit of margin is enough to lift it back out — the regime really is this narrow.
+        assert_eq!(calc_bankruptcy_price(-q, v_quote, 1, BD, PD).unwrap(), 1);
+    }
+
     /// `is_above_maintenance_margin` under the default table must reproduce the pre-tier
     /// `>= notional/6` comparison verbatim — including the exact `>=` boundary.
     #[test]
