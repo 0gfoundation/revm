@@ -912,6 +912,101 @@ fn a_sub_unit_bankrupt_short_closes_at_one_price_unit_with_the_fund_covering_the
     );
 }
 
+/// **The already-bankrupt fallback tier.** When every opposite holder is itself under water, ADL
+/// used to find no candidate at all and defer — leaving a bankrupt position open, marking against
+/// a market with no solvent counterparty left, re-swept and burning a slot every tick.
+///
+/// It now conscripts them at the SAME price it was already using (the loser's bankruptcy price)
+/// and routes both sides' shortfalls to the insurance fund. The restriction is the whole argument:
+/// this holder's deficit is already the fund's — the sweep is going to liquidate it and route its
+/// bad debt there anyway — so this realises exposure that exists rather than creating any.
+#[test]
+fn adl_conscripts_an_already_bankrupt_counterparty_and_bills_the_fund() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // ALICE: 5x long 10 @ $100. At the $75 mark she is insolvent; her bankruptcy price is $80.
+    seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+    // KEEPER: 5x short 10 @ $50 — the only opposite holder, and BANKRUPT at $75 himself
+    // (equity -$150), so the old filter skipped him outright and nothing could close.
+    seed_position_account(&mut ctx, KEEPER, -QTY, 500_000_000, 100_000_000, 5, 0);
+    storage::save_insurance_fund(&mut ctx, 1_000_000_000).unwrap();
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let value_before = conservation_sum(&mut ctx, &[ALICE, KEEPER]);
+
+    oracle_tick(&mut ctx, 7_500, 31);
+
+    assert_eq!(position(&mut ctx, ALICE).amount, 0, "the bankrupt long is closed, not deferred");
+    assert_eq!(
+        position(&mut ctx, ALICE).amount + position(&mut ctx, KEEPER).amount,
+        0,
+        "Σ amount conserved — conscripting a counterparty is still a real trade"
+    );
+    assert!(
+        storage::load_insurance_fund(&mut ctx).unwrap() < if_before,
+        "the fund took the shortfall it was going to take anyway, just earlier"
+    );
+    assert_eq!(
+        conservation_sum(&mut ctx, &[ALICE, KEEPER]),
+        value_before,
+        "value conserved once the fund is counted"
+    );
+}
+
+/// ⚠️ **The refinement, and the line the tier must not cross.** A holder that is SOLVENT at the
+/// mark but could not absorb at the loser's bankruptcy price is NOT conscripted — it is skipped,
+/// and the residual defers instead.
+///
+/// The ADL price is a HAIRCUT: strictly worse for the counterparty than the mark (an insolvent
+/// long's `p_b` sits ABOVE the mark, and a short's equity falls as price rises). So pushing such a
+/// holder under would manufacture fund exposure that would not otherwise exist, at the expense of
+/// someone who is not bankrupt. "Already bankrupt at the mark" is what makes the fallback tier
+/// defensible, and it is exactly this test that stops it widening into "whoever is available".
+#[test]
+fn adl_does_not_conscript_a_solvent_holder_the_haircut_would_sink() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+    // KEEPER: 5x short 10 @ $62.50. At the $60 mark his equity is +$150 against a $100
+    // maintenance requirement — comfortably ABOVE maintenance, so the sweep does not touch him
+    // either — but at ALICE's $80 bankruptcy price it is -$50, so absorbing would sink him.
+    //
+    // ⚠️ The crash has to be this deep for the case to exist at all: the haircut is
+    // `(p_b - mark) * qty` and the buffer is `mmr * notional`, so a holder can only be
+    // "solvent but sunk by the haircut" when `(p_b - mark)/mark` exceeds the maintenance rate.
+    // At a $75 mark the 50M haircut is smaller than the 125M buffer and no such holder exists.
+    seed_position_account(&mut ctx, KEEPER, -QTY, 625_000_000, 125_000_000, 5, 0);
+    storage::save_insurance_fund(&mut ctx, 1_000_000_000).unwrap();
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+
+    oracle_tick(&mut ctx, 6_000, 31);
+
+    assert_eq!(
+        position(&mut ctx, KEEPER).amount,
+        -QTY,
+        "a solvent holder is never conscripted into bad debt"
+    );
+    assert_eq!(
+        position(&mut ctx, ALICE).amount,
+        QTY,
+        "so the residual defers, exactly as before"
+    );
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        if_before,
+        "and the fund is not billed for a deficit that does not exist yet"
+    );
+}
+
+fn oracle_tick(ctx: &mut TestCtx, index: u64, ts: u64) {
+    run_update_index_price(
+        &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: index, timestamp: ts }
+            .abi_encode(),
+        ADMIN,
+        ctx,
+    )
+    .unwrap();
+}
+
 #[test]
 fn adl_defers_insolvent_residual_when_no_eligible_opposite_holder() {
     let mut ctx = make_ctx();

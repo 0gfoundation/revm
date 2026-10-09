@@ -215,7 +215,7 @@ pub(crate) fn run_adl<H: PerpHost>(
         bd,
         pd,
     )?;
-    let mut allow_loser_bad_debt = false;
+    let mut loser_policy = BadDebtPolicy::Forbid;
     let fill_price = if residual_equity >= 0 {
         // `mark_price > 0` is a market invariant (`addMarket` rejects 0 and every mark component
         // is floored at 1), so the solvent branch needs no zero guard.
@@ -257,7 +257,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             //
             // The WINNER is still held to zero bad debt. Deferring remains the outcome when no
             // counterparty can absorb at this price.
-            allow_loser_bad_debt = true;
+            loser_policy = BadDebtPolicy::LoserOnly;
             1
         } else {
             p_b
@@ -268,6 +268,8 @@ pub(crate) fn run_adl<H: PerpHost>(
     // Enumerate + rank opposite-side candidates ONCE (rank stable within this call).
     let registry = storage::load_position_registry(context, market.market_id)?;
     let mut cands: Vec<(Address, i128, i128)> = Vec::new(); // (addr, uPnL@mark, equity@mark)
+    // Counterparties already bankrupt at the mark, held back until `cands` is spent. `(addr, eq)`.
+    let mut fallback: Vec<(Address, i128)> = Vec::new();
     for user in registry {
         if user == loser {
             continue;
@@ -289,12 +291,29 @@ pub(crate) fn run_adl<H: PerpHost>(
         let eq_mark =
             calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
         if eq_mark <= 0 {
-            continue; // itself liquidatable — leave to the sweep
+            // ── FALLBACK TIER: already bankrupt at the mark ─────────────────────────────────────
+            //
+            // Used only after every clean candidate is exhausted, and then at the price this ADL
+            // is already using, with BOTH sides' shortfalls going to the insurance fund.
+            //
+            // The restriction is the entire argument. This holder's deficit is ALREADY the fund's:
+            // the sweep is going to liquidate it, and an insolvent liquidation routes its bad debt
+            // there anyway. Filling it here does not create exposure, it realises exposure that
+            // exists — and realising it NOW caps it, where deferring lets the loser's position keep
+            // marking against a market that has no solvent counterparty left.
+            //
+            // ⚠️ A holder that is SOLVENT at the mark but could not absorb at the fill price
+            // (`eq_fill < 0` below) is NOT in this tier and is still skipped outright. The ADL
+            // price is a HAIRCUT — strictly worse for the counterparty than the mark — so pushing
+            // such a holder under would manufacture fund exposure that would not otherwise exist,
+            // at the expense of someone who is not bankrupt.
+            fallback.push((user, eq_mark as i128));
+            continue;
         }
         let eq_fill =
             calc_position_equity(fill_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
         if eq_fill < 0 {
-            continue; // cannot absorb at the fill price without going insolvent
+            continue; // solvent, but the haircut would push it under — never conscripted
         }
         let notional = calc_value_i64(mark_price, wp.amount, bd, pd)? as i128;
         cands.push((user, notional + wp.v_quote_balance as i128, eq_mark as i128));
@@ -308,6 +327,11 @@ pub(crate) fn run_adl<H: PerpHost>(
         let rhs = b.1.saturating_mul(a.2); // uPnL_B * eq_A
         rhs.cmp(&lhs).then_with(|| a.0.cmp(&b.0))
     });
+    // The fallback tier cannot use ROE — its denominator is <= 0 — so: LEAST insolvent first
+    // (equity DESC), Address ASC tie-break. Least-insolvent-first is not arbitrary: it is the
+    // order that hands the fund the smallest bill, since the shortfall a holder contributes grows
+    // with how far under it already is.
+    fallback.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut remaining = loser_pos.amount.unsigned_abs();
     let loser_close_is_buy = !loser_is_long; // long closes by selling, short by buying
@@ -324,14 +348,28 @@ pub(crate) fn run_adl<H: PerpHost>(
         .checked_sub(loser_pos.margin)
         .ok_or_else(|| perp_err("adl: Σ position margin underflow"))?;
     let mut did_any = false;
-    // Only ever non-zero in the sub-unit bankruptcy regime above; absorbed once after the loop
-    // rather than per fill, so the fund takes one write and one event for the whole ADL.
-    let mut loser_bad_debt: u64 = 0;
+    // Shortfalls this ADL could not avoid: the loser's in the sub-unit bankruptcy regime, the
+    // winner's in the already-bankrupt fallback tier. Zero on every ordinary fill. Absorbed once
+    // after the loop rather than per fill, so the fund takes one write and one event for the
+    // whole ADL.
+    let mut bad_debt: u64 = 0;
 
-    for (winner, _, _) in cands {
+    // Clean candidates first, then — only if the residual outlives them — the already-bankrupt
+    // fallback tier. One loop, so the budget, the cancels and the event shape are shared; the only
+    // difference is which shortfalls the fill is allowed to leave behind.
+    let queue = cands
+        .into_iter()
+        .map(|(w, _, _)| (w, false))
+        .chain(fallback.into_iter().map(|(w, _)| (w, true)));
+    for (winner, is_fallback) in queue {
         if *budget == 0 || remaining == 0 {
             break;
         }
+        let policy = if is_fallback {
+            BadDebtPolicy::BothSides
+        } else {
+            loser_policy
+        };
         let mut winner_pos = storage::load_position(context, winner, market.market_id)?;
         let mut winner_account = storage::load_account(context, winner)?;
         let take = winner_pos.amount.unsigned_abs().min(remaining);
@@ -344,7 +382,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             winner_close_is_buy,
             take,
             fill_price,
-            allow_loser_bad_debt,
+            policy,
             bd,
             pd,
         )?
@@ -434,7 +472,9 @@ pub(crate) fn run_adl<H: PerpHost>(
             fill.quantity,
         )?;
         remaining -= fill.quantity;
-        loser_bad_debt = loser_bad_debt.saturating_add(fill.loser_bad_debt);
+        bad_debt = bad_debt
+            .saturating_add(fill.loser_bad_debt)
+            .saturating_add(fill.winner_bad_debt);
         *budget -= 1;
         did_any = true;
     }
@@ -466,7 +506,7 @@ pub(crate) fn run_adl<H: PerpHost>(
     // claim only: the position itself went to the winner, so Σ amount is untouched. It is routed
     // AFTER the loser's `clear_account_snapshot_mark` above on purpose — it moves no wallet, so it
     // cannot re-mark the loser, and the row reads as the fund absorbing, not as a balance change.
-    super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, loser_bad_debt)?;
+    super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
 
     // ── reduce-only: ADL shrank (or flipped) the loser's position ────────────────────────────
     //
@@ -496,9 +536,34 @@ struct AdlFillOutcome {
     quantity: u64,
     loser_realized_pnl: i64,
     winner_realized_pnl: i64,
-    /// Non-zero ONLY in the sub-unit bankruptcy regime (`allow_loser_bad_debt`). The caller routes
-    /// it to the insurance fund; the WINNER's bad debt is never permitted, at any price.
+    /// Non-zero only where [`BadDebtPolicy`] allows it. The caller routes both to the fund.
     loser_bad_debt: u64,
+    winner_bad_debt: u64,
+}
+
+/// Which side, if either, an ADL fill may leave short. The fill is always TRIED bad-debt-free
+/// first (`adl_fill` shrinks `take` before giving up), so a permission is a fallback, never a
+/// preference.
+#[derive(Clone, Copy, PartialEq)]
+enum BadDebtPolicy {
+    /// Every ordinary ADL fill. Neither side may end up short — "scheme X: no IF".
+    Forbid,
+    /// The sub-unit bankruptcy regime: no representable price closes the LOSER cleanly, so its
+    /// gap (bounded by the position's notional at one price unit) goes to the fund.
+    LoserOnly,
+    /// Last resort, and only against a counterparty that is ALREADY bankrupt at the mark. See
+    /// `run_adl`'s fallback tier for why that restriction is the whole argument.
+    BothSides,
+}
+
+impl BadDebtPolicy {
+    fn accepts(self, loser: u64, winner: u64) -> bool {
+        match self {
+            Self::Forbid => loser == 0 && winner == 0,
+            Self::LoserOnly => winner == 0,
+            Self::BothSides => true,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -511,11 +576,7 @@ fn adl_fill(
     winner_close_is_buy: bool,
     take: u64,
     fill_price: u64,
-    // `allow_loser_bad_debt`: see `run_adl`'s `p_b == 0` branch. Lets the LOSER's leg come out
-    // short, bounded by the position's notional at one price unit, so a position no representable
-    // price can close cleanly still closes. The winner's leg stays strictly bad-debt-free either
-    // way, at any price.
-    allow_loser_bad_debt: bool,
+    policy: BadDebtPolicy,
     bd: u32,
     pd: u32,
 ) -> Result<Option<AdlFillOutcome>, PerpError> {
@@ -551,7 +612,7 @@ fn adl_fill(
             winner_close_is_buy,
             OpeningMarginFunding::Requirement,
         )?;
-        if winner_outcome.bad_debt == 0 && (allow_loser_bad_debt || loser_outcome.bad_debt == 0) {
+        if policy.accepts(loser_outcome.bad_debt, winner_outcome.bad_debt) {
             *loser_pos = lp;
             *loser_wallet = lw;
             *winner_pos = wp;
@@ -561,6 +622,7 @@ fn adl_fill(
                 loser_realized_pnl: loser_outcome.realized_pnl,
                 winner_realized_pnl: winner_outcome.realized_pnl,
                 loser_bad_debt: loser_outcome.bad_debt,
+                winner_bad_debt: winner_outcome.bad_debt,
             }));
         }
         t -= 1;
