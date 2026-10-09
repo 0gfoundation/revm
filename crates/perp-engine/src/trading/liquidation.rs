@@ -10,7 +10,6 @@ use crate::{
     interface::IPerpDex,
     math::{
         calc_bankruptcy_price, calc_position_equity, calc_value, calc_value_i64,
-        checked_u64_to_i64,
     },
     storage,
     types::{AccountUpdateReason, Market, Order, OrderKind, OrderStatus, Side},

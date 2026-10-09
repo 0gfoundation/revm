@@ -969,9 +969,14 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         Side::Buy
     };
     let liquidation_quantity = pos.amount.unsigned_abs();
+    // The margin this liquidation STARTS from. Captured after `compute_funding_settlement` has
+    // already adjusted `pos.margin` in memory and before anything closes, so the difference
+    // against the post-close margin is purely what the close consumed — no funding in it. That
+    // ordering is what the clearance fee below depends on; do not move either half.
     let pre_liq_margin = pos.margin.max(0) as u64;
 
     // ── APPLY (liquidatable — commit the funding settle, then close) ──
+    let funding_published = pending_funding.is_some();
     if let Some(p) = pending_funding {
         apply_funding_settlement(context, p)?;
     }
@@ -982,6 +987,20 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // publishes nothing at all (empty book AND an insolvent residual AND no eligible ADL holder),
     // where it then meets the clearance fee's `InsuranceClear` and merges to `Multiple`.
     storage::save_position(context, user, market_id, &pos, AccountUpdateReason::FundingFee)?;
+    // That write MARKS the user, but it persists EXACTLY the `pos` the group `apply_funding_settlement`
+    // just published was derived from — nothing touches it in between — so the end-of-call drain
+    // would repeat that payload as a 0-position group with no news in it. Clear it, on the same
+    // structural-equality argument as `run_adl`'s loser clear, and only when something really was
+    // published.
+    //
+    // ⚠️ This used to be invisible because the clearance fee ALWAYS wrote the account a few lines
+    // down and so always gave the drained row something to say. Now that the fee is levied on the
+    // margin actually consumed, a liquidation that closes nothing charges nothing — and without
+    // this clear it would emit a duplicate. Any later leg that moves money (a fill, ADL, the fee)
+    // re-marks the user and the settled end state is still published.
+    if funding_published {
+        storage::clear_account_snapshot_mark(context, user);
+    }
 
     // Cancel all open orders for this user/market (emits OrderCancelled events).
     cancel_all_orders_for_market(context, user, market_id, market, CancelReason::Liquidation)?;
@@ -1033,9 +1052,27 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // further under (and `as u64` on a negative i64 would otherwise wrap to an astronomical cap).
     // Charge the clearance fee from the liquidated user's remaining wallet (capped at the balance)
     // and credit it to the Insurance Fund.
+    //
+    // ── THE FEE IS LEVIED ON WHAT THIS CALL ACTUALLY CLOSED ──────────────────────────────────────
+    //
+    // Not on `pre_liq_margin`. A liquidation does NOT always finish in one call: the book leg can
+    // stop on the band or the distinct-maker cap, and the ADL leg can stop on the shared fill
+    // budget or find too little eligible opposite interest. The position then stays open and is
+    // re-swept — and a fee on the margin present at ENTRY charged the user again every round.
+    // Over n rounds that is a geometric series, up to ~2.5x the intended fee, and it is the user
+    // paying for OUR gas caps on what is one liquidation they did not finish.
+    //
+    // Levying it on the margin the call consumed makes the total exactly one fee no matter how
+    // many rounds it takes, with NO state to remember that this victim was already charged: the
+    // consumed amounts sum to the starting margin by construction. A full close is unchanged
+    // (post == 0), and a call that closed NOTHING — empty book, no ADL budget — now charges
+    // nothing, which is also the honest answer. Binance's liquidation fee is a rate on the
+    // notional actually closed, not a flat penalty, so this is the closer model besides.
+    let post_liq_margin = storage::load_position(context, user, market_id)?.margin.max(0) as u64;
+    let closed_margin = pre_liq_margin.saturating_sub(post_liq_margin);
     let mut account = storage::load_account(context, user)?;
     let clearance_fee = {
-        let fee = (pre_liq_margin as u128).saturating_mul(market.liquidation_fee_rate_bps as u128)
+        let fee = (closed_margin as u128).saturating_mul(market.liquidation_fee_rate_bps as u128)
             / 10_000;
         let fee = (fee as u64).min(account.perp_wallet_balance.max(0) as u64);
         if fee > 0 {

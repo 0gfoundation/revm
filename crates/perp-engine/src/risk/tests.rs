@@ -823,18 +823,21 @@ fn adl_fills_against_an_order_holder_and_cancels_their_orders() {
     );
     // `Adl`, NOT `Liquidation`: KEEPER was profitable and was picked for that reason. Reporting a
     // liquidation here would tell every downstream consumer the opposite of what happened.
-    assert!(
-        JournalTr::take_logs(ctx.journal_mut())
-            .into_iter()
-            .filter(|l| l.data.topics().first() == Some(&crate::interface::IPerpDex::OrderCancelled::SIGNATURE_HASH))
-            .any(|l| {
-                crate::interface::IPerpDex::OrderCancelled::decode_raw_log(l.data.topics(), &l.data.data)
-                    .unwrap()
-                    .reason
-                    == CancelReason::Adl as u8
-            }),
-        "the cancel must be attributed to ADL"
-    );
+    {
+        use crate::interface::IPerpDex::OrderCancelled;
+        assert!(
+            JournalTr::take_logs(ctx.journal_mut())
+                .into_iter()
+                .filter(|l| l.data.topics().first() == Some(&OrderCancelled::SIGNATURE_HASH))
+                .any(|l| {
+                    OrderCancelled::decode_raw_log(l.data.topics(), &l.data.data)
+                        .unwrap()
+                        .reason
+                        == CancelReason::Adl as u8
+                }),
+            "the cancel must be attributed to ADL"
+        );
+    }
     assert_eq!(
         storage::load_insurance_fund(&mut ctx).unwrap(),
         if_before,
@@ -3110,6 +3113,69 @@ fn liquidate_short_buys_full_position_from_asks() {
     assert_eq!(wallet(&mut ctx, KEEPER), 0);
 }
 
+/// **The clearance fee is levied on the margin this call CONSUMED, so n rounds cost one fee.**
+///
+/// A liquidation does not always finish in one call — the book leg can stop on the band or the
+/// distinct-maker cap, the ADL leg on the shared fill budget or on too little eligible opposite
+/// interest — and the position is then re-swept. The fee used to be `entry margin x rate` every
+/// round, so finishing in n rounds cost a geometric series: the user paying repeatedly, for one
+/// liquidation, because of OUR gas caps.
+///
+/// Here the book absorbs half, there is no ADL counterparty, so the rest defers; a second round
+/// finishes it. The two fees must sum to the ONE-SHOT fee, which the control half measures rather
+/// than restates. Under the old rule the split run was strictly more expensive — that is the
+/// `assert!` at the end, and it is what fails if the base reverts to `pre_liq_margin`.
+#[test]
+fn a_liquidation_split_over_two_rounds_pays_one_clearance_fee() {
+    // ── split: 5 units through the book, 5 deferred, then the rest ──
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    m.liquidation_fee_rate_bps = 500;
+    storage::save_market(&mut ctx, &m).unwrap();
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
+
+    place_maker_order(&mut ctx, Side::Buy as u8, LONG_LIQ_PRICE, QTY as u64 / 2);
+    liquidate(&mut ctx, ALICE).unwrap();
+    let after_round_1 = position(&mut ctx, ALICE).amount;
+    assert_eq!(after_round_1, QTY / 2, "half closed, half deferred — no ADL counterparty");
+    let fee_1 = storage::load_insurance_fund(&mut ctx).unwrap();
+    assert!(fee_1 > 0, "a round that DID close something must still charge");
+
+    place_maker_order(&mut ctx, Side::Buy as u8, LONG_LIQ_PRICE, QTY as u64 / 2);
+    liquidate(&mut ctx, ALICE).unwrap();
+    assert_eq!(position(&mut ctx, ALICE).amount, 0, "finished");
+    let split_total = storage::load_insurance_fund(&mut ctx).unwrap();
+
+    // ── control: the identical position closed in ONE round ──
+    let mut ctl = make_ctx();
+    setup_market(&mut ctl);
+    let mut m = storage::load_market(&mut ctl, MARKET_ID).unwrap().unwrap();
+    m.liquidation_fee_rate_bps = 500;
+    storage::save_market(&mut ctl, &m).unwrap();
+    save_position(&mut ctl, QTY, -ENTRY_VALUE);
+    storage::save_mark_price(&mut ctl, MARKET_ID, LONG_LIQ_PRICE).unwrap();
+    place_maker_order(&mut ctl, Side::Buy as u8, LONG_LIQ_PRICE, QTY as u64);
+    liquidate(&mut ctl, ALICE).unwrap();
+    assert_eq!(position(&mut ctl, ALICE).amount, 0);
+    let one_shot = storage::load_insurance_fund(&mut ctl).unwrap();
+
+    assert_eq!(
+        split_total, one_shot,
+        "splitting a liquidation must not change what it costs the user"
+    );
+    // The sharp one. Round 1 closed exactly half the position, so it pays exactly half the fee.
+    // Under the old `entry margin x rate` base it would have paid the WHOLE fee up front — and the
+    // deferred half would then have been charged again next round, for 1.5x in total. Reverting
+    // the base makes this `one_shot == one_shot`... on the left and fails here.
+    assert_eq!(
+        fee_1 * 2,
+        one_shot,
+        "half the position closed must cost half the fee: one_shot={one_shot} round1={fee_1}"
+    );
+}
+
 #[test]
 fn liquidate_closes_the_book_unfillable_residual_by_adl_at_mark() {
     let mut ctx = make_ctx();
@@ -4746,9 +4812,9 @@ mod band_expiry {
     fn cancel_reasons(ctx: &mut TestCtx) -> Vec<u8> {
         JournalTr::take_logs(ctx.journal_mut())
             .into_iter()
-            .filter(|l| l.data.topics().first() == Some(&crate::interface::IPerpDex::OrderCancelled::SIGNATURE_HASH))
+            .filter(|l| l.data.topics().first() == Some(&OrderCancelled::SIGNATURE_HASH))
             .map(|l| {
-                crate::interface::IPerpDex::OrderCancelled::decode_raw_log(l.data.topics(), &l.data.data)
+                OrderCancelled::decode_raw_log(l.data.topics(), &l.data.data)
                     .unwrap()
                     .reason
             })
@@ -5680,17 +5746,25 @@ mod account_update_stream {
     /// no single label describes — and rather than pick one and lie about the other, it says
     /// `Multiple`.
     ///
-    /// This is the funding-plus-clearance-fee shape, and reaching it takes all four legs: ALICE is
-    /// liquidatable, the book is EMPTY (so the close publishes nothing), her residual is INSOLVENT
-    /// (so it takes the ADL path rather than the close-at-mark path, which would have published), and
-    /// no eligible opposite holder exists (so `run_adl` defers and writes nothing). Nothing publishes
-    /// for her — so the `FundingFee` mark from the write that persisted her funding settlement is
-    /// still standing when the clearance fee marks her `InsuranceClear`.
+    /// ⚠️ **RE-POINTED.** This used to reach `Multiple` through funding-plus-clearance-fee, on a
+    /// fixture where the liquidation closed NOTHING (empty book, insolvent residual, no eligible
+    /// ADL counterparty): nothing published for ALICE, so the `FundingFee` mark was still standing
+    /// when the clearance fee marked her `InsuranceClear`.
     ///
-    /// Remove any one leg and the row becomes single-valued, which is the point: `Multiple` is what
-    /// the rule produces in a corner, not a bucket the common paths fall into.
+    /// That shape is gone, because the clearance fee is now levied on the margin the call actually
+    /// CONSUMED. A liquidation that closed nothing charges nothing, so there is no second cause —
+    /// and the two paths that DO consume margin (the book leg and ADL) both publish for the user
+    /// inline, which clears the funding mark. The combination is unreachable by construction.
+    ///
+    /// So this now pins the new rule where the old one was observable, which is the same corner
+    /// from the other side: nothing closed, therefore no fee, therefore exactly ONE cause. The
+    /// remaining candidate for a genuine `Multiple` is the rounding write-off in
+    /// `execute_liquidation_market_order`'s full-fill path meeting the fee's `InsuranceClear` (that
+    /// site's own comment says so); it needs a hand-tuned residue and has no fixture yet.
+    /// `AccountUpdateReason::merge` itself is a four-line pure function with its wire values pinned
+    /// in `perp-core`.
     #[test]
-    fn two_causes_with_no_inline_emit_collapse_to_multiple() {
+    fn a_liquidation_that_closes_nothing_charges_no_fee_and_reports_one_cause() {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
         let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
@@ -5737,10 +5811,17 @@ mod account_update_stream {
 
         let logs = JournalTr::take_logs(ctx.journal_mut());
         assert_account_update_groups(&logs);
-        assert_ne!(
+        assert_eq!(
             position(&mut ctx, ALICE).amount,
+            QTY,
+            "fixture: nothing may close — empty book, insolvent residual, no ADL counterparty"
+        );
+        assert_eq!(
+            storage::load_insurance_fund(&mut ctx).unwrap(),
             0,
-            "fixture: the residual must be left OPEN — an ADL that found a counterparty would have              published inline and cleared the mark"
+            "a liquidation that consumed no margin charges no clearance fee, however many times \
+             it is retried — this is what stops a never-ADL-able position from having its wallet \
+             drained one fee per oracle tick forever"
         );
         let reasons = account_update_reasons(&logs);
         assert_eq!(
@@ -5749,12 +5830,10 @@ mod account_update_stream {
                 .filter(|(u, _)| *u == ALICE)
                 .map(|(_, r)| *r)
                 .collect::<Vec<_>>(),
-            vec![
-                // the funding group, published inline by `apply_funding_settlement`…
-                R::FundingFee,
-                // …and the ONE drained row, covering both the funding write and the clearance fee
-                R::Multiple,
-            ],
+            // EXACTLY ONE group: the funding settle, published inline. No clearance fee (nothing
+            // closed), and the post-funding position write's mark is cleared because the drain
+            // would only repeat that same payload with no position rows.
+            vec![R::FundingFee],
             "got {reasons:?}"
         );
     }
