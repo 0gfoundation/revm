@@ -952,48 +952,64 @@ fn adl_conscripts_an_already_bankrupt_counterparty_and_bills_the_fund() {
     );
 }
 
-/// ⚠️ **The refinement, and the line the tier must not cross.** A holder that is SOLVENT at the
-/// mark but could not absorb at the loser's bankruptcy price is NOT conscripted — it is skipped,
-/// and the residual defers instead.
+/// ⚠️ **INVERTED, as a deliberate temporary simplification.** This used to pin the opposite: a
+/// holder SOLVENT at the mark but unable to absorb at the loser's bankruptcy price was skipped
+/// outright, and the residual deferred.
 ///
-/// The ADL price is a HAIRCUT: strictly worse for the counterparty than the mark (an insolvent
-/// long's `p_b` sits ABOVE the mark, and a short's equity falls as price rises). So pushing such a
-/// holder under would manufacture fund exposure that would not otherwise exist, at the expense of
-/// someone who is not bankrupt. "Already bankrupt at the mark" is what makes the fallback tier
-/// defensible, and it is exactly this test that stops it widening into "whoever is available".
+/// Nobody is excluded now. Everything that cannot absorb bad-debt-free goes to the fallback tier
+/// and the insurance fund covers the shortfall.
+///
+/// **The cost is real and is not being denied.** This holder is not bankrupt — nothing would
+/// liquidate it at the mark — and the ADL price is a HAIRCUT (an insolvent long's `p_b` sits ABOVE
+/// the mark, and a short's equity falls as price rises), so conscripting it manufactures fund
+/// exposure that would not otherwise exist, at the expense of someone who did nothing wrong.
+///
+/// What it buys: ADL essentially cannot fail any more. `Σ amount == 0` holds inside a market
+/// (every `apply_position_fill` call site is two-sided), so opposite capacity always covers the
+/// residual; with nobody excluded the only remaining limit is the fill budget, and that is
+/// progress rather than a stall. Bankrupt positions stop accumulating in the registry, which is
+/// what was burning liquidation slots and re-arming `deferred_work` every tick.
+///
+/// ⚠️ When this is revisited, the fixture is already the right one — flip the assertions back and
+/// the narrow-band exclusion returns. The likely middle ground is in `adl_fill`: it shrinks `take`
+/// by at most 4 (dust), so a holder able to absorb PART of the residual cleanly is still billed to
+/// the fund for the whole take.
 #[test]
-fn adl_does_not_conscript_a_solvent_holder_the_haircut_would_sink() {
+fn adl_conscripts_even_a_solvent_holder_and_the_fund_covers_the_haircut() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
-    // KEEPER: 5x short 10 @ $62.50. At the $60 mark his equity is +$150 against a $100
-    // maintenance requirement — comfortably ABOVE maintenance, so the sweep does not touch him
-    // either — but at ALICE's $80 bankruptcy price it is -$50, so absorbing would sink him.
+    // KEEPER: 5x short 10 @ $62.50. At the $60 mark his equity is +$150 against a $100 maintenance
+    // requirement — comfortably ABOVE maintenance, so the sweep does not touch him either — but at
+    // ALICE's $80 bankruptcy price it is -$50.
     //
     // ⚠️ The crash has to be this deep for the case to exist at all: the haircut is
-    // `(p_b - mark) * qty` and the buffer is `mmr * notional`, so a holder can only be
-    // "solvent but sunk by the haircut" when `(p_b - mark)/mark` exceeds the maintenance rate.
-    // At a $75 mark the 50M haircut is smaller than the 125M buffer and no such holder exists.
+    // `(p_b - mark) * qty` and the buffer is `mmr * notional`, so a holder is only "solvent but
+    // sunk by the haircut" when `(p_b - mark)/mark` exceeds the maintenance rate. At a $75 mark the
+    // 50M haircut is smaller than the 125M buffer and no such holder exists.
     seed_position_account(&mut ctx, KEEPER, -QTY, 625_000_000, 125_000_000, 5, 0);
     storage::save_insurance_fund(&mut ctx, 1_000_000_000).unwrap();
     let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let value_before = conservation_sum(&mut ctx, &[ALICE, KEEPER]);
 
     oracle_tick(&mut ctx, 6_000, 31);
 
+    assert_eq!(position(&mut ctx, ALICE).amount, 0, "the bankrupt long closes");
     assert_eq!(
         position(&mut ctx, KEEPER).amount,
-        -QTY,
-        "a solvent holder is never conscripted into bad debt"
+        0,
+        "and the solvent holder is conscripted to do it"
     );
     assert_eq!(
-        position(&mut ctx, ALICE).amount,
-        QTY,
-        "so the residual defers, exactly as before"
+        if_before - storage::load_insurance_fund(&mut ctx).unwrap(),
+        50_000_000,
+        "the fund covers exactly his $50 shortfall at the $80 fill price — exposure that did not \
+         exist before this fill, which is the cost being accepted here"
     );
     assert_eq!(
-        storage::load_insurance_fund(&mut ctx).unwrap(),
-        if_before,
-        "and the fund is not billed for a deficit that does not exist yet"
+        conservation_sum(&mut ctx, &[ALICE, KEEPER]),
+        value_before,
+        "value conserved once the fund is counted"
     );
 }
 

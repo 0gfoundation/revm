@@ -291,29 +291,47 @@ pub(crate) fn run_adl<H: PerpHost>(
         let eq_mark =
             calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
         if eq_mark <= 0 {
-            // ── FALLBACK TIER: already bankrupt at the mark ─────────────────────────────────────
+            // ── FALLBACK TIER ───────────────────────────────────────────────────────────────────
             //
-            // Used only after every clean candidate is exhausted, and then at the price this ADL
-            // is already using, with BOTH sides' shortfalls going to the insurance fund.
+            // Everything that cannot absorb bad-debt-free lands here, and is used only after every
+            // clean candidate is exhausted — then at the price this ADL is already using, with
+            // BOTH sides' shortfalls going to the insurance fund.
             //
-            // The restriction is the entire argument. This holder's deficit is ALREADY the fund's:
-            // the sweep is going to liquidate it, and an insolvent liquidation routes its bad debt
-            // there anyway. Filling it here does not create exposure, it realises exposure that
-            // exists — and realising it NOW caps it, where deferring lets the loser's position keep
-            // marking against a market that has no solvent counterparty left.
+            // This arm is the easy half: the holder is ALREADY bankrupt at the mark, so its
+            // deficit is already the fund's — the sweep is going to liquidate it and route its bad
+            // debt there anyway. Filling it here does not create exposure, it realises exposure
+            // that exists, and realising it NOW caps it, where deferring lets the loser's position
+            // keep marking against a market with no solvent counterparty left. The `eq_fill < 0`
+            // arm below is the one with a real cost; see its note.
             //
-            // ⚠️ A holder that is SOLVENT at the mark but could not absorb at the fill price
-            // (`eq_fill < 0` below) is NOT in this tier and is still skipped outright. The ADL
-            // price is a HAIRCUT — strictly worse for the counterparty than the mark — so pushing
-            // such a holder under would manufacture fund exposure that would not otherwise exist,
-            // at the expense of someone who is not bankrupt.
             fallback.push((user, eq_mark as i128));
             continue;
         }
         let eq_fill =
             calc_position_equity(fill_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
         if eq_fill < 0 {
-            continue; // solvent, but the haircut would push it under — never conscripted
+            // ⚠️ DELIBERATE, AND KNOWN TO BE THE WEAK PART — a temporary simplification, chosen
+            // with the trade-off understood, to be revisited.
+            //
+            // This holder is SOLVENT at the mark: nobody would liquidate it, and the ADL price is
+            // a HAIRCUT (an insolvent long's `p_b` sits ABOVE the mark, and a short's equity falls
+            // as price rises), so conscripting it manufactures fund exposure that would not
+            // otherwise exist, at the expense of someone who is not bankrupt. That is a real cost
+            // and it is not being denied here.
+            //
+            // It buys the property that ADL now essentially CANNOT fail: `Σ amount == 0` holds
+            // inside a market (every `apply_position_fill` call site is two-sided), so opposite
+            // capacity always covers the residual, and with nobody excluded the only remaining
+            // limit is the fill budget — which is progress, not a stall. Bankrupt positions stop
+            // accumulating in the registry, which is what was burning liquidation slots and
+            // re-arming `deferred_work` every tick.
+            //
+            // The refinement when this is revisited: `adl_fill` only shrinks `take` by up to 4
+            // (dust), so a holder who could absorb PART of the residual bad-debt-free still gets
+            // billed to the fund for the whole take. Searching for the largest clean size first
+            // would charge the fund only the genuine remainder. `BadDebtPolicy` is the seam.
+            fallback.push((user, eq_mark as i128));
+            continue;
         }
         let notional = calc_value_i64(mark_price, wp.amount, bd, pd)? as i128;
         cands.push((user, notional + wp.v_quote_balance as i128, eq_mark as i128));
@@ -327,10 +345,10 @@ pub(crate) fn run_adl<H: PerpHost>(
         let rhs = b.1.saturating_mul(a.2); // uPnL_B * eq_A
         rhs.cmp(&lhs).then_with(|| a.0.cmp(&b.0))
     });
-    // The fallback tier cannot use ROE — its denominator is <= 0 — so: LEAST insolvent first
-    // (equity DESC), Address ASC tie-break. Least-insolvent-first is not arbitrary: it is the
-    // order that hands the fund the smallest bill, since the shortfall a holder contributes grows
-    // with how far under it already is.
+    // The fallback tier cannot use ROE — its denominator may be <= 0 — so: HEALTHIEST first
+    // (equity at mark DESC), Address ASC tie-break. Not arbitrary: the shortfall a holder
+    // contributes grows with how far under it already is, so this hands the fund the smallest
+    // bill, and it naturally serves the merely-thin before the already-bankrupt.
     fallback.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut remaining = loser_pos.amount.unsigned_abs();
