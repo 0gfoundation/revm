@@ -326,10 +326,14 @@ pub(crate) fn run_adl<H: PerpHost>(
             // accumulating in the registry, which is what was burning liquidation slots and
             // re-arming `deferred_work` every tick.
             //
-            // The refinement when this is revisited: `adl_fill` only shrinks `take` by up to 4
-            // (dust), so a holder who could absorb PART of the residual bad-debt-free still gets
-            // billed to the fund for the whole take. Searching for the largest clean size first
-            // would charge the fund only the genuine remainder. `BadDebtPolicy` is the seam.
+            // ⚠️ Note for whoever revisits this: there is NO "charge the fund only for the part
+            // it could not absorb cleanly" refinement available. `apply_position_fill` prorates
+            // BOTH `margin_release` and `vq_fraction` by the closed fraction, so the shortfall is
+            // LINEAR in the quantity closed — if the whole position is short at this price, every
+            // slice of it is short in the same proportion. Shrinking `take` buys nothing beyond
+            // the dust `adl_fill` already handles. The real knob is the eligibility rule itself.
+            //
+            // `BadDebtPolicy` is the seam if the exclusion comes back.
             fallback.push((user, eq_mark as i128));
             continue;
         }
@@ -375,11 +379,15 @@ pub(crate) fn run_adl<H: PerpHost>(
     // Clean candidates first, then — only if the residual outlives them — the already-bankrupt
     // fallback tier. One loop, so the budget, the cancels and the event shape are shared; the only
     // difference is which shortfalls the fill is allowed to leave behind.
-    let queue = cands
+    let mut queue: Vec<(Address, bool)> = cands
         .into_iter()
         .map(|(w, _, _)| (w, false))
-        .chain(fallback.into_iter().map(|(w, _)| (w, true)));
-    for (winner, is_fallback) in queue {
+        .chain(fallback.into_iter().map(|(w, _)| (w, true)))
+        .collect();
+    let mut qi = 0;
+    while qi < queue.len() {
+        let (winner, is_fallback) = queue[qi];
+        qi += 1;
         if *budget == 0 || remaining == 0 {
             break;
         }
@@ -405,7 +413,20 @@ pub(crate) fn run_adl<H: PerpHost>(
             pd,
         )?
         else {
-            continue; // no clean (bad-debt-free) fill possible — skip this winner
+            // A clean-tier candidate the bad-debt-free trial rejected. Do NOT drop it: re-queue it
+            // behind the fallback tier, where `BothSides` accepts.
+            //
+            // Without this, one dust-level rounding on the LOSER's leg — the same leg for every
+            // clean-tier candidate — rejects ALL of them at once, and if no holder happened to
+            // land in the fallback tier the residual defers with capacity sitting right there.
+            //
+            // Terminates: only a non-fallback entry is ever pushed, so each address is re-queued at
+            // most once, and a `BothSides` trial cannot reject (its `accepts` is unconditional and
+            // `take >= 1` under the loop guards).
+            if !is_fallback {
+                queue.push((winner, true));
+            }
+            continue;
         };
         // ── Binance parity: an ADL'd account's open orders are cancelled ─────────────────────────
         //

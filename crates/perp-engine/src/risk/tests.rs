@@ -971,9 +971,10 @@ fn adl_conscripts_an_already_bankrupt_counterparty_and_bills_the_fund() {
 /// what was burning liquidation slots and re-arming `deferred_work` every tick.
 ///
 /// ⚠️ When this is revisited, the fixture is already the right one — flip the assertions back and
-/// the narrow-band exclusion returns. The likely middle ground is in `adl_fill`: it shrinks `take`
-/// by at most 4 (dust), so a holder able to absorb PART of the residual cleanly is still billed to
-/// the fund for the whole take.
+/// the narrow-band exclusion returns. Note that "bill the fund only for the part it could not
+/// absorb cleanly" is NOT available as a middle ground: `apply_position_fill` prorates both the
+/// margin release and the vQuote fraction, so the shortfall is LINEAR in the quantity closed and
+/// every slice is short in the same proportion as the whole.
 #[test]
 fn adl_conscripts_even_a_solvent_holder_and_the_fund_covers_the_haircut() {
     let mut ctx = make_ctx();
