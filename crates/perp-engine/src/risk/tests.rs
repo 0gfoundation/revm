@@ -6912,6 +6912,59 @@ mod algo_trigger_sweep {
         assert!(storage::load_algo_down_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
     }
 
+    /// **The budget-exhaustion path, which had no test at all.** `run_trigger_sweep`'s early
+    /// return is its ONLY deferral route, and until now nothing exercised it — the cleanup that
+    /// removed a dead `deferred` local could just as easily have removed the `return Ok(true)`
+    /// and every test would still have passed.
+    ///
+    /// The fixture is deliberately cheap: these stops have no position to protect, so each one
+    /// fires, finds zero capacity and EXPIRES. That still costs one unit of budget apiece, which
+    /// is exactly what is being measured — the budget meters trigger EXECUTIONS, not fills.
+    ///
+    /// It also pins the hand-off to the drain: hitting the budget must set `deferred_work`, or a
+    /// keeper has no way to learn there is anything left to finish.
+    #[test]
+    fn exhausting_the_sweep_budget_defers_the_rest_and_arms_the_drain() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let n = crate::risk::MAX_SWEEP_ACTIONS_PER_UPDATE + 5;
+        for i in 1..=n {
+            let user = Address::from([i as u8; 20]);
+            stop_market(&mut ctx, user, 9_500, QTY as u64);
+        }
+        assert_eq!(
+            storage::load_algo_down_prices(&mut ctx, MARKET_ID).unwrap(),
+            vec![9_500],
+            "all of them share one trigger price, so this is one level with n entries"
+        );
+
+        oracle_tick(&mut ctx, 9_500, 31);
+
+        let left = storage::load_algo_level(&mut ctx, MARKET_ID, false, 9_500).unwrap().len();
+        assert_eq!(
+            left as u32,
+            n - crate::risk::MAX_SWEEP_ACTIONS_PER_UPDATE,
+            "exactly the budget's worth fired; the remainder is still indexed"
+        );
+        assert_eq!(
+            storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap().deferred_work,
+            1,
+            "a budget stopped us, not the market — the drain must be told"
+        );
+
+        // The drain gets a fresh budget and finishes them, in the SAME block and therefore at the
+        // SAME mark that fired them — which is what keeps not-latching safe.
+        crate::risk::run_drain_deferred_work(
+            &drainDeferredWorkCall { marketId: MARKET_ID }.abi_encode(),
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(
+            storage::load_algo_down_prices(&mut ctx, MARKET_ID).unwrap().is_empty(),
+            "the drain cleared the backlog"
+        );
+    }
+
     /// Triggers are served BEFORE liquidations out of the shared budget. Not politeness: a stop
     /// that executes removes the position the liquidation sweep would otherwise have had to
     /// handle, so spending on triggers reduces what is left to spend on liquidations.

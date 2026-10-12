@@ -563,7 +563,6 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
     mark_price: u64,
     budget: &mut u32,
 ) -> Result<bool, PerpError> {
-    let mut deferred = false;
     for trigger_up in [true, false] {
         let prices = if trigger_up {
             storage::load_algo_up_prices(context, market_id)?
@@ -605,7 +604,11 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
             }
         }
     }
-    Ok(deferred)
+    // The early `return Ok(true)` above is the ONLY way this sweep defers, so reaching here means
+    // every firing trigger was executed. Nothing else in here is a deferral: a stale index entry
+    // is cleaned up in passing, and a trigger that fired but could not fill is EXPIRED by the
+    // ordinary market path rather than owed — that is the Binance-parity outcome, not a backlog.
+    Ok(false)
 }
 
 /// Execute one triggered conditional order.
