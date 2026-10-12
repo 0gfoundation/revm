@@ -6477,7 +6477,8 @@ mod golden {
             depositInsuranceFundCall, getAccountCall, getApiKeysCall, getAveragePremiumIndexCall,
             getBookLevelCall, getBookPricesCall, getFundingStateCall, getIndexPriceCall,
             getInsuranceFundCall, getMarkPriceCall, getOpenOrdersCall, getPositionCall,
-            initAdminCall, liquidateCall, placeOrderSignedCall, registerApiKeyCall,
+            initAdminCall, liquidateCall, placeAlgoOrderCall, placeOrderSignedCall,
+            registerApiKeyCall,
             removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
             setMarketManagerAddressCall, setOracleAddressCall, setUserFeeRatesCall,
             transferAdminCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
@@ -6847,7 +6848,7 @@ mod golden {
     /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
     /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x83f00a6072ef43e24e11389c38fbea80a67fe449370fa81e96adc5165506ed94");
+        b256!("0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -7867,6 +7868,37 @@ mod golden {
             OrderStatus::Open as u8,
             "CAROL's ask must REST (it is above the surviving 80-tick bid), not fill"
         );
+
+        // Phase 9d — a CONDITIONAL order, placed and left UNTRIGGERED.
+        //
+        // Without this the commitment is structurally blind to the whole algo family: the trigger
+        // index blobs, the per-user algo list and the three new `Order` fields would never appear
+        // in the write stream, so a change to any of them could not move the golden.
+        //
+        // CAROL is SHORT here, so her reduce-only stop is a BUY, and it fires on the mark RISING
+        // to the trigger — which puts it in the UP index and exercises the direction that the
+        // other half of the pair does not. The trigger sits well above the current mark on purpose:
+        // the point is to pin an order that is PLACED and INDEXED but NOT fired, because a fired
+        // one leaves no algo state behind to commit to.
+        let carol_stop = dex_call(
+            &mut ctx,
+            CAROL,
+            &placeAlgoOrderCall {
+                algoType: 0,
+                marketId: MARKET_ID,
+                side: 0, // BUY — the closing side of a short
+                orderType: 1, // STOP_MARKET
+                triggerPrice: PRICE + 20 * TICK,
+                price: 0,
+                quantity: QTY,
+                tif: 0,
+                workingType: 0,
+                clientAlgoId: FixedBytes::default(),
+                flags: 1, // reduceOnly
+            }
+            .abi_encode(),
+        );
+        assert_eq!(carol_stop.len(), 32, "placeAlgoOrder returns the algo id");
 
         // Phase 10 — solvent exit + api-key delete (empty-blob fold).
         dex_call(

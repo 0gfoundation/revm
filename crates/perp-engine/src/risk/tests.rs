@@ -6940,6 +6940,158 @@ mod algo_trigger_sweep {
     }
 }
 
+/// The signed (API-key) path for conditional orders — the one real traders use, since the direct
+/// call needs an EOA with gas and a nonce. Binance's analogue is `X-MBX-APIKEY` plus an HMAC over
+/// the query string; here `keyId` names the registered ed25519 slot and the signature covers a
+/// fixed-layout canonical message.
+mod algo_order_signed {
+    use super::*;
+    use crate::interface::IPerpDex::placeAlgoOrderSignedCall;
+    use crate::types::{AlgoOrderType, ApiKey};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const RO: u8 = 1;
+    const TS: u64 = 1;
+    const RECV: u64 = 60;
+
+    fn register(ctx: &mut TestCtx, user: Address, sk: &SigningKey) {
+        storage::save_api_key(
+            ctx,
+            user,
+            0,
+            ApiKey { pubkey: sk.verifying_key().to_bytes(), expiry: 0 },
+        )
+        .unwrap();
+    }
+
+    /// Rebuilds the canonical message INDEPENDENTLY of the engine. If the two ever disagree the
+    /// signature stops verifying, which is the point — a helper that called the engine's own
+    /// writer would pin nothing.
+    fn msg(chain_id: u64, account: Address, trigger: u64, qty: u64) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(b"perpdex_v1_algo");
+        m.extend_from_slice(&chain_id.to_be_bytes());
+        m.extend_from_slice(account.as_slice());
+        m.push(0); // algoType = CONDITIONAL
+        m.extend_from_slice(&MARKET_ID.to_be_bytes());
+        m.push(Side::Sell as u8);
+        m.push(AlgoOrderType::StopMarket as u8);
+        m.extend_from_slice(&trigger.to_be_bytes());
+        m.extend_from_slice(&0u64.to_be_bytes()); // price
+        m.extend_from_slice(&qty.to_be_bytes());
+        m.push(0); // tif
+        m.push(0); // workingType = MARK_PRICE
+        m.extend_from_slice(&[0u8; 16]); // clientAlgoId
+        m.push(RO);
+        m.extend_from_slice(&TS.to_be_bytes());
+        m.extend_from_slice(&RECV.to_be_bytes());
+        m.push(0); // keyId
+        m
+    }
+
+    fn calldata(sig: &[u8], trigger: u64, qty: u64, account: Address) -> Vec<u8> {
+        placeAlgoOrderSignedCall {
+            account,
+            algoType: 0,
+            marketId: MARKET_ID,
+            side: Side::Sell as u8,
+            orderType: AlgoOrderType::StopMarket as u8,
+            triggerPrice: trigger,
+            price: 0,
+            quantity: qty,
+            tif: 0,
+            workingType: 0,
+            clientAlgoId: FixedBytes::default(),
+            flags: RO,
+            timestamp: TS,
+            recvWindow: RECV,
+            keyId: 0,
+            signature: sig.to_vec().into(),
+        }
+        .abi_encode()
+    }
+
+    #[test]
+    fn a_relayer_can_submit_a_signed_conditional_order() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register(&mut ctx, ALICE, &sk);
+        let chain_id = ctx.chain_id();
+        let sig = sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes();
+
+        // Submitted by someone who is NOT the owner — that is the whole point of the signed path.
+        crate::algo::run_place_algo_order_signed(&calldata(&sig, 8_000, QTY as u64, ALICE), &mut ctx)
+            .unwrap();
+
+        assert_eq!(
+            storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(),
+            1,
+            "the order belongs to the SIGNER, not the sender"
+        );
+    }
+
+    /// ⚠️ The cross-chain replay guard. The same signature on a chain with a different id must not
+    /// verify — this is what stops a message captured on one deployment being replayed onto
+    /// another, and it is the reason `chainId` is inside the signed bytes rather than merely
+    /// checked alongside them.
+    #[test]
+    fn a_signature_from_another_chain_does_not_verify() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register(&mut ctx, ALICE, &sk);
+        let other_chain = ctx.chain_id() ^ 1;
+        let sig = sk.sign(&msg(other_chain, ALICE, 8_000, QTY as u64)).to_bytes();
+
+        let e = crate::algo::run_place_algo_order_signed(
+            &calldata(&sig, 8_000, QTY as u64, ALICE),
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(format!("{e:?}").contains("signature"), "got {e:?}");
+        assert!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().is_empty());
+    }
+
+    /// Tampering with a field the signature covers must fail. `quantity` is the sharpest one: a
+    /// relayer that could inflate it would be placing an order the owner never authorised.
+    #[test]
+    fn tampering_with_the_wire_quantity_does_not_verify() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register(&mut ctx, ALICE, &sk);
+        let chain_id = ctx.chain_id();
+        let sig = sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes();
+
+        let e = crate::algo::run_place_algo_order_signed(
+            &calldata(&sig, 8_000, QTY as u64 * 2, ALICE),
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(format!("{e:?}").contains("signature"), "got {e:?}");
+    }
+
+    /// Replay: one signature, one order. The id IS `keccak256(signature)`, and the same hash keys
+    /// the seen-signature set, so a resubmission bounces off the guard rather than placing a
+    /// second order.
+    #[test]
+    fn the_same_signature_cannot_be_submitted_twice() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register(&mut ctx, ALICE, &sk);
+        let chain_id = ctx.chain_id();
+        let sig = sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes();
+        let data = calldata(&sig, 8_000, QTY as u64, ALICE);
+
+        crate::algo::run_place_algo_order_signed(&data, &mut ctx).unwrap();
+        let e = crate::algo::run_place_algo_order_signed(&data, &mut ctx).unwrap_err();
+        assert!(format!("{e:?}").contains("duplicate signature"), "got {e:?}");
+        assert_eq!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(), 1);
+    }
+}
+
 mod algo_trigger_index {
     use super::*;
 
