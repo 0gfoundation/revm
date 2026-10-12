@@ -24,7 +24,9 @@ use crate::{
         batchCancelOrdersSignedCall, batchPlaceOrdersCall, batchPlaceOrdersSignedCall,
         cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
         getAccountCall, getAccountMarginCall, getAdminCall, getApiKeyCall, getApiKeysCall,
-        drainDeferredWorkCall, getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall,
+        cancelAlgoOrderCall, cancelAlgoOrderSignedCall, drainDeferredWorkCall,
+        getAlgoOrderCall, getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall,
+        getOpenAlgoOrdersCall, placeAlgoOrderCall, placeAlgoOrderSignedCall,
         getFundingStateCall,
         getIndexModeCall, getIndexPriceCall, getInsuranceFundCall, getMarginTiersCall,
         getMarkPriceCall, getMarketCall,
@@ -412,6 +414,17 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // so the subsidy is open to anyone — bounded because the work is bounded (the sweep caps)
         // AND because every unit of it is permanent progress: a spammer calling it in a loop drains
         // the backlog and then pays 50_000 for a market read and a `false`.
+        // Conditional (algo) orders. Placement writes one order blob, one level FIFO, one sorted
+        // price list and one per-user list — four small blobs and no matching, so it is cheaper
+        // than `placeOrder`, which may walk the book. Priced AT `placeOrder` anyway rather than
+        // lower: the two are substitutes from a spammer's point of view and pricing the cheaper
+        // one below the dearer one would just move spam onto it.
+        m.insert(placeAlgoOrderCall::SELECTOR, (PLACE_ORDER_GAS, false));
+        m.insert(placeAlgoOrderSignedCall::SELECTOR, (PLACE_ORDER_GAS, false));
+        m.insert(cancelAlgoOrderCall::SELECTOR, (CANCEL_ORDER_GAS, false));
+        m.insert(cancelAlgoOrderSignedCall::SELECTOR, (CANCEL_ORDER_GAS, false));
+        m.insert(getAlgoOrderCall::SELECTOR, (5_000, true));
+        m.insert(getOpenAlgoOrdersCall::SELECTOR, (5_000, true));
         m.insert(drainDeferredWorkCall::SELECTOR, (50_000, false));
         m.insert(getIndexPriceCall::SELECTOR, (5_000, true));
         m.insert(getIndexModeCall::SELECTOR, (5_000, true));
@@ -624,6 +637,23 @@ pub fn run_perp_dex_call<H: PerpHost>(
         }
         s if s == updateIndexPriceFromBookCall::SELECTOR => {
             run_update_index_price_from_book(input_bytes, caller, context)
+        }
+        // Conditional (algo) orders
+        s if s == placeAlgoOrderCall::SELECTOR => {
+            crate::algo::run_place_algo_order(input_bytes, caller, context)
+        }
+        s if s == cancelAlgoOrderCall::SELECTOR => {
+            crate::algo::run_cancel_algo_order(input_bytes, caller, context)
+        }
+        s if s == getAlgoOrderCall::SELECTOR => crate::algo::run_get_algo_order(input_bytes, context),
+        s if s == getOpenAlgoOrdersCall::SELECTOR => {
+            crate::algo::run_get_open_algo_orders(input_bytes, context)
+        }
+        s if s == placeAlgoOrderSignedCall::SELECTOR => {
+            crate::algo::run_place_algo_order_signed(input_bytes, context)
+        }
+        s if s == cancelAlgoOrderSignedCall::SELECTOR => {
+            crate::algo::run_cancel_algo_order_signed(input_bytes, context)
         }
         s if s == drainDeferredWorkCall::SELECTOR => run_drain_deferred_work(input_bytes, context),
         s if s == getIndexPriceCall::SELECTOR => run_get_index_price(input_bytes, context),

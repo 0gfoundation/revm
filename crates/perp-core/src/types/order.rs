@@ -50,6 +50,88 @@ impl OrderType {
     }
 }
 
+/// Conditional (algo) order type — the `type` field of Binance's Algo Order API under
+/// `algoType=CONDITIONAL`. Named for parity; `type` is a reserved word in Solidity, so the ABI
+/// calls the slot `orderType`.
+///
+/// The four values collapse to TWO trigger directions once combined with `side`, which is why
+/// [`Order::trigger_up`] is a single bit rather than a copy of this enum:
+///
+/// ```text
+/// mark >= trigger   <-  STOP BUY,  TAKE_PROFIT SELL
+/// mark <= trigger   <-  STOP SELL, TAKE_PROFIT BUY
+/// ```
+///
+/// `TRAILING_STOP_MARKET` is deliberately absent — it is roadmap 1d and needs per-order high/low
+/// watermark state that nothing here carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum AlgoOrderType {
+    /// Trigger, then REST a limit order at `price`.
+    Stop = 0,
+    /// Trigger, then take the book at market. Unfilled remainder EXPIRES (Binance parity).
+    StopMarket = 1,
+    /// Mirror of `Stop` on the other side of the mark.
+    TakeProfit = 2,
+    /// Mirror of `StopMarket`.
+    TakeProfitMarket = 3,
+}
+
+impl AlgoOrderType {
+    #[inline]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Stop),
+            1 => Some(Self::StopMarket),
+            2 => Some(Self::TakeProfit),
+            3 => Some(Self::TakeProfitMarket),
+            _ => None,
+        }
+    }
+
+    /// `true` when the triggered order takes the book at market rather than resting.
+    #[inline]
+    pub fn is_market(self) -> bool {
+        matches!(self, Self::StopMarket | Self::TakeProfitMarket)
+    }
+
+    /// The trigger direction for this (type, side) pair: `true` = fires when `mark >= trigger`.
+    ///
+    /// A STOP protects against the price moving AGAINST the position, a TAKE_PROFIT against it
+    /// running away in your favour — so for a given side the two are exact opposites, and the
+    /// four combinations collapse to two.
+    #[inline]
+    pub fn trigger_up(self, side: Side) -> bool {
+        let is_buy = matches!(side, Side::Buy);
+        match self {
+            Self::Stop | Self::StopMarket => is_buy,
+            Self::TakeProfit | Self::TakeProfitMarket => !is_buy,
+        }
+    }
+}
+
+/// `workingType` — which price the trigger is evaluated against.
+///
+/// ⚠️ Binance's DEFAULT is `CONTRACT_PRICE` (the last trade). We accept only `MARK_PRICE`, and
+/// reject the other value LOUDLY rather than silently substituting: a client ported from Binance
+/// that omits the field is relying on contract-price semantics, and quietly giving it something
+/// else is the worst of both worlds.
+///
+/// Contract price moves on every fill, so honouring it would mean evaluating triggers inside the
+/// match loop — and it is manipulable by a single wick on a thin book, which is precisely why
+/// Binance needs its `priceProtect` flag. Our mark is `median(price1, price2, contract)` and is
+/// already wick-resistant, so `priceProtect` has nothing to protect against here and is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WorkingType {
+    MarkPrice = 0,
+    ContractPrice = 1,
+}
+
+/// `algoType` — Binance's Algo Order API also serves TWAP/VP execution algos. We implement only
+/// the conditional family; the field is carried so adding the others later needs no new selector.
+pub const ALGO_TYPE_CONDITIONAL: u8 = 0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum TimeInForce {
@@ -315,6 +397,32 @@ pub struct Order {
     /// the `fill_opening_qty == 0` watchdog.
     #[serde(default, rename = "ro")]
     pub reduce_only: bool,
+
+    // ── Conditional (algo) order fields — APPENDED LAST, positional msgpack ──────────────────
+    //
+    // A conditional order reuses THIS record rather than getting its own: when it triggers it
+    // BECOMES an ordinary order, so the transition is a flag flip instead of a copy, and
+    // `getOrder`, the cancel paths and the per-user indexes all keep working unchanged.
+    //
+    // An untriggered conditional is NOT in the book and NOT in the per-user buy/sell lists — it
+    // lives only in the per-market trigger index — so it contributes nothing to `ooIM` and nothing
+    // to the reduce-only prefix. Both of those are evaluated at TRIGGER time, by the ordinary
+    // placement path it is routed through.
+    /// Trigger price in the market's `price_decimals`. **`0` means "not a conditional order"** —
+    /// a real trigger price is always >= 1 (`mark > 0` is a market invariant and a 0 trigger could
+    /// never fire upward nor fail to fire downward).
+    #[serde(default, rename = "tp")]
+    pub trigger_price: u64,
+    /// `true`: fires when `mark >= trigger_price`. `false`: fires when `mark <= trigger_price`.
+    /// Derived once at placement from (`AlgoOrderType`, `side`) — see `AlgoOrderType::trigger_up`
+    /// for why one bit suffices for four order types.
+    #[serde(default, rename = "tu")]
+    pub trigger_up: bool,
+    /// `closePosition`: at trigger, quantity is taken as the owner's whole `|position|` AT THAT
+    /// MOMENT rather than from `quantity`. Mutually exclusive with an explicit quantity, exactly
+    /// as on Binance.
+    #[serde(default, rename = "cp")]
+    pub close_position: bool,
 }
 
 /// Lightweight per-user per-market order entry used for margin-reserve calculation.

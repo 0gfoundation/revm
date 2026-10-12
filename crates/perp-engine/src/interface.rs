@@ -517,6 +517,133 @@ sol! {
         /// misses waits for the next tick exactly as it does today.
         function drainDeferredWork(uint64 marketId) external returns (bool moreRemaining);
 
+        // ── Conditional (algo) orders — stop-loss / take-profit ─────────────────────────────────
+        //
+        // Binance moved this whole family OFF `/fapi/v1/order` onto the Algo Order API: `STOP`,
+        // `TAKE_PROFIT`, `STOP_MARKET` and `TRAILING_STOP_MARKET` all return `-4120` on the old
+        // endpoint ("Please use the Algo Order API endpoints instead"), measured on a live account
+        // four-for-four. The precompile analogue of "a different endpoint" is a different SELECTOR,
+        // which is why these are not extra parameters on `placeOrder`.
+        //
+        // Naming follows Binance's domain nouns (`algoType`, `clientAlgoId`, `workingType`) with
+        // our own verb, so it reads alongside `placeOrder` / `placeOrderSigned`.
+
+        /// Place a conditional order. It rests OUTSIDE the book until its trigger fires, costs no
+        /// margin and no open-order requirement until then, and at trigger becomes an ordinary
+        /// order that matches by the ordinary rules.
+        ///
+        /// algoType: must be 0 (`CONDITIONAL`). Binance's Algo API also serves TWAP/VP execution
+        ///   algos; the field is carried so adding those later needs no new selector.
+        ///
+        /// orderType: 0 STOP, 1 STOP_MARKET, 2 TAKE_PROFIT, 3 TAKE_PROFIT_MARKET.
+        ///   `TRAILING_STOP_MARKET` is NOT accepted — it needs per-order high/low watermark state
+        ///   that nothing here carries.
+        ///   * the `_MARKET` pair takes the book at trigger; any remainder the fill-time price band
+        ///     will not let through **EXPIRES** (Binance parity — a market order means "now or not
+        ///     at all", and Binance expires the unfilled part for the same reason).
+        ///   * the limit pair RESTS at `price` and survives until filled or cancelled. The two
+        ///     types ARE the two policies; pick the one whose failure mode you want.
+        ///
+        /// triggerPrice: fires on the MARK price, per (orderType, side):
+        ///     STOP BUY / TAKE_PROFIT SELL   ->  mark >= triggerPrice
+        ///     STOP SELL / TAKE_PROFIT BUY   ->  mark <= triggerPrice
+        ///   Must be non-zero.
+        ///
+        /// workingType: must be 0 (`MARK_PRICE`). ⚠️ Binance's DEFAULT is `CONTRACT_PRICE` (the
+        ///   last trade), so a client ported from Binance that omits the field is relying on
+        ///   contract-price semantics — this REJECTS that loudly rather than silently substituting
+        ///   a different trigger basis. Contract price moves on every fill (evaluating it would
+        ///   mean running triggers inside the match loop) and a single wick on a thin book moves
+        ///   it, which is exactly why Binance needs its `priceProtect` flag. Our mark is
+        ///   `median(price1, price2, contract)` and is already wick-resistant, so `priceProtect`
+        ///   has nothing to protect against here and is deliberately absent.
+        ///
+        /// quantity / flags bit 1 (closePosition): exactly one of the two. `closePosition` takes
+        ///   the owner's whole |position| AT TRIGGER TIME and is valid only for the `_MARKET` pair.
+        ///
+        /// price: the resting price for the limit pair; must be 0 for the `_MARKET` pair.
+        /// tif: applies to the limit pair only.
+        /// clientAlgoId: caller-assigned tracking id, emitted but not stored. bytes16(0) if unused.
+        /// flags: bit 0 reduceOnly, bit 1 closePosition. Unknown bits REJECTED.
+        ///   ⚠️ This build accepts only reduce-only / closePosition conditionals — a conditional
+        ///   that would OPEN exposure is rejected. Binance performs no margin check before trigger,
+        ///   which leaves "triggered but cannot afford to open" as a case its own docs do not
+        ///   describe; a reduce-only conditional has a zero open-order requirement before AND after
+        ///   trigger, so the case cannot arise here.
+        function placeAlgoOrder(
+            uint8 algoType,
+            uint64 marketId,
+            uint8 side,
+            uint8 orderType,
+            uint64 triggerPrice,
+            uint64 price,
+            uint64 quantity,
+            uint8 tif,
+            uint8 workingType,
+            bytes16 clientAlgoId,
+            uint8 flags
+        ) external returns (bytes32 algoId);
+
+        /// Cancel an untriggered conditional order. Once it has triggered it is an ordinary order —
+        /// cancel it with `cancelOrder`. There is no modify: Binance's Algo API has none either.
+        function cancelAlgoOrder(bytes32 algoId, uint64 marketId) external;
+
+        /// Full record of a conditional order, triggered or not.
+        function getAlgoOrder(bytes32 algoId) external view returns (
+            address owner,
+            uint64 marketId,
+            uint8 side,
+            uint8 orderType,
+            uint64 triggerPrice,
+            uint64 price,
+            uint64 quantity,
+            uint8 tif,
+            uint8 status,
+            bool reduceOnly,
+            bool closePosition
+        );
+
+        /// Ids of the UNTRIGGERED conditional orders a user holds in a market.
+        function getOpenAlgoOrders(address user, uint64 marketId) external view returns (bytes32[] memory algoIds);
+
+        /// `placeAlgoOrder` for `account`, authenticated by ed25519 signature — the API-key path,
+        /// so a trader signs locally and anyone may relay and pay the gas.
+        /// Message: "perpdex_v1_algo"(15) || chainId(8) || account(20) || algoType(1) || marketId(8)
+        ///          || side(1) || orderType(1) || triggerPrice(8) || price(8) || quantity(8)
+        ///          || tif(1) || workingType(1) || clientAlgoId(16) || flags(1)
+        ///          || timestamp(8) || recvWindow(8) || keyId(1)
+        function placeAlgoOrderSigned(
+            address account,
+            uint8 algoType,
+            uint64 marketId,
+            uint8 side,
+            uint8 orderType,
+            uint64 triggerPrice,
+            uint64 price,
+            uint64 quantity,
+            uint8 tif,
+            uint8 workingType,
+            bytes16 clientAlgoId,
+            uint8 flags,
+            uint64 timestamp,
+            uint64 recvWindow,
+            uint8 keyId,
+            bytes calldata signature
+        ) external returns (bytes32 algoId);
+
+        /// `cancelAlgoOrder` for `account`, authenticated by ed25519 signature.
+        /// Message: "perpdex_v1_algocancel"(20) || chainId(8) || account(20) || algoId(32)
+        ///          || marketId(8) || timestamp(8) || recvWindow(8) || keyId(1)
+        function cancelAlgoOrderSigned(
+            address account,
+            bytes32 algoId,
+            uint64 marketId,
+            uint64 timestamp,
+            uint64 recvWindow,
+            uint8 keyId,
+            bytes calldata signature
+        ) external;
+
         /// Query the current average premium index for the active funding epoch.
         function getAveragePremiumIndex(uint64 marketId) external view returns (int64 avgPremiumIndex, uint64 sampleCount);
 
@@ -1382,6 +1509,31 @@ sol! {
         ///   `placeOrder` calldata and re-deriving order ids per batch item, which is not something
         ///   an indexer can do. `uint8` rather than `bool` so a later bit costs no ABI round.
         event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags);
+
+        // ── Conditional (algo) orders ───────────────────────────────────────────────────────────
+        //
+        // A conditional order has its OWN placed/cancelled events because, until it triggers, it is
+        // not an order in the book sense — it has no price level, no queue position and no
+        // open-order requirement, so emitting `OrderPlaced` for it would put something in an
+        // indexer's order book that is not there.
+        //
+        // At trigger it becomes an ordinary order and from that point the ordinary events describe
+        // it: `AlgoOrderTriggered` is the hand-off, immediately followed by the `OrderPlaced` /
+        // `Trade` / `OrderRested` the ordinary placement path emits.
+
+        /// A conditional order was accepted. `algoId` is its id in BOTH namespaces: after trigger
+        /// the ordinary events carry the same value as `orderId`, so a consumer can stitch the two
+        /// halves of its life together without a mapping table.
+        event AlgoOrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint8 side, uint8 orderType, uint64 triggerPrice, uint64 price, uint64 quantity, uint8 tif, bytes16 clientAlgoId, uint8 flags);
+
+        /// The trigger fired. `markPrice` is the mark that fired it — NOT `triggerPrice`, so the
+        /// gap between the two (how far the mark jumped past the trigger in one update) is visible
+        /// on the wire rather than something a consumer has to infer.
+        event AlgoOrderTriggered(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint64 triggerPrice, uint64 markPrice);
+
+        /// An UNTRIGGERED conditional order was removed. `reason` shares the `CancelReason` space
+        /// with `OrderCancelled` so one decoder covers both.
+        event AlgoOrderCancelled(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint8 reason);
 
         // Emitted when a limit order rests in the book (after any immediate fills).
         // quantity = the resting quantity (original qty minus any fills that happened first).

@@ -6847,7 +6847,7 @@ mod golden {
     /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
     /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x25bfb280fd657756ad353e505c5c848e0aee71a8ba90c659bc13f2848f7c4239");
+        b256!("0x83f00a6072ef43e24e11389c38fbea80a67fe449370fa81e96adc5165506ed94");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -8405,6 +8405,9 @@ mod batch_cancel {
                 tif: TimeInForce::Gtc,
                 status,
                             reduce_only: false,
+                            trigger_price: 0,
+                            trigger_up: false,
+                            close_position: false,
             },
         )
         .unwrap();

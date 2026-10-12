@@ -1066,7 +1066,7 @@ pub(crate) fn decode_order_flags(flags: u8, sel: &str) -> Result<bool, PerpError
 /// nonce untouched, so the same id is reused, matching the old revert-rollback behavior).
 /// Returns `(order_id, bumped_nonce)`; the caller persists the bump via
 /// [`commit_order_nonce`] on the success path.
-pub(super) fn peek_order_id<H: PerpHost>(
+pub(crate) fn peek_order_id<H: PerpHost>(
     context: &mut H,
     account: Address,
 ) -> Result<([u8; 32], u64), PerpError> {
@@ -1089,7 +1089,7 @@ pub(super) fn derive_order_id(account: Address, nonce: u64) -> [u8; 32] {
 
 /// Persists the nonce bump reserved by [`peek_order_id`]. Call ONLY after the placement
 /// succeeded (all genuine rejects passed).
-pub(super) fn commit_order_nonce<H: PerpHost>(
+pub(crate) fn commit_order_nonce<H: PerpHost>(
     context: &mut H,
     account: Address,
     bumped_nonce: u64,
@@ -1446,6 +1446,11 @@ fn announce_new_order(
         tif: validated.kind.tif(),
         status: OrderStatus::Open,
         reduce_only: validated.reduce_only,
+        // Not conditional: this is the ordinary placement path. A triggered algo order reaches the
+        // book through here too, but by then it is an ordinary order — the trigger already fired.
+        trigger_price: 0,
+        trigger_up: false,
+        close_position: false,
     };
 
     let pending = PendingOrderPlaced {

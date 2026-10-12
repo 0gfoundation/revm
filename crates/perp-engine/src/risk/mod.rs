@@ -1769,6 +1769,22 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
         record_mid_price_sample_for_best_quote_change(context, market_id, best_bid, best_ask)?;
     }
 
+    // ── Conditional (algo) orders ────────────────────────────────────────────────────────────
+    //
+    // They are NOT in the book, so everything above misses them entirely — the loops walk the
+    // per-user BUY/SELL entry lists and the price levels, and an untriggered conditional appears
+    // in neither. Without this a liquidated (or ADL'd) account keeps live stop-losses pointing at
+    // a position that no longer exists, and they would fire later against whatever position the
+    // owner opens next.
+    //
+    // Bounded by `algo::MAX_ALGO_ORDERS_PER_MARKET`, which is exactly why that cap exists: this
+    // walk runs inside an already-capped sweep.
+    for algo_id in storage::load_user_algo_orders(context, user, market_id)? {
+        if let Some(order) = storage::load_order(context, &algo_id)? {
+            crate::algo::remove_algo_order(context, user, market_id, &algo_id, &order, reason)?;
+        }
+    }
+
     // Both order lists were cleared → `Bid = Ask = 0`, so this position's derived open-order
     // requirement drops to 0 by itself. NOTHING is credited back to the wallet: a resting order
     // escrows nothing (neither margin nor fee), so a cancel — including this cancel-all — moves

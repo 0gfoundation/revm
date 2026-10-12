@@ -36,6 +36,21 @@ const PFX_BID_PRICES: [u8; 4] = *b"bidp"; // sorted Vec<u64> of active bid price
 const PFX_ASK_PRICES: [u8; 4] = *b"askp"; // sorted Vec<u64> of active ask prices
 const PFX_BID_LEVEL: [u8; 4] = *b"bidl"; // FIFO queue of order IDs at a bid price
 const PFX_ASK_LEVEL: [u8; 4] = *b"askl"; // FIFO queue of order IDs at an ask price
+// ── Conditional (algo) order trigger index ────────────────────────────────────────────────────
+// Mirrors the book's `bidp`/`bidl` pair exactly: a sorted Vec of trigger prices per direction,
+// plus a FIFO of algo order ids at each trigger price. The DIRECTION, not the side, is what
+// partitions them — `AlgoOrderType::trigger_up` collapses four (type, side) combinations into two.
+//
+// Sort orders are chosen so the trigger sweep always walks from the FRONT and stops at the first
+// price that does not fire, making the scan cost proportional to how far the mark moved rather
+// than to how many algo orders exist:
+//   * `aupp` ASCENDING  — fires when `mark >= trigger`, so the lowest triggers fire first.
+//   * `adnp` DESCENDING — fires when `mark <= trigger`, so the highest triggers fire first.
+const PFX_ALGO_UP_PRICES: [u8; 4] = *b"aupp"; // sorted Vec<u64>, ASC  (fires on mark >= trigger)
+const PFX_ALGO_DOWN_PRICES: [u8; 4] = *b"adnp"; // sorted Vec<u64>, DESC (fires on mark <= trigger)
+const PFX_ALGO_UP_LEVEL: [u8; 4] = *b"aupl"; // FIFO of algo order ids at an up-trigger price
+const PFX_ALGO_DOWN_LEVEL: [u8; 4] = *b"adnl"; // FIFO of algo order ids at a down-trigger price
+const PFX_USER_ALGO_ORDERS: [u8; 4] = *b"ualg"; // per-user per-market Vec of live algo order ids
 const PFX_API_KEY: [u8; 4] = *b"apik"; // per-user per-slot ed25519 key
 const PFX_API_KEY_IDS: [u8; 4] = *b"akid"; // per-user list of registered key_ids
 const PFX_ORACLE: [u8; 4] = *b"orcl"; // authorized oracle address (updateIndexPrice role)
@@ -278,6 +293,38 @@ pub fn bid_level_key(market_id: u64, price: u64) -> B256 {
     pack_market_price(PFX_BID_LEVEL, market_id, price)
 }
 
+/// Sorted trigger prices (ASC) of algo orders that fire when `mark >= trigger` in a market.
+#[inline]
+pub fn algo_up_prices_key(market_id: u64) -> B256 {
+    pack_market(PFX_ALGO_UP_PRICES, market_id)
+}
+
+/// Sorted trigger prices (DESC) of algo orders that fire when `mark <= trigger` in a market.
+#[inline]
+pub fn algo_down_prices_key(market_id: u64) -> B256 {
+    pack_market(PFX_ALGO_DOWN_PRICES, market_id)
+}
+
+/// FIFO of algo order ids at one up-trigger price.
+#[inline]
+pub fn algo_up_level_key(market_id: u64, trigger_price: u64) -> B256 {
+    pack_market_price(PFX_ALGO_UP_LEVEL, market_id, trigger_price)
+}
+
+/// FIFO of algo order ids at one down-trigger price.
+#[inline]
+pub fn algo_down_level_key(market_id: u64, trigger_price: u64) -> B256 {
+    pack_market_price(PFX_ALGO_DOWN_LEVEL, market_id, trigger_price)
+}
+
+/// Live algo order ids held by a user in a market. Needed so liquidation's and ADL's
+/// `cancel_all_orders_for_market` can clear conditional orders too — they are not in the book, so
+/// walking the book would miss them entirely.
+#[inline]
+pub fn user_algo_orders_key(user: Address, market_id: u64) -> B256 {
+    pack_addr_market(PFX_USER_ALGO_ORDERS, user, market_id)
+}
+
 /// FIFO queue of order IDs at a specific ask price level.
 #[inline]
 pub fn ask_level_key(market_id: u64, price: u64) -> B256 {
@@ -442,6 +489,11 @@ mod const_key_tests {
             PFX_COMMITMENT,
             PFX_SEEN_SIG,
             PFX_SEEN_BUCKET,
+            PFX_ALGO_UP_PRICES,
+            PFX_ALGO_DOWN_PRICES,
+            PFX_ALGO_UP_LEVEL,
+            PFX_ALGO_DOWN_LEVEL,
+            PFX_USER_ALGO_ORDERS,
         ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
@@ -514,6 +566,16 @@ mod const_key_tests {
         assert_ne!(user_markets_key(a), account_key(a));
         assert_ne!(user_markets_key(a), api_key_ids_key(a));
         assert_ne!(bid_prices_key(3), ask_prices_key(3));
+        // The two trigger directions, and the trigger index against the book it mirrors.
+        assert_ne!(algo_up_prices_key(3), algo_down_prices_key(3));
+        assert_ne!(algo_up_level_key(3, 7), algo_down_level_key(3, 7));
+        assert_ne!(algo_up_prices_key(3), bid_prices_key(3));
+        assert_ne!(algo_up_level_key(3, 7), bid_level_key(3, 7));
+        assert_ne!(
+            user_algo_orders_key(a, 3),
+            user_buy_orders_key(a, 3),
+            "an algo order list must not alias the book order list for the same user+market"
+        );
         assert_ne!(bid_level_key(3, 100), ask_level_key(3, 100));
         // raw order id vs a structured key
         let id = [0x01u8; 32];

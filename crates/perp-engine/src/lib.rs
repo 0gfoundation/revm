@@ -18,6 +18,7 @@
 //! codec, keys, block commitment).
 
 pub mod account;
+pub mod algo;
 pub mod batch;
 pub mod call;
 /// Derived event payloads — the single `PositionChanged` derivation shared by all seven emit

@@ -28,7 +28,9 @@ use keys::{
     market_hot_key, market_key, market_manager_key, oracle_key, order_key, position_key,
     position_registry_key, premium_accumulator_key, price_basis_ewma_key, price_basis_window_key,
     seen_bucket_key,
-    seen_sig_key, trade_count_key, user_buy_orders_key, user_markets_key, user_sell_orders_key,
+    algo_down_level_key, algo_down_prices_key, algo_up_level_key, algo_up_prices_key,
+    seen_sig_key, trade_count_key, user_algo_orders_key, user_buy_orders_key, user_markets_key,
+    user_sell_orders_key,
 };
 
 // Canonical codec + block commitment live in `perp_core`; re-exported so in-crate callers
@@ -1853,6 +1855,176 @@ fn ensure_ask_prices_resident<H: PerpHost>(
 }
 
 /// Active bid price levels (best = max).
+// ── Conditional (algo) order trigger index ────────────────────────────────────────────────────
+//
+// Deliberately NOT routed through the typed store, unlike the book's `bid_prices`. That cache
+// exists for the per-order hot path; this index is touched once per oracle tick (one scan) plus
+// once per place/cancel, so plain blob access costs nothing measurable and keeps the typed store
+// out of this change entirely.
+//
+// Sort orders are load-bearing — see `perp_core::keys`. Both lists are walked from the FRONT and
+// the walk stops at the first price that does not fire, so the scan is proportional to how far the
+// mark moved, not to how many algo orders exist.
+
+/// Trigger prices (ASC) of algo orders firing on `mark >= trigger`.
+pub fn load_algo_up_prices<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+) -> Result<Vec<u64>, PerpError> {
+    Ok(cold_load::<_, Vec<u64>>(context, algo_up_prices_key(market_id))?
+        .map(|v| (*v).clone())
+        .unwrap_or_default())
+}
+
+/// Trigger prices (DESC) of algo orders firing on `mark <= trigger`.
+pub fn load_algo_down_prices<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+) -> Result<Vec<u64>, PerpError> {
+    Ok(cold_load::<_, Vec<u64>>(context, algo_down_prices_key(market_id))?
+        .map(|v| (*v).clone())
+        .unwrap_or_default())
+}
+
+fn save_algo_prices<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    trigger_up: bool,
+    prices: &[u64],
+) -> Result<(), PerpError> {
+    let key = if trigger_up {
+        algo_up_prices_key(market_id)
+    } else {
+        algo_down_prices_key(market_id)
+    };
+    store_blob(context, key, &encode(&prices.to_vec())?)
+}
+
+/// Algo order ids queued at one trigger price, in placement order.
+pub fn load_algo_level<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    trigger_up: bool,
+    trigger_price: u64,
+) -> Result<Vec<[u8; 32]>, PerpError> {
+    let key = if trigger_up {
+        algo_up_level_key(market_id, trigger_price)
+    } else {
+        algo_down_level_key(market_id, trigger_price)
+    };
+    Ok(cold_load::<_, Vec<[u8; 32]>>(context, key)?
+        .map(|v| (*v).clone())
+        .unwrap_or_default())
+}
+
+fn save_algo_level<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    trigger_up: bool,
+    trigger_price: u64,
+    ids: &[[u8; 32]],
+) -> Result<(), PerpError> {
+    let key = if trigger_up {
+        algo_up_level_key(market_id, trigger_price)
+    } else {
+        algo_down_level_key(market_id, trigger_price)
+    };
+    store_blob(context, key, &encode(&ids.to_vec())?)
+}
+
+/// Insert an algo order into the trigger index: its level FIFO, and its trigger price into the
+/// direction's sorted list if this is the first order at that price.
+pub fn algo_index_insert<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    trigger_up: bool,
+    trigger_price: u64,
+    order_id: [u8; 32],
+) -> Result<(), PerpError> {
+    let mut level = load_algo_level(context, market_id, trigger_up, trigger_price)?;
+    let first_at_price = level.is_empty();
+    level.push(order_id);
+    save_algo_level(context, market_id, trigger_up, trigger_price, &level)?;
+    if first_at_price {
+        let mut prices = if trigger_up {
+            load_algo_up_prices(context, market_id)?
+        } else {
+            load_algo_down_prices(context, market_id)?
+        };
+        // ASC for the up list, DESC for the down list — both so the sweep walks from the front.
+        let pos = if trigger_up {
+            prices.binary_search(&trigger_price)
+        } else {
+            prices.binary_search_by(|p| trigger_price.cmp(p))
+        };
+        if let Err(i) = pos {
+            prices.insert(i, trigger_price);
+            save_algo_prices(context, market_id, trigger_up, &prices)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove an algo order from the trigger index. Drops the price from the sorted list when its
+/// level empties, so the sweep never walks a price with nothing behind it.
+pub fn algo_index_remove<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    trigger_up: bool,
+    trigger_price: u64,
+    order_id: &[u8; 32],
+) -> Result<(), PerpError> {
+    let mut level = load_algo_level(context, market_id, trigger_up, trigger_price)?;
+    let before = level.len();
+    level.retain(|id| id != order_id);
+    if level.len() == before {
+        return Ok(()); // not indexed (already removed) — idempotent
+    }
+    let now_empty = level.is_empty();
+    save_algo_level(context, market_id, trigger_up, trigger_price, &level)?;
+    if now_empty {
+        let mut prices = if trigger_up {
+            load_algo_up_prices(context, market_id)?
+        } else {
+            load_algo_down_prices(context, market_id)?
+        };
+        let pos = if trigger_up {
+            prices.binary_search(&trigger_price)
+        } else {
+            prices.binary_search_by(|p| trigger_price.cmp(p))
+        };
+        if let Ok(i) = pos {
+            prices.remove(i);
+            save_algo_prices(context, market_id, trigger_up, &prices)?;
+        }
+    }
+    Ok(())
+}
+
+/// Live algo order ids a user holds in a market.
+pub fn load_user_algo_orders<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<Vec<[u8; 32]>, PerpError> {
+    Ok(cold_load::<_, Vec<[u8; 32]>>(context, user_algo_orders_key(user, market_id))?
+        .map(|v| (*v).clone())
+        .unwrap_or_default())
+}
+
+pub fn save_user_algo_orders<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    ids: &[[u8; 32]],
+) -> Result<(), PerpError> {
+    store_blob(
+        context,
+        user_algo_orders_key(user, market_id),
+        &encode(&ids.to_vec())?,
+    )
+}
+
 pub fn load_bid_prices<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -2861,6 +3033,9 @@ mod size_probe_tests {
             tif: TimeInForce::Gtc,
             status: OrderStatus::PartiallyFilled,
                     reduce_only: false,
+                    trigger_price: 0,
+                    trigger_up: false,
+                    close_position: false,
         };
         let buf = encode(&order).unwrap();
         println!(
@@ -3104,6 +3279,9 @@ mod encoding_roundtrip_tests {
                                 tif,
                                 status,
                                                             reduce_only: false,
+                                                            trigger_price: 0,
+                                                            trigger_up: false,
+                                                            close_position: false,
                             },
                         );
                     }
