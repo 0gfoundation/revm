@@ -6442,9 +6442,9 @@ fn an_ewma_markets_basis_cannot_exceed_the_clamp() {
 }
 
 
-// ── MAX_LIQUIDATIONS_PER_UPDATE ──────────────────────────────────────────────
+// ── MAX_SWEEP_ACTIONS_PER_UPDATE ──────────────────────────────────────────────
 //
-// The 50-cap had NO test at all: `grep MAX_LIQUIDATIONS_PER_UPDATE crates/` found only its
+// The 50-cap had NO test at all: `grep MAX_SWEEP_ACTIONS_PER_UPDATE crates/` found only its
 // definition, its use, and a doc link. Its two siblings are covered
 // (`MAX_BAND_EXPIRIES_PER_UPDATE` by `the_cap_is_on_orders_and_a_second_update_finishes_the_job`,
 // the distinct-maker cap by `liquidation_close_stops_at_the_maker_account_cap`), and the whole
@@ -6519,7 +6519,7 @@ mod liquidation_cap {
         assert_eq!(
             still_open(&mut ctx, &users),
             5,
-            "exactly MAX_LIQUIDATIONS_PER_UPDATE (50) liquidated in one update"
+            "exactly MAX_SWEEP_ACTIONS_PER_UPDATE (50) liquidated in one update"
         );
 
         // A second update at the SAME price — the mark does not have to move again. This is the
@@ -6799,6 +6799,147 @@ mod algo_order_admission {
     }
 }
 
+/// The trigger sweep: when a conditional order fires, what it becomes, and — the part that is a
+/// deliberate divergence from Binance — what happens when it does NOT get to fire.
+mod algo_trigger_sweep {
+    use super::*;
+    use crate::interface::IPerpDex::placeAlgoOrderCall;
+    use crate::types::AlgoOrderType;
+
+    const RO: u8 = 1;
+
+    fn stop_market(ctx: &mut TestCtx, user: Address, trigger: u64, qty: u64) -> [u8; 32] {
+        let out = crate::algo::run_place_algo_order(
+            &placeAlgoOrderCall {
+                algoType: 0,
+                marketId: MARKET_ID,
+                side: Side::Sell as u8,
+                orderType: AlgoOrderType::StopMarket as u8,
+                triggerPrice: trigger,
+                price: 0,
+                quantity: qty,
+                tif: 0,
+                workingType: 0,
+                clientAlgoId: FixedBytes::default(),
+                flags: RO,
+            }
+            .abi_encode(),
+            user,
+            ctx,
+        )
+        .unwrap();
+        out[..32].try_into().unwrap()
+    }
+
+    /// A stop-loss fires on the mark and closes the position against the book.
+    #[test]
+    fn a_stop_market_fires_and_closes_against_the_book() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+        // Liquidity to close into, inside the fill-time band around the $95 mark.
+        place_order(&mut ctx, MAKER, Side::Buy as u8, 9_400, QTY as u64);
+        let id = stop_market(&mut ctx, ALICE, 9_500, QTY as u64);
+
+        // $100 -> $95: at the trigger, and ALICE is still comfortably above maintenance, so this
+        // is the stop firing rather than a liquidation.
+        oracle_tick(&mut ctx, 9_500, 31);
+
+        assert_eq!(position(&mut ctx, ALICE).amount, 0, "the stop closed the position");
+        assert!(
+            storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().is_empty(),
+            "and left the conditional namespace"
+        );
+        assert!(storage::load_algo_down_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
+        assert!(
+            storage::load_order(&mut ctx, &id).unwrap().is_none(),
+            "fully filled market order: delete-on-terminal, same as any other"
+        );
+    }
+
+    /// Above the trigger nothing happens — the sweep must not fire early.
+    #[test]
+    fn it_does_not_fire_before_the_mark_reaches_the_trigger() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+        let id = stop_market(&mut ctx, ALICE, 9_000, QTY as u64);
+
+        // ⚠️ $99, not $95. At $95 this 5x long is already BELOW maintenance (equity $150 against a
+        // ~$158 requirement at mmr = 1/6) and the liquidation sweep closes it — which would make
+        // this test pass for entirely the wrong reason the day the trigger logic broke.
+        oracle_tick(&mut ctx, 9_900, 31);
+
+        assert_eq!(position(&mut ctx, ALICE).amount, QTY, "mark 9900 > trigger 9000");
+        assert!(storage::load_order(&mut ctx, &id).unwrap().is_some());
+        assert_eq!(storage::load_algo_down_prices(&mut ctx, MARKET_ID).unwrap(), vec![9_000]);
+    }
+
+    /// ⚠️ THE DIVERGENCE FROM BINANCE, and the reason it is safe.
+    ///
+    /// Binance LATCHES: once the trigger price is touched the order becomes a normal order and a
+    /// retrace cannot undo that. We do not latch — the sweep re-derives from the CURRENT mark
+    /// every run — so a trigger the budget could not reach does not fire later at a price that no
+    /// longer exists. Same rule the fill-time band imposes: something declined to execute it, so
+    /// it did not execute.
+    ///
+    /// Here the position is closed by other means between the two ticks, which is the cleanest way
+    /// to observe "the condition is re-checked rather than remembered": the order fires, finds
+    /// nothing to close, and expires instead of opening a short.
+    #[test]
+    fn a_trigger_whose_position_vanished_expires_instead_of_opening() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+        let id = stop_market(&mut ctx, ALICE, 9_500, QTY as u64);
+
+        // Close the position out from under the conditional order, by hand.
+        let mut pos = storage::load_position(&mut ctx, ALICE, MARKET_ID).unwrap();
+        pos.amount = 0;
+        pos.v_quote_balance = 0;
+        pos.margin = 0;
+        storage::save_position(&mut ctx, ALICE, MARKET_ID, &pos, AccountUpdateReason::Adjustment)
+            .unwrap();
+
+        oracle_tick(&mut ctx, 9_500, 31);
+
+        assert_eq!(
+            position(&mut ctx, ALICE).amount,
+            0,
+            "a reduce-only stop must NEVER open exposure — this is the whole point of the flag"
+        );
+        assert!(storage::load_order(&mut ctx, &id).unwrap().is_none(), "expired");
+        assert!(storage::load_algo_down_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
+    }
+
+    /// Triggers are served BEFORE liquidations out of the shared budget. Not politeness: a stop
+    /// that executes removes the position the liquidation sweep would otherwise have had to
+    /// handle, so spending on triggers reduces what is left to spend on liquidations.
+    #[test]
+    fn a_stop_fires_rather_than_the_owner_being_liquidated() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+        // In-band liquidity at the $85 mark.
+        place_order(&mut ctx, MAKER, Side::Buy as u8, 8_400, QTY as u64);
+        stop_market(&mut ctx, ALICE, 8_500, QTY as u64);
+
+        // $85 is below maintenance for this 5x long, so WITHOUT the stop the sweep would
+        // liquidate her. The stop runs first and closes it as an ordinary trade instead.
+        oracle_tick(&mut ctx, 8_500, 31);
+
+        assert_eq!(position(&mut ctx, ALICE).amount, 0);
+        let liq = JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .filter(|l| {
+                l.data.topics().first()
+                    == Some(&crate::interface::IPerpDex::Liquidation::SIGNATURE_HASH)
+            })
+            .count();
+        assert_eq!(liq, 0, "closed by her own stop, not liquidated");
+    }
+}
+
 mod algo_trigger_index {
     use super::*;
 
@@ -7042,7 +7183,7 @@ mod deferred_work_drain {
         let open_after_tick = still_open(&mut ctx, &users);
         assert!(open_after_tick > 0, "the fixture must leave a backlog");
         assert!(
-            20 - open_after_tick < MAX_LIQUIDATIONS_PER_UPDATE as usize,
+            20 - open_after_tick < MAX_SWEEP_ACTIONS_PER_UPDATE as usize,
             "fixture: the slot cap must NOT be what stopped this, or the test proves nothing"
         );
         assert_eq!(flag(&mut ctx), 1, "a budget, not the market, stopped it");

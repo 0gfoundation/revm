@@ -1115,7 +1115,7 @@ struct ValidatedOrder {
 /// `is_terminal()` = it fully filled or its IOC/FOK/market remainder expired, leaving no record.
 /// (`batchPlaceOrders` maps that split onto the `Accepted` / `Filled` status tags. The single-order
 /// entry points ignore it — they answer with the order id and let the caller read the logs.)
-fn place_order_core<H: PerpHost>(
+pub(crate) fn place_order_core<H: PerpHost>(
     account: Address,
     order_id: [u8; 32],
     market_id: u64,

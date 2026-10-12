@@ -533,3 +533,200 @@ pub fn run_cancel_algo_order_signed<H: PerpHost>(
     cancel_core(context, a.account, a.algoId.0, a.marketId)?;
     Ok(Bytes::new())
 }
+
+// ── Trigger sweep ─────────────────────────────────────────────────────────────────────────────
+
+/// Walk the trigger index and execute whatever the current mark fires.
+///
+/// # NOT latched — the condition must hold at EXECUTION time
+///
+/// Unlike the liquidation sweep, whose "under water" condition cannot un-happen, a trigger
+/// condition can: mark 100 -> 95 -> 100 leaves a 97 stop satisfied only in the middle tick. This
+/// sweep stores nothing and re-derives from the CURRENT mark every run, so a trigger the budget
+/// could not reach does NOT fire later at a price that no longer exists. That is the same rule the
+/// fill-time band imposes — the market, or our own budget, declined to execute, so it did not
+/// execute — and it is deliberately NOT Binance's latching semantics.
+///
+/// The cost: a budget overflow can MISS a trigger rather than merely delay it, silently. The
+/// window is narrow because `drainDeferredWork` is permissionless and **the mark does not change
+/// within a block**, so a drain finishes the remaining triggers at the very price that fired them;
+/// the exposure is only to the gap between oracle ticks with nobody draining.
+///
+/// # Walk order
+///
+/// Both index lists are sorted so the firing end is the FRONT, and the walk stops at the first
+/// price that does not fire — so this costs what the mark MOVED, not what the market HOLDS.
+pub(crate) fn run_trigger_sweep<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    market: &crate::types::Market,
+    mark_price: u64,
+    budget: &mut u32,
+) -> Result<bool, PerpError> {
+    let mut deferred = false;
+    for trigger_up in [true, false] {
+        let prices = if trigger_up {
+            storage::load_algo_up_prices(context, market_id)?
+        } else {
+            storage::load_algo_down_prices(context, market_id)?
+        };
+        for trigger_price in prices {
+            let fires = if trigger_up {
+                mark_price >= trigger_price
+            } else {
+                mark_price <= trigger_price
+            };
+            if !fires {
+                break; // sorted: nothing further along this list can fire either
+            }
+            for algo_id in storage::load_algo_level(context, market_id, trigger_up, trigger_price)? {
+                if *budget == 0 {
+                    // Budget, not the market, stopped us: a later attempt IN THIS BLOCK finishes
+                    // it at this same mark, which is what `deferred_work` is for.
+                    return Ok(true);
+                }
+                let Some(order) = storage::load_order(context, &algo_id)? else {
+                    // Cancelled out from under the index; drop the stale entry while we are here
+                    // rather than paying to walk it again next tick.
+                    storage::algo_index_remove(
+                        context,
+                        market_id,
+                        trigger_up,
+                        trigger_price,
+                        &algo_id,
+                    )?;
+                    continue;
+                };
+                if order.trigger_price == 0 {
+                    continue; // already triggered; not ours any more
+                }
+                fire(context, market_id, market, mark_price, &algo_id, &order)?;
+                *budget -= 1;
+            }
+        }
+    }
+    Ok(deferred)
+}
+
+/// Execute one triggered conditional order.
+///
+/// ⚠️ VALIDATE-THEN-APPLY is mandatory here, not stylistic: perp writes are commit-only (#23) and
+/// a frame revert does NOT roll them back, so anything that can fail must fail BEFORE the first
+/// write. Hence the capacity pre-check — `place_order_core` would otherwise reject a reduce-only
+/// order it cannot fit, after having written.
+fn fire<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    market: &crate::types::Market,
+    mark_price: u64,
+    algo_id: &[u8; 32],
+    order: &Order,
+) -> Result<(), PerpError> {
+    let owner = Address::from(order.owner);
+    let pos = storage::load_position(context, owner, market_id)?;
+
+    // How much this order may actually close, given the position it is protecting and everything
+    // already resting ahead of it. `closePosition` means "whatever is open AT TRIGGER TIME".
+    let capacity = match crate::reduce_only::closing_side(&pos) {
+        Some(s) if s == order.side => {
+            let entries = if order.side == Side::Buy {
+                storage::load_buy_orders_ref(context, owner, market_id)?
+            } else {
+                storage::load_sell_orders_ref(context, owner, market_id)?
+            };
+            // Price the prefix at the price this order will actually sit at: its limit price, or
+            // the mark for a market order (which jumps the queue entirely).
+            let at = if order.order_type == OrderType::Market {
+                mark_price
+            } else {
+                order.price
+            };
+            let (normals_ahead, sigma_ro) =
+                crate::reduce_only::prefix_terms(entries.iter(), order.side, Some(at));
+            pos.amount
+                .unsigned_abs()
+                .saturating_sub(normals_ahead)
+                .saturating_sub(sigma_ro)
+        }
+        // Flat, or the position flipped to the same side this order is on — it can only open now,
+        // which a reduce-only order may never do.
+        _ => 0,
+    };
+    let want = if order.close_position {
+        pos.amount.unsigned_abs()
+    } else {
+        order.quantity
+    };
+    let qty = want.min(capacity);
+
+    // ── APPLY — nothing below may fail for a reason the caller could have caused ──
+    //
+    // The order leaves the conditional namespace FIRST, so the id is free for the ordinary record
+    // `place_order_core` writes under it. Same id on purpose: a consumer stitches the conditional
+    // half and the ordinary half of this order's life together without a mapping table.
+    storage::algo_index_remove(
+        context,
+        market_id,
+        order.trigger_up,
+        order.trigger_price,
+        algo_id,
+    )?;
+    let mut live = storage::load_user_algo_orders(context, owner, market_id)?;
+    live.retain(|id| id != algo_id);
+    storage::save_user_algo_orders(context, owner, market_id, &live)?;
+
+    context.log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::AlgoOrderTriggered {
+            user: owner,
+            marketId: market_id,
+            algoId: FixedBytes(*algo_id),
+            triggerPrice: order.trigger_price,
+            // The mark that FIRED it, not the trigger — so how far the mark jumped past the
+            // trigger in one update is on the wire instead of being something to infer.
+            markPrice: mark_price,
+        }
+        .to_log_data(),
+    });
+
+    if qty == 0 {
+        // Nothing left to protect: the position closed, flipped, or is already fully committed to
+        // orders ahead of this one. Binance expires a reduce-only order in exactly this case.
+        storage::delete_order(context, algo_id)?;
+        context.log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::AlgoOrderCancelled {
+                user: owner,
+                marketId: market_id,
+                algoId: FixedBytes(*algo_id),
+                reason: CancelReason::ReduceOnlyWouldOpen as u8,
+            }
+            .to_log_data(),
+        });
+        return Ok(());
+    }
+    debug_assert!(market.active, "trigger sweep ran on an inactive market");
+
+    // From here it is an ORDINARY order. The ordinary path owns everything that follows: the
+    // fill-time band, fees, and — for the `_MARKET` pair — EXPIRING whatever the band would not
+    // let through, which is Binance's behaviour for an unfilled market order and which we get for
+    // free by not special-casing it.
+    crate::trading::place_order_core(
+        owner,
+        *algo_id,
+        market_id,
+        order.side as u8,
+        if order.order_type == OrderType::Market { 0 } else { order.price },
+        qty,
+        order.order_type as u8,
+        if order.order_type == OrderType::Market {
+            TimeInForce::Ioc as u8
+        } else {
+            order.tif as u8
+        },
+        [0u8; 16],
+        FLAG_REDUCE_ONLY,
+        context,
+    )?;
+    Ok(())
+}

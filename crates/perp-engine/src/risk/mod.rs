@@ -1175,7 +1175,7 @@ pub fn run_liquidate<H: PerpHost>(
 /// liquidatable candidates. Overflow of THIS cap defers to the next update: the
 /// registry is re-scanned every update and un-liquidated candidates stay underwater
 /// until the mark moves, so nothing is permanently missed.
-const MAX_LIQUIDATIONS_PER_UPDATE: u32 = 50;
+const MAX_SWEEP_ACTIONS_PER_UPDATE: u32 = 50;
 
 /// Total ADL fills allowed across ONE `updateIndexPrice` (shared by every liquidation
 /// in the sweep). ADL closes an insolvent book-unfillable residual as forced trades
@@ -1203,13 +1203,16 @@ fn run_liquidation_sweep<H: PerpHost>(
     market_id: u64,
     market: &crate::types::Market,
     mark_price: u64,
+    // Shared with the trigger sweep, which runs FIRST and eats from the same pot — see
+    // `run_deferred_sweeps`. Being starved here is safe (a liquidation deferred is a liquidation
+    // delayed); being starved there is a user's stop-loss not firing.
+    budget: &mut u32,
 ) -> Result<bool, PerpError> {
     // Snapshot the registry (owned Vec, deterministic insertion order). Liquidations
     // mutate the live registry via save_position, but iterating the snapshot is stable;
     // a candidate already closed by an earlier cascade in this sweep resolves to
     // NoPosition (skipped), and cascade-created candidates are picked up next update.
     let candidates = storage::load_position_registry(context, market_id)?;
-    let mut liquidated = 0u32;
     // One ADL-fill budget shared across every liquidation in this sweep (bounds per-tx
     // ADL work regardless of how many positions liquidate).
     let mut adl_budget = ADL_BUDGET_PER_UPDATE;
@@ -1218,7 +1221,7 @@ fn run_liquidation_sweep<H: PerpHost>(
     // directly below, since it lives here.
     let mut deferred = false;
     for user in candidates {
-        if liquidated >= MAX_LIQUIDATIONS_PER_UPDATE {
+        if *budget == 0 {
             // Stopped on the cap with at least one candidate unexamined. Conservative: that
             // candidate may well be healthy, so this can report deferral where none exists — the
             // drain then finds nothing and clears the bit. Reporting a FALSE NEGATIVE here would be
@@ -1242,7 +1245,7 @@ fn run_liquidation_sweep<H: PerpHost>(
         ) {
             Ok(LiquidationOutcome::Liquidated { .. }) => {
                 context.checkpoint_commit();
-                liquidated += 1;
+                *budget -= 1;
             }
             Ok(_) => {
                 // AboveMaintenance / NoPosition: zero perp writes were made.
@@ -1260,7 +1263,7 @@ fn run_liquidation_sweep<H: PerpHost>(
     // ⚠️ That is NOT "there is nothing liquidatable". This function reports CAP PRESSURE — work a
     // LATER ATTEMPT IN THE SAME BLOCK could finish because a budget, not the market, stopped it:
     //
-    //   * the 50 liquidation slots           -> the early `return Ok(true)` above
+    //   * the shared sweep budget            -> the early `return Ok(true)` above
     //   * the shared ADL fill budget         -> `adl_budget == 0` here
     //   * the per-match distinct-maker cap   -> `deferred`, set by the book leg
     //
@@ -1306,8 +1309,23 @@ fn run_deferred_sweeps<H: PerpHost>(
     mark_price: u64,
 ) -> Result<bool, PerpError> {
     let gc_deferred = run_out_of_band_expiry_sweep(context, market_id, market)?;
-    let sweep_deferred = run_liquidation_sweep(context, market_id, market, mark_price)?;
-    let deferred = gc_deferred || sweep_deferred;
+
+    // ── ONE budget, consumed in order: triggers, then liquidations ───────────────────────────
+    //
+    // Triggers go first, and not merely out of politeness to the user. A stop-loss that executes
+    // REMOVES the position the liquidation sweep would otherwise have had to handle, so the two
+    // are not competing for the same work — spending here reduces what is left to spend below.
+    // The reverse order is strictly worse: a user whose stop did not fire BECAUSE we spent the
+    // budget liquidating them is the one outcome nobody can defend.
+    //
+    // Sharing one counter rather than giving triggers their own cap keeps the per-tick gas bound
+    // a single number, so the argument for it does not have to be re-derived.
+    let mut budget = MAX_SWEEP_ACTIONS_PER_UPDATE;
+    let trigger_deferred =
+        crate::algo::run_trigger_sweep(context, market_id, market, mark_price, &mut budget)?;
+    let sweep_deferred =
+        run_liquidation_sweep(context, market_id, market, mark_price, &mut budget)?;
+    let deferred = gc_deferred || trigger_deferred || sweep_deferred;
 
     if (market.deferred_work != 0) != deferred {
         storage::save_deferred_work(context, market_id, deferred)?;
@@ -1329,7 +1347,7 @@ fn run_deferred_sweeps<H: PerpHost>(
 /// draining it could exceed the block gas limit, `updateIndexPrice` would stop landing — and with it
 /// the mark, funding and every liquidation. Cheap housekeeping must never be able to take the price
 /// feed down; this is the same reasoning that caps the neighbouring sweep at
-/// [`MAX_LIQUIDATIONS_PER_UPDATE`] and ADL at [`ADL_BUDGET_PER_UPDATE`].
+/// [`MAX_SWEEP_ACTIONS_PER_UPDATE`] and ADL at [`ADL_BUDGET_PER_UPDATE`].
 ///
 /// **Why 64.** It is [`crate::batch::MAX_BATCH_PLACE`] — the number of orders the gas table already
 /// accepts one transaction may touch (and each of those may sweep the book, so 64 expiries is
