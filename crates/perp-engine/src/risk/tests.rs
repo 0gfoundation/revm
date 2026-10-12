@@ -6807,6 +6807,7 @@ mod algo_trigger_sweep {
     use crate::types::AlgoOrderType;
 
     const RO: u8 = 1;
+    const CP: u8 = 2;
 
     fn stop_market(ctx: &mut TestCtx, user: Address, trigger: u64, qty: u64) -> [u8; 32] {
         let out = crate::algo::run_place_algo_order(
@@ -6910,6 +6911,148 @@ mod algo_trigger_sweep {
         );
         assert!(storage::load_order(&mut ctx, &id).unwrap().is_none(), "expired");
         assert!(storage::load_algo_down_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_algo(
+        ctx: &mut TestCtx,
+        user: Address,
+        side: Side,
+        kind: AlgoOrderType,
+        trigger: u64,
+        price: u64,
+        qty: u64,
+        flags: u8,
+    ) -> [u8; 32] {
+        let out = crate::algo::run_place_algo_order(
+            &placeAlgoOrderCall {
+                algoType: 0,
+                marketId: MARKET_ID,
+                side: side as u8,
+                orderType: kind as u8,
+                triggerPrice: trigger,
+                price,
+                quantity: qty,
+                tif: if kind.is_market() { 0 } else { 0 }, // GTC for the limit pair
+                workingType: 0,
+                clientAlgoId: FixedBytes::default(),
+                flags,
+            }
+            .abi_encode(),
+            user,
+            ctx,
+        )
+        .unwrap();
+        out[..32].try_into().unwrap()
+    }
+
+    /// **The LIMIT variant's trigger path, which had no test.** Every trigger test used
+    /// `STOP_MARKET`; `AlgoOrderType::Stop` appeared only in two REJECTION assertions, so the
+    /// branch that hands a fired order to `place_order_core` as a resting LIMIT had never run.
+    ///
+    /// This is also the half of the Binance parity pair that does NOT expire: a market stop says
+    /// "now or not at all", a limit stop says "at this price or better, and keep waiting".
+    #[test]
+    fn a_limit_stop_rests_in_the_book_when_it_fires() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+        // No liquidity on purpose: the fired order must REST, which is the thing being pinned.
+        let id = place_algo(&mut ctx, ALICE, Side::Sell, AlgoOrderType::Stop, 9_900, 9_950, QTY as u64, RO);
+
+        // ⚠️ 9_900, not 9_500. At 9_500 this 5x long is already BELOW maintenance (equity $150
+        // against a ~$158 requirement), so the liquidation sweep closes it and cancels every order
+        // she holds — including the one just rested. The test would then be measuring liquidation.
+        oracle_tick(&mut ctx, 9_900, 31);
+
+        assert_eq!(
+            storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(),
+            vec![9_950],
+            "the fired limit order must be RESTING in the book at its own price"
+        );
+        let o = storage::load_order(&mut ctx, &id).unwrap().expect("still live");
+        assert_eq!(o.status, OrderStatus::Open);
+        assert_eq!(o.trigger_price, 0, "it is an ordinary order now, not a conditional one");
+        assert_eq!(
+            position(&mut ctx, ALICE).amount,
+            QTY,
+            "nothing matched it, so the position is untouched — it is waiting, not failed"
+        );
+        assert!(
+            storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().is_empty(),
+            "and it left the conditional namespace on the way"
+        );
+    }
+
+    /// **`closePosition` reads the position AT TRIGGER TIME, which had no test.** The flag only
+    /// appeared in rejection assertions, so the branch that substitutes `|position|` for the
+    /// (necessarily zero) `quantity` had never run.
+    ///
+    /// The fixture grows the position between arming and firing, which is what makes it
+    /// discriminating twice over: a bug using the stored `quantity` would close 0 and EXPIRE the
+    /// order, and a bug snapshotting the size at PLACEMENT would close only half.
+    #[test]
+    fn close_position_takes_the_size_the_position_has_when_it_fires() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(
+            &mut ctx, ALICE, QTY / 2, -ENTRY_VALUE / 2, MARGIN / 2, 5, USER_WALLET as i64,
+        );
+        // quantity = 0 — mandatory with closePosition, and exactly what a naive implementation
+        // would then try to close.
+        place_algo(&mut ctx, ALICE, Side::Sell, AlgoOrderType::StopMarket, 9_500, 0, 0, RO | CP);
+
+        // Grow it AFTER arming.
+        seed_position_account(
+            &mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64,
+        );
+        place_order(&mut ctx, MAKER, Side::Buy as u8, 9_400, QTY as u64);
+
+        oracle_tick(&mut ctx, 9_500, 31);
+
+        assert_eq!(
+            position(&mut ctx, ALICE).amount,
+            0,
+            "the WHOLE position at trigger time, not the half it was armed against and not zero"
+        );
+    }
+
+    /// **The band-blocked remainder EXPIRES, which I asserted in a commit message and never
+    /// tested.** The claim was that routing a fired `_MARKET` order through the ordinary path
+    /// gives Binance's "unfilled market order expires" for free, with no special case. Free or
+    /// not, it was unverified.
+    ///
+    /// Liquidity exists here — it is simply OUTSIDE the fill-time band around the post-drop mark,
+    /// which is precisely the fast-move shape where a stop is most wanted and least fillable.
+    #[test]
+    fn a_market_stop_the_band_blocks_expires_rather_than_resting() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+        // The band is +/-10% of the mark, so at a 9_500 mark it is [8_550, 10_450]. A bid at 7_000
+        // is real liquidity the band will not let the close reach.
+        place_order(&mut ctx, MAKER, Side::Buy as u8, 7_000, QTY as u64);
+        let id = place_algo(&mut ctx, ALICE, Side::Sell, AlgoOrderType::StopMarket, 9_500, 0, QTY as u64, RO);
+
+        oracle_tick(&mut ctx, 9_500, 31);
+
+        assert_eq!(
+            position(&mut ctx, ALICE).amount,
+            QTY,
+            "nothing in band to close into, so nothing closed"
+        );
+        assert!(
+            storage::load_order(&mut ctx, &id).unwrap().is_none(),
+            "EXPIRED, not resting: a market order means now or not at all (Binance parity)"
+        );
+        assert!(
+            storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap().is_empty(),
+            "and it must NOT have become a resting sell — that would be a different order type"
+        );
+        assert!(
+            storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().is_empty(),
+            "the conditional is spent either way; the owner must re-arm"
+        );
     }
 
     /// **The budget-exhaustion path, which had no test at all.** `run_trigger_sweep`'s early
