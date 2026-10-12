@@ -632,7 +632,7 @@ sol! {
         ) external returns (bytes32 algoId);
 
         /// `cancelAlgoOrder` for `account`, authenticated by ed25519 signature.
-        /// Message: "perpdex_v1_algocancel"(20) || chainId(8) || account(20) || algoId(32)
+        /// Message: "perpdex_v1_algocancel"(21) || chainId(8) || account(20) || algoId(32)
         ///          || marketId(8) || timestamp(8) || recvWindow(8) || keyId(1)
         function cancelAlgoOrderSigned(
             address account,

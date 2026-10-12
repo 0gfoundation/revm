@@ -7125,6 +7125,166 @@ mod algo_order_signed {
         assert!(format!("{e:?}").contains("signature"), "got {e:?}");
     }
 
+    // ── cancelAlgoOrderSigned ────────────────────────────────────────────────────────────────
+    //
+    // ⚠️ This entrypoint shipped with ZERO coverage — its `debug_assert_eq!` on the canonical
+    // message length had never once been executed. It is a signed path anyone may relay, so the
+    // gap mattered more than its size suggested.
+
+    /// Rebuilt INDEPENDENTLY of the engine, same reason as the place-side helper: a helper that
+    /// called the engine's own writer would pin nothing.
+    fn cancel_msg(chain_id: u64, account: Address, algo_id: [u8; 32]) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(b"perpdex_v1_algocancel");
+        m.extend_from_slice(&chain_id.to_be_bytes());
+        m.extend_from_slice(account.as_slice());
+        m.extend_from_slice(&algo_id);
+        m.extend_from_slice(&MARKET_ID.to_be_bytes());
+        m.extend_from_slice(&TS.to_be_bytes());
+        m.extend_from_slice(&RECV.to_be_bytes());
+        m.push(0); // keyId
+        m
+    }
+
+    fn cancel_calldata(sig: &[u8], account: Address, algo_id: [u8; 32]) -> Vec<u8> {
+        crate::interface::IPerpDex::cancelAlgoOrderSignedCall {
+            account,
+            algoId: FixedBytes(algo_id),
+            marketId: MARKET_ID,
+            timestamp: TS,
+            recvWindow: RECV,
+            keyId: 0,
+            signature: sig.to_vec().into(),
+        }
+        .abi_encode()
+    }
+
+    /// Places one, then cancels it over the signed path with a third party relaying.
+    #[test]
+    fn a_relayer_can_cancel_a_signed_conditional_order() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register(&mut ctx, ALICE, &sk);
+        let chain_id = ctx.chain_id();
+        let place_sig = sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes();
+        let out = crate::algo::run_place_algo_order_signed(
+            &calldata(&place_sig, 8_000, QTY as u64, ALICE),
+            &mut ctx,
+        )
+        .unwrap();
+        let algo_id: [u8; 32] = out[..32].try_into().unwrap();
+
+        let sig = sk.sign(&cancel_msg(chain_id, ALICE, algo_id)).to_bytes();
+        crate::algo::run_cancel_algo_order_signed(&cancel_calldata(&sig, ALICE, algo_id), &mut ctx)
+            .unwrap();
+
+        assert!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().is_empty());
+        assert!(
+            storage::load_algo_down_prices(&mut ctx, MARKET_ID).unwrap().is_empty(),
+            "and it left the market trigger index, not just her own list"
+        );
+        assert!(storage::load_order(&mut ctx, &algo_id).unwrap().is_none());
+    }
+
+    /// ⚠️ The sharpest tamper on this entrypoint: `algoId` is what says WHICH order dies. A relayer
+    /// able to swap it could cancel any order the owner holds — a signature authorising the cancel
+    /// of one stop would become authority to strip them all.
+    ///
+    /// It signs for one REAL order and submits against another REAL one, so a pass means the
+    /// AIMED-AT order survived rather than merely that some error was returned.
+    ///
+    /// ⚠️ What this test does NOT catch, measured rather than assumed: deleting `algoId` from the
+    /// engine's signed message entirely. No independently-built-message test can — the helper
+    /// still includes the field, so the two messages differ either way and verification fails for
+    /// a reason unrelated to tampering. The mutation that removes the field is caught by the
+    /// HAPPY-PATH tests above, which need a verify to SUCCEED. Do not read a green here as proof
+    /// the field is covered; read the pair.
+    #[test]
+    fn tampering_with_the_cancelled_algo_id_does_not_verify() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register(&mut ctx, ALICE, &sk);
+        let chain_id = ctx.chain_id();
+
+        let place = |ctx: &mut TestCtx, trigger: u64| -> [u8; 32] {
+            let sig = sk.sign(&msg(chain_id, ALICE, trigger, QTY as u64)).to_bytes();
+            let out = crate::algo::run_place_algo_order_signed(
+                &calldata(&sig, trigger, QTY as u64, ALICE),
+                ctx,
+            )
+            .unwrap();
+            out[..32].try_into().unwrap()
+        };
+        let signed_for = place(&mut ctx, 8_000);
+        let victim = place(&mut ctx, 7_000);
+        assert_ne!(signed_for, victim);
+
+        // Authority to cancel `signed_for`, aimed at `victim`.
+        let sig = sk.sign(&cancel_msg(chain_id, ALICE, signed_for)).to_bytes();
+        let e = crate::algo::run_cancel_algo_order_signed(
+            &cancel_calldata(&sig, ALICE, victim),
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(format!("{e:?}").contains("signature"), "got {e:?}");
+        assert_eq!(
+            storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(),
+            2,
+            "BOTH orders must survive — neither the aimed-at one nor the authorised one"
+        );
+    }
+
+    #[test]
+    fn a_cancel_signature_from_another_chain_does_not_verify() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register(&mut ctx, ALICE, &sk);
+        let chain_id = ctx.chain_id();
+        let a = crate::algo::run_place_algo_order_signed(
+            &calldata(&sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes(), 8_000, QTY as u64, ALICE),
+            &mut ctx,
+        )
+        .unwrap();
+        let algo_id: [u8; 32] = a[..32].try_into().unwrap();
+
+        let sig = sk.sign(&cancel_msg(chain_id ^ 1, ALICE, algo_id)).to_bytes();
+        let e = crate::algo::run_cancel_algo_order_signed(
+            &cancel_calldata(&sig, ALICE, algo_id),
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(format!("{e:?}").contains("signature"), "got {e:?}");
+        assert_eq!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(), 1);
+    }
+
+    /// ⚠️ Pins the STATED REASON this entrypoint burns no signature, unlike its place-side twin:
+    /// replay protection is implicit because a cancelled conditional order is DELETED, so the
+    /// second submission finds nothing to cancel. If deletion ever became a status flip instead,
+    /// this test is what notices that the justification stopped holding.
+    #[test]
+    fn replaying_a_cancel_finds_nothing_to_cancel() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register(&mut ctx, ALICE, &sk);
+        let chain_id = ctx.chain_id();
+        let a = crate::algo::run_place_algo_order_signed(
+            &calldata(&sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes(), 8_000, QTY as u64, ALICE),
+            &mut ctx,
+        )
+        .unwrap();
+        let algo_id: [u8; 32] = a[..32].try_into().unwrap();
+        let sig = sk.sign(&cancel_msg(chain_id, ALICE, algo_id)).to_bytes();
+        let data = cancel_calldata(&sig, ALICE, algo_id);
+
+        crate::algo::run_cancel_algo_order_signed(&data, &mut ctx).unwrap();
+        let e = crate::algo::run_cancel_algo_order_signed(&data, &mut ctx).unwrap_err();
+        assert!(format!("{e:?}").contains("not found"), "got {e:?}");
+    }
+
     /// Replay: one signature, one order. The id IS `keccak256(signature)`, and the same hash keys
     /// the seen-signature set, so a resubmission bounces off the guard rather than placing a
     /// second order.
