@@ -6624,7 +6624,7 @@ mod golden {
     ///   * `alice_account` 999_059_629 → 999_059_631 (+2) and `insurance_fund` 49_007_956 →
     ///     49_007_954 (−2). ALICE's Phase-8 funding charge of 400 no longer leaves her wallet; it
     ///     comes out of her position margin instead, so her pre-liquidation margin is 400 thinner
-    ///     (1_591_200 → 1_590_800) and the 50 bps clearance fee levied on it drops 7_956 → 7_954.
+    ///     (1_591_318 → 1_590_918) and the 50 bps clearance fee levied on it drops 7_956 → 7_954.
     ///     Her wallet keeps the 400 it was not charged and gets back 400 less margin at
     ///     liquidation (net 0), and keeps the 2 the IF no longer collects. Σ(ALICE, IF) is
     ///     unchanged — a pure 2-unit transfer, no phantom value.
@@ -6958,8 +6958,8 @@ mod golden {
             //      exactly the 2_000 less that her margin returns at liquidation.
             //   4. A1 isolated funding: same shape, one step smaller. Her 400 funding
             //      charge is taken from the position margin instead of the wallet, so
-            //      the pre-liquidation margin is a further 400 thinner (1_591_200 →
-            //      1_590_800) and the clearance fee drops 7_956 → 7_954. The 400 she
+            //      the pre-liquidation margin is a further 400 thinner (1_591_318 →
+            //      1_590_918) and the clearance fee drops 7_956 → 7_954. The 400 she
             //      does not pay from the wallet is exactly the 400 less her margin
             //      returns, so the only net movement is the +2 she keeps (= the 2 the
             //      IF below no longer collects).
@@ -6991,7 +6991,7 @@ mod golden {
             //   (liquidation close taker fee waived — fix B).
             admin_perp_wallet: 51_003_461,
             // 50M deposit − 1M withdraw + 7_954 clearance fee
-            //   (50 bps of ALICE's 1_590_800 pre-liquidation margin — thicker than the
+            //   (50 bps of ALICE's 1_590_918 pre-liquidation margin — thicker than the
             //   pre-cap 1_056_000 because she now runs at 3x instead of 5x, and 2_400
             //   thinner than before the fee_reserved removal + A1 because her opening
             //   taker fees (2_000) and her funding charge (400) are now both charged to

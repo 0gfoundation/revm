@@ -580,8 +580,8 @@ pub fn margin_info_of(
 /// This is the LEAN fold: one accumulator, no maintenance-margin tier walk, no unrealized PnL, no
 /// `Σ isolatedWallet`. It serves the gates that want nothing but `available` —
 /// `TakerSettlement::finalize_compute`, `trading::rest_in_book`'s admission gate, its pre-walk
-/// early-out, the taker wallet-cover check, `removePositionMargin` — where the five extra
-/// accumulators would be arithmetic thrown away.
+/// early-out, the taker wallet-cover check, `addPositionMargin`, `transferFromPerp`,
+/// `depositInsuranceFund` — where the five extra accumulators would be arithmetic thrown away.
 ///
 /// The WIDE fold ([`account_margin_scalars`]) is now REST-only: `getAccount` and `getAccountMargin`
 /// are its only callers. Both other consumers it once had are gone — `trading::rest_in_book` reverted
