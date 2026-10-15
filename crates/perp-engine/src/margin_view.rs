@@ -373,8 +373,8 @@ pub fn compute_margin_info_at<H: PerpHost>(
 ///
 /// Both storage-driven entry points ([`compute_margin_info`], [`compute_margin_info_at`]) end here,
 /// so a stored position and a hypothetical one are priced by the same code — which is what lets the
-/// admission gate, `getAccount` and the `AccountBalanceChanged` after-image share one set of
-/// numbers.
+/// admission gate, `removePositionMargin`'s withdrawal cap, `getAccount` and the
+/// `AccountBalanceChanged` after-image share one set of numbers.
 pub fn margin_info_of(
     market: &crate::types::Market,
     pos: &crate::types::PerpPosition,

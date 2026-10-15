@@ -821,35 +821,102 @@ pub fn run_remove_position_margin<H: PerpHost>(
     // post-funding margin, and a reject leaves the insurance fund untouched.
     let pending_funding =
         compute_funding_settlement(context, caller, &market, &mut pos, Some(&account))?;
+    // ── The withdrawable cap (roadmap 2b — Binance's isolated `REMOVE` rule) ──
+    //
+    //   maxRemovable = max(0, min( iw − MM,  iw + uPnL − PIM ))      amount > maxRemovable ⇒ reject
+    //
+    // `iw` is `pos.margin` AFTER the in-memory funding settle above; `uPnL`, `PIM` and `MM` are at
+    // the LIVE mark. The request is accepted or refused WHOLE — never clipped to the cap, never
+    // partially honoured: Binance answered every over-request with `-4051` and an unchanged
+    // `isolatedWallet` (59/59, R21 + R21b), and debited exactly the amount sent on all 50 it took.
+    //
+    // What each term does:
+    //
+    // * `iw + uPnL − PIM` — EQUITY after the withdrawal must still cover the position's initial
+    //   margin at the mark. This is the term 2b exists for: a position in profit can release cash
+    //   down to a BALANCE below PIM, the difference carried by its unrealized profit (R21 accepted a
+    //   withdrawal leaving 8.0952 against PIM 8.3676). A loss counts too, and lowers the cap.
+    //   MEASURED: long ×10 in profit (R21, boundary at this term ±0.0012); short ×10 both sides, short
+    //   ×1 at a loss, long ×1 both sides (R21b) — including that a short's PIM is released with the
+    //   mark, not frozen at the worse of entry and mark. EXTRAPOLATED: a long above ×1 at a loss (on
+    //   a ×1 long R21b cannot tell the two readings apart), a short ×1 in profit, and any position
+    //   with resting orders (only the POSITION term `PIM` enters, never `IM` or `ooIM`). Long and
+    //   short run through this one formula — no per-side special case.
+    // * `iw − MM` — the BALANCE alone, unrealized profit excluded, must still cover maintenance. It
+    //   binds once `uPnL > PIM − MM`, and keeps the balance non-negative. Binance's documented
+    //   formula; NEVER MEASURED (at ×10 and Binance's 0.4% MMR it needs a ~10% move). EXTRAPOLATED —
+    //   and on OUR tables it is the common case, not a corner: `MM = |N|/(2·maxLev)`, so at a single
+    //   3× tier it binds from `mark ≥ 1.2·entry` for an L = 3 long. Past that point a long can
+    //   withdraw LESS as its profit grows. That is the formula, not a bug.
+    //
+    // Consequences worth knowing before "fixing" either one:
+    //
+    // * A freshly opened position can withdraw NOTHING, at any leverage: the opening fee is paid out
+    //   of the silo, so at `mark ≈ entry` the equity sits one fee BELOW `PIM` and the cap is ≈ −fee.
+    //   Binance refuses a long with no margin added the same way — MEASURED on ×1 (R21b: `0.01`
+    //   refused `-4051` at a profit mark and at a loss mark); on ×10 only the reading `W0 < PIM` at
+    //   open exists (R8, R21), no REMOVE was sent. The short is derived. `addPositionMargin(E)` then
+    //   lifts the cap to `E − fee`, so a full add-then-remove round trip of `E` is refused too. This
+    //   deliberately re-locks what B2 (`4409a033`) had unlocked.
+    // * A ×1 long's EQUITY term is EXACTLY `iw + v_quote_balance`, independent of the mark: at
+    //   `L = 1`, `PIM = N` cancels the notional inside `uPnL` to the unit. It is the cap until the
+    //   `iw − MM` term takes over (`uPnL > N − MM`: from `mark ≈ 6·entry` on a single 3× tier). With
+    //   no margin added that is `−fee` plus net funding — nothing to withdraw while funding received
+    //   ≤ the fee.
+    //
+    // It replaces a MAINTENANCE-only rule (`amount ≤ iw` and `iw − amount + uPnL ≥ MM`, both kept, as
+    // G1 and G4) whose accept set is a strict superset of this one: it let equity fall to `MM`
+    // instead of `PIM`, and once `uPnL ≥ MM` let the balance go to zero. B2 (`4409a033`) had removed
+    // a PnL-blind `iw − amount ≥ ⌊N/L⌋` gate that sat beside it and never released an unrealized
+    // profit. Neither was Binance's — R21 measured the equity term directly.
+    //
+    // ARITHMETIC. `uPnL`, `PIM` and `MM` come off `margin_info_of` — the one function
+    // `getPositionRisk` reports them from — so with no funding pending the accept boundary is
+    // `isolatedWallet`, `unrealizedProfit`, `positionInitialMargin` and `maintMargin` from that row
+    // (with funding pending, `iw` is the post-settle `pos.margin`, which the view does not settle),
+    // recombined with no rounding of its own: PIM rounds UP, MM truncates, and
+    // `uPnL = trunc0(N) + vQuote` (the notional's truncation is its only rounding), each as the
+    // engine already does it. The comparisons are taken in `i128` with no division anywhere, so
+    // "equity ≥ the PIM a client reads, balance ≥ the MM a client reads" holds bit-exactly.
+    //
+    // Gate order is fixed and each refusal names its own term: G1 the balance, G2 `iw − MM`, G3
+    // `iw + uPnL − PIM`, G4 the liquidation predicate itself.
     if pos.margin < amount {
         return Err(perp_err(
             "removePositionMargin: insufficient position margin",
         ));
     }
     let new_margin = pos.margin - amount;
-    // MAINTENANCE margin is the only requirement gate here — initial margin is deliberately NOT
-    // checked (B2, Binance parity).
+    let info = crate::margin_view::margin_info_of(&market, &pos)?;
+    debug_assert_eq!(
+        info.mark_price, mark_price,
+        "removePositionMargin: the cap and the G4 predicate must price at one mark"
+    );
+    if (new_margin as i128) < info.maint_margin as i128 {
+        return Err(perp_err(
+            "removePositionMargin: resulting margin below maintenance margin",
+        ));
+    }
+    if (new_margin as i128) + (info.unrealized_profit as i128)
+        < info.position_initial_margin as i128
+    {
+        return Err(perp_err(
+            "removePositionMargin: resulting equity below initial margin requirement",
+        ));
+    }
+    // G4 — the SAFETY NET, kept from the old rule: never leave a position that `liquidate()` would
+    // take at this same mark. It is the exact predicate the liquidation path and the sweep enforce,
+    // not a restatement of it.
     //
-    // There used to be an additional `new_margin < ROUND_DOWN(N/L)` gate. It was strictly
-    // stronger than the maintenance check below and it made `removePositionMargin` unusable in
-    // the ordinary case: since `7cc26360` an opening fill funds the trading fee OUT of the
-    // margin, so a freshly opened position at its market's max leverage already sits at
-    // `floor(N/L) − fee`, i.e. BELOW the initial-margin requirement. Every removal was refused,
-    // and even `addPositionMargin(X)` followed by `removePositionMargin(X)` — a round trip that
-    // moves the position nowhere — was refused.
-    //
-    // Binance checks maintenance margin continuously and never re-checks initial margin
-    // (`binance-margin-verified-model.md` §1.5: margin is validated at placement and not again;
-    // `addPositionMargin`/`removePositionMargin` are a pure transfer that "不改 IM,不改 MM"). The
-    // formula set §1.2 states it flatly — 「**Binance 只连续检查 MM,不检查 IM**」 — and
-    // `binance-flip-and-admission.md` §3.9 supplies the MEASUREMENT: run1's market open computed
-    // `PIM = 6.34041` while the silo received `6.30870795`, short by exactly one opening commission,
-    // and the position 「照常存活」. So 「silo 低于 IM」 is 「**常态,不是异常**」 — a continuous IM
-    // check here (or anywhere else) would be a divergence, not a safety net.
-    // The maintenance gate is the one that matters and is strictly the right one here: it
-    // accounts for unrealized PnL via `v_quote_balance`, which the initial-margin form did not,
-    // so collateral still cannot be stripped from a position that is sliding underwater — and a
-    // position can never be left immediately liquidatable.
+    // G4 is the gate that fails only when `uPnL < 0` AND `MM > PIM` (it is looser than G2 whenever
+    // `uPnL ≥ 0`, and than G3 whenever `PIM ≥ MM`). `PIM ≥ MM` holds whenever the position's
+    // leverage is at most `2 × maxLev` of the tier its notional sits in — a sufficient condition,
+    // and on a single 3× tier with `L ≤ 3` it gives `PIM ≥ 2·MM`. It is NOT an identity, though, and
+    // two routes break it: `setMarginTiers` installing a lower-leverage table under a live position
+    // (nothing re-checks open positions), and a notional growing into a lower-leverage tier as the
+    // mark rises — which G4 can only catch on a short, since a long that grew that way is in profit.
+    // Without this line a withdrawal could then leave the position liquidatable on the spot. That
+    // is the one corner where we refuse what Binance's formula would allow.
     if !is_above_maintenance_margin(
         &market.tiers,
         mark_price,

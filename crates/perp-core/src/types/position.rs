@@ -26,11 +26,12 @@ pub struct PerpPosition {
     /// Margin (collateral) allocated to this position — Binance's `isolatedWallet`.
     ///
     /// **`margin < ROUND_UP(|N| / L)` (below the position's own initial margin) is NORMAL, not an
-    /// anomaly, and nothing may assert otherwise.** Binance only checks the maintenance margin
-    /// continuously and never re-checks IM after placement
-    /// (`misc/binance-margin-verified-model.md` §1.2, and `misc/binance-flip-and-admission.md` §3.9:
-    /// 「逐仓仓位**天生**就低于自己的 `IM`」 — run1's market open computed `PIM = 6.34041` while the
-    /// silo received `6.30870795`, short by one commission, and 「照常存活」). Ours is below by the
+    /// anomaly, and nothing may assert otherwise.** Binance checks only the maintenance margin
+    /// continuously; after placement IM is checked again only when margin is withdrawn (the THIRD
+    /// case below), never continuously (`misc/binance-margin-verified-model.md` §1.2, and
+    /// `misc/binance-flip-and-admission.md` §3.9: 「逐仓仓位**天生**就低于自己的 `IM`」 — run1's
+    /// market open computed `PIM = 6.34041` while the silo received `6.30870795`, short by one
+    /// commission, and 「照常存活」). Ours is below by the
     /// same mechanism: the opening fill funds the trading fee out of the margin it creates
     /// (`isolatedWallet = Ne/L − f·Ne`, see the `fee_reserved` note below). Funding charges, close
     /// legs and ADL drain it further with no IM floor.
@@ -42,6 +43,14 @@ pub struct PerpPosition {
     /// (`derived-ooim-plan.md` §3a, `trading::settlement::OpeningMarginFunding`). Unlike a fee-sized
     /// gap this one is unbounded, so treating "short of IM" as an invariant violation is not merely
     /// pedantic — it would fire in production.
+    ///
+    /// A THIRD: `removePositionMargin` (roadmap 2b) lets a position in profit withdraw down to a
+    /// balance below `PIM`, the difference carried by unrealized profit — Binance's cap
+    /// `max(0, min(iw − MM, iw + uPnL − PIM))`, whose equity term R21 measured (balance 8.0952 left
+    /// against PIM 8.3676; the `iw − MM` term is documented, never measured). Ours adds a
+    /// liquidation guard (equity ≥ `MM`) on top. That is a check AT WITHDRAWAL TIME, not a
+    /// continuous one: it holds equity ≥ `PIM` and this field ≥ `MM` at the instant of the
+    /// withdrawal, and nothing re-checks either afterwards.
     ///
     /// The only continuous requirement gate in the engine is
     /// [`crate::math::is_above_maintenance_margin`], and it reads THIS field, so a short silo

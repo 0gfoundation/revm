@@ -2960,8 +2960,9 @@ fn taker_open_fill_charges_fee_from_margin_not_on_top_of_the_wallet() {
 ///
 /// * `isolatedWallet < positionInitialMargin`, by exactly the fee — the §3.9 shape;
 /// * it is NOT liquidatable (the maintenance check is the only continuous one);
-/// * it still accepts an `addPositionMargin`/`removePositionMargin` round trip (B2 — the removed IM
-///   gate used to refuse this exact no-op);
+/// * `removePositionMargin` sees the shortfall and nothing else: after `addPositionMargin(X)` exactly
+///   `X − fee` comes back out and the full `X` is refused (2b — Binance's withdrawal cap is equity
+///   against PIM, so the fee the silo is short by stays in);
 /// * it still accepts a new order.
 ///
 /// If a continuous IM check is ever reintroduced anywhere, at least one of these fails.
@@ -3032,9 +3033,23 @@ fn a_position_naturally_below_its_own_initial_margin_survives_normally() {
         "a silo below its own IM must NOT be liquidatable — MM is the only continuous gate"
     );
 
-    // ── B2: the add/remove no-op round trip the removed IM gate refused ──
+    // ── 2b: an add/remove round trip returns the deposit LESS the fee shortfall ──
+    // The withdrawal cap is `iw + uPnL − PIM` here (the `iw − MM` term is far looser at 1×), and
+    // the silo starts one fee below PIM, so `addPositionMargin(X)` makes exactly `X − fee`
+    // withdrawable. The full `X` is refused whole.
     let margin_before = pos(&mut ctx, ALICE).margin;
     let wallet_before = wallet(&mut ctx, ALICE);
+    let remove = |ctx: &mut TestCtx, amount: u64| {
+        crate::risk::run_remove_position_margin(
+            &removePositionMarginCall {
+                marketId: MARKET_ID,
+                amount,
+            }
+            .abi_encode(),
+            ALICE,
+            ctx,
+        )
+    };
     crate::risk::run_add_position_margin(
         &addPositionMarginCall {
             marketId: MARKET_ID,
@@ -3045,18 +3060,17 @@ fn a_position_naturally_below_its_own_initial_margin_survives_normally() {
         &mut ctx,
     )
     .unwrap();
-    crate::risk::run_remove_position_margin(
-        &removePositionMarginCall {
-            marketId: MARKET_ID,
-            amount: 100_000,
-        }
-        .abi_encode(),
-        ALICE,
-        &mut ctx,
-    )
-    .unwrap();
-    assert_eq!(pos(&mut ctx, ALICE).margin, margin_before);
-    assert_eq!(wallet(&mut ctx, ALICE), wallet_before);
+    let err = remove(&mut ctx, 100_000).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+        "{err}"
+    );
+    assert!(remove(&mut ctx, 100_000 - fee + 1).is_err());
+    remove(&mut ctx, 100_000 - fee).unwrap();
+    assert_eq!(pos(&mut ctx, ALICE).margin, INIT_MARGIN as i64, "the silo lands exactly on PIM");
+    assert_eq!(pos(&mut ctx, ALICE).margin, margin_before + fee as i64);
+    assert_eq!(wallet(&mut ctx, ALICE), wallet_before - fee);
 
     // ── and it can still trade ──
     place(&mut ctx, ALICE, 0, PRICE / 2, QTY, 0, 0);
@@ -6843,12 +6857,19 @@ mod golden {
     ///
     /// `BusinessSnapshot` is unchanged — the ids are opaque to it, only statuses are read.
     ///
+    /// Re-pinned again for roadmap 2b, `removePositionMargin` on Binance's withdrawal cap:
+    /// `BLOCK_COMMITMENT_VERSION` 31 → 32, and that byte is the ONLY thing that moved. Phase 8's
+    /// withdrawal (250_000 of the 500_000 Phase 7 added) is inside the new cap, so the write set is
+    /// byte-identical and `BusinessSnapshot` is unchanged — confirmed by running the scenario with the
+    /// new rule in place against the old pin before bumping the byte.
+    ///
     /// Prior values 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052,
     /// 0x38ca0434996ba2e636a05ff1c69c46c9ff93d343e4cde19e8223968a6a03d733,
     /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
-    /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875.
+    /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875,
+    /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20");
+        b256!("0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

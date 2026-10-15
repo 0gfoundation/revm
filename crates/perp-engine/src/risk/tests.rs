@@ -3050,12 +3050,14 @@ fn remove_position_margin_returns_safe_excess_margin_to_wallet() {
     assert_eq!(position(&mut ctx, ALICE).margin, MARGIN);
 }
 
-/// B2: MAINTENANCE margin is the only requirement gate. The initial-margin gate that used to sit
-/// in front of it is gone (Binance checks MM continuously and never re-checks IM).
+/// 2b gate order on a $1 000 long, `L = 5`, margin $200, mark = entry (uPnL 0):
+/// `PIM = 1000/5 = $200`, `MM = 1000/6 = $166_666_666`.
 ///
-/// Same scenario as before the change — remove $40 from a $200 margin on a $1 000 position — and
-/// it is still REFUSED, but by the maintenance gate, which is the tighter and more correct one:
-/// notional $1 000 ⇒ MM = 1000/6 = $166.67, and $200 − $40 = $160 < $166.67.
+/// * Removing $40 would leave $160 < MM, so G2 (`iw − MM`) refuses it — the FIRST failing gate
+///   names it, even though G3 would refuse it too.
+/// * The cap is `max(0, min(200 − 166.67, 200 + 0 − 200)) = 0`: the equity term binds, and a
+///   single micro-unit is refused by G3. Under the maintenance-only rule this replaced, $33.33
+///   came out here — it let equity fall to `MM` rather than `PIM`.
 #[test]
 fn remove_position_margin_rejects_when_it_would_breach_maintenance() {
     let mut ctx = make_ctx();
@@ -3064,30 +3066,46 @@ fn remove_position_margin_rejects_when_it_would_breach_maintenance() {
 
     let err = remove_position_margin(&mut ctx, 40_000_000).unwrap_err();
     assert!(
-        err.to_string().contains("below maintenance margin"),
-        "the maintenance gate, not the removed initial-margin gate: {err}"
+        err.to_string()
+            .contains("removePositionMargin: resulting margin below maintenance margin"),
+        "G2, the balance term, is the first gate that fails: {err}"
     );
     assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET);
     assert_eq!(position(&mut ctx, ALICE).margin, MARGIN);
 
-    // And the boundary is genuinely the maintenance threshold, not the old IM one: removing
-    // $33.33 leaves $166_666_667, one unit above MM = $166_666_666, and is ALLOWED. Under the
-    // old gate every one of these was refused, because IM = N/5 = $200 == the whole margin.
-    assert!(remove_position_margin(&mut ctx, 33_333_333).is_ok());
-    assert_eq!(position(&mut ctx, ALICE).margin, 166_666_667);
+    // $33.33 clears G2 (leaves 166_666_667 ≥ MM) but not G3: equity 166_666_667 < PIM.
+    let err = remove_position_margin(&mut ctx, 33_333_333).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+        "{err}"
+    );
+    // And the cap is exactly zero: one micro-unit is refused by the same gate.
+    let err = remove_position_margin(&mut ctx, 1).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+        "{err}"
+    );
+    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET);
+    assert_eq!(position(&mut ctx, ALICE).margin, MARGIN);
 }
 
-/// B2, the case that made the old gate unusable: at a market's MAX leverage a freshly opened
-/// position is already BELOW the initial-margin requirement, because since `7cc26360` the
-/// opening fill funds the trading fee out of the margin (`floor(N/L) − fee`). The old gate
-/// therefore refused EVERY removal — and even refused `add(X)` followed by `remove(X)`, a round
-/// trip that leaves the position exactly where it started.
+/// The fresh-position case B2 was about, under 2b: at a market's max leverage a just-opened
+/// position sits one opening fee BELOW its initial margin (since `7cc26360` the fill funds the fee
+/// out of the margin it creates), so its equity is short of `PIM` and the cap is negative.
+/// `addPositionMargin(X)` lifts the cap to `X − shortfall`, not to `X`: a full round trip of `X` is
+/// REFUSED, and exactly `X − shortfall` comes back out. Binance behaves the same way (R21b refused
+/// 0.01 on a fresh position, both sides).
 #[test]
-fn remove_position_margin_round_trips_at_max_leverage() {
+fn remove_position_margin_round_trip_returns_only_what_clears_initial_margin() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
-    // Max leverage 3, and margin one fee-tick BELOW floor(N/3) — exactly the post-fill state.
+    // Max leverage 3, and margin 1_000 below floor(N/3) — the post-fill shape. `PIM` rounds UP to
+    // 333_333_334, so the silo is 1_001 short of it.
     let post_fee_margin = 1_000_000_000i64 / 3 - 1_000;
+    let shortfall = 333_333_334 - post_fee_margin;
+    assert_eq!(shortfall, 1_001);
     storage::save_position(
         &mut ctx,
         ALICE,
@@ -3104,35 +3122,51 @@ fn remove_position_margin_round_trips_at_max_leverage() {
     .unwrap();
     let wallet_before = wallet(&mut ctx, ALICE);
 
-    // add then remove the same amount: a no-op round trip that the old IM gate rejected.
-    add_position_margin(&mut ctx, 10_000_000).unwrap();
-    remove_position_margin(&mut ctx, 10_000_000).unwrap();
-    assert_eq!(position(&mut ctx, ALICE).margin, post_fee_margin);
-    assert_eq!(wallet(&mut ctx, ALICE), wallet_before);
+    // Nothing comes out of a fresh position.
+    let err = remove_position_margin(&mut ctx, 1).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+        "{err}"
+    );
 
-    // And genuine excess above maintenance is withdrawable: MM = 1000/6 = 166_666_666, so
-    // dropping from 333_332_333 to 233_332_333 stays comfortably clear.
-    remove_position_margin(&mut ctx, 100_000_000).unwrap();
-    assert_eq!(position(&mut ctx, ALICE).margin, post_fee_margin - 100_000_000);
+    add_position_margin(&mut ctx, 10_000_000).unwrap();
+    // The full round trip is refused, whole — not clipped to the cap.
+    let err = remove_position_margin(&mut ctx, 10_000_000).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+        "{err}"
+    );
+    assert_eq!(position(&mut ctx, ALICE).margin, post_fee_margin + 10_000_000);
+    // One past the cap is refused; the cap itself comes out exactly.
+    let cap = 10_000_000 - shortfall as u64;
+    assert!(remove_position_margin(&mut ctx, cap + 1).is_err());
+    remove_position_margin(&mut ctx, cap).unwrap();
+    let pos = position(&mut ctx, ALICE);
+    assert_eq!(pos.margin, 333_333_334, "the silo lands exactly on PIM");
+    assert_eq!(wallet(&mut ctx, ALICE), wallet_before - shortfall as u64);
 }
 
+/// A position at a loss: long 10 @ $100 marked at $90, margin $200, `L = 5`.
+/// `N = 900`, `uPnL = −100`, `PIM = 900/5 = 180`, `MM = 900/6 = 150`.
+///
+/// Removing $20 leaves equity `180 − 100 = 80`. The equity term (G3, `≥ PIM = 180`) refuses it;
+/// the loss is what refuses it — the balance alone (180) would still clear both `PIM` and `MM`.
+/// The cap is `max(0, min(200 − 150, 200 − 100 − 180)) = 0`.
 #[test]
-fn remove_position_margin_rejects_when_result_below_maintenance() {
+fn remove_position_margin_rejects_when_a_loss_takes_equity_below_initial_margin() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
-    // Long 10 @ $100, margin $200, leverage 5.
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
     // Mark drops to $90 → position carries a $100 unrealized loss.
     storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
 
-    // Removing $20 passes the (PnL-blind) initial-margin check — new margin
-    // $180 == notional($900)/leverage(5) — but leaves equity at
-    // 900 − 1000 + 180 = $80, below the maintenance threshold $900/6 = $150.
-    // The PnL-aware maintenance check must reject it.
     let err = remove_position_margin(&mut ctx, 20_000_000).unwrap_err();
     assert!(
-        err.to_string().contains("below maintenance margin"),
-        "{err}"
+        err.to_string()
+            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+        "the unrealized LOSS counts against the equity term: {err}"
     );
     assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET);
     assert_eq!(position(&mut ctx, ALICE).margin, MARGIN);

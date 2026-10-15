@@ -174,7 +174,8 @@ sol! {
         ///                         one level down, before unrealised PnL. The only margin quantity
         ///                         physically held anywhere: it was moved out of the perp wallet
         ///                         when the position opened, and it moves only on open /
-        ///                         add-or-remove-margin / close, never with the mark.
+        ///                         add-or-remove-margin / funding settlement / close (including
+        ///                         forced closes), never with the mark.
         ///                         `openOrderInitialMargin` by contrast is escrowed NOWHERE — it
         ///                         is subtracted arithmetically at the admission gate.
         ///                         WAS named `positionMargin` (ours) until it took Binance's name;
@@ -1054,7 +1055,10 @@ sol! {
         /// shortfall lands on the POSITION, not here: `isolatedWallet` is funded
         /// with `min(requirement, cash at hand)` and left short by the rest (model **M1**, measured
         /// on Binance by R11 — `derived-ooim-plan.md` §3a). Consumers must therefore expect
-        /// `isolatedWallet < positionInitialMargin` after such a fill, and must not read the gap as
+        /// `isolatedWallet < positionInitialMargin` after such a fill — as they must after an
+        /// ordinary opening fill (the fee comes out of the silo, so at mark ≈ fill price it starts
+        /// one fee short), a mark rise, a funding charge, or a `removePositionMargin` against
+        /// unrealized profit — and must not read the gap as
         /// an error: the position's liquidation price is computed from the SHORT margin, which is the
         /// honest one. (Two earlier versions of this comment were wrong: one said such a fill "will be
         /// cancelled at fill time" (pre-escrow-removal behaviour), the next said the shortfall lands
@@ -1091,6 +1095,20 @@ sol! {
         /// Add isolated margin from the caller's perp wallet to an open position.
         function addPositionMargin(uint64 marketId, uint64 amount) external;
         /// Remove isolated margin from an open position back to the caller's perp wallet.
+        ///
+        /// The withdrawable cap, in `getPositionRisk`'s fields at the live mark:
+        /// `max(0, min(isolatedWallet − maintMargin,
+        ///             isolatedMargin − max(positionInitialMargin, maintMargin)))`.
+        /// Binance's cap is this with `positionInitialMargin` alone in the second term, so a
+        /// position in profit can withdraw down to a balance below its initial margin; the
+        /// `maintMargin` inside the `max()` is our liquidation guard (never leave the position
+        /// liquidatable at this mark) and binds only when `maintMargin > positionInitialMargin`
+        /// and the position is at a loss — a tier table lowered under the position by
+        /// `setMarginTiers` (which re-checks no open position), or a notional grown into a
+        /// lower-leverage tier. Pending funding is settled into `isolatedWallet` (and so
+        /// `isolatedMargin`) FIRST, which `getPositionRisk` does not do: its row gives the cap
+        /// exactly only when no funding is pending. An `amount` above the cap is refused WHOLE
+        /// (never clipped) and leaves everything, funding included, as it was.
         function removePositionMargin(uint64 marketId, uint64 amount) external;
 
         // ── Liquidation ───────────────────────────────────────────────────

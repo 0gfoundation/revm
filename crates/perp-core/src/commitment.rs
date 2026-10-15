@@ -169,7 +169,19 @@ use primitives::{B256, U256};
 //
 // No BUSINESS behaviour changes: the golden scenario's BusinessSnapshot is UNCHANGED, field for
 // field. CHAIN change: golden re-pin + wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 31;
+// ── 32 ───────────────────────────────────────────────────────────────────────────────────
+// `removePositionMargin` takes Binance's isolated withdrawal cap (roadmap 2b):
+// `max(0, min(iw − MM, iw + uPnL − PIM))`, refused whole above it. ONE execution-rule change, no
+// layout change. The rule it replaces asked only `amount ≤ iw` and `iw − amount + uPnL ≥ MM` (both
+// kept, the latter as the liquidation guard), so 32 is a pure tightening: a node on 31 accepts what
+// a node on 32 refuses (never the reverse), and every balance and liquidation decision downstream
+// of that withdrawal diverges. The golden scenario's one withdrawal (Phase 8: 250_000 back out of
+// the 500_000 added in Phase 7, after a funding settle) sits inside the new cap, so its write set
+// and its BusinessSnapshot are byte-identical at 31 and 32, and the golden value moves only because
+// this byte is hashed into it. VERIFIED, not assumed: the whole golden pin passed at the OLD value
+// with the new rule in place and this byte still 31. CHAIN change: golden re-pin + a coordinated
+// wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 32;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///
