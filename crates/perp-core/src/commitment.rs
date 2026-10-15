@@ -213,7 +213,14 @@ use primitives::{B256, U256};
 // and its BusinessSnapshot is UNCHANGED, field for field. VERIFIED, not assumed: with the two
 // fields `#[serde(skip)]` and this byte at 33, the golden reproduced the old pin 0x913b6760…40ce
 // exactly. CHAIN change: golden re-pin + a coordinated wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 34;
+// ── 35 ───────────────────────────────────────────────────────────────────────────────────
+// `cancelAlgoOrderSigned` burns its signature on submission, like the other eight signed
+// selectors: one more seen-signature write per call (and per rejected call, as a sanctioned
+// retained write). ONE execution-rule change, no layout change. A replay is now refused as a
+// duplicate instead of reaching the cancel. The golden scenario sends no signed algo cancel, so
+// its write set and BusinessSnapshot are byte-identical at 34 and 35; only this byte moves the
+// golden. CHAIN change: golden re-pin + a coordinated wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 35;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

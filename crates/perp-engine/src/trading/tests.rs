@@ -6876,7 +6876,11 @@ mod golden {
     /// creates no sub-account and makes no internal transfer, so no execution path it takes moved and
     /// `BusinessSnapshot` is UNCHANGED, field for field (asserted below).
     ///
-    /// Prior values 0x913b6760140fa04bdd42be6a6b63908f5d1d16430b96a1c8ce1b84b7612540ce,
+    /// Re-pinned again for `cancelAlgoOrderSigned` burning its signature (34 → 35). The scenario
+    /// sends no signed algo cancel, so only the version byte moved.
+    ///
+    /// Prior values 0x8362c452406bbd6f048358985803964c672ad20444e3f362327114a403b7ebb8,
+    /// 0x913b6760140fa04bdd42be6a6b63908f5d1d16430b96a1c8ce1b84b7612540ce,
     /// 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052,
     /// 0x38ca0434996ba2e636a05ff1c69c46c9ff93d343e4cde19e8223968a6a03d733,
     /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
@@ -6884,7 +6888,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x8362c452406bbd6f048358985803964c672ad20444e3f362327114a403b7ebb8");
+        b256!("0x2ffa38aefbdfa68307eb6869b95cb48d9828f407dce2924f2abd8ef5c5c0b88d");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

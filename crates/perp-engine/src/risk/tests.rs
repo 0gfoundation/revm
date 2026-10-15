@@ -7510,12 +7510,11 @@ mod algo_order_signed {
         assert_eq!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(), 1);
     }
 
-    /// ⚠️ Pins the STATED REASON this entrypoint burns no signature, unlike its place-side twin:
-    /// replay protection is implicit because a cancelled conditional order is DELETED, so the
-    /// second submission finds nothing to cancel. If deletion ever became a status flip instead,
-    /// this test is what notices that the justification stopped holding.
+    /// A replayed signed cancel is refused as a DUPLICATE SIGNATURE: the signature is burned on
+    /// submission, as on every other signed selector. A FRESH signature for the same, already
+    /// cancelled order still finds nothing (the order is deleted).
     #[test]
-    fn replaying_a_cancel_finds_nothing_to_cancel() {
+    fn replaying_a_cancel_is_refused_as_a_duplicate_signature() {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
         let sk = SigningKey::from_bytes(&[7u8; 32]);
@@ -7532,6 +7531,24 @@ mod algo_order_signed {
 
         crate::algo::run_cancel_algo_order_signed(&data, &mut ctx).unwrap();
         let e = crate::algo::run_cancel_algo_order_signed(&data, &mut ctx).unwrap_err();
+        assert!(format!("{e:?}").contains("duplicate signature"), "got {e:?}");
+
+        // A different, valid signature over the same cancel (one second later, still inside the
+        // recv window) is not a replay — it reaches the cancel and finds the order already gone.
+        let mut m = cancel_msg(chain_id, ALICE, algo_id);
+        let ts_at = m.len() - 1 - 8 - 8; // …‖timestamp(8)‖recvWindow(8)‖keyId(1)
+        m[ts_at..ts_at + 8].copy_from_slice(&(TS + 1).to_be_bytes());
+        let fresh = crate::interface::IPerpDex::cancelAlgoOrderSignedCall {
+            account: ALICE,
+            algoId: FixedBytes(algo_id),
+            marketId: MARKET_ID,
+            timestamp: TS + 1,
+            recvWindow: RECV,
+            keyId: 0,
+            signature: sk.sign(&m).to_bytes().to_vec().into(),
+        }
+        .abi_encode();
+        let e = crate::algo::run_cancel_algo_order_signed(&fresh, &mut ctx).unwrap_err();
         assert!(format!("{e:?}").contains("not found"), "got {e:?}");
     }
 

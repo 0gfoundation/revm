@@ -527,10 +527,32 @@ pub fn run_cancel_algo_order_signed<H: PerpHost>(
     crate::trading::verify_ed25519(&api_key.pubkey, &msg, &a.signature)
         .map_err(|e| perp_err(&format!("cancelAlgoOrderSigned: {e}")))?;
 
-    // No seen-signature burn here, for the same reason `cancelOrderSigned` has none: replay
-    // protection is implicit, because a cancelled conditional order is DELETED and the second
-    // attempt finds nothing to cancel.
-    cancel_core(context, a.account, a.algoId.0, a.marketId)?;
+    // Burned unconditionally, after verification and before the cancel — exactly as
+    // `cancelOrderSigned` does (see `run_place_order_signed`'s burn site for why SUBMISSION, not
+    // success, spends a signed authorization).
+    //
+    // This adds no safety the deletion did not already give: a cancelled conditional order is
+    // DELETED and algo ids are never reused (a signed one is `keccak256(signature)`, a direct one
+    // comes off the owner's monotonic nonce), so a replayed cancel could only ever find nothing.
+    // It was the ONE signed selector that skipped the burn, on that reasoning; it now matches the
+    // other eight, so "a signature is spent on submission" holds for every signed entrypoint with
+    // no exception to remember, and a replay is refused as what it is — a duplicate.
+    let sig_hash: [u8; 32] = primitives::keccak256(a.signature.as_ref()).0;
+    if storage::is_signature_seen(context, &sig_hash)? {
+        return Err(perp_err(
+            "cancelAlgoOrderSigned: duplicate signature (already submitted)",
+        ));
+    }
+
+    // ── last pre-write fault has passed; the first write happens here ──
+    let block_ts: u64 = context.timestamp();
+    let writes_before_burn = context.perp_write_count();
+    storage::mark_signature_seen(context, &sig_hash, a.timestamp)?;
+    crate::trading::gc_seen_buckets_best_effort(context, block_ts)?;
+    let burn_writes = context.perp_write_count().saturating_sub(writes_before_burn);
+
+    cancel_core(context, a.account, a.algoId.0, a.marketId)
+        .map_err(|e| e.after_retained_writes(burn_writes))?;
     Ok(Bytes::new())
 }
 
