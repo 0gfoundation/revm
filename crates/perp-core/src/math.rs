@@ -1240,6 +1240,131 @@ mod bankruptcy_price_tests {
     fn bankruptcy_price_zero_amount_is_zero() {
         assert_eq!(calc_bankruptcy_price(0, -100, 10, 2, 2).unwrap(), 0);
     }
+
+    // ── A funding DEBT (negative margin) ─────────────────────────────────────────────────────
+    //
+    // Funding lands on `margin` whole and may drive it below zero (the engine's `funding`
+    // module). These pin `calc_bankruptcy_price` on that domain: TOTAL (never an `Err` — its
+    // callers are the liquidation path and the oracle sweep, where an `Err` is a panic), and still
+    // tight wherever a non-negative bankruptcy price exists. Market: `bd = 0`, `pd = 2`, so
+    // `calc_value(p, q) = p · q · 1e4` exactly.
+
+    /// A SHORT whose debt has outgrown its entry proceeds (`credit = vQuote + margin < 0`) is
+    /// underwater at EVERY price — its equity `credit − |notional(P)|` only falls with `P` — so no
+    /// non-negative bankruptcy price exists. It is `Ok(0)`, not the `Err("bankruptcy price exceeds
+    /// u64")` it used to be: short 10 @ $100 (vQuote 1e9) carrying a 1.1e9 debt.
+    #[test]
+    fn a_short_whose_funding_debt_exceeds_its_entry_proceeds_has_bankruptcy_price_zero() {
+        let (amount, vq, margin) = (-10i64, 1_000_000_000i64, -1_100_000_000i64);
+        assert_eq!(calc_bankruptcy_price(amount, vq, margin, 0, 2).unwrap(), 0);
+        // …and the reason is real: equity is negative at 0 and at every price above it.
+        for p in [0u64, 1, 2, 10_000, 1_000_000] {
+            assert!(calc_position_equity(p, amount, vq, margin, 0, 2).unwrap() < 0, "p = {p}");
+        }
+        assert_eq!(calc_position_equity(0, amount, vq, margin, 0, 2).unwrap(), -100_000_000);
+        // One unit of debt past the proceeds is already the regime.
+        assert_eq!(calc_bankruptcy_price(amount, vq, -1_000_000_001, 0, 2).unwrap(), 0);
+    }
+
+    /// The boundary, `credit == 0`: equity is exactly 0 at price 0 and negative above. `Ok(0)` — the
+    /// one price that keeps it at zero — reached through the ordinary formula, not the debt guard.
+    #[test]
+    fn a_short_whose_funding_debt_exactly_eats_its_entry_proceeds_has_bankruptcy_price_zero() {
+        let (amount, vq, margin) = (-10i64, 1_000_000_000i64, -1_000_000_000i64);
+        assert_eq!(calc_bankruptcy_price(amount, vq, margin, 0, 2).unwrap(), 0);
+        assert_eq!(calc_position_equity(0, amount, vq, margin, 0, 2).unwrap(), 0);
+        assert!(calc_position_equity(1, amount, vq, margin, 0, 2).unwrap() < 0);
+    }
+
+    /// A LONG with a debt keeps a positive bankruptcy price — ABOVE its entry, by the debt spread
+    /// over its size — and it is TIGHT: equity at `P_b` is ≥ 0 and at `P_b − 1` it is < 0. Long 10
+    /// @ $100 (vQuote −1e9) with margin −50_000_001: `P_b = ceil(1_050_000_001 / 1e5) = 10_501`,
+    /// equity there `1_050_100_000 − 1_050_000_001 = 99_999`, and at 10_500 exactly `−1`.
+    #[test]
+    fn a_long_with_a_funding_debt_has_a_tight_bankruptcy_price_above_entry() {
+        let (amount, vq) = (10i64, -1_000_000_000i64);
+        let entry = calc_entry_price(amount, vq, 0, 2).unwrap();
+        assert_eq!(entry, 10_000);
+
+        let margin = -50_000_001i64;
+        let p_b = calc_bankruptcy_price(amount, vq, margin, 0, 2).unwrap();
+        assert_eq!(p_b, 10_501);
+        assert!(p_b > entry, "a debt lifts a long's bankruptcy price above its entry");
+        assert_eq!(calc_position_equity(p_b, amount, vq, margin, 0, 2).unwrap(), 99_999);
+        assert_eq!(calc_position_equity(p_b - 1, amount, vq, margin, 0, 2).unwrap(), -1);
+
+        // Exactly divisible: the debt of 50M lands P_b on 10_500 with equity exactly 0.
+        let p_b = calc_bankruptcy_price(amount, vq, -50_000_000, 0, 2).unwrap();
+        assert_eq!(p_b, 10_500);
+        assert_eq!(calc_position_equity(p_b, amount, vq, -50_000_000, 0, 2).unwrap(), 0);
+        assert!(calc_position_equity(p_b - 1, amount, vq, -50_000_000, 0, 2).unwrap() < 0);
+    }
+
+    /// The property, over random positions carrying a random funding debt, both sides, many
+    /// decimals: never an `Err`; a short with `credit ≤ 0` gets 0; everything else gets a price at
+    /// which equity is ≥ 0 and within one price unit's value of 0 — and, for a long, one unit
+    /// BELOW which equity is < 0, i.e. the exact flip.
+    /// The other state with no positive bankruptcy price: a LONG funded beyond its entry cost
+    /// (`vQuote + margin > 0` — a ×1 long plus funding credits or added margin) is solvent at every
+    /// price. It used to fall through to a negative price and a conversion `Err`; it gets 0.
+    #[test]
+    fn an_over_funded_long_has_bankruptcy_price_zero_not_an_error() {
+        // 10 @ $100.00 (base 0, price 2): vQuote −1e9, margin 1.1e9 ⇒ credit +1e8.
+        assert_eq!(calc_bankruptcy_price(10, -1_000_000_000, 1_100_000_000, 0, 2).unwrap(), 0);
+        assert!(calc_position_equity(0, 10, -1_000_000_000, 1_100_000_000, 0, 2).unwrap() > 0);
+        // Exactly funded (credit 0): equity is 0 at price 0, which is its bankruptcy price.
+        assert_eq!(calc_bankruptcy_price(10, -1_000_000_000, 1_000_000_000, 0, 2).unwrap(), 0);
+        // One unit short of it: the ordinary positive answer.
+        assert_eq!(calc_bankruptcy_price(10, -1_000_000_000, 999_999_999, 0, 2).unwrap(), 1);
+    }
+
+    #[test]
+    fn bankruptcy_price_is_total_and_tight_with_a_funding_debt() {
+        let mut s: u64 = 0xdeb7_0ff0_0d5e_ed01;
+        let (mut shorts_in_debt, mut checked) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            let bd = (next(&mut s) % 5) as u32;
+            let pd = (next(&mut s) % 5) as u32;
+            let entry = next(&mut s) % 10_000_000 + 1;
+            let qty = next(&mut s) % 100_000 + 1;
+            let notional = match calc_value(entry, qty, bd, pd) {
+                Ok(v) if v > 0 && v <= (i64::MAX / 4) as u64 => v as i64,
+                _ => continue,
+            };
+            // A debt anywhere from a sliver to twice the notional.
+            let margin = -((next(&mut s) % (2 * notional as u64)) as i64) - 1;
+            let is_long = next(&mut s) & 1 == 0;
+            let (amount, vq) = if is_long {
+                (qty as i64, -notional)
+            } else {
+                (-(qty as i64), notional)
+            };
+            let p_b = calc_bankruptcy_price(amount, vq, margin, bd, pd)
+                .expect("total on a funding debt");
+            let eq = |p: u64| calc_position_equity(p, amount, vq, margin, bd, pd).ok();
+            if !is_long && vq + margin <= 0 {
+                shorts_in_debt += 1;
+                assert_eq!(p_b, 0, "short with credit {} must get 0", vq + margin);
+                continue;
+            }
+            let Some(at) = eq(p_b) else { continue };
+            assert!(at >= 0, "equity(P_b) < 0: {at} P_b={p_b} a={amount} vq={vq} m={margin}");
+            let one_unit = calc_value(1, qty, bd, pd).unwrap() as i64 + 2;
+            assert!(at <= one_unit, "not tight: {at} > {one_unit} P_b={p_b}");
+            if is_long {
+                // A debt-laden long's `P_b` is ≥ 1 and is the exact flip: the ceil + upward nudge
+                // land on the FIRST price with equity ≥ 0. (A short's floor-rounded `P_b` need not
+                // be the last such price — flooring `calc_value` can leave one more unit solvent —
+                // which is why tightness above is stated in value, as in the property test above.)
+                assert!(p_b >= 1);
+                if let Some(e) = eq(p_b - 1) {
+                    assert!(e < 0, "P_b={p_b} is not the flip: equity one unit below is {e}");
+                }
+            }
+            checked += 1;
+        }
+        assert!(shorts_in_debt > 1_000 && checked > 1_000, "{shorts_in_debt} / {checked}");
+    }
 }
 
 /// [`calc_entry_price`] is the notional→price inverse of [`calc_value`], and it became

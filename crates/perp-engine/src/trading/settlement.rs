@@ -2688,6 +2688,78 @@ mod isolated_margin_tests {
         assert_eq!(outcome.bad_debt, 0);
         assert_eq!(wallet, 100);
     }
+
+    /// **The signed release's trunc0 never pushes a SHORT's remainder into the funding-debt
+    /// regime.**
+    ///
+    /// A short whose credit `vQuote + margin` is positive — solvent at SOME price — may carry a
+    /// funding debt (`margin < 0`, as low as `1 − vQuote`). After any partial close, solvent or not,
+    /// its remainder's credit must stay ≥ 0: otherwise rounding ALONE would hand
+    /// `calc_bankruptcy_price` a short with no representable price, and its next ADL would take the
+    /// one-price-unit `LoserOnly` branch meant for a genuine funding debt.
+    ///
+    /// trunc0 guarantees it: the remainder is `floor(vq·r/a) + ceil(m·r/a)` (a positive `vq`
+    /// truncates down, a negative `m` truncates UP), which is `> credit·r/a − 1 > −1`. A floor on
+    /// the margin gives only `≥ credit·r/a − 2`, so −1 is reachable — the pinned case below
+    /// (abs 7, vq 908_691_480, m −908_691_478, close 6) lands there. Half the random cases draw the
+    /// credit from `[1, abs]`, which is where that edge lives. The insolvent draw cannot break it
+    /// either: it takes only from a POSITIVE remaining margin, never below 0.
+    #[test]
+    fn a_short_with_positive_credit_keeps_a_non_negative_remainder_credit() {
+        fn next(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        let check = |abs: u64, vq: i64, m: i64, close: u64, closing_value: u64| {
+            let mut p = PerpPosition {
+                amount: -(abs as i64),
+                v_quote_balance: vq,
+                margin: m,
+                leverage: 1,
+                ..PerpPosition::default()
+            };
+            let mut wallet = 0i64;
+            apply_position_fill(
+                &mut p,
+                &mut wallet,
+                close,
+                closing_value,
+                0,
+                0,
+                true,
+                OpeningMarginFunding::Requirement,
+            )
+            .unwrap();
+            assert_eq!(p.amount, -((abs - close) as i64));
+            assert!(
+                p.v_quote_balance + p.margin >= 0,
+                "remainder credit {} < 0: abs {abs} vq {vq} m {m} close {close} cv {closing_value}",
+                p.v_quote_balance + p.margin
+            );
+        };
+        // The pinned edge: remainder credit is exactly 0 under trunc0 (−1 under a floor).
+        check(7, 908_691_480, -908_691_478, 6, 0);
+
+        let mut s: u64 = 0x7a3c_51d0_e9b2_4f86;
+        let mut in_debt = 0u32;
+        for i in 0..200_000u32 {
+            let abs = next(&mut s) % 1_000 + 2; // [2, 1001]
+            let vq = (next(&mut s) % 1_000_000_000 + 1) as i64; // [1, 1e9]
+            let credit = if i % 2 == 0 {
+                (next(&mut s) % vq as u64 + 1) as i64 // [1, vq]
+            } else {
+                (next(&mut s) % abs + 1) as i64 // [1, abs]: the rounding edge
+            };
+            let m = credit - vq;
+            in_debt += u32::from(m < 0);
+            let close = next(&mut s) % (abs - 1) + 1; // [1, abs − 1]: a remainder exists
+            let closing_value = next(&mut s) % 3_000_000_000; // solvent and insolvent closes alike
+            check(abs, vq, m, close, closing_value);
+        }
+        assert!(in_debt > 100_000, "the debt domain must dominate: {in_debt}");
+    }
 }
 
 #[cfg(test)]
