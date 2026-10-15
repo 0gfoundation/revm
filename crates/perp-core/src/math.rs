@@ -769,6 +769,21 @@ pub fn calc_entry_price(
 /// maintenance-margin adjustment (equity == 0, not equity == maintenance). Returns 0 if
 /// `amount == 0`.
 ///
+/// **TOTAL: it never errors on a representable position, and 0 is also the answer whenever no
+/// positive bankruptcy price exists.** With `credit = vQuote + margin`, two states have none:
+///
+/// * a SHORT with `credit < 0` — its equity `credit − |notional(P)|` falls with `P`, so it is
+///   underwater at every price. Only a funding DEBT gets it there: `margin` must have gone
+///   negative by more than the entry proceeds `vQuote`, which funding can do (the engine's
+///   `funding` module lets a charge run `margin` below zero);
+/// * a LONG with `credit > 0` — fully funded beyond its entry cost, solvent at every price
+///   (equity `credit + notional(P) > 0` already at `P = 0`).
+///
+/// Both used to fall through to a negative price and a `u64` conversion `Err`. Totality matters
+/// because the callers sit on the liquidation path, where an `Err` is a stuck position at best and,
+/// inside the oracle's sweep, a panic. (ADL only ever reaches the short case: on its insolvent
+/// branch a long's credit is below `−notional(mark) ≤ 0`.)
+///
 /// Used by ADL to close a liquidated residual against opposite-side holders as a
 /// forced trade at `P_b`. Rounding is chosen so the LIQUIDATED position's equity at
 /// `P_b` is `>= 0` (a long rounds the price UP, a short rounds it DOWN): closing the
@@ -786,6 +801,10 @@ pub fn calc_bankruptcy_price(
 ) -> Result<u64, PerpError> {
     if amount == 0 {
         return Ok(0);
+    }
+    let credit = v_quote_balance as i128 + margin as i128;
+    if (amount < 0 && credit < 0) || (amount > 0 && credit > 0) {
+        return Ok(0); // no positive bankruptcy price exists — see the doc
     }
     let numerator = (-(v_quote_balance as i128 + margin as i128))
         .checked_mul(pow10_i128(price_decimals)?)
@@ -1696,8 +1715,8 @@ mod margin_tier_tests {
     /// to 0 exactly when the position's whole remaining credit is worth less than ONE price unit
     /// spread over its size. Two ways in:
     ///
-    ///   * opened at the smallest representable price, with funding having clamped `margin` to 0
-    ///     (`funding.rs`: a charge is taken "down to 0", never negative) — the case below;
+    ///   * opened at the smallest representable price with no margin left (`margin == 0`) — the
+    ///     case below;
     ///   * whittled down until the REMAINING notional floors `vQuote` to literally 0, which lands
     ///     here at any entry price once the residual is small enough.
     ///

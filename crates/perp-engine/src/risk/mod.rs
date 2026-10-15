@@ -733,9 +733,10 @@ pub fn run_add_position_margin<H: PerpHost>(
         return Err(perp_err("addPositionMargin: no open position"));
     }
     let mut account = storage::load_account(context, caller)?;
-    // commit-only #23: compute funding IN MEMORY (no insurance-fund write yet), so a reject below
-    // leaves the IF untouched. The credit/charge lands on the in-memory `pos.margin` — funding is
-    // isolated to the position and never touches the account-global wallet.
+    // commit-only #23: compute funding IN MEMORY; its events are emitted only by
+    // `apply_funding_settlement` after the checks, so a reject below leaves no write and no event.
+    // The credit/charge lands on the in-memory `pos.margin` — funding is isolated to the position
+    // and never touches the account-global wallet.
     let pending_funding =
         compute_funding_settlement(context, caller, &market, &mut pos, Some(&account))?;
     // Derived-ooIM gate. A CASH move (wallet → position margin), not an open-order requirement:
@@ -817,8 +818,8 @@ pub fn run_remove_position_margin<H: PerpHost>(
         return Err(perp_err("removePositionMargin: no open position"));
     }
     let mut account = storage::load_account(context, caller)?;
-    // commit-only #23: compute funding IN MEMORY first (no IF write yet) so the checks below see
-    // post-funding margin, and a reject leaves the insurance fund untouched.
+    // commit-only #23: compute funding IN MEMORY first so the checks below see post-funding margin
+    // (possibly a debt — then G1 refuses), and a reject leaves no write and no funding event.
     let pending_funding =
         compute_funding_settlement(context, caller, &market, &mut pos, Some(&account))?;
     // ── The withdrawable cap (roadmap 2b — Binance's isolated `REMOVE` rule) ──
@@ -1001,8 +1002,9 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     if pos.amount == 0 {
         return Ok(LiquidationOutcome::NoPosition);
     }
-    // commit-only #23: compute accrued funding IN MEMORY first (no insurance-fund write), so the
-    // maintenance check sees the post-funding position but an AboveMaintenance outcome leaves
+    // commit-only #23: compute accrued funding IN MEMORY first (funding writes nothing), so the
+    // maintenance check sees the post-funding position — including a funding DEBT, which is what
+    // lets funding alone liquidate a position held up by profit — but an AboveMaintenance outcome leaves
     // ZERO writes. This is what makes the liquidation sweep's healthy-candidate scan write-free
     // (previously every scanned healthy account wrote a funding settle that only checkpoint_revert
     // discarded) and makes manual liquidate reject cleanly without relying on undo.

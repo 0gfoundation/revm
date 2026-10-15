@@ -134,14 +134,23 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         //
         // When a residual IS cleared the write stands, the user stays marked, and the drain
         // publishes a legitimate 0-position group whose `totalWalletBalance` differs by the residual.
-        if pos.v_quote_balance != 0 || pos.margin != 0 {
+        // `margin` is never residue any more, and is deliberately NOT written off:
+        // `apply_position_fill` releases it SIGNED, so a full close leaves exactly 0 — including a
+        // funding DEBT, which the close netted against its PnL. A non-zero margin here would mean
+        // that release regressed, and zeroing it would silently forgive a debt (minting money nobody
+        // paid) or destroy collateral. Left alone, it stays visible in `Σ pos.margin`; the assert
+        // makes the regression loud in every test build.
+        debug_assert_eq!(
+            pos.margin, 0,
+            "liquidation full fill left margin on a flat position — the signed release regressed"
+        );
+        if pos.v_quote_balance != 0 {
             // A rounding-residue WRITE-OFF, not a close: the PnL of this liquidation's fills was
             // already realised (and accumulated into `cumulative_realized_pnl`) by
             // `settlement::apply_position_fill` on the taker path. So nothing is added to `cr`
             // here — and, just as importantly, nothing RESETS it: `pos` is the loaded position and
-            // only these two fields are overwritten.
+            // only this one field is overwritten.
             pos.v_quote_balance = 0;
-            pos.margin = 0;
             // `Adjustment`: a protocol-side WRITE-OFF, not the order's fill. The fills themselves
             // were published by the taker path (`Order`) and that emit cleared the mark; what is left
             // here is rounding residue going nowhere, so the drain's 0-position group for it is a
@@ -168,11 +177,13 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 /// residual as a forced trade against opposite-side holders. **Every** residual comes
 /// here, solvent or not — only the price differs (mark vs the bankruptcy price `P_b`),
 /// which is what makes "a position is only ever closed against another position" an
-/// unconditional invariant. No Insurance Fund, no mint: the loser closes at a price
-/// where it realizes no bad debt, and each opposite holder that can absorb at that
-/// price without going insolvent gives up exactly its share of the
-/// shortfall. Both legs of every fill use the SAME single-floored `calc_value(P_b,
-/// take)`, so Σ vQuote and Σ amount are conserved (a real trade, not a synthetic close).
+/// unconditional invariant. No mint: the loser closes at a price where it realizes no bad
+/// debt, and each opposite holder that can absorb at that price without going insolvent
+/// gives up exactly its share of the shortfall. The fund is billed only for what no
+/// representable price can push onto the opposite side (`p_b == 0`) and for fallback-tier
+/// winners already short at the fill price. Both legs of every fill use the SAME
+/// single-floored `calc_value(P_b, take)`, so Σ vQuote and Σ amount are conserved (a real
+/// trade, not a synthetic close).
 ///
 /// Runs inside the liquidation sweep, bounded by the shared `budget` (total ADL fills
 /// for the whole `updateIndexPrice`). Any residual left unclosed (budget exhausted, or
@@ -182,9 +193,10 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 /// cancelled as part of the fill, which is both what Binance does and what removes the
 /// need for any flip-aware reservation recompute (there is nothing left to re-price).
 ///
-/// v1 simplification: opposite holders that are themselves below water are skipped
-/// (the sweep liquidates them), never forced into bad debt; cascades from ADL'ing a
-/// thin winner resolve on a later sweep, not by in-`run_adl` recursion.
+/// Opposite holders that cannot absorb bad-debt-free (bankrupt at the mark, or short at the
+/// fill price) are not skipped: they form the FALLBACK tier, used only once every clean
+/// candidate is spent, under `BothSides` (see the tier notes in the body). Cascades from
+/// ADL'ing a thin winner resolve on a later sweep, not by in-`run_adl` recursion.
 pub(crate) fn run_adl<H: PerpHost>(
     context: &mut H,
     loser: Address,
@@ -233,34 +245,49 @@ pub(crate) fn run_adl<H: PerpHost>(
             pd,
         )?;
         if p_b == 0 {
-            // ── THE SUB-UNIT BANKRUPTCY REGIME ──────────────────────────────────────────────────
+            // ── NO REPRESENTABLE BANKRUPTCY PRICE (a short only) ────────────────────────────────
             //
-            // REACHABLE, verified — see `perp_core::math`'s
-            // `bankruptcy_price_floors_to_zero_for_a_sub_unit_short`. `p_b` floors to 0 when the
-            // position's whole remaining credit (`vQuote + margin`) is worth less than ONE price
-            // unit spread over its size. Two ways in, and `p_b` is otherwise INVARIANT — it tracks
-            // the entry price, so neither funding nor a proportional partial close drifts it down:
+            // A long never lands here: on this branch its credit `vQuote + margin` is below
+            // `−notional(mark) < 0`, so its `p_b` is ≥ 1. A SHORT gets 0 in two regimes:
             //
-            //   * opened at (or at the flooring slack below) the smallest representable price,
-            //     with funding having clamped `margin` to 0;
-            //   * whittled down until the REMAINING notional floors `vQuote` to literally 0, which
-            //     happens at ANY entry price once the residual is small enough.
+            //   * SUB-UNIT — REACHABLE, verified (`perp_core::math`'s
+            //     `bankruptcy_price_floors_to_zero_for_a_sub_unit_short`):
+            //     `0 ≤ credit < calc_value(1, |amount|)` — opened at the smallest representable
+            //     price, or whittled down until the remaining notional floors `vQuote` to 0. The
+            //     loser's shortfall at one price unit is at most `calc_value(1, take)`: dust.
+            //   * FUNDING DEBT — `credit < 0`: a funding debt (negative `margin`, see
+            //     `crate::funding`) has eaten the entry proceeds, so the short is underwater at
+            //     EVERY price (`calc_bankruptcy_price` reports 0, not an error). NOT dust: the
+            //     loser's shortfall is `|credit|` pro rata plus that dust. Reachable only through a
+            //     liquidation deferred (ADL, or the sweep's budget) across many funding epochs, or
+            //     one update that lifts the mark by more than ~`1 / MAX_FUNDING_RATE` (≈133×): an
+            //     epoch moves credit by at most 0.75% of the notional at the very mark the sweep
+            //     then checks, and the last healthy check had `credit > notional` at its own mark.
             //
-            // There is no representable price that closes this cleanly: at 0 the winner would take
-            // the position for free, and anything above leaves the loser short. So fill at ONE
-            // price unit — the closest representable price above the true bankruptcy price, hence
-            // the one that minimises the shortfall — and route that shortfall to the insurance
-            // fund, which is what the fund is for.
+            // No representable price closes it cleanly: at 0 the winner (a long) would give its
+            // position away for nothing, and every price above leaves the loser short. So fill at
+            // ONE price unit — the lowest price that is not a giveaway — under `LoserOnly`: scheme X
+            // pushed as far as a representable price allows. The opposite side absorbs the
+            // shortfall down to price 1; the fund takes the part below it, plus any fallback-tier
+            // winner's own shortfall.
             //
-            // ⚠️ This is the ONE place ADL touches the IF ("scheme X: no IF" holds everywhere
-            // else), and it is a QUOTE shortfall only: the position is TRANSFERRED to the winner,
-            // so Σ amount is conserved exactly as on every other ADL path. The shortfall is
-            // bounded by `calc_value(1, |amount|)`, and the regime's own defining inequality says
-            // the position's entire credit is below that same number — so it is dust by
-            // construction, not an open-ended claim on the fund.
+            // ⚠️ The cost, plainly: the loser's shortfall at the mark, `notional(mark) + |credit|`,
+            // is fixed; the price only splits it between the winners and the fund. At price 1 a
+            // winner forfeits its slice's whole market value — more than its equity for any long
+            // above 1× on its EFFECTIVE margin, so such a winner is fallback tier: its deficit is
+            // drawn from its remaining margin, then billed to the fund. (A long credited the
+            // funding this short paid can sit at or under 1× and stay clean — `funding_debt`'s C6.)
+            // The fund's bill is therefore the smallest any representable price gives, and the
+            // saving over a fill at the mark (winners neutral, the fund pays everything) is exactly
+            // what the winners give up: each slice's value between the mark and price 1, capped at
+            // that winner's equity at the mark. Kept because it is continuous with `credit > 0`
+            // (where a `p_b` near 1 already wipes the same winners — switching to the mark at
+            // `credit ≤ 0` would be a cliff in who pays), and because in this regime the opposite
+            // side is the one credited the funding this short never paid. `realizedPnl` follows
+            // the price: the loser books ≈ its entry proceeds, the winner ≈ −its entry cost.
             //
-            // The WINNER is still held to zero bad debt. Deferring remains the outcome when no
-            // counterparty can absorb at this price.
+            // ⚠️ A QUOTE shortfall only: the position is TRANSFERRED to the winner, so Σ amount is
+            // conserved exactly as on every other ADL path.
             loser_policy = BadDebtPolicy::LoserOnly;
             1
         } else {
@@ -270,6 +297,17 @@ pub(crate) fn run_adl<H: PerpHost>(
     let loser_is_long = loser_pos.amount > 0;
 
     // Enumerate + rank opposite-side candidates ONCE (rank stable within this call).
+    //
+    // ── Candidates are judged on their EFFECTIVE margin: stored margin + pending funding ──────────
+    // A counterparty's stored margin is current only as of its last touch; if a funding epoch has
+    // passed since, it is missing the funding it owes or is owed. The loser had its own settled before this
+    // call; a winner has not. Judging it on the stored number would rank it on stale equity and,
+    // now that a funding debt can run margin negative, could admit a winner whose real equity at
+    // the fill price is below zero. The pending amount is read through the same function the
+    // settlement applies (`funding::pending_funding_payment`), and a winner that is actually FILLED
+    // has it settled for real first (the fill loop below).
+    let funding_index = storage::load_funding_state(context, market.market_id)?
+        .cumulative_funding_index;
     let registry = storage::load_position_registry(context, market.market_id)?;
     let mut cands: Vec<(Address, i128, i128)> = Vec::new(); // (addr, uPnL@mark, equity@mark)
     // Counterparties already bankrupt at the mark, held back until `cands` is spent. `(addr, eq)`.
@@ -292,8 +330,12 @@ pub(crate) fn run_adl<H: PerpHost>(
         // Binance does not exclude them either — it selects them and CANCELS their open orders.
         // That is what the fill loop below does, and it sidesteps the re-pricing question entirely
         // rather than solving it: after the cancel there are no orders left to re-price.
+        let margin = wp
+            .margin
+            .checked_add(crate::funding::pending_funding_payment(funding_index, &wp, market)?)
+            .ok_or_else(|| perp_err("adl: effective margin overflow"))?;
         let eq_mark =
-            calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
+            calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, margin, bd, pd)?;
         if eq_mark <= 0 {
             // ── FALLBACK TIER ───────────────────────────────────────────────────────────────────
             //
@@ -312,7 +354,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             continue;
         }
         let eq_fill =
-            calc_position_equity(fill_price, wp.amount, wp.v_quote_balance, wp.margin, bd, pd)?;
+            calc_position_equity(fill_price, wp.amount, wp.v_quote_balance, margin, bd, pd)?;
         if eq_fill < 0 {
             // ⚠️ DELIBERATE, AND KNOWN TO BE THE WEAK PART — a temporary simplification, chosen
             // with the trade-off understood, to be revisited.
@@ -374,10 +416,10 @@ pub(crate) fn run_adl<H: PerpHost>(
         .checked_sub(loser_pos.margin)
         .ok_or_else(|| perp_err("adl: Σ position margin underflow"))?;
     let mut did_any = false;
-    // Shortfalls this ADL could not avoid: the loser's in the sub-unit bankruptcy regime, the
-    // winner's in the already-bankrupt fallback tier. Zero on every ordinary fill. Absorbed once
-    // after the loop rather than per fill, so the fund takes one write and one event for the
-    // whole ADL.
+    // Shortfalls this ADL could not avoid: the loser's when `p_b == 0` (sub-unit or funding-debt
+    // regime), and a fallback-tier winner's under `BothSides`. Zero on every ordinary fill.
+    // Absorbed once after the loop rather than per fill, so the fund takes one write and one event
+    // for the whole ADL.
     let mut bad_debt: u64 = 0;
 
     // Clean candidates first, then — only if the residual outlives them — the already-bankrupt
@@ -402,6 +444,22 @@ pub(crate) fn run_adl<H: PerpHost>(
         };
         let mut winner_pos = storage::load_position(context, winner, market.market_id)?;
         let mut winner_account = storage::load_account(context, winner)?;
+        // Settle the winner's pending funding IN MEMORY before the trial, so the fill is tried on
+        // the margin it really has and the close nets any funding debt. Committed (events only —
+        // funding writes nothing of its own) only if the trial is accepted; a rejected candidate
+        // drops it with `winner_pos`, which is reloaded if it is tried again.
+        //
+        // Without this the ADL'd slice's accrued funding was never settled at all: the later settle
+        // charges only the REMAINING amount, and a full close re-anchors a flat position with no
+        // payment — so whatever the closed quantity owed was forgiven and whatever it was owed was
+        // lost.
+        let winner_funding = crate::funding::compute_funding_settlement(
+            context,
+            winner,
+            market,
+            &mut winner_pos,
+            Some(&winner_account),
+        )?;
         let take = winner_pos.amount.unsigned_abs().min(remaining);
         let Some(fill) = adl_fill(
             &mut loser_pos,
@@ -424,6 +482,17 @@ pub(crate) fn run_adl<H: PerpHost>(
             // clean-tier candidate — rejects ALL of them at once, and if no holder happened to
             // land in the fallback tier the residual defers with capacity sitting right there.
             //
+            // The WINNER's leg can reject too, on rounding alone: `apply_position_fill` releases a
+            // negative margin with trunc0, which puts up to one extra unit of the debt on the
+            // closing slice, and a remainder whose margin is ≤ 0 has nothing to draw it from. So a
+            // clean-tier winner carrying a funding debt whose equity at the fill price is only a
+            // few units can come out 1 unit short, be rejected, and be re-queued BEHIND the
+            // fallback tier — where it may never be reached, the residual going to a bankrupt
+            // holder under `BothSides` instead (`funding_debt`'s C7 rejected-trial tests). Narrow:
+            // near-zero winner equity AND a negative margin. trunc0 is kept because it is what
+            // keeps a solvent SHORT's remainder at credit ≥ 0 (a floor could leave it at −1, i.e.
+            // in the `p_b == 0` regime — `settlement`'s `isolated_margin_tests`).
+            //
             // Terminates: only a non-fallback entry is ever pushed, so each address is re-queued at
             // most once, and a `BothSides` trial cannot reject (its `accepts` is unconditional and
             // `take >= 1` under the loop guards).
@@ -432,6 +501,12 @@ pub(crate) fn run_adl<H: PerpHost>(
             }
             continue;
         };
+        // Accepted: publish the winner's funding group now, ahead of the cancels and the fill's own
+        // events, so the stream reads funding → ADL like every other settled path. Its margin move
+        // is already in `winner_pos` and lands with the `save_position` below.
+        if let Some(p) = winner_funding {
+            crate::funding::apply_funding_settlement(context, p)?;
+        }
         // ── Binance parity: an ADL'd account's open orders are cancelled ─────────────────────────
         //
         // AFTER the trial fill, never before: `adl_fill` works on clones and commits only if both
@@ -543,12 +618,13 @@ pub(crate) fn run_adl<H: PerpHost>(
         storage::clear_account_snapshot_mark(context, loser);
     }
 
-    // The sub-unit bankruptcy regime's shortfall, absorbed ONCE for the whole ADL rather than per
-    // fill, so the fund takes one write and emits one row. Zero on every other path — `adl_fill`
-    // only ever reports a loser shortfall when `allow_loser_bad_debt` was set, and this is a QUOTE
-    // claim only: the position itself went to the winner, so Σ amount is untouched. It is routed
-    // AFTER the loser's `clear_account_snapshot_mark` above on purpose — it moves no wallet, so it
-    // cannot re-mark the loser, and the row reads as the fund absorbing, not as a balance change.
+    // The `p_b == 0` loser shortfall and any fallback-tier winner shortfall, absorbed ONCE for the
+    // whole ADL rather than per fill, so the fund takes one write and emits one row. Zero on every
+    // fill accepted under `Forbid` (`adl_fill` reports bad debt only where `BadDebtPolicy` allows
+    // it), and this is a QUOTE claim only: the position itself went to the winner, so Σ amount is
+    // untouched. It is routed AFTER the loser's `clear_account_snapshot_mark` above on purpose — it
+    // moves no wallet, so it cannot re-mark the loser, and the row reads as the fund absorbing, not
+    // as a balance change.
     super::settlement::absorb_bad_debt_into_insurance_fund(context, market.market_id, bad_debt)?;
 
     // ── reduce-only: ADL shrank (or flipped) the loser's position ────────────────────────────
@@ -591,8 +667,10 @@ struct AdlFillOutcome {
 enum BadDebtPolicy {
     /// Every ordinary ADL fill. Neither side may end up short — "scheme X: no IF".
     Forbid,
-    /// The sub-unit bankruptcy regime: no representable price closes the LOSER cleanly, so its
-    /// gap (bounded by the position's notional at one price unit) goes to the fund.
+    /// `p_b == 0` — no representable price closes the LOSER cleanly (the sub-unit regime, or a
+    /// short whose funding debt exceeds its entry proceeds), so its gap goes to the fund: dust
+    /// below `calc_value(1, take)` in the first case, `|credit|` pro rata plus that dust in the
+    /// second. The WINNER is still held to zero bad debt.
     LoserOnly,
     /// Last resort, and only against a counterparty that is ALREADY bankrupt at the mark. See
     /// `run_adl`'s fallback tier for why that restriction is the whole argument.

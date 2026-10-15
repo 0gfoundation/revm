@@ -7,15 +7,33 @@
 //!
 //! Funding owed since then is `calc_funding_payment(amount, index_delta, …)` and
 //! is settled **lazily**: every operation that touches a position (trade fills,
-//! margin add/remove, liquidation) calls [`settle_position_funding`] on the loaded
-//! position *before* mutating it, so the entire accrual is realised against the
-//! `amount` that was actually held over the period.
+//! margin add/remove, liquidation, and each counterparty an ADL fill closes) settles
+//! it on the loaded position *before* mutating it — [`settle_position_funding`], or
+//! [`compute_funding_settlement`] + [`apply_funding_settlement`] where the caller can
+//! still refuse — so the entire accrual is realised against the `amount` that was
+//! actually held over the period.
 //!
 //! Settlement direction (matches `calc_funding_payment`'s sign): funding settles
-//! against the POSITION, never the account-global perp wallet. A positive payment
-//! is credited to the position's isolated `margin`; a negative payment (a charge)
-//! is taken from that same `margin` (down to 0) and any remainder is absorbed from
-//! the insurance fund (bad debt is written off).
+//! against the POSITION, never the account-global perp wallet. The signed payment is
+//! added to the position's isolated `margin`, WHOLE, in both directions: a credit
+//! raises it, a charge lowers it — through zero if it has to. **`margin` may go
+//! NEGATIVE.** A negative margin is a debt the position owes; nothing else pays it:
+//!
+//! * it lowers equity (`notional + vQuote + margin`), so the maintenance check sees it
+//!   and a position that keeps paying funding is eventually liquidated, even one held
+//!   up by unrealized profit;
+//! * a close nets it against the realized PnL (`settlement::apply_position_fill`
+//!   releases margin SIGNED, so the closed slice carries its share of the debt);
+//! * a shortfall at close or liquidation goes through the ordinary bad-debt path: an
+//!   ADL residual's is absorbed by opposite holders at the bankruptcy price, and only
+//!   what no representable price can place (`run_adl`'s `p_b == 0` regime, the
+//!   fallback tier) or a book close cannot pay reaches the insurance fund.
+//!
+//! It replaces a rule that took a charge from `margin` only down to 0 and drew the
+//! remainder from the insurance fund on the spot. Past that point funding no longer
+//! lowered equity, so a position solvent on unrealized profit was never liquidated,
+//! the fund paid its funding every epoch, and the close paid the user the whole profit
+//! without recovering any of it.
 //!
 //! This is what makes isolated margin actually isolated, and it is Binance's
 //! measured behaviour: funding hits the position's isolated wallet directly and
@@ -31,6 +49,12 @@
 //! one. It is quoted here only to explain the mechanism: nothing in this module computes an `LP`.
 //! Its DENOMINATOR SIGN on a SHORT position is extrapolated, like everything short-side
 //! (§6, 「空头侧符号」 — a blocking open item since docs commit `8d179c0`); no code depends on it.
+//!
+//! ⚠️ Letting `margin` run NEGATIVE is OUR choice, not a measured Binance behaviour. Binance's one
+//! funding measurement charged 0.06% of `isolatedWallet`, nowhere near zero, and no evidence covers
+//! a charge larger than the silo. What it is consistent with: the closed form is affine in `iw`
+//! with no floor, so it stays linear through `iw = 0`. The clamp this replaced made `dLP/dF = 0`
+//! below zero.
 
 use alloy_primitives::IntoLogData;
 use crate::host::PerpHost;
@@ -39,7 +63,7 @@ use primitives::{Address, Log};
 use crate::{
         errors::perp_err,
     interface::IPerpDex,
-    math::{calc_funding_payment, checked_u64_to_i64},
+    math::calc_funding_payment,
     storage,
     types::{AccountUpdateReason, Market, PerpPosition},
     PERP_DEX_ADDRESS,
@@ -47,12 +71,12 @@ use crate::{
 };
 
 /// A funding settlement computed in memory but NOT yet written (commit-only #23). The margin
-/// credit/charge has already been applied to the caller's in-memory `pos`; the insurance-fund
-/// charge + `FundingSettled` payload are carried here for a later [`apply_funding_settlement`].
-/// This lets a caller REJECT (before any storage write) between the funding computation and its
-/// commit — so a rejected op never draws from the insurance fund.
+/// credit/charge has already been applied to the caller's in-memory `pos`; the `FundingSettled`
+/// payload is carried here for a later [`apply_funding_settlement`], which only LOGS — funding
+/// writes nothing of its own. The split lets a caller REJECT between the computation and the
+/// commit with no event emitted, and places the funding group exactly where the caller wants it in
+/// the event stream.
 pub(crate) struct PendingFunding {
-    if_charge: u64,
     payment: i64,
     funding_rate: i64,
     user: Address,
@@ -82,8 +106,8 @@ pub(crate) struct PendingFunding {
     /// So it is derived where the post-funding state actually exists, from
     /// `margin_view::wallet_balances_from_parts` on the compute-time account plus the post-funding
     /// `pos.margin`. Funding touches NO wallet leg (see the module docs: it settles against
-    /// `pos.margin` only, remainder to the insurance fund), so the account half of the payload is
-    /// the caller's unmodified account either way and only the Σ leg moves.
+    /// `pos.margin` only), so the account half of the payload is the caller's unmodified account
+    /// either way and only the Σ leg moves.
     snapshot: crate::margin_view::AccountWalletBalances,
 }
 
@@ -97,10 +121,31 @@ impl PendingFunding {
     }
 }
 
-/// Pure funding computation: reads funding state, applies the funding payment to the in-memory
-/// `pos.margin` (margin → insurance-fund remainder on a charge), re-anchors `last_funding_index`,
-/// and returns the pending insurance-fund charge + log payload (`None` if there was no funding
-/// event). Performs NO storage writes, so it is safe to call before a validation reject.
+/// The funding `pos` owes or is owed at cumulative index `index`, NOT yet settled: the signed
+/// payment [`compute_funding_settlement`] would add to `pos.margin`. Zero for a flat position or
+/// one already anchored at `index`.
+///
+/// The ONE place the pending amount is derived. Exposed so a reader that must judge a position's
+/// EFFECTIVE equity without settling it — ADL ranking its counterparties — computes exactly the
+/// number the settlement will apply.
+pub(crate) fn pending_funding_payment(
+    index: i128,
+    pos: &PerpPosition,
+    market: &Market,
+) -> Result<i64, PerpError> {
+    if pos.amount == 0 || pos.last_funding_index == index {
+        return Ok(0);
+    }
+    let delta = index
+        .checked_sub(pos.last_funding_index)
+        .ok_or_else(|| perp_err("funding: index delta overflow"))?;
+    calc_funding_payment(pos.amount, delta, market.base_decimals, market.price_decimals)
+}
+
+/// Pure funding computation: reads funding state, adds the signed funding payment to the in-memory
+/// `pos.margin` (which a charge may drive negative — see the module docs), re-anchors
+/// `last_funding_index`, and returns the log payload (`None` if there was no funding event).
+/// Performs NO storage writes, so it is safe to call before a validation reject.
 ///
 /// Takes NO wallet: funding is isolated to the position (see the module docs). The caller's
 /// `UserAccount` is untouched by funding — which is exactly why `account` below is only ever READ.
@@ -123,73 +168,51 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
     let index = funding.cumulative_funding_index;
 
     let mut pending = None;
-    if pos.amount != 0 && pos.last_funding_index != index {
+    let payment = pending_funding_payment(index, pos, market)?;
+    if payment != 0 {
         // `pos.margin` BEFORE funding moves it — the anchor for the header's Σ leg. Pre-funding is
         // the right anchor precisely because the stored aggregate is pre-funding too.
         let margin_before = pos.margin;
-        let delta = index
-            .checked_sub(pos.last_funding_index)
-            .ok_or_else(|| perp_err("funding: index delta overflow"))?;
-        let payment = calc_funding_payment(
-            pos.amount,
-            delta,
-            market.base_decimals,
-            market.price_decimals,
-        )?;
-        if payment != 0 {
-            let if_charge = if payment > 0 {
-                // Credit: the position receives funding into its own isolated margin, so a
-                // receiving position gets SAFER (its maintenance headroom grows) — the wallet,
-                // which backs every other market's orders, does not move.
-                pos.margin = pos
-                    .margin
-                    .checked_add(payment)
-                    .ok_or_else(|| perp_err("funding: position margin credit overflow"))?;
-                0
-            } else {
-                // Charge: position margin (down to 0) → insurance-fund remainder. No wallet leg —
-                // the charge must bite the position that owes it, which is what moves the
-                // liquidation price and lets funding alone push a position under maintenance.
-                let mut charge = (-(payment as i128)) as u64;
-                let from_margin = (pos.margin.max(0) as i128).min(charge as i128) as u64;
-                pos.margin -= from_margin as i64;
-                charge -= from_margin;
-                charge
+        // The WHOLE payment, either sign, lands on the position's own margin. A credit makes the
+        // receiver safer; a charge bites the position that owes it — through zero if it must,
+        // because a debt that stopped lowering equity at zero is precisely the subsidy this rule
+        // removed (module docs). No wallet leg, no insurance-fund leg.
+        pos.margin = pos
+            .margin
+            .checked_add(payment)
+            .ok_or_else(|| perp_err("funding: position margin overflow"))?;
+        // The group header, off the post-funding position. Lazy account load: only reached when
+        // funding really moved money.
+        let snapshot = {
+            let loaded;
+            let account = match account {
+                Some(a) => a,
+                None => {
+                    loaded = storage::load_account_ref(context, user)?;
+                    &loaded
+                }
             };
-            // The group header, off the post-funding position. Lazy account load: only reached
-            // when funding really moved money.
-            let snapshot = {
-                let loaded;
-                let account = match account {
-                    Some(a) => a,
-                    None => {
-                        loaded = storage::load_account_ref(context, user)?;
-                        &loaded
-                    }
-                };
-                crate::margin_view::wallet_balances_from_parts(
-                    account,
-                    account
-                        .total_position_margin
-                        .checked_sub(margin_before)
-                        .ok_or_else(|| perp_err("funding: Σ position margin underflow"))?,
-                    pos.margin,
-                )?
-            };
-            pending = Some(PendingFunding {
-                if_charge,
-                payment,
-                funding_rate: funding.last_funding_rate,
-                user,
-                market_id: market.market_id,
-                snapshot,
-                // Post-funding snapshot. `last_funding_index` is re-anchored below and is not a
-                // field of `PositionChanged`, so taking it here loses nothing the log reports.
-                pos: pos.clone(),
-                base_decimals: market.base_decimals,
-                price_decimals: market.price_decimals,
-            });
-        }
+            crate::margin_view::wallet_balances_from_parts(
+                account,
+                account
+                    .total_position_margin
+                    .checked_sub(margin_before)
+                    .ok_or_else(|| perp_err("funding: Σ position margin underflow"))?,
+                pos.margin,
+            )?
+        };
+        pending = Some(PendingFunding {
+            payment,
+            funding_rate: funding.last_funding_rate,
+            user,
+            market_id: market.market_id,
+            snapshot,
+            // Post-funding snapshot. `last_funding_index` is re-anchored below and is not a field
+            // of `PositionChanged`, so taking it here loses nothing the log reports.
+            pos: pos.clone(),
+            base_decimals: market.base_decimals,
+            price_decimals: market.price_decimals,
+        });
     }
 
     // Always re-anchor — covers flat positions and freshly opened legs so they
@@ -198,39 +221,14 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
     Ok(pending)
 }
 
-/// Commits a [`PendingFunding`]: absorbs the insurance-fund shortfall (the ONLY storage write in
-/// the funding path) and emits the `InsuranceFund*` / `FundingSettled` logs. MUST run only after
-/// the caller has decided to commit (all rejects passed).
+/// Commits a [`PendingFunding`]: emits the `FundingSettled` log and its `ACCOUNT_UPDATE` group.
+/// Writes NOTHING — the margin move is persisted by the caller's own `save_position` — but it MUST
+/// still run only after the caller has decided to commit (all rejects passed), so a refused call
+/// publishes no funding events.
 pub(crate) fn apply_funding_settlement<H: PerpHost>(
     context: &mut H,
     p: PendingFunding,
 ) -> Result<(), PerpError> {
-    if p.if_charge > 0 {
-        let (absorbed, bad_debt) = storage::absorb_from_insurance_fund(context, p.if_charge)?;
-        let new_if = storage::load_insurance_fund(context)?;
-        if absorbed > 0 {
-            let absorbed_i64 = checked_u64_to_i64(absorbed, "funding: IF absorption delta")?;
-            context.log(Log {
-                address: PERP_DEX_ADDRESS,
-                data: IPerpDex::InsuranceFundChanged {
-                    delta: -absorbed_i64,
-                    newBalance: new_if,
-                }
-                .to_log_data(),
-            });
-        }
-        if bad_debt > 0 {
-            context.log(Log {
-                address: PERP_DEX_ADDRESS,
-                data: IPerpDex::InsuranceFundDepleted {
-                    marketId: p.market_id,
-                    badDebt: bad_debt,
-                }
-                .to_log_data(),
-            });
-        }
-    }
-
     let mark_price = storage::load_mark_price(context, p.market_id)?;
     context.log(Log {
         address: PERP_DEX_ADDRESS,
@@ -259,11 +257,9 @@ pub(crate) fn apply_funding_settlement<H: PerpHost>(
     // closes that hole for every caller at once instead of asking each of them to remember.
     //
     // The alternative (let the indexer derive the new `iw` by applying `amount` to its own last
-    // known value) was rejected: `amount` is the FULL payment, while the margin leg is
-    // `min(max(margin, 0), charge)` with the remainder absorbed by the insurance fund, so the
-    // consumer would have to re-implement that clamp — and the negative-margin case, where the
-    // charge takes nothing from the position at all — to get `iw` right. That is the engine rule
-    // leaking into every client.
+    // known value) would now work — `amount` IS the margin move, exactly, with no clamp — but it
+    // would make every consumer track every position's `iw` itself, and would still leave the
+    // insolvency-rejected maker above with no row. The after-image costs one log.
     //
     // Cost: one extra log per position per funding epoch (`payment != 0` is the gate, i.e. only
     // the first touch after an epoch boundary), and it lands immediately BEFORE the caller's own
@@ -275,9 +271,8 @@ pub(crate) fn apply_funding_settlement<H: PerpHost>(
     // ── The group HEADER goes here, not before `ApplyFunding` ────────────────────────────────────
     // The `ACCOUNT_UPDATE` group invariant (`crate::events`) is an ADJACENCY rule: the header's
     // position rows are the ones IMMEDIATELY after it, terminated by the first other event. The
-    // `InsuranceFundChanged` / `InsuranceFundDepleted` / `FundingSettled` rows above are other
-    // events, so a header emitted at the top of this function would close with ZERO positions and
-    // orphan the row below it. Emitting it right here is what makes the pair a group; the payload
+    // `FundingSettled` row above is another event, so a header emitted at the top of this function
+    // would close with ZERO positions and orphan the row below it. Emitting it right here is what makes the pair a group; the payload
     // was captured at compute time (see `PendingFunding::snapshot`).
     // `FundingFee` — Binance's value for exactly this: a funding settlement moved `pos.margin`.
     storage::log_account_snapshot(context, p.user, &p.snapshot, AccountUpdateReason::FundingFee);
@@ -296,9 +291,9 @@ pub(crate) fn apply_funding_settlement<H: PerpHost>(
 }
 
 /// Behaviour-preserving combined settle (compute + immediate apply). For callers that do NOT need
-/// to reject between the two (matching settlement, liquidation). Migrated callers (margin
-/// add/remove) instead use [`compute_funding_settlement`] + [`apply_funding_settlement`] with their
-/// rejects in between so a rejected op leaves the insurance fund untouched.
+/// to reject between the two (matching settlement, liquidation). Callers that can still refuse
+/// (margin add/remove) instead use [`compute_funding_settlement`] + [`apply_funding_settlement`]
+/// with their rejects in between, so a refused op publishes no funding events.
 pub(crate) fn settle_position_funding<H: PerpHost>(
     context: &mut H,
     user: Address,

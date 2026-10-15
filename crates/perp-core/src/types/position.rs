@@ -52,6 +52,13 @@ pub struct PerpPosition {
     /// continuous one: it holds equity ≥ `PIM` and this field ≥ `MM` at the instant of the
     /// withdrawal, and nothing re-checks either afterwards.
     ///
+    /// A FOURTH, and the only one that goes below zero: a funding charge lands on this field WHOLE,
+    /// so it can turn NEGATIVE — a debt the position owes (`perp_engine::funding`). The debt lowers
+    /// equity, so the maintenance check below sees it; a close releases this field signed and nets
+    /// the closed slice's share of the debt against its PnL; only a shortfall at close reaches the
+    /// insurance fund. A FLAT position always holds exactly 0 (a full close releases all of it),
+    /// which `storage::save_position` debug-asserts.
+    ///
     /// The only continuous requirement gate in the engine is
     /// [`crate::math::is_above_maintenance_margin`], and it reads THIS field, so a short silo
     /// correctly prices its own liquidation. Pinned by

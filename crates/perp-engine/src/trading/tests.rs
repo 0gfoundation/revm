@@ -6464,9 +6464,10 @@ fn fill_settles_funding_for_taker_and_maker() {
 // determinism; changes touching only these will not move the golden value):
 //   * bankrupt liquidation: absorb_from_insurance_fund / InsuranceFundDepleted
 //     / bad-debt write-off (solvent path with clearance fee IS covered)
-//   * funding charge spilling past the position margin into the insurance fund
-//     (the scenario's funding charge is fully covered by ALICE's position margin;
-//     the spill path is covered by risk::tests)
+//   * a funding charge driving a position's margin NEGATIVE (a debt), and the
+//     signed close / ADL that nets it (the scenario's funding charge is fully
+//     covered by ALICE's position margin; the debt paths are covered by
+//     risk::tests)
 //   * margin-shortfall auto-cancel cascade: taker-side
 //     cancel_same_side_orders_until_wallet_covers — requires a taker
 //     margin-cover cascade that would dominate the scenario
@@ -6863,13 +6864,20 @@ mod golden {
     /// byte-identical and `BusinessSnapshot` is unchanged — confirmed by running the scenario with the
     /// new rule in place against the old pin before bumping the byte.
     ///
+    /// Re-pinned again for funding out of EQUITY (`BLOCK_COMMITMENT_VERSION` 32 → 33): a charge may
+    /// run `pos.margin` negative, closes release margin signed, and ADL settles its winners' funding.
+    /// Again only the version byte moved — the scenario's one funding charge (400) is far inside
+    /// ALICE's margin and its ADL winners carry no pending funding, so the write set and
+    /// `BusinessSnapshot` are byte-identical, confirmed against the old pin before the bump.
+    ///
     /// Prior values 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052,
     /// 0x38ca0434996ba2e636a05ff1c69c46c9ff93d343e4cde19e8223968a6a03d733,
     /// 0x73e4a2f0cebdd3752b677a465759c090637673c4077755dc2d4037563588e7fe,
     /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875,
-    /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20.
+    /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
+    /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765");
+        b256!("0x913b6760140fa04bdd42be6a6b63908f5d1d16430b96a1c8ce1b84b7612540ce");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

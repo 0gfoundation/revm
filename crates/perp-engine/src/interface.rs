@@ -175,7 +175,10 @@ sol! {
         ///                         physically held anywhere: it was moved out of the perp wallet
         ///                         when the position opened, and it moves only on open /
         ///                         add-or-remove-margin / funding settlement / close (including
-        ///                         forced closes), never with the mark.
+        ///                         forced closes), never with the mark. May be NEGATIVE: a funding
+        ///                         charge lands on it whole, so it can become a debt (see
+        ///                         `FundingSettled`), and `totalWalletBalance` can then fall below
+        ///                         `totalCrossWalletBalance`.
         ///                         `openOrderInitialMargin` by contrast is escrowed NOWHERE — it
         ///                         is subtracted arithmetically at the admission gate.
         ///                         WAS named `positionMargin` (ours) until it took Binance's name;
@@ -1935,12 +1938,12 @@ sol! {
         // operation that touches the position after a funding epoch boundary (a fill, a margin
         // add/remove, a liquidation), never on a schedule of its own.
         //
-        // `amount` is the FULL signed payment (positive = the position received). It is NOT
-        // necessarily the change in `P[].iw`: a charge is taken from `pos.margin` down to 0 and the
-        // remainder is absorbed by the insurance fund, so applying `amount` to a locally-tracked
-        // `iw` over-debits an under-collateralised position. Read the new `iw` off the
-        // `PositionChanged` this event is paired with — `apply_funding_settlement` emits one
-        // immediately after, valued at the same `markPrice`, for exactly this reason.
+        // `amount` is the FULL signed payment (positive = the position received), and it is
+        // EXACTLY the change in `P[].iw`: the whole payment lands on the position's margin, which
+        // a charge may drive NEGATIVE (a debt that lowers equity and is netted at close). There
+        // is no insurance-fund leg, so funding never emits `InsuranceFundChanged` /
+        // `InsuranceFundDepleted`. The `AccountBalanceChanged` + `PositionChanged` group emitted
+        // right after it, valued at the same `markPrice`, carries the new `iw` as an after-image.
         event FundingSettled(uint64 indexed marketId, address indexed user, int64 fundingRate, int64 amount, uint64 markPrice);
 
         // Feeds: insurance fund balance history

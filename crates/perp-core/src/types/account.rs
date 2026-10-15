@@ -148,7 +148,9 @@ pub struct UserAccount {
 
     /// `Σ pos.margin` over ALL of this user's positions — Binance's
     /// `totalWalletBalance − totalCrossWalletBalance`, i.e. the money physically sitting in the
-    /// per-position silos.
+    /// per-position silos, net of any funding DEBT a silo carries (a position's margin may be
+    /// negative — see `perp_engine::funding`), so it, and `totalWalletBalance` with it, can fall
+    /// below zero or below the cross wallet.
     ///
     /// # Why this is STORED and the deleted "TC" was not
     ///

@@ -181,7 +181,23 @@ use primitives::{B256, U256};
 // this byte is hashed into it. VERIFIED, not assumed: the whole golden pin passed at the OLD value
 // with the new rule in place and this byte still 31. CHAIN change: golden re-pin + a coordinated
 // wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 32;
+// ── 33 ───────────────────────────────────────────────────────────────────────────────────
+// A funding charge comes out of the position's EQUITY: the whole payment lands on `pos.margin`,
+// which may now go NEGATIVE (a debt), instead of stopping at 0 and drawing the remainder from the
+// insurance fund on the spot. Three execution-rule changes land together, because the first alone
+// would strand or mint the debt:
+//   * funding: `margin += payment`, either sign, no clamp, no insurance-fund leg;
+//   * a close releases margin SIGNED (`apply_position_fill`), so the closed slice nets its share of
+//     a debt against its PnL, and a full close leaves 0 — never a debt on a flat position;
+//   * ADL settles each WINNER's pending funding before its fill (and ranks candidates on margin
+//     including it); a short whose debt outgrew its entry proceeds gets bankruptcy price 0 instead
+//     of an `Err` (`calc_bankruptcy_price` no longer errors on any representable position), and
+//     fills at one price unit like the sub-unit regime.
+// No layout change. The golden scenario's one funding charge (400) is far inside its margin and its
+// ADL winners carry no pending funding, so its write set and BusinessSnapshot are byte-identical
+// at 32 and 33 — VERIFIED by running it with all three changes in place against the old pin
+// before bumping this byte. CHAIN change: golden re-pin + a coordinated wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 33;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

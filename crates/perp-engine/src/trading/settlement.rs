@@ -585,7 +585,7 @@ pub(super) struct UserWork {
     ///
     /// Pre-funding is the right anchor precisely because the stored aggregate is pre-funding too:
     /// `funding::compute_funding_settlement` moves `pos.margin` in MEMORY and
-    /// `apply_funding_settlement` writes only the insurance fund and its logs, so the stored
+    /// `apply_funding_settlement` writes nothing (it only logs), so the stored
     /// position — and therefore the stored Σ — still holds the pre-funding margin right up to the
     /// flush's `save_position`.
     ///
@@ -881,8 +881,8 @@ impl MatchRegistry {
     }
 
     /// First touch loads pos/account/both lists and settles funding: computed in memory NOW (the
-    /// walk's working copies must carry the post-funding state) with the IF write + logs deferred
-    /// as an event at this exact stream position.
+    /// walk's working copies must carry the post-funding state) with its logs deferred as an event
+    /// at this exact stream position.
     fn get_or_load<H: PerpHost>(
         &mut self,
         context: &mut H,
@@ -1570,10 +1570,12 @@ fn finalize_core(
     // ── Trading fee: charged from the margin this fill just funded (Binance parity) ──
     // Computed HERE, before K9, because the fee must have LEFT the position margin by the time
     // maintenance is checked — otherwise a fill could be admitted that is instantly liquidatable.
-    // `fee_from_margin = min(fee, opening_margin)` cannot underflow: `apply_position_fill` just
-    // added the whole `opening_margin` to `pos.margin` (and never leaves `pos.margin` negative),
-    // and a pure close has `opening_margin == 0` → the whole fee falls to the wallet, exactly as
-    // before this change. A flip splits proportionally: the fee is charged on the FULL notional
+    // `fee_from_margin = min(fee, opening_margin)` is bounded by what `apply_position_fill` just
+    // added to `pos.margin`, so the fee never takes more than this fill funded. On a position
+    // carrying a funding debt the new leg's margin simply nets against it and the result may stay
+    // negative — K9 below is what refuses an open that leaves it under maintenance. A pure close
+    // has `opening_margin == 0` → the whole fee falls to the wallet, exactly as before this
+    // change. A flip splits proportionally: the fee is charged on the FULL notional
     // while only the opening leg funds margin, so a naive `margin -= fee` would over-draw.
     let fee_notional = closing_value
         .checked_add(opening_value)
@@ -2192,16 +2194,17 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
 /// - Short: positive
 ///
 /// On close, `vq_fraction` (the proportional share being closed) is released.
-/// Combined with `margin_release` and `close_quote_delta` (the fill-price
-/// value of the closed quantity), this yields the realised PnL:
+/// Combined with `close_quote_delta` (the fill-price value of the closed quantity) it is the
+/// realised PnL, and the released margin is added to get what the close settles:
 ///
 /// ```text
-/// realised = margin_release + vq_fraction + close_quote_delta
+/// realized_pnl      = vq_fraction + close_quote_delta
+/// settlement_credit = margin_release + realized_pnl
 /// ```
 ///
-/// A positive `realised` is a profit credited to the wallet; negative is a
-/// loss debited.  Negative equity (underwater position) is currently absorbed
-/// by the wallet via `saturating_sub` — proper bankruptcy handling is a TODO.
+/// A positive `settlement_credit` is credited to the wallet. A negative one never touches the
+/// wallet: it is drawn from the position's remaining margin (if positive), and whatever that cannot
+/// cover is bad debt for the insurance fund (see `bad_debt` below).
 ///
 /// # Margin and vq fractions
 ///
@@ -2210,12 +2213,19 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
 /// partial fills:
 ///
 /// ```text
-/// remaining_margin = floor(pos.margin * remaining_qty / pos_abs)
+/// remaining_margin = trunc0(pos.margin * remaining_qty / pos_abs)      (SIGNED)
 /// margin_release   = pos.margin - remaining_margin
 /// ```
 ///
 /// This ensures `pos.margin` is always exactly proportional to the remaining
 /// position size after each fill.
+///
+/// **`pos.margin` is released SIGNED.** Funding can drive it negative (a debt the position owes —
+/// see `crate::funding`), and the closed slice carries its share of that debt into
+/// `margin_release`, so the close nets it against the realized PnL; a full close releases all of
+/// it. Truncation toward zero is a floor for a positive margin (unchanged) and, for a debt, puts up
+/// to one unit MORE of it on the closing slice: the remainder is never more indebted than its
+/// proportional share, and the debt is collected at the first close that can pay it.
 ///
 /// # Return value
 ///
@@ -2273,10 +2283,13 @@ pub(super) fn apply_position_fill(
     if closing_qty > 0 {
         let pos_abs = pos.amount.unsigned_abs() as u128;
         let remaining_qty = pos_abs - closing_qty as u128;
+        // SIGNED: a funding debt (negative margin) is released with the slice like any margin —
+        // see the doc above. Clamping it at 0 here would pay the close its whole profit and leave
+        // the debt on a smaller (or, on a full close, FLAT) position.
         let remaining_margin =
-            i64::try_from(pos.margin.max(0) as u128 * remaining_qty / pos_abs)
-                .map_err(|_| perp_err("settlement: remaining margin exceeds i64::MAX"))?;
-        let margin_release = pos.margin.max(0) - remaining_margin;
+            i64::try_from(pos.margin as i128 * remaining_qty as i128 / pos_abs as i128)
+                .map_err(|_| perp_err("settlement: remaining margin exceeds i64 range"))?;
+        let margin_release = pos.margin - remaining_margin;
         let remaining_vq = pos.v_quote_balance as i128 * remaining_qty as i128 / pos_abs as i128;
         let remaining_vq = i64::try_from(remaining_vq)
             .map_err(|_| perp_err("settlement: remaining vQuote exceeds i64 range"))?;
@@ -2337,6 +2350,12 @@ pub(super) fn apply_position_fill(
             // position's REMAINING margin first; any shortfall beyond the whole
             // position's margin is bad debt, routed to the Insurance Fund by the
             // caller. A realized loss never reaches the wallet or another position.
+            //
+            // `.max(0)` is deliberate. A slice deficit means the WHOLE position is insolvent at
+            // this fill price (margin and vQuote are prorated linearly), so a remainder already in
+            // debt has no collateral to draw, and the deficit is bad debt now — exactly what a full
+            // close at this price would make it. Deepening the remainder's debt instead would hide
+            // the shortfall from `adl_fill`'s bad-debt-free trial.
             let deficit = settlement_credit.unsigned_abs();
             let remaining_margin = pos.margin.max(0) as u64;
             let from_margin = deficit.min(remaining_margin);

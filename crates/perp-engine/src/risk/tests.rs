@@ -1527,18 +1527,21 @@ fn settle_funding_charge_never_touches_the_wallet() {
     assert_eq!(
         storage::load_insurance_fund(&mut ctx).unwrap(),
         if_before,
-        "margin covered it — no insurance-fund spill"
+        "funding never touches the insurance fund"
     );
 }
 
+/// **Funding out of EQUITY**: a charge larger than the silo lands on `pos.margin` WHOLE and drives
+/// it NEGATIVE — a debt the position owes. Same fixture as the test it replaces
+/// (`settle_funding_charge_beyond_margin_absorbs_from_insurance_fund`: 250M against a 200M silo,
+/// an 80M fund), whose old answer was margin 0 and the fund down 50M to 30M. Now the fund does not
+/// move and the 50M is carried by the position, where the maintenance check, the close and the
+/// liquidation all see it (`mod funding_debt`).
 #[test]
-fn settle_funding_charge_beyond_margin_absorbs_from_insurance_fund() {
+fn settle_funding_charge_beyond_margin_drives_margin_negative() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
-    // A1 re-scale: the pre-A1 index of 3_000_000_000 (charge 300M) left a 50M IF shortfall only
-    // because the wallet absorbed the first 50M. With the wallet leg gone, margin alone absorbs
-    // 200M, so the index is scaled to keep the SAME 50M shortfall this test was written to pin.
     set_funding_index(&mut ctx, 2_500_000_000); // charge = 250M > margin 200M
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
 
@@ -1548,95 +1551,139 @@ fn settle_funding_charge_beyond_margin_absorbs_from_insurance_fund() {
         account.perp_wallet_balance, USER_WALLET as i64,
         "wallet untouched even when the position cannot cover the charge"
     );
-    assert_eq!(pos.margin, 0);
-    // 50M shortfall absorbed from the 80M insurance fund → 30M left.
-    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 30_000_000);
+    assert_eq!(pos.margin, MARGIN - 250_000_000, "the whole charge, through zero");
+    assert_eq!(pos.margin, -50_000_000);
+    assert_eq!(pos.last_funding_index, 2_500_000_000, "re-anchored");
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        80_000_000,
+        "the insurance fund is not a funding source any more"
+    );
 }
 
 #[test]
 fn healthy_candidate_scan_is_write_free_even_with_accrued_funding() {
     // commit-only #23: liquidate_position on a HEALTHY position computes funding in memory and
-    // returns AboveMaintenance with ZERO writes — even when the accrued funding would dip into
-    // the insurance fund. Previously it persisted the funding settle (IF draw + pos/account) and
-    // relied on checkpoint_revert/tx-revert to discard it; unit tests never revert, so any
-    // pre-reject write is visible here.
-    let mut ctx = make_ctx();
-    setup_market(&mut ctx);
-    storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
-    set_funding_index(&mut ctx, 75_000_000); // small charge (7.5M < wallet 50M): stays healthy
-    save_position(&mut ctx, QTY, -ENTRY_VALUE);
-    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
-    let pos_before = position(&mut ctx, ALICE);
-    let acct_before = storage::load_account(&mut ctx, ALICE).unwrap();
+    // returns AboveMaintenance with ZERO writes. Previously it persisted the funding settle
+    // (pos/account) and relied on checkpoint_revert/tx-revert to discard it; unit tests never
+    // revert, so any pre-reject write is visible here.
+    //
+    // Two fixtures: an ordinary small charge (7.5M against the 200M silo), and a charge LARGER
+    // than the silo (250M) on a long held up by unrealized profit at $130 — the state funding out
+    // of equity creates. Its in-memory margin is −50M, a debt, yet equity
+    // `1.3e9 − 1e9 − 50M = 250M` clears the `1.3e9 / 6 = 216_666_666` requirement, so it too is
+    // healthy and must leave no trace.
+    for (index, mark) in [(75_000_000i128, ENTRY_PRICE), (2_500_000_000, 13_000)] {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
+        storage::save_mark_price(&mut ctx, MARKET_ID, mark).unwrap();
+        set_funding_index(&mut ctx, index);
+        save_position(&mut ctx, QTY, -ENTRY_VALUE);
+        let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+        let pos_before = position(&mut ctx, ALICE);
+        let acct_before = storage::load_account(&mut ctx, ALICE).unwrap();
+        let writes_before = ctx.perp_write_count();
+        let _ = JournalTr::take_logs(ctx.journal_mut());
 
-    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
-    let mut adl_budget = 128u32;
-    let out = liquidate_position(
-        &mut ctx,
-        ALICE,
-        MARKET_ID,
-        &market,
-        ENTRY_PRICE,
-        KEEPER,
-        &mut adl_budget,
-        &mut false,
+        let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+        let mut adl_budget = 128u32;
+        let out = liquidate_position(
+            &mut ctx,
+            ALICE,
+            MARKET_ID,
+            &market,
+            mark,
+            KEEPER,
+            &mut adl_budget,
+            &mut false,
+        )
+        .unwrap();
+        assert!(
+            matches!(out, LiquidationOutcome::AboveMaintenance),
+            "index {index}: {out:?}"
+        );
+
+        assert_eq!(
+            storage::load_insurance_fund(&mut ctx).unwrap(),
+            if_before,
+            "index {index}: IF written"
+        );
+        assert_eq!(position(&mut ctx, ALICE), pos_before, "index {index}: position written");
+        assert_eq!(
+            storage::load_account(&mut ctx, ALICE).unwrap(),
+            acct_before,
+            "index {index}: account written"
+        );
+        assert_eq!(ctx.perp_write_count(), writes_before, "index {index}: a perp write");
+        assert!(
+            JournalTr::take_logs(ctx.journal_mut()).is_empty(),
+            "index {index}: a healthy scan publishes no funding events"
+        );
+    }
+}
+
+/// Everything a REFUSED call must leave bit-identical: ALICE's stored position (`margin` AND
+/// `last_funding_index`, i.e. the funding was not settled on the way out), her account, the
+/// insurance fund and the perp write counter. Paired with an empty log journal at each call site.
+fn alice_untouched_snapshot(ctx: &mut TestCtx) -> (PerpPosition, UserAccount, u64, u64) {
+    (
+        position(ctx, ALICE),
+        storage::load_account(ctx, ALICE).unwrap(),
+        storage::load_insurance_fund(ctx).unwrap(),
+        ctx.perp_write_count(),
     )
-    .unwrap();
-    assert!(
-        matches!(out, LiquidationOutcome::AboveMaintenance),
-        "{out:?}"
-    );
-
-    assert_eq!(
-        storage::load_insurance_fund(&mut ctx).unwrap(),
-        if_before,
-        "IF drawn"
-    );
-    assert_eq!(position(&mut ctx, ALICE), pos_before, "position written");
-    assert_eq!(
-        storage::load_account(&mut ctx, ALICE).unwrap(),
-        acct_before,
-        "account written"
-    );
 }
 
 #[test]
-fn add_margin_rejected_after_funding_leaves_insurance_fund_untouched() {
-    // commit-only #23 (validate-then-apply): a margin op that settles funding (drawing from the
-    // insurance fund) and THEN rejects must leave the IF untouched. Under the old ordering the
-    // funding was applied (IF drawn) before the has_available reject and only undone by
-    // checkpoint_revert; this unit test never invokes revert, so a pre-reject IF draw is visible.
+fn add_margin_rejected_after_funding_writes_nothing() {
+    // commit-only #23 (validate-then-apply): a margin op that settles funding IN MEMORY and THEN
+    // rejects must write nothing — not the settled margin, not the re-anchored index, not one
+    // event. (This used to be phrased as "leaves the insurance fund untouched", back when a charge
+    // past the silo drew on the fund; funding has no fund leg any more, so the sharp form of the
+    // property is the whole write set.)
     let mut ctx = make_ctx();
     setup_market(&mut ctx); // ALICE wallet = USER_WALLET = 50M
     storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
-    set_funding_index(&mut ctx, 3_000_000_000); // charge 300M > margin 200M → dips IF
+    // Charge 300M against the 200M silo: in memory the margin goes to −100M before the reject.
+    set_funding_index(&mut ctx, 3_000_000_000);
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
-    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let before = alice_untouched_snapshot(&mut ctx);
+    assert_eq!((before.0.margin, before.0.last_funding_index), (MARGIN, 0));
+    let _ = JournalTr::take_logs(ctx.journal_mut());
 
-    // A1: funding no longer drains the wallet, so the reject is driven by asking for more than
-    // the (untouched) 50M wallet holds. The pending IF draw is unchanged — that is the point.
+    // Funding never drains the wallet, so the reject is driven by asking for more than the
+    // (untouched) 50M wallet holds.
     let err = add_position_margin(&mut ctx, 100_000_000).unwrap_err();
     assert!(
         err.to_string().contains("insufficient perp wallet"),
         "{err}"
     );
     assert_eq!(
-        storage::load_insurance_fund(&mut ctx).unwrap(),
-        if_before,
-        "rejected add-margin must not draw from the insurance fund"
+        alice_untouched_snapshot(&mut ctx),
+        before,
+        "a rejected addPositionMargin must leave position, account, fund and write counter as \
+         they were"
+    );
+    assert!(
+        JournalTr::take_logs(ctx.journal_mut()).is_empty(),
+        "a rejected addPositionMargin must publish no funding events"
     );
 }
 
 #[test]
-fn remove_margin_rejected_after_funding_leaves_insurance_fund_untouched() {
-    // Symmetric to the add-margin case: funding drains margin to 0, then the removal rejects
-    // (insufficient position margin) — the IF must be untouched.
+fn remove_margin_rejected_after_funding_writes_nothing() {
+    // Symmetric to the add-margin case. The 300M charge takes the in-memory margin to −100M — a
+    // debt — so G1 (`pos.margin < amount`) refuses even a 1M removal from a silo that is STORED at
+    // 200M. The control below proves it is the settled debt G1 saw: with no funding pending the
+    // same request clears G1 and is refused by G3 instead.
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
     storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
-    set_funding_index(&mut ctx, 3_000_000_000); // drains wallet + margin, dips IF
+    set_funding_index(&mut ctx, 3_000_000_000); // charge 300M > margin 200M → in-memory −100M
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
-    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let before = alice_untouched_snapshot(&mut ctx);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
 
     let err = remove_position_margin(&mut ctx, 1_000_000).unwrap_err();
     assert!(
@@ -1644,9 +1691,25 @@ fn remove_margin_rejected_after_funding_leaves_insurance_fund_untouched() {
         "{err}"
     );
     assert_eq!(
-        storage::load_insurance_fund(&mut ctx).unwrap(),
-        if_before,
-        "rejected remove-margin must not draw from the insurance fund"
+        alice_untouched_snapshot(&mut ctx),
+        before,
+        "a rejected removePositionMargin must leave position, account, fund and write counter as \
+         they were"
+    );
+    assert!(
+        JournalTr::take_logs(ctx.journal_mut()).is_empty(),
+        "a rejected removePositionMargin must publish no funding events"
+    );
+
+    // Control: identical, no funding pending. G1 passes (200M ≥ 1M); G3 is the gate that refuses
+    // (equity 199M after the removal against a 200M PIM at leverage 5).
+    let mut ctl = make_ctx();
+    setup_market(&mut ctl);
+    save_position(&mut ctl, QTY, -ENTRY_VALUE);
+    let err = remove_position_margin(&mut ctl, 1_000_000).unwrap_err();
+    assert!(
+        err.to_string().contains("resulting equity below initial margin"),
+        "control: {err}"
     );
 }
 
@@ -1907,103 +1970,110 @@ fn funding_on_one_market_leaves_another_markets_headroom_intact() {
     );
 }
 
-#[test]
-fn funding_charge_past_margin_absorbs_from_insurance_fund_and_logs() {
-    use alloy_sol_types::SolEvent;
-    // The IF remainder path is REACHABLE now that the wallet no longer cushions charges — this is
-    // the correct isolated semantics (the position, not the account, backs its own funding).
-    let mut ctx = make_ctx();
-    setup_market(&mut ctx);
-    storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
-    set_funding_index(&mut ctx, 2_500_000_000); // charge 250M vs margin 200M → 50M remainder
-    save_position(&mut ctx, QTY, -ENTRY_VALUE);
-    let _ = JournalTr::take_logs(ctx.journal_mut());
-
-    let (pos, _) = settle_alice_funding(&mut ctx);
-    assert_eq!(pos.margin, 0);
-    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 30_000_000);
-
-    let logs = JournalTr::take_logs(ctx.journal_mut());
-    let changed: Vec<_> = logs
-        .iter()
-        .filter(|l| {
-            l.data.topics().first()
-                == Some(&crate::interface::IPerpDex::InsuranceFundChanged::SIGNATURE_HASH)
-        })
-        .map(|l| {
-            crate::interface::IPerpDex::InsuranceFundChanged::decode_raw_log(
-                l.data.topics(),
-                &l.data.data,
-            )
-            .unwrap()
-        })
-        .collect();
-    assert_eq!(
-        changed.len(),
-        1,
-        "one absorption → one InsuranceFundChanged"
-    );
-    assert_eq!(changed[0].delta, -50_000_000);
-    assert_eq!(changed[0].newBalance, 30_000_000);
-    assert!(
-        !logs.iter().any(|l| l.data.topics().first()
-            == Some(&crate::interface::IPerpDex::InsuranceFundDepleted::SIGNATURE_HASH)),
-        "the fund covered it — no depletion event"
-    );
+/// `E` decoded out of `logs`, in stream order.
+fn decode_events<E: SolEvent>(logs: &[primitives::Log]) -> Vec<E> {
+    logs.iter()
+        .filter(|log| log.data.topics().first() == Some(&E::SIGNATURE_HASH))
+        .map(|log| E::decode_raw_log(log.data.topics(), &log.data.data).unwrap())
+        .collect()
 }
 
+/// **A funding charge past the silo is a DEBT on the position, and the event stream says so.**
+///
+/// Folds two tests the rule change retired: `funding_charge_past_margin_absorbs_from_insurance_fund_
+/// and_logs` (250M against a 200M silo, an 80M fund: margin 0, fund −50M, one
+/// `InsuranceFundChanged`) and `funding_charge_past_the_insurance_fund_emits_depletion` (500M:
+/// margin 0, fund drained to 0, `InsuranceFundDepleted` for 220M). The second is a deep-charge row
+/// here rather than a test of its own because funding can no longer create bad debt AT ALL — the
+/// only way a debt reaches the fund now is a shortfall at close or liquidation. The depletion that
+/// test used to pin moved with it: `mod funding_debt`'s C4 has a row whose fund cannot cover the
+/// close's shortfall, and it pins `InsuranceFundDepleted` (marketId, badDebt) there.
+///
+/// Per row: the margin goes negative by exactly the shortfall; the fund, the wallet and the stored
+/// account do not move; there is NO `InsuranceFundChanged` / `InsuranceFundDepleted`; and the stream
+/// is exactly the funding group — `FundingSettled` whose `amount` is the payment APPLIED (== Δiw,
+/// nothing clamped), then the `FundingFee` header with the signed totals, then the position row
+/// carrying the negative margin.
 #[test]
-fn funding_charge_past_the_insurance_fund_emits_depletion() {
-    use alloy_sol_types::SolEvent;
-    let mut ctx = make_ctx();
-    setup_market(&mut ctx);
-    storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
-    set_funding_index(&mut ctx, 5_000_000_000); // charge 500M vs margin 200M → 300M remainder
-    save_position(&mut ctx, QTY, -ENTRY_VALUE);
-    let _ = JournalTr::take_logs(ctx.journal_mut());
+fn funding_charge_past_margin_is_a_position_debt_with_no_insurance_fund_event() {
+    use crate::events::stream_test_support::{account_update_reasons, stream_shape};
+    use crate::interface::IPerpDex::{
+        AccountBalanceChanged, FundingSettled, InsuranceFundChanged, InsuranceFundDepleted,
+        PositionChanged,
+    };
+    // (index, charge, margin after). 2.5e9 / 5e9 on a QTY long are 250M / 500M.
+    for (index, charge, margin_after) in [
+        (2_500_000_000i128, 250_000_000i64, -50_000_000i64),
+        (5_000_000_000, 500_000_000, -300_000_000),
+    ] {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        storage::save_insurance_fund(&mut ctx, 80_000_000).unwrap();
+        set_funding_index(&mut ctx, index);
+        save_position(&mut ctx, QTY, -ENTRY_VALUE);
+        let account_before = storage::load_account(&mut ctx, ALICE).unwrap();
+        assert_eq!(
+            account_before.total_position_margin, MARGIN,
+            "fixture: the stored Σ is the pre-funding silo"
+        );
+        let _ = JournalTr::take_logs(ctx.journal_mut());
 
-    let (pos, _) = settle_alice_funding(&mut ctx);
-    assert_eq!(pos.margin, 0);
-    assert_eq!(
-        wallet(&mut ctx, ALICE),
-        USER_WALLET,
-        "wallet still untouched"
-    );
-    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 0);
+        let (pos, account) = settle_alice_funding(&mut ctx);
+        assert_eq!(pos.margin, MARGIN - charge);
+        assert_eq!(pos.margin, margin_after, "charge {charge}");
+        assert_eq!(account, account_before, "charge {charge}: funding writes no account leg");
+        assert_eq!(
+            storage::load_insurance_fund(&mut ctx).unwrap(),
+            80_000_000,
+            "charge {charge}: the fund is not touched"
+        );
 
-    let logs = JournalTr::take_logs(ctx.journal_mut());
-    let changed = logs
-        .iter()
-        .find(|l| {
-            l.data.topics().first()
-                == Some(&crate::interface::IPerpDex::InsuranceFundChanged::SIGNATURE_HASH)
-        })
-        .map(|l| {
-            crate::interface::IPerpDex::InsuranceFundChanged::decode_raw_log(
-                l.data.topics(),
-                &l.data.data,
-            )
-            .unwrap()
-        })
-        .expect("InsuranceFundChanged for the 80M it could absorb");
-    assert_eq!((changed.delta, changed.newBalance), (-80_000_000, 0));
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert_eq!(
+            stream_shape(&logs),
+            vec![
+                ("FundingSettled", Some(ALICE)),
+                ("AccountBalanceChanged", Some(ALICE)),
+                ("PositionChanged", Some(ALICE)),
+            ],
+            "charge {charge}: the funding group and nothing else"
+        );
+        assert!(decode_events::<InsuranceFundChanged>(&logs).is_empty());
+        assert!(decode_events::<InsuranceFundDepleted>(&logs).is_empty());
 
-    let depleted = logs
-        .iter()
-        .find(|l| {
-            l.data.topics().first()
-                == Some(&crate::interface::IPerpDex::InsuranceFundDepleted::SIGNATURE_HASH)
-        })
-        .map(|l| {
-            crate::interface::IPerpDex::InsuranceFundDepleted::decode_raw_log(
-                l.data.topics(),
-                &l.data.data,
-            )
-            .unwrap()
-        })
-        .expect("InsuranceFundDepleted for the 220M written off");
-    assert_eq!(depleted.marketId, MARKET_ID);
-    assert_eq!(depleted.badDebt, 220_000_000);
+        let settled = decode_events::<FundingSettled>(&logs);
+        assert_eq!(
+            (settled[0].user, settled[0].marketId, settled[0].amount),
+            (ALICE, MARKET_ID, -charge),
+            "charge {charge}: FundingSettled.amount is the payment applied"
+        );
+        assert_eq!(
+            settled[0].amount,
+            pos.margin - MARGIN,
+            "charge {charge}: …which is exactly Δiw"
+        );
+
+        // The header: cw unchanged, wb = cw + Σ with the Σ leg now carrying the debt — signed.
+        let header = decode_events::<AccountBalanceChanged>(&logs);
+        assert_eq!(
+            account_update_reasons(&logs),
+            vec![(ALICE, AccountUpdateReason::FundingFee)]
+        );
+        assert_eq!(header[0].totalCrossWalletBalance, USER_WALLET as i64);
+        assert_eq!(
+            header[0].totalWalletBalance,
+            USER_WALLET as i64 + margin_after,
+            "charge {charge}: wb = cw + Σ margin, the debt included"
+        );
+        assert_eq!(header[0].totalWalletBalance, USER_WALLET as i64 + MARGIN - charge);
+
+        let row = decode_events::<PositionChanged>(&logs);
+        assert_eq!(
+            (row[0].amount, row[0].vQuoteBalance, row[0].margin),
+            (QTY, -ENTRY_VALUE, margin_after),
+            "charge {charge}: the funding row carries the negative margin as the new iw"
+        );
+    }
 }
 
 #[test]
@@ -3829,8 +3899,11 @@ fn update_market_cannot_zero_the_mark_price() {
 // * **Socialised bad debt** (`InsuranceFundDepleted`): value the insurance fund could not cover
 //   is written off, and `E` rises by the uncovered amount. The fund is seeded far past anything
 //   these scenarios can produce, and the test asserts the event never fires.
-// * **Funding**, which is not a zero-sum transfer between longs and shorts here (it settles each
-//   position against the index and spills into the insurance fund). Disabled in this market.
+// * **Funding**, which is not an exact zero-sum transfer between longs and shorts here: each
+//   position settles against the index on its own first touch, with its own floored payment, so
+//   the two sides' payments need not net to zero at any instant. (It no longer touches the
+//   insurance fund — a charge lands on `pos.margin` whole, possibly as a debt.) Disabled in this
+//   market.
 // * **`transferToPerp` / `transferFromPerp`**, which are genuine external flows. Not used here.
 #[cfg(test)]
 mod value_conservation {
@@ -4417,9 +4490,9 @@ mod usdc_custody {
                 max_price: 1_000_000,
                 price_update_interval: 15,
                 active: true,
-                // Funding OFF: it is not a zero-sum transfer inside the identity (it settles each
-                // position against the index and spills into the insurance fund), and it is not
-                // what is under test here.
+                // Funding OFF: it is not a zero-sum transfer inside the identity (each position
+                // settles against the index on its own touch, with its own floored payment), and
+                // it is not what is under test here.
                 funding_interval: 0,
                 interest_rate: 0,
                 // LIVE clearance fee, so the liquidation charges one. It also pins `risk/mod.rs`'s
@@ -9078,7 +9151,13 @@ mod withdrawal_cap {
         storage::load_account(ctx, ALICE).unwrap().perp_wallet_balance + position(ctx, ALICE).margin
     }
 
-    fn assert_margins_never_negative(logs: &[primitives::Log]) {
+    /// Every `PositionChanged` row in `logs` has a NON-NEGATIVE margin. **Only valid for a scenario
+    /// with no funding DEBT.** A funding charge lands on `pos.margin` whole and may drive it below
+    /// zero (`crate::funding`), and the rows then report that debt — correctly. The T16 scenarios
+    /// that use this charge at most 60_000 against a 160e6 silo, so here a negative row can only
+    /// mean a broken close release; a scenario that charges more funding than the silo holds must
+    /// not use this helper (see `mod funding_debt` for those).
+    fn assert_margins_nonnegative_absent_funding_debt(logs: &[primitives::Log]) {
         for row in decode::<PositionChanged>(logs) {
             assert!(row.margin >= 0, "PositionChanged({}) margin {}", row.user, row.margin);
         }
@@ -9143,7 +9222,7 @@ mod withdrawal_cap {
             .filter(|f| f.user == ALICE)
             .map(|f| f.amount)
             .sum();
-        assert_margins_never_negative(&logs);
+        assert_margins_nonnegative_absent_funding_debt(&logs);
         (trades[0].takerFee, trades[0].takerRealizedPnl, funding, logs)
     }
 
@@ -9217,7 +9296,7 @@ mod withdrawal_cap {
         let _ = JournalTr::take_logs(ctx.journal_mut());
         liquidate(&mut ctx, ALICE).unwrap();
         let logs = JournalTr::take_logs(ctx.journal_mut());
-        assert_margins_never_negative(&logs);
+        assert_margins_nonnegative_absent_funding_debt(&logs);
 
         let trades = decode::<Trade>(&logs);
         assert_eq!(trades.len(), 1);
