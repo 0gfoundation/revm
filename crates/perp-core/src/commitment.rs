@@ -197,7 +197,23 @@ use primitives::{B256, U256};
 // ADL winners carry no pending funding, so its write set and BusinessSnapshot are byte-identical
 // at 32 and 33 — VERIFIED by running it with all three changes in place against the old pin
 // before bumping this byte. CHAIN change: golden re-pin + a coordinated wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 33;
+// ── 34 ───────────────────────────────────────────────────────────────────────────────────
+// Sub-accounts + inter-account transfer (P1). A LAYOUT change: `UserAccount` gains two trailing
+// fields — "MA" (`master: Option<Address>`, set only on a sub) and "SC" (`sub_count: u8`, set only
+// on a master) — so EVERY stored account blob grows by at least two bytes (`nil` + fixint 0) and a
+// sub's by 22 + 1. Positional msgpack, appended at the tail like every earlier account field.
+//
+// New EXECUTION rules land with it, all on new selectors (`createSubAccount`, `asSubAccount`,
+// `internalTransfer`) except one: `setUserFeeRates` now refuses a sub and pushes a master's rates
+// down to each of its subs. No new key prefix — a sub is an ordinary account keyed by its derived
+// address (`types::derive_sub_account`), and the family is the two fields above.
+//
+// No BUSINESS behaviour changes for any pre-existing flow: the golden scenario creates no sub and
+// makes no internal transfer, so its write set differs only in the account blobs' two extra bytes,
+// and its BusinessSnapshot is UNCHANGED, field for field. VERIFIED, not assumed: with the two
+// fields `#[serde(skip)]` and this byte at 33, the golden reproduced the old pin 0x913b6760…40ce
+// exactly. CHAIN change: golden re-pin + a coordinated wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 34;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

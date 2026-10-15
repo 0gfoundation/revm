@@ -10,11 +10,19 @@ use crate::{
     },
     math::MAX_USER_FEE_BPS,
     storage,
-    types::UserFeeRates,
+    types::{derive_sub_account, UserFeeRates},
     PERP_DEX_ADDRESS,
     PerpError,
 };
 
+/// `setUserFeeRates(address user, uint64 makerFeeBps, uint64 takerFeeBps)` — admin only.
+///
+/// Sub-accounts carry their master's rates (copied at `createSubAccount`), and this is what keeps
+/// them in step: a SUB is refused outright ("set the master's rates" — a sub priced differently
+/// from its master would let a family route flow to whichever member is cheaper), and a MASTER's
+/// new rates are written to each of its `sub_count` ≤ `MAX_SUB_ACCOUNTS` subs in the same call,
+/// one `UserFeeRatesUpdated` per account written (master first, then subs in index order). Every
+/// reject precedes the first write (commit-only #23).
 pub fn run_set_user_fee_rates<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
@@ -31,21 +39,35 @@ pub fn run_set_user_fee_rates<H: PerpHost>(
         return Err(perp_err("setUserFeeRates: fee bps exceeds 1000 (10%)"));
     }
 
+    let sub_count = {
+        let a = storage::load_account_ref(context, args.user)?;
+        if a.master.is_some() {
+            return Err(perp_err(
+                "setUserFeeRates: user is a sub-account; set its master's rates",
+            ));
+        }
+        a.sub_count
+    };
+
     let rates = UserFeeRates {
         maker_fee_bps: args.makerFeeBps,
         taker_fee_bps: args.takerFeeBps,
     };
-    storage::save_user_fee_rates(context, args.user, rates)?;
-
-    context.log(Log {
-        address: PERP_DEX_ADDRESS,
-        data: IPerpDex::UserFeeRatesUpdated {
-            user: args.user,
-            makerFeeBps: rates.maker_fee_bps,
-            takerFeeBps: rates.taker_fee_bps,
-        }
-        .to_log_data(),
-    });
+    // The master, then its subs (0 for an ordinary user) — the push-down.
+    let family =
+        core::iter::once(args.user).chain((0..sub_count).map(|i| derive_sub_account(args.user, i)));
+    for user in family {
+        storage::save_user_fee_rates(context, user, rates)?;
+        context.log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::UserFeeRatesUpdated {
+                user,
+                makerFeeBps: rates.maker_fee_bps,
+                takerFeeBps: rates.taker_fee_bps,
+            }
+            .to_log_data(),
+        });
+    }
 
     Ok(Bytes::new())
 }

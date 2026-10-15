@@ -3115,6 +3115,8 @@ mod size_probe_tests {
             taker_fee_bps: 5,
             nonce: 7,
             total_position_margin: 4_200_000,
+            master: None,
+            sub_count: 0,
         };
         let buf = encode(&acct).unwrap();
         println!(

@@ -62,3 +62,24 @@ impl From<AsBinStr> for U256 {
         U256::from_str_radix(&value.0, 10).unwrap()
     }
 }
+
+/// `#[serde(with = "opt_address_bin")]` for an `Option<Address>` field: `None` → msgpack `nil`
+/// (1 byte), `Some(a)` → a 20-byte msgpack `bin` (22 bytes) — the same `serde_bytes` encoding
+/// [`crate::types::Order::owner`] uses for its raw `[u8; 20]`, while letting the field keep the
+/// `Address` type. (perp-core builds `primitives` without its `serde` feature, so `Address` has no
+/// `Serialize` of its own here.)
+pub mod opt_address_bin {
+    use primitives::Address;
+    use serde::{Deserializer, Serializer};
+
+    /// `None` → `nil`, `Some(a)` → `bin(20)`.
+    pub fn serialize<S: Serializer>(v: &Option<Address>, s: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(&v.map(|a| a.0 .0), s)
+    }
+
+    /// Inverse of [`serialize`].
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Address>, D::Error> {
+        let raw: Option<[u8; 20]> = serde_bytes::deserialize(d)?;
+        Ok(raw.map(Address::from))
+    }
+}

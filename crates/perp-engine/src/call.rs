@@ -12,17 +12,20 @@ use perp_core::PerpError;
 use crate::host::PerpHost;
 use crate::{
     account::{
-        run_deposit, run_get_account, run_get_api_key, run_get_api_keys,
-        run_get_user_fee_rates, run_register_api_key, run_revoke_api_key,
+        run_as_sub_account, run_create_sub_account, run_deposit, run_get_account,
+        run_get_api_key, run_get_api_keys, run_get_master, run_get_sub_accounts,
+        run_get_user_fee_rates, run_internal_transfer, run_register_api_key, run_revoke_api_key,
         run_set_user_fee_rates, run_transfer_from_perp, run_transfer_from_perp_signed,
         run_transfer_to_perp, run_transfer_to_perp_signed, run_withdraw,
+        sub_account::{self, AS_SUB_ACCOUNT_OVERHEAD_GAS},
     },
     batch,
     errors,
     interface::IPerpDex::{
-        addMarketCall, addPositionMarginCall, batchCancelOrdersCall,
+        addMarketCall, addPositionMarginCall, asSubAccountCall, batchCancelOrdersCall,
         batchCancelOrdersSignedCall, batchPlaceOrdersCall, batchPlaceOrdersSignedCall,
-        cancelOrderCall, cancelOrderSignedCall, depositCall, depositInsuranceFundCall,
+        cancelOrderCall, cancelOrderSignedCall, createSubAccountCall, depositCall,
+        depositInsuranceFundCall, getMasterCall, getSubAccountsCall, internalTransferCall,
         getAccountCall, getAccountMarginCall, getAdminCall, getApiKeyCall, getApiKeysCall,
         cancelAlgoOrderCall, cancelAlgoOrderSignedCall, drainDeferredWorkCall,
         getAlgoOrderCall, getAveragePremiumIndexCall, getBookLevelCall, getBookPricesCall,
@@ -239,9 +242,43 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // answer this one call already holds — and, unlike the `1 + N` shape, holds CONSISTENTLY.
         // The 20_000 is asserted by `margin_view_tests::get_account`, so a silent drift fails.
         m.insert(getAccountCall::SELECTOR, (20_000, true));
-        m.insert(setUserFeeRatesCall::SELECTOR, (30_000, false));
+        // 30_000 → 80_000 for the sub-account push-down: a master's rates are also written to each
+        // of its ≤ `MAX_SUB_ACCOUNTS` = 10 subs. Each extra write is one account load plus an
+        // in-place two-field `mutate_account` (no snapshot — fee rates are not in the event
+        // payload) and one `UserFeeRatesUpdated` log, i.e. the 5_000 scalar tier: 30_000 for the
+        // master's own write, unchanged, + 10 × 5_000. FLAT at the worst case (a full family), so the
+        // price does not depend on how many subs the target happens to have. Admin-only, so this is
+        // honesty rather than a spam brake.
+        m.insert(setUserFeeRatesCall::SELECTOR, (80_000, false));
         m.insert(getUserFeeRatesCall::SELECTOR, (5_000, true));
         m.insert(getMarketFeeTotalCall::SELECTOR, (5_000, true));
+        // Sub-accounts (P1)
+        //
+        // `createSubAccount` 50_000: two account writes (the new sub's blob, the master's
+        // `sub_count`) — the work `setUserFeeRates` priced at 30_000 for one — plus the three guard
+        // loads on the derived address (account, market index, API-key ids) and a string-carrying
+        // log. Rounded UP to deposit's pre-surcharge base (its 60_000 less the 10_000 snapshot
+        // surcharge, which does not apply here) rather than down because every call creates a
+        // PERMANENT account record (no delete), so this is the price of state growth, capped at 10
+        // per master. It publishes no `AccountBalanceChanged` (no balance moves), so no snapshot
+        // surcharge applies.
+        m.insert(createSubAccountCall::SELECTOR, (50_000, false));
+        // `asSubAccount`: the table entry is only the wrapper's OVERHEAD and the floor (see
+        // `sub_account::AS_SUB_ACCOUNT_OVERHEAD_GAS`). The real charge — inner selector's cost (its
+        // batch `BASE_BATCH_GAS + N * unit` for an inner batch) + overhead — is computed pre-dispatch
+        // in `run_perp_dex_call`, exactly like the batch selectors' dynamic gas. Not static: every
+        // whitelisted inner selector mutates.
+        m.insert(asSubAccountCall::SELECTOR, (AS_SUB_ACCOUNT_OVERHEAD_GAS, false));
+        // `internalTransfer` 50_000 = `transferFromPerp`'s 30_000 (one account RMW, the derived-
+        // available fold on a PERP source, one snapshot) + 10_000 for the SECOND account RMW + 10_000
+        // for the SECOND `AccountBalanceChanged` snapshot (the "+10_000 per snapshot" rule at the top
+        // of this block). FLAT at that worst case (two distinct accounts); the `from == to` shape
+        // touches one and still pays it.
+        m.insert(internalTransferCall::SELECTOR, (50_000, false));
+        // Views: one account `_ref` load (+ ≤ 10 keccaks of a 42-byte preimage for the list) — the
+        // scalar-getter tier.
+        m.insert(getSubAccountsCall::SELECTOR, (5_000, true));
+        m.insert(getMasterCall::SELECTOR, (5_000, true));
         // Roles
         m.insert(setMarketManagerAddressCall::SELECTOR, (30_000, false));
         m.insert(getMarketManagerAddressCall::SELECTOR, (5_000, true));
@@ -501,8 +538,15 @@ pub fn run_perp_dex_call<H: PerpHost>(
     // an insufficient `gas_limit` is a clean `OutOfGas` with zero writes, exactly like the fixed-cost
     // check above. `None` means "not a batch selector", or "the length word is untrustworthy", in
     // which case only the floor is charged and the handler produces the clean revert.
+    //
+    // `asSubAccount` takes the same path: its real charge is its INNER selector's charge (flat, or
+    // that inner batch's dynamic cost) plus a fixed overhead, decided here from the calldata alone
+    // so an under-funded wrapper is the same clean pre-write `OutOfGas`. See
+    // `sub_account::as_sub_account_dynamic_gas`.
     let mut charged_gas = base_gas_used;
-    if let Some(cost) = batch::batch_dynamic_gas(selector, input_bytes) {
+    if let Some(cost) = batch::batch_dynamic_gas(selector, input_bytes)
+        .or_else(|| sub_account::as_sub_account_dynamic_gas(selector, input_bytes))
+    {
         if cost > gas_limit {
             return Err(PerpError::OutOfGas);
         }
@@ -532,7 +576,156 @@ pub fn run_perp_dex_call<H: PerpHost>(
 
     // Dispatch — note: no `?` here; errors are caught below and converted to
     // clean REVERT output so ethers.js can read `e.reason`.
-    let result = match selector {
+    let result = dispatch(selector, input_bytes, caller, context);
+
+    // ── The coalesced account snapshots: one per STILL-marked user, in address order, LAST ──
+    //
+    // SUCCESS PATH ONLY, and this is the whole reason it sits between the dispatch and the output:
+    // a reverted call must publish nothing (its perp writes are validate-then-apply, so there is
+    // nothing to report), and a snapshot taken after the dispatch is a settled account state rather
+    // than one of the half-updated intermediates the old per-write emission produced. TOP-LEVEL by
+    // construction — the depth gate above rejects `> 1`, so this entry point cannot be nested and no
+    // inner call can drain early; the liquidation sweep and the batch drivers are plain calls in this
+    // same frame and coalesce into this drain. See `storage::flush_account_snapshots`.
+    //
+    // "STILL-marked" is the granularity change: the trading paths publish at their own economic
+    // events — one per FILL for a maker, one per ORDER for a taker — and clear those users' marks
+    // (`storage::clear_account_snapshot_mark`), so what reaches this drain is the non-trading writes
+    // plus the incidental fee recipient. A user who moved AGAIN after their direct emit stays marked
+    // and is drained here too, which is the fail-safe direction.
+    //
+    // A drain failure is folded back into `result` so it takes the same clean-revert path a dispatch
+    // error takes (and trips the same `perp_write_count` witness). Only a pathological account can
+    // get there — the same exposure the write-site emission had.
+    let result = result.and_then(|bytes| {
+        crate::storage::flush_account_snapshots(context)?;
+        Ok(bytes)
+    });
+
+    match result {
+        Ok(bytes) => {
+            // The snapshots are FREE — the call is charged only `charged_gas` (the flat per-selector
+            // cost, or `BASE_BATCH_GAS + N * unit` for a batch selector, or the inner charge +
+            // overhead for `asSubAccount`). Never per event, never dynamic: per-event metering for
+            // this precompile was rejected outright.
+            Ok(PerpOutput::new(charged_gas, bytes))
+        }
+        // Fatal + shell errors propagate as-is (halt / precompile-level error, never a revert).
+        Err(
+            e @ (PerpError::Fatal(_)
+            | PerpError::OutOfGas
+            | PerpError::StaticRestrictionViolation
+            | PerpError::StatefulInvalidInput),
+        ) => Err(e),
+        // All other errors become a clean REVERT with an ABI-encoded reason
+        // string, so ethers.js exposes `e.reason` to the caller.
+        Err(error) => {
+            // Tripwire: a reverting call that WROTE the overlay is a residual write-then-error
+            // (commit-only #23 — the write leaks with no undo). Record the offending selector +
+            // count into a global so the exact path can be surfaced (read via
+            // [`last_perp_write_then_revert`]).
+            //
+            // ── The one sanctioned exception ─────────────────────────────────────────────────
+            // A path may deliberately retain writes across its own reject, but it has to SAY SO,
+            // per write, by returning `PerpError::RejectAfterRetainedWrite` with a count it
+            // measured around those writes. Today the only user is the signed-call replay burn:
+            // spending a signature has to outlive the reject it is spent on, or a rejected
+            // signature stays replayable for the rest of its recv window. Subtracting an ALLOWANCE
+            // rather than skipping the check keeps the guard live on the same call — anything the
+            // rejecting code wrote on TOP of the sanctioned writes still trips it, which is the
+            // property that matters, since `place_order_core` is where the val0 leak lived.
+            let writes_after = context.perp_write_count();
+            let sanctioned = match &error {
+                PerpError::RejectAfterRetainedWrite {
+                    sanctioned_writes, ..
+                } => *sanctioned_writes,
+                _ => 0,
+            };
+            if writes_after.saturating_sub(writes_before) > sanctioned {
+                // Under `asSubAccount` the handler that leaked is the INNER one: report its
+                // selector, not the envelope's, or every wrapped leak reads as `asSubAccount`.
+                // Cold path — only reached when a leak has already happened.
+                let reported = if selector == asSubAccountCall::SELECTOR {
+                    asSubAccountCall::abi_decode_validate(input_bytes)
+                        .ok()
+                        .and_then(|a| a.data.get(..4).and_then(|s| <[u8; 4]>::try_from(s).ok()))
+                        .unwrap_or(selector)
+                } else {
+                    selector
+                };
+                let sel = u32::from_be_bytes(reported);
+                LAST_WRITE_THEN_REVERT_SELECTOR.store(sel, core::sync::atomic::Ordering::Relaxed);
+                PERP_WRITE_THEN_REVERT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                // ── STRUCTURAL GUARD (debug builds only; zero release cost) ──────────────────
+                //
+                // This counter existed before and was DIAGNOSTIC ONLY, which is precisely how the
+                // val0 leak at block 1,098,719 shipped: `rest_in_book`'s rest-margin reject fired
+                // after `match_order` had flushed, the counter ticked, and nothing failed. A
+                // silent witness is not a guard.
+                //
+                // Why an assertion here and not a test per reject path: the class is "ANY reject
+                // reachable after ANY perp write", and enumerating reject paths can only ever pin
+                // the ones already known. This is the fixed point every path funnels through, and
+                // `perp_write_count` is monotonic and revert-blind (commit-only — a revert does
+                // not decrement it), so "wrote, then reverted" is exactly `writes_after !=
+                // writes_before` with no bookkeeping of our own.
+                //
+                // ⚠️ NOT a release halt, deliberately. Every node running the same code takes the
+                // same branch, so a leak is deterministic and consensus-safe; promoting it to a
+                // chain halt would convert one user's stuck order into a liveness failure. The
+                // release build keeps the counter, which the correctness gate reads.
+                //
+                // ⚠️ Blind spot to keep in mind: it only sees calls routed through THIS shell.
+                // Unit tests that invoke `run_place_order` / `run_cancel_order` directly are below
+                // it and are not covered — those need the state-snapshot assertions in
+                // `trading::tests` instead.
+                debug_assert!(
+                    false,
+                    "commit-only #23 VIOLATED: selector {sel:#010x} reverted with \
+                     {} unsanctioned perp write(s) already committed ({sanctioned} sanctioned) \
+                     (error: {error}). Perp writes have NO undo, \
+                     so this leaks off-trie state under a failed receipt — and because logs ARE \
+                     EVM-journaled, on-chain it appears as status 0x0 with zero logs and silently \
+                     mutated state. Fix the PATH, not this assertion: move the DECISION above the \
+                     first write. That is usually cheaper than it looks — the val0 leak was fixed \
+                     by hoisting the write barrier past a rest decision that was already \
+                     write-clean (see `trading::MatchOutcome`), not by rewriting the path. \
+                     Making the outcome a partial success instead is a LAST resort: it has to be \
+                     an outcome the order-lifecycle contract can express, which \
+                     'expire a remainder that never rested' was not. \
+                     `PerpError::RejectAfterRetainedWrite` is NOT a way out of this: it sanctions \
+                     writes whose survival is what the caller should observe (a spent signature), \
+                     not writes that merely happen to have run first.",
+                    writes_after - writes_before - sanctioned,
+                );
+            }
+            Ok(PerpOutput::new_reverted(
+                charged_gas,
+                encode_revert_string(&error.to_string()),
+            ))
+        }
+    }
+}
+
+/// **The selector → handler table** — the one place a selector is routed to its handler.
+///
+/// Factored out of [`run_perp_dex_call`] so `asSubAccount` can run its inner call through EXACTLY
+/// the handlers a direct call reaches, with `caller` replaced by the sub-account
+/// (`account::sub_account::run_as_sub_account`). Everything that must happen ONCE per call — the
+/// gas charge, the static check, the EOA depth guard, the commit-only write tripwire and the
+/// `AccountBalanceChanged` snapshot open/flush — stays in `run_perp_dex_call` and is deliberately
+/// NOT in here, so an inner call can neither re-open nor drain the snapshot set nor run the
+/// tripwire twice.
+///
+/// No `?` on the handlers: the result is returned as-is and the caller decides what an error
+/// becomes. A selector with no arm is a loud `Fatal` — the table and this match drifting apart.
+pub(crate) fn dispatch<H: PerpHost>(
+    selector: [u8; 4],
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    match selector {
         // Admin
         s if s == initAdminCall::SELECTOR => run_init_admin(input_bytes, context),
         s if s == transferAdminCall::SELECTOR => run_transfer_admin(input_bytes, caller, context),
@@ -558,6 +751,16 @@ pub fn run_perp_dex_call<H: PerpHost>(
         }
         s if s == getUserFeeRatesCall::SELECTOR => run_get_user_fee_rates(input_bytes, context),
         s if s == getMarketFeeTotalCall::SELECTOR => run_get_market_fee_total(input_bytes, context),
+        // Sub-accounts
+        s if s == createSubAccountCall::SELECTOR => {
+            run_create_sub_account(input_bytes, caller, context)
+        }
+        s if s == asSubAccountCall::SELECTOR => run_as_sub_account(input_bytes, caller, context),
+        s if s == internalTransferCall::SELECTOR => {
+            run_internal_transfer(input_bytes, caller, context)
+        }
+        s if s == getSubAccountsCall::SELECTOR => run_get_sub_accounts(input_bytes, context),
+        s if s == getMasterCall::SELECTOR => run_get_master(input_bytes, context),
         // Roles
         s if s == setMarketManagerAddressCall::SELECTOR => {
             run_set_market_manager(input_bytes, caller, context)
@@ -663,125 +866,10 @@ pub fn run_perp_dex_call<H: PerpHost>(
         s if s == getAveragePremiumIndexCall::SELECTOR => {
             run_get_average_premium_index(input_bytes, context)
         }
-        // Unreachable: the selector-table gate above rejects unknown selectors before
-        // dispatch. Loud fatal (not a panic) if map and match ever drift apart.
+        // Unreachable: the selector-table gate in `run_perp_dex_call` rejects unknown selectors
+        // before dispatch, and `asSubAccount` only forwards whitelisted (tabled) ones. Loud fatal
+        // (not a panic) if map and match ever drift apart.
         _ => Err(PerpError::Fatal("perpdex: selector dispatch mismatch".into())),
-    };
-
-    // ── The coalesced account snapshots: one per STILL-marked user, in address order, LAST ──
-    //
-    // SUCCESS PATH ONLY, and this is the whole reason it sits between the dispatch and the output:
-    // a reverted call must publish nothing (its perp writes are validate-then-apply, so there is
-    // nothing to report), and a snapshot taken after the dispatch is a settled account state rather
-    // than one of the half-updated intermediates the old per-write emission produced. TOP-LEVEL by
-    // construction — the depth gate above rejects `> 1`, so this entry point cannot be nested and no
-    // inner call can drain early; the liquidation sweep and the batch drivers are plain calls in this
-    // same frame and coalesce into this drain. See `storage::flush_account_snapshots`.
-    //
-    // "STILL-marked" is the granularity change: the trading paths publish at their own economic
-    // events — one per FILL for a maker, one per ORDER for a taker — and clear those users' marks
-    // (`storage::clear_account_snapshot_mark`), so what reaches this drain is the non-trading writes
-    // plus the incidental fee recipient. A user who moved AGAIN after their direct emit stays marked
-    // and is drained here too, which is the fail-safe direction.
-    //
-    // A drain failure is folded back into `result` so it takes the same clean-revert path a dispatch
-    // error takes (and trips the same `perp_write_count` witness). Only a pathological account can
-    // get there — the same exposure the write-site emission had.
-    let result = result.and_then(|bytes| {
-        crate::storage::flush_account_snapshots(context)?;
-        Ok(bytes)
-    });
-
-    match result {
-        Ok(bytes) => {
-            // The snapshots are FREE — the call is charged only `charged_gas` (the flat per-selector
-            // cost, or `BASE_BATCH_GAS + N * unit` for a batch selector). Never per event, never
-            // dynamic: per-event metering for this precompile was rejected outright.
-            Ok(PerpOutput::new(charged_gas, bytes))
-        }
-        // Fatal + shell errors propagate as-is (halt / precompile-level error, never a revert).
-        Err(
-            e @ (PerpError::Fatal(_)
-            | PerpError::OutOfGas
-            | PerpError::StaticRestrictionViolation
-            | PerpError::StatefulInvalidInput),
-        ) => Err(e),
-        // All other errors become a clean REVERT with an ABI-encoded reason
-        // string, so ethers.js exposes `e.reason` to the caller.
-        Err(error) => {
-            // Tripwire: a reverting call that WROTE the overlay is a residual write-then-error
-            // (commit-only #23 — the write leaks with no undo). Record the offending selector +
-            // count into a global so the exact path can be surfaced (read via
-            // [`last_perp_write_then_revert`]).
-            //
-            // ── The one sanctioned exception ─────────────────────────────────────────────────
-            // A path may deliberately retain writes across its own reject, but it has to SAY SO,
-            // per write, by returning `PerpError::RejectAfterRetainedWrite` with a count it
-            // measured around those writes. Today the only user is the signed-call replay burn:
-            // spending a signature has to outlive the reject it is spent on, or a rejected
-            // signature stays replayable for the rest of its recv window. Subtracting an ALLOWANCE
-            // rather than skipping the check keeps the guard live on the same call — anything the
-            // rejecting code wrote on TOP of the sanctioned writes still trips it, which is the
-            // property that matters, since `place_order_core` is where the val0 leak lived.
-            let writes_after = context.perp_write_count();
-            let sanctioned = match &error {
-                PerpError::RejectAfterRetainedWrite {
-                    sanctioned_writes, ..
-                } => *sanctioned_writes,
-                _ => 0,
-            };
-            if writes_after.saturating_sub(writes_before) > sanctioned {
-                let sel = u32::from_be_bytes(selector);
-                LAST_WRITE_THEN_REVERT_SELECTOR.store(sel, core::sync::atomic::Ordering::Relaxed);
-                PERP_WRITE_THEN_REVERT_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                // ── STRUCTURAL GUARD (debug builds only; zero release cost) ──────────────────
-                //
-                // This counter existed before and was DIAGNOSTIC ONLY, which is precisely how the
-                // val0 leak at block 1,098,719 shipped: `rest_in_book`'s rest-margin reject fired
-                // after `match_order` had flushed, the counter ticked, and nothing failed. A
-                // silent witness is not a guard.
-                //
-                // Why an assertion here and not a test per reject path: the class is "ANY reject
-                // reachable after ANY perp write", and enumerating reject paths can only ever pin
-                // the ones already known. This is the fixed point every path funnels through, and
-                // `perp_write_count` is monotonic and revert-blind (commit-only — a revert does
-                // not decrement it), so "wrote, then reverted" is exactly `writes_after !=
-                // writes_before` with no bookkeeping of our own.
-                //
-                // ⚠️ NOT a release halt, deliberately. Every node running the same code takes the
-                // same branch, so a leak is deterministic and consensus-safe; promoting it to a
-                // chain halt would convert one user's stuck order into a liveness failure. The
-                // release build keeps the counter, which the correctness gate reads.
-                //
-                // ⚠️ Blind spot to keep in mind: it only sees calls routed through THIS shell.
-                // Unit tests that invoke `run_place_order` / `run_cancel_order` directly are below
-                // it and are not covered — those need the state-snapshot assertions in
-                // `trading::tests` instead.
-                debug_assert!(
-                    false,
-                    "commit-only #23 VIOLATED: selector {sel:#010x} reverted with \
-                     {} unsanctioned perp write(s) already committed ({sanctioned} sanctioned) \
-                     (error: {error}). Perp writes have NO undo, \
-                     so this leaks off-trie state under a failed receipt — and because logs ARE \
-                     EVM-journaled, on-chain it appears as status 0x0 with zero logs and silently \
-                     mutated state. Fix the PATH, not this assertion: move the DECISION above the \
-                     first write. That is usually cheaper than it looks — the val0 leak was fixed \
-                     by hoisting the write barrier past a rest decision that was already \
-                     write-clean (see `trading::MatchOutcome`), not by rewriting the path. \
-                     Making the outcome a partial success instead is a LAST resort: it has to be \
-                     an outcome the order-lifecycle contract can express, which \
-                     'expire a remainder that never rested' was not. \
-                     `PerpError::RejectAfterRetainedWrite` is NOT a way out of this: it sanctions \
-                     writes whose survival is what the caller should observe (a spent signature), \
-                     not writes that merely happen to have run first.",
-                    writes_after - writes_before - sanctioned,
-                );
-            }
-            Ok(PerpOutput::new_reverted(
-                charged_gas,
-                encode_revert_string(&error.to_string()),
-            ))
-        }
     }
 }
 

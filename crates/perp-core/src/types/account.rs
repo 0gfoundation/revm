@@ -1,7 +1,49 @@
 //! User account stored in the PerpDEX precompile.
+use primitives::{keccak256, Address};
 use serde::{Deserialize, Serialize};
 
 use crate::{as_bin::AsBinStr, error::{perp_err, PerpError}};
+
+/// Maximum number of sub-accounts one master may create. A fixed protocol constant, deliberately
+/// NOT admin-tunable: it bounds the fan-out of every per-family walk (`getSubAccounts`, the
+/// `setUserFeeRates` push-down), which is what lets those selectors keep a FLAT gas price.
+///
+/// A `u8` because it is the type of [`UserAccount::sub_count`] and of the `index` fed to
+/// [`derive_sub_account`].
+pub const MAX_SUB_ACCOUNTS: u8 = 10;
+
+/// Domain prefix of the sub-account address derivation. Versioned so a future derivation can never
+/// collide with this one.
+pub const SUB_ACCOUNT_DOMAIN: &[u8] = b"perpdex_subaccount_v1";
+
+/// **The sub-account address of `(master, index)`** — Hyperliquid-style derived identity:
+///
+/// ```text
+/// sub = address( keccak256( "perpdex_subaccount_v1" ‖ master(20) ‖ index(1) )[12..32] )
+/// ```
+///
+/// i.e. the low 20 bytes of the keccak of a 42-byte preimage, exactly like an Ethereum address is
+/// the low 20 bytes of a public key's keccak. Pure and dependency-free so a client or harness can
+/// reproduce it byte for byte (no RLP, no ABI encoding — a plain concatenation).
+///
+/// A derived address has NO private key: nobody can sign as it, so it can only ever act through
+/// its master (`asSubAccount`). That is the whole security model of a sub-account, and it rests on
+/// keccak preimage resistance — finding a key whose address equals a given derived address is a
+/// 2^160 search. (An attacker grinding BOTH its own masters and its own keys meets a collision at
+/// ~2^80, the CREATE2 bound; the prize is only a key for its OWN sub, i.e. bypassing the family
+/// rules for its own funds.)
+///
+/// `index` is assigned sequentially by `createSubAccount` (0, 1, 2, …); a master's subs are
+/// therefore exactly `derive_sub_account(master, i)` for `i < sub_count`, which is why no list of
+/// them is stored.
+pub fn derive_sub_account(master: Address, index: u8) -> Address {
+    const D: usize = SUB_ACCOUNT_DOMAIN.len(); // 21
+    let mut preimage = [0u8; D + 20 + 1];
+    preimage[..D].copy_from_slice(SUB_ACCOUNT_DOMAIN);
+    preimage[D..D + 20].copy_from_slice(master.as_slice());
+    preimage[D + 20] = index;
+    Address::from_slice(&keccak256(preimage)[12..])
+}
 
 /// Maximum positive balance accepted by the signed perp wallet.
 pub const MAX_PERP_WALLET_BALANCE: u64 = i64::MAX as u64;
@@ -206,6 +248,27 @@ pub struct UserAccount {
     /// wrong balance silently.
     #[serde(rename = "PM", default)]
     pub total_position_margin: i64,
+
+    // ── Sub-account family (P1) ────────────────────────────────────────────────
+    // Appended positionally, like every field above them; `default` lets a shorter blob decode.
+    /// Set ONLY on a sub-account: the master that created it (and the only address that may act for
+    /// it, through `asSubAccount`). `None` on every other account — a master and an ordinary user
+    /// look identical here, and an address with `master == None` is by definition a master
+    /// candidate.
+    ///
+    /// `Option<Address>` rather than "zero address = none" because it is the CHEAPER encoding for
+    /// the common case: `None` is one msgpack `nil` byte, while an `Address` is always a 22-byte bin
+    /// (2-byte header + 20). Every non-sub account — i.e. almost all of them — pays 1 byte instead of
+    /// 22; a sub pays 22 either way.
+    ///
+    /// Written once, at `createSubAccount`, and never again: no delete, no re-parenting.
+    #[serde(rename = "MA", default, with = "crate::as_bin::opt_address_bin")]
+    pub master: Option<Address>,
+    /// Set ONLY on a master: how many sub-accounts it has created, ≤ [`MAX_SUB_ACCOUNTS`]. Its subs
+    /// are `derive_sub_account(self, i)` for `i < sub_count` — the list is derived, not stored.
+    /// Always 0 on a sub (a sub cannot create subs).
+    #[serde(rename = "SC", default)]
+    pub sub_count: u8,
     // NOTE: the former "TC" (`total_perp_collateral`) aggregate is GONE. It was
     // `wallet + Σ_positions(margin + the since-deleted margin_reserved)` — fully derivable from state
     // that is already published, used by no protocol rule, yet incrementally maintained on the
@@ -224,11 +287,21 @@ impl Default for UserAccount {
             taker_fee_bps: 0,
             nonce: 0,
             total_position_margin: 0,
+            master: None,
+            sub_count: 0,
         }
     }
 }
 
 impl UserAccount {
+    /// The root of this account's family: its master if it is a sub, itself otherwise. Two accounts
+    /// are in the same family iff their roots are equal (master ↔ own sub, sub ↔ sibling sub, and an
+    /// account with itself).
+    #[inline]
+    pub fn family_root(&self, own_address: Address) -> Address {
+        self.master.unwrap_or(own_address)
+    }
+
     /// The CROSS perp wallet clamped at 0 — **a test/diagnostic contrast only; NO published surface
     /// uses it any more.**
     ///
@@ -295,8 +368,10 @@ impl UserAccount {
 ///
 /// Numbering follows [`crate::types::CancelReason`]/[`crate::types::OrderStatus`] style — a stable
 /// `u8` wire code, never a string. The codes 0..=7 are the Binance vocabulary values we can
-/// actually produce; `255` is [`Self::Multiple`], the one value that is OURS (see below), parked at
-/// the top of the range so the Binance-aligned block stays contiguous and extensible.
+/// actually produce; 8 ([`Self::InternalTransfer`]) is ours — appended after them for an operation
+/// Binance's vocabulary has no value for; `255` is [`Self::Multiple`], also ours and the one value
+/// that is not a single cause (see below), parked at the top of the range so the low block stays
+/// contiguous and extensible.
 ///
 /// # The mapping to Binance's `a.m` vocabulary
 ///
@@ -310,6 +385,7 @@ impl UserAccount {
 /// | [`Self::AssetTransfer`] | `ASSET_TRANSFER` | an internal wallet-to-wallet move of the same asset that touches no position: `transferToPerp` / `transferFromPerp` (spot USDC ledger ↔ perp wallet). |
 /// | [`Self::Adjustment`] | `ADJUSTMENT` | the protocol moved a position or a balance with NO order of the user's and no transfer: the liquidation residual closed at mark, both ADL legs, and the post-close dust write-off. |
 /// | [`Self::InsuranceClear`] | `INSURANCE_CLEAR` | the counterparty of the wallet move is the INSURANCE FUND: the liquidation clearance fee, and the admin's `depositInsuranceFund` / `withdrawInsuranceFund`. |
+/// | [`Self::InternalTransfer`] | — (none; ours) | `internalTransfer`: value moved between TWO accounts (family or external) — both legs, sender and receiver, carry it. |
 ///
 /// `MARGIN_TYPE_CHANGE` is deliberately **absent**: this venue is isolated-margin-only (there is no
 /// cross mode and no selector that could change a margin type), so the value would be one no path
@@ -325,6 +401,17 @@ impl UserAccount {
 /// and the perp wallet) and touches no position, which is the `ASSET_TRANSFER` shape. `DEPOSIT` /
 /// `WITHDRAW` are then free to mean what they say — value crossing the venue boundary — which is
 /// the only distinction a consumer of `usdcBalance` actually needs.
+///
+/// ## `internalTransfer`: its own code, NOT `ASSET_TRANSFER`
+///
+/// `ASSET_TRANSFER` keeps its meaning — one account, two of ITS wallets. `internalTransfer` moves
+/// value between two DIFFERENT accounts (a master and its sub, two siblings, or two unrelated
+/// users), so the receiver's balance rises with no action of its own. A consumer reconciling a
+/// single account's ledger must be able to tell "I moved my own money" from "someone sent me money"
+/// without inspecting the surrounding logs, which is the whole purpose of this field. The rare
+/// `from == to` shape (one account, two wallets, through `internalTransfer` rather than
+/// `transferToPerp`/`transferFromPerp`) carries it too — the code names the SELECTOR's operation,
+/// one label per entry point, never a value-diff guess.
 ///
 /// # ⚠️ [`Self::Multiple`] is not a default, and not "unknown"
 ///
@@ -355,6 +442,10 @@ pub enum AccountUpdateReason {
     Adjustment = 6,
     /// Binance `INSURANCE_CLEAR`: the move settles against the insurance fund.
     InsuranceClear = 7,
+    /// `internalTransfer`: value moved between two accounts (sub-account family or external). Both
+    /// the sender's and the receiver's after-image carry it. Deliberately NOT [`Self::AssetTransfer`]
+    /// — see the type docs.
+    InternalTransfer = 8,
     /// **OURS, not Binance's.** Two or more distinct causes coalesced into one drained row. See the
     /// type docs — never chosen by a publish site, only produced by [`Self::merge`].
     Multiple = 255,
@@ -382,6 +473,7 @@ impl AccountUpdateReason {
             5 => Self::AssetTransfer,
             6 => Self::Adjustment,
             7 => Self::InsuranceClear,
+            8 => Self::InternalTransfer,
             255 => Self::Multiple,
             _ => return None,
         })
@@ -459,13 +551,14 @@ mod tests {
             (AssetTransfer, 5),
             (Adjustment, 6),
             (InsuranceClear, 7),
+            (InternalTransfer, 8),
             (Multiple, 255),
         ] {
             assert_eq!(r.code(), code, "{r:?}");
             assert_eq!(AccountUpdateReason::from_code(code), Some(r));
         }
         // No catch-all: an undefined byte decodes to `None`, never onto a neighbouring reason.
-        assert_eq!(AccountUpdateReason::from_code(8), None);
+        assert_eq!(AccountUpdateReason::from_code(9), None);
         assert_eq!(AccountUpdateReason::from_code(254), None);
     }
 
@@ -485,6 +578,7 @@ mod tests {
             AssetTransfer,
             Adjustment,
             InsuranceClear,
+            InternalTransfer,
             Multiple,
         ];
         for a in all {
@@ -506,6 +600,88 @@ mod tests {
         assert_eq!(Adjustment.merge(InsuranceClear), Multiple);
         assert_eq!(FundingFee.merge(InsuranceClear), Multiple);
         assert_eq!(Order.merge(Order), Order);
+    }
+
+    /// The derivation against vectors computed OUTSIDE this codebase (ethers v6:
+    /// `getAddress(dataSlice(keccak256(concat([toUtf8Bytes("perpdex_subaccount_v1"), master,
+    /// Uint8Array([index])])), 12))`), so a client reproducing the documented formula gets these
+    /// exact addresses. A self-referential test (derive == derive) would pin nothing.
+    #[test]
+    fn the_sub_account_derivation_matches_an_independent_vector() {
+        use primitives::address;
+        let m1 = address!("1111111111111111111111111111111111111111");
+        let m2 = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        for (master, index, expected) in [
+            (m1, 0u8, address!("24eC69c992D5c4DB42c24451181Bb2956af63E3f")),
+            (m1, 1, address!("123832A262863ceCa86046F21D24853587D01FC9")),
+            (m1, 9, address!("67CA0A43deDAb1Af20f8c7B45EaC8a4e468593Ca")),
+            (m2, 0, address!("68Ec85D317b90572c24467d735786f25476c8Cd1")),
+            (m2, 1, address!("f502C903E921900b354f38326E34b2D676AB82Cf")),
+            (m2, 9, address!("e5BC8A2e872Cba851C6877Fb8470a23230754a91")),
+        ] {
+            assert_eq!(derive_sub_account(master, index), expected, "{master} #{index}");
+        }
+        assert_eq!(SUB_ACCOUNT_DOMAIN.len(), 21, "the documented preimage is 21 + 20 + 1 bytes");
+    }
+
+    /// Deterministic, and distinct across every `(master, index)` a family can reach — including
+    /// across two masters, and never equal to either master.
+    #[test]
+    fn derived_sub_accounts_are_deterministic_and_distinct() {
+        use primitives::address;
+        let masters = [
+            address!("1111111111111111111111111111111111111111"),
+            address!("2222222222222222222222222222222222222222"),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for m in masters {
+            seen.insert(m);
+        }
+        for m in masters {
+            for i in 0..MAX_SUB_ACCOUNTS {
+                let a = derive_sub_account(m, i);
+                assert_eq!(a, derive_sub_account(m, i), "deterministic");
+                assert!(seen.insert(a), "collision at {m} #{i}");
+            }
+        }
+        assert_eq!(seen.len(), 2 + 2 * MAX_SUB_ACCOUNTS as usize);
+    }
+
+    /// The two family fields are APPENDED (positional msgpack) and cost an ordinary account exactly
+    /// two bytes — `nil` for `master`, fixint `0` for `sub_count` — while a sub's `master` is a
+    /// 22-byte bin. Also pins that a pre-P1 (shorter) blob still decodes, with both fields defaulted.
+    #[test]
+    fn the_family_fields_are_appended_and_cheap_for_ordinary_accounts() {
+        use crate::codec::{decode, encode};
+        let plain = UserAccount::default();
+        let plain_bytes = encode(&plain).unwrap();
+        let sub = UserAccount {
+            master: Some(Address::repeat_byte(0x11)),
+            ..UserAccount::default()
+        };
+        let sub_bytes = encode(&sub).unwrap();
+        assert_eq!(sub_bytes.len(), plain_bytes.len() + 21, "Some(addr) = 22 bytes vs nil = 1");
+        assert_eq!(&plain_bytes[plain_bytes.len() - 2..], &[0xc0, 0x00], "nil, then fixint 0");
+        assert_eq!(decode::<UserAccount>(&sub_bytes).unwrap(), sub);
+
+        // A blob written before the two fields existed: the same array with its last two elements
+        // dropped (msgpack fixarray header 0x98 = 8 elements → 0x96 = 6).
+        assert_eq!(plain_bytes[0], 0x98, "8-element fixarray");
+        let mut old = plain_bytes[..plain_bytes.len() - 2].to_vec();
+        old[0] = 0x96;
+        assert_eq!(decode::<UserAccount>(&old).unwrap(), plain);
+    }
+
+    #[test]
+    fn the_family_root_is_the_master_for_a_sub_and_self_otherwise() {
+        let me = Address::repeat_byte(0x22);
+        let boss = Address::repeat_byte(0x11);
+        assert_eq!(UserAccount::default().family_root(me), me);
+        let sub = UserAccount {
+            master: Some(boss),
+            ..UserAccount::default()
+        };
+        assert_eq!(sub.family_root(me), boss);
     }
 
     #[test]

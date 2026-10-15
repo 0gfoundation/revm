@@ -5,7 +5,8 @@ pub mod order;
 pub mod position;
 
 pub use account::{
-    AccountUpdateReason, ApiKey, UserAccount, MAX_PERP_WALLET_BALANCE, MAX_USER_MARKETS,
+    derive_sub_account, AccountUpdateReason, ApiKey, UserAccount, MAX_PERP_WALLET_BALANCE,
+    MAX_SUB_ACCOUNTS, MAX_USER_MARKETS, SUB_ACCOUNT_DOMAIN,
 };
 pub use fee::UserFeeRates;
 pub use oracle::{

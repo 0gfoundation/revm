@@ -453,11 +453,86 @@ sol! {
             AccountPosition[] positions
         );
         /// Set per-user trading fee rates in basis points. Only callable by admin.
+        ///
+        /// Sub-accounts inherit their master's rates: setting a MASTER's rates also writes them to
+        /// every one of its sub-accounts (one `UserFeeRatesUpdated` per account written, master
+        /// first, then subs in index order), and setting a SUB's rates directly is rejected — set
+        /// the master's.
         function setUserFeeRates(address user, uint64 makerFeeBps, uint64 takerFeeBps) external;
         /// Query per-user trading fee rates in basis points. Unset users default to zero.
         function getUserFeeRates(address user) external view returns (uint64 makerFeeBps, uint64 takerFeeBps);
         /// Query total trading fees collected for one market.
         function getMarketFeeTotal(uint64 marketId) external view returns (uint64 totalFee);
+
+        // ── Sub-accounts (P1) ──────────────────────────────────────────────────
+        /// Create the caller's next sub-account. Direct call only; the caller becomes its master.
+        ///
+        /// The sub's address is DERIVED, not chosen, and has no private key:
+        ///   `sub = address(keccak256("perpdex_subaccount_v1" ‖ master(20) ‖ index(1))[12..32])`
+        /// with `index` = the caller's current sub-account count (0, 1, 2, … — sequential, never
+        /// reused). At most 10 per master. A sub cannot create sub-accounts, and an address that is
+        /// a sub can never become a master. The new sub inherits the master's fee rates.
+        ///
+        /// `name` is a label only: it is NOT stored — it lives solely in the `SubAccountCreated`
+        /// event — and must be 1..=32 bytes. There is no rename and no delete.
+        ///
+        /// ⚠️ A new sub may start with a NON-ZERO SPOT balance. Until it is created, the next
+        /// derived address (`derive(master, getSubAccounts(master).length)`, public) is an ordinary
+        /// address, so anyone can credit it with an external `internalTransfer`; creation adopts
+        /// that balance as the sub's (i.e. the family's) money rather than refusing, because
+        /// refusing would let anyone block a master's next sub, and every later one, for 1 USDC.
+        /// Only state that needs the address's own key refuses the create.
+        function createSubAccount(string name) external returns (address subAccount);
+        /// Execute one inner call AS `subAccount`. Caller must be `subAccount`'s master.
+        ///
+        /// `data` is a complete inner calldata (4-byte selector + ABI args) for one of the
+        /// whitelisted direct per-user selectors — placeOrder, cancelOrder, batchPlaceOrders,
+        /// batchCancelOrders, placeAlgoOrder, cancelAlgoOrder, setLeverage, addPositionMargin,
+        /// removePositionMargin, transferToPerp, transferFromPerp, registerApiKey, revokeApiKey,
+        /// internalTransfer — which then runs exactly as if `subAccount` had called it directly.
+        /// Everything else is rejected: deposit / withdraw (a sub's money enters and leaves through
+        /// its master via `internalTransfer`), createSubAccount, asSubAccount, every `*Signed`
+        /// selector (those authenticate an `account` argument, not the caller), every admin / role
+        /// / market / oracle / insurance-fund selector, the permissionless protocol-work
+        /// selectors (`liquidate`, `drainDeferredWork`, `updateIndexPriceFromBook` — call them
+        /// directly), and every view.
+        ///
+        /// ⚠️ NEVER send ERC-20 USDC to a sub-account address (e.g. as an exchange withdrawal
+        /// destination): it has no private key, and `deposit` — the only thing that could sweep
+        /// it in — is not available to a sub, so that USDC is unrecoverable. Clients must never
+        /// offer a sub address as an ERC-20 destination.
+        ///
+        /// The return data is the inner call's return data VERBATIM — not wrapped in a `bytes` —
+        /// so decode it with the INNER function's ABI (e.g. `placeOrder`'s `bytes32 orderId`). That
+        /// is why no output is declared here. An inner revert reverts this call with the inner
+        /// reason, unchanged. Gas = the inner selector's own cost (incl. a batch's per-item cost)
+        /// + a fixed 5_000 overhead, decided from the CALLDATA before anything else runs (like a
+        /// batch's): a call refused for the wrong caller or the wrong `subAccount` still pays the
+        /// full inner charge. Only an undecodable envelope or a non-whitelisted inner selector —
+        /// visible in the calldata alone — pays just the 5_000.
+        function asSubAccount(address subAccount, bytes calldata data) external;
+        /// Move `amount` (quote units, 6 dp) from the caller's `fromWallet` to `to`'s `toWallet`.
+        /// Wallets: 0 = SPOT (the deposit/withdraw balance, `usdcBalance`), 1 = PERP (the perp
+        /// wallet). A sub-account reaches this through `asSubAccount`. Not signable.
+        ///
+        /// * Within a FAMILY (master ↔ its sub, sub ↔ sibling sub, or one account between its own
+        ///   two wallets): any wallet combination.
+        /// * To anyone else (EXTERNAL): only master/ordinary account → master/ordinary account,
+        ///   SPOT → SPOT, and at least 1 USDC (1_000_000). A sub can neither send outside its family
+        ///   nor receive from outside it. (That binds once the sub EXISTS: a master's next derived
+        ///   address is an ordinary account until `createSubAccount`, so a sub can be born holding
+        ///   SPOT credited from outside — see `createSubAccount`.)
+        ///
+        /// A PERP source is gated on the derived available balance (`perp_wallet_balance − Σ ooIM`,
+        /// the same gate as `transferFromPerp`). No ERC-20 moves; the sum of internal balances is
+        /// unchanged. Emits `InternalTransfer`, then one `AccountBalanceChanged` (reason 8) per
+        /// account touched, in ascending address order.
+        function internalTransfer(address to, uint8 fromWallet, uint8 toWallet, uint64 amount) external;
+        /// The sub-accounts of `master`, in index order (empty if none). Derived from the stored
+        /// count — `subs[i] == derive(master, i)`.
+        function getSubAccounts(address master) external view returns (address[] subs);
+        /// The master of `account`, or the zero address if `account` is not a sub-account.
+        function getMaster(address account) external view returns (address master);
 
         // ── Market management (admin only) ─────────────────────────────────
         /// Register a new perpetual market.
@@ -1342,6 +1417,11 @@ sol! {
         // Feeds: internal wallet movement history
         event TransferToPerp(address indexed user, uint64 amount);
         event TransferFromPerp(address indexed user, uint64 amount);
+        // Feeds: sub-account directory. `name` exists ONLY here (it is not stored on-chain).
+        event SubAccountCreated(address indexed master, address indexed subAccount, uint8 index, string name);
+        // Feeds: inter-account transfer history. Wallets: 0 = SPOT, 1 = PERP. Followed (at the end
+        // of the call) by one `AccountBalanceChanged(reason = 8)` per account touched.
+        event InternalTransfer(address indexed from, address indexed to, uint8 fromWallet, uint8 toWallet, uint64 amount);
         /// Account BALANCE after-image — our `ACCOUNT_UPDATE`'s `B[]` leg, and nothing else.
         ///
         /// # The payload is exactly what the trigger can guarantee
@@ -1496,8 +1576,10 @@ sol! {
         /// `ASSET_TRANSFER` (`transferToPerp` / `transferFromPerp`, wallet ↔ wallet), 6 =
         /// `ADJUSTMENT` (protocol-forced, no order: the liquidation residual closed at mark, both
         /// ADL legs, the post-close dust write-off), 7 = `INSURANCE_CLEAR` (the move settles against
-        /// the insurance fund: the liquidation clearance fee, `deposit`/`withdrawInsuranceFund`).
-        /// **255 = `Multiple`**, which is OURS and not Binance's: the end-of-call drain publishes one
+        /// the insurance fund: the liquidation clearance fee, `deposit`/`withdrawInsuranceFund`),
+        /// 8 = `INTERNAL_TRANSFER` (ours — no exact Binance `a.m` equivalent: `internalTransfer`,
+        /// value moved between two accounts; the sender's and the receiver's rows both carry it).
+        /// **255 = `Multiple`**, also ours and not Binance's: the end-of-call drain publishes one
         /// row per user, so two DIFFERENT causes can fold into it, and rather than pick one label and
         /// lie about the other the row says "several". Switch on this field with a default branch.
         ///

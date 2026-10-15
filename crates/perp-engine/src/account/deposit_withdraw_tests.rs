@@ -671,7 +671,9 @@ fn metadata_only_call_emits_no_balance_after_image() {
     )
     .unwrap();
     assert!(!output.reverted);
-    assert_eq!(output.gas_used, 30_000);
+    // 80_000: the flat price covers the sub-account push-down's worst case (a master with
+    // `MAX_SUB_ACCOUNTS` subs), whether or not this user has any — see the `SELECTORS` entry.
+    assert_eq!(output.gas_used, 80_000);
     assert!(JournalTr::take_logs(ctx.journal_mut())
         .iter()
         .all(|log| log.data.topics().first() != Some(&AccountBalanceChanged::SIGNATURE_HASH)));
