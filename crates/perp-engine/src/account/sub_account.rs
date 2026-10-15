@@ -521,3 +521,8 @@ pub fn run_get_master<H: PerpHost>(
 #[cfg(test)]
 #[path = "sub_account_tests.rs"]
 mod tests;
+
+/// The spec §9 suite, written independently from the spec rather than from this implementation.
+#[cfg(test)]
+#[path = "sub_account_spec_tests.rs"]
+mod spec_tests;
