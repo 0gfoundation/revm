@@ -3436,3 +3436,92 @@ fn kill_t19_a_fire_that_ends_a_position_runs_before_that_positions_activation() 
         "fire leg before activation leg"
     );
 }
+
+/// Kills C2j — "generation not bumped inside a liquidation close". The generation must move on
+/// EVERY path that takes a position to zero, including a MAKER whose resting order is hit by a
+/// LIQUIDATION's close order (the liquidation runs its own market order through `match_order`,
+/// not `placeOrder`). DAVE is short 3 with a closePosition BUY stop and an activated trailing BUY,
+/// and rests the BUY 3 that ALICE's liquidation sells into: DAVE goes flat as the liquidation's
+/// maker. He then reopens a short 3 the same way round. Both bound orders belong to the ENDED
+/// short and must be spent with 11, never close the new one.
+///
+/// Numbers: ALICE long 3 at 5x (margin $60) is under water at 9_100 (60 − 3·9 = 33 < 3·91/6 =
+/// 45.5) and her liquidation sells 3 into DAVE's bid. The trailer's low is 9_100 after that tick,
+/// so its stop is ⌈9_100·1.01⌉ = 9_191 and the next tick (10_000) fires it. The closePosition
+/// stop (BUY STOP_MARKET 10_500) fires on the tick to 10_500, with BOB's ask there for a wrong
+/// close to hit.
+#[test]
+fn kill_c2j_a_maker_closed_by_a_liquidation_ends_its_position_for_bound_orders() {
+    let mut ctx = fresh();
+    seed_pos(&mut ctx, ALICE, 3, 5);
+    seed_pos(&mut ctx, DAVE, -3, 1);
+    let cp = place_algo(&mut ctx, DAVE, &cp_stop_call(BUY, 10_500)).0;
+    let tr = trail(&mut ctx, DAVE, BUY, 0, 100, 3);
+    rest(&mut ctx, DAVE, BUY, 9_100, 3);
+
+    // ALICE is liquidated into DAVE's bid: DAVE is flat, and his bound orders are untouched.
+    let c = tick(&mut ctx, 9_100);
+    let liq = evs::<Liquidation>(&c.logs);
+    assert_eq!(liq.len(), 1);
+    assert_eq!(liq[0].user, ALICE);
+    assert_eq!(trades(&c.logs).len(), 1);
+    assert_eq!((trades(&c.logs)[0].1, trades(&c.logs)[0].3), (DAVE, 3), "DAVE is the maker");
+    assert_eq!(amount(&mut ctx, DAVE), 0);
+    assert!(algo_cancels(&c.logs).is_empty() && triggered(&c.logs).is_empty());
+    assert_eq!(open_algos(&mut ctx, DAVE), vec![cp, tr]);
+
+    // A NEW short 3, same way round.
+    rest(&mut ctx, ERIN, BUY, 9_100, 3);
+    take(&mut ctx, DAVE, SELL, 3);
+    assert_eq!(amount(&mut ctx, DAVE), -3);
+
+    // The trailer (low 9_100 → stop 9_191) fires at 10_000 — spent as 11, nothing placed.
+    let c = tick(&mut ctx, 10_000);
+    assert_eq!(triggered(&c.logs), vec![(tr, 9_191, 10_000)]);
+    assert_eq!(algo_cancels(&c.logs), vec![(tr, R_POSITION_CLOSED)]);
+    assert!(placed(&c.logs).is_empty(), "nothing placed for an order of the ended short");
+    assert_eq!(amount(&mut ctx, DAVE), -3);
+
+    // The closePosition stop fires at 10_500, liquidity right there — spent as 11 too.
+    rest(&mut ctx, BOB, SELL, 10_500, 10);
+    let c = tick(&mut ctx, 10_500);
+    assert_eq!(triggered(&c.logs), vec![(cp, 10_500, 10_500)]);
+    assert_eq!(algo_cancels(&c.logs), vec![(cp, R_POSITION_CLOSED)]);
+    assert!(placed(&c.logs).is_empty() && trades(&c.logs).is_empty());
+    assert_eq!(amount(&mut ctx, DAVE), -3, "the new short is untouched");
+    assert!(open_algos(&mut ctx, DAVE).is_empty());
+}
+
+/// Kills T34 — "trailing fire deferral not propagated to `deferred_work`". In every bracket-style
+/// test the liquidation sweep's CONSERVATIVE deferral (budget 0 with an open position left in the
+/// registry) masks it. Here nothing is open at all: 60 activated trailers outlived their positions
+/// (both owners closed against ERIN, who is flat too), so the tick spends its 50 actions expiring
+/// 50 of them (`AlgoOrderTriggered` + 11) with an EMPTY position registry — the trailing leg is the
+/// only one that can raise the flag, and the drain must find the other 10.
+#[test]
+fn kill_t34_a_trailing_overflow_alone_raises_the_deferred_flag() {
+    let mut ctx = fresh();
+    let ids = crowd(&mut ctx, 60, 0);
+    seed_pos(&mut ctx, ERIN, -200, 1);
+    for k in 0..2u16 {
+        let u = extra(k);
+        rest(&mut ctx, u, SELL, MARK, 100);
+        take(&mut ctx, ERIN, BUY, 100);
+        assert_eq!(amount(&mut ctx, u), 0);
+    }
+    assert_eq!(amount(&mut ctx, ERIN), 0);
+    assert!(storage::load_position_registry(&mut ctx, MARKET_ID).unwrap().is_empty());
+
+    let c = tick(&mut ctx, 9_900);
+    let want: Vec<(Id, u64, u64)> = ids.iter().map(|id| (*id, 9_900, 9_900)).collect();
+    assert_eq!(triggered(&c.logs), want[..BUDGET].to_vec());
+    assert_eq!(
+        algo_cancels(&c.logs),
+        ids[..BUDGET].iter().map(|id| (*id, R_POSITION_CLOSED)).collect::<Vec<_>>()
+    );
+    assert!(deferred(&mut ctx), "10 due trailers left on the budget: deferred work");
+    let (more, c) = drain(&mut ctx);
+    assert!(!more);
+    assert_eq!(triggered(&c.logs), want[BUDGET..].to_vec());
+    assert!(!deferred(&mut ctx));
+}
