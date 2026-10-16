@@ -549,9 +549,10 @@ pub(super) enum MakerFillOutcome {
 }
 
 // ── Match working-copy registry (commit-only #23, tranche-4 L1) ─────────────────
-// Per-user working copies for one match: each touched user (maker, and taker on self-match) is
-// loaded ONCE (with funding computed+applied at first touch, exactly where today's first
-// settle_maker_fill did it) and saved ONCE at flush — same write-key set and net values as
+// Per-user working copies for one match: each touched user (every maker; the taker once it has
+// fills, or earlier when the walk cancels one of its own resting orders — STP, or K9 on a FOK
+// self-match) is loaded ONCE (with funding computed+applied at first touch, exactly where today's
+// first settle_maker_fill did it) and saved ONCE at flush — same write-key set and net values as
 // today's per-fill saves, with per-list dirty flags so an untouched list never enters the delta.
 // Vec-backed (few users per match) for deterministic flush order.
 

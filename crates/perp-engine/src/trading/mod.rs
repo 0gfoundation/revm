@@ -1722,12 +1722,23 @@ fn remove_order_entry_by_price(
 /// The one thing it must satisfy is
 ///
 /// ```text
-///     bound <= true_requirement            (unconditionally)
+///     bound <= true_requirement            (whenever every unit either fills or rests)
 /// ```
 ///
 /// because then `available < bound  ⟹  available < true_requirement`, and the early reject can
 /// never be wrong. Being LOOSE is harmless: a bound of 0 simply means no filtering. Nothing may ever
 /// treat this as authoritative — accepting here says nothing at all.
+///
+/// ⚠️ The condition is not "unconditionally". A unit that EXPIRES needs no margin at all, so for an
+/// order whose remainder is discarded — an IOC or market order that runs out of book, or any order
+/// that self-trade prevention STOPS (`EXPIRE_TAKER` / `EXPIRE_BOTH`) at its owner's own order — the
+/// true requirement can be below the bound, and this filter refuses an order the full path would
+/// have accepted (and expired). That is deliberate: it is Binance's admission, which checks margin
+/// against the order's FULL size before matching, and narrowing the filter to "units that will
+/// rest" would need the walk it exists to avoid — skipping it for such orders would reopen the
+/// deep-walk DoS. Under the default `EXPIRE_MAKER` it stays exact: cancelling the owner's own
+/// opposite-side orders can only shrink `max(Bid, Ask)`, never grow the true requirement past the
+/// bound (pinned by `stp_matching::t23_*` and `t23b_*`).
 ///
 /// # ⚠️ THE TRAP: a REDUCING order's true requirement can be zero or NEGATIVE
 ///

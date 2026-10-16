@@ -226,11 +226,12 @@ pub enum PerpBatchTag {
     /// (`Open` / `PartiallyFilled`). For a placement the `orderId` field is the id it rests under.
     Accepted = 1,
     /// Accepted and TERMINAL — `batchPlaceOrders` only: the placement reached a terminal status and
-    /// left no resting record, i.e. it fully filled (`Filled`) or its IOC/FOK/market remainder
-    /// `Expired`. The rule is exactly `OrderStatus::is_terminal()`; which flavour it was, and the
-    /// fill prices/quantities, come from the `Trade` / `PositionChanged` logs (a terminal order is
-    /// deleted from the order map, so `getOrder` cannot answer it). Never produced by
-    /// `batchCancelOrders`.
+    /// left no resting record, i.e. it fully filled (`Filled`) or its remainder `Expired` — an
+    /// IOC / market remainder, or that of any order self-trade prevention stopped (a GTC
+    /// included). The rule is exactly `OrderStatus::is_terminal()`; which flavour it was, and the
+    /// fill prices/quantities, come from the `Trade` / `PositionChanged` / `OrderExpired` logs (a
+    /// terminal order is deleted from the order map, so `getOrder` cannot answer it). Never
+    /// produced by `batchCancelOrders`.
     Filled = 2,
     /// The item errored **after** writing perp state (invariant / arithmetic / post-write). Its
     /// writes cannot be undone, so the loop stops here and the call still returns `Ok`. For a

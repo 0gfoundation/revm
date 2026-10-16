@@ -627,6 +627,11 @@ sol! {
         ///     at all", and Binance expires the unfilled part for the same reason).
         ///   * the limit pair RESTS at `price` and survives until filled or cancelled. The two
         ///     types ARE the two policies; pick the one whose failure mode you want.
+        ///   Either way the fired order walks the book like any taker, under the STP mode it
+        ///   inherited (see `placeOrder`): it can cancel its owner's own crossing orders, or stop
+        ///   at them and expire (reason 9). If the matcher REFUSES the placement it became (an
+        ///   unfillable FOK, a crossing PostOnly, a refused rest), the conditional is spent and
+        ///   reported as `AlgoOrderCancelled` reason 10 — the oracle transaction still succeeds.
         ///
         /// triggerPrice: fires on the MARK price, per (orderType, side):
         ///     STOP BUY / TAKE_PROFIT SELL   ->  mark >= triggerPrice
@@ -881,6 +886,33 @@ sol! {
         ///               `OrderRested`, `getOrder` and `getOpenOrders`. One encoding per mode, so
         ///               every echo equals the byte that was sent.
         ///     bit 1, bits 4-7  reserved; must be 0.
+        ///
+        /// Self-trade prevention (STP). When the walk meets a resting order of the SAME ADDRESS
+        /// (a sub-account is a different address: it trades with its master as usual), the
+        /// TAKER's mode decides — a resting order's own mode and kind are never read, so a resting
+        /// PostOnly is cancelled like any other. The check is per resting ORDER in FIFO: an order
+        /// of someone else queued ahead of the caller's own at the same price fills first.
+        ///   * EXPIRE_MAKER: the resting order is cancelled for its WHOLE remaining quantity
+        ///     (`OrderCancelled` reason 9) and the walk goes on; the taker's quantity is untouched.
+        ///   * EXPIRE_TAKER: the walk STOPS. Fills before it stand; the remainder EXPIRES
+        ///     (`OrderExpired` reason 9) — a GTC included, which then never rests — and the
+        ///     resting order keeps its place.
+        ///   * EXPIRE_BOTH: the resting order is cancelled (reason 9), then the walk stops and the
+        ///     remainder expires (reason 9).
+        /// It applies to GTC, IOC and market takers (and to a fired conditional, which inherits
+        /// the mode). It does NOT apply to FOK — a FOK still trades with its owner's own orders
+        /// (Binance: "STP won't take effect"; it is the only way left to self-trade) — nor to
+        /// PostOnly, which is refused (`PostOnly order would match`) when it would cross any order,
+        /// its owner's included. An IOC / market remainder that ran out of book after STP cancels
+        /// expires with reason 0, not 9: STP did not stop it. A blocked match prints nothing — no
+        /// `Trade`, fee, last-traded price or trade id — and a user whose only part in it is a
+        /// cancelled order gets no `AccountBalanceChanged` (Binance: cancelled orders push no
+        /// `ACCOUNT_UPDATE`).
+        /// There is no per-order limit on STP cancels: each removes one of the caller's own open
+        /// orders in this market, so the open-order cap above bounds them.
+        /// Margin admission is on the FULL size before matching (Binance's), so an EXPIRE_TAKER /
+        /// EXPIRE_BOTH order whose remainder would expire is still refused if resting all of it
+        /// would be unaffordable.
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
@@ -926,22 +958,30 @@ sol! {
         /// open-into-insolvency) does NOT undo the items before it. The call returns Ok once the loop
         /// has begun. A rejected item is write-clean AND log-clean — it emits no `OrderPlaced`.
         ///
-        /// Each item matches the book **as left by the previous item**, so self-crossing inside one
-        /// batch is allowed and behaves exactly like submitting the items as separate transactions in
-        /// that order.
+        /// Items execute in order, and each matches the book **as left by the previous item**: a
+        /// later item is the TAKER against earlier ones, exactly as if the items were separate
+        /// transactions in that order. So self-trade prevention applies inside a batch too — under
+        /// the default EXPIRE_MAKER a later GTC / IOC / market item that crosses an earlier item's
+        /// resting order CANCELS it (`OrderCancelled` reason 9) — a FOK item still self-fills, and
+        /// a PostOnly item is rejected. ⚠️ This is stricter than Binance, which does not promise
+        /// any matching order within a batch ("processed concurrently"); do not port a strategy
+        /// that relies on Binance batch semantics here, or vice versa.
         ///
         /// `statuses` = N concatenated 34-byte records, index-aligned to `orders`:
         ///   byte 0      tag      1 = Accepted (rests: Open/PartiallyFilled),
-        ///                        2 = Accepted and terminal (fully Filled, or an IOC/FOK/market
-        ///                            remainder that Expired — no resting record is left),
+        ///                        2 = Accepted and terminal (fully Filled, or a remainder that
+        ///                            Expired — an IOC / market remainder, or any order self-trade
+        ///                            prevention STOPPED, a GTC included; `OrderExpired.reason`
+        ///                            tells which — no resting record is left),
         ///                        0 = Rejected, 3 = Aborted, 4 = NotAttempted
         ///   bytes 1..33 orderId  the id the order was placed under; ZERO for tags 0/3/4 (a
         ///                        rejected item never consumed an id, so none exists)
         ///   byte 33     reason   numeric reason code; 0 when accepted
         /// Reason codes are NUMERIC (never strings) — see `PerpBatchReason` in `perp_dex::batch`;
         /// place-path rejects occupy the 16..=63 band. `statuses` is the outcome AT THE TIME the item
-        /// ran: the taker wallet-cover path can auto-cancel an order an earlier item just rested, and
-        /// the logs (`Trade` / `OrderCancelled` / `PositionChanged`) are the authority on final state.
+        /// ran: the taker wallet-cover path, or a later item's self-trade prevention, can cancel an
+        /// order an earlier item just rested (its tag stays 1), and the logs (`Trade` /
+        /// `OrderCancelled` / `PositionChanged`) are the authority on final state.
         ///
         /// orderId derivation is the SAME per-user nonce chain `placeOrder` uses —
         /// keccak256(account || nonce) — and the nonce advances by exactly the number of items that
@@ -1575,7 +1615,9 @@ sol! {
         /// A **SELF-TRADE emits BOTH** legs for the same address: the maker-leg row at the fill and
         /// the taker-leg row at the end of the order. The maker leg is deliberately not suppressed —
         /// that would make a maker's own notification conditional on who the counterparty turned out
-        /// to be.
+        /// to be. Only a FOK taker can still self-trade: self-trade prevention cancels or stops
+        /// every GTC / IOC / market taker at its own order, and a user whose only part in a match
+        /// is such a CANCELLED order (or a K9-cancelled one) gets no row at all — no money moved.
         ///
         /// ⚠️ **Consumers must take the LAST row per user**, exactly as they already must for
         /// `PositionChanged`. A user can legitimately appear several times in one transaction, and a
@@ -1642,9 +1684,12 @@ sol! {
         // Feeds: /allOrders (initial record), /openOrders (pending state)
         /// flags: the accepted modifier bitfield (bit 0 = reduceOnly, bits 3:2 = STP mode — `00`
         ///   is EXPIRE_MAKER, the default), echoed so the flags are recoverable from the EVENT
-        ///   STREAM. A liquidation close's STP bits carry no meaning (STP never applies to it). Without it the only off-chain route is decoding
-        ///   `placeOrder` calldata and re-deriving order ids per batch item, which is not something
-        ///   an indexer can do. `uint8` rather than `bool` so a later bit costs no ABI round.
+        ///   STREAM (the `@order` stream's `V`). The mode is echoed for FOK and PostOnly too,
+        ///   though STP never applies to them, and a liquidation close's STP bits carry no meaning
+        ///   at all.
+        ///   Without it the only off-chain route is decoding `placeOrder` calldata and re-deriving
+        ///   order ids per batch item, which is not something an indexer can do. `uint8` rather
+        ///   than `bool` so a later bit costs no ABI round.
         event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags);
 
         // ── Conditional (algo) orders ───────────────────────────────────────────────────────────
@@ -1661,6 +1706,10 @@ sol! {
         /// A conditional order was accepted. `algoId` is its id in BOTH namespaces: after trigger
         /// the ordinary events carry the same value as `orderId`, so a consumer can stitch the two
         /// halves of its life together without a mapping table.
+        ///
+        /// `flags` is the byte as SENT (bit 0 reduceOnly, bit 1 closePosition, bits 3:2 STP mode).
+        /// Each STP mode has one encoding, so its bits 3:2 equal those of the fired order's
+        /// `OrderPlaced.flags` — the mode the trigger inherits.
         event AlgoOrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint8 side, uint8 orderType, uint64 triggerPrice, uint64 price, uint64 quantity, uint8 tif, bytes16 clientAlgoId, uint8 flags);
 
         /// The trigger fired. `markPrice` is the mark that fired it — NOT `triggerPrice`, so the
@@ -1668,8 +1717,15 @@ sol! {
         /// on the wire rather than something a consumer has to infer.
         event AlgoOrderTriggered(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint64 triggerPrice, uint64 markPrice);
 
-        /// An UNTRIGGERED conditional order was removed. `reason` shares the `CancelReason` space
-        /// with `OrderCancelled` so one decoder covers both.
+        /// A conditional order was removed. `reason` shares the `CancelReason` space with
+        /// `OrderCancelled` so one decoder covers both. Usually an UNTRIGGERED one (0 = its owner
+        /// cancelled it, …). Two reasons instead follow a FIRED trigger (`AlgoOrderTriggered`
+        /// immediately precedes them) and mean the trigger is spent with nothing placed (no
+        /// `OrderPlaced`):
+        ///   * 6 (`ReduceOnlyWouldOpen`) — nothing was left to reduce at trigger time;
+        ///   * 10 (`TriggerRejected`) — the matcher refused the ordinary order it became: an
+        ///     unfillable FOK, a crossing PostOnly, a refused rest. Binance's `ALGO_UPDATE`
+        ///     `REJECTED` ("denied by the matching engine").
         event AlgoOrderCancelled(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint8 reason);
 
         // Emitted when a limit order rests in the book (after any immediate fills).
@@ -1700,6 +1756,11 @@ sol! {
         // It is a MARGIN BASIS AND NOTHING ELSE: the book level, the insert position, the fill
         // price and the fee all key on `price`. `assumingPrice >= price` for a sell and
         // `== price` for a buy, so it must NOT be shown to a user as the order's price.
+        //
+        // `flags` — the same bitfield as `OrderPlaced.flags` (bit 0 reduceOnly, bits 3:2 the STP
+        // mode the order was placed with). A resting order's own mode is never read by the
+        // matcher — only a taker's is — so this is an echo for the `@order` stream's `V`, not a
+        // statement of how the order will be treated.
         event OrderRested(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 tif, bytes16 clientOrderId, uint64 assumingPrice, uint8 flags);
         // Feeds: /openOrders (remove), /allOrders (status=CANCELED, updateTime)
         //
@@ -1708,8 +1769,10 @@ sol! {
         // rejected as opening-into-insolvency, 3 = the owner was liquidated, 4 = the order was
         // stranded out of band at the touch and the mark update expired it, 5/6/7 = reduce-only
         // eviction (position shrank / would open / overtaken by a normal order), 8 = the owner was
-        // an ADL counterparty, 9 = self-trade prevention (a same-address taker expired this maker),
-        // 10 = a triggered conditional order was rejected by the matcher (on `AlgoOrderCancelled`).
+        // an ADL counterparty, 9 = self-trade prevention (a same-address GTC / IOC / market taker
+        // whose mode is EXPIRE_MAKER or EXPIRE_BOTH met this order; its WHOLE remaining quantity is
+        // cancelled — the stream's `X = EXPIRED_IN_MATCH`), 10 = a triggered conditional order was
+        // rejected by the matcher (on `AlgoOrderCancelled` only).
         //
         // Without it this event was byte-identical for a user cancel and a protocol kill (three
         // indexed fields, no data) and — under delete-on-terminal — `getOrder` answers "not found"
@@ -1720,13 +1783,15 @@ sol! {
         // `storage::mark_account_snapshot_dirty`.
         event OrderCancelled(address indexed user, bytes32 indexed orderId, uint64 indexed marketId, uint8 reason);
 
-        // Feeds: /allOrders (status=EXPIRED, updateTime), and the `@order` stream's terminal frame
-        //        for a TIF expiry.
+        // Feeds: /allOrders (status=EXPIRED, or EXPIRED_IN_MATCH for reason 9, updateTime), and the
+        //        `@order` stream's terminal frame for an expiry.
         //
-        // THE TERMINAL EVENT OF AN IOC / MARKET ORDER THAT DID NOT FULLY FILL. Before it, such an
-        // order ended with NO terminal event at all: `cancel_unfilled_remainder` set
-        // `OrderStatus::Expired` in memory, delete-on-terminal then removed the record so `getOrder`
-        // answered "not found", and the stream read `OrderPlaced → Trade × N → (nothing)`.
+        // THE TERMINAL EVENT OF A TAKER REMAINDER THAT WILL NEVER REST: an IOC / market order that
+        // did not fully fill, or any order whose walk self-trade prevention STOPPED (a GTC
+        // included). Before it, such an order ended with NO terminal event at all:
+        // `cancel_unfilled_remainder` set `OrderStatus::Expired` in memory, delete-on-terminal then
+        // removed the record so `getOrder` answered "not found", and the stream read
+        // `OrderPlaced → Trade × N → (nothing)`.
         //
         // `filledQuantity` — how much of the order executed, `quantity − expiredQuantity`. It lets a
         //                    consumer reconcile the stream's cumulative `z` against a number the
@@ -1734,6 +1799,16 @@ sol! {
         //                    received all of.
         // `expiredQuantity` — the remainder that was discarded. Always > 0: a fully filled order has
         //                    no remainder and is not an expiry (see below).
+        // `reason` — WHY it expired (`ExpiryReason`, perp-core `types::order`):
+        //              0 = the time-in-force: the walk ran out of liquidity, hit the limit price or
+        //                  the fill-time band. Also an EXPIRE_MAKER walk that cancelled its owner's
+        //                  orders and THEN ran out of book — STP did not stop it.
+        //              9 = self-trade prevention: the walk was stopped at the taker's own resting
+        //                  order (EXPIRE_TAKER / EXPIRE_BOTH). The same number as the
+        //                  `OrderCancelled` reason for the maker leg, so one decoder reads both
+        //                  legs.
+        //            Without it an EXPIRE_TAKER expiry is unexplained on chain: the resting order
+        //            it stopped at is untouched and emits nothing.
         //
         // ── WHY A SEPARATE EVENT AND NOT `OrderCancelled` ───────────────────────────────────────
         //
@@ -1743,17 +1818,20 @@ sol! {
         // order not found" the last time an expiry was reported as a cancel. An IOC remainder never
         // rested — there is no book entry, no `OrderRested`, nothing for a projector to remove — so
         // it cannot go on that event. That invariant now has a runtime guard (`events.rs`,
-        // `rested_guard`), so re-merging them will fail tests rather than reach a projector.
+        // `rested_guard`), so re-merging them will fail tests rather than reach a projector; the
+        // same guard checks the converse (an `OrderExpired` names an order placed in that call that
+        // never rested).
         //
         // ── WHY EMIT IT AT ALL, GIVEN IT IS DERIVABLE ───────────────────────────────────────────
         //
-        // It IS derivable: a consumer knows `tif`/`orderType` from `OrderPlaced` and can reason "an
-        // IOC never rests, so any unfilled remainder is dead". This is therefore not an information
-        // gap, and it is emitted anyway for three reasons.
+        // For a TIF expiry it IS derivable: a consumer knows `tif`/`orderType` from `OrderPlaced`
+        // and can reason "an IOC never rests, so any unfilled remainder is dead". (An STP expiry is
+        // not derivable at all — see `reason`.) It is emitted anyway for three reasons.
         //
         // 1. THAT DERIVATION IS ENGINE POLICY, NOT ARITHMETIC. It hardcodes *which TIFs rest* into
         //    every consumer. Add a TIF that rests conditionally and every one of them is silently
-        //    wrong — no error, just orders that never close.
+        //    wrong — no error, just orders that never close. (STP is exactly such a rule: a GTC
+        //    stopped by it does not rest.)
         // 2. ABSENCE IS A FRAGILE SIGNAL TO SCOPE. "No `OrderRested` followed this `OrderPlaced`"
         //    requires knowing where the following-window ENDS. Inside a 64-item batch one
         //    transaction carries dozens of interleaved order lifecycles; getting that window wrong
@@ -1768,24 +1846,26 @@ sol! {
         // ── THE EXACT FIRING SET ────────────────────────────────────────────────────────────────
         //
         // Emitted iff the taker order's final status is `OrderStatus::Expired`, which
-        // `cancel_unfilled_remainder` is the ONLY producer of, and only when `remaining > 0`. It has
-        // exactly two call sites, so the firing set is exactly two paths:
+        // `cancel_unfilled_remainder` is the ONLY producer of, and only when `remaining > 0`. Its
+        // call sites are exactly three paths:
         //
-        // * `execute_limit_order`'s `TimeInForce::Ioc` branch — a partial fill, or no fill at all.
+        // * `execute_limit_order`'s `TimeInForce::Ioc` branch — a partial fill, or no fill at all
+        //   (reason 0, or 9 when STP stopped the walk).
         // * `execute_market_order` — same, plus the case where the price band stops the walk.
+        // * `execute_limit_order`'s `TimeInForce::Gtc` branch, ONLY when self-trade prevention
+        //   stopped the walk (EXPIRE_TAKER / EXPIRE_BOTH) — reason 9, and the remainder does not
+        //   rest.
         //
         // NOT emitted for:
         // * FOK — `ensure_fok_filled` returns `Err` on any remainder, so the whole order reverts and
-        //   there is no partially-filled FOK to report a remainder for.
-        // * GTC / PostOnly — a remainder RESTS (`OrderRested`), and if the rest is refused
-        //   `raise_rest_refusal` reverts the whole order. Neither reaches an expiry.
+        //   there is no partially-filled FOK to report a remainder for. (STP never applies to FOK.)
+        // * GTC / PostOnly otherwise — a remainder RESTS (`OrderRested`), and if the rest is
+        //   refused `raise_rest_refusal` reverts the whole order. Neither reaches an expiry.
         // * A FULLY FILLED order of any kind — no remainder, and its terminal state is already
         //   unambiguous from `z == q`.
-        // * A resting order killed by the protocol (out-of-band sweep, liquidation, maker-cover) —
-        //   that IS a cancel of something that rested, and stays on `OrderCancelled` with its
-        //   `reason`.
-        // `reason` — `ExpiryReason` (perp-core `types::order`): 0 = the time-in-force ran out of
-        //            book, 9 = self-trade prevention stopped the walk at the taker's own order.
+        // * A resting order killed by the protocol (out-of-band sweep, liquidation, maker-cover,
+        //   self-trade prevention's maker leg) — that IS a cancel of something that rested, and
+        //   stays on `OrderCancelled` with its `reason`.
         event OrderExpired(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint64 filledQuantity, uint64 expiredQuantity, uint8 reason);
 
         // Feeds: /trades, /historicalTrades, /aggTrades, /klines, /ticker/24hr, /myTrades, and the

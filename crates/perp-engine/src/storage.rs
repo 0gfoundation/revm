@@ -589,6 +589,10 @@ pub(crate) fn clear_account_snapshot_mark<H: PerpHost>(context: &mut H, user: Ad
 ///
 /// # This is also what caps a SELF-MATCH at exactly two rows
 ///
+/// Only a FOK taker can self-match: self-trade prevention cancels or stops every GTC / IOC /
+/// market taker at its own resting order, and a taker whose only contact with its own order was
+/// such a cancel gets no row at all (the flush's cancel-only route).
+///
 /// A self-matching user is in the `MatchRegistry`, so the flush evaluates its mark-clear gate for
 /// them — and that gate does NOT fire, because the taker leg evolved the same working copy past the
 /// maker-leg payload it published. The flush's own `save_position` / `save_account` then re-mark
