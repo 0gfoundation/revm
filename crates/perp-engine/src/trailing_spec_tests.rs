@@ -2051,14 +2051,29 @@ fn register_alice_key(ctx: &mut TestCtx) {
     );
 }
 
-/// `placeAlgoOrderSigned` for ALICE: the 114-byte message rebuilt from the ABI docs. Returns the
-/// calldata and the signature.
+/// `placeAlgoOrderSigned` for ALICE, a reduce-only trailing stop: see [`signed_algo`].
 fn signed_trail(
     ctx: &mut TestCtx,
     side: u8,
     activation: u64,
     cb: u64,
     qty: u64,
+    salt: u8,
+) -> (Vec<u8>, Vec<u8>) {
+    signed_algo(ctx, TRAILING, side, activation, cb, qty, RO, salt)
+}
+
+/// `placeAlgoOrderSigned` for ALICE: the 114-byte message rebuilt from the ABI docs. Returns the
+/// calldata and the signature.
+#[allow(clippy::too_many_arguments)]
+fn signed_algo(
+    ctx: &mut TestCtx,
+    kind: u8,
+    side: u8,
+    trigger: u64,
+    price: u64,
+    qty: u64,
+    flags: u8,
     salt: u8,
 ) -> (Vec<u8>, Vec<u8>) {
     let mut client = [0u8; 16];
@@ -2069,13 +2084,13 @@ fn signed_trail(
     msg.extend_from_slice(ALICE.as_slice());
     msg.push(0); // algoType
     msg.extend_from_slice(&MARKET_ID.to_be_bytes());
-    msg.extend_from_slice(&[side, TRAILING]);
-    msg.extend_from_slice(&activation.to_be_bytes());
-    msg.extend_from_slice(&cb.to_be_bytes());
+    msg.extend_from_slice(&[side, kind]);
+    msg.extend_from_slice(&trigger.to_be_bytes());
+    msg.extend_from_slice(&price.to_be_bytes());
     msg.extend_from_slice(&qty.to_be_bytes());
     msg.extend_from_slice(&[0, 0]); // tif, workingType
     msg.extend_from_slice(&client);
-    msg.push(RO);
+    msg.push(flags);
     msg.extend_from_slice(&SIGNED_TS.to_be_bytes());
     msg.extend_from_slice(&SIGNED_RECV.to_be_bytes());
     msg.push(1); // keyId
@@ -2086,14 +2101,14 @@ fn signed_trail(
         algoType: 0,
         marketId: MARKET_ID,
         side,
-        orderType: TRAILING,
-        triggerPrice: activation,
-        price: cb,
+        orderType: kind,
+        triggerPrice: trigger,
+        price,
         quantity: qty,
         tif: 0,
         workingType: 0,
         clientAlgoId: client.into(),
-        flags: RO,
+        flags,
         timestamp: SIGNED_TS,
         recvWindow: SIGNED_RECV,
         keyId: 1,
@@ -3247,6 +3262,56 @@ fn fix_cancel_order_refuses_an_untriggered_conditional_id() {
     let c = take(&mut ctx, ERIN, SELL, 3);
     assert_eq!(trades(&c.logs), bob.iter().map(|_| (ERIN, BOB, 9_900, 1)).collect::<Vec<_>>());
     assert!(storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
+}
+
+/// A relayed signed submission refused by `order would immediately trigger`, the burn's measured
+/// cost, then `duplicate signature`.
+fn refused_after_the_burn(ctx: &mut TestCtx, input: &[u8]) {
+    let _ = take_logs(ctx);
+    let before = world(ctx);
+    let w = ctx.perp_write_count();
+    let out = run_perp_dex_call(input, GAS, DAVE, U256::ZERO, false, ctx).unwrap();
+    assert_eq!(revert_reason(&out), E_IMMEDIATE);
+    assert!(ctx.perp_write_count() > w, "the signature was burned");
+    assert!(take_logs(ctx).is_empty());
+    assert!(world(ctx) == before, "only the seen-signature set moved");
+    rejected(ctx, DAVE, input, E_DUP_SIG);
+}
+
+/// "Would immediately trigger" reads the stored mark, which moves every tick, so the refusal is
+/// TRANSIENT and must spend a signed submission (the rule `placeOrderSigned` states: a refused
+/// signature left live lets an observer land it later, at a moment its owner believed it had
+/// failed). Before the fix it was checked before the burn: refused with 0 writes, then accepted
+/// from the same calldata once the mark moved back.
+///
+/// ALICE (long 10) signs, at mark 10_000, a SELL trailing stop activating at 10_100 and a SELL
+/// STOP_MARKET at 9_950 — both fine at that mark. The first is relayed after a tick to 10_150
+/// (activation already reached), the second after a tick to 9_950 (trigger already satisfied):
+/// each is refused after its burn, and with the mark back at 10_050 / 10_000 the same calldata
+/// is a duplicate and nothing was placed.
+#[test]
+fn fix_a_mark_dependent_signed_refusal_burns_the_signature() {
+    let mut ctx = trail_fixture();
+    register_alice_key(&mut ctx);
+    let (trail_in, _) = signed_trail(&mut ctx, SELL, 10_100, 100, 1, 1);
+    let (stop_in, _) = signed_algo(&mut ctx, STOP_MARKET, SELL, 9_950, 0, 1, RO, 2);
+
+    tick(&mut ctx, 10_150);
+    refused_after_the_burn(&mut ctx, &trail_in);
+    tick(&mut ctx, 10_050);
+    rejected(&mut ctx, DAVE, &trail_in, E_DUP_SIG);
+
+    tick(&mut ctx, 9_950);
+    refused_after_the_burn(&mut ctx, &stop_in);
+    tick(&mut ctx, 10_000);
+    rejected(&mut ctx, DAVE, &stop_in, E_DUP_SIG);
+    assert!(open_algos(&mut ctx, ALICE).is_empty());
+
+    // A static refusal still costs nothing and gives the same answer again (the callback grid).
+    let (bad, _) = signed_trail(&mut ctx, SELL, 10_100, 15, 1, 3);
+    let reason = format!("placeAlgoOrderSigned: {E_CALLBACK}");
+    rejected(&mut ctx, DAVE, &bad, &reason);
+    rejected(&mut ctx, DAVE, &bad, &reason);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════

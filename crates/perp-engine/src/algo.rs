@@ -69,7 +69,9 @@
 //! (`trigger_fires`, inclusive) is evaluated on the STORED mark, and a trigger it is already
 //! satisfied by is refused (`placeAlgoOrder: order would immediately trigger`). Before the first
 //! oracle tick that mark is the market's `initialMarkPrice`; a zero mark — unreachable through
-//! the ABI — has no reference and skips the check, as the price band does.
+//! the ABI — has no reference and skips the check, as the price band does. The refusal is
+//! TRANSIENT (the next tick may lift it), so on the signed path it comes after the signature is
+//! burned, like every other refusal that reads the mark or the owner's state.
 
 use crate::host::PerpHost;
 use crate::interface::IPerpDex::{
@@ -279,38 +281,9 @@ fn validate(
         // be able to close a dust remainder.
     }
 
-    // ── Would it fire on the stored mark right now? Then refuse it (Binance `-2021`) ─────────────
-    //
-    // Evaluated with THE SWEEP'S OWN PREDICATE (`trigger_fires`) on the mark the next sweep would
-    // see first, so "would immediately trigger" means exactly "the next oracle tick fires it if the
-    // mark does not move" — including equality, where the sweep fires. Accepting it instead would
-    // not execute it now (triggers run only inside the oracle sweep), it would execute it at
-    // whatever the NEXT mark is: a stop the caller may have meant as a limit-style "only below
-    // here" is filled at a price nobody chose. Binance answers "Order would immediately trigger".
-    //
-    // `mark_price == 0` skips the check: there is no reference to compare against, the same
-    // convention as the price band (`math::price_band` — "mark == 0: no band"). It is unreachable
-    // through the ABI — `addMarket` refuses `initialMarkPrice == 0` and the oracle path floors every
-    // mark component at 1 — so before the first oracle tick the reference is simply the market's
-    // `initialMarkPrice`, and only a hand-built fixture can carry 0.
-    //
-    // For a trailing stop the same predicate reads the ACTIVATION price in the activation
-    // direction (`AlgoOrderType::trigger_up`): a SELL whose activation price the mark already
-    // reaches is refused, which is Binance's `-2021` for an activatePrice on the wrong side. Send 0
-    // to activate now instead.
+    // The "would immediately trigger" refusal and the activate-now mark check read the STORED
+    // MARK, so they are not here: see `place_core`.
     let trigger_up = kind.trigger_up(side);
-    if trigger_price != 0
-        && market.mark_price != 0
-        && trigger_fires(trigger_up, trigger_price, market.mark_price)
-    {
-        return Err(perp_err("placeAlgoOrder: order would immediately trigger"));
-    }
-    // Activating now needs a mark to seed the peak with. Unreachable through the ABI, as above.
-    if trailing && trigger_price == 0 && market.mark_price == 0 {
-        return Err(perp_err(
-            "placeAlgoOrder: no mark price to activate a trailing stop at",
-        ));
-    }
 
     Ok(ValidatedAlgo {
         side,
@@ -340,6 +313,47 @@ fn place_core<H: PerpHost>(
     client_algo_id: FixedBytes<16>,
     flags: u8,
 ) -> Result<Bytes, PerpError> {
+    // ── Would it fire on the stored mark right now? Then refuse it (Binance `-2021`) ─────────────
+    //
+    // Evaluated with THE SWEEP'S OWN PREDICATE (`trigger_fires`) on the mark the next sweep would
+    // see first, so "would immediately trigger" means exactly "the next oracle tick fires it if the
+    // mark does not move" — including equality, where the sweep fires. Accepting it instead would
+    // not execute it now (triggers run only inside the oracle sweep), it would execute it at
+    // whatever the NEXT mark is: a stop the caller may have meant as a limit-style "only below
+    // here" is filled at a price nobody chose. Binance answers "Order would immediately trigger".
+    //
+    // ⚠️ HERE and not in `validate`, because it is TRANSIENT: the mark moves every tick, so the
+    // same request can be refused now and accepted one tick later. The signed path runs `validate`
+    // BEFORE it burns the signature and this function AFTER, and a transient refusal must burn
+    // (`trading::run_place_order_signed`): otherwise a refused signature stays live for the rest of
+    // its recv window, and an observer can land it once the mark moves back — at a moment the
+    // owner believed it had failed. Same for the activate-now check below. Still pre-write on both
+    // paths.
+    //
+    // `mark_price == 0` skips the check: there is no reference to compare against, the same
+    // convention as the price band (`math::price_band` — "mark == 0: no band"). It is unreachable
+    // through the ABI — `addMarket` refuses `initialMarkPrice == 0` and the oracle path floors every
+    // mark component at 1 — so before the first oracle tick the reference is simply the market's
+    // `initialMarkPrice`, and only a hand-built fixture can carry 0.
+    //
+    // For a trailing stop the same predicate reads the ACTIVATION price in the activation
+    // direction (`AlgoOrderType::trigger_up`): a SELL whose activation price the mark already
+    // reaches is refused, which is Binance's `-2021` for an activatePrice on the wrong side. Send 0
+    // to activate now instead.
+    let trailing = v.trail_bps != 0;
+    if v.trigger_price != 0
+        && market.mark_price != 0
+        && trigger_fires(v.trigger_up, v.trigger_price, market.mark_price)
+    {
+        return Err(perp_err("placeAlgoOrder: order would immediately trigger"));
+    }
+    // Activating now needs a mark to seed the peak with. Unreachable through the ABI, as above.
+    if trailing && v.trigger_price == 0 && market.mark_price == 0 {
+        return Err(perp_err(
+            "placeAlgoOrder: no mark price to activate a trailing stop at",
+        ));
+    }
+
     let mut live = storage::load_user_algo_orders(context, account, market_id)?;
     if live.len() >= MAX_ALGO_ORDERS_PER_MARKET {
         return Err(perp_err(
@@ -356,7 +370,6 @@ fn place_core<H: PerpHost>(
     // A trailing stop with activation price 0 activates NOW, at the stored mark and its seq
     // (`IndexPriceState.timestamp`, 0 before the first oracle tick). Its record carries that mark
     // as the effective activation price, so `trigger_price` is never 0 for a conditional.
-    let trailing = v.trail_bps != 0;
     let activate_at = if trailing && v.trigger_price == 0 {
         Some(storage::load_index_price_state(context, market_id)?.timestamp)
     } else {
@@ -704,8 +717,11 @@ pub fn run_place_algo_order_signed<H: PerpHost>(
         ));
     }
 
-    // Validate BEFORE the burn, so a malformed request costs no write at all. Everything after
-    // this point either succeeds or is a sanctioned reject-after-write.
+    // Validate BEFORE the burn, so a malformed request costs no write at all. Only refusals that
+    // are PERMANENT for this message belong there; everything that reads the mark or the owner's
+    // state (would-immediately-trigger, the position binding, the caps) is in `place_core`, after
+    // the burn, because it can lift a tick later. Everything after this point either succeeds or
+    // is a sanctioned reject-after-write.
     let market = storage::load_market_ref(context, a.marketId)?
         .ok_or_else(|| perp_err("placeAlgoOrderSigned: unknown market"))?;
     if !market.active {

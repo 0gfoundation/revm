@@ -837,6 +837,11 @@ sol! {
 
         /// `placeAlgoOrder` for `account`, authenticated by ed25519 signature — the API-key path,
         /// so a trader signs locally and anyone may relay and pay the gas.
+        /// A malformed request (any refusal fixed by the message itself) is refused BEFORE the
+        /// signature is spent. A refusal that reads the current mark or the owner's state —
+        /// `order would immediately trigger`, the position binding, the order caps — comes AFTER
+        /// it: the next tick could lift it, so the signature must not stay replayable. Resending
+        /// the same signature is then `duplicate signature`.
         /// Message: "perpdex_v1_algo"(15) || chainId(8) || account(20) || algoType(1) || marketId(8)
         ///          || side(1) || orderType(1) || triggerPrice(8) || price(8) || quantity(8)
         ///          || tif(1) || workingType(1) || clientAlgoId(16) || flags(1)

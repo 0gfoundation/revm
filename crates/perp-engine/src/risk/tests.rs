@@ -8166,11 +8166,11 @@ mod algo_order_signed {
         );
     }
 
-    /// The closePosition-parity refusals reach the signed path too, and each lands on its own side
-    /// of the burn. "Would immediately trigger" is a VALIDATION failure: refused before the burn,
-    /// write-clean, the signature unspent. The position binding reads state, so it is checked in
-    /// `place_core` beside the caps: a sanctioned reject AFTER the burn — the signature is spent and
-    /// a replay is a duplicate.
+    /// The closePosition-parity refusals reach the signed path too, AFTER the burn: both read
+    /// what can change under an unchanged message — "would immediately trigger" the stored mark,
+    /// the position binding the owner's position — so both are checked in `place_core` beside the
+    /// caps. Each is a sanctioned reject after the burn: the signature is spent and a replay is a
+    /// duplicate. (The static RO|CP refusal stays a validation failure before the burn.)
     #[test]
     fn the_signed_path_applies_the_close_position_parity_refusals() {
         const CP: u8 = 2;
@@ -8188,15 +8188,25 @@ mod algo_order_signed {
         };
 
         // A SELL stop AT the $100.00 mark would fire on the next tick.
-        let writes = JournalTr::perp_write_count(ctx.journal_mut());
-        let e = submit(&mut ctx, ENTRY_PRICE, QTY as u64, RO).unwrap_err();
-        assert!(format!("{e:?}").contains("order would immediately trigger"), "got {e:?}");
-        assert_eq!(JournalTr::perp_write_count(ctx.journal_mut()), writes, "pre-burn, write-clean");
         let e = submit(&mut ctx, ENTRY_PRICE, QTY as u64, RO).unwrap_err();
         assert!(
-            format!("{e:?}").contains("would immediately trigger"),
-            "the same signature again is refused for the same reason, not as a duplicate: {e:?}"
+            matches!(e, PerpError::RejectAfterRetainedWrite { .. })
+                && format!("{e:?}").contains("order would immediately trigger"),
+            "got {e:?}"
         );
+        assert!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().is_empty());
+        let e = submit(&mut ctx, ENTRY_PRICE, QTY as u64, RO).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("duplicate signature"),
+            "the refusal can lift a tick later, so the signature is spent: {e:?}"
+        );
+        // A static refusal (RO|CP together) still costs nothing and stays resubmittable.
+        let writes = JournalTr::perp_write_count(ctx.journal_mut());
+        let e = submit(&mut ctx, 9_000, 0, RO | CP).unwrap_err();
+        assert!(format!("{e:?}").contains("reduceOnly cannot be sent with closePosition"), "{e:?}");
+        assert_eq!(JournalTr::perp_write_count(ctx.journal_mut()), writes, "pre-burn, write-clean");
+        let e = submit(&mut ctx, 9_000, 0, RO | CP).unwrap_err();
+        assert!(format!("{e:?}").contains("reduceOnly cannot be sent"), "not a duplicate: {e:?}");
 
         // closePosition with ALICE flat.
         let e = submit(&mut ctx, 9_000, 0, CP).unwrap_err();
