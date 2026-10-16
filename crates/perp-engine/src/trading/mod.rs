@@ -1512,26 +1512,6 @@ fn ensure_post_only_does_not_cross<H: PerpHost>(
     Ok((best_bid, best_ask))
 }
 
-fn remove_order_entry(
-    entries: &mut std::collections::VecDeque<OrderEntry>,
-    order_id: &[u8; 32],
-    side_label: &str,
-) -> Result<OrderEntry, PerpError> {
-    let idx = entries
-        .iter()
-        .position(|e| &e.order_id == order_id)
-        .ok_or_else(|| {
-            perp_invariant_err(format!(
-                "{side_label} entry for order {:?} not found during cancel",
-                order_id
-            ))
-        })?;
-    // VecDeque::remove returns Option (unlike Vec::remove); idx came from position() so it is Some.
-    Ok(entries
-        .remove(idx)
-        .expect("index from position() is in bounds"))
-}
-
 /// #B: index of `order_id` in a PRICE-SORTED list, found via binary-search to the price-run
 /// (O(log n)) then a scan of that small same-price run — instead of an O(n) id scan. The order's
 /// `price` is always known at the call site (the loaded Order / the matched level). `buy_side`
@@ -1581,9 +1561,10 @@ pub(super) fn find_entry_by_price_id(
     result
 }
 
-/// #B: `remove_order_entry` for the hot cancel path — O(log n) via [`find_entry_by_price_id`]
-/// instead of the O(n) id scan. Byte-identical result to `remove_order_entry` (removes the same
-/// unique entry; order_ids are unique per side).
+/// #B: remove one entry from a per-account order list — O(log n) via [`find_entry_by_price_id`]
+/// instead of an O(n) id scan. Removes the same unique entry the id scan would (order_ids are unique
+/// per side), so the result is byte-identical; it is now the ONLY entry-removal routine (the O(n)
+/// `remove_order_entry` it replaced on the hot cancel path is gone — every caller knows the price).
 fn remove_order_entry_by_price(
     entries: &mut std::collections::VecDeque<OrderEntry>,
     order_id: &[u8; 32],
@@ -1971,6 +1952,47 @@ fn cancel_order_core<H: PerpHost>(
 
 // ── Matching engine ───────────────────────────────────────────────────────────
 
+/// Write back one level the match walk is DONE with — the single place a walked level is closed.
+///
+/// `count_new` is the level's post-walk LIVE count (`count_old - level_removed`). Zero means the
+/// level is logically empty — any ids still in `new_queue` are stale — so the price leaves the index
+/// (`RemovePrice`, recorded in `removed` so the post-walk best recompute skips it, and `cleared`
+/// set) and the blob is deleted (`SaveLevel` with count 0, which also drops the stale ids).
+/// Otherwise the surviving FIFO is saved with its count.
+///
+/// The walk closes a level from more than one place (the taker ran out of quantity mid-level, or it
+/// consumed every live maker here), and each used to carry its own copy of this block. They must
+/// never drift: `removed`/`cleared` feed the post-walk `SaveBest` / `MidPriceSample` recompute, and
+/// a close that forgot them would leave a stale best quote behind an emptied level.
+fn close_level(
+    registry: &mut settlement::MatchRegistry,
+    is_bid: bool,
+    price: u64,
+    new_queue: Vec<[u8; 32]>,
+    count_new: u64,
+    removed: &mut Vec<u64>,
+    cleared: &mut bool,
+) {
+    if count_new == 0 {
+        registry.push_event(settlement::MatchEvent::RemovePrice { is_bid, price });
+        removed.push(price);
+        *cleared = true;
+        registry.push_event(settlement::MatchEvent::SaveLevel {
+            is_bid,
+            price,
+            queue: Vec::new(),
+            count: 0,
+        });
+    } else {
+        registry.push_event(settlement::MatchEvent::SaveLevel {
+            is_bid,
+            price,
+            queue: new_queue,
+            count: count_new,
+        });
+    }
+}
+
 /// Core matching loop. Performs **zero storage writes** and returns the decided-but-unwritten
 /// [`MatchOutcome`]; the CALLER owns the write barrier ([`MatchOutcome::apply`]).
 pub(super) fn match_order<H: PerpHost>(
@@ -2057,33 +2079,18 @@ pub(super) fn match_order<H: PerpHost>(
 
                 while qi < queue.len() {
                     if remaining == 0 {
+                        // Live orders may remain in the untouched tail — keep it verbatim (any stale
+                        // ids ride along and are swept on the next walk).
                         new_queue.extend(queue[qi..].iter().copied());
-                        let count_new = count_old.saturating_sub(level_removed);
-                        if count_new == 0 {
-                            // Level logically empty (any ids left in new_queue are stale) — drop the
-                            // price; SaveLevel with count 0 deletes the blob (clears stale ids).
-                            registry.push_event(settlement::MatchEvent::RemovePrice {
-                                is_bid: false,
-                                price: ask_price,
-                            });
-                            removed_asks.push(ask_price);
-                            ask_levels_cleared = true;
-                            registry.push_event(settlement::MatchEvent::SaveLevel {
-                                is_bid: false,
-                                price: ask_price,
-                                queue: Vec::new(),
-                                count: 0,
-                            });
-                        } else {
-                            // Live orders remain in the untouched tail — keep it verbatim (any stale
-                            // ids ride along and are swept on the next walk).
-                            registry.push_event(settlement::MatchEvent::SaveLevel {
-                                is_bid: false,
-                                price: ask_price,
-                                queue: new_queue,
-                                count: count_new,
-                            });
-                        }
+                        close_level(
+                            &mut registry,
+                            false,
+                            ask_price,
+                            new_queue,
+                            count_old.saturating_sub(level_removed),
+                            &mut removed_asks,
+                            &mut ask_levels_cleared,
+                        );
                         break 'outer;
                     }
                     let maker_id = queue[qi];
@@ -2236,28 +2243,15 @@ pub(super) fn match_order<H: PerpHost>(
                 }
 
                 // Normal level end (taker still had capacity → consumed every live maker here).
-                let count_new = count_old.saturating_sub(level_removed);
-                if count_new == 0 {
-                    registry.push_event(settlement::MatchEvent::RemovePrice {
-                        is_bid: false,
-                        price: ask_price,
-                    });
-                    removed_asks.push(ask_price);
-                    ask_levels_cleared = true;
-                    registry.push_event(settlement::MatchEvent::SaveLevel {
-                        is_bid: false,
-                        price: ask_price,
-                        queue: Vec::new(),
-                        count: 0,
-                    });
-                } else {
-                    registry.push_event(settlement::MatchEvent::SaveLevel {
-                        is_bid: false,
-                        price: ask_price,
-                        queue: new_queue,
-                        count: count_new,
-                    });
-                }
+                close_level(
+                    &mut registry,
+                    false,
+                    ask_price,
+                    new_queue,
+                    count_old.saturating_sub(level_removed),
+                    &mut removed_asks,
+                    &mut ask_levels_cleared,
+                );
             }
             if ask_levels_cleared {
                 // New best ask from the walk's own knowledge: the price-index snapshot minus the
@@ -2313,28 +2307,15 @@ pub(super) fn match_order<H: PerpHost>(
                 while qi < queue.len() {
                     if remaining == 0 {
                         new_queue.extend(queue[qi..].iter().copied());
-                        let count_new = count_old.saturating_sub(level_removed);
-                        if count_new == 0 {
-                            registry.push_event(settlement::MatchEvent::RemovePrice {
-                                is_bid: true,
-                                price: bid_price,
-                            });
-                            removed_bids.push(bid_price);
-                            bid_levels_cleared = true;
-                            registry.push_event(settlement::MatchEvent::SaveLevel {
-                                is_bid: true,
-                                price: bid_price,
-                                queue: Vec::new(),
-                                count: 0,
-                            });
-                        } else {
-                            registry.push_event(settlement::MatchEvent::SaveLevel {
-                                is_bid: true,
-                                price: bid_price,
-                                queue: new_queue,
-                                count: count_new,
-                            });
-                        }
+                        close_level(
+                            &mut registry,
+                            true,
+                            bid_price,
+                            new_queue,
+                            count_old.saturating_sub(level_removed),
+                            &mut removed_bids,
+                            &mut bid_levels_cleared,
+                        );
                         break 'outer;
                     }
                     let maker_id = queue[qi];
@@ -2466,28 +2447,15 @@ pub(super) fn match_order<H: PerpHost>(
                     }
                 }
 
-                let count_new = count_old.saturating_sub(level_removed);
-                if count_new == 0 {
-                    registry.push_event(settlement::MatchEvent::RemovePrice {
-                        is_bid: true,
-                        price: bid_price,
-                    });
-                    removed_bids.push(bid_price);
-                    bid_levels_cleared = true;
-                    registry.push_event(settlement::MatchEvent::SaveLevel {
-                        is_bid: true,
-                        price: bid_price,
-                        queue: Vec::new(),
-                        count: 0,
-                    });
-                } else {
-                    registry.push_event(settlement::MatchEvent::SaveLevel {
-                        is_bid: true,
-                        price: bid_price,
-                        queue: new_queue,
-                        count: count_new,
-                    });
-                }
+                close_level(
+                    &mut registry,
+                    true,
+                    bid_price,
+                    new_queue,
+                    count_old.saturating_sub(level_removed),
+                    &mut removed_bids,
+                    &mut bid_levels_cleared,
+                );
             }
             if bid_levels_cleared {
                 // New best bid = max non-removed price in the snapshot (mirrors refresh_best_bid
@@ -3433,7 +3401,7 @@ pub(super) fn release_open_order_margin<H: PerpHost>(
         .ok_or_else(|| perp_invariant_err("cancel: order missing for price lookup"))?;
 
     // Real removal FIRST (in-place on a warm list / one materialize on a cold first-touch) — returns
-    // the cancelled entry (and reproduces remove_order_entry's not-found invariant verbatim). Only
+    // the cancelled entry (or raises the not-found invariant). Only
     // the cancelled side's key is written. Cancel has no reject, so this is a pure apply.
     let cancelled_entry = match side {
         Side::Buy => storage::mutate_buy_orders(context, user, market_id, |list| {
@@ -3508,20 +3476,23 @@ fn remove_entry_from_side_aggregates(
 /// smaller `Bid`/`Ask` it leaves behind. The book entry's `amount` is the authoritative remaining
 /// quantity (kept current by `reduce_order_entry_core`); the order's `filled` can lag it during the
 /// same matching round, so the aggregate is shrunk by the entry, not by `order.quantity - filled`.
+///
+/// `price` is the order's LIMIT price (the list's sort key — never the frozen `assuming_price`). Every
+/// caller has it in hand (the cover loop reads it off the entry it picked, an in-match maker cancel
+/// off the loaded maker `Order`), so the entry is found by binary search to its price run, O(log n),
+/// rather than by an O(n) id scan of the account's whole list.
 pub(super) fn release_open_order_margin_core(
     pos: &mut crate::types::PerpPosition,
     buy_entries: &mut std::collections::VecDeque<OrderEntry>,
     sell_entries: &mut std::collections::VecDeque<OrderEntry>,
     side: Side,
     order_id: &[u8; 32],
+    price: u64,
     market: &crate::types::Market,
 ) -> Result<(), PerpError> {
-    let removed = {
-        let (entries, label) = match side {
-            Side::Buy => (&mut *buy_entries, "buy"),
-            Side::Sell => (&mut *sell_entries, "sell"),
-        };
-        remove_order_entry(entries, order_id, label)?
+    let removed = match side {
+        Side::Buy => remove_order_entry_by_price(buy_entries, order_id, price, true, "buy")?,
+        Side::Sell => remove_order_entry_by_price(sell_entries, order_id, price, false, "sell")?,
     };
     let notional = removed.margin_notional(market.base_decimals, market.price_decimals)?;
     remove_entry_from_side_aggregates(pos, side, removed.amount, notional)

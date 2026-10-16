@@ -309,10 +309,10 @@ impl TakerSettlement {
                         break;
                     }
                     let next = match taker_side {
-                        Side::Buy => sim_buy.back().map(|e| e.order_id),
-                        Side::Sell => sim_sell.back().map(|e| e.order_id),
+                        Side::Buy => sim_buy.back().map(|e| (e.order_id, e.price)),
+                        Side::Sell => sim_sell.back().map(|e| (e.order_id, e.price)),
                     };
-                    let Some(oid) = next else {
+                    let Some((oid, price)) = next else {
                         return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
                     };
                     super::release_open_order_margin_core(
@@ -321,6 +321,7 @@ impl TakerSettlement {
                         &mut sim_sell,
                         taker_side,
                         &oid,
+                        price,
                         market,
                     )?;
                     cancelled_any = true;
@@ -1182,8 +1183,11 @@ impl MatchRegistry {
                 None
             };
             // `Order` for every flushed user: each is in this registry because a matched order
-            // touched them (a maker fill, the taker leg of a self-match, or a fill rejected as
-            // opening-into-insolvency whose order was cancelled).
+            // touched them — a maker fill; the taker of an order that filled at all (it joins in
+            // `finalize_compute`); or a resting order the walk CANCELLED in place
+            // (`cancel_rejected_maker_registry`: a fill rejected as opening-into-insolvency), which
+            // may be the taker's own order on a self-match. The last kind moved no money unless
+            // funding settled at first touch (`get_or_load`).
             storage::save_position(context, user, market_id, &w.pos, AccountUpdateReason::Order)?;
             storage::save_account(context, user, w.account, AccountUpdateReason::Order)?;
             #[cfg(debug_assertions)]
@@ -1336,9 +1340,11 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
 }
 
 /// Registry-backed maker cancel for a `RejectedInsolvent` fill: drops the rejected order from the
-/// registry copies (flushed later) and writes the order status + OrderCancelled log immediately
-/// (same stream positions as before). No money moves — the order held no escrow; removing it from
-/// `Bid`/`Ask` is the whole effect.
+/// registry copies and queues its `DeleteOrder` + `OrderCancelled` as DEFERRED match events. Nothing
+/// is written here — like every other walk effect it lands only when the caller's write barrier
+/// (`MatchOutcome::apply` → [`MatchRegistry::flush`]) replays the queue, at the stream position it
+/// was pushed; a match that is dropped instead discards it with everything else. No money moves —
+/// the order held no escrow; removing it from `Bid`/`Ask` is the whole effect.
 pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
     context: &mut H,
     reg: &mut MatchRegistry,
@@ -1357,15 +1363,18 @@ pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
         &mut w.sell_entries,
         maker_side,
         order_id,
+        // The maker's LIMIT price = the level the walk found it on = its entry's sort key.
+        maker_order.price,
         market,
     )?;
     match maker_side {
         Side::Buy => w.dirty_buy = true,
         Side::Sell => w.dirty_sell = true,
     }
-    // delete-on-terminal: the rejected maker is Cancelled → removed from the map (its id stays in
-    // the level queue and is swept as a stale entry; the match walk decrements the live count for
-    // this reject, so the level's count stays accurate).
+    // delete-on-terminal: the rejected maker is Cancelled → removed from the map. Its id also leaves
+    // the level: the walk simply does not re-queue it into `new_queue` (the level is rewritten from
+    // `new_queue` when the walk closes it), and it counts the departure in `level_removed`, so the
+    // level's live count stays accurate.
     maker_order.status = OrderStatus::Cancelled;
     reg.push_event(MatchEvent::DeleteOrder {
         order_id: *order_id,
