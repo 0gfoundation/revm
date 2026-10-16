@@ -6956,6 +6956,15 @@ mod golden {
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
+    ///
+    /// It does NOT pin the positive-maker fee on a PARTIALLY filled order. That fee is the
+    /// whole-order difference (`entry_fill_plan`), and none of this scenario's positive-rate
+    /// partial fills truncates differently under the difference and under an independent per-fill
+    /// floor. A mutant that switches to the per-fill floor leaves both the commitment and this
+    /// snapshot unchanged. Adding such a fill here would move the snapshot, so the path is pinned
+    /// instead in `fee_spec_tests`, by
+    /// `a_positive_maker_pays_the_whole_order_difference_across_partial_fills` (balances) and
+    /// `a_partially_filled_order_is_rebated_per_fill_on_its_own_floor` (`Trade.makerFee`).
     #[derive(Debug, PartialEq, Eq)]
     struct BusinessSnapshot {
         /// (amount, vQuoteBalance, margin)

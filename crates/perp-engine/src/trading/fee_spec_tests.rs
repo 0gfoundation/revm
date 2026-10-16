@@ -888,6 +888,62 @@ fn a_partially_filled_order_is_rebated_per_fill_on_its_own_floor() {
     }
 }
 
+/// A POSITIVE maker rate keeps the whole-order DIFFERENCE (`entry_fill_plan`, unchanged by the
+/// rebate work), measured in balances, not only in `Trade.makerFee`. The golden `BusinessSnapshot`
+/// cannot catch a regression here: none of its positive-rate partial fills truncates differently
+/// under the two forms. This test is the guard. One order of 3 at the touch, +100 ppm, taken 1 lot
+/// at a time by three separate takers:
+///   * buy side, $100.005: whole-order fees 10_000 / 20_001 / 30_001 at 1 / 2 / 3 lots, so the
+///     fills are charged `10_000, 10_001, 10_000` and their sum, 30_001, is the order's fee;
+///   * sell side, $99.995: 9_999 / 19_999 / 29_998, so `9_999, 10_000, 9_999`, summing to 29_998.
+/// A per-fill floor would charge 30_000 / 29_997 and lose one unit of the order's fee. The maker's
+/// gross wallet falls by exactly the order's fee. The fee recipient and the fee total each grow by
+/// the takers' fees plus that fee, and no unit is created or destroyed.
+#[test]
+fn a_positive_maker_pays_the_whole_order_difference_across_partial_fills() {
+    for side in [BUY, SELL] {
+        let p = levels(side)[0];
+        let mut ctx = fresh();
+        set_fees(&mut ctx, ALICE, 0, 300);
+        set_maker(&mut ctx, BOB, 100);
+        rest(&mut ctx, BOB, 1 - side, p, 3);
+        let b = before(&mut ctx);
+
+        let trades: Vec<Trade> = (0..3)
+            .map(|_| {
+                let t = take(&mut ctx, ALICE, side, 1);
+                assert_eq!(t.len(), 1, "side {side}: one fill per take");
+                t.into_iter().next().unwrap()
+            })
+            .collect();
+
+        let whole = |q: u64| fee(notional(p, q), 100);
+        let want = [whole(3) - whole(2), whole(2) - whole(1), whole(1)];
+        let (order_fee, per_fill_floor) = (whole(3), 3 * fee(notional(p, 1), 100));
+        assert_eq!(order_fee, per_fill_floor + 1, "side {side}: fixture — the two forms disagree");
+        assert_eq!(
+            want,
+            if side == BUY { [10_000, 10_001, 10_000] } else { [9_999, 10_000, 9_999] },
+            "side {side}: the hand-worked difference"
+        );
+        assert_eq!(
+            trades.iter().map(|t| (t.maker, t.makerFee)).collect::<Vec<_>>(),
+            want.iter().map(|&c| (BOB, c as i64)).collect::<Vec<_>>(),
+            "side {side}: each fill pays the whole-order difference"
+        );
+        let taker_fees: u64 = trades.iter().map(|t| t.takerFee).sum();
+        assert_eq!(taker_fees, 3 * fee(notional(p, 1), 300), "side {side}: single-fill takers");
+        let net = taker_fees + order_fee;
+        assert_eq!(
+            b.deltas(&mut ctx),
+            [-(taker_fees as i64), -(order_fee as i64), 0, 0, net as i64],
+            "side {side}: Δwb (ALICE, BOB, CAROL, DAVE, ADMIN)"
+        );
+        assert_eq!(fee_total(&mut ctx) - b.fee_total, net, "side {side}: the fee total");
+        assert_eq!(money(&mut ctx), b.money, "side {side}: conservation");
+    }
+}
+
 /// A FOK taker still self-trades (STP does not apply to it), so one account is both legs: it pays
 /// the taker fee and is credited its own rebate, and the fee recipient nets `F − rebate ≥ 0`.
 #[test]
