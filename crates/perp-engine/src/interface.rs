@@ -585,24 +585,27 @@ sol! {
             int64  interestRate,
             uint32 liquidationFeeRateBps
         );
-        /// Drain the work a previous sweep left behind — the band GC and the liquidation sweep,
+        /// Drain the work a previous sweep left behind — the band GC, the conditional-order
+        /// triggers (fixed and trailing), trailing-stop activations and the liquidation sweep,
         /// nothing else. **PERMISSIONLESS**: any caller, no admin or oracle role.
         ///
         /// # Why it exists
         ///
-        /// Both sweeps are capped per run (50 liquidations, 128 ADL fills, 64 band expiries) and
-        /// their overflow is deferred, not recorded — the next run re-derives its candidates from
-        /// scratch. But they only run inside `updateIndexPrice`, which is itself rate-limited to one
-        /// effective call per `priceUpdateInterval`, so a backlog drained at most once per interval
-        /// however deep it was. This decouples the two: the backlog can be drained every block.
+        /// Every sweep is capped per run (50 actions shared by trigger fires and liquidations, 64
+        /// trailing activations, 128 ADL fills, 64 band expiries) and its overflow is deferred,
+        /// not recorded — the next run re-derives its candidates from scratch. But they only run
+        /// inside `updateIndexPrice`, which is itself rate-limited to one effective call per
+        /// `priceUpdateInterval`, so a backlog drained at most once per interval however deep it
+        /// was. This decouples the two: the backlog can be drained every block.
         ///
         /// # What it does NOT do
         ///
         /// No index price, no mark recompute, no premium-index sample, no funding, no
         /// `MarkPriceUpdated`. Running those a second time between oracle ticks would double-count
-        /// the funding epoch. It reuses the mark already stored, which has not moved since the tick
-        /// that set it — so the band centre and the maintenance check are the same ones the sweep
-        /// would have used had it not run out of budget.
+        /// the funding epoch. Trailing stops' best marks are folded again but cannot move: the
+        /// mark is the one the tick already folded in. It reuses the mark already stored, which
+        /// has not moved since the tick that set it — so the band centre and the maintenance check
+        /// are the same ones the sweep would have used had it not run out of budget.
         ///
         /// # Returns
         ///
@@ -616,6 +619,12 @@ sol! {
         /// the same bounded work a sweep does, and because every unit of that budget is permanent
         /// progress, repeated calls cannot be spun for unbounded work: they drain the backlog and
         /// then become no-ops.
+        ///
+        /// For TRAILING STOPS this call is load-bearing rather than a nicety: stops with one
+        /// callback rate share the market's best mark, so they cross TOGETHER, and a crash
+        /// routinely fires more than one tick's budget. Fires are not latched (see
+        /// `placeAlgoOrder`), so any a keeper does not drain before the next tick are re-tested
+        /// at the next mark — and skipped if it bounced.
         ///
         /// ⚠️ A `false` return is NOT a proof the market is clean. The flag only records that a
         /// sweep hit a CAP; work can appear with no cap ever being hit — funding accrual alone
@@ -648,9 +657,8 @@ sol! {
         ///   algos; the field is carried so adding those later needs no new selector.
         ///
         /// orderType: 0 STOP, 1 STOP_MARKET, 2 TAKE_PROFIT, 3 TAKE_PROFIT_MARKET,
-        ///   4 TRAILING_STOP_MARKET — `triggerPrice` = activation price (0 = now), `price` =
-        ///   callback rate in bps (10..=1000, step 10), reduceOnly required.
-        ///   * the `_MARKET` pair takes the book at trigger; any remainder the fill-time price band
+        ///   4 TRAILING_STOP_MARKET (see "Trailing stops" below).
+        ///   * the `_MARKET` types take the book at trigger; any remainder the fill-time price band
         ///     will not let through **EXPIRES** (Binance parity — a market order means "now or not
         ///     at all", and Binance expires the unfilled part for the same reason).
         ///   * the limit pair RESTS at `price` and survives until filled or cancelled. The two
@@ -668,7 +676,69 @@ sol! {
         ///   refused with `placeAlgoOrder: order would immediately trigger` (Binance `-2021`).
         ///   Equality counts as satisfied, exactly as at the sweep. Before the first oracle tick
         ///   the stored mark is the market's `initialMarkPrice` (`addMarket` refuses 0; a zero mark
-        ///   would skip the check, as the price band does).
+        ///   would skip the check, as the price band does). A trailing stop's `triggerPrice` is its
+        ///   ACTIVATION price instead — see below.
+        ///
+        /// Trailing stops (orderType 4, Binance `TRAILING_STOP_MARKET`):
+        ///   * `triggerPrice` = the ACTIVATION price: a SELL activates once mark >= it, a BUY once
+        ///     mark <= it (reaching it counts). 0 = activate NOW, at the stored mark — Binance's
+        ///     "default: the latest price"; the order then records that mark as its activation
+        ///     price (`AlgoOrderPlaced.triggerPrice`, `getAlgoOrder.triggerPrice`), and
+        ///     `AlgoOrderActivated` follows `AlgoOrderPlaced` in the same transaction. A non-zero
+        ///     activation price must be a multiple of tickSize and NOT already reached by the
+        ///     stored mark: `placeAlgoOrder: order would immediately trigger` (Binance `-2021` for
+        ///     an activatePrice on the wrong side). Send 0 to activate now.
+        ///   * `price` = the CALLBACK RATE in basis points, i.e. Binance's `callbackRate` × 100:
+        ///     10 (0.1 %) to 1000 (10 %) in steps of 10. Anything else: `placeAlgoOrder:
+        ///     callbackRate (price) must be 10..=1000 bps in steps of 10`.
+        ///   * Activated, it tracks the BEST mark since activation — the highest for a SELL (`H`),
+        ///     the lowest for a BUY (`L`) — and fires when
+        ///         SELL:  mark <= H × (1 − callbackRate)      BUY:  mark >= L × (1 + callbackRate)
+        ///     evaluated EXACTLY (integer cross-multiplication, no rounding) and inclusively. It
+        ///     cannot fire on the tick it activates or makes a new best: its stop is then strictly
+        ///     beyond the mark. At trigger it becomes a reduce-only MARKET order (implicitly IOC,
+        ///     inheriting the STP mode) for `quantity`, bounded by |position|; whatever the band
+        ///     blocks EXPIRES, as for STOP_MARKET.
+        ///   * The REPORTED stop (`AlgoOrderActivated.stopPrice`,
+        ///     `AlgoOrderTriggered.triggerPrice`, `getAlgoOrder.currentStop`) is that threshold
+        ///     rounded onto the tick grid AWAY from the mark (down for a SELL, up for a BUY). A mark is on the grid, so it fires exactly
+        ///     when the mark reaches the reported stop. On a low-priced market where `H ×
+        ///     callbackRate` is under a tick, the stop moves in whole ticks: the effective callback
+        ///     is coarser than asked, never finer — it never fires early.
+        ///   * `quantity` is required (> 0, a multiple of stepSize, ≤ maxQuantity, no minQuantity —
+        ///     the reduce-only exemption); `tif` and `workingType` must be 0. flags: reduceOnly is
+        ///     REQUIRED (`placeAlgoOrder: TRAILING_STOP_MARKET requires reduceOnly`) and
+        ///     closePosition REFUSED (`placeAlgoOrder: closePosition is not supported for
+        ///     TRAILING_STOP_MARKET` — Binance offers it only on STOP_MARKET / TAKE_PROFIT_MARKET);
+        ///     the STP bits as for every conditional.
+        ///   * It is BOUND TO THE POSITION like a closePosition order (next paragraph but one):
+        ///     placement needs an open position with `side` its closing side (`placeAlgoOrder:
+        ///     TRAILING_STOP_MARKET requires an open position on the closing side`), and once that
+        ///     position has gone flat or flipped the order is spent with `AlgoOrderCancelled`
+        ///     reason 11 — when it would have ACTIVATED (that event alone: it never triggered), or
+        ///     when it FIRES (`AlgoOrderTriggered`, then reason 11, nothing placed).
+        ///   * ⚠️ SAMPLING — a deliberate divergence. The best mark is taken over the STORED mark,
+        ///     written once per oracle tick (`priceUpdateInterval`, 15 s on our markets) as
+        ///     `median(price1, price2, contract)`; Binance trails `CONTRACT_PRICE` continuously by
+        ///     default. A spike or dip between two ticks is invisible here, and a gap through the
+        ///     stop fires at the gapped mark. In exchange the trail is public data: a consumer
+        ///     reconstructs it exactly as `H = max(AlgoOrderActivated.markPrice, every later
+        ///     MarkPriceUpdated.markPrice of the market)` (min for a BUY). There is no per-tick
+        ///     event.
+        ///   * ⚠️ NOT LATCHED, like every conditional here. Fires share the oracle tick's
+        ///     50-action budget with the fixed conditionals (served first) and the liquidation
+        ///     sweep; activations have a cap of their own (64), so crossings that need no position
+        ///     cannot starve stop-losses or liquidations. Overflow sets the deferred-work flag and
+        ///     `drainDeferredWork` finishes it at the SAME mark — for trailing stops, which cross
+        ///     together, overflow is the normal case, so keepers should drain. A fire nobody drains
+        ///     before the next tick is re-tested at that tick's mark: if the mark bounced back
+        ///     above the stop it does not fire (Binance would have) and keeps trailing from the
+        ///     same best mark. An activation carried past a tick activates at that tick's mark if
+        ///     the price is still reached, and otherwise keeps waiting. The best mark itself is
+        ///     never deferred.
+        ///   * Cancelled like any conditional (`cancelAlgoOrder`, liquidation / ADL cancel-all),
+        ///     pending or activated. Cost per tick does not grow with the number of trailing
+        ///     orders (see the `trailing` module for the bound).
         ///
         /// workingType: must be 0 (`MARK_PRICE`). ⚠️ Binance's DEFAULT is `CONTRACT_PRICE` (the
         ///   last trade), so a client ported from Binance that omits the field is relying on
@@ -689,9 +759,13 @@ sol! {
         ///   `AlgoOrderCancelled` reason 11, nothing placed. The check is LAZY (closing a position
         ///   touches no order), so until then the dead order still lists in `getOpenAlgoOrders`
         ///   and counts toward the caps; cancel it to free the slot sooner. There is no
-        ///   one-per-direction limit.
+        ///   one-per-direction limit. A trailing stop is bound the same way (above).
+        ///   There is no one-shot "close my position now" conditional either, and none is needed:
+        ///   a reduce-only MARKET `placeOrder` with `quantity ≥ |position|` closes the whole
+        ///   position at once (it is truncated to |position| — see `placeOrder` flags bit 0).
         ///
-        /// price: the resting price for the limit pair; must be 0 for the `_MARKET` pair.
+        /// price: the resting price for the limit pair; the callback rate in bps for
+        ///   TRAILING_STOP_MARKET; must be 0 for STOP_MARKET / TAKE_PROFIT_MARKET.
         /// tif: applies to the limit pair only.
         /// clientAlgoId: caller-assigned tracking id, emitted but not stored. bytes16(0) if unused.
         /// flags: bit 0 reduceOnly, bit 1 closePosition, bits 3:2 self-trade-prevention mode
@@ -723,7 +797,10 @@ sol! {
         /// cancel it with `cancelOrder`. There is no modify: Binance's Algo API has none either.
         function cancelAlgoOrder(bytes32 algoId, uint64 marketId) external;
 
-        /// Full record of a conditional order, triggered or not.
+        /// Full record of an UNTRIGGERED conditional order (a triggered one is an ordinary order:
+        /// `getOrder`). The fields echo `placeAlgoOrder`'s: for TRAILING_STOP_MARKET (orderType 4)
+        /// `triggerPrice` is the effective activation price (the stored mark at placement when 0
+        /// was sent) and `price` the callback rate in bps.
         function getAlgoOrder(bytes32 algoId) external view returns (
             address owner,
             uint64 marketId,
@@ -740,11 +817,17 @@ sol! {
             /// Appended last; every field of the tuple is static, so a decoder for the older
             /// eleven-field tuple still reads the first eleven unchanged.
             uint8 selfTradePreventionMode,
-            /// TRAILING_STOP_MARKET only (0 / false / 0 / 0 otherwise). Appended after the
-            /// twelve above, all static, so older decoders are unaffected.
+            /// The four below are TRAILING_STOP_MARKET only — 0 / false / 0 / 0 for every other
+            /// type. Appended after the twelve above, all static, so older decoders are
+            /// unaffected. `callbackRateBps`: the callback rate (= `price` for this type).
             uint16 callbackRateBps,
+            /// `false` while it waits for its activation price.
             bool activated,
+            /// The best SAMPLED mark since activation (highest for a SELL, lowest for a BUY); 0
+            /// while pending. Derived on read — no per-order peak is stored.
             uint64 peakPrice,
+            /// The stop it fires at now, rounded onto the tick grid away from the mark (see
+            /// `placeAlgoOrder`); 0 while pending.
             uint64 currentStop
         );
 
@@ -1780,16 +1863,30 @@ sol! {
         /// `flags` is the byte as SENT (bit 0 reduceOnly, bit 1 closePosition, bits 3:2 STP mode).
         /// Each STP mode has one encoding, so its bits 3:2 equal those of the fired order's
         /// `OrderPlaced.flags` — the mode the trigger inherits.
+        ///
+        /// For TRAILING_STOP_MARKET (`orderType` 4): `triggerPrice` is the effective activation
+        /// price — the stored mark when it was sent as 0, in which case `AlgoOrderActivated`
+        /// follows in the same transaction — and `price` the callback rate in bps.
         event AlgoOrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint8 side, uint8 orderType, uint64 triggerPrice, uint64 price, uint64 quantity, uint8 tif, bytes16 clientAlgoId, uint8 flags);
 
         /// The trigger fired. `markPrice` is the mark that fired it — NOT `triggerPrice`, so the
         /// gap between the two (how far the mark jumped past the trigger in one update) is visible
-        /// on the wire rather than something a consumer has to infer.
+        /// on the wire rather than something a consumer has to infer. For a trailing stop
+        /// `triggerPrice` is the stop that fired (tick-rounded, as `getAlgoOrder.currentStop`), not
+        /// the activation price it was placed with.
         event AlgoOrderTriggered(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint64 triggerPrice, uint64 markPrice);
 
-        /// A TRAILING_STOP_MARKET order activated: from here it trails the best mark since this
-        /// tick, starting at `markPrice`, and `stopPrice` is its first stop. Emitted once per
-        /// order — in the placement transaction when it was placed with activation price 0.
+        /// A TRAILING_STOP_MARKET order activated — Binance's `ALGO_UPDATE` `ia` turning true.
+        /// From here it trails the best mark since this tick, starting at `markPrice` (the mark of
+        /// the tick that activated it, which after a gap can be well past the activation price),
+        /// and `stopPrice` is its first stop (tick-rounded). Emitted ONCE per order: in the
+        /// placement transaction when it was placed with activation price 0, else in the
+        /// `updateIndexPrice` (or `drainDeferredWork`) that reached the activation price.
+        ///
+        /// There is no event when the stop moves — that would be one log per order per tick in a
+        /// trend. It needs none: `best = max(markPrice, every later MarkPriceUpdated.markPrice)`
+        /// (min for a BUY) and the stop formula in `placeAlgoOrder` reproduce it exactly, and
+        /// `getAlgoOrder` reports both.
         event AlgoOrderActivated(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint64 markPrice, uint64 stopPrice);
 
         /// A conditional order was removed. `reason` shares the `CancelReason` space with
@@ -1801,8 +1898,12 @@ sol! {
         ///   * 10 (`TriggerRejected`) — the matcher refused the ordinary order it became: an
         ///     unfillable FOK, a crossing PostOnly, a refused rest. Binance's `ALGO_UPDATE`
         ///     `REJECTED` ("denied by the matching engine");
-        ///   * 11 (`PositionClosed`) — a closePosition order whose position went flat or flipped
-        ///     after it was placed (even if a new one is open now): Binance's `GTE_GTC` `EXPIRED`.
+        ///   * 11 (`PositionClosed`) — a position-bound order (closePosition, or a trailing stop)
+        ///     whose position went flat or flipped after it was placed (even if a new one is open
+        ///     now): Binance's `GTE_GTC` `EXPIRED`.
+        /// A trailing stop still WAITING for its activation price can also be spent with 11, when
+        /// that price is reached: then no `AlgoOrderTriggered` precedes it, since it never
+        /// triggered (nor activated).
         event AlgoOrderCancelled(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint8 reason);
 
         // Emitted when a limit order rests in the book (after any immediate fills).
@@ -1849,8 +1950,9 @@ sol! {
         // an ADL counterparty, 9 = self-trade prevention (a same-address GTC / IOC / market taker
         // whose mode is EXPIRE_MAKER or EXPIRE_BOTH met this order; its WHOLE remaining quantity is
         // cancelled — the stream's `X = EXPIRED_IN_MATCH`), 10 = a triggered conditional order was
-        // rejected by the matcher, 11 = a triggered closePosition order's position had closed or
-        // flipped since placement (10 and 11 on `AlgoOrderCancelled` only).
+        // rejected by the matcher, 11 = a position-bound conditional's (closePosition or trailing
+        // stop) position had closed or flipped since placement (10 and 11 on `AlgoOrderCancelled`
+        // only).
         //
         // Without it this event was byte-identical for a user cancel and a protocol kill (three
         // indexed fields, no data) and — under delete-on-terminal — `getOrder` answers "not found"
