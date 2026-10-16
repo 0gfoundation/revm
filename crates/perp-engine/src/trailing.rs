@@ -1272,3 +1272,9 @@ pub(crate) fn view<H: PerpHost>(
 #[cfg(test)]
 #[path = "trailing_tests.rs"]
 mod tests;
+
+/// The `fire()` capacity fix, closePosition parity and trailing stops, written independently from
+/// the spec rather than from this implementation (or its `tests`).
+#[cfg(test)]
+#[path = "trailing_spec_tests.rs"]
+mod spec_tests;
