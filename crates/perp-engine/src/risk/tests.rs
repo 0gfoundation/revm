@@ -6858,8 +6858,10 @@ mod algo_order_admission {
             flags: RO,
         };
         bad(&mut ctx, placeAlgoOrderCall { algoType: 1, ..base.clone() }, "CONDITIONAL");
-        // TRAILING_STOP_MARKET is roadmap 1d; rejected by name so the gap is legible.
-        bad(&mut ctx, placeAlgoOrderCall { orderType: 4, ..base.clone() }, "orderType");
+        // 4 is TRAILING_STOP_MARKET now; past it, nothing. A trailing stop's `price` slot is its
+        // callback rate, so this one's `price: 0` is what is refused (see `trailing::tests`).
+        bad(&mut ctx, placeAlgoOrderCall { orderType: 5, ..base.clone() }, "invalid orderType");
+        bad(&mut ctx, placeAlgoOrderCall { orderType: 4, ..base.clone() }, "callbackRate");
         bad(&mut ctx, placeAlgoOrderCall { triggerPrice: 0, ..base.clone() }, "triggerPrice");
         bad(&mut ctx, placeAlgoOrderCall { flags: 0, ..base.clone() }, "reduceOnly or closePosition");
         // Bits 3:2 are the STP mode now, so 0b1000 alone is a legal mode with no reduce-only bit —

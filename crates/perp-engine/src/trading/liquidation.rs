@@ -67,6 +67,7 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         stp: StpMode::default(),
         // Not a conditional order, so bound to no position.
         position_generation: 0,
+        trail_bps: 0,
     };
     // commit-only #23: the close order is persisted ONCE after matching (below); the
     // OrderPlaced log keeps its original position (logs are EVM-journaled).

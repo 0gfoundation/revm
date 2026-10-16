@@ -303,6 +303,19 @@ use primitives::{B256, U256};
 //     only by the two fields' bytes — VERIFIED: with both `#[serde(skip)]` it reproduced the
 //     previous 38 pin 0x720411d8…e3e0. BusinessSnapshot UNCHANGED. CHAIN change: golden re-pin +
 //     a coordinated wipe on deploy.
+//   * TRAILING_STOP_MARKET (`orderType = 4`). A LAYOUT change: `Order` gains a trailing "tb"
+//     (`trail_bps`, u16, 0 = not trailing), so every order blob grows by one byte. Seven NEW key
+//     families (`trlm` meta, `trls` stack pages, `trld` directory, `trlb` buckets, `trlo` links,
+//     `tpnp`/`tpnl` pending index; all raw packed bytes) enter the delta of any block that places,
+//     activates, fires or cancels a trailing stop, and every oracle tick of a market that has one.
+//     New execution rules, all reachable only through the new order type: the unbudgeted stack
+//     step, the trailing fire walk on the shared sweep budget after the fixed triggers, the
+//     activation walk on its own 64 cap, and `AlgoOrderActivated`. A node on the previous 38
+//     refuses `orderType = 4` that this node accepts. The golden scenario places no trailing stop,
+//     so its write set differs only by the "tb" byte (each oracle tick reads the absent `trlm` and
+//     writes nothing) — VERIFIED: with the field `#[serde(skip)]` it reproduced the previous 38 pin
+//     0xa72ce19d…d940. BusinessSnapshot UNCHANGED. CHAIN change: golden re-pin + a coordinated
+//     wipe on deploy.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 38;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

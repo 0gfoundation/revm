@@ -51,6 +51,18 @@
 //!   Binance's own recipe. Pinned by
 //!   `trading::tests::reduce_only_e2e::a_market_reduce_only_order_is_still_truncated_to_the_position`.
 //!
+//! # Trailing stops
+//!
+//! `TRAILING_STOP_MARKET` (`orderType = 4`) shares this selector, the record, both caps, the owner's
+//! list, every cancel path and `fire()` — but not the trigger index. Its trigger MOVES with the best
+//! mark since activation, so it lives in the per-market structure in [`crate::trailing`], which
+//! documents the semantics, the invariants and the per-tick work bound. `triggerPrice` is the
+//! activation price (0 = activate now, at the stored mark), `price` the callback rate in basis
+//! points (10..=1000, step 10). Reduce-only is REQUIRED and closePosition REFUSED (Binance offers
+//! it only on the `_MARKET` stop pair). It is position-bound like a closePosition order: placement
+//! needs an open position on its closing side, and it is spent with `PositionClosed` if that
+//! position ended — checked when it activates and when it fires.
+//!
 //! # Every conditional order is refused if it would fire NOW
 //!
 //! Binance `-2021` "Order would immediately trigger": at placement, the sweep's own predicate
@@ -132,6 +144,9 @@ struct ValidatedAlgo {
     close_position: bool,
     /// Inherited by the ordinary order the trigger produces.
     stp: StpMode,
+    /// `TRAILING_STOP_MARKET`'s callback rate in bps; 0 for every other type. For a trailing order
+    /// `trigger_price` is the activation price as SENT — 0 means "activate now at the stored mark".
+    trail_bps: u16,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -159,10 +174,12 @@ fn validate(
         ));
     }
     let side = Side::from_u8(side).ok_or_else(|| perp_err("placeAlgoOrder: invalid side"))?;
-    let kind = AlgoOrderType::from_u8(order_type).ok_or_else(|| {
-        perp_err("placeAlgoOrder: invalid orderType (TRAILING_STOP_MARKET is not supported)")
-    })?;
-    if trigger_price == 0 {
+    let kind = AlgoOrderType::from_u8(order_type)
+        .ok_or_else(|| perp_err("placeAlgoOrder: invalid orderType"))?;
+    let trailing = kind == AlgoOrderType::TrailingStopMarket;
+    // A trailing stop's `triggerPrice` is its ACTIVATION price, and 0 is meaningful there:
+    // "activate now, at the stored mark" (Binance's default activatePrice = the latest price).
+    if trigger_price == 0 && !trailing {
         return Err(perp_err("placeAlgoOrder: triggerPrice must be non-zero"));
     }
     if trigger_price % market.tick_size != 0 {
@@ -184,6 +201,20 @@ fn validate(
         return Err(perp_err(
             "placeAlgoOrder: reduceOnly cannot be sent with closePosition",
         ));
+    }
+
+    // TRAILING_STOP_MARKET: reduceOnly REQUIRED, closePosition REFUSED — Binance offers
+    // closePosition only on STOP_MARKET / TAKE_PROFIT_MARKET. Relaxing either later is a change
+    // here alone: `fire` already sizes a closePosition order from the position.
+    if trailing {
+        if close_position {
+            return Err(perp_err(
+                "placeAlgoOrder: closePosition is not supported for TRAILING_STOP_MARKET",
+            ));
+        }
+        if !reduce_only {
+            return Err(perp_err("placeAlgoOrder: TRAILING_STOP_MARKET requires reduceOnly"));
+        }
     }
 
     // Phase scope — see the module docs for why this restriction removes a whole failure class
@@ -208,7 +239,18 @@ fn validate(
         return Err(perp_err("placeAlgoOrder: quantity must be non-zero"));
     }
 
-    if is_market {
+    if trailing {
+        // `price` carries the CALLBACK RATE in basis points (Binance's `callbackRate` × 100):
+        // 0.1 %–10 % in 0.1 % steps, the grid that bounds the bucket directory at 100 entries.
+        if !crate::trailing::valid_callback(price) {
+            return Err(perp_err(
+                "placeAlgoOrder: callbackRate (price) must be 10..=1000 bps in steps of 10",
+            ));
+        }
+        if tif != 0 {
+            return Err(perp_err("placeAlgoOrder: tif is unused for a *_MARKET type, send 0"));
+        }
+    } else if is_market {
         if price != 0 {
             return Err(perp_err("placeAlgoOrder: price must be 0 for a *_MARKET type"));
         }
@@ -251,9 +293,23 @@ fn validate(
     // through the ABI — `addMarket` refuses `initialMarkPrice == 0` and the oracle path floors every
     // mark component at 1 — so before the first oracle tick the reference is simply the market's
     // `initialMarkPrice`, and only a hand-built fixture can carry 0.
+    //
+    // For a trailing stop the same predicate reads the ACTIVATION price in the activation
+    // direction (`AlgoOrderType::trigger_up`): a SELL whose activation price the mark already
+    // reaches is refused, which is Binance's `-2021` for an activatePrice on the wrong side. Send 0
+    // to activate now instead.
     let trigger_up = kind.trigger_up(side);
-    if market.mark_price != 0 && trigger_fires(trigger_up, trigger_price, market.mark_price) {
+    if trigger_price != 0
+        && market.mark_price != 0
+        && trigger_fires(trigger_up, trigger_price, market.mark_price)
+    {
         return Err(perp_err("placeAlgoOrder: order would immediately trigger"));
+    }
+    // Activating now needs a mark to seed the peak with. Unreachable through the ABI, as above.
+    if trailing && trigger_price == 0 && market.mark_price == 0 {
+        return Err(perp_err(
+            "placeAlgoOrder: no mark price to activate a trailing stop at",
+        ));
     }
 
     Ok(ValidatedAlgo {
@@ -267,15 +323,18 @@ fn validate(
         reduce_only,
         close_position,
         stp,
+        trail_bps: if trailing { price as u16 } else { 0 },
     })
 }
 
 /// Shared tail: write the record, index it, emit. `algo_id` is already derived and, on the signed
 /// path, its signature already burned.
+#[allow(clippy::too_many_arguments)]
 fn place_core<H: PerpHost>(
     context: &mut H,
     account: Address,
     market_id: u64,
+    market: &crate::types::Market,
     algo_id: [u8; 32],
     v: ValidatedAlgo,
     client_algo_id: FixedBytes<16>,
@@ -294,11 +353,28 @@ fn place_core<H: PerpHost>(
         return Err(perp_err("placeAlgoOrder: max open orders reached"));
     }
 
+    // A trailing stop with activation price 0 activates NOW, at the stored mark and its seq
+    // (`IndexPriceState.timestamp`, 0 before the first oracle tick). Its record carries that mark
+    // as the effective activation price, so `trigger_price` is never 0 for a conditional.
+    let trailing = v.trail_bps != 0;
+    let activate_at = if trailing && v.trigger_price == 0 {
+        Some(storage::load_index_price_state(context, market_id)?.timestamp)
+    } else {
+        None
+    };
+    let trigger_price = if activate_at.is_some() {
+        market.mark_price
+    } else {
+        v.trigger_price
+    };
+
     let mut order = Order {
         owner: account.0 .0,
         market_id,
         side: v.side,
-        price: v.price,
+        // A trailing stop's `price` slot carried its callback rate, which lives in `trail_bps`;
+        // what it becomes at trigger is a market order, whose record price is 0.
+        price: if trailing { 0 } else { v.price },
         quantity: v.quantity,
         filled: 0,
         // The ORDINARY type the trigger will produce — a conditional order is not a third kind of
@@ -311,37 +387,43 @@ fn place_core<H: PerpHost>(
         tif: v.tif,
         status: OrderStatus::Open,
         reduce_only: v.reduce_only,
-        trigger_price: v.trigger_price,
+        trigger_price,
         trigger_up: v.trigger_up,
         close_position: v.close_position,
         stp: v.stp,
         // Set below, for a position-bound order only.
         position_generation: 0,
+        trail_bps: v.trail_bps,
     };
 
     // ── Position binding (Binance `GTE_GTC`) ─────────────────────────────────────────────────────
     //
-    // A position-bound order (`Order::is_position_bound` — a closePosition one) belongs to the
-    // position that is open NOW: it is refused unless one is open and the order is on its closing
-    // side, and it records which life of the position that is. When it fires, `fire` compares that
-    // against the position's current `generation`; if the position went flat or flipped in between
-    // — even if a new one has since been opened the same way — the order is spent with
-    // `PositionClosed` instead of closing a position it was never placed against. That comparison
-    // is the whole expiry, so closing a position costs nothing extra.
+    // A position-bound order (`Order::is_position_bound` — a closePosition one or a trailing
+    // stop) belongs to the position that is open NOW: it is refused unless one is open and the
+    // order is on its closing side, and it records which life of the position that is. When it
+    // fires, `fire` compares that against the position's current `generation`; if the position
+    // went flat or flipped in between — even if a new one has since been opened the same way —
+    // the order is spent with `PositionClosed` instead of closing a position it was never placed
+    // against. That comparison is the whole expiry, so closing a position costs nothing extra. A
+    // trailing stop is compared once more, when it activates (`trailing::run_activation_sweep`).
     //
     // Still pre-write: the position is only read.
     if order.is_position_bound() {
         let pos = storage::load_position_ref(context, account, market_id)?;
         if crate::reduce_only::closing_side(&pos) != Some(v.side) {
-            return Err(perp_err(
-                "placeAlgoOrder: closePosition requires an open position on the closing side",
-            ));
+            return Err(perp_err(if trailing {
+                "placeAlgoOrder: TRAILING_STOP_MARKET requires an open position on the closing side"
+            } else {
+                "placeAlgoOrder: closePosition requires an open position on the closing side"
+            }));
         }
         order.position_generation = pos.generation;
     }
 
     storage::save_order(context, &algo_id, &order)?;
-    storage::algo_index_insert(context, market_id, v.trigger_up, v.trigger_price, algo_id)?;
+    if !trailing {
+        storage::algo_index_insert(context, market_id, v.trigger_up, v.trigger_price, algo_id)?;
+    }
     live.push(algo_id);
     storage::save_user_algo_orders(context, account, market_id, &live)?;
 
@@ -353,7 +435,9 @@ fn place_core<H: PerpHost>(
             algoId: FixedBytes(algo_id),
             side: v.side as u8,
             orderType: v.kind as u8,
-            triggerPrice: v.trigger_price,
+            // The EFFECTIVE activation price for a trailing stop sent with 0 (the stored mark it
+            // activated at), so the event and `getAlgoOrder` agree.
+            triggerPrice: trigger_price,
             price: v.price,
             quantity: v.quantity,
             tif: v.tif as u8,
@@ -362,11 +446,16 @@ fn place_core<H: PerpHost>(
         }
         .to_log_data(),
     });
+    // After `AlgoOrderPlaced`, so an immediate activation's `AlgoOrderActivated` follows it.
+    if trailing {
+        crate::trailing::place(context, market_id, market, &algo_id, &order, activate_at)?;
+    }
     Ok(Bytes::from(FixedBytes::<32>(algo_id).to_vec()))
 }
 
-/// Remove an untriggered conditional order from both indexes and delete it. Idempotent in the
-/// index, so cancel / cancel-all / the sweep may all reach the same id.
+/// Remove an untriggered conditional order from its trigger index (the fixed one, or the trailing
+/// structure) and from the owner's list, and delete it. Idempotent in the index, so cancel /
+/// cancel-all / the sweep may all reach the same id.
 pub(crate) fn remove_algo_order<H: PerpHost>(
     context: &mut H,
     account: Address,
@@ -375,13 +464,29 @@ pub(crate) fn remove_algo_order<H: PerpHost>(
     order: &Order,
     reason: CancelReason,
 ) -> Result<(), PerpError> {
-    storage::algo_index_remove(
-        context,
-        market_id,
-        order.trigger_up,
-        order.trigger_price,
-        algo_id,
-    )?;
+    if order.is_trailing() {
+        crate::trailing::remove(context, market_id, algo_id, order)?;
+    } else {
+        storage::algo_index_remove(
+            context,
+            market_id,
+            order.trigger_up,
+            order.trigger_price,
+            algo_id,
+        )?;
+    }
+    retire_algo_order(context, account, market_id, algo_id, reason)
+}
+
+/// The tail every removal of an untriggered conditional shares, once it is out of its trigger
+/// index: off the owner's list, record deleted, `AlgoOrderCancelled(reason)`.
+pub(crate) fn retire_algo_order<H: PerpHost>(
+    context: &mut H,
+    account: Address,
+    market_id: u64,
+    algo_id: &[u8; 32],
+    reason: CancelReason,
+) -> Result<(), PerpError> {
     let mut live = storage::load_user_algo_orders(context, account, market_id)?;
     live.retain(|id| id != algo_id);
     storage::save_user_algo_orders(context, account, market_id, &live)?;
@@ -425,7 +530,8 @@ pub fn run_place_algo_order<H: PerpHost>(
         &market,
     )?;
     let (algo_id, bumped) = crate::trading::peek_order_id(context, caller)?;
-    let out = place_core(context, caller, a.marketId, algo_id, v, a.clientAlgoId, a.flags)?;
+    let out =
+        place_core(context, caller, a.marketId, &market, algo_id, v, a.clientAlgoId, a.flags)?;
     // The nonce bump is persisted only once the placement has succeeded, exactly as on
     // `placeOrder`. It used to be written BEFORE `place_core`, so `place_core`'s two capacity
     // rejects fired after a perp write — a commit-only #23 leak (the nonce advanced under a reverted
@@ -480,7 +586,19 @@ pub fn run_get_algo_order<H: PerpHost>(
     if o.trigger_price == 0 {
         return Err(perp_err("getAlgoOrder: not a conditional order"));
     }
-    let kind = if o.order_type == OrderType::Market {
+    // Branch on the trailing marker FIRST: by `(order_type, trigger_up)` alone a trailing SELL
+    // (market, activates upward) would read as a TAKE_PROFIT_MARKET.
+    let trail = if o.is_trailing() {
+        let tick = storage::load_market_ref(context, o.market_id)?
+            .map(|m| m.tick_size)
+            .unwrap_or(0);
+        crate::trailing::view(context, o.market_id, &a.algoId.0, &o, tick)?
+    } else {
+        crate::trailing::TrailView::default()
+    };
+    let kind = if o.is_trailing() {
+        AlgoOrderType::TrailingStopMarket
+    } else if o.order_type == OrderType::Market {
         if o.trigger_up == matches!(o.side, Side::Buy) {
             AlgoOrderType::StopMarket
         } else {
@@ -498,13 +616,18 @@ pub fn run_get_algo_order<H: PerpHost>(
             side: o.side as u8,
             orderType: kind as u8,
             triggerPrice: o.trigger_price,
-            price: o.price,
+            // As placed: a trailing stop's `price` slot is its callback rate.
+            price: if o.is_trailing() { o.trail_bps as u64 } else { o.price },
             quantity: o.quantity,
             tif: o.tif as u8,
             status: o.status as u8,
             reduceOnly: o.reduce_only,
             closePosition: o.close_position,
             selfTradePreventionMode: o.stp as u8,
+            callbackRateBps: o.trail_bps,
+            activated: trail.activated,
+            peakPrice: trail.peak,
+            currentStop: trail.stop,
         },
     )))
 }
@@ -614,15 +737,14 @@ pub fn run_place_algo_order_signed<H: PerpHost>(
     let _ = crate::trading::gc_seen_buckets_best_effort(context, a.timestamp);
     let burn_writes = context.perp_write_count() - writes_before_burn;
 
-    place_core(context, a.account, a.marketId, algo_id, v, a.clientAlgoId, a.flags).map_err(|e| {
-        match e {
+    place_core(context, a.account, a.marketId, &market, algo_id, v, a.clientAlgoId, a.flags)
+        .map_err(|e| match e {
             PerpError::Reject(msg) => PerpError::RejectAfterRetainedWrite {
                 message: msg,
                 sanctioned_writes: burn_writes,
             },
             other => other,
-        }
-    })
+        })
 }
 
 /// `cancelAlgoOrderSigned(...)`
@@ -757,7 +879,7 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
                 if order.trigger_price == 0 {
                     continue; // already triggered; not ours any more
                 }
-                fire(context, market_id, market, mark_price, &algo_id, &order)?;
+                fire(context, market_id, market, mark_price, &algo_id, &order, FireFrom::Index)?;
                 *budget -= 1;
             }
         }
@@ -768,6 +890,32 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
     // market path, and one the matcher REFUSED is cancelled (`TriggerRejected`) — each a final
     // outcome (the Binance-parity one), not a backlog.
     Ok(false)
+}
+
+/// Where a fired order came from — which decides who takes it out of its trigger index, and what
+/// `AlgoOrderTriggered.triggerPrice` reports.
+#[derive(Clone, Copy, Debug)]
+enum FireFrom {
+    /// The fixed-trigger index: `fire` removes it, and reports the stored trigger price.
+    Index,
+    /// The trailing structure: the walk has already unlinked it, and `stop` is the tick-rounded
+    /// stop that fired (`trailing::display_stop`) — the stored `trigger_price` is the ACTIVATION
+    /// price, which is not what fired it.
+    Trailing { stop: u64 },
+}
+
+/// `fire` for an order the trailing fire walk has just unlinked.
+pub(crate) fn fire_trailing<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    market: &crate::types::Market,
+    mark_price: u64,
+    algo_id: &[u8; 32],
+    order: &Order,
+    stop: u64,
+) -> Result<(), PerpError> {
+    debug_assert!(order.is_trailing());
+    fire(context, market_id, market, mark_price, algo_id, order, FireFrom::Trailing { stop })
 }
 
 /// Execute one triggered conditional order.
@@ -801,6 +949,7 @@ fn fire<H: PerpHost>(
     mark_price: u64,
     algo_id: &[u8; 32],
     order: &Order,
+    from: FireFrom,
 ) -> Result<(), PerpError> {
     let owner = Address::from(order.owner);
     let pos = storage::load_position_ref(context, owner, market_id)?;
@@ -862,13 +1011,19 @@ fn fire<H: PerpHost>(
     // The order leaves the conditional namespace FIRST, so the id is free for the ordinary record
     // `place_order_core` writes under it. Same id on purpose: a consumer stitches the conditional
     // half and the ordinary half of this order's life together without a mapping table.
-    storage::algo_index_remove(
-        context,
-        market_id,
-        order.trigger_up,
-        order.trigger_price,
-        algo_id,
-    )?;
+    let reported_trigger = match from {
+        FireFrom::Index => {
+            storage::algo_index_remove(
+                context,
+                market_id,
+                order.trigger_up,
+                order.trigger_price,
+                algo_id,
+            )?;
+            order.trigger_price
+        }
+        FireFrom::Trailing { stop } => stop,
+    };
     let mut live = storage::load_user_algo_orders(context, owner, market_id)?;
     live.retain(|id| id != algo_id);
     storage::save_user_algo_orders(context, owner, market_id, &live)?;
@@ -879,7 +1034,7 @@ fn fire<H: PerpHost>(
             user: owner,
             marketId: market_id,
             algoId: FixedBytes(*algo_id),
-            triggerPrice: order.trigger_price,
+            triggerPrice: reported_trigger,
             // The mark that FIRED it, not the trigger — so how far the mark jumped past the
             // trigger in one update is on the wire instead of being something to infer.
             markPrice: mark_price,

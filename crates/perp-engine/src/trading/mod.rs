@@ -1540,6 +1540,7 @@ fn announce_new_order(
         stp: validated.stp,
         // An ordinary order is bound to no position (only a conditional one can be).
         position_generation: 0,
+        trail_bps: 0,
     };
 
     let pending = PendingOrderPlaced {

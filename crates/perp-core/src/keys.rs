@@ -51,6 +51,18 @@ const PFX_ALGO_DOWN_PRICES: [u8; 4] = *b"adnp"; // sorted Vec<u64>, DESC (fires 
 const PFX_ALGO_UP_LEVEL: [u8; 4] = *b"aupl"; // FIFO of algo order ids at an up-trigger price
 const PFX_ALGO_DOWN_LEVEL: [u8; 4] = *b"adnl"; // FIFO of algo order ids at a down-trigger price
 const PFX_USER_ALGO_ORDERS: [u8; 4] = *b"ualg"; // per-user per-market Vec of live algo order ids
+// ── Trailing stops (TRAILING_STOP_MARKET), perp-engine `trailing` ─────────────────────────────
+// Per (market, side): the activated orders live in a paged suffix-extreme STACK of (seq, peak)
+// pairs, one FIFO per callback bucket and a DIRECTORY of bucket fronts; orders still waiting for
+// their activation price live in a price-sorted pending index. Every list is raw packed bytes,
+// never msgpack `Vec<[u8;32]>`. The `side` byte is `Side as u8` (Buy 0, Sell 1).
+const PFX_TRAIL_META: [u8; 4] = *b"trlm"; // per-market meta of both sides (stack bounds, caches)
+const PFX_TRAIL_STACK: [u8; 4] = *b"trls"; // per (market, side, page) 64 packed (seq, peak) pairs
+const PFX_TRAIL_DIR: [u8; 4] = *b"trld"; // per (market, side) bucket-front directory, sorted
+const PFX_TRAIL_BUCKET: [u8; 4] = *b"trlb"; // per (market, side, callback bps) FIFO {head, tail}
+const PFX_TRAIL_LINK: [u8; 4] = *b"trlo"; // per order: queue links + activation tag
+const PFX_TRAIL_PEND_PRICES: [u8; 4] = *b"tpnp"; // per (market, side) sorted pending activation prices
+const PFX_TRAIL_PEND_LEVEL: [u8; 4] = *b"tpnl"; // per (market, side, price) pending FIFO {head, tail}
 const PFX_API_KEY: [u8; 4] = *b"apik"; // per-user per-slot ed25519 key
 const PFX_API_KEY_IDS: [u8; 4] = *b"akid"; // per-user list of registered key_ids
 const PFX_ORACLE: [u8; 4] = *b"orcl"; // authorized oracle address (updateIndexPrice role)
@@ -118,6 +130,27 @@ fn pack_market_price(prefix: [u8; 4], market_id: u64, price: u64) -> B256 {
     buf[..4].copy_from_slice(&prefix);
     buf[4..12].copy_from_slice(&market_id.to_be_bytes());
     buf[12..20].copy_from_slice(&price.to_be_bytes());
+    B256::new(buf)
+}
+
+/// `prefix(4) ++ market_id(8 BE) ++ side(1) ++ 19 zero`.
+#[inline]
+fn pack_market_side(prefix: [u8; 4], market_id: u64, side: u8) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[..4].copy_from_slice(&prefix);
+    buf[4..12].copy_from_slice(&market_id.to_be_bytes());
+    buf[12] = side;
+    B256::new(buf)
+}
+
+/// `prefix(4) ++ market_id(8 BE) ++ side(1) ++ x(8 BE) ++ 11 zero`.
+#[inline]
+fn pack_market_side_u64(prefix: [u8; 4], market_id: u64, side: u8, x: u64) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[..4].copy_from_slice(&prefix);
+    buf[4..12].copy_from_slice(&market_id.to_be_bytes());
+    buf[12] = side;
+    buf[13..21].copy_from_slice(&x.to_be_bytes());
     B256::new(buf)
 }
 
@@ -332,6 +365,59 @@ pub fn ask_level_key(market_id: u64, price: u64) -> B256 {
     pack_market_price(PFX_ASK_LEVEL, market_id, price)
 }
 
+// ── Trailing stops ────────────────────────────────────────────────────────────────────────────
+
+/// Per-market trailing meta: both sides' stack bounds, garbage-page range and the cached values
+/// (`best_thr`, `max_front`, pending front) that let a tick with nothing to do read ONE key.
+#[inline]
+pub fn trail_meta_key(market_id: u64) -> B256 {
+    pack_market(PFX_TRAIL_META, market_id)
+}
+
+/// One page (64 entries) of a side's suffix-extreme stack.
+#[inline]
+pub fn trail_stack_page_key(market_id: u64, side: u8, page: u64) -> B256 {
+    pack_market_side_u64(PFX_TRAIL_STACK, market_id, side, page)
+}
+
+/// A side's directory of callback-bucket fronts (≤ 100 entries, sorted by firing priority).
+#[inline]
+pub fn trail_dir_key(market_id: u64, side: u8) -> B256 {
+    pack_market_side(PFX_TRAIL_DIR, market_id, side)
+}
+
+/// `{head, tail}` of one callback bucket's FIFO of activated orders.
+#[inline]
+pub fn trail_bucket_key(market_id: u64, side: u8, callback_bps: u16) -> B256 {
+    pack_market_side_u64(PFX_TRAIL_BUCKET, market_id, side, callback_bps as u64)
+}
+
+/// A trailing order's queue links (`prev`/`next`) and activation tag.
+///
+/// `prefix(4) ++ algo_id[..28]`: the id is a preimage-resistant keccak output (the same argument
+/// as [`order_key`]), so 28 bytes of it keep ~2^112 collision resistance — the layout
+/// [`seen_sig_key`] already uses — and the prefix keeps it off the raw order-id namespace.
+#[inline]
+pub fn trail_link_key(algo_id: &[u8; 32]) -> B256 {
+    let mut buf = [0u8; 32];
+    buf[..4].copy_from_slice(&PFX_TRAIL_LINK);
+    buf[4..32].copy_from_slice(&algo_id[..28]);
+    B256::new(buf)
+}
+
+/// A side's sorted list of distinct pending activation prices (SELL ascending, BUY descending —
+/// the activating end first, like `aupp` / `adnp`).
+#[inline]
+pub fn trail_pending_prices_key(market_id: u64, side: u8) -> B256 {
+    pack_market_side(PFX_TRAIL_PEND_PRICES, market_id, side)
+}
+
+/// `{head, tail}` of the FIFO of orders waiting for one activation price.
+#[inline]
+pub fn trail_pending_level_key(market_id: u64, side: u8, price: u64) -> B256 {
+    pack_market_side_u64(PFX_TRAIL_PEND_LEVEL, market_id, side, price)
+}
+
 // The per-level live-order count now lives INSIDE the level blob (see storage `LevelBlob`) — no
 // separate count key.
 
@@ -511,6 +597,13 @@ mod const_key_tests {
             PFX_ALGO_UP_LEVEL,
             PFX_ALGO_DOWN_LEVEL,
             PFX_USER_ALGO_ORDERS,
+            PFX_TRAIL_META,
+            PFX_TRAIL_STACK,
+            PFX_TRAIL_DIR,
+            PFX_TRAIL_BUCKET,
+            PFX_TRAIL_LINK,
+            PFX_TRAIL_PEND_PRICES,
+            PFX_TRAIL_PEND_LEVEL,
         ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
@@ -597,6 +690,37 @@ mod const_key_tests {
             "an algo order list must not alias the book order list for the same user+market"
         );
         assert_ne!(bid_level_key(3, 100), ask_level_key(3, 100));
+        // Trailing: the two sides of every per-side family, and the families against each other
+        // and against the fixed-trigger index they sit beside.
+        for (a, b) in [
+            (trail_dir_key(3, 0), trail_dir_key(3, 1)),
+            (trail_pending_prices_key(3, 0), trail_pending_prices_key(3, 1)),
+            (trail_stack_page_key(3, 0, 7), trail_stack_page_key(3, 1, 7)),
+            (trail_stack_page_key(3, 1, 7), trail_stack_page_key(3, 1, 8)),
+            (trail_bucket_key(3, 0, 10), trail_bucket_key(3, 1, 10)),
+            (trail_bucket_key(3, 1, 10), trail_bucket_key(3, 1, 20)),
+            (trail_pending_level_key(3, 0, 7), trail_pending_level_key(3, 1, 7)),
+            (trail_pending_level_key(3, 1, 7), algo_up_level_key(3, 7)),
+            (trail_pending_prices_key(3, 1), algo_up_prices_key(3)),
+            (trail_stack_page_key(3, 1, 0), trail_pending_level_key(3, 1, 0)),
+            (trail_bucket_key(3, 1, 0), trail_stack_page_key(3, 1, 0)),
+            (trail_dir_key(3, 1), trail_pending_prices_key(3, 1)),
+            (trail_meta_key(3), market_key(3)),
+            (trail_link_key(&[7u8; 32]), order_key(&[7u8; 32])),
+            (trail_link_key(&[7u8; 32]), seen_sig_key(&[7u8; 32])),
+        ] {
+            assert_ne!(a, b);
+        }
+        // Each field lands where the layout comment says.
+        let k = trail_stack_page_key(0x0102, 1, 0x0a0b);
+        assert_eq!(&k.0[..4], b"trls");
+        assert_eq!(&k.0[4..12], &0x0102u64.to_be_bytes());
+        assert_eq!(k.0[12], 1);
+        assert_eq!(&k.0[13..21], &0x0a0bu64.to_be_bytes());
+        assert_eq!(&k.0[21..], &[0u8; 11]);
+        let l = trail_link_key(&[0x5au8; 32]);
+        assert_eq!(&l.0[..4], b"trlo");
+        assert_eq!(&l.0[4..], &[0x5au8; 28]);
         // raw order id vs a structured key
         let id = [0x01u8; 32];
         assert_ne!(order_key(&id), position_key(a, 3));

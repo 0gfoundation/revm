@@ -32,6 +32,8 @@ pub mod margin_view;
 pub mod risk;
 pub mod storage;
 pub mod trading;
+/// Trailing stops (`TRAILING_STOP_MARKET`): the grouped-lazy per-market structure and its sweeps.
+pub mod trailing;
 
 pub use call::{run_perp_dex_call, PerpOutput};
 pub use host::{InMemoryHost, PerpHost};

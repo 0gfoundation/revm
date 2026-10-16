@@ -62,8 +62,11 @@ impl OrderType {
 /// mark <= trigger   <-  STOP SELL, TAKE_PROFIT BUY
 /// ```
 ///
-/// `TRAILING_STOP_MARKET` is deliberately absent — it is roadmap 1d and needs per-order high/low
-/// watermark state that nothing here carries.
+/// `TRAILING_STOP_MARKET` (4) is the one type whose trigger MOVES: it follows the highest (SELL) or
+/// lowest (BUY) mark since it activated, and fires a callback-rate retracement away from it. Its
+/// `trigger_up` is the ACTIVATION direction (see [`Self::trigger_up`]); the moving trigger itself
+/// is not on the order record at all — it lives in the per-market trailing structure
+/// (`perp-engine` `trailing`), so a new extreme rewrites no order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum AlgoOrderType {
@@ -75,6 +78,10 @@ pub enum AlgoOrderType {
     TakeProfit = 2,
     /// Mirror of `StopMarket`.
     TakeProfitMarket = 3,
+    /// Binance `TRAILING_STOP_MARKET`: activate when the mark reaches the activation price (or at
+    /// placement), then fire at market once the mark retraces the callback rate from the best mark
+    /// seen since activation. Unfilled remainder EXPIRES, like `StopMarket`.
+    TrailingStopMarket = 4,
 }
 
 impl AlgoOrderType {
@@ -85,6 +92,7 @@ impl AlgoOrderType {
             1 => Some(Self::StopMarket),
             2 => Some(Self::TakeProfit),
             3 => Some(Self::TakeProfitMarket),
+            4 => Some(Self::TrailingStopMarket),
             _ => None,
         }
     }
@@ -92,7 +100,10 @@ impl AlgoOrderType {
     /// `true` when the triggered order takes the book at market rather than resting.
     #[inline]
     pub fn is_market(self) -> bool {
-        matches!(self, Self::StopMarket | Self::TakeProfitMarket)
+        matches!(
+            self,
+            Self::StopMarket | Self::TakeProfitMarket | Self::TrailingStopMarket
+        )
     }
 
     /// The trigger direction for this (type, side) pair: `true` = fires when `mark >= trigger`.
@@ -100,12 +111,17 @@ impl AlgoOrderType {
     /// A STOP protects against the price moving AGAINST the position, a TAKE_PROFIT against it
     /// running away in your favour — so for a given side the two are exact opposites, and the
     /// four combinations collapse to two.
+    ///
+    /// For `TRAILING_STOP_MARKET` this is the ACTIVATION direction, not the firing one: a SELL
+    /// activates once `mark >= activatePrice` (it then trails the high and fires on the way DOWN),
+    /// a BUY once `mark <= activatePrice`. Placement's "would immediately trigger" refusal reads it
+    /// the same way, which is Binance's `-2021` for an activation price on the wrong side.
     #[inline]
     pub fn trigger_up(self, side: Side) -> bool {
         let is_buy = matches!(side, Side::Buy);
         match self {
             Self::Stop | Self::StopMarket => is_buy,
-            Self::TakeProfit | Self::TakeProfitMarket => !is_buy,
+            Self::TakeProfit | Self::TakeProfitMarket | Self::TrailingStopMarket => !is_buy,
         }
     }
 }
@@ -464,11 +480,13 @@ pub enum CancelReason {
     /// the matcher (an unfillable FOK, a crossing PostOnly, a refused rest). Carried by
     /// `AlgoOrderCancelled`; the trigger is spent.
     TriggerRejected = 10,
-    /// A POSITION-BOUND conditional order ([`Order::is_position_bound`] — a `closePosition` one)
-    /// triggered after the position it was placed against had ENDED: gone flat or flipped, at
-    /// any point since placement, even if a new position is open now. Nothing is placed; carried
-    /// by `AlgoOrderCancelled` right after `AlgoOrderTriggered`, like 6 and 10. Binance's
-    /// `GTE_GTC` order "EXPIRED" when its position closes.
+    /// A POSITION-BOUND conditional order ([`Order::is_position_bound`] — a `closePosition` order
+    /// or a trailing stop) triggered after the position it was placed against had ENDED: gone flat
+    /// or flipped, at any point since placement, even if a new position is open now. Nothing is
+    /// placed; carried by `AlgoOrderCancelled` right after `AlgoOrderTriggered`, like 6 and 10. A
+    /// trailing stop is also checked when it ACTIVATES: one whose position ended while it waited
+    /// for its activation price is spent there, with this code and no `AlgoOrderTriggered` (it
+    /// never triggered). Binance's `GTE_GTC` order "EXPIRED" when its position closes.
     ///
     /// DISTINCT from [`Self::ReduceOnlyWouldOpen`] (6) on purpose. 6 says "this side would open
     /// now", which is false for the case this code exists for: close a long, open a new long, and
@@ -554,16 +572,35 @@ pub struct Order {
     /// the order's kind, never off this value.
     #[serde(default, rename = "pg")]
     pub position_generation: u64,
+    /// Trailing callback rate in basis points — APPENDED LAST, positional msgpack. **`0` means "not
+    /// a trailing stop"**, and it is the one field the engine branches on for that: a
+    /// `TRAILING_STOP_MARKET` order has `10..=1000` here (0.1 %–10 % in 0.1 % steps), every other
+    /// order 0.
+    ///
+    /// On a trailing order `trigger_price` holds the effective ACTIVATION price (the one sent, or
+    /// the stored mark at placement when 0 was sent — so it is never 0 and the "0 = not a
+    /// conditional" sentinel still holds) and `trigger_up` the activation direction. The moving
+    /// stop and the best mark since activation are NOT stored here; they are derived from the
+    /// per-market trailing structure, which is what keeps a new extreme from rewriting every order.
+    #[serde(default, rename = "tb")]
+    pub trail_bps: u16,
 }
 
 impl Order {
     /// Is this conditional order BOUND TO THE POSITION it was placed against? Such an order can be
-    /// placed only on the closing side of an open position, and it expires — lazily, at trigger —
-    /// once that position goes flat or flips (Binance's `GTE_GTC`). Today that is a `closePosition`
-    /// order; the one place to extend when another kind binds.
+    /// placed only on the closing side of an open position, and it expires — lazily, at trigger
+    /// (or, for a trailing stop, at activation) — once that position goes flat or flips (Binance's
+    /// `GTE_GTC`). A `closePosition` order and a trailing stop; the one place to extend when
+    /// another kind binds.
     #[inline]
     pub fn is_position_bound(&self) -> bool {
-        self.close_position
+        self.close_position || self.is_trailing()
+    }
+
+    /// Is this a `TRAILING_STOP_MARKET` order? Read off [`Self::trail_bps`], the single marker.
+    #[inline]
+    pub fn is_trailing(&self) -> bool {
+        self.trail_bps != 0
     }
 }
 
@@ -843,6 +880,7 @@ mod stp_mode_tests {
             close_position: false,
             stp: StpMode::ExpireBoth,
             position_generation: 3,
+            trail_bps: 0,
         };
         let back: Order = crate::codec::decode(&crate::codec::encode(&order).unwrap()).unwrap();
         assert_eq!(back, order);

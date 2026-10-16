@@ -647,9 +647,9 @@ sol! {
         /// algoType: must be 0 (`CONDITIONAL`). Binance's Algo API also serves TWAP/VP execution
         ///   algos; the field is carried so adding those later needs no new selector.
         ///
-        /// orderType: 0 STOP, 1 STOP_MARKET, 2 TAKE_PROFIT, 3 TAKE_PROFIT_MARKET.
-        ///   `TRAILING_STOP_MARKET` is NOT accepted — it needs per-order high/low watermark state
-        ///   that nothing here carries.
+        /// orderType: 0 STOP, 1 STOP_MARKET, 2 TAKE_PROFIT, 3 TAKE_PROFIT_MARKET,
+        ///   4 TRAILING_STOP_MARKET — `triggerPrice` = activation price (0 = now), `price` =
+        ///   callback rate in bps (10..=1000, step 10), reduceOnly required.
         ///   * the `_MARKET` pair takes the book at trigger; any remainder the fill-time price band
         ///     will not let through **EXPIRES** (Binance parity — a market order means "now or not
         ///     at all", and Binance expires the unfilled part for the same reason).
@@ -739,7 +739,13 @@ sol! {
             /// `flags` bits 3:2 as a value: 0 EXPIRE_MAKER, 1 EXPIRE_TAKER, 2 EXPIRE_BOTH.
             /// Appended last; every field of the tuple is static, so a decoder for the older
             /// eleven-field tuple still reads the first eleven unchanged.
-            uint8 selfTradePreventionMode
+            uint8 selfTradePreventionMode,
+            /// TRAILING_STOP_MARKET only (0 / false / 0 / 0 otherwise). Appended after the
+            /// twelve above, all static, so older decoders are unaffected.
+            uint16 callbackRateBps,
+            bool activated,
+            uint64 peakPrice,
+            uint64 currentStop
         );
 
         /// Ids of the UNTRIGGERED conditional orders a user holds in a market.
@@ -1780,6 +1786,11 @@ sol! {
         /// gap between the two (how far the mark jumped past the trigger in one update) is visible
         /// on the wire rather than something a consumer has to infer.
         event AlgoOrderTriggered(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint64 triggerPrice, uint64 markPrice);
+
+        /// A TRAILING_STOP_MARKET order activated: from here it trails the best mark since this
+        /// tick, starting at `markPrice`, and `stopPrice` is its first stop. Emitted once per
+        /// order — in the placement transaction when it was placed with activation price 0.
+        event AlgoOrderActivated(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint64 markPrice, uint64 stopPrice);
 
         /// A conditional order was removed. `reason` shares the `CancelReason` space with
         /// `OrderCancelled` so one decoder covers both. Usually an UNTRIGGERED one (0 = its owner

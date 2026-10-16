@@ -156,7 +156,7 @@ pub(crate) mod bench_counter {
 /// lived in the state trie under `PERP_DEX_ADDRESS`; perp data now rides the journal's perp
 /// section instead, so it gets the same revert lifecycle but never enters the state root.
 /// See `docs/perpstate-journal集成方案.md` §4.2.
-fn load_blob<H: PerpHost>(context: &mut H, key: B256) -> Result<Vec<u8>, PerpError> {
+pub(crate) fn load_blob<H: PerpHost>(context: &mut H, key: B256) -> Result<Vec<u8>, PerpError> {
     let buf = context.perp_load(key)?;
     #[cfg(test)]
     bench_counter::record_read(key, buf.len());
@@ -171,7 +171,7 @@ fn load_blob<H: PerpHost>(context: &mut H, key: B256) -> Result<Vec<u8>, PerpErr
 /// the net delta by [`finalize_block_commitment`] (which the block executor calls after
 /// `take_perp_delta`), so a key written N times across the block is hashed once. This replaces the
 /// former per-call `flush_commitment` over a per-write framed log.
-fn store_blob<H: PerpHost>(
+pub(crate) fn store_blob<H: PerpHost>(
     context: &mut H,
     key: B256,
     buf: &[u8],
@@ -3136,6 +3136,7 @@ mod size_probe_tests {
                     close_position: false,
                     stp: Default::default(),
                     position_generation: 0,
+                    trail_bps: 0,
         };
         let buf = encode(&order).unwrap();
         println!(
@@ -3388,6 +3389,7 @@ mod encoding_roundtrip_tests {
                                                             close_position: false,
                                                             stp: Default::default(),
                                                             position_generation: u64::MAX,
+                                                            trail_bps: u16::MAX,
                             },
                         );
                     }

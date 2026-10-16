@@ -1375,8 +1375,17 @@ fn run_deferred_sweeps<H: PerpHost>(
     context: &mut H,
     market_id: u64,
     market: &Market,
+    // `IndexPriceState.timestamp` of `mark_price` — the trailing structure's tick sequence.
+    seq: u64,
     mark_price: u64,
 ) -> Result<bool, PerpError> {
+    // ── Trailing stops, step 1: fold the mark into the peaks — FIRST and NOT budgeted ─────────
+    //
+    // A peak the budget skipped would make a stop fire later than it should, and a skipped tick
+    // can never be replayed, so this is the one leg that always runs in full. It is idempotent at
+    // a fixed `(seq, mark)`, which is what lets the drain call this whole function again.
+    crate::trailing::on_mark(context, market_id, seq, mark_price)?;
+
     let gc_deferred = run_out_of_band_expiry_sweep(context, market_id, market)?;
 
     // ── ONE budget, consumed in order: triggers, then liquidations ───────────────────────────
@@ -1392,9 +1401,30 @@ fn run_deferred_sweeps<H: PerpHost>(
     let mut budget = MAX_SWEEP_ACTIONS_PER_UPDATE;
     let trigger_deferred =
         crate::algo::run_trigger_sweep(context, market_id, market, mark_price, &mut budget)?;
+    // Trailing fires share the pot, after the fixed triggers (no price-priority merge between the
+    // two: it would only matter on overflow, which the drain finishes at the same mark). A
+    // SEPARATE call, because the fixed sweep returns early when the budget runs out.
+    let trailing_deferred =
+        crate::trailing::run_fire_sweep(context, market_id, market, mark_price, &mut budget)?;
+    // Activations on their OWN cap: a crowd of crossing activation prices must not spend the
+    // budget stop-losses and liquidations need. A new activation cannot fire on the tick it
+    // activates (its peak is the mark), so running it after the fire walk changes no outcome.
+    let mut activation_cap = crate::trailing::MAX_TRAILING_ACTIVATIONS_PER_UPDATE;
+    let activation_deferred = crate::trailing::run_activation_sweep(
+        context,
+        market_id,
+        market,
+        seq,
+        mark_price,
+        &mut activation_cap,
+    )?;
     let sweep_deferred =
         run_liquidation_sweep(context, market_id, market, mark_price, &mut budget)?;
-    let deferred = gc_deferred || trigger_deferred || sweep_deferred;
+    let deferred = gc_deferred
+        || trigger_deferred
+        || trailing_deferred
+        || activation_deferred
+        || sweep_deferred;
 
     if (market.deferred_work != 0) != deferred {
         storage::save_deferred_work(context, market_id, deferred)?;
@@ -2459,7 +2489,7 @@ fn apply_index_price_update<H: PerpHost>(
     // what the close absorbs — while the BBO cache is still provably live, which is what lets the
     // removal use the cheap cancel-path variant and get its top-of-book invariant check for free.
     // Capped; see MAX_BAND_EXPIRIES_PER_UPDATE.
-    run_deferred_sweeps(context, market_id, &market, mark_price)?;
+    run_deferred_sweeps(context, market_id, &market, effective_timestamp, mark_price)?;
 
     // ── 6. Emit events ────────────────────────────────────────────────────────
     // ONE price event per update. This used to be `IndexPriceUpdated` immediately followed by
@@ -2619,7 +2649,10 @@ pub fn run_drain_deferred_work<H: PerpHost>(
     // No re-load dance is needed here, unlike `apply_index_price_update`, precisely because this
     // call does not write a new mark first.
     let mark_price = market.mark_price;
-    let more = run_deferred_sweeps(context, args.marketId, &market, mark_price)?;
+    // The seq that mark was written at: the trailing step re-runs at the same `(seq, mark)` and so
+    // changes nothing (it is idempotent there), which is the whole of what the drain needs from it.
+    let seq = storage::load_index_price_state(context, args.marketId)?.timestamp;
+    let more = run_deferred_sweeps(context, args.marketId, &market, seq, mark_price)?;
 
     Ok(Bytes::from(drainDeferredWorkCall::abi_encode_returns(&more)))
 }

@@ -6961,9 +6961,17 @@ mod golden {
     /// `BusinessSnapshot` UNCHANGED. VERIFIED: with both fields `#[serde(skip)]` the scenario
     /// reproduced the previous pin 0x720411d8…e3e0.
     ///
-    /// Prior values 0x720411d896e56b98c027a692b9cb8afba35c93accce39ccbef86a1a59f93e3e0 (38, fire()
-    /// capacity fix), 0x525fea15e0541c3a4441899ac1d7862a0fc5d2cb3dae2a933a6b3b5594d933ee (37, ppm
-    /// fees + maker rebate),
+    /// Re-pinned again within 38 for the trailing stop: `Order` gains a trailing "tb"
+    /// (`trail_bps`, u16, 0 = not trailing), positional msgpack, appended — so every order blob the
+    /// scenario writes is one byte longer (a fixint 0: it places no trailing stop). A LAYOUT change
+    /// only. The trailing structure itself writes nothing here: each oracle tick reads its (absent)
+    /// meta key and stops. `BusinessSnapshot` UNCHANGED. VERIFIED: with the field `#[serde(skip)]`
+    /// the scenario reproduced the previous pin 0xa72ce19d…d940.
+    ///
+    /// Prior values 0xa72ce19d4e1c033989c620e39e9a7e09d6b483aee1c38cfe0d9e08770898d940 (38,
+    /// closePosition parity), 0x720411d896e56b98c027a692b9cb8afba35c93accce39ccbef86a1a59f93e3e0 (38,
+    /// fire() capacity fix), 0x525fea15e0541c3a4441899ac1d7862a0fc5d2cb3dae2a933a6b3b5594d933ee (37,
+    /// ppm fees + maker rebate),
     /// 0xc1379f42cc51db429ce10ab455e6daeb918a81bca8df7d210ae584768e631988 (36, STP),
     /// 0x064ca8b4d053dc1def05f9991d75afd9dc52440890525c0a2efbc018382f8912,
     /// 0x2ffa38aefbdfa68307eb6869b95cb48d9828f407dce2924f2abd8ef5c5c0b88d,
@@ -6976,7 +6984,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xa72ce19d4e1c033989c620e39e9a7e09d6b483aee1c38cfe0d9e08770898d940");
+        b256!("0x37a18141947ba3bb4fe923fe0e05a07d4dc0a8d1987096250991ed7d0f3f79de");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -8592,6 +8600,7 @@ mod batch_cancel {
                             close_position: false,
                             stp: Default::default(),
                             position_generation: 0,
+                            trail_bps: 0,
             },
         )
         .unwrap();
