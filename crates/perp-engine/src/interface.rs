@@ -910,9 +910,11 @@ sol! {
         /// `ACCOUNT_UPDATE`).
         /// There is no per-order limit on STP cancels: each removes one of the caller's own open
         /// orders in this market, so the open-order cap above bounds them.
-        /// Margin admission is on the FULL size before matching (Binance's), so an EXPIRE_TAKER /
-        /// EXPIRE_BOTH order whose remainder would expire is still refused if resting all of it
-        /// would be unaffordable.
+        /// The pre-walk affordability filter judges the FULL size, so when it applies (only when
+        /// the order reduces no position and the caller has no resting order on its own side) an
+        /// EXPIRE_TAKER / EXPIRE_BOTH order the caller could not afford to rest in full is refused
+        /// even though its remainder would only expire. Otherwise only the fills before the stop
+        /// are margin-checked, and the remainder expires.
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
