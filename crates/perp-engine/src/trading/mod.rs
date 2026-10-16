@@ -30,10 +30,7 @@ use crate::{
         getBookPricesCall, getMarketFeeTotalCall, getOpenOrdersCall, getOpenOrdersReturn,
         getOrderCall, getOrderReturn, placeOrderCall, placeOrderSignedCall, PlaceItem,
     },
-    math::{
-        calc_trading_fee,
-        calc_value,
-    },
+    math::calc_value,
     risk::record_mid_price_sample_for_best_quote_change,
     storage,
     types::{
@@ -2380,6 +2377,17 @@ pub(super) fn match_order<H: PerpHost>(
                         registry.defer_maker_level(false, ask_price, new_queue, count_new)?;
                         break 'outer;
                     }
+                    // This fill's notional and its share of the taker's ONE fee, priced BEFORE the
+                    // maker settles. Pure arithmetic over the taker's running total — nothing is
+                    // recorded until the maker accepts the fill (a K9-rejected maker consumes no
+                    // share). See `TakerSettlement::fee_share_of_next_fill`.
+                    let fill_notional = calc_value(
+                        ask_price,
+                        fill_qty,
+                        market.base_decimals,
+                        market.price_decimals,
+                    )?;
+                    let taker_fee_share = taker_settlement.fee_share_of_next_fill(fill_notional)?;
                     // Maker open-solvency guard (K9): settle the maker first. If filling
                     // it would open its position below maintenance at mark, cancel the
                     // maker order (drop it from this level by not re-queuing) and skip —
@@ -2428,15 +2436,14 @@ pub(super) fn match_order<H: PerpHost>(
                         stp.is_none() || maker_addr != taker_addr,
                         "self-trade prevention let a taker fill its own resting order"
                     );
-                    taker_settlement.record_fill(ask_price, fill_qty, Side::Buy, market)?;
-                    let fill_notional = calc_value(
+                    taker_settlement.record_fill(
                         ask_price,
                         fill_qty,
-                        market.base_decimals,
-                        market.price_decimals,
+                        Side::Buy,
+                        fill_notional,
+                        taker_fee_share,
+                        market,
                     )?;
-                    let taker_fee =
-                        calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
                     last_trade_price = Some(ask_price);
                     registry.push_event(settlement::MatchEvent::Trade {
                         market_id,
@@ -2447,7 +2454,7 @@ pub(super) fn match_order<H: PerpHost>(
                         price: ask_price,
                         quantity: fill_qty,
                         taker_side: Side::Buy,
-                        taker_fee,
+                        taker_fee: taker_fee_share,
                         maker_fee,
                         // The maker settled just above, per fill, so its `rp` is final here. The
                         // taker's is not knowable yet (one settlement for the whole order, after
@@ -2656,6 +2663,14 @@ pub(super) fn match_order<H: PerpHost>(
                         registry.defer_maker_level(true, bid_price, new_queue, count_new)?;
                         break 'outer;
                     }
+                    // Priced before the maker settles — see the Buy mirror.
+                    let fill_notional = calc_value(
+                        bid_price,
+                        fill_qty,
+                        market.base_decimals,
+                        market.price_decimals,
+                    )?;
+                    let taker_fee_share = taker_settlement.fee_share_of_next_fill(fill_notional)?;
                     // Maker open-solvency guard (K9) — see the mirror on the Buy side.
                     let (maker_fee, maker_pos_snapshot, maker_realized_pnl, maker_closed_qty) =
                         match settlement::settle_maker_fill_registry(
@@ -2696,15 +2711,14 @@ pub(super) fn match_order<H: PerpHost>(
                         stp.is_none() || maker_addr != taker_addr,
                         "self-trade prevention let a taker fill its own resting order"
                     );
-                    taker_settlement.record_fill(bid_price, fill_qty, Side::Sell, market)?;
-                    let fill_notional = calc_value(
+                    taker_settlement.record_fill(
                         bid_price,
                         fill_qty,
-                        market.base_decimals,
-                        market.price_decimals,
+                        Side::Sell,
+                        fill_notional,
+                        taker_fee_share,
+                        market,
                     )?;
-                    let taker_fee =
-                        calc_trading_fee(fill_notional, taker_settlement.taker_fee_bps())?;
                     last_trade_price = Some(bid_price);
                     registry.push_event(settlement::MatchEvent::Trade {
                         market_id,
@@ -2715,7 +2729,7 @@ pub(super) fn match_order<H: PerpHost>(
                         price: bid_price,
                         quantity: fill_qty,
                         taker_side: Side::Sell,
-                        taker_fee,
+                        taker_fee: taker_fee_share,
                         maker_fee,
                         // Sell-side mirror; see the note on the Buy walk.
                         taker_realized_pnl: 0,
@@ -3914,3 +3928,8 @@ mod tests;
 #[cfg(test)]
 #[path = "stp_spec_tests.rs"]
 mod stp_spec_tests;
+
+/// Trading-fee accounting (taker fee attribution) through the full call shell.
+#[cfg(test)]
+#[path = "fee_spec_tests.rs"]
+mod fee_spec_tests;

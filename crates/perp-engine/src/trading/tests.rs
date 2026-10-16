@@ -14165,6 +14165,7 @@ mod resting_notional_stream {
 // rather than merely written down.
 mod account_snapshot_events {
     use super::*;
+    use crate::math::calc_trading_fee;
     use crate::interface::IPerpDex::{
         batchPlaceOrdersCall, setLeverageCall, OrderCancelled, PlaceItem, Trade,
     };

@@ -33,6 +33,11 @@ pub(super) struct TakerSettlement {
     market_id: u64,
     fills: Vec<RecordedFill>,
     taker_fee_bps: u64,
+    /// `C_k`: the summed notional `Σ calc_value(price_j, qty_j)` of the fills recorded so far —
+    /// the running total [`Self::fee_share_of_next_fill`] differences against. After the last
+    /// fill it is exactly the `fee_notional` [`finalize_core`] charges the ONE taker fee on (both
+    /// sum the same per-fill `calc_value` terms).
+    fee_notional: u64,
 }
 
 struct RecordedFill {
@@ -49,6 +54,10 @@ struct RecordedFill {
     /// `0` until `finalize_core` runs, and legitimately `0` afterwards for any fill whose leg was
     /// purely opening (see the apportionment note).
     realized_pnl: i64,
+    /// This fill's share of the order's taker fee (`Trade.takerFee`), fixed when the fill is
+    /// recorded — see [`TakerSettlement::fee_share_of_next_fill`]. Carried so `finalize_core` can
+    /// assert the shares sum to the fee it charges, exactly.
+    fee_share: u64,
 }
 
 impl TakerSettlement {
@@ -76,11 +85,38 @@ impl TakerSettlement {
             } else {
                 rates.taker_fee_bps
             },
+            fee_notional: 0,
         })
     }
 
-    pub(super) fn taker_fee_bps(&self) -> u64 {
-        self.taker_fee_bps
+    /// The share of the order's ONE taker fee that the NEXT fill carries, if it is recorded with
+    /// `fill_notional` (its `calc_value(price, qty)`). PURE — it reads the running total and
+    /// changes nothing, so the walk can price a fill before it knows whether the maker accepts it;
+    /// only [`Self::record_fill`] advances the total.
+    ///
+    /// # Differences of cumulative floors, not a per-fill floor
+    ///
+    /// The taker is charged once, in [`finalize_core`]: `F = floor(Σ n_i · t / D)`. The share of
+    /// fill `k` is
+    ///
+    /// ```text
+    /// share_k = floor(C_k · t / D) − floor(C_{k−1} · t / D),      C_k = Σ_{j≤k} n_j
+    /// ```
+    ///
+    /// and the sum TELESCOPES: `Σ share_k = floor(C_N · t / D) = F`, with zero residual however
+    /// each floor truncates — the same technique, for the same reason, as the `takerRealizedPnl`
+    /// apportionment in [`finalize_core`]. The independent per-fill floor `floor(n_k · t / D)` this
+    /// replaces is SUPERADDITIVE: its fills sum to `F` minus up to `N − 1` units, so
+    /// `Σ Trade.takerFee` under-reported the fee the taker actually paid. `floor` is monotone, so
+    /// every share is `≥ 0`.
+    pub(super) fn fee_share_of_next_fill(&self, fill_notional: u64) -> Result<u64, PerpError> {
+        let next = self
+            .fee_notional
+            .checked_add(fill_notional)
+            .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
+        calc_trading_fee(next, self.taker_fee_bps)?
+            .checked_sub(calc_trading_fee(self.fee_notional, self.taker_fee_bps)?)
+            .ok_or_else(|| perp_invariant_err("taker fee share: cumulative floor decreased"))
     }
 
     /// Accumulates one partial fill into the running closing/opening totals.
@@ -102,19 +138,41 @@ impl TakerSettlement {
     ///
     /// Notional values (not just quantities) are accumulated here because fee
     /// calculation uses the total traded notional across all partial fills.
+    ///
+    /// `fill_notional` / `fee_share` are the values the walk priced this fill with BEFORE settling
+    /// its maker (`calc_value(fill_price, fill_qty)` and [`Self::fee_share_of_next_fill`] of it).
+    /// Recording advances the running total by exactly that notional, so the next fill's share is
+    /// taken against it.
     pub(super) fn record_fill(
         &mut self,
         fill_price: u64,
         fill_qty: u64,
         taker_side: Side,
-        _market: &crate::types::Market,
+        fill_notional: u64,
+        fee_share: u64,
+        market: &crate::types::Market,
     ) -> Result<(), PerpError> {
+        debug_assert_eq!(
+            calc_value(fill_price, fill_qty, market.base_decimals, market.price_decimals).ok(),
+            Some(fill_notional),
+            "record_fill: the walk priced the fill on a different notional"
+        );
+        debug_assert_eq!(
+            self.fee_share_of_next_fill(fill_notional).ok(),
+            Some(fee_share),
+            "record_fill: the taker fee share changed between pricing and recording the fill"
+        );
+        self.fee_notional = self
+            .fee_notional
+            .checked_add(fill_notional)
+            .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
         self.fills.push(RecordedFill {
             price: fill_price,
             quantity: fill_qty,
             taker_side,
             // Apportioned later, in `finalize_core` — nothing here knows the entry basis yet.
             realized_pnl: 0,
+            fee_share,
         });
         Ok(())
     }
@@ -1655,6 +1713,14 @@ fn finalize_core(
         .checked_add(opening_value)
         .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
     let fee = calc_trading_fee(fee_notional, taker_fee_bps)?;
+    // The per-fill shares `Trade.takerFee` reports (`TakerSettlement::fee_share_of_next_fill`) were
+    // fixed during the walk, before this fee existed; they must TELESCOPE to it with no residual.
+    // Same placement, and the same reasoning, as the realized-PnL assertion above.
+    debug_assert_eq!(
+        fills.iter().map(|f| f.fee_share as u128).sum::<u128>(),
+        fee as u128,
+        "per-fill taker fee shares must sum EXACTLY to the taker fee charged"
+    );
     let fee_from_margin = fee.min(fill_outcome.opening_margin);
     let fee_from_wallet = fee - fee_from_margin;
     let from_margin_i64 = checked_u64_to_i64(fee_from_margin, "settlement: fee from margin")?;
