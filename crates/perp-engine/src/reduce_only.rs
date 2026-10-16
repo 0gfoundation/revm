@@ -176,6 +176,63 @@ pub enum QueuePosition {
     Immediate,
 }
 
+impl QueuePosition {
+    /// The queue position of an order of `kind` at `price`. Derived from the ORDER KIND, never
+    /// from the price alone: a market / IOC / FOK order has no queue position, and a market
+    /// order's price is not even set.
+    ///
+    /// The one derivation for both callers of [`closing_capacity`] — `placeOrder` admission and a
+    /// fired conditional order — so the two cannot rank the same order differently.
+    #[inline]
+    pub fn for_kind(kind: crate::types::OrderKind, price: u64) -> Self {
+        if kind.has_resting_queue_position() {
+            QueuePosition::Resting { price }
+        } else {
+            QueuePosition::Immediate
+        }
+    }
+}
+
+/// How much a reduce-only order on the position's CLOSING side may close — the one capacity rule,
+/// shared by [`admit`] and by a fired conditional order (`algo::fire`). The caller has already
+/// established that `side` is the closing side of `pos`.
+///
+/// # An immediate order is bounded by the POSITION and by nothing else
+///
+/// It fills before every resting order, so no `normals_ahead` term applies. `Σ reduce-only` does
+/// not apply either: those orders fill LATER, and the post-fill eviction pass ([`restore`]) trims
+/// them against whatever position is left — Binance `er=4`, a reduce-only market order crowding
+/// out the resting reduce-only orders behind it. Subtracting them here would refuse a close on
+/// account of orders that cannot precede it — the same class of defect as the priority bug, just
+/// milder.
+///
+/// It also skips the list load entirely, which is the cheap path for the common close.
+///
+/// # Why the trigger path shares it rather than keeping its own copy
+///
+/// `fire` used to compute this itself, with the prefix condition for EVERY fired order, priced at
+/// the mark for a market one. A stop-loss next to a full-size resting reduce-only take-profit
+/// therefore found no room and expired instead of closing: long 10 with a reduce-only TP sell 10
+/// resting, a closePosition stop closed NOTHING; with the TP at 5 it closed only 5 — the standard
+/// TP + SL bracket was broken. One function for both callers is what keeps the two from drifting
+/// apart again.
+pub(crate) fn closing_capacity<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    side: Side,
+    pos: &PerpPosition,
+    queue: QueuePosition,
+) -> Result<u64, PerpError> {
+    Ok(match queue {
+        QueuePosition::Immediate => pos.amount.unsigned_abs(),
+        QueuePosition::Resting { price } => {
+            let entries = side_entries_ref(context, user, market_id, side)?;
+            capacity_for_new(pos, entries.iter(), side, price)
+        }
+    })
+}
+
 /// Admits a reduce-only order, returning the quantity that is actually accepted.
 ///
 /// Rejects a flat position and a same-side (would-open) request outright; otherwise TRUNCATES the
@@ -207,21 +264,9 @@ pub fn admit<H: PerpHost>(
         ));
     }
 
-    // ── An immediate order is bounded by the POSITION and by nothing else ────────────────────
-    //
-    // It fills before every resting order, so no `normals_ahead` term applies. `Σ reduce-only` does
-    // not apply either: those orders fill LATER, and the post-fill eviction pass trims them against
-    // whatever position is left. Subtracting them here would refuse a close on account of orders
-    // that cannot precede it — the same class of defect as the priority bug, just milder.
-    //
-    // Also skips the list load entirely, which is the cheap path for the common close.
-    let capacity = match queue {
-        QueuePosition::Immediate => pos.amount.unsigned_abs(),
-        QueuePosition::Resting { price } => {
-            let entries = load_side_entries(context, user, market_id, side)?;
-            capacity_for_new(&pos, &entries, side, price)
-        }
-    };
+    // An immediate order is bounded by the POSITION and by nothing else; a resting one by the
+    // prefix condition. See `closing_capacity`, which a fired conditional order shares.
+    let capacity = closing_capacity(context, user, market_id, side, &pos, queue)?;
 
     let mut accepted = request.min(capacity);
     if step_size > 0 {
@@ -366,11 +411,20 @@ fn load_side_entries<H: PerpHost>(
     market_id: u64,
     side: Side,
 ) -> Result<std::collections::VecDeque<OrderEntry>, PerpError> {
-    let arc = match side {
-        Side::Buy => storage::load_buy_orders_ref(context, user, market_id)?,
-        Side::Sell => storage::load_sell_orders_ref(context, user, market_id)?,
-    };
-    Ok((*arc).clone())
+    Ok((*side_entries_ref(context, user, market_id, side)?).clone())
+}
+
+/// [`load_side_entries`] without the copy, for a caller that only reads the list.
+fn side_entries_ref<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    side: Side,
+) -> Result<std::sync::Arc<std::collections::VecDeque<OrderEntry>>, PerpError> {
+    match side {
+        Side::Buy => storage::load_buy_orders_ref(context, user, market_id),
+        Side::Sell => storage::load_sell_orders_ref(context, user, market_id),
+    }
 }
 
 #[cfg(test)]

@@ -6940,7 +6940,15 @@ mod golden {
     /// msgpack integer above 127 is wider than a fixint. Plus the version byte. The
     /// `BusinessSnapshot` is UNCHANGED, field for field (asserted below).
     ///
-    /// Prior values 0xc1379f42cc51db429ce10ab455e6daeb918a81bca8df7d210ae584768e631988 (36, STP),
+    /// Re-pinned for the conditional-order series (`BLOCK_COMMITMENT_VERSION` 37 → 38), first for
+    /// the `fire()` capacity fix: a fired order that fills immediately is bounded by `|position|`
+    /// alone. The scenario's one conditional (CAROL's Phase-9d stop) never fires, so only the
+    /// version byte moved — VERIFIED: with the fix in place and the byte still 37 the scenario
+    /// reproduced the previous pin 0x525fea15…33ee. `BusinessSnapshot` UNCHANGED.
+    ///
+    /// Prior values 0x525fea15e0541c3a4441899ac1d7862a0fc5d2cb3dae2a933a6b3b5594d933ee (37, ppm
+    /// fees + maker rebate),
+    /// 0xc1379f42cc51db429ce10ab455e6daeb918a81bca8df7d210ae584768e631988 (36, STP),
     /// 0x064ca8b4d053dc1def05f9991d75afd9dc52440890525c0a2efbc018382f8912,
     /// 0x2ffa38aefbdfa68307eb6869b95cb48d9828f407dce2924f2abd8ef5c5c0b88d,
     /// 0x8362c452406bbd6f048358985803964c672ad20444e3f362327114a403b7ebb8,
@@ -6952,7 +6960,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x525fea15e0541c3a4441899ac1d7862a0fc5d2cb3dae2a933a6b3b5594d933ee");
+        b256!("0x720411d896e56b98c027a692b9cb8afba35c93accce39ccbef86a1a59f93e3e0");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

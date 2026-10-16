@@ -272,7 +272,22 @@ use primitives::{B256, U256};
 //     no rebate), but only reachable once the admin raises `R`: with no negative rate anywhere every
 //     write is byte-identical. The golden scenario sets none, so its pin and BusinessSnapshot do
 //     not move.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 37;
+// ── 38 ───────────────────────────────────────────────────────────────────────────────────
+// Conditional orders: the fire() capacity fix, closePosition parity and the trailing stop. ONE
+// bump covers the series; each commit adds its line.
+//   * A fired conditional order is sized by the SAME capacity rule as `placeOrder`'s reduce-only
+//     admission (`reduce_only::closing_capacity`). One that fills immediately — the `_MARKET` pair,
+//     or a limit IOC / FOK — is bounded by `|position|` alone; it used to have the owner's resting
+//     reduce-only orders (and the normal orders "ahead of the mark") subtracted too, so a stop
+//     beside a full-size reduce-only take-profit closed nothing and expired (reason 6), and beside
+//     a half-size one closed only half. The resting reduce-only orders it leaves over-committed are
+//     evicted after the fill by the ordinary pass (Binance `er=4`). A fired order that RESTS (GTC /
+//     PostOnly) keeps the prefix condition at its own limit price. An execution-rule change (a node
+//     on 37 expires a stop that a node on 38 fills), no layout change. The golden scenario fires
+//     no trigger, so its write set and BusinessSnapshot are byte-identical — VERIFIED: with the fix
+//     in place and this byte still 37 the scenario reproduced the old pin 0x525fea15…33ee. Only
+//     this byte moves the golden. CHAIN change: golden re-pin + a coordinated wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 38;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

@@ -1245,11 +1245,7 @@ pub(crate) fn place_order_core<H: PerpHost>(
             validated.side,
             // Derived from the ORDER KIND, never from the price alone: a market/IOC/FOK order has no
             // queue position, and a market order's price is not even set.
-            if validated.kind.has_resting_queue_position() {
-                crate::reduce_only::QueuePosition::Resting { price }
-            } else {
-                crate::reduce_only::QueuePosition::Immediate
-            },
+            crate::reduce_only::QueuePosition::for_kind(validated.kind, price),
             quantity,
             validated.market.step_size,
         )?

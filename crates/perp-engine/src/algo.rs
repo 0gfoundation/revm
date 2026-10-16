@@ -38,8 +38,8 @@ use crate::interface::IPerpDex::{
     placeAlgoOrderCall, placeAlgoOrderSignedCall,
 };
 use crate::types::{
-    AlgoOrderType, CancelReason, Order, OrderStatus, OrderType, Side, StpMode, TimeInForce,
-    WorkingType, ALGO_TYPE_CONDITIONAL,
+    AlgoOrderType, CancelReason, Order, OrderKind, OrderStatus, OrderType, Side, StpMode,
+    TimeInForce, WorkingType, ALGO_TYPE_CONDITIONAL,
 };
 use crate::{errors::perp_err, storage, PerpError, PERP_DEX_ADDRESS};
 use alloy_primitives::IntoLogData;
@@ -716,31 +716,34 @@ fn fire<H: PerpHost>(
     order: &Order,
 ) -> Result<(), PerpError> {
     let owner = Address::from(order.owner);
-    let pos = storage::load_position(context, owner, market_id)?;
+    let pos = storage::load_position_ref(context, owner, market_id)?;
 
-    // How much this order may actually close, given the position it is protecting and everything
-    // already resting ahead of it. `closePosition` means "whatever is open AT TRIGGER TIME".
+    // What the trigger produces — derived ONCE, and it feeds both the capacity rule below and the
+    // placement at the end, so the two cannot disagree about what kind of order this is. A `_MARKET`
+    // conditional becomes a market order (implicitly IOC); a limit one keeps the TIF it was placed
+    // with.
+    let kind = match order.order_type {
+        OrderType::Market => OrderKind::Market,
+        OrderType::Limit => OrderKind::Limit(order.tif),
+    };
+
+    // How much this order may actually close: THE SAME RULE `placeOrder`'s reduce-only admission
+    // applies (`reduce_only::closing_capacity`), keyed on where the fired order sits in its owner's
+    // own queue. An immediate one — the `_MARKET` pair, or a limit IOC / FOK — fills before every
+    // resting order, so it is bounded by `|position|` alone, and the post-fill eviction pass trims
+    // whatever resting reduce-only orders it leaves over-committed (Binance `er=4`). Only a fired
+    // order that RESTS (GTC / PostOnly) is held to the prefix condition at its own limit price.
+    //
+    // `closePosition` means "whatever is open AT TRIGGER TIME".
     let capacity = match crate::reduce_only::closing_side(&pos) {
-        Some(s) if s == order.side => {
-            let entries = if order.side == Side::Buy {
-                storage::load_buy_orders_ref(context, owner, market_id)?
-            } else {
-                storage::load_sell_orders_ref(context, owner, market_id)?
-            };
-            // Price the prefix at the price this order will actually sit at: its limit price, or
-            // the mark for a market order (which jumps the queue entirely).
-            let at = if order.order_type == OrderType::Market {
-                mark_price
-            } else {
-                order.price
-            };
-            let (normals_ahead, sigma_ro) =
-                crate::reduce_only::prefix_terms(entries.iter(), order.side, Some(at));
-            pos.amount
-                .unsigned_abs()
-                .saturating_sub(normals_ahead)
-                .saturating_sub(sigma_ro)
-        }
+        Some(s) if s == order.side => crate::reduce_only::closing_capacity(
+            context,
+            owner,
+            market_id,
+            order.side,
+            &pos,
+            crate::reduce_only::QueuePosition::for_kind(kind, order.price),
+        )?,
         // Flat, or the position flipped to the same side this order is on — it can only open now,
         // which a reduce-only order may never do.
         _ => 0,
@@ -783,8 +786,9 @@ fn fire<H: PerpHost>(
     });
 
     if qty == 0 {
-        // Nothing left to protect: the position closed, flipped, or is already fully committed to
-        // orders ahead of this one. Binance expires a reduce-only order in exactly this case.
+        // Nothing left to protect: the position closed or flipped, or — for a fired order that
+        // would REST — is already fully committed to orders ahead of it. Binance expires a
+        // reduce-only order in exactly this case.
         storage::delete_order(context, algo_id)?;
         context.log(Log {
             address: PERP_DEX_ADDRESS,
@@ -810,14 +814,11 @@ fn fire<H: PerpHost>(
         *algo_id,
         market_id,
         order.side as u8,
-        if order.order_type == OrderType::Market { 0 } else { order.price },
+        if kind.is_limit() { order.price } else { 0 },
         qty,
-        order.order_type as u8,
-        if order.order_type == OrderType::Market {
-            TimeInForce::Ioc as u8
-        } else {
-            order.tif as u8
-        },
+        kind.order_type() as u8,
+        // A market order reports `Ioc` — what it is.
+        kind.tif() as u8,
         [0u8; 16],
         // Through the one encoder, so the fired order is reduce-only AND carries the mode set at
         // `placeAlgoOrder` — the trigger inherits it.
