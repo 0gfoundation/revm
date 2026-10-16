@@ -239,6 +239,10 @@ use primitives::{B256, U256};
 //     instead of reverting the oracle transaction over the trigger's retained writes. An
 //     execution-rule change (a node on 35 reverts that tick, a node on 36 commits it); the golden
 //     scenario fires no trigger, so its pin does not move.
+//   * A match participant whose only part was LOSING an order (published nothing; `amount`,
+//     `margin` and the account blob as stored) is flushed through the reservation-only position
+//     write: no `AccountBalanceChanged`, and no same-value account write in the block delta. The
+//     golden scenario has no such participant, so its pin does not move.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 36;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

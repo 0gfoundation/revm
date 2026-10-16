@@ -1182,14 +1182,57 @@ impl MatchRegistry {
             } else {
                 None
             };
-            // `Order` for every flushed user: each is in this registry because a matched order
-            // touched them — a maker fill; the taker of an order that filled at all (it joins in
-            // `finalize_compute`); or a resting order the walk CANCELLED in place
-            // (`cancel_rejected_maker_registry`: a fill rejected as opening-into-insolvency), which
-            // may be the taker's own order on a self-match. The last kind moved no money unless
-            // funding settled at first touch (`get_or_load`).
-            storage::save_position(context, user, market_id, &w.pos, AccountUpdateReason::Order)?;
-            storage::save_account(context, user, w.account, AccountUpdateReason::Order)?;
+            // ── Cancel-only participants are SILENT ───────────────────────────────────────────
+            //
+            // Every user is in this registry because a matched order touched them — a maker fill;
+            // the taker of an order that filled at all (it joins in `finalize_compute`); or a
+            // resting order the walk CANCELLED in place (`cancel_rejected_maker_registry`: a fill
+            // rejected as opening-into-insolvency), which may be the taker's own order on a
+            // self-match. The last kind moves no money unless funding settled at first touch
+            // (`get_or_load`).
+            //
+            // `save_position` + `save_account` both MARK the user for an end-of-call
+            // `AccountBalanceChanged`, unconditionally — so a user whose only part in this match
+            // was losing an order got an EMPTY drain row: nothing it publishes had moved. That is
+            // the opposite of Binance's documented rule ("Unfilled orders or cancelled orders will
+            // not make the event ACCOUNT_UPDATE pushed") and of what a direct cancel already does
+            // (`release_open_order_margin` takes the reservation-only route for the same reason).
+            //
+            // So a user who PUBLISHED nothing in this match and whose `amount`, `margin` and
+            // account blob all equal the stored ones takes the reservation-only route: its
+            // `Bid`/`Ask` shrank (the cancel) and `last_funding_index` may have been re-anchored by
+            // a zero-payment funding settle, so the position IS written — but nobody is marked.
+            // Why those three suffice: the payload is `usdcBalance`, `perp_wallet_balance` and
+            // `Σ pos.margin` — the account blob and this market's `margin` — and `amount` is what
+            // a fill moves, so it separates "cancelled" from "traded" for any user that published
+            // nothing. A funding payment moves `margin`; a fee-recipient credit moves the account
+            // bytes; a maker fill publishes. Each of those keeps the old route, so no row that is
+            // owed is dropped.
+            //
+            // ⚠️ `published.is_none()` is part of the predicate, not a mere assertion: a self-trade
+            // can return `amount`, `margin` AND the account to their stored values (sell 1 as maker,
+            // buy it back as taker, at one price, with no fees) while having published a maker-leg
+            // row — that user traded and stays on the old route.
+            //
+            // The order lists are saved and the aggregates resynced ABOVE, on both routes: the list
+            // saves are what maintain the user↔market index membership.
+            let silent = published.is_none() && {
+                let stored = storage::load_position_ref(context, user, market_id)?;
+                stored.amount == w.pos.amount && stored.margin == w.pos.margin
+            } && *storage::load_account_ref(context, user)? == w.account;
+            if silent {
+                storage::save_position_reservation_only(context, user, market_id, w.pos)?;
+            } else {
+                // `Order` for every user who traded or whose money moved in this match.
+                storage::save_position(
+                    context,
+                    user,
+                    market_id,
+                    &w.pos,
+                    AccountUpdateReason::Order,
+                )?;
+                storage::save_account(context, user, w.account, AccountUpdateReason::Order)?;
+            }
             #[cfg(debug_assertions)]
             {
                 let settled = crate::margin_view::index_account_wallet_balances(

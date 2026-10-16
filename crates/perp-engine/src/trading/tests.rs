@@ -14985,6 +14985,222 @@ mod account_snapshot_events {
         assert_event_matches_get_account(&mut ctx, &events[1]);
     }
 
+    // ── Cancel-only match participants are SILENT (D9) ─────────────────────────────────────────
+    //
+    // A user whose only part in a match is LOSING an order (K9 today; STP's maker cancel next)
+    // moved no money, so — Binance: "Unfilled orders or cancelled orders will not make the event
+    // ACCOUNT_UPDATE pushed" — it gets no `AccountBalanceChanged`. The flush used to give it an
+    // empty drain row, because its unconditional `save_position` / `save_account` marked it.
+
+    /// Mark $200 with a band wide enough that $100 fills still execute: a maker SELL at $100 is then
+    /// an opening short whose equity (0) is below maintenance, so K9 cancels it.
+    fn k9_mark(ctx: &mut TestCtx) {
+        let mut market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+        market.mark_price = 200 * TICK;
+        market.price_band_bps = 1_000_000;
+        storage::save_market(ctx, &market).unwrap();
+    }
+
+    /// CAROL long 1 lot at $100, so her sell is a pure CLOSE that K9 does not gate.
+    fn carol_long(ctx: &mut TestCtx) {
+        fund(ctx, CAROL, WALLET);
+        storage::save_position(
+            ctx,
+            CAROL,
+            MARKET_ID,
+            &PerpPosition {
+                amount: QTY as i64,
+                v_quote_balance: -(FILL_VALUE as i64),
+                margin: INIT_MARGIN as i64,
+                leverage: 1,
+                ..PerpPosition::default()
+            },
+            AccountUpdateReason::Adjustment,
+        )
+        .unwrap();
+    }
+
+    /// The K9-cancelled maker (BOB, no pending funding) publishes NOTHING: its `OrderCancelled` is
+    /// the whole story. CAROL, filled behind it, and ALICE, the taker, keep their groups.
+    #[test]
+    fn a_k9_cancelled_maker_without_funding_publishes_no_account_update() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        carol_long(&mut ctx);
+        let bob_sell = place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0);
+        place(&mut ctx, CAROL, 1, PRICE, QTY, 0, 0);
+        k9_mark(&mut ctx);
+        let bob_wallet = wallet(&mut ctx, BOB);
+
+        let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, QTY);
+        assert_account_update_groups(&logs);
+        assert_eq!(
+            stream_shape(&logs),
+            vec![
+                ("OrderPlaced", Some(ALICE)),
+                ("OrderCancelled", Some(BOB)),
+                ("Trade", Some(ALICE)),
+                ("AccountBalanceChanged", Some(CAROL)),
+                ("PositionChanged", Some(CAROL)),
+                ("AccountBalanceChanged", Some(ALICE)),
+                ("PositionChanged", Some(ALICE)),
+            ],
+            "no row for BOB — before the fix he got an empty drain row at the end"
+        );
+        // …while his state really did change in the one way a cancel changes it.
+        assert_terminal(&mut ctx, bob_sell);
+        assert_eq!(pos(&mut ctx, BOB).total_sell_qty, 0, "his Ask shrank");
+        assert_eq!(wallet(&mut ctx, BOB), bob_wallet, "and no money moved");
+    }
+
+    /// The K9-cancelled maker WITH pending funding publishes exactly its funding group — the money
+    /// that did move — and no second, empty row for the cancel.
+    #[test]
+    fn a_k9_cancelled_maker_with_funding_publishes_only_its_funding_group() {
+        let mut ctx = make_ctx();
+        setup_banded(&mut ctx, 1_000_000);
+        set_mark(&mut ctx, PRICE);
+        fund(&mut ctx, CAROL, WALLET);
+        // CAROL short 1 lot, then a stranded ask at $1 that K9 refuses to fill (see
+        // `an_insolvency_rejected_maker_still_reports_its_funding_adjusted_margin`).
+        place(&mut ctx, BOB, 0, PRICE, QTY, 0, 0);
+        place(&mut ctx, CAROL, 1, PRICE, QTY, 0, 0);
+        try_place_limit(&mut ctx, CAROL, 1, TICK).unwrap();
+        storage::save_funding_state(
+            &mut ctx,
+            MARKET_ID,
+            &FundingState {
+                last_funding_rate: -1_000,
+                next_funding_ts: u64::MAX,
+                cumulative_funding_index: -(PRICE as i128) * 1_000,
+            },
+        )
+        .unwrap();
+        let margin_before = pos(&mut ctx, CAROL).margin;
+
+        let logs = crossing_order(&mut ctx, ALICE, 0, TICK, QTY);
+        assert_account_update_groups(&logs);
+        assert_eq!(pos(&mut ctx, CAROL).margin, margin_before - 1_000, "fixture: funding paid");
+        let carol: Vec<_> = account_update_reasons(&logs)
+            .into_iter()
+            .filter(|(u, _)| *u == CAROL)
+            .collect();
+        assert_eq!(
+            carol,
+            vec![(CAROL, AccountUpdateReason::FundingFee)],
+            "the funding group and nothing else"
+        );
+    }
+
+    /// A taker whose ONLY interaction is K9 cancelling its own resting order (a zero-fill
+    /// self-match) joins the registry through that cancel — and must then be as silent as any
+    /// pure placement: `OrderPlaced`, the cancel, `OrderRested`, and no account row.
+    #[test]
+    fn a_zero_fill_self_match_publishes_no_account_update() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let own_sell = place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
+        k9_mark(&mut ctx);
+
+        let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, QTY);
+        assert_eq!(
+            stream_shape(&logs),
+            vec![
+                ("OrderPlaced", Some(ALICE)),
+                ("OrderCancelled", Some(ALICE)),
+                ("OrderRested", Some(ALICE)),
+            ],
+        );
+        assert_terminal(&mut ctx, own_sell);
+        assert_eq!(pos(&mut ctx, ALICE).amount, 0);
+    }
+
+    /// The account-bytes leg of the predicate is not a formality. The fee recipient whose own maker
+    /// order is K9-cancelled joins the registry through that cancel; a LATER maker's fee is then
+    /// credited onto its working copy (`MatchRegistry::credit_admin`'s read-through). It published
+    /// nothing and its position is untouched — but its WALLET moved, so it must keep the old route:
+    /// skipping its `save_account` would not just drop the row, it would drop the fee.
+    #[test]
+    fn a_cancel_only_fee_recipient_still_banks_the_fee_and_gets_its_row() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        fund(&mut ctx, ADMIN, WALLET);
+        carol_long(&mut ctx);
+        storage::save_user_fee_rates(
+            &mut ctx,
+            CAROL,
+            UserFeeRates {
+                maker_fee_bps: 10,
+                taker_fee_bps: 0,
+            },
+        )
+        .unwrap();
+        // ADMIN first in the FIFO (K9 cancels it: an opening short), CAROL behind (a close: filled).
+        place(&mut ctx, ADMIN, 1, PRICE, QTY, 0, 0);
+        place(&mut ctx, CAROL, 1, PRICE, QTY, 0, 0);
+        k9_mark(&mut ctx);
+        let admin_before = wallet(&mut ctx, ADMIN);
+
+        let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, QTY);
+        let fee = calc_trading_fee(FILL_VALUE, 10).unwrap();
+        assert!(fee > 0, "fixture: a real maker fee");
+        assert_eq!(wallet(&mut ctx, ADMIN), admin_before + fee, "the fee is banked");
+        assert!(
+            account_update_reasons(&logs).contains(&(ADMIN, AccountUpdateReason::Order)),
+            "and announced: {:?}",
+            account_update_reasons(&logs)
+        );
+    }
+
+    /// The trap in the silence predicate: a self-trade that ROUND-TRIPS (sell 1 as maker, buy it
+    /// back as taker, one price, no fees) leaves `amount`, `margin` and the account blob exactly as
+    /// stored — yet it TRADED and published a maker-leg row. "Unchanged ⇒ published nothing" is
+    /// false here, which is why `published.is_none()` is part of the predicate rather than an
+    /// assertion about it: this test panics on the assertion form. Both legs still publish.
+    #[test]
+    fn a_round_trip_self_trade_still_publishes_both_legs() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let fees = storage::load_user_fee_rates(&mut ctx, ALICE).unwrap();
+        assert_eq!((fees.maker_fee_bps, fees.taker_fee_bps), (0, 0), "fixture: no fees");
+        let account_before = storage::load_account(&mut ctx, ALICE).unwrap();
+        place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
+
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let out = run_perp_dex_call(
+            &placeOrderCall {
+                marketId: MARKET_ID,
+                side: 0,
+                price: PRICE,
+                quantity: QTY,
+                orderType: 0,
+                tif: 2, // FOK
+                clientOrderId: FixedBytes::default(),
+                flags: 0,
+            }
+            .abi_encode(),
+            10_000_000,
+            ALICE,
+            U256::ZERO,
+            false,
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(!out.reverted, "{:?}", String::from_utf8_lossy(&out.bytes));
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+
+        let p = pos(&mut ctx, ALICE);
+        assert_eq!((p.amount, p.margin), (0, 0), "fixture: the position round-tripped to flat");
+        let mut account_after = storage::load_account(&mut ctx, ALICE).unwrap();
+        account_after.nonce = account_before.nonce;
+        assert_eq!(account_after, account_before, "fixture: the account round-tripped too");
+        assert_eq!(
+            snapshots_of(&logs).iter().map(|e| e.user).collect::<Vec<_>>(),
+            vec![ALICE, ALICE],
+            "maker-leg row + taker-leg row, as for any self-trade"
+        );
+    }
+
     /// **The one branch where a bug LOSES an event: the fee recipient is also a maker.**
     ///
     /// ADMIN rests a sell at `PRICE`; BOB rests one a tick worse. ALICE sweeps both, so ADMIN's own
