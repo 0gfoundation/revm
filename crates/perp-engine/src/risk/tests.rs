@@ -7091,6 +7091,46 @@ mod algo_trigger_sweep {
         );
     }
 
+    /// A trigger is never refused by the per-market open-order cap, even when its owner sits AT
+    /// the cap: `fire` takes the conditional off the owner's list before placing it, so the fired
+    /// limit order converts one counted open order into another. Were it refused, the refusal
+    /// would land inside the ORACLE transaction.
+    ///
+    /// ⚠️ Mutation note: "check the cap on the trigger path too" is an EQUIVALENT mutation — by the
+    /// argument above the count a trigger sees is at most 199, so the check would pass. What this
+    /// pins is the outcome (rests, no error, still exactly at the cap), and the `Triggered` arm's
+    /// `debug_assert!` pins the invariant that makes the skip safe.
+    #[test]
+    fn a_trigger_at_the_open_order_cap_still_rests() {
+        use crate::algo::MAX_OPEN_ORDERS_PER_MARKET;
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, 100_000_000_000);
+        let id = place_algo(&mut ctx, ALICE, Side::Sell, AlgoOrderType::Stop, 9_900, 9_950, QTY as u64, RO);
+        // 199 resting bids, inside the fill-time band so the oracle tick's band expiry leaves them
+        // alone, and below the stop's price so the fired sell does not cross them.
+        for _ in 0..MAX_OPEN_ORDERS_PER_MARKET - 1 {
+            place_order(&mut ctx, ALICE, Side::Buy as u8, 9_000, 1);
+        }
+        let open = |ctx: &mut TestCtx| {
+            storage::book_order_count(ctx, ALICE, MARKET_ID).unwrap()
+                + storage::load_user_algo_orders(ctx, ALICE, MARKET_ID).unwrap().len()
+        };
+        assert_eq!(open(&mut ctx), MAX_OPEN_ORDERS_PER_MARKET, "fixture: exactly at the cap");
+        let e = try_place_order(&mut ctx, ALICE, Side::Buy as u8, 9_000, 1).unwrap_err();
+        assert!(format!("{e:?}").contains("max open orders reached"), "got {e:?}");
+
+        oracle_tick(&mut ctx, 9_900, 31);
+
+        assert_eq!(storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap(), vec![9_950]);
+        assert_eq!(
+            storage::load_order(&mut ctx, &id).unwrap().expect("rested").status,
+            OrderStatus::Open
+        );
+        assert!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().is_empty());
+        assert_eq!(open(&mut ctx), MAX_OPEN_ORDERS_PER_MARKET, "one counted order became another");
+    }
+
     /// **`closePosition` reads the position AT TRIGGER TIME, which had no test.** The flag only
     /// appeared in rejection assertions, so the branch that substitutes `|position|` for the
     /// (necessarily zero) `quantity` had never run.

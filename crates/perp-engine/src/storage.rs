@@ -1291,6 +1291,51 @@ pub fn ensure_user_market_admission<H: PerpHost>(
     Ok(())
 }
 
+/// Resting BOOK orders `user` holds in `market_id`: the per-(user, market) buy list plus the sell
+/// list. Each resting order has exactly one entry in its owner's list for its side (an entry
+/// leaves the list when its order fills or is cancelled), so this is the exact count. Two `_ref`
+/// probes, no decode on a warm list.
+pub fn book_order_count<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<usize, PerpError> {
+    Ok(load_buy_orders_ref(context, user, market_id)?.len()
+        + load_sell_orders_ref(context, user, market_id)?.len())
+}
+
+/// Pre-write admission gate for [`crate::algo::MAX_OPEN_ORDERS_PER_MARKET`] on the ordinary
+/// placement path: refuses when the user's open orders in this market — book buys + book sells +
+/// untriggered conditionals — are already at the cap. Pure read, so a refusal is a genuine
+/// (write-clean) reject.
+///
+/// The caller decides WHETHER it applies (only to an order that can rest); this only counts.
+///
+/// The conditional list is read only when it could matter: it never holds more than
+/// [`crate::algo::MAX_ALGO_ORDERS_PER_MARKET`] ids, so while the book count alone is more than that
+/// below the cap the answer is already "admit" and the extra (usually cold, usually empty) read is
+/// skipped. Exact, not a heuristic — it is the same comparison with the algo term at its maximum.
+pub fn ensure_open_order_capacity<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<(), PerpError> {
+    use crate::algo::{MAX_ALGO_ORDERS_PER_MARKET, MAX_OPEN_ORDERS_PER_MARKET};
+    let book = book_order_count(context, user, market_id)?;
+    if book + MAX_ALGO_ORDERS_PER_MARKET < MAX_OPEN_ORDERS_PER_MARKET {
+        return Ok(());
+    }
+    let algo = load_user_algo_orders(context, user, market_id)?.len();
+    debug_assert!(
+        algo <= MAX_ALGO_ORDERS_PER_MARKET,
+        "conditional list of {user} in market {market_id} exceeds its own cap: {algo}"
+    );
+    if book + algo >= MAX_OPEN_ORDERS_PER_MARKET {
+        return Err(perp_err("placeOrder: max open orders reached"));
+    }
+    Ok(())
+}
+
 /// Adds `market_id` to `user`'s set (idempotent; keeps it ascending).
 ///
 /// The cap here is an INVARIANT backstop, not the enforcement point: every path that can reach it

@@ -220,7 +220,17 @@ use primitives::{B256, U256};
 // duplicate instead of reaching the cancel. The golden scenario sends no signed algo cancel, so
 // its write set and BusinessSnapshot are byte-identical at 34 and 35; only this byte moves the
 // golden. CHAIN change: golden re-pin + a coordinated wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 35;
+// ── 36 ───────────────────────────────────────────────────────────────────────────────────
+// The self-trade-prevention series. ONE bump covers the whole series; each commit that moves the
+// golden re-pins it and adds its line here.
+//   * Per-market open-order cap (`algo::MAX_OPEN_ORDERS_PER_MARKET` = 200, Binance's
+//     `MAX_NUM_ORDERS`): book buys + book sells + untriggered conditionals per (user, market). A
+//     GTC / PostOnly placement or a `placeAlgoOrder` at the cap is refused pre-write; IOC / FOK /
+//     market orders, liquidation closes and fired triggers are never refused by it. A pure
+//     tightening (a node on 35 accepts what a node on 36 refuses, never the reverse), no layout
+//     change. The golden scenario never comes near 200 orders, so its write set and
+//     BusinessSnapshot are byte-identical; only this byte moves the golden.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 36;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

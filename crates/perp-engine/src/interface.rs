@@ -611,6 +611,11 @@ sol! {
         /// margin and no open-order requirement until then, and at trigger becomes an ordinary
         /// order that matches by the ordinary rules.
         ///
+        /// It DOES count as an open order: at most 32 untriggered conditionals per (user, market),
+        /// and those count toward the 200 per-market open-order cap shared with resting orders
+        /// (see `placeOrder`) — `placeAlgoOrder: max open orders reached`. Its trigger is never
+        /// refused by that cap: firing takes it off the conditional list as it enters the book.
+        ///
         /// algoType: must be 0 (`CONDITIONAL`). Binance's Algo API also serves TWAP/VP execution
         ///   algos; the field is carried so adding those later needs no new selector.
         ///
@@ -837,6 +842,14 @@ sol! {
         ///     that exists. Reverts with `placeOrder: tif not allowed for market order`.
         /// A market order always reports `tif = 1` (IOC) in `OrderPlaced`, whichever of the two
         /// accepted bytes was sent.
+        ///
+        /// Open-order cap: a user may hold at most `MAX_OPEN_ORDERS_PER_MARKET` (200) open orders
+        /// per market — resting orders on BOTH sides plus untriggered conditional orders (Binance's
+        /// `MAX_NUM_ORDERS`). An order that can rest (GTC, PostOnly) is refused at the cap with
+        /// `placeOrder: max open orders reached`, judged on the count BEFORE it matches, so at the
+        /// cap even a GTC that would have filled completely is refused. IOC, FOK and market orders
+        /// are never refused by it (a user at the cap can always close), and nothing already open
+        /// is cancelled by it.
         /// clientOrderId: optional caller-assigned tracking ID; pass bytes16(0) if unused.
         ///   Emitted in events but not stored or validated on-chain.
         /// Returns a unique order ID.
@@ -891,7 +904,8 @@ sol! {
         /// Atomicity is **abort-forward**, not all-or-nothing: items run in strict calldata order and
         /// a per-item genuine reject (unknown/inactive market, bad side/orderType/tif, an illegal
         /// (orderType, tif) pair, qty or price
-        /// out of range, PostOnly would cross, FOK unfillable, insufficient margin, K9
+        /// out of range, the open-order cap (counting the items before it that rested), PostOnly
+        /// would cross, FOK unfillable, insufficient margin, K9
         /// open-into-insolvency) does NOT undo the items before it. The call returns Ok once the loop
         /// has begun. A rejected item is write-clean AND log-clean — it emits no `OrderPlaced`.
         ///

@@ -46,6 +46,30 @@ use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
 use primitives::{Address, Bytes, FixedBytes, Log};
 
+/// Open orders one user may hold in one market: resting book orders on BOTH sides plus untriggered
+/// conditional orders. Binance USDⓈ-M's `MAX_NUM_ORDERS` filter is 200 too (`-2025` "Reach max open
+/// order limit.").
+///
+/// # Why it exists
+///
+/// Every per-user walk over a market's orders is bounded by it: the reduce-only prefix and eviction
+/// passes, the cover-cancel loop in taker settlement, and liquidation's / ADL's
+/// `cancel_all_orders_for_market`, which runs inside an already-capped sweep. It also bounds how
+/// many of a user's OWN orders a single taker can meet on the opposite side of the book.
+///
+/// # Where it is enforced
+///
+/// At placement only, and only for an order that can REST (GTC, PostOnly) or for a conditional
+/// order; nothing already open is ever cancelled by it. The count is taken BEFORE the match, so at
+/// the cap a GTC that would have filled completely is refused too — the same "filter at submission"
+/// shape as Binance. IOC / FOK / market orders and liquidation closes are never refused by it, so a
+/// user at the cap can always close. A triggered conditional order is not re-checked: it left the
+/// conditional list before it was placed, so it converts one counted order into another and cannot
+/// raise the count.
+///
+/// `MAX_ALGO_ORDERS_PER_MARKET` is a sub-cap INSIDE this one, not on top of it.
+pub const MAX_OPEN_ORDERS_PER_MARKET: usize = 200;
+
 /// Untriggered conditional orders one user may hold in one market.
 ///
 /// Not cosmetic: liquidation and ADL both call `cancel_all_orders_for_market`, which must clear
@@ -195,6 +219,12 @@ fn place_core<H: PerpHost>(
             "placeAlgoOrder: too many open conditional orders in this market",
         ));
     }
+    // The combined cap: an untriggered conditional is an open order too.
+    if storage::book_order_count(context, account, market_id)? + live.len()
+        >= MAX_OPEN_ORDERS_PER_MARKET
+    {
+        return Err(perp_err("placeAlgoOrder: max open orders reached"));
+    }
 
     let order = Order {
         owner: account.0 .0,
@@ -302,8 +332,13 @@ pub fn run_place_algo_order<H: PerpHost>(
         &market,
     )?;
     let (algo_id, bumped) = crate::trading::peek_order_id(context, caller)?;
+    let out = place_core(context, caller, a.marketId, algo_id, v, a.clientAlgoId, a.flags)?;
+    // The nonce bump is persisted only once the placement has succeeded, exactly as on
+    // `placeOrder`. It used to be written BEFORE `place_core`, so `place_core`'s two capacity
+    // rejects fired after a perp write — a commit-only #23 leak (the nonce advanced under a reverted
+    // call) that only went unnoticed because the tests drove this handler below the call shell.
     crate::trading::commit_order_nonce(context, caller, bumped)?;
-    place_core(context, caller, a.marketId, algo_id, v, a.clientAlgoId, a.flags)
+    Ok(out)
 }
 
 /// `cancelAlgoOrder(bytes32 algoId, uint64 marketId)`
@@ -751,6 +786,7 @@ fn fire<H: PerpHost>(
         },
         [0u8; 16],
         FLAG_REDUCE_ONLY,
+        crate::trading::PlacementOrigin::Triggered,
         context,
     )?;
     Ok(())

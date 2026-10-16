@@ -301,6 +301,10 @@ pub enum PerpBatchReason {
     /// product: FOK or PostOnly on a MARKET order. Distinct from [`Self::InvalidTif`], which means
     /// the tif byte itself is out of range.
     TifNotAllowedForOrderType = 32,
+    /// `placeOrder: max open orders reached` — the item would REST (GTC / PostOnly) and its owner
+    /// already holds `algo::MAX_OPEN_ORDERS_PER_MARKET` open orders in that market (book orders on
+    /// both sides, earlier items of this batch included, plus untriggered conditionals).
+    MaxOpenOrders = 33,
     /// A checked-arithmetic guard (`… overflow` / `… underflow` / `exceeds i64…`), matched
     /// structurally because the engine has ~30 of them and they are all
     /// unreachable-by-construction. Path-independent, hence the engine band.
@@ -371,6 +375,7 @@ fn place_reason(rest: &str) -> PerpBatchReason {
         "insufficient perp wallet for margin" => PerpBatchReason::InsufficientMargin,
         "open would breach maintenance margin" => PerpBatchReason::OpenIntoInsolvency,
         "fee recipient not initialised" => PerpBatchReason::FeeRecipientNotSet,
+        "max open orders reached" => PerpBatchReason::MaxOpenOrders,
         other if is_arith_guard(other) => PerpBatchReason::ArithmeticGuard,
         _ => PerpBatchReason::Other,
     }

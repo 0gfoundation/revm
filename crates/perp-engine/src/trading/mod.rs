@@ -67,6 +67,7 @@ pub fn run_place_order<H: PerpHost>(
         args.tif,
         args.clientOrderId.0,
         args.flags,
+        PlacementOrigin::Submitted,
         context,
     )?;
     // Placement succeeded — persist the nonce bump (commit-only: rejected placements above
@@ -187,6 +188,7 @@ pub fn run_place_order_signed<H: PerpHost>(
         args.tif,
         args.clientOrderId.0,
         args.flags,
+        PlacementOrigin::Submitted,
         context,
     )
     .map_err(|e| e.after_retained_writes(burn_writes))?;
@@ -664,6 +666,7 @@ fn place_batch_item<H: PerpHost>(
         item.tif,
         item.clientOrderId.0,
         item.flags,
+        PlacementOrigin::Submitted,
         context,
     )?;
     Ok(if status.is_terminal() {
@@ -1110,6 +1113,17 @@ struct ValidatedOrder {
     reduce_only: bool,
 }
 
+/// Where an ordinary placement comes from. It decides one thing only: whether the per-market
+/// open-order cap ([`crate::algo::MAX_OPEN_ORDERS_PER_MARKET`]) is checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacementOrigin {
+    /// A user submission: `placeOrder`, `placeOrderSigned`, a batch item (also via `asSubAccount`).
+    Submitted,
+    /// A conditional order the trigger sweep fired (`algo::fire`), placed inside an ORACLE
+    /// transaction on the owner's behalf.
+    Triggered,
+}
+
 /// Validate → build in memory → execute → ONE final persist. Returns the taker order's FINAL status,
 /// which is the whole outcome the callers need: `Open`/`PartiallyFilled` = it rests, and anything
 /// `is_terminal()` = it fully filled or its IOC/FOK/market remainder expired, leaving no record.
@@ -1126,6 +1140,7 @@ pub(crate) fn place_order_core<H: PerpHost>(
     tif_u8: u8,
     client_order_id: [u8; 16],
     flags: u8,
+    origin: PlacementOrigin,
     context: &mut H,
 ) -> Result<OrderStatus, PerpError> {
     let validated = validate_place_order(
@@ -1144,6 +1159,37 @@ pub(crate) fn place_order_core<H: PerpHost>(
     // user already holds a position or a resting order. Placed with the other genuine rejects,
     // BEFORE any write, so the commit-only "no reject after a write" rule holds.
     storage::ensure_user_market_admission(context, account, market_id)?;
+
+    // ── per-market open-order cap ──────────────────────────────────────────────────────────────
+    //
+    // Only for an order that can REST — GTC and PostOnly, i.e. exactly the kinds with a resting
+    // queue position. An IOC / FOK / market order never adds a book entry, so it is never refused
+    // here: a user at the cap can still close. The count is the PRE-match one (a GTC that would have
+    // filled completely is refused at the cap too — a submission filter, like Binance's). Pre-write,
+    // like the market-index cap above.
+    if validated.kind.has_resting_queue_position() {
+        match origin {
+            PlacementOrigin::Submitted => {
+                storage::ensure_open_order_capacity(context, account, market_id)?
+            }
+            // NOT re-checked, so the cap can never refuse inside an oracle transaction. It could not
+            // anyway: `fire` removes the conditional from the owner's list BEFORE placing it, so a
+            // trigger trades one counted open order for another (conditional −1, book ≤ +1), and
+            // every conditional was itself admitted under the cap.
+            PlacementOrigin::Triggered => {
+                #[cfg(debug_assertions)]
+                {
+                    let open = storage::book_order_count(context, account, market_id)?
+                        + storage::load_user_algo_orders(context, account, market_id)?.len();
+                    debug_assert!(
+                        open < crate::algo::MAX_OPEN_ORDERS_PER_MARKET,
+                        "a triggered order found {account} at the open-order cap ({open}) in \
+                         market {market_id}: some path admitted an order without the cap check"
+                    );
+                }
+            }
+        }
+    }
 
     // ── reduce-only admission: the ONE place the invariant is enforced ────────────────────────
     //
