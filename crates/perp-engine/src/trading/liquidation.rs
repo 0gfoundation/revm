@@ -65,6 +65,8 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         // orders in this market are all cancelled before it runs, so it cannot meet one). The
         // field is the default only because the record has to hold something.
         stp: StpMode::default(),
+        // Not a conditional order, so bound to no position.
+        position_generation: 0,
     };
     // commit-only #23: the close order is persisted ONCE after matching (below); the
     // OrderPlaced log keeps its original position (logs are EVM-journaled).

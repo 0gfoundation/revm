@@ -3424,6 +3424,8 @@ fn taker_reverse_uses_released_close_margin_before_opening_margin_check() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: (INIT_MARGIN - TAKER_FEE * 2) as i64,
             leverage: 1,
+            // The flip ENDED the short's life: a new generation (see `PerpPosition::generation`).
+            generation: 1,
             ..PerpPosition::default()
         }
     );
@@ -3481,6 +3483,8 @@ fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
             // close). This position is a fresh LONG whose `v_quote_balance` carries no trace of the
             // short it replaced, so a `cr` of 0 here would be a lost round.
             cumulative_realized_pnl: 100_000,
+            // The flip ENDED the short's life: a new generation (see `PerpPosition::generation`).
+            generation: 1,
             ..PerpPosition::default()
         }
     );
@@ -6946,7 +6950,19 @@ mod golden {
     /// version byte moved — VERIFIED: with the fix in place and the byte still 37 the scenario
     /// reproduced the previous pin 0x525fea15…33ee. `BusinessSnapshot` UNCHANGED.
     ///
-    /// Prior values 0x525fea15e0541c3a4441899ac1d7862a0fc5d2cb3dae2a933a6b3b5594d933ee (37, ppm
+    /// Re-pinned again within 38 for closePosition parity: `PerpPosition` gains a trailing
+    /// "g" (`generation`) and `Order` a trailing "pg" (`position_generation`), positional msgpack,
+    /// appended — so every position blob and every order blob the scenario writes is one byte
+    /// longer (a fixint: 0 on every order, since CAROL's stop is a reduce-only quantity order and
+    /// bound to nothing; on a position, how many times it has gone flat or flipped). A LAYOUT
+    /// change only: the new placement rules (reduceOnly + closePosition refused, "would
+    /// immediately trigger" refused, closePosition bound to an open position) refuse nothing the
+    /// scenario sends — CAROL's BUY stop sits above the mark — and its stop never fires.
+    /// `BusinessSnapshot` UNCHANGED. VERIFIED: with both fields `#[serde(skip)]` the scenario
+    /// reproduced the previous pin 0x720411d8…e3e0.
+    ///
+    /// Prior values 0x720411d896e56b98c027a692b9cb8afba35c93accce39ccbef86a1a59f93e3e0 (38, fire()
+    /// capacity fix), 0x525fea15e0541c3a4441899ac1d7862a0fc5d2cb3dae2a933a6b3b5594d933ee (37, ppm
     /// fees + maker rebate),
     /// 0xc1379f42cc51db429ce10ab455e6daeb918a81bca8df7d210ae584768e631988 (36, STP),
     /// 0x064ca8b4d053dc1def05f9991d75afd9dc52440890525c0a2efbc018382f8912,
@@ -6960,7 +6976,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x720411d896e56b98c027a692b9cb8afba35c93accce39ccbef86a1a59f93e3e0");
+        b256!("0xa72ce19d4e1c033989c620e39e9a7e09d6b483aee1c38cfe0d9e08770898d940");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -8575,6 +8591,7 @@ mod batch_cancel {
                             trigger_up: false,
                             close_position: false,
                             stp: Default::default(),
+                            position_generation: 0,
             },
         )
         .unwrap();

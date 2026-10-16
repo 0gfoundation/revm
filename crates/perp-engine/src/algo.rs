@@ -31,6 +31,33 @@
 //! before trigger, which leaves "triggered but cannot afford to open" as a case its own
 //! documentation does not describe; a reduce-only conditional has a zero open-order requirement
 //! before AND after trigger, so the case cannot arise here at all.
+//!
+//! # closePosition (Binance parity)
+//!
+//! * `reduceOnly` and `closePosition` are EXCLUSIVE (Binance: reduceOnly "cannot be sent with
+//!   closePosition=true"); a closePosition order is reduce-only by construction.
+//! * It is BOUND TO THE POSITION open when it is placed — Binance's `GTE_GTC`. Placement needs an
+//!   open position with the order on its closing side, and records that position's
+//!   `PerpPosition::generation`. Once the position has gone flat or flipped, the order is spent
+//!   when its trigger fires (`AlgoOrderTriggered`, then `AlgoOrderCancelled(PositionClosed = 11)`),
+//!   even if a new position has been opened the same way since. The expiry is LAZY: closing a
+//!   position touches no order, so until it would fire the dead order still lists in
+//!   `getOpenAlgoOrders` and still counts toward the caps — cancel it to free the slot sooner.
+//! * There is NO one-per-direction limit (Binance's `-4130` is unconfirmed outside `GTE_GTC`, and
+//!   the 32-per-market cap already bounds the list).
+//! * There is NO one-shot "close position now" selector, and none is needed: a reduce-only MARKET
+//!   `placeOrder` with `quantity ≥ |position|` is admitted and truncated to `|position|` (an
+//!   immediate order is bounded by the position alone, `reduce_only::closing_capacity`), which is
+//!   Binance's own recipe. Pinned by
+//!   `trading::tests::reduce_only_e2e::a_market_reduce_only_order_is_still_truncated_to_the_position`.
+//!
+//! # Every conditional order is refused if it would fire NOW
+//!
+//! Binance `-2021` "Order would immediately trigger": at placement, the sweep's own predicate
+//! (`trigger_fires`, inclusive) is evaluated on the STORED mark, and a trigger it is already
+//! satisfied by is refused (`placeAlgoOrder: order would immediately trigger`). Before the first
+//! oracle tick that mark is the market's `initialMarkPrice`; a zero mark — unreachable through
+//! the ABI — has no reference and skips the check, as the price band does.
 
 use crate::host::PerpHost;
 use crate::interface::IPerpDex::{
@@ -149,6 +176,16 @@ fn validate(
     let reduce_only = flags & FLAG_REDUCE_ONLY != 0;
     let close_position = flags & FLAG_CLOSE_POSITION != 0;
 
+    // Binance: `reduceOnly` "cannot be sent with closePosition=true". The pair is not a stronger
+    // order, only an ambiguous one: a closePosition order is reduce-only by construction (it
+    // closes `|position|` at trigger and the trigger places it reduce-only), so accepting both
+    // bits would give one order two spellings and the record a flag that says nothing.
+    if reduce_only && close_position {
+        return Err(perp_err(
+            "placeAlgoOrder: reduceOnly cannot be sent with closePosition",
+        ));
+    }
+
     // Phase scope — see the module docs for why this restriction removes a whole failure class
     // rather than merely deferring it.
     if !reduce_only && !close_position {
@@ -200,11 +237,30 @@ fn validate(
         // be able to close a dust remainder.
     }
 
+    // ── Would it fire on the stored mark right now? Then refuse it (Binance `-2021`) ─────────────
+    //
+    // Evaluated with THE SWEEP'S OWN PREDICATE (`trigger_fires`) on the mark the next sweep would
+    // see first, so "would immediately trigger" means exactly "the next oracle tick fires it if the
+    // mark does not move" — including equality, where the sweep fires. Accepting it instead would
+    // not execute it now (triggers run only inside the oracle sweep), it would execute it at
+    // whatever the NEXT mark is: a stop the caller may have meant as a limit-style "only below
+    // here" is filled at a price nobody chose. Binance answers "Order would immediately trigger".
+    //
+    // `mark_price == 0` skips the check: there is no reference to compare against, the same
+    // convention as the price band (`math::price_band` — "mark == 0: no band"). It is unreachable
+    // through the ABI — `addMarket` refuses `initialMarkPrice == 0` and the oracle path floors every
+    // mark component at 1 — so before the first oracle tick the reference is simply the market's
+    // `initialMarkPrice`, and only a hand-built fixture can carry 0.
+    let trigger_up = kind.trigger_up(side);
+    if market.mark_price != 0 && trigger_fires(trigger_up, trigger_price, market.mark_price) {
+        return Err(perp_err("placeAlgoOrder: order would immediately trigger"));
+    }
+
     Ok(ValidatedAlgo {
         side,
         kind,
         trigger_price,
-        trigger_up: kind.trigger_up(side),
+        trigger_up,
         price,
         quantity,
         tif,
@@ -238,7 +294,7 @@ fn place_core<H: PerpHost>(
         return Err(perp_err("placeAlgoOrder: max open orders reached"));
     }
 
-    let order = Order {
+    let mut order = Order {
         owner: account.0 .0,
         market_id,
         side: v.side,
@@ -259,7 +315,31 @@ fn place_core<H: PerpHost>(
         trigger_up: v.trigger_up,
         close_position: v.close_position,
         stp: v.stp,
+        // Set below, for a position-bound order only.
+        position_generation: 0,
     };
+
+    // ── Position binding (Binance `GTE_GTC`) ─────────────────────────────────────────────────────
+    //
+    // A position-bound order (`Order::is_position_bound` — a closePosition one) belongs to the
+    // position that is open NOW: it is refused unless one is open and the order is on its closing
+    // side, and it records which life of the position that is. When it fires, `fire` compares that
+    // against the position's current `generation`; if the position went flat or flipped in between
+    // — even if a new one has since been opened the same way — the order is spent with
+    // `PositionClosed` instead of closing a position it was never placed against. That comparison
+    // is the whole expiry, so closing a position costs nothing extra.
+    //
+    // Still pre-write: the position is only read.
+    if order.is_position_bound() {
+        let pos = storage::load_position_ref(context, account, market_id)?;
+        if crate::reduce_only::closing_side(&pos) != Some(v.side) {
+            return Err(perp_err(
+                "placeAlgoOrder: closePosition requires an open position on the closing side",
+            ));
+        }
+        order.position_generation = pos.generation;
+    }
+
     storage::save_order(context, &algo_id, &order)?;
     storage::algo_index_insert(context, market_id, v.trigger_up, v.trigger_price, algo_id)?;
     live.push(algo_id);
@@ -607,6 +687,18 @@ pub fn run_cancel_algo_order_signed<H: PerpHost>(
 
 // ── Trigger sweep ─────────────────────────────────────────────────────────────────────────────
 
+/// THE firing predicate: does a trigger in direction `trigger_up` at `trigger_price` fire on
+/// `mark`? Inclusive both ways. One definition for the sweep and for placement's
+/// "would immediately trigger" refusal, so the two cannot disagree at the boundary.
+#[inline]
+pub(crate) fn trigger_fires(trigger_up: bool, trigger_price: u64, mark: u64) -> bool {
+    if trigger_up {
+        mark >= trigger_price
+    } else {
+        mark <= trigger_price
+    }
+}
+
 /// Walk the trigger index and execute whatever the current mark fires.
 ///
 /// # NOT latched — the condition must hold at EXECUTION time
@@ -641,12 +733,7 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
             storage::load_algo_down_prices(context, market_id)?
         };
         for trigger_price in prices {
-            let fires = if trigger_up {
-                mark_price >= trigger_price
-            } else {
-                mark_price <= trigger_price
-            };
-            if !fires {
+            if !trigger_fires(trigger_up, trigger_price, mark_price) {
                 break; // sorted: nothing further along this list can fire either
             }
             for algo_id in storage::load_algo_level(context, market_id, trigger_up, trigger_price)? {
@@ -734,26 +821,41 @@ fn fire<H: PerpHost>(
     // whatever resting reduce-only orders it leaves over-committed (Binance `er=4`). Only a fired
     // order that RESTS (GTC / PostOnly) is held to the prefix condition at its own limit price.
     //
-    // `closePosition` means "whatever is open AT TRIGGER TIME".
-    let capacity = match crate::reduce_only::closing_side(&pos) {
-        Some(s) if s == order.side => crate::reduce_only::closing_capacity(
-            context,
-            owner,
-            market_id,
-            order.side,
-            &pos,
-            crate::reduce_only::QueuePosition::for_kind(kind, order.price),
-        )?,
-        // Flat, or the position flipped to the same side this order is on — it can only open now,
-        // which a reduce-only order may never do.
-        _ => 0,
-    };
-    let want = if order.close_position {
-        pos.amount.unsigned_abs()
+    // `closePosition` means "whatever is open AT TRIGGER TIME" — of the position it was placed
+    // against. A position-bound order whose position has ENDED since placement (gone flat or
+    // flipped: its `generation` moved, see `place_core`) closes nothing, whatever is open now.
+    let bound_position_gone =
+        order.is_position_bound() && pos.generation != order.position_generation;
+    let qty = if bound_position_gone {
+        0
     } else {
-        order.quantity
+        let capacity = match crate::reduce_only::closing_side(&pos) {
+            Some(s) if s == order.side => crate::reduce_only::closing_capacity(
+                context,
+                owner,
+                market_id,
+                order.side,
+                &pos,
+                crate::reduce_only::QueuePosition::for_kind(kind, order.price),
+            )?,
+            // Flat, or the position flipped to the same side this order is on — it can only open
+            // now, which a reduce-only order may never do.
+            _ => 0,
+        };
+        let want = if order.close_position {
+            pos.amount.unsigned_abs()
+        } else {
+            order.quantity
+        };
+        want.min(capacity)
     };
-    let qty = want.min(capacity);
+    // A bound order whose generation still matches is on the closing side of a live position (the
+    // generation moves on every close and flip, and placement required the closing side), and it
+    // fires immediately, so it always has something to place.
+    debug_assert!(
+        !order.is_position_bound() || bound_position_gone || qty > 0,
+        "a position-bound conditional with a live generation found nothing to close"
+    );
 
     // ── APPLY — nothing below may fail for a reason the caller could have caused ──
     //
@@ -788,7 +890,14 @@ fn fire<H: PerpHost>(
     if qty == 0 {
         // Nothing left to protect: the position closed or flipped, or — for a fired order that
         // would REST — is already fully committed to orders ahead of it. Binance expires a
-        // reduce-only order in exactly this case.
+        // reduce-only order in exactly this case. A position-bound order whose position ended says
+        // so with its own code: it may well be on today's closing side (closed, then reopened the
+        // same way), so 6's "would open" would send a consumer looking for a flip.
+        let reason = if bound_position_gone {
+            CancelReason::PositionClosed
+        } else {
+            CancelReason::ReduceOnlyWouldOpen
+        };
         storage::delete_order(context, algo_id)?;
         context.log(Log {
             address: PERP_DEX_ADDRESS,
@@ -796,7 +905,7 @@ fn fire<H: PerpHost>(
                 user: owner,
                 marketId: market_id,
                 algoId: FixedBytes(*algo_id),
-                reason: CancelReason::ReduceOnlyWouldOpen as u8,
+                reason: reason as u8,
             }
             .to_log_data(),
         });

@@ -664,7 +664,11 @@ sol! {
         /// triggerPrice: fires on the MARK price, per (orderType, side):
         ///     STOP BUY / TAKE_PROFIT SELL   ->  mark >= triggerPrice
         ///     STOP SELL / TAKE_PROFIT BUY   ->  mark <= triggerPrice
-        ///   Must be non-zero.
+        ///   Must be non-zero, and must NOT already be satisfied by the stored mark — that is
+        ///   refused with `placeAlgoOrder: order would immediately trigger` (Binance `-2021`).
+        ///   Equality counts as satisfied, exactly as at the sweep. Before the first oracle tick
+        ///   the stored mark is the market's `initialMarkPrice` (`addMarket` refuses 0; a zero mark
+        ///   would skip the check, as the price band does).
         ///
         /// workingType: must be 0 (`MARK_PRICE`). ⚠️ Binance's DEFAULT is `CONTRACT_PRICE` (the
         ///   last trade), so a client ported from Binance that omits the field is relying on
@@ -677,6 +681,15 @@ sol! {
         ///
         /// quantity / flags bit 1 (closePosition): exactly one of the two. `closePosition` takes
         ///   the owner's whole |position| AT TRIGGER TIME and is valid only for the `_MARKET` pair.
+        ///   A closePosition order is BOUND TO THE POSITION open when it is placed (Binance's
+        ///   `GTE_GTC`): placement needs an open position with `side` its closing side, else
+        ///   `placeAlgoOrder: closePosition requires an open position on the closing side`. If that
+        ///   position goes flat or flips before the trigger fires — even if a new one is opened the
+        ///   same way afterwards — the order is spent when it fires: `AlgoOrderTriggered`, then
+        ///   `AlgoOrderCancelled` reason 11, nothing placed. The check is LAZY (closing a position
+        ///   touches no order), so until then the dead order still lists in `getOpenAlgoOrders`
+        ///   and counts toward the caps; cancel it to free the slot sooner. There is no
+        ///   one-per-direction limit.
         ///
         /// price: the resting price for the limit pair; must be 0 for the `_MARKET` pair.
         /// tif: applies to the limit pair only.
@@ -684,7 +697,9 @@ sol! {
         /// flags: bit 0 reduceOnly, bit 1 closePosition, bits 3:2 self-trade-prevention mode
         ///   (same values as `placeOrder`'s; the order the trigger produces INHERITS it). Unknown
         ///   bits REJECTED, and the reserved mode `0b11` is refused with
-        ///   `placeAlgoOrder: invalid self-trade prevention mode`.
+        ///   `placeAlgoOrder: invalid self-trade prevention mode`. Bits 0 and 1 are EXCLUSIVE —
+        ///   `placeAlgoOrder: reduceOnly cannot be sent with closePosition` (Binance parity; a
+        ///   closePosition order is reduce-only by construction, and its trigger places it so).
         ///   ⚠️ This build accepts only reduce-only / closePosition conditionals — a conditional
         ///   that would OPEN exposure is rejected. Binance performs no margin check before trigger,
         ///   which leaves "triggered but cannot afford to open" as a case its own docs do not
@@ -904,6 +919,12 @@ sol! {
         ///            a promise. Read the accepted size from `OrderPlaced.quantity`, which fires on
         ///            every accepted order; `OrderRested` only fires when a remainder rests, so an
         ///            IOC or a fully-filled order has no `OrderRested` to read.
+        ///            A MARKET, IOC or FOK order has no place in that queue — it fills before
+        ///            everything resting — so it is bounded by |position| alone, and the resting
+        ///            reduce-only orders it leaves over-committed are evicted after the fill. That
+        ///            makes a reduce-only MARKET order with `quantity ≥ |position|` the ONE-SHOT
+        ///            CLOSE: it is accepted and truncated to |position| (floored to `stepSize`) —
+        ///            Binance's own recipe; there is no separate close selector.
         ///     bits 3:2  self-trade-prevention mode, an ENUM (not two independent bits):
         ///                 00 EXPIRE_MAKER (the default — `flags = 0` means this)
         ///                 01 EXPIRE_TAKER
@@ -1762,13 +1783,15 @@ sol! {
 
         /// A conditional order was removed. `reason` shares the `CancelReason` space with
         /// `OrderCancelled` so one decoder covers both. Usually an UNTRIGGERED one (0 = its owner
-        /// cancelled it, …). Two reasons instead follow a FIRED trigger (`AlgoOrderTriggered`
+        /// cancelled it, …). Three reasons instead follow a FIRED trigger (`AlgoOrderTriggered`
         /// immediately precedes them) and mean the trigger is spent with nothing placed (no
         /// `OrderPlaced`):
         ///   * 6 (`ReduceOnlyWouldOpen`) — nothing was left to reduce at trigger time;
         ///   * 10 (`TriggerRejected`) — the matcher refused the ordinary order it became: an
         ///     unfillable FOK, a crossing PostOnly, a refused rest. Binance's `ALGO_UPDATE`
-        ///     `REJECTED` ("denied by the matching engine").
+        ///     `REJECTED` ("denied by the matching engine");
+        ///   * 11 (`PositionClosed`) — a closePosition order whose position went flat or flipped
+        ///     after it was placed (even if a new one is open now): Binance's `GTE_GTC` `EXPIRED`.
         event AlgoOrderCancelled(address indexed user, uint64 indexed marketId, bytes32 indexed algoId, uint8 reason);
 
         // Emitted when a limit order rests in the book (after any immediate fills).
@@ -1815,7 +1838,8 @@ sol! {
         // an ADL counterparty, 9 = self-trade prevention (a same-address GTC / IOC / market taker
         // whose mode is EXPIRE_MAKER or EXPIRE_BOTH met this order; its WHOLE remaining quantity is
         // cancelled — the stream's `X = EXPIRED_IN_MATCH`), 10 = a triggered conditional order was
-        // rejected by the matcher (on `AlgoOrderCancelled` only).
+        // rejected by the matcher, 11 = a triggered closePosition order's position had closed or
+        // flipped since placement (10 and 11 on `AlgoOrderCancelled` only).
         //
         // Without it this event was byte-identical for a user cancel and a protocol kill (three
         // indexed fields, no data) and — under delete-on-terminal — `getOrder` answers "not found"

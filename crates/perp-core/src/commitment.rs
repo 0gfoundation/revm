@@ -287,6 +287,22 @@ use primitives::{B256, U256};
 //     no trigger, so its write set and BusinessSnapshot are byte-identical — VERIFIED: with the fix
 //     in place and this byte still 37 the scenario reproduced the old pin 0x525fea15…33ee. Only
 //     this byte moves the golden. CHAIN change: golden re-pin + a coordinated wipe on deploy.
+//   * closePosition parity. A LAYOUT change: `PerpPosition` gains a trailing "g" (`generation`,
+//     u64 — bumped by `save_position` each time a non-zero `amount` goes to 0 or changes sign) and
+//     `Order` a trailing "pg" (`position_generation`, u64), positional msgpack, appended — so every
+//     position blob and every order blob grows by at least one byte. Three placement rules land
+//     with it, each a pure tightening (a node on 38 refuses what a node on 37 accepted, never the
+//     reverse): `placeAlgoOrder` refuses reduceOnly together with closePosition; refuses any
+//     conditional whose trigger the STORED mark already satisfies ("would immediately trigger",
+//     the sweep's own inclusive predicate; skipped at mark 0, unreachable through the ABI); and
+//     refuses a closePosition order unless a position is open with the order on its closing side,
+//     recording its generation. And one execution rule: a fired closePosition order whose recorded
+//     generation differs from the position's is spent with `AlgoOrderCancelled(PositionClosed =
+//     11)` and places nothing (it used to close whatever was open, or expire as 6 after a flip).
+//     The golden scenario sends nothing these refuse and fires no trigger, so its write set differs
+//     only by the two fields' bytes — VERIFIED: with both `#[serde(skip)]` it reproduced the
+//     previous 38 pin 0x720411d8…e3e0. BusinessSnapshot UNCHANGED. CHAIN change: golden re-pin +
+//     a coordinated wipe on deploy.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 38;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

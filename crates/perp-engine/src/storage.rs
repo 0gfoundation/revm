@@ -789,6 +789,12 @@ pub fn save_position_reservation_only<H: PerpHost>(
              quantity (`Σ pos.margin` is `totalWalletBalance − totalCrossWalletBalance`), and this \
              route marks nobody, so the move would never reach the event stream"
         );
+        debug_assert_eq!(
+            old.generation, pos.generation,
+            "save_position_reservation_only from a STALE copy — `generation` is owned by \
+             save_position, and writing an older value back would revive every position-bound \
+             conditional order the ended position left behind"
+        );
     }
     typed_store_mut(context).set_position(user, market_id, pos);
     Ok(())
@@ -1023,9 +1029,9 @@ pub fn save_position<H: PerpHost>(
     // The SAME already-paid read supplies `old.margin` for the `Σ pos.margin` aggregate below —
     // which is the whole reason that aggregate is affordable here and the deleted `total_perp_collateral`
     // was not (see `types::UserAccount::total_position_margin`).
-    let (old_amount, old_margin) = {
+    let (old_amount, old_margin, old_generation) = {
         let old = load_position_ref(context, user, market_id)?;
-        (old.amount, old.margin)
+        (old.amount, old.margin, old.generation)
     };
     // "A flat position holds no margin", enforced at the ONE door every `pos.margin` write comes
     // through rather than per market at snapshot time.
@@ -1058,7 +1064,31 @@ pub fn save_position<H: PerpHost>(
     } else if old_amount != 0 && pos.amount == 0 {
         registry_remove(context, market_id, user)?;
     }
-    typed_store_mut(context).set_position(user, market_id, pos.clone());
+    // ── `PerpPosition::generation` — THE single maintenance point ──────────────────────────────
+    //
+    // A position's life ENDS when a non-zero `amount` goes to 0 or changes sign; the next one (or
+    // the remainder of a flip) is a new generation. Detected here because this is the one door
+    // every `amount` write comes through, from the SAME already-paid read as the registry hook —
+    // no extra load. Set from the STORED value, overriding whatever the caller's struct carries:
+    // the caller loaded the position and edited `amount` / `margin` / …, never this, so ownership
+    // here means no call site has to remember it and a stale copy cannot roll it back. A position-
+    // bound conditional order compares against it when it fires (`algo::fire`) — that comparison
+    // is the whole lazy expiry, which is why closing a position costs nothing more than this.
+    //
+    // Per SAVE, not per fill: a match flushes each participant once. That loses nothing, because
+    // every fill one match applies to one participant moves their `amount` the same way (a maker's
+    // orders a taker hits are all on one side; a self-trade's two legs net to zero), so "the saved
+    // amount is 0 or of the other sign" is exactly "it reached zero on the way" — a position cannot
+    // touch zero and come back to the same sign inside one save.
+    let life_ended =
+        old_amount != 0 && (pos.amount == 0 || (old_amount < 0) != (pos.amount < 0));
+    let mut stored = pos.clone();
+    stored.generation = if life_ended {
+        old_generation.wrapping_add(1)
+    } else {
+        old_generation
+    };
+    typed_store_mut(context).set_position(user, market_id, stored);
     // Per-user market index: the SAME zero-crossing, but evaluated AFTER the write — the
     // leave branch re-reads the position to decide whether the user still has anything here,
     // so it has to see the new `amount`.
@@ -1159,6 +1189,9 @@ pub fn save_position_leverage_only<H: PerpHost>(
                 // change closes nothing. It is not a balance, so unlike the fields above it would
                 // not desync a published total — it would corrupt a lifetime statistic, silently.
                 p.cumulative_realized_pnl,
+                // And `generation`, owned by `save_position`: a stale copy written back here would
+                // revive the position-bound conditional orders of a life that has ended.
+                p.generation,
             )
         };
         debug_assert_eq!(
@@ -3102,6 +3135,7 @@ mod size_probe_tests {
                     trigger_up: false,
                     close_position: false,
                     stp: Default::default(),
+                    position_generation: 0,
         };
         let buf = encode(&order).unwrap();
         println!(
@@ -3163,6 +3197,7 @@ mod size_probe_tests {
             total_sell_qty: 12_000_000,
             total_sell_notional: 10_000_000,
             cumulative_realized_pnl: -4_200_000,
+            generation: 3,
         };
         let buf = encode(&pos).unwrap();
         println!(
@@ -3352,6 +3387,7 @@ mod encoding_roundtrip_tests {
                                                             trigger_up: false,
                                                             close_position: false,
                                                             stp: Default::default(),
+                                                            position_generation: u64::MAX,
                             },
                         );
                     }
@@ -3409,6 +3445,7 @@ mod encoding_roundtrip_tests {
                 // monotonically over a position's whole life, so its round-trip at `i64::MIN`
                 // matters more than most.
                 cumulative_realized_pnl: i64::MIN,
+                generation: u64::MAX,
             },
         );
         rt(

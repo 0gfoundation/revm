@@ -1538,6 +1538,8 @@ fn announce_new_order(
         trigger_up: false,
         close_position: false,
         stp: validated.stp,
+        // An ordinary order is bound to no position (only a conditional one can be).
+        position_generation: 0,
     };
 
     let pending = PendingOrderPlaced {

@@ -162,6 +162,31 @@ pub struct PerpPosition {
     /// see the overflow note in `apply_position_fill`.
     #[serde(default, rename = "cr")]
     pub cumulative_realized_pnl: i64,
+    /// `g` — which LIFE of this `(user, market)` position is open: bumped by one each time a
+    /// non-zero position ENDS, i.e. its `amount` goes to 0 or changes sign. APPENDED LAST —
+    /// positional msgpack.
+    ///
+    /// It exists for position-BOUND conditional orders (`types::Order::is_position_bound` — a
+    /// `closePosition` stop / take-profit): one records this value at placement
+    /// (`Order::position_generation`) and, when its trigger fires, is spent with
+    /// `CancelReason::PositionClosed` if the two differ. That is Binance's `GTE_GTC` — the order
+    /// expires with its position — done LAZILY: closing a position touches no order, the check
+    /// costs nothing until the order would fire, and it still refuses the dangerous case of an old
+    /// stop closing a NEW position opened the same way after the bound one was closed.
+    ///
+    /// # Owned by `storage::save_position`, and by nothing else
+    ///
+    /// That function is the single door for every `amount` write (the two narrower routes beside
+    /// it `debug_assert` `amount` unchanged), so the zero-crossing it already detects for the
+    /// position registry is exactly where a life ends. It sets this field from the STORED value it
+    /// already reads, ignoring whatever the caller's struct carries, so no call site has to
+    /// maintain it and a stale copy cannot roll it back. Like `cumulative_realized_pnl`, it
+    /// deliberately SURVIVES the position going flat — a flat position record is never deleted.
+    ///
+    /// `u64`, so it cannot wrap in practice: every increment is a close or flip that a
+    /// transaction paid for.
+    #[serde(default, rename = "g")]
+    pub generation: u64,
 }
 
 impl PerpPosition {
@@ -192,6 +217,7 @@ impl Default for PerpPosition {
             // A position that never existed has realised nothing. The only default that is NOT
             // trivially right is `leverage`, which is 1 rather than 0.
             cumulative_realized_pnl: 0,
+            generation: 0,
         }
     }
 }

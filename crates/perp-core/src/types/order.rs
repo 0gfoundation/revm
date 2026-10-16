@@ -464,6 +464,19 @@ pub enum CancelReason {
     /// the matcher (an unfillable FOK, a crossing PostOnly, a refused rest). Carried by
     /// `AlgoOrderCancelled`; the trigger is spent.
     TriggerRejected = 10,
+    /// A POSITION-BOUND conditional order ([`Order::is_position_bound`] — a `closePosition` one)
+    /// triggered after the position it was placed against had ENDED: gone flat or flipped, at
+    /// any point since placement, even if a new position is open now. Nothing is placed; carried
+    /// by `AlgoOrderCancelled` right after `AlgoOrderTriggered`, like 6 and 10. Binance's
+    /// `GTE_GTC` order "EXPIRED" when its position closes.
+    ///
+    /// DISTINCT from [`Self::ReduceOnlyWouldOpen`] (6) on purpose. 6 says "this side would open
+    /// now", which is false for the case this code exists for: close a long, open a new long, and
+    /// the old closePosition SELL is on the CLOSING side again. It is spent because the position
+    /// it was bound to no longer exists, and a consumer reading 6 would look for a flip that never
+    /// happened. The expiry is LAZY — detected when the trigger fires, through
+    /// [`crate::types::PerpPosition::generation`] — so closing a position costs nothing extra.
+    PositionClosed = 11,
 }
 
 // ── Structs ───────────────────────────────────────────────────────────────
@@ -530,6 +543,28 @@ pub struct Order {
     /// and so a conditional order carries it to the ordinary order its trigger produces.
     #[serde(default, rename = "stp")]
     pub stp: StpMode,
+    /// The owner's [`crate::types::PerpPosition::generation`] in this market when a
+    /// POSITION-BOUND conditional order was placed — APPENDED LAST, positional msgpack.
+    ///
+    /// Read only when [`Self::is_position_bound`]: at trigger, a value that differs from the
+    /// position's current generation means the position this order was placed against has ended
+    /// (gone flat or flipped), and the order is spent with
+    /// [`CancelReason::PositionClosed`] instead of closing whatever is open now. 0 on every other
+    /// order, where it means nothing — 0 is also a legitimate generation, so binding is read off
+    /// the order's kind, never off this value.
+    #[serde(default, rename = "pg")]
+    pub position_generation: u64,
+}
+
+impl Order {
+    /// Is this conditional order BOUND TO THE POSITION it was placed against? Such an order can be
+    /// placed only on the closing side of an open position, and it expires — lazily, at trigger —
+    /// once that position goes flat or flips (Binance's `GTE_GTC`). Today that is a `closePosition`
+    /// order; the one place to extend when another kind binds.
+    #[inline]
+    pub fn is_position_bound(&self) -> bool {
+        self.close_position
+    }
 }
 
 /// Lightweight per-user per-market order entry used for margin-reserve calculation.
@@ -777,6 +812,7 @@ mod stp_mode_tests {
     fn reason_codes_are_pinned() {
         assert_eq!(CancelReason::SelfTradePrevention as u8, 9);
         assert_eq!(CancelReason::TriggerRejected as u8, 10);
+        assert_eq!(CancelReason::PositionClosed as u8, 11);
         assert_eq!(ExpiryReason::Tif as u8, 0);
         assert_eq!(ExpiryReason::SelfTradePrevention as u8, 9);
         assert_eq!(
@@ -806,6 +842,7 @@ mod stp_mode_tests {
             trigger_up: false,
             close_position: false,
             stp: StpMode::ExpireBoth,
+            position_generation: 3,
         };
         let back: Order = crate::codec::decode(&crate::codec::encode(&order).unwrap()).unwrap();
         assert_eq!(back, order);
