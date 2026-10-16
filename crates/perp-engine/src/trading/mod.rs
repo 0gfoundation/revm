@@ -37,7 +37,7 @@ use crate::{
     risk::record_mid_price_sample_for_best_quote_change,
     storage,
     types::{
-        ApiKey, CancelReason, Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side,
+        ApiKey, CancelReason, Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side, StpMode,
         TimeInForce,
     },
     PERP_DEX_ADDRESS,
@@ -789,7 +789,7 @@ pub fn run_get_order<H: PerpHost>(
             quantity: order.quantity,
             filled: order.filled,
             status: order.status as u8,
-            flags: encode_order_flags(order.reduce_only),
+            flags: encode_order_flags(order.reduce_only, order.stp),
         },
     )))
 }
@@ -817,14 +817,16 @@ pub fn run_get_open_orders<H: PerpHost>(
         sides.push(Side::Buy as u8);
         prices.push(entry.price);
         remaining_quantities.push(entry.amount);
-        flags.push(encode_order_flags(entry.reduce_only));
+        // Off the ENTRY (it mirrors both modifiers), so this view never loads an order.
+        flags.push(encode_order_flags(entry.reduce_only, entry.stp));
     }
     for entry in sell_entries.iter() {
         order_ids.push(FixedBytes(entry.order_id));
         sides.push(Side::Sell as u8);
         prices.push(entry.price);
         remaining_quantities.push(entry.amount);
-        flags.push(encode_order_flags(entry.reduce_only));
+        // Off the ENTRY (it mirrors both modifiers), so this view never loads an order.
+        flags.push(encode_order_flags(entry.reduce_only, entry.stp));
     }
 
     Ok(Bytes::from(getOpenOrdersCall::abi_encode_returns(
@@ -1001,7 +1003,8 @@ pub(crate) fn verify_ed25519(
 
 // ── Core order logic (shared by direct and signed paths) ─────────────────────
 
-/// `placeOrder`'s `flags` bitfield.
+/// `placeOrder`'s `flags` bitfield: bit 0 reduce-only, bits 3:2 the self-trade-prevention mode
+/// ([`StpMode`], shared with `placeAlgoOrder`), every other bit reserved.
 ///
 /// Unknown bits are REJECTED, not ignored. Ignoring them would let a caller ask for a modifier this
 /// build does not implement and receive a plain order that looks accepted — the failure would then
@@ -1033,25 +1036,58 @@ pub(crate) const ORDER_FLAG_REDUCE_ONLY: u8 = 1 << 0;
 /// rejected call — and in a release build the `fill_opening_qty == 0` watchdog is compiled out, so
 /// it would be a SILENT wrong position rather than a loud one.
 const REDUCE_ONLY_ENABLED: bool = true;
-const ORDER_FLAGS_KNOWN: u8 = ORDER_FLAG_REDUCE_ONLY;
+const ORDER_FLAGS_KNOWN: u8 = ORDER_FLAG_REDUCE_ONLY | StpMode::FLAG_MASK;
 
-/// The wire `flags` byte for an order's stored modifiers — the inverse of [`decode_order_flags`].
-///
-/// Exists so the events and the two order views publish the flag rather than leaving it
-/// recoverable only by decoding `placeOrder` calldata (which an indexer cannot do: it would have
-/// to re-derive each batch item's order id to attribute the flag).
-#[inline]
-pub(crate) fn encode_order_flags(reduce_only: bool) -> u8 {
-    if reduce_only {
-        ORDER_FLAG_REDUCE_ONLY
-    } else {
-        0
+/// The per-order modifiers a `flags` byte decodes to — what an `Order` / `OrderEntry` stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OrderFlags {
+    pub(crate) reduce_only: bool,
+    pub(crate) stp: StpMode,
+}
+
+impl OrderFlags {
+    /// The modifiers an order record carries.
+    #[inline]
+    pub(crate) fn of(order: &Order) -> Self {
+        Self {
+            reduce_only: order.reduce_only,
+            stp: order.stp,
+        }
+    }
+
+    /// Their wire byte (see [`encode_order_flags`]).
+    #[inline]
+    pub(crate) fn encode(self) -> u8 {
+        encode_order_flags(self.reduce_only, self.stp)
     }
 }
 
-/// Decodes `flags` into the per-order modifiers, rejecting anything unrecognised. Returns
-/// `reduce_only`. Kept beside the constants so a new bit cannot be added to one without the other.
-pub(crate) fn decode_order_flags(flags: u8, sel: &str) -> Result<bool, PerpError> {
+/// The wire `flags` byte for an order's stored modifiers — the inverse of [`decode_order_flags`],
+/// and the ONLY encoder: every echo (`OrderPlaced`, `OrderRested`, `getOrder`, `getOpenOrders`)
+/// and every protocol-built order (a fired trigger, a liquidation close) goes through here, so no
+/// site can hand-assemble a byte that disagrees with the others.
+///
+/// Exists so the events and the two order views publish the flags rather than leaving them
+/// recoverable only by decoding `placeOrder` calldata (which an indexer cannot do: it would have
+/// to re-derive each batch item's order id to attribute them).
+///
+/// ⚠️ `StpMode::ExpireMaker` encodes as `00`, the same bits as "no mode given". An echo site that
+/// forgot to pass the stored mode would therefore not fail — it would silently claim EXPIRE_MAKER.
+/// Pass the STORED value, never a default.
+#[inline]
+pub(crate) fn encode_order_flags(reduce_only: bool, stp: StpMode) -> u8 {
+    let ro = if reduce_only {
+        ORDER_FLAG_REDUCE_ONLY
+    } else {
+        0
+    };
+    ro | stp.to_flags()
+}
+
+/// Decodes `flags` into the per-order modifiers, rejecting anything unrecognised: unknown bits
+/// first, then the reserved STP mode `0b11`. Kept beside the constants so a new bit cannot be added
+/// to one without the other.
+pub(crate) fn decode_order_flags(flags: u8, sel: &str) -> Result<OrderFlags, PerpError> {
     let unknown = flags & !ORDER_FLAGS_KNOWN;
     if unknown != 0 {
         return Err(perp_err(format!("{sel}: unknown order flags 0x{unknown:02x}")));
@@ -1060,7 +1096,9 @@ pub(crate) fn decode_order_flags(flags: u8, sel: &str) -> Result<bool, PerpError
     if reduce_only && !REDUCE_ONLY_ENABLED {
         return Err(perp_err(format!("{sel}: reduce-only not yet enabled")));
     }
-    Ok(reduce_only)
+    let stp = StpMode::from_flags(flags)
+        .ok_or_else(|| perp_err(format!("{sel}: invalid self-trade prevention mode")))?;
+    Ok(OrderFlags { reduce_only, stp })
 }
 
 /// Allocate the next order ID for `account` using the per-user nonce counter.
@@ -1111,6 +1149,8 @@ struct ValidatedOrder {
     /// `flags` bit 0, decoded once here so nothing downstream re-parses the bitfield. Reaches the
     /// stored `Order` via `announce_new_order` and the `OrderEntry` via `rest_in_book`.
     reduce_only: bool,
+    /// `flags` bits 3:2, decoded by the same call and threaded the same way.
+    stp: StpMode,
 }
 
 /// Where an ordinary placement comes from. It decides one thing only: whether the per-market
@@ -1358,7 +1398,7 @@ fn validate_place_order<H: PerpHost>(
     tif_u8: u8,
     flags: u8,
 ) -> Result<ValidatedOrder, PerpError> {
-    let reduce_only = decode_order_flags(flags, "placeOrder")?;
+    let OrderFlags { reduce_only, stp } = decode_order_flags(flags, "placeOrder")?;
     let market = storage::load_market(context, market_id)?
         .ok_or_else(|| perp_err("placeOrder: unknown market"))?;
     if !market.active {
@@ -1408,7 +1448,7 @@ fn validate_place_order<H: PerpHost>(
         // sanity cap (`price > market.max_price`) above still prevents absurd book pollution.
     }
 
-    Ok(ValidatedOrder { market, side, kind, reduce_only })
+    Ok(ValidatedOrder { market, side, kind, reduce_only, stp })
 }
 
 /// The `OrderPlaced` log of a placement that is not yet known-accepted.
@@ -1497,10 +1537,11 @@ fn announce_new_order(
         trigger_price: 0,
         trigger_up: false,
         close_position: false,
+        stp: validated.stp,
     };
 
     let pending = PendingOrderPlaced {
-        flags: encode_order_flags(validated.reduce_only),
+        flags: encode_order_flags(validated.reduce_only, validated.stp),
         user: account,
         market_id,
         order_id: *order_id,
@@ -1812,7 +1853,7 @@ fn execute_limit_order<H: PerpHost>(
                 quantity,
                 tif,
                 client_order_id,
-                taker_order.reduce_only,
+                OrderFlags::of(taker_order),
                 market,
                 Some(bbo),
                 // PostOnly never matches, so there is nothing deferred to flush.
@@ -1855,7 +1896,7 @@ fn execute_limit_order<H: PerpHost>(
                 remaining,
                 tif,
                 client_order_id,
-                taker_order.reduce_only,
+                OrderFlags::of(taker_order),
                 market,
                 // GTC: matching ran, so the BBO is read inside `rest_in_book` — pre-flush for the
                 // band gate, and again post-flush for the cache write. See the notes there.
@@ -2768,8 +2809,9 @@ fn rest_in_book<H: PerpHost>(
     tif: TimeInForce,
     client_order_id: [u8; 16],
     // Threaded rather than re-read: the `OrderEntry` this builds is what the admission predicate and
-    // all three eviction triggers walk, so the flag has to be ON the entry.
-    reduce_only: bool,
+    // all three eviction triggers walk, so `reduce_only` has to be ON the entry; `stp` rides along
+    // so `getOpenOrders` can echo it off the entry, and `OrderRested` echoes both.
+    flags: OrderFlags,
     market: &crate::types::Market,
     // 2b resolve-once: (best_bid, best_ask). `Some` = the caller already read the BBO (PostOnly
     // threads its do-not-cross read — no match ran, so it is still current). `None` = read it here.
@@ -2927,7 +2969,8 @@ fn rest_in_book<H: PerpHost>(
         amount: qty,
         maker_fee_bps,
         assuming_price,
-        reduce_only,
+        reduce_only: flags.reduce_only,
+        stp: flags.stp,
     };
     // `Bid`/`Ask` grow by this order's notional at its FROZEN Assuming Price — the same
     // per-order-floored `calc_value` term the raw-list fold would contribute, so the aggregates stay
@@ -3188,7 +3231,7 @@ fn rest_in_book<H: PerpHost>(
             // published because it is un-derivable off-chain: for a sell it is `max(T, limit)` with
             // `T` resolved ONCE, above, and never again (see THE FREEZE).
             assumingPrice: assuming_price,
-            flags: encode_order_flags(reduce_only),
+            flags: flags.encode(),
         }
         .to_log_data(),
     });
@@ -3207,7 +3250,7 @@ fn rest_in_book<H: PerpHost>(
     // The whole cost when the owner holds no reduce-only order on this side — the overwhelmingly
     // common case — is one scan of the list this call already had warm. The heavy part (loading the
     // position, folding the prefix) is behind that check.
-    if !reduce_only {
+    if !flags.reduce_only {
         crate::reduce_only::restore(
             context,
             user,

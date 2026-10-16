@@ -3081,6 +3081,7 @@ mod size_probe_tests {
                     trigger_price: 0,
                     trigger_up: false,
                     close_position: false,
+                    stp: Default::default(),
         };
         let buf = encode(&order).unwrap();
         println!(
@@ -3096,6 +3097,7 @@ mod size_probe_tests {
             maker_fee_bps: 2,
             assuming_price: 6_550_000,
                     reduce_only: false,
+                    stp: Default::default(),
         };
         println!(
             "OrderEntry x1 (in vec): {} bytes",
@@ -3329,6 +3331,7 @@ mod encoding_roundtrip_tests {
                                                             trigger_price: 0,
                                                             trigger_up: false,
                                                             close_position: false,
+                                                            stp: Default::default(),
                             },
                         );
                     }
@@ -3349,6 +3352,7 @@ mod encoding_roundtrip_tests {
                 maker_fee_bps: 12_345,
                 assuming_price: u64::MAX,
                             reduce_only: false,
+                            stp: Default::default(),
             },
         );
         rt(

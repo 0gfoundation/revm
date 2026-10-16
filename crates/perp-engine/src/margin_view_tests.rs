@@ -174,6 +174,7 @@ fn entry(order_id: u8, price: u64, amount: u64) -> OrderEntry {
         maker_fee_bps: 0,
         assuming_price: price,
             reduce_only: false,
+            stp: Default::default(),
     }
 }
 

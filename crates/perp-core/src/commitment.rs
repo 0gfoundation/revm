@@ -230,6 +230,10 @@ use primitives::{B256, U256};
 //     tightening (a node on 35 accepts what a node on 36 refuses, never the reverse), no layout
 //     change. The golden scenario never comes near 200 orders, so its write set and
 //     BusinessSnapshot are byte-identical; only this byte moves the golden.
+//   * STP encoding: `Order` and `OrderEntry` gain a trailing `stp` (`StpMode`, positional msgpack,
+//     appended), so every order blob and every per-user entry list grows by one byte per order.
+//     `flags` bits 3:2 are decoded (`0b11` refused), stored and echoed; matching does not read the
+//     field yet. A LAYOUT change; BusinessSnapshot unchanged.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 36;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

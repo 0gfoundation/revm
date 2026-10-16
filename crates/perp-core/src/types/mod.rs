@@ -15,8 +15,8 @@ pub use oracle::{
     PriceBasisWindow, PRICE_BASIS_WINDOW_SIZE,
 };
 pub use order::{
-    AlgoOrderType, CancelReason, Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side,
-    TimeInForce, WorkingType, ALGO_TYPE_CONDITIONAL,
+    AlgoOrderType, CancelReason, ExpiryReason, Order, OrderEntry, OrderKind, OrderStatus,
+    OrderType, Side, StpMode, TimeInForce, WorkingType, ALGO_TYPE_CONDITIONAL,
 };
 pub use position::{
     MarginTier, MarginTiers, Market, MarketHot, PerpPosition, BASIS_MODE_EWMA,

@@ -6887,7 +6887,15 @@ mod golden {
     /// direct `placeAlgoOrder` now persists its nonce bump AFTER the placement instead of before;
     /// same key, same value, and #16d hashes the net delta, so that reorder is invisible here.)
     ///
-    /// Prior values 0x2ffa38aefbdfa68307eb6869b95cb48d9828f407dce2924f2abd8ef5c5c0b88d,
+    /// Re-pinned again within 36 for the STP encoding: `Order` and `OrderEntry` each gain a trailing
+    /// "stp" field (positional msgpack, appended), so every order blob and every per-user entry
+    /// list the scenario writes is one byte per order longer — CAROL's untriggered Phase-9d stop
+    /// included. A LAYOUT change only: no order in the scenario sets STP bits, matching does not
+    /// read the field yet, and `BusinessSnapshot` is UNCHANGED. VERIFIED: with both fields
+    /// `#[serde(skip)]` the scenario reproduced the previous pin 0x064ca8b4…8912 exactly.
+    ///
+    /// Prior values 0x064ca8b4d053dc1def05f9991d75afd9dc52440890525c0a2efbc018382f8912,
+    /// 0x2ffa38aefbdfa68307eb6869b95cb48d9828f407dce2924f2abd8ef5c5c0b88d,
     /// 0x8362c452406bbd6f048358985803964c672ad20444e3f362327114a403b7ebb8,
     /// 0x913b6760140fa04bdd42be6a6b63908f5d1d16430b96a1c8ce1b84b7612540ce,
     /// 0x6ef01990b3e35d7e6cec4df47218bbdf3b857b7355e36c42d9318b142a742052,
@@ -6897,7 +6905,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x064ca8b4d053dc1def05f9991d75afd9dc52440890525c0a2efbc018382f8912");
+        b256!("0xc1379f42cc51db429ce10ab455e6daeb918a81bca8df7d210ae584768e631988");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -8489,6 +8497,7 @@ mod batch_cancel {
                             trigger_price: 0,
                             trigger_up: false,
                             close_position: false,
+                            stp: Default::default(),
             },
         )
         .unwrap();
@@ -9308,6 +9317,10 @@ mod batch_cancel {
                 PerpBatchReason::FeeRecipientNotSet,
             ),
             ("max open orders reached", PerpBatchReason::MaxOpenOrders),
+            (
+                "invalid self-trade prevention mode",
+                PerpBatchReason::InvalidStpMode,
+            ),
             ("reserve delta overflow", PerpBatchReason::ArithmeticGuard),
             ("fee reserve overflow", PerpBatchReason::ArithmeticGuard),
             (
@@ -9400,13 +9413,14 @@ mod batch_cancel {
                 PerpBatchReason::FeeRecipientNotSet as u8,
                 PerpBatchReason::TifNotAllowedForOrderType as u8,
                 PerpBatchReason::MaxOpenOrders as u8,
+                PerpBatchReason::InvalidStpMode as u8,
                 PerpBatchReason::ArithmeticGuard as u8,
                 PerpBatchReason::Invariant as u8,
                 PerpBatchReason::Other as u8,
             ],
             [
                 0, 1, 2, 3, 4, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
-                33, 253, 254, 255
+                33, 34, 253, 254, 255
             ]
         );
     }
@@ -16317,11 +16331,14 @@ mod signed_replay {
     /// Unknown bits are REJECTED, not ignored. Ignoring them would hand back a plain order to a
     /// caller who asked for a modifier this build does not have — the failure would surface as
     /// unexpected fills rather than as an error.
+    ///
+    /// Bits 3:2 are KNOWN now (the self-trade-prevention mode), so `0x04` and `0x08` are legal
+    /// modes and are accepted; their reserved combination `0x0c` is refused with its own message,
+    /// not as an unknown bit. Bit 1 and bits 4–7 are still unknown.
     #[test]
     fn unknown_flag_bits_are_rejected() {
         let (mut ctx, sk) = fixture();
-        for bit in 1..8u8 {
-            let flags = 1u8 << bit;
+        for flags in [0x02u8, 0x10, 0x20, 0x40, 0x80] {
             let (reverted, reason) =
                 call(&mut ctx, &signed_place_input_flags(&sk, flags, flags));
             assert!(reverted, "flags 0x{flags:02x} must be rejected");
@@ -16329,6 +16346,22 @@ mod signed_replay {
                 reason.contains(&format!("unknown order flags 0x{flags:02x}")),
                 "got {reason}"
             );
+        }
+        let (reverted, reason) = call(&mut ctx, &signed_place_input_flags(&sk, 0x0c, 0x0c));
+        assert!(reverted, "the reserved STP mode 0b11 must be rejected");
+        assert!(
+            reason.contains("placeOrder: invalid self-trade prevention mode"),
+            "got {reason}"
+        );
+        // Unknown bits are reported BEFORE the mode is decoded: one byte, one error.
+        let (reverted, reason) = call(&mut ctx, &signed_place_input_flags(&sk, 0x1c, 0x1c));
+        assert!(reverted);
+        assert!(reason.contains("unknown order flags 0x10"), "got {reason}");
+        // The two legal non-default modes place a plain GTC bid.
+        for flags in [0x04u8, 0x08] {
+            let (reverted, reason) =
+                call(&mut ctx, &signed_place_input_flags(&sk, flags, flags));
+            assert!(!reverted, "STP mode 0x{flags:02x} is legal: {reason}");
         }
     }
 
@@ -16353,6 +16386,9 @@ mod signed_replay {
         for (flags, want) in [
             (1u8, "reduce-only requires an open position"),
             (2u8, "unknown order flags 0x02"),
+            (0x20u8, "unknown order flags 0x20"),
+            (0x0cu8, "placeOrder: invalid self-trade prevention mode"),
+            (0x0du8, "placeOrder: invalid self-trade prevention mode"),
         ] {
             let input = placeOrderCall {
                 marketId: MARKET_ID,
@@ -17485,5 +17521,169 @@ mod open_order_cap {
         assert!(out.reverted);
         assert_eq!(JournalTr::perp_write_count(ctx.journal_mut()), writes);
         assert_eq!(storage::load_user_nonce(&mut ctx, ALICE).unwrap(), nonce);
+    }
+}
+
+// ── Self-trade-prevention ENCODING (flags bits 3:2) ──────────────────────────────────────────
+//
+// The mode is decoded, validated, stored on `Order` / `OrderEntry` and echoed. `00` IS
+// EXPIRE_MAKER, so an echo site that dropped the stored mode would not fail — it would silently
+// report EXPIRE_MAKER. Hence every test here uses the two NON-default modes as well.
+#[cfg(test)]
+mod stp_encoding {
+    use super::batch_cancel::{decode_statuses, expect};
+    use super::*;
+    use crate::{
+        batch::{PerpBatchReason, PerpBatchTag},
+        interface::IPerpDex::{
+            batchPlaceOrdersCall, getOpenOrdersCall, OrderPlaced, OrderRested, PlaceItem,
+        },
+        types::StpMode,
+    };
+
+    const MODES: [StpMode; 3] = [StpMode::ExpireMaker, StpMode::ExpireTaker, StpMode::ExpireBoth];
+
+    fn place_flags(
+        ctx: &mut TestCtx,
+        caller: Address,
+        side: u8,
+        price: u64,
+        order_type: u8,
+        tif: u8,
+        flags: u8,
+    ) -> [u8; 32] {
+        let input = placeOrderCall {
+            marketId: MARKET_ID,
+            side,
+            price,
+            quantity: QTY,
+            orderType: order_type,
+            tif,
+            clientOrderId: FixedBytes::default(),
+            flags,
+        }
+        .abi_encode();
+        let out = run_perp_dex_call(&input, 30_000_000, caller, U256::ZERO, false, ctx).unwrap();
+        assert!(!out.reverted, "{:?}", String::from_utf8_lossy(&out.bytes));
+        out.bytes[..32].try_into().unwrap()
+    }
+
+    fn events<E: SolEvent>(ctx: &mut TestCtx) -> Vec<E> {
+        JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .filter(|l| l.data.topics().first() == Some(&E::SIGNATURE_HASH))
+            .map(|l| E::decode_raw_log(l.data.topics(), &l.data.data).unwrap())
+            .collect()
+    }
+
+    fn get_order_flags(ctx: &mut TestCtx, id: [u8; 32]) -> u8 {
+        let ret = run_get_order(
+            &getOrderCall { orderId: id.into(), marketId: MARKET_ID }.abi_encode(),
+            ctx,
+        )
+        .unwrap();
+        getOrderCall::abi_decode_returns(&ret).unwrap().flags
+    }
+
+    fn open_order_flags(ctx: &mut TestCtx, user: Address, id: [u8; 32]) -> u8 {
+        let ret = run_get_open_orders(
+            &getOpenOrdersCall { user, marketId: MARKET_ID }.abi_encode(),
+            ctx,
+        )
+        .unwrap();
+        let d = getOpenOrdersCall::abi_decode_returns(&ret).unwrap();
+        let k = d.orderIds.iter().position(|o| o.0 == id).expect("listed");
+        d.flags[k]
+    }
+
+    /// Every echo of every kind of order carries the byte that was sent, for all three modes, alone
+    /// and combined with reduce-only — and the stored `Order` / `OrderEntry` hold the mode.
+    #[test]
+    fn every_echo_carries_the_mode_that_was_sent() {
+        for mode in MODES {
+            let f = mode.to_flags();
+            let mut ctx = make_ctx();
+            setup(&mut ctx);
+            fund(&mut ctx, ALICE, WALLET * 100);
+            fund(&mut ctx, BOB, WALLET * 100);
+            place(&mut ctx, BOB, 1, PRICE + TICK, QTY, 0, 0);
+            place(&mut ctx, BOB, 1, PRICE + TICK, QTY, 0, 0);
+            let _ = JournalTr::take_logs(ctx.journal_mut());
+
+            // GTC and PostOnly REST: OrderPlaced, OrderRested, getOrder, getOpenOrders, storage.
+            for (tif, price) in [(0u8, PRICE - TICK), (3u8, PRICE - 2 * TICK)] {
+                let id = place_flags(&mut ctx, ALICE, 0, price, 0, tif, f);
+                let logs = JournalTr::take_logs(ctx.journal_mut());
+                let placed: Vec<u8> = logs
+                    .iter()
+                    .filter(|l| l.data.topics().first() == Some(&OrderPlaced::SIGNATURE_HASH))
+                    .map(|l| OrderPlaced::decode_raw_log(l.data.topics(), &l.data.data).unwrap().flags)
+                    .collect();
+                let rested: Vec<u8> = logs
+                    .iter()
+                    .filter(|l| l.data.topics().first() == Some(&OrderRested::SIGNATURE_HASH))
+                    .map(|l| OrderRested::decode_raw_log(l.data.topics(), &l.data.data).unwrap().flags)
+                    .collect();
+                assert_eq!((placed, rested), (vec![f], vec![f]), "{mode:?} tif {tif}");
+                assert_eq!(get_order_flags(&mut ctx, id), f, "{mode:?} getOrder");
+                assert_eq!(open_order_flags(&mut ctx, ALICE, id), f, "{mode:?} getOpenOrders");
+                assert_eq!(get_order(&mut ctx, id).stp, mode);
+                let entry = storage::load_buy_orders(&mut ctx, ALICE, MARKET_ID)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.order_id == id)
+                    .unwrap();
+                assert_eq!(entry.stp, mode, "the ENTRY mirrors it (getOpenOrders reads only this)");
+            }
+
+            // FOK and market take BOB's asks and leave no record: OrderPlaced is their only echo.
+            place_flags(&mut ctx, ALICE, 0, PRICE + TICK, 0, 2, f);
+            place_flags(&mut ctx, ALICE, 0, 0, 1, 0, f);
+            let placed: Vec<u8> = events::<OrderPlaced>(&mut ctx).into_iter().map(|e| e.flags).collect();
+            assert_eq!(placed, vec![f, f], "{mode:?} FOK + market");
+            assert_eq!(pos(&mut ctx, ALICE).amount, 2 * QTY as i64, "both filled");
+
+            // Reduce-only and the mode are independent bits of one byte.
+            let ro = f | 1;
+            let id = place_flags(&mut ctx, ALICE, 1, PRICE + 5 * TICK, 0, 0, ro);
+            assert_eq!(get_order_flags(&mut ctx, id), ro, "{mode:?} reduce-only getOrder");
+            assert_eq!(open_order_flags(&mut ctx, ALICE, id), ro);
+            let o = get_order(&mut ctx, id);
+            assert!(o.reduce_only);
+            assert_eq!(o.stp, mode);
+        }
+    }
+
+    /// In a batch, the reserved mode is a per-item `Rejected` with its OWN reason (34) — not the
+    /// unknown-bits catch-all — and the batch carries on.
+    #[test]
+    fn a_batch_item_with_the_reserved_mode_is_rejected_with_its_own_reason() {
+        let mut ctx = make_ctx();
+        setup(&mut ctx);
+        let base = storage::load_user_nonce(&mut ctx, ALICE).unwrap();
+        let item = |flags: u8| PlaceItem {
+            marketId: MARKET_ID,
+            side: 0,
+            price: PRICE - TICK,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+            flags,
+        };
+        let input = batchPlaceOrdersCall { orders: vec![item(0x0c), item(0x08), item(0x02)] }.abi_encode();
+        let out = run_perp_dex_call(&input, 30_000_000, ALICE, U256::ZERO, false, &mut ctx).unwrap();
+        assert!(!out.reverted);
+        let blob = batchPlaceOrdersCall::abi_decode_returns(&out.bytes).unwrap().to_vec();
+        let id = derive_order_id(ALICE, base);
+        assert_eq!(
+            decode_statuses(&blob),
+            vec![
+                expect(PerpBatchTag::Rejected, [0u8; 32], PerpBatchReason::InvalidStpMode),
+                expect(PerpBatchTag::Accepted, id, PerpBatchReason::None),
+                expect(PerpBatchTag::Rejected, [0u8; 32], PerpBatchReason::Other),
+            ]
+        );
+        assert_eq!(get_order(&mut ctx, id).stp, StpMode::ExpireBoth);
     }
 }

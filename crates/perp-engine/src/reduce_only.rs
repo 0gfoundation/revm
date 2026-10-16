@@ -385,6 +385,7 @@ mod tests {
             maker_fee_bps: 0,
             assuming_price: price,
             reduce_only,
+            stp: Default::default(),
         }
     }
 

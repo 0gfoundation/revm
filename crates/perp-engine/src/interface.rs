@@ -648,7 +648,10 @@ sol! {
         /// price: the resting price for the limit pair; must be 0 for the `_MARKET` pair.
         /// tif: applies to the limit pair only.
         /// clientAlgoId: caller-assigned tracking id, emitted but not stored. bytes16(0) if unused.
-        /// flags: bit 0 reduceOnly, bit 1 closePosition. Unknown bits REJECTED.
+        /// flags: bit 0 reduceOnly, bit 1 closePosition, bits 3:2 self-trade-prevention mode
+        ///   (same values as `placeOrder`'s; the order the trigger produces INHERITS it). Unknown
+        ///   bits REJECTED, and the reserved mode `0b11` is refused with
+        ///   `placeAlgoOrder: invalid self-trade prevention mode`.
         ///   ⚠️ This build accepts only reduce-only / closePosition conditionals — a conditional
         ///   that would OPEN exposure is rejected. Binance performs no margin check before trigger,
         ///   which leaves "triggered but cannot afford to open" as a case its own docs do not
@@ -684,7 +687,11 @@ sol! {
             uint8 tif,
             uint8 status,
             bool reduceOnly,
-            bool closePosition
+            bool closePosition,
+            /// `flags` bits 3:2 as a value: 0 EXPIRE_MAKER, 1 EXPIRE_TAKER, 2 EXPIRE_BOTH.
+            /// Appended last; every field of the tuple is static, so a decoder for the older
+            /// eleven-field tuple still reads the first eleven unchanged.
+            uint8 selfTradePreventionMode
         );
 
         /// Ids of the UNTRIGGERED conditional orders a user holds in a market.
@@ -864,7 +871,16 @@ sol! {
         ///            a promise. Read the accepted size from `OrderPlaced.quantity`, which fires on
         ///            every accepted order; `OrderRested` only fires when a remainder rests, so an
         ///            IOC or a fully-filled order has no `OrderRested` to read.
-        ///     bits 1-7  reserved (closePosition, priceProtect, ...); must be 0.
+        ///     bits 3:2  self-trade-prevention mode, an ENUM (not two independent bits):
+        ///                 00 EXPIRE_MAKER (the default — `flags = 0` means this)
+        ///                 01 EXPIRE_TAKER
+        ///                 10 EXPIRE_BOTH
+        ///                 11 reserved — REJECTED with `placeOrder: invalid self-trade prevention
+        ///                    mode` (batch reason 34); never a "no STP" mode
+        ///               Decoded, validated, stored on the order and echoed by `OrderPlaced`,
+        ///               `OrderRested`, `getOrder` and `getOpenOrders`. One encoding per mode, so
+        ///               every echo equals the byte that was sent.
+        ///     bit 1, bits 4-7  reserved; must be 0.
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
@@ -897,7 +913,8 @@ sol! {
             uint8   tif;        // 0 = GTC, 1 = IOC, 2 = FOK, 3 = PostOnly
                                 // Market accepts only 0/1 — see `placeOrder` for the legal matrix
             bytes16 clientOrderId;
-            uint8   flags;      // see `placeOrder`; unknown bits are rejected per item
+            uint8   flags;      // see `placeOrder` (bit 0 reduceOnly, bits 3:2 STP mode); unknown
+                                // bits / the reserved STP mode are rejected per item
     }
         /// Place up to MAX_BATCH_PLACE (64) orders in one call, on behalf of the caller.
         ///
@@ -943,8 +960,9 @@ sol! {
             uint64  quantity,
             uint64  filled,
             uint8   status,
-            /// The accepted modifier bitfield (bit 0 = reduceOnly). Binance's `/fapi/v1/order`
-            /// returns `reduceOnly`, so this is REST-facing, not engine internals.
+            /// The accepted modifier bitfield (bit 0 = reduceOnly, bits 3:2 = STP mode). Binance's
+            /// `/fapi/v1/order` returns `reduceOnly` and `selfTradePreventionMode`, so this is
+            /// REST-facing, not engine internals.
             uint8   flags
         );
         /// Query a user's open order entries in one market.
@@ -954,8 +972,9 @@ sol! {
             uint8[]   sides,
             uint64[]  prices,
             uint64[]  remainingQuantities,
-            /// Index-aligned modifier bitfields (bit 0 = reduceOnly), for
-            /// `/fapi/v1/openOrders`'s `reduceOnly`.
+            /// Index-aligned modifier bitfields (bit 0 = reduceOnly, bits 3:2 = STP mode), for
+            /// `/fapi/v1/openOrders`'s `reduceOnly` / `selfTradePreventionMode`. Read off the entry
+            /// list, never by loading each order.
             uint8[]   flags
         );
         /// Query one side's active price levels in matching priority order.
@@ -1621,8 +1640,9 @@ sol! {
         // Emitted once per accepted placeOrder / placeOrderSigned call, before any matching.
         // Fires only when validation passes; a reverted tx emits nothing.
         // Feeds: /allOrders (initial record), /openOrders (pending state)
-        /// flags: the accepted modifier bitfield (bit 0 = reduceOnly), echoed so the flag is
-        ///   recoverable from the EVENT STREAM. Without it the only off-chain route is decoding
+        /// flags: the accepted modifier bitfield (bit 0 = reduceOnly, bits 3:2 = STP mode — `00`
+        ///   is EXPIRE_MAKER, the default), echoed so the flags are recoverable from the EVENT
+        ///   STREAM. A liquidation close's STP bits carry no meaning (STP never applies to it). Without it the only off-chain route is decoding
         ///   `placeOrder` calldata and re-deriving order ids per batch item, which is not something
         ///   an indexer can do. `uint8` rather than `bool` so a later bit costs no ABI round.
         event OrderPlaced(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags);
@@ -1686,7 +1706,10 @@ sol! {
         // `reason` is `CancelReason` (perp-core `types::order`): 0 = the owner asked (cancelOrder /
         // cancelOrderSigned / batchCancelOrders), 1 = taker margin cover mid-match, 2 = maker fill
         // rejected as opening-into-insolvency, 3 = the owner was liquidated, 4 = the order was
-        // stranded out of band at the touch and the mark update expired it.
+        // stranded out of band at the touch and the mark update expired it, 5/6/7 = reduce-only
+        // eviction (position shrank / would open / overtaken by a normal order), 8 = the owner was
+        // an ADL counterparty, 9 = self-trade prevention (a same-address taker expired this maker),
+        // 10 = a triggered conditional order was rejected by the matcher (on `AlgoOrderCancelled`).
         //
         // Without it this event was byte-identical for a user cancel and a protocol kill (three
         // indexed fields, no data) and — under delete-on-terminal — `getOrder` answers "not found"

@@ -250,6 +250,25 @@ impl OrderKind {
         matches!(self, OrderKind::Limit(TimeInForce::Gtc))
     }
 
+    /// Does self-trade prevention apply when this order is the TAKER? (A resting order's own kind
+    /// is never consulted: STP is decided by the taker's mode alone, and a resting PostOnly or
+    /// FOK-born order is cancelled as a maker like any other.)
+    ///
+    /// GTC, IOC and market orders: yes. FOK and PostOnly: no — Binance: "STP won't take effect"
+    /// for them. A PostOnly taker never reaches the matcher anyway (it rejects on a cross), and a
+    /// FOK keeps today's behaviour of trading with its owner's own liquidity.
+    ///
+    /// Deliberately EXHAUSTIVE (no `_` arm): a new TIF (GTD, …) must come back here and state
+    /// whether STP applies to it instead of silently inheriting an answer.
+    #[inline]
+    pub fn stp_applies(self) -> bool {
+        match self {
+            OrderKind::Market => true,
+            OrderKind::Limit(TimeInForce::Gtc | TimeInForce::Ioc) => true,
+            OrderKind::Limit(TimeInForce::Fok | TimeInForce::PostOnly) => false,
+        }
+    }
+
     /// Does this order have a POSITION IN THE OWNER'S OWN RESTING QUEUE — i.e. is its limit price
     /// meaningful as "when do I fill relative to my other orders"?
     ///
@@ -303,6 +322,79 @@ impl OrderStatus {
             OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Expired
         )
     }
+}
+
+/// Self-trade prevention mode — `flags` bits 3:2 on `placeOrder`, batch items and
+/// `placeAlgoOrder` (one decoder, [`StpMode::from_flags`]).
+///
+/// Only the TAKER's mode is ever read: when a taker meets a resting order of the SAME ADDRESS, the
+/// taker's mode decides which side is expired. A resting order's mode is stored only so the views
+/// and events can echo it back.
+///
+/// An ENUM in two bits, not a bitmask: as a mask `00` would also have to mean "expire maker", so
+/// `00` and `10` would be two spellings of one mode and a re-encoded echo could differ from the
+/// raw byte the caller sent. With the enum every mode has exactly one encoding. `0b11` is reserved
+/// and REJECTED — kept for a possible future mode, never to mean "no STP".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum StpMode {
+    /// Cancel the resting (maker) order, keep matching. The default: `flags = 0` means this.
+    #[default]
+    ExpireMaker = 0,
+    /// Stop matching and expire the taker's remainder; the resting order stays.
+    ExpireTaker = 1,
+    /// Cancel the resting order AND expire the taker's remainder.
+    ExpireBoth = 2,
+}
+
+impl StpMode {
+    /// The two `flags` bits the mode occupies.
+    pub const FLAG_MASK: u8 = 0b1100;
+
+    /// Decode the mode out of a `flags` byte (other bits ignored). `None` only for the reserved
+    /// `0b11`.
+    #[inline]
+    pub fn from_flags(flags: u8) -> Option<Self> {
+        match (flags & Self::FLAG_MASK) >> 2 {
+            0 => Some(Self::ExpireMaker),
+            1 => Some(Self::ExpireTaker),
+            2 => Some(Self::ExpireBoth),
+            _ => None,
+        }
+    }
+
+    /// This mode's bits, positioned for a `flags` byte (the inverse of [`Self::from_flags`]).
+    #[inline]
+    pub fn to_flags(self) -> u8 {
+        (self as u8) << 2
+    }
+
+    /// Does this mode cancel the resting order of the same address?
+    #[inline]
+    pub fn expires_maker(self) -> bool {
+        matches!(self, Self::ExpireMaker | Self::ExpireBoth)
+    }
+
+    /// Does this mode stop the taker and expire its remainder?
+    #[inline]
+    pub fn expires_taker(self) -> bool {
+        matches!(self, Self::ExpireTaker | Self::ExpireBoth)
+    }
+}
+
+/// Why a taker's unfilled remainder expired — the `reason` of `OrderExpired`.
+///
+/// `9` is deliberately the same number as [`CancelReason::SelfTradePrevention`], so one decoder
+/// reads the STP code off both legs of a prevented self-trade (the maker's `OrderCancelled` and the
+/// taker's `OrderExpired`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ExpiryReason {
+    /// The time-in-force ran out of book: an IOC or market remainder (liquidity, limit price or the
+    /// fill-time band stopped the walk).
+    Tif = 0,
+    /// Self-trade prevention stopped the walk at the taker's own resting order.
+    SelfTradePrevention = 9,
 }
 
 /// Why an order left the book — byte 4 of `OrderCancelled`.
@@ -363,6 +455,14 @@ pub enum CancelReason {
     /// liquidated — their position was profitable, which is exactly why it was selected — and
     /// reporting `Liquidation` would tell every downstream consumer the opposite of what happened.
     Adl = 8,
+    /// Self-trade prevention: a taker of the SAME ADDRESS met this resting order and the taker's
+    /// [`StpMode`] expires the maker (`ExpireMaker` / `ExpireBoth`). The whole remaining quantity is
+    /// cancelled, not only what the taker would have filled.
+    SelfTradePrevention = 9,
+    /// A conditional (algo) order triggered, and the ordinary placement it became was REJECTED by
+    /// the matcher (an unfillable FOK, a crossing PostOnly, a refused rest). Carried by
+    /// `AlgoOrderCancelled`; the trigger is spent.
+    TriggerRejected = 10,
 }
 
 // ── Structs ───────────────────────────────────────────────────────────────
@@ -423,6 +523,12 @@ pub struct Order {
     /// as on Binance.
     #[serde(default, rename = "cp")]
     pub close_position: bool,
+    /// Self-trade-prevention mode, from `flags` bits 3:2 — APPENDED LAST, positional msgpack.
+    ///
+    /// Read by the matcher only while this order is the TAKER; stored so `getOrder` can echo it,
+    /// and so a conditional order carries it to the ordinary order its trigger produces.
+    #[serde(default, rename = "stp")]
+    pub stp: StpMode,
 }
 
 /// Lightweight per-user per-market order entry used for margin-reserve calculation.
@@ -489,6 +595,11 @@ pub struct OrderEntry {
     /// a path that runs on every placement.
     #[serde(default, rename = "ro")]
     pub reduce_only: bool,
+    /// Mirror of [`Order::stp`], carried on the entry for the same reason as `reduce_only`:
+    /// `getOpenOrders` echoes each order's flags off this list, and without it that view would need
+    /// a `load_order` per entry. Never read by matching (a resting order's mode is not consulted).
+    #[serde(default, rename = "stp")]
+    pub stp: StpMode,
 }
 
 impl OrderEntry {
@@ -599,5 +710,118 @@ mod order_kind_tests {
             .filter(|k| k.rests_remainder())
             .collect();
         assert_eq!(resting, vec![OrderKind::Limit(TimeInForce::Gtc)]);
+    }
+}
+
+#[cfg(test)]
+mod stp_mode_tests {
+    use super::*;
+
+    const ALL_MODES: [StpMode; 3] =
+        [StpMode::ExpireMaker, StpMode::ExpireTaker, StpMode::ExpireBoth];
+
+    /// The wire table, pinned: bits 3:2 are an ENUM, `0b11` is the one reserved value, and every
+    /// other bit of the byte is ignored by this decoder (the callers reject unknown bits first).
+    #[test]
+    fn the_flag_encoding_is_pinned() {
+        assert_eq!(StpMode::FLAG_MASK, 0b1100);
+        assert_eq!(StpMode::from_flags(0b0000), Some(StpMode::ExpireMaker));
+        assert_eq!(StpMode::from_flags(0b0100), Some(StpMode::ExpireTaker));
+        assert_eq!(StpMode::from_flags(0b1000), Some(StpMode::ExpireBoth));
+        assert_eq!(StpMode::from_flags(0b1100), None, "0b11 is reserved, never 'no STP'");
+        assert_eq!(StpMode::default(), StpMode::ExpireMaker, "flags = 0 means EXPIRE_MAKER");
+        for other in [0x01u8, 0x02, 0x10, 0xf0, 0xf3] {
+            assert_eq!(StpMode::from_flags(other), Some(StpMode::ExpireMaker), "0x{other:02x}");
+            assert_eq!(StpMode::from_flags(other | 0b1000), Some(StpMode::ExpireBoth));
+            assert_eq!(StpMode::from_flags(other | 0b1100), None);
+        }
+    }
+
+    /// One encoding per mode: decode ∘ encode is the identity and encode touches only bits 3:2.
+    /// This is what lets an echo of the stored mode equal the byte the caller sent.
+    #[test]
+    fn every_mode_round_trips_through_its_bits() {
+        for m in ALL_MODES {
+            assert_eq!(m.to_flags() & !StpMode::FLAG_MASK, 0);
+            assert_eq!(StpMode::from_flags(m.to_flags()), Some(m));
+            assert_eq!(StpMode::from_flags(m.to_flags() | 0x01), Some(m), "reduce-only bit is independent");
+        }
+    }
+
+    #[test]
+    fn which_side_each_mode_expires() {
+        let table: Vec<(bool, bool)> =
+            ALL_MODES.iter().map(|m| (m.expires_maker(), m.expires_taker())).collect();
+        assert_eq!(table, vec![(true, false), (false, true), (true, true)]);
+    }
+
+    /// STP applies to GTC, IOC and market takers only.
+    #[test]
+    fn stp_applies_to_gtc_ioc_and_market_only() {
+        assert!(OrderKind::Market.stp_applies());
+        for (tif, applies) in [
+            (TimeInForce::Gtc, true),
+            (TimeInForce::Ioc, true),
+            (TimeInForce::Fok, false),
+            (TimeInForce::PostOnly, false),
+        ] {
+            assert_eq!(OrderKind::Limit(tif).stp_applies(), applies, "{tif:?}");
+        }
+    }
+
+    /// The new reason codes, pinned as wire values, and the deliberate 9 = 9 between the two legs.
+    #[test]
+    fn reason_codes_are_pinned() {
+        assert_eq!(CancelReason::SelfTradePrevention as u8, 9);
+        assert_eq!(CancelReason::TriggerRejected as u8, 10);
+        assert_eq!(ExpiryReason::Tif as u8, 0);
+        assert_eq!(ExpiryReason::SelfTradePrevention as u8, 9);
+        assert_eq!(
+            ExpiryReason::SelfTradePrevention as u8,
+            CancelReason::SelfTradePrevention as u8,
+            "one decoder reads STP off both legs"
+        );
+    }
+
+    /// The stored mode survives the positional codec on both records, as ONE byte (a `repr(u8)`
+    /// value, not a string or a map).
+    #[test]
+    fn the_mode_round_trips_through_the_codec() {
+        assert_eq!(crate::codec::encode(&StpMode::ExpireBoth).unwrap(), vec![0x02]);
+        let order = Order {
+            owner: [7u8; 20],
+            market_id: 1,
+            side: Side::Sell,
+            price: 100,
+            quantity: 5,
+            filled: 0,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            status: OrderStatus::Open,
+            reduce_only: true,
+            trigger_price: 0,
+            trigger_up: false,
+            close_position: false,
+            stp: StpMode::ExpireBoth,
+        };
+        let back: Order = crate::codec::decode(&crate::codec::encode(&order).unwrap()).unwrap();
+        assert_eq!(back, order);
+        let entry = OrderEntry {
+            order_id: [9u8; 32],
+            price: 100,
+            amount: 5,
+            maker_fee_bps: 2,
+            assuming_price: 101,
+            reduce_only: false,
+            stp: StpMode::ExpireTaker,
+        };
+        let back: OrderEntry =
+            crate::codec::decode(&crate::codec::encode(&entry).unwrap()).unwrap();
+        assert_eq!(back, entry);
+        // Appended LAST and one byte wide: the default mode is the trailing positional element,
+        // a single `0x00`.
+        let default_mode = OrderEntry { stp: StpMode::ExpireMaker, ..entry };
+        let enc = crate::codec::encode(&default_mode).unwrap();
+        assert_eq!(*enc.last().unwrap(), 0x00, "the mode is the trailing positional element");
     }
 }

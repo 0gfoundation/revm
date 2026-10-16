@@ -6833,7 +6833,12 @@ mod algo_order_admission {
         bad(&mut ctx, placeAlgoOrderCall { orderType: 4, ..base.clone() }, "orderType");
         bad(&mut ctx, placeAlgoOrderCall { triggerPrice: 0, ..base.clone() }, "triggerPrice");
         bad(&mut ctx, placeAlgoOrderCall { flags: 0, ..base.clone() }, "reduceOnly or closePosition");
-        bad(&mut ctx, placeAlgoOrderCall { flags: 0b1000, ..base.clone() }, "unknown flag");
+        // Bits 3:2 are the STP mode now, so 0b1000 alone is a legal mode with no reduce-only bit —
+        // refused for THAT, not as an unknown bit. The RO bit is kept on the next two so the
+        // reduce-only scope check cannot mask the error under test.
+        bad(&mut ctx, placeAlgoOrderCall { flags: 0b1000, ..base.clone() }, "reduceOnly or closePosition");
+        bad(&mut ctx, placeAlgoOrderCall { flags: 0b1101, ..base.clone() }, "invalid self-trade prevention mode");
+        bad(&mut ctx, placeAlgoOrderCall { flags: 0b1_0001, ..base.clone() }, "unknown flag");
         // closePosition is *_MARKET only, and excludes an explicit quantity.
         bad(
             &mut ctx,
@@ -7091,6 +7096,66 @@ mod algo_trigger_sweep {
         );
     }
 
+    /// A conditional order's STP mode is set at `placeAlgoOrder` and INHERITED by the ordinary
+    /// order its trigger produces — through the one flags encoder, so the fired order's
+    /// `OrderPlaced`, `OrderRested` and `getOrder` all echo reduce-only plus that mode, and
+    /// `getAlgoOrder` reports it as a value while the order waits.
+    #[test]
+    fn a_fired_conditional_inherits_its_stp_mode() {
+        use crate::interface::IPerpDex::{getAlgoOrderCall, OrderPlaced, OrderRested};
+        use crate::types::StpMode;
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+        let flags = RO | StpMode::ExpireBoth.to_flags();
+        let id = place_algo(&mut ctx, ALICE, Side::Sell, AlgoOrderType::Stop, 9_900, 9_950, QTY as u64, flags);
+
+        let placed = JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .find(|l| {
+                l.data.topics().first()
+                    == Some(&crate::interface::IPerpDex::AlgoOrderPlaced::SIGNATURE_HASH)
+            })
+            .map(|l| {
+                crate::interface::IPerpDex::AlgoOrderPlaced::decode_raw_log(
+                    l.data.topics(),
+                    &l.data.data,
+                )
+                .unwrap()
+                .flags
+            });
+        assert_eq!(placed, Some(flags), "AlgoOrderPlaced echoes the raw (= canonical) byte");
+        let ret = crate::algo::run_get_algo_order(
+            &getAlgoOrderCall { algoId: id.into() }.abi_encode(),
+            &mut ctx,
+        )
+        .unwrap();
+        let view = getAlgoOrderCall::abi_decode_returns(&ret).unwrap();
+        assert_eq!(view.selfTradePreventionMode, StpMode::ExpireBoth as u8);
+        assert!(view.reduceOnly);
+
+        oracle_tick(&mut ctx, 9_900, 31);
+
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        let echoed: Vec<u8> = logs
+            .iter()
+            .filter_map(|l| match l.data.topics().first() {
+                Some(t) if *t == OrderPlaced::SIGNATURE_HASH => Some(
+                    OrderPlaced::decode_raw_log(l.data.topics(), &l.data.data).unwrap().flags,
+                ),
+                Some(t) if *t == OrderRested::SIGNATURE_HASH => Some(
+                    OrderRested::decode_raw_log(l.data.topics(), &l.data.data).unwrap().flags,
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(echoed, vec![flags, flags], "OrderPlaced + OrderRested of the fired order");
+        let o = storage::load_order(&mut ctx, &id).unwrap().expect("rested");
+        assert_eq!(o.trigger_price, 0, "an ordinary order now");
+        assert_eq!(o.stp, StpMode::ExpireBoth, "inherited, not reset to the default");
+        assert!(o.reduce_only);
+    }
+
     /// A trigger is never refused by the per-market open-order cap, even when its owner sits AT
     /// the cap: `fire` takes the conditional off the owner's list before placing it, so the fired
     /// limit order converts one counted open order into another. Were it refused, the refusal
@@ -7311,6 +7376,10 @@ mod algo_order_signed {
     /// signature stops verifying, which is the point — a helper that called the engine's own
     /// writer would pin nothing.
     fn msg(chain_id: u64, account: Address, trigger: u64, qty: u64) -> Vec<u8> {
+        msg_flags(chain_id, account, trigger, qty, RO)
+    }
+
+    fn msg_flags(chain_id: u64, account: Address, trigger: u64, qty: u64, flags: u8) -> Vec<u8> {
         let mut m = Vec::new();
         m.extend_from_slice(b"perpdex_v1_algo");
         m.extend_from_slice(&chain_id.to_be_bytes());
@@ -7325,7 +7394,7 @@ mod algo_order_signed {
         m.push(0); // tif
         m.push(0); // workingType = MARK_PRICE
         m.extend_from_slice(&[0u8; 16]); // clientAlgoId
-        m.push(RO);
+        m.push(flags);
         m.extend_from_slice(&TS.to_be_bytes());
         m.extend_from_slice(&RECV.to_be_bytes());
         m.push(0); // keyId
@@ -7333,6 +7402,10 @@ mod algo_order_signed {
     }
 
     fn calldata(sig: &[u8], trigger: u64, qty: u64, account: Address) -> Vec<u8> {
+        calldata_flags(sig, trigger, qty, account, RO)
+    }
+
+    fn calldata_flags(sig: &[u8], trigger: u64, qty: u64, account: Address, flags: u8) -> Vec<u8> {
         placeAlgoOrderSignedCall {
             account,
             algoType: 0,
@@ -7345,13 +7418,49 @@ mod algo_order_signed {
             tif: 0,
             workingType: 0,
             clientAlgoId: FixedBytes::default(),
-            flags: RO,
+            flags,
             timestamp: TS,
             recvWindow: RECV,
             keyId: 0,
             signature: sig.to_vec().into(),
         }
         .abi_encode()
+    }
+
+    /// The signed path decodes the STP bits with the same decoder: the reserved mode is refused
+    /// BEFORE the burn (it is a validation failure, so the signature stays unspent and nothing is
+    /// written), and a legal mode is stored for the trigger to inherit.
+    #[test]
+    fn the_signed_path_validates_and_stores_the_stp_mode() {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        register(&mut ctx, ALICE, &sk);
+        let chain_id = ctx.chain_id();
+
+        let bad = RO | 0b1100;
+        let sig = sk.sign(&msg_flags(chain_id, ALICE, 8_000, QTY as u64, bad)).to_bytes();
+        let writes = JournalTr::perp_write_count(ctx.journal_mut());
+        let e = crate::algo::run_place_algo_order_signed(
+            &calldata_flags(&sig, 8_000, QTY as u64, ALICE, bad),
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(format!("{e:?}").contains("invalid self-trade prevention mode"), "got {e:?}");
+        assert_eq!(JournalTr::perp_write_count(ctx.journal_mut()), writes, "pre-burn, write-clean");
+
+        let good = RO | crate::types::StpMode::ExpireTaker.to_flags();
+        let sig = sk.sign(&msg_flags(chain_id, ALICE, 8_000, QTY as u64, good)).to_bytes();
+        let out = crate::algo::run_place_algo_order_signed(
+            &calldata_flags(&sig, 8_000, QTY as u64, ALICE, good),
+            &mut ctx,
+        )
+        .unwrap();
+        let id: [u8; 32] = out[..32].try_into().unwrap();
+        assert_eq!(
+            storage::load_order(&mut ctx, &id).unwrap().unwrap().stp,
+            crate::types::StpMode::ExpireTaker
+        );
     }
 
     #[test]
@@ -9044,6 +9153,7 @@ mod withdrawal_cap {
                         maker_fee_bps: 0,
                         assuming_price: price,
                         reduce_only: false,
+                        stp: Default::default(),
                     });
                 }
             }

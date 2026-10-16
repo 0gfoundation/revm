@@ -12,7 +12,7 @@ use crate::{
         calc_bankruptcy_price, calc_position_equity, calc_value, calc_value_i64,
     },
     storage,
-    types::{AccountUpdateReason, Market, Order, OrderKind, OrderStatus, Side},
+    types::{AccountUpdateReason, Market, Order, OrderKind, OrderStatus, Side, StpMode},
     PERP_DEX_ADDRESS,
     PerpError,
 };
@@ -61,6 +61,10 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         trigger_price: 0,
         trigger_up: false,
         close_position: false,
+        // Self-trade prevention never applies to a liquidation close (the liquidated user's own
+        // orders in this market are all cancelled before it runs, so it cannot meet one). The
+        // field is the default only because the record has to hold something.
+        stp: StpMode::default(),
     };
     // commit-only #23: the close order is persisted ONCE after matching (below); the
     // OrderPlaced log keeps its original position (logs are EVM-journaled).
@@ -76,8 +80,10 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
             orderType: kind.order_type() as u8,
             tif: kind.tif() as u8,
             clientOrderId: FixedBytes::default(),
-            // A liquidation close is a protocol action, not a user order — no modifiers apply.
-            flags: 0,
+            // A liquidation close is a protocol action, not a user order — no modifiers apply. The
+            // byte still goes through the one encoder; its STP bits (EXPIRE_MAKER, `00`) are
+            // MEANINGLESS for this order.
+            flags: super::encode_order_flags(false, StpMode::default()),
         }
         .to_log_data(),
     });

@@ -38,8 +38,8 @@ use crate::interface::IPerpDex::{
     placeAlgoOrderCall, placeAlgoOrderSignedCall,
 };
 use crate::types::{
-    AlgoOrderType, CancelReason, Order, OrderStatus, OrderType, Side, TimeInForce, WorkingType,
-    ALGO_TYPE_CONDITIONAL,
+    AlgoOrderType, CancelReason, Order, OrderStatus, OrderType, Side, StpMode, TimeInForce,
+    WorkingType, ALGO_TYPE_CONDITIONAL,
 };
 use crate::{errors::perp_err, storage, PerpError, PERP_DEX_ADDRESS};
 use alloy_primitives::IntoLogData;
@@ -83,7 +83,9 @@ pub const MAX_ALGO_ORDERS_PER_MARKET: usize = 32;
 
 const FLAG_REDUCE_ONLY: u8 = 1 << 0;
 const FLAG_CLOSE_POSITION: u8 = 1 << 1;
-const KNOWN_FLAGS: u8 = FLAG_REDUCE_ONLY | FLAG_CLOSE_POSITION;
+/// Bits 3:2 are the self-trade-prevention mode, decoded by the SAME `StpMode::from_flags` as
+/// `placeOrder`'s — the mode set here is the one the triggered order matches with.
+const KNOWN_FLAGS: u8 = FLAG_REDUCE_ONLY | FLAG_CLOSE_POSITION | StpMode::FLAG_MASK;
 
 /// Everything `placeAlgoOrder` and its signed twin agree on before anything is written.
 struct ValidatedAlgo {
@@ -96,6 +98,8 @@ struct ValidatedAlgo {
     tif: TimeInForce,
     reduce_only: bool,
     close_position: bool,
+    /// Inherited by the ordinary order the trigger produces.
+    stp: StpMode,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -135,6 +139,8 @@ fn validate(
     if flags & !KNOWN_FLAGS != 0 {
         return Err(perp_err("placeAlgoOrder: unknown flag bits"));
     }
+    let stp = StpMode::from_flags(flags)
+        .ok_or_else(|| perp_err("placeAlgoOrder: invalid self-trade prevention mode"))?;
     let reduce_only = flags & FLAG_REDUCE_ONLY != 0;
     let close_position = flags & FLAG_CLOSE_POSITION != 0;
 
@@ -199,6 +205,7 @@ fn validate(
         tif,
         reduce_only,
         close_position,
+        stp,
     })
 }
 
@@ -246,6 +253,7 @@ fn place_core<H: PerpHost>(
         trigger_price: v.trigger_price,
         trigger_up: v.trigger_up,
         close_position: v.close_position,
+        stp: v.stp,
     };
     storage::save_order(context, &algo_id, &order)?;
     storage::algo_index_insert(context, market_id, v.trigger_up, v.trigger_price, algo_id)?;
@@ -411,6 +419,7 @@ pub fn run_get_algo_order<H: PerpHost>(
             status: o.status as u8,
             reduceOnly: o.reduce_only,
             closePosition: o.close_position,
+            selfTradePreventionMode: o.stp as u8,
         },
     )))
 }
@@ -785,7 +794,9 @@ fn fire<H: PerpHost>(
             order.tif as u8
         },
         [0u8; 16],
-        FLAG_REDUCE_ONLY,
+        // Through the one encoder, so the fired order is reduce-only AND carries the mode set at
+        // `placeAlgoOrder` — the trigger inherits it.
+        crate::trading::encode_order_flags(true, order.stp),
         crate::trading::PlacementOrigin::Triggered,
         context,
     )?;

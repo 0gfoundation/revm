@@ -774,6 +774,7 @@ mod mutation_killers {
                     maker_fee_bps: 0,
                     assuming_price: 0,
                     reduce_only: false,
+                    stp: Default::default(),
                 }]
                 .into_iter()
                 .collect();

@@ -305,6 +305,10 @@ pub enum PerpBatchReason {
     /// already holds `algo::MAX_OPEN_ORDERS_PER_MARKET` open orders in that market (book orders on
     /// both sides, earlier items of this batch included, plus untriggered conditionals).
     MaxOpenOrders = 33,
+    /// `placeOrder: invalid self-trade prevention mode` — `flags` bits 3:2 = `0b11`, the reserved
+    /// mode. Distinct from an unknown bit (which lands in [`Self::Other`]): the bit IS known, its
+    /// value is not.
+    InvalidStpMode = 34,
     /// A checked-arithmetic guard (`… overflow` / `… underflow` / `exceeds i64…`), matched
     /// structurally because the engine has ~30 of them and they are all
     /// unreachable-by-construction. Path-independent, hence the engine band.
@@ -376,6 +380,7 @@ fn place_reason(rest: &str) -> PerpBatchReason {
         "open would breach maintenance margin" => PerpBatchReason::OpenIntoInsolvency,
         "fee recipient not initialised" => PerpBatchReason::FeeRecipientNotSet,
         "max open orders reached" => PerpBatchReason::MaxOpenOrders,
+        "invalid self-trade prevention mode" => PerpBatchReason::InvalidStpMode,
         other if is_arith_guard(other) => PerpBatchReason::ArithmeticGuard,
         _ => PerpBatchReason::Other,
     }
