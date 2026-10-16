@@ -3936,3 +3936,9 @@ mod stp_spec_tests;
 #[cfg(test)]
 #[path = "fee_spec_tests.rs"]
 mod fee_spec_tests;
+
+/// Maker rebates and ppm fee rates, written independently from the spec rather than from this
+/// implementation (or its `fee_spec_tests`).
+#[cfg(test)]
+#[path = "rebate_spec_tests.rs"]
+mod rebate_spec_tests;
