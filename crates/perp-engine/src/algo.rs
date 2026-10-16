@@ -672,8 +672,9 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
     }
     // The early `return Ok(true)` above is the ONLY way this sweep defers, so reaching here means
     // every firing trigger was executed. Nothing else in here is a deferral: a stale index entry
-    // is cleaned up in passing, and a trigger that fired but could not fill is EXPIRED by the
-    // ordinary market path rather than owed — that is the Binance-parity outcome, not a backlog.
+    // is cleaned up in passing, a trigger that fired but could not fill is EXPIRED by the ordinary
+    // market path, and one the matcher REFUSED is cancelled (`TriggerRejected`) — each a final
+    // outcome (the Binance-parity one), not a backlog.
     Ok(false)
 }
 
@@ -683,6 +684,24 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
 /// a frame revert does NOT roll them back, so anything that can fail must fail BEFORE the first
 /// write. Hence the capacity pre-check — `place_order_core` would otherwise reject a reduce-only
 /// order it cannot fit, after having written.
+///
+/// # A placement the matcher refuses is an OUTCOME, not an error
+///
+/// The capacity pre-check cannot see the matcher's own rejects, and those are reachable from a
+/// trigger: a limit conditional may carry any TIF, so a fired FOK may be unfillable, a fired
+/// PostOnly may cross, and a fired GTC may be refused at rest (a new best quote outside the band,
+/// or an unaffordable rest). By then this function HAS written — the conditional left its indexes
+/// and `AlgoOrderTriggered` is logged — so propagating the reject would revert the ORACLE
+/// transaction over retained perp writes and truncated logs, skip the rest of this tick's sweep
+/// (including liquidations), and orphan the record (out of every index, never deleted).
+///
+/// So a GENUINE reject — `Reject` with the perp write counter unmoved, the same witness the batch
+/// driver uses (`batch::drive_batch`) — is the trigger's terminal outcome: the record is deleted
+/// and `AlgoOrderCancelled(TriggerRejected)` follows `AlgoOrderTriggered`, the same two-event shape
+/// as the `qty == 0` expiry below (Binance: ALGO_UPDATE `REJECTED`, "denied by the matching
+/// engine"). A placement reject is write-clean AND log-clean (its `OrderPlaced` is buffered and
+/// never emitted), so nothing of the refused order survives. Anything else — a reject AFTER a
+/// write, or a `Fatal` — still propagates: that is a real leak or a halt, not a market outcome.
 fn fire<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -780,7 +799,8 @@ fn fire<H: PerpHost>(
     // fill-time band, fees, and — for the `_MARKET` pair — EXPIRING whatever the band would not
     // let through, which is Binance's behaviour for an unfilled market order and which we get for
     // free by not special-casing it.
-    crate::trading::place_order_core(
+    let writes_before = context.perp_write_count();
+    let placed = crate::trading::place_order_core(
         owner,
         *algo_id,
         market_id,
@@ -799,6 +819,29 @@ fn fire<H: PerpHost>(
         crate::trading::encode_order_flags(true, order.stp),
         crate::trading::PlacementOrigin::Triggered,
         context,
-    )?;
-    Ok(())
+    );
+    match placed {
+        Ok(_) => Ok(()),
+        Err(PerpError::Reject(msg)) if context.perp_write_count() == writes_before => {
+            // A write-clean `[INVARIANT]` would be absorbed here exactly as the batch driver absorbs
+            // one; make it loud where it can be (tests, the correctness gate), not in an oracle tx.
+            debug_assert!(
+                !msg.starts_with("[INVARIANT] "),
+                "a triggered placement hit an invariant: {msg}"
+            );
+            storage::delete_order(context, algo_id)?;
+            context.log(Log {
+                address: PERP_DEX_ADDRESS,
+                data: IPerpDex::AlgoOrderCancelled {
+                    user: owner,
+                    marketId: market_id,
+                    algoId: FixedBytes(*algo_id),
+                    reason: CancelReason::TriggerRejected as u8,
+                }
+                .to_log_data(),
+            });
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }

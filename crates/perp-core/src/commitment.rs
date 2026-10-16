@@ -234,6 +234,11 @@ use primitives::{B256, U256};
 //     appended), so every order blob and every per-user entry list grows by one byte per order.
 //     `flags` bits 3:2 are decoded (`0b11` refused), stored and echoed; matching does not read the
 //     field yet. A LAYOUT change; BusinessSnapshot unchanged.
+//   * A triggered conditional whose ordinary placement the matcher REFUSES (unfillable FOK,
+//     crossing PostOnly, refused rest) is deleted with `AlgoOrderCancelled(TriggerRejected = 10)`
+//     instead of reverting the oracle transaction over the trigger's retained writes. An
+//     execution-rule change (a node on 35 reverts that tick, a node on 36 commits it); the golden
+//     scenario fires no trigger, so its pin does not move.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 36;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
