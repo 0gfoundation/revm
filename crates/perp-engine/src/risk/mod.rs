@@ -1412,7 +1412,8 @@ fn run_deferred_sweeps<H: PerpHost>(
 ///
 /// **Why a cap at all.** This runs on EVERY oracle update, i.e. every block, inside the transaction
 /// that also moves the mark, settles funding and runs the liquidation sweep. Users control the
-/// book's depth and there is no per-account order cap, so the out-of-band prefix is unbounded. If
+/// book's depth, and the per-market open-order cap (`MAX_OPEN_ORDERS_PER_MARKET`) bounds one
+/// account but not the number of accounts, so the out-of-band prefix is unbounded. If
 /// draining it could exceed the block gas limit, `updateIndexPrice` would stop landing — and with it
 /// the mark, funding and every liquidation. Cheap housekeeping must never be able to take the price
 /// feed down; this is the same reasoning that caps the neighbouring sweep at

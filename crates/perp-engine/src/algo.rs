@@ -55,7 +55,12 @@ use primitives::{Address, Bytes, FixedBytes, Log};
 /// Every per-user walk over a market's orders is bounded by it: the reduce-only prefix and eviction
 /// passes, the cover-cancel loop in taker settlement, and liquidation's / ADL's
 /// `cancel_all_orders_for_market`, which runs inside an already-capped sweep. It also bounds how
-/// many of a user's OWN orders a single taker can meet on the opposite side of the book.
+/// many of a user's OWN orders a single taker can meet on the opposite side of the book, and so
+/// how many self-trade prevention can cancel, since STP has no per-order cancel limit: at most 200
+/// for one `EXPIRE_MAKER` taker, and 199 for a fired conditional, which left its own count before
+/// it was placed. The trigger leg of one oracle tick fires at most `MAX_SWEEP_ACTIONS_PER_UPDATE`
+/// = 50 of them, so STP adds at most 50 × 199 cancels to `updateIndexPrice` (the gas note there,
+/// in `call.rs`, says why that is not priced).
 ///
 /// # Where it is enforced
 ///

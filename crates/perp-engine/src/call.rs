@@ -441,6 +441,20 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // statement is that this selector is subsidised by design and the new work does not change
         // that. FLAT, per selector — dynamic or per-item metering for this precompile was rejected
         // outright.
+        //
+        // NOR for self-trade prevention on the trigger leg. A fired conditional walks the book
+        // under the STP mode it inherited, and under `EXPIRE_MAKER` there is no per-order cancel
+        // limit: one fire cancels every own order it meets on the opposite side, at most
+        // `MAX_OPEN_ORDERS_PER_MARKET` - 1 = 199 (the conditional counted against its owner's 200
+        // and left its list before it was placed). The trigger leg spends the same
+        // `MAX_SWEEP_ACTIONS_PER_UPDATE` = 50 budget as the liquidations, so STP adds at most
+        // 50 × 199 = 9_950 cancel-sized operations per tick (and per `drainDeferredWork`, which
+        // runs the same sweeps). That is the same order as the liquidation leg's cancel-all — up to
+        // 200 orders for each of 50 liquidated owners — and it is bounded by the per-market
+        // open-order cap. Unlike that leg it needs no insolvency: anyone holding a conditional and
+        // opposite-side orders can queue the work into the oracle transaction. But every unit of
+        // it removes an order that already paid `PLACE_ORDER_GAS` to rest, which is more than the
+        // cancel costs. Deliberately not priced, for the reasons above.
         m.insert(updateIndexPriceCall::SELECTOR, (50_000, false));
         // Same 50_000 as `updateIndexPrice`: the two run the IDENTICAL downstream tail (mark
         // recompute, premium accumulation, band expiry, liquidation sweep), and the book path
