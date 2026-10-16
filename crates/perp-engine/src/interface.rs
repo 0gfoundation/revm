@@ -465,8 +465,9 @@ sol! {
         /// full only where the counterparty taker's rate covers it. That cap is the protocol's
         /// solvency guarantee; fee schedules are expected to be designed so it rarely binds.
         ///
-        /// New rates apply to orders that START RESTING afterwards: a resting order keeps the
-        /// maker rate it snapshotted, until it fills out or is cancelled.
+        /// A new MAKER rate applies to orders that START RESTING afterwards: a resting order keeps
+        /// the maker rate it snapshotted, until it fills out or is cancelled. A new TAKER rate
+        /// applies from the next match.
         ///
         /// Sub-accounts inherit their master's rates: setting a MASTER's rates also writes them to
         /// every one of its sub-accounts (one `UserFeeRatesUpdated` per account written, master
@@ -484,7 +485,8 @@ sol! {
         /// accepts is `−R`. Admin only; `R ≤ 10_000` (1%). Default 0 = rebates disabled.
         ///
         /// Lowering `R` does NOT touch rates already set below `−R`, nor the rate an already
-        /// resting order snapshotted: those keep earning their rebate. Solvency does not rest on
+        /// resting order snapshotted, nor the rate a sub-account created later inherits from its
+        /// master: those keep earning their rebate. Solvency does not rest on
         /// `R` — every fill's rebate is capped at that fill's share of the taker fee.
         function setMaxMakerRebate(uint64 maxMakerRebatePpm) external;
         /// The current maker-rebate bound `R`, in ppm.

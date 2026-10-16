@@ -295,9 +295,19 @@ impl TakerSettlement {
         // Every rebate the walk credited is capped at its own fill's share of the taker fee
         // (`entry_fill_plan`), and the shares sum to `core.fee` exactly (`finalize_core`'s
         // telescoping assertion), so `Σ rebates ≤ fee` by construction and the fee recipient's
-        // credit cannot go negative. Checked here, pre-write, so a violation is a clean reject of
-        // the whole match rather than a post-flush failure. The taker is still debited the FULL
+        // credit cannot go negative. Checked here, pre-write, so on an ordinary order match a
+        // violation is a clean reject of the whole match rather than a post-flush failure. On a
+        // liquidation close it is unreachable — the waived taker fee zeroes every share, hence
+        // every rebate (asserted below) — and if it ever fired there it would be a mid-apply
+        // failure of the liquidation, not a clean reject. The taker is still debited the FULL
         // fee (`total_required` below); the rebated part of it is already in the makers' wallets.
+        // A zero taker rate — a zero-fee account, or a liquidation close's waiver — prices every
+        // share at 0, so no rebate can have been credited. Caught where a regression would start.
+        debug_assert!(
+            self.taker_fee_ppm != 0 || reg.rebate_total == 0,
+            "a match with a zero taker rate credited {} of maker rebate",
+            reg.rebate_total
+        );
         let fee_recipient_credit = core.fee.checked_sub(reg.rebate_total).ok_or_else(|| {
             perp_invariant_err("maker rebates exceed the taker fee that funds them")
         })?;

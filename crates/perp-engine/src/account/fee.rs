@@ -52,8 +52,10 @@ pub fn run_set_user_fee_rates<H: PerpHost>(
     if args.makerFeePpm > MAX_FEE_PPM as i64 {
         return Err(perp_err("setUserFeeRates: maker fee exceeds 100000 ppm (10%)"));
     }
-    let max_rebate = storage::load_max_maker_rebate(context)?;
-    // `R ≤ MAX_MAKER_REBATE_CEILING_PPM` (setMaxMakerRebate), so the negation cannot overflow.
+    // Clamped to the setter's ceiling before the signed negation: the setter never stores more,
+    // but the loader decodes any u64, and a bare `as i64` on a corrupt value would wrap.
+    let max_rebate =
+        storage::load_max_maker_rebate(context)?.min(MAX_MAKER_REBATE_CEILING_PPM);
     if args.makerFeePpm < -(max_rebate as i64) {
         return Err(perp_err(format!(
             "setUserFeeRates: maker rebate exceeds maxMakerRebate ({max_rebate} ppm)"
@@ -112,7 +114,8 @@ pub fn run_get_user_fee_rates<H: PerpHost>(
 /// checks a negative maker rate against, `0 ≤ R ≤ MAX_MAKER_REBATE_CEILING_PPM`.
 ///
 /// Prospective only: no stored rate and no resting order's snapshot is re-validated, so lowering
-/// `R` leaves every existing rebate in place. That is safe because no fill's rebate can exceed its
+/// `R` leaves every existing rebate in place — and a sub-account created later inherits its
+/// master's rate as it is (`createSubAccount` copies it unchecked). That is safe because no fill's rebate can exceed its
 /// own taker-fee share (`settlement::entry_fill_plan`), whatever `R` is or was.
 pub fn run_set_max_maker_rebate<H: PerpHost>(
     input_bytes: &[u8],
