@@ -243,6 +243,13 @@ use primitives::{B256, U256};
 //     `margin` and the account blob as stored) is flushed through the reservation-only position
 //     write: no `AccountBalanceChanged`, and no same-value account write in the block delta. The
 //     golden scenario has no such participant, so its pin does not move.
+//   * STP matching: a GTC / IOC / market taker that meets a resting order of its OWN address no
+//     longer trades with it. The taker's mode decides: EXPIRE_MAKER cancels that order (reason 9)
+//     and walks on; EXPIRE_TAKER stops and expires the remainder (`OrderExpired.reason` 9, a GTC
+//     included — it never rests); EXPIRE_BOTH does both. FOK, PostOnly and liquidation closes are
+//     unchanged. An execution-rule change: a node on 35 self-trades where a node on 36 cancels or
+//     expires. The golden scenario has no same-address cross, so its write set, pin and
+//     BusinessSnapshot are unchanged.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 36;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

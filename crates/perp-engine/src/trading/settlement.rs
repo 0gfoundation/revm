@@ -641,7 +641,8 @@ pub(super) enum MatchEvent {
         order: crate::types::Order,
     },
     /// delete-on-terminal: drop a maker order that reached a terminal status (fully filled during
-    /// the walk, or cancelled by the K9 insolvency reject) from the order map.
+    /// the walk, or cancelled in it by the K9 insolvency reject or by self-trade prevention) from
+    /// the order map.
     DeleteOrder {
         order_id: [u8; 32],
     },
@@ -756,7 +757,8 @@ impl MatchRegistry {
     ///    to filter by `taker_order_id`.
     /// 2. Both walks call `taker_settlement.record_fill` IMMEDIATELY before pushing the fill's
     ///    `Trade`, with no early exit between them, so the two sequences advance in lockstep. A
-    ///    K9-rejected maker `continue`s BEFORE both, so it perturbs neither.
+    ///    K9-rejected maker `continue`s BEFORE both, and a self-trade-prevented one `continue`s or
+    ///    stops the walk before both, so neither perturbs them.
     ///
     /// Both are load-bearing, so the count mismatch is a hard invariant error rather than a
     /// silent truncation: if a future walk ever pushes a `Trade` without recording a fill (or the
@@ -825,8 +827,8 @@ impl MatchRegistry {
     }
 
     /// The taker's [`RestBasis`] when the walk touched it but produced **no fill** — a self-match
-    /// maker the K9 guard cancelled, which evolves the taker's own working copy (and its order
-    /// lists) without ever reaching `finalize_compute`'s fill arm.
+    /// maker the K9 guard or self-trade prevention cancelled, which evolves the taker's own working
+    /// copy (and its order lists) without ever reaching `finalize_compute`'s fill arm.
     ///
     /// `None` = the taker never joined this match, so the store is already the post-flush state for
     /// it and `rest_in_book` reads storage.
@@ -1186,10 +1188,10 @@ impl MatchRegistry {
             //
             // Every user is in this registry because a matched order touched them — a maker fill;
             // the taker of an order that filled at all (it joins in `finalize_compute`); or a
-            // resting order the walk CANCELLED in place (`cancel_rejected_maker_registry`: a fill
-            // rejected as opening-into-insolvency), which may be the taker's own order on a
-            // self-match. The last kind moves no money unless funding settled at first touch
-            // (`get_or_load`).
+            // resting order the walk CANCELLED in place (`cancel_maker_in_match`: a fill rejected
+            // as opening-into-insolvency, or the taker's own order removed by self-trade
+            // prevention — a K9 cancel may be the taker's own order too, on a FOK self-match). The
+            // last kind moves no money unless funding settled at first touch (`get_or_load`).
             //
             // `save_position` + `save_account` both MARK the user for an end-of-call
             // `AccountBalanceChanged`, unconditionally — so a user whose only part in this match
@@ -1382,13 +1384,23 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     })
 }
 
-/// Registry-backed maker cancel for a `RejectedInsolvent` fill: drops the rejected order from the
-/// registry copies and queues its `DeleteOrder` + `OrderCancelled` as DEFERRED match events. Nothing
-/// is written here — like every other walk effect it lands only when the caller's write barrier
-/// (`MatchOutcome::apply` → [`MatchRegistry::flush`]) replays the queue, at the stream position it
-/// was pushed; a match that is dropped instead discards it with everything else. No money moves —
-/// the order held no escrow; removing it from `Bid`/`Ask` is the whole effect.
-pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
+/// Registry-backed cancel of a resting maker the walk REMOVES instead of filling: drops the order
+/// from the registry copies and queues its `DeleteOrder` + `OrderCancelled(reason)` as DEFERRED
+/// match events. Two callers, told apart by `reason`:
+/// * `MakerInsolvent` — a `RejectedInsolvent` fill (K9: filling it would open the maker below
+///   maintenance);
+/// * `SelfTradePrevention` — the maker belongs to the taker's own address and the taker's mode
+///   expires the maker. Its WHOLE remainder goes, not only what the taker would have filled.
+///
+/// Nothing is written here — like every other walk effect it lands only when the caller's write
+/// barrier (`MatchOutcome::apply` → [`MatchRegistry::flush`]) replays the queue, at the stream
+/// position it was pushed; a match that is dropped instead discards it with everything else. No
+/// money moves — the order held no escrow; removing it from `Bid`/`Ask` is the whole effect.
+///
+/// ⚠️ Never call `execute_order_cancellation` / `remove_from_book_during_match` from the walk
+/// instead: both WRITE immediately (breaking the zero-write walk), and both decrement the level's
+/// live count a second time on top of the walk's own `level_removed`.
+pub(super) fn cancel_maker_in_match<H: PerpHost>(
     context: &mut H,
     reg: &mut MatchRegistry,
     maker: Address,
@@ -1397,7 +1409,16 @@ pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
     order_id: &[u8; 32],
     maker_order: &mut crate::types::Order,
     market: &crate::types::Market,
+    reason: crate::types::CancelReason,
 ) -> Result<(), PerpError> {
+    debug_assert!(
+        matches!(
+            reason,
+            crate::types::CancelReason::MakerInsolvent
+                | crate::types::CancelReason::SelfTradePrevention
+        ),
+        "the walk cancels a maker only for K9 or STP, not {reason:?}"
+    );
     let i = reg.get_or_load(context, maker, market_id, market)?;
     let w = &mut reg.users[i].1;
     super::release_open_order_margin_core(
@@ -1414,8 +1435,8 @@ pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
         Side::Buy => w.dirty_buy = true,
         Side::Sell => w.dirty_sell = true,
     }
-    // delete-on-terminal: the rejected maker is Cancelled → removed from the map. Its id also leaves
-    // the level: the walk simply does not re-queue it into `new_queue` (the level is rewritten from
+    // delete-on-terminal: the cancelled maker is removed from the map. Its id also leaves the
+    // level: the walk simply does not re-queue it into `new_queue` (the level is rewritten from
     // `new_queue` when the walk closes it), and it counts the departure in `level_removed`, so the
     // level's live count stays accurate.
     maker_order.status = OrderStatus::Cancelled;
@@ -1425,8 +1446,8 @@ pub(super) fn cancel_rejected_maker_registry<H: PerpHost>(
     reg.push_event(MatchEvent::OrderCancelled {
         user: maker,
         order_id: *order_id,
-        // K9 reject: the protocol dropped this maker, its owner did not.
-        reason: crate::types::CancelReason::MakerInsolvent,
+        // The protocol dropped this maker, its owner did not ask.
+        reason,
     });
     Ok(())
 }
@@ -1739,7 +1760,7 @@ pub(super) fn settle_maker_fill_core(
     // READ-ONLY: locate the maker's book entry and price this fill's share of the order's maker
     // fee. Done up front because the fee must be charged BEFORE the K9 check below, while the
     // entry itself may only be reduced once the fill is accepted (a K9 reject leaves the entry in
-    // place for `cancel_rejected_maker_registry` to release).
+    // place for `cancel_maker_in_match` to release).
     // #B: fill_price == the resting maker's order price (a match executes at the maker's level), so
     // it is exactly the sort key `entry_fill_plan` binary-searches on.
     let (entry_idx, entry_new_amount, maker_fee) = entry_fill_plan(

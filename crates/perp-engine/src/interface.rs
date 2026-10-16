@@ -1784,7 +1784,9 @@ sol! {
         // * A resting order killed by the protocol (out-of-band sweep, liquidation, maker-cover) —
         //   that IS a cancel of something that rested, and stays on `OrderCancelled` with its
         //   `reason`.
-        event OrderExpired(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint64 filledQuantity, uint64 expiredQuantity);
+        // `reason` — `ExpiryReason` (perp-core `types::order`): 0 = the time-in-force ran out of
+        //            book, 9 = self-trade prevention stopped the walk at the taker's own order.
+        event OrderExpired(address indexed user, uint64 indexed marketId, bytes32 indexed orderId, uint64 filledQuantity, uint64 expiredQuantity, uint8 reason);
 
         // Feeds: /trades, /historicalTrades, /aggTrades, /klines, /ticker/24hr, /myTrades, and the
         //        `@order` stream's per-fill `o.rp`.

@@ -3912,6 +3912,9 @@ mod value_conservation {
     const N: u64 = 8;
     const SEED_WALLET: i64 = 400_000_000; // $400 each
     const SEED_IF: u64 = 10_000_000_000; // deep enough that bad debt is always covered
+    /// Coverage floor on self-trade-prevention cancels in the randomised pass — about half of the
+    /// 41 the seeded pass reaches.
+    const STP_FLOOR: u32 = 20;
 
     fn user(i: u64) -> Address {
         let mut b = [0u8; 20];
@@ -3947,7 +3950,9 @@ mod value_conservation {
         c + if a >= 0 { v } else { -v }
     }
 
-    fn framed<F: FnOnce(&mut TestCtx) -> Result<Bytes, PerpError>>(ctx: &mut TestCtx, f: F) {
+    /// Returns how many self-trade-prevention cancels (`OrderCancelled`, reason 9) the frame
+    /// committed — read before `commit_tx`, which drains the log buffer.
+    fn framed<F: FnOnce(&mut TestCtx) -> Result<Bytes, PerpError>>(ctx: &mut TestCtx, f: F) -> u32 {
         // EVM-framed exactly like on-chain: a genuine reject reverts the frame and must leave the
         // system value untouched, so rejects are part of what this test covers.
         let cp = ctx.journal_mut().checkpoint();
@@ -3956,7 +3961,24 @@ mod value_conservation {
             Err(PerpError::Reject(_)) => ctx.journal_mut().checkpoint_revert(cp),
             Err(e) => panic!("hard failure: {e:?}"),
         }
+        let stp = JournalTr::take_logs(ctx.journal_mut())
+            .iter()
+            .filter(|l| {
+                l.data.topics().first()
+                    == Some(&crate::interface::IPerpDex::OrderCancelled::SIGNATURE_HASH)
+            })
+            .filter(|l| {
+                crate::interface::IPerpDex::OrderCancelled::decode_raw_log(
+                    l.data.topics(),
+                    &l.data.data,
+                )
+                .unwrap()
+                .reason
+                    == crate::types::CancelReason::SelfTradePrevention as u8
+            })
+            .count() as u32;
         ctx.journal_mut().commit_tx();
+        stp
     }
 
     /// Fills, partial fills, cancels, leverage changes, liquidations and ADL, in a randomised
@@ -4007,6 +4029,7 @@ mod value_conservation {
         // the step that produced it (see the gate below).
         let mut was_negative: Vec<bool> = vec![false; N as usize];
         let mut negative_wallet_steps = 0u32;
+        let mut stp_cancels = 0u32;
 
         for op in 0..1200u32 {
             let i = (rng() % N) as usize;
@@ -4016,7 +4039,7 @@ mod value_conservation {
 
             if roll < 12 {
                 if let Some(id) = resting[i].take() {
-                    framed(&mut ctx, |c| {
+                    stp_cancels += framed(&mut ctx, |c| {
                         crate::trading::run_cancel_order(
                             &crate::interface::IPerpDex::cancelOrderCall {
                                 orderId: id.into(),
@@ -4030,7 +4053,7 @@ mod value_conservation {
                 }
             } else if roll < 20 {
                 let lev = 1 + rng() % 3;
-                framed(&mut ctx, |c| {
+                stp_cancels += framed(&mut ctx, |c| {
                     run_set_leverage(
                         &setLeverageCall {
                             marketId: MARKET_ID,
@@ -4058,7 +4081,7 @@ mod value_conservation {
                     .unwrap()
                     .amount;
                 let mut id = None;
-                framed(&mut ctx, |c| {
+                stp_cancels += framed(&mut ctx, |c| {
                     let r = try_place_order(c, who, side, price, qty);
                     if let Ok(bytes) = &r {
                         id = Some(bytes[..32].try_into().unwrap());
@@ -4090,7 +4113,7 @@ mod value_conservation {
                 let registry_before = storage::load_position_registry(&mut ctx, MARKET_ID)
                     .unwrap()
                     .len();
-                framed(&mut ctx, |c| {
+                stp_cancels += framed(&mut ctx, |c| {
                     run_update_index_price(
                         &updateIndexPriceCall {
                             marketId: MARKET_ID,
@@ -4166,10 +4189,13 @@ mod value_conservation {
         // The scenario has to actually reach the interesting paths, or it proves nothing.
         println!(
             "conservation scenario: {fills} fills, {liquidations} liquidations, \
-             {negative_wallet_steps} wallet-goes-negative steps"
+             {negative_wallet_steps} wallet-goes-negative steps, {stp_cancels} STP cancels"
         );
         assert!(fills > 100, "too few fills: {fills}");
         assert!(liquidations > 0, "no position was ever liquidated");
+        // Every user both rests and crosses, so its takers meet its own orders: self-trade
+        // prevention's cancels run under the same value gate.
+        assert!(stp_cancels >= STP_FLOOR, "too few STP cancels: {stp_cancels}");
         // ADL is deliberately NOT asserted here: it needs an insolvent residual the book could not
         // absorb AND an opposite-side holder with no resting orders at all, which a book-building
         // fuzz almost never produces. It gets its own deterministic leg below (and
@@ -7884,6 +7910,246 @@ mod algo_trigger_rejected {
             .count();
         assert_eq!(cancelled, 0);
         assert_eq!(position(&mut ctx, KEEPER).amount, 0);
+    }
+}
+
+/// Self-trade prevention on a FIRED conditional order (plan T15, and T25's mode variants). The mode
+/// is set at `placeAlgoOrder` and INHERITED by the ordinary order the trigger places, which then
+/// walks the book like any taker — inside the ORACLE transaction. Every tick goes through the
+/// call shell, so a reject that leaked a write would trip its write-then-revert tripwire.
+///
+/// ALICE (a healthy 5x long the stop protects) also rests her own BID, which a fired sell meets.
+/// No liquidation candidate here: the subject is the trigger's own outcome.
+mod algo_stp {
+    use super::*;
+    use crate::interface::IPerpDex::{
+        placeAlgoOrderCall, AlgoOrderCancelled, AlgoOrderTriggered, OrderCancelled, OrderExpired,
+        OrderPlaced, Trade,
+    };
+    use crate::types::{AlgoOrderType, CancelReason, StpMode, TimeInForce};
+
+    const RO: u8 = 1;
+    const OWN_BID: u64 = 9_950;
+    const MAKER_BID: u64 = 9_940;
+
+    fn fixture(own_bid: bool) -> (TestCtx, Option<[u8; 32]>) {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+        let own = own_bid.then(|| {
+            let out = run_place_order(
+                &placeOrderCall {
+                    marketId: MARKET_ID,
+                    side: Side::Buy as u8,
+                    price: OWN_BID,
+                    quantity: 2,
+                    orderType: 0,
+                    tif: 0,
+                    clientOrderId: FixedBytes::default(),
+                    flags: 0,
+                }
+                .abi_encode(),
+                ALICE,
+                &mut ctx,
+            )
+            .unwrap();
+            out[..32].try_into().unwrap()
+        });
+        (ctx, own)
+    }
+
+    /// A reduce-only STOP sell for ALICE (a limit `Stop` at `price`/`tif`, or a `StopMarket` when
+    /// `price == 0`), firing at mark <= 9_900, carrying `mode`.
+    fn arm(ctx: &mut TestCtx, price: u64, tif: TimeInForce, mode: StpMode) -> [u8; 32] {
+        let order_type = if price == 0 { AlgoOrderType::StopMarket } else { AlgoOrderType::Stop };
+        let out = crate::algo::run_place_algo_order(
+            &placeAlgoOrderCall {
+                algoType: 0,
+                marketId: MARKET_ID,
+                side: Side::Sell as u8,
+                orderType: order_type as u8,
+                triggerPrice: 9_900,
+                price,
+                quantity: QTY as u64,
+                tif: tif as u8,
+                workingType: 0,
+                clientAlgoId: FixedBytes::default(),
+                flags: RO | mode.to_flags(),
+            }
+            .abi_encode(),
+            ALICE,
+            ctx,
+        )
+        .unwrap();
+        out[..32].try_into().unwrap()
+    }
+
+    /// The oracle tick, through the shell. It must SUCCEED; returns its logs.
+    fn tick(ctx: &mut TestCtx) -> Vec<primitives::Log> {
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let out = run_perp_dex_call(
+            &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: 9_900, timestamp: 31 }
+                .abi_encode(),
+            30_000_000,
+            ADMIN,
+            U256::ZERO,
+            false,
+            ctx,
+        )
+        .unwrap();
+        assert!(
+            !out.reverted,
+            "the oracle tx must succeed: {:?}",
+            String::from_utf8_lossy(&out.bytes)
+        );
+        JournalTr::take_logs(ctx.journal_mut())
+    }
+
+    /// The order-lifecycle events of the stream, by name, with the cancel / expiry reasons inline.
+    fn lifecycle(logs: &[primitives::Log]) -> Vec<String> {
+        logs.iter()
+            .filter_map(|l| {
+                let t = l.data.topics();
+                let h = *t.first()?;
+                if h == AlgoOrderTriggered::SIGNATURE_HASH {
+                    Some("AlgoOrderTriggered".into())
+                } else if h == AlgoOrderCancelled::SIGNATURE_HASH {
+                    let e = AlgoOrderCancelled::decode_raw_log(t, &l.data.data).unwrap();
+                    Some(format!("AlgoOrderCancelled({})", e.reason))
+                } else if h == OrderPlaced::SIGNATURE_HASH {
+                    Some("OrderPlaced".into())
+                } else if h == OrderCancelled::SIGNATURE_HASH {
+                    let e = OrderCancelled::decode_raw_log(t, &l.data.data).unwrap();
+                    Some(format!("OrderCancelled({})", e.reason))
+                } else if h == OrderExpired::SIGNATURE_HASH {
+                    let e = OrderExpired::decode_raw_log(t, &l.data.data).unwrap();
+                    Some(format!(
+                        "OrderExpired({},{},{})",
+                        e.filledQuantity, e.expiredQuantity, e.reason
+                    ))
+                } else if h == Trade::SIGNATURE_HASH {
+                    Some("Trade".into())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn live(ctx: &mut TestCtx, id: [u8; 32]) -> bool {
+        storage::load_order(ctx, &id).unwrap().is_some()
+    }
+
+    /// T15 — a fired reduce-only stop-MARKET inherits its mode. ALICE's own bid sits at the top of
+    /// the book, a third party's behind it.
+    /// * EXPIRE_TAKER: the walk stops at her bid — the close expires with reason 9, her bid stays,
+    ///   MAKER is untouched, the position is still open.
+    /// * EXPIRE_MAKER (the default): her bid is cancelled (reason 9) and the close fills MAKER.
+    /// * EXPIRE_BOTH: her bid is cancelled AND the close expires.
+    #[test]
+    fn t15_a_fired_conditional_inherits_its_stp_mode() {
+        let stp = CancelReason::SelfTradePrevention as u8;
+        for mode in [StpMode::ExpireTaker, StpMode::ExpireMaker, StpMode::ExpireBoth] {
+            let (mut ctx, own) = fixture(true);
+            let own = own.unwrap();
+            place_order(&mut ctx, MAKER, Side::Buy as u8, MAKER_BID, QTY as u64);
+            // A `*_MARKET` conditional sends tif 0 (unused).
+            arm(&mut ctx, 0, TimeInForce::Gtc, mode);
+            let logs = tick(&mut ctx);
+            let q = QTY as u64;
+            let (want, own_live, amount) = match mode {
+                StpMode::ExpireTaker => (
+                    vec![
+                        "AlgoOrderTriggered".into(),
+                        "OrderPlaced".into(),
+                        format!("OrderExpired(0,{q},{stp})"),
+                    ],
+                    true,
+                    QTY,
+                ),
+                StpMode::ExpireMaker => (
+                    vec![
+                        "AlgoOrderTriggered".into(),
+                        "OrderPlaced".into(),
+                        format!("OrderCancelled({stp})"),
+                        "Trade".into(),
+                    ],
+                    false,
+                    0,
+                ),
+                StpMode::ExpireBoth => (
+                    vec![
+                        "AlgoOrderTriggered".into(),
+                        "OrderPlaced".into(),
+                        format!("OrderCancelled({stp})"),
+                        format!("OrderExpired(0,{q},{stp})"),
+                    ],
+                    false,
+                    QTY,
+                ),
+            };
+            assert_eq!(lifecycle(&logs), want, "{mode:?}");
+            assert_eq!(live(&mut ctx, own), own_live, "{mode:?}");
+            assert_eq!(position(&mut ctx, ALICE).amount, amount, "{mode:?}");
+        }
+    }
+
+    /// T25's mode variants — a fired DEEP-limit GTC (8_000, below the band's 8_910 floor at the
+    /// 9_900 mark), so if it rests it is refused as a too-good best.
+    ///
+    /// Without an own order on the path the mode is moot: every mode rests → refused →
+    /// `AlgoOrderCancelled(10)`. With ALICE's own bid on the path the mode decides:
+    /// * EXPIRE_MAKER cancels the bid and walks on, then RESTS → refused. The whole placement is
+    ///   discarded write-clean, the STP cancel with it: her bid is still there and no
+    ///   `OrderCancelled` was ever emitted.
+    /// * EXPIRE_TAKER / EXPIRE_BOTH stop at the bid and EXPIRE the remainder (reason 9) — the
+    ///   placement is accepted, nothing rests, so nothing is refused and the trigger is spent
+    ///   normally.
+    #[test]
+    fn t25_a_fired_deep_gtc_under_each_mode_with_and_without_an_own_order() {
+        let stp = CancelReason::SelfTradePrevention as u8;
+        let rejected = CancelReason::TriggerRejected as u8;
+        let q = QTY as u64;
+        for own_bid in [false, true] {
+            for mode in [StpMode::ExpireMaker, StpMode::ExpireTaker, StpMode::ExpireBoth] {
+                let (mut ctx, own) = fixture(own_bid);
+                let id = arm(&mut ctx, 8_000, TimeInForce::Gtc, mode);
+                let logs = tick(&mut ctx);
+                let case = format!("own bid {own_bid}, {mode:?}");
+                let refused = vec![
+                    "AlgoOrderTriggered".to_string(),
+                    format!("AlgoOrderCancelled({rejected})"),
+                ];
+                let want = match (own_bid, mode) {
+                    (false, _) | (true, StpMode::ExpireMaker) => refused,
+                    (true, StpMode::ExpireTaker) => vec![
+                        "AlgoOrderTriggered".into(),
+                        "OrderPlaced".into(),
+                        format!("OrderExpired(0,{q},{stp})"),
+                    ],
+                    (true, StpMode::ExpireBoth) => vec![
+                        "AlgoOrderTriggered".into(),
+                        "OrderPlaced".into(),
+                        format!("OrderCancelled({stp})"),
+                        format!("OrderExpired(0,{q},{stp})"),
+                    ],
+                };
+                assert_eq!(lifecycle(&logs), want, "{case}");
+                // The trigger is spent either way, and nothing ever rests.
+                assert!(!live(&mut ctx, id), "{case}");
+                assert!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID)
+                    .unwrap()
+                    .is_empty());
+                assert!(
+                    storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap().is_empty(),
+                    "{case}"
+                );
+                assert_eq!(position(&mut ctx, ALICE).amount, QTY, "{case}");
+                if let Some(own) = own {
+                    assert_eq!(live(&mut ctx, own), mode != StpMode::ExpireBoth, "{case}");
+                }
+            }
+        }
     }
 }
 

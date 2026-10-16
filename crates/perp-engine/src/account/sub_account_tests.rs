@@ -861,3 +861,63 @@ mod mutation_killers {
         }
     }
 }
+
+/// Self-trade prevention is keyed on the ADDRESS, not the family (plan T20). A sub-account is a
+/// different address from its master, so a master's resting order is FILLED by the sub's GTC
+/// (and vice versa) under the default `EXPIRE_MAKER` — never cancelled — on both sides.
+#[test]
+fn a_master_and_its_sub_trade_with_each_other_under_stp() {
+    use crate::interface::IPerpDex::{OrderCancelled, Trade};
+    let order = |side: u8| {
+        placeOrderCall {
+            marketId: MARKET_ID,
+            side,
+            price: PRICE,
+            quantity: QTY,
+            orderType: 0,
+            tif: 0,
+            clientOrderId: FixedBytes::default(),
+            flags: 0,
+        }
+        .abi_encode()
+    };
+    for maker_side in [0u8, 1] {
+        for master_rests in [true, false] {
+            let mut ctx = make_ctx();
+            let sub = create(&mut ctx, MASTER, "desk");
+            seed(&mut ctx, MASTER, 0, 10 * USDC);
+            ok(&mut ctx, MASTER, &transfer(sub, WALLET_PERP, WALLET_PERP, 5 * USDC));
+            let (maker_in, taker_in) = (order(maker_side), order(1 - maker_side));
+            let (maker, taker) = if master_rests {
+                ok(&mut ctx, MASTER, &maker_in);
+                (MASTER, sub)
+            } else {
+                ok(&mut ctx, MASTER, &as_sub(sub, maker_in));
+                (sub, MASTER)
+            };
+            let _ = JournalTr::take_logs(ctx.journal_mut());
+            if master_rests {
+                ok(&mut ctx, MASTER, &as_sub(sub, taker_in));
+            } else {
+                ok(&mut ctx, MASTER, &taker_in);
+            }
+            let logs = JournalTr::take_logs(ctx.journal_mut());
+            let trades: Vec<(Address, Address)> = logs
+                .iter()
+                .filter(|l| l.data.topics().first() == Some(&Trade::SIGNATURE_HASH))
+                .map(|l| {
+                    let t = Trade::decode_raw_log(l.data.topics(), &l.data.data).unwrap();
+                    (t.maker, t.taker)
+                })
+                .collect();
+            let case = format!("maker side {maker_side}, master rests {master_rests}");
+            assert_eq!(trades, vec![(maker, taker)], "{case}: a fill, not a prevention");
+            assert!(
+                !logs
+                    .iter()
+                    .any(|l| l.data.topics().first() == Some(&OrderCancelled::SIGNATURE_HASH)),
+                "{case}: nothing cancelled"
+            );
+        }
+    }
+}

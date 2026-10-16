@@ -37,8 +37,8 @@ use crate::{
     risk::record_mid_price_sample_for_best_quote_change,
     storage,
     types::{
-        ApiKey, CancelReason, Order, OrderEntry, OrderKind, OrderStatus, OrderType, Side, StpMode,
-        TimeInForce,
+        ApiKey, CancelReason, ExpiryReason, Order, OrderEntry, OrderKind, OrderStatus, OrderType,
+        Side, StpMode, TimeInForce,
     },
     PERP_DEX_ADDRESS,
     PerpError,
@@ -1292,8 +1292,8 @@ pub(crate) fn place_order_core<H: PerpHost>(
 
     // The ONE dispatch on what the order is. `OrderKind` makes it total: there is no third case to
     // forget, and the limit arm gets its TIF by destructuring (not by re-reading a field that a
-    // market order also has).
-    match validated.kind {
+    // market order also has). `Some(reason)` = the remainder expired (and why).
+    let expiry = match validated.kind {
         OrderKind::Limit(tif) => execute_limit_order(
             context,
             account,
@@ -1320,7 +1320,7 @@ pub(crate) fn place_order_core<H: PerpHost>(
             &mut taker_order,
             &mut pending,
         )?,
-    }
+    };
     #[cfg(debug_assertions)]
     if validated.reduce_only {
         let after = storage::load_position_ref(context, account, market_id)?
@@ -1336,15 +1336,16 @@ pub(crate) fn place_order_core<H: PerpHost>(
     // other apply site — an IOC/market order that expired against an empty book matches nothing and
     // rests nothing, yet legitimately emits OrderPlaced. No-op when an apply already flushed it.
     emit_pending_order_placed(context, &mut pending);
-    // ── THE TIF EXPIRY'S TERMINAL EVENT ──────────────────────────────────────────────────────────
+    // ── THE EXPIRY'S TERMINAL EVENT ──────────────────────────────────────────────────────────────
     // `OrderStatus::Expired` is set in exactly one place (`cancel_unfilled_remainder`, and only when
-    // `remaining > 0`), so testing the FINAL STATUS here is the same predicate as "an IOC or market
-    // order discarded a remainder" — without re-deriving which TIFs rest, which is precisely the
-    // reasoning this event exists to stop a CONSUMER from having to do. FOK reverts instead
-    // (`ensure_fok_filled`), a refused GTC rest reverts (`raise_rest_refusal`), and a full fill has
-    // no remainder, so none of them land here.
+    // `remaining > 0`), which also hands back the reason — so `expiry` here is the same predicate
+    // as "this order discarded a remainder" (an IOC or market order, or any STP-applicable order
+    // whose walk self-trade prevention stopped) without re-deriving which TIFs rest, which is
+    // precisely the reasoning this event exists to stop a CONSUMER from having to do. FOK reverts
+    // instead (`ensure_fok_filled`), a refused GTC rest reverts (`raise_rest_refusal`), and a full
+    // fill has no remainder, so none of them land here.
     //
-    // ⚠️ THIS SITE, NOT THE TWO `cancel_unfilled_remainder` CALL SITES. Both of those sit before the
+    // ⚠️ THIS SITE, NOT THE `cancel_unfilled_remainder` CALL SITES. All of those sit before the
     // `emit_pending_order_placed` fallback above, and an IOC that matches NOTHING reaches no other
     // apply site — so emitting there would put the terminal event BEFORE this order's own
     // `OrderPlaced`. Here it is after `OrderPlaced` and after every `Trade` the match flushed, which
@@ -1353,7 +1354,12 @@ pub(crate) fn place_order_core<H: PerpHost>(
     //
     // It is emitted BEFORE the persist below only because the persist is a delete; nothing here
     // reads the store.
-    if taker_order.status == OrderStatus::Expired {
+    debug_assert_eq!(
+        expiry.is_some(),
+        taker_order.status == OrderStatus::Expired,
+        "an expiry reason is returned exactly when the remainder expired"
+    );
+    if let Some(reason) = expiry {
         // Derived from the two quantities the order itself carries, so `filled + expired == quantity`
         // holds by construction rather than by a second count of the `Trade` logs.
         let expired_quantity = taker_order.quantity.saturating_sub(taker_order.filled);
@@ -1370,6 +1376,7 @@ pub(crate) fn place_order_core<H: PerpHost>(
                 orderId: FixedBytes(order_id),
                 filledQuantity: taker_order.filled,
                 expiredQuantity: expired_quantity,
+                reason: reason as u8,
             }
             .to_log_data(),
         });
@@ -1556,11 +1563,40 @@ fn announce_new_order(
     (order, pending)
 }
 
-/// Binance-style TIF expiry (IOC/market not fully filled) → Expired, not Cancelled (which is
-/// reserved for user-initiated cancels). In-memory only; the caller performs the final persist.
-fn cancel_unfilled_remainder(taker_order: &mut Order, remaining: u64) {
+/// Binance-style expiry of a taker remainder that will never rest → Expired, not Cancelled (which
+/// is reserved for orders that rested). In-memory only; the caller performs the final persist.
+///
+/// Two causes, told apart by `reason` and published as `OrderExpired.reason`:
+/// * [`ExpiryReason::Tif`]: an IOC or market remainder the walk did not fill (liquidity, the limit
+///   price or the fill-time band stopped it);
+/// * [`ExpiryReason::SelfTradePrevention`]: the walk was stopped at the taker's own resting order
+///   (`EXPIRE_TAKER` / `EXPIRE_BOTH`), for ANY kind STP applies to, GTC included.
+///
+/// Returns the reason exactly when it expired something (`remaining > 0`) — the value
+/// `place_order_core` keys its one `OrderExpired` emission on.
+fn cancel_unfilled_remainder(
+    taker_order: &mut Order,
+    remaining: u64,
+    reason: ExpiryReason,
+) -> Option<ExpiryReason> {
     if remaining > 0 {
         taker_order.status = OrderStatus::Expired;
+        Some(reason)
+    } else {
+        None
+    }
+}
+
+/// The expiry reason for an IOC or market remainder: STP if the walk was stopped at the taker's own
+/// order, the TIF otherwise. An `EXPIRE_MAKER` walk that cancelled its owner's orders and then ran
+/// out of book is a plain TIF expiry (`0`) — STP did not stop it (Binance: a market order that
+/// empties the book after an STP cancel is `EXPIRED`, not `EXPIRED_IN_MATCH`).
+#[inline]
+fn immediate_expiry_reason(stp_taker_expired: bool) -> ExpiryReason {
+    if stp_taker_expired {
+        ExpiryReason::SelfTradePrevention
+    } else {
+        ExpiryReason::Tif
     }
 }
 
@@ -1817,6 +1853,9 @@ fn reject_provably_unaffordable_limit_order<H: PerpHost>(
 }
 
 /// The four TIFs of a LIMIT order — the only order type that has one.
+///
+/// Returns the expiry reason when the order's remainder EXPIRED (`OrderStatus::Expired`), `None`
+/// when it filled completely or rested — see [`cancel_unfilled_remainder`].
 fn execute_limit_order<H: PerpHost>(
     context: &mut H,
     account: Address,
@@ -1830,7 +1869,7 @@ fn execute_limit_order<H: PerpHost>(
     market: &crate::types::Market,
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
-) -> Result<(), PerpError> {
+) -> Result<Option<ExpiryReason>, PerpError> {
     // BEFORE the walk, and before `check_fok_feasibility`'s walk too — that is the entire point.
     // Applies to all four TIFs: PostOnly does not walk, but the filter is sound for it as well and
     // raises the identical reject its own gate would, so scoping it would only add a case to reason
@@ -1860,6 +1899,7 @@ fn execute_limit_order<H: PerpHost>(
                 None,
                 pending_placed,
             )?)
+            .map(|()| None)
         }
         TimeInForce::Gtc => {
             // ── ATOMIC MATCH + REST ──────────────────────────────────────────────────────────
@@ -1883,7 +1923,24 @@ fn execute_limit_order<H: PerpHost>(
             )?;
             if outcome.remaining == 0 {
                 // Fully filled: no rest phase, so the barrier is right here.
-                return outcome.apply(context, side, market, pending_placed);
+                outcome.apply(context, side, market, pending_placed)?;
+                return Ok(None);
+            }
+            // ── STP stopped the walk: the remainder EXPIRES, it never rests ─────────────────
+            //
+            // `EXPIRE_TAKER` / `EXPIRE_BOTH` met the taker's own resting order. Resting the rest
+            // here would put this order on the book BEHIND an order of its own owner that it
+            // crosses — exactly the self-cross STP exists to refuse — so like Binance
+            // (`EXPIRED_IN_MATCH`) the remainder is discarded and the fills before the stop stand.
+            // No rest phase, so the barrier is immediate, as on the IOC arm.
+            if outcome.stp_taker_expired {
+                let expiry = cancel_unfilled_remainder(
+                    taker_order,
+                    outcome.remaining,
+                    ExpiryReason::SelfTradePrevention,
+                );
+                outcome.apply(context, side, market, pending_placed)?;
+                return Ok(expiry);
             }
             let remaining = outcome.remaining;
             raise_rest_refusal(rest_in_book(
@@ -1904,6 +1961,7 @@ fn execute_limit_order<H: PerpHost>(
                 Some(outcome),
                 pending_placed,
             )?)
+            .map(|()| None)
         }
         TimeInForce::Ioc => {
             let outcome = match_order(
@@ -1920,8 +1978,13 @@ fn execute_limit_order<H: PerpHost>(
                 taker_order,
             )?;
             // No rest phase → nothing can refuse after the match, so the barrier is immediate.
-            cancel_unfilled_remainder(taker_order, outcome.remaining);
-            outcome.apply(context, side, market, pending_placed)
+            let expiry = cancel_unfilled_remainder(
+                taker_order,
+                outcome.remaining,
+                immediate_expiry_reason(outcome.stp_taker_expired),
+            );
+            outcome.apply(context, side, market, pending_placed)?;
+            Ok(expiry)
         }
         TimeInForce::Fok => {
             check_fok_feasibility(context, market_id, side, price, quantity, market)?;
@@ -1942,7 +2005,10 @@ fn execute_limit_order<H: PerpHost>(
             // pre-write, so this is a belt-and-braces restatement — and a restatement of a REJECT
             // belongs on the write-clean side of the barrier, not behind it.
             ensure_fok_filled(outcome.remaining)?;
-            outcome.apply(context, side, market, pending_placed)
+            // STP never applies to a FOK taker (`OrderKind::stp_applies`), so nothing stopped it.
+            debug_assert!(!outcome.stp_taker_expired, "STP stopped a FOK walk");
+            outcome.apply(context, side, market, pending_placed)?;
+            Ok(None)
         }
     }
 }
@@ -1982,7 +2048,7 @@ fn execute_market_order<H: PerpHost>(
     market: &crate::types::Market,
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
-) -> Result<(), PerpError> {
+) -> Result<Option<ExpiryReason>, PerpError> {
     let outcome = match_order(
         context,
         account,
@@ -1998,8 +2064,13 @@ fn execute_market_order<H: PerpHost>(
     )?;
     // A market order has NO rest phase, so nothing can refuse after the match: the barrier is
     // immediate and this path is byte-identical to the pre-hoist code.
-    cancel_unfilled_remainder(taker_order, outcome.remaining);
-    outcome.apply(context, side, market, pending_placed)
+    let expiry = cancel_unfilled_remainder(
+        taker_order,
+        outcome.remaining,
+        immediate_expiry_reason(outcome.stp_taker_expired),
+    );
+    outcome.apply(context, side, market, pending_placed)?;
+    Ok(expiry)
 }
 
 fn cancel_order_core<H: PerpHost>(
@@ -2129,6 +2200,26 @@ pub(super) fn match_order<H: PerpHost>(
     let (mark_upper, mark_lower) =
         crate::math::mark_band_bounds(mark, market.price_band_bps);
 
+    // ── Self-trade prevention: decided ONCE, from the TAKER alone ───────────────────────────────
+    //
+    // `Some(mode)` when STP governs this walk: a GTC, IOC or market taker
+    // (`OrderKind::stp_applies`) that is not a liquidation close. `None` for a FOK taker (it trades
+    // with its owner's own liquidity, as before — Binance: "STP won't take effect"), for PostOnly
+    // (never reaches a walk: it rejects on any cross), and for a liquidation close (the liquidated
+    // user's orders in this market are all cancelled before it runs, so it cannot meet one). A
+    // fired conditional order carries the mode it was placed with.
+    //
+    // The check runs per resting ORDER, in FIFO, on the same ADDRESS only (a sub-account is a
+    // different address and trades with its master as usual), and only the TAKER's mode is read.
+    let stp = (!liquidation_close && kind.stp_applies()).then_some(taker_order.stp);
+    // Own resting orders this walk cancelled. NOT capped per order: every one is an open order of
+    // the taker's own on the opposite side of this market, so the per-market open-order cap bounds
+    // it (`MAX_OPEN_ORDERS_PER_MARKET`), and each was paid for when it was placed.
+    let mut stp_cancels = 0usize;
+    // The walk was STOPPED at the taker's own order (`EXPIRE_TAKER` / `EXPIRE_BOTH`): whatever is
+    // left expires with reason 9 and never rests.
+    let mut stp_taker_expired = false;
+
     match side {
         Side::Buy => {
             // Match against asks (sorted ASC: lowest ask first).
@@ -2157,7 +2248,8 @@ pub(super) fn match_order<H: PerpHost>(
                 let count_old = blob.count;
                 let queue = &blob.ids;
                 let mut new_queue: Vec<[u8; 32]> = Vec::new();
-                // Live makers that LEAVE this level during the walk (fully filled / K9-rejected).
+                // Live makers that LEAVE this level during the walk (fully filled / K9-rejected /
+                // cancelled by self-trade prevention).
                 // The post-walk live count is `count_old - level_removed`; stale ids the walk sweeps
                 // (already gone from the book) are NOT counted here — they were decremented when
                 // they left. See `finalize_level_count` below.
@@ -2201,6 +2293,68 @@ pub(super) fn match_order<H: PerpHost>(
                     let fill_qty = remaining.min(available);
 
                     let maker_addr = Address::from(maker_order.owner);
+                    // ── STP: same ADDRESS only; the TAKER's mode governs; per resting ORDER ─────
+                    //
+                    // BEFORE the liquidation cap and the maker settle, so an own maker never
+                    // reaches `settle_maker_fill_registry` (and with it the K9 guard or a fill).
+                    // Nothing here writes: the cancel lands in the registry copies and the deferred
+                    // event queue like a K9 cancel, so dropping the outcome undoes it.
+                    if let Some(mode) = stp {
+                        if maker_addr == taker_addr {
+                            if mode.expires_maker() {
+                                // The maker's WHOLE remainder is cancelled (Binance), not only
+                                // what this taker would have filled; the taker's `remaining` is
+                                // untouched.
+                                settlement::cancel_maker_in_match(
+                                    context,
+                                    &mut registry,
+                                    maker_addr,
+                                    market_id,
+                                    Side::Sell,
+                                    &maker_id,
+                                    &mut maker_order,
+                                    market,
+                                    CancelReason::SelfTradePrevention,
+                                )?;
+                                stp_cancels += 1;
+                                debug_assert!(
+                                    stp_cancels <= crate::algo::MAX_OPEN_ORDERS_PER_MARKET,
+                                    "STP cancelled more own orders than the open-order cap admits"
+                                );
+                                // A live maker left the level, exactly as on the K9 path.
+                                level_removed += 1;
+                                if !mode.expires_taker() {
+                                    // EXPIRE_MAKER: keep walking, deeper if need be.
+                                    continue;
+                                }
+                            } else {
+                                // EXPIRE_TAKER: the own maker stays, in its FIFO slot.
+                                new_queue.push(maker_id);
+                            }
+                            // EXPIRE_TAKER / EXPIRE_BOTH: stop the walk here. The untouched tail
+                            // stays verbatim, and the level is closed like any other.
+                            new_queue.extend(queue[qi..].iter().copied());
+                            let count_new = count_old.saturating_sub(level_removed);
+                            debug_assert!(
+                                mode.expires_maker() || count_new > 0,
+                                "an own maker left live must keep its level alive"
+                            );
+                            close_level(
+                                &mut registry,
+                                false,
+                                ask_price,
+                                new_queue,
+                                count_new,
+                                &mut removed_asks,
+                                &mut ask_levels_cleared,
+                            );
+                            stp_taker_expired = true;
+                            // ⚠️ `break 'outer`, not a flag checked at the top of the `while`: when
+                            // the own maker is the level's LAST id the `while` would end normally
+                            // and the `for` would go on to fill the next level.
+                            break 'outer;
+                        }
+                    }
                     if liquidation_close
                         && !registry.can_touch_user(maker_addr, MAX_LIQUIDATION_MAKER_ACCOUNTS)
                     {
@@ -2234,7 +2388,7 @@ pub(super) fn match_order<H: PerpHost>(
                                 closed_quantity,
                             } => (maker_fee, pos_snapshot, realized_pnl, closed_quantity),
                             MakerFillOutcome::RejectedInsolvent => {
-                                settlement::cancel_rejected_maker_registry(
+                                settlement::cancel_maker_in_match(
                                     context,
                                     &mut registry,
                                     maker_addr,
@@ -2243,6 +2397,7 @@ pub(super) fn match_order<H: PerpHost>(
                                     &maker_id,
                                     &mut maker_order,
                                     market,
+                                    CancelReason::MakerInsolvent,
                                 )?;
                                 // A live maker left the level (cancelled): count it. Dropped from the
                                 // queue (not re-queued); if it was the last live order the count hits 0
@@ -2251,6 +2406,12 @@ pub(super) fn match_order<H: PerpHost>(
                                 continue;
                             }
                         };
+                    // STP watchdog: a governed walk never FILLS against its own owner — the check
+                    // above `continue`s or stops on every own maker before it can get here.
+                    debug_assert!(
+                        stp.is_none() || maker_addr != taker_addr,
+                        "self-trade prevention let a taker fill its own resting order"
+                    );
                     taker_settlement.record_fill(ask_price, fill_qty, Side::Buy, market)?;
                     let fill_notional = calc_value(
                         ask_price,
@@ -2424,6 +2585,52 @@ pub(super) fn match_order<H: PerpHost>(
                     let fill_qty = remaining.min(available);
 
                     let maker_addr = Address::from(maker_order.owner);
+                    // STP — see the Buy mirror.
+                    if let Some(mode) = stp {
+                        if maker_addr == taker_addr {
+                            if mode.expires_maker() {
+                                settlement::cancel_maker_in_match(
+                                    context,
+                                    &mut registry,
+                                    maker_addr,
+                                    market_id,
+                                    Side::Buy,
+                                    &maker_id,
+                                    &mut maker_order,
+                                    market,
+                                    CancelReason::SelfTradePrevention,
+                                )?;
+                                stp_cancels += 1;
+                                debug_assert!(
+                                    stp_cancels <= crate::algo::MAX_OPEN_ORDERS_PER_MARKET,
+                                    "STP cancelled more own orders than the open-order cap admits"
+                                );
+                                level_removed += 1;
+                                if !mode.expires_taker() {
+                                    continue;
+                                }
+                            } else {
+                                new_queue.push(maker_id);
+                            }
+                            new_queue.extend(queue[qi..].iter().copied());
+                            let count_new = count_old.saturating_sub(level_removed);
+                            debug_assert!(
+                                mode.expires_maker() || count_new > 0,
+                                "an own maker left live must keep its level alive"
+                            );
+                            close_level(
+                                &mut registry,
+                                true,
+                                bid_price,
+                                new_queue,
+                                count_new,
+                                &mut removed_bids,
+                                &mut bid_levels_cleared,
+                            );
+                            stp_taker_expired = true;
+                            break 'outer;
+                        }
+                    }
                     if liquidation_close
                         && !registry.can_touch_user(maker_addr, MAX_LIQUIDATION_MAKER_ACCOUNTS)
                     {
@@ -2453,7 +2660,7 @@ pub(super) fn match_order<H: PerpHost>(
                                 closed_quantity,
                             } => (maker_fee, pos_snapshot, realized_pnl, closed_quantity),
                             MakerFillOutcome::RejectedInsolvent => {
-                                settlement::cancel_rejected_maker_registry(
+                                settlement::cancel_maker_in_match(
                                     context,
                                     &mut registry,
                                     maker_addr,
@@ -2462,12 +2669,17 @@ pub(super) fn match_order<H: PerpHost>(
                                     &maker_id,
                                     &mut maker_order,
                                     market,
+                                    CancelReason::MakerInsolvent,
                                 )?;
                                 // A live maker left the level (see the Buy mirror): count it.
                                 level_removed += 1;
                                 continue;
                             }
                         };
+                    debug_assert!(
+                        stp.is_none() || maker_addr != taker_addr,
+                        "self-trade prevention let a taker fill its own resting order"
+                    );
                     taker_settlement.record_fill(bid_price, fill_qty, Side::Sell, market)?;
                     let fill_notional = calc_value(
                         bid_price,
@@ -2588,14 +2800,16 @@ pub(super) fn match_order<H: PerpHost>(
     // is not a cosmetic refactor.
     let rest_basis = match &taker_plan {
         Some(plan) => Some(plan.rest_basis()),
-        // Zero fills. The taker may still have a working copy (a self-match maker the K9 guard
-        // cancelled); `None` means it never joined, so storage is already its post-flush state.
+        // Zero fills. The taker may still have a working copy (a self-match maker that the K9 guard
+        // or self-trade prevention cancelled); `None` means it never joined, so storage is already
+        // its post-flush state.
         None => {
             registry.taker_rest_basis(taker_addr, market.base_decimals, market.price_decimals)?
         }
     };
     Ok(MatchOutcome {
         remaining,
+        stp_taker_expired,
         registry,
         taker_plan,
         last_trade_price,
@@ -2643,6 +2857,11 @@ pub(super) fn match_order<H: PerpHost>(
 pub(super) struct MatchOutcome {
     /// Unfilled quantity after matching.
     pub(super) remaining: u64,
+    /// Self-trade prevention STOPPED the walk at the taker's own resting order (`EXPIRE_TAKER` /
+    /// `EXPIRE_BOTH`). Implies `remaining > 0` (a walk only meets a maker while it has quantity
+    /// left), and tells the caller the remainder EXPIRES with reason 9 — for a GTC too, which then
+    /// never rests.
+    pub(super) stp_taker_expired: bool,
 
     registry: settlement::MatchRegistry,
     taker_plan: Option<settlement::TakerPlan>,

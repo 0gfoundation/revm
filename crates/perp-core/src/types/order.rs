@@ -418,7 +418,7 @@ pub enum CancelReason {
     /// took are affordable (`release_orders_until_margin_covered`).
     TakerMarginCover = 1,
     /// A maker fill was rejected as opening-into-insolvency (K9), so the maker order it came from is
-    /// dropped (`cancel_rejected_maker_registry`).
+    /// dropped (`cancel_maker_in_match`).
     MakerInsolvent = 2,
     /// The owner was liquidated: liquidation cancels every order they hold in that market
     /// (`cancel_all_orders_for_market`).

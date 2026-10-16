@@ -338,6 +338,20 @@ mod group_guard {
 // `checkpoint_revert` truncates a SUFFIX of the log vector. A surviving `OrderCancelled` keeps every
 // log emitted before it, so its `OrderRested` survives too; a reverted range can only leave this
 // guard holding ids for logs that no longer exist, which makes it more permissive, never wrong.
+//
+// ## Two more legs, both about the order lifecycle around an expiry and a self-trade
+//
+// * **`OrderExpired` names an order BORN in this call that did NOT rest.** The mirror image of the
+//   cancel rule: an expiry is the terminal event of a remainder that never reached the book (an IOC
+//   or market remainder, or one self-trade prevention stopped — a GTC included), so it is emitted
+//   by the call that placed the order, after that order's own `OrderPlaced`, and never for an order
+//   that rested. An `OrderExpired` for a rested order would leave a projector's open-order entry
+//   behind forever (it removes on `OrderCancelled`); one for an order not placed here is an expiry
+//   reported for an order that is not this call's taker.
+// * **An `OrderCancelled(reason = 9)` (self-trade prevention) names the user of the most recent
+//   `OrderPlaced`.** STP only ever cancels a resting order of the TAKER's own address, and the
+//   taker's `OrderPlaced` is flushed at the head of its match, before any event the match queued.
+//   A reason-9 cancel of anybody else is a cancel attributed to the wrong cause.
 #[cfg(debug_assertions)]
 mod rested_guard {
     use alloy_sol_types::SolEvent;
@@ -355,6 +369,8 @@ mod rested_guard {
     struct Seen {
         born: std::collections::BTreeSet<B256>,
         rested: std::collections::BTreeSet<B256>,
+        /// The `user` topic of the most recent `OrderPlaced` — the taker an STP cancel belongs to.
+        last_placed_user: Option<B256>,
     }
 
     pub(super) fn reset() {
@@ -362,6 +378,7 @@ mod rested_guard {
             let mut s = s.borrow_mut();
             s.born.clear();
             s.rested.clear();
+            s.last_placed_user = None;
         });
     }
 
@@ -374,9 +391,9 @@ mod rested_guard {
             return;
         };
 
-        // ⚠️ THE ORDER-ID TOPIC INDEX IS NOT THE SAME ON ALL THREE EVENTS.
-        //   OrderPlaced / OrderRested: (user, marketId, orderId) -> topic[3]
-        //   OrderCancelled:            (user, orderId, marketId) -> topic[2]
+        // ⚠️ THE ORDER-ID TOPIC INDEX IS NOT THE SAME ON ALL FOUR EVENTS.
+        //   OrderPlaced / OrderRested / OrderExpired: (user, marketId, orderId) -> topic[3]
+        //   OrderCancelled:                           (user, orderId, marketId) -> topic[2]
         // Reading the wrong slot would compare an order id against a market id and this guard would
         // fire on everything, so the index is taken from each event's own declaration.
         let topic = |i: usize| -> B256 {
@@ -386,13 +403,50 @@ mod rested_guard {
         };
 
         if topic0 == IPerpDex::OrderPlaced::SIGNATURE_HASH {
+            let (id, user) = (topic(3), topic(1));
+            SEEN.with(|s| {
+                let mut s = s.borrow_mut();
+                s.born.insert(id);
+                // A placement starts a NEW lifecycle for this id, so an earlier rest of the same id
+                // no longer counts. On a chain an id is never placed twice; it does recur in a test
+                // that builds several fresh contexts on one thread without a call boundary in
+                // between (the same user's first nonce in each), and the expiry leg below must not
+                // read the previous context's rest as this order's.
+                s.rested.remove(&id);
+                s.last_placed_user = Some(user);
+            });
+        } else if topic0 == IPerpDex::OrderExpired::SIGNATURE_HASH {
             let id = topic(3);
-            SEEN.with(|s| s.borrow_mut().born.insert(id));
+            let (born, rested) = SEEN.with(|s| {
+                let s = s.borrow();
+                (s.born.contains(&id), s.rested.contains(&id))
+            });
+            assert!(
+                born && !rested,
+                "OrderExpired lifecycle invariant: order {id} expired but was {} in this call. An \
+                 expiry is the terminal event of a taker remainder that NEVER reached the book, \
+                 emitted by the call that placed it — a rested order leaves by OrderCancelled.",
+                if born { "RESTED" } else { "not PLACED" }
+            );
         } else if topic0 == IPerpDex::OrderRested::SIGNATURE_HASH {
             let id = topic(3);
             SEEN.with(|s| s.borrow_mut().rested.insert(id));
         } else if topic0 == IPerpDex::OrderCancelled::SIGNATURE_HASH {
             let id = topic(2);
+            let reason = IPerpDex::OrderCancelled::decode_raw_log(topics, &log.data.data)
+                .expect("OrderCancelled decodes")
+                .reason;
+            if reason == crate::types::CancelReason::SelfTradePrevention as u8 {
+                let last = SEEN.with(|s| s.borrow().last_placed_user);
+                assert_eq!(
+                    last,
+                    Some(topic(1)),
+                    "STP cancel attribution: OrderCancelled(reason 9) for order {id} names user \
+                     {} but the most recent OrderPlaced (the taker) is {last:?}. Self-trade \
+                     prevention only ever cancels a resting order of the TAKER's own address.",
+                    topic(1)
+                );
+            }
             let violated = SEEN.with(|s| {
                 let s = s.borrow();
                 s.born.contains(&id) && !s.rested.contains(&id)
@@ -716,9 +770,12 @@ mod rested_invariant_self_tests {
     use crate::{interface::IPerpDex, PERP_DEX_ADDRESS};
 
     const X: Address = address!("1111111111111111111111111111111111111111");
+    const Y: Address = address!("2222222222222222222222222222222222222222");
     /// Deliberately NOT 1, so a guard reading `OrderCancelled`'s order id out of the wrong topic
     /// slot would pick up this market id instead and the reject cases below would stop failing.
     const MARKET: u64 = 7;
+    /// `CancelReason::SelfTradePrevention`.
+    const STP: u8 = 9;
 
     fn id(n: u8) -> FixedBytes<32> {
         let mut b = [0u8; 32];
@@ -727,10 +784,14 @@ mod rested_invariant_self_tests {
     }
 
     fn placed(n: u8) -> Log {
+        placed_by(X, n)
+    }
+
+    fn placed_by(user: Address, n: u8) -> Log {
         Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::OrderPlaced {
-                user: X,
+                user,
                 marketId: MARKET,
                 orderId: id(n),
                 side: 0,
@@ -765,13 +826,17 @@ mod rested_invariant_self_tests {
     }
 
     fn cancelled(n: u8) -> Log {
+        cancelled_with(X, n, 0)
+    }
+
+    fn cancelled_with(user: Address, n: u8, reason: u8) -> Log {
         Log {
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::OrderCancelled {
-                user: X,
+                user,
                 orderId: id(n),
                 marketId: MARKET,
-                reason: 0,
+                reason,
             }
             .to_log_data(),
         }
@@ -786,6 +851,7 @@ mod rested_invariant_self_tests {
                 orderId: id(n),
                 filledQuantity: 0,
                 expiredQuantity: 1,
+                reason: 0,
             }
             .to_log_data(),
         }
@@ -850,6 +916,82 @@ mod rested_invariant_self_tests {
     #[test]
     fn reporting_the_same_unrested_order_as_expired_is_accepted() {
         feed(&[placed(1), expired(1)]);
+    }
+
+    // ── `OrderExpired` ⇒ born here, never rested ─────────────────────────────────────────────
+
+    /// The converse mistake: a RESTED order reported as expired would leave the projector's entry
+    /// behind forever — it removes on `OrderCancelled`, not on an expiry.
+    #[test]
+    #[should_panic(expected = "but was RESTED in this call")]
+    fn an_expiry_of_a_rested_order_is_rejected() {
+        feed(&[placed(1), rested(1), expired(1)]);
+    }
+
+    /// An expiry is emitted by the call that placed the order, after its `OrderPlaced`.
+    #[test]
+    #[should_panic(expected = "but was not PLACED in this call")]
+    fn an_expiry_of_an_order_not_placed_in_this_call_is_rejected() {
+        feed(&[expired(1)]);
+    }
+
+    /// Keyed on the id: another order's `OrderPlaced` does not license it.
+    #[test]
+    #[should_panic(expected = "but was not PLACED in this call")]
+    fn an_expiry_is_not_licensed_by_another_orders_placement() {
+        feed(&[placed(2), expired(1)]);
+    }
+
+    /// A re-placement of an id starts a new lifecycle: the earlier rest belongs to the previous one
+    /// (the shape of two fresh test contexts on one thread, each placing the same user's nonce 0).
+    #[test]
+    fn a_rest_before_the_ids_latest_placement_does_not_count_against_an_expiry() {
+        feed(&[placed(1), rested(1), placed(1), expired(1)]);
+    }
+
+    /// …and does not license a cancel either: the new lifecycle has not rested.
+    #[test]
+    #[should_panic(expected = "without ever having RESTED")]
+    fn a_rest_before_the_ids_latest_placement_does_not_license_a_cancel() {
+        feed(&[placed(1), rested(1), placed(1), cancelled(1)]);
+    }
+
+    // ── `OrderCancelled(9)` ⇒ the most recent `OrderPlaced`'s user ───────────────────────────
+
+    /// The real shape: the taker's `OrderPlaced`, then the STP cancel of its OWN resting order,
+    /// which rested in an earlier call. A batch puts other placements of the same user in between.
+    #[test]
+    fn an_stp_cancel_of_the_takers_own_order_is_accepted() {
+        feed(&[placed_by(X, 1), cancelled_with(X, 9, STP)]);
+        feed(&[placed_by(X, 1), rested(1), placed_by(X, 2), cancelled_with(X, 1, STP)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "STP cancel attribution")]
+    fn an_stp_cancel_of_another_users_order_is_rejected() {
+        feed(&[placed_by(X, 1), cancelled_with(Y, 9, STP)]);
+    }
+
+    /// Only the MOST RECENT placement is the taker: an earlier placement by the cancelled user does
+    /// not license it.
+    #[test]
+    #[should_panic(expected = "STP cancel attribution")]
+    fn only_the_most_recent_placement_is_the_taker() {
+        feed(&[placed_by(Y, 1), placed_by(X, 2), cancelled_with(Y, 9, STP)]);
+    }
+
+    /// No taker at all in this call — an STP cancel has nothing to belong to.
+    #[test]
+    #[should_panic(expected = "STP cancel attribution")]
+    fn an_stp_cancel_with_no_placement_in_this_call_is_rejected() {
+        feed(&[cancelled_with(X, 9, STP)]);
+    }
+
+    /// The leg is scoped to reason 9: a K9 cancel (reason 2) of another user's maker is the normal
+    /// case and must pass.
+    #[test]
+    fn other_cancel_reasons_are_not_attributed_to_the_taker() {
+        feed(&[placed_by(X, 1), cancelled_with(Y, 9, 2)]);
     }
 
     /// Resting a DIFFERENT order does not license the cancel — the guard keys on the id, so it
