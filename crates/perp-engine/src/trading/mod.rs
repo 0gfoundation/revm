@@ -3903,3 +3903,9 @@ fn check_fok_feasibility<H: PerpHost>(
 
 #[cfg(test)]
 mod tests;
+
+/// Self-trade prevention and the per-market open-order cap, written independently from the plan
+/// rather than from this implementation.
+#[cfg(test)]
+#[path = "stp_spec_tests.rs"]
+mod stp_spec_tests;
