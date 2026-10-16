@@ -2361,9 +2361,13 @@ pub(super) fn match_order<H: PerpHost>(
                                 &mut ask_levels_cleared,
                             );
                             stp_taker_expired = true;
-                            // ⚠️ `break 'outer`, not a flag checked at the top of the `while`: when
-                            // the own maker is the level's LAST id the `while` would end normally
-                            // and the `for` would go on to fill the next level.
+                            // ⚠️ `break 'outer`: the stop is final. An inner `break` would let the
+                            // `for` go on and fill the next level (pinned by both suites' T5). A
+                            // flag tested at the top of the `while` fills nothing, but when the own
+                            // maker is the level's LAST id the `while` ends normally and the `for`
+                            // loads the next level and re-saves it untouched: a redundant write in
+                            // the block delta, so a different commitment (pinned by
+                            // `stp_spec_tests::t5b_*`).
                             break 'outer;
                         }
                     }

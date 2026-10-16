@@ -28,7 +28,8 @@ use alloy_sol_types::{SolCall, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
 use ed25519_dalek::{Signer, SigningKey};
-use primitives::{address, hardfork::SpecId, keccak256, Address, FixedBytes, U256};
+use perp_core::keys::{ask_level_key, bid_level_key};
+use primitives::{address, hardfork::SpecId, keccak256, Address, FixedBytes, B256, U256};
 
 use crate::call::PerpOutput;
 use crate::host::PerpHost;
@@ -1338,6 +1339,71 @@ fn t5_the_stop_holds_when_the_own_order_is_the_last_id_of_its_level() {
                     assert_eq!(prices(&mut ctx, d.maker()), vec![d.lvl(1)]);
                 }
                 assert!(open_ids(&mut ctx, ALICE, d.taker()).is_empty(), "{tag}: rested");
+            }
+        }
+    }
+}
+
+/// The keys written since the previous call, drained from the typed live store's dirty set — the
+/// exact key set the block commitment folds. A same-value write IS in it (the delta does not filter
+/// them), so a redundant write changes the commitment even when no stored value moves. Only the
+/// dirty flags go; every value stays, so the context remains usable.
+fn drain_written(ctx: &mut TestCtx) -> Vec<B256> {
+    ctx.live().take_delta().unwrap().into_iter().map(|(k, _)| k).collect()
+}
+
+/// The storage key of the book level on `side` at `price`.
+fn level_key(side: u8, price: u64) -> B256 {
+    if side == BUY {
+        bid_level_key(MARKET_ID, price)
+    } else {
+        ask_level_key(MARKET_ID, price)
+    }
+}
+
+/// T5b (+ M7b): T5 checks that nothing beyond the stop FILLS, and a stop written as "set a flag,
+/// test it at the top of the `while`" passes that. When the own order is the level's LAST id, that
+/// form lets the `while` end normally, so the `for` loads the NEXT level, meets the flag at the top
+/// of its `while` and closes it untouched: no fill, but a redundant level write in the block delta,
+/// i.e. a different commitment. The stop must be final: the walk writes the level it stopped on
+/// and NOTHING beyond it. EXPIRE_TAKER (the own order stays; its level is re-saved as it was) and
+/// EXPIRE_BOTH (it is cancelled, its level removed and the best quote refreshed from the price
+/// index, which READS the next price but must not rewrite its level), for every STP taker kind on
+/// both sides.
+#[test]
+fn t5b_an_stp_stop_on_a_levels_last_id_writes_no_level_beyond_it() {
+    for d in DIRS {
+        for mode in [ET, EB] {
+            for kind in STP_KINDS {
+                let mut ctx = fresh();
+                let own = rest(&mut ctx, ALICE, d.maker(), d.lvl(0), 1);
+                let third = rest(&mut ctx, BOB, d.maker(), d.lvl(1), 1);
+                let next_before = level(&mut ctx, d.maker(), d.lvl(1));
+                let _ = drain_written(&mut ctx);
+
+                let (out, logs) = ok(&mut ctx, ALICE, &taker(d, kind, 1, 1, mode));
+                let t = order_id_of(&out);
+                let tag = format!("{d:?} mode {mode:#06b} kind {kind:?}");
+                assert_eq!(expiry(&logs), (t, 0, 1, X_STP), "{tag}");
+                assert!(trades(&logs).is_empty(), "{tag}: nothing trades");
+                if mode == EB {
+                    assert_eq!(cancels(&logs), vec![(ALICE, own, C_STP)], "{tag}");
+                } else {
+                    assert!(cancels(&logs).is_empty(), "{tag}");
+                }
+
+                let written = drain_written(&mut ctx);
+                assert!(
+                    written.contains(&level_key(d.maker(), d.lvl(0))),
+                    "{tag}: fixture — the level the walk stopped on is written"
+                );
+                assert!(
+                    !written.contains(&level_key(d.maker(), d.lvl(1))),
+                    "{tag}: the STP stop is final, yet the level BEYOND it ({}) was rewritten",
+                    d.lvl(1)
+                );
+                assert_eq!(level(&mut ctx, d.maker(), d.lvl(1)), next_before, "{tag}");
+                assert!(order(&mut ctx, third).is_some(), "{tag}: the third party is untouched");
             }
         }
     }
