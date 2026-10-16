@@ -259,10 +259,10 @@ use primitives::{B256, U256};
 //     `u64` it was, but every stored non-zero rate is now 100× larger, so its msgpack integer can
 //     widen (2 bps = fixint `0x02` → 200 ppm = `0xcc 0xc8`). Positive-rate arithmetic is
 //     byte-identical — `floor(n·100r / 1e6) == floor(n·r / 1e4)` — so no fee, balance or fee total
-//     moves. Negative maker rates are still refused (the rebate lands with its settlement). The
-//     golden scenario's rates are rescaled ×100 (2/5 bps → 200/500 ppm); its account and order-entry
-//     blobs widen, and its BusinessSnapshot is UNCHANGED, field for field. CHAIN change: golden
-//     re-pin + a coordinated wipe on deploy.
+//     moves. At this step negative maker rates were still refused; the rebate bullet below lifts
+//     that (`maker ≥ −R`). The golden scenario's rates are rescaled ×100 (2/5 bps → 200/500
+//     ppm); its account and order-entry blobs widen, and its BusinessSnapshot is UNCHANGED, field
+//     for field. CHAIN change: golden re-pin + a coordinated wipe on deploy.
 //   * The maker REBATE. A new global key `mrbt` (the bound `R`, u64 ppm, absent = 0) and its
 //     setter; `setUserFeeRates` accepts `maker ≥ −R`. A fill against a negative-rate resting order
 //     credits that maker `min(floor(n_i·|m|/1e6), share_i)` — `share_i` the fill's cumulative-floor
