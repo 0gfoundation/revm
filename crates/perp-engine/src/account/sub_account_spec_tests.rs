@@ -45,7 +45,8 @@ use crate::interface::IPerpDex::{
     getMarginTiersCall, getMarkPriceCall, getMarketCall, getMarketFeeTotalCall,
     getMarketManagerAddressCall, getMasterCall, getOpenAlgoOrdersCall, getOpenOrdersCall,
     getOracleAddressCall, getOrderCall, getPositionCall, getPositionRiskCall,
-    getSubAccountsCall, getSymbolConfigCall, getUserFeeRatesCall, initAdminCall,
+    getMaxMakerRebateCall, getSubAccountsCall, getSymbolConfigCall, getUserFeeRatesCall,
+    initAdminCall, setMaxMakerRebateCall,
     internalTransferCall, liquidateCall, placeAlgoOrderCall, placeAlgoOrderSignedCall,
     placeOrderCall, placeOrderSignedCall, registerApiKeyCall, removePositionMarginCall,
     revokeApiKeyCall, setBasisModeCall, setLeverageCall, setLeverageSignedCall,
@@ -1036,6 +1037,7 @@ fn spec_wrap_table() -> Vec<(&'static str, [u8; 4], Wrap)> {
         ("initAdmin", initAdminCall::SELECTOR, Deny),
         ("transferAdmin", transferAdminCall::SELECTOR, Deny),
         ("setUserFeeRates", setUserFeeRatesCall::SELECTOR, Deny),
+        ("setMaxMakerRebate", setMaxMakerRebateCall::SELECTOR, Deny),
         ("setMarketManagerAddress", setMarketManagerAddressCall::SELECTOR, Deny),
         ("setOracleAddress", setOracleAddressCall::SELECTOR, Deny),
         ("addMarket", addMarketCall::SELECTOR, Deny),
@@ -1053,6 +1055,7 @@ fn spec_wrap_table() -> Vec<(&'static str, [u8; 4], Wrap)> {
         ("getAdmin", getAdminCall::SELECTOR, Deny),
         ("getAccount", getAccountCall::SELECTOR, Deny),
         ("getUserFeeRates", getUserFeeRatesCall::SELECTOR, Deny),
+        ("getMaxMakerRebate", getMaxMakerRebateCall::SELECTOR, Deny),
         ("getMarketFeeTotal", getMarketFeeTotalCall::SELECTOR, Deny),
         ("getSubAccounts", getSubAccountsCall::SELECTOR, Deny),
         ("getMaster", getMasterCall::SELECTOR, Deny),
@@ -1097,7 +1100,7 @@ fn the_as_sub_account_whitelist_matches_the_spec_for_every_selector_in_the_table
         "the shell's selector table and the spec classification differ — classify the new \
          selector here (default DENY) before it ships"
     );
-    assert_eq!(table.len(), 70);
+    assert_eq!(table.len(), 72);
     assert_eq!(table.iter().filter(|r| matches!(r.2, Wrap::Allow { .. })).count(), 14);
     // `internalTransfer` is not key-signable (spec §5): no signed twin exists.
     assert!(!names.iter().any(|n| n.starts_with("internalTransfer") && n.ends_with("Signed")));

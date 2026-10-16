@@ -63,6 +63,7 @@ const PFX_BASIS_EWMA: [u8; 4] = *b"bsew"; // per-market PriceBasisEwma (oracle-c
 const PFX_FUNDING_STATE: [u8; 4] = *b"fund"; // per-market FundingState
 const PFX_PREMIUM_ACCUMULATOR: [u8; 4] = *b"pacc"; // per-market PremiumIndexAccumulator
 const PFX_INSURANCE_FUND: [u8; 4] = *b"infd"; // global insurance fund balance
+const PFX_MAX_MAKER_REBATE: [u8; 4] = *b"mrbt"; // global maker-rebate ceiling R (u64 ppm)
 const PFX_COMMITMENT: [u8; 4] = *b"cmit"; // global on-trie commitment anchor slot
 const PFX_SEEN_SIG: [u8; 4] = *b"seen"; // signed-order replay guard: seen signature markers
 const PFX_SEEN_BUCKET: [u8; 4] = *b"snbk"; // time-bucketed index of seen-sig keys (for GC)
@@ -427,6 +428,20 @@ pub fn insurance_fund_key() -> B256 {
     INSURANCE_FUND_KEY
 }
 
+// ── Maker-rebate ceiling ──────────────────────────────────────────────────────
+
+/// Global maker-rebate ceiling `R` (u64, ppm of notional), set by `setMaxMakerRebate`. An absent
+/// key reads as 0 — rebates disabled. It bounds the maker rate `setUserFeeRates` will accept
+/// (`maker ≥ −R`) at the moment of the call and nothing else: the per-fill rebate cap, not `R`, is
+/// what keeps every fill solvent.
+pub const MAX_MAKER_REBATE_KEY: B256 = packed_const(PFX_MAX_MAKER_REBATE);
+
+/// See [`MAX_MAKER_REBATE_KEY`].
+#[inline]
+pub fn max_maker_rebate_key() -> B256 {
+    MAX_MAKER_REBATE_KEY
+}
+
 // ── Signed-order replay guard (seen-signature set) ─────────────────────────────
 // Decoupled from the order map: with delete-on-terminal the order-id is no longer a durable
 // replay witness (a filled/cancelled signed order is deleted), so a signature's replay guard lives
@@ -481,11 +496,13 @@ mod const_key_tests {
             PFX_MARKET_MANAGER,
             PFX_INDEX_PRICE,
             PFX_INDEX_HISTORY,
+            PFX_INDEX_MODE,
             PFX_BASIS_WINDOW,
             PFX_BASIS_EWMA,
             PFX_FUNDING_STATE,
             PFX_PREMIUM_ACCUMULATOR,
             PFX_INSURANCE_FUND,
+            PFX_MAX_MAKER_REBATE,
             PFX_COMMITMENT,
             PFX_SEEN_SIG,
             PFX_SEEN_BUCKET,
@@ -551,6 +568,9 @@ mod const_key_tests {
         let mut wcmit = [0u8; 32];
         wcmit[..4].copy_from_slice(b"cmit");
         assert_eq!(commitment_slot(), B256::new(wcmit));
+        let mut wrebate = [0u8; 32];
+        wrebate[..4].copy_from_slice(b"mrbt");
+        assert_eq!(max_maker_rebate_key(), B256::new(wrebate));
     }
 
     /// Same fields under different families must differ; the raw-order namespace must not equal

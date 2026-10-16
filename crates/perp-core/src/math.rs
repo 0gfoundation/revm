@@ -38,6 +38,15 @@ pub const FEE_PPM_DENOMINATOR: u64 = 1_000_000;
 /// itself, i.e. a 100%-of-notional fee.
 pub const MAX_FEE_PPM: u64 = 100_000;
 
+/// Hard ceiling on the admin-set maker-rebate bound `R` (`setMaxMakerRebate`): 10_000 ppm = 1%
+/// of notional. The largest rebate any venue in the survey pays is dYdX's 110 ppm, so this only
+/// removes the absurd end of the range.
+///
+/// Neither `R` nor this ceiling is what keeps the protocol solvent: each fill's rebate is capped
+/// at that fill's share of the taker fee, so a fill's net fee is never negative whatever the rates
+/// are. `R` only bounds which maker rates `setUserFeeRates` accepts.
+pub const MAX_MAKER_REBATE_CEILING_PPM: u64 = 10_000;
+
 /// Default price-band half-width (basis points) used when a market's
 /// `price_band_bps` is left at `0`. 1_000 bps = ±10%.
 pub const DEFAULT_PRICE_BAND_BPS: u32 = 1_000;

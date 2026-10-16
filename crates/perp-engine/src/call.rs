@@ -14,7 +14,8 @@ use crate::{
     account::{
         run_as_sub_account, run_create_sub_account, run_deposit, run_get_account,
         run_get_api_key, run_get_api_keys, run_get_master, run_get_sub_accounts,
-        run_get_user_fee_rates, run_internal_transfer, run_register_api_key, run_revoke_api_key,
+        run_get_max_maker_rebate, run_get_user_fee_rates, run_internal_transfer,
+        run_register_api_key, run_revoke_api_key, run_set_max_maker_rebate,
         run_set_user_fee_rates, run_transfer_from_perp, run_transfer_from_perp_signed,
         run_transfer_to_perp, run_transfer_to_perp_signed, run_withdraw,
         sub_account::{self, AS_SUB_ACCOUNT_OVERHEAD_GAS},
@@ -36,11 +37,11 @@ use crate::{
         getMarketFeeTotalCall, getMarketManagerAddressCall, getOpenOrdersCall,
         getOracleAddressCall, getOrderCall, getPositionCall, getPositionRiskCall,
         getSymbolConfigCall,
-        getUserFeeRatesCall,
+        getMaxMakerRebateCall, getUserFeeRatesCall,
         initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
         removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
         setBasisModeCall, setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall,
-        setUserFeeRatesCall,
+        setMaxMakerRebateCall, setUserFeeRatesCall,
         transferAdminCall, transferFromPerpCall, transferFromPerpSignedCall, transferToPerpCall,
         transferToPerpSignedCall, updateIndexPriceCall, updateIndexPriceFromBookCall,
         updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
@@ -252,6 +253,10 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(setUserFeeRatesCall::SELECTOR, (80_000, false));
         m.insert(getUserFeeRatesCall::SELECTOR, (5_000, true));
         m.insert(getMarketFeeTotalCall::SELECTOR, (5_000, true));
+        // The maker-rebate bound `R`: one scalar write + one log, the admin-setter tier of
+        // `setOracleAddress`; the getter is the 5_000 scalar-read tier.
+        m.insert(setMaxMakerRebateCall::SELECTOR, (30_000, false));
+        m.insert(getMaxMakerRebateCall::SELECTOR, (5_000, true));
         // Sub-accounts (P1)
         //
         // `createSubAccount` 50_000: two account writes (the new sub's blob, the master's
@@ -765,6 +770,10 @@ pub(crate) fn dispatch<H: PerpHost>(
         }
         s if s == getUserFeeRatesCall::SELECTOR => run_get_user_fee_rates(input_bytes, context),
         s if s == getMarketFeeTotalCall::SELECTOR => run_get_market_fee_total(input_bytes, context),
+        s if s == setMaxMakerRebateCall::SELECTOR => {
+            run_set_max_maker_rebate(input_bytes, caller, context)
+        }
+        s if s == getMaxMakerRebateCall::SELECTOR => run_get_max_maker_rebate(input_bytes, context),
         // Sub-accounts
         s if s == createSubAccountCall::SELECTOR => {
             run_create_sub_account(input_bytes, caller, context)

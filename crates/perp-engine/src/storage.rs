@@ -24,7 +24,7 @@ use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
     bid_level_key, bid_prices_key, commitment_slot, funding_state_key,
     index_mode_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
-    market_fee_total_key,
+    market_fee_total_key, max_maker_rebate_key,
     market_hot_key, market_key, market_manager_key, oracle_key, order_key, position_key,
     position_registry_key, premium_accumulator_key, price_basis_ewma_key, price_basis_window_key,
     seen_bucket_key,
@@ -899,6 +899,22 @@ pub fn save_user_fee_rates<H: PerpHost>(
         a.maker_fee_ppm = rates.maker_fee_ppm;
         a.taker_fee_ppm = rates.taker_fee_ppm;
     })
+}
+
+/// The global maker-rebate bound `R` in ppm (`setMaxMakerRebate`); an absent key is 0, i.e.
+/// rebates disabled. Byte tier, like the other parameterless scalars.
+pub fn load_max_maker_rebate<H: PerpHost>(context: &mut H) -> Result<u64, PerpError> {
+    let buf = load_blob(context, max_maker_rebate_key())?;
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    decode(&buf)
+}
+
+/// Writes the maker-rebate bound `R` (ppm). Bounds are the caller's (`setMaxMakerRebate`).
+pub fn save_max_maker_rebate<H: PerpHost>(context: &mut H, ppm: u64) -> Result<(), PerpError> {
+    let buf = encode(&ppm)?;
+    store_blob(context, max_maker_rebate_key(), &buf)
 }
 
 pub fn load_market_fee_total<H: PerpHost>(

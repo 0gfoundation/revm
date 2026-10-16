@@ -2378,9 +2378,10 @@ pub(super) fn match_order<H: PerpHost>(
                         break 'outer;
                     }
                     // This fill's notional and its share of the taker's ONE fee, priced BEFORE the
-                    // maker settles. Pure arithmetic over the taker's running total — nothing is
-                    // recorded until the maker accepts the fill (a K9-rejected maker consumes no
-                    // share). See `TakerSettlement::fee_share_of_next_fill`.
+                    // maker settles: the share is the cap on a negative-rate maker's rebate for this
+                    // fill (`settlement::entry_fill_plan`). Pure arithmetic over the taker's running
+                    // total — nothing is recorded until the maker accepts the fill (a K9-rejected
+                    // maker consumes no share). See `TakerSettlement::fee_share_of_next_fill`.
                     let fill_notional = calc_value(
                         ask_price,
                         fill_qty,
@@ -2403,6 +2404,7 @@ pub(super) fn match_order<H: PerpHost>(
                             ask_price,
                             fill_qty,
                             Side::Buy,
+                            taker_fee_share,
                             market,
                         )? {
                             MakerFillOutcome::Filled {
@@ -2682,6 +2684,7 @@ pub(super) fn match_order<H: PerpHost>(
                             bid_price,
                             fill_qty,
                             Side::Sell,
+                            taker_fee_share,
                             market,
                         )? {
                             MakerFillOutcome::Filled {

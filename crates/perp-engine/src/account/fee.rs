@@ -6,9 +6,10 @@ use primitives::{Address, Bytes, Log};
 use crate::{
         errors::perp_err,
     interface::IPerpDex::{
-        self, getUserFeeRatesCall, getUserFeeRatesReturn, setUserFeeRatesCall,
+        self, getMaxMakerRebateCall, getUserFeeRatesCall, getUserFeeRatesReturn,
+        setMaxMakerRebateCall, setUserFeeRatesCall,
     },
-    math::MAX_FEE_PPM,
+    math::{MAX_FEE_PPM, MAX_MAKER_REBATE_CEILING_PPM},
     storage,
     types::{derive_sub_account, UserFeeRates},
     PERP_DEX_ADDRESS,
@@ -17,9 +18,15 @@ use crate::{
 
 /// `setUserFeeRates(address user, int64 makerFeePpm, uint64 takerFeePpm)` — admin only.
 ///
-/// Rates are in ppm of notional (`math::FEE_PPM_DENOMINATOR`), each bounded by
-/// [`MAX_FEE_PPM`]. The maker rate is signed but must still be `≥ 0`: maker rebates are not
-/// settled yet, so a negative rate is refused rather than accepted and silently charged as zero.
+/// Rates are in ppm of notional (`math::FEE_PPM_DENOMINATOR`): `0 ≤ taker ≤ MAX_FEE_PPM` and
+/// `−R ≤ maker ≤ MAX_FEE_PPM`, with `R` = [`storage::load_max_maker_rebate`] read NOW.
+///
+/// Deliberately NO rule between the two rates, and none across accounts (no "taker ≥ R", no
+/// "min taker + min maker ≥ 0"). Fee tiers are designed by hand so that a rebate never exceeds
+/// the taker fee that funds it; the code's only solvency guarantee is the always-on per-fill cap
+/// in `settlement::entry_fill_plan` (`rebate_i ≤ the fill's taker-fee share`), which holds
+/// whatever is configured. Lowering `R` later leaves rates already set below `−R` untouched for
+/// the same reason — the cap, not `R`, is what bounds what they can draw.
 ///
 /// Sub-accounts carry their master's rates (copied at `createSubAccount`), and this is what keeps
 /// them in step: a SUB is refused outright ("set the master's rates" — a sub priced differently
@@ -45,8 +52,12 @@ pub fn run_set_user_fee_rates<H: PerpHost>(
     if args.makerFeePpm > MAX_FEE_PPM as i64 {
         return Err(perp_err("setUserFeeRates: maker fee exceeds 100000 ppm (10%)"));
     }
-    if args.makerFeePpm < 0 {
-        return Err(perp_err("setUserFeeRates: negative maker fee (maker rebates not enabled)"));
+    let max_rebate = storage::load_max_maker_rebate(context)?;
+    // `R ≤ MAX_MAKER_REBATE_CEILING_PPM` (setMaxMakerRebate), so the negation cannot overflow.
+    if args.makerFeePpm < -(max_rebate as i64) {
+        return Err(perp_err(format!(
+            "setUserFeeRates: maker rebate exceeds maxMakerRebate ({max_rebate} ppm)"
+        )));
     }
 
     let sub_count = {
@@ -95,6 +106,45 @@ pub fn run_get_user_fee_rates<H: PerpHost>(
             takerFeePpm: rates.taker_fee_ppm,
         },
     )))
+}
+
+/// `setMaxMakerRebate(uint64 ppm)` — admin only. Sets the bound `R` that `setUserFeeRates`
+/// checks a negative maker rate against, `0 ≤ R ≤ MAX_MAKER_REBATE_CEILING_PPM`.
+///
+/// Prospective only: no stored rate and no resting order's snapshot is re-validated, so lowering
+/// `R` leaves every existing rebate in place. That is safe because no fill's rebate can exceed its
+/// own taker-fee share (`settlement::entry_fill_plan`), whatever `R` is or was.
+pub fn run_set_max_maker_rebate<H: PerpHost>(
+    input_bytes: &[u8],
+    caller: Address,
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = setMaxMakerRebateCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("setMaxMakerRebate: invalid calldata"))?;
+    require_admin(caller, context)?;
+    if args.maxMakerRebatePpm > MAX_MAKER_REBATE_CEILING_PPM {
+        return Err(perp_err("setMaxMakerRebate: exceeds 10000 ppm (1%)"));
+    }
+    storage::save_max_maker_rebate(context, args.maxMakerRebatePpm)?;
+    context.log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::MaxMakerRebateUpdated {
+            maxMakerRebatePpm: args.maxMakerRebatePpm,
+        }
+        .to_log_data(),
+    });
+    Ok(Bytes::new())
+}
+
+/// `getMaxMakerRebate()` — the current maker-rebate bound `R` in ppm (0 when never set).
+pub fn run_get_max_maker_rebate<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    getMaxMakerRebateCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getMaxMakerRebate: invalid calldata"))?;
+    let ppm = storage::load_max_maker_rebate(context)?;
+    Ok(Bytes::from(getMaxMakerRebateCall::abi_encode_returns(&ppm)))
 }
 
 fn require_admin<H: PerpHost>(

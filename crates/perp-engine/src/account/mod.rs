@@ -8,7 +8,10 @@ pub use deposit_withdraw::{
     run_deposit, run_get_account, run_transfer_from_perp, run_transfer_from_perp_signed,
     run_transfer_to_perp, run_transfer_to_perp_signed, run_withdraw,
 };
-pub use fee::{run_get_user_fee_rates, run_set_user_fee_rates};
+pub use fee::{
+    run_get_max_maker_rebate, run_get_user_fee_rates, run_set_max_maker_rebate,
+    run_set_user_fee_rates,
+};
 pub use sub_account::{
     run_as_sub_account, run_create_sub_account, run_get_master, run_get_sub_accounts,
     run_internal_transfer,

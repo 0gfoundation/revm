@@ -456,7 +456,9 @@ sol! {
         /// 1 bp = 100 ppm). Only callable by admin.
         ///
         /// `makerFeePpm` is SIGNED (a negative rate is a maker rebate); `takerFeePpm` is not.
-        /// Bounds: `0 ≤ takerFeePpm ≤ 100_000` and `0 ≤ makerFeePpm ≤ 100_000` (10%).
+        /// Bounds: `0 ≤ takerFeePpm ≤ 100_000` (10%) and `−R ≤ makerFeePpm ≤ 100_000`, where `R`
+        /// is `getMaxMakerRebate()` AT THE TIME OF THIS CALL. There is no rule tying a maker rate
+        /// to any taker rate.
         ///
         /// Sub-accounts inherit their master's rates: setting a MASTER's rates also writes them to
         /// every one of its sub-accounts (one `UserFeeRatesUpdated` per account written, master
@@ -466,8 +468,17 @@ sol! {
         /// Query per-user trading fee rates in ppm of notional (maker signed). Unset users default
         /// to zero.
         function getUserFeeRates(address user) external view returns (int64 makerFeePpm, uint64 takerFeePpm);
-        /// Query total trading fees collected for one market.
+        /// Query total trading fees collected for one market, NET of maker rebates.
         function getMarketFeeTotal(uint64 marketId) external view returns (uint64 totalFee);
+        /// Set the maker-rebate bound `R`, in ppm: the most negative maker rate `setUserFeeRates`
+        /// accepts is `−R`. Admin only; `R ≤ 10_000` (1%). Default 0 = rebates disabled.
+        ///
+        /// Lowering `R` does NOT touch rates already set below `−R`, nor the rate an already
+        /// resting order snapshotted: those keep earning their rebate. Solvency does not rest on
+        /// `R` — every fill's rebate is capped at that fill's share of the taker fee.
+        function setMaxMakerRebate(uint64 maxMakerRebatePpm) external;
+        /// The current maker-rebate bound `R`, in ppm.
+        function getMaxMakerRebate() external view returns (uint64 maxMakerRebatePpm);
 
         // ── Sub-accounts (P1) ──────────────────────────────────────────────────
         /// Create the caller's next sub-account. Direct call only; the caller becomes its master.
@@ -1689,6 +1700,8 @@ sol! {
             int64   totalCrossWalletBalance
         );
         event UserFeeRatesUpdated(address indexed user, int64 makerFeePpm, uint64 takerFeePpm);
+        /// `setMaxMakerRebate`: the new bound `R`, in ppm.
+        event MaxMakerRebateUpdated(uint64 maxMakerRebatePpm);
 
         // Emitted once per accepted placeOrder / placeOrderSigned call, before any matching.
         // Fires only when validation passes; a reverted tx emits nothing.
@@ -1882,7 +1895,9 @@ sol! {
         // Feeds: /trades, /historicalTrades, /aggTrades, /klines, /ticker/24hr, /myTrades, and the
         //        `@order` stream's per-fill `o.rp`.
         // tradeId: global sequential counter for fromId pagination and firstId/lastId in 24hr ticker
-        // takerFee / makerFee: USDC micro-units (6-decimal) charged to each side for this fill
+        // takerFee: USDC micro-units (6-decimal), this fill's share of the taker's ONE order fee
+        // makerFee: SIGNED USDC micro-units — > 0 the commission the maker paid, < 0 the maker
+        //           rebate it was credited (post-cap), 0 neither
         //
         // ── takerRealizedPnl / makerRealizedPnl — the `@order` stream's `o.rp` ──────────────────
         //
@@ -1915,7 +1930,7 @@ sol! {
         // rounding residual. `makerRealizedPnl` is not apportioned at all: the maker settles once
         // per fill, so it is that fill's own value verbatim, and equals the `realizedPnl` on the
         // maker's `PositionChanged` for the same fill.
-        event Trade(uint64 indexed marketId, uint64 tradeId, bytes32 takerOrderId, bytes32 makerOrderId, address taker, address maker, uint64 price, uint64 quantity, uint8 takerSide, uint64 takerFee, uint64 makerFee, int64 takerRealizedPnl, int64 makerRealizedPnl);
+        event Trade(uint64 indexed marketId, uint64 tradeId, bytes32 takerOrderId, bytes32 makerOrderId, address taker, address maker, uint64 price, uint64 quantity, uint8 takerSide, uint64 takerFee, int64 makerFee, int64 takerRealizedPnl, int64 makerRealizedPnl);
 
         /// Feeds: /positionRisk (history), /income (REALIZED_PNL), and — since the `@position`
         /// WebSocket stream was removed — the whole of `ACCOUNT_UPDATE.a.P[]`.

@@ -265,6 +265,11 @@ impl TakerSettlement {
         // `rest_in_book`, which decides ONCE, above the barrier. There is nothing here for a second
         // opinion to be right or wrong about.
         if self.fills.is_empty() {
+            // A rebate is paid only on a recorded fill, so a fill-less match holds none — and if it
+            // did, nothing would fund it.
+            if reg.rebate_total != 0 {
+                return Err(perp_invariant_err("maker rebate credited on a match with no fills"));
+            }
             return Ok(None);
         }
 
@@ -284,6 +289,18 @@ impl TakerSettlement {
             self.taker_fee_ppm,
             market,
         )?;
+
+        // ── The maker rebates are paid out of THIS taker fee ─────────────────────────────────
+        //
+        // Every rebate the walk credited is capped at its own fill's share of the taker fee
+        // (`entry_fill_plan`), and the shares sum to `core.fee` exactly (`finalize_core`'s
+        // telescoping assertion), so `Σ rebates ≤ fee` by construction and the fee recipient's
+        // credit cannot go negative. Checked here, pre-write, so a violation is a clean reject of
+        // the whole match rather than a post-flush failure. The taker is still debited the FULL
+        // fee (`total_required` below); the rebated part of it is already in the makers' wallets.
+        let fee_recipient_credit = core.fee.checked_sub(reg.rebate_total).ok_or_else(|| {
+            perp_invariant_err("maker rebates exceed the taker fee that funds them")
+        })?;
 
         // `finalize_core` has apportioned each fill's share of the taker's close PnL; stamp it onto
         // the `Trade` rows the walk queued with a `0` placeholder. Done HERE, at the first point
@@ -406,7 +423,7 @@ impl TakerSettlement {
         Ok(Some(TakerPlan {
             user: self.user,
             market_id: self.market_id,
-            fee: core.fee,
+            fee_recipient_credit,
             total_required: core.total_required,
             pos_log,
             realized_pnl: core.realized_pnl,
@@ -488,7 +505,10 @@ fn work_position_snapshot(
 pub(super) struct TakerPlan {
     user: Address,
     market_id: u64,
-    fee: u64,
+    /// What the fee recipient is credited for this order: the taker fee NET of the maker rebates
+    /// it funded (`fee − rebate_total`, `≥ 0` by the per-fill cap). Also what `market_fee_total`
+    /// grows by for the taker leg, so the fee total stays the admin wallet's net intake.
+    fee_recipient_credit: u64,
     total_required: u64,
     pos_log: crate::types::PerpPosition,
     realized_pnl: i64,
@@ -527,7 +547,7 @@ pub(super) fn finalize_apply<H: PerpHost>(
     storage::mutate_account_balance(context, plan.user, AccountUpdateReason::Order, |a| {
         a.debit_perp(plan.total_required)
     })??;
-    credit_fee_recipient(context, plan.market_id, plan.fee)?;
+    credit_fee_recipient(context, plan.market_id, plan.fee_recipient_credit)?;
 
     // ── ONE account snapshot for the TAKER, for this whole ORDER — the group HEADER ─────────────
     //
@@ -583,7 +603,9 @@ pub(super) enum MakerFillOutcome {
     /// row — so the position row has to be pushed after that, by the same caller. Pushed from in
     /// here it would land BEFORE the `Trade`, one event too early, and orphan itself.
     Filled {
-        maker_fee: u64,
+        /// SIGNED, as `Trade.makerFee` reports it: positive = the commission the maker paid,
+        /// negative = the rebate it was credited (post-cap). See [`MakerFee`].
+        maker_fee: i64,
         /// The maker's position AFTER this fill (all-scalar clone).
         pos_snapshot: crate::types::PerpPosition,
         realized_pnl: i64,
@@ -721,7 +743,8 @@ pub(super) enum MatchEvent {
         quantity: u64,
         taker_side: Side,
         taker_fee: u64,
-        maker_fee: u64,
+        /// Signed: `> 0` paid, `< 0` rebated (post-cap) — see [`MakerFillOutcome::Filled`].
+        maker_fee: i64,
         /// This fill's share of the TAKER's close PnL (`Trade.takerRealizedPnl`).
         ///
         /// ⚠️ Pushed as a PLACEHOLDER `0` by the walk and backfilled later by
@@ -777,6 +800,15 @@ pub(super) struct MatchRegistry {
     /// (see [`Self::credit_admin`]).
     fee_admin: Option<Address>,
     admin_credit_pending: u64,
+    /// `Σ` maker rebates credited during this match's walk — every one already sitting in its
+    /// maker's working-copy wallet. They are paid out of THIS match's taker fee: `finalize_compute`
+    /// nets them off it (`fee − rebate_total`, never negative because each rebate is capped by its
+    /// own fill's taker-fee share) and the fee recipient is credited only the remainder. The fee
+    /// recipient is therefore never debited and never has to be pre-funded.
+    ///
+    /// One registry per `match_order` call, so the cap and the netting are per match: a batch item
+    /// or a fired conditional has its own.
+    rebate_total: u64,
     /// Set when the walk stopped early because a LIQUIDATION close had already touched
     /// [`MAX_LIQUIDATION_MAKER_ACCOUNTS`](super::MAX_LIQUIDATION_MAKER_ACCOUNTS) distinct makers.
     /// That cap is per MATCH, not per sweep, so a later attempt gets a fresh allowance and can
@@ -793,6 +825,7 @@ impl MatchRegistry {
             events: Vec::new(),
             fee_admin: None,
             admin_credit_pending: 0,
+            rebate_total: 0,
         }
     }
 
@@ -1008,6 +1041,16 @@ impl MatchRegistry {
             },
         ));
         Ok(self.users.len() - 1)
+    }
+
+    /// Accumulates one maker fill's rebate (already credited to that maker's working copy) into
+    /// [`Self::rebate_total`], which `finalize_compute` nets off the taker fee.
+    fn add_rebate(&mut self, amount: u64) -> Result<(), PerpError> {
+        self.rebate_total = self
+            .rebate_total
+            .checked_add(amount)
+            .ok_or_else(|| perp_err("placeOrder: maker rebate total overflow"))?;
+        Ok(())
     }
 
     /// Fee-recipient wallet credit with registry read-through (zero storage writes during the
@@ -1377,6 +1420,9 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     fill_price: u64,
     fill_qty: u64,
     taker_side: Side,
+    // This fill's share of the taker fee (`TakerSettlement::fee_share_of_next_fill`) — the most a
+    // negative-rate maker can be rebated on it.
+    taker_fee_share: u64,
     market: &crate::types::Market,
 ) -> Result<MakerFillOutcome, PerpError> {
     let maker_side = taker_side.opposite();
@@ -1395,6 +1441,7 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
         maker_order_id,
         fill_price,
         fill_qty,
+        taker_fee_share,
         market,
     )?;
 
@@ -1417,26 +1464,34 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
         market_id,
         amount: bad_debt,
     });
-    // Fee credit: the admin==ZERO reject is checked NOW (read-only, pre-write); the fee-total
-    // write defers as an event, and the admin wallet credit routes through the registry
-    // read-through so an admin who is also a trading party sees earlier fees mid-walk.
-    if maker_fee > 0 {
-        let admin = storage::load_admin(context)?;
-        if admin == Address::ZERO {
-            return Err(perp_err("placeOrder: fee recipient not initialised"));
+    match maker_fee {
+        // Fee credit: the admin==ZERO reject is checked NOW (read-only, pre-write); the fee-total
+        // write defers as an event, and the admin wallet credit routes through the registry
+        // read-through so an admin who is also a trading party sees earlier fees mid-walk.
+        MakerFee::Charge(fee) if fee > 0 => {
+            let admin = storage::load_admin(context)?;
+            if admin == Address::ZERO {
+                return Err(perp_err("placeOrder: fee recipient not initialised"));
+            }
+            reg.push_event(MatchEvent::FeeCredit {
+                market_id,
+                amount: fee,
+            });
+            reg.credit_admin(admin, fee)?;
         }
-        reg.push_event(MatchEvent::FeeCredit {
-            market_id,
-            amount: maker_fee,
-        });
-        reg.credit_admin(admin, maker_fee)?;
+        MakerFee::Charge(_) => {}
+        // Already in the maker's working-copy wallet (`settle_maker_fill_core`); the registry only
+        // records it, so `finalize_compute` can net it off the taker fee that pays for it. No
+        // admin debit, no fee-total write here: the fee recipient's credit and the fee total both
+        // move once, by the NET amount, in `finalize_apply`.
+        MakerFee::Rebate(rebate) => reg.add_rebate(rebate)?,
     }
 
     // NOTE: the `PositionChanged` for this fill is NOT pushed here — it is handed back to the walk
     // and pushed after the fill's `Trade` + the maker's `AccountSnapshot`, so header and row are
     // adjacent. See `MakerFillOutcome::Filled`.
     Ok(MakerFillOutcome::Filled {
-        maker_fee,
+        maker_fee: maker_fee.signed()?,
         pos_snapshot,
         realized_pnl,
         closed_quantity,
@@ -1797,7 +1852,7 @@ fn finalize_core(
 /// Outcome of [`settle_maker_fill_core`]: the pure maker-fill decision + its effect summary.
 pub(super) enum MakerFillCore {
     Filled {
-        maker_fee: u64,
+        maker_fee: MakerFee,
         bad_debt: u64,
         realized_pnl: i64,
         closed_quantity: u64,
@@ -1822,6 +1877,7 @@ pub(super) fn settle_maker_fill_core(
     maker_order_id: &[u8; 32],
     fill_price: u64,
     fill_qty: u64,
+    taker_fee_share: u64,
     market: &crate::types::Market,
 ) -> Result<MakerFillCore, PerpError> {
     // READ-ONLY: locate the maker's book entry and price this fill's share of the order's maker
@@ -1839,6 +1895,7 @@ pub(super) fn settle_maker_fill_core(
         fill_price,
         matches!(maker_side, Side::Buy),
         fill_qty,
+        taker_fee_share,
         market,
         match maker_side {
             Side::Buy => "buy",
@@ -1894,8 +1951,12 @@ pub(super) fn settle_maker_fill_core(
     // wallet. Now the fee comes out of `opening_margin` first, with only the uncovered part
     // (the pure-close case, `opening_margin == 0`) falling to the wallet. Applied to the TRIAL
     // copy so it is already out of `trial_pos.margin` when K9 runs below.
-    let fee_from_margin = maker_fee.min(fill_outcome.opening_margin);
-    let fee_from_wallet = maker_fee - fee_from_margin;
+    //
+    // A REBATE charges nothing here (`charge() == 0`, so `fee_from_margin == 0`): it is CREDITED,
+    // and only once the fill is accepted — see the accept block below.
+    let charge = maker_fee.charge();
+    let fee_from_margin = charge.min(fill_outcome.opening_margin);
+    let fee_from_wallet = charge - fee_from_margin;
     let from_margin_i64 = checked_u64_to_i64(fee_from_margin, "settlement: fee from margin")?;
     let from_wallet_i64 = checked_u64_to_i64(fee_from_wallet, "settlement: fee from wallet")?;
     trial_pos.margin = trial_pos
@@ -2023,9 +2084,24 @@ pub(super) fn settle_maker_fill_core(
         }
     }
 
-    // Accept: adopt the trial result verbatim.
+    // Accept: adopt the trial result verbatim — plus this fill's maker REBATE, if any.
+    //
+    // ── Where the rebate lands, and when ─────────────────────────────────────────────────────
+    //
+    // The maker's PERP WALLET, not `pos.margin`. A margin credit on a pure full close would leave
+    // margin on a flat position — the state `storage::save_position` asserts can never exist (and
+    // `trading::liquidation`'s close path asserts the same), and money a flat position could
+    // never release.
+    //
+    // HERE, after `apply_position_fill` and after both opening guards passed on the trial copy, so
+    // the rebate is neither cash at hand for this fill's M1 cap (`CappedAtCashAtHand` read
+    // `trial_wallet` above, before it) nor an input to the K9 / tier verdict. It is paid out of this
+    // match's taker fee (`MatchRegistry::rebate_total` → `finalize_compute`), which every accepted
+    // match collects in full.
     *pos = trial_pos;
-    account.perp_wallet_balance = trial_wallet;
+    account.perp_wallet_balance = trial_wallet
+        .checked_add(checked_u64_to_i64(maker_fee.rebate(), "settlement: maker rebate")?)
+        .ok_or_else(|| perp_err("perp wallet: balance overflow"))?;
 
     // Apply the entry reduce planned above (the lists were untouched in between, so `entry_idx`
     // is still valid), and shrink `Bid`/`Ask` by exactly the term the reduce removes. Two points:
@@ -2596,16 +2672,73 @@ pub(super) fn apply_position_fill(
 
 // ── Order entry updates after fill ───────────────────────────────────────────
 
+/// One maker fill's commission, decided by [`entry_fill_plan`] from the rate the order
+/// snapshotted when it started resting (`OrderEntry::maker_fee_ppm`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MakerFee {
+    /// A non-negative rate: the maker PAYS this much to the fee recipient.
+    Charge(u64),
+    /// A negative rate: the maker is CREDITED this much, out of this fill's taker-fee share.
+    Rebate(u64),
+}
+
+impl MakerFee {
+    /// What the maker pays (`0` for a rebate).
+    fn charge(self) -> u64 {
+        match self {
+            Self::Charge(fee) => fee,
+            Self::Rebate(_) => 0,
+        }
+    }
+
+    /// What the maker is credited (`0` for a charge).
+    fn rebate(self) -> u64 {
+        match self {
+            Self::Charge(_) => 0,
+            Self::Rebate(rebate) => rebate,
+        }
+    }
+
+    /// Signed, as `Trade.makerFee` reports it: `> 0` paid, `< 0` credited.
+    fn signed(self) -> Result<i64, PerpError> {
+        match self {
+            Self::Charge(fee) => checked_u64_to_i64(fee, "settlement: maker fee"),
+            Self::Rebate(rebate) => Ok(-checked_u64_to_i64(rebate, "settlement: maker rebate")?),
+        }
+    }
+}
+
 /// READ-ONLY plan for shrinking a maker's book entry by `fill_qty`. Returns
 /// `(index, post-fill amount, this fill's maker fee)` and touches nothing, so the caller can price
 /// and GATE the fill (K9 runs on a position the fee has already left) before committing to the
 /// mutation — and so a K9 reject leaves the entry intact for the cancel path to release.
+///
+/// # A non-negative rate: a CHARGE, by whole-order difference
 ///
 /// The fee is the DIFFERENCE between the whole order's fee at its pre- and post-fill amounts,
 /// never `calc_trading_fee(fill notional)`: differencing two whole-order fees makes the per-fill
 /// fees of a partially-filled order sum EXACTLY to the order's total fee, with no floor-composition
 /// drift across partial fills. (Under the old escrow this same quantity was the amount RELEASED
 /// from `pos.fee_reserved`; it is unchanged — only its funding source moved.)
+///
+/// # A negative rate: a REBATE, per fill, capped by the fill's taker-fee share
+///
+/// ```text
+/// rebate_i = min( floor(n_i · |m| / 1e6),  share_i )        n_i = calc_value(price, fill_qty)
+/// ```
+///
+/// * **Its own floor, NOT the whole-order difference.** The difference form can hand one fill
+///   one unit MORE than `floor(n_i · |m| / 1e6)` (the earlier fills' truncation catches up on a
+///   later one), so a maker at `|m| = t` could out-earn the taker fee its own fill paid. The
+///   independent floor rounds every fill toward the protocol instead.
+/// * **Capped at `share_i`** — this fill's share of the taker's ONE fee
+///   (`TakerSettlement::fee_share_of_next_fill`; the shares sum to the fee exactly). This is the
+///   code's ONLY solvency guarantee for rebates, and it holds whatever the rates are: no config
+///   rule ties a maker rate to any taker rate, so a 0-fee taker, a liquidation close (its taker fee
+///   is waived, so every share is 0), a maker whose snapshot predates a lowered `R`, or simply a
+///   taker cheaper than the maker's rebate all reach it, and each such fill nets the protocol
+///   `share_i − rebate_i ≥ 0`. Where `t ≥ |m|` it never binds:
+///   `floor(n_i·|m|/1e6) ≤ floor(n_i·t/1e6) ≤ share_i`.
 #[allow(clippy::too_many_arguments)]
 fn entry_fill_plan(
     entries: &std::collections::VecDeque<crate::types::OrderEntry>,
@@ -2613,9 +2746,10 @@ fn entry_fill_plan(
     price: u64,
     buy_side: bool,
     fill_qty: u64,
+    taker_fee_share: u64,
     market: &crate::types::Market,
     side_label: &str,
-) -> Result<(usize, u64, u64), PerpError> {
+) -> Result<(usize, u64, MakerFee), PerpError> {
     // #B: binary-search to the maker's price (known = the matched level) then scan the tiny
     // same-price run — O(log n) instead of the O(n) id scan; full-fill removal is O(1)-ish
     // VecDeque::remove instead of the O(n) retain.
@@ -2631,16 +2765,22 @@ fn entry_fill_plan(
             "{side_label} entry for order {order_id:?} has insufficient amount during fill update"
         )));
     }
-    // `setUserFeeRates` refuses a negative maker rate, so no entry can snapshot one.
-    let e_fee_ppm = u64::try_from(e_fee_ppm).map_err(|_| {
-        perp_invariant_err(format!(
-            "{side_label} entry for order {order_id:?} carries a negative maker fee rate"
-        ))
-    })?;
-    let old_order_fee = calc_maker_fee_for_order_qty(e_price, e_amount, e_fee_ppm, market)?;
     let new_amount = e_amount.saturating_sub(fill_qty);
-    let new_order_fee = calc_maker_fee_for_order_qty(e_price, new_amount, e_fee_ppm, market)?;
-    Ok((idx, new_amount, old_order_fee.saturating_sub(new_order_fee)))
+    let fee = if e_fee_ppm >= 0 {
+        let rate = e_fee_ppm as u64;
+        let old_order_fee = calc_maker_fee_for_order_qty(e_price, e_amount, rate, market)?;
+        let new_order_fee = calc_maker_fee_for_order_qty(e_price, new_amount, rate, market)?;
+        MakerFee::Charge(old_order_fee.saturating_sub(new_order_fee))
+    } else {
+        // `e_price` is the fill price (a match executes at the maker's level — the key this
+        // entry was just found by), so this is the walk's own `n_i`.
+        debug_assert_eq!(e_price, price, "a maker fills at its own limit price");
+        let fill_notional =
+            calc_value(e_price, fill_qty, market.base_decimals, market.price_decimals)?;
+        let uncapped = calc_trading_fee(fill_notional, e_fee_ppm.unsigned_abs())?;
+        MakerFee::Rebate(uncapped.min(taker_fee_share))
+    };
+    Ok((idx, new_amount, fee))
 }
 
 /// Routes position **bad debt** — a realized loss beyond the position's own margin —

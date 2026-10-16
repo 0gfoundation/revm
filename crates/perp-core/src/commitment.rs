@@ -263,6 +263,15 @@ use primitives::{B256, U256};
 //     golden scenario's rates are rescaled ×100 (2/5 bps → 200/500 ppm); its account and order-entry
 //     blobs widen, and its BusinessSnapshot is UNCHANGED, field for field. CHAIN change: golden
 //     re-pin + a coordinated wipe on deploy.
+//   * The maker REBATE. A new global key `mrbt` (the bound `R`, u64 ppm, absent = 0) and its
+//     setter; `setUserFeeRates` accepts `maker ≥ −R`. A fill against a negative-rate resting order
+//     credits that maker `min(floor(n_i·|m|/1e6), share_i)` — `share_i` the fill's cumulative-floor
+//     share of the taker fee — to its perp wallet; the fee recipient is credited the taker fee NET
+//     of the match's rebates, and `market_fee_total` grows by the same net amount. An
+//     execution-rule change (a node on 36 refuses a negative rate a node on 37 accepts, and pays
+//     no rebate), but only reachable once the admin raises `R`: with no negative rate anywhere every
+//     write is byte-identical. The golden scenario sets none, so its pin and BusinessSnapshot do
+//     not move.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 37;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
