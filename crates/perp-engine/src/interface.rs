@@ -794,7 +794,8 @@ sol! {
         ) external returns (bytes32 algoId);
 
         /// Cancel an untriggered conditional order. Once it has triggered it is an ordinary order —
-        /// cancel it with `cancelOrder`. There is no modify: Binance's Algo API has none either.
+        /// cancel it with `cancelOrder` (which, the other way round, refuses an untriggered one).
+        /// There is no modify: Binance's Algo API has none either.
         function cancelAlgoOrder(bytes32 algoId, uint64 marketId) external;
 
         /// Full record of an UNTRIGGERED conditional order (a triggered one is an ordinary order:
@@ -1058,6 +1059,10 @@ sol! {
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
+        /// The id of an UNTRIGGERED conditional order is refused (`order not cancellable`, also in
+        /// `cancelOrderSigned` and as a `batchCancelOrders` item): it is not in the book — cancel it
+        /// with `cancelAlgoOrder`. Once it has triggered, its id names an ordinary order and this
+        /// cancels it.
         function cancelOrder(bytes32 orderId, uint64 marketId) external;
         /// Cancel up to MAX_BATCH_CANCEL (256) open orders in one call (caller must be the owner of each).
         ///

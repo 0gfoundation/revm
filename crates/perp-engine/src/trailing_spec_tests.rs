@@ -47,6 +47,7 @@
 //!   anywhere, liquidation cancel-all, the signed path, STP inheritance, per-tick work vs N, the
 //!   decline-then-spike path and its garbage, and a seeded random differential run against an
 //!   O(N) per-order model written here from the formulas above ([`Model`]).
+//! * `fix_*` — regressions for the review findings on this series, each pinning its fix.
 //! * `bug_*` — a finding outside this spec, kept `#[ignore]`d (see its doc).
 
 use std::cell::RefCell;
@@ -61,7 +62,8 @@ use primitives::{address, hardfork::SpecId, keccak256, Address, FixedBytes, B256
 use crate::call::PerpOutput;
 use crate::host::{InMemoryHost, PerpHost};
 use crate::interface::IPerpDex::{
-    cancelAlgoOrderCall, drainDeferredWorkCall, getAlgoOrderCall, getAlgoOrderReturn,
+    batchCancelOrdersCall, cancelAlgoOrderCall, cancelOrderCall, cancelOrderSignedCall,
+    drainDeferredWorkCall, getAlgoOrderCall, getAlgoOrderReturn,
     getOpenAlgoOrdersCall, placeAlgoOrderCall, placeAlgoOrderSignedCall, placeOrderCall,
     registerApiKeyCall, updateIndexPriceCall, AlgoOrderActivated, AlgoOrderCancelled,
     AlgoOrderPlaced, AlgoOrderTriggered, Liquidation, OrderCancelled, OrderPlaced, Trade,
@@ -3134,6 +3136,117 @@ fn t_the_oldest_orders_leaving_frees_the_low_history_and_the_rest_stay_exact() {
     let fired = triggered(&h.inner.logs[l0..]);
     assert_eq!(ids_of(&fired), survivors);
     assert!(fired.iter().all(|t| (t.1, t.2) == (9_450, 9_450)));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// Review findings on this series — regressions
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+const E_CANCEL_CONDITIONAL: &str =
+    "cancelOrder: order not cancellable (an untriggered conditional order — use cancelAlgoOrder)";
+
+fn cancel_order_call(id: Id) -> Vec<u8> {
+    cancelOrderCall { orderId: id.into(), marketId: MARKET_ID }.abi_encode()
+}
+
+fn bid_level_count(ctx: &mut TestCtx, price: u64) -> u64 {
+    storage::load_bid_level_arc(ctx, MARKET_ID, price).unwrap().count
+}
+
+/// `cancelOrderSigned` for ALICE: the 102-byte message rebuilt from the ABI docs.
+fn signed_cancel(ctx: &mut TestCtx, id: Id) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"perpdex_v1_cancel");
+    msg.extend_from_slice(&ctx.chain_id().to_be_bytes());
+    msg.extend_from_slice(ALICE.as_slice());
+    msg.extend_from_slice(&id);
+    msg.extend_from_slice(&MARKET_ID.to_be_bytes());
+    msg.extend_from_slice(&SIGNED_TS.to_be_bytes());
+    msg.extend_from_slice(&SIGNED_RECV.to_be_bytes());
+    msg.push(1); // keyId
+    assert_eq!(msg.len(), 102);
+    cancelOrderSignedCall {
+        account: ALICE,
+        orderId: id.into(),
+        marketId: MARKET_ID,
+        timestamp: SIGNED_TS,
+        recvWindow: SIGNED_RECV,
+        keyId: 1,
+        signature: key().sign(&msg).to_bytes().to_vec().into(),
+    }
+    .abi_encode()
+}
+
+/// `cancelOrder` refuses the id of an UNTRIGGERED conditional order, on all three of its
+/// entrypoints, before any write. Such a record has status Open, so without the guard the
+/// book-cancel path ran on it: it lowered the live count of the REAL level at (side, price) —
+/// dropping the price from the index once it reached 0 — and only then failed on the missing
+/// per-user entry, after those writes, which commit-only #23 keeps. The record survived, so
+/// repeating the call let any account empty any level for one cancel per resting order.
+///
+/// BOB rests three bids of 1 at 9_900. ALICE, flat, holds a reduce-only limit STOP BUY at 9_900
+/// (trigger 10_100); then, short 1, an activated and a pending trailing BUY (whose records carry
+/// price 0, so the old path walked level 0). Every refusal is write-clean and log-clean and
+/// leaves the 9_900 level counting 3; in a batch each is a genuine `NotCancellable` (3) item
+/// next to an accepted one; the signed one is refused after its burn and is then a duplicate.
+/// Afterwards `cancelAlgoOrder` still cancels the stop, and ERIN's market SELL 3 fills all of
+/// BOB's bids.
+#[test]
+fn fix_cancel_order_refuses_an_untriggered_conditional_id() {
+    let mut ctx = fresh();
+    let bob: Vec<Id> = (0..3).map(|_| rest(&mut ctx, BOB, BUY, 9_900, 1)).collect();
+    let stop = place_algo(&mut ctx, ALICE, &algo_call(STOP, BUY, 10_100, 9_900, 1, GTC, RO)).0;
+    for _ in 0..3 {
+        rejected(&mut ctx, ALICE, &cancel_order_call(stop), E_CANCEL_CONDITIONAL);
+    }
+    // The owner check still answers first, as on `cancelAlgoOrder`.
+    rejected(&mut ctx, BOB, &cancel_order_call(stop), "cancelOrder: not owner");
+    assert_eq!(bid_level_count(&mut ctx, 9_900), 3);
+    assert_eq!(storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(), vec![9_900]);
+
+    seed_pos(&mut ctx, ALICE, -1, 1);
+    let act = trail(&mut ctx, ALICE, BUY, 0, 100, 1);
+    let pend = trail(&mut ctx, ALICE, BUY, 9_500, 100, 1);
+    for id in [act, pend] {
+        rejected(&mut ctx, ALICE, &cancel_order_call(id), E_CANCEL_CONDITIONAL);
+    }
+
+    // batchCancelOrders: three genuine rejects beside one accepted cancel of a real order.
+    let own = rest(&mut ctx, ALICE, BUY, 9_800, 1);
+    let c = ok(
+        &mut ctx,
+        ALICE,
+        &batchCancelOrdersCall { orderIds: vec![stop.into(), act.into(), pend.into(), own.into()] }
+            .abi_encode(),
+    );
+    let blob = batchCancelOrdersCall::abi_decode_returns(&c.out.bytes).unwrap();
+    let records: Vec<(u8, Id, u8)> =
+        blob.chunks(34).map(|r| (r[0], r[1..33].try_into().unwrap(), r[33])).collect();
+    assert_eq!(records, vec![(0, stop, 3), (0, act, 3), (0, pend, 3), (1, own, 0)]);
+    assert_eq!(book_cancels(&c.logs), vec![(own, R_USER)]);
+    assert!(algo_event_count(&c.logs) == 0);
+
+    // cancelOrderSigned: refused after the burn (the only writes), then a duplicate.
+    register_alice_key(&mut ctx);
+    let input = signed_cancel(&mut ctx, stop);
+    let _ = take_logs(&mut ctx);
+    let before = world(&mut ctx);
+    let w = ctx.perp_write_count();
+    let out = run_perp_dex_call(&input, GAS, DAVE, U256::ZERO, false, &mut ctx).unwrap();
+    assert_eq!(revert_reason(&out), E_CANCEL_CONDITIONAL);
+    assert!(ctx.perp_write_count() > w, "the signature was burned");
+    assert!(take_logs(&mut ctx).is_empty());
+    assert!(world(&mut ctx) == before, "only the seen-signature set moved");
+    rejected(&mut ctx, DAVE, &input, "cancelOrderSigned: duplicate signature (already submitted)");
+
+    assert_eq!(bid_level_count(&mut ctx, 9_900), 3);
+    assert_eq!(storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap(), vec![9_900]);
+    assert_eq!(open_algos(&mut ctx, ALICE), vec![stop, act, pend]);
+    let c = cancel_algo(&mut ctx, ALICE, stop);
+    assert_eq!(algo_cancels(&c.logs), vec![(stop, R_USER)]);
+    let c = take(&mut ctx, ERIN, SELL, 3);
+    assert_eq!(trades(&c.logs), bob.iter().map(|_| (ERIN, BOB, 9_900, 1)).collect::<Vec<_>>());
+    assert!(storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════

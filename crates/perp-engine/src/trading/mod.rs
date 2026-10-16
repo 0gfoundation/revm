@@ -2092,6 +2092,19 @@ fn cancel_order_core<H: PerpHost>(
     if order.owner != account.0 .0 {
         return Err(perp_err("cancelOrder: not owner"));
     }
+    // An UNTRIGGERED conditional order shares this id namespace and says `Open`, but it is in no
+    // book level and no per-user entry list — it lives only in a trigger index (or the trailing
+    // structure). The book-cancel path below would lower the live count of whatever REAL level
+    // sits at its (side, price), maybe drop that price from the index, and only then fail on the
+    // missing entry: after writes commit-only #23 keeps, with the record left behind to do it
+    // again. Refused here, as a pure read, the mirror of `cancelAlgoOrder`'s "already triggered"
+    // guard. Worded as "not cancellable" so a batch item reports `NotCancellable`.
+    if order.trigger_price != 0 {
+        return Err(perp_err(
+            "cancelOrder: order not cancellable (an untriggered conditional order — use \
+             cancelAlgoOrder)",
+        ));
+    }
     if !matches!(
         order.status,
         OrderStatus::Open | OrderStatus::PartiallyFilled
