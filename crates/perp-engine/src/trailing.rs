@@ -79,6 +79,10 @@
 //!    position-free crossings cannot eat the stop-loss and liquidation budget.
 //! 6. liquidations.
 //!
+//! On a DEACTIVATED market legs 3–5 are skipped (a fired order would be refused, and so spent):
+//! nothing fires or activates until the first tick after reactivation, which re-derives both from
+//! its own mark. Leg 1 still runs, so an activated stop trails the published mark through a pause.
+//!
 //! # Per-tick work bound (excluding `fire()` itself)
 //!
 //! `S` = live stack length of a side, `Pg = ⌈S/64⌉ + 1` its live pages.

@@ -566,6 +566,11 @@ sol! {
         /// Register a new perpetual market.
         function addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint64 initialMarkPrice, uint32 priceBandBps) external;
         /// Update mutable market parameters (tick/step/quantity/price limits, active flag, and funding config).
+        /// `active = false` refuses every new order; conditional orders then neither fire nor
+        /// activate (an activated trailing stop keeps tracking the published mark) and nothing is
+        /// spent — the first oracle tick after reactivation re-tests them all at its own mark, as
+        /// for any untriggered conditional (NOT latched). Oracle ticks, funding, the band GC and
+        /// liquidations keep running while inactive.
         /// baseDecimals and priceDecimals cannot be changed after creation.
         function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps) external;
         /// Read the current mark price for a market.

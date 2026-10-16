@@ -1399,25 +1399,45 @@ fn run_deferred_sweeps<H: PerpHost>(
     // Sharing one counter rather than giving triggers their own cap keeps the per-tick gas bound
     // a single number, so the argument for it does not have to be re-derived.
     let mut budget = MAX_SWEEP_ACTIONS_PER_UPDATE;
-    let trigger_deferred =
-        crate::algo::run_trigger_sweep(context, market_id, market, mark_price, &mut budget)?;
-    // Trailing fires share the pot, after the fixed triggers (no price-priority merge between the
-    // two: it would only matter on overflow, which the drain finishes at the same mark). A
-    // SEPARATE call, because the fixed sweep returns early when the budget runs out.
-    let trailing_deferred =
-        crate::trailing::run_fire_sweep(context, market_id, market, mark_price, &mut budget)?;
-    // Activations on their OWN cap: a crowd of crossing activation prices must not spend the
-    // budget stop-losses and liquidations need. A new activation cannot fire on the tick it
-    // activates (its peak is the mark), so running it after the fire walk changes no outcome.
-    let mut activation_cap = crate::trailing::MAX_TRAILING_ACTIVATIONS_PER_UPDATE;
-    let activation_deferred = crate::trailing::run_activation_sweep(
-        context,
-        market_id,
-        market,
-        seq,
-        mark_price,
-        &mut activation_cap,
-    )?;
+    // ── A DEACTIVATED market converts no conditional order ───────────────────────────────────
+    //
+    // `updateMarket(active = false)` stops every new order, and a fired conditional IS a new order:
+    // `place_order_core` would refuse it write-clean ("market not active"), and `fire` treats a
+    // refusal as an OUTCOME — the order would be SPENT (`TriggerRejected`) although nothing traded,
+    // so a pause would quietly destroy every stop-loss the next ticks crossed. So the three legs
+    // that turn a conditional into something else — fixed fires, trailing fires, trailing
+    // activations — wait for reactivation. The peaks (`on_mark` above) keep following the
+    // published mark, so an activated trailing stop trails through the pause.
+    //
+    // A skipped leg reports NO deferral: its work is not budget-bound, a drain could do nothing
+    // with it, and a set bit would spin a keeper's `while (drain())` for the whole pause. Nothing
+    // is lost by that either — none of these legs is latched, so the first tick after
+    // reactivation re-derives everything from its own mark (and an activation then starts its
+    // peak at that mark), exactly as for work a budget left undrained.
+    let (trigger_deferred, trailing_deferred, activation_deferred) = if market.active {
+        let trigger_deferred =
+            crate::algo::run_trigger_sweep(context, market_id, market, mark_price, &mut budget)?;
+        // Trailing fires share the pot, after the fixed triggers (no price-priority merge between
+        // the two: it would only matter on overflow, which the drain finishes at the same mark). A
+        // SEPARATE call, because the fixed sweep returns early when the budget runs out.
+        let trailing_deferred =
+            crate::trailing::run_fire_sweep(context, market_id, market, mark_price, &mut budget)?;
+        // Activations on their OWN cap: a crowd of crossing activation prices must not spend the
+        // budget stop-losses and liquidations need. A new activation cannot fire on the tick it
+        // activates (its peak is the mark), so running it after the fire walk changes no outcome.
+        let mut activation_cap = crate::trailing::MAX_TRAILING_ACTIVATIONS_PER_UPDATE;
+        let activation_deferred = crate::trailing::run_activation_sweep(
+            context,
+            market_id,
+            market,
+            seq,
+            mark_price,
+            &mut activation_cap,
+        )?;
+        (trigger_deferred, trailing_deferred, activation_deferred)
+    } else {
+        (false, false, false)
+    };
     let sweep_deferred =
         run_liquidation_sweep(context, market_id, market, mark_price, &mut budget)?;
     let deferred = gc_deferred

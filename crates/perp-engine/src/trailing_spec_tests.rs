@@ -47,8 +47,8 @@
 //!   anywhere, liquidation cancel-all, the signed path, STP inheritance, per-tick work vs N, the
 //!   decline-then-spike path and its garbage, and a seeded random differential run against an
 //!   O(N) per-order model written here from the formulas above ([`Model`]).
-//! * `fix_*` — regressions for the review findings on this series, each pinning its fix.
-//! * `bug_*` — a finding outside this spec, kept `#[ignore]`d (see its doc).
+//! * `fix_*` — regressions for the review findings on this series, each pinning its fix (one of
+//!   them replaces the `#[ignore]`d `bug_*` test this suite first kept for a finding outside it).
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -3314,49 +3314,71 @@ fn fix_a_mark_dependent_signed_refusal_burns_the_signature() {
     rejected(&mut ctx, DAVE, &bad, &reason);
 }
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════
-// ⚠️ A finding outside this spec, kept as a marked test (it fails in debug builds)
-// ═════════════════════════════════════════════════════════════════════════════════════════════
-
-/// ⚠️ BUG (pre-existing; fixed conditionals have it too, so it is not a trailing-stop defect):
-/// `risk::apply_index_price_update` runs `run_deferred_sweeps` whatever `Market.active` says, but
-/// `algo::fire` asserts `debug_assert!(market.active, "trigger sweep ran on an inactive market")`.
-/// So once a market is deactivated with `updateMarket(active = false)`, the next oracle tick
-/// that crosses any trigger PANICS a debug build (tests, a debug correctness-gate node). A release
-/// build skips the assert and carries on into `place_order_core`. Either the sweep should skip an
-/// inactive market or the assert is wrong — the spec does not say which, so this only pins "an
-/// oracle tick on a deactivated market does not panic".
-#[test]
-#[ignore = "BUG (pre-existing, outside this spec): a trigger on a deactivated market trips a debug_assert"]
-fn bug_an_oracle_tick_on_a_deactivated_market_does_not_panic() {
+fn update_market_active(ctx: &mut TestCtx, active: bool) {
     use crate::interface::IPerpDex::updateMarketCall;
-    for trailing in [true, false] {
-        let mut ctx = trail_fixture();
-        if trailing {
-            trail(&mut ctx, ALICE, SELL, 0, 100, 1);
-        } else {
-            place_algo(&mut ctx, ALICE, &ro_stop_call(SELL, 9_900, 1));
+    ok(
+        ctx,
+        ADMIN,
+        &updateMarketCall {
+            marketId: MARKET_ID,
+            tickSize: 1,
+            stepSize: 1,
+            minQuantity: 1,
+            maxQuantity: 1_000_000,
+            maxPrice: 1_000_000,
+            priceUpdateInterval: INTERVAL,
+            active,
+            fundingInterval: 0,
+            interestRate: 0,
+            liquidationFeeRateBps: 0,
+            priceBandBps: 0,
         }
-        ok(
-            &mut ctx,
-            ADMIN,
-            &updateMarketCall {
-                marketId: MARKET_ID,
-                tickSize: 1,
-                stepSize: 1,
-                minQuantity: 1,
-                maxQuantity: 1_000_000,
-                maxPrice: 1_000_000,
-                priceUpdateInterval: INTERVAL,
-                active: false,
-                fundingInterval: 0,
-                interestRate: 0,
-                liquidationFeeRateBps: 0,
-                priceBandBps: 0,
-            }
-            .abi_encode(),
-        );
-        // Stop 9_900 / trigger 9_900: this tick crosses it.
-        tick(&mut ctx, 9_900);
+        .abi_encode(),
+    );
+}
+
+/// A DEACTIVATED market converts no conditional order. The oracle sweep used to run its trigger
+/// legs whatever `Market.active` said: in a debug build the first crossing panicked on `fire`'s
+/// `debug_assert!(market.active)`; in a release build `place_order_core` refused the fired order
+/// ("market not active") and `fire` SPENT it as `TriggerRejected` (10) — a pause destroyed every
+/// stop the next ticks crossed, though nothing traded. (Kept `#[ignore]`d as
+/// `bug_an_oracle_tick_on_a_deactivated_market_does_not_panic` until this fix.)
+///
+/// ALICE (long 10) holds a reduce-only STOP_MARKET SELL 1 at 9_900, a SELL trailer activated now
+/// (b 100) and a pending one activating at 10_100; BOB bids 2 @ 9_900. Paused, the ticks go to
+/// 10_200 and then 9_900: that crosses the fixed stop, the activated trailer's stop (H 10_200 →
+/// ⌊10_098⌋) and the pending one's activation — and nothing fires, activates or is cancelled, no
+/// deferred work is flagged, and the activated trailer still trails (peak 10_200). Reactivated, the
+/// next tick at 9_900 fires the fixed stop and then the trailer into BOB's bid; the pending one is
+/// re-tested at 9_900 (below 10_100) and keeps waiting.
+#[test]
+fn fix_a_deactivated_market_fires_and_activates_nothing_until_reactivated() {
+    let mut ctx = trail_fixture();
+    let stop = place_algo(&mut ctx, ALICE, &ro_stop_call(SELL, 9_900, 1)).0;
+    let act = trail(&mut ctx, ALICE, SELL, 0, 100, 1);
+    let pend = trail(&mut ctx, ALICE, SELL, 10_100, 100, 1);
+    rest(&mut ctx, BOB, BUY, 9_900, 2);
+    update_market_active(&mut ctx, false);
+
+    for mark in [10_200, 9_900] {
+        let c = tick(&mut ctx, mark);
+        assert_eq!(algo_event_count(&c.logs), 0, "paused at {mark}");
+        assert!(placed(&c.logs).is_empty() && trades(&c.logs).is_empty());
+        assert!(!deferred(&mut ctx), "a skipped leg is not deferred work");
     }
+    let (more, c) = drain(&mut ctx);
+    assert!(!more && algo_event_count(&c.logs) == 0);
+    assert_eq!(open_algos(&mut ctx, ALICE), vec![stop, act, pend]);
+    assert_eq!(trail_state(&mut ctx, act), (true, 10_200, 10_098), "the peak follows the mark");
+    assert_eq!(trail_state(&mut ctx, pend), (false, 0, 0));
+    assert_eq!(amount(&mut ctx, ALICE), 10);
+
+    update_market_active(&mut ctx, true);
+    let c = tick(&mut ctx, 9_900);
+    assert_eq!(triggered(&c.logs), vec![(stop, 9_900, 9_900), (act, 10_098, 9_900)]);
+    assert!(algo_cancels(&c.logs).is_empty() && activations(&c.logs).is_empty());
+    assert_eq!(trades(&c.logs), vec![(ALICE, BOB, 9_900, 1), (ALICE, BOB, 9_900, 1)]);
+    assert_eq!(amount(&mut ctx, ALICE), 8);
+    assert_eq!(open_algos(&mut ctx, ALICE), vec![pend]);
+    assert_eq!(trail_state(&mut ctx, pend), (false, 0, 0));
 }
