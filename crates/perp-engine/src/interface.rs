@@ -460,6 +460,14 @@ sol! {
         /// is `getMaxMakerRebate()` AT THE TIME OF THIS CALL. There is no rule tying a maker rate
         /// to any taker rate.
         ///
+        /// A negative maker rate is a CEILING on the rebate, not a promise: each fill's rebate is
+        /// capped at that fill's share of the taker fee (see `Trade.makerFee`), so it is paid in
+        /// full only where the counterparty taker's rate covers it. That cap is the protocol's
+        /// solvency guarantee; fee schedules are expected to be designed so it rarely binds.
+        ///
+        /// New rates apply to orders that START RESTING afterwards: a resting order keeps the
+        /// maker rate it snapshotted, until it fills out or is cancelled.
+        ///
         /// Sub-accounts inherit their master's rates: setting a MASTER's rates also writes them to
         /// every one of its sub-accounts (one `UserFeeRatesUpdated` per account written, master
         /// first, then subs in index order), and setting a SUB's rates directly is rejected — set
@@ -468,7 +476,9 @@ sol! {
         /// Query per-user trading fee rates in ppm of notional (maker signed). Unset users default
         /// to zero.
         function getUserFeeRates(address user) external view returns (int64 makerFeePpm, uint64 takerFeePpm);
-        /// Query total trading fees collected for one market, NET of maker rebates.
+        /// Query total trading fees collected for one market, NET of maker rebates: it rises by
+        /// `Σ (Trade.takerFee + Trade.makerFee)` per match, exactly the fee recipient's intake,
+        /// and never falls.
         function getMarketFeeTotal(uint64 marketId) external view returns (uint64 totalFee);
         /// Set the maker-rebate bound `R`, in ppm: the most negative maker rate `setUserFeeRates`
         /// accepts is `−R`. Admin only; `R ≤ 10_000` (1%). Default 0 = rebates disabled.
@@ -1617,7 +1627,10 @@ sol! {
         /// * a **MAKER** whose resting order is filled: **one per FILL.** A maker order is consumed at
         ///   most once per taker sweep, so this is also one per maker order. The row is emitted inside
         ///   the match, immediately after that fill's `Trade` and immediately BEFORE that fill's
-        ///   `PositionChanged` (the `Trade` is outside the group).
+        ///   `PositionChanged` (the `Trade` is outside the group). A maker REBATE is already in this
+        ///   row: it is credited to the cross wallet (`totalCrossWalletBalance`, and so
+        ///   `totalWalletBalance`), never to the position's margin, so it shows in the header and not
+        ///   in the `PositionChanged` row.
         /// * a **TAKER**: **one per ORDER**, after the order has settled (so a batch of K crossing
         ///   items publishes K rows for the initiator, one per item). This INCLUDES the taker leg of
         ///   a liquidation close, which used to be suppressed: a liquidation is legitimately several
@@ -1630,7 +1643,9 @@ sol! {
         /// * **everything else** — deposit / withdraw / transferToPerp / transferFromPerp,
         ///   `setLeverage`, the fee recipient, and the settled end state after a multi-leg
         ///   liquidation — **one per user per transaction**, drained at the end of the call in
-        ///   ascending address order, always as a 0-position group.
+        ///   ascending address order, always as a 0-position group. The fee recipient's row
+        ///   reflects its NET intake: taker fees and maker commissions less the maker rebates
+        ///   they funded.
         ///
         /// A **SELF-TRADE emits BOTH** legs for the same address: the maker-leg row at the fill and
         /// the taker-leg row at the end of the order. The maker leg is deliberately not suppressed —
@@ -1699,6 +1714,8 @@ sol! {
             int64   totalWalletBalance,
             int64   totalCrossWalletBalance
         );
+        /// `setUserFeeRates`, one per account written (a master, then its subs): rates in ppm,
+        /// `makerFeePpm` signed (negative = a maker rebate rate).
         event UserFeeRatesUpdated(address indexed user, int64 makerFeePpm, uint64 takerFeePpm);
         /// `setMaxMakerRebate`: the new bound `R`, in ppm.
         event MaxMakerRebateUpdated(uint64 maxMakerRebatePpm);
@@ -1895,9 +1912,34 @@ sol! {
         // Feeds: /trades, /historicalTrades, /aggTrades, /klines, /ticker/24hr, /myTrades, and the
         //        `@order` stream's per-fill `o.rp`.
         // tradeId: global sequential counter for fromId pagination and firstId/lastId in 24hr ticker
-        // takerFee: USDC micro-units (6-decimal), this fill's share of the taker's ONE order fee
-        // makerFee: SIGNED USDC micro-units — > 0 the commission the maker paid, < 0 the maker
-        //           rebate it was credited (post-cap), 0 neither
+        //
+        // ── takerFee / makerFee — this fill's fees, in USDC micro-units (6-decimal) ─────────────
+        //
+        // takerFee (uint64): this fill's SHARE of the ONE taker fee the order pays. The taker is
+        //   charged once, on the order's summed notional, `F = floor(Σ n_i · t / 1e6)` (rates in
+        //   ppm); fill k's share is `floor(C_k·t/1e6) − floor(C_{k−1}·t/1e6)` with `C_k` the
+        //   running notional, so `Σ takerFee` over an order's fills is EXACTLY `F` — no N−1
+        //   rounding gap. 0 throughout a liquidation close (its taker fee is waived) and for a
+        //   0-fee taker.
+        //
+        // makerFee (int64, SIGNED):
+        //   * `> 0` — the commission a maker at a non-negative rate PAID for this fill;
+        //   * `< 0` — the REBATE a maker at a negative rate was CREDITED, post-cap:
+        //       `−makerFee = min(floor(n · |rate| / 1e6), takerFee)`
+        //     i.e. paid in full unless this fill's taker share is smaller. A 0-fee taker or a
+        //     liquidation close therefore pays its makers no rebate (makerFee 0), while a
+        //     positive-rate maker in the same match still pays.
+        //   The rate is the one the resting order SNAPSHOTTED when it started resting, not its
+        //   owner's current rate.
+        //
+        // FEE-RECIPIENT IDENTITY. Per match, the fee recipient's wallet credit and the rise in
+        // `getMarketFeeTotal` are both `Σ (takerFee + makerFee)` over the match's fills — never
+        // negative, since each rebate is at most its own fill's takerFee. The fee recipient is
+        // never debited for a rebate.
+        //
+        // ⚠️ makerFee was `uint64` until the rebate; widening it changed the event SIGNATURE and so
+        // `Trade`'s topic0. A decoder still filtering on the old signature does not fail — it
+        // silently receives no trades.
         //
         // ── takerRealizedPnl / makerRealizedPnl — the `@order` stream's `o.rp` ──────────────────
         //
