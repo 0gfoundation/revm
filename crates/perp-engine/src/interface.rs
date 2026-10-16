@@ -906,8 +906,10 @@ sol! {
         /// its owner's included. An IOC / market remainder that ran out of book after STP cancels
         /// expires with reason 0, not 9: STP did not stop it. A blocked match prints nothing — no
         /// `Trade`, fee, last-traded price or trade id — and a user whose only part in it is a
-        /// cancelled order gets no `AccountBalanceChanged` (Binance: cancelled orders push no
-        /// `ACCOUNT_UPDATE`).
+        /// cancelled order gets no `ORDER`-reason `AccountBalanceChanged` (Binance: cancelled
+        /// orders push no `ACCOUNT_UPDATE`). A funding payment realised when the walk first touches
+        /// that user still publishes its own `FundingSettled` group, including its `FUNDING_FEE`
+        /// `AccountBalanceChanged`.
         /// There is no per-order limit on STP cancels: each removes one of the caller's own open
         /// orders in this market, so the open-order cap above bounds them.
         /// The pre-walk affordability filter judges the FULL size, so when it applies (only when
@@ -1619,7 +1621,9 @@ sol! {
         /// that would make a maker's own notification conditional on who the counterparty turned out
         /// to be. Only a FOK taker can still self-trade: self-trade prevention cancels or stops
         /// every GTC / IOC / market taker at its own order, and a user whose only part in a match
-        /// is such a CANCELLED order (or a K9-cancelled one) gets no row at all — no money moved.
+        /// is such a CANCELLED order (or a K9-cancelled one) gets no `ORDER`-reason row — no money
+        /// moved. A funding payment realised when the walk first touches that user still publishes
+        /// its own `FundingSettled` group, including its `FUNDING_FEE` row.
         ///
         /// ⚠️ **Consumers must take the LAST row per user**, exactly as they already must for
         /// `PositionChanged`. A user can legitimately appear several times in one transaction, and a

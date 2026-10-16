@@ -251,8 +251,9 @@ impl OrderKind {
     }
 
     /// Does self-trade prevention apply when this order is the TAKER? (A resting order's own kind
-    /// is never consulted: STP is decided by the taker's mode alone, and a resting PostOnly or
-    /// FOK-born order is cancelled as a maker like any other.)
+    /// is never consulted: STP is decided by the taker's mode alone, and a resting order — a GTC
+    /// remainder, a PostOnly, or a fired conditional's rest — is cancelled as a maker like any
+    /// other, whatever its own kind or mode. A FOK never rests.)
     ///
     /// GTC, IOC and market orders: yes. FOK and PostOnly: no — Binance: "STP won't take effect"
     /// for them. A PostOnly taker never reaches the matcher anyway (it rejects on a cross), and a
