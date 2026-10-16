@@ -447,7 +447,7 @@ fn order_id_of(out: &PerpOutput) -> [u8; 32] {
 fn set_fees(
     ctx: &mut TestCtx,
     user: Address,
-    maker: u64,
+    maker: i64,
     taker: u64,
 ) -> (PerpOutput, Vec<primitives::Log>) {
     ok(
@@ -455,8 +455,8 @@ fn set_fees(
         ADMIN,
         &setUserFeeRatesCall {
             user,
-            makerFeeBps: maker,
-            takerFeeBps: taker,
+            makerFeePpm: maker,
+            takerFeePpm: taker,
         }
         .abi_encode(),
     )
@@ -579,9 +579,9 @@ fn nonce(ctx: &mut TestCtx, user: Address) -> u64 {
     storage::load_user_nonce(ctx, user).unwrap()
 }
 
-fn fees(ctx: &mut TestCtx, user: Address) -> (u64, u64) {
+fn fees(ctx: &mut TestCtx, user: Address) -> (i64, u64) {
     let r = storage::load_user_fee_rates(ctx, user).unwrap();
-    (r.maker_fee_bps, r.taker_fee_bps)
+    (r.maker_fee_ppm, r.taker_fee_ppm)
 }
 
 /// Spec §5 conservation: `Σ usdc_balance + Σ perp_wallet_balance` over `users`.
@@ -680,7 +680,7 @@ fn derivation_matches_the_spec_formula_and_independent_vectors() {
 #[test]
 fn create_assigns_sequential_derived_subs_copies_fees_and_stops_at_ten() {
     let mut ctx = ctx();
-    set_fees(&mut ctx, MA, 2, 5);
+    set_fees(&mut ctx, MA, 200, 500);
     for i in 0..MAX_SUB_ACCOUNTS {
         let name = format!("desk-{i}");
         let (out, logs) = ok(&mut ctx, MA, &create_input(&name));
@@ -706,8 +706,8 @@ fn create_assigns_sequential_derived_subs_copies_fees_and_stops_at_ten() {
             storage::load_account(&mut ctx, sub).unwrap(),
             UserAccount {
                 master: Some(MA),
-                maker_fee_bps: 2,
-                taker_fee_bps: 5,
+                maker_fee_ppm: 200,
+                taker_fee_ppm: 500,
                 ..UserAccount::default()
             },
             "#{i}"
@@ -717,8 +717,8 @@ fn create_assigns_sequential_derived_subs_copies_fees_and_stops_at_ten() {
     assert_eq!(
         storage::load_account(&mut ctx, MA).unwrap(),
         UserAccount {
-            maker_fee_bps: 2,
-            taker_fee_bps: 5,
+            maker_fee_ppm: 200,
+            taker_fee_ppm: 500,
             sub_count: 10,
             ..UserAccount::default()
         },
@@ -831,7 +831,7 @@ fn create_refuses_a_derived_address_that_already_has_keyed_engine_state() {
 #[test]
 fn create_adopts_a_gifted_spot_balance_as_the_new_subs_money() {
     let mut ctx = ctx();
-    set_fees(&mut ctx, MA, 2, 5);
+    set_fees(&mut ctx, MA, 200, 500);
     seed(&mut ctx, X, 5 * ONE_USDC, 0);
     ok(&mut ctx, X, &xfer(SA0, SPOT, SPOT, ONE_USDC));
     assert_eq!(spot(&mut ctx, SA0), ONE_USDC);
@@ -845,8 +845,8 @@ fn create_adopts_a_gifted_spot_balance_as_the_new_subs_money() {
         UserAccount {
             usdc_balance: U256::from(ONE_USDC).into(),
             master: Some(MA),
-            maker_fee_bps: 2,
-            taker_fee_bps: 5,
+            maker_fee_ppm: 200,
+            taker_fee_ppm: 500,
             ..UserAccount::default()
         },
         "the gift is the new sub's SPOT balance; everything else is a fresh sub"
@@ -869,18 +869,18 @@ fn create_adopts_a_gifted_spot_balance_as_the_new_subs_money() {
 #[test]
 fn create_overwrites_admin_fee_rates_preset_on_the_derived_address() {
     let mut ctx = ctx();
-    set_fees(&mut ctx, MA, 2, 5);
-    set_fees(&mut ctx, SA0, 1, 1);
+    set_fees(&mut ctx, MA, 200, 500);
+    set_fees(&mut ctx, SA0, 100, 100);
     assert_ne!(storage::load_account(&mut ctx, SA0).unwrap(), UserAccount::default());
 
     assert_eq!(create(&mut ctx, MA, "desk"), SA0);
-    assert_eq!(fees(&mut ctx, SA0), (2, 5), "the master's rates, not the preset");
+    assert_eq!(fees(&mut ctx, SA0), (200, 500), "the master's rates, not the preset");
     assert_eq!(
         storage::load_account(&mut ctx, SA0).unwrap(),
         UserAccount {
             master: Some(MA),
-            maker_fee_bps: 2,
-            taker_fee_bps: 5,
+            maker_fee_ppm: 200,
+            taker_fee_ppm: 500,
             ..UserAccount::default()
         }
     );
@@ -890,8 +890,8 @@ fn create_overwrites_admin_fee_rates_preset_on_the_derived_address() {
         ADMIN,
         &setUserFeeRatesCall {
             user: SA0,
-            makerFeeBps: 1,
-            takerFeeBps: 1,
+            makerFeePpm: 100,
+            takerFeePpm: 100,
         }
         .abi_encode(),
         E_FEE_SUB,
@@ -906,43 +906,43 @@ fn create_overwrites_admin_fee_rates_preset_on_the_derived_address() {
 #[test]
 fn fee_rates_are_copied_at_create_and_pushed_down_by_the_admin() {
     let mut ctx = ctx();
-    set_fees(&mut ctx, MA, 2, 5);
-    set_fees(&mut ctx, MB, 9, 9);
+    set_fees(&mut ctx, MA, 200, 500);
+    set_fees(&mut ctx, MB, 900, 900);
     for want in [SA0, SA1, SA2] {
         assert_eq!(create(&mut ctx, MA, "d"), want);
-        assert_eq!(fees(&mut ctx, want), (2, 5), "copied at create");
+        assert_eq!(fees(&mut ctx, want), (200, 500), "copied at create");
     }
     assert_eq!(create(&mut ctx, MB, "d"), SB0);
-    assert_eq!(fees(&mut ctx, SB0), (9, 9));
+    assert_eq!(fees(&mut ctx, SB0), (900, 900));
 
     // The push-down: one write + one event per family member, master first, subs in order.
-    let (out, logs) = set_fees(&mut ctx, MA, 3, 7);
+    let (out, logs) = set_fees(&mut ctx, MA, 300, 700);
     assert_eq!(out.gas_used, 80_000);
     assert_eq!(logs.len(), 4, "fee rates are not a balance: no AccountBalanceChanged");
     let rows: Vec<_> = decode_events::<UserFeeRatesUpdated>(&logs)
         .into_iter()
-        .map(|e| (e.user, e.makerFeeBps, e.takerFeeBps))
+        .map(|e| (e.user, e.makerFeePpm, e.takerFeePpm))
         .collect();
-    assert_eq!(rows, vec![(MA, 3, 7), (SA0, 3, 7), (SA1, 3, 7), (SA2, 3, 7)]);
+    assert_eq!(rows, vec![(MA, 300, 700), (SA0, 300, 700), (SA1, 300, 700), (SA2, 300, 700)]);
     for u in [MA, SA0, SA1, SA2] {
-        assert_eq!(fees(&mut ctx, u), (3, 7));
+        assert_eq!(fees(&mut ctx, u), (300, 700));
         let v = view(&mut ctx, &getUserFeeRatesCall { user: u }.abi_encode());
         let r = getUserFeeRatesCall::abi_decode_returns(&v.bytes).unwrap();
-        assert_eq!((r.makerFeeBps, r.takerFeeBps), (3, 7));
+        assert_eq!((r.makerFeePpm, r.takerFeePpm), (300, 700));
     }
     // The push-down touched only the fee fields: a sub's blob is still {master, rates}.
     assert_eq!(
         storage::load_account(&mut ctx, SA1).unwrap(),
         UserAccount {
             master: Some(MA),
-            maker_fee_bps: 3,
-            taker_fee_bps: 7,
+            maker_fee_ppm: 300,
+            taker_fee_ppm: 700,
             ..UserAccount::default()
         }
     );
     // The other family is not a member.
-    assert_eq!(fees(&mut ctx, MB), (9, 9));
-    assert_eq!(fees(&mut ctx, SB0), (9, 9));
+    assert_eq!(fees(&mut ctx, MB), (900, 900));
+    assert_eq!(fees(&mut ctx, SB0), (900, 900));
 
     // Setting a SUB directly is refused, write-free.
     for sub in [SA0, SA2, SB0] {
@@ -951,8 +951,8 @@ fn fee_rates_are_copied_at_create_and_pushed_down_by_the_admin() {
             ADMIN,
             &setUserFeeRatesCall {
                 user: sub,
-                makerFeeBps: 0,
-                takerFeeBps: 0,
+                makerFeePpm: 0,
+                takerFeePpm: 0,
             }
             .abi_encode(),
             E_FEE_SUB,
@@ -961,14 +961,14 @@ fn fee_rates_are_copied_at_create_and_pushed_down_by_the_admin() {
     // A sub created AFTER the push-down inherits the CURRENT rates.
     let sa3 = create(&mut ctx, MA, "late");
     assert_eq!(sa3, derive_sub_account(MA, 3));
-    assert_eq!(fees(&mut ctx, sa3), (3, 7));
+    assert_eq!(fees(&mut ctx, sa3), (300, 700));
     // An ordinary user: one write, one event — the pre-P1 behaviour.
-    let (_, logs) = set_fees(&mut ctx, X, 1, 1);
+    let (_, logs) = set_fees(&mut ctx, X, 100, 100);
     let rows: Vec<_> = decode_events::<UserFeeRatesUpdated>(&logs)
         .into_iter()
-        .map(|e| (e.user, e.makerFeeBps, e.takerFeeBps))
+        .map(|e| (e.user, e.makerFeePpm, e.takerFeePpm))
         .collect();
-    assert_eq!(rows, vec![(X, 1, 1)]);
+    assert_eq!(rows, vec![(X, 100, 100)]);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════

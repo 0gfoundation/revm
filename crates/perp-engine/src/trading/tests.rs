@@ -1680,8 +1680,8 @@ fn the_tripwire_still_bites_on_a_real_write_then_revert() {
         &mut ctx,
         ALICE,
         crate::types::UserFeeRates {
-            maker_fee_bps: 0,
-            taker_fee_bps: 100,
+            maker_fee_ppm: 0,
+            taker_fee_ppm: 10_000,
         },
     )
     .unwrap();
@@ -2273,8 +2273,8 @@ fn matched_call_publishes_one_snapshot_per_economic_event() {
         &mut ctx,
         BOB,
         UserFeeRates {
-            maker_fee_bps: 1,
-            taker_fee_bps: 0,
+            maker_fee_ppm: 100,
+            taker_fee_ppm: 0,
         },
     )
     .unwrap();
@@ -2442,8 +2442,8 @@ fn maker_open_fill_funds_its_fee_from_margin_needing_no_free_wallet() {
         &mut ctx,
         BOB,
         UserFeeRates {
-            maker_fee_bps: 200,
-            taker_fee_bps: 0,
+            maker_fee_ppm: 20_000,
+            taker_fee_ppm: 0,
         },
     )
     .unwrap();
@@ -2711,8 +2711,8 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
         &mut ctx,
         BOB,
         UserFeeRates {
-            maker_fee_bps: 200,
-            taker_fee_bps: 0,
+            maker_fee_ppm: 20_000,
+            taker_fee_ppm: 0,
         },
     )
     .unwrap();
@@ -2895,8 +2895,8 @@ fn market_fee_total_tracks_collected_maker_and_taker_fees() {
         &mut ctx,
         ALICE,
         UserFeeRates {
-            maker_fee_bps: 0,
-            taker_fee_bps: 100,
+            maker_fee_ppm: 0,
+            taker_fee_ppm: 10_000,
         },
     )
     .unwrap();
@@ -2904,8 +2904,8 @@ fn market_fee_total_tracks_collected_maker_and_taker_fees() {
         &mut ctx,
         BOB,
         UserFeeRates {
-            maker_fee_bps: 200,
-            taker_fee_bps: 0,
+            maker_fee_ppm: 20_000,
+            taker_fee_ppm: 0,
         },
     )
     .unwrap();
@@ -2933,8 +2933,8 @@ fn taker_open_fill_charges_fee_from_margin_not_on_top_of_the_wallet() {
         &mut ctx,
         ALICE,
         UserFeeRates {
-            maker_fee_bps: 0,
-            taker_fee_bps: 100,
+            maker_fee_ppm: 0,
+            taker_fee_ppm: 10_000,
         },
     )
     .unwrap();
@@ -2995,8 +2995,8 @@ fn a_position_naturally_below_its_own_initial_margin_survives_normally() {
         &mut ctx,
         ALICE,
         UserFeeRates {
-            maker_fee_bps: 0,
-            taker_fee_bps: 100,
+            maker_fee_ppm: 0,
+            taker_fee_ppm: 10_000,
         },
     )
     .unwrap();
@@ -3105,8 +3105,8 @@ fn maker_open_fill_charges_fee_from_margin_not_from_the_wallet() {
         &mut ctx,
         BOB,
         UserFeeRates {
-            maker_fee_bps: 200,
-            taker_fee_bps: 0,
+            maker_fee_ppm: 20_000,
+            taker_fee_ppm: 0,
         },
     )
     .unwrap();
@@ -3147,8 +3147,8 @@ fn pure_close_fill_charges_the_whole_fee_to_the_wallet() {
         &mut ctx,
         ALICE,
         UserFeeRates {
-            maker_fee_bps: 0,
-            taker_fee_bps: 100,
+            maker_fee_ppm: 0,
+            taker_fee_ppm: 10_000,
         },
     )
     .unwrap();
@@ -3188,8 +3188,8 @@ fn flip_fill_splits_the_fee_between_margin_and_wallet_without_underflow() {
         &mut ctx,
         ALICE,
         UserFeeRates {
-            maker_fee_bps: 0,
-            taker_fee_bps: 1_000, // 10% — the tightened ceiling
+            maker_fee_ppm: 0,
+            taker_fee_ppm: 100_000, // 10% — the tightened ceiling
         },
     )
     .unwrap();
@@ -3258,8 +3258,8 @@ fn placement_charges_no_wallet_and_cancel_restores_the_available_exactly() {
         &mut ctx,
         ALICE,
         UserFeeRates {
-            maker_fee_bps: 200,
-            taker_fee_bps: 0,
+            maker_fee_ppm: 20_000,
+            taker_fee_ppm: 0,
         },
     )
     .unwrap();
@@ -3606,8 +3606,8 @@ fn trade_apportions_taker_realized_pnl_by_telescoping_with_zero_residual() {
         &mut ctx,
         ALICE,
         UserFeeRates {
-            maker_fee_bps: 0,
-            taker_fee_bps: 10,
+            maker_fee_ppm: 0,
+            taker_fee_ppm: 1_000,
         },
     )
     .unwrap();
@@ -3616,8 +3616,8 @@ fn trade_apportions_taker_realized_pnl_by_telescoping_with_zero_residual() {
             &mut ctx,
             maker,
             UserFeeRates {
-                maker_fee_bps: 5,
-                taker_fee_bps: 0,
+                maker_fee_ppm: 500,
+                taker_fee_ppm: 0,
             },
         )
         .unwrap();
@@ -6933,7 +6933,15 @@ mod golden {
     /// read the field yet, and `BusinessSnapshot` is UNCHANGED. VERIFIED: with both fields
     /// `#[serde(skip)]` the scenario reproduced the previous pin 0x064ca8b4…8912 exactly.
     ///
-    /// Prior values 0x064ca8b4d053dc1def05f9991d75afd9dc52440890525c0a2efbc018382f8912,
+    /// Re-pinned for trading fees in ppm (`BLOCK_COMMITMENT_VERSION` 36 → 37). The scenario's
+    /// `setUserFeeRates` calls move from 2/5 bps to the same rates in ppm, 200/500, so every fee it
+    /// charges is the same integer (`floor(n·200/1e6) == floor(n·2/1e4)`). What moved is the bytes:
+    /// the account blobs and order-entry snapshots now carry 200/500 where they carried 2/5, and a
+    /// msgpack integer above 127 is wider than a fixint. Plus the version byte. The
+    /// `BusinessSnapshot` is UNCHANGED, field for field (asserted below).
+    ///
+    /// Prior values 0xc1379f42cc51db429ce10ab455e6daeb918a81bca8df7d210ae584768e631988 (36, STP),
+    /// 0x064ca8b4d053dc1def05f9991d75afd9dc52440890525c0a2efbc018382f8912,
     /// 0x2ffa38aefbdfa68307eb6869b95cb48d9828f407dce2924f2abd8ef5c5c0b88d,
     /// 0x8362c452406bbd6f048358985803964c672ad20444e3f362327114a403b7ebb8,
     /// 0x913b6760140fa04bdd42be6a6b63908f5d1d16430b96a1c8ce1b84b7612540ce,
@@ -6944,7 +6952,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xc1379f42cc51db429ce10ab455e6daeb918a81bca8df7d210ae584768e631988");
+        b256!("0x525fea15e0541c3a4441899ac1d7862a0fc5d2cb3dae2a933a6b3b5594d933ee");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -7466,8 +7474,8 @@ mod golden {
                 ADMIN,
                 &setUserFeeRatesCall {
                     user,
-                    makerFeeBps: 2,
-                    takerFeeBps: 5,
+                    makerFeePpm: 200,
+                    takerFeePpm: 500,
                 }
                 .abi_encode(),
             );
@@ -7477,8 +7485,8 @@ mod golden {
             BOB,
             &setUserFeeRatesCall {
                 user: BOB,
-                makerFeeBps: 0,
-                takerFeeBps: 0,
+                makerFeePpm: 0,
+                takerFeePpm: 0,
             }
             .abi_encode(),
             "not admin",
@@ -10556,8 +10564,8 @@ mod batch_place {
             ctx,
             ALICE,
             UserFeeRates {
-                maker_fee_bps: 0,
-                taker_fee_bps: 100,
+                maker_fee_ppm: 0,
+                taker_fee_ppm: 10_000,
             },
         )
         .unwrap();
@@ -15371,8 +15379,8 @@ mod account_snapshot_events {
             &mut ctx,
             CAROL,
             UserFeeRates {
-                maker_fee_bps: 10,
-                taker_fee_bps: 0,
+                maker_fee_ppm: 1_000,
+                taker_fee_ppm: 0,
             },
         )
         .unwrap();
@@ -15383,7 +15391,7 @@ mod account_snapshot_events {
         let admin_before = wallet(&mut ctx, ADMIN);
 
         let logs = crossing_order(&mut ctx, ALICE, 0, PRICE, QTY);
-        let fee = calc_trading_fee(FILL_VALUE, 10).unwrap();
+        let fee = calc_trading_fee(FILL_VALUE, 1_000).unwrap();
         assert!(fee > 0, "fixture: a real maker fee");
         assert_eq!(wallet(&mut ctx, ADMIN), admin_before + fee, "the fee is banked");
         assert!(
@@ -15403,7 +15411,7 @@ mod account_snapshot_events {
         let mut ctx = make_ctx();
         setup(&mut ctx);
         let fees = storage::load_user_fee_rates(&mut ctx, ALICE).unwrap();
-        assert_eq!((fees.maker_fee_bps, fees.taker_fee_bps), (0, 0), "fixture: no fees");
+        assert_eq!((fees.maker_fee_ppm, fees.taker_fee_ppm), (0, 0), "fixture: no fees");
         let account_before = storage::load_account(&mut ctx, ALICE).unwrap();
         place(&mut ctx, ALICE, 1, PRICE, QTY, 0, 0);
 
@@ -15470,15 +15478,15 @@ mod account_snapshot_events {
             &mut ctx,
             BOB,
             UserFeeRates {
-                maker_fee_bps: 10,
-                taker_fee_bps: 0,
+                maker_fee_ppm: 1_000,
+                taker_fee_ppm: 0,
             },
         )
         .unwrap();
         assert_eq!(
             storage::load_user_fee_rates(&mut ctx, ALICE)
                 .unwrap()
-                .taker_fee_bps,
+                .taker_fee_ppm,
             0,
             "fixture: the taker must pay no fee, or the drain row is not attributable"
         );
@@ -15556,8 +15564,8 @@ mod account_snapshot_events {
                 &mut ctx,
                 BOB,
                 UserFeeRates {
-                    maker_fee_bps: 1,
-                    taker_fee_bps: 0,
+                    maker_fee_ppm: 100,
+                    taker_fee_ppm: 0,
                 },
             )
             .unwrap();
@@ -15829,8 +15837,8 @@ mod position_changed_derived_fields {
                 &mut ctx,
                 user,
                 UserFeeRates {
-                    maker_fee_bps: 2,
-                    taker_fee_bps: 5,
+                    maker_fee_ppm: 200,
+                    taker_fee_ppm: 500,
                 },
             )
             .unwrap();
@@ -16012,8 +16020,8 @@ mod position_changed_derived_fields {
                 &mut ctx,
                 user,
                 UserFeeRates {
-                    maker_fee_bps: 5,
-                    taker_fee_bps: 10,
+                    maker_fee_ppm: 500,
+                    taker_fee_ppm: 1_000,
                 },
             )
             .unwrap();
@@ -16191,8 +16199,8 @@ mod position_changed_derived_fields {
                 &mut ctx,
                 user,
                 UserFeeRates {
-                    maker_fee_bps: 2,
-                    taker_fee_bps: 5,
+                    maker_fee_ppm: 200,
+                    taker_fee_ppm: 500,
                 },
             )
             .unwrap();
@@ -18448,7 +18456,7 @@ mod stp_matching {
                     storage::save_user_fee_rates(
                         &mut ctx,
                         who,
-                        UserFeeRates { maker_fee_bps: 10, taker_fee_bps: 10 },
+                        UserFeeRates { maker_fee_ppm: 1_000, taker_fee_ppm: 1_000 },
                     )
                     .unwrap();
                 }

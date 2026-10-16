@@ -8,14 +8,18 @@ use crate::{
     interface::IPerpDex::{
         self, getUserFeeRatesCall, getUserFeeRatesReturn, setUserFeeRatesCall,
     },
-    math::MAX_USER_FEE_BPS,
+    math::MAX_FEE_PPM,
     storage,
     types::{derive_sub_account, UserFeeRates},
     PERP_DEX_ADDRESS,
     PerpError,
 };
 
-/// `setUserFeeRates(address user, uint64 makerFeeBps, uint64 takerFeeBps)` — admin only.
+/// `setUserFeeRates(address user, int64 makerFeePpm, uint64 takerFeePpm)` — admin only.
+///
+/// Rates are in ppm of notional (`math::FEE_PPM_DENOMINATOR`), each bounded by
+/// [`MAX_FEE_PPM`]. The maker rate is signed but must still be `≥ 0`: maker rebates are not
+/// settled yet, so a negative rate is refused rather than accepted and silently charged as zero.
 ///
 /// Sub-accounts carry their master's rates (copied at `createSubAccount`), and this is what keeps
 /// them in step: a SUB is refused outright ("set the master's rates" — a sub priced differently
@@ -35,8 +39,14 @@ pub fn run_set_user_fee_rates<H: PerpHost>(
     if args.user == Address::ZERO {
         return Err(perp_err("setUserFeeRates: user cannot be zero address"));
     }
-    if args.makerFeeBps > MAX_USER_FEE_BPS || args.takerFeeBps > MAX_USER_FEE_BPS {
-        return Err(perp_err("setUserFeeRates: fee bps exceeds 1000 (10%)"));
+    if args.takerFeePpm > MAX_FEE_PPM {
+        return Err(perp_err("setUserFeeRates: taker fee exceeds 100000 ppm (10%)"));
+    }
+    if args.makerFeePpm > MAX_FEE_PPM as i64 {
+        return Err(perp_err("setUserFeeRates: maker fee exceeds 100000 ppm (10%)"));
+    }
+    if args.makerFeePpm < 0 {
+        return Err(perp_err("setUserFeeRates: negative maker fee (maker rebates not enabled)"));
     }
 
     let sub_count = {
@@ -50,8 +60,8 @@ pub fn run_set_user_fee_rates<H: PerpHost>(
     };
 
     let rates = UserFeeRates {
-        maker_fee_bps: args.makerFeeBps,
-        taker_fee_bps: args.takerFeeBps,
+        maker_fee_ppm: args.makerFeePpm,
+        taker_fee_ppm: args.takerFeePpm,
     };
     // The master, then its subs (0 for an ordinary user) — the push-down.
     let family =
@@ -62,8 +72,8 @@ pub fn run_set_user_fee_rates<H: PerpHost>(
             address: PERP_DEX_ADDRESS,
             data: IPerpDex::UserFeeRatesUpdated {
                 user,
-                makerFeeBps: rates.maker_fee_bps,
-                takerFeeBps: rates.taker_fee_bps,
+                makerFeePpm: rates.maker_fee_ppm,
+                takerFeePpm: rates.taker_fee_ppm,
             }
             .to_log_data(),
         });
@@ -81,8 +91,8 @@ pub fn run_get_user_fee_rates<H: PerpHost>(
     let rates = storage::load_user_fee_rates(context, args.user)?;
     Ok(Bytes::from(getUserFeeRatesCall::abi_encode_returns(
         &getUserFeeRatesReturn {
-            makerFeeBps: rates.maker_fee_bps,
-            takerFeeBps: rates.taker_fee_bps,
+            makerFeePpm: rates.maker_fee_ppm,
+            takerFeePpm: rates.taker_fee_ppm,
         },
     )))
 }

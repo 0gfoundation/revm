@@ -3096,7 +3096,7 @@ fn rest_in_book<H: PerpHost>(
     // The FEE RATE is read from the store on BOTH paths, deliberately: it is not a settlement
     // output. Only `setUserFeeRates` moves it, the flush cannot, so the pre-barrier read is the same
     // integer the post-barrier one would give.
-    let maker_fee_bps = storage::load_account_ref(context, user)?.maker_fee_bps;
+    let maker_fee_ppm = storage::load_account_ref(context, user)?.maker_fee_ppm;
     let (pos_basis, wallet, cover_cancelled) = match basis {
         Some(b) => (b.pos, b.wallet, b.cover_cancelled),
         None => (
@@ -3216,7 +3216,7 @@ fn rest_in_book<H: PerpHost>(
         order_id: *order_id,
         price,
         amount: qty,
-        maker_fee_bps,
+        maker_fee_ppm,
         assuming_price,
         reduce_only: flags.reduce_only,
         stp: flags.stp,

@@ -174,16 +174,16 @@ pub struct UserAccount {
     pub perp_wallet_balance: i64,
 
     // ── Folded per-user scalars (were separate off-trie keys) ──────────────────
-    // Maker/taker fee bps + the order-id nonce are per-USER (like the account) and are read
+    // Maker/taker fee rates + the order-id nonce are per-USER (like the account) and are read
     // TOGETHER with the account on the hot placement path, so they ride in the account blob — one
     // probe/decode instead of three. Appended positionally (`#[serde(default)]` so a shorter blob
     // still decodes); read via `load_account_ref` (Arc, no usdc_balance String clone).
-    /// Maker fee in basis points (order-entry fee rate).
+    /// Maker fee rate in ppm of notional, SIGNED (snapshotted onto each resting order's entry).
     #[serde(rename = "MF", default)]
-    pub maker_fee_bps: u64,
-    /// Taker fee in basis points.
+    pub maker_fee_ppm: i64,
+    /// Taker fee rate in ppm of notional.
     #[serde(rename = "TF", default)]
-    pub taker_fee_bps: u64,
+    pub taker_fee_ppm: u64,
     /// Monotonic per-user nonce used to derive order ids (`keccak(account ‖ nonce)`).
     #[serde(rename = "NO", default)]
     pub nonce: u64,
@@ -283,8 +283,8 @@ impl Default for UserAccount {
         Self {
             usdc_balance: "0".into(),
             perp_wallet_balance: 0,
-            maker_fee_bps: 0,
-            taker_fee_bps: 0,
+            maker_fee_ppm: 0,
+            taker_fee_ppm: 0,
             nonce: 0,
             total_position_margin: 0,
             master: None,

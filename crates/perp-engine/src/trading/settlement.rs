@@ -7,7 +7,7 @@ use crate::{
         errors::{perp_err, perp_invariant_err},
     interface::IPerpDex,
     math::{
-        calc_maker_fee_for_order_qty_with_bps, calc_trading_fee,
+        calc_maker_fee_for_order_qty, calc_trading_fee,
         calc_value, calc_value_i64, checked_u64_to_i64, is_above_maintenance_margin,
         max_leverage_for_notional,
     },
@@ -32,7 +32,7 @@ pub(super) struct TakerSettlement {
     user: Address,
     market_id: u64,
     fills: Vec<RecordedFill>,
-    taker_fee_bps: u64,
+    taker_fee_ppm: u64,
     /// `C_k`: the summed notional `Σ calc_value(price_j, qty_j)` of the fills recorded so far —
     /// the running total [`Self::fee_share_of_next_fill`] differences against. After the last
     /// fill it is exactly the `fee_notional` [`finalize_core`] charges the ONE taker fee on (both
@@ -80,10 +80,10 @@ impl TakerSettlement {
             // user is already charged the liquidation clearance fee (to the IF). This
             // also keeps the close from reverting on `ensure_taker_wallet_can_cover_margin`
             // when the underwater user has no free wallet to cover a taker fee.
-            taker_fee_bps: if waive_taker_fee {
+            taker_fee_ppm: if waive_taker_fee {
                 0
             } else {
-                rates.taker_fee_bps
+                rates.taker_fee_ppm
             },
             fee_notional: 0,
         })
@@ -114,8 +114,8 @@ impl TakerSettlement {
             .fee_notional
             .checked_add(fill_notional)
             .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
-        calc_trading_fee(next, self.taker_fee_bps)?
-            .checked_sub(calc_trading_fee(self.fee_notional, self.taker_fee_bps)?)
+        calc_trading_fee(next, self.taker_fee_ppm)?
+            .checked_sub(calc_trading_fee(self.fee_notional, self.taker_fee_ppm)?)
             .ok_or_else(|| perp_invariant_err("taker fee share: cumulative floor decreased"))
     }
 
@@ -281,7 +281,7 @@ impl TakerSettlement {
             &mut self.fills,
             taker_side,
             mark,
-            self.taker_fee_bps,
+            self.taker_fee_ppm,
             market,
         )?;
 
@@ -1535,7 +1535,7 @@ fn finalize_core(
     fills: &mut [RecordedFill],
     taker_side: Side,
     mark_price: u64,
-    taker_fee_bps: u64,
+    taker_fee_ppm: u64,
     market: &crate::types::Market,
 ) -> Result<TakerFillCore, PerpError> {
     let mut remaining_closing_qty = pos.amount.unsigned_abs();
@@ -1712,7 +1712,7 @@ fn finalize_core(
     let fee_notional = closing_value
         .checked_add(opening_value)
         .ok_or_else(|| perp_err("placeOrder: taker fee notional overflow"))?;
-    let fee = calc_trading_fee(fee_notional, taker_fee_bps)?;
+    let fee = calc_trading_fee(fee_notional, taker_fee_ppm)?;
     // The per-fill shares `Trade.takerFee` reports (`TakerSettlement::fee_share_of_next_fill`) were
     // fixed during the walk, before this fee existed; they must TELESCOPE to it with no residual.
     // Same placement, and the same reasoning, as the realized-PnL assertion above.
@@ -2624,17 +2624,22 @@ fn entry_fill_plan(
             "{side_label} entry for order {order_id:?} not found during fill update"
         ))
     })?;
-    let (e_price, e_amount, e_fee_bps) =
-        (entries[idx].price, entries[idx].amount, entries[idx].maker_fee_bps);
+    let (e_price, e_amount, e_fee_ppm) =
+        (entries[idx].price, entries[idx].amount, entries[idx].maker_fee_ppm);
     if e_amount < fill_qty {
         return Err(perp_invariant_err(format!(
             "{side_label} entry for order {order_id:?} has insufficient amount during fill update"
         )));
     }
-    let old_order_fee = calc_maker_fee_for_order_qty_with_bps(e_price, e_amount, e_fee_bps, market)?;
+    // `setUserFeeRates` refuses a negative maker rate, so no entry can snapshot one.
+    let e_fee_ppm = u64::try_from(e_fee_ppm).map_err(|_| {
+        perp_invariant_err(format!(
+            "{side_label} entry for order {order_id:?} carries a negative maker fee rate"
+        ))
+    })?;
+    let old_order_fee = calc_maker_fee_for_order_qty(e_price, e_amount, e_fee_ppm, market)?;
     let new_amount = e_amount.saturating_sub(fill_qty);
-    let new_order_fee =
-        calc_maker_fee_for_order_qty_with_bps(e_price, new_amount, e_fee_bps, market)?;
+    let new_order_fee = calc_maker_fee_for_order_qty(e_price, new_amount, e_fee_ppm, market)?;
     Ok((idx, new_amount, old_order_fee.saturating_sub(new_order_fee)))
 }
 

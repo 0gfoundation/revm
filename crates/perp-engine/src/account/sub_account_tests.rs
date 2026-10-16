@@ -194,10 +194,10 @@ fn get_subs(ctx: &mut TestCtx, master: Address) -> Vec<Address> {
     getSubAccountsCall::abi_decode_returns(&out.bytes).unwrap()
 }
 
-fn fee_rates(ctx: &mut TestCtx, user: Address) -> (u64, u64) {
+fn fee_rates(ctx: &mut TestCtx, user: Address) -> (i64, u64) {
     let out = ok(ctx, OTHER, &getUserFeeRatesCall { user }.abi_encode());
     let r = getUserFeeRatesCall::abi_decode_returns(&out.bytes).unwrap();
-    (r.makerFeeBps, r.takerFeeBps)
+    (r.makerFeePpm, r.takerFeePpm)
 }
 
 // ── createSubAccount ──────────────────────────────────────────────────────────
@@ -318,22 +318,22 @@ fn fee_rates_are_copied_at_creation_and_pushed_down_by_the_admin() {
     let set = |user, m, t| {
         setUserFeeRatesCall {
             user,
-            makerFeeBps: m,
-            takerFeeBps: t,
+            makerFeePpm: m,
+            takerFeePpm: t,
         }
         .abi_encode()
     };
 
-    ok(&mut ctx, ADMIN, &set(MASTER, 2, 5));
+    ok(&mut ctx, ADMIN, &set(MASTER, 200, 500));
     let sub0 = create(&mut ctx, MASTER, "a");
-    assert_eq!(fee_rates(&mut ctx, sub0), (2, 5), "copied from the master at creation");
+    assert_eq!(fee_rates(&mut ctx, sub0), (200, 500), "copied from the master at creation");
     let sub1 = create(&mut ctx, MASTER, "b");
     let _ = JournalTr::take_logs(ctx.journal_mut());
 
-    let out = ok(&mut ctx, ADMIN, &set(MASTER, 3, 7));
+    let out = ok(&mut ctx, ADMIN, &set(MASTER, 300, 700));
     assert_eq!(out.gas_used, 80_000);
     for u in [MASTER, sub0, sub1] {
-        assert_eq!(fee_rates(&mut ctx, u), (3, 7), "{u}");
+        assert_eq!(fee_rates(&mut ctx, u), (300, 700), "{u}");
     }
     let updated: Vec<Address> = JournalTr::take_logs(ctx.journal_mut())
         .iter()
@@ -343,7 +343,7 @@ fn fee_rates_are_copied_at_creation_and_pushed_down_by_the_admin() {
     assert_eq!(updated, vec![MASTER, sub0, sub1], "one event per account written, in order");
 
     rejects(&mut ctx, ADMIN, &set(sub0, 0, 0), "is a sub-account; set its master's rates");
-    assert_eq!(fee_rates(&mut ctx, sub0), (3, 7));
+    assert_eq!(fee_rates(&mut ctx, sub0), (300, 700));
 }
 
 // ── asSubAccount ──────────────────────────────────────────────────────────────
@@ -771,7 +771,7 @@ mod mutation_killers {
                     order_id: [0x5a; 32],
                     price: PRICE,
                     amount: QTY,
-                    maker_fee_bps: 0,
+                    maker_fee_ppm: 0,
                     assuming_price: 0,
                     reduce_only: false,
                     stp: Default::default(),

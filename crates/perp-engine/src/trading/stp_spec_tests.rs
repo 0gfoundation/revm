@@ -438,14 +438,14 @@ fn rest(ctx: &mut TestCtx, user: Address, side: u8, price: u64, qty: u64) -> [u8
     rest_with(ctx, user, side, price, qty, GTC, 0)
 }
 
-fn set_fees(ctx: &mut TestCtx, user: Address, maker_bps: u64, taker_bps: u64) {
+fn set_fees(ctx: &mut TestCtx, user: Address, maker_ppm: i64, taker_ppm: u64) {
     ok(
         ctx,
         ADMIN,
         &setUserFeeRatesCall {
             user,
-            makerFeeBps: maker_bps,
-            takerFeeBps: taker_bps,
+            makerFeePpm: maker_ppm,
+            takerFeePpm: taker_ppm,
         }
         .abi_encode(),
     );
@@ -1515,13 +1515,13 @@ fn t10_fok_still_self_trades_under_every_mode() {
     for d in DIRS {
         for mode in MODES {
             let mut ctx = fresh();
-            set_fees(&mut ctx, ALICE, 2, 5);
+            set_fees(&mut ctx, ALICE, 200, 500);
             let ids = book(&mut ctx, d, &[&[(ALICE, 2)]]);
             let fees0 = fee_total(&mut ctx);
             let (_, logs) = ok(&mut ctx, ALICE, &limit(d.taker(), d.lvl(0), 2, FOK, mode));
             assert_eq!(trades(&logs), vec![(ALICE, ALICE, d.lvl(0), 2)], "{d:?} {mode:#06b}");
             let tr = &evs::<Trade>(&logs)[0];
-            // 2 × $100 = 200_000_000; taker 5 bps, maker 2 bps.
+            // 2 × $100 = 200_000_000; taker 500 ppm (5 bps), maker 200 ppm (2 bps).
             assert_eq!((tr.takerFee, tr.makerFee), (100_000, 40_000));
             assert_eq!(fee_total(&mut ctx) - fees0, 140_000);
             assert!(cancels(&logs).is_empty());
@@ -1597,7 +1597,7 @@ fn t17_a_prevented_match_moves_no_last_traded_fee_or_trade_id() {
                 let tag = format!("{d:?} {mode:#06b} {kind:?}");
                 let mut ctx = fresh();
                 for u in [ALICE, BOB, CAROL, DAVE] {
-                    set_fees(&mut ctx, u, 2, 5);
+                    set_fees(&mut ctx, u, 200, 500);
                 }
                 // One real print: trade id 0, last_traded = lvl(0).
                 rest(&mut ctx, BOB, d.maker(), d.lvl(0), 1);

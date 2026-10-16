@@ -250,7 +250,20 @@ use primitives::{B256, U256};
 //     unchanged. An execution-rule change: a node on 35 self-trades where a node on 36 cancels or
 //     expires. The golden scenario has no same-address cross, so its write set, pin and
 //     BusinessSnapshot are unchanged.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 36;
+// ── 37 ───────────────────────────────────────────────────────────────────────────────────
+// Trading fees in ppm, and the maker rebate. ONE bump covers the series; each commit adds its line.
+//   * Trading-fee rates move from basis points to PARTS PER MILLION (`math::FEE_PPM_DENOMINATOR`),
+//     and the maker rate becomes SIGNED: `UserAccount` "MF" and `OrderEntry`'s snapshot (renamed
+//     "MFB" → "MFP" — positional msgpack, so the name is not on the wire) are `i64`, "TF" stays
+//     `u64`. A LAYOUT change by VALUE, not by shape: a non-negative `i64` encodes exactly like the
+//     `u64` it was, but every stored non-zero rate is now 100× larger, so its msgpack integer can
+//     widen (2 bps = fixint `0x02` → 200 ppm = `0xcc 0xc8`). Positive-rate arithmetic is
+//     byte-identical — `floor(n·100r / 1e6) == floor(n·r / 1e4)` — so no fee, balance or fee total
+//     moves. Negative maker rates are still refused (the rebate lands with its settlement). The
+//     golden scenario's rates are rescaled ×100 (2/5 bps → 200/500 ppm); its account and order-entry
+//     blobs widen, and its BusinessSnapshot is UNCHANGED, field for field. CHAIN change: golden
+//     re-pin + a coordinated wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 37;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

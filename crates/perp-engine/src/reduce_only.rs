@@ -382,7 +382,7 @@ mod tests {
             order_id: [0u8; 32],
             price,
             amount,
-            maker_fee_bps: 0,
+            maker_fee_ppm: 0,
             assuming_price: price,
             reduce_only,
             stp: Default::default(),

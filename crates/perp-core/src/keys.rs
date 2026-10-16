@@ -22,7 +22,7 @@ use primitives::{keccak256, Address, B256};
 
 // ── Key-family prefixes (4-byte, ASCII, must be pairwise distinct) ─────────────
 const PFX_ADMIN: [u8; 4] = *b"admn";
-const PFX_ACCOUNT: [u8; 4] = *b"acct"; // per-user account (balance + folded fee bps + order nonce)
+const PFX_ACCOUNT: [u8; 4] = *b"acct"; // per-user account (balance + folded fee rates + order nonce)
 const PFX_MARKET_FEE_TOTAL: [u8; 4] = *b"mfee"; // per-market collected trading fee total
 const PFX_TRADE_COUNT: [u8; 4] = *b"tcnt"; // per-market sequential trade ID counter
 const PFX_POSITION: [u8; 4] = *b"pos\x00";

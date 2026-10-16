@@ -185,7 +185,7 @@ pub fn run_create_sub_account<H: PerpHost>(
         )));
     }
 
-    let (index, maker_fee_bps, taker_fee_bps) = {
+    let (index, maker_fee_ppm, taker_fee_ppm) = {
         let me = storage::load_account_ref(context, caller)?;
         if me.master.is_some() {
             return Err(perp_err(
@@ -197,7 +197,7 @@ pub fn run_create_sub_account<H: PerpHost>(
                 "createSubAccount: sub-account limit reached (max {MAX_SUB_ACCOUNTS})"
             )));
         }
-        (me.sub_count, me.maker_fee_bps, me.taker_fee_bps)
+        (me.sub_count, me.maker_fee_ppm, me.taker_fee_ppm)
     };
     let sub = derive_sub_account(caller, index);
     ensure_derived_address_unclaimed(context, sub)?;
@@ -209,8 +209,8 @@ pub fn run_create_sub_account<H: PerpHost>(
     storage::mutate_account(context, sub, |a| {
         a.master = Some(caller);
         // Fee rates are inherited at birth and kept in step by `setUserFeeRates`' push-down.
-        a.maker_fee_bps = maker_fee_bps;
-        a.taker_fee_bps = taker_fee_bps;
+        a.maker_fee_ppm = maker_fee_ppm;
+        a.taker_fee_ppm = taker_fee_ppm;
     })?;
     storage::mutate_account(context, caller, |a| a.sub_count = index + 1)?;
 
@@ -242,7 +242,7 @@ pub fn run_create_sub_account<H: PerpHost>(
 ///   sub's money, i.e. the master's. The consequence, documented on the ABI: a sub can be BORN
 ///   holding third-party money — the "no third party → sub" transfer rule binds only once the sub
 ///   exists, and the external path cannot tell a future sub from any other address (one-way hash).
-/// * **`maker_fee_bps` / `taker_fee_bps`.** Admin-settable on any non-sub address, and overwritten
+/// * **`maker_fee_ppm` / `taker_fee_ppm`.** Admin-settable on any non-sub address, and overwritten
 ///   by the inherited rates below anyway.
 ///
 /// Everything else on the account — a balance in the perp wallet or a silo, a nonce, a family link —

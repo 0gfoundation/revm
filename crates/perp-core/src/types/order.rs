@@ -550,9 +550,11 @@ pub struct OrderEntry {
     pub price: u64,
     /// Remaining (unfilled) amount tracked for margin purposes.
     pub amount: u64,
-    /// Maker fee rate snapshotted when the order started resting.
-    #[serde(default, rename = "MFB")]
-    pub maker_fee_bps: u64,
+    /// The owner's maker fee rate (ppm, signed) snapshotted when the order started resting. A fill
+    /// is charged — or rebated — at THIS rate, not the owner's current one, for as long as the
+    /// order rests.
+    #[serde(default, rename = "MFP")]
+    pub maker_fee_ppm: i64,
     /// The order's **Assuming Price**, FROZEN at the instant it was placed — the price this entry's
     /// contribution to its side's margin aggregate (`Bid`/`Ask`) is valued at for as long as it
     /// rests. ONE rule covers both sides:
@@ -811,7 +813,7 @@ mod stp_mode_tests {
             order_id: [9u8; 32],
             price: 100,
             amount: 5,
-            maker_fee_bps: 2,
+            maker_fee_ppm: 200,
             assuming_price: 101,
             reduce_only: false,
             stp: StpMode::ExpireTaker,

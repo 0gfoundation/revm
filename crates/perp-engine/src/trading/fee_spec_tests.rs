@@ -1,5 +1,6 @@
-//! **Trading-fee accounting through the full call shell**: how the ONE taker fee an order pays is
-//! attributed to its individual fills (`Trade.takerFee`).
+//! **Trading fees through the full call shell**: the rate surface (`setUserFeeRates` in ppm, its
+//! bounds and events) and how the ONE taker fee an order pays is attributed to its individual
+//! fills (`Trade.takerFee`).
 //!
 //! Every call goes through `run_perp_dex_call`, so the gas charge, the commit-only #23 tripwire, the
 //! debug event guards in `crate::events` and the end-of-call `AccountBalanceChanged` drain are all in
@@ -18,7 +19,10 @@ use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, Address, FixedBytes, U256};
 
 use crate::call::PerpOutput;
-use crate::interface::IPerpDex::{placeOrderCall, setUserFeeRatesCall, Trade};
+use crate::host::PerpHost;
+use crate::interface::IPerpDex::{
+    getUserFeeRatesCall, placeOrderCall, setUserFeeRatesCall, Trade, UserFeeRatesUpdated,
+};
 use crate::types::{AccountUpdateReason, MarginTiers, Market};
 use crate::{run_perp_dex_call, storage, PERP_DEX_ADDRESS, USDC_ADDRESS};
 
@@ -119,6 +123,17 @@ fn ok(ctx: &mut TestCtx, caller: Address, input: &[u8]) -> (PerpOutput, Vec<prim
     (out, logs)
 }
 
+/// A REJECTED shell call: the exact reason, no perp write, no log.
+fn rejected(ctx: &mut TestCtx, caller: Address, input: &[u8], expect: &str) {
+    let _ = take_logs(ctx);
+    let writes = ctx.perp_write_count();
+    let out = run_perp_dex_call(input, GAS, caller, U256::ZERO, false, ctx).unwrap();
+    assert!(out.reverted, "expected the revert `{expect}`, but the call SUCCEEDED");
+    assert_eq!(revert_reason(&out), expect);
+    assert_eq!(ctx.perp_write_count(), writes, "[{expect}] the rejected call wrote perp state");
+    assert!(take_logs(ctx).is_empty(), "[{expect}] the rejected call logged");
+}
+
 fn evs<E: SolEvent>(logs: &[primitives::Log]) -> Vec<E> {
     logs.iter()
         .filter(|log| log.data.topics().first() == Some(&E::SIGNATURE_HASH))
@@ -152,17 +167,33 @@ fn take(ctx: &mut TestCtx, user: Address, side: u8, qty: u64) -> Vec<Trade> {
     evs::<Trade>(&logs)
 }
 
-fn set_fees(ctx: &mut TestCtx, user: Address, maker_bps: u64, taker_bps: u64) {
-    ok(
+fn rates_input(user: Address, maker_ppm: i64, taker_ppm: u64) -> Vec<u8> {
+    setUserFeeRatesCall {
+        user,
+        makerFeePpm: maker_ppm,
+        takerFeePpm: taker_ppm,
+    }
+    .abi_encode()
+}
+
+fn set_fees(ctx: &mut TestCtx, user: Address, maker_ppm: i64, taker_ppm: u64) {
+    ok(ctx, ADMIN, &rates_input(user, maker_ppm, taker_ppm));
+}
+
+/// `getUserFeeRates(user)` through the shell, as `(makerFeePpm, takerFeePpm)`.
+fn rates(ctx: &mut TestCtx, user: Address) -> (i64, u64) {
+    let out = run_perp_dex_call(
+        &getUserFeeRatesCall { user }.abi_encode(),
+        GAS,
+        BOB,
+        U256::ZERO,
+        true,
         ctx,
-        ADMIN,
-        &setUserFeeRatesCall {
-            user,
-            makerFeeBps: maker_bps,
-            takerFeeBps: taker_bps,
-        }
-        .abi_encode(),
-    );
+    )
+    .unwrap();
+    assert!(!out.reverted);
+    let r = getUserFeeRatesCall::abi_decode_returns(&out.bytes).unwrap();
+    (r.makerFeePpm, r.takerFeePpm)
 }
 
 /// The fee recipient's signed perp wallet.
@@ -179,13 +210,91 @@ fn notional(p: u64, q: u64) -> u64 {
     p * q
 }
 
+/// A non-negative rate's fee, recomputed from the ABI doc: `floor(n · ppm / 1e6)`.
+fn fee(n: u64, ppm: u64) -> u64 {
+    (n as u128 * ppm as u128 / 1_000_000) as u64
+}
+
+/// The taker rate the attribution tests run at: 100 ppm = 1 bp.
+const TAKER_PPM: u64 = 100;
+
 /// The maker levels a `taker_side` order crosses, touch first: three levels each `5_000`
-/// micro-dollars off a round price, so every fill's 1 bp fee is `x.5` units before the floor.
+/// micro-dollars off a round price, so every fill's 100 ppm (1 bp) fee is `x.5` units before the floor.
 fn levels(taker_side: u8) -> [u64; 3] {
     if taker_side == BUY {
         [MARK + 5_000, MARK + 15_000, MARK + 25_000]
     } else {
         [MARK - 5_000, MARK - 15_000, MARK - 25_000]
+    }
+}
+
+// ── Rates: units, bounds, events ─────────────────────────────────────────────────────────────
+
+/// 100_000 ppm = 10%, the ceiling for either rate (`math::MAX_FEE_PPM`).
+const MAX_FEE: u64 = 100_000;
+
+const E_TAKER_MAX: &str = "setUserFeeRates: taker fee exceeds 100000 ppm (10%)";
+const E_MAKER_MAX: &str = "setUserFeeRates: maker fee exceeds 100000 ppm (10%)";
+const E_MAKER_NEG: &str = "setUserFeeRates: negative maker fee (maker rebates not enabled)";
+const E_NOT_ADMIN: &str = "not authorised: caller is not admin";
+
+/// `0 ≤ taker ≤ 100_000` and `0 ≤ maker ≤ 100_000`, both ends inclusive; one past either end is
+/// refused write-free with its own reason, and a refusal leaves the previous rates in place. Each
+/// accepted call publishes `UserFeeRatesUpdated(user, int64 makerFeePpm, uint64 takerFeePpm)` with
+/// exactly the stored pair, and `getUserFeeRates` returns it.
+#[test]
+fn fee_rates_are_ppm_bounded_at_ten_percent_and_published_as_set() {
+    let mut ctx = fresh();
+    for (m, t) in [(0i64, 0u64), (1, 1), (MAX_FEE as i64, MAX_FEE), (0, MAX_FEE), (MAX_FEE as i64, 0), (200, 500)] {
+        let (out, logs) = ok(&mut ctx, ADMIN, &rates_input(ALICE, m, t));
+        assert_eq!(out.gas_used, 80_000, "the flat setUserFeeRates price");
+        let ev = evs::<UserFeeRatesUpdated>(&logs);
+        assert_eq!(
+            ev.iter().map(|e| (e.user, e.makerFeePpm, e.takerFeePpm)).collect::<Vec<_>>(),
+            vec![(ALICE, m, t)]
+        );
+        assert_eq!(rates(&mut ctx, ALICE), (m, t));
+    }
+    for (m, t, reason) in [
+        (0i64, MAX_FEE + 1, E_TAKER_MAX),
+        (0, u64::MAX, E_TAKER_MAX),
+        (MAX_FEE as i64 + 1, 0, E_MAKER_MAX),
+        (i64::MAX, 0, E_MAKER_MAX),
+        (-1, 0, E_MAKER_NEG),
+        (i64::MIN, 0, E_MAKER_NEG),
+    ] {
+        rejected(&mut ctx, ADMIN, &rates_input(ALICE, m, t), reason);
+        assert_eq!(rates(&mut ctx, ALICE), (200, 500), "a refusal keeps the stored rates");
+    }
+    rejected(&mut ctx, BOB, &rates_input(ALICE, 1, 1), E_NOT_ADMIN);
+    // The default is zero for an address nobody configured.
+    assert_eq!(rates(&mut ctx, CAROL), (0, 0));
+}
+
+/// Fees are charged at `floor(n · ppm / 1e6)`, and for a positive rate that is EXACTLY the bps
+/// fee the same schedule charged before the unit change (`floor(n · bps / 1e4)` at `ppm = 100·bps`).
+/// A maker at 200 ppm (2 bps) and a taker at 500 ppm (5 bps) on a fill whose fees truncate.
+#[test]
+fn a_fill_is_charged_its_ppm_rates_exactly_as_the_bps_rates_were() {
+    for side in [BUY, SELL] {
+        let mut ctx = fresh();
+        set_fees(&mut ctx, ALICE, 0, 500);
+        set_fees(&mut ctx, BOB, 200, 0);
+        let p = levels(side)[0];
+        rest(&mut ctx, BOB, 1 - side, p, 3);
+        let admin_before = admin_wallet(&mut ctx);
+        let fee_total_before = fee_total(&mut ctx);
+
+        let trades = take(&mut ctx, ALICE, side, 3);
+
+        let n = notional(p, 3);
+        let (taker_fee, maker_fee) = (fee(n, 500), fee(n, 200));
+        assert_eq!((taker_fee, maker_fee), (n * 5 / 10_000, n * 2 / 10_000), "ppm == bps × 100");
+        assert_ne!(n * 5 % 10_000, 0, "fixture: the taker fee truncates");
+        assert_eq!(trades.len(), 1);
+        assert_eq!((trades[0].takerFee, trades[0].makerFee), (taker_fee, maker_fee));
+        assert_eq!(admin_wallet(&mut ctx) - admin_before, (taker_fee + maker_fee) as i64);
+        assert_eq!(fee_total(&mut ctx) - fee_total_before, taker_fee + maker_fee);
     }
 }
 
@@ -196,10 +305,10 @@ fn levels(taker_side: u8) -> [u64; 3] {
 /// floor dropped up to `N − 1` units.
 ///
 /// Fixture: three fills of notional `100_005_000`, `100_015_000`, `100_025_000` (or the bid-side
-/// mirror) at a 1 bp taker rate, i.e. `10_000.5`, `10_001.5`, `10_002.5` units before the floor.
+/// mirror) at a 100 ppm (1 bp) taker rate, i.e. `10_000.5`, `10_001.5`, `10_002.5` units before the floor.
 ///
 /// ```text
-/// C_k          floor(C_k · 1/10_000)   share_k
+/// C_k          floor(C_k · 100/1e6)    share_k
 /// 100_005_000         10_000            10_000
 /// 200_020_000         20_002            10_002
 /// 300_045_000         30_004            10_002     Σ = 30_004 = F
@@ -211,7 +320,7 @@ fn levels(taker_side: u8) -> [u64; 3] {
 fn taker_fee_shares_telescope_to_the_one_fee_charged() {
     for side in [BUY, SELL] {
         let mut ctx = fresh();
-        set_fees(&mut ctx, ALICE, 0, 1);
+        set_fees(&mut ctx, ALICE, 0, TAKER_PPM);
         let maker_side = 1 - side;
         let lv = levels(side);
         rest(&mut ctx, BOB, maker_side, lv[0], 1);
@@ -228,7 +337,7 @@ fn taker_fee_shares_telescope_to_the_one_fee_charged() {
             lv.to_vec(),
             "side {side}: the walk takes the touch first"
         );
-        let charged: u64 = lv.iter().map(|&p| notional(p, 1)).sum::<u64>() / 10_000;
+        let charged = fee(lv.iter().map(|&p| notional(p, 1)).sum(), TAKER_PPM);
         assert_eq!(charged, if side == BUY { 30_004 } else { 29_995 });
         let shares: Vec<u64> = trades.iter().map(|t| t.takerFee).collect();
         assert_eq!(
@@ -246,7 +355,7 @@ fn taker_fee_shares_telescope_to_the_one_fee_charged() {
         assert_eq!(fee_total(&mut ctx) - fee_total_before, charged);
 
         // The fixture discriminates: the independent per-fill floor loses a unit.
-        let independent: u64 = lv.iter().map(|&p| notional(p, 1) / 10_000).sum();
+        let independent: u64 = lv.iter().map(|&p| fee(notional(p, 1), TAKER_PPM)).sum();
         assert_eq!(independent + 1, charged, "side {side}: fixture must truncate");
     }
 }
@@ -257,7 +366,7 @@ fn taker_fee_shares_telescope_to_the_one_fee_charged() {
 #[test]
 fn a_rejected_maker_consumes_no_taker_fee_share() {
     let mut ctx = fresh();
-    set_fees(&mut ctx, ALICE, 0, 1);
+    set_fees(&mut ctx, ALICE, 0, TAKER_PPM);
     // CAROL rests the touch with a wallet that cannot fund it at all; the mark then moves so far
     // against her that the fill would open her below maintenance → K9 cancels her order.
     let lv = levels(BUY);
@@ -281,7 +390,7 @@ fn a_rejected_maker_consumes_no_taker_fee_share() {
     //   C1 = 100_015_000 → 10_001        C2 = 200_040_000 → 20_004 → share 10_003
     let shares: Vec<u64> = trades.iter().map(|t| t.takerFee).collect();
     assert_eq!(shares, vec![10_001, 10_003]);
-    let charged = (notional(lv[1], 1) + notional(lv[2], 1)) / 10_000;
+    let charged = fee(notional(lv[1], 1) + notional(lv[2], 1), TAKER_PPM);
     assert_eq!(shares.iter().sum::<u64>(), charged);
     assert_eq!(admin_wallet(&mut ctx) - admin_before, charged as i64);
 }

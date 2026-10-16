@@ -452,15 +452,20 @@ sol! {
             uint64   maxWithdrawAmount,
             AccountPosition[] positions
         );
-        /// Set per-user trading fee rates in basis points. Only callable by admin.
+        /// Set per-user trading fee rates in PARTS PER MILLION of notional (1 ppm = 0.0001%;
+        /// 1 bp = 100 ppm). Only callable by admin.
+        ///
+        /// `makerFeePpm` is SIGNED (a negative rate is a maker rebate); `takerFeePpm` is not.
+        /// Bounds: `0 ≤ takerFeePpm ≤ 100_000` and `0 ≤ makerFeePpm ≤ 100_000` (10%).
         ///
         /// Sub-accounts inherit their master's rates: setting a MASTER's rates also writes them to
         /// every one of its sub-accounts (one `UserFeeRatesUpdated` per account written, master
         /// first, then subs in index order), and setting a SUB's rates directly is rejected — set
         /// the master's.
-        function setUserFeeRates(address user, uint64 makerFeeBps, uint64 takerFeeBps) external;
-        /// Query per-user trading fee rates in basis points. Unset users default to zero.
-        function getUserFeeRates(address user) external view returns (uint64 makerFeeBps, uint64 takerFeeBps);
+        function setUserFeeRates(address user, int64 makerFeePpm, uint64 takerFeePpm) external;
+        /// Query per-user trading fee rates in ppm of notional (maker signed). Unset users default
+        /// to zero.
+        function getUserFeeRates(address user) external view returns (int64 makerFeePpm, uint64 takerFeePpm);
         /// Query total trading fees collected for one market.
         function getMarketFeeTotal(uint64 marketId) external view returns (uint64 totalFee);
 
@@ -1683,7 +1688,7 @@ sol! {
             int64   totalWalletBalance,
             int64   totalCrossWalletBalance
         );
-        event UserFeeRatesUpdated(address indexed user, uint64 makerFeeBps, uint64 takerFeeBps);
+        event UserFeeRatesUpdated(address indexed user, int64 makerFeePpm, uint64 takerFeePpm);
 
         // Emitted once per accepted placeOrder / placeOrderSigned call, before any matching.
         // Fires only when validation passes; a reverted tx emits nothing.

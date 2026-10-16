@@ -43,10 +43,9 @@ fn decode_get_account(bytes: &Bytes) -> (U256, i64) {
     (ret.usdcBalance, ret.availableBalance)
 }
 
-fn decode_user_fee_rates(bytes: &Bytes) -> (u64, u64) {
-    let maker = U256::from_be_slice(&bytes[..32]).to::<u64>();
-    let taker = U256::from_be_slice(&bytes[32..64]).to::<u64>();
-    (maker, taker)
+fn decode_user_fee_rates(bytes: &Bytes) -> (i64, u64) {
+    let r = getUserFeeRatesCall::abi_decode_returns(bytes).unwrap();
+    (r.makerFeePpm, r.takerFeePpm)
 }
 
 #[test]
@@ -77,8 +76,8 @@ fn admin_can_set_user_fee_rates() {
     run_set_user_fee_rates(
         &setUserFeeRatesCall {
             user: ALICE,
-            makerFeeBps: 2,
-            takerFeeBps: 5,
+            makerFeePpm: 200,
+            takerFeePpm: 500,
         }
         .abi_encode(),
         ADMIN,
@@ -88,22 +87,22 @@ fn admin_can_set_user_fee_rates() {
     let ret = run_get_user_fee_rates(&getUserFeeRatesCall { user: ALICE }.abi_encode(), &mut ctx)
         .unwrap();
 
-    assert_eq!(decode_user_fee_rates(&ret), (2, 5));
+    assert_eq!(decode_user_fee_rates(&ret), (200, 500));
 }
 
-/// The fee-rate ceiling is 1_000 bps (10%), not the old 100%-of-notional `FEE_BPS_DENOMINATOR`.
-/// Defence in depth only: the binding rule is K9 at fill time (the fee now leaves the position
-/// margin, so `f > 1/(2·L_max)` simply makes a max-leverage open fail maintenance).
+/// The fee-rate ceiling is 100_000 ppm (10%), not a 100%-of-notional fee. Defence in depth only:
+/// the binding rule is K9 at fill time (the fee now leaves the position margin, so
+/// `f > 1/(2·L_max)` simply makes a max-leverage open fail maintenance).
 #[test]
-fn set_user_fee_rates_accepts_1000_bps_and_rejects_1001() {
+fn set_user_fee_rates_accepts_100000_ppm_and_rejects_100001() {
     let mut ctx = make_ctx(U256::ZERO);
     storage::save_admin(&mut ctx, ADMIN).unwrap();
 
     run_set_user_fee_rates(
         &setUserFeeRatesCall {
             user: ALICE,
-            makerFeeBps: 1_000,
-            takerFeeBps: 1_000,
+            makerFeePpm: 100_000,
+            takerFeePpm: 100_000,
         }
         .abi_encode(),
         ADMIN,
@@ -112,26 +111,30 @@ fn set_user_fee_rates_accepts_1000_bps_and_rejects_1001() {
     .unwrap();
     let ret = run_get_user_fee_rates(&getUserFeeRatesCall { user: ALICE }.abi_encode(), &mut ctx)
         .unwrap();
-    assert_eq!(decode_user_fee_rates(&ret), (1_000, 1_000));
+    assert_eq!(decode_user_fee_rates(&ret), (100_000, 100_000));
 
-    for (maker, taker) in [(1_001u64, 0u64), (0, 1_001)] {
+    for (maker, taker, side) in [(100_001i64, 0u64, "maker"), (0, 100_001, "taker")] {
         let err = run_set_user_fee_rates(
             &setUserFeeRatesCall {
                 user: ALICE,
-                makerFeeBps: maker,
-                takerFeeBps: taker,
+                makerFeePpm: maker,
+                takerFeePpm: taker,
             }
             .abi_encode(),
             ADMIN,
             &mut ctx,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("fee bps exceeds 1000"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&format!("{side} fee exceeds 100000 ppm (10%)")),
+            "{err}"
+        );
     }
     // The rejected calls left the accepted rates in place.
     let ret = run_get_user_fee_rates(&getUserFeeRatesCall { user: ALICE }.abi_encode(), &mut ctx)
         .unwrap();
-    assert_eq!(decode_user_fee_rates(&ret), (1_000, 1_000));
+    assert_eq!(decode_user_fee_rates(&ret), (100_000, 100_000));
 }
 
 #[test]
@@ -659,8 +662,8 @@ fn metadata_only_call_emits_no_balance_after_image() {
     let output = crate::run_perp_dex_call(
         &setUserFeeRatesCall {
             user: ALICE,
-            makerFeeBps: 1,
-            takerFeeBps: 2,
+            makerFeePpm: 100,
+            takerFeePpm: 200,
         }
         .abi_encode(),
         1_000_000,

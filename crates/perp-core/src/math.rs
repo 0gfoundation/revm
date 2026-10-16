@@ -15,19 +15,28 @@ pub const MAX_FUNDING_RATE: i64 = 7_500; // +0.75%
 pub const MIN_FUNDING_RATE: i64 = -7_500; // -0.75%
 pub const CLAMP_UPPER_BOUND: i64 = 500; // +0.05%  (inner clamp for I−P)
 pub const CLAMP_LOWER_BOUND: i64 = -500; // -0.05%
-/// Trading fee denominator. 1 basis point = 1 / 10_000.
-pub const FEE_BPS_DENOMINATOR: u64 = 10_000;
+/// Trading-fee rate denominator: rates are in PARTS PER MILLION, 1 ppm = 1 / 1_000_000 = 0.0001%.
+///
+/// ppm rather than basis points because a maker REBATE is sub-basis-point at every venue that
+/// pays one (Binance −0.5…−0.8 bp, Hyperliquid −0.1…−0.3 bp, dYdX −1.1 bp = −110 ppm): an integer
+/// bps rate cannot express any of them, and every published schedule sits on the 0.0001% grid.
+/// It is also the unit of [`FUNDING_RATE_ONE`]. A positive rate in ppm is EXACTLY the old bps rate
+/// × 100 — `floor(n·100r / 1e6) == floor(n·r / 1e4)` — so rescaling a schedule changes no fee.
+///
+/// Trading fees only: the liquidation clearance fee stays in basis points
+/// (`Market::liquidation_fee_rate_bps`).
+pub const FEE_PPM_DENOMINATOR: u64 = 1_000_000;
 
-/// Hard ceiling accepted by `setUserFeeRates` for either fee rate: 1_000 bps = 10% of notional.
+/// Hard ceiling accepted by `setUserFeeRates` for either fee rate: 100_000 ppm = 10% of notional.
 ///
 /// Defence in depth, NOT the binding rule. The trading fee is charged out of the margin the fill
 /// funds (`fee_from_margin = min(fee, opening_margin)`), so for a max-leverage open to survive the
 /// K9 maintenance check the rate must satisfy `f ≤ 1/(2·L_max)` — the tier's maintenance rate,
-/// `1/6 ≈ 1_666 bps` at the default `L_max = 3`. K9 enforces exactly that at FILL time, per market
-/// and per position size (the tier table can lower `L_max`, raising the real bound). This static
-/// cap only removes the absurd end of the range: the previous bound was `FEE_BPS_DENOMINATOR`,
-/// i.e. a 100%-of-notional fee.
-pub const MAX_USER_FEE_BPS: u64 = 1_000;
+/// `1/6 ≈ 166_666 ppm` at the default `L_max = 3`. K9 enforces exactly that at FILL time, per
+/// market and per position size (the tier table can lower `L_max`, raising the real bound). This
+/// static cap only removes the absurd end of the range: the bound before it was the denominator
+/// itself, i.e. a 100%-of-notional fee.
+pub const MAX_FEE_PPM: u64 = 100_000;
 
 /// Default price-band half-width (basis points) used when a market's
 /// `price_band_bps` is left at `0`. 1_000 bps = ±10%.
@@ -304,29 +313,29 @@ pub fn calc_value(
     u64::try_from(value).map_err(|_| perp_err("math: value exceeds u64"))
 }
 
-/// Trading fee in quote units, rounded down.
+/// Trading fee in quote units for a NON-NEGATIVE rate in ppm, rounded down.
 #[inline]
-pub fn calc_trading_fee(notional: u64, fee_bps: u64) -> Result<u64, PerpError> {
+pub fn calc_trading_fee(notional: u64, fee_ppm: u64) -> Result<u64, PerpError> {
     let fee = (notional as u128)
-        .checked_mul(fee_bps as u128)
+        .checked_mul(fee_ppm as u128)
         .ok_or_else(|| perp_err("math: trading fee overflow"))?
-        / FEE_BPS_DENOMINATOR as u128;
+        / FEE_PPM_DENOMINATOR as u128;
     u64::try_from(fee).map_err(|_| perp_err("math: trading fee exceeds u64"))
 }
 
-/// Maker fee (quote units) for `qty` of an order resting at `price`, using a
-/// pre-snapshotted `maker_fee_bps`. Single source of truth shared by the
-/// placement, fill-release, and cancel-release paths so the reserve↔release
-/// fee math cannot drift between them.
+/// Maker fee (quote units) for `qty` of an order resting at `price`, at the order's snapshotted
+/// NON-NEGATIVE maker rate in ppm. The fill path differences two of these (the whole order before
+/// and after the fill), which is what makes a partially filled order's per-fill fees sum exactly
+/// to its whole-order fee.
 #[inline]
-pub fn calc_maker_fee_for_order_qty_with_bps(
+pub fn calc_maker_fee_for_order_qty(
     price: u64,
     qty: u64,
-    maker_fee_bps: u64,
+    maker_fee_ppm: u64,
     market: &Market,
 ) -> Result<u64, PerpError> {
     let notional = calc_value(price, qty, market.base_decimals, market.price_decimals)?;
-    calc_trading_fee(notional, maker_fee_bps)
+    calc_trading_fee(notional, maker_fee_ppm)
 }
 
 /// Signed version of `calc_value` for negative quantities.
@@ -3121,6 +3130,49 @@ mod price_basis_ewma_tests {
             effective_basis(b, INDEX),
             -20,
             "a day-old basis is discarded, not averaged in"
+        );
+    }
+}
+
+#[cfg(test)]
+mod trading_fee_ppm_tests {
+    use super::{calc_trading_fee, FEE_PPM_DENOMINATOR, MAX_FEE_PPM};
+
+    /// A positive rate in ppm charges EXACTLY what the same rate in basis points did, ×100:
+    /// `floor(n·100r / 1e6) == floor(n·r / 1e4)`. This is what lets the bps → ppm move rescale a
+    /// fee schedule without moving a single fee. Exhaustive over every bps rate up to the old
+    /// 1_000 bps ceiling, against notionals chosen to sit on, just below and just above every
+    /// truncation boundary, plus a deterministic pseudo-random spread up to `u64::MAX / 2`.
+    #[test]
+    fn a_ppm_rate_reproduces_the_bps_fee_exactly() {
+        let mut notionals: Vec<u64> = vec![0, 1, 9_999, 10_000, 10_001, 99_999_999, 100_000_001];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..2_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            notionals.push(x >> 1);
+        }
+        for bps in 0..=1_000u64 {
+            for &n in &notionals {
+                let old = (n as u128 * bps as u128 / 10_000) as u64;
+                assert_eq!(calc_trading_fee(n, bps * 100).unwrap(), old, "n = {n}, {bps} bps");
+            }
+        }
+    }
+
+    #[test]
+    fn the_rate_unit_is_parts_per_million_and_the_ceiling_is_ten_percent() {
+        assert_eq!(FEE_PPM_DENOMINATOR, 1_000_000);
+        assert_eq!(MAX_FEE_PPM, 100_000);
+        // 1 ppm of 1 USDC (1e6 micro) is one micro-unit; the floor drops anything below it.
+        assert_eq!(calc_trading_fee(1_000_000, 1).unwrap(), 1);
+        assert_eq!(calc_trading_fee(999_999, 1).unwrap(), 0);
+        assert_eq!(calc_trading_fee(1_000_000, MAX_FEE_PPM).unwrap(), 100_000);
+        // u64 notional × the ceiling stays inside the u128 product.
+        assert_eq!(
+            calc_trading_fee(u64::MAX, MAX_FEE_PPM).unwrap(),
+            (u64::MAX as u128 * 100_000 / 1_000_000) as u64
         );
     }
 }

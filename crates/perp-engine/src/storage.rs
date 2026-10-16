@@ -875,7 +875,7 @@ pub fn flush_batch_ws<H: PerpHost>(context: &mut H) {
 }
 
 
-// Fee rates + nonce are folded into UserAccount (per-user, co-read with the account on the hot
+// Fee rates (ppm, maker signed) + nonce are folded into UserAccount (per-user, co-read with the account on the hot
 // placement path). Reads go through `load_account_ref` (Arc bump — never clones the usdc_balance
 // String); writes RMW the account blob in place.
 
@@ -885,8 +885,8 @@ pub fn load_user_fee_rates<H: PerpHost>(
 ) -> Result<UserFeeRates, PerpError> {
     let a = load_account_ref(context, user)?;
     Ok(UserFeeRates {
-        maker_fee_bps: a.maker_fee_bps,
-        taker_fee_bps: a.taker_fee_bps,
+        maker_fee_ppm: a.maker_fee_ppm,
+        taker_fee_ppm: a.taker_fee_ppm,
     })
 }
 
@@ -896,8 +896,8 @@ pub fn save_user_fee_rates<H: PerpHost>(
     rates: UserFeeRates,
 ) -> Result<(), PerpError> {
     mutate_account(context, user, |a| {
-        a.maker_fee_bps = rates.maker_fee_bps;
-        a.taker_fee_bps = rates.taker_fee_bps;
+        a.maker_fee_ppm = rates.maker_fee_ppm;
+        a.taker_fee_ppm = rates.taker_fee_ppm;
     })
 }
 
@@ -3098,7 +3098,7 @@ mod size_probe_tests {
             order_id: [0xCD; 32],
             price: 65_432_10,
             amount: 150_000_000,
-            maker_fee_bps: 2,
+            maker_fee_ppm: 200,
             assuming_price: 6_550_000,
                     reduce_only: false,
                     stp: Default::default(),
@@ -3162,8 +3162,8 @@ mod size_probe_tests {
         let acct = UserAccount {
             usdc_balance: "123456789000000000000".into(), // 21-digit decimal string
             perp_wallet_balance: 1_234_567_890,
-            maker_fee_bps: 2,
-            taker_fee_bps: 5,
+            maker_fee_ppm: 200,
+            taker_fee_ppm: 500,
             nonce: 7,
             total_position_margin: 4_200_000,
             master: None,
@@ -3249,8 +3249,8 @@ mod size_probe_tests {
         println!(
             "UserFeeRates: {} bytes",
             encode(&UserFeeRates {
-                maker_fee_bps: 2,
-                taker_fee_bps: 5
+                maker_fee_ppm: 200,
+                taker_fee_ppm: 500
             })
             .unwrap()
             .len()
@@ -3353,7 +3353,7 @@ mod encoding_roundtrip_tests {
                 order_id: id,
                 price: u64::MAX,
                 amount: u64::MAX,
-                maker_fee_bps: 12_345,
+                maker_fee_ppm: -12_345,
                 assuming_price: u64::MAX,
                             reduce_only: false,
                             stp: Default::default(),

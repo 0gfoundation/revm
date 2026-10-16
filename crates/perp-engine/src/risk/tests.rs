@@ -365,8 +365,8 @@ fn sweep_liquidates_underwater_user_with_no_free_wallet_for_taker_fee() {
         &mut ctx,
         ALICE,
         UserFeeRates {
-            maker_fee_bps: 0,
-            taker_fee_bps: 10,
+            maker_fee_ppm: 0,
+            taker_fee_ppm: 1_000,
         },
     )
     .unwrap();
@@ -755,8 +755,8 @@ fn adl_fills_against_an_order_holder_and_cancels_their_orders() {
         &mut ctx,
         KEEPER,
         UserFeeRates {
-            maker_fee_bps: 200,
-            taker_fee_bps: 0,
+            maker_fee_ppm: 20_000,
+            taker_fee_ppm: 0,
         },
     )
     .unwrap();
@@ -4002,8 +4002,8 @@ mod value_conservation {
                 UserAccount {
                     perp_wallet_balance: SEED_WALLET,
                     // Live fee rates: fees must move between users and ADMIN without leaking.
-                    maker_fee_bps: 5,
-                    taker_fee_bps: 10,
+                    maker_fee_ppm: 500,
+                    taker_fee_ppm: 1_000,
                     ..UserAccount::default()
                 },
                 AccountUpdateReason::Adjustment,
@@ -8470,7 +8470,8 @@ mod withdrawal_cap {
     const Q: i64 = 3;
     /// Notional of `Q` at `ENTRY_PRICE`: `10_000 · 3 · 1e6 / 1e2`.
     const N0: i64 = 300_000_000;
-    const TAKER_BPS: u64 = 10;
+    /// 10 bps = 1_000 ppm.
+    const TAKER_PPM: u64 = 1_000;
     /// 10 bps of `N0` — only ever compared against the fee READ off the `Trade` event.
     const OPEN_FEE: u64 = 300_000;
     /// ALICE's perp wallet before a real-fill open.
@@ -8756,9 +8757,9 @@ mod withdrawal_cap {
     }
 
     /// Opens ALICE `q` contracts at `ENTRY_PRICE` through a REAL matched fill against MAKER, at
-    /// leverage `lev` and taker fee `taker_bps`. Returns the opening fee as READ off the `Trade`
+    /// leverage `lev` and taker fee `taker_ppm`. Returns the opening fee as READ off the `Trade`
     /// event, cross-checked against the silo: `floor(value / L) − fee`.
-    fn open_via_fill(ctx: &mut TestCtx, long: bool, q: u64, lev: u64, taker_bps: u64) -> u64 {
+    fn open_via_fill(ctx: &mut TestCtx, long: bool, q: u64, lev: u64, taker_ppm: u64) -> u64 {
         storage::save_account(
             ctx,
             ALICE,
@@ -8773,8 +8774,8 @@ mod withdrawal_cap {
             ctx,
             ALICE,
             UserFeeRates {
-                maker_fee_bps: 0,
-                taker_fee_bps: taker_bps,
+                maker_fee_ppm: 0,
+                taker_fee_ppm: taker_ppm,
             },
         )
         .unwrap();
@@ -8807,10 +8808,10 @@ mod withdrawal_cap {
         fee
     }
 
-    fn opened(long: bool, q: u64, lev: u64, taker_bps: u64) -> (TestCtx, u64) {
+    fn opened(long: bool, q: u64, lev: u64, taker_ppm: u64) -> (TestCtx, u64) {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
-        let fee = open_via_fill(&mut ctx, long, q, lev, taker_bps);
+        let fee = open_via_fill(&mut ctx, long, q, lev, taker_ppm);
         (ctx, fee)
     }
 
@@ -8831,7 +8832,7 @@ mod withdrawal_cap {
             (2, 150_000_000, 11_000, 164_700_000),
             (3, 100_000_000, 11_000, 119_700_000),
         ] {
-            let (mut ctx, fee) = opened(true, Q as u64, lev, TAKER_BPS);
+            let (mut ctx, fee) = opened(true, Q as u64, lev, TAKER_PPM);
             assert_eq!(fee, OPEN_FEE);
             add_position_margin(&mut ctx, e).unwrap();
             set_mark(&mut ctx, mark);
@@ -9045,7 +9046,7 @@ mod withdrawal_cap {
         const MARKS: [u64; 3] = [9_000, 10_000, 12_000];
         const E: u64 = 300_000_000;
 
-        let (mut ctx, fee) = opened(true, Q as u64, 1, TAKER_BPS);
+        let (mut ctx, fee) = opened(true, Q as u64, 1, TAKER_PPM);
         assert_eq!(fee, OPEN_FEE);
         for mark in MARKS {
             set_mark(&mut ctx, mark);
@@ -9060,7 +9061,7 @@ mod withdrawal_cap {
         }
 
         for mark in MARKS {
-            let (mut ctx, fee) = opened(true, Q as u64, 1, TAKER_BPS);
+            let (mut ctx, fee) = opened(true, Q as u64, 1, TAKER_PPM);
             add_position_margin(&mut ctx, E).unwrap();
             set_mark(&mut ctx, mark);
             assert_regime(&risk_row(&mut ctx), Regime::Equity);
@@ -9093,7 +9094,7 @@ mod withdrawal_cap {
             (false, 2, 9_994, 9_993, 15_000),
             (false, 3, 9_993, 9_992, 20_000),
         ] {
-            let (mut ctx, fee) = opened(long, Q as u64, lev, TAKER_BPS);
+            let (mut ctx, fee) = opened(long, Q as u64, lev, TAKER_PPM);
             assert_eq!(fee, OPEN_FEE);
             let row = risk_row(&mut ctx);
             assert_eq!(
@@ -9117,7 +9118,7 @@ mod withdrawal_cap {
                 assert_eq!(probe(&mut ctx, G3), cap, "{long}/{lev} @ {mark}");
             }
         }
-        let (mut ctx, _) = opened(true, Q as u64, 1, TAKER_BPS);
+        let (mut ctx, _) = opened(true, Q as u64, 1, TAKER_PPM);
         for mark in [10_016u64, 15_000, 20_000] {
             set_mark(&mut ctx, mark);
             assert_regime(&risk_row(&mut ctx), Regime::Equity);
@@ -9156,7 +9157,7 @@ mod withdrawal_cap {
             assert_not_liquidatable(&mut ctx);
         }
 
-        let (mut ctx, fee) = opened(true, Q as u64, 3, TAKER_BPS);
+        let (mut ctx, fee) = opened(true, Q as u64, 3, TAKER_PPM);
         assert_eq!(fee, OPEN_FEE);
         set_mark(&mut ctx, 20_000);
         let row = risk_row(&mut ctx);
@@ -9174,14 +9175,14 @@ mod withdrawal_cap {
             (11_900u64, Regime::Equity, G3, 37_700_000u64),
             (12_100, Regime::Balance, G2, 39_200_000),
         ] {
-            let (mut ctx, _) = opened(true, Q as u64, 3, TAKER_BPS);
+            let (mut ctx, _) = opened(true, Q as u64, 3, TAKER_PPM);
             set_mark(&mut ctx, mark);
             let row = risk_row(&mut ctx);
             assert_regime(&row, regime);
             assert_eq!(cap_of(&row), want, "@ {mark}: below the 1.20 peak");
             assert_eq!(probe(&mut ctx, gate), want, "@ {mark}");
         }
-        let (mut ctx, _) = opened(true, Q as u64, 3, TAKER_BPS);
+        let (mut ctx, _) = opened(true, Q as u64, 3, TAKER_PPM);
         set_mark(&mut ctx, 12_000);
         let row = risk_row(&mut ctx);
         let balance_term = row.isolatedWallet as i128 - row.maintMargin as i128;
@@ -9457,7 +9458,7 @@ mod withdrawal_cap {
     /// cap 199.7e6. `setLeverage` moves no margin.
     #[test]
     fn t12_raising_leverage_raises_the_cap_to_the_new_pim() {
-        let (mut ctx, fee) = opened(true, Q as u64, 1, TAKER_BPS);
+        let (mut ctx, fee) = opened(true, Q as u64, 1, TAKER_PPM);
         assert_eq!(fee, OPEN_FEE);
         let row = risk_row(&mut ctx);
         assert_eq!(row.positionInitialMargin, 300_000_000);
@@ -9474,7 +9475,7 @@ mod withdrawal_cap {
         assert_refused_whole(&mut ctx, 149_700_001, G3);
         // The accept side at L = 2, on a fresh open — taking the cap here would move the silo the
         // L = 3 step below reads.
-        let (mut fresh, _) = opened(true, Q as u64, 1, TAKER_BPS);
+        let (mut fresh, _) = opened(true, Q as u64, 1, TAKER_PPM);
         set_leverage(&mut fresh, 2).unwrap();
         assert_eq!(probe(&mut fresh, G3), 149_700_000);
 
@@ -9582,7 +9583,7 @@ mod withdrawal_cap {
                         order_id,
                         price,
                         amount: 1 + next(&mut order_seed) % (2 * qty),
-                        maker_fee_bps: 0,
+                        maker_fee_ppm: 0,
                         assuming_price: price,
                         reduce_only: false,
                         stp: Default::default(),
@@ -9727,7 +9728,7 @@ mod withdrawal_cap {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
         set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0, 150_000_000], &[3, 1]).unwrap();
-        let fee = open_via_fill(&mut ctx, false, 1, 3, TAKER_BPS);
+        let fee = open_via_fill(&mut ctx, false, 1, 3, TAKER_PPM);
         assert_eq!(fee, 100_000);
         add_position_margin(&mut ctx, 500_000_000).unwrap();
         let iw = 100_000_000 / 3 - fee as i64 + 500_000_000;
@@ -9794,7 +9795,7 @@ mod withdrawal_cap {
     /// $110 (`PIM` 2.2e8, `MM` 1.1e8, `uPnL` 6e7), and the cap 39.4e6 taken: the silo is 160e6 —
     /// BELOW `PIM`. Its liquidation price is $87.99: `6e4·P − 4.4e8 ≥ 1e4·P ⇔ P ≥ 8_800`.
     fn withdrawn_to_cap() -> TestCtx {
-        let (mut ctx, fee) = opened(true, 6, 3, TAKER_BPS);
+        let (mut ctx, fee) = opened(true, 6, 3, TAKER_PPM);
         assert_eq!(fee, 600_000);
         set_mark(&mut ctx, 11_000);
         assert_regime(&risk_row(&mut ctx), Regime::Equity);
@@ -10001,13 +10002,13 @@ mod funding_debt {
         .unwrap();
     }
 
-    fn set_taker_bps(ctx: &mut TestCtx, user: Address, bps: u64) {
+    fn set_taker_ppm(ctx: &mut TestCtx, user: Address, ppm: u64) {
         storage::save_user_fee_rates(
             ctx,
             user,
             UserFeeRates {
-                maker_fee_bps: 0,
-                taker_fee_bps: bps,
+                maker_fee_ppm: 0,
+                taker_fee_ppm: ppm,
             },
         )
         .unwrap();
@@ -10184,7 +10185,7 @@ mod funding_debt {
         assert_eq!(settled.margin, -50_000_000);
         assert_eq!(assert_sigma_margin_consistent(&mut ctx, ALICE), -50_000_000);
 
-        set_taker_bps(&mut ctx, ALICE, 10);
+        set_taker_ppm(&mut ctx, ALICE, 1_000);
         storage::save_mark_price(&mut ctx, MARKET_ID, MARK_130).unwrap();
         place_maker_order(&mut ctx, BUY, MARK_130, QTY as u64);
         let users = [ALICE, MAKER, ADMIN];
@@ -10256,7 +10257,7 @@ mod funding_debt {
         save_position(&mut ctx, QTY, -ENTRY_VALUE);
         set_funding_index(&mut ctx, INDEX);
         assert_eq!(persist_alice_funding(&mut ctx).margin, -50_000_001);
-        set_taker_bps(&mut ctx, ALICE, 10);
+        set_taker_ppm(&mut ctx, ALICE, 1_000);
         storage::save_mark_price(&mut ctx, MARKET_ID, MARK_130).unwrap();
         place_maker_order(&mut ctx, BUY, MARK_130, QTY as u64);
         let value_before = conservation_sum(&mut ctx, &users);
@@ -10295,7 +10296,7 @@ mod funding_debt {
         save_position_with_leverage(&mut ctx, QTY, -ENTRY_VALUE, 2);
         set_funding_index(&mut ctx, INDEX);
         assert_eq!(persist_alice_funding(&mut ctx).margin, -50_000_001);
-        set_taker_bps(&mut ctx, ALICE, 10);
+        set_taker_ppm(&mut ctx, ALICE, 1_000);
         storage::save_mark_price(&mut ctx, MARKET_ID, MARK_130).unwrap();
         place_maker_order(&mut ctx, BUY, MARK_130, 2 * QTY as u64);
         let value_before = conservation_sum(&mut ctx, &users);
