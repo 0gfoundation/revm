@@ -61,8 +61,12 @@
 //! many orders there are, and the fire walk stops at the first front that does not fire.
 //!
 //! **Why a new activation or a fresh extreme cannot fire on its own tick (L4).** Its peak is the
-//! current mark `m ≥ 1`, and `b ≥ 10` puts `thr` strictly on the far side of `m`. So the order of
-//! the per-tick legs below changes no outcome, and activation can run after the fire walk.
+//! current mark `m ≥ 1`, and `b ≥ 10` puts `thr` strictly on the far side of `m`. So running
+//! activation after the fire walk loses no fire. The leg ORDER is still load-bearing, for the
+//! generation check AT activation: a fire in the same tick can end a position (as the taker, or as
+//! the maker another owner's fire hits) that a pending stop is bound to, and only
+//! fires-then-activations spends that stop as `PositionClosed` instead of activating it on a flat
+//! account. It also fixes the stream order: `AlgoOrderTriggered` before `AlgoOrderActivated`.
 //!
 //! # Per-tick legs (`risk::run_deferred_sweeps`, in this order)
 //!

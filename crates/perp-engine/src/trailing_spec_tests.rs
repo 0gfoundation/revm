@@ -49,6 +49,7 @@
 //!   O(N) per-order model written here from the formulas above ([`Model`]).
 //! * `fix_*` — regressions for the review findings on this series, each pinning its fix (one of
 //!   them replaces the `#[ignore]`d `bug_*` test this suite first kept for a finding outside it).
+//! * `kill_*` — one test per mutant that survived the suite above, named after it.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -3381,4 +3382,57 @@ fn fix_a_deactivated_market_fires_and_activates_nothing_until_reactivated() {
     assert_eq!(amount(&mut ctx, ALICE), 8);
     assert_eq!(open_algos(&mut ctx, ALICE), vec![pend]);
     assert_eq!(trail_state(&mut ctx, pend), (false, 0, 0));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// Mutation survivors — each test names the mutant of this series it kills
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Kills T19 — "activation leg runs BEFORE the fire leg". The spec fixes the per-tick order
+/// (… fixed triggers → trailing fires → activations → liquidations), and L4 makes it irrelevant
+/// for whether a NEW activation fires — but NOT for the lazy expiry at activation: a fire in the
+/// same tick can END the position a pending trailer is bound to (here as the maker of the fired
+/// order), and only fires-then-activations sees that.
+///
+/// ALICE long 10 holds an activated SELL trailer (H 10_000, b 100 → stop 9_900); CAROL short 10
+/// holds a PENDING BUY trailer (activation 9_950) and the BUY 10 @ 9_900 that ALICE's fire hits.
+/// Tick 9_900: ALICE's trailer fires and closes CAROL's short; CAROL's trailer is then reached —
+/// and spent as 11 at activation, never activated (no `AlgoOrderActivated`, gone from her list).
+/// With the legs swapped it activates first (bound to a live generation) and lingers, activated,
+/// on a flat account.
+///
+/// Second half: with unrelated orders the stream carries the fire leg's `AlgoOrderTriggered`
+/// BEFORE the activation leg's `AlgoOrderActivated` (DAVE's BUY activates at 9_900, stop
+/// ⌈9_900·1.01⌉ = 9_999).
+#[test]
+fn kill_t19_a_fire_that_ends_a_position_runs_before_that_positions_activation() {
+    let mut ctx = fresh();
+    seed_pos(&mut ctx, ALICE, 10, 1);
+    seed_pos(&mut ctx, CAROL, -10, 1);
+    let a = trail(&mut ctx, ALICE, SELL, 0, 100, 10);
+    let c_pend = trail(&mut ctx, CAROL, BUY, 9_950, 100, 10);
+    rest(&mut ctx, CAROL, BUY, 9_900, 10);
+    let c = tick(&mut ctx, 9_900);
+    assert_eq!(triggered(&c.logs), vec![(a, 9_900, 9_900)]);
+    assert_eq!(trades(&c.logs), vec![(ALICE, CAROL, 9_900, 10)]);
+    assert_eq!((amount(&mut ctx, ALICE), amount(&mut ctx, CAROL)), (0, 0));
+    assert!(activations(&c.logs).is_empty(), "CAROL's short ended in the fire leg");
+    assert_eq!(algo_cancels(&c.logs), vec![(c_pend, R_POSITION_CLOSED)]);
+    algo_gone(&mut ctx, c_pend);
+    assert!(open_algos(&mut ctx, CAROL).is_empty());
+
+    let mut ctx = fresh();
+    seed_pos(&mut ctx, ALICE, 10, 1);
+    seed_pos(&mut ctx, DAVE, -10, 1);
+    let a = trail(&mut ctx, ALICE, SELL, 0, 100, 10);
+    let d = trail(&mut ctx, DAVE, BUY, 9_950, 100, 10);
+    rest(&mut ctx, BOB, BUY, 9_900, 10);
+    let c = tick(&mut ctx, 9_900);
+    assert_eq!(triggered(&c.logs), vec![(a, 9_900, 9_900)]);
+    assert_eq!(activations(&c.logs), vec![(d, 9_900, 9_999)]);
+    let at = |sig: B256| c.logs.iter().position(|l| l.data.topics().first() == Some(&sig)).unwrap();
+    assert!(
+        at(AlgoOrderTriggered::SIGNATURE_HASH) < at(AlgoOrderActivated::SIGNATURE_HASH),
+        "fire leg before activation leg"
+    );
 }

@@ -1423,8 +1423,13 @@ fn run_deferred_sweeps<H: PerpHost>(
         let trailing_deferred =
             crate::trailing::run_fire_sweep(context, market_id, market, mark_price, &mut budget)?;
         // Activations on their OWN cap: a crowd of crossing activation prices must not spend the
-        // budget stop-losses and liquidations need. A new activation cannot fire on the tick it
-        // activates (its peak is the mark), so running it after the fire walk changes no outcome.
+        // budget stop-losses and liquidations need. AFTER the fire walk, and the order is
+        // load-bearing: a fire in this tick can END a position — as the taker, or as the maker
+        // another owner's fired order hits — that a pending trailing stop is bound to, and only
+        // fires-then-activations sees that at activation and spends the stop as `PositionClosed`
+        // instead of activating it on a position that no longer exists. (L4 — a new activation
+        // cannot fire on its own tick — covers only the other direction: nothing activated here
+        // could have fired in the walk above.) Pinned by `kill_t19_*` in the trailing spec suite.
         let mut activation_cap = crate::trailing::MAX_TRAILING_ACTIVATIONS_PER_UPDATE;
         let activation_deferred = crate::trailing::run_activation_sweep(
             context,
