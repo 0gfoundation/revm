@@ -41,6 +41,10 @@ mod cross_accounting_tests;
 /// ADL interim, J6 and the negative-wallet audit — under the custody identity.
 #[cfg(test)]
 mod cross_settlement_tests;
+/// The independent cross-margin P2 spec suite (`SPEC_cross_margin.md` P2 ground rules, report §3.2
+/// model): every surface against a model, every gate to the unit, the P2 liquidation interim.
+#[cfg(test)]
+mod cross_margin_p2_spec_tests;
 pub mod risk;
 pub mod storage;
 pub mod trading;
