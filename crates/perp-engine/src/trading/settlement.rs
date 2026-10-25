@@ -19,6 +19,13 @@ use crate::{
 
 // ── Position settlement ───────────────────────────────────────────────────────
 
+/// The taker refusal of J6: an ISOLATED open whose silo cash the wallet does not hold (only cross
+/// unrealized profit backs it). See the J6 block in [`TakerSettlement::finalize_compute`].
+/// Binance's code for an order the account cannot margin is `-2019`.
+pub(crate) const ISOLATED_SILO_CASH_REJECT: &str =
+    "placeOrder: -2019 Margin is insufficient. An ISOLATED position is funded from the wallet \
+     balance, never from cross unrealized profit";
+
 /// Accumulates fill data for a taker across multiple partial fills, then
 /// commits the net effect to storage in a single [`finalize`] call.
 ///
@@ -413,6 +420,32 @@ impl TakerSettlement {
                 }
                 (sim_pos, cancelled_any)
             };
+
+        // ── J6: an ISOLATED silo is funded with WALLET CASH, never with cross unrealized profit ──
+        //
+        // The gate above admits the fills against `A`, and for an account holding positions
+        // CROSSED in force `A` counts their unrealized PnL. That is right for what `A` is for — a
+        // cross position's initial margin is a derived requirement, and Binance lets cross profit
+        // back it — but an ISOLATED open MOVES CASH: `core.opening_margin` leaves the wallet for
+        // this position's silo. Funded past the wallet, the silo would hold cross profit converted
+        // into isolated collateral, and the wallet would carry the hole (cross report J6, deviation
+        // D16). So the cash that moves must be in the wallet: `opening_margin ≤ max(W, 0)`, `W`
+        // being the wallet after this order's own close proceeds and before its debit — exactly
+        // the cash at hand the MAKER's M1 cap reads (`apply_position_fill`'s
+        // `CappedAtCashAtHand`), so the two sides follow one rule: the maker's silo is capped to
+        // the cash, the taker (whose draw is decided here, not capped) is refused beyond it.
+        //
+        // The fee is not part of it: it is not silo cash, and like every fee it may be backed by
+        // `A` (a cross account's fee can take `W` below zero).
+        //
+        // HERE, after the available-balance decision, so it only ever binds where that gate let
+        // the fills through: for an account with no cross position `A = W − Σ ooIM ≤ W`, so
+        // passing the gate already implies `W ≥ total_required ≥ opening_margin` and this can never
+        // fire — every isolated-only refusal keeps its existing message, byte for byte. Pre-write,
+        // like every other reject in this function.
+        if core.opening_margin > 0 && core.opening_margin as i128 > wallet.max(0) as i128 {
+            return Err(perp_err(ISOLATED_SILO_CASH_REJECT));
+        }
 
         // The wallet `finalize_apply`'s debit will leave. For an account with no position CROSSED
         // in force it cannot go below zero: both branches above exit with
@@ -1587,6 +1620,9 @@ pub(super) fn cancel_maker_in_match<H: PerpHost>(
 pub(super) struct TakerFillCore {
     pub(super) bad_debt: u64,
     pub(super) fee: u64,
+    /// The cash the opening leg moves into an ISOLATED silo (`0` for a pure close and for a CROSSED
+    /// position) — what J6 holds to the wallet (see `finalize_compute`).
+    pub(super) opening_margin: u64,
     pub(super) total_required: u64,
     pub(super) realized_pnl: i64,
     pub(super) closed_quantity: u64,
@@ -1875,6 +1911,7 @@ fn finalize_core(
     Ok(TakerFillCore {
         bad_debt: fill_outcome.bad_debt,
         fee,
+        opening_margin: fill_outcome.opening_margin,
         total_required,
         realized_pnl: fill_outcome.realized_pnl,
         closed_quantity: closing_qty,

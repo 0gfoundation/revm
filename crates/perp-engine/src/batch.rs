@@ -378,6 +378,12 @@ fn place_reason(rest: &str) -> PerpBatchReason {
         "PostOnly order would match" => PerpBatchReason::PostOnlyWouldMatch,
         "FOK order cannot be fully filled" => PerpBatchReason::FokUnfillable,
         "insufficient perp wallet for margin" => PerpBatchReason::InsufficientMargin,
+        // J6 (cross margin): the isolated silo's cash is not in the wallet — the same cause.
+        r if Some(r)
+            == crate::trading::ISOLATED_SILO_CASH_REJECT.strip_prefix("placeOrder: ") =>
+        {
+            PerpBatchReason::InsufficientMargin
+        }
         "open would breach maintenance margin" => PerpBatchReason::OpenIntoInsolvency,
         "fee recipient not initialised" => PerpBatchReason::FeeRecipientNotSet,
         "max open orders reached" => PerpBatchReason::MaxOpenOrders,

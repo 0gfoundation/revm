@@ -7,6 +7,8 @@
 //!   B-only `AccountBalanceChanged(FUNDING_FEE)` group — no `PositionChanged`;
 //! * the P2 liquidation interim: the sweep and `liquidate()` never liquidate a CROSSED position
 //!   (no `Err`, no write), and ADL ranks a cross winner on its account `E` and settles it into `W`;
+//! * J6: the cash a TAKER moves into an ISOLATED silo must be in the wallet — cross unrealized
+//!   profit admits orders, it never becomes isolated collateral; the maker's M1 cap is unchanged;
 //!
 //! Every scenario re-checks the custody identity after every step ([`Ledger::check`]): the
 //! price-independent sum `Σ spot + Σ W + Σ margin + Σ vQuote + Σ pending funding + IF` over every
@@ -143,6 +145,29 @@ fn ok(ctx: &mut TestCtx, caller: Address, input: &[u8]) -> Vec<Log> {
     let out = call(ctx, caller, input);
     assert!(!out.reverted, "call reverted: {}", revert_reason(&out));
     JournalTr::take_logs(ctx.journal_mut())
+}
+
+/// Runs `input` as `caller` and asserts it reverted with exactly `reason`, writing nothing.
+fn rejects(ctx: &mut TestCtx, caller: Address, input: &[u8], reason: &str) {
+    let before = blobs(ctx);
+    let out = call(ctx, caller, input);
+    assert!(out.reverted, "expected a revert with {reason:?}");
+    assert_eq!(revert_reason(&out), reason);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    assert_eq!(blobs(ctx), before, "a refused call wrote state");
+}
+
+/// Every account and position blob plus the fund, for "a refused call wrote nothing".
+fn blobs(ctx: &mut TestCtx) -> Vec<String> {
+    let mut out = Vec::new();
+    for u in USERS {
+        out.push(format!("{:?}", storage::load_account(ctx, u).unwrap()));
+        for m in MARKETS {
+            out.push(format!("{:?}", pos(ctx, u, m)));
+        }
+    }
+    out.push(format!("IF {}", insurance_fund(ctx)));
+    out
 }
 
 fn order(market: u64, side: u8, price: u64, qty: u64, tif: u8) -> Vec<u8> {
@@ -818,4 +843,87 @@ fn adl_holds_an_underwater_cross_winner_back_to_the_fallback_tier() {
     let gain = value(px(100), 5) - value(px(70), 5);
     assert_eq!(wallet(&mut ctx, ALICE), w0 + gain);
     assert_eq!(pos(&mut ctx, ALICE, M1).margin, 0);
+}
+
+// ── J6: an isolated silo is funded with wallet cash only ─────────────────────────
+
+/// ALICE holds a CROSSED long deep in profit and a small wallet. Her available balance — which
+/// counts that profit — admits an ISOLATED open whose silo is larger than her wallet, and J6 refuses
+/// it: the silo would be cross profit turned into isolated collateral, with the wallet carrying the
+/// hole. A smaller isolated open, whose silo the wallet holds, goes through and leaves the wallet
+/// non-negative.
+#[test]
+fn j6_a_taker_isolated_silo_is_funded_from_the_wallet_only() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+    }
+    set_type(&mut ctx, ALICE, M2, ISOLATED);
+    set_leverage(&mut ctx, ALICE, M1, 3);
+    set_wallet(&mut ctx, ALICE, 400 * USD);
+    let ledger = Ledger::open(&mut ctx);
+
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    set_mark(&mut ctx, M1, px(200)); // cross uPnL +$1,000
+    let w0 = wallet(&mut ctx, ALICE);
+    assert_eq!(w0, 400 * USD - fee(value(px(100), 10), TAKER_PPM));
+    let silo = value(px(100), 5); // 1x
+    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    assert!(f.a >= silo as i128, "the available balance alone would admit it: A = {}", f.a);
+    assert!(silo > w0, "but the wallet does not hold the silo's cash");
+
+    ok(&mut ctx, BOB, &order(M2, SELL, px(100), 5, GTC));
+    rejects(
+        &mut ctx,
+        ALICE,
+        &order(M2, BUY, px(100), 5, IOC),
+        crate::trading::ISOLATED_SILO_CASH_REJECT,
+    );
+    ledger.check(&mut ctx, "after the refusal");
+
+    // A silo the wallet does hold.
+    let logs = ok(&mut ctx, ALICE, &order(M2, BUY, px(100), 3, IOC));
+    ledger.check(&mut ctx, "after the funded open");
+    let n = value(px(100), 3);
+    assert_eq!(pos(&mut ctx, ALICE, M2).margin, n - fee(n, TAKER_PPM));
+    assert_eq!(wallet(&mut ctx, ALICE), w0 - n);
+    assert!(wallet(&mut ctx, ALICE) >= 0);
+    assert_eq!(position_changes(&logs, ALICE)[0].marginType, ISOLATED);
+
+    // The batch status table files the refusal under the same cause as any unaffordable order.
+    assert_eq!(
+        crate::batch::reason_code(&crate::errors::perp_err(
+            crate::trading::ISOLATED_SILO_CASH_REJECT
+        )),
+        crate::batch::PerpBatchReason::InsufficientMargin
+    );
+}
+
+/// The MAKER side keeps its M1 cap verbatim: an ISOLATED resting order admitted on cross profit
+/// fills, and its silo receives the wallet's cash and not a unit more — the wallet ends at zero,
+/// never below, and the silo is short (it carries the gap, as it always has).
+#[test]
+fn j6_a_maker_isolated_silo_stays_capped_at_the_cash_at_hand() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+    }
+    set_type(&mut ctx, ALICE, M2, ISOLATED);
+    set_leverage(&mut ctx, ALICE, M1, 3);
+    set_wallet(&mut ctx, ALICE, 400 * USD);
+    let ledger = Ledger::open(&mut ctx);
+
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    set_mark(&mut ctx, M1, px(200));
+    let w0 = wallet(&mut ctx, ALICE);
+    ok(&mut ctx, ALICE, &order(M2, BUY, px(100), 5, GTC)); // admitted on A
+    ok(&mut ctx, BOB, &order(M2, SELL, px(100), 5, IOC));
+    ledger.check(&mut ctx, "after the maker fill");
+
+    let n = value(px(100), 5);
+    assert!(n > w0);
+    assert_eq!(wallet(&mut ctx, ALICE), 0, "the silo took the cash at hand and no more");
+    assert_eq!(pos(&mut ctx, ALICE, M2).margin, w0 - fee(n, MAKER_PPM as u64));
 }
