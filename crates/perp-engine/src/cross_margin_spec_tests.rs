@@ -60,7 +60,7 @@ use crate::interface::IPerpDex::{
     getSymbolConfigReturn, liquidateCall, placeAlgoOrderCall, placeOrderCall, registerApiKeyCall,
     removePositionMarginCall, setLeverageCall, setMarginTiersCall, setMarginTypeCall,
     setMarginTypeSignedCall, updateIndexPriceCall, AccountBalanceChanged, AccountPosition,
-    Liquidation, MarginTiersUpdated, MarginTypeChanged, PositionChanged, Trade,
+    Adl, Liquidation, MarginTiersUpdated, MarginTypeChanged, PositionChanged, Trade,
 };
 use crate::types::{AccountUpdateReason, MarginTiers, MarginType, Market, PerpPosition};
 use crate::{run_perp_dex_call, storage, PERP_DEX_ADDRESS, USDC_ADDRESS};
@@ -1494,6 +1494,51 @@ fn mt_the_type_persists_across_flat_like_leverage() {
     assert_eq!((s.leverage, s.marginType), (3, ISOLATED));
     switch_self(&mut ctx, ALICE, M1, CROSSED);
     assert_eq!(sym(&mut ctx, ALICE, M1).leverage, 3);
+}
+
+/// …and a LIQUIDATION and an ADL do not move it either: only `setMarginType` writes the type. With
+/// the gate on and everyone ISOLATED, ALICE (long 10 @ $100, 3x) is liquidated at mark $75
+/// (equity 333.33 − 250 = 83.33 < MM 750 / 6 = 125). The book takes 4 (DAVE's bid at $74, inside
+/// the ±10 % band), the ADL takes BOB's whole short of 3, and 3 are left — a PARTIAL liquidation.
+/// Every party's record still says ISOLATED, every surface reports it, and every `PositionChanged`
+/// the liquidation published carries it: the liquidated user (the funding write and the close
+/// legs), the book counterparty, and the ADL winner (the winner leg).
+#[test]
+fn mt_liquidation_and_adl_leave_the_type_alone() {
+    let mut ctx = fresh();
+    let _g = cross_on();
+    for u in [ALICE, BOB, DAVE] {
+        switch_self(&mut ctx, u, M1, ISOLATED);
+    }
+    seed(&mut ctx, ALICE, M1, 10, 3);
+    seed(&mut ctx, BOB, M1, -3, 3);
+    storage::save_mark_price(&mut ctx, M1, 7_500).unwrap();
+    rest(&mut ctx, DAVE, M1, BUY, 7_400, 4);
+
+    let c = ok(&mut ctx, ERIN, &liquidateCall { user: ALICE, marketId: M1 }.abi_encode());
+    let l = evs::<Liquidation>(&c.logs);
+    assert_eq!(l.len(), 1);
+    assert_eq!(l[0].user, ALICE);
+    let adl = evs::<Adl>(&c.logs);
+    assert_eq!(adl.len(), 1, "the ADL leg must run");
+    assert_eq!((adl[0].adlUser, adl[0].qty), (BOB, 3));
+    assert_eq!(amount(&mut ctx, DAVE, M1), 4, "the book leg must run");
+    assert_eq!(amount(&mut ctx, BOB, M1), 0);
+    assert_eq!(amount(&mut ctx, ALICE, M1), 3, "a partial liquidation leaves ALICE open");
+
+    let rows = evs::<PositionChanged>(&c.logs);
+    for u in [ALICE, BOB, DAVE] {
+        assert!(rows.iter().any(|e| e.user == u), "{u} published no PositionChanged");
+    }
+    assert!(
+        rows.iter().all(|e| e.marginType == ISOLATED),
+        "a liquidation or ADL row reported CROSSED: {:?}",
+        rows.iter().map(|e| (e.user, e.marginType)).collect::<Vec<_>>()
+    );
+    for u in [ALICE, BOB, DAVE] {
+        assert_eq!(storage::load_position(&mut ctx, u, M1).unwrap().margin_type, ISOLATED, "{u}");
+        assert_eq!(reported(&mut ctx, u, M1), ISOLATED, "{u}");
+    }
 }
 
 /// With the gate on every surface follows the stored choice, per market: a user CROSSED in M1 and
