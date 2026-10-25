@@ -535,9 +535,10 @@ sol! {
         ///
         /// `data` is a complete inner calldata (4-byte selector + ABI args) for one of the
         /// whitelisted direct per-user selectors — placeOrder, cancelOrder, batchPlaceOrders,
-        /// batchCancelOrders, placeAlgoOrder, cancelAlgoOrder, setLeverage, addPositionMargin,
-        /// removePositionMargin, transferToPerp, transferFromPerp, registerApiKey, revokeApiKey,
-        /// internalTransfer — which then runs exactly as if `subAccount` had called it directly.
+        /// batchCancelOrders, placeAlgoOrder, cancelAlgoOrder, setLeverage, setMarginType,
+        /// addPositionMargin, removePositionMargin, transferToPerp, transferFromPerp,
+        /// registerApiKey, revokeApiKey, internalTransfer — which then runs exactly as if
+        /// `subAccount` had called it directly.
         /// Everything else is rejected: deposit / withdraw (a sub's money enters and leaves through
         /// its master via `internalTransfer`), createSubAccount, asSubAccount, every `*Signed`
         /// selector (those authenticate an `account` argument, not the caller), every admin / role
@@ -1060,6 +1061,61 @@ sol! {
             uint64 maxNotionalValue,
             uint8 marginType
         );
+
+        // ── Margin type (cross P1) ─────────────────────────────────────────
+        /// Change the caller's margin type in one market — Binance's `POST /fapi/v1/marginType`
+        /// ("Change symbol level margin type"). `marginType`: `0` = CROSSED, `1` = ISOLATED; any
+        /// other value reverts. The setting lives on the `(user, marketId)` position record and
+        /// survives the position going flat, like `leverage`; leverage is left unchanged.
+        ///
+        /// Refusals, in this order, every one BEFORE any write; the revert string carries Binance's
+        /// code where Binance has one (`"setMarginType: -4047 ..."`):
+        ///   0. a `marginType` other than 0 / 1 — `setMarginType: invalid marginType`;
+        ///   1. unknown market — `setMarginType: unknown market`;
+        ///   2. the type already IN FORCE was requested — `-4046 No need to change margin type.`;
+        ///   3. any open order of the caller's in the market, a resting book order OR an
+        ///      untriggered conditional / trailing stop — `-4047 Margin type cannot be changed if
+        ///      there exists open orders.` Counting conditional orders is OUR conservative reading;
+        ///      Binance does not say. A position-bound conditional whose position has since closed
+        ///      still lists in `getOpenAlgoOrders` and still counts — cancel it first;
+        ///   4. a non-zero position in the market — `-4048 Margin type cannot be changed if there
+        ///      exists position.`;
+        ///   5. the account is being liquidated — `-2023 User in liquidation mode now.` Arrives
+        ///      with the account's liquidation flag (cross P2); until that field exists no account
+        ///      can be in that state;
+        ///   6. CROSSED requested while cross margin is not enabled — `setMarginType: CROSSED
+        ///      margin is not enabled yet`.
+        /// "In force" in 2 is the EFFECTIVE type `getSymbolConfig` reports. While cross margin is
+        /// not enabled that is ISOLATED for everyone, so this selector then changes nothing:
+        /// ISOLATED is `-4046` and CROSSED is refusal 6 (after 3–5, so a caller learns the
+        /// blocking open order or position first, as it will once the gate lifts).
+        ///
+        /// Success writes only the position record's type byte and emits `MarginTypeChanged`. It
+        /// emits NO `AccountBalanceChanged`: with no position and no order in the market, no
+        /// balance any snapshot carries can move (the same reason `setLeverage` emits none).
+        /// Allowed through `asSubAccount`.
+        function setMarginType(uint64 marketId, uint8 marginType) external;
+        /// `setMarginType` for `account`, authenticated by ed25519 signature.
+        /// Message: "perpdex_v1_margintype"(21) || chainId(8) || account(20) || marketId(8)
+        ///          || marginType(1) || timestamp(8) || recvWindow(8) || keyId(1)
+        /// Refused BEFORE the signature is spent — the refusals that are permanent for this
+        /// message: undecodable calldata, refusal 0, an unregistered api key, recvWindow / expiry /
+        /// signature failures, an already-spent signature, and refusal 1. Refusals 2–6 read the
+        /// owner's state or the gate, can lift later, and so come AFTER the burn (a refused
+        /// signature must not stay replayable until they lift) — in the same order and with the
+        /// same strings as `setMarginType`.
+        /// A signature is single-use and is spent by SUBMISSION, not by success: once this call has
+        /// been included, resubmitting the same signature reverts with "duplicate signature" EVEN IF
+        /// this call was rejected. Re-sign with a fresh timestamp to retry.
+        function setMarginTypeSigned(
+            address account,
+            uint64 marketId,
+            uint8 marginType,
+            uint64 timestamp,
+            uint64 recvWindow,
+            uint8 keyId,
+            bytes calldata signature
+        ) external;
 
         // ── Trading ────────────────────────────────────────────────────────
         /// Place a limit or market order.
@@ -1898,7 +1954,9 @@ sol! {
         /// ADL legs, the post-close dust write-off), 7 = `INSURANCE_CLEAR` (the move settles against
         /// the insurance fund: the liquidation clearance fee, `deposit`/`withdrawInsuranceFund`),
         /// 8 = `INTERNAL_TRANSFER` (ours — no exact Binance `a.m` equivalent: `internalTransfer`,
-        /// value moved between two accounts; the sender's and the receiver's rows both carry it).
+        /// value moved between two accounts; the sender's and the receiver's rows both carry it),
+        /// 9 = `MARGIN_TYPE_CHANGE` (Binance's code for a margin-type switch — DEFINED but carried
+        /// by no row: `setMarginType` moves no balance and publishes only `MarginTypeChanged`).
         /// **255 = `Multiple`**, also ours and not Binance's: the end-of-call drain publishes one
         /// row per user, so two DIFFERENT causes can fold into it, and rather than pick one label and
         /// lie about the other the row says "several". Switch on this field with a default branch.
@@ -2326,6 +2384,13 @@ sol! {
         event PositionMarginAdjusted(address indexed user, uint64 indexed marketId, int64 delta, int64 margin);
         // Feeds: useful for debugging / audit; no direct REST endpoint
         event LeverageChanged(address indexed user, uint64 indexed marketId, uint64 leverage);
+        /// `setMarginType` / `setMarginTypeSigned` succeeded: `marginType` (`0` = CROSSED,
+        /// `1` = ISOLATED) is now the user's type in `marketId`. Binance's
+        /// `ACCOUNT_UPDATE` with `m = MARGIN_TYPE_CHANGE` (`AccountUpdateReason` code 9) — but
+        /// this venue publishes it as THIS log alone, with no `AccountBalanceChanged`: a switch
+        /// is only allowed flat and order-free, so no balance moves. An indexer synthesising
+        /// Binance's push from it uses reason code 9 and a flat `P[]` row.
+        event MarginTypeChanged(address indexed user, uint64 indexed marketId, uint8 marginType);
 
         // Feeds: /income (LIQUIDATION_FEE for liquidator)
         event Liquidation(address indexed user, uint64 indexed marketId, address liquidator, int64 amount, uint64 reward, uint64 markPrice);

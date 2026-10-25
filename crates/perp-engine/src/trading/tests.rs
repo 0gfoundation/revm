@@ -17089,6 +17089,7 @@ mod signed_replay {
             b"perpdex_v1_batch_order",
             b"perpdex_v1_xfer_to",
             b"perpdex_v1_xfer_from",
+            b"perpdex_v1_margintype",
         ];
         for (i, a) in prefixes.iter().enumerate() {
             for (j, b) in prefixes.iter().enumerate() {
@@ -17726,6 +17727,7 @@ mod abi_message_layout {
             ("perpdex_v1_leverage", 80),
             ("perpdex_v1_xfer_to", 71),
             ("perpdex_v1_xfer_from", 73),
+            ("perpdex_v1_margintype", 75),
         ] {
             assert_eq!(
                 declared_width(prefix),

@@ -40,12 +40,14 @@ use crate::{
         getMaxMakerRebateCall, getUserFeeRatesCall,
         initAdminCall, liquidateCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall,
         removePositionMarginCall, revokeApiKeyCall, setLeverageCall, setLeverageSignedCall,
-        setBasisModeCall, setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall,
+        setBasisModeCall, setMarginTiersCall, setMarginTypeCall, setMarginTypeSignedCall,
+        setMarketManagerAddressCall, setOracleAddressCall,
         setMaxMakerRebateCall, setUserFeeRatesCall,
         transferAdminCall, transferFromPerpCall, transferFromPerpSignedCall, transferToPerpCall,
         transferToPerpSignedCall, updateIndexPriceCall, updateIndexPriceFromBookCall,
         updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
     },
+    margin_type::{run_set_margin_type, run_set_margin_type_signed},
     margin_view::{run_get_account_margin, run_get_position_risk},
     risk::{
         run_add_market, run_add_position_margin, run_deposit_insurance_fund,
@@ -322,6 +324,15 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // reflect the removal of work that is still being done by a different line.
         m.insert(setLeverageCall::SELECTOR, (30_000, false));
         m.insert(setLeverageSignedCall::SELECTOR, (30_000, false));
+        // Margin type (cross P1): priced WITH `setLeverage`, both paths, flat — the same shape of
+        // work: one market + one position `_ref` load, a settings-only position write that marks
+        // nobody, one log, and (signed) the same verify + burn. In place of `setLeverage`'s
+        // per-user index walk it reads the three per-(user, market) order lists (`-4047`: book
+        // buys, book sells, conditionals), and from cross P2 the account for `-2023`. No
+        // `AccountBalanceChanged` is published (see `storage::save_position_margin_type_only`),
+        // so there is no snapshot surcharge to add.
+        m.insert(setMarginTypeCall::SELECTOR, (30_000, false));
+        m.insert(setMarginTypeSignedCall::SELECTOR, (30_000, false));
         // `getSymbolConfig`: priced with `getPosition` (5_000), not with the derived margin views.
         // It is the same load set as `getPosition` — one position `_ref` and one market `_ref`, both
         // scalar blobs — and then pure in-register arithmetic: a walk of a table bounded by
@@ -810,6 +821,11 @@ pub(crate) fn dispatch<H: PerpHost>(
         s if s == setLeverageCall::SELECTOR => run_set_leverage(input_bytes, caller, context),
         s if s == setLeverageSignedCall::SELECTOR => run_set_leverage_signed(input_bytes, context),
         s if s == getSymbolConfigCall::SELECTOR => run_get_symbol_config(input_bytes, context),
+        // Margin type
+        s if s == setMarginTypeCall::SELECTOR => run_set_margin_type(input_bytes, caller, context),
+        s if s == setMarginTypeSignedCall::SELECTOR => {
+            run_set_margin_type_signed(input_bytes, context)
+        }
         // Trading
         s if s == placeOrderCall::SELECTOR => run_place_order(input_bytes, caller, context),
         s if s == cancelOrderCall::SELECTOR => run_cancel_order(input_bytes, caller, context),

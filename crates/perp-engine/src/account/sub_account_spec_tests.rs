@@ -49,7 +49,8 @@ use crate::interface::IPerpDex::{
     initAdminCall, setMaxMakerRebateCall,
     internalTransferCall, liquidateCall, placeAlgoOrderCall, placeAlgoOrderSignedCall,
     placeOrderCall, placeOrderSignedCall, registerApiKeyCall, removePositionMarginCall,
-    revokeApiKeyCall, setBasisModeCall, setLeverageCall, setLeverageSignedCall,
+    revokeApiKeyCall, setBasisModeCall, setLeverageCall, setLeverageSignedCall, setMarginTypeCall,
+    setMarginTypeSignedCall,
     setMarginTiersCall, setMarketManagerAddressCall, setOracleAddressCall,
     setUserFeeRatesCall, transferAdminCall, transferFromPerpCall, transferFromPerpSignedCall,
     transferToPerpCall, transferToPerpSignedCall, updateIndexPriceCall,
@@ -1010,6 +1011,8 @@ fn spec_wrap_table() -> Vec<(&'static str, [u8; 4], Wrap)> {
         ("placeAlgoOrder", placeAlgoOrderCall::SELECTOR, allow("placeAlgoOrder: invalid calldata", 200_000)),
         ("cancelAlgoOrder", cancelAlgoOrderCall::SELECTOR, allow("cancelAlgoOrder: invalid calldata", 80_000)),
         ("setLeverage", setLeverageCall::SELECTOR, allow("setLeverage: invalid calldata", 30_000)),
+        // Cross P1 — added to the whitelist with the selector.
+        ("setMarginType", setMarginTypeCall::SELECTOR, allow("setMarginType: invalid calldata", 30_000)),
         ("addPositionMargin", addPositionMarginCall::SELECTOR, allow("addPositionMargin: invalid calldata", 40_000)),
         ("removePositionMargin", removePositionMarginCall::SELECTOR, allow("removePositionMargin: invalid calldata", 40_000)),
         ("transferToPerp", transferToPerpCall::SELECTOR, allow("transferToPerp: invalid calldata", 30_000)),
@@ -1031,6 +1034,7 @@ fn spec_wrap_table() -> Vec<(&'static str, [u8; 4], Wrap)> {
         ("placeAlgoOrderSigned", placeAlgoOrderSignedCall::SELECTOR, Deny),
         ("cancelAlgoOrderSigned", cancelAlgoOrderSignedCall::SELECTOR, Deny),
         ("setLeverageSigned", setLeverageSignedCall::SELECTOR, Deny),
+        ("setMarginTypeSigned", setMarginTypeSignedCall::SELECTOR, Deny),
         ("transferToPerpSigned", transferToPerpSignedCall::SELECTOR, Deny),
         ("transferFromPerpSigned", transferFromPerpSignedCall::SELECTOR, Deny),
         // ── DENY: admin / role / oracle / market-manager / market-config / insurance fund ──
@@ -1100,8 +1104,8 @@ fn the_as_sub_account_whitelist_matches_the_spec_for_every_selector_in_the_table
         "the shell's selector table and the spec classification differ — classify the new \
          selector here (default DENY) before it ships"
     );
-    assert_eq!(table.len(), 72);
-    assert_eq!(table.iter().filter(|r| matches!(r.2, Wrap::Allow { .. })).count(), 14);
+    assert_eq!(table.len(), 74);
+    assert_eq!(table.iter().filter(|r| matches!(r.2, Wrap::Allow { .. })).count(), 15);
     // `internalTransfer` is not key-signable (spec §5): no signed twin exists.
     assert!(!names.iter().any(|n| n.starts_with("internalTransfer") && n.ends_with("Signed")));
 

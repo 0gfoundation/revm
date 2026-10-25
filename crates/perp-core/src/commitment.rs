@@ -342,6 +342,11 @@ use primitives::{B256, U256};
 //     golden scenario's write set differs only by the position blobs' extra byte — VERIFIED: with
 //     the field `#[serde(skip)]` it reproduced the 39-P0 pin 0xafd82645…7b48. BusinessSnapshot
 //     UNCHANGED. CHAIN change: golden re-pin + a coordinated wipe on deploy.
+//   * P1 — `setMarginType` / `setMarginTypeSigned` (and `setMarginType` on the `asSubAccount`
+//     whitelist). New selectors, no layout change. While the gate is off neither can write the
+//     type byte — ISOLATED is already in force (`-4046`) and CROSSED is refused — so the only
+//     state they can move is the signed path's spent-signature marker (burned on submission,
+//     like every signed selector). The golden scenario calls neither: its pin does not move.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

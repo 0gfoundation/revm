@@ -29,7 +29,7 @@ use crate::{
         batchPlaceOrdersCall, cancelAlgoOrderCall, cancelOrderCall, createSubAccountCall,
         depositCall, getMasterCall, getSubAccountsCall, internalTransferCall, placeAlgoOrderCall,
         placeOrderCall, registerApiKeyCall, removePositionMarginCall, revokeApiKeyCall,
-        setLeverageCall, transferFromPerpCall, transferToPerpCall, withdrawCall,
+        setLeverageCall, setMarginTypeCall, transferFromPerpCall, transferToPerpCall, withdrawCall,
     },
     math::QUOTE_DECIMALS,
     storage,
@@ -82,6 +82,7 @@ pub const AS_SUB_ACCOUNT_OVERHEAD_GAS: u64 = 5_000;
 /// | `placeAlgoOrder` | conditional order keyed by `caller`, id from the sub's nonce |
 /// | `cancelAlgoOrder` | ownership checked against `caller` |
 /// | `setLeverage` | the sub's own position in that market |
+/// | `setMarginType` | the sub's own position record in that market, gated by its own orders and position |
 /// | `addPositionMargin` | sub's perp wallet → sub's position silo |
 /// | `removePositionMargin` | sub's position silo → sub's perp wallet, under the sub's own cap |
 /// | `transferToPerp` | sub's spot → sub's perp wallet |
@@ -119,6 +120,7 @@ pub fn sub_account_selector_allowed(selector: [u8; 4]) -> bool {
         placeAlgoOrderCall::SELECTOR,
         cancelAlgoOrderCall::SELECTOR,
         setLeverageCall::SELECTOR,
+        setMarginTypeCall::SELECTOR,
         addPositionMarginCall::SELECTOR,
         removePositionMarginCall::SELECTOR,
         transferToPerpCall::SELECTOR,

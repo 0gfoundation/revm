@@ -396,14 +396,14 @@ fn as_sub_account_authorization_and_whitelist() {
     rejects(&mut ctx, MASTER, &as_sub(MASTER, place_buy()), "caller is not the master");
     rejects(&mut ctx, MASTER, &as_sub(OTHER, place_buy()), "caller is not the master");
 
-    // The whitelist is exactly the 14 documented selectors, all of them tabled + dispatched.
+    // The whitelist is exactly the 15 documented selectors, all of them tabled + dispatched.
     let table = selectors_map();
     let allowed: Vec<_> = table
         .keys()
         .copied()
         .filter(|s| sub_account_selector_allowed(*s))
         .collect();
-    assert_eq!(allowed.len(), 14);
+    assert_eq!(allowed.len(), 15);
 
     // Every other selector in the table is refused — whatever its arguments, since the refusal
     // precedes the inner decode.
@@ -419,7 +419,7 @@ fn as_sub_account_authorization_and_whitelist() {
         rejects(&mut ctx, MASTER, &as_sub(sub, inner), expect);
         denied += 1;
     }
-    assert_eq!(denied, table.len() - 14);
+    assert_eq!(denied, table.len() - 15);
     assert!(!sub_account_selector_allowed(asSubAccountCall::SELECTOR), "no recursion");
     assert!(!sub_account_selector_allowed(createSubAccountCall::SELECTOR), "no nesting");
 

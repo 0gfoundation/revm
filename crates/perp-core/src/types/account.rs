@@ -369,9 +369,10 @@ impl UserAccount {
 /// Numbering follows [`crate::types::CancelReason`]/[`crate::types::OrderStatus`] style — a stable
 /// `u8` wire code, never a string. The codes 0..=7 are the Binance vocabulary values we can
 /// actually produce; 8 ([`Self::InternalTransfer`]) is ours — appended after them for an operation
-/// Binance's vocabulary has no value for; `255` is [`Self::Multiple`], also ours and the one value
-/// that is not a single cause (see below), parked at the top of the range so the low block stays
-/// contiguous and extensible.
+/// Binance's vocabulary has no value for; 9 ([`Self::MarginTypeChange`]) is Binance's again, and
+/// the one code no row carries (see below); `255` is [`Self::Multiple`], also ours and the one
+/// value that is not a single cause (see below), parked at the top of the range so the low block
+/// stays contiguous and extensible.
 ///
 /// # The mapping to Binance's `a.m` vocabulary
 ///
@@ -386,10 +387,20 @@ impl UserAccount {
 /// | [`Self::Adjustment`] | `ADJUSTMENT` | the protocol moved a position or a balance with NO order of the user's and no transfer: the liquidation residual closed at mark, both ADL legs, and the post-close dust write-off. |
 /// | [`Self::InsuranceClear`] | `INSURANCE_CLEAR` | the counterparty of the wallet move is the INSURANCE FUND: the liquidation clearance fee, and the admin's `depositInsuranceFund` / `withdrawInsuranceFund`. |
 /// | [`Self::InternalTransfer`] | — (none; ours) | `internalTransfer`: value moved between TWO accounts (family or external) — both legs, sender and receiver, carry it. |
+/// | [`Self::MarginTypeChange`] | `MARGIN_TYPE_CHANGE` | **nothing — no `AccountBalanceChanged` row carries it.** See below. |
 ///
-/// `MARGIN_TYPE_CHANGE` is deliberately **absent**: this venue is isolated-margin-only (there is no
-/// cross mode and no selector that could change a margin type), so the value would be one no path
-/// can produce — a hole in the table a consumer could mistake for something meaningful.
+/// ## `MARGIN_TYPE_CHANGE`: defined, and produced by no row
+///
+/// It was deliberately absent while the venue was isolated-only, as a value no path could produce.
+/// Cross margin (P1) added the switch — `setMarginType` — but the switch STILL publishes no
+/// `AccountBalanceChanged`: it is refused unless the position is flat and the market holds none of
+/// the owner's orders, so none of the three balances the row carries can move, and a row with no
+/// change in it has no truthful reason (the argument `setLeverage`'s silence rests on — see
+/// `perp_engine::storage::save_position_margin_type_only`). The switch is published as its own
+/// `MarginTypeChanged` log instead. The code is defined anyway, at Binance's name, because that
+/// log IS Binance's `ACCOUNT_UPDATE m=MARGIN_TYPE_CHANGE`: an indexer synthesising Binance's push
+/// from it needs the canonical byte, and it must be the same byte this enum would use if a future
+/// path ever did publish a row for it. Switch on the field with a default branch regardless.
 ///
 /// ## `transferToPerp` / `transferFromPerp`: `ASSET_TRANSFER`, not `MARGIN_TRANSFER`
 ///
@@ -446,6 +457,10 @@ pub enum AccountUpdateReason {
     /// the sender's and the receiver's after-image carry it. Deliberately NOT [`Self::AssetTransfer`]
     /// — see the type docs.
     InternalTransfer = 8,
+    /// Binance `MARGIN_TYPE_CHANGE`: the margin type of a position changed. **Carried by no
+    /// `AccountBalanceChanged` row** — the switch moves no balance and publishes only its
+    /// `MarginTypeChanged` log; the code exists for that log's Binance mapping. See the type docs.
+    MarginTypeChange = 9,
     /// **OURS, not Binance's.** Two or more distinct causes coalesced into one drained row. See the
     /// type docs — never chosen by a publish site, only produced by [`Self::merge`].
     Multiple = 255,
@@ -474,6 +489,7 @@ impl AccountUpdateReason {
             6 => Self::Adjustment,
             7 => Self::InsuranceClear,
             8 => Self::InternalTransfer,
+            9 => Self::MarginTypeChange,
             255 => Self::Multiple,
             _ => return None,
         })
@@ -552,14 +568,16 @@ mod tests {
             (Adjustment, 6),
             (InsuranceClear, 7),
             (InternalTransfer, 8),
+            (MarginTypeChange, 9),
             (Multiple, 255),
         ] {
             assert_eq!(r.code(), code, "{r:?}");
             assert_eq!(AccountUpdateReason::from_code(code), Some(r));
         }
         // No catch-all: an undefined byte decodes to `None`, never onto a neighbouring reason.
-        assert_eq!(AccountUpdateReason::from_code(9), None);
-        assert_eq!(AccountUpdateReason::from_code(254), None);
+        for code in 10..=254 {
+            assert_eq!(AccountUpdateReason::from_code(code), None, "code {code}");
+        }
     }
 
     /// The drain's conflict rule. The properties that matter are that it is IDEMPOTENT (the common
@@ -579,6 +597,7 @@ mod tests {
             Adjustment,
             InsuranceClear,
             InternalTransfer,
+            MarginTypeChange,
             Multiple,
         ];
         for a in all {
