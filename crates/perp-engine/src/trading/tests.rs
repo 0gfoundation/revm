@@ -16385,7 +16385,7 @@ mod position_changed_derived_fields {
     }
 
     /// The path that had NO other position row at all: a maker whose fill is rejected as
-    /// open-into-insolvency (`MakerFillOutcome::RejectedInsolvent`). Its funding is computed at
+    /// open-into-insolvency (`MakerFillOutcome::Rejected`). Its funding is computed at
     /// `MatchRegistry::get_or_load` and flushed to storage with everyone else's, but the walk
     /// pushes no `PositionChanged` for it — so before the funding-path emit this transaction moved
     /// the maker's `iw` and published an account update with no `P[]` entry for it.

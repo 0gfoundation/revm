@@ -711,22 +711,32 @@ pub(super) enum MakerFillOutcome {
         realized_pnl: i64,
         closed_quantity: u64,
     },
-    /// The fill was NOT applied and the caller must cancel the maker order. TWO triggers, both
-    /// meaning "this maker cannot take this fill":
+    /// The fill was NOT applied and the caller must cancel the maker order, publishing `reason` on
+    /// its `OrderCancelled`. THREE triggers, all meaning "this maker cannot take this fill":
     ///
     /// 1. it would open/increase an ISOLATED position below the maintenance-margin threshold at
     ///    the current mark (K9 — a CROSSED maker is never refused on solvency, see
-    ///    `settle_maker_fill_core`);
-    /// 2. it would open at a leverage the resulting size's margin tier no longer permits.
+    ///    `settle_maker_fill_core`) — `MakerInsolvent`;
+    /// 2. it would open at a leverage the resulting size's margin tier no longer permits —
+    ///    `MakerInsolvent`;
+    /// 3. the maker's ACCOUNT is in liquidation (`UserAccount::in_liquidation`, cross margin) —
+    ///    `Liquidation`. A cross liquidation cancels all of the account's orders, in steps (P3);
+    ///    until the last one is gone, none of them may fill. Checked before anything else, off the
+    ///    account the registry already loaded.
     ///
     /// A wallet SHORTFALL is deliberately NOT in this list: the fill happens and the wallet goes
     /// negative (Binance never sweeps an under-covered lien — see the long note in
     /// [`settle_maker_fill_core`]). This channel is for fills that would leave an INSOLVENT
-    /// POSITION, which is a different question from an under-funded wallet.
+    /// POSITION or that a liquidation has frozen, which are different questions from an
+    /// under-funded wallet — and NOT for an unhealthy cross ACCOUNT: a cross maker fill gets no
+    /// account-level check (owner decision Q9 / D13), the liquidation sweep is the backstop.
     ///
     /// Funding accrued on the maker's position IS settled and persisted regardless (it is owed
     /// whether or not the fill happens, and may already have touched the Insurance Fund inline).
-    RejectedInsolvent,
+    Rejected {
+        /// `MakerInsolvent` (1, 2) or `Liquidation` (3).
+        reason: crate::types::CancelReason,
+    },
 }
 
 // ── Match working-copy registry (commit-only #23, tranche-4 L1) ─────────────────
@@ -1534,6 +1544,20 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     let mark = market.mark_price;
 
     let w = &mut reg.users[i].1;
+    // ── A maker in LIQUIDATION is cancelled, not filled (cross report §3.3 item 4) ──────────────
+    //
+    // `liq_flags` is the account-level freeze a cross liquidation sets (P3): the episode cancels
+    // every one of the account's orders, in steps under a budget, and the flag is what guarantees
+    // that the ones not reached yet cannot fill in between. So any order of a flagged account —
+    // either margin type, reduce-only or not — is removed when the walk reaches it, exactly like a
+    // K9 reject. Free: the account is the working copy `get_or_load` just took (its funding is
+    // settled and persisted regardless, as for every rejected maker). Nothing sets the flag before
+    // P3, so this never fires in production yet.
+    if w.account.in_liquidation() {
+        return Ok(MakerFillOutcome::Rejected {
+            reason: crate::types::CancelReason::Liquidation,
+        });
+    }
     let core = settle_maker_fill_core(
         &mut w.pos,
         &mut w.account,
@@ -1549,7 +1573,11 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     )?;
 
     let (maker_fee, bad_debt, realized_pnl, closed_quantity) = match core {
-        MakerFillCore::RejectedInsolvent => return Ok(MakerFillOutcome::RejectedInsolvent),
+        MakerFillCore::RejectedInsolvent => {
+            return Ok(MakerFillOutcome::Rejected {
+                reason: crate::types::CancelReason::MakerInsolvent,
+            })
+        }
         MakerFillCore::Filled {
             maker_fee,
             bad_debt,
@@ -1603,9 +1631,10 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
 
 /// Registry-backed cancel of a resting maker the walk REMOVES instead of filling: drops the order
 /// from the registry copies and queues its `DeleteOrder` + `OrderCancelled(reason)` as DEFERRED
-/// match events. Two callers, told apart by `reason`:
-/// * `MakerInsolvent` — a `RejectedInsolvent` fill (K9: filling it would open the maker below
-///   maintenance);
+/// match events. Three reasons, from two callers:
+/// * `MakerInsolvent` — a rejected fill (K9: filling it would open the maker below maintenance,
+///   or past its tier);
+/// * `Liquidation` — a rejected fill whose maker's account is in liquidation (cross margin);
 /// * `SelfTradePrevention` — the maker belongs to the taker's own address and the taker's mode
 ///   expires the maker. Its WHOLE remainder goes, not only what the taker would have filled.
 ///
@@ -1632,9 +1661,10 @@ pub(super) fn cancel_maker_in_match<H: PerpHost>(
         matches!(
             reason,
             crate::types::CancelReason::MakerInsolvent
+                | crate::types::CancelReason::Liquidation
                 | crate::types::CancelReason::SelfTradePrevention
         ),
-        "the walk cancels a maker only for K9 or STP, not {reason:?}"
+        "the walk cancels a maker only for K9, a liquidation freeze or STP, not {reason:?}"
     );
     let i = reg.get_or_load(context, maker, market_id, market)?;
     let w = &mut reg.users[i].1;

@@ -317,7 +317,7 @@ pub(crate) fn apply_funding_settlement<H: PerpHost>(
     //
     // On most paths a later `PositionChanged` would have covered it (a fill, a margin add/remove,
     // a liquidation close), but NOT on all of them: a maker whose fill is rejected as
-    // open-into-insolvency (`MakerFillOutcome::RejectedInsolvent`) has its funding computed at
+    // open-into-insolvency (`MakerFillOutcome::Rejected`) has its funding computed at
     // `MatchRegistry::get_or_load`, flushed to storage with the rest, and no `PositionChanged`
     // pushed for it. Emitting from here — the ONE place that knows funding actually moved money —
     // closes that hole for every caller at once instead of asking each of them to remember.

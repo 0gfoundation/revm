@@ -2403,10 +2403,11 @@ pub(super) fn match_order<H: PerpHost>(
                     )?;
                     let taker_fee_share = taker_settlement.fee_share_of_next_fill(fill_notional)?;
                     // Maker open-solvency guard (K9): settle the maker first. If filling
-                    // it would open its position below maintenance at mark, cancel the
-                    // maker order (drop it from this level by not re-queuing) and skip —
-                    // the taker's `remaining` is untouched so it keeps matching. Funding
-                    // is settled+persisted inside either way.
+                    // it would open its position below maintenance at mark — or its account
+                    // is frozen by a liquidation — cancel the maker order (drop it from this
+                    // level by not re-queuing) and skip — the taker's `remaining` is
+                    // untouched so it keeps matching. Funding is settled+persisted inside
+                    // either way.
                     let (maker_fee, maker_pos_snapshot, maker_realized_pnl, maker_closed_qty) =
                         match settlement::settle_maker_fill_registry(
                             context,
@@ -2426,7 +2427,7 @@ pub(super) fn match_order<H: PerpHost>(
                                 realized_pnl,
                                 closed_quantity,
                             } => (maker_fee, pos_snapshot, realized_pnl, closed_quantity),
-                            MakerFillOutcome::RejectedInsolvent => {
+                            MakerFillOutcome::Rejected { reason } => {
                                 settlement::cancel_maker_in_match(
                                     context,
                                     &mut registry,
@@ -2436,7 +2437,7 @@ pub(super) fn match_order<H: PerpHost>(
                                     &maker_id,
                                     &mut maker_order,
                                     market,
-                                    CancelReason::MakerInsolvent,
+                                    reason,
                                 )?;
                                 // A live maker left the level (cancelled): count it. Dropped from the
                                 // queue (not re-queued); if it was the last live order the count hits 0
@@ -2706,7 +2707,7 @@ pub(super) fn match_order<H: PerpHost>(
                                 realized_pnl,
                                 closed_quantity,
                             } => (maker_fee, pos_snapshot, realized_pnl, closed_quantity),
-                            MakerFillOutcome::RejectedInsolvent => {
+                            MakerFillOutcome::Rejected { reason } => {
                                 settlement::cancel_maker_in_match(
                                     context,
                                     &mut registry,
@@ -2716,7 +2717,7 @@ pub(super) fn match_order<H: PerpHost>(
                                     &maker_id,
                                     &mut maker_order,
                                     market,
-                                    CancelReason::MakerInsolvent,
+                                    reason,
                                 )?;
                                 // A live maker left the level (see the Buy mirror): count it.
                                 level_removed += 1;

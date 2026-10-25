@@ -4,7 +4,9 @@
 //!   so it is checked even when its wallet draw (the fee) is zero — no B1 exemption for an open;
 //! * J1: an opening taker fill of an account with cross exposure must leave it at or above cross
 //!   maintenance (`E_post − draw ≥ Σ_C MM_post`) — refused at exactly one unit below, even where
-//!   the available balance alone admits it; a pure reduce keeps the B1 exemption.
+//!   the available balance alone admits it; a pure reduce keeps the B1 exemption;
+//! * makers (Q9 / D13): a cross maker fill gets no account-level check, however unhealthy the
+//!   account — but every resting order of an account IN LIQUIDATION is cancelled, not filled.
 //!
 //! A child of `cross_settlement_tests`, so it runs on that fixture: two markets on an exact grid
 //! (base 0 decimals, price 2), `USD` = one dollar in quote units, the custody [`Ledger`] re-checked
@@ -258,4 +260,116 @@ fn a_zero_fee_cross_open_cancels_its_own_same_side_orders_to_fit() {
         "the resting buy was cancelled to make room"
     );
     assert_eq!(fold(&mut ctx, ALICE).a, 50 * USD as i128, "W − PIM = $150 − $100");
+}
+
+// ── Makers ────────────────────────────────────────────────────────────────────────────────────
+
+fn trades_with(logs: &[Log], maker: Address) -> usize {
+    use crate::interface::IPerpDex::Trade;
+    logs.iter()
+        .filter(|l| l.data.topics().first() == Some(&Trade::SIGNATURE_HASH))
+        .map(|l| Trade::decode_raw_log(l.data.topics(), &l.data.data).unwrap())
+        .filter(|t| t.maker == maker)
+        .count()
+}
+
+/// Q9 / D13: a resting cross order fills whatever the health of its account. ALICE's account is
+/// below cross maintenance (`E = $199 < Σ MM = $200`) with a NEGATIVE available balance — no new
+/// order of hers would be admitted — and her resting cross buy, admitted while she was healthy,
+/// still fills in full when CAROL sells into it.
+#[test]
+fn a_cross_maker_fill_is_not_refused_on_account_health() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+        set_type(&mut ctx, CAROL, m, ISOLATED);
+        set_leverage(&mut ctx, ALICE, m, 3);
+    }
+    set_wallet(&mut ctx, ALICE, 1_000 * USD);
+    trade(&mut ctx, M2, ALICE, BOB, BUY, px(100), 20);
+    let id = place(&mut ctx, ALICE, &order(M1, BUY, px(100), 3, GTC));
+    set_mark(&mut ctx, M2, px(60));
+    let f = fold(&mut ctx, ALICE);
+    assert!(f.below_cross_maintenance() && f.a < 0, "underwater and over-committed: {f:?}");
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = ok(&mut ctx, CAROL, &order(M1, SELL, px(100), 3, IOC));
+    ledger.check(&mut ctx, "after the maker fill");
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 3, "filled, not cancelled");
+    assert_eq!(trades_with(&logs, ALICE), 1);
+    assert!(cancels(&logs, ALICE).is_empty(), "order {id:?} was not cancelled");
+    assert!(fold(&mut ctx, ALICE).below_cross_maintenance());
+}
+
+/// An account IN LIQUIDATION (`liq_flags`, set by P3 — here by the test stand-in) has every resting
+/// order removed when the walk reaches it instead of filled: a cross buy, an isolated sell, and a
+/// reduce-only order alike, each with `OrderCancelled(reason = Liquidation)`. The taker walks on to
+/// the next maker and fills there; the flagged account's positions do not move. Cleared, the
+/// account's next resting order fills again.
+#[test]
+fn a_maker_of_an_account_in_liquidation_is_cancelled_not_filled() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+        set_type(&mut ctx, CAROL, m, ISOLATED);
+    }
+    set_type(&mut ctx, ALICE, M2, ISOLATED);
+    // A cross long of 5 on M1 for the reduce-only sell to work against.
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 5);
+    let cross_buy = place(&mut ctx, ALICE, &order(M1, BUY, px(100), 3, GTC));
+    ok(&mut ctx, BOB, &order(M1, BUY, px(99), 3, GTC));
+    let iso_sell = place(&mut ctx, ALICE, &order(M2, SELL, px(100), 2, GTC));
+    let reduce_only = place(
+        &mut ctx,
+        ALICE,
+        &placeOrderCall {
+            marketId: M1,
+            side: SELL,
+            price: px(101),
+            quantity: 2,
+            orderType: 0,
+            tif: GTC,
+            clientOrderId: FixedBytes::default(),
+            flags: 1,
+        }
+        .abi_encode(),
+    );
+    storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
+    // Position state and wallet (the order aggregates do move: the cancels shrink `Bid`/`Ask`).
+    let alice = |ctx: &mut TestCtx| {
+        let (p1, p2) = (pos(ctx, ALICE, M1), pos(ctx, ALICE, M2));
+        let state = |p: crate::types::PerpPosition| (p.amount, p.v_quote_balance, p.margin);
+        (state(p1), state(p2), wallet(ctx, ALICE))
+    };
+    let before = alice(&mut ctx);
+    let ledger = Ledger::open(&mut ctx);
+    let liquidation = crate::types::CancelReason::Liquidation as u8;
+
+    // CAROL sells 3 down to $99: ALICE's $100 cross buy is first in line and is cancelled; BOB's
+    // $99 bid fills.
+    let logs = ok(&mut ctx, CAROL, &order(M1, SELL, px(99), 3, IOC));
+    ledger.check(&mut ctx, "after the cross maker was skipped");
+    assert_eq!(cancels(&logs, ALICE), vec![(cross_buy, liquidation)]);
+    assert_eq!((trades_with(&logs, ALICE), trades_with(&logs, BOB)), (0, 1));
+    assert_eq!(pos(&mut ctx, CAROL, M1).amount, -3);
+    // An isolated order and a reduce-only one are frozen alike: the flag is the ACCOUNT's.
+    let logs = ok(&mut ctx, CAROL, &order(M2, BUY, px(100), 2, IOC));
+    assert_eq!(cancels(&logs, ALICE), vec![(iso_sell, liquidation)]);
+    assert_eq!(pos(&mut ctx, CAROL, M2).amount, 0, "nothing else on the book: it expired");
+    ok(&mut ctx, BOB, &order(M1, SELL, px(101), 3, GTC));
+    let logs = ok(&mut ctx, CAROL, &order(M1, BUY, px(101), 2, IOC));
+    assert_eq!(cancels(&logs, ALICE), vec![(reduce_only, liquidation)]);
+    assert_eq!(trades_with(&logs, BOB), 1, "the walk went on to BOB's ask");
+    ledger.check(&mut ctx, "after the isolated and reduce-only makers were skipped");
+    assert_eq!(alice(&mut ctx), before, "ALICE's positions and wallet did not move");
+
+    // Cleared: her next resting order fills as usual.
+    storage::set_in_liquidation_for_test(&mut ctx, ALICE, false).unwrap();
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(98), 1, GTC));
+    let logs = ok(&mut ctx, CAROL, &order(M1, SELL, px(98), 1, IOC));
+    assert_eq!(trades_with(&logs, ALICE), 1);
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 6);
+    ledger.check(&mut ctx, "after the flag was cleared");
 }

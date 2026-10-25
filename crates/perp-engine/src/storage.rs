@@ -764,6 +764,25 @@ pub fn save_account<H: PerpHost>(
     Ok(())
 }
 
+/// Test-only stand-in for cross liquidation's `liq_flags` writer (P3): sets or clears
+/// [`crate::types::LIQ_FLAG_IN_LIQUIDATION`] on `user`'s stored account, through
+/// [`mutate_account`] — the writer the flag is reserved for ([`save_account`] carries the stored
+/// value over its caller's copy). Moves no balance, so it marks nothing.
+#[cfg(test)]
+pub(crate) fn set_in_liquidation_for_test<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    on: bool,
+) -> Result<(), PerpError> {
+    mutate_account(context, user, |a| {
+        if on {
+            a.liq_flags |= crate::types::LIQ_FLAG_IN_LIQUIDATION;
+        } else {
+            a.liq_flags &= !crate::types::LIQ_FLAG_IN_LIQUIDATION;
+        }
+    })
+}
+
 /// Position write for the paths that touch ONLY the per-side aggregates (`total_buy/sell_{qty,
 /// notional}` — the `Bid`/`Ask` that derived `ooIM` is computed from): an order resting, an order
 /// being cancelled, a cancel-all clearing both sides.
