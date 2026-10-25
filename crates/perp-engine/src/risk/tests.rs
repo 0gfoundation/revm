@@ -98,6 +98,7 @@ fn setup_market(ctx: &mut TestCtx) {
             tiers: MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         },
     )
     .unwrap();
@@ -513,6 +514,46 @@ fn liquidation_conserves_sigma_amount() {
         "WHALE took all 10 and is flat"
     );
     assert_eq!(conservation_sum(&mut ctx, &users), value_before, "and value conserved");
+}
+
+/// Cross P2: `UserAccount::open_position_count` (maintained at `save_position`'s zero-crossing)
+/// through the liquidation paths — a liquidated loser and an ADL'd winner both closed to flat drop
+/// to 0, and a winner only partly ADL'd keeps its 1. (The debug cross-check against a walk of the
+/// index also runs on every snapshot these calls publish.)
+#[test]
+fn the_open_position_count_follows_a_liquidation_and_an_adl() {
+    fn count(ctx: &mut TestCtx, user: Address) -> u8 {
+        storage::load_account(ctx, user).unwrap().open_position_count
+    }
+    let crash = |ctx: &mut TestCtx, index_price: u64| {
+        run_update_index_price(
+            &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: index_price, timestamp: 31 }
+                .abi_encode(),
+            ADMIN,
+            ctx,
+        )
+        .unwrap();
+    };
+
+    // Insolvent at $75: ALICE is liquidated, her whole residual ADL'd against KEEPER — both flat.
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+    seed_position_account(&mut ctx, KEEPER, -QTY, ENTRY_VALUE, MARGIN, 5, 0);
+    assert_eq!((count(&mut ctx, ALICE), count(&mut ctx, KEEPER)), (1, 1));
+    crash(&mut ctx, 7_500);
+    assert_eq!((position(&mut ctx, ALICE).amount, position(&mut ctx, KEEPER).amount), (0, 0));
+    assert_eq!((count(&mut ctx, ALICE), count(&mut ctx, KEEPER)), (0, 0));
+
+    // Solvent at $85 against a short twice her size: WHALE absorbs 10 of 20 and stays open.
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
+    seed_absorbing_short(&mut ctx, 2);
+    assert_eq!((count(&mut ctx, ALICE), count(&mut ctx, WHALE)), (1, 1));
+    crash(&mut ctx, 8_500);
+    assert_eq!((position(&mut ctx, ALICE).amount, position(&mut ctx, WHALE).amount), (0, -QTY));
+    assert_eq!((count(&mut ctx, ALICE), count(&mut ctx, WHALE)), (0, 1));
 }
 
 /// The fallback when there is nobody to absorb: the position STAYS OPEN. Accepted deliberately —
@@ -5190,6 +5231,7 @@ mod usdc_custody {
                 tiers: MarginTiers::default(), // one tier, max leverage 3, mmr 1/6
                 basis_mode: 0,
                 deferred_work: 0,
+                cumulative_funding_index: 0,
             },
         )
         .unwrap();
@@ -11000,6 +11042,7 @@ mod withdrawal_cap {
                     tiers: MarginTiers::from_tiers(&rows).unwrap(),
                     basis_mode: 0,
                     deferred_work: 0,
+                    cumulative_funding_index: 0,
                 },
             )
             .unwrap();

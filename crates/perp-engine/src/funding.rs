@@ -166,6 +166,18 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
 ) -> Result<Option<PendingFunding>, PerpError> {
     let funding = storage::load_funding_state(context, market.market_id)?;
     let index = funding.cumulative_funding_index;
+    // The index's MIRROR on the stored `Market` (what the account folds price pending funding from,
+    // without loading `FundingState`) must equal the source of truth read just above. Compared
+    // against a FRESH read of the stored blob, not the caller's `market`, which may be a copy taken
+    // earlier in the call. `storage::save_funding_state` is the one writer of both.
+    #[cfg(debug_assertions)]
+    if let Some(stored) = storage::load_market_ref(context, market.market_id)? {
+        debug_assert_eq!(
+            stored.cumulative_funding_index, index,
+            "funding: market {} mirrors cumulative funding index {} but FundingState holds {index}",
+            market.market_id, stored.cumulative_funding_index
+        );
+    }
 
     let mut pending = None;
     let payment = pending_funding_payment(index, pos, market)?;

@@ -360,6 +360,19 @@ use primitives::{B256, U256};
 //     leaving `|notional| >= cap` is refused (taker revert `-2027`, maker order cancelled like a
 //     tier refusal), and `setLeverage` on a position that large is `-2027`. The golden scenario
 //     installs no table: its pin does not move.
+//   * P2 — cross accounting, layout. `Market` gains a trailing "fx" (`cumulative_funding_index`,
+//     i128, positional msgpack, appended, serde default 0): a MIRROR of `FundingState`'s index,
+//     written by `save_funding_state` (the one door of the index) whenever it differs, so an
+//     account fold prices pending funding off the `Market` it already loads. The `Market` blob is
+//     rewritten on every oracle tick anyway (`save_mark_price`), so the mirror adds no key to any
+//     block's delta. `UserAccount` gains trailing "LF" (`liq_flags`, u8, bit 0 = IN_LIQUIDATION —
+//     defined, set by nothing before P3) and "OP" (`open_position_count`, u8: positions with
+//     `amount != 0`, cross and isolated, maintained by `save_position` on the zero-crossing it
+//     already detects, inside the account write an open or close already makes; `save_account`
+//     carries both over from the store, like `total_position_margin`). No execution rule moves
+//     while the gate is off. The golden scenario's write set differs only by the blobs' extra
+//     bytes — VERIFIED: with all three fields `#[serde(skip)]` it reproduced the 39-P1 pin
+//     0x7deaa026…6637. BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

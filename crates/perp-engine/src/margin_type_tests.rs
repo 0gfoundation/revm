@@ -66,6 +66,7 @@ fn make_ctx() -> TestCtx {
             tiers: MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         },
     )
     .unwrap();
@@ -194,6 +195,10 @@ fn with_cross_enabled_every_surface_reports_the_stored_choice() {
     store_type(&mut ctx, BOB, ISOLATED);
     assert_eq!(reported_type(&mut ctx, BOB), ISOLATED);
 
+    // ALICE's CROSSED short is seeded (see `seed_cross`); the fill CLOSES it against BOB's opening
+    // ISOLATED short, so both rows of one fill carry their own type.
+    seed_cross(&mut ctx, ALICE, -(QTY as i64));
+    assert_eq!(reported_type(&mut ctx, ALICE), CROSSED, "an open CROSSED position");
     trade(&mut ctx, ALICE, BOB, 0);
     let rows = position_rows(&JournalTr::take_logs(ctx.journal_mut()));
     let of = |u: Address| rows.iter().find(|r| r.user == u).unwrap().marginType;
@@ -292,6 +297,30 @@ fn switches(ctx: &mut TestCtx, caller: Address, user: Address, input: &[u8], to:
 
 fn stored(ctx: &mut TestCtx, user: Address) -> crate::types::PerpPosition {
     storage::load_position(ctx, user, MARKET_ID).unwrap()
+}
+
+/// Seeds `user` OFF-BOOK with `amount` (signed, base units) entered at `PRICE` and NO isolated
+/// margin, keeping the record's stored settings — a CROSSED position as cross margin (P2) defines
+/// one: its collateral is the cross wallet, so `pos.margin == 0` (`save_position` debug-asserts it
+/// for every position CROSSED in force).
+///
+/// Gate-on tests open their CROSSED positions HERE and let real fills only CLOSE them: an OPENING
+/// fill on a record CROSSED in force would still fund an isolated silo until the fill path gains
+/// its cross branch, which is exactly the state that assertion forbids. Through the production
+/// door (`save_position`), so the registry, the per-user market index and the open-position count
+/// follow.
+fn seed_cross(ctx: &mut TestCtx, user: Address, amount: i64) {
+    let lots = amount / QTY as i64;
+    let pos = crate::types::PerpPosition {
+        amount,
+        v_quote_balance: -lots * USDC as i64,
+        margin: 0,
+        ..stored(ctx, user)
+    };
+    storage::save_position(ctx, user, MARKET_ID, &pos, AccountUpdateReason::Adjustment).unwrap();
+    // A planted fixture, not an event under test.
+    storage::clear_account_snapshot_mark(ctx, user);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
 }
 
 /// `user` rests a GTC buy one tick under `PRICE` (no ask to cross); returns its id.
@@ -466,6 +495,8 @@ fn with_cross_enabled_any_open_order_blocks_the_switch() {
     let mut ctx = make_ctx();
     let _cross = crate::margin_type::test_gate::enable();
     let to_iso = set_type(MARKET_ID, ISOLATED);
+    // The counterparty opens on every fill below; see `seed_cross`.
+    store_type(&mut ctx, BOB, ISOLATED);
 
     let bid = rest_bid(&mut ctx, ALICE);
     rejects(&mut ctx, ALICE, &to_iso, E_OPEN_ORDERS);
@@ -475,8 +506,9 @@ fn with_cross_enabled_any_open_order_blocks_the_switch() {
     rejects(&mut ctx, ALICE, &to_iso, E_OPEN_ORDERS);
     cancel_conditional(&mut ctx, ALICE, stop);
 
-    // A trailing stop is position-bound: it needs ALICE's long to exist when placed.
-    trade(&mut ctx, ALICE, BOB, 0);
+    // A trailing stop is position-bound: it needs ALICE's long to exist when placed. Seeded
+    // CROSSED (see `seed_cross`); the fill below closes it.
+    seed_cross(&mut ctx, ALICE, QTY as i64);
     let trailing = place_conditional(&mut ctx, ALICE, true);
     rejects(&mut ctx, ALICE, &to_iso, E_OPEN_ORDERS);
     trade(&mut ctx, ALICE, BOB, 1);
@@ -492,7 +524,8 @@ fn with_cross_enabled_any_open_order_blocks_the_switch() {
 fn with_cross_enabled_the_refusals_come_in_binance_order() {
     let mut ctx = make_ctx();
     let _cross = crate::margin_type::test_gate::enable();
-    trade(&mut ctx, ALICE, BOB, 0);
+    // A CROSSED long (see `seed_cross`).
+    seed_cross(&mut ctx, ALICE, QTY as i64);
     rejects(&mut ctx, ALICE, &set_type(MARKET_ID, ISOLATED), E_POSITION);
     let bid = rest_bid(&mut ctx, ALICE);
     rejects(&mut ctx, ALICE, &set_type(MARKET_ID, ISOLATED), E_OPEN_ORDERS);
@@ -509,6 +542,8 @@ fn with_cross_enabled_the_choice_persists_across_close_and_reopen() {
     let mut ctx = make_ctx();
     let _cross = crate::margin_type::test_gate::enable();
     switches(&mut ctx, ALICE, ALICE, &set_type(MARKET_ID, ISOLATED), ISOLATED);
+    // The counterparty opens on two of the four fills below; see `seed_cross`.
+    store_type(&mut ctx, BOB, ISOLATED);
 
     trade(&mut ctx, ALICE, BOB, 0);
     let rows = position_rows(&JournalTr::take_logs(ctx.journal_mut()));
@@ -522,8 +557,10 @@ fn with_cross_enabled_the_choice_persists_across_close_and_reopen() {
     assert_eq!(reported_type(&mut ctx, ALICE), ISOLATED, "kept by the reopen");
     trade(&mut ctx, ALICE, BOB, 1);
     switches(&mut ctx, ALICE, ALICE, &set_type(MARKET_ID, CROSSED), CROSSED);
-    // BOB took the other side of every fill and never chose.
-    assert_eq!(reported_type(&mut ctx, BOB), CROSSED);
+    // BOB took the other side of every fill and kept his own choice through all of them; a record
+    // that never chose is still Binance's default.
+    assert_eq!(reported_type(&mut ctx, BOB), ISOLATED);
+    assert_eq!(reported_type(&mut ctx, ADMIN), CROSSED);
 }
 
 // ── setMarginTypeSigned ───────────────────────────────────────────────────────
@@ -601,7 +638,8 @@ fn signed_state_refusals_follow_the_burn_with_the_direct_strings() {
 
     let mut ctx = make_ctx();
     register_key(&mut ctx, ALICE, &sk);
-    trade(&mut ctx, ALICE, BOB, 0);
+    // Still enabled: a CROSSED long (see `seed_cross`).
+    seed_cross(&mut ctx, ALICE, QTY as i64);
     rejects_after_burn(&mut ctx, &signed(&sk, MARKET_ID, ISOLATED), E_POSITION);
 }
 

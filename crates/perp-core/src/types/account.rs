@@ -269,6 +269,42 @@ pub struct UserAccount {
     /// Always 0 on a sub (a sub cannot create subs).
     #[serde(rename = "SC", default)]
     pub sub_count: u8,
+
+    // ── Cross margin (P2) ───────────────────────────────────────────────────────
+    // Appended positionally, like every field above them; `default` lets a shorter blob decode.
+    /// Account-level liquidation flags — bit 0 is [`LIQ_FLAG_IN_LIQUIDATION`], Binance's
+    /// "User in liquidation mode now" (`-2023`). Every other bit is reserved and zero.
+    ///
+    /// DEFINED here (cross P2) and nothing more: no path sets it yet, so every account reads `0`.
+    /// Cross liquidation (P3) owns it — set when a cross liquidation episode starts, cleared when
+    /// the account is healthy again — and the read side (`setMarginType`'s `-2023`, reduce-only
+    /// admission while set, a resting order of a flagged maker cancelled instead of filled) keys
+    /// off [`Self::in_liquidation`].
+    ///
+    /// Like [`Self::total_position_margin`] it is NOT a field a whole-blob `storage::save_account`
+    /// may write: that function carries the STORED value over whatever its caller's copy holds, so
+    /// a path that loaded the account before the flag moved cannot clear (or set) it by writing
+    /// the copy back. Its writer goes through `storage::mutate_account`.
+    #[serde(rename = "LF", default)]
+    pub liq_flags: u8,
+    /// How many of this user's markets hold a NON-ZERO position, cross AND isolated — the
+    /// "no open positions (cross or isolated)" condition Binance's negative-balance clearance
+    /// (`INSURANCE_CLEAR`) requires (cross P3; owner decision Q8).
+    ///
+    /// # Owned by `storage::save_position`, and by nothing else
+    ///
+    /// Maintained at the one place every `amount` write passes through, from the SAME zero-crossing
+    /// the open-position registry and the per-user market index already detect: `+1` when a
+    /// position opens from flat, `−1` when it closes to flat (a flip crosses no zero and moves
+    /// nothing). That read is already paid for, so the count costs no load — only an account write
+    /// on an open or a close, which those paths make anyway. `storage::save_account` carries the
+    /// stored value over its caller's copy, exactly as it does for `total_position_margin`.
+    ///
+    /// A `u8`: it is bounded by [`MAX_USER_MARKETS`] (16), because a non-zero position keeps its
+    /// market in the per-user index. `margin_view::index_account_scalars` cross-checks it against
+    /// a fresh walk of the index in `debug_assertions` builds.
+    #[serde(rename = "OP", default)]
+    pub open_position_count: u8,
     // NOTE: the former "TC" (`total_perp_collateral`) aggregate is GONE. It was
     // `wallet + Σ_positions(margin + the since-deleted margin_reserved)` — fully derivable from state
     // that is already published, used by no protocol rule, yet incrementally maintained on the
@@ -289,11 +325,24 @@ impl Default for UserAccount {
             total_position_margin: 0,
             master: None,
             sub_count: 0,
+            liq_flags: 0,
+            open_position_count: 0,
         }
     }
 }
 
+/// [`UserAccount::liq_flags`] bit 0: a cross liquidation episode is in progress for this account —
+/// Binance's `-2023 User in liquidation mode now.` Set and cleared by cross liquidation (P3).
+pub const LIQ_FLAG_IN_LIQUIDATION: u8 = 1;
+
 impl UserAccount {
+    /// Whether [`LIQ_FLAG_IN_LIQUIDATION`] is set — the ONE reader every `-2023` check goes
+    /// through. Total (a bit test).
+    #[inline]
+    pub fn in_liquidation(&self) -> bool {
+        self.liq_flags & LIQ_FLAG_IN_LIQUIDATION != 0
+    }
+
     /// The root of this account's family: its master if it is a sub, itself otherwise. Two accounts
     /// are in the same family iff their roots are equal (master ↔ own sub, sub ↔ sibling sub, and an
     /// account with itself).
@@ -680,15 +729,45 @@ mod tests {
         };
         let sub_bytes = encode(&sub).unwrap();
         assert_eq!(sub_bytes.len(), plain_bytes.len() + 21, "Some(addr) = 22 bytes vs nil = 1");
-        assert_eq!(&plain_bytes[plain_bytes.len() - 2..], &[0xc0, 0x00], "nil, then fixint 0");
+        // The family pair, then the two cross-P2 fields behind it (see the next test).
+        let family = &plain_bytes[plain_bytes.len() - 4..plain_bytes.len() - 2];
+        assert_eq!(family, &[0xc0, 0x00], "nil, then fixint 0");
         assert_eq!(decode::<UserAccount>(&sub_bytes).unwrap(), sub);
 
-        // A blob written before the two fields existed: the same array with its last two elements
-        // dropped (msgpack fixarray header 0x98 = 8 elements → 0x96 = 6).
-        assert_eq!(plain_bytes[0], 0x98, "8-element fixarray");
-        let mut old = plain_bytes[..plain_bytes.len() - 2].to_vec();
+        // A blob written before the family fields existed: the same array with its last FOUR
+        // elements dropped (the family pair and the two later cross fields; msgpack fixarray header
+        // 0x9a = 10 elements → 0x96 = 6).
+        assert_eq!(plain_bytes[0], 0x9a, "10-element fixarray");
+        let mut old = plain_bytes[..plain_bytes.len() - 4].to_vec();
         old[0] = 0x96;
         assert_eq!(decode::<UserAccount>(&old).unwrap(), plain);
+    }
+
+    /// The two cross-P2 fields (`liq_flags`, `open_position_count`) are APPENDED after the family
+    /// pair and cost an ordinary account two bytes (two fixint 0s); a blob written before them
+    /// decodes with both defaulted, and non-default values survive the codec.
+    #[test]
+    fn the_cross_account_fields_are_appended_and_default_to_zero() {
+        use crate::codec::{decode, encode};
+        let plain = UserAccount::default();
+        let plain_bytes = encode(&plain).unwrap();
+        assert_eq!(&plain_bytes[plain_bytes.len() - 2..], &[0x00, 0x00], "two fixint 0s, LAST");
+        let mut old = plain_bytes[..plain_bytes.len() - 2].to_vec();
+        old[0] -= 2;
+        assert_eq!(decode::<UserAccount>(&old).unwrap(), plain, "pre-P2 blob decodes, defaulted");
+
+        let flagged = UserAccount {
+            liq_flags: LIQ_FLAG_IN_LIQUIDATION,
+            open_position_count: 16,
+            ..UserAccount::default()
+        };
+        let bytes = encode(&flagged).unwrap();
+        assert_eq!(&bytes[bytes.len() - 2..], &[0x01, 0x10]);
+        assert_eq!(decode::<UserAccount>(&bytes).unwrap(), flagged);
+        assert!(flagged.in_liquidation());
+        assert!(!plain.in_liquidation());
+        // Only bit 0 means anything; a reserved bit alone is not "in liquidation".
+        assert!(!UserAccount { liq_flags: 0b10, ..UserAccount::default() }.in_liquidation());
     }
 
     #[test]

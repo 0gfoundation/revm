@@ -76,6 +76,7 @@ fn market() -> Market {
         tiers: MarginTiers::default(),
         basis_mode: 0,
         deferred_work: 0,
+        cumulative_funding_index: 0,
     }
 }
 

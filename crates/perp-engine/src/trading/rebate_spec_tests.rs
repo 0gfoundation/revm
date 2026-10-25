@@ -128,6 +128,7 @@ fn market_with(base_decimals: u32) -> TestCtx {
             tiers: MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         },
     )
     .unwrap();
@@ -1364,6 +1365,7 @@ fn ppm_at_100x_is_the_old_bps_fee_for_every_whole_bps_rate() {
         tiers: MarginTiers::default(),
         basis_mode: 0,
         deferred_work: 0,
+        cumulative_funding_index: 0,
     };
     for bps in [0u64, 1, 2, 3, 5, 7, 9, 10, 33, 999, 1_000] {
         for (p, q) in [(10_003u64, 31_234u64), (10_007, 20_007), (1, 1), (999_999, 999_999)] {

@@ -737,13 +737,26 @@ fn log_account_balance_changed<H: PerpHost>(
 ///
 /// A test fixture that wants a non-zero aggregate must create it the way production does, through
 /// [`save_position`].
+///
+/// The same holds for the two cross-margin (P2) fields: `open_position_count` is owned by
+/// [`save_position`] exactly like `total_position_margin`, and `liq_flags` by its dedicated
+/// `mutate_account` writer (cross liquidation, P3). Both are carried over from the store too.
 pub fn save_account<H: PerpHost>(
     context: &mut H,
     user: Address,
     mut account: UserAccount,
     reason: AccountUpdateReason,
 ) -> Result<(), PerpError> {
-    account.total_position_margin = load_account_ref(context, user)?.total_position_margin;
+    {
+        let stored = load_account_ref(context, user)?;
+        account.total_position_margin = stored.total_position_margin;
+        // The two cross-P2 fields are owned the same way: `open_position_count` by `save_position`
+        // (written there alongside `total_position_margin`, so the same stale-copy hazard applies),
+        // `liq_flags` by its own `mutate_account` writer (cross liquidation, P3). A whole-blob save
+        // from a copy must not roll either back.
+        account.open_position_count = stored.open_position_count;
+        account.liq_flags = stored.liq_flags;
+    }
     typed_store_mut(context).set_account(user, account);
     // The wallet moved ⇒ one snapshot at the end of the call, carrying `reason`. Ordering against
     // the write no longer matters (nothing is folded here); the drain reads the settled store.
@@ -1074,6 +1087,25 @@ pub fn save_position<H: PerpHost>(
          must zero `margin` alongside `amount`",
         pos.margin
     );
+    // CROSS MARGIN (P2): an effective-CROSSED position holds NO silo — `pos.margin` is Binance's
+    // `isolatedWallet`, which is 0 on every cross row. Its collateral is the shared cross wallet
+    // (`perp_wallet_balance`), its initial margin is DERIVED into `availableBalance` instead of
+    // being moved out of the wallet, and its funding, PnL and fees settle against the wallet. A
+    // non-zero margin here would be money counted twice: once in `Σ pos.margin`
+    // (`totalWalletBalance`) and once as cross collateral by the account fold
+    // (`margin_view::cross_fold`), which ignores it.
+    //
+    // A `debug_assert`, not an `[INVARIANT]` reject: this door is reached from the liquidation
+    // sweep (every close leg and ADL fill writes through here), and the sweep PANICS on any `Err`
+    // from `liquidate_position` — a release-mode reject here would turn a reporting invariant into
+    // a node halt. Total: `effective_margin_type` has no error path.
+    debug_assert!(
+        crate::margin_type::effective_margin_type(pos) != crate::types::MarginType::Crossed
+            || pos.margin == 0,
+        "save_position: {user} market {market_id} is CROSSED in force but holds isolated margin {} \
+         — a cross position's collateral is the cross wallet, never a silo",
+        pos.margin
+    );
     if old_amount == 0 && pos.amount != 0 {
         registry_add(context, market_id, user)?;
     } else if old_amount != 0 && pos.amount == 0 {
@@ -1128,7 +1160,25 @@ pub fn save_position<H: PerpHost>(
     // do not dirty the account key for a no-op. Deterministic — the condition is a comparison of two
     // stored integers, identical on every node. (A leverage-only write does not reach here at all
     // any more; it has [`save_position_leverage_only`].)
-    if pos.margin != old_margin {
+    //
+    // ── `UserAccount::open_position_count` — THE single maintenance point (cross P2) ─────────────
+    //
+    // The same zero-crossing the registry hook above acts on: `+1` when this market's position
+    // opens from flat, `−1` when it closes to flat. A flip crosses no zero and moves nothing; a
+    // `0 → 0` write (funding re-anchor, a dust write-off of a flat record) moves nothing. Folded
+    // into the SAME account mutation as the margin aggregate, so an open or close whose margin
+    // also moved still costs one account write.
+    //
+    // SATURATING, not checked: this door is reached from the liquidation sweep, which panics on
+    // any `Err`. The count is bounded by `MAX_USER_MARKETS` (16) — a non-zero position keeps its
+    // market in the per-user index — so neither end is reachable; the `debug_assert`s say so, and
+    // `margin_view::index_account_scalars` re-walks the index against the stored count.
+    let count_delta: i8 = match (old_amount != 0, pos.amount != 0) {
+        (false, true) => 1,
+        (true, false) => -1,
+        _ => 0,
+    };
+    if pos.margin != old_margin || count_delta != 0 {
         let delta = pos
             .margin
             .checked_sub(old_margin)
@@ -1141,6 +1191,25 @@ pub fn save_position<H: PerpHost>(
                 .total_position_margin
                 .checked_add(delta)
                 .ok_or_else(|| perp_err("save_position: total position margin overflow"))?;
+            match count_delta {
+                1 => {
+                    debug_assert!(
+                        (a.open_position_count as usize) < crate::types::MAX_USER_MARKETS,
+                        "save_position: {user} opens a position with open_position_count {} \
+                         already at MAX_USER_MARKETS",
+                        a.open_position_count
+                    );
+                    a.open_position_count = a.open_position_count.saturating_add(1);
+                }
+                -1 => {
+                    debug_assert!(
+                        a.open_position_count > 0,
+                        "save_position: {user} closes a position with open_position_count 0"
+                    );
+                    a.open_position_count = a.open_position_count.saturating_sub(1);
+                }
+                _ => {}
+            }
             Ok::<(), PerpError>(())
         })??;
     }
@@ -2899,13 +2968,33 @@ pub fn load_funding_state<H: PerpHost>(
     decode(&buf)
 }
 
+/// Writes a market's [`FundingState`] — and is the ONE door through which its
+/// `cumulative_funding_index` moves, so it also keeps the index's MIRROR on the `Market` blob
+/// ([`Market::cumulative_funding_index`]) equal to it.
+///
+/// The mirror lets an account fold price each cross position's pending funding from the
+/// `{Market, position}` pair it already loads, without a third load per market. `FundingState`
+/// stays the source of truth: settlement reads it, the folds read the copy, and
+/// `funding::compute_funding_settlement` cross-checks the two in `debug_assertions` builds.
+///
+/// The mirror is written ONLY when it differs, so the oracle's between-epoch save (which rewrites
+/// `next_funding_ts` bookkeeping with an unchanged index) does not touch the `Market` here — it is
+/// rewritten by `save_mark_price` on that same tick regardless. A market that does not exist has
+/// nothing to mirror into (no production path saves funding state for one).
 pub fn save_funding_state<H: PerpHost>(
     context: &mut H,
     market_id: u64,
     state: &FundingState,
 ) -> Result<(), PerpError> {
     let buf = encode(state)?;
-    store_blob(context, funding_state_key(market_id), &buf)
+    store_blob(context, funding_state_key(market_id), &buf)?;
+    let index = state.cumulative_funding_index;
+    let stale = load_market_ref(context, market_id)?
+        .is_some_and(|m| m.cumulative_funding_index != index);
+    if stale {
+        mutate_market(context, market_id, |m| m.cumulative_funding_index = index)?;
+    }
+    Ok(())
 }
 
 // ── Insurance Fund ────────────────────────────────────────────────────────────
@@ -3284,6 +3373,8 @@ mod size_probe_tests {
             total_position_margin: 4_200_000,
             master: None,
             sub_count: 0,
+            liq_flags: 0,
+            open_position_count: 0,
         };
         let buf = encode(&acct).unwrap();
         println!(
@@ -3311,6 +3402,7 @@ mod size_probe_tests {
             tiers: MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         };
         let buf = encode(&market).unwrap();
         println!("Market: {} bytes", buf.len());
@@ -3548,6 +3640,7 @@ mod encoding_roundtrip_tests {
                 tiers: MarginTiers::default(),
                 basis_mode: 0,
                 deferred_work: 0,
+                cumulative_funding_index: 0,
             },
         );
     }

@@ -1358,12 +1358,27 @@ pub fn index_account_scalars<H: PerpHost>(
     // is flat, and a flat position holds no margin (asserted at every `save_position`).
     #[cfg(debug_assertions)]
     if override_market.is_none() {
-        let stored = storage::load_account_ref(context, user)?.total_position_margin;
+        let account = storage::load_account_ref(context, user)?;
+        let (stored, stored_count) = (account.total_position_margin, account.open_position_count);
         debug_assert_eq!(
             stored as i128,
             scalars.total_wallet_balance as i128 - scalars.total_cross_wallet_balance as i128,
             "{who}: stored total_position_margin for {user} diverged from Σ pos.margin walked over \
              the per-user market index — a pos.margin write bypassed save_position's maintenance"
+        );
+        // `UserAccount::open_position_count` (cross P2) against the same kind of fresh walk. Over
+        // the INDEX, while the stored count is over ALL markets: equal because a non-zero position
+        // keeps its market in the index (`storage::sync_user_market_membership`).
+        let mut walked = 0usize;
+        for &market_id in market_ids.iter() {
+            if storage::load_position_ref(context, user, market_id)?.amount != 0 {
+                walked += 1;
+            }
+        }
+        debug_assert_eq!(
+            stored_count as usize, walked,
+            "{who}: stored open_position_count for {user} diverged from the non-zero positions \
+             walked over the per-user market index — an amount write bypassed save_position"
         );
     }
 

@@ -59,6 +59,11 @@ pub struct PerpPosition {
     /// insurance fund. A FLAT position always holds exactly 0 (a full close releases all of it),
     /// which `storage::save_position` debug-asserts.
     ///
+    /// So does a position CROSSED in force ([`MarginType`], cross margin P2), at every size: its
+    /// collateral is the shared cross wallet, its initial margin is derived rather than moved, and
+    /// its funding and PnL settle against the wallet — there is no silo. `storage::save_position`
+    /// debug-asserts that too, and every account fold ignores this field for a cross position.
+    ///
     /// The only continuous requirement gate in the engine is
     /// [`crate::math::is_above_maintenance_margin`], and it reads THIS field, so a short silo
     /// correctly prices its own liquidation. Pinned by
@@ -677,6 +682,30 @@ pub struct Market {
     /// a no-op call must cost one read and nothing else.
     #[serde(default, rename = "dw")]
     pub deferred_work: u8,
+    /// `fx` — a MIRROR of this market's [`crate::types::FundingState::cumulative_funding_index`].
+    /// APPENDED LAST — positional msgpack; serde default `0`, which is also the index every market
+    /// starts from.
+    ///
+    /// # Why the index is copied here (cross margin P2, graft 2 of the design report)
+    ///
+    /// A CROSS account's balance includes the funding every cross position has accrued but not yet
+    /// settled (`cWB = W + Σ_C PF_k`, and funding settles lazily — see `perp_engine::funding`), so
+    /// every account-level fold needs each market's cumulative index. The account walk already
+    /// loads `{Market, position}` per market; reading the index off `FundingState` would add a
+    /// THIRD load per market to every fold, on the admission gates and (from P3) on every cross
+    /// candidate of the liquidation sweep. The `Market` blob is rewritten on every oracle tick
+    /// anyway (`storage::save_mark_price`), and the index only moves on an epoch boundary of that
+    /// same tick, so mirroring it costs no additional key in any block's delta.
+    ///
+    /// # `FundingState` stays the source of truth
+    ///
+    /// The ONE writer is `storage::save_funding_state` — every write of the index goes through it,
+    /// and it copies the new value here in the same breath. Funding SETTLEMENT still reads
+    /// `FundingState` itself; only the read-only folds read this copy. A `debug_assertions`
+    /// cross-check compares the two wherever both are in hand
+    /// (`funding::compute_funding_settlement`, and the cross fold in `margin_view`).
+    #[serde(default, rename = "fx")]
+    pub cumulative_funding_index: i128,
 }
 
 /// [`Market::basis_mode`]: the legacy 30-second time-weighted window. Default.
@@ -902,6 +931,8 @@ mod tests {
             // Non-zero deliberately: the positional codec appends this LAST, and a `0` here would
             // round-trip even if the field were dropped from the encoding entirely.
             deferred_work: 1,
+            // Non-zero and beyond i64 for the same reason: the mirrored funding index is an i128.
+            cumulative_funding_index: -12_345_678_901_234_567_890,
         };
         m.tiers =
             MarginTiers::from_tiers(&[tier(0, 3), tier(50_000, 2), tier(250_000, 1)]).unwrap();

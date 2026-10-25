@@ -103,6 +103,7 @@ fn setup(ctx: &mut TestCtx) {
             tiers: MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         },
     )
     .unwrap();
@@ -437,6 +438,7 @@ fn setup_banded(ctx: &mut TestCtx, band_bps: u32) {
             tiers: MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         },
     )
     .unwrap();
@@ -2186,6 +2188,7 @@ fn margin_uses_market_price_decimals() {
             tiers: MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         },
     )
     .unwrap();
@@ -6342,6 +6345,7 @@ mod perf {
                 tiers: MarginTiers::default(),
                 basis_mode: 0,
                 deferred_work: 0,
+                cumulative_funding_index: 0,
             },
         )
         .unwrap();
@@ -6985,7 +6989,17 @@ mod golden {
     /// the byte; `BusinessSnapshot` UNCHANGED. VERIFIED: with the field `#[serde(skip)]` the
     /// scenario reproduced the previous 39 (P0) pin 0xafd82645…7b48.
     ///
-    /// Prior values 0xafd826451ed6c8e356b03def92beb67c4e2431333141b39bfc21aeef4f057b48 (39, P0
+    /// Re-pinned again within 39 for P2 (cross accounting), three appended fields: `Market` gains
+    /// "fx" (`cumulative_funding_index`, i128 — the mirror of `FundingState`'s index; 0 here, the
+    /// scenario crosses no funding epoch) and `UserAccount` gains "LF" (`liq_flags`, u8, never set
+    /// before P3) and "OP" (`open_position_count`, u8, maintained by `save_position` on every
+    /// open/close) — so every market and account blob the scenario writes grows. A LAYOUT change
+    /// only: the count rides the account write an open or close already makes, and every position
+    /// is ISOLATED in force. `BusinessSnapshot` UNCHANGED. VERIFIED: with all three fields
+    /// `#[serde(skip)]` the scenario reproduced the previous 39 (P1) pin 0x7deaa026…6637.
+    ///
+    /// Prior values 0x7deaa0263925b95e203cf08b43fbf93b34f7af725d19933d6e72510cd6c86637 (39, P1
+    /// margin type), 0xafd826451ed6c8e356b03def92beb67c4e2431333141b39bfc21aeef4f057b48 (39, P0
     /// maintenance-rate column), 0x37a18141947ba3bb4fe923fe0e05a07d4dc0a8d1987096250991ed7d0f3f79de (38,
     /// trailing stop), 0xa72ce19d4e1c033989c620e39e9a7e09d6b483aee1c38cfe0d9e08770898d940 (38,
     /// closePosition parity), 0x720411d896e56b98c027a692b9cb8afba35c93accce39ccbef86a1a59f93e3e0 (38,
@@ -7003,7 +7017,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x7deaa0263925b95e203cf08b43fbf93b34f7af725d19933d6e72510cd6c86637");
+        b256!("0x8c500d81725e79c199fc06ab19800c60c25a914672399c09d6110ef2d5c2a62c");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -11926,6 +11940,7 @@ mod user_market_index {
             tiers: MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         }
     }
 
@@ -12940,6 +12955,7 @@ mod derived_ooim_divergence {
             tiers,
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         }
     }
 
@@ -13380,6 +13396,7 @@ mod assuming_price {
                 tiers: MarginTiers::default(),
                 basis_mode: 0,
                 deferred_work: 0,
+                cumulative_funding_index: 0,
             },
         )
         .unwrap();
@@ -13963,6 +13980,7 @@ mod resting_notional_stream {
                 tiers: MarginTiers::default(),
                 basis_mode: 0,
                 deferred_work: 0,
+                cumulative_funding_index: 0,
             },
         )
         .unwrap();

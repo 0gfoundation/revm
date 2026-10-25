@@ -542,6 +542,7 @@ fn get_account_reports_available_wallet_net_of_allocations() {
             tiers: crate::types::MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         },
     )
     .unwrap();

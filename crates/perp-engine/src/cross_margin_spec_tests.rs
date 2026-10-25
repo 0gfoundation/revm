@@ -198,6 +198,7 @@ fn the_market(id: u64, base_decimals: u32, max: u64) -> Market {
         tiers: MarginTiers::default(),
         basis_mode: 0,
         deferred_work: 0,
+        cumulative_funding_index: 0,
     }
 }
 
@@ -257,6 +258,24 @@ fn seed(ctx: &mut TestCtx, user: Address, market: u64, amount: i64, leverage: u6
         AccountUpdateReason::Adjustment,
     )
     .unwrap();
+    let _ = take_logs(ctx);
+}
+
+/// [`seed`] for a position CROSSED in force: same entry at the stored mark, but NO isolated
+/// margin — a cross position's collateral is the cross wallet (P2: `save_position` debug-asserts
+/// `pos.margin == 0` for every position CROSSED in force). Gate-on scenarios open CROSSED
+/// positions here and let real fills only CLOSE them, until the fill path gains its cross branch.
+fn seed_cross(ctx: &mut TestCtx, user: Address, market: u64, amount: i64) {
+    let mark = storage::load_mark_price(ctx, market).unwrap() as i128;
+    let scale: i128 = if market == TM { 1 } else { 10_000 };
+    let n = amount as i128 * mark * scale;
+    let p = PerpPosition {
+        amount,
+        v_quote_balance: (-n) as i64,
+        margin: 0,
+        ..storage::load_position(ctx, user, market).unwrap()
+    };
+    storage::save_position(ctx, user, market, &p, AccountUpdateReason::Adjustment).unwrap();
     let _ = take_logs(ctx);
 }
 
@@ -1543,7 +1562,8 @@ fn mt_liquidation_and_adl_leave_the_type_alone() {
 
 /// With the gate on every surface follows the stored choice, per market: a user CROSSED in M1 and
 /// ISOLATED in M2 reads so in getSymbolConfig, getPositionRisk, both getAccount rows and the
-/// PositionChanged of a fill in each.
+/// PositionChanged of a fill in each. (The CROSSED fill CLOSES a seeded cross short — see
+/// [`seed_cross`]; the ISOLATED one opens.)
 #[test]
 fn mt_with_the_gate_on_every_surface_follows_the_stored_choice() {
     let mut ctx = fresh();
@@ -1552,6 +1572,7 @@ fn mt_with_the_gate_on_every_surface_follows_the_stored_choice() {
         switch_self(&mut ctx, DAVE, m, ISOLATED);
     }
     switch_self(&mut ctx, ALICE, M2, ISOLATED);
+    seed_cross(&mut ctx, ALICE, M1, -1);
     rest(&mut ctx, ALICE, M1, BUY, 9_500, 1);
     rest(&mut ctx, ALICE, M2, BUY, 9_500, 1);
     let rows = account(&mut ctx, ALICE).positions;

@@ -65,6 +65,7 @@ fn make_ctx() -> TestCtx {
             tiers: MarginTiers::default(),
             basis_mode: 0,
             deferred_work: 0,
+            cumulative_funding_index: 0,
         },
     )
     .unwrap();
@@ -799,8 +800,13 @@ mod mutation_killers {
             let next = derive_sub_account(MASTER, 0);
             plant(&mut ctx, next);
             let _ = JournalTr::take_logs(ctx.journal_mut());
+            // The one account field a position plants is `open_position_count` (owned by
+            // `save_position`, cross P2) — and the guard deliberately does not read it: it is
+            // redundant with the market index (a non-zero position keeps its market there), which
+            // is the clause under test. Every field the guard DOES read is still default.
+            let planted = storage::load_account(&mut ctx, next).unwrap();
             assert_eq!(
-                storage::load_account(&mut ctx, next).unwrap(),
+                UserAccount { open_position_count: 0, ..planted },
                 UserAccount::default(),
                 "[{what}] the account blob itself must be untouched to isolate the clause"
             );

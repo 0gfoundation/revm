@@ -198,6 +198,7 @@ pub fn run_add_market<H: PerpHost>(
         basis_mode: crate::types::BASIS_MODE_WINDOW,
         // A brand-new market has no book and no positions, so no sweep has anything to defer.
         deferred_work: 0,
+        cumulative_funding_index: 0,
         // `addMarket` is deliberately NOT grown to carry the tier table (it is already
         // 14 args with a fixed-offset signed layout). Every market is born single-tier
         // `[{0, DEFAULT_MAX_LEVERAGE}]` — maintenance rate 1/6, leverage cap 3 — and is

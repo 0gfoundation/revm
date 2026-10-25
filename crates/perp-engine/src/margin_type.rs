@@ -224,11 +224,11 @@ fn set_margin_type_core<H: PerpHost>(
         ));
     }
 
-    // 5. ── HOOK (cross P2): `-2023 User in liquidation mode now.` ──────────────────────────────
-    //    Refuse while the account's liquidation flag (`UserAccount::liq_flags`, IN_LIQUIDATION) is
-    //    set. That field does not exist yet — it arrives with cross accounting in P2 — so no
-    //    account can be in that state and there is nothing to refuse. When it lands, the check
-    //    goes HERE (after -4048, before the gate), as one account `_ref` load:
+    // 5. ── HOOK (cross P2c): `-2023 User in liquidation mode now.` ─────────────────────────────
+    //    Refuse while the account's liquidation flag is set (`UserAccount::in_liquidation`, bit
+    //    `LIQ_FLAG_IN_LIQUIDATION` of `liq_flags`). The field exists since P2a, but nothing sets it
+    //    before cross liquidation (P3), so no account can be in that state yet. The check goes HERE
+    //    (after -4048, before the gate), as one account `_ref` load:
     //        "setMarginType: -2023 User in liquidation mode now."
 
     // 6. The gate: CROSSED cannot be chosen until cross margin exists.
