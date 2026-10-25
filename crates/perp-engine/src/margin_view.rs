@@ -562,10 +562,358 @@ pub fn margin_info_of(
     })
 }
 
+// ── The cross fold: THE account-level walk (cross margin P2) ───────────────────────────────────
+//
+// Notation (cross report §3.2). `W` = `perp_wallet_balance` (signed). For market `k`:
+// `N_k = trunc(amount_k · mark_k)` (signed), `uPnL_k = N_k + vQuote_k`, `PF_k` = the funding the
+// position has accrued but not yet settled, `L_k` = `pos.leverage`. `C` = the markets CROSSED in
+// force, `I` = the ISOLATED ones.
+//
+// ```text
+// cWB = W + Σ_C PF_k                                   Binance crossWalletBalance
+// E   = cWB + Σ_C uPnL_k                               cross margin balance
+// PIM_k = ROUND_UP(|N_k| / L_k),  MM_k = slice-form tier MM (explicit or derived rate)
+// A   = cWB + Σ_C (uPnL_k − PIM_k) − Σ_{C∪I} ooIM_k     availableBalance (signed, unclamped)
+// X   = max(0, min(cWB − Σ_I ooIM_k − Σ_C MM_k, A))     maxWithdrawAmount
+// liquidatable (cross, account-level)  ⇔  E < Σ_C MM_k
+// ```
+//
+// For an account with no position CROSSED in force every cross term is 0, so `cWB = W`,
+// `A = W − Σ ooIM` (the isolated admission basis, unchanged) and `X = max(0, A)`. While cross
+// margin is gated off (`types::CROSS_MARGIN_ENABLED`) that is every account.
+
+/// One market's terms in the [`CrossFold`]. Pure data, produced by [`cross_leg`].
+///
+/// The cross terms (`upnl`, `pim`, `mm`, `pending_funding`) are filled only for a market CROSSED
+/// in force and are 0 for an ISOLATED one — an isolated position's PnL, initial margin, maintenance
+/// and funding live in its own silo and never reach the cross wallet. `oo_im` is filled for both:
+/// Binance charges ISOLATED open-order IM against the cross wallet too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrossLeg {
+    /// The market.
+    pub market_id: u64,
+    /// The position is CROSSED in force ([`crate::margin_type::effective_margin_type`]).
+    pub cross: bool,
+    /// `amount != 0`.
+    pub has_position: bool,
+    /// `uPnL_k = N_k + vQuote_k` at the stored mark; `0` when the mark is `0` (see [`cross_leg`]).
+    pub upnl: i128,
+    /// `PIM_k = ROUND_UP(|N_k| / L_k)`.
+    pub pim: i128,
+    /// `MM_k` — maintenance margin at `|N_k|` under the market's tier table.
+    pub mm: i128,
+    /// `ooIM_k`, either type.
+    pub oo_im: i128,
+    /// `PF_k` — the signed funding payment the position would receive (`> 0`) or pay (`< 0`) if it
+    /// were settled now, priced off the `Market`'s MIRROR of the cumulative funding index.
+    pub pending_funding: i128,
+}
+
+/// The account-level cross quantities, all in `i128`, signed where the quantity can be negative.
+/// Produced by [`cross_fold`] / [`cross_fold_checked`] (and, for the views, by the wide walk
+/// [`fold_account_margin`] through the same [`CrossSums`]). See the notation block above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrossFold {
+    /// `W` — the stored (or overridden) `perp_wallet_balance`.
+    pub w: i128,
+    /// `Σ_C PF_k`.
+    pub pending_funding_cross: i128,
+    /// `cWB = W + Σ_C PF_k` — Binance's `crossWalletBalance`. Funding settles lazily here, but the
+    /// number equals what Binance's instant settlement would show.
+    pub cwb: i128,
+    /// `Σ_C uPnL_k` — Binance's `totalCrossUnPnl`.
+    pub cross_upnl: i128,
+    /// `Σ_C PIM_k`.
+    pub cross_pim: i128,
+    /// `Σ_C MM_k`.
+    pub cross_mm: i128,
+    /// `Σ_{C∪I} ooIM_k` — every market's open-order IM.
+    pub oo_im_all: i128,
+    /// `Σ_I ooIM_k`.
+    pub iso_oo_im: i128,
+    /// `E = cWB + Σ_C uPnL_k`.
+    pub e: i128,
+    /// `A = cWB + Σ_C (uPnL_k − PIM_k) − Σ_{C∪I} ooIM_k` — the admission basis, signed.
+    pub a: i128,
+    /// `X = max(0, min(cWB − Σ_I ooIM_k − Σ_C MM_k, A))` — what may leave the perp wallet.
+    pub x: i128,
+    /// At least one market CROSSED in force holds a non-zero position.
+    pub has_cross: bool,
+    /// How many legs [`cross_fold`] could not evaluate and therefore left OUT of every sum: a
+    /// market id in the index that names no market, or a leg whose arithmetic overflowed. Always
+    /// `0` from [`cross_fold_checked`], which refuses such a leg instead. Not reachable through any
+    /// engine path; the sweep-facing fold counts it rather than failing.
+    pub faulted_legs: u8,
+}
+
+impl CrossFold {
+    /// The account-level cross liquidation condition `E < Σ_C MM_k` (strict — `E == Σ MM` is
+    /// healthy, the engine's `>=` rule). `false` for an account with no cross position. REPORTED
+    /// only in P2: cross liquidation (P3) acts on it.
+    #[inline]
+    pub fn below_cross_maintenance(&self) -> bool {
+        self.has_cross && self.e < self.cross_mm
+    }
+}
+
+/// The running sums behind a [`CrossFold`] — the ONE place legs are summed, shared by the lean
+/// walk ([`cross_fold`]) and the wide one ([`fold_account_margin`]), so the gates and the views
+/// cannot add different sets of terms.
+///
+/// Plain `+` in `i128`: every leg term is bounded by `2^65` in magnitude (a `u64`/`i64` quantity,
+/// or the sum of two), and a walk has at most `MAX_MARGIN_INFO_MARKETS + 1` (65) legs, so no sum
+/// can approach `2^127`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrossSums {
+    pending_funding_cross: i128,
+    cross_upnl: i128,
+    cross_pim: i128,
+    cross_mm: i128,
+    oo_im_all: i128,
+    iso_oo_im: i128,
+    has_cross: bool,
+}
+
+impl CrossSums {
+    /// Adds one leg.
+    #[inline]
+    pub fn add(&mut self, leg: &CrossLeg) {
+        self.oo_im_all += leg.oo_im;
+        if leg.cross {
+            self.pending_funding_cross += leg.pending_funding;
+            self.cross_upnl += leg.upnl;
+            self.cross_pim += leg.pim;
+            self.cross_mm += leg.mm;
+            self.has_cross |= leg.has_position;
+        } else {
+            self.iso_oo_im += leg.oo_im;
+        }
+    }
+
+    /// The account quantities over these sums and the wallet `w` — the ONE implementation of the
+    /// formulas in the notation block above.
+    #[inline]
+    pub fn finish(&self, w: i64, faulted_legs: u8) -> CrossFold {
+        let w = w as i128;
+        let cwb = w + self.pending_funding_cross;
+        let a = cwb + self.cross_upnl - self.cross_pim - self.oo_im_all;
+        CrossFold {
+            w,
+            pending_funding_cross: self.pending_funding_cross,
+            cwb,
+            cross_upnl: self.cross_upnl,
+            cross_pim: self.cross_pim,
+            cross_mm: self.cross_mm,
+            oo_im_all: self.oo_im_all,
+            iso_oo_im: self.iso_oo_im,
+            e: cwb + self.cross_upnl,
+            a,
+            x: (cwb - self.iso_oo_im - self.cross_mm).min(a).max(0),
+            has_cross: self.has_cross,
+            faulted_legs,
+        }
+    }
+}
+
+/// [`CrossLeg`] for one `(market, position)` pair, from IN-MEMORY values only. Pure.
+///
+/// Every term comes from the function the rest of the engine already prices it with — `N`, `PIM`
+/// and `ooIM` from [`position_derived_margin`], `MM` from [`maintenance_margin`], `PF` from
+/// [`crate::funding::pending_funding_payment`] (the amount settlement would apply) — so a leg is
+/// the same number a row ([`margin_info_of`]) or a settlement reports, not a second derivation.
+///
+/// # A mark of `0`
+///
+/// `N = 0`, so `PIM = MM = 0` follow by themselves; `uPnL` would be the bare `vQuote` — the whole
+/// entry cost booked as a loss (a gain for a short) against no price at all — so it is `0` instead
+/// (J4: a leg with no price neither props the account up nor drags it under). `addMarket` refuses a
+/// zero mark and every mark component is floored at 1, so only a fixture reaches this.
+///
+/// Errors only on arithmetic outside the engine's representable range (a notional or sum past
+/// `i64`), which no engine path produces; [`cross_fold`] turns such an error into a faulted leg.
+pub fn cross_leg(
+    market: &crate::types::Market,
+    pos: &crate::types::PerpPosition,
+) -> Result<CrossLeg, PerpError> {
+    let derived = position_derived_margin(market, pos)?;
+    let cross = crate::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed;
+    let mut leg = CrossLeg {
+        market_id: market.market_id,
+        cross,
+        has_position: pos.amount != 0,
+        oo_im: derived.margin.open_order_initial_margin as i128,
+        ..CrossLeg::default()
+    };
+    if cross {
+        let n = derived.signed_notional;
+        if market.mark_price != 0 {
+            leg.upnl = n as i128 + pos.v_quote_balance as i128;
+        }
+        leg.pim = derived.margin.position_initial_margin as i128;
+        let abs_n = n.checked_abs().ok_or_else(|| perp_err("cross fold: notional abs overflow"))?;
+        leg.mm = maintenance_margin(&market.tiers, abs_n)? as i128;
+        leg.pending_funding =
+            crate::funding::pending_funding_payment(market.cumulative_funding_index, pos, market)?
+                as i128;
+    }
+    Ok(leg)
+}
+
+/// **The cross fold — TOTAL.** Every account-level cross quantity ([`CrossFold`]) for `user`, over
+/// the per-user market index, in ONE walk. This is the form the liquidation sweep and ADL (cross
+/// P3) call, and the sweep PANICS on any `Err` from `liquidate_position`, so:
+///
+/// * accumulation is in `i128` and never narrowed;
+/// * a market id in the index that names no market contributes NOTHING (and `debug_assert`s — it
+///   is corrupt state), instead of an `Err`;
+/// * a leg whose arithmetic leaves the representable range contributes nothing either;
+/// * a mark of `0` contributes `uPnL = MM = 0` ([`cross_leg`]).
+///
+/// The last three are counted in [`CrossFold::faulted_legs`]. The only `Err` left is the storage
+/// layer's own (a load or decode fault), which no fold can answer.
+///
+/// Gates and views want the opposite policy — refuse rather than price around a hole — and take
+/// [`cross_fold_checked`], which is this same walk.
+///
+/// # Overrides
+///
+/// `wallet_override` replaces `W`; `override_market` substitutes an IN-MEMORY position for one
+/// market id — the state a caller is ABOUT to write, or a match's registry working copy. When that
+/// id is not yet in the index (a user entering a market) its leg is added anyway; a market that
+/// does not exist then contributes nothing (the placement path refuses an unknown market first).
+/// A working copy has had its funding settled already (its `last_funding_index` re-anchored), so
+/// its `PF` is 0 and the settled amount is in the wallet the caller overrides with.
+///
+/// # Cost
+///
+/// The index, plus `{Market, position}` per member market — exactly the walk the isolated
+/// admission basis always did — plus the account when `W` is not overridden. No `FundingState`
+/// load: `PF_k` is priced off the `Market`'s mirror of the cumulative index
+/// ([`crate::types::Market::cumulative_funding_index`]).
+///
+/// `legs`, when given, receives one [`CrossLeg`] per evaluated leg in walk order (a faulted leg is
+/// not pushed) — what a per-market cross number such as the cross liquidation price is built from.
+///
+/// # ⚠️ DO NOT CACHE THIS, AND DO NOT INCREMENT IT — RE-WALK, EVERY TIME
+///
+/// See [`derived_available_balance_with`]. Every term moves with its own market's mark (and `PF`
+/// with its funding epoch) while the user does nothing (R13).
+pub fn cross_fold<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    wallet_override: Option<i64>,
+    override_market: Option<(u64, &crate::types::PerpPosition)>,
+    legs: Option<&mut Vec<CrossLeg>>,
+) -> Result<CrossFold, PerpError> {
+    cross_fold_walk(context, user, wallet_override, override_market, legs, FoldPolicy::Total)
+}
+
+/// [`cross_fold`] for the gates and the views: the same walk, but a leg it cannot evaluate is
+/// REFUSED instead of left out — an index entry naming no market is an `[INVARIANT]` reject, an
+/// arithmetic overflow is the per-leg reject — which is the error behaviour the isolated
+/// admission basis always had. [`CrossFold::faulted_legs`] is therefore always `0` here.
+pub fn cross_fold_checked<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    wallet_override: Option<i64>,
+    override_market: Option<(u64, &crate::types::PerpPosition)>,
+    legs: Option<&mut Vec<CrossLeg>>,
+) -> Result<CrossFold, PerpError> {
+    cross_fold_walk(context, user, wallet_override, override_market, legs, FoldPolicy::Checked)
+}
+
+/// What [`cross_fold_walk`] does with a leg it cannot evaluate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FoldPolicy {
+    /// Leave it out and count it (the sweep-facing fold).
+    Total,
+    /// Refuse (the gates and views).
+    Checked,
+}
+
+fn cross_fold_walk<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    wallet_override: Option<i64>,
+    override_market: Option<(u64, &crate::types::PerpPosition)>,
+    mut legs: Option<&mut Vec<CrossLeg>>,
+    policy: FoldPolicy,
+) -> Result<CrossFold, PerpError> {
+    let w = match wallet_override {
+        Some(w) => w,
+        None => storage::load_account_ref(context, user)?.perp_wallet_balance,
+    };
+    let markets = storage::load_user_markets_ref(context, user)?;
+    let mut sums = CrossSums::default();
+    let mut faulted: u8 = 0;
+    let mut applied_override = false;
+    // One leg, under the policy. `Ok(())` when it was added OR (Total) left out.
+    let mut take = |leg: Result<CrossLeg, PerpError>,
+                    sums: &mut CrossSums,
+                    legs: &mut Option<&mut Vec<CrossLeg>>|
+     -> Result<(), PerpError> {
+        match leg {
+            Ok(leg) => {
+                sums.add(&leg);
+                if let Some(legs) = legs.as_mut() {
+                    legs.push(leg);
+                }
+                Ok(())
+            }
+            Err(e) if policy == FoldPolicy::Checked => Err(e),
+            Err(_) => {
+                faulted = faulted.saturating_add(1);
+                Ok(())
+            }
+        }
+    };
+    for market_id in markets.iter().copied() {
+        // The index is a set, so no id repeats and no term is double-counted.
+        let Some(market) = storage::load_market_ref(context, market_id)? else {
+            let e = perp_invariant_err(format!(
+                "derived margin: user market index holds unknown market {market_id}"
+            ));
+            // Corrupt state: the index is only ever written for a market that exists. Refused on
+            // the checked path; on the total one it is left out — and flagged loudly in debug
+            // builds.
+            debug_assert!(
+                policy == FoldPolicy::Checked,
+                "cross fold: {user}'s market index holds unknown market {market_id}"
+            );
+            take(Err(e), &mut sums, &mut legs)?;
+            continue;
+        };
+        let leg = match override_market {
+            Some((id, over)) if id == market_id => {
+                applied_override = true;
+                cross_leg(&market, over)
+            }
+            _ => {
+                // TWO loads per market — `{market, position}`; both `Bid`/`Ask` aggregates sit in
+                // the position blob, frozen (R12), and the funding index is mirrored into `market`.
+                let pos = storage::load_position_ref(context, user, market_id)?;
+                cross_leg(&market, &pos)
+            }
+        };
+        take(leg, &mut sums, &mut legs)?;
+    }
+    if let Some((id, over)) = override_market {
+        if !applied_override {
+            // Entering a market: the index is only written at save time, so the id the caller is
+            // pricing is legitimately absent. A market that does not exist contributes nothing
+            // (the placement path rejects an unknown market long before this point).
+            if let Some(market) = storage::load_market_ref(context, id)? {
+                take(cross_leg(&market, over), &mut sums, &mut legs)?;
+            }
+        }
+    }
+    Ok(sums.finish(w, faulted))
+}
+
 // ── Derived-ooIM admission basis (the live enforcement gate) ─────────────────────────────────
 
 /// `Σ_markets ooIM` for `user`, over the per-user market index — the account-level open-order
-/// requirement.
+/// requirement, ISOLATED and CROSSED markets alike ([`CrossFold::oo_im_all`]).
 ///
 /// Enumerates exactly the markets the user is active in (non-zero position OR at least one
 /// resting order), which is precisely the support of the sum: a market the user has left
@@ -573,29 +921,13 @@ pub fn margin_info_of(
 /// there is no other way to enumerate a user's markets, and walking every market on the exchange
 /// would be unbounded.
 ///
-/// `override_market` substitutes an IN-MEMORY position for one market id, so a caller can price
-/// the state it is ABOUT to write (the hypothetical post-placement position) or the state a match
-/// is holding in its registry working copy, without touching storage. When the overridden id is
-/// not yet in the index — a user entering a market — its term is added anyway, which is exactly
-/// what the placement gate needs. [`fold_account_margin`]'s override is the same rule, term for
-/// term, on the wide fold.
+/// `override_market` substitutes an IN-MEMORY position for one market id; see [`cross_fold`].
 ///
-/// # Who folds THIS and who folds the wide one
-///
-/// This is the LEAN fold: one accumulator, no maintenance-margin tier walk, no unrealized PnL, no
-/// `Σ isolatedWallet`. It serves the gates that want nothing but `available` —
-/// `TakerSettlement::finalize_compute`, `trading::rest_in_book`'s admission gate, its pre-walk
-/// early-out, the taker wallet-cover check, `addPositionMargin`, `transferFromPerp`,
-/// `depositInsuranceFund` — where the five extra accumulators would be arithmetic thrown away.
-///
-/// The WIDE fold ([`account_margin_scalars`]) is now REST-only: `getAccount` and `getAccountMargin`
-/// are its only callers. Both other consumers it once had are gone — `trading::rest_in_book` reverted
-/// to this lean form when a pure placement became silent, and the `AccountBalanceChanged` drain took
-/// the leaner [`index_account_wallet_balances`] when its payload narrowed to the balances.
+/// A projection of [`cross_fold_checked`] (cross P2): the walk, the override rule and the
+/// `[INVARIANT]` refusal of an index entry naming no market all live there now, once.
 ///
 /// Pure read — every loader it reaches is a `_ref` (cache-fill, never dirty-mark) reader, so it
-/// enters no key into the block delta and cannot move the commitment. Returns `u128` so the fold
-/// cannot overflow before the caller compares it.
+/// enters no key into the block delta and cannot move the commitment.
 ///
 /// # ⚠️ DO NOT CACHE THIS, AND DO NOT INCREMENT IT — RE-WALK, EVERY TIME
 ///
@@ -609,48 +941,26 @@ pub fn total_open_order_initial_margin<H: PerpHost>(
     user: Address,
     override_market: Option<(u64, &crate::types::PerpPosition)>,
 ) -> Result<u128, PerpError> {
-    let markets = storage::load_user_markets_ref(context, user)?;
-    let mut total: u128 = 0;
-    let mut applied_override = false;
-    for market_id in markets.iter().copied() {
-        // The index is a set, so no id repeats and no term is double-counted.
-        let market = storage::load_market_ref(context, market_id)?.ok_or_else(|| {
-            crate::errors::perp_invariant_err(format!(
-                "derived margin: user market index holds unknown market {market_id}"
-            ))
-        })?;
-        total += match override_market {
-            Some((id, over)) if id == market_id => {
-                applied_override = true;
-                position_open_order_margin(&market, over)?
-            }
-            _ => {
-                // TWO loads per market — `{market, position}`. The `MarketHot` read and the sell-list
-                // read the old read-time `Ask` re-fold needed are both gone: both aggregates sit in
-                // the position blob, frozen (R12).
-                let pos = storage::load_position_ref(context, user, market_id)?;
-                position_open_order_margin(&market, &pos)?
-            }
-        } as u128;
-    }
-    if let Some((id, over)) = override_market {
-        if !applied_override {
-            // Entering a market: the index is only written at save time, so the id the caller is
-            // pricing is legitimately absent. A market that does not exist contributes nothing
-            // (the placement path rejects an unknown market long before this point).
-            if let Some(market) = storage::load_market_ref(context, id)? {
-                total += position_open_order_margin(&market, over)? as u128;
-            }
-        }
-    }
-    Ok(total)
+    // `W` is not part of the answer; a zero override spares the account load.
+    let fold = cross_fold_checked(context, user, Some(0), override_market, None)?;
+    Ok(fold.oo_im_all as u128)
 }
 
-/// The user's available balance — **the admission basis**.
+/// The user's available balance — **the admission basis** — Binance's `availableBalance`:
+///
+/// ```text
+/// A = cWB + Σ_C (uPnL_k − PIM_k) − Σ_{C∪I} ooIM_k          (see the notation block on CrossLeg)
+/// ```
+///
+/// which, for an account with no position CROSSED in force (every account while cross margin is
+/// gated off), is the isolated basis it always was:
 ///
 /// ```text
 /// available = perp_wallet_balance − Σ_markets ooIM
 /// ```
+///
+/// Cross unrealized profit COUNTS toward opening (Binance: "Available for Order"), it does not
+/// count toward withdrawal — that is [`CrossFold::x`].
 ///
 /// There is no gross-up term. Phase 1 needed one (`+ Σ margin_reserved`) because the escrow had
 /// ALREADY been debited from the wallet, so subtracting Σ ooIM on top would have charged the
@@ -669,16 +979,17 @@ pub fn derived_available_balance<H: PerpHost>(
 
 /// [`derived_available_balance`] with in-memory overrides for the wallet and/or one market's
 /// position — the form the fill paths need, where the authoritative values live in a registry
-/// working copy that has not been flushed yet.
+/// working copy that has not been flushed yet. [`CrossFold::a`] of [`cross_fold_checked`].
 ///
 /// # ⚠️ DO NOT CACHE THE RESULT, AND DO NOT DERIVE IT FROM A PREVIOUS CALL BY SUBTRACTING A DELTA
 ///
 /// This must be RECOMPUTED on every check. The temptation is real and the gates now invite it:
 /// `rest_in_book`'s gate and the taker gates evaluate this at the POST state and read like
-/// incremental arithmetic, and the identity `available(after) == available(before) − Δ ooIM` genuinely holds —
-/// but **only within a single call**, where every other market's term is the same integer on both
-/// sides. Across calls it does not hold at all: `ooIM_m` contains `N_m = trunc(amount_m × mark_m)`,
-/// so every other market's term moves with ITS OWN mark, with no action by the user.
+/// incremental arithmetic, and the identity `available(after) == available(before) − Δ ooIM`
+/// genuinely holds — but **only within a single call**, where every other market's term is the same
+/// integer on both sides. Across calls it does not hold at all: `ooIM_m` contains
+/// `N_m = trunc(amount_m × mark_m)`, so every other market's term moves with ITS OWN mark, with no
+/// action by the user (and, for a cross account, so does every other market's `uPnL` and `PF`).
 ///
 /// Measured, twice over:
 /// * **R13** — `Δtotal == ΔooIM_B` on 30/30 frames of a hands-off window, and the stronger
@@ -698,11 +1009,7 @@ pub fn derived_available_balance_with<H: PerpHost>(
     wallet_override: Option<i64>,
     override_market: Option<(u64, &crate::types::PerpPosition)>,
 ) -> Result<i128, PerpError> {
-    let wallet = match wallet_override {
-        Some(w) => w,
-        None => storage::load_account_ref(context, user)?.perp_wallet_balance,
-    };
-    Ok(wallet as i128 - total_open_order_initial_margin(context, user, override_market)? as i128)
+    Ok(cross_fold_checked(context, user, wallet_override, override_market, None)?.a)
 }
 
 /// The affordability test on the derived basis: `available >= requirement`, with a NON-POSITIVE
@@ -892,20 +1199,24 @@ pub struct AccountMarginTotals {
     pub total_unrealized_profit: i128,
     /// Σ `isolatedWallet` — the silos.
     pub total_position_margin: i128,
+    /// The cross-margin sums (cross P2) over the same legs, through the SAME [`CrossSums`] the
+    /// admission basis ([`cross_fold`]) adds them with.
+    pub cross: CrossSums,
 }
 
 impl AccountMarginTotals {
-    /// Add one market's [`MarginInfo`] to every accumulator. The ONLY place the six terms are
-    /// summed, so the in-index and the entering-a-new-market arms of [`fold_account_margin`] cannot
-    /// accumulate different sets of fields.
+    /// Add one market's [`MarginInfo`] and its [`CrossLeg`] to every accumulator. The ONLY place
+    /// the row terms are summed, so the in-index and the entering-a-new-market arms of
+    /// [`fold_account_margin`] cannot accumulate different sets of fields.
     #[inline]
-    fn add(&mut self, info: &MarginInfo) {
+    fn add(&mut self, info: &MarginInfo, leg: &CrossLeg) {
         self.total_initial_margin += info.initial_margin as u128;
         self.total_position_initial_margin += info.position_initial_margin as u128;
         self.total_open_order_initial_margin += info.open_order_initial_margin as u128;
         self.total_maint_margin += info.maint_margin as u128;
         self.total_unrealized_profit += info.unrealized_profit as i128;
         self.total_position_margin += info.position_margin as i128;
+        self.cross.add(leg);
     }
 }
 
@@ -917,17 +1228,34 @@ pub struct AccountMarginScalars {
     /// Binance `totalWalletBalance` — the GROSS wallet: `totalCrossWalletBalance + Σ isolatedWallet`.
     /// Complete only when the market set is the whole index (see [`MarketSetSource`]).
     pub total_wallet_balance: i64,
-    /// Binance `totalCrossWalletBalance` — our stored `perp_wallet_balance`, verbatim. Signed and
-    /// unclamped.
+    /// Binance `totalCrossWalletBalance` — `cWB = perp_wallet_balance + Σ_C PF_k`: the stored
+    /// cross wallet plus the funding every position CROSSED in force has accrued and not yet
+    /// settled (cross P2; see [`CrossFold::cwb`]). Exactly the stored wallet for an account with no
+    /// cross position. Signed and unclamped.
     pub total_cross_wallet_balance: i64,
+    /// The stored `perp_wallet_balance` (`W`), verbatim — what `AccountBalanceChanged` publishes as
+    /// its `totalCrossWalletBalance`, which carries no unsettled funding (the event reports the
+    /// ledger, the views report Binance's instant-settlement number). Equal to
+    /// [`Self::total_cross_wallet_balance`] unless a cross position has funding pending.
+    pub perp_wallet_balance: i64,
     /// Binance `totalMarginBalance` = `totalWalletBalance + totalUnrealizedProfit` — total account
     /// EQUITY. Note this is GROSS-based, so it is NOT `total_cross_wallet_balance + upnl`.
     pub total_margin_balance: i64,
-    /// `totalCrossWalletBalance + totalUnrealizedProfit`. **Not a Binance field** — it is
-    /// [`Self::total_margin_balance`] minus `Σ isolatedWallet`, and it is what a caller working
-    /// from a PARTIAL market list can honestly be given (a "total wallet balance" over a partial
-    /// list would be a total that is not total).
+    /// `E = totalCrossWalletBalance + Σ_C uPnL_k` — the CROSS margin balance, Binance's
+    /// account-level "margin balance" of the cross positions, the left side of the cross
+    /// liquidation condition `E < Σ_C MM_k`. Only CROSSED positions' unrealized profit is in it
+    /// (cross P2, G16: it used to add every position's, isolated ones included); for an account
+    /// with no cross position it is the cross wallet itself.
     pub cross_margin_balance: i64,
+    /// Binance `totalCrossUnPnl` = `Σ_C uPnL_k`.
+    pub total_cross_unrealized_profit: i64,
+    /// `Σ_C MM_k` — the maintenance margin of the positions CROSSED in force.
+    pub total_cross_maint_margin: u64,
+    /// Binance `maxWithdrawAmount` = `max(0, min(cWB − Σ_I ooIM − Σ_C MM, availableBalance))`;
+    /// `max(0, availableBalance)` for an account with no cross position.
+    pub max_withdraw_amount: u64,
+    /// The whole cross fold these fields were narrowed from, in `i128`.
+    pub cross: CrossFold,
     /// Binance `totalUnrealizedProfit` = Σ `unrealizedProfit`.
     pub total_unrealized_profit: i64,
     /// Binance `totalInitialMargin` (== the next two, summed).
@@ -938,10 +1266,47 @@ pub struct AccountMarginScalars {
     pub total_open_order_initial_margin: u64,
     /// Binance `totalMaintMargin`.
     pub total_maint_margin: u64,
-    /// Binance `availableBalance` = `totalCrossWalletBalance − totalOpenOrderInitialMargin`, and
-    /// deliberately **NOT clamped at zero** (Binance's is; see [`run_get_account_margin`]).
-    /// Cross-based, not gross: the silos are already out of the cross wallet.
+    /// Binance `availableBalance` = `A = cWB + Σ_C (uPnL_k − PIM_k) − Σ ooIM` ([`CrossFold::a`]),
+    /// i.e. `totalCrossWalletBalance − totalOpenOrderInitialMargin` for an account with no cross
+    /// position, and deliberately **NOT clamped at zero** (Binance's is; see
+    /// [`run_get_account_margin`]). Cross-based, not gross: the silos are already out of the cross
+    /// wallet.
     pub available_balance: i64,
+}
+
+/// The [`CrossLeg`] of a row the wide fold has just priced — off the same `(market, position)`
+/// (both resident, so these are cache hits, not loads) through the same [`cross_leg`] the
+/// admission basis uses. In debug builds it is checked term for term against the row it sits
+/// beside: the leg and the row are two readings of one set of functions and must agree.
+fn row_cross_leg<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    over: Option<&crate::types::PerpPosition>,
+    info: &MarginInfo,
+) -> Result<CrossLeg, PerpError> {
+    let market = storage::load_market_ref(context, market_id)?
+        .ok_or_else(|| perp_err("marginInfo: unknown market"))?;
+    let leg = match over {
+        Some(over) => cross_leg(&market, over)?,
+        None => {
+            let pos = storage::load_position_ref(context, user, market_id)?;
+            cross_leg(&market, &pos)?
+        }
+    };
+    debug_assert_eq!(leg.oo_im, info.open_order_initial_margin as i128, "leg vs row: ooIM");
+    debug_assert_eq!(leg.cross, info.margin_type == crate::types::MarginType::Crossed.code());
+    if leg.cross {
+        debug_assert_eq!(
+            (leg.pim, leg.mm),
+            (info.position_initial_margin as i128, info.maint_margin as i128),
+            "leg vs row: PIM / MM"
+        );
+        if info.mark_price != 0 {
+            debug_assert_eq!(leg.upnl, info.unrealized_profit as i128, "leg vs row: uPnL");
+        }
+    }
+    Ok(leg)
 }
 
 /// Fold [`compute_margin_info`] over a market set. **The only account-level Σ in the engine.**
@@ -1013,15 +1378,21 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
                 "{who}: user market index holds unknown market {market_id}"
             )));
         }
-        let info = match override_market {
+        let over = match override_market {
             Some((id, over)) if id == market_id => {
                 applied_override = true;
-                compute_margin_info_at(context, market_id, over)
+                Some(over)
             }
-            _ => compute_margin_info(context, user, market_id),
+            _ => None,
+        };
+        let info = match over {
+            Some(over) => compute_margin_info_at(context, market_id, over),
+            None => compute_margin_info(context, user, market_id),
         }
         .map_err(|e| relabel_market(e, who, market_id))?;
-        totals.add(&info);
+        let leg = row_cross_leg(context, user, market_id, over, &info)
+            .map_err(|e| relabel_market(e, who, market_id))?;
+        totals.add(&info, &leg);
         // Kept, not recomputed: `info` is the value the six Σ terms above were just taken from.
         if let Some(rows) = rows.as_mut() {
             rows.push(AccountPositionRow { market_id, info });
@@ -1034,7 +1405,9 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
             // (the placement path rejects an unknown market long before this point).
             if let Some(market) = storage::load_market_ref(context, id)? {
                 let info = margin_info_of(&market, over).map_err(|e| relabel_market(e, who, id))?;
-                totals.add(&info);
+                let leg = row_cross_leg(context, user, id, Some(over), &info)
+                    .map_err(|e| relabel_market(e, who, id))?;
+                totals.add(&info, &leg);
                 // Appended for the same reason its term is: the row set must name exactly the
                 // market set the totals were summed over, override arm included.
                 if let Some(rows) = rows.as_mut() {
@@ -1050,15 +1423,23 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
 }
 
 /// [`fold_account_margin`] plus the stored cross wallet, narrowed to the ABI's widths with the
-/// four balance identities applied. **The single source of every account-level scalar.**
+/// balance identities applied. **The single source of every account-level scalar.**
 ///
 /// ```text
-/// totalCrossWalletBalance = perp_wallet_balance                                  (stored)
+/// totalCrossWalletBalance = cWB = perp_wallet_balance + Σ_C PF_k        (stored + unsettled)
 /// totalWalletBalance      = totalCrossWalletBalance + Σ isolatedWallet           (Binance gross)
 /// totalMarginBalance      = totalWalletBalance      + totalUnrealizedProfit      (equity)
-/// crossMarginBalance      = totalCrossWalletBalance + totalUnrealizedProfit
-/// availableBalance        = totalCrossWalletBalance − totalOpenOrderInitialMargin
+/// crossMarginBalance      = E = totalCrossWalletBalance + Σ_C uPnL_k
+/// availableBalance        = A = totalCrossWalletBalance + Σ_C (uPnL_k − PIM_k)
+///                               − totalOpenOrderInitialMargin
+/// maxWithdrawAmount       = X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))
 /// ```
+///
+/// (cross P2; the cross terms come from [`CrossSums::finish`], the formulas the admission basis
+/// uses.) With no position CROSSED in force — every account while cross margin is gated off —
+/// `cWB` is the stored wallet, `crossMarginBalance` is the wallet, `availableBalance` is
+/// `totalCrossWalletBalance − totalOpenOrderInitialMargin` and `maxWithdrawAmount` is
+/// `max(0, availableBalance)`, exactly as before.
 ///
 /// Each narrowing is the point where a pathological state surfaces as a clean revert instead of
 /// wrapping.
@@ -1092,7 +1473,11 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
     // Signed and unclamped: this is the CROSS wallet exactly as stored. A negative value is a
     // settled receivable (see `types::UserAccount::perp_wallet_balance`), and hiding it behind a
     // `uint64` floor is precisely the blind spot the old `availablePerpBalance` had.
-    let total_cross_wallet_balance = storage::load_account_ref(context, user)?.perp_wallet_balance;
+    let perp_wallet_balance = storage::load_account_ref(context, user)?.perp_wallet_balance;
+    // The cross quantities over the same legs, through the same formulas as the admission basis
+    // (`CrossSums::finish`). For an account with no position CROSSED in force: `cWB = W`,
+    // `A = W − Σ ooIM`, `X = max(0, A)`, `E = W` and every other cross term 0.
+    let cross = totals.cross.finish(perp_wallet_balance, 0);
 
     let narrow_u64 = |v: u128, what: &str| {
         u64::try_from(v).map_err(|_| perp_err(format!("{who}: {what} exceeds u64")))
@@ -1107,6 +1492,7 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
         totals.total_open_order_initial_margin,
         "total open-order initial margin",
     )?;
+    let total_cross_wallet_balance = narrow_i64(cross.cwb, "total cross wallet balance")?;
     let total_wallet_balance = narrow_i64(
         total_cross_wallet_balance as i128 + totals.total_position_margin,
         "total wallet balance",
@@ -1115,14 +1501,24 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
     Ok(AccountMarginScalars {
         total_wallet_balance,
         total_cross_wallet_balance,
+        perp_wallet_balance,
         total_margin_balance: narrow_i64(
             total_wallet_balance as i128 + total_unrealized_profit as i128,
             "total margin balance",
         )?,
-        cross_margin_balance: narrow_i64(
-            total_cross_wallet_balance as i128 + total_unrealized_profit as i128,
-            "cross margin balance",
+        cross_margin_balance: narrow_i64(cross.e, "cross margin balance")?,
+        total_cross_unrealized_profit: narrow_i64(
+            cross.cross_upnl,
+            "total cross unrealized profit",
         )?,
+        // `MM_k >= 0` for every leg, so the sum is non-negative; `.max(0)` only keeps the cast
+        // total.
+        total_cross_maint_margin: narrow_u64(
+            cross.cross_mm.max(0) as u128,
+            "total cross maintenance margin",
+        )?,
+        max_withdraw_amount: narrow_u64(cross.x as u128, "max withdraw amount")?,
+        cross,
         total_unrealized_profit,
         total_initial_margin: narrow_u64(totals.total_initial_margin, "total initial margin")?,
         total_position_initial_margin: narrow_u64(
@@ -1131,10 +1527,7 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
         )?,
         total_open_order_initial_margin,
         total_maint_margin: narrow_u64(totals.total_maint_margin, "total maintenance margin")?,
-        available_balance: narrow_i64(
-            total_cross_wallet_balance as i128 - total_open_order_initial_margin as i128,
-            "available balance",
-        )?,
+        available_balance: narrow_i64(cross.a, "available balance")?,
     })
 }
 
@@ -1220,10 +1613,21 @@ pub fn run_get_account_margin<H: PerpHost>(
         None,
     )?;
 
+    // This selector's `crossMarginBalance` is its OWN documented quantity,
+    // `totalCrossWalletBalance + totalUnrealizedProfit` over the listed markets — NOT `E`
+    // (`AccountMarginScalars::cross_margin_balance`, which sums cross uPnL only, cross P2 / G16).
+    // The two agree for an account whose listed positions are all CROSSED; for every ISOLATED one
+    // (every position while cross margin is gated off) this keeps the number the selector has
+    // always returned. Narrowed under the same name the scalar fold used to narrow it under.
+    let cross_wallet_plus_upnl = i64::try_from(
+        s.total_cross_wallet_balance as i128 + s.total_unrealized_profit as i128,
+    )
+    .map_err(|_| perp_err("getAccountMargin: cross margin balance exceeds i64"))?;
+
     Ok(Bytes::from(getAccountMarginCall::abi_encode_returns(
         &getAccountMarginReturn {
             totalCrossWalletBalance: s.total_cross_wallet_balance,
-            crossMarginBalance: s.cross_margin_balance,
+            crossMarginBalance: cross_wallet_plus_upnl,
             totalInitialMargin: s.total_initial_margin,
             totalPositionInitialMargin: s.total_position_initial_margin,
             totalOpenOrderInitialMargin: s.total_open_order_initial_margin,
@@ -1335,6 +1739,10 @@ pub fn index_account_scalars<H: PerpHost>(
             gate, scalars.available_balance as i128,
             "{who}: availableBalance must equal the admission gate's own basis"
         );
+        // And every cross quantity, not just `A`: the lean fold (the gates, and the liquidation
+        // sweep from P3) and this wide one must be the same numbers over the same index.
+        let lean = cross_fold_checked(context, user, None, override_market, None)?;
+        debug_assert_eq!(lean, scalars.cross, "{who}: the lean and the wide cross folds disagree");
     }
 
     // ── The stored `Σ pos.margin` against a FRESH WALK of the user's positions ────────────────
@@ -1511,11 +1919,18 @@ pub fn index_account_wallet_balances<H: PerpHost>(
     // `Ok(..)` guard, not `unwrap`: the wide fold has narrowing guards and per-market rejects this
     // one does not need, and a state that trips them is exactly a state in which `getAccount` itself
     // reverts — there is then no published number to disagree with.
+    //
+    // The event reports the LEDGER — the stored wallet — while `getAccount`'s cross wallet also
+    // carries the funding cross positions have accrued and not settled (cross P2: `cWB = W + Σ_C
+    // PF`). So the comparison is against the wide fold's stored wallet and its `Σ isolatedWallet`
+    // leg (`totalWalletBalance − totalCrossWalletBalance`); for an account with no cross position
+    // the two pairs are the published fields themselves.
     #[cfg(debug_assertions)]
     if let Ok(wide) = index_account_scalars(context, user, who, None, None) {
+        let silos = wide.total_wallet_balance as i128 - wide.total_cross_wallet_balance as i128;
         debug_assert_eq!(
-            (total_wallet_balance, total_cross_wallet_balance),
-            (wide.total_wallet_balance, wide.total_cross_wallet_balance),
+            (total_wallet_balance as i128, total_cross_wallet_balance),
+            (wide.perp_wallet_balance as i128 + silos, wide.perp_wallet_balance),
             "{who}: the lean snapshot fold and the wide getAccount fold disagree for {user}"
         );
     }
