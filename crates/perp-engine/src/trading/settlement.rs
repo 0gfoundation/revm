@@ -1584,6 +1584,15 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     // K9 reject. Free: the account is the working copy `get_or_load` just took (its funding is
     // settled and persisted regardless, as for every rejected maker). Nothing sets the flag before
     // P3, so this never fires in production yet.
+    //
+    // P3: Q11 ACCEPTS a reduce-only order while the flag is set, and if it rests it is cancelled
+    // here at first touch — accepted, then destroyed, with nothing on `OrderPlaced` / `OrderRested`
+    // saying it can never fill. A flagged account can still reduce as a TAKER (a reduce-only
+    // market / IOC order, a fired stop: a pure reduce on a cross wallet is not margin-gated, see
+    // `FillsGate`), so the gap is resting reduces only. Decide it with the episode: either exempt a
+    // reduce-only maker of a flagged account from this freeze (its fill can only lower `Σ MM`; the
+    // reduce-only eviction already keeps it within the position), or refuse a reduce-only order
+    // that would REST while flagged (`-2023`), admitting only immediate ones.
     if w.account.in_liquidation() {
         return Ok(MakerFillOutcome::Rejected {
             reason: crate::types::CancelReason::Liquidation,

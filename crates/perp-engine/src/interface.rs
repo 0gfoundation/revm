@@ -1329,7 +1329,30 @@ sol! {
         /// cross liquidation) only a reduce-only order is accepted; any other is refused
         /// `placeOrder: -2023 User in liquidation mode now. …` (batch reason 35), on every
         /// placement entrypoint. And none of the account's RESTING orders fills meanwhile: the
-        /// walk cancels each it meets (`OrderCancelled` reason 3) and goes on.
+        /// walk cancels each it meets (`OrderCancelled` reason 3) and goes on — a reduce-only one
+        /// included, so while flagged a reduce-only GTC is accepted but cancelled at first touch;
+        /// reduce with a reduce-only MARKET / IOC order (P3 decides whether resting reduce-only
+        /// orders of a flagged account may fill).
+        ///
+        /// Margin refusals. ISOLATED: `placeOrder: insufficient perp wallet for margin` (batch
+        /// reason 29) and `placeOrder: open would breach maintenance margin` (K9, 30).
+        /// ⚠️ ABI CHANGE (cross P2) — on a position CROSSED in force (or an account holding one),
+        /// all with Binance's `-2019`:
+        ///   * `placeOrder: -2019 Margin is insufficient. The available balance does not cover the
+        ///     order` (29): the available balance (`getAccount.availableBalance`, cross unrealised
+        ///     PnL included) does not cover a cross OPEN's initial margin plus fee, or a cross
+        ///     order's resting cost — its `openOrderInitialMargin` delta PLUS its Open Loss
+        ///     (Binance F8: for its opening part, `qty × (limit − mark)` on a buy above the mark,
+        ///     `qty × (mark − limit)` on a sell below it, at the mark at placement);
+        ///   * `placeOrder: -2019 Margin is insufficient. The open would leave the cross margin
+        ///     balance below the cross maintenance margin` (30): an opening TAKER fill of an
+        ///     account with cross exposure must leave `crossMarginBalance ≥ totalCrossMaintMargin`;
+        ///   * `placeOrder: -2019 Margin is insufficient. An ISOLATED position is funded from the
+        ///     wallet balance, never from cross unrealized profit` (29): an isolated open's margin
+        ///     must be in the wallet itself.
+        /// A pure REDUCE of a CROSSED position — or of any position of an account that still holds
+        /// cross exposure — is never margin-refused: its fee comes out of the cross wallet, which
+        /// may go negative (the account is judged on `crossMarginBalance`).
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
@@ -1376,8 +1399,10 @@ sol! {
         /// (orderType, tif) pair, qty or price
         /// out of range, the open-order cap (counting the items before it that rested), PostOnly
         /// would cross, FOK unfillable, insufficient margin, K9
-        /// open-into-insolvency) does NOT undo the items before it. The call returns Ok once the loop
-        /// has begun. A rejected item is write-clean AND log-clean — it emits no `OrderPlaced`.
+        /// open-into-insolvency, and — cross P2 — the cross margin refusals listed on `placeOrder`
+        /// (reasons 29 / 30) and `-2023` for an account in liquidation (reason 35)) does NOT undo
+        /// the items before it. The call returns Ok once the loop has begun. A rejected item is
+        /// write-clean AND log-clean — it emits no `OrderPlaced`.
         ///
         /// Items execute in order, and each matches the book **as left by the previous item**: a
         /// later item is the TAKER against earlier ones, exactly as if the items were separate
@@ -1695,6 +1720,13 @@ sol! {
         /// reaches): above it `addPositionMargin: -4050 Cross balance insufficient.`. A market
         /// CROSSED in force has no isolated margin to add to: `addPositionMargin: -4049 Add margin
         /// only support for isolated position.` (`removePositionMargin` likewise, `-4049`).
+        ///
+        /// ⚠️ ABI CHANGE (cross P2), visible with cross margin gated OFF: the cap refusal was
+        /// `addPositionMargin: insufficient perp wallet balance`; it is now the `-4050` string
+        /// above for every account (the accept/refuse decision of an isolated-only account is
+        /// unchanged). Update any matcher on the old text. The `-4049` strings are new and
+        /// reachable only on a market CROSSED in force. `removePositionMargin`'s own refusals are
+        /// unchanged.
         function addPositionMargin(uint64 marketId, uint64 amount) external;
         /// Remove isolated margin from an open position back to the caller's perp wallet.
         ///
@@ -1715,6 +1747,12 @@ sol! {
 
         // ── Liquidation ───────────────────────────────────────────────────
         /// Liquidate an under-margined position (anyone can call).
+        ///
+        /// ⚠️ ABI CHANGE (cross P2): a position CROSSED in force is refused with
+        /// `liquidate: position is CROSSED — account-level cross liquidation is not live yet` (no
+        /// write) until cross liquidation lands (P3), which will judge the ACCOUNT
+        /// (`crossMarginBalance < totalCrossMaintMargin`) instead. Unreachable while cross margin
+        /// is gated off.
         function liquidate(address user, uint64 marketId) external;
 
         // ── Insurance Fund ────────────────────────────────────────────────
