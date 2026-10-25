@@ -364,75 +364,99 @@ impl TakerSettlement {
         // ONE fold of the post-fill account: its `A` is the available-balance gate below
         // (`derived_available_balance_with` is exactly this fold's `a`), and its `E` / `Σ_C MM` are
         // J1's — so the account-level check costs no load beyond the walk the gate always made.
-        let fold = crate::margin_view::cross_fold_checked(
-            context,
-            self.user,
-            Some(wallet),
-            Some((self.market_id, &after_fills)),
-            None,
-        )?;
-        let available = fold.a;
+        //
+        // ── …and ONLY where a decision below reads it (J4) ───────────────────────────────────────
+        //
+        // Every fill set that OPENS needs it (the gate's `A`, J1's `E` / `Σ_C MM`), and so does a
+        // pure reduce that draws from the wallet (its gate's `A`). A pure reduce that draws NOTHING
+        // (`total_required == 0`) needs nothing from it: it passes B1 at any `A` and is never held
+        // to J1. That is EVERY liquidation close (the taker fee is waived and a close moves no silo
+        // cash), and the liquidation sweep PANICS on any `Err` from `liquidate_position`. This fold
+        // is the CHECKED one — a cross leg whose arithmetic leaves the representable range (a
+        // pending funding payment past `i64`, say) is an `Err` here — so walking it on a mixed
+        // account's isolated liquidation close would hand a cross leg's arithmetic a way to panic
+        // the node, for a number the close does not use. Skipped, the close reads no other market.
+        let fold = if core.opens || core.total_required != 0 {
+            Some(crate::margin_view::cross_fold_checked(
+                context,
+                self.user,
+                Some(wallet),
+                Some((self.market_id, &after_fills)),
+                None,
+            )?)
+        } else {
+            None
+        };
 
         // LEVEL 1 fast path (the common case): the available already covers the fills with NO
         // cover cancels → produce the plan with ZERO order-list clones. Only a genuinely tight
-        // taker falls through.
-        let (rest_pos, cover_cancelled) =
-            if fills_are_covered(available, core.total_required, core.cross_open) {
-                (after_fills, false)
-            } else {
-                // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
-                // `release_open_order_margin_core` so the sim cannot diverge from `finalize_apply`'s
-                // real loop. A cancel frees no cash now — it lowers `Bid`/`Ask` and therefore
-                // `Σ ooIM`, which is what raises the available. The loop's own test is
-                // `available >= total_required`, a straight money-out amount and NOT a delta, so
-                // `rest_in_book`'s post-state restatement does not apply to it — `available >=
-                // amount` is already the right form (the same class as `transferFromPerp` /
-                // `addPositionMargin`).
-                //
-                // ⚠️ The loop's break condition covers `total_required` ONLY, and always did: it
-                // has never cancelled orders to make room for a REST (whenever the fills alone were
-                // affordable it broke on the first iteration with zero cancels). So dropping the
-                // rest term from the fast-path test above changes WHICH branch a fills-affordable /
-                // rest-unaffordable taker takes, and nothing about how many of its orders are
-                // cancelled — that taker now reaches `rest_in_book`, which refuses, and the whole
-                // order rejects cleanly pre-flush instead of rejecting from in here.
-                let mut sim_pos = after_fills.clone();
-                let mut sim_buy = w.buy_entries.clone();
-                let mut sim_sell = w.sell_entries.clone();
-                let mut cancelled_any = false;
-                loop {
-                    // No re-fold: `release_open_order_margin_core` below subtracts each cancelled
-                    // entry's frozen term from `sim_pos`, so its aggregates ARE `Bid`/`Ask` for the
-                    // simulated book.
-                    let avail = crate::margin_view::derived_available_balance_with(
-                        context,
-                        self.user,
-                        Some(wallet),
-                        Some((self.market_id, &sim_pos)),
-                    )?;
-                    if fills_are_covered(avail, core.total_required, core.cross_open) {
-                        break;
-                    }
-                    let next = match taker_side {
-                        Side::Buy => sim_buy.back().map(|e| (e.order_id, e.price)),
-                        Side::Sell => sim_sell.back().map(|e| (e.order_id, e.price)),
-                    };
-                    let Some((oid, price)) = next else {
-                        return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
-                    };
-                    super::release_open_order_margin_core(
-                        &mut sim_pos,
-                        &mut sim_buy,
-                        &mut sim_sell,
-                        taker_side,
-                        &oid,
-                        price,
-                        market,
-                    )?;
-                    cancelled_any = true;
+        // taker falls through. No fold ⇒ nothing to cover (see above).
+        let covered = match &fold {
+            Some(f) => fills_are_covered(f.a, core.total_required, core.cross_open),
+            None => {
+                debug_assert!(
+                    core.total_required == 0 && !core.cross_open,
+                    "the fold was skipped for a fill set whose gate reads it"
+                );
+                true
+            }
+        };
+        let (rest_pos, cover_cancelled) = if covered {
+            (after_fills, false)
+        } else {
+            // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
+            // `release_open_order_margin_core` so the sim cannot diverge from `finalize_apply`'s
+            // real loop. A cancel frees no cash now — it lowers `Bid`/`Ask` and therefore
+            // `Σ ooIM`, which is what raises the available. The loop's own test is
+            // `available >= total_required`, a straight money-out amount and NOT a delta, so
+            // `rest_in_book`'s post-state restatement does not apply to it — `available >=
+            // amount` is already the right form (the same class as `transferFromPerp` /
+            // `addPositionMargin`).
+            //
+            // ⚠️ The loop's break condition covers `total_required` ONLY, and always did: it
+            // has never cancelled orders to make room for a REST (whenever the fills alone were
+            // affordable it broke on the first iteration with zero cancels). So dropping the
+            // rest term from the fast-path test above changes WHICH branch a fills-affordable /
+            // rest-unaffordable taker takes, and nothing about how many of its orders are
+            // cancelled — that taker now reaches `rest_in_book`, which refuses, and the whole
+            // order rejects cleanly pre-flush instead of rejecting from in here.
+            let mut sim_pos = after_fills.clone();
+            let mut sim_buy = w.buy_entries.clone();
+            let mut sim_sell = w.sell_entries.clone();
+            let mut cancelled_any = false;
+            loop {
+                // No re-fold: `release_open_order_margin_core` below subtracts each cancelled
+                // entry's frozen term from `sim_pos`, so its aggregates ARE `Bid`/`Ask` for the
+                // simulated book.
+                let avail = crate::margin_view::derived_available_balance_with(
+                    context,
+                    self.user,
+                    Some(wallet),
+                    Some((self.market_id, &sim_pos)),
+                )?;
+                if fills_are_covered(avail, core.total_required, core.cross_open) {
+                    break;
                 }
-                (sim_pos, cancelled_any)
-            };
+                let next = match taker_side {
+                    Side::Buy => sim_buy.back().map(|e| (e.order_id, e.price)),
+                    Side::Sell => sim_sell.back().map(|e| (e.order_id, e.price)),
+                };
+                let Some((oid, price)) = next else {
+                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                };
+                super::release_open_order_margin_core(
+                    &mut sim_pos,
+                    &mut sim_buy,
+                    &mut sim_sell,
+                    taker_side,
+                    &oid,
+                    price,
+                    market,
+                )?;
+                cancelled_any = true;
+            }
+            (sim_pos, cancelled_any)
+        };
 
         // ── J6: an ISOLATED silo is funded with WALLET CASH, never with cross unrealized profit ──
         //
@@ -488,11 +512,10 @@ impl TakerSettlement {
         // * while cross margin is gated off nothing is CROSSED in force, so it is never reached.
         // * never on an oracle path: a fired conditional is reduce-only.
         // Pre-write, like every other reject in this function.
-        if core.opens
-            && fold.has_cross
-            && !fold.covers_cross_maintenance_after(core.total_required as i128)
-        {
-            return Err(perp_err(CROSS_MAINTENANCE_REJECT));
+        if let Some(f) = fold.filter(|_| core.opens) {
+            if f.has_cross && !f.covers_cross_maintenance_after(core.total_required as i128) {
+                return Err(perp_err(CROSS_MAINTENANCE_REJECT));
+            }
         }
 
         // The wallet `finalize_apply`'s debit will leave. For an account with no position CROSSED

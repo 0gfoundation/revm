@@ -771,6 +771,46 @@ fn the_sweep_and_liquidate_leave_a_crossed_position_alone() {
     assert!(!deferred);
 }
 
+/// J4: an ISOLATED liquidation close walks no account fold, so a CROSSED leg it does not need
+/// cannot fail it. CAROL holds an isolated 3x long of 10 on M1 and a CROSSED long of 1 on M2 whose
+/// pending funding no `i64` holds — a leg the CHECKED fold (the gates' and views') refuses with
+/// `math: funding payment exceeds i64`. The tick to $70 still liquidates the isolated position into
+/// BOB's bid: the close's fee is waived and it moves no silo cash, so its fills gate passes at any
+/// balance and nothing reads the cross leg. Folded, the leg's `Err` would reach the sweep's
+/// `panic!` on every node. The cross leg is left as it was.
+#[test]
+fn an_isolated_liquidation_close_never_folds_a_failing_cross_leg() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+    }
+    set_type(&mut ctx, CAROL, M1, ISOLATED);
+    set_leverage(&mut ctx, CAROL, M1, 3);
+    trade(&mut ctx, M2, CAROL, BOB, BUY, px(100), 1); // cross long 1 on M2
+    trade(&mut ctx, M1, CAROL, BOB, BUY, px(100), 10); // isolated 3x long 10 on M1
+    ok(&mut ctx, BOB, &order(M1, BUY, px(69), 10, GTC)); // the bid the close lands on
+
+    // `−1 · 10^21 / 10^2` of funding on the one cross contract: past `i64`.
+    set_funding_index(&mut ctx, M2, 1_000_000_000_000_000_000_000);
+    let cross_leg = pos(&mut ctx, CAROL, M2);
+    let m2 = storage::load_market(&mut ctx, M2).unwrap().unwrap();
+    assert!(crate::margin_view::cross_leg(&m2, &cross_leg).is_err(), "the cross leg fails");
+    assert!(
+        crate::margin_view::cross_fold_checked(&mut ctx, CAROL, None, None, None).is_err(),
+        "the checked fold refuses CAROL's account"
+    );
+
+    let logs = tick(&mut ctx, M1, px(70), 30);
+    let liq = liquidations(&logs);
+    assert_eq!(liq.len(), 1, "exactly one liquidation");
+    assert_eq!(liq[0].user, CAROL);
+    assert_eq!(pos(&mut ctx, CAROL, M1).amount, 0, "closed in full");
+    assert_eq!(pos(&mut ctx, BOB, M1).amount, 0, "into BOB's bid, no ADL");
+    assert!(adl_fills(&logs).is_empty());
+    assert_eq!(pos(&mut ctx, CAROL, M2), cross_leg, "the cross leg is untouched");
+}
+
 /// The ADL scene shared by the two winner tests: CAROL is an ISOLATED 3x long of 10, opened against
 /// ALICE (CROSSED, 3x, short 5) and BOB (ISOLATED, 1x, short 5), on an empty book, so a tick to $70
 /// liquidates CAROL and her whole position is an ADL residual — solvent, so filled at the mark.
