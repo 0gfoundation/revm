@@ -461,18 +461,28 @@ sol! {
         ///   was simply wrong. Same class of error as the `walletBalance` collision in §7.1.2.
         /// * `maxWithdrawAmount` — Binance's
         ///   `max(0, min(totalCrossWalletBalance − Σ isolated openOrderInitialMargin −
-        ///   totalCrossMaintMargin, availableBalance))` (cross P2): cross unrealised PROFIT does not
-        ///   withdraw (only the wallet term and `availableBalance` bound it, and `availableBalance`
-        ///   already nets cross losses), and the cross positions' maintenance margin stays behind.
-        ///   For an account with no CROSSED position it is `max(0, availableBalance)`, i.e. the most
-        ///   that `transferFromPerp` lets out of the PERP wallet right now.
+        ///   totalCrossMaintMargin, availableBalance))` (cross P2), with a third term of ours inside
+        ///   the `min`: `crossMarginBalance − Σ isolated openOrderInitialMargin −
+        ///   totalCrossMaintMargin`, so no money out can take a healthy account below cross
+        ///   maintenance (Binance's two terms allow it once a cross position's maintenance margin
+        ///   exceeds its initial margin — a notional the mark carried into a higher-MMR tier). Cross
+        ///   unrealised PROFIT does not withdraw (only the wallet term and `availableBalance` bound
+        ///   it, and `availableBalance` already nets cross losses), and the cross positions'
+        ///   maintenance margin stays behind. For an account with no CROSSED position it is
+        ///   `max(0, availableBalance)`, i.e. the most that `transferFromPerp` lets out of the PERP
+        ///   wallet right now.
         ///   ⚠️ **THE NAME IS WRONG FOR OUR TWO-LAYER MODEL AND WE KEPT IT ANYWAY.** `withdraw()`
         ///   gates on `usdcBalance` — the SPOT layer — not on this number. So "max withdraw" here
         ///   does NOT tell you how much you can withdraw from the protocol; it tells you how much
         ///   you can move perp → spot. To actually withdraw you then need a second step whose
         ///   limit is `usdcBalance`. The name is kept only because Binance uses it for the
-        ///   same-shaped field. **Prefer `availableBalance` in new code** — it is the same number
-        ///   before the clamp, and it is not lying about which layer it describes.
+        ///   same-shaped field.
+        ///   ⚠️ **It is NOT `availableBalance` clamped** once the account holds a CROSSED position:
+        ///   `availableBalance` counts cross unrealised profit (it may back an ORDER), this field
+        ///   never does (it may not LEAVE), and it also keeps the cross maintenance margin back. Use
+        ///   `availableBalance` to predict what an order may draw and THIS field to predict what a
+        ///   money-out call may move; they coincide (before the clamp) only for an account with no
+        ///   CROSSED position.
         ///   The clamp matters: `availableBalance` is signed and can be negative (an
         ///   under-covered account), but "you may withdraw a negative amount" is meaningless, so
         ///   this field floors at zero. **The un-clamped truth stays visible in
@@ -489,8 +499,8 @@ sol! {
         /// readings rather than a published formula, so mirroring it would have been presenting an
         /// extrapolation as a rule. That applies to predicting *Binance*. Here we are not
         /// predicting anything — the field is DEFINED by the published formula above (its two-term
-        /// form, cross report §1.2), which for an isolated-only account is `max(0,
-        /// availableBalance)`, so there is no extrapolation left in it.
+        /// form, cross report §1.2, plus our maintenance floor), which for an isolated-only account
+        /// is `max(0, availableBalance)`, so there is no extrapolation left in it.
         ///
         /// ⚠️ PORTING PITFALLS FROM §7 THAT WE DO NOT REPRODUCE.
         ///

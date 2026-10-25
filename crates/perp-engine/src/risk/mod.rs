@@ -845,8 +845,10 @@ pub fn run_add_position_margin<H: PerpHost>(
     // wallet — otherwise a user could park their whole balance in position margin out from under
     // their resting orders — and not `A` either: for a cross account `A` counts cross unrealized
     // profit, which must never become isolated collateral (J6 — this is Binance's add-margin cap,
-    // `max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, cross report F5). For an account with no cross
-    // position the two decide identically for a positive amount.
+    // `max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, cross report F5, with our maintenance floor
+    // `E − Σ_I ooIM − Σ_C MM` inside the `min`: cash parked in a silo leaves the cross account as
+    // surely as a transfer does). For an account with no cross position the two decide identically
+    // for a positive amount.
     //
     // Refused with Binance's `-4050 Cross balance insufficient.` — the add-margin cap IS the cross
     // wallet's withdrawable balance (F5). For an account with no cross position the decision is

@@ -985,7 +985,8 @@ fn transfer_in(amount: u64) -> Vec<u8> {
     crate::interface::IPerpDex::transferToPerpCall { amount }.abi_encode()
 }
 
-/// The money-out gates read `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, not `A`: cross profit
+/// The money-out gates read `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A, E − Σ_I ooIM − Σ_C MM))`,
+/// not `A`: cross profit
 /// admits orders but never leaves the wallet, and a NEGATIVE cross wallet withdraws nothing however
 /// much profit stands behind it — while a deposit nets against it.
 #[test]

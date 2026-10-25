@@ -577,7 +577,8 @@ pub fn margin_info_of(
 // E   = cWB + Σ_C uPnL_k                               cross margin balance
 // PIM_k = ROUND_UP(|N_k| / L_k),  MM_k = slice-form tier MM (explicit or derived rate)
 // A   = cWB + Σ_C (uPnL_k − PIM_k) − Σ_{C∪I} ooIM_k     availableBalance (signed, unclamped)
-// X   = max(0, min(cWB − Σ_I ooIM_k − Σ_C MM_k, A))     maxWithdrawAmount
+// X   = max(0, min(cWB − Σ_I ooIM_k − Σ_C MM_k, A,      maxWithdrawAmount (the third term is
+//                  E − Σ_I ooIM_k − Σ_C MM_k))           ours — see `CrossFold::x`)
 // liquidatable (cross, account-level)  ⇔  E < Σ_C MM_k
 // ```
 //
@@ -638,7 +639,20 @@ pub struct CrossFold {
     pub e: i128,
     /// `A = cWB + Σ_C (uPnL_k − PIM_k) − Σ_{C∪I} ooIM_k` — the admission basis, signed.
     pub a: i128,
-    /// `X = max(0, min(cWB − Σ_I ooIM_k − Σ_C MM_k, A))` — what may leave the perp wallet.
+    /// `X = max(0, min(cWB − Σ_I ooIM_k − Σ_C MM_k, A, E − Σ_I ooIM_k − Σ_C MM_k))` — what may
+    /// leave the perp wallet.
+    ///
+    /// The first two terms are Binance's (cross report §1.2, F3). The third is OURS, and it is the
+    /// money-out twin of J1: no withdrawal may take a healthy account below cross maintenance.
+    /// Binance's two terms do not guarantee that — the first leaves `E' = Σ MM + Σ_C uPnL`, the
+    /// second `E' = Σ_C PIM + Σ ooIM`, and both are below `Σ_C MM` as soon as some cross leg has
+    /// `MM_k > PIM_k` (a mark that carried its notional into a higher-MMR tier than its leverage
+    /// was chosen for — the shape `setLeverage`'s tier cap checks only when leverage is set). It
+    /// binds only there: it is below the first term iff `Σ_C uPnL < 0`, and below `A` iff
+    /// `Σ_C MM > Σ_C PIM + Σ_C ooIM`. Equivalently the first two terms with the first one as
+    /// `cWB + min(0, Σ_C uPnL) − Σ_I ooIM − Σ_C MM`. For an account with no cross position it
+    /// equals `A` (`E = cWB = W`, every `Σ_C` is 0 and `Σ_I ooIM = Σ ooIM`), so every isolated
+    /// money-out decision is the one it was.
     pub x: i128,
     /// At least one market CROSSED in force holds a non-zero position.
     pub has_cross: bool,
@@ -709,7 +723,13 @@ impl CrossSums {
     pub fn finish(&self, w: i64, faulted_legs: u8) -> CrossFold {
         let w = w as i128;
         let cwb = w + self.pending_funding_cross;
-        let a = cwb + self.cross_upnl - self.cross_pim - self.oo_im_all;
+        let e = cwb + self.cross_upnl;
+        let a = e - self.cross_pim - self.oo_im_all;
+        // Binance's two terms, and the maintenance floor (see `CrossFold::x`).
+        let x = (cwb - self.iso_oo_im - self.cross_mm)
+            .min(a)
+            .min(e - self.iso_oo_im - self.cross_mm)
+            .max(0);
         CrossFold {
             w,
             pending_funding_cross: self.pending_funding_cross,
@@ -719,9 +739,9 @@ impl CrossSums {
             cross_mm: self.cross_mm,
             oo_im_all: self.oo_im_all,
             iso_oo_im: self.iso_oo_im,
-            e: cwb + self.cross_upnl,
+            e,
             a,
-            x: (cwb - self.iso_oo_im - self.cross_mm).min(a).max(0),
+            x,
             has_cross: self.has_cross,
             faulted_legs,
         }
@@ -1029,7 +1049,7 @@ pub fn derived_available_balance_with<H: PerpHost>(
 /// [`cross_fold_checked`]:
 ///
 /// ```text
-/// X = max(0, min(cWB − Σ_I ooIM − Σ_C MM,  A))
+/// X = max(0, min(cWB − Σ_I ooIM − Σ_C MM,  A,  E − Σ_I ooIM − Σ_C MM))
 /// ```
 ///
 /// **THE money-out basis** (`transferFromPerp`, `internalTransfer` out of the perp wallet,
@@ -1040,6 +1060,8 @@ pub fn derived_available_balance_with<H: PerpHost>(
 /// negative cross wallet — a normal cross state since P2b (a realized loss, a funding charge or a
 /// fee settles into `W` whatever its sign) — therefore withdraws NOTHING, however much cross
 /// profit stands behind it: no money-out gate can walk an account away from its own receivable.
+/// The third term is ours (see [`CrossFold::x`]): no money out may leave the account below cross
+/// maintenance, `E − amount ≥ Σ_C MM + Σ_I ooIM` — J1's rule for opens, on the money-out side.
 ///
 /// For an account with no position CROSSED in force `X = max(0, A)`, and every caller gates a
 /// POSITIVE amount, for which `X ≥ amount ⇔ A ≥ amount`: the isolated money-out gates decide
@@ -1384,7 +1406,8 @@ pub struct AccountMarginScalars {
     pub total_cross_unrealized_profit: i64,
     /// `Σ_C MM_k` — the maintenance margin of the positions CROSSED in force.
     pub total_cross_maint_margin: u64,
-    /// Binance `maxWithdrawAmount` = `max(0, min(cWB − Σ_I ooIM − Σ_C MM, availableBalance))`;
+    /// Binance `maxWithdrawAmount` = `max(0, min(cWB − Σ_I ooIM − Σ_C MM, availableBalance))`, held
+    /// to cross maintenance by a third term of ours (`E − Σ_I ooIM − Σ_C MM`, [`CrossFold::x`]);
     /// `max(0, availableBalance)` for an account with no cross position.
     pub max_withdraw_amount: u64,
     /// The whole cross fold these fields were narrowed from, in `i128`.
@@ -1565,7 +1588,8 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
 /// crossMarginBalance      = E = totalCrossWalletBalance + Σ_C uPnL_k
 /// availableBalance        = A = totalCrossWalletBalance + Σ_C (uPnL_k − PIM_k)
 ///                               − totalOpenOrderInitialMargin
-/// maxWithdrawAmount       = X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))
+/// maxWithdrawAmount       = X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A,
+///                                          E − Σ_I ooIM − Σ_C MM))
 /// ```
 ///
 /// (cross P2; the cross terms come from [`CrossSums::finish`], the formulas the admission basis

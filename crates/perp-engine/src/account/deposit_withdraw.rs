@@ -200,7 +200,8 @@ fn transfer_from_perp_core<H: PerpHost>(
     // come out of the WITHDRAWABLE balance. This is THE money-out gate — the one place where getting
     // the basis wrong lets a user strip the collateral out from under their own resting orders, or
     // (cross margin) withdraw unrealized profit or walk away from a negative cross wallet — so it
-    // reads `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, never the raw wallet. For an account
+    // reads `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A, E − Σ_I ooIM − Σ_C MM))` (the last term
+    // keeps a healthy cross account at or above maintenance), never the raw wallet. For an account
     // with no cross position that is `max(0, perp_wallet_balance − Σ ooIM)`, the basis it always
     // read for a positive amount.
     let available = crate::margin_view::derived_withdrawable_balance(context, account_addr)?;

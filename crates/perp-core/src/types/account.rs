@@ -116,9 +116,9 @@ pub struct UserAccount {
     ///   load-bearing accounting, not a placeholder.
     /// * **It cannot be walked away from.** Every money-out gate (`transferFromPerp`,
     ///   `internalTransfer` from the perp wallet, `depositInsuranceFund`, `addPositionMargin`) reads
-    ///   the withdrawable balance `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, whose first term
-    ///   holds no unrealized profit at all: a negative cross wallet withdraws NOTHING, however much
-    ///   profit stands behind it. Every risk-increasing admission reads `A = cWB + Σ_C (uPnL − PIM) −
+    ///   the withdrawable balance `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A, E − Σ_I ooIM − Σ_C
+    ///   MM))`, whose first term holds no unrealized profit at all: a negative cross wallet
+    ///   withdraws NOTHING, however much profit stands behind it. Every risk-increasing admission reads `A = cWB + Σ_C (uPnL − PIM) −
     ///   Σ ooIM`, which the deficit lowers one for one; an ISOLATED open must moreover find its silo's
     ///   cash in the wallet itself (J6), so a deficit is never papered over with a silo.
     /// * **It is collected.** The next deposit, the next profitable close, a funding credit and an

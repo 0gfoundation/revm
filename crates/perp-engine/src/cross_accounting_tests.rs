@@ -501,7 +501,8 @@ fn model(legs: &[Leg], markets: &[(u64, ModelMarket)], w: i64) -> crate::margin_
         iso_oo_im: iso_oo,
         e: cwb + upnl,
         a,
-        x: (cwb - iso_oo - mm).min(a).max(0),
+        // Binance's two terms, and the maintenance floor no money out may cross.
+        x: (cwb - iso_oo - mm).min(a).min(cwb + upnl - iso_oo - mm).max(0),
         has_cross,
         faulted_legs: 0,
     }

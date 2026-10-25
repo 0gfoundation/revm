@@ -22,7 +22,7 @@
 //! cWB          W + Σ_C PF_k
 //! E            cWB + Σ_C uPnL_k
 //! A            cWB + Σ_C (uPnL_k − PIM_k) − Σ_{C∪I} ooIM_k
-//! X            max(0, min(cWB − Σ_I ooIM_k − Σ_C MM_k, A))
+//! X            max(0, min(cWB − Σ_I ooIM_k − Σ_C MM_k, A, E − Σ_I ooIM_k − Σ_C MM_k))
 //! LP (cross k) the mark of k at which E < Σ_C MM, every other cross leg held (LP1)
 //! LP (iso k)   the mark of k at which margin_k + uPnL_k < MM_k
 //! ```
@@ -573,7 +573,9 @@ fn model(ctx: &mut TestCtx, u: Address) -> Model {
     md.cwb = md.w + md.c_pf;
     md.e = md.cwb + md.c_upnl;
     md.a = md.cwb + md.c_upnl - md.c_pim - md.oo_all;
-    md.x = (md.cwb - md.i_oo - md.c_mm).min(md.a).max(0);
+    // Binance's two terms (§3.2), and the maintenance floor no money out may cross (review fix:
+    // without it a withdrawal could take a healthy account under `Σ_C MM` once a leg's MM > PIM).
+    md.x = (md.cwb - md.i_oo - md.c_mm).min(md.a).min(md.e - md.i_oo - md.c_mm).max(0);
     md
 }
 

@@ -1213,6 +1213,59 @@ fn every_money_out_gate_stops_at_x_to_the_unit_with_cross_profit() {
     ledger.check(&mut ctx, "after the deposit");
 }
 
+/// No money out may take a healthy account below cross maintenance — `X`'s third term,
+/// `E − Σ_I ooIM − Σ_C MM`, the money-out twin of J1. ALICE (J1 scene, wallet $10,000) holds the
+/// CROSSED M2 short the $500 mark carried into tier 1 (`MM $800 > PIM $250`, `uPnL −$4,000`) and an
+/// ISOLATED long of 1 on M1: healthy, `E` about 7.5× `Σ MM`. Binance's two terms alone would let
+/// `A` — $550 more than `E − Σ MM` — leave, and strand the account at `E = Σ PIM < Σ MM`. Each of
+/// the four money-out gates refuses `X + 1` and takes `X`, which leaves the account exactly AT
+/// maintenance (healthy), with nothing more to withdraw. `depositInsuranceFund` is the admin's, so
+/// the admin plays ALICE there.
+#[test]
+fn no_money_out_takes_a_healthy_cross_account_below_maintenance() {
+    use crate::interface::IPerpDex::depositInsuranceFundCall;
+    let gates: [(&str, Address, fn(u64) -> Vec<u8>); 4] = [
+        ("transferFromPerp: insufficient perp wallet balance", ALICE, |x| transfer_out(x)),
+        ("internalTransfer: insufficient perp wallet balance", ALICE, |x| {
+            internal(1, 0, x as i64)
+        }),
+        ("depositInsuranceFund: insufficient perp wallet balance", ADMIN, |x| {
+            depositInsuranceFundCall { amount: x }.abi_encode()
+        }),
+        (crate::risk::ADD_MARGIN_CAP_REJECT, ALICE, |x| add_margin(M1, x as i64)),
+    ];
+    for (refused, user, money_out) in gates {
+        let mut ctx = make_ctx();
+        let _cross = crate::margin_type::test_gate::enable();
+        two_tier_m2(&mut ctx);
+        for m in MARKETS {
+            set_type(&mut ctx, BOB, m, ISOLATED);
+        }
+        set_type(&mut ctx, user, M1, ISOLATED);
+        set_leverage(&mut ctx, user, M2, 20);
+        set_wallet(&mut ctx, user, 10_000 * USD);
+        trade(&mut ctx, M2, user, BOB, SELL, px(100), 10);
+        trade(&mut ctx, M1, user, BOB, BUY, px(100), 1);
+        set_mark(&mut ctx, M2, px(500));
+        let f = fold(&mut ctx, user);
+        assert_eq!((f.cross_mm, f.cross_pim), ((800 * USD) as i128, (250 * USD) as i128));
+        assert!(f.e > 7 * f.cross_mm, "healthy: {f:?}");
+        let binance = (f.cwb - f.iso_oo_im - f.cross_mm).min(f.a);
+        assert_eq!(f.x, f.e - f.cross_mm, "{refused}: the maintenance floor binds");
+        assert_eq!(binance - f.x, (550 * USD) as i128, "Binance's terms alone: Σ MM − Σ PIM more");
+        let x = f.x as u64;
+        let ledger = Ledger::open(&mut ctx);
+
+        rejects(&mut ctx, user, &money_out(x + 1), refused);
+        ok(&mut ctx, user, &money_out(x));
+        ledger.check(&mut ctx, refused);
+        let f = fold(&mut ctx, user);
+        assert_eq!(f.e, f.cross_mm, "{refused}: left exactly AT cross maintenance");
+        assert!(!f.below_cross_maintenance());
+        assert_eq!(f.x, 0);
+    }
+}
+
 // ── Gated off: byte identity ──────────────────────────────────────────────────────────────────
 
 /// Every P2c gate keys on the margin type IN FORCE (or on the account's liquidation flag, which no
