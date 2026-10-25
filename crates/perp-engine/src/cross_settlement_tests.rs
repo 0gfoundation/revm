@@ -10,7 +10,8 @@
 //! * J6: the cash a TAKER moves into an ISOLATED silo must be in the wallet — cross unrealized
 //!   profit admits orders, it never becomes isolated collateral; the maker's M1 cap is unchanged;
 //! * the negative-wallet audit: every money-out gate reads `X`, so a negative cross wallet (or
-//!   cross profit) never leaves; a randomised mixed sequence keeps the identity after every step.
+//!   cross profit) never leaves; a randomised mixed sequence keeps the identity after every step;
+//! * gated off, every one of those paths is byte-identical to an explicitly ISOLATED account.
 //!
 //! Every scenario re-checks the custody identity after every step ([`Ledger::check`]): the
 //! price-independent sum `Σ spot + Σ W + Σ margin + Σ vQuote + Σ pending funding + IF` over every
@@ -1178,4 +1179,100 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
     assert!(liqs >= 2, "liquidations {liqs}");
     assert!(cross_adl >= 2, "ADL fills on a cross winner {cross_adl}");
     assert!(withdrawals >= 40, "withdrawals {withdrawals}");
+}
+
+// ── Gated off: byte identity ─────────────────────────────────────────────────────
+
+/// Every P2b branch keys on the margin type IN FORCE, so with cross margin gated off (production)
+/// a position that still STORES the CROSSED default must behave exactly as one explicitly switched
+/// to ISOLATED with the gate on: the same call outcomes (revert flag, return bytes, gas), the same
+/// event stream byte for byte, and the same stored state (bar the stored type byte itself). The
+/// scenario walks every money path this slice touched — taker and maker fills with fees, a flip, a
+/// funding settle, the four money-out gates (accepted and refused), a margin top-up, an oracle tick
+/// that liquidates and ADLs, and a manual `liquidate()` refusal.
+#[test]
+fn gated_off_every_money_path_is_byte_identical_to_explicitly_isolated() {
+    fn scenario(ctx: &mut TestCtx) -> (Vec<(bool, Vec<u8>, u64)>, Vec<Log>) {
+        use crate::interface::IPerpDex::{
+            addPositionMarginCall, depositInsuranceFundCall, internalTransferCall,
+        };
+        let mut outs = Vec::new();
+        let mut run = |ctx: &mut TestCtx, who: Address, input: Vec<u8>| {
+            let out = call(ctx, who, &input);
+            outs.push((out.reverted, out.bytes.to_vec(), out.gas_used));
+        };
+        run(ctx, CAROL, setLeverageCall { marketId: M2, leverage: 3 }.abi_encode());
+        // Fills with fees on both sides, then a flip at a loss.
+        run(ctx, BOB, order(M1, SELL, px(100), 10, GTC));
+        run(ctx, ALICE, order(M1, BUY, px(100), 10, IOC));
+        set_mark(ctx, M1, px(90));
+        run(ctx, CAROL, order(M1, BUY, px(90), 15, GTC));
+        run(ctx, ALICE, order(M1, SELL, px(90), 15, IOC));
+        // A funding epoch, settled at ALICE's and CAROL's next touch.
+        set_funding_index(ctx, M1, 10_000 * 2_500);
+        run(ctx, ALICE, order(M1, BUY, px(90), 2, GTC));
+        run(ctx, CAROL, order(M1, SELL, px(90), 2, IOC));
+        // The money-out gates, accepted and refused, and a silo top-up.
+        run(ctx, ALICE, transfer_out(100 * USD as u64));
+        run(ctx, BOB, transfer_out(WALLET as u64));
+        run(
+            ctx,
+            ALICE,
+            internalTransferCall { to: ALICE, fromWallet: 1, toWallet: 0, amount: USD as u64 }
+                .abi_encode(),
+        );
+        run(ctx, ADMIN, depositInsuranceFundCall { amount: 1 }.abi_encode());
+        run(ctx, ALICE, addPositionMarginCall { marketId: M1, amount: 10 * USD as u64 }.abi_encode());
+        // CAROL's 3x long on M2 against BOB and ALICE, an empty book, a tick that takes it.
+        run(ctx, BOB, order(M2, SELL, px(100), 5, GTC));
+        run(ctx, ALICE, order(M2, SELL, px(100), 5, GTC));
+        run(ctx, CAROL, order(M2, BUY, px(100), 10, IOC));
+        run(
+            ctx,
+            ADMIN,
+            updateIndexPriceCall { marketId: M2, indexPrice: px(70), timestamp: 30 }.abi_encode(),
+        );
+        run(ctx, CAROL, liquidateCall { user: ALICE, marketId: M2 }.abi_encode());
+        (outs, JournalTr::take_logs(ctx.journal_mut()))
+    }
+
+    fn state(ctx: &mut TestCtx) -> Vec<String> {
+        let mut out = vec![format!("IF {}", insurance_fund(ctx))];
+        for u in USERS {
+            out.push(format!("{:?}", storage::load_account(ctx, u).unwrap()));
+            for m in MARKETS {
+                let mut p = pos(ctx, u, m);
+                p.margin_type = 0; // the one byte the two runs store differently, on purpose
+                out.push(format!("{:?}", p));
+            }
+        }
+        out
+    }
+
+    // Gated off — production: every slot still stores the CROSSED default.
+    let mut gated = make_ctx();
+    let (gated_outs, gated_logs) = scenario(&mut gated);
+    let gated_state = state(&mut gated);
+
+    // Gated on, every slot ISOLATED by choice.
+    let mut isolated = make_ctx();
+    let (isolated_outs, isolated_logs, isolated_state) = {
+        let _cross = crate::margin_type::test_gate::enable();
+        for u in USERS {
+            for m in MARKETS {
+                set_type(&mut isolated, u, m, ISOLATED);
+            }
+        }
+        let (outs, logs) = scenario(&mut isolated);
+        (outs, logs, state(&mut isolated))
+    };
+
+    assert_eq!(gated_outs, isolated_outs, "the same outcomes, return data and gas");
+    assert_eq!(gated_logs, isolated_logs, "the same events, byte for byte");
+    assert_eq!(gated_state, isolated_state, "the same stored state");
+    // The scenario really reached what it claims to.
+    assert!(gated_outs.iter().any(|o| o.0), "some refusals");
+    assert_eq!(liquidations(&gated_logs).len(), 1);
+    assert!(!adl_fills(&gated_logs).is_empty(), "an ADL fill");
+    assert!(funding_rows(&gated_logs, ALICE).len() == 1);
 }
