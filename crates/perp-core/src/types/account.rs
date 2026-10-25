@@ -286,11 +286,11 @@ pub struct UserAccount {
     /// Account-level liquidation flags — bit 0 is [`LIQ_FLAG_IN_LIQUIDATION`], Binance's
     /// "User in liquidation mode now" (`-2023`). Every other bit is reserved and zero.
     ///
-    /// DEFINED here (cross P2) and nothing more: no path sets it yet, so every account reads `0`.
-    /// Cross liquidation (P3) owns it — set when a cross liquidation episode starts, cleared when
-    /// the account is healthy again — and the read side (`setMarginType`'s `-2023`, reduce-only
-    /// admission while set, a resting order of a flagged maker cancelled instead of filled) keys
-    /// off [`Self::in_liquidation`].
+    /// No path sets it yet (cross P2), so every account reads `0`. Cross liquidation (P3) owns it —
+    /// set when a cross liquidation episode starts, cleared when the account is healthy again. The
+    /// read side is live since P2c and keys off [`Self::in_liquidation`]: `setMarginType`'s
+    /// `-2023`, every placement entrypoint's `-2023` for an order that is not reduce-only, and a
+    /// resting order of a flagged maker cancelled instead of filled.
     ///
     /// Like [`Self::total_position_margin`] it is NOT a field a whole-blob `storage::save_account`
     /// may write: that function carries the STORED value over whatever its caller's copy holds, so

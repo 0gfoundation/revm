@@ -311,6 +311,9 @@ pub enum PerpBatchReason {
     /// mode. Distinct from an unknown bit (which lands in [`Self::Other`]): the bit IS known, its
     /// value is not.
     InvalidStpMode = 34,
+    /// `placeOrder: -2023 User in liquidation mode now. …` (`trading::IN_LIQUIDATION_REJECT`) — the
+    /// owner's account is in liquidation and the item is not reduce-only (owner decision Q11).
+    UserInLiquidation = 35,
     /// A checked-arithmetic guard (`… overflow` / `… underflow` / `exceeds i64…`), matched
     /// structurally because the engine has ~30 of them and they are all
     /// unreachable-by-construction. Path-independent, hence the engine band.
@@ -395,6 +398,9 @@ fn place_reason(rest: &str) -> PerpBatchReason {
         "fee recipient not initialised" => PerpBatchReason::FeeRecipientNotSet,
         "max open orders reached" => PerpBatchReason::MaxOpenOrders,
         "invalid self-trade prevention mode" => PerpBatchReason::InvalidStpMode,
+        r if Some(r) == crate::trading::IN_LIQUIDATION_REJECT.strip_prefix("placeOrder: ") => {
+            PerpBatchReason::UserInLiquidation
+        }
         other if is_arith_guard(other) => PerpBatchReason::ArithmeticGuard,
         _ => PerpBatchReason::Other,
     }

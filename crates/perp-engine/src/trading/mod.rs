@@ -1191,6 +1191,15 @@ pub(crate) fn place_order_core<H: PerpHost>(
         tif_u8,
         flags,
     )?;
+    // ── -2023: an account IN LIQUIDATION places only reduce-only orders (owner decision Q11) ──
+    // A fired closePosition / conditional order arrives here reduce-only, so it passes too. See
+    // `refuse_unless_reducing_in_liquidation`.
+    refuse_unless_reducing_in_liquidation(
+        context,
+        account,
+        validated.reduce_only,
+        IN_LIQUIDATION_REJECT,
+    )?;
     // Per-user market-index cap. This is the ONLY way into a market the user is not already
     // active in — a position can only appear through a fill of an order they placed, and every
     // other position writer (maker fill, liquidation, ADL, funding) acts on a market where the
@@ -1387,6 +1396,38 @@ pub(crate) fn place_order_core<H: PerpHost>(
         storage::save_order_owned(context, &order_id, taker_order)?;
     }
     Ok(status)
+}
+
+/// `placeOrder`'s refusal for an account in liquidation (owner decision Q11) — Binance's `-2023`.
+pub(crate) const IN_LIQUIDATION_REJECT: &str =
+    "placeOrder: -2023 User in liquidation mode now. Only reduce-only and closePosition orders \
+     are accepted";
+
+/// Owner decision Q11 / Binance `-2023 User in liquidation mode now.`: while the account's
+/// liquidation flag is set ([`crate::types::UserAccount::in_liquidation`] — set and cleared by
+/// cross liquidation, P3) only a REDUCING order is accepted — reduce-only, or closePosition (which
+/// is reduce-only by construction). `reducing` is the caller's verdict on the order; `reject` its
+/// entrypoint's string.
+///
+/// The ONE rule every placement entrypoint applies: `placeOrder`, `placeOrderSigned` and both
+/// batch selectors through [`place_order_core`] (a fired conditional reaches that too, always
+/// reduce-only), and `placeAlgoOrder` / `placeAlgoOrderSigned` — conditional and trailing alike —
+/// through `algo::place_core`. A cancel is never refused: it only lightens what the liquidation
+/// has to unwind.
+///
+/// A reducing order costs nothing here. Any other loads the account (`_ref`, cache-fill: every
+/// placement path reads it again for the fee rates). Pre-write; on a signed entrypoint after the
+/// signature burn, with the other refusals that can lift later.
+pub(crate) fn refuse_unless_reducing_in_liquidation<H: PerpHost>(
+    context: &mut H,
+    account: Address,
+    reducing: bool,
+    reject: &'static str,
+) -> Result<(), PerpError> {
+    if !reducing && storage::load_account_ref(context, account)?.in_liquidation() {
+        return Err(perp_err(reject));
+    }
+    Ok(())
 }
 
 fn validate_place_order<H: PerpHost>(

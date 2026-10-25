@@ -9,7 +9,10 @@
 //!   account — but every resting order of an account IN LIQUIDATION is cancelled, not filled;
 //! * the pre-walk unaffordable-order filter credits a cross order's own open gain, so it never
 //!   refuses what the full path admits, and still refuses what it can bound; the resting gate
-//!   reads `A`, cross unrealized profit included, to the unit.
+//!   reads `A`, cross unrealized profit included, to the unit;
+//! * Q11 / `-2023`: while the account is IN LIQUIDATION only reduce-only / closePosition orders
+//!   are accepted, on every placement entrypoint, and `setMarginType` refuses (after `-4048`,
+//!   before the gate) on both of its paths.
 //!
 //! A child of `cross_settlement_tests`, so it runs on that fixture: two markets on an exact grid
 //! (base 0 decimals, price 2), `USD` = one dollar in quote units, the custody [`Ledger`] re-checked
@@ -497,4 +500,303 @@ fn the_resting_gate_reads_a_with_cross_profit_to_the_unit() {
     ledger.check(&mut ctx, "after the rest");
     assert_eq!(pos(&mut ctx, ALICE, M1).total_buy_qty, 3, "it rests");
     assert_eq!(fold(&mut ctx, ALICE).a, 0);
+}
+
+// ── Q11 / -2023: an account in liquidation ────────────────────────────────────────────────────
+
+use crate::interface::IPerpDex::{
+    batchPlaceOrdersCall, batchPlaceOrdersSignedCall, cancelOrderCall, placeAlgoOrderCall,
+    placeOrderSignedCall, setMarginTypeSignedCall, PlaceItem,
+};
+use ed25519_dalek::{Signer, SigningKey};
+
+const KEY_ID: u8 = 1;
+/// The default test block's timestamp, so a signed message is fresh.
+const SIGNED_TS: u64 = 1;
+const SIGNED_RECV: u64 = 60;
+const RO: u8 = 1;
+
+fn key() -> SigningKey {
+    SigningKey::from_bytes(&[0x2c; 32])
+}
+
+fn register_alice_key(ctx: &mut TestCtx) {
+    let pubkey = key().verifying_key().to_bytes();
+    storage::save_api_key(ctx, ALICE, KEY_ID, crate::types::ApiKey { pubkey, expiry: 0 }).unwrap();
+}
+
+fn chain_id(ctx: &TestCtx) -> u64 {
+    crate::host::PerpHost::chain_id(ctx)
+}
+
+fn item(market: u64, side: u8, price: u64, qty: u64, tif: u8, flags: u8) -> PlaceItem {
+    PlaceItem {
+        marketId: market,
+        side,
+        price,
+        quantity: qty,
+        orderType: 0,
+        tif,
+        clientOrderId: FixedBytes::default(),
+        flags,
+    }
+}
+
+fn ro_order(market: u64, side: u8, price: u64, qty: u64, tif: u8) -> Vec<u8> {
+    let i = item(market, side, price, qty, tif, RO);
+    placeOrderCall {
+        marketId: i.marketId,
+        side: i.side,
+        price: i.price,
+        quantity: i.quantity,
+        orderType: i.orderType,
+        tif: i.tif,
+        clientOrderId: i.clientOrderId,
+        flags: i.flags,
+    }
+    .abi_encode()
+}
+
+/// `placeOrderSigned` for ALICE (the 105-byte message).
+fn signed_order(ctx: &TestCtx, it: &PlaceItem, salt: u8) -> Vec<u8> {
+    let mut client = [0u8; 16];
+    client[15] = salt;
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"perpdex_v1_order");
+    msg.extend_from_slice(&chain_id(ctx).to_be_bytes());
+    msg.extend_from_slice(ALICE.as_slice());
+    msg.extend_from_slice(&it.marketId.to_be_bytes());
+    msg.push(it.side);
+    msg.extend_from_slice(&it.price.to_be_bytes());
+    msg.extend_from_slice(&it.quantity.to_be_bytes());
+    msg.extend_from_slice(&[it.orderType, it.tif]);
+    msg.extend_from_slice(&client);
+    msg.extend_from_slice(&SIGNED_TS.to_be_bytes());
+    msg.extend_from_slice(&SIGNED_RECV.to_be_bytes());
+    msg.extend_from_slice(&[KEY_ID, it.flags]);
+    assert_eq!(msg.len(), 105);
+    placeOrderSignedCall {
+        account: ALICE,
+        marketId: it.marketId,
+        side: it.side,
+        price: it.price,
+        quantity: it.quantity,
+        orderType: it.orderType,
+        tif: it.tif,
+        clientOrderId: client.into(),
+        timestamp: SIGNED_TS,
+        recvWindow: SIGNED_RECV,
+        keyId: KEY_ID,
+        flags: it.flags,
+        signature: key().sign(&msg).to_bytes().to_vec().into(),
+    }
+    .abi_encode()
+}
+
+/// `batchPlaceOrdersSigned` for ALICE.
+fn signed_batch(ctx: &TestCtx, items: Vec<PlaceItem>) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"perpdex_v1_batch_order");
+    msg.extend_from_slice(&chain_id(ctx).to_be_bytes());
+    msg.extend_from_slice(ALICE.as_slice());
+    msg.push(KEY_ID);
+    msg.extend_from_slice(&SIGNED_TS.to_be_bytes());
+    msg.extend_from_slice(&SIGNED_RECV.to_be_bytes());
+    msg.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for o in &items {
+        msg.extend_from_slice(&o.marketId.to_be_bytes());
+        msg.push(o.side);
+        msg.extend_from_slice(&o.price.to_be_bytes());
+        msg.extend_from_slice(&o.quantity.to_be_bytes());
+        msg.push(o.orderType);
+        msg.push(o.tif);
+        msg.extend_from_slice(&o.clientOrderId.0);
+        msg.push(o.flags);
+    }
+    batchPlaceOrdersSignedCall {
+        account: ALICE,
+        keyId: KEY_ID,
+        timestamp: SIGNED_TS,
+        recvWindow: SIGNED_RECV,
+        orders: items,
+        signature: key().sign(&msg).to_bytes().to_vec().into(),
+    }
+    .abi_encode()
+}
+
+/// `setMarginTypeSigned` for ALICE (the 75-byte message).
+fn signed_margin_type(ctx: &TestCtx, market: u64, margin_type: u8) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"perpdex_v1_margintype");
+    msg.extend_from_slice(&chain_id(ctx).to_be_bytes());
+    msg.extend_from_slice(ALICE.as_slice());
+    msg.extend_from_slice(&market.to_be_bytes());
+    msg.push(margin_type);
+    msg.extend_from_slice(&SIGNED_TS.to_be_bytes());
+    msg.extend_from_slice(&SIGNED_RECV.to_be_bytes());
+    msg.push(KEY_ID);
+    assert_eq!(msg.len(), 75);
+    setMarginTypeSignedCall {
+        account: ALICE,
+        marketId: market,
+        marginType: margin_type,
+        timestamp: SIGNED_TS,
+        recvWindow: SIGNED_RECV,
+        keyId: KEY_ID,
+        signature: key().sign(&msg).to_bytes().to_vec().into(),
+    }
+    .abi_encode()
+}
+
+/// `(tag, reason)` per record of a batch status blob.
+fn statuses(out: &PerpOutput) -> Vec<(u8, u8)> {
+    let blob = batchPlaceOrdersCall::abi_decode_returns(&out.bytes).unwrap();
+    blob.chunks(crate::batch::BATCH_STATUS_RECORD_LEN).map(|r| (r[0], r[33])).collect()
+}
+
+/// A STOP_MARKET (`1`) / TAKE_PROFIT_MARKET (`3`) / TRAILING_STOP_MARKET (`4`) conditional on M1.
+fn algo(side: u8, order_type: u8, trigger: u64, price: u64, qty: u64, flags: u8) -> Vec<u8> {
+    placeAlgoOrderCall {
+        algoType: 0,
+        marketId: M1,
+        side,
+        orderType: order_type,
+        triggerPrice: trigger,
+        price,
+        quantity: qty,
+        tif: 0,
+        workingType: 0,
+        clientAlgoId: FixedBytes::default(),
+        flags,
+    }
+    .abi_encode()
+}
+
+/// Q11 across every placement entrypoint. ALICE holds a cross long of 5 on M1 and her account is
+/// flagged IN LIQUIDATION: an order that is not reduce-only is refused `-2023` — `placeOrder`
+/// (write-clean), `placeOrderSigned` (the signature is burned, nothing else moves), both batch
+/// selectors (that item `Rejected`, reason 35, the batch goes on) — while a reduce-only order is
+/// accepted on each of them and closes, a reduce-only and a closePosition conditional and a
+/// trailing stop are accepted, and a cancel goes through. Cleared, a plain order is accepted again.
+#[test]
+fn in_liquidation_only_reducing_orders_are_accepted_on_every_entrypoint() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_type(&mut ctx, BOB, M1, ISOLATED);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 5);
+    ok(&mut ctx, BOB, &order(M1, BUY, px(100), 5, GTC)); // bids for her reducing sells
+    register_alice_key(&mut ctx);
+    storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
+    let reject = crate::trading::IN_LIQUIDATION_REJECT;
+    let alice = |ctx: &mut TestCtx| (pos(ctx, ALICE, M1).amount, wallet(ctx, ALICE));
+
+    // placeOrder: refused write-clean, a buy and a sell alike; reduce-only goes through.
+    rejects(&mut ctx, ALICE, &order(M1, BUY, px(90), 1, GTC), reject);
+    rejects(&mut ctx, ALICE, &order(M1, SELL, px(100), 1, IOC), reject);
+    ok(&mut ctx, ALICE, &ro_order(M1, SELL, px(100), 1, IOC));
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 4);
+
+    // placeOrderSigned: refused after the burn, with the same string; reduce-only goes through.
+    let before = alice(&mut ctx);
+    let input = signed_order(&ctx, &item(M1, BUY, px(90), 1, GTC, 0), 1);
+    let out = call(&mut ctx, ALICE, &input);
+    assert!(out.reverted);
+    assert_eq!(revert_reason(&out), reject);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    assert_eq!(alice(&mut ctx), before);
+    let input = signed_order(&ctx, &item(M1, SELL, px(100), 1, IOC, RO), 2);
+    ok(&mut ctx, ALICE, &input);
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 3);
+
+    // Both batch selectors: the plain item is Rejected (reason 35), the reduce-only one placed.
+    let plain = item(M1, BUY, px(90), 1, GTC, 0);
+    let reducing = item(M1, SELL, px(100), 1, IOC, RO);
+    let out = call(
+        &mut ctx,
+        ALICE,
+        &batchPlaceOrdersCall { orders: vec![plain.clone(), reducing.clone()] }.abi_encode(),
+    );
+    assert!(!out.reverted, "{}", revert_reason(&out));
+    let in_liq = crate::batch::PerpBatchReason::UserInLiquidation as u8;
+    assert_eq!(statuses(&out), vec![(0, in_liq), (2, 0)]);
+    let input = signed_batch(&ctx, vec![plain, reducing]);
+    let out = call(&mut ctx, ALICE, &input);
+    assert!(!out.reverted, "{}", revert_reason(&out));
+    assert_eq!(statuses(&out), vec![(0, in_liq), (2, 0)]);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 1);
+
+    // Conditionals are reducing by construction: a reduce-only stop, a closePosition take-profit
+    // and a trailing stop are all accepted.
+    ok(&mut ctx, ALICE, &algo(SELL, 1, px(80), 0, 1, RO));
+    ok(&mut ctx, ALICE, &algo(SELL, 3, px(120), 0, 0, 2));
+    ok(&mut ctx, ALICE, &algo(SELL, 4, 0, 100, 1, RO));
+
+    // A cancel is never refused.
+    let resting = place(&mut ctx, ALICE, &ro_order(M1, SELL, px(130), 1, GTC));
+    ok(&mut ctx, ALICE, &cancelOrderCall { orderId: resting.into(), marketId: M1 }.abi_encode());
+
+    // Cleared: a plain order is accepted again.
+    storage::set_in_liquidation_for_test(&mut ctx, ALICE, false).unwrap();
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(90), 1, GTC));
+
+    assert_eq!(
+        crate::batch::reason_code(&crate::errors::perp_err(reject)),
+        crate::batch::PerpBatchReason::UserInLiquidation
+    );
+}
+
+/// `setMarginType`'s `-2023`, at its place in Binance's order (§3.6): after `-4046` / `-4047` /
+/// `-4048`, before the gate — on both paths, the signed one after its burn. Gated OFF a CROSSED
+/// request reaches it too (the gate is the LAST refusal), and once the flag clears the same switch
+/// goes through.
+#[test]
+fn set_margin_type_refuses_in_liquidation_after_4048_and_before_the_gate() {
+    let mut ctx = make_ctx();
+    register_alice_key(&mut ctx);
+    let _cross = crate::margin_type::test_gate::enable();
+    set_type(&mut ctx, BOB, M1, ISOLATED);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 1); // a position on M1; M2 flat and order-free
+    storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
+    let set = |market, margin_type| setMarginTypeCall { marketId: market, marginType: margin_type };
+
+    // Earlier refusals win.
+    rejects(
+        &mut ctx,
+        ALICE,
+        &set(M2, CROSSED).abi_encode(),
+        "setMarginType: -4046 No need to change margin type.",
+    );
+    rejects(
+        &mut ctx,
+        ALICE,
+        &set(M1, ISOLATED).abi_encode(),
+        "setMarginType: -4048 Margin type cannot be changed if there exists position.",
+    );
+    // Then -2023, direct and signed.
+    let in_liq = "setMarginType: -2023 User in liquidation mode now.";
+    rejects(&mut ctx, ALICE, &set(M2, ISOLATED).abi_encode(), in_liq);
+    let input = signed_margin_type(&ctx, M2, ISOLATED);
+    let out = call(&mut ctx, ALICE, &input);
+    assert!(out.reverted);
+    assert_eq!(revert_reason(&out), in_liq);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    assert_eq!(pos(&mut ctx, ALICE, M2).margin_type, CROSSED, "nothing switched");
+
+    // Before the gate: with cross margin gated off, CROSSED (not in force, so not -4046) hits
+    // -2023 before "not enabled".
+    drop(_cross);
+    rejects(&mut ctx, ALICE, &set(M2, CROSSED).abi_encode(), in_liq);
+    storage::set_in_liquidation_for_test(&mut ctx, ALICE, false).unwrap();
+    rejects(
+        &mut ctx,
+        ALICE,
+        &set(M2, CROSSED).abi_encode(),
+        "setMarginType: CROSSED margin is not enabled yet",
+    );
+
+    // Cleared, with the gate on: the switch goes through.
+    let _cross = crate::margin_type::test_gate::enable();
+    ok(&mut ctx, ALICE, &set(M2, ISOLATED).abi_encode());
+    assert_eq!(pos(&mut ctx, ALICE, M2).margin_type, ISOLATED);
 }

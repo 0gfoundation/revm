@@ -303,6 +303,12 @@ fn validate(
 /// Shared tail: write the record, index it, emit. `algo_id` is already derived and, on the signed
 /// path, its signature already burned.
 #[allow(clippy::too_many_arguments)]
+/// `placeAlgoOrder`'s refusal for an account in liquidation (owner decision Q11) — Binance's
+/// `-2023`. Unreachable while `validate` admits only reducing conditionals; see `place_core`.
+const ALGO_IN_LIQUIDATION_REJECT: &str =
+    "placeAlgoOrder: -2023 User in liquidation mode now. Only reduceOnly and closePosition \
+     conditionals are accepted";
+
 fn place_core<H: PerpHost>(
     context: &mut H,
     account: Address,
@@ -313,6 +319,20 @@ fn place_core<H: PerpHost>(
     client_algo_id: FixedBytes<16>,
     flags: u8,
 ) -> Result<Bytes, PerpError> {
+    // ── -2023: an account in liquidation places only reducing orders (owner decision Q11) ────────
+    //
+    // The shared rule (`trading::refuse_unless_reducing_in_liquidation`). Every conditional this
+    // build accepts IS reducing — `validate` admits only reduceOnly or closePosition, and a
+    // trailing stop must be reduceOnly — so it passes all of them today, at no cost; it is here so
+    // that relaxing `validate` cannot open a back door past the freeze. Transient, so after the
+    // signed path's burn, like the `-2021` check below.
+    crate::trading::refuse_unless_reducing_in_liquidation(
+        context,
+        account,
+        v.reduce_only || v.close_position,
+        ALGO_IN_LIQUIDATION_REJECT,
+    )?;
+
     // ── Would it fire on the stored mark right now? Then refuse it (Binance `-2021`) ─────────────
     //
     // Evaluated with THE SWEEP'S OWN PREDICATE (`trigger_fires`) on the mark the next sweep would

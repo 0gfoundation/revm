@@ -15,7 +15,7 @@
 //! ours     MM = Σ_bands ⌊width_i · rate_i⌋     each band floored once ("slice form", D10)
 //!          rate_i = column_i / 1e6, or 1 / (2 · maxLev_i) when the column is 0 (Q7)
 //! valid    rate_i < 1 / maxLev_i (strict: IM > MM), rates non-decreasing (exact comparison)
-//! switch   invalid type → unknown market → −4046 → −4047 → −4048 → (−2023, P2) → gate   (§3.6)
+//! switch   invalid type → unknown market → −4046 → −4047 → −4048 → −2023 → gate   (§3.6)
 //! ```
 //!
 //! Every call goes through the full shell (`run_perp_dex_call`), so the gas table, the dispatch, the

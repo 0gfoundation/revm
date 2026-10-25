@@ -122,7 +122,7 @@ pub fn run_set_margin_type<H: PerpHost>(
 /// * BEFORE: decode, refusal 0 (an invalid type code), key / recvWindow / expiry / signature, the
 ///   duplicate check, refusal 1 (unknown market — markets are never deleted).
 /// * AFTER, inside the shared core, in exactly the direct path's order and with its strings:
-///   `-4046`, `-4047`, `-4048`, the `-2023` hook, the gate. The gate is constant for a given build,
+///   `-4046`, `-4047`, `-4048`, `-2023`, the gate. The gate is constant for a given build,
 ///   but it lifts at the P3 flip and it is the LAST check of the shared core, so keeping it there
 ///   keeps the two paths' refusal precedence identical; a signature burned on it is one the owner
 ///   signed for a mode the build does not offer.
@@ -224,12 +224,13 @@ fn set_margin_type_core<H: PerpHost>(
         ));
     }
 
-    // 5. ── HOOK (cross P2c): `-2023 User in liquidation mode now.` ─────────────────────────────
-    //    Refuse while the account's liquidation flag is set (`UserAccount::in_liquidation`, bit
-    //    `LIQ_FLAG_IN_LIQUIDATION` of `liq_flags`). The field exists since P2a, but nothing sets it
-    //    before cross liquidation (P3), so no account can be in that state yet. The check goes HERE
-    //    (after -4048, before the gate), as one account `_ref` load:
-    //        "setMarginType: -2023 User in liquidation mode now."
+    // 5. The account is in liquidation (`UserAccount::in_liquidation`, the
+    //    `LIQ_FLAG_IN_LIQUIDATION` bit of `liq_flags`): Binance's `-2023`. One account `_ref`
+    //    load. Set and cleared by cross liquidation (P3) — nothing sets it before then, so no
+    //    account can be refused here yet.
+    if storage::load_account_ref(context, account)?.in_liquidation() {
+        return Err(perp_err("setMarginType: -2023 User in liquidation mode now."));
+    }
 
     // 6. The gate: CROSSED cannot be chosen until cross margin exists.
     if requested == MarginType::Crossed && !cross_margin_enabled() {

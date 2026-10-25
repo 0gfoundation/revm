@@ -1181,9 +1181,9 @@ sol! {
         ///      still lists in `getOpenAlgoOrders` and still counts — cancel it first;
         ///   4. a non-zero position in the market — `-4048 Margin type cannot be changed if there
         ///      exists position.`;
-        ///   5. the account is being liquidated — `-2023 User in liquidation mode now.` Arrives
-        ///      with the account's liquidation flag (cross P2); until that field exists no account
-        ///      can be in that state;
+        ///   5. the account is being liquidated — `-2023 User in liquidation mode now.` (its
+        ///      liquidation flag, set and cleared by cross liquidation — P3; until then no account
+        ///      can be in that state);
         ///   6. CROSSED requested while cross margin is not enabled — `setMarginType: CROSSED
         ///      margin is not enabled yet`.
         /// "In force" in 2 is the EFFECTIVE type `getSymbolConfig` reports. While cross margin is
@@ -1304,6 +1304,11 @@ sol! {
         /// EXPIRE_TAKER / EXPIRE_BOTH order the caller could not afford to rest in full is refused
         /// even though its remainder would only expire. Otherwise only the fills before the stop
         /// are margin-checked, and the remainder expires.
+        /// While the caller's account is in liquidation (its liquidation flag, set and cleared by
+        /// cross liquidation) only a reduce-only order is accepted; any other is refused
+        /// `placeOrder: -2023 User in liquidation mode now. …` (batch reason 35), on every
+        /// placement entrypoint. And none of the account's RESTING orders fills meanwhile: the
+        /// walk cancels each it meets (`OrderCancelled` reason 3) and goes on.
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
