@@ -695,3 +695,28 @@ fn the_margin_type_only_route_refuses_a_leverage_change() {
     p.leverage = 2;
     let _ = storage::save_position_margin_type_only(&mut ctx, ALICE, MARKET_ID, p);
 }
+
+/// The general route (`save_position` — fills, funding, liquidation, ADL) must not move the type
+/// either, in either direction: a rebuilt-from-default copy resetting ISOLATED to CROSSED is the
+/// silent failure this guards against.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "moved margin_type — only setMarginType")]
+fn the_general_route_refuses_a_margin_type_change() {
+    let mut ctx = make_ctx();
+    store_type(&mut ctx, ALICE, ISOLATED);
+    let mut p = stored(&mut ctx, ALICE);
+    p.margin_type = CROSSED;
+    let _ = storage::save_position(&mut ctx, ALICE, MARKET_ID, &p, AccountUpdateReason::Adjustment);
+}
+
+/// …nor may the aggregates-only route (a placement or a cancel).
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "save_position_reservation_only moved margin_type")]
+fn the_reservation_only_route_refuses_a_margin_type_change() {
+    let mut ctx = make_ctx();
+    let mut p = stored(&mut ctx, ALICE);
+    p.margin_type = ISOLATED;
+    let _ = storage::save_position_reservation_only(&mut ctx, ALICE, MARKET_ID, p);
+}

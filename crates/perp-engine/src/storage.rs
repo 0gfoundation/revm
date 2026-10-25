@@ -795,6 +795,11 @@ pub fn save_position_reservation_only<H: PerpHost>(
              save_position, and writing an older value back would revive every position-bound \
              conditional order the ended position left behind"
         );
+        debug_assert_eq!(
+            old.margin_type, pos.margin_type,
+            "save_position_reservation_only moved margin_type — only setMarginType \
+             (save_position_margin_type_only) may write it"
+        );
     }
     typed_store_mut(context).set_position(user, market_id, pos);
     Ok(())
@@ -1029,10 +1034,20 @@ pub fn save_position<H: PerpHost>(
     // The SAME already-paid read supplies `old.margin` for the `Σ pos.margin` aggregate below —
     // which is the whole reason that aggregate is affordable here and the deleted `total_perp_collateral`
     // was not (see `types::UserAccount::total_position_margin`).
-    let (old_amount, old_margin, old_generation) = {
+    let (old_amount, old_margin, old_generation, old_margin_type) = {
         let old = load_position_ref(context, user, market_id)?;
-        (old.amount, old.margin, old.generation)
+        (old.amount, old.margin, old.generation, old.margin_type)
     };
+    // `margin_type` is a SETTING with exactly one writer, `setMarginType`, which goes through
+    // [`save_position_margin_type_only`]. Every other position write comes through here: fills,
+    // funding, liquidation and ADL. None of them may move it. A path that rebuilt a position from a
+    // default, or reset the byte, would silently put an ISOLATED user back on CROSSED (0) with no
+    // event. Checked from the read the registry hook already pays for.
+    debug_assert_eq!(
+        old_margin_type, pos.margin_type,
+        "save_position: {user} market {market_id} moved margin_type — only setMarginType \
+         (save_position_margin_type_only) may write it"
+    );
     // "A flat position holds no margin", enforced at the ONE door every `pos.margin` write comes
     // through rather than per market at snapshot time.
     //
