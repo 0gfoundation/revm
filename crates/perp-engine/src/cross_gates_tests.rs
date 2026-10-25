@@ -1310,8 +1310,10 @@ fn every_money_out_gate_stops_at_x_to_the_unit_with_cross_profit() {
 #[test]
 fn no_money_out_takes_a_healthy_cross_account_below_maintenance() {
     use crate::interface::IPerpDex::depositInsuranceFundCall;
-    let gates: [(&str, Address, fn(u64) -> Vec<u8>); 4] = [
-        ("transferFromPerp: insufficient perp wallet balance", ALICE, |x| transfer_out(x)),
+    /// A money-out call of `amount`, encoded.
+    type MoneyOut = fn(u64) -> Vec<u8>;
+    let gates: [(&str, Address, MoneyOut); 4] = [
+        ("transferFromPerp: insufficient perp wallet balance", ALICE, transfer_out),
         ("internalTransfer: insufficient perp wallet balance", ALICE, |x| {
             internal(1, 0, x as i64)
         }),
