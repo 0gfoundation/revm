@@ -522,7 +522,7 @@ pub fn margin_info_of(
     // `(amount, v_quote_balance, margin)` triple off the same `pos` every field above was built
     // from — which is also why the price cannot describe a different position than its own row.
     // The cost is arithmetic only: ~64 iterations for the domain bound plus ~64 for the search,
-    // each a handful of `i128` multiplications and a walk of the ≤ MAX_MARGIN_TIERS = 8 table
+    // each a handful of `i128` multiplications and a walk of the ≤ MAX_MARGIN_TIERS = 16 table
     // already resident in `market`.
     let liquidation_price = crate::math::calc_liquidation_price(
         &market.tiers,

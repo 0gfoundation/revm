@@ -232,7 +232,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // and it performs ZERO storage loads — `margin_view::margin_info_of` runs it on the tier
         // table and the `(amount, vQuote, margin)` triple it is already holding, so the ≤ 33 `_ref`
         // loads that dominate this selector are untouched. What it costs is ~128 iterations of a
-        // handful of `i128` multiplications plus a ≤ MAX_MARGIN_TIERS = 8 band walk — ~64 for the
+        // handful of `i128` multiplications plus a ≤ MAX_MARGIN_TIERS = 16 band walk — ~64 for the
         // domain bound and ~64 for the bisection — bounded by MAX_USER_MARKETS = 16 rows, i.e.
         // ~2_048 such iterations worst case against ~33 storage loads. A single load is orders of
         // magnitude more expensive than all of them together, which is the same reasoning that
@@ -294,7 +294,9 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         m.insert(updateMarketCall::SELECTOR, (50_000, false));
         m.insert(getMarkPriceCall::SELECTOR, (5_000, true));
         m.insert(getMarketCall::SELECTOR, (5_000, true));
-        // Risk table: setter mirrors addMarket's admin-write cost; getter is a plain view.
+        // Risk table: setter mirrors addMarket's admin-write cost; getter is a plain view (its
+        // derived effective-rate / `cum` / cap columns are arithmetic over the table already
+        // inside the one `Market` blob it reads — no extra load).
         m.insert(setMarginTiersCall::SELECTOR, (100_000, false));
         // Mirrors setMarginTiers: an admin load-modify-save of one Market blob.
         m.insert(setBasisModeCall::SELECTOR, (100_000, false));
@@ -323,7 +325,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // `getSymbolConfig`: priced with `getPosition` (5_000), not with the derived margin views.
         // It is the same load set as `getPosition` — one position `_ref` and one market `_ref`, both
         // scalar blobs — and then pure in-register arithmetic: a walk of a table bounded by
-        // MAX_MARGIN_TIERS = 8 that is already resident inside the `Market` it just read. No
+        // MAX_MARGIN_TIERS = 16 that is already resident inside the `Market` it just read. No
         // per-user list, no order lists, no per-market walk, so none of the work the 20_000 tier
         // prices is present. FLAT, per selector.
         m.insert(getSymbolConfigCall::SELECTOR, (5_000, true));
@@ -380,7 +382,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // deliberately: the load set is identical (one market `_ref`, one position `_ref`, and in
         // debug the same two order lists), and the extra `liquidationPrice` adds ZERO loads — it
         // bisects `is_above_maintenance_margin` over ~64 iterations of a handful of `i128`
-        // multiplications plus a walk of the MAX_MARGIN_TIERS = 8 table already resident in the
+        // multiplications plus a walk of the MAX_MARGIN_TIERS = 16 table already resident in the
         // `Market` this call read, and ~64 more for its domain bound. That is orders of magnitude
         // below one storage load. Pricing the superset above the call it supersedes would have
         // taxed the only remaining single-market accessor. FLAT, per selector.

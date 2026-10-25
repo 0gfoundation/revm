@@ -229,7 +229,16 @@ impl Default for PerpPosition {
 /// The table is stored INLINE in [`Market`] (see [`MarginTiers`]), so this bounds the
 /// blob size and the per-`placeOrder` `Market` memcpy. Raising it later cannot change
 /// existing blobs: the codec emits exactly `len` elements, never the padding.
-pub const MAX_MARGIN_TIERS: usize = 8;
+///
+/// 16, raised from 8 so a Binance USDⓈ-M bracket table loads row for row: BTCUSDT's
+/// `leverageBracket` has 10 brackets. A [`MarginTier`] is 16 bytes (the `u32` rate column
+/// sits in what was the `u64`/`u32` pair's padding), so the inline array is 256 bytes.
+pub const MAX_MARGIN_TIERS: usize = 16;
+
+/// Denominator of [`MarginTier::maint_margin_rate_ppm`]: parts per million, so
+/// `1_000_000` is a 100% maintenance-margin rate and Binance's `maintMarginRatio = 0.004`
+/// is `4_000`.
+pub const MMR_PPM_ONE: u32 = 1_000_000;
 
 /// Absolute ceiling accepted by `setMarginTiers` for any tier's `max_leverage`.
 /// Not a per-market cap — tier 0's `max_leverage` is the per-market `setLeverage` cap.
@@ -239,12 +248,14 @@ pub const MAX_LEVERAGE_HARD_CAP: u32 = 100;
 /// Its maintenance rate `1 / (2 * 3) = 1/6` is the historical hardcoded rate.
 pub const DEFAULT_MAX_LEVERAGE: u32 = 3;
 
-/// One row of a market's margin-tier table.
+/// One row of a market's margin-tier table — one Binance `leverageBracket` row.
 ///
 /// A tier covers notional `[lower_bound_notional, next tier's lower_bound_notional)`
 /// and carries the maximum leverage allowed while the position's notional sits in that
-/// band. The maintenance-margin RATE of a tier is derived from it:
-/// `mmr(n) = 1 / (2 * max_leverage(n))` — see [`crate::math::maintenance_margin`].
+/// band, and the band's maintenance-margin RATE: its own `maint_margin_rate_ppm` column
+/// when set, else derived as `mmr(n) = 1 / (2 * max_leverage(n))` — see
+/// [`crate::math::maintenance_margin`]. Binance's `cum` is not stored; it is a function
+/// of the bounds and rates ([`crate::math::leverage_brackets`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarginTier {
     /// Inclusive lower bound of this tier's notional band, in quote units.
@@ -253,6 +264,16 @@ pub struct MarginTier {
     /// Maximum leverage permitted while notional lies in this tier.
     /// Non-increasing across the table (bigger positions get less leverage).
     pub max_leverage: u32,
+    /// Binance's `maintMarginRatio` for this band, in parts per million ([`MMR_PPM_ONE`]).
+    /// **`0` means DERIVED**: the rate is `1 / (2 * max_leverage)`, the rule every table used
+    /// before this column existed, so an all-zero column computes exactly what it always did.
+    ///
+    /// `setMarginTiers` admits a table only if every tier's effective rate is strictly below
+    /// its initial-margin rate `1 / max_leverage` (IM > MM in every tier) and the effective
+    /// rates are non-decreasing across the table. Appended last (positional msgpack) with a
+    /// serde default, so a two-element row decodes as derived.
+    #[serde(default)]
+    pub maint_margin_rate_ppm: u32,
 }
 
 /// A market's margin-tier table: a FIXED inline array plus a live length.
@@ -302,6 +323,7 @@ impl MarginTiers {
         let mut tiers = [MarginTier {
             lower_bound_notional: 0,
             max_leverage: 0,
+            maint_margin_rate_ppm: 0,
         }; MAX_MARGIN_TIERS];
         tiers[..src.len()].copy_from_slice(src);
         Some(Self {
@@ -318,6 +340,7 @@ impl Default for MarginTiers {
         Self::from_tiers(&[MarginTier {
             lower_bound_notional: 0,
             max_leverage: DEFAULT_MAX_LEVERAGE,
+            maint_margin_rate_ppm: 0,
         }])
         .expect("one tier is within MAX_MARGIN_TIERS")
     }
@@ -331,7 +354,7 @@ impl PartialEq for MarginTiers {
 }
 
 /// Hand-rolled so the blob carries exactly `len` elements as a plain msgpack sequence
-/// (`[[lb, lev], ...]`) — never the fixed-array padding. That is what decouples the
+/// (`[[lb, lev, mmr_ppm], ...]`) — never the fixed-array padding. That is what decouples the
 /// on-chain encoding from [`MAX_MARGIN_TIERS`].
 impl Serialize for MarginTiers {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -359,6 +382,7 @@ impl<'de> Deserialize<'de> for MarginTiers {
                 let mut tiers = [MarginTier {
                     lower_bound_notional: 0,
                     max_leverage: 0,
+                    maint_margin_rate_ppm: 0,
                 }; MAX_MARGIN_TIERS];
                 let mut len = 0usize;
                 while let Some(tier) = seq.next_element::<MarginTier>()? {
@@ -548,6 +572,7 @@ mod tests {
         MarginTier {
             lower_bound_notional,
             max_leverage,
+            maint_margin_rate_ppm: 0,
         }
     }
 

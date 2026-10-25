@@ -316,7 +316,24 @@ use primitives::{B256, U256};
 //     writes nothing) — VERIFIED: with the field `#[serde(skip)]` it reproduced the previous 38 pin
 //     0xa72ce19d…d940. BusinessSnapshot UNCHANGED. CHAIN change: golden re-pin + a coordinated
 //     wipe on deploy.
-pub const BLOCK_COMMITMENT_VERSION: u8 = 38;
+// ── 39 ───────────────────────────────────────────────────────────────────────────────────
+// CROSS margin mode (Binance USDⓈ-M parity), phases P0–P4. ONE bump covers the series; each
+// commit that moves the golden re-pins it and adds its line here.
+//   * P0 — explicit maintenance-margin-rate column. A LAYOUT change: `MarginTier` gains a
+//     trailing `maint_margin_rate_ppm` (u32, positional msgpack, appended, serde default; `0` =
+//     DERIVED `1/(2·maxLeverage)`, the only rule before), so every tier row in every `Market` blob
+//     grows by one byte (a fixint 0). Execution rules, all reachable only by sending a non-zero
+//     column through `setMarginTiers` (whose ABI gains the column, so its selector moves): a set
+//     rate replaces the derived one inside the unchanged slice form, `⌊slice · ppm / 1e6⌋` per
+//     band; the table is refused unless every effective rate is strictly below `1/maxLeverage` and
+//     the effective rates are non-decreasing (a pure tightening of what a zero column could
+//     express — a node on 38 has no column to refuse). `MAX_MARGIN_TIERS` 8 → 16 (the codec emits
+//     only live rows, so no blob changes for it). With a zero column `maintenance_margin` is the
+//     same expression byte for byte. The golden scenario installs no table, so its write set
+//     differs only by the market blobs' extra byte — VERIFIED: with the field `#[serde(skip)]` it
+//     reproduced the previous 38 pin 0x37a18141…79de. BusinessSnapshot UNCHANGED. CHAIN change:
+//     golden re-pin + a coordinated wipe on deploy.
+pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
 ///

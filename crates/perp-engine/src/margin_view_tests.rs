@@ -274,6 +274,7 @@ fn set_tiers(ctx: &mut TestCtx, market_id: u64, rows: &[(u64, u32)]) {
             |&(lower_bound_notional, max_leverage)| crate::types::MarginTier {
                 lower_bound_notional,
                 max_leverage,
+                maint_margin_rate_ppm: 0,
             },
         )
         .collect();

@@ -24,8 +24,8 @@ use crate::{
     },
     math::{
         calc_funding_rate, calc_value, calc_value_i64, checked_u64_to_i64,
-        is_above_maintenance_margin, max_leverage_for_notional, max_notional_for_leverage,
-        FUNDING_RATE_ONE,
+        is_above_maintenance_margin, leverage_brackets, max_leverage_for_notional,
+        max_notional_for_leverage, tier_mmr_below_initial, tier_mmr_not_above, FUNDING_RATE_ONE,
     },
     storage,
     trading::{
@@ -331,7 +331,8 @@ pub fn run_update_market<H: PerpHost>(
     Ok(Bytes::new())
 }
 
-/// `setMarginTiers(uint64 marketId, uint64[] lowerBounds, uint32[] maxLeverages)`
+/// `setMarginTiers(uint64 marketId, uint64[] lowerBounds, uint32[] maxLeverages,
+/// uint32[] maintMarginRatesPpm)`
 ///
 /// Replaces a market's margin-tier table wholesale. ALL validation runs before the single
 /// `save_market` (validate-then-apply: perp writes are commit-only, so no genuine reject
@@ -385,16 +386,39 @@ pub fn run_set_margin_tiers<H: PerpHost>(
             "setMarginTiers: maxLeverages must be non-increasing",
         ));
     }
+    if args.maintMarginRatesPpm.len() != args.lowerBounds.len() {
+        return Err(perp_err(
+            "setMarginTiers: maintMarginRatesPpm and lowerBounds length mismatch",
+        ));
+    }
 
     let rows: Vec<MarginTier> = args
         .lowerBounds
         .iter()
         .zip(args.maxLeverages.iter())
-        .map(|(&lower_bound_notional, &max_leverage)| MarginTier {
-            lower_bound_notional,
-            max_leverage,
-        })
+        .zip(args.maintMarginRatesPpm.iter())
+        .map(
+            |((&lower_bound_notional, &max_leverage), &maint_margin_rate_ppm)| MarginTier {
+                lower_bound_notional,
+                max_leverage,
+                maint_margin_rate_ppm,
+            },
+        )
         .collect();
+    // Rates are checked on the EFFECTIVE value (an explicit ppm, or the derived `1/(2L)` when
+    // the column is 0), exactly: `math::tier_mmr_*` cross-multiply fractions, never round.
+    // IM > MM per tier (a derived rate always satisfies it) and non-decreasing across tiers
+    // together give `MM(N) <= N · mmr(n) < N / L_n` inside every band.
+    if !rows.iter().all(tier_mmr_below_initial) {
+        return Err(perp_err(
+            "setMarginTiers: maintMarginRatePpm must be below 1000000 / maxLeverage (IM > MM)",
+        ));
+    }
+    if rows.windows(2).any(|w| !tier_mmr_not_above(&w[0], &w[1])) {
+        return Err(perp_err(
+            "setMarginTiers: maintenance margin rates must be non-decreasing",
+        ));
+    }
     // Unreachable: the length bounds above are exactly `from_tiers`' precondition.
     let tiers = MarginTiers::from_tiers(&rows)
         .ok_or_else(|| perp_err("setMarginTiers: invalid tier count"))?;
@@ -409,6 +433,7 @@ pub fn run_set_margin_tiers<H: PerpHost>(
             marketId: args.marketId,
             lowerBounds: args.lowerBounds,
             maxLeverages: args.maxLeverages,
+            maintMarginRatesPpm: args.maintMarginRatesPpm,
         }
         .to_log_data(),
     });
@@ -416,7 +441,13 @@ pub fn run_set_margin_tiers<H: PerpHost>(
     Ok(Bytes::new())
 }
 
-/// `getMarginTiers(uint64 marketId) returns (uint64[] lowerBounds, uint32[] maxLeverages)`
+/// `getMarginTiers(uint64 marketId) returns (uint64[] lowerBounds, uint32[] maxLeverages,
+/// uint32[] maintMarginRatesPpm, uint32[] effectiveMaintMarginRatesPpm, uint64[] cums,
+/// uint64[] notionalCaps)`
+///
+/// The stored table, then Binance's derived `leverageBracket` columns from
+/// `math::leverage_brackets` — the one implementation of `cum`, next to the slice form it
+/// describes. Zero extra loads: the table lives inside the `Market` blob.
 pub fn run_get_margin_tiers<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
@@ -428,10 +459,18 @@ pub fn run_get_margin_tiers<H: PerpHost>(
         .ok_or_else(|| perp_err("getMarginTiers: unknown market"))?;
 
     let table = market.tiers.as_slice();
+    let brackets = leverage_brackets(&market.tiers);
     Ok(Bytes::from(getMarginTiersCall::abi_encode_returns(
         &getMarginTiersReturn {
             lowerBounds: table.iter().map(|t| t.lower_bound_notional).collect(),
             maxLeverages: table.iter().map(|t| t.max_leverage).collect(),
+            maintMarginRatesPpm: table.iter().map(|t| t.maint_margin_rate_ppm).collect(),
+            effectiveMaintMarginRatesPpm: brackets
+                .iter()
+                .map(|b| b.maint_margin_rate_ppm)
+                .collect(),
+            cums: brackets.iter().map(|b| b.cum).collect(),
+            notionalCaps: brackets.iter().map(|b| b.notional_cap).collect(),
         },
     )))
 }
@@ -587,8 +626,9 @@ fn set_leverage_core<H: PerpHost>(
     let mut pos = storage::load_position(context, account, market_id)?;
 
     // The cap comes from the market's own risk table — the single source of truth, so the
-    // cap and the maintenance rate can never disagree (mmr(n) = 1/(2*max_leverage(n)); the
-    // legacy 1/6 rate IS L₀ = 3).
+    // cap and the maintenance rate can never disagree (mmr(n) is the tier's own column, else
+    // 1/(2*max_leverage(n)); `setMarginTiers` keeps it below 1/max_leverage(n); the legacy 1/6
+    // rate IS L₀ = 3 with the column unset).
     //
     // Look the tier up by the position's CURRENT notional rather than hardcoding tier 0.
     // Tier 0 is merely the value this collapses to in two cases that both happen to hold

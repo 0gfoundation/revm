@@ -886,21 +886,44 @@ sol! {
         /// Query the current average premium index for the active funding epoch.
         function getAveragePremiumIndex(uint64 marketId) external view returns (int64 avgPremiumIndex, uint64 sampleCount);
 
-        /// Replace a market's margin-tier table (admin or market manager).
+        /// Replace a market's margin-tier table (admin or market manager). One tier is one
+        /// Binance `GET /fapi/v1/leverageBracket` row.
         ///
-        /// Two index-aligned parallel arrays (same shape as the batch calls): tier `i` is
-        /// `{lowerBounds[i], maxLeverages[i]}`. Deliberately NOT part of `updateMarket`, so
+        /// Three index-aligned parallel arrays (same shape as the batch calls): tier `i` is
+        /// `{lowerBounds[i], maxLeverages[i], maintMarginRatesPpm[i]}` — Binance's
+        /// `notionalFloor` (quote units), `initialLeverage` and `maintMarginRatio` (in parts per
+        /// million: Binance `0.004` is `4000`). Deliberately NOT part of `updateMarket`, so
         /// retuning tick/step/funding can never reset the risk table.
         ///
-        /// Rejected (whole call, zero writes) unless ALL hold: the market exists; the two
-        /// arrays are the same length; `1 <= length <= MAX_MARGIN_TIERS (8)`;
-        /// `lowerBounds[0] == 0`; `lowerBounds` strictly increasing; every `maxLeverages[i]`
-        /// in `1..=MAX_LEVERAGE_HARD_CAP (100)`; `maxLeverages` non-increasing.
+        /// `maintMarginRatesPpm[i] == 0` means DERIVED: the tier's rate is `1 / (2 ·
+        /// maxLeverages[i])`, the rule every table followed before the column existed, so a
+        /// table sent with an all-zero column behaves exactly as it always did. A non-zero entry
+        /// is used verbatim. Binance's `cum` is not an input — it follows from the bounds and the
+        /// rates and `getMarginTiers` returns it.
+        ///
+        /// Rejected (whole call, zero writes) unless ALL hold: the market exists;
+        /// `lowerBounds` and `maxLeverages` are the same length; `1 <= length <=
+        /// MAX_MARGIN_TIERS (16)`; `lowerBounds[0] == 0`; `lowerBounds` strictly increasing;
+        /// every `maxLeverages[i]` in `1..=MAX_LEVERAGE_HARD_CAP (100)`; `maxLeverages`
+        /// non-increasing; `maintMarginRatesPpm` the same length as `lowerBounds`; every
+        /// tier's EFFECTIVE rate strictly below its initial-margin rate, i.e. an explicit
+        /// `maintMarginRatesPpm[i] < 1e6 / maxLeverages[i]` (IM > MM in every tier — a derived
+        /// rate always is); the effective rates non-decreasing across the table (compared
+        /// exactly, so a derived `1/(2L)` meets an explicit ppm without rounding).
+        ///
+        /// Maintenance margin is the SLICE form of Binance's `notional · mmr − cum`: each band's
+        /// share is floored once, so the requirement is continuous at every bound
+        /// (`perp_core::math::maintenance_margin`).
         ///
         /// Tier 0's `maxLeverage` becomes the market's `setLeverage` cap. Existing positions
         /// are NOT re-checked: an over-levered position keeps running and is only refused
         /// when it next tries to OPEN.
-        function setMarginTiers(uint64 marketId, uint64[] lowerBounds, uint32[] maxLeverages) external;
+        function setMarginTiers(
+            uint64 marketId,
+            uint64[] lowerBounds,
+            uint32[] maxLeverages,
+            uint32[] maintMarginRatesPpm
+        ) external;
 
         /// Select which basis mechanism feeds Price 2 of this market's mark.
         ///
@@ -920,9 +943,37 @@ sol! {
         ///
         /// Callable by admin or the market manager.
         function setBasisMode(uint64 marketId, uint8 mode) external;
-        /// Read a market's margin-tier table as the same two index-aligned arrays
-        /// `setMarginTiers` takes. Reverts if the market does not exist.
-        function getMarginTiers(uint64 marketId) external view returns (uint64[] lowerBounds, uint32[] maxLeverages);
+        /// Read a market's margin-tier table: the three index-aligned arrays `setMarginTiers`
+        /// takes, exactly as stored (so they round-trip), followed by three DERIVED arrays that
+        /// complete Binance's `leverageBracket` row. Reverts if the market does not exist.
+        ///
+        ///   lowerBounds                   Binance `notionalFloor`, quote units.
+        ///   maxLeverages                  Binance `initialLeverage`.
+        ///   maintMarginRatesPpm           the stored column: `0` = derived (see `setMarginTiers`).
+        ///   effectiveMaintMarginRatesPpm  Binance `maintMarginRatio`, ppm: the column when set;
+        ///                                 a derived `1/(2L)` rounded UP to whole ppm (`3x` →
+        ///                                 166667) — the engine itself uses the exact `1/(2L)`.
+        ///   cums                          Binance `cum`, the "maintenance amount", quote units:
+        ///                                 `cum_0 = 0`, `cum_i = cum_{i-1} + lowerBounds[i] ·
+        ///                                 (rate_i − rate_{i-1}) / 1e6` over the effective column,
+        ///                                 evaluated exactly and floored once.
+        ///   notionalCaps                  Binance `notionalCap`: the next tier's `lowerBounds`,
+        ///                                 and `type(uint64).max` for the last tier, whose band is
+        ///                                 unbounded. (NOT `getSymbolConfig`'s `0 = unbounded`.)
+        ///
+        /// With these, `maintMargin = notional · effectiveRate / 1e6 − cum` for a notional in
+        /// `[lowerBound, notionalCap)` is Binance's formula. The engine enforces its integer slice
+        /// form, which is NEVER ABOVE that value: it floors once per band (under one quote unit
+        /// per tier reached), and a derived rate is reported rounded up. For an explicit table
+        /// with whole-dollar bounds — any Binance table — the rates and `cum` are exact.
+        function getMarginTiers(uint64 marketId) external view returns (
+            uint64[] lowerBounds,
+            uint32[] maxLeverages,
+            uint32[] maintMarginRatesPpm,
+            uint32[] effectiveMaintMarginRatesPpm,
+            uint64[] cums,
+            uint64[] notionalCaps
+        );
 
         // ── Leverage ───────────────────────────────────────────────────────
         /// Set the leverage for the caller's position in a market.
@@ -2250,8 +2301,10 @@ sol! {
         // Feeds: market metadata bootstrap for indexer
         event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint64 initialMarkPrice, uint32 priceBandBps);
         // Feeds: market risk-table updates for indexer / risk UI.
-        // Index-aligned parallel arrays; the full replacement table, not a delta.
-        event MarginTiersUpdated(uint64 indexed marketId, uint64[] lowerBounds, uint32[] maxLeverages);
+        // Index-aligned parallel arrays as `setMarginTiers` took them (`maintMarginRatesPpm` 0 =
+        // derived); the full replacement table, not a delta. Effective rates, `cum` and caps:
+        // `getMarginTiers`.
+        event MarginTiersUpdated(uint64 indexed marketId, uint64[] lowerBounds, uint32[] maxLeverages, uint32[] maintMarginRatesPpm);
         // Feeds: market metadata updates for indexer
         event MarketUpdated(uint64 indexed marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps);
         // Feeds: /premiumIndex (mark + index price history), /fundingRate (markPrice field),

@@ -5,7 +5,7 @@
 
 use crate::{
     error::{perp_err, PerpError},
-    types::{MarginTiers, Market, OrderEntry},
+    types::{MarginTier, MarginTiers, Market, OrderEntry, MMR_PPM_ONE},
 };
 
 pub const QUOTE_DECIMALS: u32 = 6;
@@ -370,9 +370,11 @@ pub fn calc_value_i64(
 /// Maintenance margin required for a position of `abs_notional` quote units under a
 /// market's margin-tier table.
 ///
-/// Spec (`perpdex-docs trading/margin-tiers.md`):
-/// `maintenance_margin = notional * mmr(n) - deduction(n)`, `mmr(n) = 1 / (2*L_n)`,
-/// `deduction(n) = deduction(n-1) + B_n * (mmr(n) - mmr(n-1))`.
+/// Spec (`perpdex-docs trading/margin-tiers.md`, Binance `leverageBracket`):
+/// `maintenance_margin = notional * mmr(n) - deduction(n)`,
+/// `deduction(n) = deduction(n-1) + B_n * (mmr(n) - mmr(n-1))` (Binance's `cum`), where
+/// `mmr(n)` is tier `n`'s explicit `maint_margin_rate_ppm / 1e6` when that column is set and
+/// `1 / (2*L_n)` when it is `0` (see [`tier_slice_maintenance`]).
 ///
 /// # Why this is the SLICE form and not the spec's subtractive recursion
 ///
@@ -391,6 +393,9 @@ pub fn calc_value_i64(
 /// sides of a boundary — see `tier_boundaries_are_continuous`), and is monotone
 /// non-decreasing in notional.
 ///
+/// The same holds with an explicit rate column: each slice is still floored once,
+/// `⌊slice · ppm / 1e6⌋`, so continuity and monotonicity do not depend on where a rate came from.
+///
 /// `abs_notional` must already be non-negative (callers pass `notional.checked_abs()?`);
 /// a negative input is clamped to 0 rather than producing a negative requirement.
 /// A tier's `max_leverage` is floored at 1 so a corrupt blob cannot divide by zero.
@@ -400,18 +405,140 @@ pub fn maintenance_margin(tiers: &MarginTiers, abs_notional: i64) -> Result<i64,
     let table = tiers.as_slice();
     let mut acc: i128 = 0;
     let mut lo: i128 = 0;
-    let mut lev: i128 = (table[0].max_leverage as i128).max(1);
+    let mut cur = &table[0];
     for tier in &table[1..] {
         let bound = tier.lower_bound_notional as i128;
         if n < bound {
             break;
         }
-        acc += (bound - lo) / (2 * lev);
+        acc += tier_slice_maintenance(cur, bound - lo);
         lo = bound;
-        lev = (tier.max_leverage as i128).max(1);
+        cur = tier;
     }
-    acc += (n - lo) / (2 * lev);
+    acc += tier_slice_maintenance(cur, n - lo);
     i64::try_from(acc).map_err(|_| perp_err("math: maintenance margin exceeds i64"))
+}
+
+/// Maintenance charged on `slice` quote units of notional inside `tier`'s band, floored once.
+///
+/// * Column `0` (DERIVED): `⌊slice / (2·L)⌋` — byte for byte the expression every table used
+///   before the column existed, `L` floored at 1 so a corrupt blob cannot divide by zero.
+/// * Column `m > 0` (EXPLICIT): `⌊slice · m / 1e6⌋`, `m` capped at [`MMR_PPM_ONE`] (100%). The cap
+///   is unreachable through `setMarginTiers` (it admits only `m < 1e6 / L`); it keeps a corrupt
+///   blob inside the `mmr <= 1` that [`calc_liquidation_price`]'s monotonicity argument needs.
+///
+/// `slice <= i64::MAX` and `m <= 1e6`, so the product stays far inside `i128`.
+#[inline]
+fn tier_slice_maintenance(tier: &MarginTier, slice: i128) -> i128 {
+    match tier.maint_margin_rate_ppm {
+        0 => slice / (2 * (tier.max_leverage as i128).max(1)),
+        ppm => slice * ppm.min(MMR_PPM_ONE) as i128 / MMR_PPM_ONE as i128,
+    }
+}
+
+/// A tier's EFFECTIVE maintenance-margin rate as the exact fraction `num / den` of one ppm
+/// (rate `= num / (den · 1e6)`): an explicit column `m` is `(m, 1)` (capped at 100% like
+/// [`tier_slice_maintenance`]); a derived tier is `1 / (2L) = (500_000 / L) ppm`, i.e.
+/// `(500_000, L)`, which is generally NOT a whole number of ppm (`L = 3` is 166_666.67 ppm).
+/// Kept as a fraction so validation compares rates exactly instead of through a rounding.
+#[inline]
+fn tier_mmr_fraction(tier: &MarginTier) -> (u128, u128) {
+    match tier.maint_margin_rate_ppm {
+        0 => (
+            (MMR_PPM_ONE / 2) as u128,
+            (tier.max_leverage as u128).max(1),
+        ),
+        ppm => (ppm.min(MMR_PPM_ONE) as u128, 1),
+    }
+}
+
+/// `true` iff `lower`'s effective maintenance rate is `<=` `upper`'s — compared EXACTLY
+/// (cross-multiplied fractions), so a derived `1/(2L)` meets an explicit ppm without rounding.
+/// `setMarginTiers` requires this of every adjacent pair: Binance's rates never fall as the
+/// bracket grows, which is also what keeps `cum >= 0` and `MM <= notional · mmr(n)`.
+#[inline]
+pub fn tier_mmr_not_above(lower: &MarginTier, upper: &MarginTier) -> bool {
+    let (a, b) = tier_mmr_fraction(lower);
+    let (c, d) = tier_mmr_fraction(upper);
+    a * d <= c * b
+}
+
+/// `true` iff the tier's effective maintenance rate is STRICTLY below its initial-margin rate
+/// `1 / max_leverage` — IM > MM inside the band. Always true of a derived tier
+/// (`1/(2L) < 1/L`); for an explicit column `m` it is `m · L < 1e6`. `setMarginTiers` requires
+/// it of every tier: together with non-decreasing rates it gives `MM(N) <= N · mmr(n) < N / L_n`
+/// for any notional in tier `n`, so a position opened within its tier's leverage starts above
+/// maintenance.
+#[inline]
+pub fn tier_mmr_below_initial(tier: &MarginTier) -> bool {
+    let (num, den) = tier_mmr_fraction(tier);
+    num * (tier.max_leverage as u128).max(1) < MMR_PPM_ONE as u128 * den
+}
+
+/// A tier's effective maintenance rate in WHOLE ppm, as `getMarginTiers` reports it: the
+/// explicit column verbatim, a derived `1/(2L)` rounded UP (`L = 3` → 166_667). Rounding up is
+/// the conservative direction for a consumer re-evaluating Binance's `N · MMR − cum`: it can
+/// only over-state the requirement the engine enforces, never under-state it (see
+/// [`leverage_brackets`]). The engine itself never reads this rounding — it uses
+/// [`tier_slice_maintenance`].
+#[inline]
+pub fn effective_mmr_ppm(tier: &MarginTier) -> u32 {
+    let (num, den) = tier_mmr_fraction(tier);
+    num.div_ceil(den) as u32
+}
+
+/// One row of Binance's `GET /fapi/v1/leverageBracket` for a tier table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeverageBracket {
+    /// `notionalFloor`: the tier's `lower_bound_notional`.
+    pub notional_floor: u64,
+    /// `notionalCap`: the NEXT tier's `lower_bound_notional`; `u64::MAX` for the last tier,
+    /// whose band is unbounded.
+    pub notional_cap: u64,
+    /// `initialLeverage`: the tier's `max_leverage`.
+    pub initial_leverage: u32,
+    /// `maintMarginRatio` in ppm: [`effective_mmr_ppm`].
+    pub maint_margin_rate_ppm: u32,
+    /// `cum` (the "maintenance amount"), quote units: Binance's recursion over the REPORTED
+    /// rate column, `cum_0 = 0`, `cum_n = cum_{n−1} + floor_n · (mmr_n − mmr_{n−1})`, evaluated
+    /// as one exact sum and floored once.
+    pub cum: u64,
+}
+
+/// Binance's `leverageBracket` view of a tier table: per tier the effective rate, `cum` and
+/// `notionalCap`, so `MM = notional · mmr / 1e6 − cum` can be evaluated off-chain.
+///
+/// How that formula relates to the requirement the engine ENFORCES ([`maintenance_margin`],
+/// the slice form): over the reals the two are the same sum. In integers the engine is NEVER
+/// ABOVE `N · mmr / 1e6 − cum` and may sit below it: it floors once per slice (under one quote
+/// unit per tier reached), `cum` is floored too (which only raises the formula), and a derived
+/// rate is reported rounded UP (which raises it by up to `N / 1e6`). For an explicit table with
+/// whole-dollar bounds — every Binance table — the column and `cum` are exact and the only
+/// residue is the partial slice's floor.
+pub fn leverage_brackets(tiers: &MarginTiers) -> Vec<LeverageBracket> {
+    let table = tiers.as_slice();
+    let mut out = Vec::with_capacity(table.len());
+    // Σ floor_k · (mmr_k − mmr_{k−1}) in ppm·quote units: each term <= u64::MAX · 1e6, so 16 of
+    // them stay far inside i128. Signed only so a corrupt (non-monotone) blob cannot underflow.
+    let mut cum_ppm: i128 = 0;
+    let mut prev_mmr: i128 = 0;
+    for (i, tier) in table.iter().enumerate() {
+        let mmr = effective_mmr_ppm(tier);
+        if i > 0 {
+            cum_ppm += tier.lower_bound_notional as i128 * (mmr as i128 - prev_mmr);
+        }
+        prev_mmr = mmr as i128;
+        out.push(LeverageBracket {
+            notional_floor: tier.lower_bound_notional,
+            notional_cap: table
+                .get(i + 1)
+                .map_or(u64::MAX, |next| next.lower_bound_notional),
+            initial_leverage: tier.max_leverage,
+            maint_margin_rate_ppm: mmr,
+            cum: (cum_ppm.max(0) / MMR_PPM_ONE as i128).min(u64::MAX as i128) as u64,
+        });
+    }
+    out
 }
 
 /// Maximum leverage a market's tier table permits at `abs_notional` quote units: the
@@ -942,9 +1069,9 @@ fn liquidation_price_domain_hi(
 /// properties of the code, not of the model:
 ///
 /// 1. **It is a fixed point, not a formula.** `mmr` depends on the tier, the tier depends on
-///    `|notional|`, and `|notional|` depends on the very price being solved for. The general rate is
-///    `mmr = 1 / (2 · max_leverage(tier))`; the published `5/6` and `7/6` shortcuts are only the
-///    `mmr = 1/6` case, i.e. the default single tier.
+///    `|notional|`, and `|notional|` depends on the very price being solved for. The rate is the
+///    tier's explicit column or, when unset, `mmr = 1 / (2 · max_leverage(tier))`; the published
+///    `5/6` and `7/6` shortcuts are only the `mmr = 1/6` case, i.e. the default single tier.
 /// 2. **[`maintenance_margin`] is the integer SLICE form**, floored once per crossed band. Its own
 ///    doc comment records that the algebraically-equivalent `N·mmr − cum` is integer-discontinuous
 ///    at 53.1% of two-tier boundaries, deterministically — so a re-derivation would agree on every
@@ -958,7 +1085,7 @@ fn liquidation_price_domain_hi(
 /// flip point of the function `liquidate()` calls, not an algebraic model of it: exact by
 /// construction, no rounding decision to make, no per-band case analysis, and correct for any tier
 /// count. Cost is ~64 iterations of a few multiplications and a walk of a table bounded by
-/// `MAX_MARGIN_TIERS = 8`, plus ~64 for the domain bound — with **zero storage loads**.
+/// `MAX_MARGIN_TIERS = 16`, plus ~64 for the domain bound — with **zero storage loads**.
 ///
 /// ## Why `g` is monotone
 ///
@@ -967,21 +1094,22 @@ fn liquidation_price_domain_hi(
 /// * `position_value` moves by exactly `±Δ` (`notional` is its only `P`-dependent term).
 /// * `threshold` moves by at most `Δ`, and never the other way: `maintenance_margin` is
 ///   non-decreasing in `|notional|`, and one UNIT of `|notional|` moves it by 0 or 1 — inside a band
-///   because `⌊(m+1)/(2L)⌋ − ⌊m/(2L)⌋ ∈ {0, 1}`, and ACROSS a band because the slice form's crossed
-///   terms are shared verbatim by both sides of a boundary (that is
-///   `tier_boundaries_are_continuous`). Telescoping unit steps gives `Δthreshold <= Δ`.
+///   because `⌊(m+1)·r⌋ − ⌊m·r⌋ ∈ {0, 1}` for a rate `r <= 1` (`r = 1/(2L)` or `ppm / 1e6`), and
+///   ACROSS a band because the slice form's crossed terms are shared verbatim by both sides of a
+///   boundary (that is `tier_boundaries_are_continuous`). Telescoping unit steps gives
+///   `Δthreshold <= Δ`.
 ///
 /// So for a LONG (`amount > 0`) `notional` is non-decreasing in `P`, `position_value` rises by `Δ`,
 /// `threshold` by at most `Δ`, and `g` is non-DEcreasing. For a SHORT `notional` is non-increasing,
 /// so `position_value` falls while `|notional|` and therefore `threshold` rise, and `g` is
 /// non-INcreasing. Either way one flip.
 ///
-/// The `<= Δ` step needs `mmr <= 1/2`, i.e. every tier's effective `max_leverage >= 1`.
-/// `maintenance_margin` floors `max_leverage` at 1 for exactly that reason, so `mmr` can never
-/// reach 1 and the argument holds even on a corrupt blob; the `debug_assert!` below surfaces such a
-/// blob rather than protecting the search from it. `liquidation_predicate_is_monotone_in_price`
-/// pins the property itself over randomised positions and tables rather than trusting this
-/// paragraph.
+/// The `<= Δ` step needs `mmr <= 1`. A derived rate is at most `1/2`: `maintenance_margin` floors
+/// `max_leverage` at 1 for exactly that reason. An explicit column is capped at 100% by the same
+/// function (`setMarginTiers` admits only `ppm < 1e6 / L <= 1e6`). So the argument holds even on a
+/// corrupt blob; the `debug_assert!` below surfaces a zero-leverage blob rather than protecting the
+/// search from it. `liquidation_predicate_is_monotone_in_price` pins the property itself over
+/// randomised positions and tables rather than trusting this paragraph.
 ///
 /// # The two ways there is NO liquidation price
 ///
@@ -1584,6 +1712,7 @@ mod margin_tier_tests {
             .map(|&(lower_bound_notional, max_leverage)| MarginTier {
                 lower_bound_notional,
                 max_leverage,
+                maint_margin_rate_ppm: 0,
             })
             .collect();
         MarginTiers::from_tiers(&v).expect("valid tier count")
@@ -1936,6 +2065,7 @@ mod liquidation_price_tests {
             .map(|&(lower_bound_notional, max_leverage)| MarginTier {
                 lower_bound_notional,
                 max_leverage,
+                maint_margin_rate_ppm: 0,
             })
             .collect();
         MarginTiers::from_tiers(&v).expect("valid tier count")

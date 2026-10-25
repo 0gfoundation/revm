@@ -2373,6 +2373,8 @@ fn set_leverage(ctx: &mut TestCtx, leverage: u64) -> Result<Bytes, PerpError> {
     )
 }
 
+/// `setMarginTiers` with every tier's maintenance rate DERIVED (an all-zero rate column) — the
+/// table shape every test wrote before the column existed.
 fn set_margin_tiers(
     ctx: &mut TestCtx,
     caller: Address,
@@ -2380,11 +2382,30 @@ fn set_margin_tiers(
     lower_bounds: &[u64],
     max_leverages: &[u32],
 ) -> Result<Bytes, PerpError> {
+    set_margin_tiers_with_rates(
+        ctx,
+        caller,
+        market_id,
+        lower_bounds,
+        max_leverages,
+        &vec![0; lower_bounds.len()],
+    )
+}
+
+fn set_margin_tiers_with_rates(
+    ctx: &mut TestCtx,
+    caller: Address,
+    market_id: u64,
+    lower_bounds: &[u64],
+    max_leverages: &[u32],
+    maint_margin_rates_ppm: &[u32],
+) -> Result<Bytes, PerpError> {
     run_set_margin_tiers(
         &setMarginTiersCall {
             marketId: market_id,
             lowerBounds: lower_bounds.to_vec(),
             maxLeverages: max_leverages.to_vec(),
+            maintMarginRatesPpm: maint_margin_rates_ppm.to_vec(),
         }
         .abi_encode(),
         caller,
@@ -2392,7 +2413,10 @@ fn set_margin_tiers(
     )
 }
 
-fn get_margin_tiers(ctx: &mut TestCtx, market_id: u64) -> (Vec<u64>, Vec<u32>) {
+fn get_margin_tiers_full(
+    ctx: &mut TestCtx,
+    market_id: u64,
+) -> crate::interface::IPerpDex::getMarginTiersReturn {
     let out = run_get_margin_tiers(
         &getMarginTiersCall {
             marketId: market_id,
@@ -2401,7 +2425,12 @@ fn get_margin_tiers(ctx: &mut TestCtx, market_id: u64) -> (Vec<u64>, Vec<u32>) {
         ctx,
     )
     .unwrap();
-    let decoded = getMarginTiersCall::abi_decode_returns(&out).unwrap();
+    getMarginTiersCall::abi_decode_returns(&out).unwrap()
+}
+
+/// The `(lowerBounds, maxLeverages)` pair — the two columns every pre-rate test compares.
+fn get_margin_tiers(ctx: &mut TestCtx, market_id: u64) -> (Vec<u64>, Vec<u32>) {
+    let decoded = get_margin_tiers_full(ctx, market_id);
     (decoded.lowerBounds, decoded.maxLeverages)
 }
 
@@ -2664,7 +2693,7 @@ fn set_margin_tiers_accepts_the_maximum_table_size() {
         .map(|i| i * 1_000_000)
         .collect();
     let levs: Vec<u32> = (0..crate::types::MAX_MARGIN_TIERS as u32)
-        .map(|i| 8 - i)
+        .map(|i| crate::types::MAX_MARGIN_TIERS as u32 - i)
         .collect();
 
     set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &bounds, &levs).unwrap();
@@ -2698,9 +2727,9 @@ fn set_margin_tiers_rejects_each_invariant_individually() {
         ),
         (&[], &[], "at least one tier required"),
         (
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
-            &[9, 8, 7, 6, 5, 4, 3, 2, 1],
-            "at most 8 tiers allowed",
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            &[17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+            "at most 16 tiers allowed",
         ),
         (&[1_000], &[3], "first tier must start at 0"),
         (
@@ -2865,6 +2894,7 @@ fn set_margin_tiers_emits_the_full_replacement_table() {
     assert_eq!(updated[0].marketId, MARKET_ID);
     assert_eq!(updated[0].lowerBounds, vec![0, 1_000_000]);
     assert_eq!(updated[0].maxLeverages, vec![3, 2]);
+    assert_eq!(updated[0].maintMarginRatesPpm, vec![0, 0]);
 }
 
 // ── Per-open margin-tier guard ────────────────────────────────────────────────
@@ -10232,6 +10262,7 @@ mod withdrawal_cap {
         MarginTier {
             lower_bound_notional,
             max_leverage,
+            maint_margin_rate_ppm: 0,
         }
     }
 

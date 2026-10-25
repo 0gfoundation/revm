@@ -6968,7 +6968,17 @@ mod golden {
     /// meta key and stops. `BusinessSnapshot` UNCHANGED. VERIFIED: with the field `#[serde(skip)]`
     /// the scenario reproduced the previous pin 0xa72ce19d…d940.
     ///
-    /// Prior values 0xa72ce19d4e1c033989c620e39e9a7e09d6b483aee1c38cfe0d9e08770898d940 (38,
+    /// Re-pinned for the cross-margin series (`BLOCK_COMMITMENT_VERSION` 38 → 39), first for P0,
+    /// the explicit maintenance-rate column: `MarginTier` gains a trailing `maint_margin_rate_ppm`
+    /// (u32, 0 = derived `1/(2L)`), positional msgpack, appended — so every market blob the
+    /// scenario writes is one byte longer per tier row (a fixint 0: it installs no table, every
+    /// market keeps the default `{0, 3x, derived}`). A LAYOUT change only; with a zero column the
+    /// maintenance requirement is the same expression byte for byte. `BusinessSnapshot` UNCHANGED.
+    /// VERIFIED: with the field `#[serde(skip)]` the scenario reproduced the previous 38 pin
+    /// 0x37a18141…79de.
+    ///
+    /// Prior values 0x37a18141947ba3bb4fe923fe0e05a07d4dc0a8d1987096250991ed7d0f3f79de (38,
+    /// trailing stop), 0xa72ce19d4e1c033989c620e39e9a7e09d6b483aee1c38cfe0d9e08770898d940 (38,
     /// closePosition parity), 0x720411d896e56b98c027a692b9cb8afba35c93accce39ccbef86a1a59f93e3e0 (38,
     /// fire() capacity fix), 0x525fea15e0541c3a4441899ac1d7862a0fc5d2cb3dae2a933a6b3b5594d933ee (37,
     /// ppm fees + maker rebate),
@@ -6984,7 +6994,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x37a18141947ba3bb4fe923fe0e05a07d4dc0a8d1987096250991ed7d0f3f79de");
+        b256!("0xafd826451ed6c8e356b03def92beb67c4e2431333141b39bfc21aeef4f057b48");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -13213,10 +13223,12 @@ mod derived_ooim_divergence {
             MarginTier {
                 lower_bound_notional: 0,
                 max_leverage: 10,
+                maint_margin_rate_ppm: 0,
             },
             MarginTier {
                 lower_bound_notional: 2_000_000,
                 max_leverage: 2,
+                maint_margin_rate_ppm: 0,
             },
         ])
         .unwrap();
