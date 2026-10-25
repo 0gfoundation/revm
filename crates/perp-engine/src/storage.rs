@@ -2951,11 +2951,11 @@ pub fn absorb_from_insurance_fund<H: PerpHost>(
 // seen check runs, so a stale marker can never cause a false reject — GC exists purely to bound
 // storage, and losing a marker late is harmless.
 
-const SEEN_BUCKET_WIDTH_SECS: u64 = 15;
+pub(crate) const SEEN_BUCKET_WIDTH_SECS: u64 = 15;
 /// Buckets retained behind the current one before GC drops them. `RETENTION * WIDTH` must exceed
 /// the max recv window (+ clock skew) so a bucket is dropped only once EVERY signature it could
 /// hold is already recv-window-expired (hence its marker unreachable). 6 * 15 = 90s > 60s + 5s.
-const SEEN_RETENTION_BUCKETS: u64 = 6;
+pub(crate) const SEEN_RETENTION_BUCKETS: u64 = 6;
 
 /// Replay check: has this signature (by `keccak256(signature)`) already been submitted?
 pub fn is_signature_seen<H: PerpHost>(

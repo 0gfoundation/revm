@@ -358,12 +358,17 @@ fn register_key(ctx: &mut TestCtx, user: Address, sk: &SigningKey) {
 
 /// `setMarginTypeSigned` for ALICE, signed over the canonical 75-byte message.
 fn signed(sk: &SigningKey, market_id: u64, margin_type: u8) -> Vec<u8> {
+    signed_at(sk, market_id, margin_type, SIGNED_TS)
+}
+
+/// [`signed`] with the message's `timestamp`.
+fn signed_at(sk: &SigningKey, market_id: u64, margin_type: u8, ts: u64) -> Vec<u8> {
     let mut msg = [0u8; 75];
     let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_margintype", CHAIN_ID);
     c = crate::trading::put(&mut msg, c, ALICE.as_slice());
     c = crate::trading::put(&mut msg, c, &market_id.to_be_bytes());
     c = crate::trading::put(&mut msg, c, &[margin_type]);
-    c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+    c = crate::trading::put(&mut msg, c, &ts.to_be_bytes());
     c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
     c = crate::trading::put(&mut msg, c, &[0]);
     assert_eq!(c, msg.len());
@@ -371,7 +376,7 @@ fn signed(sk: &SigningKey, market_id: u64, margin_type: u8) -> Vec<u8> {
         account: ALICE,
         marketId: market_id,
         marginType: margin_type,
-        timestamp: SIGNED_TS,
+        timestamp: ts,
         recvWindow: SIGNED_RECV,
         keyId: 0,
         signature: sk.sign(&msg).to_bytes().to_vec().into(),
@@ -719,4 +724,47 @@ fn the_reservation_only_route_refuses_a_margin_type_change() {
     let mut p = stored(&mut ctx, ALICE);
     p.margin_type = ISOLATED;
     let _ = storage::save_position_reservation_only(&mut ctx, ALICE, MARKET_ID, p);
+}
+
+/// `setMarginTypeSigned` runs the seen-signature GC after its burn, like every signed selector. The
+/// GC collects only the ONE bucket that is exactly `SEEN_RETENTION_BUCKETS` behind the block's, so
+/// a signed selector that skipped it would leave that bucket's markers in off-trie state for good
+/// whenever it was the only signed traffic in the window. Here it is the only signed traffic: a
+/// signature burned at `t` must be gone once a second `setMarginTypeSigned` lands in the bucket that
+/// collects `t`'s, and the second one's own marker must be kept.
+#[test]
+fn the_signed_switch_collects_the_expired_seen_bucket() {
+    use crate::storage::{SEEN_BUCKET_WIDTH_SECS as W, SEEN_RETENTION_BUCKETS as R};
+    let mut ctx = make_ctx();
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    register_key(&mut ctx, ALICE, &sk);
+    let sig_hash = |input: &[u8]| -> [u8; 32] {
+        let call = setMarginTypeSignedCall::abi_decode(input).unwrap();
+        primitives::keccak256(call.signature.as_ref()).0
+    };
+
+    let t0 = 10 * W;
+    ctx.block.timestamp = U256::from(t0);
+    let first = signed_at(&sk, MARKET_ID, ISOLATED, t0);
+    rejects_after_burn(&mut ctx, &first, E_NO_NEED);
+    assert!(storage::is_signature_seen(&mut ctx, &sig_hash(&first)).unwrap());
+
+    // One bucket short of collection: the marker stays.
+    let t1 = (t0 / W + R - 1) * W;
+    ctx.block.timestamp = U256::from(t1);
+    let second = signed_at(&sk, MARKET_ID, ISOLATED, t1);
+    rejects_after_burn(&mut ctx, &second, E_NO_NEED);
+    assert!(storage::is_signature_seen(&mut ctx, &sig_hash(&first)).unwrap(), "collected early");
+
+    // The block's bucket is now exactly `R` behind `first`'s: this call's GC collects it.
+    let t2 = (t0 / W + R) * W;
+    ctx.block.timestamp = U256::from(t2);
+    let third = signed_at(&sk, MARKET_ID, ISOLATED, t2);
+    rejects_after_burn(&mut ctx, &third, E_NO_NEED);
+    assert!(
+        !storage::is_signature_seen(&mut ctx, &sig_hash(&first)).unwrap(),
+        "setMarginTypeSigned did not collect the expired bucket"
+    );
+    assert!(storage::is_signature_seen(&mut ctx, &sig_hash(&second)).unwrap());
+    assert!(storage::is_signature_seen(&mut ctx, &sig_hash(&third)).unwrap());
 }
