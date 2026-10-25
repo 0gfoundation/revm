@@ -1828,6 +1828,12 @@ fn finalize_core(
         .checked_abs()
         .ok_or_else(|| perp_err("placeOrder: tier notional abs overflow"))?;
         let tier_cap = max_leverage_for_notional(&market.tiers, abs_notional);
+        // `0`: past the table's terminal `notionalCap` — no leverage admits this size.
+        if tier_cap == 0 {
+            return Err(perp_err(
+                "placeOrder: -2027 position exceeds the market's maximum notional",
+            ));
+        }
         if pos.leverage.max(1) > tier_cap as u64 {
             return Err(perp_err(
                 "placeOrder: leverage exceeds the margin tier for this position size",
@@ -2088,6 +2094,7 @@ pub(super) fn settle_maker_fill_core(
         )?
         .checked_abs()
         .ok_or_else(|| perp_err("settlement: tier notional abs overflow"))?;
+        // `tier_cap == 0` (past the terminal `notionalCap`) refuses through the same comparison.
         let tier_cap = max_leverage_for_notional(&market.tiers, abs_notional);
         if trial_pos.leverage.max(1) > tier_cap as u64 {
             return Ok(MakerFillCore::RejectedInsolvent);

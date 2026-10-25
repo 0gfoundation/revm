@@ -922,6 +922,16 @@ sol! {
         /// is used verbatim. Binance's `cum` is not an input — it follows from the bounds and the
         /// rates and `getMarginTiers` returns it.
         ///
+        /// `notionalCap` is the LAST bracket's Binance `notionalCap` (quote units): the largest
+        /// position the market admits at ANY leverage — every other bracket's cap is the next
+        /// floor, so this is the only one the arrays cannot express. `0` (or
+        /// `type(uint64).max`, what `getMarginTiers` reports for an unbounded last band) means
+        /// UNBOUNDED, and is stored as `0`. A capped table refuses, exactly like a tier cap, any
+        /// OPENING fill that leaves `|notional at mark| >= notionalCap` (taker: revert `-2027`;
+        /// maker: the resting order is cancelled), and `setLeverage` on a position already that
+        /// large (`-2027`). Closing is never refused; maintenance past the cap continues at the
+        /// last tier's rate.
+        ///
         /// Rejected (whole call, zero writes) unless ALL hold: the market exists;
         /// `lowerBounds` and `maxLeverages` are the same length; `1 <= length <=
         /// MAX_MARGIN_TIERS (16)`; `lowerBounds[0] == 0`; `lowerBounds` strictly increasing;
@@ -930,7 +940,8 @@ sol! {
         /// tier's EFFECTIVE rate strictly below its initial-margin rate, i.e. an explicit
         /// `maintMarginRatesPpm[i] < 1e6 / maxLeverages[i]` (IM > MM in every tier — a derived
         /// rate always is); the effective rates non-decreasing across the table (compared
-        /// exactly, so a derived `1/(2L)` meets an explicit ppm without rounding).
+        /// exactly, so a derived `1/(2L)` meets an explicit ppm without rounding); a bounded
+        /// `notionalCap` strictly above the last `lowerBounds` entry.
         ///
         /// Maintenance margin is the SLICE form of Binance's `notional · mmr − cum`: each band's
         /// share is floored once, so the requirement is continuous at every bound
@@ -943,7 +954,8 @@ sol! {
             uint64 marketId,
             uint64[] lowerBounds,
             uint32[] maxLeverages,
-            uint32[] maintMarginRatesPpm
+            uint32[] maintMarginRatesPpm,
+            uint64 notionalCap
         ) external;
 
         /// Select which basis mechanism feeds Price 2 of this market's mark.
@@ -978,9 +990,10 @@ sol! {
         ///                                 `cum_0 = 0`, `cum_i = cum_{i-1} + lowerBounds[i] ·
         ///                                 (rate_i − rate_{i-1}) / 1e6` over the effective column,
         ///                                 evaluated exactly and floored once.
-        ///   notionalCaps                  Binance `notionalCap`: the next tier's `lowerBounds`,
-        ///                                 and `type(uint64).max` for the last tier, whose band is
-        ///                                 unbounded. (NOT `getSymbolConfig`'s `0 = unbounded`.)
+        ///   notionalCaps                  Binance `notionalCap`: the next tier's `lowerBounds`;
+        ///                                 for the last tier the `notionalCap` `setMarginTiers`
+        ///                                 took, or `type(uint64).max` when that is unbounded.
+        ///                                 (NOT `getSymbolConfig`'s `0 = unbounded`.)
         ///
         /// With these, `maintMargin = notional · effectiveRate / 1e6 − cum` for a notional in
         /// `[lowerBound, notionalCap)` is Binance's formula. The engine enforces its integer slice
@@ -1024,8 +1037,9 @@ sol! {
         ///   maxNotionalValue  the largest `|notional|` (quote units, at MARK, the same basis
         ///                     `AccountPosition.notional` reports) the tier table admits while
         ///                     `leverage` is in force: the upper bound of the highest tier whose
-        ///                     `maxLeverage` is still `>= leverage`. **`0` MEANS UNBOUNDED** — that
-        ///                     tier is the last one and its band runs to infinity. Every market
+        ///                     `maxLeverage` is still `>= leverage`; when that tier is the last
+        ///                     one, the table's `notionalCap` (`setMarginTiers`). **`0` MEANS
+        ///                     UNBOUNDED** — the last band of an uncapped table. Every market
         ///                     today ships the single default tier `{0, 3}`, so every market today
         ///                     returns `0` at every legal leverage; the field only becomes
         ///                     informative once `setMarginTiers` installs a real table.
@@ -2404,9 +2418,9 @@ sol! {
         event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint64 initialMarkPrice, uint32 priceBandBps);
         // Feeds: market risk-table updates for indexer / risk UI.
         // Index-aligned parallel arrays as `setMarginTiers` took them (`maintMarginRatesPpm` 0 =
-        // derived); the full replacement table, not a delta. Effective rates, `cum` and caps:
-        // `getMarginTiers`.
-        event MarginTiersUpdated(uint64 indexed marketId, uint64[] lowerBounds, uint32[] maxLeverages, uint32[] maintMarginRatesPpm);
+        // derived) and the last bracket's `notionalCap` as stored (0 = unbounded); the full
+        // replacement table, not a delta. Effective rates, `cum` and caps: `getMarginTiers`.
+        event MarginTiersUpdated(uint64 indexed marketId, uint64[] lowerBounds, uint32[] maxLeverages, uint32[] maintMarginRatesPpm, uint64 notionalCap);
         // Feeds: market metadata updates for indexer
         event MarketUpdated(uint64 indexed marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps);
         // Feeds: /premiumIndex (mark + index price history), /fundingRate (markPrice field),

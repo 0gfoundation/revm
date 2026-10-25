@@ -391,11 +391,17 @@ fn set_type(market: u64, t: u8) -> Vec<u8> {
 }
 
 fn set_tiers(market: u64, t: &[Row]) -> Vec<u8> {
+    set_tiers_capped(market, t, 0)
+}
+
+/// [`set_tiers`] with the last bracket's `notionalCap` (`0` = unbounded).
+fn set_tiers_capped(market: u64, t: &[Row], cap: u64) -> Vec<u8> {
     setMarginTiersCall {
         marketId: market,
         lowerBounds: t.iter().map(|r| r.lb).collect(),
         maxLeverages: t.iter().map(|r| r.lev).collect(),
         maintMarginRatesPpm: t.iter().map(|r| r.ppm).collect(),
+        notionalCap: cap,
     }
     .abi_encode()
 }
@@ -809,6 +815,76 @@ fn p0_the_btc_table_reads_back_as_binances_leverage_bracket() {
     }
 }
 
+/// Binance BTCUSDT's CURRENT `leverageBracket` (live capture, 2026-10-14): `(floor $,
+/// initialLeverage, maintMarginRatio ppm)`; its last bracket's `notionalCap` is [`BTC_LIVE_CAP_USD`].
+const BTC_LIVE: [Row; 12] = [
+    row(0, 150, 4_000),
+    row(300_000, 100, 5_000),
+    row(800_000, 75, 6_500),
+    row(3_000_000, 50, 10_000),
+    row(12_000_000, 25, 20_000),
+    row(70_000_000, 20, 25_000),
+    row(100_000_000, 10, 50_000),
+    row(230_000_000, 5, 100_000),
+    row(480_000_000, 4, 125_000),
+    row(600_000_000, 3, 150_000),
+    row(800_000_000, 2, 250_000),
+    row(1_200_000_000, 1, 500_000),
+];
+const BTC_LIVE_CAP_USD: u64 = 1_800_000_000;
+/// The `cum` column Binance returned with it, USDT.
+const BTC_LIVE_CUM_USD: [u64; 12] = [
+    0,
+    300,
+    1_500,
+    12_000,
+    132_000,
+    482_000,
+    2_982_000,
+    14_482_000,
+    26_482_000,
+    41_482_000,
+    121_482_000,
+    421_482_000,
+];
+
+/// Binance's current BTCUSDT table loads exactly as Binance returned it — 150x first, twelve
+/// brackets, and the last bracket's FINITE `notionalCap` — and every column the getter reports is
+/// Binance's: the rates, `cum` and `notionalCap` (the last one $1.8B, not "unbounded"). The event
+/// carries the cap; `getSymbolConfig`'s `maxNotionalValue` is Binance's at every leverage,
+/// including 1x, where it is the cap.
+#[test]
+fn p0_binances_live_btc_table_reads_back_with_its_last_notional_cap() {
+    let mut ctx = fresh();
+    assert_eq!(binance_cums(&BTC_LIVE), BTC_LIVE_CUM_USD.map(|c| c * USD).to_vec());
+    let c = ok(&mut ctx, ADMIN, &set_tiers_capped(TM, &BTC_LIVE, BTC_LIVE_CAP_USD * USD));
+    let e = evs::<MarginTiersUpdated>(&c.logs);
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].notionalCap, BTC_LIVE_CAP_USD * USD);
+
+    let t = tiers(&mut ctx, TM);
+    assert_eq!(t.maxLeverages, BTC_LIVE.iter().map(|r| r.lev).collect::<Vec<_>>());
+    assert_eq!(t.effectiveMaintMarginRatesPpm, BTC_LIVE.iter().map(|r| r.ppm).collect::<Vec<_>>());
+    assert_eq!(t.cums, BTC_LIVE_CUM_USD.map(|c| c * USD).to_vec());
+    let mut caps: Vec<u64> = BTC_LIVE[1..].iter().map(|r| r.lb).collect();
+    caps.push(BTC_LIVE_CAP_USD * USD);
+    assert_eq!(t.notionalCaps, caps);
+
+    for (lev, cap_usd) in [
+        (150u64, 300_000u64),
+        (100, 800_000),
+        (75, 3_000_000),
+        (20, 100_000_000),
+        (3, 800_000_000),
+        (2, 1_200_000_000),
+        (1, BTC_LIVE_CAP_USD),
+    ] {
+        ok(&mut ctx, ERIN, &setLeverageCall { marketId: TM, leverage: lev }.abi_encode());
+        let s = sym(&mut ctx, ERIN, TM);
+        assert_eq!((s.leverage, s.maxNotionalValue), (lev, cap_usd * USD), "leverage {lev}");
+    }
+}
+
 /// `cum` follows Binance's recursion over the REPORTED (rounded-up) rates, exactly accumulated and
 /// floored once — on a derived table with non-whole-ppm rates and on a mixed table.
 #[test]
@@ -1019,6 +1095,7 @@ fn p0_structural_refusals_reject_the_whole_table() {
             lowerBounds: lbs,
             maxLeverages: levs,
             maintMarginRatesPpm: ppms,
+            notionalCap: 0,
         }
         .abi_encode()
     };
@@ -1073,6 +1150,7 @@ fn p0_the_getter_round_trips_through_the_setter() {
         lowerBounds: g.lowerBounds.clone(),
         maxLeverages: g.maxLeverages.clone(),
         maintMarginRatesPpm: g.maintMarginRatesPpm.clone(),
+        notionalCap: *g.notionalCaps.last().unwrap(),
     }
     .abi_encode();
     ok(&mut ctx, ADMIN, &back);

@@ -332,7 +332,7 @@ pub fn run_update_market<H: PerpHost>(
 }
 
 /// `setMarginTiers(uint64 marketId, uint64[] lowerBounds, uint32[] maxLeverages,
-/// uint32[] maintMarginRatesPpm)`
+/// uint32[] maintMarginRatesPpm, uint64 notionalCap)`
 ///
 /// Replaces a market's margin-tier table wholesale. ALL validation runs before the single
 /// `save_market` (validate-then-apply: perp writes are commit-only, so no genuine reject
@@ -419,9 +419,24 @@ pub fn run_set_margin_tiers<H: PerpHost>(
             "setMarginTiers: maintenance margin rates must be non-decreasing",
         ));
     }
+    // The last bracket's `notionalCap`. `0` and `type(uint64).max` both mean UNBOUNDED and are
+    // stored as `0`: the second is what `getMarginTiers` reports for an unbounded last band, so a
+    // table read back and written again is unchanged. Anything else must lie strictly above the
+    // last floor, or the last band would be empty.
+    let notional_cap = match args.notionalCap {
+        u64::MAX => 0,
+        cap => cap,
+    };
+    let last_floor = rows.last().map_or(0, |t| t.lower_bound_notional);
+    if notional_cap != 0 && notional_cap <= last_floor {
+        return Err(perp_err(
+            "setMarginTiers: notionalCap must be above the last lowerBound (0 = unbounded)",
+        ));
+    }
     // Unreachable: the length bounds above are exactly `from_tiers`' precondition.
     let tiers = MarginTiers::from_tiers(&rows)
-        .ok_or_else(|| perp_err("setMarginTiers: invalid tier count"))?;
+        .ok_or_else(|| perp_err("setMarginTiers: invalid tier count"))?
+        .with_notional_cap(notional_cap);
 
     // ── APPLY (all rejects passed) ──
     market.tiers = tiers;
@@ -434,6 +449,7 @@ pub fn run_set_margin_tiers<H: PerpHost>(
             lowerBounds: args.lowerBounds,
             maxLeverages: args.maxLeverages,
             maintMarginRatesPpm: args.maintMarginRatesPpm,
+            notionalCap: notional_cap,
         }
         .to_log_data(),
     });
@@ -649,6 +665,13 @@ fn set_leverage_core<H: PerpHost>(
     .checked_abs()
     .ok_or_else(|| perp_err("setLeverage: tier notional abs overflow"))?;
     let cap = max_leverage_for_notional(&market.tiers, abs_notional) as u64;
+    // `0`: the position is at or past the table's terminal `notionalCap` (reachable only by mark
+    // drift or a later `setMarginTiers`), where no leverage is admitted — Binance's `-2027`.
+    if cap == 0 {
+        return Err(perp_err(
+            "setLeverage: -2027 position exceeds the market's maximum notional",
+        ));
+    }
     if leverage == 0 || leverage > cap {
         return Err(perp_err(format!("setLeverage: leverage must be 1–{cap}")));
     }

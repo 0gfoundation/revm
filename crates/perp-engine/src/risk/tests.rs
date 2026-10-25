@@ -2400,12 +2400,34 @@ fn set_margin_tiers_with_rates(
     max_leverages: &[u32],
     maint_margin_rates_ppm: &[u32],
 ) -> Result<Bytes, PerpError> {
+    set_margin_tiers_capped(
+        ctx,
+        caller,
+        market_id,
+        lower_bounds,
+        max_leverages,
+        maint_margin_rates_ppm,
+        0,
+    )
+}
+
+/// The full `setMarginTiers` call, the last bracket's `notionalCap` included (`0` = unbounded).
+fn set_margin_tiers_capped(
+    ctx: &mut TestCtx,
+    caller: Address,
+    market_id: u64,
+    lower_bounds: &[u64],
+    max_leverages: &[u32],
+    maint_margin_rates_ppm: &[u32],
+    notional_cap: u64,
+) -> Result<Bytes, PerpError> {
     run_set_margin_tiers(
         &setMarginTiersCall {
             marketId: market_id,
             lowerBounds: lower_bounds.to_vec(),
             maxLeverages: max_leverages.to_vec(),
             maintMarginRatesPpm: maint_margin_rates_ppm.to_vec(),
+            notionalCap: notional_cap,
         }
         .abi_encode(),
         caller,
@@ -2955,6 +2977,9 @@ const BTCUSDT_LIVE: [(u64, u32, u32); 12] = [
     (800_000_000, 2, 250_000),
     (1_200_000_000, 1, 500_000),
 ];
+/// The last bracket's `notionalCap` Binance returned with [`BTCUSDT_LIVE`], USDT — its maximum
+/// position at any leverage.
+const BTCUSDT_LIVE_CAP: u64 = 1_800_000_000;
 /// The `cum` column Binance returned with [`BTCUSDT_LIVE`], USDT.
 const BTCUSDT_LIVE_CUM: [u64; 12] = [
     0,
@@ -2971,15 +2996,28 @@ const BTCUSDT_LIVE_CUM: [u64; 12] = [
     421_482_000,
 ];
 
-fn install_rows(ctx: &mut TestCtx, rows: &[(u64, u32, u32)]) -> Result<Bytes, PerpError> {
+/// Installs `rows` (`$` floors) with the last bracket's `notionalCap` (`$`, `0` = unbounded).
+fn install_rows(
+    ctx: &mut TestCtx,
+    rows: &[(u64, u32, u32)],
+    cap_usd: u64,
+) -> Result<Bytes, PerpError> {
     let bounds: Vec<u64> = rows.iter().map(|r| r.0 * USD).collect();
     let levs: Vec<u32> = rows.iter().map(|r| r.1).collect();
     let rates: Vec<u32> = rows.iter().map(|r| r.2).collect();
-    set_margin_tiers_with_rates(ctx, ADMIN, MARKET_ID, &bounds, &levs, &rates)
+    set_margin_tiers_capped(
+        ctx,
+        ADMIN,
+        MARKET_ID,
+        &bounds,
+        &levs,
+        &rates,
+        cap_usd * USD,
+    )
 }
 
 fn install_btcusdt(ctx: &mut TestCtx) {
-    install_rows(ctx, &BTCUSDT_2023).unwrap();
+    install_rows(ctx, &BTCUSDT_2023, 0).unwrap();
 }
 
 /// A Binance bracket table loads through `setMarginTiers` and `getMarginTiers` hands back
@@ -3040,14 +3078,15 @@ fn get_margin_tiers_reports_binance_btcusdt_brackets_verbatim() {
 }
 
 /// Binance's CURRENT BTCUSDT table — 12 brackets, 150x first — loads exactly as Binance returned it
-/// and reads back as Binance's own `leverageBracket`: every row's `cum` is the one Binance sent with
-/// it. 150x is `MAX_LEVERAGE_HARD_CAP`, so it is `setLeverage`'s cap on that market; 151 is refused
-/// both as a tier and as a leverage, with zero writes.
+/// and reads back as Binance's own `leverageBracket`: every row's `cum` and `notionalCap` are the
+/// ones Binance sent with it, the last a finite $1.8B. 150x is `MAX_LEVERAGE_HARD_CAP`, so it is
+/// `setLeverage`'s cap on that market; 151 is refused both as a tier and as a leverage, with zero
+/// writes.
 #[test]
 fn binances_live_btcusdt_table_loads_verbatim_at_150x() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
-    install_rows(&mut ctx, &BTCUSDT_LIVE).unwrap();
+    install_rows(&mut ctx, &BTCUSDT_LIVE, BTCUSDT_LIVE_CAP).unwrap();
 
     let got = get_margin_tiers_full(&mut ctx, MARKET_ID);
     assert_eq!(
@@ -3066,6 +3105,9 @@ fn binances_live_btcusdt_table_loads_verbatim_at_150x() {
         BTCUSDT_LIVE_CUM.map(|c| c * USD).to_vec(),
         "the cum column Binance returned"
     );
+    let mut caps: Vec<u64> = BTCUSDT_LIVE[1..].iter().map(|r| r.0 * USD).collect();
+    caps.push(BTCUSDT_LIVE_CAP * USD);
+    assert_eq!(got.notionalCaps, caps, "the notionalCap column Binance returned");
 
     set_leverage(&mut ctx, 150).unwrap();
     let err = set_leverage(&mut ctx, 151).unwrap_err();
@@ -3077,7 +3119,7 @@ fn binances_live_btcusdt_table_loads_verbatim_at_150x() {
     let before = get_margin_tiers_columns(&mut ctx, MARKET_ID);
     let mut over = BTCUSDT_LIVE;
     over[0].1 = 151;
-    let err = install_rows(&mut ctx, &over).unwrap_err();
+    let err = install_rows(&mut ctx, &over, BTCUSDT_LIVE_CAP).unwrap_err();
     assert!(
         err.to_string().contains("maxLeverage must be 1–150"),
         "{err}"
@@ -3421,6 +3463,165 @@ fn per_open_tier_guard_rejects_the_maker_leg_too() {
 
     assert_eq!(position(&mut ctx, MAKER).amount, 0, "maker fill refused");
     assert_eq!(position(&mut ctx, ALICE).amount, 0, "nothing matched");
+}
+
+// ── The terminal notionalCap (Binance's last-bracket `notionalCap`) ───────────
+
+/// `{0, 3x}` capped at `cap` — the default table with a maximum position.
+fn install_capped_default(ctx: &mut TestCtx, cap: u64) {
+    set_margin_tiers_capped(ctx, ADMIN, MARKET_ID, &[0], &[3], &[0], cap).unwrap();
+}
+
+/// An OPEN that leaves `|notional| >= notionalCap` is refused (`-2027`), at any leverage, pre-write;
+/// one quote unit more of cap and the same open is accepted — the cap is exclusive, like every
+/// tier's upper edge.
+#[test]
+fn notional_cap_refuses_an_opening_taker_at_the_cap() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    // MAKER is already long 2, so his resting sell REDUCES and only ALICE's leg is gated.
+    seed_position_account(
+        &mut ctx,
+        MAKER,
+        2,
+        -200_000_000,
+        200_000_000,
+        1,
+        MAKER_WALLET as i64,
+    );
+    // qty 2 at $100: a 200_000_000 notional, at 1x — the most conservative leverage there is.
+    stage_open_into_tier(&mut ctx, 1, 2);
+    install_capped_default(&mut ctx, 200_000_000);
+
+    let err = try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("placeOrder: -2027 position exceeds the market's maximum notional"),
+        "{err}"
+    );
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    assert_eq!(position(&mut ctx, MAKER).amount, 2, "the maker's ask is untouched");
+
+    install_capped_default(&mut ctx, 200_000_001);
+    try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap();
+    assert_eq!(position(&mut ctx, ALICE).amount, 2);
+    assert_eq!(position(&mut ctx, MAKER).amount, 0);
+}
+
+/// The maker leg: a resting order whose fill would take the maker to the cap is cancelled instead
+/// of filled — the same route as a tier refusal.
+#[test]
+fn notional_cap_refuses_the_maker_leg_too() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    storage::save_account(
+        &mut ctx,
+        ALICE,
+        UserAccount {
+            perp_wallet_balance: 2_000_000_000,
+            ..UserAccount::default()
+        },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+    place_order(&mut ctx, MAKER, Side::Sell as u8, ENTRY_PRICE, 2);
+    install_capped_default(&mut ctx, 150_000_000);
+
+    try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap();
+
+    assert_eq!(position(&mut ctx, MAKER).amount, 0, "maker fill refused");
+    assert_eq!(position(&mut ctx, ALICE).amount, 0, "nothing matched");
+    assert!(
+        storage::load_sell_orders(&mut ctx, MAKER, MARKET_ID)
+            .unwrap()
+            .is_empty(),
+        "the refused maker order is cancelled"
+    );
+}
+
+/// A position already past the cap (here: the cap lowered under it) may still REDUCE — closing is
+/// never refused — but `setLeverage` on it is `-2027`: no leverage admits that size.
+#[test]
+fn notional_cap_never_blocks_a_reduce_and_refuses_set_leverage_past_it() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    stage_open_into_tier(&mut ctx, 1, 2);
+    try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap();
+    assert_eq!(position(&mut ctx, ALICE).amount, 2);
+    install_capped_default(&mut ctx, 100_000_000);
+
+    let err = set_leverage(&mut ctx, 1).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("setLeverage: -2027 position exceeds the market's maximum notional"),
+        "{err}"
+    );
+    assert_eq!(position(&mut ctx, ALICE).leverage, 1, "refused: nothing written");
+
+    place_order(&mut ctx, MAKER, Side::Buy as u8, ENTRY_PRICE, 1);
+    try_place_order(&mut ctx, ALICE, Side::Sell as u8, ENTRY_PRICE, 1).unwrap();
+    assert_eq!(position(&mut ctx, ALICE).amount, 1, "the reduce went through");
+    // Now at exactly the cap: still no leverage admits it.
+    assert!(set_leverage(&mut ctx, 1).is_err());
+}
+
+/// The setter: a bounded cap must sit strictly above the last floor (refused otherwise, zero
+/// writes); `type(uint64).max` — what the getter reports for an unbounded band — is stored as `0`,
+/// so a table read back and written again is unchanged; the event carries the STORED cap and the
+/// getter reports it as the last `notionalCap`.
+#[test]
+fn set_margin_tiers_validates_stores_and_reports_the_notional_cap() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let bounds = [0, 1_000_000];
+    let before = get_margin_tiers_columns(&mut ctx, MARKET_ID);
+    for bad in [1_000_000, 999_999, 1] {
+        let err = set_margin_tiers_capped(&mut ctx, ADMIN, MARKET_ID, &bounds, &[3, 2], &[0, 0], bad)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("setMarginTiers: notionalCap must be above the last lowerBound"),
+            "cap {bad}: {err}"
+        );
+        assert_eq!(get_margin_tiers_columns(&mut ctx, MARKET_ID), before, "cap {bad} wrote");
+    }
+
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    let caps_of_events = |ctx: &mut TestCtx| -> Vec<u64> {
+        JournalTr::take_logs(ctx.journal_mut())
+            .into_iter()
+            .filter(|log| {
+                log.data.topics().first() == Some(&IPerpDex::MarginTiersUpdated::SIGNATURE_HASH)
+            })
+            .map(|log| {
+                IPerpDex::MarginTiersUpdated::decode_raw_log(log.data.topics(), &log.data.data)
+                    .unwrap()
+                    .notionalCap
+            })
+            .collect()
+    };
+
+    set_margin_tiers_capped(&mut ctx, ADMIN, MARKET_ID, &bounds, &[3, 2], &[0, 0], 1_000_001)
+        .unwrap();
+    assert_eq!(caps_of_events(&mut ctx), vec![1_000_001]);
+    assert_eq!(
+        get_margin_tiers_full(&mut ctx, MARKET_ID).notionalCaps,
+        vec![1_000_000, 1_000_001]
+    );
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    assert_eq!(market.tiers.notional_cap(), 1_000_001);
+
+    for unbounded in [0, u64::MAX] {
+        set_margin_tiers_capped(&mut ctx, ADMIN, MARKET_ID, &bounds, &[3, 2], &[0, 0], unbounded)
+            .unwrap();
+        assert_eq!(caps_of_events(&mut ctx), vec![0], "stored and published as 0");
+        let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+        assert_eq!(market.tiers.notional_cap(), 0);
+        assert_eq!(
+            get_margin_tiers_full(&mut ctx, MARKET_ID).notionalCaps,
+            vec![1_000_000, u64::MAX]
+        );
+    }
 }
 
 #[test]

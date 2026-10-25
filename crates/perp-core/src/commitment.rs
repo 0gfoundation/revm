@@ -352,6 +352,14 @@ use primitives::{B256, U256};
 //     previous build refuses a table with a tier above 100x that this one accepts), and through
 //     the table, of `setLeverage`'s cap on such a market. No layout change; the golden scenario
 //     installs no table: its pin does not move.
+//   * P0 review — the terminal `notionalCap` (Binance's last-bracket cap, its maximum position).
+//     `MarginTiers` gains `notional_cap` (0 = unbounded), carried as a FOURTH positional element of
+//     the table's LAST row and only when non-zero, so an uncapped table's blob is byte-identical.
+//     `setMarginTiers` takes it (selector moves again), `MarginTiersUpdated` carries it (topic0
+//     moves again). New execution rules, reachable only through a non-zero cap: an opening fill
+//     leaving `|notional| >= cap` is refused (taker revert `-2027`, maker order cancelled like a
+//     tier refusal), and `setLeverage` on a position that large is `-2027`. The golden scenario
+//     installs no table: its pin does not move.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

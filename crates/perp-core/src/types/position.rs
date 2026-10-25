@@ -374,7 +374,8 @@ pub struct MarginTier {
     pub maint_margin_rate_ppm: u32,
 }
 
-/// A market's margin-tier table: a FIXED inline array plus a live length.
+/// A market's margin-tier table: a FIXED inline array plus a live length, and the table's
+/// terminal `notionalCap`.
 ///
 /// Deliberately NOT a `Vec`: [`Market`] is otherwise all scalars, so its clone is a
 /// memcpy, and `validate_place_order` clones an owned `Market` on every `placeOrder`.
@@ -389,6 +390,14 @@ pub struct MarginTier {
 pub struct MarginTiers {
     tiers: [MarginTier; MAX_MARGIN_TIERS],
     len: u8,
+    /// Binance's `notionalCap` of the LAST bracket — the largest position the table admits at
+    /// ANY leverage (Binance refuses beyond it with `-2027`). Every other tier's cap is the next
+    /// tier's floor, so this is the one cap that is not derivable from the rows. **`0` means
+    /// UNBOUNDED** (the last band runs to infinity), which every table had before this existed.
+    /// When set it is strictly above the last tier's `lower_bound_notional` (`setMarginTiers`
+    /// checks it). On the wire it is a fourth element of the LAST row, present only when non-zero
+    /// (see the `Serialize` impl), so an uncapped table's blob is unchanged.
+    notional_cap: u64,
 }
 
 impl MarginTiers {
@@ -411,8 +420,15 @@ impl MarginTiers {
         false
     }
 
-    /// Build a table from an already-VALIDATED slice. Returns `None` when the slice is
-    /// empty or longer than [`MAX_MARGIN_TIERS`]; the ordering/leverage invariants are
+    /// The last bracket's `notionalCap`: the largest `|notional|` the table admits at any
+    /// leverage, exclusive. **`0` = unbounded.**
+    #[inline]
+    pub fn notional_cap(&self) -> u64 {
+        self.notional_cap
+    }
+
+    /// Build a table from an already-VALIDATED slice, uncapped. Returns `None` when the slice
+    /// is empty or longer than [`MAX_MARGIN_TIERS`]; the ordering/leverage invariants are
     /// the caller's job (`run_set_margin_tiers` checks them, each with its own error).
     pub fn from_tiers(src: &[MarginTier]) -> Option<Self> {
         if src.is_empty() || src.len() > MAX_MARGIN_TIERS {
@@ -427,13 +443,22 @@ impl MarginTiers {
         Some(Self {
             tiers,
             len: src.len() as u8,
+            notional_cap: 0,
         })
+    }
+
+    /// The same table with its terminal [`notional_cap`](Self::notional_cap) set (`0` =
+    /// unbounded). Already-VALIDATED: `run_set_margin_tiers` checks a non-zero cap is above the
+    /// last tier's floor.
+    pub fn with_notional_cap(mut self, notional_cap: u64) -> Self {
+        self.notional_cap = notional_cap;
+        self
     }
 }
 
 impl Default for MarginTiers {
     /// One tier `{0, DEFAULT_MAX_LEVERAGE}` — maintenance rate `1/6`, the pre-tier
-    /// hardcoded behaviour.
+    /// hardcoded behaviour — and no cap.
     fn default() -> Self {
         Self::from_tiers(&[MarginTier {
             lower_bound_notional: 0,
@@ -444,25 +469,53 @@ impl Default for MarginTiers {
     }
 }
 
-/// Compares only the LIVE tiers — the padding beyond `len` is not state.
+/// Compares the LIVE tiers and the cap — the padding beyond `len` is not state.
 impl PartialEq for MarginTiers {
     fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
+        self.as_slice() == other.as_slice() && self.notional_cap == other.notional_cap
     }
 }
 
 /// Hand-rolled so the blob carries exactly `len` elements as a plain msgpack sequence
 /// (`[[lb, lev, mmr_ppm], ...]`) — never the fixed-array padding. That is what decouples the
 /// on-chain encoding from [`MAX_MARGIN_TIERS`].
+///
+/// A non-zero [`notional_cap`](MarginTiers::notional_cap) rides on the LAST row as a fourth,
+/// positional element (`[lb, lev, mmr_ppm, cap]`) — the append-only rule applied to that row, and
+/// where Binance itself puts it. A zero cap is not emitted at all, so an uncapped table encodes
+/// exactly as it did before the cap existed.
 impl Serialize for MarginTiers {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let live = self.as_slice();
+        let last = live.len() - 1;
         let mut seq = serializer.serialize_seq(Some(live.len()))?;
-        for tier in live {
-            seq.serialize_element(tier)?;
+        for (i, tier) in live.iter().enumerate() {
+            if i == last && self.notional_cap != 0 {
+                seq.serialize_element(&(
+                    tier.lower_bound_notional,
+                    tier.max_leverage,
+                    tier.maint_margin_rate_ppm,
+                    self.notional_cap,
+                ))?;
+            } else {
+                seq.serialize_element(tier)?;
+            }
         }
         seq.end()
     }
+}
+
+/// One row as the codec carries it: a [`MarginTier`] plus the optional trailing cap, every
+/// element after the first two defaulted (positional msgpack), so `[lb, lev]`, `[lb, lev, mmr]`
+/// and `[lb, lev, mmr, cap]` all decode.
+#[derive(Deserialize)]
+struct WireTier {
+    lower_bound_notional: u64,
+    max_leverage: u32,
+    #[serde(default)]
+    maint_margin_rate_ppm: u32,
+    #[serde(default)]
+    notional_cap: u64,
 }
 
 impl<'de> Deserialize<'de> for MarginTiers {
@@ -483,11 +536,24 @@ impl<'de> Deserialize<'de> for MarginTiers {
                     maint_margin_rate_ppm: 0,
                 }; MAX_MARGIN_TIERS];
                 let mut len = 0usize;
-                while let Some(tier) = seq.next_element::<MarginTier>()? {
+                let mut notional_cap = 0u64;
+                while let Some(row) = seq.next_element::<WireTier>()? {
                     if len == MAX_MARGIN_TIERS {
                         return Err(de::Error::custom("margin tiers: too many tiers"));
                     }
-                    tiers[len] = tier;
+                    // Only the LAST row may carry a cap: one followed by another row is not a
+                    // blob this codec writes.
+                    if notional_cap != 0 {
+                        return Err(de::Error::custom(
+                            "margin tiers: notionalCap on a non-final tier",
+                        ));
+                    }
+                    tiers[len] = MarginTier {
+                        lower_bound_notional: row.lower_bound_notional,
+                        max_leverage: row.max_leverage,
+                        maint_margin_rate_ppm: row.maint_margin_rate_ppm,
+                    };
+                    notional_cap = row.notional_cap;
                     len += 1;
                 }
                 // A corrupt/truncated blob must NOT yield an empty table: every reader
@@ -498,6 +564,7 @@ impl<'de> Deserialize<'de> for MarginTiers {
                 Ok(MarginTiers {
                     tiers,
                     len: len as u8,
+                    notional_cap,
                 })
             }
         }
@@ -841,5 +908,50 @@ mod tests {
         let bytes = crate::codec::encode(&m).unwrap();
         let back: Market = crate::codec::decode(&bytes).unwrap();
         assert_eq!(back, m);
+
+        // …and its terminal cap, which rides on the table's last row.
+        m.tiers = m.tiers.with_notional_cap(1_800_000);
+        let bytes = crate::codec::encode(&m).unwrap();
+        let back: Market = crate::codec::decode(&bytes).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.tiers.notional_cap(), 1_800_000);
+    }
+
+    /// The terminal `notionalCap` is a fourth positional element of the LAST row only, emitted only
+    /// when set: an uncapped table encodes byte for byte as a plain sequence of rows (so no blob
+    /// written before the cap existed changes), a capped one round-trips, and a cap on any other
+    /// row is not a blob this codec writes — refused.
+    #[test]
+    fn margin_tiers_carry_the_notional_cap_on_the_last_row_only() {
+        let rows = [tier(0, 150), tier(300_000, 100), tier(1_200_000, 1)];
+        let uncapped = MarginTiers::from_tiers(&rows).unwrap();
+        assert_eq!(uncapped.notional_cap(), 0, "a table is unbounded unless capped");
+        assert_eq!(
+            crate::codec::encode(&uncapped).unwrap(),
+            crate::codec::encode(&rows.to_vec()).unwrap(),
+            "an uncapped table is exactly its rows"
+        );
+
+        let capped = uncapped.with_notional_cap(1_800_000);
+        assert_ne!(capped, uncapped, "the cap is state");
+        let bytes = crate::codec::encode(&capped).unwrap();
+        let back: MarginTiers = crate::codec::decode(&bytes).unwrap();
+        assert_eq!(back, capped);
+        assert_eq!(back.notional_cap(), 1_800_000);
+        let wire: (MarginTier, MarginTier, (u64, u32, u32, u64)) =
+            crate::codec::decode(&bytes).unwrap();
+        assert_eq!(wire.0, rows[0]);
+        assert_eq!(wire.1, rows[1]);
+        assert_eq!(wire.2, (1_200_000, 1, 0, 1_800_000), "the cap is the last row's 4th element");
+
+        let misplaced = crate::codec::encode(&(
+            (0u64, 150u32, 0u32, 1_800_000u64),
+            (300_000u64, 100u32, 0u32),
+        ))
+        .unwrap();
+        assert!(
+            crate::codec::decode::<MarginTiers>(&misplaced).is_err(),
+            "a cap on a non-final row must be refused"
+        );
     }
 }

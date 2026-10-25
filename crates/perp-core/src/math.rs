@@ -492,8 +492,8 @@ pub fn effective_mmr_ppm(tier: &MarginTier) -> u32 {
 pub struct LeverageBracket {
     /// `notionalFloor`: the tier's `lower_bound_notional`.
     pub notional_floor: u64,
-    /// `notionalCap`: the NEXT tier's `lower_bound_notional`; `u64::MAX` for the last tier,
-    /// whose band is unbounded.
+    /// `notionalCap`: the NEXT tier's `lower_bound_notional`; for the last tier the table's
+    /// [`MarginTiers::notional_cap`], or `u64::MAX` when that is `0` (the band is unbounded).
     pub notional_cap: u64,
     /// `initialLeverage`: the tier's `max_leverage`.
     pub initial_leverage: u32,
@@ -530,9 +530,13 @@ pub fn leverage_brackets(tiers: &MarginTiers) -> Vec<LeverageBracket> {
         prev_mmr = mmr as i128;
         out.push(LeverageBracket {
             notional_floor: tier.lower_bound_notional,
-            notional_cap: table
-                .get(i + 1)
-                .map_or(u64::MAX, |next| next.lower_bound_notional),
+            notional_cap: table.get(i + 1).map_or(
+                match tiers.notional_cap() {
+                    0 => u64::MAX,
+                    cap => cap,
+                },
+                |next| next.lower_bound_notional,
+            ),
             initial_leverage: tier.max_leverage,
             maint_margin_rate_ppm: mmr,
             cum: (cum_ppm.max(0) / MMR_PPM_ONE as i128).min(u64::MAX as i128) as u64,
@@ -544,9 +548,18 @@ pub fn leverage_brackets(tiers: &MarginTiers) -> Vec<LeverageBracket> {
 /// Maximum leverage a market's tier table permits at `abs_notional` quote units: the
 /// `max_leverage` of the last tier whose `lower_bound_notional` the notional reaches.
 /// At notional 0 this is tier 0's `max_leverage` — the market's `setLeverage` cap.
+///
+/// **`0` at or above the table's [`MarginTiers::notional_cap`]**: no leverage admits a position
+/// that large — Binance's `-2027` at its last bracket's `notionalCap`. Every caller compares a
+/// leverage `>= 1` against this, so `0` refuses through the same comparison as any tier cap: the
+/// per-open guards (taker and maker) and `setLeverage`. An uncapped table (`0`) never returns it.
 #[inline]
 pub fn max_leverage_for_notional(tiers: &MarginTiers, abs_notional: i64) -> u32 {
     let n = (abs_notional as i128).max(0);
+    let cap = tiers.notional_cap();
+    if cap != 0 && n >= cap as i128 {
+        return 0;
+    }
     let table = tiers.as_slice();
     let mut lev = table[0].max_leverage;
     for tier in &table[1..] {
@@ -569,9 +582,10 @@ pub fn max_leverage_for_notional(tiers: &MarginTiers, abs_notional: i64) -> u32 
 /// consumer re-deriving it from `getMarginTiers` and drifting.
 ///
 /// `leverage` is admissible in tier `i` iff `table[i].max_leverage >= leverage`; the answer is the
-/// upper bound of the LAST such tier, i.e. `table[i+1].lower_bound_notional`, and `0` when tier `i`
-/// is the final tier (its band runs to infinity). `max_leverage` is non-increasing across the table,
-/// so the admissible tiers are a prefix and "the last one" is well defined.
+/// upper bound of the LAST such tier, i.e. `table[i+1].lower_bound_notional`, and when tier `i` is
+/// the final tier, the table's [`MarginTiers::notional_cap`] — `0` (unbounded) unless the table
+/// sets one. `max_leverage` is non-increasing across the table, so the admissible tiers are a
+/// prefix and "the last one" is well defined.
 ///
 /// # What is asserted, and the one state that breaks it
 ///
@@ -603,7 +617,7 @@ pub fn max_notional_for_leverage(tiers: &MarginTiers, leverage: u64) -> u64 {
     );
     table
         .get(last.unwrap_or(0) + 1)
-        .map_or(0, |t| t.lower_bound_notional)
+        .map_or(tiers.notional_cap(), |t| t.lower_bound_notional)
 }
 
 // ── Derived open-order initial margin (ooIM) ─────────────────────────────────────────────────
@@ -1959,6 +1973,59 @@ mod margin_tier_tests {
         }
     }
 
+    /// Binance BTCUSDT `leverageBracket` as `GET /fapi/v1/leverageBracket` returned it on
+    /// 2026-10-14 (internal-docs `misc/evidence/binance-run21-upnl.json`, request 11):
+    /// `(notionalFloor $, initialLeverage, maintMarginRatio ppm, cum $, notionalCap $)`, row for
+    /// row. Twelve brackets, 150x first, the 3x bracket's 15% confirmed, a FINITE last cap.
+    const BTCUSDT_LIVE: [(u64, u32, u32, u64, u64); 12] = [
+        (0, 150, 4_000, 0, 300_000),
+        (300_000, 100, 5_000, 300, 800_000),
+        (800_000, 75, 6_500, 1_500, 3_000_000),
+        (3_000_000, 50, 10_000, 12_000, 12_000_000),
+        (12_000_000, 25, 20_000, 132_000, 70_000_000),
+        (70_000_000, 20, 25_000, 482_000, 100_000_000),
+        (100_000_000, 10, 50_000, 2_982_000, 230_000_000),
+        (230_000_000, 5, 100_000, 14_482_000, 480_000_000),
+        (480_000_000, 4, 125_000, 26_482_000, 600_000_000),
+        (600_000_000, 3, 150_000, 41_482_000, 800_000_000),
+        (800_000_000, 2, 250_000, 121_482_000, 1_200_000_000),
+        (1_200_000_000, 1, 500_000, 421_482_000, 1_800_000_000),
+    ];
+
+    /// Binance's CURRENT BTCUSDT table, loaded with its last `notionalCap`, IS Binance's
+    /// `leverageBracket` response: every row's floor, leverage, rate, `cum` and `notionalCap`
+    /// (the last one the finite $1.8B), and it passes both validation predicates.
+    #[test]
+    fn binance_live_btcusdt_brackets_reproduce_the_response() {
+        let rows: Vec<(u64, u32, u32)> =
+            BTCUSDT_LIVE.iter().map(|&(f, l, r, _, _)| (f * USD, l, r)).collect();
+        let t = rated(&rows).with_notional_cap(1_800_000_000 * USD);
+        let b = leverage_brackets(&t);
+        assert_eq!(b.len(), 12);
+        for (i, (row, live)) in b.iter().zip(BTCUSDT_LIVE).enumerate() {
+            let (floor, lev, mmr, cum, cap) = live;
+            assert_eq!(
+                (
+                    row.notional_floor,
+                    row.initial_leverage,
+                    row.maint_margin_rate_ppm,
+                    row.cum,
+                    row.notional_cap
+                ),
+                (floor * USD, lev, mmr, cum * USD, cap * USD),
+                "bracket {}",
+                i + 1
+            );
+            assert!(tier_mmr_below_initial(&t.as_slice()[i]));
+            if i > 0 {
+                assert!(tier_mmr_not_above(&t.as_slice()[i - 1], &t.as_slice()[i]));
+            }
+        }
+        // getSymbolConfig's inverse at the extremes: 150x up to $300k, 1x up to the cap.
+        assert_eq!(max_notional_for_leverage(&t, 150), 300_000 * USD);
+        assert_eq!(max_notional_for_leverage(&t, 1), 1_800_000_000 * USD);
+    }
+
     /// Binance's `MM = N·MMR − cum` against the engine's slice form on the BTCUSDT table: EXACT at
     /// whole-dollar notionals in every bracket (hand values), and on random notionals the engine is
     /// never above the formula and below it by under one quote unit (only the partial slice is
@@ -2254,6 +2321,38 @@ mod margin_tier_tests {
         assert_eq!(max_notional_for_leverage(&t, 1), 0);
     }
 
+    /// A terminal `notionalCap` closes the last band: the forward lookup admits NO leverage at or
+    /// above it (`0`, Binance's `-2027`) and the last tier's below it, the inverse reports it for
+    /// every leverage the last tier admits instead of "unbounded", and `leverage_brackets` reports
+    /// it as the last row's `notionalCap`. Uncapped, all three are as before.
+    #[test]
+    fn a_notional_cap_closes_the_last_band() {
+        let open = table(&[(0, 3), (200_000_000, 2), (400_000_000, 1)]);
+        let t = open.with_notional_cap(900_000_000);
+        assert_eq!(max_leverage_for_notional(&t, 0), 3);
+        assert_eq!(max_leverage_for_notional(&t, 400_000_000), 1);
+        assert_eq!(max_leverage_for_notional(&t, 899_999_999), 1);
+        assert_eq!(max_leverage_for_notional(&t, 900_000_000), 0, "AT the cap");
+        assert_eq!(max_leverage_for_notional(&t, i64::MAX), 0);
+        assert_eq!(max_leverage_for_notional(&open, i64::MAX), 1, "uncapped: unchanged");
+
+        assert_eq!(max_notional_for_leverage(&t, 3), 200_000_000);
+        assert_eq!(max_notional_for_leverage(&t, 2), 400_000_000);
+        assert_eq!(max_notional_for_leverage(&t, 1), 900_000_000);
+        assert_eq!(max_notional_for_leverage(&open, 1), 0, "uncapped: unbounded");
+
+        let caps: Vec<u64> = leverage_brackets(&t).iter().map(|b| b.notional_cap).collect();
+        assert_eq!(caps, [200_000_000, 400_000_000, 900_000_000]);
+        let caps: Vec<u64> = leverage_brackets(&open).iter().map(|b| b.notional_cap).collect();
+        assert_eq!(caps, [200_000_000, 400_000_000, u64::MAX]);
+
+        // A single-tier table: the cap is tier 0's own upper edge.
+        let one = MarginTiers::default().with_notional_cap(5_000);
+        assert_eq!(max_leverage_for_notional(&one, 4_999), DEFAULT_MAX_LEVERAGE);
+        assert_eq!(max_leverage_for_notional(&one, 5_000), 0);
+        assert_eq!(max_notional_for_leverage(&one, 1), 5_000);
+    }
+
     /// The inversion agrees with the FORWARD lookup it inverts, which is the property that makes it
     /// safe for a consumer to stop re-deriving one from the other: at any notional strictly below
     /// the reported bound the forward lookup must still permit `leverage`, and AT the bound it must
@@ -2272,7 +2371,13 @@ mod margin_tier_tests {
                 lev = 1 + next(&mut s) as u32 % lev;
                 rows.push((bound, lev));
             }
-            let t = table(&rows);
+            // Half the tables carry a terminal `notionalCap` above the last floor.
+            let cap = if next(&mut s) % 2 == 0 {
+                bound + 1 + next(&mut s) % 1_000_000_000
+            } else {
+                0
+            };
+            let t = table(&rows).with_notional_cap(cap);
             // Only leverages `setLeverage` could actually have written — i.e. `<=` tier 0's cap,
             // the precondition `max_notional_for_leverage` asserts.
             for leverage in 1..=u64::from(rows[0].1) {
@@ -2280,6 +2385,7 @@ mod margin_tier_tests {
                 if max_notional == 0 {
                     // Unbounded: the forward lookup must permit `leverage` everywhere, including
                     // at the largest notional the table can be asked about.
+                    assert_eq!(cap, 0, "a capped table reported unbounded: {rows:?}");
                     assert!(
                         u64::from(max_leverage_for_notional(&t, i64::MAX)) >= leverage,
                         "unbounded at leverage {leverage} but the top tier refuses it: {rows:?}"
