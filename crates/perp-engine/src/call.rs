@@ -244,6 +244,12 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // `getAccount` + N × `getPositionRisk` (20_000 + 16 × 20_000 = 340_000 and ~64 loads) for an
         // answer this one call already holds — and, unlike the `1 + N` shape, holds CONSISTENTLY.
         // The 20_000 is asserted by `margin_view_tests::get_account`, so a silent drift fails.
+        //
+        // ⚠️ RE-EXAMINED AND LEFT AT 20_000 for cross P2. The walk is unchanged — the cross fold
+        // (`margin_view::CrossSums`) is accumulated from the SAME `{market, position}` pair per
+        // member, with no `FundingState` load (pending funding is priced off the `Market`'s mirror
+        // of the funding index) — and a CROSSED row's liquidation price is the same zero-load
+        // bisection with a different margin term. Two appended `int64`/`uint64` words.
         m.insert(getAccountCall::SELECTOR, (20_000, true));
         // 30_000 → 80_000 for the sub-account push-down: a master's rates are also written to each
         // of its ≤ `MAX_SUB_ACCOUNTS` = 10 subs. Each extra write is one account load plus an
@@ -397,6 +403,13 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // `Market` this call read, and ~64 more for its domain bound. That is orders of magnitude
         // below one storage load. Pricing the superset above the call it supersedes would have
         // taxed the only remaining single-market accessor. FLAT, per selector.
+        //
+        // Cross P2: a row for an OPEN position CROSSED in force is a function of the whole cross
+        // account (its liquidation price depends on the cross wallet and every other cross leg),
+        // so that row also walks the user's market index — ≤ MAX_USER_MARKETS × {market, position}
+        // = ≤ 33 `_ref` loads, exactly `getAccount`'s walk, which this tier already prices at
+        // 20_000. Every other row (ISOLATED, or flat) keeps its two loads; while cross margin is
+        // gated off no row walks.
         m.insert(getPositionRiskCall::SELECTOR, (20_000, true));
         m.insert(getAccountMarginCall::SELECTOR, (50_000, true));
         // +10_000 each for the single `AccountBalanceChanged` snapshot they emit (see "Account").

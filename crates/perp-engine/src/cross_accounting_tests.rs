@@ -16,7 +16,10 @@ use primitives::{address, hardfork::SpecId, Address, FixedBytes, U256};
 
 use crate::{
     host::PerpHost,
-    interface::IPerpDex::{placeOrderCall, updateIndexPriceCall},
+    interface::IPerpDex::{
+        getAccountCall, getAccountMarginCall, getAccountMarginReturn, getAccountReturn,
+        getPositionRiskCall, placeOrderCall, updateIndexPriceCall, AccountPosition,
+    },
     run_perp_dex_call, storage,
     types::{
         AccountUpdateReason, FundingState, MarginTiers, MarginType, Market, PerpPosition,
@@ -788,4 +791,160 @@ fn the_overrides_price_a_hypothetical_post_state() {
     assert_eq!(got, model(&[held, entering], &markets, 1_000 * USD));
 
     assert_eq!(fold(&mut ctx, ALICE), stored, "pricing a hypothetical wrote nothing");
+}
+
+// ── The read surfaces: getAccount, the rows, getPositionRisk ─────────────────
+
+/// A static view call through the full shell; returns the output and asserts the flat gas.
+fn view(ctx: &mut TestCtx, input: &[u8], gas: u64) -> PerpOutput {
+    let out = run_perp_dex_call(input, 1_000_000, ADMIN, U256::ZERO, true, ctx).unwrap();
+    assert!(!out.reverted, "view reverted: {:?}", alloy_sol_types::Revert::abi_decode(&out.bytes));
+    assert_eq!(out.gas_used, gas, "flat per-selector gas");
+    out
+}
+
+fn get_account(ctx: &mut TestCtx, user: Address) -> getAccountReturn {
+    let out = view(ctx, &getAccountCall { user }.abi_encode(), 20_000);
+    getAccountCall::abi_decode_returns(&out.bytes).unwrap()
+}
+
+fn position_risk(ctx: &mut TestCtx, user: Address, market: u64) -> AccountPosition {
+    let out = view(ctx, &getPositionRiskCall { user, marketId: market }.abi_encode(), 20_000);
+    getPositionRiskCall::abi_decode_returns(&out.bytes).unwrap()
+}
+
+fn account_margin(ctx: &mut TestCtx, user: Address, ids: &[u64]) -> getAccountMarginReturn {
+    let input = getAccountMarginCall { user, marketIds: ids.to_vec() }.abi_encode();
+    getAccountMarginCall::abi_decode_returns(&view(ctx, &input, 50_000).bytes).unwrap()
+}
+
+/// Whether the account is below cross maintenance with `market`'s mark at `mark` — the stored mark
+/// is moved for the question and put back, so this is the cross condition itself, evaluated by the
+/// fold, independently of the liquidation-price search.
+fn liquidatable_at(ctx: &mut TestCtx, user: Address, market: u64, mark: u64) -> bool {
+    let stored = storage::load_mark_price(ctx, market).unwrap();
+    storage::save_mark_price(ctx, market, mark).unwrap();
+    let f = crate::margin_view::cross_fold(ctx, user, None, None, None).unwrap();
+    storage::save_mark_price(ctx, market, stored).unwrap();
+    f.below_cross_maintenance()
+}
+
+/// `getAccount` on the mixed account reports the cross quantities — `totalCrossWalletBalance =
+/// cWB`, `availableBalance = A`, `maxWithdrawAmount = X`, `totalCrossUnPnl`, and the two appended
+/// fields `crossMarginBalance = E` and `totalCrossMaintMargin` — every one equal to the independent
+/// model; the gross identities still hold over the rows; `getAccountMargin` over the same set keeps
+/// its own documented `crossMarginBalance`; CROSSED rows carry no isolated margin and the CROSS
+/// liquidation price, which is the exact flip point of the account condition; and
+/// `getPositionRisk` reports every row field for field.
+#[test]
+fn get_account_reports_the_cross_quantities() {
+    let mut ctx = make_ctx();
+    storage::save_market(&mut ctx, &market(M3)).unwrap();
+    let _cross = crate::margin_type::test_gate::enable();
+    let (legs, markets) = mixed_account(&mut ctx);
+    set_wallet(&mut ctx, ALICE, 5_000 * USD);
+    let want = model(&legs, &markets, 5_000 * USD);
+
+    let a = get_account(&mut ctx, ALICE);
+    assert_eq!(a.totalCrossWalletBalance as i128, want.cwb);
+    assert_eq!(a.availableBalance as i128, want.a);
+    assert_eq!(a.maxWithdrawAmount as i128, want.x);
+    assert_eq!(a.totalCrossUnPnl as i128, want.cross_upnl);
+    assert_eq!(a.crossMarginBalance as i128, want.e);
+    assert_eq!(a.totalCrossMaintMargin as i128, want.cross_mm);
+    assert_eq!(a.totalOpenOrderInitialMargin as i128, want.oo_im_all);
+    // Gross: the cross wallet plus the one silo; equity adds EVERY position's PnL.
+    let rows = &a.positions;
+    assert_eq!(rows.iter().map(|r| r.marketId).collect::<Vec<_>>(), vec![M1, M2, M3]);
+    let silos: i64 = rows.iter().map(|r| r.isolatedWallet).sum();
+    assert_eq!(silos, 200 * USD);
+    assert_eq!(a.totalWalletBalance, a.totalCrossWalletBalance + silos);
+    assert_eq!(a.totalMarginBalance, a.totalWalletBalance + a.totalUnrealizedProfit);
+    assert_eq!(
+        a.totalCrossUnPnl,
+        rows.iter().filter(|r| r.marginType == 0).map(|r| r.unrealizedProfit).sum::<i64>()
+    );
+    assert_eq!(
+        a.totalCrossMaintMargin,
+        rows.iter().filter(|r| r.marginType == 0).map(|r| r.maintMargin).sum::<u64>()
+    );
+    // getAccountMargin over the same set: same A, cWB; its crossMarginBalance keeps its definition.
+    let am = account_margin(&mut ctx, ALICE, &[M1, M2, M3]);
+    assert_eq!(
+        (am.availableBalance, am.totalCrossWalletBalance),
+        (a.availableBalance, a.totalCrossWalletBalance)
+    );
+    assert_eq!(am.crossMarginBalance, a.totalCrossWalletBalance + a.totalUnrealizedProfit);
+    assert_ne!(am.crossMarginBalance, a.crossMarginBalance, "different definitions, isolated PnL");
+
+    assert!(rows.iter().any(|r| r.marginType == 0 && r.liquidationPrice != 0));
+    for row in rows {
+        let input = getPositionRiskCall { user: ALICE, marketId: row.marketId }.abi_encode();
+        let single = view(&mut ctx, &input, 20_000);
+        assert_eq!(
+            single.bytes.to_vec(),
+            getPositionRiskCall::abi_encode_returns(row),
+            "getPositionRisk vs getAccount row, market {}",
+            row.marketId
+        );
+        if row.marginType == 0 {
+            assert_eq!((row.isolatedWallet, row.isolatedMargin), (0, 0), "no silo on a cross row");
+            let lp = row.liquidationPrice;
+            if lp == 0 {
+                // No price liquidates the account through this leg: for this long the wallet
+                // carries it all the way down.
+                assert!(row.positionAmt > 0 && !liquidatable_at(&mut ctx, ALICE, row.marketId, 1));
+            } else if row.positionAmt > 0 {
+                assert!(liquidatable_at(&mut ctx, ALICE, row.marketId, lp));
+                assert!(!liquidatable_at(&mut ctx, ALICE, row.marketId, lp + 1));
+            } else {
+                assert!(liquidatable_at(&mut ctx, ALICE, row.marketId, lp));
+                assert!(!liquidatable_at(&mut ctx, ALICE, row.marketId, lp - 1));
+            }
+        } else {
+            // The isolated row is the isolated row: its own silo and its own price.
+            assert_eq!(row.isolatedWallet, 200 * USD);
+            assert_eq!(row.isolatedMargin, row.isolatedWallet + row.unrealizedProfit);
+            let m = storage::load_market_ref(&mut ctx, row.marketId).unwrap().unwrap();
+            let iso_lp = crate::math::calc_liquidation_price(
+                &m.tiers,
+                row.positionAmt,
+                row.vQuoteBalance,
+                row.isolatedWallet,
+                0,
+                2,
+            )
+            .unwrap();
+            assert_eq!(row.liquidationPrice, iso_lp);
+        }
+    }
+}
+
+/// The cross liquidation price is an ACCOUNT number: moving another cross market's mark, the
+/// wallet, or another leg's pending funding moves it, with this market untouched.
+#[test]
+fn the_cross_liquidation_price_moves_with_the_rest_of_the_account() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_market(&mut ctx, M1, 10_000, &[(0, 3, 0)]);
+    set_market(&mut ctx, M2, 10_000, &[(0, 3, 0)]);
+    plant_leg(&mut ctx, ALICE, &Leg::new(M1, 10, 10_000, 3, true, 0));
+    plant_leg(&mut ctx, ALICE, &Leg::new(M2, -10, 10_000, 3, true, 0));
+    set_wallet(&mut ctx, ALICE, 300 * USD);
+    let lp = |ctx: &mut TestCtx| position_risk(ctx, ALICE, M1).liquidationPrice;
+    let base = lp(&mut ctx);
+    // The hedge loses as M2 rises: the long's liquidation price rises with it.
+    storage::save_mark_price(&mut ctx, M2, 10_500).unwrap();
+    let hedged_loss = lp(&mut ctx);
+    assert!(hedged_loss > base, "{hedged_loss} vs {base}");
+    storage::save_mark_price(&mut ctx, M2, 10_000).unwrap();
+    // More wallet: lower.
+    set_wallet(&mut ctx, ALICE, 600 * USD);
+    assert!(lp(&mut ctx) < base);
+    set_wallet(&mut ctx, ALICE, 300 * USD);
+    // The short pays $10 of pending funding (index −1% of $100 per contract): higher.
+    set_funding_index(&mut ctx, M2, -10_000 * 10_000);
+    assert!(lp(&mut ctx) > base);
+    // …and getAccount agrees with getPositionRisk throughout.
+    assert_eq!(get_account(&mut ctx, ALICE).positions[0].liquidationPrice, lp(&mut ctx));
 }

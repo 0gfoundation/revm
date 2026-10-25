@@ -150,7 +150,10 @@ sol! {
         ///   isolatedMargin        `isolatedWallet + unrealizedProfit`, where `isolatedWallet` is
         ///                         the field two below. This is position EQUITY at mark, not a
         ///                         balance: it may sit below `isolatedWallet`, and it may go
-        ///                         negative.
+        ///                         negative. **`0` on a CROSSED row** (cross P2, `marginType == 0`):
+        ///                         a cross position has no equity of its own — its equity is the
+        ///                         account's `crossMarginBalance` (`getAccount`) — exactly as
+        ///                         Binance's V3 cross rows report it.
         ///   positionInitialMargin `ROUND_UP(notional / leverage)` — ROUND_UP, not truncate.
         ///   initialMargin         `ROUND_UP( max(|N + Bid|, |N − Ask|) / leverage )` — the
         ///                         JOINT requirement over position AND resting orders, a genuine
@@ -183,6 +186,10 @@ sol! {
         ///                         is subtracted arithmetically at the admission gate.
         ///                         WAS named `positionMargin` (ours) until it took Binance's name;
         ///                         bindings generated before that are looking for the old one.
+        ///                         **Always `0` on a CROSSED row** (cross P2): a cross position
+        ///                         holds no silo — its collateral is the cross wallet, its initial
+        ///                         margin is derived into `availableBalance`, and its funding and
+        ///                         PnL settle against `totalCrossWalletBalance`.
         ///   liquidationPrice      the mark price at which this position **IS** liquidatable — for a
         ///                         LONG the GREATEST such price, for a SHORT the LEAST.
         ///                         **Conservative by construction: at this price liquidation
@@ -195,6 +202,17 @@ sol! {
         ///                         notional cannot outgrow its funding anywhere in the representable
         ///                         price range. `0` is the ABSENCE of a price, not a price of zero;
         ///                         `positionAmt` in the same row separates the flat case.
+        ///                         **On a CROSSED row (cross P2) it is the CROSS liquidation
+        ///                         price**: the mark of THIS market at which the whole cross account
+        ///                         becomes liquidatable (`crossMarginBalance < totalCrossMaintMargin`),
+        ///                         every other cross position held at its own current mark —
+        ///                         Binance's `LP1` with `WB = totalCrossWalletBalance`,
+        ///                         `TMM1`/`UPNL1` = the other cross positions' maintenance margin and
+        ///                         unrealised PnL. Same search (`margin_view::cross_liquidation_price`
+        ///                         hands `calc_liquidation_price` the account's other terms as the
+        ///                         position's margin), same conservative rounding, same `0`s. It
+        ///                         therefore MOVES when any other cross position's mark, the cross
+        ///                         wallet or a pending funding amount moves, not only this market's.
         ///                         ⚠️ IT IS A SEARCH, NOT A FORMULA, AND THAT IS DELIBERATE.
         ///                         `math::calc_liquidation_price` bisects
         ///                         `math::is_above_maintenance_margin` — the predicate `liquidate()`
@@ -250,6 +268,10 @@ sol! {
         ///                         word longer. Inside `getAccount().positions[]` the row STRIDE
         ///                         grows, so a binding generated before it mis-decodes every row
         ///                         after the first — regenerate.
+        ///
+        /// A CROSSED row (cross P2) differs from an ISOLATED one in exactly three fields —
+        /// `isolatedMargin = isolatedWallet = 0` and `liquidationPrice` is the cross one, see each;
+        /// everything else is a property of the position alone and is computed identically.
         ///
         /// A user with no position and no orders reads back all zeros with `leverage = 1` and
         /// `marginType = 1`. Both selectors REVERT if the market does not exist — the decimals and
@@ -318,8 +340,14 @@ sol! {
         ///                               rewritten on every order rest and cancel; `Σ pos.margin`
         ///                               does not move on either.)
         ///   totalCrossWalletBalance     Binance `totalCrossWalletBalance` — our stored
-        ///                               `perpWalletBalance`, verbatim and signed. Position margin
-        ///                               has physically left it; the open-order requirement has not.
+        ///                               `perpWalletBalance`, signed, PLUS the funding every
+        ///                               CROSSED position has accrued and not yet settled (cross P2:
+        ///                               funding settles lazily, so the stored wallet lags Binance's
+        ///                               instant settlement by exactly that; this field does not).
+        ///                               With no cross position it is the stored wallet verbatim —
+        ///                               the number `AccountBalanceChanged` carries, which reports
+        ///                               the settled ledger. Isolated position margin has physically
+        ///                               left it; the open-order requirement has not.
         ///   totalMarginBalance          Binance `totalMarginBalance` =
         ///                               `totalWalletBalance + totalUnrealizedProfit`. Total account
         ///                               EQUITY. GROSS-based, so it is NOT
@@ -329,11 +357,17 @@ sol! {
         ///   totalPositionInitialMargin  Σ `positionInitialMargin`.
         ///   totalOpenOrderInitialMargin Σ `openOrderInitialMargin`. Escrowed NOWHERE — derived.
         ///   totalMaintMargin            Σ `maintMargin`. Below it, positions are liquidatable.
-        ///   availableBalance            `totalCrossWalletBalance − totalOpenOrderInitialMargin`,
-        ///                               signed and UNCLAMPED. The exact quantity every admission
-        ///                               gate enforces (`derived_available_balance`), so it is the
-        ///                               real headroom, not a parallel reporting number. CROSS-based
-        ///                               on purpose: the silos are already out of the cross wallet.
+        ///   availableBalance            Binance `availableBalance` = `totalCrossWalletBalance +
+        ///                               Σ_cross (unrealizedProfit − positionInitialMargin) −
+        ///                               totalOpenOrderInitialMargin` (cross P2: cross unrealised
+        ///                               profit COUNTS toward opening, cross positions' initial
+        ///                               margin is charged here instead of being moved into a silo),
+        ///                               i.e. `totalCrossWalletBalance − totalOpenOrderInitialMargin`
+        ///                               for an account with no CROSSED position. Signed and
+        ///                               UNCLAMPED. The exact quantity every admission gate enforces
+        ///                               (`derived_available_balance`), so it is the real headroom,
+        ///                               not a parallel reporting number. CROSS-based on purpose:
+        ///                               the silos are already out of the cross wallet.
         ///                               A negative value is not by itself distress — a mark move
         ///                               alone reaches it, and resting orders are not torn down for
         ///                               it — but new risk-INCREASING actions are refused until it
@@ -357,6 +391,22 @@ sol! {
         ///                               caller that only wants the ids can still take it from here.
         ///                               Bindings generated before this are looking for the old
         ///                               name and will not find it.
+        ///   crossMarginBalance          `totalCrossWalletBalance + totalCrossUnPnl` — the CROSS
+        ///                               margin balance `E`, the left side of the account's cross
+        ///                               liquidation condition. Equals `totalCrossWalletBalance` for
+        ///                               an account with no CROSSED position. NOTE `getAccountMargin`
+        ///                               has a field of the same name with a DIFFERENT, older
+        ///                               definition (`totalCrossWalletBalance + totalUnrealizedProfit`,
+        ///                               isolated PnL included); the two agree only when every
+        ///                               position is CROSSED. Prefer this one.
+        ///                               ⚠️ ABI CHANGE (cross P2): APPENDED after `positions`, so the
+        ///                               return's head grows by one word — regenerate the binding.
+        ///   totalCrossMaintMargin       Σ `maintMargin` over the CROSSED positions. The account is
+        ///                               liquidatable (cross liquidation, P3) when
+        ///                               `crossMarginBalance < totalCrossMaintMargin`; `0` with no
+        ///                               CROSSED position.
+        ///                               ⚠️ ABI CHANGE (cross P2): APPENDED after
+        ///                               `crossMarginBalance`.
         ///
         /// ⚠️ WHY THE ROWS ARE IN HERE AND NOT FETCHED PER MARKET: **`1 + N` READS CANNOT BE MADE
         /// CONSISTENT.** `getAccount` for the totals followed by one per-market row call per id was the
@@ -387,28 +437,35 @@ sol! {
         /// Binance-shaped `/account` fills those three in itself, from the row, a constant and its
         /// own market table.
         ///
-        /// ⚠️ `totalCrossUnPnl` AND `maxWithdrawAmount` ARE PRESENT BUT DEGENERATE. Read this before
-        /// using either — both were once deliberately omitted, and one of those reasons still bites.
+        /// ⚠️ `totalCrossUnPnl` AND `maxWithdrawAmount`: real since cross P2, but DEGENERATE for an
+        /// account with no CROSSED position (every account while cross margin is gated off). Read
+        /// this before using either — both were once deliberately omitted, and one of those reasons
+        /// still bites.
         ///
-        /// They are here for RESPONSE-SHAPE COMPATIBILITY: a client written against Binance's
+        /// They were added for RESPONSE-SHAPE COMPATIBILITY: a client written against Binance's
         /// account payload can bind to this selector without a special case. That was an explicit
         /// product decision, taken knowing the objections below.
         ///
-        /// * `totalCrossUnPnl` — Binance's `Σ uPnL` over the account's CROSSED positions. ZERO
-        ///   while cross margin is not enabled (`types::CROSS_MARGIN_ENABLED`, off through the
-        ///   cross series' P1–P2 and most of P3): every position is ISOLATED in force, so there is
-        ///   no cross position to sum and all unrealised PnL is in `totalUnrealizedProfit`. It is
-        ///   **NOT a constant** — cross accounting (P2) makes it the real sum, which is non-zero
-        ///   once the gate flips. Bind to it like Binance's field and keep the cross-vs-isolated
-        ///   split; do not hardcode `0`.
+        /// * `totalCrossUnPnl` — Binance's `Σ uPnL` over the account's CROSSED positions — the
+        ///   real sum since cross P2 (`Σ positions[i].unrealizedProfit` over the rows with
+        ///   `marginType == 0`; a row whose mark is `0` contributes `0`). It is still ZERO while
+        ///   cross margin is not enabled (`types::CROSS_MARGIN_ENABLED`, off through the cross
+        ///   series' P1–P2 and most of P3): every position is ISOLATED in force, so there is no
+        ///   cross position to sum and all unrealised PnL is in `totalUnrealizedProfit`. It is
+        ///   **NOT a constant** — it is non-zero for any account holding a CROSSED position once
+        ///   the gate flips. Bind to it like Binance's field and keep the cross-vs-isolated split;
+        ///   do not hardcode `0`.
         ///   NAME: this was `crossUnPnl` until the rename below. Binance has BOTH spellings and
         ///   they live at different levels — `crossUnPnl` on an `assets[]` ROW, `totalCrossUnPnl`
         ///   as the ACCOUNT-LEVEL scalar. This is the account-level one, so the per-asset spelling
         ///   was simply wrong. Same class of error as the `walletBalance` collision in §7.1.2.
-        /// * `maxWithdrawAmount` — `max(0, availableBalance)`, i.e. the most that
-        ///   `transferFromPerp` will let out of the PERP wallet right now. (Cross P2 makes it
-        ///   Binance's `max(0, min(crossWallet − ΣisoOpenOrderIM − ΣcrossMM, availableBalance))`,
-        ///   which is this same number for an account with no CROSSED position.)
+        /// * `maxWithdrawAmount` — Binance's
+        ///   `max(0, min(totalCrossWalletBalance − Σ isolated openOrderInitialMargin −
+        ///   totalCrossMaintMargin, availableBalance))` (cross P2): cross unrealised PROFIT does not
+        ///   withdraw (only the wallet term and `availableBalance` bound it, and `availableBalance`
+        ///   already nets cross losses), and the cross positions' maintenance margin stays behind.
+        ///   For an account with no CROSSED position it is `max(0, availableBalance)`, i.e. the most
+        ///   that `transferFromPerp` lets out of the PERP wallet right now.
         ///   ⚠️ **THE NAME IS WRONG FOR OUR TWO-LAYER MODEL AND WE KEPT IT ANYWAY.** `withdraw()`
         ///   gates on `usdcBalance` — the SPOT layer — not on this number. So "max withdraw" here
         ///   does NOT tell you how much you can withdraw from the protocol; it tells you how much
@@ -420,14 +477,17 @@ sol! {
         ///   under-covered account), but "you may withdraw a negative amount" is meaningless, so
         ///   this field floors at zero. **The un-clamped truth stays visible in
         ///   `availableBalance` right next to it** — that is why clamping here costs no
-        ///   information, and why it must NOT be done to `availableBalance` itself.
+        ///   information, and why it must NOT be done to `availableBalance` itself. (The
+        ///   money-out gates themselves still enforce `availableBalance`; moving them onto this
+        ///   number for CROSSED accounts is a later cross-P2 step.)
         ///
         /// One earlier objection has dissolved and is recorded so it is not re-raised: the docs
         /// note `maxWithdrawAmount == availableBalance` on Binance as an OBSERVATION over 69
         /// readings rather than a published formula, so mirroring it would have been presenting an
         /// extrapolation as a rule. That applies to predicting *Binance*. Here we are not
-        /// predicting anything — we DEFINE the field as `max(0, availableBalance)`, so there is no
-        /// extrapolation left in it.
+        /// predicting anything — the field is DEFINED by the published formula above (its two-term
+        /// form, cross report §1.2), which for an isolated-only account is `max(0,
+        /// availableBalance)`, so there is no extrapolation left in it.
         ///
         /// ⚠️ PORTING PITFALLS FROM §7 THAT WE DO NOT REPRODUCE.
         ///
@@ -475,7 +535,9 @@ sol! {
             int64    availableBalance,
             int64    totalCrossUnPnl,
             uint64   maxWithdrawAmount,
-            AccountPosition[] positions
+            AccountPosition[] positions,
+            int64    crossMarginBalance,
+            uint64   totalCrossMaintMargin
         );
         /// Set per-user trading fee rates in PARTS PER MILLION of notional (1 ppm = 0.0001%;
         /// 1 bp = 100 ppm). Only callable by admin.
@@ -1454,6 +1516,12 @@ sol! {
         /// tuple. A backend rendering SEVERAL markets should use neither — `getAccount().positions[]`
         /// carries this identical row for every market in ONE state, so this selector is for the
         /// genuinely single-market query.
+        ///
+        /// A CROSSED position's row (cross P2) is a function of the whole cross account — its
+        /// `liquidationPrice` depends on the cross wallet and every other cross position — so for
+        /// an OPEN cross position this call also walks the user's market index, the same walk
+        /// `getAccount` makes and priced at the same flat 20_000. An ISOLATED or flat row costs the
+        /// two loads it always did.
         function getPositionRisk(address user, uint64 marketId) external view returns (
             AccountPosition position
         );
@@ -1471,19 +1539,30 @@ sol! {
         /// market index, so a SHORT list under-counts `totalOpenOrderInitialMargin` here and
         /// therefore over-reports `availableBalance` relative to what the engine will enforce.
         ///
-        ///   totalCrossWalletBalance   the user's perp wallet, SIGNED and unclamped. Binance's
+        ///   totalCrossWalletBalance   the user's perp wallet, SIGNED and unclamped, plus the
+        ///                             unsettled funding of the CROSSED positions among the listed
+        ///                             markets (cross P2; see `getAccount`). Binance's
         ///                             `totalCrossWalletBalance` — see the ⚠️ below for why this is
         ///                             NOT Binance's `totalWalletBalance`, which it used to be
         ///                             misnamed after.
         ///   crossMarginBalance        `totalCrossWalletBalance + totalUnrealizedProfit`. NOT a
         ///                             Binance field, and NOT Binance's `totalMarginBalance` (that
         ///                             one is GROSS-based; `getAccount` returns it).
+        ///                             ⚠️ NOT `getAccount`'s `crossMarginBalance` either (cross P2):
+        ///                             that one is the cross margin balance `E`, which adds CROSSED
+        ///                             positions' unrealised PnL only. This field keeps its original
+        ///                             definition (every listed position's PnL), so it is unchanged
+        ///                             for an isolated-only account; the two agree when every listed
+        ///                             position is CROSSED.
         ///   totalInitialMargin        Σ `initialMargin`         (== the next two, summed).
         ///   totalPositionInitialMargin Σ `positionInitialMargin`.
         ///   totalOpenOrderInitialMargin Σ `openOrderInitialMargin`.
         ///   totalMaintMargin          Σ `maintMargin`.
         ///   totalUnrealizedProfit     Σ `unrealizedProfit`.
-        ///   availableBalance          `totalCrossWalletBalance − totalOpenOrderInitialMargin`.
+        ///   availableBalance          `totalCrossWalletBalance − totalOpenOrderInitialMargin`, plus
+        ///                             `Σ (unrealizedProfit − positionInitialMargin)` over the listed
+        ///                             CROSSED positions (cross P2) — `getAccount`'s formula over the
+        ///                             listed markets.
         ///
         /// `totalWalletBalance` is deliberately absent here: `Σ isolatedWallet` over a PARTIAL list
         /// under-counts the silos, so the gross wallet it implies would be a "total" that is not

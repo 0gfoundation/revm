@@ -1074,16 +1074,108 @@ pub fn run_get_position_risk<H: PerpHost>(
     if storage::load_market_ref(context, args.marketId)?.is_none() {
         return Err(perp_err("getPositionRisk: unknown market"));
     }
-    let row = AccountPositionRow {
+    let mut row = AccountPositionRow {
         market_id: args.marketId,
         info: compute_margin_info(context, args.user, args.marketId)?,
     };
+    // A position CROSSED in force is priced against the WHOLE cross account (cross P2): its
+    // liquidation price depends on the cross wallet and every other cross leg, so the row needs
+    // the account fold — the index walk `getAccount` makes, under the same flat 20_000 (see the
+    // gas note in `call`). Only an open cross position takes it: an ISOLATED row, or a flat one,
+    // is complete as computed and costs exactly the two loads it always did. While cross margin is
+    // gated off no row takes it.
+    let crossed = row.info.margin_type == crate::types::MarginType::Crossed.code();
+    if crossed && row.info.position_amt != 0 {
+        let fold = cross_fold_checked(context, args.user, None, None, None)?;
+        let market = storage::load_market_ref(context, args.marketId)?
+            .ok_or_else(|| perp_err("getPositionRisk: unknown market"))?;
+        apply_cross_row(&market, &mut row.info, &fold)?;
+    }
 
     // `sol!` collapses a single-struct return to the struct itself, so `getPositionRiskReturn` IS
     // `IPerpDex::AccountPosition` — there is not even a per-selector wrapper type left to fill.
     Ok(Bytes::from(getPositionRiskCall::abi_encode_returns(
         &row.to_abi(),
     )))
+}
+
+/// **The cross liquidation price** of one position CROSSED in force: the mark price of ITS market
+/// at which the whole cross account becomes liquidatable, every other cross leg held at its own
+/// stored mark — Binance's `LP1` (cross report §1.5, §3.2).
+///
+/// The account condition is `E < Σ_C MM` (strict). Solved for this market's mark `P` it reads
+///
+/// ```text
+/// N_k(P) + vQuote_k + [ cWB + Σ_{j≠k} (uPnL_j − MM_j) ]  <  MM_k(N_k(P))
+/// ```
+///
+/// which is [`crate::math::is_above_maintenance_margin`]'s predicate with the bracket as the
+/// position's margin — so [`crate::math::calc_liquidation_price`] BISECTS it as it does an isolated
+/// position's, tier crossings and the slice form included, and the reported price is the exact flip
+/// point of the cross condition, not a closed form of it. Algebraically it is Binance's
+/// `LP1 = (WB − TMM1 + UPNL1 + cumB − Side1·Pos1·EP1) / (Pos1·MMR_B − Side1·Pos1)` with
+/// `WB = cWB`, `TMM1 = Σ_{j≠k} MM_j`, `UPNL1 = Σ_{j≠k} uPnL_j`.
+///
+/// `cWB` already carries this leg's own pending funding (`PF_k` is in `Σ_C PF`), so the bracket
+/// adds nothing more for it. `leg` supplies this leg's own `uPnL_k` and `MM_k` as `fold` summed
+/// them; `fold` is the account's [`CrossFold`].
+///
+/// The same `0` conventions as the isolated search: flat ⇒ `0`; a long the account carries at
+/// every price ⇒ `0`.
+pub fn cross_liquidation_price(
+    market: &crate::types::Market,
+    amount: i64,
+    v_quote_balance: i64,
+    leg: &CrossLeg,
+    fold: &CrossFold,
+) -> Result<u64, PerpError> {
+    let others = (fold.cross_upnl - leg.upnl) - (fold.cross_mm - leg.mm);
+    let effective_margin = i64::try_from(fold.cwb + others)
+        .map_err(|_| perp_err("cross liquidation price: effective margin exceeds i64"))?;
+    crate::math::calc_liquidation_price(
+        &market.tiers,
+        amount,
+        v_quote_balance,
+        effective_margin,
+        market.base_decimals,
+        market.price_decimals,
+    )
+}
+
+/// Turns the row [`margin_info_of`] computed for a position CROSSED in force into its CROSS shape
+/// (cross P2, report §3.5 — Binance's V3 cross rows):
+///
+/// * `isolatedWallet = 0` — a cross position has no silo (`storage::save_position` asserts
+///   `pos.margin == 0`), and `isolatedMargin = 0` — there is no isolated equity, the position's
+///   equity is the account's;
+/// * `liquidationPrice` = [`cross_liquidation_price`] against `fold`.
+///
+/// Every other field — notional, uPnL, PIM, ooIM, IM, MM, entry, the inputs — is a property of the
+/// position alone and is the same number as for an isolated row. The row's own `uPnL_k` / `MM_k`
+/// for the price search are read off the row (`uPnL = 0` at a zero mark, as [`cross_leg`] counts
+/// it): the same functions the fold summed them with, which `row_cross_leg` checks in debug builds.
+fn apply_cross_row(
+    market: &crate::types::Market,
+    info: &mut MarginInfo,
+    fold: &CrossFold,
+) -> Result<(), PerpError> {
+    debug_assert_eq!(info.margin_type, crate::types::MarginType::Crossed.code());
+    debug_assert_eq!(info.position_margin, 0, "a cross position holds no isolated margin");
+    info.position_margin = 0;
+    info.isolated_margin = 0;
+    if info.position_amt != 0 {
+        let leg = CrossLeg {
+            market_id: market.market_id,
+            cross: true,
+            has_position: true,
+            upnl: if info.mark_price == 0 { 0 } else { info.unrealized_profit as i128 },
+            mm: info.maint_margin as i128,
+            ..CrossLeg::default()
+        };
+        info.liquidation_price =
+            cross_liquidation_price(market, info.position_amt, info.v_quote_balance, &leg, fold)?;
+    }
+    Ok(())
 }
 
 /// One row of `getAccount`'s `positions[]`: a market id and the [`MarginInfo`] for it.
@@ -1459,8 +1551,9 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
     source: MarketSetSource,
     who: &str,
     override_market: Option<(u64, &crate::types::PerpPosition)>,
-    rows: Option<&mut Vec<AccountPositionRow>>,
+    mut rows: Option<&mut Vec<AccountPositionRow>>,
 ) -> Result<AccountMarginScalars, PerpError> {
+    let first_row = rows.as_ref().map_or(0, |r| r.len());
     let totals = fold_account_margin(
         context,
         user,
@@ -1468,7 +1561,7 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
         source,
         who,
         override_market,
-        rows,
+        rows.as_deref_mut(),
     )?;
     // Signed and unclamped: this is the CROSS wallet exactly as stored. A negative value is a
     // settled receivable (see `types::UserAccount::perp_wallet_balance`), and hiding it behind a
@@ -1478,6 +1571,19 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
     // (`CrossSums::finish`). For an account with no position CROSSED in force: `cWB = W`,
     // `A = W − Σ ooIM`, `X = max(0, A)`, `E = W` and every other cross term 0.
     let cross = totals.cross.finish(perp_wallet_balance, 0);
+    // The rows this walk pushed for positions CROSSED in force take their cross shape against the
+    // fold just finished — the same fold the scalars below are narrowed from, so a row's
+    // liquidation price and the account's totals describe one state.
+    if let Some(rows) = rows {
+        for row in rows[first_row..].iter_mut() {
+            if row.info.margin_type == crate::types::MarginType::Crossed.code() {
+                let market = storage::load_market_ref(context, row.market_id)?
+                    .ok_or_else(|| perp_err(format!("{who}: market {} vanished", row.market_id)))?;
+                apply_cross_row(&market, &mut row.info, &cross)
+                    .map_err(|e| relabel_market(e, who, row.market_id))?;
+            }
+        }
+    }
 
     let narrow_u64 = |v: u128, what: &str| {
         u64::try_from(v).map_err(|_| perp_err(format!("{who}: {what} exceeds u64")))

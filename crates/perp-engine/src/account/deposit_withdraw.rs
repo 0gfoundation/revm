@@ -419,21 +419,29 @@ pub fn run_get_account<H: PerpHost>(
             totalOpenOrderInitialMargin: s.total_open_order_initial_margin,
             totalMaintMargin: s.total_maint_margin,
             availableBalance: s.available_balance,
-            // Zero while cross margin is gated off: every position is ISOLATED in force, so there
-            // is no cross position to sum. Cross accounting (P2) replaces this with the real
-            // `Σ uPnL` over CROSSED positions — see the note on `getAccount`.
-            totalCrossUnPnl: 0,
-            // `max(0, availableBalance)`. Floors at zero because "withdraw a negative amount" is
-            // meaningless; the un-clamped value stays visible in `availableBalance` above, so the
-            // clamp costs no information. NOTE this is the perp→spot limit, not the protocol
-            // withdrawal limit (`withdraw` gates on `usdcBalance`).
-            maxWithdrawAmount: s.available_balance.max(0) as u64,
+            // `Σ uPnL` over the positions CROSSED in force (cross P2). Zero while cross margin is
+            // gated off: every position is ISOLATED in force, so there is no cross position to sum
+            // and all unrealised PnL is in `totalUnrealizedProfit`.
+            totalCrossUnPnl: s.total_cross_unrealized_profit,
+            // Binance's `max(0, min(cWB − Σ isoOpenOrderIM − Σ crossMM, availableBalance))` (cross
+            // P2) — `max(0, availableBalance)` for an account with no cross position. Floors at
+            // zero because "withdraw a negative amount" is meaningless; the un-clamped value stays
+            // visible in `availableBalance` above. NOTE this is the perp→spot limit, not the
+            // protocol withdrawal limit (`withdraw` gates on `usdcBalance`).
+            maxWithdrawAmount: s.max_withdraw_amount,
             // The per-market detail behind every total above, one row per market in the index, from
             // the SAME walk that produced them — so the totals are self-checkable against the rows
             // with no second call, and the balance identities hold within this one response. See
             // `margin_view::AccountPositionRow`; the rows subsume the `marketIds` array this
             // replaced (each carries its own `marketId`).
             positions: view.positions.iter().map(|r| r.to_abi()).collect(),
+            // ── appended (cross P2) ──
+            // `E = totalCrossWalletBalance + totalCrossUnPnl`, the cross margin balance; the cross
+            // wallet itself for an account with no cross position.
+            crossMarginBalance: s.cross_margin_balance,
+            // `Σ maintMargin` over the positions CROSSED in force; `E < totalCrossMaintMargin` is
+            // the account's cross liquidation condition.
+            totalCrossMaintMargin: s.total_cross_maint_margin,
         },
     )))
 }
