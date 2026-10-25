@@ -815,6 +815,27 @@ fn p0_the_btc_table_reads_back_as_binances_leverage_bracket() {
     }
 }
 
+/// The ABI moves the `setMarginTiers` / `MarginTiersUpdated` docs announce, pinned so the notes
+/// cannot drift from the code: the setter's selector and the event's topic0 are those of the
+/// five-field shapes, not the pre-P0 three-field ones.
+#[test]
+fn p0_the_announced_selector_and_topic_moves_are_the_real_ones() {
+    assert_eq!(setMarginTiersCall::SELECTOR, [0x64, 0x30, 0x93, 0xa5]);
+    assert_eq!(
+        MarginTiersUpdated::SIGNATURE_HASH,
+        primitives::b256!("3a84256764d1409d0ecec333b28e23fd56f48643efce82ed3e46ec7590500a6c")
+    );
+    // The pre-P0 shapes, for contrast: `setMarginTiers(uint64,uint64[],uint32[])` was 0x34364f71.
+    assert_eq!(
+        &primitives::keccak256("setMarginTiers(uint64,uint64[],uint32[])")[..4],
+        &[0x34, 0x36, 0x4f, 0x71]
+    );
+    assert_eq!(
+        primitives::keccak256("MarginTiersUpdated(uint64,uint64[],uint32[])"),
+        primitives::b256!("3cb888268979d015fe25916506201197e8c69685683b7a04afc7ba8274213674")
+    );
+}
+
 /// Binance BTCUSDT's CURRENT `leverageBracket` (live capture, 2026-10-14): `(floor $,
 /// initialLeverage, maintMarginRatio ppm)`; its last bracket's `notionalCap` is [`BTC_LIVE_CAP_USD`].
 const BTC_LIVE: [Row; 12] = [

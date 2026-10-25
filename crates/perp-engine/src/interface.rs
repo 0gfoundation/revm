@@ -950,6 +950,11 @@ sol! {
         /// Tier 0's `maxLeverage` becomes the market's `setLeverage` cap. Existing positions
         /// are NOT re-checked: an over-levered position keeps running and is only refused
         /// when it next tries to OPEN.
+        ///
+        /// ⚠️ ABI CHANGE (cross P0): `maintMarginRatesPpm` and then `notionalCap` were APPENDED as
+        /// parameters, so the SELECTOR moved `0x34364f71` → `0x643093a5`. The old three-argument
+        /// call now matches no selector and REVERTS, so the market keeps whatever table it had.
+        /// Regenerate the binding, and update every provisioning script that installs tables.
         function setMarginTiers(
             uint64 marketId,
             uint64[] lowerBounds,
@@ -995,11 +1000,23 @@ sol! {
         ///                                 took, or `type(uint64).max` when that is unbounded.
         ///                                 (NOT `getSymbolConfig`'s `0 = unbounded`.)
         ///
+        /// ⚠️ `maintMarginRatesPpm` HERE IS THE STORED COLUMN, NOT BINANCE'S `maintMarginRatio`.
+        /// It is named after the `setMarginTiers` parameter it round-trips with, so writing back
+        /// what was read leaves the table unchanged and a derived tier stays derived. That makes it
+        /// `0` for every derived tier, which today means every tier on every devnet market. A
+        /// consumer mapping Binance's `maintMarginRatio`, or evaluating `N · MMR − cum`, must bind
+        /// to `effectiveMaintMarginRatesPpm`. Reading the stored column as the rate gives MM = 0.
+        ///
         /// With these, `maintMargin = notional · effectiveRate / 1e6 − cum` for a notional in
         /// `[lowerBound, notionalCap)` is Binance's formula. The engine enforces its integer slice
         /// form, which is NEVER ABOVE that value: it floors once per band (under one quote unit
         /// per tier reached), and a derived rate is reported rounded up. For an explicit table
         /// with whole-dollar bounds — any Binance table — the rates and `cum` are exact.
+        ///
+        /// ⚠️ ABI CHANGE (cross P0): the return grew from `(lowerBounds, maxLeverages)` to these
+        /// six arrays. The original two are still FIRST, so a decoder that reads only them still
+        /// finds them where they were. The selector is unchanged because the input did not move.
+        /// Regenerate the binding to see the other four.
         function getMarginTiers(uint64 marketId) external view returns (
             uint64[] lowerBounds,
             uint32[] maxLeverages,
@@ -2420,6 +2437,10 @@ sol! {
         // Index-aligned parallel arrays as `setMarginTiers` took them (`maintMarginRatesPpm` 0 =
         // derived) and the last bracket's `notionalCap` as stored (0 = unbounded); the full
         // replacement table, not a delta. Effective rates, `cum` and caps: `getMarginTiers`.
+        // ⚠️ ABI CHANGE (cross P0): `maintMarginRatesPpm` and then `notionalCap` APPENDED, so the
+        // event SIGNATURE changed and so did topic0 (`0x3cb88826…` → `0x3a842567…`). An indexer
+        // filtering on the old topic0 sees no tier updates at all, and gets NO error. Regenerate
+        // the binding.
         event MarginTiersUpdated(uint64 indexed marketId, uint64[] lowerBounds, uint32[] maxLeverages, uint32[] maintMarginRatesPpm, uint64 notionalCap);
         // Feeds: market metadata updates for indexer
         event MarketUpdated(uint64 indexed marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps);
