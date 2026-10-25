@@ -48,10 +48,13 @@ sol! {
         /// Any future signed selector must keep its prefix distinct from all of these, and must not
         /// be a proper prefix of another.
         ///
-        /// This is the money-OUT direction of the pair: it is gated on derived `available`
-        /// (`perp_wallet_balance − Σ ooIM`), so an API key holding this signature can pull
-        /// collateral out from under nothing — resting orders keep their requirement — but it CAN
-        /// move the free balance back to spot. Scope API keys accordingly.
+        /// This is the money-OUT direction of the pair: it is gated on the withdrawable balance
+        /// `getAccount.maxWithdrawAmount` (`X`, `margin_view::derived_withdrawable_balance` —
+        /// `perp_wallet_balance − Σ ooIM` for an account with no CROSSED position; cross
+        /// unrealised profit never counts, and cross maintenance margin stays behind), so an API
+        /// key holding this signature can pull collateral out from under nothing — resting orders
+        /// keep their requirement — but it CAN move the free balance back to spot. Scope API keys
+        /// accordingly.
         ///
         /// A signature is single-use and is spent by SUBMISSION, not by success: once this call has
         /// been included, resubmitting the same signature reverts with "duplicate signature" EVEN IF
@@ -279,7 +282,9 @@ sol! {
         /// of plausible zeros. (`getPosition` differs here on purpose; see it.)
         struct AccountPosition {
             uint64 marketId;         // which market this row is for
-            // ── inputs: every field below is recomputable from these six ──
+            // ── inputs: every field below is recomputable from these six — except a CROSSED
+            //    row's `liquidationPrice`, which also depends on the ACCOUNT (the cross wallet and
+            //    every other cross leg: Binance's LP1, see the field) ──
             uint64 markPrice;
             int64  positionAmt;
             int64  vQuoteBalance;
@@ -652,10 +657,11 @@ sol! {
         ///   address is an ordinary account until `createSubAccount`, so a sub can be born holding
         ///   SPOT credited from outside — see `createSubAccount`.)
         ///
-        /// A PERP source is gated on the derived available balance (`perp_wallet_balance − Σ ooIM`,
-        /// the same gate as `transferFromPerp`). No ERC-20 moves; the sum of internal balances is
-        /// unchanged. Emits `InternalTransfer`, then one `AccountBalanceChanged` (reason 8) per
-        /// account touched, in ascending address order.
+        /// A PERP source is gated on the withdrawable balance `getAccount.maxWithdrawAmount` (`X` —
+        /// `perp_wallet_balance − Σ ooIM` for an account with no CROSSED position; never cross
+        /// unrealised profit), the same gate as `transferFromPerp`. No ERC-20 moves; the sum of
+        /// internal balances is unchanged. Emits `InternalTransfer`, then one
+        /// `AccountBalanceChanged` (reason 8) per account touched, in ascending address order.
         function internalTransfer(address to, uint8 fromWallet, uint8 toWallet, uint64 amount) external;
         /// The sub-accounts of `master`, in index order (empty if none). Derived from the stored
         /// count — `subs[i] == derive(master, i)`.
@@ -1605,6 +1611,7 @@ sol! {
         /// walletBalance                                                (gross)
         /// crossWalletBalance = walletBalance      - SUM isolatedWallet (net of positions)
         /// availableBalance   = crossWalletBalance - SUM ooIM           (net of open orders)
+        ///                      + SUM_cross (uPnL - PIM)                (CROSSED, cross P2)
         /// ```
         ///
         /// Only the outer two are ledger state there; `SUM ooIM` is never debited from anything,
@@ -1623,8 +1630,12 @@ sol! {
         /// ```
         ///
         /// `availableBalance` here is therefore the REAL headroom — the very quantity the
-        /// engine's admission gates compare against — and not, as it was under the escrow, a
-        /// figure that subtracted the open-order requirement twice.
+        /// engine's ORDER admission gates compare against — and not, as it was under the escrow, a
+        /// figure that subtracted the open-order requirement twice. It is the headroom for ORDERS:
+        /// for an account with a CROSSED position it counts cross unrealised profit, which no
+        /// money-out call can move. Those (`transferFromPerp`, `internalTransfer` from the perp
+        /// wallet, `depositInsuranceFund`, `addPositionMargin`) are gated on `getAccount`'s
+        /// `maxWithdrawAmount` instead, which this selector does not report.
         ///
         /// ⚠️ One deliberate departure: **we do NOT truncate `availableBalance` at zero.**
         /// Binance does — it was measured reporting `0.00000000` where the true value was
@@ -2049,7 +2060,11 @@ sol! {
         /// * **funding**, **add/removePositionMargin**, the **liquidation residual close**, and each
         ///   **ADL** fill: **one per economic event**, inline, immediately before that event's own
         ///   position row. A funding settle followed by a margin add is two pushes; one ADL fill is
-        ///   two pushes (one for the liquidated user, one for the counterparty).
+        ///   two pushes (one for the liquidated user, one for the counterparty). The one exception
+        ///   is the funding settle of a CROSSED position (cross P2): its payment lands in the cross
+        ///   wallet and nothing on the position changes, so its group has NO position row — a
+        ///   0-position `FUNDING_FEE` group right after its `FundingSettled` (Binance's B-only
+        ///   push, F32).
         /// * **everything else** — deposit / withdraw / transferToPerp / transferFromPerp,
         ///   `setLeverage`, the fee recipient, and the settled end state after a multi-leg
         ///   liquidation — **one per user per transaction**, drained at the end of the call in
@@ -2436,10 +2451,11 @@ sol! {
         /// ```
         ///
         /// More than one of these can fire for the same `(user, marketId)` in one transaction (one
-        /// per fill, plus one for the funding settle that precedes them). That is not new and needs
-        /// no special handling: take the LAST one per `(user, marketId)` — every field is a LEVEL
-        /// (an after-image), never a delta, except `realizedPnl` / `closedQuantity`, which are
-        /// per-event and must be summed if you want a transaction total.
+        /// per fill, plus one for the funding settle that precedes them — an ISOLATED position's
+        /// only: a CROSSED position's funding settle publishes no position row). That is not new
+        /// and needs no special handling: take the LAST one per `(user, marketId)` — every field is
+        /// a LEVEL (an after-image), never a delta, except `realizedPnl` / `closedQuantity`, which
+        /// are per-event and must be summed if you want a transaction total.
         ///
         /// ⚠️ `realizedPnl` and `cumulativeRealizedPnl` are the SAME quantity at two different
         /// altitudes and must not be confused: the former is this event's own delta, the latter the
@@ -2666,12 +2682,19 @@ sol! {
         // operation that touches the position after a funding epoch boundary (a fill, a margin
         // add/remove, a liquidation), never on a schedule of its own.
         //
-        // `amount` is the FULL signed payment (positive = the position received), and it is
-        // EXACTLY the change in `P[].iw`: the whole payment lands on the position's margin, which
-        // a charge may drive NEGATIVE (a debt that lowers equity and is netted at close). There
-        // is no insurance-fund leg, so funding never emits `InsuranceFundChanged` /
-        // `InsuranceFundDepleted`. The `AccountBalanceChanged` + `PositionChanged` group emitted
-        // right after it, valued at the same `markPrice`, carries the new `iw` as an after-image.
+        // `amount` is the FULL signed payment (positive = the position received). Where it lands
+        // depends on the position's margin type IN FORCE (cross P2):
+        // * ISOLATED — it is EXACTLY the change in `P[].iw`: the whole payment lands on the
+        //   position's margin, which a charge may drive NEGATIVE (a debt that lowers equity and is
+        //   netted at close). The `AccountBalanceChanged` + `PositionChanged` group emitted right
+        //   after it, valued at the same `markPrice`, carries the new `iw` as an after-image.
+        // * CROSSED — it is EXACTLY the change in the cross wallet, `totalCrossWalletBalance`
+        //   (which a charge may drive negative). The group emitted right after it is an
+        //   `AccountBalanceChanged(FUNDING_FEE)` with ZERO position rows — Binance's B-only
+        //   `FUNDING_FEE` push for a cross position (F32): nothing on the position changed, and a
+        //   cross row's `iw` is always 0. Do not apply `amount` to `P[].iw` for a cross position.
+        // There is no insurance-fund leg in either case, so funding never emits
+        // `InsuranceFundChanged` / `InsuranceFundDepleted`.
         event FundingSettled(uint64 indexed marketId, address indexed user, int64 fundingRate, int64 amount, uint64 markPrice);
 
         // Feeds: insurance fund balance history

@@ -386,8 +386,11 @@ pub fn run_transfer_from_perp_signed<H: PerpHost>(
 ///
 /// This function contains NO arithmetic: it decodes, calls
 /// [`crate::margin_view::index_account_view`], and ABI-encodes. The `AccountBalanceChanged` event
-/// calls the same producer and encodes the same fields into a log, which is why the two surfaces
-/// cannot report different numbers for the same state.
+/// reads the same STORED quantities (`margin_view::index_account_wallet_balances`), so the two
+/// surfaces agree on every field they share for an account with no CROSSED position. With one
+/// (cross P2) they deliberately differ by the unsettled cross funding: the event reports the
+/// LEDGER wallet `W`, while `totalCrossWalletBalance` here is `cWB = W + Σ_C PF` (pending funding
+/// counted, Binance's instant-settlement number) — and `totalWalletBalance` with it.
 ///
 /// # ONE CALL, ONE STATE
 ///
