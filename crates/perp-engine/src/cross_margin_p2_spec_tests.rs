@@ -2397,6 +2397,34 @@ fn liq_adl_ranks_a_cross_winner_on_its_account_equity() {
     assert_eq!(run_with(5_000 * USD), vec![ERIN]);
 }
 
+/// A CROSSED winner the fill would take below zero is NOT a clean candidate, however high its rank:
+/// the report's clean tier is `E − take·|fill − mark| ≥ 0` (§3.4 ADL), and here `take` is BOB's
+/// whole short, so both readings of it agree. CAROL's long of 4 is liquidated at 900 with an empty
+/// book, filled at her bankruptcy price 951 — 51 above the mark, against the shorts. BOB (cross,
+/// W = −300): `E = −300 + 400 = 100 > 0` and `uPnL / E = 4`, but `E − 4 · 51 = −104 < 0`. ERIN
+/// (isolated, ROE 400 / 2,398) is clean: she is ADL'd first and takes all 4; BOB is untouched.
+#[test]
+fn liq_adl_prefers_a_clean_winner_to_a_cross_winner_the_fill_takes_negative() {
+    let (_g, mut ctx) = crossed_world();
+    let ctx = &mut ctx;
+    set_lev(ctx, CAROL, M1, 20);
+    fill(ctx, CAROL, M1, 4, 1_000);
+    fill(ctx, BOB, M1, -4, 1_000);
+    set_type(ctx, ERIN, M1, ISOLATED);
+    set_lev(ctx, ERIN, M1, 2);
+    fill(ctx, ERIN, M1, -4, 1_000);
+    set_wallet(ctx, BOB, (-300 * USD) as i64);
+    let bob = pos(ctx, BOB, M1);
+    let c = tick(ctx, M1, 900);
+    assert_eq!(evs::<Liquidation>(&c.logs).len(), 1);
+    let md = model(ctx, BOB);
+    assert_eq!(md.e, 100 * USD, "BOB's account is solvent at the mark…");
+    let adl = evs::<Adl>(&c.logs);
+    assert!(adl.iter().all(|a| a.price == 951), "…but not at the bankruptcy-price fill");
+    assert_eq!(adl.iter().map(|a| (a.adlUser, a.qty)).collect::<Vec<_>>(), vec![(ERIN, 4)]);
+    assert_eq!(pos(ctx, BOB, M1), bob, "the cross winner was held back to the fallback tier");
+}
+
 /// A CROSSED winner whose account equity is not positive (`E ≤ 0` — a loss on another cross
 /// market) is held to the fallback tier, and ADL through it is total: no error, no division by a
 /// zero margin, its fill settled into W, the identity intact.
