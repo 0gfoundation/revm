@@ -18,7 +18,8 @@ use crate::{
     host::PerpHost,
     interface::IPerpDex::{
         getAccountCall, getAccountMarginCall, getAccountMarginReturn, getAccountReturn,
-        getPositionRiskCall, placeOrderCall, updateIndexPriceCall, AccountPosition,
+        getOpenOrdersCall, getPositionCall, getPositionRiskCall, getSymbolConfigCall,
+        placeOrderCall, updateIndexPriceCall, AccountPosition,
     },
     run_perp_dex_call, storage,
     types::{
@@ -947,4 +948,164 @@ fn the_cross_liquidation_price_moves_with_the_rest_of_the_account() {
     assert!(lp(&mut ctx) > base);
     // …and getAccount agrees with getPositionRisk throughout.
     assert_eq!(get_account(&mut ctx, ALICE).positions[0].liquidationPrice, lp(&mut ctx));
+}
+
+// ── Binance's LP1 on a two-market cross account ───────────────────────────────
+
+/// `⌊n / d⌋` for a positive `d`.
+fn floor_div(n: i128, d: i128) -> i128 {
+    n.div_euclid(d)
+}
+
+/// The cross liquidation price of each leg of a two-market cross account against Binance's
+/// published one-way formula (cross report §1.5, [A]):
+///
+/// ```text
+/// LP1 = (WB − TMM1 + UPNL1 + cumB − Side1·Pos1·EP1) / (Pos1·MMR_B − Side1·Pos1)
+/// ```
+///
+/// with `WB` the cross wallet, `TMM1` / `UPNL1` the OTHER market's maintenance margin and
+/// unrealised PnL, `cumB` / `MMR_B` the bracket the position sits in AT the liquidation price.
+/// Market K is a 2-contract long @ $30,000 (mark $28,000) on a two-bracket explicit table — 0.4% to
+/// $50,000, 0.5% above, so `cum = $50` and the liquidation notional lands in bracket 2; market J is
+/// a 10-contract short @ $1,500 (mark $1,600) at a flat 1%. Wallet $10,000, no funding.
+///
+/// ```text
+/// K (long):  (10,000 − 160 − 1,000 + 50 − 60,000) / (2·0.005 − 2)  = 25,683.4171… → greatest
+///            liquidatable cent 2,568,341
+/// J (short): (10,000 − 230 − 4,000 + 0 + 15,000) / (10·0.01 + 10)  =  2,056.4356… → least
+///            liquidatable cent   205,644
+/// ```
+///
+/// (`TMM1` for K is J's `10·1,600·1% = 160`; for J it is K's `56,000·0.5% − 50 = 230`.) The
+/// engine's search must land on exactly those cents, and the rows must agree with
+/// `getPositionRisk`.
+#[test]
+fn the_cross_liquidation_price_is_binances_lp1() {
+    const K: u64 = M1;
+    const J: u64 = M2;
+    let usd = USD as u64;
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_market(&mut ctx, K, 2_800_000, &[(0, 125, 4_000), (50_000 * usd, 100, 5_000)]);
+    set_market(&mut ctx, J, 160_000, &[(0, 50, 10_000)]);
+    plant_leg(&mut ctx, ALICE, &Leg::new(K, 2, 3_000_000, 20, true, 0));
+    plant_leg(&mut ctx, ALICE, &Leg::new(J, -10, 150_000, 20, true, 0));
+    set_wallet(&mut ctx, ALICE, 10_000 * USD);
+
+    // LP1 in cents as an exact fraction `n / d`: every dollar term × 1e6 (quote units), MMR in
+    // ppm, so `cents = num_q · 100 / den_ppm`. Terms: [WB, TMM1, UPNL1, cumB, Side1, Pos1, EP1,
+    // MMR_B ppm], dollars.
+    let lp1_cents = |t: [i128; 8]| {
+        let [wb, tmm, upnl, cum, side, pos, ep, mmr_ppm] = t;
+        let num = (wb - tmm + upnl + cum - side * pos * ep) * USD as i128;
+        let den = pos * mmr_ppm - side * pos * 1_000_000;
+        (num * 100, den)
+    };
+    let (n, d) = lp1_cents([10_000, 160, -1_000, 50, 1, 2, 30_000, 5_000]);
+    // n / d with both negative: the exact quotient is 2,568,341.708…; the long's flip is its floor.
+    assert_eq!(floor_div(-n, -d), 2_568_341);
+    let (n, d) = lp1_cents([10_000, 230, -4_000, 0, -1, 10, 1_500, 10_000]);
+    // 205,643.564…; the short's flip is its ceiling.
+    assert_eq!(-floor_div(-n, d), 205_644);
+
+    let a = get_account(&mut ctx, ALICE);
+    let lp = |m: u64| a.positions.iter().find(|r| r.marketId == m).unwrap().liquidationPrice;
+    assert_eq!(lp(K), 2_568_341, "the long's cross LP is Binance's LP1, to the cent");
+    assert_eq!(lp(J), 205_644, "the short's cross LP is Binance's LP1, to the cent");
+    for (m, side) in [(K, 1i64), (J, -1)] {
+        assert_eq!(position_risk(&mut ctx, ALICE, m).liquidationPrice, lp(m));
+        // And it IS the flip of the account condition, from the fold alone.
+        assert!(liquidatable_at(&mut ctx, ALICE, m, lp(m)));
+        assert!(!liquidatable_at(&mut ctx, ALICE, m, (lp(m) as i64 + side) as u64));
+    }
+    // The figures the formula used, as the account reports them.
+    assert_eq!(a.totalCrossUnPnl, (-4_000 - 1_000) * USD);
+    assert_eq!(a.totalCrossMaintMargin, (230 + 160) * usd);
+    assert_eq!(a.crossMarginBalance, (10_000 - 5_000) * USD);
+}
+
+// ── Byte identity for isolated-only accounts ──────────────────────────────────
+
+/// Every account getter's raw bytes for one user, in a fixed order.
+fn getter_bytes(ctx: &mut TestCtx, user: Address) -> Vec<Vec<u8>> {
+    let mut out = vec![
+        view(ctx, &getAccountCall { user }.abi_encode(), 20_000).bytes.to_vec(),
+        view(ctx, &getAccountMarginCall { user, marketIds: vec![M1, M2] }.abi_encode(), 50_000)
+            .bytes
+            .to_vec(),
+    ];
+    for m in [M1, M2] {
+        let risk = getPositionRiskCall { user, marketId: m }.abi_encode();
+        out.push(view(ctx, &risk, 20_000).bytes.to_vec());
+        for input in [
+            getSymbolConfigCall { user, marketId: m }.abi_encode(),
+            getPositionCall { user, marketId: m }.abi_encode(),
+            getOpenOrdersCall { user, marketId: m }.abi_encode(),
+        ] {
+            let o = run_perp_dex_call(&input, 1_000_000, ADMIN, U256::ZERO, true, ctx).unwrap();
+            assert!(!o.reverted);
+            out.push(o.bytes.to_vec());
+        }
+    }
+    out
+}
+
+/// An isolated-only account through the cross machinery is the account it always was: the same
+/// trading scenario — fills on two markets, resting orders on both sides, pending funding on an
+/// isolated position, a mark move — run gated off (production: every stored byte the CROSSED
+/// default) and gated ON with every actor ISOLATED, publishes the same logs and the same bytes from
+/// every account getter; and `getAccount`'s cross fields take their degenerate values.
+#[test]
+fn every_getter_is_byte_identical_for_an_isolated_only_account() {
+    fn scenario(ctx: &mut TestCtx) -> Vec<primitives::Log> {
+        trade(ctx, M1, ALICE, BOB, BUY, 3);
+        trade(ctx, M2, BOB, ALICE, BUY, 2);
+        ok(ctx, ALICE, &order(M1, BUY, 9_900, 2, GTC));
+        ok(ctx, ALICE, &order(M2, SELL, 10_200, 1, GTC));
+        ok(ctx, BOB, &order(M2, BUY, 9_700, 4, GTC));
+        set_funding_index(ctx, M1, 10_000 * 2_500);
+        storage::save_mark_price(ctx, M2, 10_400).unwrap();
+        trade(ctx, M1, ALICE, BOB, SELL, 1); // settles ALICE's and BOB's M1 funding
+        // …and a further epoch left PENDING on both isolated M1 positions at read time.
+        set_funding_index(ctx, M1, 10_000 * 6_000);
+        JournalTr::take_logs(ctx.journal_mut())
+    }
+
+    // Gated off — production. Every getter read with the gate still off.
+    let mut gated = make_ctx();
+    let gated_logs = scenario(&mut gated);
+    let gated_bytes: Vec<_> = [ALICE, BOB].map(|u| getter_bytes(&mut gated, u)).into();
+
+    // Gated on, every actor ISOLATED by choice.
+    let mut isolated = make_ctx();
+    let (isolated_logs, isolated_bytes) = {
+        let _cross = crate::margin_type::test_gate::enable();
+        for u in [ALICE, BOB] {
+            for m in [M1, M2] {
+                let mut p = storage::load_position(&mut isolated, u, m).unwrap();
+                p.margin_type = MarginType::Isolated.code();
+                storage::save_position_margin_type_only(&mut isolated, u, m, p).unwrap();
+            }
+        }
+        let logs = scenario(&mut isolated);
+        let bytes: Vec<_> = [ALICE, BOB].map(|u| getter_bytes(&mut isolated, u)).into();
+        (logs, bytes)
+    };
+
+    assert_eq!(gated_logs, isolated_logs, "the same events, byte for byte");
+    for (i, u) in [ALICE, BOB].into_iter().enumerate() {
+        let g = &gated_bytes[i];
+        assert_eq!(*g, isolated_bytes[i], "{u}: every getter byte-identical");
+
+        let a = getAccountCall::abi_decode_returns(&g[0]).unwrap();
+        let w = storage::load_account(&mut gated, u).unwrap().perp_wallet_balance;
+        assert_eq!(a.totalCrossWalletBalance, w, "the stored wallet, no funding added");
+        assert_eq!(a.availableBalance, w - a.totalOpenOrderInitialMargin as i64);
+        assert_eq!(a.maxWithdrawAmount, a.availableBalance.max(0) as u64);
+        assert_eq!((a.totalCrossUnPnl, a.totalCrossMaintMargin), (0, 0));
+        assert_eq!(a.crossMarginBalance, a.totalCrossWalletBalance);
+        assert!(a.positions.iter().all(|r| r.marginType == 1));
+        assert!(a.positions.iter().any(|r| r.isolatedWallet != 0), "silos really are in play");
+    }
 }
