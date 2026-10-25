@@ -12,7 +12,9 @@
 //!   reads `A`, cross unrealized profit included, to the unit;
 //! * Q11 / `-2023`: while the account is IN LIQUIDATION only reduce-only / closePosition orders
 //!   are accepted, on every placement entrypoint, and `setMarginType` refuses (after `-4048`,
-//!   before the gate) on both of its paths.
+//!   before the gate) on both of its paths;
+//! * `setLeverage` on a CROSSED position: raising always, lowering against `A` (`-2028`) to the
+//!   unit; the tier cap (`-2027`) still applies; ISOLATED unchanged.
 //!
 //! A child of `cross_settlement_tests`, so it runs on that fixture: two markets on an exact grid
 //! (base 0 decimals, price 2), `USD` = one dollar in quote units, the custody [`Ledger`] re-checked
@@ -799,4 +801,73 @@ fn set_margin_type_refuses_in_liquidation_after_4048_and_before_the_gate() {
     let _cross = crate::margin_type::test_gate::enable();
     ok(&mut ctx, ALICE, &set(M2, ISOLATED).abi_encode());
     assert_eq!(pos(&mut ctx, ALICE, M2).margin_type, ISOLATED);
+}
+
+// ── setLeverage on a CROSSED position ────────────────────────────────────────────────────────
+
+/// A CROSSED position's leverage moves both ways under a live position. ALICE holds a cross long
+/// of 10 at $100, opened at 2x (`PIM = $500`) on a $100 wallet (`A = −$400`): RAISING to 3x is
+/// admitted even so (the requirement only falls, `PIM = $333.33`). LOWERING back to 2x adds
+/// `$166.67` of `PIM`, so it needs `A` to cover exactly that: refused `-2028` with the wallet one
+/// unit short, admitted at the boundary (`A_after = 0`). It writes the leverage only, like every
+/// leverage change.
+#[test]
+fn cross_set_leverage_raises_freely_and_lowers_against_a_to_the_unit() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_type(&mut ctx, BOB, M1, ISOLATED);
+    set_leverage(&mut ctx, ALICE, M1, 2);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    set_wallet(&mut ctx, ALICE, 100 * USD);
+    assert!(fold(&mut ctx, ALICE).a < 0);
+
+    let logs = ok(&mut ctx, ALICE, &setLeverageCall { marketId: M1, leverage: 3 }.abi_encode());
+    assert_eq!(pos(&mut ctx, ALICE, M1).leverage, 3, "raised at a negative available balance");
+    assert_eq!(count_events::<AccountBalanceChanged>(&logs), 0, "a leverage-only write");
+
+    let n = value(px(100), 10);
+    let delta = n / 2 - ceil_div(n, 3);
+    let w_edge = n / 2; // A(3x) = W − ⌈N/3⌉ must equal Δ = N/2 − ⌈N/3⌉
+    set_wallet(&mut ctx, ALICE, w_edge - 1);
+    assert_eq!(fold(&mut ctx, ALICE).a, (delta - 1) as i128);
+    let lower = setLeverageCall { marketId: M1, leverage: 2 }.abi_encode();
+    rejects(&mut ctx, ALICE, &lower, crate::risk::CROSS_LEVERAGE_REJECT);
+    set_wallet(&mut ctx, ALICE, w_edge);
+    ok(&mut ctx, ALICE, &lower);
+    assert_eq!(pos(&mut ctx, ALICE, M1).leverage, 2);
+    assert_eq!(fold(&mut ctx, ALICE).a, 0, "exactly covered");
+}
+
+/// The tier cap still binds a CROSSED position, raising included: with the table's `notionalCap`
+/// installed below the position's notional, no leverage is admitted (`-2027`); and an ISOLATED
+/// position keeps its rule — no lowering under an open position, at any balance.
+#[test]
+fn cross_set_leverage_keeps_the_tier_cap_and_isolated_keeps_its_rule() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+    }
+    set_type(&mut ctx, ALICE, M2, ISOLATED);
+    set_leverage(&mut ctx, ALICE, M1, 2);
+    set_leverage(&mut ctx, ALICE, M2, 3);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    trade(&mut ctx, M2, ALICE, BOB, BUY, px(100), 10);
+
+    rejects(
+        &mut ctx,
+        ALICE,
+        &setLeverageCall { marketId: M2, leverage: 2 }.abi_encode(),
+        "setLeverage: cannot reduce leverage with open position",
+    );
+
+    let mut mk = storage::load_market(&mut ctx, M1).unwrap().unwrap();
+    mk.tiers = MarginTiers::default().with_notional_cap(500 * USD as u64);
+    storage::save_market(&mut ctx, &mk).unwrap();
+    rejects(
+        &mut ctx,
+        ALICE,
+        &setLeverageCall { marketId: M1, leverage: 3 }.abi_encode(),
+        "setLeverage: -2027 position exceeds the market's maximum notional",
+    );
 }

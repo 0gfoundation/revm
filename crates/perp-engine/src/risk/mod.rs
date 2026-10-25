@@ -602,8 +602,9 @@ pub fn run_set_leverage_signed<H: PerpHost>(
     // The next position then opens at a leverage the owner had deliberately moved away from, with
     // a nearer liquidation price. The ceiling is bounded and worth stating: an attacker can only
     // replay a value the OWNER signed in the last ~65s, and `set_leverage_core` refuses to LOWER
-    // leverage on an open position, so against a live position a replay can only push leverage up.
-    // No fund path — this is risk-control integrity.
+    // leverage on an open ISOLATED position, so against a live one a replay can only push leverage
+    // up (a CROSSED position may be lowered too, but only as far as the available balance carries
+    // it — `-2028`). No fund path — this is risk-control integrity.
     //
     // Burned unconditionally, after verification and BEFORE `set_leverage_core` — a signed
     // authorization is spent by submission, not by success. See the long note at
@@ -677,8 +678,19 @@ fn set_leverage_core<H: PerpHost>(
         return Err(perp_err(format!("setLeverage: leverage must be 1–{cap}")));
     }
 
+    // ── The margin-type split (cross margin P2c, report §3.3 item 7) ──
+    //
+    // ISOLATED in force: unchanged — no lowering under an open position (its silo was sized at the
+    // old leverage; Binance `-4161`), and the order book's `ΔooIM` gated on `A`.
+    // CROSSED in force: there is no silo to re-size, the position's initial margin is DERIVED into
+    // `A` at `pos.leverage`, so the leverage may move either way under a live position — raising
+    // always (the requirement only falls), lowering only if `A` covers what it adds
+    // (`cross_leverage_gate`, Binance `-2028`). Maintenance does not depend on the leverage, so the
+    // account's cross health (`E` vs `Σ_C MM`) is untouched either way.
+    let cross =
+        crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed;
     let old_leverage = pos.leverage.max(1);
-    if pos.amount != 0 && leverage < old_leverage {
+    if !cross && pos.amount != 0 && leverage < old_leverage {
         return Err(perp_err(
             "setLeverage: cannot reduce leverage with open position",
         ));
@@ -686,7 +698,11 @@ fn set_leverage_core<H: PerpHost>(
 
     // `&pos`, not `&mut pos`: this is a pure GATE. It is why `setLeverage` cannot move `pos.margin`
     // and therefore publishes no account snapshot — see `storage::save_position_leverage_only`.
-    rebalance_order_margin_for_leverage(context, account, &market, &pos, leverage)?;
+    if cross {
+        cross_leverage_gate(context, account, &market, &pos, leverage)?;
+    } else {
+        rebalance_order_margin_for_leverage(context, account, &market, &pos, leverage)?;
+    }
     pos.leverage = leverage;
     // ── `setLeverage` publishes NO `AccountBalanceChanged`, on purpose ──────────────────────────
     //
@@ -1858,6 +1874,51 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
         return Err(perp_err(
             "setLeverage: insufficient perp wallet for order margin",
         ));
+    }
+    Ok(())
+}
+
+/// `setLeverage`'s refusal for a CROSSED position whose lower leverage the available balance cannot
+/// carry — Binance's `-2028`.
+pub(crate) const CROSS_LEVERAGE_REJECT: &str =
+    "setLeverage: -2028 Leverage is smaller than permitted: insufficient margin balance.";
+
+/// The CROSSED `setLeverage` gate (cross report §3.3 item 7, G12): `derived_can_afford(A, ΔIM)`.
+///
+/// A cross position's initial margin is not a silo but a term of the account's available balance —
+/// `PIM = ROUND_UP(|N| / L)` at the position's own leverage, and its resting orders' `ooIM` on top
+/// (`A = cWB + Σ_C (uPnL − PIM) − Σ ooIM`). A leverage change moves exactly this market's joint
+/// requirement `IM = PIM + ooIM = ROUND_UP(max(|N + Bid|, |N − Ask|) / L)` and nothing else, so the
+/// change is affordable iff the CURRENT `A` covers `ΔIM = IM(new L) − IM(old L)` — `A(after) ≥ 0`
+/// in delta form, the identity `rest_in_book` documents, with this market's term the only one that
+/// differs. Raising divides the requirement down (`ΔIM ≤ 0`): always admitted, by the
+/// non-positive-requirement clause, at any balance. Lowering is refused `-2028` unless `A` covers
+/// the increase.
+///
+/// Pure read + reject, like [`rebalance_order_margin_for_leverage`] (the isolated gate it replaces
+/// for a cross position — that one charges only `ΔooIM`, because an isolated position's own
+/// requirement is its silo, fixed at open): zero writes either way, the walk the same one fold.
+fn cross_leverage_gate<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market: &crate::types::Market,
+    pos: &crate::types::PerpPosition,
+    new_leverage: u64,
+) -> Result<(), PerpError> {
+    let mut after = pos.clone();
+    after.leverage = new_leverage;
+    let im = |p: &crate::types::PerpPosition| -> Result<i128, PerpError> {
+        Ok(crate::margin_view::position_derived_margin(market, p)?.margin.initial_margin as i128)
+    };
+    let delta = im(&after)? - im(pos)?;
+    let available = crate::margin_view::derived_available_balance_with(
+        context,
+        user,
+        None,
+        Some((market.market_id, pos)),
+    )?;
+    if !crate::margin_view::derived_can_afford(available, delta) {
+        return Err(perp_err(CROSS_LEVERAGE_REJECT));
     }
     Ok(())
 }

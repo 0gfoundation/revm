@@ -1097,7 +1097,12 @@ sol! {
         );
 
         // ── Leverage ───────────────────────────────────────────────────────
-        /// Set the leverage for the caller's position in a market.
+        /// Set the leverage for the caller's position in a market. Bounded by the tier the
+        /// position's notional sits in (`-2027` past the table's `notionalCap`). Under an open
+        /// position: ISOLATED may only RAISE it (`setLeverage: cannot reduce leverage with open
+        /// position`, Binance's `-4161`); CROSSED may move it either way — raising always, lowering
+        /// only while the available balance covers the extra initial margin
+        /// (`setLeverage: -2028 Leverage is smaller than permitted: insufficient margin balance.`).
         function setLeverage(uint64 marketId, uint64 leverage) external;
         /// Set leverage for `account`, authenticated by ed25519 signature.
         /// Message: "perpdex_v1_leverage"(19) || chainId(8) || account(20) || marketId(8) || leverage(8)
