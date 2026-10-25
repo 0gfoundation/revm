@@ -1844,6 +1844,11 @@ fn remove_order_entry_by_price(
 /// too. Where the book offers no gain the cross bound is the isolated one, so the filter keeps its
 /// teeth on the deep-walk orders it exists for.
 ///
+/// The Open Loss `rest_in_book` charges a cross order's resting OPENING part (Binance F8) is left
+/// out of the bound on purpose: a filled unit's loss against the mark is already inside the
+/// fold's `A`, and the bound only has to stay below the true requirement, so omitting a cost term
+/// can only loosen the filter, never make it refuse what the full path admits.
+///
 /// The cross report (§3.3 item 5) proposed one of two other fixes; neither is the right one now:
 /// * "add `Σ_C max(0, uPnL_k)` to the upper bound on `A`" — moot since P2a: `available` here IS
 ///   the fold's `A`, which already holds every cross leg's `uPnL`, and the gate behind this filter
@@ -3136,7 +3141,8 @@ fn entries_iter(
 enum RestOutcome {
     Rested,
     RefusedTooGoodBest,
-    /// The rest's marginal `ooIM` does not fit in the available balance.
+    /// The rest's marginal `ooIM` (plus, for a cross order, its Open Loss) does not fit in the
+    /// available balance.
     ///
     /// This used to be raised in place (two `return Err`s, one per side arm) while a crossing GTC's
     /// fills were already flushed, which was the val0 leak at block 1,098,719. It was then made a
@@ -3151,6 +3157,55 @@ const TOO_GOOD_BEST_REJECT: &str = "placeOrder: a new best quote must be inside 
 /// same cause, so a client cannot tell "refused before the walk" from "refused after it".
 pub(super) const INSUFFICIENT_MARGIN_REJECT: &str =
     "placeOrder: insufficient perp wallet for margin";
+
+/// The quantity of a `qty` order on `side` that can only OPEN: what is left once the position it
+/// offsets has been closed — net of the same-side orders already resting against it, which are
+/// first in line to close it. `0` for a pure reduce. Conservative by construction: an order that
+/// shares the closing room with earlier same-side orders is treated as opening as soon as theirs
+/// would fill that room.
+fn opening_part_of_order(pos: &crate::types::PerpPosition, side: Side, qty: u64) -> u64 {
+    let (offset, resting) = match side {
+        Side::Buy if pos.amount < 0 => (pos.amount.unsigned_abs(), pos.total_buy_qty),
+        Side::Sell if pos.amount > 0 => (pos.amount.unsigned_abs(), pos.total_sell_qty),
+        _ => (0, 0),
+    };
+    qty.saturating_sub(offset.saturating_sub(resting))
+}
+
+/// Binance's **Open Loss** (F8) of a resting order on a position CROSSED in force:
+/// `q_open × max(0, price − mark)` for a buy, `q_open × max(0, mark − price)` for a sell, with
+/// `q_open` the order's OPENING part ([`opening_part_of_order`]) and `mark` the stored mark at
+/// placement. The whole Binance order cost is `IM + Open Loss`; the IM half is the order's `ooIM`
+/// (a sell's at `max(T, limit) ≥ mark`, so it carries no open loss of its own).
+///
+/// `0` for a position ISOLATED in force (its maker fill is held to K9 instead), for a pure reduce
+/// (Binance gates no reducing order; a reduce booked at a bad price is the close-through-bankruptcy
+/// risk every close carries), for an order on the good side of the mark, and at a mark of `0`.
+///
+/// It is the cost at PLACEMENT. A mark that later moves through a resting order's price turns it
+/// into an open loss the account did not pay for — Binance's own behaviour, and not a lever: no
+/// user moves the mark. The liquidation sweep (P3) is the backstop for it.
+fn cross_rest_open_loss(
+    market: &crate::types::Market,
+    pos: &crate::types::PerpPosition,
+    side: Side,
+    price: u64,
+    qty: u64,
+) -> Result<u64, PerpError> {
+    if crate::margin_type::effective_margin_type(pos) != crate::types::MarginType::Crossed {
+        return Ok(0);
+    }
+    let mark = market.mark_price;
+    let loss_per_unit = match side {
+        Side::Buy => price.saturating_sub(mark),
+        Side::Sell => mark.saturating_sub(price),
+    };
+    if mark == 0 || loss_per_unit == 0 {
+        return Ok(0);
+    }
+    let q_open = opening_part_of_order(pos, side, qty);
+    calc_value(loss_per_unit, q_open, market.base_decimals, market.price_decimals)
+}
 
 fn rest_in_book<H: PerpHost>(
     context: &mut H,
@@ -3422,6 +3477,18 @@ fn rest_in_book<H: PerpHost>(
             .checked_add(entry_notional)
             .ok_or_else(|| perp_err(format!("placeOrder: total {label} notional overflow")))?;
     }
+    // ── A CROSS order's Open Loss (Binance F8: `Cost = IM + Open Loss`) ──
+    //
+    // `0` for an order on an ISOLATED position (its maker fill is held to K9 on the trial silo,
+    // which refuses an open into insolvency) and for the part of an order that only reduces. For
+    // the OPENING part of an order on a position CROSSED in force it is what the fill will book
+    // against the account's equity the moment it happens, priced against the mark: nothing checks a
+    // cross maker fill (owner decision Q9 / D13 — and K9 does not apply to a margin-free position),
+    // so it must be paid for HERE, at placement, or a sell resting below the mark (a buy above it)
+    // is admitted on its initial margin alone and fills into an open loss the account never had —
+    // the counterparty, possibly the user's own sub-account, collecting it as profit. See
+    // [`cross_rest_open_loss`].
+    let open_loss = cross_rest_open_loss(market, &pos_basis, side, price, qty)?;
     // `pos_after` overrides storage for this market: it is not written until PHASE 2.
     let available_after = crate::margin_view::derived_available_balance_with(
         context,
@@ -3429,14 +3496,24 @@ fn rest_in_book<H: PerpHost>(
         Some(wallet),
         Some((market_id, &pos_after)),
     )?;
-    if available_after < 0 {
+    // `A_after − OpenLoss ≥ 0`, i.e. `Δ ooIM + OpenLoss ≤ A(before)` — the measured delta form with
+    // the order's whole Binance cost. The B1 escape is unchanged: an order whose cost is not
+    // positive (`Δ ooIM ≤ 0` and no open loss) rests at any balance.
+    if available_after < open_loss as i128 {
         let delta = crate::margin_view::derived_requirement_delta(market, &pos_basis, &pos_after)?;
-        if delta > 0 {
+        if delta > 0 || open_loss > 0 {
             // Write-clean (validate-then-apply: the probe above materialised nothing, and
             // `deferred` is dropped unflushed). A clean whole-order reject.
             return Ok(RestOutcome::RefusedUnaffordable);
         }
     }
+    // P3: the gate above is `A`'s, so an account that already sits UNDER cross maintenance while
+    // `A ≥ 0` (a leg whose `MM > PIM` after tier drift) may still rest an opening order, and — no
+    // maker fill being checked (Q9) — have it filled, which the taker's J1 would have refused. The
+    // Open Loss above keeps such a fill from booking anything beyond the mark; what is left is the
+    // detection window: the P3 sweep flags the account on the next tick of any of its markets, after
+    // which Q11 (`-2023`) refuses its non-reducing placements and the maker freeze cancels what it
+    // rested in between.
 
     // ══════════════════════════════════════════════════════════════════════════════════════════
     // ── THE WRITE BARRIER ── every refusal has passed; from here the placement is ACCEPTED.

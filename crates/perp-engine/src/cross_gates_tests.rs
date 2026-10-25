@@ -688,6 +688,92 @@ fn the_resting_gate_reads_a_with_cross_profit_to_the_unit() {
     assert_eq!(fold(&mut ctx, ALICE).a, 0);
 }
 
+/// Binance's Open Loss (F8, `Cost = IM + Open Loss`) is part of a CROSS order's cost at placement.
+/// M1 gets a single 50x tier and a 10% band; BOB (CROSSED, 50x, flat) rests 100 on the bad side of
+/// the $100 mark, at the band's edge — a SELL at $90 (initial margin `100 × $100 / 50 = $200`: a
+/// sell is margined at `max(T, limit) ≥ mark`) or a BUY at $110 (`$220`, at its limit). Filling it
+/// books `100 × $10 = $1,000` against his equity at once, and nothing checks a cross maker fill
+/// (Q9), so the $1,000 is paid for here: refused one unit short of `IM + $1,000`, rested at it. On
+/// the old gate (IM alone) a $202 wallet rested the sell, and the fill left BOB at `E = −$799.80`
+/// with his counterparty — possibly his own sub-account — holding the $1,000. Lifted now, it leaves
+/// him solvent and above maintenance.
+#[test]
+fn a_cross_order_pays_its_open_loss_at_placement() {
+    for side in [SELL, BUY] {
+        let mut ctx = make_ctx();
+        let _cross = crate::margin_type::test_gate::enable();
+        let mut mk = storage::load_market(&mut ctx, M1).unwrap().unwrap();
+        mk.tiers = MarginTiers::from_tiers(&[MarginTier {
+            lower_bound_notional: 0,
+            max_leverage: 50,
+            maint_margin_rate_ppm: 0,
+        }])
+        .unwrap();
+        mk.price_band_bps = 1_000;
+        storage::save_market(&mut ctx, &mk).unwrap();
+        set_type(&mut ctx, CAROL, M1, ISOLATED);
+        set_leverage(&mut ctx, BOB, M1, 50);
+        let (price, im) =
+            if side == SELL { (px(90), 200 * USD) } else { (px(110), 220 * USD) };
+        let w_edge = im + 1_000 * USD;
+
+        set_wallet(&mut ctx, BOB, w_edge - 1);
+        rejects(
+            &mut ctx,
+            BOB,
+            &order(M1, side, price, 100, GTC),
+            "placeOrder: insufficient perp wallet for margin",
+        );
+        set_wallet(&mut ctx, BOB, w_edge);
+        let ledger = Ledger::open(&mut ctx);
+        place(&mut ctx, BOB, &order(M1, side, price, 100, GTC));
+        assert_eq!(fold(&mut ctx, BOB).a, (1_000 * USD) as i128, "A = W − IM: the loss is not in A");
+
+        let taker = if side == SELL { ALICE } else { CAROL };
+        let logs = ok(&mut ctx, taker, &order(M1, 1 - side, price, 100, IOC));
+        ledger.check(&mut ctx, "after the fill");
+        assert_eq!(trades_with(&logs, BOB), 1);
+        let f = fold(&mut ctx, BOB);
+        let maker_fee = fee(value(price, 100), MAKER_PPM as u64);
+        assert_eq!(f.cross_upnl, -(1_000 * USD) as i128, "the open loss, booked at the fill");
+        assert_eq!(f.e, (im - maker_fee) as i128, "E keeps the initial margin the order paid");
+        assert!(!f.below_cross_maintenance(), "solvent and above maintenance: {f:?}");
+    }
+}
+
+/// The Open Loss is charged on the order's OPENING part only. BOB is a CROSSED 3x long of 10 at the
+/// $100 mark with `A = −$1`. A SELL of 10 at $90 only reduces — no open loss, no `ooIM` — so it
+/// rests at that negative balance (B1). Five more at $90 only OPEN (the ten resting ahead of them
+/// take the whole closing room), and they add no `ooIM` either (`|N − Ask| < |N|`): their cost is
+/// the open loss alone, `5 × $10 = $50`, refused one unit short and rested at it.
+#[test]
+fn the_open_loss_is_charged_on_the_opening_part_only() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_type(&mut ctx, CAROL, M1, ISOLATED);
+    set_leverage(&mut ctx, BOB, M1, 3);
+    trade(&mut ctx, M1, BOB, CAROL, BUY, px(100), 10);
+    let pim = ceil_div(value(px(100), 10), 3);
+    set_wallet(&mut ctx, BOB, pim - USD);
+    assert_eq!(fold(&mut ctx, BOB).a, -(USD as i128));
+
+    place(&mut ctx, BOB, &order(M1, SELL, px(90), 10, GTC));
+    assert_eq!(pos(&mut ctx, BOB, M1).total_sell_qty, 10, "the reduce rests at A < 0");
+
+    let w_edge = pim + 50 * USD;
+    set_wallet(&mut ctx, BOB, w_edge - 1);
+    rejects(
+        &mut ctx,
+        BOB,
+        &order(M1, SELL, px(90), 5, GTC),
+        "placeOrder: insufficient perp wallet for margin",
+    );
+    set_wallet(&mut ctx, BOB, w_edge);
+    place(&mut ctx, BOB, &order(M1, SELL, px(90), 5, GTC));
+    assert_eq!(pos(&mut ctx, BOB, M1).total_sell_qty, 15);
+    assert_eq!(fold(&mut ctx, BOB).a, (50 * USD) as i128, "no ooIM: the cost was the loss alone");
+}
+
 // ── Q11 / -2023: an account in liquidation ────────────────────────────────────────────────────
 
 use crate::interface::IPerpDex::{
