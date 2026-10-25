@@ -376,7 +376,8 @@ impl UserAccount {
     /// ⚠️ Do NOT reach for this in engine logic. The clamped view is exactly what breaks the custody
     /// identity: summing wallets through this function over-states the protocol's liabilities by the
     /// size of every deficit — and since cross margin (P2) a negative cross wallet is a normal
-    /// state, not a corner (`trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet`
+    /// state, not a corner
+    /// (`trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet`
     /// produces the one ISOLATED state where it bites; `risk::tests::usdc_custody` asserts the two
     /// views AGREE on the isolated maker-fill path, which is what the M1 switch bought). Gates use
     /// `margin_view::derived_available_balance` (orders) and

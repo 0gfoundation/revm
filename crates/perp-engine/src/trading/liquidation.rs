@@ -448,7 +448,8 @@ pub(crate) fn run_adl<H: PerpHost>(
         rhs.cmp(&lhs).then_with(|| a.0.cmp(&b.0))
     });
     // The fallback tier cannot use ROE — its denominator may be <= 0 — so: HEALTHIEST first
-    // (equity at mark DESC — a CROSSED holder's account `E`), Address ASC tie-break. Not arbitrary: the shortfall a holder
+    // (equity at mark DESC — a CROSSED holder's account `E`), Address ASC tie-break. Not
+    // arbitrary: the shortfall a holder
     // contributes grows with how far under it already is, so this hands the fund the smallest
     // bill, and it naturally serves the merely-thin before the already-bankrupt.
     fallback.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

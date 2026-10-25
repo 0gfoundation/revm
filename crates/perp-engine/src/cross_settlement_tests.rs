@@ -538,7 +538,11 @@ fn a_mixed_account_funds_its_isolated_silo_and_nothing_for_its_cross_leg() {
 /// Moves `market`'s cumulative funding index (and its `Market` mirror — `save_funding_state` is
 /// the one door for both) without a tick.
 fn set_funding_index(ctx: &mut TestCtx, market: u64, index: i128) {
-    let fs = FundingState { last_funding_rate: 7_500, next_funding_ts: 0, cumulative_funding_index: index };
+    let fs = FundingState {
+        last_funding_rate: 7_500,
+        next_funding_ts: 0,
+        cumulative_funding_index: index,
+    };
     storage::save_funding_state(ctx, market, &fs).unwrap();
 }
 
@@ -937,6 +941,10 @@ fn transfer_out(amount: u64) -> Vec<u8> {
     transferFromPerpCall { amount }.abi_encode()
 }
 
+fn transfer_in(amount: u64) -> Vec<u8> {
+    crate::interface::IPerpDex::transferToPerpCall { amount }.abi_encode()
+}
+
 /// The money-out gates read `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, not `A`: cross profit
 /// admits orders but never leaves the wallet, and a NEGATIVE cross wallet withdraws nothing however
 /// much profit stands behind it — while a deposit nets against it.
@@ -995,11 +1003,13 @@ fn a_negative_cross_wallet_and_cross_profit_never_leave_through_the_money_out_ga
     rejects(&mut ctx, ALICE, &internal, "internalTransfer: insufficient perp wallet balance");
 
     // Money IN nets against the deficit — it lands in the same signed field.
-    storage::mutate_account(&mut ctx, ALICE, |a| a.usdc_balance = (USD as u64 * 1_000).to_string().into())
-        .unwrap();
+    storage::mutate_account(&mut ctx, ALICE, |a| {
+        a.usdc_balance = (USD as u64 * 1_000).to_string().into()
+    })
+    .unwrap();
     let ledger = Ledger::open(&mut ctx);
     let top_up = 300 * USD as u64;
-    ok(&mut ctx, ALICE, &crate::interface::IPerpDex::transferToPerpCall { amount: top_up }.abi_encode());
+    ok(&mut ctx, ALICE, &transfer_in(top_up));
     assert_eq!(wallet(&mut ctx, ALICE), w + top_up as i64);
     ledger.check(&mut ctx, "after the deposit");
 }
@@ -1132,13 +1142,14 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
             Vec::new()
         } else if roll < 84 {
             // Money back in from the spot balance — onto a possibly NEGATIVE wallet, where it nets.
-            let spot: U256 = storage::load_account(&mut ctx, u).unwrap().usdc_balance.clone().into();
+            let spot: U256 =
+                storage::load_account(&mut ctx, u).unwrap().usdc_balance.clone().into();
             let amount = spot.to::<u64>().min((1 + rng() % 300) * USD as u64);
             if amount == 0 {
                 continue;
             }
             let w = wallet(&mut ctx, u);
-            ok(&mut ctx, u, &crate::interface::IPerpDex::transferToPerpCall { amount }.abi_encode());
+            ok(&mut ctx, u, &transfer_in(amount));
             assert_eq!(wallet(&mut ctx, u), w + amount as i64, "step {step}: a top-up nets");
             JournalTr::take_logs(ctx.journal_mut())
         } else {
@@ -1222,7 +1233,8 @@ fn gated_off_every_money_path_is_byte_identical_to_explicitly_isolated() {
                 .abi_encode(),
         );
         run(ctx, ADMIN, depositInsuranceFundCall { amount: 1 }.abi_encode());
-        run(ctx, ALICE, addPositionMarginCall { marketId: M1, amount: 10 * USD as u64 }.abi_encode());
+        let top_up = addPositionMarginCall { marketId: M1, amount: 10 * USD as u64 };
+        run(ctx, ALICE, top_up.abi_encode());
         // CAROL's 3x long on M2 against BOB and ALICE, an empty book, a tick that takes it.
         run(ctx, BOB, order(M2, SELL, px(100), 5, GTC));
         run(ctx, ALICE, order(M2, SELL, px(100), 5, GTC));
