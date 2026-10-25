@@ -716,8 +716,11 @@ fn adl_fill(
     while t > 0 && t > floor {
         let v = calc_value(fill_price, t, bd, pd)?;
         // Trial on clones; commit only if BOTH sides are bad-debt free.
-        // Both legs are PURE CLOSES (`opening_qty == 0`), so the funding mode is inert — ADL never
-        // opens, and therefore never short-funds, a silo.
+        // Both legs are PURE CLOSES (`opening_qty == 0`), so the ISOLATED funding rule is inert —
+        // ADL never opens, and therefore never short-funds, a silo. The mode still matters for a
+        // CROSSED leg (`for_position` → `Cross`): its realized PnL settles into the cross wallet,
+        // either sign, and it reports NO bad debt — so on a cross winner the policy below binds
+        // only the loser's leg, and the winner's account absorbs the price.
         let mut lp = loser_pos.clone();
         let mut lw = *loser_wallet;
         let loser_outcome = apply_position_fill(
@@ -728,7 +731,7 @@ fn adl_fill(
             0,
             0,
             loser_close_is_buy,
-            OpeningMarginFunding::Requirement,
+            OpeningMarginFunding::for_position(loser_pos, OpeningMarginFunding::Requirement),
         )?;
         let mut wp = winner_pos.clone();
         let mut ww = *winner_wallet;
@@ -740,7 +743,7 @@ fn adl_fill(
             0,
             0,
             winner_close_is_buy,
-            OpeningMarginFunding::Requirement,
+            OpeningMarginFunding::for_position(winner_pos, OpeningMarginFunding::Requirement),
         )?;
         if policy.accepts(loser_outcome.bad_debt, winner_outcome.bad_debt) {
             *loser_pos = lp;

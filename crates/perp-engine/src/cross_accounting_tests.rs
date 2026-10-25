@@ -6,9 +6,9 @@
 //! * the invariant `CROSSED in force ⇒ pos.margin == 0`, asserted at `save_position`.
 //!
 //! Cross margin is gated off in production; the tests that need a position CROSSED in force take
-//! the `#[cfg(test)]` override (`margin_type::test_gate`). Until the fill path gains its cross
-//! branch, cross positions are SEEDED here (margin 0, through `save_position`), never opened by a
-//! fill.
+//! the `#[cfg(test)]` override (`margin_type::test_gate`). Cross positions are SEEDED here (margin
+//! 0, through `save_position`): these tests pin the fold and the views on exact planted states.
+//! Opening and closing them through real fills is `cross_settlement_tests` (P2b).
 use alloy_sol_types::{SolCall, SolError};
 use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;

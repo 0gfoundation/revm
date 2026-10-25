@@ -414,9 +414,13 @@ impl TakerSettlement {
                 (sim_pos, cancelled_any)
             };
 
-        // The wallet `finalize_apply`'s debit will leave. Cannot underflow: both branches above
-        // exit with `derived_can_afford(available, total_required)` true, and
-        // `available = wallet − Σ ooIM ≤ wallet` because `Σ ooIM ≥ 0`.
+        // The wallet `finalize_apply`'s debit will leave. For an account with no position CROSSED
+        // in force it cannot go below zero: both branches above exit with
+        // `derived_can_afford(available, total_required)` true, and there
+        // `available = wallet − Σ ooIM ≤ wallet` because `Σ ooIM ≥ 0`. A cross account's
+        // available also counts its cross unrealized PnL, so its fee may legitimately take the
+        // wallet negative (backed by that PnL); the checked `i64` subtraction cannot underflow in
+        // either case.
         let rest_wallet = wallet
             .checked_sub(checked_u64_to_i64(
                 core.total_required,
@@ -624,8 +628,9 @@ pub(super) enum MakerFillOutcome {
     /// The fill was NOT applied and the caller must cancel the maker order. TWO triggers, both
     /// meaning "this maker cannot take this fill":
     ///
-    /// 1. it would open/increase the position below the maintenance-margin threshold at the
-    ///    current mark (K9);
+    /// 1. it would open/increase an ISOLATED position below the maintenance-margin threshold at
+    ///    the current mark (K9 — a CROSSED maker is never refused on solvency, see
+    ///    `settle_maker_fill_core`);
     /// 2. it would open at a leverage the resulting size's margin tier no longer permits.
     ///
     /// A wallet SHORTFALL is deliberately NOT in this list: the fill happens and the wallet goes
@@ -1730,6 +1735,12 @@ fn finalize_core(
         };
     }
 
+    // NOT capped, unlike the maker path: the taker's draw is gated at fill time — the caller
+    // (`finalize_compute`) refuses, or covers-then-refuses, unless `available` covers
+    // `total_required`, and for an ISOLATED open the silo's cash is also refused unless the
+    // wallet itself holds it (J6), so the cash IS there. A cap here would silently short-fund a
+    // taker the gates already vouched for. A CROSSED position moves no cash at all (`Cross`).
+    let funding = OpeningMarginFunding::for_position(pos, OpeningMarginFunding::Requirement);
     let fill_outcome = apply_position_fill(
         pos,
         &mut account.perp_wallet_balance,
@@ -1738,11 +1749,7 @@ fn finalize_core(
         opening_qty,
         opening_value,
         is_buy,
-        // NOT capped, unlike the maker path: the taker's draw is gated at fill time — the caller
-        // (`finalize_compute`) refuses, or covers-then-refuses, unless `available` covers
-        // `total_required`, and `available = wallet − Σ ooIM ≤ wallet`, so the cash IS there. A cap
-        // here would silently short-fund a taker the gate already vouched for.
-        OpeningMarginFunding::Requirement,
+        funding,
     )?;
 
     // ── THE PROOF THAT THE APPORTIONMENT IS EXACT ───────────────────────────────────────────────
@@ -1797,8 +1804,15 @@ fn finalize_core(
     // Open-into-insolvency guard (K9): a taker may not open/increase a position that is already
     // below maintenance margin at the current mark. Skipped when mark is unset (0). Closing/
     // reducing is never gated: its realized loss beyond margin is legitimate bad debt.
+    //
+    // ISOLATED only. A CROSSED position holds no silo (`pos.margin == 0`), so this per-position
+    // predicate would read its equity as bare uPnL — the open's own slippage below MM — and refuse
+    // virtually every cross open. Cross solvency is ACCOUNT-level (`E ≥ Σ_C MM`); the taker's
+    // account-level check is cross P2c's (J1: `E_post ≥ ΣMM_post`, from the same fold
+    // `finalize_compute` already walks for the available-balance gate).
     if opening_qty > 0
         && mark_price > 0
+        && funding != OpeningMarginFunding::Cross
         && !is_above_maintenance_margin(
             &market.tiers,
             mark_price,
@@ -1948,6 +1962,10 @@ pub(super) fn settle_maker_fill_core(
     }
     let mut trial_pos = pos.clone();
     let mut trial_wallet = account.perp_wallet_balance;
+    // M1 (see the block below `trial_wallet -= opening_margin`): the maker's ISOLATED opening leg
+    // is funded with the cash actually at hand, and `trial_pos.margin` carries any shortfall. A
+    // CROSSED maker moves no cash (`Cross`): the fee and any realized loss land on the wallet.
+    let funding = OpeningMarginFunding::for_position(pos, OpeningMarginFunding::CappedAtCashAtHand);
     let fill_outcome = apply_position_fill(
         &mut trial_pos,
         &mut trial_wallet,
@@ -1956,9 +1974,7 @@ pub(super) fn settle_maker_fill_core(
         fill.opening_qty,
         fill.opening_value,
         fill.is_buy,
-        // M1 (see the block below `trial_wallet -= opening_margin`): the maker's opening leg is
-        // funded with the cash actually at hand, and `trial_pos.margin` carries any shortfall.
-        OpeningMarginFunding::CappedAtCashAtHand,
+        funding,
     )?;
 
     // ── Maker trading fee: charged from the margin this fill just funded (Binance parity) ──
@@ -2066,8 +2082,14 @@ pub(super) fn settle_maker_fill_core(
     // Open-into-insolvency guard (K9): a fill may not open/increase the maker's position below
     // maintenance margin at the current mark. Skipped when mark == 0. Closing/reducing is never
     // gated — its realized loss beyond margin is legitimate bad debt (absorbed on accept).
+    //
+    // ISOLATED only — see the taker's K9 in `finalize_core` for why the per-position predicate
+    // cannot judge a CROSSED position. And unlike the taker, a cross MAKER gets no account-level
+    // replacement: Binance does not refuse an already-resting order at match time, so neither do
+    // we (owner decision Q9 / deviation D13). The liquidation sweep is the backstop (cross P3).
     if fill.opening_qty > 0
         && mark_price > 0
+        && funding != OpeningMarginFunding::Cross
         && !is_above_maintenance_margin(
             &market.tiers,
             mark_price,
@@ -2435,9 +2457,22 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
 /// settlement_credit = margin_release + realized_pnl
 /// ```
 ///
-/// A positive `settlement_credit` is credited to the wallet. A negative one never touches the
-/// wallet: it is drawn from the position's remaining margin (if positive), and whatever that cannot
-/// cover is bad debt for the insurance fund (see `bad_debt` below).
+/// For an ISOLATED position a positive `settlement_credit` is credited to the wallet, and a
+/// negative one never touches the wallet: it is drawn from the position's remaining margin (if
+/// positive), and whatever that cannot cover is bad debt for the insurance fund (see `bad_debt`
+/// below).
+///
+/// # A CROSSED position ([`OpeningMarginFunding::Cross`], cross margin P2)
+///
+/// It has no silo (`pos.margin == 0`, asserted at `storage::save_position`), so `margin_release`
+/// is 0 and the whole `settlement_credit` is the realized PnL — and it goes to the CROSS WALLET,
+/// **either sign**. A loss larger than the wallet takes `W` below zero; there is no per-fill bad
+/// debt (cross report G2). That is Binance's cross model: realized PnL, fees and funding all land in
+/// `crossWalletBalance`, the account's other cross positions' unrealized profit is what backs a
+/// negative balance, and a deficit becomes an insurance-fund matter only at the ACCOUNT level —
+/// when the account holds no position at all (owner decision Q8, cross P3). The opening leg moves
+/// no cash either: its initial margin is DERIVED into the account's available balance
+/// (`margin_view::cross_fold`'s `A`), never physically moved out of the wallet.
 ///
 /// # Margin and vq fractions
 ///
@@ -2465,13 +2500,15 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
 /// Returns the opening margin, bad debt, and gross realized PnL:
 /// - `opening_margin` — margin the new position leg was ACTUALLY funded with; the caller
 ///   deducts exactly this from the wallet. Equal to the requirement `opening_value / L` under
-///   [`OpeningMarginFunding::Requirement`], and to `min(requirement, cash at hand)` under
-///   [`OpeningMarginFunding::CappedAtCashAtHand`].
+///   [`OpeningMarginFunding::Requirement`], to `min(requirement, cash at hand)` under
+///   [`OpeningMarginFunding::CappedAtCashAtHand`], and to `0` under
+///   [`OpeningMarginFunding::Cross`].
 /// - `bad_debt` — isolated-margin shortfall: when a close realizes a loss that
 ///   exceeds the closed slice's collateral, the deficit is drawn from the
 ///   position's REMAINING margin first; anything still uncovered is `bad_debt`,
-///   which the caller routes DIRECTLY to the Insurance Fund. A realized loss is
-///   never debited from the wallet or another position's margin.
+///   which the caller routes DIRECTLY to the Insurance Fund. An ISOLATED realized loss is
+///   never debited from the wallet or another position's margin. Always `0` for a CROSSED
+///   position, whose loss is debited from the wallet instead.
 /// - `realized_pnl` — gross close PnL, excluding released margin, fees, and funding.
 pub(super) struct PositionFillOutcome {
     pub(super) opening_margin: u64,
@@ -2479,8 +2516,15 @@ pub(super) struct PositionFillOutcome {
     pub(super) realized_pnl: i64,
 }
 
-/// How much of the opening leg's initial-margin REQUIREMENT this fill is allowed to fund —
-/// the M1/M1′ decision of `derived-ooim-plan.md` §3a.
+/// How a fill funds the opening leg's initial-margin REQUIREMENT — the M1/M1′ decision of
+/// `derived-ooim-plan.md` §3a for an ISOLATED position — and, through [`Self::Cross`], whether the
+/// position has a silo at all.
+///
+/// Callers do not pick [`Self::Cross`] themselves: they name their ISOLATED rule and pass it
+/// through [`Self::for_position`], which substitutes `Cross` for a position CROSSED in force. So
+/// every fill path — taker, maker, the liquidation close (a taker), both ADL legs, closePosition and
+/// fired conditionals (takers) — settles a cross position by the cross rule without having to
+/// remember to, and `apply_position_fill` asserts the two agree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum OpeningMarginFunding {
     /// Fund the requirement IN FULL. For callers that have already gated the draw against
@@ -2495,6 +2539,27 @@ pub(super) enum OpeningMarginFunding {
     /// deliberately `1.05818580` short). Used by the maker fill, which is NOT gated at fill time:
     /// nothing is escrowed at placement and admission was checked once, when the order rested.
     CappedAtCashAtHand,
+    /// The position is CROSSED in force (cross margin P2): NO silo. The opening leg moves no cash
+    /// (`opening_margin == 0`, so `pos.margin` stays 0 and the fee falls wholly on the wallet via
+    /// `fee_from_margin = min(fee, 0) = 0`), and a closing leg credits its realized PnL to the
+    /// wallet, POSITIVE OR NEGATIVE, with no per-fill bad debt. See [`apply_position_fill`].
+    Cross,
+}
+
+impl OpeningMarginFunding {
+    /// The mode a fill on `pos` settles under: [`Self::Cross`] for a position CROSSED in force
+    /// ([`crate::margin_type::effective_margin_type`]), else `isolated` — the caller's ISOLATED
+    /// rule. Total (the type gate has no error path), so it is safe on the liquidation and ADL
+    /// paths. While cross margin is gated off this is always `isolated`.
+    #[inline]
+    pub(super) fn for_position(pos: &crate::types::PerpPosition, isolated: Self) -> Self {
+        debug_assert!(isolated != Self::Cross, "for_position takes the caller's ISOLATED rule");
+        if crate::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed {
+            Self::Cross
+        } else {
+            isolated
+        }
+    }
 }
 
 // 8 args: the fill's two legs are four of them, and `funding` (the M1 cap) has to be a parameter
@@ -2511,6 +2576,16 @@ pub(super) fn apply_position_fill(
     is_buy: bool,
     funding: OpeningMarginFunding,
 ) -> Result<PositionFillOutcome, PerpError> {
+    // The caller's mode and the position's type in force must agree — `for_position` is the one
+    // place the choice is made, and a cross position settled by an isolated rule (or the reverse)
+    // would move cash into, or out of, a silo the position does not have.
+    let cross = funding == OpeningMarginFunding::Cross;
+    debug_assert_eq!(
+        cross,
+        crate::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed,
+        "apply_position_fill: funding mode {funding:?} disagrees with the position's margin type \
+         in force — route it through OpeningMarginFunding::for_position"
+    );
     let mut bad_debt = 0u64;
     let mut realized_pnl = 0i64;
     if closing_qty > 0 {
@@ -2573,7 +2648,24 @@ pub(super) fn apply_position_fill(
             .margin
             .checked_sub(margin_release)
             .ok_or_else(|| perp_err("settlement: margin overflow"))?;
-        if settlement_credit >= 0 {
+        if cross {
+            // CROSSED (cross report G2): no silo to draw from and no per-fill bad debt. The close
+            // settles against the CROSS WALLET whatever its sign — a profit raises `W`, a loss
+            // lowers it, through zero if it must. `margin_release` is 0 (a cross position holds no
+            // margin), so this is exactly `W += realized`.
+            //
+            // A negative `W` is a normal cross state, not a fault: it is backed by the account's
+            // other cross positions' unrealized profit (`E = cWB + Σ_C uPnL` is what liquidation
+            // reads), it refuses every opening and every money-out gate through `A` / `X`
+            // (`margin_view::cross_fold`), and it nets against the next deposit or profit. Only an
+            // account with NO position left has its negative balance cleared by the insurance fund
+            // (owner decision Q8, cross P3).
+            //
+            // Checked, not saturating: a saturated wallet would mint or burn silently.
+            *wallet = wallet
+                .checked_add(settlement_credit)
+                .ok_or_else(|| perp_err("settlement: cross wallet overflow"))?;
+        } else if settlement_credit >= 0 {
             // Solvent close: the closed slice's leftover collateral + profit
             // returns to the wallet.
             *wallet = wallet.saturating_add(settlement_credit);
@@ -2644,9 +2736,14 @@ pub(super) fn apply_position_fill(
         //
         // `.max(0)`: an already-negative wallet has no cash to give, so such a fill opens a
         // position with ZERO margin rather than deepening the deficit.
+        //
+        // CROSSED: nothing moves. The requirement is not funded out of the wallet at all — it is
+        // DERIVED into the account's available balance (`PIM_k` in `A`), which is what the taker
+        // gate and every later admission read.
         let initial_margin = match funding {
             OpeningMarginFunding::Requirement => requirement,
             OpeningMarginFunding::CappedAtCashAtHand => requirement.min((*wallet).max(0) as u64),
+            OpeningMarginFunding::Cross => 0,
         };
         let initial_margin_i64 = checked_u64_to_i64(initial_margin, "settlement: initial margin")?;
         let opening_qty_i64 = checked_u64_to_i64(opening_qty, "settlement: opening quantity")?;

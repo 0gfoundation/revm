@@ -37,6 +37,10 @@ mod cross_margin_spec_tests;
 /// read surfaces.
 #[cfg(test)]
 mod cross_accounting_tests;
+/// Cross margin P2b: money movement on a CROSSED position — fills, funding, the P2 liquidation /
+/// ADL interim, J6 and the negative-wallet audit — under the custody identity.
+#[cfg(test)]
+mod cross_settlement_tests;
 pub mod risk;
 pub mod storage;
 pub mod trading;
