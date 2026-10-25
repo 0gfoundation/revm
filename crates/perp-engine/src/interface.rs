@@ -477,9 +477,12 @@ sol! {
         ///   under-covered account), but "you may withdraw a negative amount" is meaningless, so
         ///   this field floors at zero. **The un-clamped truth stays visible in
         ///   `availableBalance` right next to it** — that is why clamping here costs no
-        ///   information, and why it must NOT be done to `availableBalance` itself. (The
-        ///   money-out gates themselves still enforce `availableBalance`; moving them onto this
-        ///   number for CROSSED accounts is a later cross-P2 step.)
+        ///   information, and why it must NOT be done to `availableBalance` itself. The money-out
+        ///   gates (`transferFromPerp`, `internalTransfer` from the perp wallet,
+        ///   `depositInsuranceFund`, `addPositionMargin`) enforce exactly THIS number
+        ///   (`margin_view::derived_withdrawable_balance`), so cross unrealized profit and a
+        ///   negative cross wallet can never leave; for an account with no CROSSED position that is
+        ///   the same decision `availableBalance` gave for a positive amount.
         ///
         /// One earlier objection has dissolved and is recorded so it is not re-raised: the docs
         /// note `maxWithdrawAmount == availableBalance` on Binance as an OBSERVATION over 69
@@ -1624,13 +1627,17 @@ sol! {
         /// cancelled at fill time" (pre-escrow-removal behaviour), the next said the shortfall lands
         /// on the cross wallet (model M1′, a conjecture R11 refuted).)
         ///
-        /// `totalCrossWalletBalance` is nonetheless still `int64`, because one narrow case remains:
-        /// a maker commission the capped opening margin could not absorb — on a pure close, the
-        /// whole fee. A NEGATIVE cross wallet is a RECEIVABLE, not protocol bad debt: it is a
-        /// negative claim inside the custody identity, it blocks every money-out gate, and it nets
-        /// against the user's next deposit. See `types::UserAccount::perp_wallet_balance` for the
-        /// derivation, the no-double-count argument, and why absorbing it from the Insurance Fund
-        /// would be strictly worse.
+        /// `totalCrossWalletBalance` is `int64`, and a negative value is a NORMAL state for an
+        /// account holding CROSSED positions (cross margin P2): their realized losses, funding and
+        /// fees all settle into the cross wallet whatever its sign, backed by the account's other
+        /// cross positions. For an isolated-only account one narrow case remains: a maker commission
+        /// the capped opening margin could not absorb — on a pure close, the whole fee. Either way a
+        /// NEGATIVE cross wallet is a RECEIVABLE, not protocol bad debt: it is a negative claim
+        /// inside the custody identity, it blocks every money-out gate (`maxWithdrawAmount` is 0),
+        /// and it nets against the user's next deposit or profit. See
+        /// `types::UserAccount::perp_wallet_balance` for the derivation, the no-double-count
+        /// argument, and why absorbing it from the Insurance Fund before the account holds no
+        /// position would be strictly worse.
         ///
         /// There is no longer any clamped surface to work around: `AccountBalanceChanged` used to
         /// project the cross wallet through a `uint64` floored at 0, which hid a deficit from anyone

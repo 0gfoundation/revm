@@ -421,10 +421,12 @@ pub fn run_internal_transfer<H: PerpHost>(
             return Err(perp_err("internalTransfer: insufficient spot balance"));
         }
     } else {
-        // THE money-out gate of the perp wallet, identical to `transferFromPerp`'s: derived
-        // `available = perp_wallet_balance − Σ ooIM`, recomputed fresh (never cached — it moves
-        // with every market's mark). A positive `amount` must be covered in full.
-        let available = crate::margin_view::derived_available_balance(context, from)?;
+        // THE money-out gate of the perp wallet, identical to `transferFromPerp`'s: the derived
+        // withdrawable balance `X` (`perp_wallet_balance − Σ ooIM` floored at 0 for an account with
+        // no cross position; no unrealized profit and no negative cross wallet ever leaves),
+        // recomputed fresh (never cached — it moves with every market's mark). A positive `amount`
+        // must be covered in full.
+        let available = crate::margin_view::derived_withdrawable_balance(context, from)?;
         if !crate::margin_view::derived_can_afford(available, amount as i128) {
             return Err(perp_err(
                 "internalTransfer: insufficient perp wallet balance",

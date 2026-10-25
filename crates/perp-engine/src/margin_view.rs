@@ -10,9 +10,10 @@
 //! requirement is computed here, on demand, from `(N, Bid, Ask, L)`.
 //!
 //! So this is no longer a pure read layer: [`derived_available_balance`] is the **admission
-//! basis** every money-out gate in the engine now asks. It still writes nothing — every loader it
-//! calls is a `_ref` (cache-fill, never dirty-mark) reader, so it enters no key into the block
-//! delta — but its ANSWER now decides accept/reject.
+//! basis** every order gate in the engine asks, and [`derived_withdrawable_balance`] its
+//! money-out companion (cross P2b: `X`, which no unrealized profit reaches). Both still write
+//! nothing — every loader they call is a `_ref` (cache-fill, never dirty-mark) reader, so they
+//! enter no key into the block delta — but their ANSWERS decide accept/reject.
 //!
 //! ```text
 //! Bid            = pos.total_buy_notional      Σ resting buys  qty × frozen assuming price
@@ -22,7 +23,9 @@
 //! available      = perp_wallet_balance − Σ_markets ooIM(market)
 //! ```
 //!
-//! summed over the per-user market index (the only enumerable set of a user's markets).
+//! summed over the per-user market index (the only enumerable set of a user's markets). That is
+//! the basis for an account with no position CROSSED in force; the cross fold
+//! ([`cross_fold`], cross margin P2) generalises it to Binance's `A` and `X`.
 //! `perp_wallet_balance` is the analogue of Binance's `crossWalletBalance`: position margin has
 //! been physically moved out of it, the open-order requirement has NOT.
 //!
@@ -1010,6 +1013,34 @@ pub fn derived_available_balance_with<H: PerpHost>(
     override_market: Option<(u64, &crate::types::PerpPosition)>,
 ) -> Result<i128, PerpError> {
     Ok(cross_fold_checked(context, user, wallet_override, override_market, None)?.a)
+}
+
+/// What may LEAVE the perp wallet now — Binance's `maxWithdrawAmount`, [`CrossFold::x`] of
+/// [`cross_fold_checked`]:
+///
+/// ```text
+/// X = max(0, min(cWB − Σ_I ooIM − Σ_C MM,  A))
+/// ```
+///
+/// **THE money-out basis** (`transferFromPerp`, `internalTransfer` out of the perp wallet,
+/// `depositInsuranceFund`, `addPositionMargin`), where [`derived_available_balance`] is the
+/// ORDER basis. The difference is the whole point of cross margin's two numbers (cross report
+/// §1.2, F3/F4): the first term holds no unrealized PnL at all, so cross profit can back an order
+/// (it is in `A`) but can never leave the wallet, and the second term charges cross losses. A
+/// negative cross wallet — a normal cross state since P2b (a realized loss, a funding charge or a
+/// fee settles into `W` whatever its sign) — therefore withdraws NOTHING, however much cross
+/// profit stands behind it: no money-out gate can walk an account away from its own receivable.
+///
+/// For an account with no position CROSSED in force `X = max(0, A)`, and every caller gates a
+/// POSITIVE amount, for which `X ≥ amount ⇔ A ≥ amount`: the isolated money-out gates decide
+/// exactly as they did on `A`.
+///
+/// Recomputed on every call, never cached — see [`derived_available_balance_with`].
+pub fn derived_withdrawable_balance<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+) -> Result<i128, PerpError> {
+    Ok(cross_fold_checked(context, user, None, None, None)?.x)
 }
 
 /// The affordability test on the derived basis: `available >= requirement`, with a NON-POSITIVE

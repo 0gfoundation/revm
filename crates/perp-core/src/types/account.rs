@@ -81,55 +81,72 @@ pub struct UserAccount {
     #[serde(rename = "UB")]
     pub usdc_balance: AsBinStr,
 
-    /// Perp trading wallet — the CROSS wallet (Binance's `crossWalletBalance`): position margin has
-    /// been physically moved out of it, the derived open-order requirement has NOT.
+    /// Perp trading wallet — the CROSS wallet (Binance's `crossWalletBalance`, `W` in the cross
+    /// notation): ISOLATED position margin has been physically moved out of it, the derived
+    /// open-order requirement has NOT, and every position CROSSED in force settles into it.
     ///
-    /// **Signed on purpose** — not as a placeholder awaiting bankruptcy handling, but because one
-    /// narrow path can still legitimately drive it under zero (below).
+    /// **Signed, and negative is a NORMAL state** (cross margin P2). A CROSSED position has no silo
+    /// (`pos.margin == 0`), so its realized PnL, its funding and its fees all land HERE, whatever
+    /// their sign (`perp_engine::trading::settlement::apply_position_fill` under `Cross`,
+    /// `perp_engine::funding::compute_funding_settlement`): a cross close that loses more than the
+    /// wallet holds takes it below zero, and there is no per-fill bad debt to stop it (cross report
+    /// G2). That is Binance's cross model — and what makes a negative wallet NOT a fault is that it
+    /// is not the number solvency is judged on. The account's cross margin balance
+    /// `E = cWB + Σ_C uPnL` is (`cWB = W + Σ_C pending funding`): the other cross positions'
+    /// unrealized profit backs a negative `W`, and the account is liquidatable exactly when
+    /// `E < Σ_C MM` (`perp_engine::margin_view::cross_fold`; acted on by cross P3).
     ///
-    /// ⚠️ **This used to be documented as "the Binance-aligned representation". That claim was too
-    /// strong and has been withdrawn.** Binance's `availableBalance` does have a true value that
-    /// goes negative while the reported field is clamped at 0 (measured: reported `0.00000000`
-    /// against a back-solved `−0.00088443`), so the SHAPE — a genuinely signed internal balance —
-    /// is real. (We no longer copy the ABI-side floor at all; see the Observability section below.)
-    /// What is not aligned is what the
-    /// negative MEANS. R11 measured Binance's negative appearing only when the fill COMMISSION could
-    /// not be paid, at exactly the commission (`−0.25717240`), and cleared by the insurance fund
-    /// three seconds later (`derived-ooim-plan.md` §3a). This field used to represent something else
-    /// entirely: a PERSISTENT margin deficit, of unbounded size, that nothing in the engine cleared.
+    /// The ISOLATED producer from before cross margin is still here, unchanged and still bounded: a
+    /// maker fee the fill's (M1-capped) opening margin could not absorb — `fee_from_wallet` in
+    /// `settle_maker_fill_core`, chiefly on a pure close whose own proceeds an insolvent close ate
+    /// (pinned by `trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet`
+    /// for an isolated-only account). An ISOLATED loss never reaches the wallet: it is contained in
+    /// the silo, and what exceeds the silo is bad debt for the insurance fund. (Binance's R11
+    /// measurement of exactly that — a negative appearing only at the commission, `−0.25717240`,
+    /// cleared by the fund three seconds later — is where the isolated half of this rule comes
+    /// from; `derived-ooim-plan.md` §3a.)
     ///
-    /// That difference is gone on our side too. An underfunded maker fill no longer funds the silo in
-    /// full and drives this negative (model M1′, adopted from a conjecture §3.3 marked ~50/50); it
-    /// funds `pos.margin` with `min(requirement, cash at hand)` and leaves the SILO short — model
-    /// **M1**, which R11 measured (`trading::settlement::settle_maker_fill_core`). The deficit is
-    /// therefore attached to the POSITION, and closing or liquidating that position resolves it
-    /// through the existing bad-debt → insurance-fund path.
+    /// # What a negative value means, and what holds it in place
     ///
-    /// # When this is still negative, and what it means then
-    ///
-    /// One producer remains: a maker fee the fill's (capped) opening margin could not absorb —
-    /// `fee_from_wallet` in `settle_maker_fill_core` — chiefly on a PURE CLOSE, which has no opening
-    /// margin at all, whose own proceeds an insolvent close consumed. It is bounded by that fee.
-    /// Pinned by `trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet`,
-    /// which also enumerates why no other path can get here (every money-out gate and the taker fill
-    /// are gated on `available ≤ wallet`; funding settles into `pos.margin`; the clearance fee is
-    /// `.min(perp_wallet_balance.max(0))`; residual settlement and ADL only credit).
-    ///
-    /// While negative it is a RECEIVABLE, not a loss, and the machinery for that is unchanged:
+    /// A RECEIVABLE: value the account owes the system, held as one signed field. The machinery is:
     ///
     /// * **Nothing is over-promised.** The deficit enters the custody identity as a NEGATIVE claim,
     ///   so the sum of what everyone can withdraw is still ≤ what the DEX custodies. Clamping the
     ///   field at 0 is what breaks the identity — by exactly the deficit. The negative sign is
     ///   load-bearing accounting, not a placeholder.
-    /// * **It cannot be walked away from through the perp layer.** `available` is
-    ///   `perp_wallet_balance − Σ ooIM`, so a negative wallet refuses every money-out gate that
-    ///   reads it (`transferFromPerp`, `addPositionMargin`, `depositInsuranceFund`) and every
-    ///   risk-increasing admission; and because the deficit is ONE signed field, the next deposit
-    ///   NETS against it automatically rather than landing in a fresh spendable bucket.
-    /// * **It is NOT double-counted with the Insurance Fund.** Disjoint slices: the wallet only ever
-    ///   goes negative to pay the FEE RECIPIENT, and the fund absorbs only what a realized loss
-    ///   exceeded the position's margin by (`apply_position_fill` never debits a wallet —
-    ///   isolated margin).
+    /// * **It cannot be walked away from.** Every money-out gate (`transferFromPerp`,
+    ///   `internalTransfer` from the perp wallet, `depositInsuranceFund`, `addPositionMargin`) reads
+    ///   the withdrawable balance `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, whose first term
+    ///   holds no unrealized profit at all: a negative cross wallet withdraws NOTHING, however much
+    ///   profit stands behind it. Every risk-increasing admission reads `A = cWB + Σ_C (uPnL − PIM) −
+    ///   Σ ooIM`, which the deficit lowers one for one; an ISOLATED open must moreover find its silo's
+    ///   cash in the wallet itself (J6), so a deficit is never papered over with a silo.
+    /// * **It is collected.** The next deposit, the next profitable close, a funding credit and an
+    ///   isolated position's close credit all NET against it — it is one signed field, so nothing
+    ///   lands in a fresh spendable bucket.
+    /// * **It is NOT double-counted with the Insurance Fund.** Disjoint slices: the fund absorbs only
+    ///   ISOLATED bad debt (what a realized loss exceeded its own silo by — `apply_position_fill`
+    ///   never debits a wallet for an isolated loss), while a cross loss is never bad debt per fill
+    ///   and lives here.
+    ///
+    /// # When it is cleared — and when it must NOT be
+    ///
+    /// The insurance fund clears a negative wallet ONLY when the account holds no position at all,
+    /// cross or isolated (`open_position_count == 0`; Binance's rule, owner decision Q8 — cross P3).
+    /// Until then it stays negative: an isolated silo still open will return its close credit to
+    /// this wallet, and the cross positions still open may yet close in profit, so the protocol can
+    /// still collect it.
+    ///
+    /// ## ⛔ Do NOT "fix" a negative value by absorbing it from the Insurance Fund any earlier
+    ///
+    /// It is the change this shape invites, and it is strictly worse than leaving it alone. Custody
+    /// would still balance (the fund falls, the wallet rises), so the conservation gates would not
+    /// object — but it FORGIVES a debt the protocol can still collect, turning a receivable into a
+    /// socialised write-off, and while the account still holds an isolated silo it hands the user
+    /// the fund's money to keep (cross report J3). The same applies to the fill-time silo shortfall
+    /// of an isolated maker: the position may yet close in profit, and the fund already absorbs the
+    /// beyond-silo slice if it does not. Assertions in `usdc_custody` fail on purpose if anyone wires
+    /// up the latter. Leave them failing.
     ///
     /// # The custody identity
     ///
@@ -142,34 +159,28 @@ pub struct UserAccount {
     ///                          + insurance_fund + Σ (v_quote + signed_value(mark, amount))
     /// ```
     ///
-    /// The M1 switch needed NO new term in it: a short silo means `Σ position.margin` is lower and
-    /// `Σ perp_wallet_balance` higher by the same amount, and the identity sums both.
-    ///
-    /// ## ⛔ Do NOT "fix" a negative value by absorbing it from the Insurance Fund
-    ///
-    /// It is the change this shape invites, and it is strictly worse than leaving it alone. Custody
-    /// would still balance (the fund falls, the wallet rises), so the conservation gates would not
-    /// object — but it FORGIVES a debt the protocol can still collect, turning a receivable into a
-    /// socialised write-off. The same applies to the fill-time silo shortfall: the position may yet
-    /// close in profit, and the fund already absorbs the beyond-silo slice if it does not. Assertions
-    /// in `usdc_custody` fail on purpose if anyone adds either. Leave them failing.
+    /// Cross margin needed NO new term in it: a cross close moves value between `v_quote` and this
+    /// field exactly as an isolated close moves it between `v_quote`, the silo and this field, and
+    /// a cross funding settle moves it between counterparties' wallets (pending funding, counted
+    /// at its settlement value, closes the identity between settles).
+    /// `cross_settlement_tests::Ledger` re-checks it after every step of every cross money path —
+    /// open, close, flip, fee, funding, ADL, a wallet driven negative.
     ///
     /// ## Observability
     ///
     /// The true signed value is readable through EVERY published surface — there is no clamped one
     /// left. Both account views (`getAccount(address)`, index-driven, and
     /// `getAccountMargin(address, uint64[])`) return `int64 totalCrossWalletBalance` and
-    /// `int64 availableBalance` unclamped, AND so does the `AccountBalanceChanged` event, whose
-    /// `int64 totalCrossWalletBalance` is this field verbatim. (The event carries only the three
-    /// BALANCES — the account-level margin totals around them are `getAccount`-only, the way Binance
-    /// keeps them on REST rather than on `ACCOUNT_UPDATE`.) An operator watching only the EVENT stream can therefore
-    /// see a deficit appear, which used not to be true: the event projected the wallet through a
-    /// `uint64` floored at 0 (via [`UserAccount::visible_perp_wallet_balance`], now test-only), the
-    /// way Binance's own clamped `availableBalance` does
-    /// (`misc/binance-v3-account-balance-field-reference.md`, the `availableBalance` row / R5:
-    /// computed `−0.00085981`, reported `0.00000000`). (`getAccount` used to floor too, under the
-    /// name `availablePerpBalance`; that blind spot went when it became the full account-level
-    /// roll-up. The event's went with this change.)
+    /// `int64 availableBalance` unclamped (for an account holding cross positions `getAccount`'s
+    /// `totalCrossWalletBalance` is `cWB`, i.e. this field plus the cross funding accrued and not yet
+    /// settled), AND so does the `AccountBalanceChanged` event, whose `int64 totalCrossWalletBalance`
+    /// is this field verbatim. (The event carries only the three BALANCES — the account-level margin
+    /// totals around them are `getAccount`-only, the way Binance keeps them on REST rather than on
+    /// `ACCOUNT_UPDATE`.) An operator watching only the EVENT stream can therefore see a deficit
+    /// appear. (The event used to project the wallet through a `uint64` floored at 0, via
+    /// [`UserAccount::visible_perp_wallet_balance`], now test-only — the way Binance's own clamped
+    /// `availableBalance` does, `misc/binance-v3-account-balance-field-reference.md`, R5: computed
+    /// `−0.00085981`, reported `0.00000000`.)
     #[serde(rename = "PB")]
     pub perp_wallet_balance: i64,
 
@@ -364,13 +375,14 @@ impl UserAccount {
     ///
     /// ⚠️ Do NOT reach for this in engine logic. The clamped view is exactly what breaks the custody
     /// identity: summing wallets through this function over-states the protocol's liabilities by the
-    /// size of every deficit
-    /// (`trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet` produces
-    /// the one state where that still bites; `risk::tests::usdc_custody` asserts the two views now
-    /// AGREE on the maker-fill path, which is what the M1 switch bought). Gates use
-    /// `margin_view::derived_available_balance`, which is signed. What it is still FOR is pinning
-    /// that contrast in tests — asserting that a clamped reading would have reported 0 where the
-    /// honest surfaces report the deficit.
+    /// size of every deficit — and since cross margin (P2) a negative cross wallet is a normal
+    /// state, not a corner (`trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet`
+    /// produces the one ISOLATED state where it bites; `risk::tests::usdc_custody` asserts the two
+    /// views AGREE on the isolated maker-fill path, which is what the M1 switch bought). Gates use
+    /// `margin_view::derived_available_balance` (orders) and
+    /// `margin_view::derived_withdrawable_balance` (money out), both signed at the source. What
+    /// this is still FOR is pinning that contrast in tests — asserting that a clamped reading would
+    /// have reported 0 where the honest surfaces report the deficit.
     #[inline]
     pub fn visible_perp_wallet_balance(&self) -> u64 {
         if self.perp_wallet_balance <= 0 {
@@ -392,7 +404,9 @@ impl UserAccount {
         Ok(())
     }
 
-    /// Debits perp wallet balance, allowing the internal value to go negative.
+    /// Debits perp wallet balance, allowing the internal value to go negative — a normal state for
+    /// a cross account (see [`Self::perp_wallet_balance`]). No affordability rule lives here: the
+    /// caller's gate (`A` for orders, `X` for money out) decides whether the debit may happen.
     #[inline]
     pub fn debit_perp(&mut self, amount: u64) -> Result<(), PerpError> {
         let amount =

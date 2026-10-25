@@ -195,12 +195,15 @@ fn transfer_from_perp_core<H: PerpHost>(
     }
 
     let mut account = storage::load_account(context, account_addr)?;
-    // Derived-ooIM gate. Cash leaving the perp wallet entirely: `Σ ooIM` is untouched (neither
-    // the book nor any position moves), so the requirement is exactly `amount` and it must come
-    // out of AVAILABLE. This is THE money-out gate — the one place where getting the basis wrong
-    // lets a user strip the collateral out from under their own resting orders — so it reads
-    // `perp_wallet_balance − Σ ooIM`, never the raw wallet.
-    let available = crate::margin_view::derived_available_balance(context, account_addr)?;
+    // Derived money-out gate. Cash leaving the perp wallet entirely: `Σ ooIM` is untouched
+    // (neither the book nor any position moves), so the requirement is exactly `amount` and it must
+    // come out of the WITHDRAWABLE balance. This is THE money-out gate — the one place where getting
+    // the basis wrong lets a user strip the collateral out from under their own resting orders, or
+    // (cross margin) withdraw unrealized profit or walk away from a negative cross wallet — so it
+    // reads `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, never the raw wallet. For an account
+    // with no cross position that is `max(0, perp_wallet_balance − Σ ooIM)`, the basis it always
+    // read for a positive amount.
+    let available = crate::margin_view::derived_withdrawable_balance(context, account_addr)?;
     if !crate::margin_view::derived_can_afford(available, amount as i128) {
         return Err(perp_err(
             "transferFromPerp: insufficient perp wallet balance",

@@ -2096,20 +2096,27 @@ pub(super) fn settle_maker_fill_core(
     // legitimately funds its opening leg out of the closing leg's released margin and profit, so
     // most flips are fully funded and nothing is short at all.
     //
-    // # What can still take the wallet negative here: the COMMISSION, and only it
+    // # What can take the wallet negative here
     //
-    // `fee_from_wallet` above is `maker_fee − min(maker_fee, opening_margin)`, so when the capped
-    // opening margin cannot absorb the commission the wallet pays the rest and may go under — by at
-    // most the maker fee. This is deliberate and is §3a's recommendation for the commission gap
-    // ("让 `pos.margin` 再短那一截", i.e. let the silo carry it, and do NOT open a second
-    // insurance-fund path for it); the residue that reaches the wallet is the case with no silo to
-    // carry it at all — chiefly a PURE CLOSE (`opening_qty == 0` ⇒ `opening_margin == 0`) whose own
-    // proceeds were eaten by an insolvent close. Binance's wallet goes negative in exactly this
-    // one place too, and only this one. That is why `perp_wallet_balance` stays `i64` with a
-    // clamped ABI view (`types::account`), and why the negative-wallet gates
-    // (`derived_available_balance` refusing money-out, a deposit netting against it) are still
-    // live: they are now belt and braces for a commission-sized transient rather than the primary
-    // home of a structural deficit.
+    // ISOLATED: the COMMISSION, and only it. `fee_from_wallet` above is
+    // `maker_fee − min(maker_fee, opening_margin)`, so when the capped opening margin cannot absorb
+    // the commission the wallet pays the rest and may go under — by at most the maker fee. This is
+    // deliberate and is §3a's recommendation for the commission gap ("让 `pos.margin` 再短那一截",
+    // i.e. let the silo carry it, and do NOT open a second insurance-fund path for it); the residue
+    // that reaches the wallet is the case with no silo to carry it at all — chiefly a PURE CLOSE
+    // (`opening_qty == 0` ⇒ `opening_margin == 0`) whose own proceeds were eaten by an insolvent
+    // close.
+    //
+    // CROSSED (cross margin P2): anything the position realizes. There is no silo, so the realized
+    // PnL (`apply_position_fill` under `Cross`) and the whole fee land on this wallet, and a loss
+    // larger than it leaves it negative — a normal cross state, backed by the account's other
+    // cross positions and judged at the account level (`E < Σ_C MM`). No account-level check runs
+    // here (owner decision Q9).
+    //
+    // That is why `perp_wallet_balance` is `i64`, and why the negative-wallet machinery — the
+    // money-out gates on `X` (`margin_view::derived_withdrawable_balance`), the order gates on `A`,
+    // a deposit netting against the deficit — is a load-bearing part of the model, not a
+    // belt-and-braces guard (`types::UserAccount::perp_wallet_balance`).
     let opening_margin_i64 = checked_u64_to_i64(
         fill_outcome.opening_margin,
         "settlement: maker opening margin",
@@ -2767,8 +2774,9 @@ pub(super) fn apply_position_fill(
         //   `fee_from_margin = min(fee, opening_margin)` the commission comes out of this capped
         //   opening margin, so the silo is short by the commission too, and NO insurance-fund path
         //   is opened for it. (The wallet only pays a commission the opening margin could not
-        //   absorb, which is the one narrow way it can still go negative — bounded by the fee.
-        //   Binance's wallet does exactly that, transiently, before `INSURANCE_CLEAR`.)
+        //   absorb, which is the one narrow way an ISOLATED fill can still take it negative —
+        //   bounded by the fee. Binance's wallet does exactly that, transiently, before
+        //   `INSURANCE_CLEAR`. A CROSSED fill never reaches this cap: it funds nothing.)
         // * it is NOT `available = wallet − Σ ooIM`: ooIM is a LIEN, never a debit, and the lien
         //   being consumed here is this very order's. Netting other resting orders' liens out of
         //   the cap would starve the silo of money that has not left.

@@ -807,11 +807,15 @@ pub fn run_add_position_margin<H: PerpHost>(
     // touches the account-global wallet), or on this `account` copy's wallet for a CROSSED one.
     let pending_funding =
         compute_funding_settlement(context, caller, &market, &mut pos, Some(&mut account))?;
-    // Derived-ooIM gate. A CASH move (wallet → position margin), not an open-order requirement:
-    // it changes neither `Bid`/`Ask` nor `N` nor `L`, so Σ ooIM is unchanged and the requirement
-    // is exactly `amount`. It must come out of AVAILABLE, not the raw wallet — otherwise a user
-    // could park their whole balance in position margin out from under their resting orders.
-    let available = crate::margin_view::derived_available_balance(context, caller)?;
+    // Derived money-out gate. A CASH move (wallet → position margin), not an open-order
+    // requirement: it changes neither `Bid`/`Ask` nor `N` nor `L`, so Σ ooIM is unchanged and the
+    // requirement is exactly `amount`. It must come out of the WITHDRAWABLE balance, not the raw
+    // wallet — otherwise a user could park their whole balance in position margin out from under
+    // their resting orders — and not `A` either: for a cross account `A` counts cross unrealized
+    // profit, which must never become isolated collateral (J6 — this is Binance's add-margin cap,
+    // `max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, cross report F5). For an account with no cross
+    // position the two decide identically for a positive amount.
+    let available = crate::margin_view::derived_withdrawable_balance(context, caller)?;
     if !crate::margin_view::derived_can_afford(available, args.amount as i128) {
         return Err(perp_err(
             "addPositionMargin: insufficient perp wallet balance",
@@ -1207,12 +1211,18 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // Isolated margin: the position's loss (book leg + residual) was already contained
     // to its margin and any bad debt routed directly to the Insurance Fund by the close
     // paths (apply_position_fill / settle_liquidation_residual), so LIQUIDATION never drives
-    // the wallet negative. It may nonetheless ARRIVE here negative — a maker fill charges the part
-    // of its commission the (M1-capped) opening margin could not absorb to the wallet, which on a
-    // pure close is the whole fee (`settle_maker_fill_core`; a margin shortfall no longer reaches
-    // the wallet at all) — hence the `.max(0)` below: the clearance fee is capped at the
-    // POSITIVE balance, so an already-negative wallet is charged nothing rather than being pushed
-    // further under (and `as u64` on a negative i64 would otherwise wrap to an astronomical cap).
+    // the wallet negative. It may nonetheless ARRIVE here negative, and since cross margin (P2)
+    // that is a normal state rather than a corner: the same wallet is the CROSS wallet, which every
+    // cross position's realized loss, funding charge and fee settles into whatever its sign
+    // (`settlement::apply_position_fill` under `Cross`) — besides the isolated maker commission an
+    // M1-capped opening margin could not absorb (`settle_maker_fill_core`). Hence the `.max(0)`
+    // below: the clearance fee is capped at the POSITIVE balance, so an already-negative wallet is
+    // charged nothing rather than being pushed further under (and `as u64` on a negative i64 would
+    // otherwise wrap to an astronomical cap).
+    //
+    // P3 (J5 / Q3): an ISOLATED liquidation's fee is then capped at the close credit this close
+    // returned to the wallet instead, so it cannot quietly draw on the cross pool; and it becomes
+    // a rate on the closed NOTIONAL for both modes.
     // Charge the clearance fee from the liquidated user's remaining wallet (capped at the balance)
     // and credit it to the Insurance Fund.
     //
@@ -2066,8 +2076,8 @@ pub fn run_deposit_insurance_fund<H: PerpHost>(
     }
 
     let mut account = storage::load_account(context, caller)?;
-    // Derived-ooIM gate — a pure cash-out, see `addPositionMargin`.
-    let available = crate::margin_view::derived_available_balance(context, caller)?;
+    // Derived money-out gate — a pure cash-out, see `addPositionMargin` / `transferFromPerp`.
+    let available = crate::margin_view::derived_withdrawable_balance(context, caller)?;
     if !crate::margin_view::derived_can_afford(available, args.amount as i128) {
         return Err(perp_err(
             "depositInsuranceFund: insufficient perp wallet balance",

@@ -9,6 +9,8 @@
 //!   (no `Err`, no write), and ADL ranks a cross winner on its account `E` and settles it into `W`;
 //! * J6: the cash a TAKER moves into an ISOLATED silo must be in the wallet — cross unrealized
 //!   profit admits orders, it never becomes isolated collateral; the maker's M1 cap is unchanged;
+//! * the negative-wallet audit: every money-out gate reads `X`, so a negative cross wallet (or
+//!   cross profit) never leaves; a randomised mixed sequence keeps the identity after every step.
 //!
 //! Every scenario re-checks the custody identity after every step ([`Ledger::check`]): the
 //! price-independent sum `Σ spot + Σ W + Σ margin + Σ vQuote + Σ pending funding + IF` over every
@@ -28,7 +30,7 @@ use primitives::{address, hardfork::SpecId, Address, FixedBytes, Log, U256};
 
 use crate::{
     interface::IPerpDex::{
-        liquidateCall, placeOrderCall, setLeverageCall, setMarginTypeCall,
+        liquidateCall, placeOrderCall, setLeverageCall, setMarginTypeCall, transferFromPerpCall,
         updateIndexPriceCall, AccountBalanceChanged, Adl, FundingSettled, InsuranceFundChanged,
         InsuranceFundDepleted, Liquidation, PositionChanged,
     },
@@ -926,4 +928,254 @@ fn j6_a_maker_isolated_silo_stays_capped_at_the_cash_at_hand() {
     assert!(n > w0);
     assert_eq!(wallet(&mut ctx, ALICE), 0, "the silo took the cash at hand and no more");
     assert_eq!(pos(&mut ctx, ALICE, M2).margin, w0 - fee(n, MAKER_PPM as u64));
+}
+
+// ── The negative-wallet audit ─────────────────────────────────────────────────────
+
+fn transfer_out(amount: u64) -> Vec<u8> {
+    transferFromPerpCall { amount }.abi_encode()
+}
+
+/// The money-out gates read `X = max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, not `A`: cross profit
+/// admits orders but never leaves the wallet, and a NEGATIVE cross wallet withdraws nothing however
+/// much profit stands behind it — while a deposit nets against it.
+#[test]
+fn a_negative_cross_wallet_and_cross_profit_never_leave_through_the_money_out_gates() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+        set_type(&mut ctx, CAROL, m, ISOLATED);
+        set_leverage(&mut ctx, ALICE, m, 3);
+    }
+    set_wallet(&mut ctx, ALICE, 2_000 * USD);
+    let ledger = Ledger::open(&mut ctx);
+
+    // A cross long that triples: +$2,000 of profit on a $2,000 wallet.
+    trade(&mut ctx, M2, ALICE, BOB, BUY, px(100), 10);
+    set_mark(&mut ctx, M2, px(300));
+    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    let w = wallet(&mut ctx, ALICE);
+    assert!(f.a > 2_500 * USD as i128, "A counts the profit: {}", f.a);
+    // X is the wallet less the cross maintenance margin ($500 at $3,000 of notional): none of the
+    // profit, and none of what maintenance needs.
+    assert_eq!(f.x, w as i128 - 500 * USD as i128, "X does not count it");
+    assert!(f.x > 0 && f.x < f.a);
+    // More than X is refused, X itself goes through.
+    rejects(
+        &mut ctx,
+        ALICE,
+        &transfer_out(f.x as u64 + 1),
+        "transferFromPerp: insufficient perp wallet balance",
+    );
+    ok(&mut ctx, ALICE, &transfer_out(f.x as u64));
+    ledger.check(&mut ctx, "after withdrawing X");
+
+    // A cross loss on M1 takes the wallet negative: X is 0, so not one unit leaves — not through
+    // `transferFromPerp`, not through `internalTransfer` from the perp wallet.
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    set_mark(&mut ctx, M1, px(40));
+    ok(&mut ctx, ALICE, &order(M1, SELL, px(40), 10, GTC));
+    ok(&mut ctx, CAROL, &order(M1, BUY, px(40), 10, IOC));
+    ledger.check(&mut ctx, "after the losing close");
+    let w = wallet(&mut ctx, ALICE);
+    assert!(w < 0, "negative wallet: {w}");
+    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    assert!(f.a > 0, "the remaining cross profit still admits orders: A = {}", f.a);
+    assert_eq!(f.x, 0);
+    rejects(&mut ctx, ALICE, &transfer_out(1), "transferFromPerp: insufficient perp wallet balance");
+    let internal = crate::interface::IPerpDex::internalTransferCall {
+        to: ALICE,
+        fromWallet: 1,
+        toWallet: 0,
+        amount: USD as u64,
+    }
+    .abi_encode();
+    rejects(&mut ctx, ALICE, &internal, "internalTransfer: insufficient perp wallet balance");
+
+    // Money IN nets against the deficit — it lands in the same signed field.
+    storage::mutate_account(&mut ctx, ALICE, |a| a.usdc_balance = (USD as u64 * 1_000).to_string().into())
+        .unwrap();
+    let ledger = Ledger::open(&mut ctx);
+    let top_up = 300 * USD as u64;
+    ok(&mut ctx, ALICE, &crate::interface::IPerpDex::transferToPerpCall { amount: top_up }.abi_encode());
+    assert_eq!(wallet(&mut ctx, ALICE), w + top_up as i64);
+    ledger.check(&mut ctx, "after the deposit");
+}
+
+/// The custody identity under a RANDOMISED mixed sequence: three traders — ALICE CROSSED in both
+/// markets, BOB and CAROL CROSSED or ISOLATED per market at random — at random leverage on thin
+/// wallets, placing passive and aggressive orders on both markets, cancelling, transferring out,
+/// taking funding charges and credits, and riding oracle ticks that run the liquidation sweep and
+/// ADL. The identity is re-checked after EVERY operation, every withdrawal decision is checked
+/// against `X`, and the run must actually reach the cross paths it is about: cross fills, a
+/// negative cross wallet, liquidations, ADL fills on a cross winner.
+#[test]
+fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        let mut mk = storage::load_market(&mut ctx, m).unwrap().unwrap();
+        mk.liquidation_fee_rate_bps = 50; // a live clearance fee: wallet → fund, inside the identity
+        mk.price_band_bps = 1_000;
+        storage::save_market(&mut ctx, &mk).unwrap();
+    }
+    storage::save_insurance_fund(&mut ctx, 10_000_000 * USD as u64).unwrap();
+
+    let mut seed: u64 = 0xC205_5AFE_2B1D_0001;
+    let mut rng = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let traders = [ALICE, BOB, CAROL];
+    // ALICE trades taker-fee-free: an underwater cross account cannot pay a taker fee out of a
+    // negative available balance (an isolated one cannot either — the taker gate is cross P2c's),
+    // so without this its losing closes would only ever happen as a maker.
+    set_taker_fee(&mut ctx, ALICE, 0);
+    for &u in &traders {
+        set_wallet(&mut ctx, u, 1_500 * USD);
+        for m in MARKETS {
+            if u != ALICE && rng() % 2 == 0 {
+                set_type(&mut ctx, u, m, ISOLATED);
+            }
+            set_leverage(&mut ctx, u, m, if u == ALICE { 3 } else { 1 + rng() % 3 });
+        }
+    }
+    let ledger = Ledger::open(&mut ctx);
+
+    let mut index = [0i128; 2];
+    // The ORACLE index per market, walked on its own (not off the mark, which the book drags), as a
+    // sawtooth between $60 and $160 so positions really go under.
+    let mut oracle = [px(100) as i64; 2];
+    let mut target = [px(60) as i64; 2];
+    let mut ts = 30;
+    let mut resting: Vec<Vec<([u8; 32], u64)>> = vec![Vec::new(); 3];
+    let (mut cross_fills, mut negative_cross_wallets, mut liqs, mut cross_adl, mut withdrawals) =
+        (0u32, 0u32, 0u32, 0u32, 0u32);
+    for step in 0..2_000u32 {
+        let i = (rng() % 3) as usize;
+        let (u, j) = (traders[i], (rng() % 2) as usize);
+        let m = MARKETS[j];
+        let roll = rng() % 100;
+        let logs = if roll < 55 {
+            let mark = storage::load_mark_price(&mut ctx, m).unwrap();
+            let side = (rng() % 2) as u8;
+            let aggressive = rng() % 2 == 0;
+            let offset = (1 + rng() % 4) * 100;
+            let price = if (side == BUY) == aggressive {
+                mark + offset
+            } else {
+                mark.saturating_sub(offset).max(100)
+            };
+            let tif = if aggressive { IOC } else { GTC };
+            let before = pos(&mut ctx, u, m);
+            // ALICE trades bigger: the cross account is the one this test is about.
+            let qty = 1 + rng() % if u == ALICE { 15 } else { 8 };
+            let out = call(&mut ctx, u, &order(m, side, price, qty, tif));
+            let logs = JournalTr::take_logs(ctx.journal_mut());
+            if !out.reverted {
+                if tif == GTC {
+                    resting[i].push((out.bytes[..32].try_into().unwrap(), m));
+                }
+                let after = pos(&mut ctx, u, m);
+                if after.amount != before.amount
+                    && crate::margin_type::effective_margin_type(&after) == MarginType::Crossed
+                {
+                    cross_fills += 1;
+                }
+            }
+            logs
+        } else if roll < 65 {
+            // Cancel this trader's oldest resting order (it may already have filled — then the
+            // cancel is refused, which must write nothing either).
+            if resting[i].is_empty() {
+                continue;
+            }
+            let (id, mk) = resting[i].remove(0);
+            let input = crate::interface::IPerpDex::cancelOrderCall {
+                orderId: id.into(),
+                marketId: mk,
+            }
+            .abi_encode();
+            let _ = call(&mut ctx, u, &input);
+            JournalTr::take_logs(ctx.journal_mut())
+        } else if roll < 71 {
+            // A funding epoch on `m`, either sign; every payment is exact on this grid.
+            index[j] += 100_000 * ((rng() % 2_001) as i128 - 1_000);
+            set_funding_index(&mut ctx, m, index[j]);
+            Vec::new()
+        } else if roll < 78 {
+            let x = crate::margin_view::cross_fold(&mut ctx, u, None, None, None).unwrap().x;
+            // ALICE, while exposed, takes everything withdrawable — which leaves her
+            // wallet at the cross maintenance margin, so the next realized cross loss takes it
+            // below zero.
+            let exposed = MARKETS.iter().any(|&mk| pos(&mut ctx, ALICE, mk).amount != 0);
+            let amount = if u == ALICE && exposed {
+                (x as u64).max(1)
+            } else {
+                (1 + rng() % 200) * USD as u64
+            };
+            let out = call(&mut ctx, u, &transfer_out(amount));
+            assert_eq!(out.reverted, x < amount as i128, "step {step}: the gate is X = {x}");
+            withdrawals += u32::from(!out.reverted);
+            JournalTr::take_logs(ctx.journal_mut())
+        } else if roll < 80 {
+            // An oracle GAP: the mark jumps up to ±40% with no sweep (the next tick runs it). The
+            // identity is price-independent, so this only moves value between unrealized terms —
+            // and gives the next closes real losses to realize.
+            let mark = storage::load_mark_price(&mut ctx, m).unwrap() as i64;
+            let jump = mark * ((rng() % 81) as i64 - 40) / 100;
+            set_mark(&mut ctx, m, (mark + jump).max(100) as u64);
+            Vec::new()
+        } else if roll < 84 {
+            // Money back in from the spot balance — onto a possibly NEGATIVE wallet, where it nets.
+            let spot: U256 = storage::load_account(&mut ctx, u).unwrap().usdc_balance.clone().into();
+            let amount = spot.to::<u64>().min((1 + rng() % 300) * USD as u64);
+            if amount == 0 {
+                continue;
+            }
+            let w = wallet(&mut ctx, u);
+            ok(&mut ctx, u, &crate::interface::IPerpDex::transferToPerpCall { amount }.abi_encode());
+            assert_eq!(wallet(&mut ctx, u), w + amount as i64, "step {step}: a top-up nets");
+            JournalTr::take_logs(ctx.journal_mut())
+        } else {
+            if (oracle[j] - target[j]).abs() < 500 {
+                target[j] = if target[j] == px(60) as i64 { px(160) as i64 } else { px(60) as i64 };
+            }
+            oracle[j] =
+                (oracle[j] + (target[j] - oracle[j]) / 3 + (rng() % 300) as i64 - 150).max(100);
+            ts += 15;
+            ok(
+                &mut ctx,
+                ADMIN,
+                &updateIndexPriceCall { marketId: m, indexPrice: oracle[j] as u64, timestamp: ts }
+                    .abi_encode(),
+            )
+        };
+        assert_eq!(count_events::<InsuranceFundDepleted>(&logs), 0, "step {step}: socialised loss");
+        liqs += count_events::<Liquidation>(&logs) as u32;
+        for (winner, _, _) in adl_fills(&logs) {
+            if pos(&mut ctx, winner, m).margin_type == CROSSED {
+                cross_adl += 1;
+            }
+        }
+        ledger.check(&mut ctx, &format!("step {step}"));
+        if wallet(&mut ctx, ALICE) < 0 {
+            negative_cross_wallets += 1;
+        }
+    }
+    eprintln!(
+        "coverage: cross fills {cross_fills}, steps with ALICE's cross wallet negative \
+         {negative_cross_wallets}, liquidations {liqs}, cross ADL fills {cross_adl}, withdrawals \
+         {withdrawals}"
+    );
+    // Coverage floors, about half of what this seed reaches (66 / 19 / 4 / 4 / 96), so a change
+    // that quietly stops the run from reaching a path fails here instead of passing vacuously.
+    assert!(cross_fills >= 30, "cross fills {cross_fills}");
+    assert!(negative_cross_wallets >= 5, "the cross wallet went negative on too few steps");
+    assert!(liqs >= 2, "liquidations {liqs}");
+    assert!(cross_adl >= 2, "ADL fills on a cross winner {cross_adl}");
+    assert!(withdrawals >= 40, "withdrawals {withdrawals}");
 }
