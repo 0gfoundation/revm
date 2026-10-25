@@ -333,6 +333,15 @@ use primitives::{B256, U256};
 //     differs only by the market blobs' extra byte — VERIFIED: with the field `#[serde(skip)]` it
 //     reproduced the previous 38 pin 0x37a18141…79de. BusinessSnapshot UNCHANGED. CHAIN change:
 //     golden re-pin + a coordinated wipe on deploy.
+//   * P1 — margin type, gated off. A LAYOUT change: `PerpPosition` gains a trailing "mt"
+//     (`margin_type`, u8, positional msgpack, appended, serde default; 0 = CROSSED, Binance's
+//     default, 1 = ISOLATED), so every position blob grows by one byte (a fixint). No execution
+//     rule moves: `CROSS_MARGIN_ENABLED = false`, so every position is ISOLATED in force whatever
+//     the byte says, and no margin rule reads it. Only reporting carries it (the effective type
+//     on `AccountPosition`, `PositionChanged`, `getSymbolConfig`; logs are not committed). The
+//     golden scenario's write set differs only by the position blobs' extra byte — VERIFIED: with
+//     the field `#[serde(skip)]` it reproduced the 39-P0 pin 0xafd82645…7b48. BusinessSnapshot
+//     UNCHANGED. CHAIN change: golden re-pin + a coordinated wipe on deploy.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

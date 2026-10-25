@@ -329,7 +329,7 @@ fn get_account(ctx: &mut TestCtx, user: Address) -> getAccountReturn {
 /// An array rather than a tuple because 17 fields is past the arity std implements `PartialEq` for —
 /// and positional over ALL of them on purpose: a comparison field-by-field by name would still pass
 /// if two same-typed fields were swapped on one side.
-fn row_fields(p: &AccountPosition) -> [i128; 18] {
+fn row_fields(p: &AccountPosition) -> [i128; 19] {
     [
         p.marketId as i128,
         p.markPrice as i128,
@@ -349,6 +349,7 @@ fn row_fields(p: &AccountPosition) -> [i128; 18] {
         p.isolatedWallet as i128,
         p.liquidationPrice as i128,
         p.cumulativeRealizedPnl as i128,
+        p.marginType as i128,
     ]
 }
 
@@ -1596,7 +1597,7 @@ fn get_account_positions_agree_with_get_position_risk_field_for_field() {
 
     // ── the fixture really does exercise every field ──
     // Without this the loop above could pass on three rows of zeros, which would prove nothing about
-    // the encoders. Each of the 16 non-id numbers has to be non-trivial SOMEWHERE in the row set.
+    // the encoders. Each of the 18 non-id numbers has to be non-trivial SOMEWHERE in the row set.
     let nonzero = |f: fn(&AccountPosition) -> i128| a.positions.iter().any(|p| f(p) != 0);
     assert!(
         nonzero(|p| p.markPrice as i128)
@@ -1615,7 +1616,8 @@ fn get_account_positions_agree_with_get_position_risk_field_for_field() {
             && nonzero(|p| p.maintMargin as i128)
             && nonzero(|p| p.isolatedWallet as i128)
             && nonzero(|p| p.liquidationPrice as i128)
-            && nonzero(|p| p.cumulativeRealizedPnl as i128),
+            && nonzero(|p| p.cumulativeRealizedPnl as i128)
+            && nonzero(|p| p.marginType as i128),
         "every row field must be non-trivial somewhere in the fixture, or the agreement above is \
          an agreement about zeros: {:?}",
         a.positions.iter().map(row_fields).collect::<Vec<_>>()
@@ -1736,9 +1738,10 @@ fn a_market_the_user_is_not_in_is_absent_from_positions_but_readable_singly() {
             0,
             0, // liquidationPrice: nothing to liquidate
             0, // cumulativeRealizedPnl: never traded here
+            1, // marginType: ISOLATED in force — the gate, not the stored default 0 (CROSSED)
         ],
         "a market the user holds nothing in reads back as a zero row at the market's live mark, \
-         with leverage floored to 1 — not a revert, and not absent"
+         with leverage floored to 1 and the gated margin type — not a revert, and not absent"
     );
 
     // ── THE ACCEPTED LIMITATION ON `cr`, stated as a test ──────────────────────────────────────

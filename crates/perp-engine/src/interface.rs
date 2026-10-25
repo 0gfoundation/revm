@@ -83,7 +83,7 @@ sol! {
         /// `margin_view::margin_info_of` — the single implementation of the per-market margin
         /// arithmetic. There is no second derivation to drift from and no second encoder to drop a
         /// field, and `margin_view_tests::get_account_positions_agree_with_get_position_risk_field_for_field`
-        /// asserts the two ACCESS PATHS agree positionally over all 18 numbers, on a live
+        /// asserts the two ACCESS PATHS agree positionally over all 19 numbers, on a live
         /// multi-market index, rather than trusting it.
         ///
         /// ⚠️ **REPLACES `getMarginInfo`**, which returned these same numbers minus `marketId` and
@@ -235,10 +235,26 @@ sol! {
         ///                         history in is not enumerable on chain. See the note on
         ///                         `PositionChanged`; a consumer wanting that set must keep its own.
         ///
-        /// A user with no position and no orders reads back all zeros with `leverage = 1`. Both
-        /// selectors REVERT if the market does not exist — the decimals and the tier table are
-        /// required INPUTS, so a fabricated zero market would report a full row of plausible zeros.
-        /// (`getPosition` differs here on purpose; see it.)
+        /// Setting (cross P1):
+        ///   marginType            the margin type IN FORCE for this `(user, marketId)`: `0` =
+        ///                         CROSSED, `1` = ISOLATED — Binance's `marginType` (and its V2
+        ///                         `isolated == (marginType == 1)`). The EFFECTIVE type, not the
+        ///                         stored choice: while cross margin is not enabled
+        ///                         (`types::CROSS_MARGIN_ENABLED`, off through the cross series'
+        ///                         P1–P3) EVERY row reports `1`, whatever was stored. One function
+        ///                         decides it (`margin_type::effective_margin_type`), and
+        ///                         `getSymbolConfig` and `PositionChanged` report the same value.
+        ///                         Like `leverage` it is a setting that survives the position
+        ///                         going flat; only `setMarginType` changes it.
+        ///                         ⚠️ ABI CHANGE: appended LAST in cross P1, so the struct is one
+        ///                         word longer. Inside `getAccount().positions[]` the row STRIDE
+        ///                         grows, so a binding generated before it mis-decodes every row
+        ///                         after the first — regenerate.
+        ///
+        /// A user with no position and no orders reads back all zeros with `leverage = 1` and
+        /// `marginType = 1`. Both selectors REVERT if the market does not exist — the decimals and
+        /// the tier table are required INPUTS, so a fabricated zero market would report a full row
+        /// of plausible zeros. (`getPosition` differs here on purpose; see it.)
         struct AccountPosition {
             uint64 marketId;         // which market this row is for
             // ── inputs: every field below is recomputable from these six ──
@@ -261,6 +277,8 @@ sol! {
             // ── derived, ours ──
             uint64 liquidationPrice;
             int64  cumulativeRealizedPnl;
+            // ── setting (cross P1, appended) ──
+            uint8  marginType;       // 0 CROSSED, 1 ISOLATED — the type IN FORCE
         }
         /// Query a user's spot USDC plus the full account-level margin roll-up, over the markets
         /// the user is actually active in. **INDEX-DRIVEN**: the caller passes no market list —
@@ -363,9 +381,11 @@ sol! {
         /// literally, and three of its fields are absent on purpose. `symbol`: we key by
         /// `marketId`, and the backend maps id → symbol itself from the `MarketAdded` log (a string
         /// repeated in 16 rows is calldata spent on data the caller already has). `isolated`:
-        /// always `true` — this venue has no cross mode. `positionSide`: always `BOTH` — one-way
-        /// mode only. A backend serving a Binance-shaped `/account` fills those three in itself,
-        /// from constants and its own market table.
+        /// DERIVED from the row's `marginType` (`isolated == (marginType == 1)`) — no longer a
+        /// constant since cross P1, though while cross margin is gated off every row still reports
+        /// ISOLATED. `positionSide`: always `BOTH` — one-way mode only. A backend serving a
+        /// Binance-shaped `/account` fills those three in itself, from the row, a constant and its
+        /// own market table.
         ///
         /// ⚠️ `totalCrossUnPnl` AND `maxWithdrawAmount` ARE PRESENT BUT DEGENERATE. Read this before
         /// using either — both were once deliberately omitted, and one of those reasons still bites.
@@ -993,9 +1013,9 @@ sol! {
             uint8 keyId,
             bytes calldata signature
         ) external;
-        /// A user's leverage in one market, together with the largest position the market's risk
-        /// table permits AT that leverage. Binance's `/fapi/v1/symbolConfig` row, less the
-        /// constants. Reverts if the market does not exist.
+        /// A user's leverage and margin type in one market, together with the largest position the
+        /// market's risk table permits AT that leverage. Binance's `/fapi/v1/symbolConfig` row,
+        /// less the constants. Reverts if the market does not exist.
         ///
         ///   leverage          the position's `leverage` setting, `1` when unset — the same
         ///                     floored value `getPosition` and every `AccountPosition` row report, so this selector cannot disagree
@@ -1008,6 +1028,14 @@ sol! {
         ///                     today ships the single default tier `{0, 3}`, so every market today
         ///                     returns `0` at every legal leverage; the field only becomes
         ///                     informative once `setMarginTiers` installs a real table.
+        ///   marginType        the margin type IN FORCE: `0` = CROSSED, `1` = ISOLATED — the
+        ///                     same effective value every `AccountPosition` row and
+        ///                     `PositionChanged` carry. While cross margin is not enabled
+        ///                     (`types::CROSS_MARGIN_ENABLED`, off through the cross series' P1–P3)
+        ///                     it is `1` for every user in every market.
+        ///                     ⚠️ ABI CHANGE (cross P1): APPENDED as a third return word, after the
+        ///                     two existing ones, rather than first as in Binance's JSON — so a
+        ///                     decoder reading the old two words still finds them where they were.
         ///
         /// ⚠️ WHY THIS IS A SELECTOR AND NOT `getMarginTiers` PLUS CLIENT ARITHMETIC. The chain
         /// enforces the tier table in ONE direction — given a notional, which leverage is still
@@ -1020,15 +1048,17 @@ sol! {
         /// `math::max_notional_for_leverage` is the inversion, it lives next to the forward lookup
         /// it inverts, and this selector is how it gets out.
         ///
-        /// ⚠️ NUMBERS ONLY — `marginType` and `isAutoAddMargin` are deliberately ABSENT. Binance's
-        /// row carries both; ours would be the constants `"ISOLATED"` and `false` for every user in
-        /// every market forever (this venue has no cross mode and no auto-margin-add), and encoding
-        /// a constant into a return value spends calldata on data the caller already has. The
-        /// `AccountPosition` comment states the same rule for `symbol` / `isolated` /
-        /// `positionSide`. A backend serving a Binance-shaped `/symbolConfig` fills them in itself.
+        /// ⚠️ NUMBERS ONLY — `isAutoAddMargin` is deliberately ABSENT. Binance's row carries it;
+        /// ours would be the constant `false` for every user in every market forever (this venue
+        /// has no auto-margin-add), and encoding a constant into a return value spends calldata on
+        /// data the caller already has. The `AccountPosition` comment states the same rule for
+        /// `symbol` / `positionSide`. A backend serving a Binance-shaped `/symbolConfig` fills it
+        /// in itself. (`marginType` was absent on the same grounds until cross P1 made it a real
+        /// per-user setting.)
         function getSymbolConfig(address user, uint64 marketId) external view returns (
             uint64 leverage,
-            uint64 maxNotionalValue
+            uint64 maxNotionalValue,
+            uint8 marginType
         );
 
         // ── Trading ────────────────────────────────────────────────────────
@@ -2195,7 +2225,7 @@ sol! {
         ///   bep  breakeven price   breakevenPrice    ⚠️ PLACEHOLDER, always 0 — see below
         ///   cr   cumulative rPnL   cumulativeRealizedPnl  POPULATED. A LEVEL, not a delta.
         ///   up   unrealised PnL    unrealizedProfit
-        ///   mt   margin type       constant "isolated" — we have no cross mode
+        ///   mt   margin type       marginType        0 = "cross", 1 = "isolated" — IN FORCE (below)
         ///   iw   isolated wallet   margin
         ///   ps   position side     constant "BOTH"     — one-way mode only
         ///   ma   margin asset      constant "USDC"     — single-collateral venue
@@ -2227,6 +2257,13 @@ sol! {
         ///                     AVERAGE entry over everything still open — after a partial close it
         ///                     is NOT the last fill price. Derived by `math::calc_entry_price`,
         ///                     the algebraic inverse of the `calc_value` the fills used.
+        ///   marginType        the margin type IN FORCE for this `(user, marketId)`, `0` = CROSSED,
+        ///                     `1` = ISOLATED — the same effective value `AccountPosition.marginType`
+        ///                     and `getSymbolConfig` report. While cross margin is not enabled
+        ///                     (`types::CROSS_MARGIN_ENABLED`, cross series P1–P3) it is always `1`.
+        ///                     ⚠️ ABI CHANGE (cross P1): APPENDED as the last field, so the event
+        ///                     SIGNATURE — and topic0 — changed. An indexer filtering on the old
+        ///                     topic0 sees no `PositionChanged` at all; regenerate the binding.
         ///   unrealizedProfit  Binance's `positionAmt × (markPrice − entryPrice)` at the market's
         ///                     CURRENT mark, computed as `signedNotional + vQuoteBalance` so the
         ///                     only rounding in it is the truncation already inside
@@ -2284,7 +2321,7 @@ sol! {
         /// `Trade.takerFee` / `Trade.makerFee`. When it IS populated the test asserting it zero
         /// must be updated in the same change — see
         /// `the_breakeven_price_placeholder_is_zero`.
-        event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage, int64 realizedPnl, uint64 closedQuantity, uint64 entryPrice, int64 unrealizedProfit, int64 cumulativeRealizedPnl, uint64 breakevenPrice);
+        event PositionChanged(address indexed user, uint64 indexed marketId, int64 amount, int64 vQuoteBalance, int64 margin, uint64 leverage, int64 realizedPnl, uint64 closedQuantity, uint64 entryPrice, int64 unrealizedProfit, int64 cumulativeRealizedPnl, uint64 breakevenPrice, uint8 marginType);
         // Feeds: isolated margin adjustment history. delta > 0 means add margin; delta < 0 means remove margin.
         event PositionMarginAdjusted(address indexed user, uint64 indexed marketId, int64 delta, int64 margin);
         // Feeds: useful for debugging / audit; no direct REST endpoint

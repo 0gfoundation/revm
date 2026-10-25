@@ -19,7 +19,7 @@ pub use order::{
     OrderType, Side, StpMode, TimeInForce, WorkingType, ALGO_TYPE_CONDITIONAL,
 };
 pub use position::{
-    MarginTier, MarginTiers, Market, MarketHot, PerpPosition, BASIS_MODE_EWMA,
-    BASIS_MODE_WINDOW, DEFAULT_MAX_LEVERAGE,
+    MarginTier, MarginTiers, MarginType, Market, MarketHot, PerpPosition, BASIS_MODE_EWMA,
+    BASIS_MODE_WINDOW, CROSS_MARGIN_ENABLED, DEFAULT_MAX_LEVERAGE,
     MAX_LEVERAGE_HARD_CAP, MAX_MARGIN_TIERS, MMR_PPM_ONE,
 };

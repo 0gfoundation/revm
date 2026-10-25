@@ -1176,33 +1176,81 @@ pub fn save_position_leverage_only<H: PerpHost>(
     #[cfg(debug_assertions)]
     {
         let old = load_position_ref(context, user, market_id)?;
-        let same = |p: &PerpPosition| {
-            (
-                p.amount,
-                p.v_quote_balance,
-                p.margin,
-                p.total_buy_qty,
-                p.total_buy_notional,
-                p.total_sell_qty,
-                p.total_sell_notional,
-                // `cumulative_realized_pnl` too: nothing but a CLOSE may move it, and a leverage
-                // change closes nothing. It is not a balance, so unlike the fields above it would
-                // not desync a published total — it would corrupt a lifetime statistic, silently.
-                p.cumulative_realized_pnl,
-                // And `generation`, owned by `save_position`: a stale copy written back here would
-                // revive the position-bound conditional orders of a life that has ended.
-                p.generation,
-            )
-        };
         debug_assert_eq!(
-            same(&old),
-            same(&pos),
+            (position_state_fields(&old), old.margin_type),
+            (position_state_fields(&pos), pos.margin_type),
             "save_position_leverage_only on a path that changed more than `leverage` — this route \
              marks NOBODY, so any other move would never reach the event stream"
         );
     }
     typed_store_mut(context).set_position(user, market_id, pos);
     Ok(())
+}
+
+/// Position write for the one path that touches ONLY `margin_type`: `setMarginType`
+/// (`margin_type::set_margin_type_core`).
+///
+/// The sibling of [`save_position_leverage_only`], on the same STATIC, route-based argument, and
+/// stronger: a margin-type change is only ever allowed on a FLAT position with no order in the
+/// market (`-4047` / `-4048` refuse anything else before this runs), so there is no `amount`, no
+/// `margin`, no `Bid`/`Ask` for any published number to be derived from — nothing an
+/// `AccountBalanceChanged` row or a `PositionChanged` row carries can move, and this route marks
+/// nobody. The change has its own `MarginTypeChanged` log. Not [`save_position`]: there is no
+/// zero-crossing (`amount` is 0 before and after), so the registry, the per-user market index and
+/// `generation` have nothing to do — and a flat, order-free market is not in the user's index.
+///
+/// The `debug_assert`s keep it static: everything except `margin_type` must be unchanged, and the
+/// position must be flat and order-free, or this route is being used by a path it does not
+/// describe.
+pub fn save_position_margin_type_only<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    pos: PerpPosition,
+) -> Result<(), PerpError> {
+    #[cfg(debug_assertions)]
+    {
+        let old = load_position_ref(context, user, market_id)?;
+        debug_assert_eq!(
+            (position_state_fields(&old), old.leverage),
+            (position_state_fields(&pos), pos.leverage),
+            "save_position_margin_type_only on a path that changed more than `margin_type` — this \
+             route marks NOBODY, so any other move would never reach the event stream"
+        );
+        debug_assert!(
+            old.amount == 0 && old.total_buy_qty == 0 && old.total_sell_qty == 0,
+            "save_position_margin_type_only on {user} market {market_id} with a position or \
+             resting orders — `setMarginType` must have refused (-4047 / -4048)"
+        );
+    }
+    typed_store_mut(context).set_position(user, market_id, pos);
+    Ok(())
+}
+
+/// Everything on a [`PerpPosition`] except its two SETTINGS (`leverage`, `margin_type`) — the
+/// fields the settings-only routes ([`save_position_leverage_only`],
+/// [`save_position_margin_type_only`]) assert they leave untouched.
+#[cfg(debug_assertions)]
+fn position_state_fields(p: &PerpPosition) -> (i64, i64, i64, u64, u64, u64, u64, i128, i64, u64) {
+    (
+        p.amount,
+        p.v_quote_balance,
+        p.margin,
+        p.total_buy_qty,
+        p.total_buy_notional,
+        p.total_sell_qty,
+        p.total_sell_notional,
+        // `last_funding_index` too: only a funding settlement moves it, and a settings change
+        // settles nothing.
+        p.last_funding_index,
+        // `cumulative_realized_pnl` too: nothing but a CLOSE may move it, and a settings change
+        // closes nothing. It is not a balance, so unlike the fields above it would not desync a
+        // published total — it would corrupt a lifetime statistic, silently.
+        p.cumulative_realized_pnl,
+        // And `generation`, owned by `save_position`: a stale copy written back here would revive
+        // the position-bound conditional orders of a life that has ended.
+        p.generation,
+    )
 }
 
 // ── Per-market open-position registry ──────────────────────────────────────
@@ -3199,6 +3247,7 @@ mod size_probe_tests {
             total_sell_notional: 10_000_000,
             cumulative_realized_pnl: -4_200_000,
             generation: 3,
+            margin_type: 1,
         };
         let buf = encode(&pos).unwrap();
         println!(
@@ -3448,6 +3497,8 @@ mod encoding_roundtrip_tests {
                 // matters more than most.
                 cumulative_realized_pnl: i64::MIN,
                 generation: u64::MAX,
+                // ISOLATED: the non-default value, so the round-trip proves it is not dropped.
+                margin_type: 1,
             },
         );
         rt(

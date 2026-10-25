@@ -187,6 +187,27 @@ pub struct PerpPosition {
     /// transaction paid for.
     #[serde(default, rename = "g")]
     pub generation: u64,
+    /// `mt` — the margin type the owner chose for this `(user, market)`: [`MarginType`]'s wire
+    /// code, `0` = CROSSED, `1` = ISOLATED. Binance's `marginType`, set per symbol by
+    /// `POST /fapi/v1/marginType`. APPENDED LAST — positional msgpack.
+    ///
+    /// # It is the STORED choice, not the type in force
+    ///
+    /// Read it through `perp_engine::margin_type::effective_margin_type`, never directly: while
+    /// [`CROSS_MARGIN_ENABLED`] is `false` every position is ISOLATED whatever this byte says, and
+    /// that function is the one place the rule lives. A default (zero) byte is CROSSED because
+    /// that is Binance's default ("All contracts and positions are defaulted to the Cross Margin
+    /// mode") — so the day the gate flips, every position that never chose becomes CROSSED.
+    ///
+    /// # Kept across flat, like `leverage`
+    ///
+    /// A setting, not position state: it survives the position going flat and being reopened, and
+    /// no fill, funding settlement or liquidation writes it. Its ONE writer is `setMarginType`,
+    /// through `storage::save_position_margin_type_only`, and only while the position is flat and
+    /// the market holds none of the owner's orders — so a non-zero position never changes type
+    /// under itself. Every other route stores it back verbatim from the blob it loaded.
+    #[serde(default, rename = "mt")]
+    pub margin_type: u8,
 }
 
 impl PerpPosition {
@@ -218,6 +239,76 @@ impl Default for PerpPosition {
             // trivially right is `leverage`, which is 1 rather than 0.
             cumulative_realized_pnl: 0,
             generation: 0,
+            // Binance's default. Not in force while `CROSS_MARGIN_ENABLED` is off.
+            margin_type: MarginType::Crossed as u8,
+        }
+    }
+}
+
+// ── Margin type ───────────────────────────────────────────────────────────
+
+/// **Is CROSS margin mode live?** `false` through the cross-margin series' P1–P2 and most of P3;
+/// flipped to `true` as the LAST step of P3, once cross accounting and cross liquidation exist.
+///
+/// While `false`:
+/// * every position is ISOLATED in force, whatever its stored [`PerpPosition::margin_type`] says
+///   ([`MarginType::effective`]), so every margin rule, view and event behaves exactly as it did
+///   before the field existed;
+/// * `setMarginType(CROSSED)` is refused, and `setMarginType(ISOLATED)` is `-4046` (it already is).
+///
+/// A plain `const`, deliberately: consensus code must not read a runtime switch. The engine's
+/// tests enable it per thread through a `#[cfg(test)]`-only override in
+/// `perp_engine::margin_type`, which compiles out of every non-test build.
+pub const CROSS_MARGIN_ENABLED: bool = false;
+
+/// A position's margin mode — Binance's `marginType`. One-way mode only: one type per
+/// `(user, market)`, chosen per market (Binance: "Switching the margin mode will only apply to the
+/// selected contract").
+///
+/// The `u8` is a wire code (stored on [`PerpPosition::margin_type`], carried by
+/// `MarginTypeChanged`, `PositionChanged`, `AccountPosition` and `getSymbolConfig`), pinned
+/// literally by a test. `0 = CROSSED` so a zero-initialised position has Binance's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MarginType {
+    /// Binance `CROSSED`: the position draws on the shared cross wallet.
+    Crossed = 0,
+    /// Binance `ISOLATED`: the position carries its own margin silo (`PerpPosition::margin`).
+    Isolated = 1,
+}
+
+impl MarginType {
+    /// The wire code.
+    #[inline]
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The inverse of [`Self::code`]; `None` for any other byte — no catch-all, so an ABI caller
+    /// sending `2` is refused rather than mapped onto a neighbour.
+    #[inline]
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Crossed),
+            1 => Some(Self::Isolated),
+            _ => None,
+        }
+    }
+
+    /// **The type IN FORCE** for a stored code, given whether cross margin is enabled — the one
+    /// implementation of the gate. ISOLATED whenever `cross_enabled` is false.
+    ///
+    /// TOTAL, on purpose: it sits under views, events and (from P2) the liquidation sweep, whose
+    /// error paths must not exist (the sweep panics on any `Err`). A stored byte other than 0/1
+    /// cannot be written — `setMarginType` validates through [`Self::from_code`] and is the only
+    /// writer — and if one appeared anyway it reads as ISOLATED, the mode that keeps a position
+    /// off the shared wallet.
+    #[inline]
+    pub fn effective(stored: u8, cross_enabled: bool) -> Self {
+        if cross_enabled && stored == Self::Crossed as u8 {
+            Self::Crossed
+        } else {
+            Self::Isolated
         }
     }
 }
@@ -564,6 +655,59 @@ mod tests {
         );
         // Only the order-book aggregates move — the position itself is untouched.
         assert_eq!((p.amount, p.margin), (5, 100));
+    }
+
+    // ── Margin type ───────────────────────────────────────────────────────
+
+    /// The wire codes are a CONTRACT (stored on every position, carried by three ABI surfaces), so
+    /// they are pinned literally; anything else decodes to `None`, never onto a neighbour.
+    #[test]
+    fn the_margin_type_wire_codes_round_trip() {
+        for (t, code) in [(MarginType::Crossed, 0u8), (MarginType::Isolated, 1)] {
+            assert_eq!(t.code(), code, "{t:?}");
+            assert_eq!(MarginType::from_code(code), Some(t));
+        }
+        for code in 2..=u8::MAX {
+            assert_eq!(MarginType::from_code(code), None, "code {code}");
+        }
+        // A position that never chose is CROSSED — Binance's default — in STORAGE.
+        assert_eq!(PerpPosition::default().margin_type, MarginType::Crossed.code());
+    }
+
+    /// The gate: disabled ⇒ ISOLATED whatever is stored; enabled ⇒ the stored choice, with an
+    /// unwritable byte reading as ISOLATED (total, no error path).
+    #[test]
+    fn the_effective_margin_type_is_isolated_unless_cross_is_enabled() {
+        for stored in 0..=u8::MAX {
+            assert_eq!(MarginType::effective(stored, false), MarginType::Isolated, "{stored}");
+        }
+        assert_eq!(MarginType::effective(0, true), MarginType::Crossed);
+        assert_eq!(MarginType::effective(1, true), MarginType::Isolated);
+        for stored in 2..=u8::MAX {
+            assert_eq!(MarginType::effective(stored, true), MarginType::Isolated, "{stored}");
+        }
+    }
+
+    /// Appended LAST and defaulted: a blob written before the field existed decodes as CROSSED
+    /// (stored), and a non-default value survives the codec.
+    #[test]
+    fn the_margin_type_is_appended_and_round_trips() {
+        let p = PerpPosition {
+            amount: 3,
+            margin_type: MarginType::Isolated.code(),
+            ..PerpPosition::default()
+        };
+        let bytes = crate::codec::encode(&p).unwrap();
+        let back: PerpPosition = crate::codec::decode(&bytes).unwrap();
+        assert_eq!(back, p);
+        // The pre-P1 layout is this one minus its last element: drop the trailing fixint and fix
+        // the array header (positional msgpack: 0x9N fixarray).
+        let mut old = bytes.clone();
+        assert_eq!(old.pop(), Some(MarginType::Isolated.code()), "the type byte is LAST");
+        old[0] -= 1;
+        let back: PerpPosition = crate::codec::decode(&old).unwrap();
+        assert_eq!(back.margin_type, MarginType::Crossed.code());
+        assert_eq!(back.amount, 3);
     }
 
     // ── MarginTiers codec ─────────────────────────────────────────────────

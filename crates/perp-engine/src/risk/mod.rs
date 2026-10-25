@@ -687,7 +687,7 @@ fn set_leverage_core<H: PerpHost>(
     Ok(Bytes::new())
 }
 
-/// `getSymbolConfig(address user, uint64 marketId) returns (uint64 leverage, uint64 maxNotionalValue)`
+/// `getSymbolConfig(address user, uint64 marketId) returns (uint64 leverage, uint64 maxNotionalValue, uint8 marginType)`
 ///
 /// `leverage` is `pos.leverage.max(1)` — the SAME floor `margin_view::margin_info_of` and
 /// `math::open_order_margin` apply, so this selector reports the leverage that is actually in
@@ -697,6 +697,9 @@ fn set_leverage_core<H: PerpHost>(
 /// unbounded. Kept in `math::` next to the forward lookup it inverts so the two cannot disagree
 /// about the band structure; see that function for the `setMarginTiers`-under-a-live-position
 /// state its assertion covers, and the ABI doc for why this is a selector at all.
+///
+/// `marginType` is the type IN FORCE, through [`crate::margin_type::effective_margin_type`] — the
+/// same gate the `AccountPosition` row and `PositionChanged` read, never the raw stored byte.
 ///
 /// Reverts on an unknown market: the tier table is a required input, and fabricating an empty one
 /// would report `0` — "unbounded" — for a market that does not exist.
@@ -716,6 +719,7 @@ pub fn run_get_symbol_config<H: PerpHost>(
         &getSymbolConfigReturn {
             leverage,
             maxNotionalValue: max_notional_for_leverage(&market.tiers, leverage),
+            marginType: crate::margin_type::effective_margin_type(&pos).code(),
         },
     )))
 }

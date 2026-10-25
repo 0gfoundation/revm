@@ -176,6 +176,10 @@ pub struct MarginInfo {
     /// enters no Σ — the account-level fold has no `cr` term, because summing lifetime PnL across
     /// markets is not a quantity Binance's account payload reports.
     pub cumulative_realized_pnl: i64,
+    /// The margin type IN FORCE ([`crate::types::MarginType`]'s wire code) — from
+    /// [`crate::margin_type::effective_margin_type`], the gate every surface shares, never the raw
+    /// stored byte. ISOLATED (`1`) for every position while cross margin is not enabled.
+    pub margin_type: u8,
 }
 
 /// The derived open-order requirement for ONE `(market, position)` pair, computed from
@@ -554,6 +558,7 @@ pub fn margin_info_of(
         // Verbatim, not derived: this is a stored lifetime total, so the row and the
         // `PositionChanged` event report the same field rather than two derivations of it.
         cumulative_realized_pnl: pos.cumulative_realized_pnl,
+        margin_type: crate::margin_type::effective_margin_type(pos).code(),
     })
 }
 
@@ -829,6 +834,7 @@ impl AccountPositionRow {
             isolatedWallet: i.position_margin,
             liquidationPrice: i.liquidation_price,
             cumulativeRealizedPnl: i.cumulative_realized_pnl,
+            marginType: i.margin_type,
         }
     }
 }

@@ -6977,7 +6977,16 @@ mod golden {
     /// VERIFIED: with the field `#[serde(skip)]` the scenario reproduced the previous 38 pin
     /// 0x37a18141…79de.
     ///
-    /// Prior values 0x37a18141947ba3bb4fe923fe0e05a07d4dc0a8d1987096250991ed7d0f3f79de (38,
+    /// Re-pinned again within 39 for P1, the margin type: `PerpPosition` gains a trailing "mt"
+    /// (`margin_type`, u8, 0 = CROSSED — Binance's default), positional msgpack, appended — so
+    /// every position blob the scenario writes is one byte longer (a fixint 0: nobody calls
+    /// `setMarginType`). A LAYOUT change only. Cross margin is gated off
+    /// (`CROSS_MARGIN_ENABLED = false`), so every position is ISOLATED in force and no rule reads
+    /// the byte; `BusinessSnapshot` UNCHANGED. VERIFIED: with the field `#[serde(skip)]` the
+    /// scenario reproduced the previous 39 (P0) pin 0xafd82645…7b48.
+    ///
+    /// Prior values 0xafd826451ed6c8e356b03def92beb67c4e2431333141b39bfc21aeef4f057b48 (39, P0
+    /// maintenance-rate column), 0x37a18141947ba3bb4fe923fe0e05a07d4dc0a8d1987096250991ed7d0f3f79de (38,
     /// trailing stop), 0xa72ce19d4e1c033989c620e39e9a7e09d6b483aee1c38cfe0d9e08770898d940 (38,
     /// closePosition parity), 0x720411d896e56b98c027a692b9cb8afba35c93accce39ccbef86a1a59f93e3e0 (38,
     /// fire() capacity fix), 0x525fea15e0541c3a4441899ac1d7862a0fc5d2cb3dae2a933a6b3b5594d933ee (37,
@@ -6994,7 +7003,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xafd826451ed6c8e356b03def92beb67c4e2431333141b39bfc21aeef4f057b48");
+        b256!("0x7deaa0263925b95e203cf08b43fbf93b34f7af725d19933d6e72510cd6c86637");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.

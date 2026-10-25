@@ -133,6 +133,9 @@ pub(crate) fn emit_position_changed_at_mark<H: PerpHost>(
             // position, which nothing stores. See the ABI comment on `PositionChanged`; do not read
             // it as data and do not populate it from here without adding that state.
             breakevenPrice: 0,
+            // `P[].mt` — the type IN FORCE, through the one gate every surface shares, so this
+            // row, `AccountPosition.marginType` and `getSymbolConfig` cannot disagree.
+            marginType: crate::margin_type::effective_margin_type(pos).code(),
         }
         .to_log_data(),
     });
@@ -706,6 +709,7 @@ mod group_invariant_self_tests {
                 unrealizedProfit: 0,
                 cumulativeRealizedPnl: 0,
                 breakevenPrice: 0,
+                marginType: 1,
             }
             .to_log_data(),
         }
