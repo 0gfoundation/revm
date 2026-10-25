@@ -373,6 +373,12 @@ use primitives::{B256, U256};
 //     while the gate is off. The golden scenario's write set differs only by the blobs' extra
 //     bytes — VERIFIED: with all three fields `#[serde(skip)]` it reproduced the 39-P1 pin
 //     0x7deaa026…6637. BusinessSnapshot UNCHANGED.
+//   * P2 review fixes — execution rules for positions CROSSED in force only: a pure reduce on a
+//     cross wallet is not margin-gated, a zero-draw taker close walks no account fold (J4), the
+//     withdrawable balance `X` gains the maintenance floor `E − Σ_I ooIM − Σ_C MM`, a resting cross
+//     order pays its Open Loss, and a cross order's margin refusal carries `-2019`. Gated off no
+//     write, event or refusal of an isolated account moves: the golden pin 0x8c500d81…a62c is
+//     unchanged, BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
