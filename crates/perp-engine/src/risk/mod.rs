@@ -1035,6 +1035,13 @@ pub(crate) enum LiquidationOutcome {
     NoPosition,
     /// Position is at or above the maintenance-margin threshold — not liquidatable.
     AboveMaintenance,
+    /// The position is CROSSED in force. Its solvency is ACCOUNT-level (`E < Σ_C MM`, reported by
+    /// `margin_view::CrossFold::below_cross_maintenance`) and the per-position predicate cannot
+    /// judge it — a cross position holds no silo, so it would read as insolvent on any loss at all.
+    /// P3: replaced by the cross liquidation episode. Until then such a position is never
+    /// liquidated, and NOTHING is written (no funding settle either), exactly like
+    /// `AboveMaintenance`.
+    Crossed,
 }
 
 /// Core liquidation logic, shared by the manual `liquidate` entry point
@@ -1044,6 +1051,7 @@ pub(crate) enum LiquidationOutcome {
 /// wrapper). Settles funding on the position first (so the charge counts toward
 /// insolvency), then:
 /// - `amount == 0`  → `NoPosition` (no state change beyond the funding settle);
+/// - CROSSED in force → `Crossed`, before the funding settle, with no write (cross P2 interim);
 /// - above maintenance → `AboveMaintenance`;
 /// - otherwise closes through the orderbook, settles any residual at mark, charges
 ///   the clearance fee to the IF, emits `Liquidation`, and returns `Liquidated`.
@@ -1069,6 +1077,24 @@ pub(crate) fn liquidate_position<H: PerpHost>(
 
     if pos.amount == 0 {
         return Ok(LiquidationOutcome::NoPosition);
+    }
+    // ── P3: cross liquidation replaces this. The P2 interim: never liquidate a CROSSED position ───
+    //
+    // Everything below is the ISOLATED liquidation: a per-position maintenance test on the silo,
+    // a close of this one market, a clearance fee on the silo it consumed. None of it is defined for
+    // a position CROSSED in force — it has no silo (`pos.margin == 0`), so the predicate would call
+    // it insolvent on its first unit of loss, and its losses settle against the shared wallet the
+    // isolated close never touches. So until the account-level episode exists (P3: detection on
+    // `E < Σ_C MM`, cancel-all, close per market, ADL, negative-balance clearance), a cross position
+    // is reported `Crossed` and left open.
+    //
+    // HERE — before the funding compute, and with no write — so the answer is TOTAL for the sweep
+    // (which panics on any `Err` from this function): `effective_margin_type` has no error path,
+    // and a cross position's funding needs its account, which this path does not load. The sweep
+    // treats `Crossed` like `AboveMaintenance` (checkpoint reverted, nothing to revert), and manual
+    // `liquidate()` refuses it.
+    if crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed {
+        return Ok(LiquidationOutcome::Crossed);
     }
     // commit-only #23: compute accrued funding IN MEMORY first (funding writes nothing), so the
     // maintenance check sees the post-funding position — including a funding DEBT, which is what
@@ -1299,8 +1325,15 @@ pub fn run_liquidate<H: PerpHost>(
         LiquidationOutcome::AboveMaintenance => {
             Err(perp_err("liquidate: position is above maintenance margin"))
         }
+        // P3: a cross position starts the account-level episode from this market instead.
+        LiquidationOutcome::Crossed => Err(perp_err(LIQUIDATE_CROSSED_REJECT)),
     }
 }
+
+/// `liquidate()`'s refusal for a position CROSSED in force while cross liquidation does not exist
+/// (cross P2 interim — P3 replaces it with the account-level episode).
+pub(crate) const LIQUIDATE_CROSSED_REJECT: &str =
+    "liquidate: position is CROSSED — account-level cross liquidation is not live yet";
 
 /// Max positions actually LIQUIDATED per `updateIndexPrice` sweep. This bounds the
 /// expensive half — each liquidation closes through the book + writes — but NOT the
@@ -1331,7 +1364,9 @@ const ADL_BUDGET_PER_UPDATE: u32 = 128;
 ///
 /// Each candidate is attempted under its own journal checkpoint:
 /// - `Liquidated` → commit the writes;
-/// - healthy / stale (`AboveMaintenance` / `NoPosition`) → revert (the sweep leaves no trace).
+/// - healthy / stale (`AboveMaintenance` / `NoPosition`) → revert (the sweep leaves no trace);
+/// - CROSSED in force (`Crossed`) → revert, untouched: cross liquidation is account-level and does
+///   not exist yet (P3: the sweep runs the cross episode for such a candidate).
 ///
 /// Any other error after the liquidatability check is a commit-only invariant failure and aborts
 /// the node rather than allowing a partial write set.
@@ -1385,7 +1420,7 @@ fn run_liquidation_sweep<H: PerpHost>(
                 *budget -= 1;
             }
             Ok(_) => {
-                // AboveMaintenance / NoPosition: zero perp writes were made.
+                // AboveMaintenance / NoPosition / Crossed: zero perp writes were made.
                 context.checkpoint_revert(cp);
             }
             Err(e) => {

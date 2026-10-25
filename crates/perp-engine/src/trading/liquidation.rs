@@ -206,6 +206,18 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 /// fill price) are not skipped: they form the FALLBACK tier, used only once every clean
 /// candidate is spent, under `BothSides` (see the tier notes in the body). Cascades from
 /// ADL'ing a thin winner resolve on a later sweep, not by in-`run_adl` recursion.
+///
+/// # CROSSED winners — the P2 interim (P3 replaces it)
+///
+/// A winner CROSSED in force has no silo, so its position equity is not a number ADL can rank or
+/// screen it by. It is judged on its ACCOUNT instead: `E` from the TOTAL cross fold
+/// (`margin_view::cross_fold`, no `Err` but the storage layer's, no division anywhere), ranked
+/// `uPnL_k / E` (the cross report's provisional rank, §3.4 ADL; Binance's own formula for a cross
+/// position, `PnL% × EffLev`, reduces to exactly that for a profitable one), clean while
+/// `E > 0` and `E` would stay `≥ 0` with this whole position closed at the fill price, fallback
+/// tier otherwise. Its fill settles into its cross wallet, either sign, with no bad debt of its own
+/// (`settlement::apply_position_fill` under `Cross`), so the fill policy binds only the loser's
+/// leg. The loser is never CROSSED: `liquidate_position` does not liquidate one in P2.
 pub(crate) fn run_adl<H: PerpHost>(
     context: &mut H,
     loser: Address,
@@ -215,6 +227,13 @@ pub(crate) fn run_adl<H: PerpHost>(
 ) -> Result<(), PerpError> {
     let mut loser_pos = storage::load_position(context, loser, market.market_id)?;
     if loser_pos.amount == 0 || *budget == 0 {
+        return Ok(());
+    }
+    // P3: a CROSSED loser's residual is closed by the cross episode, at the MM-share bankruptcy
+    // price. Unreachable in P2 — the only caller, `liquidate_position`, never liquidates a cross
+    // position — and answered totally (nothing done, nothing written) rather than with an `Err`,
+    // because this runs inside the sweep.
+    if crate::margin_type::effective_margin_type(&loser_pos) == crate::types::MarginType::Crossed {
         return Ok(());
     }
     let bd = market.base_decimals;
@@ -329,6 +348,29 @@ pub(crate) fn run_adl<H: PerpHost>(
         if wp.amount == 0 || (wp.amount > 0) == loser_is_long {
             continue; // flat or same side as the loser
         }
+        // ── A CROSSED winner: judged and ranked on its ACCOUNT (P2 interim — see the doc) ────────
+        //
+        // P3: the clean-tier test becomes `E − take·|fill − mark| ≥ 0` per fill, and the rank is
+        // shared with the sweep's own fold. Total: the fold has no `Err` but the storage layer's,
+        // and nothing here divides — the comparator below cross-multiplies.
+        if crate::margin_type::effective_margin_type(&wp) == crate::types::MarginType::Crossed {
+            let upnl_mark = calc_value_i64(mark_price, wp.amount, bd, pd)? as i128
+                + wp.v_quote_balance as i128;
+            let upnl_fill = calc_value_i64(fill_price, wp.amount, bd, pd)? as i128
+                + wp.v_quote_balance as i128;
+            // `E = cWB + Σ_C uPnL` — pending funding of every cross leg included (`cWB`), and this
+            // market priced at the stored mark, which is `mark_price` on both callers.
+            let e = crate::margin_view::cross_fold(context, user, None, None, None)?.e;
+            // The account's equity with this WHOLE position closed at the fill price instead of
+            // the mark (`take ≤ |amount|`, so this is the worst case of any one fill).
+            let e_fill = e - upnl_mark + upnl_fill;
+            if e <= 0 || e_fill < 0 {
+                fallback.push((user, e));
+            } else {
+                cands.push((user, upnl_mark, e));
+            }
+            continue;
+        }
         // ⚠️ Holders with resting orders are NOT excluded. v1 skipped them — an ADL fill moves the
         // position, which re-prices every order resting against it, and v1 did not want to reason
         // about that. The exclusion turned out to be the binding constraint on ADL in practice:
@@ -395,7 +437,8 @@ pub(crate) fn run_adl<H: PerpHost>(
         let notional = calc_value_i64(mark_price, wp.amount, bd, pd)? as i128;
         cands.push((user, notional + wp.v_quote_balance as i128, eq_mark as i128));
     }
-    // ROE = uPnL/equity DESC (equity>0), Address ASC tie-break; cross-multiply, no div.
+    // ROE = uPnL/equity DESC (equity>0), Address ASC tie-break; cross-multiply, no div. A CROSSED
+    // candidate's pair is `(uPnL_k, E)` — the same ratio with the account as the denominator.
     // `saturating_mul` is deterministic and cannot panic — both products only approach
     // i128::MAX at the joint i64 extremes, where a saturated tie deterministically falls
     // through to the Address tie-break (equal ROE ranking either way).
@@ -405,7 +448,7 @@ pub(crate) fn run_adl<H: PerpHost>(
         rhs.cmp(&lhs).then_with(|| a.0.cmp(&b.0))
     });
     // The fallback tier cannot use ROE — its denominator may be <= 0 — so: HEALTHIEST first
-    // (equity at mark DESC), Address ASC tie-break. Not arbitrary: the shortfall a holder
+    // (equity at mark DESC — a CROSSED holder's account `E`), Address ASC tie-break. Not arbitrary: the shortfall a holder
     // contributes grows with how far under it already is, so this hands the fund the smallest
     // bill, and it naturally serves the merely-thin before the already-bankrupt.
     fallback.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
