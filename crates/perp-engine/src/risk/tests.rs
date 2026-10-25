@@ -1694,12 +1694,9 @@ fn add_margin_rejected_after_funding_writes_nothing() {
     let _ = JournalTr::take_logs(ctx.journal_mut());
 
     // Funding never drains the wallet, so the reject is driven by asking for more than the
-    // (untouched) 50M wallet holds.
+    // (untouched) 50M wallet holds — the withdrawable-balance cap, Binance's `-4050`.
     let err = add_position_margin(&mut ctx, 100_000_000).unwrap_err();
-    assert!(
-        err.to_string().contains("insufficient perp wallet"),
-        "{err}"
-    );
+    assert!(err.to_string().contains(super::ADD_MARGIN_CAP_REJECT), "{err}");
     assert_eq!(
         alice_untouched_snapshot(&mut ctx),
         before,
@@ -3791,10 +3788,7 @@ fn add_position_margin_rejects_insufficient_wallet() {
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
 
     let err = add_position_margin(&mut ctx, USER_WALLET + 1).unwrap_err();
-    assert!(
-        err.to_string().contains("insufficient perp wallet balance"),
-        "{err}"
-    );
+    assert!(err.to_string().contains(super::ADD_MARGIN_CAP_REJECT), "{err}");
 }
 
 #[test]

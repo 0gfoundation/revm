@@ -14,7 +14,9 @@
 //!   are accepted, on every placement entrypoint, and `setMarginType` refuses (after `-4048`,
 //!   before the gate) on both of its paths;
 //! * `setLeverage` on a CROSSED position: raising always, lowering against `A` (`-2028`) to the
-//!   unit; the tier cap (`-2027`) still applies; ISOLATED unchanged.
+//!   unit; the tier cap (`-2027`) still applies; ISOLATED unchanged;
+//! * add/removePositionMargin: a CROSSED market `-4049`; an isolated add capped by `X` (`-4050`) to
+//!   the unit, cross unrealized profit excluded; an isolated remove unchanged.
 //!
 //! A child of `cross_settlement_tests`, so it runs on that fixture: two markets on an exact grid
 //! (base 0 decimals, price 2), `USD` = one dollar in quote units, the custody [`Ledger`] re-checked
@@ -869,5 +871,79 @@ fn cross_set_leverage_keeps_the_tier_cap_and_isolated_keeps_its_rule() {
         ALICE,
         &setLeverageCall { marketId: M1, leverage: 3 }.abi_encode(),
         "setLeverage: -2027 position exceeds the market's maximum notional",
+    );
+}
+
+// ── add/removePositionMargin ──────────────────────────────────────────────────────────────────
+
+fn add_margin(market: u64, amount: i64) -> Vec<u8> {
+    crate::interface::IPerpDex::addPositionMarginCall { marketId: market, amount: amount as u64 }
+        .abi_encode()
+}
+
+fn remove_margin(market: u64, amount: i64) -> Vec<u8> {
+    crate::interface::IPerpDex::removePositionMarginCall {
+        marketId: market,
+        amount: amount as u64,
+    }
+    .abi_encode()
+}
+
+/// A market CROSSED in force has no silo: adding to it or removing from it is Binance's `-4049` —
+/// with a position or without one (the type check comes first) — and writes nothing.
+#[test]
+fn position_margin_on_a_crossed_market_is_4049() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_type(&mut ctx, BOB, M1, ISOLATED);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    let (add, remove) =
+        (crate::risk::ADD_MARGIN_CROSSED_REJECT, crate::risk::REMOVE_MARGIN_CROSSED_REJECT);
+    rejects(&mut ctx, ALICE, &add_margin(M1, USD), add);
+    rejects(&mut ctx, ALICE, &remove_margin(M1, USD), remove);
+    // M2: CROSSED, flat — still -4049, not "no open position".
+    rejects(&mut ctx, ALICE, &add_margin(M2, USD), add);
+    rejects(&mut ctx, ALICE, &remove_margin(M2, USD), remove);
+}
+
+/// An ISOLATED add is capped by the withdrawable balance `X`, not by `A`: ALICE's cross long on M1
+/// has doubled, so `A` holds $1,000 of profit that `X` does not (`X = W − Σ_C MM`). One unit above
+/// `X` is refused `-4050`; `X` itself is accepted, and lands in the silo. Removing more than the
+/// silo holds still answers with the isolated rule's own string.
+#[test]
+fn an_isolated_add_is_capped_by_x_to_the_unit_and_remove_is_unchanged() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+    }
+    set_type(&mut ctx, ALICE, M2, ISOLATED);
+    set_leverage(&mut ctx, ALICE, M1, 3);
+    set_wallet(&mut ctx, ALICE, 2_000 * USD);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    trade(&mut ctx, M2, ALICE, BOB, BUY, px(100), 5);
+    set_mark(&mut ctx, M1, px(200));
+    let ledger = Ledger::open(&mut ctx);
+
+    let f = fold(&mut ctx, ALICE);
+    let w = wallet(&mut ctx, ALICE) as i128;
+    let mm = (value(px(200), 10) / 6) as i128;
+    assert_eq!(f.x, w - mm, "X = cWB − Σ_C MM: none of the profit");
+    assert!(f.a > f.x + 500 * USD as i128, "A counts the profit: A = {}, X = {}", f.a, f.x);
+    let x = f.x as i64;
+    rejects(&mut ctx, ALICE, &add_margin(M2, x + 1), crate::risk::ADD_MARGIN_CAP_REJECT);
+    let silo = pos(&mut ctx, ALICE, M2).margin;
+    ok(&mut ctx, ALICE, &add_margin(M2, x));
+    ledger.check(&mut ctx, "after the add");
+    assert_eq!(pos(&mut ctx, ALICE, M2).margin, silo + x);
+    assert_eq!(wallet(&mut ctx, ALICE) as i128, w - f.x);
+    assert_eq!(fold(&mut ctx, ALICE).x, 0);
+
+    let silo = pos(&mut ctx, ALICE, M2).margin;
+    rejects(
+        &mut ctx,
+        ALICE,
+        &remove_margin(M2, silo + 1),
+        "removePositionMargin: insufficient position margin",
     );
 }

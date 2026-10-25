@@ -1669,7 +1669,11 @@ sol! {
             int64  availableBalance
         );
 
-        /// Add isolated margin from the caller's perp wallet to an open position.
+        /// Add isolated margin from the caller's perp wallet to an open position. Capped by the
+        /// withdrawable balance (`getAccount`'s `maxWithdrawAmount`, which no unrealized profit
+        /// reaches): above it `addPositionMargin: -4050 Cross balance insufficient.`. A market
+        /// CROSSED in force has no isolated margin to add to: `addPositionMargin: -4049 Add margin
+        /// only support for isolated position.` (`removePositionMargin` likewise, `-4049`).
         function addPositionMargin(uint64 marketId, uint64 amount) external;
         /// Remove isolated margin from an open position back to the caller's perp wallet.
         ///

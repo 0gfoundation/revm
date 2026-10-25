@@ -797,6 +797,16 @@ pub fn run_get_position<H: PerpHost>(
 
 // ── Liquidation ───────────────────────────────────────────────────────────────
 
+/// `addPositionMargin` on a market CROSSED in force — Binance's `-4049`.
+pub(crate) const ADD_MARGIN_CROSSED_REJECT: &str =
+    "addPositionMargin: -4049 Add margin only support for isolated position.";
+/// `removePositionMargin` on a market CROSSED in force — Binance's `-4049`, from the remove side.
+pub(crate) const REMOVE_MARGIN_CROSSED_REJECT: &str =
+    "removePositionMargin: -4049 Remove margin only support for isolated position.";
+/// `addPositionMargin` beyond the withdrawable balance `X` — Binance's `-4050`.
+pub(crate) const ADD_MARGIN_CAP_REJECT: &str =
+    "addPositionMargin: -4050 Cross balance insufficient.";
+
 /// `addPositionMargin(uint64 marketId, uint64 amount)`
 pub fn run_add_position_margin<H: PerpHost>(
     input_bytes: &[u8],
@@ -813,6 +823,12 @@ pub fn run_add_position_margin<H: PerpHost>(
         .ok_or_else(|| perp_err("addPositionMargin: unknown market"))?;
 
     let mut pos = storage::load_position(context, caller, args.marketId)?;
+    // A CROSSED position has no silo to add to (`CROSSED ⇒ margin == 0`): its margin IS the cross
+    // wallet. Binance `-4049`, ahead of the position check — no amount of position makes a cross
+    // market's margin addable.
+    if crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed {
+        return Err(perp_err(ADD_MARGIN_CROSSED_REJECT));
+    }
     if pos.amount == 0 {
         return Err(perp_err("addPositionMargin: no open position"));
     }
@@ -831,11 +847,14 @@ pub fn run_add_position_margin<H: PerpHost>(
     // profit, which must never become isolated collateral (J6 — this is Binance's add-margin cap,
     // `max(0, min(cWB − Σ_I ooIM − Σ_C MM, A))`, cross report F5). For an account with no cross
     // position the two decide identically for a positive amount.
+    //
+    // Refused with Binance's `-4050 Cross balance insufficient.` — the add-margin cap IS the cross
+    // wallet's withdrawable balance (F5). For an account with no cross position the decision is
+    // the one it always was (`X ≥ amount ⇔ A ≥ amount` for a positive amount); only the string
+    // gained the code.
     let available = crate::margin_view::derived_withdrawable_balance(context, caller)?;
     if !crate::margin_view::derived_can_afford(available, args.amount as i128) {
-        return Err(perp_err(
-            "addPositionMargin: insufficient perp wallet balance",
-        ));
+        return Err(perp_err(ADD_MARGIN_CAP_REJECT));
     }
     account.debit_perp(args.amount)?;
     pos.margin = pos
@@ -902,6 +921,10 @@ pub fn run_remove_position_margin<H: PerpHost>(
     }
 
     let mut pos = storage::load_position(context, caller, args.marketId)?;
+    // A CROSSED position has no silo to remove from — see `addPositionMargin` (`-4049`).
+    if crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed {
+        return Err(perp_err(REMOVE_MARGIN_CROSSED_REJECT));
+    }
     if pos.amount == 0 {
         return Err(perp_err("removePositionMargin: no open position"));
     }
