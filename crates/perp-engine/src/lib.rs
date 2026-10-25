@@ -30,6 +30,9 @@ pub mod interface;
 pub mod reduce_only;
 pub mod margin_type;
 pub mod margin_view;
+/// The independent cross-margin P0/P1 spec suite (`SPEC_cross_margin.md`).
+#[cfg(test)]
+mod cross_margin_spec_tests;
 pub mod risk;
 pub mod storage;
 pub mod trading;
