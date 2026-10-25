@@ -419,8 +419,9 @@ pub fn run_get_account<H: PerpHost>(
             totalOpenOrderInitialMargin: s.total_open_order_initial_margin,
             totalMaintMargin: s.total_maint_margin,
             availableBalance: s.available_balance,
-            // Structurally zero: isolated-only, so there are no cross positions to sum.
-            // Present for response-shape compatibility only — see the note on `getAccount`.
+            // Zero while cross margin is gated off: every position is ISOLATED in force, so there
+            // is no cross position to sum. Cross accounting (P2) replaces this with the real
+            // `Σ uPnL` over CROSSED positions — see the note on `getAccount`.
             totalCrossUnPnl: 0,
             // `max(0, availableBalance)`. Floors at zero because "withdraw a negative amount" is
             // meaningless; the un-clamped value stays visible in `availableBalance` above, so the

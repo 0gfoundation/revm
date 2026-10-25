@@ -394,16 +394,21 @@ sol! {
         /// account payload can bind to this selector without a special case. That was an explicit
         /// product decision, taken knowing the objections below.
         ///
-        /// * `totalCrossUnPnl` — ALWAYS EXACTLY ZERO, and permanently so. We are isolated-only;
-        ///   there are no cross positions for it to sum. It is not "zero right now". **Do not build
-        ///   a cross-vs-isolated split on it** — that split does not exist here. All unrealised PnL
-        ///   is in `totalUnrealizedProfit`.
+        /// * `totalCrossUnPnl` — Binance's `Σ uPnL` over the account's CROSSED positions. ZERO
+        ///   while cross margin is not enabled (`types::CROSS_MARGIN_ENABLED`, off through the
+        ///   cross series' P1–P2 and most of P3): every position is ISOLATED in force, so there is
+        ///   no cross position to sum and all unrealised PnL is in `totalUnrealizedProfit`. It is
+        ///   **NOT a constant** — cross accounting (P2) makes it the real sum, which is non-zero
+        ///   once the gate flips. Bind to it like Binance's field and keep the cross-vs-isolated
+        ///   split; do not hardcode `0`.
         ///   NAME: this was `crossUnPnl` until the rename below. Binance has BOTH spellings and
         ///   they live at different levels — `crossUnPnl` on an `assets[]` ROW, `totalCrossUnPnl`
         ///   as the ACCOUNT-LEVEL scalar. This is the account-level one, so the per-asset spelling
         ///   was simply wrong. Same class of error as the `walletBalance` collision in §7.1.2.
         /// * `maxWithdrawAmount` — `max(0, availableBalance)`, i.e. the most that
-        ///   `transferFromPerp` will let out of the PERP wallet right now.
+        ///   `transferFromPerp` will let out of the PERP wallet right now. (Cross P2 makes it
+        ///   Binance's `max(0, min(crossWallet − ΣisoOpenOrderIM − ΣcrossMM, availableBalance))`,
+        ///   which is this same number for an account with no CROSSED position.)
         ///   ⚠️ **THE NAME IS WRONG FOR OUR TWO-LAYER MODEL AND WE KEPT IT ANYWAY.** `withdraw()`
         ///   gates on `usdcBalance` — the SPOT layer — not on this number. So "max withdraw" here
         ///   does NOT tell you how much you can withdraw from the protocol; it tells you how much
