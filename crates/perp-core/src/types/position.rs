@@ -322,8 +322,9 @@ impl MarginType {
 /// existing blobs: the codec emits exactly `len` elements, never the padding.
 ///
 /// 16, raised from 8 so a Binance USDⓈ-M bracket table loads row for row: BTCUSDT's
-/// `leverageBracket` has 10 brackets. A [`MarginTier`] is 16 bytes (the `u32` rate column
-/// sits in what was the `u64`/`u32` pair's padding), so the inline array is 256 bytes.
+/// `leverageBracket` has 12 brackets (live capture, 2026-10-14). A [`MarginTier`] is 16 bytes
+/// (the `u32` rate column sits in what was the `u64`/`u32` pair's padding), so the inline array
+/// is 256 bytes.
 pub const MAX_MARGIN_TIERS: usize = 16;
 
 /// Denominator of [`MarginTier::maint_margin_rate_ppm`]: parts per million, so
@@ -333,7 +334,13 @@ pub const MMR_PPM_ONE: u32 = 1_000_000;
 
 /// Absolute ceiling accepted by `setMarginTiers` for any tier's `max_leverage`.
 /// Not a per-market cap — tier 0's `max_leverage` is the per-market `setLeverage` cap.
-pub const MAX_LEVERAGE_HARD_CAP: u32 = 100;
+///
+/// 150: Binance USDⓈ-M's highest `initialLeverage`, BTCUSDT's first bracket (150x at a 0.4%
+/// maintenance rate in the live `leverageBracket` capture of 2026-10-14), so a Binance table
+/// loads as published. A sanity bound against a fat-fingered table, nothing more: no arithmetic
+/// depends on it (every use of a tier's leverage is a divisor or an `i128`/`u128` product), and
+/// the risk a tier carries is bounded by its own IM > MM check, not by this.
+pub const MAX_LEVERAGE_HARD_CAP: u32 = 150;
 
 /// `max_leverage` of the single tier every market is created with.
 /// Its maintenance rate `1 / (2 * 3) = 1/6` is the historical hardcoded rate.

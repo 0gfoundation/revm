@@ -146,7 +146,7 @@ const ET_EMPTY: &str = "setMarginTiers: at least one tier required";
 const ET_MANY: &str = "setMarginTiers: at most 16 tiers allowed";
 const ET_FIRST: &str = "setMarginTiers: first tier must start at 0";
 const ET_BOUNDS: &str = "setMarginTiers: lowerBounds must be strictly increasing";
-const ET_LEV: &str = "setMarginTiers: maxLeverage must be 1–100";
+const ET_LEV: &str = "setMarginTiers: maxLeverage must be 1–150";
 const ET_LEV_ORDER: &str = "setMarginTiers: maxLeverages must be non-increasing";
 const ET_RATE_LEN: &str = "setMarginTiers: maintMarginRatesPpm and lowerBounds length mismatch";
 const ET_IM_MM: &str =
@@ -680,10 +680,10 @@ fn engine_mm(ctx: &mut TestCtx, n: u64, long: bool) -> u64 {
 }
 
 /// Binance BTCUSDT `leverageBracket` (report §1.4: cum 0 / 50 / 1,300 / 46,300 / … /
-/// 101,421,300), `(floor $, initialLeverage, maintMarginRatio ppm)`. Tier 0's 125x is loaded at
-/// the engine's hard cap of 100 (MAX_LEVERAGE_HARD_CAP; see `p0_structural_refusals…`).
+/// 101,421,300), `(floor $, initialLeverage, maintMarginRatio ppm)`, verbatim — tier 0's 125x
+/// included (the leverage hard cap is 150; see `p0_structural_refusals…`).
 const BTC: [Row; 10] = [
-    row(0, 100, 4_000),
+    row(0, 125, 4_000),
     row(50_000, 100, 5_000),
     row(250_000, 50, 10_000),
     row(3_000_000, 20, 25_000),
@@ -795,7 +795,8 @@ fn p0_the_btc_table_reads_back_as_binances_leverage_bracket() {
     // getSymbolConfig's maxNotionalValue reads the same table backwards: the upper bound of the
     // highest tier still admitting the leverage; 0 = unbounded (the last tier).
     for (lev, cap) in [
-        (100u64, 250_000 * USD),
+        (125u64, 50_000 * USD),
+        (100, 250_000 * USD),
         (50, 3_000_000 * USD),
         (20, 15_000_000 * USD),
         (3, 200_000_000 * USD),
@@ -1028,12 +1029,12 @@ fn p0_structural_refusals_reject_the_whole_table() {
     rejected(&mut ctx, ADMIN, &raw(vec![0, 100, 100], vec![3, 3, 3], vec![0; 3]), ET_BOUNDS);
     rejected(&mut ctx, ADMIN, &raw(vec![0, 100, 50], vec![3, 3, 3], vec![0; 3]), ET_BOUNDS);
     rejected(&mut ctx, ADMIN, &raw(vec![0], vec![0], vec![0]), ET_LEV);
-    rejected(&mut ctx, ADMIN, &raw(vec![0], vec![101], vec![0]), ET_LEV);
-    // Binance's 125x first BTC bracket is above the hard cap (an open owner item, see the report).
+    rejected(&mut ctx, ADMIN, &raw(vec![0], vec![151], vec![0]), ET_LEV);
+    // One above Binance's highest bracket (BTCUSDT's 150x, the hard cap) is refused.
     rejected(
         &mut ctx,
         ADMIN,
-        &raw(vec![0, 50_000 * USD], vec![125, 100], vec![4_000, 5_000]),
+        &raw(vec![0, 300_000 * USD], vec![151, 100], vec![4_000, 5_000]),
         ET_LEV,
     );
     rejected(&mut ctx, ADMIN, &raw(vec![0, 100], vec![3, 4], vec![0, 0]), ET_LEV_ORDER);

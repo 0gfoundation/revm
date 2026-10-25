@@ -347,6 +347,11 @@ use primitives::{B256, U256};
 //     type byte — ISOLATED is already in force (`-4046`) and CROSSED is refused — so the only
 //     state they can move is the signed path's spent-signature marker (burned on submission,
 //     like every signed selector). The golden scenario calls neither: its pin does not move.
+//   * P0 review — `MAX_LEVERAGE_HARD_CAP` 100 → 150, so Binance's current BTCUSDT table (150x
+//     first bracket) loads as published. A WIDENING of `setMarginTiers` validation (a node on the
+//     previous build refuses a table with a tier above 100x that this one accepts), and through
+//     the table, of `setLeverage`'s cap on such a market. No layout change; the golden scenario
+//     installs no table: its pin does not move.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

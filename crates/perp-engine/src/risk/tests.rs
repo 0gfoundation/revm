@@ -2760,8 +2760,8 @@ fn set_margin_tiers_rejects_each_invariant_individually() {
             &[3, 2, 1],
             "lowerBounds must be strictly increasing",
         ),
-        (&[0], &[0], "maxLeverage must be 1–100"),
-        (&[0], &[101], "maxLeverage must be 1–100"),
+        (&[0], &[0], "maxLeverage must be 1–150"),
+        (&[0], &[151], "maxLeverage must be 1–150"),
         (&[0, 1_000], &[2, 3], "maxLeverages must be non-increasing"),
     ];
 
@@ -2920,13 +2920,12 @@ fn set_margin_tiers_emits_the_full_replacement_table() {
 /// One dollar in quote units.
 const USD: u64 = 1_000_000;
 
-/// Binance BTCUSDT's 10-bracket `leverageBracket` table (the table the cross-margin research read;
-/// re-check Binance's live brackets before loading it on a real market — the 3x bracket's 15% is
-/// read off an image). `(notionalFloor $, initialLeverage, maintMarginRatio ppm)`, with ONE
-/// change: bracket 1 is 125x on Binance and `MAX_LEVERAGE_HARD_CAP` is 100, so it is loaded at
-/// 100x here. Leverage plays no part in `cum`, which depends on the floors and rates only.
-const BTCUSDT_LOADABLE: [(u64, u32, u32); 10] = [
-    (0, 100, 4_000),
+/// Binance BTCUSDT's 10-bracket `leverageBracket` table as the cross-margin research read it (the
+/// 2023 table; its 3x bracket's 15% was read off an image), loaded VERBATIM — bracket 1's 125x
+/// included. `(notionalFloor $, initialLeverage, maintMarginRatio ppm)`. Binance's CURRENT table is
+/// [`BTCUSDT_LIVE`].
+const BTCUSDT_2023: [(u64, u32, u32); 10] = [
+    (0, 125, 4_000),
     (50_000, 100, 5_000),
     (250_000, 50, 10_000),
     (3_000_000, 20, 25_000),
@@ -2938,11 +2937,49 @@ const BTCUSDT_LOADABLE: [(u64, u32, u32); 10] = [
     (300_000_000, 1, 500_000),
 ];
 
+/// Binance BTCUSDT's `leverageBracket` as `GET /fapi/v1/leverageBracket?symbol=BTCUSDT` returned
+/// it on 2026-10-14 (internal-docs `misc/evidence/binance-run21-upnl.json`, request 11): 12
+/// brackets, 150x at 0.4% first, the 3x bracket's 15% confirmed. `(notionalFloor $,
+/// initialLeverage, maintMarginRatio ppm)`.
+const BTCUSDT_LIVE: [(u64, u32, u32); 12] = [
+    (0, 150, 4_000),
+    (300_000, 100, 5_000),
+    (800_000, 75, 6_500),
+    (3_000_000, 50, 10_000),
+    (12_000_000, 25, 20_000),
+    (70_000_000, 20, 25_000),
+    (100_000_000, 10, 50_000),
+    (230_000_000, 5, 100_000),
+    (480_000_000, 4, 125_000),
+    (600_000_000, 3, 150_000),
+    (800_000_000, 2, 250_000),
+    (1_200_000_000, 1, 500_000),
+];
+/// The `cum` column Binance returned with [`BTCUSDT_LIVE`], USDT.
+const BTCUSDT_LIVE_CUM: [u64; 12] = [
+    0,
+    300,
+    1_500,
+    12_000,
+    132_000,
+    482_000,
+    2_982_000,
+    14_482_000,
+    26_482_000,
+    41_482_000,
+    121_482_000,
+    421_482_000,
+];
+
+fn install_rows(ctx: &mut TestCtx, rows: &[(u64, u32, u32)]) -> Result<Bytes, PerpError> {
+    let bounds: Vec<u64> = rows.iter().map(|r| r.0 * USD).collect();
+    let levs: Vec<u32> = rows.iter().map(|r| r.1).collect();
+    let rates: Vec<u32> = rows.iter().map(|r| r.2).collect();
+    set_margin_tiers_with_rates(ctx, ADMIN, MARKET_ID, &bounds, &levs, &rates)
+}
+
 fn install_btcusdt(ctx: &mut TestCtx) {
-    let bounds: Vec<u64> = BTCUSDT_LOADABLE.iter().map(|r| r.0 * USD).collect();
-    let levs: Vec<u32> = BTCUSDT_LOADABLE.iter().map(|r| r.1).collect();
-    let rates: Vec<u32> = BTCUSDT_LOADABLE.iter().map(|r| r.2).collect();
-    set_margin_tiers_with_rates(ctx, ADMIN, MARKET_ID, &bounds, &levs, &rates).unwrap();
+    install_rows(ctx, &BTCUSDT_2023).unwrap();
 }
 
 /// A Binance bracket table loads through `setMarginTiers` and `getMarginTiers` hands back
@@ -2955,17 +2992,17 @@ fn get_margin_tiers_reports_binance_btcusdt_brackets_verbatim() {
     install_btcusdt(&mut ctx);
 
     let got = get_margin_tiers_full(&mut ctx, MARKET_ID);
-    let rates: Vec<u32> = BTCUSDT_LOADABLE.iter().map(|r| r.2).collect();
+    let rates: Vec<u32> = BTCUSDT_2023.iter().map(|r| r.2).collect();
     assert_eq!(
         got.lowerBounds,
-        BTCUSDT_LOADABLE
+        BTCUSDT_2023
             .iter()
             .map(|r| r.0 * USD)
             .collect::<Vec<_>>()
     );
     assert_eq!(
         got.maxLeverages,
-        BTCUSDT_LOADABLE.iter().map(|r| r.1).collect::<Vec<_>>()
+        BTCUSDT_2023.iter().map(|r| r.1).collect::<Vec<_>>()
     );
     assert_eq!(
         got.maintMarginRatesPpm, rates,
@@ -2993,19 +3030,62 @@ fn get_margin_tiers_reports_binance_btcusdt_brackets_verbatim() {
         .to_vec(),
         "Binance's published BTCUSDT cum column"
     );
-    let mut caps: Vec<u64> = BTCUSDT_LOADABLE[1..].iter().map(|r| r.0 * USD).collect();
+    let mut caps: Vec<u64> = BTCUSDT_2023[1..].iter().map(|r| r.0 * USD).collect();
     caps.push(u64::MAX);
     assert_eq!(
         got.notionalCaps, caps,
         "next floor; the last band is unbounded"
     );
+    assert_eq!(got.maxLeverages[0], 125, "bracket 1's 125x loads as published");
+}
 
-    // Binance's 125x first bracket is refused by the (unchanged) leverage hard cap.
-    let err = set_margin_tiers_with_rates(&mut ctx, ADMIN, MARKET_ID, &[0], &[125], &[4_000])
-        .unwrap_err();
+/// Binance's CURRENT BTCUSDT table — 12 brackets, 150x first — loads exactly as Binance returned it
+/// and reads back as Binance's own `leverageBracket`: every row's `cum` is the one Binance sent with
+/// it. 150x is `MAX_LEVERAGE_HARD_CAP`, so it is `setLeverage`'s cap on that market; 151 is refused
+/// both as a tier and as a leverage, with zero writes.
+#[test]
+fn binances_live_btcusdt_table_loads_verbatim_at_150x() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    install_rows(&mut ctx, &BTCUSDT_LIVE).unwrap();
+
+    let got = get_margin_tiers_full(&mut ctx, MARKET_ID);
+    assert_eq!(
+        got.lowerBounds,
+        BTCUSDT_LIVE.iter().map(|r| r.0 * USD).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        got.maxLeverages,
+        BTCUSDT_LIVE.iter().map(|r| r.1).collect::<Vec<_>>()
+    );
+    let rates: Vec<u32> = BTCUSDT_LIVE.iter().map(|r| r.2).collect();
+    assert_eq!(got.maintMarginRatesPpm, rates);
+    assert_eq!(got.effectiveMaintMarginRatesPpm, rates);
+    assert_eq!(
+        got.cums,
+        BTCUSDT_LIVE_CUM.map(|c| c * USD).to_vec(),
+        "the cum column Binance returned"
+    );
+
+    set_leverage(&mut ctx, 150).unwrap();
+    let err = set_leverage(&mut ctx, 151).unwrap_err();
     assert!(
-        err.to_string().contains("maxLeverage must be 1–100"),
+        err.to_string().contains("setLeverage: leverage must be 1–150"),
         "{err}"
+    );
+
+    let before = get_margin_tiers_columns(&mut ctx, MARKET_ID);
+    let mut over = BTCUSDT_LIVE;
+    over[0].1 = 151;
+    let err = install_rows(&mut ctx, &over).unwrap_err();
+    assert!(
+        err.to_string().contains("maxLeverage must be 1–150"),
+        "{err}"
+    );
+    assert_eq!(
+        get_margin_tiers_columns(&mut ctx, MARKET_ID),
+        before,
+        "a refused table writes nothing"
     );
 }
 

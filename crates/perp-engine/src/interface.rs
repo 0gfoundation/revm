@@ -925,7 +925,7 @@ sol! {
         /// Rejected (whole call, zero writes) unless ALL hold: the market exists;
         /// `lowerBounds` and `maxLeverages` are the same length; `1 <= length <=
         /// MAX_MARGIN_TIERS (16)`; `lowerBounds[0] == 0`; `lowerBounds` strictly increasing;
-        /// every `maxLeverages[i]` in `1..=MAX_LEVERAGE_HARD_CAP (100)`; `maxLeverages`
+        /// every `maxLeverages[i]` in `1..=MAX_LEVERAGE_HARD_CAP (150)`; `maxLeverages`
         /// non-increasing; `maintMarginRatesPpm` the same length as `lowerBounds`; every
         /// tier's EFFECTIVE rate strictly below its initial-margin rate, i.e. an explicit
         /// `maintMarginRatesPpm[i] < 1e6 / maxLeverages[i]` (IM > MM in every tier — a derived
