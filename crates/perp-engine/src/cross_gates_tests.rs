@@ -16,7 +16,10 @@
 //! * `setLeverage` on a CROSSED position: raising always, lowering against `A` (`-2028`) to the
 //!   unit; the tier cap (`-2027`) still applies; ISOLATED unchanged;
 //! * add/removePositionMargin: a CROSSED market `-4049`; an isolated add capped by `X` (`-4050`) to
-//!   the unit, cross unrealized profit excluded; an isolated remove unchanged.
+//!   the unit, cross unrealized profit excluded; an isolated remove unchanged;
+//! * every money-out gate stops at `X` to the unit with cross profit standing behind it, and money
+//!   in nets against a negative cross wallet;
+//! * gated off, every P2c gate is byte-identical to an explicitly ISOLATED account.
 //!
 //! A child of `cross_settlement_tests`, so it runs on that fixture: two markets on an exact grid
 //! (base 0 decimals, price 2), `USD` = one dollar in quote units, the custody [`Ledger`] re-checked
@@ -946,4 +949,195 @@ fn an_isolated_add_is_capped_by_x_to_the_unit_and_remove_is_unchanged() {
         &remove_margin(M2, silo + 1),
         "removePositionMargin: insufficient position margin",
     );
+}
+
+// ── Money out stops at X ──────────────────────────────────────────────────────────────────────
+
+fn internal(from_wallet: u8, to_wallet: u8, amount: i64) -> Vec<u8> {
+    crate::interface::IPerpDex::internalTransferCall {
+        to: ALICE,
+        fromWallet: from_wallet,
+        toWallet: to_wallet,
+        amount: amount as u64,
+    }
+    .abi_encode()
+}
+
+fn set_spot(ctx: &mut TestCtx, user: Address, amount: u64) {
+    storage::mutate_account(ctx, user, |a| a.usdc_balance = amount.to_string().into()).unwrap();
+}
+
+/// Binance's `maxWithdrawAmount` is every money-out gate, to the unit: with a doubled cross long
+/// behind it (`uPnL = +$500`, which `A` counts and `X` does not), `internalTransfer` out of the
+/// perp wallet and the admin's `depositInsuranceFund` refuse `X + 1` and take `X` (the
+/// `transferFromPerp` twin is P2b's test). Then money IN onto a NEGATIVE cross wallet — through
+/// `internalTransfer` from spot — nets against it, and `X` only reopens once the wallet is back
+/// above the cross maintenance margin.
+#[test]
+fn every_money_out_gate_stops_at_x_to_the_unit_with_cross_profit() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+    }
+    for u in [ALICE, ADMIN] {
+        set_leverage(&mut ctx, u, M2, 3);
+        set_wallet(&mut ctx, u, 2_000 * USD);
+        trade(&mut ctx, M2, u, BOB, BUY, px(100), 5);
+    }
+    set_mark(&mut ctx, M2, px(200));
+    let ledger = Ledger::open(&mut ctx);
+
+    // internalTransfer, PERP (1) → SPOT (0).
+    let f = fold(&mut ctx, ALICE);
+    assert_eq!(f.x, wallet(&mut ctx, ALICE) as i128 - (value(px(200), 5) / 6) as i128);
+    // `A − X = uPnL − PIM + MM` = $500 − $333.33 + $166.67.
+    assert!(f.a > f.x + 300 * USD as i128, "the profit is in A, not in X");
+    let x = f.x as i64;
+    rejects(
+        &mut ctx,
+        ALICE,
+        &internal(1, 0, x + 1),
+        "internalTransfer: insufficient perp wallet balance",
+    );
+    ok(&mut ctx, ALICE, &internal(1, 0, x));
+    assert_eq!(fold(&mut ctx, ALICE).x, 0);
+
+    // depositInsuranceFund, the admin's perp wallet → the fund.
+    let x = fold(&mut ctx, ADMIN).x as u64;
+    let deposit = |amount: u64| {
+        crate::interface::IPerpDex::depositInsuranceFundCall { amount }.abi_encode()
+    };
+    rejects(
+        &mut ctx,
+        ADMIN,
+        &deposit(x + 1),
+        "depositInsuranceFund: insufficient perp wallet balance",
+    );
+    let if0 = insurance_fund(&mut ctx);
+    ok(&mut ctx, ADMIN, &deposit(x));
+    assert_eq!(insurance_fund(&mut ctx), if0 + x);
+    assert_eq!(fold(&mut ctx, ADMIN).x, 0);
+    ledger.check(&mut ctx, "after the withdrawals");
+
+    // A negative cross wallet: X is 0, and money in nets against the deficit first.
+    set_wallet(&mut ctx, ALICE, -100 * USD);
+    set_spot(&mut ctx, ALICE, 1_000 * USD as u64);
+    let ledger = Ledger::open(&mut ctx);
+    assert_eq!(fold(&mut ctx, ALICE).x, 0);
+    let refused = "internalTransfer: insufficient perp wallet balance";
+    rejects(&mut ctx, ALICE, &internal(1, 0, 1), refused);
+    ok(&mut ctx, ALICE, &internal(0, 1, 350 * USD));
+    assert_eq!(wallet(&mut ctx, ALICE), 250 * USD, "the deposit netted the deficit");
+    let mm = value(px(200), 5) / 6;
+    assert_eq!(fold(&mut ctx, ALICE).x, (250 * USD - mm) as i128, "X reopens above Σ MM");
+    ledger.check(&mut ctx, "after the deposit");
+}
+
+// ── Gated off: byte identity ──────────────────────────────────────────────────────────────────
+
+/// Every P2c gate keys on the margin type IN FORCE (or on the account's liquidation flag, which no
+/// margin type changes), so with cross margin gated off — production — an account that still
+/// STORES the CROSSED default behaves exactly like one explicitly switched to ISOLATED: the same
+/// outcomes (revert flag, return bytes, gas), the same events byte for byte, the same state. The
+/// scenario walks every gate this slice touched: the taker fills gate (a zero-fee open included),
+/// the maker path, the pre-walk filter, `setLeverage` both ways, add / remove margin at and past
+/// their caps, `-2023` on placement and on `setMarginType`, and the money-out gates at `X`.
+#[test]
+fn gated_off_every_p2c_gate_is_byte_identical_to_explicitly_isolated() {
+    fn scenario(ctx: &mut TestCtx) -> (Vec<(bool, Vec<u8>, u64)>, Vec<Log>) {
+        let mut outs = Vec::new();
+        let mut run = |ctx: &mut TestCtx, who: Address, input: Vec<u8>| {
+            let out = call(ctx, who, &input);
+            outs.push((out.reverted, out.bytes.to_vec(), out.gas_used));
+        };
+        // A taker open and a maker fill; leverage raised under the position, then the refused
+        // lowering; the margin caps.
+        run(ctx, ALICE, setLeverageCall { marketId: M1, leverage: 2 }.abi_encode());
+        run(ctx, BOB, order(M1, SELL, px(100), 10, GTC));
+        run(ctx, ALICE, order(M1, BUY, px(100), 10, IOC));
+        run(ctx, ALICE, setLeverageCall { marketId: M1, leverage: 3 }.abi_encode());
+        run(ctx, ALICE, setLeverageCall { marketId: M1, leverage: 1 }.abi_encode());
+        run(ctx, ALICE, add_margin(M1, WALLET));
+        run(ctx, ALICE, add_margin(M1, 10 * USD));
+        run(ctx, ALICE, remove_margin(M1, 5 * USD));
+        run(ctx, ALICE, remove_margin(M1, WALLET));
+        // A zero-fee taker open (B1 governs an isolated one exactly as before).
+        set_taker_fee(ctx, CAROL, 0);
+        run(ctx, BOB, order(M1, SELL, px(100), 3, GTC));
+        run(ctx, CAROL, order(M1, BUY, px(100), 3, IOC));
+        // The pre-walk filter: an order far beyond CAROL's thin wallet, on a book it would cross.
+        set_wallet(ctx, CAROL, 50 * USD);
+        run(ctx, BOB, order(M2, SELL, px(90), 50, GTC));
+        run(ctx, CAROL, order(M2, BUY, px(90), 50, GTC));
+        // -2023, on placement (a plain order refused, a reduce-only one through) and on the switch.
+        storage::set_in_liquidation_for_test(ctx, ALICE, true).unwrap();
+        run(ctx, ALICE, order(M1, BUY, px(90), 1, GTC));
+        run(ctx, BOB, order(M1, BUY, px(100), 1, GTC));
+        run(ctx, ALICE, ro_order(M1, SELL, px(100), 1, IOC));
+        run(ctx, ALICE, setMarginTypeCall { marketId: M2, marginType: ISOLATED }.abi_encode());
+        storage::set_in_liquidation_for_test(ctx, ALICE, false).unwrap();
+        // The money-out gates at and past X.
+        let x = fold(ctx, ALICE).x as i64;
+        run(ctx, ALICE, transfer_out(x as u64 + 1));
+        run(ctx, ALICE, internal(1, 0, x + 1));
+        run(ctx, ALICE, internal(1, 0, x / 2));
+        run(ctx, ALICE, transfer_out((x - x / 2) as u64));
+        (outs, JournalTr::take_logs(ctx.journal_mut()))
+    }
+
+    fn state(ctx: &mut TestCtx) -> Vec<String> {
+        let mut out = vec![format!("IF {}", insurance_fund(ctx))];
+        for u in USERS {
+            out.push(format!("{:?}", storage::load_account(ctx, u).unwrap()));
+            for m in MARKETS {
+                let mut p = pos(ctx, u, m);
+                p.margin_type = 0; // the one byte the two runs store differently, on purpose
+                out.push(format!("{:?}", p));
+            }
+        }
+        out
+    }
+
+    // Gated off — production: every slot still stores the CROSSED default.
+    let mut gated = make_ctx();
+    let (gated_outs, gated_logs) = scenario(&mut gated);
+    let gated_state = state(&mut gated);
+
+    // Gated on, every slot ISOLATED by choice.
+    let mut isolated = make_ctx();
+    let (isolated_outs, isolated_logs, isolated_state) = {
+        let _cross = crate::margin_type::test_gate::enable();
+        for u in USERS {
+            for m in MARKETS {
+                set_type(&mut isolated, u, m, ISOLATED);
+            }
+        }
+        let (outs, logs) = scenario(&mut isolated);
+        (outs, logs, state(&mut isolated))
+    };
+
+    assert_eq!(gated_outs, isolated_outs, "the same outcomes, return data and gas");
+    assert_eq!(gated_logs, isolated_logs, "the same events, byte for byte");
+    assert_eq!(gated_state, isolated_state, "the same stored state");
+    // The scenario reached what it claims to.
+    let reasons: Vec<String> = gated_outs
+        .iter()
+        .filter(|o| o.0)
+        .map(|o| alloy_sol_types::Revert::abi_decode(&o.1).map(|r| r.reason).unwrap_or_default())
+        .collect();
+    for want in [
+        "setLeverage: cannot reduce leverage with open position",
+        crate::risk::ADD_MARGIN_CAP_REJECT,
+        "removePositionMargin: insufficient position margin",
+        "placeOrder: insufficient perp wallet for margin",
+        crate::trading::IN_LIQUIDATION_REJECT,
+        "setMarginType: -4046 No need to change margin type.",
+        "transferFromPerp: insufficient perp wallet balance",
+        "internalTransfer: insufficient perp wallet balance",
+    ] {
+        assert!(reasons.iter().any(|r| r == want), "never refused with {want:?}: {reasons:?}");
+    }
+    assert_eq!(gated_outs.iter().filter(|o| o.0).count(), reasons.len());
+    assert_eq!(reasons.len(), 8, "{reasons:?}");
 }
