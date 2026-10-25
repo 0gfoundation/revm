@@ -162,12 +162,13 @@ fn j1_refuses_an_isolated_open_that_drains_the_cross_wallet_below_maintenance() 
     assert_eq!(f.e, f.cross_mm, "exactly at cross maintenance");
 }
 
-/// A pure REDUCE keeps the B1 exemption: ALICE's account is already below cross maintenance
+/// J1 does not hold a pure REDUCE: ALICE's account is already below cross maintenance
 /// (`E = $500 < Σ MM = $800`), and buying back 2 of her short at $500 realizes $800 of loss and
-/// leaves it still below (`E = $499.50 < $550`) — but it reduces, so J1 does not apply and the
-/// available balance covers the fee.
+/// leaves it still below (`E = $499.50 < $550`) — but it reduces, so J1 does not apply (nor does
+/// the available-balance gate: a pure reduce on a cross wallet is not margin-gated, see the
+/// reduce tests below).
 #[test]
-fn j1_leaves_a_pure_reduce_to_the_available_balance_gate() {
+fn j1_does_not_hold_a_pure_reduce() {
     let mut ctx = make_ctx();
     let _cross = crate::margin_type::test_gate::enable();
     j1_scene(&mut ctx);
@@ -192,6 +193,184 @@ fn j1_leaves_a_pure_reduce_to_the_available_balance_gate() {
         )),
         crate::batch::PerpBatchReason::OpenIntoInsolvency
     );
+}
+
+// ── A pure reduce on a cross wallet is not margin-gated ──────────────────────────────────────
+
+/// `AlgoOrderCancelled(reason)` rows for `user`.
+fn algo_cancels(logs: &[Log], user: Address) -> Vec<u8> {
+    use crate::interface::IPerpDex::AlgoOrderCancelled;
+    logs.iter()
+        .filter(|l| l.data.topics().first() == Some(&AlgoOrderCancelled::SIGNATURE_HASH))
+        .map(|l| AlgoOrderCancelled::decode_raw_log(l.data.topics(), &l.data.data).unwrap())
+        .filter(|e| e.user == user)
+        .map(|e| e.reason)
+        .collect()
+}
+
+/// ALICE: a CROSSED 2x long of 90 on M1, bought at $100 from an ISOLATED BOB on a $4,600 wallet
+/// (fee $4.50). At a $80 mark her account is HEALTHY — `E = $2,795.50` against `Σ MM = $1,200` —
+/// but under INITIAL margin: `PIM = $3,600` puts her available balance at `−$804.50`. CAROL
+/// (ISOLATED) is the counterparty for her reduces.
+fn healthy_under_im_scene(ctx: &mut TestCtx) {
+    for m in MARKETS {
+        set_type(ctx, BOB, m, ISOLATED);
+        set_type(ctx, CAROL, m, ISOLATED);
+    }
+    set_leverage(ctx, ALICE, M1, 2);
+    set_wallet(ctx, ALICE, 4_600 * USD);
+    trade(ctx, M1, ALICE, BOB, BUY, px(100), 90);
+    assert_eq!(wallet(ctx, ALICE), 4_595 * USD + USD / 2);
+}
+
+/// The healthy-but-under-IM account of [`healthy_under_im_scene`] at the $80 mark.
+fn assert_healthy_under_im(ctx: &mut TestCtx) {
+    let f = fold(ctx, ALICE);
+    assert_eq!(
+        (f.e, f.cross_mm, f.a),
+        ((2_795 * USD + USD / 2) as i128, (1_200 * USD) as i128, -(804 * USD + USD / 2) as i128),
+        "healthy (E ≥ Σ MM), under initial margin (A < 0)"
+    );
+}
+
+/// A pure reduce of a CROSSED position is not margin-gated: its draw is the fee, and on a cross
+/// wallet nothing comes back to cover it — `A_post` still charges the remaining legs' initial
+/// margin — so holding it to `A_post ≥ fee` refused healthy accounts the very trade that lowers
+/// their risk. ALICE (healthy, `A = −$804.50`) sells 18 of her 90 reduce-only at the mark: it fills,
+/// the fee and the realized loss land in the wallet, and her available balance is STILL negative
+/// afterwards (`−$85.22` — the old gate's refusal, by `$85.94`). Binance gates no reduce-only order.
+///
+/// The same holds for closing a WHOLE losing leg whose loss the other legs' initial margin outweighs
+/// — see [`a_cross_wallet_closes_a_losing_leg_whatever_the_other_legs_initial_margin`].
+#[test]
+fn a_cross_reduce_is_not_margin_gated_on_a_healthy_account_under_initial_margin() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    healthy_under_im_scene(&mut ctx);
+    set_mark(&mut ctx, M1, px(80));
+    assert_healthy_under_im(&mut ctx);
+    ok(&mut ctx, CAROL, &order(M1, BUY, px(80), 18, GTC));
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = ok(&mut ctx, ALICE, &ro_order(M1, SELL, px(80), 18, IOC));
+    ledger.check(&mut ctx, "after the reduce");
+    assert_eq!(trades_with(&logs, CAROL), 1);
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 72);
+    assert!(cancels(&logs, ALICE).is_empty(), "nothing was cancelled to cover it");
+    let realized = value(px(80), 18) - value(px(100), 18);
+    let reduce_fee = fee(value(px(80), 18), TAKER_PPM);
+    assert_eq!(wallet(&mut ctx, ALICE), 4_595 * USD + USD / 2 + realized - reduce_fee);
+    let f = fold(&mut ctx, ALICE);
+    assert!(!f.below_cross_maintenance());
+    assert_eq!(
+        f.a,
+        (wallet(&mut ctx, ALICE) - 1_440 * USD - 2_880 * USD) as i128,
+        "A_post = W − $1,440 of uPnL − $2,880 of PIM"
+    );
+    assert!(f.a < reduce_fee as i128, "the old gate (A_post ≥ fee) would have refused it");
+}
+
+/// The whole-leg case: ALICE holds CROSSED 3x longs of 20 on M1 and 60 on M2. M1 falls to $60:
+/// her account is healthy (`E = $1,896 ≥ Σ MM = $1,200`), and closing the losing M1 leg outright
+/// leaves `A_post = E − PIM(M2) = −$104` — the M2 leg's `$2,000` of initial margin outweighs the
+/// account's whole equity. The close goes through; the account is healthier after it.
+#[test]
+fn a_cross_wallet_closes_a_losing_leg_whatever_the_other_legs_initial_margin() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+        set_type(&mut ctx, CAROL, m, ISOLATED);
+        set_leverage(&mut ctx, ALICE, m, 3);
+    }
+    set_wallet(&mut ctx, ALICE, 2_700 * USD);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 20);
+    trade(&mut ctx, M2, ALICE, BOB, BUY, px(100), 60);
+    assert_eq!(wallet(&mut ctx, ALICE), 2_696 * USD);
+    set_mark(&mut ctx, M1, px(60));
+    let f = fold(&mut ctx, ALICE);
+    assert_eq!((f.e, f.cross_mm), ((1_896 * USD) as i128, (1_200 * USD) as i128));
+    assert!(f.a < 0, "under initial margin: {f:?}");
+    ok(&mut ctx, CAROL, &order(M1, BUY, px(60), 20, GTC));
+    let ledger = Ledger::open(&mut ctx);
+
+    ok(&mut ctx, ALICE, &ro_order(M1, SELL, px(60), 20, IOC));
+    ledger.check(&mut ctx, "after the close");
+    assert_eq!((pos(&mut ctx, ALICE, M1).amount, pos(&mut ctx, ALICE, M2).amount), (0, 60));
+    let close_fee = fee(value(px(60), 20), TAKER_PPM);
+    assert_eq!(wallet(&mut ctx, ALICE), 2_696 * USD - 800 * USD - close_fee);
+    let f = fold(&mut ctx, ALICE);
+    assert_eq!(f.a, (1_896 * USD - close_fee - 2_000 * USD) as i128, "A_post = E_post − PIM(M2)");
+    assert_eq!(f.cross_mm, (1_000 * USD) as i128);
+    assert!(!f.below_cross_maintenance());
+}
+
+/// A fired stop-loss is a reduce-only TAKER, so the same gate decided it — and refused it on a
+/// healthy account under initial margin, which `fire` treats as final: it spent the conditional as
+/// `AlgoOrderCancelled(TriggerRejected)` and left the position open. ALICE (the scene above) holds a
+/// reduce-only STOP_MARKET sell of 18 at $81; the tick to $80 fires it and it fills into CAROL's bid.
+#[test]
+fn a_fired_cross_stop_loss_fills_at_a_negative_available_balance() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    healthy_under_im_scene(&mut ctx);
+    const STOP_MARKET: u8 = 1;
+    ok(&mut ctx, ALICE, &algo(SELL, STOP_MARKET, px(81), 0, 18, RO));
+    ok(&mut ctx, CAROL, &order(M1, BUY, px(80), 18, GTC));
+
+    let logs = tick(&mut ctx, M1, px(80), 30);
+    assert!(algo_cancels(&logs, ALICE).is_empty(), "the stop was not spent as TriggerRejected");
+    assert_eq!(trades_with(&logs, CAROL), 1, "it filled");
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 72);
+    assert!(fold(&mut ctx, ALICE).a < 0, "at a still-negative available balance");
+}
+
+/// An ISOLATED reduce of an account that still holds cross exposure after it draws its fee from the
+/// same cross wallet, and the silo it hands back only raises `A` — so it is not gated either. CAROL
+/// holds a CROSSED 3x long of 10 on M2 and an ISOLATED 3x long of 10 on M1; M2 falls to $30, which
+/// takes her account under water (`A < 0`). Selling 1 of the isolated position at $100 goes through.
+///
+/// An account with NO cross exposure keeps the isolated rule byte for byte: once CAROL has closed
+/// the M2 leg — its $700 loss leaves her wallet negative — the same isolated reduce must cover its
+/// fee from the wallet it hands its silo back to, and is refused (the cover loop has no same-side
+/// order to cancel).
+#[test]
+fn an_isolated_reduce_on_a_cross_wallet_is_not_margin_gated_either() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+        set_leverage(&mut ctx, CAROL, m, 3);
+    }
+    set_type(&mut ctx, CAROL, M1, ISOLATED);
+    set_wallet(&mut ctx, CAROL, 700 * USD);
+    trade(&mut ctx, M2, CAROL, BOB, BUY, px(100), 10); // cross
+    trade(&mut ctx, M1, CAROL, BOB, BUY, px(100), 10); // isolated: $333.33 of silo cash
+    set_mark(&mut ctx, M2, px(30));
+    ok(&mut ctx, BOB, &order(M1, BUY, px(100), 2, GTC));
+    let f = fold(&mut ctx, CAROL);
+    assert!(f.has_cross && f.a < 0, "cross exposure, under water: {f:?}");
+    let ledger = Ledger::open(&mut ctx);
+
+    ok(&mut ctx, CAROL, &ro_order(M1, SELL, px(100), 1, IOC));
+    ledger.check(&mut ctx, "after the isolated reduce");
+    assert_eq!(pos(&mut ctx, CAROL, M1).amount, 9);
+    assert!(fold(&mut ctx, CAROL).a < 0, "admitted at a negative available balance");
+
+    // The cross leg closes at its $700 loss (itself a reduce on a cross wallet): no cross exposure
+    // is left, and the wallet is negative.
+    ok(&mut ctx, BOB, &order(M2, BUY, px(30), 10, GTC));
+    ok(&mut ctx, CAROL, &ro_order(M2, SELL, px(30), 10, IOC));
+    assert_eq!(pos(&mut ctx, CAROL, M2).amount, 0);
+    let f = fold(&mut ctx, CAROL);
+    assert!(!f.has_cross && f.w < 0, "isolated only, on a negative wallet: {f:?}");
+    rejects(
+        &mut ctx,
+        CAROL,
+        &ro_order(M1, SELL, px(100), 1, IOC),
+        "placeOrder: insufficient perp wallet for margin",
+    );
+    ledger.check(&mut ctx, "after the refusal");
 }
 
 // ── The fills gate on a cross open ───────────────────────────────────────────────────────────
