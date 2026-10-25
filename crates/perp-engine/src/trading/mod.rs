@@ -13,7 +13,7 @@ mod settlement;
 pub(crate) use liquidation::{
     execute_liquidation_market_order, run_adl,
 };
-pub(crate) use settlement::ISOLATED_SILO_CASH_REJECT;
+pub(crate) use settlement::{CROSS_MAINTENANCE_REJECT, ISOLATED_SILO_CASH_REJECT};
 use settlement::{MakerFillOutcome, TakerSettlement};
 
 /// Maximum distinct maker accounts a single liquidation close may touch.

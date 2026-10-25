@@ -1033,7 +1033,7 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
     }
     storage::save_insurance_fund(&mut ctx, 10_000_000 * USD as u64).unwrap();
 
-    let mut seed: u64 = 0xC205_5AFE_2B1D_0001;
+    let mut seed: u64 = 0xC205_5AFE_2B1D_0021;
     let mut rng = move || {
         seed ^= seed << 13;
         seed ^= seed >> 7;
@@ -1042,8 +1042,10 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
     };
     let traders = [ALICE, BOB, CAROL];
     // ALICE trades taker-fee-free: an underwater cross account cannot pay a taker fee out of a
-    // negative available balance (an isolated one cannot either — the taker gate is cross P2c's),
-    // so without this its losing closes would only ever happen as a maker.
+    // negative available balance (an isolated one cannot either — a pure reduce's draw IS its fee,
+    // gated like any other), so without this its losing closes would only ever happen as a maker.
+    // Her OPENS are margin-checked all the same: a cross open's requirement sits inside the
+    // post-fill available balance, not in its (zero) draw (`settlement::fills_are_covered`).
     set_taker_fee(&mut ctx, ALICE, 0);
     for &u in &traders {
         set_wallet(&mut ctx, u, 1_500 * USD);
@@ -1058,9 +1060,11 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
 
     let mut index = [0i128; 2];
     // The ORACLE index per market, walked on its own (not off the mark, which the book drags), as a
-    // sawtooth between $60 and $160 so positions really go under.
+    // sawtooth between $60 and $160 so positions really go under — the two markets in OPPOSITE
+    // phase, so ALICE's legs diverge: a cross wallet only goes negative when one leg's profit backs
+    // the realized loss of the other (with the account in profit, `X` withdraws down to `Σ MM`).
     let mut oracle = [px(100) as i64; 2];
-    let mut target = [px(60) as i64; 2];
+    let mut target = [px(60) as i64, px(160) as i64];
     let mut ts = 30;
     let mut resting: Vec<Vec<([u8; 32], u64)>> = vec![Vec::new(); 3];
     let (mut cross_fills, mut negative_cross_wallets, mut liqs, mut cross_adl, mut withdrawals) =
@@ -1183,12 +1187,12 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
          {negative_cross_wallets}, liquidations {liqs}, cross ADL fills {cross_adl}, withdrawals \
          {withdrawals}"
     );
-    // Coverage floors, about half of what this seed reaches (66 / 19 / 4 / 4 / 96), so a change
+    // Coverage floors, about half of what this seed reaches (74 / 55 / 11 / 12 / 89), so a change
     // that quietly stops the run from reaching a path fails here instead of passing vacuously.
-    assert!(cross_fills >= 30, "cross fills {cross_fills}");
-    assert!(negative_cross_wallets >= 5, "the cross wallet went negative on too few steps");
-    assert!(liqs >= 2, "liquidations {liqs}");
-    assert!(cross_adl >= 2, "ADL fills on a cross winner {cross_adl}");
+    assert!(cross_fills >= 35, "cross fills {cross_fills}");
+    assert!(negative_cross_wallets >= 25, "the cross wallet went negative on too few steps");
+    assert!(liqs >= 5, "liquidations {liqs}");
+    assert!(cross_adl >= 5, "ADL fills on a cross winner {cross_adl}");
     assert!(withdrawals >= 40, "withdrawals {withdrawals}");
 }
 
@@ -1288,3 +1292,9 @@ fn gated_off_every_money_path_is_byte_identical_to_explicitly_isolated() {
     assert!(!adl_fills(&gated_logs).is_empty(), "an ADL fill");
     assert!(funding_rows(&gated_logs, ALICE).len() == 1);
 }
+
+// ── Cross margin P2c: the gates and controls ──────────────────────────────────────
+//
+// A child module, so it runs on this file's fixture (`make_ctx`, `Ledger`, `trade`, …) as-is.
+#[path = "cross_gates_tests.rs"]
+mod gates;

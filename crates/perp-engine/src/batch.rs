@@ -294,7 +294,8 @@ pub enum PerpBatchReason {
     /// `rest_in_book`, and the taker's fills+rest / post-auto-cancel wallet-cover reject in
     /// `finalize_compute`.
     InsufficientMargin = 29,
-    /// `placeOrder: open would breach maintenance margin` — the K9 open-into-insolvency guard.
+    /// `placeOrder: open would breach maintenance margin` — the K9 open-into-insolvency guard — and
+    /// its account-level twin, the cross J1 refusal (`trading::CROSS_MAINTENANCE_REJECT`).
     OpenIntoInsolvency = 30,
     /// `placeOrder: fee recipient not initialised`
     FeeRecipientNotSet = 31,
@@ -385,6 +386,12 @@ fn place_reason(rest: &str) -> PerpBatchReason {
             PerpBatchReason::InsufficientMargin
         }
         "open would breach maintenance margin" => PerpBatchReason::OpenIntoInsolvency,
+        // J1 (cross margin): the account-level twin of the K9 guard above — the same cause.
+        r if Some(r)
+            == crate::trading::CROSS_MAINTENANCE_REJECT.strip_prefix("placeOrder: ") =>
+        {
+            PerpBatchReason::OpenIntoInsolvency
+        }
         "fee recipient not initialised" => PerpBatchReason::FeeRecipientNotSet,
         "max open orders reached" => PerpBatchReason::MaxOpenOrders,
         "invalid self-trade prevention mode" => PerpBatchReason::InvalidStpMode,

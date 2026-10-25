@@ -26,6 +26,14 @@ pub(crate) const ISOLATED_SILO_CASH_REJECT: &str =
     "placeOrder: -2019 Margin is insufficient. An ISOLATED position is funded from the wallet \
      balance, never from cross unrealized profit";
 
+/// The taker refusal of J1: an open the available balance admits, but after which an account with
+/// cross exposure would have its cross margin balance below its cross maintenance margin. See the
+/// J1 block in [`TakerSettlement::finalize_compute`]. Binance's code for an order the account
+/// cannot margin is `-2019`.
+pub(crate) const CROSS_MAINTENANCE_REJECT: &str =
+    "placeOrder: -2019 Margin is insufficient. The open would leave the cross margin balance \
+     below the cross maintenance margin";
+
 /// Accumulates fill data for a taker across multiple partial fills, then
 /// commits the net effect to storage in a single [`finalize`] call.
 ///
@@ -353,18 +361,23 @@ impl TakerSettlement {
         // the walk has consumed — each surviving entry still at its own frozen assuming price.
         let after_fills = work_position_snapshot(w, bd, pd)?;
         let wallet = w.account.perp_wallet_balance;
-        let available = crate::margin_view::derived_available_balance_with(
+        // ONE fold of the post-fill account: its `A` is the available-balance gate below
+        // (`derived_available_balance_with` is exactly this fold's `a`), and its `E` / `Σ_C MM` are
+        // J1's — so the account-level check costs no load beyond the walk the gate always made.
+        let fold = crate::margin_view::cross_fold_checked(
             context,
             self.user,
             Some(wallet),
             Some((self.market_id, &after_fills)),
+            None,
         )?;
+        let available = fold.a;
 
         // LEVEL 1 fast path (the common case): the available already covers the fills with NO
         // cover cancels → produce the plan with ZERO order-list clones. Only a genuinely tight
         // taker falls through.
         let (rest_pos, cover_cancelled) =
-            if crate::margin_view::derived_can_afford(available, core.total_required as i128) {
+            if fills_are_covered(available, core.total_required, core.cross_open) {
                 (after_fills, false)
             } else {
                 // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
@@ -397,7 +410,7 @@ impl TakerSettlement {
                         Some(wallet),
                         Some((self.market_id, &sim_pos)),
                     )?;
-                    if crate::margin_view::derived_can_afford(avail, core.total_required as i128) {
+                    if fills_are_covered(avail, core.total_required, core.cross_open) {
                         break;
                     }
                     let next = match taker_side {
@@ -447,6 +460,41 @@ impl TakerSettlement {
             return Err(perp_err(ISOLATED_SILO_CASH_REJECT));
         }
 
+        // ── J1: an open must leave the ACCOUNT at or above cross maintenance ────────────────────
+        //
+        // The available-balance gate does not imply it (cross report §3.0 J1). Passing it gives
+        // `E − total_required ≥ Σ_C PIM + Σ ooIM`, which covers `Σ_C MM` only while every cross leg
+        // has `PIM_k ≥ MM_k` — and the per-open tier guard (after `finalize_core`'s K9) checks the
+        // ONE market being filled. A cross leg whose notional the mark has carried into a
+        // higher-MMR tier than its leverage was chosen for has `MM > PIM`, so an account the gate
+        // still admits can already sit under maintenance and keep adding to it. So the post-fill
+        // account is held to the liquidation predicate itself, on the gate's own fold:
+        // `E_post − total_required ≥ Σ_C MM_post`, `E` taken on the post-fill wallet (this order's
+        // realized PnL in it, its draw not yet out of it — hence the subtraction) and the post-fill
+        // position (whose `uPnL` already prices the fill against the mark: Binance's Open Loss).
+        //
+        // WHICH fills: every OPENING / increasing one (`opens` — a flip's new leg included) of an
+        // account that holds cross exposure after it (`has_cross`). A cross open is the case the
+        // report names; an ISOLATED open is held to it too, because its silo cash leaves `W` and so
+        // lowers `E` by exactly `total_required` — draining the cross wallet under maintenance into
+        // a silo the cross positions cannot reach is the same hole by another door. A pure reduce
+        // keeps the B1 exemption.
+        //
+        // HERE, after the available-balance decision (and the cover simulation, which moves
+        // `Σ ooIM` only, never `E` or `Σ_C MM`, so the fold's two are still the post-cover ones):
+        // * an account with no cross exposure can never reach it (`has_cross` is false), so every
+        //   isolated-only outcome — refusal strings included — is exactly what it was. (It could
+        //   not fire there anyway once the gate has passed: `A = W − Σ ooIM ≤ W`, `Σ_C MM = 0`.)
+        // * while cross margin is gated off nothing is CROSSED in force, so it is never reached.
+        // * never on an oracle path: a fired conditional is reduce-only.
+        // Pre-write, like every other reject in this function.
+        if core.opens
+            && fold.has_cross
+            && !fold.covers_cross_maintenance_after(core.total_required as i128)
+        {
+            return Err(perp_err(CROSS_MAINTENANCE_REJECT));
+        }
+
         // The wallet `finalize_apply`'s debit will leave. For an account with no position CROSSED
         // in force it cannot go below zero: both branches above exit with
         // `derived_can_afford(available, total_required)` true, and there
@@ -480,6 +528,7 @@ impl TakerSettlement {
                 wallet: rest_wallet,
                 cover_cancelled,
             },
+            cross_open: core.cross_open,
         }))
     }
 }
@@ -563,6 +612,9 @@ pub(super) struct TakerPlan {
     /// The state this plan's APPLY will leave behind, for the rest decision that runs BEFORE it.
     /// See [`RestBasis`].
     rest_basis: RestBasis,
+    /// [`TakerFillCore::cross_open`] — the apply-phase cover loop asks [`fills_are_covered`] with
+    /// the same flag the compute phase decided on.
+    cross_open: bool,
 }
 
 impl TakerPlan {
@@ -584,6 +636,7 @@ pub(super) fn finalize_apply<H: PerpHost>(
         plan.market_id,
         taker_side,
         plan.total_required,
+        plan.cross_open,
         market,
     )?;
 
@@ -1626,6 +1679,13 @@ pub(super) struct TakerFillCore {
     pub(super) total_required: u64,
     pub(super) realized_pnl: i64,
     pub(super) closed_quantity: u64,
+    /// The fills open or increase the position (`opening_qty > 0`, a flip's new leg included) —
+    /// what J1 holds to account-level cross maintenance (see `finalize_compute`). `false` for a
+    /// pure reduce, which keeps the B1 exemption.
+    pub(super) opens: bool,
+    /// `opens` on a position CROSSED in force: the fills gate takes no B1 exemption for it (see
+    /// [`fills_are_covered`]).
+    pub(super) cross_open: bool,
 }
 
 /// PURE core of [`TakerSettlement::finalize`] (commit-only #23, tranche-4): fill aggregation
@@ -1845,9 +1905,9 @@ fn finalize_core(
     //
     // ISOLATED only. A CROSSED position holds no silo (`pos.margin == 0`), so this per-position
     // predicate would read its equity as bare uPnL — the open's own slippage below MM — and refuse
-    // virtually every cross open. Cross solvency is ACCOUNT-level (`E ≥ Σ_C MM`); the taker's
-    // account-level check is cross P2c's (J1: `E_post ≥ ΣMM_post`, from the same fold
-    // `finalize_compute` already walks for the available-balance gate).
+    // virtually every cross open. Cross solvency is ACCOUNT-level (`E ≥ Σ_C MM`), and the taker's
+    // account-level check is J1 in `finalize_compute` (`E_post − draw ≥ ΣMM_post`, off the same
+    // fold the available-balance gate walks), keyed on `TakerFillCore::opens` below.
     if opening_qty > 0
         && mark_price > 0
         && funding != OpeningMarginFunding::Cross
@@ -1915,6 +1975,8 @@ fn finalize_core(
         total_required,
         realized_pnl: fill_outcome.realized_pnl,
         closed_quantity: closing_qty,
+        opens: opening_qty > 0,
+        cross_open: opening_qty > 0 && funding == OpeningMarginFunding::Cross,
     })
 }
 
@@ -2345,7 +2407,7 @@ fn split_position_fill(
 ///    rest_delta`, which needed an extra `rest_delta >= 0` step; the rest is no longer gated here at
 ///    all — `rest_in_book` decides it once, pre-flush.)
 /// 2. **Cover path**: `finalize_compute` already ran this LIFO loop, on the same state, with the
-///    same predicate (`derived_can_afford(available, total_required)`) and the same per-cancel
+///    same predicate ([`fills_are_covered`]) and the same per-cancel
 ///    arithmetic — its `sim` calls `release_open_order_margin_core`, and the real cancel below routes
 ///    through `release_open_order_margin`, which ends in the same
 ///    `remove_entry_from_side_aggregates(pos, side, entry.amount, entry.margin_notional(..))`. It
@@ -2373,13 +2435,16 @@ fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
     market_id: u64,
     side: Side,
     required_margin: u64,
+    cross_open: bool,
     market: &crate::types::Market,
 ) -> Result<(), PerpError> {
-    if required_margin == 0 {
+    // The B1 shortcut: nothing to cover. Not for a cross open, whose requirement sits inside the
+    // available balance rather than in `required_margin` (see `fills_are_covered`).
+    if required_margin == 0 && !cross_open {
         return Ok(());
     }
 
-    if taker_margin_is_covered(context, user, required_margin)? {
+    if taker_margin_is_covered(context, user, required_margin, cross_open)? {
         return Ok(());
     }
 
@@ -2389,10 +2454,11 @@ fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
         market_id,
         side,
         required_margin,
+        cross_open,
         market,
     )?;
 
-    if !taker_margin_is_covered(context, user, required_margin)? {
+    if !taker_margin_is_covered(context, user, required_margin, cross_open)? {
         // INVARIANT, not a user error — and labelled as one now (it used to raise `perp_err`).
         //
         // This sits inside `finalize_apply`, i.e. AFTER `registry.flush`, so it is structurally a
@@ -2413,18 +2479,40 @@ fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
     Ok(())
 }
 
-/// `derived_available >= required_margin`, read from storage. The single predicate both the
-/// cover loop and its bracketing checks use, so they cannot drift apart.
+/// The taker FILLS gate: may an order whose fills leave the derived available balance at
+/// `available` (post-fill, before the order's wallet draw) draw `total_required` from the wallet?
+///
+/// For every fill but a cross open this is [`crate::margin_view::derived_can_afford`] —
+/// `available ≥ total_required`, with B1's exemption that a non-positive requirement is always
+/// affordable. That exemption is right where `total_required` IS the requirement: an ISOLATED
+/// open's draw carries its silo, so it is never 0, and a draw of 0 is a pure close (or a dust fill)
+/// that costs nothing.
+///
+/// A CROSS OPEN (`cross_open`) is the one fill whose requirement is NOT in `total_required`: it
+/// moves no silo cash, so its draw is the fee alone, while what it requires — its `PIM` and `ooIM`,
+/// net of its own fill's `uPnL` — is already INSIDE the post-fill `available`. The condition is
+/// therefore the post-state one, `available ≥ total_required` with no exemption: at a zero fee (a
+/// zero-rate account, or a fee that floors to 0) the exemption would admit an open of any size,
+/// with no initial-margin check at all. A cross pure reduce keeps it.
+fn fills_are_covered(available: i128, total_required: u64, cross_open: bool) -> bool {
+    if cross_open {
+        available >= total_required as i128
+    } else {
+        crate::margin_view::derived_can_afford(available, total_required as i128)
+    }
+}
+
+/// [`fills_are_covered`] on the derived available balance read from storage. The single predicate
+/// both the cover loop and its bracketing checks use, so they cannot drift apart — and the one the
+/// compute phase decided on.
 fn taker_margin_is_covered<H: PerpHost>(
     context: &mut H,
     user: Address,
     required_margin: u64,
+    cross_open: bool,
 ) -> Result<bool, PerpError> {
     let available = crate::margin_view::derived_available_balance(context, user)?;
-    Ok(crate::margin_view::derived_can_afford(
-        available,
-        required_margin as i128,
-    ))
+    Ok(fills_are_covered(available, required_margin, cross_open))
 }
 
 /// Cancels same-side open orders one at a time (last-placed first) until the AVAILABLE balance
@@ -2439,9 +2527,10 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
     market_id: u64,
     side: Side,
     required_margin: u64,
+    cross_open: bool,
     market: &crate::types::Market,
 ) -> Result<(), PerpError> {
-    while !taker_margin_is_covered(context, user, required_margin)? {
+    while !taker_margin_is_covered(context, user, required_margin, cross_open)? {
         let order_id = match side {
             Side::Buy => storage::load_buy_orders_ref(context, user, market_id)?
                 .back()

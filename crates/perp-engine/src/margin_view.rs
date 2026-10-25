@@ -657,6 +657,16 @@ impl CrossFold {
     pub fn below_cross_maintenance(&self) -> bool {
         self.has_cross && self.e < self.cross_mm
     }
+
+    /// J1 (cross P2c): whether the account still meets cross maintenance after a further `debit`
+    /// leaves the cross wallet — `E − debit ≥ Σ_C MM`, the negation of the liquidation condition on
+    /// the post-debit balance (`E == Σ MM` is healthy). The taker gate passes the order's wallet
+    /// draw (an isolated silo's cash plus the wallet's part of the fee), which this fold, taken on
+    /// the post-fill wallet before that draw, does not yet hold.
+    #[inline]
+    pub fn covers_cross_maintenance_after(&self, debit: i128) -> bool {
+        self.e - debit >= self.cross_mm
+    }
 }
 
 /// The running sums behind a [`CrossFold`] — the ONE place legs are summed, shared by the lean
