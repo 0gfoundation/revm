@@ -462,12 +462,14 @@ pub(crate) fn run_adl<H: PerpHost>(
         // charges only the REMAINING amount, and a full close re-anchors a flat position with no
         // payment — so whatever the closed quantity owed was forgiven and whatever it was owed was
         // lost.
+        // `&mut`: a CROSSED winner's funding lands on this copy's wallet, which is saved with the
+        // fill below — or dropped with it, on a rejected trial.
         let winner_funding = crate::funding::compute_funding_settlement(
             context,
             winner,
             market,
             &mut winner_pos,
-            Some(&winner_account),
+            Some(&mut winner_account),
         )?;
         let take = winner_pos.amount.unsigned_abs().min(remaining);
         let Some(fill) = adl_fill(

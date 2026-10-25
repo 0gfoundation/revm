@@ -1015,21 +1015,23 @@ impl MatchRegistry {
         // Read-through: fees credited to the admin before they joined the registry are pending;
         // fold them into the copy so this user's wallet matches the old per-fill storage writes.
         //
-        // ⚠️ BEFORE the funding compute below, not after. Funding never reads the account (it
-        // settles against `pos.margin` only), so the two are order-independent as far as the
-        // ARITHMETIC goes — but the funding compute now derives the `AccountBalanceChanged` header
-        // for its own group from this copy, and a header taken before the fold would publish a
-        // wallet the flush is about to overwrite.
+        // ⚠️ BEFORE the funding compute below, not after. An ISOLATED settle never touches the
+        // account (it settles against `pos.margin`), and a CROSSED one only adds to its wallet, so
+        // the two are order-independent as far as the ARITHMETIC goes — but the funding compute
+        // derives the `AccountBalanceChanged` header for its own group from this copy, and a
+        // header taken before the fold would publish a wallet the flush is about to overwrite.
         if self.fee_admin == Some(user) && self.admin_credit_pending > 0 {
             account.credit_perp(self.admin_credit_pending)?;
             self.admin_credit_pending = 0;
         }
+        // `&mut account`: a CROSSED position's funding lands on this working copy's wallet (cross
+        // margin P2), which the flush persists with everything else.
         let pending = crate::funding::compute_funding_settlement(
             context,
             user,
             market,
             &mut pos,
-            Some(&account),
+            Some(&mut account),
         )?;
         // A funding settle publishes its OWN account header (`apply_funding_settlement`), so it
         // counts as a published payload for this user: recording it lets the flush's mark-clear gate

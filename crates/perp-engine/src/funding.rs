@@ -13,8 +13,9 @@
 //! still refuse — so the entire accrual is realised against the `amount` that was
 //! actually held over the period.
 //!
-//! Settlement direction (matches `calc_funding_payment`'s sign): funding settles
-//! against the POSITION, never the account-global perp wallet. The signed payment is
+//! Settlement direction (matches `calc_funding_payment`'s sign): for an ISOLATED position
+//! funding settles against the POSITION, never the account-global perp wallet (a CROSSED one is
+//! the opposite — see the section below). The signed payment is
 //! added to the position's isolated `margin`, WHOLE, in both directions: a credit
 //! raises it, a charge lowers it — through zero if it has to. **`margin` may go
 //! NEGATIVE.** A negative margin is a debt the position owes; nothing else pays it:
@@ -34,6 +35,21 @@
 //! lowered equity, so a position solvent on unrealized profit was never liquidated,
 //! the fund paid its funding every epoch, and the close paid the user the whole profit
 //! without recovering any of it.
+//!
+//! # A position CROSSED in force (cross margin P2)
+//!
+//! Everything above describes an ISOLATED position. A CROSSED one has no silo (`pos.margin == 0`,
+//! asserted at `storage::save_position`), so its funding settles into the account's CROSS WALLET
+//! (`perp_wallet_balance`), either sign, through zero if it must — Binance's cross model, where
+//! FUNDING FEE moves `crossWalletBalance` and nothing else. Until it is settled the account fold
+//! already counts it (`cWB = W + Σ_C PF`, `margin_view::cross_fold`), so settling moves no
+//! account-level quantity: it only turns a pending amount into a booked one.
+//!
+//! Its events are Binance's B-only push (`ACCOUNT_UPDATE m=FUNDING_FEE` "without any position P
+//! message", cross report F32): `FundingSettled`, then the `AccountBalanceChanged(FUNDING_FEE)`
+//! header carrying the moved wallet — and NO `PositionChanged`, because no field of the position
+//! row moved. A path that can settle funding on a cross position must therefore hand
+//! [`compute_funding_settlement`] the account it is going to persist.
 //!
 //! This is what makes isolated margin actually isolated, and it is Binance's
 //! measured behaviour: funding hits the position's isolated wallet directly and
@@ -61,7 +77,7 @@ use crate::host::PerpHost;
 use primitives::{Address, Log};
 
 use crate::{
-        errors::perp_err,
+        errors::{perp_err, perp_invariant_err},
     interface::IPerpDex,
     math::calc_funding_payment,
     storage,
@@ -90,6 +106,10 @@ pub(crate) struct PendingFunding {
     /// can value `unrealizedProfit` without a second market load. Immutable per market.
     base_decimals: u32,
     price_decimals: u32,
+    /// The position is CROSSED in force: the payment landed on the caller's account wallet, not
+    /// on `pos.margin`, and [`apply_funding_settlement`] publishes the group WITHOUT a position row
+    /// (Binance's B-only funding push — see the module docs).
+    cross: bool,
     /// The `AccountBalanceChanged` HEADER for the funding group, captured at compute time.
     ///
     /// # Why it has to be carried rather than read at apply time
@@ -105,9 +125,10 @@ pub(crate) struct PendingFunding {
     ///
     /// So it is derived where the post-funding state actually exists, from
     /// `margin_view::wallet_balances_from_parts` on the compute-time account plus the post-funding
-    /// `pos.margin`. Funding touches NO wallet leg (see the module docs: it settles against
-    /// `pos.margin` only), so the account half of the payload is the caller's unmodified account
-    /// either way and only the Σ leg moves.
+    /// `pos.margin`. An ISOLATED settle touches NO wallet leg (it settles against `pos.margin`
+    /// only), so the account half of the payload is the caller's unmodified account and only the
+    /// Σ leg moves; a CROSSED settle is the mirror image — the Σ leg is untouched and the cross
+    /// wallet carries the payment, on the caller's account, which is the copy it persists.
     snapshot: crate::margin_view::AccountWalletBalances,
 }
 
@@ -142,27 +163,35 @@ pub(crate) fn pending_funding_payment(
     calc_funding_payment(pos.amount, delta, market.base_decimals, market.price_decimals)
 }
 
-/// Pure funding computation: reads funding state, adds the signed funding payment to the in-memory
-/// `pos.margin` (which a charge may drive negative — see the module docs), re-anchors
-/// `last_funding_index`, and returns the log payload (`None` if there was no funding event).
-/// Performs NO storage writes, so it is safe to call before a validation reject.
+/// Pure funding computation: reads funding state, settles the signed funding payment IN MEMORY,
+/// re-anchors `last_funding_index`, and returns the log payload (`None` if there was no funding
+/// event). Performs NO storage writes, so it is safe to call before a validation reject.
 ///
-/// Takes NO wallet: funding is isolated to the position (see the module docs). The caller's
-/// `UserAccount` is untouched by funding — which is exactly why `account` below is only ever READ.
+/// Where the payment lands depends on the position's margin type IN FORCE:
+///
+/// * ISOLATED — on the in-memory `pos.margin` (which a charge may drive negative — see the module
+///   docs). The caller's `UserAccount` is untouched, and `account` below is only READ.
+/// * CROSSED — on `account.perp_wallet_balance`, the cross wallet, either sign; `pos.margin` stays
+///   0. `account` is then REQUIRED: it is the copy the caller persists, so the payment is saved
+///   with it. A cross settle without one is refused as an `[INVARIANT]` (it would drop the payment
+///   on the floor); every path that can reach a cross position passes its account — the match
+///   registry, ADL winners, `add`/`removePositionMargin` — and the liquidation path skips a cross
+///   position before funding (cross P2 interim; P3's episode must pass the account).
 ///
 /// `account` is the caller's already-loaded copy, used to build the group header
-/// ([`PendingFunding::snapshot`]) without a second load; pass `None` and it is loaded lazily, and
-/// only when funding actually moved money (`payment != 0`), so a write-free scan such as the
-/// liquidation sweep's healthy-candidate path still touches no account blob. It must be the state
-/// the caller is going to PERSIST for this user (the registry path folds its pending fee credits in
-/// before calling), and `pos.margin` on entry must be this market's STORED margin — both hold on
-/// every call site, because funding is always the first thing a path settles.
+/// ([`PendingFunding::snapshot`]) without a second load; for an ISOLATED position pass `None` and
+/// it is loaded lazily, and only when funding actually moved money (`payment != 0`), so a
+/// write-free scan such as the liquidation sweep's healthy-candidate path still touches no account
+/// blob. It must be the state the caller is going to PERSIST for this user (the registry path folds
+/// its pending fee credits in before calling), and `pos.margin` on entry must be this market's
+/// STORED margin — both hold on every call site, because funding is always the first thing a path
+/// settles.
 pub(crate) fn compute_funding_settlement<H: PerpHost>(
     context: &mut H,
     user: Address,
     market: &Market,
     pos: &mut PerpPosition,
-    account: Option<&crate::types::UserAccount>,
+    account: Option<&mut crate::types::UserAccount>,
 ) -> Result<Option<PendingFunding>, PerpError> {
     let funding = storage::load_funding_state(context, market.market_id)?;
     let index = funding.cumulative_funding_index;
@@ -185,19 +214,43 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
         // `pos.margin` BEFORE funding moves it — the anchor for the header's Σ leg. Pre-funding is
         // the right anchor precisely because the stored aggregate is pre-funding too.
         let margin_before = pos.margin;
-        // The WHOLE payment, either sign, lands on the position's own margin. A credit makes the
-        // receiver safer; a charge bites the position that owes it — through zero if it must,
-        // because a debt that stopped lowering equity at zero is precisely the subsidy this rule
-        // removed (module docs). No wallet leg, no insurance-fund leg.
-        pos.margin = pos
-            .margin
-            .checked_add(payment)
-            .ok_or_else(|| perp_err("funding: position margin overflow"))?;
-        // The group header, off the post-funding position. Lazy account load: only reached when
-        // funding really moved money.
-        let snapshot = {
+        let cross = crate::margin_type::effective_margin_type(pos)
+            == crate::types::MarginType::Crossed;
+        let snapshot = if cross {
+            // CROSSED: the whole payment, either sign, lands on the cross wallet — through zero if
+            // it must, exactly like a realized loss (`settlement::apply_position_fill`). The
+            // position has no silo to put it in.
+            let Some(account) = account else {
+                return Err(perp_invariant_err(
+                    "funding: a CROSSED position settled without its account (the payment \
+                     belongs to the cross wallet)",
+                ));
+            };
+            account.perp_wallet_balance = account
+                .perp_wallet_balance
+                .checked_add(payment)
+                .ok_or_else(|| perp_err("funding: cross wallet overflow"))?;
+            crate::margin_view::wallet_balances_from_parts(
+                account,
+                account
+                    .total_position_margin
+                    .checked_sub(margin_before)
+                    .ok_or_else(|| perp_err("funding: Σ position margin underflow"))?,
+                pos.margin,
+            )?
+        } else {
+            // ISOLATED: the WHOLE payment, either sign, lands on the position's own margin. A
+            // credit makes the receiver safer; a charge bites the position that owes it — through
+            // zero if it must, because a debt that stopped lowering equity at zero is precisely the
+            // subsidy this rule removed (module docs). No wallet leg, no insurance-fund leg.
+            pos.margin = pos
+                .margin
+                .checked_add(payment)
+                .ok_or_else(|| perp_err("funding: position margin overflow"))?;
+            // The group header, off the post-funding position. Lazy account load: only reached
+            // when funding really moved money.
             let loaded;
-            let account = match account {
+            let account: &crate::types::UserAccount = match account {
                 Some(a) => a,
                 None => {
                     loaded = storage::load_account_ref(context, user)?;
@@ -224,6 +277,7 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
             pos: pos.clone(),
             base_decimals: market.base_decimals,
             price_decimals: market.price_decimals,
+            cross,
         });
     }
 
@@ -286,19 +340,29 @@ pub(crate) fn apply_funding_settlement<H: PerpHost>(
     // `FundingSettled` row above is another event, so a header emitted at the top of this function
     // would close with ZERO positions and orphan the row below it. Emitting it right here is what makes the pair a group; the payload
     // was captured at compute time (see `PendingFunding::snapshot`).
-    // `FundingFee` — Binance's value for exactly this: a funding settlement moved `pos.margin`.
+    // `FundingFee` — Binance's value for exactly this: a funding settlement moved `pos.margin` (an
+    // isolated position) or the cross wallet (a cross one).
     storage::log_account_snapshot(context, p.user, &p.snapshot, AccountUpdateReason::FundingFee);
-    crate::events::emit_position_changed_at_mark(
-        context,
-        p.user,
-        p.market_id,
-        &p.pos,
-        mark_price,
-        p.base_decimals,
-        p.price_decimals,
-        0,
-        0,
-    )?;
+    // ── A CROSSED settle publishes NO position row ──────────────────────────────────────────────
+    //
+    // Binance pushes cross funding as `ACCOUNT_UPDATE m=FUNDING_FEE` with the balance only,
+    // "without any position P message" (cross report F32), and the reason above is why: every
+    // field of a cross position's row — `amount`, `vQuote`, `margin` (0), the entry and the PnL —
+    // is exactly what it was, and only the wallet in the header moved. So the group is the header
+    // alone, a 0-position group whose payload is new (the wallet moved by `payment != 0`).
+    if !p.cross {
+        crate::events::emit_position_changed_at_mark(
+            context,
+            p.user,
+            p.market_id,
+            &p.pos,
+            mark_price,
+            p.base_decimals,
+            p.price_decimals,
+            0,
+            0,
+        )?;
+    }
     Ok(())
 }
 
@@ -306,6 +370,9 @@ pub(crate) fn apply_funding_settlement<H: PerpHost>(
 /// to reject between the two (matching settlement, liquidation). Callers that can still refuse
 /// (margin add/remove) instead use [`compute_funding_settlement`] + [`apply_funding_settlement`]
 /// with their rejects in between, so a refused op publishes no funding events.
+///
+/// ISOLATED positions only: it holds no account, and a CROSSED position's payment belongs to one
+/// (it is refused as an `[INVARIANT]`, see [`compute_funding_settlement`]).
 pub(crate) fn settle_position_funding<H: PerpHost>(
     context: &mut H,
     user: Address,

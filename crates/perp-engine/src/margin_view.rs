@@ -1921,7 +1921,8 @@ pub struct AccountWalletBalances {
 /// would make it true come later (or, on the match path, at the flush).
 ///
 /// * `trading::settlement::UserWork::wallet_balances` — a maker mid-sweep;
-/// * `funding::compute_funding_settlement` — funding moves `pos.margin` in memory only;
+/// * `funding::compute_funding_settlement` — funding moves an isolated `pos.margin` (or a cross
+///   position's wallet, on the caller's account copy) in memory only;
 /// * `trading::liquidation::run_adl`'s LOSER leg — its position/account are written once after the
 ///   fill loop.
 ///

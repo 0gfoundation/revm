@@ -803,10 +803,10 @@ pub fn run_add_position_margin<H: PerpHost>(
     let mut account = storage::load_account(context, caller)?;
     // commit-only #23: compute funding IN MEMORY; its events are emitted only by
     // `apply_funding_settlement` after the checks, so a reject below leaves no write and no event.
-    // The credit/charge lands on the in-memory `pos.margin` — funding is isolated to the position
-    // and never touches the account-global wallet.
+    // The credit/charge lands on the in-memory `pos.margin` of an ISOLATED position (it never
+    // touches the account-global wallet), or on this `account` copy's wallet for a CROSSED one.
     let pending_funding =
-        compute_funding_settlement(context, caller, &market, &mut pos, Some(&account))?;
+        compute_funding_settlement(context, caller, &market, &mut pos, Some(&mut account))?;
     // Derived-ooIM gate. A CASH move (wallet → position margin), not an open-order requirement:
     // it changes neither `Bid`/`Ask` nor `N` nor `L`, so Σ ooIM is unchanged and the requirement
     // is exactly `amount`. It must come out of AVAILABLE, not the raw wallet — otherwise a user
@@ -889,7 +889,7 @@ pub fn run_remove_position_margin<H: PerpHost>(
     // commit-only #23: compute funding IN MEMORY first so the checks below see post-funding margin
     // (possibly a debt — then G1 refuses), and a reject leaves no write and no funding event.
     let pending_funding =
-        compute_funding_settlement(context, caller, &market, &mut pos, Some(&account))?;
+        compute_funding_settlement(context, caller, &market, &mut pos, Some(&mut account))?;
     // ── The withdrawable cap (roadmap 2b — Binance's isolated `REMOVE` rule) ──
     //
     //   maxRemovable = max(0, min( iw − MM,  iw + uPnL − PIM ))      amount > maxRemovable ⇒ reject

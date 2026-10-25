@@ -3,6 +3,8 @@
 //! * fills: a cross open moves NO cash (`pos.margin` stays 0), a cross close credits its realized
 //!   PnL to the cross wallet `W` EITHER SIGN with no per-fill bad debt, every fee comes out of `W`,
 //!   and a flip does both in one fill — taker and maker alike;
+//! * funding: a cross position's funding settles into `W`, published as `FundingSettled` plus a
+//!   B-only `AccountBalanceChanged(FUNDING_FEE)` group — no `PositionChanged`;
 //!
 //! Every scenario re-checks the custody identity after every step ([`Ledger::check`]): the
 //! price-independent sum `Σ spot + Σ W + Σ margin + Σ vQuote + Σ pending funding + IF` over every
@@ -22,11 +24,11 @@ use primitives::{address, hardfork::SpecId, Address, FixedBytes, Log, U256};
 
 use crate::{
     interface::IPerpDex::{
-        placeOrderCall, setLeverageCall, setMarginTypeCall, InsuranceFundChanged,
-        InsuranceFundDepleted, PositionChanged,
+        placeOrderCall, setLeverageCall, setMarginTypeCall, AccountBalanceChanged,
+        FundingSettled, InsuranceFundChanged, InsuranceFundDepleted, PositionChanged,
     },
     run_perp_dex_call, storage,
-    types::{AccountUpdateReason, MarginTiers, MarginType, Market, UserAccount},
+    types::{AccountUpdateReason, FundingState, MarginTiers, MarginType, Market, UserAccount},
     PerpOutput, PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
 
@@ -498,4 +500,151 @@ fn a_mixed_account_funds_its_isolated_silo_and_nothing_for_its_cross_leg() {
         "both legs realize the same $200 into the one wallet"
     );
     assert_eq!(storage::load_account(&mut ctx, ALICE).unwrap().total_position_margin, 0);
+}
+
+// ── Funding ───────────────────────────────────────────────────────────────────
+
+/// Moves `market`'s cumulative funding index (and its `Market` mirror — `save_funding_state` is
+/// the one door for both) without a tick.
+fn set_funding_index(ctx: &mut TestCtx, market: u64, index: i128) {
+    let fs = FundingState { last_funding_rate: 7_500, next_funding_ts: 0, cumulative_funding_index: index };
+    storage::save_funding_state(ctx, market, &fs).unwrap();
+}
+
+/// The funding a position of `amount` pays (`< 0`) or receives at `index`, from a fresh anchor:
+/// `calc_funding_payment` on this grid is `−amount · Δ / 10^2`.
+fn funding_payment(amount: i64, index: i128) -> i64 {
+    (-(amount as i128) * index / 100) as i64
+}
+
+/// The `FundingSettled` rows of `logs` for `user`, each with the index of the log after it.
+fn funding_rows(logs: &[Log], user: Address) -> Vec<(usize, FundingSettled)> {
+    logs.iter()
+        .enumerate()
+        .filter(|(_, l)| l.data.topics().first() == Some(&FundingSettled::SIGNATURE_HASH))
+        .map(|(i, l)| (i, FundingSettled::decode_raw_log(l.data.topics(), &l.data.data).unwrap()))
+        .filter(|(_, e)| e.user == user)
+        .collect()
+}
+
+fn header_at(logs: &[Log], i: usize) -> Option<AccountBalanceChanged> {
+    let l = logs.get(i)?;
+    (l.data.topics().first() == Some(&AccountBalanceChanged::SIGNATURE_HASH))
+        .then(|| AccountBalanceChanged::decode_raw_log(l.data.topics(), &l.data.data).unwrap())
+}
+
+fn is_position_row(logs: &[Log], i: usize) -> bool {
+    logs.get(i).is_some_and(|l| l.data.topics().first() == Some(&PositionChanged::SIGNATURE_HASH))
+}
+
+/// A cross position's funding — paid here — settles into the CROSS WALLET at its next touch (a
+/// partial close as a taker), never into a silo, and is published Binance's B-only way:
+/// `FundingSettled`, then the `AccountBalanceChanged(FUNDING_FEE)` header carrying the moved wallet,
+/// and NO position row in that group. The isolated counterparty's funding, still pending, is
+/// untouched; the identity (which counts pending funding) holds throughout.
+#[test]
+fn cross_funding_settles_into_the_wallet_as_a_balance_only_push() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_type(&mut ctx, BOB, M1, ISOLATED);
+    set_type(&mut ctx, CAROL, M1, ISOLATED);
+    let ledger = Ledger::open(&mut ctx);
+
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    // 0.75% of $100 per contract: the long pays $7.50, the short is owed it.
+    let index = 10_000 * 7_500;
+    set_funding_index(&mut ctx, M1, index);
+    ledger.check(&mut ctx, "with funding pending on both sides");
+    let owed = funding_payment(10, index);
+    assert_eq!(owed, -7_500_000);
+    let w0 = wallet(&mut ctx, ALICE);
+    let before = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    assert_eq!(before.cwb, w0 as i128 + owed as i128, "cWB counts it while pending");
+
+    let logs = trade(&mut ctx, M1, ALICE, CAROL, SELL, px(100), 4);
+    ledger.check(&mut ctx, "after the settling close");
+    crate::events::stream_test_support::assert_account_update_groups(&logs);
+
+    let close_fee = fee(value(px(100), 4), TAKER_PPM);
+    assert_eq!(wallet(&mut ctx, ALICE), w0 + owed - close_fee);
+    let a = pos(&mut ctx, ALICE, M1);
+    assert_eq!((a.amount, a.margin, a.last_funding_index), (6, 0, index));
+    // BOB (isolated, untouched) still has his credit pending, on his position.
+    assert_eq!(pos(&mut ctx, BOB, M1).last_funding_index, 0);
+
+    let rows = funding_rows(&logs, ALICE);
+    assert_eq!(rows.len(), 1, "one settle");
+    let (i, settled) = &rows[0];
+    assert_eq!(settled.amount, owed);
+    let header = header_at(&logs, i + 1).expect("the funding group's header follows FundingSettled");
+    assert_eq!(header.user, ALICE);
+    assert_eq!(header.reason, AccountUpdateReason::FundingFee.code());
+    assert_eq!(header.totalCrossWalletBalance, w0 + owed, "the header carries the moved wallet");
+    assert!(!is_position_row(&logs, i + 2), "a cross funding settle publishes NO position row");
+}
+
+/// The receiving side, as a MAKER: a cross short is owed funding, which lands on its wallet when
+/// the maker is first touched in a match — before its fill, as its own B-only group — and the fill
+/// then settles on top of it.
+#[test]
+fn a_cross_maker_receives_funding_into_the_wallet_before_its_fill() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_type(&mut ctx, BOB, M1, ISOLATED);
+    set_type(&mut ctx, CAROL, M1, ISOLATED);
+    let ledger = Ledger::open(&mut ctx);
+
+    trade(&mut ctx, M1, ALICE, BOB, SELL, px(100), 10); // ALICE cross short 10
+    let index = 10_000 * 7_500;
+    set_funding_index(&mut ctx, M1, index);
+    let owed = funding_payment(-10, index);
+    assert_eq!(owed, 7_500_000, "the short is paid");
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 3, GTC));
+    let w0 = wallet(&mut ctx, ALICE);
+    let logs = ok(&mut ctx, CAROL, &order(M1, SELL, px(100), 3, IOC));
+    ledger.check(&mut ctx, "after the maker fill");
+    crate::events::stream_test_support::assert_account_update_groups(&logs);
+
+    assert_eq!(wallet(&mut ctx, ALICE), w0 + owed - fee(value(px(100), 3), MAKER_PPM as u64));
+    assert_eq!(pos(&mut ctx, ALICE, M1).margin, 0);
+    let rows = funding_rows(&logs, ALICE);
+    assert_eq!(rows.len(), 1);
+    let (i, settled) = &rows[0];
+    assert_eq!(settled.amount, owed);
+    let header = header_at(&logs, i + 1).unwrap();
+    assert_eq!((header.user, header.totalCrossWalletBalance), (ALICE, w0 + owed));
+    assert!(!is_position_row(&logs, i + 2));
+}
+
+/// A funding charge larger than the wallet takes a cross wallet negative, exactly like a realized
+/// loss — no clamp, no insurance-fund leg — and it stays negative (owner decision Q8: clearance is
+/// P3's, and only once the account holds no position).
+#[test]
+fn a_cross_funding_charge_beyond_the_wallet_drives_it_negative() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_type(&mut ctx, BOB, M1, ISOLATED);
+    set_type(&mut ctx, CAROL, M1, ISOLATED);
+    set_leverage(&mut ctx, ALICE, M1, 3);
+    set_wallet(&mut ctx, ALICE, 400 * USD);
+    let ledger = Ledger::open(&mut ctx);
+
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    let w0 = wallet(&mut ctx, ALICE);
+    // A (fixture-sized) $500 charge on the $1,000 long.
+    let index = 5_000_000_000;
+    set_funding_index(&mut ctx, M1, index);
+    let owed = funding_payment(10, index);
+    assert_eq!(owed, -500 * USD);
+    let if0 = insurance_fund(&mut ctx);
+    // Settle it with a zero-fee pure close of 1 (a close with a fee would be refused: the
+    // available balance is below the fee once the charge lands).
+    set_taker_fee(&mut ctx, ALICE, 0);
+    let logs = trade(&mut ctx, M1, ALICE, CAROL, SELL, px(100), 1);
+    ledger.check(&mut ctx, "after the charge settled");
+    assert_eq!(wallet(&mut ctx, ALICE), w0 + owed);
+    assert!(wallet(&mut ctx, ALICE) < 0);
+    assert_eq!(pos(&mut ctx, ALICE, M1).margin, 0);
+    assert_eq!(insurance_fund(&mut ctx), if0);
+    assert_eq!(count_events::<InsuranceFundChanged>(&logs), 0);
 }
