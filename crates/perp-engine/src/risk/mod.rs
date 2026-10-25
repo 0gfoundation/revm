@@ -995,6 +995,14 @@ pub fn run_remove_position_margin<H: PerpHost>(
     //
     // Gate order is fixed and each refusal names its own term: G1 the balance, G2 `iw − MM`, G3
     // `iw + uPnL − PIM`, G4 the liquidation predicate itself.
+    //
+    // Why these four carry no Binance code (`-4051 Isolated balance insufficient.`, which Binance
+    // answers every over-request with) while the ADD cap carries `-4050`: cross margin left the
+    // REMOVE rule exactly as it was (cross report §3.3 item 8), and the P2 ground rule keeps every
+    // isolated outcome byte-identical while cross margin is gated off — refusal strings included.
+    // The add cap is the sanctioned exception because its BASIS changed (`A` → `X`) and its string
+    // with it. Prefixing these four is a harness-visible change with no rule behind it; if wanted,
+    // it belongs with the P3 flip, where the harness lockstep regenerates its string matchers anyway.
     if pos.margin < amount {
         return Err(perp_err(
             "removePositionMargin: insufficient position margin",

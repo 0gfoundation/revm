@@ -1929,7 +1929,8 @@ pub(crate) fn reject_provably_unaffordable_limit_order<H: PerpHost>(
     // A CROSSED order's own open gain lowers its requirement (see "A CROSS order" above): credit
     // the most it can be, plus the slack once more for that term's own flooring. Gated off,
     // nothing is CROSSED in force and the bound is exactly what it was.
-    if crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed {
+    let cross = crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed;
+    if cross {
         let gain_per_unit = match side {
             Side::Buy => market.mark_price.saturating_sub(side_min),
             Side::Sell => storage::load_market_hot(context, market_id)?
@@ -1949,7 +1950,9 @@ pub(crate) fn reject_provably_unaffordable_limit_order<H: PerpHost>(
 
     let available = crate::margin_view::derived_available_balance(context, user)?;
     if available < bound {
-        return Err(perp_err(INSUFFICIENT_MARGIN_REJECT));
+        // The rest gate's and the fills gate's own string for the same cause — the cross one for an
+        // order on a position CROSSED in force (`insufficient_margin_reject`).
+        return Err(perp_err(insufficient_margin_reject(cross)));
     }
     Ok(())
 }
@@ -2127,7 +2130,9 @@ fn raise_rest_refusal(outcome: RestOutcome) -> Result<(), PerpError> {
     match outcome {
         RestOutcome::Rested => Ok(()),
         RestOutcome::RefusedTooGoodBest => Err(perp_err(TOO_GOOD_BEST_REJECT)),
-        RestOutcome::RefusedUnaffordable => Err(perp_err(INSUFFICIENT_MARGIN_REJECT)),
+        RestOutcome::RefusedUnaffordable { cross } => {
+            Err(perp_err(insufficient_margin_reject(cross)))
+        }
     }
 }
 
@@ -3149,7 +3154,10 @@ enum RestOutcome {
     /// remainder EXPIRY, which stopped the leak but broke the order-lifecycle contract (an
     /// `OrderCancelled` with no `OrderRested` before it) and diverged from Binance, which rejects
     /// the whole order (`-2019`). Now the barrier sits below the decision, so it is simply a reject.
-    RefusedUnaffordable,
+    RefusedUnaffordable {
+        /// The order's position is CROSSED in force: refused with the `-2019` string.
+        cross: bool,
+    },
 }
 
 const TOO_GOOD_BEST_REJECT: &str = "placeOrder: a new best quote must be inside the price band";
@@ -3157,6 +3165,26 @@ const TOO_GOOD_BEST_REJECT: &str = "placeOrder: a new best quote must be inside 
 /// same cause, so a client cannot tell "refused before the walk" from "refused after it".
 pub(super) const INSUFFICIENT_MARGIN_REJECT: &str =
     "placeOrder: insufficient perp wallet for margin";
+/// [`INSUFFICIENT_MARGIN_REJECT`] for an order on a position CROSSED in force — the same cause, the
+/// available balance `A` not covering the order's cost (a cross open's initial margin at the
+/// fills gate; `Δ ooIM` plus its Open Loss at the rest gate; the pre-walk bound) — with Binance's
+/// code, `-2019`, like the two other cross margin refusals of the place path (J1, J6). An
+/// ISOLATED order keeps the uncoded string byte for byte, so gated off nothing changes. Batch
+/// reason `InsufficientMargin` (29), like its isolated twin.
+///
+/// ABI CHANGE (cross P2): a new revert string, reachable only on a position CROSSED in force.
+pub(crate) const CROSS_INSUFFICIENT_MARGIN_REJECT: &str =
+    "placeOrder: -2019 Margin is insufficient. The available balance does not cover the order";
+
+/// The place path's insufficient-margin refusal for an order on a position CROSSED in force
+/// (`cross`) or not.
+pub(super) fn insufficient_margin_reject(cross: bool) -> &'static str {
+    if cross {
+        CROSS_INSUFFICIENT_MARGIN_REJECT
+    } else {
+        INSUFFICIENT_MARGIN_REJECT
+    }
+}
 
 /// The quantity of a `qty` order on `side` that can only OPEN: what is left once the position it
 /// offsets has been closed — net of the same-side orders already resting against it, which are
@@ -3504,7 +3532,9 @@ fn rest_in_book<H: PerpHost>(
         if delta > 0 || open_loss > 0 {
             // Write-clean (validate-then-apply: the probe above materialised nothing, and
             // `deferred` is dropped unflushed). A clean whole-order reject.
-            return Ok(RestOutcome::RefusedUnaffordable);
+            let cross = crate::margin_type::effective_margin_type(&pos_basis)
+                == crate::types::MarginType::Crossed;
+            return Ok(RestOutcome::RefusedUnaffordable { cross });
         }
     }
     // P3: the gate above is `A`'s, so an account that already sits UNDER cross maintenance while

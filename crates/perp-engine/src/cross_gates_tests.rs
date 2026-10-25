@@ -413,7 +413,7 @@ fn a_zero_fee_cross_open_is_still_held_to_its_initial_margin() {
         &mut ctx,
         ALICE,
         &order(M1, BUY, px(100), 3, IOC),
-        "placeOrder: insufficient perp wallet for margin",
+        crate::trading::CROSS_INSUFFICIENT_MARGIN_REJECT,
     );
     ledger.check(&mut ctx, "after the refusal");
 
@@ -639,7 +639,7 @@ fn the_pre_walk_filter_still_refuses_a_cross_order_it_can_bound() {
     set_wallet(&mut ctx, ALICE, 199 * USD);
     match filter(&mut ctx) {
         Err(crate::PerpError::Reject(m)) => {
-            assert_eq!(m, "placeOrder: insufficient perp wallet for margin")
+            assert_eq!(m, crate::trading::CROSS_INSUFFICIENT_MARGIN_REJECT)
         }
         other => panic!("the filter let a provably unaffordable cross order through: {other:?}"),
     }
@@ -647,7 +647,7 @@ fn the_pre_walk_filter_still_refuses_a_cross_order_it_can_bound() {
         &mut ctx,
         ALICE,
         &order(M1, BUY, px(90), 10, GTC),
-        "placeOrder: insufficient perp wallet for margin",
+        crate::trading::CROSS_INSUFFICIENT_MARGIN_REJECT,
     );
     // At $234 the full path admits it, and the filter, sound, lets it through.
     set_wallet(&mut ctx, ALICE, 234 * USD);
@@ -678,7 +678,7 @@ fn the_resting_gate_reads_a_with_cross_profit_to_the_unit() {
         &mut ctx,
         ALICE,
         &order(M1, BUY, px(100), 3, GTC),
-        "placeOrder: insufficient perp wallet for margin",
+        crate::trading::CROSS_INSUFFICIENT_MARGIN_REJECT,
     );
     set_wallet(&mut ctx, ALICE, w_edge);
     let ledger = Ledger::open(&mut ctx);
@@ -722,7 +722,7 @@ fn a_cross_order_pays_its_open_loss_at_placement() {
             &mut ctx,
             BOB,
             &order(M1, side, price, 100, GTC),
-            "placeOrder: insufficient perp wallet for margin",
+            crate::trading::CROSS_INSUFFICIENT_MARGIN_REJECT,
         );
         set_wallet(&mut ctx, BOB, w_edge);
         let ledger = Ledger::open(&mut ctx);
@@ -766,7 +766,7 @@ fn the_open_loss_is_charged_on_the_opening_part_only() {
         &mut ctx,
         BOB,
         &order(M1, SELL, px(90), 5, GTC),
-        "placeOrder: insufficient perp wallet for margin",
+        crate::trading::CROSS_INSUFFICIENT_MARGIN_REJECT,
     );
     set_wallet(&mut ctx, BOB, w_edge);
     place(&mut ctx, BOB, &order(M1, SELL, px(90), 5, GTC));

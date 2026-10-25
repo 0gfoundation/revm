@@ -125,7 +125,10 @@ const TAKER_PPM: u64 = 500;
 const MAKER_PPM: i64 = 200;
 
 // Refusal strings — the ABI docs' wording and the report's Binance codes (§1.8, F29).
-const E_MARGIN: &str = "placeOrder: insufficient perp wallet for margin";
+/// The insufficient-margin refusal of an order on a position CROSSED in force — Binance's `-2019`
+/// (the isolated twin is `placeOrder: insufficient perp wallet for margin`).
+const E_MARGIN: &str =
+    "placeOrder: -2019 Margin is insufficient. The available balance does not cover the order";
 const E_J1: &str = "placeOrder: -2019 Margin is insufficient. The open would leave the cross \
                     margin balance below the cross maintenance margin";
 const E_J6: &str = "placeOrder: -2019 Margin is insufficient. An ISOLATED position is funded from \

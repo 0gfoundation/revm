@@ -9473,6 +9473,19 @@ mod batch_cancel {
                 "placeOrder: {msg}"
             );
         }
+        // The cross margin place-path refusals (they carry Binance codes, so they are matched by
+        // their whole text).
+        for (msg, want) in [
+            (
+                crate::trading::CROSS_INSUFFICIENT_MARGIN_REJECT,
+                PerpBatchReason::InsufficientMargin,
+            ),
+            (crate::trading::ISOLATED_SILO_CASH_REJECT, PerpBatchReason::InsufficientMargin),
+            (crate::trading::CROSS_MAINTENANCE_REJECT, PerpBatchReason::OpenIntoInsolvency),
+            (crate::trading::IN_LIQUIDATION_REJECT, PerpBatchReason::UserInLiquidation),
+        ] {
+            assert_eq!(reason_code(&perp_err(msg)), want, "{msg}");
+        }
         // Non-`placeOrder:`-prefixed engine guards reachable from the place path.
         assert_eq!(
             reason_code(&perp_err("settlement: realized PnL overflow")),

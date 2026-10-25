@@ -292,7 +292,9 @@ pub enum PerpBatchReason {
     FokUnfillable = 28,
     /// `placeOrder: insufficient perp wallet for margin` — the resting-margin reject in
     /// `rest_in_book`, and the taker's fills+rest / post-auto-cancel wallet-cover reject in
-    /// `finalize_compute`.
+    /// `finalize_compute` — its cross twin `placeOrder: -2019 Margin is insufficient. The available
+    /// balance does not cover the order` (`trading::CROSS_INSUFFICIENT_MARGIN_REJECT`, an order on
+    /// a position CROSSED in force), and J6's `trading::ISOLATED_SILO_CASH_REJECT`.
     InsufficientMargin = 29,
     /// `placeOrder: open would breach maintenance margin` — the K9 open-into-insolvency guard — and
     /// its account-level twin, the cross J1 refusal (`trading::CROSS_MAINTENANCE_REJECT`).
@@ -382,6 +384,12 @@ fn place_reason(rest: &str) -> PerpBatchReason {
         "PostOnly order would match" => PerpBatchReason::PostOnlyWouldMatch,
         "FOK order cannot be fully filled" => PerpBatchReason::FokUnfillable,
         "insufficient perp wallet for margin" => PerpBatchReason::InsufficientMargin,
+        // Its cross twin (an order on a position CROSSED in force), with Binance's `-2019`.
+        r if Some(r)
+            == crate::trading::CROSS_INSUFFICIENT_MARGIN_REJECT.strip_prefix("placeOrder: ") =>
+        {
+            PerpBatchReason::InsufficientMargin
+        }
         // J6 (cross margin): the isolated silo's cash is not in the wallet — the same cause.
         r if Some(r)
             == crate::trading::ISOLATED_SILO_CASH_REJECT.strip_prefix("placeOrder: ") =>

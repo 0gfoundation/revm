@@ -447,7 +447,8 @@ impl TakerSettlement {
                     Side::Sell => sim_sell.back().map(|e| (e.order_id, e.price)),
                 };
                 let Some((oid, price)) = next else {
-                    return Err(perp_err("placeOrder: insufficient perp wallet for margin"));
+                    // `-2019` for a cross open (the only cross fill set this gate can refuse).
+                    return Err(perp_err(super::insufficient_margin_reject(core.cross)));
                 };
                 super::release_open_order_margin_core(
                     &mut sim_pos,
