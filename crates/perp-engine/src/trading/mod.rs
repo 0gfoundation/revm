@@ -1782,12 +1782,41 @@ fn remove_order_entry_by_price(
 /// fill count is bounded by `quantity / min_quantity`), the fill/rest split floors once more, and
 /// `ooIM`'s `round_up_div` plus `opening_margin`'s truncating division contribute a constant.
 ///
+/// # A CROSS order: its own fill can CREDIT the available balance (cross margin P2c)
+///
+/// The bound above prices the ISOLATED requirement of the order's fills — their silo,
+/// `opening_value / L` at the FILL price. A position CROSSED in force moves no silo: its fill adds
+/// `PIM` at the MARK to the requirement inside `A`, and its `uPnL` — `N − opening_value`, the fill
+/// priced against the mark — to `A` itself. Per fill that is `(N − value)/L − (N − value)` more
+/// than the isolated requirement, i.e. the requirement is LOWER by `(1 − 1/L)` of the order's open
+/// GAIN (a buy filled below the mark, a sell above it). An open loss only raises it. So
+///
+/// ```text
+///     cross requirement  ≥  isolated requirement − open_gain,
+///     open_gain ≤ q × (mark − best_ask)   (buy: every fill is at ≥ the touch it starts from)
+///     open_gain ≤ q × (best_bid − mark)   (sell: every fill is at ≤ the best bid)
+/// ```
+///
+/// and the bound subtracts that (each per-unit gain floored at 0, valued once — plus the slack
+/// again for its own flooring). It stays a sound filter: refused here ⟹ `A < cross requirement`,
+/// which the fills gate (`settlement::fills_are_covered`, no B1 escape for a cross open) refuses
+/// too. Where the book offers no gain the cross bound is the isolated one, so the filter keeps its
+/// teeth on the deep-walk orders it exists for.
+///
+/// The cross report (§3.3 item 5) proposed one of two other fixes; neither is the right one now:
+/// * "add `Σ_C max(0, uPnL_k)` to the upper bound on `A`" — moot since P2a: `available` here IS
+///   the fold's `A`, which already holds every cross leg's `uPnL`, and the gate behind this filter
+///   reads the same `A`. What the bound was missing is the ORDER's own gain, which no leg holds.
+/// * "skip the filter for an account with cross positions" — misses a flat account's first cross
+///   order (the gain is this order's own), and after the P3 flip every position is CROSSED by
+///   default, so it would switch the deep-walk DoS filter off for every account.
+///
 /// # Cost
 ///
-/// One `MarketHot` read (buy side only, already warm), the position blob, and — only when the bound
-/// comes out positive — one `derived_available_balance` fold over the per-user market index, bounded
-/// by `MAX_USER_MARKETS = 16`. Never the book.
-fn reject_provably_unaffordable_limit_order<H: PerpHost>(
+/// One `MarketHot` read (buy side, and a CROSSED sell's best bid; already warm), the position blob,
+/// and — only when the bound comes out positive — one `derived_available_balance` fold over the
+/// per-user market index, bounded by `MAX_USER_MARKETS = 16`. Never the book.
+pub(crate) fn reject_provably_unaffordable_limit_order<H: PerpHost>(
     context: &mut H,
     user: Address,
     market_id: u64,
@@ -1849,7 +1878,25 @@ fn reject_provably_unaffordable_limit_order<H: PerpHost>(
     // on purpose — `L >= 1`, so the unscaled figure is never smaller than the scaled one.
     let fills_max = quantity / market.min_quantity.max(1);
     let slack = (fills_max as i128).saturating_add(4);
-    let bound = raw_bound.saturating_sub(slack);
+    let mut bound = raw_bound.saturating_sub(slack);
+
+    // A CROSSED order's own open gain lowers its requirement (see "A CROSS order" above): credit
+    // the most it can be, plus the slack once more for that term's own flooring. Gated off,
+    // nothing is CROSSED in force and the bound is exactly what it was.
+    if crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed {
+        let gain_per_unit = match side {
+            Side::Buy => market.mark_price.saturating_sub(side_min),
+            Side::Sell => storage::load_market_hot(context, market_id)?
+                .best_bid
+                .saturating_sub(market.mark_price),
+        };
+        let Ok(open_gain) =
+            calc_value(gain_per_unit, quantity, market.base_decimals, market.price_decimals)
+        else {
+            return Ok(());
+        };
+        bound = bound.saturating_sub(open_gain as i128).saturating_sub(slack);
+    }
     if bound <= 0 {
         return Ok(());
     }

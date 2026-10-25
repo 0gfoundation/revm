@@ -6,7 +6,10 @@
 //!   maintenance (`E_post − draw ≥ Σ_C MM_post`) — refused at exactly one unit below, even where
 //!   the available balance alone admits it; a pure reduce keeps the B1 exemption;
 //! * makers (Q9 / D13): a cross maker fill gets no account-level check, however unhealthy the
-//!   account — but every resting order of an account IN LIQUIDATION is cancelled, not filled.
+//!   account — but every resting order of an account IN LIQUIDATION is cancelled, not filled;
+//! * the pre-walk unaffordable-order filter credits a cross order's own open gain, so it never
+//!   refuses what the full path admits, and still refuses what it can bound; the resting gate
+//!   reads `A`, cross unrealized profit included, to the unit.
 //!
 //! A child of `cross_settlement_tests`, so it runs on that fixture: two markets on an exact grid
 //! (base 0 decimals, price 2), `USD` = one dollar in quote units, the custody [`Ledger`] re-checked
@@ -372,4 +375,126 @@ fn a_maker_of_an_account_in_liquidation_is_cancelled_not_filled() {
     assert_eq!(trades_with(&logs, ALICE), 1);
     assert_eq!(pos(&mut ctx, ALICE, M1).amount, 6);
     ledger.check(&mut ctx, "after the flag was cleared");
+}
+
+// ── The pre-walk filter and the resting gate ─────────────────────────────────────────────────
+
+/// A cross order whose fill lands on the good side of the mark has its open GAIN in the available
+/// balance (`uPnL` at the mark), so it needs less than the isolated bound the pre-walk filter used
+/// to apply. ALICE (cross, 3x, `A = $250`) buys 10 at $90 with the mark at $100: the isolated bound
+/// is `⌈$900 / 3⌉ = $300 > A` and the old filter refused it outright, yet the order needs only
+/// `PIM $333.33 − gain $100 + fee $0.45` and goes through. The mirror, a sell of 10 at $110 into a
+/// $110 bid (bound `⌈$1,000 / 3⌉`, the sell valued at `min(limit, mark)`), likewise.
+#[test]
+fn the_pre_walk_filter_credits_a_cross_orders_own_open_gain() {
+    for side in [BUY, SELL] {
+        let mut ctx = make_ctx();
+        let _cross = crate::margin_type::test_gate::enable();
+        set_type(&mut ctx, BOB, M1, ISOLATED);
+        set_leverage(&mut ctx, ALICE, M1, 3);
+        set_wallet(&mut ctx, ALICE, 250 * USD);
+        // The counter-order on the good side of the $100 mark.
+        let price = if side == BUY { px(90) } else { px(110) };
+        ok(&mut ctx, BOB, &order(M1, 1 - side, price, 10, GTC));
+        let ledger = Ledger::open(&mut ctx);
+
+        // What the filter used to compare `A` against: the order resting whole at
+        // `p_min = min(limit, best ask for a buy, mark)`.
+        let market = storage::load_market(&mut ctx, M1).unwrap().unwrap();
+        let flat = pos(&mut ctx, ALICE, M1);
+        let mut resting = flat.clone();
+        let p_min = price.min(px(100));
+        if side == BUY {
+            resting.total_buy_notional = value(p_min, 10) as u64;
+        } else {
+            resting.total_sell_notional = value(p_min, 10) as u64;
+        }
+        let isolated_bound =
+            crate::margin_view::derived_requirement_delta(&market, &flat, &resting).unwrap();
+        assert_eq!(isolated_bound, ceil_div(value(p_min, 10), 3) as i128);
+        assert!(fold(&mut ctx, ALICE).a < isolated_bound, "the old filter refused it");
+
+        ok(&mut ctx, ALICE, &order(M1, side, price, 10, GTC));
+        ledger.check(&mut ctx, "after the order");
+        let amount = pos(&mut ctx, ALICE, M1).amount;
+        assert_eq!(amount, if side == BUY { 10 } else { -10 }, "filled in full, nothing rested");
+        let want = 250 * USD - ceil_div(value(px(100), 10), 3) + 100 * USD
+            - fee(value(price, 10), TAKER_PPM);
+        assert_eq!(fold(&mut ctx, ALICE).a, want as i128, "A = W − PIM + gain − fee");
+    }
+}
+
+/// The credit is bounded, so the filter keeps its teeth on a cross order: with `A = $199` against a
+/// true requirement of `$233.78` (the buy above), the filter itself refuses it before any walk —
+/// called directly here, since the full path's own refusal reads the same.
+#[test]
+fn the_pre_walk_filter_still_refuses_a_cross_order_it_can_bound() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    set_type(&mut ctx, BOB, M1, ISOLATED);
+    set_leverage(&mut ctx, ALICE, M1, 3);
+    ok(&mut ctx, BOB, &order(M1, SELL, px(90), 10, GTC));
+    let market = storage::load_market(&mut ctx, M1).unwrap().unwrap();
+    let filter = |ctx: &mut TestCtx| {
+        crate::trading::reject_provably_unaffordable_limit_order(
+            ctx,
+            ALICE,
+            M1,
+            crate::types::Side::Buy,
+            px(90),
+            10,
+            &market,
+        )
+    };
+
+    set_wallet(&mut ctx, ALICE, 199 * USD);
+    match filter(&mut ctx) {
+        Err(crate::PerpError::Reject(m)) => {
+            assert_eq!(m, "placeOrder: insufficient perp wallet for margin")
+        }
+        other => panic!("the filter let a provably unaffordable cross order through: {other:?}"),
+    }
+    rejects(
+        &mut ctx,
+        ALICE,
+        &order(M1, BUY, px(90), 10, GTC),
+        "placeOrder: insufficient perp wallet for margin",
+    );
+    // At $234 the full path admits it, and the filter, sound, lets it through.
+    set_wallet(&mut ctx, ALICE, 234 * USD);
+    assert!(filter(&mut ctx).is_ok());
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(90), 10, GTC));
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 10);
+}
+
+/// The resting gate (`rest_in_book`) reads `A`, cross unrealized profit included: ALICE's cross
+/// long on M2 has doubled (`uPnL = +$1,000`, `PIM = $666.67`), which backs a resting buy on M1
+/// (`ooIM = $100`) even on a NEGATIVE wallet. Refused one unit below `A_after = 0`, rested at it.
+#[test]
+fn the_resting_gate_reads_a_with_cross_profit_to_the_unit() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    for m in MARKETS {
+        set_type(&mut ctx, BOB, m, ISOLATED);
+        set_leverage(&mut ctx, ALICE, m, 3);
+    }
+    trade(&mut ctx, M2, ALICE, BOB, BUY, px(100), 10);
+    set_mark(&mut ctx, M2, px(200));
+    let oo_im = value(px(100), 3) / 3;
+    let w_edge = ceil_div(value(px(200), 10), 3) + oo_im - 1_000 * USD;
+    assert!(w_edge < 0, "the edge is a negative wallet: {w_edge}");
+
+    set_wallet(&mut ctx, ALICE, w_edge - 1);
+    rejects(
+        &mut ctx,
+        ALICE,
+        &order(M1, BUY, px(100), 3, GTC),
+        "placeOrder: insufficient perp wallet for margin",
+    );
+    set_wallet(&mut ctx, ALICE, w_edge);
+    let ledger = Ledger::open(&mut ctx);
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 3, GTC));
+    ledger.check(&mut ctx, "after the rest");
+    assert_eq!(pos(&mut ctx, ALICE, M1).total_buy_qty, 3, "it rests");
+    assert_eq!(fold(&mut ctx, ALICE).a, 0);
 }
