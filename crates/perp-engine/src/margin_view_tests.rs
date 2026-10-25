@@ -267,14 +267,22 @@ fn position_risk(ctx: &mut TestCtx, user: Address, market_id: u64) -> AccountPos
 /// would do, but these are read-path tests and the admin plumbing is exercised in
 /// `risk::tests`; going straight at the blob keeps the fixture to one statement.
 fn set_tiers(ctx: &mut TestCtx, market_id: u64, rows: &[(u64, u32)]) {
+    let rated: Vec<(u64, u32, u32)> = rows.iter().map(|&(lb, lev)| (lb, lev, 0)).collect();
+    set_tiers_with_rates(ctx, market_id, &rated);
+}
+
+/// [`set_tiers`] with an explicit maintenance-rate column (`0` = derived `1/(2L)`).
+fn set_tiers_with_rates(ctx: &mut TestCtx, market_id: u64, rows: &[(u64, u32, u32)]) {
     let mut market = storage::load_market(ctx, market_id).unwrap().unwrap();
     let tiers: Vec<crate::types::MarginTier> = rows
         .iter()
         .map(
-            |&(lower_bound_notional, max_leverage)| crate::types::MarginTier {
-                lower_bound_notional,
-                max_leverage,
-                maint_margin_rate_ppm: 0,
+            |&(lower_bound_notional, max_leverage, maint_margin_rate_ppm)| {
+                crate::types::MarginTier {
+                    lower_bound_notional,
+                    max_leverage,
+                    maint_margin_rate_ppm,
+                }
             },
         )
         .collect();
@@ -1824,6 +1832,42 @@ fn get_position_risk_liquidation_price_uses_the_markets_own_tier_table() {
             expected_short,
             "SHORT in market {market}"
         );
+    }
+}
+
+/// The explicit maintenance-rate column reaches the margin views. Same grid, mark and position as
+/// the test above (LONG 3 @ $100, $100 silo, notional $300 — in the second band), on
+/// `[{$0, 3x, derived}, {$200, 2x, rate}]` with the second band's rate derived (25%) and then set
+/// explicitly to 20%:
+///
+/// ```text
+///     maintMargin = ⌊200e6/6⌋ + ⌊100e6 · rate⌋ = 33_333_333 + 25_000_000 | 20_000_000
+///     rate 20%: g(P) = 30_000P − 200e6 − 33_333_333 − (6_000P − 40e6) = 24_000P − 193_333_333
+///               g < 0 <=> P < 8055.55…  =>  greatest liquidatable P = 8055 (n = 241_650_000 ✓)
+/// ```
+#[test]
+fn get_position_risk_uses_the_explicit_maintenance_rate_column() {
+    let mut ctx = make_ctx();
+    setup_a(&mut ctx);
+    fund(&mut ctx, ALICE, 5_000 * USD);
+
+    for (rate, expected_mm, expected_long) in [
+        (0u32, 58_333_333u64, 8_148u64),
+        (200_000, 53_333_333, 8_055),
+    ] {
+        set_tiers_with_rates(&mut ctx, MARKET_A, &[(0, 3, 0), (200 * USD, 2, rate)]);
+        set_position(
+            &mut ctx,
+            ALICE,
+            MARKET_A,
+            3,
+            -(300 * USD as i64),
+            100 * USD as i64,
+            3,
+        );
+        let row = position_risk(&mut ctx, ALICE, MARKET_A);
+        assert_eq!(row.maintMargin, expected_mm, "rate {rate}");
+        assert_eq!(row.liquidationPrice, expected_long, "rate {rate}");
     }
 }
 

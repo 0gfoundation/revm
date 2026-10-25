@@ -1108,8 +1108,10 @@ fn liquidation_price_domain_hi(
 /// `max_leverage` at 1 for exactly that reason. An explicit column is capped at 100% by the same
 /// function (`setMarginTiers` admits only `ppm < 1e6 / L <= 1e6`). So the argument holds even on a
 /// corrupt blob; the `debug_assert!` below surfaces a zero-leverage blob rather than protecting the
-/// search from it. `liquidation_predicate_is_monotone_in_price` pins the property itself over
-/// randomised positions and tables rather than trusting this paragraph.
+/// search from it. `liquidation_predicate_is_monotone_in_price` (derived rates) and
+/// `liquidation_price_agrees_with_a_linear_scan_under_explicit_rates` (explicit rates up to 100%)
+/// pin the property itself over randomised positions and tables rather than trusting this
+/// paragraph.
 ///
 /// # The two ways there is NO liquidation price
 ///
@@ -1872,6 +1874,327 @@ mod margin_tier_tests {
         }
     }
 
+    // ── Explicit maintenance-rate column ───────────────────────────────────
+
+    const USD: u64 = 1_000_000;
+
+    /// `(lower_bound, max_leverage, maint_margin_rate_ppm)` rows.
+    fn rated(rows: &[(u64, u32, u32)]) -> MarginTiers {
+        let v: Vec<MarginTier> = rows
+            .iter()
+            .map(
+                |&(lower_bound_notional, max_leverage, maint_margin_rate_ppm)| MarginTier {
+                    lower_bound_notional,
+                    max_leverage,
+                    maint_margin_rate_ppm,
+                },
+            )
+            .collect();
+        MarginTiers::from_tiers(&v).expect("valid tier count")
+    }
+
+    /// Binance BTCUSDT `leverageBracket` (the 10-bracket table of the cross-margin research; the 3x
+    /// bracket's 15% was read off an image — re-check before loading it live). `(floor $, lev, ppm)`.
+    const BTCUSDT: [(u64, u32, u32); 10] = [
+        (0, 125, 4_000),
+        (50_000, 100, 5_000),
+        (250_000, 50, 10_000),
+        (3_000_000, 20, 25_000),
+        (15_000_000, 10, 50_000),
+        (30_000_000, 5, 100_000),
+        (80_000_000, 4, 125_000),
+        (100_000_000, 3, 150_000),
+        (200_000_000, 2, 250_000),
+        (300_000_000, 1, 500_000),
+    ];
+    /// Binance's published `cum` column for it, USDT.
+    const BTCUSDT_CUM: [u64; 10] = [
+        0,
+        50,
+        1_300,
+        46_300,
+        421_300,
+        1_921_300,
+        3_921_300,
+        6_421_300,
+        26_421_300,
+        101_421_300,
+    ];
+
+    fn btcusdt() -> MarginTiers {
+        let rows: Vec<(u64, u32, u32)> = BTCUSDT.iter().map(|&(f, l, r)| (f * USD, l, r)).collect();
+        rated(&rows)
+    }
+
+    /// `cum` is Binance's: `leverage_brackets` reproduces the published column, the recursion
+    /// `cum_n = cum_{n−1} + floor_n·(MMR_n − MMR_{n−1})` holds row by row, the table passes both
+    /// validation predicates, and `notionalCap` is the next floor (unbounded last).
+    #[test]
+    fn binance_btcusdt_brackets_reproduce_the_published_cum() {
+        let t = btcusdt();
+        let b = leverage_brackets(&t);
+        assert_eq!(b.len(), 10);
+        for (i, row) in b.iter().enumerate() {
+            assert_eq!(row.notional_floor, BTCUSDT[i].0 * USD);
+            assert_eq!(row.initial_leverage, BTCUSDT[i].1);
+            assert_eq!(
+                row.maint_margin_rate_ppm, BTCUSDT[i].2,
+                "explicit = effective"
+            );
+            assert_eq!(row.cum, BTCUSDT_CUM[i] * USD, "cum of bracket {}", i + 1);
+            let cap = BTCUSDT.get(i + 1).map_or(u64::MAX, |n| n.0 * USD);
+            assert_eq!(row.notional_cap, cap);
+            if i > 0 {
+                let step = (BTCUSDT[i].0 * USD) as u128 * (BTCUSDT[i].2 - BTCUSDT[i - 1].2) as u128
+                    / MMR_PPM_ONE as u128;
+                assert_eq!(
+                    row.cum as u128,
+                    b[i - 1].cum as u128 + step,
+                    "recursion at bracket {}",
+                    i + 1
+                );
+                assert!(tier_mmr_not_above(&t.as_slice()[i - 1], &t.as_slice()[i]));
+            }
+            assert!(tier_mmr_below_initial(&t.as_slice()[i]));
+        }
+    }
+
+    /// Binance's `MM = N·MMR − cum` against the engine's slice form on the BTCUSDT table: EXACT at
+    /// whole-dollar notionals in every bracket (hand values), and on random notionals the engine is
+    /// never above the formula and below it by under one quote unit (only the partial slice is
+    /// floored — every crossed band is a whole-dollar multiple of a ppm rate).
+    #[test]
+    fn binance_mm_formula_matches_the_slice_form_on_btcusdt() {
+        let t = btcusdt();
+        // (notional $, N·MMR − cum $), one or more per bracket plus every boundary.
+        for (n, mm) in [
+            (10_000u64, 40u64),
+            (50_000, 200),
+            (100_000, 450),
+            (250_000, 1_200),
+            (1_000_000, 8_700),
+            (3_000_000, 28_700),
+            (10_000_000, 203_700),
+            (15_000_000, 328_700),
+            (20_000_000, 578_700),
+            (50_000_000, 3_078_700),
+            (90_000_000, 7_328_700),
+            (150_000_000, 16_078_700),
+            (250_000_000, 36_078_700),
+            (400_000_000, 98_578_700),
+        ] {
+            assert_eq!(
+                maintenance_margin(&t, (n * USD) as i64).unwrap(),
+                (mm * USD) as i64,
+                "N = ${n}"
+            );
+        }
+
+        let b = leverage_brackets(&t);
+        let mut s: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..20_000 {
+            // Spread over ~0..$600M, with a heavy share near the bracket floors.
+            let n = match next(&mut s) % 3 {
+                0 => next(&mut s) % (600_000_000 * USD),
+                _ => {
+                    let f = BTCUSDT[(next(&mut s) % 10) as usize].0 * USD;
+                    f + next(&mut s) % 1_000_000 - f.min(500_000)
+                }
+            };
+            let k = b.iter().rposition(|r| r.notional_floor <= n).unwrap();
+            // In ppm·quote units, exactly: N·MMR − cum·1e6.
+            let formula = n as i128 * b[k].maint_margin_rate_ppm as i128
+                - b[k].cum as i128 * MMR_PPM_ONE as i128;
+            let mm = maintenance_margin(&t, n as i64).unwrap() as i128 * MMR_PPM_ONE as i128;
+            assert!(mm <= formula, "engine above Binance at N={n}");
+            assert!(
+                formula - mm < MMR_PPM_ONE as i128,
+                "residue >= 1 unit at N={n}"
+            );
+        }
+    }
+
+    /// An explicit column that EQUALS the derived rate computes exactly what the zero column does —
+    /// at every notional, on every tier mix. Uses the BTCUSDT leverages, which (except 3x, whose
+    /// `1/6` is not a whole ppm) all divide 500_000: there Binance's rate IS our derived one.
+    #[test]
+    fn an_explicit_column_equal_to_the_derived_rate_changes_nothing() {
+        let levs: Vec<(u64, u32)> = BTCUSDT
+            .iter()
+            .filter(|r| r.1 != 3)
+            .map(|r| (r.0 * USD, r.1))
+            .collect();
+        let derived = rated(&levs.iter().map(|&(f, l)| (f, l, 0)).collect::<Vec<_>>());
+        let explicit = rated(
+            &levs
+                .iter()
+                .map(|&(f, l)| (f, l, (MMR_PPM_ONE / 2) / l))
+                .collect::<Vec<_>>(),
+        );
+        // ... and every alternating mix of the two.
+        let mixed = rated(
+            &levs
+                .iter()
+                .enumerate()
+                .map(|(i, &(f, l))| (f, l, if i % 2 == 0 { 0 } else { (MMR_PPM_ONE / 2) / l }))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(leverage_brackets(&derived), leverage_brackets(&explicit));
+        assert_eq!(leverage_brackets(&derived), leverage_brackets(&mixed));
+
+        let mut probe: Vec<i64> = vec![0, 1, 2, 199, 200, 201, i64::MAX];
+        for &(f, _) in &levs {
+            let f = f as i64;
+            probe.extend([f - 1, f, f + 1, f + 7_777]);
+        }
+        let mut s: u64 = 0xdead_beef_cafe_f00d;
+        for _ in 0..20_000 {
+            probe.push((next(&mut s) % (2 * 300_000_000 * USD)) as i64);
+        }
+        for n in probe {
+            let d = maintenance_margin(&derived, n).unwrap();
+            assert_eq!(
+                d,
+                maintenance_margin(&explicit, n).unwrap(),
+                "explicit N={n}"
+            );
+            assert_eq!(d, maintenance_margin(&mixed, n).unwrap(), "mixed N={n}");
+        }
+        // And the default single tier (column 0) is still `n / 6`, byte for byte.
+        let d = MarginTiers::default();
+        assert_eq!(d.as_slice()[0].maint_margin_rate_ppm, 0);
+        for n in [0i64, 5, 6, 7, 1_000_003, i64::MAX] {
+            assert_eq!(maintenance_margin(&d, n).unwrap(), n / 6);
+        }
+    }
+
+    /// Random VALID explicit/mixed tables, up to MAX_MARGIN_TIERS = 16 rows: the slice form stays
+    /// continuous at every boundary and monotone in notional, and the engine is never above the
+    /// `leverage_brackets` formula. This is `tier_boundaries_are_continuous` and
+    /// `maintenance_margin_is_monotone_in_notional` with the rate column populated.
+    #[test]
+    fn explicit_rate_tables_stay_continuous_monotone_and_under_the_formula() {
+        let mut s: u64 = 0x0123_4567_89ab_cdef;
+        for _ in 0..3_000 {
+            let n_tiers = 1 + (next(&mut s) % crate::types::MAX_MARGIN_TIERS as u64) as usize;
+            let mut rows: Vec<MarginTier> = Vec::with_capacity(n_tiers);
+            let mut bound = 0u64;
+            let mut lev = 1 + (next(&mut s) % 125) as u32;
+            for i in 0..n_tiers {
+                if i > 0 {
+                    bound += 1 + next(&mut s) % 10_000_000_000;
+                    lev = 1 + next(&mut s) as u32 % lev;
+                }
+                // Highest admissible explicit rate (m·L < 1e6) and the lowest that does not fall
+                // below the previous tier's effective rate.
+                let top = (MMR_PPM_ONE - 1) / lev;
+                let floor = rows.last().map_or(1, effective_mmr_ppm).max(1);
+                assert!(
+                    floor <= top,
+                    "generator: no admissible rate {rows:?} lev={lev}"
+                );
+                let derived = MarginTier {
+                    lower_bound_notional: bound,
+                    max_leverage: lev,
+                    maint_margin_rate_ppm: 0,
+                };
+                let use_derived = next(&mut s).is_multiple_of(3)
+                    && rows.last().is_none_or(|p| tier_mmr_not_above(p, &derived));
+                rows.push(MarginTier {
+                    maint_margin_rate_ppm: if use_derived {
+                        0
+                    } else {
+                        floor + (next(&mut s) % (top - floor + 1) as u64) as u32
+                    },
+                    ..derived
+                });
+            }
+            // The generator only builds what setMarginTiers admits.
+            assert!(rows.iter().all(tier_mmr_below_initial), "{rows:?}");
+            assert!(
+                rows.windows(2).all(|w| tier_mmr_not_above(&w[0], &w[1])),
+                "{rows:?}"
+            );
+
+            let full = MarginTiers::from_tiers(&rows).unwrap();
+            for k in 1..rows.len() {
+                let b = rows[k].lower_bound_notional as i64;
+                let truncated = MarginTiers::from_tiers(&rows[..k]).unwrap();
+                assert_eq!(
+                    maintenance_margin(&full, b).unwrap(),
+                    maintenance_margin(&truncated, b).unwrap(),
+                    "discontinuity at boundary {k} of {rows:?}"
+                );
+            }
+
+            let brackets = leverage_brackets(&full);
+            let top_bound = rows.last().unwrap().lower_bound_notional;
+            let mut prev = 0i64;
+            let mut n = 0u64;
+            for _ in 0..64 {
+                n += next(&mut s) % (top_bound / 32 + 1_000);
+                let mm = maintenance_margin(&full, n as i64).unwrap();
+                assert!(mm >= prev, "mm dropped at n={n} in {rows:?}");
+                prev = mm;
+                let k = brackets
+                    .iter()
+                    .rposition(|r| r.notional_floor <= n)
+                    .unwrap();
+                let formula = n as i128 * brackets[k].maint_margin_rate_ppm as i128
+                    - brackets[k].cum as i128 * MMR_PPM_ONE as i128;
+                assert!(
+                    mm as i128 * MMR_PPM_ONE as i128 <= formula,
+                    "engine above N·MMR − cum at n={n} in {rows:?}"
+                );
+            }
+        }
+    }
+
+    /// The exact-fraction predicates and the reported rounding, on the cases that decide them.
+    #[test]
+    fn rate_predicates_compare_exactly_and_report_derived_rates_rounded_up() {
+        let t = |lev: u32, ppm: u32| MarginTier {
+            lower_bound_notional: 0,
+            max_leverage: lev,
+            maint_margin_rate_ppm: ppm,
+        };
+        // IM > MM: explicit `ppm · L < 1e6`, equality refused; derived always passes.
+        assert!(tier_mmr_below_initial(&t(4, 249_999)));
+        assert!(!tier_mmr_below_initial(&t(4, 250_000)));
+        assert!(tier_mmr_below_initial(&t(1, 999_999)));
+        assert!(!tier_mmr_below_initial(&t(1, 1_000_000)));
+        assert!(!tier_mmr_below_initial(&t(125, 8_000)));
+        assert!(tier_mmr_below_initial(&t(125, 7_999)));
+        for lev in 1..=125 {
+            assert!(tier_mmr_below_initial(&t(lev, 0)), "derived at {lev}x");
+        }
+        // Derived 3x is 166_666.67 ppm: 166_666 is below it, 166_667 above — no rounding.
+        assert!(!tier_mmr_not_above(&t(3, 0), &t(2, 166_666)));
+        assert!(tier_mmr_not_above(&t(3, 0), &t(2, 166_667)));
+        assert!(tier_mmr_not_above(&t(3, 166_666), &t(3, 0)));
+        assert!(!tier_mmr_not_above(&t(3, 166_667), &t(3, 0)));
+        // Derived vs derived follows leverage; equal explicit rates are admitted.
+        assert!(tier_mmr_not_above(&t(3, 0), &t(2, 0)));
+        assert!(!tier_mmr_not_above(&t(2, 0), &t(3, 0)));
+        assert!(tier_mmr_not_above(&t(5, 100_000), &t(4, 100_000)));
+        // Reported effective rate: explicit verbatim, derived rounded UP, corrupt rows bounded.
+        assert_eq!(effective_mmr_ppm(&t(3, 0)), 166_667);
+        assert_eq!(effective_mmr_ppm(&t(4, 0)), 125_000);
+        assert_eq!(effective_mmr_ppm(&t(7, 0)), 71_429);
+        assert_eq!(effective_mmr_ppm(&t(3, 150_000)), 150_000);
+        assert_eq!(effective_mmr_ppm(&t(0, 0)), 500_000);
+        assert_eq!(effective_mmr_ppm(&t(1, 2_000_000)), 1_000_000);
+    }
+
+    /// A corrupt explicit rate above 100% is capped there, so `mmr <= 1` — the bound the
+    /// liquidation search's monotonicity argument needs — holds on any blob.
+    #[test]
+    fn a_corrupt_explicit_rate_is_capped_at_one_hundred_percent() {
+        let t = rated(&[(0, 1, 2_000_000)]);
+        assert_eq!(maintenance_margin(&t, 100).unwrap(), 100);
+        assert_eq!(maintenance_margin(&t, i64::MAX).unwrap(), i64::MAX);
+    }
+
     #[test]
     fn maintenance_margin_clamps_negative_input_and_survives_a_zero_leverage_blob() {
         let t = table(&[(0, 3)]);
@@ -2382,6 +2705,83 @@ mod liquidation_price_tests {
             let mut dense = (lo..=lo.saturating_add(200).min(hi)).chain(core::iter::empty());
             check(&mut dense);
         }
+    }
+
+    /// The linear-scan oracle below on tables carrying EXPLICIT maintenance rates — including rates
+    /// above 1/2, which a derived tier can never have (`1x` admits up to 999_999 ppm), so the
+    /// search's monotonicity argument is exercised at `mmr <= 1` rather than `<= 1/2`. On every
+    /// draw the predicate is monotone over the whole scanned prefix (the liquidatable prices are a
+    /// prefix for a long and a suffix for a short) and the bisection returns the scan's flip.
+    #[test]
+    fn liquidation_price_agrees_with_a_linear_scan_under_explicit_rates() {
+        const SCAN: u64 = 6_000;
+        let mut s: u64 = 0x5eed_0fca_11ab_1e5e;
+        let (bd, pd) = (6u32, 0u32);
+        let (mut checked_long, mut checked_short) = (0usize, 0usize);
+        for _ in 0..1_200 {
+            let n_tiers = 1 + (next(&mut s) % 4) as usize;
+            let mut rows: Vec<MarginTier> = Vec::with_capacity(n_tiers);
+            let mut bound = 0u64;
+            let mut lev = 1 + (next(&mut s) % 8) as u32;
+            for i in 0..n_tiers {
+                if i > 0 {
+                    bound += 1 + next(&mut s) % 8_000;
+                    lev = 1 + next(&mut s) as u32 % lev;
+                }
+                let top = (crate::types::MMR_PPM_ONE - 1) / lev;
+                let floor = rows.last().map_or(1, effective_mmr_ppm).max(1);
+                rows.push(MarginTier {
+                    lower_bound_notional: bound,
+                    max_leverage: lev,
+                    maint_margin_rate_ppm: floor + (next(&mut s) % (top - floor + 1) as u64) as u32,
+                });
+            }
+            assert!(rows.windows(2).all(|w| tier_mmr_not_above(&w[0], &w[1])));
+            let t = MarginTiers::from_tiers(&rows).unwrap();
+            let qty = (next(&mut s) % 10 + 1) as i64;
+            let is_long = next(&mut s) & 1 == 0;
+            let amount = if is_long { qty } else { -qty };
+            let vq = (next(&mut s) % 12_000) as i64 - 6_000;
+            let margin = (next(&mut s) % 6_000) as i64;
+
+            let got = calc_liquidation_price(&t, amount, vq, margin, bd, pd).unwrap();
+            let liquidatable: Vec<u64> = (1..=SCAN)
+                .filter(|&p| !above(&t, p, amount, vq, margin, bd, pd))
+                .collect();
+            // Monotone over the scan: one contiguous run, anchored at 1 (long) or SCAN (short).
+            if let (Some(&first), Some(&last)) = (liquidatable.first(), liquidatable.last()) {
+                assert_eq!(
+                    (last - first + 1) as usize,
+                    liquidatable.len(),
+                    "not contiguous a={amount} vq={vq} m={margin} {rows:?}"
+                );
+                if is_long {
+                    assert_eq!(first, 1, "LONG set is not a prefix {rows:?}");
+                } else {
+                    assert_eq!(last, SCAN, "SHORT set is not a suffix {rows:?}");
+                }
+            }
+            if is_long {
+                match liquidatable.last() {
+                    Some(&last) if last == SCAN => continue,
+                    Some(&last) => {
+                        assert_eq!(got, last, "LONG a={amount} vq={vq} m={margin} {rows:?}");
+                        checked_long += 1;
+                    }
+                    None => {
+                        assert_eq!(got, 0, "LONG a={amount} vq={vq} m={margin} {rows:?}");
+                        checked_long += 1;
+                    }
+                }
+            } else if let Some(&first) = liquidatable.first() {
+                assert_eq!(got, first, "SHORT a={amount} vq={vq} m={margin} {rows:?}");
+                checked_short += 1;
+            }
+        }
+        assert!(
+            checked_long > 100 && checked_short > 100,
+            "scan oracle exercised too few cases: long={checked_long} short={checked_short}"
+        );
     }
 
     /// An INDEPENDENT ORACLE for the search: a linear scan of the predicate.

@@ -2428,6 +2428,24 @@ fn get_margin_tiers_full(
     getMarginTiersCall::abi_decode_returns(&out).unwrap()
 }
 
+/// All six `getMarginTiers` columns as one comparable value (the `sol!` return struct derives
+/// neither `PartialEq` nor `Debug`).
+#[allow(clippy::type_complexity)]
+fn get_margin_tiers_columns(
+    ctx: &mut TestCtx,
+    market_id: u64,
+) -> (Vec<u64>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u64>, Vec<u64>) {
+    let d = get_margin_tiers_full(ctx, market_id);
+    (
+        d.lowerBounds,
+        d.maxLeverages,
+        d.maintMarginRatesPpm,
+        d.effectiveMaintMarginRatesPpm,
+        d.cums,
+        d.notionalCaps,
+    )
+}
+
 /// The `(lowerBounds, maxLeverages)` pair — the two columns every pre-rate test compares.
 fn get_margin_tiers(ctx: &mut TestCtx, market_id: u64) -> (Vec<u64>, Vec<u32>) {
     let decoded = get_margin_tiers_full(ctx, market_id);
@@ -2895,6 +2913,326 @@ fn set_margin_tiers_emits_the_full_replacement_table() {
     assert_eq!(updated[0].lowerBounds, vec![0, 1_000_000]);
     assert_eq!(updated[0].maxLeverages, vec![3, 2]);
     assert_eq!(updated[0].maintMarginRatesPpm, vec![0, 0]);
+}
+
+// ── Explicit maintenance-margin rates (Binance `leverageBracket`) ─────────────
+
+/// One dollar in quote units.
+const USD: u64 = 1_000_000;
+
+/// Binance BTCUSDT's 10-bracket `leverageBracket` table (the table the cross-margin research read;
+/// re-check Binance's live brackets before loading it on a real market — the 3x bracket's 15% is
+/// read off an image). `(notionalFloor $, initialLeverage, maintMarginRatio ppm)`, with ONE
+/// change: bracket 1 is 125x on Binance and `MAX_LEVERAGE_HARD_CAP` is 100, so it is loaded at
+/// 100x here. Leverage plays no part in `cum`, which depends on the floors and rates only.
+const BTCUSDT_LOADABLE: [(u64, u32, u32); 10] = [
+    (0, 100, 4_000),
+    (50_000, 100, 5_000),
+    (250_000, 50, 10_000),
+    (3_000_000, 20, 25_000),
+    (15_000_000, 10, 50_000),
+    (30_000_000, 5, 100_000),
+    (80_000_000, 4, 125_000),
+    (100_000_000, 3, 150_000),
+    (200_000_000, 2, 250_000),
+    (300_000_000, 1, 500_000),
+];
+
+fn install_btcusdt(ctx: &mut TestCtx) {
+    let bounds: Vec<u64> = BTCUSDT_LOADABLE.iter().map(|r| r.0 * USD).collect();
+    let levs: Vec<u32> = BTCUSDT_LOADABLE.iter().map(|r| r.1).collect();
+    let rates: Vec<u32> = BTCUSDT_LOADABLE.iter().map(|r| r.2).collect();
+    set_margin_tiers_with_rates(ctx, ADMIN, MARKET_ID, &bounds, &levs, &rates).unwrap();
+}
+
+/// A Binance bracket table loads through `setMarginTiers` and `getMarginTiers` hands back
+/// Binance's own `leverageBracket` row: the stored column, the effective rate, the published `cum`
+/// (0 / 50 / 1,300 / 46,300 / … / 101,421,300 USDT) and `notionalCap`.
+#[test]
+fn get_margin_tiers_reports_binance_btcusdt_brackets_verbatim() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    install_btcusdt(&mut ctx);
+
+    let got = get_margin_tiers_full(&mut ctx, MARKET_ID);
+    let rates: Vec<u32> = BTCUSDT_LOADABLE.iter().map(|r| r.2).collect();
+    assert_eq!(
+        got.lowerBounds,
+        BTCUSDT_LOADABLE
+            .iter()
+            .map(|r| r.0 * USD)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        got.maxLeverages,
+        BTCUSDT_LOADABLE.iter().map(|r| r.1).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        got.maintMarginRatesPpm, rates,
+        "the stored column round-trips"
+    );
+    assert_eq!(
+        got.effectiveMaintMarginRatesPpm, rates,
+        "an explicit column IS the effective rate"
+    );
+    assert_eq!(
+        got.cums,
+        [
+            0u64,
+            50,
+            1_300,
+            46_300,
+            421_300,
+            1_921_300,
+            3_921_300,
+            6_421_300,
+            26_421_300,
+            101_421_300
+        ]
+        .map(|c| c * USD)
+        .to_vec(),
+        "Binance's published BTCUSDT cum column"
+    );
+    let mut caps: Vec<u64> = BTCUSDT_LOADABLE[1..].iter().map(|r| r.0 * USD).collect();
+    caps.push(u64::MAX);
+    assert_eq!(
+        got.notionalCaps, caps,
+        "next floor; the last band is unbounded"
+    );
+
+    // Binance's 125x first bracket is refused by the (unchanged) leverage hard cap.
+    let err = set_margin_tiers_with_rates(&mut ctx, ADMIN, MARKET_ID, &[0], &[125], &[4_000])
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("maxLeverage must be 1–100"),
+        "{err}"
+    );
+}
+
+/// A DERIVED tier (column 0) reports `1/(2L)` rounded UP to whole ppm, and `cum` is Binance's
+/// recursion over that reported column. The default table is one derived 3x tier.
+#[test]
+fn get_margin_tiers_reports_derived_rates_rounded_up() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+
+    let got = get_margin_tiers_full(&mut ctx, MARKET_ID);
+    assert_eq!(got.maintMarginRatesPpm, vec![0]);
+    assert_eq!(
+        got.effectiveMaintMarginRatesPpm,
+        vec![166_667],
+        "1/6 rounded up"
+    );
+    assert_eq!(got.cums, vec![0]);
+    assert_eq!(got.notionalCaps, vec![u64::MAX]);
+
+    // Mixed: derived 3x, derived 2x (exactly 250_000 ppm), explicit 40% at 1x.
+    set_margin_tiers_with_rates(
+        &mut ctx,
+        ADMIN,
+        MARKET_ID,
+        &[0, 50_000 * USD, 250_000 * USD],
+        &[3, 2, 1],
+        &[0, 0, 400_000],
+    )
+    .unwrap();
+    let got = get_margin_tiers_full(&mut ctx, MARKET_ID);
+    assert_eq!(got.maintMarginRatesPpm, vec![0, 0, 400_000]);
+    assert_eq!(
+        got.effectiveMaintMarginRatesPpm,
+        vec![166_667, 250_000, 400_000]
+    );
+    // cum_1 = 50_000e6 · (250_000 − 166_667) / 1e6 = 4_166_650_000
+    // cum_2 = cum_1 + 250_000e6 · (400_000 − 250_000) / 1e6 = 4_166_650_000 + 37_500_000_000
+    assert_eq!(got.cums, vec![0, 4_166_650_000, 41_666_650_000]);
+    assert_eq!(
+        got.notionalCaps,
+        vec![50_000 * USD, 250_000 * USD, u64::MAX]
+    );
+}
+
+/// The two new invariants, each with its own error string, each refused with ZERO writes — and the
+/// boundary case of each accepted, so the check is exactly the documented inequality.
+#[test]
+fn set_margin_tiers_rejects_bad_maintenance_rates_individually() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let before = get_margin_tiers_columns(&mut ctx, MARKET_ID);
+
+    // (lowerBounds, maxLeverages, maintMarginRatesPpm, expected error)
+    type Case<'a> = (&'a [u64], &'a [u32], &'a [u32], &'a str);
+    let cases: &[Case<'_>] = &[
+        // The column must be index-aligned with the other two.
+        (
+            &[0, 1_000],
+            &[3, 2],
+            &[0],
+            "maintMarginRatesPpm and lowerBounds length mismatch",
+        ),
+        (
+            &[0],
+            &[3],
+            &[0, 0],
+            "maintMarginRatesPpm and lowerBounds length mismatch",
+        ),
+        // MMR >= IMR: 4x has IMR 250_000 ppm; equality is refused (IM must EXCEED MM).
+        (
+            &[0],
+            &[4],
+            &[250_000],
+            "must be below 1000000 / maxLeverage",
+        ),
+        (
+            &[0],
+            &[4],
+            &[900_000],
+            "must be below 1000000 / maxLeverage",
+        ),
+        (
+            &[0],
+            &[1],
+            &[1_000_000],
+            "must be below 1000000 / maxLeverage",
+        ),
+        // Only the offending tier is out of range; the first is fine.
+        (
+            &[0, 1_000],
+            &[10, 5],
+            &[50_000, 200_000],
+            "must be below 1000000 / maxLeverage",
+        ),
+        // Explicit rates falling.
+        (
+            &[0, 1_000],
+            &[3, 2],
+            &[100_000, 90_000],
+            "rates must be non-decreasing",
+        ),
+        // Derived 3x is 1/6 = 166_666.67 ppm: an explicit 166_666 after it FALLS (compared
+        // exactly, not after rounding the derived rate to 166_667 or 166_666).
+        (
+            &[0, 1_000],
+            &[3, 2],
+            &[0, 166_666],
+            "rates must be non-decreasing",
+        ),
+        // ... and an explicit rate above a following DERIVED one: 2x derived is 250_000.
+        (
+            &[0, 1_000],
+            &[3, 2],
+            &[300_000, 0],
+            "rates must be non-decreasing",
+        ),
+    ];
+    for (bounds, levs, rates, expected) in cases {
+        let err = set_margin_tiers_with_rates(&mut ctx, ADMIN, MARKET_ID, bounds, levs, rates)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(expected),
+            "expected {expected:?}, got {err}"
+        );
+        assert_eq!(
+            get_margin_tiers_columns(&mut ctx, MARKET_ID),
+            before,
+            "a reject must not write ({expected})"
+        );
+    }
+
+    // The boundaries themselves are admitted: one ppm under the IMR, an explicit rate EQUAL to
+    // the previous one, and 166_667 right after a derived 1/6.
+    for (bounds, levs, rates) in [
+        (&[0u64][..], &[4u32][..], &[249_999u32][..]),
+        (&[0], &[1], &[999_999]),
+        (&[0, 1_000], &[3, 2], &[100_000, 100_000]),
+        (&[0, 1_000], &[3, 2], &[0, 166_667]),
+    ] {
+        set_margin_tiers_with_rates(&mut ctx, ADMIN, MARKET_ID, bounds, levs, rates)
+            .unwrap_or_else(|e| panic!("{bounds:?} {levs:?} {rates:?} must be admitted: {e}"));
+        assert_eq!(
+            get_margin_tiers_full(&mut ctx, MARKET_ID).maintMarginRatesPpm,
+            rates
+        );
+    }
+}
+
+#[test]
+fn set_margin_tiers_emits_the_rate_column() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    set_margin_tiers_with_rates(
+        &mut ctx,
+        ADMIN,
+        MARKET_ID,
+        &[0, 1_000_000],
+        &[3, 2],
+        &[0, 200_000],
+    )
+    .unwrap();
+
+    let updated: Vec<_> = JournalTr::take_logs(ctx.journal_mut())
+        .into_iter()
+        .filter(|log| {
+            log.data.topics().first() == Some(&IPerpDex::MarginTiersUpdated::SIGNATURE_HASH)
+        })
+        .map(|log| {
+            IPerpDex::MarginTiersUpdated::decode_raw_log(log.data.topics(), &log.data.data).unwrap()
+        })
+        .collect();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(
+        updated[0].maintMarginRatesPpm,
+        vec![0, 200_000],
+        "as sent: 0 stays 0"
+    );
+}
+
+/// The stored column reaches the ENFORCED rule, not just the getter: the maintenance requirement
+/// the liquidation predicate applies to a BTCUSDT-table position is Binance's
+/// `notional · MMR − cum`, exactly, at notionals in five different brackets.
+#[test]
+fn an_explicit_rate_column_is_the_maintenance_rule_liquidation_applies() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    install_btcusdt(&mut ctx);
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+
+    // (notional $, Binance MM $ = N·MMR − cum)
+    for (notional, mm) in [
+        (10_000u64, 40u64),        // 0.4%
+        (100_000, 450),            // 0.5%  − 50
+        (1_000_000, 8_700),        // 1%    − 1,300
+        (90_000_000, 7_328_700),   // 12.5% − 3,921,300
+        (150_000_000, 16_078_700), // 15%   − 6,421,300 (the bracket Binance does NOT derive)
+        (400_000_000, 98_578_700), // 50%   − 101,421,300
+    ] {
+        assert_eq!(
+            crate::math::maintenance_margin(&market.tiers, (notional * USD) as i64).unwrap(),
+            (mm * USD) as i64,
+            "notional ${notional}"
+        );
+        // The liquidation predicate flips exactly there: equity == MM is healthy, one unit less
+        // is not. A LONG of `notional` base units at price $1 on a 0/0-decimal grid has notional
+        // `amount · 1e6` quote units; `v_quote_balance` puts its equity at the probed value.
+        let n = (notional * USD) as i64;
+        for (equity, healthy) in [((mm * USD) as i64, true), ((mm * USD) as i64 - 1, false)] {
+            assert_eq!(
+                crate::math::is_above_maintenance_margin(
+                    &market.tiers,
+                    1,
+                    notional as i64,
+                    equity - n,
+                    0,
+                    0,
+                    0,
+                )
+                .unwrap(),
+                healthy,
+                "notional ${notional} equity {equity}"
+            );
+        }
+    }
 }
 
 // ── Per-open margin-tier guard ────────────────────────────────────────────────

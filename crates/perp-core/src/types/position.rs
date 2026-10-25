@@ -603,6 +603,31 @@ mod tests {
         }
     }
 
+    /// The rate column is a positional TAIL field: a row carries it as its third element, and a
+    /// two-element row — the encoding before the column existed — still decodes, as DERIVED (0).
+    #[test]
+    fn margin_tier_rate_column_is_an_appended_defaulted_field() {
+        let rated = MarginTier {
+            lower_bound_notional: 50_000_000_000,
+            max_leverage: 100,
+            maint_margin_rate_ppm: 5_000,
+        };
+        let bytes = crate::codec::encode(&rated).unwrap();
+        let (lb, lev, ppm): (u64, u32, u32) = crate::codec::decode(&bytes).unwrap();
+        assert_eq!((lb, lev, ppm), (50_000_000_000, 100, 5_000));
+        assert_eq!(crate::codec::decode::<MarginTier>(&bytes).unwrap(), rated);
+
+        let legacy = crate::codec::encode(&(1_000u64, 3u32)).unwrap();
+        assert_eq!(
+            crate::codec::decode::<MarginTier>(&legacy).unwrap(),
+            tier(1_000, 3),
+            "a two-element row is a derived tier"
+        );
+        let legacy_table = crate::codec::encode(&vec![(0u64, 5u32), (1_000, 3)]).unwrap();
+        let t: MarginTiers = crate::codec::decode(&legacy_table).unwrap();
+        assert_eq!(t.as_slice(), &[tier(0, 5), tier(1_000, 3)]);
+    }
+
     #[test]
     fn margin_tiers_decoder_rejects_empty_and_oversized_tables() {
         let empty = crate::codec::encode(&Vec::<MarginTier>::new()).unwrap();
