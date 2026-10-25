@@ -300,15 +300,15 @@ fn validate(
     })
 }
 
-/// Shared tail: write the record, index it, emit. `algo_id` is already derived and, on the signed
-/// path, its signature already burned.
-#[allow(clippy::too_many_arguments)]
 /// `placeAlgoOrder`'s refusal for an account in liquidation (owner decision Q11) — Binance's
 /// `-2023`. Unreachable while `validate` admits only reducing conditionals; see `place_core`.
 const ALGO_IN_LIQUIDATION_REJECT: &str =
     "placeAlgoOrder: -2023 User in liquidation mode now. Only reduceOnly and closePosition \
      conditionals are accepted";
 
+/// Shared tail: write the record, index it, emit. `algo_id` is already derived and, on the signed
+/// path, its signature already burned.
+#[allow(clippy::too_many_arguments)]
 fn place_core<H: PerpHost>(
     context: &mut H,
     account: Address,
