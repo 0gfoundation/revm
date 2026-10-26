@@ -1203,8 +1203,8 @@ sol! {
         ///   4. a non-zero position in the market — `-4048 Margin type cannot be changed if there
         ///      exists position.`;
         ///   5. the account is being liquidated — `-2023 User in liquidation mode now.` (its
-        ///      liquidation flag, set and cleared by cross liquidation — P3; until then no account
-        ///      can be in that state);
+        ///      liquidation flag, set and cleared by cross liquidation, P3 — between
+        ///      `CrossLiquidationStarted` and `CrossLiquidationEnded`);
         ///   6. CROSSED requested while cross margin is not enabled — `setMarginType: CROSSED
         ///      margin is not enabled yet`.
         /// "In force" in 2 is the EFFECTIVE type `getSymbolConfig` reports. While cross margin is
@@ -1748,11 +1748,19 @@ sol! {
         // ── Liquidation ───────────────────────────────────────────────────
         /// Liquidate an under-margined position (anyone can call).
         ///
-        /// ⚠️ ABI CHANGE (cross P2): a position CROSSED in force is refused with
-        /// `liquidate: position is CROSSED — account-level cross liquidation is not live yet` (no
-        /// write) until cross liquidation lands (P3), which will judge the ACCOUNT
-        /// (`crossMarginBalance < totalCrossMaintMargin`) instead. Unreachable while cross margin
-        /// is gated off.
+        /// A position CROSSED in force is judged on its ACCOUNT (cross P3): at or above cross
+        /// maintenance (`crossMarginBalance >= totalCrossMaintMargin`) it is refused with
+        /// `liquidate: account is above cross maintenance margin` (no write); below it the call
+        /// runs the account's liquidation episode starting at `marketId` — cancel every open order
+        /// of the account, close its cross markets one by one (this one first) until it is back at
+        /// maintenance, ADL what the book does not take — within a 16-step budget, the rest left to
+        /// the next tick (`CrossLiquidationStarted` / `Liquidation` / `CrossLiquidationEnded`). An
+        /// account flagged by an earlier unfinished episode is resumed — or, recovered since,
+        /// un-flagged — through ANY `marketId`, one where it holds no position included (the way
+        /// out for a flag that outlived the account's last cross position). ⚠️ ABI CHANGE (cross
+        /// P3): the P2 refusal `liquidate: position is CROSSED —
+        /// account-level cross liquidation is not live yet` is gone. Unreachable while cross
+        /// margin is gated off.
         function liquidate(address user, uint64 marketId) external;
 
         // ── Insurance Fund ────────────────────────────────────────────────
@@ -2593,7 +2601,28 @@ sol! {
         event MarginTypeChanged(address indexed user, uint64 indexed marketId, uint8 marginType);
 
         // Feeds: /income (LIQUIDATION_FEE for liquidator)
-        event Liquidation(address indexed user, uint64 indexed marketId, address liquidator, int64 amount, uint64 reward, uint64 markPrice);
+        // One per liquidated (user, market): `amount` the signed position before the close,
+        // `reward` the clearance fee credited to the insurance fund (cross P3: a rate on the
+        // NOTIONAL closed, both margin types), `marginType` the position's type in force (0 =
+        // CROSSED — one row per market an account-level cross episode closed; 1 = ISOLATED).
+        // ⚠️ ABI CHANGE (cross P3): `marginType` APPENDED, so the event signature and topic0 moved.
+        // An indexer filtering on the old topic0 sees NO liquidations at all, and gets no error.
+        // Regenerate the binding.
+        event Liquidation(address indexed user, uint64 indexed marketId, address liquidator, int64 amount, uint64 reward, uint64 markPrice, uint8 marginType);
+        // Feeds: cross liquidation episodes (cross P3, R6). `CrossLiquidationStarted` when an
+        // account's cross margin balance falls below its cross maintenance margin
+        // (`crossMarginBalance < totalCrossMaintMargin`, the values at detection) and the account
+        // enters liquidation mode (Binance `-2023`: only reduce-only / closePosition orders until it
+        // ends); `triggerMarketId` is the market whose tick (or manual `liquidate`) caught it.
+        // `CrossLiquidationEnded` when the flag is cleared: the account is back at or above cross
+        // maintenance (a partial liquidation stopped there, Q6) or holds no cross position any more;
+        // `marketId` is the market being processed when it ended, the two balances the values that
+        // ended it. Between the two, every closed market emits its own `Liquidation` (marginType 0).
+        // An episode may span several transactions (a per-tick step budget); a `Started` with no
+        // `Ended` yet means the account is still flagged. Both values saturate at the int64 /
+        // uint64 bounds.
+        event CrossLiquidationStarted(address indexed user, uint64 indexed triggerMarketId, int64 crossMarginBalance, uint64 totalCrossMaintMargin);
+        event CrossLiquidationEnded(address indexed user, uint64 indexed marketId, int64 crossMarginBalance, uint64 totalCrossMaintMargin);
 
         // Auto-deleveraging: one per forced trade closing a liquidated insolvent
         // residual (`liquidatedUser`) against an opposite-side holder (`adlUser`) at

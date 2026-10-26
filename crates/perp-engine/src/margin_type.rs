@@ -226,8 +226,7 @@ fn set_margin_type_core<H: PerpHost>(
 
     // 5. The account is in liquidation (`UserAccount::in_liquidation`, the
     //    `LIQ_FLAG_IN_LIQUIDATION` bit of `liq_flags`): Binance's `-2023`. One account `_ref`
-    //    load. Set and cleared by cross liquidation (P3) — nothing sets it before then, so no
-    //    account can be refused here yet.
+    //    load. Set and cleared by cross liquidation (`risk::cross_liquidation`).
     if storage::load_account_ref(context, account)?.in_liquidation() {
         return Err(perp_err("setMarginType: -2023 User in liquidation mode now."));
     }

@@ -713,12 +713,14 @@ fn adl_fills(logs: &[Log]) -> Vec<(Address, u64, u64)> {
         .collect()
 }
 
-/// The sweep and manual `liquidate()` leave a CROSSED position alone — even one the isolated
-/// predicate would take on its own slippage, on an account that is genuinely below cross
-/// maintenance — with no `Err` (the sweep would panic) and no write, while the SAME sweep still
-/// liquidates an isolated position in the same market and ADLs its residual.
+/// One tick liquidates BOTH kinds of candidate in its registry, each on its own predicate: CAROL's
+/// ISOLATED position per position (its silo is below maintenance) and ALICE's CROSSED one at the
+/// ACCOUNT level (`E < Σ MM`) through the episode — flagged, closed (the empty bid side fills
+/// nothing, so the whole position goes to ADL at the MARK: the account still has equity), and
+/// un-flagged once nothing cross is left. Both residuals land on BOB, the custody identity holds,
+/// and a later `liquidate()` finds nothing to do.
 #[test]
-fn the_sweep_and_liquidate_leave_a_crossed_position_alone() {
+fn one_tick_liquidates_a_crossed_account_and_an_isolated_position() {
     let mut ctx = make_ctx();
     let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
@@ -732,43 +734,31 @@ fn the_sweep_and_liquidate_leave_a_crossed_position_alone() {
     ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 10, IOC)); // cross long 10
     ok(&mut ctx, CAROL, &order(M1, BUY, px(100), 10, IOC)); // isolated long 10 at 3x
     ledger.check(&mut ctx, "after the opens");
-    let alice_before = (pos(&mut ctx, ALICE, M1), storage::load_account(&mut ctx, ALICE).unwrap());
+    let w0 = wallet(&mut ctx, ALICE);
 
-    // $100 → $70: CAROL's silo is below maintenance; ALICE's ACCOUNT is too (E = W − $300 against
-    // Σ MM = $116.67), and her margin-free position would fail the isolated predicate outright.
+    // $100 → $70: CAROL's silo is below maintenance, and so is ALICE's ACCOUNT
+    // (E = W − $300 ≈ $99.50 against Σ MM = $116.67).
+    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    assert!(!f.below_cross_maintenance(), "healthy before the tick: {f:?}");
     let logs = tick(&mut ctx, M1, px(70), 30);
     ledger.check(&mut ctx, "after the sweep");
-    let liq = liquidations(&logs);
-    assert_eq!(liq.len(), 1, "exactly one liquidation");
-    assert_eq!(liq[0].user, CAROL);
+    let mut liq: Vec<(Address, u8)> =
+        liquidations(&logs).iter().map(|l| (l.user, l.marginType)).collect();
+    liq.sort();
+    assert_eq!(liq, vec![(ALICE, CROSSED), (CAROL, ISOLATED)]);
     assert_eq!(pos(&mut ctx, CAROL, M1).amount, 0);
-    assert_eq!(adl_fills(&logs), vec![(BOB, 10, px(70))], "CAROL's residual went to BOB at mark");
-    assert_eq!(
-        (pos(&mut ctx, ALICE, M1), storage::load_account(&mut ctx, ALICE).unwrap()),
-        alice_before,
-        "the cross position and its account are untouched"
-    );
-    assert!(position_changes(&logs, ALICE).is_empty());
-    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
-    assert!(f.below_cross_maintenance(), "reported below maintenance (P3 acts on it): {f:?}");
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    let mut adl = adl_fills(&logs);
+    adl.sort();
+    assert_eq!(adl, vec![(BOB, 10, px(70)), (BOB, 10, px(70))], "both at the mark");
+    assert_eq!(wallet(&mut ctx, ALICE), w0 - 300 * USD, "the cross loss settled into W, no fee");
+    assert_eq!(count_events::<crate::interface::IPerpDex::CrossLiquidationStarted>(&logs), 1);
+    assert_eq!(count_events::<crate::interface::IPerpDex::CrossLiquidationEnded>(&logs), 1);
+    assert!(!storage::load_account(&mut ctx, ALICE).unwrap().in_liquidation());
 
-    // Manual liquidation refuses it, cleanly.
     let out = call(&mut ctx, CAROL, &liquidateCall { user: ALICE, marketId: M1 }.abi_encode());
     assert!(out.reverted);
-    assert_eq!(revert_reason(&out), crate::risk::LIQUIDATE_CROSSED_REJECT);
-    let _ = JournalTr::take_logs(ctx.journal_mut());
-    assert_eq!(
-        (pos(&mut ctx, ALICE, M1), storage::load_account(&mut ctx, ALICE).unwrap()),
-        alice_before
-    );
-    // And the core answers it totally — `Crossed`, never an `Err`.
-    let market = storage::load_market(&mut ctx, M1).unwrap().unwrap();
-    let (mut budget, mut deferred) = (16, false);
-    let outcome = crate::risk::liquidate_position(
-        &mut ctx, ALICE, M1, &market, px(70), CAROL, &mut budget, &mut deferred,
-    );
-    assert_eq!(outcome.unwrap(), crate::risk::LiquidationOutcome::Crossed);
-    assert!(!deferred);
+    assert_eq!(revert_reason(&out), "liquidate: no open position");
 }
 
 /// J4: an ISOLATED liquidation close walks no account fold, so a CROSSED leg it does not need
@@ -865,6 +855,12 @@ fn adl_ranks_a_cross_winner_on_its_account_and_settles_it_into_the_wallet() {
 /// isolated winner is filled first, and only the remainder reaches it — under `BothSides`, where
 /// its fill still settles into its (negative) wallet with no bad debt of its own. Total throughout:
 /// no `Err`, no division by its zero margin.
+///
+/// CAROL is liquidated through `liquidate()` at a $70 mark, not by a tick: ALICE's account is
+/// below cross maintenance too, and a tick's sweep would run HER episode as well (P3) — this pins
+/// ADL's treatment of an underwater cross WINNER, which is reachable whenever the loser's
+/// liquidation runs before the winner's own (an earlier registry slot, another market's tick, a
+/// keeper).
 #[test]
 fn adl_holds_an_underwater_cross_winner_back_to_the_fallback_tier() {
     let mut ctx = make_ctx();
@@ -880,7 +876,8 @@ fn adl_holds_an_underwater_cross_winner_back_to_the_fallback_tier() {
     let e = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap().e;
     assert!(e + 150 * USD as i128 <= 0, "ALICE's account is underwater at $70 too: E = {e}");
 
-    let logs = tick(&mut ctx, M1, px(70), 30);
+    set_mark(&mut ctx, M1, px(70));
+    let logs = ok(&mut ctx, ADMIN, &liquidateCall { user: CAROL, marketId: M1 }.abi_encode());
     ledger.check(&mut ctx, "after the liquidation + ADL");
     assert_eq!(
         adl_fills(&logs),
@@ -1074,10 +1071,12 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
     }
     storage::save_insurance_fund(&mut ctx, 10_000_000 * USD as u64).unwrap();
 
-    // Re-seeded (was `…_0021`) when the clearance fee moved to the notional basis (cross P3, Q3):
-    // the larger fee on the run's isolated liquidations changes every later random decision, and
-    // the old seed then never took ALICE's cross wallet negative.
-    let mut seed: u64 = 0xC205_5AFE_2B1D_009B;
+    // Re-seeded twice in cross P3 (was `…_0021`, then `…_009B`): first when the clearance fee moved
+    // to the notional basis (Q3), then when the sweep began liquidating cross accounts — each
+    // changes every later random decision, and the earlier seeds then never took ALICE's cross
+    // wallet negative. A seed that does is rarer now (3 in 300): the sweep closes an account the
+    // sawtooth drives under maintenance before it can realize the loss itself.
+    let mut seed: u64 = 0xC205_5AFE_2B1D_0094;
     let mut rng = move || {
         seed ^= seed << 13;
         seed ^= seed >> 7;
@@ -1231,12 +1230,12 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
          {negative_cross_wallets}, liquidations {liqs}, cross ADL fills {cross_adl}, withdrawals \
          {withdrawals}"
     );
-    // Coverage floors, about half of what this seed reaches (43 / 30 / 12 / 8 / 89), so a change
+    // Coverage floors, about half of what this seed reaches (54 / 69 / 8 / 5 / 83), so a change
     // that quietly stops the run from reaching a path fails here instead of passing vacuously.
-    assert!(cross_fills >= 20, "cross fills {cross_fills}");
-    assert!(negative_cross_wallets >= 15, "the cross wallet went negative on too few steps");
-    assert!(liqs >= 6, "liquidations {liqs}");
-    assert!(cross_adl >= 4, "ADL fills on a cross winner {cross_adl}");
+    assert!(cross_fills >= 25, "cross fills {cross_fills}");
+    assert!(negative_cross_wallets >= 30, "the cross wallet went negative on too few steps");
+    assert!(liqs >= 4, "liquidations {liqs}");
+    assert!(cross_adl >= 2, "ADL fills on a cross winner {cross_adl}");
     assert!(withdrawals >= 40, "withdrawals {withdrawals}");
 }
 

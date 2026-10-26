@@ -175,8 +175,9 @@ pub(crate) fn pending_funding_payment(
 ///   0. `account` is then REQUIRED: it is the copy the caller persists, so the payment is saved
 ///   with it. A cross settle without one is refused as an `[INVARIANT]` (it would drop the payment
 ///   on the floor); every path that can reach a cross position passes its account — the match
-///   registry, ADL winners, `add`/`removePositionMargin` — and the liquidation path skips a cross
-///   position before funding (cross P2 interim; P3's episode must pass the account).
+///   registry, ADL winners, `add`/`removePositionMargin`, and the cross liquidation episode
+///   (`risk::cross_liquidation`), which settles each market before closing it — and the ISOLATED
+///   liquidation path never sees one (both its callers route a cross position to the episode).
 ///
 /// `account` is the caller's already-loaded copy, used to build the group header
 /// ([`PendingFunding::snapshot`]) without a second load; for an ISOLATED position pass `None` and

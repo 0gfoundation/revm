@@ -391,6 +391,14 @@ use primitives::{B256, U256};
 //     (999_059_631 → 999_053_585) and the insurance fund (49_007_954 → 49_014_000): her fee is
 //     14_000 (50 bps of 0.04 @ $70) instead of 7_954 (50 bps of her silo). Golden re-pinned
 //     0x8c500d81…a62c → 0xaea562b9…1e61.
+//   * P3 — cross liquidation (the account-level episode, `perp_engine::risk::cross_liquidation`):
+//     the sweep and `liquidate()` judge a position CROSSED in force on its ACCOUNT (`E < Σ_C MM`)
+//     and run the episode — `liq_flags` set and cleared, every order of the account cancelled,
+//     each cross market closed by a limit IOC at the MM-share bankruptcy price and ADL, a
+//     continuation recorded in `Market::deferred_work`. New execution rules reachable only on a
+//     position CROSSED in force: gated off no write of an isolated account moves; the golden pin
+//     0xaea562b9…1e61 is unchanged, BusinessSnapshot UNCHANGED. (The `Liquidation` event's
+//     appended `marginType` is a log, not state.)
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

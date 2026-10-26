@@ -764,7 +764,8 @@ pub fn save_account<H: PerpHost>(
     Ok(())
 }
 
-/// Test-only stand-in for cross liquidation's `liq_flags` writer (P3): sets or clears
+/// Test-only stand-in for cross liquidation's `liq_flags` writer (`risk::cross_liquidation`, which
+/// writes it the same way): sets or clears
 /// [`crate::types::LIQ_FLAG_IN_LIQUIDATION`] on `user`'s stored account, through
 /// [`mutate_account`] — the writer the flag is reserved for ([`save_account`] carries the stored
 /// value over its caller's copy). Moves no balance, so it marks nothing.

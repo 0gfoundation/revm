@@ -665,8 +665,8 @@ pub struct CrossFold {
 
 impl CrossFold {
     /// The account-level cross liquidation condition `E < Σ_C MM_k` (strict — `E == Σ MM` is
-    /// healthy, the engine's `>=` rule). `false` for an account with no cross position. REPORTED
-    /// only in P2: cross liquidation (P3) acts on it.
+    /// healthy, the engine's `>=` rule). `false` for an account with no cross position. What the
+    /// liquidation sweep and `liquidate()` act on (`risk::cross_liquidation`, cross P3).
     #[inline]
     pub fn below_cross_maintenance(&self) -> bool {
         self.has_cross && self.e < self.cross_mm

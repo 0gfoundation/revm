@@ -50,7 +50,8 @@
 //!   no per-fill bad debt, fees from W, flips; the open-position count.
 //! * `fund_*` — §3.3 item 6 / F32: cross funding into W with the B-only event shape.
 //! * `gate_*` — §3.3 items 3, 5, 7, 8, 9, 10, J1, J6, Q9, Q11: every boundary to the unit.
-//! * `liq_*` — the P2 interim: the sweep and `liquidate()` skip CROSSED, ADL with cross winners.
+//! * `liq_*` — the sweep and `liquidate()` judge a CROSSED position on its account (P3; the P2
+//!   interim skipped it), ADL with cross winners.
 //! * `gated_*` — gated off, an isolated multi-market scenario is byte-identical to the same
 //!   scenario with the gate on and every account explicitly ISOLATED.
 
@@ -72,8 +73,8 @@ use crate::interface::IPerpDex::{
     removePositionMarginCall, setBasisModeCall, setLeverageCall, setMarginTiersCall,
     setMarginTypeCall, setMarginTypeSignedCall, setUserFeeRatesCall, transferFromPerpCall,
     transferToPerpCall, updateIndexPriceCall, updateMarketCall, withdrawInsuranceFundCall,
-    AccountBalanceChanged, AccountPosition, Adl, FundingSettled, Liquidation, OrderCancelled,
-    PlaceItem, PositionChanged, Trade,
+    AccountBalanceChanged, AccountPosition, Adl, CrossLiquidationEnded, CrossLiquidationStarted,
+    FundingSettled, Liquidation, OrderCancelled, PlaceItem, PositionChanged, Trade,
 };
 use crate::types::{AccountUpdateReason, MarginTiers, Market};
 use crate::{run_perp_dex_call, storage, PERP_DEX_ADDRESS, USDC_ADDRESS};
@@ -146,8 +147,8 @@ const E_4050: &str = "addPositionMargin: -4050 Cross balance insufficient.";
 const E_OUT: &str = "transferFromPerp: insufficient perp wallet balance";
 const E_OUT_INTERNAL: &str = "internalTransfer: insufficient perp wallet balance";
 const E_OUT_IF: &str = "depositInsuranceFund: insufficient perp wallet balance";
-const E_LIQ_CROSSED: &str =
-    "liquidate: position is CROSSED — account-level cross liquidation is not live yet";
+const E_LIQ_CROSS_HEALTHY: &str = "liquidate: account is above cross maintenance margin";
+const E_LIQ_NO_POSITION: &str = "liquidate: no open position";
 const E_HEALTHY: &str = "liquidate: position is above maintenance margin";
 
 /// Binance's `-2023` batch reason (`PerpBatchReason::UserInLiquidation`).
@@ -1217,17 +1218,23 @@ fn walk_randomised_mixed_accounts_keep_the_model_and_custody() {
     }
     enable_funding(ctx, M1, 400);
     enable_funding(ctx, M3, -300);
-    let mut rng = Rng(0x00c0_ffee_2026_1025);
+    // Re-seeded (was `0x00c0_ffee_2026_1025`) for P3, whose sweep now liquidates the accounts the
+    // walk drives under maintenance and so changes every later random decision.
+    let mut rng = Rng(0x00c0_ffee_2026_0018);
     let mut reasons: std::collections::BTreeMap<String, u32> = Default::default();
     let traders = [ALICE, BOB, CAROL];
     let (mut accepted, mut refused, mut predicted) = (0u32, 0u32, 0u32);
     let (mut negative_w, mut below_mm, mut ticks, mut stress) = (0u32, 0u32, 0u32, 0u32);
+    let mut cross_episodes = 0u32;
     for step in 0..900u32 {
         VIEWS.with(|v| v.set(step % 3 == 0));
         if step % 100 == 99 {
-            // A stress episode: a trader drains X, takes a 15 % adverse move on a cross leg, and
-            // closes it as a maker — the loss lands in W whatever its size (no per-fill bad debt),
-            // so W can go negative (money out then refused on X) until a deposit or profit nets it.
+            // A stress episode: a trader drains X and closes a cross leg as a MAKER 15 % through
+            // the mark — the loss lands in W whatever its size (no per-fill bad debt), so W can go
+            // negative (money out then refused on X) until a deposit or profit nets it — and only
+            // then does the mark follow. (In that order on purpose: with the mark moved first, the
+            // tick's sweep would liquidate the drained account before it could close — P3.) The
+            // tick that follows judges the account: under cross maintenance, its episode runs.
             let u = rng.pick(&traders);
             if let Some(l) = model(ctx, u).legs.iter().find(|l| l.cross && l.amount != 0).copied() {
                 VIEWS.with(|v| v.set(true));
@@ -1237,17 +1244,18 @@ fn walk_randomised_mixed_accounts_keep_the_model_and_custody() {
                 }
                 let mk = mark(ctx, l.market);
                 let to = if l.amount > 0 { mk - mk * 15 / 100 } else { mk + mk * 15 / 100 };
-                tick(ctx, l.market, to);
-                // The sweep ran on that tick and left the cross leg alone (P2 interim), whether or
-                // not the account is now under maintenance.
-                assert_eq!(pos(ctx, u, l.market).amount, l.amount, "the sweep touched a cross leg");
-                below_mm += model(ctx, u).below_maintenance() as u32;
                 let side = if l.amount > 0 { SELL } else { BUY };
-                let a = pos(ctx, u, l.market).amount.unsigned_abs();
-                if a != 0 {
-                    ok(ctx, u, &order(l.market, side, to, a, LIMIT, RO));
-                    ok(ctx, DAVE, &mkt(l.market, 1 - side, a));
-                }
+                // Nothing else of `u`'s resting in the market, so the close is provably reducing.
+                cancel_all(ctx, u, l.market);
+                let a = l.amount.unsigned_abs();
+                ok(ctx, u, &order(l.market, side, to, a, LIMIT, RO));
+                ok(ctx, DAVE, &mkt(l.market, 1 - side, a));
+                assert_eq!(pos(ctx, u, l.market).amount, 0, "closed");
+                let md = model(ctx, u);
+                negative_w += (md.w < 0) as u32;
+                below_mm += md.below_maintenance() as u32;
+                let c = tick(ctx, l.market, to);
+                cross_episodes += evs::<CrossLiquidationStarted>(&c.logs).len() as u32;
                 stress += 1;
             }
         }
@@ -1387,7 +1395,8 @@ fn walk_randomised_mixed_accounts_keep_the_model_and_custody() {
                 let d = (mk as u128 * bp as u128 / 10_000).max(1) as u64;
                 let up = if adverse { a < 0 } else { rng.below(2) == 0 };
                 let to = if up { mk + d } else { mk - d.min(mk / 2) };
-                tick(ctx, m, to);
+                let c = tick(ctx, m, to);
+                cross_episodes += evs::<CrossLiquidationStarted>(&c.logs).len() as u32;
                 ticks += 1;
                 continue;
             }
@@ -1428,11 +1437,12 @@ fn walk_randomised_mixed_accounts_keep_the_model_and_custody() {
         "random walk: accepted {accepted}, refused {refused}, predicted {predicted}, \
          ticks {ticks}, \
          negative-W account-steps {negative_w}, below-maintenance account-steps {below_mm}, \
-         stress episodes {stress}\n\
+         stress episodes {stress}, cross liquidation episodes {cross_episodes}\n\
          refusals {reasons:#?}"
     );
     assert!(accepted > 250 && refused > 100 && predicted > 150 && ticks > 100, "coverage");
     assert!(negative_w > 0 && below_mm > 0 && stress > 4, "no negative W or E < ΣMM reached");
+    assert!(cross_episodes > 0, "no cross liquidation episode ran");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -2335,12 +2345,15 @@ fn gate_in_liquidation_reaches_a_sub_account_through_its_master() {
 // The P2 liquidation interim
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 
-/// The sweep and `liquidate()` never liquidate a CROSSED position in P2 — not an `Err`, not a
-/// write: `liquidate()` refuses it by name, the sweep passes it by — while an ISOLATED position in
-/// the same tick is liquidated as always, and its residual ADL'd against a CROSSED winner, whose
-/// fill settles into W with no margin and no fee.
+/// The sweep and `liquidate()` judge a CROSSED position on its ACCOUNT (P3 — the P2 interim left
+/// it alone): healthy, `liquidate()` refuses it write-clean; below cross maintenance after the tick
+/// (E = −400 < ΣMM = 225, BANKRUPT), the tick's sweep runs the episode, whose IOC finds no bid and
+/// whose ADL then fills at the MM-share bankruptcy price — above the mark for an insolvent long, all
+/// of the account's share on its one market — so the deficit goes to the winner, DAVE, and the
+/// wallet ends at zero, not below (no fee either: a bankrupt account pays none). An ISOLATED
+/// position in the same tick is liquidated per position as always.
 #[test]
-fn liq_the_sweep_and_liquidate_skip_a_crossed_position() {
+fn liq_the_sweep_and_liquidate_judge_a_crossed_position_on_its_account() {
     let (_g, mut ctx) = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M1, 10, 1_000);
@@ -2348,28 +2361,37 @@ fn liq_the_sweep_and_liquidate_skip_a_crossed_position() {
     fill(ctx, CAROL, M1, 5, 1_000); // isolated: silo 250 − 2.5
     fill(ctx, BOB, M2, 2, 500); // a healthy isolated position
     set_wallet(ctx, ALICE, (600 * USD) as i64);
-    rejected(ctx, ERIN, &liquidateCall { user: ALICE, marketId: M1 }.abi_encode(), E_LIQ_CROSSED);
-    let alice = (pos(ctx, ALICE, M1), wallet(ctx, ALICE));
-    let (dave_w, dave_cr) = (wallet(ctx, DAVE), pos(ctx, DAVE, M1).cumulative_realized_pnl);
+    assert!(!model(ctx, ALICE).below_maintenance());
+    rejected(ctx, ERIN, &liquidateCall { user: ALICE, marketId: M1 }.abi_encode(), E_LIQ_CROSS_HEALTHY);
+    let if0 = storage::load_insurance_fund(ctx).unwrap();
 
     let c = tick(ctx, M1, 900);
-    let liq = evs::<Liquidation>(&c.logs);
-    assert_eq!(liq.len(), 1);
-    assert_eq!(liq[0].user, CAROL, "only the ISOLATED position was liquidated");
-    assert_eq!((pos(ctx, ALICE, M1), wallet(ctx, ALICE)), alice, "the CROSSED account untouched");
-    let md = model(ctx, ALICE);
-    assert!(md.below_maintenance(), "E = −405 < ΣMM = 225: reported, not acted on (P3)");
-    let got = account(ctx, ALICE);
-    assert!(got.crossMarginBalance < got.totalCrossMaintMargin as i64);
+    let mut liq: Vec<(Address, u8)> =
+        evs::<Liquidation>(&c.logs).iter().map(|l| (l.user, l.marginType)).collect();
+    liq.sort();
+    assert_eq!(liq, vec![(ALICE, CROSSED), (CAROL, ISOLATED)]);
+    assert_eq!(pos(ctx, ALICE, M1).amount, 0);
+    assert_eq!(pos(ctx, CAROL, M1).amount, 0);
+    let started = evs::<CrossLiquidationStarted>(&c.logs);
+    assert_eq!(started.len(), 1);
+    assert_eq!((started[0].user, started[0].triggerMarketId), (ALICE, M1));
+    assert_eq!(
+        (started[0].crossMarginBalance, started[0].totalCrossMaintMargin),
+        ((-400 * USD) as i64, (225 * USD) as u64),
+        "the detection values"
+    );
+    assert_eq!(evs::<CrossLiquidationEnded>(&c.logs).len(), 1);
+    assert!(!storage::load_account(ctx, ALICE).unwrap().in_liquidation());
     let adl = evs::<Adl>(&c.logs);
-    assert_eq!(adl.iter().map(|a| a.qty).sum::<u64>(), 5);
-    assert!(adl.iter().all(|a| a.adlUser == DAVE && a.liquidatedUser == CAROL));
-    assert_eq!(pos(ctx, DAVE, M1).margin, 0);
-    let realized = pos(ctx, DAVE, M1).cumulative_realized_pnl - dave_cr;
-    assert!(realized > 0);
-    assert_eq!(wallet(ctx, DAVE) - dave_w, realized as i128, "the cross winner's PnL is in W");
+    assert!(adl.iter().all(|a| a.adlUser == DAVE), "DAVE is the only opposite holder");
+    let alice_adl: Vec<&Adl> = adl.iter().filter(|a| a.liquidatedUser == ALICE).collect();
+    assert_eq!(alice_adl.iter().map(|a| a.qty).sum::<u64>(), 10);
+    assert!(alice_adl.iter().all(|a| a.price > 900), "an insolvent long's price is above the mark");
+    let w = wallet(ctx, ALICE);
+    assert!((0..USD).contains(&w), "the deficit went to the winner, W ends at zero: {w}");
+    assert_eq!(storage::load_insurance_fund(ctx).unwrap(), if0, "no fee, no bad debt");
 
-    rejected(ctx, ERIN, &liquidateCall { user: ALICE, marketId: M1 }.abi_encode(), E_LIQ_CROSSED);
+    rejected(ctx, ERIN, &liquidateCall { user: ALICE, marketId: M1 }.abi_encode(), E_LIQ_NO_POSITION);
     rejected(ctx, ERIN, &liquidateCall { user: BOB, marketId: M2 }.abi_encode(), E_HEALTHY);
 }
 

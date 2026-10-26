@@ -43,6 +43,8 @@ use crate::{
     PerpError,
 };
 
+pub(crate) mod cross_liquidation;
+
 // ── Admin: ownership ──────────────────────────────────────────────────────────
 
 /// `initAdmin(address admin)` — one-time initialisation; fails if already set.
@@ -1088,23 +1090,16 @@ pub(crate) enum LiquidationOutcome {
     NoPosition,
     /// Position is at or above the maintenance-margin threshold — not liquidatable.
     AboveMaintenance,
-    /// The position is CROSSED in force. Its solvency is ACCOUNT-level (`E < Σ_C MM`, reported by
-    /// `margin_view::CrossFold::below_cross_maintenance`) and the per-position predicate cannot
-    /// judge it — a cross position holds no silo, so it would read as insolvent on any loss at all.
-    /// P3: replaced by the cross liquidation episode. Until then such a position is never
-    /// liquidated, and NOTHING is written (no funding settle either), exactly like
-    /// `AboveMaintenance`.
-    Crossed,
 }
 
-/// Core liquidation logic, shared by the manual `liquidate` entry point
+/// Core ISOLATED liquidation logic, shared by the manual `liquidate` entry point
 /// (`run_liquidate`) and the protocol-automatic sweep (inside
 /// `run_update_index_price`). The caller must already hold the loaded `market`
 /// and a non-zero `mark_price` (the mark==0 degenerate case is rejected by the
-/// wrapper). Settles funding on the position first (so the charge counts toward
-/// insolvency), then:
+/// wrapper). A position CROSSED in force is never brought here: both callers route it to the
+/// account-level episode (`cross_liquidation::liquidate_cross_account`). Settles funding on the
+/// position first (so the charge counts toward insolvency), then:
 /// - `amount == 0`  → `NoPosition` (no state change beyond the funding settle);
-/// - CROSSED in force → `Crossed`, before the funding settle, with no write (cross P2 interim);
 /// - above maintenance → `AboveMaintenance`;
 /// - otherwise closes through the orderbook, settles any residual at mark, charges
 ///   the clearance fee to the IF, emits `Liquidation`, and returns `Liquidated`.
@@ -1131,23 +1126,19 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     if pos.amount == 0 {
         return Ok(LiquidationOutcome::NoPosition);
     }
-    // ── P3: cross liquidation replaces this. The P2 interim: never liquidate a CROSSED position ───
+    // ── ISOLATED only ─────────────────────────────────────────────────────────────────────────
     //
     // Everything below is the ISOLATED liquidation: a per-position maintenance test on the silo,
-    // a close of this one market, a clearance fee on the silo it consumed. None of it is defined for
-    // a position CROSSED in force — it has no silo (`pos.margin == 0`), so the predicate would call
-    // it insolvent on its first unit of loss, and its losses settle against the shared wallet the
-    // isolated close never touches. So until the account-level episode exists (P3: detection on
-    // `E < Σ_C MM`, cancel-all, close per market, ADL, negative-balance clearance), a cross position
-    // is reported `Crossed` and left open.
-    //
-    // HERE — before the funding compute, and with no write — so the answer is TOTAL for the sweep
-    // (which panics on any `Err` from this function): `effective_margin_type` has no error path,
-    // and a cross position's funding needs its account, which this path does not load. The sweep
-    // treats `Crossed` like `AboveMaintenance` (checkpoint reverted, nothing to revert), and manual
-    // `liquidate()` refuses it.
+    // a close of this one market, a clearance fee capped at what this close returns. None of it is
+    // defined for a position CROSSED in force — it has no silo (`pos.margin == 0`), so the
+    // predicate would call it insolvent on its first unit of loss, and its losses settle against
+    // the shared wallet. Both callers route such a position to the account-level episode instead
+    // (`cross_liquidation`), so this is unreachable; answered with NO write — before the funding
+    // compute, which for a cross position needs the account this path does not load — rather than
+    // with an `Err`, because the sweep panics on any `Err` from this function.
     if crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed {
-        return Ok(LiquidationOutcome::Crossed);
+        debug_assert!(false, "liquidate_position: a CROSSED position must be routed to the episode");
+        return Ok(LiquidationOutcome::AboveMaintenance);
     }
     // commit-only #23: compute accrued funding IN MEMORY first (funding writes nothing), so the
     // maintenance check sees the post-funding position — including a funding DEBT, which is what
@@ -1314,6 +1305,7 @@ pub(crate) fn liquidate_position<H: PerpHost>(
             amount: liq_amount,
             reward: clearance_fee,
             markPrice: mark_price,
+            marginType: crate::types::MarginType::Isolated.code(),
         }
         .to_log_data(),
     });
@@ -1407,6 +1399,14 @@ pub(crate) fn charge_clearance_fee<H: PerpHost>(
 /// [`liquidate_position`]: decodes calldata, loads the market + mark price (refusing
 /// a market with no oracle price), and maps the core outcome to the caller-facing
 /// result. `caller` is recorded as the liquidator.
+///
+/// A position CROSSED in force is judged on its ACCOUNT instead (cross P3): the account-level
+/// check, then — below cross maintenance — the liquidation episode starting at `marketId`, with a
+/// fresh [`cross_liquidation::MANUAL_CROSS_STEP_BUDGET`] steps and [`ADL_BUDGET_PER_UPDATE`] ADL
+/// fills (what it leaves becomes a continuation, like the sweep's). A healthy account is refused
+/// before any write; a flagged one that has recovered is un-flagged, and that is the call's effect
+/// — reachable through ANY market for a flagged account, a market where it holds nothing included.
+/// Gas stays flat.
 pub fn run_liquidate<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
@@ -1424,6 +1424,48 @@ pub fn run_liquidate<H: PerpHost>(
         // so solvency would be judged on the sign of `v_quote + margin` alone.
         // Refuse to liquidate without a real mark price.
         return Err(perp_err("liquidate: mark price unavailable"));
+    }
+
+    // The account-level episode for a position CROSSED in force — and for a FLAGGED account with
+    // no position here at all: an episode an earlier call left unfinished resumes (or, the account
+    // having recovered, ends) from any market. That is also the way out for a flag that outlived
+    // its account's last cross position (an interrupted episode whose account then closed the rest
+    // itself, or was ADL'd out of it): no sweep visits an account in no registry, and this call is
+    // permissionless.
+    let route_to_episode = {
+        let pos = storage::load_position_ref(context, args.user, args.marketId)?;
+        if pos.amount != 0 {
+            crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed
+        } else {
+            storage::load_account_ref(context, args.user)?.in_liquidation()
+        }
+    };
+    if route_to_episode {
+        let mut budget = cross_liquidation::MANUAL_CROSS_STEP_BUDGET;
+        let mut adl_budget = ADL_BUDGET_PER_UPDATE;
+        // No sweep owns this call: the episode writes any continuation to its market's
+        // `deferred_work` directly, so this stays false.
+        let mut deferred = false;
+        let caller = cross_liquidation::EpisodeCaller {
+            sweep_market: None,
+            fresh_market: None,
+            liquidator: caller,
+        };
+        return match cross_liquidation::liquidate_cross_account(
+            context,
+            args.user,
+            args.marketId,
+            caller,
+            &mut budget,
+            &mut adl_budget,
+            &mut deferred,
+        )? {
+            cross_liquidation::CrossLiquidationOutcome::Healthy => {
+                Err(perp_err(LIQUIDATE_CROSS_HEALTHY_REJECT))
+            }
+            cross_liquidation::CrossLiquidationOutcome::Recovered
+            | cross_liquidation::CrossLiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
+        };
     }
 
     let mut adl_budget = ADL_BUDGET_PER_UPDATE;
@@ -1446,20 +1488,19 @@ pub fn run_liquidate<H: PerpHost>(
         LiquidationOutcome::AboveMaintenance => {
             Err(perp_err("liquidate: position is above maintenance margin"))
         }
-        // P3: a cross position starts the account-level episode from this market instead.
-        LiquidationOutcome::Crossed => Err(perp_err(LIQUIDATE_CROSSED_REJECT)),
     }
 }
 
-/// `liquidate()`'s refusal for a position CROSSED in force while cross liquidation does not exist
-/// (cross P2 interim — P3 replaces it with the account-level episode).
-pub(crate) const LIQUIDATE_CROSSED_REJECT: &str =
-    "liquidate: position is CROSSED — account-level cross liquidation is not live yet";
+/// `liquidate()`'s refusal for a position CROSSED in force whose ACCOUNT is at or above cross
+/// maintenance (`crossMarginBalance ≥ totalCrossMaintMargin`) — nothing written.
+pub(crate) const LIQUIDATE_CROSS_HEALTHY_REJECT: &str =
+    "liquidate: account is above cross maintenance margin";
 
-/// Max positions actually LIQUIDATED per `updateIndexPrice` sweep. This bounds the
-/// expensive half — each liquidation closes through the book + writes — but NOT the
+/// Max liquidation STEPS per `updateIndexPrice` sweep: one isolated liquidation, or one step of a
+/// cross episode (one market's cancel-all, or one market's close — cross P3). This bounds the
+/// expensive half — each step cancels or closes through the book + writes — but NOT the
 /// registry scan itself: the loop still visits every registered candidate until it
-/// has liquidated this many, so a sweep over N mostly-healthy positions is O(N)
+/// has spent this many, so a sweep over N mostly-healthy positions is O(N)
 /// (load + funding-settle + revert per healthy candidate). That O(N) scan on the
 /// (delayed-execution) newPayload critical path is a known scale limit; the real fix
 /// is the tick-bucket candidate index (auto-liq Phase E), which visits only
@@ -1484,10 +1525,13 @@ const ADL_BUDGET_PER_UPDATE: u32 = 128;
 /// maintenance at the new mark.
 ///
 /// Each candidate is attempted under its own journal checkpoint:
-/// - `Liquidated` → commit the writes;
-/// - healthy / stale (`AboveMaintenance` / `NoPosition`) → revert (the sweep leaves no trace);
-/// - CROSSED in force (`Crossed`) → revert, untouched: cross liquidation is account-level and does
-///   not exist yet (P3: the sweep runs the cross episode for such a candidate).
+/// - an ISOLATED position ([`liquidate_position`]): `Liquidated` → commit the writes; healthy /
+///   stale (`AboveMaintenance` / `NoPosition`) → revert (the sweep leaves no trace);
+/// - a position CROSSED in force: judged on its ACCOUNT (`E < Σ_C MM`, the total fold) by the
+///   cross episode (`cross_liquidation::liquidate_cross_account`), which starts at this market and
+///   spends the same step budget — `Healthy` → revert, anything else → commit. The registry is a
+///   SET, so an account is processed at most once per sweep, however many of its markets an
+///   episode touches.
 ///
 /// Any other error after the liquidatability check is a commit-only invariant failure and aborts
 /// the node rather than allowing a partial write set.
@@ -1500,6 +1544,9 @@ fn run_liquidation_sweep<H: PerpHost>(
     // `run_deferred_sweeps`. Being starved here is safe (a liquidation deferred is a liquidation
     // delayed); being starved there is a user's stop-loss not firing.
     budget: &mut u32,
+    // This market's mark was published by THIS transaction (an oracle tick) — exempt from the
+    // cross episode's stale-mark guard. `false` on a drain.
+    fresh_mark: bool,
 ) -> Result<bool, PerpError> {
     // Snapshot the registry (owned Vec, deterministic insertion order). Liquidations
     // mutate the live registry via save_position, but iterating the snapshot is stable;
@@ -1521,34 +1568,72 @@ fn run_liquidation_sweep<H: PerpHost>(
             // the harmful direction, and the `break` cannot produce one.
             return Ok(true);
         }
+        // ── A position CROSSED in force: the ACCOUNT is the candidate ──
+        let crossed = {
+            let pos = storage::load_position_ref(context, user, market_id)?;
+            pos.amount != 0
+                && crate::margin_type::effective_margin_type(&pos)
+                    == crate::types::MarginType::Crossed
+        };
         // commit-only (#23): healthy candidates are write-free (funding is computed in memory
         // and only applied when liquidatable), so the checkpoint only balances EVM-side state.
         // A liquidation that FAILS mid-apply would leave partial perp writes with no undo — a
         // corruption-anyway condition: halt loudly rather than skip silently.
         let cp = context.checkpoint();
-        match liquidate_position(
-            context,
-            user,
-            market_id,
-            market,
-            mark_price,
-            Address::ZERO,
-            &mut adl_budget,
-            &mut deferred,
-        ) {
-            Ok(LiquidationOutcome::Liquidated { .. }) => {
-                context.checkpoint_commit();
-                *budget -= 1;
+        let wrote = if crossed {
+            let caller = cross_liquidation::EpisodeCaller {
+                sweep_market: Some(market_id),
+                fresh_market: fresh_mark.then_some(market_id),
+                liquidator: Address::ZERO,
+            };
+            match cross_liquidation::liquidate_cross_account(
+                context,
+                user,
+                market_id,
+                caller,
+                budget,
+                &mut adl_budget,
+                &mut deferred,
+            ) {
+                // Healthy: zero perp writes were made.
+                Ok(cross_liquidation::CrossLiquidationOutcome::Healthy) => false,
+                // The episode spent its own steps out of `budget`.
+                Ok(_) => true,
+                Err(e) => {
+                    panic!(
+                        "liquidation sweep: the cross liquidation episode failed mid-apply \
+                         (commit-only invariant): {e:?}"
+                    );
+                }
             }
-            Ok(_) => {
-                // AboveMaintenance / NoPosition / Crossed: zero perp writes were made.
-                context.checkpoint_revert(cp);
+        } else {
+            match liquidate_position(
+                context,
+                user,
+                market_id,
+                market,
+                mark_price,
+                Address::ZERO,
+                &mut adl_budget,
+                &mut deferred,
+            ) {
+                Ok(LiquidationOutcome::Liquidated { .. }) => {
+                    *budget -= 1;
+                    true
+                }
+                // AboveMaintenance / NoPosition: zero perp writes were made.
+                Ok(_) => false,
+                Err(e) => {
+                    panic!(
+                        "liquidation sweep: liquidate_position failed mid-apply (commit-only invariant): {e:?}"
+                    );
+                }
             }
-            Err(e) => {
-                panic!(
-                    "liquidation sweep: liquidate_position failed mid-apply (commit-only invariant): {e:?}"
-                );
-            }
+        };
+        if wrote {
+            context.checkpoint_commit();
+        } else {
+            context.checkpoint_revert(cp);
         }
     }
     // Walked every candidate without hitting the cap.
@@ -1602,6 +1687,8 @@ fn run_deferred_sweeps<H: PerpHost>(
     // `IndexPriceState.timestamp` of `mark_price` — the trailing structure's tick sequence.
     seq: u64,
     mark_price: u64,
+    // `mark_price` was published by THIS transaction (the oracle path), not re-read (the drain).
+    fresh_mark: bool,
 ) -> Result<bool, PerpError> {
     // ── Trailing stops, step 1: fold the mark into the peaks — FIRST and NOT budgeted ─────────
     //
@@ -1668,7 +1755,7 @@ fn run_deferred_sweeps<H: PerpHost>(
         (false, false, false)
     };
     let sweep_deferred =
-        run_liquidation_sweep(context, market_id, market, mark_price, &mut budget)?;
+        run_liquidation_sweep(context, market_id, market, mark_price, &mut budget, fresh_mark)?;
     let deferred = gc_deferred
         || trigger_deferred
         || trailing_deferred
@@ -2783,7 +2870,7 @@ fn apply_index_price_update<H: PerpHost>(
     // what the close absorbs — while the BBO cache is still provably live, which is what lets the
     // removal use the cheap cancel-path variant and get its top-of-book invariant check for free.
     // Capped; see MAX_BAND_EXPIRIES_PER_UPDATE.
-    run_deferred_sweeps(context, market_id, &market, effective_timestamp, mark_price)?;
+    run_deferred_sweeps(context, market_id, &market, effective_timestamp, mark_price, true)?;
 
     // ── 6. Emit events ────────────────────────────────────────────────────────
     // ONE price event per update. This used to be `IndexPriceUpdated` immediately followed by
@@ -2946,7 +3033,7 @@ pub fn run_drain_deferred_work<H: PerpHost>(
     // The seq that mark was written at: the trailing step re-runs at the same `(seq, mark)` and so
     // changes nothing (it is idempotent there), which is the whole of what the drain needs from it.
     let seq = storage::load_index_price_state(context, args.marketId)?.timestamp;
-    let more = run_deferred_sweeps(context, args.marketId, &market, seq, mark_price)?;
+    let more = run_deferred_sweeps(context, args.marketId, &market, seq, mark_price, false)?;
 
     Ok(Bytes::from(drainDeferredWorkCall::abi_encode_returns(&more)))
 }
