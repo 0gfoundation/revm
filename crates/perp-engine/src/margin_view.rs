@@ -659,7 +659,8 @@ pub struct CrossFold {
     /// How many legs [`cross_fold`] could not evaluate and therefore left OUT of every sum: a
     /// market id in the index that names no market, or a leg whose arithmetic overflowed. Always
     /// `0` from [`cross_fold_checked`], which refuses such a leg instead. Not reachable through any
-    /// engine path; the sweep-facing fold counts it rather than failing.
+    /// engine path; the total fold (like [`cross_health`], the sweep's) counts it rather than
+    /// failing.
     pub faulted_legs: u8,
 }
 
@@ -793,8 +794,11 @@ pub fn cross_leg(
 }
 
 /// **The cross fold — TOTAL.** Every account-level cross quantity ([`CrossFold`]) for `user`, over
-/// the per-user market index, in ONE walk. This is the form the liquidation sweep and ADL (cross
-/// P3) call, and the sweep PANICS on any `Err` from `liquidate_position`, so:
+/// the per-user market index, in ONE walk. It was the form the liquidation sweep and ADL called
+/// (cross P3); since P4 they read the health terms they need (`E`, `Σ_C MM`, per-leg `uPnL` /
+/// `MM` / `PF`) from [`cross_health`] instead — no walk — and THIS walk is what every
+/// `cross_health` result is re-derived by in `debug_assertions` builds. The policy is the sweep's,
+/// which PANICS on any `Err` from `liquidate_position`, so:
 ///
 /// * accumulation is in `i128` and never narrowed;
 /// * a market id in the index that names no market contributes NOTHING (and `debug_assert`s — it
@@ -858,7 +862,8 @@ pub fn cross_fold_checked<H: PerpHost>(
 /// What [`cross_fold_walk`] does with a leg it cannot evaluate.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FoldPolicy {
-    /// Leave it out and count it (the sweep-facing fold).
+    /// Leave it out and count it (the sweep's policy — [`cross_health`] keeps it, and is checked
+    /// against this walk).
     Total,
     /// Refuse (the gates and views).
     Checked,
@@ -1058,7 +1063,7 @@ fn cross_health_leg(
 /// In `debug_assertions` builds every call re-derives its answer with [`cross_fold`] and panics on
 /// any difference — `W`, `E`, `Σ_C MM`, `has_cross`, the faulted count, and every per-leg value —
 /// after checking the stored legs themselves against a fresh walk of the positions
-/// ([`debug_assert_cross_legs`]): the `total_position_margin` pattern. A release build does no
+/// (`debug_assert_cross_legs`): the `total_position_margin` pattern. A release build does no
 /// walk.
 pub fn cross_health<H: PerpHost>(
     context: &mut H,

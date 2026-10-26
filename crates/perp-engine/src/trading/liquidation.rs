@@ -221,7 +221,8 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 ///
 /// A winner CROSSED in force has no silo, so its position equity is not a number ADL can rank or
 /// screen it by. It is judged on its ACCOUNT instead — `E` and this market's leg from the TOTAL
-/// cross fold (`margin_view::cross_fold`: no `Err` but the storage layer's; J4):
+/// cross health check (`margin_view::cross_health`, priced off the account's stored cross legs —
+/// cross P4; no `Err` but the storage layer's; J4):
 ///
 /// * **Rank** — Binance's `PnL% × EffLev` when `PnL% ≥ 0` and `PnL% / EffLev` when `< 0`, with
 ///   `PnL% = uPnL_k / |N_k|` (symbol level) and `EffLev = |N_k| / E` (account level — cross report
