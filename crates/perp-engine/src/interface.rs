@@ -291,7 +291,8 @@ sol! {
         /// everything else is a property of the position alone and is computed identically.
         ///
         /// A user with no position and no orders reads back all zeros with `leverage = 1` and
-        /// `marginType = 1`. Both selectors REVERT if the market does not exist — the decimals and
+        /// `marginType = 0` (CROSSED: a market the user never called `setMarginType` on is CROSSED
+        /// since the flip). Both selectors REVERT if the market does not exist — the decimals and
         /// the tier table are required INPUTS, so a fabricated zero market would report a full row
         /// of plausible zeros. (`getPosition` differs here on purpose; see it.)
         struct AccountPosition {
@@ -1510,6 +1511,11 @@ sol! {
         );
         /// Query the FIFO order-id queue at one price level.
         /// side: 0 = Buy reads the bid level; 1 = Sell reads the ask level.
+        ///
+        /// The queue is LAZY: cancelling an order that is not first at its price only drops the
+        /// level's live count, and its id stays here until a match walk sweeps it (or the level
+        /// empties) — while the order record itself is already deleted, so `getOrder` on such an
+        /// id REVERTS ("order not found"). A consumer rebuilding the book skips those ids.
         function getBookLevel(uint64 marketId, uint8 side, uint64 price) external view returns (
             bytes32[] orderIds
         );
