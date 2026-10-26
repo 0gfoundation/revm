@@ -5,8 +5,8 @@
 //!   `UserAccount::liq_flags` (defined; P3 sets it), both carried over by `storage::save_account`;
 //! * the invariant `CROSSED in force ⇒ pos.margin == 0`, asserted at `save_position`.
 //!
-//! Cross margin is gated off in production; the tests that need a position CROSSED in force take
-//! the `#[cfg(test)]` override (`margin_type::test_gate`). Cross positions are SEEDED here (margin
+//! The tests run on the real gate (cross margin is live since the P3 flip); the gated-off pins
+//! force it off (`margin_type::test_gate::disable`). Cross positions are SEEDED here (margin
 //! 0, through `save_position`): these tests pin the fold and the views on exact planted states.
 //! Opening and closing them through real fills is `cross_settlement_tests` (P2b).
 use alloy_sol_types::{SolCall, SolError};
@@ -315,7 +315,6 @@ fn a_stale_account_copy_cannot_roll_back_the_count_or_the_flags() {
 #[should_panic(expected = "is CROSSED in force but holds isolated margin")]
 fn a_crossed_position_holding_isolated_margin_is_refused_at_the_door() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     let pos =
         PerpPosition { amount: 1, v_quote_balance: -USD, margin: 1, ..PerpPosition::default() };
     assert_eq!(pos.margin_type, MarginType::Crossed.code());
@@ -335,7 +334,6 @@ fn the_invariant_binds_only_the_type_in_force() {
         plant(&mut ctx, ALICE, M1, silo.clone()); // gated off: ISOLATED in force
     }
 
-    let _cross = crate::margin_type::test_gate::enable();
     isolate(&mut ctx, BOB, M1);
     let isolated = PerpPosition { margin_type: MarginType::Isolated.code(), ..silo.clone() };
     plant(&mut ctx, BOB, M1, isolated);
@@ -571,7 +569,6 @@ fn mixed_account(ctx: &mut TestCtx) -> (Vec<Leg>, Vec<(u64, ModelMarket)>) {
 fn the_cross_fold_matches_an_independent_model_on_a_mixed_account() {
     let mut ctx = make_ctx();
     storage::save_market(&mut ctx, &market(M3)).unwrap();
-    let _cross = crate::margin_type::test_gate::enable();
     let (legs, markets) = mixed_account(&mut ctx);
     set_wallet(&mut ctx, ALICE, 5_000 * USD);
 
@@ -608,10 +605,7 @@ fn gated_off_the_fold_is_the_isolated_basis_it_always_was() {
     let mut ctx = make_ctx();
     storage::save_market(&mut ctx, &market(M3)).unwrap();
     // Plant with cross on (the cross legs must be margin-free), then read with it off.
-    let (legs, markets) = {
-        let _cross = crate::margin_type::test_gate::enable();
-        mixed_account(&mut ctx)
-    };
+    let (legs, markets) = mixed_account(&mut ctx);
     let _off = crate::margin_type::test_gate::disable();
     set_wallet(&mut ctx, ALICE, 5_000 * USD);
     let got = fold(&mut ctx, ALICE);
@@ -643,7 +637,6 @@ fn gated_off_the_fold_is_the_isolated_basis_it_always_was() {
 #[test]
 fn an_underwater_cross_account_reports_below_maintenance_and_zero_withdrawable() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_market(&mut ctx, M1, 10_000, &[(0, 3, 0)]);
     plant_leg(&mut ctx, ALICE, &Leg::new(M1, 10, 14_000, 3, true, 0)); // −$400 at $100
     set_wallet(&mut ctx, ALICE, 500 * USD);
@@ -672,7 +665,6 @@ fn an_underwater_cross_account_reports_below_maintenance_and_zero_withdrawable()
 #[test]
 fn cross_profit_opens_but_does_not_withdraw() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_market(&mut ctx, M1, 15_000, &[(0, 3, 0)]);
     plant_leg(&mut ctx, ALICE, &Leg::new(M1, 10, 10_000, 3, true, 0)); // +$500 at $150
     set_wallet(&mut ctx, ALICE, 100 * USD);
@@ -691,7 +683,6 @@ fn cross_profit_opens_but_does_not_withdraw() {
 #[test]
 fn a_zero_mark_cross_leg_contributes_no_pnl_and_no_maintenance() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_market(&mut ctx, M1, 0, &[(0, 3, 0)]);
     set_market(&mut ctx, M2, 10_000, &[(0, 3, 0)]);
     let mut dark = Leg::new(M1, 10, 9_000, 2, true, 0);
@@ -754,7 +745,6 @@ fn a_missing_market_contributes_nothing_to_the_total_fold() {
 #[test]
 fn an_overflowing_leg_is_refused_checked_and_left_out_total() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     plant_leg(&mut ctx, ALICE, &Leg::new(M1, 2, 9_000, 1, true, 0));
     let sound = fold(&mut ctx, ALICE);
     plant(&mut ctx, ALICE, M2, PerpPosition { amount: i64::MAX / 2, ..PerpPosition::default() });
@@ -771,7 +761,6 @@ fn an_overflowing_leg_is_refused_checked_and_left_out_total() {
 #[test]
 fn the_overrides_price_a_hypothetical_post_state() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_market(&mut ctx, M1, 10_000, &[(0, 3, 0)]);
     set_market(&mut ctx, M2, 20_000, &[(0, 3, 0)]);
     let held = Leg::new(M1, 3, 9_000, 3, true, 0);
@@ -858,7 +847,6 @@ fn liquidatable_at(ctx: &mut TestCtx, user: Address, market: u64, mark: u64) -> 
 fn get_account_reports_the_cross_quantities() {
     let mut ctx = make_ctx();
     storage::save_market(&mut ctx, &market(M3)).unwrap();
-    let _cross = crate::margin_type::test_gate::enable();
     let (legs, markets) = mixed_account(&mut ctx);
     set_wallet(&mut ctx, ALICE, 5_000 * USD);
     let want = model(&legs, &markets, 5_000 * USD);
@@ -947,7 +935,6 @@ fn get_account_reports_the_cross_quantities() {
 #[test]
 fn the_cross_liquidation_price_moves_with_the_rest_of_the_account() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_market(&mut ctx, M1, 10_000, &[(0, 3, 0)]);
     set_market(&mut ctx, M2, 10_000, &[(0, 3, 0)]);
     plant_leg(&mut ctx, ALICE, &Leg::new(M1, 10, 10_000, 3, true, 0));
@@ -1007,7 +994,6 @@ fn the_cross_liquidation_price_is_binances_lp1() {
     const J: u64 = M2;
     let usd = USD as u64;
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_market(&mut ctx, K, 2_800_000, &[(0, 125, 4_000), (50_000 * usd, 100, 5_000)]);
     set_market(&mut ctx, J, 160_000, &[(0, 50, 10_000)]);
     plant_leg(&mut ctx, ALICE, &Leg::new(K, 2, 3_000_000, 20, true, 0));
@@ -1106,7 +1092,6 @@ fn every_getter_is_byte_identical_for_an_isolated_only_account() {
     // Gated on, every actor ISOLATED by choice.
     let mut isolated = make_ctx();
     let (isolated_logs, isolated_bytes) = {
-        let _cross = crate::margin_type::test_gate::enable();
         for u in [ALICE, BOB] {
             for m in [M1, M2] {
                 isolate(&mut isolated, u, m);

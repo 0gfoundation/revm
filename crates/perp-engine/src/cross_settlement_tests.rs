@@ -22,10 +22,10 @@
 //! this IS the identity `erc20(USDC, PERP_DEX) == Σ claims` with the deposits held fixed. A negative
 //! `W` enters it as a negative claim, which is what keeps it closing.
 //!
-//! Cross margin is gated off in production; every test here takes the `#[cfg(test)]` override
-//! (`margin_type::test_gate`). Under it a position nobody switched is CROSSED (the stored default),
-//! so each counterparty that is meant to be ISOLATED is switched explicitly, through
-//! `setMarginType`.
+//! Every test here runs on the real gate (cross margin is live since the P3 flip): a position
+//! nobody switched is CROSSED (the stored default), so each counterparty that is meant to be
+//! ISOLATED is switched explicitly, through `setMarginType`. Only the gated-off byte-identity pin
+//! forces the gate off (`margin_type::test_gate::disable`).
 use alloy_sol_types::{SolCall, SolError, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
@@ -312,7 +312,6 @@ impl Ledger {
 #[test]
 fn a_cross_taker_open_moves_no_cash_and_pays_its_fee_from_the_wallet() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     let ledger = Ledger::open(&mut ctx);
 
@@ -347,7 +346,6 @@ fn a_cross_taker_open_moves_no_cash_and_pays_its_fee_from_the_wallet() {
 #[test]
 fn a_cross_maker_open_moves_no_cash_and_is_not_refused_on_per_position_solvency() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     let ledger = Ledger::open(&mut ctx);
 
@@ -369,7 +367,6 @@ fn a_cross_maker_open_moves_no_cash_and_is_not_refused_on_per_position_solvency(
 #[test]
 fn a_cross_partial_close_credits_the_realized_profit_to_the_wallet() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_type(&mut ctx, CAROL, M1, ISOLATED);
     let ledger = Ledger::open(&mut ctx);
@@ -401,7 +398,6 @@ fn a_cross_partial_close_credits_the_realized_profit_to_the_wallet() {
 #[test]
 fn a_cross_loss_beyond_the_wallet_drives_it_negative_with_no_bad_debt() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
         set_type(&mut ctx, CAROL, m, ISOLATED);
@@ -452,7 +448,6 @@ fn a_cross_loss_beyond_the_wallet_drives_it_negative_with_no_bad_debt() {
 #[test]
 fn a_cross_taker_close_at_a_loss_settles_into_the_wallet_with_no_bad_debt() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_type(&mut ctx, BOB, M2, ISOLATED);
     set_type(&mut ctx, CAROL, M1, ISOLATED);
@@ -480,7 +475,6 @@ fn a_cross_taker_close_at_a_loss_settles_into_the_wallet_with_no_bad_debt() {
 #[test]
 fn a_cross_flip_closes_and_reopens_in_one_fill() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_type(&mut ctx, CAROL, M1, ISOLATED);
     let ledger = Ledger::open(&mut ctx);
@@ -508,7 +502,6 @@ fn a_cross_flip_closes_and_reopens_in_one_fill() {
 #[test]
 fn a_mixed_account_funds_its_isolated_silo_and_nothing_for_its_cross_leg() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
         set_type(&mut ctx, CAROL, m, ISOLATED);
@@ -589,7 +582,6 @@ fn is_position_row(logs: &[Log], i: usize) -> bool {
 #[test]
 fn cross_funding_settles_into_the_wallet_as_a_balance_only_push() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_type(&mut ctx, CAROL, M1, ISOLATED);
     let ledger = Ledger::open(&mut ctx);
@@ -633,7 +625,6 @@ fn cross_funding_settles_into_the_wallet_as_a_balance_only_push() {
 #[test]
 fn a_cross_maker_receives_funding_into_the_wallet_before_its_fill() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_type(&mut ctx, CAROL, M1, ISOLATED);
     let ledger = Ledger::open(&mut ctx);
@@ -666,7 +657,6 @@ fn a_cross_maker_receives_funding_into_the_wallet_before_its_fill() {
 #[test]
 fn a_cross_funding_charge_beyond_the_wallet_drives_it_negative() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_type(&mut ctx, CAROL, M1, ISOLATED);
     set_leverage(&mut ctx, ALICE, M1, 3);
@@ -731,7 +721,6 @@ fn adl_fills(logs: &[Log]) -> Vec<(Address, u64, u64)> {
 #[test]
 fn one_tick_liquidates_a_crossed_account_and_an_isolated_position() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_type(&mut ctx, CAROL, M1, ISOLATED);
     set_leverage(&mut ctx, ALICE, M1, 3);
@@ -780,7 +769,6 @@ fn one_tick_liquidates_a_crossed_account_and_an_isolated_position() {
 #[test]
 fn an_isolated_liquidation_close_never_folds_a_failing_cross_leg() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
     }
@@ -833,7 +821,6 @@ fn adl_scene(ctx: &mut TestCtx, alice_wallet: i64) {
 #[test]
 fn adl_ranks_a_cross_winner_on_its_account_and_settles_it_into_the_wallet() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     adl_scene(&mut ctx, WALLET);
     let ledger = Ledger::open(&mut ctx);
     let w0 = wallet(&mut ctx, ALICE);
@@ -873,7 +860,6 @@ fn adl_ranks_a_cross_winner_on_its_account_and_settles_it_into_the_wallet() {
 #[test]
 fn adl_holds_an_underwater_cross_winner_back_to_the_fallback_tier() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     adl_scene(&mut ctx, 1_000 * USD);
     // ALICE's other cross leg: a long of 20 on M2, marked down $1,200 — E goes below zero.
     set_type(&mut ctx, BOB, M2, ISOLATED);
@@ -908,7 +894,6 @@ fn adl_holds_an_underwater_cross_winner_back_to_the_fallback_tier() {
 #[test]
 fn j6_a_taker_isolated_silo_is_funded_from_the_wallet_only() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
     }
@@ -959,7 +944,6 @@ fn j6_a_taker_isolated_silo_is_funded_from_the_wallet_only() {
 #[test]
 fn j6_a_maker_isolated_silo_stays_capped_at_the_cash_at_hand() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
     }
@@ -998,7 +982,6 @@ fn transfer_in(amount: u64) -> Vec<u8> {
 #[test]
 fn a_negative_cross_wallet_and_cross_profit_never_leave_through_the_money_out_gates() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
         set_type(&mut ctx, CAROL, m, ISOLATED);
@@ -1071,7 +1054,6 @@ fn a_negative_cross_wallet_and_cross_profit_never_leave_through_the_money_out_ga
 #[test]
 fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         let mut mk = storage::load_market(&mut ctx, m).unwrap().unwrap();
         mk.liquidation_fee_rate_bps = 50; // a live clearance fee: wallet → fund, inside the identity
@@ -1252,8 +1234,9 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
 
 /// Every P2b branch keys on the margin type IN FORCE, so with cross margin gated off (forced off,
 /// as before the flip) a position that still STORES the CROSSED default must behave exactly as one
-/// explicitly switched to ISOLATED with the gate on: the same call outcomes (revert flag, return bytes, gas), the same
-/// event stream byte for byte, and the same stored state (bar the stored type byte itself). The
+/// explicitly switched to ISOLATED with the gate on: the same call outcomes (revert flag, return
+/// bytes, gas), the same event stream byte for byte, and the same stored state (bar the stored
+/// type byte itself). The
 /// scenario walks every money path this slice touched — taker and maker fills with fees, a flip, a
 /// funding settle, the four money-out gates (accepted and refused), a margin top-up, an oracle tick
 /// that liquidates and ADLs, and a manual `liquidate()` refusal.
@@ -1328,7 +1311,6 @@ fn gated_off_every_money_path_is_byte_identical_to_explicitly_isolated() {
     // Gated on, every slot ISOLATED by choice.
     let mut isolated = make_ctx();
     let (isolated_outs, isolated_logs, isolated_state) = {
-        let _cross = crate::margin_type::test_gate::enable();
         for u in USERS {
             for m in MARKETS {
                 set_type(&mut isolated, u, m, ISOLATED);

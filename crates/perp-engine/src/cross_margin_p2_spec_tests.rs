@@ -208,12 +208,6 @@ fn gate() -> bool {
     crate::margin_type::cross_margin_enabled()
 }
 
-/// The spec's `#[cfg(test)]` override, for this thread, until the guard drops.
-type CrossOn = crate::margin_type::test_gate::Guard;
-
-fn cross_on() -> CrossOn {
-    crate::margin_type::test_gate::enable()
-}
 
 fn make_ctx() -> TestCtx {
     let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
@@ -250,7 +244,7 @@ fn the_market(id: u64) -> Market {
 
 /// Three markets with their tier tables set THROUGH THE ABI, fee rates set through the ABI, every
 /// account enrolled with a $1e9 perp wallet. Every account's stored margin type is the default
-/// (CROSSED); nothing is in force until a test takes the gate.
+/// (CROSSED), in force under the real gate.
 fn fresh() -> TestCtx {
     USERS.with(|u| u.borrow_mut().clear());
     let mut ctx = make_ctx();
@@ -324,12 +318,11 @@ fn flag(ctx: &mut TestCtx, u: Address, on: bool) {
     let _ = take_logs(ctx);
 }
 
-/// Gate-on setup used by most scenarios: DAVE CROSSED everywhere (the default), CAROL ISOLATED
-/// everywhere, ALICE CROSSED on M1/M2 and ISOLATED on M3, BOB CROSSED on M1/M3 and ISOLATED on M2,
-/// ERIN and ADMIN at the default. Leverage: ALICE 20/10/5, BOB 10/5/5, CAROL 10/5/5, ERIN 10/5/5,
-/// DAVE 1/1/1.
-fn crossed_world() -> (CrossOn, TestCtx) {
-    let g = cross_on();
+/// The setup most scenarios use, under the real gate (cross margin as it ships): DAVE CROSSED
+/// everywhere (the default), CAROL ISOLATED everywhere, ALICE CROSSED on M1/M2 and ISOLATED on M3,
+/// BOB CROSSED on M1/M3 and ISOLATED on M2, ERIN and ADMIN at the default. Leverage: ALICE
+/// 20/10/5, BOB 10/5/5, CAROL 10/5/5, ERIN 10/5/5, DAVE 1/1/1.
+fn crossed_world() -> TestCtx {
     let mut ctx = fresh();
     for m in MARKETS {
         set_type(&mut ctx, CAROL, m, ISOLATED);
@@ -344,7 +337,7 @@ fn crossed_world() -> (CrossOn, TestCtx) {
             set_lev(&mut ctx, u, m, l);
         }
     }
-    (g, ctx)
+    ctx
 }
 
 // ── The spec model (§3.2) ───────────────────────────────────────────────────────────────────
@@ -1077,7 +1070,7 @@ fn model_reproduces_the_reports_formulas() {
 /// negative W backed by cross profit, and a final close.
 #[test]
 fn walk_scripted_three_markets_mixed_cross_and_isolated() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     set_wallet(ctx, ALICE, (50_000 * USD) as i64);
     set_wallet(ctx, BOB, (20_000 * USD) as i64);
@@ -1204,7 +1197,7 @@ impl Rng {
 /// reached.
 #[test]
 fn walk_randomised_mixed_accounts_keep_the_model_and_custody() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     for (u, w) in [(ALICE, 6_000), (BOB, 4_000), (CAROL, 4_000)] {
         set_wallet(ctx, u, (w * USD) as i64);
@@ -1446,7 +1439,7 @@ fn walk_randomised_mixed_accounts_keep_the_model_and_custody() {
 /// isolated basis: `E = cWB = W`, `A = W − Σ ooIM`, `X = max(0, A)` (§3.2, last line).
 #[test]
 fn f_an_isolated_only_account_reads_the_isolated_basis() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, CAROL, M1, 10, 1_000);
     rest(ctx, CAROL, M1, BUY, 900, 2);
@@ -1469,7 +1462,7 @@ fn f_an_isolated_only_account_reads_the_isolated_basis() {
 /// `X = min(cWB − ΣMM, A) = min(300 − 275, 750) = 25` is all that leaves.
 #[test]
 fn f_cross_profit_backs_orders_but_does_not_withdraw() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M1, 10, 1_000);
     tick(ctx, M1, 1_100);
@@ -1494,7 +1487,7 @@ fn f_cross_profit_backs_orders_but_does_not_withdraw() {
 /// exactly where the fill alone puts them. An ISOLATED position's pending funding is not in `cWB`.
 #[test]
 fn f_pending_funding_is_in_cwb_and_settling_it_moves_no_account_number() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     enable_funding(ctx, M1, 500);
     fill(ctx, ALICE, M1, 10, 1_000);
@@ -1531,7 +1524,7 @@ fn f_pending_funding_is_in_cwb_and_settling_it_moves_no_account_number() {
 /// sweep and ADL — which fold the account — run through it without an error.
 #[test]
 fn f_a_zero_mark_cross_leg_contributes_nothing_and_stays_total() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     make(ctx, ALICE, M2, -5, 500); // cross short, vQuote +2,500
     fill(ctx, ALICE, M1, -4, 1_000); // cross short: the ADL winner below
@@ -1561,7 +1554,7 @@ fn f_a_zero_mark_cross_leg_contributes_nothing_and_stays_total() {
 /// (uPnL −300, MM 115). And it MOVES with the other market's mark.
 #[test]
 fn f_the_cross_liquidation_price_is_binances_lp1() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M1, 10, 1_000);
     fill(ctx, ALICE, M2, -4, 500);
@@ -1585,7 +1578,7 @@ fn f_the_cross_liquidation_price_is_binances_lp1() {
 /// (updateMarket, setMarginTiers, setBasisMode) — `cWB` keeps matching the FundingState index.
 #[test]
 fn f_the_funding_mirror_survives_market_admin_calls() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     enable_funding(ctx, M1, 400);
     fill(ctx, ALICE, M1, 10, 1_000);
@@ -1623,7 +1616,7 @@ fn f_the_funding_mirror_survives_market_admin_calls() {
 /// is the fee; an isolated open on the same account moves its silo out of `W`.
 #[test]
 fn fill_a_cross_open_moves_no_cash_and_pays_its_fee_from_w() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     let w0 = wallet(ctx, ALICE);
     fill(ctx, ALICE, M1, 10, 1_000);
@@ -1650,7 +1643,7 @@ fn fill_a_cross_open_moves_no_cash_and_pays_its_fee_from_w() {
 /// receivable that stands until then.
 #[test]
 fn fill_a_cross_close_settles_either_sign_into_w_with_no_bad_debt() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M3, 1, 200);
     // Profit, as a taker: 10 long from 1,000 closed at 1,050.
@@ -1689,7 +1682,7 @@ fn fill_a_cross_close_settles_either_sign_into_w_with_no_bad_debt() {
 /// one fee on the whole notional.
 #[test]
 fn fill_a_cross_flip_closes_and_reopens_in_one_fill() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M1, 10, 1_000);
     let w0 = wallet(ctx, ALICE);
@@ -1709,7 +1702,7 @@ fn fill_a_cross_flip_closes_and_reopens_in_one_fill() {
 /// close, a maker close, either type — and ignores resting orders (Q8 bookkeeping).
 #[test]
 fn fill_the_open_position_count_follows_every_zero_crossing() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     let count = |ctx: &mut TestCtx| storage::load_account(ctx, ALICE).unwrap().open_position_count;
     rest(ctx, ALICE, M2, BUY, 400, 1);
@@ -1739,7 +1732,7 @@ fn fill_the_open_position_count_follows_every_zero_crossing() {
 /// carries its `PositionChanged` with the moved silo. A charge beyond the wallet takes it negative.
 #[test]
 fn fund_cross_funding_is_a_balance_only_push_into_w() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     enable_funding(ctx, M1, 500);
     fill(ctx, ALICE, M1, 10, 1_000);
@@ -1787,7 +1780,7 @@ fn funding_of(logs: &[Log], u: Address) -> i128 {
 /// both sides — the sign follows `calc_funding_payment`, on the wallet.
 #[test]
 fn fund_cross_funding_credits_and_charges_the_wallet_either_sign() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     enable_funding(ctx, M2, 500);
     fill(ctx, ALICE, M2, -10, 500); // short receives at +500
@@ -1820,7 +1813,7 @@ fn zero_fees(ctx: &mut TestCtx, u: Address) {
 /// requirement, and a cross open's requirement is its PIM).
 #[test]
 fn gate_a_cross_taker_open_needs_a_post_to_cover_its_fee() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     // 10 at the mark on M1, leverage 20: uPnL 0, PIM 500, fee 5 — so W ≥ 505.
     let need = ceil_div(val(1_000, 10), 20) + fee(val(1_000, 10), TAKER_PPM);
@@ -1845,14 +1838,14 @@ fn gate_a_cross_taker_open_needs_a_post_to_cover_its_fee() {
 /// The J1 fixture: ALICE short 39 on M2 at leverage 10 (inside the first bracket at 500), the mark
 /// carried to 1,100. Now `N = 42,900`: `MM = 20,000·5 % + 22,900·15 % = 4,435 > PIM = 4,290`, and
 /// the leg is $23,400 under water — an account `A` can admit while it sits under maintenance.
-fn j1_fixture() -> (CrossOn, TestCtx) {
-    let (g, mut ctx) = crossed_world();
+fn j1_fixture() -> TestCtx {
+    let mut ctx = crossed_world();
     fill(&mut ctx, ALICE, M2, -39, 500);
     tick(&mut ctx, M2, 1_100);
     let md = model(&mut ctx, ALICE);
     assert_eq!((md.leg(M2).mm, md.leg(M2).pim), (4_435 * USD, 4_290 * USD));
     assert_eq!(md.leg(M2).upnl, -23_400 * USD);
-    (g, ctx)
+    ctx
 }
 
 /// J1: an opening taker fill must leave `E_post − draw ≥ Σ_C MM_post` (equality healthy, §1.5 /
@@ -1861,7 +1854,7 @@ fn j1_fixture() -> (CrossOn, TestCtx) {
 /// `A_post = W − 23,400 − 4,290 − 50 ≈ 120 ≥ fee`.
 #[test]
 fn gate_j1_holds_a_cross_open_to_account_maintenance_to_the_unit() {
-    let (_g, mut ctx) = j1_fixture();
+    let mut ctx = j1_fixture();
     let ctx = &mut ctx;
     let w_star = 4_435 * USD + 25 * USD + fee(val(1_000, 1), TAKER_PPM) + 23_400 * USD;
     rest(ctx, DAVE, M1, SELL, 1_000, 1);
@@ -1880,7 +1873,7 @@ fn gate_j1_holds_a_cross_open_to_account_maintenance_to_the_unit() {
 /// falls by the draw (1 on M3 at leverage 5: 40 into the silo, the 0.1 fee out of it — draw 40).
 #[test]
 fn gate_j1_holds_an_isolated_open_of_a_cross_account_to_maintenance() {
-    let (_g, mut ctx) = j1_fixture();
+    let mut ctx = j1_fixture();
     let ctx = &mut ctx;
     let w_star = 4_435 * USD + 40 * USD + 23_400 * USD;
     rest(ctx, DAVE, M3, SELL, 200, 1);
@@ -1897,7 +1890,7 @@ fn gate_j1_holds_an_isolated_open_of_a_cross_account_to_maintenance() {
 /// under maintenance with `A < 0` reduces by taker order, and stays under; an OPEN is refused.
 #[test]
 fn gate_a_pure_reduce_is_not_held_to_j1() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     zero_fees(ctx, ERIN);
     set_lev(ctx, ERIN, M2, 10);
@@ -1919,7 +1912,7 @@ fn gate_a_pure_reduce_is_not_held_to_j1() {
 /// (leverage 20) adds ooIM 90, so it rests from `W = −310` up, a NEGATIVE wallet.
 #[test]
 fn gate_the_resting_order_gate_reads_a_with_cross_profit_to_the_unit() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M2, 10, 500);
     tick(ctx, M2, 600);
@@ -1942,7 +1935,7 @@ fn gate_the_resting_order_gate_reads_a_with_cross_profit_to_the_unit() {
 ///     itself is worth +100 uPnL = its own PIM, so `A_post = W ≥ fee 0.95` admits it from W = 0.95.
 #[test]
 fn gate_the_pre_walk_filter_does_not_refuse_cross_backed_orders() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M2, 10, 500);
     tick(ctx, M2, 600);
@@ -1950,10 +1943,7 @@ fn gate_the_pre_walk_filter_does_not_refuse_cross_backed_orders() {
     rest(ctx, ALICE, M1, BUY, 900, 5);
     assert_eq!(model(ctx, ALICE).a, (1 + 1_000 - 600 - 225) * USD);
 
-    let (_g2, mut ctx) = {
-        drop(_g);
-        crossed_world()
-    };
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     let f = fee(val(950, 2), TAKER_PPM);
     rest(ctx, DAVE, M1, SELL, 950, 2);
@@ -1969,7 +1959,7 @@ fn gate_the_pre_walk_filter_does_not_refuse_cross_backed_orders() {
 /// `ΔIM = ΔPIM + ΔooIM ≤ A`. ISOLATED keeps its rule (no lowering under a position).
 #[test]
 fn gate_cross_set_leverage_lowers_against_a_and_raises_freely() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M1, 10, 1_000); // PIM 500 at 20×
     // 20× → 10×: ΔIM = 500, so A = W − 500 must cover it: W ≥ 1,000.
@@ -1997,22 +1987,22 @@ fn gate_cross_set_leverage_lowers_against_a_and_raises_freely() {
 
 /// The X fixture: ALICE cross long 10 on M1 at +$1,000 (MM 275, PIM 550), an ISOLATED long of 5 on
 /// M3, W = $1,275 — so `A = 1,275 + 1,000 − 550 = 1,725` but `X = min(1,275 − 275, A) = 1,000`.
-fn x_fixture() -> (CrossOn, TestCtx) {
-    let (g, mut ctx) = crossed_world();
+fn x_fixture() -> TestCtx {
+    let mut ctx = crossed_world();
     fill(&mut ctx, ALICE, M1, 10, 1_000);
     fill(&mut ctx, ALICE, M3, 5, 200);
     tick(&mut ctx, M1, 1_100);
     set_wallet(&mut ctx, ALICE, (1_275 * USD) as i64);
     let md = model(&mut ctx, ALICE);
     assert_eq!((md.a, md.x), (1_725 * USD, 1_000 * USD));
-    (g, ctx)
+    ctx
 }
 
 /// §3.3 item 8: add/remove position margin on a CROSSED market is `-4049` (with or without a
 /// position); an isolated add is capped by X (`-4050`), not by A.
 #[test]
 fn gate_position_margin_is_4049_on_crossed_and_x_capped_on_isolated() {
-    let (_g, mut ctx) = x_fixture();
+    let mut ctx = x_fixture();
     let ctx = &mut ctx;
     let add =
         |m: u64, a: i128| addPositionMarginCall { marketId: m, amount: a as u64 }.abi_encode();
@@ -2035,7 +2025,7 @@ fn gate_position_margin_is_4049_on_crossed_and_x_capped_on_isolated() {
 /// nothing out.
 #[test]
 fn gate_every_money_out_gate_stops_at_x() {
-    let (_g, mut ctx) = x_fixture();
+    let mut ctx = x_fixture();
     let ctx = &mut ctx;
     let x = 1_000 * USD;
     rejected(ctx, ALICE, &transferFromPerpCall { amount: (x + 1) as u64 }.abi_encode(), E_OUT);
@@ -2068,7 +2058,7 @@ fn gate_every_money_out_gate_stops_at_x() {
 /// silo of 120.
 #[test]
 fn gate_j6_an_isolated_taker_silo_is_funded_from_wallet_cash_only() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M1, 10, 1_000);
     tick(ctx, M1, 1_100); // +1,000 cross profit
@@ -2087,7 +2077,7 @@ fn gate_j6_an_isolated_taker_silo_is_funded_from_wallet_cash_only() {
 /// max(W, 0))` — here W = 70 against a requirement of 120 — and never from cross profit.
 #[test]
 fn gate_j6_an_isolated_maker_silo_is_capped_at_the_cash_at_hand() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M1, 10, 1_000);
     tick(ctx, M1, 1_100);
@@ -2103,7 +2093,7 @@ fn gate_j6_an_isolated_maker_silo_is_capped_at_the_cash_at_hand() {
 /// the account under maintenance (a bid at 1,000 hit with the mark at 960).
 #[test]
 fn gate_a_cross_maker_fill_is_not_checked_against_the_account() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     set_wallet(ctx, ALICE, (500 * USD) as i64);
     rest(ctx, ALICE, M1, BUY, 1_000, 10); // ooIM 500 = A
@@ -2224,7 +2214,7 @@ fn item(m: u64, side: u8, price: u64, qty: u64, flags: u8) -> PlaceItem {
 /// Nobody else is affected, and clearing the flag lifts it all.
 #[test]
 fn gate_in_liquidation_only_reducing_orders_on_every_entrypoint() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     let sk = register_key(ctx, ALICE);
     fill(ctx, ALICE, M1, 10, 1_000);
@@ -2319,7 +2309,7 @@ fn gate_in_liquidation_only_reducing_orders_on_every_entrypoint() {
 /// same way; a reduce-only order goes through.
 #[test]
 fn gate_in_liquidation_reaches_a_sub_account_through_its_master() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     let c = ok(ctx, ALICE, &createSubAccountCall { name: "s".into() }.abi_encode());
     let sub = createSubAccountCall::abi_decode_returns(&c.out.bytes).unwrap();
@@ -2354,7 +2344,7 @@ fn gate_in_liquidation_reaches_a_sub_account_through_its_master() {
 /// position in the same tick is liquidated per position as always.
 #[test]
 fn liq_the_sweep_and_liquidate_judge_a_crossed_position_on_its_account() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     fill(ctx, ALICE, M1, 10, 1_000);
     set_lev(ctx, CAROL, M1, 20);
@@ -2402,7 +2392,7 @@ fn liq_the_sweep_and_liquidate_judge_a_crossed_position_on_its_account() {
 #[test]
 fn liq_adl_ranks_a_cross_winner_on_its_account_equity() {
     fn run_with(bob_wallet: i128) -> Vec<Address> {
-        let (_g, mut ctx) = crossed_world();
+        let mut ctx = crossed_world();
         let ctx = &mut ctx;
         set_lev(ctx, CAROL, M1, 20);
         fill(ctx, CAROL, M1, 4, 1_000);
@@ -2432,7 +2422,7 @@ fn liq_adl_ranks_a_cross_winner_on_its_account_equity() {
 /// (isolated, ROE 400 / 2,398) is clean: she is ADL'd first and takes all 4; BOB is untouched.
 #[test]
 fn liq_adl_prefers_a_clean_winner_to_a_cross_winner_the_fill_takes_negative() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     set_lev(ctx, CAROL, M1, 20);
     fill(ctx, CAROL, M1, 4, 1_000);
@@ -2457,7 +2447,7 @@ fn liq_adl_prefers_a_clean_winner_to_a_cross_winner_the_fill_takes_negative() {
 /// zero margin, its fill settled into W, the identity intact.
 #[test]
 fn liq_adl_against_a_cross_winner_at_non_positive_equity_is_total() {
-    let (_g, mut ctx) = crossed_world();
+    let mut ctx = crossed_world();
     let ctx = &mut ctx;
     set_lev(ctx, CAROL, M1, 20);
     fill(ctx, CAROL, M1, 4, 1_000);
@@ -2564,7 +2554,6 @@ fn gated_an_isolated_scenario_is_byte_identical_with_the_gate_on_and_everyone_is
     let refusals = rec_a.iter().filter(|o| o.0).count();
     assert!(liquidations >= 2 && adls >= 1 && fundings >= 4 && refusals >= 2, "scenario coverage");
 
-    let _g = cross_on();
     let mut b = fresh();
     for u in [ALICE, BOB, CAROL, DAVE, ERIN, ADMIN] {
         for m in MARKETS {

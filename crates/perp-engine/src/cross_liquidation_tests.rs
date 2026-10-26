@@ -120,10 +120,10 @@ fn market(id: u64) -> Market {
     }
 }
 
-/// Cross margin on (the test override); every account but ALICE switched to ISOLATED everywhere,
-/// so ALICE is the only CROSSED account unless a test says otherwise.
-fn make_ctx() -> (crate::margin_type::test_gate::Guard, TestCtx) {
-    let gate = crate::margin_type::test_gate::enable();
+/// Cross margin as it ships (the real gate); every account but ALICE switched to ISOLATED
+/// everywhere, so ALICE — at the default — is the only CROSSED account unless a test says
+/// otherwise.
+fn make_ctx() -> TestCtx {
     let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
     for a in [USDC_ADDRESS, PERP_DEX_ADDRESS].into_iter().chain(USERS) {
         JournalTr::load_account(ctx.journal_mut(), a).unwrap();
@@ -146,7 +146,7 @@ fn make_ctx() -> (crate::margin_type::test_gate::Guard, TestCtx) {
     for m in MARKETS {
         set_leverage(&mut ctx, ALICE, m, 3);
     }
-    (gate, ctx)
+    ctx
 }
 
 fn call(ctx: &mut TestCtx, caller: Address, input: &[u8]) -> PerpOutput {
@@ -382,7 +382,7 @@ fn long_10_on_m1(ctx: &mut TestCtx, w: i64) {
 /// `Liquidation` (marginType 0), `Ended` with the values that ended it.
 #[test]
 fn a_partial_cross_liquidation_stops_once_the_account_is_back_at_maintenance() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     long_10_on_m1(&mut ctx, usd(300));
     rest(&mut ctx, MAKER, M1, BUY, px(80), 4);
     let ledger = Ledger::open(&mut ctx);
@@ -434,7 +434,7 @@ fn a_partial_cross_liquidation_stops_once_the_account_is_back_at_maintenance() {
 /// wallet → insurance fund.
 #[test]
 fn a_cross_liquidation_the_book_absorbs_closes_the_position_and_charges_the_notional_fee() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_fee_rate(&mut ctx, M1, 125);
     long_10_on_m1(&mut ctx, usd(300));
     rest(&mut ctx, MAKER, M1, BUY, px(80), 10);
@@ -456,7 +456,7 @@ fn a_cross_liquidation_the_book_absorbs_closes_the_position_and_charges_the_noti
 /// `E_after = $5`, so the $10 fee due is cut to $5 and the wallet ends at exactly 0.
 #[test]
 fn a_cross_clearance_fee_is_capped_at_the_post_close_equity() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_fee_rate(&mut ctx, M1, 125);
     long_10_on_m1(&mut ctx, usd(205));
     rest(&mut ctx, MAKER, M1, BUY, px(80), 10);
@@ -475,7 +475,7 @@ fn a_cross_clearance_fee_is_capped_at_the_post_close_equity() {
 /// economically neutral for him — and ALICE keeps her `E`.
 #[test]
 fn the_unfilled_rest_is_adld_at_the_mark_while_the_account_has_equity() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     long_10_on_m1(&mut ctx, usd(300));
     let ledger = Ledger::open(&mut ctx);
 
@@ -497,7 +497,7 @@ fn the_unfilled_rest_is_adld_at_the_mark_while_the_account_has_equity() {
 /// leg fills nothing. The 1.25% fee is due on $900 of notional but capped at `E_after = 0`.
 #[test]
 fn a_bankrupt_account_is_adld_at_its_bankruptcy_price_and_pays_no_fee() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_fee_rate(&mut ctx, M1, 125);
     long_10_on_m1(&mut ctx, usd(100));
     rest(&mut ctx, MAKER, M1, BUY, px(80), 10);
@@ -526,7 +526,7 @@ fn a_bankrupt_account_is_adld_at_its_bankruptcy_price_and_pays_no_fee() {
 /// which already restores the account — a partial liquidation.
 #[test]
 fn the_ioc_limit_is_clamped_into_the_price_band() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     let mut mk = storage::load_market(&mut ctx, M1).unwrap().unwrap();
     mk.price_band_bps = 500;
     storage::save_market(&mut ctx, &mk).unwrap();
@@ -565,7 +565,7 @@ fn longs_on_m1_and_m2(ctx: &mut TestCtx, w: i64) {
 /// and ALICE's wallet ends at zero, not below.
 #[test]
 fn a_bankrupt_multi_market_account_splits_its_deficit_by_maintenance_margin() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     longs_on_m1_and_m2(&mut ctx, usd(200));
     set_mark(&mut ctx, M2, px(90));
     let ledger = Ledger::open(&mut ctx);
@@ -594,7 +594,7 @@ fn a_bankrupt_multi_market_account_splits_its_deficit_by_maintenance_margin() {
 /// registry and finishes the job.
 #[test]
 fn a_stale_market_is_skipped_and_its_own_tick_resumes_the_episode() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     longs_on_m1_and_m2(&mut ctx, usd(200));
     set_mark(&mut ctx, M2, px(90));
     ctx.block.timestamp = U256::from(10_000);
@@ -636,7 +636,7 @@ fn a_stale_market_is_skipped_and_its_own_tick_resumes_the_episode() {
 /// touched.
 #[test]
 fn the_account_is_caught_on_the_tick_of_the_market_that_moved_which_closes_first() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 20);
     trade(&mut ctx, M2, ALICE, CAROL, BUY, px(100), 5);
     set_wallet(&mut ctx, ALICE, usd(550));
@@ -665,7 +665,7 @@ fn the_account_is_caught_on_the_tick_of_the_market_that_moved_which_closes_first
 /// closes CROSS positions only.
 #[test]
 fn a_mixed_account_has_every_order_cancelled_and_its_isolated_position_untouched() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_type(&mut ctx, ALICE, M2, ISOLATED);
     set_leverage(&mut ctx, ALICE, M2, 1);
     trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
@@ -737,7 +737,7 @@ fn a_mixed_account_has_every_order_cancelled_and_its_isolated_position_untouched
 /// cancelled, both markets close, the flag clears and the bit is cleared with nothing left.
 #[test]
 fn an_episode_out_of_budget_records_a_continuation_the_drain_resumes() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
     trade(&mut ctx, M2, ALICE, CAROL, BUY, px(100), 10);
     for m in MARKETS {
@@ -850,7 +850,7 @@ fn deposit(ctx: &mut TestCtx, ledger: &mut Ledger, user: Address, amount: i64) -
 /// drain finds nothing left and clears it.
 #[test]
 fn an_interrupted_episode_resumes_on_the_tick_of_another_market() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     longs_on_m1_and_m2(&mut ctx, WALLET);
     for m in MARKETS {
         rest(&mut ctx, ALICE, m, BUY, px(50), 1);
@@ -893,7 +893,7 @@ fn an_interrupted_episode_resumes_on_the_tick_of_another_market() {
 /// again.
 #[test]
 fn a_deposit_cures_a_flagged_account_and_the_next_tick_ends_the_episode() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     longs_on_m1_and_m2(&mut ctx, WALLET);
     rest(&mut ctx, ALICE, M3, BUY, px(50), 1);
     set_wallet(&mut ctx, ALICE, usd(300));
@@ -946,7 +946,7 @@ fn a_deposit_cures_a_flagged_account_and_the_next_tick_ends_the_episode() {
 /// drain then finds her healthy and ends the episode with one write.
 #[test]
 fn a_reduce_only_fill_while_flagged_restores_the_account_and_the_drain_ends_it() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     long_10_on_m1(&mut ctx, WALLET);
     rest(&mut ctx, ALICE, M2, BUY, px(50), 1);
     let m3_bid = rest(&mut ctx, ALICE, M3, BUY, px(50), 1);
@@ -995,7 +995,7 @@ fn a_reduce_only_fill_while_flagged_restores_the_account_and_the_drain_ends_it()
 /// ends the episode.
 #[test]
 fn a_stopped_oracle_holds_the_market_until_it_publishes_again() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     longs_on_m1_and_m2(&mut ctx, usd(200));
     set_mark(&mut ctx, M2, px(90));
     ctx.block.timestamp = U256::from(10_000);
@@ -1037,7 +1037,7 @@ fn a_stopped_oracle_holds_the_market_until_it_publishes_again() {
 /// the caller as liquidator.
 #[test]
 fn liquidate_judges_the_account_and_starts_the_episode_at_the_given_market() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     longs_on_m1_and_m2(&mut ctx, usd(400));
     rejects(
         &mut ctx,
@@ -1065,7 +1065,7 @@ fn liquidate_judges_the_account_and_starts_the_episode_at_the_given_market() {
 /// there is still "no open position".
 #[test]
 fn liquidate_ends_a_recovered_flag_through_any_market() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
     rejects(
         &mut ctx,
@@ -1094,7 +1094,7 @@ fn liquidate_ends_a_recovered_flag_through_any_market() {
 /// about cross exposure. She may open again at once.
 #[test]
 fn the_flag_ends_with_the_last_cross_position_closed_by_any_route() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_type(&mut ctx, ALICE, M3, ISOLATED);
     set_leverage(&mut ctx, ALICE, M3, 1);
     trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
@@ -1129,7 +1129,7 @@ fn the_flag_ends_with_the_last_cross_position_closed_by_any_route() {
 #[test]
 fn a_fired_stop_or_an_adl_fill_closing_the_last_cross_position_ends_the_episode() {
     // A fired stop.
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     long_10_on_m1(&mut ctx, usd(400));
     ok(
         &mut ctx,
@@ -1158,7 +1158,7 @@ fn a_fired_stop_or_an_adl_fill_closing_the_last_cross_position_ends_the_episode(
     drop(ctx);
 
     // An ADL fill against the flagged account.
-    let (_g2, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_leverage(&mut ctx, CAROL, M1, 3);
     trade(&mut ctx, M1, CAROL, ALICE, BUY, px(100), 4);
     storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
@@ -1200,7 +1200,7 @@ fn trade_at(
 /// (`−20 / 9,980` is the larger). Both are clean for their 2 at $6.67 a unit over the mark.
 #[test]
 fn adl_ranks_a_losing_cross_winner_by_upnl_times_e_over_n_squared() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_type(&mut ctx, BOB, M1, CROSSED);
     set_leverage(&mut ctx, BOB, M1, 3);
     set_leverage(&mut ctx, CAROL, M1, 3);
@@ -1235,7 +1235,7 @@ fn adl_ranks_a_losing_cross_winner_by_upnl_times_e_over_n_squared() {
 /// she is ADL'd first; KEEPER (ISOLATED, short 2 from $62, ROE `+$4 / $128`) is not reached.
 #[test]
 fn adl_clean_tier_is_judged_on_the_fill_not_the_whole_position() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_leverage(&mut ctx, CAROL, M1, 3);
     set_leverage(&mut ctx, KEEPER, M1, 1);
     trade(&mut ctx, M1, CAROL, MAKER, BUY, px(100), 2);
@@ -1261,7 +1261,7 @@ fn adl_clean_tier_is_judged_on_the_fill_not_the_whole_position() {
 /// only come from ALICE, who takes it as fallback tier.
 #[test]
 fn adl_a_cross_fill_the_account_cannot_carry_goes_behind_the_clean_tier() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_leverage(&mut ctx, CAROL, M1, 3);
     set_leverage(&mut ctx, KEEPER, M1, 1);
     trade(&mut ctx, M1, CAROL, MAKER, BUY, px(100), 8);
@@ -1333,7 +1333,7 @@ fn underwater_long(ctx: &mut TestCtx) {
 /// of the call clears it.
 #[test]
 fn a_user_close_of_the_last_position_clears_the_negative_wallet() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     underwater_long(&mut ctx);
     rest(&mut ctx, MAKER, M1, BUY, px(70), 10);
     let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
@@ -1349,7 +1349,7 @@ fn a_user_close_of_the_last_position_clears_the_negative_wallet() {
 /// filled by a taker at $70.
 #[test]
 fn a_maker_close_of_the_last_position_clears_the_negative_wallet() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     long_10_on_m1(&mut ctx, usd(200));
     rest_flags(&mut ctx, ALICE, M1, SELL, px(70), 10, RO);
     set_mark(&mut ctx, M1, px(70));
@@ -1366,7 +1366,7 @@ fn a_maker_close_of_the_last_position_clears_the_negative_wallet() {
 /// $70 — BEFORE the liquidation sweep, which then finds no position — and sells into the $70 bid.
 #[test]
 fn a_fired_stop_closing_the_last_position_clears_the_negative_wallet() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     long_10_on_m1(&mut ctx, usd(200));
     ok(
         &mut ctx,
@@ -1405,7 +1405,7 @@ fn a_fired_stop_closing_the_last_position_clears_the_negative_wallet() {
 /// left), and the end of the call clears the rest. (A bankrupt account pays no clearance fee.)
 #[test]
 fn a_cross_episode_closing_through_the_band_clears_the_negative_wallet() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_fee_rate(&mut ctx, M1, 125);
     let mut mk = storage::load_market(&mut ctx, M1).unwrap().unwrap();
     mk.price_band_bps = 1_000;
@@ -1431,7 +1431,7 @@ fn a_cross_episode_closing_through_the_band_clears_the_negative_wallet() {
 /// resumes it — cancels the rest, closes M1 through the band — and its call clears the wallet.
 #[test]
 fn a_drained_episode_closing_the_last_position_clears_the_negative_wallet() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     let mut mk = storage::load_market(&mut ctx, M1).unwrap().unwrap();
     mk.price_band_bps = 1_000;
     storage::save_market(&mut ctx, &mk).unwrap();
@@ -1478,7 +1478,7 @@ fn a_drained_episode_closing_the_last_position_clears_the_negative_wallet() {
 /// of the call clears it.
 #[test]
 fn an_adl_fill_closing_the_winners_last_position_clears_its_negative_wallet() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_leverage(&mut ctx, CAROL, M1, 3);
     trade(&mut ctx, M1, CAROL, ALICE, BUY, px(100), 4);
     set_wallet(&mut ctx, ALICE, usd(-140));
@@ -1507,7 +1507,7 @@ fn an_adl_fill_closing_the_winners_last_position_clears_its_negative_wallet() {
 #[test]
 fn a_negative_wallet_waits_for_the_last_position_and_nets_the_silo_first() {
     for (close_at, residual) in [(px(100), 0), (px(90), usd(10))] {
-        let (_g, mut ctx) = make_ctx();
+        let mut ctx = make_ctx();
         set_type(&mut ctx, ALICE, M2, ISOLATED);
         set_leverage(&mut ctx, ALICE, M2, 1);
         trade(&mut ctx, M2, ALICE, CAROL, BUY, px(100), 1);
@@ -1556,7 +1556,7 @@ fn a_negative_wallet_waits_for_the_last_position_and_nets_the_silo_first() {
 #[test]
 fn a_short_insurance_fund_pays_what_it_has_and_logs_the_rest_as_depleted() {
     for fund in [usd(40), 0] {
-        let (_g, mut ctx) = make_ctx();
+        let mut ctx = make_ctx();
         underwater_long(&mut ctx);
         rest(&mut ctx, MAKER, M1, BUY, px(70), 10);
         storage::save_insurance_fund(&mut ctx, fund as u64).unwrap();
@@ -1587,7 +1587,7 @@ fn a_short_insurance_fund_pays_what_it_has_and_logs_the_rest_as_depleted() {
 /// no extra row.
 #[test]
 fn a_last_close_with_a_non_negative_wallet_clears_nothing() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     long_10_on_m1(&mut ctx, usd(300));
     set_mark(&mut ctx, M1, px(70));
     rest(&mut ctx, MAKER, M1, BUY, px(70), 10);
@@ -1609,7 +1609,7 @@ fn a_last_close_with_a_non_negative_wallet_clears_nothing() {
 /// skips both — no `Err`, no panic — and the skipped legs are exactly as they were.
 #[test]
 fn the_episode_skips_a_zero_mark_and_an_unpriceable_leg_without_failing() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
     trade(&mut ctx, M2, ALICE, CAROL, BUY, px(100), 1);
     trade(&mut ctx, M3, ALICE, CAROL, BUY, px(100), 1);
@@ -1663,7 +1663,7 @@ impl Rng {
 /// floors: cross episodes, bankrupt ones, and multi-market closes are reached.
 #[test]
 fn a_randomised_multi_market_run_never_panics_and_detection_is_complete() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     for m in MARKETS {
         set_fee_rate(&mut ctx, m, 50);
         // A live 10% band, so a liquidation closes near the mark, as on a real market.
@@ -1855,7 +1855,7 @@ fn a_randomised_multi_market_run_never_panics_and_detection_is_complete() {
 /// cleared, socialised deficits, stale markets skipped.
 #[test]
 fn a_randomised_run_with_deep_negative_wallets_and_an_empty_fund_never_panics() {
-    let (_g, mut ctx) = make_ctx();
+    let mut ctx = make_ctx();
     set_fee_rate(&mut ctx, M2, 125);
     for m in MARKETS {
         let mut mk = storage::load_market(&mut ctx, m).unwrap().unwrap();

@@ -23,9 +23,10 @@
 //!
 //! A child of `cross_settlement_tests`, so it runs on that fixture: two markets on an exact grid
 //! (base 0 decimals, price 2), `USD` = one dollar in quote units, the custody [`Ledger`] re-checked
-//! around every step, and `rejects` asserting a refused call wrote nothing. Every test takes the
-//! `#[cfg(test)]` override (`margin_type::test_gate`); counterparties meant to be ISOLATED are
-//! switched explicitly.
+//! around every step, and `rejects` asserting a refused call wrote nothing. Every test runs on the
+//! real gate (cross margin is live since the P3 flip) — only the gated-off pins force it off
+//! (`margin_type::test_gate::disable`) — and counterparties meant to be ISOLATED are switched
+//! explicitly.
 use super::*;
 use crate::types::{MarginTier, MarginTiers};
 
@@ -88,7 +89,6 @@ fn j1_scene(ctx: &mut TestCtx) {
 #[test]
 fn j1_refuses_an_open_the_available_balance_admits_one_unit_below_maintenance() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     j1_scene(&mut ctx);
     ok(&mut ctx, BOB, &order(M1, SELL, px(100), 5, GTC));
 
@@ -131,7 +131,6 @@ fn j1_refuses_an_open_the_available_balance_admits_one_unit_below_maintenance() 
 #[test]
 fn j1_refuses_an_isolated_open_that_drains_the_cross_wallet_below_maintenance() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     j1_scene(&mut ctx);
     set_type(&mut ctx, ALICE, M1, ISOLATED);
     ok(&mut ctx, BOB, &order(M1, SELL, px(100), 6, GTC));
@@ -170,7 +169,6 @@ fn j1_refuses_an_isolated_open_that_drains_the_cross_wallet_below_maintenance() 
 #[test]
 fn j1_does_not_hold_a_pure_reduce() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     j1_scene(&mut ctx);
     set_wallet(&mut ctx, ALICE, 4_500 * USD);
     assert!(fold(&mut ctx, ALICE).below_cross_maintenance());
@@ -205,7 +203,6 @@ fn j1_does_not_hold_a_pure_reduce() {
 #[test]
 fn r2_an_opening_order_rests_only_at_cross_maintenance() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     j1_scene(&mut ctx);
     let w_edge = 4_000 * USD + 800 * USD;
     let bid = order(M1, BUY, px(90), 5, GTC);
@@ -285,7 +282,6 @@ fn assert_healthy_under_im(ctx: &mut TestCtx) {
 #[test]
 fn a_cross_reduce_is_not_margin_gated_on_a_healthy_account_under_initial_margin() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     healthy_under_im_scene(&mut ctx);
     set_mark(&mut ctx, M1, px(80));
     assert_healthy_under_im(&mut ctx);
@@ -317,7 +313,6 @@ fn a_cross_reduce_is_not_margin_gated_on_a_healthy_account_under_initial_margin(
 #[test]
 fn a_cross_wallet_closes_a_losing_leg_whatever_the_other_legs_initial_margin() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
         set_type(&mut ctx, CAROL, m, ISOLATED);
@@ -352,7 +347,6 @@ fn a_cross_wallet_closes_a_losing_leg_whatever_the_other_legs_initial_margin() {
 #[test]
 fn a_fired_cross_stop_loss_fills_at_a_negative_available_balance() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     healthy_under_im_scene(&mut ctx);
     const STOP_MARKET: u8 = 1;
     ok(&mut ctx, ALICE, &algo(SELL, STOP_MARKET, px(81), 0, 18, RO));
@@ -377,7 +371,6 @@ fn a_fired_cross_stop_loss_fills_at_a_negative_available_balance() {
 #[test]
 fn an_isolated_reduce_on_a_cross_wallet_is_not_margin_gated_either() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
         set_leverage(&mut ctx, CAROL, m, 3);
@@ -441,7 +434,6 @@ fn cancels(logs: &[Log], user: Address) -> Vec<([u8; 32], u8)> {
 #[test]
 fn a_zero_fee_cross_open_is_still_held_to_its_initial_margin() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_leverage(&mut ctx, ALICE, M1, 3);
     set_taker_fee(&mut ctx, ALICE, 0);
@@ -473,7 +465,6 @@ fn a_zero_fee_cross_open_is_still_held_to_its_initial_margin() {
 #[test]
 fn a_zero_fee_cross_open_cancels_its_own_same_side_orders_to_fit() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_leverage(&mut ctx, ALICE, M1, 3);
     set_taker_fee(&mut ctx, ALICE, 0);
@@ -512,7 +503,6 @@ fn trades_with(logs: &[Log], maker: Address) -> usize {
 #[test]
 fn a_cross_maker_fill_is_not_refused_on_account_health() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
         set_type(&mut ctx, CAROL, m, ISOLATED);
@@ -543,7 +533,6 @@ fn a_cross_maker_fill_is_not_refused_on_account_health() {
 #[test]
 fn a_maker_of_an_account_in_liquidation_is_cancelled_not_filled() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
         set_type(&mut ctx, CAROL, m, ISOLATED);
@@ -627,7 +616,6 @@ fn a_maker_of_an_account_in_liquidation_is_cancelled_not_filled() {
 fn the_pre_walk_filter_credits_a_cross_orders_own_open_gain() {
     for side in [BUY, SELL] {
         let mut ctx = make_ctx();
-        let _cross = crate::margin_type::test_gate::enable();
         set_type(&mut ctx, BOB, M1, ISOLATED);
         set_leverage(&mut ctx, ALICE, M1, 3);
         set_wallet(&mut ctx, ALICE, 250 * USD);
@@ -668,7 +656,6 @@ fn the_pre_walk_filter_credits_a_cross_orders_own_open_gain() {
 #[test]
 fn the_pre_walk_filter_still_refuses_a_cross_order_it_can_bound() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_leverage(&mut ctx, ALICE, M1, 3);
     ok(&mut ctx, BOB, &order(M1, SELL, px(90), 10, GTC));
@@ -711,7 +698,6 @@ fn the_pre_walk_filter_still_refuses_a_cross_order_it_can_bound() {
 #[test]
 fn the_resting_gate_reads_a_with_cross_profit_to_the_unit() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
         set_leverage(&mut ctx, ALICE, m, 3);
@@ -750,7 +736,6 @@ fn the_resting_gate_reads_a_with_cross_profit_to_the_unit() {
 fn a_cross_order_pays_its_open_loss_at_placement() {
     for side in [SELL, BUY] {
         let mut ctx = make_ctx();
-        let _cross = crate::margin_type::test_gate::enable();
         let mut mk = storage::load_market(&mut ctx, M1).unwrap().unwrap();
         mk.tiers = MarginTiers::from_tiers(&[MarginTier {
             lower_bound_notional: 0,
@@ -798,7 +783,6 @@ fn a_cross_order_pays_its_open_loss_at_placement() {
 #[test]
 fn the_open_loss_is_charged_on_the_opening_part_only() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, CAROL, M1, ISOLATED);
     set_leverage(&mut ctx, BOB, M1, 3);
     trade(&mut ctx, M1, BOB, CAROL, BUY, px(100), 10);
@@ -1002,7 +986,6 @@ fn algo(side: u8, order_type: u8, trigger: u64, price: u64, qty: u64, flags: u8)
 #[test]
 fn in_liquidation_only_reducing_orders_are_accepted_on_every_entrypoint() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 5);
     ok(&mut ctx, BOB, &order(M1, BUY, px(100), 5, GTC)); // bids for her reducing sells
@@ -1075,7 +1058,6 @@ fn in_liquidation_only_reducing_orders_are_accepted_on_every_entrypoint() {
 fn set_margin_type_refuses_in_liquidation_after_4048_and_before_the_gate() {
     let mut ctx = make_ctx();
     register_alice_key(&mut ctx);
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 1); // a position on M1; M2 flat and order-free
     storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
@@ -1106,7 +1088,6 @@ fn set_margin_type_refuses_in_liquidation_after_4048_and_before_the_gate() {
 
     // Before the gate: with cross margin gated off, CROSSED (not in force, so not -4046) hits
     // -2023 before "not enabled".
-    drop(_cross);
     let off = crate::margin_type::test_gate::disable();
     rejects(&mut ctx, ALICE, &set(M2, CROSSED).abi_encode(), in_liq);
     storage::set_in_liquidation_for_test(&mut ctx, ALICE, false).unwrap();
@@ -1119,7 +1100,6 @@ fn set_margin_type_refuses_in_liquidation_after_4048_and_before_the_gate() {
 
     // Cleared, with the gate on: the switch goes through.
     drop(off);
-    let _cross = crate::margin_type::test_gate::enable();
     ok(&mut ctx, ALICE, &set(M2, ISOLATED).abi_encode());
     assert_eq!(pos(&mut ctx, ALICE, M2).margin_type, ISOLATED);
 }
@@ -1135,7 +1115,6 @@ fn set_margin_type_refuses_in_liquidation_after_4048_and_before_the_gate() {
 #[test]
 fn cross_set_leverage_raises_freely_and_lowers_against_a_to_the_unit() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     set_leverage(&mut ctx, ALICE, M1, 2);
     trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
@@ -1165,7 +1144,6 @@ fn cross_set_leverage_raises_freely_and_lowers_against_a_to_the_unit() {
 #[test]
 fn cross_set_leverage_keeps_the_tier_cap_and_isolated_keeps_its_rule() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
     }
@@ -1213,7 +1191,6 @@ fn remove_margin(market: u64, amount: i64) -> Vec<u8> {
 #[test]
 fn position_margin_on_a_crossed_market_is_4049() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
     trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
     let (add, remove) =
@@ -1232,7 +1209,6 @@ fn position_margin_on_a_crossed_market_is_4049() {
 #[test]
 fn an_isolated_add_is_capped_by_x_to_the_unit_and_remove_is_unchanged() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
     }
@@ -1292,7 +1268,6 @@ fn set_spot(ctx: &mut TestCtx, user: Address, amount: u64) {
 #[test]
 fn every_money_out_gate_stops_at_x_to_the_unit_with_cross_profit() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     for m in MARKETS {
         set_type(&mut ctx, BOB, m, ISOLATED);
     }
@@ -1375,7 +1350,6 @@ fn no_money_out_takes_a_healthy_cross_account_below_maintenance() {
     ];
     for (refused, user, money_out) in gates {
         let mut ctx = make_ctx();
-        let _cross = crate::margin_type::test_gate::enable();
         two_tier_m2(&mut ctx);
         for m in MARKETS {
             set_type(&mut ctx, BOB, m, ISOLATED);
@@ -1482,7 +1456,6 @@ fn gated_off_every_p2c_gate_is_byte_identical_to_explicitly_isolated() {
     // Gated on, every slot ISOLATED by choice.
     let mut isolated = make_ctx();
     let (isolated_outs, isolated_logs, isolated_state) = {
-        let _cross = crate::margin_type::test_gate::enable();
         for u in USERS {
             for m in MARKETS {
                 set_type(&mut isolated, u, m, ISOLATED);

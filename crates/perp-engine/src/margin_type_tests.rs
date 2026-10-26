@@ -185,12 +185,11 @@ fn gated_off_every_surface_reports_isolated_whatever_is_stored() {
     assert_eq!(reported_type(&mut ctx, BOB), ISOLATED);
 }
 
-/// Enabled (the test override): every surface reports the STORED choice — CROSSED for a record
-/// that never chose, ISOLATED once stored — and they agree with each other and with the event.
+/// Enabled (the real gate): every surface reports the STORED choice — CROSSED for a record that
+/// never chose, ISOLATED once stored — and they agree with each other and with the event.
 #[test]
 fn with_cross_enabled_every_surface_reports_the_stored_choice() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     assert!(crate::margin_type::cross_margin_enabled());
     assert_eq!(reported_type(&mut ctx, ALICE), CROSSED, "Binance's default");
 
@@ -533,14 +532,13 @@ fn an_invalid_code_and_an_unknown_market_are_refused_first() {
     rejects(&mut ctx, ALICE, &setMarginTypeCall::SELECTOR, "setMarginType: invalid calldata");
 }
 
-// ── setMarginType: enabled (the test override) ────────────────────────────────
+// ── setMarginType: enabled (the real gate) ────────────────────────────────────
 
 /// The success path, both directions: one write, `MarginTypeChanged` only, the stored choice and
 /// the type in force follow, leverage stays. Asking for the type in force again is `-4046`.
 #[test]
 fn with_cross_enabled_the_switch_succeeds_both_ways() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     ok(&mut ctx, ALICE, &setLeverageCall { marketId: MARKET_ID, leverage: 2 }.abi_encode());
     rejects(&mut ctx, ALICE, &set_type(MARKET_ID, CROSSED), E_NO_NEED);
     switches(&mut ctx, ALICE, ALICE, &set_type(MARKET_ID, ISOLATED), ISOLATED);
@@ -557,7 +555,6 @@ fn with_cross_enabled_the_switch_succeeds_both_ways() {
 #[test]
 fn with_cross_enabled_any_open_order_blocks_the_switch() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     let to_iso = set_type(MARKET_ID, ISOLATED);
     // The counterparty opens on every fill below; see `seed_cross`.
     store_type(&mut ctx, BOB, ISOLATED);
@@ -587,7 +584,6 @@ fn with_cross_enabled_any_open_order_blocks_the_switch() {
 #[test]
 fn with_cross_enabled_the_refusals_come_in_binance_order() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     // A CROSSED long (see `seed_cross`).
     seed_cross(&mut ctx, ALICE, QTY as i64);
     rejects(&mut ctx, ALICE, &set_type(MARKET_ID, ISOLATED), E_POSITION);
@@ -604,7 +600,6 @@ fn with_cross_enabled_the_refusals_come_in_binance_order() {
 #[test]
 fn with_cross_enabled_the_choice_persists_across_close_and_reopen() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     switches(&mut ctx, ALICE, ALICE, &set_type(MARKET_ID, ISOLATED), ISOLATED);
     // The counterparty opens on two of the four fills below; see `seed_cross`.
     store_type(&mut ctx, BOB, ISOLATED);
@@ -634,7 +629,6 @@ fn with_cross_enabled_the_choice_persists_across_close_and_reopen() {
 #[test]
 fn the_signed_switch_succeeds_once_for_the_signing_account() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     let sk = SigningKey::from_bytes(&[0x5a; 32]);
     register_key(&mut ctx, ALICE, &sk);
     let input = signed(&sk, MARKET_ID, ISOLATED);
@@ -698,7 +692,6 @@ fn signed_state_refusals_follow_the_burn_with_the_direct_strings() {
 
     // Enabled: -4047, then -4048 — each from a fresh context so each signature is new.
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     register_key(&mut ctx, ALICE, &sk);
     rest_bid(&mut ctx, ALICE);
     rejects_after_burn(&mut ctx, &signed(&sk, MARKET_ID, ISOLATED), E_OPEN_ORDERS);
@@ -715,7 +708,6 @@ fn signed_state_refusals_follow_the_burn_with_the_direct_strings() {
 #[test]
 fn the_signed_message_binds_type_and_market() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     let sk = SigningKey::from_bytes(&[0x5a; 32]);
     register_key(&mut ctx, ALICE, &sk);
     let mut forged = setMarginTypeSignedCall::abi_decode(&signed(&sk, MARKET_ID, CROSSED)).unwrap();
@@ -751,7 +743,6 @@ fn a_master_switches_its_sub_accounts_margin_type() {
     rejects(&mut ctx, BOB, &wrap(ISOLATED), "asSubAccount: caller is not the master of subAccount");
     drop(off);
 
-    let _cross = crate::margin_type::test_gate::enable();
     switches(&mut ctx, ALICE, sub, &wrap(ISOLATED), ISOLATED);
     assert_eq!(stored(&mut ctx, ALICE).margin_type, CROSSED, "the master's own record is untouched");
 }
@@ -760,7 +751,6 @@ fn a_master_switches_its_sub_accounts_margin_type() {
 #[test]
 fn the_switch_publishes_no_balance_row_and_reason_nine_is_defined() {
     let mut ctx = make_ctx();
-    let _cross = crate::margin_type::test_gate::enable();
     let _ = JournalTr::take_logs(ctx.journal_mut());
     ok(&mut ctx, ALICE, &set_type(MARKET_ID, ISOLATED));
     let logs = JournalTr::take_logs(ctx.journal_mut());

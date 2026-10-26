@@ -24,10 +24,11 @@
 //! the exact reason, zero perp writes (or, for a signed call refused after its burn, writes but no
 //! business-state change), no log and a bit-identical world.
 //!
-//! Cross margin is gated off in production (`CROSS_MARGIN_ENABLED = false`); the spec allows a
-//! `#[cfg(test)]`-only override, and the tests that need the CROSSED paths take it through
-//! [`cross_on`]. Counterparties in gate-on scenarios that trade are made ISOLATED explicitly, so these
-//! tests keep meaning the same thing once P2 gives CROSSED its own accounting.
+//! Cross margin is live since the P3 flip (`CROSS_MARGIN_ENABLED = true`), and the gate-on tests
+//! run on the real gate. The `gated_*` / `mt_gated_*` tests pin the gated engine through the
+//! spec's `#[cfg(test)]`-only override, [`gate_off`] (and [`cross_on`] inside it).
+//! Counterparties in gate-on scenarios that trade are made ISOLATED explicitly, so these tests
+//! keep meaning the same thing now that CROSSED has its own accounting.
 //!
 //! # Map (test prefix → spec item)
 //!
@@ -1335,7 +1336,6 @@ fn mt_an_invalid_type_then_an_unknown_market_come_first() {
 #[test]
 fn mt_with_the_gate_on_the_default_is_crossed_and_it_switches_both_ways() {
     let mut ctx = fresh();
-    let _g = cross_on();
     assert_eq!(reported(&mut ctx, ALICE, M1), CROSSED);
     refuse(&mut ctx, ALICE, M1, CROSSED, E_4046);
     switch_self(&mut ctx, ALICE, M1, ISOLATED);
@@ -1352,7 +1352,6 @@ fn mt_with_the_gate_on_the_default_is_crossed_and_it_switches_both_ways() {
     switch_self(&mut ctx, BOB, M1, ISOLATED);
     assert_eq!(reported(&mut ctx, ALICE, M1), ISOLATED);
     // Forcing the gate off: every surface reads ISOLATED again whatever is stored.
-    drop(_g);
     let _off = gate_off();
     assert_eq!(reported(&mut ctx, ALICE, M1), ISOLATED);
     assert_eq!(reported(&mut ctx, CAROL, M1), ISOLATED);
@@ -1364,7 +1363,6 @@ fn mt_with_the_gate_on_the_default_is_crossed_and_it_switches_both_ways() {
 #[test]
 fn mt_with_the_gate_on_each_refusal_is_reached_only_past_the_earlier_ones() {
     let mut ctx = fresh();
-    let _g = cross_on();
     for u in [ALICE, DAVE] {
         switch_self(&mut ctx, u, M1, ISOLATED);
     }
@@ -1394,7 +1392,6 @@ fn mt_with_the_gate_on_each_refusal_is_reached_only_past_the_earlier_ones() {
 #[test]
 fn mt_every_kind_of_open_order_blocks_the_switch() {
     let mut ctx = fresh();
-    let _g = cross_on();
     for u in [ALICE, DAVE] {
         switch_self(&mut ctx, u, M1, ISOLATED);
     }
@@ -1434,7 +1431,6 @@ fn mt_every_kind_of_open_order_blocks_the_switch() {
 #[test]
 fn mt_a_reduce_only_order_blocks_with_4047_before_4048() {
     let mut ctx = fresh();
-    let _g = cross_on();
     for u in [ALICE, DAVE] {
         switch_self(&mut ctx, u, M1, ISOLATED);
     }
@@ -1452,7 +1448,6 @@ fn mt_a_reduce_only_order_blocks_with_4047_before_4048() {
 #[test]
 fn mt_orders_and_positions_block_only_their_own_user_and_market() {
     let mut ctx = fresh();
-    let _g = cross_on();
     for u in [ALICE, BOB, DAVE] {
         for m in [M1, M2] {
             switch_self(&mut ctx, u, m, ISOLATED);
@@ -1483,7 +1478,6 @@ fn mt_orders_and_positions_block_only_their_own_user_and_market() {
 #[test]
 fn mt_any_position_blocks_and_flat_lifts_it() {
     let mut ctx = fresh();
-    let _g = cross_on();
     for u in [ALICE, BOB, DAVE] {
         switch_self(&mut ctx, u, M1, ISOLATED);
     }
@@ -1504,7 +1498,6 @@ fn mt_any_position_blocks_and_flat_lifts_it() {
 #[test]
 fn mt_the_type_persists_across_flat_like_leverage() {
     let mut ctx = fresh();
-    let _g = cross_on();
     switch_self(&mut ctx, DAVE, M1, ISOLATED);
     ok(&mut ctx, ALICE, &setLeverageCall { marketId: M1, leverage: 2 }.abi_encode());
     switch_self(&mut ctx, ALICE, M1, ISOLATED);
@@ -1541,7 +1534,6 @@ fn mt_the_type_persists_across_flat_like_leverage() {
 #[test]
 fn mt_liquidation_and_adl_leave_the_type_alone() {
     let mut ctx = fresh();
-    let _g = cross_on();
     for u in [ALICE, BOB, DAVE] {
         switch_self(&mut ctx, u, M1, ISOLATED);
     }
@@ -1583,7 +1575,6 @@ fn mt_liquidation_and_adl_leave_the_type_alone() {
 #[test]
 fn mt_with_the_gate_on_every_surface_follows_the_stored_choice() {
     let mut ctx = fresh();
-    let _g = cross_on();
     for m in [M1, M2] {
         switch_self(&mut ctx, DAVE, m, ISOLATED);
     }
@@ -1631,7 +1622,6 @@ fn mt_a_master_switches_its_sub_account() {
     rejected(&mut ctx, ALICE, &wrap(NO_MARKET, ISOLATED), E_MARKET);
     drop(off);
 
-    let _g = cross_on();
     // The wrong caller still pays the full inner charge (gas is decided from the calldata).
     let o = rejected(&mut ctx, BOB, &wrap(M1, ISOLATED), E_NOT_MASTER);
     assert_eq!(o.gas_used, MT_GAS + SUB_OVERHEAD);
@@ -1758,7 +1748,6 @@ fn mt_signed_switch_succeeds_once_and_replays_are_duplicates() {
     let mut ctx = fresh();
     let sk = key(9);
     register(&mut ctx, ALICE, 1, &sk, 0);
-    let _g = cross_on();
     let input = Msg::new(&ctx, ALICE, M1, ISOLATED).call(&sk);
     switch(&mut ctx, ERIN, ALICE, &input, M1, ISOLATED, MT_GAS, true);
     assert_eq!(reported(&mut ctx, ERIN, M1), CROSSED, "the relayer's record moved");
@@ -1851,7 +1840,6 @@ fn mt_signed_state_refusals_follow_the_burn() {
     // With the blockers gone and the gate on, those spent signatures stay spent.
     close(&mut ctx, ALICE, M1);
     drop(off);
-    let _g = cross_on();
     for spent in [&gate, &blocked, &pos] {
         rejected(&mut ctx, ERIN, &spent.call(&sk), E_DUP);
     }
@@ -1871,7 +1859,6 @@ fn mt_the_signature_binds_every_field() {
     register(&mut ctx, ALICE, 1, &sk, 0);
     register(&mut ctx, ALICE, 2, &sk, 0);
     register(&mut ctx, BOB, 1, &sk, 0); // the same key under another account
-    let _g = cross_on();
     let good = Msg::new(&ctx, ALICE, M1, ISOLATED);
     let variants = [
         Msg { account: BOB, ..good },
@@ -1907,7 +1894,6 @@ fn mt_a_sub_account_signs_its_own_switch() {
         ALICE,
         &asSubAccountCall { subAccount: sub, data: reg.abi_encode().into() }.abi_encode(),
     );
-    let _g = cross_on();
     let m = Msg::new(&ctx, sub, M2, ISOLATED);
     switch(&mut ctx, ERIN, sub, &m.call(&sk), M2, ISOLATED, MT_GAS, true);
     assert_eq!(reported(&mut ctx, ALICE, M2), CROSSED);
@@ -2019,7 +2005,6 @@ fn gated_and_explicitly_isolated_with_the_gate_on_are_the_same() {
     };
 
     let mut d = fresh();
-    let _g = cross_on();
     for u in [ALICE, BOB, CAROL, DAVE] {
         switch_self(&mut d, u, M1, ISOLATED);
     }
