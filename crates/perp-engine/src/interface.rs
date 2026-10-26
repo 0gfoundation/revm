@@ -417,11 +417,12 @@ sol! {
         ///   crossMarginBalance          `totalCrossWalletBalance + totalCrossUnPnl` — the CROSS
         ///                               margin balance `E`, the left side of the account's cross
         ///                               liquidation condition. Equals `totalCrossWalletBalance` for
-        ///                               an account with no CROSSED position. NOTE `getAccountMargin`
-        ///                               has a field of the same name with a DIFFERENT, older
-        ///                               definition (`totalCrossWalletBalance + totalUnrealizedProfit`,
-        ///                               isolated PnL included); the two agree only when every
-        ///                               position is CROSSED. Prefer this one.
+        ///                               an account with no CROSSED position. `getAccountMargin`'s
+        ///                               field of the same name is this same `E` over the markets
+        ///                               listed to it (since the cross flip, R8 — it used to be
+        ///                               `totalCrossWalletBalance + totalUnrealizedProfit`,
+        ///                               isolated PnL included); over the account's index the two
+        ///                               agree.
         ///                               ⚠️ ABI CHANGE (cross P2): APPENDED after `positions`, so the
         ///                               return's head grows by one word — regenerate the binding.
         ///   totalCrossMaintMargin       Σ `maintMargin` over the CROSSED positions. The account is
@@ -1349,11 +1350,11 @@ sol! {
         /// While the caller's account is in liquidation (its liquidation flag, set and cleared by
         /// cross liquidation) only a reduce-only order is accepted; any other is refused
         /// `placeOrder: -2023 User in liquidation mode now. …` (batch reason 35), on every
-        /// placement entrypoint. And none of the account's RESTING orders fills meanwhile: the
-        /// walk cancels each it meets (`OrderCancelled` reason 3) and goes on — a reduce-only one
-        /// included, so while flagged a reduce-only GTC is accepted but cancelled at first touch;
-        /// reduce with a reduce-only MARKET / IOC order (P3 decides whether resting reduce-only
-        /// orders of a flagged account may fill).
+        /// placement entrypoint. Of the account's RESTING orders meanwhile, one that can open is
+        /// cancelled when the walk meets it (`OrderCancelled` reason 3) and the walk goes on, while
+        /// a reduce-only / closePosition one FILLS (R1 — it can only shrink the position, which is
+        /// what the liquidation wants): so a reduce-only GTC placed while flagged rests and fills
+        /// like any other.
         ///
         /// Margin refusals. ISOLATED: `placeOrder: insufficient perp wallet for margin` (batch
         /// reason 29) and `placeOrder: open would breach maintenance margin` (K9, 30).
@@ -1367,7 +1368,10 @@ sol! {
         ///     `qty × (mark − limit)` on a sell below it, at the mark at placement);
         ///   * `placeOrder: -2019 Margin is insufficient. The open would leave the cross margin
         ///     balance below the cross maintenance margin` (30): an opening TAKER fill of an
-        ///     account with cross exposure must leave `crossMarginBalance ≥ totalCrossMaintMargin`;
+        ///     account with cross exposure must leave `crossMarginBalance ≥ totalCrossMaintMargin`
+        ///     — and (cross P3, R2: J1 at rest) so must an order that can open and would REST, its
+        ///     Open Loss included (`crossMarginBalance − OpenLoss ≥ totalCrossMaintMargin` after
+        ///     it), isolated orders of such an account included; a reduce-only one never is;
         ///   * `placeOrder: -2019 Margin is insufficient. An ISOLATED position is funded from the
         ///     wallet balance, never from cross unrealized profit` (29): an isolated open's margin
         ///     must be in the wallet itself.
