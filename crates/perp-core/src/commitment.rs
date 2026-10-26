@@ -406,6 +406,10 @@ use primitives::{B256, U256};
 //     accounts reach it too (a maker commission on a last close was the one route). The golden
 //     scenario leaves no account flat below zero: the pin 0xaea562b9…1e61 is unchanged,
 //     BusinessSnapshot UNCHANGED.
+//   * P3 — the liquidation flag ends with the account's last cross position, whatever closed it
+//     (a reduce-only close, a maker fill, a fired stop, ADL against the account): the end of that
+//     call clears `liq_flags`. Reachable only on an account in cross liquidation: the golden pin
+//     0xaea562b9…1e61 is unchanged, BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

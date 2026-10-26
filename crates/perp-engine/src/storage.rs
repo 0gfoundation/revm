@@ -658,16 +658,22 @@ pub fn begin_perp_call<H: PerpHost>(context: &mut H) {
 ///
 /// # It also SETTLES the accounts whose last position closed in this call (cross P3)
 ///
-/// [`save_position`] records every account whose `open_position_count` reached 0 during the call
-/// (`TypedPerpStore::settle_accounts`), and this is where the record is acted on, against the
-/// wallet the call ENDS with: a negative one is cleared by the insurance fund
-/// ([`crate::risk::negative_balance::clear_negative_wallet`], owner decision Q8). It is the end of
-/// the call because that is the first point every route's writes have landed — see the note at the
-/// recording site.
+/// [`save_position`] records every account whose `open_position_count` reached 0 during the call,
+/// and every account IN LIQUIDATION that closed a CROSSED position (`TypedPerpStore::settle_accounts`),
+/// and this is where the record is acted on, against the state the call ENDS with:
 ///
-/// The settled users join the drain's ascending address walk, each in one place: the user's
-/// pending row (if any) first — the state the call left, negative wallet included, which is what
-/// Binance shows before its clearance — then the clearance, which publishes its OWN
+/// 1. a flagged account left holding no cross position ends its liquidation episode
+///    ([`crate::risk::cross_liquidation::end_flag_without_cross_position`], `CrossLiquidationEnded`)
+///    — the flag can never outlive the last cross position, whichever route closed it;
+/// 2. a flat account's negative wallet is cleared by the insurance fund
+///    ([`crate::risk::negative_balance::clear_negative_wallet`], owner decision Q8).
+///
+/// It is the end of the call because that is the first point every route's writes have landed —
+/// see the note at the recording site.
+///
+/// The settled users join the drain's ascending address walk, each in one place: the episode end
+/// first, then the user's pending row (if any) — the state the call left, negative wallet included,
+/// which is what Binance shows before its clearance — then the clearance, which publishes its OWN
 /// `INSURANCE_CLEAR` row. A settlement that finds nothing to do writes nothing and publishes
 /// nothing. Total like the drain: only the storage layer can fail.
 pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpError> {
@@ -686,10 +692,16 @@ pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpE
     let users: std::collections::BTreeSet<Address> =
         touched.keys().chain(settle.keys()).copied().collect();
     for user in users {
+        let settle_market = settle.get(&user).copied();
+        if let Some(market_id) = settle_market {
+            crate::risk::cross_liquidation::end_flag_without_cross_position(
+                context, user, market_id,
+            )?;
+        }
         if let Some(&reason) = touched.get(&user) {
             emit_account_snapshot(context, user, reason)?;
         }
-        if let Some(&market_id) = settle.get(&user) {
+        if let Some(market_id) = settle_market {
             crate::risk::negative_balance::clear_negative_wallet(context, user, market_id)?;
         }
     }
@@ -1224,21 +1236,26 @@ pub fn save_position<H: PerpHost>(
     // market in the per-user index — so neither end is reachable; the `debug_assert`s say so, and
     // `margin_view::index_account_scalars` re-walks the index against the stored count.
     //
-    // ── …and the LAST close, which the end of the call must SETTLE (cross P3) ─────────────────
+    // ── …and the closes the end of the call must SETTLE (cross P3) ─────────────────────────────
     //
-    // The `−1` crossing that takes the count to 0 is the account's last position closing, by
-    // whatever route — a user order, a maker fill, a fired conditional, a liquidation of either
-    // margin type, an ADL fill on either side. With the wallet below zero at that point, the
-    // insurance fund clears it (owner decision Q8: only once NO position is left, cross or
-    // isolated — `risk::negative_balance`).
+    // A `−1` crossing can leave something behind that only the account's LAST close of a kind may
+    // resolve, by whatever route it closed — a user order, a maker fill, a fired conditional, a
+    // liquidation of either margin type, an ADL fill on either side:
     //
-    // It is not acted on HERE. This write is mid-path on every one of those routes: the caller
+    // * the count reaches 0 — the last position, cross or isolated. With the wallet below zero at
+    //   that point, the insurance fund clears it (owner decision Q8 — `risk::negative_balance`);
+    // * a CROSSED position closes while the account is IN LIQUIDATION — if it was the last cross
+    //   position, the flag must end with it
+    //   (`risk::cross_liquidation::end_flag_without_cross_position`): no sweep visits an account
+    //   that is in no cross market's registry, so nothing else would ever clear it.
+    //
+    // Neither is acted on HERE. This write is mid-path on every one of those routes: the caller
     // still holds the account it is about to write back (the match flush, both liquidation legs,
     // ADL — position BEFORE account), so a wallet credit made now would be overwritten by that
     // copy, and the wallet that decides the clearance is the one the call ENDS with (a taker's fee
     // is debited after its close is saved). So the user is only RECORDED, call-scoped, and the
     // end of the call settles it (`flush_account_snapshots`). The record costs a `BTreeMap` insert
-    // on a last close only, from the account mutation the crossing makes anyway.
+    // on these closes only, from the account mutation the crossing makes anyway.
     let count_delta: i8 = match (old_amount != 0, pos.amount != 0) {
         (false, true) => 1,
         (true, false) => -1,
@@ -1249,6 +1266,8 @@ pub fn save_position<H: PerpHost>(
             .margin
             .checked_sub(old_margin)
             .ok_or_else(|| perp_err("save_position: position margin delta overflow"))?;
+        let closed_crossed = count_delta == -1
+            && crate::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed;
         // `mutate_account`, not `mutate_account_balance`: this is not a WALLET move (no
         // `credit_perp`/`debit_perp`), and `save_position` marks the snapshot itself two lines below,
         // so marking here as well would be redundant.
@@ -1276,7 +1295,10 @@ pub fn save_position<H: PerpHost>(
                 }
                 _ => {}
             }
-            Ok::<bool, PerpError>(count_delta == -1 && a.open_position_count == 0)
+            Ok::<bool, PerpError>(
+                count_delta == -1
+                    && (a.open_position_count == 0 || (closed_crossed && a.in_liquidation())),
+            )
         })??;
         if settle {
             typed_store_mut(context).note_account_to_settle(user, market_id);

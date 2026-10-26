@@ -203,8 +203,9 @@ pub struct TypedPerpStore {
     touched_accounts: std::collections::BTreeMap<Address, AccountUpdateReason>,
     /// Users who, during the CURRENT perp call, closed a position to flat in a way the end of the
     /// call has to SETTLE — their last position (`open_position_count` reached 0: a negative wallet
-    /// is then cleared by the insurance fund, cross report Q8). The value is the market of the
-    /// latest such close. Drained, with [`Self::touched_accounts`], by
+    /// is then cleared by the insurance fund, cross report Q8) or a CROSSED position while their
+    /// account is in liquidation (the flag must not outlive the last cross position). The value is
+    /// the market of the latest such close. Drained, with [`Self::touched_accounts`], by
     /// `perp_engine::storage::flush_account_snapshots`.
     ///
     /// CALL-scoped exactly like [`Self::touched_accounts`] (same [`Self::begin_call`] reset, same

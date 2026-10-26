@@ -9,8 +9,14 @@
 //!   included, the isolated position untouched (Q2, R3);
 //! * detection completeness (the account is caught on the tick of the market that moved, which
 //!   closes first) and the close order;
-//! * budget and continuation (`deferred_work`, resumed by the drain), the `-2023` freeze in between;
-//! * manual `liquidate()`: healthy refused write-clean, a recovered flag cleared, the start market;
+//! * budget and continuation (`deferred_work`, resumed by the drain — or by the tick of ANY market
+//!   the account holds), the `-2023` freeze in between (reduce-only orders accepted and filled, R1;
+//!   everything else refused or cancelled), a deposit curing the account (the next tick ends the
+//!   episode with one write), a market whose oracle stopped (skipped until it publishes again);
+//! * the flag never outlives the last cross position, whatever route closes it (a reduce-only
+//!   close, a maker fill, a fired stop, ADL against the flagged account);
+//! * manual `liquidate()`: healthy refused write-clean, a recovered flag cleared through any market,
+//!   the start market;
 //! * negative-balance clearance (Q8, R4): a negative wallet is cleared by the insurance fund at the
 //!   end of the call that closed the account's LAST position — by a user close, a maker fill, a
 //!   fired stop, a cross episode (sweep or drain), an ADL fill on the winning side — never while a
@@ -31,13 +37,17 @@ use crate::host::PerpHost;
 use crate::{
     interface::IPerpDex::{
         drainDeferredWorkCall, liquidateCall, placeAlgoOrderCall, placeOrderCall, setLeverageCall,
-        setMarginTypeCall, transferFromPerpCall, updateIndexPriceCall, AccountBalanceChanged, Adl,
+        setMarginTypeCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
+        AccountBalanceChanged, Adl,
         AlgoOrderCancelled, CrossLiquidationEnded, CrossLiquidationStarted, InsuranceFundChanged,
         InsuranceFundDepleted, Liquidation, OrderCancelled, OrderPlaced, Trade,
     },
     risk::cross_liquidation::{liquidate_cross_account, CrossLiquidationOutcome, EpisodeCaller},
     run_perp_dex_call, storage,
-    types::{AccountUpdateReason, FundingState, MarginTiers, MarginType, Market, UserAccount},
+    types::{
+        AccountUpdateReason, FundingState, IndexPriceState, MarginTiers, MarginType, Market,
+        UserAccount,
+    },
     PerpOutput, PERP_DEX_ADDRESS, USDC_ADDRESS,
 };
 
@@ -785,6 +795,224 @@ fn an_episode_out_of_budget_records_a_continuation_the_drain_resumes() {
     assert_eq!(deferred_of(&mut ctx, M1), 0);
 }
 
+/// `deferred_work` of market `m`.
+fn deferred_of(ctx: &mut TestCtx, m: u64) -> u8 {
+    storage::load_market(ctx, m).unwrap().unwrap().deferred_work
+}
+
+/// An episode run directly with `budget` steps and no sweep owning it (a continuation is written to
+/// its market's `deferred_work`), its logs drained.
+fn budgeted_episode(ctx: &mut TestCtx, user: Address, start: u64, budget: u32) -> CrossLiquidationOutcome {
+    let caller = EpisodeCaller { sweep_market: None, fresh_market: None, liquidator: KEEPER };
+    let (mut budget, mut adl_budget, mut deferred) = (budget, 128, false);
+    let out =
+        liquidate_cross_account(ctx, user, start, caller, &mut budget, &mut adl_budget, &mut deferred)
+            .unwrap();
+    storage::flush_account_snapshots(ctx).unwrap();
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    out
+}
+
+/// New money from outside the system into `user`'s perp wallet, through `transferToPerp`; the
+/// identity's total grows by exactly it.
+fn deposit(ctx: &mut TestCtx, ledger: &mut Ledger, user: Address, amount: i64) -> Vec<Log> {
+    let a = storage::load_account(ctx, user).unwrap();
+    let spot: U256 = a.usdc_balance.clone().into();
+    storage::mutate_account(ctx, user, |a| {
+        a.usdc_balance = (spot + U256::from(amount as u64)).into();
+    })
+    .unwrap();
+    ledger.total += amount as i128;
+    ok(ctx, user, &transferToPerpCall { amount: amount as u64 }.abi_encode())
+}
+
+/// **A continuation is resumed by the tick of ANY market the account holds.** ALICE (cross longs on
+/// M1 and M2, an order in each of M1–M3) is caught below maintenance and her episode runs out of
+/// budget after two cancels: flagged, M3's order still resting, nothing closed, the continuation on
+/// M1. It is M2's tick — not M1's — that comes next: its sweep finds the flagged account in M2's
+/// registry and resumes the SAME episode from M2 (no second `Started`): M3's order goes, M2 (the
+/// market that ticked) closes first, then M1, and the episode ends. M1's bit is still set; M1's
+/// drain finds nothing left and clears it.
+#[test]
+fn an_interrupted_episode_resumes_on_the_tick_of_another_market() {
+    let (_g, mut ctx) = make_ctx();
+    longs_on_m1_and_m2(&mut ctx, WALLET);
+    for m in MARKETS {
+        rest(&mut ctx, ALICE, m, BUY, px(50), 1);
+    }
+    set_wallet(&mut ctx, ALICE, usd(300));
+    set_mark(&mut ctx, M1, px(80));
+    let ledger = Ledger::open(&mut ctx);
+    assert!(fold(&mut ctx, ALICE).below_cross_maintenance());
+
+    let out = budgeted_episode(&mut ctx, ALICE, M1, 2);
+    ledger.check(&mut ctx, "after the budgeted episode");
+    assert_eq!(out, CrossLiquidationOutcome::Liquidated { ended: false });
+    assert!(flagged(&mut ctx, ALICE));
+    assert_eq!(storage::book_order_count(&mut ctx, ALICE, M3).unwrap(), 1);
+    assert_eq!((deferred_of(&mut ctx, M1), deferred_of(&mut ctx, M2)), (1, 0));
+
+    let logs = tick(&mut ctx, M2, px(100));
+    ledger.check(&mut ctx, "after M2's tick");
+    assert!(evs::<CrossLiquidationStarted>(&logs).is_empty(), "the same episode, resumed");
+    assert_eq!(storage::book_order_count(&mut ctx, ALICE, M3).unwrap(), 0);
+    let liq: Vec<u64> = evs::<Liquidation>(&logs).iter().map(|l| l.marketId).collect();
+    assert_eq!(liq, vec![M2, M1], "the market that ticked first");
+    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_eq!(deferred_of(&mut ctx, M1), 1, "M2's sweep does not own M1's bit");
+
+    let out = call(&mut ctx, KEEPER, &drainDeferredWorkCall { marketId: M1 }.abi_encode());
+    assert!(!drainDeferredWorkCall::abi_decode_returns(&out.bytes).unwrap(), "nothing left");
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    assert!(evs::<Liquidation>(&logs).is_empty());
+    assert_eq!(deferred_of(&mut ctx, M1), 0);
+}
+
+/// **A deposit cures a flagged account; the next tick ends the episode with one write.** ALICE's
+/// episode runs out of budget on its one cancel (M3), flagged with nothing closed. In between she
+/// is in liquidation mode — an opening order is `-2023`, so is a margin-type switch, while a
+/// reduce-only order is accepted and rests — and she deposits enough to be back above maintenance.
+/// The flag stays until a tick looks: M2's tick finds her healthy and ENDS the episode (`Ended`,
+/// nothing closed, nothing cancelled — her reduce-only order keeps resting), and she may open again.
+#[test]
+fn a_deposit_cures_a_flagged_account_and_the_next_tick_ends_the_episode() {
+    let (_g, mut ctx) = make_ctx();
+    longs_on_m1_and_m2(&mut ctx, WALLET);
+    rest(&mut ctx, ALICE, M3, BUY, px(50), 1);
+    set_wallet(&mut ctx, ALICE, usd(300));
+    set_mark(&mut ctx, M1, px(80));
+    let mut ledger = Ledger::open(&mut ctx);
+
+    assert_eq!(
+        budgeted_episode(&mut ctx, ALICE, M1, 1),
+        CrossLiquidationOutcome::Liquidated { ended: false }
+    );
+    ledger.check(&mut ctx, "after the budgeted episode");
+    assert!(flagged(&mut ctx, ALICE));
+    assert_eq!((pos(&mut ctx, ALICE, M1).amount, pos(&mut ctx, ALICE, M2).amount), (10, 10));
+    assert_eq!(deferred_of(&mut ctx, M1), 1);
+
+    // Liquidation mode.
+    rejects(&mut ctx, ALICE, &order(M2, BUY, px(90), 1, GTC), crate::trading::IN_LIQUIDATION_REJECT);
+    rejects(
+        &mut ctx,
+        ALICE,
+        &setMarginTypeCall { marketId: M3, marginType: ISOLATED }.abi_encode(),
+        "setMarginType: -2023 User in liquidation mode now.",
+    );
+    rest_flags(&mut ctx, ALICE, M2, SELL, px(120), 5, RO);
+
+    // The cure: $1,000 in, E = $1,100 ≥ Σ MM = $300 (and above initial margin, A = $500).
+    deposit(&mut ctx, &mut ledger, ALICE, usd(1_000));
+    ledger.check(&mut ctx, "after the deposit");
+    assert!(!fold(&mut ctx, ALICE).below_cross_maintenance());
+    assert!(flagged(&mut ctx, ALICE), "nothing has looked yet");
+    rejects(&mut ctx, ALICE, &order(M2, BUY, px(90), 1, GTC), crate::trading::IN_LIQUIDATION_REJECT);
+
+    let logs = tick(&mut ctx, M2, px(100));
+    ledger.check(&mut ctx, "after M2's tick");
+    assert!(evs::<Liquidation>(&logs).is_empty(), "nothing closed");
+    assert!(evs::<OrderCancelled>(&logs).is_empty(), "nothing cancelled");
+    let ended = evs::<CrossLiquidationEnded>(&logs);
+    assert_eq!((ended.len(), ended[0].marketId), (1, M2));
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_eq!(storage::book_order_count(&mut ctx, ALICE, M2).unwrap(), 1, "the RO order rests on");
+    ok(&mut ctx, ALICE, &order(M2, BUY, px(90), 1, GTC));
+}
+
+/// **R1 while flagged: her reduce-only order fills, everything else of hers is frozen.** ALICE
+/// (cross long 10 on M1, orders on M2 and M3) is flagged with the continuation on M1 after one
+/// cancel. She rests a reduce-only sell of 5 at $80 (Q11 accepts it) and a taker lifts it — a
+/// flagged account's reduce-only maker order FILLS (R1) — which takes her back above maintenance.
+/// Her opening bid on M3, reached by a seller, is CANCELLED instead of filled (reason 3). M1's drain
+/// then finds her healthy and ends the episode with one write.
+#[test]
+fn a_reduce_only_fill_while_flagged_restores_the_account_and_the_drain_ends_it() {
+    let (_g, mut ctx) = make_ctx();
+    long_10_on_m1(&mut ctx, WALLET);
+    rest(&mut ctx, ALICE, M2, BUY, px(50), 1);
+    let m3_bid = rest(&mut ctx, ALICE, M3, BUY, px(50), 1);
+    set_wallet(&mut ctx, ALICE, usd(300));
+    set_mark(&mut ctx, M1, px(80));
+    let ledger = Ledger::open(&mut ctx);
+
+    budgeted_episode(&mut ctx, ALICE, M1, 1);
+    ledger.check(&mut ctx, "after the budgeted episode");
+    assert!(flagged(&mut ctx, ALICE));
+    assert_eq!(storage::book_order_count(&mut ctx, ALICE, M3).unwrap(), 1);
+    assert_eq!(deferred_of(&mut ctx, M1), 1);
+
+    rest_flags(&mut ctx, ALICE, M1, SELL, px(80), 5, RO);
+    let logs = ok(&mut ctx, BOB, &order(M1, BUY, px(80), 5, IOC));
+    ledger.check(&mut ctx, "after the reduce-only fill");
+    let t = evs::<Trade>(&logs);
+    assert_eq!((t.len(), t[0].maker, t[0].quantity), (1, ALICE, 5), "R1: it filled");
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 5);
+    assert!(!fold(&mut ctx, ALICE).below_cross_maintenance(), "E = $100 ≥ Σ MM = $66.67");
+    assert!(flagged(&mut ctx, ALICE));
+
+    let logs = ok(&mut ctx, CAROL, &order(M3, SELL, px(50), 1, IOC));
+    ledger.check(&mut ctx, "after the frozen bid was reached");
+    assert!(evs::<Trade>(&logs).is_empty(), "a flagged account's opening order does not fill");
+    let c = evs::<OrderCancelled>(&logs);
+    assert_eq!((c.len(), c[0].orderId.0, c[0].reason), (1, m3_bid, CANCEL_LIQUIDATION));
+
+    let out = call(&mut ctx, KEEPER, &drainDeferredWorkCall { marketId: M1 }.abi_encode());
+    assert!(!out.reverted);
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    ledger.check(&mut ctx, "after the drain");
+    assert!(evs::<Liquidation>(&logs).is_empty());
+    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 5, "the rest is hers");
+    assert_eq!(deferred_of(&mut ctx, M1), 0);
+}
+
+/// **A market whose oracle STOPPED.** As in the stale-skip test, M1's tick closes M1 and skips M2
+/// (its mark is older than `3 × 15 s`): flagged, below maintenance, and NO continuation recorded —
+/// a same-block retry could not close at a price the oracle no longer publishes. A keeper's
+/// `liquidate(ALICE, M2)` meanwhile is no way around the guard: it skips M2 too, writes nothing and
+/// fails nothing. Once M2's oracle publishes again (its index timestamp fresh — here the fixture
+/// stands in for a tick whose own sweep did not reach her), the same `liquidate()` closes M2 and
+/// ends the episode.
+#[test]
+fn a_stopped_oracle_holds_the_market_until_it_publishes_again() {
+    let (_g, mut ctx) = make_ctx();
+    longs_on_m1_and_m2(&mut ctx, usd(200));
+    set_mark(&mut ctx, M2, px(90));
+    ctx.block.timestamp = U256::from(10_000);
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = tick_at(&mut ctx, M1, px(70), 10_000);
+    ledger.check(&mut ctx, "after M1's tick");
+    let liq: Vec<u64> = evs::<Liquidation>(&logs).iter().map(|l| l.marketId).collect();
+    assert_eq!(liq, vec![M1]);
+    assert!(flagged(&mut ctx, ALICE));
+    assert_eq!((deferred_of(&mut ctx, M1), deferred_of(&mut ctx, M2)), (0, 0), "no continuation");
+
+    let writes = ctx.perp_write_count();
+    let logs = ok(&mut ctx, KEEPER, &liquidate(ALICE, M2));
+    assert!(logs.is_empty(), "skipped: nothing to log");
+    assert_eq!(ctx.perp_write_count(), writes, "and nothing written");
+    assert_eq!(pos(&mut ctx, ALICE, M2).amount, 10);
+    assert!(flagged(&mut ctx, ALICE));
+
+    storage::save_index_price_state(
+        &mut ctx,
+        M2,
+        &IndexPriceState { index_price: px(90), timestamp: 10_000 },
+    )
+    .unwrap();
+    let logs = ok(&mut ctx, KEEPER, &liquidate(ALICE, M2));
+    ledger.check(&mut ctx, "after liquidate()");
+    let liq = evs::<Liquidation>(&logs);
+    assert_eq!((liq.len(), liq[0].marketId, liq[0].liquidator), (1, M2, KEEPER));
+    assert_eq!(pos(&mut ctx, ALICE, M2).amount, 0);
+    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    assert!(!flagged(&mut ctx, ALICE));
+}
+
 // ── Manual liquidate() ──────────────────────────────────────────────────────────
 
 /// `liquidate()` of a CROSSED position judges the ACCOUNT: healthy, refused write-clean; below
@@ -813,20 +1041,15 @@ fn liquidate_judges_the_account_and_starts_the_episode_at_the_given_market() {
     assert!(!fold(&mut ctx, ALICE).below_cross_maintenance());
 }
 
-/// A FLAG that outlived the account's last cross position — an interrupted episode whose account
-/// then closed the rest itself — is in no registry, so no sweep can clear it. `liquidate()` for the
-/// account through ANY market clears it (`Ended`), a market where it holds nothing included; an
-/// unflagged account with nothing there is still "no open position".
+/// `liquidate()` for a FLAGGED account goes to the episode through ANY market — one where it holds
+/// nothing included — so a keeper need not know where the account trades: a flag on an account
+/// that has recovered (here a fixture flag on a flat account, the one way to get a flag without a
+/// cross position now) is ended (`Ended`, no `Liquidation`); an unflagged account with nothing
+/// there is still "no open position".
 #[test]
-fn liquidate_clears_a_flag_that_outlived_the_last_cross_position() {
+fn liquidate_ends_a_recovered_flag_through_any_market() {
     let (_g, mut ctx) = make_ctx();
-    long_10_on_m1(&mut ctx, usd(300));
     storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
-    // She closes it herself with a reduce-only order (accepted while flagged).
-    rest(&mut ctx, MAKER, M1, BUY, px(100), 10);
-    ok(&mut ctx, ALICE, &order_flags(M1, SELL, px(100), 10, IOC, RO));
-    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
-    assert!(flagged(&mut ctx, ALICE), "nothing cleared it");
     rejects(
         &mut ctx,
         ALICE,
@@ -835,11 +1058,102 @@ fn liquidate_clears_a_flag_that_outlived_the_last_cross_position() {
     );
 
     let logs = ok(&mut ctx, KEEPER, &liquidate(ALICE, M3));
-    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    let ended = evs::<CrossLiquidationEnded>(&logs);
+    assert_eq!((ended.len(), ended[0].marketId), (1, M3));
     assert!(evs::<Liquidation>(&logs).is_empty());
     assert!(!flagged(&mut ctx, ALICE));
     rejects(&mut ctx, KEEPER, &liquidate(ALICE, M3), "liquidate: no open position");
     ok(&mut ctx, ALICE, &order(M1, BUY, px(90), 1, GTC));
+}
+
+// ── The flag never outlives the last cross position ─────────────────────────────
+
+/// **The flag ends with the account's last cross position, whatever closed it.** ALICE is flagged
+/// (an episode left unfinished — the fixture flag stands in for it) and holds cross longs on M1 and
+/// M2 plus an ISOLATED long on M3. Her own reduce-only close of M1 (Q11) leaves the flag: M2 is
+/// still a cross position, and its ticks will resume the episode. Her reduce-only RESTING order on
+/// M2, filled as a maker (R1), closes the LAST cross position — and the end of that call ends the
+/// episode (`Ended` at M2, `Σ MM` 0) although her isolated position is still open: the flag is about
+/// cross exposure. She may open again at once.
+#[test]
+fn the_flag_ends_with_the_last_cross_position_closed_by_any_route() {
+    let (_g, mut ctx) = make_ctx();
+    set_type(&mut ctx, ALICE, M3, ISOLATED);
+    set_leverage(&mut ctx, ALICE, M3, 1);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    trade(&mut ctx, M2, ALICE, CAROL, BUY, px(100), 10);
+    trade(&mut ctx, M3, ALICE, CAROL, BUY, px(100), 1);
+    storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
+    let ledger = Ledger::open(&mut ctx);
+
+    rest(&mut ctx, MAKER, M1, BUY, px(100), 10);
+    let logs = ok(&mut ctx, ALICE, &order_flags(M1, SELL, px(100), 10, IOC, RO));
+    ledger.check(&mut ctx, "after the M1 close");
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    assert!(evs::<CrossLiquidationEnded>(&logs).is_empty(), "M2 is still a cross position");
+    assert!(flagged(&mut ctx, ALICE));
+
+    rest_flags(&mut ctx, ALICE, M2, SELL, px(100), 10, RO);
+    let logs = ok(&mut ctx, BOB, &order(M2, BUY, px(100), 10, IOC));
+    ledger.check(&mut ctx, "after the M2 maker close");
+    assert_eq!(pos(&mut ctx, ALICE, M2).amount, 0);
+    assert_eq!(pos(&mut ctx, ALICE, M3).amount, 1, "the isolated position is untouched");
+    let ended = evs::<CrossLiquidationEnded>(&logs);
+    assert_eq!(ended.len(), 1);
+    assert_eq!((ended[0].user, ended[0].marketId, ended[0].totalCrossMaintMargin), (ALICE, M2, 0));
+    assert_eq!(ended[0].crossMarginBalance, wallet(&mut ctx, ALICE), "E is the wallet now");
+    assert!(!flagged(&mut ctx, ALICE));
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(90), 1, GTC));
+}
+
+/// The same for a last cross position closed by a FIRED STOP (on M1's tick, before the sweep) and
+/// for one closed by ADL with the flagged account on the WINNING side (CAROL's isolated long
+/// liquidated by `liquidate()` against ALICE's cross short): each ends the episode in its own call.
+#[test]
+fn a_fired_stop_or_an_adl_fill_closing_the_last_cross_position_ends_the_episode() {
+    // A fired stop.
+    let (_g, mut ctx) = make_ctx();
+    long_10_on_m1(&mut ctx, usd(400));
+    ok(
+        &mut ctx,
+        ALICE,
+        &placeAlgoOrderCall {
+            algoType: 0,
+            marketId: M1,
+            side: SELL,
+            orderType: 1,
+            triggerPrice: px(95),
+            price: 0,
+            quantity: 10,
+            tif: 0,
+            workingType: 0,
+            clientAlgoId: FixedBytes::default(),
+            flags: RO,
+        }
+        .abi_encode(),
+    );
+    storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
+    rest(&mut ctx, MAKER, M1, BUY, px(90), 10);
+    let logs = tick(&mut ctx, M1, px(90));
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    assert!(!flagged(&mut ctx, ALICE));
+    drop(ctx);
+
+    // An ADL fill against the flagged account.
+    let (_g2, mut ctx) = make_ctx();
+    set_leverage(&mut ctx, CAROL, M1, 3);
+    trade(&mut ctx, M1, CAROL, ALICE, BUY, px(100), 4);
+    storage::set_in_liquidation_for_test(&mut ctx, ALICE, true).unwrap();
+    set_mark(&mut ctx, M1, px(60));
+    let ledger = Ledger::open(&mut ctx);
+    let logs = ok(&mut ctx, KEEPER, &liquidate(CAROL, M1));
+    ledger.check(&mut ctx, "after the ADL");
+    assert_eq!(adls(&logs).iter().map(|a| a.1).collect::<Vec<_>>(), vec![ALICE]);
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    let ended = evs::<CrossLiquidationEnded>(&logs);
+    assert_eq!((ended.len(), ended[0].user, ended[0].marketId), (1, ALICE, M1));
+    assert!(!flagged(&mut ctx, ALICE));
 }
 
 // ── Negative-balance clearance (Q8, R4) ─────────────────────────────────────────
@@ -1210,8 +1524,9 @@ impl Rng {
 /// each other and a MAKER, with the clearance fee on, while the oracle walks every market up and down
 /// by up to 25% a tick. After EVERY step the custody identity holds and `Σ amount == 0` per market;
 /// after every tick of `m`, no account holding a cross position in `m` is left below maintenance
-/// unless it is still flagged (the episode could not finish). Coverage floors: cross episodes,
-/// bankrupt ones, and multi-market closes are reached.
+/// unless it is still flagged (the episode could not finish), and after EVERY step no account is
+/// flagged without a cross position. Coverage floors: cross episodes, bankrupt ones, and
+/// multi-market closes are reached.
 #[test]
 fn a_randomised_multi_market_run_never_panics_and_detection_is_complete() {
     let (_g, mut ctx) = make_ctx();
@@ -1331,6 +1646,19 @@ fn a_randomised_multi_market_run_never_panics_and_detection_is_complete() {
             }
         }
         ledger.check(&mut ctx, &format!("step {step}"));
+        // The flag never outlives the account's last cross position, whatever closed it.
+        for &u in &traders {
+            if flagged(&mut ctx, u) {
+                assert!(
+                    MARKETS.iter().any(|&m| {
+                        let p = pos(&mut ctx, u, m);
+                        p.amount != 0
+                            && crate::margin_type::effective_margin_type(&p) == MarginType::Crossed
+                    }),
+                    "step {step}: {u} is flagged with no cross position"
+                );
+            }
+        }
         // Top up a FLAT account the run has drained, so it keeps trading.
         for &u in &traders {
             let flat = storage::load_account(&mut ctx, u).unwrap().open_position_count == 0;

@@ -1407,7 +1407,8 @@ pub(crate) fn charge_clearance_fee<H: PerpHost>(
 /// fills (what it leaves becomes a continuation, like the sweep's). A healthy account is refused
 /// before any write; a flagged one that has recovered is un-flagged, and that is the call's effect
 /// — reachable through ANY market for a flagged account, a market where it holds nothing included.
-/// Gas stays flat.
+/// A market whose mark is stale is skipped here too (Q10: a keeper cannot force a close at a price
+/// the oracle has stopped publishing); once it ticks again, this call closes it. Gas stays flat.
 pub fn run_liquidate<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
@@ -1429,10 +1430,10 @@ pub fn run_liquidate<H: PerpHost>(
 
     // The account-level episode for a position CROSSED in force — and for a FLAGGED account with
     // no position here at all: an episode an earlier call left unfinished resumes (or, the account
-    // having recovered, ends) from any market. That is also the way out for a flag that outlived
-    // its account's last cross position (an interrupted episode whose account then closed the rest
-    // itself, or was ADL'd out of it): no sweep visits an account in no registry, and this call is
-    // permissionless.
+    // having recovered, ends) from any market, so a keeper need not know which markets it holds.
+    // (A flag cannot outlive the account's last cross position — the end of the call that closed
+    // it ends the episode, `cross_liquidation::end_flag_without_cross_position` — so this route
+    // is a resume, not the only way out.)
     let route_to_episode = {
         let pos = storage::load_position_ref(context, args.user, args.marketId)?;
         if pos.amount != 0 {

@@ -36,7 +36,10 @@
 //!    A market whose mark is `0` (J4) or older than `STALE_MULT` price intervals (Q10) is skipped.
 //!    One step per market.
 //! 5. END: the flag is cleared (`CrossLiquidationEnded`) as soon as the account is healthy again or
-//!    holds no cross position; otherwise it stays set until a later tick finishes the job.
+//!    holds no cross position; otherwise it stays set until a later tick finishes the job. A last
+//!    cross position closed by any OTHER route while the flag is set — the user's own reduce-only
+//!    orders, a fired stop, an ADL fill against the account — ends it at the end of that call
+//!    ([`end_flag_without_cross_position`]): the flag never outlives the last cross position.
 //!
 //! # Bounded, and resumable
 //!
@@ -47,7 +50,12 @@
 //! on the next market in its order that still holds a cross position — and the next tick or
 //! `drainDeferredWork` of that market resumes it: the account is in that market's registry and
 //! still flagged. Every phase is idempotent (a market with nothing left to cancel costs nothing, a
-//! closed market is skipped), so resuming is simply running the episode again.
+//! closed market is skipped), so resuming is simply running the episode again. Any tick of ANY
+//! market the account still holds a cross position in resumes it just the same (the account is in
+//! that registry too), and a flagged account found healthy there — a mark moved back, a deposit,
+//! its own reduce-only closes — is un-flagged with that single write (`Recovered`). Work a same-
+//! block retry could not finish (a stale mark, no ADL counterparty) records nothing: it waits for
+//! the market's own next tick, or a keeper's `liquidate()` once that mark is fresh again.
 //!
 //! # TOTAL
 //!
@@ -474,6 +482,40 @@ fn settle_cross_funding<H: PerpHost>(
     storage::save_account(context, user, account, AccountUpdateReason::FundingFee)?;
     storage::clear_account_snapshot_mark(context, user);
     Ok(())
+}
+
+/// End `user`'s liquidation episode if the account is flagged but holds no cross position any more
+/// — run by the end of a call in which the account closed a CROSSED position while flagged, or
+/// closed its last position (`storage::flush_account_snapshots`; recorded by `save_position`).
+///
+/// The episode cannot see this itself when the close is not its own: the user's reduce-only orders
+/// (accepted while flagged, Q11, and filled as a maker, R1), a fired stop, the account ADL'd as a
+/// winner, an isolated liquidation of its last position. Without it the flag would outlive the
+/// account's last cross position — and no sweep would ever clear it, since only a market whose
+/// registry holds the account visits it. `marketId` on `CrossLiquidationEnded` is the market of
+/// that last close; the balances are the account's then (`E` its cross wallet, `Σ MM` 0).
+///
+/// Nothing to do — not flagged, or still holding a cross position (its markets' ticks resume the
+/// episode, R6) — writes and emits nothing. Total: position loads and the total fold.
+pub(crate) fn end_flag_without_cross_position<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<(), PerpError> {
+    if !storage::load_account_ref(context, user)?.in_liquidation() {
+        return Ok(());
+    }
+    // A position walk rather than `CrossFold::has_cross`: the fold leaves a leg it cannot evaluate
+    // OUT of every sum (J4), and an unpriceable cross position is still a cross position.
+    let markets = storage::load_user_markets_ref(context, user)?;
+    for &k in markets.iter() {
+        let pos = storage::load_position_ref(context, user, k)?;
+        if pos.amount != 0 && is_crossed(&pos) {
+            return Ok(());
+        }
+    }
+    let fold = cross_fold(context, user, None, None, None)?;
+    end_episode(context, user, market_id, fold.e, fold.cross_mm)
 }
 
 /// Clear the liquidation flag and emit `CrossLiquidationEnded` with the values that ended it.
