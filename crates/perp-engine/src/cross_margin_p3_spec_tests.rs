@@ -2327,7 +2327,7 @@ impl Fuzz {
             index,
             stalled_until,
             base_tiers,
-            aux: Rng(seed ^ 0x52_32_52_32),
+            aux: Rng(seed ^ 0x5232_5232),
             stats: Stats::default(),
             digest: Vec::new(),
         }
