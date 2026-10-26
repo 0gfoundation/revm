@@ -242,8 +242,9 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 ///
 /// Comes from a cross liquidation episode (`risk::cross_liquidation`) with its fill price decided
 /// on the ACCOUNT (`cross_fill_price`): the mark while `E ≥ 0`, the MM-share bankruptcy price
-/// otherwise. Its leg settles into its cross wallet like any cross fill; the episode charges the
-/// clearance fee on what this closed.
+/// clamped into the market's band otherwise (the deficit the band's edge does not transfer stays
+/// in the loser's wallet). Its leg settles into its cross wallet like any cross fill; the episode
+/// charges the clearance fee on what this closed.
 pub(crate) fn run_adl<H: PerpHost>(
     context: &mut H,
     loser: Address,
@@ -252,8 +253,9 @@ pub(crate) fn run_adl<H: PerpHost>(
     budget: &mut u32,
     // The fill price for a CROSSED loser, decided by its liquidation episode
     // (`risk::cross_liquidation`): the mark while the ACCOUNT's `E ≥ 0`, its MM-share bankruptcy
-    // price otherwise (R5) — a cross position has no silo, so its own position equity cannot pick
-    // the price the way an isolated one does below. `None` for an ISOLATED loser.
+    // price clamped into the band otherwise (R5) — a cross position has no silo, so its own
+    // position equity cannot pick the price the way an isolated one does below. `None` for an
+    // ISOLATED loser.
     cross_fill_price: Option<u64>,
 ) -> Result<(), PerpError> {
     let mut loser_pos = storage::load_position(context, loser, market.market_id)?;

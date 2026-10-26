@@ -1691,6 +1691,78 @@ fn adl_values_a_holder_it_cannot_price_at_the_fill_as_fallback_tier_never_an_err
     }
 }
 
+/// **A cross loser's ADL price is clamped into the band** (P3 review) — the IOC's own clamp (Q4),
+/// now the ADL's too. [`dust_leg_deep_deficit`] under the fixture's 100% band: the ≈ $9,998,500
+/// bankruptcy price is cut to the band's edge, $200, so BOB pays $100 for the contract, not ≈ $10M,
+/// and the $9,998,300 the edge did not transfer stays in ALICE's wallet — she is flat, so the
+/// insurance fund clears it at the end of the call (Q8). By the tick and by `liquidate()` alike;
+/// the sweep used to panic here (an `i64` overflow valuing BOB at the unclamped price).
+#[test]
+fn a_wallet_deficit_is_adld_no_further_than_the_band_and_the_fund_clears_the_rest() {
+    for manual in [false, true] {
+        let mut ctx = make_ctx();
+        dust_leg_deep_deficit(&mut ctx);
+        let if0 = insurance_fund_seeded(&mut ctx, usd(10_000_000));
+        let ledger = Ledger::open(&mut ctx);
+
+        let logs = if manual {
+            ok(&mut ctx, KEEPER, &liquidate(ALICE, M1))
+        } else {
+            tick(&mut ctx, M1, px(100))
+        };
+        ledger.check(&mut ctx, "after the liquidation");
+        assert_eq!(adls(&logs), vec![(ALICE, BOB, M1, 1, px(200))], "manual {manual}");
+        assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+        assert_eq!(wallet(&mut ctx, ALICE), 0, "cleared");
+        assert!(!flagged(&mut ctx, ALICE));
+        let cleared: Vec<i64> = evs::<InsuranceFundChanged>(&logs).iter().map(|c| c.delta).collect();
+        assert_eq!(cleared.last(), Some(&usd(-9_998_300)), "the rest of the deficit: {cleared:?}");
+        assert_eq!(rows(&logs, ALICE).last().unwrap().reason, INSURANCE_CLEAR);
+        assert!(if0 - insurance_fund(&mut ctx) >= usd(9_998_300) as u64);
+    }
+}
+
+/// **No deficit cascade through a solvent cross winner** (P3 review). ALICE: a cross long of 1 on
+/// M1 next to a −$10,000 wallet. BOB, CROSSED, is the M1 short (`E = $1,000`) and long 10 on M3
+/// against KEEPER (ISOLATED). M1 and M3 run a 5% band. M1's tick ADLs ALICE's contract to BOB at
+/// the band's edge, $105 — not at her $10,100 bankruptcy price, which used to push BOB's wallet to
+/// −$9,000, and M3's tick then dumped BOB's deficit onto KEEPER at 10× the mark (KEEPER's whole
+/// silo) with the fund paying $8,000 more. Now BOB pays $5 and stays healthy, ALICE's $9,995 left
+/// over is cleared by the fund, and M3's tick touches nobody.
+#[test]
+fn a_dust_leg_does_not_cascade_its_wallet_deficit_through_a_solvent_cross_winner() {
+    let mut ctx = make_ctx();
+    set_type(&mut ctx, BOB, M1, CROSSED);
+    set_type(&mut ctx, BOB, M3, CROSSED);
+    set_leverage(&mut ctx, BOB, M1, 3);
+    set_leverage(&mut ctx, BOB, M3, 3);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 1);
+    trade(&mut ctx, M3, BOB, KEEPER, BUY, px(100), 10);
+    set_wallet(&mut ctx, BOB, usd(1_000));
+    set_wallet(&mut ctx, ALICE, usd(-10_000));
+    let if0 = insurance_fund_seeded(&mut ctx, usd(1_000_000));
+    for m in [M1, M3] {
+        let mut mk = storage::load_market(&mut ctx, m).unwrap().unwrap();
+        mk.price_band_bps = 500;
+        storage::save_market(&mut ctx, &mk).unwrap();
+    }
+    let ledger = Ledger::open(&mut ctx);
+    let keeper_silo = pos(&mut ctx, KEEPER, M3).margin;
+
+    let logs = tick(&mut ctx, M1, px(100));
+    ledger.check(&mut ctx, "after M1's tick");
+    assert_eq!(adls(&logs), vec![(ALICE, BOB, M1, 1, px(105))]);
+    assert_eq!(wallet(&mut ctx, BOB), usd(995));
+    assert!(!flagged(&mut ctx, BOB) && !fold(&mut ctx, BOB).below_cross_maintenance());
+    assert_eq!(wallet(&mut ctx, ALICE), 0);
+    assert_eq!(if0 - insurance_fund(&mut ctx), usd(9_995) as u64);
+
+    let logs = tick(&mut ctx, M3, px(100));
+    ledger.check(&mut ctx, "after M3's tick");
+    assert!(adls(&logs).is_empty() && evs::<Liquidation>(&logs).is_empty());
+    assert_eq!((pos(&mut ctx, BOB, M3).amount, pos(&mut ctx, KEEPER, M3).margin), (10, keeper_silo));
+}
+
 // ── A randomised multi-market run ──────────────────────────────────────────────
 
 /// A deterministic PRNG (xorshift64).

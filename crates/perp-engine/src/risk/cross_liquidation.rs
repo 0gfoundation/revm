@@ -32,9 +32,10 @@
 //!    wallet; a LIMIT IOC for the whole `|amount_k|` at the MM-share bankruptcy price clamped into
 //!    the band (Q4, Q5); the clearance fee on the notional closed, capped at `max(0, E_after)`
 //!    (Q3); STOP once `E ≥ Σ MM` (Q6 — a partial liquidation); otherwise hand the unfilled rest to
-//!    ADL at the mark while `E ≥ 0`, at the bankruptcy price otherwise (R5), fee, stop check again.
-//!    A market whose mark is `0` (J4) or older than `STALE_MULT` price intervals (Q10) is skipped.
-//!    One step per market.
+//!    ADL at the mark while `E ≥ 0`, at the bankruptcy price clamped into the band otherwise (R5 —
+//!    what the band's edge does not transfer stays in the wallet, for the account's silos and in
+//!    the end the insurance fund, Q8), fee, stop check again. A market whose mark is `0` (J4) or
+//!    older than `STALE_MULT` price intervals (Q10) is skipped. One step per market.
 //! 5. END: the flag is cleared (`CrossLiquidationEnded`) as soon as the account is healthy again or
 //!    holds no cross position; otherwise it stays set until a later tick finishes the job. A last
 //!    cross position closed by any OTHER route while the flag is set — the user's own reduce-only
@@ -326,8 +327,7 @@ fn close_market<H: PerpHost>(
 
     // ── (d) the IOC at the MM-share bankruptcy price, clamped into the band (Q4) ──
     let bankruptcy = mm_share_bankruptcy_price(market, &pos, &fold, &legs);
-    let (upper, lower) = crate::math::mark_band_bounds(mark, market.price_band_bps);
-    let limit = (bankruptcy as u128).max(lower).min(upper).min(u64::MAX as u128) as u64;
+    let limit = clamp_into_band(bankruptcy, market);
     let close = execute_liquidation_market_order(context, user, market, side, qty, Some(limit))?;
     let mut leftover = close.maker_cap_deferred;
     let (mut fold, mut reward) = charge_fee_and_fold(context, user, market, qty - close.remaining)?;
@@ -337,13 +337,27 @@ fn close_market<H: PerpHost>(
         // R5: at the MARK while the account still has equity (the winners lose exposure, not
         // money), at the MM-share bankruptcy price once it has none (the winners absorb this
         // market's share of the deficit). Recomputed on the post-IOC state.
+        //
+        // ── …CLAMPED INTO THE BAND, like the IOC's limit (P3 review) ──
+        //
+        // `share_k = E · MM_k / Σ MM` is the whole deficit when the account's other legs are
+        // gone: a deficit already REALIZED into the wallet (a reduce-only close through
+        // bankruptcy, a funding run, an earlier fallback fill) next to one small leg makes `Σ MM ≈
+        // MM_k`, and the unclamped price lands at any multiple of the mark — the J2 concentration
+        // the MM split exists to prevent, arriving through `W` instead of through other legs'
+        // uPnL, and past `i64` for a large holder at that price. The band is the farthest from
+        // the mark this episode trades at, book or ADL: the winners pay at most the band's edge,
+        // and what the clamped price does not transfer STAYS IN THE WALLET as a receivable — the
+        // account's isolated silos net it as they close, and once it holds no position the
+        // insurance fund clears the rest (owner decision Q8), the same fund an isolated close's
+        // bad debt reaches. (A market whose band is set wide open accepts the wider price.)
         let price = if fold.e >= 0 {
             mark
         } else {
             let pos = storage::load_position(context, user, k)?;
             let mut legs = Vec::new();
             let f = cross_fold(context, user, None, None, Some(&mut legs))?;
-            mm_share_bankruptcy_price(market, &pos, &f, &legs)
+            clamp_into_band(mm_share_bankruptcy_price(market, &pos, &f, &legs), market)
         };
         run_adl(context, user, market, mark, adl_budget, Some(price))?;
         let after = storage::load_position_ref(context, user, k)?.amount.unsigned_abs();
@@ -373,6 +387,14 @@ fn close_market<H: PerpHost>(
         cross_mm: fold.cross_mm,
         leftover,
     }))
+}
+
+/// `price` clamped into `market`'s band around its mark (`math::mark_band_bounds`), the farthest a
+/// cross episode trades from the mark — its IOC's limit (Q4) and its ADL price alike. Total: the
+/// bounds are `u128`, the result saturates to `u64`.
+fn clamp_into_band(price: u64, market: &Market) -> u64 {
+    let (upper, lower) = crate::math::mark_band_bounds(market.mark_price, market.price_band_bps);
+    (price as u128).max(lower).min(upper).min(u64::MAX as u128) as u64
 }
 
 /// The clearance fee on `closed` (Q3: the notional closed × the market's rate, capped at
