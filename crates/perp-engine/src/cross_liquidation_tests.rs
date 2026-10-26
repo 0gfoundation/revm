@@ -1637,6 +1637,80 @@ fn a_negative_wallet_waits_for_the_last_position_and_nets_the_silo_first() {
     }
 }
 
+/// `OrderCancelled.reason` 2 = MakerInsolvent (K9 — and a cross opening with no cash at hand).
+const CANCEL_MAKER_INSOLVENT: u8 = 2;
+
+/// **A resting CROSS order cannot open on a wallet with no cash** (P3 review). A receivable is a
+/// non-positive wallet nothing in the cross fold watches — an account with no cross position is in
+/// no cross registry, never flagged, its resting orders never cancelled — and a taker open, a
+/// rest and every outflow are shut on it (`A < 0`, `X = 0`), but a resting cross order placed while
+/// the account was healthy still filled as a maker (Q9 skips the account check), opening a cross
+/// position at `E = W ≤ 0`:
+/// * a RECEIVABLE (`W < 0`, an isolated silo still open, J3): the next tick's episode priced the
+///   whole receivable into that market's ADL price and a bystander paid it, and the silo then went
+///   home to the user in full;
+/// * a CLEARED account (`W = 0` after Q8): a free option — an adverse move before the next tick
+///   was the ADL winners' or the fund's, a favourable one the account's.
+///
+/// Now such a fill is refused like an isolated maker's K9 — the order cancelled with reason 2 —
+/// exactly as the same order on an ISOLATED market already was (its silo would get no cash).
+#[test]
+fn a_resting_cross_order_cannot_open_on_a_wallet_with_no_cash() {
+    // A receivable: ALICE's cross M1 long closed at a loss while her ISOLATED M3 long is open.
+    let mut ctx = make_ctx();
+    set_type(&mut ctx, ALICE, M3, ISOLATED);
+    set_wallet(&mut ctx, ALICE, usd(3_000));
+    trade(&mut ctx, M3, ALICE, CAROL, BUY, px(100), 10);
+    let bid = rest(&mut ctx, ALICE, M2, BUY, px(100), 10);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 40);
+    rest(&mut ctx, MAKER, M1, BUY, px(30), 40);
+    ok(&mut ctx, ALICE, &order_flags(M1, SELL, px(30), 40, IOC, RO));
+    assert!(wallet(&mut ctx, ALICE) < 0, "a receivable: the isolated M3 long is still open");
+    let ledger = Ledger::open(&mut ctx);
+    let w0 = wallet(&mut ctx, ALICE);
+
+    let logs = ok(&mut ctx, KEEPER, &order(M2, SELL, px(100), 10, IOC));
+    ledger.check(&mut ctx, "after the refused maker fill");
+    assert!(evs::<Trade>(&logs).is_empty(), "the bid did not fill");
+    let c = evs::<OrderCancelled>(&logs);
+    assert_eq!(
+        c.iter().map(|c| (c.user, c.orderId.0, c.reason)).collect::<Vec<_>>(),
+        vec![(ALICE, bid, CANCEL_MAKER_INSOLVENT)]
+    );
+    assert_eq!((pos(&mut ctx, ALICE, M2).amount, wallet(&mut ctx, ALICE)), (0, w0));
+
+    // A cleared account: flat, the fund paid its deficit, its bid still resting.
+    let mut ctx = make_ctx();
+    set_wallet(&mut ctx, ALICE, usd(1_000));
+    let bid = rest(&mut ctx, ALICE, M2, BUY, px(100), 5);
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 20);
+    insurance_fund_seeded(&mut ctx, usd(1_000));
+    rest(&mut ctx, MAKER, M1, BUY, px(40), 20);
+    let logs = ok(&mut ctx, ALICE, &order_flags(M1, SELL, px(40), 20, IOC, RO));
+    assert_eq!(rows(&logs, ALICE).last().unwrap().reason, INSURANCE_CLEAR);
+    assert_eq!(wallet(&mut ctx, ALICE), 0);
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = ok(&mut ctx, KEEPER, &order(M2, SELL, px(100), 5, IOC));
+    ledger.check(&mut ctx, "after the refused maker fill");
+    assert!(evs::<Trade>(&logs).is_empty(), "the bid did not fill");
+    let c = evs::<OrderCancelled>(&logs);
+    assert_eq!(
+        c.iter().map(|c| (c.user, c.orderId.0, c.reason)).collect::<Vec<_>>(),
+        vec![(ALICE, bid, CANCEL_MAKER_INSOLVENT)]
+    );
+    assert_eq!((pos(&mut ctx, ALICE, M2).amount, wallet(&mut ctx, ALICE)), (0, 0));
+
+    // With cash at hand the same resting order fills as before (Q9: no account-level check).
+    let mut ctx = make_ctx();
+    set_wallet(&mut ctx, ALICE, usd(1_000));
+    rest(&mut ctx, ALICE, M2, BUY, px(100), 5);
+    set_wallet(&mut ctx, ALICE, 1);
+    let logs = ok(&mut ctx, KEEPER, &order(M2, SELL, px(100), 5, IOC));
+    assert_eq!(evs::<Trade>(&logs).len(), 1);
+    assert_eq!(pos(&mut ctx, ALICE, M2).amount, 5);
+}
+
 /// **R4 — the fund is SHORT.** The user-close route with only $40 in the fund: it pays what it has,
 /// `InsuranceFundDepleted(M1, $60)` records the rest as socialised (the convention of every deficit
 /// the fund cannot absorb), and the wallet still ends at exactly 0 — the identity opens by exactly

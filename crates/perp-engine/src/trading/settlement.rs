@@ -745,7 +745,8 @@ pub(super) enum MakerFillOutcome {
     /// its `OrderCancelled`. THREE triggers, all meaning "this maker cannot take this fill":
     ///
     /// 1. it would open/increase an ISOLATED position below the maintenance-margin threshold at
-    ///    the current mark (K9 — a CROSSED maker is never refused on solvency, see
+    ///    the current mark (K9), or a CROSSED one on a wallet with no cash at hand (`W ≤ 0` after
+    ///    the fill's close leg — the one solvency floor of a cross maker, O(1); see
     ///    `settle_maker_fill_core`) — `MakerInsolvent`;
     /// 2. it would open at a leverage the resulting size's margin tier no longer permits —
     ///    `MakerInsolvent`;
@@ -760,7 +761,9 @@ pub(super) enum MakerFillOutcome {
     /// [`settle_maker_fill_core`]). This channel is for fills that would leave an INSOLVENT
     /// POSITION or that a liquidation has frozen, which are different questions from an
     /// under-funded wallet — and NOT for an unhealthy cross ACCOUNT: a cross maker fill gets no
-    /// account-level check (owner decision Q9 / D13), the liquidation sweep is the backstop.
+    /// account-level check (owner decision Q9 / D13), the liquidation sweep is the backstop. (A
+    /// wallet with NO cash is the exception, trigger 1: an under-covered lien fills, an
+    /// uncovered one on a receivable or a cleared account does not.)
     ///
     /// Funding accrued on the maker's position IS settled and persisted regardless (it is owed
     /// whether or not the fill happens, and may already have touched the Insurance Fund inline).
@@ -2155,6 +2158,10 @@ pub(super) fn settle_maker_fill_core(
         fill.is_buy,
         funding,
     )?;
+    // The cash at hand when the opening leg happens: the wallet after this fill's own close leg,
+    // before its fee — what M1 funds an ISOLATED opening leg from (inside `apply_position_fill`),
+    // and what a CROSSED one needs to be positive (the cash-at-hand floor below).
+    let cash_at_hand = trial_wallet;
 
     // ── Maker trading fee: charged from the margin this fill just funded (Binance parity) ──
     // This is a NEW wallet-side charge, not a deletion: the maker fee used to be pre-escrowed in
@@ -2251,7 +2258,8 @@ pub(super) fn settle_maker_fill_core(
     // PnL (`apply_position_fill` under `Cross`) and the whole fee land on this wallet, and a loss
     // larger than it leaves it negative — a normal cross state, backed by the account's other
     // cross positions and judged at the account level (`E < Σ_C MM`). No account-level check runs
-    // here (owner decision Q9).
+    // here (owner decision Q9) — only the cash-at-hand floor below: no OPENING on a wallet with
+    // no cash.
     //
     // That is why `perp_wallet_balance` is `i64`, and why the negative-wallet machinery — the
     // money-out gates on `X` (`margin_view::derived_withdrawable_balance`), the order gates on `A`,
@@ -2286,6 +2294,27 @@ pub(super) fn settle_maker_fill_core(
             market.price_decimals,
         )?
     {
+        return Ok(MakerFillCore::RejectedInsolvent);
+    }
+
+    // ── The cross maker's one O(1) floor: no opening on a wallet with no cash (P3 review) ──
+    //
+    // Q9 runs no ACCOUNT-level check on a cross maker fill, and that is right for an account the
+    // cross sweep watches. It was not right for a wallet at or below zero, the one state no gate
+    // re-examines a resting order against: a RECEIVABLE (`W < 0` while an isolated silo is open,
+    // J3) or an account the insurance fund just CLEARED (`W = 0`, Q8). Every taker open, every
+    // new rest and every outflow is shut there (`A < 0`, `X = 0`), but an order resting from
+    // before still filled, opening a cross position at `E ≤ 0` on an account in no cross registry
+    // — its next tick then priced the receivable into that market's ADL price for a bystander to
+    // pay (the silo going home to the user in full), or, cleared, it held a free option: an
+    // adverse move the ADL winners' or the fund's, a favourable one its own. An ISOLATED maker in
+    // the same state is already refused (M1 funds its silo with nothing, and K9 above fails), so
+    // the cross one is refused the same way, on the same cash basis: `MakerInsolvent`. For an
+    // account with no other cross leg this IS the account check (`E = W`); for one with cross
+    // gains elsewhere it is conservative — an account that has realized more than it holds may
+    // not grow its exposure on its unrealized profit alone through a resting order. Closing is
+    // never refused.
+    if fill.opening_qty > 0 && funding == OpeningMarginFunding::Cross && cash_at_hand <= 0 {
         return Ok(MakerFillCore::RejectedInsolvent);
     }
 
@@ -2632,9 +2661,11 @@ impl FillsGate {
 /// debt on a cross wallet) — the "active close through bankruptcy" risk of cross report §5.1,
 /// which isolated closes already carry as bad debt. Cross P3 does not bound the price: the
 /// overshoot is a receivable on the wallet while the account holds any position (`A < 0` and
-/// `X = 0` shut every open and outflow), and once the LAST position is closed the insurance fund
-/// clears what is left (`risk::negative_balance`, owner decision Q8) — the same fund that takes an
-/// isolated close's bad debt.
+/// `X = 0` shut every taker open, every new rest and every outflow; an order resting from before
+/// cannot open on it either — a maker fill needs cash at hand, `settle_maker_fill_core`, as an
+/// isolated one always did), and once the LAST position is closed the insurance fund clears what
+/// is left (`risk::negative_balance`, owner decision Q8) — the same fund that takes an isolated
+/// close's bad debt.
 fn fills_are_covered(available: i128, total_required: u64, gate: FillsGate) -> bool {
     match gate {
         FillsGate::Available => {

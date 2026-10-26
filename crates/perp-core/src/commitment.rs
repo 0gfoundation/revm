@@ -452,6 +452,11 @@ use primitives::{B256, U256};
 //     to the $180 mark: BOB +$64.30, the fund −$64.30 (DAVE's cleared deficit $35.70 → $100) —
 //     the intended change, written down in `cross_golden_tests`. Cross pin re-pinned
 //     0x84977f13…e969 → 0x9c7be213…4132.
+//   * P3 review — a CROSSED maker fill that OPENS needs cash at hand (`W > 0` after the fill's
+//     close leg), else it is refused like an isolated K9 (`MakerInsolvent`, the order cancelled):
+//     a receivable or a cleared wallet can no longer open through an order resting from before.
+//     Reachable only with a cross maker at `W ≤ 0`: both pins unchanged (0xfdf928b5…47d4,
+//     0x9c7be213…4132), BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

@@ -2334,7 +2334,9 @@ sol! {
         //
         // `reason` is `CancelReason` (perp-core `types::order`): 0 = the owner asked (cancelOrder /
         // cancelOrderSigned / batchCancelOrders), 1 = taker margin cover mid-match, 2 = maker fill
-        // rejected as opening-into-insolvency, 3 = the owner was liquidated, 4 = the order was
+        // rejected as opening-into-insolvency (an ISOLATED open below maintenance or past its tier,
+        // or — cross P3 — a CROSSED open on a wallet with no cash: at or below zero after the
+        // fill's own close leg), 3 = the owner was liquidated, 4 = the order was
         // stranded out of band at the touch and the mark update expired it, 5/6/7 = reduce-only
         // eviction (position shrank / would open / overtaken by a normal order), 8 = the owner was
         // an ADL counterparty, 9 = self-trade prevention (a same-address GTC / IOC / market taker

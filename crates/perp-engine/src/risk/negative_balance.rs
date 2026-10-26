@@ -5,8 +5,11 @@
 //! `types::UserAccount::perp_wallet_balance`), and so may an isolated-only one, by a maker
 //! commission its close had nothing left to pay. While the account holds ANY position that deficit
 //! is a receivable: the account's other positions may still close in profit, an isolated silo will
-//! hand its close credit back to this very wallet, and `A < 0` / `X = 0` keep every open and every
-//! outflow shut in the meantime. Binance's rule for clearing it (cross report §1.6 item 9, F23)
+//! hand its close credit back to this very wallet, and `A < 0` / `X = 0` keep every taker open,
+//! every new rest and every outflow shut in the meantime — and an order resting from before cannot
+//! open on it either: a maker fill that opens needs cash at hand, cross as isolated
+//! (`trading::settlement::settle_maker_fill_core`; so a cleared wallet, at 0, opens nothing until
+//! money comes in). Binance's rule for clearing it (cross report §1.6 item 9, F23)
 //! is the account holding NO open position, cross or isolated; we apply it at the moment that first
 //! becomes true — the end of the call that closed the last one (deviation D6: no ten-minute timer
 //! on chain), whatever route closed it.
