@@ -399,6 +399,13 @@ use primitives::{B256, U256};
 //     position CROSSED in force: gated off no write of an isolated account moves; the golden pin
 //     0xaea562b9…1e61 is unchanged, BusinessSnapshot UNCHANGED. (The `Liquidation` event's
 //     appended `marginType` is a log, not state.)
+//   * P3 — negative-balance clearance (owner decisions Q8, R4). An EXECUTION-RULE change for both
+//     margin types, no layout change: an account whose LAST position closes (any route) with the
+//     wallet below zero has it cleared at the end of that call — the insurance fund pays `−W` (what
+//     it has; the rest is socialised, `InsuranceFundDepleted`) and the wallet becomes 0. Isolated
+//     accounts reach it too (a maker commission on a last close was the one route). The golden
+//     scenario leaves no account flat below zero: the pin 0xaea562b9…1e61 is unchanged,
+//     BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

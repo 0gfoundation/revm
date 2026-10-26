@@ -11,6 +11,11 @@
 //!   closes first) and the close order;
 //! * budget and continuation (`deferred_work`, resumed by the drain), the `-2023` freeze in between;
 //! * manual `liquidate()`: healthy refused write-clean, a recovered flag cleared, the start market;
+//! * negative-balance clearance (Q8, R4): a negative wallet is cleared by the insurance fund at the
+//!   end of the call that closed the account's LAST position — by a user close, a maker fill, a
+//!   fired stop, a cross episode (sweep or drain), an ADL fill on the winning side — never while a
+//!   position (an isolated silo included) is open, and with a short fund what it cannot pay is
+//!   socialised (`InsuranceFundDepleted`);
 //! * J4: a mark of 0 and a leg the fold cannot price are skipped, never an `Err`;
 //! * a randomised multi-market run: never a panic, custody after every step, and after every tick
 //!   no account holding a cross position in the ticked market is left below maintenance unflagged.
@@ -26,8 +31,9 @@ use crate::host::PerpHost;
 use crate::{
     interface::IPerpDex::{
         drainDeferredWorkCall, liquidateCall, placeAlgoOrderCall, placeOrderCall, setLeverageCall,
-        setMarginTypeCall, updateIndexPriceCall, Adl, AlgoOrderCancelled, CrossLiquidationEnded,
-        CrossLiquidationStarted, Liquidation, OrderCancelled, OrderPlaced, Trade,
+        setMarginTypeCall, transferFromPerpCall, updateIndexPriceCall, AccountBalanceChanged, Adl,
+        AlgoOrderCancelled, CrossLiquidationEnded, CrossLiquidationStarted, InsuranceFundChanged,
+        InsuranceFundDepleted, Liquidation, OrderCancelled, OrderPlaced, Trade,
     },
     risk::cross_liquidation::{liquidate_cross_account, CrossLiquidationOutcome, EpisodeCaller},
     run_perp_dex_call, storage,
@@ -202,6 +208,12 @@ fn rest(ctx: &mut TestCtx, user: Address, m: u64, side: u8, price: u64, qty: u64
     placed_id(&logs, user)
 }
 
+/// [`rest`] with order flags (`RO`).
+fn rest_flags(ctx: &mut TestCtx, user: Address, m: u64, side: u8, price: u64, qty: u64, flags: u8) {
+    let logs = ok(ctx, user, &order_flags(m, side, price, qty, GTC, flags));
+    assert!(evs::<Trade>(&logs).is_empty(), "the resting order traded");
+}
+
 fn placed_id(logs: &[Log], user: Address) -> [u8; 32] {
     evs::<OrderPlaced>(logs).iter().find(|o| o.user == user).expect("an OrderPlaced").orderId.0
 }
@@ -243,6 +255,13 @@ fn pos(ctx: &mut TestCtx, user: Address, m: u64) -> crate::types::PerpPosition {
 
 fn insurance_fund(ctx: &mut TestCtx) -> u64 {
     storage::load_insurance_fund(ctx).unwrap()
+}
+
+/// Fixture only: sets the insurance fund to `amount` — new money for the identity, so BEFORE
+/// [`Ledger::open`]. Returns the fund.
+fn insurance_fund_seeded(ctx: &mut TestCtx, amount: i64) -> u64 {
+    storage::save_insurance_fund(ctx, amount as u64).unwrap();
+    amount as u64
 }
 
 fn fold(ctx: &mut TestCtx, user: Address) -> crate::margin_view::CrossFold {
@@ -821,6 +840,318 @@ fn liquidate_clears_a_flag_that_outlived_the_last_cross_position() {
     assert!(!flagged(&mut ctx, ALICE));
     rejects(&mut ctx, KEEPER, &liquidate(ALICE, M3), "liquidate: no open position");
     ok(&mut ctx, ALICE, &order(M1, BUY, px(90), 1, GTC));
+}
+
+// ── Negative-balance clearance (Q8, R4) ─────────────────────────────────────────
+
+/// `AccountBalanceChanged` reason 7, Binance's `INSURANCE_CLEAR`.
+const INSURANCE_CLEAR: u8 = 7;
+
+/// `user`'s `AccountBalanceChanged` rows in `logs`, in order.
+fn rows(logs: &[Log], user: Address) -> Vec<AccountBalanceChanged> {
+    evs::<AccountBalanceChanged>(logs).into_iter().filter(|r| r.user == user).collect()
+}
+
+/// **Q8 — the clearance, and its shape.** `user` closed its LAST position in the call that logged
+/// `logs`, leaving the wallet at `-deficit`: the insurance fund paid it (`InsuranceFundChanged`,
+/// `−deficit`), the wallet is exactly 0, and the account's LAST row of the call is its own
+/// `INSURANCE_CLEAR` at 0 — preceded by a row that published the deficit itself, unclamped.
+fn assert_cleared(ctx: &mut TestCtx, logs: &[Log], user: Address, deficit: i64, if_before: u64) {
+    assert!(deficit > 0);
+    assert_eq!(storage::load_account(ctx, user).unwrap().open_position_count, 0, "flat");
+    assert_eq!(wallet(ctx, user), 0, "the negative wallet was cleared to exactly 0");
+    assert_eq!(if_before - insurance_fund(ctx), deficit as u64, "the fund paid the deficit");
+    let changed = evs::<InsuranceFundChanged>(logs);
+    assert_eq!(changed.last().map(|c| (c.delta, c.newBalance)), Some((-deficit, insurance_fund(ctx))));
+    assert!(evs::<InsuranceFundDepleted>(logs).is_empty(), "the fund covered it all");
+    let r = rows(logs, user);
+    let clears: Vec<&AccountBalanceChanged> =
+        r.iter().filter(|r| r.reason == INSURANCE_CLEAR).collect();
+    assert_eq!(clears.len(), 1, "one INSURANCE_CLEAR row");
+    let last = r.last().unwrap();
+    assert_eq!(
+        (last.reason, last.totalCrossWalletBalance, last.totalWalletBalance),
+        (INSURANCE_CLEAR, 0, 0),
+        "the clearance is the account's last row of the call"
+    );
+    let published: Vec<i64> = r.iter().map(|r| r.totalCrossWalletBalance).collect();
+    assert!(
+        published.contains(&-deficit),
+        "the deficit itself was published before it was cleared: {published:?}"
+    );
+}
+
+/// ALICE: a CROSSED 3x long of 10 on M1 at $100 with $200 left in the wallet — her only position.
+/// At a $70 mark she is $100 under water.
+fn underwater_long(ctx: &mut TestCtx) {
+    long_10_on_m1(ctx, usd(200));
+    set_mark(ctx, M1, px(70));
+}
+
+/// **Route: the user's own close.** ALICE sells her last position herself (reduce-only, a pure
+/// reduce on a cross wallet is never margin-gated) at $70 — through her bankruptcy price: the $300
+/// loss settles into the cross wallet (no per-fill bad debt, G2), which goes to −$100, and the end
+/// of the call clears it.
+#[test]
+fn a_user_close_of_the_last_position_clears_the_negative_wallet() {
+    let (_g, mut ctx) = make_ctx();
+    underwater_long(&mut ctx);
+    rest(&mut ctx, MAKER, M1, BUY, px(70), 10);
+    let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = ok(&mut ctx, ALICE, &order_flags(M1, SELL, px(70), 10, IOC, RO));
+    ledger.check(&mut ctx, "after the close");
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    assert_cleared(&mut ctx, &logs, ALICE, usd(100), if0);
+}
+
+/// **Route: a maker fill.** ALICE's last position is closed by her own resting reduce-only order,
+/// filled by a taker at $70.
+#[test]
+fn a_maker_close_of_the_last_position_clears_the_negative_wallet() {
+    let (_g, mut ctx) = make_ctx();
+    long_10_on_m1(&mut ctx, usd(200));
+    rest_flags(&mut ctx, ALICE, M1, SELL, px(70), 10, RO);
+    set_mark(&mut ctx, M1, px(70));
+    let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = ok(&mut ctx, BOB, &order(M1, BUY, px(70), 10, IOC));
+    ledger.check(&mut ctx, "after the fill");
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    assert_cleared(&mut ctx, &logs, ALICE, usd(100), if0);
+}
+
+/// **Route: a fired conditional.** ALICE's stop-market (reduce-only) at $75 fires on M1's tick to
+/// $70 — BEFORE the liquidation sweep, which then finds no position — and sells into the $70 bid.
+#[test]
+fn a_fired_stop_closing_the_last_position_clears_the_negative_wallet() {
+    let (_g, mut ctx) = make_ctx();
+    long_10_on_m1(&mut ctx, usd(200));
+    ok(
+        &mut ctx,
+        ALICE,
+        &placeAlgoOrderCall {
+            algoType: 0,
+            marketId: M1,
+            side: SELL,
+            orderType: 1,
+            triggerPrice: px(75),
+            price: 0,
+            quantity: 10,
+            tif: 0,
+            workingType: 0,
+            clientAlgoId: FixedBytes::default(),
+            flags: RO,
+        }
+        .abi_encode(),
+    );
+    rest(&mut ctx, MAKER, M1, BUY, px(70), 10);
+    let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = tick(&mut ctx, M1, px(70));
+    ledger.check(&mut ctx, "after the tick");
+    assert!(evs::<Liquidation>(&logs).is_empty(), "the stop closed it first");
+    assert!(evs::<CrossLiquidationStarted>(&logs).is_empty());
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    assert_cleared(&mut ctx, &logs, ALICE, usd(100), if0);
+}
+
+/// **Route: a cross liquidation episode (the sweep).** M1's band is 10%: at a $70 mark ALICE's
+/// bankruptcy price ($80: `E = −$100`, all of the share on M1) is above the band, so the IOC's limit
+/// is clamped DOWN to the band's edge, $77, and fills the $77 bid — below her bankruptcy price. The
+/// close realizes −$230, the wallet ends at −$30, the episode ends (no cross position left), and the
+/// end of the call clears the rest. (A bankrupt account pays no clearance fee.)
+#[test]
+fn a_cross_episode_closing_through_the_band_clears_the_negative_wallet() {
+    let (_g, mut ctx) = make_ctx();
+    set_fee_rate(&mut ctx, M1, 125);
+    let mut mk = storage::load_market(&mut ctx, M1).unwrap().unwrap();
+    mk.price_band_bps = 1_000;
+    storage::save_market(&mut ctx, &mk).unwrap();
+    long_10_on_m1(&mut ctx, usd(200));
+    rest(&mut ctx, MAKER, M1, BUY, px(77), 10);
+    let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = tick(&mut ctx, M1, px(70));
+    ledger.check(&mut ctx, "after the tick");
+    let close: Vec<OrderPlaced> =
+        evs::<OrderPlaced>(&logs).into_iter().filter(|o| o.user == ALICE).collect();
+    assert_eq!(close[0].price, px(77), "clamped from $80 to mark + 10%");
+    assert_eq!(evs::<Liquidation>(&logs)[0].reward, 0, "bankrupt: no fee");
+    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_cleared(&mut ctx, &logs, ALICE, usd(30), if0);
+}
+
+/// **Route: the drain.** The same band-clamped episode, but run out of budget in its cancel phase
+/// first (ALICE has orders on M2 and M3): the continuation is on M1, and `drainDeferredWork(M1)`
+/// resumes it — cancels the rest, closes M1 through the band — and its call clears the wallet.
+#[test]
+fn a_drained_episode_closing_the_last_position_clears_the_negative_wallet() {
+    let (_g, mut ctx) = make_ctx();
+    let mut mk = storage::load_market(&mut ctx, M1).unwrap().unwrap();
+    mk.price_band_bps = 1_000;
+    storage::save_market(&mut ctx, &mk).unwrap();
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    rest(&mut ctx, ALICE, M2, BUY, px(50), 1);
+    rest(&mut ctx, ALICE, M3, BUY, px(50), 1);
+    set_wallet(&mut ctx, ALICE, usd(200));
+    set_mark(&mut ctx, M1, px(70));
+    rest(&mut ctx, MAKER, M1, BUY, px(77), 10);
+    let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
+    let ledger = Ledger::open(&mut ctx);
+
+    let caller = EpisodeCaller { sweep_market: None, fresh_market: None, liquidator: KEEPER };
+    let (mut budget, mut adl_budget, mut deferred) = (1, 128, false);
+    liquidate_cross_account(&mut ctx, ALICE, M1, caller, &mut budget, &mut adl_budget, &mut deferred)
+        .unwrap();
+    storage::flush_account_snapshots(&mut ctx).unwrap();
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    assert!(flagged(&mut ctx, ALICE));
+    assert_eq!(storage::load_market(&mut ctx, M1).unwrap().unwrap().deferred_work, 1);
+
+    let logs = ok(&mut ctx, KEEPER, &drainDeferredWorkCall { marketId: M1 }.abi_encode());
+    ledger.check(&mut ctx, "after the drain");
+    assert_eq!(storage::book_order_count(&mut ctx, ALICE, M3).unwrap(), 0);
+    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_cleared(&mut ctx, &logs, ALICE, usd(30), if0);
+}
+
+/// **Route: ADL, the account on the WINNING side.** ALICE (CROSSED, short 4 at $100, wallet −$140)
+/// is the only counterparty of CAROL's ISOLATED 3x long, liquidated (by `liquidate()`, so the
+/// tick's sweep does not run ALICE's own episode first) at a $60 mark with an empty book. CAROL is
+/// insolvent, so ADL fills at her bankruptcy price ≈ $66.67 — $6.67 above the mark against ALICE,
+/// more than her `E = $20` can carry (`20 − 4 · 6.67 < 0`, R5), so she is fallback tier, and the
+/// only one: she is closed out of her last position with the wallet still below zero, and the end
+/// of the call clears it.
+#[test]
+fn an_adl_fill_closing_the_winners_last_position_clears_its_negative_wallet() {
+    let (_g, mut ctx) = make_ctx();
+    set_leverage(&mut ctx, CAROL, M1, 3);
+    trade(&mut ctx, M1, CAROL, ALICE, BUY, px(100), 4);
+    set_wallet(&mut ctx, ALICE, usd(-140));
+    set_mark(&mut ctx, M1, px(60));
+    let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
+    let ledger = Ledger::open(&mut ctx);
+    assert_eq!(fold(&mut ctx, ALICE).e, usd(20) as i128);
+
+    let logs = ok(&mut ctx, KEEPER, &liquidate(CAROL, M1));
+    ledger.check(&mut ctx, "after the liquidation + ADL");
+    let a = adls(&logs);
+    assert_eq!(a.len(), 1);
+    assert_eq!((a[0].0, a[0].1, a[0].3), (CAROL, ALICE, 4));
+    assert!(a[0].4 > px(66) && a[0].4 <= px(67), "at CAROL's bankruptcy price: {}", a[0].4);
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    let paid = if0 - insurance_fund(&mut ctx);
+    assert!(paid > 0 && paid < usd(7) as u64, "≈ $6.67: {paid}");
+    assert_cleared(&mut ctx, &logs, ALICE, paid as i64, if0);
+}
+
+/// **Not before the LAST position (Q8, J3).** ALICE closes her cross long at a loss while she still
+/// holds an ISOLATED long on M2: the wallet stays negative — a receivable — and keeps every open
+/// and every withdrawal shut (`A < 0`, `X = 0`), across calls. Closing the isolated position hands
+/// its silo back to that wallet first; only what is left negative after the LAST close is cleared.
+/// Run twice: a silo that covers the deficit (nothing to clear, no row) and one that does not.
+#[test]
+fn a_negative_wallet_waits_for_the_last_position_and_nets_the_silo_first() {
+    for (close_at, residual) in [(px(100), 0), (px(90), usd(10))] {
+        let (_g, mut ctx) = make_ctx();
+        set_type(&mut ctx, ALICE, M2, ISOLATED);
+        set_leverage(&mut ctx, ALICE, M2, 1);
+        trade(&mut ctx, M2, ALICE, CAROL, BUY, px(100), 1);
+        underwater_long(&mut ctx);
+        rest(&mut ctx, MAKER, M1, BUY, px(70), 10);
+        let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
+        let ledger = Ledger::open(&mut ctx);
+
+        let logs = ok(&mut ctx, ALICE, &order_flags(M1, SELL, px(70), 10, IOC, RO));
+        ledger.check(&mut ctx, "after the cross close");
+        assert_eq!(wallet(&mut ctx, ALICE), usd(-100), "still owed: an isolated position is open");
+        assert!(rows(&logs, ALICE).iter().all(|r| r.reason != INSURANCE_CLEAR));
+        assert_eq!(insurance_fund(&mut ctx), if0);
+        rejects(
+            &mut ctx,
+            ALICE,
+            &transferFromPerpCall { amount: 1 }.abi_encode(),
+            "transferFromPerp: insufficient perp wallet balance",
+        );
+        let out = call(&mut ctx, ALICE, &order(M3, BUY, px(100), 1, GTC));
+        assert!(out.reverted, "an opening order on A < 0");
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        assert_eq!(wallet(&mut ctx, ALICE), usd(-100), "and it stands across calls");
+
+        // The isolated close: its $100 silo, plus or minus its PnL, nets against the deficit.
+        rest(&mut ctx, MAKER, M2, BUY, close_at, 1);
+        let logs = ok(&mut ctx, ALICE, &order_flags(M2, SELL, close_at, 1, IOC, RO));
+        ledger.check(&mut ctx, "after the isolated close");
+        assert_eq!(storage::load_account(&mut ctx, ALICE).unwrap().open_position_count, 0);
+        if residual == 0 {
+            assert_eq!(wallet(&mut ctx, ALICE), 0, "the silo covered it");
+            assert!(rows(&logs, ALICE).iter().all(|r| r.reason != INSURANCE_CLEAR));
+            assert!(evs::<InsuranceFundChanged>(&logs).is_empty(), "nothing to clear");
+            assert_eq!(insurance_fund(&mut ctx), if0);
+        } else {
+            assert_cleared(&mut ctx, &logs, ALICE, residual, if0);
+        }
+    }
+}
+
+/// **R4 — the fund is SHORT.** The user-close route with only $40 in the fund: it pays what it has,
+/// `InsuranceFundDepleted(M1, $60)` records the rest as socialised (the convention of every deficit
+/// the fund cannot absorb), and the wallet still ends at exactly 0 — the identity opens by exactly
+/// that $60. With the fund EMPTY the same close writes the fund nothing, logs no
+/// `InsuranceFundChanged`, and socialises all $100.
+#[test]
+fn a_short_insurance_fund_pays_what_it_has_and_logs_the_rest_as_depleted() {
+    for fund in [usd(40), 0] {
+        let (_g, mut ctx) = make_ctx();
+        underwater_long(&mut ctx);
+        rest(&mut ctx, MAKER, M1, BUY, px(70), 10);
+        storage::save_insurance_fund(&mut ctx, fund as u64).unwrap();
+        let mut ledger = Ledger::open(&mut ctx);
+
+        let logs = ok(&mut ctx, ALICE, &order_flags(M1, SELL, px(70), 10, IOC, RO));
+        let uncovered = usd(100) - fund;
+        ledger.total += uncovered as i128;
+        ledger.check(&mut ctx, "after the close (the uncovered part socialised)");
+        assert_eq!(wallet(&mut ctx, ALICE), 0);
+        assert_eq!(insurance_fund(&mut ctx), 0);
+        let changed = evs::<InsuranceFundChanged>(&logs);
+        if fund > 0 {
+            assert_eq!(changed.len(), 1);
+            assert_eq!((changed[0].delta, changed[0].newBalance), (-fund, 0));
+        } else {
+            assert!(changed.is_empty(), "nothing paid, nothing logged");
+        }
+        let depleted = evs::<InsuranceFundDepleted>(&logs);
+        assert_eq!(depleted.len(), 1);
+        assert_eq!((depleted[0].marketId, depleted[0].badDebt), (M1, uncovered as u64));
+        let last = rows(&logs, ALICE).pop().unwrap();
+        assert_eq!((last.reason, last.totalCrossWalletBalance), (INSURANCE_CLEAR, 0));
+    }
+}
+
+/// A last close that leaves the wallet at or above zero clears nothing: no fund write, no event,
+/// no extra row.
+#[test]
+fn a_last_close_with_a_non_negative_wallet_clears_nothing() {
+    let (_g, mut ctx) = make_ctx();
+    long_10_on_m1(&mut ctx, usd(300));
+    set_mark(&mut ctx, M1, px(70));
+    rest(&mut ctx, MAKER, M1, BUY, px(70), 10);
+    let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
+
+    let logs = ok(&mut ctx, ALICE, &order_flags(M1, SELL, px(70), 10, IOC, RO));
+    assert_eq!(storage::load_account(&mut ctx, ALICE).unwrap().open_position_count, 0);
+    assert_eq!(wallet(&mut ctx, ALICE), 0, "exactly zero is not negative");
+    assert_eq!(insurance_fund(&mut ctx), if0);
+    assert!(evs::<InsuranceFundChanged>(&logs).is_empty());
+    assert!(rows(&logs, ALICE).iter().all(|r| r.reason != INSURANCE_CLEAR));
 }
 
 // ── J4: total ───────────────────────────────────────────────────────────────────

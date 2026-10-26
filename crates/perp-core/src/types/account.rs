@@ -137,6 +137,13 @@ pub struct UserAccount {
     /// this wallet, and the cross positions still open may yet close in profit, so the protocol can
     /// still collect it.
     ///
+    /// It is cleared at the end of the call whose close took the count to 0, by whatever route that
+    /// close came (`perp_engine::risk::negative_balance`, recorded by `storage::save_position`,
+    /// settled by `storage::flush_account_snapshots`): the fund pays `−W`, the wallet becomes
+    /// exactly 0, and the account publishes an `INSURANCE_CLEAR` row. A fund that holds less pays
+    /// what it has and the rest is socialised (`InsuranceFundDepleted`), the convention of every
+    /// deficit the fund cannot absorb (R4); the wallet still ends at 0.
+    ///
     /// ## ⛔ Do NOT "fix" a negative value by absorbing it from the Insurance Fund any earlier
     ///
     /// It is the change this shape invites, and it is strictly worse than leaving it alone. Custody
@@ -452,7 +459,7 @@ impl UserAccount {
 /// | [`Self::MarginTransfer`] | `MARGIN_TRANSFER` | an ISOLATED POSITION's margin moved against the wallet — `addPositionMargin` / `removePositionMargin`. This is what the Binance value means (their *Modify Isolated Position Margin*), and we have exactly that operation, so it is reserved for it. |
 /// | [`Self::AssetTransfer`] | `ASSET_TRANSFER` | an internal wallet-to-wallet move of the same asset that touches no position: `transferToPerp` / `transferFromPerp` (spot USDC ledger ↔ perp wallet). |
 /// | [`Self::Adjustment`] | `ADJUSTMENT` | the protocol moved a position or a balance with NO order of the user's and no transfer: the liquidation residual closed at mark, both ADL legs, and the post-close dust write-off. |
-/// | [`Self::InsuranceClear`] | `INSURANCE_CLEAR` | the counterparty of the wallet move is the INSURANCE FUND: the liquidation clearance fee, and the admin's `depositInsuranceFund` / `withdrawInsuranceFund`. |
+/// | [`Self::InsuranceClear`] | `INSURANCE_CLEAR` | the counterparty of the wallet move is the INSURANCE FUND: the liquidation clearance fee, the admin's `depositInsuranceFund` / `withdrawInsuranceFund`, and the clearance of a negative wallet once the account holds no position (owner decision Q8 — its own row, after the one that published the deficit). |
 /// | [`Self::InternalTransfer`] | — (none; ours) | `internalTransfer`: value moved between TWO accounts (family or external) — both legs, sender and receiver, carry it. |
 /// | [`Self::MarginTypeChange`] | `MARGIN_TYPE_CHANGE` | **nothing — no `AccountBalanceChanged` row carries it.** See below. |
 ///

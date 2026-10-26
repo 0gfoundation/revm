@@ -655,13 +655,43 @@ pub fn begin_perp_call<H: PerpHost>(context: &mut H) {
 ///
 /// Tests that drive an engine handler directly (`run_place_order`, `storage::save_account`, …) rather
 /// than through the shell must call this themselves; nothing else does.
+///
+/// # It also SETTLES the accounts whose last position closed in this call (cross P3)
+///
+/// [`save_position`] records every account whose `open_position_count` reached 0 during the call
+/// (`TypedPerpStore::settle_accounts`), and this is where the record is acted on, against the
+/// wallet the call ENDS with: a negative one is cleared by the insurance fund
+/// ([`crate::risk::negative_balance::clear_negative_wallet`], owner decision Q8). It is the end of
+/// the call because that is the first point every route's writes have landed — see the note at the
+/// recording site.
+///
+/// The settled users join the drain's ascending address walk, each in one place: the user's
+/// pending row (if any) first — the state the call left, negative wallet included, which is what
+/// Binance shows before its clearance — then the clearance, which publishes its OWN
+/// `INSURANCE_CLEAR` row. A settlement that finds nothing to do writes nothing and publishes
+/// nothing. Total like the drain: only the storage layer can fail.
 pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpError> {
     // Taken out of the store first: `emit_account_snapshot` borrows `context` mutably for its fold.
     // The `reason` comes out of the map with the user — recorded at MARKING time, because this loop
     // has no way to know what moved (see `mark_account_snapshot_dirty`).
     let touched = typed_store_mut(context).take_touched_accounts();
-    for (user, reason) in touched {
-        emit_account_snapshot(context, user, reason)?;
+    let settle = typed_store_mut(context).take_accounts_to_settle();
+    if settle.is_empty() {
+        for (user, reason) in touched {
+            emit_account_snapshot(context, user, reason)?;
+        }
+        return Ok(());
+    }
+    // Both sets, one ascending walk (`BTreeSet` over two `BTreeMap`s' keys: deterministic).
+    let users: std::collections::BTreeSet<Address> =
+        touched.keys().chain(settle.keys()).copied().collect();
+    for user in users {
+        if let Some(&reason) = touched.get(&user) {
+            emit_account_snapshot(context, user, reason)?;
+        }
+        if let Some(&market_id) = settle.get(&user) {
+            crate::risk::negative_balance::clear_negative_wallet(context, user, market_id)?;
+        }
     }
     Ok(())
 }
@@ -1193,6 +1223,22 @@ pub fn save_position<H: PerpHost>(
     // any `Err`. The count is bounded by `MAX_USER_MARKETS` (16) — a non-zero position keeps its
     // market in the per-user index — so neither end is reachable; the `debug_assert`s say so, and
     // `margin_view::index_account_scalars` re-walks the index against the stored count.
+    //
+    // ── …and the LAST close, which the end of the call must SETTLE (cross P3) ─────────────────
+    //
+    // The `−1` crossing that takes the count to 0 is the account's last position closing, by
+    // whatever route — a user order, a maker fill, a fired conditional, a liquidation of either
+    // margin type, an ADL fill on either side. With the wallet below zero at that point, the
+    // insurance fund clears it (owner decision Q8: only once NO position is left, cross or
+    // isolated — `risk::negative_balance`).
+    //
+    // It is not acted on HERE. This write is mid-path on every one of those routes: the caller
+    // still holds the account it is about to write back (the match flush, both liquidation legs,
+    // ADL — position BEFORE account), so a wallet credit made now would be overwritten by that
+    // copy, and the wallet that decides the clearance is the one the call ENDS with (a taker's fee
+    // is debited after its close is saved). So the user is only RECORDED, call-scoped, and the
+    // end of the call settles it (`flush_account_snapshots`). The record costs a `BTreeMap` insert
+    // on a last close only, from the account mutation the crossing makes anyway.
     let count_delta: i8 = match (old_amount != 0, pos.amount != 0) {
         (false, true) => 1,
         (true, false) => -1,
@@ -1206,7 +1252,7 @@ pub fn save_position<H: PerpHost>(
         // `mutate_account`, not `mutate_account_balance`: this is not a WALLET move (no
         // `credit_perp`/`debit_perp`), and `save_position` marks the snapshot itself two lines below,
         // so marking here as well would be redundant.
-        mutate_account(context, user, |a| {
+        let settle = mutate_account(context, user, |a| {
             a.total_position_margin = a
                 .total_position_margin
                 .checked_add(delta)
@@ -1230,8 +1276,11 @@ pub fn save_position<H: PerpHost>(
                 }
                 _ => {}
             }
-            Ok::<(), PerpError>(())
+            Ok::<bool, PerpError>(count_delta == -1 && a.open_position_count == 0)
         })??;
+        if settle {
+            typed_store_mut(context).note_account_to_settle(user, market_id);
+        }
     }
     // Position state moved (`amount` / `v_quote_balance` / `margin`) ⇒ one snapshot at the end of
     // the call. Binance's `ACCOUNT_UPDATE` carries a `P[]` array for exactly this, and its own

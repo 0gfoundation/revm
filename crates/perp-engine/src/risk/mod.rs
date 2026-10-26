@@ -44,6 +44,7 @@ use crate::{
 };
 
 pub(crate) mod cross_liquidation;
+pub(crate) mod negative_balance;
 
 // ── Admin: ownership ──────────────────────────────────────────────────────────
 

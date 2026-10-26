@@ -2629,11 +2629,13 @@ impl FillsGate {
 /// raises `A` — so it is not gated either; an account with NO cross exposure keeps the isolated
 /// rule, byte for byte (gated off, nothing else exists).
 ///
-/// P3: a reduce priced through the account's bankruptcy books the overshoot into `W` (no per-fill
-/// bad debt on a cross wallet) — the "active close through bankruptcy" risk of cross report §5.1,
-/// which isolated closes already carry as bad debt. If P3 bounds it (e.g. a taker close of an
-/// account with `E < Σ MM` may not trade past its bankruptcy price), it does so on the price, not
-/// on this gate.
+/// A reduce priced through the account's bankruptcy books the overshoot into `W` (no per-fill bad
+/// debt on a cross wallet) — the "active close through bankruptcy" risk of cross report §5.1,
+/// which isolated closes already carry as bad debt. Cross P3 does not bound the price: the
+/// overshoot is a receivable on the wallet while the account holds any position (`A < 0` and
+/// `X = 0` shut every open and outflow), and once the LAST position is closed the insurance fund
+/// clears what is left (`risk::negative_balance`, owner decision Q8) — the same fund that takes an
+/// isolated close's bad debt.
 fn fills_are_covered(available: i128, total_required: u64, gate: FillsGate) -> bool {
     match gate {
         FillsGate::Available => {

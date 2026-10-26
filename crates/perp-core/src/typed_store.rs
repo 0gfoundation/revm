@@ -201,6 +201,16 @@ pub struct TypedPerpStore {
     /// entry, bumps no `write_count`, and sets no `tx_dirty`, so it cannot reach the block delta or
     /// the commitment.
     touched_accounts: std::collections::BTreeMap<Address, AccountUpdateReason>,
+    /// Users who, during the CURRENT perp call, closed a position to flat in a way the end of the
+    /// call has to SETTLE — their last position (`open_position_count` reached 0: a negative wallet
+    /// is then cleared by the insurance fund, cross report Q8). The value is the market of the
+    /// latest such close. Drained, with [`Self::touched_accounts`], by
+    /// `perp_engine::storage::flush_account_snapshots`.
+    ///
+    /// CALL-scoped exactly like [`Self::touched_accounts`] (same [`Self::begin_call`] reset, same
+    /// reason: a reverted call settles nothing), a `BTreeMap` for the same deterministic ascending
+    /// order, and likewise NOT a storage key — no dirty entry, no `write_count`, no commitment.
+    settle_accounts: std::collections::BTreeMap<Address, u64>,
 }
 
 impl TypedPerpStore {
@@ -1174,6 +1184,21 @@ impl TypedPerpStore {
     #[inline]
     pub fn begin_call(&mut self) {
         self.touched_accounts.clear();
+        self.settle_accounts.clear();
+    }
+
+    /// Records that `user` closed a position in `market_id` in a way the end of the current call
+    /// must settle (see [`Self::settle_accounts`]). Idempotent per user; the latest market wins.
+    #[inline]
+    pub fn note_account_to_settle(&mut self, user: Address, market_id: u64) {
+        self.settle_accounts.insert(user, market_id);
+    }
+
+    /// Takes the call's to-settle set, leaving it empty — ascending address order, each user with
+    /// the market of its latest recorded close.
+    #[inline]
+    pub fn take_accounts_to_settle(&mut self) -> std::collections::BTreeMap<Address, u64> {
+        core::mem::take(&mut self.settle_accounts)
     }
 
     /// Marks `user` as owing one account snapshot at the end of the current call, carrying the

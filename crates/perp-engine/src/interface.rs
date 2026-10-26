@@ -2159,7 +2159,10 @@ sol! {
         /// `ASSET_TRANSFER` (`transferToPerp` / `transferFromPerp`, wallet ↔ wallet), 6 =
         /// `ADJUSTMENT` (protocol-forced, no order: the liquidation residual closed at mark, both
         /// ADL legs, the post-close dust write-off), 7 = `INSURANCE_CLEAR` (the move settles against
-        /// the insurance fund: the liquidation clearance fee, `deposit`/`withdrawInsuranceFund`),
+        /// the insurance fund: the liquidation clearance fee, `deposit`/`withdrawInsuranceFund`, and
+        /// — cross P3, owner decision Q8 — the clearance of a negative wallet at the end of the call
+        /// that closed the account's last position: a 0-position row at the cleared 0, after the
+        /// row that published the deficit),
         /// 8 = `INTERNAL_TRANSFER` (ours — no exact Binance `a.m` equivalent: `internalTransfer`,
         /// value moved between two accounts; the sender's and the receiver's rows both carry it),
         /// 9 = `MARGIN_TYPE_CHANGE` (Binance's code for a margin-type switch — DEFINED but carried
@@ -2765,10 +2768,12 @@ sol! {
         event FundingSettled(uint64 indexed marketId, address indexed user, int64 fundingRate, int64 amount, uint64 markPrice);
 
         // Feeds: insurance fund balance history
-        // delta > 0 = deposit or liquidation surplus credited; delta < 0 = deficit absorbed.
+        // delta > 0 = deposit or liquidation surplus credited; delta < 0 = deficit absorbed (bad
+        // debt, or — cross P3 — a negative wallet cleared once its account holds no position).
         event InsuranceFundChanged(int64 delta, uint64 newBalance);
         // Emitted when the insurance fund cannot fully cover a deficit.
-        // badDebt = the uncovered amount absorbed by the protocol.
+        // badDebt = the uncovered amount absorbed by the protocol. For a negative-wallet clearance
+        // `marketId` is the market whose close left the account flat.
         event InsuranceFundDepleted(uint64 indexed marketId, uint64 badDebt);
 
         // Feeds: role address changes

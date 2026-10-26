@@ -1650,10 +1650,16 @@ fn fill_a_cross_open_moves_no_cash_and_pays_its_fee_from_w() {
 /// A cross close settles its realized PnL into W EITHER SIGN, through zero, with no per-fill bad
 /// debt and no insurance-fund move (G2): a loss larger than the wallet leaves W negative, money out
 /// stops at X = 0, and a deposit nets against the deficit.
+///
+/// ALICE keeps an ISOLATED long of 1 on M3 throughout, so the account is never flat: a negative W
+/// with NO position left is cleared by the insurance fund at the end of the call (owner decision
+/// Q8 — `risk::negative_balance`, pinned by the cross liquidation suite), and this pins the
+/// receivable that stands until then.
 #[test]
 fn fill_a_cross_close_settles_either_sign_into_w_with_no_bad_debt() {
     let (_g, mut ctx) = crossed_world();
     let ctx = &mut ctx;
+    fill(ctx, ALICE, M3, 1, 200);
     // Profit, as a taker: 10 long from 1,000 closed at 1,050.
     fill(ctx, ALICE, M1, 10, 1_000);
     let w0 = wallet(ctx, ALICE);
@@ -1675,7 +1681,7 @@ fn fill_a_cross_close_settles_either_sign_into_w_with_no_bad_debt() {
     assert_eq!(insurance(ctx), fund, "no bad debt");
     assert_eq!(pos(ctx, ALICE, M1).cumulative_realized_pnl as i128, 500 * USD - 1_500 * USD);
     let md = model(ctx, ALICE);
-    assert_eq!((md.a, md.x), (w, 0), "a flat account: A = W < 0, X = 0");
+    assert_eq!((md.a, md.x), (w, 0), "no cross position, no order: A = W < 0, X = 0");
     rejected(ctx, ALICE, &transferFromPerpCall { amount: 1 }.abi_encode(), E_OUT);
     rest(ctx, DAVE, M1, SELL, 900, 1);
     rejected(ctx, ALICE, &mkt(M1, BUY, 1), E_MARGIN);

@@ -445,13 +445,20 @@ fn a_cross_loss_beyond_the_wallet_drives_it_negative_with_no_bad_debt() {
 /// The same loss closed as a TAKER (with a zero taker fee — a cross pure close that leaves the
 /// available balance negative is still refused its fee, exactly like an isolated one; that gate is
 /// cross P2c's): the wallet goes negative by exactly the realized loss.
+///
+/// ALICE also holds an ISOLATED long of 1 on M2, so the close does not leave her flat: a negative
+/// wallet with NO position left is cleared by the insurance fund at the end of the call (owner
+/// decision Q8, `risk::negative_balance`), which is not what this pins.
 #[test]
 fn a_cross_taker_close_at_a_loss_settles_into_the_wallet_with_no_bad_debt() {
     let mut ctx = make_ctx();
     let _cross = crate::margin_type::test_gate::enable();
     set_type(&mut ctx, BOB, M1, ISOLATED);
+    set_type(&mut ctx, BOB, M2, ISOLATED);
     set_type(&mut ctx, CAROL, M1, ISOLATED);
+    set_type(&mut ctx, ALICE, M2, ISOLATED);
     set_leverage(&mut ctx, ALICE, M1, 3);
+    trade(&mut ctx, M2, ALICE, BOB, BUY, px(100), 1);
     set_wallet(&mut ctx, ALICE, 400 * USD);
     let ledger = Ledger::open(&mut ctx);
 

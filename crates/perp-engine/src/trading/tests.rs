@@ -2690,14 +2690,17 @@ fn a_short_silo_lowers_the_maintenance_buffer_it_is_measured_against() {
 /// where there is a position to carry it, and do NOT open a second insurance-fund path), and it is
 /// bounded by the fee. It is also the one place Binance's own wallet goes negative: R11 measured
 /// `−0.25717240`, exactly the fill commission, cleared by `INSURANCE_CLEAR` seconds later. Ours is
-/// not cleared, so `perp_wallet_balance: i64` stays.
+/// cleared the same way since cross P3 (owner decision Q8, `risk::negative_balance`): BOB's close
+/// is his LAST position, so the end of the call that made him flat has the insurance fund cover
+/// the deficit and publishes an `INSURANCE_CLEAR` row (with a position still open the deficit
+/// would stand as a receivable, `perp_wallet_balance: i64`).
 ///
 /// **This state is the reason `AccountBalanceChanged` had to become signed.** The event's wallet
 /// field used to be `uint64 perpWalletBalance` and floored at 0, so the very deficit this test
 /// produces was invisible to anyone watching only the event stream — the field reported `0` while
-/// the ledger held `−12_000`. The assertions below pin the fixed behaviour: the event reports
-/// `totalCrossWalletBalance == −12_000` unclamped, and a hypothetical clamped reading would have
-/// said `0`.
+/// the ledger held `−12_000`. The assertions below pin the fixed behaviour: the call's row for the
+/// close reports `totalCrossWalletBalance == −12_000` unclamped (a hypothetical clamped reading
+/// would have said `0`), and the clearance row that follows it reports the cleared 0.
 ///
 /// Arithmetic: BOB is long QTY at entry $100 with a leverage-3 silo of 333_333 and an EMPTY wallet,
 /// and rests a sell at the $60 mark (a pure reduce, so `ooIM = 0` admits it for free). The close
@@ -2759,14 +2762,6 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
         (0, 0),
         "flat, silo emptied"
     );
-    assert_eq!(
-        storage::load_account(&mut ctx, BOB)
-            .unwrap()
-            .perp_wallet_balance,
-        -maker_fee,
-        "the wallet went negative by EXACTLY the commission and no more — no margin shortfall \
-         reaches it any more (that is the M1 cap), only a fee with nothing left to absorb it"
-    );
     // ── THE TASK-A PIN: the deficit reaches the EVENT STREAM, unclamped ──────────────────────
     let bob_events = JournalTr::take_logs(ctx.journal_mut())
         .into_iter()
@@ -2778,52 +2773,67 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
         .collect::<Vec<_>>();
     assert_eq!(
         bob_events.len(),
-        1,
-        "one snapshot per user per call, drained at the end"
+        2,
+        "the close's row, drained at the end, then the clearance's own row"
     );
     assert_eq!(
         bob_events[0].totalCrossWalletBalance, -maker_fee,
-        "the event reports the DEFICIT. Under the retired `uint64 perpWalletBalance` this read 0 \
-         and an operator watching only the event stream could not see it accumulate."
+        "the wallet went negative by EXACTLY the commission and no more — no margin shortfall \
+         reaches it any more (that is the M1 cap), only a fee with nothing left to absorb it. The \
+         event reports the DEFICIT: under the retired `uint64 perpWalletBalance` this read 0 and an \
+         operator watching only the event stream could not see it."
     );
     assert_eq!(
-        storage::load_account(&mut ctx, BOB)
-            .unwrap()
-            .visible_perp_wallet_balance(),
+        crate::types::UserAccount {
+            perp_wallet_balance: bob_events[0].totalCrossWalletBalance,
+            ..crate::types::UserAccount::default()
+        }
+        .visible_perp_wallet_balance(),
         0,
         "what a CLAMPED reading would have said — kept as the contrast, used by no published surface"
     );
     // BOB is flat with no orders, so he has left the market index entirely: the event's totals are
-    // an EMPTY fold plus the raw wallet, and it still agrees with `getAccount` field for field.
+    // an EMPTY fold plus the raw wallet.
     assert_eq!(
         bob_events[0].totalWalletBalance, -maker_fee,
         "no silos left"
     );
-    // `availableBalance` left the event with the six other margin totals (they are `/fapi/v2/account`
-    // fields, not `ACCOUNT_UPDATE` fields), so it is asserted on its only remaining surface. The
-    // deficit shows through there too, which is the point of the un-clamping.
+    // ── Q8: flat with a negative wallet ⇒ the insurance fund clears it, in its own row ──────────
+    assert_eq!(
+        bob_events[1].reason,
+        AccountUpdateReason::InsuranceClear.code(),
+        "Binance's INSURANCE_CLEAR"
+    );
+    assert_eq!(
+        (bob_events[1].totalCrossWalletBalance, bob_events[1].totalWalletBalance),
+        (0, 0)
+    );
+    assert_eq!(
+        storage::load_account(&mut ctx, BOB)
+            .unwrap()
+            .perp_wallet_balance,
+        0,
+        "cleared"
+    );
     assert_eq!(
         get_account(&mut ctx, BOB).availableBalance,
-        -maker_fee,
-        "no ooIM left, and getAccount reports the deficit unclamped"
+        0,
+        "no ooIM left, nothing owed any more"
     );
-    assert_event_matches_get_account(&mut ctx, &bob_events[0]);
-    // Not a mint: the fee recipient really was paid, and the insolvent close's beyond-margin slice
-    // really did reach the fund. The negative is the funding gap between the two.
+    assert_event_matches_get_account(&mut ctx, &bob_events[1]);
+    // Not a mint: the fee recipient really was paid, the insolvent close's beyond-margin slice
+    // really did reach the fund, and the fund then paid the commission gap between the two.
     assert_eq!(wallet(&mut ctx, ADMIN), maker_fee as u64);
     assert_eq!(
         if_before - storage::load_insurance_fund(&mut ctx).unwrap(),
-        66_667,
-        "loss 400_000 − released margin 333_333"
+        66_667 + maker_fee as u64,
+        "loss 400_000 − released margin 333_333, plus the cleared commission"
     );
-    // Money-out is refused while under water, and a deposit nets against it — the receivable
-    // machinery is unchanged, it just guards a commission-sized transient now.
+    // Money-out stays shut on the cleared (zero) wallet.
     assert!(!crate::margin_view::derived_can_afford(
         available(&mut ctx, BOB),
         1
     ));
-    fund(&mut ctx, BOB, maker_fee as u64);
-    assert_eq!(available(&mut ctx, BOB), 0, "the credit nets the deficit");
 }
 
 /// The `RejectedInsolvent` channel is still LIVE — it just no longer answers "the wallet is short".
