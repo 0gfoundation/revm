@@ -4171,8 +4171,11 @@ fn an_isolated_clearance_fee_is_capped_at_the_close_credit() {
 
     assert_eq!(position(&mut ctx, ALICE).amount, 0);
     let fee = storage::load_insurance_fund(&mut ctx).unwrap() - if_before;
+    // The uncapped fee at the market's stored rate, on the $810 notional closed.
+    let uncapped = 810_000_000u64 * m.liquidation_fee_rate_bps as u64 / 10_000;
+    assert_eq!(uncapped, 40_500_000);
     assert!(
-        810_000_000u64 * 500 / 10_000 > 10_000_000,
+        uncapped > fee,
         "the uncapped notional fee ($40.50) must exceed the cap for this to test it"
     );
     assert_eq!(fee, 10_000_000, "capped at the $10 close credit (J5)");
