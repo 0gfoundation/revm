@@ -225,10 +225,14 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 ///
 /// * **Rank** — Binance's `PnL% × EffLev` when `PnL% ≥ 0` and `PnL% / EffLev` when `< 0`, with
 ///   `PnL% = uPnL_k / |N_k|` (symbol level) and `EffLev = |N_k| / E` (account level — cross report
-///   §1.7, F25), which reduce to `uPnL_k / E` and `uPnL_k · E / N_k²`. An ISOLATED winner keeps its
-///   position-level `uPnL / equity` for both signs (§3.4: Binance's denominator for an isolated
-///   position is unpublished, F26). The two kinds are ordered together EXACTLY: every rank is a
-///   ratio, compared by cross-multiplication in 512 bits ([`AdlRank`]), so the order is total.
+///   §1.7, F25), which reduce to `uPnL_k / E` and `uPnL_k · E / N_k²`. An ISOLATED winner gets the
+///   SAME sign split with its position equity (silo + pending funding + uPnL) in `E`'s place —
+///   F25's split is confirmed for every position; only the isolated denominator is unpublished
+///   (F26), and position equity is the one it already used for a gain. (Until the P3 review an
+///   isolated loss ranked `uPnL / equity`, which orders losses the other way round and could not
+///   be compared with a cross loss on one scale.) Both kinds are ordered together EXACTLY: every
+///   rank is a ratio, compared by cross-multiplication in 512 bits ([`AdlRank`]), so the order is
+///   total.
 /// * **Tier** — rankable needs `E > 0`; an account at or below zero is fallback tier outright. A
 ///   rankable one is then clean PER FILL: `E − take · |fill − mark| ≥ 0` for the `take` this fill
 ///   would close (the worst its equity can do at the fill price instead of the mark). A fill that
@@ -449,7 +453,7 @@ fn run_adl_fills<H: PerpHost>(
                 Some(leg) if e > 0 => {
                     // `N_k`: the leg's `uPnL` less the entry basis (`uPnL = N + vQuote`).
                     let notional = leg.upnl - wp.v_quote_balance as i128;
-                    cands.push((user, AdlRank::cross(leg.upnl, e, notional), Some(e)));
+                    cands.push((user, AdlRank::sign_split(leg.upnl, e, notional), Some(e)));
                 }
                 _ => fallback.push((user, e, Some(e))),
             }
@@ -542,12 +546,13 @@ fn run_adl_fills<H: PerpHost>(
         };
         let notional = notional as i128;
         let upnl = notional + wp.v_quote_balance as i128;
-        cands.push((user, AdlRank::ratio(upnl, eq_mark as i128), None));
+        cands.push((user, AdlRank::sign_split(upnl, eq_mark as i128, notional), None));
     }
-    // Rank DESC, Address ASC tie-break. An ISOLATED candidate's rank is its ROE `uPnL / equity`
-    // (equity > 0 on this tier), a CROSSED one's Binance's sign-split account rank (R5); both are
-    // exact ratios, so this is a TOTAL order — cross-multiplied in 512 bits, never saturated (a
-    // saturated product could make the comparator inconsistent, and `sort_by` may panic on one).
+    // Rank DESC, Address ASC tie-break. Every candidate's rank is Binance's sign split (R5): over
+    // its ACCOUNT equity for a CROSSED one, its position equity for an ISOLATED one (> 0 on this
+    // tier); both are exact ratios, so this is a TOTAL order — cross-multiplied in 512 bits, never
+    // saturated (a saturated product could make the comparator inconsistent, and `sort_by` may
+    // panic on one).
     cands.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     // The fallback tier cannot use ROE — its denominator may be <= 0 — so: HEALTHIEST first
     // (equity at mark DESC — a CROSSED holder's account `E`), Address ASC tie-break. Not
@@ -855,10 +860,11 @@ impl AdlRank {
         }
     }
 
-    /// A CROSSED winner with account equity `e > 0`: Binance's `PnL% × EffLev = uPnL / E` for
-    /// `uPnL ≥ 0`, `PnL% / EffLev = uPnL · E / N²` for `uPnL < 0` (`N` the leg's notional; an
-    /// `N` that floored to 0 counts as 1).
-    fn cross(upnl: i128, e: i128, notional: i128) -> Self {
+    /// Binance's sign-split rank with equity `e > 0` — the ACCOUNT's `E` for a CROSSED winner, the
+    /// position's equity for an ISOLATED one: `PnL% × EffLev = uPnL / e` for `uPnL ≥ 0`,
+    /// `PnL% / EffLev = uPnL · e / N²` for `uPnL < 0` (`N` the leg's notional; an `N` that floored
+    /// to 0 counts as 1).
+    fn sign_split(upnl: i128, e: i128, notional: i128) -> Self {
         if upnl >= 0 {
             return Self::ratio(upnl, e);
         }
@@ -1067,12 +1073,13 @@ mod adl_rank_tests {
         assert!(AdlRank::ratio(-1, 1_000_000) < AdlRank::ratio(0, 7));
         assert_eq!(AdlRank::ratio(0, 7), AdlRank::ratio(0, 1));
         assert!(AdlRank::ratio(0, 1) < AdlRank::ratio(1, i128::MAX));
-        // Cross: a gain is `uPnL / E`; a loss `uPnL · E / N²` — more equity ranks LOWER there.
-        assert_eq!(AdlRank::cross(10, 40, 600), AdlRank::ratio(1, 4));
-        assert!(AdlRank::cross(-20, 9_980, 120) < AdlRank::cross(-20, 80, 120));
+        // The sign split: a gain is `uPnL / E`; a loss `uPnL · E / N²` — more equity ranks LOWER
+        // there.
+        assert_eq!(AdlRank::sign_split(10, 40, 600), AdlRank::ratio(1, 4));
+        assert!(AdlRank::sign_split(-20, 9_980, 120) < AdlRank::sign_split(-20, 80, 120));
         assert!(AdlRank::ratio(-20, 9_980) > AdlRank::ratio(-20, 80), "the rule R5 replaces");
         // A notional that floored to 0 counts as 1.
-        assert_eq!(AdlRank::cross(-1, 1, 0), AdlRank::ratio(-1, 1));
+        assert_eq!(AdlRank::sign_split(-1, 1, 0), AdlRank::ratio(-1, 1));
     }
 
     /// TOTAL at the joint extremes, where the previous saturating `i128` products would tie or
@@ -1089,15 +1096,15 @@ mod adl_rank_tests {
             AdlRank::ratio(-1, big),
             AdlRank::ratio(-big, 1),
             AdlRank::ratio(i128::MIN, 1),
-            AdlRank::cross(-(1 << 66), 1 << 71, i64::MAX as i128),
-            AdlRank::cross(-(1 << 66), (1 << 71) - 1, i64::MAX as i128),
-            AdlRank::cross(i128::MIN, big, 1),
-            AdlRank::cross(big, big, big),
+            AdlRank::sign_split(-(1 << 66), 1 << 71, i64::MAX as i128),
+            AdlRank::sign_split(-(1 << 66), (1 << 71) - 1, i64::MAX as i128),
+            AdlRank::sign_split(i128::MIN, big, 1),
+            AdlRank::sign_split(big, big, big),
         ];
         assert!(AdlRank::ratio(big - 1, big) < AdlRank::ratio(big, big));
         assert!(
-            AdlRank::cross(-(1 << 66), 1 << 71, i64::MAX as i128)
-                < AdlRank::cross(-(1 << 66), (1 << 71) - 1, i64::MAX as i128)
+            AdlRank::sign_split(-(1 << 66), 1 << 71, i64::MAX as i128)
+                < AdlRank::sign_split(-(1 << 66), (1 << 71) - 1, i64::MAX as i128)
         );
         for a in &ranks {
             assert_eq!(a.cmp(a), Ordering::Equal);

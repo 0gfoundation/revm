@@ -464,6 +464,11 @@ use primitives::{B256, U256};
 //     16-market cap. A WRITE-SET change: a conditional in a market not yet in the index adds the
 //     id (and its retirement removes it). The goldens place none outside an indexed market: both
 //     pins unchanged, BusinessSnapshot UNCHANGED.
+//   * P3 review — an ISOLATED ADL winner at a LOSS ranks by Binance's sign split too
+//     (`uPnL · equity / N²`, its position equity in `E`'s place), not `uPnL / equity`; a gain's
+//     rank is the same expression as before. An EXECUTION-RULE change (which holder an ADL takes
+//     first). The golden scenarios' ADLs rank no losing isolated holder against another: both
+//     pins unchanged, BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

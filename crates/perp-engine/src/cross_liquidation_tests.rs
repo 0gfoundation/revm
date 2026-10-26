@@ -17,9 +17,10 @@
 //!   close, a maker fill, a fired stop, ADL against the flagged account);
 //! * manual `liquidate()`: healthy refused write-clean, a recovered flag cleared through any
 //!   market, the start market;
-//! * cross ADL (R5): a losing cross winner ranks `uPnL · E / N²` among isolated winners on their
-//!   ROE, the clean tier is judged per fill (`E − take · |fill − mark| ≥ 0`), and a fill the
-//!   account cannot carry re-queues it behind the clean tier;
+//! * cross ADL (R5): a losing winner ranks `uPnL · E / N²` — `E` its account's when CROSSED, its
+//!   position equity when ISOLATED — the clean tier is judged per fill
+//!   (`E − take · |fill − mark| ≥ 0`), a fill the account cannot carry re-queues it behind the
+//!   clean tier, and there the fund carries what its equity cannot;
 //! * negative-balance clearance (Q8, R4): a negative wallet is cleared by the insurance fund at the
 //!   end of the call that closed the account's LAST position — by a user close, a maker fill, a
 //!   fired stop, a cross episode (sweep or drain), an ADL fill on the winning side — never while a
@@ -1345,6 +1346,37 @@ fn adl_ranks_a_losing_cross_winner_by_upnl_times_e_over_n_squared() {
     let order: Vec<(Address, u64)> = adls(&logs).iter().map(|a| (a.1, a.3)).collect();
     assert_eq!(order, vec![(KEEPER, 1), (ALICE, 2), (BOB, 2)]);
     assert!(adls(&logs).iter().all(|a| a.4 > px(66) && a.4 <= px(67)));
+}
+
+/// **An ISOLATED winner at a loss ranks by the same sign split** (P3 review; Binance's
+/// `PnL% / EffLev`, F25, with its position equity as the denominator F26 leaves open). CAROL's
+/// ISOLATED 3x long of 1 from $160 is liquidated at $100 on an empty book and ADL-ed at her
+/// bankruptcy price ≈ $106.67. Two shorts from $99, both at a LOSS at the $100 mark: KEEPER,
+/// ISOLATED short 5 (uPnL −$5, notional $500, position equity $160) — `−5 · 160 / 500² ≈
+/// −0.0032`; ALICE, CROSSED short 10 (uPnL −$10, notional $1,000, `E = $1,000`) — `−10 · 1,000 /
+/// 1,000² = −0.01`. KEEPER ranks first and takes it. The old isolated `uPnL / equity` put KEEPER
+/// at −0.031, BELOW ALICE: a loss was ranked by one formula for an isolated holder and the
+/// inverse one for a cross holder, in one sort.
+#[test]
+fn adl_ranks_an_isolated_loss_by_the_same_sign_split_as_a_cross_one() {
+    let mut ctx = make_ctx();
+    set_leverage(&mut ctx, CAROL, M1, 3);
+    set_leverage(&mut ctx, KEEPER, M1, 3);
+    trade_at(&mut ctx, M1, CAROL, MAKER, BUY, px(160), 1);
+    trade_at(&mut ctx, M1, MAKER, KEEPER, BUY, px(99), 5);
+    trade_at(&mut ctx, M1, MAKER, ALICE, BUY, px(99), 10);
+    set_wallet(&mut ctx, ALICE, usd(1_010));
+    set_mark(&mut ctx, M1, px(100));
+    let ledger = Ledger::open(&mut ctx);
+    assert_eq!(fold(&mut ctx, ALICE).e, usd(1_000) as i128);
+    let keeper = pos(&mut ctx, KEEPER, M1);
+    assert_eq!((keeper.amount, keeper.margin - usd(5)), (-5, usd(160)), "equity $160");
+
+    let logs = ok(&mut ctx, ADMIN, &liquidate(CAROL, M1));
+    ledger.check(&mut ctx, "after the liquidation + ADL");
+    let order: Vec<(Address, u64)> = adls(&logs).iter().map(|a| (a.1, a.3)).collect();
+    assert_eq!(order, vec![(KEEPER, 1)]);
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, -10, "not reached");
 }
 
 /// **R5 — the clean tier is decided PER FILL, on the `take`.** CAROL's ISOLATED 3x long of 2 is
