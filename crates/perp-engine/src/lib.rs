@@ -45,6 +45,10 @@ mod cross_settlement_tests;
 /// model): every surface against a model, every gate to the unit, the P2 liquidation interim.
 #[cfg(test)]
 mod cross_margin_p2_spec_tests;
+/// Cross margin P3a: cross liquidation — account-level detection, the episode, its budget and
+/// continuation, manual `liquidate()`, totality — under the custody identity.
+#[cfg(test)]
+mod cross_liquidation_tests;
 pub mod risk;
 pub mod storage;
 pub mod trading;
