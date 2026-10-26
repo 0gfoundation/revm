@@ -62,6 +62,10 @@ mod cross_margin_p3_spec_tests;
 /// health check priced from it (`margin_view::cross_health`).
 #[cfg(test)]
 mod cross_legs_tests;
+/// Cross margin P4: an independent spec suite — the cross legs and the health check recomputed
+/// from the position records after every call, on every route, and at random.
+#[cfg(test)]
+mod cross_legs_spec_tests;
 pub mod risk;
 pub mod storage;
 pub mod trading;
