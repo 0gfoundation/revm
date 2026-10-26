@@ -154,13 +154,26 @@ pub(crate) fn pending_funding_payment(
     pos: &PerpPosition,
     market: &Market,
 ) -> Result<i64, PerpError> {
-    if pos.amount == 0 || pos.last_funding_index == index {
+    pending_funding_of(index, pos.amount, pos.last_funding_index, market)
+}
+
+/// [`pending_funding_payment`] from the two position fields it reads, `amount` and
+/// `last_funding_index` — the form a cross leg on the account carries them in
+/// (`types::CrossLegState`, priced by `margin_view::cross_health`, cross P4). The same
+/// expression, so the two can never disagree.
+pub(crate) fn pending_funding_of(
+    index: i128,
+    amount: i64,
+    last_funding_index: i128,
+    market: &Market,
+) -> Result<i64, PerpError> {
+    if amount == 0 || last_funding_index == index {
         return Ok(0);
     }
     let delta = index
-        .checked_sub(pos.last_funding_index)
+        .checked_sub(last_funding_index)
         .ok_or_else(|| perp_err("funding: index delta overflow"))?;
-    calc_funding_payment(pos.amount, delta, market.base_decimals, market.price_decimals)
+    calc_funding_payment(amount, delta, market.base_decimals, market.price_decimals)
 }
 
 /// Pure funding computation: reads funding state, settles the signed funding payment IN MEMORY,

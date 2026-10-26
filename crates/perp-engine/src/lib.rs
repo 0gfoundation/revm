@@ -58,7 +58,8 @@ mod cross_golden_tests;
 /// conservation after every call, and the never-`Err` fuzz.
 #[cfg(test)]
 mod cross_margin_p3_spec_tests;
-/// Cross margin P4: the account's cross-leg summary (`types::CrossLegs`) on every route.
+/// Cross margin P4: the account's cross-leg summary (`types::CrossLegs`) on every route, and the
+/// health check priced from it (`margin_view::cross_health`).
 #[cfg(test)]
 mod cross_legs_tests;
 pub mod risk;

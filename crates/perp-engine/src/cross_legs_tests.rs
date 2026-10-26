@@ -1,4 +1,5 @@
-//! Cross margin P4 — the account's cross-leg summary (`types::CrossLegs`, its own per-user blob).
+//! Cross margin P4 — the account's cross-leg summary (`types::CrossLegs`, its own per-user blob)
+//! and the health check priced from it (`margin_view::cross_health`).
 //!
 //! The summary's invariant is that it is EXACTLY the state of the account's non-zero positions
 //! CROSSED in force, in market order. These tests derive that list independently — from the
@@ -14,6 +15,7 @@ use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, Address, FixedBytes, Log, U256};
 
+use crate::margin_view::{CrossHealth, CrossHealthLeg};
 use crate::{
     interface::IPerpDex::{
         addPositionMarginCall, asSubAccountCall, batchPlaceOrdersCall, createSubAccountCall,
@@ -358,4 +360,155 @@ fn a_silent_match_flush_carries_a_zero_payment_funding_re_anchor_into_the_leg() 
     assert_eq!(storage::load_account(&mut ctx, ALICE).unwrap().perp_wallet_balance, 0);
     assert_eq!(stored_legs(&mut ctx, ALICE)[0].last_funding_index, 5, "the leg carries the index");
     assert_legs(&mut ctx, &USERS, "silent flush");
+}
+
+// ── D3 / D4: the health check is the walk's numbers ─────────────────────────────
+
+/// `cross_health` against `cross_fold` computed HERE — not through the `debug_assertions`
+/// cross-check inside it, so this holds in a release test build too: `W`, `E`, `Σ_C MM`,
+/// `has_cross`, and every leg the walk prices for a position CROSSED in force and non-zero.
+fn assert_health_is_the_fold(ctx: &mut TestCtx, user: Address, at: &str) -> CrossHealth {
+    let mut legs = Vec::new();
+    let health = crate::margin_view::cross_health(ctx, user, Some(&mut legs)).unwrap();
+    let mut walked = Vec::new();
+    let fold = crate::margin_view::cross_fold(ctx, user, None, None, Some(&mut walked)).unwrap();
+    assert_eq!(
+        (health.w, health.e, health.cross_mm, health.has_cross),
+        (fold.w, fold.e, fold.cross_mm, fold.has_cross),
+        "{at}: {user}'s health against the walk"
+    );
+    let fold_legs: Vec<CrossHealthLeg> = walked
+        .iter()
+        .filter(|l| l.cross && l.has_position)
+        .map(|l| CrossHealthLeg {
+            market_id: l.market_id,
+            upnl: l.upnl,
+            mm: l.mm,
+            pending_funding: l.pending_funding,
+        })
+        .collect();
+    assert_eq!(legs, fold_legs, "{at}: {user}'s legs against the walk");
+    health
+}
+
+/// An account with three cross legs (one priced at a funding index that moved, one short) and an
+/// isolated position beside them: the health check reports the walk's numbers through opens, a
+/// funding move, a mark move, a partial close and a close — and an account with no cross position
+/// reports `E = W`, `Σ MM = 0`, no leg.
+#[test]
+fn the_health_check_reports_the_walks_numbers() {
+    let mut ctx = make_ctx();
+    let h = assert_health_is_the_fold(&mut ctx, ALICE, "no position");
+    assert_eq!((h.e, h.cross_mm, h.has_cross), (WALLET as i128, 0, false));
+
+    ok(&mut ctx, BOB, &order(M1, SELL, px(100), 10, GTC));
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 10, IOC));
+    ok(&mut ctx, BOB, &order(M2, BUY, px(100), 4, GTC));
+    ok(&mut ctx, ALICE, &order(M2, SELL, px(100), 4, IOC));
+    set_type(&mut ctx, ALICE, M3, ISOLATED);
+    ok(&mut ctx, BOB, &order(M3, SELL, px(100), 2, GTC));
+    ok(&mut ctx, ALICE, &order(M3, BUY, px(100), 2, IOC));
+    let h = assert_health_is_the_fold(&mut ctx, ALICE, "opens");
+    assert!(h.has_cross && h.cross_mm > 0);
+
+    let fs =
+        FundingState { last_funding_rate: 0, next_funding_ts: 0, cumulative_funding_index: 3_333 };
+    storage::save_funding_state(&mut ctx, M1, &fs).unwrap();
+    let mut legs = Vec::new();
+    crate::margin_view::cross_health(&mut ctx, ALICE, Some(&mut legs)).unwrap();
+    assert_ne!(legs[0].pending_funding, 0, "M1's leg owes funding");
+    assert_health_is_the_fold(&mut ctx, ALICE, "funding moved");
+
+    storage::save_mark_price(&mut ctx, M2, px(130)).unwrap();
+    assert_health_is_the_fold(&mut ctx, ALICE, "mark moved");
+    ok(&mut ctx, BOB, &order(M1, BUY, px(100), 4, GTC));
+    ok(&mut ctx, ALICE, &order(M1, SELL, px(100), 4, IOC));
+    assert_health_is_the_fold(&mut ctx, ALICE, "partial close");
+    ok(&mut ctx, BOB, &order(M2, SELL, px(130), 4, GTC));
+    ok(&mut ctx, ALICE, &order(M2, BUY, px(130), 4, IOC));
+    let h = assert_health_is_the_fold(&mut ctx, ALICE, "close");
+    let mut legs = Vec::new();
+    crate::margin_view::cross_health(&mut ctx, ALICE, Some(&mut legs)).unwrap();
+    assert_eq!(legs.iter().map(|l| l.market_id).collect::<Vec<_>>(), vec![M1]);
+    assert_eq!(h.faulted_legs, 0);
+    for u in USERS {
+        assert_health_is_the_fold(&mut ctx, u, "every account");
+    }
+}
+
+/// J4, the TOTAL policy: a leg priced at a mark of `0` counts `uPnL = MM = 0` and stays a leg; a
+/// leg whose pending funding leaves `i64` is left OUT of every sum and counted — exactly as the
+/// walk does, which leaves the same leg out.
+#[test]
+fn a_zero_mark_and_an_unpriceable_leg_are_the_walks_too() {
+    let mut ctx = make_ctx();
+    for m in MARKETS {
+        ok(&mut ctx, BOB, &order(m, SELL, px(100), 1, GTC));
+        ok(&mut ctx, ALICE, &order(m, BUY, px(100), 1, IOC));
+    }
+    storage::save_mark_price(&mut ctx, M3, 0).unwrap();
+    let fs = FundingState {
+        last_funding_rate: 0,
+        next_funding_ts: 0,
+        cumulative_funding_index: 1_000_000_000_000_000_000_000,
+    };
+    storage::save_funding_state(&mut ctx, M2, &fs).unwrap();
+    let h = assert_health_is_the_fold(&mut ctx, ALICE, "J4");
+    assert_eq!(h.faulted_legs, 1, "M2's leg cannot be priced");
+    let fold = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    assert_eq!(fold.faulted_legs, 1);
+    let mut legs = Vec::new();
+    crate::margin_view::cross_health(&mut ctx, ALICE, Some(&mut legs)).unwrap();
+    let m3 = legs.iter().find(|l| l.market_id == M3).copied().unwrap();
+    assert_eq!((m3.upnl, m3.mm), (0, 0), "no price: neither props the account up nor drags it");
+    assert!(legs.iter().all(|l| l.market_id != M2));
+    assert!(h.has_cross);
+}
+
+/// With the gate off (a test's override — the engine before the flip) no position is CROSSED in
+/// force, whatever the list holds: no leg is read, `E = W`, `Σ MM = 0`, as the walk reports.
+#[test]
+fn gated_off_the_health_check_sees_no_cross_leg() {
+    let mut ctx = make_ctx();
+    ok(&mut ctx, BOB, &order(M1, SELL, px(100), 10, GTC));
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 10, IOC));
+    assert_eq!(stored_legs(&mut ctx, ALICE).len(), 1);
+    let _off = crate::margin_type::test_gate::disable();
+    let h = assert_health_is_the_fold(&mut ctx, ALICE, "gated off");
+    let w = storage::load_account(&mut ctx, ALICE).unwrap().perp_wallet_balance as i128;
+    assert_eq!((h.e, h.cross_mm, h.has_cross, h.faulted_legs), (w, 0, false, 0));
+}
+
+/// **D4** — a leg list that has drifted from the positions is caught by the walk every health
+/// check re-runs in a debug build: a planted leg of the wrong size. (A release build does no walk
+/// and prices what the list says — the drift the debug check exists to catch first.)
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "diverged from the CROSSED non-zero"))]
+fn a_drifted_leg_list_is_caught_by_the_debug_walk() {
+    let mut ctx = make_ctx();
+    ok(&mut ctx, BOB, &order(M1, SELL, px(100), 10, GTC));
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 10, IOC));
+    let mut leg = stored_legs(&mut ctx, ALICE)[0];
+    leg.amount = 11;
+    storage::plant_cross_leg_for_test(&mut ctx, ALICE, M1, Some(leg)).unwrap();
+    let h = crate::margin_view::cross_health(&mut ctx, ALICE, None).unwrap();
+    let fold = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    assert_ne!(h.cross_mm, fold.cross_mm, "release: priced from the drifted list");
+}
+
+/// **D4** — the health numbers themselves are held to the walk's: a leg naming a market that does
+/// not exist (corrupt state) is left out and counted, and a debug build stops on it first.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "names unknown market 99"))]
+fn a_leg_naming_no_market_is_left_out_and_flagged() {
+    let mut ctx = make_ctx();
+    let leg = CrossLegState {
+        market_id: 99,
+        amount: 1,
+        v_quote_balance: -100,
+        last_funding_index: 0,
+    };
+    storage::plant_cross_leg_for_test(&mut ctx, ALICE, 99, Some(leg)).unwrap();
+    let h = crate::margin_view::cross_health(&mut ctx, ALICE, None).unwrap();
+    assert_eq!((h.faulted_legs, h.has_cross, h.cross_mm), (1, false, 0));
 }

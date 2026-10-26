@@ -943,6 +943,232 @@ fn cross_fold_walk<H: PerpHost>(
     Ok(sums.finish(w, faulted))
 }
 
+// ── The cross HEALTH check: no position walk (cross margin P4) ─────────────────────────────────
+//
+// What the liquidation sweep, the episode and ADL read of an account is its HEALTH — `E`, `Σ_C MM`
+// and, per cross leg, `uPnL_k` / `MM_k` / `PF_k` — never `A`, `X`, `ooIM` or `PIM`. Every one of
+// those terms is a function of the market and of three position fields (`amount`, `vQuote`,
+// `last_funding_index`), which are stored per user for each position CROSSED in force
+// (`types::CrossLegs`, maintained by `storage::save_position`). So the health check is the account
+// blob (`W`), the cross-leg blob and one `Market` per leg (resident after its first load in a
+// block): no per-user market index, no position loads — where `cross_fold` costs the index and a
+// `{market, position}` pair per member market.
+
+/// One cross leg's health terms, as [`cross_health`] priced them — the [`CrossLeg`] fields the
+/// sweep, the episode and ADL read, from the same functions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrossHealthLeg {
+    /// The market.
+    pub market_id: u64,
+    /// `uPnL_k = N_k + vQuote_k` at the stored mark; `0` when the mark is `0` (J4).
+    pub upnl: i128,
+    /// `MM_k` — maintenance margin at `|N_k|` under the market's tier table.
+    pub mm: i128,
+    /// `PF_k` — the signed funding a settlement would apply now, off the `Market`'s mirror of the
+    /// cumulative funding index.
+    pub pending_funding: i128,
+}
+
+/// The account-level cross HEALTH: [`CrossFold`]'s `W`, `E`, `Σ_C MM`, `has_cross` and
+/// `faulted_legs`, and nothing else. Produced by [`cross_health`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrossHealth {
+    /// `W` — the stored `perp_wallet_balance`.
+    pub w: i128,
+    /// `E = W + Σ_C PF_k + Σ_C uPnL_k` — the cross margin balance.
+    pub e: i128,
+    /// `Σ_C MM_k`.
+    pub cross_mm: i128,
+    /// At least one cross leg was evaluated (every leg is a non-zero position).
+    pub has_cross: bool,
+    /// Cross legs left OUT of every sum because they could not be evaluated: a leg naming no
+    /// market, or one whose arithmetic overflowed — [`CrossFold::faulted_legs`]' rule, counted over
+    /// the cross legs only (an isolated position is no part of the health).
+    pub faulted_legs: u8,
+}
+
+impl CrossHealth {
+    /// The account-level cross liquidation condition `E < Σ_C MM` (strict) —
+    /// [`CrossFold::below_cross_maintenance`], on the same numbers.
+    #[inline]
+    pub fn below_cross_maintenance(&self) -> bool {
+        self.has_cross && self.e < self.cross_mm
+    }
+}
+
+/// [`CrossHealthLeg`] for one stored leg. Pure. The terms come from the functions [`cross_leg`]
+/// prices them with — `N` by [`calc_value_i64`] (as [`position_derived_margin`] does), `MM` by
+/// [`maintenance_margin`], `PF` by `funding::pending_funding_of` (the expression of
+/// `funding::pending_funding_payment`) — in the same order, so each errs exactly where
+/// [`cross_leg`] errs on the same leg, with one exception: [`cross_leg`] also prices the leg's
+/// `PIM` / `ooIM` (from `pos.leverage` and the `Bid` / `Ask` aggregates, which the leg does not
+/// carry), and a leg whose `IM` alone overflows `u64` is faulted there and priced here. No engine
+/// path reaches that (the placement gates bound `Bid` / `Ask` by the account's available balance),
+/// and the `debug_assertions` cross-check in [`cross_health`] would flag it.
+fn cross_health_leg(
+    market: &crate::types::Market,
+    leg: &crate::types::CrossLegState,
+) -> Result<CrossHealthLeg, PerpError> {
+    let n =
+        calc_value_i64(market.mark_price, leg.amount, market.base_decimals, market.price_decimals)?;
+    let upnl = if market.mark_price != 0 { n as i128 + leg.v_quote_balance as i128 } else { 0 };
+    let abs_n = n.checked_abs().ok_or_else(|| perp_err("cross fold: notional abs overflow"))?;
+    let mm = maintenance_margin(&market.tiers, abs_n)? as i128;
+    let pending_funding = crate::funding::pending_funding_of(
+        market.cumulative_funding_index,
+        leg.amount,
+        leg.last_funding_index,
+        market,
+    )? as i128;
+    Ok(CrossHealthLeg { market_id: leg.market_id, upnl, mm, pending_funding })
+}
+
+/// **The cross HEALTH check — TOTAL.** `W`, `E`, `Σ_C MM`, `has_cross` and the faulted-leg count of
+/// `user` ([`CrossHealth`]), priced from the user's stored cross legs ([`crate::types::CrossLegs`])
+/// and one `Market` per leg: bit-for-bit the numbers [`cross_fold`] produces for those fields, at a
+/// fraction of the loads.
+///
+/// For every site that reads only those terms — the liquidation sweep's detection, the episode's
+/// stop checks and its MM-share bankruptcy price, ADL's cross winners, the flag's end. The gates
+/// and the views need `A`, `X`, `ooIM` or `PIM`, which depend on every market's resting orders and
+/// leverage, and keep [`cross_fold_checked`] / [`cross_fold`].
+///
+/// TOTAL under the same policy (J4): accumulation in `i128`, never narrowed; a leg naming no
+/// market contributes nothing (and `debug_assert`s — corrupt state); a leg whose arithmetic leaves
+/// the representable range contributes nothing; a mark of `0` gives `uPnL = MM = 0`. The left-out
+/// legs are counted in [`CrossHealth::faulted_legs`]. The only `Err` is the storage layer's.
+///
+/// With the gate off (only a test can turn it off) no position is CROSSED in force: no leg is
+/// read, `E = W`, `Σ_C MM = 0` — exactly what the walk reports.
+///
+/// `legs`, when given, receives one [`CrossHealthLeg`] per evaluated leg, in market order.
+///
+/// # Cost
+///
+/// The account and the cross-leg blob (each resident after its first load in a block) and one
+/// `Market` per cross leg (likewise). No index, no position, no `FundingState`.
+///
+/// # ⚠️ DO NOT CACHE THIS, AND DO NOT INCREMENT IT — RE-PRICE, EVERY TIME
+///
+/// The legs are POSITION state; the answer is not. Every term moves with its own market's mark and
+/// funding index while the user does nothing (R13) — exactly as for [`cross_fold`].
+///
+/// # Checked against the walk
+///
+/// In `debug_assertions` builds every call re-derives its answer with [`cross_fold`] and panics on
+/// any difference — `W`, `E`, `Σ_C MM`, `has_cross`, the faulted count, and every per-leg value —
+/// after checking the stored legs themselves against a fresh walk of the positions
+/// ([`debug_assert_cross_legs`]): the `total_position_margin` pattern. A release build does no
+/// walk.
+pub fn cross_health<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    mut legs: Option<&mut Vec<CrossHealthLeg>>,
+) -> Result<CrossHealth, PerpError> {
+    #[cfg(debug_assertions)]
+    let pushed_from = legs.as_ref().map_or(0, |l| l.len());
+    let w = storage::load_account_ref(context, user)?.perp_wallet_balance as i128;
+    let (mut pending_funding, mut upnl, mut cross_mm) = (0i128, 0i128, 0i128);
+    let mut has_cross = false;
+    let mut faulted: u8 = 0;
+    if crate::margin_type::cross_margin_enabled() {
+        let stored = storage::load_cross_legs_ref(context, user)?;
+        for leg in stored.iter() {
+            let Some(market) = storage::load_market_ref(context, leg.market_id)? else {
+                // Corrupt state: a non-zero position in a market that does not exist. Left out —
+                // and flagged loudly in debug builds, as the walk does.
+                debug_assert!(
+                    false,
+                    "cross health: {user}'s cross leg names unknown market {}",
+                    leg.market_id
+                );
+                faulted = faulted.saturating_add(1);
+                continue;
+            };
+            match cross_health_leg(&market, leg) {
+                Ok(h) => {
+                    pending_funding += h.pending_funding;
+                    upnl += h.upnl;
+                    cross_mm += h.mm;
+                    has_cross = true;
+                    if let Some(legs) = legs.as_mut() {
+                        legs.push(h);
+                    }
+                }
+                Err(_) => faulted = faulted.saturating_add(1),
+            }
+        }
+    }
+    let health = CrossHealth {
+        w,
+        e: w + pending_funding + upnl,
+        cross_mm,
+        has_cross,
+        faulted_legs: faulted,
+    };
+    #[cfg(debug_assertions)]
+    debug_assert_cross_health(
+        context,
+        user,
+        &health,
+        legs.as_deref().map(|l| &l[pushed_from..]),
+    )?;
+    Ok(health)
+}
+
+/// `debug_assertions` only — [`cross_health`]'s cross-check against the walk it replaces: the
+/// stored legs against the positions ([`debug_assert_cross_legs`]), then every number against a
+/// fresh [`cross_fold`] — `W`, `E`, `Σ_C MM`, `has_cross`, and (when `legs` is given) each leg's
+/// `uPnL` / `MM` / `PF` against the fold's leg of a position CROSSED in force and non-zero. The
+/// faulted count is held to the cross positions the fold could not evaluate: the cross legs
+/// stored, less the cross legs the fold priced. Panics on any difference.
+#[cfg(debug_assertions)]
+fn debug_assert_cross_health<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    health: &CrossHealth,
+    legs: Option<&[CrossHealthLeg]>,
+) -> Result<(), PerpError> {
+    debug_assert_cross_legs(context, user, "cross_health")?;
+    let mut walked = Vec::new();
+    let fold = cross_fold(context, user, None, None, Some(&mut walked))?;
+    let mut fold_legs: Vec<CrossHealthLeg> = walked
+        .iter()
+        .filter(|l| l.cross && l.has_position)
+        .map(|l| CrossHealthLeg {
+            market_id: l.market_id,
+            upnl: l.upnl,
+            mm: l.mm,
+            pending_funding: l.pending_funding,
+        })
+        .collect();
+    fold_legs.sort_by_key(|l| l.market_id);
+    let held = if crate::margin_type::cross_margin_enabled() {
+        storage::load_cross_legs_ref(context, user)?.len()
+    } else {
+        0
+    };
+    let expected = CrossHealth {
+        w: fold.w,
+        e: fold.e,
+        cross_mm: fold.cross_mm,
+        has_cross: fold.has_cross,
+        faulted_legs: held.saturating_sub(fold_legs.len()) as u8,
+    };
+    debug_assert_eq!(
+        *health, expected,
+        "cross_health for {user} disagrees with the cross_fold walk it replaces"
+    );
+    if let Some(legs) = legs {
+        debug_assert_eq!(
+            legs,
+            fold_legs.as_slice(),
+            "cross_health's legs for {user} disagree with the cross_fold walk's"
+        );
+    }
+    Ok(())
+}
+
 // ── Derived-ooIM admission basis (the live enforcement gate) ─────────────────────────────────
 
 /// `Σ_markets ooIM` for `user`, over the per-user market index — the account-level open-order
@@ -1968,12 +2194,13 @@ pub fn index_account_scalars<H: PerpHost>(
 /// non-zero position, which keeps its market in the index.
 ///
 /// With the gate OFF (only a test can turn it off) nothing is CROSSED in force and every reader
-/// ignores the list, so there is nothing to hold it to: legs a test wrote before turning the gate
-/// off are left as they were, and the check passes.
+/// ignores the list ([`cross_health`]), so there is nothing to hold it to: legs a test wrote before
+/// turning the gate off are left as they were, and the check passes.
 ///
-/// Run on every `getAccount` and every published snapshot ([`index_account_scalars`]), so a write
-/// that reached a position without `storage::save_position`'s maintenance panics in the test suite
-/// instead of mis-pricing an account's health in production.
+/// Run on every `getAccount` and every published snapshot ([`index_account_scalars`]) and inside
+/// every [`cross_health`] (whose numbers rest on it), so a write that reached a position without
+/// `storage::save_position`'s maintenance panics in the test suite instead of mis-pricing an
+/// account's health in production.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_cross_legs<H: PerpHost>(
     context: &mut H,

@@ -1645,6 +1645,19 @@ fn set_cross_leg<H: PerpHost>(
     Ok(())
 }
 
+/// Test-only: sets `user`'s cross leg of `market_id` through the list's one writer WITHOUT a
+/// position write — the drift `margin_view::cross_health`'s `debug_assertions` walk exists to
+/// catch, planted on purpose.
+#[cfg(test)]
+pub(crate) fn plant_cross_leg_for_test<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    leg: Option<crate::types::CrossLegState>,
+) -> Result<(), PerpError> {
+    set_cross_leg(context, user, market_id, leg)
+}
+
 /// Pre-write admission gate for the [`MAX_USER_MARKETS`] cap.
 ///
 /// Called from the VALIDATION phase of order placement — book (`who` = `"placeOrder"`) and
