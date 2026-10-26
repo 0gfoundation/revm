@@ -101,7 +101,7 @@ const fn px(dollars: u64) -> u64 {
 /// every "xleg" value's bytes change and nothing else does — VERIFIED: with the "xleg" keys kept
 /// out of the block delta the scenario still reproduces 0x9c7be213…4132. `CrossSnapshot`
 /// UNCHANGED. Previous pin 0x3c401b0086975d55a76f24c4bdea8fb637fb5114c93b7ff9cc1a56bedb5173b9.
-const CROSS_GOLDEN_COMMITMENT: B256 =
+pub(crate) const CROSS_GOLDEN_COMMITMENT: B256 =
     b256!("0x60470df0b8c7f002d65d94138759b0bba11c791b1446a49ab64e8e2714504b3f");
 
 /// The business end state, read back through the views (and the liquidation flag, which no view

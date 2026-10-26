@@ -6600,7 +6600,7 @@ fn fill_settles_funding_for_taker_and_maker() {
 // resting-order margin rebalance (debit + credit) incl. setLeverageSigned;
 // transferAdmin; user-facing Market orders (filled + expired remainder);
 // liquidation residual settle at mark price; getBookPrices / getBookLevel.
-mod golden {
+pub(crate) mod golden {
     use super::*;
     use crate::{
         interface::IPerpDex::{
@@ -7105,7 +7105,7 @@ mod golden {
     /// 0x345e5092f80e665e92fdb64d0cf72c27d466d9481a8784104b042b854e985875,
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
-    const GOLDEN_COMMITMENT: B256 =
+    pub(crate) const GOLDEN_COMMITMENT: B256 =
         b256!("0xfdf928b54c849a832e948e32d20b951490ebdc33c54c38254a13f10351a147d4");
 
     /// Business end-state read back through view calls after the scenario.
