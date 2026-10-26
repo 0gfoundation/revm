@@ -2149,7 +2149,14 @@ struct Stats {
     deferrals: u64,
     flagged_after_tick: u64,
     refused_2023: u64,
+    /// Every refusal with the J1 string (`E_J1`): the taker's J1 and R2 at rest.
+    refused_j1: u64,
+    /// R2 probes ([`Fuzz::r2_probe`]): placed, refused by R2 (J1 at rest), admitted.
+    r2_probes: u64,
     refused_r2: u64,
+    r2_admitted: u64,
+    /// Bracket retunes ([`Fuzz::retune`]).
+    retunes: u64,
     stale_skips: u64,
     exempt_after_tick: u64,
     min_wallet: i128,
@@ -2175,7 +2182,11 @@ impl Stats {
         self.deferrals += o.deferrals;
         self.flagged_after_tick += o.flagged_after_tick;
         self.refused_2023 += o.refused_2023;
+        self.refused_j1 += o.refused_j1;
+        self.r2_probes += o.r2_probes;
         self.refused_r2 += o.refused_r2;
+        self.r2_admitted += o.r2_admitted;
+        self.retunes += o.retunes;
         self.stale_skips += o.stale_skips;
         self.exempt_after_tick += o.exempt_after_tick;
         self.min_wallet = self.min_wallet.min(o.min_wallet);
@@ -2235,6 +2246,10 @@ struct Fuzz {
     lps: [Address; 2],
     index: Vec<u64>,
     stalled_until: Vec<u64>,
+    /// Each market's own tier table, which [`Fuzz::r2_excursion`] restores.
+    base_tiers: Vec<Vec<Band>>,
+    /// The R2 excursion's own random stream (see [`Fuzz::step`]).
+    aux: Rng,
     stats: Stats,
     /// One digest per call — two runs of a seed must agree call for call (determinism).
     digest: Vec<[u8; 32]>,
@@ -2303,6 +2318,7 @@ impl Fuzz {
         }
         let index = specs.iter().map(|s| s.mark0).collect();
         let stalled_until = vec![0; specs.len()];
+        let base_tiers = specs.iter().map(|s| s.tiers.clone()).collect();
         Fuzz {
             w,
             rng,
@@ -2310,6 +2326,8 @@ impl Fuzz {
             lps: [DAVE, ERIN],
             index,
             stalled_until,
+            base_tiers,
+            aux: Rng(seed ^ 0x52_32_52_32),
             stats: Stats::default(),
             digest: Vec::new(),
         }
@@ -2345,7 +2363,7 @@ impl Fuzz {
                     self.stats.refused_2023 += 1;
                 }
                 if e == E_J1 {
-                    self.stats.refused_r2 += 1;
+                    self.stats.refused_j1 += 1;
                 }
                 assert!(
                     sel != updateIndexPriceCall::SELECTOR && sel != drainDeferredWorkCall::SELECTOR,
@@ -2446,6 +2464,11 @@ impl Fuzz {
         let m = self.rng.pick(&markets);
         let mk = self.mark(m);
         let lp = self.rng.pick(&self.lps);
+        // The R2 excursion runs on its own random stream and leaves the world as it found it, so
+        // the main stream's trajectory — and every coverage floor of the run — is undisturbed.
+        if self.aux.chance(1, 25) {
+            self.r2_excursion();
+        }
         match self.rng.below(32) {
             0..=6 => {
                 // A market order against liquidity a provider rests within 1 % of the mark.
@@ -2634,6 +2657,148 @@ impl Fuzz {
         self.stats.min_e = min_e;
     }
 
+    /// **R2 — J1 at rest, in an excursion.** The venue retunes a random market's brackets to a
+    /// TIGHT table — one bracket, leverage up to 2, maintenance 30 %, above the initial margin of
+    /// every position opened at leverage 4 or more: TIER DRIFT, `Σ_C MM > Σ_C PIM`, the state R2
+    /// exists for (outside it the available-balance gate refuses first, which is why the plain
+    /// fuzz never meets R2) — then probes R2 ([`Fuzz::r2_probe`]), then restores the market's own
+    /// table. No tick runs in between and the probe leaves nothing behind (a refusal writes
+    /// nothing, an admitted probe is cancelled), so the world comes back as it was; every call in
+    /// between is held to the full per-call check, with the model priced on the tight table.
+    fn r2_excursion(&mut self) {
+        let m = self.aux.pick(&self.markets());
+        let k = (m - 1) as usize;
+        self.set_tiers(m, vec![Band { lb: 0, lev: 2, ppm: 300_000 }]);
+        self.r2_probe();
+        let own = self.base_tiers[k].clone();
+        self.set_tiers(m, own);
+        self.stats.retunes += 1;
+    }
+
+    /// `setMarginTiers` through the shell; the model learns the table first, since the call's own
+    /// check prices every account with it.
+    fn set_tiers(&mut self, m: u64, tiers: Vec<Band>) {
+        let input = setMarginTiersCall {
+            marketId: m,
+            lowerBounds: tiers.iter().map(|b| b.lb * USD as u64).collect(),
+            maxLeverages: tiers.iter().map(|b| b.lev).collect(),
+            maintMarginRatesPpm: tiers.iter().map(|b| b.ppm).collect(),
+            notionalCap: 0,
+        }
+        .abi_encode();
+        self.w.specs[(m - 1) as usize].tiers = tiers;
+        self.call(ADMIN, &input).unwrap();
+    }
+
+    /// **R2 probed.** Finds a trader holding cross exposure, not flagged, whose available balance
+    /// exceeds its maintenance slack `S = E − ΣMM`, and a market where ONE resting order on the
+    /// side that OPENS (a bid on a long or flat position, an ask on a short) can carry an Open
+    /// Loss on the chosen side of `S` within that balance — priced so that it cannot trade (under
+    /// the best ask / over the best bid), inside the band, as far through the mark as both allow
+    /// — and places it: half the time for the least whole number of units whose Open Loss EXCEEDS
+    /// `S`, half the time for the most whose Open Loss does not (none, one tick passive, when the
+    /// account already sits under, `S < 0`). Held to R2: refused with the J1 string ONLY when the
+    /// model says `E − OpenLoss < ΣMM`, and never admitted then. A refusal by another gate is
+    /// counted, not judged; an admitted probe is cancelled.
+    fn r2_probe(&mut self) {
+        let mut traders = self.traders.clone();
+        let start = self.aux.below(traders.len() as u64) as usize;
+        traders.rotate_left(start);
+        let past = self.aux.chance(1, 2);
+        for u in traders {
+            let a = self.w.acct(u);
+            if !a.has_cross || a.flagged {
+                continue;
+            }
+            let avail = self.w.account_view(u).availableBalance as i128;
+            if past && avail <= (a.e - a.cmm).max(0) {
+                continue;
+            }
+            for m in self.markets() {
+                let Some((side, price, qty, open_loss)) = self.r2_order(u, &a, m, avail, past)
+                else {
+                    continue;
+                };
+                let under = a.e - open_loss < a.cmm;
+                let (e, cmm) = (a.e, a.cmm);
+                self.stats.r2_probes += 1;
+                match self.call(u, &gtc(m, side, price, qty)) {
+                    Err(r) if r == E_J1 => {
+                        assert!(under, "R2 refused {u}: E {e} − OL {open_loss} ≥ ΣMM {cmm}");
+                        self.stats.refused_r2 += 1;
+                    }
+                    Err(_) => {}
+                    Ok(_) => {
+                        assert!(!under, "R2 admitted {u}: E {e} − OL {open_loss} < ΣMM {cmm}");
+                        self.stats.r2_admitted += 1;
+                        let id = placeOrderCall::abi_decode_returns(&self.w.last_out).unwrap();
+                        let cancel = cancelOrderCall { orderId: id, marketId: m };
+                        self.call(u, &cancel.abi_encode()).unwrap();
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// The probe order of [`Fuzz::r2_probe`] for `u` on `m` — `(side, price, qty, OpenLoss)`, its
+    /// Open Loss past the slack (`past`) or within it — or `None` when no such order fits the book
+    /// or `avail` (the order's open-order margin estimated at `max(price, mark) / leverage` per
+    /// unit, padded by a tenth).
+    fn r2_order(
+        &mut self,
+        u: Address,
+        a: &Acct,
+        m: u64,
+        avail: i128,
+        past: bool,
+    ) -> Option<(u8, u64, u64, i128)> {
+        let l = *a.leg(m);
+        let side = match l.amount.signum() {
+            1 => BUY,
+            -1 => SELL,
+            _ => self.aux.pick(&[BUY, SELL]),
+        };
+        let mk = l.mark;
+        let hot = storage::load_market_hot(&mut self.w.ctx, m).unwrap();
+        let (upper, lower) = self.w.band(m);
+        let slack = a.e - a.cmm;
+        let (price, qty) = if slack < 0 {
+            (if side == BUY { mk - 1 } else { mk + 1 }, 1)
+        } else if l.cross {
+            // The furthest price through the mark the band and the book leave.
+            let room = if side == BUY {
+                let ask = if hot.best_ask == 0 { u64::MAX } else { hot.best_ask - 1 };
+                upper.min(ask).saturating_sub(mk)
+            } else {
+                mk.saturating_sub(lower.max(hot.best_bid + 1).max(1))
+            };
+            if room == 0 {
+                return None;
+            }
+            let within = (slack / (room as i128 * USD)) as u64;
+            let units = if past { within + 1 } else { within };
+            (if side == BUY { mk + room } else { mk - room }, units)
+        } else {
+            // An isolated order carries no Open Loss: only an account already under is refused.
+            return None;
+        };
+        let crosses = if side == BUY {
+            hot.best_ask != 0 && price >= hot.best_ask
+        } else {
+            price <= hot.best_bid
+        };
+        if price == 0 || qty == 0 || crosses || qty > 10_000 {
+            return None;
+        }
+        let (p, m_) = (price as i128, mk as i128);
+        let through = if side == BUY { p - m_ } else { m_ - p };
+        let open_loss = if l.cross { through.max(0) * qty as i128 * USD } else { 0 };
+        let lev = self.w.pos(u, m).leverage.max(1) as i128;
+        let oo_im = qty as i128 * p.max(m_) * USD / lev;
+        (avail - open_loss - oo_im * 11 / 10 >= 0).then_some((side, price, qty, open_loss))
+    }
+
     fn cancel_all(&mut self, u: Address, m: u64) {
         let ids: Vec<Id> = storage::load_buy_orders(&mut self.w.ctx, u, m)
             .unwrap()
@@ -2788,6 +2953,8 @@ fn fuzz_never_err_conserves_and_ends_healthy_five_markets() {
         assert!(s.min_wallet < 0 && s.min_e < 0, "a negative wallet and E < 0 reached");
         assert!(s.refused_2023 > 0, "the freeze was met");
         assert!(s.flagged_after_tick > 0, "an episode outlived its tick");
+        assert!(s.retunes > 0 && s.r2_admitted > 0, "brackets retuned, probes admitted");
+        assert!(s.refused_r2 > 0, "R2 refused a resting opening order");
     }
 }
 
