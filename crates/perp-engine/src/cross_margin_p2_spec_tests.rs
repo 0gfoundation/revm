@@ -2343,7 +2343,7 @@ fn gate_in_liquidation_reaches_a_sub_account_through_its_master() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
-// The P2 liquidation interim
+// Liquidation of a CROSSED position (P3 — the P2 interim skipped it) and ADL with cross winners
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The sweep and `liquidate()` judge a CROSSED position on its ACCOUNT (P3 — the P2 interim left

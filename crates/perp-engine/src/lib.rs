@@ -37,12 +37,12 @@ mod cross_margin_spec_tests;
 /// read surfaces.
 #[cfg(test)]
 mod cross_accounting_tests;
-/// Cross margin P2b: money movement on a CROSSED position — fills, funding, the P2 liquidation /
-/// ADL interim, J6 and the negative-wallet audit — under the custody identity.
+/// Cross margin P2b: money movement on a CROSSED position — fills, funding, liquidation and ADL
+/// next to cross positions, J6 and the negative-wallet audit — under the custody identity.
 #[cfg(test)]
 mod cross_settlement_tests;
 /// The independent cross-margin P2 spec suite (`SPEC_cross_margin.md` P2 ground rules, report §3.2
-/// model): every surface against a model, every gate to the unit, the P2 liquidation interim.
+/// model): every surface against a model, every gate to the unit, cross liquidation and ADL.
 #[cfg(test)]
 mod cross_margin_p2_spec_tests;
 /// Cross margin P3a: cross liquidation — account-level detection, the episode, its budget and

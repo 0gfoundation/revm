@@ -5,8 +5,10 @@
 //!   and a flip does both in one fill — taker and maker alike;
 //! * funding: a cross position's funding settles into `W`, published as `FundingSettled` plus a
 //!   B-only `AccountBalanceChanged(FUNDING_FEE)` group — no `PositionChanged`;
-//! * the P2 liquidation interim: the sweep and `liquidate()` never liquidate a CROSSED position
-//!   (no `Err`, no write), and ADL ranks a cross winner on its account `E` and settles it into `W`;
+//! * liquidation next to cross positions: one tick liquidates a cross account (P3's episode, whose
+//!   own suite is `cross_liquidation_tests`) and an isolated position each on its own predicate;
+//!   an isolated close never folds a failing cross leg; ADL ranks a cross winner on its account
+//!   `E` and settles it into `W`;
 //! * J6: the cash a TAKER moves into an ISOLATED silo must be in the wallet — cross unrealized
 //!   profit admits orders, it never becomes isolated collateral; the maker's M1 cap is unchanged;
 //! * the negative-wallet audit: every money-out gate reads `X`, so a negative cross wallet (or
@@ -684,7 +686,7 @@ fn a_cross_funding_charge_beyond_the_wallet_drives_it_negative() {
     assert_eq!(count_events::<InsuranceFundChanged>(&logs), 0);
 }
 
-// ── The P2 liquidation / ADL interim ─────────────────────────────────────────────
+// ── Liquidation and ADL next to cross positions ─────────────────────────────────
 
 /// An oracle tick on `market` — the mark becomes `median(index, index + basis, last trade)`, i.e.
 /// the index here (no basis samples, funding off) — followed by the liquidation sweep.
