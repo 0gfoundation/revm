@@ -2518,6 +2518,7 @@ pub(super) fn match_order<H: PerpHost>(
                             Side::Buy,
                             taker_fee_share,
                             market,
+                            maker_order.reduce_only || maker_order.close_position,
                         )? {
                             MakerFillOutcome::Filled {
                                 maker_fee,
@@ -2798,6 +2799,7 @@ pub(super) fn match_order<H: PerpHost>(
                             Side::Sell,
                             taker_fee_share,
                             market,
+                            maker_order.reduce_only || maker_order.close_position,
                         )? {
                             MakerFillOutcome::Filled {
                                 maker_fee,

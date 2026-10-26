@@ -494,11 +494,12 @@ fn a_cross_maker_fill_is_not_refused_on_account_health() {
     assert!(fold(&mut ctx, ALICE).below_cross_maintenance());
 }
 
-/// An account IN LIQUIDATION (`liq_flags`, set by P3 — here by the test stand-in) has every resting
-/// order removed when the walk reaches it instead of filled: a cross buy, an isolated sell, and a
-/// reduce-only order alike, each with `OrderCancelled(reason = Liquidation)`. The taker walks on to
-/// the next maker and fills there; the flagged account's positions do not move. Cleared, the
-/// account's next resting order fills again.
+/// An account IN LIQUIDATION (`liq_flags`, set by the cross episode — here by the test stand-in)
+/// has every resting order that can OPEN removed when the walk reaches it instead of filled — a
+/// cross buy and an isolated sell alike, each with `OrderCancelled(reason = Liquidation)` — and the
+/// taker walks on to the next maker and fills there. A REDUCE-ONLY resting order is exempt (R1):
+/// it can only shrink the position, so it fills as usual. Cleared, the account's next resting order
+/// fills again.
 #[test]
 fn a_maker_of_an_account_in_liquidation_is_cancelled_not_filled() {
     let mut ctx = make_ctx();
@@ -546,23 +547,31 @@ fn a_maker_of_an_account_in_liquidation_is_cancelled_not_filled() {
     assert_eq!(cancels(&logs, ALICE), vec![(cross_buy, liquidation)]);
     assert_eq!((trades_with(&logs, ALICE), trades_with(&logs, BOB)), (0, 1));
     assert_eq!(pos(&mut ctx, CAROL, M1).amount, -3);
-    // An isolated order and a reduce-only one are frozen alike: the flag is the ACCOUNT's.
+    // An isolated order is frozen alike: the flag is the ACCOUNT's.
     let logs = ok(&mut ctx, CAROL, &order(M2, BUY, px(100), 2, IOC));
     assert_eq!(cancels(&logs, ALICE), vec![(iso_sell, liquidation)]);
     assert_eq!(pos(&mut ctx, CAROL, M2).amount, 0, "nothing else on the book: it expired");
+    ledger.check(&mut ctx, "after the cross and isolated makers were skipped");
+    assert_eq!(alice(&mut ctx), before, "ALICE's positions and wallet did not move");
+
+    // R1: the reduce-only sell is NOT frozen — first at $101, it fills ahead of BOB's ask.
     ok(&mut ctx, BOB, &order(M1, SELL, px(101), 3, GTC));
     let logs = ok(&mut ctx, CAROL, &order(M1, BUY, px(101), 2, IOC));
-    assert_eq!(cancels(&logs, ALICE), vec![(reduce_only, liquidation)]);
-    assert_eq!(trades_with(&logs, BOB), 1, "the walk went on to BOB's ask");
-    ledger.check(&mut ctx, "after the isolated and reduce-only makers were skipped");
-    assert_eq!(alice(&mut ctx), before, "ALICE's positions and wallet did not move");
+    assert!(cancels(&logs, ALICE).is_empty(), "the reduce-only maker was not cancelled");
+    assert_eq!((trades_with(&logs, ALICE), trades_with(&logs, BOB)), (1, 0));
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 3, "it reduced the position");
+    assert!(storage::load_sell_orders(&mut ctx, ALICE, M1)
+        .unwrap()
+        .iter()
+        .all(|e| e.order_id != reduce_only));
+    ledger.check(&mut ctx, "after the reduce-only maker filled");
 
     // Cleared: her next resting order fills as usual.
     storage::set_in_liquidation_for_test(&mut ctx, ALICE, false).unwrap();
     ok(&mut ctx, ALICE, &order(M1, BUY, px(98), 1, GTC));
     let logs = ok(&mut ctx, CAROL, &order(M1, SELL, px(98), 1, IOC));
     assert_eq!(trades_with(&logs, ALICE), 1);
-    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 6);
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 4);
     ledger.check(&mut ctx, "after the flag was cleared");
 }
 

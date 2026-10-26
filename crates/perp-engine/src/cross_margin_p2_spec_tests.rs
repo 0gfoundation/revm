@@ -2295,18 +2295,19 @@ fn gate_in_liquidation_only_reducing_orders_on_every_entrypoint() {
     ok(ctx, ALICE, &cancelOrderCall { orderId: ro.into(), marketId: M1 }.abi_encode());
 
     // The maker freeze: DAVE buys 2 — ALICE's plain sell at 1,100 is cancelled (reason 3), BOB's at
-    // 1,101 fills; then 1 more — ALICE's REDUCE-ONLY sell at 1,200 is cancelled too, and nothing
-    // fills.
+    // 1,101 fills; then 1 more — ALICE's REDUCE-ONLY sell at 1,200 is EXEMPT (P3, R1: it can only
+    // reduce) and fills.
     let c = ok(ctx, DAVE, &mkt(M1, BUY, 2));
     let cancels = evs::<OrderCancelled>(&c.logs);
     assert_eq!(cancels.len(), 1);
     assert_eq!((cancels[0].user, cancels[0].reason), (ALICE, CANCEL_LIQUIDATION));
     assert!(evs::<Trade>(&c.logs).iter().all(|t| t.maker == BOB && t.quantity == 2));
-    let c = ok(ctx, DAVE, &mkt(M1, BUY, 1));
-    let cancels = evs::<OrderCancelled>(&c.logs);
-    assert_eq!((cancels.len(), cancels[0].user, cancels[0].reason), (1, ALICE, CANCEL_LIQUIDATION));
-    assert!(evs::<Trade>(&c.logs).is_empty());
     assert_eq!(pos(ctx, ALICE, M1).amount, 8, "a frozen maker is never filled");
+    let c = ok(ctx, DAVE, &mkt(M1, BUY, 1));
+    assert!(evs::<OrderCancelled>(&c.logs).is_empty(), "the reduce-only maker is not frozen");
+    let t = evs::<Trade>(&c.logs);
+    assert_eq!((t.len(), t[0].maker, t[0].price, t[0].quantity), (1, ALICE, 1_200, 1));
+    assert_eq!(pos(ctx, ALICE, M1).amount, 7, "it reduced the position");
 
     // Nobody else is affected; clearing the flag lifts everything.
     rest(ctx, BOB, M1, BUY, 900, 1);

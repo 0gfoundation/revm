@@ -750,10 +750,11 @@ pub(super) enum MakerFillOutcome {
     ///    `settle_maker_fill_core`) — `MakerInsolvent`;
     /// 2. it would open at a leverage the resulting size's margin tier no longer permits —
     ///    `MakerInsolvent`;
-    /// 3. the maker's ACCOUNT is in liquidation (`UserAccount::in_liquidation`, cross margin) —
-    ///    `Liquidation`. A cross liquidation cancels all of the account's orders, in steps (P3);
-    ///    until the last one is gone, none of them may fill. Checked before anything else, off the
-    ///    account the registry already loaded.
+    /// 3. the maker's ACCOUNT is in liquidation (`UserAccount::in_liquidation`, cross margin) and
+    ///    the order can open — `Liquidation`. A cross liquidation cancels all of the account's
+    ///    orders, in steps; until the last one is gone, none that can open may fill (a reduce-only
+    ///    / closePosition order is exempt, R1). Checked before anything else, off the account the
+    ///    registry already loaded.
     ///
     /// A wallet SHORTFALL is deliberately NOT in this list: the fill happens and the wallet goes
     /// negative (Binance never sweeps an under-covered lien — see the long note in
@@ -1568,6 +1569,9 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     // negative-rate maker can be rebated on it.
     taker_fee_share: u64,
     market: &crate::types::Market,
+    // The resting order can only REDUCE its owner's position: reduce-only or closePosition (R1 —
+    // exempt from the liquidation freeze below).
+    maker_reduces_only: bool,
 ) -> Result<MakerFillOutcome, PerpError> {
     let maker_side = taker_side.opposite();
     let i = reg.get_or_load(context, maker, market_id, market)?;
@@ -1577,23 +1581,23 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     let w = &mut reg.users[i].1;
     // ── A maker in LIQUIDATION is cancelled, not filled (cross report §3.3 item 4) ──────────────
     //
-    // `liq_flags` is the account-level freeze a cross liquidation sets (P3): the episode cancels
-    // every one of the account's orders, in steps under a budget, and the flag is what guarantees
-    // that the ones not reached yet cannot fill in between. So any order of a flagged account —
-    // either margin type, reduce-only or not — is removed when the walk reaches it, exactly like a
+    // `liq_flags` is the account-level freeze a cross liquidation sets (`risk::cross_liquidation`):
+    // the episode cancels every one of the account's orders, in steps under a budget, and the flag
+    // is what guarantees that the ones not reached yet cannot fill in between. So an order of a
+    // flagged account — either margin type — is removed when the walk reaches it, exactly like a
     // K9 reject. Free: the account is the working copy `get_or_load` just took (its funding is
-    // settled and persisted regardless, as for every rejected maker). Nothing sets the flag before
-    // P3, so this never fires in production yet.
+    // settled and persisted regardless, as for every rejected maker).
     //
-    // P3: Q11 ACCEPTS a reduce-only order while the flag is set, and if it rests it is cancelled
-    // here at first touch — accepted, then destroyed, with nothing on `OrderPlaced` / `OrderRested`
-    // saying it can never fill. A flagged account can still reduce as a TAKER (a reduce-only
-    // market / IOC order, a fired stop: a pure reduce on a cross wallet is not margin-gated, see
-    // `FillsGate`), so the gap is resting reduces only. Decide it with the episode: either exempt a
-    // reduce-only maker of a flagged account from this freeze (its fill can only lower `Σ MM`; the
-    // reduce-only eviction already keeps it within the position), or refuse a reduce-only order
-    // that would REST while flagged (`-2023`), admitting only immediate ones.
-    if w.account.in_liquidation() {
+    // ── …unless it can only REDUCE (R1) ──
+    //
+    // Q11 ACCEPTS a reduce-only / closePosition order while the flag is set — the one thing a
+    // flagged account may still do — and one that rests would otherwise be cancelled here at first
+    // touch: accepted, then destroyed, with nothing on `OrderPlaced` / `OrderRested` saying it could
+    // never fill. It is exempt instead, because its fill can only help the episode: it shrinks the
+    // position (the reduce-only eviction keeps every such order within it, so it cannot flip), which
+    // lowers `Σ MM`, and a pure reduce on a cross wallet is not margin-gated anyway (`FillsGate`).
+    // Everything else of a flagged account — the orders that can open — stays frozen.
+    if w.account.in_liquidation() && !maker_reduces_only {
         return Ok(MakerFillOutcome::Rejected {
             reason: crate::types::CancelReason::Liquidation,
         });
