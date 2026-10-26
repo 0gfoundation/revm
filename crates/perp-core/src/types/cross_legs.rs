@@ -89,11 +89,11 @@ impl CrossLegState {
 /// # Why its own key, not a field of `UserAccount`
 ///
 /// The account blob is written on every placement (the order nonce) and every fill, and every
-/// written blob is re-encoded and hashed into the block commitment at the end of the block. Embedded
-/// in the account (the first design, cross P4 D1/D2), the legs grew it from 21 to 126 / 440 bytes
-/// at 4 / 16 cross positions and slowed a single-call block's `placeOrder` by 4.8% / 8.4% — a path
-/// that never moves a leg. Here a placement writes no leg, and only a call that moves a cross
-/// position (which writes that position anyway) writes this blob.
+/// written blob is re-encoded and hashed into the block commitment at the end of the block.
+/// Embedded in the account (the first design, cross P4 D1/D2), the legs grew it from 21 to 126 /
+/// 440 bytes at 4 / 16 cross positions and slowed a single-call block's `placeOrder` by 4.8% /
+/// 8.4% — a path that never moves a leg. Here a placement writes no leg, and only a call that
+/// moves a cross position (which writes that position anyway) writes this blob.
 ///
 /// # The blob: packed, not positional msgpack
 ///

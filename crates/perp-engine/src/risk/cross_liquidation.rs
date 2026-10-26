@@ -311,9 +311,9 @@ struct CloseStep {
 }
 
 /// Close `user`'s cross position in `market` — one episode step. `None` when the leg cannot be
-/// evaluated (it faulted in the health check, J4), with nothing written. `priced`: every cross leg of the
-/// account is priced at a mark the episode trusts ([`every_cross_leg_is_priced`]) — without it no
-/// deficit sets an ADL price (see the ADL leg below).
+/// evaluated (it faulted in the health check, J4), with nothing written. `priced`: every cross leg
+/// of the account is priced at a mark the episode trusts ([`every_cross_leg_is_priced`]) — without
+/// it no deficit sets an ADL price (see the ADL leg below).
 fn close_market<H: PerpHost>(
     context: &mut H,
     user: Address,
