@@ -28,6 +28,11 @@
 //!   every market before it trades: the margin shape the harness's existing scenarios have.
 //! * `isolated_random_m2` — `isolated_random` on market 2 alone, the shape the harness's
 //!   single-market runs (`MARKET_ID` = 2) model end to end.
+//! * `cross_scenes` — deterministic scenes a random trace reaches rarely or never: a lazily-deleted
+//!   id in a level's FIFO under a checkpoint; a CROSSED loser ADL-ed against an under-water CROSSED
+//!   winner (the fund covering it), with the loser's capped fee and the winner's negative-wallet
+//!   clearance in one call — in both address orders; a CROSSED maker refused on a cleared wallet;
+//!   a maker refused at its leverage tier.
 //!
 //! Every checkpoint also reads `getAccountMargin` over no market (the STORED wallet, which
 //! `AccountBalanceChanged` carries) and over each market an actor holds a position in (that leg's
@@ -2562,4 +2567,264 @@ fn fixture_export_isolated_random_m2() {
          crash liquidating X1 and X4, a spike liquidating X2 with ADL."
     );
     emit(&r, "isolated_random_m2", &description, Some(SEED));
+}
+
+// ── (e) cross scenes: the shapes a random trace reaches rarely or never ────────────────────────
+
+/// Deterministic scenes the harness review asked for, each one a shape a random trace reaches by
+/// luck or not at all:
+///
+/// * a lazily-deleted id in a level's FIFO (an owner cancel of an order that is not first in its
+///   queue), seen by a checkpoint's `getBookLevel` while its `getOrder` reverts;
+/// * a CROSSED loser ADL-ed at its bankruptcy price against a CROSSED winner that is already under
+///   water (fallback tier: the fund covers its fill down to its `E`), in the same call as the
+///   loser's capped clearance fee and the winner's negative-wallet clearance (Q8) — once with the
+///   loser's address below the winner's and once above, since the end-of-call drain publishes
+///   their reason-7 rows in address order;
+/// * a CROSSED maker refused on a wallet the fund has cleared to 0 (no cash at hand), and a maker
+///   refused because the fill would carry its leverage past its tier (both reason 2).
+mod cross_scenes {
+    use super::*;
+
+    const ADMIN: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const ORACLE: Address = address!("0000000000000000000000000000000000000c1e");
+    /// Deep liquidity, ISOLATED on every market.
+    const LP: Address = address!("7777777777777777777777777777777777777777");
+    /// The first ADL scene: the loser's address is BELOW the winner's.
+    const L1: Address = address!("1111111111111111111111111111111111111111");
+    const W1: Address = address!("2222222222222222222222222222222222222222");
+    /// The second: the winner's address is below the loser's.
+    const W2: Address = address!("5555555555555555555555555555555555555555");
+    const L2: Address = address!("6666666666666666666666666666666666666666");
+    /// The maker refused with no cash, and the maker refused at its tier.
+    const C: Address = address!("3333333333333333333333333333333333333333");
+    const D: Address = address!("4444444444444444444444444444444444444444");
+    const TRADERS: [Address; 6] = [L1, W1, W2, L2, C, D];
+    /// The two ADL markets: a 20% band, one 20x tier.
+    const M20: u64 = 20;
+    const M23: u64 = 23;
+    /// Wide band, one 20x tier: the winners' second legs, the cash-less maker, the stale id.
+    const M21: u64 = 21;
+    /// Wide band, 20x below $5k and 5x above: the tier refusal.
+    const M22: u64 = 22;
+    const MARKETS: [u64; 4] = [M20, M21, M22, M23];
+    const USD: u64 = 1_000_000;
+    const BUY: u8 = 0;
+    const SELL: u8 = 1;
+    const GTC: u8 = 0;
+    const RO: u8 = 0b01;
+    const ISOLATED: u8 = 1;
+    const T0: u64 = 1_800;
+
+    /// Every market prices in cents (`priceDecimals` 2) and trades whole units.
+    const fn px(dollars: u64) -> u64 {
+        dollars * 100
+    }
+
+    fn limit(m: u64, side: u8, price: u64, qty: u64, flags: u8) -> Vec<u8> {
+        let c = placeOrderCall {
+            marketId: m,
+            side,
+            price,
+            quantity: qty,
+            orderType: 0,
+            tif: GTC,
+            clientOrderId: FixedBytes::default(),
+            flags,
+        };
+        c.abi_encode()
+    }
+
+    fn market(m: u64, side: u8, qty: u64) -> Vec<u8> {
+        let c = placeOrderCall {
+            marketId: m,
+            side,
+            price: 0,
+            quantity: qty,
+            orderType: 1,
+            tif: GTC,
+            clientOrderId: FixedBytes::default(),
+            flags: 0,
+        };
+        c.abi_encode()
+    }
+
+    fn tick(r: &mut Recorder, m: u64, dollars: u64) {
+        let ts = r.h.now - r.h.now % 15;
+        let u = updateIndexPriceCall { marketId: m, indexPrice: px(dollars), timestamp: ts };
+        r.ok(ORACLE, &u.abi_encode());
+    }
+
+    fn last_id(r: &Recorder) -> Id {
+        r.last_ret[..32].try_into().unwrap()
+    }
+
+    /// The ADL scene on `m`: `loser` short 150 at $100 against `winner`'s long; `winner` then
+    /// loses $3,600 on a reduce-only fat-finger of a second long (M21), which leaves it at
+    /// `E = −$2,600`. A spike to $116 takes the loser to `E = −$1,400` and the winner up to
+    /// `−$200`: the sweep closes the loser at its bankruptcy price clamped into the band ($106.66,
+    /// no book), ADL-ing the winner — fallback tier, under water — whose fill the fund covers back
+    /// up to `−$200`; the loser's clearance fee is capped at its last dollar of equity, and the
+    /// winner, flat with a negative wallet, is cleared by the fund at the end of the call.
+    fn adl_scene(r: &mut Recorder, m: u64, loser: Address, winner: Address, t: u64) {
+        r.next_block(t);
+        // The loser rests first, so it is ahead of the winner in the market's registry.
+        r.ok(loser, &limit(m, SELL, px(100), 150, 0));
+        r.ok(winner, &market(m, BUY, 150));
+        r.ok(LP, &limit(M21, SELL, px(100), 40, 0));
+        r.ok(winner, &market(M21, BUY, 40));
+        r.next_block(t + 3);
+        r.ok(winner, &limit(M21, SELL, px(10), 40, RO));
+        r.ok(LP, &market(M21, BUY, 40));
+        let e = r.view(&getAccountCall { user: winner }).crossMarginBalance;
+        assert_eq!(e, -2_600 * USD as i64, "the winner is under water before the spike");
+        r.next_block(t + 15);
+        tick(r, m, 116);
+        let w = r.view(&getAccountCall { user: winner });
+        assert_eq!((w.totalCrossWalletBalance, w.positions.len()), (0, 0), "Q8 cleared the winner");
+        assert_eq!(r.view(&getPositionCall { user: loser, marketId: m }).amount, 0);
+    }
+
+    pub(super) fn scenario() -> Recorder {
+        let mut rec = Recorder::new(T0, 1);
+        let r = &mut rec;
+        for (u, label) in [
+            (ADMIN, "admin"),
+            (ORACLE, "oracle"),
+            (LP, "lp"),
+            (L1, "l1_loser"),
+            (W1, "w1_underwater_winner"),
+            (W2, "w2_underwater_winner"),
+            (L2, "l2_loser"),
+            (C, "c_cashless_maker"),
+            (D, "d_tier_capped_maker"),
+        ] {
+            r.actor(u, label);
+        }
+        r.markets = MARKETS.to_vec();
+        r.mint(ADMIN, 2_000_000 * USD);
+        r.mint(LP, 10_000_000 * USD);
+        for u in TRADERS {
+            r.mint(u, 1_000 * USD);
+        }
+        r.ok(ADMIN, &initAdminCall { admin: ADMIN }.abi_encode());
+        r.ok(ADMIN, &setOracleAddressCall { oracle: ORACLE }.abi_encode());
+        for m in MARKETS {
+            let band = if m == M20 || m == M23 { 2_000 } else { 1_000_000 };
+            let add = addMarketCall {
+                marketId: m,
+                baseDecimals: 0,
+                priceDecimals: 2,
+                tickSize: 1,
+                stepSize: 1,
+                minQuantity: 1,
+                maxQuantity: 1_000_000,
+                maxPrice: 100_000_000,
+                priceUpdateInterval: 15,
+                fundingInterval: 0,
+                interestRate: 0,
+                liquidationFeeRateBps: 125,
+                initialMarkPrice: px(100),
+                priceBandBps: band,
+            };
+            r.ok(ADMIN, &add.abi_encode());
+            let (lower_bounds, max_leverages) =
+                if m == M22 { (vec![0, 5_000 * USD], vec![20, 5]) } else { (vec![0], vec![20]) };
+            let tiers = setMarginTiersCall {
+                marketId: m,
+                maintMarginRatesPpm: vec![0; lower_bounds.len()],
+                lowerBounds: lower_bounds,
+                maxLeverages: max_leverages,
+                notionalCap: 0,
+            };
+            r.ok(ADMIN, &tiers.abi_encode());
+        }
+        r.ok(ADMIN, &depositCall { amount: U256::from(1_000_000 * USD) }.abi_encode());
+        r.ok(ADMIN, &transferToPerpCall { amount: 500_000 * USD }.abi_encode());
+        r.ok(ADMIN, &depositInsuranceFundCall { amount: 100_000 * USD }.abi_encode());
+        r.ok(LP, &depositCall { amount: U256::from(5_000_000 * USD) }.abi_encode());
+        r.ok(LP, &transferToPerpCall { amount: 5_000_000 * USD }.abi_encode());
+        for u in TRADERS {
+            r.ok(u, &depositCall { amount: U256::from(1_000 * USD) }.abi_encode());
+            r.ok(u, &transferToPerpCall { amount: 1_000 * USD }.abi_encode());
+        }
+        for m in MARKETS {
+            r.ok(LP, &setMarginTypeCall { marketId: m, marginType: ISOLATED }.abi_encode());
+            for u in TRADERS {
+                r.ok(u, &setLeverageCall { marketId: m, leverage: 20 }.abi_encode());
+            }
+        }
+        r.checkpoint("setup: roles, markets, money in, every trader CROSSED at 20x");
+
+        // ── A lazily-deleted id: the second of two orders at one price, cancelled by its owner,
+        //    stays in the level's FIFO (only the live count drops) until a walk sweeps it ──
+        r.next_block(T0 + 3);
+        r.ok(LP, &limit(M21, SELL, px(500), 1, 0));
+        let first = last_id(r);
+        r.ok(LP, &limit(M21, SELL, px(500), 1, 0));
+        let second = last_id(r);
+        r.ok(LP, &cancelOrderCall { orderId: second.into(), marketId: M21 }.abi_encode());
+        let level = r.view(&getBookLevelCall { marketId: M21, side: SELL, price: px(500) });
+        let ids: Vec<Id> = level.iter().map(|x| x.0).collect();
+        assert_eq!(ids, vec![first, second], "the cancelled id stays in the FIFO");
+        let get = getOrderCall { orderId: second.into(), marketId: M21 }.abi_encode();
+        let (reverted, _) = r.probe(|h| static_call(h, &get));
+        assert!(reverted, "getOrder of the stale id reverts");
+        r.checkpoint("a stale id in the M21 ask level at $500");
+
+        adl_scene(r, M20, L1, W1, T0 + 15);
+        r.checkpoint("ADL of L1 against the under-water W1 (loser's address below)");
+        adl_scene(r, M23, L2, W2, T0 + 45);
+        r.checkpoint("ADL of L2 against the under-water W2 (winner's address below)");
+
+        // ── A CROSSED maker whose wallet the fund cleared: its opening bid is refused (2) ──
+        r.next_block(T0 + 75);
+        r.ok(C, &limit(M21, BUY, px(90), 10, 0));
+        r.ok(LP, &limit(M22, SELL, px(100), 40, 0));
+        r.ok(C, &market(M22, BUY, 40));
+        r.ok(C, &limit(M22, SELL, px(10), 40, RO));
+        r.ok(LP, &market(M22, BUY, 40));
+        let c = r.view(&getAccountCall { user: C });
+        assert_eq!(c.totalCrossWalletBalance, 0, "Q8 cleared C (its bid holds no position)");
+        // The walk reaches C's bid, refuses it, finds nothing else and expires the remainder.
+        r.ok(LP, &market(M21, SELL, 10));
+        assert_eq!(r.view(&getPositionCall { user: C, marketId: M21 }).amount, 0);
+
+        // ── A maker whose fill would carry its leverage past its tier: refused (2) ──
+        r.next_block(T0 + 90);
+        r.ok(D, &limit(M22, BUY, px(100), 80, 0));
+        r.ok(LP, &market(M22, SELL, 80));
+        let d = r.view(&getPositionCall { user: D, marketId: M22 });
+        assert_eq!(d.amount, 0, "D's bid was refused, not filled");
+        r.checkpoint("end");
+        rec
+    }
+}
+
+#[test]
+#[ignore = "fixture exporter — PERP_FIXTURE_OUT=<dir> cargo test -p perp-engine --lib \
+            fixture_export -- --ignored"]
+fn fixture_export_cross_scenes() {
+    let r = cross_scenes::scenario();
+    for (key, at_least) in [
+        ("CrossLiquidationStarted", 2),
+        ("Adl", 2),
+        ("OrderCancelled.reason=2", 2),
+        ("AccountBalanceChanged.reason=7", 6),
+    ] {
+        assert!(count(&r, key) >= at_least, "cross_scenes: {key} < {at_least}");
+    }
+    emit(
+        &r,
+        "cross_scenes",
+        "Deterministic scenes on four markets (ids 20-23, 0 / 2 decimals, $100 marks): a stale \
+         id in a level's FIFO (an owner cancel of the second order at a price) under a \
+         checkpoint; twice, a CROSSED loser ADL-ed at its band-clamped bankruptcy price against \
+         an under-water CROSSED winner (fallback tier, the fund covering the fill), with the \
+         loser's clearance fee capped at its last dollar and the winner's negative wallet \
+         cleared (Q8) in the same call - first with the loser's address below the winner's, \
+         then above; a CROSSED maker refused on the wallet the fund cleared to 0; a maker \
+         refused at its leverage tier.",
+        None,
+    );
 }
