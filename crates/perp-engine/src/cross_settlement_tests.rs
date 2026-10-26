@@ -1335,3 +1335,9 @@ fn gated_off_every_money_path_is_byte_identical_to_explicitly_isolated() {
 // A child module, so it runs on this file's fixture (`make_ctx`, `Ledger`, `trade`, …) as-is.
 #[path = "cross_gates_tests.rs"]
 mod gates;
+
+// ── Reduce-only evictions and the admission basis ─────────────────────────────────────
+//
+// A child module for the same reason: the fixture's `Ledger` and write-nothing `rejects`.
+#[path = "reduce_only_basis_tests.rs"]
+mod reduce_only_basis;

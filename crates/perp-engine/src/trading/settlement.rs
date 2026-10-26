@@ -356,10 +356,13 @@ impl TakerSettlement {
         // floor `T`. What this function owes the rest decision is not a second opinion but the
         // STATE to decide on: [`RestBasis`], the taker's position + wallet exactly as the flush and
         // `finalize_apply` will leave them.
-        let (bd, pd) = (market.base_decimals, market.price_decimals);
         // `Bid`/`Ask` come off the WORKING order lists, which are the authoritative record of what
-        // the walk has consumed — each surviving entry still at its own frozen assuming price.
-        let after_fills = work_position_snapshot(w, bd, pd)?;
+        // the walk has consumed — each surviving entry still at its own frozen assuming price —
+        // less the reduce-only orders the flush's own pass will evict from them (see
+        // [`post_flush_snapshot`]: the apply-phase cover loop runs AFTER that pass, so the fills
+        // gate and the cover simulation below must not count them either).
+        let (after_fills, evicted_lists) = post_flush_snapshot(w, market)?;
+        let evicted_own_side = own_side_evicted(w, evicted_lists.as_ref(), taker_side);
         let wallet = w.account.perp_wallet_balance;
         // ONE fold of the post-fill account: its `A` is the available-balance gate below
         // (`derived_available_balance_with` is exactly this fold's `a`), and its `E` / `Σ_C MM` are
@@ -425,9 +428,15 @@ impl TakerSettlement {
             // rest-unaffordable taker takes, and nothing about how many of its orders are
             // cancelled — that taker now reaches `rest_in_book`, which refuses, and the whole
             // order rejects cleanly pre-flush instead of rejecting from in here.
+            //
+            // The simulation starts from the lists AS THE FLUSH LEAVES THEM — after its reduce-only
+            // pass — because that is what the real loop pops from: `finalize_apply` runs after the
+            // flush, so LIFO over the pre-eviction lists could pick an order that is already gone.
             let mut sim_pos = after_fills.clone();
-            let mut sim_buy = w.buy_entries.clone();
-            let mut sim_sell = w.sell_entries.clone();
+            let (mut sim_buy, mut sim_sell) = match evicted_lists {
+                Some(lists) => lists,
+                None => (w.buy_entries.clone(), w.sell_entries.clone()),
+            };
             let mut cancelled_any = false;
             loop {
                 // No re-fold: `release_open_order_margin_core` below subtracts each cancelled
@@ -556,7 +565,7 @@ impl TakerSettlement {
             rest_basis: RestBasis {
                 pos: rest_pos,
                 wallet: rest_wallet,
-                cover_cancelled,
+                own_side_cancelled: cover_cancelled || evicted_own_side,
             },
             gate,
         }))
@@ -575,21 +584,23 @@ impl TakerSettlement {
 /// numbers. They live here.
 ///
 /// Every field is the *post* value, not a delta:
-/// * `pos` — `w.pos` with `Bid`/`Ask` resynced from the working order lists
-///   ([`work_position_snapshot`]), then with the cover loop's simulated cancels applied. The flush
-///   writes those same working copies and `finalize_apply` performs those same cancels, so this IS
-///   the position the store will hold.
+/// * `pos` — `w.pos` with `Bid`/`Ask` resynced from the working order lists, less the reduce-only
+///   orders the flush's own reduce-only pass evicts ([`post_flush_snapshot`]), then with the cover
+///   loop's simulated cancels applied. The flush writes those same working copies and runs that
+///   same pass, and `finalize_apply` performs those same cancels, so this IS the position the store
+///   will hold.
 /// * `wallet` — post-fill (close proceeds already credited by `finalize_core`) and post-debit
 ///   (`− total_required`, which `finalize_apply` takes).
-/// * `cover_cancelled` — whether the cover loop will really cancel at least one of the taker's own
-///   SAME-SIDE resting orders. The rest decision needs it because such a cancel can lower the
-///   taker's own side of the BBO, and `rest_in_book`'s new-best band gate reads the BBO pre-flush.
-///   See the `may_become_best` note there.
+/// * `own_side_cancelled` — whether the barrier will really cancel at least one of the taker's own
+///   SAME-SIDE resting orders: a cover cancel, or a reduce-only order the flush's pass evicts. The
+///   rest decision needs it because such a cancel can lower the taker's own side of the BBO, and
+///   `rest_in_book`'s new-best band gate reads the BBO pre-flush. See the `may_become_best` note
+///   there.
 #[derive(Clone)]
 pub(super) struct RestBasis {
     pub(super) pos: crate::types::PerpPosition,
     pub(super) wallet: i64,
-    pub(super) cover_cancelled: bool,
+    pub(super) own_side_cancelled: bool,
 }
 
 /// The registry working copy's position AS THE FLUSH WILL WRITE IT: `w.pos` with the per-side
@@ -621,6 +632,68 @@ fn work_position_snapshot(
     pos.total_sell_qty = tsq;
     pos.total_sell_notional = tsn;
     Ok(pos)
+}
+
+/// A user's two order lists, as working copies.
+type EntryLists = (
+    std::collections::VecDeque<crate::types::OrderEntry>,
+    std::collections::VecDeque<crate::types::OrderEntry>,
+);
+
+/// The taker's position AS THE FLUSH WILL LEAVE IT: [`work_position_snapshot`], then the flush's
+/// own reduce-only pass (`reduce_only::restore_both_sides`) replayed on copies of the working lists
+/// ([`super::replay_reduce_only_restore`]). Returns the copies too — `(buy, sell)`, post-eviction —
+/// but only when the pass evicted something; `None` means `w`'s lists are already what the flush
+/// leaves.
+///
+/// # Why the gates must be measured AFTER the pass
+///
+/// The flush evicts every reduce-only order a fill left unable to reduce — the position shrank
+/// under it, flipped, or closed — and it does so BEFORE `finalize_apply` runs the cover loop and
+/// before the GTC remainder rests. Measured on the working lists alone, every gate of this order
+/// counted those orders in `Bid`/`Ask`, i.e. charged it `ooIM` for orders its own acceptance
+/// destroys. On Binance a reduce-only order carries no open-order margin and is expired once it
+/// can no longer reduce, so that charge was never owed. And the [`RestBasis`] diverged from what
+/// the barrier writes (`rest_in_book`'s debug assertion), in BOTH directions:
+/// * too STRICT: the rest gate refused a remainder whose post-flush `ooIM` fitted — short 5 with a
+///   reduce-only buy 5 resting, buy 8 crossing 5: flat after the fill, the reduce-only buy
+///   evicted, but the remainder priced as if it still sat beside the new buy 3;
+/// * too LOOSE: a taker short of cover simulated its LIFO cancels from the PRE-eviction lists, so
+///   it could pop a normal order behind the doomed reduce-only one that the real loop — running
+///   after the eviction, already covered — never cancels. The rest was then admitted on a basis
+///   without that order, and could leave the account at `A < 0`.
+///
+/// Free when the taker holds no reduce-only order in this market — one scan of each working list,
+/// no clone.
+fn post_flush_snapshot(
+    w: &UserWork,
+    market: &crate::types::Market,
+) -> Result<(crate::types::PerpPosition, Option<EntryLists>), PerpError> {
+    let mut pos = work_position_snapshot(w, market.base_decimals, market.price_decimals)?;
+    let holds_reduce_only = |l: &std::collections::VecDeque<crate::types::OrderEntry>| {
+        l.iter().any(|e| e.reduce_only)
+    };
+    if !holds_reduce_only(&w.buy_entries) && !holds_reduce_only(&w.sell_entries) {
+        return Ok((pos, None));
+    }
+    let mut buy = w.buy_entries.clone();
+    let mut sell = w.sell_entries.clone();
+    // The flush's order (`restore_both_sides`). The two sides do not interact — an eviction moves
+    // one side's list and aggregates, never `pos.amount`, which is all the other side reads.
+    let mut evicted = false;
+    for side in [Side::Buy, Side::Sell] {
+        evicted |= super::replay_reduce_only_restore(&mut pos, &mut buy, &mut sell, side, market)?;
+    }
+    Ok((pos, evicted.then_some((buy, sell))))
+}
+
+/// Whether [`post_flush_snapshot`]'s pass evicted one of `w`'s orders on `side` — each eviction
+/// removes exactly one entry, so the list lengths say it.
+fn own_side_evicted(w: &UserWork, evicted_lists: Option<&EntryLists>, side: Side) -> bool {
+    evicted_lists.is_some_and(|(buy, sell)| match side {
+        Side::Buy => buy.len() != w.buy_entries.len(),
+        Side::Sell => sell.len() != w.sell_entries.len(),
+    })
 }
 
 /// The taker settlement's APPLY half (commit-only #23 L2b): everything after the decision —
@@ -1075,15 +1148,20 @@ impl MatchRegistry {
     pub(super) fn taker_rest_basis(
         &self,
         user: Address,
-        base_decimals: u32,
-        price_decimals: u32,
+        side: Side,
+        market: &crate::types::Market,
     ) -> Result<Option<RestBasis>, PerpError> {
         match self.user_work(user) {
-            Some(w) => Ok(Some(RestBasis {
-                pos: work_position_snapshot(w, base_decimals, price_decimals)?,
-                wallet: w.account.perp_wallet_balance,
-                cover_cancelled: false,
-            })),
+            Some(w) => {
+                // The flush runs its reduce-only pass on every user it touched, this taker
+                // included, so the basis is measured after it here too.
+                let (pos, evicted_lists) = post_flush_snapshot(w, market)?;
+                Ok(Some(RestBasis {
+                    own_side_cancelled: own_side_evicted(w, evicted_lists.as_ref(), side),
+                    pos,
+                    wallet: w.account.perp_wallet_balance,
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -1545,6 +1623,11 @@ impl MatchRegistry {
         //
         // Not mid-walk, on purpose — admission already guarantees a reduce-only order is fully
         // coverable at the moment the walk reaches it. See `crate::reduce_only::restore`.
+        //
+        // ⚠️ The TAKER's gates were measured AFTER this pass, not before it: `finalize_compute` and
+        // `taker_rest_basis` replay it on copies (`post_flush_snapshot`). Moving it, or adding a
+        // trigger here, has to move that replay with it — `rest_in_book`'s basis assertion is what
+        // notices when the two disagree.
         for user in touched {
             crate::reduce_only::restore_both_sides(
                 context,

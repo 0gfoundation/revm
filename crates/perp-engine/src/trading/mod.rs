@@ -2951,9 +2951,7 @@ pub(super) fn match_order<H: PerpHost>(
         // Zero fills. The taker may still have a working copy (a self-match maker that the K9 guard
         // or self-trade prevention cancelled); `None` means it never joined, so storage is already
         // its post-flush state.
-        None => {
-            registry.taker_rest_basis(taker_addr, market.base_decimals, market.price_decimals)?
-        }
+        None => registry.taker_rest_basis(taker_addr, side, market)?,
     };
     Ok(MatchOutcome {
         remaining,
@@ -3291,8 +3289,8 @@ fn rest_in_book<H: PerpHost>(
     // output. Only `setUserFeeRates` moves it, the flush cannot, so the pre-barrier read is the same
     // integer the post-barrier one would give.
     let maker_fee_ppm = storage::load_account_ref(context, user)?.maker_fee_ppm;
-    let (pos_basis, wallet, cover_cancelled) = match basis {
-        Some(b) => (b.pos, b.wallet, b.cover_cancelled),
+    let (pos_basis, wallet, own_side_cancelled) = match basis {
+        Some(b) => (b.pos, b.wallet, b.own_side_cancelled),
         None => (
             storage::load_position(context, user, market_id)?,
             storage::load_account_ref(context, user)?.perp_wallet_balance,
@@ -3336,14 +3334,15 @@ fn rest_in_book<H: PerpHost>(
     //
     // The pre-BBO is exact on our OWN side except for one narrow case:
     // * the match consumes the OPPOSITE side only, so it cannot move our side's best at all;
-    // * `finalize_apply`'s cover loop cancels the taker's OWN same-side orders, which CAN lower a
-    //   bid / raise an ask and hand the best to this very order.
+    // * `finalize_apply`'s cover loop, and the flush's reduce-only pass, cancel the taker's OWN
+    //   same-side orders, which CAN lower a bid / raise an ask and hand the best to this very
+    //   order.
     //
-    // Hence the `cover_cancelled` disjunct: when the cover loop will really cancel, treat the order
-    // as possibly-best and band-check it. That over-checks (never under-checks) in a corner that is
-    // already all but unreachable — a crossing order's remainder sits at or past the touch it just
-    // crossed, so it is the new best on its own side anyway.
-    let may_become_best = cover_cancelled
+    // Hence the `own_side_cancelled` disjunct: when the barrier will really cancel one, treat the
+    // order as possibly-best and band-check it. That over-checks (never under-checks) in a corner
+    // that is already all but unreachable — a crossing order's remainder sits at or past the touch
+    // it just crossed, so it is the new best on its own side anyway.
+    let may_become_best = own_side_cancelled
         || match side {
             Side::Buy => best_bid == 0 || price > best_bid,
             Side::Sell => best_ask == 0 || price < best_ask,
@@ -4082,6 +4081,51 @@ pub(super) fn release_open_order_margin_core(
     };
     let notional = removed.margin_notional(market.base_decimals, market.price_decimals)?;
     remove_entry_from_side_aggregates(pos, side, removed.amount, notional)
+}
+
+/// [`crate::reduce_only::restore`] on `side`, replayed on in-memory copies: evicts from the copies
+/// exactly the entries the real pass would cancel against `pos`, shrinking `pos`'s aggregates by
+/// each, and returns whether it evicted anything. NO storage access.
+///
+/// It is how an admission decision sees the state its own acceptance leaves. The real pass runs
+/// AFTER the decision (behind the write barrier), and every order it evicts there is an order that
+/// can no longer reduce — on Binance such an order carries no open-order margin and is expired, so
+/// an order whose acceptance kills it must not be charged for it. The caller is the match flush's
+/// pass on the taker (`ReduceOnlyPositionShrank` / `ReduceOnlyWouldOpen`), replayed by
+/// `settlement::post_flush_snapshot` before the fills gate, the cover simulation and the
+/// [`settlement::RestBasis`] are measured.
+///
+/// The decision is the real pass's own ([`crate::reduce_only::next_eviction`]) and the removal is
+/// the cover simulation's ([`release_open_order_margin_core`]), so neither can drift from what the
+/// barrier then writes; the debug assertions after the barrier hold the two to account.
+pub(super) fn replay_reduce_only_restore(
+    pos: &mut crate::types::PerpPosition,
+    buy_entries: &mut std::collections::VecDeque<OrderEntry>,
+    sell_entries: &mut std::collections::VecDeque<OrderEntry>,
+    side: Side,
+    market: &crate::types::Market,
+) -> Result<bool, PerpError> {
+    let mut evicted = false;
+    loop {
+        let list = match side {
+            Side::Buy => &*buy_entries,
+            Side::Sell => &*sell_entries,
+        };
+        let Some(eviction) = crate::reduce_only::next_eviction(pos, list, side) else {
+            return Ok(evicted);
+        };
+        let victim = eviction.entry;
+        release_open_order_margin_core(
+            pos,
+            buy_entries,
+            sell_entries,
+            side,
+            &victim.order_id,
+            victim.price,
+            market,
+        )?;
+        evicted = true;
+    }
 }
 
 // ── FOK / PostOnly pre-checks ─────────────────────────────────────────────────

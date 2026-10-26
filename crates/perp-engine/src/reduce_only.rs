@@ -343,32 +343,19 @@ pub fn restore<H: PerpHost>(
         }
 
         let pos = storage::load_position_ref(context, user, market_id)?;
-        let side_is_closing = closing_side(&pos) == Some(side);
-        let (normals_ahead, sigma_ro) = prefix_terms(&entries, side, None);
-        if side_is_closing && normals_ahead.saturating_add(sigma_ro) <= pos.amount.unsigned_abs() {
+        let Some(eviction) = next_eviction(&pos, &entries, side) else {
             return Ok(());
-        }
+        };
         // A side that is no longer the closing side is reported as such whatever the caller's
         // trigger was: "the position flipped or went flat" is the true cause, and it is sufficient
         // on its own — R19 ② separated it from the size condition by flipping a position while
         // `|position|` still exceeded the resting quantity, and the order died anyway.
-        let reason = if side_is_closing {
+        let reason = if eviction.side_is_closing {
             reason
         } else {
             crate::types::CancelReason::ReduceOnlyWouldOpen
         };
-
-        // The farthest reduce-only entry. `max_by_key` returns the LAST maximum, so equal-distance
-        // (same-price) entries are evicted in list order — which is insertion order, i.e. FIFO,
-        // taking the earliest first. §1.6 records FIFO and orderId-ascending as indistinguishable
-        // in the evidence; FIFO is the one that can be explained to a user, and our order ids are
-        // `keccak(account ‖ nonce)`, so ascending-id would be pseudorandom.
-        let victim = entries
-            .iter()
-            .filter(|e| e.reduce_only)
-            .min_by_key(|e| std::cmp::Reverse(distance_from_touch(side, e.price)))
-            .map(|e| e.order_id)
-            .expect("a reduce-only entry exists — checked above");
+        let victim = eviction.entry.order_id;
 
         let order = storage::load_order(context, &victim)?.ok_or_else(|| {
             crate::errors::perp_invariant_err(
@@ -386,6 +373,57 @@ pub fn restore<H: PerpHost>(
             reason,
         )?;
     }
+}
+
+/// The order [`restore`] evicts next from one side — see [`next_eviction`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Eviction {
+    /// The victim: the reduce-only entry FARTHEST from the touch.
+    pub(crate) entry: OrderEntry,
+    /// `false` = the side is no longer the position's closing side (it flipped or went flat), which
+    /// is what the eviction is then reported as, whatever triggered the pass.
+    pub(crate) side_is_closing: bool,
+}
+
+/// [`restore`]'s DECISION, pure: the reduce-only entry it evicts next from `side`'s `entries`
+/// against `pos`, or `None` once the prefix condition holds there.
+///
+/// One function for the real pass and for every place that has to know its outcome BEFORE it
+/// runs. The admission gates are those places: the order that triggers a pass (a fill that shrinks,
+/// flips or closes the taker's own position) is decided before the pass evicts anything, and the
+/// orders it is about to evict carry no margin once they are gone — so the gate must be measured
+/// without them, which means replaying exactly this decision on the gate's copies
+/// (`trading::replay_reduce_only_restore`). Two copies of the rule would let the gate and the pass
+/// disagree about which orders survive.
+///
+/// Only `pos.amount` is read; the aggregates play no part in the prefix condition.
+pub(crate) fn next_eviction<'a, I>(pos: &PerpPosition, entries: I, side: Side) -> Option<Eviction>
+where
+    I: IntoIterator<Item = &'a OrderEntry> + Clone,
+{
+    if !entries.clone().into_iter().any(|e| e.reduce_only) {
+        return None;
+    }
+    let side_is_closing = closing_side(pos) == Some(side);
+    let (normals_ahead, sigma_ro) = prefix_terms(entries.clone(), side, None);
+    if side_is_closing && normals_ahead.saturating_add(sigma_ro) <= pos.amount.unsigned_abs() {
+        return None;
+    }
+    // The farthest reduce-only entry. `min_by_key` over the REVERSED distance returns the FIRST of
+    // the farthest, so equal-distance (same-price) entries are evicted in list order — which is
+    // insertion order, i.e. FIFO, taking the earliest first. §1.6 records FIFO and
+    // orderId-ascending as indistinguishable in the evidence; FIFO is the one that can be explained
+    // to a user, and our order ids are `keccak(account ‖ nonce)`, so ascending-id would be
+    // pseudorandom.
+    let entry = entries
+        .into_iter()
+        .filter(|e| e.reduce_only)
+        .min_by_key(|e| std::cmp::Reverse(distance_from_touch(side, e.price)))
+        .copied()?;
+    Some(Eviction {
+        entry,
+        side_is_closing,
+    })
 }
 
 /// [`restore`] on BOTH sides.
