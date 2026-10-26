@@ -1674,6 +1674,91 @@ pub fn load_cross_legs_ref<H: PerpHost>(
     Ok(arc.unwrap_or_default())
 }
 
+/// `user`'s cross health as memoized EARLIER IN THIS CALL (`margin_view::cross_health_for_adl`),
+/// if the memo still holds for the inputs given — the stored `wallet` and the `legs` `Arc` just
+/// read — and no market changed since ([`crate::typed_store::CrossHealthMemo`]): the health, and
+/// the market whose leg it last priced with that leg's terms. Pure read.
+pub fn cross_health_memo_hit<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    wallet: i64,
+    legs: &std::sync::Arc<crate::types::CrossLegs>,
+) -> Option<(crate::margin_view::CrossHealth, u64, Option<crate::margin_view::CrossHealthLeg>)> {
+    let store = typed_store_mut(context);
+    let epoch = store.market_epoch();
+    let m = store.cross_health_memo(user)?;
+    if m.wallet != wallet || !std::sync::Arc::ptr_eq(&m.legs, legs) || m.market_epoch != epoch {
+        return None;
+    }
+    let health = crate::margin_view::CrossHealth {
+        w: wallet as i128,
+        e: m.e,
+        cross_mm: m.cross_mm,
+        has_cross: m.has_cross,
+        faulted_legs: m.faulted_legs,
+    };
+    let leg = m.leg.map(|(upnl, mm, pending_funding)| crate::margin_view::CrossHealthLeg {
+        market_id: m.leg_market,
+        upnl,
+        mm,
+        pending_funding,
+    });
+    Some((health, m.leg_market, leg))
+}
+
+/// Records `health` and the terms `leg` of its leg in `leg_market`, priced from `wallet` and
+/// `legs` against the markets as they are NOW, as `user`'s cross health for the rest of the call
+/// ([`cross_health_memo_hit`]). Call-scoped, no storage key.
+pub fn memo_cross_health<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    wallet: i64,
+    legs: std::sync::Arc<crate::types::CrossLegs>,
+    health: &crate::margin_view::CrossHealth,
+    leg_market: u64,
+    leg: Option<crate::margin_view::CrossHealthLeg>,
+) {
+    let store = typed_store_mut(context);
+    let memo = crate::typed_store::CrossHealthMemo {
+        wallet,
+        legs,
+        market_epoch: store.market_epoch(),
+        e: health.e,
+        cross_mm: health.cross_mm,
+        has_cross: health.has_cross,
+        faulted_legs: health.faulted_legs,
+        leg_market,
+        leg: leg.map(|l| (l.upnl, l.mm, l.pending_funding)),
+    };
+    store.memo_cross_health(user, memo);
+}
+
+/// Room for `n` memoized cross health checks in this call ([`memo_cross_health`]) — ADL, about to
+/// rank a market's `n` registered holders.
+pub fn reserve_cross_health_memo<H: PerpHost>(context: &mut H, n: usize) {
+    typed_store_mut(context).reserve_cross_health_memo(n);
+}
+
+/// Counts one more ADL ranking in the current call; returns how many there have been, this one
+/// included. Call-scoped, no storage key.
+pub fn note_adl_ranking<H: PerpHost>(context: &mut H) -> u32 {
+    typed_store_mut(context).note_adl_ranking()
+}
+
+/// Replaces the leg a still-valid memo of `user` carries ([`memo_cross_health`]) with the terms
+/// of its leg in `leg_market`, priced against the same inputs.
+pub fn memo_cross_health_leg<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    leg_market: u64,
+    leg: Option<crate::margin_view::CrossHealthLeg>,
+) {
+    if let Some(m) = typed_store_mut(context).cross_health_memo_mut(user) {
+        m.leg_market = leg_market;
+        m.leg = leg.map(|l| (l.upnl, l.mm, l.pending_funding));
+    }
+}
+
 /// Sets (`Some`) or removes (`None`) `user`'s cross leg of `market_id` — the ONE writer of the
 /// list, called by [`save_position`] and [`save_position_reservation_only_after_funding`] when the
 /// leg their write implies moved. In place on a resident list; the list's last leg leaving deletes

@@ -81,10 +81,12 @@ impl CrossLegState {
 /// assert the three fields unchanged, and `setMarginType` only switches a FLAT position, which has
 /// no entry either way.
 ///
-/// It is POSITION STATE, not a mark-dependent sum: nothing here moves when a mark or a funding index
-/// moves, so it does not cache what R13 forbids caching (the health terms are re-priced at every
-/// read). Checked against a fresh walk of the positions on every `getAccount` and every published
-/// snapshot (`perp_engine::margin_view::index_account_scalars`), and every `cross_health` result is
+/// It is POSITION STATE, not a mark-dependent sum: nothing here moves when a mark or a funding
+/// index moves, so it does not cache what R13 forbids caching (the health terms are re-priced at
+/// every read — ADL's call-scoped memo, `crate::typed_store::CrossHealthMemo`, answers again only
+/// while these legs, the wallet and every `Market` are unchanged). Checked against a fresh walk of
+/// the positions on every `getAccount` and every published snapshot
+/// (`perp_engine::margin_view::index_account_scalars`), and every `cross_health` result is
 /// re-derived by the walk it replaces (`cross_fold`), both in `debug_assertions` builds.
 ///
 /// # Why its own key, not a field of `UserAccount`

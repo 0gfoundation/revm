@@ -1056,7 +1056,9 @@ fn cross_health_leg(
 /// # ⚠️ DO NOT CACHE THIS, AND DO NOT INCREMENT IT — RE-PRICE, EVERY TIME
 ///
 /// The legs are POSITION state; the answer is not. Every term moves with its own market's mark and
-/// funding index while the user does nothing (R13) — exactly as for [`cross_fold`].
+/// funding index while the user does nothing (R13) — exactly as for [`cross_fold`]. The one memo
+/// is ADL's [`cross_health_for_adl`]: call-scoped, and keyed on every input this is a function of,
+/// the `Market` blobs included — not a cache that could outlive a mark.
 ///
 /// # Checked against the walk
 ///
@@ -1119,6 +1121,128 @@ pub fn cross_health<H: PerpHost>(
         legs.as_deref().map(|l| &l[pushed_from..]),
     )?;
     Ok(health)
+}
+
+/// ADL's read of an opposite-side CROSSED holder: its health ([`cross_health`]) and the terms of
+/// its leg in `market_id` — what [`cross_health`]'s `legs` output carries for that market, `None`
+/// when the account holds no cross leg there or the check leaves it out — answered from the CALL's
+/// memo when nothing the check is a function of has changed since it last priced this account in
+/// this call: the stored wallet (by value), the stored cross legs (by `Arc` identity) and every
+/// `Market` (the store's market epoch). See [`crate::typed_store::CrossHealthMemo`].
+///
+/// Why ADL: every loser of a sweep ranks the same opposite-side holders again, and between two
+/// losers only the accounts a fill or a liquidation wrote change — the memo re-prices exactly those
+/// (and every account, once any `Market` moved), where re-pricing all of them made a tick with L
+/// losers cost `L × M × k` leg pricings (P4 review, finding 4).
+///
+/// That is NOT caching across the moves R13 is about — a mark or funding-index move is a `Market`
+/// write, which moves the epoch and re-prices every entry. The memo is call-scoped (dropped by the
+/// next call's `begin_call`), so it never carries an answer past the call that priced it.
+///
+/// `memoize: false` neither reads nor writes the memo — plain [`cross_health`]. ADL passes it for
+/// the FIRST ranking of a call: keeping the memo costs a map entry per holder, which only a later
+/// ranking in the same call can pay back, and most calls rank once.
+///
+/// Bit-for-bit [`cross_health`]'s answer; in `debug_assertions` builds every memo hit is re-priced
+/// and compared. TOTAL as [`cross_health`]. With the gate off it is plain [`cross_health`]. `buf`
+/// is the caller's scratch for the full check's legs, reused across calls.
+pub fn cross_health_for_adl<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    memoize: bool,
+    buf: &mut Vec<CrossHealthLeg>,
+) -> Result<(CrossHealth, Option<CrossHealthLeg>), PerpError> {
+    fn fresh<H: PerpHost>(
+        context: &mut H,
+        user: Address,
+        market_id: u64,
+        buf: &mut Vec<CrossHealthLeg>,
+    ) -> Result<(CrossHealth, Option<CrossHealthLeg>), PerpError> {
+        buf.clear();
+        let health = cross_health(context, user, Some(buf))?;
+        Ok((health, buf.iter().find(|l| l.market_id == market_id).copied()))
+    }
+    if !memoize || !crate::margin_type::cross_margin_enabled() {
+        return fresh(context, user, market_id, buf);
+    }
+    #[cfg(test)]
+    if memo_stats::bypassed() {
+        return fresh(context, user, market_id, buf);
+    }
+    let wallet = storage::load_account_ref(context, user)?.perp_wallet_balance;
+    let legs = storage::load_cross_legs_ref(context, user)?;
+    if let Some((health, leg_market, leg)) =
+        storage::cross_health_memo_hit(context, user, wallet, &legs)
+    {
+        let leg = if leg_market == market_id {
+            leg
+        } else {
+            // The same inputs, another market's leg: priced alone, by the function the full check
+            // prices it with — a leg naming no market, or one that overflows, is left out there.
+            let priced = match legs.get(market_id) {
+                Some(l) => storage::load_market_ref(context, market_id)?
+                    .and_then(|market| cross_health_leg(&market, l).ok()),
+                None => None,
+            };
+            storage::memo_cross_health_leg(context, user, market_id, priced);
+            priced
+        };
+        #[cfg(debug_assertions)]
+        {
+            let mut check = Vec::new();
+            let want = fresh(context, user, market_id, &mut check)?;
+            debug_assert_eq!(
+                (health, leg),
+                want,
+                "cross_health_for_adl: a stale memo for {user} in market {market_id}"
+            );
+        }
+        #[cfg(test)]
+        memo_stats::count(true);
+        return Ok((health, leg));
+    }
+    #[cfg(test)]
+    memo_stats::count(false);
+    // Priced from the same `wallet` and `legs` the memo is keyed on: nothing is written between
+    // their read above and the check's own.
+    let (health, leg) = fresh(context, user, market_id, buf)?;
+    storage::memo_cross_health(context, user, wallet, legs, &health, market_id, leg);
+    Ok((health, leg))
+}
+
+/// Test builds only: [`cross_health_for_adl`]'s hits and misses on this thread, so a test can
+/// show which answers the memo gave.
+#[cfg(test)]
+pub(crate) mod memo_stats {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static HITS_MISSES: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+        static BYPASS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Makes [`super::cross_health_for_adl`] re-price every time on this thread (`true`), so a
+    /// test can run the same calls with and without the memo.
+    pub(crate) fn bypass(on: bool) {
+        BYPASS.with(|b| b.set(on));
+    }
+
+    pub(super) fn bypassed() -> bool {
+        BYPASS.with(Cell::get)
+    }
+
+    pub(super) fn count(hit: bool) {
+        HITS_MISSES.with(|c| {
+            let (h, m) = c.get();
+            c.set(if hit { (h + 1, m) } else { (h, m + 1) });
+        });
+    }
+
+    /// `(hits, misses)` since the thread started or the last `take`, and resets them.
+    pub(crate) fn take() -> (u64, u64) {
+        HITS_MISSES.with(|c| c.replace((0, 0)))
+    }
 }
 
 /// `debug_assertions` only — [`cross_health`]'s cross-check against the walk it replaces: the

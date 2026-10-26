@@ -432,8 +432,14 @@ fn run_adl_fills<H: PerpHost>(
     // Counterparties already bankrupt at the mark, held back until `cands` is spent.
     // `(addr, eq, Some(E) for a CROSSED one — the floor its fallback fill is held to)`.
     let mut fallback: Vec<(Address, i128, Option<i128>)> = Vec::new();
-    // One buffer for every CROSSED candidate's health legs, cleared per candidate.
+    // One scratch buffer for every CROSSED candidate's health legs. The call's health memo
+    // (`cross_health_for_adl`) from its second ranking on — the first one has nothing to reuse and
+    // pays nothing — with room for every holder.
     let mut legs = Vec::new();
+    let memoize = storage::note_adl_ranking(context) > 1;
+    if memoize {
+        storage::reserve_cross_health_memo(context, registry.len());
+    }
     for user in registry {
         if user == loser {
             continue;
@@ -450,10 +456,20 @@ fn run_adl_fills<H: PerpHost>(
         // evaluate leaves the winner unrankable — fallback tier, at its `E`. `E = cWB + Σ_C uPnL`:
         // pending funding of every cross leg included (`cWB`), this market priced at its stored
         // mark, which is `mark_price` on both callers.
+        //
+        // Through the call's memo (`cross_health_for_adl`): every loser of a sweep ranks the same
+        // holders again, and between two losers only the accounts a fill or a liquidation wrote
+        // change — the memo re-prices exactly those (and every account, once any `Market` moved).
         if crate::margin_type::effective_margin_type(&wp) == crate::types::MarginType::Crossed {
-            legs.clear();
-            let e = crate::margin_view::cross_health(context, user, Some(&mut legs))?.e;
-            match legs.iter().find(|l| l.market_id == market.market_id) {
+            let (health, leg) = crate::margin_view::cross_health_for_adl(
+                context,
+                user,
+                market.market_id,
+                memoize,
+                &mut legs,
+            )?;
+            let e = health.e;
+            match leg {
                 Some(leg) if e > 0 => {
                     // `N_k`: the leg's `uPnL` less the entry basis (`uPnL = N + vQuote`).
                     let notional = leg.upnl - wp.v_quote_balance as i128;

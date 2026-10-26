@@ -427,6 +427,151 @@ fn the_aggregates_only_route_cannot_write_back_a_stale_position() {
     assert_eq!(stored_legs(&mut ctx, ALICE)[0].amount, 7);
 }
 
+// ── The call's health memo (ADL ranking) ──────────────────────────────────────
+
+/// ADL's memoized read (`cross_health_for_adl`) answers again only while every input of the health
+/// check holds — the stored wallet, the stored legs, every `Market` — and only within the call:
+/// each step below moves one input and must be re-priced (a miss) to the fresh check's numbers; an
+/// untouched account is a hit with the same numbers, for the market asked before or another one.
+/// Compared with a fresh `cross_health` here as well as by the memo's own `debug_assertions`
+/// re-check, so this holds in a release test build too.
+#[test]
+fn the_health_memo_answers_again_only_while_its_inputs_hold() {
+    use crate::margin_view::{cross_health, cross_health_for_adl, memo_stats};
+    let mut ctx = make_ctx();
+    ok(&mut ctx, BOB, &order(M1, SELL, px(100), 10, GTC));
+    ok(&mut ctx, BOB, &order(M2, BUY, px(100), 10, GTC));
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 4, IOC));
+    ok(&mut ctx, ALICE, &order(M2, SELL, px(100), 3, IOC));
+    let step = |ctx: &mut TestCtx, m: u64, at: &str, want_hit: bool| {
+        memo_stats::take();
+        let memo = cross_health_for_adl(ctx, ALICE, m, true, &mut Vec::new()).unwrap();
+        let (hits, misses) = memo_stats::take();
+        assert_eq!((hits, misses), (want_hit as u64, !want_hit as u64), "{at}: hit / miss");
+        let mut legs = Vec::new();
+        let fresh = cross_health(ctx, ALICE, Some(&mut legs)).unwrap();
+        let leg = legs.iter().find(|l| l.market_id == m).copied();
+        assert_eq!(memo, (fresh, leg), "{at}: the fresh check's numbers");
+        memo.0
+    };
+    let first = step(&mut ctx, M1, "first", false);
+    assert!(first.has_cross);
+    assert_eq!(step(&mut ctx, M1, "untouched", true), first);
+    assert_eq!(step(&mut ctx, M2, "untouched, another market's leg", true), first);
+    assert_eq!(step(&mut ctx, M3, "untouched, a market with no leg", true), first);
+
+    // The wallet moves, nothing else.
+    set_wallet(&mut ctx, ALICE, WALLET - 7);
+    let after_wallet = step(&mut ctx, M1, "wallet", false);
+    assert_eq!(after_wallet.e, first.e - 7);
+    step(&mut ctx, M1, "wallet, again", true);
+
+    // A leg moves, the wallet does not: a position write through the one door.
+    let mut p = pos(&mut ctx, ALICE, M2);
+    p.amount -= 1;
+    p.v_quote_balance += px(100) as i64 * 10_000;
+    storage::save_position(&mut ctx, ALICE, M2, &p, AccountUpdateReason::Order).unwrap();
+    let after_leg = step(&mut ctx, M2, "leg", false);
+    assert_ne!(after_leg.cross_mm, after_wallet.cross_mm, "the leg is priced again");
+    step(&mut ctx, M2, "leg, again", true);
+
+    // A mark moves, nothing of ALICE's does.
+    storage::save_mark_price(&mut ctx, M2, px(90)).unwrap();
+    let after_mark = step(&mut ctx, M2, "mark", false);
+    assert_ne!(after_mark.e, after_leg.e, "the short leg gained");
+    step(&mut ctx, M1, "mark, again", true);
+
+    // A new call drops the memo.
+    storage::begin_perp_call(&mut ctx);
+    assert_eq!(step(&mut ctx, M1, "next call", false), after_mark);
+}
+
+/// One oracle tick that liquidates several bankrupt cross accounts, each ADL'd (empty book)
+/// against the same cross holders, ends in the same store — the same block delta — and the same
+/// log stream whether ADL ranks the holders through the call's memo or re-prices every one of them
+/// for every loser; and the memo did answer for the later losers.
+#[test]
+fn a_multi_loser_adl_tick_is_the_same_with_and_without_the_memo() {
+    use crate::host::InMemoryHost;
+    use crate::margin_view::memo_stats;
+    const T0: u64 = 1_000_005;
+    const Q: u64 = 10;
+    let winners: Vec<Address> = (1..=6u8).map(|i| Address::repeat_byte(0x40 + i)).collect();
+    let losers: Vec<Address> = (1..=3u8).map(|i| Address::repeat_byte(0x70 + i)).collect();
+    let run = |h: &mut InMemoryHost, who: Address, input: &[u8]| {
+        let out = run_perp_dex_call(input, 30_000_000, who, U256::ZERO, false, h).unwrap();
+        let reason =
+            alloy_sol_types::Revert::abi_decode(&out.bytes).map(|r| r.reason).unwrap_or_default();
+        assert!(!out.reverted, "call reverted: {reason}");
+    };
+    let wallet = |h: &mut InMemoryHost, u: Address, w: i64| {
+        storage::mutate_account(h, u, |a| a.perp_wallet_balance = w).unwrap();
+    };
+    let tick_at = |h: &mut InMemoryHost, m: u64, index: u64, ts: u64| {
+        storage::save_last_traded_price(h, m, 0).unwrap();
+        let tick = updateIndexPriceCall { marketId: m, indexPrice: index, timestamp: ts };
+        run(h, ADMIN, &tick.abi_encode());
+    };
+    // The world: BOB (ISOLATED) makes the markets; every winner shorts market 1 and goes long 2
+    // and 3; every loser goes long market 1 and is left with 20% of its notional.
+    let mut world = InMemoryHost::new(T0);
+    storage::save_admin(&mut world, ADMIN).unwrap();
+    for m in MARKETS {
+        storage::save_market(&mut world, &market(m)).unwrap();
+    }
+    storage::save_insurance_fund(&mut world, 1_000_000_000 * USD as u64).unwrap();
+    wallet(&mut world, BOB, WALLET);
+    for m in MARKETS {
+        run(&mut world, BOB, &setMarginTypeCall { marketId: m, marginType: ISOLATED }.abi_encode());
+    }
+    let n_w = winners.len() as u64;
+    run(&mut world, BOB, &order(M1, BUY, px(100), n_w * Q, GTC));
+    run(&mut world, BOB, &order(M2, SELL, px(100), n_w * Q, GTC));
+    run(&mut world, BOB, &order(M3, SELL, px(100), n_w * Q, GTC));
+    for (i, &w) in winners.iter().enumerate() {
+        wallet(&mut world, w, (20_000 + 3_000 * i as i64) * USD);
+        run(&mut world, w, &order(M1, SELL, px(100), Q, IOC));
+        run(&mut world, w, &order(M2, BUY, px(100), Q, IOC));
+        run(&mut world, w, &order(M3, BUY, px(100), Q, IOC));
+    }
+    run(&mut world, BOB, &order(M1, SELL, px(100), losers.len() as u64 * Q, GTC));
+    for &u in &losers {
+        wallet(&mut world, u, WALLET);
+        run(&mut world, u, &order(M1, BUY, px(100), Q, IOC));
+        wallet(&mut world, u, (Q * px(100) * 10_000) as i64 / 5);
+    }
+    for m in MARKETS {
+        tick_at(&mut world, m, px(100), T0);
+    }
+    world.end_block();
+
+    let outcome = |bypass: bool| {
+        let mut h = InMemoryHost::new(world.now);
+        h.committed = world.committed.clone();
+        h.balances = world.balances.clone();
+        h.logs.clear();
+        memo_stats::bypass(bypass);
+        memo_stats::take();
+        tick_at(&mut h, M1, px(78), T0 + 15);
+        memo_stats::bypass(false);
+        let stats = memo_stats::take();
+        let logs = std::mem::take(&mut h.logs);
+        let commitment = perp_core::compute_block_commitment(U256::ZERO, &h.end_block());
+        (logs, commitment, stats)
+    };
+    let (logs, commitment, (hits, misses)) = outcome(false);
+    let (logs_fresh, commitment_fresh, fresh_stats) = outcome(true);
+    assert_eq!(fresh_stats, (0, 0), "the bypass re-priced every holder");
+    let liquidations = evs::<crate::interface::IPerpDex::Liquidation>(&logs).len();
+    assert_eq!(liquidations, losers.len(), "every loser was liquidated");
+    assert!(evs::<Adl>(&logs).len() >= losers.len(), "…and ADL'd");
+    // The first loser's ranking keeps no memo; the second prices the five holders left and keeps
+    // them; the third finds the four no fill touched.
+    assert_eq!((hits, misses), (4, 5), "the later losers' rankings hit the memo");
+    assert_eq!(logs, logs_fresh, "the same log stream");
+    assert_eq!(commitment, commitment_fresh, "the same block delta");
+}
+
 // ── D3 / D4: the health check is the walk's numbers ─────────────────────────────
 
 /// `cross_health` against `cross_fold` computed HERE — not through the `debug_assertions`

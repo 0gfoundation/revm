@@ -35,6 +35,45 @@ use crate::types::{
 };
 use crate::error::PerpError;
 
+/// One cross HEALTH check priced in the current call (`perp_engine::margin_view::cross_health`,
+/// through ADL's memoized read of it, `cross_health_for_adl`): the inputs it is a function of, and
+/// its answer — `E`, `Σ_C MM`, and the terms of the one leg last asked for. The store only keeps
+/// it; the engine decides when it still holds.
+///
+/// The health of an account is a pure function of its stored `perp_wallet_balance`, its stored
+/// [`CrossLegs`] and the `Market` blob of each leg (mark, funding index, tier table, decimals) — so
+/// an entry answers again exactly when all three are unchanged:
+///
+/// * the wallet, compared by VALUE;
+/// * the legs, by IDENTITY (`Arc::ptr_eq`): this entry holds the `Arc` it priced, so the store
+///   cannot mutate that allocation in place (`Arc::make_mut` clones a shared value) — any write
+///   of the legs leaves a different `Arc` behind, and the held one keeps its address from being
+///   reused;
+/// * the markets, by the store's [`TypedPerpStore::market_epoch`], which every change to the
+///   market sub-map moves.
+#[derive(Clone, Debug)]
+pub struct CrossHealthMemo {
+    /// The `perp_wallet_balance` it was priced with.
+    pub wallet: i64,
+    /// The legs it was priced from (held — see the type doc).
+    pub legs: Arc<CrossLegs>,
+    /// [`TypedPerpStore::market_epoch`] when it was priced.
+    pub market_epoch: u64,
+    /// The answer: `E`.
+    pub e: i128,
+    /// The answer: `Σ_C MM`.
+    pub cross_mm: i128,
+    /// The answer: at least one leg was evaluated.
+    pub has_cross: bool,
+    /// The answer: legs left out of every sum.
+    pub faulted_legs: u8,
+    /// The market whose leg was last asked for.
+    pub leg_market: u64,
+    /// That leg's `(uPnL, MM, PF)`; `None` when the account holds no cross leg there or the check
+    /// leaves it out.
+    pub leg: Option<(i128, i128, i128)>,
+}
+
 /// Identifies which typed sub-map + identity a dirty `B256` key refers to, so [`TypedPerpStore::take_delta`]
 /// can read the entity's current value back out (or detect its removal → tombstone) without
 /// re-parsing the packed key. One variant per off-trie namespace (Stage A.1 = the three
@@ -219,6 +258,21 @@ pub struct TypedPerpStore {
     /// reason: a reverted call settles nothing), a `BTreeMap` for the same deterministic ascending
     /// order, and likewise NOT a storage key — no dirty entry, no `write_count`, no commitment.
     settle_accounts: std::collections::BTreeMap<Address, u64>,
+    /// Moves on every change to the `markets` sub-map — a write (`market_mut`, `set_market`) or a
+    /// cold fill — and on nothing else; never reset. Equal values bracket a span in which no
+    /// resident `Market` changed, which is how a [`CrossHealthMemo`] knows its markets still hold.
+    /// Not a storage key: no dirty entry, no `write_count`, no commitment.
+    market_epoch: u64,
+    /// The cross health checks priced so far in the CURRENT perp call, per user
+    /// ([`CrossHealthMemo`]). CALL-scoped like [`Self::touched_accounts`] (the same
+    /// [`Self::begin_call`] reset), so the `Arc`s it holds — which make the next write of those
+    /// legs clone them — never outlive the call that took them. Not a storage key: no dirty entry,
+    /// no `write_count`, no commitment; iteration order never matters (lookups only).
+    cross_health_memo: HashMap<Address, CrossHealthMemo>,
+    /// ADL rankings run so far in the CURRENT perp call — the memo above is kept only from the
+    /// second one on (`perp_engine::trading::liquidation`), so a call that ranks once pays nothing
+    /// for it. CALL-scoped (the same [`Self::begin_call`] reset); not a storage key.
+    adl_rankings: u32,
 }
 
 impl TypedPerpStore {
@@ -385,6 +439,7 @@ impl TypedPerpStore {
                     .insert(keys::market_key(market_id), StoreSlot::Market(market_id));
                 self.write_count += 1;
                 self.tx_dirty = true;
+                self.market_epoch += 1;
                 Some(Arc::make_mut(m))
             }
             _ => None,
@@ -400,6 +455,7 @@ impl TypedPerpStore {
     /// Cold-fill (cache semantics, no dirty mark; see [`Self::fill_account`]).
     #[inline]
     pub fn fill_market(&mut self, market_id: u64, value: Option<Arc<Market>>) {
+        self.market_epoch += 1;
         self.markets.entry(market_id).or_insert(value);
     }
 
@@ -407,7 +463,14 @@ impl TypedPerpStore {
     #[inline]
     pub fn set_market(&mut self, market_id: u64, value: Market) {
         self.mark(keys::market_key(market_id), StoreSlot::Market(market_id));
+        self.market_epoch += 1;
         self.markets.insert(market_id, Some(Arc::new(value)));
+    }
+
+    /// The market sub-map's change counter (see [`CrossHealthMemo`]).
+    #[inline]
+    pub fn market_epoch(&self) -> u64 {
+        self.market_epoch
     }
 
     // ── per-(user, market) position ──────────────────────────────────────────
@@ -1257,6 +1320,45 @@ impl TypedPerpStore {
     pub fn begin_call(&mut self) {
         self.touched_accounts.clear();
         self.settle_accounts.clear();
+        self.cross_health_memo.clear();
+        self.adl_rankings = 0;
+    }
+
+    /// Counts one more ADL ranking in the current call and returns how many there have been,
+    /// this one included.
+    #[inline]
+    pub fn note_adl_ranking(&mut self) -> u32 {
+        self.adl_rankings = self.adl_rankings.saturating_add(1);
+        self.adl_rankings
+    }
+
+    /// The current call's memoized cross health check of `user`, if one was recorded — whether it
+    /// still holds is the caller's to decide ([`CrossHealthMemo`]).
+    #[inline]
+    pub fn cross_health_memo(&self, user: Address) -> Option<&CrossHealthMemo> {
+        self.cross_health_memo.get(&user)
+    }
+
+    /// Mutable access to `user`'s memoized cross health check (to record another leg's terms).
+    #[inline]
+    pub fn cross_health_memo_mut(&mut self, user: Address) -> Option<&mut CrossHealthMemo> {
+        self.cross_health_memo.get_mut(&user)
+    }
+
+    /// Records (or replaces) `user`'s memoized cross health check for the rest of the call.
+    #[inline]
+    pub fn memo_cross_health(&mut self, user: Address, memo: CrossHealthMemo) {
+        self.cross_health_memo.insert(user, memo);
+    }
+
+    /// Room for `n` memoized checks in all, so a caller about to price `n` accounts grows the
+    /// memo once rather than by repeated doubling.
+    #[inline]
+    pub fn reserve_cross_health_memo(&mut self, n: usize) {
+        let len = self.cross_health_memo.len();
+        if n > len {
+            self.cross_health_memo.reserve(n - len);
+        }
     }
 
     /// Records that `user` closed a position in `market_id` in a way the end of the current call
