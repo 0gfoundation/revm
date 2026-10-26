@@ -486,6 +486,11 @@ use primitives::{B256, U256};
 //     the per-leg terms off the cross legs (`margin_view::cross_health`) instead of the position
 //     walk. No rule moves — the same numbers, re-derived by the walk in every debug build: both
 //     pins unchanged (0xfdf928b5…47d4, 0x3c401b00…73b9), both snapshots UNCHANGED.
+//   * P4 review — `save_position` sets the cross leg BEFORE the position write (a reject after it
+//     inside a batch can no longer keep a position without its leg); the aggregates-only position
+//     route takes the four side aggregates instead of a whole position; ADL ranks in 256 bits when
+//     it can and re-ranks a call's cross holders from a call-scoped health memo. No write moves:
+//     both pins unchanged (0xfdf928b5…47d4, 0x3c401b00…73b9), both snapshots UNCHANGED.
 //   * P4 review — the "xleg" codec (finding 5). A LAYOUT change of the one key family: a
 //     `CrossLegs` blob is ONE msgpack `bin` whose payload is the entries back to back, each
 //     `uvarint(market) · zvarint(amount) · zvarint(vQuote) · zvarint(funding index)` (LEB128,
