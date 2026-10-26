@@ -410,6 +410,11 @@ use primitives::{B256, U256};
 //     (a reduce-only close, a maker fill, a fired stop, ADL against the account): the end of that
 //     call clears `liq_flags`. Reachable only on an account in cross liquidation: the golden pin
 //     0xaea562b9…1e61 is unchanged, BusinessSnapshot UNCHANGED.
+//   * P3 — cross ADL, final rules (R5): a CROSSED winner ranks `uPnL / E` (gain) or
+//     `uPnL · E / N²` (loss) and is clean per fill while `E − take · |fill − mark| ≥ 0`; the rank
+//     comparison is exact (512-bit cross-multiplication) for every winner. An ISOLATED winner's
+//     ROE order is the one the saturating comparator gave wherever it did not saturate, so no
+//     isolated ADL moves: the golden pin 0xaea562b9…1e61 is unchanged, BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

@@ -17,6 +17,9 @@
 //!   close, a maker fill, a fired stop, ADL against the flagged account);
 //! * manual `liquidate()`: healthy refused write-clean, a recovered flag cleared through any market,
 //!   the start market;
+//! * cross ADL (R5): a losing cross winner ranks `uPnL · E / N²` among isolated winners on their
+//!   ROE, the clean tier is judged per fill (`E − take · |fill − mark| ≥ 0`), and a fill the account
+//!   cannot carry re-queues it behind the clean tier;
 //! * negative-balance clearance (Q8, R4): a negative wallet is cleared by the insurance fund at the
 //!   end of the call that closed the account's LAST position — by a user close, a maker fill, a
 //!   fired stop, a cross episode (sweep or drain), an ADL fill on the winning side — never while a
@@ -1154,6 +1157,99 @@ fn a_fired_stop_or_an_adl_fill_closing_the_last_cross_position_ends_the_episode(
     let ended = evs::<CrossLiquidationEnded>(&logs);
     assert_eq!((ended.len(), ended[0].user, ended[0].marketId), (1, ALICE, M1));
     assert!(!flagged(&mut ctx, ALICE));
+}
+
+// ── Cross ADL: ranking and the per-fill clean tier (R5) ─────────────────────────
+
+/// `maker` rests `qty` at `price` on `m` with the mark moved there first (fixture), `taker` takes it.
+fn trade_at(ctx: &mut TestCtx, m: u64, taker: Address, maker: Address, side: u8, price: u64, qty: u64) {
+    set_mark(ctx, m, price);
+    trade(ctx, m, taker, maker, side, price, qty);
+}
+
+/// **R5 — a CROSSED winner with a LOSS ranks `uPnL · E / N²` (Binance's `PnL% / EffLev`), mixed
+/// with an isolated winner on its ROE.** CAROL's ISOLATED 3x long of 5 (entry $100) is liquidated
+/// by `liquidate()` at a $60 mark on an empty book: insolvent, so ADL fills at her bankruptcy price
+/// ≈ $66.67. The shorts: KEEPER (ISOLATED, entered at $100, +$40) and ALICE and BOB (CROSSED, short
+/// 2 each, entered at $50 — both at −$20). KEEPER's positive rank goes first. Among the two losing
+/// cross accounts the one with the SMALLER equity goes next — ALICE, `E = $80`, rank
+/// `−20 · 80 / 120²` against BOB's `−20 · 9,980 / 120²` — where `uPnL / E` would have picked BOB
+/// (`−20 / 9,980` is the larger). Both are clean for their 2 at $6.67 a unit over the mark.
+#[test]
+fn adl_ranks_a_losing_cross_winner_by_upnl_times_e_over_n_squared() {
+    let (_g, mut ctx) = make_ctx();
+    set_type(&mut ctx, BOB, M1, CROSSED);
+    set_leverage(&mut ctx, BOB, M1, 3);
+    set_leverage(&mut ctx, CAROL, M1, 3);
+    set_leverage(&mut ctx, KEEPER, M1, 1);
+    trade(&mut ctx, M1, CAROL, MAKER, BUY, px(100), 4);
+    trade(&mut ctx, M1, CAROL, KEEPER, BUY, px(100), 1);
+    // MAKER buys its short back from ALICE and BOB at $50: they are short 2 each from there.
+    trade_at(&mut ctx, M1, MAKER, ALICE, BUY, px(50), 2);
+    trade_at(&mut ctx, M1, MAKER, BOB, BUY, px(50), 2);
+    assert_eq!(pos(&mut ctx, MAKER, M1).amount, 0);
+    set_wallet(&mut ctx, ALICE, usd(100));
+    set_wallet(&mut ctx, BOB, usd(10_000));
+    set_mark(&mut ctx, M1, px(60));
+    let ledger = Ledger::open(&mut ctx);
+    assert_eq!((fold(&mut ctx, ALICE).e, fold(&mut ctx, BOB).e), (usd(80) as i128, usd(9_980) as i128));
+
+    let logs = ok(&mut ctx, ADMIN, &liquidate(CAROL, M1));
+    ledger.check(&mut ctx, "after the liquidation + ADL");
+    let order: Vec<(Address, u64)> = adls(&logs).iter().map(|a| (a.1, a.3)).collect();
+    assert_eq!(order, vec![(KEEPER, 1), (ALICE, 2), (BOB, 2)]);
+    assert!(adls(&logs).iter().all(|a| a.4 > px(66) && a.4 <= px(67)));
+}
+
+/// **R5 — the clean tier is decided PER FILL, on the `take`.** CAROL's ISOLATED 3x long of 2 is
+/// liquidated at $60 (bankruptcy ≈ $66.67, $6.67 a unit over the mark). ALICE (CROSSED) is short 10
+/// with `E = $40` and the higher rank (`+$10 / $40`): closing her WHOLE short at the fill price would
+/// take $66.7 off an equity of $40 — the P2 interim's whole-position test put her in the fallback
+/// tier — but this fill closes only the 2 CAROL has, $13.3 of it, which she carries. So she is
+/// ADL'd first; KEEPER (ISOLATED, short 2 from $62, ROE `+$4 / $128`) is not reached.
+#[test]
+fn adl_clean_tier_is_judged_on_the_fill_not_the_whole_position() {
+    let (_g, mut ctx) = make_ctx();
+    set_leverage(&mut ctx, CAROL, M1, 3);
+    set_leverage(&mut ctx, KEEPER, M1, 1);
+    trade(&mut ctx, M1, CAROL, MAKER, BUY, px(100), 2);
+    trade_at(&mut ctx, M1, MAKER, ALICE, BUY, px(61), 10);
+    trade_at(&mut ctx, M1, MAKER, KEEPER, BUY, px(62), 2);
+    assert_eq!(pos(&mut ctx, MAKER, M1).amount, 10);
+    set_wallet(&mut ctx, ALICE, usd(30));
+    set_mark(&mut ctx, M1, px(60));
+    let ledger = Ledger::open(&mut ctx);
+    assert_eq!(fold(&mut ctx, ALICE).e, usd(40) as i128);
+
+    let logs = ok(&mut ctx, ADMIN, &liquidate(CAROL, M1));
+    ledger.check(&mut ctx, "after the liquidation + ADL");
+    let order: Vec<(Address, u64)> = adls(&logs).iter().map(|a| (a.1, a.3)).collect();
+    assert_eq!(order, vec![(ALICE, 2)]);
+    assert_eq!(pos(&mut ctx, KEEPER, M1).amount, -2, "not reached");
+    assert!(wallet(&mut ctx, ALICE) > 0);
+}
+
+/// **R5 — a fill the account cannot carry goes behind the fallback tier.** The same scene with
+/// CAROL long 8 (bankruptcy ≈ $66.67 again): ALICE's fill would now be 8 — $53.3 against `E = $40`
+/// — so she is re-queued behind the fallback tier and KEEPER's clean 2 go first; the rest (6) can
+/// only come from ALICE, who takes it as fallback tier.
+#[test]
+fn adl_a_cross_fill_the_account_cannot_carry_goes_behind_the_clean_tier() {
+    let (_g, mut ctx) = make_ctx();
+    set_leverage(&mut ctx, CAROL, M1, 3);
+    set_leverage(&mut ctx, KEEPER, M1, 1);
+    trade(&mut ctx, M1, CAROL, MAKER, BUY, px(100), 8);
+    trade_at(&mut ctx, M1, MAKER, ALICE, BUY, px(61), 10);
+    trade_at(&mut ctx, M1, MAKER, KEEPER, BUY, px(62), 2);
+    assert_eq!(pos(&mut ctx, MAKER, M1).amount, 4);
+    set_wallet(&mut ctx, ALICE, usd(30));
+    set_mark(&mut ctx, M1, px(60));
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = ok(&mut ctx, ADMIN, &liquidate(CAROL, M1));
+    ledger.check(&mut ctx, "after the liquidation + ADL");
+    let order: Vec<(Address, u64)> = adls(&logs).iter().map(|a| (a.1, a.3)).collect();
+    assert_eq!(order, vec![(KEEPER, 2), (ALICE, 6)]);
 }
 
 // ── Negative-balance clearance (Q8, R4) ─────────────────────────────────────────

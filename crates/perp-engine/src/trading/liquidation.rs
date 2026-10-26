@@ -217,17 +217,26 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 /// candidate is spent, under `BothSides` (see the tier notes in the body). Cascades from
 /// ADL'ing a thin winner resolve on a later sweep, not by in-`run_adl` recursion.
 ///
-/// # CROSSED winners — the P2 interim ranking (P3b replaces it)
+/// # CROSSED winners (cross P3, R5)
 ///
 /// A winner CROSSED in force has no silo, so its position equity is not a number ADL can rank or
-/// screen it by. It is judged on its ACCOUNT instead: `E` from the TOTAL cross fold
-/// (`margin_view::cross_fold`, no `Err` but the storage layer's, no division anywhere), ranked
-/// `uPnL_k / E` (the cross report's provisional rank, §3.4 ADL; Binance's own formula for a cross
-/// position, `PnL% × EffLev`, reduces to exactly that for a profitable one), clean while
-/// `E > 0` and `E` would stay `≥ 0` with this whole position closed at the fill price, fallback
-/// tier otherwise. Its fill settles into its cross wallet, either sign, with no bad debt of its own
+/// screen it by. It is judged on its ACCOUNT instead — `E` and this market's leg from the TOTAL
+/// cross fold (`margin_view::cross_fold`: no `Err` but the storage layer's; J4):
+///
+/// * **Rank** — Binance's `PnL% × EffLev` when `PnL% ≥ 0` and `PnL% / EffLev` when `< 0`, with
+///   `PnL% = uPnL_k / |N_k|` (symbol level) and `EffLev = |N_k| / E` (account level — cross report
+///   §1.7, F25), which reduce to `uPnL_k / E` and `uPnL_k · E / N_k²`. An ISOLATED winner keeps its
+///   position-level `uPnL / equity` for both signs (§3.4: Binance's denominator for an isolated
+///   position is unpublished, F26). The two kinds are ordered together EXACTLY: every rank is a
+///   ratio, compared by cross-multiplication in 512 bits ([`AdlRank`]), so the order is total.
+/// * **Tier** — rankable needs `E > 0`; an account at or below zero is fallback tier outright. A
+///   rankable one is then clean PER FILL: `E − take · |fill − mark| ≥ 0` for the `take` this fill
+///   would close (the worst its equity can do at the fill price instead of the mark). A fill that
+///   fails it re-queues the winner behind the fallback tier, like a rejected trial.
+///
+/// Its fill settles into its cross wallet, either sign, with no bad debt of its own
 /// (`settlement::apply_position_fill` under `Cross`), so the fill policy binds only the loser's
-/// leg.
+/// leg. Like every winner, it loses only its orders in THIS market (deviation D7).
 ///
 /// # A CROSSED loser
 ///
@@ -407,7 +416,8 @@ fn run_adl_fills<H: PerpHost>(
     let funding_index = storage::load_funding_state(context, market.market_id)?
         .cumulative_funding_index;
     let registry = storage::load_position_registry(context, market.market_id)?;
-    let mut cands: Vec<(Address, i128, i128)> = Vec::new(); // (addr, uPnL@mark, equity@mark)
+    // Clean candidates: `(addr, rank, Some(E) for a CROSSED one — its per-fill tier test)`.
+    let mut cands: Vec<(Address, AdlRank, Option<i128>)> = Vec::new();
     // Counterparties already bankrupt at the mark, held back until `cands` is spent. `(addr, eq)`.
     let mut fallback: Vec<(Address, i128)> = Vec::new();
     for user in registry {
@@ -418,26 +428,23 @@ fn run_adl_fills<H: PerpHost>(
         if wp.amount == 0 || (wp.amount > 0) == loser_is_long {
             continue; // flat or same side as the loser
         }
-        // ── A CROSSED winner: judged and ranked on its ACCOUNT (P2 interim — see the doc) ────────
+        // ── A CROSSED winner: judged and ranked on its ACCOUNT (R5 — see the doc) ───────────────
         //
-        // P3: the clean-tier test becomes `E − take·|fill − mark| ≥ 0` per fill, and the rank is
-        // shared with the sweep's own fold. Total: the fold has no `Err` but the storage layer's,
-        // and nothing here divides — the comparator below cross-multiplies.
+        // TOTAL (J4): `E` and this market's leg come from the total fold, nothing here divides
+        // (the rank is a ratio compared by cross-multiplication), and a leg the fold could not
+        // evaluate leaves the winner unrankable — fallback tier, at its `E`. `E = cWB + Σ_C uPnL`:
+        // pending funding of every cross leg included (`cWB`), this market priced at its stored
+        // mark, which is `mark_price` on both callers.
         if crate::margin_type::effective_margin_type(&wp) == crate::types::MarginType::Crossed {
-            let upnl_mark = calc_value_i64(mark_price, wp.amount, bd, pd)? as i128
-                + wp.v_quote_balance as i128;
-            let upnl_fill = calc_value_i64(fill_price, wp.amount, bd, pd)? as i128
-                + wp.v_quote_balance as i128;
-            // `E = cWB + Σ_C uPnL` — pending funding of every cross leg included (`cWB`), and this
-            // market priced at the stored mark, which is `mark_price` on both callers.
-            let e = crate::margin_view::cross_fold(context, user, None, None, None)?.e;
-            // The account's equity with this WHOLE position closed at the fill price instead of
-            // the mark (`take ≤ |amount|`, so this is the worst case of any one fill).
-            let e_fill = e - upnl_mark + upnl_fill;
-            if e <= 0 || e_fill < 0 {
-                fallback.push((user, e));
-            } else {
-                cands.push((user, upnl_mark, e));
+            let mut legs = Vec::new();
+            let e = crate::margin_view::cross_fold(context, user, None, None, Some(&mut legs))?.e;
+            match legs.iter().find(|l| l.market_id == market.market_id) {
+                Some(leg) if e > 0 => {
+                    // `N_k`: the leg's `uPnL` less the entry basis (`uPnL = N + vQuote`).
+                    let notional = leg.upnl - wp.v_quote_balance as i128;
+                    cands.push((user, AdlRank::cross(leg.upnl, e, notional), Some(e)));
+                }
+                _ => fallback.push((user, e)),
             }
             continue;
         }
@@ -505,18 +512,14 @@ fn run_adl_fills<H: PerpHost>(
             continue;
         }
         let notional = calc_value_i64(mark_price, wp.amount, bd, pd)? as i128;
-        cands.push((user, notional + wp.v_quote_balance as i128, eq_mark as i128));
+        let upnl = notional + wp.v_quote_balance as i128;
+        cands.push((user, AdlRank::ratio(upnl, eq_mark as i128), None));
     }
-    // ROE = uPnL/equity DESC (equity>0), Address ASC tie-break; cross-multiply, no div. A CROSSED
-    // candidate's pair is `(uPnL_k, E)` — the same ratio with the account as the denominator.
-    // `saturating_mul` is deterministic and cannot panic — both products only approach
-    // i128::MAX at the joint i64 extremes, where a saturated tie deterministically falls
-    // through to the Address tie-break (equal ROE ranking either way).
-    cands.sort_by(|a, b| {
-        let lhs = a.1.saturating_mul(b.2); // uPnL_A * eq_B
-        let rhs = b.1.saturating_mul(a.2); // uPnL_B * eq_A
-        rhs.cmp(&lhs).then_with(|| a.0.cmp(&b.0))
-    });
+    // Rank DESC, Address ASC tie-break. An ISOLATED candidate's rank is its ROE `uPnL / equity`
+    // (equity > 0 on this tier), a CROSSED one's Binance's sign-split account rank (R5); both are
+    // exact ratios, so this is a TOTAL order — cross-multiplied in 512 bits, never saturated (a
+    // saturated product could make the comparator inconsistent, and `sort_by` may panic on one).
+    cands.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     // The fallback tier cannot use ROE — its denominator may be <= 0 — so: HEALTHIEST first
     // (equity at mark DESC — a CROSSED holder's account `E`), Address ASC tie-break. Not
     // arbitrary: the shortfall a holder
@@ -548,14 +551,16 @@ fn run_adl_fills<H: PerpHost>(
     // Clean candidates first, then — only if the residual outlives them — the already-bankrupt
     // fallback tier. One loop, so the budget, the cancels and the event shape are shared; the only
     // difference is which shortfalls the fill is allowed to leave behind.
-    let mut queue: Vec<(Address, bool)> = cands
+    //
+    // A CROSSED clean candidate carries its `E` for the per-fill tier test (R5); `None` otherwise.
+    let mut queue: Vec<(Address, bool, Option<i128>)> = cands
         .into_iter()
-        .map(|(w, _, _)| (w, false))
-        .chain(fallback.into_iter().map(|(w, _)| (w, true)))
+        .map(|(w, _, e)| (w, false, e))
+        .chain(fallback.into_iter().map(|(w, _)| (w, true, None)))
         .collect();
     let mut qi = 0;
     while qi < queue.len() {
-        let (winner, is_fallback) = queue[qi];
+        let (winner, is_fallback, cross_e) = queue[qi];
         qi += 1;
         if *budget == 0 || remaining == 0 {
             break;
@@ -566,6 +571,22 @@ fn run_adl_fills<H: PerpHost>(
             loser_policy
         };
         let mut winner_pos = storage::load_position(context, winner, market.market_id)?;
+        // ── R5: a CROSSED winner is clean only for a fill its account can carry ──────────────────
+        //
+        // `E − take · |fill − mark| ≥ 0`: closing `take` at the fill price instead of the mark
+        // moves its equity by at most that much. A fill it cannot carry would push the account's
+        // whole wallet under zero to absorb this loser's price, so it goes behind the fallback
+        // tier instead, exactly like a rejected trial. TOTAL: an unrepresentable slippage value is
+        // "cannot carry".
+        if let (false, Some(e)) = (is_fallback, cross_e) {
+            let take = winner_pos.amount.unsigned_abs().min(remaining);
+            let slippage = calc_value(fill_price.abs_diff(mark_price), take, bd, pd)
+                .map_or(i128::MAX, |v| v as i128);
+            if e.saturating_sub(slippage) < 0 {
+                queue.push((winner, true, None));
+                continue;
+            }
+        }
         let mut winner_account = storage::load_account(context, winner)?;
         // Settle the winner's pending funding IN MEMORY before the trial, so the fill is tried on
         // the margin it really has and the close nets any funding debt. Committed (events only —
@@ -622,7 +643,7 @@ fn run_adl_fills<H: PerpHost>(
             // most once, and a `BothSides` trial cannot reject (its `accepts` is unconditional and
             // `take >= 1` under the loop guards).
             if !is_fallback {
-                queue.push((winner, true));
+                queue.push((winner, true, None));
             }
             continue;
         };
@@ -771,6 +792,84 @@ fn run_adl_fills<H: PerpHost>(
     Ok(())
 }
 
+/// An ADL winner's rank — a ratio `num / den` with `den > 0`, compared EXACTLY (cross report §1.7,
+/// R5; see `run_adl`'s doc for which ratio each kind of winner gets).
+///
+/// Held as a sign and two magnitudes so that the comparison is a cross-multiplication of
+/// magnitudes in `U512`. Every input is an `i128`, so a numerator is below 2^254 (`|uPnL| · E`) and
+/// a denominator at most 2^254 (`N²`): every product is below 2^508 — nothing saturates, and the
+/// order is total for ANY inputs. (The previous comparator multiplied in `i128`, saturating, which
+/// could tie unequal ranks — or compare inconsistently, which `sort_by` may panic on — at the joint
+/// extremes. Wherever it did not saturate, it is this order.)
+#[derive(Clone, Copy, Debug)]
+struct AdlRank {
+    /// `−1`, `0` or `1`: the sign of the ratio.
+    sign: i8,
+    /// `|num|`.
+    num: alloy_primitives::U512,
+    /// `den > 0`.
+    den: alloy_primitives::U512,
+}
+
+impl AdlRank {
+    /// `num / den` for `den > 0` (a `den ≤ 0` is clamped to 1 — no caller passes one).
+    fn ratio(num: i128, den: i128) -> Self {
+        Self {
+            sign: num.signum() as i8,
+            num: alloy_primitives::U512::from(num.unsigned_abs()),
+            den: alloy_primitives::U512::from(den.max(1) as u128),
+        }
+    }
+
+    /// A CROSSED winner with account equity `e > 0`: Binance's `PnL% × EffLev = uPnL / E` for
+    /// `uPnL ≥ 0`, `PnL% / EffLev = uPnL · E / N²` for `uPnL < 0` (`N` the leg's notional; an
+    /// `N` that floored to 0 counts as 1).
+    fn cross(upnl: i128, e: i128, notional: i128) -> Self {
+        if upnl >= 0 {
+            return Self::ratio(upnl, e);
+        }
+        let n = alloy_primitives::U512::from(notional.unsigned_abs().max(1));
+        Self {
+            sign: -1,
+            num: alloy_primitives::U512::from(upnl.unsigned_abs())
+                * alloy_primitives::U512::from(e.max(1) as u128),
+            den: n * n,
+        }
+    }
+}
+
+impl Ord for AdlRank {
+    /// Ascending by value.
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        match self.sign.cmp(&other.sign) {
+            core::cmp::Ordering::Equal => {}
+            unequal => return unequal,
+        }
+        // Same sign: compare |a| = a.num/a.den with |b| by cross-multiplication.
+        let (lhs, rhs) = (self.num * other.den, other.num * self.den);
+        if self.sign < 0 {
+            rhs.cmp(&lhs)
+        } else {
+            lhs.cmp(&rhs)
+        }
+    }
+}
+
+impl PartialOrd for AdlRank {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Equality is equality of VALUE (`1/2 == 2/4`), consistent with [`Ord`].
+impl PartialEq for AdlRank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == core::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for AdlRank {}
+
 /// One ADL forced trade: close `take` of both the loser and one opposite holder at
 /// `fill_price`, shrinking `take` (bounded) so NEITHER side realizes bad debt from sub-unit
 /// flooring. Both legs use the SAME single-floored `calc_value(fill_price, take)`. Returns the
@@ -880,3 +979,67 @@ fn adl_fill(
 }
 
 // `emit_position_changed` lives in `crate::events` — one derivation for all seven emit sites.
+
+#[cfg(test)]
+mod adl_rank_tests {
+    use super::AdlRank;
+    use core::cmp::Ordering;
+
+    /// Value order, not representation: `1/2 == 2/4`, signs order before magnitudes, and a loss
+    /// ranks below a zero below a gain.
+    #[test]
+    fn an_adl_rank_compares_ratios_by_value() {
+        assert_eq!(AdlRank::ratio(1, 2), AdlRank::ratio(2, 4));
+        assert!(AdlRank::ratio(1, 3) < AdlRank::ratio(1, 2));
+        assert!(AdlRank::ratio(-1, 2) < AdlRank::ratio(-1, 3));
+        assert!(AdlRank::ratio(-1, 1_000_000) < AdlRank::ratio(0, 7));
+        assert_eq!(AdlRank::ratio(0, 7), AdlRank::ratio(0, 1));
+        assert!(AdlRank::ratio(0, 1) < AdlRank::ratio(1, i128::MAX));
+        // Cross: a gain is `uPnL / E`; a loss `uPnL · E / N²` — more equity ranks LOWER there.
+        assert_eq!(AdlRank::cross(10, 40, 600), AdlRank::ratio(1, 4));
+        assert!(AdlRank::cross(-20, 9_980, 120) < AdlRank::cross(-20, 80, 120));
+        assert!(AdlRank::ratio(-20, 9_980) > AdlRank::ratio(-20, 80), "the rule R5 replaces");
+        // A notional that floored to 0 counts as 1.
+        assert_eq!(AdlRank::cross(-1, 1, 0), AdlRank::ratio(-1, 1));
+    }
+
+    /// TOTAL at the joint extremes, where the previous saturating `i128` products would tie or
+    /// invert: the comparison is exact, antisymmetric and transitive over a mixed set.
+    #[test]
+    fn an_adl_rank_is_a_total_order_at_the_extremes() {
+        let big = i128::MAX;
+        let ranks = [
+            AdlRank::ratio(big, 1),
+            AdlRank::ratio(big, big),
+            AdlRank::ratio(big - 1, big),
+            AdlRank::ratio(1, big),
+            AdlRank::ratio(0, big),
+            AdlRank::ratio(-1, big),
+            AdlRank::ratio(-big, 1),
+            AdlRank::ratio(i128::MIN, 1),
+            AdlRank::cross(-(1 << 66), 1 << 71, i64::MAX as i128),
+            AdlRank::cross(-(1 << 66), (1 << 71) - 1, i64::MAX as i128),
+            AdlRank::cross(i128::MIN, big, 1),
+            AdlRank::cross(big, big, big),
+        ];
+        assert!(AdlRank::ratio(big - 1, big) < AdlRank::ratio(big, big));
+        assert!(
+            AdlRank::cross(-(1 << 66), 1 << 71, i64::MAX as i128)
+                < AdlRank::cross(-(1 << 66), (1 << 71) - 1, i64::MAX as i128)
+        );
+        for a in &ranks {
+            assert_eq!(a.cmp(a), Ordering::Equal);
+            for b in &ranks {
+                assert_eq!(a.cmp(b), b.cmp(a).reverse(), "antisymmetric");
+                for c in &ranks {
+                    if a <= b && b <= c {
+                        assert!(a <= c, "transitive");
+                    }
+                }
+            }
+        }
+        let mut sorted = ranks.to_vec();
+        sorted.sort();
+        assert!(sorted.windows(2).all(|w| w[0] <= w[1]));
+    }
+}
