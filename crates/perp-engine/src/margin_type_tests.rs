@@ -475,7 +475,7 @@ fn rejects_after_burn(ctx: &mut TestCtx, input: &[u8], expect: &str) {
 #[test]
 fn production_ships_cross_margin_on_and_the_default_is_crossed() {
     let mut ctx = make_ctx();
-    assert!(crate::types::CROSS_MARGIN_ENABLED);
+    const { assert!(crate::types::CROSS_MARGIN_ENABLED) };
     assert_eq!(crate::margin_type::test_gate::forced(), None, "no override");
     assert!(crate::margin_type::cross_margin_enabled());
     assert_eq!(stored(&mut ctx, ALICE).margin_type, CROSSED, "the stored default");
