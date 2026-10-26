@@ -395,8 +395,12 @@ sol! {
         ///                               market set every total above was summed over, carrying the
         ///                               per-market numbers those totals are made OF. At most
         ///                               MAX_USER_MARKETS = 16 rows, so the array is bounded by the
-        ///                               same constant that bounds the walk. Empty for an account
-        ///                               with no positions and no resting orders, in which case
+        ///                               same constant that bounds the walk. A market is in the
+        ///                               index while the account holds a position, a resting order
+        ///                               or (⚠️ cross P3 review) an untriggered conditional order
+        ///                               there — so a market holding only a conditional has a
+        ///                               zero row. Empty for an account with no positions and no
+        ///                               open orders of either kind, in which case
         ///                               every total is 0 and the call still succeeds — an empty
         ///                               array is the "no markets" signal, distinguishable from a
         ///                               market set that happened to sum to zero.
@@ -777,6 +781,11 @@ sol! {
         /// and those count toward the 200 per-market open-order cap shared with resting orders
         /// (see `placeOrder`) — `placeAlgoOrder: max open orders reached`. Its trigger is never
         /// refused by that cap: firing takes it off the conditional list as it enters the book.
+        /// ⚠️ ABI CHANGE (cross P3 review): it also makes its market one the account is ACTIVE in
+        /// (the per-user market index `getAccount` walks, and that a cross liquidation's cancel-all
+        /// walks — Binance cancels every open order of a liquidated account, conditionals
+        /// included), so a conditional in a market the account is not in yet counts toward the
+        /// 16-market cap: `placeAlgoOrder: user market limit reached (16 markets)`.
         ///
         /// algoType: must be 0 (`CONDITIONAL`). Binance's Algo API also serves TWAP/VP execution
         ///   algos; the field is carried so adding those later needs no new selector.

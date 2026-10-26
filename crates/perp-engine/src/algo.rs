@@ -386,6 +386,11 @@ fn place_core<H: PerpHost>(
     {
         return Err(perp_err("placeAlgoOrder: max open orders reached"));
     }
+    // An untriggered conditional makes its market one the account is active in — a member of the
+    // per-user market index, which the cross liquidation's cancel-all walks (cross P3 review) — so
+    // entering a market it is not in yet is admitted under the same `MAX_USER_MARKETS` cap as a
+    // book order. Pre-write, like every refusal above.
+    storage::ensure_user_market_admission(context, account, market_id, "placeAlgoOrder")?;
 
     // A trailing stop with activation price 0 activates NOW, at the stored mark and its seq
     // (`IndexPriceState.timestamp`, 0 before the first oracle tick). Its record carries that mark

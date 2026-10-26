@@ -12068,8 +12068,9 @@ mod user_market_index {
     }
 
     /// The index recomputed from scratch out of the state it mirrors — the ground truth the
-    /// property test compares against. Deliberately re-derives the predicate from the three
-    /// underlying reads rather than reusing any engine helper.
+    /// property test compares against. Deliberately re-derives the predicate from the four
+    /// underlying reads rather than reusing any engine helper (the conditional list joined the
+    /// predicate in the cross P3 review).
     fn ground_truth(ctx: &mut TestCtx, user: Address, markets: &[u64]) -> Vec<u64> {
         markets
             .iter()
@@ -12078,6 +12079,7 @@ mod user_market_index {
                 storage::load_position(ctx, user, m).unwrap().amount != 0
                     || !storage::load_buy_orders(ctx, user, m).unwrap().is_empty()
                     || !storage::load_sell_orders(ctx, user, m).unwrap().is_empty()
+                    || !storage::load_user_algo_orders(ctx, user, m).unwrap().is_empty()
             })
             .collect()
     }

@@ -769,6 +769,83 @@ fn a_mixed_account_has_every_order_cancelled_and_its_isolated_position_untouched
     assert!(!flagged(&mut ctx, ALICE));
 }
 
+/// A reduce-only STOP_MARKET SELL of `qty` on `m`, triggered at `trigger` — NOT position-bound, so
+/// it may be placed with no position in `m` at all.
+fn stop_sell(m: u64, trigger: u64, qty: u64) -> Vec<u8> {
+    placeAlgoOrderCall {
+        algoType: 0,
+        marketId: m,
+        side: SELL,
+        orderType: 1,
+        triggerPrice: trigger,
+        price: 0,
+        quantity: qty,
+        tif: 0,
+        workingType: 0,
+        clientAlgoId: FixedBytes::default(),
+        flags: RO,
+    }
+    .abi_encode()
+}
+
+/// **R3 — the cancel-all reaches a conditional order in a market where the account holds NOTHING
+/// else** (P3 review). ALICE's reduce-only stop on M3, with no position and no book order there:
+/// the per-user market index used to count only positions and book orders, so M3 was not in it,
+/// the episode never visited M3, and the stop outlived the liquidation — later reducing a position
+/// she opened after it, at a trigger set before she was liquidated (and `setMarginType(M3)` stayed
+/// `-4047`). A conditional order now makes its market a member of the index like a book order
+/// does: it is cancelled with the rest (reason 3), and the index forgets M3 once nothing is left.
+#[test]
+fn the_cancel_all_reaches_a_conditional_order_in_a_market_with_nothing_else() {
+    let mut ctx = make_ctx();
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 10);
+    ok(&mut ctx, ALICE, &stop_sell(M3, px(50), 1));
+    let stop = storage::load_user_algo_orders(&mut ctx, ALICE, M3).unwrap()[0];
+    assert_eq!(storage::load_user_markets(&mut ctx, ALICE).unwrap(), vec![M1, M3]);
+    set_wallet(&mut ctx, ALICE, usd(300));
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = tick(&mut ctx, M1, px(80));
+    ledger.check(&mut ctx, "after the tick");
+    assert_eq!(evs::<CrossLiquidationStarted>(&logs).len(), 1);
+    let algo: Vec<([u8; 32], u64, u8)> = evs::<AlgoOrderCancelled>(&logs)
+        .iter()
+        .filter(|c| c.user == ALICE)
+        .map(|c| (c.algoId.0, c.marketId, c.reason))
+        .collect();
+    assert_eq!(algo, vec![(stop, M3, CANCEL_LIQUIDATION)]);
+    assert!(storage::load_user_algo_orders(&mut ctx, ALICE, M3).unwrap().is_empty());
+    assert!(storage::load_user_markets(&mut ctx, ALICE).unwrap().is_empty(), "flat, order-free");
+}
+
+/// A conditional order counts toward `MAX_USER_MARKETS` like a book order: with conditionals in
+/// 16 markets, one in a 17th is refused before any write — and so is a book order there. A
+/// conditional in a market already in the index is admitted.
+#[test]
+fn a_conditional_order_counts_toward_the_user_market_cap() {
+    let mut ctx = make_ctx();
+    for id in 4..=17 {
+        storage::save_market(&mut ctx, &market(id)).unwrap();
+    }
+    for id in 1..=16 {
+        ok(&mut ctx, ALICE, &stop_sell(id, px(50), 1));
+    }
+    assert_eq!(storage::load_user_markets(&mut ctx, ALICE).unwrap().len(), 16);
+    rejects(
+        &mut ctx,
+        ALICE,
+        &stop_sell(17, px(50), 1),
+        "placeAlgoOrder: user market limit reached (16 markets)",
+    );
+    rejects(
+        &mut ctx,
+        ALICE,
+        &order(17, BUY, px(50), 1, GTC),
+        "placeOrder: user market limit reached (16 markets)",
+    );
+    ok(&mut ctx, ALICE, &stop_sell(16, px(40), 1));
+}
+
 // ── Budget and continuation ─────────────────────────────────────────────────────
 
 /// **Out of budget, the episode records a CONTINUATION, and the drain resumes it.** ALICE is under

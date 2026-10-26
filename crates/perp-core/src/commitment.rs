@@ -457,6 +457,13 @@ use primitives::{B256, U256};
 //     a receivable or a cleared wallet can no longer open through an order resting from before.
 //     Reachable only with a cross maker at `W ≤ 0`: both pins unchanged (0xfdf928b5…47d4,
 //     0x9c7be213…4132), BusinessSnapshot UNCHANGED.
+//   * P3 review — an untriggered conditional order makes its market a member of the per-user
+//     market index ("umkt"; the list is a fourth leg of the activity predicate, synced on every
+//     `save_user_algo_orders`), so a cross liquidation's cancel-all reaches a conditional in a
+//     market where the account holds nothing else; `placeAlgoOrder` is admitted under the
+//     16-market cap. A WRITE-SET change: a conditional in a market not yet in the index adds the
+//     id (and its retirement removes it). The goldens place none outside an indexed market: both
+//     pins unchanged, BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

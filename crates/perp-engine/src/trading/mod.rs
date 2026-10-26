@@ -1205,7 +1205,7 @@ pub(crate) fn place_order_core<H: PerpHost>(
     // other position writer (maker fill, liquidation, ADL, funding) acts on a market where the
     // user already holds a position or a resting order. Placed with the other genuine rejects,
     // BEFORE any write, so the commit-only "no reject after a write" rule holds.
-    storage::ensure_user_market_admission(context, account, market_id)?;
+    storage::ensure_user_market_admission(context, account, market_id, "placeOrder")?;
 
     // ── per-market open-order cap ──────────────────────────────────────────────────────────────
     //

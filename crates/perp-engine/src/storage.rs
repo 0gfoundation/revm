@@ -1506,9 +1506,11 @@ fn registry_remove<H: PerpHost>(
 
 // ── Per-user market index (`umkt`) ─────────────────────────────────────────
 // The INVERSE of the per-market position registry above: for a user, which markets are they
-// active in? "Active" means **a non-zero position OR at least one resting order** — the position
-// registry cannot answer this, both because its direction is market → users and because it is
-// blind to a market where the user holds only resting orders.
+// active in? "Active" means **a non-zero position OR at least one open order** — a resting book
+// order or an untriggered conditional one (cross P3 review: a cross liquidation's cancel-all walks
+// this index, and Binance cancels "all open orders of the trader", conditionals included) — the
+// position registry cannot answer this, both because its direction is market → users and because
+// it is blind to a market where the user holds only orders.
 //
 // Stored as an ASCENDING `Vec<u64>` in the typed store (same shape as the per-market price
 // indexes). Ascending is what makes the blob CANONICAL: the same logical set reached by different
@@ -1517,8 +1519,9 @@ fn registry_remove<H: PerpHost>(
 // unbounded, and it is additionally capped at [`MAX_USER_MARKETS`].
 //
 // Maintained by [`sync_user_market_membership`], called from the write choke points of the
-// activity predicate: [`save_position`] (position leg) and [`save_buy_orders`] /
-// [`save_sell_orders`] / [`mutate_buy_orders`] / [`mutate_sell_orders`] (order-list legs).
+// activity predicate: [`save_position`] (position leg), [`save_buy_orders`] /
+// [`save_sell_orders`] / [`mutate_buy_orders`] / [`mutate_sell_orders`] (order-list legs) and
+// [`save_user_algo_orders`] (the conditional-order leg).
 // NOTHING reads it yet — it is deliberately inert until the derived-ooIM admission path lands.
 
 /// The markets `user` is active in (ascending). Empty when the user is flat everywhere.
@@ -1553,20 +1556,22 @@ pub fn load_user_markets_ref<H: PerpHost>(
 
 /// Pre-write admission gate for the [`MAX_USER_MARKETS`] cap.
 ///
-/// Called from the VALIDATION phase of order placement — the only way a user can enter a market
-/// they are not already in (a position can only appear through a fill of an order they placed;
-/// a maker fill, a liquidation, an ADL or a funding settlement always acts on a market the user
-/// is already active in). Pure read: it writes nothing, so it is a genuine reject in the
-/// commit-only sense and may precede every write on the path.
+/// Called from the VALIDATION phase of order placement — book (`who` = `"placeOrder"`) and
+/// conditional (`"placeAlgoOrder"`) — the only ways a user can enter a market they are not already
+/// in (a position can only appear through a fill of an order they placed; a maker fill, a
+/// liquidation, an ADL or a funding settlement always acts on a market the user is already active
+/// in). Pure read: it writes nothing, so it is a genuine reject in the commit-only sense and may
+/// precede every write on the path.
 pub fn ensure_user_market_admission<H: PerpHost>(
     context: &mut H,
     user: Address,
     market_id: u64,
+    who: &str,
 ) -> Result<(), PerpError> {
     let markets = load_user_markets_ref(context, user)?;
     if markets.len() >= MAX_USER_MARKETS && markets.binary_search(&market_id).is_err() {
         return Err(perp_err(format!(
-            "placeOrder: user market limit reached ({MAX_USER_MARKETS} markets)"
+            "{who}: user market limit reached ({MAX_USER_MARKETS} markets)"
         )));
     }
     Ok(())
@@ -1664,7 +1669,7 @@ fn user_markets_remove<H: PerpHost>(
 }
 
 /// Ground truth of the membership predicate, read back from storage: does `user` hold a non-zero
-/// position OR any resting order in `market_id`?
+/// position, any resting order or any untriggered conditional order in `market_id`?
 fn user_market_is_active<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -1676,21 +1681,25 @@ fn user_market_is_active<H: PerpHost>(
     if !load_buy_orders_ref(context, user, market_id)?.is_empty() {
         return Ok(true);
     }
-    Ok(!load_sell_orders_ref(context, user, market_id)?.is_empty())
+    if !load_sell_orders_ref(context, user, market_id)?.is_empty() {
+        return Ok(true);
+    }
+    Ok(!load_user_algo_orders(context, user, market_id)?.is_empty())
 }
 
 /// Per-write index maintenance, called AFTER one leg of the activity predicate (the position, the
-/// buy list or the sell list) has been written, with that leg's own before/after emptiness.
+/// buy list, the sell list or the conditional list) has been written, with that leg's own
+/// before/after emptiness.
 ///
 /// Only a leg TRANSITION can change membership, so the common case (`was == now`) costs a single
 /// bool compare and touches no storage:
 /// * leg became non-empty → the user is active here → insert (idempotent: a user who was already
 ///   in the market through another leg writes nothing).
-/// * leg became empty → the user MIGHT have left; consult the other two legs and remove only if
-///   all three are now inactive.
+/// * leg became empty → the user MIGHT have left; consult the other three legs and remove only if
+///   all four are now inactive.
 ///
 /// Evaluating this after the leg's own write is what makes it order-independent: whichever leg
-/// moves last sees the other two in their final state, so any interleaving of the three writes
+/// moves last sees the other three in their final state, so any interleaving of the four writes
 /// converges on the same set.
 fn sync_user_market_membership<H: PerpHost>(
     context: &mut H,
@@ -2338,17 +2347,23 @@ pub fn load_user_algo_orders<H: PerpHost>(
         .unwrap_or_default())
 }
 
+/// Write `user`'s live conditional-order ids in `market_id`. The conditional list is a leg of the
+/// per-user market index's activity predicate (an untriggered conditional is an open order the
+/// account's cancel-all must reach), so its emptiness is read before the write and the index synced
+/// after it, exactly like the book-order lists.
 pub fn save_user_algo_orders<H: PerpHost>(
     context: &mut H,
     user: Address,
     market_id: u64,
     ids: &[[u8; 32]],
 ) -> Result<(), PerpError> {
+    let was_active = !load_user_algo_orders(context, user, market_id)?.is_empty();
     store_blob(
         context,
         user_algo_orders_key(user, market_id),
         &encode(&ids.to_vec())?,
-    )
+    )?;
+    sync_user_market_membership(context, user, market_id, was_active, !ids.is_empty())
 }
 
 pub fn load_bid_prices<H: PerpHost>(
