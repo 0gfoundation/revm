@@ -1927,8 +1927,8 @@ pub(crate) fn reject_provably_unaffordable_limit_order<H: PerpHost>(
     let mut bound = raw_bound.saturating_sub(slack);
 
     // A CROSSED order's own open gain lowers its requirement (see "A CROSS order" above): credit
-    // the most it can be, plus the slack once more for that term's own flooring. Gated off,
-    // nothing is CROSSED in force and the bound is exactly what it was.
+    // the most it can be, plus the slack once more for that term's own flooring. An ISOLATED
+    // order's bound is exactly what it was.
     let cross = crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed;
     if cross {
         let gain_per_unit = match side {
@@ -3175,8 +3175,8 @@ pub(super) const INSUFFICIENT_MARGIN_REJECT: &str =
 /// available balance `A` not covering the order's cost (a cross open's initial margin at the
 /// fills gate; `Δ ooIM` plus its Open Loss at the rest gate; the pre-walk bound) — with Binance's
 /// code, `-2019`, like the two other cross margin refusals of the place path (J1, J6). An
-/// ISOLATED order keeps the uncoded string byte for byte, so gated off nothing changes. Batch
-/// reason `InsufficientMargin` (29), like its isolated twin.
+/// ISOLATED order keeps the uncoded string byte for byte. Batch reason `InsufficientMargin` (29),
+/// like its isolated twin.
 ///
 /// ABI CHANGE (cross P2): a new revert string, reachable only on a position CROSSED in force.
 pub(crate) const CROSS_INSUFFICIENT_MARGIN_REJECT: &str =
@@ -3561,7 +3561,7 @@ fn rest_in_book<H: PerpHost>(
     // silo cash out of the cross wallet). Never a reduce-only order (it cannot open, whatever the
     // conservative opening part says about the orders ahead of it — a fired stop included) nor a
     // pure reduce, which keep B1. An account with no cross position never reaches it, so every
-    // isolated outcome is what it was; gated off nothing is CROSSED in force.
+    // isolated outcome is what it was.
     if fold.has_cross
         && !flags.reduce_only
         && opening_part_of_order(&pos_basis, side, qty) > 0

@@ -515,7 +515,6 @@ impl TakerSettlement {
         // * an account with no cross exposure can never reach it (`has_cross` is false), so every
         //   isolated-only outcome — refusal strings included — is exactly what it was. (It could
         //   not fire there anyway once the gate has passed: `A = W − Σ ooIM ≤ W`, `Σ_C MM = 0`.)
-        // * while cross margin is gated off nothing is CROSSED in force, so it is never reached.
         // * never on an oracle path: a fired conditional is reduce-only.
         // Pre-write, like every other reject in this function.
         if let Some(f) = fold.filter(|_| core.opens) {
@@ -2627,7 +2626,7 @@ impl FillsGate {
 /// lowers by exactly itself. An isolated reduce of an account with cross exposure is the same case
 /// by another door — its fee comes out of the same cross wallet, and the silo it hands back only
 /// raises `A` — so it is not gated either; an account with NO cross exposure keeps the isolated
-/// rule, byte for byte (gated off, nothing else exists).
+/// rule, byte for byte.
 ///
 /// A reduce priced through the account's bankruptcy books the overshoot into `W` (no per-fill bad
 /// debt on a cross wallet) — the "active close through bankruptcy" risk of cross report §5.1,
@@ -2832,7 +2831,7 @@ impl OpeningMarginFunding {
     /// The mode a fill on `pos` settles under: [`Self::Cross`] for a position CROSSED in force
     /// ([`crate::margin_type::effective_margin_type`]), else `isolated` — the caller's ISOLATED
     /// rule. Total (the type gate has no error path), so it is safe on the liquidation and ADL
-    /// paths. While cross margin is gated off this is always `isolated`.
+    /// paths. With cross margin gated off (a test's override) this is always `isolated`.
     #[inline]
     pub(super) fn for_position(pos: &crate::types::PerpPosition, isolated: Self) -> Self {
         debug_assert!(isolated != Self::Cross, "for_position takes the caller's ISOLATED rule");

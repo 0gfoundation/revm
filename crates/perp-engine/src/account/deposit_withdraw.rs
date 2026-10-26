@@ -426,9 +426,8 @@ pub fn run_get_account<H: PerpHost>(
             totalOpenOrderInitialMargin: s.total_open_order_initial_margin,
             totalMaintMargin: s.total_maint_margin,
             availableBalance: s.available_balance,
-            // `Σ uPnL` over the positions CROSSED in force (cross P2). Zero while cross margin is
-            // gated off: every position is ISOLATED in force, so there is no cross position to sum
-            // and all unrealised PnL is in `totalUnrealizedProfit`.
+            // `Σ uPnL` over the positions CROSSED in force (cross P2). Zero for an account with no
+            // cross position, whose unrealised PnL is all in `totalUnrealizedProfit`.
             totalCrossUnPnl: s.total_cross_unrealized_profit,
             // Binance's `max(0, min(cWB − Σ isoOpenOrderIM − Σ crossMM, availableBalance))` (cross
             // P2) — `max(0, availableBalance)` for an account with no cross position. Floors at

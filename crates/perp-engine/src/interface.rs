@@ -3,6 +3,21 @@ use alloy_sol_types::sol;
 
 sol! {
     interface IPerpDex {
+        // ⚠️ ABI CHANGE (cross P3): THE DEFAULT MARGIN TYPE IS CROSSED. Cross margin is live
+        // (`types::CROSS_MARGIN_ENABLED = true`). A `(user, marketId)` whose owner never called
+        // `setMarginType` is CROSSED — Binance's default ("All contracts and positions are
+        // defaulted to the Cross Margin mode"); until this change every position was ISOLATED in
+        // force. A CROSSED position holds no isolated silo (`isolatedMargin` / `isolatedWallet`
+        // 0): its initial margin is derived into `availableBalance`, its realized PnL, fees and
+        // funding settle into the cross wallet (`totalCrossWalletBalance`, which may go negative),
+        // and it is liquidated at ACCOUNT level, across every cross market at once, when
+        // `crossMarginBalance < totalCrossMaintMargin` (`CrossLiquidationStarted` …
+        // `CrossLiquidationEnded`). Every surface that reports a margin type — the
+        // `AccountPosition` row, `PositionChanged`, `getSymbolConfig`, `Liquidation` — reports `0`
+        // for such a position. A client that wants isolated margin calls
+        // `setMarginType(marketId, 1)` in each market while it holds no position and no open order
+        // there (`-4048` / `-4047` otherwise); the choice is kept across flat, like `leverage`.
+
         // ── Admin ─────────────────────────────────────────────────────────────
         /// Initialise the admin address. Can only be called once (when no admin is set).
         function initAdmin(address admin) external;
@@ -259,10 +274,9 @@ sol! {
         /// Setting (cross P1):
         ///   marginType            the margin type IN FORCE for this `(user, marketId)`: `0` =
         ///                         CROSSED, `1` = ISOLATED — Binance's `marginType` (and its V2
-        ///                         `isolated == (marginType == 1)`). The EFFECTIVE type, not the
-        ///                         stored choice: while cross margin is not enabled
-        ///                         (`types::CROSS_MARGIN_ENABLED`, off through the cross series'
-        ///                         P1–P3) EVERY row reports `1`, whatever was stored. One function
+        ///                         `isolated == (marginType == 1)`). The EFFECTIVE type — since
+        ///                         the cross flip (P3) the stored choice itself, `0` for a market
+        ///                         whose owner never chose (Binance's default). One function
         ///                         decides it (`margin_type::effective_margin_type`), and
         ///                         `getSymbolConfig` and `PositionChanged` report the same value.
         ///                         Like `leverage` it is a setting that survives the position
@@ -437,13 +451,13 @@ sol! {
         /// `marketId`, and the backend maps id → symbol itself from the `MarketAdded` log (a string
         /// repeated in 16 rows is calldata spent on data the caller already has). `isolated`:
         /// DERIVED from the row's `marginType` (`isolated == (marginType == 1)`) — no longer a
-        /// constant since cross P1, though while cross margin is gated off every row still reports
-        /// ISOLATED. `positionSide`: always `BOTH` — one-way mode only. A backend serving a
+        /// constant since cross P1, and `false` by default since the cross flip (P3), as on
+        /// Binance. `positionSide`: always `BOTH` — one-way mode only. A backend serving a
         /// Binance-shaped `/account` fills those three in itself, from the row, a constant and its
         /// own market table.
         ///
         /// ⚠️ `totalCrossUnPnl` AND `maxWithdrawAmount`: real since cross P2, but DEGENERATE for an
-        /// account with no CROSSED position (every account while cross margin is gated off). Read
+        /// account with no CROSSED position (one that chose ISOLATED in every market). Read
         /// this before using either — both were once deliberately omitted, and one of those reasons
         /// still bites.
         ///
@@ -453,13 +467,12 @@ sol! {
         ///
         /// * `totalCrossUnPnl` — Binance's `Σ uPnL` over the account's CROSSED positions — the
         ///   real sum since cross P2 (`Σ positions[i].unrealizedProfit` over the rows with
-        ///   `marginType == 0`; a row whose mark is `0` contributes `0`). It is still ZERO while
-        ///   cross margin is not enabled (`types::CROSS_MARGIN_ENABLED`, off through the cross
-        ///   series' P1–P2 and most of P3): every position is ISOLATED in force, so there is no
-        ///   cross position to sum and all unrealised PnL is in `totalUnrealizedProfit`. It is
-        ///   **NOT a constant** — it is non-zero for any account holding a CROSSED position once
-        ///   the gate flips. Bind to it like Binance's field and keep the cross-vs-isolated split;
-        ///   do not hardcode `0`.
+        ///   `marginType == 0`; a row whose mark is `0` contributes `0`). It is ZERO only for an
+        ///   account with no CROSSED position, whose unrealised PnL is all in
+        ///   `totalUnrealizedProfit`. It is **NOT a constant** — since the cross flip (P3) every
+        ///   position is CROSSED unless its owner chose ISOLATED, so it is non-zero for most
+        ///   accounts. Bind to it like Binance's field and keep the cross-vs-isolated split; do not
+        ///   hardcode `0`.
         ///   NAME: this was `crossUnPnl` until the rename below. Binance has BOTH spellings and
         ///   they live at different levels — `crossUnPnl` on an `assets[]` ROW, `totalCrossUnPnl`
         ///   as the ACCOUNT-LEVEL scalar. This is the account-level one, so the per-asset spelling
@@ -1153,9 +1166,8 @@ sol! {
         ///                     informative once `setMarginTiers` installs a real table.
         ///   marginType        the margin type IN FORCE: `0` = CROSSED, `1` = ISOLATED — the
         ///                     same effective value every `AccountPosition` row and
-        ///                     `PositionChanged` carry. While cross margin is not enabled
-        ///                     (`types::CROSS_MARGIN_ENABLED`, off through the cross series' P1–P3)
-        ///                     it is `1` for every user in every market.
+        ///                     `PositionChanged` carry. `0` for a market whose owner never chose
+        ///                     (Binance's default, since the cross flip — P3).
         ///                     ⚠️ ABI CHANGE (cross P1): APPENDED as a third return word, after the
         ///                     two existing ones, rather than first as in Binance's JSON — so a
         ///                     decoder reading the old two words still finds them where they were.
@@ -1204,13 +1216,13 @@ sol! {
         ///      exists position.`;
         ///   5. the account is being liquidated — `-2023 User in liquidation mode now.` (its
         ///      liquidation flag, set and cleared by cross liquidation, P3 — between
-        ///      `CrossLiquidationStarted` and `CrossLiquidationEnded`);
-        ///   6. CROSSED requested while cross margin is not enabled — `setMarginType: CROSSED
-        ///      margin is not enabled yet`.
-        /// "In force" in 2 is the EFFECTIVE type `getSymbolConfig` reports. While cross margin is
-        /// not enabled that is ISOLATED for everyone, so this selector then changes nothing:
-        /// ISOLATED is `-4046` and CROSSED is refusal 6 (after 3–5, so a caller learns the
-        /// blocking open order or position first, as it will once the gate lifts).
+        ///      `CrossLiquidationStarted` and `CrossLiquidationEnded`).
+        /// "In force" in 2 is the EFFECTIVE type `getSymbolConfig` reports: CROSSED for a market
+        /// the caller never switched (Binance's default, since the cross flip — P3), so the first
+        /// call a new user makes to go isolated is `setMarginType(marketId, 1)`, and
+        /// `setMarginType(marketId, 0)` is `-4046` until then. (Before the flip a sixth refusal,
+        /// `setMarginType: CROSSED margin is not enabled yet`, refused every CROSSED request after
+        /// 3–5; the build no longer reaches it.)
         ///
         /// Success writes only the position record's type byte and emits `MarginTypeChanged`. It
         /// emits NO `AccountBalanceChanged`: with no position and no order in the market, no
@@ -1759,8 +1771,7 @@ sol! {
         /// un-flagged — through ANY `marketId`, one where it holds no position included (the way
         /// out for a flag that outlived the account's last cross position). ⚠️ ABI CHANGE (cross
         /// P3): the P2 refusal `liquidate: position is CROSSED —
-        /// account-level cross liquidation is not live yet` is gone. Unreachable while cross
-        /// margin is gated off.
+        /// account-level cross liquidation is not live yet` is gone.
         function liquidate(address user, uint64 marketId) external;
 
         // ── Insurance Fund ────────────────────────────────────────────────
@@ -2528,8 +2539,8 @@ sol! {
         ///                     the algebraic inverse of the `calc_value` the fills used.
         ///   marginType        the margin type IN FORCE for this `(user, marketId)`, `0` = CROSSED,
         ///                     `1` = ISOLATED — the same effective value `AccountPosition.marginType`
-        ///                     and `getSymbolConfig` report. While cross margin is not enabled
-        ///                     (`types::CROSS_MARGIN_ENABLED`, cross series P1–P3) it is always `1`.
+        ///                     and `getSymbolConfig` report: `0` for a market whose owner never
+        ///                     chose (Binance's default, since the cross flip — P3).
         ///                     ⚠️ ABI CHANGE (cross P1): APPENDED as the last field, so the event
         ///                     SIGNATURE — and topic0 — changed. An indexer filtering on the old
         ///                     topic0 sees no `PositionChanged` at all; regenerate the binding.

@@ -317,7 +317,7 @@ pub enum PerpBatchReason {
     /// owner's account is in liquidation and the item is not reduce-only (owner decision Q11).
     ///
     /// ⚠️ ABI CHANGE (cross P2): a new reason value a status decoder must learn. Set by cross
-    /// liquidation (P3) — unreachable while cross margin is gated off.
+    /// liquidation (P3), reachable since the cross flip.
     UserInLiquidation = 35,
     /// A checked-arithmetic guard (`… overflow` / `… underflow` / `exceeds i64…`), matched
     /// structurally because the engine has ~30 of them and they are all

@@ -181,7 +181,7 @@ pub struct MarginInfo {
     pub cumulative_realized_pnl: i64,
     /// The margin type IN FORCE ([`crate::types::MarginType`]'s wire code) — from
     /// [`crate::margin_type::effective_margin_type`], the gate every surface shares, never the raw
-    /// stored byte. ISOLATED (`1`) for every position while cross margin is not enabled.
+    /// stored byte: CROSSED (`0`) for a position whose owner never chose (Binance's default).
     pub margin_type: u8,
 }
 
@@ -583,8 +583,8 @@ pub fn margin_info_of(
 // ```
 //
 // For an account with no position CROSSED in force every cross term is 0, so `cWB = W`,
-// `A = W − Σ ooIM` (the isolated admission basis, unchanged) and `X = max(0, A)`. While cross
-// margin is gated off (`types::CROSS_MARGIN_ENABLED`) that is every account.
+// `A = W − Σ ooIM` (the isolated admission basis, unchanged) and `X = max(0, A)` — an account
+// that chose ISOLATED everywhere (and, with `types::CROSS_MARGIN_ENABLED` off, every account).
 
 /// One market's terms in the [`CrossFold`]. Pure data, produced by [`cross_leg`].
 ///
@@ -985,8 +985,8 @@ pub fn total_open_order_initial_margin<H: PerpHost>(
 /// A = cWB + Σ_C (uPnL_k − PIM_k) − Σ_{C∪I} ooIM_k          (see the notation block on CrossLeg)
 /// ```
 ///
-/// which, for an account with no position CROSSED in force (every account while cross margin is
-/// gated off), is the isolated basis it always was:
+/// which, for an account with no position CROSSED in force (one that chose ISOLATED everywhere),
+/// is the isolated basis it always was:
 ///
 /// ```text
 /// available = perp_wallet_balance − Σ_markets ooIM
@@ -1145,8 +1145,7 @@ pub fn run_get_position_risk<H: PerpHost>(
     // liquidation price depends on the cross wallet and every other cross leg, so the row needs
     // the account fold — the index walk `getAccount` makes, under the same flat 20_000 (see the
     // gas note in `call`). Only an open cross position takes it: an ISOLATED row, or a flat one,
-    // is complete as computed and costs exactly the two loads it always did. While cross margin is
-    // gated off no row takes it.
+    // is complete as computed and costs exactly the two loads it always did.
     let crossed = row.info.margin_type == crate::types::MarginType::Crossed.code();
     if crossed && row.info.position_amt != 0 {
         let fold = cross_fold_checked(context, args.user, None, None, None)?;
@@ -1593,8 +1592,8 @@ pub fn fold_account_margin<H: PerpHost, I: IntoIterator<Item = u64>>(
 /// ```
 ///
 /// (cross P2; the cross terms come from [`CrossSums::finish`], the formulas the admission basis
-/// uses.) With no position CROSSED in force — every account while cross margin is gated off —
-/// `cWB` is the stored wallet, `crossMarginBalance` is the wallet, `availableBalance` is
+/// uses.) With no position CROSSED in force — an account that chose ISOLATED everywhere — `cWB`
+/// is the stored wallet, `crossMarginBalance` is the wallet, `availableBalance` is
 /// `totalCrossWalletBalance − totalOpenOrderInitialMargin` and `maxWithdrawAmount` is
 /// `max(0, availableBalance)`, exactly as before.
 ///

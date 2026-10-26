@@ -7022,6 +7022,15 @@ mod golden {
     /// Nothing else moves. Prior value 0x8c500d81725e79c199fc06ab19800c60c25a914672399c09d6110ef2d5c2a62c
     /// (39, P2 cross accounting).
     ///
+    /// Re-pinned again within 39 for the P3 FLIP (R8, `CROSS_MARGIN_ENABLED = true`): a position
+    /// that never chose is CROSSED in force, so this scenario — which pins ISOLATED margin — has
+    /// ALICE, BOB and CAROL call `setMarginType(ISOLATED)` on the flat market first (Phase 3b).
+    /// Their position records store 1 where they stored 0; nothing else in the write set moves.
+    /// VERIFIED: with the gate forced off and the three switches skipped, the scenario reproduced
+    /// the previous pin 0xaea562b9…1e61. `BusinessSnapshot` UNCHANGED — the flip moves none of it.
+    /// Prior value 0xaea562b976f3f646a94f8cfbf468c1caf8e7c7465e30f351f3fb8ec719c91e61 (39, P3
+    /// clearance fee).
+    ///
     /// Prior values 0x7deaa0263925b95e203cf08b43fbf93b34f7af725d19933d6e72510cd6c86637 (39, P1
     /// margin type), 0xafd826451ed6c8e356b03def92beb67c4e2431333141b39bfc21aeef4f057b48 (39, P0
     /// maintenance-rate column), 0x37a18141947ba3bb4fe923fe0e05a07d4dc0a8d1987096250991ed7d0f3f79de (38,
@@ -7041,7 +7050,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0xaea562b976f3f646a94f8cfbf468c1caf8e7c7465e30f351f3fb8ec719c91e61");
+        b256!("0xfdf928b54c849a832e948e32d20b951490ebdc33c54c38254a13f10351a147d4");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -7639,6 +7648,22 @@ mod golden {
             }
             .abi_encode(),
         );
+
+        // Phase 3b — margin type. This scenario pins ISOLATED margin: since the cross flip a
+        // never-set position is CROSSED (Binance's default), so every trader chooses ISOLATED on
+        // the flat, order-free market first — the switch a real user makes, with its
+        // `MarginTypeChanged`. The cross scenario is `cross_golden`.
+        for user in [ALICE, BOB, CAROL] {
+            dex_call(
+                &mut ctx,
+                user,
+                &crate::interface::IPerpDex::setMarginTypeCall {
+                    marketId: MARKET_ID,
+                    marginType: crate::types::MarginType::Isolated.code(),
+                }
+                .abi_encode(),
+            );
+        }
 
         // Phase 4 — leverage.
         dex_call(

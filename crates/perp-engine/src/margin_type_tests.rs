@@ -470,6 +470,33 @@ fn rejects_after_burn(ctx: &mut TestCtx, input: &[u8], expect: &str) {
 
 // ── setMarginType: gated off (production) ─────────────────────────────────────
 
+/// The flip (cross P3, R8): production ships cross margin ON — no override in play — so a market
+/// nobody switched is CROSSED on every surface and in its fills (no silo: the cross wallet carries
+/// it), `setMarginType(CROSSED)` is `-4046`, and the switch goes to ISOLATED and back.
+#[test]
+fn production_ships_cross_margin_on_and_the_default_is_crossed() {
+    let mut ctx = make_ctx();
+    assert!(crate::types::CROSS_MARGIN_ENABLED);
+    assert_eq!(crate::margin_type::test_gate::forced(), None, "no override");
+    assert!(crate::margin_type::cross_margin_enabled());
+    assert_eq!(stored(&mut ctx, ALICE).margin_type, CROSSED, "the stored default");
+    assert_eq!(reported_type(&mut ctx, ALICE), CROSSED, "a never-touched market");
+    rejects(&mut ctx, ALICE, &set_type(MARKET_ID, CROSSED), E_NO_NEED);
+    switches(&mut ctx, ALICE, ALICE, &set_type(MARKET_ID, ISOLATED), ISOLATED);
+    switches(&mut ctx, ALICE, ALICE, &set_type(MARKET_ID, CROSSED), CROSSED);
+
+    // A fill on two never-switched records: both rows CROSSED, neither position holds a silo.
+    trade(&mut ctx, BOB, ALICE, 0);
+    let rows = position_rows(&JournalTr::take_logs(ctx.journal_mut()));
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.marginType == CROSSED));
+    for u in [ALICE, BOB] {
+        assert_eq!(reported_type(&mut ctx, u), CROSSED);
+        assert_ne!(stored(&mut ctx, u).amount, 0);
+        assert_eq!(stored(&mut ctx, u).margin, 0, "a cross position has no silo");
+    }
+}
+
 /// Gated off, the switch can change nothing: ISOLATED is already in force for every stored value
 /// (`-4046`), CROSSED meets the gate — and every refusal writes nothing.
 #[test]

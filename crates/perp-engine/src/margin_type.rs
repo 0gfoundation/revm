@@ -1,13 +1,15 @@
-//! Margin type — Binance's `marginType` (CROSSED / ISOLATED), cross-margin series P1.
+//! Margin type — Binance's `marginType` (CROSSED / ISOLATED), cross-margin series P1, live since
+//! the P3 flip.
 //!
-//! # What exists, and what does not yet
+//! # The gate
 //!
 //! Every position record carries the owner's STORED choice ([`PerpPosition::margin_type`]); this
-//! module owns the rule that turns it into the type IN FORCE ([`effective_margin_type`]). Cross
-//! accounting (P2) and cross liquidation (P3) do not exist yet, so the rule is GATED: while
-//! [`CROSS_MARGIN_ENABLED`] is `false` every position is ISOLATED in force, and every margin rule,
-//! view and event behaves exactly as it did before the field existed. The gate flips as the last
-//! step of P3.
+//! module owns the rule that turns it into the type IN FORCE ([`effective_margin_type`]). The rule
+//! is gated by [`CROSS_MARGIN_ENABLED`]: it was `false` through P1, P2 and P3's build-up — every
+//! position ISOLATED in force, every margin rule, view and event as before the field existed —
+//! and flipped to `true` as the last step of P3, once cross accounting (P2) and cross liquidation
+//! (P3) existed. Since then the stored choice is in force, and a position whose owner never chose
+//! is CROSSED, Binance's default ([`never_set_position`]).
 //!
 //! Every reader of the type goes through [`effective_margin_type`] — the `AccountPosition` row,
 //! `PositionChanged` and `getSymbolConfig` today — so the gate lives in one place and the three
@@ -19,9 +21,9 @@
 //! [`run_set_margin_type_signed`]) are Binance's `POST /fapi/v1/marginType`: validate-then-apply
 //! (commit-only #23), every refusal before the one write, the write through
 //! [`storage::save_position_margin_type_only`] (no hooks, no snapshot), then `MarginTypeChanged`.
-//! Only a flat, order-free market can switch, so nothing a balance row carries can move. While the
-//! gate is off the switch changes nothing: ISOLATED is already in force (`-4046`) and CROSSED is
-//! refused.
+//! Only a flat, order-free market can switch, so nothing a balance row carries can move. The gate
+//! is the switch's last refusal: with it off (a test's override; the build before the flip) the
+//! switch changes nothing — ISOLATED is already in force (`-4046`) and CROSSED is refused.
 
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
@@ -177,8 +179,8 @@ pub fn run_set_margin_type<H: PerpHost>(
 /// * BEFORE: decode, refusal 0 (an invalid type code), key / recvWindow / expiry / signature, the
 ///   duplicate check, refusal 1 (unknown market — markets are never deleted).
 /// * AFTER, inside the shared core, in exactly the direct path's order and with its strings:
-///   `-4046`, `-4047`, `-4048`, `-2023`, the gate. The gate is constant for a given build,
-///   but it lifts at the P3 flip and it is the LAST check of the shared core, so keeping it there
+///   `-4046`, `-4047`, `-4048`, `-2023`, the gate. The gate is constant for a given build
+///   (it lifted at the P3 flip) and it is the LAST check of the shared core, so keeping it there
 ///   keeps the two paths' refusal precedence identical; a signature burned on it is one the owner
 ///   signed for a mode the build does not offer.
 pub fn run_set_margin_type_signed<H: PerpHost>(
@@ -253,8 +255,9 @@ fn set_margin_type_core<H: PerpHost>(
     let mut pos = storage::load_position(context, account, market_id)?;
 
     // 2. Already in force — the EFFECTIVE type, the one `getSymbolConfig` reports, not the stored
-    //    byte. While the gate is off everyone is ISOLATED in force, so asking for ISOLATED is
-    //    Binance's "no need", even for a record that still stores the CROSSED default.
+    //    byte: a record that never chose is CROSSED in force (Binance's default), so asking for
+    //    CROSSED is Binance's "no need". (With the gate off everyone is ISOLATED in force, and
+    //    ISOLATED is "no need" even for a record that stores the CROSSED default.)
     if effective_margin_type(&pos) == requested {
         return Err(perp_err("setMarginType: -4046 No need to change margin type."));
     }
@@ -286,7 +289,9 @@ fn set_margin_type_core<H: PerpHost>(
         return Err(perp_err("setMarginType: -2023 User in liquidation mode now."));
     }
 
-    // 6. The gate: CROSSED cannot be chosen until cross margin exists.
+    // 6. The gate: CROSSED cannot be chosen while cross margin is off. Live since the P3 flip, so
+    //    production never reaches it; kept as the gate's last refusal for a build (or a test's
+    //    override) that turns it off.
     if requested == MarginType::Crossed && !cross_margin_enabled() {
         return Err(perp_err("setMarginType: CROSSED margin is not enabled yet"));
     }

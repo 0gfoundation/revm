@@ -415,6 +415,17 @@ use primitives::{B256, U256};
 //     comparison is exact (512-bit cross-multiplication) for every winner. An ISOLATED winner's
 //     ROE order is the one the saturating comparator gave wherever it did not saturate, so no
 //     isolated ADL moves: the golden pin 0xaea562b9…1e61 is unchanged, BusinessSnapshot UNCHANGED.
+//   * P3 — THE FLIP (R8): `CROSS_MARGIN_ENABLED = true`. An EXECUTION-RULE change, no layout
+//     change: the stored margin type is now in force, so a position whose owner never chose —
+//     stored 0, Binance's default — is CROSSED (the shared cross wallet, no silo, account-level
+//     liquidation), and `setMarginType(CROSSED)` succeeds after the §3.6 checks. The golden
+//     scenario pins ISOLATED margin, so its three traders now choose ISOLATED explicitly
+//     (`setMarginType` on the flat market before any order): their position records store 1
+//     where they stored 0, the only difference in the write set — VERIFIED: with the gate forced
+//     off and the three switches skipped the scenario reproduced the previous pin
+//     0xaea562b9…1e61. BusinessSnapshot UNCHANGED (the flip moves none of it; R7's earlier
+//     two-field delta stands). Golden re-pinned 0xaea562b9…1e61 → 0xfdf928b5…47d4. CHAIN change:
+//     a coordinated wipe on deploy.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

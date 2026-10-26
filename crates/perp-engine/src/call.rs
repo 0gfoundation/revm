@@ -408,8 +408,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // account (its liquidation price depends on the cross wallet and every other cross leg),
         // so that row also walks the user's market index — ≤ MAX_USER_MARKETS × {market, position}
         // = ≤ 33 `_ref` loads, exactly `getAccount`'s walk, which this tier already prices at
-        // 20_000. Every other row (ISOLATED, or flat) keeps its two loads; while cross margin is
-        // gated off no row walks.
+        // 20_000. Every other row (ISOLATED, or flat) keeps its two loads.
         m.insert(getPositionRiskCall::SELECTOR, (20_000, true));
         m.insert(getAccountMarginCall::SELECTOR, (50_000, true));
         // +10_000 each for the single `AccountBalanceChanged` snapshot they emit (see "Account").

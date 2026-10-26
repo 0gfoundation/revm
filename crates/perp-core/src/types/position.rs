@@ -198,11 +198,11 @@ pub struct PerpPosition {
     ///
     /// # It is the STORED choice, not the type in force
     ///
-    /// Read it through `perp_engine::margin_type::effective_margin_type`, never directly: while
-    /// [`CROSS_MARGIN_ENABLED`] is `false` every position is ISOLATED whatever this byte says, and
-    /// that function is the one place the rule lives. A default (zero) byte is CROSSED because
-    /// that is Binance's default ("All contracts and positions are defaulted to the Cross Margin
-    /// mode") — so the day the gate flips, every position that never chose becomes CROSSED.
+    /// Read it through `perp_engine::margin_type::effective_margin_type`, never directly: with
+    /// [`CROSS_MARGIN_ENABLED`] off every position is ISOLATED whatever this byte says, and that
+    /// function is the one place the rule lives. A default (zero) byte is CROSSED because that is
+    /// Binance's default ("All contracts and positions are defaulted to the Cross Margin mode") —
+    /// so since the gate flipped (cross P3), every position that never chose is CROSSED.
     ///
     /// # Kept across flat, like `leverage`
     ///
@@ -244,7 +244,7 @@ impl Default for PerpPosition {
             // trivially right is `leverage`, which is 1 rather than 0.
             cumulative_realized_pnl: 0,
             generation: 0,
-            // Binance's default. Not in force while `CROSS_MARGIN_ENABLED` is off.
+            // Binance's default: a position that never chose is CROSSED.
             margin_type: MarginType::Crossed as u8,
         }
     }
@@ -252,19 +252,21 @@ impl Default for PerpPosition {
 
 // ── Margin type ───────────────────────────────────────────────────────────
 
-/// **Is CROSS margin mode live?** `false` through the cross-margin series' P1–P2 and most of P3;
-/// flipped to `true` as the LAST step of P3, once cross accounting and cross liquidation exist.
+/// **Is CROSS margin mode live?** Yes: `false` through the cross-margin series' P1–P2 and most of
+/// P3, flipped to `true` as the LAST step of P3, once cross accounting and cross liquidation
+/// existed.
 ///
-/// While `false`:
-/// * every position is ISOLATED in force, whatever its stored [`PerpPosition::margin_type`] says
-///   ([`MarginType::effective`]), so every margin rule, view and event behaves exactly as it did
-///   before the field existed;
-/// * `setMarginType(CROSSED)` is refused, and `setMarginType(ISOLATED)` is `-4046` (it already is).
+/// While `true` the stored [`PerpPosition::margin_type`] is in force ([`MarginType::effective`]),
+/// so a position that never chose is CROSSED (Binance's default) and `setMarginType` switches
+/// both ways. Were it `false`:
+/// * every position would be ISOLATED in force, whatever its stored byte says, so every margin
+///   rule, view and event would behave exactly as it did before the field existed;
+/// * `setMarginType(CROSSED)` would be refused, and `setMarginType(ISOLATED)` `-4046`.
 ///
 /// A plain `const`, deliberately: consensus code must not read a runtime switch. The engine's
-/// tests enable it per thread through a `#[cfg(test)]`-only override in
+/// tests can force it on or off per thread through a `#[cfg(test)]`-only override in
 /// `perp_engine::margin_type`, which compiles out of every non-test build.
-pub const CROSS_MARGIN_ENABLED: bool = false;
+pub const CROSS_MARGIN_ENABLED: bool = true;
 
 /// A position's margin mode — Binance's `marginType`. One-way mode only: one type per
 /// `(user, market)`, chosen per market (Binance: "Switching the margin mode will only apply to the
