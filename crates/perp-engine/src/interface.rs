@@ -1792,9 +1792,10 @@ sol! {
         /// maintenance, ADL what the book does not take — within a 16-step budget, the rest left to
         /// the next tick (`CrossLiquidationStarted` / `Liquidation` / `CrossLiquidationEnded`). An
         /// account flagged by an earlier unfinished episode is resumed — or, recovered since,
-        /// un-flagged — through ANY `marketId`, one where it holds no position included (the way
-        /// out for a flag that outlived the account's last cross position). ⚠️ ABI CHANGE (cross
-        /// P3): the P2 refusal `liquidate: position is CROSSED —
+        /// un-flagged — through ANY `marketId`: one where it holds no position, a CROSSED one, or
+        /// an ISOLATED one whose position is not itself below maintenance (one that is, is
+        /// liquidated by the call as an isolated position — call again for the episode). ⚠️ ABI
+        /// CHANGE (cross P3): the P2 refusal `liquidate: position is CROSSED —
         /// account-level cross liquidation is not live yet` is gone.
         function liquidate(address user, uint64 marketId) external;
 

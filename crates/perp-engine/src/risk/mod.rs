@@ -1415,9 +1415,11 @@ pub(crate) fn charge_clearance_fee<H: PerpHost>(
 /// fresh [`cross_liquidation::MANUAL_CROSS_STEP_BUDGET`] steps and [`ADL_BUDGET_PER_UPDATE`] ADL
 /// fills (what it leaves becomes a continuation, like the sweep's). A healthy account is refused
 /// before any write; a flagged one that has recovered is un-flagged, and that is the call's effect
-/// — reachable through ANY market for a flagged account, a market where it holds nothing included.
-/// A market whose mark is stale is skipped here too (Q10: a keeper cannot force a close at a price
-/// the oracle has stopped publishing); once it ticks again, this call closes it. Gas stays flat.
+/// — reachable through ANY market for a flagged account: one where it holds nothing, a CROSSED
+/// one, or an ISOLATED one whose position is not itself liquidatable (P3 review — one that is, is
+/// liquidated by the call like any isolated position, and the keeper calls again). A market whose
+/// mark is stale is skipped here too (Q10: a keeper cannot force a close at a price the oracle has
+/// stopped publishing); once it ticks again, this call closes it. Gas stays flat.
 pub fn run_liquidate<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,
@@ -1452,31 +1454,7 @@ pub fn run_liquidate<H: PerpHost>(
         }
     };
     if route_to_episode {
-        let mut budget = cross_liquidation::MANUAL_CROSS_STEP_BUDGET;
-        let mut adl_budget = ADL_BUDGET_PER_UPDATE;
-        // No sweep owns this call: the episode writes any continuation to its market's
-        // `deferred_work` directly, so this stays false.
-        let mut deferred = false;
-        let caller = cross_liquidation::EpisodeCaller {
-            sweep_market: None,
-            fresh_market: None,
-            liquidator: caller,
-        };
-        return match cross_liquidation::liquidate_cross_account(
-            context,
-            args.user,
-            args.marketId,
-            caller,
-            &mut budget,
-            &mut adl_budget,
-            &mut deferred,
-        )? {
-            cross_liquidation::CrossLiquidationOutcome::Healthy => {
-                Err(perp_err(LIQUIDATE_CROSS_HEALTHY_REJECT))
-            }
-            cross_liquidation::CrossLiquidationOutcome::Recovered
-            | cross_liquidation::CrossLiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
-        };
+        return run_liquidate_episode(context, args.user, args.marketId, caller);
     }
 
     let mut adl_budget = ADL_BUDGET_PER_UPDATE;
@@ -1496,9 +1474,52 @@ pub fn run_liquidate<H: PerpHost>(
     )? {
         LiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
         LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
+        // An ISOLATED position above its own maintenance: nothing written (`liquidate_position`
+        // validates before it writes). For a FLAGGED account the call is the episode's instead —
+        // a keeper told "any `marketId`" may well pick the market of a healthy isolated position
+        // (P3 review) — and the episode judges the account for itself.
         LiquidationOutcome::AboveMaintenance => {
+            if storage::load_account_ref(context, args.user)?.in_liquidation() {
+                return run_liquidate_episode(context, args.user, args.marketId, caller);
+            }
             Err(perp_err("liquidate: position is above maintenance margin"))
         }
+    }
+}
+
+/// `liquidate()`'s cross route: the account-level episode for `user` starting at `market_id`, with
+/// a fresh [`cross_liquidation::MANUAL_CROSS_STEP_BUDGET`] steps and [`ADL_BUDGET_PER_UPDATE`] ADL
+/// fills. A healthy, unflagged account is refused before any write.
+fn run_liquidate_episode<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    liquidator: Address,
+) -> Result<Bytes, PerpError> {
+    let mut budget = cross_liquidation::MANUAL_CROSS_STEP_BUDGET;
+    let mut adl_budget = ADL_BUDGET_PER_UPDATE;
+    // No sweep owns this call: the episode writes any continuation to its market's `deferred_work`
+    // directly, so this stays false.
+    let mut deferred = false;
+    let caller = cross_liquidation::EpisodeCaller {
+        sweep_market: None,
+        fresh_market: None,
+        liquidator,
+    };
+    match cross_liquidation::liquidate_cross_account(
+        context,
+        user,
+        market_id,
+        caller,
+        &mut budget,
+        &mut adl_budget,
+        &mut deferred,
+    )? {
+        cross_liquidation::CrossLiquidationOutcome::Healthy => {
+            Err(perp_err(LIQUIDATE_CROSS_HEALTHY_REJECT))
+        }
+        cross_liquidation::CrossLiquidationOutcome::Recovered
+        | cross_liquidation::CrossLiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
     }
 }
 

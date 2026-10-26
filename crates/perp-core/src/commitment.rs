@@ -469,6 +469,9 @@ use primitives::{B256, U256};
 //     rank is the same expression as before. An EXECUTION-RULE change (which holder an ADL takes
 //     first). The golden scenarios' ADLs rank no losing isolated holder against another: both
 //     pins unchanged, BusinessSnapshot UNCHANGED.
+//   * P3 review — `liquidate(user, m)` on a FLAGGED account whose ISOLATED position in `m` is not
+//     liquidatable runs the account's episode (resume, or end on recovery) instead of refusing.
+//     Reachable only on a flagged account: both pins unchanged, BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

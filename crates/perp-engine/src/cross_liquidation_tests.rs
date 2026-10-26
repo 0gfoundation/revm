@@ -1204,6 +1204,47 @@ fn liquidate_ends_a_recovered_flag_through_any_market() {
     ok(&mut ctx, ALICE, &order(M1, BUY, px(90), 1, GTC));
 }
 
+/// **…a market where it holds an ISOLATED position included** (P3 review). ALICE: cross longs on
+/// M1 and M2 and an ISOLATED long on M3; M1's tick takes her account under maintenance while M2's
+/// mark is stale, so the episode closes M1, skips M2 and leaves her flagged. She then recovers (a
+/// deposit). `liquidate(ALICE, M3)` — the market of her healthy isolated position — used to take
+/// the per-position isolated path, refuse "position is above maintenance margin" and leave the
+/// flag; now, the isolated position not being liquidatable, the call falls through to the episode,
+/// which finds the account healthy and ends it. An isolated position that IS below its own
+/// maintenance is still liquidated by that call, and an unflagged account's healthy one is still
+/// refused.
+#[test]
+fn liquidate_resumes_a_flagged_account_through_its_isolated_market() {
+    let mut ctx = make_ctx();
+    set_type(&mut ctx, ALICE, M3, ISOLATED);
+    set_leverage(&mut ctx, ALICE, M3, 1);
+    trade(&mut ctx, M3, ALICE, CAROL, BUY, px(100), 1);
+    longs_on_m1_and_m2(&mut ctx, usd(200));
+    set_mark(&mut ctx, M2, px(90));
+    ctx.block.timestamp = U256::from(10_000);
+    let mut ledger = Ledger::open(&mut ctx);
+    tick_at(&mut ctx, M1, px(70), 10_000);
+    assert!(flagged(&mut ctx, ALICE), "M2 is stale: the episode could not finish");
+    assert_eq!(pos(&mut ctx, ALICE, M2).amount, 10);
+    deposit(&mut ctx, &mut ledger, ALICE, usd(10_000));
+    assert!(!fold(&mut ctx, ALICE).below_cross_maintenance(), "recovered");
+
+    let logs = ok(&mut ctx, KEEPER, &liquidate(ALICE, M3));
+    ledger.check(&mut ctx, "after liquidate(M3)");
+    let ended = evs::<CrossLiquidationEnded>(&logs);
+    assert_eq!((ended.len(), ended[0].marketId), (1, M3));
+    assert!(evs::<Liquidation>(&logs).is_empty(), "nothing closed");
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_eq!((pos(&mut ctx, ALICE, M2).amount, pos(&mut ctx, ALICE, M3).amount), (10, 1));
+    // Unflagged now: the healthy isolated position is refused as ever.
+    rejects(
+        &mut ctx,
+        KEEPER,
+        &liquidate(ALICE, M3),
+        "liquidate: position is above maintenance margin",
+    );
+}
+
 // ── The flag never outlives the last cross position ─────────────────────────────
 
 /// **The flag ends with the account's last cross position, whatever closed it.** ALICE is flagged
