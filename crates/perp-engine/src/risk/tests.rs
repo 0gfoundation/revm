@@ -1729,7 +1729,7 @@ fn remove_margin_rejected_after_funding_writes_nothing() {
 
     let err = remove_position_margin(&mut ctx, 1_000_000).unwrap_err();
     assert!(
-        err.to_string().contains("insufficient position margin"),
+        err.to_string().contains(REMOVE_MARGIN_G1_REJECT),
         "{err}"
     );
     assert_eq!(
@@ -1750,7 +1750,7 @@ fn remove_margin_rejected_after_funding_writes_nothing() {
     save_position(&mut ctl, QTY, -ENTRY_VALUE);
     let err = remove_position_margin(&mut ctl, 1_000_000).unwrap_err();
     assert!(
-        err.to_string().contains("resulting equity below initial margin"),
+        err.to_string().contains(REMOVE_MARGIN_G3_REJECT),
         "control: {err}"
     );
 }
@@ -3825,7 +3825,7 @@ fn remove_position_margin_rejects_when_it_would_breach_maintenance() {
     let err = remove_position_margin(&mut ctx, 40_000_000).unwrap_err();
     assert!(
         err.to_string()
-            .contains("removePositionMargin: resulting margin below maintenance margin"),
+            .contains(REMOVE_MARGIN_G2_REJECT),
         "G2, the balance term, is the first gate that fails: {err}"
     );
     assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET);
@@ -3835,14 +3835,14 @@ fn remove_position_margin_rejects_when_it_would_breach_maintenance() {
     let err = remove_position_margin(&mut ctx, 33_333_333).unwrap_err();
     assert!(
         err.to_string()
-            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+            .contains(REMOVE_MARGIN_G3_REJECT),
         "{err}"
     );
     // And the cap is exactly zero: one micro-unit is refused by the same gate.
     let err = remove_position_margin(&mut ctx, 1).unwrap_err();
     assert!(
         err.to_string()
-            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+            .contains(REMOVE_MARGIN_G3_REJECT),
         "{err}"
     );
     assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET);
@@ -3884,7 +3884,7 @@ fn remove_position_margin_round_trip_returns_only_what_clears_initial_margin() {
     let err = remove_position_margin(&mut ctx, 1).unwrap_err();
     assert!(
         err.to_string()
-            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+            .contains(REMOVE_MARGIN_G3_REJECT),
         "{err}"
     );
 
@@ -3893,7 +3893,7 @@ fn remove_position_margin_round_trip_returns_only_what_clears_initial_margin() {
     let err = remove_position_margin(&mut ctx, 10_000_000).unwrap_err();
     assert!(
         err.to_string()
-            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+            .contains(REMOVE_MARGIN_G3_REJECT),
         "{err}"
     );
     assert_eq!(position(&mut ctx, ALICE).margin, post_fee_margin + 10_000_000);
@@ -3923,7 +3923,7 @@ fn remove_position_margin_rejects_when_a_loss_takes_equity_below_initial_margin(
     let err = remove_position_margin(&mut ctx, 20_000_000).unwrap_err();
     assert!(
         err.to_string()
-            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+            .contains(REMOVE_MARGIN_G3_REJECT),
         "the unrealized LOSS counts against the equity term: {err}"
     );
     assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET);
@@ -9954,11 +9954,26 @@ mod withdrawal_cap {
     };
     use crate::types::AccountUpdateReason as R;
 
-    const G1: &str = "removePositionMargin: insufficient position margin";
-    const G2: &str = "removePositionMargin: resulting margin below maintenance margin";
-    const G3: &str = "removePositionMargin: resulting equity below initial margin requirement";
-    const G4: &str = "removePositionMargin: resulting position below maintenance margin";
+    const G1: &str = crate::risk::REMOVE_MARGIN_G1_REJECT;
+    const G2: &str = crate::risk::REMOVE_MARGIN_G2_REJECT;
+    const G3: &str = crate::risk::REMOVE_MARGIN_G3_REJECT;
+    const G4: &str = crate::risk::REMOVE_MARGIN_G4_REJECT;
     const LIQ_REFUSED: &str = "liquidate: position is above maintenance margin";
+
+    /// Every cap refusal carries Binance's `-4051` with its exact message (the cross flip, R8),
+    /// then the term that refused it — four distinct strings, written out here so a reworded
+    /// constant fails.
+    #[test]
+    fn every_cap_refusal_carries_binances_4051_and_names_its_term() {
+        let p = "removePositionMargin: -4051 Isolated balance insufficient. ";
+        assert_eq!(G1, format!("{p}The amount exceeds the position margin"));
+        assert_eq!(G2, format!("{p}The resulting margin would be below maintenance margin"));
+        assert_eq!(
+            G3,
+            format!("{p}The resulting equity would be below the initial margin requirement")
+        );
+        assert_eq!(G4, format!("{p}The resulting position would be below maintenance margin"));
+    }
 
     /// `q = 3` on the base-0 / price-2 grid: `n(p) = p · 3e4`, divisible by 1, 2, 3 and 6 at every
     /// cent price, so every cap identity below holds to the micro-unit.
@@ -12682,7 +12697,7 @@ mod funding_debt {
         let err = remove_position_margin(&mut ctx, 1).unwrap_err();
         assert!(
             matches!(&err, PerpError::Reject(m)
-                if m == "removePositionMargin: insufficient position margin"),
+                if m == crate::risk::REMOVE_MARGIN_G1_REJECT),
             "{err}"
         );
         assert_eq!(alice_untouched_snapshot(&mut ctx), before);

@@ -3093,7 +3093,7 @@ fn a_position_naturally_below_its_own_initial_margin_survives_normally() {
     let err = remove(&mut ctx, 100_000).unwrap_err();
     assert!(
         err.to_string()
-            .contains("removePositionMargin: resulting equity below initial margin requirement"),
+            .contains(crate::risk::REMOVE_MARGIN_G3_REJECT),
         "{err}"
     );
     assert!(remove(&mut ctx, 100_000 - fee + 1).is_err());

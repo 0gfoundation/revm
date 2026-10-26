@@ -1263,7 +1263,7 @@ fn an_isolated_add_is_capped_by_x_to_the_unit_and_remove_is_unchanged() {
         &mut ctx,
         ALICE,
         &remove_margin(M2, silo + 1),
-        "removePositionMargin: insufficient position margin",
+        crate::risk::REMOVE_MARGIN_G1_REJECT,
     );
 }
 
@@ -1504,7 +1504,7 @@ fn gated_off_every_p2c_gate_is_byte_identical_to_explicitly_isolated() {
     for want in [
         "setLeverage: cannot reduce leverage with open position",
         crate::risk::ADD_MARGIN_CAP_REJECT,
-        "removePositionMargin: insufficient position margin",
+        crate::risk::REMOVE_MARGIN_G1_REJECT,
         "placeOrder: insufficient perp wallet for margin",
         crate::trading::IN_LIQUIDATION_REJECT,
         "setMarginType: -4046 No need to change margin type.",

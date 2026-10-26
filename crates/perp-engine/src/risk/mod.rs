@@ -809,6 +809,24 @@ pub(crate) const REMOVE_MARGIN_CROSSED_REJECT: &str =
 /// `addPositionMargin` beyond the withdrawable balance `X` — Binance's `-4050`.
 pub(crate) const ADD_MARGIN_CAP_REJECT: &str =
     "addPositionMargin: -4050 Cross balance insufficient.";
+/// `removePositionMargin`'s four cap refusals (`run_remove_position_margin`, G1–G4): Binance's
+/// `-4051 Isolated balance insufficient.`, which Binance answers every over-request with, then the
+/// term that refused. G1: the amount exceeds the silo.
+pub(crate) const REMOVE_MARGIN_G1_REJECT: &str =
+    "removePositionMargin: -4051 Isolated balance insufficient. The amount exceeds the position \
+     margin";
+/// G2: the silo left would not cover maintenance (`iw − MM`).
+pub(crate) const REMOVE_MARGIN_G2_REJECT: &str =
+    "removePositionMargin: -4051 Isolated balance insufficient. The resulting margin would be \
+     below maintenance margin";
+/// G3: the equity left would not cover the position's initial margin (`iw + uPnL − PIM`).
+pub(crate) const REMOVE_MARGIN_G3_REJECT: &str =
+    "removePositionMargin: -4051 Isolated balance insufficient. The resulting equity would be \
+     below the initial margin requirement";
+/// G4: the position left would be liquidatable at this mark.
+pub(crate) const REMOVE_MARGIN_G4_REJECT: &str =
+    "removePositionMargin: -4051 Isolated balance insufficient. The resulting position would be \
+     below maintenance margin";
 
 /// `addPositionMargin(uint64 marketId, uint64 amount)`
 pub fn run_add_position_margin<H: PerpHost>(
@@ -999,17 +1017,14 @@ pub fn run_remove_position_margin<H: PerpHost>(
     // Gate order is fixed and each refusal names its own term: G1 the balance, G2 `iw − MM`, G3
     // `iw + uPnL − PIM`, G4 the liquidation predicate itself.
     //
-    // Why these four carry no Binance code (`-4051 Isolated balance insufficient.`, which Binance
-    // answers every over-request with) while the ADD cap carries `-4050`: cross margin left the
-    // REMOVE rule exactly as it was (cross report §3.3 item 8), and the P2 ground rule keeps every
-    // isolated outcome byte-identical while cross margin is gated off — refusal strings included.
-    // The add cap is the sanctioned exception because its BASIS changed (`A` → `X`) and its string
-    // with it. Prefixing these four is a harness-visible change with no rule behind it; if wanted,
-    // it belongs with the P3 flip, where the harness lockstep regenerates its string matchers anyway.
+    // Each of the four carries Binance's `-4051 Isolated balance insufficient.` — which Binance
+    // answers every over-request with — followed by the term that refused it
+    // (`REMOVE_MARGIN_G1_REJECT` … `G4`). Cross margin left the REMOVE rule exactly as it was
+    // (cross report §3.3 item 8); the code arrived with the cross flip (R8). Through P2 these four
+    // kept their uncoded strings, because the P2 ground rule kept every isolated outcome
+    // byte-identical while cross margin was gated off.
     if pos.margin < amount {
-        return Err(perp_err(
-            "removePositionMargin: insufficient position margin",
-        ));
+        return Err(perp_err(REMOVE_MARGIN_G1_REJECT));
     }
     let new_margin = pos.margin - amount;
     let info = crate::margin_view::margin_info_of(&market, &pos)?;
@@ -1018,16 +1033,12 @@ pub fn run_remove_position_margin<H: PerpHost>(
         "removePositionMargin: the cap and the G4 predicate must price at one mark"
     );
     if (new_margin as i128) < info.maint_margin as i128 {
-        return Err(perp_err(
-            "removePositionMargin: resulting margin below maintenance margin",
-        ));
+        return Err(perp_err(REMOVE_MARGIN_G2_REJECT));
     }
     if (new_margin as i128) + (info.unrealized_profit as i128)
         < info.position_initial_margin as i128
     {
-        return Err(perp_err(
-            "removePositionMargin: resulting equity below initial margin requirement",
-        ));
+        return Err(perp_err(REMOVE_MARGIN_G3_REJECT));
     }
     // G4 — the SAFETY NET, kept from the old rule: never leave a position that `liquidate()` would
     // take at this same mark. It is the exact predicate the liquidation path and the sweep enforce,
@@ -1051,9 +1062,7 @@ pub fn run_remove_position_margin<H: PerpHost>(
         market.base_decimals,
         market.price_decimals,
     )? {
-        return Err(perp_err(
-            "removePositionMargin: resulting position below maintenance margin",
-        ));
+        return Err(perp_err(REMOVE_MARGIN_G4_REJECT));
     }
 
     account.credit_perp(args.amount)?;

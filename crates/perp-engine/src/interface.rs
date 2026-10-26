@@ -1737,8 +1737,8 @@ sol! {
         /// `addPositionMargin: insufficient perp wallet balance`; it is now the `-4050` string
         /// above for every account (the accept/refuse decision of an isolated-only account is
         /// unchanged). Update any matcher on the old text. The `-4049` strings are new and
-        /// reachable only on a market CROSSED in force. `removePositionMargin`'s own refusals are
-        /// unchanged.
+        /// reachable only on a market CROSSED in force. (`removePositionMargin`'s cap refusals
+        /// gained their code, `-4051`, at the cross flip — see there.)
         function addPositionMargin(uint64 marketId, uint64 amount) external;
         /// Remove isolated margin from an open position back to the caller's perp wallet.
         ///
@@ -1754,7 +1754,20 @@ sol! {
         /// lower-leverage tier. Pending funding is settled into `isolatedWallet` (and so
         /// `isolatedMargin`) FIRST, which `getPositionRisk` does not do: its row gives the cap
         /// exactly only when no funding is pending. An `amount` above the cap is refused WHOLE
-        /// (never clipped) and leaves everything, funding included, as it was.
+        /// (never clipped) and leaves everything, funding included, as it was, with Binance's
+        /// `-4051` followed by the term that refused it:
+        ///   `removePositionMargin: -4051 Isolated balance insufficient. ` + one of
+        ///   * `The amount exceeds the position margin` (`amount > isolatedWallet`);
+        ///   * `The resulting margin would be below maintenance margin`;
+        ///   * `The resulting equity would be below the initial margin requirement`;
+        ///   * `The resulting position would be below maintenance margin` (the liquidation guard).
+        /// A market CROSSED in force has no silo: `-4049 Remove margin only support for isolated
+        /// position.`
+        /// ⚠️ ABI CHANGE (cross P3, the flip): the four cap refusals were the uncoded
+        /// `removePositionMargin: insufficient position margin` / `resulting margin below
+        /// maintenance margin` / `resulting equity below initial margin requirement` / `resulting
+        /// position below maintenance margin`. The accept/refuse decision is unchanged; update any
+        /// matcher on the old text.
         function removePositionMargin(uint64 marketId, uint64 amount) external;
 
         // ── Liquidation ───────────────────────────────────────────────────
