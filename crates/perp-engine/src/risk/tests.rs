@@ -49,6 +49,9 @@ type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>,
 
 fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
+    // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+    // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+    crate::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, KEEPER, MAKER, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -168,7 +171,7 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
             v_quote_balance: -ENTRY_VALUE,
             margin: 500_000_000,
             leverage: 2,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -288,7 +291,7 @@ fn liquidation_matching_caps_distinct_maker_accounts() {
             v_quote_balance: -i64::try_from(entry_value).unwrap(),
             margin: i64::try_from(entry_value / 5).unwrap(),
             leverage: 5,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -429,7 +432,7 @@ fn seed_position_account(
             v_quote_balance: v_quote,
             margin,
             leverage,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -1788,7 +1791,7 @@ fn settle_funding_noop_for_flat_position_but_reanchors() {
             v_quote_balance: 0,
             margin: 0,
             leverage: 5,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -2552,7 +2555,7 @@ fn save_position_with_leverage(
             v_quote_balance,
             margin: MARGIN,
             leverage,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3870,7 +3873,7 @@ fn remove_position_margin_round_trip_returns_only_what_clears_initial_margin() {
             v_quote_balance: -ENTRY_VALUE,
             margin: post_fee_margin,
             leverage: 3,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3969,7 +3972,7 @@ fn remove_position_margin_settles_pending_funding_first() {
             v_quote_balance: -ENTRY_VALUE,
             margin: 400_000_000,
             leverage: 5,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -4992,7 +4995,7 @@ mod value_conservation {
                     v_quote_balance: vq,
                     margin: MARGIN,
                     leverage: 5,
-                    ..PerpPosition::default()
+                    ..crate::margin_type::never_set_position()
                 },
                 AccountUpdateReason::Adjustment,
             )
@@ -5242,6 +5245,9 @@ mod usdc_custody {
             )
             .unwrap();
         }
+        // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+        // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+        crate::margin_type::test_gate::isolated_by_default();
         let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
         for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS]
             .iter()
@@ -11136,7 +11142,7 @@ mod withdrawal_cap {
                     total_buy_notional: bid,
                     total_sell_qty: sell_qty,
                     total_sell_notional: ask,
-                    ..PerpPosition::default()
+                    ..crate::margin_type::never_set_position()
                 },
                 AccountUpdateReason::Adjustment,
             )
@@ -11487,7 +11493,7 @@ mod funding_debt {
                 margin,
                 leverage: 5,
                 last_funding_index,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )

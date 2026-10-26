@@ -164,9 +164,16 @@ fn users() -> Vec<Address> {
     USERS.with(|u| u.borrow().clone())
 }
 
-/// Enables cross margin on this thread until the guard drops — the spec's `#[cfg(test)]` override.
-fn cross_on() -> impl Drop {
+/// Forces cross margin ON on this thread until the guard drops — the spec's `#[cfg(test)]`
+/// override.
+fn cross_on() -> crate::margin_type::test_gate::Guard {
     crate::margin_type::test_gate::enable()
+}
+
+/// Forces cross margin OFF on this thread until the guard drops: the gated engine, which every
+/// `gated_*` / `mt_gated_*` test pins (every position ISOLATED in force whatever it stores).
+fn gate_off() -> crate::margin_type::test_gate::Guard {
+    crate::margin_type::test_gate::disable()
 }
 
 fn make_ctx() -> TestCtx {
@@ -235,10 +242,16 @@ fn enroll(ctx: &mut TestCtx, u: Address) {
 }
 
 /// Seeds `user` OFF-BOOK with `amount` contracts in `market`, entered at the stored mark, margin
-/// `|notional| / leverage`, keeping the record's stored margin type. Fixture only: it bypasses
-/// every gate — so a test that enables cross margin switches the user to ISOLATED BEFORE seeding
-/// (an isolated silo under a CROSSED record is a state P2 forbids).
+/// `|notional| / leverage` — an ISOLATED position. Fixture only: it bypasses every gate. A record
+/// CROSSED in force (the default, with the gate on) is first switched to ISOLATED, flat, as
+/// `setMarginType(ISOLATED)` would (an isolated silo under a CROSSED record is a state P2
+/// forbids); with the gate off the stored byte is kept, whatever it says.
 fn seed(ctx: &mut TestCtx, user: Address, market: u64, amount: i64, leverage: u64) {
+    if sym(ctx, user, market).marginType == CROSSED {
+        let mut flat = storage::load_position(ctx, user, market).unwrap();
+        flat.margin_type = ISOLATED;
+        storage::save_position_margin_type_only(ctx, user, market, flat).unwrap();
+    }
     let mark = storage::load_mark_price(ctx, market).unwrap() as i128;
     let scale: i128 = if market == TM { 1 } else { 10_000 };
     let n = amount as i128 * mark * scale;
@@ -1244,6 +1257,7 @@ fn mt_wire_codes_and_reason_nine() {
 /// each fill) — although every stored record is the zero-initialised CROSSED.
 #[test]
 fn mt_gated_every_surface_reports_isolated() {
+    let _off = gate_off();
     let mut ctx = fresh();
     for m in [M1, M2] {
         let s = sym(&mut ctx, ERIN, m);
@@ -1273,6 +1287,7 @@ fn mt_gated_every_surface_reports_isolated() {
 /// Nothing is ever written.
 #[test]
 fn mt_gated_the_ladder_ends_at_the_gate() {
+    let _off = gate_off();
     let mut ctx = fresh();
     refuse(&mut ctx, ALICE, M1, ISOLATED, E_4046);
     refuse(&mut ctx, ALICE, M1, CROSSED, E_GATE);
@@ -1296,7 +1311,7 @@ fn mt_gated_the_ladder_ends_at_the_gate() {
 fn mt_an_invalid_type_then_an_unknown_market_come_first() {
     for gate in [false, true] {
         let mut ctx = fresh();
-        let _g = gate.then(cross_on);
+        let _g = if gate { cross_on() } else { gate_off() };
         if gate {
             switch_self(&mut ctx, ALICE, M1, ISOLATED);
         }
@@ -1336,8 +1351,9 @@ fn mt_with_the_gate_on_the_default_is_crossed_and_it_switches_both_ways() {
     switch_self(&mut ctx, ALICE, M2, ISOLATED);
     switch_self(&mut ctx, BOB, M1, ISOLATED);
     assert_eq!(reported(&mut ctx, ALICE, M1), ISOLATED);
-    // Dropping the gate: every surface reads ISOLATED again whatever is stored.
+    // Forcing the gate off: every surface reads ISOLATED again whatever is stored.
     drop(_g);
+    let _off = gate_off();
     assert_eq!(reported(&mut ctx, ALICE, M1), ISOLATED);
     assert_eq!(reported(&mut ctx, CAROL, M1), ISOLATED);
 }
@@ -1607,11 +1623,13 @@ fn mt_a_master_switches_its_sub_account() {
     };
 
     // Gated: the sub's refusals.
+    let off = gate_off();
     let o = rejected(&mut ctx, ALICE, &wrap(M1, ISOLATED), E_4046);
     assert_eq!(o.gas_used, MT_GAS + SUB_OVERHEAD);
     rejected(&mut ctx, ALICE, &wrap(M1, CROSSED), E_GATE);
     rejected(&mut ctx, ALICE, &wrap(M1, 5), E_TYPE);
     rejected(&mut ctx, ALICE, &wrap(NO_MARKET, ISOLATED), E_MARKET);
+    drop(off);
 
     let _g = cross_on();
     // The wrong caller still pays the full inner charge (gas is decided from the calldata).
@@ -1760,6 +1778,7 @@ fn mt_signed_switch_succeeds_once_and_replays_are_duplicates() {
 /// Their documented order: type → key → (window / expiry / signature) → duplicate → market.
 #[test]
 fn mt_signed_permanent_refusals_precede_the_burn() {
+    let _off = gate_off();
     let mut ctx = fresh();
     let sk = key(9);
     let stranger = key(4);
@@ -1815,6 +1834,7 @@ fn mt_signed_state_refusals_follow_the_burn() {
     };
 
     // Gated.
+    let off = gate_off();
     ctx.block.timestamp = U256::from(10);
     let m = next(&ctx, ISOLATED);
     rejected_after_burn(&mut ctx, &m.call(&sk), E_4046);
@@ -1830,6 +1850,7 @@ fn mt_signed_state_refusals_follow_the_burn() {
 
     // With the blockers gone and the gate on, those spent signatures stay spent.
     close(&mut ctx, ALICE, M1);
+    drop(off);
     let _g = cross_on();
     for spent in [&gate, &blocked, &pos] {
         rejected(&mut ctx, ERIN, &spent.call(&sk), E_DUP);
@@ -1943,6 +1964,7 @@ fn isolated_scenario(ctx: &mut TestCtx) -> (Vec<Vec<Log>>, Vec<Vec<u8>>) {
 /// getter.
 #[test]
 fn gated_refused_switch_attempts_change_nothing() {
+    let _off = gate_off();
     let mut a = fresh();
     let baseline = isolated_scenario(&mut a);
 
@@ -1961,9 +1983,11 @@ fn gated_refused_switch_attempts_change_nothing() {
 }
 
 /// Gated, the STORED byte has no effect: actors whose records say ISOLATED (written with the gate
-/// on, then the gate dropped) run the scenario byte-identically to actors at the default CROSSED.
+/// on, then the gate forced off again) run the scenario byte-identically to actors at the default
+/// CROSSED.
 #[test]
 fn gated_the_stored_byte_has_no_effect() {
+    let _off = gate_off();
     let mut a = fresh();
     let baseline = isolated_scenario(&mut a);
 
@@ -1988,8 +2012,11 @@ fn gated_the_stored_byte_has_no_effect() {
 /// gated one: ISOLATED is today's semantics, and the gate changes nothing for it.
 #[test]
 fn gated_and_explicitly_isolated_with_the_gate_on_are_the_same() {
-    let mut a = fresh();
-    let baseline = isolated_scenario(&mut a);
+    let baseline = {
+        let _off = gate_off();
+        let mut a = fresh();
+        isolated_scenario(&mut a)
+    };
 
     let mut d = fresh();
     let _g = cross_on();

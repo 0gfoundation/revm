@@ -53,6 +53,9 @@ type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>,
 
 fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
+    // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+    // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+    crate::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, BOB, CAROL, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -2009,7 +2012,7 @@ fn position_registry_tracks_open_positions() {
     let u2 = user_addr(2);
     let open = |amt: i64| PerpPosition {
         amount: amt,
-        ..PerpPosition::default()
+        ..crate::margin_type::never_set_position()
     };
 
     // Opening (0 -> !=0) adds to the registry.
@@ -2732,7 +2735,7 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: (FILL_VALUE / 3) as i64,
             leverage: 3,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -2862,7 +2865,7 @@ fn the_k9_maintenance_guard_still_cancels_a_maker_and_the_taker_walks_on() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: INIT_MARGIN as i64,
             leverage: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3416,7 +3419,7 @@ fn taker_reverse_uses_released_close_margin_before_opening_margin_check() {
             amount: -(QTY as i64),
             v_quote_balance: FILL_VALUE as i64,
             margin: INIT_MARGIN as i64,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3439,7 +3442,7 @@ fn taker_reverse_uses_released_close_margin_before_opening_margin_check() {
             leverage: 1,
             // The flip ENDED the short's life: a new generation (see `PerpPosition::generation`).
             generation: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         }
     );
 }
@@ -3458,7 +3461,7 @@ fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
             amount: -(QTY as i64),
             v_quote_balance: FILL_VALUE as i64,
             margin: INIT_MARGIN as i64,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3498,7 +3501,7 @@ fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
             cumulative_realized_pnl: 100_000,
             // The flip ENDED the short's life: a new generation (see `PerpPosition::generation`).
             generation: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         }
     );
     assert_eq!(wallet(&mut ctx, ALICE), 0);
@@ -3516,7 +3519,7 @@ fn maker_close_emits_fill_realized_pnl() {
             amount: -(QTY as i64),
             v_quote_balance: FILL_VALUE as i64,
             margin: INIT_MARGIN as i64,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3651,7 +3654,7 @@ fn trade_apportions_taker_realized_pnl_by_telescoping_with_zero_residual() {
             v_quote_balance: alice_vq,
             margin: -alice_vq,
             leverage: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3667,7 +3670,7 @@ fn trade_apportions_taker_realized_pnl_by_telescoping_with_zero_residual() {
             v_quote_balance: 2 * FILL_VALUE as i64,
             margin: 2 * FILL_VALUE as i64,
             leverage: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3681,7 +3684,7 @@ fn trade_apportions_taker_realized_pnl_by_telescoping_with_zero_residual() {
             v_quote_balance: FILL_VALUE as i64,
             margin: FILL_VALUE as i64,
             leverage: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3847,7 +3850,7 @@ fn trade_taker_realized_pnl_is_zero_on_the_opening_legs_of_a_flip() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: FILL_VALUE as i64,
             leverage: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3932,7 +3935,7 @@ fn insolvent_close_breaks_the_wallet_identity_by_exactly_the_bad_debt() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: (FILL_VALUE / 10) as i64,
             leverage: 10,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -4096,7 +4099,7 @@ fn underwater_maker_close_routes_bad_debt_to_insurance_fund_not_wallet() {
             v_quote_balance: -((FILL_VALUE * 2) as i64),
             margin: 500_000,
             leverage: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -4289,7 +4292,7 @@ fn self_trade_finalizes_taker_from_latest_maker_state() {
         pos(&mut ctx, ALICE),
         PerpPosition {
             leverage: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         }
     );
 }
@@ -4347,7 +4350,7 @@ fn self_trade_taker_margin_expiry_does_not_cancel_current_taker_order() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: INIT_MARGIN as i64,
             leverage: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         }
     );
     assert_eq!(wallet(&mut ctx, ALICE), INIT_MARGIN - old_buy_margin);
@@ -4659,7 +4662,7 @@ fn an_illegal_pair_is_rejected_before_any_write_or_log() {
             "an illegal (orderType, tif) pair must emit no logs at all"
         );
         assert_eq!(get_order(&mut ctx, resting).filled, 0, "maker untouched");
-        assert_eq!(pos(&mut ctx, ALICE), PerpPosition::default());
+        assert_eq!(pos(&mut ctx, ALICE), crate::margin_type::never_set_position());
         assert_eq!(wallet(&mut ctx, ALICE), WALLET);
         assert_eq!(
             storage::load_user_nonce(&mut ctx, ALICE).unwrap(),
@@ -4750,7 +4753,7 @@ fn each_limit_tif_keeps_its_own_behaviour_after_the_collapse() {
             "{err}"
         );
         assert_eq!(get_order(&mut ctx, maker).filled, 0);
-        assert_eq!(pos(&mut ctx, ALICE), PerpPosition::default());
+        assert_eq!(pos(&mut ctx, ALICE), crate::margin_type::never_set_position());
     }
     // PostOnly — refuses to take liquidity at all.
     {
@@ -6461,7 +6464,7 @@ fn fill_settles_funding_for_taker_and_maker() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: FILL_VALUE as i64,
             leverage: 1,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -10193,7 +10196,7 @@ mod batch_place {
             pos(&mut ctx, ALICE),
             PerpPosition {
                 leverage: 1,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             }
         );
         assert_eq!(trade_count(&mut ctx), 1);
@@ -11320,7 +11323,7 @@ mod risk_reducing_admission {
                 v_quote_balance: -notional,
                 margin: notional,
                 leverage: 1,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -13033,7 +13036,7 @@ mod derived_ooim_divergence {
                 v_quote_balance: -notional,
                 margin: notional.abs(),
                 leverage,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -14547,7 +14550,7 @@ mod account_snapshot_events {
                 v_quote_balance: -notional,
                 margin: notional.abs(),
                 leverage: 1,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -15369,7 +15372,7 @@ mod account_snapshot_events {
                 v_quote_balance: -(FILL_VALUE as i64),
                 margin: INIT_MARGIN as i64,
                 leverage: 1,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -15754,7 +15757,7 @@ mod position_changed_derived_fields {
                 v_quote_balance: v_quote,
                 margin,
                 leverage: 1,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -17254,7 +17257,7 @@ mod reduce_only_e2e {
                 v_quote_balance: -notional,
                 margin: notional.abs(),
                 leverage: 1,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -18935,7 +18938,7 @@ mod stp_matching {
                 v_quote_balance: -amount / QTY as i64 * FILL_VALUE as i64,
                 margin: (amount.unsigned_abs() / QTY * FILL_VALUE) as i64,
                 leverage: 1,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )

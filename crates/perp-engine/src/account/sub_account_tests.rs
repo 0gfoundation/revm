@@ -39,6 +39,9 @@ type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>,
 // ── Fixture ───────────────────────────────────────────────────────────────────
 
 fn make_ctx() -> TestCtx {
+    // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+    // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+    crate::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(InMemoryDB::default(), SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, MASTER, OTHER, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -787,7 +790,7 @@ mod mutation_killers {
                     v_quote_balance: -1_000_000,
                     margin: 0,
                     leverage: 1,
-                    ..PerpPosition::default()
+                    ..crate::margin_type::never_set_position()
                 };
                 storage::save_position(c, who, MARKET_ID, &pos, AccountUpdateReason::Adjustment)
                     .unwrap();

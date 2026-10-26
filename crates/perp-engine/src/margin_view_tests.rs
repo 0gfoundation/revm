@@ -70,6 +70,9 @@ type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>,
 
 fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
+    // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+    // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+    crate::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, BOB, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -143,7 +146,7 @@ fn set_position(
             v_quote_balance,
             margin,
             leverage,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )

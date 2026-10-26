@@ -25,6 +25,9 @@ fn make_ctx(alice_usdc: U256) -> TestCtx {
     let mut db = InMemoryDB::default();
     db.insert_account_storage(USDC_ADDRESS, erc20_balance_slot(ALICE).into(), alice_usdc)
         .unwrap();
+    // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+    // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+    crate::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -554,7 +557,7 @@ fn get_account_reports_available_wallet_net_of_allocations() {
             amount: 1,
             margin: 40,
             leverage: 1,
-            ..Default::default()
+            ..crate::margin_type::never_set_position()
         },
         crate::types::AccountUpdateReason::Adjustment,
     )

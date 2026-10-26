@@ -1107,6 +1107,7 @@ fn set_margin_type_refuses_in_liquidation_after_4048_and_before_the_gate() {
     // Before the gate: with cross margin gated off, CROSSED (not in force, so not -4046) hits
     // -2023 before "not enabled".
     drop(_cross);
+    let off = crate::margin_type::test_gate::disable();
     rejects(&mut ctx, ALICE, &set(M2, CROSSED).abi_encode(), in_liq);
     storage::set_in_liquidation_for_test(&mut ctx, ALICE, false).unwrap();
     rejects(
@@ -1117,6 +1118,7 @@ fn set_margin_type_refuses_in_liquidation_after_4048_and_before_the_gate() {
     );
 
     // Cleared, with the gate on: the switch goes through.
+    drop(off);
     let _cross = crate::margin_type::test_gate::enable();
     ok(&mut ctx, ALICE, &set(M2, ISOLATED).abi_encode());
     assert_eq!(pos(&mut ctx, ALICE, M2).margin_type, ISOLATED);
@@ -1406,8 +1408,9 @@ fn no_money_out_takes_a_healthy_cross_account_below_maintenance() {
 // ── Gated off: byte identity ──────────────────────────────────────────────────────────────────
 
 /// Every P2c gate keys on the margin type IN FORCE (or on the account's liquidation flag, which no
-/// margin type changes), so with cross margin gated off — production — an account that still
-/// STORES the CROSSED default behaves exactly like one explicitly switched to ISOLATED: the same
+/// margin type changes), so with cross margin gated off — forced off, as before the flip — an
+/// account that still STORES the CROSSED default behaves exactly like one explicitly switched to
+/// ISOLATED: the same
 /// outcomes (revert flag, return bytes, gas), the same events byte for byte, the same state. The
 /// scenario walks every gate this slice touched: the taker fills gate (a zero-fee open included),
 /// the maker path, the pre-walk filter, `setLeverage` both ways, add / remove margin at and past
@@ -1468,10 +1471,13 @@ fn gated_off_every_p2c_gate_is_byte_identical_to_explicitly_isolated() {
         out
     }
 
-    // Gated off — production: every slot still stores the CROSSED default.
+    // Gated off — the engine before the flip: every slot still stores the CROSSED default.
     let mut gated = make_ctx();
-    let (gated_outs, gated_logs) = scenario(&mut gated);
-    let gated_state = state(&mut gated);
+    let (gated_outs, gated_logs, gated_state) = {
+        let _off = crate::margin_type::test_gate::disable();
+        let (outs, logs) = scenario(&mut gated);
+        (outs, logs, state(&mut gated))
+    };
 
     // Gated on, every slot ISOLATED by choice.
     let mut isolated = make_ctx();

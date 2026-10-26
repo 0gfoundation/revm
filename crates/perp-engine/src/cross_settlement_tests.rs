@@ -1250,9 +1250,9 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
 
 // ── Gated off: byte identity ─────────────────────────────────────────────────────
 
-/// Every P2b branch keys on the margin type IN FORCE, so with cross margin gated off (production)
-/// a position that still STORES the CROSSED default must behave exactly as one explicitly switched
-/// to ISOLATED with the gate on: the same call outcomes (revert flag, return bytes, gas), the same
+/// Every P2b branch keys on the margin type IN FORCE, so with cross margin gated off (forced off,
+/// as before the flip) a position that still STORES the CROSSED default must behave exactly as one
+/// explicitly switched to ISOLATED with the gate on: the same call outcomes (revert flag, return bytes, gas), the same
 /// event stream byte for byte, and the same stored state (bar the stored type byte itself). The
 /// scenario walks every money path this slice touched — taker and maker fills with fees, a flip, a
 /// funding settle, the four money-out gates (accepted and refused), a margin top-up, an oracle tick
@@ -1317,10 +1317,13 @@ fn gated_off_every_money_path_is_byte_identical_to_explicitly_isolated() {
         out
     }
 
-    // Gated off — production: every slot still stores the CROSSED default.
+    // Gated off — the engine before the flip: every slot still stores the CROSSED default.
     let mut gated = make_ctx();
-    let (gated_outs, gated_logs) = scenario(&mut gated);
-    let gated_state = state(&mut gated);
+    let (gated_outs, gated_logs, gated_state) = {
+        let _off = crate::margin_type::test_gate::disable();
+        let (outs, logs) = scenario(&mut gated);
+        (outs, logs, state(&mut gated))
+    };
 
     // Gated on, every slot ISOLATED by choice.
     let mut isolated = make_ctx();

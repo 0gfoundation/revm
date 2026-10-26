@@ -189,8 +189,6 @@ fn table(m: u64) -> &'static [Band] {
 thread_local! {
     /// Every account that can hold value — the conservation and model checks run over these.
     static USERS: RefCell<Vec<Address>> = const { RefCell::new(Vec::new()) };
-    /// The model's own copy of the gate (set by [`cross_on`]).
-    static GATE: Cell<bool> = const { Cell::new(false) };
     /// Whether [`ok`] runs the full view comparison (the randomised walk thins it).
     static VIEWS: Cell<bool> = const { Cell::new(true) };
     /// When `Some`, [`attempt`] records every call's outcome (the gated comparison).
@@ -204,22 +202,17 @@ fn users() -> Vec<Address> {
     USERS.with(|u| u.borrow().clone())
 }
 
+/// The gate in force on this thread. The model reads the engine's own switch — the `const`, or a
+/// test's `#[cfg(test)]` override — so the two can never disagree about it.
 fn gate() -> bool {
-    GATE.with(Cell::get)
+    crate::margin_type::cross_margin_enabled()
 }
 
 /// The spec's `#[cfg(test)]` override, for this thread, until the guard drops.
-struct CrossOn(#[allow(dead_code)] crate::margin_type::test_gate::Guard);
-
-impl Drop for CrossOn {
-    fn drop(&mut self) {
-        GATE.with(|g| g.set(false));
-    }
-}
+type CrossOn = crate::margin_type::test_gate::Guard;
 
 fn cross_on() -> CrossOn {
-    GATE.with(|g| g.set(true));
-    CrossOn(crate::margin_type::test_gate::enable())
+    crate::margin_type::test_gate::enable()
 }
 
 fn make_ctx() -> TestCtx {
@@ -2552,15 +2545,19 @@ fn isolated_scenario(ctx: &mut TestCtx) -> (Vec<Outcome>, Vec<Vec<u8>>) {
     (rec, views)
 }
 
-/// Gated off (production), the scenario at the stored default (CROSSED, not in force) is
-/// byte-identical — every outcome, return value, gas figure and log, every getter, the whole stored
-/// world bar the type byte — to the same scenario with the gate ON and every account explicitly
-/// ISOLATED. P2 changes nothing an isolated account can observe.
+/// With the gate forced OFF (the engine before the flip), the scenario at the stored default
+/// (CROSSED, not in force) is byte-identical — every outcome, return value, gas figure and log,
+/// every getter, the whole stored world bar the type byte — to the same scenario with the gate ON
+/// and every account explicitly ISOLATED. Cross margin changes nothing an isolated account can
+/// observe.
 #[test]
 fn gated_an_isolated_scenario_is_byte_identical_with_the_gate_on_and_everyone_isolated() {
-    let mut a = fresh();
-    let (rec_a, views_a) = isolated_scenario(&mut a);
-    let world_a = world_of(&mut a, true);
+    let (rec_a, views_a, world_a) = {
+        let _off = crate::margin_type::test_gate::disable();
+        let mut a = fresh();
+        let (rec, views) = isolated_scenario(&mut a);
+        (rec, views, world_of(&mut a, true))
+    };
     let liquidations: usize = rec_a.iter().map(|o| evs::<Liquidation>(&o.3).len()).sum();
     let adls: usize = rec_a.iter().map(|o| evs::<Adl>(&o.3).len()).sum();
     let fundings: usize = rec_a.iter().map(|o| evs::<FundingSettled>(&o.3).len()).sum();

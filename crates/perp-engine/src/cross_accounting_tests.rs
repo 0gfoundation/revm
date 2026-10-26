@@ -161,6 +161,15 @@ fn plant(ctx: &mut TestCtx, user: Address, market: u64, pos: PerpPosition) {
     let _ = JournalTr::take_logs(ctx.journal_mut());
 }
 
+/// Switches `user`'s flat record in `market` to ISOLATED through the switch's own door, as
+/// `setMarginType(ISOLATED)` would. Returns the switched (still flat) record.
+fn isolate(ctx: &mut TestCtx, user: Address, market: u64) -> PerpPosition {
+    let mut flat = storage::load_position(ctx, user, market).unwrap();
+    flat.margin_type = MarginType::Isolated.code();
+    storage::save_position_margin_type_only(ctx, user, market, flat.clone()).unwrap();
+    flat
+}
+
 // ── The funding-index mirror ──────────────────────────────────────────────────
 
 /// Every oracle tick leaves the `Market`'s mirrored funding index equal to `FundingState`'s —
@@ -275,8 +284,12 @@ fn the_open_position_count_follows_open_close_and_flip() {
 fn a_stale_account_copy_cannot_roll_back_the_count_or_the_flags() {
     let mut ctx = make_ctx();
     let stale = storage::load_account(&mut ctx, ALICE).unwrap();
-    let pos =
-        PerpPosition { amount: 1, v_quote_balance: -USD, margin: USD, ..PerpPosition::default() };
+    let pos = PerpPosition {
+        amount: 1,
+        v_quote_balance: -USD,
+        margin: USD,
+        ..isolate(&mut ctx, ALICE, M1)
+    };
     plant(&mut ctx, ALICE, M1, pos);
     storage::mutate_account(&mut ctx, ALICE, |a| a.liq_flags = LIQ_FLAG_IN_LIQUIDATION).unwrap();
     storage::save_account(
@@ -309,19 +322,21 @@ fn a_crossed_position_holding_isolated_margin_is_refused_at_the_door() {
     let _ = storage::save_position(&mut ctx, ALICE, M1, &pos, AccountUpdateReason::Adjustment);
 }
 
-/// …while the same bytes are an ordinary ISOLATED position when the gate is off (production), or
-/// when the record stores ISOLATED, and a margin-free CROSSED position is the normal cross shape.
+/// …while the same bytes are an ordinary ISOLATED position when the gate is forced off (as it
+/// was before the flip), or when the record stores ISOLATED, and a margin-free CROSSED position is
+/// the normal cross shape.
 #[test]
 fn the_invariant_binds_only_the_type_in_force() {
     let mut ctx = make_ctx();
     let silo =
         PerpPosition { amount: 1, v_quote_balance: -USD, margin: 1, ..PerpPosition::default() };
-    plant(&mut ctx, ALICE, M1, silo.clone()); // gated off: ISOLATED in force
+    {
+        let _off = crate::margin_type::test_gate::disable();
+        plant(&mut ctx, ALICE, M1, silo.clone()); // gated off: ISOLATED in force
+    }
 
     let _cross = crate::margin_type::test_gate::enable();
-    let mut flat = storage::load_position(&mut ctx, BOB, M1).unwrap();
-    flat.margin_type = MarginType::Isolated.code();
-    storage::save_position_margin_type_only(&mut ctx, BOB, M1, flat).unwrap();
+    isolate(&mut ctx, BOB, M1);
     let isolated = PerpPosition { margin_type: MarginType::Isolated.code(), ..silo.clone() };
     plant(&mut ctx, BOB, M1, isolated);
     plant(&mut ctx, BOB, M2, PerpPosition { margin: 0, ..silo });
@@ -389,9 +404,7 @@ fn value(price: u64, qty: u64) -> u64 {
 /// limit, a sell's `max(T, limit)`), then the position.
 fn plant_leg(ctx: &mut TestCtx, user: Address, leg: &Leg) {
     if !leg.cross {
-        let mut flat = storage::load_position(ctx, user, leg.market).unwrap();
-        flat.margin_type = MarginType::Isolated.code();
-        storage::save_position_margin_type_only(ctx, user, leg.market, flat).unwrap();
+        isolate(ctx, user, leg.market);
     }
     let m = storage::load_market_ref(ctx, leg.market).unwrap().unwrap();
     let floor = crate::margin_view::assuming_price_floor(ctx, leg.market, &m).unwrap();
@@ -599,6 +612,7 @@ fn gated_off_the_fold_is_the_isolated_basis_it_always_was() {
         let _cross = crate::margin_type::test_gate::enable();
         mixed_account(&mut ctx)
     };
+    let _off = crate::margin_type::test_gate::disable();
     set_wallet(&mut ctx, ALICE, 5_000 * USD);
     let got = fold(&mut ctx, ALICE);
     let isolated: Vec<Leg> = legs.iter().map(|l| Leg { cross: false, ..l.clone() }).collect();
@@ -704,7 +718,8 @@ fn a_zero_mark_cross_leg_contributes_no_pnl_and_no_maintenance() {
 fn a_missing_market_is_refused_by_the_checked_fold() {
     let mut ctx = make_ctx();
     plant_leg(&mut ctx, ALICE, &Leg::new(M1, 1, 10_000, 1, false, 100 * USD));
-    plant(&mut ctx, ALICE, 99, PerpPosition { amount: 1, margin: 1, ..PerpPosition::default() });
+    let orphan = PerpPosition { amount: 1, margin: 1, ..isolate(&mut ctx, ALICE, 99) };
+    plant(&mut ctx, ALICE, 99, orphan);
     let err =
         crate::margin_view::cross_fold_checked(&mut ctx, ALICE, None, None, None).unwrap_err();
     assert_eq!(
@@ -727,7 +742,8 @@ fn a_missing_market_contributes_nothing_to_the_total_fold() {
     let mut ctx = make_ctx();
     plant_leg(&mut ctx, ALICE, &Leg::new(M1, 1, 10_000, 1, false, 100 * USD));
     let before = fold(&mut ctx, ALICE);
-    plant(&mut ctx, ALICE, 99, PerpPosition { amount: 1, margin: 1, ..PerpPosition::default() });
+    let orphan = PerpPosition { amount: 1, margin: 1, ..isolate(&mut ctx, ALICE, 99) };
+    plant(&mut ctx, ALICE, 99, orphan);
     let after = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
     assert_eq!(after, crate::margin_view::CrossFold { faulted_legs: 1, ..before });
 }
@@ -1054,9 +1070,10 @@ fn getter_bytes(ctx: &mut TestCtx, user: Address) -> Vec<Vec<u8>> {
 
 /// An isolated-only account through the cross machinery is the account it always was: the same
 /// trading scenario — fills on two markets, resting orders on both sides, pending funding on an
-/// isolated position, a mark move — run gated off (production: every stored byte the CROSSED
-/// default) and gated ON with every actor ISOLATED, publishes the same logs and the same bytes from
-/// every account getter; and `getAccount`'s cross fields take their degenerate values.
+/// isolated position, a mark move — run with the gate forced OFF (the engine before the flip:
+/// every stored byte the CROSSED default) and gated ON with every actor ISOLATED, publishes the
+/// same logs and the same bytes from every account getter; and `getAccount`'s cross fields take
+/// their degenerate values.
 #[test]
 fn every_getter_is_byte_identical_for_an_isolated_only_account() {
     fn scenario(ctx: &mut TestCtx) -> Vec<primitives::Log> {
@@ -1073,10 +1090,14 @@ fn every_getter_is_byte_identical_for_an_isolated_only_account() {
         JournalTr::take_logs(ctx.journal_mut())
     }
 
-    // Gated off — production. Every getter read with the gate still off.
+    // Gated off — the engine before the flip. Every getter read with the gate still off.
     let mut gated = make_ctx();
-    let gated_logs = scenario(&mut gated);
-    let gated_bytes: Vec<_> = [ALICE, BOB].map(|u| getter_bytes(&mut gated, u)).into();
+    let (gated_logs, gated_bytes) = {
+        let _off = crate::margin_type::test_gate::disable();
+        let logs = scenario(&mut gated);
+        let bytes: Vec<_> = [ALICE, BOB].map(|u| getter_bytes(&mut gated, u)).into();
+        (logs, bytes)
+    };
 
     // Gated on, every actor ISOLATED by choice.
     let mut isolated = make_ctx();
@@ -1084,9 +1105,7 @@ fn every_getter_is_byte_identical_for_an_isolated_only_account() {
         let _cross = crate::margin_type::test_gate::enable();
         for u in [ALICE, BOB] {
             for m in [M1, M2] {
-                let mut p = storage::load_position(&mut isolated, u, m).unwrap();
-                p.margin_type = MarginType::Isolated.code();
-                storage::save_position_margin_type_only(&mut isolated, u, m, p).unwrap();
+                isolate(&mut isolated, u, m);
             }
         }
         let logs = scenario(&mut isolated);

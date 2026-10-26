@@ -1053,6 +1053,8 @@ pub fn save_erc20_balance<H: PerpHost>(
 
 // ── PerpPosition ──────────────────────────────────────────────────────────────
 
+/// The position of `(user, market)`. One that was never written reads as
+/// [`crate::margin_type::never_set_position`] — the default position, margin type CROSSED.
 pub fn load_position<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -1061,16 +1063,17 @@ pub fn load_position<H: PerpHost>(
     use crate::typed_store::Resident;
     match typed_store_mut(context).position(user, market_id) {
         Resident::Hit(p) => return Ok(p.clone()),
-        Resident::Deleted => return Ok(PerpPosition::default()),
+        Resident::Deleted => return Ok(crate::margin_type::never_set_position()),
         Resident::Miss => {}
     }
     Ok(cold_fill_position(context, user, market_id)?
         .map(|p| (*p).clone())
-        .unwrap_or_default())
+        .unwrap_or_else(crate::margin_type::never_set_position))
 }
 
 /// Zero-copy position read (点1): `Arc<PerpPosition>`, no per-read clone. Defaulted like
-/// [`load_position`] (absent → default position) so call sites keep `p.field` (Deref) ergonomics.
+/// [`load_position`] (absent → the never-set position) so call sites keep `p.field` (Deref)
+/// ergonomics.
 /// PURE reads only (margin / size / entry checks). Fill/settlement RMW keep [`load_position`] +
 /// [`save_position`].
 pub fn load_position_ref<H: PerpHost>(
@@ -1088,10 +1091,10 @@ pub fn load_position_ref<H: PerpHost>(
         typed_store_mut(context).position(user, market_id),
         Resident::Deleted
     ) {
-        return Ok(std::sync::Arc::new(PerpPosition::default()));
+        return Ok(std::sync::Arc::new(crate::margin_type::never_set_position()));
     }
     Ok(cold_fill_position(context, user, market_id)?
-        .unwrap_or_else(|| std::sync::Arc::new(PerpPosition::default())))
+        .unwrap_or_else(|| std::sync::Arc::new(crate::margin_type::never_set_position())))
 }
 
 

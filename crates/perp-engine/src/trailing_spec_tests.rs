@@ -173,6 +173,9 @@ fn users() -> Vec<Address> {
 
 fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
+    // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+    // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+    crate::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ADMIN, Address::ZERO] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -266,7 +269,7 @@ fn seed_pos(ctx: &mut TestCtx, user: Address, amount: i64, leverage: u64) {
             v_quote_balance: -amount * m * 10_000,
             margin: amount.abs() * m * 10_000 / leverage as i64,
             leverage,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -2233,6 +2236,8 @@ struct Counting {
 
 impl Counting {
     fn new() -> Self {
+        // Isolated margin, explicitly — as `make_ctx`.
+        crate::margin_type::test_gate::isolated_by_default();
         Self { inner: InMemoryHost::new(1), on: false, keys: HashSet::new(), loads: 0 }
     }
 }
@@ -2331,7 +2336,7 @@ fn h_setup(n_long: u16, n_short: u16) -> (Counting, Vec<Address>, Vec<Address>) 
                 v_quote_balance: -amount * MARK as i64 * 10_000,
                 margin: amount.abs() * MARK as i64 * 10_000,
                 leverage: 1,
-                ..PerpPosition::default()
+                ..crate::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -2900,7 +2905,7 @@ fn run_differential(seed: u64, steps: usize, cov: &mut Coverage) {
             // now belongs to a position that ended.
             let k = rng.below(12) as usize;
             let (u, amt) = if k < 6 { (longs[k], 1_000) } else { (shorts[k - 6], -1_000) };
-            let flat = PerpPosition::default();
+            let flat = crate::margin_type::never_set_position();
             storage::save_position(&mut ctx, u, MARKET_ID, &flat, AccountUpdateReason::Adjustment)
                 .unwrap();
             seed_pos(&mut ctx, u, amt, 1);

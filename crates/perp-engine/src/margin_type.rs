@@ -38,15 +38,32 @@ use crate::{
 };
 
 /// Whether cross margin is live: [`CROSS_MARGIN_ENABLED`], a plain `const` in every non-test
-/// build. Under `cfg(test)` a test may enable it for its own thread ([`test_gate::enable`]) to
-/// exercise the CROSSED paths before the flip; that hook does not exist outside test builds.
+/// build. Under `cfg(test)` a test may force it on or off for its own thread
+/// ([`test_gate::enable`] / [`test_gate::disable`]); that hook does not exist outside test builds.
 #[inline]
 pub fn cross_margin_enabled() -> bool {
     #[cfg(test)]
-    if test_gate::enabled() {
-        return true;
+    if let Some(forced) = test_gate::forced() {
+        return forced;
     }
     CROSS_MARGIN_ENABLED
+}
+
+/// What a `(user, market)` that was never written reads as: [`PerpPosition::default`], whose
+/// margin type is CROSSED — Binance's default ("All contracts and positions are defaulted to the
+/// Cross Margin mode"). The position loaders (`storage::load_position` / `load_position_ref`)
+/// return it for an absent record, so it is also what that position's first save stores.
+///
+/// Under `cfg(test)` a fixture may make the never-set type ISOLATED for its thread
+/// ([`test_gate::isolated_by_default`]); outside test builds this is exactly
+/// [`PerpPosition::default`].
+#[inline]
+pub(crate) fn never_set_position() -> PerpPosition {
+    #[cfg(test)]
+    if let Some(t) = test_gate::never_set_type() {
+        return PerpPosition { margin_type: t.code(), ..PerpPosition::default() };
+    }
+    PerpPosition::default()
 }
 
 /// The margin type IN FORCE for `pos` — the ONE implementation of the gate
@@ -57,33 +74,71 @@ pub fn effective_margin_type(pos: &PerpPosition) -> MarginType {
     MarginType::effective(pos.margin_type, cross_margin_enabled())
 }
 
-/// `#[cfg(test)]`-only override of [`CROSS_MARGIN_ENABLED`], per THREAD (the test harness runs
-/// each test on its own thread, so one test enabling it cannot leak into another).
+/// `#[cfg(test)]`-only hooks on the margin-type rule, per THREAD (the test harness runs each test
+/// on its own thread, so nothing one test sets can leak into another). Two independent hooks:
+///
+/// * **The gate** — [`enable`] / [`disable`] force [`cross_margin_enabled`] on or off until the
+///   returned guard drops. A guard restores whatever was in force before it, so they nest: a test
+///   can run the isolated engine with the gate forced OFF and compare it, inside a nested scope,
+///   against the same scenario with the gate forced ON.
+/// * **The never-set default** — [`isolated_by_default`]: from then on, on this thread, a position
+///   that was never written reads, and is therefore first stored, as ISOLATED instead of Binance's
+///   CROSSED ([`never_set_position`]). It changes the STORED byte, not the gate: the position is
+///   ISOLATED exactly as if its owner had called `setMarginType(ISOLATED)` on the flat market, and
+///   every rule runs under the real gate. The fixtures of the suites written for isolated margin
+///   call it, so their accounts stay isolated by an explicit choice rather than by the gate.
 #[cfg(test)]
 pub(crate) mod test_gate {
     use core::cell::Cell;
 
+    use crate::types::MarginType;
+
     std::thread_local! {
-        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+        static NEVER_SET: Cell<Option<MarginType>> = const { Cell::new(None) };
     }
 
-    pub(crate) fn enabled() -> bool {
-        ENABLED.with(Cell::get)
+    /// The gate this thread forces, if any; `None` = the real [`super::CROSS_MARGIN_ENABLED`].
+    pub(crate) fn forced() -> Option<bool> {
+        FORCED.with(Cell::get)
     }
 
-    /// Enables cross margin on this thread until the returned guard drops.
-    #[must_use = "cross margin is enabled only while the guard is alive"]
+    /// Forces cross margin ON on this thread until the returned guard drops.
+    #[must_use = "the gate is forced only while the guard is alive"]
     pub(crate) fn enable() -> Guard {
-        ENABLED.with(|c| c.set(true));
-        Guard(())
+        force(true)
     }
 
-    pub(crate) struct Guard(());
+    /// Forces cross margin OFF on this thread until the returned guard drops: every position is
+    /// ISOLATED in force whatever it stores, and `setMarginType(CROSSED)` is refused.
+    #[must_use = "the gate is forced only while the guard is alive"]
+    pub(crate) fn disable() -> Guard {
+        force(false)
+    }
+
+    fn force(on: bool) -> Guard {
+        Guard(FORCED.with(|c| c.replace(Some(on))))
+    }
+
+    /// Restores the gate that was in force when it was created.
+    pub(crate) struct Guard(Option<bool>);
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            ENABLED.with(|c| c.set(false));
+            FORCED.with(|c| c.set(self.0));
         }
+    }
+
+    /// Makes every never-written position on this thread ISOLATED (see the module doc). For the
+    /// rest of the thread — i.e. of the test — so a fixture can call it without handing back a
+    /// guard; calling it again is a no-op.
+    pub(crate) fn isolated_by_default() {
+        NEVER_SET.with(|c| c.set(Some(MarginType::Isolated)));
+    }
+
+    /// The never-set margin type this thread overrides, if any.
+    pub(crate) fn never_set_type() -> Option<MarginType> {
+        NEVER_SET.with(Cell::get)
     }
 }
 

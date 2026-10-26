@@ -80,6 +80,9 @@ type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>,
 
 fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
+    // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+    // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+    crate::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, KEEPER, MAKER, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -562,7 +565,7 @@ fn seed_position(
             v_quote_balance: v_quote,
             margin,
             leverage,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -1294,7 +1297,7 @@ fn every_whitelisted_action_lands_on_the_sub_and_never_on_the_master() {
 
     // Through all of it, the master's blobs never moved.
     assert!(owned(&mut ctx, MA) == ma, "an action AS the sub landed on the master");
-    assert_eq!(position(&mut ctx, MA), PerpPosition::default());
+    assert_eq!(position(&mut ctx, MA), crate::margin_type::never_set_position());
 
     // internalTransfer as the sub → its master.
     wrap(&mut ctx, xfer(MA, SPOT, SPOT, 100_000_000));
@@ -1818,6 +1821,9 @@ fn deposit_and_withdraw_through_the_wrapper_are_refused_and_money_leaves_via_the
         db.insert_account_storage(USDC_ADDRESS, erc20_balance_slot(who).into(), U256::from(amount))
             .unwrap();
     }
+    // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+    // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+    crate::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for a in [USDC_ADDRESS, PERP_DEX_ADDRESS, MA, SA0, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), a).unwrap();

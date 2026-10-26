@@ -93,6 +93,9 @@ const STOP_MARKET: u8 = 1;
 
 fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
+    // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
+    // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
+    crate::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, BOB, CAROL, DAVE, ERIN, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -164,7 +167,7 @@ fn seed_pos(ctx: &mut TestCtx, user: Address, amount: i64, leverage: u64) {
             v_quote_balance: -amount * UNIT_VALUE,
             margin: amount.abs() * UNIT_VALUE / leverage as i64,
             leverage,
-            ..PerpPosition::default()
+            ..crate::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )

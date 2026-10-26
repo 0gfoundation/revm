@@ -3225,15 +3225,17 @@ pub(super) fn absorb_bad_debt_into_insurance_fund<H: PerpHost>(
 #[cfg(test)]
 mod isolated_margin_tests {
     use super::{apply_position_fill, OpeningMarginFunding};
-    use crate::types::PerpPosition;
+    use crate::types::{MarginType, PerpPosition};
 
-    /// Long `amount` units, entry value `-v_quote_balance`, isolated `margin`, leverage 1.
+    /// Long `amount` units, entry value `-v_quote_balance`, isolated `margin`, leverage 1 —
+    /// explicitly ISOLATED (the default margin type is CROSSED).
     fn long(amount: i64, v_quote_balance: i64, margin: i64) -> PerpPosition {
         PerpPosition {
             amount,
             v_quote_balance,
             margin,
             leverage: 1,
+            margin_type: MarginType::Isolated.code(),
             ..PerpPosition::default()
         }
     }
@@ -3400,6 +3402,7 @@ mod isolated_margin_tests {
                 v_quote_balance: vq,
                 margin: m,
                 leverage: 1,
+                margin_type: MarginType::Isolated.code(),
                 ..PerpPosition::default()
             };
             let mut wallet = 0i64;
