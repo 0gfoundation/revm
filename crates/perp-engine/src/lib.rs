@@ -49,6 +49,10 @@ mod cross_margin_p2_spec_tests;
 /// continuation, manual `liquidate()`, totality — under the custody identity.
 #[cfg(test)]
 mod cross_liquidation_tests;
+/// The cross golden scenario (cross P3, R8): the commitment pin and business snapshot of cross
+/// margin as it ships, beside the isolated `trading::tests::golden`.
+#[cfg(test)]
+mod cross_golden_tests;
 pub mod risk;
 pub mod storage;
 pub mod trading;

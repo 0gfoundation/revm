@@ -426,6 +426,12 @@ use primitives::{B256, U256};
 //     0xaea562b9…1e61. BusinessSnapshot UNCHANGED (the flip moves none of it; R7's earlier
 //     two-field delta stands). Golden re-pinned 0xaea562b9…1e61 → 0xfdf928b5…47d4. CHAIN change:
 //     a coordinated wipe on deploy.
+//   * P3 — the CROSS golden scenario (`perp_engine::cross_golden_tests`), a second pin beside the
+//     isolated one, of cross margin as it ships: mixed cross / isolated accounts, a funding epoch,
+//     a partial cross liquidation, a bankrupt episode ADL-ed at the MM-share bankruptcy price
+//     past a stale leg, the flag ended by a reduce-only close and the negative wallet that close
+//     left cleared by the insurance fund. Pinned 0x84977f13…e969 with its own business snapshot.
+//     A test only: no rule moves, and the isolated pin 0xfdf928b5…47d4 is unchanged.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
