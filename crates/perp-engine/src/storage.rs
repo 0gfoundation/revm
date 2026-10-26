@@ -176,9 +176,19 @@ pub(crate) fn store_blob<H: PerpHost>(
     key: B256,
     buf: &[u8],
 ) -> Result<(), PerpError> {
+    store_blob_owned(context, key, buf.to_vec())
+}
+
+/// [`store_blob`] taking the bytes BY VALUE — for a caller that built or edited its own buffer,
+/// which then moves into the overlay without a copy.
+pub(crate) fn store_blob_owned<H: PerpHost>(
+    context: &mut H,
+    key: B256,
+    buf: Vec<u8>,
+) -> Result<(), PerpError> {
     #[cfg(test)]
     bench_counter::record_write(key, buf.len());
-    context.perp_store(key, buf.to_vec());
+    context.perp_store(key, buf);
     Ok(())
 }
 
@@ -1540,14 +1550,6 @@ fn position_state_fields(p: &PerpPosition) -> (i64, i64, i64, u64, u64, u64, u64
 // validators). An empty blob deletes the key. Membership is exact — closed
 // positions are removed — so the set never grows unbounded.
 
-fn pack_addresses(addrs: &[Address]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(addrs.len() * 20);
-    for a in addrs {
-        buf.extend_from_slice(a.as_slice());
-    }
-    buf
-}
-
 fn unpack_addresses(buf: &[u8]) -> Result<Vec<Address>, PerpError> {
     if buf.len() % 20 != 0 {
         return Err(perp_err("corrupt position-registry blob"));
@@ -1563,28 +1565,31 @@ pub fn load_position_registry<H: PerpHost>(
     unpack_addresses(&load_blob(context, position_registry_key(market_id))?)
 }
 
-/// Persists the registry; an empty slice deletes the key.
-fn save_position_registry<H: PerpHost>(
-    context: &mut H,
-    market_id: u64,
-    addrs: &[Address],
-) -> Result<(), PerpError> {
-    store_blob(
-        context,
-        position_registry_key(market_id),
-        &pack_addresses(addrs),
-    )
+/// Where `user` sits in a packed registry blob, if it is there — a scan of the 20-byte records in
+/// place, with no `Vec<Address>` built.
+fn registry_slot(buf: &[u8], user: Address) -> Result<Option<usize>, PerpError> {
+    if buf.len() % 20 != 0 {
+        return Err(perp_err("corrupt position-registry blob"));
+    }
+    Ok(buf.chunks_exact(20).position(|a| a == user.as_slice()))
 }
+
+// The two membership edits work on the PACKED bytes: the blob read is edited in place — one
+// record appended, or one cut out with the rest moved up, so the insertion order is the one
+// unpack → push / retain → pack gave — and moved back into the overlay. Byte-identical to that
+// round trip, without its `Vec<Address>`, its re-pack and its copy on the way out: a close in a
+// market of M holders used to copy the M × 20-byte blob four times (P4 review, finding 7).
 
 fn registry_add<H: PerpHost>(
     context: &mut H,
     market_id: u64,
     user: Address,
 ) -> Result<(), PerpError> {
-    let mut regs = load_position_registry(context, market_id)?;
-    if !regs.contains(&user) {
-        regs.push(user);
-        save_position_registry(context, market_id, &regs)?;
+    let key = position_registry_key(market_id);
+    let mut buf = load_blob(context, key)?;
+    if registry_slot(&buf, user)?.is_none() {
+        buf.extend_from_slice(user.as_slice());
+        store_blob_owned(context, key, buf)?;
     }
     Ok(())
 }
@@ -1594,11 +1599,13 @@ fn registry_remove<H: PerpHost>(
     market_id: u64,
     user: Address,
 ) -> Result<(), PerpError> {
-    let mut regs = load_position_registry(context, market_id)?;
-    let before = regs.len();
-    regs.retain(|a| a != &user);
-    if regs.len() != before {
-        save_position_registry(context, market_id, &regs)?;
+    let key = position_registry_key(market_id);
+    let mut buf = load_blob(context, key)?;
+    // At most one record per user (`registry_add` appends only when absent). The last one leaving
+    // stores the empty blob, which deletes the key.
+    if let Some(i) = registry_slot(&buf, user)? {
+        buf.drain(i * 20..(i + 1) * 20);
+        store_blob_owned(context, key, buf)?;
     }
     Ok(())
 }

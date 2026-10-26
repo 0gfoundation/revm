@@ -2046,6 +2046,57 @@ fn position_registry_tracks_open_positions() {
         .is_empty());
 }
 
+/// The registry blob is the members' 20-byte addresses back to back, in insertion order, edited in
+/// place: an open appends one record, a close cuts its record out of the middle and moves the rest
+/// up, and the last close leaves no key at all (an empty blob).
+#[test]
+fn position_registry_blob_is_edited_in_place() {
+    let mut ctx = make_ctx();
+    let m = MARKET_ID;
+    let users = [user_addr(1), user_addr(2), user_addr(3), user_addr(4)];
+    let open = |amt: i64| PerpPosition {
+        amount: amt,
+        ..crate::margin_type::never_set_position()
+    };
+    let blob = |ctx: &mut TestCtx| {
+        storage::load_blob(ctx, perp_core::keys::position_registry_key(MARKET_ID)).unwrap()
+    };
+    let packed = |members: &[Address]| members.iter().flat_map(|a| a.0 .0).collect::<Vec<u8>>();
+    for (i, &u) in users.iter().enumerate() {
+        let amt = if i % 2 == 0 { 5 } else { -5 };
+        storage::save_position(&mut ctx, u, m, &open(amt), AccountUpdateReason::Adjustment).unwrap();
+    }
+    assert_eq!(blob(&mut ctx), packed(&users));
+    // A close in the middle, then at the end, then at the front.
+    for (gone, left) in [
+        (users[1], vec![users[0], users[2], users[3]]),
+        (users[3], vec![users[0], users[2]]),
+        (users[0], vec![users[2]]),
+    ] {
+        storage::save_position(&mut ctx, gone, m, &open(0), AccountUpdateReason::Adjustment)
+            .unwrap();
+        assert_eq!(blob(&mut ctx), packed(&left), "{gone} closed");
+        assert_eq!(storage::load_position_registry(&mut ctx, m).unwrap(), left);
+    }
+    // Reopening appends at the end, once.
+    storage::save_position(&mut ctx, users[1], m, &open(2), AccountUpdateReason::Adjustment).unwrap();
+    storage::save_position(&mut ctx, users[1], m, &open(3), AccountUpdateReason::Adjustment).unwrap();
+    assert_eq!(blob(&mut ctx), packed(&[users[2], users[1]]));
+    for u in [users[2], users[1]] {
+        storage::save_position(&mut ctx, u, m, &open(0), AccountUpdateReason::Adjustment).unwrap();
+    }
+    assert!(blob(&mut ctx).is_empty(), "the last close deletes the key");
+    // An open by a user the blob already lists — a planted state: the position zeroed behind the
+    // hook's back — keeps one record.
+    storage::save_position(&mut ctx, users[0], m, &open(1), AccountUpdateReason::Adjustment).unwrap();
+    {
+        use crate::host::PerpHost as _;
+        ctx.live().set_position(users[0], m, crate::margin_type::never_set_position());
+    }
+    storage::save_position(&mut ctx, users[0], m, &open(1), AccountUpdateReason::Adjustment).unwrap();
+    assert_eq!(blob(&mut ctx), packed(&[users[0]]), "never listed twice");
+}
+
 #[test]
 fn rejects_quantity_not_multiple_of_step_size() {
     let mut ctx = make_ctx();
