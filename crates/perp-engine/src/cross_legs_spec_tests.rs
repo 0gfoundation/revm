@@ -34,6 +34,11 @@
 //! * At every block end: the committed bytes of every account's legs key decode to `legs(u)`, and
 //!   the key is ABSENT for an account with no cross leg.
 //!
+//! The checker reads on a throwaway copy of the host ([`World::probe`]), never on the host the
+//! calls run on: its reads would otherwise leave every account's legs resident after each call,
+//! and the next call would never take the cold-load branch a real block takes for an account it
+//! has not touched yet.
+//!
 //! # Map
 //!
 //! * `route_*` — one scenario per route that moves a position: taker and maker fills (open,
@@ -245,6 +250,11 @@ struct World {
     /// The return bytes of the last call made through [`World::attempt`].
     last_out: Vec<u8>,
     reached: Reached,
+    /// The per-call check is on — off only in a test that plants a leg the positions do not
+    /// imply (corrupt state, which no call can produce).
+    checked: bool,
+    /// Inside [`World::probe`]: `h` is the throwaway copy.
+    probing: bool,
 }
 
 fn revert_reason(out: &PerpOutput) -> String {
@@ -345,6 +355,8 @@ impl World {
             specs: specs.clone(),
             last_out: Vec::new(),
             reached: Reached::default(),
+            checked: true,
+            probing: false,
         };
         w.ok(ADMIN, &initAdminCall { admin: ADMIN }.abi_encode());
         for s in &specs {
@@ -432,6 +444,28 @@ impl World {
 
     // ── reads ──
 
+    /// Runs `f` on a throwaway copy of the host — the live store and the byte overlay cloned, the
+    /// committed store lent — so that what the checker reads (the legs, the health, a view) never
+    /// warms the real host's in-block caches: the legs a call finds resident or cold are exactly
+    /// those it would find with nobody watching, so the cold-load branches run too. Re-entrant: a
+    /// read inside a probe runs on that probe.
+    fn probe<R>(&mut self, f: impl FnOnce(&mut World) -> R) -> R {
+        if self.probing {
+            return f(self);
+        }
+        let mut copy = InMemoryHost::new(self.h.now);
+        copy.live = self.h.live.clone();
+        copy.overlay = self.h.overlay.clone();
+        copy.committed = std::mem::take(&mut self.h.committed);
+        std::mem::swap(&mut self.h, &mut copy);
+        self.probing = true;
+        let r = f(self);
+        self.probing = false;
+        std::mem::swap(&mut self.h, &mut copy);
+        self.h.committed = std::mem::take(&mut copy.committed);
+        r
+    }
+
     fn pos(&mut self, u: Address, m: u64) -> crate::types::PerpPosition {
         storage::load_position(&mut self.h, u, m).unwrap()
     }
@@ -453,19 +487,14 @@ impl World {
     }
 
     fn stored_legs(&mut self, u: Address) -> Vec<CrossLegState> {
-        storage::load_cross_legs_ref(&mut self.h, u).unwrap().0.clone()
+        self.probe(|w| storage::load_cross_legs_ref(&mut w.h, u).unwrap().0.clone())
     }
 
     fn account_view(&mut self, u: Address) -> getAccountReturn {
-        let out = run_perp_dex_call(
-            &getAccountCall { user: u }.abi_encode(),
-            GAS,
-            KEEPER,
-            U256::ZERO,
-            true,
-            &mut self.h,
-        )
-        .unwrap();
+        let input = getAccountCall { user: u }.abi_encode();
+        let out = self.probe(|w| {
+            run_perp_dex_call(&input, GAS, KEEPER, U256::ZERO, true, &mut w.h).unwrap()
+        });
         assert!(!out.reverted, "getAccount reverted: {}", revert_reason(&out));
         getAccountCall::abi_decode_returns(&out.bytes).unwrap()
     }
@@ -494,6 +523,10 @@ impl World {
     /// The model's health of `u`, priced from `legs(u)`, the marks, the FundingState indices and
     /// the tier tables this world set.
     fn model_health(&mut self, u: Address) -> Health {
+        self.probe(|w| w.model_health_of(u))
+    }
+
+    fn model_health_of(&mut self, u: Address) -> Health {
         let w = self.wallet(u);
         let mut hl = Health { w, e: w, cmm: 0, has_cross: false, legs: Vec::new() };
         for l in self.model_legs(u) {
@@ -517,7 +550,8 @@ impl World {
     /// The engine's `cross_health`, in the model's shape.
     fn engine_health(&mut self, u: Address) -> (Health, u8) {
         let mut legs = Vec::new();
-        let h = crate::margin_view::cross_health(&mut self.h, u, Some(&mut legs)).unwrap();
+        let h = self.probe(|w| crate::margin_view::cross_health(&mut w.h, u, Some(&mut legs)));
+        let h = h.unwrap();
         let legs = legs
             .iter()
             .map(|l| LegTerms {
@@ -530,16 +564,22 @@ impl World {
         (Health { w: h.w, e: h.e, cmm: h.cross_mm, has_cross: h.has_cross, legs }, h.faulted_legs)
     }
 
-    /// The per-call check (module docs) for every account.
+    /// The per-call check (module docs) for every account, on a probe.
     fn check(&mut self, at: &str) {
+        if self.checked {
+            self.probe(|w| w.check_all(at));
+        }
+    }
+
+    fn check_all(&mut self, at: &str) {
         for u in self.users.clone() {
+            if let Resident::Hit(v) = self.h.live.cross_legs(u) {
+                assert!(!v.is_empty(), "{at}: {u}'s legs resident as an EMPTY list, not a delete");
+            }
             let want = self.model_legs(u);
             assert!(want.len() <= crate::types::MAX_USER_MARKETS, "{at}: {u} legs {want:?}");
             let got = self.stored_legs(u);
             assert_eq!(got, want, "{at}: {u}'s stored cross legs");
-            if let Resident::Hit(v) = self.h.live.cross_legs(u) {
-                assert!(!v.is_empty(), "{at}: {u}'s legs resident as an EMPTY list, not a delete");
-            }
             let model = self.model_health(u);
             let (engine, faulted) = self.engine_health(u);
             assert_eq!(faulted, 0, "{at}: {u} faulted legs");
@@ -550,7 +590,7 @@ impl World {
 
     /// The legs every account holds now (the refused-call witness and the moved-legs counter).
     fn all_legs(&mut self) -> Vec<Vec<CrossLegState>> {
-        self.users.clone().into_iter().map(|u| self.stored_legs(u)).collect()
+        self.probe(|w| w.users.clone().into_iter().map(|u| w.stored_legs(u)).collect())
     }
 
     /// Ends the block: the delta reaches the committed store and the live store is reset. Then
@@ -558,19 +598,24 @@ impl World {
     fn end_block(&mut self) {
         let _ = self.h.end_block();
         self.reached.blocks += 1;
-        for u in self.users.clone() {
-            let want = self.model_legs(u);
-            let key = perp_core::keys::cross_legs_key(u);
-            match self.h.committed.get(&key) {
-                None => assert!(want.is_empty(), "block end: {u} has legs {want:?} uncommitted"),
-                Some((bytes, _)) => {
-                    assert!(!want.is_empty(), "block end: {u} holds no leg, the key is stored");
-                    let got: CrossLegs = perp_core::codec::decode(bytes).unwrap();
-                    assert_eq!(got.0, want, "block end: {u}'s committed cross legs");
+        if !self.checked {
+            return;
+        }
+        self.probe(|w| {
+            for u in w.users.clone() {
+                let want = w.model_legs(u);
+                let key = perp_core::keys::cross_legs_key(u);
+                match w.h.committed.get(&key) {
+                    None => assert!(want.is_empty(), "block end: {u}'s legs {want:?} uncommitted"),
+                    Some((bytes, _)) => {
+                        assert!(!want.is_empty(), "block end: {u} holds no leg, the key is stored");
+                        let got: CrossLegs = perp_core::codec::decode(bytes).unwrap();
+                        assert_eq!(got.0, want, "block end: {u}'s committed cross legs");
+                    }
                 }
             }
-        }
-        self.check("after the block end");
+            w.check_all("after the block end");
+        });
     }
 
     // ── the shell ──
@@ -636,8 +681,7 @@ impl World {
         let clear = evs::<AccountBalanceChanged>(logs);
         r.clearances += clear.iter().filter(|a| a.reason == INSURANCE_CLEAR).count() as u64;
         for a in adl {
-            let winner = a.adlUser;
-            let p = storage::load_position(&mut self.h, winner, a.marketId).unwrap();
+            let p = self.probe(|w| w.pos(a.adlUser, a.marketId));
             self.reached.adl_cross_winner += (p.margin_type == CROSSED) as u64;
         }
     }
@@ -1124,6 +1168,121 @@ fn route_sixteen_markets_mixed_account() {
     assert!(!evs::<CrossLiquidationStarted>(&logs).is_empty());
     w.end_block();
     assert_eq!(w.reached.max_legs, 16, "BOB: sixteen cross legs");
+}
+
+/// **ADL ranks every CROSS winner on its OWN leg** (R5: `uPnL_k / E` for a winner in profit).
+/// ALICE's cross long of 2 is liquidated at an unchanged mark with an empty book (`0 ≤ E < ΣMM`:
+/// the remainder goes to ADL at the mark). The shorts are BOB (1 @ 1,100: `uPnL = $100`, `E =
+/// $1,000`, rank 0.1) and CAROL (2 @ 1,500: `uPnL = $1,000`, `E = $5,000`, rank 0.2), BOB first in
+/// the market's registry: CAROL ranks first and takes both units. Ranking CAROL on BOB's leg
+/// (0.02) would hand them to BOB.
+#[test]
+fn route_adl_ranks_each_cross_winner_on_its_own_leg() {
+    let mut w = std_world();
+    w.fill(BOB, M1, -1, 1_100);
+    w.fill(CAROL, M1, -2, 1_500);
+    w.ok(BOB, &transferFromPerpCall { amount: (d(1_000_000) - d(900)) as u64 }.abi_encode());
+    w.ok(CAROL, &transferFromPerpCall { amount: (d(1_000_000) - d(4_000)) as u64 }.abi_encode());
+    let (b, c) = (w.model_health(BOB), w.model_health(CAROL));
+    assert_eq!((b.e, b.legs[0].upnl, c.e, c.legs[0].upnl), (d(1_000), d(100), d(5_000), d(1_000)));
+    // ALICE: long 2 on M1 and 10 on M2, then the M2 long closed as a maker at a loss that leaves
+    // `E = $90` against `MM_M1 = $100`.
+    w.fill(ALICE, M1, 2, 1_000);
+    w.fill(ALICE, M2, 10, 1_000);
+    let x = w.account_view(ALICE).maxWithdrawAmount;
+    w.ok(ALICE, &transferFromPerpCall { amount: x }.abi_encode());
+    assert_eq!(w.wallet(ALICE), d(1_200));
+    w.make(ALICE, M2, -10, 889, RO);
+    let a = w.model_health(ALICE);
+    assert_eq!((a.e, a.cmm), (d(90), d(100)));
+    w.end_block();
+    let logs = w.tick(M1, 1_000);
+    let adl: Vec<(Address, u64, u64)> =
+        evs::<Adl>(&logs).iter().map(|a| (a.adlUser, a.qty, a.price)).collect();
+    assert_eq!(adl, vec![(CAROL, 2, 1_000)], "CAROL ranks first on her own leg");
+    w.end_block();
+}
+
+/// **The partial stop is judged AFTER the clearance fee** (Q6: "after deducting realized losses
+/// and the Liquidation Clearance Fee"; Q3: 5 % of the notional closed). ALICE's cross long of 10 @
+/// 1,000 on a $1,000 wallet is caught at 940 (`E = $400 < MM = $470`). Her IOC (limit = BP 900)
+/// sells 2 into BOB's bid at the mark: `E` stays $400 against `MM = $376` on the 8 left — healthy
+/// BEFORE the $94 fee, under it AFTER ($306). So the episode goes on and ADLs the 8 at the mark.
+#[test]
+fn route_episode_partial_stop_is_judged_after_the_fee() {
+    let mut fee_market = Spec::whole(M1, 1_000, &T10);
+    fee_market.fee_bps = 500;
+    let mut w = World::new(vec![fee_market]);
+    for u in [ALICE, BOB] {
+        w.enroll(u, d(1_000_000));
+        w.set_lev(u, M1, 10);
+    }
+    w.fill(ALICE, M1, 10, 1_000);
+    let x = w.account_view(ALICE).maxWithdrawAmount;
+    w.ok(ALICE, &transferFromPerpCall { amount: x }.abi_encode());
+    assert_eq!(w.wallet(ALICE), d(1_000));
+    w.rest(BOB, M1, BUY, 940, 2);
+    w.end_block();
+    let logs = w.tick(M1, 940);
+    let liq = evs::<Liquidation>(&logs);
+    assert_eq!(liq.len(), 1, "one close step");
+    assert_eq!(liq[0].amount, 10, "the IOC's 2 and the ADL's 8: the whole position");
+    let adl: Vec<(u64, u64)> = evs::<Adl>(&logs).iter().map(|a| (a.qty, a.price)).collect();
+    assert_eq!(adl, vec![(8, 940)], "the remainder, at the mark (E ≥ 0)");
+    assert!(w.stored_legs(ALICE).is_empty());
+    assert!(!w.flagged(ALICE), "the episode ended");
+    w.end_block();
+}
+
+/// **A leg the health check cannot price keeps the deficit off the ADL price** (J4, P3 review: the
+/// ADL fills at the MARK unless every cross leg is priced). No call can produce such a leg — it is
+/// planted here, a leg naming a market that does not exist, which the TOTAL health check leaves
+/// out and counts as faulted. ALICE's real leg, long 10 @ 1,000 on a $1,000 wallet, is crashed to
+/// 800 (`E = −$1,000`): with every leg priced her remainder would be ADL'd at the MM-share
+/// bankruptcy price 900; with the faulted leg it is ADL'd at the mark. Release only: in a debug
+/// build the walk the health check is checked against panics on the planted leg first.
+#[cfg(not(debug_assertions))]
+#[test]
+fn route_a_faulted_leg_keeps_the_deficit_off_the_adl_price() {
+    let mut w = std_world();
+    w.fill(ALICE, M1, 10, 1_000);
+    let x = w.account_view(ALICE).maxWithdrawAmount;
+    w.ok(ALICE, &transferFromPerpCall { amount: x }.abi_encode());
+    w.checked = false;
+    let phantom = CrossLegState {
+        market_id: 99,
+        amount: 1,
+        v_quote_balance: 0,
+        last_funding_index: 0,
+    };
+    storage::plant_cross_leg_for_test(&mut w.h, ALICE, 99, Some(phantom)).unwrap();
+    let (_, faulted) = w.engine_health(ALICE);
+    assert_eq!(faulted, 1);
+    let logs = w.tick(M1, 800);
+    let adl: Vec<(u64, u64)> = evs::<Adl>(&logs).iter().map(|a| (a.qty, a.price)).collect();
+    assert_eq!(adl, vec![(10, 800)], "at the mark, not at the bankruptcy price 900");
+}
+
+/// **D4 — the debug cross-check compares the health's NUMBERS with the walk's, not only the list.**
+/// A position whose resting-bid aggregate is past anything a gate admits (planted, at leverage 1:
+/// no call can produce it) keeps its leg exactly as stored — amount, vQuote and anchor unchanged,
+/// so the list check passes — but the walk cannot price its open-order margin and leaves the leg
+/// out, while the legs-based health prices it: the one divergence the two are documented to have.
+/// Every debug `cross_health` must catch it.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "disagrees with the cross_fold walk")]
+fn debug_cross_check_compares_the_health_with_the_walk() {
+    let mut w = std_world();
+    w.fill(ALICE, M1, 2, 1_000);
+    w.checked = false;
+    // At leverage 1 the bid branch `N + Bid` is past `u64`: the walk's initial margin overflows.
+    let mut p = w.pos(ALICE, M1);
+    p.leverage = 1;
+    p.total_buy_qty = u64::MAX / 2;
+    p.total_buy_notional = u64::MAX;
+    w.h.live.set_position(ALICE, M1, p);
+    let _ = crate::margin_view::cross_health(&mut w.h, ALICE, None);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
