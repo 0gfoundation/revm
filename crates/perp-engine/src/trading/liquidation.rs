@@ -33,22 +33,32 @@ pub(crate) struct LiquidationCloseOutcome {
     pub(crate) maker_cap_deferred: bool,
 }
 
+///
+/// `limit`: `None` for an ISOLATED liquidation — a MARKET order, bounded by the price band alone.
+/// `Some(p)` for a CROSS episode's close (cross P3, owner decision Q4): a LIMIT IOC at `p`, the
+/// account's MM-share bankruptcy price clamped into the band — Binance's "one large Immediate or
+/// Cancel order" whose "limit price" is the bankruptcy price. Both never rest.
 pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
     context: &mut H,
     user: Address,
     market: &Market,
     side: Side,
     quantity: u64,
+    limit: Option<u64>,
 ) -> Result<LiquidationCloseOutcome, PerpError> {
     let (order_id, bumped_nonce) = super::peek_order_id(context, user)?;
-    // A liquidation close IS a market order: immediate-or-cancel, bounded by the price band, never
-    // resting. One `OrderKind` says so, and the record/event's two wire fields are derived from it.
-    let kind = OrderKind::Market;
+    // A liquidation close is immediate-or-cancel, bounded by the price band, never resting: a
+    // market order, or (cross) a limit IOC. One `OrderKind` says which, and the record/event's two
+    // wire fields are derived from it.
+    let (kind, price) = match limit {
+        None => (OrderKind::Market, 0),
+        Some(p) => (OrderKind::Limit(crate::types::TimeInForce::Ioc), p),
+    };
     let mut order = Order {
         owner: user.0 .0,
         market_id: market.market_id,
         side,
-        price: 0,
+        price,
         quantity,
         filled: 0,
         order_type: kind.order_type(),
@@ -78,7 +88,7 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
             marketId: market.market_id,
             orderId: FixedBytes(order_id),
             side: side as u8,
-            price: 0,
+            price,
             quantity,
             orderType: kind.order_type() as u8,
             tif: kind.tif() as u8,
@@ -97,9 +107,9 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         &order_id,
         market.market_id,
         side,
-        0,
+        price,
         quantity,
-        kind, // market order: never rests, never all-or-nothing
+        kind, // market order or limit IOC: never rests, never all-or-nothing
         market,
         // Liquidation close: waive the taker trading fee (the liquidated user pays
         // the clearance fee to the IF instead). Also prevents the close from
@@ -111,8 +121,8 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
     // A liquidation that cannot complete is a LIVENESS failure, not a user error, so the write
     // barrier is hoisted by exactly ZERO statements here: `apply` is the next thing that runs.
     //
-    // Structurally, not by convention: this close is `OrderKind::Market`, and `Market` has
-    // `rests_remainder() == false`, so `match_order` never builds a `rest_basis`, no caller of this
+    // Structurally, not by convention: this close is `OrderKind::Market` or a limit IOC, and neither
+    // has `rests_remainder() == true`, so `match_order` never builds a `rest_basis`, no caller of this
     // function ever calls `rest_in_book`, and neither `RestOutcome` refusal is reachable from this
     // path at all. The set of rejects between the match and the flush is empty, which is the same
     // set it was before the hoist — the liquidation path's reject surface is unchanged.
@@ -207,7 +217,7 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 /// candidate is spent, under `BothSides` (see the tier notes in the body). Cascades from
 /// ADL'ing a thin winner resolve on a later sweep, not by in-`run_adl` recursion.
 ///
-/// # CROSSED winners — the P2 interim (P3 replaces it)
+/// # CROSSED winners — the P2 interim ranking (P3b replaces it)
 ///
 /// A winner CROSSED in force has no silo, so its position equity is not a number ADL can rank or
 /// screen it by. It is judged on its ACCOUNT instead: `E` from the TOTAL cross fold
@@ -217,28 +227,71 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 /// `E > 0` and `E` would stay `≥ 0` with this whole position closed at the fill price, fallback
 /// tier otherwise. Its fill settles into its cross wallet, either sign, with no bad debt of its own
 /// (`settlement::apply_position_fill` under `Cross`), so the fill policy binds only the loser's
-/// leg. The loser is never CROSSED: `liquidate_position` does not liquidate one in P2.
+/// leg.
+///
+/// # A CROSSED loser
+///
+/// Comes from a cross liquidation episode (`risk::cross_liquidation`) with its fill price decided
+/// on the ACCOUNT (`cross_fill_price`): the mark while `E ≥ 0`, the MM-share bankruptcy price
+/// otherwise. Its leg settles into its cross wallet like any cross fill; the episode charges the
+/// clearance fee on what this closed.
 pub(crate) fn run_adl<H: PerpHost>(
     context: &mut H,
     loser: Address,
     market: &Market,
     mark_price: u64,
     budget: &mut u32,
+    // The fill price for a CROSSED loser, decided by its liquidation episode
+    // (`risk::cross_liquidation`): the mark while the ACCOUNT's `E ≥ 0`, its MM-share bankruptcy
+    // price otherwise (R5) — a cross position has no silo, so its own position equity cannot pick
+    // the price the way an isolated one does below. `None` for an ISOLATED loser.
+    cross_fill_price: Option<u64>,
 ) -> Result<(), PerpError> {
     let mut loser_pos = storage::load_position(context, loser, market.market_id)?;
     if loser_pos.amount == 0 || *budget == 0 {
         return Ok(());
     }
-    // P3: a CROSSED loser's residual is closed by the cross episode, at the MM-share bankruptcy
-    // price. Unreachable in P2 — the only caller, `liquidate_position`, never liquidates a cross
-    // position — and answered totally (nothing done, nothing written) rather than with an `Err`,
-    // because this runs inside the sweep.
-    if crate::margin_type::effective_margin_type(&loser_pos) == crate::types::MarginType::Crossed {
-        return Ok(());
-    }
     let bd = market.base_decimals;
     let pd = market.price_decimals;
+    let loser_cross =
+        crate::margin_type::effective_margin_type(&loser_pos) == crate::types::MarginType::Crossed;
+    let (fill_price, loser_policy) = if loser_cross {
+        // ── A CROSSED loser: the episode's price ─────────────────────────────────────────────────
+        //
+        // Its leg settles into the cross wallet either sign and reports NO bad debt
+        // (`settlement::apply_position_fill` under `Cross`), so the policy binds only the WINNER's
+        // leg — `Forbid` and `LoserOnly` are the same thing here. A bankruptcy price of 0 (a short
+        // with no representable price) fills at ONE unit, the isolated rule's lowest non-giveaway
+        // price. Without a price (no caller does that) nothing is done — totally, this runs inside
+        // the sweep.
+        let Some(p) = cross_fill_price else {
+            debug_assert!(false, "run_adl: a CROSSED loser needs its episode's fill price");
+            return Ok(());
+        };
+        (p.max(1), BadDebtPolicy::Forbid)
+    } else {
+        isolated_adl_price(&loser_pos, mark_price, bd, pd)?
+    };
+    run_adl_fills(
+        context,
+        loser,
+        &mut loser_pos,
+        market,
+        mark_price,
+        budget,
+        fill_price,
+        loser_policy,
+    )
+}
 
+/// The fill price and loser policy of an ISOLATED loser's ADL: the mark for a solvent residual,
+/// its bankruptcy price for an insolvent one (see the body).
+fn isolated_adl_price(
+    loser_pos: &crate::types::PerpPosition,
+    mark_price: u64,
+    bd: u32,
+    pd: u32,
+) -> Result<(u64, BadDebtPolicy), PerpError> {
     // ── The fill price: MARK for a solvent residual, BANKRUPTCY PRICE for an insolvent one ──────
     //
     // Both kinds of residual come here, and the only thing that differs is the price. Using `p_b`
@@ -322,6 +375,23 @@ pub(crate) fn run_adl<H: PerpHost>(
             p_b
         }
     };
+    Ok((fill_price, loser_policy))
+}
+
+/// The ADL fill loop proper, at a price and loser policy already decided ([`run_adl`]).
+#[allow(clippy::too_many_arguments)]
+fn run_adl_fills<H: PerpHost>(
+    context: &mut H,
+    loser: Address,
+    loser_pos: &mut crate::types::PerpPosition,
+    market: &Market,
+    mark_price: u64,
+    budget: &mut u32,
+    fill_price: u64,
+    loser_policy: BadDebtPolicy,
+) -> Result<(), PerpError> {
+    let bd = market.base_decimals;
+    let pd = market.price_decimals;
     let loser_is_long = loser_pos.amount > 0;
 
     // Enumerate + rank opposite-side candidates ONCE (rank stable within this call).
@@ -517,7 +587,7 @@ pub(crate) fn run_adl<H: PerpHost>(
         )?;
         let take = winner_pos.amount.unsigned_abs().min(remaining);
         let Some(fill) = adl_fill(
-            &mut loser_pos,
+            loser_pos,
             &mut loser_account.perp_wallet_balance,
             loser_close_is_buy,
             &mut winner_pos,
@@ -631,7 +701,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             context,
             loser,
             market,
-            &loser_pos,
+            loser_pos,
             fill.loser_realized_pnl,
             fill.quantity,
         )?;
@@ -659,7 +729,7 @@ pub(crate) fn run_adl<H: PerpHost>(
             context,
             loser,
             market.market_id,
-            &loser_pos,
+            loser_pos,
             AccountUpdateReason::Adjustment,
         )?;
         storage::save_account(context, loser, loser_account, AccountUpdateReason::Adjustment)?;

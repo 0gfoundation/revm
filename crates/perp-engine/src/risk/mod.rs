@@ -1228,6 +1228,7 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         market,
         liquidation_side,
         liquidation_quantity,
+        None,
     )?;
     let remaining = close.remaining;
     // The book leg stopped on the distinct-maker cap, which is per MATCH: a retry gets a fresh
@@ -1254,7 +1255,7 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         // are deliberate: the frequency is held down by capping leverage and shortening the price
         // update interval, and a deferred position was already the behaviour for insolvent
         // residuals.
-        run_adl(context, user, market, mark_price, adl_budget)?;
+        run_adl(context, user, market, mark_price, adl_budget, None)?;
     }
 
     // ── THE CLEARANCE FEE: a rate on the NOTIONAL this call closed (Q3), capped at the CLOSE

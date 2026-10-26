@@ -313,7 +313,8 @@ fn liquidation_matching_caps_distinct_maker_accounts() {
         .unwrap()
         .unwrap();
     let close =
-        execute_liquidation_market_order(&mut ctx, ALICE, &market, Side::Sell, quantity).unwrap();
+        execute_liquidation_market_order(&mut ctx, ALICE, &market, Side::Sell, quantity, None)
+            .unwrap();
 
     assert_eq!(close.remaining, 1);
     // The 1 unit left over is NOT "the book ran out" — there is a 129th maker sitting right there
