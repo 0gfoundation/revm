@@ -66,6 +66,10 @@ mod cross_legs_tests;
 /// from the position records after every call, on every route, and at random.
 #[cfg(test)]
 mod cross_legs_spec_tests;
+/// Real-engine event fixtures for the perpdex-perf harness: scenarios driven through the call
+/// entry point on an `InMemoryHost`, recorded as receipts plus getter reads (`#[ignore]`d tool).
+#[cfg(test)]
+mod fixture_export_tests;
 pub mod risk;
 pub mod storage;
 pub mod trading;
