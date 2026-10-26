@@ -699,6 +699,18 @@ fn s1_decompose(
                 std::hint::black_box(margin_view::cross_fold(h, u, None, None, None).unwrap());
             }),
         ),
+        (
+            "cross legs blob (P4, cold)",
+            Box::new(|h, u| {
+                std::hint::black_box(storage::load_cross_legs_ref(h, u).unwrap());
+            }),
+        ),
+        (
+            "cross_health, cold (P4: account + cross legs + compute)",
+            Box::new(|h, u| {
+                std::hint::black_box(margin_view::cross_health(h, u, None).unwrap());
+            }),
+        ),
     ];
     let warm_up = |h: &mut InMemoryHost| {
         for m in 1..=k {
@@ -760,6 +772,36 @@ fn s1_decompose(
         out,
         "| position(m1) + cold fold + account hit (the detection's reads) | {detection:.3} |"
     );
+    // P4: the detection the sweep runs since the switch — `cross_health`, no walk.
+    let mut v = Vec::new();
+    for _ in 0..reps {
+        let mut h = restore(&w.snap);
+        warm_up(&mut h);
+        for &u in &w.users {
+            margin_view::cross_health(&mut h, u, None).unwrap();
+        }
+        let t = Instant::now();
+        for &u in &w.users {
+            std::hint::black_box(margin_view::cross_health(&mut h, u, None).unwrap());
+        }
+        v.push(t.elapsed().as_nanos() as f64 / 1e3 / n);
+    }
+    let health_warm = median(&v);
+    out!(out, "| cross_health, warm (compute + resident lookups) | {health_warm:.3} |");
+    let mut v = Vec::new();
+    for _ in 0..reps {
+        let mut h = restore(&w.snap);
+        warm_up(&mut h);
+        let t = Instant::now();
+        for &u in &w.users {
+            std::hint::black_box(storage::load_position_ref(&mut h, u, 1).unwrap());
+            std::hint::black_box(margin_view::cross_health(&mut h, u, None).unwrap());
+            std::hint::black_box(storage::load_account_ref(&mut h, u).unwrap());
+        }
+        v.push(t.elapsed().as_nanos() as f64 / 1e3 / n);
+    }
+    let p4 = median(&v);
+    out!(out, "| position(m1) + cold cross_health + account hit (P4 detection reads) | {p4:.3} |");
     let (pos1, acct, umkt, posk, mkts, fold) =
         (results[0], results[1], results[2], results[3], results[4], results[5]);
     let walk = umkt + posk;
@@ -783,6 +825,17 @@ fn s1_decompose(
              {:.3} µs",
             t - detection
         );
+    }
+    let (legs, health) = (results[6], results[7]);
+    out!(
+        out,
+        "P4 detection reads (position(m1) + cold cross_health + account hit) {p4:.3} µs/candidate \
+         = position(m1) {pos1:.3} + cross legs {legs:.3} + the rest of cross_health (account, \
+         market hits, compute) {:.3}; cold cross_health alone {health:.3}, warm {health_warm:.3}",
+        (p4 - pos1 - legs).max(0.0)
+    );
+    if let Some(t) = tick_per_cand {
+        out!(out, "noliq tick {t:.3} µs/candidate → beyond the P4 reads {:.3} µs", t - p4);
     }
 }
 
