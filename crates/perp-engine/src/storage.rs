@@ -1233,6 +1233,27 @@ pub fn save_position<H: PerpHost>(
     } else if old_amount != 0 && pos.amount == 0 {
         registry_remove(context, market_id, user)?;
     }
+    // ── The cross legs (`types::CrossLegs`) — THE single maintenance point (cross P4) ─────────
+    //
+    // This market's CROSS LEG — `amount`, `v_quote_balance`, `last_funding_index` of a position
+    // CROSSED in force and non-zero (see `types::CrossLegs` for the invariant) — set from the
+    // position being stored, so the cross health check (`margin_view::cross_health`) can price the
+    // account from the account blob and this list, with no position walk. Compared against the
+    // leg of the OLD position, from the same already-paid read: a write that moves none of the
+    // three (a margin-only write, an isolated position, a `0 → 0` re-anchor) touches nothing; one
+    // that does rewrites this user's one list key — only ever on a call that moves a cross
+    // position, never on a placement or a cancel. Total: setting a leg cannot fail.
+    //
+    // BEFORE the position write, not after it: what follows that write can still return an `Err`
+    // (the per-user index's cap, the margin aggregate's overflow checks), and inside a batch an
+    // item that fails there is abort-forward — `drive_batch` KEEPS its writes. A leg set after
+    // them would then be missing under a stored non-zero CROSSED position, which the sweep, ADL
+    // and the flag's end judge by the legs alone. Set first, the leg and the position are written
+    // together or not at all.
+    let new_leg = crate::margin_type::cross_leg_of(market_id, pos);
+    if new_leg != old_leg {
+        set_cross_leg(context, user, market_id, new_leg)?;
+    }
     // ── `PerpPosition::generation` — THE single maintenance point ──────────────────────────────
     //
     // A position's life ENDS when a non-zero `amount` goes to 0 or changes sign; the next one (or
@@ -1363,20 +1384,6 @@ pub fn save_position<H: PerpHost>(
         if settle {
             typed_store_mut(context).note_account_to_settle(user, market_id);
         }
-    }
-    // ── The cross legs (`types::CrossLegs`) — THE single maintenance point (cross P4) ─────────
-    //
-    // This market's CROSS LEG — `amount`, `v_quote_balance`, `last_funding_index` of a position
-    // CROSSED in force and non-zero (see `types::CrossLegs` for the invariant) — set from the
-    // position being stored, so the cross health check (`margin_view::cross_health`) can price the
-    // account from the account blob and this list, with no position walk. Compared against the
-    // leg of the OLD position, from the same already-paid read: a write that moves none of the
-    // three (a margin-only write, an isolated position, a `0 → 0` re-anchor) touches nothing; one
-    // that does rewrites this user's one list key — only ever on a call that moves a cross
-    // position, never on a placement or a cancel. Total: setting a leg cannot fail.
-    let new_leg = crate::margin_type::cross_leg_of(market_id, pos);
-    if new_leg != old_leg {
-        set_cross_leg(context, user, market_id, new_leg)?;
     }
     // Position state moved (`amount` / `v_quote_balance` / `margin`) ⇒ one snapshot at the end of
     // the call. Binance's `ACCOUNT_UPDATE` carries a `P[]` array for exactly this, and its own

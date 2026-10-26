@@ -363,6 +363,36 @@ fn a_silent_match_flush_carries_a_zero_payment_funding_re_anchor_into_the_leg() 
     assert_legs(&mut ctx, &USERS, "silent flush");
 }
 
+/// `save_position` sets the leg BEFORE it writes the position: a write that fails AFTER the
+/// position write — here the per-user index's cap, which no call reaches (the placement gate
+/// refuses a 17th market first), so the full index is planted — keeps both or neither. Inside a
+/// batch it matters: an aborted item's writes are kept (`drive_batch` flushes the working set
+/// either way), and a position stored without its leg would be invisible to the sweep, ADL and
+/// the flag's end, which judge an account by its legs alone.
+#[test]
+fn a_position_write_that_fails_after_storing_keeps_its_leg() {
+    use crate::host::PerpHost as _;
+    let mut ctx = make_ctx();
+    ctx.live().set_user_markets(ALICE, (10..10 + crate::types::MAX_USER_MARKETS as u64).collect());
+    storage::begin_batch_ws(&mut ctx, ALICE);
+    let mut p = pos(&mut ctx, ALICE, M1);
+    assert_eq!((p.margin_type, p.amount), (CROSSED, 0));
+    p.amount = 5;
+    p.v_quote_balance = -5 * px(100) as i64 * 10_000;
+    let r = storage::save_position(&mut ctx, ALICE, M1, &p, AccountUpdateReason::Order);
+    let err = format!("{:?}", r.expect_err("the per-user index is full"));
+    assert!(err.contains("[INVARIANT]") && err.contains("markets"), "{err}");
+    storage::flush_batch_ws(&mut ctx);
+
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 5, "the position write was kept");
+    assert_eq!(
+        stored_legs(&mut ctx, ALICE),
+        walked_legs(&mut ctx, ALICE),
+        "…and so was its leg"
+    );
+    assert_eq!(markets_of(&stored_legs(&mut ctx, ALICE)), vec![M1]);
+}
+
 // ── D3 / D4: the health check is the walk's numbers ─────────────────────────────
 
 /// `cross_health` against `cross_fold` computed HERE — not through the `debug_assertions`
