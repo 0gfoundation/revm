@@ -1185,11 +1185,6 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         Side::Buy
     };
     let liquidation_quantity = pos.amount.unsigned_abs();
-    // The margin this liquidation STARTS from. Captured after `compute_funding_settlement` has
-    // already adjusted `pos.margin` in memory and before anything closes, so the difference
-    // against the post-close margin is purely what the close consumed — no funding in it. That
-    // ordering is what the clearance fee below depends on; do not move either half.
-    let pre_liq_margin = pos.margin.max(0) as u64;
 
     // ── APPLY (liquidatable — commit the funding settle, then close) ──
     let funding_published = pending_funding.is_some();
@@ -1210,8 +1205,8 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // published.
     //
     // ⚠️ This used to be invisible because the clearance fee ALWAYS wrote the account a few lines
-    // down and so always gave the drained row something to say. Now that the fee is levied on the
-    // margin actually consumed, a liquidation that closes nothing charges nothing — and without
+    // down and so always gave the drained row something to say. Now that the fee is levied on
+    // what the call actually closed, a liquidation that closes nothing charges nothing — and without
     // this clear it would emit a duplicate. Any later leg that moves money (a fill, ADL, the fee)
     // re-marks the user and the settled end state is still published.
     if funding_published {
@@ -1220,6 +1215,11 @@ pub(crate) fn liquidate_position<H: PerpHost>(
 
     // Cancel all open orders for this user/market (emits OrderCancelled events).
     cancel_all_orders_for_market(context, user, market_id, market, CancelReason::Liquidation)?;
+
+    // The wallet BEFORE the close legs — the base of the clearance fee's J5 cap (the close credit
+    // this close returns to it). After the funding settle, which moves no wallet for an isolated
+    // position (it settles against `pos.margin`), and after the cancel-all, which moves no money.
+    let pre_close_wallet = storage::load_account_ref(context, user)?.perp_wallet_balance;
 
     // Try to close through the orderbook; ADL any residual.
     let close = execute_liquidation_market_order(
@@ -1257,68 +1257,52 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         run_adl(context, user, market, mark_price, adl_budget)?;
     }
 
-    // Isolated margin: the position's loss (book leg + residual) was already contained
-    // to its margin and any bad debt routed directly to the Insurance Fund by the close
-    // paths (apply_position_fill / settle_liquidation_residual), so LIQUIDATION never drives
-    // the wallet negative. It may nonetheless ARRIVE here negative, and since cross margin (P2)
-    // that is a normal state rather than a corner: the same wallet is the CROSS wallet, which every
-    // cross position's realized loss, funding charge and fee settles into whatever its sign
-    // (`settlement::apply_position_fill` under `Cross`) — besides the isolated maker commission an
-    // M1-capped opening margin could not absorb (`settle_maker_fill_core`). Hence the `.max(0)`
-    // below: the clearance fee is capped at the POSITIVE balance, so an already-negative wallet is
-    // charged nothing rather than being pushed further under (and `as u64` on a negative i64 would
-    // otherwise wrap to an astronomical cap).
+    // ── THE CLEARANCE FEE: a rate on the NOTIONAL this call closed (Q3), capped at the CLOSE
+    // CREDIT it returned to the wallet (J5) ───────────────────────────────────────────────────────
     //
-    // P3 (J5 / Q3): an ISOLATED liquidation's fee is then capped at the close credit this close
-    // returned to the wallet instead, so it cannot quietly draw on the cross pool; and it becomes
-    // a rate on the closed NOTIONAL for both modes.
-    // Charge the clearance fee from the liquidated user's remaining wallet (capped at the balance)
-    // and credit it to the Insurance Fund.
+    // Binance's Liquidation Clearance Fee is `Position Nominal Value × Liquidation Fee Rate`
+    // (cross report F21), and owner decision Q3 makes it that for BOTH margin types:
+    // `notional(mark, closed) × liquidation_fee_rate_bps / 10_000`. It used to be the same rate on
+    // the silo margin the close CONSUMED, which only an isolated position has — a cross position's
+    // `margin` is always 0 — so one rule for both modes needs the notional basis. See
+    // [`charge_clearance_fee`] for the arithmetic and the rate's semantics (R7).
     //
-    // ── THE FEE IS LEVIED ON WHAT THIS CALL ACTUALLY CLOSED ──────────────────────────────────────
+    // ── ON WHAT THIS CALL ACTUALLY CLOSED ──────────────────────────────────────────────────────
     //
-    // Not on `pre_liq_margin`. A liquidation does NOT always finish in one call: the book leg can
-    // stop on the band or the distinct-maker cap, and the ADL leg can stop on the shared fill
-    // budget or find too little eligible opposite interest. The position then stays open and is
-    // re-swept — and a fee on the margin present at ENTRY charged the user again every round.
-    // Over n rounds that is a geometric series, up to ~2.5x the intended fee, and it is the user
-    // paying for OUR gas caps on what is one liquidation they did not finish.
+    // `closed` is the quantity THIS call took off the position (book leg + ADL), never the entry
+    // size. A liquidation does NOT always finish in one call: the book leg can stop on the band or
+    // the distinct-maker cap, and the ADL leg on the shared fill budget or on too little eligible
+    // opposite interest. The position then stays open and is re-swept — and a fee on the size at
+    // ENTRY would charge the user again every round, a geometric series paid for OUR gas caps. On
+    // the closed quantity the rounds sum to one fee (up to one unit of flooring per round), with no
+    // state to remember that this victim was already charged, and a call that closed NOTHING —
+    // empty book, no ADL budget — charges nothing.
     //
-    // Levying it on the margin the call consumed makes the total exactly one fee no matter how
-    // many rounds it takes, with NO state to remember that this victim was already charged: the
-    // consumed amounts sum to the starting margin by construction. A full close is unchanged
-    // (post == 0), and a call that closed NOTHING — empty book, no ADL budget — now charges
-    // nothing, which is also the honest answer. Binance's liquidation fee is a rate on the
-    // notional actually closed, not a flat penalty, so this is the closer model besides.
-    let post_liq_margin = storage::load_position(context, user, market_id)?.margin.max(0) as u64;
-    let closed_margin = pre_liq_margin.saturating_sub(post_liq_margin);
-    let mut account = storage::load_account(context, user)?;
-    let clearance_fee = {
-        let fee = (closed_margin as u128).saturating_mul(market.liquidation_fee_rate_bps as u128)
-            / 10_000;
-        let fee = (fee as u64).min(account.perp_wallet_balance.max(0) as u64);
-        if fee > 0 {
-            account.debit_perp(fee)?;
-            // `InsuranceClear`: the counterparty of this wallet move IS the insurance fund — the
-            // clearance fee is debited here and credited to the fund two lines below.
-            storage::save_account(context, user, account, AccountUpdateReason::InsuranceClear)?;
-            let old_if = storage::load_insurance_fund(context)?;
-            let new_if = old_if
-                .checked_add(fee)
-                .ok_or_else(|| perp_err("liquidate: insurance fund overflow"))?;
-            storage::save_insurance_fund(context, new_if)?;
-            let fee_i64 = checked_u64_to_i64(fee, "liquidate: clearance fee delta")?;
-            context.log(Log {
-                address: PERP_DEX_ADDRESS,
-                data: IPerpDex::InsuranceFundChanged {
-                    delta: fee_i64,
-                    newBalance: new_if,
-                }
-                .to_log_data(),
-            });
-        }
-        fee
-    };
+    // ── J5: AT MOST WHAT THE CLOSE RETURNED TO THE WALLET ──────────────────────────────────────
+    //
+    // The fee is debited from `perp_wallet_balance`, and since cross margin (P2) that is the CROSS
+    // wallet: uncapped, an isolated liquidation's fee would quietly draw on the collateral of the
+    // account's cross positions. Binance deducts it "from the assets made available for the
+    // position", i.e. from what the close releases. So the cap is the close CREDIT — the wallet's
+    // rise across the two close legs (`apply_position_fill` releases the silo plus the realized
+    // PnL into it; an insolvent close returns nothing, its shortfall being bad debt) — and never
+    // more than the wallet then holds: a close credit that only netted a pre-existing negative
+    // wallet (a receivable) toward zero is not cash to charge, and a fee must never create or
+    // deepen a deficit. Hence a BANKRUPT isolated liquidation pays 0 (Binance: "no clearance fee
+    // for a bankrupt position").
+    let post_amount = storage::load_position_ref(context, user, market_id)?.amount;
+    let closed_quantity = liquidation_quantity.saturating_sub(post_amount.unsigned_abs());
+    let post_close_wallet = storage::load_account_ref(context, user)?.perp_wallet_balance;
+    let close_credit = (post_close_wallet as i128 - pre_close_wallet as i128).max(0);
+    let fee_cap = close_credit.min(post_close_wallet.max(0) as i128);
+    let clearance_fee = charge_clearance_fee(
+        context,
+        user,
+        market,
+        mark_price,
+        closed_quantity,
+        fee_cap,
+    )?;
 
     context.log(Log {
         address: PERP_DEX_ADDRESS,
@@ -1337,6 +1321,83 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         amount: liq_amount,
         reward: clearance_fee,
     })
+}
+
+/// The liquidation CLEARANCE FEE due on `closed_quantity` closed in `market` at `mark_price` —
+/// `notional × liquidation_fee_rate_bps / 10_000`, floored — before any cap.
+///
+/// # The rate (R7)
+///
+/// `Market::liquidation_fee_rate_bps` is a rate on the closed NOTIONAL, for both margin types —
+/// Binance's `exchangeInfo.liquidationFee` (`0.0125` = 125 bps on BTCUSDT / ETHUSDT / BNBUSDT,
+/// `0.015` on SOLUSDT; cross report F22). It used to be a rate on the isolated silo margin the
+/// close consumed. The engine has no default of its own (every market states its rate at
+/// `addMarket` / `updateMarket`), and the devnet markets were never calibrated on the old basis:
+/// they all run at 0 (`perpdex-perf` `LIQUIDATION_FEE_RATE_BPS = 0n`, the US-equity
+/// `markets.json`), which means "no fee" under both readings. So nothing is re-scaled here; a market
+/// that wants Binance's fee states Binance's number, 125.
+///
+/// # Total
+///
+/// The notional is `calc_value`, saturated to `u64::MAX` where it would not fit (the cap binds long
+/// before); the product is `u128`, saturating. No `Err` — this runs on the sweep path.
+pub(crate) fn clearance_fee_due(market: &Market, mark_price: u64, closed_quantity: u64) -> u128 {
+    let notional =
+        calc_value(mark_price, closed_quantity, market.base_decimals, market.price_decimals)
+            .unwrap_or(u64::MAX);
+    (notional as u128).saturating_mul(market.liquidation_fee_rate_bps as u128) / 10_000
+}
+
+/// Charge the liquidation clearance fee on `closed_quantity` ([`clearance_fee_due`]) to `user`'s
+/// perp wallet, at most `cap`, and credit it to the insurance fund. Returns the fee charged.
+///
+/// The CAP is the caller's, because it is the one thing the two margin types differ in (owner
+/// decision Q3): an ISOLATED liquidation passes the close credit its close returned to the wallet
+/// (J5 — see `liquidate_position`), a CROSS one `max(0, E_after)`. Either way a bankrupt
+/// liquidation passes `0` and pays nothing, Binance's rule.
+///
+/// TOTAL (J4) beyond the storage layer: the fee is further bounded so the wallet debit stays an
+/// `i64` and the fund a `u64`, so neither `debit_perp` nor the fund credit can fail. A fee of `0`
+/// writes nothing and emits nothing.
+pub(crate) fn charge_clearance_fee<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market: &Market,
+    mark_price: u64,
+    closed_quantity: u64,
+    cap: i128,
+) -> Result<u64, PerpError> {
+    if closed_quantity == 0 || cap <= 0 || market.liquidation_fee_rate_bps == 0 {
+        return Ok(0);
+    }
+    let old_if = storage::load_insurance_fund(context)?;
+    let mut account = storage::load_account(context, user)?;
+    // `W − fee ≥ i64::MIN` (a cross wallet may already be negative) and `IF + fee ≤ u64::MAX`.
+    let wallet_room = (account.perp_wallet_balance as i128 - i64::MIN as i128) as u128;
+    let fee = clearance_fee_due(market, mark_price, closed_quantity)
+        .min(cap as u128)
+        .min(wallet_room)
+        .min(i64::MAX as u128)
+        .min((u64::MAX - old_if) as u128) as u64;
+    if fee == 0 {
+        return Ok(0);
+    }
+    account.debit_perp(fee)?;
+    // `InsuranceClear`: the counterparty of this wallet move IS the insurance fund — the clearance
+    // fee is debited here and credited to the fund just below.
+    storage::save_account(context, user, account, AccountUpdateReason::InsuranceClear)?;
+    let new_if = old_if + fee;
+    storage::save_insurance_fund(context, new_if)?;
+    context.log(Log {
+        address: PERP_DEX_ADDRESS,
+        data: IPerpDex::InsuranceFundChanged {
+            // `fee ≤ i64::MAX` by the bound above.
+            delta: fee as i64,
+            newBalance: new_if,
+        }
+        .to_log_data(),
+    });
+    Ok(fee)
 }
 
 /// `liquidate(address user, uint64 marketId)`

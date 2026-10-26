@@ -612,9 +612,11 @@ pub struct Market {
     /// Per-epoch interest rate in FUNDING_RATE_ONE units (1e6 = 100%). Default: 100 = 0.01%.
     #[serde(default)]
     pub interest_rate: i64,
-    /// Liquidation clearance fee in basis points (1 bps = 0.01%).
-    /// Charged from remaining margin on solvent liquidations; credited to Insurance Fund.
-    /// 0 = no fee.
+    /// Liquidation clearance fee in basis points (1 bps = 0.01%) of the NOTIONAL a liquidation
+    /// closes (valued at the mark), for both margin types — Binance's `liquidationFee` (125 bps on
+    /// BTCUSDT; cross margin P3, owner decision Q3). Charged from the liquidated wallet, capped at
+    /// what the close returned to it (isolated) or at `max(0, E_after)` (cross), so a bankrupt
+    /// liquidation pays nothing; credited to the Insurance Fund. 0 = no fee.
     #[serde(default, rename = "lf")]
     pub liquidation_fee_rate_bps: u32,
     /// Price band half-width in basis points (1 bps = 0.01%). A limit order is

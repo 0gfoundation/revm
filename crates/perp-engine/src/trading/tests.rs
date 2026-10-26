@@ -6998,6 +6998,17 @@ mod golden {
     /// is ISOLATED in force. `BusinessSnapshot` UNCHANGED. VERIFIED: with all three fields
     /// `#[serde(skip)]` the scenario reproduced the previous 39 (P1) pin 0x7deaa026…6637.
     ///
+    /// Re-pinned again within 39 for P3 (cross liquidation, owner decision Q3 / J5 / R7): the
+    /// liquidation clearance fee is a rate on the NOTIONAL the liquidation closed (valued at the
+    /// mark), no longer on the silo margin it consumed, and an isolated liquidation's fee is capped
+    /// at the close credit its close returned to the wallet. The INTENDED isolated business change,
+    /// and it moves exactly two `BusinessSnapshot` fields, by the same 6_046: ALICE's liquidation
+    /// closes 0.04 @ the $70 mark = 2_800_000 of notional, so her 50 bps fee is 14_000 (it was
+    /// 7_954 = 50 bps of her 1_590_918 silo; the J5 cap, her ~1.4M close credit, does not bind) —
+    /// `alice_account.1` 999_059_631 → 999_053_585 and `insurance_fund` 49_007_954 → 49_014_000.
+    /// Nothing else moves. Prior value 0x8c500d81725e79c199fc06ab19800c60c25a914672399c09d6110ef2d5c2a62c
+    /// (39, P2 cross accounting).
+    ///
     /// Prior values 0x7deaa0263925b95e203cf08b43fbf93b34f7af725d19933d6e72510cd6c86637 (39, P1
     /// margin type), 0xafd826451ed6c8e356b03def92beb67c4e2431333141b39bfc21aeef4f057b48 (39, P0
     /// maintenance-rate column), 0x37a18141947ba3bb4fe923fe0e05a07d4dc0a8d1987096250991ed7d0f3f79de (38,
@@ -7017,7 +7028,7 @@ mod golden {
     /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
     /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
     const GOLDEN_COMMITMENT: B256 =
-        b256!("0x8c500d81725e79c199fc06ab19800c60c25a914672399c09d6110ef2d5c2a62c");
+        b256!("0xaea562b976f3f646a94f8cfbf468c1caf8e7c7465e30f351f3fb8ec719c91e61");
 
     /// Business end-state read back through view calls after the scenario.
     /// Pins semantics independently of the commitment hash construction.
@@ -7120,7 +7131,10 @@ mod golden {
             //      does not pay from the wallet is exactly the 400 less her margin
             //      returns, so the only net movement is the +2 she keeps (= the 2 the
             //      IF below no longer collects).
-            alice_account: (U256::from(500_000_000u64), 999_059_631),
+            //   5. cross P3 (Q3 / J5): the clearance fee is 50 bps of the NOTIONAL closed
+            //      (0.04 @ $70 = 2_800_000 → 14_000), no longer of the silo margin (7_954):
+            //      6_046 more leaves her wallet for the IF below (999_059_631 → 999_053_585).
+            alice_account: (U256::from(500_000_000u64), 999_053_585),
             // BOB perp = 1e9 + 830_000 short PnL (622_500 on the 3-QTY
             //   liquidation leg + 207_500 on the QTY closed via CAROL) + 400
             //   funding credit − 1_446 maker fees − 400_000 still reserved for
@@ -7147,14 +7161,13 @@ mod golden {
             // 100M funding − 50M IF deposit + 1M IF withdraw + 3_461 fees
             //   (liquidation close taker fee waived — fix B).
             admin_perp_wallet: 51_003_461,
-            // 50M deposit − 1M withdraw + 7_954 clearance fee
-            //   (50 bps of ALICE's 1_590_918 pre-liquidation margin — thicker than the
-            //   pre-cap 1_056_000 because she now runs at 3x instead of 5x, and 2_400
-            //   thinner than before the fee_reserved removal + A1 because her opening
-            //   taker fees (2_000) and her funding charge (400) are now both charged to
-            //   that margin; the 12 the IF no longer collects is the 12 ALICE keeps
-            //   above).
-            insurance_fund: 49_007_954,
+            // 50M deposit − 1M withdraw + 14_000 clearance fee: 50 bps of the 2_800_000
+            //   NOTIONAL ALICE's liquidation closed (0.04 @ the $70 mark — cross P3, Q3). It
+            //   was 7_954 = 50 bps of her 1_590_918 pre-liquidation silo margin until the fee
+            //   moved to the notional basis; the 6_046 difference is exactly what ALICE's
+            //   wallet above gives up. Its J5 cap (the close credit her close returned to the
+            //   wallet) does not bind.
+            insurance_fund: 49_014_000,
             // ALICE takers 2_015 + BOB maker 806 + 480 + 160 (CAROL's taker fee
             //   is 0 bps; the liquidation close taker fee is waived — fix B).
             market_fee_total: 3_461,

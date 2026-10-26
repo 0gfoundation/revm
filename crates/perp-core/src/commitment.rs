@@ -379,6 +379,18 @@ use primitives::{B256, U256};
 //     order pays its Open Loss, and a cross order's margin refusal carries `-2019`. Gated off no
 //     write, event or refusal of an isolated account moves: the golden pin 0x8c500d81…a62c is
 //     unchanged, BusinessSnapshot UNCHANGED.
+//   * P3 — the liquidation clearance fee (owner decision Q3, J5, R7). An EXECUTION-RULE change for
+//     isolated liquidations, no layout change: the fee is `notional(mark, closed quantity) ×
+//     liquidation_fee_rate_bps / 10_000` — a rate on the NOTIONAL the call closed, Binance's
+//     `liquidationFee` — where it was the same rate on the silo margin the close consumed, and it is
+//     capped at the close credit the close returned to the wallet (and at the positive wallet), so
+//     it can never draw on the cross pool and a bankrupt liquidation pays nothing. The fee moves a
+//     different amount from the wallet to the insurance fund, so the account and fund values
+//     folded into the delta differ. The INTENDED isolated business change: the golden scenario's
+//     BusinessSnapshot moves in exactly two fields, by the same 6_046 — ALICE's available balance
+//     (999_059_631 → 999_053_585) and the insurance fund (49_007_954 → 49_014_000): her fee is
+//     14_000 (50 bps of 0.04 @ $70) instead of 7_954 (50 bps of her silo). Golden re-pinned
+//     0x8c500d81…a62c → 0xaea562b9…1e61.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

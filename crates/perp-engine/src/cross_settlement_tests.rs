@@ -1074,7 +1074,10 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
     }
     storage::save_insurance_fund(&mut ctx, 10_000_000 * USD as u64).unwrap();
 
-    let mut seed: u64 = 0xC205_5AFE_2B1D_0021;
+    // Re-seeded (was `…_0021`) when the clearance fee moved to the notional basis (cross P3, Q3):
+    // the larger fee on the run's isolated liquidations changes every later random decision, and
+    // the old seed then never took ALICE's cross wallet negative.
+    let mut seed: u64 = 0xC205_5AFE_2B1D_009B;
     let mut rng = move || {
         seed ^= seed << 13;
         seed ^= seed >> 7;
@@ -1228,12 +1231,12 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
          {negative_cross_wallets}, liquidations {liqs}, cross ADL fills {cross_adl}, withdrawals \
          {withdrawals}"
     );
-    // Coverage floors, about half of what this seed reaches (74 / 55 / 11 / 12 / 89), so a change
+    // Coverage floors, about half of what this seed reaches (43 / 30 / 12 / 8 / 89), so a change
     // that quietly stops the run from reaching a path fails here instead of passing vacuously.
-    assert!(cross_fills >= 35, "cross fills {cross_fills}");
-    assert!(negative_cross_wallets >= 25, "the cross wallet went negative on too few steps");
-    assert!(liqs >= 5, "liquidations {liqs}");
-    assert!(cross_adl >= 5, "ADL fills on a cross winner {cross_adl}");
+    assert!(cross_fills >= 20, "cross fills {cross_fills}");
+    assert!(negative_cross_wallets >= 15, "the cross wallet went negative on too few steps");
+    assert!(liqs >= 6, "liquidations {liqs}");
+    assert!(cross_adl >= 4, "ADL fills on a cross winner {cross_adl}");
     assert!(withdrawals >= 40, "withdrawals {withdrawals}");
 }
 

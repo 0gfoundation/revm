@@ -4079,7 +4079,9 @@ fn liquidate_short_buys_full_position_from_asks() {
     assert_eq!(wallet(&mut ctx, KEEPER), 0);
 }
 
-/// **The clearance fee is levied on the margin this call CONSUMED, so n rounds cost one fee.**
+/// **The clearance fee is levied on what this call CLOSED, so n rounds cost one fee.** (On the
+/// notional closed since cross P3 / Q3; on the silo margin consumed before — the property is the
+/// same either way.)
 ///
 /// A liquidation does not always finish in one call — the book leg can stop on the band or the
 /// distinct-maker cap, the ADL leg on the shared fill budget or on too little eligible opposite
@@ -4090,7 +4092,7 @@ fn liquidate_short_buys_full_position_from_asks() {
 /// Here the book absorbs half, there is no ADL counterparty, so the rest defers; a second round
 /// finishes it. The two fees must sum to the ONE-SHOT fee, which the control half measures rather
 /// than restates. Under the old rule the split run was strictly more expensive — that is the
-/// `assert!` at the end, and it is what fails if the base reverts to `pre_liq_margin`.
+/// `assert!` at the end, and it is what fails if the base reverts to the ENTRY size.
 #[test]
 fn a_liquidation_split_over_two_rounds_pays_one_clearance_fee() {
     // ── split: 5 units through the book, 5 deferred, then the rest ──
@@ -4139,6 +4141,74 @@ fn a_liquidation_split_over_two_rounds_pays_one_clearance_fee() {
         fee_1 * 2,
         one_shot,
         "half the position closed must cost half the fee: one_shot={one_shot} round1={fee_1}"
+    );
+}
+
+/// **Q3: the clearance fee is a rate on the NOTIONAL closed — and J5: an isolated one never takes
+/// more than its close returned to the wallet.**
+///
+/// Long 10 @ $100 on a $200 silo, closed into a $81 bid: realized −$190, so the close returns only
+/// $10 to the wallet. 5% of the $810 notional closed is $40.50 — but the cap is the $10 close
+/// credit, not the $60 the wallet then holds: the other $50 is collateral the close did not
+/// release (since cross margin, the wallet IS the cross pool), and the fee must not reach it.
+#[test]
+fn an_isolated_clearance_fee_is_capped_at_the_close_credit() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    m.liquidation_fee_rate_bps = 500;
+    storage::save_market(&mut ctx, &m).unwrap();
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    storage::save_mark_price(&mut ctx, MARKET_ID, 8_100).unwrap();
+    place_maker_order(&mut ctx, Side::Buy as u8, 8_100, QTY as u64);
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+
+    liquidate(&mut ctx, ALICE).unwrap();
+
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    let fee = storage::load_insurance_fund(&mut ctx).unwrap() - if_before;
+    assert!(
+        810_000_000u64 * 500 / 10_000 > 10_000_000,
+        "the uncapped notional fee ($40.50) must exceed the cap for this to test it"
+    );
+    assert_eq!(fee, 10_000_000, "capped at the $10 close credit (J5)");
+    assert_eq!(
+        wallet(&mut ctx, ALICE),
+        USER_WALLET,
+        "the wallet keeps exactly what it held before the close: the fee took the whole credit \
+         and nothing else"
+    );
+}
+
+/// **A BANKRUPT isolated liquidation pays no clearance fee** (Binance: none on a bankrupt
+/// position). Long 10 @ $100 on a $200 silo closed into a $75 bid: realized −$250, the silo covers
+/// $200 and $50 is bad debt — the close returns nothing to the wallet, so the J5 cap is 0 however
+/// large the notional fee would be.
+#[test]
+fn a_bankrupt_isolated_liquidation_pays_no_clearance_fee() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    m.liquidation_fee_rate_bps = 500;
+    storage::save_market(&mut ctx, &m).unwrap();
+    storage::save_insurance_fund(&mut ctx, 1_000_000_000).unwrap();
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    storage::save_mark_price(&mut ctx, MARKET_ID, 7_500).unwrap();
+    place_maker_order(&mut ctx, Side::Buy as u8, 7_500, QTY as u64);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    liquidate(&mut ctx, ALICE).unwrap();
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    let liq = decode_events::<crate::interface::IPerpDex::Liquidation>(&logs);
+    assert_eq!(liq.len(), 1);
+    assert_eq!(liq[0].reward, 0, "bankrupt: no clearance fee");
+    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET, "the wallet is untouched");
+    assert_eq!(
+        storage::load_insurance_fund(&mut ctx).unwrap(),
+        1_000_000_000 - 50_000_000,
+        "the fund only absorbed the $50 of bad debt"
     );
 }
 
@@ -6525,7 +6595,7 @@ mod account_update_stream {
     fn the_liquidation_clearance_fee_reports_insurance_clear() {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
-        // 5% of the pre-liquidation margin, charged out of ALICE's wallet to the fund.
+        // 5% of the notional closed, charged out of ALICE's wallet to the fund.
         let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
         m.liquidation_fee_rate_bps = 500;
         storage::save_market(&mut ctx, &m).unwrap();
@@ -6554,11 +6624,13 @@ mod account_update_stream {
             ],
             "the fee leg is its own push, and it names the insurance fund as the counterparty"
         );
-        // …and the fee was real, so the row is not an artefact of a zero move: 5% of the $200
-        // pre-liquidation margin, capped at the positive wallet, credited to the fund.
+        // …and the fee was real, so the row is not an artefact of a zero move: 5% of the $900
+        // NOTIONAL closed (10 @ $90 — cross P3, Q3: the rate is on the notional, no longer on the
+        // $200 silo), under its J5 cap (the $100 the close returned to the wallet), credited to
+        // the fund.
         assert_eq!(
             storage::load_insurance_fund(&mut ctx).unwrap() - if_before,
-            MARGIN as u64 * 500 / 10_000,
+            900_000_000u64 * 500 / 10_000,
             "the fund really was credited the clearance fee"
         );
         assert!(
@@ -6747,9 +6819,9 @@ mod account_update_stream {
     /// ADL counterparty): nothing published for ALICE, so the `FundingFee` mark was still standing
     /// when the clearance fee marked her `InsuranceClear`.
     ///
-    /// That shape is gone, because the clearance fee is now levied on the margin the call actually
-    /// CONSUMED. A liquidation that closed nothing charges nothing, so there is no second cause —
-    /// and the two paths that DO consume margin (the book leg and ADL) both publish for the user
+    /// That shape is gone, because the clearance fee is now levied on what the call actually
+    /// CLOSED. A liquidation that closed nothing charges nothing, so there is no second cause —
+    /// and the two paths that DO close (the book leg and ADL) both publish for the user
     /// inline, which clears the funding mark. The combination is unreachable by construction.
     ///
     /// So this now pins the new rule where the old one was observable, which is the same corner
@@ -11294,7 +11366,8 @@ mod withdrawal_cap {
 
     /// T16 ④: liquidation after the cap. The reported $87.99 is honoured by `liquidate()` on both
     /// sides — refused at $88.00, executed at $87.99 into a MAKER bid. Taker fee waived; a 5%
-    /// clearance fee on the 160e6 silo closed (8e6) goes to the insurance fund. Realized
+    /// clearance fee on the $527.94 notional closed (26.397e6 — under its J5 cap, the 87.94e6 the
+    /// close returned to the wallet) goes to the insurance fund. Realized
     /// `6·87.99·1e6 − 6e8 = −72_060_000`; the silo covers it (no bad debt); total wallet moves by
     /// `realized − clearance fee`.
     #[test]
@@ -11325,7 +11398,7 @@ mod withdrawal_cap {
         let liquidation = decode::<Liquidation>(&logs);
         assert_eq!(liquidation.len(), 1);
         let clearance = liquidation[0].reward;
-        assert_eq!(clearance, 8_000_000);
+        assert_eq!(clearance, 26_397_000);
         assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap() - if0, clearance);
         assert_eq!(
             total_wallet(&mut ctx) - tw0,
@@ -11892,7 +11965,7 @@ mod funding_debt {
     // ── C5: liquidation through the book ─────────────────────────────────────────────────────
 
     /// **C5 — liquidating a debt-laden long through the book: the full fill releases the debt
-    /// (margin EXACTLY 0) and the clearance fee is 0.**
+    /// (margin EXACTLY 0) and the clearance fee is the notional one.**
     ///
     /// C1's state at `k*`: long 10 @ $100, silo 200M, 292.5M of funding pending → −92.5M once
     /// settled, at a $130 mark (equity 207.5M < MM). MAKER bids all 10 at $130; the clearance rate
@@ -11901,13 +11974,13 @@ mod funding_debt {
     /// * The flat position holds margin 0, so `execute_liquidation_market_order`'s
     ///   `debug_assert_eq!(pos.margin, 0)` does not fire — and its write-off branch, which would
     ///   have ZEROED the debt, is not taken.
-    /// * `pre_liq_margin = margin.max(0) = 0`, so `closed_margin = 0` and the clearance fee is 0:
-    ///   `Liquidation.reward == 0`, the fund unchanged. A debt-driven liquidation is fee-free — and a
-    ///   long with `U ≥ MM` can only BE liquidated once its margin is negative (`M − F < MM − U ≤ 0`),
-    ///   so this is every funding-driven liquidation of a profitable position, not a corner. Pinned
-    ///   as current behaviour.
+    /// * The clearance fee is 5% of the $1,300 NOTIONAL closed = 65M (cross P3, Q3), under its J5
+    ///   cap (the 207.5M close credit). It used to be 0 here: on the old base — the silo margin the
+    ///   close consumed, `margin.max(0) = 0` for a debt-laden silo — every funding-driven
+    ///   liquidation of a profitable long was fee-free (a long with `U ≥ MM` can only BE liquidated
+    ///   once its margin is negative), a quirk of the base rather than a rule.
     #[test]
-    fn c5_a_book_liquidation_releases_the_debt_and_charges_no_clearance_fee() {
+    fn c5_a_book_liquidation_releases_the_debt_and_charges_the_notional_clearance_fee() {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
         let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
@@ -11940,12 +12013,15 @@ mod funding_debt {
             (0, 0, 0),
             "the full fill released the debt itself — nothing for the write-off to forgive"
         );
-        assert_eq!(signed_wallet(&mut ctx, ALICE), USER_WALLET as i64 + 207_500_000);
+        assert_eq!(
+            signed_wallet(&mut ctx, ALICE),
+            USER_WALLET as i64 + 207_500_000 - 65_000_000
+        );
         let liq = decode_events::<Liquidation>(&logs);
         assert_eq!(liq.len(), 1);
-        assert_eq!(liq[0].reward, 0, "pre_liq_margin clamps the −92.5M debt to 0: no fee");
-        assert!(decode_events::<InsuranceFundChanged>(&logs).is_empty());
-        assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 10_000_000);
+        assert_eq!(liq[0].reward, 65_000_000, "5% of the $1,300 notional closed");
+        assert_eq!(decode_events::<InsuranceFundChanged>(&logs).len(), 1);
+        assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 10_000_000 + 65_000_000);
         assert_eq!(assert_sigma_margin_consistent(&mut ctx, ALICE), 0);
         assert_eq!(
             conservation_sum(&mut ctx, &users) - value_before,
