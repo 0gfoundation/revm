@@ -22,7 +22,7 @@ use crate::{
 
 use keys::{
     account_key, admin_key, api_key_ids_key, api_key_key, ask_level_key, ask_prices_key,
-    bid_level_key, bid_prices_key, commitment_slot, funding_state_key,
+    bid_level_key, bid_prices_key, commitment_slot, cross_legs_key, funding_state_key,
     index_mode_state_key, index_price_history_key, index_price_state_key, insurance_fund_key,
     market_fee_total_key, max_maker_rebate_key,
     market_hot_key, market_key, market_manager_key, oracle_key, order_key, position_key,
@@ -846,6 +846,9 @@ pub(crate) fn set_in_liquidation_for_test<H: PerpHost>(
 /// defensive: `Σ pos.margin` is half of the `totalWalletBalance` this event publishes, so a
 /// `margin` edit slipping through this silent route would move a PUBLISHED field with no snapshot to
 /// announce it — the exact payload/trigger mismatch the narrowed payload exists to close.
+///
+/// One `save_position` hook it does keep: the account's cross leg (`types::CrossLegs`, cross P4),
+/// whose `last_funding_index` a silent match flush may have re-anchored — see below.
 pub fn save_position_reservation_only<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -877,6 +880,32 @@ pub fn save_position_reservation_only<H: PerpHost>(
             "save_position_reservation_only moved margin_type — only setMarginType \
              (save_position_margin_type_only) may write it"
         );
+        debug_assert_eq!(
+            old.v_quote_balance, pos.v_quote_balance,
+            "save_position_reservation_only moved v_quote_balance — only a fill moves it, and a \
+             fill goes through save_position"
+        );
+    }
+    // ── The cross legs (`types::CrossLegs`, cross P4) ────────────────────────────────────────
+    //
+    // `amount` and `v_quote_balance` cannot move here (asserted above), but `last_funding_index`
+    // can: a match flush sends a user who published nothing down this route after a ZERO-payment
+    // funding settle re-anchored the index (`trading::settlement`'s silent route). A CROSSED
+    // non-zero position's leg carries that index, so it is mirrored — silently, like the route
+    // itself: the leg is no published balance. Only a non-zero CROSSED position has a leg at all,
+    // so every other write here (an isolated or flat market, i.e. most resting and cancelling)
+    // pays nothing; one that has pays a resident position read.
+    if pos.amount != 0
+        && crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed
+    {
+        let old_leg = crate::margin_type::cross_leg_of(
+            market_id,
+            &*load_position_ref(context, user, market_id)?,
+        );
+        let new_leg = crate::margin_type::cross_leg_of(market_id, &pos);
+        if new_leg != old_leg {
+            set_cross_leg(context, user, market_id, new_leg)?;
+        }
     }
     typed_store_mut(context).set_position(user, market_id, pos);
     Ok(())
@@ -1114,9 +1143,10 @@ pub fn save_position<H: PerpHost>(
     // The SAME already-paid read supplies `old.margin` for the `Σ pos.margin` aggregate below —
     // which is the whole reason that aggregate is affordable here and the deleted `total_perp_collateral`
     // was not (see `types::UserAccount::total_position_margin`).
-    let (old_amount, old_margin, old_generation, old_margin_type) = {
+    let (old_amount, old_margin, old_generation, old_margin_type, old_leg) = {
         let old = load_position_ref(context, user, market_id)?;
-        (old.amount, old.margin, old.generation, old.margin_type)
+        let leg = crate::margin_type::cross_leg_of(market_id, &old);
+        (old.amount, old.margin, old.generation, old.margin_type, leg)
     };
     // `margin_type` is a SETTING with exactly one writer, `setMarginType`, which goes through
     // [`save_position_margin_type_only`]. Every other position write comes through here: fills,
@@ -1308,6 +1338,20 @@ pub fn save_position<H: PerpHost>(
         if settle {
             typed_store_mut(context).note_account_to_settle(user, market_id);
         }
+    }
+    // ── The cross legs (`types::CrossLegs`) — THE single maintenance point (cross P4) ─────────
+    //
+    // This market's CROSS LEG — `amount`, `v_quote_balance`, `last_funding_index` of a position
+    // CROSSED in force and non-zero (see `types::CrossLegs` for the invariant) — set from the
+    // position being stored, so the cross health check (`margin_view::cross_health`) can price the
+    // account from the account blob and this list, with no position walk. Compared against the
+    // leg of the OLD position, from the same already-paid read: a write that moves none of the
+    // three (a margin-only write, an isolated position, a `0 → 0` re-anchor) touches nothing; one
+    // that does rewrites this user's one list key — only ever on a call that moves a cross
+    // position, never on a placement or a cancel. Total: setting a leg cannot fail.
+    let new_leg = crate::margin_type::cross_leg_of(market_id, pos);
+    if new_leg != old_leg {
+        set_cross_leg(context, user, market_id, new_leg)?;
     }
     // Position state moved (`amount` / `v_quote_balance` / `margin`) ⇒ one snapshot at the end of
     // the call. Binance's `ACCOUNT_UPDATE` carries a `P[]` array for exactly this, and its own
@@ -1552,6 +1596,53 @@ pub fn load_user_markets_ref<H: PerpHost>(
     let arc = cold_load::<_, Vec<u64>>(context, user_markets_key(user))?;
     typed_store_mut(context).fill_user_markets(user, arc.clone());
     Ok(arc.unwrap_or_else(|| std::sync::Arc::new(Vec::new())))
+}
+
+/// The user's CROSS LEGS (`types::CrossLegs`, cross P4) — zero-clone (`Arc`, refcount bump);
+/// empty for an account holding no position CROSSED in force (the key is deleted with its last
+/// leg). Pure read, cache-fill only.
+pub fn load_cross_legs_ref<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+) -> Result<std::sync::Arc<crate::types::CrossLegs>, PerpError> {
+    use crate::typed_store::Resident;
+    if let Some(arc) = typed_store_mut(context).cross_legs_arc(user) {
+        return Ok(arc);
+    }
+    // Deleted (the last cross leg went THIS block) is definitively empty — it must not fall
+    // through to the committed store, which still holds the pre-delete list.
+    if matches!(typed_store_mut(context).cross_legs(user), Resident::Deleted) {
+        return Ok(std::sync::Arc::new(crate::types::CrossLegs::default()));
+    }
+    let arc = cold_load::<_, crate::types::CrossLegs>(context, cross_legs_key(user))?;
+    typed_store_mut(context).fill_cross_legs(user, arc.clone());
+    Ok(arc.unwrap_or_default())
+}
+
+/// Sets (`Some`) or removes (`None`) `user`'s cross leg of `market_id` — the ONE writer of the
+/// list, called by [`save_position`] and [`save_position_reservation_only`] when the leg their
+/// write implies moved. In place on a resident list; the list's last leg leaving deletes the key.
+fn set_cross_leg<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    leg: Option<crate::types::CrossLegState>,
+) -> Result<(), PerpError> {
+    if let Some(legs) = typed_store_mut(context).cross_legs_mut(user) {
+        legs.set(market_id, leg);
+        if legs.is_empty() {
+            typed_store_mut(context).remove_cross_legs(user);
+        }
+        return Ok(());
+    }
+    let mut legs = (*load_cross_legs_ref(context, user)?).clone();
+    legs.set(market_id, leg);
+    if legs.is_empty() {
+        typed_store_mut(context).remove_cross_legs(user);
+    } else {
+        typed_store_mut(context).set_cross_legs(user, legs);
+    }
+    Ok(())
 }
 
 /// Pre-write admission gate for the [`MAX_USER_MARKETS`] cap.

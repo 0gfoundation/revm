@@ -87,8 +87,16 @@ const fn px(dollars: u64) -> u64 {
 }
 
 /// Pinned final commitment-slot value of [`run_cross_golden_scenario`].
+///
+/// Re-pinned within 39 for P4 (the cross-leg summary): an account holding a position CROSSED in
+/// force now has a per-user "xleg" blob (`types::CrossLegs` — one entry per such position,
+/// maintained by `save_position`), written in every block that moves one of its cross positions.
+/// A WRITE-SET change only — new keys, no other key's bytes move — and `CrossSnapshot` UNCHANGED.
+/// VERIFIED: with the "xleg" keys kept out of the block delta the scenario reproduced the previous
+/// pin 0x9c7be213a8addb7411d483e0ab00a49f8e61d90ac205f7be905fdcbfa2d44132 (39, P3 review: a stale
+/// leg sets no ADL price).
 const CROSS_GOLDEN_COMMITMENT: B256 =
-    b256!("0x9c7be213a8addb7411d483e0ab00a49f8e61d90ac205f7be905fdcbfa2d44132");
+    b256!("0x3c401b0086975d55a76f24c4bdea8fb637fb5114c93b7ff9cc1a56bedb5173b9");
 
 /// The business end state, read back through the views (and the liquidation flag, which no view
 /// reports, from the account record). Pins cross margin's semantics independently of the hash.

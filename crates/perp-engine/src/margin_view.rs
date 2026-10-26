@@ -1954,9 +1954,49 @@ pub fn index_account_scalars<H: PerpHost>(
             "{who}: stored open_position_count for {user} diverged from the non-zero positions \
              walked over the per-user market index — an amount write bypassed save_position"
         );
+        // The cross legs (`types::CrossLegs`, cross P4) against the same kind of fresh walk.
+        debug_assert_cross_legs(context, user, who)?;
     }
 
     Ok(scalars)
+}
+
+/// `debug_assertions` only: the user's stored cross legs ([`crate::types::CrossLegs`]) against a
+/// FRESH WALK of the user's positions over the per-user market index — one
+/// [`crate::margin_type::cross_leg_of`] per member market, in market order — panicking on any
+/// difference. Over the INDEX while the list is over ALL markets: equal because every entry is a
+/// non-zero position, which keeps its market in the index.
+///
+/// With the gate OFF (only a test can turn it off) nothing is CROSSED in force and every reader
+/// ignores the list, so there is nothing to hold it to: legs a test wrote before turning the gate
+/// off are left as they were, and the check passes.
+///
+/// Run on every `getAccount` and every published snapshot ([`index_account_scalars`]), so a write
+/// that reached a position without `storage::save_position`'s maintenance panics in the test suite
+/// instead of mis-pricing an account's health in production.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_cross_legs<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    who: &str,
+) -> Result<(), PerpError> {
+    if !crate::margin_type::cross_margin_enabled() {
+        return Ok(());
+    }
+    let markets = storage::load_user_markets_ref(context, user)?;
+    let mut walked = Vec::new();
+    for &k in markets.iter() {
+        let pos = storage::load_position_ref(context, user, k)?;
+        walked.extend(crate::margin_type::cross_leg_of(k, &pos));
+    }
+    walked.sort_by_key(|l| l.market_id);
+    let stored = storage::load_cross_legs_ref(context, user)?;
+    debug_assert_eq!(
+        stored.0, walked,
+        "{who}: stored cross_legs for {user} diverged from the CROSSED non-zero positions walked \
+         over the per-user market index — a position write bypassed save_position's maintenance"
+    );
+    Ok(())
 }
 
 /// The three balances the `AccountBalanceChanged` snapshot publishes — Binance's `B[]` leg, and the

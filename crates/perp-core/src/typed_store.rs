@@ -30,7 +30,8 @@ use std::vec::Vec;
 use crate::codec::{encode, pack_level, LevelBlob};
 use crate::keys;
 use crate::types::{
-    AccountUpdateReason, Market, MarketHot, Order, OrderEntry, PerpPosition, UserAccount,
+    AccountUpdateReason, CrossLegs, Market, MarketHot, Order, OrderEntry, PerpPosition,
+    UserAccount,
 };
 use crate::error::PerpError;
 
@@ -52,6 +53,7 @@ enum StoreSlot {
     BidLevel(u64, u64),
     AskLevel(u64, u64),
     UserMarkets(Address),
+    CrossLegs(Address),
 }
 
 /// Three-state read result from a typed sub-map.
@@ -155,6 +157,11 @@ pub struct TypedPerpStore {
     /// and keeping one copy removes any chance of the ws and the main map disagreeing about
     /// membership while the batch's per-item hooks read it back.
     user_markets: HashMap<Address, Slot<Vec<u64>>>,
+    /// Per-user cross legs (cross margin P4, [`CrossLegs`]): the state of every position CROSSED
+    /// in force, sorted by market. NOT hoisted into the batch working-set, for `user_markets`'
+    /// reasons: it is written only when a cross position moves, and one copy means the ws and the
+    /// main map can never disagree while a batch's per-item hooks read it back.
+    cross_legs: HashMap<Address, Slot<CrossLegs>>,
     // Stage B extends with the remaining namespaces, same patterns:
     //   bid_levels / ask_levels / bid_prices / ask_prices /
     //   market_fee_total / trade_count / position_registry / api_keys / api_key_ids /
@@ -1105,6 +1112,70 @@ impl TypedPerpStore {
         self.user_markets.insert(user, None);
     }
 
+    // ── Per-user cross legs (cross margin P4) ────────────────────────────────────
+    // Same shape and conventions as the per-user market index: kept sorted by the writer, and the
+    // EMPTY list is a DELETE (resident tombstone → empty bytes), so the namespace holds only the
+    // accounts that hold a cross position.
+
+    /// Three-state read of a user's cross legs (see [`Resident`]).
+    #[inline]
+    pub fn cross_legs(&self, user: Address) -> Resident<'_, CrossLegs> {
+        match self.cross_legs.get(&user) {
+            None => Resident::Miss,
+            Some(None) => Resident::Deleted,
+            Some(Some(v)) => Resident::Hit(v.as_ref()),
+        }
+    }
+
+    /// Zero-clone shared read (Arc bump); `None` covers deleted AND miss.
+    #[inline]
+    pub fn cross_legs_arc(&self, user: Address) -> Option<Arc<CrossLegs>> {
+        self.cross_legs.get(&user).and_then(|s| s.clone())
+    }
+
+    /// Cold-fill (cache semantics, no dirty mark; see [`Self::fill_account`]).
+    #[inline]
+    pub fn fill_cross_legs(&mut self, user: Address, value: Option<Arc<CrossLegs>>) {
+        self.cross_legs.entry(user).or_insert(value);
+    }
+
+    /// `&mut` access to a RESIDENT, live list; marks the key dirty (see [`Self::account_mut`]:
+    /// CoW, in place after the first write). `None` for a missing or deleted entry — the caller
+    /// materializes it and [`Self::set_cross_legs`] it instead.
+    #[inline]
+    pub fn cross_legs_mut(&mut self, user: Address) -> Option<&mut CrossLegs> {
+        match self.cross_legs.get_mut(&user) {
+            Some(Some(v)) => {
+                // Inlined `mark` (disjoint-field borrows: `v` holds `cross_legs`).
+                self.dirty.insert(keys::cross_legs_key(user), StoreSlot::CrossLegs(user));
+                self.write_count += 1;
+                self.tx_dirty = true;
+                Some(Arc::make_mut(v))
+            }
+            _ => None,
+        }
+    }
+
+    /// Inserts/overwrites the list and marks its key dirty. The caller keeps it sorted and
+    /// non-empty (an empty list is [`Self::remove_cross_legs`]).
+    #[inline]
+    pub fn set_cross_legs(&mut self, user: Address, value: CrossLegs) {
+        debug_assert!(
+            !value.is_empty() && value.0.windows(2).all(|w| w[0].market_id < w[1].market_id),
+            "cross legs must be non-empty and strictly ascending by market (canonical bytes)"
+        );
+        self.mark(keys::cross_legs_key(user), StoreSlot::CrossLegs(user));
+        self.cross_legs.insert(user, Some(Arc::new(value)));
+    }
+
+    /// Removes the list (the account's last cross position closed): resident tombstone + dirty
+    /// mark, so the block delta emits empty bytes (the store DELETE convention).
+    #[inline]
+    pub fn remove_cross_legs(&mut self, user: Address) {
+        self.mark(keys::cross_legs_key(user), StoreSlot::CrossLegs(user));
+        self.cross_legs.insert(user, None);
+    }
+
     // ── Batch single-initiator working-set lifecycle ───────────────────────────
     /// Attaches a batch-scoped working-set for `owner`. Every subsequent account/position/buy/sell
     /// accessor whose subject is `owner` routes to the local working-set until [`Self::flush_batch`];
@@ -1316,6 +1387,10 @@ impl TypedPerpStore {
                     Some(Some(v)) => encode(v.as_ref())?,
                     _ => Vec::new(),
                 },
+                StoreSlot::CrossLegs(u) => match self.cross_legs.get(&u) {
+                    Some(Some(v)) => encode(v.as_ref())?,
+                    _ => Vec::new(),
+                },
             };
             out.push((key, bytes));
         }
@@ -1379,6 +1454,7 @@ impl PerpStore for TypedPerpStore {
                 StoreSlot::BidLevel(m, p) => level_entry(self.bid_levels.get(&(m, p))),
                 StoreSlot::AskLevel(m, p) => level_entry(self.ask_levels.get(&(m, p))),
                 StoreSlot::UserMarkets(u) => entry(self.user_markets.get(&u)),
+                StoreSlot::CrossLegs(u) => entry(self.cross_legs.get(&u)),
             };
             out.insert(key, e);
         }
@@ -1678,6 +1754,41 @@ mod tests {
         let delta = store.take_delta().unwrap();
         assert_eq!(delta.len(), 1);
         assert!(delta[0].1.is_empty(), "empty set → delete convention");
+    }
+
+    /// The cross-leg list (cross P4): a cold fill is no write; an in-place mutation of a resident
+    /// list and a whole-list set both mark ONE key whose bytes are the final list; removing it is
+    /// a resident tombstone emitted as empty bytes (a delete).
+    #[test]
+    fn cross_legs_mutate_in_place_and_empty_is_a_delete() {
+        use crate::types::{CrossLegState, CrossLegs};
+        let u = addr(0x78);
+        let leg = |k: u64| CrossLegState {
+            market_id: k,
+            amount: 1,
+            v_quote_balance: -100,
+            last_funding_index: 0,
+        };
+        let mut store = TypedPerpStore::default();
+        store.fill_cross_legs(u, Some(Arc::new(CrossLegs(vec![leg(2)]))));
+        assert!(store.take_delta().unwrap().is_empty(), "a fill is not a write");
+        store.cross_legs_mut(u).unwrap().set(5, Some(leg(5)));
+        store.cross_legs_mut(u).unwrap().set(1, Some(leg(1)));
+        let delta = store.take_delta().unwrap();
+        assert_eq!(delta.len(), 1, "one key however many writes");
+        assert_eq!(delta[0].0, keys::cross_legs_key(u));
+        assert_eq!(delta[0].1, encode(&CrossLegs(vec![leg(1), leg(2), leg(5)])).unwrap());
+
+        store.remove_cross_legs(u);
+        assert_eq!(store.cross_legs(u), Resident::Deleted, "not a fall-through Miss");
+        assert!(store.cross_legs_mut(u).is_none(), "no mutable access to a tombstone");
+        let delta = store.take_delta().unwrap();
+        assert_eq!(delta.len(), 1);
+        assert!(delta[0].1.is_empty(), "empty list → delete convention");
+
+        store.set_cross_legs(u, CrossLegs(vec![leg(3)]));
+        assert_eq!(store.cross_legs_arc(u).unwrap().get(3), Some(&leg(3)));
+        assert_eq!(store.take_delta().unwrap()[0].1, encode(&CrossLegs(vec![leg(3)])).unwrap());
     }
 
     #[test]

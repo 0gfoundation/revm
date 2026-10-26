@@ -76,6 +76,18 @@ pub fn effective_margin_type(pos: &PerpPosition) -> MarginType {
     MarginType::effective(pos.margin_type, cross_margin_enabled())
 }
 
+/// The [`crate::types::CrossLegs`] entry `pos` — the stored position of `(user, market_id)` —
+/// contributes: `Some` iff it is CROSSED in force ([`effective_margin_type`],
+/// under [`cross_margin_enabled`]) and non-zero. The one predicate every maintainer and checker of
+/// the list goes through. Total.
+#[inline]
+pub(crate) fn cross_leg_of(
+    market_id: u64,
+    pos: &PerpPosition,
+) -> Option<crate::types::CrossLegState> {
+    crate::types::CrossLegState::of(market_id, pos, cross_margin_enabled())
+}
+
 /// `#[cfg(test)]`-only hooks on the margin-type rule, per THREAD (the test harness runs each test
 /// on its own thread, so nothing one test sets can leak into another). Two independent hooks:
 ///

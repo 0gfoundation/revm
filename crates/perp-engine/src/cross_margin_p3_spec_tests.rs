@@ -642,6 +642,22 @@ impl World {
             if a.flagged {
                 assert!(a.has_cross, "{at}: {u} is flagged without a cross position");
             }
+            // Cross P4: the account's cross-leg summary is exactly its non-zero CROSSED positions'
+            // state, in market order — derived here from the position blobs, not by the engine.
+            let walked: Vec<crate::types::CrossLegState> = self
+                .markets()
+                .into_iter()
+                .map(|m| (m, self.pos(u, m)))
+                .filter(|(_, p)| p.margin_type == CROSSED && p.amount != 0)
+                .map(|(m, p)| crate::types::CrossLegState {
+                    market_id: m,
+                    amount: p.amount,
+                    v_quote_balance: p.v_quote_balance,
+                    last_funding_index: p.last_funding_index,
+                })
+                .collect();
+            let stored = storage::load_cross_legs_ref(&mut self.ctx, u).unwrap();
+            assert_eq!(stored.0, walked, "{at}: {u} cross legs");
         }
     }
 

@@ -32,6 +32,7 @@ const PFX_MARKET: [u8; 4] = *b"mkt\x00";
 const PFX_MARKET_HOT: [u8; 4] = *b"mhot"; // per-market grouped hot scalars (MarketHot): mark/BBO/last/OI
 const PFX_POSITION_REGISTRY: [u8; 4] = *b"preg"; // per-market set of addresses with an open position
 const PFX_USER_MARKETS: [u8; 4] = *b"umkt"; // per-user set of market ids the user is active in
+const PFX_CROSS_LEGS: [u8; 4] = *b"xleg"; // per-user state of every position CROSSED in force
 const PFX_BID_PRICES: [u8; 4] = *b"bidp"; // sorted Vec<u64> of active bid prices
 const PFX_ASK_PRICES: [u8; 4] = *b"askp"; // sorted Vec<u64> of active ask prices
 const PFX_BID_LEVEL: [u8; 4] = *b"bidl"; // FIFO queue of order IDs at a bid price
@@ -307,6 +308,15 @@ pub fn user_markets_key(user: Address) -> B256 {
     pack_addr(PFX_USER_MARKETS, user)
 }
 
+/// Per-user CROSS LEGS (cross margin P4): the state of every non-zero position CROSSED in force,
+/// sorted by market (`types::CrossLegs`) — what the cross health check prices an account from.
+/// Maintained by `perp-engine`'s `save_position` hook; bounded by `MAX_USER_MARKETS`; an empty
+/// list is a delete, so only an account holding a cross position has the key.
+#[inline]
+pub fn cross_legs_key(user: Address) -> B256 {
+    pack_addr(PFX_CROSS_LEGS, user)
+}
+
 // ── Order book ────────────────────────────────────────────────────────────────
 
 /// Sorted list of all active **bid** prices for a market (Vec<u64>, price DESC).
@@ -572,6 +582,7 @@ mod const_key_tests {
             PFX_MARKET_HOT,
             PFX_POSITION_REGISTRY,
             PFX_USER_MARKETS,
+            PFX_CROSS_LEGS,
             PFX_BID_PRICES,
             PFX_ASK_PRICES,
             PFX_BID_LEVEL,
@@ -650,6 +661,12 @@ mod const_key_tests {
         wu[4..24].copy_from_slice(a.as_slice());
         assert_eq!(user_markets_key(a), B256::new(wu));
 
+        // cross legs = "xleg" ++ addr ++ 8 zero
+        let mut wx = [0u8; 32];
+        wx[..4].copy_from_slice(b"xleg");
+        wx[4..24].copy_from_slice(a.as_slice());
+        assert_eq!(cross_legs_key(a), B256::new(wx));
+
         // order = raw id (no prefix, no hash)
         let id = [0x42u8; 32];
         assert_eq!(order_key(&id), B256::new(id));
@@ -678,6 +695,8 @@ mod const_key_tests {
         // per-user market index shares `pack_addr`'s shape with the account/api-key-ids families
         assert_ne!(user_markets_key(a), account_key(a));
         assert_ne!(user_markets_key(a), api_key_ids_key(a));
+        assert_ne!(cross_legs_key(a), account_key(a));
+        assert_ne!(cross_legs_key(a), user_markets_key(a));
         assert_ne!(bid_prices_key(3), ask_prices_key(3));
         // The two trigger directions, and the trigger index against the book it mirrors.
         assert_ne!(algo_up_prices_key(3), algo_down_prices_key(3));

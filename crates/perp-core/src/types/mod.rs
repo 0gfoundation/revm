@@ -1,4 +1,5 @@
 pub mod account;
+pub mod cross_legs;
 pub mod fee;
 pub mod oracle;
 pub mod order;
@@ -8,6 +9,7 @@ pub use account::{
     derive_sub_account, AccountUpdateReason, ApiKey, UserAccount, LIQ_FLAG_IN_LIQUIDATION,
     MAX_PERP_WALLET_BALANCE, MAX_SUB_ACCOUNTS, MAX_USER_MARKETS, SUB_ACCOUNT_DOMAIN,
 };
+pub use cross_legs::{CrossLegState, CrossLegs};
 pub use fee::UserFeeRates;
 pub use oracle::{
     FundingState, IndexModeState, IndexPriceHistory, IndexPriceState, PremiumIndexAccumulator,
