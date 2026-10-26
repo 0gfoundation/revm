@@ -905,7 +905,9 @@ pub fn save_position_reservation_only<H: PerpHost>(
 /// silent, but `last_funding_index` did, and a CROSSED non-zero position's leg
 /// (`types::CrossLegs`, cross P4) carries it: it is mirrored here — silently too, the leg being no
 /// published balance. Only a non-zero position CROSSED in force has a leg, and the leg is written
-/// only when the index really moved.
+/// only when the leg the stored position implies moved — any of its `amount`, `v_quote_balance`
+/// or `last_funding_index` (the first two are `debug_assert`ed unchanged, so in practice the
+/// index).
 pub fn save_position_reservation_only_after_funding<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -1242,7 +1244,9 @@ pub fn save_position<H: PerpHost>(
     // leg of the OLD position, from the same already-paid read: a write that moves none of the
     // three (a margin-only write, an isolated position, a `0 → 0` re-anchor) touches nothing; one
     // that does rewrites this user's one list key — only ever on a call that moves a cross
-    // position, never on a placement or a cancel. Total: setting a leg cannot fail.
+    // position, never on a placement or a cancel. Total but for the storage layer: setting a leg
+    // returns only a storage-layer `Err` (a cold load of the list that does not decode), J4's one
+    // allowed kind.
     //
     // BEFORE the position write, not after it: what follows that write can still return an `Err`
     // (the per-user index's cap, the margin aggregate's overflow checks), and inside a batch an
