@@ -448,6 +448,15 @@ fn run_adl_fills<H: PerpHost>(
             }
             continue;
         }
+        // ── TOTAL (J4): an ISOLATED holder that cannot be valued is fallback tier, served last ──
+        //
+        // Every number below is arithmetic on this holder's own position, and any of it can fail
+        // to fit an `i64` — the notional at the FILL price above all: a CROSSED loser's price is
+        // clamped into the band, but a wide band still leaves room for a huge holder's value there
+        // to overflow. This runs inside the liquidation sweep, which panics on an `Err`, so a value
+        // that does not fit decides the TIER instead: fallback (at `i128::MIN` — after every
+        // holder that could be valued — when even its equity at the mark is unknown), where
+        // `adl_fill` skips it outright if the fill itself cannot be valued either.
         // ⚠️ Holders with resting orders are NOT excluded. v1 skipped them — an ADL fill moves the
         // position, which re-prices every order resting against it, and v1 did not want to reason
         // about that. The exclusion turned out to be the binding constraint on ADL in practice:
@@ -458,12 +467,19 @@ fn run_adl_fills<H: PerpHost>(
         // Binance does not exclude them either — it selects them and CANCELS their open orders.
         // That is what the fill loop below does, and it sidesteps the re-pricing question entirely
         // rather than solving it: after the cancel there are no orders left to re-price.
-        let margin = wp
-            .margin
-            .checked_add(crate::funding::pending_funding_payment(funding_index, &wp, market)?)
-            .ok_or_else(|| perp_err("adl: effective margin overflow"))?;
-        let eq_mark =
-            calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, margin, bd, pd)?;
+        let Some(margin) = crate::funding::pending_funding_payment(funding_index, &wp, market)
+            .ok()
+            .and_then(|pf| wp.margin.checked_add(pf))
+        else {
+            fallback.push((user, i128::MIN));
+            continue;
+        };
+        let Ok(eq_mark) =
+            calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, margin, bd, pd)
+        else {
+            fallback.push((user, i128::MIN));
+            continue;
+        };
         if eq_mark <= 0 {
             // ── FALLBACK TIER ───────────────────────────────────────────────────────────────────
             //
@@ -481,8 +497,10 @@ fn run_adl_fills<H: PerpHost>(
             fallback.push((user, eq_mark as i128));
             continue;
         }
+        // Unrepresentable at the fill price counts as short there (J4, above).
         let eq_fill =
-            calc_position_equity(fill_price, wp.amount, wp.v_quote_balance, margin, bd, pd)?;
+            calc_position_equity(fill_price, wp.amount, wp.v_quote_balance, margin, bd, pd)
+                .unwrap_or(-1);
         if eq_fill < 0 {
             // ⚠️ DELIBERATE, AND KNOWN TO BE THE WEAK PART — a temporary simplification, chosen
             // with the trade-off understood, to be revisited.
@@ -511,7 +529,11 @@ fn run_adl_fills<H: PerpHost>(
             fallback.push((user, eq_mark as i128));
             continue;
         }
-        let notional = calc_value_i64(mark_price, wp.amount, bd, pd)? as i128;
+        let Ok(notional) = calc_value_i64(mark_price, wp.amount, bd, pd) else {
+            fallback.push((user, eq_mark as i128));
+            continue;
+        };
+        let notional = notional as i128;
         let upnl = notional + wp.v_quote_balance as i128;
         cands.push((user, AdlRank::ratio(upnl, eq_mark as i128), None));
     }
@@ -619,8 +641,7 @@ fn run_adl_fills<H: PerpHost>(
             policy,
             bd,
             pd,
-        )?
-        else {
+        ) else {
             // A clean-tier candidate the bad-debt-free trial rejected. Do NOT drop it: re-queue it
             // behind the fallback tier, where `BothSides` accepts.
             //
@@ -640,8 +661,9 @@ fn run_adl_fills<H: PerpHost>(
             // in the `p_b == 0` regime — `settlement`'s `isolated_margin_tests`).
             //
             // Terminates: only a non-fallback entry is ever pushed, so each address is re-queued at
-            // most once, and a `BothSides` trial cannot reject (its `accepts` is unconditional and
-            // `take >= 1` under the loop guards).
+            // most once. A `BothSides` trial rejects only a fill it cannot value at all (its
+            // `accepts` is unconditional and `take >= 1` under the loop guards; J4 — see
+            // `adl_fill`), and that holder is simply passed over.
             if !is_fallback {
                 queue.push((winner, true, None));
             }
@@ -874,7 +896,8 @@ impl Eq for AdlRank {}
 /// `fill_price`, shrinking `take` (bounded) so NEITHER side realizes bad debt from sub-unit
 /// flooring. Both legs use the SAME single-floored `calc_value(fill_price, take)`. Returns the
 /// the committed quantity and each participant's realized PnL, or `None` if no
-/// clean fill is possible near `take`.
+/// clean fill is possible near `take` — or no fill can be VALUED (a value past the integer
+/// widths: never an `Err`, this runs inside the liquidation sweep).
 struct AdlFillOutcome {
     quantity: u64,
     loser_realized_pnl: i64,
@@ -924,12 +947,16 @@ fn adl_fill(
     policy: BadDebtPolicy,
     bd: u32,
     pd: u32,
-) -> Result<Option<AdlFillOutcome>, PerpError> {
+) -> Option<AdlFillOutcome> {
     use super::settlement::{apply_position_fill, OpeningMarginFunding};
     let floor = take.saturating_sub(4); // try take, take-1, .., take-4 (dust is <=1-2)
     let mut t = take;
     while t > 0 && t > floor {
-        let v = calc_value(fill_price, t, bd, pd)?;
+        // TOTAL (J4): this runs inside the liquidation sweep, which panics on an `Err`. A trial
+        // whose arithmetic does not fit — the fill's value, or either leg's settlement — is a
+        // trial that cannot fill (`None`: the caller moves on to the next candidate); nothing has
+        // been written, both legs are clones.
+        let v = calc_value(fill_price, t, bd, pd).ok()?;
         // Trial on clones; commit only if BOTH sides are bad-debt free.
         // Both legs are PURE CLOSES (`opening_qty == 0`), so the ISOLATED funding rule is inert —
         // ADL never opens, and therefore never short-funds, a silo. The mode still matters for a
@@ -947,7 +974,8 @@ fn adl_fill(
             0,
             loser_close_is_buy,
             OpeningMarginFunding::for_position(loser_pos, OpeningMarginFunding::Requirement),
-        )?;
+        )
+        .ok()?;
         let mut wp = winner_pos.clone();
         let mut ww = *winner_wallet;
         let winner_outcome = apply_position_fill(
@@ -959,23 +987,24 @@ fn adl_fill(
             0,
             winner_close_is_buy,
             OpeningMarginFunding::for_position(winner_pos, OpeningMarginFunding::Requirement),
-        )?;
+        )
+        .ok()?;
         if policy.accepts(loser_outcome.bad_debt, winner_outcome.bad_debt) {
             *loser_pos = lp;
             *loser_wallet = lw;
             *winner_pos = wp;
             *winner_wallet = ww;
-            return Ok(Some(AdlFillOutcome {
+            return Some(AdlFillOutcome {
                 quantity: t,
                 loser_realized_pnl: loser_outcome.realized_pnl,
                 winner_realized_pnl: winner_outcome.realized_pnl,
                 loser_bad_debt: loser_outcome.bad_debt,
                 winner_bad_debt: winner_outcome.bad_debt,
-            }));
+            });
         }
         t -= 1;
     }
-    Ok(None)
+    None
 }
 
 // `emit_position_changed` lives in `crate::events` — one derivation for all seven emit sites.

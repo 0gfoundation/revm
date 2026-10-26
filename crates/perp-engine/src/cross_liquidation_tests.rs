@@ -1633,6 +1633,64 @@ fn the_episode_skips_a_zero_mark_and_an_unpriceable_leg_without_failing() {
     assert_eq!(pos(&mut ctx, ALICE, M3), m3_before);
 }
 
+/// ALICE: a ONE-contract CROSSED long on M1 (against BOB) next to a cross wallet of −$9,998,400,
+/// reached through the ABI — a 160,000-contract cross long on M2 closed reduce-only into a $0.01 bid
+/// (a cross reduce is never margin-gated). BOB is ISOLATED short 1,000,000 on M1 (CAROL holds the
+/// other side of the 999,999). `E = −$9.998M` against `Σ MM = $16.67`: the whole deficit is M1's
+/// MM share, so M1's bankruptcy price is ≈ $9,998,500 — ≈ 100,000× the $100 mark.
+fn dust_leg_deep_deficit(ctx: &mut TestCtx) {
+    set_wallet(ctx, ALICE, usd(6_000_000));
+    for u in [BOB, CAROL, KEEPER] {
+        set_wallet(ctx, u, usd(1_000_000_000));
+    }
+    trade(ctx, M1, ALICE, BOB, BUY, px(100), 1);
+    ok(ctx, CAROL, &order(M1, BUY, px(100), 999_999, GTC));
+    ok(ctx, BOB, &order(M1, SELL, px(100), 999_999, IOC));
+    assert_eq!(pos(ctx, BOB, M1).amount, -1_000_000);
+    trade(ctx, M2, ALICE, KEEPER, BUY, px(100), 160_000);
+    ok(ctx, MAKER, &order(M2, BUY, 1, 160_000, GTC));
+    ok(ctx, ALICE, &order_flags(M2, SELL, 1, 160_000, IOC, RO));
+    assert_eq!((pos(ctx, ALICE, M1).amount, pos(ctx, ALICE, M2).amount), (1, 0));
+    assert_eq!(wallet(ctx, ALICE), usd(-9_998_400));
+}
+
+/// **J4 — ADL is TOTAL on the fill price** (P3 review). M1's band is wide open (`u32::MAX` bps), so
+/// the bankruptcy price of [`dust_leg_deep_deficit`]'s one-contract leg (≈ $9,998,500) is the ADL
+/// price as it stands, and BOB's notional there — 10^6 contracts — is past `i64`. Valuing him at it
+/// used to be an `Err`: the sweep PANICKED, and `liquidate()` reverted after three perp writes (the
+/// flag, the IOC's order and nonce — a commit-only #23 violation). Now a holder the fill price
+/// cannot value is fallback tier, and the fill itself — one contract — can be valued: BOB takes it
+/// at that price, his silo's shortfall goes to the (seeded) insurance fund, ALICE ends flat at
+/// zero. Both routes — the tick and a keeper's `liquidate()` — and nothing is lost.
+#[test]
+fn adl_values_a_holder_it_cannot_price_at_the_fill_as_fallback_tier_never_an_err() {
+    for manual in [false, true] {
+        let mut ctx = make_ctx();
+        dust_leg_deep_deficit(&mut ctx);
+        let mut mk = storage::load_market(&mut ctx, M1).unwrap().unwrap();
+        mk.price_band_bps = u32::MAX;
+        storage::save_market(&mut ctx, &mk).unwrap();
+        insurance_fund_seeded(&mut ctx, usd(20_000_000));
+        let ledger = Ledger::open(&mut ctx);
+
+        let logs = if manual {
+            ok(&mut ctx, KEEPER, &liquidate(ALICE, M1))
+        } else {
+            tick(&mut ctx, M1, px(100))
+        };
+        ledger.check(&mut ctx, "after the liquidation");
+        let a = adls(&logs);
+        assert_eq!(a.len(), 1, "manual {manual}: {a:?}");
+        assert_eq!((a[0].0, a[0].1, a[0].2, a[0].3), (ALICE, BOB, M1, 1));
+        assert!(a[0].4 > px(9_998_000), "the unclamped bankruptcy price: {}", a[0].4);
+        assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+        assert_eq!(pos(&mut ctx, BOB, M1).amount, -999_999);
+        assert!((0..usd(1)).contains(&wallet(&mut ctx, ALICE)), "manual {manual}");
+        assert!(!flagged(&mut ctx, ALICE));
+        assert!(evs::<InsuranceFundDepleted>(&logs).is_empty(), "the fund covered it");
+    }
+}
+
 // ── A randomised multi-market run ──────────────────────────────────────────────
 
 /// A deterministic PRNG (xorshift64).
