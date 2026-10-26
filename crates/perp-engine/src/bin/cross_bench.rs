@@ -24,6 +24,11 @@
 //!         `Q` in market 1 and long `Q` in markets 2..=k, wallets random). Times `tick` (the
 //!         `updateIndexPrice` that finds it: detection over all M + 1, the episode, the ADL) and
 //!         `manual` (`liquidate()` at a mark set without a tick: the episode and its ADL only).
+//!   s4    ADL, MANY LOSERS. L cross accounts long `Q` in market 1 only, each bankrupt at the
+//!         −22% mark (wallet 20% of its notional), against M cross winners built as in s2 (short
+//!         `Q` in market 1, long `Q` in markets 2..=k); market 1's book is empty, so every loser's
+//!         close goes to ADL — one fill each — and every loser's ADL ranks the M winners again.
+//!         Times the one `updateIndexPrice` that finds them all, for L = 1, 10, 50 (`--l` for one).
 //!   s3    ORDER PATH. One account (`--mode`) long `Q` in k markets: `place`+`cancel` a resting
 //!         GTC buy `--ops` times, then a taker loop of `--ops` IOC fills alternating an OPENING buy
 //!         and a REDUCING sell against a deep isolated maker. `--block-ops B` ends a block every B
@@ -37,6 +42,7 @@
 //!   cross_bench s1 --mode cross|isolated --n N --k K [--reps R] [--liq-pct X] [--analysis]
 //!   cross_bench s2 --m M --k K [--reps R]
 //!   cross_bench s3 --mode cross|isolated --k K [--ops N] [--reps R] [--block-ops B]
+//!   cross_bench s4 --m M --k K [--l L] [--reps R]
 //!   cross_bench blob
 //!   cross_bench all [--quick] [--reps R] [--s3-reps R]
 //!
@@ -919,6 +925,78 @@ fn run_s2(m_w: usize, k: u64, reps: usize, seed: u64) {
     }
 }
 
+// ── s4: ADL, many losers ──────────────────────────────────────────────────────
+
+/// L cross losers long `Q` in market 1 (bankrupt at the −22% mark: wallet 20% of one leg's
+/// notional), M cross winners short `Q` in market 1 and long `Q` in 2..=k; the isolated house holds
+/// the rest. Market 1's book is empty, so every loser's close goes to ADL and ranks all M winners.
+fn build_s4(l: usize, m_w: usize, k: u64, seed: u64) -> InMemoryHost {
+    let mut h = base(k);
+    let losers: Vec<Address> = (0..l).map(|i| user(1_000_000 + i)).collect();
+    let winners: Vec<Address> = (1..=m_w).map(user).collect();
+    let mut rng = Rng(seed);
+    ok(&mut h, HOUSE, &order(1, BUY, P, m_w as u64 * Q, GTC));
+    for m in 2..=k {
+        ok(&mut h, HOUSE, &order(m, SELL, P, m_w as u64 * Q, GTC));
+    }
+    for &w in &winners {
+        set_wallet(&mut h, w, 20_000_000_000 + rng.below(200_000_000_000) as i64);
+        ok(&mut h, w, &order(1, SELL, P, Q, IOC));
+        for m in 2..=k {
+            ok(&mut h, w, &order(m, BUY, P, Q, IOC));
+        }
+    }
+    ok(&mut h, HOUSE, &order(1, SELL, P, l as u64 * Q, GTC));
+    for &u in &losers {
+        set_wallet(&mut h, u, POP_WALLET);
+        ok(&mut h, u, &order(1, BUY, P, Q, IOC));
+        set_wallet(&mut h, u, LEG_NOTIONAL / 5);
+    }
+    seal(&mut h, k);
+    h
+}
+
+fn s4_header() {
+    println!(
+        "| scenario | L losers | M | k | reps | median µs | p90 µs | µs/loser (median) | \
+         block-end µs (median) | Liquidation / Adl / CrossLiqStarted |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+}
+
+fn run_s4(ls: &[usize], m_w: usize, k: u64, reps: usize, seed: u64) {
+    for &l in ls {
+        let t = Instant::now();
+        let snap = build_s4(l, m_w, k, seed);
+        eprintln!("s4 L={l} M={m_w} k={k}: built in {:.1} s", t.elapsed().as_secs_f64());
+        let (mut us, mut blk) = (Vec::new(), Vec::new());
+        let mut ev = (0, 0, 0);
+        for _ in 0..reps {
+            let mut h = restore(&snap);
+            let s = shot(&mut h, ADMIN, &tick(1, LIQ_PX, T1));
+            us.push(s.us);
+            blk.push(s.blk_us);
+            ev = (
+                count::<Liquidation>(&s.logs),
+                count::<Adl>(&s.logs),
+                count::<CrossLiquidationStarted>(&s.logs),
+            );
+        }
+        assert!(ev.0 == l && ev.1 >= l, "s4 L={l}: not every loser was liquidated ({ev:?})");
+        println!(
+            "| s4 ADL ×L | {l} | {m_w} | {k} | {reps} | {:.1} | {:.1} | {:.1} | {:.1} | \
+             {} / {} / {} |",
+            median(&us),
+            p90(&us),
+            median(&us) / l.max(1) as f64,
+            median(&blk),
+            ev.0,
+            ev.1,
+            ev.2
+        );
+    }
+}
+
 // ── s3: order path ────────────────────────────────────────────────────────────
 
 fn build_s3(mode: Mode, k: u64, ops: usize) -> InMemoryHost {
@@ -1143,6 +1221,11 @@ fn main() {
             let (k, ops, reps) = (num("--k", 1) as u64, num("--ops", 100_000), num("--reps", 5));
             run_s3(mode(), k, ops, reps, num("--block-ops", 1), &mut notes);
         }
+        "s4" => {
+            s4_header();
+            let ls = get("--l").map_or(vec![1, 10, 50], |v| vec![v.parse().expect("a number")]);
+            run_s4(&ls, num("--m", 1000), num("--k", 4) as u64, num("--reps", 5), seed);
+        }
         "blob" => run_blob(),
         "all" => {
             let quick = has("--quick");
@@ -1180,7 +1263,9 @@ fn main() {
             println!("\n## s3 write sets (single-call blocks, first repetition)\n");
         }
         _ => {
-            eprintln!("usage: cross_bench s1|s2|s3|blob|all [...] — see src/bin/cross_bench.rs");
+            eprintln!(
+                "usage: cross_bench s1|s2|s3|s4|blob|all [...] — see src/bin/cross_bench.rs"
+            );
             std::process::exit(2);
         }
     }
