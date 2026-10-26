@@ -395,6 +395,7 @@ pub fn load_account_ref<H: PerpHost>(
 /// | [`mutate_account_balance`] | ✅ | the wallet moved (`credit_perp` / `debit_perp`) |
 /// | [`save_position`] | ✅ | position state moved (`amount`, `v_quote_balance`, `margin`) |
 /// | [`save_position_reservation_only`] | ❌ | per-side AGGREGATES only — `Bid`/`Ask`, i.e. `Σ ooIM` |
+/// | [`save_position_reservation_only_after_funding`] | ❌ | + a 0-payment funding re-anchor |
 /// | [`save_position_leverage_only`] | ❌ | `leverage` only — not a field of this event, and it moves no other |
 /// | [`mutate_account`] | ❌ | nonce bump / fee-rate update; provably cannot move a balance |
 ///
@@ -847,8 +848,10 @@ pub(crate) fn set_in_liquidation_for_test<H: PerpHost>(
 /// `margin` edit slipping through this silent route would move a PUBLISHED field with no snapshot to
 /// announce it — the exact payload/trigger mismatch the narrowed payload exists to close.
 ///
-/// One `save_position` hook it does keep: the account's cross leg (`types::CrossLegs`, cross P4),
-/// whose `last_funding_index` a silent match flush may have re-anchored — see below.
+/// `last_funding_index` is asserted unchanged too: the cross legs (`types::CrossLegs`, cross P4)
+/// carry it, and this route skips their maintenance — it is what keeps a placement and a cancel
+/// free of it. The one flush that may have re-anchored the index (a zero-payment funding settle on
+/// a match's silent route) writes through [`save_position_reservation_only_after_funding`].
 pub fn save_position_reservation_only<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -885,27 +888,49 @@ pub fn save_position_reservation_only<H: PerpHost>(
             "save_position_reservation_only moved v_quote_balance — only a fill moves it, and a \
              fill goes through save_position"
         );
-    }
-    // ── The cross legs (`types::CrossLegs`, cross P4) ────────────────────────────────────────
-    //
-    // `amount` and `v_quote_balance` cannot move here (asserted above), but `last_funding_index`
-    // can: a match flush sends a user who published nothing down this route after a ZERO-payment
-    // funding settle re-anchored the index (`trading::settlement`'s silent route). A CROSSED
-    // non-zero position's leg carries that index, so it is mirrored — silently, like the route
-    // itself: the leg is no published balance. Only a non-zero CROSSED position has a leg at all,
-    // so every other write here (an isolated or flat market, i.e. most resting and cancelling)
-    // pays nothing; one that has pays a resident position read.
-    if pos.amount != 0
-        && crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed
-    {
-        let old_leg = crate::margin_type::cross_leg_of(
-            market_id,
-            &*load_position_ref(context, user, market_id)?,
+        debug_assert_eq!(
+            old.last_funding_index, pos.last_funding_index,
+            "save_position_reservation_only moved last_funding_index — a funding re-anchor writes \
+             through save_position_reservation_only_after_funding (the cross legs carry it)"
         );
-        let new_leg = crate::margin_type::cross_leg_of(market_id, &pos);
-        if new_leg != old_leg {
-            set_cross_leg(context, user, market_id, new_leg)?;
-        }
+    }
+    typed_store_mut(context).set_position(user, market_id, pos);
+    Ok(())
+}
+
+/// [`save_position_reservation_only`] for the one flush that may also have RE-ANCHORED the
+/// position's funding index: a match's silent route (`trading::settlement` — a user who published
+/// nothing and whose `amount`, `margin` and account are as stored), after `get_or_load` settled
+/// funding with a payment that truncated to ZERO. Nothing published moves, so the route stays
+/// silent, but `last_funding_index` did, and a CROSSED non-zero position's leg
+/// (`types::CrossLegs`, cross P4) carries it: it is mirrored here — silently too, the leg being no
+/// published balance. Only a non-zero position CROSSED in force has a leg, and the leg is written
+/// only when the index really moved.
+pub fn save_position_reservation_only_after_funding<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    pos: PerpPosition,
+) -> Result<(), PerpError> {
+    let old_leg = crate::margin_type::cross_leg_of(
+        market_id,
+        &*load_position_ref(context, user, market_id)?,
+    );
+    let new_leg = crate::margin_type::cross_leg_of(market_id, &pos);
+    if new_leg != old_leg {
+        set_cross_leg(context, user, market_id, new_leg)?;
+    }
+    // The position write itself, without the funding-index assertion this route exists to waive:
+    // the other checks of [`save_position_reservation_only`] hold here exactly as there.
+    #[cfg(debug_assertions)]
+    {
+        let old = load_position_ref(context, user, market_id)?;
+        debug_assert_eq!(
+            (old.amount, old.margin, old.v_quote_balance, old.generation, old.margin_type),
+            (pos.amount, pos.margin, pos.v_quote_balance, pos.generation, pos.margin_type),
+            "save_position_reservation_only_after_funding on a path that moved more than the \
+             per-side aggregates and the funding index"
+        );
     }
     typed_store_mut(context).set_position(user, market_id, pos);
     Ok(())
@@ -1620,8 +1645,9 @@ pub fn load_cross_legs_ref<H: PerpHost>(
 }
 
 /// Sets (`Some`) or removes (`None`) `user`'s cross leg of `market_id` — the ONE writer of the
-/// list, called by [`save_position`] and [`save_position_reservation_only`] when the leg their
-/// write implies moved. In place on a resident list; the list's last leg leaving deletes the key.
+/// list, called by [`save_position`] and [`save_position_reservation_only_after_funding`] when the
+/// leg their write implies moved. In place on a resident list; the list's last leg leaving deletes
+/// the key.
 fn set_cross_leg<H: PerpHost>(
     context: &mut H,
     user: Address,

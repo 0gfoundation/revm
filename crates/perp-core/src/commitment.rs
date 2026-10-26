@@ -476,7 +476,7 @@ use primitives::{B256, U256};
 //     (`types::CrossLegs`: `{market_id, amount, v_quote_balance, last_funding_index}` of every
 //     position CROSSED in force and non-zero, sorted by market; positional msgpack; an empty list
 //     is a delete), written by `save_position` (and, for a zero-payment funding re-anchor, by the
-//     reservation-only route) in every block that moves a cross position. No other key's bytes
+//     match's silent flush route) in every block that moves a cross position. No other key's bytes
 //     move: the legs are NOT a `UserAccount` field (embedded, they cost the order path 4.8–10.2%,
 //     D2). The isolated pin 0xfdf928b5…47d4 is unchanged (its accounts hold no cross position).
 //     The CROSS pin is re-pinned 0x9c7be213…4132 → 0x3c401b00…73b9 — VERIFIED: with the "xleg"

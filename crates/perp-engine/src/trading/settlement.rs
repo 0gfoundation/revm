@@ -1472,7 +1472,11 @@ impl MatchRegistry {
                 stored.amount == w.pos.amount && stored.margin == w.pos.margin
             } && *storage::load_account_ref(context, user)? == w.account;
             if silent {
-                storage::save_position_reservation_only(context, user, market_id, w.pos)?;
+                // `_after_funding`: `get_or_load` may have re-anchored the funding index with a
+                // zero payment, which the cross legs carry (cross P4).
+                storage::save_position_reservation_only_after_funding(
+                    context, user, market_id, w.pos,
+                )?;
             } else {
                 // `Order` for every user who traded or whose money moved in this match.
                 storage::save_position(

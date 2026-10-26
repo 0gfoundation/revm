@@ -8,8 +8,9 @@
 //! batch working set), a sub-account's order through `asSubAccount`, a fired `closePosition` stop,
 //! a switch to ISOLATED and an isolated silo topped up, a cross liquidation episode and its ADL
 //! (both legs) — and the one narrow route that moves a leg without `save_position`: a match flush
-//! that sends a user who published nothing down the reservation-only route after a ZERO-payment
-//! funding settle re-anchored its index.
+//! that sends a user who published nothing down the silent route
+//! (`save_position_reservation_only_after_funding`) after a ZERO-payment funding settle
+//! re-anchored its index.
 use alloy_sol_types::{SolCall, SolError, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
@@ -332,9 +333,9 @@ fn the_legs_follow_every_route_that_moves_a_cross_position() {
 
 /// The one route that moves a cross leg WITHOUT `save_position`: a match in which the user only
 /// LOST an order (a CROSSED maker refused for want of cash at hand, `MakerInsolvent`) flushes it
-/// through `save_position_reservation_only` — nothing published, `amount`, `margin` and the account
-/// unchanged — after `get_or_load` re-anchored its funding index with a payment that truncates to
-/// zero. The leg carries the new index.
+/// through `save_position_reservation_only_after_funding` — nothing published, `amount`, `margin`
+/// and the account unchanged — after `get_or_load` re-anchored its funding index with a payment
+/// that truncates to zero. The leg carries the new index.
 #[test]
 fn a_silent_match_flush_carries_a_zero_payment_funding_re_anchor_into_the_leg() {
     let mut ctx = make_ctx();
