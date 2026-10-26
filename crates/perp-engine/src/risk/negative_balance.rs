@@ -22,12 +22,13 @@
 //!
 //! # Events
 //!
-//! `InsuranceFundChanged(−covered, fund)` when the fund paid anything, `InsuranceFundDepleted(market,
-//! uncovered)` when it could not pay everything — `market` is the one whose close made the account
-//! flat — and the account's own `AccountBalanceChanged` with reason `INSURANCE_CLEAR` (7), a
-//! 0-position group: Binance's `ACCOUNT_UPDATE` with `m = INSURANCE_CLEAR`. It follows the row the
-//! call published for the account's last state, so a consumer sees the deficit appear and then
-//! cleared (Binance R11 shows exactly that pair three seconds apart).
+//! `InsuranceFundChanged(−covered, fund)` when the fund paid anything,
+//! `InsuranceFundDepleted(market, uncovered)` when it could not pay everything — `market` is the
+//! one whose close made the account flat — and the account's own `AccountBalanceChanged` with
+//! reason `INSURANCE_CLEAR` (7), a 0-position group: Binance's `ACCOUNT_UPDATE` with
+//! `m = INSURANCE_CLEAR`. It follows the row the call published for the account's last state, so a
+//! consumer sees the deficit appear and then cleared (Binance R11 shows exactly that pair three
+//! seconds apart).
 //!
 //! # Total
 //!

@@ -659,12 +659,14 @@ pub fn begin_perp_call<H: PerpHost>(context: &mut H) {
 /// # It also SETTLES the accounts whose last position closed in this call (cross P3)
 ///
 /// [`save_position`] records every account whose `open_position_count` reached 0 during the call,
-/// and every account IN LIQUIDATION that closed a CROSSED position (`TypedPerpStore::settle_accounts`),
-/// and this is where the record is acted on, against the state the call ENDS with:
+/// and every account IN LIQUIDATION that closed a CROSSED position
+/// (`TypedPerpStore::settle_accounts`), and this is where the record is acted on, against the
+/// state the call ENDS with:
 ///
 /// 1. a flagged account left holding no cross position ends its liquidation episode
-///    ([`crate::risk::cross_liquidation::end_flag_without_cross_position`], `CrossLiquidationEnded`)
-///    — the flag can never outlive the last cross position, whichever route closed it;
+///    ([`crate::risk::cross_liquidation::end_flag_without_cross_position`],
+///    `CrossLiquidationEnded`) — the flag can never outlive the last cross position, whichever
+///    route closed it;
 /// 2. a flat account's negative wallet is cleared by the insurance fund
 ///    ([`crate::risk::negative_balance::clear_negative_wallet`], owner decision Q8).
 ///

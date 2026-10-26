@@ -2780,8 +2780,8 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
         bob_events[0].totalCrossWalletBalance, -maker_fee,
         "the wallet went negative by EXACTLY the commission and no more — no margin shortfall \
          reaches it any more (that is the M1 cap), only a fee with nothing left to absorb it. The \
-         event reports the DEFICIT: under the retired `uint64 perpWalletBalance` this read 0 and an \
-         operator watching only the event stream could not see it."
+         event reports the DEFICIT: under the retired `uint64 perpWalletBalance` this read 0 and \
+         an operator watching only the event stream could not see it."
     );
     assert_eq!(
         crate::types::UserAccount {
