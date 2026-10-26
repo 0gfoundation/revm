@@ -432,6 +432,18 @@ use primitives::{B256, U256};
 //     past a stale leg, the flag ended by a reduce-only close and the negative wallet that close
 //     left cleared by the insurance fund. Pinned 0x84977f13…e969 with its own business snapshot.
 //     A test only: no rule moves, and the isolated pin 0xfdf928b5…47d4 is unchanged.
+//   * P3 review — ADL is TOTAL on fill-price arithmetic (J4): an opposite holder that cannot be
+//     valued (at the fill price above all) is fallback tier instead of an `Err` that halted the
+//     sweep, and a fill that cannot be valued is skipped. Reachable only past the integer widths:
+//     both pins unchanged (0xfdf928b5…47d4, 0x84977f13…e969), BusinessSnapshot UNCHANGED.
+//   * P3 review — a CROSSED loser's ADL price (`E < 0`) is clamped into the market's band, like
+//     the episode IOC's limit; what the band's edge does not transfer stays in its wallet (its
+//     silos net it, Q8 clears the rest). Reachable only in a cross episode: both pins unchanged,
+//     BusinessSnapshot UNCHANGED.
+//   * P3 review — a CROSSED ADL winner in the FALLBACK tier is backed by the insurance fund: its
+//     `E` falls to `min(E, 0)` and no further, the rest is its bad debt for the fund (the bound an
+//     isolated fallback winner's silo always gave). Reachable only with a cross winner: both pins
+//     unchanged, BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
