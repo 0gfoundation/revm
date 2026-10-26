@@ -1,8 +1,9 @@
 //! The account's CROSS LEGS (cross margin P4): per user, the state of every position CROSSED in
 //! force — the summary the cross health check is priced from, stored under its own key
 //! ([`crate::keys::cross_legs_key`]).
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::error::{perp_err, PerpError};
 use crate::types::{MarginType, PerpPosition, MAX_USER_MARKETS};
 
 /// One entry of [`CrossLegs`]: a CROSSED, non-zero position's state — exactly the fields the cross
@@ -10,20 +11,16 @@ use crate::types::{MarginType, PerpPosition, MAX_USER_MARKETS};
 /// mark)`, `uPnL = N + v_quote_balance`, `MM` at `|N|`, and the pending funding
 /// `amount × (index − last_funding_index)`.
 ///
-/// Positional msgpack like every blob type: field ORDER is layout-significant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Stored only inside a [`CrossLegs`] blob, in its packed layout (see there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossLegState {
     /// The market.
-    #[serde(rename = "k")]
     pub market_id: u64,
     /// [`PerpPosition::amount`] — never 0 on a stored entry.
-    #[serde(rename = "a")]
     pub amount: i64,
     /// [`PerpPosition::v_quote_balance`].
-    #[serde(rename = "v")]
     pub v_quote_balance: i64,
     /// [`PerpPosition::last_funding_index`].
-    #[serde(rename = "fi")]
     pub last_funding_index: i128,
 }
 
@@ -98,10 +95,143 @@ impl CrossLegState {
 /// that never moves a leg. Here a placement writes no leg, and only a call that moves a cross
 /// position (which writes that position anyway) writes this blob.
 ///
-/// `#[serde(transparent)]`: the blob is the bare msgpack array of entries.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+/// # The blob: packed, not positional msgpack
+///
+/// A cross fill rewrites this blob (it moves `amount` and `v_quote_balance`), and every written
+/// blob is encoded and hashed into the block commitment at the end of the block — so its codec is
+/// on every cross fill's path. Positional msgpack spent ~45 ns per entry in serde's per-field
+/// machinery and wrote `last_funding_index` as a 16-byte `bin` (rmp's `i128`): 419 bytes and
+/// ~0.7 µs to encode at 16 legs (P4 review, finding 5). The blob is instead ONE msgpack `bin`
+/// whose payload is the entries back to back, each
+///
+/// ```text
+/// uvarint(market_id) · zvarint(amount) · zvarint(v_quote_balance) · zvarint(last_funding_index)
+/// ```
+///
+/// — `uvarint` LEB128 (7 bits per byte, low group first, the high bit set on every byte but the
+/// last), `zvarint` the zigzag map (`0, −1, 1, −2, … → 0, 1, 2, 3, …`) then `uvarint`, minimal
+/// length — in ascending market order. Canonical: one list, one byte string. Decoding refuses a
+/// truncated varint (an incomplete last entry included), one wider than its field or not of
+/// minimal length, and entries not strictly ascending by market (a `PerpError` — the storage
+/// layer's, J4's one allowed kind); nothing else is checked there, the writer being
+/// [`CrossLegs::set`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CrossLegs(pub Vec<CrossLegState>);
+
+/// The longest an entry packs to: `uvarint(u64)` and two `zvarint(i64)` at 10 bytes each,
+/// `zvarint(i128)` at 19.
+const MAX_PACKED_LEG: usize = 10 + 10 + 10 + 19;
+
+#[inline]
+fn put_uvarint(out: &mut [u8], at: &mut usize, mut v: u128) {
+    while v >= 0x80 {
+        out[*at] = (v as u8) | 0x80;
+        *at += 1;
+        v >>= 7;
+    }
+    out[*at] = v as u8;
+    *at += 1;
+}
+
+#[inline]
+fn zigzag(v: i128) -> u128 {
+    ((v << 1) ^ (v >> 127)) as u128
+}
+
+#[inline]
+fn unzigzag(v: u128) -> i128 {
+    ((v >> 1) as i128) ^ -((v & 1) as i128)
+}
+
+/// Reads a `uvarint` of at most `max_bits` significant bits from `buf[*at..]`.
+#[inline]
+fn get_uvarint(buf: &[u8], at: &mut usize, max_bits: u32) -> Result<u128, PerpError> {
+    let mut v: u128 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = *buf.get(*at).ok_or_else(|| perp_err("corrupt cross-legs blob (truncated)"))?;
+        *at += 1;
+        let bits = (byte & 0x7f) as u128;
+        // The group must fit what is left of `max_bits`.
+        if shift >= max_bits || (shift > 0 && bits >> (max_bits - shift).min(127) != 0) {
+            return Err(perp_err("corrupt cross-legs blob (varint overflow)"));
+        }
+        v |= bits << shift;
+        if byte & 0x80 == 0 {
+            // A last group of 0 after another one is a non-minimal encoding of a shorter value.
+            if byte == 0 && shift > 0 {
+                return Err(perp_err("corrupt cross-legs blob (non-minimal varint)"));
+            }
+            return Ok(v);
+        }
+        shift += 7;
+    }
+}
+
+impl CrossLegs {
+    /// Packs the entries ([`CrossLegs`]' layout) into `out`, returning the length written. `out`
+    /// holds at least `MAX_PACKED_LEG` bytes per entry.
+    fn pack_into(&self, out: &mut [u8]) -> usize {
+        let mut at = 0;
+        for l in &self.0 {
+            put_uvarint(out, &mut at, l.market_id as u128);
+            put_uvarint(out, &mut at, zigzag(l.amount as i128));
+            put_uvarint(out, &mut at, zigzag(l.v_quote_balance as i128));
+            put_uvarint(out, &mut at, zigzag(l.last_funding_index));
+        }
+        at
+    }
+
+    /// Inverse of [`Self::pack_into`].
+    fn unpack(buf: &[u8]) -> Result<Self, PerpError> {
+        let mut legs = Vec::with_capacity((buf.len() / 4).min(MAX_USER_MARKETS));
+        let mut at = 0;
+        while at < buf.len() {
+            let market_id = get_uvarint(buf, &mut at, 64)? as u64;
+            let amount = unzigzag(get_uvarint(buf, &mut at, 64)?) as i64;
+            let v_quote_balance = unzigzag(get_uvarint(buf, &mut at, 64)?) as i64;
+            let last_funding_index = unzigzag(get_uvarint(buf, &mut at, 128)?);
+            if legs.last().is_some_and(|l: &CrossLegState| l.market_id >= market_id) {
+                return Err(perp_err("corrupt cross-legs blob (markets not ascending)"));
+            }
+            legs.push(CrossLegState { market_id, amount, v_quote_balance, last_funding_index });
+        }
+        Ok(Self(legs))
+    }
+}
+
+impl Serialize for CrossLegs {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // On the stack at the cap (16 entries, 784 bytes); a longer list — which `set` asserts
+        // cannot exist — on the heap.
+        let mut stack = [0u8; MAX_USER_MARKETS * MAX_PACKED_LEG];
+        let mut heap = Vec::new();
+        let out: &mut [u8] = if self.0.len() <= MAX_USER_MARKETS {
+            &mut stack
+        } else {
+            heap.resize(self.0.len() * MAX_PACKED_LEG, 0);
+            &mut heap
+        };
+        let n = self.pack_into(out);
+        serializer.serialize_bytes(&out[..n])
+    }
+}
+
+impl<'de> Deserialize<'de> for CrossLegs {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Packed;
+        impl serde::de::Visitor<'_> for Packed {
+            type Value = CrossLegs;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a packed cross-legs byte string")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<CrossLegs, E> {
+                CrossLegs::unpack(v).map_err(|e| E::custom(format!("{e:?}")))
+            }
+        }
+        deserializer.deserialize_bytes(Packed)
+    }
+}
 
 impl CrossLegs {
     /// The entry of `market_id`, if any. A binary search (the list is sorted).
@@ -195,23 +325,11 @@ mod tests {
         assert!(l.is_empty());
     }
 
-    /// The blob is the bare array of entries (`transparent`), each a 4-element array in field
-    /// order; a full list at the cap survives the codec.
+    /// The blob is ONE msgpack `bin` of the packed entries: the exact bytes of a one-entry list
+    /// (`uvarint` market, then the zigzag `uvarint`s of amount, vQuote and funding index), and a
+    /// full list at the cap — every field at its extremes — survives the codec.
     #[test]
-    fn the_blob_is_a_bare_array_of_positional_entries() {
-        let mut l = CrossLegs::default();
-        for k in (1..=MAX_USER_MARKETS as u64).rev() {
-            let e = CrossLegState {
-                market_id: k,
-                amount: -(k as i64),
-                v_quote_balance: 1_000_000 * k as i64,
-                last_funding_index: -(k as i128) << 70,
-            };
-            l.set(k, Some(e));
-        }
-        let bytes = encode(&l).unwrap();
-        assert_eq!(bytes[0], 0xdc, "array16 header: 16 entries");
-        assert_eq!(decode::<CrossLegs>(&bytes).unwrap(), l);
+    fn the_blob_is_one_bin_of_packed_entries() {
         let one = CrossLegs(vec![CrossLegState {
             market_id: 3,
             amount: 1,
@@ -219,8 +337,75 @@ mod tests {
             last_funding_index: 0,
         }]);
         let one_bytes = encode(&one).unwrap();
-        assert_eq!(one_bytes[..5], [0x91, 0x94, 0x03, 0x01, 0xfe], "[[k, a, v, fi]]");
+        assert_eq!(one_bytes, [0xc4, 0x04, 0x03, 0x02, 0x03, 0x00], "bin8 · 3 · z(1) · z(−2) · z(0)");
         assert_eq!(decode::<CrossLegs>(&one_bytes).unwrap(), one);
+        let two = CrossLegs(vec![CrossLegState {
+            market_id: 300,
+            amount: -64,
+            v_quote_balance: 64,
+            last_funding_index: -1,
+        }]);
+        assert_eq!(
+            encode(&two).unwrap(),
+            [0xc4, 0x06, 0xac, 0x02, 0x7f, 0x80, 0x01, 0x01],
+            "300 = 0xac 0x02; z(−64) = 127; z(64) = 128 = 0x80 0x01; z(−1) = 1"
+        );
+        let mut l = CrossLegs::default();
+        let extremes = [
+            (i64::MIN, i64::MAX, i128::MIN),
+            (i64::MAX, i64::MIN, i128::MAX),
+            (-1, 0, -(1 << 70)),
+            (1, -1, 1 << 100),
+        ];
+        for k in (1..=MAX_USER_MARKETS as u64).rev() {
+            let (a, v, fi) = extremes[k as usize % 4];
+            let market_id = if k == MAX_USER_MARKETS as u64 { u64::MAX } else { k };
+            l.set(market_id, Some(CrossLegState {
+                market_id,
+                amount: a,
+                v_quote_balance: v,
+                last_funding_index: fi,
+            }));
+        }
+        let bytes = encode(&l).unwrap();
+        assert_eq!(bytes[0], 0xc5, "bin16: past 255 bytes at the extremes");
+        assert_eq!(decode::<CrossLegs>(&bytes).unwrap(), l);
+    }
+
+    /// The decoder refuses every byte string the encoder cannot produce that would otherwise
+    /// decode: a truncated entry, a varint wider than its field or not minimal, markets out of
+    /// order — and a msgpack array (the earlier layout).
+    #[test]
+    fn the_decoder_refuses_what_the_encoder_cannot_write() {
+        let bin = |payload: &[u8]| {
+            let mut b = vec![0xc4, payload.len() as u8];
+            b.extend_from_slice(payload);
+            b
+        };
+        assert!(decode::<CrossLegs>(&bin(&[0x03, 0x02, 0x03, 0x00])).is_ok());
+        for (payload, why) in [
+            (&[0x03, 0x02, 0x03][..], "a missing field"),
+            (&[0x03, 0x02, 0x03, 0x80][..], "a varint cut mid-way"),
+            (&[0x03, 0x02, 0x03, 0x00, 0x04][..], "a trailing partial entry"),
+            (&[0x83, 0x00, 0x02, 0x03, 0x00][..], "a non-minimal market id"),
+            (
+                &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0x02, 0x03, 0x00][..],
+                "a market id past 64 bits",
+            ),
+            (&[0x05, 0x02, 0x03, 0x00, 0x05, 0x02, 0x03, 0x00][..], "a market twice"),
+            (&[0x05, 0x02, 0x03, 0x00, 0x04, 0x02, 0x03, 0x00][..], "markets descending"),
+        ] {
+            assert!(decode::<CrossLegs>(&bin(payload)).is_err(), "{why}");
+        }
+        let fi_past_128 = [&[0x03, 0x02, 0x03][..], &[0xff; 18], &[0x04]].concat();
+        assert!(decode::<CrossLegs>(&bin(&fi_past_128)).is_err(), "a funding index past 128 bits");
+        let fi_at_128 = [&[0x03, 0x02, 0x03][..], &[0xff; 18], &[0x03]].concat();
+        assert_eq!(
+            decode::<CrossLegs>(&bin(&fi_at_128)).unwrap().0[0].last_funding_index,
+            i128::MIN,
+            "z(i128::MIN) = u128::MAX: eighteen full groups and a last of 0b11"
+        );
+        assert!(decode::<CrossLegs>(&[0x91, 0x94, 0x03, 0x01, 0xfe, 0x00]).is_err(), "an array");
     }
 
     /// `CrossLegState::of` is the invariant's predicate: a non-zero position CROSSED in force

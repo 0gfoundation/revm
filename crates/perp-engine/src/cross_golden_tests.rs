@@ -95,8 +95,14 @@ const fn px(dollars: u64) -> u64 {
 /// VERIFIED: with the "xleg" keys kept out of the block delta the scenario reproduced the previous
 /// pin 0x9c7be213a8addb7411d483e0ab00a49f8e61d90ac205f7be905fdcbfa2d44132 (39, P3 review: a stale
 /// leg sets no ADL price).
+///
+/// Re-pinned within 39 for the P4 review (finding 5): the "xleg" blob's codec is now one msgpack
+/// `bin` of packed varint entries instead of a positional msgpack array (`types::CrossLegs`), so
+/// every "xleg" value's bytes change and nothing else does — VERIFIED: with the "xleg" keys kept
+/// out of the block delta the scenario still reproduces 0x9c7be213…4132. `CrossSnapshot`
+/// UNCHANGED. Previous pin 0x3c401b0086975d55a76f24c4bdea8fb637fb5114c93b7ff9cc1a56bedb5173b9.
 const CROSS_GOLDEN_COMMITMENT: B256 =
-    b256!("0x3c401b0086975d55a76f24c4bdea8fb637fb5114c93b7ff9cc1a56bedb5173b9");
+    b256!("0x60470df0b8c7f002d65d94138759b0bba11c791b1446a49ab64e8e2714504b3f");
 
 /// The business end state, read back through the views (and the liquidation flag, which no view
 /// reports, from the account record). Pins cross margin's semantics independently of the hash.

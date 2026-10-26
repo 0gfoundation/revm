@@ -486,6 +486,15 @@ use primitives::{B256, U256};
 //     the per-leg terms off the cross legs (`margin_view::cross_health`) instead of the position
 //     walk. No rule moves — the same numbers, re-derived by the walk in every debug build: both
 //     pins unchanged (0xfdf928b5…47d4, 0x3c401b00…73b9), both snapshots UNCHANGED.
+//   * P4 review — the "xleg" codec (finding 5). A LAYOUT change of the one key family: a
+//     `CrossLegs` blob is ONE msgpack `bin` whose payload is the entries back to back, each
+//     `uvarint(market) · zvarint(amount) · zvarint(vQuote) · zvarint(funding index)` (LEB128,
+//     zigzag, minimal), where it was a positional msgpack array of 4-element arrays with the i128
+//     index as a 16-byte `bin` — 419 → ~130 bytes at 16 legs, and no serde per field on every
+//     cross fill's block-end encode. Every "xleg" value's bytes change, nothing else's. The
+//     isolated pin 0xfdf928b5…47d4 is unchanged (no cross position); the CROSS pin is re-pinned
+//     0x3c401b00…73b9 → 0x60470df0…4b3f — VERIFIED: with the "xleg" keys kept out of the block
+//     delta it reproduces 0x9c7be213…4132, as before. Both snapshots UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
