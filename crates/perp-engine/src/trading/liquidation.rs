@@ -839,19 +839,24 @@ fn run_adl_fills<H: PerpHost>(
 /// R5; see `run_adl`'s doc for which ratio each kind of winner gets).
 ///
 /// Held as a sign and two magnitudes so that the comparison is a cross-multiplication of
-/// magnitudes in `U512`. Every input is an `i128`, so a numerator is below 2^254 (`|uPnL| · E`) and
-/// a denominator at most 2^254 (`N²`): every product is below 2^508 — nothing saturates, and the
-/// order is total for ANY inputs. (The previous comparator multiplied in `i128`, saturating, which
-/// could tie unequal ranks — or compare inconsistently, which `sort_by` may panic on — at the joint
-/// extremes. Wherever it did not saturate, it is this order.)
+/// magnitudes. Every input is an `i128`, so a numerator is below 2^254 (`|uPnL| · E`) and a
+/// denominator at most 2^254 (`N²`): both fit a `U256`, every product is below 2^508 — nothing
+/// saturates, and the order is total for ANY inputs. (The previous comparator multiplied in
+/// `i128`, saturating, which could tie unequal ranks — or compare inconsistently, which `sort_by`
+/// may panic on — at the joint extremes. Wherever it did not saturate, it is this order.)
+///
+/// The products are taken in 256 bits when all four magnitudes fit a `u128` — every rank of a
+/// gain, and every loss rank whose `|uPnL| · E` does — and in `U512` otherwise: the same exact
+/// products, so the same order. A `U512` product cost ~50 ns, and ADL sorts every candidate
+/// set once per loser (`M log M` comparisons — half of an ADL's cost at M = 1000 before this).
 #[derive(Clone, Copy, Debug)]
 struct AdlRank {
     /// `−1`, `0` or `1`: the sign of the ratio.
     sign: i8,
     /// `|num|`.
-    num: alloy_primitives::U512,
+    num: alloy_primitives::U256,
     /// `den > 0`.
-    den: alloy_primitives::U512,
+    den: alloy_primitives::U256,
 }
 
 impl AdlRank {
@@ -859,8 +864,8 @@ impl AdlRank {
     fn ratio(num: i128, den: i128) -> Self {
         Self {
             sign: num.signum() as i8,
-            num: alloy_primitives::U512::from(num.unsigned_abs()),
-            den: alloy_primitives::U512::from(den.max(1) as u128),
+            num: alloy_primitives::U256::from(num.unsigned_abs()),
+            den: alloy_primitives::U256::from(den.max(1) as u128),
         }
     }
 
@@ -872,14 +877,54 @@ impl AdlRank {
         if upnl >= 0 {
             return Self::ratio(upnl, e);
         }
-        let n = alloy_primitives::U512::from(notional.unsigned_abs().max(1));
+        let n = alloy_primitives::U256::from(notional.unsigned_abs().max(1));
         Self {
             sign: -1,
-            num: alloy_primitives::U512::from(upnl.unsigned_abs())
-                * alloy_primitives::U512::from(e.max(1) as u128),
+            // Both products of two values below 2^128: below 2^256, no overflow.
+            num: alloy_primitives::U256::from(upnl.unsigned_abs())
+                * alloy_primitives::U256::from(e.max(1) as u128),
             den: n * n,
         }
     }
+
+    /// `|self|` against `|other|`: `self.num · other.den` against `other.num · self.den`, exact.
+    fn cmp_magnitude(&self, other: &Self) -> core::cmp::Ordering {
+        match (
+            u128_of(&self.num),
+            u128_of(&other.den),
+            u128_of(&other.num),
+            u128_of(&self.den),
+        ) {
+            (Some(a), Some(d), Some(b), Some(c)) => mul_wide(a, d).cmp(&mul_wide(b, c)),
+            _ => {
+                use alloy_primitives::U512;
+                let wide = |v: &alloy_primitives::U256| U512::from(*v);
+                (wide(&self.num) * wide(&other.den)).cmp(&(wide(&other.num) * wide(&self.den)))
+            }
+        }
+    }
+}
+
+/// `v` as a `u128` when it fits.
+#[inline]
+fn u128_of(v: &alloy_primitives::U256) -> Option<u128> {
+    match v.as_limbs() {
+        [lo, hi, 0, 0] => Some(((*hi as u128) << 64) | *lo as u128),
+        _ => None,
+    }
+}
+
+/// The exact 256-bit product `a · b` as `(high, low)` 128-bit halves — ordered as the product is.
+#[inline]
+fn mul_wide(a: u128, b: u128) -> (u128, u128) {
+    const LO: u128 = u64::MAX as u128;
+    let (a1, a0, b1, b0) = (a >> 64, a & LO, b >> 64, b & LO);
+    let (p00, p01, p10, p11) = (a0 * b0, a0 * b1, a1 * b0, a1 * b1);
+    // The middle column: three terms below 2^64 each, so no overflow in 128 bits.
+    let mid = (p00 >> 64) + (p01 & LO) + (p10 & LO);
+    let low = (p00 & LO) | (mid << 64);
+    let high = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
+    (high, low)
 }
 
 impl Ord for AdlRank {
@@ -890,11 +935,11 @@ impl Ord for AdlRank {
             unequal => return unequal,
         }
         // Same sign: compare |a| = a.num/a.den with |b| by cross-multiplication.
-        let (lhs, rhs) = (self.num * other.den, other.num * self.den);
+        let magnitude = self.cmp_magnitude(other);
         if self.sign < 0 {
-            rhs.cmp(&lhs)
+            magnitude.reverse()
         } else {
-            lhs.cmp(&rhs)
+            magnitude
         }
     }
 }
@@ -1124,5 +1169,77 @@ mod adl_rank_tests {
         let mut sorted = ranks.to_vec();
         sorted.sort();
         assert!(sorted.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    /// The comparison the products were always taken in: `U512` cross-multiplication.
+    fn reference(a: &AdlRank, b: &AdlRank) -> Ordering {
+        use alloy_primitives::U512;
+        let w = |v: alloy_primitives::U256| U512::from(v);
+        a.sign.cmp(&b.sign).then_with(|| {
+            let m = (w(a.num) * w(b.den)).cmp(&(w(b.num) * w(a.den)));
+            if a.sign < 0 {
+                m.reverse()
+            } else {
+                m
+            }
+        })
+    }
+
+    /// `mul_wide` is the exact 256-bit product, at the edges of `u128`.
+    #[test]
+    fn the_wide_product_is_exact() {
+        use alloy_primitives::U256;
+        let edges = [0u128, 1, 2, u64::MAX as u128, 1 << 64, (1 << 64) + 1, u128::MAX - 1, u128::MAX];
+        for &a in &edges {
+            for &b in &edges {
+                let (hi, lo) = super::mul_wide(a, b);
+                let want = U256::from(a) * U256::from(b);
+                assert_eq!((U256::from(hi) << 128) | U256::from(lo), want, "{a} · {b}");
+            }
+        }
+    }
+
+    /// The 256-bit fast path orders every pair exactly as the `U512` products do — across
+    /// magnitudes on both sides of 2^64 and 2^128 (the fast path's edge), both signs and both
+    /// rank shapes, ties included.
+    #[test]
+    fn the_fast_comparison_is_the_u512_order() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut ranks = Vec::new();
+        for i in 0..4000 {
+            let bits = [8u32, 40, 63, 64, 65, 100, 126, 127][i % 8];
+            let mut val = |sign: bool| {
+                let v = ((next() as u128) << 64 | next() as u128) >> (128 - bits);
+                let v = v.min(i128::MAX as u128) as i128;
+                if sign && next() % 2 == 0 {
+                    -v
+                } else {
+                    v
+                }
+            };
+            let (u, e, n) = (val(true), val(false).max(1), val(true));
+            ranks.push(if i % 3 == 0 { AdlRank::ratio(u, e) } else { AdlRank::sign_split(u, e, n) });
+            if i % 50 == 0 {
+                // Equal values in different terms: `k·u / k·e`.
+                ranks.push(AdlRank::ratio(u / 2 * 2, e.max(2) / 2 * 2));
+                ranks.push(AdlRank::ratio(u / 2, e.max(2) / 2));
+            }
+        }
+        let mut fast_paths = 0;
+        for (i, a) in ranks.iter().enumerate() {
+            for b in ranks.iter().skip(i % 7).step_by(7) {
+                assert_eq!(a.cmp(b), reference(a, b), "{a:?} vs {b:?}");
+                if [a.num, a.den, b.num, b.den].iter().all(|v| super::u128_of(v).is_some()) {
+                    fast_paths += 1;
+                }
+            }
+        }
+        assert!(fast_paths > 100_000, "the fast path was exercised ({fast_paths})");
     }
 }
