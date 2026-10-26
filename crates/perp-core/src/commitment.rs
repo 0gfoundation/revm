@@ -472,6 +472,20 @@ use primitives::{B256, U256};
 //   * P3 review — `liquidate(user, m)` on a FLAGGED account whose ISOLATED position in `m` is not
 //     liquidatable runs the account's episode (resume, or end on recovery) instead of refusing.
 //     Reachable only on a flagged account: both pins unchanged, BusinessSnapshot UNCHANGED.
+//   * P4 — the cross-leg summary (D1/D2). A WRITE-SET change: a new per-user key family "xleg"
+//     (`types::CrossLegs`: `{market_id, amount, v_quote_balance, last_funding_index}` of every
+//     position CROSSED in force and non-zero, sorted by market; positional msgpack; an empty list
+//     is a delete), written by `save_position` (and, for a zero-payment funding re-anchor, by the
+//     reservation-only route) in every block that moves a cross position. No other key's bytes
+//     move: the legs are NOT a `UserAccount` field (embedded, they cost the order path 4.8–10.2%,
+//     D2). The isolated pin 0xfdf928b5…47d4 is unchanged (its accounts hold no cross position).
+//     The CROSS pin is re-pinned 0x9c7be213…4132 → 0x3c401b00…73b9 — VERIFIED: with the "xleg"
+//     keys kept out of the block delta it reproduced 0x9c7be213…4132. BusinessSnapshot and
+//     CrossSnapshot UNCHANGED.
+//   * P4 — the cross health check (D3/D4): the sweep, the episode and ADL read `E`, `Σ_C MM` and
+//     the per-leg terms off the cross legs (`margin_view::cross_health`) instead of the position
+//     walk. No rule moves — the same numbers, re-derived by the walk in every debug build: both
+//     pins unchanged (0xfdf928b5…47d4, 0x3c401b00…73b9), both snapshots UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
