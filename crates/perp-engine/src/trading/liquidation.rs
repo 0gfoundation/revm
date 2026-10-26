@@ -234,9 +234,13 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
 ///   would close (the worst its equity can do at the fill price instead of the mark). A fill that
 ///   fails it re-queues the winner behind the fallback tier, like a rejected trial.
 ///
-/// Its fill settles into its cross wallet, either sign, with no bad debt of its own
-/// (`settlement::apply_position_fill` under `Cross`), so the fill policy binds only the loser's
-/// leg. Like every winner, it loses only its orders in THIS market (deviation D7).
+/// Its fill settles into its cross wallet, either sign (`settlement::apply_position_fill` under
+/// `Cross`). In the clean tier the per-fill test keeps that within its equity, so the fill policy
+/// binds only the loser's leg. In the FALLBACK tier — `E ≤ 0`, a leg the fold could not price, or
+/// a fill it could not carry — it is held to `E_after ≥ min(E, 0)`, and what the fill price would
+/// take past that is its bad debt, absorbed by the fund like an isolated fallback winner's silo
+/// shortfall (`adl_fill`): ADL never drives a cross account deeper than its own equity (P3
+/// review). Like every winner, it loses only its orders in THIS market (deviation D7).
 ///
 /// # A CROSSED loser
 ///
@@ -420,8 +424,9 @@ fn run_adl_fills<H: PerpHost>(
     let registry = storage::load_position_registry(context, market.market_id)?;
     // Clean candidates: `(addr, rank, Some(E) for a CROSSED one — its per-fill tier test)`.
     let mut cands: Vec<(Address, AdlRank, Option<i128>)> = Vec::new();
-    // Counterparties already bankrupt at the mark, held back until `cands` is spent. `(addr, eq)`.
-    let mut fallback: Vec<(Address, i128)> = Vec::new();
+    // Counterparties already bankrupt at the mark, held back until `cands` is spent.
+    // `(addr, eq, Some(E) for a CROSSED one — the floor its fallback fill is held to)`.
+    let mut fallback: Vec<(Address, i128, Option<i128>)> = Vec::new();
     for user in registry {
         if user == loser {
             continue;
@@ -446,7 +451,7 @@ fn run_adl_fills<H: PerpHost>(
                     let notional = leg.upnl - wp.v_quote_balance as i128;
                     cands.push((user, AdlRank::cross(leg.upnl, e, notional), Some(e)));
                 }
-                _ => fallback.push((user, e)),
+                _ => fallback.push((user, e, Some(e))),
             }
             continue;
         }
@@ -473,13 +478,13 @@ fn run_adl_fills<H: PerpHost>(
             .ok()
             .and_then(|pf| wp.margin.checked_add(pf))
         else {
-            fallback.push((user, i128::MIN));
+            fallback.push((user, i128::MIN, None));
             continue;
         };
         let Ok(eq_mark) =
             calc_position_equity(mark_price, wp.amount, wp.v_quote_balance, margin, bd, pd)
         else {
-            fallback.push((user, i128::MIN));
+            fallback.push((user, i128::MIN, None));
             continue;
         };
         if eq_mark <= 0 {
@@ -496,7 +501,7 @@ fn run_adl_fills<H: PerpHost>(
             // keep marking against a market with no solvent counterparty left. The `eq_fill < 0`
             // arm below is the one with a real cost; see its note.
             //
-            fallback.push((user, eq_mark as i128));
+            fallback.push((user, eq_mark as i128, None));
             continue;
         }
         // Unrepresentable at the fill price counts as short there (J4, above).
@@ -528,11 +533,11 @@ fn run_adl_fills<H: PerpHost>(
             // the dust `adl_fill` already handles. The real knob is the eligibility rule itself.
             //
             // `BadDebtPolicy` is the seam if the exclusion comes back.
-            fallback.push((user, eq_mark as i128));
+            fallback.push((user, eq_mark as i128, None));
             continue;
         }
         let Ok(notional) = calc_value_i64(mark_price, wp.amount, bd, pd) else {
-            fallback.push((user, eq_mark as i128));
+            fallback.push((user, eq_mark as i128, None));
             continue;
         };
         let notional = notional as i128;
@@ -576,11 +581,12 @@ fn run_adl_fills<H: PerpHost>(
     // fallback tier. One loop, so the budget, the cancels and the event shape are shared; the only
     // difference is which shortfalls the fill is allowed to leave behind.
     //
-    // A CROSSED clean candidate carries its `E` for the per-fill tier test (R5); `None` otherwise.
+    // A CROSSED candidate carries its `E` — in the clean tier for the per-fill tier test (R5), in
+    // the fallback tier for the floor its fill is held to (see `adl_fill`); `None` otherwise.
     let mut queue: Vec<(Address, bool, Option<i128>)> = cands
         .into_iter()
         .map(|(w, _, e)| (w, false, e))
-        .chain(fallback.into_iter().map(|(w, _)| (w, true, None)))
+        .chain(fallback.into_iter().map(|(w, _, e)| (w, true, e)))
         .collect();
     let mut qi = 0;
     while qi < queue.len() {
@@ -600,14 +606,14 @@ fn run_adl_fills<H: PerpHost>(
         // `E − take · |fill − mark| ≥ 0`: closing `take` at the fill price instead of the mark
         // moves its equity by at most that much. A fill it cannot carry would push the account's
         // whole wallet under zero to absorb this loser's price, so it goes behind the fallback
-        // tier instead, exactly like a rejected trial. TOTAL: an unrepresentable slippage value is
-        // "cannot carry".
+        // tier instead, exactly like a rejected trial — where the fund carries what its equity
+        // cannot (`adl_fill`). TOTAL: an unrepresentable slippage value is "cannot carry".
         if let (false, Some(e)) = (is_fallback, cross_e) {
             let take = winner_pos.amount.unsigned_abs().min(remaining);
             let slippage = calc_value(fill_price.abs_diff(mark_price), take, bd, pd)
                 .map_or(i128::MAX, |v| v as i128);
             if e.saturating_sub(slippage) < 0 {
-                queue.push((winner, true, None));
+                queue.push((winner, true, cross_e));
                 continue;
             }
         }
@@ -640,7 +646,11 @@ fn run_adl_fills<H: PerpHost>(
             winner_close_is_buy,
             take,
             fill_price,
+            mark_price,
             policy,
+            // The fallback tier's floor for a CROSSED winner; the clean tier needs none (R5 above
+            // already held the fill within its equity).
+            if is_fallback { cross_e } else { None },
             bd,
             pd,
         ) else {
@@ -667,7 +677,7 @@ fn run_adl_fills<H: PerpHost>(
             // `accepts` is unconditional and `take >= 1` under the loop guards; J4 — see
             // `adl_fill`), and that holder is simply passed over.
             if !is_fallback {
-                queue.push((winner, true, None));
+                queue.push((winner, true, cross_e));
             }
             continue;
         };
@@ -946,7 +956,10 @@ fn adl_fill(
     winner_close_is_buy: bool,
     take: u64,
     fill_price: u64,
+    mark_price: u64,
     policy: BadDebtPolicy,
+    // A CROSSED winner in the FALLBACK tier: its account's `E` before this fill (see below).
+    winner_cross_e: Option<i128>,
     bd: u32,
     pd: u32,
 ) -> Option<AdlFillOutcome> {
@@ -991,7 +1004,35 @@ fn adl_fill(
             OpeningMarginFunding::for_position(winner_pos, OpeningMarginFunding::Requirement),
         )
         .ok()?;
-        if policy.accepts(loser_outcome.bad_debt, winner_outcome.bad_debt) {
+        // ── A CROSSED winner in the FALLBACK tier is backed by the fund, like an isolated one ──
+        //
+        // An isolated fallback winner loses at most its silo: the shortfall its close realizes
+        // past it is `bad_debt` (`apply_position_fill`), which `BothSides` routes to the fund. A
+        // cross fill has no silo and reports none — the whole off-mark loss would land on the
+        // account's wallet, beyond its equity, and a solvent winner conscripted that way would
+        // carry this loser's deficit into its OWN next liquidation (P3 review). So it is held to
+        // the same bound: its `E` may fall to `min(E, 0)` and no further — a solvent account down
+        // to zero, one already under water not one unit deeper (its deficit is the fund's already,
+        // the isolated tier's "already bankrupt at the mark" argument) — and the rest is credited
+        // back to its wallet and reported as ITS bad debt, for the fund to absorb with the
+        // loser's. `E` moves by exactly the wallet's move plus this leg's `uPnL` at the mark
+        // (`uPnL = N + vQuote`, the fold's own leg formula); its other legs do not move.
+        let mut winner_bad_debt = winner_outcome.bad_debt;
+        if let Some(e) = winner_cross_e {
+            let upnl = |p: &crate::types::PerpPosition| -> Option<i128> {
+                Some(calc_value_i64(mark_price, p.amount, bd, pd).ok()? as i128
+                    + p.v_quote_balance as i128)
+            };
+            let e_after =
+                e + (ww as i128 - *winner_wallet as i128) + upnl(&wp)? - upnl(winner_pos)?;
+            let cover = (e.min(0) - e_after).max(0);
+            if cover > 0 {
+                let cover = i64::try_from(cover).ok()?;
+                ww = ww.checked_add(cover)?;
+                winner_bad_debt = winner_bad_debt.checked_add(cover as u64)?;
+            }
+        }
+        if policy.accepts(loser_outcome.bad_debt, winner_bad_debt) {
             *loser_pos = lp;
             *loser_wallet = lw;
             *winner_pos = wp;
@@ -1001,7 +1042,7 @@ fn adl_fill(
                 loser_realized_pnl: loser_outcome.realized_pnl,
                 winner_realized_pnl: winner_outcome.realized_pnl,
                 loser_bad_debt: loser_outcome.bad_debt,
-                winner_bad_debt: winner_outcome.bad_debt,
+                winner_bad_debt,
             });
         }
         t -= 1;

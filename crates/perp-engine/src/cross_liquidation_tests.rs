@@ -1258,10 +1258,12 @@ fn adl_clean_tier_is_judged_on_the_fill_not_the_whole_position() {
 /// **R5 — a fill the account cannot carry goes behind the fallback tier.** The same scene with
 /// CAROL long 8 (bankruptcy ≈ $66.67 again): ALICE's fill would now be 8 — $53.3 against `E = $40`
 /// — so she is re-queued behind the fallback tier and KEEPER's clean 2 go first; the rest (6) can
-/// only come from ALICE, who takes it as fallback tier.
+/// only come from ALICE, who takes it as fallback tier. (6 × ≈ $6.67 is a cent over her $40: the
+/// fund pays that cent — see the next test — so it is seeded.)
 #[test]
 fn adl_a_cross_fill_the_account_cannot_carry_goes_behind_the_clean_tier() {
     let mut ctx = make_ctx();
+    insurance_fund_seeded(&mut ctx, usd(1_000));
     set_leverage(&mut ctx, CAROL, M1, 3);
     set_leverage(&mut ctx, KEEPER, M1, 1);
     trade(&mut ctx, M1, CAROL, MAKER, BUY, px(100), 8);
@@ -1276,6 +1278,48 @@ fn adl_a_cross_fill_the_account_cannot_carry_goes_behind_the_clean_tier() {
     ledger.check(&mut ctx, "after the liquidation + ADL");
     let order: Vec<(Address, u64)> = adls(&logs).iter().map(|a| (a.1, a.3)).collect();
     assert_eq!(order, vec![(KEEPER, 2), (ALICE, 6)]);
+}
+
+/// **A CROSSED winner in the fallback tier pays at most its own equity, the fund the rest** (P3
+/// review) — the bound an ISOLATED fallback winner always had (its silo). The scene above: CAROL's
+/// isolated long of 8 is liquidated at $60 (bankruptcy ≈ $66.67), KEEPER takes a clean 2, and the
+/// last 6 can only come from ALICE, cross short 10 from $61, as fallback tier — 6 × ≈ $6.67 ≈ $40
+/// off the mark:
+/// * `E = $10` (re-queued: the fill does not fit her equity) — her `E` ends at exactly 0, and the
+///   fund pays the ≈ $30 her equity could not;
+/// * `E = −$5` (under water already, fallback outright) — her `E` ends at −$5, not one unit lower,
+///   and the fund pays the whole ≈ $40.
+///
+/// A cross fill used to report no bad debt at all: her wallet took everything, ending at ≈ −$30 /
+/// ≈ −$45 — a deficit her own next liquidation would have passed on to HER counterparties.
+#[test]
+fn adl_a_crossed_fallback_winner_pays_at_most_its_equity_and_the_fund_the_rest() {
+    for (w, e) in [(usd(0), usd(10)), (usd(-15), usd(-5))] {
+        let mut ctx = make_ctx();
+        set_leverage(&mut ctx, CAROL, M1, 3);
+        set_leverage(&mut ctx, KEEPER, M1, 1);
+        trade(&mut ctx, M1, CAROL, MAKER, BUY, px(100), 8);
+        trade_at(&mut ctx, M1, MAKER, ALICE, BUY, px(61), 10);
+        trade_at(&mut ctx, M1, MAKER, KEEPER, BUY, px(62), 2);
+        set_wallet(&mut ctx, ALICE, w);
+        set_mark(&mut ctx, M1, px(60));
+        let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
+        let ledger = Ledger::open(&mut ctx);
+        assert_eq!(fold(&mut ctx, ALICE).e, e as i128);
+
+        let logs = ok(&mut ctx, ADMIN, &liquidate(CAROL, M1));
+        ledger.check(&mut ctx, "after the liquidation + ADL");
+        let a = adls(&logs);
+        let order: Vec<(Address, u64)> = a.iter().map(|a| (a.1, a.3)).collect();
+        assert_eq!(order, vec![(KEEPER, 2), (ALICE, 6)], "E {e}");
+        // ALICE's fill: 6 contracts `p − $60` over the mark (base 0 dp, price 2 dp).
+        let slip = 6 * (a[1].4 - px(60)) as i64 * 10_000;
+        assert!(slip > usd(39) && slip < usd(41), "{slip}");
+        assert_eq!(fold(&mut ctx, ALICE).e, e.min(0) as i128, "E {e}: no deeper than min(E, 0)");
+        let cover = slip - e.max(0);
+        assert_eq!(if0 - insurance_fund(&mut ctx), cover as u64, "E {e}: the fund's part");
+        assert_eq!(evs::<InsuranceFundChanged>(&logs).last().unwrap().delta, -cover);
+    }
 }
 
 // ── Negative-balance clearance (Q8, R4) ─────────────────────────────────────────
@@ -1469,23 +1513,24 @@ fn a_drained_episode_closing_the_last_position_clears_the_negative_wallet() {
     assert_cleared(&mut ctx, &logs, ALICE, usd(30), if0);
 }
 
-/// **Route: ADL, the account on the WINNING side.** ALICE (CROSSED, short 4 at $100, wallet −$140)
+/// **Route: ADL, the account on the WINNING side.** ALICE (CROSSED, short 4 at $100, wallet −$170)
 /// is the only counterparty of CAROL's ISOLATED 3x long, liquidated (by `liquidate()`, so the
 /// tick's sweep does not run ALICE's own episode first) at a $60 mark with an empty book. CAROL is
 /// insolvent, so ADL fills at her bankruptcy price ≈ $66.67 — $6.67 above the mark against ALICE,
-/// more than her `E = $20` can carry (`20 − 4 · 6.67 < 0`, R5), so she is fallback tier, and the
-/// only one: she is closed out of her last position with the wallet still below zero, and the end
-/// of the call clears it.
+/// whose account is already under water (`E = −$10`): fallback tier, and the only one. The fund
+/// backs that fill — ALICE's `E` stays at −$10, the ≈ $26.67 off the mark is the fund's (P3 review)
+/// — and she is closed out of her last position with the wallet at that −$10, which the end of the
+/// call clears.
 #[test]
 fn an_adl_fill_closing_the_winners_last_position_clears_its_negative_wallet() {
     let mut ctx = make_ctx();
     set_leverage(&mut ctx, CAROL, M1, 3);
     trade(&mut ctx, M1, CAROL, ALICE, BUY, px(100), 4);
-    set_wallet(&mut ctx, ALICE, usd(-140));
+    set_wallet(&mut ctx, ALICE, usd(-170));
     set_mark(&mut ctx, M1, px(60));
     let if0 = insurance_fund_seeded(&mut ctx, usd(1_000));
     let ledger = Ledger::open(&mut ctx);
-    assert_eq!(fold(&mut ctx, ALICE).e, usd(20) as i128);
+    assert_eq!(fold(&mut ctx, ALICE).e, usd(-10) as i128);
 
     let logs = ok(&mut ctx, KEEPER, &liquidate(CAROL, M1));
     ledger.check(&mut ctx, "after the liquidation + ADL");
@@ -1494,9 +1539,10 @@ fn an_adl_fill_closing_the_winners_last_position_clears_its_negative_wallet() {
     assert_eq!((a[0].0, a[0].1, a[0].3), (CAROL, ALICE, 4));
     assert!(a[0].4 > px(66) && a[0].4 <= px(67), "at CAROL's bankruptcy price: {}", a[0].4);
     assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
-    let paid = if0 - insurance_fund(&mut ctx);
-    assert!(paid > 0 && paid < usd(7) as u64, "≈ $6.67: {paid}");
-    assert_cleared(&mut ctx, &logs, ALICE, paid as i64, if0);
+    // The fill's cover, absorbed with the ADL: 4 contracts `p − $60` over the mark.
+    let cover = 4 * (a[0].4 - px(60)) * 10_000;
+    assert_eq!(evs::<InsuranceFundChanged>(&logs)[0].delta, -(cover as i64));
+    assert_cleared(&mut ctx, &logs, ALICE, usd(10), if0 - cover);
 }
 
 /// **Not before the LAST position (Q8, J3).** ALICE closes her cross long at a loss while she still
@@ -1634,8 +1680,8 @@ fn the_episode_skips_a_zero_mark_and_an_unpriceable_leg_without_failing() {
 }
 
 /// ALICE: a ONE-contract CROSSED long on M1 (against BOB) next to a cross wallet of −$9,998,400,
-/// reached through the ABI — a 160,000-contract cross long on M2 closed reduce-only into a $0.01 bid
-/// (a cross reduce is never margin-gated). BOB is ISOLATED short 1,000,000 on M1 (CAROL holds the
+/// reached through the ABI — a 160,000-contract cross long on M2 closed reduce-only into a $0.01
+/// bid (a cross reduce is never margin-gated). BOB is ISOLATED short 1,000,000 on M1 (CAROL holds the
 /// other side of the 999,999). `E = −$9.998M` against `Σ MM = $16.67`: the whole deficit is M1's
 /// MM share, so M1's bankruptcy price is ≈ $9,998,500 — ≈ 100,000× the $100 mark.
 fn dust_leg_deep_deficit(ctx: &mut TestCtx) {
@@ -1715,7 +1761,8 @@ fn a_wallet_deficit_is_adld_no_further_than_the_band_and_the_fund_clears_the_res
         assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
         assert_eq!(wallet(&mut ctx, ALICE), 0, "cleared");
         assert!(!flagged(&mut ctx, ALICE));
-        let cleared: Vec<i64> = evs::<InsuranceFundChanged>(&logs).iter().map(|c| c.delta).collect();
+        let cleared: Vec<i64> =
+            evs::<InsuranceFundChanged>(&logs).iter().map(|c| c.delta).collect();
         assert_eq!(cleared.last(), Some(&usd(-9_998_300)), "the rest of the deficit: {cleared:?}");
         assert_eq!(rows(&logs, ALICE).last().unwrap().reason, INSURANCE_CLEAR);
         assert!(if0 - insurance_fund(&mut ctx) >= usd(9_998_300) as u64);
@@ -1760,7 +1807,10 @@ fn a_dust_leg_does_not_cascade_its_wallet_deficit_through_a_solvent_cross_winner
     let logs = tick(&mut ctx, M3, px(100));
     ledger.check(&mut ctx, "after M3's tick");
     assert!(adls(&logs).is_empty() && evs::<Liquidation>(&logs).is_empty());
-    assert_eq!((pos(&mut ctx, BOB, M3).amount, pos(&mut ctx, KEEPER, M3).margin), (10, keeper_silo));
+    assert_eq!(
+        (pos(&mut ctx, BOB, M3).amount, pos(&mut ctx, KEEPER, M3).margin),
+        (10, keeper_silo)
+    );
 }
 
 // ── A randomised multi-market run ──────────────────────────────────────────────

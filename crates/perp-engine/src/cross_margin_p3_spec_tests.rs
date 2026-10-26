@@ -2022,19 +2022,21 @@ fn clr_the_last_close_clears_a_negative_wallet_on_every_route() {
     // The silo's close credit ($50) netted the deficit first.
     assert_cleared(&mut w, &logs, ALICE, d(450), f);
 
-    // An ADL fill closing the winner's last position: BOB, cross short 4 with W = −$410, is only
-    // fallback tier for CAROL's 900 fill at an 850 mark (E 190 − 4 · 50 < 0) and the only short,
-    // so it is his: +$400 realized leaves −$10.
+    // An ADL fill closing the winner's last position: BOB, cross short 4 with W = −$620, is under
+    // water at the 850 mark (E = −$20), so fallback tier for CAROL's 900 fill, and the only short,
+    // so it is his. The fund backs a fallback cross winner down to `min(E, 0)` (P3 review): of
+    // the fill's $200 off the mark it pays all of it, +$400 realized and the $200 cover leave
+    // W = −$20 — his `E`, unmoved — and the end of the call clears that.
     let mut w = std_world();
     w.set_type(CAROL, M1, ISOLATED);
     w.fill(CAROL, M1, 4, 1_000);
     w.fill(BOB, M1, -4, 1_000);
-    w.set_wallet(BOB, -d(410));
+    w.set_wallet(BOB, -d(620));
     let f = w.fund();
     let logs = w.tick(M1, 850);
     let adl: Vec<(Address, u64)> = evs::<Adl>(&logs).iter().map(|a| (a.adlUser, a.price)).collect();
     assert_eq!(adl, vec![(BOB, 900)]);
-    assert_cleared(&mut w, &logs, BOB, d(10), f);
+    assert_cleared(&mut w, &logs, BOB, d(20), f - d(200));
 }
 
 /// **R4 — a short fund pays what it has**: the wallet still ends at 0, the fund at 0, and the rest

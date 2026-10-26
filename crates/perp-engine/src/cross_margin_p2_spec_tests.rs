@@ -2444,7 +2444,10 @@ fn liq_adl_prefers_a_clean_winner_to_a_cross_winner_the_fill_takes_negative() {
 
 /// A CROSSED winner whose account equity is not positive (`E ≤ 0` — a loss on another cross
 /// market) is held to the fallback tier, and ADL through it is total: no error, no division by a
-/// zero margin, its fill settled into W, the identity intact.
+/// zero margin, its fill settled into W, the identity intact. (Cross P3 review: the fund backs a
+/// fallback-tier cross winner — its `E` cannot fall below `min(E, 0)` — so here, `E < 0`, the
+/// fill's whole loss off the mark is credited back: W moves by the realized PnL plus that cover,
+/// which is the leg's uPnL at the mark, and `E` does not move.)
 #[test]
 fn liq_adl_against_a_cross_winner_at_non_positive_equity_is_total() {
     let mut ctx = crossed_world();
@@ -2463,7 +2466,10 @@ fn liq_adl_against_a_cross_winner_at_non_positive_equity_is_total() {
     assert!(adl.iter().all(|a| a.adlUser == ALICE));
     assert_eq!((pos(ctx, ALICE, M1).amount, pos(ctx, ALICE, M1).margin), (0, 0));
     let realized = pos(ctx, ALICE, M1).cumulative_realized_pnl - cr0;
-    assert_eq!(wallet(ctx, ALICE) - w0, realized as i128);
+    let cover: i128 = adl.iter().map(|a| a.qty as i128 * (a.price as i128 - 900) * USD).sum();
+    assert!(cover > 0);
+    assert_eq!(wallet(ctx, ALICE) - w0, realized as i128 + cover);
+    assert_eq!(model(ctx, ALICE).e, -100 * USD, "E = 1,500 + 400 − 2,000, unmoved by the fill");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
