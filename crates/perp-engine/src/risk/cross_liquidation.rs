@@ -2,7 +2,7 @@
 //!
 //! A position CROSSED in force has no silo. Its solvency is the ACCOUNT's — liquidatable exactly
 //! when the cross margin balance `E = cWB + Σ_C uPnL_k` is below the cross maintenance margin
-//! `Σ_C MM_k` (`margin_view::CrossFold::below_cross_maintenance`) — so it is never judged, closed
+//! `Σ_C MM_k` (`margin_view::CrossHealth::below_cross_maintenance`) — so it is never judged, closed
 //! or charged per position the way `risk::liquidate_position` treats an ISOLATED one. Both callers
 //! route a cross position here instead: the protocol sweep (`run_liquidation_sweep`, on every tick
 //! of a market the account holds a position in) and the permissionless `liquidate()`.
@@ -19,8 +19,8 @@
 //!
 //! # The episode ([`liquidate_cross_account`])
 //!
-//! 1. VALIDATE on the TOTAL fold, writing nothing: `E ≥ Σ MM` is healthy (a flag left over from an
-//!    earlier episode is then cleared, and that is all).
+//! 1. VALIDATE on the TOTAL health check, writing nothing: `E ≥ Σ MM` is healthy (a flag left over
+//!    from an earlier episode is then cleared, and that is all).
 //! 2. FLAG the account (`UserAccount::liq_flags`, Binance `-2023`: only reduce-only /
 //!    closePosition orders until it ends) and emit `CrossLiquidationStarted`.
 //! 3. CANCEL every open order in every market of the account — book orders and untriggered
@@ -62,10 +62,11 @@
 //! # TOTAL
 //!
 //! The sweep PANICS on any `Err` (a mid-apply failure under commit-only would leave a partial write
-//! set). Everything here uses the total fold (`margin_view::cross_fold`), skips what it cannot
-//! evaluate (a market the index names that does not exist, a leg whose arithmetic faulted, a mark
-//! of 0), clamps instead of failing (the bankruptcy price, the band, the fee), and saturates the
-//! event fields. The only `Err` left is the storage layer's.
+//! set). Everything here uses the total health check (`margin_view::cross_health`, the TOTAL
+//! policy of `margin_view::cross_fold` on the account's stored cross legs — cross P4), skips what
+//! it cannot evaluate (a leg naming a market that does not exist, a leg whose arithmetic faulted, a
+//! mark of 0), clamps instead of failing (the bankruptcy price, the band, the fee), and saturates
+//! the event fields. The only `Err` left is the storage layer's.
 
 use alloy_primitives::IntoLogData;
 use primitives::{Address, Log};
@@ -73,7 +74,7 @@ use primitives::{Address, Log};
 use crate::{
     host::PerpHost,
     interface::IPerpDex,
-    margin_view::{cross_fold, CrossFold, CrossLeg},
+    margin_view::{cross_health, CrossHealth, CrossHealthLeg},
     storage,
     trading::{execute_liquidation_market_order, run_adl},
     types::{AccountUpdateReason, CancelReason, MarginType, Market, PerpPosition, Side},
@@ -139,19 +140,29 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
     adl_budget: &mut u32,
     deferred: &mut bool,
 ) -> Result<CrossLiquidationOutcome, PerpError> {
-    // ── (a) VALIDATE — the account-level predicate on the TOTAL fold; NO write before a refusal ──
-    let mut legs = Vec::new();
-    let fold = cross_fold(context, user, None, None, Some(&mut legs))?;
+    // ── (a) VALIDATE — the account-level predicate on the TOTAL health check; NO write before a
+    // refusal ──
+    //
+    // The health check prices the account from its stored cross legs (cross P4): the account,
+    // its cross-leg blob and its legs' markets, no index, no position — the whole cost of a
+    // healthy candidate, which is what almost every sweep candidate is. No per-leg terms on this
+    // path either.
+    let health = cross_health(context, user, None)?;
     let flagged = storage::load_account_ref(context, user)?.in_liquidation();
-    if !fold.below_cross_maintenance() {
+    if !health.below_cross_maintenance() {
         if !flagged {
             return Ok(CrossLiquidationOutcome::Healthy);
         }
         // An episode an earlier call left unfinished, and the account recovered in between (a
         // mark moved back, a deposit, the user's own reduce-only closes): one write ends it.
-        end_episode(context, user, start_market, fold.e, fold.cross_mm)?;
+        end_episode(context, user, start_market, health.e, health.cross_mm)?;
         return Ok(CrossLiquidationOutcome::Recovered);
     }
+    // Under maintenance: the per-leg terms the close order and the priced check read, off the
+    // same state (nothing has been written since the check above).
+    let mut legs = Vec::new();
+    let _same = cross_health(context, user, Some(&mut legs))?;
+    debug_assert_eq!(_same, health, "cross_health is a pure read");
 
     // ── (b) FLAG — Binance's "liquidation mode", on the transition only ──
     if !flagged {
@@ -165,13 +176,13 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
             data: IPerpDex::CrossLiquidationStarted {
                 user,
                 triggerMarketId: start_market,
-                crossMarginBalance: saturate_i64(fold.e),
-                totalCrossMaintMargin: saturate_u64(fold.cross_mm),
+                crossMarginBalance: saturate_i64(health.e),
+                totalCrossMaintMargin: saturate_u64(health.cross_mm),
             }
             .to_log_data(),
         });
     }
-    // Decided ONCE, from the detection fold: a close moves `MM_k` only of the market it closes.
+    // Decided ONCE, from the detection legs: a close moves `MM_k` only of the market it closes.
     let order = close_order(&legs, start_market);
 
     // ── (c) CANCEL ALL — every market of the account, isolated ones included (Q2, R3) ──
@@ -209,7 +220,7 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
     // Whether the deficit may set an ADL price at all: only while every cross leg is priced at a
     // mark this call trusts (see `close_market`). Decided once — no mark but this transaction's own
     // moves within it, and the block clock does not.
-    let priced = every_cross_leg_is_priced(context, user, &legs, caller)?;
+    let priced = every_cross_leg_is_priced(context, &health, &legs, caller)?;
     let mut continuation: Option<u64> = None;
     for (i, &k) in order.iter().enumerate() {
         let pos = storage::load_position_ref(context, user, k)?;
@@ -219,7 +230,8 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
         let Some(market) = storage::load_market_ref(context, k)? else {
             continue;
         };
-        // J4: no price, nothing to close at (the fold already counts the leg as `uPnL = MM = 0`).
+        // J4: no price, nothing to close at (the health check already counts the leg as
+        // `uPnL = MM = 0`).
         if market.mark_price == 0 {
             continue;
         }
@@ -234,7 +246,8 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
         let Some(step) =
             close_market(context, user, &market, caller.liquidator, adl_budget, priced)?
         else {
-            // The leg faulted in the fold (J4): nothing evaluable to close it at, no step spent.
+            // The leg faulted in the health check (J4): nothing evaluable to close it at, no step
+            // spent.
             continue;
         };
         *budget -= 1;
@@ -252,9 +265,9 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
     // Every market this call could reach has been tried. Healthy now (or no cross position left)
     // ends the episode; otherwise the flag stays, and the work that a same-block retry could
     // finish (an ADL budget or a maker cap that ran out) is recorded on its market.
-    let fold = cross_fold(context, user, None, None, None)?;
-    if !fold.below_cross_maintenance() {
-        end_episode(context, user, start_market, fold.e, fold.cross_mm)?;
+    let health = cross_health(context, user, None)?;
+    if !health.below_cross_maintenance() {
+        end_episode(context, user, start_market, health.e, health.cross_mm)?;
         return Ok(CrossLiquidationOutcome::Liquidated { ended: true });
     }
     if let Some(k) = continuation {
@@ -267,18 +280,17 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
 /// — the market whose tick caught the account, with the fresh mark and the band centred on it —
 /// then every other cross market holding a position by `MM_k` DESCENDING (the largest share of the
 /// requirement first, so the stop condition is reached in the fewest closes), ties by market id
-/// ASCENDING. Built from the detection fold's legs; a faulted leg is not among them (J4).
-fn close_order(legs: &[CrossLeg], start_market: u64) -> Vec<u64> {
-    let held = |l: &&CrossLeg| l.cross && l.has_position;
+/// ASCENDING. Built from the detection's health legs — every one a position CROSSED in force and
+/// non-zero; a faulted leg is not among them (J4).
+fn close_order(legs: &[CrossHealthLeg], start_market: u64) -> Vec<u64> {
     let mut rest: Vec<(u64, i128)> = legs
         .iter()
-        .filter(held)
         .filter(|l| l.market_id != start_market)
         .map(|l| (l.market_id, l.mm))
         .collect();
     rest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut order = Vec::with_capacity(rest.len() + 1);
-    if legs.iter().filter(held).any(|l| l.market_id == start_market) {
+    if legs.iter().any(|l| l.market_id == start_market) {
         order.push(start_market);
     }
     order.extend(rest.into_iter().map(|(k, _)| k));
@@ -299,7 +311,7 @@ struct CloseStep {
 }
 
 /// Close `user`'s cross position in `market` — one episode step. `None` when the leg cannot be
-/// evaluated (it faulted in the fold, J4), with nothing written. `priced`: every cross leg of the
+/// evaluated (it faulted in the health check, J4), with nothing written. `priced`: every cross leg of the
 /// account is priced at a mark the episode trusts ([`every_cross_leg_is_priced`]) — without it no
 /// deficit sets an ADL price (see the ADL leg below).
 fn close_market<H: PerpHost>(
@@ -313,11 +325,11 @@ fn close_market<H: PerpHost>(
     let k = market.market_id;
     let mark = market.mark_price;
 
-    // The bankruptcy price off the fold BEFORE anything moves. Pending funding is already in `E`
-    // (`cWB`), and settling it below moves `W` by exactly what `cWB` held for it, so the price is
-    // the same before and after the settle.
+    // The bankruptcy price off the health check BEFORE anything moves. Pending funding is already
+    // in `E` (`cWB`), and settling it below moves `W` by exactly what `cWB` held for it, so the
+    // price is the same before and after the settle.
     let mut legs = Vec::new();
-    let fold = cross_fold(context, user, None, None, Some(&mut legs))?;
+    let health = cross_health(context, user, Some(&mut legs))?;
     if !legs.iter().any(|l| l.market_id == k) {
         return Ok(None);
     }
@@ -336,14 +348,15 @@ fn close_market<H: PerpHost>(
     let side = if liq_amount > 0 { Side::Sell } else { Side::Buy };
 
     // ── (d) the IOC at the MM-share bankruptcy price, clamped into the band (Q4) ──
-    let bankruptcy = mm_share_bankruptcy_price(market, &pos, &fold, &legs);
+    let bankruptcy = mm_share_bankruptcy_price(market, &pos, &health, &legs);
     let limit = clamp_into_band(bankruptcy, market);
     let close = execute_liquidation_market_order(context, user, market, side, qty, Some(limit))?;
     let mut leftover = close.maker_cap_deferred;
-    let (mut fold, mut reward) = charge_fee_and_fold(context, user, market, qty - close.remaining)?;
+    let (mut health, mut reward) =
+        charge_fee_and_check(context, user, market, qty - close.remaining)?;
 
     // ── (e) the unfilled rest → ADL, unless the IOC already restored the account (Q6) ──
-    if fold.below_cross_maintenance() && close.remaining > 0 {
+    if health.below_cross_maintenance() && close.remaining > 0 {
         // R5: at the MARK while the account still has equity (the winners lose exposure, not
         // money), at the MM-share bankruptcy price once it has none (the winners absorb this
         // market's share of the deficit). Recomputed on the post-IOC state.
@@ -362,7 +375,7 @@ fn close_market<H: PerpHost>(
         // insurance fund clears the rest (owner decision Q8), the same fund an isolated close's
         // bad debt reaches. (A market whose band is set wide open accepts the wider price.)
         //
-        // ── …and only off a fold every leg of which is priced (P3 review) ──
+        // ── …and only off a health check every leg of which is priced (P3 review) ──
         //
         // The deficit `E` — and so `share_k` — sums EVERY cross leg at its stored mark, a leg the
         // episode skips (stale, Q10; mark 0 or unpriceable, J4) included. A leg it will not close
@@ -372,19 +385,19 @@ fn close_market<H: PerpHost>(
         // oracle prints again). So while any leg is unpriced the ADL fills at the MARK — the
         // winners neutral, as at `E ≥ 0` — and the deficit waits on the account until that leg's
         // own tick prices it. The IOC's limit is left as it is: the book trades by choice.
-        let price = if fold.e >= 0 || !priced {
+        let price = if health.e >= 0 || !priced {
             mark
         } else {
             let pos = storage::load_position(context, user, k)?;
             let mut legs = Vec::new();
-            let f = cross_fold(context, user, None, None, Some(&mut legs))?;
-            clamp_into_band(mm_share_bankruptcy_price(market, &pos, &f, &legs), market)
+            let h = cross_health(context, user, Some(&mut legs))?;
+            clamp_into_band(mm_share_bankruptcy_price(market, &pos, &h, &legs), market)
         };
         run_adl(context, user, market, mark, adl_budget, Some(price))?;
         let after = storage::load_position_ref(context, user, k)?.amount.unsigned_abs();
-        let (f, fee) =
-            charge_fee_and_fold(context, user, market, close.remaining.saturating_sub(after))?;
-        fold = f;
+        let (h, fee) =
+            charge_fee_and_check(context, user, market, close.remaining.saturating_sub(after))?;
+        health = h;
         reward = reward.saturating_add(fee);
         leftover |= after > 0 && *adl_budget == 0;
     }
@@ -403,9 +416,9 @@ fn close_market<H: PerpHost>(
         .to_log_data(),
     });
     Ok(Some(CloseStep {
-        healthy: !fold.below_cross_maintenance(),
-        e: fold.e,
-        cross_mm: fold.cross_mm,
+        healthy: !health.below_cross_maintenance(),
+        e: health.e,
+        cross_mm: health.cross_mm,
         leftover,
     }))
 }
@@ -419,29 +432,30 @@ fn clamp_into_band(price: u64, market: &Market) -> u64 {
 }
 
 /// The clearance fee on `closed` (Q3: the notional closed × the market's rate, capped at
-/// `max(0, E_after)` — so a bankrupt account pays nothing), then the fold the stop condition reads,
-/// fee included ("after deducting realized losses and the Liquidation Clearance Fee").
-fn charge_fee_and_fold<H: PerpHost>(
+/// `max(0, E_after)` — so a bankrupt account pays nothing), then the health check the stop
+/// condition reads, fee included ("after deducting realized losses and the Liquidation Clearance
+/// Fee").
+fn charge_fee_and_check<H: PerpHost>(
     context: &mut H,
     user: Address,
     market: &Market,
     closed: u64,
-) -> Result<(CrossFold, u64), PerpError> {
-    let fold = cross_fold(context, user, None, None, None)?;
+) -> Result<(CrossHealth, u64), PerpError> {
+    let health = cross_health(context, user, None)?;
     let fee = crate::risk::charge_clearance_fee(
         context,
         user,
         market,
         market.mark_price,
         closed,
-        fold.e.max(0),
+        health.e.max(0),
     )?;
     if fee == 0 {
-        return Ok((fold, 0));
+        return Ok((health, 0));
     }
-    // The fee left the wallet, so `E` fell by exactly it and `Σ MM` did not move — but re-walk
-    // rather than patch: the fold is never adjusted by a delta (R13).
-    Ok((cross_fold(context, user, None, None, None)?, fee))
+    // The fee left the wallet, so `E` fell by exactly it and `Σ MM` did not move — but re-price
+    // rather than patch: the health is never adjusted by a delta (R13).
+    Ok((cross_health(context, user, None)?, fee))
 }
 
 /// The MM-share bankruptcy price of `pos` (cross report §3.2, owner decision Q5, deviation D4):
@@ -461,22 +475,22 @@ fn charge_fee_and_fold<H: PerpHost>(
 fn mm_share_bankruptcy_price(
     market: &Market,
     pos: &PerpPosition,
-    fold: &CrossFold,
-    legs: &[CrossLeg],
+    health: &CrossHealth,
+    legs: &[CrossHealthLeg],
 ) -> u64 {
     let mark = market.mark_price;
     let Some(leg) = legs.iter().find(|l| l.market_id == market.market_id) else {
         return mark;
     };
-    let share = if fold.cross_mm > 0 {
-        match fold.e.checked_mul(leg.mm) {
-            Some(p) => p / fold.cross_mm,
-            None => (fold.e / fold.cross_mm).saturating_mul(leg.mm),
+    let share = if health.cross_mm > 0 {
+        match health.e.checked_mul(leg.mm) {
+            Some(p) => p / health.cross_mm,
+            None => (health.e / health.cross_mm).saturating_mul(leg.mm),
         }
     } else {
         // `Σ MM == 0` with the account below it means `E < 0` and every leg priced at `MM = 0`:
         // the whole deficit is this market's to clear.
-        fold.e
+        health.e
     };
     // `N_k(mark)`: the leg's `uPnL` less the entry basis (`uPnL = N + vQuote`, mark ≠ 0 here).
     let target = leg.upnl - pos.v_quote_balance as i128 - share;
@@ -495,26 +509,26 @@ fn mm_share_bankruptcy_price(
     .unwrap_or(mark)
 }
 
-/// Every cross position of `user` is priced at a mark the episode trusts: a leg the detection fold
-/// evaluated (`legs` — one it could not, J4, is left out of it), on a market that exists, with a
-/// mark that is neither `0` (J4) nor stale (Q10, judged as the close loop judges it — the market
-/// whose tick runs the episode is fresh). The legs the close loop would skip are exactly the ones
-/// that fail it. Total: position, market and index-state loads.
+/// Every cross position of `user` is priced at a mark the episode trusts: a leg the detection's
+/// health check evaluated (`legs`; one it could not — a leg naming no market, or one whose
+/// arithmetic faulted, J4 — is counted in `health.faulted_legs` instead), with a mark that is
+/// neither `0` (J4) nor stale (Q10, judged as the close loop judges it — the market whose tick runs
+/// the episode is fresh). The legs the close loop would skip are exactly the ones that fail it.
+///
+/// The account's cross legs ARE its non-zero positions CROSSED in force (`types::CrossLegs`), so
+/// the evaluated legs and the faulted count cover every one of them without a position walk.
+/// Total: market and index-state loads.
 fn every_cross_leg_is_priced<H: PerpHost>(
     context: &mut H,
-    user: Address,
-    legs: &[CrossLeg],
+    health: &CrossHealth,
+    legs: &[CrossHealthLeg],
     caller: EpisodeCaller,
 ) -> Result<bool, PerpError> {
-    let markets = storage::load_user_markets_ref(context, user)?;
-    for &k in markets.iter() {
-        let pos = storage::load_position_ref(context, user, k)?;
-        if pos.amount == 0 || !is_crossed(&pos) {
-            continue;
-        }
-        if !legs.iter().any(|l| l.market_id == k) {
-            return Ok(false);
-        }
+    if health.faulted_legs != 0 {
+        return Ok(false);
+    }
+    for leg in legs {
+        let k = leg.market_id;
         let Some(market) = storage::load_market_ref(context, k)? else {
             return Ok(false);
         };
@@ -571,7 +585,7 @@ fn settle_cross_funding<H: PerpHost>(
 /// that last close; the balances are the account's then (`E` its cross wallet, `Σ MM` 0).
 ///
 /// Nothing to do — not flagged, or still holding a cross position (its markets' ticks resume the
-/// episode, R6) — writes and emits nothing. Total: position loads and the total fold.
+/// episode, R6) — writes and emits nothing. Total: the account and the health check.
 pub(crate) fn end_flag_without_cross_position<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -580,17 +594,17 @@ pub(crate) fn end_flag_without_cross_position<H: PerpHost>(
     if !storage::load_account_ref(context, user)?.in_liquidation() {
         return Ok(());
     }
-    // A position walk rather than `CrossFold::has_cross`: the fold leaves a leg it cannot evaluate
-    // OUT of every sum (J4), and an unpriceable cross position is still a cross position.
-    let markets = storage::load_user_markets_ref(context, user)?;
-    for &k in markets.iter() {
-        let pos = storage::load_position_ref(context, user, k)?;
-        if pos.amount != 0 && is_crossed(&pos) {
-            return Ok(());
-        }
+    // The stored cross legs rather than `CrossHealth::has_cross`: the health check leaves a leg it
+    // cannot evaluate OUT of every sum (J4), and an unpriceable cross position is still a cross
+    // position. The legs ARE the non-zero positions CROSSED in force — under the gate, which with
+    // cross margin off (only a test can turn it off) makes none of them CROSSED.
+    if crate::margin_type::cross_margin_enabled()
+        && !storage::load_cross_legs_ref(context, user)?.is_empty()
+    {
+        return Ok(());
     }
-    let fold = cross_fold(context, user, None, None, None)?;
-    end_episode(context, user, market_id, fold.e, fold.cross_mm)
+    let health = cross_health(context, user, None)?;
+    end_episode(context, user, market_id, health.e, health.cross_mm)
 }
 
 /// Clear the liquidation flag and emit `CrossLiquidationEnded` with the values that ended it.

@@ -431,6 +431,8 @@ fn run_adl_fills<H: PerpHost>(
     // Counterparties already bankrupt at the mark, held back until `cands` is spent.
     // `(addr, eq, Some(E) for a CROSSED one — the floor its fallback fill is held to)`.
     let mut fallback: Vec<(Address, i128, Option<i128>)> = Vec::new();
+    // One buffer for every CROSSED candidate's health legs, cleared per candidate.
+    let mut legs = Vec::new();
     for user in registry {
         if user == loser {
             continue;
@@ -441,14 +443,15 @@ fn run_adl_fills<H: PerpHost>(
         }
         // ── A CROSSED winner: judged and ranked on its ACCOUNT (R5 — see the doc) ───────────────
         //
-        // TOTAL (J4): `E` and this market's leg come from the total fold, nothing here divides
-        // (the rank is a ratio compared by cross-multiplication), and a leg the fold could not
+        // TOTAL (J4): `E` and this market's leg come from the total health check (the account
+        // blob's cross legs and their markets — no position walk, cross P4), nothing here divides
+        // (the rank is a ratio compared by cross-multiplication), and a leg the check could not
         // evaluate leaves the winner unrankable — fallback tier, at its `E`. `E = cWB + Σ_C uPnL`:
         // pending funding of every cross leg included (`cWB`), this market priced at its stored
         // mark, which is `mark_price` on both callers.
         if crate::margin_type::effective_margin_type(&wp) == crate::types::MarginType::Crossed {
-            let mut legs = Vec::new();
-            let e = crate::margin_view::cross_fold(context, user, None, None, Some(&mut legs))?.e;
+            legs.clear();
+            let e = crate::margin_view::cross_health(context, user, Some(&mut legs))?.e;
             match legs.iter().find(|l| l.market_id == market.market_id) {
                 Some(leg) if e > 0 => {
                     // `N_k`: the leg's `uPnL` less the entry basis (`uPnL = N + vQuote`).
