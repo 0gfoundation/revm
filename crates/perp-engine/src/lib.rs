@@ -53,6 +53,11 @@ mod cross_liquidation_tests;
 /// margin as it ships, beside the isolated `trading::tests::golden`.
 #[cfg(test)]
 mod cross_golden_tests;
+/// The independent cross-margin P3 spec suite (`SPEC_cross_margin.md` R1–R8, report §1.5–§1.7 and
+/// §3.4): Binance's liquidation-price examples, the episode, ADL, the negative-wallet clearance,
+/// conservation after every call, and the never-`Err` fuzz.
+#[cfg(test)]
+mod cross_margin_p3_spec_tests;
 pub mod risk;
 pub mod storage;
 pub mod trading;
