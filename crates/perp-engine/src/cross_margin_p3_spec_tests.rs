@@ -55,6 +55,9 @@
 //! * `adl_*` — R5: the sign-split cross rank, the per-fill clean tier, D7.
 //! * `clr_*` — Q8 / R4: the negative-wallet clearance on every route, never with a position left,
 //!   and a short insurance fund.
+//! * `fuzz_*` — the never-`Err` randomized multi-market runs — five markets, sixteen markets, and a
+//!   crowd that exhausts the sweep's step budget — and their determinism (`P3_FUZZ_SEEDS` /
+//!   `P3_FUZZ_STEPS` and the per-test variables for a long run).
 
 use alloy_sol_types::{SolCall, SolError, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
@@ -68,7 +71,7 @@ use crate::interface::IPerpDex::{
     batchPlaceOrdersCall, cancelAlgoOrderCall, cancelOrderCall, drainDeferredWorkCall,
     getAccountCall, getAccountReturn, getPositionRiskCall, liquidateCall, placeAlgoOrderCall,
     placeOrderCall, placeOrderSignedCall, registerApiKeyCall, setLeverageCall, setMarginTiersCall,
-    setMarginTypeCall, transferToPerpCall, updateIndexPriceCall,
+    setMarginTypeCall, transferFromPerpCall, transferToPerpCall, updateIndexPriceCall,
     updateMarketCall, AccountBalanceChanged, AccountPosition, Adl, AlgoOrderCancelled,
     AlgoOrderPlaced, CrossLiquidationEnded, CrossLiquidationStarted, InsuranceFundChanged,
     InsuranceFundDepleted, Liquidation, OrderCancelled, OrderPlaced, PlaceItem, Trade,
@@ -122,6 +125,8 @@ const E_2023_MT: &str = "setMarginType: -2023 User in liquidation mode now.";
 const E_J1: &str = "placeOrder: -2019 Margin is insufficient. The open would leave the cross \
                     margin balance below the cross maintenance margin";
 const E_LIQ_HEALTHY: &str = "liquidate: account is above cross maintenance margin";
+const E_LIQ_NO_POSITION: &str = "liquidate: no open position";
+const E_LIQ_ISO_HEALTHY: &str = "liquidate: position is above maintenance margin";
 
 /// The report's step budgets (§3.4): 50 per sweep (the existing `MAX_SWEEP_ACTIONS_PER_UPDATE`),
 /// a fresh 16 for a manual `liquidate()`.
@@ -338,6 +343,13 @@ struct Leg {
     upnl: i128,
     mm: i128,
     pf: i128,
+}
+
+impl Leg {
+    /// An ISOLATED position below its own maintenance (`margin + PF + uPnL < MM`).
+    fn iso_liquidatable(&self) -> bool {
+        !self.cross && self.amount != 0 && (self.margin as i128 + self.pf + self.upnl) < self.mm
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -786,6 +798,19 @@ impl World {
         );
         assert_eq!(self.mark(m), index, "the tick set the mark");
         logs
+    }
+
+    /// Every resting order of `u` on `m`, cancelled.
+    fn cancel_all(&mut self, u: Address, m: u64) {
+        let ids: Vec<Id> = storage::load_buy_orders(&mut self.ctx, u, m)
+            .unwrap()
+            .iter()
+            .chain(storage::load_sell_orders(&mut self.ctx, u, m).unwrap().iter())
+            .map(|e| e.order_id)
+            .collect();
+        for id in ids {
+            self.ok(u, &cancelOrderCall { orderId: id.into(), marketId: m }.abi_encode());
+        }
     }
 
     fn account_view(&mut self, u: Address) -> getAccountReturn {
@@ -2048,4 +2073,725 @@ fn clr_never_while_any_position_is_open() {
     // The last one closes (at its entry): now it is cleared.
     let logs = w.make(ALICE, M2, -1, 1_000, RO);
     assert_cleared(&mut w, &logs, ALICE, d(1_400), f);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// The never-`Err` fuzz (J4)
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+/// splitmix64.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+
+    fn pick<T: Copy>(&mut self, v: &[T]) -> T {
+        v[self.below(v.len() as u64) as usize]
+    }
+
+    fn chance(&mut self, num: u64, den: u64) -> bool {
+        self.below(den) < num
+    }
+}
+
+/// What a fuzz run reached — the coverage the long run reports and the default run floors.
+#[derive(Default, Debug, Clone)]
+struct Stats {
+    steps: u64,
+    accepted: u64,
+    refused: u64,
+    ticks: u64,
+    drains: u64,
+    keeper_liquidations: u64,
+    episodes: u64,
+    episodes_ended: u64,
+    cross_closes: u64,
+    iso_closes: u64,
+    adl_fills: u64,
+    clearances: u64,
+    socialised: u64,
+    deferrals: u64,
+    flagged_after_tick: u64,
+    refused_2023: u64,
+    refused_r2: u64,
+    stale_skips: u64,
+    exempt_after_tick: u64,
+    min_wallet: i128,
+    min_e: i128,
+    settle_rounds: u64,
+}
+
+impl Stats {
+    fn add(&mut self, o: &Stats) {
+        self.steps += o.steps;
+        self.accepted += o.accepted;
+        self.refused += o.refused;
+        self.ticks += o.ticks;
+        self.drains += o.drains;
+        self.keeper_liquidations += o.keeper_liquidations;
+        self.episodes += o.episodes;
+        self.episodes_ended += o.episodes_ended;
+        self.cross_closes += o.cross_closes;
+        self.iso_closes += o.iso_closes;
+        self.adl_fills += o.adl_fills;
+        self.clearances += o.clearances;
+        self.socialised += o.socialised;
+        self.deferrals += o.deferrals;
+        self.flagged_after_tick += o.flagged_after_tick;
+        self.refused_2023 += o.refused_2023;
+        self.refused_r2 += o.refused_r2;
+        self.stale_skips += o.stale_skips;
+        self.exempt_after_tick += o.exempt_after_tick;
+        self.min_wallet = self.min_wallet.min(o.min_wallet);
+        self.min_e = self.min_e.min(o.min_e);
+        self.settle_rounds = self.settle_rounds.max(o.settle_rounds);
+    }
+}
+
+/// The fuzz's market table: whole-dollar markets (exact integers, so the identity closes to the
+/// unit through funding too), different tier shapes (derived, explicit with `MM > PIM` drift,
+/// Binance-like), bands on and off, clearance fees, funding of either sign.
+fn fuzz_specs(n: u64) -> Vec<Spec> {
+    let tiers: [&[Band]; 5] = [
+        &[
+            Band { lb: 0, lev: 20, ppm: 0 },
+            Band { lb: 50_000, lev: 10, ppm: 0 },
+            Band { lb: 200_000, lev: 4, ppm: 0 },
+        ],
+        &DRIFT,
+        &[Band { lb: 0, lev: 5, ppm: 0 }],
+        &[
+            Band { lb: 0, lev: 50, ppm: 10_000 },
+            Band { lb: 10_000, lev: 25, ppm: 20_000 },
+            Band { lb: 50_000, lev: 10, ppm: 50_000 },
+        ],
+        &T10,
+    ];
+    let marks = [1_000, 500, 200, 100, 50];
+    let bands = [10_000, 500, 1_000, 10_000, 300];
+    let fees = [125, 0, 500, 0, 125];
+    let funding = [Some(300), Some(-200), None, Some(100), None];
+    (0..n)
+        .map(|i| {
+            let k = (i % 5) as usize;
+            Spec {
+                id: i + 1,
+                bd: 0,
+                pd: 0,
+                mark0: marks[k],
+                tiers: tiers[k].to_vec(),
+                interval: 15,
+                band_bps: bands[k],
+                fee_bps: fees[k],
+                funding: funding[k],
+            }
+        })
+        .collect()
+}
+
+const KEEPER: Address = address!("6666666666666666666666666666666666666666");
+
+struct Fuzz {
+    w: World,
+    rng: Rng,
+    traders: Vec<Address>,
+    /// Deep liquidity: DAVE (ISOLATED, leverage 1) and ERIN (CROSSED, $1e9).
+    lps: [Address; 2],
+    index: Vec<u64>,
+    stalled_until: Vec<u64>,
+    stats: Stats,
+    /// One digest per call — two runs of a seed must agree call for call (determinism).
+    digest: Vec<[u8; 32]>,
+}
+
+const LIQ_REFUSALS: [&str; 3] = [E_LIQ_HEALTHY, E_LIQ_NO_POSITION, E_LIQ_ISO_HEALTHY];
+
+impl Fuzz {
+    fn new(seed: u64, n_markets: u64, n_traders: u32, warmup: bool) -> Fuzz {
+        let mut rng = Rng(seed);
+        let specs = fuzz_specs(n_markets);
+        let mut w = World::new(specs.clone());
+        w.enroll(ERIN, BIG);
+        w.enroll(KEEPER, 0);
+        // A third of the seeds run on a small or an EMPTY insurance fund.
+        match rng.below(3) {
+            0 => w.set_fund(0),
+            1 => w.set_fund(d(2_000) as u64),
+            _ => {}
+        }
+        let mut traders = Vec::new();
+        for i in 0..n_traders {
+            let u = user(1_000 + i);
+            w.enroll(u, d(200 + rng.below(8_000) as i128));
+            w.set_spot(u, d(50_000) as u128);
+            if i % 3 == 0 {
+                w.ok(
+                    ADMIN,
+                    &crate::interface::IPerpDex::setUserFeeRatesCall {
+                        user: u,
+                        makerFeePpm: 200,
+                        takerFeePpm: 500,
+                    }
+                    .abi_encode(),
+                );
+            }
+            for s in &specs {
+                if rng.chance(1, 3) {
+                    w.set_type(u, s.id, ISOLATED);
+                }
+                // Half the time at the table's cap.
+                let cap = s.tiers[0].lev as u64;
+                let lev = if rng.chance(1, 2) { cap } else { 1 + rng.below(cap) };
+                w.set_lev(u, s.id, lev);
+            }
+            traders.push(u);
+        }
+        if warmup {
+            // A crowd: every trader opens a LONG on the first market at leverage 10 with five times
+            // its wallet (inside the first bracket — the same liquidation threshold for every
+            // account of a margin type) and rests a far bid on the second, so that one crash of
+            // the first market takes ~60 accounts under at once, each costing a cancel and a
+            // close: far more than the sweep's 50 steps.
+            let (m1, m2) = (specs[0].id, specs[1].id);
+            for &u in &traders {
+                w.set_lev(u, m1, 10);
+                let wallet = storage::load_account(&mut w.ctx, u).unwrap().perp_wallet_balance;
+                let qty = ((wallet as u64 / USD as u64) * 5).min(45_000) / specs[0].mark0;
+                let lp = if rng.chance(1, 2) { DAVE } else { ERIN };
+                if w.attempt(lp, &gtc(m1, SELL, specs[0].mark0, qty.max(1))).is_ok() {
+                    let _ = w.attempt(u, &mkt(m1, BUY, qty.max(1)));
+                    w.cancel_all(lp, m1);
+                }
+                let _ = w.attempt(u, &gtc(m2, BUY, specs[1].mark0 / 2, 1));
+            }
+        }
+        let index = specs.iter().map(|s| s.mark0).collect();
+        let stalled_until = vec![0; specs.len()];
+        Fuzz {
+            w,
+            rng,
+            traders,
+            lps: [DAVE, ERIN],
+            index,
+            stalled_until,
+            stats: Stats::default(),
+            digest: Vec::new(),
+        }
+    }
+
+    fn markets(&self) -> Vec<u64> {
+        self.w.markets()
+    }
+
+    /// One checked call; feeds the digest and the counters. Never-revert selectors (oracle,
+    /// drain) and `liquidate()`'s refusal set are enforced here.
+    fn call(&mut self, caller: Address, input: &[u8]) -> Result<Vec<Log>, String> {
+        let r = self.w.attempt(caller, input);
+        let sel: [u8; 4] = input[..4].try_into().unwrap();
+        let mut h = Vec::new();
+        h.extend_from_slice(&sel);
+        match &r {
+            Ok(logs) => {
+                self.stats.accepted += 1;
+                h.extend_from_slice(&self.w.last_out);
+                for l in logs {
+                    for t in l.data.topics() {
+                        h.extend_from_slice(t.as_slice());
+                    }
+                    h.extend_from_slice(&l.data.data);
+                }
+                self.count(logs);
+            }
+            Err(e) => {
+                self.stats.refused += 1;
+                h.extend_from_slice(e.as_bytes());
+                if e.contains("-2023") {
+                    self.stats.refused_2023 += 1;
+                }
+                if e == E_J1 {
+                    self.stats.refused_r2 += 1;
+                }
+                assert!(
+                    sel != updateIndexPriceCall::SELECTOR && sel != drainDeferredWorkCall::SELECTOR,
+                    "the oracle / drain path reverted: {e}"
+                );
+                if sel == liquidateCall::SELECTOR {
+                    assert!(LIQ_REFUSALS.contains(&e.as_str()), "liquidate() refused with `{e}`");
+                }
+            }
+        }
+        self.digest.push(*primitives::keccak256(&h));
+        r
+    }
+
+    fn count(&mut self, logs: &[Log]) {
+        let s = &mut self.stats;
+        s.episodes += evs::<CrossLiquidationStarted>(logs).len() as u64;
+        s.episodes_ended += evs::<CrossLiquidationEnded>(logs).len() as u64;
+        for l in evs::<Liquidation>(logs) {
+            if l.marginType == CROSSED {
+                s.cross_closes += 1;
+            } else {
+                s.iso_closes += 1;
+            }
+        }
+        s.adl_fills += evs::<Adl>(logs).len() as u64;
+        let paid = evs::<InsuranceFundChanged>(logs).into_iter().filter(|c| c.delta < 0);
+        s.clearances += paid.count() as u64;
+        s.socialised += evs::<InsuranceFundDepleted>(logs).len() as u64;
+    }
+
+    fn mark(&mut self, m: u64) -> u64 {
+        self.w.mark(m)
+    }
+
+    /// The oracle publishes a new index for `m` one interval after its last publication — the
+    /// clock catching up when that is ahead of it — then the detection property is checked.
+    fn tick(&mut self, m: u64, index: u64) {
+        let interval = self.w.spec(m).interval;
+        let last = storage::load_index_price_state(&mut self.w.ctx, m).unwrap().timestamp;
+        let ts = (last + interval).max(self.w.now - self.w.now % interval);
+        if ts > self.w.now {
+            let t = ts;
+            self.w.set_now(t);
+        }
+        let input =
+            updateIndexPriceCall { marketId: m, indexPrice: index, timestamp: ts }.abi_encode();
+        let logs = self.call(ADMIN, &input).unwrap();
+        self.stats.ticks += 1;
+        self.index[(m - 1) as usize] = index;
+        self.after_tick(m, &logs);
+    }
+
+    /// **Detection is complete** (§3.4): after `m`'s tick, no account holding a cross position in
+    /// `m` is under cross maintenance and unflagged, and no isolated position in `m` is under its
+    /// own — unless the sweep left work for the same block (`deferred_work`), or another
+    /// liquidation in this tick reached the account after its turn (an ADL fill or a maker fill:
+    /// D13, the next tick sees it).
+    fn after_tick(&mut self, m: u64, logs: &[Log]) {
+        let mut touched: Vec<Address> = evs::<Adl>(logs).iter().map(|a| a.adlUser).collect();
+        touched.extend(evs::<Trade>(logs).iter().map(|t| t.maker));
+        let deferred = self.w.deferred(m);
+        self.stats.deferrals += deferred as u64;
+        for u in self.traders.clone().into_iter().chain(self.lps) {
+            let a = self.w.acct(u);
+            let l = *a.leg(m);
+            if l.amount == 0 {
+                continue;
+            }
+            self.stats.flagged_after_tick += a.flagged as u64;
+            let missed = (l.cross && a.below() && !a.flagged) || l.iso_liquidatable();
+            if missed {
+                assert!(
+                    deferred || touched.contains(&u),
+                    "detection missed {u} on {m}'s tick: {a:#?}"
+                );
+                self.stats.exempt_after_tick += 1;
+            }
+            if a.flagged && a.below() {
+                // An episode left this account under: its remaining markets were stale (or out of
+                // budget, recorded).
+                self.stats.stale_skips += !deferred as u64;
+            }
+        }
+    }
+
+    fn step(&mut self, step: u64) {
+        self.stats.steps += 1;
+        let dt = 1 + self.rng.below(3);
+        let now = self.w.now + dt;
+        self.w.set_now(now);
+        let markets = self.markets();
+        if self.rng.chance(1, 60) {
+            let m = self.rng.pick(&markets);
+            self.stalled_until[(m - 1) as usize] = step + 20 + self.rng.below(60);
+        }
+        let u = self.rng.pick(&self.traders.clone());
+        let m = self.rng.pick(&markets);
+        let mk = self.mark(m);
+        let lp = self.rng.pick(&self.lps);
+        match self.rng.below(32) {
+            0..=6 => {
+                // A market order against liquidity a provider rests within 1 % of the mark.
+                let cap = self.rng.pick(&[2_000u64, 10_000, 40_000, 100_000]);
+                let qty = 1 + self.rng.below(cap / mk);
+                let side = self.rng.pick(&[BUY, SELL]);
+                let off = self.rng.below(mk / 100 + 1);
+                let price = if side == BUY { mk + off } else { mk.saturating_sub(off).max(1) };
+                let lq = self.call(lp, &gtc(m, 1 - side, price, qty)).is_ok();
+                let _ = self.call(u, &mkt(m, side, qty));
+                if lq {
+                    self.cancel_all(lp, m);
+                }
+            }
+            7..=8 => {
+                // A limit away from the mark (maker liquidity of the traders).
+                let side = self.rng.pick(&[BUY, SELL]);
+                let off = 1 + self.rng.below(mk / 10 + 1);
+                let price = if side == BUY { mk.saturating_sub(off).max(1) } else { mk + off };
+                let qty = 1 + self.rng.below(10_000 / mk + 1);
+                let flags = if self.rng.chance(1, 4) { RO } else { 0 };
+                let _ = self.call(u, &order(m, side, price, qty, LIMIT, GTC, flags));
+            }
+            9 => {
+                // A provider takes whatever rests (the traders' maker fills: D13, R1, the freeze).
+                let qty = 1 + self.rng.below(20_000 / mk + 1);
+                let side = self.rng.pick(&[BUY, SELL]);
+                let _ = self.call(lp, &mkt(m, side, qty));
+            }
+            10 => {
+                // A reduce-only close of the whole position: taker, or maker the provider takes.
+                let a = self.w.pos(u, m).amount;
+                if a != 0 {
+                    let side = if a > 0 { SELL } else { BUY };
+                    let off = self.rng.below(mk / 50 + 1);
+                    let price = if side == BUY { mk + off } else { mk.saturating_sub(off).max(1) };
+                    let q = a.unsigned_abs();
+                    if self.rng.chance(1, 2) {
+                        let lq = self.call(lp, &gtc(m, 1 - side, price, q)).is_ok();
+                        let _ = self.call(u, &mkt_ro(m, side, q));
+                        if lq {
+                            self.cancel_all(lp, m);
+                        }
+                    } else if self.call(u, &gtc_ro(m, side, price, q)).is_ok() {
+                        let _ = self.call(lp, &mkt(m, 1 - side, q));
+                    }
+                }
+            }
+            11 => {
+                let ids: Vec<Id> = storage::load_buy_orders(&mut self.w.ctx, u, m)
+                    .unwrap()
+                    .iter()
+                    .chain(storage::load_sell_orders(&mut self.w.ctx, u, m).unwrap().iter())
+                    .map(|e| e.order_id)
+                    .collect();
+                if !ids.is_empty() {
+                    let id = ids[self.rng.below(ids.len() as u64) as usize];
+                    let cancel = cancelOrderCall { orderId: id.into(), marketId: m }.abi_encode();
+                    let _ = self.call(u, &cancel);
+                }
+            }
+            12 => {
+                let cap = self.w.spec(m).tiers[0].lev as u64;
+                let lev = 1 + self.rng.below(cap);
+                let _ = self.call(u, &setLeverageCall { marketId: m, leverage: lev }.abi_encode());
+            }
+            13 => {
+                // Money out, decided by X (maxWithdrawAmount).
+                let x = self.w.account_view(u).maxWithdrawAmount as i128;
+                let amount = match self.rng.below(3) {
+                    0 => x,
+                    1 => x + 1,
+                    _ => d(1 + self.rng.below(3_000) as i128),
+                }
+                .max(1);
+                let r = self.call(u, &transferFromPerpCall { amount: amount as u64 }.abi_encode());
+                assert_eq!(r.is_ok(), amount <= x, "money out against X = {x}: {amount} {r:?}");
+            }
+            14 => {
+                let amount = d(1 + self.rng.below(5_000) as i128) as u64;
+                let _ = self.call(u, &transferToPerpCall { amount }.abi_encode());
+            }
+            15 => {
+                let t = if self.w.pos(u, m).margin_type == CROSSED { ISOLATED } else { CROSSED };
+                let switch = setMarginTypeCall { marketId: m, marginType: t }.abi_encode();
+                let _ = self.call(u, &switch);
+            }
+            16 => {
+                // A protective conditional: a closePosition stop or a reduce-only trailing stop.
+                let a = self.w.pos(u, m).amount;
+                if a != 0 {
+                    let side = if a > 0 { SELL } else { BUY };
+                    let r = 2 + self.rng.below(18);
+                    let input = if self.rng.chance(1, 2) {
+                        let trig = if a > 0 { mk - mk * r / 100 } else { mk + mk * r / 100 };
+                        stop_market(m, side, trig.max(1), 0, CLOSE_POSITION)
+                    } else {
+                        trailing(m, side, a.unsigned_abs(), 10 * (1 + self.rng.below(100)))
+                    };
+                    let _ = self.call(u, &input);
+                }
+            }
+            17 => {
+                self.stats.keeper_liquidations += 1;
+                let v = self.rng.pick(&self.traders.clone());
+                let _ = self.call(KEEPER, &liquidate(v, m));
+            }
+            18 => {
+                self.stats.drains += 1;
+                let _ = self.call(KEEPER, &drain(m));
+            }
+            19 => {
+                // Stress: a cross leg closed as a maker 15–80 % through the mark — the loss lands
+                // in W whatever its size, which is how a wallet goes deeply negative (no per-fill
+                // bad debt for a cross position). Then nothing: the next ticks find the account.
+                let a = self.w.acct(u);
+                if let Some(l) = a.legs.iter().find(|l| l.cross && l.amount != 0).copied() {
+                    let lm = self.w.mark(l.market);
+                    let r = 15 + self.rng.below(66);
+                    let side = if l.amount > 0 { SELL } else { BUY };
+                    let price =
+                        if l.amount > 0 { (lm - lm * r / 100).max(1) } else { lm + lm * r / 100 };
+                    self.cancel_all(u, l.market);
+                    let q = l.amount.unsigned_abs();
+                    if self.call(u, &gtc_ro(l.market, side, price, q)).is_ok() {
+                        let _ = self.call(lp, &mkt(l.market, 1 - side, q));
+                    }
+                }
+            }
+            20 if self.rng.chance(1, 3) => {
+                // A market-wide move: every live oracle publishes a 15–50 % crash (or a spike), one
+                // market per tick — accounts go under together, the sweep budget is shared out,
+                // and the episodes meet each other's stale marks.
+                let down = self.rng.chance(3, 4);
+                for m in markets {
+                    let k = (m - 1) as usize;
+                    if self.stalled_until[k] > step {
+                        continue;
+                    }
+                    let cur = self.index[k];
+                    let delta = cur * (15 + self.rng.below(36)) / 100;
+                    let next = if down { cur.saturating_sub(delta).max(1) } else { cur + delta };
+                    self.tick(m, next.min(1_000_000));
+                }
+            }
+            _ => {
+                // An oracle tick: small moves mostly, gaps, crashes and spikes.
+                let k = (m - 1) as usize;
+                if self.stalled_until[k] > step {
+                    return;
+                }
+                let cur = self.index[k];
+                let max_price = 1_000_000;
+                let roll = self.rng.below(100);
+                let bp: u64 = match roll {
+                    0..=59 => 10 + self.rng.below(300),
+                    60..=79 => 300 + self.rng.below(700),
+                    80..=89 => 1_500 + self.rng.below(3_500),
+                    90..=94 => 1_500 + self.rng.below(4_500),
+                    _ => 0,
+                };
+                let up = match roll {
+                    80..=89 => false,
+                    90..=94 => true,
+                    _ => self.rng.chance(1, 2),
+                };
+                let delta = (cur as u128 * bp as u128 / 10_000) as u64;
+                let next = if up {
+                    (cur + delta).min(max_price)
+                } else {
+                    cur.saturating_sub(delta).max(1)
+                };
+                self.tick(m, next);
+            }
+        }
+        let mut min_w = self.stats.min_wallet;
+        let mut min_e = self.stats.min_e;
+        for t in self.traders.clone() {
+            let a = self.w.acct(t);
+            min_w = min_w.min(a.w);
+            if a.has_cross {
+                min_e = min_e.min(a.e);
+            }
+        }
+        self.stats.min_wallet = min_w;
+        self.stats.min_e = min_e;
+    }
+
+    fn cancel_all(&mut self, u: Address, m: u64) {
+        let ids: Vec<Id> = storage::load_buy_orders(&mut self.w.ctx, u, m)
+            .unwrap()
+            .iter()
+            .chain(storage::load_sell_orders(&mut self.w.ctx, u, m).unwrap().iter())
+            .map(|e| e.order_id)
+            .collect();
+        for id in ids {
+            let _ = self.call(u, &cancelOrderCall { orderId: id.into(), marketId: m }.abi_encode());
+        }
+    }
+
+    /// The end of a run: every oracle publishes again on a moving clock (no market stale) and every
+    /// market is drained, round after round, until no account is flagged or under maintenance.
+    /// Then EVERY account is either healthy — cross at maintenance, each isolated position above
+    /// its own — or flat with a wallet at or above zero, and the views agree with the model.
+    fn settle(&mut self) {
+        let markets = self.markets();
+        for k in 0..self.stalled_until.len() {
+            self.stalled_until[k] = 0;
+        }
+        let bad = |f: &mut Fuzz| -> Vec<Address> {
+            let mut v = Vec::new();
+            for u in f.traders.clone().into_iter().chain(f.lps) {
+                let a = f.w.acct(u);
+                if a.flagged || a.below() || a.legs.iter().any(|l| l.iso_liquidatable()) {
+                    v.push(u);
+                }
+            }
+            v
+        };
+        let mut rounds = 0;
+        while !bad(self).is_empty() {
+            rounds += 1;
+            assert!(rounds <= 60, "the settle did not converge: {:?}", bad(self));
+            for &m in &markets {
+                let idx = self.index[(m - 1) as usize];
+                self.tick(m, idx);
+            }
+            for &m in &markets {
+                for _ in 0..20 {
+                    self.call(KEEPER, &drain(m)).unwrap();
+                    if !drainDeferredWorkCall::abi_decode_returns(&self.w.last_out).unwrap() {
+                        break;
+                    }
+                }
+            }
+        }
+        self.stats.settle_rounds = rounds;
+        for u in self.traders.clone().into_iter().chain(self.lps) {
+            let a = self.w.acct(u);
+            assert!(!a.flagged, "{u} is still flagged");
+            if a.flat() {
+                assert!(a.w >= 0, "{u} flat with W = {}", a.w);
+            } else {
+                assert!(!a.below(), "{u} under cross maintenance: {a:#?}");
+                assert!(!a.legs.iter().any(|l| l.iso_liquidatable()), "{u} isolated under: {a:#?}");
+            }
+            self.w.check_view(u);
+        }
+    }
+}
+
+/// Runs one seed; returns its stats and per-call digest.
+fn fuzz_run(
+    seed: u64,
+    steps: u64,
+    n_markets: u64,
+    n_traders: u32,
+    warmup: bool,
+) -> (Stats, Vec<[u8; 32]>) {
+    let mut f = Fuzz::new(seed, n_markets, n_traders, warmup);
+    f.stats.min_wallet = i128::MAX;
+    f.stats.min_e = i128::MAX;
+    if warmup {
+        // The crowd's crash: the first market loses a quarter in one tick.
+        let crash = f.index[0] * 3 / 4;
+        f.tick(1, crash);
+    }
+    for step in 0..steps {
+        f.step(step);
+    }
+    f.settle();
+    (f.stats.clone(), f.digest)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Runs `seeds` seeds from `base`, each wrapped so a failure names its seed; aggregates the stats.
+fn fuzz_many(
+    base: u64,
+    seeds: u64,
+    steps: u64,
+    n_markets: u64,
+    n_traders: u32,
+    warmup: bool,
+) -> Stats {
+    let mut total = Stats { min_wallet: i128::MAX, min_e: i128::MAX, ..Stats::default() };
+    let mut failed = Vec::new();
+    for i in 0..seeds {
+        let seed = base.wrapping_add(i.wrapping_mul(0x5851_f42d_4c95_7f2d));
+        let r = std::panic::catch_unwind(|| fuzz_run(seed, steps, n_markets, n_traders, warmup));
+        match r {
+            Ok((s, _)) => total.add(&s),
+            Err(e) => {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                failed.push((seed, msg));
+            }
+        }
+    }
+    eprintln!(
+        "fuzz {n_markets} markets × {n_traders} traders, {seeds} seeds × {steps} steps: {total:#?}"
+    );
+    let shown = &failed[..failed.len().min(5)];
+    assert!(failed.is_empty(), "{} of {seeds} seeds failed: {shown:#?}", failed.len());
+    total
+}
+
+/// **The never-`Err` fuzz.** Five markets (every tier shape, bands on and off, fees, funding of
+/// both signs), 10 traders with random margin types per market and leverage up to each table's
+/// cap, two liquidity providers (one isolated, one cross), an empty or small insurance fund on a
+/// third of the seeds each. Steps: market and limit orders, reduce-only closes as taker and maker,
+/// the providers taking resting orders, cancels, leverage, money out (asserted against X) and in,
+/// mode switches, closePosition and trailing stops, keeper `liquidate()` (only the three healthy /
+/// flat refusals allowed) and drains, deep losses realised as a maker, and oracle ticks — small
+/// moves, gaps, crashes and spikes, market-wide crashes one market per tick, oracles stalling
+/// while the clock runs (stale marks).
+///
+/// Every call: the oracle and the drain never revert or panic, refusals are write-clean, the
+/// custody identity holds (only the socialised shortfall moves it), `Σ amount == 0`, the stored
+/// invariants. After every tick: detection is complete. At the end: every account healthy or flat
+/// at `W ≥ 0`, nothing flagged, the views equal to the model. (`fuzz_is_deterministic`: a seed
+/// replayed gives the same digest for every call.)
+///
+/// `P3_FUZZ_SEEDS` / `P3_FUZZ_STEPS` / `P3_FUZZ_BASE` scale it for a long run.
+#[test]
+fn fuzz_never_err_conserves_and_ends_healthy_five_markets() {
+    let seeds = env_u64("P3_FUZZ_SEEDS", 4);
+    let steps = env_u64("P3_FUZZ_STEPS", 1_500);
+    let base = env_u64("P3_FUZZ_BASE", 0x0003_c0ff_ee00_2026);
+    let s = fuzz_many(base, seeds, steps, 5, 10, false);
+    if seeds >= 4 && steps >= 1_000 {
+        assert!(s.episodes > 0 && s.episodes_ended > 0 && s.cross_closes > 0, "cross episodes");
+        assert!(s.iso_closes > 0 && s.adl_fills > 0, "isolated closes and ADL");
+        assert!(s.clearances + s.socialised > 0, "a negative wallet cleared");
+        assert!(s.min_wallet < 0 && s.min_e < 0, "a negative wallet and E < 0 reached");
+        assert!(s.refused_2023 > 0, "the freeze was met");
+        assert!(s.flagged_after_tick > 0, "an episode outlived its tick");
+    }
+}
+
+/// The fuzz at the per-user market cap: 16 markets, 8 traders.
+#[test]
+fn fuzz_never_err_sixteen_markets() {
+    let seeds = env_u64("P3_FUZZ16_SEEDS", 1);
+    let steps = env_u64("P3_FUZZ16_STEPS", 1_200);
+    let base = env_u64("P3_FUZZ_BASE", 0x0016_c0ff_ee00_2026);
+    fuzz_many(base, seeds, steps, 16, 8, false);
+}
+
+/// The fuzz with a CROWD: 60 traders on three markets, each opened near its leverage at the start,
+/// so one market-wide move puts more accounts under in one tick than the sweep's 50 steps reach.
+/// The sweep defers (`deferred_work`), the drains and later ticks resume, and every property of the
+/// fuzz holds through it.
+#[test]
+fn fuzz_never_err_crowd_exhausts_the_sweep_budget() {
+    let seeds = env_u64("P3_FUZZ_CROWD_SEEDS", 1);
+    let steps = env_u64("P3_FUZZ_CROWD_STEPS", 300);
+    let base = env_u64("P3_FUZZ_BASE", 0x00c0_0d00_2026);
+    let s = fuzz_many(base, seeds, steps, 3, 60, true);
+    assert!(s.deferrals > 0, "the sweep budget was never exhausted");
+}
+
+/// A replayed seed is call-for-call identical.
+#[test]
+fn fuzz_is_deterministic() {
+    let (_, a) = fuzz_run(0x00de_7e2a_1234, 400, 5, 6, false);
+    let (_, b) = fuzz_run(0x00de_7e2a_1234, 400, 5, 6, false);
+    assert_eq!(a.len(), b.len());
+    assert!(a == b, "two runs of one seed diverged");
 }
