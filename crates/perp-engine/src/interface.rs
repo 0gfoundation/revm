@@ -689,6 +689,17 @@ sol! {
 
         // ── Market management (admin only) ─────────────────────────────────
         /// Register a new perpetual market.
+        ///
+        /// `liquidationFeeRateBps` — ⚠️ ABI CHANGE (cross P3, owner decision Q3 / R7): the
+        /// liquidation CLEARANCE FEE as a rate on the NOTIONAL a liquidation closes, valued at the
+        /// mark, for both margin types — Binance's `liquidationFee` (125 = 1.25%, BTCUSDT /
+        /// ETHUSDT). It used to be a rate on the isolated silo margin the close consumed, so at
+        /// leverage `L` the same number now charges about `L×` as much: a pre-P3 calibration must
+        /// be divided by the leverage it assumed, not carried over. Charged from the liquidated
+        /// wallet to the insurance fund, capped at what the close returned to the wallet
+        /// (isolated, J5) or at `max(0, crossMarginBalance after)` (cross), so a bankrupt
+        /// liquidation pays nothing. Not range-checked: 10,000 = the whole notional. Same meaning
+        /// on `updateMarket`, `getMarket`, `MarketAdded` and `MarketUpdated`.
         function addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint64 initialMarkPrice, uint32 priceBandBps) external;
         /// Update mutable market parameters (tick/step/quantity/price limits, active flag, and funding config).
         /// `active = false` refuses every new order; conditional orders then neither fire nor
@@ -697,10 +708,14 @@ sol! {
         /// for any untriggered conditional (NOT latched). Oracle ticks, funding, the band GC and
         /// liquidations keep running while inactive.
         /// baseDecimals and priceDecimals cannot be changed after creation.
+        /// `liquidationFeeRateBps`: a rate on the NOTIONAL closed (⚠️ ABI CHANGE, cross P3 — see
+        /// `addMarket`).
         function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps) external;
         /// Read the current mark price for a market.
         function getMarkPrice(uint64 marketId) external view returns (uint64 price);
         /// Read the configuration of a registered market. Reverts if the market does not exist.
+        /// `liquidationFeeRateBps`: a rate on the NOTIONAL closed (⚠️ ABI CHANGE, cross P3 — see
+        /// `addMarket`).
         function getMarket(uint64 marketId) external view returns (
             uint32 baseDecimals,
             uint32 priceDecimals,
@@ -2200,9 +2215,10 @@ sol! {
         /// `ADJUSTMENT` (protocol-forced, no order: the liquidation residual closed at mark, both
         /// ADL legs, the post-close dust write-off), 7 = `INSURANCE_CLEAR` (the move settles against
         /// the insurance fund: the liquidation clearance fee, `deposit`/`withdrawInsuranceFund`,
-        /// and — cross P3, owner decision Q8 — the clearance of a negative wallet at the end of the
-        /// call that closed the account's last position: a 0-position row at the cleared 0, after
-        /// the row that published the deficit),
+        /// and — ⚠️ ABI CHANGE (cross P3), owner decision Q8 — the clearance of a negative wallet
+        /// at the end of the call that closed the account's last position, WHATEVER the call (a
+        /// user close, a maker fill, a fired stop, a liquidation): a 0-position row at the
+        /// cleared 0, after the row that published the deficit),
         /// 8 = `INTERNAL_TRANSFER` (ours — no exact Binance `a.m` equivalent: `internalTransfer`,
         /// value moved between two accounts; the sender's and the receiver's rows both carry it),
         /// 9 = `MARGIN_TYPE_CHANGE` (Binance's code for a margin-type switch — DEFINED but carried
@@ -2665,16 +2681,29 @@ sol! {
         // ended it. Between the two, every closed market emits its own `Liquidation` (marginType 0).
         // An episode may span several transactions (a per-tick step budget); a `Started` with no
         // `Ended` yet means the account is still flagged. Both values saturate at the int64 /
-        // uint64 bounds.
+        // uint64 bounds. ⚠️ ABI CHANGE (cross P3): both events are NEW (two new topic0s).
+        //
+        // An episode's close of one market is an `OrderPlaced` of the liquidated user with
+        // `orderType` 0 (LIMIT), `tif` 1 (IOC) and `price` = its MM-share bankruptcy price clamped
+        // into the market's band — a computed price that need not lie on the tick grid — followed
+        // by its `Trade`s, then any `Adl` rows for the rest; an ISOLATED liquidation's close stays
+        // `orderType` 1 (MARKET) with `price` 0. Either way the order never rests and leaves no
+        // record (`getOrder` does not find it).
         event CrossLiquidationStarted(address indexed user, uint64 indexed triggerMarketId, int64 crossMarginBalance, uint64 totalCrossMaintMargin);
         event CrossLiquidationEnded(address indexed user, uint64 indexed marketId, int64 crossMarginBalance, uint64 totalCrossMaintMargin);
 
-        // Auto-deleveraging: one per forced trade closing a liquidated insolvent
-        // residual (`liquidatedUser`) against an opposite-side holder (`adlUser`) at
-        // the liquidated position's bankruptcy `price`. `qty` = deleveraged size.
+        // Auto-deleveraging: one per forced trade closing a liquidated position's book-unfillable
+        // residual (`liquidatedUser`) against an opposite-side holder (`adlUser`) at `price`: the
+        // MARK for a solvent residual — an isolated position with equity left, a cross account
+        // with `crossMarginBalance ≥ 0`, or a cross account any of whose cross legs is unpriced
+        // (stale or mark 0) — else the bankruptcy price: the isolated position's own, or (cross
+        // P3) the account's MM-share bankruptcy price clamped into the market's band. `qty` =
+        // deleveraged size.
         event Adl(address indexed liquidatedUser, address indexed adlUser, uint64 indexed marketId, uint64 qty, uint64 price);
 
         // Feeds: market metadata bootstrap for indexer
+        // `liquidationFeeRateBps`: a rate on the NOTIONAL closed (⚠️ ABI CHANGE, cross P3 — see
+        // `addMarket`).
         event MarketAdded(uint64 indexed marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint64 initialMarkPrice, uint32 priceBandBps);
         // Feeds: market risk-table updates for indexer / risk UI.
         // Index-aligned parallel arrays as `setMarginTiers` took them (`maintMarginRatesPpm` 0 =
@@ -2686,6 +2715,8 @@ sol! {
         // the binding.
         event MarginTiersUpdated(uint64 indexed marketId, uint64[] lowerBounds, uint32[] maxLeverages, uint32[] maintMarginRatesPpm, uint64 notionalCap);
         // Feeds: market metadata updates for indexer
+        // `liquidationFeeRateBps`: a rate on the NOTIONAL closed (⚠️ ABI CHANGE, cross P3 — see
+        // `addMarket`).
         event MarketUpdated(uint64 indexed marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps);
         // Feeds: /premiumIndex (mark + index price history), /fundingRate (markPrice field),
         //        and the `@markPrice` websocket stream — this is its ONLY streaming source, and
@@ -2811,11 +2842,17 @@ sol! {
 
         // Feeds: insurance fund balance history
         // delta > 0 = deposit or liquidation surplus credited; delta < 0 = deficit absorbed (bad
-        // debt, or — cross P3 — a negative wallet cleared once its account holds no position).
+        // debt — an ADL fallback-tier winner's included, a CROSSED one's since the P3 review — or,
+        // cross P3, a negative wallet cleared once its account holds no position).
+        // ⚠️ ABI CHANGE (cross P3): the clearance makes a NEGATIVE delta (and, with a short fund,
+        // `InsuranceFundDepleted`) appear on ORDINARY calls — a user's own close, a maker fill, a
+        // fired stop, any call that closes an account's last position below zero — not only on
+        // liquidations; each comes with the account's `AccountBalanceChanged` reason 7.
         event InsuranceFundChanged(int64 delta, uint64 newBalance);
         // Emitted when the insurance fund cannot fully cover a deficit.
         // badDebt = the uncovered amount absorbed by the protocol. For a negative-wallet clearance
-        // `marketId` is the market whose close left the account flat.
+        // `marketId` is the market whose close left the account flat. ⚠️ ABI CHANGE (cross P3): see
+        // `InsuranceFundChanged` — it can appear on an ordinary call.
         event InsuranceFundDepleted(uint64 indexed marketId, uint64 badDebt);
 
         // Feeds: role address changes
