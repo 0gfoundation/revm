@@ -390,11 +390,11 @@ pub(crate) struct Eviction {
 ///
 /// One function for the real pass and for every place that has to know its outcome BEFORE it
 /// runs. The admission gates are those places: the order that triggers a pass (a fill that shrinks,
-/// flips or closes the taker's own position) is decided before the pass evicts anything, and the
-/// orders it is about to evict carry no margin once they are gone — so the gate must be measured
-/// without them, which means replaying exactly this decision on the gate's copies
-/// (`trading::replay_reduce_only_restore`). Two copies of the rule would let the gate and the pass
-/// disagree about which orders survive.
+/// flips or closes the taker's own position; a normal order that overtakes the owner's reduce-only
+/// orders) is decided before the pass evicts anything, and the orders it is about to evict carry
+/// no margin once they are gone — so the gate must be measured without them, which means
+/// replaying exactly this decision on the gate's copies (`trading::replay_reduce_only_restore`).
+/// Two copies of the rule would let the gate and the pass disagree about which orders survive.
 ///
 /// Only `pos.amount` is read; the aggregates play no part in the prefix condition.
 pub(crate) fn next_eviction<'a, I>(pos: &PerpPosition, entries: I, side: Side) -> Option<Eviction>

@@ -3289,12 +3289,18 @@ fn rest_in_book<H: PerpHost>(
     // output. Only `setUserFeeRates` moves it, the flush cannot, so the pre-barrier read is the same
     // integer the post-barrier one would give.
     let maker_fee_ppm = storage::load_account_ref(context, user)?.maker_fee_ppm;
-    let (pos_basis, wallet, own_side_cancelled) = match basis {
-        Some(b) => (b.pos, b.wallet, b.own_side_cancelled),
+    let (pos_basis, wallet, own_side_cancelled, own_side_list) = match basis {
+        Some(b) => (b.pos, b.wallet, b.own_side_cancelled, b.own_side_list),
         None => (
             storage::load_position(context, user, market_id)?,
             storage::load_account_ref(context, user)?.perp_wallet_balance,
             false,
+            // A reduce-only order overtakes nothing (see the pass at the end of PHASE 2).
+            if flags.reduce_only {
+                None
+            } else {
+                stored_side_list_with_reduce_only(context, user, market_id, side)?
+            },
         ),
     };
     // ONE BBO resolve for the band gate. On the deferred path this is the PRE-barrier BBO; see
@@ -3472,11 +3478,11 @@ fn rest_in_book<H: PerpHost>(
     // that de-risks them and send them to liquidation instead. This is `derived_can_afford`'s "a
     // non-positive requirement is always affordable", restated at the one site that still has to ask.
     //
-    // (At THIS site `Δ ooIM` is in fact never negative — `max(|N + Bid|, |N − Ask|)` is
-    // non-decreasing in each of `Bid`/`Ask` at fixed `N`, `PIM` does not move, and
-    // `round_up_div`/`saturating_sub` preserve that — so the escape only ever fires at `Δ == 0`. The
-    // guard is still written as `Δ > 0` so it stays the faithful restatement of `derived_can_afford`,
-    // which other sites reach with a genuinely negative delta.)
+    // (At THIS site `Δ ooIM` is never negative unless the rest OVERTAKES reduce-only orders —
+    // `max(|N + Bid|, |N − Ask|)` is non-decreasing in each of `Bid`/`Ask` at fixed `N`, `PIM` does
+    // not move, and `round_up_div`/`saturating_sub` preserve that. An order that evicts reduce-only
+    // orders lowers its own side by their terms, and can come out negative: then the escape is
+    // exactly B1 — the placement as a whole lowers the requirement.)
     //
     // Cost: in the accepting case this market's `ooIM` is evaluated ONCE (inside the walk, via the
     // override) instead of three times.
@@ -3489,7 +3495,43 @@ fn rest_in_book<H: PerpHost>(
     // silent — R14 measurement + the official trigger sentence, see
     // `storage::mark_account_snapshot_dirty`), so the widening has no consumer again and the five
     // accumulators it folded would be discarded arithmetic on the hottest path.
-    let mut pos_after = pos_basis.clone();
+    //
+    // # The orders this rest OVERTAKES — measured without them
+    //
+    // The third reduce-only eviction trigger (the pass at the end of PHASE 2): a NORMAL order
+    // resting nearer the touch grows the "ahead" term of the owner's reduce-only orders behind it,
+    // and the pass evicts as many as the prefix condition needs. It runs AFTER this decision, so
+    // the decision replays it here — on the post-barrier list with the new entry inserted where
+    // PHASE 2 inserts it — and the gate is measured without the orders it evicts. On Binance a
+    // reduce-only order carries no open-order margin and is expired once it can no longer reduce,
+    // so the order whose rest kills one is not liable for it. Measured with them, the gate was
+    // too strict: short 5 with a reduce-only buy 5 @ $90, a normal buy 16 @ $100 resting ahead of
+    // it was priced at `Bid = $2,050` (`ooIM = $1,050` at leverage 1) where `$1,600` is what rests
+    // (`ooIM = $600`).
+    //
+    // `pos_pre` is the basis without them; `None` = nothing evicted (the common case — no
+    // reduce-only order on this side, so no list was even cloned). The order's OWN terms (its Open
+    // Loss, its opening part) are measured against it; the delta runs from the true before
+    // (`pos_basis`) to the true after (`pos_after`).
+    let pos_pre = match own_side_list.filter(|_| !flags.reduce_only) {
+        Some(mut list) => {
+            let i = match side {
+                Side::Buy => list.partition_point(|e| e.price > price),
+                Side::Sell => list.partition_point(|e| e.price < price),
+            };
+            list.insert(i, new_entry);
+            let mut pre = pos_basis.clone();
+            let mut other = std::collections::VecDeque::new();
+            let (buy, sell) = match side {
+                Side::Buy => (&mut list, &mut other),
+                Side::Sell => (&mut other, &mut list),
+            };
+            replay_reduce_only_restore(&mut pre, buy, sell, side, market)?.then_some(pre)
+        }
+        None => None,
+    };
+    let pre = pos_pre.as_ref().unwrap_or(&pos_basis);
+    let mut pos_after = pre.clone();
     {
         let (qty_field, notional_field, label) = match side {
             Side::Buy => (
@@ -3521,7 +3563,7 @@ fn rest_in_book<H: PerpHost>(
     // is admitted on its initial margin alone and fills into an open loss the account never had —
     // the counterparty, possibly the user's own sub-account, collecting it as profit. See
     // [`cross_rest_open_loss`].
-    let open_loss = cross_rest_open_loss(market, &pos_basis, side, price, qty)?;
+    let open_loss = cross_rest_open_loss(market, pre, side, price, qty)?;
     // `pos_after` overrides storage for this market: it is not written until PHASE 2. ONE fold:
     // its `A` is the gate below (`derived_available_balance_with` is exactly this fold's `a`), its
     // `E` / `Σ_C MM` the maintenance check after it (R2) — no load beyond the walk the gate made.
@@ -3563,7 +3605,7 @@ fn rest_in_book<H: PerpHost>(
     // isolated outcome is what it was.
     if fold.has_cross
         && !flags.reduce_only
-        && opening_part_of_order(&pos_basis, side, qty) > 0
+        && opening_part_of_order(pre, side, qty) > 0
         && fold.e - (open_loss as i128) < fold.cross_mm
     {
         // Write-clean, like the refusals above.
@@ -3741,6 +3783,10 @@ fn rest_in_book<H: PerpHost>(
     // The whole cost when the owner holds no reduce-only order on this side — the overwhelmingly
     // common case — is one scan of the list this call already had warm. The heavy part (loading the
     // position, folding the prefix) is behind that check.
+    //
+    // PHASE 1 replayed this pass (`pos_pre`) and decided on its outcome; this is the real one, run
+    // whenever it could evict — not only when the replay did — so the prefix condition never
+    // depends on the replay's plumbing. The assertion below holds the two to each other.
     if !flags.reduce_only {
         crate::reduce_only::restore(
             context,
@@ -3749,6 +3795,28 @@ fn rest_in_book<H: PerpHost>(
             side,
             crate::types::CancelReason::ReduceOnlyOvertaken,
         )?;
+    }
+    #[cfg(debug_assertions)]
+    {
+        // PHASE 2 wrote what PHASE 1 decided on: the rest's own terms, less exactly the reduce-only
+        // orders the replay evicted.
+        let settled = storage::load_position_ref(context, user, market_id)?;
+        debug_assert_eq!(
+            (
+                settled.total_buy_qty,
+                settled.total_buy_notional,
+                settled.total_sell_qty,
+                settled.total_sell_notional
+            ),
+            (
+                pos_after.total_buy_qty,
+                pos_after.total_buy_notional,
+                pos_after.total_sell_qty,
+                pos_after.total_sell_notional
+            ),
+            "the overtake pass evicted other orders than PHASE 1 replayed — the rest was admitted \
+             on the wrong state (`replay_reduce_only_restore`)"
+        );
     }
 
     Ok(RestOutcome::Rested)
@@ -4090,10 +4158,11 @@ pub(super) fn release_open_order_margin_core(
 /// It is how an admission decision sees the state its own acceptance leaves. The real pass runs
 /// AFTER the decision (behind the write barrier), and every order it evicts there is an order that
 /// can no longer reduce — on Binance such an order carries no open-order margin and is expired, so
-/// an order whose acceptance kills it must not be charged for it. The caller is the match flush's
-/// pass on the taker (`ReduceOnlyPositionShrank` / `ReduceOnlyWouldOpen`), replayed by
-/// `settlement::post_flush_snapshot` before the fills gate, the cover simulation and the
-/// [`settlement::RestBasis`] are measured.
+/// an order whose acceptance kills it must not be charged for it. Callers:
+/// * `settlement::post_flush_snapshot` — the match flush's pass on the taker
+///   (`ReduceOnlyPositionShrank` / `ReduceOnlyWouldOpen`), replayed before the fills gate, the
+///   cover simulation and the [`settlement::RestBasis`] are measured;
+/// * [`rest_in_book`] — the overtake pass a NORMAL order's rest triggers (`ReduceOnlyOvertaken`).
 ///
 /// The decision is the real pass's own ([`crate::reduce_only::next_eviction`]) and the removal is
 /// the cover simulation's ([`release_open_order_margin_core`]), so neither can drift from what the
@@ -4126,6 +4195,22 @@ pub(super) fn replay_reduce_only_restore(
         )?;
         evicted = true;
     }
+}
+
+/// The owner's `side` list off the STORE, only when it holds a reduce-only entry — the store-path
+/// twin of `settlement::RestBasis::own_side_list`, for a rest no match touched. A `_ref` read of
+/// the list PHASE 2 inserts into anyway; cloned only when there is something to overtake.
+fn stored_side_list_with_reduce_only<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    side: Side,
+) -> Result<Option<std::collections::VecDeque<OrderEntry>>, PerpError> {
+    let list = match side {
+        Side::Buy => storage::load_buy_orders_ref(context, user, market_id)?,
+        Side::Sell => storage::load_sell_orders_ref(context, user, market_id)?,
+    };
+    Ok(list.iter().any(|e| e.reduce_only).then(|| (*list).clone()))
 }
 
 // ── FOK / PostOnly pre-checks ─────────────────────────────────────────────────

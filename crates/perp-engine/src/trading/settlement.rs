@@ -409,8 +409,8 @@ impl TakerSettlement {
                 true
             }
         };
-        let (rest_pos, cover_cancelled) = if covered {
-            (after_fills, false)
+        let (rest_pos, cover_cancelled, rest_lists) = if covered {
+            (after_fills, false, evicted_lists)
         } else {
             // Cover needed (rare): simulate the LIFO same-side cancels on clones, reusing
             // `release_open_order_margin_core` so the sim cannot diverge from `finalize_apply`'s
@@ -470,7 +470,7 @@ impl TakerSettlement {
                 )?;
                 cancelled_any = true;
             }
-            (sim_pos, cancelled_any)
+            (sim_pos, cancelled_any, Some((sim_buy, sim_sell)))
         };
 
         // ── J6: an ISOLATED silo is funded with WALLET CASH, never with cross unrealized profit ──
@@ -549,6 +549,7 @@ impl TakerSettlement {
             .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
 
         let pos_log = w.pos.clone();
+        let own_side_list = own_side_list_with_reduce_only(w, rest_lists, taker_side);
         reg.push_event(MatchEvent::AbsorbBadDebt {
             market_id: self.market_id,
             amount: core.bad_debt,
@@ -566,6 +567,7 @@ impl TakerSettlement {
                 pos: rest_pos,
                 wallet: rest_wallet,
                 own_side_cancelled: cover_cancelled || evicted_own_side,
+                own_side_list,
             },
             gate,
         }))
@@ -596,11 +598,16 @@ impl TakerSettlement {
 ///   rest decision needs it because such a cancel can lower the taker's own side of the BBO, and
 ///   `rest_in_book`'s new-best band gate reads the BBO pre-flush. See the `may_become_best` note
 ///   there.
+/// * `own_side_list` — the taker's SAME-SIDE order list as the barrier leaves it (post-eviction,
+///   post-cover), but only when it still holds a reduce-only entry: that is the one case in which
+///   the remainder's rest can OVERTAKE something (`reduce_only::restore`'s third trigger), and
+///   `rest_in_book` replays that pass on it before deciding. `None` = nothing to overtake.
 #[derive(Clone)]
 pub(super) struct RestBasis {
     pub(super) pos: crate::types::PerpPosition,
     pub(super) wallet: i64,
     pub(super) own_side_cancelled: bool,
+    pub(super) own_side_list: Option<std::collections::VecDeque<crate::types::OrderEntry>>,
 }
 
 /// The registry working copy's position AS THE FLUSH WILL WRITE IT: `w.pos` with the per-side
@@ -685,6 +692,35 @@ fn post_flush_snapshot(
         evicted |= super::replay_reduce_only_restore(&mut pos, &mut buy, &mut sell, side, market)?;
     }
     Ok((pos, evicted.then_some((buy, sell))))
+}
+
+/// [`RestBasis::own_side_list`]: the taker's `side` list as the barrier leaves it — `lists` when
+/// the pass or the cover simulation produced copies, `w`'s own list otherwise — kept only when it
+/// holds a reduce-only entry. Cloned only then, so a taker without one pays one scan.
+fn own_side_list_with_reduce_only(
+    w: &UserWork,
+    lists: Option<EntryLists>,
+    side: Side,
+) -> Option<std::collections::VecDeque<crate::types::OrderEntry>> {
+    let holds_reduce_only = |l: &std::collections::VecDeque<crate::types::OrderEntry>| {
+        l.iter().any(|e| e.reduce_only)
+    };
+    match lists {
+        Some((buy, sell)) => {
+            let list = match side {
+                Side::Buy => buy,
+                Side::Sell => sell,
+            };
+            holds_reduce_only(&list).then_some(list)
+        }
+        None => {
+            let list = match side {
+                Side::Buy => &w.buy_entries,
+                Side::Sell => &w.sell_entries,
+            };
+            holds_reduce_only(list).then(|| list.clone())
+        }
+    }
 }
 
 /// Whether [`post_flush_snapshot`]'s pass evicted one of `w`'s orders on `side` — each eviction
@@ -1158,6 +1194,7 @@ impl MatchRegistry {
                 let (pos, evicted_lists) = post_flush_snapshot(w, market)?;
                 Ok(Some(RestBasis {
                     own_side_cancelled: own_side_evicted(w, evicted_lists.as_ref(), side),
+                    own_side_list: own_side_list_with_reduce_only(w, evicted_lists, side),
                     pos,
                     wallet: w.account.perp_wallet_balance,
                 }))
