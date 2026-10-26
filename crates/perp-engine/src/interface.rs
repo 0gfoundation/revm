@@ -1611,15 +1611,17 @@ sol! {
         ///                             `totalCrossWalletBalance` — see the ⚠️ below for why this is
         ///                             NOT Binance's `totalWalletBalance`, which it used to be
         ///                             misnamed after.
-        ///   crossMarginBalance        `totalCrossWalletBalance + totalUnrealizedProfit`. NOT a
-        ///                             Binance field, and NOT Binance's `totalMarginBalance` (that
-        ///                             one is GROSS-based; `getAccount` returns it).
-        ///                             ⚠️ NOT `getAccount`'s `crossMarginBalance` either (cross P2):
-        ///                             that one is the cross margin balance `E`, which adds CROSSED
-        ///                             positions' unrealised PnL only. This field keeps its original
-        ///                             definition (every listed position's PnL), so it is unchanged
-        ///                             for an isolated-only account; the two agree when every listed
-        ///                             position is CROSSED.
+        ///   crossMarginBalance        the cross margin balance `E` over the listed markets:
+        ///                             `totalCrossWalletBalance` + the unrealised PnL of the listed
+        ///                             CROSSED positions only — `getAccount`'s field of the same
+        ///                             name, the left side of the cross liquidation test
+        ///                             (`E < totalCrossMaintMargin`). NOT Binance's
+        ///                             `totalMarginBalance` (that one is GROSS-based and counts
+        ///                             every position's PnL; `getAccount` returns it).
+        ///                             ⚠️ ABI CHANGE (cross P3, the flip — R8): until then this
+        ///                             field was `totalCrossWalletBalance + totalUnrealizedProfit`,
+        ///                             ISOLATED positions' PnL included. The two differ by the
+        ///                             listed ISOLATED positions' unrealised PnL.
         ///   totalInitialMargin        Σ `initialMargin`         (== the next two, summed).
         ///   totalPositionInitialMargin Σ `positionInitialMargin`.
         ///   totalOpenOrderInitialMargin Σ `openOrderInitialMargin`.

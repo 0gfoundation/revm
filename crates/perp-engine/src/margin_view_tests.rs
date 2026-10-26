@@ -1116,10 +1116,10 @@ fn outputs_are_recomputable_from_the_reported_inputs() {
         acc.totalUnrealizedProfit,
         a_info.unrealizedProfit + b_info.unrealizedProfit
     );
-    assert_eq!(
-        acc.crossMarginBalance,
-        acc.totalCrossWalletBalance + acc.totalUnrealizedProfit
-    );
+    // `crossMarginBalance` is `E` (the cross flip, R8): the cross wallet plus the CROSSED
+    // positions' PnL. Both positions here are ISOLATED, so it is the cross wallet itself.
+    assert_eq!(acc.crossMarginBalance, acc.totalCrossWalletBalance);
+    assert_ne!(acc.totalUnrealizedProfit, 0, "and the isolated PnL really is left out");
     // `availableBalance = walletBalance - Σ ooIM`, Binance's identity literally. The wallet is
     // net of the POSITION allocation only; the open-order requirement is subtracted here and
     // nowhere else.
@@ -1343,8 +1343,9 @@ fn get_account_reflects_a_short_under_funded_silo_at_its_actual_value() {
         "$500 cross + $100 silo"
     );
     assert_eq!(a.totalUnrealizedProfit, 80 * USD as i64);
-    // Equity is GROSS-based: $600 + $80. Note it is NOT cross + uPnL ($580) — that difference is
-    // exactly why `getAccountMargin`'s field is named `crossMarginBalance`.
+    // Equity is GROSS-based: $600 + $80. Note it is NOT cross + uPnL ($580) — the confusion that
+    // renamed `getAccountMargin`'s `marginBalance` to `crossMarginBalance` (today the cross margin
+    // balance `E`, $500 here: the silo's position is ISOLATED).
     assert_eq!(a.totalMarginBalance, 680 * USD as i64);
     assert_eq!(
         a.totalMarginBalance,
@@ -2196,8 +2197,8 @@ fn the_event_and_get_account_agree_field_for_field_on_the_same_state() {
 ///
 /// If the two ever forked the arithmetic this is the test that catches it. The fields that are NOT
 /// shared are the point of each selector: `getAccount` alone reports `totalWalletBalance` /
-/// `totalMarginBalance` (they need the WHOLE index to be honest), and `getAccountMargin` alone
-/// reports `crossMarginBalance` (the partial-list-safe analogue).
+/// `totalMarginBalance` (they need the WHOLE index to be honest). `crossMarginBalance` (`E`) is
+/// shared since the cross flip (R8); before it, `getAccountMargin`'s was `cross + Σ uPnL`.
 #[test]
 fn get_account_and_get_account_margin_agree_on_the_same_market_set() {
     let mut ctx = make_ctx();
@@ -2224,6 +2225,7 @@ fn get_account_and_get_account_margin_agree_on_the_same_market_set() {
             idx.totalOpenOrderInitialMargin,
             idx.totalMaintMargin,
             idx.availableBalance,
+            idx.crossMarginBalance,
         ),
         (
             list.totalCrossWalletBalance,
@@ -2233,16 +2235,17 @@ fn get_account_and_get_account_margin_agree_on_the_same_market_set() {
             list.totalOpenOrderInitialMargin,
             list.totalMaintMargin,
             list.availableBalance,
+            list.crossMarginBalance,
         ),
         "same market set, same walkers ⇒ identical numbers"
     );
-    // The one shared-quantity difference is the NAME, and it is the naming bug this change fixed:
-    // `crossMarginBalance` is cross + uPnL, whereas the Binance-named `totalMarginBalance` is
-    // GROSS + uPnL. They differ by exactly Σ isolatedWallet.
+    // `crossMarginBalance` is `E` = cross + Σ CROSSED uPnL, whereas the Binance-named
+    // `totalMarginBalance` is GROSS + Σ uPnL. On this isolated-only account they differ by exactly
+    // Σ isolatedWallet + Σ uPnL.
     assert_eq!(
         idx.totalMarginBalance - list.crossMarginBalance,
-        idx.totalWalletBalance - idx.totalCrossWalletBalance,
-        "the two 'margin balance' figures differ by exactly Σ isolatedWallet"
+        idx.totalWalletBalance - idx.totalCrossWalletBalance + idx.totalUnrealizedProfit,
+        "the two 'margin balance' figures differ by Σ isolatedWallet + Σ isolated uPnL"
     );
     assert_ne!(
         idx.totalMarginBalance, list.crossMarginBalance,

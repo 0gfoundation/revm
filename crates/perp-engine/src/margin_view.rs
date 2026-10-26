@@ -1736,8 +1736,10 @@ pub fn account_margin_scalars<H: PerpHost, I: IntoIterator<Item = u64>>(
 /// (Under the old escrow it double-subtracted the open-order requirement; that caveat is gone
 /// with the escrow.)
 ///
-/// `marginBalance` was renamed `crossMarginBalance` for the same reason: it is `cross + Σ upnl`,
-/// whereas Binance's `totalMarginBalance` is `GROSS + Σ upnl`. `getAccount` returns that one.
+/// `marginBalance` was renamed `crossMarginBalance` for the same reason, and since the cross flip
+/// (R8) it is the cross margin balance `E = cross + Σ_CROSSED upnl` — `getAccount`'s field of the
+/// same name — whereas Binance's `totalMarginBalance` is `GROSS + Σ upnl`. `getAccount` returns
+/// that one.
 ///
 /// # Why `totalWalletBalance` is deliberately NOT returned here
 ///
@@ -1783,21 +1785,15 @@ pub fn run_get_account_margin<H: PerpHost>(
         None,
     )?;
 
-    // This selector's `crossMarginBalance` is its OWN documented quantity,
-    // `totalCrossWalletBalance + totalUnrealizedProfit` over the listed markets — NOT `E`
-    // (`AccountMarginScalars::cross_margin_balance`, which sums cross uPnL only, cross P2 / G16).
-    // The two agree for an account whose listed positions are all CROSSED; for every ISOLATED one
-    // (every position while cross margin is gated off) this keeps the number the selector has
-    // always returned. Narrowed under the same name the scalar fold used to narrow it under.
-    let cross_wallet_plus_upnl = i64::try_from(
-        s.total_cross_wallet_balance as i128 + s.total_unrealized_profit as i128,
-    )
-    .map_err(|_| perp_err("getAccountMargin: cross margin balance exceeds i64"))?;
-
+    // `crossMarginBalance` is the cross margin balance `E` over the listed markets
+    // (`AccountMarginScalars::cross_margin_balance`: `totalCrossWalletBalance` plus the unrealised
+    // PnL of the CROSSED positions only — cross P2 / G16), the same quantity `getAccount` names so.
+    // Until the cross flip (R8) this selector kept its pre-cross definition,
+    // `totalCrossWalletBalance + totalUnrealizedProfit` (ISOLATED positions' PnL included).
     Ok(Bytes::from(getAccountMarginCall::abi_encode_returns(
         &getAccountMarginReturn {
             totalCrossWalletBalance: s.total_cross_wallet_balance,
-            crossMarginBalance: cross_wallet_plus_upnl,
+            crossMarginBalance: s.cross_margin_balance,
             totalInitialMargin: s.total_initial_margin,
             totalPositionInitialMargin: s.total_position_initial_margin,
             totalOpenOrderInitialMargin: s.total_open_order_initial_margin,

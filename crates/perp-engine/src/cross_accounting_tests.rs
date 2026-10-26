@@ -886,14 +886,18 @@ fn get_account_reports_the_cross_quantities() {
         a.totalCrossMaintMargin,
         rows.iter().filter(|r| r.marginType == 0).map(|r| r.maintMargin).sum::<u64>()
     );
-    // getAccountMargin over the same set: same A, cWB; its crossMarginBalance keeps its definition.
+    // getAccountMargin over the same set: same A, cWB and — since the cross flip (R8) — the same
+    // `E`, which leaves the ISOLATED leg's PnL out (its pre-flip definition counted it).
     let am = account_margin(&mut ctx, ALICE, &[M1, M2, M3]);
     assert_eq!(
-        (am.availableBalance, am.totalCrossWalletBalance),
-        (a.availableBalance, a.totalCrossWalletBalance)
+        (am.availableBalance, am.totalCrossWalletBalance, am.crossMarginBalance),
+        (a.availableBalance, a.totalCrossWalletBalance, a.crossMarginBalance)
     );
-    assert_eq!(am.crossMarginBalance, a.totalCrossWalletBalance + a.totalUnrealizedProfit);
-    assert_ne!(am.crossMarginBalance, a.crossMarginBalance, "different definitions, isolated PnL");
+    assert_ne!(
+        am.crossMarginBalance,
+        a.totalCrossWalletBalance + a.totalUnrealizedProfit,
+        "the isolated leg's PnL is not in E"
+    );
 
     assert!(rows.iter().any(|r| r.marginType == 0 && r.liquidationPrice != 0));
     for row in rows {
