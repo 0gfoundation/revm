@@ -33,6 +33,9 @@
 //!   winner (the fund covering it), with the loser's capped fee and the winner's negative-wallet
 //!   clearance in one call — in both address orders; a CROSSED maker refused on a cleared wallet;
 //!   a maker refused at its leverage tier.
+//! * `cross_episodes` — the episode's own decisions: a stale leg left open (Q10) and the flag that
+//!   stays, -2023, a flagged maker's reduce-only fill (R1) ending the flag, an isolated liquidation
+//!   next to a cross wallet, and three legs closed in one call in the documented order.
 //!
 //! Every checkpoint also reads `getAccountMargin` over no market (the STORED wallet, which
 //! `AccountBalanceChanged` carries) and over each market an actor holds a position in (that leg's
@@ -2825,6 +2828,284 @@ fn fixture_export_cross_scenes() {
          cleared (Q8) in the same call - first with the loser's address below the winner's, \
          then above; a CROSSED maker refused on the wallet the fund cleared to 0; a maker \
          refused at its leverage tier.",
+        None,
+    );
+}
+
+// ── (f) cross episodes: stale legs, the flag, and the close order ──────────────────────────────
+
+/// The account-level episode's own decisions, each in a call of its own:
+///
+/// * F (CROSSED on M24 and M25) is caught by a crash on M24 while M25's mark is stale (no tick for
+///   longer than three oracle intervals, Q10): the episode closes M24 and leaves M25 alone, so the
+///   flag stays. F's opening order is refused (-2023); its reduce-only one on M25 rests, a provider
+///   takes it (R1: a flagged maker's reduce-only order fills), and with no cross position left the
+///   flag ends at the end of that call.
+/// * H (CROSSED on M24, ISOLATED on M26) is caught by the same crash and recovers in one step;
+///   later its ISOLATED M26 position is liquidated next to its cross wallet.
+/// * E (CROSSED on M27, M28 and M29, each fresh) is made bankrupt by a crash on M27: the episode
+///   closes ALL three in one call, in its documented order — the trigger market first, then by
+///   maintenance margin DESCENDING (M29 before M28, against market-id order).
+mod cross_episodes {
+    use super::*;
+
+    const ADMIN: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const ORACLE: Address = address!("0000000000000000000000000000000000000c1e");
+    /// Deep liquidity, ISOLATED on every market.
+    const LP: Address = address!("7777777777777777777777777777777777777777");
+    const F: Address = address!("1111111111111111111111111111111111111111");
+    const G: Address = address!("2222222222222222222222222222222222222222");
+    const H: Address = address!("3333333333333333333333333333333333333333");
+    const E: Address = address!("4444444444444444444444444444444444444444");
+    const TRADERS: [Address; 4] = [F, G, H, E];
+    /// Hourly-ish funding (every 60 s, 300 ppm) so the episode's funding settles move money.
+    const M24: u64 = 24;
+    const M25: u64 = 25;
+    const M26: u64 = 26;
+    /// No funding: the close-order scene.
+    const M27: u64 = 27;
+    const M28: u64 = 28;
+    const M29: u64 = 29;
+    const MARKETS: [u64; 6] = [M24, M25, M26, M27, M28, M29];
+    const USD: u64 = 1_000_000;
+    const BUY: u8 = 0;
+    const SELL: u8 = 1;
+    const GTC: u8 = 0;
+    const RO: u8 = 0b01;
+    const ISOLATED: u8 = 1;
+    const T0: u64 = 3_600;
+
+    /// Every market prices in cents (`priceDecimals` 2) and trades whole units.
+    const fn px(dollars: u64) -> u64 {
+        dollars * 100
+    }
+
+    fn limit(m: u64, side: u8, price: u64, qty: u64, flags: u8) -> Vec<u8> {
+        let c = placeOrderCall {
+            marketId: m,
+            side,
+            price,
+            quantity: qty,
+            orderType: 0,
+            tif: GTC,
+            clientOrderId: FixedBytes::default(),
+            flags,
+        };
+        c.abi_encode()
+    }
+
+    fn market(m: u64, side: u8, qty: u64) -> Vec<u8> {
+        let c = placeOrderCall {
+            marketId: m,
+            side,
+            price: 0,
+            quantity: qty,
+            orderType: 1,
+            tif: GTC,
+            clientOrderId: FixedBytes::default(),
+            flags: 0,
+        };
+        c.abi_encode()
+    }
+
+    fn tick(r: &mut Recorder, m: u64, cents: u64) -> Vec<Log> {
+        let ts = r.h.now - r.h.now % 15;
+        let u = updateIndexPriceCall { marketId: m, indexPrice: cents, timestamp: ts };
+        r.ok(ORACLE, &u.abi_encode())
+    }
+
+    /// `marketId` of every CROSSED `Liquidation` of `user` in `logs`, in log order.
+    fn cross_steps(logs: &[Log], user: Address) -> Vec<u64> {
+        let mut out = Vec::new();
+        for l in logs {
+            let t = l.data.topics();
+            if t[0] == I::Liquidation::SIGNATURE_HASH {
+                let e = I::Liquidation::decode_raw_log(t, &l.data.data).unwrap();
+                if e.user == user && e.marginType == 0 {
+                    out.push(e.marketId);
+                }
+            }
+        }
+        out
+    }
+
+    fn flagged(logs: &[Log], user: Address, started: bool) -> bool {
+        logs.iter().any(|l| {
+            let t = l.data.topics();
+            let hash = if started {
+                I::CrossLiquidationStarted::SIGNATURE_HASH
+            } else {
+                I::CrossLiquidationEnded::SIGNATURE_HASH
+            };
+            t[0] == hash && Address::from_word(t[1]) == user
+        })
+    }
+
+    pub(super) fn scenario() -> Recorder {
+        let mut rec = Recorder::new(T0, 1);
+        let r = &mut rec;
+        for (u, label) in [
+            (ADMIN, "admin"),
+            (ORACLE, "oracle"),
+            (LP, "lp"),
+            (F, "f_stale_leg"),
+            (G, "g"),
+            (H, "h_cross_and_isolated"),
+            (E, "e_three_legs"),
+        ] {
+            r.actor(u, label);
+        }
+        r.markets = MARKETS.to_vec();
+        r.mint(ADMIN, 2_000_000 * USD);
+        r.mint(LP, 10_000_000 * USD);
+        for u in TRADERS {
+            r.mint(u, 2_000 * USD);
+        }
+        r.ok(ADMIN, &initAdminCall { admin: ADMIN }.abi_encode());
+        r.ok(ADMIN, &setOracleAddressCall { oracle: ORACLE }.abi_encode());
+        for m in MARKETS {
+            let funded = m <= M26;
+            let add = addMarketCall {
+                marketId: m,
+                baseDecimals: 0,
+                priceDecimals: 2,
+                tickSize: 1,
+                stepSize: 1,
+                minQuantity: 1,
+                maxQuantity: 1_000_000,
+                maxPrice: 100_000_000,
+                priceUpdateInterval: 15,
+                fundingInterval: if funded { 60 } else { 0 },
+                interestRate: if funded { 300 } else { 0 },
+                liquidationFeeRateBps: 100,
+                initialMarkPrice: px(100),
+                priceBandBps: 1_000_000,
+            };
+            r.ok(ADMIN, &add.abi_encode());
+            let tiers = setMarginTiersCall {
+                marketId: m,
+                lowerBounds: vec![0],
+                maxLeverages: vec![20],
+                maintMarginRatesPpm: vec![0],
+                notionalCap: 0,
+            };
+            r.ok(ADMIN, &tiers.abi_encode());
+        }
+        r.ok(ADMIN, &depositCall { amount: U256::from(1_000_000 * USD) }.abi_encode());
+        r.ok(ADMIN, &transferToPerpCall { amount: 500_000 * USD }.abi_encode());
+        r.ok(ADMIN, &depositInsuranceFundCall { amount: 100_000 * USD }.abi_encode());
+        r.ok(LP, &depositCall { amount: U256::from(5_000_000 * USD) }.abi_encode());
+        r.ok(LP, &transferToPerpCall { amount: 5_000_000 * USD }.abi_encode());
+        for u in TRADERS {
+            r.ok(u, &depositCall { amount: U256::from(2_000 * USD) }.abi_encode());
+            r.ok(u, &transferToPerpCall { amount: 2_000 * USD }.abi_encode());
+        }
+        for m in MARKETS {
+            r.ok(LP, &setMarginTypeCall { marketId: m, marginType: ISOLATED }.abi_encode());
+            for u in TRADERS {
+                r.ok(u, &setLeverageCall { marketId: m, leverage: 20 }.abi_encode());
+            }
+        }
+        // H: ISOLATED on M26 (an isolated leg next to its cross wallet).
+        r.ok(H, &setMarginTypeCall { marketId: M26, marginType: ISOLATED }.abi_encode());
+        for m in [M24, M25, M26] {
+            tick(r, m, px(100));
+        }
+        r.checkpoint("setup: roles, markets, money in, traders CROSSED at 20x, H ISOLATED on M26");
+
+        // ── F: CROSSED on M24 and M25; G and H on M24 too; H ISOLATED on M26 ──
+        r.next_block(T0 + 5);
+        r.ok(LP, &limit(M24, SELL, px(100), 200, 0));
+        r.ok(F, &market(M24, BUY, 200));
+        r.ok(LP, &limit(M25, SELL, px(100), 150, 0));
+        r.ok(F, &market(M25, BUY, 150));
+        r.ok(LP, &limit(M24, SELL, px(100), 100, 0));
+        r.ok(G, &market(M24, BUY, 100));
+        r.ok(LP, &limit(M24, SELL, px(100), 100, 0));
+        r.ok(H, &market(M24, BUY, 100));
+        r.ok(LP, &limit(M26, SELL, px(100), 200, 0));
+        r.ok(H, &market(M26, BUY, 200));
+        // A funding epoch on M24-M26.
+        r.next_block(T0 + 61);
+        for m in [M24, M25, M26] {
+            tick(r, m, px(100));
+        }
+        r.checkpoint("legs open, a funding epoch rolled");
+
+        // ── The crash on M24 while M25's mark ages past three intervals ──
+        r.next_block(T0 + 100);
+        tick(r, M24, px(100));
+        tick(r, M26, px(100));
+        r.ok(LP, &limit(M24, BUY, px(89), 60, 0));
+        r.next_block(T0 + 130);
+        let crash = tick(r, M24, px(88));
+        assert!(flagged(&crash, F, true), "F's episode starts");
+        assert_eq!(cross_steps(&crash, F), vec![M24], "F's stale M25 leg is not closed");
+        assert!(!flagged(&crash, F, false), "F stays flagged (its M25 leg is left)");
+        r.checkpoint("the M24 crash: F flagged with its stale M25 leg, H back to health");
+
+        // F may only reduce: an opening order is refused (-2023); its reduce-only sell rests at the
+        // stored mark and a provider takes it, which leaves no cross position: the flag ends.
+        r.next_block(T0 + 135);
+        r.refused(F, &limit(M25, SELL, px(100), 10, 0), "2023");
+        r.ok(F, &limit(M25, SELL, px(100), 150, RO));
+        let take = r.ok(LP, &market(M25, BUY, 150));
+        assert!(flagged(&take, F, false), "F's flag ends with its last cross position");
+        // H: its ISOLATED M26 long liquidated into a bid, next to its cross wallet.
+        r.next_block(T0 + 145);
+        r.ok(LP, &limit(M26, BUY, px(92), 300, 0));
+        tick(r, M26, 9_350);
+        assert_eq!(r.view(&getPositionCall { user: H, marketId: M26 }).amount, 0);
+        r.checkpoint("F's flag ended by a reduce-only fill; H's isolated M26 liquidated");
+
+        // ── E: three fresh CROSSED legs, made bankrupt by a crash on one of them ──
+        // MM = N / 40 per leg: M27 $10,000 → 250, M28 $3,000 → 75, M29 $6,000 → 150.
+        r.next_block(T0 + 160);
+        for (m, qty) in [(M27, 100), (M28, 30), (M29, 60)] {
+            r.ok(LP, &limit(m, SELL, px(100), qty, 0));
+            r.ok(E, &market(m, BUY, qty));
+        }
+        r.next_block(T0 + 175);
+        tick(r, M28, px(100));
+        tick(r, M29, px(100));
+        r.next_block(T0 + 180);
+        let crash = tick(r, M27, px(70));
+        assert_eq!(
+            cross_steps(&crash, E),
+            vec![M27, M29, M28],
+            "the trigger market first, then maintenance margin descending"
+        );
+        assert!(flagged(&crash, E, false), "E's episode ends with no cross position");
+        r.checkpoint("end");
+        rec
+    }
+}
+
+#[test]
+#[ignore = "fixture exporter — PERP_FIXTURE_OUT=<dir> cargo test -p perp-engine --lib \
+            fixture_export -- --ignored"]
+fn fixture_export_cross_episodes() {
+    let r = cross_episodes::scenario();
+    for (key, at_least) in [
+        ("CrossLiquidationStarted", 3),
+        ("CrossLiquidationEnded", 3),
+        ("Liquidation.marginType=0", 5),
+        ("Liquidation.marginType=1", 1),
+        ("FundingSettled.amount!=0", 1),
+    ] {
+        assert!(count(&r, key) >= at_least, "cross_episodes: {key} < {at_least}");
+    }
+    emit(
+        &r,
+        "cross_episodes",
+        "Deterministic cross-episode scenes on six markets (ids 24-29, 0 / 2 decimals, $100 \
+         marks; 24-26 roll funding every 60 s): a crash on M24 catches F while its M25 mark is \
+         stale, so the episode closes M24 only and the flag stays; F's opening order is refused \
+         (-2023), its reduce-only sell rests and is taken, and the flag ends with its last cross \
+         position; H recovers in one step, and later its ISOLATED M26 position is liquidated next \
+         to its cross wallet; E's three fresh cross legs (M27, M28, M29) are all closed in one \
+         call after a crash on M27 - the trigger market first, then by maintenance margin \
+         descending (M29 before M28).",
         None,
     );
 }
