@@ -15,18 +15,25 @@
 //!   limit IOC at her bankruptcy price, the book takes part of it, and she is back at maintenance:
 //!   the rest stays hers, the flag ends, the clearance fee is 1.25% of the notional closed (Q3);
 //! * an ADL (R5): M3 spikes, DAVE's account is BANKRUPT, the book has nothing for his IOC, and the
-//!   short is ADL-ed at his MM-share bankruptcy price (Q4, Q5) against the winner that ranks first
-//!   — BOB's isolated long in profit, ahead of ERIN's cross long at a LOSS (`uPnL · E / N²`);
+//!   short is ADL-ed against the winner that ranks first — BOB's isolated long in profit, ahead of
+//!   ERIN's cross long at a LOSS (`uPnL · E / N²`);
 //! * a STALE market (Q10): DAVE's other cross leg is on M2, whose oracle never published, so the
-//!   episode skips it and the flag stays set;
+//!   episode skips it and the flag stays set — and, a leg being unpriced, no deficit sets the ADL
+//!   price (P3 review): M3 goes at the MARK, BOB neutral, the whole deficit waits on DAVE's wallet;
 //! * the flag ENDED by a reduce-only close: DAVE closes the M2 leg himself, the only kind of order
 //!   a flagged account may place (Q11), and the end of that call ends the episode;
 //! * a NEGATIVE-wallet clearance (Q8, R4): that close was DAVE's last position and left his wallet
-//!   with M2's share of his deficit, so the insurance fund pays it and the wallet ends at 0.
+//!   with his whole deficit, so the insurance fund pays it and the wallet ends at 0.
 //!
 //! Re-pin procedure, as for the isolated golden: run `cross_golden_scenario`, copy the printed
 //! `cross golden commitment =` value. A re-pin is legitimate only when [`CrossSnapshot`] still
 //! matches, or the business change that moved it is the intended one and is written down here.
+//!
+//! Business changes since the first pin:
+//! * P3 review — a stale leg sets no ADL price: DAVE's M3 short, ADL-ed while his M2 leg is stale,
+//!   now fills at the MARK ($180, was his MM-share bankruptcy price $173.57). BOB's wallet
+//!   +$64.30 (`accounts[1]`, $4,735.50 → $4,799.80); DAVE's cleared deficit $35.70 → $100.00, so
+//!   the insurance fund −$64.30 (`insurance_fund`, $967.80 → $903.50).
 use alloy_sol_types::{SolCall, SolError, SolEvent};
 use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
@@ -81,7 +88,7 @@ const fn px(dollars: u64) -> u64 {
 
 /// Pinned final commitment-slot value of [`run_cross_golden_scenario`].
 const CROSS_GOLDEN_COMMITMENT: B256 =
-    b256!("0x84977f13f05a8953b30b33f696a2b0b33ce7aaed393a1fe76559cf961d5de969");
+    b256!("0x9c7be213a8addb7411d483e0ab00a49f8e61d90ac205f7be905fdcbfa2d44132");
 
 /// The business end state, read back through the views (and the liquidation flag, which no view
 /// reports, from the account record). Pins cross margin's semantics independently of the hash.
@@ -124,9 +131,10 @@ fn expected_snapshot() -> CrossSnapshot {
             // ALICE: W = $399.50 − $0.10 funding − $120 realized − $3.50 fee = $275.90;
             // E = W − $180 = $95.90; A = E − PIM $140 = −$44.10; X = 0; Σ MM = $70.
             (275_900_000, 95_900_000, -44_100_000, 0, 70 * USD),
-            // BOB, isolated only: W = $5,000 − $2,000 silos + $999.80 + $735.70 from the ADL.
-            (4_735_500_000, 4_735_500_000, 4_735_500_000, 4_735_500_000, 0),
-            // DAVE: the −$35.70 cleared to exactly 0.
+            // BOB, isolated only: W = $5,000 − $2,000 silos + $999.80 + $800 from the ADL (his
+            // $400 silo and the $400 gain at the $180 mark).
+            (4_799_800_000, 4_799_800_000, 4_799_800_000, 4_799_800_000, 0),
+            // DAVE: the −$100 cleared to exactly 0.
             (0, 0, 0, 0, 0),
             // ERIN: E = $1,000 − $60 (M3 at $180 vs $190); A = E − PIM ($200 + $360);
             // X = A; Σ MM = $33.33 + $180.
@@ -135,8 +143,8 @@ fn expected_snapshot() -> CrossSnapshot {
             (100_000 * D, 100_060 * D, 98_700 * D, 98_700 * USD, 226_666_666),
         ],
         in_liquidation: [false; 5],
-        // $1,000 deposited + ALICE's $3.50 clearance fee − DAVE's $35.70 clearance.
-        insurance_fund: 967_800_000,
+        // $1,000 deposited + ALICE's $3.50 clearance fee − DAVE's $100 clearance.
+        insurance_fund: 903_500_000,
         // $2,000 − the $1,000 fund deposit + $1.00 of trading fees.
         admin_wallet: 1_001_000_000,
         // M2's is `addMarket`'s initial mark: its oracle never published.
@@ -381,11 +389,12 @@ fn run_cross_golden_scenario() -> (B256, CrossSnapshot) {
 
     // Phase 7 (t = 4530) — M3 spikes to $180: DAVE is BANKRUPT. `E = $700 − $800 = −$100`
     // against `Σ MM = $300 (M3) + $166.67 (M2)`. M3, the trigger, closes first: no ask for the
-    // IOC, so the short is ADL-ed at his MM-share bankruptcy price — M3 carries 300/466.67 of the
-    // $100 deficit, $64.29, so the close realizes $735.71: $173.57 a contract (R5). BOB's
-    // isolated long in profit ranks ahead of ERIN's cross long at a loss and takes all 10. M2 is
-    // stale (its oracle never published), so it is skipped and the flag stays set: DAVE's wallet
-    // is −$35.70, M2's share.
+    // IOC, so the short is ADL-ed. M2 is stale (its oracle never published), so it is skipped and
+    // the flag stays set — and with a leg unpriced no deficit sets the ADL price (P3 review): the
+    // 10 go at the MARK, $180 (R5's MM-share price would have been $173.57, charging BOB M3's
+    // 300/466.67 share of a deficit measured partly at M2's unpublished mark). BOB's isolated long
+    // in profit ranks ahead of ERIN's cross long at a loss and takes all 10. DAVE's wallet is
+    // −$100: the whole deficit waits on the account.
     let logs = tick(ctx, M3, 180, 4_530);
     let started = evs::<CrossLiquidationStarted>(&logs);
     assert_eq!(started.len(), 1);
@@ -400,7 +409,7 @@ fn run_cross_golden_scenario() -> (B256, CrossSnapshot) {
         adl.iter()
             .map(|a| (a.liquidatedUser, a.adlUser, a.marketId, a.qty, a.price))
             .collect::<Vec<_>>(),
-        vec![(DAVE, BOB, M3, 10, 17_357)]
+        vec![(DAVE, BOB, M3, 10, px(180))]
     );
     let liq = evs::<Liquidation>(&logs);
     assert_eq!(liq.len(), 1);
@@ -416,7 +425,7 @@ fn run_cross_golden_scenario() -> (B256, CrossSnapshot) {
 
     // Phase 8 (t = 4545) — flagged, DAVE may only reduce (Q11): a plain order is `-2023`; his
     // reduce-only sell closes the M2 leg into MAKER's bid at $100. That was his LAST position:
-    // the end of the call ends the episode and clears the −$35.70 from the insurance fund (Q8).
+    // the end of the call ends the episode and clears the −$100 from the insurance fund (Q8).
     at(ctx, 4_545);
     refused(ctx, DAVE, &order(M2, SELL, px(100), 1, IOC, 0), "-2023 User in liquidation mode now.");
     run(ctx, MAKER, &order(M2, BUY, px(100), 10, GTC, 0));
@@ -425,18 +434,18 @@ fn run_cross_golden_scenario() -> (B256, CrossSnapshot) {
     assert_eq!(ended.len(), 1);
     assert_eq!(
         (ended[0].user, ended[0].marketId, ended[0].crossMarginBalance),
-        (DAVE, M2, -35_700_000)
+        (DAVE, M2, -100_000_000)
     );
     assert_eq!(ended[0].totalCrossMaintMargin, 0, "no cross position left");
     let fund = evs::<InsuranceFundChanged>(&logs);
-    assert_eq!(fund.iter().map(|f| f.delta).collect::<Vec<_>>(), vec![-35_700_000]);
+    assert_eq!(fund.iter().map(|f| f.delta).collect::<Vec<_>>(), vec![-100_000_000]);
     let rows: Vec<(u8, i64)> = evs::<AccountBalanceChanged>(&logs)
         .into_iter()
         .filter(|r| r.user == DAVE)
         .map(|r| (r.reason, r.totalCrossWalletBalance))
         .collect();
     assert_eq!(rows.last(), Some(&(INSURANCE_CLEAR, 0)), "the clearance is his last row");
-    assert!(rows.contains(&(0, -35_700_000)), "the deficit was published first: {rows:?}");
+    assert!(rows.contains(&(0, -100_000_000)), "the deficit was published first: {rows:?}");
     assert!(!flagged(ctx, DAVE));
 
     let snapshot = take_snapshot(ctx);

@@ -35,7 +35,8 @@
 //!    ADL at the mark while `E ≥ 0`, at the bankruptcy price clamped into the band otherwise (R5 —
 //!    what the band's edge does not transfer stays in the wallet, for the account's silos and in
 //!    the end the insurance fund, Q8), fee, stop check again. A market whose mark is `0` (J4) or
-//!    older than `STALE_MULT` price intervals (Q10) is skipped. One step per market.
+//!    older than `STALE_MULT` price intervals (Q10) is skipped — and while any leg is skipped so,
+//!    no deficit sets an ADL price: the rest goes at the mark. One step per market.
 //! 5. END: the flag is cleared (`CrossLiquidationEnded`) as soon as the account is healthy again or
 //!    holds no cross position; otherwise it stays set until a later tick finishes the job. A last
 //!    cross position closed by any OTHER route while the flag is set — the user's own reduce-only
@@ -204,6 +205,11 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
     }
 
     // ── (d) / (e) CLOSE — market by market, re-checking after each ──
+    //
+    // Whether the deficit may set an ADL price at all: only while every cross leg is priced at a
+    // mark this call trusts (see `close_market`). Decided once — no mark but this transaction's own
+    // moves within it, and the block clock does not.
+    let priced = every_cross_leg_is_priced(context, user, &legs, caller)?;
     let mut continuation: Option<u64> = None;
     for (i, &k) in order.iter().enumerate() {
         let pos = storage::load_position_ref(context, user, k)?;
@@ -225,7 +231,8 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
             record_continuation(context, user, &order[i..], caller, deferred)?;
             return Ok(CrossLiquidationOutcome::Liquidated { ended: false });
         }
-        let Some(step) = close_market(context, user, &market, caller.liquidator, adl_budget)?
+        let Some(step) =
+            close_market(context, user, &market, caller.liquidator, adl_budget, priced)?
         else {
             // The leg faulted in the fold (J4): nothing evaluable to close it at, no step spent.
             continue;
@@ -292,13 +299,16 @@ struct CloseStep {
 }
 
 /// Close `user`'s cross position in `market` — one episode step. `None` when the leg cannot be
-/// evaluated (it faulted in the fold, J4), with nothing written.
+/// evaluated (it faulted in the fold, J4), with nothing written. `priced`: every cross leg of the
+/// account is priced at a mark the episode trusts ([`every_cross_leg_is_priced`]) — without it no
+/// deficit sets an ADL price (see the ADL leg below).
 fn close_market<H: PerpHost>(
     context: &mut H,
     user: Address,
     market: &Market,
     liquidator: Address,
     adl_budget: &mut u32,
+    priced: bool,
 ) -> Result<Option<CloseStep>, PerpError> {
     let k = market.market_id;
     let mark = market.mark_price;
@@ -351,7 +361,18 @@ fn close_market<H: PerpHost>(
         // account's isolated silos net it as they close, and once it holds no position the
         // insurance fund clears the rest (owner decision Q8), the same fund an isolated close's
         // bad debt reaches. (A market whose band is set wide open accepts the wider price.)
-        let price = if fold.e >= 0 {
+        //
+        // ── …and only off a fold every leg of which is priced (P3 review) ──
+        //
+        // The deficit `E` — and so `share_k` — sums EVERY cross leg at its stored mark, a leg the
+        // episode skips (stale, Q10; mark 0 or unpriceable, J4) included. A leg it will not close
+        // at its mark is not a price to charge this market's winners a share of a deficit by
+        // either: a stale wick would make them pay a deficit that exists only at the stale price
+        // (and the stale leg, left open, would hand the difference back to the account when its
+        // oracle prints again). So while any leg is unpriced the ADL fills at the MARK — the
+        // winners neutral, as at `E ≥ 0` — and the deficit waits on the account until that leg's
+        // own tick prices it. The IOC's limit is left as it is: the book trades by choice.
+        let price = if fold.e >= 0 || !priced {
             mark
         } else {
             let pos = storage::load_position(context, user, k)?;
@@ -472,6 +493,38 @@ fn mm_share_bankruptcy_price(
         market.price_decimals,
     )
     .unwrap_or(mark)
+}
+
+/// Every cross position of `user` is priced at a mark the episode trusts: a leg the detection fold
+/// evaluated (`legs` — one it could not, J4, is left out of it), on a market that exists, with a
+/// mark that is neither `0` (J4) nor stale (Q10, judged as the close loop judges it — the market
+/// whose tick runs the episode is fresh). The legs the close loop would skip are exactly the ones
+/// that fail it. Total: position, market and index-state loads.
+fn every_cross_leg_is_priced<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    legs: &[CrossLeg],
+    caller: EpisodeCaller,
+) -> Result<bool, PerpError> {
+    let markets = storage::load_user_markets_ref(context, user)?;
+    for &k in markets.iter() {
+        let pos = storage::load_position_ref(context, user, k)?;
+        if pos.amount == 0 || !is_crossed(&pos) {
+            continue;
+        }
+        if !legs.iter().any(|l| l.market_id == k) {
+            return Ok(false);
+        }
+        let Some(market) = storage::load_market_ref(context, k)? else {
+            return Ok(false);
+        };
+        if market.mark_price == 0
+            || (caller.fresh_market != Some(k) && mark_is_stale(context, &market)?)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Settle `user`'s pending funding in `market` into the cross wallet, persisted and published the

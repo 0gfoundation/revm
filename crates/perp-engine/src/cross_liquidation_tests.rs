@@ -629,6 +629,49 @@ fn a_stale_market_is_skipped_and_its_own_tick_resumes_the_episode() {
     assert!((0..usd(1)).contains(&w), "{w}");
 }
 
+/// **A stale leg sets no ADL price** (P3 review). ALICE: cross longs of 20 on M1 and 2 on M2 at
+/// $100, $700 in the wallet. M2 ticks a wick to $50 — she is still healthy (`E = $600 ≥ $350`) —
+/// and its oracle then goes silent. 46 s later M1 ticks to $67: `E = −$60` (the wick's −$100
+/// included) `< Σ MM`, and M2 is skipped as stale. M1's rest used to go to ADL at its MM-share
+/// bankruptcy price ≈ $69.79: BOB, the winner, paid ≈ $55.83 of a deficit that existed only at
+/// M2's stale price, and when M2 printed $100 again ALICE was healthy holding the difference. Now
+/// it goes at the MARK, BOB neutral, the deficit waits on the account: ALICE keeps exactly what
+/// the same close with no wick leaves her ($40), and M2's next print ends the episode.
+#[test]
+fn a_stale_leg_sets_no_adl_price_the_rest_goes_at_the_mark() {
+    let mut ctx = make_ctx();
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 20);
+    trade(&mut ctx, M2, ALICE, CAROL, BUY, px(100), 2);
+    set_wallet(&mut ctx, ALICE, usd(700));
+    ctx.block.timestamp = U256::from(1_000);
+    let logs = tick_at(&mut ctx, M2, px(50), 1_000);
+    assert!(evs::<Liquidation>(&logs).is_empty(), "healthy after the wick");
+    let ledger = Ledger::open(&mut ctx);
+    let bob_w0 = wallet(&mut ctx, BOB) + pos(&mut ctx, BOB, M1).margin;
+
+    ctx.block.timestamp = U256::from(1_046);
+    let logs = tick_at(&mut ctx, M1, px(67), 1_046);
+    ledger.check(&mut ctx, "after M1's tick");
+    assert_eq!(evs::<CrossLiquidationStarted>(&logs)[0].crossMarginBalance, usd(-60));
+    assert_eq!(adls(&logs), vec![(ALICE, BOB, M1, 20, px(67))], "at the mark");
+    assert_eq!(
+        wallet(&mut ctx, BOB) - bob_w0,
+        usd(20 * 33),
+        "BOB books exactly his gain at the mark"
+    );
+    assert_eq!(wallet(&mut ctx, ALICE), usd(40));
+    assert_eq!(pos(&mut ctx, ALICE, M2).amount, 2, "the stale leg is not closed");
+    assert!(flagged(&mut ctx, ALICE), "still below maintenance at M2's stale mark");
+
+    ctx.block.timestamp = U256::from(1_050);
+    let logs = tick_at(&mut ctx, M2, px(100), 1_050);
+    ledger.check(&mut ctx, "after M2's tick");
+    assert!(evs::<Liquidation>(&logs).is_empty());
+    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_eq!((wallet(&mut ctx, ALICE), pos(&mut ctx, ALICE, M2).amount), (usd(40), 2));
+}
+
 /// **Detection completeness and the close order.** ALICE holds a long of 20 on M1 (the larger MM)
 /// and 5 on M2. A tick of M1 that leaves her healthy does nothing. M2's tick to $60 takes her ACCOUNT
 /// under maintenance (`E = $350 < $383.33`) — it is caught on M2's tick, and M2, the trigger, closes

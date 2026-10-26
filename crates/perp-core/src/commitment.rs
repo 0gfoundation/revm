@@ -444,6 +444,14 @@ use primitives::{B256, U256};
 //     `E` falls to `min(E, 0)` and no further, the rest is its bad debt for the fund (the bound an
 //     isolated fallback winner's silo always gave). Reachable only with a cross winner: both pins
 //     unchanged, BusinessSnapshot UNCHANGED.
+//   * P3 review — a stale leg sets no ADL price: while any cross leg of the account is one the
+//     episode skips (stale, Q10; mark 0 or unpriceable, J4), a `E < 0` market's rest goes to ADL
+//     at the MARK, the deficit waiting on the account. Reachable only in a cross episode: the
+//     isolated pin 0xfdf928b5…47d4 is unchanged, BusinessSnapshot UNCHANGED. The CROSS golden
+//     ADLs DAVE past exactly such a leg (M2, never published), so its M3 fill moves from $173.57
+//     to the $180 mark: BOB +$64.30, the fund −$64.30 (DAVE's cleared deficit $35.70 → $100) —
+//     the intended change, written down in `cross_golden_tests`. Cross pin re-pinned
+//     0x84977f13…e969 → 0x9c7be213…4132.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).
