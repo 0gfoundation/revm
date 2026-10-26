@@ -195,6 +195,46 @@ fn j1_does_not_hold_a_pure_reduce() {
     );
 }
 
+/// R2 — J1 AT REST, to the unit. ALICE (J1 scene: `E = W − $4,000`, `Σ MM = $800`) rests an
+/// OPENING GTC buy of 5 on M1 under the mark, so it carries no Open Loss. Resting moves neither
+/// `E` nor `Σ MM`, so the order is held to the liquidation predicate on the account as it stands:
+/// one unit below `E == Σ MM` it is refused with J1's `-2019`, write-clean — although the
+/// available balance covers its `ooIM` ($150) by about $400 — and at the boundary it rests. A
+/// REDUCE-ONLY order (a buy against her M2 short) rests below maintenance: it cannot open, and
+/// reducing orders keep B1.
+#[test]
+fn r2_an_opening_order_rests_only_at_cross_maintenance() {
+    let mut ctx = make_ctx();
+    let _cross = crate::margin_type::test_gate::enable();
+    j1_scene(&mut ctx);
+    let w_edge = 4_000 * USD + 800 * USD;
+    let bid = order(M1, BUY, px(90), 5, GTC);
+
+    set_wallet(&mut ctx, ALICE, w_edge - 1);
+    let ledger = Ledger::open(&mut ctx);
+    let oo_im = ceil_div(value(px(90), 5), 3);
+    let a = fold(&mut ctx, ALICE).a;
+    assert!(a - oo_im as i128 >= 399 * USD as i128, "the available balance admits it: A = {a}");
+    rejects(&mut ctx, ALICE, &bid, crate::trading::CROSS_MAINTENANCE_REJECT);
+    ledger.check(&mut ctx, "after the refusal");
+
+    // Reduce-only keeps B1: a buy against the M2 short rests on the account below maintenance.
+    let ro = place(&mut ctx, ALICE, &ro_order(M2, BUY, px(400), 2, GTC));
+    assert!(storage::load_buy_orders(&mut ctx, ALICE, M2)
+        .unwrap()
+        .iter()
+        .any(|e| e.order_id == ro));
+
+    set_wallet(&mut ctx, ALICE, w_edge);
+    let id = place(&mut ctx, ALICE, &bid);
+    assert!(storage::load_buy_orders(&mut ctx, ALICE, M1)
+        .unwrap()
+        .iter()
+        .any(|e| e.order_id == id));
+    let f = fold(&mut ctx, ALICE);
+    assert_eq!(f.e, f.cross_mm, "rested exactly at cross maintenance");
+}
+
 // ── A pure reduce on a cross wallet is not margin-gated ──────────────────────────────────────
 
 /// `AlgoOrderCancelled(reason)` rows for `user`.

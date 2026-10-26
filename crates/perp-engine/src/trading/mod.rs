@@ -2133,6 +2133,7 @@ fn raise_rest_refusal(outcome: RestOutcome) -> Result<(), PerpError> {
         RestOutcome::RefusedUnaffordable { cross } => {
             Err(perp_err(insufficient_margin_reject(cross)))
         }
+        RestOutcome::RefusedUnderCrossMaintenance => Err(perp_err(CROSS_MAINTENANCE_REJECT)),
     }
 }
 
@@ -3160,6 +3161,9 @@ enum RestOutcome {
         /// The order's position is CROSSED in force: refused with the `-2019` string.
         cross: bool,
     },
+    /// The order can open, its account holds cross exposure, and `E − OpenLoss < Σ_C MM` — J1 at
+    /// rest (R2). Raised with the taker J1's string (`CROSS_MAINTENANCE_REJECT`, `-2019`).
+    RefusedUnderCrossMaintenance,
 }
 
 const TOO_GOOD_BEST_REJECT: &str = "placeOrder: a new best quote must be inside the price band";
@@ -3519,13 +3523,17 @@ fn rest_in_book<H: PerpHost>(
     // the counterparty, possibly the user's own sub-account, collecting it as profit. See
     // [`cross_rest_open_loss`].
     let open_loss = cross_rest_open_loss(market, &pos_basis, side, price, qty)?;
-    // `pos_after` overrides storage for this market: it is not written until PHASE 2.
-    let available_after = crate::margin_view::derived_available_balance_with(
+    // `pos_after` overrides storage for this market: it is not written until PHASE 2. ONE fold:
+    // its `A` is the gate below (`derived_available_balance_with` is exactly this fold's `a`), its
+    // `E` / `Σ_C MM` the maintenance check after it (R2) — no load beyond the walk the gate made.
+    let fold = crate::margin_view::cross_fold_checked(
         context,
         user,
         Some(wallet),
         Some((market_id, &pos_after)),
+        None,
     )?;
+    let available_after = fold.a;
     // `A_after − OpenLoss ≥ 0`, i.e. `Δ ooIM + OpenLoss ≤ A(before)` — the measured delta form with
     // the order's whole Binance cost. The B1 escape is unchanged: an order whose cost is not
     // positive (`Δ ooIM ≤ 0` and no open loss) rests at any balance.
@@ -3539,13 +3547,29 @@ fn rest_in_book<H: PerpHost>(
             return Ok(RestOutcome::RefusedUnaffordable { cross });
         }
     }
-    // P3: the gate above is `A`'s, so an account that already sits UNDER cross maintenance while
-    // `A ≥ 0` (a leg whose `MM > PIM` after tier drift) may still rest an opening order, and — no
-    // maker fill being checked (Q9) — have it filled, which the taker's J1 would have refused. The
-    // Open Loss above keeps such a fill from booking anything beyond the mark; what is left is the
-    // detection window: the P3 sweep flags the account on the next tick of any of its markets, after
-    // which Q11 (`-2023`) refuses its non-reducing placements and the maker freeze cancels what it
-    // rested in between.
+    // ── R2: J1 AT REST — an order that can open must find the account at cross maintenance ──────
+    //
+    // The gate above is `A`'s, so an account that already sits UNDER cross maintenance while
+    // `A ≥ 0` (a leg whose `MM > PIM` after tier drift) could still rest an opening order and —
+    // no maker fill being checked (Q9) — have it filled, which the taker's J1 refuses. So the
+    // resting order is held to the liquidation predicate itself, on the same fold:
+    // `E − OpenLoss ≥ Σ_C MM`. Resting moves neither `E` nor `Σ_C MM` (only `ooIM`), so these are
+    // the post-rest values; the Open Loss is what the fill would book against `E` at the mark.
+    //
+    // WHICH orders: the ones that can OPEN (`opening_part_of_order > 0`) of an account holding
+    // cross exposure (`has_cross`) — a cross order, and an isolated one too (its fill would move
+    // silo cash out of the cross wallet). Never a reduce-only order (it cannot open, whatever the
+    // conservative opening part says about the orders ahead of it — a fired stop included) nor a
+    // pure reduce, which keep B1. An account with no cross position never reaches it, so every
+    // isolated outcome is what it was; gated off nothing is CROSSED in force.
+    if fold.has_cross
+        && !flags.reduce_only
+        && opening_part_of_order(&pos_basis, side, qty) > 0
+        && fold.e - (open_loss as i128) < fold.cross_mm
+    {
+        // Write-clean, like the refusals above.
+        return Ok(RestOutcome::RefusedUnderCrossMaintenance);
+    }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════
     // ── THE WRITE BARRIER ── every refusal has passed; from here the placement is ACCEPTED.
