@@ -1205,7 +1205,8 @@ mod adl_rank_tests {
     #[test]
     fn the_wide_product_is_exact() {
         use alloy_primitives::U256;
-        let edges = [0u128, 1, 2, u64::MAX as u128, 1 << 64, (1 << 64) + 1, u128::MAX - 1, u128::MAX];
+        let edges =
+            [0u128, 1, 2, u64::MAX as u128, 1 << 64, (1 << 64) + 1, u128::MAX - 1, u128::MAX];
         for &a in &edges {
             for &b in &edges {
                 let (hi, lo) = super::mul_wide(a, b);
@@ -1240,7 +1241,11 @@ mod adl_rank_tests {
                 }
             };
             let (u, e, n) = (val(true), val(false).max(1), val(true));
-            ranks.push(if i % 3 == 0 { AdlRank::ratio(u, e) } else { AdlRank::sign_split(u, e, n) });
+            ranks.push(if i % 3 == 0 {
+                AdlRank::ratio(u, e)
+            } else {
+                AdlRank::sign_split(u, e, n)
+            });
             if i % 50 == 0 {
                 // Equal values in different terms: `k·u / k·e`.
                 ranks.push(AdlRank::ratio(u / 2 * 2, e.max(2) / 2 * 2));

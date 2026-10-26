@@ -2064,7 +2064,8 @@ fn position_registry_blob_is_edited_in_place() {
     let packed = |members: &[Address]| members.iter().flat_map(|a| a.0 .0).collect::<Vec<u8>>();
     for (i, &u) in users.iter().enumerate() {
         let amt = if i % 2 == 0 { 5 } else { -5 };
-        storage::save_position(&mut ctx, u, m, &open(amt), AccountUpdateReason::Adjustment).unwrap();
+        storage::save_position(&mut ctx, u, m, &open(amt), AccountUpdateReason::Adjustment)
+            .unwrap();
     }
     assert_eq!(blob(&mut ctx), packed(&users));
     // A close in the middle, then at the end, then at the front.
@@ -2079,8 +2080,10 @@ fn position_registry_blob_is_edited_in_place() {
         assert_eq!(storage::load_position_registry(&mut ctx, m).unwrap(), left);
     }
     // Reopening appends at the end, once.
-    storage::save_position(&mut ctx, users[1], m, &open(2), AccountUpdateReason::Adjustment).unwrap();
-    storage::save_position(&mut ctx, users[1], m, &open(3), AccountUpdateReason::Adjustment).unwrap();
+    storage::save_position(&mut ctx, users[1], m, &open(2), AccountUpdateReason::Adjustment)
+        .unwrap();
+    storage::save_position(&mut ctx, users[1], m, &open(3), AccountUpdateReason::Adjustment)
+        .unwrap();
     assert_eq!(blob(&mut ctx), packed(&[users[2], users[1]]));
     for u in [users[2], users[1]] {
         storage::save_position(&mut ctx, u, m, &open(0), AccountUpdateReason::Adjustment).unwrap();
@@ -2088,12 +2091,14 @@ fn position_registry_blob_is_edited_in_place() {
     assert!(blob(&mut ctx).is_empty(), "the last close deletes the key");
     // An open by a user the blob already lists — a planted state: the position zeroed behind the
     // hook's back — keeps one record.
-    storage::save_position(&mut ctx, users[0], m, &open(1), AccountUpdateReason::Adjustment).unwrap();
+    storage::save_position(&mut ctx, users[0], m, &open(1), AccountUpdateReason::Adjustment)
+        .unwrap();
     {
         use crate::host::PerpHost as _;
         ctx.live().set_position(users[0], m, crate::margin_type::never_set_position());
     }
-    storage::save_position(&mut ctx, users[0], m, &open(1), AccountUpdateReason::Adjustment).unwrap();
+    storage::save_position(&mut ctx, users[0], m, &open(1), AccountUpdateReason::Adjustment)
+        .unwrap();
     assert_eq!(blob(&mut ctx), packed(&[users[0]]), "never listed twice");
 }
 
@@ -12605,7 +12610,7 @@ mod user_market_index {
     /// | placement increment, SELL arm (`trading/mod.rs`) | drop the `checked_add` | FAILS |
     /// | the shared decrement (`remove_entry_from_side_aggregates`) — cancel, partial fill, LIFO cover | no-op the `checked_sub` | FAILS |
     /// | partial-fill delta feeding it (`settle_maker_fill_core`) | pass 0 instead of the delta | FAILS |
-    /// | liquidation cancel-all zeroing (`risk/mod.rs`, then `clear_side_aggregates`; now the zeroed `SideAggregates` write) | drop the call | FAILS |
+    /// | liquidation cancel-all zeroing (`risk/mod.rs`, the zeroed `SideAggregates`) | drop the call | FAILS |
     ///
     /// …and mutation-tested against the FREEZE specifically: maintaining any one site at
     /// `entry.price` instead of `entry.assuming_price` also FAILS, because the sites then disagree

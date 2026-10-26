@@ -1568,7 +1568,7 @@ pub fn load_position_registry<H: PerpHost>(
 /// Where `user` sits in a packed registry blob, if it is there — a scan of the 20-byte records in
 /// place, with no `Vec<Address>` built.
 fn registry_slot(buf: &[u8], user: Address) -> Result<Option<usize>, PerpError> {
-    if buf.len() % 20 != 0 {
+    if !buf.len().is_multiple_of(20) {
         return Err(perp_err("corrupt position-registry blob"));
     }
     Ok(buf.chunks_exact(20).position(|a| a == user.as_slice()))

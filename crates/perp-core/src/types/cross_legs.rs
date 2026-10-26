@@ -337,7 +337,11 @@ mod tests {
             last_funding_index: 0,
         }]);
         let one_bytes = encode(&one).unwrap();
-        assert_eq!(one_bytes, [0xc4, 0x04, 0x03, 0x02, 0x03, 0x00], "bin8 · 3 · z(1) · z(−2) · z(0)");
+        assert_eq!(
+            one_bytes,
+            [0xc4, 0x04, 0x03, 0x02, 0x03, 0x00],
+            "bin8 · 3 · z(1) · z(−2) · z(0)"
+        );
         assert_eq!(decode::<CrossLegs>(&one_bytes).unwrap(), one);
         let two = CrossLegs(vec![CrossLegState {
             market_id: 300,
