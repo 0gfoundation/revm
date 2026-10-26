@@ -113,7 +113,7 @@ impl CrossLegs {
     /// holds — and a `debug_assert` says so.
     pub fn set(&mut self, market_id: u64, leg: Option<CrossLegState>) {
         debug_assert!(
-            leg.map_or(true, |l| l.market_id == market_id && l.amount != 0),
+            leg.is_none_or(|l| l.market_id == market_id && l.amount != 0),
             "CrossLegs::set: entry {leg:?} for market {market_id}"
         );
         match (self.0.binary_search_by_key(&market_id, |l| l.market_id), leg) {
