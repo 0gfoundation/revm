@@ -29,6 +29,10 @@
 //! * `isolated_random_m2` — `isolated_random` on market 2 alone, the shape the harness's
 //!   single-market runs (`MARKET_ID` = 2) model end to end.
 //!
+//! Every checkpoint also reads `getAccountMargin` over no market (the STORED wallet, which
+//! `AccountBalanceChanged` carries) and over each market an actor holds a position in (that leg's
+//! unsettled cross funding on top) — what a harness seeding mid-trace starts from.
+//!
 //! # Regenerate
 //!
 //! ```text
@@ -519,6 +523,10 @@ fn snapshot_reads(h: &mut InMemoryHost, actors: &[Address], markets: &[u64]) -> 
         let ids: Vec<String> = markets.iter().map(|m| m.to_string()).collect();
         let am = [haddr(u), format!("[{}]", ids.join(","))];
         perp(h, &mut out, getAccountMarginCall { user: u, marketIds: markets.to_vec() }, &am);
+        // Over NO market: `totalCrossWalletBalance` is then the STORED wallet `W`, with none of
+        // the unsettled cross funding `getAccount` adds to it — what a mid-trace seed starts from.
+        let none = [haddr(u), "[]".to_string()];
+        perp(h, &mut out, getAccountMarginCall { user: u, marketIds: Vec::new() }, &none);
         perp(h, &mut out, getUserFeeRatesCall { user: u }, &a);
         perp(h, &mut out, getMasterCall { account: u }, &a);
         perp(h, &mut out, getSubAccountsCall { master: u }, &a);
@@ -528,7 +536,14 @@ fn snapshot_reads(h: &mut InMemoryHost, actors: &[Address], markets: &[u64]) -> 
     for &u in actors {
         for &m in markets {
             let a = [haddr(u), num(m)];
-            perp(h, &mut out, getPositionCall { user: u, marketId: m }, &a);
+            let pos = perp(h, &mut out, getPositionCall { user: u, marketId: m }, &a);
+            if pos.is_some_and(|p| p.amount != 0) {
+                // `W` plus THIS market's unsettled cross funding (0 for an ISOLATED position):
+                // the seed's per-leg pending funding.
+                let one = [haddr(u), format!("[{m}]")];
+                let c = getAccountMarginCall { user: u, marketIds: vec![m] };
+                perp(h, &mut out, c, &one);
+            }
             perp(h, &mut out, getPositionRiskCall { user: u, marketId: m }, &a);
             perp(h, &mut out, getSymbolConfigCall { user: u, marketId: m }, &a);
             perp(h, &mut out, getOpenOrdersCall { user: u, marketId: m }, &a);
