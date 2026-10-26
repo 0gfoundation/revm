@@ -296,7 +296,9 @@ pub struct UserAccount {
     /// Owned by cross liquidation (P3, `perp_engine::risk::cross_liquidation`): set when an
     /// episode starts (`CrossLiquidationStarted`), cleared when the account is back at or above
     /// cross maintenance or holds no cross position (`CrossLiquidationEnded`) — possibly several
-    /// transactions later, when the episode ran out of per-tick budget. Read through
+    /// transactions later, when the episode ran out of per-tick budget, and at the latest at the
+    /// end of the call that closes the account's last cross position by any route (so it never
+    /// outlives cross exposure). Read through
     /// [`Self::in_liquidation`]: `setMarginType`'s `-2023`, every placement entrypoint's `-2023`
     /// for an order that is not reduce-only, and a resting order of a flagged maker cancelled
     /// instead of filled unless it can only reduce.
