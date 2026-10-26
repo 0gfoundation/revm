@@ -438,6 +438,7 @@ fn namespaces(users: &[Address], k: u64) -> HashMap<B256, &'static str> {
     for &u in users.iter().chain([HOUSE, LP, ADMIN, TRADER].iter()) {
         names.insert(keys::account_key(u), "account");
         names.insert(keys::user_markets_key(u), "umkt");
+        names.insert(keys::cross_legs_key(u), "cross_legs");
         for m in 1..=k {
             names.insert(keys::position_key(u, m), "position");
             names.insert(keys::user_buy_orders_key(u, m), "user_orders");
@@ -886,10 +887,16 @@ fn build_s3(mode: Mode, k: u64, ops: usize) -> InMemoryHost {
     h
 }
 
-/// Stored blob sizes of `u` in a sealed world: account, position(m1), user-market index.
-fn blob_sizes(snap: &InMemoryHost, u: Address) -> (usize, usize, usize) {
+/// Stored blob sizes of `u` in a sealed world: account, position(m1), user-market index, cross
+/// legs (cross P4; 0 = no key).
+fn blob_sizes(snap: &InMemoryHost, u: Address) -> (usize, usize, usize, usize) {
     let len = |key: B256| snap.committed.get(&key).map(|(b, _)| b.len()).unwrap_or(0);
-    (len(keys::account_key(u)), len(keys::position_key(u, 1)), len(keys::user_markets_key(u)))
+    (
+        len(keys::account_key(u)),
+        len(keys::position_key(u, 1)),
+        len(keys::user_markets_key(u)),
+        len(keys::cross_legs_key(u)),
+    )
 }
 
 /// Block-boundary bookkeeping of an s3 loop.
@@ -904,8 +911,9 @@ struct Blocks {
     delta: DeltaStats,
 }
 
-/// Op kind → (calls, delta keys, delta bytes, calls whose delta wrote the account).
-type DeltaStats = BTreeMap<&'static str, (u64, u64, u64, u64)>;
+/// Op kind → (calls, delta keys, delta bytes, calls whose delta wrote the account, calls whose
+/// delta wrote the cross legs).
+type DeltaStats = BTreeMap<&'static str, (u64, u64, u64, u64, u64)>;
 
 impl Blocks {
     fn after(&mut self, h: &mut InMemoryHost, kind: &'static str) {
@@ -926,6 +934,7 @@ impl Blocks {
             e.1 += delta.len() as u64;
             e.2 += delta.values().map(|d| d.bytes.len() as u64).sum::<u64>();
             e.3 += delta.contains_key(&keys::account_key(TRADER)) as u64;
+            e.4 += delta.contains_key(&keys::cross_legs_key(TRADER)) as u64;
         }
     }
 
@@ -958,10 +967,10 @@ fn s3_header() {
 fn run_s3(mode: Mode, k: u64, ops: usize, reps: usize, block_ops: usize, notes: &mut String) {
     let t = Instant::now();
     let snap = build_s3(mode, k, ops);
-    let (acct, pos, umkt) = blob_sizes(&snap, TRADER);
+    let (acct, pos, umkt, legs) = blob_sizes(&snap, TRADER);
     eprintln!(
         "s3 {} k={k}: built in {:.1} s; blobs: account {acct} B, position(m1) {pos} B, \
-         umkt {umkt} B",
+         umkt {umkt} B, cross legs {legs} B",
         mode.name(),
         t.elapsed().as_secs_f64()
     );
@@ -1023,27 +1032,31 @@ fn run_s3(mode: Mode, k: u64, ops: usize, reps: usize, block_ops: usize, notes: 
         }
     }
     for (lp, d) in deltas {
-        for (kind, (calls, keys_n, bytes, acct_w)) in d {
+        for (kind, (calls, keys_n, bytes, acct_w, legs_w)) in d {
             out!(
                 notes,
                 "s3 {} k={k} {lp}: {kind}: delta {:.1} keys / {:.0} B per call, account written in \
-                 {:.0}% of calls (account blob {acct} B)",
+                 {:.0}% of calls (account blob {acct} B), cross legs in {:.0}% ({legs} B)",
                 mode.name(),
                 keys_n as f64 / calls as f64,
                 bytes as f64 / calls as f64,
-                100.0 * acct_w as f64 / calls as f64
+                100.0 * acct_w as f64 / calls as f64,
+                100.0 * legs_w as f64 / calls as f64
             );
         }
     }
 }
 
 fn run_blob() {
-    println!("| cross positions k | account blob B | position(m1) blob B | umkt blob B |");
-    println!("|---:|---:|---:|---:|");
+    println!(
+        "| cross positions k | account blob B | position(m1) blob B | umkt blob B | cross legs \
+         blob B |"
+    );
+    println!("|---:|---:|---:|---:|---:|");
     for k in [1u64, 4, 16] {
         let snap = build_s3(Mode::Cross, k, 0);
-        let (a, p, u) = blob_sizes(&snap, TRADER);
-        println!("| {k} | {a} | {p} | {u} |");
+        let (a, p, u, l) = blob_sizes(&snap, TRADER);
+        println!("| {k} | {a} | {p} | {u} | {l} |");
     }
 }
 
