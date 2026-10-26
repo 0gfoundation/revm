@@ -3689,15 +3689,20 @@ fn rest_in_book<H: PerpHost>(
     }
 
     // Resting only touches the per-side aggregates, so this skips save_position's old-position
-    // re-read + `amount` zero-crossing registry hooks (dead work here) and moves the position in
-    // by value instead of cloning it.
+    // re-read + `amount` zero-crossing registry hooks (dead work here) and writes just the four
+    // aggregates onto the stored position, in place.
     //
     // It is ALSO what keeps a pure placement silent on the `@account` stream: an aggregates-only
     // write does not mark the user for an `AccountBalanceChanged` snapshot, while `save_position`
     // would. Resting moves no money and moves no position state — the two things Binance's
     // `ACCOUNT_UPDATE` reports — so it publishes nothing. See the trigger table and the R14 /
     // official-doc citation on `storage::mark_account_snapshot_dirty`.
-    storage::save_position_reservation_only(context, user, market_id, pos)?;
+    storage::save_position_reservation_only(
+        context,
+        user,
+        market_id,
+        storage::SideAggregates::of(&pos),
+    )?;
 
     emit_pending_order_placed(context, pending_placed);
     context.log(Log {
@@ -4013,7 +4018,12 @@ pub(super) fn release_open_order_margin<H: PerpHost>(
     // `AccountBalanceChanged` snapshot. A cancel moves no money and no position state, which is
     // exactly Binance's measured behaviour ("Unfilled orders or cancelled orders will not make the
     // event `ACCOUNT_UPDATE` pushed"); see `storage::mark_account_snapshot_dirty`.
-    storage::save_position_reservation_only(context, user, market_id, pos)?;
+    storage::save_position_reservation_only(
+        context,
+        user,
+        market_id,
+        storage::SideAggregates::of(&pos),
+    )?;
     Ok(())
 }
 

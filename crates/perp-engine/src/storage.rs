@@ -413,14 +413,15 @@ pub fn load_account_ref<H: PerpHost>(
 ///   sites set the nonce and the fee-rate pair. Neither balance is reachable from there.
 /// * `totalWalletBalance` = `totalCrossWalletBalance + Σ pos.margin`. Both terms now live on the
 ///   ACCOUNT blob (`Σ pos.margin` is the stored `UserAccount::total_position_margin`), and the only
-///   writer of the Σ leg is [`save_position`] (marks), maintaining it from the delta of the position
-///   write that moved `pos.margin`; [`save_position_reservation_only`] `debug_assert`s that it does
-///   not touch `margin` at all. The per-user market INDEX no longer enters this field, so an
-///   order-list leg flipping index membership in [`sync_user_market_membership`] cannot move it even
-///   in principle — which is what removed the subtle half of this argument (it used to rest on "a
-///   market can only be added or dropped by that leg while the position is flat, and a flat position
-///   carries no margin"; that invariant is still asserted, now in [`save_position`] itself, but
-///   nothing published depends on it any more).
+///   writer of the Σ leg is [`save_position`] (marks), maintaining it from the delta of the
+///   position write that moved `pos.margin`; [`save_position_reservation_only`] takes only the
+///   [`SideAggregates`], so it cannot touch `margin` at all. The per-user market INDEX no longer
+///   enters this field, so an order-list leg flipping index membership in
+///   [`sync_user_market_membership`] cannot move it even in principle — which is what removed the
+///   subtle half of this argument (it used to rest on "a market can only be added or dropped by
+///   that leg while the position is flat, and a flat position carries no margin"; that invariant is
+///   still asserted, now in [`save_position`] itself, but nothing published depends on it any
+///   more).
 ///
 /// This was NOT true of the previous eleven-field payload: `totalOpenOrderInitialMargin` and
 /// `availableBalance` move on every placement and cancel, so the event shipped fields its own trigger
@@ -829,72 +830,89 @@ pub(crate) fn set_in_liquidation_for_test<H: PerpHost>(
     })
 }
 
-/// Position write for the paths that touch ONLY the per-side aggregates (`total_buy/sell_{qty,
-/// notional}` — the `Bid`/`Ask` that derived `ooIM` is computed from): an order resting, an order
-/// being cancelled, a cancel-all clearing both sides.
+/// A position's per-side resting-order aggregates — `Bid` (`total_buy_{qty,notional}`) and `Ask`
+/// (`total_sell_{qty,notional}`), the terms derived `ooIM` is computed from — and NOTHING else of
+/// it: what [`save_position_reservation_only`] takes and writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SideAggregates {
+    /// `PerpPosition::total_buy_qty`.
+    pub buy_qty: u64,
+    /// `PerpPosition::total_buy_notional`.
+    pub buy_notional: u64,
+    /// `PerpPosition::total_sell_qty`.
+    pub sell_qty: u64,
+    /// `PerpPosition::total_sell_notional`.
+    pub sell_notional: u64,
+}
+
+impl SideAggregates {
+    /// `pos`'s four aggregates.
+    #[inline]
+    pub fn of(pos: &PerpPosition) -> Self {
+        Self {
+            buy_qty: pos.total_buy_qty,
+            buy_notional: pos.total_buy_notional,
+            sell_qty: pos.total_sell_qty,
+            sell_notional: pos.total_sell_notional,
+        }
+    }
+
+    /// Writes the four aggregates into `pos`, leaving every other field as it is.
+    #[inline]
+    fn apply(self, pos: &mut PerpPosition) {
+        pos.total_buy_qty = self.buy_qty;
+        pos.total_buy_notional = self.buy_notional;
+        pos.total_sell_qty = self.sell_qty;
+        pos.total_sell_notional = self.sell_notional;
+    }
+}
+
+/// Position write for the paths that touch ONLY the per-side aggregates ([`SideAggregates`] — the
+/// `Bid`/`Ask` that derived `ooIM` is computed from): an order resting, an order being cancelled, a
+/// cancel-all clearing both sides.
+///
+/// It takes the four aggregates, not a position, and sets them on the STORED position in place
+/// (`position_mut`; the one-time materialization of a never-set position otherwise): every other
+/// field is the store's by construction. So no caller can write back a stale or funding-settled
+/// copy through it — `amount`, `margin`, `v_quote_balance`, `last_funding_index`, `generation`,
+/// `margin_type` and `leverage` are out of its reach, in release builds as much as in debug ones.
 ///
 /// Two things it deliberately skips, and they are the same two facts:
 ///
 /// * `save_position`'s `amount` zero-crossing hooks (open-position registry, per-user market index)
-///   are dead work here — `amount` is unchanged, asserted below.
+///   are dead work here — `amount` cannot move.
 /// * it does **NOT** mark the user for an `AccountBalanceChanged` snapshot. Aggregates-only means no
 ///   wallet moved and no position state moved, which is exactly the condition under which Binance
 ///   pushes no `ACCOUNT_UPDATE` — see the trigger table on [`mark_account_snapshot_dirty`]. This is
 ///   what makes a pure placement and a pure cancel silent. Routing an aggregates-only write through
 ///   `save_position` instead would publish a snapshot for both.
 ///
-/// `margin` is asserted unchanged alongside `amount`, and that assertion is load-bearing rather than
-/// defensive: `Σ pos.margin` is half of the `totalWalletBalance` this event publishes, so a
-/// `margin` edit slipping through this silent route would move a PUBLISHED field with no snapshot to
-/// announce it — the exact payload/trigger mismatch the narrowed payload exists to close.
+/// That `margin` cannot move here is load-bearing rather than incidental: `Σ pos.margin` is half of
+/// the `totalWalletBalance` this event publishes, so a `margin` edit slipping through this silent
+/// route would move a PUBLISHED field with no snapshot to announce it — the exact payload/trigger
+/// mismatch the narrowed payload exists to close.
 ///
-/// `last_funding_index` is asserted unchanged too: the cross legs (`types::CrossLegs`, cross P4)
-/// carry it, and this route skips their maintenance — it is what keeps a placement and a cancel
-/// free of it. The one flush that may have re-anchored the index (a zero-payment funding settle on
-/// a match's silent route) writes through [`save_position_reservation_only_after_funding`].
+/// Nor can `amount`, `v_quote_balance` or `last_funding_index`: the cross legs (`types::CrossLegs`,
+/// cross P4) carry them, and this route skips their maintenance — it is what keeps a placement and
+/// a cancel free of it. The one flush that may have re-anchored the index (a zero-payment funding
+/// settle on a match's silent route) writes through
+/// [`save_position_reservation_only_after_funding`].
 pub fn save_position_reservation_only<H: PerpHost>(
     context: &mut H,
     user: Address,
     market_id: u64,
-    pos: PerpPosition,
+    sides: SideAggregates,
 ) -> Result<(), PerpError> {
-    #[cfg(debug_assertions)]
-    {
-        let old = load_position_ref(context, user, market_id)?;
-        debug_assert_eq!(
-            old.amount, pos.amount,
-            "save_position_reservation_only on a path that changed pos.amount — the zero-crossing \
-             registry hooks + collateral re-derivation in save_position are NOT dead there"
-        );
-        debug_assert_eq!(
-            old.margin, pos.margin,
-            "save_position_reservation_only on a path that changed pos.margin — that is a PUBLISHED \
-             quantity (`Σ pos.margin` is `totalWalletBalance − totalCrossWalletBalance`), and this \
-             route marks nobody, so the move would never reach the event stream"
-        );
-        debug_assert_eq!(
-            old.generation, pos.generation,
-            "save_position_reservation_only from a STALE copy — `generation` is owned by \
-             save_position, and writing an older value back would revive every position-bound \
-             conditional order the ended position left behind"
-        );
-        debug_assert_eq!(
-            old.margin_type, pos.margin_type,
-            "save_position_reservation_only moved margin_type — only setMarginType \
-             (save_position_margin_type_only) may write it"
-        );
-        debug_assert_eq!(
-            old.v_quote_balance, pos.v_quote_balance,
-            "save_position_reservation_only moved v_quote_balance — only a fill moves it, and a \
-             fill goes through save_position"
-        );
-        debug_assert_eq!(
-            old.last_funding_index, pos.last_funding_index,
-            "save_position_reservation_only moved last_funding_index — a funding re-anchor writes \
-             through save_position_reservation_only_after_funding (the cross legs carry it)"
-        );
+    // Resident (every caller has just read it): in place — CoW on the first write after a cold
+    // fill, as `mutate_account` — and marked dirty by `position_mut`.
+    if let Some(p) = typed_store_mut(context).position_mut(user, market_id) {
+        sides.apply(p);
+        return Ok(());
     }
-    typed_store_mut(context).set_position(user, market_id, pos);
+    // Not resident, or a never-set position: materialize what a read returns, then write it.
+    let mut p = load_position(context, user, market_id)?;
+    sides.apply(&mut p);
+    typed_store_mut(context).set_position(user, market_id, p);
     Ok(())
 }
 
@@ -922,8 +940,9 @@ pub fn save_position_reservation_only_after_funding<H: PerpHost>(
     if new_leg != old_leg {
         set_cross_leg(context, user, market_id, new_leg)?;
     }
-    // The position write itself, without the funding-index assertion this route exists to waive:
-    // the other checks of [`save_position_reservation_only`] hold here exactly as there.
+    // The position write itself. Unlike [`save_position_reservation_only`], which takes only the
+    // aggregates, this route takes the caller's whole position (it must carry the new index), so
+    // what else must not have moved is asserted instead.
     #[cfg(debug_assertions)]
     {
         let old = load_position_ref(context, user, market_id)?;
@@ -1295,13 +1314,13 @@ pub fn save_position<H: PerpHost>(
     // delta comes from the `old_margin` the registry hook already paid for, so this costs no extra
     // read — only the account write, and only when the margin actually moved.
     //
-    // ⚠️ This is the ONLY place the aggregate may be touched. `save_position` is the single door for
-    // every `pos.margin` write (`TypedPerpStore::set_position` / `position_mut` have no other
-    // caller — verified by grep), and `save_position_reservation_only` `debug_assert`s that it cannot
-    // change `margin`, which is precisely why the aggregate is cheap: it does NOT move on an order
-    // resting or being cancelled. A second maintenance site, or one added to the reservation-only
-    // route, re-opens exactly the drift `margin_view::index_account_scalars`' `debug_assertions`
-    // cross-check exists to catch.
+    // ⚠️ This is the ONLY place the aggregate may be touched. `save_position` is the single door
+    // for every `pos.margin` write (`TypedPerpStore::set_position` / `position_mut` have no caller
+    // outside this file's position routes — verified by grep), and `save_position_reservation_only`
+    // takes only the side aggregates, so it cannot change `margin`, which is precisely why the
+    // aggregate is cheap: it does NOT move on an order resting or being cancelled. A second
+    // maintenance site, or one added to the reservation-only route, re-opens exactly the drift
+    // `margin_view::index_account_scalars`' `debug_assertions` cross-check exists to catch.
     //
     // Conditional on a non-zero delta so the many saves that move only `amount` / `v_quote_balance`
     // do not dirty the account key for a no-op. Deterministic — the condition is a comparison of two

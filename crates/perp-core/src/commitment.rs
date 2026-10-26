@@ -109,8 +109,8 @@ use primitives::{B256, U256};
 // write that MOVES `pos.margin` (an open, a fill, a close, funding, liquidation, ADL,
 // `add/removePositionMargin`) also writes the ACCOUNT key — a key that write did not previously enter
 // into the block delta. A rest/cancel is untouched: it goes through
-// `save_position_reservation_only`, which cannot change `margin` (asserted), so a pure placement and a
-// pure cancel still write no account key.
+// `save_position_reservation_only`, which writes only the per-side aggregates (it cannot change
+// `margin`), so a pure placement and a pure cancel still write no account key.
 //
 // What this buys: `AccountBalanceChanged.totalWalletBalance` used to be WALKED — one index load plus
 // one position load per member market, up to 17 `_ref` loads at `MAX_USER_MARKETS` — on every

@@ -393,6 +393,40 @@ fn a_position_write_that_fails_after_storing_keeps_its_leg() {
     assert_eq!(markets_of(&stored_legs(&mut ctx, ALICE)), vec![M1]);
 }
 
+/// The aggregates-only route (an order resting, a cancel) writes the four per-side aggregates onto
+/// the STORED position and nothing else, so even a caller holding a STALE copy — read before a
+/// fill moved `amount` / `v_quote_balance` — cannot roll the position back under its leg. Its
+/// signature makes that so in every build: it takes `SideAggregates`, not a position.
+#[test]
+fn the_aggregates_only_route_cannot_write_back_a_stale_position() {
+    let mut ctx = make_ctx();
+    ok(&mut ctx, BOB, &order(M1, SELL, px(100), 10, GTC));
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 4, IOC));
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(99), 2, GTC));
+    let stale = pos(&mut ctx, ALICE, M1);
+    assert_eq!((stale.amount, stale.total_buy_qty), (4, 2));
+    ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 3, IOC));
+    let fresh = pos(&mut ctx, ALICE, M1);
+    assert_eq!(fresh.amount, 7, "the fill moved the stored position past the stale copy");
+
+    let mut sides = storage::SideAggregates::of(&stale);
+    sides.sell_qty = 1;
+    storage::save_position_reservation_only(&mut ctx, ALICE, M1, sides).unwrap();
+    let after = pos(&mut ctx, ALICE, M1);
+    assert_eq!(storage::SideAggregates::of(&after), sides, "the aggregates were written");
+    let rest = |p: &crate::types::PerpPosition| {
+        let mut p = p.clone();
+        p.total_buy_qty = 0;
+        p.total_buy_notional = 0;
+        p.total_sell_qty = 0;
+        p.total_sell_notional = 0;
+        p
+    };
+    assert_eq!(rest(&after), rest(&fresh), "…and nothing else: the stored fields stand");
+    assert_legs(&mut ctx, &USERS, "aggregates-only write");
+    assert_eq!(stored_legs(&mut ctx, ALICE)[0].amount, 7);
+}
+
 // ── D3 / D4: the health check is the walk's numbers ─────────────────────────────
 
 /// `cross_health` against `cross_fold` computed HERE — not through the `debug_assertions`

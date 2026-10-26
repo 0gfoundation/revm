@@ -223,9 +223,9 @@ pub struct UserAccount {
     /// two hottest paths in the engine. The escrow is GONE (see the note where the six escrow fields
     /// used to be in [`crate::types::PerpPosition`]); the requirement it stood for is DERIVED on read
     /// now. What is left, `Σ pos.margin`, does **not** move on a rest or a cancel — that is exactly
-    /// the invariant `storage::save_position_reservation_only` `debug_assert`s — so this field is
-    /// maintained only where `pos.margin` itself moves: opens, closes, fills, funding, liquidation,
-    /// ADL and `add/removePositionMargin`.
+    /// what `storage::save_position_reservation_only` guarantees by taking only the per-side
+    /// aggregates — so this field is maintained only where `pos.margin` itself moves: opens,
+    /// closes, fills, funding, liquidation, ADL and `add/removePositionMargin`.
     ///
     /// And on those paths the maintenance is **free**: `storage::save_position` already reads the OLD
     /// position (it needs `old.amount` for the registry / market-index zero-crossing hooks), so

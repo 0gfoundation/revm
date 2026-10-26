@@ -12554,7 +12554,7 @@ mod user_market_index {
     /// | placement increment, SELL arm (`trading/mod.rs`) | drop the `checked_add` | FAILS |
     /// | the shared decrement (`remove_entry_from_side_aggregates`) — cancel, partial fill, LIFO cover | no-op the `checked_sub` | FAILS |
     /// | partial-fill delta feeding it (`settle_maker_fill_core`) | pass 0 instead of the delta | FAILS |
-    /// | liquidation cancel-all zeroing (`risk/mod.rs`, `clear_side_aggregates`) | drop the call | FAILS |
+    /// | liquidation cancel-all zeroing (`risk/mod.rs`, then `clear_side_aggregates`; now the zeroed `SideAggregates` write) | drop the call | FAILS |
     ///
     /// …and mutation-tested against the FREEZE specifically: maintaining any one site at
     /// `entry.price` instead of `entry.assuming_price` also FAILS, because the sites then disagree

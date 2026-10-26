@@ -1892,10 +1892,11 @@ const MAX_BAND_EXPIRIES_PER_UPDATE: u32 = crate::batch::MAX_BATCH_PLACE as u32;
 ///
 /// Per-order cost is O(1) writes, NOT O(k) blob rewrites, so expiring k orders of one user is not
 /// O(k²): `mutate_buy_orders`/`mutate_sell_orders` edit the resident `VecDeque` IN PLACE and
-/// `save_position_reservation_only` overwrites the resident position struct, with serialization
-/// deferred to one write per key at block end. No per-user grouping is needed to get that, which is
-/// why the loop is free to run in the deterministic order the event stream wants: price order
-/// (ascending asks / descending bids), then FIFO within a level. No hash-map iteration anywhere.
+/// `save_position_reservation_only` sets the aggregates on the resident position struct, with
+/// serialization deferred to one write per key at block end. No per-user grouping is needed to get
+/// that, which is why the loop is free to run in the deterministic order the event stream wants:
+/// price order (ascending asks / descending bids), then FIFO within a level. No hash-map iteration
+/// anywhere.
 fn run_out_of_band_expiry_sweep<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -2321,14 +2322,18 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
     // requirement drops to 0 by itself. NOTHING is credited back to the wallet: a resting order
     // escrows nothing (neither margin nor fee), so a cancel — including this cancel-all — moves
     // no money at all. It only shrinks `Σ ooIM`, i.e. frees AVAILABLE, not balance.
-    let mut pos = storage::load_position(context, user, market_id)?;
-    pos.clear_side_aggregates();
     // Aggregates-only (`pos.amount` untouched), so the reservation-only route: it skips
     // `save_position`'s dead `amount` zero-crossing hooks and, per
     // `storage::mark_account_snapshot_dirty`, does not by itself mark the user for an
     // `AccountBalanceChanged` snapshot — cancelling publishes nothing. The liquidation that calls
-    // this marks the user anyway, at its own position and wallet writes.
-    storage::save_position_reservation_only(context, user, market_id, pos)?;
+    // this marks the user anyway, at its own position and wallet writes. Zeroed aggregates need no
+    // read of the position: the route sets them on the stored one.
+    storage::save_position_reservation_only(
+        context,
+        user,
+        market_id,
+        storage::SideAggregates::default(),
+    )?;
 
     Ok(())
 }

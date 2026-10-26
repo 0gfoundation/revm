@@ -812,15 +812,16 @@ fn the_general_route_refuses_a_margin_type_change() {
     let _ = storage::save_position(&mut ctx, ALICE, MARKET_ID, &p, AccountUpdateReason::Adjustment);
 }
 
-/// …nor may the aggregates-only route (a placement or a cancel).
-#[cfg(debug_assertions)]
+/// …nor can the aggregates-only route (a placement or a cancel): it takes the four per-side
+/// aggregates, never a position, so the stored type survives it in every build.
 #[test]
-#[should_panic(expected = "save_position_reservation_only moved margin_type")]
-fn the_reservation_only_route_refuses_a_margin_type_change() {
+fn the_reservation_only_route_cannot_move_the_margin_type() {
     let mut ctx = make_ctx();
-    let mut p = stored(&mut ctx, ALICE);
-    p.margin_type = ISOLATED;
-    let _ = storage::save_position_reservation_only(&mut ctx, ALICE, MARKET_ID, p);
+    store_type(&mut ctx, ALICE, ISOLATED);
+    let sides = storage::SideAggregates { buy_qty: 3, buy_notional: 7, ..Default::default() };
+    storage::save_position_reservation_only(&mut ctx, ALICE, MARKET_ID, sides).unwrap();
+    let p = stored(&mut ctx, ALICE);
+    assert_eq!((p.margin_type, p.total_buy_qty, p.total_buy_notional), (ISOLATED, 3, 7));
 }
 
 /// `setMarginTypeSigned` runs the seen-signature GC after its burn, like every signed selector. The

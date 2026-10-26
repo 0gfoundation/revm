@@ -73,12 +73,13 @@ impl CrossLegState {
 /// funding settlements, closePosition and every fired conditional order, the sub-account and batch
 /// routes, and every test fixture — which sets the entry from the position it stores whenever the
 /// entry it implies moved. The narrower routes beside it keep the invariant too:
-/// `save_position_reservation_only` (an order resting, a cancel) moves none of the three fields
-/// (asserted), so a placement and a cancel never touch this list; its one sibling that may move
-/// one — `save_position_reservation_only_after_funding`, a match flush of a user who published
-/// nothing after a ZERO-payment funding settle re-anchored `last_funding_index` — mirrors it; the
-/// two settings routes (`setLeverage`, `setMarginType`) assert the three fields unchanged, and
-/// `setMarginType` only switches a FLAT position, which has no entry either way.
+/// `save_position_reservation_only` (an order resting, a cancel) takes only the per-side aggregates
+/// and so cannot move any of the three fields: a placement and a cancel never touch this list; its
+/// one sibling that may move one — `save_position_reservation_only_after_funding`, a match flush of
+/// a user who published nothing after a ZERO-payment funding settle re-anchored
+/// `last_funding_index` — mirrors it; the two settings routes (`setLeverage`, `setMarginType`)
+/// assert the three fields unchanged, and `setMarginType` only switches a FLAT position, which has
+/// no entry either way.
 ///
 /// It is POSITION STATE, not a mark-dependent sum: nothing here moves when a mark or a funding index
 /// moves, so it does not cache what R13 forbids caching (the health terms are re-priced at every
