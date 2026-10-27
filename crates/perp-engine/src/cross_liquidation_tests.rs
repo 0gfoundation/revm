@@ -521,6 +521,75 @@ fn a_bankrupt_account_is_adld_at_its_bankruptcy_price_and_pays_no_fee() {
     assert!(!flagged(&mut ctx, ALICE));
 }
 
+/// **…but a non-round deficit pays the bankruptcy price's ROUNDING DUST.** The devnet liquidation
+/// gate's `cross-bankrupt` case on its own numbers (2026-10-27), where the harness had asserted 0
+/// and the engine charged 99. (The test above pays 0 only because its $90 is exact.)
+///
+/// M2 re-gridded as BTC-PERP — base 3 / price 2 decimals, tick 10, so `calc_value(P, q) = 10·P·q`
+/// exactly — at 50 bps, band off. ALICE: CROSSED long 0.01 (`amount` 10) @ $100,000 at 3x against
+/// BOB, cross wallet 341_039_999 after it (the gate's 342_039_999 less its 1_000_000 taker fee).
+/// The tick to $63,260.10 leaves `E = 341_039_999 − 367_399_000 = −26_359_001` against
+/// `Σ MM = 105_433_500`: bankrupt, the one leg's share is all of `E`, so the close targets a
+/// notional of `632_601_000 + 26_359_001 = 658_960_001`, and the MM-share bankruptcy price rounds
+/// UP to 6_589_601 — 99 over the target, the most a 10-lot can overshoot here
+/// (`calc_value(1, 10) − 1`). The empty book fills nothing, BOB takes the 10 by ADL at that price,
+/// `E_after = 99`, and the fee is `min(3_163_005 due, 99)`: the dust goes to the insurance fund,
+/// the wallet ends at 0.
+#[test]
+fn a_bankrupt_cross_account_pays_its_bankruptcy_price_rounding_dust_as_the_clearance_fee() {
+    const P_B: u64 = 6_589_601;
+    let mut ctx = make_ctx();
+    let mut mk = storage::load_market(&mut ctx, M2).unwrap().unwrap();
+    mk.base_decimals = 3;
+    mk.tick_size = 10;
+    mk.mark_price = 10_000_000;
+    mk.liquidation_fee_rate_bps = 50;
+    storage::save_market(&mut ctx, &mk).unwrap();
+    trade(&mut ctx, M2, ALICE, BOB, BUY, 10_000_000, 10);
+    set_wallet(&mut ctx, ALICE, 341_039_999);
+    let ledger = Ledger::open(&mut ctx);
+    let (if0, bob_w0) = (insurance_fund(&mut ctx), wallet(&mut ctx, BOB));
+    let bob_silo = pos(&mut ctx, BOB, M2).margin;
+
+    let logs = tick(&mut ctx, M2, 6_326_010);
+    ledger.check(&mut ctx, "after the tick");
+    let started = evs::<CrossLiquidationStarted>(&logs);
+    assert_eq!(
+        (started.len(), started[0].crossMarginBalance, started[0].totalCrossMaintMargin),
+        (1, -26_359_001, 105_433_500),
+        "the gate's plan: E and Σ MM at the trigger mark"
+    );
+    let close: Vec<OrderPlaced> =
+        evs::<OrderPlaced>(&logs).into_iter().filter(|o| o.user == ALICE).collect();
+    assert_eq!((close.len(), close[0].price), (1, P_B), "the IOC at the bankruptcy price");
+    assert!(evs::<Trade>(&logs).is_empty(), "nothing in the book");
+    assert_eq!(adls(&logs), vec![(ALICE, BOB, M2, 10, P_B)]);
+    let overshoot = crate::math::calc_value(P_B, 10, 3, 2).unwrap() - 658_960_001;
+    assert_eq!(overshoot, 99, "the rounding overshoot over the target notional");
+    assert_eq!(overshoot, crate::math::calc_value(1, 10, 3, 2).unwrap() - 1, "the tight bound");
+
+    let mk = storage::load_market(&mut ctx, M2).unwrap().unwrap();
+    let due = crate::risk::clearance_fee_due(&mk, 6_326_010, 10);
+    assert_eq!(due, 3_163_005);
+    let liq = evs::<Liquidation>(&logs);
+    assert_eq!(liq.len(), 1);
+    assert_eq!(
+        (liq[0].user, liq[0].marketId, liq[0].amount, liq[0].reward, liq[0].marginType),
+        (ALICE, M2, 10, overshoot, CROSSED),
+        "the fee is E_after = the overshoot, not 0 and not the due"
+    );
+    assert_eq!(insurance_fund(&mut ctx) - if0, overshoot, "the dust went to the fund");
+    assert_eq!(wallet(&mut ctx, ALICE), 0, "+99 left by the close, −99 clearance fee");
+    assert_eq!(
+        wallet(&mut ctx, BOB) - bob_w0,
+        bob_silo + 1_000_000_000 - 658_960_100,
+        "BOB: his silo plus the short's gain to the bankruptcy price"
+    );
+    let ended = evs::<CrossLiquidationEnded>(&logs);
+    assert_eq!((ended.len(), ended[0].crossMarginBalance), (1, 0));
+    assert!(!flagged(&mut ctx, ALICE));
+}
+
 /// **Q4 — the IOC limit is the bankruptcy price CLAMPED into the band.** M1's band is 5%; at $80
 /// the bankruptcy price ($70) is below the band's lower edge ($76), so the IOC goes out at $76: it
 /// takes the 4 bid at $77 and stops there (the $75 bid is outside both the limit and the band),

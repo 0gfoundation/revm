@@ -4219,6 +4219,103 @@ fn a_bankrupt_isolated_liquidation_pays_no_clearance_fee() {
     );
 }
 
+/// **…but a bankrupt residual ADL'd AT its bankruptcy price pays that price's ROUNDING DUST.** The
+/// devnet liquidation gate's `fee` case on its own numbers (2026-10-27), where the harness had
+/// asserted 0 and the engine charged 33.
+///
+/// A BTC-PERP-like market — base 3 / price 2 decimals, tick 10, so `calc_value(P, q) = 10·P·q`
+/// exactly — at 50 bps. ALICE: ISOLATED long 0.01 (`amount` 10) @ $100,000 at 3x, `vQuote` −1e9,
+/// silo 332_333_333 (the 1e9 / 3 initial margin less the gate's 1_000_000 taker fee); KEEPER the
+/// opposite isolated short. The oracle ticks to $40,000 with an empty book: ALICE's equity there is
+/// −267_666_667, so the whole 10 go to ADL at her bankruptcy price, which a long rounds UP —
+/// `⌈667_666_667 / 100⌉ = 6_676_667` — and at which she keeps `667_666_700 − 667_666_667 = 33`.
+///
+/// That 33 is the close credit (J5), so of the 2_000_000 due (50 bps of the $400 closed at the
+/// mark) she pays exactly 33: the dust goes to the insurance fund and her wallet nets 0. It sits
+/// inside the bound `calc_value(1, 10) − 1 = 99` (`pd + bd ≤ 6`), and the system's value is
+/// conserved — no bad debt, nothing minted.
+#[test]
+fn a_bankrupt_isolated_adl_pays_its_bankruptcy_price_rounding_dust_as_the_clearance_fee() {
+    const SILO: i64 = 332_333_333;
+    const P_B: u64 = 6_676_667;
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let mut m = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    m.base_decimals = 3;
+    m.tick_size = 10;
+    m.max_price = 100_000_000;
+    m.liquidation_fee_rate_bps = 50;
+    storage::save_market(&mut ctx, &m).unwrap();
+    storage::save_mark_price(&mut ctx, MARKET_ID, 10_000_000).unwrap();
+    seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, SILO, 3, USER_WALLET as i64);
+    seed_position_account(&mut ctx, KEEPER, -QTY, ENTRY_VALUE, 333_333_333, 3, 0);
+    let users = [ALICE, KEEPER];
+    let value_before = conservation_sum(&mut ctx, &users);
+    let if_before = storage::load_insurance_fund(&mut ctx).unwrap();
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    run_update_index_price(
+        &updateIndexPriceCall {
+            marketId: MARKET_ID,
+            indexPrice: 4_000_000,
+            timestamp: 31,
+        }
+        .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .unwrap();
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+
+    // The close: no book, so all 10 by ADL against KEEPER at the rounded-up bankruptcy price.
+    let adl = decode_events::<crate::interface::IPerpDex::Adl>(&logs);
+    assert_eq!(adl.len(), 1);
+    assert_eq!(
+        (adl[0].liquidatedUser, adl[0].adlUser, adl[0].qty, adl[0].price),
+        (ALICE, KEEPER, QTY as u64, P_B)
+    );
+    let surplus = calc_value(P_B, QTY as u64, 3, 2).unwrap() as i64 - (ENTRY_VALUE - SILO);
+    assert_eq!(surplus, 33, "the liquidated equity at P_b: the rounding surplus");
+    let changes = decode_events::<crate::interface::IPerpDex::PositionChanged>(&logs);
+    let alice_close: Vec<_> = changes.iter().filter(|c| c.user == ALICE).collect();
+    assert_eq!(alice_close.len(), 1);
+    assert_eq!(
+        alice_close[0].realizedPnl,
+        surplus - SILO,
+        "she loses her silo less the surplus"
+    );
+
+    // The fee: due 2_000_000, capped at the 33 close credit.
+    let due = clearance_fee_due(&m, 4_000_000, QTY as u64);
+    assert_eq!(due, 2_000_000);
+    let liq = decode_events::<crate::interface::IPerpDex::Liquidation>(&logs);
+    assert_eq!(liq.len(), 1);
+    assert_eq!(
+        (liq[0].user, liq[0].amount, liq[0].reward, liq[0].markPrice, liq[0].marginType),
+        (ALICE, QTY, 33, 4_000_000, crate::types::MarginType::Isolated.code())
+    );
+    assert!((liq[0].reward as u128) < due, "dust, not the fee due");
+    assert!(
+        liq[0].reward < calc_value(1, QTY as u64, 3, 2).unwrap(),
+        "under one price unit's worth of the closed size (`pd + bd ≤ 6`)"
+    );
+    let if_events = decode_events::<crate::interface::IPerpDex::InsuranceFundChanged>(&logs);
+    assert_eq!(if_events.len(), 1);
+    assert_eq!((if_events[0].delta, if_events[0].newBalance), (33, if_before + 33));
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), if_before + 33);
+
+    // The parties: ALICE's wallet rose by the 33 and paid it on, KEEPER booked the rest.
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    assert_eq!(position(&mut ctx, KEEPER).amount, 0);
+    assert_eq!(wallet(&mut ctx, ALICE), USER_WALLET, "+33 close credit, −33 clearance fee");
+    assert_eq!(
+        wallet(&mut ctx, KEEPER),
+        (333_333_333 + ENTRY_VALUE - 667_666_700) as u64,
+        "his silo plus the short's gain to P_b"
+    );
+    assert_eq!(conservation_sum(&mut ctx, &users), value_before, "conserved: no bad debt, no mint");
+}
+
 #[test]
 fn liquidate_closes_the_book_unfillable_residual_by_adl_at_mark() {
     let mut ctx = make_ctx();
