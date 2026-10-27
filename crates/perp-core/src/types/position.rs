@@ -618,7 +618,10 @@ pub struct Market {
     /// closes (valued at the mark), for both margin types — Binance's `liquidationFee` (125 bps on
     /// BTCUSDT; cross margin P3, owner decision Q3). Charged from the liquidated wallet, capped at
     /// what the close returned to it (isolated) or at `max(0, E_after)` (cross), so a bankrupt
-    /// liquidation pays nothing; credited to the Insurance Fund. 0 = no fee.
+    /// liquidation pays at most the rounding dust its close at the bankruptcy price leaves (see
+    /// `math::calc_bankruptcy_price`: `≤ calc_value(1, |amount|) − 1` where `pd + bd ≤ 6`, for one
+    /// ADL fill or a full close; a partial close over `n` fills can add up to `n` units), not 0
+    /// by rule; credited to the Insurance Fund. 0 = no fee.
     #[serde(default, rename = "lf")]
     pub liquidation_fee_rate_bps: u32,
     /// Price band half-width in basis points (1 bps = 0.01%). A limit order is

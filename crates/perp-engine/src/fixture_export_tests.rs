@@ -2665,10 +2665,12 @@ mod cross_scenes {
     /// The ADL scene on `m`: `loser` short 150 at $100 against `winner`'s long; `winner` then
     /// loses $3,600 on a reduce-only fat-finger of a second long (M21), which leaves it at
     /// `E = −$2,600`. A spike to $116 takes the loser to `E = −$1,400` and the winner up to
-    /// `−$200`: the sweep closes the loser at its bankruptcy price clamped into the band ($106.66,
-    /// no book), ADL-ing the winner — fallback tier, under water — whose fill the fund covers back
-    /// up to `−$200`; the loser's clearance fee is capped at its last dollar of equity, and the
-    /// winner, flat with a negative wallet, is cleared by the fund at the end of the call.
+    /// `−$200`: the sweep closes the loser at its MM-share bankruptcy price ($106.66 — inside the
+    /// 20% band, so not clamped; no book), ADL-ing the winner — fallback tier, under water — whose
+    /// fill the fund covers back up to `−$200`; the loser's clearance fee is capped at its last
+    /// dollar of equity — the bankruptcy price's rounding dust (a short rounds DOWN: 150 × $106.66
+    /// = $15,999 against a $16,000 target), which a bankrupt account pays — and the winner, flat
+    /// with a negative wallet, is cleared by the fund at the end of the call.
     fn adl_scene(r: &mut Recorder, m: u64, loser: Address, winner: Address, t: u64) {
         r.next_block(t);
         // The loser rests first, so it is ahead of the winner in the market's registry.

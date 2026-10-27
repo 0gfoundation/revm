@@ -2340,7 +2340,7 @@ fn gate_in_liquidation_reaches_a_sub_account_through_its_master() {
 /// (E = −400 < ΣMM = 225, BANKRUPT), the tick's sweep runs the episode, whose IOC finds no bid and
 /// whose ADL then fills at the MM-share bankruptcy price — above the mark for an insolvent long, all
 /// of the account's share on its one market — so the deficit goes to the winner, DAVE, and the
-/// wallet ends at zero, not below (no fee either: a bankrupt account pays none). An ISOLATED
+/// wallet ends at zero, not below (no fee either: this world's rate is 0). An ISOLATED
 /// position in the same tick is liquidated per position as always.
 #[test]
 fn liq_the_sweep_and_liquidate_judge_a_crossed_position_on_its_account() {

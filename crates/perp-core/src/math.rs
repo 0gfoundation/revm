@@ -948,8 +948,16 @@ pub fn calc_entry_price(
 /// `P_b` is `>= 0` (a long rounds the price UP, a short rounds it DOWN): closing the
 /// residual at `P_b` then never realizes a loss beyond the position's own margin, so
 /// it never produces bad debt — ADL scheme X routes NO bad debt to the Insurance
-/// Fund. A tiny (<= 1 sub-unit) equity surplus is a conserving credit from the ADL
+/// Fund. The equity surplus `S` left at `P_b` is a conserving credit from the ADL
 /// counterparty, never a mint.
+///
+/// ⚠️ `S` is bounded by one PRICE unit's worth of the position, NOT by one quote unit. With
+/// `x = |amount| · 10^(6 − pd − bd)` (one price unit of the position, in quote units):
+/// `0 ≤ S ≤ ⌈x⌉ − 1` for a long, `0 ≤ S ≤ ⌈x⌉` for a short — so `S ≤ calc_value(1, |amount|)`,
+/// one more on a short — and `S ≤ calc_value(1, |amount|) − 1` on any market with `pd + bd ≤ 6`
+/// (`x` integral), which is attained: 0.01 BTC at 3 / 2 decimals keeps up to 99. The liquidation
+/// clearance fee is capped at what the close returns, so a bankrupt liquidation pays `S` (up to the
+/// fee due) to the insurance fund — see `perp_engine::risk::charge_clearance_fee`.
 #[inline]
 pub fn calc_bankruptcy_price(
     amount: i64,
@@ -979,9 +987,10 @@ pub fn calc_bankruptcy_price(
     if amount > 0 && numerator % denominator != 0 {
         price += 1;
     }
-    // `calc_value_i64` floors internally, so nudge once more if that flooring pushed
-    // the liquidated equity a sub-unit negative (long: price up, short: price down).
-    // Bounded, deterministic.
+    // `calc_value_i64` truncates, but that cannot push the liquidated equity negative here:
+    // `−credit` is an integer, so a long's `notional(P_b) ≥ −credit` survives the floor and a
+    // short's floored `|notional(P_b)|` stays `≤ credit`. So the first check below never nudges;
+    // the nudge (long: price up, short: price down) is a defensive guard. Bounded, deterministic.
     for _ in 0..2 {
         let p = u64::try_from(price).map_err(|_| perp_err("math: bankruptcy price exceeds u64"))?;
         let eq = calc_value_i64(p, amount, base_decimals, price_decimals)?
@@ -1360,7 +1369,8 @@ mod bankruptcy_price_tests {
     /// For realistic longs AND shorts across many decimals/leverages, the bankruptcy
     /// price must satisfy `0 <= equity(P_b) <= dust` — i.e. closing the residual at
     /// `P_b` NEVER leaves the position insolvent (no bad debt, ADL scheme X routes none
-    /// to the IF), and `P_b` is tight (equity is a sub-unit above zero, a conserving
+    /// to the IF), and `P_b` is tight (equity is within one PRICE unit's worth of the
+    /// position above zero — about `calc_value(1, qty)`, not one quote unit — a conserving
     /// crumb, never a mint).
     #[test]
     fn bankruptcy_price_keeps_liquidated_equity_nonnegative_and_tight() {

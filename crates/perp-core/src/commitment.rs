@@ -384,13 +384,14 @@ use primitives::{B256, U256};
 //     liquidation_fee_rate_bps / 10_000` — a rate on the NOTIONAL the call closed, Binance's
 //     `liquidationFee` — where it was the same rate on the silo margin the close consumed, and it is
 //     capped at the close credit the close returned to the wallet (and at the positive wallet), so
-//     it can never draw on the cross pool and a bankrupt liquidation pays nothing. The fee moves a
-//     different amount from the wallet to the insurance fund, so the account and fund values
-//     folded into the delta differ. The INTENDED isolated business change: the golden scenario's
-//     BusinessSnapshot moves in exactly two fields, by the same 6_046 — ALICE's available balance
-//     (999_059_631 → 999_053_585) and the insurance fund (49_007_954 → 49_014_000): her fee is
-//     14_000 (50 bps of 0.04 @ $70) instead of 7_954 (50 bps of her silo). Golden re-pinned
-//     0x8c500d81…a62c → 0xaea562b9…1e61.
+//     it can never draw on the cross pool and a bankrupt liquidation pays at most the rounding dust
+//     of its bankruptcy-price close (not 0 by rule — `math::calc_bankruptcy_price`'s bound; noted
+//     2026-10-27, no rule change). The fee moves a different amount from the wallet to the
+//     insurance fund, so the account and fund values folded into the delta differ. The INTENDED
+//     isolated business change: the golden scenario's BusinessSnapshot moves in exactly two
+//     fields, by the same 6_046 — ALICE's available balance (999_059_631 → 999_053_585) and the
+//     insurance fund (49_007_954 → 49_014_000): her fee is 14_000 (50 bps of 0.04 @ $70) instead
+//     of 7_954 (50 bps of her silo). Golden re-pinned 0x8c500d81…a62c → 0xaea562b9…1e61.
 //   * P3 — cross liquidation (the account-level episode, `perp_engine::risk::cross_liquidation`):
 //     the sweep and `liquidate()` judge a position CROSSED in force on its ACCOUNT (`E < Σ_C MM`)
 //     and run the episode — `liq_flags` set and cleared, every order of the account cancelled,

@@ -495,7 +495,8 @@ fn the_unfilled_rest_is_adld_at_the_mark_while_the_account_has_equity() {
 /// for an insolvent long — so BOB, the winner, absorbs the $100 deficit (he books +$100 where the
 /// mark would have given him +$200) and ALICE's wallet ends at exactly 0: not negative, nothing for
 /// the insurance fund. The IOC's limit is that same $90 (band off), above every bid, so the book
-/// leg fills nothing. The 1.25% fee is due on $900 of notional but capped at `E_after = 0`.
+/// leg fills nothing. The 1.25% fee is due on $900 of notional but capped at `E_after = 0`. (0
+/// because $90 is exact: a price that rounds leaves dust for the fee — the next test.)
 #[test]
 fn a_bankrupt_account_is_adld_at_its_bankruptcy_price_and_pays_no_fee() {
     let mut ctx = make_ctx();
@@ -1708,7 +1709,8 @@ fn a_fired_stop_closing_the_last_position_clears_the_negative_wallet() {
 /// bankruptcy price ($80: `E = −$100`, all of the share on M1) is above the band, so the IOC's
 /// limit is clamped DOWN to the band's edge, $77, and fills the $77 bid — below her bankruptcy
 /// price. The close realizes −$230, the wallet ends at −$30, the episode ends (no cross position
-/// left), and the end of the call clears the rest. (A bankrupt account pays no clearance fee.)
+/// left), and the end of the call clears the rest. (Closed below its bankruptcy price, the account
+/// is left with `E_after < 0`: no clearance fee.)
 #[test]
 fn a_cross_episode_closing_through_the_band_clears_the_negative_wallet() {
     let mut ctx = make_ctx();

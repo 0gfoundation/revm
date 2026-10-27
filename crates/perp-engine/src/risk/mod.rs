@@ -1287,11 +1287,25 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // account's cross positions. Binance deducts it "from the assets made available for the
     // position", i.e. from what the close releases. So the cap is the close CREDIT — the wallet's
     // rise across the two close legs (`apply_position_fill` releases the silo plus the realized
-    // PnL into it; an insolvent close returns nothing, its shortfall being bad debt) — and never
-    // more than the wallet then holds: a close credit that only netted a pre-existing negative
-    // wallet (a receivable) toward zero is not cash to charge, and a fee must never create or
-    // deepen a deficit. Hence a BANKRUPT isolated liquidation pays 0 (Binance: "no clearance fee
-    // for a bankrupt position").
+    // PnL into it; a fill worse than the bankruptcy price returns nothing, its shortfall being bad
+    // debt) — and never more than the wallet then holds: a close credit that only netted a
+    // pre-existing negative wallet (a receivable) toward zero is not cash to charge, and a fee must
+    // never create or deepen a deficit.
+    //
+    // ⚠️ So a BANKRUPT isolated liquidation pays (almost) nothing — Binance's "no clearance fee for
+    // a bankrupt position" holds up to ROUNDING DUST, not exactly. Closed through the book worse
+    // than its bankruptcy price, it returns nothing and pays 0. But its book-unfillable residual is
+    // ADL'd AT its bankruptcy price `P_b`, which `calc_bankruptcy_price` rounds in the position's
+    // favour, so that close returns the equity surplus `S` left at `P_b`: up to one price unit's
+    // worth of the residual `q` — `0 ≤ S ≤ calc_value(1, q)` (one more on a short), and
+    // `≤ calc_value(1, q) − 1` wherever `pd + bd ≤ 6`, as on every devnet market — plus at most a
+    // quote unit per ADL fill of flooring where `pd + bd > 6` or the close is partial. That dust IS
+    // the close credit, so the fee is `min(due, dust)`: it goes to the insurance fund, not to the
+    // victim, whose wallet nets `dust − fee` (0 whenever the due covers it). The devnet gate's
+    // case — long 0.01 BTC @ $100,000 on a 332_333_333 silo, mark $40,000: `P_b = 6_676_667`,
+    // `S = 33`, fee 33 of the 2_000_000 due — is pinned by
+    // `a_bankrupt_isolated_adl_pays_its_bankruptcy_price_rounding_dust_as_the_clearance_fee`. A
+    // book fill BETTER than `P_b` is no dust: it realizes a real surplus, charged up to the due.
     let post_amount = storage::load_position_ref(context, user, market_id)?.amount;
     let closed_quantity = liquidation_quantity.saturating_sub(post_amount.unsigned_abs());
     let post_close_wallet = storage::load_account_ref(context, user)?.perp_wallet_balance;
@@ -1357,7 +1371,12 @@ pub(crate) fn clearance_fee_due(market: &Market, mark_price: u64, closed_quantit
 /// The CAP is the caller's, because it is the one thing the two margin types differ in (owner
 /// decision Q3): an ISOLATED liquidation passes the close credit its close returned to the wallet
 /// (J5 — see `liquidate_position`), a CROSS one `max(0, E_after)`. Either way a bankrupt
-/// liquidation passes `0` and pays nothing, Binance's rule.
+/// liquidation passes at most the ROUNDING DUST its close at the bankruptcy price leaves — that
+/// price is rounded in the account's favour, so the close keeps a surplus of up to one price unit's
+/// worth of the closed size (`≤ calc_value(1, |amount|) − 1` wherever `pd + bd ≤ 6`; the exact
+/// bound is `perp_core::math::calc_bankruptcy_price`'s) — and pays `min(due, dust)` into the fund:
+/// Binance's "no clearance fee for a bankrupt position" up to that dust (devnet: 33 and 99 on
+/// 0.01 BTC, against 2_000_000 and 3_163_005 due).
 ///
 /// TOTAL (J4) beyond the storage layer: the fee is further bounded so the wallet debit stays an
 /// `i64` and the fund a `u64`, so neither `debit_perp` nor the fund credit can fail. A fee of `0`

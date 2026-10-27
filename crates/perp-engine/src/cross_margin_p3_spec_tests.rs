@@ -1319,8 +1319,8 @@ fn ep_the_ioc_limit_is_the_mm_share_bankruptcy_price_then_adl_at_mark_and_a_part
 /// MM-share bankruptcy price 872 of the scenario above is clamped UP to 882. Upper: a bankrupt long
 /// (`E = −$300`) has its bankruptcy price ABOVE the mark (930), clamped DOWN to 918 — where the
 /// book takes the whole position. The close realizes past the account's equity, so the wallet ends
-/// −$120 and, the account being flat, the insurance fund clears it (Q8); a bankrupt close pays no
-/// clearance fee.
+/// −$120 and, the account being flat, the insurance fund clears it (Q8); a bankrupt close filled
+/// past its bankruptcy price pays no clearance fee.
 #[test]
 fn ep_the_ioc_limit_is_clamped_into_the_band() {
     // Lower bound.

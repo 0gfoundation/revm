@@ -699,8 +699,14 @@ sol! {
         /// be divided by the leverage it assumed, not carried over. Charged from the liquidated
         /// wallet to the insurance fund, capped at what the close returned to the wallet
         /// (isolated, J5) or at `max(0, crossMarginBalance after)` (cross), so a bankrupt
-        /// liquidation pays nothing. Not range-checked: 10,000 = the whole notional. Same meaning
-        /// on `updateMarket`, `getMarket`, `MarketAdded` and `MarketUpdated`.
+        /// liquidation pays at most DUST — not 0 by rule: its close at the bankruptcy price,
+        /// rounded in the account's favour, leaves up to one price unit's worth of the closed
+        /// size (at most `|amount| · 10^(6 − priceDecimals − baseDecimals) − 1` quote units where
+        /// `priceDecimals + baseDecimals ≤ 6`: 99 for 0.01 at 3 / 2 decimals — for one ADL fill
+        /// or a full close; a partial close over `n` fills can add up to `n` units of proration),
+        /// and the fee takes that dust, never more than the fee due. Not range-checked: 10,000 =
+        /// the whole notional.
+        /// Same meaning on `updateMarket`, `getMarket`, `MarketAdded` and `MarketUpdated`.
         function addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint64 initialMarkPrice, uint32 priceBandBps) external;
         /// Update mutable market parameters (tick/step/quantity/price limits, active flag, and funding config).
         /// `active = false` refuses every new order; conditional orders then neither fire nor
@@ -2670,8 +2676,10 @@ sol! {
         // Feeds: /income (LIQUIDATION_FEE for liquidator)
         // One per liquidated (user, market): `amount` the signed position before the close,
         // `reward` the clearance fee credited to the insurance fund (cross P3: a rate on the
-        // NOTIONAL closed, both margin types), `marginType` the position's type in force (0 =
-        // CROSSED — one row per market an account-level cross episode closed; 1 = ISOLATED).
+        // NOTIONAL closed, both margin types, capped as `addMarket` says — a bankrupt close pays 0
+        // or the bankruptcy price's rounding dust, NOT 0 by rule), `marginType` the position's
+        // type in force (0 = CROSSED — one row per market an account-level cross episode closed;
+        // 1 = ISOLATED).
         // ⚠️ ABI CHANGE (cross P3): `marginType` APPENDED, so the event signature and topic0 moved.
         // An indexer filtering on the old topic0 sees NO liquidations at all, and gets no error.
         // Regenerate the binding.

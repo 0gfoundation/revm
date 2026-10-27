@@ -432,9 +432,24 @@ fn clamp_into_band(price: u64, market: &Market) -> u64 {
 }
 
 /// The clearance fee on `closed` (Q3: the notional closed × the market's rate, capped at
-/// `max(0, E_after)` — so a bankrupt account pays nothing), then the health check the stop
-/// condition reads, fee included ("after deducting realized losses and the Liquidation Clearance
-/// Fee").
+/// `max(0, E_after)`), then the health check the stop condition reads, fee included ("after
+/// deducting realized losses and the Liquidation Clearance Fee").
+///
+/// ⚠️ A bankrupt account pays (almost) nothing — up to ROUNDING DUST, not exactly 0. Closed at its
+/// MM-share bankruptcy price ([`mm_share_bankruptcy_price`], rounded in the account's favour),
+/// market `k` moves `E` by `−share_k + ov_k`, `ov_k` being that price's overshoot over its target
+/// notional. For a leg of `q` contracts `0 ≤ ov_k ≤ calc_value(1, q)` (one more on a short), and
+/// `ov_k ≤ calc_value(1, q) − 1` wherever `pd + bd ≤ 6`, as on every devnet market (the bound is
+/// `perp_core::math::calc_bankruptcy_price`'s). The share truncates toward zero, so
+/// `E_after ≤ ov_k` — with equality on the last bankrupt leg, whose share is all of `E` — and the
+/// fee is at most `min(due, ov_k)`: the dust goes to the insurance fund, not to the account (on the
+/// last leg its wallet ends at `ov_k − fee`, 0 whenever the due covers it). A short split across
+/// `n` ADL fills where `pd + bd > 6` adds up to `n − 1` quote units, an IOC that filled part of the
+/// leg at its limit up to one. The devnet gate's case — long 0.01 BTC, `E = −26_359_001`: fee 99
+/// of 3_163_005 due — is pinned by `cross_liquidation_tests`'s
+/// `a_bankrupt_cross_account_pays_its_bankruptcy_price_rounding_dust_as_the_clearance_fee`. A close
+/// the band clamps, or one ADL'd at the mark because a leg is unpriced, leaves `E_after < 0` and
+/// pays 0; an IOC fill BETTER than its limit is no dust — a real surplus, charged up to the due.
 fn charge_fee_and_check<H: PerpHost>(
     context: &mut H,
     user: Address,

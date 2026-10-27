@@ -4190,7 +4190,8 @@ fn an_isolated_clearance_fee_is_capped_at_the_close_credit() {
 /// **A BANKRUPT isolated liquidation pays no clearance fee** (Binance: none on a bankrupt
 /// position). Long 10 @ $100 on a $200 silo closed into a $75 bid: realized −$250, the silo covers
 /// $200 and $50 is bad debt — the close returns nothing to the wallet, so the J5 cap is 0 however
-/// large the notional fee would be.
+/// large the notional fee would be. (That is a fill WORSE than its $80 bankruptcy price; a residual
+/// ADL'd AT a rounded bankruptcy price pays the rounding dust — the next test.)
 #[test]
 fn a_bankrupt_isolated_liquidation_pays_no_clearance_fee() {
     let mut ctx = make_ctx();
