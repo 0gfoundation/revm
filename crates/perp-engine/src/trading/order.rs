@@ -1128,7 +1128,7 @@ fn execute_limit_order<H: PerpHost>(
 /// only because the GTC path had already written by the time it asked. Keeping one funnel is
 /// deliberate: it is what stops the next refusal added to `RestOutcome` from being handled
 /// differently by one caller than another.
-fn raise_rest_refusal(outcome: RestOutcome) -> Result<(), PerpError> {
+pub(super) fn raise_rest_refusal(outcome: RestOutcome) -> Result<(), PerpError> {
     match outcome {
         RestOutcome::Rested => Ok(()),
         RestOutcome::RefusedTooGoodBest => Err(perp_err(TOO_GOOD_BEST_REJECT)),
