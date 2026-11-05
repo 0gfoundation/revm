@@ -5782,3 +5782,17 @@ mod stp_encoding;
 // tripwire and the end-of-call `AccountBalanceChanged` drain all watch it.
 #[cfg(test)]
 mod stp_matching;
+
+/// Self-trade prevention and the per-market open-order cap, written independently from the plan
+/// rather than from this implementation.
+#[cfg(test)]
+mod stp_spec;
+
+/// Trading-fee accounting (taker fee attribution) through the full call shell.
+#[cfg(test)]
+mod fee_spec;
+
+/// Maker rebates and ppm fee rates, written independently from the spec rather than from this
+/// implementation (or its `fee_spec_tests`).
+#[cfg(test)]
+mod rebate_spec;

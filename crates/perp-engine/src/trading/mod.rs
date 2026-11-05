@@ -4304,20 +4304,3 @@ fn check_fok_feasibility<H: PerpHost>(
 
 #[cfg(test)]
 pub(crate) mod tests;
-
-/// Self-trade prevention and the per-market open-order cap, written independently from the plan
-/// rather than from this implementation.
-#[cfg(test)]
-#[path = "stp_spec_tests.rs"]
-mod stp_spec_tests;
-
-/// Trading-fee accounting (taker fee attribution) through the full call shell.
-#[cfg(test)]
-#[path = "fee_spec_tests.rs"]
-mod fee_spec_tests;
-
-/// Maker rebates and ppm fee rates, written independently from the spec rather than from this
-/// implementation (or its `fee_spec_tests`).
-#[cfg(test)]
-#[path = "rebate_spec_tests.rs"]
-mod rebate_spec_tests;
