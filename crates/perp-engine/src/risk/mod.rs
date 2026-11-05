@@ -30,7 +30,7 @@ use crate::{
         max_notional_for_leverage, tier_mmr_below_initial, tier_mmr_not_above, FUNDING_RATE_ONE,
     },
     storage,
-    trading::{execute_liquidation_market_order, run_adl},
+    trading::execute_liquidation_market_order,
     types::{
         AccountUpdateReason, CancelReason, FundingState, IndexModeState, IndexPriceState,
         MarginTier, MarginTiers,
@@ -45,6 +45,7 @@ pub(crate) mod cross_liquidation;
 pub mod funding;
 pub(crate) mod negative_balance;
 
+mod adl;
 mod admin;
 mod band_expiry;
 mod index_price;
@@ -57,6 +58,7 @@ mod position_margin;
 // One file per section. The globs keep every `crate::risk::X` path resolving; the
 // `pub(super)` items they carry are what the sibling sections and `risk::tests` (through
 // `super::*`) reach.
+pub(crate) use adl::*;
 pub use admin::*;
 use band_expiry::*;
 pub use funding::{run_drain_deferred_work, run_get_average_premium_index, run_get_funding_state};

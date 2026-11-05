@@ -107,3 +107,45 @@ pub fn run_get_insurance_fund<H: PerpHost>(
         &balance,
     )))
 }
+
+/// Routes position **bad debt** — a realized loss beyond the position's own margin —
+/// directly to the Insurance Fund, WITHOUT touching any wallet (isolated margin).
+///
+/// The IF balance is reduced by as much of `bad_debt` as it can cover; any uncovered
+/// remainder is socialized bad debt (logged via `InsuranceFundDepleted`). Unlike the
+/// old `resolve_maker_wallet_deficit`, this does NOT credit a wallet — the loss was
+/// already contained to the position's margin in `apply_position_fill`, so the wallet
+/// is never involved. Shared by every close path (maker fill, taker fill, liquidation).
+pub(crate) fn absorb_bad_debt_into_insurance_fund<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    bad_debt: u64,
+) -> Result<(), PerpError> {
+    if bad_debt == 0 {
+        return Ok(());
+    }
+    let (absorbed, remaining) = storage::absorb_from_insurance_fund(context, bad_debt)?;
+    if absorbed > 0 {
+        let new_if_balance = storage::load_insurance_fund(context)?;
+        let absorbed_i64 = checked_u64_to_i64(absorbed, "settlement: bad-debt IF absorption")?;
+        context.log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::InsuranceFundChanged {
+                delta: -absorbed_i64,
+                newBalance: new_if_balance,
+            }
+            .to_log_data(),
+        });
+    }
+    if remaining > 0 {
+        context.log(Log {
+            address: PERP_DEX_ADDRESS,
+            data: IPerpDex::InsuranceFundDepleted {
+                marketId: market_id,
+                badDebt: remaining,
+            }
+            .to_log_data(),
+        });
+    }
+    Ok(())
+}

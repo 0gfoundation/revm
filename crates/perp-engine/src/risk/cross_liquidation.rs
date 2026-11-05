@@ -75,8 +75,9 @@ use crate::{
     host::PerpHost,
     interface::IPerpDex,
     margin::view::{cross_health, CrossHealth, CrossHealthLeg},
+    risk::run_adl,
     storage,
-    trading::{execute_liquidation_market_order, run_adl},
+    trading::execute_liquidation_market_order,
     types::{AccountUpdateReason, CancelReason, MarginType, Market, PerpPosition, Side},
     PerpError, PERP_DEX_ADDRESS,
 };

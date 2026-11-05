@@ -1356,7 +1356,7 @@ impl MatchRegistry {
                     crate::risk::funding::apply_funding_settlement(context, p)?;
                 }
                 MatchEvent::AbsorbBadDebt { market_id, amount } => {
-                    absorb_bad_debt_into_insurance_fund(context, market_id, amount)?;
+                    crate::risk::absorb_bad_debt_into_insurance_fund(context, market_id, amount)?;
                 }
                 MatchEvent::FeeCredit { market_id, amount } => {
                     // Wallet credit already handled via the registry read-through (credit_admin);
@@ -2947,10 +2947,10 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
 ///   never debited from the wallet or another position's margin. Always `0` for a CROSSED
 ///   position, whose loss is debited from the wallet instead.
 /// - `realized_pnl` — gross close PnL, excluding released margin, fees, and funding.
-pub(super) struct PositionFillOutcome {
+pub(crate) struct PositionFillOutcome {
     pub(super) opening_margin: u64,
-    pub(super) bad_debt: u64,
-    pub(super) realized_pnl: i64,
+    pub(crate) bad_debt: u64,
+    pub(crate) realized_pnl: i64,
 }
 
 /// How a fill funds the opening leg's initial-margin REQUIREMENT — the M1/M1′ decision of
@@ -2963,7 +2963,7 @@ pub(super) struct PositionFillOutcome {
 /// fired conditionals (takers) — settles a cross position by the cross rule without having to
 /// remember to, and `apply_position_fill` asserts the two agree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum OpeningMarginFunding {
+pub(crate) enum OpeningMarginFunding {
     /// Fund the requirement IN FULL. For callers that have already gated the draw against
     /// `available` and therefore KNOW the cash is there — the taker path, whose
     /// `finalize_compute` refuses (or covers, then refuses) unless
@@ -2990,7 +2990,7 @@ impl OpeningMarginFunding {
     /// rule. Total (the type gate has no error path), so it is safe on the liquidation and ADL
     /// paths. With cross margin gated off (a test's override) this is always `isolated`.
     #[inline]
-    pub(super) fn for_position(pos: &crate::types::PerpPosition, isolated: Self) -> Self {
+    pub(crate) fn for_position(pos: &crate::types::PerpPosition, isolated: Self) -> Self {
         debug_assert!(isolated != Self::Cross, "for_position takes the caller's ISOLATED rule");
         if crate::margin::margin_type::effective_margin_type(pos)
             == crate::types::MarginType::Crossed
@@ -3006,7 +3006,7 @@ impl OpeningMarginFunding {
 // because the requirement is computed and applied to `pos.margin` in here — a caller cannot cap it
 // after the fact without re-deriving it. Same allow as `settle_maker_fill_core` / `adl_fill`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn apply_position_fill(
+pub(crate) fn apply_position_fill(
     pos: &mut crate::types::PerpPosition,
     wallet: &mut i64,
     closing_qty: u64,
@@ -3336,48 +3336,6 @@ fn entry_fill_plan(
         MakerFee::Rebate(uncapped.min(taker_fee_share))
     };
     Ok((idx, new_amount, fee))
-}
-
-/// Routes position **bad debt** — a realized loss beyond the position's own margin —
-/// directly to the Insurance Fund, WITHOUT touching any wallet (isolated margin).
-///
-/// The IF balance is reduced by as much of `bad_debt` as it can cover; any uncovered
-/// remainder is socialized bad debt (logged via `InsuranceFundDepleted`). Unlike the
-/// old `resolve_maker_wallet_deficit`, this does NOT credit a wallet — the loss was
-/// already contained to the position's margin in `apply_position_fill`, so the wallet
-/// is never involved. Shared by every close path (maker fill, taker fill, liquidation).
-pub(super) fn absorb_bad_debt_into_insurance_fund<H: PerpHost>(
-    context: &mut H,
-    market_id: u64,
-    bad_debt: u64,
-) -> Result<(), PerpError> {
-    if bad_debt == 0 {
-        return Ok(());
-    }
-    let (absorbed, remaining) = storage::absorb_from_insurance_fund(context, bad_debt)?;
-    if absorbed > 0 {
-        let new_if_balance = storage::load_insurance_fund(context)?;
-        let absorbed_i64 = checked_u64_to_i64(absorbed, "settlement: bad-debt IF absorption")?;
-        context.log(Log {
-            address: PERP_DEX_ADDRESS,
-            data: IPerpDex::InsuranceFundChanged {
-                delta: -absorbed_i64,
-                newBalance: new_if_balance,
-            }
-            .to_log_data(),
-        });
-    }
-    if remaining > 0 {
-        context.log(Log {
-            address: PERP_DEX_ADDRESS,
-            data: IPerpDex::InsuranceFundDepleted {
-                marketId: market_id,
-                badDebt: remaining,
-            }
-            .to_log_data(),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
