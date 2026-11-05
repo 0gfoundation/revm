@@ -55,7 +55,8 @@
 //!
 //! `TRAILING_STOP_MARKET` (`orderType = 4`) shares this selector, the record, both caps, the owner's
 //! list, every cancel path and `fire()` — but not the trigger index. Its trigger MOVES with the best
-//! mark since activation, so it lives in the per-market structure in [`crate::trailing`], which
+//! mark since activation, so it lives in the per-market structure in
+//! [`crate::trading::algo::trailing`], which
 //! documents the semantics, the invariants and the per-tick work bound. `triggerPrice` is the
 //! activation price (0 = activate now, at the stored mark), `price` the callback rate in basis
 //! points (10..=1000, step 10). Reduce-only is REQUIRED and closePosition REFUSED (Binance offers
@@ -86,6 +87,9 @@ use crate::{errors::perp_err, storage, PerpError, PERP_DEX_ADDRESS};
 use alloy_primitives::IntoLogData;
 use alloy_sol_types::SolCall;
 use primitives::{Address, Bytes, FixedBytes, Log};
+
+/// Trailing stops (`TRAILING_STOP_MARKET`): the grouped-lazy per-market structure and its sweeps.
+pub mod trailing;
 
 /// Open orders one user may hold in one market: resting book orders on BOTH sides plus untriggered
 /// conditional orders. Binance USDⓈ-M's `MAX_NUM_ORDERS` filter is 200 too (`-2025` "Reach max open
@@ -244,7 +248,7 @@ fn validate(
     if trailing {
         // `price` carries the CALLBACK RATE in basis points (Binance's `callbackRate` × 100):
         // 0.1 %–10 % in 0.1 % steps, the grid that bounds the bucket directory at 100 entries.
-        if !crate::trailing::valid_callback(price) {
+        if !crate::trading::algo::trailing::valid_callback(price) {
             return Err(perp_err(
                 "placeAlgoOrder: callbackRate (price) must be 10..=1000 bps in steps of 10",
             ));
@@ -448,7 +452,7 @@ fn place_core<H: PerpHost>(
     // Still pre-write: the position is only read.
     if order.is_position_bound() {
         let pos = storage::load_position_ref(context, account, market_id)?;
-        if crate::reduce_only::closing_side(&pos) != Some(v.side) {
+        if crate::trading::reduce_only::closing_side(&pos) != Some(v.side) {
             return Err(perp_err(if trailing {
                 "placeAlgoOrder: TRAILING_STOP_MARKET requires an open position on the closing side"
             } else {
@@ -486,7 +490,14 @@ fn place_core<H: PerpHost>(
     });
     // After `AlgoOrderPlaced`, so an immediate activation's `AlgoOrderActivated` follows it.
     if trailing {
-        crate::trailing::place(context, market_id, market, &algo_id, &order, activate_at)?;
+        crate::trading::algo::trailing::place(
+            context,
+            market_id,
+            market,
+            &algo_id,
+            &order,
+            activate_at,
+        )?;
     }
     Ok(Bytes::from(FixedBytes::<32>(algo_id).to_vec()))
 }
@@ -503,7 +514,7 @@ pub(crate) fn remove_algo_order<H: PerpHost>(
     reason: CancelReason,
 ) -> Result<(), PerpError> {
     if order.is_trailing() {
-        crate::trailing::remove(context, market_id, algo_id, order)?;
+        crate::trading::algo::trailing::remove(context, market_id, algo_id, order)?;
     } else {
         storage::algo_index_remove(
             context,
@@ -630,9 +641,9 @@ pub fn run_get_algo_order<H: PerpHost>(
         let tick = storage::load_market_ref(context, o.market_id)?
             .map(|m| m.tick_size)
             .unwrap_or(0);
-        crate::trailing::view(context, o.market_id, &a.algoId.0, &o, tick)?
+        crate::trading::algo::trailing::view(context, o.market_id, &a.algoId.0, &o, tick)?
     } else {
-        crate::trailing::TrailView::default()
+        crate::trading::algo::trailing::TrailView::default()
     };
     let kind = if o.is_trailing() {
         AlgoOrderType::TrailingStopMarket
@@ -1019,14 +1030,14 @@ fn fire<H: PerpHost>(
     let qty = if bound_position_gone {
         0
     } else {
-        let capacity = match crate::reduce_only::closing_side(&pos) {
-            Some(s) if s == order.side => crate::reduce_only::closing_capacity(
+        let capacity = match crate::trading::reduce_only::closing_side(&pos) {
+            Some(s) if s == order.side => crate::trading::reduce_only::closing_capacity(
                 context,
                 owner,
                 market_id,
                 order.side,
                 &pos,
-                crate::reduce_only::QueuePosition::for_kind(kind, order.price),
+                crate::trading::reduce_only::QueuePosition::for_kind(kind, order.price),
             )?,
             // Flat, or the position flipped to the same side this order is on — it can only open
             // now, which a reduce-only order may never do.
@@ -1156,3 +1167,8 @@ fn fire<H: PerpHost>(
         Err(e) => Err(e),
     }
 }
+
+/// The `fire()` capacity fix, closePosition parity and trailing stops, written independently from
+/// the spec rather than from this implementation (or its `tests`).
+#[cfg(test)]
+mod trailing_spec_tests;

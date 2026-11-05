@@ -842,7 +842,7 @@ fn run_adl_fills<H: PerpHost>(
     // The LOSER only: a winner's whole book in this market is cancelled as part of its fill, so by
     // the time the position moved it had no reduce-only order left to evict. (This used to hold for
     // a different reason — order-holding candidates were excluded from the winner set outright.)
-    crate::reduce_only::restore_both_sides(
+    crate::trading::reduce_only::restore_both_sides(
         context,
         loser,
         market,

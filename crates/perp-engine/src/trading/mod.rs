@@ -7,7 +7,9 @@ use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
+pub mod algo;
 mod liquidation;
+pub mod reduce_only;
 mod settlement;
 
 pub(crate) use liquidation::{
@@ -1014,7 +1016,8 @@ pub(crate) const ORDER_FLAG_REDUCE_ONLY: u8 = 1 << 0;
 ///
 /// # Why this is still `false` even though admission is implemented
 ///
-/// [`crate::reduce_only::admit`] establishes the prefix condition at PLACEMENT, but two things can
+/// [`crate::trading::reduce_only::admit`] establishes the prefix condition at PLACEMENT, but two
+/// things can
 /// break it afterwards, and each needs its own evaluation point before the flag is safe to expose:
 ///
 /// ```text
@@ -1152,7 +1155,7 @@ struct ValidatedOrder {
 }
 
 /// Where an ordinary placement comes from. It decides one thing only: whether the per-market
-/// open-order cap ([`crate::algo::MAX_OPEN_ORDERS_PER_MARKET`]) is checked.
+/// open-order cap ([`crate::trading::algo::MAX_OPEN_ORDERS_PER_MARKET`]) is checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlacementOrigin {
     /// A user submission: `placeOrder`, `placeOrderSigned`, a batch item (also via `asSubAccount`).
@@ -1229,7 +1232,7 @@ pub(crate) fn place_order_core<H: PerpHost>(
                     let open = storage::book_order_count(context, account, market_id)?
                         + storage::load_user_algo_orders(context, account, market_id)?.len();
                     debug_assert!(
-                        open < crate::algo::MAX_OPEN_ORDERS_PER_MARKET,
+                        open < crate::trading::algo::MAX_OPEN_ORDERS_PER_MARKET,
                         "a triggered order found {account} at the open-order cap ({open}) in \
                          market {market_id}: some path admitted an order without the cap check"
                     );
@@ -1246,16 +1249,16 @@ pub(crate) fn place_order_core<H: PerpHost>(
     // `OrderPlaced` all carry from this point on.
     //
     // An order that clears this gate can never produce an opening fill, which is why the fill path
-    // carries only a watchdog and no clamp. See `crate::reduce_only`.
+    // carries only a watchdog and no clamp. See `crate::trading::reduce_only`.
     let quantity = if validated.reduce_only {
-        crate::reduce_only::admit(
+        crate::trading::reduce_only::admit(
             context,
             account,
             market_id,
             validated.side,
             // Derived from the ORDER KIND, never from the price alone: a market/IOC/FOK order has no
             // queue position, and a market order's price is not even set.
-            crate::reduce_only::QueuePosition::for_kind(validated.kind, price),
+            crate::trading::reduce_only::QueuePosition::for_kind(validated.kind, price),
             quantity,
             validated.market.step_size,
         )?
@@ -2439,7 +2442,7 @@ pub(super) fn match_order<H: PerpHost>(
                                 )?;
                                 stp_cancels += 1;
                                 debug_assert!(
-                                    stp_cancels <= crate::algo::MAX_OPEN_ORDERS_PER_MARKET,
+                                    stp_cancels <= crate::trading::algo::MAX_OPEN_ORDERS_PER_MARKET,
                                     "STP cancelled more own orders than the open-order cap admits"
                                 );
                                 // A live maker left the level, exactly as on the K9 path.
@@ -2741,7 +2744,7 @@ pub(super) fn match_order<H: PerpHost>(
                                 )?;
                                 stp_cancels += 1;
                                 debug_assert!(
-                                    stp_cancels <= crate::algo::MAX_OPEN_ORDERS_PER_MARKET,
+                                    stp_cancels <= crate::trading::algo::MAX_OPEN_ORDERS_PER_MARKET,
                                     "STP cancelled more own orders than the open-order cap admits"
                                 );
                                 level_removed += 1;
@@ -3788,7 +3791,7 @@ fn rest_in_book<H: PerpHost>(
     // whenever it could evict — not only when the replay did — so the prefix condition never
     // depends on the replay's plumbing. The assertion below holds the two to each other.
     if !flags.reduce_only {
-        crate::reduce_only::restore(
+        crate::trading::reduce_only::restore(
             context,
             user,
             market,
@@ -4151,7 +4154,8 @@ pub(super) fn release_open_order_margin_core(
     remove_entry_from_side_aggregates(pos, side, removed.amount, notional)
 }
 
-/// [`crate::reduce_only::restore`] on `side`, replayed on in-memory copies: evicts from the copies
+/// [`crate::trading::reduce_only::restore`] on `side`, replayed on in-memory copies: evicts from
+/// the copies
 /// exactly the entries the real pass would cancel against `pos`, shrinking `pos`'s aggregates by
 /// each, and returns whether it evicted anything. NO storage access.
 ///
@@ -4164,7 +4168,8 @@ pub(super) fn release_open_order_margin_core(
 ///   cover simulation and the [`settlement::RestBasis`] are measured;
 /// * [`rest_in_book`] — the overtake pass a NORMAL order's rest triggers (`ReduceOnlyOvertaken`).
 ///
-/// The decision is the real pass's own ([`crate::reduce_only::next_eviction`]) and the removal is
+/// The decision is the real pass's own ([`crate::trading::reduce_only::next_eviction`]) and the
+/// removal is
 /// the cover simulation's ([`release_open_order_margin_core`]), so neither can drift from what the
 /// barrier then writes; the debug assertions after the barrier hold the two to account.
 pub(super) fn replay_reduce_only_restore(
@@ -4180,7 +4185,7 @@ pub(super) fn replay_reduce_only_restore(
             Side::Buy => &*buy_entries,
             Side::Sell => &*sell_entries,
         };
-        let Some(eviction) = crate::reduce_only::next_eviction(pos, list, side) else {
+        let Some(eviction) = crate::trading::reduce_only::next_eviction(pos, list, side) else {
             return Ok(evicted);
         };
         let victim = eviction.entry;

@@ -1659,14 +1659,14 @@ impl MatchRegistry {
         // side.
         //
         // Not mid-walk, on purpose — admission already guarantees a reduce-only order is fully
-        // coverable at the moment the walk reaches it. See `crate::reduce_only::restore`.
+        // coverable at the moment the walk reaches it. See `crate::trading::reduce_only::restore`.
         //
         // ⚠️ The TAKER's gates were measured AFTER this pass, not before it: `finalize_compute` and
         // `taker_rest_basis` replay it on copies (`post_flush_snapshot`). Moving it, or adding a
         // trigger here, has to move that replay with it — `rest_in_book`'s basis assertion is what
         // notices when the two disagree.
         for user in touched {
-            crate::reduce_only::restore_both_sides(
+            crate::trading::reduce_only::restore_both_sides(
                 context,
                 user,
                 market,
@@ -2243,7 +2243,8 @@ pub(super) fn settle_maker_fill_core(
     let fill = split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market)?;
     // ── reduce-only watchdog (maker side) ────────────────────────────────────────────────────
     //
-    // NOT a clamp. `crate::reduce_only`'s prefix condition at ADMISSION is what guarantees this,
+    // NOT a clamp. `crate::trading::reduce_only`'s prefix condition at ADMISSION is what guarantees
+    // this,
     // and the whole design rests on that guarantee: it is why the fill path needs no per-fill
     // clamp and why eviction does not have to run mid-walk. If this ever fires, the predicate or
     // one of its evaluation points is wrong, and clamping here would hide that.

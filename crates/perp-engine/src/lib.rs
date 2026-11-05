@@ -18,7 +18,6 @@
 //! codec, keys, block commitment).
 
 pub mod account;
-pub mod algo;
 pub mod batch;
 pub mod call;
 /// Derived event payloads — the single `PositionChanged` derivation shared by all seven emit
@@ -27,7 +26,6 @@ mod events;
 pub mod funding;
 pub mod host;
 pub mod interface;
-pub mod reduce_only;
 pub mod margin_type;
 pub mod margin_view;
 /// The independent cross-margin P0/P1 spec suite (`SPEC_cross_margin.md`).
@@ -73,8 +71,6 @@ mod fixture_export_tests;
 pub mod risk;
 pub mod storage;
 pub mod trading;
-/// Trailing stops (`TRAILING_STOP_MARKET`): the grouped-lazy per-market structure and its sweeps.
-pub mod trailing;
 
 pub use call::{run_perp_dex_call, PerpOutput};
 pub use host::{InMemoryHost, PerpHost};

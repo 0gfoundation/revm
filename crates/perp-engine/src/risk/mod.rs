@@ -1747,7 +1747,7 @@ fn run_deferred_sweeps<H: PerpHost>(
     // A peak the budget skipped would make a stop fire later than it should, and a skipped tick
     // can never be replayed, so this is the one leg that always runs in full. It is idempotent at
     // a fixed `(seq, mark)`, which is what lets the drain call this whole function again.
-    crate::trailing::on_mark(context, market_id, seq, mark_price)?;
+    crate::trading::algo::trailing::on_mark(context, market_id, seq, mark_price)?;
 
     let gc_deferred = run_out_of_band_expiry_sweep(context, market_id, market)?;
 
@@ -1779,12 +1779,24 @@ fn run_deferred_sweeps<H: PerpHost>(
     // peak at that mark), exactly as for work a budget left undrained.
     let (trigger_deferred, trailing_deferred, activation_deferred) = if market.active {
         let trigger_deferred =
-            crate::algo::run_trigger_sweep(context, market_id, market, mark_price, &mut budget)?;
+            crate::trading::algo::run_trigger_sweep(
+                context,
+                market_id,
+                market,
+                mark_price,
+                &mut budget,
+            )?;
         // Trailing fires share the pot, after the fixed triggers (no price-priority merge between
         // the two: it would only matter on overflow, which the drain finishes at the same mark). A
         // SEPARATE call, because the fixed sweep returns early when the budget runs out.
         let trailing_deferred =
-            crate::trailing::run_fire_sweep(context, market_id, market, mark_price, &mut budget)?;
+            crate::trading::algo::trailing::run_fire_sweep(
+                context,
+                market_id,
+                market,
+                mark_price,
+                &mut budget,
+            )?;
         // Activations on their OWN cap: a crowd of crossing activation prices must not spend the
         // budget stop-losses and liquidations need. AFTER the fire walk, and the order is
         // load-bearing: a fire in this tick can END a position — as the taker, or as the maker
@@ -1793,8 +1805,9 @@ fn run_deferred_sweeps<H: PerpHost>(
         // instead of activating it on a position that no longer exists. (L4 — a new activation
         // cannot fire on its own tick — covers only the other direction: nothing activated here
         // could have fired in the walk above.) Pinned by `kill_t19_*` in the trailing spec suite.
-        let mut activation_cap = crate::trailing::MAX_TRAILING_ACTIVATIONS_PER_UPDATE;
-        let activation_deferred = crate::trailing::run_activation_sweep(
+        let mut activation_cap =
+            crate::trading::algo::trailing::MAX_TRAILING_ACTIVATIONS_PER_UPDATE;
+        let activation_deferred = crate::trading::algo::trailing::run_activation_sweep(
             context,
             market_id,
             market,
@@ -2333,7 +2346,9 @@ pub(crate) fn cancel_all_orders_for_market<H: PerpHost>(
     // walk runs inside an already-capped sweep.
     for algo_id in storage::load_user_algo_orders(context, user, market_id)? {
         if let Some(order) = storage::load_order(context, &algo_id)? {
-            crate::algo::remove_algo_order(context, user, market_id, &algo_id, &order, reason)?;
+            crate::trading::algo::remove_algo_order(
+                context, user, market_id, &algo_id, &order, reason,
+            )?;
         }
     }
 

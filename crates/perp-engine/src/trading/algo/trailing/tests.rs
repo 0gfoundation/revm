@@ -145,8 +145,12 @@ fn try_place(
     cb: u64,
     qty: u64,
 ) -> Result<Id, PerpError> {
-    crate::algo::run_place_algo_order(&trailing_call(side, activation, cb, qty, RO), owner, h)
-        .map(|b| b[..32].try_into().unwrap())
+    crate::trading::algo::run_place_algo_order(
+        &trailing_call(side, activation, cb, qty, RO),
+        owner,
+        h,
+    )
+    .map(|b| b[..32].try_into().unwrap())
 }
 
 fn place(h: &mut InMemoryHost, owner: Address, side: Side, activation: u64, cb: u16) -> Id {
@@ -154,7 +158,7 @@ fn place(h: &mut InMemoryHost, owner: Address, side: Side, activation: u64, cb: 
 }
 
 fn cancel(h: &mut InMemoryHost, owner: Address, id: &Id) {
-    crate::algo::run_cancel_algo_order(
+    crate::trading::algo::run_cancel_algo_order(
         &cancelAlgoOrderCall { algoId: (*id).into(), marketId: MKT }.abi_encode(),
         owner,
         h,
@@ -163,7 +167,7 @@ fn cancel(h: &mut InMemoryHost, owner: Address, id: &Id) {
 }
 
 fn view(h: &mut InMemoryHost, id: &Id) -> crate::interface::IPerpDex::getAlgoOrderReturn {
-    let ret = crate::algo::run_get_algo_order(
+    let ret = crate::trading::algo::run_get_algo_order(
         &getAlgoOrderCall { algoId: (*id).into() }.abi_encode(),
         h,
     )
@@ -172,7 +176,7 @@ fn view(h: &mut InMemoryHost, id: &Id) -> crate::interface::IPerpDex::getAlgoOrd
 }
 
 fn open_algo_orders(h: &mut InMemoryHost, u: Address) -> BTreeSet<Id> {
-    let ret = crate::algo::run_get_open_algo_orders(
+    let ret = crate::trading::algo::run_get_open_algo_orders(
         &getOpenAlgoOrdersCall { user: u, marketId: MKT }.abi_encode(),
         h,
     )
@@ -919,7 +923,7 @@ impl World {
         for _ in 0..self.r.below(5) {
             let u = self.r.pick(&self.users);
             if self.m.orders.values().filter(|o| o.owner == u).count()
-                >= crate::algo::MAX_ALGO_ORDERS_PER_MARKET
+                >= crate::trading::algo::MAX_ALGO_ORDERS_PER_MARKET
             {
                 continue;
             }
@@ -1118,7 +1122,7 @@ fn differential_through_the_oracle_path() {
 fn decline(d: usize) -> (InMemoryHost, u64, u64) {
     let m0: u64 = 10_000_000;
     let mut h = new_host(m0);
-    let users = d.div_ceil(crate::algo::MAX_ALGO_ORDERS_PER_MARKET);
+    let users = d.div_ceil(crate::trading::algo::MAX_ALGO_ORDERS_PER_MARKET);
     for i in 0..users {
         seed_position(&mut h, user(i), POS, m0);
     }
@@ -1129,7 +1133,13 @@ fn decline(d: usize) -> (InMemoryHost, u64, u64) {
         set_mark(&mut h, seq, mark);
         let p = run_legs(&mut h, seq, mark, 50, MAX_TRAILING_ACTIVATIONS_PER_UPDATE);
         assert!(p.fired.is_empty());
-        place(&mut h, user(k / crate::algo::MAX_ALGO_ORDERS_PER_MARKET), Side::Sell, 0, 1000);
+        place(
+            &mut h,
+            user(k / crate::trading::algo::MAX_ALGO_ORDERS_PER_MARKET),
+            Side::Sell,
+            0,
+            1000,
+        );
         if k % 512 == 0 {
             h.end_block();
         }
@@ -1404,14 +1414,14 @@ fn placement_refusals() {
     for (call, want) in cases {
         let writes = h.perp_write_count();
         let nonce = storage::load_user_nonce(&mut h, u).unwrap();
-        let e = crate::algo::run_place_algo_order(&call, u, &mut h).unwrap_err();
+        let e = crate::trading::algo::run_place_algo_order(&call, u, &mut h).unwrap_err();
         assert!(format!("{e:?}").contains(want), "want {want:?}, got {e:?}");
         assert_eq!(h.perp_write_count(), writes, "{want}: write-clean");
         assert_eq!(storage::load_user_nonce(&mut h, u).unwrap(), nonce);
     }
     let mut tif = placeAlgoOrderCall::abi_decode(&trailing_call(Side::Sell, 0, 100, 1, RO)).unwrap();
     tif.tif = 1;
-    let e = crate::algo::run_place_algo_order(&tif.abi_encode(), u, &mut h).unwrap_err();
+    let e = crate::trading::algo::run_place_algo_order(&tif.abi_encode(), u, &mut h).unwrap_err();
     assert!(format!("{e:?}").contains("tif is unused"), "{e:?}");
     // BUY mirror of the wrong-side activation, and a flat owner.
     let e = try_place(&mut h, user(BOB), Side::Buy, 20_000, 100, 1).unwrap_err();
@@ -1419,7 +1429,7 @@ fn placement_refusals() {
     let e = try_place(&mut h, user(7), Side::Sell, 0, 100, 1).unwrap_err();
     assert!(format!("{e:?}").contains("requires an open position"), "{e:?}");
     // Counted in the 32 conditional orders.
-    for _ in 0..crate::algo::MAX_ALGO_ORDERS_PER_MARKET {
+    for _ in 0..crate::trading::algo::MAX_ALGO_ORDERS_PER_MARKET {
         place(&mut h, u, Side::Sell, 0, 100);
     }
     let e = try_place(&mut h, u, Side::Sell, 0, 100, 1).unwrap_err();
@@ -1569,7 +1579,7 @@ fn fixed_triggers_spend_the_shared_budget_first() {
     seed_position(&mut h, u, POS, 20_000);
     let mut fixed = Vec::new();
     for _ in 0..30 {
-        let out = crate::algo::run_place_algo_order(
+        let out = crate::trading::algo::run_place_algo_order(
             &placeAlgoOrderCall {
                 algoType: 0,
                 marketId: MKT,
@@ -1626,7 +1636,7 @@ fn a_deferred_fire_that_nobody_drained_is_retested() {
 #[test]
 fn a_fixed_conditional_reports_no_trailing_fields() {
     let mut h = scenario(20_000);
-    let out = crate::algo::run_place_algo_order(
+    let out = crate::trading::algo::run_place_algo_order(
         &placeAlgoOrderCall {
             algoType: 0,
             marketId: MKT,
@@ -1692,7 +1702,7 @@ fn the_signed_path_places_a_trailing_stop() {
     m.push(0);
     assert_eq!(m.len(), 114);
     let sig = sk.sign(&m).to_bytes();
-    let out = crate::algo::run_place_algo_order_signed(
+    let out = crate::trading::algo::run_place_algo_order_signed(
         &placeAlgoOrderSignedCall {
             account: u,
             algoType: 0,

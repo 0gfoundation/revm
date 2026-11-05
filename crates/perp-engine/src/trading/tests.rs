@@ -17315,7 +17315,8 @@ mod signed_replay {
 
 // ── reduce-only, end to end ──────────────────────────────────────────────────────
 //
-// The unit tests in `crate::reduce_only` pin the predicate as arithmetic. These drive it through
+// The unit tests in `crate::trading::reduce_only` pin the predicate as arithmetic. These drive it
+// through
 // the real selector: admission, silent truncation, and the eviction trigger that has nothing to do
 // with the position (a normal order resting AHEAD).
 #[cfg(test)]
@@ -17906,7 +17907,7 @@ mod open_order_cap {
     use super::batch_cancel::{decode_statuses, expect};
     use super::*;
     use crate::{
-        algo::{MAX_ALGO_ORDERS_PER_MARKET, MAX_OPEN_ORDERS_PER_MARKET},
+        trading::algo::{MAX_ALGO_ORDERS_PER_MARKET, MAX_OPEN_ORDERS_PER_MARKET},
         batch::{PerpBatchReason, PerpBatchTag},
         interface::IPerpDex::{batchPlaceOrdersCall, placeAlgoOrderCall, PlaceItem},
         types::AlgoOrderType,

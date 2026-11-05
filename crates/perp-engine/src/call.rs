@@ -896,20 +896,20 @@ pub(crate) fn dispatch<H: PerpHost>(
         }
         // Conditional (algo) orders
         s if s == placeAlgoOrderCall::SELECTOR => {
-            crate::algo::run_place_algo_order(input_bytes, caller, context)
+            crate::trading::algo::run_place_algo_order(input_bytes, caller, context)
         }
         s if s == cancelAlgoOrderCall::SELECTOR => {
-            crate::algo::run_cancel_algo_order(input_bytes, caller, context)
+            crate::trading::algo::run_cancel_algo_order(input_bytes, caller, context)
         }
-        s if s == getAlgoOrderCall::SELECTOR => crate::algo::run_get_algo_order(input_bytes, context),
+        s if s == getAlgoOrderCall::SELECTOR => crate::trading::algo::run_get_algo_order(input_bytes, context),
         s if s == getOpenAlgoOrdersCall::SELECTOR => {
-            crate::algo::run_get_open_algo_orders(input_bytes, context)
+            crate::trading::algo::run_get_open_algo_orders(input_bytes, context)
         }
         s if s == placeAlgoOrderSignedCall::SELECTOR => {
-            crate::algo::run_place_algo_order_signed(input_bytes, context)
+            crate::trading::algo::run_place_algo_order_signed(input_bytes, context)
         }
         s if s == cancelAlgoOrderSignedCall::SELECTOR => {
-            crate::algo::run_cancel_algo_order_signed(input_bytes, context)
+            crate::trading::algo::run_cancel_algo_order_signed(input_bytes, context)
         }
         s if s == drainDeferredWorkCall::SELECTOR => run_drain_deferred_work(input_bytes, context),
         s if s == getIndexPriceCall::SELECTOR => run_get_index_price(input_bytes, context),

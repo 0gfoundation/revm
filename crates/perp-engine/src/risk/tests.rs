@@ -7605,7 +7605,7 @@ mod algo_order_admission {
         working_type: u8,
         flags: u8,
     ) -> Result<Bytes, PerpError> {
-        crate::algo::run_place_algo_order(
+        crate::trading::algo::run_place_algo_order(
             &placeAlgoOrderCall {
                 algoType: 0,
                 marketId: MARKET_ID,
@@ -7653,7 +7653,7 @@ mod algo_order_admission {
         assert!(storage::load_bid_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
         assert!(storage::load_ask_prices(&mut ctx, MARKET_ID).unwrap().is_empty());
 
-        crate::algo::run_cancel_algo_order(
+        crate::trading::algo::run_cancel_algo_order(
             &cancelAlgoOrderCall { algoId: FixedBytes(algo_id), marketId: MARKET_ID }.abi_encode(),
             ALICE,
             &mut ctx,
@@ -7706,7 +7706,8 @@ mod algo_order_admission {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
         let bad = |ctx: &mut TestCtx, c: placeAlgoOrderCall, want: &str| {
-            let e = crate::algo::run_place_algo_order(&c.abi_encode(), ALICE, ctx).unwrap_err();
+            let e = crate::trading::algo::run_place_algo_order(&c.abi_encode(), ALICE, ctx)
+                .unwrap_err();
             assert!(format!("{e:?}").contains(want), "want {want:?}, got {e:?}");
         };
         let base = placeAlgoOrderCall {
@@ -7760,7 +7761,7 @@ mod algo_order_admission {
     fn the_per_market_cap_is_enforced() {
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
-        for i in 0..crate::algo::MAX_ALGO_ORDERS_PER_MARKET {
+        for i in 0..crate::trading::algo::MAX_ALGO_ORDERS_PER_MARKET {
             // All below the $100 mark, so none would trigger immediately.
             place(
                 &mut ctx,
@@ -7819,7 +7820,7 @@ mod algo_trigger_sweep {
     const CP: u8 = 2;
 
     fn stop_market(ctx: &mut TestCtx, user: Address, trigger: u64, qty: u64) -> [u8; 32] {
-        let out = crate::algo::run_place_algo_order(
+        let out = crate::trading::algo::run_place_algo_order(
             &placeAlgoOrderCall {
                 algoType: 0,
                 marketId: MARKET_ID,
@@ -7933,7 +7934,7 @@ mod algo_trigger_sweep {
         qty: u64,
         flags: u8,
     ) -> [u8; 32] {
-        let out = crate::algo::run_place_algo_order(
+        let out = crate::trading::algo::run_place_algo_order(
             &placeAlgoOrderCall {
                 algoType: 0,
                 marketId: MARKET_ID,
@@ -8022,7 +8023,7 @@ mod algo_trigger_sweep {
                 .flags
             });
         assert_eq!(placed, Some(flags), "AlgoOrderPlaced echoes the raw (= canonical) byte");
-        let ret = crate::algo::run_get_algo_order(
+        let ret = crate::trading::algo::run_get_algo_order(
             &getAlgoOrderCall { algoId: id.into() }.abi_encode(),
             &mut ctx,
         )
@@ -8064,7 +8065,7 @@ mod algo_trigger_sweep {
     /// `debug_assert!` pins the invariant that makes the skip safe.
     #[test]
     fn a_trigger_at_the_open_order_cap_still_rests() {
-        use crate::algo::MAX_OPEN_ORDERS_PER_MARKET;
+        use crate::trading::algo::MAX_OPEN_ORDERS_PER_MARKET;
         let mut ctx = make_ctx();
         setup_market(&mut ctx);
         seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, 100_000_000_000);
@@ -8352,7 +8353,7 @@ mod algo_fire_capacity {
         tif: TimeInForce,
         flags: u8,
     ) -> [u8; 32] {
-        let out = crate::algo::run_place_algo_order(
+        let out = crate::trading::algo::run_place_algo_order(
             &placeAlgoOrderCall {
                 algoType: 0,
                 marketId: MARKET_ID,
@@ -8576,7 +8577,7 @@ mod close_position_parity {
         qty: u64,
         flags: u8,
     ) -> Result<[u8; 32], PerpError> {
-        crate::algo::run_place_algo_order(
+        crate::trading::algo::run_place_algo_order(
             &placeAlgoOrderCall {
                 algoType: 0,
                 marketId: MARKET_ID,
@@ -9009,7 +9010,7 @@ mod algo_order_signed {
         let bad = RO | 0b1100;
         let sig = sk.sign(&msg_flags(chain_id, ALICE, 8_000, QTY as u64, bad)).to_bytes();
         let writes = JournalTr::perp_write_count(ctx.journal_mut());
-        let e = crate::algo::run_place_algo_order_signed(
+        let e = crate::trading::algo::run_place_algo_order_signed(
             &calldata_flags(&sig, 8_000, QTY as u64, ALICE, bad),
             &mut ctx,
         )
@@ -9019,7 +9020,7 @@ mod algo_order_signed {
 
         let good = RO | crate::types::StpMode::ExpireTaker.to_flags();
         let sig = sk.sign(&msg_flags(chain_id, ALICE, 8_000, QTY as u64, good)).to_bytes();
-        let out = crate::algo::run_place_algo_order_signed(
+        let out = crate::trading::algo::run_place_algo_order_signed(
             &calldata_flags(&sig, 8_000, QTY as u64, ALICE, good),
             &mut ctx,
         )
@@ -9046,7 +9047,7 @@ mod algo_order_signed {
         let chain_id = ctx.chain_id();
         let submit = |ctx: &mut TestCtx, trigger: u64, qty: u64, flags: u8| {
             let sig = sk.sign(&msg_flags(chain_id, ALICE, trigger, qty, flags)).to_bytes();
-            crate::algo::run_place_algo_order_signed(
+            crate::trading::algo::run_place_algo_order_signed(
                 &calldata_flags(&sig, trigger, qty, ALICE, flags),
                 ctx,
             )
@@ -9095,7 +9096,7 @@ mod algo_order_signed {
         let sig = sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes();
 
         // Submitted by someone who is NOT the owner — that is the whole point of the signed path.
-        crate::algo::run_place_algo_order_signed(&calldata(&sig, 8_000, QTY as u64, ALICE), &mut ctx)
+        crate::trading::algo::run_place_algo_order_signed(&calldata(&sig, 8_000, QTY as u64, ALICE), &mut ctx)
             .unwrap();
 
         assert_eq!(
@@ -9118,7 +9119,7 @@ mod algo_order_signed {
         let other_chain = ctx.chain_id() ^ 1;
         let sig = sk.sign(&msg(other_chain, ALICE, 8_000, QTY as u64)).to_bytes();
 
-        let e = crate::algo::run_place_algo_order_signed(
+        let e = crate::trading::algo::run_place_algo_order_signed(
             &calldata(&sig, 8_000, QTY as u64, ALICE),
             &mut ctx,
         )
@@ -9138,7 +9139,7 @@ mod algo_order_signed {
         let chain_id = ctx.chain_id();
         let sig = sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes();
 
-        let e = crate::algo::run_place_algo_order_signed(
+        let e = crate::trading::algo::run_place_algo_order_signed(
             &calldata(&sig, 8_000, QTY as u64 * 2, ALICE),
             &mut ctx,
         )
@@ -9189,7 +9190,7 @@ mod algo_order_signed {
         register(&mut ctx, ALICE, &sk);
         let chain_id = ctx.chain_id();
         let place_sig = sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes();
-        let out = crate::algo::run_place_algo_order_signed(
+        let out = crate::trading::algo::run_place_algo_order_signed(
             &calldata(&place_sig, 8_000, QTY as u64, ALICE),
             &mut ctx,
         )
@@ -9197,8 +9198,11 @@ mod algo_order_signed {
         let algo_id: [u8; 32] = out[..32].try_into().unwrap();
 
         let sig = sk.sign(&cancel_msg(chain_id, ALICE, algo_id)).to_bytes();
-        crate::algo::run_cancel_algo_order_signed(&cancel_calldata(&sig, ALICE, algo_id), &mut ctx)
-            .unwrap();
+        crate::trading::algo::run_cancel_algo_order_signed(
+            &cancel_calldata(&sig, ALICE, algo_id),
+            &mut ctx,
+        )
+        .unwrap();
 
         assert!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().is_empty());
         assert!(
@@ -9231,7 +9235,7 @@ mod algo_order_signed {
 
         let place = |ctx: &mut TestCtx, trigger: u64| -> [u8; 32] {
             let sig = sk.sign(&msg(chain_id, ALICE, trigger, QTY as u64)).to_bytes();
-            let out = crate::algo::run_place_algo_order_signed(
+            let out = crate::trading::algo::run_place_algo_order_signed(
                 &calldata(&sig, trigger, QTY as u64, ALICE),
                 ctx,
             )
@@ -9244,7 +9248,7 @@ mod algo_order_signed {
 
         // Authority to cancel `signed_for`, aimed at `victim`.
         let sig = sk.sign(&cancel_msg(chain_id, ALICE, signed_for)).to_bytes();
-        let e = crate::algo::run_cancel_algo_order_signed(
+        let e = crate::trading::algo::run_cancel_algo_order_signed(
             &cancel_calldata(&sig, ALICE, victim),
             &mut ctx,
         )
@@ -9264,7 +9268,7 @@ mod algo_order_signed {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         register(&mut ctx, ALICE, &sk);
         let chain_id = ctx.chain_id();
-        let a = crate::algo::run_place_algo_order_signed(
+        let a = crate::trading::algo::run_place_algo_order_signed(
             &calldata(&sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes(), 8_000, QTY as u64, ALICE),
             &mut ctx,
         )
@@ -9272,7 +9276,7 @@ mod algo_order_signed {
         let algo_id: [u8; 32] = a[..32].try_into().unwrap();
 
         let sig = sk.sign(&cancel_msg(chain_id ^ 1, ALICE, algo_id)).to_bytes();
-        let e = crate::algo::run_cancel_algo_order_signed(
+        let e = crate::trading::algo::run_cancel_algo_order_signed(
             &cancel_calldata(&sig, ALICE, algo_id),
             &mut ctx,
         )
@@ -9291,7 +9295,7 @@ mod algo_order_signed {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         register(&mut ctx, ALICE, &sk);
         let chain_id = ctx.chain_id();
-        let a = crate::algo::run_place_algo_order_signed(
+        let a = crate::trading::algo::run_place_algo_order_signed(
             &calldata(&sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes(), 8_000, QTY as u64, ALICE),
             &mut ctx,
         )
@@ -9300,8 +9304,8 @@ mod algo_order_signed {
         let sig = sk.sign(&cancel_msg(chain_id, ALICE, algo_id)).to_bytes();
         let data = cancel_calldata(&sig, ALICE, algo_id);
 
-        crate::algo::run_cancel_algo_order_signed(&data, &mut ctx).unwrap();
-        let e = crate::algo::run_cancel_algo_order_signed(&data, &mut ctx).unwrap_err();
+        crate::trading::algo::run_cancel_algo_order_signed(&data, &mut ctx).unwrap();
+        let e = crate::trading::algo::run_cancel_algo_order_signed(&data, &mut ctx).unwrap_err();
         assert!(format!("{e:?}").contains("duplicate signature"), "got {e:?}");
 
         // A different, valid signature over the same cancel (one second later, still inside the
@@ -9319,7 +9323,7 @@ mod algo_order_signed {
             signature: sk.sign(&m).to_bytes().to_vec().into(),
         }
         .abi_encode();
-        let e = crate::algo::run_cancel_algo_order_signed(&fresh, &mut ctx).unwrap_err();
+        let e = crate::trading::algo::run_cancel_algo_order_signed(&fresh, &mut ctx).unwrap_err();
         assert!(format!("{e:?}").contains("not found"), "got {e:?}");
     }
 
@@ -9336,8 +9340,8 @@ mod algo_order_signed {
         let sig = sk.sign(&msg(chain_id, ALICE, 8_000, QTY as u64)).to_bytes();
         let data = calldata(&sig, 8_000, QTY as u64, ALICE);
 
-        crate::algo::run_place_algo_order_signed(&data, &mut ctx).unwrap();
-        let e = crate::algo::run_place_algo_order_signed(&data, &mut ctx).unwrap_err();
+        crate::trading::algo::run_place_algo_order_signed(&data, &mut ctx).unwrap();
+        let e = crate::trading::algo::run_place_algo_order_signed(&data, &mut ctx).unwrap_err();
         assert!(format!("{e:?}").contains("duplicate signature"), "got {e:?}");
         assert_eq!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(), 1);
     }
@@ -9364,7 +9368,7 @@ mod algo_trigger_rejected {
 
     /// A reduce-only limit STOP sell for ALICE at `price` with `tif`, firing at mark <= 9_900.
     fn arm(ctx: &mut TestCtx, price: u64, tif: TimeInForce) -> [u8; 32] {
-        let out = crate::algo::run_place_algo_order(
+        let out = crate::trading::algo::run_place_algo_order(
             &placeAlgoOrderCall {
                 algoType: 0,
                 marketId: MARKET_ID,
@@ -9558,7 +9562,7 @@ mod algo_stp {
     /// `price == 0`), firing at mark <= 9_900, carrying `mode`.
     fn arm(ctx: &mut TestCtx, price: u64, tif: TimeInForce, mode: StpMode) -> [u8; 32] {
         let order_type = if price == 0 { AlgoOrderType::StopMarket } else { AlgoOrderType::Stop };
-        let out = crate::algo::run_place_algo_order(
+        let out = crate::trading::algo::run_place_algo_order(
             &placeAlgoOrderCall {
                 algoType: 0,
                 marketId: MARKET_ID,

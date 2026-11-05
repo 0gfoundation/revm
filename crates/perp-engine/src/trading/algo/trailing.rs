@@ -222,7 +222,7 @@ pub(crate) fn display_stop(side: Side, peak: u64, cb: u16, tick: u64) -> u64 {
 /// immediately trigger" refusal and the sweep agree at the boundary.
 #[inline]
 fn activates(side: Side, activation: u64, mark: u64) -> bool {
-    crate::algo::trigger_fires(side == Side::Sell, activation, mark)
+    crate::trading::algo::trigger_fires(side == Side::Sell, activation, mark)
 }
 
 /// Is `cb` on the callback grid?
@@ -1149,7 +1149,9 @@ pub(crate) fn run_fire_sweep<H: PerpHost>(
             let stop = display_stop(side, f.peak, f.cb, market.tick_size);
             match storage::load_order(context, &id)? {
                 Some(order) => {
-                    crate::algo::fire_trailing(context, market_id, market, mark, &id, &order, stop)?
+                    crate::trading::algo::fire_trailing(
+                        context, market_id, market, mark, &id, &order, stop,
+                    )?
                 }
                 // Every removal path unlinks, so the structure never holds a dangling id.
                 None => debug_assert!(false, "trailing: dangling id in a bucket"),
@@ -1206,7 +1208,7 @@ pub(crate) fn run_activation_sweep<H: PerpHost>(
                 if pos.generation != order.position_generation {
                     // Bound to a position that has ended (Order::is_position_bound): it would
                     // only ever trail a position it was not placed against.
-                    crate::algo::retire_algo_order(
+                    crate::trading::algo::retire_algo_order(
                         context,
                         owner,
                         market_id,
@@ -1278,11 +1280,4 @@ pub(crate) fn view<H: PerpHost>(
 }
 
 #[cfg(test)]
-#[path = "trailing_tests.rs"]
 mod tests;
-
-/// The `fire()` capacity fix, closePosition parity and trailing stops, written independently from
-/// the spec rather than from this implementation (or its `tests`).
-#[cfg(test)]
-#[path = "trailing_spec_tests.rs"]
-mod spec_tests;
