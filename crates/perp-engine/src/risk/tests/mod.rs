@@ -7578,11 +7578,6 @@ mod liquidation_cap {
     }
 }
 
-/// `drainDeferredWork` — the permissionless drain for work a capped sweep left behind.
-/// The algo-order trigger index. Its SORT DIRECTIONS are load-bearing, not cosmetic: the sweep
-/// walks each list from the front and stops at the first price that does not fire, which is what
-/// makes the scan cost proportional to how far the mark moved instead of to how many algo orders
-/// exist. Get a direction backwards and the sweep either fires nothing or walks everything.
 /// `placeAlgoOrder` admission. Every rejection here is a rejection Binance would also make, or a
 /// deliberate, documented divergence — there are no "we did not get round to it" errors.
 mod algo_order_admission {
@@ -9753,6 +9748,10 @@ mod algo_stp {
     }
 }
 
+/// The algo-order trigger index. Its SORT DIRECTIONS are load-bearing, not cosmetic: the sweep
+/// walks each list from the front and stops at the first price that does not fire, which is what
+/// makes the scan cost proportional to how far the mark moved instead of to how many algo orders
+/// exist. Get a direction backwards and the sweep either fires nothing or walks everything.
 mod algo_trigger_index {
     use super::*;
 
@@ -9841,6 +9840,7 @@ mod algo_trigger_index {
     }
 }
 
+/// `drainDeferredWork` — the permissionless drain for work a capped sweep left behind.
 mod deferred_work_drain {
     use super::liquidation_cap::*;
     use super::*;
