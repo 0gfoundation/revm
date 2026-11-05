@@ -17820,7 +17820,7 @@ mod reduce_only_e2e {
 // against the real message lengths, so the fourth time is caught by `cargo test`.
 #[cfg(test)]
 mod abi_message_layout {
-    const IFACE: &str = include_str!("../interface.rs");
+    const IFACE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/interface.rs"));
 
     /// Sum of the declared field widths for the `Message:` block naming `prefix`.
     ///
