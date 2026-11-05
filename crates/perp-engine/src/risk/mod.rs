@@ -6,6 +6,9 @@ use crate::host::PerpHost;
 use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 
 use crate::{
+    account::signing::{
+        check_api_key_expiry, check_recv_window, gc_seen_buckets_best_effort, verify_ed25519,
+    },
         errors::perp_err,
     events::emit_position_changed,
     risk::funding::{apply_funding_settlement, compute_funding_settlement},
@@ -28,11 +31,7 @@ use crate::{
         max_notional_for_leverage, tier_mmr_below_initial, tier_mmr_not_above, FUNDING_RATE_ONE,
     },
     storage,
-    trading::{
-        check_api_key_expiry, check_recv_window, execute_liquidation_market_order,
-        gc_seen_buckets_best_effort, run_adl,
-        verify_ed25519,
-    },
+    trading::{execute_liquidation_market_order, run_adl},
     types::{
         AccountUpdateReason, CancelReason, FundingState, IndexModeState, IndexPriceState,
         MarginTier, MarginTiers,
@@ -571,17 +570,17 @@ pub fn run_set_leverage_signed<H: PerpHost>(
     //   "perpdex_v1_leverage" || chainId(8) || account(20) || marketId(8) || leverage(8)
     //   || timestamp(8) || recvWindow(8) || keyId(1)
     let mut msg = [0u8; 80];
-    let mut c = crate::trading::write_signed_header(
+    let mut c = crate::account::signing::write_signed_header(
         &mut msg,
         b"perpdex_v1_leverage",
         context.chain_id(),
     );
-    c = crate::trading::put(&mut msg, c, args.account.as_slice());
-    c = crate::trading::put(&mut msg, c, &args.marketId.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &args.leverage.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &args.timestamp.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &args.recvWindow.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[args.keyId]);
+    c = crate::account::signing::put(&mut msg, c, args.account.as_slice());
+    c = crate::account::signing::put(&mut msg, c, &args.marketId.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &args.leverage.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &args.timestamp.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &args.recvWindow.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[args.keyId]);
     debug_assert_eq!(c, msg.len(), "setLeverageSigned message layout");
 
     verify_ed25519(&api_key.pubkey, &msg, &args.signature)

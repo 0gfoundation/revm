@@ -30,11 +30,13 @@ use alloy_sol_types::SolCall;
 use primitives::{keccak256, Address, Bytes, Log};
 
 use crate::{
+    account::signing::{
+        check_api_key_expiry, check_recv_window, gc_seen_buckets_best_effort, verify_ed25519,
+    },
     errors::perp_err,
     host::PerpHost,
     interface::IPerpDex::{self, setMarginTypeCall, setMarginTypeSignedCall},
     storage,
-    trading::{check_api_key_expiry, check_recv_window, gc_seen_buckets_best_effort, verify_ed25519},
     types::{MarginType, PerpPosition, CROSS_MARGIN_ENABLED},
     PerpError, PERP_DEX_ADDRESS,
 };
@@ -214,17 +216,17 @@ pub fn run_set_margin_type_signed<H: PerpHost>(
     //   "perpdex_v1_margintype" || chainId(8) || account(20) || marketId(8) || marginType(1)
     //   || timestamp(8) || recvWindow(8) || keyId(1)
     let mut msg = [0u8; 75];
-    let mut c = crate::trading::write_signed_header(
+    let mut c = crate::account::signing::write_signed_header(
         &mut msg,
         b"perpdex_v1_margintype",
         context.chain_id(),
     );
-    c = crate::trading::put(&mut msg, c, args.account.as_slice());
-    c = crate::trading::put(&mut msg, c, &args.marketId.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[args.marginType]);
-    c = crate::trading::put(&mut msg, c, &args.timestamp.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &args.recvWindow.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[args.keyId]);
+    c = crate::account::signing::put(&mut msg, c, args.account.as_slice());
+    c = crate::account::signing::put(&mut msg, c, &args.marketId.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[args.marginType]);
+    c = crate::account::signing::put(&mut msg, c, &args.timestamp.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &args.recvWindow.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[args.keyId]);
     debug_assert_eq!(c, msg.len(), "setMarginTypeSigned message layout");
 
     verify_ed25519(&api_key.pubkey, &msg, &args.signature)

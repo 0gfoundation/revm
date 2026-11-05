@@ -10,6 +10,7 @@ use crate::{
     interface::IPerpDex::{
         batchPlaceOrdersCall, batchPlaceOrdersSignedCall, OrderPlaced, PlaceItem, Trade,
     },
+    types::ApiKey,
     PLACE_ORDER_GAS,
     PerpError,
 };

@@ -1,6 +1,7 @@
 pub mod api_key;
 pub mod deposit_withdraw;
 pub mod fee;
+pub(crate) mod signing;
 pub mod sub_account;
 
 pub use api_key::{run_get_api_key, run_get_api_keys, run_register_api_key, run_revoke_api_key};

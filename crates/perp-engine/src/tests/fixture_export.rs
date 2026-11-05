@@ -866,7 +866,7 @@ mod isolated_golden {
     }
 
     fn signed_place(sk: &SigningKey, side: u8, price: u64, qty: u64, client: [u8; 16]) -> Vec<u8> {
-        use crate::trading::{put, write_signed_header};
+        use crate::account::signing::{put, write_signed_header};
         let mut msg = [0u8; 105];
         let mut c = write_signed_header(&mut msg, b"perpdex_v1_order", CHAIN_ID);
         c = put(&mut msg, c, ALICE.as_slice());
@@ -899,7 +899,7 @@ mod isolated_golden {
     }
 
     fn signed_cancel(sk: &SigningKey, order_id: Id) -> Vec<u8> {
-        use crate::trading::{put, write_signed_header};
+        use crate::account::signing::{put, write_signed_header};
         let mut msg = [0u8; 102];
         let mut c = write_signed_header(&mut msg, b"perpdex_v1_cancel", CHAIN_ID);
         c = put(&mut msg, c, ALICE.as_slice());
@@ -922,7 +922,7 @@ mod isolated_golden {
     }
 
     fn signed_leverage(sk: &SigningKey, leverage: u64) -> Vec<u8> {
-        use crate::trading::{put, write_signed_header};
+        use crate::account::signing::{put, write_signed_header};
         let mut msg = [0u8; 80];
         let mut c = write_signed_header(&mut msg, b"perpdex_v1_leverage", CHAIN_ID);
         c = put(&mut msg, c, ALICE.as_slice());

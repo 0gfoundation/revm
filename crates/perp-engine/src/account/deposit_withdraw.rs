@@ -6,6 +6,9 @@ use crate::host::PerpHost;
 use primitives::{keccak256, Address, Bytes, Log, U256};
 
 use crate::{
+    account::signing::{
+        check_api_key_expiry, check_recv_window, gc_seen_buckets_best_effort, verify_ed25519,
+    },
         errors::{perp_err, perp_invariant_err},
     interface::IPerpDex::{
         self, depositCall, getAccountCall, getAccountReturn, transferFromPerpCall,
@@ -13,7 +16,6 @@ use crate::{
         TransferFromPerp, TransferToPerp,
     },
     storage::{self, load_erc20_balance, save_erc20_balance},
-    trading::{check_api_key_expiry, check_recv_window, gc_seen_buckets_best_effort, verify_ed25519},
     types::{AccountUpdateReason, MAX_PERP_WALLET_BALANCE},
     PERP_DEX_ADDRESS, USDC_ADDRESS,
     PerpError,
@@ -260,7 +262,7 @@ fn transfer_signed_message<const N: usize>(
     recv_window: u64,
     key_id: u8,
 ) -> [u8; N] {
-    use crate::trading::{put, write_signed_header};
+    use crate::account::signing::{put, write_signed_header};
     let mut msg = [0u8; N];
     let mut c = write_signed_header(&mut msg, prefix, chain_id);
     c = put(&mut msg, c, account.as_slice());

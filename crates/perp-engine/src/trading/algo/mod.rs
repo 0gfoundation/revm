@@ -713,9 +713,9 @@ pub fn run_place_algo_order_signed<H: PerpHost>(
 
     let api_key = storage::load_api_key(context, a.account, a.keyId)?
         .ok_or_else(|| perp_err("placeAlgoOrderSigned: no api key registered for account"))?;
-    crate::trading::check_recv_window(context, a.timestamp, a.recvWindow)
+    crate::account::signing::check_recv_window(context, a.timestamp, a.recvWindow)
         .map_err(|e| perp_err(&format!("placeAlgoOrderSigned: {e}")))?;
-    crate::trading::check_api_key_expiry(context, &api_key)
+    crate::account::signing::check_api_key_expiry(context, &api_key)
         .map_err(|e| perp_err(&format!("placeAlgoOrderSigned: {e}")))?;
 
     // Canonical fixed-layout message. ⚠️ No byte total is quoted: the array literal IS the length
@@ -725,23 +725,27 @@ pub fn run_place_algo_order_signed<H: PerpHost>(
     //   || orderType(1) || triggerPrice(8) || price(8) || quantity(8) || tif(1) || workingType(1)
     //   || clientAlgoId(16) || flags(1) || timestamp(8) || recvWindow(8) || keyId(1)
     let mut msg = [0u8; 114];
-    let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_algo", context.chain_id());
-    c = crate::trading::put(&mut msg, c, a.account.as_slice());
-    c = crate::trading::put(&mut msg, c, &[a.algoType]);
-    c = crate::trading::put(&mut msg, c, &a.marketId.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[a.side, a.orderType]);
-    c = crate::trading::put(&mut msg, c, &a.triggerPrice.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &a.price.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &a.quantity.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[a.tif, a.workingType]);
-    c = crate::trading::put(&mut msg, c, &a.clientAlgoId.0);
-    c = crate::trading::put(&mut msg, c, &[a.flags]);
-    c = crate::trading::put(&mut msg, c, &a.timestamp.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &a.recvWindow.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[a.keyId]);
+    let mut c = crate::account::signing::write_signed_header(
+        &mut msg,
+        b"perpdex_v1_algo",
+        context.chain_id(),
+    );
+    c = crate::account::signing::put(&mut msg, c, a.account.as_slice());
+    c = crate::account::signing::put(&mut msg, c, &[a.algoType]);
+    c = crate::account::signing::put(&mut msg, c, &a.marketId.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[a.side, a.orderType]);
+    c = crate::account::signing::put(&mut msg, c, &a.triggerPrice.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &a.price.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &a.quantity.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[a.tif, a.workingType]);
+    c = crate::account::signing::put(&mut msg, c, &a.clientAlgoId.0);
+    c = crate::account::signing::put(&mut msg, c, &[a.flags]);
+    c = crate::account::signing::put(&mut msg, c, &a.timestamp.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &a.recvWindow.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[a.keyId]);
     debug_assert_eq!(c, msg.len(), "placeAlgoOrderSigned message layout");
 
-    crate::trading::verify_ed25519(&api_key.pubkey, &msg, &a.signature)
+    crate::account::signing::verify_ed25519(&api_key.pubkey, &msg, &a.signature)
         .map_err(|e| perp_err(&format!("placeAlgoOrderSigned: {e}")))?;
 
     // algoId = keccak256(signature); the SAME hash keys the seen-signature replay set, exactly as
@@ -786,7 +790,7 @@ pub fn run_place_algo_order_signed<H: PerpHost>(
     storage::mark_signature_seen(context, &algo_id, a.timestamp)?;
     // Best-effort by design: this runs AFTER a committed burn, so surfacing its `Err` would
     // revert a call whose signature is already spent.
-    let _ = crate::trading::gc_seen_buckets_best_effort(context, a.timestamp);
+    let _ = crate::account::signing::gc_seen_buckets_best_effort(context, a.timestamp);
     let burn_writes = context.perp_write_count() - writes_before_burn;
 
     place_core(context, a.account, a.marketId, &market, algo_id, v, a.clientAlgoId, a.flags)
@@ -809,25 +813,28 @@ pub fn run_cancel_algo_order_signed<H: PerpHost>(
 
     let api_key = storage::load_api_key(context, a.account, a.keyId)?
         .ok_or_else(|| perp_err("cancelAlgoOrderSigned: no api key registered for account"))?;
-    crate::trading::check_recv_window(context, a.timestamp, a.recvWindow)
+    crate::account::signing::check_recv_window(context, a.timestamp, a.recvWindow)
         .map_err(|e| perp_err(&format!("cancelAlgoOrderSigned: {e}")))?;
-    crate::trading::check_api_key_expiry(context, &api_key)
+    crate::account::signing::check_api_key_expiry(context, &api_key)
         .map_err(|e| perp_err(&format!("cancelAlgoOrderSigned: {e}")))?;
 
     //   "perpdex_v1_algocancel" || chainId(8) || account(20) || algoId(32) || marketId(8)
     //   || timestamp(8) || recvWindow(8) || keyId(1)
     let mut msg = [0u8; 106];
-    let mut c =
-        crate::trading::write_signed_header(&mut msg, b"perpdex_v1_algocancel", context.chain_id());
-    c = crate::trading::put(&mut msg, c, a.account.as_slice());
-    c = crate::trading::put(&mut msg, c, &a.algoId.0);
-    c = crate::trading::put(&mut msg, c, &a.marketId.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &a.timestamp.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &a.recvWindow.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[a.keyId]);
+    let mut c = crate::account::signing::write_signed_header(
+        &mut msg,
+        b"perpdex_v1_algocancel",
+        context.chain_id(),
+    );
+    c = crate::account::signing::put(&mut msg, c, a.account.as_slice());
+    c = crate::account::signing::put(&mut msg, c, &a.algoId.0);
+    c = crate::account::signing::put(&mut msg, c, &a.marketId.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &a.timestamp.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &a.recvWindow.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[a.keyId]);
     debug_assert_eq!(c, msg.len(), "cancelAlgoOrderSigned message layout");
 
-    crate::trading::verify_ed25519(&api_key.pubkey, &msg, &a.signature)
+    crate::account::signing::verify_ed25519(&api_key.pubkey, &msg, &a.signature)
         .map_err(|e| perp_err(&format!("cancelAlgoOrderSigned: {e}")))?;
 
     // Burned unconditionally, after verification and before the cancel — exactly as
@@ -851,7 +858,7 @@ pub fn run_cancel_algo_order_signed<H: PerpHost>(
     let block_ts: u64 = context.timestamp();
     let writes_before_burn = context.perp_write_count();
     storage::mark_signature_seen(context, &sig_hash, a.timestamp)?;
-    crate::trading::gc_seen_buckets_best_effort(context, block_ts)?;
+    crate::account::signing::gc_seen_buckets_best_effort(context, block_ts)?;
     let burn_writes = context.perp_write_count().saturating_sub(writes_before_burn);
 
     cancel_core(context, a.account, a.algoId.0, a.marketId)

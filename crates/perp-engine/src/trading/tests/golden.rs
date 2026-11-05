@@ -860,17 +860,18 @@ fn signed_place_input(
     client_id: [u8; 16],
 ) -> Vec<u8> {
     let mut msg = [0u8; 105];
-    let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_order", TEST_CHAIN_ID);
-    c = crate::trading::put(&mut msg, c, ALICE.as_slice());
-    c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[side]);
-    c = crate::trading::put(&mut msg, c, &price.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &qty.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[order_type, tif]);
-    c = crate::trading::put(&mut msg, c, &client_id);
-    c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[0, 0]);
+    let mut c =
+        crate::account::signing::write_signed_header(&mut msg, b"perpdex_v1_order", TEST_CHAIN_ID);
+    c = crate::account::signing::put(&mut msg, c, ALICE.as_slice());
+    c = crate::account::signing::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[side]);
+    c = crate::account::signing::put(&mut msg, c, &price.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &qty.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[order_type, tif]);
+    c = crate::account::signing::put(&mut msg, c, &client_id);
+    c = crate::account::signing::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[0, 0]);
     debug_assert_eq!(c, msg.len());
     let sig = sk.sign(&msg);
     placeOrderSignedCall {
@@ -894,13 +895,14 @@ fn signed_place_input(
 fn signed_cancel_input(sk: &SigningKey, order_id: [u8; 32]) -> Vec<u8> {
     // Canonical 94-byte message, layout from run_cancel_order_signed.
     let mut msg = [0u8; 102];
-    let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_cancel", TEST_CHAIN_ID);
-    c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
-    c = crate::trading::put(&mut msg, c, &order_id);
-    c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[0]);
+    let mut c =
+        crate::account::signing::write_signed_header(&mut msg, b"perpdex_v1_cancel", TEST_CHAIN_ID);
+    c = crate::account::signing::put(&mut msg, c, &ALICE.as_slice());
+    c = crate::account::signing::put(&mut msg, c, &order_id);
+    c = crate::account::signing::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[0]);
     debug_assert_eq!(c, msg.len());
     let sig = sk.sign(&msg);
     cancelOrderSignedCall {
@@ -918,13 +920,17 @@ fn signed_cancel_input(sk: &SigningKey, order_id: [u8; 32]) -> Vec<u8> {
 fn signed_leverage_input(sk: &SigningKey, leverage: u64) -> Vec<u8> {
     // Canonical 72-byte message, layout from run_set_leverage_signed.
     let mut msg = [0u8; 80];
-    let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_leverage", TEST_CHAIN_ID);
-    c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
-    c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &leverage.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[0]);
+    let mut c = crate::account::signing::write_signed_header(
+        &mut msg,
+        b"perpdex_v1_leverage",
+        TEST_CHAIN_ID,
+    );
+    c = crate::account::signing::put(&mut msg, c, &ALICE.as_slice());
+    c = crate::account::signing::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &leverage.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &SIGNED_TS.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[0]);
     debug_assert_eq!(c, msg.len());
     let sig = sk.sign(&msg);
     setLeverageSignedCall {

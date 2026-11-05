@@ -428,13 +428,14 @@ fn signed(sk: &SigningKey, market_id: u64, margin_type: u8) -> Vec<u8> {
 /// [`signed`] with the message's `timestamp`.
 fn signed_at(sk: &SigningKey, market_id: u64, margin_type: u8, ts: u64) -> Vec<u8> {
     let mut msg = [0u8; 75];
-    let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_margintype", CHAIN_ID);
-    c = crate::trading::put(&mut msg, c, ALICE.as_slice());
-    c = crate::trading::put(&mut msg, c, &market_id.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[margin_type]);
-    c = crate::trading::put(&mut msg, c, &ts.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
-    c = crate::trading::put(&mut msg, c, &[0]);
+    let mut c =
+        crate::account::signing::write_signed_header(&mut msg, b"perpdex_v1_margintype", CHAIN_ID);
+    c = crate::account::signing::put(&mut msg, c, ALICE.as_slice());
+    c = crate::account::signing::put(&mut msg, c, &market_id.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[margin_type]);
+    c = crate::account::signing::put(&mut msg, c, &ts.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &SIGNED_RECV.to_be_bytes());
+    c = crate::account::signing::put(&mut msg, c, &[0]);
     assert_eq!(c, msg.len());
     setMarginTypeSignedCall {
         account: ALICE,

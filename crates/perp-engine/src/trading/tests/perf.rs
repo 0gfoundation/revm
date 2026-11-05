@@ -461,20 +461,24 @@ fn perf_match_single_fill_signed() {
             client_id[8..].copy_from_slice(&i.to_be_bytes());
             // Canonical 96-byte message, layout from run_place_order_signed.
             let mut msg = [0u8; 105];
-            let mut c = crate::trading::write_signed_header(&mut msg, b"perpdex_v1_order", TEST_CHAIN_ID);
-            c = crate::trading::put(&mut msg, c, &ALICE.as_slice());
-            c = crate::trading::put(&mut msg, c, &MARKET_ID.to_be_bytes());
-            c = crate::trading::put(&mut msg, c, &[0]);
-            c = crate::trading::put(&mut msg, c, &PRICE.to_be_bytes());
-            c = crate::trading::put(&mut msg, c, &QTY.to_be_bytes());
-            c = crate::trading::put(&mut msg, c, &[0]);
-            c = crate::trading::put(&mut msg, c, &[0]);
-            c = crate::trading::put(&mut msg, c, &client_id);
-            c = crate::trading::put(&mut msg, c, &block_ts.to_be_bytes());
-            c = crate::trading::put(&mut msg, c, &recv_window.to_be_bytes());
-            c = crate::trading::put(&mut msg, c, &[0]);
-            c = crate::trading::put(&mut msg, c, &[0]);
-            c = crate::trading::put(&mut msg, c, &[0]);
+            let mut c = crate::account::signing::write_signed_header(
+                &mut msg,
+                b"perpdex_v1_order",
+                TEST_CHAIN_ID,
+            );
+            c = crate::account::signing::put(&mut msg, c, &ALICE.as_slice());
+            c = crate::account::signing::put(&mut msg, c, &MARKET_ID.to_be_bytes());
+            c = crate::account::signing::put(&mut msg, c, &[0]);
+            c = crate::account::signing::put(&mut msg, c, &PRICE.to_be_bytes());
+            c = crate::account::signing::put(&mut msg, c, &QTY.to_be_bytes());
+            c = crate::account::signing::put(&mut msg, c, &[0]);
+            c = crate::account::signing::put(&mut msg, c, &[0]);
+            c = crate::account::signing::put(&mut msg, c, &client_id);
+            c = crate::account::signing::put(&mut msg, c, &block_ts.to_be_bytes());
+            c = crate::account::signing::put(&mut msg, c, &recv_window.to_be_bytes());
+            c = crate::account::signing::put(&mut msg, c, &[0]);
+            c = crate::account::signing::put(&mut msg, c, &[0]);
+            c = crate::account::signing::put(&mut msg, c, &[0]);
             debug_assert_eq!(c, msg.len());
             let sig = sk.sign(&msg);
             placeOrderSignedCall {
