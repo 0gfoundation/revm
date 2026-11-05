@@ -8,9 +8,9 @@ use primitives::{address, hardfork::SpecId, U256};
 use crate::{
     risk::funding::settle_position_funding,
     interface::IPerpDex::{
-        addPositionMarginCall, getMarginTiersCall, getSymbolConfigCall, liquidateCall,
-        placeOrderCall, removePositionMarginCall, setLeverageCall, setMarginTiersCall,
-        updateIndexPriceCall,
+        addPositionMarginCall, drainDeferredWorkCall, getAveragePremiumIndexCall,
+        getMarginTiersCall, getSymbolConfigCall, liquidateCall, placeOrderCall,
+        removePositionMarginCall, setLeverageCall, setMarginTiersCall, updateIndexPriceCall,
     },
     run_perp_dex_call,
     trading::{run_place_order, MAX_LIQUIDATION_MAKER_ACCOUNTS},

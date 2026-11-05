@@ -73,18 +73,24 @@
 //! below zero.
 
 use alloy_primitives::IntoLogData;
+use alloy_sol_types::SolCall;
 use crate::host::PerpHost;
-use primitives::{Address, Log};
+use primitives::{Address, Bytes, Log};
 
 use crate::{
         errors::{perp_err, perp_invariant_err},
-    interface::IPerpDex,
+    interface::IPerpDex::{
+        self, drainDeferredWorkCall, getAveragePremiumIndexCall, getAveragePremiumIndexReturn,
+        getFundingStateCall, getFundingStateReturn,
+    },
     math::calc_funding_payment,
     storage,
     types::{AccountUpdateReason, Market, PerpPosition},
     PERP_DEX_ADDRESS,
     PerpError,
 };
+
+use super::run_deferred_sweeps;
 
 /// A funding settlement computed in memory but NOT yet written (commit-only #23). The margin
 /// credit/charge has already been applied to the caller's in-memory `pos`; the `FundingSettled`
@@ -397,4 +403,79 @@ pub(crate) fn settle_position_funding<H: PerpHost>(
         apply_funding_settlement(context, pending)?;
     }
     Ok(())
+}
+
+// ── Funding state ─────────────────────────────────────────────────────────────
+
+/// `getFundingState(uint64 marketId) returns (int64 fundingRate, uint64 fundingInterval, uint64 nextFundingTime)`
+pub fn run_get_funding_state<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = getFundingStateCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getFundingState: invalid calldata"))?;
+    let state = storage::load_funding_state(context, args.marketId)?;
+    let market = storage::load_market_ref(context, args.marketId)?
+        .ok_or_else(|| perp_err("getFundingState: unknown market"))?;
+    Ok(Bytes::from(getFundingStateCall::abi_encode_returns(
+        &getFundingStateReturn {
+            fundingRate: state.last_funding_rate,
+            fundingInterval: market.funding_interval,
+            nextFundingTime: state.next_funding_ts,
+        },
+    )))
+}
+
+/// `getAveragePremiumIndex(uint64 marketId) returns (int64 avgPremiumIndex, uint64 sampleCount)`
+/// `drainDeferredWork(uint64 marketId) returns (bool moreRemaining)`
+///
+/// PERMISSIONLESS. See the ABI doc for why it exists and what it deliberately does not do.
+///
+/// The fast path — `Market.deferred_work == 0` — is one market read and a return, which is what
+/// makes a per-block keeper poll affordable. It is NOT gated on a timestamp: being able to run more
+/// often than `priceUpdateInterval` is the entire point.
+pub fn run_drain_deferred_work<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = drainDeferredWorkCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("drainDeferredWork: invalid calldata"))?;
+
+    let market = storage::load_market_ref(context, args.marketId)?
+        .ok_or_else(|| perp_err("drainDeferredWork: unknown market"))?;
+
+    if market.deferred_work == 0 {
+        return Ok(Bytes::from(drainDeferredWorkCall::abi_encode_returns(
+            &false,
+        )));
+    }
+
+    // `market.mark_price` is the mark the last oracle tick stored and nothing since has moved it,
+    // so the band centre and the maintenance check are the ones the interrupted sweep was using.
+    // No re-load dance is needed here, unlike `apply_index_price_update`, precisely because this
+    // call does not write a new mark first.
+    let mark_price = market.mark_price;
+    // The seq that mark was written at: the trailing step re-runs at the same `(seq, mark)` and so
+    // changes nothing (it is idempotent there), which is the whole of what the drain needs from it.
+    let seq = storage::load_index_price_state(context, args.marketId)?.timestamp;
+    let more = run_deferred_sweeps(context, args.marketId, &market, seq, mark_price, false)?;
+
+    Ok(Bytes::from(drainDeferredWorkCall::abi_encode_returns(&more)))
+}
+
+pub fn run_get_average_premium_index<H: PerpHost>(
+    input_bytes: &[u8],
+    context: &mut H,
+) -> Result<Bytes, PerpError> {
+    let args = getAveragePremiumIndexCall::abi_decode_validate(input_bytes)
+        .map_err(|_| perp_err("getAveragePremiumIndex: invalid calldata"))?;
+    storage::load_market_ref(context, args.marketId)?
+        .ok_or_else(|| perp_err("getAveragePremiumIndex: unknown market"))?;
+    let acc = storage::load_premium_accumulator(context, args.marketId)?;
+    Ok(Bytes::from(getAveragePremiumIndexCall::abi_encode_returns(
+        &getAveragePremiumIndexReturn {
+            avgPremiumIndex: acc.average()?,
+            sampleCount: acc.sample_count,
+        },
+    )))
 }
