@@ -453,5 +453,4 @@ pub fn run_get_account<H: PerpHost>(
 }
 
 #[cfg(test)]
-#[path = "deposit_withdraw_tests.rs"]
 mod tests;
