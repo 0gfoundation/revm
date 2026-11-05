@@ -26,42 +26,14 @@ mod events;
 pub mod host;
 pub mod interface;
 pub mod margin;
-/// The independent cross-margin P0/P1 spec suite (`SPEC_cross_margin.md`).
-#[cfg(test)]
-mod cross_margin_spec_tests;
-/// Cross margin P2a: the accounting core (funding mirror, account fields, the cross fold) and its
-/// read surfaces.
-#[cfg(test)]
-mod cross_accounting_tests;
-/// Cross margin P2b: money movement on a CROSSED position — fills, funding, liquidation and ADL
-/// next to cross positions, J6 and the negative-wallet audit — under the custody identity.
-#[cfg(test)]
-mod cross_settlement_tests;
 /// The independent cross-margin P2 spec suite (`SPEC_cross_margin.md` P2 ground rules, report §3.2
 /// model): every surface against a model, every gate to the unit, cross liquidation and ADL.
 #[cfg(test)]
 mod cross_margin_p2_spec_tests;
-/// Cross margin P3a: cross liquidation — account-level detection, the episode, its budget and
-/// continuation, manual `liquidate()`, totality — under the custody identity.
-#[cfg(test)]
-mod cross_liquidation_tests;
 /// The cross golden scenario (cross P3, R8): the commitment pin and business snapshot of cross
 /// margin as it ships, beside the isolated `trading::tests::golden`.
 #[cfg(test)]
 mod cross_golden_tests;
-/// The independent cross-margin P3 spec suite (`SPEC_cross_margin.md` R1–R8, report §1.5–§1.7 and
-/// §3.4): Binance's liquidation-price examples, the episode, ADL, the negative-wallet clearance,
-/// conservation after every call, and the never-`Err` fuzz.
-#[cfg(test)]
-mod cross_margin_p3_spec_tests;
-/// Cross margin P4: the account's cross-leg summary (`types::CrossLegs`) on every route, and the
-/// health check priced from it (`margin_view::cross_health`).
-#[cfg(test)]
-mod cross_legs_tests;
-/// Cross margin P4: an independent spec suite — the cross legs and the health check recomputed
-/// from the position records after every call, on every route, and at random.
-#[cfg(test)]
-mod cross_legs_spec_tests;
 /// Real-engine event fixtures for the perpdex-perf harness: scenarios driven through the call
 /// entry point on an `InMemoryHost`, recorded as receipts plus getter reads (`#[ignore]`d tool).
 #[cfg(test)]

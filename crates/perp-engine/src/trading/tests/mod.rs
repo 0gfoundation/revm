@@ -5796,3 +5796,8 @@ mod fee_spec;
 /// implementation (or its `fee_spec_tests`).
 #[cfg(test)]
 mod rebate_spec;
+
+/// Cross margin P2b: money movement on a CROSSED position — fills, funding, liquidation and ADL
+/// next to cross positions, J6 and the negative-wallet audit — under the custody identity.
+#[cfg(test)]
+mod cross_settlement;

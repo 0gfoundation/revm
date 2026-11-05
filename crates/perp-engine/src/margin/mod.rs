@@ -4,3 +4,5 @@
 
 pub mod margin_type;
 pub mod view;
+#[cfg(test)]
+mod tests;

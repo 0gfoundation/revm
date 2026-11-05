@@ -5308,3 +5308,14 @@ mod withdrawal_cap;
 // `calc_value(p, q) = p · q · 1e4` exactly; one 3× tier, `MM = ⌊|N| / 6⌋`; funding index → payment
 // on a `QTY` (= 10) position is `∓ ⌊index_delta / 10⌋`. Every number below is hand-derived.
 mod funding_debt;
+
+/// Cross margin P3a: cross liquidation — account-level detection, the episode, its budget and
+/// continuation, manual `liquidate()`, totality — under the custody identity.
+#[cfg(test)]
+mod cross_liquidation;
+
+/// The independent cross-margin P3 spec suite (`SPEC_cross_margin.md` R1–R8, report §1.5–§1.7 and
+/// §3.4): Binance's liquidation-price examples, the episode, ADL, the negative-wallet clearance,
+/// conservation after every call, and the never-`Err` fuzz.
+#[cfg(test)]
+mod cross_liquidation_spec;
