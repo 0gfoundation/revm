@@ -71,7 +71,7 @@ fn alice_bids(ctx: &mut TestCtx) -> Vec<(u64, u64, bool)> {
 }
 
 fn available(ctx: &mut TestCtx, user: Address) -> i128 {
-    crate::margin_view::derived_available_balance(ctx, user).unwrap()
+    crate::margin::view::derived_available_balance(ctx, user).unwrap()
 }
 
 /// The place path's insufficient-margin refusal for an order on a position of `margin_type`.

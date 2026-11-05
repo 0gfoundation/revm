@@ -180,7 +180,8 @@ pub struct MarginInfo {
     /// markets is not a quantity Binance's account payload reports.
     pub cumulative_realized_pnl: i64,
     /// The margin type IN FORCE ([`crate::types::MarginType`]'s wire code) — from
-    /// [`crate::margin_type::effective_margin_type`], the gate every surface shares, never the raw
+    /// [`crate::margin::margin_type::effective_margin_type`], the gate every surface shares, never
+    /// the raw
     /// stored byte: CROSSED (`0`) for a position whose owner never chose (Binance's default).
     pub margin_type: u8,
 }
@@ -561,7 +562,7 @@ pub fn margin_info_of(
         // Verbatim, not derived: this is a stored lifetime total, so the row and the
         // `PositionChanged` event report the same field rather than two derivations of it.
         cumulative_realized_pnl: pos.cumulative_realized_pnl,
-        margin_type: crate::margin_type::effective_margin_type(pos).code(),
+        margin_type: crate::margin::margin_type::effective_margin_type(pos).code(),
     })
 }
 
@@ -596,7 +597,7 @@ pub fn margin_info_of(
 pub struct CrossLeg {
     /// The market.
     pub market_id: u64,
-    /// The position is CROSSED in force ([`crate::margin_type::effective_margin_type`]).
+    /// The position is CROSSED in force ([`crate::margin::margin_type::effective_margin_type`]).
     pub cross: bool,
     /// `amount != 0`.
     pub has_position: bool,
@@ -770,7 +771,8 @@ pub fn cross_leg(
     pos: &crate::types::PerpPosition,
 ) -> Result<CrossLeg, PerpError> {
     let derived = position_derived_margin(market, pos)?;
-    let cross = crate::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed;
+    let cross =
+        crate::margin::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed;
     let mut leg = CrossLeg {
         market_id: market.market_id,
         cross,
@@ -1078,7 +1080,7 @@ pub fn cross_health<H: PerpHost>(
     let (mut pending_funding, mut upnl, mut cross_mm) = (0i128, 0i128, 0i128);
     let mut has_cross = false;
     let mut faulted: u8 = 0;
-    if crate::margin_type::cross_margin_enabled() {
+    if crate::margin::margin_type::cross_margin_enabled() {
         let stored = storage::load_cross_legs_ref(context, user)?;
         for leg in stored.iter() {
             let Some(market) = storage::load_market_ref(context, leg.market_id)? else {
@@ -1163,7 +1165,7 @@ pub fn cross_health_for_adl<H: PerpHost>(
         let health = cross_health(context, user, Some(buf))?;
         Ok((health, buf.iter().find(|l| l.market_id == market_id).copied()))
     }
-    if !memoize || !crate::margin_type::cross_margin_enabled() {
+    if !memoize || !crate::margin::margin_type::cross_margin_enabled() {
         return fresh(context, user, market_id, buf);
     }
     #[cfg(test)]
@@ -1272,7 +1274,7 @@ fn debug_assert_cross_health<H: PerpHost>(
         })
         .collect();
     fold_legs.sort_by_key(|l| l.market_id);
-    let held = if crate::margin_type::cross_margin_enabled() {
+    let held = if crate::margin::margin_type::cross_margin_enabled() {
         storage::load_cross_legs_ref(context, user)?.len()
     } else {
         0
@@ -2318,7 +2320,8 @@ pub fn index_account_scalars<H: PerpHost>(
 
 /// `debug_assertions` only: the user's stored cross legs ([`crate::types::CrossLegs`]) against a
 /// FRESH WALK of the user's positions over the per-user market index — one
-/// [`crate::margin_type::cross_leg_of`] per member market, in market order — panicking on any
+/// [`crate::margin::margin_type::cross_leg_of`] per member market, in market order — panicking on
+/// any
 /// difference. Over the INDEX while the list is over ALL markets: equal because every entry is a
 /// non-zero position, which keeps its market in the index.
 ///
@@ -2336,14 +2339,14 @@ pub(crate) fn debug_assert_cross_legs<H: PerpHost>(
     user: Address,
     who: &str,
 ) -> Result<(), PerpError> {
-    if !crate::margin_type::cross_margin_enabled() {
+    if !crate::margin::margin_type::cross_margin_enabled() {
         return Ok(());
     }
     let markets = storage::load_user_markets_ref(context, user)?;
     let mut walked = Vec::new();
     for &k in markets.iter() {
         let pos = storage::load_position_ref(context, user, k)?;
-        walked.extend(crate::margin_type::cross_leg_of(k, &pos));
+        walked.extend(crate::margin::margin_type::cross_leg_of(k, &pos));
     }
     walked.sort_by_key(|l| l.market_id);
     let stored = storage::load_cross_legs_ref(context, user)?;
@@ -2544,5 +2547,4 @@ fn relabel_market(e: PerpError, who: &str, market_id: u64) -> PerpError {
 }
 
 #[cfg(test)]
-#[path = "margin_view_tests.rs"]
 mod tests;

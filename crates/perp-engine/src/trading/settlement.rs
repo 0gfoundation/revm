@@ -384,7 +384,7 @@ impl TakerSettlement {
         // account's isolated liquidation close would hand a cross leg's arithmetic a way to panic
         // the node, for a number the close does not use. Skipped, the close reads no other market.
         let fold = if core.opens || (core.total_required != 0 && !core.cross) {
-            Some(crate::margin_view::cross_fold_checked(
+            Some(crate::margin::view::cross_fold_checked(
                 context,
                 self.user,
                 Some(wallet),
@@ -442,7 +442,7 @@ impl TakerSettlement {
                 // No re-fold: `release_open_order_margin_core` below subtracts each cancelled
                 // entry's frozen term from `sim_pos`, so its aggregates ARE `Bid`/`Ask` for the
                 // simulated book.
-                let avail = crate::margin_view::derived_available_balance_with(
+                let avail = crate::margin::view::derived_available_balance_with(
                     context,
                     self.user,
                     Some(wallet),
@@ -931,20 +931,20 @@ pub(super) struct UserWork {
     /// The payload of the last account snapshot published for this user during the match, if any.
     /// Kept so the flush can decide whether the end-of-call drain still owes this user an event —
     /// see the "duplicate mark" note in [`MatchRegistry::flush`].
-    last_published: Option<crate::margin_view::AccountWalletBalances>,
+    last_published: Option<crate::margin::view::AccountWalletBalances>,
 }
 
 impl UserWork {
     /// The three balances `AccountBalanceChanged` publishes, **as the flush will write them** —
-    /// the working-copy analogue of [`crate::margin_view::index_account_wallet_balances`].
+    /// the working-copy analogue of [`crate::margin::view::index_account_wallet_balances`].
     ///
     /// `cw` and `usdcBalance` are read straight off the working account (the flush's `save_account`
     /// writes exactly this struct). `wb = cw + Σ_all_markets pos.margin` reconstructs the Σ from
     /// [`Self::other_market_position_margin`] plus this market's live working `pos.margin`, which is
     /// the value the flush's `save_position` is going to store. The narrowing guard is the same one
     /// (and the only one) the settled producer has.
-    fn wallet_balances(&self) -> Result<crate::margin_view::AccountWalletBalances, PerpError> {
-        crate::margin_view::wallet_balances_from_parts(
+    fn wallet_balances(&self) -> Result<crate::margin::view::AccountWalletBalances, PerpError> {
+        crate::margin::view::wallet_balances_from_parts(
             &self.account,
             self.other_market_position_margin,
             self.pos.margin,
@@ -1040,7 +1040,7 @@ pub(super) enum MatchEvent {
     /// the maker's rows for that fill instead of floating to the end of the call.
     AccountSnapshot {
         user: Address,
-        balances: crate::margin_view::AccountWalletBalances,
+        balances: crate::margin::view::AccountWalletBalances,
         /// Carried alongside the payload for the same reason: the reason belongs to the PUBLISH
         /// SITE, and the publish site is the walk (`push_maker_snapshot`), not this replay.
         reason: AccountUpdateReason,
@@ -1605,7 +1605,7 @@ impl MatchRegistry {
             }
             #[cfg(debug_assertions)]
             {
-                let settled = crate::margin_view::index_account_wallet_balances(
+                let settled = crate::margin::view::index_account_wallet_balances(
                     context,
                     user,
                     "match flush convergence",
@@ -2719,7 +2719,7 @@ fn ensure_taker_wallet_can_cover_margin<H: PerpHost>(
 /// phase's decision and the apply phase's cover loop cannot ask different questions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FillsGate {
-    /// [`crate::margin_view::derived_can_afford`]`(A_post, total_required)` — B1: a non-positive
+    /// [`crate::margin::view::derived_can_afford`]`(A_post, total_required)` — B1: a non-positive
     /// requirement is always affordable. Every ISOLATED fill set (an open, a flip, and a reduce of
     /// an account with no cross exposure).
     Available,
@@ -2735,7 +2735,7 @@ impl FillsGate {
     /// took one; the only thing read off it is whether the account holds cross exposure, and only
     /// for a pure reduce of an ISOLATED position (for which the fold is always taken when it draws
     /// anything, and is irrelevant when it draws nothing — B1 passes it either way).
-    pub(super) fn of(core: &TakerFillCore, fold: Option<&crate::margin_view::CrossFold>) -> Self {
+    pub(super) fn of(core: &TakerFillCore, fold: Option<&crate::margin::view::CrossFold>) -> Self {
         if core.cross_open {
             Self::CrossOpen
         } else if !core.opens && (core.cross || fold.is_some_and(|f| f.has_cross)) {
@@ -2751,7 +2751,7 @@ impl FillsGate {
 ///
 /// # [`FillsGate::Available`] — every isolated fill set
 ///
-/// [`crate::margin_view::derived_can_afford`] — `available ≥ total_required`, with B1's exemption
+/// [`crate::margin::view::derived_can_afford`] — `available ≥ total_required`, with B1's exemption
 /// that a non-positive requirement is always affordable. That exemption is right where
 /// `total_required` IS the requirement: an ISOLATED open's draw carries its silo, so it is never 0,
 /// and a draw of 0 is a pure close (or a dust fill) that costs nothing.
@@ -2794,7 +2794,7 @@ impl FillsGate {
 fn fills_are_covered(available: i128, total_required: u64, gate: FillsGate) -> bool {
     match gate {
         FillsGate::Available => {
-            crate::margin_view::derived_can_afford(available, total_required as i128)
+            crate::margin::view::derived_can_afford(available, total_required as i128)
         }
         FillsGate::CrossOpen => available >= total_required as i128,
         FillsGate::CrossWalletReduce => true,
@@ -2813,7 +2813,7 @@ fn taker_margin_is_covered<H: PerpHost>(
     if gate == FillsGate::CrossWalletReduce {
         return Ok(true);
     }
-    let available = crate::margin_view::derived_available_balance(context, user)?;
+    let available = crate::margin::view::derived_available_balance(context, user)?;
     Ok(fills_are_covered(available, required_margin, gate))
 }
 
@@ -2985,13 +2985,16 @@ pub(super) enum OpeningMarginFunding {
 
 impl OpeningMarginFunding {
     /// The mode a fill on `pos` settles under: [`Self::Cross`] for a position CROSSED in force
-    /// ([`crate::margin_type::effective_margin_type`]), else `isolated` — the caller's ISOLATED
+    /// ([`crate::margin::margin_type::effective_margin_type`]), else `isolated` — the caller's
+    /// ISOLATED
     /// rule. Total (the type gate has no error path), so it is safe on the liquidation and ADL
     /// paths. With cross margin gated off (a test's override) this is always `isolated`.
     #[inline]
     pub(super) fn for_position(pos: &crate::types::PerpPosition, isolated: Self) -> Self {
         debug_assert!(isolated != Self::Cross, "for_position takes the caller's ISOLATED rule");
-        if crate::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed {
+        if crate::margin::margin_type::effective_margin_type(pos)
+            == crate::types::MarginType::Crossed
+        {
             Self::Cross
         } else {
             isolated
@@ -3019,7 +3022,7 @@ pub(super) fn apply_position_fill(
     let cross = funding == OpeningMarginFunding::Cross;
     debug_assert_eq!(
         cross,
-        crate::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed,
+        crate::margin::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed,
         "apply_position_fill: funding mode {funding:?} disagrees with the position's margin type \
          in force — route it through OpeningMarginFunding::for_position"
     );

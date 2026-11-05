@@ -47,8 +47,8 @@ use crate::{
         transferToPerpSignedCall, updateIndexPriceCall, updateIndexPriceFromBookCall,
         updateMarketCall, withdrawCall, withdrawInsuranceFundCall,
     },
-    margin_type::{run_set_margin_type, run_set_margin_type_signed},
-    margin_view::{run_get_account_margin, run_get_position_risk},
+    margin::margin_type::{run_set_margin_type, run_set_margin_type_signed},
+    margin::view::{run_get_account_margin, run_get_position_risk},
     risk::{
         run_add_market, run_add_position_margin, run_deposit_insurance_fund,
         run_drain_deferred_work, run_get_admin,

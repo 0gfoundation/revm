@@ -74,7 +74,7 @@ use primitives::{Address, Log};
 use crate::{
     host::PerpHost,
     interface::IPerpDex,
-    margin_view::{cross_health, CrossHealth, CrossHealthLeg},
+    margin::view::{cross_health, CrossHealth, CrossHealthLeg},
     storage,
     trading::{execute_liquidation_market_order, run_adl},
     types::{AccountUpdateReason, CancelReason, MarginType, Market, PerpPosition, Side},
@@ -613,7 +613,7 @@ pub(crate) fn end_flag_without_cross_position<H: PerpHost>(
     // cannot evaluate OUT of every sum (J4), and an unpriceable cross position is still a cross
     // position. The legs ARE the non-zero positions CROSSED in force — under the gate, which with
     // cross margin off (only a test can turn it off) makes none of them CROSSED.
-    if crate::margin_type::cross_margin_enabled()
+    if crate::margin::margin_type::cross_margin_enabled()
         && !storage::load_cross_legs_ref(context, user)?.is_empty()
     {
         return Ok(());
@@ -705,7 +705,7 @@ fn has_open_orders<H: PerpHost>(
 }
 
 fn is_crossed(pos: &PerpPosition) -> bool {
-    crate::margin_type::effective_margin_type(pos) == MarginType::Crossed
+    crate::margin::margin_type::effective_margin_type(pos) == MarginType::Crossed
 }
 
 fn saturate_i64(v: i128) -> i64 {

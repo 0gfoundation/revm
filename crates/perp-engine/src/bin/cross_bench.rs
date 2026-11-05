@@ -63,7 +63,7 @@ use perp_engine::{
         updateIndexPriceCall, Adl, CrossLiquidationEnded, CrossLiquidationStarted, Liquidation,
         MarkPriceUpdated, Trade,
     },
-    margin_view, run_perp_dex_call, storage,
+    margin, run_perp_dex_call, storage,
     types::{MarginTiers, Market},
     InMemoryHost, PerpError, PerpHost, PerpOutput,
 };
@@ -556,7 +556,7 @@ fn build_s1(mode: Mode, n: usize, k: u64, liq_pct: f64, seed: u64) -> S1World {
         // above it once market 1 alone is closed (one episode step each).
         for (i, &u) in users.iter().enumerate() {
             if is_thin[i] {
-                let mm = margin_view::cross_fold(&mut h, u, None, None, None).unwrap().cross_mm;
+                let mm = margin::view::cross_fold(&mut h, u, None, None, None).unwrap().cross_mm;
                 set_wallet(&mut h, u, (mm + LEG_NOTIONAL as i128 / 10) as i64);
             }
         }
@@ -702,7 +702,7 @@ fn s1_decompose(
         (
             "cross_fold, cold (account + umkt + k positions + compute)",
             Box::new(|h, u| {
-                std::hint::black_box(margin_view::cross_fold(h, u, None, None, None).unwrap());
+                std::hint::black_box(margin::view::cross_fold(h, u, None, None, None).unwrap());
             }),
         ),
         (
@@ -714,7 +714,7 @@ fn s1_decompose(
         (
             "cross_health, cold (P4: account + cross legs + compute)",
             Box::new(|h, u| {
-                std::hint::black_box(margin_view::cross_health(h, u, None).unwrap());
+                std::hint::black_box(margin::view::cross_health(h, u, None).unwrap());
             }),
         ),
     ];
@@ -750,11 +750,11 @@ fn s1_decompose(
         let mut h = restore(&w.snap);
         warm_up(&mut h);
         for &u in &w.users {
-            margin_view::cross_fold(&mut h, u, None, None, None).unwrap();
+            margin::view::cross_fold(&mut h, u, None, None, None).unwrap();
         }
         let t = Instant::now();
         for &u in &w.users {
-            std::hint::black_box(margin_view::cross_fold(&mut h, u, None, None, None).unwrap());
+            std::hint::black_box(margin::view::cross_fold(&mut h, u, None, None, None).unwrap());
         }
         v.push(t.elapsed().as_nanos() as f64 / 1e3 / n);
     }
@@ -768,7 +768,7 @@ fn s1_decompose(
         let t = Instant::now();
         for &u in &w.users {
             std::hint::black_box(storage::load_position_ref(&mut h, u, 1).unwrap());
-            std::hint::black_box(margin_view::cross_fold(&mut h, u, None, None, None).unwrap());
+            std::hint::black_box(margin::view::cross_fold(&mut h, u, None, None, None).unwrap());
             std::hint::black_box(storage::load_account_ref(&mut h, u).unwrap());
         }
         v.push(t.elapsed().as_nanos() as f64 / 1e3 / n);
@@ -784,11 +784,11 @@ fn s1_decompose(
         let mut h = restore(&w.snap);
         warm_up(&mut h);
         for &u in &w.users {
-            margin_view::cross_health(&mut h, u, None).unwrap();
+            margin::view::cross_health(&mut h, u, None).unwrap();
         }
         let t = Instant::now();
         for &u in &w.users {
-            std::hint::black_box(margin_view::cross_health(&mut h, u, None).unwrap());
+            std::hint::black_box(margin::view::cross_health(&mut h, u, None).unwrap());
         }
         v.push(t.elapsed().as_nanos() as f64 / 1e3 / n);
     }
@@ -801,7 +801,7 @@ fn s1_decompose(
         let t = Instant::now();
         for &u in &w.users {
             std::hint::black_box(storage::load_position_ref(&mut h, u, 1).unwrap());
-            std::hint::black_box(margin_view::cross_health(&mut h, u, None).unwrap());
+            std::hint::black_box(margin::view::cross_health(&mut h, u, None).unwrap());
             std::hint::black_box(storage::load_account_ref(&mut h, u).unwrap());
         }
         v.push(t.elapsed().as_nanos() as f64 / 1e3 / n);

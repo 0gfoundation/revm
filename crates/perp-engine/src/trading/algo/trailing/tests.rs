@@ -77,7 +77,7 @@ fn base_market(mark: u64) -> Market {
 fn new_host(mark: u64) -> InMemoryHost {
     // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
     // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
-    crate::margin_type::test_gate::isolated_by_default();
+    crate::margin::margin_type::test_gate::isolated_by_default();
     let mut h = InMemoryHost::new(1);
     storage::save_admin(&mut h, ADMIN).unwrap();
     storage::save_market(&mut h, &base_market(mark)).unwrap();
@@ -105,7 +105,7 @@ fn seed_position(h: &mut InMemoryHost, u: Address, amount: i64, mark: u64) {
             v_quote_balance: if amount > 0 { -value } else { value },
             margin: 100 * value,
             leverage: 5,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )

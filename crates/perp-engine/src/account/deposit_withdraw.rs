@@ -204,8 +204,8 @@ fn transfer_from_perp_core<H: PerpHost>(
     // keeps a healthy cross account at or above maintenance), never the raw wallet. For an account
     // with no cross position that is `max(0, perp_wallet_balance − Σ ooIM)`, the basis it always
     // read for a positive amount.
-    let available = crate::margin_view::derived_withdrawable_balance(context, account_addr)?;
-    if !crate::margin_view::derived_can_afford(available, amount as i128) {
+    let available = crate::margin::view::derived_withdrawable_balance(context, account_addr)?;
+    if !crate::margin::view::derived_can_afford(available, amount as i128) {
         return Err(perp_err(
             "transferFromPerp: insufficient perp wallet balance",
         ));
@@ -381,11 +381,11 @@ pub fn run_transfer_from_perp_signed<H: PerpHost>(
 ///
 /// The market set is the index (`umkt`), not a caller argument, so every total is COMPLETE — this
 /// is the difference from `getAccountMargin`, and it is the ONLY difference: both call the same
-/// [`crate::margin_view::account_margin_scalars`] walkers, so the arithmetic cannot drift between
+/// [`crate::margin::view::account_margin_scalars`] walkers, so the arithmetic cannot drift between
 /// them.
 ///
 /// This function contains NO arithmetic: it decodes, calls
-/// [`crate::margin_view::index_account_view`], and ABI-encodes. The `AccountBalanceChanged` event
+/// [`crate::margin::view::index_account_view`], and ABI-encodes. The `AccountBalanceChanged` event
 /// reads the same STORED quantities (`margin_view::index_account_wallet_balances`), so the two
 /// surfaces agree on every field they share for an account with no CROSSED position. With one
 /// (cross P2) they deliberately differ by the unsettled cross funding: the event reports the
@@ -411,7 +411,7 @@ pub fn run_get_account<H: PerpHost>(
     let args = getAccountCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("getAccount: invalid calldata"))?;
 
-    let view = crate::margin_view::index_account_view(context, args.user, "getAccount")?;
+    let view = crate::margin::view::index_account_view(context, args.user, "getAccount")?;
     let s = view.scalars;
 
     Ok(Bytes::from(getAccountCall::abi_encode_returns(

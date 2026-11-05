@@ -135,7 +135,7 @@ pub(crate) fn emit_position_changed_at_mark<H: PerpHost>(
             breakevenPrice: 0,
             // `P[].mt` — the type IN FORCE, through the one gate every surface shares, so this
             // row, `AccountPosition.marginType` and `getSymbolConfig` cannot disagree.
-            marginType: crate::margin_type::effective_margin_type(pos).code(),
+            marginType: crate::margin::margin_type::effective_margin_type(pos).code(),
         }
         .to_log_data(),
     });

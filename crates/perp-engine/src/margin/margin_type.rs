@@ -326,5 +326,4 @@ fn set_margin_type_core<H: PerpHost>(
 }
 
 #[cfg(test)]
-#[path = "margin_type_tests.rs"]
 mod tests;

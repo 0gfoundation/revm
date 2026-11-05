@@ -168,8 +168,8 @@ fn reported_type(ctx: &mut TestCtx, user: Address) -> u8 {
 #[test]
 fn gated_off_every_surface_reports_isolated_whatever_is_stored() {
     let mut ctx = make_ctx();
-    let _off = crate::margin_type::test_gate::disable();
-    assert!(!crate::margin_type::cross_margin_enabled(), "forced off");
+    let _off = crate::margin::margin_type::test_gate::disable();
+    assert!(!crate::margin::margin_type::cross_margin_enabled(), "forced off");
     assert_eq!(storage::load_position(&mut ctx, ALICE, MARKET_ID).unwrap().margin_type, CROSSED);
     assert_eq!(reported_type(&mut ctx, ALICE), ISOLATED, "a never-touched market");
     store_type(&mut ctx, BOB, ISOLATED);
@@ -190,7 +190,7 @@ fn gated_off_every_surface_reports_isolated_whatever_is_stored() {
 #[test]
 fn with_cross_enabled_every_surface_reports_the_stored_choice() {
     let mut ctx = make_ctx();
-    assert!(crate::margin_type::cross_margin_enabled());
+    assert!(crate::margin::margin_type::cross_margin_enabled());
     assert_eq!(reported_type(&mut ctx, ALICE), CROSSED, "Binance's default");
 
     store_type(&mut ctx, BOB, ISOLATED);
@@ -212,7 +212,7 @@ fn with_cross_enabled_every_surface_reports_the_stored_choice() {
 /// was in force before it, and with none alive the production gate is back.
 #[test]
 fn the_test_overrides_end_with_their_guards() {
-    use crate::margin_type::{cross_margin_enabled, test_gate};
+    use crate::margin::margin_type::{cross_margin_enabled, test_gate};
     let mut ctx = make_ctx();
     let production = crate::types::CROSS_MARGIN_ENABLED;
     let production_type = if production { CROSSED } else { ISOLATED };
@@ -236,7 +236,7 @@ fn the_test_overrides_end_with_their_guards() {
 /// would have left.
 #[test]
 fn the_isolated_by_default_hook_moves_only_the_never_set_byte() {
-    use crate::margin_type::{cross_margin_enabled, test_gate};
+    use crate::margin::margin_type::{cross_margin_enabled, test_gate};
     let mut ctx = make_ctx();
     let _on = test_gate::enable();
     store_type(&mut ctx, BOB, CROSSED); // written: CROSSED by choice
@@ -476,8 +476,8 @@ fn rejects_after_burn(ctx: &mut TestCtx, input: &[u8], expect: &str) {
 fn production_ships_cross_margin_on_and_the_default_is_crossed() {
     let mut ctx = make_ctx();
     const { assert!(crate::types::CROSS_MARGIN_ENABLED) };
-    assert_eq!(crate::margin_type::test_gate::forced(), None, "no override");
-    assert!(crate::margin_type::cross_margin_enabled());
+    assert_eq!(crate::margin::margin_type::test_gate::forced(), None, "no override");
+    assert!(crate::margin::margin_type::cross_margin_enabled());
     assert_eq!(stored(&mut ctx, ALICE).margin_type, CROSSED, "the stored default");
     assert_eq!(reported_type(&mut ctx, ALICE), CROSSED, "a never-touched market");
     rejects(&mut ctx, ALICE, &set_type(MARKET_ID, CROSSED), E_NO_NEED);
@@ -501,7 +501,7 @@ fn production_ships_cross_margin_on_and_the_default_is_crossed() {
 #[test]
 fn gated_off_the_switch_refuses_every_request_and_writes_nothing() {
     let mut ctx = make_ctx();
-    let _off = crate::margin_type::test_gate::disable();
+    let _off = crate::margin::margin_type::test_gate::disable();
     assert_eq!(stored(&mut ctx, ALICE).margin_type, CROSSED, "the stored default");
     rejects(&mut ctx, ALICE, &set_type(MARKET_ID, ISOLATED), E_NO_NEED);
     rejects(&mut ctx, ALICE, &set_type(MARKET_ID, CROSSED), E_GATE);
@@ -683,7 +683,7 @@ fn signed_state_refusals_follow_the_burn_with_the_direct_strings() {
     // Gated off: ISOLATED is -4046, CROSSED is the gate.
     let sk = SigningKey::from_bytes(&[0x5a; 32]);
     {
-        let _off = crate::margin_type::test_gate::disable();
+        let _off = crate::margin::margin_type::test_gate::disable();
         let mut ctx = make_ctx();
         register_key(&mut ctx, ALICE, &sk);
         rejects_after_burn(&mut ctx, &signed(&sk, MARKET_ID, ISOLATED), E_NO_NEED);
@@ -737,7 +737,7 @@ fn a_master_switches_its_sub_accounts_margin_type() {
     let _ = JournalTr::take_logs(ctx.journal_mut());
 
     // Gated off: the sub's refusals, not the master's.
-    let off = crate::margin_type::test_gate::disable();
+    let off = crate::margin::margin_type::test_gate::disable();
     rejects(&mut ctx, ALICE, &wrap(ISOLATED), E_NO_NEED);
     rejects(&mut ctx, ALICE, &wrap(CROSSED), E_GATE);
     rejects(&mut ctx, BOB, &wrap(ISOLATED), "asSubAccount: caller is not the master of subAccount");
@@ -834,7 +834,7 @@ fn the_reservation_only_route_cannot_move_the_margin_type() {
 fn the_signed_switch_collects_the_expired_seen_bucket() {
     use crate::storage::{SEEN_BUCKET_WIDTH_SECS as W, SEEN_RETENTION_BUCKETS as R};
     // Gated off, so every switch is refused (`-4046`) after its burn: the GC is under test here.
-    let _off = crate::margin_type::test_gate::disable();
+    let _off = crate::margin::margin_type::test_gate::disable();
     let mut ctx = make_ctx();
     let sk = SigningKey::from_bytes(&[7u8; 32]);
     register_key(&mut ctx, ALICE, &sk);

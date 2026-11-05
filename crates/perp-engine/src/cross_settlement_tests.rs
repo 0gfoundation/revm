@@ -290,7 +290,7 @@ impl Ledger {
             assert_eq!(net, 0, "{at}: market {m} is not zero-sum (Σ amount = {net})");
             for u in USERS {
                 let p = pos(ctx, u, m);
-                if crate::margin_type::effective_margin_type(&p) == MarginType::Crossed {
+                if crate::margin::margin_type::effective_margin_type(&p) == MarginType::Crossed {
                     assert_eq!(p.margin, 0, "{at}: {u} is CROSSED in market {m} but holds a silo");
                 }
             }
@@ -433,7 +433,7 @@ fn a_cross_loss_beyond_the_wallet_drives_it_negative_with_no_bad_debt() {
     assert_eq!(count_events::<InsuranceFundChanged>(&logs), 0);
     assert_eq!(position_changes(&logs, ALICE)[0].realizedPnl, realized);
     // The account is healthy: E = W + M2's +$2,000 is far above Σ MM.
-    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    let f = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
     assert_eq!(f.e, w1 as i128 + 2_000 * USD as i128);
     assert!(!f.below_cross_maintenance());
 }
@@ -594,7 +594,7 @@ fn cross_funding_settles_into_the_wallet_as_a_balance_only_push() {
     let owed = funding_payment(10, index);
     assert_eq!(owed, -7_500_000);
     let w0 = wallet(&mut ctx, ALICE);
-    let before = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    let before = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
     assert_eq!(before.cwb, w0 as i128 + owed as i128, "cWB counts it while pending");
 
     let logs = trade(&mut ctx, M1, ALICE, CAROL, SELL, px(100), 4);
@@ -736,7 +736,7 @@ fn one_tick_liquidates_a_crossed_account_and_an_isolated_position() {
 
     // $100 → $70: CAROL's silo is below maintenance, and so is ALICE's ACCOUNT
     // (E = W − $300 ≈ $99.50 against Σ MM = $116.67).
-    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    let f = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
     assert!(!f.below_cross_maintenance(), "healthy before the tick: {f:?}");
     let logs = tick(&mut ctx, M1, px(70), 30);
     ledger.check(&mut ctx, "after the sweep");
@@ -782,9 +782,9 @@ fn an_isolated_liquidation_close_never_folds_a_failing_cross_leg() {
     set_funding_index(&mut ctx, M2, 1_000_000_000_000_000_000_000);
     let cross_leg = pos(&mut ctx, CAROL, M2);
     let m2 = storage::load_market(&mut ctx, M2).unwrap().unwrap();
-    assert!(crate::margin_view::cross_leg(&m2, &cross_leg).is_err(), "the cross leg fails");
+    assert!(crate::margin::view::cross_leg(&m2, &cross_leg).is_err(), "the cross leg fails");
     assert!(
-        crate::margin_view::cross_fold_checked(&mut ctx, CAROL, None, None, None).is_err(),
+        crate::margin::view::cross_fold_checked(&mut ctx, CAROL, None, None, None).is_err(),
         "the checked fold refuses CAROL's account"
     );
 
@@ -868,7 +868,7 @@ fn adl_holds_an_underwater_cross_winner_back_to_the_fallback_tier() {
     set_mark(&mut ctx, M2, px(40));
     let ledger = Ledger::open(&mut ctx);
     let w0 = wallet(&mut ctx, ALICE);
-    let e = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap().e;
+    let e = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap().e;
     assert!(e + 150 * USD as i128 <= 0, "ALICE's account is underwater at $70 too: E = {e}");
 
     set_mark(&mut ctx, M1, px(70));
@@ -907,7 +907,7 @@ fn j6_a_taker_isolated_silo_is_funded_from_the_wallet_only() {
     let w0 = wallet(&mut ctx, ALICE);
     assert_eq!(w0, 400 * USD - fee(value(px(100), 10), TAKER_PPM));
     let silo = value(px(100), 5); // 1x
-    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    let f = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
     assert!(f.a >= silo as i128, "the available balance alone would admit it: A = {}", f.a);
     assert!(silo > w0, "but the wallet does not hold the silo's cash");
 
@@ -993,7 +993,7 @@ fn a_negative_cross_wallet_and_cross_profit_never_leave_through_the_money_out_ga
     // A cross long that triples: +$2,000 of profit on a $2,000 wallet.
     trade(&mut ctx, M2, ALICE, BOB, BUY, px(100), 10);
     set_mark(&mut ctx, M2, px(300));
-    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    let f = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
     let w = wallet(&mut ctx, ALICE);
     assert!(f.a > 2_500 * USD as i128, "A counts the profit: {}", f.a);
     // X is the wallet less the cross maintenance margin ($500 at $3,000 of notional): none of the
@@ -1019,7 +1019,7 @@ fn a_negative_cross_wallet_and_cross_profit_never_leave_through_the_money_out_ga
     ledger.check(&mut ctx, "after the losing close");
     let w = wallet(&mut ctx, ALICE);
     assert!(w < 0, "negative wallet: {w}");
-    let f = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    let f = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
     assert!(f.a > 0, "the remaining cross profit still admits orders: A = {}", f.a);
     assert_eq!(f.x, 0);
     rejects(&mut ctx, ALICE, &transfer_out(1), "transferFromPerp: insufficient perp wallet balance");
@@ -1130,7 +1130,8 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
                 }
                 let after = pos(&mut ctx, u, m);
                 if after.amount != before.amount
-                    && crate::margin_type::effective_margin_type(&after) == MarginType::Crossed
+                    && crate::margin::margin_type::effective_margin_type(&after)
+                        == MarginType::Crossed
                 {
                     cross_fills += 1;
                 }
@@ -1156,7 +1157,7 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
             set_funding_index(&mut ctx, m, index[j]);
             Vec::new()
         } else if roll < 78 {
-            let x = crate::margin_view::cross_fold(&mut ctx, u, None, None, None).unwrap().x;
+            let x = crate::margin::view::cross_fold(&mut ctx, u, None, None, None).unwrap().x;
             // ALICE, while exposed, takes everything withdrawable — which leaves her
             // wallet at the cross maintenance margin, so the next realized cross loss takes it
             // below zero.
@@ -1303,7 +1304,7 @@ fn gated_off_every_money_path_is_byte_identical_to_explicitly_isolated() {
     // Gated off — the engine before the flip: every slot still stores the CROSSED default.
     let mut gated = make_ctx();
     let (gated_outs, gated_logs, gated_state) = {
-        let _off = crate::margin_type::test_gate::disable();
+        let _off = crate::margin::margin_type::test_gate::disable();
         let (outs, logs) = scenario(&mut gated);
         (outs, logs, state(&mut gated))
     };

@@ -129,7 +129,7 @@ pub(crate) struct PendingFunding {
     /// only), so the account half of the payload is the caller's unmodified account and only the
     /// Σ leg moves; a CROSSED settle is the mirror image — the Σ leg is untouched and the cross
     /// wallet carries the payment, on the caller's account, which is the copy it persists.
-    snapshot: crate::margin_view::AccountWalletBalances,
+    snapshot: crate::margin::view::AccountWalletBalances,
 }
 
 impl PendingFunding {
@@ -137,7 +137,7 @@ impl PendingFunding {
     /// which records it as the user's `last_published` so the flush's mark-clear gate can tell that
     /// the end-of-call drain has nothing to add for a user whose ONLY event was this funding group
     /// (an insolvency-rejected maker is exactly that case).
-    pub(crate) fn snapshot(&self) -> &crate::margin_view::AccountWalletBalances {
+    pub(crate) fn snapshot(&self) -> &crate::margin::view::AccountWalletBalances {
         &self.snapshot
     }
 }
@@ -228,7 +228,7 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
         // `pos.margin` BEFORE funding moves it — the anchor for the header's Σ leg. Pre-funding is
         // the right anchor precisely because the stored aggregate is pre-funding too.
         let margin_before = pos.margin;
-        let cross = crate::margin_type::effective_margin_type(pos)
+        let cross = crate::margin::margin_type::effective_margin_type(pos)
             == crate::types::MarginType::Crossed;
         let snapshot = if cross {
             // CROSSED: the whole payment, either sign, lands on the cross wallet — through zero if
@@ -244,7 +244,7 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
                 .perp_wallet_balance
                 .checked_add(payment)
                 .ok_or_else(|| perp_err("funding: cross wallet overflow"))?;
-            crate::margin_view::wallet_balances_from_parts(
+            crate::margin::view::wallet_balances_from_parts(
                 account,
                 account
                     .total_position_margin
@@ -271,7 +271,7 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
                     &loaded
                 }
             };
-            crate::margin_view::wallet_balances_from_parts(
+            crate::margin::view::wallet_balances_from_parts(
                 account,
                 account
                     .total_position_margin

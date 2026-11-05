@@ -426,8 +426,8 @@ pub fn run_internal_transfer<H: PerpHost>(
         // no cross position; no unrealized profit and no negative cross wallet ever leaves),
         // recomputed fresh (never cached — it moves with every market's mark). A positive `amount`
         // must be covered in full.
-        let available = crate::margin_view::derived_withdrawable_balance(context, from)?;
-        if !crate::margin_view::derived_can_afford(available, amount as i128) {
+        let available = crate::margin::view::derived_withdrawable_balance(context, from)?;
+        if !crate::margin::view::derived_can_afford(available, amount as i128) {
             return Err(perp_err(
                 "internalTransfer: insufficient perp wallet balance",
             ));

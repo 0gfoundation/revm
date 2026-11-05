@@ -55,7 +55,7 @@ fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
     // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
     // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
-    crate::margin_type::test_gate::isolated_by_default();
+    crate::margin::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, BOB, CAROL, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -210,13 +210,13 @@ fn assert_event_matches_get_account(ctx: &mut TestCtx, event: &AccountBalanceCha
 fn oo_im(ctx: &mut TestCtx, user: Address) -> u64 {
     let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
     let p = storage::load_position(ctx, user, MARKET_ID).unwrap();
-    crate::margin_view::position_open_order_margin(&market, &p).unwrap()
+    crate::margin::view::position_open_order_margin(&market, &p).unwrap()
 }
 
 /// `perp_wallet_balance − Σ ooIM` — the account's spendable headroom, i.e. the quantity every
 /// admission gate now compares against. Signed: it can legitimately go negative.
 fn available(ctx: &mut TestCtx, user: Address) -> i128 {
-    crate::margin_view::derived_available_balance(ctx, user).unwrap()
+    crate::margin::view::derived_available_balance(ctx, user).unwrap()
 }
 
 /// Set `user`'s wallet so that AVAILABLE lands exactly on `target`.
@@ -2012,7 +2012,7 @@ fn position_registry_tracks_open_positions() {
     let u2 = user_addr(2);
     let open = |amt: i64| PerpPosition {
         amount: amt,
-        ..crate::margin_type::never_set_position()
+        ..crate::margin::margin_type::never_set_position()
     };
 
     // Opening (0 -> !=0) adds to the registry.
@@ -2056,7 +2056,7 @@ fn position_registry_blob_is_edited_in_place() {
     let users = [user_addr(1), user_addr(2), user_addr(3), user_addr(4)];
     let open = |amt: i64| PerpPosition {
         amount: amt,
-        ..crate::margin_type::never_set_position()
+        ..crate::margin::margin_type::never_set_position()
     };
     let blob = |ctx: &mut TestCtx| {
         storage::load_blob(ctx, perp_core::keys::position_registry_key(MARKET_ID)).unwrap()
@@ -2095,7 +2095,7 @@ fn position_registry_blob_is_edited_in_place() {
         .unwrap();
     {
         use crate::host::PerpHost as _;
-        ctx.live().set_position(users[0], m, crate::margin_type::never_set_position());
+        ctx.live().set_position(users[0], m, crate::margin::margin_type::never_set_position());
     }
     storage::save_position(&mut ctx, users[0], m, &open(1), AccountUpdateReason::Adjustment)
         .unwrap();
@@ -2599,7 +2599,7 @@ fn an_unfundable_maker_fill_still_fills_and_the_silo_is_short_not_the_wallet() {
     // The requirement itself is unchanged — it is the FUNDING that fell short, and the gap is
     // visible as `positionInitialMargin > isolatedWallet` (the §3.9 shape, which
     // `a_position_naturally_below_its_own_initial_margin_survives_normally` proves is normal).
-    let info = crate::margin_view::compute_margin_info(&mut ctx, BOB, MARKET_ID).unwrap();
+    let info = crate::margin::view::compute_margin_info(&mut ctx, BOB, MARKET_ID).unwrap();
     assert_eq!(info.position_initial_margin, INIT_MARGIN);
     assert_eq!(
         info.position_initial_margin as i64 - bob_pos.margin,
@@ -2634,7 +2634,7 @@ fn an_unfundable_maker_fill_still_fills_and_the_silo_is_short_not_the_wallet() {
     // any new order with a positive requirement) still refuses him. What changed is that he is not
     // in DEBT — a unit credited to him is spendable rather than swallowed by a deficit.
     assert_eq!(available(&mut ctx, BOB), 0);
-    assert!(!crate::margin_view::derived_can_afford(
+    assert!(!crate::margin::view::derived_can_afford(
         available(&mut ctx, BOB),
         1
     ));
@@ -2684,7 +2684,7 @@ fn a_short_silo_lowers_the_maintenance_buffer_it_is_measured_against() {
     // The shortfall is ABI-visible as the position's own margin, i.e. as `isolatedWallet` —
     // consumers compute LP from this number, so it has to be the short one.
     set_mark(&mut ctx, 160 * TICK);
-    let i = crate::margin_view::compute_margin_info(&mut ctx, BOB, MARKET_ID).unwrap();
+    let i = crate::margin::view::compute_margin_info(&mut ctx, BOB, MARKET_ID).unwrap();
     assert_eq!(i.position_margin, (INIT_MARGIN - SHORTFALL) as i64);
     assert_eq!(i.maint_margin, 1_600_000 / 6);
     assert_eq!(
@@ -2791,7 +2791,7 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: (FILL_VALUE / 3) as i64,
             leverage: 3,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -2889,7 +2889,7 @@ fn a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet() {
         "loss 400_000 − released margin 333_333, plus the cleared commission"
     );
     // Money-out stays shut on the cleared (zero) wallet.
-    assert!(!crate::margin_view::derived_can_afford(
+    assert!(!crate::margin::view::derived_can_afford(
         available(&mut ctx, BOB),
         1
     ));
@@ -2921,7 +2921,7 @@ fn the_k9_maintenance_guard_still_cancels_a_maker_and_the_taker_walks_on() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: INIT_MARGIN as i64,
             leverage: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3078,7 +3078,7 @@ fn a_position_naturally_below_its_own_initial_margin_survives_normally() {
     place(&mut ctx, ALICE, 0, PRICE, QTY, 0, 0); // real taker open, leverage 1
 
     // ── the §3.9 shape, produced not written ──
-    let i = crate::margin_view::compute_margin_info(&mut ctx, ALICE, MARKET_ID).unwrap();
+    let i = crate::margin::view::compute_margin_info(&mut ctx, ALICE, MARKET_ID).unwrap();
     assert_eq!(
         i.position_initial_margin, INIT_MARGIN,
         "PIM = ROUND_UP(N/1)"
@@ -3475,7 +3475,7 @@ fn taker_reverse_uses_released_close_margin_before_opening_margin_check() {
             amount: -(QTY as i64),
             v_quote_balance: FILL_VALUE as i64,
             margin: INIT_MARGIN as i64,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3498,7 +3498,7 @@ fn taker_reverse_uses_released_close_margin_before_opening_margin_check() {
             leverage: 1,
             // The flip ENDED the short's life: a new generation (see `PerpPosition::generation`).
             generation: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         }
     );
 }
@@ -3517,7 +3517,7 @@ fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
             amount: -(QTY as i64),
             v_quote_balance: FILL_VALUE as i64,
             margin: INIT_MARGIN as i64,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3557,7 +3557,7 @@ fn taker_reverse_accounts_close_and_open_values_at_each_fill_price() {
             cumulative_realized_pnl: 100_000,
             // The flip ENDED the short's life: a new generation (see `PerpPosition::generation`).
             generation: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         }
     );
     assert_eq!(wallet(&mut ctx, ALICE), 0);
@@ -3575,7 +3575,7 @@ fn maker_close_emits_fill_realized_pnl() {
             amount: -(QTY as i64),
             v_quote_balance: FILL_VALUE as i64,
             margin: INIT_MARGIN as i64,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3710,7 +3710,7 @@ fn trade_apportions_taker_realized_pnl_by_telescoping_with_zero_residual() {
             v_quote_balance: alice_vq,
             margin: -alice_vq,
             leverage: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3726,7 +3726,7 @@ fn trade_apportions_taker_realized_pnl_by_telescoping_with_zero_residual() {
             v_quote_balance: 2 * FILL_VALUE as i64,
             margin: 2 * FILL_VALUE as i64,
             leverage: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3740,7 +3740,7 @@ fn trade_apportions_taker_realized_pnl_by_telescoping_with_zero_residual() {
             v_quote_balance: FILL_VALUE as i64,
             margin: FILL_VALUE as i64,
             leverage: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3906,7 +3906,7 @@ fn trade_taker_realized_pnl_is_zero_on_the_opening_legs_of_a_flip() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: FILL_VALUE as i64,
             leverage: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3991,7 +3991,7 @@ fn insolvent_close_breaks_the_wallet_identity_by_exactly_the_bad_debt() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: (FILL_VALUE / 10) as i64,
             leverage: 10,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -4155,7 +4155,7 @@ fn underwater_maker_close_routes_bad_debt_to_insurance_fund_not_wallet() {
             v_quote_balance: -((FILL_VALUE * 2) as i64),
             margin: 500_000,
             leverage: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -4348,7 +4348,7 @@ fn self_trade_finalizes_taker_from_latest_maker_state() {
         pos(&mut ctx, ALICE),
         PerpPosition {
             leverage: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         }
     );
 }
@@ -4406,7 +4406,7 @@ fn self_trade_taker_margin_expiry_does_not_cancel_current_taker_order() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: INIT_MARGIN as i64,
             leverage: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         }
     );
     assert_eq!(wallet(&mut ctx, ALICE), INIT_MARGIN - old_buy_margin);
@@ -4718,7 +4718,7 @@ fn an_illegal_pair_is_rejected_before_any_write_or_log() {
             "an illegal (orderType, tif) pair must emit no logs at all"
         );
         assert_eq!(get_order(&mut ctx, resting).filled, 0, "maker untouched");
-        assert_eq!(pos(&mut ctx, ALICE), crate::margin_type::never_set_position());
+        assert_eq!(pos(&mut ctx, ALICE), crate::margin::margin_type::never_set_position());
         assert_eq!(wallet(&mut ctx, ALICE), WALLET);
         assert_eq!(
             storage::load_user_nonce(&mut ctx, ALICE).unwrap(),
@@ -4809,7 +4809,7 @@ fn each_limit_tif_keeps_its_own_behaviour_after_the_collapse() {
             "{err}"
         );
         assert_eq!(get_order(&mut ctx, maker).filled, 0);
-        assert_eq!(pos(&mut ctx, ALICE), crate::margin_type::never_set_position());
+        assert_eq!(pos(&mut ctx, ALICE), crate::margin::margin_type::never_set_position());
     }
     // PostOnly — refuses to take liquidity at all.
     {
@@ -6520,7 +6520,7 @@ fn fill_settles_funding_for_taker_and_maker() {
             v_quote_balance: -(FILL_VALUE as i64),
             margin: FILL_VALUE as i64,
             leverage: 1,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -10277,7 +10277,7 @@ mod batch_place {
             pos(&mut ctx, ALICE),
             PerpPosition {
                 leverage: 1,
-                ..crate::margin_type::never_set_position()
+                ..crate::margin::margin_type::never_set_position()
             }
         );
         assert_eq!(trade_count(&mut ctx), 1);
@@ -11404,7 +11404,7 @@ mod risk_reducing_admission {
                 v_quote_balance: -notional,
                 margin: notional,
                 leverage: 1,
-                ..crate::margin_type::never_set_position()
+                ..crate::margin::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -11867,7 +11867,7 @@ mod risk_reducing_admission {
         let assuming = if side == 0 {
             price
         } else {
-            price.max(crate::margin_view::assuming_price_floor(ctx, MARKET_ID, &market).unwrap())
+            price.max(crate::margin::view::assuming_price_floor(ctx, MARKET_ID, &market).unwrap())
         };
         let notional =
             crate::math::calc_value(assuming, qty, market.base_decimals, market.price_decimals)
@@ -11880,8 +11880,8 @@ mod risk_reducing_admission {
             after.total_sell_notional += notional;
         }
         let delta =
-            crate::margin_view::derived_requirement_delta(&market, &before, &after).unwrap();
-        let available_after = crate::margin_view::derived_available_balance_with(
+            crate::margin::view::derived_requirement_delta(&market, &before, &after).unwrap();
+        let available_after = crate::margin::view::derived_available_balance_with(
             ctx,
             user,
             None,
@@ -13051,7 +13051,7 @@ mod user_market_index {
 // `P × 10_000` quote units — $100 ⇒ 1_000_000, $90 ⇒ 900_000, $110 ⇒ 1_100_000.
 mod derived_ooim_divergence {
     use super::*;
-    use crate::margin_view::{position_open_order_margin, total_open_order_initial_margin};
+    use crate::margin::view::{position_open_order_margin, total_open_order_initial_margin};
     use crate::types::MarginTier;
 
     const P_LOW: u64 = 90 * TICK;
@@ -13119,7 +13119,7 @@ mod derived_ooim_divergence {
                 v_quote_balance: -notional,
                 margin: notional.abs(),
                 leverage,
-                ..crate::margin_type::never_set_position()
+                ..crate::margin::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -13422,7 +13422,7 @@ mod derived_ooim_divergence {
             1_800_000
         );
 
-        let available = crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap();
+        let available = crate::margin::view::derived_available_balance(&mut ctx, ALICE).unwrap();
         assert_eq!(available, funded as i128 - 1_800_000);
         // The trap, stated numerically: grossing the (nonexistent) escrow back up, as Phase 1
         // correctly did, would now over-report by exactly the requirement.
@@ -14026,9 +14026,9 @@ mod assuming_price {
         ctx: &mut TestCtx,
         user: Address,
     ) -> crate::interface::IPerpDex::AccountPosition {
-        crate::margin_view::AccountPositionRow {
+        crate::margin::view::AccountPositionRow {
             market_id: MARKET_ID,
-            info: crate::margin_view::compute_margin_info(ctx, user, MARKET_ID).unwrap(),
+            info: crate::margin::view::compute_margin_info(ctx, user, MARKET_ID).unwrap(),
         }
         .to_abi()
     }
@@ -14191,7 +14191,7 @@ mod resting_notional_stream {
     /// selector — calldata in, ABI-decoded return out — not through `compute_margin_info`. The
     /// claim being tested is about what a consumer can poll, so it is polled.
     fn reported_notionals(ctx: &mut TestCtx, user: Address) -> (u64, u64) {
-        let out = crate::margin_view::run_get_position_risk(
+        let out = crate::margin::view::run_get_position_risk(
             &getPositionRiskCall {
                 user,
                 marketId: MARKET_ID,
@@ -14633,7 +14633,7 @@ mod account_snapshot_events {
                 v_quote_balance: -notional,
                 margin: notional.abs(),
                 leverage: 1,
-                ..crate::margin_type::never_set_position()
+                ..crate::margin::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -15455,7 +15455,7 @@ mod account_snapshot_events {
                 v_quote_balance: -(FILL_VALUE as i64),
                 margin: INIT_MARGIN as i64,
                 leverage: 1,
-                ..crate::margin_type::never_set_position()
+                ..crate::margin::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -15840,7 +15840,7 @@ mod position_changed_derived_fields {
                 v_quote_balance: v_quote,
                 margin,
                 leverage: 1,
-                ..crate::margin_type::never_set_position()
+                ..crate::margin::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -17341,7 +17341,7 @@ mod reduce_only_e2e {
                 v_quote_balance: -notional,
                 margin: notional.abs(),
                 leverage: 1,
-                ..crate::margin_type::never_set_position()
+                ..crate::margin::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )
@@ -19022,7 +19022,7 @@ mod stp_matching {
                 v_quote_balance: -amount / QTY as i64 * FILL_VALUE as i64,
                 margin: (amount.unsigned_abs() / QTY * FILL_VALUE) as i64,
                 leverage: 1,
-                ..crate::margin_type::never_set_position()
+                ..crate::margin::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )

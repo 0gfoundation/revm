@@ -505,7 +505,7 @@ pub fn load_account_ref<H: PerpHost>(
 ///   a new event, not a correction, and consumers take the last row per user.
 ///
 /// Cost. Each published snapshot costs one
-/// [`crate::margin_view::index_account_wallet_balances`] call: **ONE** account `_ref` load, flat, with
+/// [`crate::margin::view::index_account_wallet_balances`] call: **ONE** account `_ref` load, flat, with
 /// no walk at all — all three published balances are stored scalars on that blob (`Σ pos.margin` is
 /// the maintained `UserAccount::total_position_margin`). It was ≤ 18 loads while that Σ was walked off
 /// the per-user market index at one position load per member market, and ≤ 33 before that, while the
@@ -632,7 +632,7 @@ pub(crate) fn publish_account_snapshot_now<H: PerpHost>(
 pub(crate) fn log_account_snapshot<H: PerpHost>(
     context: &mut H,
     user: Address,
-    b: &crate::margin_view::AccountWalletBalances,
+    b: &crate::margin::view::AccountWalletBalances,
     reason: AccountUpdateReason,
 ) {
     log_account_balance_changed(context, user, b, reason);
@@ -724,7 +724,8 @@ pub fn flush_account_snapshots<H: PerpHost>(context: &mut H) -> Result<(), PerpE
 
 /// Folds and logs one `AccountBalanceChanged` — **the one and only site that constructs this log.**
 ///
-/// All three balances come from [`crate::margin_view::index_account_wallet_balances`], which is now
+/// All three balances come from [`crate::margin::view::index_account_wallet_balances`], which is
+/// now
 /// ZERO-WALK: **one account load** and an addition, because all three are stored scalars on that blob
 /// (`Σ pos.margin` is [`crate::types::UserAccount::total_position_margin`], maintained by
 /// [`save_position`]). The wide `index_account_scalars` roll-up `getAccount` folds is not on this path
@@ -741,20 +742,21 @@ fn emit_account_snapshot<H: PerpHost>(
     reason: AccountUpdateReason,
 ) -> Result<(), PerpError> {
     let b =
-        crate::margin_view::index_account_wallet_balances(context, user, "AccountBalanceChanged")?;
+        crate::margin::view::index_account_wallet_balances(context, user, "AccountBalanceChanged")?;
     log_account_balance_changed(context, user, &b, reason);
     Ok(())
 }
 
 /// **The one and only site that constructs the `AccountBalanceChanged` log.** Two producers feed it
-/// — [`crate::margin_view::index_account_wallet_balances`] off the settled store (the drain and the
+/// — [`crate::margin::view::index_account_wallet_balances`] off the settled store (the drain and
+/// the
 /// taker emit) and `trading::settlement::UserWork::wallet_balances` off a match working copy (the
 /// per-fill maker emit) — and both hand it the same three-field `AccountWalletBalances`, so there is
 /// exactly one definition of the wire payload no matter where the numbers came from.
 fn log_account_balance_changed<H: PerpHost>(
     context: &mut H,
     user: Address,
-    b: &crate::margin_view::AccountWalletBalances,
+    b: &crate::margin::view::AccountWalletBalances,
     reason: AccountUpdateReason,
 ) {
     context.log(primitives::Log {
@@ -942,11 +944,11 @@ pub fn save_position_reservation_only_after_funding<H: PerpHost>(
     market_id: u64,
     pos: PerpPosition,
 ) -> Result<(), PerpError> {
-    let old_leg = crate::margin_type::cross_leg_of(
+    let old_leg = crate::margin::margin_type::cross_leg_of(
         market_id,
         &*load_position_ref(context, user, market_id)?,
     );
-    let new_leg = crate::margin_type::cross_leg_of(market_id, &pos);
+    let new_leg = crate::margin::margin_type::cross_leg_of(market_id, &pos);
     if new_leg != old_leg {
         set_cross_leg(context, user, market_id, new_leg)?;
     }
@@ -1139,7 +1141,7 @@ pub fn save_erc20_balance<H: PerpHost>(
 // ── PerpPosition ──────────────────────────────────────────────────────────────
 
 /// The position of `(user, market)`. One that was never written reads as
-/// [`crate::margin_type::never_set_position`] — the default position, margin type CROSSED.
+/// [`crate::margin::margin_type::never_set_position`] — the default position, margin type CROSSED.
 pub fn load_position<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -1148,12 +1150,12 @@ pub fn load_position<H: PerpHost>(
     use crate::typed_store::Resident;
     match typed_store_mut(context).position(user, market_id) {
         Resident::Hit(p) => return Ok(p.clone()),
-        Resident::Deleted => return Ok(crate::margin_type::never_set_position()),
+        Resident::Deleted => return Ok(crate::margin::margin_type::never_set_position()),
         Resident::Miss => {}
     }
     Ok(cold_fill_position(context, user, market_id)?
         .map(|p| (*p).clone())
-        .unwrap_or_else(crate::margin_type::never_set_position))
+        .unwrap_or_else(crate::margin::margin_type::never_set_position))
 }
 
 /// Zero-copy position read (点1): `Arc<PerpPosition>`, no per-read clone. Defaulted like
@@ -1176,10 +1178,10 @@ pub fn load_position_ref<H: PerpHost>(
         typed_store_mut(context).position(user, market_id),
         Resident::Deleted
     ) {
-        return Ok(std::sync::Arc::new(crate::margin_type::never_set_position()));
+        return Ok(std::sync::Arc::new(crate::margin::margin_type::never_set_position()));
     }
     Ok(cold_fill_position(context, user, market_id)?
-        .unwrap_or_else(|| std::sync::Arc::new(crate::margin_type::never_set_position())))
+        .unwrap_or_else(|| std::sync::Arc::new(crate::margin::margin_type::never_set_position())))
 }
 
 
@@ -1201,7 +1203,7 @@ pub fn save_position<H: PerpHost>(
     // was not (see `types::UserAccount::total_position_margin`).
     let (old_amount, old_margin, old_generation, old_margin_type, old_leg) = {
         let old = load_position_ref(context, user, market_id)?;
-        let leg = crate::margin_type::cross_leg_of(market_id, &old);
+        let leg = crate::margin::margin_type::cross_leg_of(market_id, &old);
         (old.amount, old.margin, old.generation, old.margin_type, leg)
     };
     // `margin_type` is a SETTING with exactly one writer, `setMarginType`, which goes through
@@ -1253,7 +1255,7 @@ pub fn save_position<H: PerpHost>(
     // from `liquidate_position` — a release-mode reject here would turn a reporting invariant into
     // a node halt. Total: `effective_margin_type` has no error path.
     debug_assert!(
-        crate::margin_type::effective_margin_type(pos) != crate::types::MarginType::Crossed
+        crate::margin::margin_type::effective_margin_type(pos) != crate::types::MarginType::Crossed
             || pos.margin == 0,
         "save_position: {user} market {market_id} is CROSSED in force but holds isolated margin {} \
          — a cross position's collateral is the cross wallet, never a silo",
@@ -1283,7 +1285,7 @@ pub fn save_position<H: PerpHost>(
     // them would then be missing under a stored non-zero CROSSED position, which the sweep, ADL
     // and the flag's end judge by the legs alone. Set first, the leg and the position are written
     // together or not at all.
-    let new_leg = crate::margin_type::cross_leg_of(market_id, pos);
+    let new_leg = crate::margin::margin_type::cross_leg_of(market_id, pos);
     if new_leg != old_leg {
         set_cross_leg(context, user, market_id, new_leg)?;
     }
@@ -1381,7 +1383,8 @@ pub fn save_position<H: PerpHost>(
             .checked_sub(old_margin)
             .ok_or_else(|| perp_err("save_position: position margin delta overflow"))?;
         let closed_crossed = count_delta == -1
-            && crate::margin_type::effective_margin_type(pos) == crate::types::MarginType::Crossed;
+            && crate::margin::margin_type::effective_margin_type(pos)
+                == crate::types::MarginType::Crossed;
         // `mutate_account`, not `mutate_account_balance`: this is not a WALLET move (no
         // `credit_perp`/`debit_perp`), and `save_position` marks the snapshot itself two lines below,
         // so marking here as well would be redundant.
@@ -1690,21 +1693,21 @@ pub fn cross_health_memo_hit<H: PerpHost>(
     user: Address,
     wallet: i64,
     legs: &std::sync::Arc<crate::types::CrossLegs>,
-) -> Option<(crate::margin_view::CrossHealth, u64, Option<crate::margin_view::CrossHealthLeg>)> {
+) -> Option<(crate::margin::view::CrossHealth, u64, Option<crate::margin::view::CrossHealthLeg>)> {
     let store = typed_store_mut(context);
     let epoch = store.market_epoch();
     let m = store.cross_health_memo(user)?;
     if m.wallet != wallet || !std::sync::Arc::ptr_eq(&m.legs, legs) || m.market_epoch != epoch {
         return None;
     }
-    let health = crate::margin_view::CrossHealth {
+    let health = crate::margin::view::CrossHealth {
         w: wallet as i128,
         e: m.e,
         cross_mm: m.cross_mm,
         has_cross: m.has_cross,
         faulted_legs: m.faulted_legs,
     };
-    let leg = m.leg.map(|(upnl, mm, pending_funding)| crate::margin_view::CrossHealthLeg {
+    let leg = m.leg.map(|(upnl, mm, pending_funding)| crate::margin::view::CrossHealthLeg {
         market_id: m.leg_market,
         upnl,
         mm,
@@ -1721,9 +1724,9 @@ pub fn memo_cross_health<H: PerpHost>(
     user: Address,
     wallet: i64,
     legs: std::sync::Arc<crate::types::CrossLegs>,
-    health: &crate::margin_view::CrossHealth,
+    health: &crate::margin::view::CrossHealth,
     leg_market: u64,
-    leg: Option<crate::margin_view::CrossHealthLeg>,
+    leg: Option<crate::margin::view::CrossHealthLeg>,
 ) {
     let store = typed_store_mut(context);
     let memo = crate::typed_store::CrossHealthMemo {
@@ -1758,7 +1761,7 @@ pub fn memo_cross_health_leg<H: PerpHost>(
     context: &mut H,
     user: Address,
     leg_market: u64,
-    leg: Option<crate::margin_view::CrossHealthLeg>,
+    leg: Option<crate::margin::view::CrossHealthLeg>,
 ) {
     if let Some(m) = typed_store_mut(context).cross_health_memo_mut(user) {
         m.leg_market = leg_market;

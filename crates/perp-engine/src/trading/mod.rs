@@ -1814,7 +1814,7 @@ fn remove_order_entry_by_price(
 ///   `N` is valued at the MARK while its cash cost is valued at the fill price, and the bound has to
 ///   be below both.
 ///
-/// The bound itself is not hand-rolled: it is [`crate::margin_view::derived_requirement_delta`] —
+/// The bound itself is not hand-rolled: it is [`crate::margin::view::derived_requirement_delta`] —
 /// the production `ooIM` delta — evaluated on a hypothetical where the WHOLE order rests at `p_min`.
 /// Under guards 1+2 the moved branch is monotone in that notional, so the real requirement (any
 /// fill/rest split) is at least this. Using the real function is deliberate: it inherits the `max()`
@@ -1917,7 +1917,7 @@ pub(crate) fn reject_provably_unaffordable_limit_order<H: PerpHost>(
         return Ok(());
     };
     *own_notional = sum;
-    let Ok(raw_bound) = crate::margin_view::derived_requirement_delta(market, &pos, &hypothetical)
+    let Ok(raw_bound) = crate::margin::view::derived_requirement_delta(market, &pos, &hypothetical)
     else {
         return Ok(());
     };
@@ -1932,7 +1932,7 @@ pub(crate) fn reject_provably_unaffordable_limit_order<H: PerpHost>(
     // A CROSSED order's own open gain lowers its requirement (see "A CROSS order" above): credit
     // the most it can be, plus the slack once more for that term's own flooring. An ISOLATED
     // order's bound is exactly what it was.
-    let cross = crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed;
+    let cross = crate::margin::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed;
     if cross {
         let gain_per_unit = match side {
             Side::Buy => market.mark_price.saturating_sub(side_min),
@@ -1951,7 +1951,7 @@ pub(crate) fn reject_provably_unaffordable_limit_order<H: PerpHost>(
         return Ok(());
     }
 
-    let available = crate::margin_view::derived_available_balance(context, user)?;
+    let available = crate::margin::view::derived_available_balance(context, user)?;
     if available < bound {
         // The rest gate's and the fills gate's own string for the same cause — the cross one for an
         // order on a position CROSSED in force (`insufficient_margin_reject`).
@@ -3227,7 +3227,7 @@ fn cross_rest_open_loss(
     price: u64,
     qty: u64,
 ) -> Result<u64, PerpError> {
-    if crate::margin_type::effective_margin_type(pos) != crate::types::MarginType::Crossed {
+    if crate::margin::margin_type::effective_margin_type(pos) != crate::types::MarginType::Crossed {
         return Ok(0);
     }
     let mark = market.mark_price;
@@ -3410,7 +3410,7 @@ fn rest_in_book<H: PerpHost>(
         // it side-conditional is what lets ONE rule (`Σ calc_value(assuming_price, amount)`) serve
         // both aggregates.
         Side::Buy => price,
-        Side::Sell => price.max(crate::margin_view::assuming_price_floor(
+        Side::Sell => price.max(crate::margin::view::assuming_price_floor(
             context, market_id, market,
         )?),
     };
@@ -3570,7 +3570,7 @@ fn rest_in_book<H: PerpHost>(
     // `pos_after` overrides storage for this market: it is not written until PHASE 2. ONE fold:
     // its `A` is the gate below (`derived_available_balance_with` is exactly this fold's `a`), its
     // `E` / `Σ_C MM` the maintenance check after it (R2) — no load beyond the walk the gate made.
-    let fold = crate::margin_view::cross_fold_checked(
+    let fold = crate::margin::view::cross_fold_checked(
         context,
         user,
         Some(wallet),
@@ -3582,11 +3582,11 @@ fn rest_in_book<H: PerpHost>(
     // the order's whole Binance cost. The B1 escape is unchanged: an order whose cost is not
     // positive (`Δ ooIM ≤ 0` and no open loss) rests at any balance.
     if available_after < open_loss as i128 {
-        let delta = crate::margin_view::derived_requirement_delta(market, &pos_basis, &pos_after)?;
+        let delta = crate::margin::view::derived_requirement_delta(market, &pos_basis, &pos_after)?;
         if delta > 0 || open_loss > 0 {
             // Write-clean (validate-then-apply: the probe above materialised nothing, and
             // `deferred` is dropped unflushed). A clean whole-order reject.
-            let cross = crate::margin_type::effective_margin_type(&pos_basis)
+            let cross = crate::margin::margin_type::effective_margin_type(&pos_basis)
                 == crate::types::MarginType::Crossed;
             return Ok(RestOutcome::RefusedUnaffordable { cross });
         }

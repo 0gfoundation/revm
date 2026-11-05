@@ -550,7 +550,7 @@ impl World {
     /// The engine's `cross_health`, in the model's shape.
     fn engine_health(&mut self, u: Address) -> (Health, u8) {
         let mut legs = Vec::new();
-        let h = self.probe(|w| crate::margin_view::cross_health(&mut w.h, u, Some(&mut legs)));
+        let h = self.probe(|w| crate::margin::view::cross_health(&mut w.h, u, Some(&mut legs)));
         let h = h.unwrap();
         let legs = legs
             .iter()
@@ -1282,7 +1282,7 @@ fn debug_cross_check_compares_the_health_with_the_walk() {
     p.total_buy_qty = u64::MAX / 2;
     p.total_buy_notional = u64::MAX;
     w.h.live.set_position(ALICE, M1, p);
-    let _ = crate::margin_view::cross_health(&mut w.h, ALICE, None);
+    let _ = crate::margin::view::cross_health(&mut w.h, ALICE, None);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════

@@ -205,7 +205,7 @@ fn users() -> Vec<Address> {
 /// The gate in force on this thread. The model reads the engine's own switch — the `const`, or a
 /// test's `#[cfg(test)]` override — so the two can never disagree about it.
 fn gate() -> bool {
-    crate::margin_type::cross_margin_enabled()
+    crate::margin::margin_type::cross_margin_enabled()
 }
 
 
@@ -2549,7 +2549,7 @@ fn isolated_scenario(ctx: &mut TestCtx) -> (Vec<Outcome>, Vec<Vec<u8>>) {
 #[test]
 fn gated_an_isolated_scenario_is_byte_identical_with_the_gate_on_and_everyone_isolated() {
     let (rec_a, views_a, world_a) = {
-        let _off = crate::margin_type::test_gate::disable();
+        let _off = crate::margin::margin_type::test_gate::disable();
         let mut a = fresh();
         let (rec, views) = isolated_scenario(&mut a);
         (rec, views, world_of(&mut a, true))

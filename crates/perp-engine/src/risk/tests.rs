@@ -51,7 +51,7 @@ fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
     // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
     // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
-    crate::margin_type::test_gate::isolated_by_default();
+    crate::margin::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, KEEPER, MAKER, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -171,7 +171,7 @@ fn index_update_sweep_liquidates_underwater_and_skips_healthy() {
             v_quote_balance: -ENTRY_VALUE,
             margin: 500_000_000,
             leverage: 2,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -291,7 +291,7 @@ fn liquidation_matching_caps_distinct_maker_accounts() {
             v_quote_balance: -i64::try_from(entry_value).unwrap(),
             margin: i64::try_from(entry_value / 5).unwrap(),
             leverage: 5,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -432,7 +432,7 @@ fn seed_position_account(
             v_quote_balance: v_quote,
             margin,
             leverage,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -822,7 +822,7 @@ fn adl_fills_against_an_order_holder_and_cancels_their_orders() {
     let keeper_pos = position(&mut ctx, KEEPER);
     let keeper_market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
     assert_eq!(
-        crate::margin_view::position_open_order_margin(&keeper_market, &keeper_pos).unwrap(),
+        crate::margin::view::position_open_order_margin(&keeper_market, &keeper_pos).unwrap(),
         0,
         "pure-reduce order requires no open-order margin — this is what makes any \
          `requirement != 0` proxy insufficient for 'has resting orders'"
@@ -1791,7 +1791,7 @@ fn settle_funding_noop_for_flat_position_but_reanchors() {
             v_quote_balance: 0,
             margin: 0,
             leverage: 5,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -1996,7 +1996,7 @@ fn funding_on_one_market_leaves_another_markets_headroom_intact() {
         .unwrap();
     let pos2 = storage::load_position(&mut ctx, ALICE, OTHER_MARKET).unwrap();
     assert_eq!(
-        crate::margin_view::position_open_order_margin(&market2, &pos2).unwrap(),
+        crate::margin::view::position_open_order_margin(&market2, &pos2).unwrap(),
         USER_WALLET,
         "the whole wallet is committable on market 2"
     );
@@ -2006,7 +2006,7 @@ fn funding_on_one_market_leaves_another_markets_headroom_intact() {
         "resting escrows nothing — the wallet is untouched by the placement"
     );
     assert_eq!(
-        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap(),
+        crate::margin::view::derived_available_balance(&mut ctx, ALICE).unwrap(),
         0,
         "and the full 50M was available to commit — market-1 funding took none of it"
     );
@@ -2531,7 +2531,7 @@ fn position(ctx: &mut TestCtx, user: Address) -> PerpPosition {
 fn oo_im(ctx: &mut TestCtx, user: Address) -> u64 {
     let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
     let pos = storage::load_position(ctx, user, MARKET_ID).unwrap();
-    crate::margin_view::position_open_order_margin(&market, &pos).unwrap()
+    crate::margin::view::position_open_order_margin(&market, &pos).unwrap()
 }
 
 fn save_position(ctx: &mut TestCtx, amount: i64, v_quote_balance: i64) {
@@ -2555,7 +2555,7 @@ fn save_position_with_leverage(
             v_quote_balance,
             margin: MARGIN,
             leverage,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3714,7 +3714,7 @@ fn set_leverage_decrease_without_position_tops_up_order_margin() {
         "placement debits nothing"
     );
     assert_eq!(
-        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap(),
+        crate::margin::view::derived_available_balance(&mut ctx, ALICE).unwrap(),
         166_666_666
     );
 
@@ -3726,7 +3726,7 @@ fn set_leverage_decrease_without_position_tops_up_order_margin() {
     assert_eq!(oo_im(&mut ctx, ALICE), 500_000_000);
     assert_eq!(wallet(&mut ctx, ALICE), 500_000_000);
     assert_eq!(
-        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap(),
+        crate::margin::view::derived_available_balance(&mut ctx, ALICE).unwrap(),
         0
     );
 }
@@ -3764,7 +3764,7 @@ fn set_leverage_decrease_without_position_rejects_when_order_margin_topup_is_unf
     assert_eq!(oo_im(&mut ctx, ALICE), 333_333_334);
     assert_eq!(wallet(&mut ctx, ALICE), 400_000_000);
     assert_eq!(
-        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap(),
+        crate::margin::view::derived_available_balance(&mut ctx, ALICE).unwrap(),
         66_666_666
     );
 }
@@ -3873,7 +3873,7 @@ fn remove_position_margin_round_trip_returns_only_what_clears_initial_margin() {
             v_quote_balance: -ENTRY_VALUE,
             margin: post_fee_margin,
             leverage: 3,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -3972,7 +3972,7 @@ fn remove_position_margin_settles_pending_funding_first() {
             v_quote_balance: -ENTRY_VALUE,
             margin: 400_000_000,
             leverage: 5,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -5096,7 +5096,7 @@ mod value_conservation {
                     v_quote_balance: vq,
                     margin: MARGIN,
                     leverage: 5,
-                    ..crate::margin_type::never_set_position()
+                    ..crate::margin::margin_type::never_set_position()
                 },
                 AccountUpdateReason::Adjustment,
             )
@@ -5305,7 +5305,7 @@ mod usdc_custody {
             depositCall, getAccountCall, getAccountMarginCall, transferFromPerpCall,
             transferToPerpCall, withdrawCall,
         },
-        margin_view::run_get_account_margin,
+        margin::view::run_get_account_margin,
         storage::keys::erc20_balance_slot,
     };
 
@@ -5348,7 +5348,7 @@ mod usdc_custody {
         }
         // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
         // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
-        crate::margin_type::test_gate::isolated_by_default();
+        crate::margin::margin_type::test_gate::isolated_by_default();
         let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
         for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS]
             .iter()
@@ -10099,7 +10099,7 @@ mod withdrawal_cap {
     // ── read side: the client's view ─────────────────────────────────────────────────────────
 
     fn risk_row_on(ctx: &mut TestCtx, user: Address, market_id: u64) -> AccountPosition {
-        let out = crate::margin_view::run_get_position_risk(
+        let out = crate::margin::view::run_get_position_risk(
             &getPositionRiskCall {
                 user,
                 marketId: market_id,
@@ -11061,9 +11061,9 @@ mod withdrawal_cap {
         );
         assert_eq!(cap_of(&row), cap_before, "bit-identical cap with the order resting");
 
-        let available0 = crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap();
+        let available0 = crate::margin::view::derived_available_balance(&mut ctx, ALICE).unwrap();
         assert_eq!(probe(&mut ctx, G3), cap_before);
-        let available1 = crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap();
+        let available1 = crate::margin::view::derived_available_balance(&mut ctx, ALICE).unwrap();
         assert_eq!(available1 - available0, cap_before as i128);
         assert_eq!(risk_row(&mut ctx).openOrderInitialMargin, row.openOrderInitialMargin);
     }
@@ -11262,7 +11262,7 @@ mod withdrawal_cap {
                     total_buy_notional: bid,
                     total_sell_qty: sell_qty,
                     total_sell_notional: ask,
-                    ..crate::margin_type::never_set_position()
+                    ..crate::margin::margin_type::never_set_position()
                 },
                 AccountUpdateReason::Adjustment,
             )
@@ -11613,7 +11613,7 @@ mod funding_debt {
                 margin,
                 leverage: 5,
                 last_funding_index,
-                ..crate::margin_type::never_set_position()
+                ..crate::margin::margin_type::never_set_position()
             },
             AccountUpdateReason::Adjustment,
         )

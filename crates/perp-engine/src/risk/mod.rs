@@ -690,8 +690,8 @@ fn set_leverage_core<H: PerpHost>(
     // always (the requirement only falls), lowering only if `A` covers what it adds
     // (`cross_leverage_gate`, Binance `-2028`). Maintenance does not depend on the leverage, so the
     // account's cross health (`E` vs `Σ_C MM`) is untouched either way.
-    let cross =
-        crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed;
+    let cross = crate::margin::margin_type::effective_margin_type(&pos)
+        == crate::types::MarginType::Crossed;
     let old_leverage = pos.leverage.max(1);
     if !cross && pos.amount != 0 && leverage < old_leverage {
         return Err(perp_err(
@@ -741,7 +741,8 @@ fn set_leverage_core<H: PerpHost>(
 /// about the band structure; see that function for the `setMarginTiers`-under-a-live-position
 /// state its assertion covers, and the ABI doc for why this is a selector at all.
 ///
-/// `marginType` is the type IN FORCE, through [`crate::margin_type::effective_margin_type`] — the
+/// `marginType` is the type IN FORCE, through
+/// [`crate::margin::margin_type::effective_margin_type`] — the
 /// same gate the `AccountPosition` row and `PositionChanged` read, never the raw stored byte.
 ///
 /// Reverts on an unknown market: the tier table is a required input, and fabricating an empty one
@@ -762,7 +763,7 @@ pub fn run_get_symbol_config<H: PerpHost>(
         &getSymbolConfigReturn {
             leverage,
             maxNotionalValue: max_notional_for_leverage(&market.tiers, leverage),
-            marginType: crate::margin_type::effective_margin_type(&pos).code(),
+            marginType: crate::margin::margin_type::effective_margin_type(&pos).code(),
         },
     )))
 }
@@ -784,7 +785,7 @@ pub fn run_get_position<H: PerpHost>(
 
     let pos = storage::load_position_ref(context, args.user, args.marketId)?;
     let open_order_margin = match storage::load_market_ref(context, args.marketId)? {
-        Some(market) => crate::margin_view::position_open_order_margin(&market, &pos)?,
+        Some(market) => crate::margin::view::position_open_order_margin(&market, &pos)?,
         None => 0,
     };
     Ok(Bytes::from(getPositionCall::abi_encode_returns(
@@ -847,7 +848,9 @@ pub fn run_add_position_margin<H: PerpHost>(
     // A CROSSED position has no silo to add to (`CROSSED ⇒ margin == 0`): its margin IS the cross
     // wallet. Binance `-4049`, ahead of the position check — no amount of position makes a cross
     // market's margin addable.
-    if crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed {
+    if crate::margin::margin_type::effective_margin_type(&pos)
+        == crate::types::MarginType::Crossed
+    {
         return Err(perp_err(ADD_MARGIN_CROSSED_REJECT));
     }
     if pos.amount == 0 {
@@ -875,8 +878,8 @@ pub fn run_add_position_margin<H: PerpHost>(
     // wallet's withdrawable balance (F5). For an account with no cross position the decision is
     // the one it always was (`X ≥ amount ⇔ A ≥ amount` for a positive amount); only the string
     // gained the code.
-    let available = crate::margin_view::derived_withdrawable_balance(context, caller)?;
-    if !crate::margin_view::derived_can_afford(available, args.amount as i128) {
+    let available = crate::margin::view::derived_withdrawable_balance(context, caller)?;
+    if !crate::margin::view::derived_can_afford(available, args.amount as i128) {
         return Err(perp_err(ADD_MARGIN_CAP_REJECT));
     }
     account.debit_perp(args.amount)?;
@@ -945,7 +948,9 @@ pub fn run_remove_position_margin<H: PerpHost>(
 
     let mut pos = storage::load_position(context, caller, args.marketId)?;
     // A CROSSED position has no silo to remove from — see `addPositionMargin` (`-4049`).
-    if crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed {
+    if crate::margin::margin_type::effective_margin_type(&pos)
+        == crate::types::MarginType::Crossed
+    {
         return Err(perp_err(REMOVE_MARGIN_CROSSED_REJECT));
     }
     if pos.amount == 0 {
@@ -1027,7 +1032,7 @@ pub fn run_remove_position_margin<H: PerpHost>(
         return Err(perp_err(REMOVE_MARGIN_G1_REJECT));
     }
     let new_margin = pos.margin - amount;
-    let info = crate::margin_view::margin_info_of(&market, &pos)?;
+    let info = crate::margin::view::margin_info_of(&market, &pos)?;
     debug_assert_eq!(
         info.mark_price, mark_price,
         "removePositionMargin: the cap and the G4 predicate must price at one mark"
@@ -1146,7 +1151,9 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // (`cross_liquidation`), so this is unreachable; answered with NO write — before the funding
     // compute, which for a cross position needs the account this path does not load — rather than
     // with an `Err`, because the sweep panics on any `Err` from this function.
-    if crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed {
+    if crate::margin::margin_type::effective_margin_type(&pos)
+        == crate::types::MarginType::Crossed
+    {
         debug_assert!(false, "liquidate_position: a CROSSED position must be routed to the episode");
         return Ok(LiquidationOutcome::AboveMaintenance);
     }
@@ -1467,7 +1474,8 @@ pub fn run_liquidate<H: PerpHost>(
     let route_to_episode = {
         let pos = storage::load_position_ref(context, args.user, args.marketId)?;
         if pos.amount != 0 {
-            crate::margin_type::effective_margin_type(&pos) == crate::types::MarginType::Crossed
+            crate::margin::margin_type::effective_margin_type(&pos)
+                == crate::types::MarginType::Crossed
         } else {
             storage::load_account_ref(context, args.user)?.in_liquidation()
         }
@@ -1624,7 +1632,7 @@ fn run_liquidation_sweep<H: PerpHost>(
         let crossed = {
             let pos = storage::load_position_ref(context, user, market_id)?;
             pos.amount != 0
-                && crate::margin_type::effective_margin_type(&pos)
+                && crate::margin::margin_type::effective_margin_type(&pos)
                     == crate::types::MarginType::Crossed
         };
         // commit-only (#23): healthy candidates are write-free (funding is computed in memory
@@ -2092,7 +2100,7 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
 ) -> Result<(), PerpError> {
     let mut after = pos.clone();
     after.leverage = new_leverage;
-    let delta = crate::margin_view::derived_requirement_delta(market, pos, &after)?;
+    let delta = crate::margin::view::derived_requirement_delta(market, pos, &after)?;
     // The available is measured on the CURRENT (pre-change) state, which is what `delta` is the
     // increment to — with the caller's in-memory `pos` overriding storage for this market, since
     // it is not written until after this gate. A non-positive delta is free (`derived_can_afford`).
@@ -2112,13 +2120,13 @@ fn rebalance_order_margin_for_leverage<H: PerpHost>(
     //     resting can only ever raise `max(|N + Bid|, |N − Ask|)`, so its delta is never negative.
     // Sequencing note if that ever changes: `pos.leverage` is written by the CALLER after this
     // returns, so an override carrying `after` here would be one step ahead of storage.
-    let available = crate::margin_view::derived_available_balance_with(
+    let available = crate::margin::view::derived_available_balance_with(
         context,
         user,
         None,
         Some((market.market_id, pos)),
     )?;
-    if !crate::margin_view::derived_can_afford(available, delta) {
+    if !crate::margin::view::derived_can_afford(available, delta) {
         return Err(perp_err(
             "setLeverage: insufficient perp wallet for order margin",
         ));
@@ -2156,16 +2164,16 @@ fn cross_leverage_gate<H: PerpHost>(
     let mut after = pos.clone();
     after.leverage = new_leverage;
     let im = |p: &crate::types::PerpPosition| -> Result<i128, PerpError> {
-        Ok(crate::margin_view::position_derived_margin(market, p)?.margin.initial_margin as i128)
+        Ok(crate::margin::view::position_derived_margin(market, p)?.margin.initial_margin as i128)
     };
     let delta = im(&after)? - im(pos)?;
-    let available = crate::margin_view::derived_available_balance_with(
+    let available = crate::margin::view::derived_available_balance_with(
         context,
         user,
         None,
         Some((market.market_id, pos)),
     )?;
-    if !crate::margin_view::derived_can_afford(available, delta) {
+    if !crate::margin::view::derived_can_afford(available, delta) {
         return Err(perp_err(CROSS_LEVERAGE_REJECT));
     }
     Ok(())
@@ -2392,8 +2400,8 @@ pub fn run_deposit_insurance_fund<H: PerpHost>(
 
     let mut account = storage::load_account(context, caller)?;
     // Derived money-out gate — a pure cash-out, see `addPositionMargin` / `transferFromPerp`.
-    let available = crate::margin_view::derived_withdrawable_balance(context, caller)?;
-    if !crate::margin_view::derived_can_afford(available, args.amount as i128) {
+    let available = crate::margin::view::derived_withdrawable_balance(context, caller)?;
+    if !crate::margin::view::derived_can_afford(available, args.amount as i128) {
         return Err(perp_err(
             "depositInsuranceFund: insufficient perp wallet balance",
         ));

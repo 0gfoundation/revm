@@ -72,7 +72,7 @@ fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
     // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
     // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
-    crate::margin_type::test_gate::isolated_by_default();
+    crate::margin::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, BOB, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -146,7 +146,7 @@ fn set_position(
             v_quote_balance,
             margin,
             leverage,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -207,7 +207,7 @@ fn set_orders(
     );
     let market = storage::load_market_ref(ctx, market_id).unwrap().unwrap();
     let (bd, pd) = (market.base_decimals, market.price_decimals);
-    let floor = crate::margin_view::assuming_price_floor(ctx, market_id, &market).unwrap();
+    let floor = crate::margin::view::assuming_price_floor(ctx, market_id, &market).unwrap();
 
     let buys: Vec<OrderEntry> = buys
         .iter()
@@ -1943,7 +1943,7 @@ fn get_position_risk_reports_zero_liquidation_price_when_there_is_none() {
 fn get_position_risk_rejects_unknown_market() {
     let mut ctx = make_ctx();
     setup_a(&mut ctx);
-    let err = crate::margin_view::run_get_position_risk(
+    let err = crate::margin::view::run_get_position_risk(
         &getPositionRiskCall {
             user: ALICE,
             marketId: 999,

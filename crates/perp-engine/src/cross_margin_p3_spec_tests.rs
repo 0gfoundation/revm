@@ -660,7 +660,7 @@ impl World {
             assert_eq!(stored.0, walked, "{at}: {u} cross legs");
             // …and the health check priced from it is the model's account (every leg priceable
             // here, so none is faulted).
-            let h = crate::margin_view::cross_health(&mut self.ctx, u, None).unwrap();
+            let h = crate::margin::view::cross_health(&mut self.ctx, u, None).unwrap();
             assert_eq!(
                 (h.e, h.cross_mm, h.has_cross, h.faulted_legs),
                 (a.e, a.cmm, a.has_cross, 0),

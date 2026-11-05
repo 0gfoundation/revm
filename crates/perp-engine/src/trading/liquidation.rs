@@ -273,8 +273,8 @@ pub(crate) fn run_adl<H: PerpHost>(
     }
     let bd = market.base_decimals;
     let pd = market.price_decimals;
-    let loser_cross =
-        crate::margin_type::effective_margin_type(&loser_pos) == crate::types::MarginType::Crossed;
+    let loser_cross = crate::margin::margin_type::effective_margin_type(&loser_pos)
+        == crate::types::MarginType::Crossed;
     let (fill_price, loser_policy) = if loser_cross {
         // ── A CROSSED loser: the episode's price ─────────────────────────────────────────────────
         //
@@ -460,8 +460,10 @@ fn run_adl_fills<H: PerpHost>(
         // Through the call's memo (`cross_health_for_adl`): every loser of a sweep ranks the same
         // holders again, and between two losers only the accounts a fill or a liquidation wrote
         // change — the memo re-prices exactly those (and every account, once any `Market` moved).
-        if crate::margin_type::effective_margin_type(&wp) == crate::types::MarginType::Crossed {
-            let (health, leg) = crate::margin_view::cross_health_for_adl(
+        if crate::margin::margin_type::effective_margin_type(&wp)
+            == crate::types::MarginType::Crossed
+        {
+            let (health, leg) = crate::margin::view::cross_health_for_adl(
                 context,
                 user,
                 market.market_id,
@@ -771,7 +773,7 @@ fn run_adl_fills<H: PerpHost>(
         // winner's off the settled store, which its two writes just above made current. The trailing
         // `did_any` writes re-mark the loser, so the drain adds one 0-position group for its settled
         // end state — correct, and the fail-safe direction.
-        let loser_balances = crate::margin_view::wallet_balances_from_parts(
+        let loser_balances = crate::margin::view::wallet_balances_from_parts(
             &loser_account,
             loser_other_market_margin,
             loser_pos.margin,

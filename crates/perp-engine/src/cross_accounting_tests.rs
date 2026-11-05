@@ -330,7 +330,7 @@ fn the_invariant_binds_only_the_type_in_force() {
     let silo =
         PerpPosition { amount: 1, v_quote_balance: -USD, margin: 1, ..PerpPosition::default() };
     {
-        let _off = crate::margin_type::test_gate::disable();
+        let _off = crate::margin::margin_type::test_gate::disable();
         plant(&mut ctx, ALICE, M1, silo.clone()); // gated off: ISOLATED in force
     }
 
@@ -405,7 +405,7 @@ fn plant_leg(ctx: &mut TestCtx, user: Address, leg: &Leg) {
         isolate(ctx, user, leg.market);
     }
     let m = storage::load_market_ref(ctx, leg.market).unwrap().unwrap();
-    let floor = crate::margin_view::assuming_price_floor(ctx, leg.market, &m).unwrap();
+    let floor = crate::margin::view::assuming_price_floor(ctx, leg.market, &m).unwrap();
     let entry = |i: usize, price: u64, qty: u64, assuming: u64| {
         let mut id = [0u8; 32];
         id[0] = leg.market as u8;
@@ -473,7 +473,7 @@ fn model_mm(tiers: &[(u64, u32, u32)], n: i128) -> i128 {
 /// The expected [`CrossFold`] for `legs` and wallet `w`, from the formulas alone (cross report
 /// §3.2): `N = trunc(amount · mark · 1e4)` on this grid, `uPnL = N + vQuote` (0 at mark 0),
 /// `PIM = ⌈|N|/L⌉`, `ooIM = ⌈max(|N+Bid|, |N−Ask|)/L⌉ − PIM`, `PF = −trunc(amount · index / 1e2)`.
-fn model(legs: &[Leg], markets: &[(u64, ModelMarket)], w: i64) -> crate::margin_view::CrossFold {
+fn model(legs: &[Leg], markets: &[(u64, ModelMarket)], w: i64) -> crate::margin::view::CrossFold {
     let mm_of = |id: u64| &markets.iter().find(|(m, _)| *m == id).unwrap().1;
     let (mut pf, mut upnl, mut pim, mut mm, mut oo, mut iso_oo) = (0i128, 0, 0, 0, 0, 0);
     let mut has_cross = false;
@@ -501,7 +501,7 @@ fn model(legs: &[Leg], markets: &[(u64, ModelMarket)], w: i64) -> crate::margin_
     }
     let cwb = w as i128 + pf;
     let a = cwb + upnl - pim - oo;
-    crate::margin_view::CrossFold {
+    crate::margin::view::CrossFold {
         w: w as i128,
         pending_funding_cross: pf,
         cwb,
@@ -519,9 +519,9 @@ fn model(legs: &[Leg], markets: &[(u64, ModelMarket)], w: i64) -> crate::margin_
     }
 }
 
-fn fold(ctx: &mut TestCtx, user: Address) -> crate::margin_view::CrossFold {
-    let total = crate::margin_view::cross_fold(ctx, user, None, None, None).unwrap();
-    let checked = crate::margin_view::cross_fold_checked(ctx, user, None, None, None).unwrap();
+fn fold(ctx: &mut TestCtx, user: Address) -> crate::margin::view::CrossFold {
+    let total = crate::margin::view::cross_fold(ctx, user, None, None, None).unwrap();
+    let checked = crate::margin::view::cross_fold_checked(ctx, user, None, None, None).unwrap();
     assert_eq!(total, checked, "the total and the checked folds agree on a sound account");
     total
 }
@@ -587,7 +587,7 @@ fn the_cross_fold_matches_an_independent_model_on_a_mixed_account() {
 
     // Per leg, in index order.
     let mut legs_out = Vec::new();
-    crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, Some(&mut legs_out)).unwrap();
+    crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, Some(&mut legs_out)).unwrap();
     assert_eq!(legs_out.iter().map(|l| l.market_id).collect::<Vec<_>>(), vec![M1, M2, M3]);
     for (got, leg) in legs_out.iter().zip(&legs) {
         let one = model(std::slice::from_ref(leg), &markets, 0);
@@ -606,7 +606,7 @@ fn gated_off_the_fold_is_the_isolated_basis_it_always_was() {
     storage::save_market(&mut ctx, &market(M3)).unwrap();
     // Plant with cross on (the cross legs must be margin-free), then read with it off.
     let (legs, markets) = mixed_account(&mut ctx);
-    let _off = crate::margin_type::test_gate::disable();
+    let _off = crate::margin::margin_type::test_gate::disable();
     set_wallet(&mut ctx, ALICE, 5_000 * USD);
     let got = fold(&mut ctx, ALICE);
     let isolated: Vec<Leg> = legs.iter().map(|l| Leg { cross: false, ..l.clone() }).collect();
@@ -621,12 +621,12 @@ fn gated_off_the_fold_is_the_isolated_basis_it_always_was() {
     for id in [M1, M2, M3] {
         let m = storage::load_market_ref(&mut ctx, id).unwrap().unwrap();
         let p = storage::load_position_ref(&mut ctx, ALICE, id).unwrap();
-        sum_ooim += crate::margin_view::position_open_order_margin(&m, &p).unwrap() as i128;
+        sum_ooim += crate::margin::view::position_open_order_margin(&m, &p).unwrap() as i128;
     }
     assert_eq!(got.a, 5_000 * USD as i128 - sum_ooim);
     assert_eq!(got.x, got.a.max(0));
     assert_eq!(
-        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap(),
+        crate::margin::view::derived_available_balance(&mut ctx, ALICE).unwrap(),
         got.a,
         "the gates' basis is the fold's A"
     );
@@ -712,13 +712,13 @@ fn a_missing_market_is_refused_by_the_checked_fold() {
     let orphan = PerpPosition { amount: 1, margin: 1, ..isolate(&mut ctx, ALICE, 99) };
     plant(&mut ctx, ALICE, 99, orphan);
     let err =
-        crate::margin_view::cross_fold_checked(&mut ctx, ALICE, None, None, None).unwrap_err();
+        crate::margin::view::cross_fold_checked(&mut ctx, ALICE, None, None, None).unwrap_err();
     assert_eq!(
         err.to_string(),
         "[INVARIANT] derived margin: user market index holds unknown market 99"
     );
     assert_eq!(
-        crate::margin_view::derived_available_balance(&mut ctx, ALICE).unwrap_err(),
+        crate::margin::view::derived_available_balance(&mut ctx, ALICE).unwrap_err(),
         err,
         "the gates' basis refuses the same way"
     );
@@ -735,8 +735,8 @@ fn a_missing_market_contributes_nothing_to_the_total_fold() {
     let before = fold(&mut ctx, ALICE);
     let orphan = PerpPosition { amount: 1, margin: 1, ..isolate(&mut ctx, ALICE, 99) };
     plant(&mut ctx, ALICE, 99, orphan);
-    let after = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
-    assert_eq!(after, crate::margin_view::CrossFold { faulted_legs: 1, ..before });
+    let after = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    assert_eq!(after, crate::margin::view::CrossFold { faulted_legs: 1, ..before });
 }
 
 /// A leg whose arithmetic leaves the representable range (a notional past `i64`): refused by the
@@ -749,10 +749,10 @@ fn an_overflowing_leg_is_refused_checked_and_left_out_total() {
     let sound = fold(&mut ctx, ALICE);
     plant(&mut ctx, ALICE, M2, PerpPosition { amount: i64::MAX / 2, ..PerpPosition::default() });
     let err =
-        crate::margin_view::cross_fold_checked(&mut ctx, ALICE, None, None, None).unwrap_err();
+        crate::margin::view::cross_fold_checked(&mut ctx, ALICE, None, None, None).unwrap_err();
     assert_eq!(err.to_string(), "math: signed value exceeds i64");
-    let total = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
-    assert_eq!(total, crate::margin_view::CrossFold { faulted_legs: 1, ..sound });
+    let total = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    assert_eq!(total, crate::margin::view::CrossFold { faulted_legs: 1, ..sound });
 }
 
 /// The overrides price a post-trade state without touching storage: a wallet override replaces
@@ -781,7 +781,7 @@ fn the_overrides_price_a_hypothetical_post_state() {
         ..PerpPosition::default()
     };
     let got =
-        crate::margin_view::cross_fold(&mut ctx, ALICE, Some(7 * USD), Some((M1, &over)), None)
+        crate::margin::view::cross_fold(&mut ctx, ALICE, Some(7 * USD), Some((M1, &over)), None)
             .unwrap();
     assert_eq!(got, model(std::slice::from_ref(&grown), &markets, 7 * USD));
 
@@ -793,7 +793,7 @@ fn the_overrides_price_a_hypothetical_post_state() {
         leverage: 2,
         ..PerpPosition::default()
     };
-    let got = crate::margin_view::cross_fold(&mut ctx, ALICE, None, Some((M2, &over2)), None)
+    let got = crate::margin::view::cross_fold(&mut ctx, ALICE, None, Some((M2, &over2)), None)
         .unwrap();
     assert_eq!(got, model(&[held, entering], &markets, 1_000 * USD));
 
@@ -831,7 +831,7 @@ fn account_margin(ctx: &mut TestCtx, user: Address, ids: &[u64]) -> getAccountMa
 fn liquidatable_at(ctx: &mut TestCtx, user: Address, market: u64, mark: u64) -> bool {
     let stored = storage::load_mark_price(ctx, market).unwrap();
     storage::save_mark_price(ctx, market, mark).unwrap();
-    let f = crate::margin_view::cross_fold(ctx, user, None, None, None).unwrap();
+    let f = crate::margin::view::cross_fold(ctx, user, None, None, None).unwrap();
     storage::save_mark_price(ctx, market, stored).unwrap();
     f.below_cross_maintenance()
 }
@@ -1083,7 +1083,7 @@ fn every_getter_is_byte_identical_for_an_isolated_only_account() {
     // Gated off — the engine before the flip. Every getter read with the gate still off.
     let mut gated = make_ctx();
     let (gated_logs, gated_bytes) = {
-        let _off = crate::margin_type::test_gate::disable();
+        let _off = crate::margin::margin_type::test_gate::disable();
         let logs = scenario(&mut gated);
         let bytes: Vec<_> = [ALICE, BOB].map(|u| getter_bytes(&mut gated, u)).into();
         (logs, bytes)

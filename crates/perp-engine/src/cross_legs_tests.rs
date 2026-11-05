@@ -16,7 +16,7 @@ use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, Address, FixedBytes, Log, U256};
 
-use crate::margin_view::{CrossHealth, CrossHealthLeg};
+use crate::margin::view::{CrossHealth, CrossHealthLeg};
 use crate::{
     interface::IPerpDex::{
         addPositionMarginCall, asSubAccountCall, batchPlaceOrdersCall, createSubAccountCall,
@@ -437,7 +437,7 @@ fn the_aggregates_only_route_cannot_write_back_a_stale_position() {
 /// re-check, so this holds in a release test build too.
 #[test]
 fn the_health_memo_answers_again_only_while_its_inputs_hold() {
-    use crate::margin_view::{cross_health, cross_health_for_adl, memo_stats};
+    use crate::margin::view::{cross_health, cross_health_for_adl, memo_stats};
     let mut ctx = make_ctx();
     ok(&mut ctx, BOB, &order(M1, SELL, px(100), 10, GTC));
     ok(&mut ctx, BOB, &order(M2, BUY, px(100), 10, GTC));
@@ -493,7 +493,7 @@ fn the_health_memo_answers_again_only_while_its_inputs_hold() {
 #[test]
 fn a_multi_loser_adl_tick_is_the_same_with_and_without_the_memo() {
     use crate::host::InMemoryHost;
-    use crate::margin_view::memo_stats;
+    use crate::margin::view::memo_stats;
     const T0: u64 = 1_000_005;
     const Q: u64 = 10;
     let winners: Vec<Address> = (1..=6u8).map(|i| Address::repeat_byte(0x40 + i)).collect();
@@ -579,9 +579,9 @@ fn a_multi_loser_adl_tick_is_the_same_with_and_without_the_memo() {
 /// `has_cross`, and every leg the walk prices for a position CROSSED in force and non-zero.
 fn assert_health_is_the_fold(ctx: &mut TestCtx, user: Address, at: &str) -> CrossHealth {
     let mut legs = Vec::new();
-    let health = crate::margin_view::cross_health(ctx, user, Some(&mut legs)).unwrap();
+    let health = crate::margin::view::cross_health(ctx, user, Some(&mut legs)).unwrap();
     let mut walked = Vec::new();
-    let fold = crate::margin_view::cross_fold(ctx, user, None, None, Some(&mut walked)).unwrap();
+    let fold = crate::margin::view::cross_fold(ctx, user, None, None, Some(&mut walked)).unwrap();
     assert_eq!(
         (health.w, health.e, health.cross_mm, health.has_cross),
         (fold.w, fold.e, fold.cross_mm, fold.has_cross),
@@ -625,7 +625,7 @@ fn the_health_check_reports_the_walks_numbers() {
         FundingState { last_funding_rate: 0, next_funding_ts: 0, cumulative_funding_index: 3_333 };
     storage::save_funding_state(&mut ctx, M1, &fs).unwrap();
     let mut legs = Vec::new();
-    crate::margin_view::cross_health(&mut ctx, ALICE, Some(&mut legs)).unwrap();
+    crate::margin::view::cross_health(&mut ctx, ALICE, Some(&mut legs)).unwrap();
     assert_ne!(legs[0].pending_funding, 0, "M1's leg owes funding");
     assert_health_is_the_fold(&mut ctx, ALICE, "funding moved");
 
@@ -638,7 +638,7 @@ fn the_health_check_reports_the_walks_numbers() {
     ok(&mut ctx, ALICE, &order(M2, BUY, px(130), 4, IOC));
     let h = assert_health_is_the_fold(&mut ctx, ALICE, "close");
     let mut legs = Vec::new();
-    crate::margin_view::cross_health(&mut ctx, ALICE, Some(&mut legs)).unwrap();
+    crate::margin::view::cross_health(&mut ctx, ALICE, Some(&mut legs)).unwrap();
     assert_eq!(legs.iter().map(|l| l.market_id).collect::<Vec<_>>(), vec![M1]);
     assert_eq!(h.faulted_legs, 0);
     for u in USERS {
@@ -665,10 +665,10 @@ fn a_zero_mark_and_an_unpriceable_leg_are_the_walks_too() {
     storage::save_funding_state(&mut ctx, M2, &fs).unwrap();
     let h = assert_health_is_the_fold(&mut ctx, ALICE, "J4");
     assert_eq!(h.faulted_legs, 1, "M2's leg cannot be priced");
-    let fold = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    let fold = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
     assert_eq!(fold.faulted_legs, 1);
     let mut legs = Vec::new();
-    crate::margin_view::cross_health(&mut ctx, ALICE, Some(&mut legs)).unwrap();
+    crate::margin::view::cross_health(&mut ctx, ALICE, Some(&mut legs)).unwrap();
     let m3 = legs.iter().find(|l| l.market_id == M3).copied().unwrap();
     assert_eq!((m3.upnl, m3.mm), (0, 0), "no price: neither props the account up nor drags it");
     assert!(legs.iter().all(|l| l.market_id != M2));
@@ -683,7 +683,7 @@ fn gated_off_the_health_check_sees_no_cross_leg() {
     ok(&mut ctx, BOB, &order(M1, SELL, px(100), 10, GTC));
     ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 10, IOC));
     assert_eq!(stored_legs(&mut ctx, ALICE).len(), 1);
-    let _off = crate::margin_type::test_gate::disable();
+    let _off = crate::margin::margin_type::test_gate::disable();
     let h = assert_health_is_the_fold(&mut ctx, ALICE, "gated off");
     let w = storage::load_account(&mut ctx, ALICE).unwrap().perp_wallet_balance as i128;
     assert_eq!((h.e, h.cross_mm, h.has_cross, h.faulted_legs), (w, 0, false, 0));
@@ -701,8 +701,8 @@ fn a_drifted_leg_list_is_caught_by_the_debug_walk() {
     let mut leg = stored_legs(&mut ctx, ALICE)[0];
     leg.amount = 11;
     storage::plant_cross_leg_for_test(&mut ctx, ALICE, M1, Some(leg)).unwrap();
-    let h = crate::margin_view::cross_health(&mut ctx, ALICE, None).unwrap();
-    let fold = crate::margin_view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
+    let h = crate::margin::view::cross_health(&mut ctx, ALICE, None).unwrap();
+    let fold = crate::margin::view::cross_fold(&mut ctx, ALICE, None, None, None).unwrap();
     assert_ne!(h.cross_mm, fold.cross_mm, "release: priced from the drifted list");
 }
 
@@ -719,6 +719,6 @@ fn a_leg_naming_no_market_is_left_out_and_flagged() {
         last_funding_index: 0,
     };
     storage::plant_cross_leg_for_test(&mut ctx, ALICE, 99, Some(leg)).unwrap();
-    let h = crate::margin_view::cross_health(&mut ctx, ALICE, None).unwrap();
+    let h = crate::margin::view::cross_health(&mut ctx, ALICE, None).unwrap();
     assert_eq!((h.faulted_legs, h.has_cross, h.cross_mm), (1, false, 0));
 }

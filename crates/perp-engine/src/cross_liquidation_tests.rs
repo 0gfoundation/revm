@@ -278,8 +278,8 @@ fn insurance_fund_seeded(ctx: &mut TestCtx, amount: i64) -> u64 {
     amount as u64
 }
 
-fn fold(ctx: &mut TestCtx, user: Address) -> crate::margin_view::CrossFold {
-    crate::margin_view::cross_fold(ctx, user, None, None, None).unwrap()
+fn fold(ctx: &mut TestCtx, user: Address) -> crate::margin::view::CrossFold {
+    crate::margin::view::cross_fold(ctx, user, None, None, None).unwrap()
 }
 
 fn evs<E: SolEvent>(logs: &[Log]) -> Vec<E> {
@@ -357,7 +357,7 @@ impl Ledger {
             assert_eq!(net, 0, "{at}: market {m} is not zero-sum (Σ amount = {net})");
             for u in USERS {
                 let p = pos(ctx, u, m);
-                if crate::margin_type::effective_margin_type(&p) == MarginType::Crossed {
+                if crate::margin::margin_type::effective_margin_type(&p) == MarginType::Crossed {
                     assert_eq!(p.margin, 0, "{at}: {u} is CROSSED in market {m} but holds a silo");
                 }
             }
@@ -2267,7 +2267,8 @@ fn a_randomised_multi_market_run_never_panics_and_detection_is_complete() {
                     .filter(|&u| {
                         let p = pos(&mut ctx, u, m);
                         p.amount != 0
-                            && crate::margin_type::effective_margin_type(&p) == MarginType::Crossed
+                            && crate::margin::margin_type::effective_margin_type(&p)
+                                == MarginType::Crossed
                     })
                     .collect();
                 let d = index[m_i] * rng.below(31) / 100;
@@ -2310,7 +2311,8 @@ fn a_randomised_multi_market_run_never_panics_and_detection_is_complete() {
                     MARKETS.iter().any(|&m| {
                         let p = pos(&mut ctx, u, m);
                         p.amount != 0
-                            && crate::margin_type::effective_margin_type(&p) == MarginType::Crossed
+                            && crate::margin::margin_type::effective_margin_type(&p)
+                                == MarginType::Crossed
                     }),
                     "step {step}: {u} is flagged with no cross position"
                 );
@@ -2545,7 +2547,8 @@ fn a_randomised_run_with_deep_negative_wallets_and_an_empty_fund_never_panics() 
                 .filter(|&k| {
                     let p = pos(&mut ctx, u, k);
                     p.amount != 0
-                        && crate::margin_type::effective_margin_type(&p) == MarginType::Crossed
+                        && crate::margin::margin_type::effective_margin_type(&p)
+                            == MarginType::Crossed
                 })
                 .collect();
             if acct.in_liquidation() {

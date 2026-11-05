@@ -82,7 +82,7 @@ fn make_ctx() -> TestCtx {
     let db = InMemoryDB::default();
     // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
     // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
-    crate::margin_type::test_gate::isolated_by_default();
+    crate::margin::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS, ALICE, KEEPER, MAKER, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
@@ -174,7 +174,7 @@ fn position(ctx: &mut TestCtx, user: Address) -> PerpPosition {
 fn oo_im(ctx: &mut TestCtx, user: Address) -> u64 {
     let market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
     let pos = storage::load_position(ctx, user, MARKET_ID).unwrap();
-    crate::margin_view::position_open_order_margin(&market, &pos).unwrap()
+    crate::margin::view::position_open_order_margin(&market, &pos).unwrap()
 }
 
 // ── Actors ───────────────────────────────────────────────────────────────────────────────
@@ -565,7 +565,7 @@ fn seed_position(
             v_quote_balance: v_quote,
             margin,
             leverage,
-            ..crate::margin_type::never_set_position()
+            ..crate::margin::margin_type::never_set_position()
         },
         AccountUpdateReason::Adjustment,
     )
@@ -1297,7 +1297,7 @@ fn every_whitelisted_action_lands_on_the_sub_and_never_on_the_master() {
 
     // Through all of it, the master's blobs never moved.
     assert!(owned(&mut ctx, MA) == ma, "an action AS the sub landed on the master");
-    assert_eq!(position(&mut ctx, MA), crate::margin_type::never_set_position());
+    assert_eq!(position(&mut ctx, MA), crate::margin::margin_type::never_set_position());
 
     // internalTransfer as the sub → its master.
     wrap(&mut ctx, xfer(MA, SPOT, SPOT, 100_000_000));
@@ -1778,7 +1778,7 @@ fn a_perp_source_is_gated_on_derived_available_and_a_mark_move_moves_the_gate() 
     // ── at $100 ──
     assert_eq!(oo_im(&mut ctx, SA0), 650_000_000);
     assert_eq!(available(&mut ctx, SA0), 850_000_000);
-    assert_eq!(crate::margin_view::derived_available_balance(&mut ctx, SA0).unwrap(), 850_000_000);
+    assert_eq!(crate::margin::view::derived_available_balance(&mut ctx, SA0).unwrap(), 850_000_000);
     rejected(&mut ctx, MA, &as_sub(SA0, xfer(MA, PERP, SPOT, 850_000_001)), E_XFER_PERP);
 
     // ── the mark moves; SA0 does nothing ──
@@ -1823,7 +1823,7 @@ fn deposit_and_withdraw_through_the_wrapper_are_refused_and_money_leaves_via_the
     }
     // Isolated margin, explicitly: every position this suite opens is ISOLATED unless a test
     // switches it (`margin_type::test_gate::isolated_by_default`), under the real gate.
-    crate::margin_type::test_gate::isolated_by_default();
+    crate::margin::margin_type::test_gate::isolated_by_default();
     let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
     for a in [USDC_ADDRESS, PERP_DEX_ADDRESS, MA, SA0, ADMIN] {
         JournalTr::load_account(ctx.journal_mut(), a).unwrap();

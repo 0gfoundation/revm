@@ -30,8 +30,8 @@
 use super::*;
 use crate::types::{MarginTier, MarginTiers};
 
-fn fold(ctx: &mut TestCtx, user: Address) -> crate::margin_view::CrossFold {
-    crate::margin_view::cross_fold(ctx, user, None, None, None).unwrap()
+fn fold(ctx: &mut TestCtx, user: Address) -> crate::margin::view::CrossFold {
+    crate::margin::view::cross_fold(ctx, user, None, None, None).unwrap()
 }
 
 /// `ROUND_UP(n / l)` — the engine's `PIM` on this grid.
@@ -636,7 +636,7 @@ fn the_pre_walk_filter_credits_a_cross_orders_own_open_gain() {
             resting.total_sell_notional = value(p_min, 10) as u64;
         }
         let isolated_bound =
-            crate::margin_view::derived_requirement_delta(&market, &flat, &resting).unwrap();
+            crate::margin::view::derived_requirement_delta(&market, &flat, &resting).unwrap();
         assert_eq!(isolated_bound, ceil_div(value(p_min, 10), 3) as i128);
         assert!(fold(&mut ctx, ALICE).a < isolated_bound, "the old filter refused it");
 
@@ -1088,7 +1088,7 @@ fn set_margin_type_refuses_in_liquidation_after_4048_and_before_the_gate() {
 
     // Before the gate: with cross margin gated off, CROSSED (not in force, so not -4046) hits
     // -2023 before "not enabled".
-    let off = crate::margin_type::test_gate::disable();
+    let off = crate::margin::margin_type::test_gate::disable();
     rejects(&mut ctx, ALICE, &set(M2, CROSSED).abi_encode(), in_liq);
     storage::set_in_liquidation_for_test(&mut ctx, ALICE, false).unwrap();
     rejects(
@@ -1448,7 +1448,7 @@ fn gated_off_every_p2c_gate_is_byte_identical_to_explicitly_isolated() {
     // Gated off — the engine before the flip: every slot still stores the CROSSED default.
     let mut gated = make_ctx();
     let (gated_outs, gated_logs, gated_state) = {
-        let _off = crate::margin_type::test_gate::disable();
+        let _off = crate::margin::margin_type::test_gate::disable();
         let (outs, logs) = scenario(&mut gated);
         (outs, logs, state(&mut gated))
     };

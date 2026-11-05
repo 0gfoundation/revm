@@ -167,14 +167,14 @@ fn users() -> Vec<Address> {
 
 /// Forces cross margin ON on this thread until the guard drops — the spec's `#[cfg(test)]`
 /// override.
-fn cross_on() -> crate::margin_type::test_gate::Guard {
-    crate::margin_type::test_gate::enable()
+fn cross_on() -> crate::margin::margin_type::test_gate::Guard {
+    crate::margin::margin_type::test_gate::enable()
 }
 
 /// Forces cross margin OFF on this thread until the guard drops: the gated engine, which every
 /// `gated_*` / `mt_gated_*` test pins (every position ISOLATED in force whatever it stores).
-fn gate_off() -> crate::margin_type::test_gate::Guard {
-    crate::margin_type::test_gate::disable()
+fn gate_off() -> crate::margin::margin_type::test_gate::Guard {
+    crate::margin::margin_type::test_gate::disable()
 }
 
 fn make_ctx() -> TestCtx {
