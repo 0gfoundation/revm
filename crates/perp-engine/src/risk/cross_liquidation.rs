@@ -566,7 +566,7 @@ fn settle_cross_funding<H: PerpHost>(
 ) -> Result<(), PerpError> {
     let mut pos = storage::load_position(context, user, market.market_id)?;
     let mut account = storage::load_account(context, user)?;
-    let Some(pending) = crate::funding::compute_funding_settlement(
+    let Some(pending) = crate::risk::funding::compute_funding_settlement(
         context,
         user,
         market,
@@ -578,7 +578,7 @@ fn settle_cross_funding<H: PerpHost>(
         // and write the position anyway.
         return Ok(());
     };
-    crate::funding::apply_funding_settlement(context, pending)?;
+    crate::risk::funding::apply_funding_settlement(context, pending)?;
     // Position BEFORE account (`run_add_position_margin`'s order). The group just published is
     // derived from exactly these two copies, so the end-of-call drain would only repeat it — the
     // same clear `liquidate_position` makes after its own funding write.

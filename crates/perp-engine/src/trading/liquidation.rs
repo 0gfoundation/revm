@@ -357,7 +357,8 @@ fn isolated_adl_price(
             //     price, or whittled down until the remaining notional floors `vQuote` to 0. The
             //     loser's shortfall at one price unit is at most `calc_value(1, take)`: dust.
             //   * FUNDING DEBT — `credit < 0`: a funding debt (negative `margin`, see
-            //     `crate::funding`) has eaten the entry proceeds, so the short is underwater at
+            //     `crate::risk::funding`) has eaten the entry proceeds, so the short is underwater
+            //     at
             //     EVERY price (`calc_bankruptcy_price` reports 0, not an error). NOT dust: the
             //     loser's shortfall is `|credit|` pro rata plus that dust. Reachable only through a
             //     liquidation deferred (ADL, or the sweep's budget) across many funding epochs, or
@@ -500,7 +501,7 @@ fn run_adl_fills<H: PerpHost>(
         // Binance does not exclude them either — it selects them and CANCELS their open orders.
         // That is what the fill loop below does, and it sidesteps the re-pricing question entirely
         // rather than solving it: after the cancel there are no orders left to re-price.
-        let Some(margin) = crate::funding::pending_funding_payment(funding_index, &wp, market)
+        let Some(margin) = crate::risk::funding::pending_funding_payment(funding_index, &wp, market)
             .ok()
             .and_then(|pf| wp.margin.checked_add(pf))
         else {
@@ -656,7 +657,7 @@ fn run_adl_fills<H: PerpHost>(
         // lost.
         // `&mut`: a CROSSED winner's funding lands on this copy's wallet, which is saved with the
         // fill below — or dropped with it, on a rejected trial.
-        let winner_funding = crate::funding::compute_funding_settlement(
+        let winner_funding = crate::risk::funding::compute_funding_settlement(
             context,
             winner,
             market,
@@ -712,7 +713,7 @@ fn run_adl_fills<H: PerpHost>(
         // events, so the stream reads funding → ADL like every other settled path. Its margin move
         // is already in `winner_pos` and lands with the `save_position` below.
         if let Some(p) = winner_funding {
-            crate::funding::apply_funding_settlement(context, p)?;
+            crate::risk::funding::apply_funding_settlement(context, p)?;
         }
         // ── Binance parity: an ADL'd account's open orders are cancelled ─────────────────────────
         //

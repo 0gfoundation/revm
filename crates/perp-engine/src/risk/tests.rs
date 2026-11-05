@@ -6,7 +6,7 @@ use database::InMemoryDB;
 use primitives::{address, hardfork::SpecId, U256};
 
 use crate::{
-    funding::settle_position_funding,
+    risk::funding::settle_position_funding,
     interface::IPerpDex::{
         addPositionMarginCall, getMarginTiersCall, getSymbolConfigCall, liquidateCall,
         placeOrderCall, removePositionMarginCall, setLeverageCall, setMarginTiersCall,
@@ -11370,7 +11370,8 @@ mod withdrawal_cap {
 
     /// Every `PositionChanged` row in `logs` has a NON-NEGATIVE margin. **Only valid for a scenario
     /// with no funding DEBT.** A funding charge lands on `pos.margin` whole and may drive it below
-    /// zero (`crate::funding`), and the rows then report that debt — correctly. The T16 scenarios
+    /// zero (`crate::risk::funding`), and the rows then report that debt — correctly. The T16
+    /// scenarios
     /// that use this charge at most 60_000 against a 160e6 silo, so here a negative row can only
     /// mean a broken close release; a scenario that charges more funding than the silo holds must
     /// not use this helper (see `mod funding_debt` for those).
@@ -11538,7 +11539,8 @@ mod withdrawal_cap {
 
 // ── Funding out of EQUITY: the debt a funding charge can leave on a position ─────────────────────
 //
-// A funding charge lands on `pos.margin` WHOLE (`crate::funding`), so a position that keeps paying
+// A funding charge lands on `pos.margin` WHOLE (`crate::risk::funding`), so a position that keeps
+// paying
 // can run its margin NEGATIVE — a debt it owes. These pin what every consumer of that debt does
 // with it: the maintenance check and the sweep (C1), a voluntary close, partial close and flip
 // (C2, C3), an insolvent close (C4), a liquidation through the book (C5), the oracle sweep on a
@@ -12614,9 +12616,10 @@ mod funding_debt {
         // Nothing left to settle: the 300M is not charged a second time.
         let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
         let mut pos = whale.clone();
-        let pending =
-            crate::funding::compute_funding_settlement(&mut ctx, WHALE, &market, &mut pos, None)
-                .unwrap();
+        let pending = crate::risk::funding::compute_funding_settlement(
+            &mut ctx, WHALE, &market, &mut pos, None,
+        )
+        .unwrap();
         assert!(pending.is_none());
         assert_eq!(pos, whale);
     }

@@ -754,7 +754,8 @@ impl CrossSums {
 ///
 /// Every term comes from the function the rest of the engine already prices it with — `N`, `PIM`
 /// and `ooIM` from [`position_derived_margin`], `MM` from [`maintenance_margin`], `PF` from
-/// [`crate::funding::pending_funding_payment`] (the amount settlement would apply) — so a leg is
+/// [`crate::risk::funding::pending_funding_payment`] (the amount settlement would apply) — so a leg
+/// is
 /// the same number a row ([`margin_info_of`]) or a settlement reports, not a second derivation.
 ///
 /// # A mark of `0`
@@ -788,9 +789,11 @@ pub fn cross_leg(
         leg.pim = derived.margin.position_initial_margin as i128;
         let abs_n = n.checked_abs().ok_or_else(|| perp_err("cross fold: notional abs overflow"))?;
         leg.mm = maintenance_margin(&market.tiers, abs_n)? as i128;
-        leg.pending_funding =
-            crate::funding::pending_funding_payment(market.cumulative_funding_index, pos, market)?
-                as i128;
+        leg.pending_funding = crate::risk::funding::pending_funding_payment(
+            market.cumulative_funding_index,
+            pos,
+            market,
+        )? as i128;
     }
     Ok(leg)
 }
@@ -1021,7 +1024,7 @@ fn cross_health_leg(
     let upnl = if market.mark_price != 0 { n as i128 + leg.v_quote_balance as i128 } else { 0 };
     let abs_n = n.checked_abs().ok_or_else(|| perp_err("cross fold: notional abs overflow"))?;
     let mm = maintenance_margin(&market.tiers, abs_n)? as i128;
-    let pending_funding = crate::funding::pending_funding_of(
+    let pending_funding = crate::risk::funding::pending_funding_of(
         market.cumulative_funding_index,
         leg.amount,
         leg.last_funding_index,

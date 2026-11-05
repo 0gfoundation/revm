@@ -956,7 +956,7 @@ impl UserWork {
 /// the EXACT sequence the old code performed them; [`MatchRegistry::flush`] replays them in order,
 /// so the log stream and the insurance-fund/trade-counter evolutions are byte-identical.
 pub(super) enum MatchEvent {
-    ApplyFunding(crate::funding::PendingFunding),
+    ApplyFunding(crate::risk::funding::PendingFunding),
     AbsorbBadDebt {
         market_id: u64,
         amount: u64,
@@ -1271,7 +1271,7 @@ impl MatchRegistry {
         }
         // `&mut account`: a CROSSED position's funding lands on this working copy's wallet (cross
         // margin P2), which the flush persists with everything else.
-        let pending = crate::funding::compute_funding_settlement(
+        let pending = crate::risk::funding::compute_funding_settlement(
             context,
             user,
             market,
@@ -1353,7 +1353,7 @@ impl MatchRegistry {
         for e in events {
             match e {
                 MatchEvent::ApplyFunding(p) => {
-                    crate::funding::apply_funding_settlement(context, p)?;
+                    crate::risk::funding::apply_funding_settlement(context, p)?;
                 }
                 MatchEvent::AbsorbBadDebt { market_id, amount } => {
                     absorb_bad_debt_into_insurance_fund(context, market_id, amount)?;
@@ -2926,7 +2926,7 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
 /// position size after each fill.
 ///
 /// **`pos.margin` is released SIGNED.** Funding can drive it negative (a debt the position owes —
-/// see `crate::funding`), and the closed slice carries its share of that debt into
+/// see `crate::risk::funding`), and the closed slice carries its share of that debt into
 /// `margin_release`, so the close nets it against the realized PnL; a full close releases all of
 /// it. Truncation toward zero is a floor for a positive margin (unchanged) and, for a debt, puts up
 /// to one unit MORE of it on the closing slice: the remainder is never more indebted than its

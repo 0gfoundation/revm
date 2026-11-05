@@ -272,7 +272,7 @@ impl Ledger {
                 let p = pos(ctx, u, m);
                 let mk = storage::load_market(ctx, m).unwrap().unwrap();
                 let index = storage::load_funding_state(ctx, m).unwrap().cumulative_funding_index;
-                let pf = crate::funding::pending_funding_payment(index, &p, &mk).unwrap();
+                let pf = crate::risk::funding::pending_funding_payment(index, &p, &mk).unwrap();
                 v += p.margin as i128 + p.v_quote_balance as i128 + pf as i128;
             }
         }

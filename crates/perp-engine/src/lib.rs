@@ -23,7 +23,6 @@ pub mod call;
 /// Derived event payloads — the single `PositionChanged` derivation shared by all seven emit
 /// sites. Crate-private: nothing outside the engine constructs its own log.
 mod events;
-pub mod funding;
 pub mod host;
 pub mod interface;
 pub mod margin;

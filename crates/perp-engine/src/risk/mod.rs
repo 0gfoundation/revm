@@ -8,7 +8,7 @@ use primitives::{keccak256, Address, Bytes, FixedBytes, Log};
 use crate::{
         errors::perp_err,
     events::emit_position_changed,
-    funding::{apply_funding_settlement, compute_funding_settlement},
+    risk::funding::{apply_funding_settlement, compute_funding_settlement},
     interface::IPerpDex::{
         self, addMarketCall, addPositionMarginCall, depositInsuranceFundCall, getAdminCall,
         getAveragePremiumIndexCall, getAveragePremiumIndexReturn, getFundingStateCall,
@@ -44,6 +44,7 @@ use crate::{
 };
 
 pub(crate) mod cross_liquidation;
+pub mod funding;
 pub(crate) mod negative_balance;
 
 // ── Admin: ownership ──────────────────────────────────────────────────────────
