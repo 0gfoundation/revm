@@ -637,7 +637,7 @@ fn to_json(r: &Recorder, scenario: &str, description: &str, seed: Option<u64>) -
         "\"generator\":{{\"umiCommit\":{},\"exporter\":{},\"test\":{},\
          \"blockCommitmentVersion\":{},\"seed\":{seed},\"callGasLimit\":{GAS}}},",
         js(&commit),
-        js("crates/perp-engine/src/fixture_export_tests.rs"),
+        js(file!()),
         js(&format!("fixture_export_{scenario}")),
         perp_core::BLOCK_COMMITMENT_VERSION,
     );
@@ -1364,7 +1364,7 @@ fn fixture_export_cross_golden() {
     assert_eq!(pin.blocks.len(), 1);
     assert_eq!(
         B256::from(pin.commitment.to_be_bytes::<32>()),
-        crate::cross_golden_tests::CROSS_GOLDEN_COMMITMENT,
+        crate::tests::cross_golden::CROSS_GOLDEN_COMMITMENT,
         "the one-block replay is not the cross golden scenario write for write"
     );
     pin.checkpoint("end");
