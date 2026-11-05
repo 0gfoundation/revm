@@ -26,8 +26,8 @@ pub mod storage;
 
 // The engine and state core live in the `perp-engine` / `perp-core` crates; re-exported
 // at the historical `perp_dex::*` paths for in-crate consumers and external callers.
-pub use perp_core::{math, typed_store, types};
-pub use perp_engine::{account, batch, funding, interface, risk, trading};
+pub use perp_core::{typed_store, types};
+pub use perp_engine::{interface, trading};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
