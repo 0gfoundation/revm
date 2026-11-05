@@ -247,7 +247,7 @@ pub(super) fn match_order<H: PerpHost>(
                             // maker is the level's LAST id the `while` ends normally and the `for`
                             // loads the next level and re-saves it untouched: a redundant write in
                             // the block delta, so a different commitment (pinned by
-                            // `stp_spec_tests::t5b_*`).
+                            // `trading::tests::stp_spec::t5b_*`).
                             break 'outer;
                         }
                     }

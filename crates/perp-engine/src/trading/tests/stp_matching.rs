@@ -407,7 +407,7 @@ fn t4_expire_taker_keeps_the_fills_expires_the_rest_and_leaves_the_own_maker_in_
 /// T5 — EXPIRE_TAKER where ALICE's own order is the LAST id of its level and a third party
 /// waits one level deeper: the walk must stop dead. A stop that only ended the level (an inner
 /// `break`) would let the next level fill. The "flag checked at the top of the `while`" form
-/// fills nothing but rewrites the next level; `stp_spec_tests::t5b_*` pins that one.
+/// fills nothing but rewrites the next level; `trading::tests::stp_spec::t5b_*` pins that one.
 #[test]
 fn t5_expire_taker_stops_dead_when_the_own_maker_is_the_levels_last_id() {
     for side in SIDES {

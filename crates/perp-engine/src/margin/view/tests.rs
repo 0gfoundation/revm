@@ -1140,9 +1140,9 @@ fn outputs_are_recomputable_from_the_reported_inputs() {
 // ── 9. `getAccount`: the SAME walkers, driven by the per-user market index ─
 //
 // `getAccount` and `getAccountMargin` share one set of Σ walkers
-// (`margin_view::account_margin_scalars`) and differ ONLY in where the market set comes from. These
-// tests exercise that seam: the index path's edges (empty, at the 16-market cap), the fields the
-// index makes possible (`totalWalletBalance` needs `Σ isolatedWallet` over the WHOLE set), the
+// (`margin::view::account_margin_scalars`) and differ ONLY in where the market set comes from.
+// These tests exercise that seam: the index path's edges (empty, at the 16-market cap), the fields
+// the index makes possible (`totalWalletBalance` needs `Σ isolatedWallet` over the WHOLE set), the
 // clamp that was dropped, and the round-trip against per-market `getPositionRisk`.
 
 /// An account with NO markets: the index is empty, every total is 0, and the call SUCCEEDS.
@@ -1512,12 +1512,12 @@ fn get_account_totals_equal_the_sum_of_per_market_position_risk() {
 ///
 /// And it is deliberately NOT weakened by the move. Both surfaces now return one
 /// `interface::IPerpDex::AccountPosition` through the ONE encoder
-/// (`margin_view::AccountPositionRow::to_abi`), which is what makes this hold — but "the shared
+/// (`margin::view::AccountPositionRow::to_abi`), which is what makes this hold — but "the shared
 /// encoder makes it hold" is exactly the kind of claim that stops being true in a refactor, and a
 /// change that forks the two paths has to fail HERE rather than in production. Two call paths
 /// through one struct is still a property worth pinning.
 ///
-/// What it catches, given the values cannot drift (one `margin_view::margin_info_of` output, kept by
+/// What it catches, given the values cannot drift (one `margin::view::margin_info_of` output, kept by
 /// `fold_account_margin` rather than recomputed): a row paired with the wrong `marketId`, rows built
 /// from a different market set than the totals, one path reaching a different `MarginInfo` than the
 /// other, and any future re-introduction of a second encoder that drops or mis-assigns a field.
@@ -2366,7 +2366,7 @@ fn views_reject_an_unknown_market() {
     );
 
     // The per-market reject inside the account fold is prefixed `marginInfo:` — the SHARED
-    // computation (`margin_view::margin_info_of`), not a selector. It read `getMarginInfo:` while
+    // computation (`margin::view::margin_info_of`), not a selector. It read `getMarginInfo:` while
     // that flat-tuple selector existed; with it deleted the prefix would have named nothing
     // callable, in a string a user actually sees.
     let input = getAccountMarginCall {

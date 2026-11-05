@@ -395,8 +395,8 @@ fn a_pure_cancel_publishes_no_account_snapshot() {
 #[test]
 fn placement_and_cancel_cannot_move_any_published_field() {
     // Force one snapshot for `user` and return its whole payload. `credit_perp(0)` is a write
-    // that MOVES NOTHING, so the payload is the current state verbatim — the same isolation
-    // trick `margin_view_tests::the_event_and_get_account_agree_field_for_field_on_the_same_state`
+    // that MOVES NOTHING, so the payload is the current state verbatim — the same isolation trick
+    // `margin::view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state`
     // uses.
     fn published(ctx: &mut TestCtx, user: Address) -> (U256, i64, i64) {
         let _ = JournalTr::take_logs(ctx.journal_mut());

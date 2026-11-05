@@ -388,7 +388,7 @@ pub(super) fn rest_in_book<H: PerpHost>(
     //     ⇒   Δ ooIM ≤ available(before)   ⟺   available(after) ≥ 0
     //
     // That identity is exact here, not approximate: `ooIM_m` is a pure function of market `m`'s own
-    // `(N_m, Bid_m, Ask_m, L_m)` (`margin_view::position_derived_margin` → `math::open_order_margin`,
+    // `(N_m, Bid_m, Ask_m, L_m)` (`margin::view::position_derived_margin` → `math::open_order_margin`,
     // which takes nothing else), so every `m ≠ this` term is literally the same integer in both sums
     // within one call — there is NO cross-market coupling to make the cancellation lossy. Both sides
     // also price THIS market at the same mark: the threaded `market` and the one the Σ walk re-reads
@@ -427,7 +427,7 @@ pub(super) fn rest_in_book<H: PerpHost>(
     // # Why the LEAN fold — `Σ ooIM` alone, not the ten-scalar roll-up
     //
     // The gate needs one number, `available(after)`, and that is all this walk produces. A previous
-    // pass widened it to `margin_view::index_account_scalars` so the placement could publish an
+    // pass widened it to `margin::view::index_account_scalars` so the placement could publish an
     // `AccountBalanceChanged` off the same walk; that event is gone (a pure placement is deliberately
     // silent — R14 measurement + the official trigger sentence, see
     // `storage::mark_account_snapshot_dirty`), so the widening has no consumer again and the five

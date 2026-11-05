@@ -11,7 +11,7 @@ mod margin_mode_spec;
 mod cross_accounting;
 
 /// Cross margin P4: the account's cross-leg summary (`types::CrossLegs`) on every route, and the
-/// health check priced from it (`margin_view::cross_health`).
+/// health check priced from it (`margin::view::cross_health`).
 #[cfg(test)]
 mod cross_legs;
 

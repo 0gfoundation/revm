@@ -3,11 +3,11 @@
 //! Written from `SPEC_cross_margin.md` (owner decisions, P0 and P1 scope) and the design report
 //! `CROSS_MARGIN_explore.md` (§1.3–§1.4 Binance's margin and bracket formulas, §1.8 the mode switch
 //! and its error codes, §3.1 storage, §3.5 the API, §3.6 the refusal order, §5.2 Q1/Q7, §6), NOT
-//! from the implementation's own tests (`margin_type_tests`, the P0 tier tests in `risk::tests` and
-//! `perp_core::math`). Exact reject strings and ABI shapes come from the published ABI docs
-//! (`interface.rs`); every number asserted below is either written out by hand in the comment next
-//! to it or computed by the small spec models in this file ([`slice_mm`], [`reported_ppm`],
-//! [`binance_cums`]), which are written from the formulas, not from the engine.
+//! from the implementation's own tests (`margin::margin_type::tests`, the P0 tier tests in
+//! `risk::tests` and `perp_core::math`). Exact reject strings and ABI shapes come from the
+//! published ABI docs (`interface.rs`); every number asserted below is either written out by hand
+//! in the comment next to it or computed by the small spec models in this file ([`slice_mm`],
+//! [`reported_ppm`], [`binance_cums`]), which are written from the formulas, not from the engine.
 //!
 //! ```text
 //! Binance  MM = N · MMR_k − cum_k              for lowerBound_k ≤ N < notionalCap_k   (§1.4, F9)

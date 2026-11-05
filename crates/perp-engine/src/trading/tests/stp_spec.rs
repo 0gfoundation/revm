@@ -1,7 +1,7 @@
 //! **Self-trade prevention (STP) and the per-market open-order cap, written from the plan
 //! (`STP_PLAN_final.md`: the body, overridden by its Appendix B) by an independent writer — NOT
-//! from the implementation's own tests** (`trading::tests::stp_matching`, `risk::tests::algo_stp`,
-//! `risk::tests::algo_trigger_rejected`, …).
+//! from the implementation's own tests** (`trading::tests::stp_matching`,
+//! `risk::tests::algo::algo_stp`, `risk::tests::algo::algo_trigger_rejected`, …).
 //!
 //! Every call goes through the full shell (`run_perp_dex_call`), so the gas charge, the EOA depth
 //! guard, the commit-only #23 tripwire (a `debug_assert` on any write-then-revert), the debug event

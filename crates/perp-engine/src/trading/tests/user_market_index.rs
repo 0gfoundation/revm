@@ -309,7 +309,7 @@ fn assert_side_totals_are_bid_and_ask(
 // recomputed ground truth after EVERY transition.
 //
 // Like `assert_side_totals_are_bid_and_ask`, this deliberately does NOT ask the engine for its own
-// fold (`margin_view::index_account_scalars` / `fold_account_margin`) — that would only prove the
+// fold (`margin::view::index_account_scalars` / `fold_account_margin`) — that would only prove the
 // engine agrees with itself. It sums `pos.margin` inline out of the position blobs, over ALL the
 // sweep's markets rather than the per-user index, which additionally pins the identity the
 // published surfaces depend on: `Σ_all pos.margin == Σ_index pos.margin`, i.e. no margin is ever
@@ -603,8 +603,8 @@ fn index_matches_ground_truth_after_every_operation() {
 ///
 /// | site | mutation | result |
 /// |---|---|---|
-/// | placement increment, BUY arm (`trading/mod.rs`) | drop the `checked_add` | FAILS |
-/// | placement increment, SELL arm (`trading/mod.rs`) | drop the `checked_add` | FAILS |
+/// | placement increment, BUY arm (`trading/resting.rs`) | drop the `checked_add` | FAILS |
+/// | placement increment, SELL arm (`trading/resting.rs`) | drop the `checked_add` | FAILS |
 /// | the shared decrement (`remove_entry_from_side_aggregates`) — cancel, partial fill, LIFO cover | no-op the `checked_sub` | FAILS |
 /// | partial-fill delta feeding it (`settle_maker_fill_core`) | pass 0 instead of the delta | FAILS |
 /// | liquidation cancel-all zeroing (`risk/mod.rs`, the zeroed `SideAggregates`) | drop the call | FAILS |
@@ -664,7 +664,7 @@ fn side_aggregates_are_exactly_bid_and_ask_after_every_operation() {
 /// wallet-cover cascade.
 ///
 /// Ground truth is computed INDEPENDENTLY — `Σ` over the position blobs, inline, not
-/// `margin_view`'s own fold — for the same reason the Bid/Ask property does it: reusing the
+/// `margin::view`'s own fold — for the same reason the Bid/Ask property does it: reusing the
 /// engine's fold would only prove the engine agrees with itself. It also sums over ALL the
 /// sweep's markets rather than the per-user index, which pins the identity the two published
 /// surfaces depend on (`getAccount` sums over the index, the event reads this all-markets field).
@@ -674,7 +674,7 @@ fn side_aggregates_are_exactly_bid_and_ask_after_every_operation() {
 ///
 /// | mutation | caught by |
 /// |---|---|
-/// | drop the increment entirely | THIS test (`step 1`), and the `debug_assertions` cross-check in `margin_view::index_account_scalars` via ~15 other tests |
+/// | drop the increment entirely | THIS test (`step 1`), and the `debug_assertions` cross-check in `margin::view::index_account_scalars` via ~15 other tests |
 /// | wrong sign (`old_margin − pos.margin`) | THIS test, and the same cross-check |
 /// | `pos.margin` instead of the delta | THIS test, and the same cross-check |
 ///

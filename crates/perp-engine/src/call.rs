@@ -115,7 +115,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         //
         // ── THE `+10_000` ON EVERY SELECTOR THAT EMITS `AccountBalanceChanged` EXACTLY ONCE ──
         //
-        // Publishing one snapshot folds `margin_view::index_account_wallet_balances` over the user's
+        // Publishing one snapshot folds `margin::view::index_account_wallet_balances` over the user's
         // market index. Charging nothing for it would leave these selectors buying a fold PLUS their
         // writes for less than a read selector pays for a fold alone — and `transferToPerp(1)` /
         // `transferFromPerp(1)` are freely spammable, so the brake really would weaken. So: one
@@ -209,7 +209,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         //
         // * The WALK did not move. Same market set, same `{market, position}` per member, same
         //   `≤ 33 _ref` loads. The rows are the fold's own `MarginInfo`s KEPT instead of discarded
-        //   (`margin_view::fold_account_margin`) — no extra load, no second pass, no extra
+        //   (`margin::view::fold_account_margin`) — no extra load, no second pass, no extra
         //   arithmetic. The dominant cost of this selector is untouched.
         // * What DID grow is the encoded output: 960 → 8_640 bytes at the 16-market cap (MEASURED),
         //   exactly 9×. That is one bounded allocation and ~8.6 KB of ABI encoding, orders of
@@ -231,7 +231,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // ⚠️ RE-EXAMINED AND LEFT AT 20_000 AGAIN when every `positions[]` row grew
         // `liquidationPrice`. Same argument as the row array itself, one level down: the WALK does
         // not move, only the encoded output grows. The added work is a liquidation SEARCH per row,
-        // and it performs ZERO storage loads — `margin_view::margin_info_of` runs it on the tier
+        // and it performs ZERO storage loads — `margin::view::margin_info_of` runs it on the tier
         // table and the `(amount, vQuote, margin)` triple it is already holding, so the ≤ 33 `_ref`
         // loads that dominate this selector are untouched. What it costs is ~128 iterations of a
         // handful of `i128` multiplications plus a ≤ MAX_MARGIN_TIERS = 16 band walk — ~64 for the
@@ -243,10 +243,10 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // point of the field being on the row is that a backend rendering N markets stops issuing
         // `getAccount` + N × `getPositionRisk` (20_000 + 16 × 20_000 = 340_000 and ~64 loads) for an
         // answer this one call already holds — and, unlike the `1 + N` shape, holds CONSISTENTLY.
-        // The 20_000 is asserted by `margin_view_tests::get_account`, so a silent drift fails.
+        // The 20_000 is asserted by `margin::view::tests::get_account`, so a silent drift fails.
         //
         // ⚠️ RE-EXAMINED AND LEFT AT 20_000 for cross P2. The walk is unchanged — the cross fold
-        // (`margin_view::CrossSums`) is accumulated from the SAME `{market, position}` pair per
+        // (`margin::view::CrossSums`) is accumulated from the SAME `{market, position}` pair per
         // member, with no `FundingState` load (pending funding is priced off the `Market`'s mirror
         // of the funding index) — and a CROSSED row's liquidation price is the same zero-load
         // bisection with a different margin term. Two appended `int64`/`uint64` words.
@@ -325,7 +325,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         //
         // The number stays at 30_000 anyway, and not out of inertia:
         // `risk::rebalance_order_margin_for_leverage` walks the per-user market index on its own
-        // (`margin_view::derived_available_balance_with`), which is exactly the "walks a per-user
+        // (`margin::view::derived_available_balance_with`), which is exactly the "walks a per-user
         // list" work this 10_000 tier prices. Dropping it back to 20_000 would weaken a spam brake to
         // reflect the removal of work that is still being done by a different line.
         m.insert(setLeverageCall::SELECTOR, (30_000, false));
@@ -392,7 +392,7 @@ pub(crate) fn selectors_map() -> &'static HashMap<[u8; 4], (u64, bool)> {
         // Derived margin views: pure reads (`can_be_static`). Priced like `getOpenOrders`
         // (20_000) because the per-market row walks the same two per-user order lists; the
         // account roll-up does that once per market id and is bounded by
-        // `margin_view::MAX_MARGIN_INFO_MARKETS`.
+        // `margin::view::MAX_MARGIN_INFO_MARKETS`.
         //
         // `getPositionRisk` INHERITED this 20_000 from `getMarginInfo`, the flat-tuple selector it
         // replaced and which is now deleted. It is a strict superset of that call and priced at it

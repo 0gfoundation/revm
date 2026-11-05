@@ -4,10 +4,11 @@
 //! Written from `SPEC_cross_margin.md` (owner decisions Q1–Q12, the P3 decisions R1–R8) and the
 //! design report `CROSS_MARGIN_explore.md` (§1.5–§1.7 Binance's liquidation and ADL facts, §3.0
 //! grafts J1–J7, §3.2 the formulas, §3.4 detection / the episode / ADL, §4 deviations), NOT from
-//! the implementation's own tests (`cross_liquidation_tests`, `cross_golden_tests`) nor from its
-//! internals. Every action goes through the full shell (`run_perp_dex_call`); state is only READ
-//! directly, to feed the model its inputs, plus a few fixture writes between calls (a wallet, the
-//! block clock, the last traded price before an oracle tick so that the mark is exactly the index).
+//! the implementation's own tests (`risk::tests::cross_liquidation`, `tests::cross_golden`) nor
+//! from its internals. Every action goes through the full shell (`run_perp_dex_call`); state is
+//! only READ directly, to feed the model its inputs, plus a few fixture writes between calls (a
+//! wallet, the block clock, the last traded price before an oracle tick so that the mark is exactly
+//! the index).
 //!
 //! # The model, written from the formulas (§3.2, §3.4)
 //!

@@ -27,7 +27,7 @@ pub struct CrossLegState {
 impl CrossLegState {
     /// The entry the stored position `pos` of `(user, market_id)` contributes to the user's
     /// [`CrossLegs`]: `Some` iff it is CROSSED IN FORCE — [`MarginType::effective`] of its stored
-    /// byte under `cross_enabled`, the gate (`perp_engine::margin_type` passes
+    /// byte under `cross_enabled`, the gate (`perp_engine::margin::margin_type` passes
     /// `cross_margin_enabled()`) — and its `amount` is non-zero: the invariant documented on
     /// [`CrossLegs`]. Total.
     #[inline]
@@ -45,7 +45,7 @@ impl CrossLegState {
 /// **A user's cross legs** — one [`CrossLegState`] per market whose position is CROSSED in force
 /// and non-zero, so that judging the account (`E = cWB + Σ_C uPnL` against `Σ_C MM`) costs the
 /// account blob, this blob and the legs' `Market` blobs — no per-user market index and no position
-/// loads (`perp_engine::margin_view::cross_health`, cross P4). Stored under its own per-user key,
+/// loads (`perp_engine::margin::view::cross_health`, cross P4). Stored under its own per-user key,
 /// [`crate::keys::cross_legs_key`]; an EMPTY list is not stored (the key is deleted, the per-user
 /// market index's convention), so an account that holds no cross position has no such key.
 ///
@@ -59,9 +59,9 @@ impl CrossLegState {
 ///
 /// "In force" is the stored margin type under the gate (`CROSS_MARGIN_ENABLED`), a `const` in every
 /// non-test build — `true` since the P3 flip — so it never moves under a stored position. Only a
-/// TEST can flip it (`perp_engine::margin_type::test_gate`): entries written on one side of such a
-/// flip are not re-keyed on the other, and the reader applies the gate it runs under (gated off,
-/// nothing is CROSSED in force, whatever the list holds).
+/// TEST can flip it (`perp_engine::margin::margin_type::test_gate`): entries written on one side of
+/// such a flip are not re-keyed on the other, and the reader applies the gate it runs under (gated
+/// off, nothing is CROSSED in force, whatever the list holds).
 ///
 /// # Owned by `storage::save_position`, and by nothing else
 ///
@@ -83,7 +83,7 @@ impl CrossLegState {
 /// every read — ADL's call-scoped memo, `crate::typed_store::CrossHealthMemo`, answers again only
 /// while these legs, the wallet and every `Market` are unchanged). Checked against a fresh walk of
 /// the positions on every `getAccount` and every published snapshot
-/// (`perp_engine::margin_view::index_account_scalars`), and every `cross_health` result is
+/// (`perp_engine::margin::view::index_account_scalars`), and every `cross_health` result is
 /// re-derived by the walk it replaces (`cross_fold`), both in `debug_assertions` builds.
 ///
 /// # Why its own key, not a field of `UserAccount`

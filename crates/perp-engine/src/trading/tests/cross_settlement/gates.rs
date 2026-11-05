@@ -21,12 +21,12 @@
 //!   in nets against a negative cross wallet;
 //! * gated off, every P2c gate is byte-identical to an explicitly ISOLATED account.
 //!
-//! A child of `cross_settlement_tests`, so it runs on that fixture: two markets on an exact grid
-//! (base 0 decimals, price 2), `USD` = one dollar in quote units, the custody [`Ledger`] re-checked
-//! around every step, and `rejects` asserting a refused call wrote nothing. Every test runs on the
-//! real gate (cross margin is live since the P3 flip) — only the gated-off pins force it off
-//! (`margin_type::test_gate::disable`) — and counterparties meant to be ISOLATED are switched
-//! explicitly.
+//! A child of `trading::tests::cross_settlement`, so it runs on that fixture: two markets on an
+//! exact grid (base 0 decimals, price 2), `USD` = one dollar in quote units, the custody [`Ledger`]
+//! re-checked around every step, and `rejects` asserting a refused call wrote nothing. Every test
+//! runs on the real gate (cross margin is live since the P3 flip) — only the gated-off pins force
+//! it off (`margin_type::test_gate::disable`) — and counterparties meant to be ISOLATED are
+//! switched explicitly.
 use super::*;
 use crate::types::{MarginTier, MarginTiers};
 

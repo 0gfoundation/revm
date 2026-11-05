@@ -19,7 +19,7 @@
 //! The insurance fund covers `−W` and the wallet is set to exactly 0. When the fund holds less, it
 //! covers what it has and the rest is SOCIALISED, logged by `InsuranceFundDepleted` — the
 //! convention every other deficit the fund cannot absorb already follows (isolated bad debt,
-//! `trading::settlement::absorb_bad_debt_into_insurance_fund`; R4). The wallet still ends at 0:
+//! `risk::insurance::absorb_bad_debt_into_insurance_fund`; R4). The wallet still ends at 0:
 //! the shortfall is the protocol's, not a debt left on an account that has nothing open to collect
 //! it from.
 //!

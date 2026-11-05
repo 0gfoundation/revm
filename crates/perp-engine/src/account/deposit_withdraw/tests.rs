@@ -40,7 +40,7 @@ fn make_ctx(alice_usdc: U256) -> TestCtx {
 /// `bytes[32..64]` for the (then-second, then-`uint64`) available balance; `getAccount` now returns
 /// twelve scalars plus `positions[]` (which replaced the `marketIds` array), so word 1 is
 /// `totalWalletBalance` and hand-slicing would silently read the wrong field. The full roll-up is
-/// exercised in `margin_view_tests`.
+/// exercised in `margin::view::tests`.
 fn decode_get_account(bytes: &Bytes) -> (U256, i64) {
     let ret = getAccountCall::abi_decode_returns(bytes).expect("getAccount returns must decode");
     (ret.usdcBalance, ret.availableBalance)

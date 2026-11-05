@@ -8,7 +8,7 @@
 //! The tests run on the real gate (cross margin is live since the P3 flip); the gated-off pins
 //! force it off (`margin_type::test_gate::disable`). Cross positions are SEEDED here (margin
 //! 0, through `save_position`): these tests pin the fold and the views on exact planted states.
-//! Opening and closing them through real fills is `cross_settlement_tests` (P2b).
+//! Opening and closing them through real fills is `trading::tests::cross_settlement` (P2b).
 use alloy_sol_types::{SolCall, SolError};
 use context::{BlockEnv, CfgEnv, Context, ContextTr, Journal, JournalTr, TxEnv};
 use database::InMemoryDB;

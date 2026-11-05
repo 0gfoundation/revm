@@ -86,11 +86,11 @@ fn setup_market_no_funding(ctx: &mut TestCtx) {
             // it is not what is under test here.
             funding_interval: 0,
             interest_rate: 0,
-            // LIVE clearance fee, so the liquidation charges one. It also pins `risk/mod.rs`'s
-            // `.min(account.perp_wallet_balance.max(0))`: MK's wallet is EMPTY when the
-            // liquidation lands (the fill drained it into the silo), so the fee must come out as
-            // ZERO rather than pushing him under water. Under M1′ this pinned the same clamp
-            // against an already-NEGATIVE wallet; the `max(0)` half of it is now covered by
+            // LIVE clearance fee, so the liquidation charges one. It also pins
+            // `risk/liquidation.rs`'s `.min(account.perp_wallet_balance.max(0))`: MK's wallet is
+            // EMPTY when the liquidation lands (the fill drained it into the silo), so the fee must
+            // come out as ZERO rather than pushing him under water. Under M1′ this pinned the same
+            // clamp against an already-NEGATIVE wallet; the `max(0)` half of it is now covered by
             // `a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet` plus the unit
             // tests in `types::account`.
             liquidation_fee_rate_bps: 50,
@@ -361,7 +361,7 @@ fn custodied_usdc_still_equals_all_claims_when_a_short_silo_position_is_liquidat
     // This is the production shape of an underfunded maker fill, and it needs no hand-written
     // state at all. `ooIM = IM − PIM` nets the close a fill would perform, so at
     // `Bid ≈ 2|N|` the two branches of the joint `max()` tie and the order is admitted FREE
-    // (`trading/mod.rs`'s buy arm even documents this band: unlike a sell, a resting BUY gets
+    // (`trading/resting.rs`'s buy arm even documents this band: unlike a sell, a resting BUY gets
     // no Assuming-Price uplift, so for us the `ooIM = 0` band is both free AND fillable).
     // The fill then closes the short at a LOSS — so the margin it releases is less than the
     // margin the new long leg needs — and the shortfall stays in the SILO (M1).
@@ -479,8 +479,8 @@ fn custodied_usdc_still_equals_all_claims_when_a_short_silo_position_is_liquidat
 
     // MK ends with NOTHING STRANDED: no position, no silo, and a wallet at exactly zero. The
     // wallet is untouched by the liquidation itself — isolated margin never debits it, and the
-    // clearance fee is capped at `perp_wallet_balance.max(0)` = 0 (risk/mod.rs). This is the
-    // assertion M1′ could not make: there it ended at −66_666_666, with the position that
+    // clearance fee is capped at `perp_wallet_balance.max(0)` = 0 (risk/liquidation.rs). This is
+    // the assertion M1′ could not make: there it ended at −66_666_666, with the position that
     // justified the debit gone and nothing in the engine able to clear it.
     assert_eq!(
         storage::load_account(&mut ctx, MK)

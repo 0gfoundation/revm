@@ -4,9 +4,9 @@
 //! Written from `SPEC_cross_margin.md` ("P4 — decisions" D1–D4: the per-user list of the state of
 //! every position CROSSED in force, maintained by the position write hook, and the account-level
 //! health `W`, `E = W + Σ_C (PF_k + uPnL_k)`, `Σ_C MM_k` priced from it under the TOTAL policy J4),
-//! NOT from the implementation's tests (`cross_legs_tests`) nor from its internals. Every state
-//! change goes through the call entry point (`run_perp_dex_call`) on an [`InMemoryHost`] whose
-//! blocks are ended explicitly, so the legs also travel through the committed store. The only
+//! NOT from the implementation's tests (`margin::tests::cross_legs`) nor from its internals. Every
+//! state change goes through the call entry point (`run_perp_dex_call`) on an [`InMemoryHost`]
+//! whose blocks are ended explicitly, so the legs also travel through the committed store. The only
 //! fixture writes are the ERC-20 balance a `deposit` pulls from, the block clock, and the last
 //! traded price cleared before an oracle tick so that the mark is exactly the published index.
 //!

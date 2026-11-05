@@ -995,12 +995,12 @@ fn sell_gtc_partial_fill_then_rest(
 /// * pre-check (`finalize_compute`, settlement.rs): `need = total_required + rest_delta`
 ///   `= 1_000_000 + calc_value($100.00, QTY) = 2 x FILL_VALUE`, because it resolved the floor
 ///   from the PRE-fill `last_traded` (= 0 → floor = mark = $100).
-/// * real check (`rest_in_book`, trading/mod.rs sell arm): the same formula over
+/// * real check (`rest_in_book`, trading/resting.rs sell arm): the same formula over
 ///   `calc_value($100.15, QTY)`, because `save_last_traded_price` ran in between.
 ///
 /// **That window no longer exists**: `save_last_traded_price` is deferred past the rest decision, so
 /// `T` is resolved exactly once — and at the PRE-fill `last_traded`, which is the documented-correct
-/// input ("not the caller's own fill", `margin_view::assuming_price_floor`). `2 x FILL_VALUE` is
+/// input ("not the caller's own fill", `margin::view::assuming_price_floor`). `2 x FILL_VALUE` is
 /// therefore now genuinely affordable, so the fixture is driven **one quantum below** it: enough to
 /// refuse, which is the state this test is about.
 ///
@@ -2192,7 +2192,7 @@ fn matched_call_publishes_one_snapshot_per_economic_event() {
     // `Σ isolatedWallet` carries the silo into `totalWalletBalance`, so the settled gross wallet is
     // back to `WALLET`: the money is in the silo instead of the wallet, counted once.
     // (This market's `mark_price` is 0, so the mark-derived totals — PIM, MM — are 0 here by
-    // construction; `margin_view_tests` covers them at a live mark.)
+    // construction; `margin::view::tests` covers them at a live mark.)
     assert_eq!(alice.totalWalletBalance, WALLET as i64);
     assert!(
         events
@@ -3438,7 +3438,7 @@ fn decode_position_changes(
 ///
 /// Single-market tests only — `Σ isolatedWallet` is this market's `pos.margin`. The callers below
 /// cross-check it against the emitted event, so a divergence between this and the real producer
-/// (`margin_view::index_account_wallet_balances`) cannot hide.
+/// (`margin::view::index_account_wallet_balances`) cannot hide.
 fn wb(ctx: &mut TestCtx, user: Address) -> i64 {
     storage::load_account(ctx, user)
         .unwrap()
@@ -5467,7 +5467,7 @@ fn perp_writes_survive_enclosing_revert_commit_only() {
 // ── Performance baseline harness ──────────────────────────────────────────
 //
 // Run with:
-//   cargo test -p revm-precompile --release perf_ -- --ignored --nocapture --test-threads=1
+//   cargo test -p perp-engine --release perf_ -- --ignored --nocapture --test-threads=1
 //
 // Methodology: each scenario does an explicit warmup, then accumulates
 // per-section `Instant` deltas over enough iterations for >=100ms of timed
@@ -5793,7 +5793,7 @@ mod stp_spec;
 mod fee_spec;
 
 /// Maker rebates and ppm fee rates, written independently from the spec rather than from this
-/// implementation (or its `fee_spec_tests`).
+/// implementation (or its `trading::tests::fee_spec`).
 #[cfg(test)]
 mod rebate_spec;
 

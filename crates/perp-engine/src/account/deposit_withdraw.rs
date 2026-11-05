@@ -388,7 +388,7 @@ pub fn run_transfer_from_perp_signed<H: PerpHost>(
 ///
 /// This function contains NO arithmetic: it decodes, calls
 /// [`crate::margin::view::index_account_view`], and ABI-encodes. The `AccountBalanceChanged` event
-/// reads the same STORED quantities (`margin_view::index_account_wallet_balances`), so the two
+/// reads the same STORED quantities (`margin::view::index_account_wallet_balances`), so the two
 /// surfaces agree on every field they share for an account with no CROSSED position. With one
 /// (cross P2) they deliberately differ by the unsettled cross funding: the event reports the
 /// LEDGER wallet `W`, while `totalCrossWalletBalance` here is `cWB = W + Σ_C PF` (pending funding
@@ -440,7 +440,7 @@ pub fn run_get_account<H: PerpHost>(
             // The per-market detail behind every total above, one row per market in the index, from
             // the SAME walk that produced them — so the totals are self-checkable against the rows
             // with no second call, and the balance identities hold within this one response. See
-            // `margin_view::AccountPositionRow`; the rows subsume the `marketIds` array this
+            // `margin::view::AccountPositionRow`; the rows subsume the `marketIds` array this
             // replaced (each carries its own `marketId`).
             positions: view.positions.iter().map(|r| r.to_abi()).collect(),
             // ── appended (cross P2) ──

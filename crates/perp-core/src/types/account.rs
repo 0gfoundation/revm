@@ -88,13 +88,13 @@ pub struct UserAccount {
     /// **Signed, and negative is a NORMAL state** (cross margin P2). A CROSSED position has no silo
     /// (`pos.margin == 0`), so its realized PnL, its funding and its fees all land HERE, whatever
     /// their sign (`perp_engine::trading::settlement::apply_position_fill` under `Cross`,
-    /// `perp_engine::funding::compute_funding_settlement`): a cross close that loses more than the
-    /// wallet holds takes it below zero, and there is no per-fill bad debt to stop it (cross report
-    /// G2). That is Binance's cross model — and what makes a negative wallet NOT a fault is that it
-    /// is not the number solvency is judged on. The account's cross margin balance
+    /// `perp_engine::risk::funding::compute_funding_settlement`): a cross close that loses more
+    /// than the wallet holds takes it below zero, and there is no per-fill bad debt to stop it
+    /// (cross report G2). That is Binance's cross model — and what makes a negative wallet NOT a
+    /// fault is that it is not the number solvency is judged on. The account's cross margin balance
     /// `E = cWB + Σ_C uPnL` is (`cWB = W + Σ_C pending funding`): the other cross positions'
     /// unrealized profit backs a negative `W`, and the account is liquidatable exactly when
-    /// `E < Σ_C MM` (`perp_engine::margin_view::cross_fold`; acted on by cross P3).
+    /// `E < Σ_C MM` (`perp_engine::margin::view::cross_fold`; acted on by cross P3).
     ///
     /// The ISOLATED producer from before cross margin is still here, unchanged and still bounded: a
     /// maker fee the fill's (M1-capped) opening margin could not absorb — `fee_from_wallet` in
@@ -170,8 +170,8 @@ pub struct UserAccount {
     /// field exactly as an isolated close moves it between `v_quote`, the silo and this field, and
     /// a cross funding settle moves it between counterparties' wallets (pending funding, counted
     /// at its settlement value, closes the identity between settles).
-    /// `cross_settlement_tests::Ledger` re-checks it after every step of every cross money path —
-    /// open, close, flip, fee, funding, ADL, a wallet driven negative.
+    /// `trading::tests::cross_settlement::Ledger` re-checks it after every step of every cross
+    /// money path — open, close, flip, fee, funding, ADL, a wallet driven negative.
     ///
     /// ## Observability
     ///
@@ -209,8 +209,8 @@ pub struct UserAccount {
     /// `Σ pos.margin` over ALL of this user's positions — Binance's
     /// `totalWalletBalance − totalCrossWalletBalance`, i.e. the money physically sitting in the
     /// per-position silos, net of any funding DEBT a silo carries (a position's margin may be
-    /// negative — see `perp_engine::funding`), so it, and `totalWalletBalance` with it, can fall
-    /// below zero or below the cross wallet.
+    /// negative — see `perp_engine::risk::funding`), so it, and `totalWalletBalance` with it, can
+    /// fall below zero or below the cross wallet.
     ///
     /// # Why this is STORED and the deleted "TC" was not
     ///
@@ -242,14 +242,14 @@ pub struct UserAccount {
     /// `AccountBalanceChanged` publishes `totalWalletBalance`, which used to cost a walk of the
     /// user's market index (1 index load + 1 position load per member market, up to 17 `_ref` loads
     /// at [`MAX_USER_MARKETS`]). The emit path is now ONE account load and an addition — zero index
-    /// loads, zero position loads. See `margin_view::index_account_wallet_balances`.
+    /// loads, zero position loads. See `margin::view::index_account_wallet_balances`.
     ///
     /// # The risk, and the guard
     ///
     /// A derived quantity cannot drift; a stored one can. `save_position` is the SINGLE door for every
     /// `pos.margin` write (`TypedPerpStore::set_position` / `position_mut` are reached from nowhere
     /// else in the engine), so there is exactly one maintenance point — and
-    /// `margin_view::index_account_scalars` re-walks the user's positions in `debug_assertions` builds
+    /// `margin::view::index_account_scalars` re-walks the user's positions in `debug_assertions` builds
     /// and compares the walk against this field on every `getAccount` and every published snapshot.
     /// A missed maintenance point therefore panics in the test suite rather than silently mis-reporting
     /// a balance. Independently pinned after every operation of a randomised sequence by
@@ -323,7 +323,7 @@ pub struct UserAccount {
     /// stored value over its caller's copy, exactly as it does for `total_position_margin`.
     ///
     /// A `u8`: it is bounded by [`MAX_USER_MARKETS`] (16), because a non-zero position keeps its
-    /// market in the per-user index. `margin_view::index_account_scalars` cross-checks it against
+    /// market in the per-user index. `margin::view::index_account_scalars` cross-checks it against
     /// a fresh walk of the index in `debug_assertions` builds.
     #[serde(rename = "OP", default)]
     pub open_position_count: u8,
@@ -392,8 +392,8 @@ impl UserAccount {
     /// (`trading::tests::a_maker_close_fee_is_the_only_remaining_way_to_a_negative_wallet`
     /// produces the one ISOLATED state where it bites; `risk::tests::usdc_custody` asserts the two
     /// views AGREE on the isolated maker-fill path, which is what the M1 switch bought). Gates use
-    /// `margin_view::derived_available_balance` (orders) and
-    /// `margin_view::derived_withdrawable_balance` (money out), both signed at the source. What
+    /// `margin::view::derived_available_balance` (orders) and
+    /// `margin::view::derived_withdrawable_balance` (money out), both signed at the source. What
     /// this is still FOR is pinning that contrast in tests — asserting that a clamped reading would
     /// have reported 0 where the honest surfaces report the deficit.
     #[inline]
@@ -627,7 +627,7 @@ mod tests {
     /// gates. (It used to have a companion `has_available_perp(amount)`, which asked
     /// `perp_wallet_balance >= amount`. That question is wrong now: the wallet is the CROSS
     /// wallet and still holds the collateral backing every resting order, so the gate is
-    /// `margin_view::derived_available_balance` and its `derived_can_afford`. The predicate was
+    /// `margin::view::derived_available_balance` and its `derived_can_afford`. The predicate was
     /// deleted rather than left lying around for someone to reuse.)
     /// The wire codes are a CONTRACT (they are in an indexed log topic), so they are pinned
     /// literally rather than derived from the declaration order they happen to have.

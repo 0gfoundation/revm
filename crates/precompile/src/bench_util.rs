@@ -30,16 +30,16 @@ use crate::perp_dex::{
 };
 
 /// The full in-memory CTX the precompile runs against (no node / consensus / disk), identical in
-/// shape to `perp_dex/trading/tests.rs::make_ctx()`.
+/// shape to perp-engine's `trading::tests::make_ctx()` (`trading/tests/mod.rs`).
 pub type BenchCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
 
 pub const ADMIN: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 pub const MARKET_ID: u64 = 1;
 
-// Reuse the tests.rs market scale (base_decimals 8 / price_decimals 9 / tick 1e9): proven to run
-// the full margin/reservation arithmetic without overflow. The absolute price scale is irrelevant
-// to every sim here — what matters is the *count* of levels and the *length* of each account's
-// order list, both of which we set independently of the scale.
+// Reuse the engine's `trading::tests` market scale (base_decimals 8 / price_decimals 9 / tick
+// 1e9): proven to run the full margin/reservation arithmetic without overflow. The absolute price
+// scale is irrelevant to every sim here — what matters is the *count* of levels and the *length*
+// of each account's order list, both of which we set independently of the scale.
 pub const TICK: u64 = 1_000_000_000;
 pub const QTY: u64 = 1_000_000;
 /// Base price for the sim books (`= 100 * TICK`), well clear of 0 and of `max_price`.

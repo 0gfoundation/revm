@@ -489,7 +489,7 @@ fn b3_case3c_the_requirement_is_order_independent_not_priced_at_a_particular_ord
 
 /// `(Δ ooIM, available(after))` for the hypothetical "rest `qty` at `price` on `side`" — the
 /// two quantities `rest_in_book`'s gate is a function of, computed here the way the gate
-/// computes them (`margin_view`, same helpers, same overrides) so the table below indexes the
+/// computes them (`margin::view`, same helpers, same overrides) so the table below indexes the
 /// real inputs and not a paraphrase.
 fn gate_inputs(
     ctx: &mut TestCtx,

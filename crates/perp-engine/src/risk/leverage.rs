@@ -199,7 +199,7 @@ fn set_leverage_core<H: PerpHost>(
 
 /// `getSymbolConfig(address user, uint64 marketId) returns (uint64 leverage, uint64 maxNotionalValue, uint8 marginType)`
 ///
-/// `leverage` is `pos.leverage.max(1)` — the SAME floor `margin_view::margin_info_of` and
+/// `leverage` is `pos.leverage.max(1)` — the SAME floor `margin::view::margin_info_of` and
 /// `math::open_order_margin` apply, so this selector reports the leverage that is actually in
 /// force rather than a raw blob field that may still read 0 on a defaulted position.
 ///

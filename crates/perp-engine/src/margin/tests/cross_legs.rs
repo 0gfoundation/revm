@@ -1,5 +1,5 @@
 //! Cross margin P4 — the account's cross-leg summary (`types::CrossLegs`, its own per-user blob)
-//! and the health check priced from it (`margin_view::cross_health`).
+//! and the health check priced from it (`margin::view::cross_health`).
 //!
 //! The summary's invariant is that it is EXACTLY the state of the account's non-zero positions
 //! CROSSED in force, in market order. These tests derive that list independently — from the

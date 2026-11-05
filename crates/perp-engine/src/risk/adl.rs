@@ -49,7 +49,7 @@ use crate::{
 ///
 /// A winner CROSSED in force has no silo, so its position equity is not a number ADL can rank or
 /// screen it by. It is judged on its ACCOUNT instead — `E` and this market's leg from the TOTAL
-/// cross health check (`margin_view::cross_health`, priced off the account's stored cross legs —
+/// cross health check (`margin::view::cross_health`, priced off the account's stored cross legs —
 /// cross P4; no `Err` but the storage layer's; J4):
 ///
 /// * **Rank** — Binance's `PnL% × EffLev` when `PnL% ≥ 0` and `PnL% / EffLev` when `< 0`, with
@@ -419,7 +419,7 @@ fn run_adl_fills<H: PerpHost>(
     // `Σ pos.margin` over the loser's OTHER markets, captured in the one breath where both terms are
     // in hand and both are still pre-ADL. The loser's position/account are written ONCE after the
     // fill loop, so each per-fill header for the loser has to be derived from the working copies —
-    // `margin_view::wallet_balances_from_parts` documents the shape and why the difference is the
+    // `margin::view::wallet_balances_from_parts` documents the shape and why the difference is the
     // right thing to hold. (The WINNER needs none of this: its two writes land inside the loop,
     // before its own header.)
     let loser_other_market_margin = loser_account

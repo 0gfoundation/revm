@@ -14,7 +14,7 @@
 //! * `isolated_golden` — the actions of `trading::tests::golden` (`commitment_golden_scenario`),
 //!   one block at timestamp 1 as there. Its block commitment must equal the pinned
 //!   `GOLDEN_COMMITMENT`, which proves the replay is that scenario write for write.
-//! * `cross_golden` — the actions of `cross_golden_tests`. That scenario moves the block clock
+//! * `cross_golden` — the actions of `tests::cross_golden`. That scenario moves the block clock
 //!   inside ONE block; here every clock move starts a new block (the chain's shape). The same
 //!   actions run in one block first and must reproduce `CROSS_GOLDEN_COMMITMENT`; the split run
 //!   must then end with every getter returning the same bytes (block boundaries are
@@ -1204,7 +1204,7 @@ mod cross_golden {
     }
 
     /// The block clock moves to `t`. `split`: a new block, the one before it checkpointed as
-    /// `label`; otherwise the clock moves inside the one block, as in `cross_golden_tests`.
+    /// `label`; otherwise the clock moves inside the one block, as in `tests::cross_golden`.
     fn at(r: &mut Recorder, split: bool, t: u64, label: &str) {
         if r.h.now == t {
             return;
@@ -1223,7 +1223,7 @@ mod cross_golden {
         r.ok(ORACLE, &u.abi_encode());
     }
 
-    /// `cross_golden_tests::run_cross_golden_scenario`, call for call, minus its views.
+    /// `tests::cross_golden::run_cross_golden_scenario`, call for call, minus its views.
     pub(super) fn scenario(split: bool) -> Recorder {
         let mut rec = Recorder::new(900, 1);
         let r = &mut rec;

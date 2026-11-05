@@ -497,7 +497,7 @@ const ADL_BUDGET_PER_UPDATE: u32 = 128;
 /// - an ISOLATED position ([`liquidate_position`]): `Liquidated` → commit the writes; healthy /
 ///   stale (`AboveMaintenance` / `NoPosition`) → revert (the sweep leaves no trace);
 /// - a position CROSSED in force: judged on its ACCOUNT (`E < Σ_C MM`, the total health check
-///   `margin_view::cross_health` — the account, its cross-leg blob and the legs' markets, no
+///   `margin::view::cross_health` — the account, its cross-leg blob and the legs' markets, no
 ///   position walk, cross P4) by the cross episode (`cross_liquidation::liquidate_cross_account`),
 ///   which starts at this market and spends the same step budget — `Healthy` → revert, anything
 ///   else → commit. The registry is a SET, so an account is processed at most once per sweep,

@@ -299,8 +299,8 @@ const NEW_ADMIN: Address = address!("6666666666666666666666666666666666666666");
 /// existing field of any blob changes value, and nothing conditions on the new field.
 /// `totalWalletBalance`, the field the aggregate actually serves, is not pinned by the snapshot —
 /// it is pinned against the wide fold by
-/// `margin_view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state` and by
-/// the `debug_assertions` cross-check inside `margin_view::index_account_scalars`, which compares
+/// `margin::view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state` and by
+/// the `debug_assertions` cross-check inside `margin::view::index_account_scalars`, which compares
 /// the stored aggregate against a fresh walk on every `getAccount` and every published snapshot.
 /// Prior value 0xea28799e35db06c71ad95e1517df8e289028b79721bcdb27c183f7d594d72f0e.
 /// RE-PIN (per-position cumulative realised PnL + `BLOCK_COMMITMENT_VERSION` 23→24): a LAYOUT
@@ -513,7 +513,7 @@ pub(crate) const GOLDEN_COMMITMENT: B256 =
 /// partial fills truncates differently under the difference and under an independent per-fill
 /// floor. A mutant that switches to the per-fill floor leaves both the commitment and this
 /// snapshot unchanged. Adding such a fill here would move the snapshot, so the path is pinned
-/// instead in `fee_spec_tests`, by
+/// instead in `trading::tests::fee_spec`, by
 /// `a_positive_maker_pays_the_whole_order_difference_across_partial_fills` (balances) and
 /// `a_partially_filled_order_is_rebated_per_fill_on_its_own_floor` (`Trade.makerFee`).
 #[derive(Debug, PartialEq, Eq)]

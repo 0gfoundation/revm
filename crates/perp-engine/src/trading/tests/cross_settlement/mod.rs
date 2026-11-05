@@ -6,9 +6,9 @@
 //! * funding: a cross position's funding settles into `W`, published as `FundingSettled` plus a
 //!   B-only `AccountBalanceChanged(FUNDING_FEE)` group — no `PositionChanged`;
 //! * liquidation next to cross positions: one tick liquidates a cross account (P3's episode, whose
-//!   own suite is `cross_liquidation_tests`) and an isolated position each on its own predicate;
-//!   an isolated close never folds a failing cross leg; ADL ranks a cross winner on its account
-//!   `E` and settles it into `W`;
+//!   own suite is `risk::tests::cross_liquidation`) and an isolated position each on its own
+//!   predicate; an isolated close never folds a failing cross leg; ADL ranks a cross winner on its
+//!   account `E` and settles it into `W`;
 //! * J6: the cash a TAKER moves into an ISOLATED silo must be in the wallet — cross unrealized
 //!   profit admits orders, it never becomes isolated collateral; the maker's M1 cap is unchanged;
 //! * the negative-wallet audit: every money-out gate reads `X`, so a negative cross wallet (or

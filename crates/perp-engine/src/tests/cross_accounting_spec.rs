@@ -4,10 +4,10 @@
 //! report `CROSS_MARGIN_explore.md` (§1.1–§1.3 Binance's balance fields, §1.5 the cross liquidation
 //! condition and LP1, §1.8 funding / leverage / codes, §2 G1–G16, §3.0 grafts J1–J7, §3.2 the
 //! formulas, §3.3 items 1–11, §3.5 the API), NOT from the implementation's own tests
-//! (`cross_accounting_tests`, `cross_settlement_tests`, `cross_gates_tests`) nor from its
-//! internals. Every call goes through the full shell (`run_perp_dex_call`); state is only READ
-//! directly, to feed the model its inputs (positions, wallets, marks, funding indices, order
-//! lists).
+//! (`margin::tests::cross_accounting`, `trading::tests::cross_settlement`,
+//! `trading::tests::cross_settlement::gates`) nor from its internals. Every call goes through the
+//! full shell (`run_perp_dex_call`); state is only READ directly, to feed the model its inputs
+//! (positions, wallets, marks, funding indices, order lists).
 //!
 //! # The model (§3.2), written from the formulas
 //!

@@ -3,9 +3,9 @@
 //!
 //! Written from `SPEC_closepos_trailing.md` (owner decisions 1–8 and commits 1–4) and the owner memo
 //! at the end of `TRAIL_designs.md` (§0, §1.3, §2.5–§2.8), NOT from the implementation's own tests
-//! (`trailing::tests`, `risk::tests::{algo_fire_capacity, close_position_parity}`). Exact reject
-//! strings and ABI shapes come from the published ABI docs (`interface.rs`); every number asserted
-//! below is worked out by hand from the spec formulas in the comment next to it:
+//! (`trailing::tests`, `risk::tests::algo::{algo_fire_capacity, close_position_parity}`). Exact
+//! reject strings and ABI shapes come from the published ABI docs (`interface.rs`); every number
+//! asserted below is worked out by hand from the spec formulas in the comment next to it:
 //!
 //! ```text
 //! SELL fires   10000·mark ≤ H·(10000 − b)      thr = ⌊H(10000−b)/10000⌋, stop = thr ↓ tick

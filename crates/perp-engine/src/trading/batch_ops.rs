@@ -2,7 +2,7 @@ use super::*;
 
 // ── Batch cancel (Phase 1) ───────────────────────────────────────────────────
 //
-// The shell lives in `perp_dex::batch`: pre-decode length reading, the up-front gas bound, the
+// The shell lives in `crate::batch`: pre-decode length reading, the up-front gas bound, the
 // numeric reason codes, the 34-byte status records and the abort-forward driver — all selector-
 // agnostic, so `batchPlaceOrders` (Phase 2) reuses them with a different per-item closure.
 //
@@ -162,7 +162,7 @@ pub(crate) fn batch_cancel_message(
 
 // ── Batch place (Phase 2) ────────────────────────────────────────────────────
 //
-// Same shell as batch cancel (`perp_dex::batch`), same abort-forward semantics, and
+// Same shell as batch cancel (`crate::batch`), same abort-forward semantics, and
 // `place_order_core` is reused unchanged — no forked matching, margin or settlement logic. Two
 // things are specific to placement:
 //

@@ -35,7 +35,7 @@ use crate::types::{
 };
 use crate::error::PerpError;
 
-/// One cross HEALTH check priced in the current call (`perp_engine::margin_view::cross_health`,
+/// One cross HEALTH check priced in the current call (`perp_engine::margin::view::cross_health`,
 /// through ADL's memoized read of it, `cross_health_for_adl`): the inputs it is a function of, and
 /// its answer — `E`, `Σ_C MM`, and the terms of the one leg last asked for. The store only keeps
 /// it; the engine decides when it still holds.
@@ -270,7 +270,7 @@ pub struct TypedPerpStore {
     /// no `write_count`, no commitment; iteration order never matters (lookups only).
     cross_health_memo: HashMap<Address, CrossHealthMemo>,
     /// ADL rankings run so far in the CURRENT perp call — the memo above is kept only from the
-    /// second one on (`perp_engine::trading::liquidation`), so a call that ranks once pays nothing
+    /// second one on (`perp_engine::risk::adl`), so a call that ranks once pays nothing
     /// for it. CALL-scoped (the same [`Self::begin_call`] reset); not a storage key.
     adl_rankings: u32,
 }

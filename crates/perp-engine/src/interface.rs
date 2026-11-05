@@ -64,7 +64,7 @@ sol! {
         /// be a proper prefix of another.
         ///
         /// This is the money-OUT direction of the pair: it is gated on the withdrawable balance
-        /// `getAccount.maxWithdrawAmount` (`X`, `margin_view::derived_withdrawable_balance` —
+        /// `getAccount.maxWithdrawAmount` (`X`, `margin::view::derived_withdrawable_balance` —
         /// `perp_wallet_balance − Σ ooIM` for an account with no CROSSED position; cross
         /// unrealised profit never counts, and cross maintenance margin stays behind), so an API
         /// key holding this signature can pull collateral out from under nothing — resting orders
@@ -88,7 +88,7 @@ sol! {
         /// # THIS COMMENT IS THE FIELD-BY-FIELD CONTRACT — every surface points here
         ///
         /// Two selectors return this struct and there is exactly ONE encoder behind both
-        /// (`margin_view::AccountPositionRow::to_abi`), so it is also the one place the fields are
+        /// (`margin::view::AccountPositionRow::to_abi`), so it is also the one place the fields are
         /// specified:
         ///
         /// * `getPositionRisk(user, marketId)` — ONE row. The single-market accessor, the analogue
@@ -97,10 +97,10 @@ sol! {
         ///   and ONE state. **Prefer it** over `1 + N` reads; see `getAccount` for why `1 + N`
         ///   cannot be made consistent.
         ///
-        /// Every field of every row comes from one `margin_view::MarginInfo`, produced by
-        /// `margin_view::margin_info_of` — the single implementation of the per-market margin
+        /// Every field of every row comes from one `margin::view::MarginInfo`, produced by
+        /// `margin::view::margin_info_of` — the single implementation of the per-market margin
         /// arithmetic. There is no second derivation to drift from and no second encoder to drop a
-        /// field, and `margin_view_tests::get_account_positions_agree_with_get_position_risk_field_for_field`
+        /// field, and `margin::view::tests::get_account_positions_agree_with_get_position_risk_field_for_field`
         /// asserts the two ACCESS PATHS agree positionally over all 19 numbers, on a live
         /// multi-market index, rather than trusting it.
         ///
@@ -143,10 +143,10 @@ sol! {
         ///                   `T` is resolved ONCE, when the order is placed, and the term is FROZEN
         ///                   at `max(T, limit)` for that order's whole life — never re-resolved
         ///                   (MEASURED, R12; `types::OrderEntry::assuming_price`, and see the
-        ///                   `margin_view` module docs). So this field does NOT move with the mark:
-        ///                   it changes only when an order of this user's is placed, cancelled or
-        ///                   filled. Fields DERIVED from it do move with the mark, but through `N`
-        ///                   (the live position notional) — never through this one.
+        ///                   `margin::view` module docs). So this field does NOT move with the
+        ///                   mark: it changes only when an order of this user's is placed,
+        ///                   cancelled or filled. Fields DERIVED from it do move with the mark, but
+        ///                   through `N` (the live position notional) — never through this one.
         ///
         /// Derived (Binance formulas, Binance rounding):
         ///   entryPrice            Binance `entryPrice` — the position's volume-weighted average
@@ -226,7 +226,7 @@ sol! {
         ///                         every other cross position held at its own current mark —
         ///                         Binance's `LP1` with `WB = totalCrossWalletBalance`,
         ///                         `TMM1`/`UPNL1` = the other cross positions' maintenance margin and
-        ///                         unrealised PnL. Same search (`margin_view::cross_liquidation_price`
+        ///                         unrealised PnL. Same search (`margin::view::cross_liquidation_price`
         ///                         hands `calc_liquidation_price` the account's other terms as the
         ///                         position's margin), same conservative rounding, same `0`s. It
         ///                         therefore MOVES when any other cross position's mark, the cross
@@ -448,7 +448,7 @@ sol! {
         ///
         /// This costs nothing: the walk behind the totals ALREADY computes each row in full and
         /// discarded everything but the sums. No extra load, no second pass — see
-        /// `margin_view::fold_account_margin`. The same holds for `liquidationPrice`, the one row
+        /// `margin::view::fold_account_margin`. The same holds for `liquidationPrice`, the one row
         /// field with no `total…` counterpart: its search consumes only the tier table and position
         /// triple that walk is already holding.
         ///
@@ -514,7 +514,7 @@ sol! {
         ///   information, and why it must NOT be done to `availableBalance` itself. The money-out
         ///   gates (`transferFromPerp`, `internalTransfer` from the perp wallet,
         ///   `depositInsuranceFund`, `addPositionMargin`) enforce exactly THIS number
-        ///   (`margin_view::derived_withdrawable_balance`), so cross unrealized profit and a
+        ///   (`margin::view::derived_withdrawable_balance`), so cross unrealized profit and a
         ///   negative cross wallet can never leave; for an account with no CROSSED position that is
         ///   the same decision `availableBalance` gave for a positive amount.
         ///
@@ -556,9 +556,9 @@ sol! {
         ///   (`markPrice, positionAmt, vQuoteBalance, leverage, bidNotional, askNotional`), so every
         ///   derived field in the row AND every total above it can be recomputed from this ONE
         ///   response, byte-exactly, with no second call. That round-trip is pinned by
-        ///   `margin_view_tests::get_account_totals_equal_the_sum_of_per_market_position_risk`,
+        ///   `margin::view::tests::get_account_totals_equal_the_sum_of_per_market_position_risk`,
         ///   and the rows' agreement with the single-market accessor by
-        ///   `margin_view_tests::get_account_positions_agree_with_get_position_risk_field_for_field`.
+        ///   `margin::view::tests::get_account_positions_agree_with_get_position_risk_field_for_field`.
         function getAccount(address user) external view returns (
             uint256  usdcBalance,
             int64    totalWalletBalance,
@@ -1418,7 +1418,7 @@ sol! {
         ///   byte 0     tag       0 = Rejected, 1 = Accepted (cancelled), 3 = Aborted, 4 = NotAttempted
         ///   bytes 1..33 orderId  the input id, echoed
         ///   byte 33    reason    numeric reason code; 0 when accepted
-        /// Reason codes are NUMERIC (never strings) — see `PerpBatchReason` in `perp_dex::batch`.
+        /// Reason codes are NUMERIC (never strings) — see `PerpBatchReason` in `crate::batch`.
         ///
         /// Gas: BASE_BATCH + N * cancelOrder-cost, charged up front from the pre-decode array length.
         /// Reverts as a whole (zero writes) for: bad calldata, N == 0, N > 256, insufficient gas.
@@ -1470,7 +1470,7 @@ sol! {
         ///   bytes 1..33 orderId  the id the order was placed under; ZERO for tags 0/3/4 (a
         ///                        rejected item never consumed an id, so none exists)
         ///   byte 33     reason   numeric reason code; 0 when accepted
-        /// Reason codes are NUMERIC (never strings) — see `PerpBatchReason` in `perp_dex::batch`;
+        /// Reason codes are NUMERIC (never strings) — see `PerpBatchReason` in `crate::batch`;
         /// place-path rejects occupy the 16..=63 band. `statuses` is the outcome AT THE TIME the item
         /// ran: the taker wallet-cover path, or a later item's self-trade prevention, can cancel an
         /// order an earlier item just rested (its tag stays 1), and the logs (`Trade` /
@@ -1569,12 +1569,12 @@ sol! {
         /// the braces removed. That was a SECOND ABI ENCODER for a row this interface already had a
         /// type for, and the duplication is what §7.1.2 exists to fight: two encoders writing the
         /// same seventeen numbers is a field silently dropped from one of them, waiting to happen.
-        /// There is now exactly one — `margin_view::AccountPositionRow::to_abi` — reached by both
+        /// There is now exactly one — `margin::view::AccountPositionRow::to_abi` — reached by both
         /// the single-market and the bulk path.
         ///
         /// So read [`AccountPosition`] — that comment IS the field-by-field contract, including the
         /// rounding mode of every derived value. Nothing is recomputed per surface: every field comes
-        /// from ONE `margin_view::MarginInfo` produced by ONE `margin_view::margin_info_of` call,
+        /// from ONE `margin::view::MarginInfo` produced by ONE `margin::view::margin_info_of` call,
         /// `liquidationPrice` included.
         ///
         /// `marketId` is now returned, and it is deliberately not "redundant with the argument": it
@@ -1639,7 +1639,7 @@ sol! {
         /// exists for the "just these markets" query and for paging past MAX_USER_MARKETS.
         ///
         /// The arithmetic is literally shared with `getAccount` — one set of Σ walkers
-        /// (`margin_view::account_margin_scalars`), differing only in where the market set comes
+        /// (`margin::view::account_margin_scalars`), differing only in where the market set comes
         /// from. Duplicate ids are counted ONCE. At most MAX_MARGIN_INFO_MARKETS (64) ids; an
         /// unknown market id reverts. NOTE the engine's own admission gate sums over the per-user
         /// market index, so a SHORT list under-counts `totalOpenOrderInitialMargin` here and
@@ -2608,9 +2608,9 @@ sol! {
         ///                     only rounding in it is the truncation already inside
         ///                     `signedNotional`. This is the SAME quantity, under the same
         ///                     lowercase-`r` spelling, that an `AccountPosition` row carries — there is one
-        ///                     definition of it in the engine (`margin_view::position_margin_info`)
-        ///                     and this field reuses it rather than re-deriving from `entryPrice`,
-        ///                     which would round twice.
+        ///                     definition of it in the engine
+        ///                     (`margin::view::position_margin_info`) and this field reuses it
+        ///                     rather than re-deriving from `entryPrice`, which would round twice.
         ///
         /// ## `cumulativeRealizedPnl` (`P[].cr`) — POPULATED, and the reason it is worth having
         ///

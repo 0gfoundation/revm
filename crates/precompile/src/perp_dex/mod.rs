@@ -7,11 +7,13 @@
 //! ```text
 //! perp_dex/
 //! ├── mod.rs      ← you are here: PrecompileResult adapter over perp_engine::run_perp_dex_call
-//! │                 + facade re-exports at the historical perp_dex::* paths
+//! │                 + facade re-exports at their historical perp_dex::* paths (interface,
+//! │                   trading, types, typed_store, the address and gas consts)
 //! ├── storage.rs  ← facade over perp_engine::storage + the block-end commitment anchor
 //! ├── errors.rs   ← PrecompileError constructors + From<PerpError>
 //! └── prof.rs     ← bench-util stage profiler
-//! The engine itself lives in the `perp-engine` crate; the state core in `perp-core`.
+//! The engine itself lives in the `perp-engine` crate (src/: the call.rs / batch.rs shell,
+//! trading/, margin/, risk/, account/, storage.rs); the state core in `perp-core`.
 //! ```
 
 use context::ContextTr;

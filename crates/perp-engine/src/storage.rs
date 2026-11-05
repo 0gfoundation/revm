@@ -380,8 +380,8 @@ pub fn load_account_ref<H: PerpHost>(
 /// | a TAKER (incl. a liquidation close) | one per ORDER | `settlement::finalize_apply`, off the settled store |
 /// | a funding settle | one per settle | `funding::apply_funding_settlement`, from the compute-time copy |
 /// | add/removePositionMargin | one per call | `risk::run_{add,remove}_position_margin`, off the settled store |
-/// | a liquidation residual close | one per close | `trading::liquidation`, off the settled store |
-/// | each ADL fill | one per PARTY per fill | `trading::liquidation::run_adl` (loser from the working copy, winner off the store) |
+/// | a liquidation residual close | one per close | `trading::liquidation_close`, off the settled store |
+/// | each ADL fill | one per PARTY per fill | `risk::adl::run_adl` (loser from the working copy, winner off the store) |
 /// | everyone else | coalesced, one per user per call | THIS mark + the drain |
 ///
 /// **Every one of the direct emits sits immediately BEFORE the `PositionChanged` row(s) it owns** —
@@ -540,7 +540,7 @@ pub fn load_account_ref<H: PerpHost>(
 /// cleared it (see [`clear_account_snapshot_mark`]), which rules most of them out:
 ///
 /// * **The liquidated user, book-leg dust + clearance fee.** A full book close leaves rounding
-///   residue that `trading::liquidation::execute_liquidation_market_order` writes off
+///   residue that `trading::liquidation_close::execute_liquidation_market_order` writes off
 ///   (`Adjustment`), and `risk::liquidate_position` then charges the clearance fee to the insurance
 ///   fund (`InsuranceClear`). Both are past the close's own emit, so both survive → `Multiple`.
 /// * **The liquidated user, funding + clearance fee.** `risk::liquidate_position` persists the
@@ -1219,7 +1219,7 @@ pub fn save_position<H: PerpHost>(
     // "A flat position holds no margin", enforced at the ONE door every `pos.margin` write comes
     // through rather than per market at snapshot time.
     //
-    // This assertion used to live in `margin_view::index_account_wallet_balances`, per member market
+    // This assertion used to live in `margin::view::index_account_wallet_balances`, per member market
     // of the per-user index, where it guarded the emit path's Σ walk: an order-list leg can flip index
     // membership (a placement adds a market, a cancel drops one) WITHOUT marking the user for a
     // snapshot, so a flat market carrying margin would have made a pure placement move
@@ -1248,7 +1248,7 @@ pub fn save_position<H: PerpHost>(
     // being moved out of the wallet, and its funding, PnL and fees settle against the wallet. A
     // non-zero margin here would be money counted twice: once in `Σ pos.margin`
     // (`totalWalletBalance`) and once as cross collateral by the account fold
-    // (`margin_view::cross_fold`), which ignores it.
+    // (`margin::view::cross_fold`), which ignores it.
     //
     // A `debug_assert`, not an `[INVARIANT]` reject: this door is reached from the liquidation
     // sweep (every close leg and ADL fill writes through here), and the sweep PANICS on any `Err`
@@ -1270,7 +1270,7 @@ pub fn save_position<H: PerpHost>(
     //
     // This market's CROSS LEG — `amount`, `v_quote_balance`, `last_funding_index` of a position
     // CROSSED in force and non-zero (see `types::CrossLegs` for the invariant) — set from the
-    // position being stored, so the cross health check (`margin_view::cross_health`) can price the
+    // position being stored, so the cross health check (`margin::view::cross_health`) can price the
     // account from the account blob and this list, with no position walk. Compared against the
     // leg of the OLD position, from the same already-paid read: a write that moves none of the
     // three (a margin-only write, an isolated position, a `0 → 0` re-anchor) touches nothing; one
@@ -1332,7 +1332,7 @@ pub fn save_position<H: PerpHost>(
     // takes only the side aggregates, so it cannot change `margin`, which is precisely why the
     // aggregate is cheap: it does NOT move on an order resting or being cancelled. A second
     // maintenance site, or one added to the reservation-only route, re-opens exactly the drift
-    // `margin_view::index_account_scalars`' `debug_assertions` cross-check exists to catch.
+    // `margin::view::index_account_scalars`' `debug_assertions` cross-check exists to catch.
     //
     // Conditional on a non-zero delta so the many saves that move only `amount` / `v_quote_balance`
     // do not dirty the account key for a no-op. Deterministic — the condition is a comparison of two
@@ -1350,7 +1350,7 @@ pub fn save_position<H: PerpHost>(
     // SATURATING, not checked: this door is reached from the liquidation sweep, which panics on
     // any `Err`. The count is bounded by `MAX_USER_MARKETS` (16) — a non-zero position keeps its
     // market in the per-user index — so neither end is reachable; the `debug_assert`s say so, and
-    // `margin_view::index_account_scalars` re-walks the index against the stored count.
+    // `margin::view::index_account_scalars` re-walks the index against the stored count.
     //
     // ── …and the closes the end of the call must SETTLE (cross P3) ─────────────────────────────
     //
@@ -1684,7 +1684,7 @@ pub fn load_cross_legs_ref<H: PerpHost>(
     Ok(arc.unwrap_or_default())
 }
 
-/// `user`'s cross health as memoized EARLIER IN THIS CALL (`margin_view::cross_health_for_adl`),
+/// `user`'s cross health as memoized EARLIER IN THIS CALL (`margin::view::cross_health_for_adl`),
 /// if the memo still holds for the inputs given — the stored `wallet` and the `legs` `Arc` just
 /// read — and no market changed since ([`crate::typed_store::CrossHealthMemo`]): the health, and
 /// the market whose leg it last priced with that leg's terms. Pure read.
@@ -1797,7 +1797,7 @@ fn set_cross_leg<H: PerpHost>(
 }
 
 /// Test-only: sets `user`'s cross leg of `market_id` through the list's one writer WITHOUT a
-/// position write — the drift `margin_view::cross_health`'s `debug_assertions` walk exists to
+/// position write — the drift `margin::view::cross_health`'s `debug_assertions` walk exists to
 /// catch, planted on purpose.
 #[cfg(test)]
 pub(crate) fn plant_cross_leg_for_test<H: PerpHost>(

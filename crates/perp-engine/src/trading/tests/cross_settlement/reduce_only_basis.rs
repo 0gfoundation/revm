@@ -23,9 +23,9 @@
 //! compared the rest's decision with what its pass left — until the check after that pass, which
 //! is the second oracle every scenario here runs under.
 //!
-//! A child of `cross_settlement_tests`, so it runs on that fixture ([`Ledger`], `rejects`, …).
-//! Every scenario runs once per margin type, and ALICE trades fee-free so each boundary is exact to
-//! the quote unit.
+//! A child of `trading::tests::cross_settlement`, so it runs on that fixture ([`Ledger`],
+//! `rejects`, …). Every scenario runs once per margin type, and ALICE trades fee-free so each
+//! boundary is exact to the quote unit.
 use super::*;
 use crate::interface::IPerpDex::OrderCancelled;
 use crate::types::CancelReason;

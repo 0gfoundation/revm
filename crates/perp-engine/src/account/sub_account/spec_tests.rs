@@ -1,5 +1,5 @@
 //! **Sub-accounts (P1), written from the spec (`SPEC_subaccounts_P1.md` §9) by an independent
-//! writer — NOT from the implementation's own tests** (`sub_account_tests.rs`).
+//! writer — NOT from the implementation's own tests** (`sub_account/tests.rs`).
 //!
 //! Every call goes through the full shell (`run_perp_dex_call`), so the gas charge, the static
 //! check, the EOA depth guard, the commit-only #23 tripwire (a `debug_assert` on any

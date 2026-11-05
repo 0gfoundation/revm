@@ -53,11 +53,11 @@ pub struct PerpPosition {
     /// withdrawal, and nothing re-checks either afterwards.
     ///
     /// A FOURTH, and the only one that goes below zero: a funding charge lands on this field WHOLE,
-    /// so it can turn NEGATIVE — a debt the position owes (`perp_engine::funding`). The debt lowers
-    /// equity, so the maintenance check below sees it; a close releases this field signed and nets
-    /// the closed slice's share of the debt against its PnL; only a shortfall at close reaches the
-    /// insurance fund. A FLAT position always holds exactly 0 (a full close releases all of it),
-    /// which `storage::save_position` debug-asserts.
+    /// so it can turn NEGATIVE — a debt the position owes (`perp_engine::risk::funding`). The debt
+    /// lowers equity, so the maintenance check below sees it; a close releases this field signed
+    /// and nets the closed slice's share of the debt against its PnL; only a shortfall at close
+    /// reaches the insurance fund. A FLAT position always holds exactly 0 (a full close releases
+    /// all of it), which `storage::save_position` debug-asserts.
     ///
     /// So does a position CROSSED in force ([`MarginType`], cross margin P2), at every size: its
     /// collateral is the shared cross wallet, its initial margin is derived rather than moved, and
@@ -198,11 +198,11 @@ pub struct PerpPosition {
     ///
     /// # It is the STORED choice, not the type in force
     ///
-    /// Read it through `perp_engine::margin_type::effective_margin_type`, never directly: with
-    /// [`CROSS_MARGIN_ENABLED`] off every position is ISOLATED whatever this byte says, and that
-    /// function is the one place the rule lives. A default (zero) byte is CROSSED because that is
-    /// Binance's default ("All contracts and positions are defaulted to the Cross Margin mode") —
-    /// so since the gate flipped (cross P3), every position that never chose is CROSSED.
+    /// Read it through `perp_engine::margin::margin_type::effective_margin_type`, never directly:
+    /// with [`CROSS_MARGIN_ENABLED`] off every position is ISOLATED whatever this byte says, and
+    /// that function is the one place the rule lives. A default (zero) byte is CROSSED because that
+    /// is Binance's default ("All contracts and positions are defaulted to the Cross Margin mode")
+    /// — so since the gate flipped (cross P3), every position that never chose is CROSSED.
     ///
     /// # Kept across flat, like `leverage`
     ///
@@ -265,7 +265,7 @@ impl Default for PerpPosition {
 ///
 /// A plain `const`, deliberately: consensus code must not read a runtime switch. The engine's
 /// tests can force it on or off per thread through a `#[cfg(test)]`-only override in
-/// `perp_engine::margin_type`, which compiles out of every non-test build.
+/// `perp_engine::margin::margin_type`, which compiles out of every non-test build.
 pub const CROSS_MARGIN_ENABLED: bool = true;
 
 /// A position's margin mode — Binance's `marginType`. One-way mode only: one type per
@@ -696,13 +696,14 @@ pub struct Market {
     /// # Why the index is copied here (cross margin P2, graft 2 of the design report)
     ///
     /// A CROSS account's balance includes the funding every cross position has accrued but not yet
-    /// settled (`cWB = W + Σ_C PF_k`, and funding settles lazily — see `perp_engine::funding`), so
-    /// every account-level fold needs each market's cumulative index. The account walk already
-    /// loads `{Market, position}` per market; reading the index off `FundingState` would add a
-    /// THIRD load per market to every fold, on the admission gates and (from P3) on every cross
-    /// candidate of the liquidation sweep. The `Market` blob is rewritten on every oracle tick
-    /// anyway (`storage::save_mark_price`), and the index only moves on an epoch boundary of that
-    /// same tick, so mirroring it costs no additional key in any block's delta.
+    /// settled (`cWB = W + Σ_C PF_k`, and funding settles lazily — see
+    /// `perp_engine::risk::funding`), so every account-level fold needs each market's cumulative
+    /// index. The account walk already loads `{Market, position}` per market; reading the index off
+    /// `FundingState` would add a THIRD load per market to every fold, on the admission gates and
+    /// (from P3) on every cross candidate of the liquidation sweep. The `Market` blob is rewritten
+    /// on every oracle tick anyway (`storage::save_mark_price`), and the index only moves on an
+    /// epoch boundary of that same tick, so mirroring it costs no additional key in any block's
+    /// delta.
     ///
     /// # `FundingState` stays the source of truth
     ///
@@ -710,7 +711,7 @@ pub struct Market {
     /// and it copies the new value here in the same breath. Funding SETTLEMENT still reads
     /// `FundingState` itself; only the read-only folds read this copy. A `debug_assertions`
     /// cross-check compares the two wherever both are in hand
-    /// (`funding::compute_funding_settlement`, and the cross fold in `margin_view`).
+    /// (`funding::compute_funding_settlement`, and the cross fold in `margin::view`).
     #[serde(default, rename = "fx")]
     pub cumulative_funding_index: i128,
 }

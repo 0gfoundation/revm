@@ -80,7 +80,7 @@ pub(crate) fn emit_position_changed<H: PerpHost>(
 ///   fill price. Its `amount == 0` early return is what makes the flat case a hard 0 rather than
 ///   a division.
 /// * `unrealizedProfit` = `signedNotional + vQuoteBalance` — the SAME definition, byte for byte,
-///   that `margin_view::margin_info_of` reports as `unrealizedProfit` on every `AccountPosition` row
+///   that `margin::view::margin_info_of` reports as `unrealizedProfit` on every `AccountPosition` row
 ///   (see its "── unrealizedProfit ──" block: Binance's `positionAmt × (markPrice − entryPrice)`
 ///   with the only rounding being the truncation already inside `signedNotional`). It is NOT
 ///   re-derived from `entryPrice`, which would round twice. Sign follows from that: a long

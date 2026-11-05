@@ -427,7 +427,7 @@ use primitives::{B256, U256};
 //     0xaea562b9…1e61. BusinessSnapshot UNCHANGED (the flip moves none of it; R7's earlier
 //     two-field delta stands). Golden re-pinned 0xaea562b9…1e61 → 0xfdf928b5…47d4. CHAIN change:
 //     a coordinated wipe on deploy.
-//   * P3 — the CROSS golden scenario (`perp_engine::cross_golden_tests`), a second pin beside the
+//   * P3 — the CROSS golden scenario (`perp_engine::tests::cross_golden`), a second pin beside the
 //     isolated one, of cross margin as it ships: mixed cross / isolated accounts, a funding epoch,
 //     a partial cross liquidation, a bankrupt episode ADL-ed at the MM-share bankruptcy price
 //     past a stale leg, the flag ended by a reduce-only close and the negative wallet that close
@@ -451,7 +451,7 @@ use primitives::{B256, U256};
 //     isolated pin 0xfdf928b5…47d4 is unchanged, BusinessSnapshot UNCHANGED. The CROSS golden
 //     ADLs DAVE past exactly such a leg (M2, never published), so its M3 fill moves from $173.57
 //     to the $180 mark: BOB +$64.30, the fund −$64.30 (DAVE's cleared deficit $35.70 → $100) —
-//     the intended change, written down in `cross_golden_tests`. Cross pin re-pinned
+//     the intended change, written down in `tests::cross_golden`. Cross pin re-pinned
 //     0x84977f13…e969 → 0x9c7be213…4132.
 //   * P3 review — a CROSSED maker fill that OPENS needs cash at hand (`W > 0` after the fill's
 //     close leg), else it is refused like an isolated K9 (`MakerInsolvent`, the order cancelled):
@@ -484,7 +484,7 @@ use primitives::{B256, U256};
 //     keys kept out of the block delta it reproduced 0x9c7be213…4132. BusinessSnapshot and
 //     CrossSnapshot UNCHANGED.
 //   * P4 — the cross health check (D3/D4): the sweep, the episode and ADL read `E`, `Σ_C MM` and
-//     the per-leg terms off the cross legs (`margin_view::cross_health`) instead of the position
+//     the per-leg terms off the cross legs (`margin::view::cross_health`) instead of the position
 //     walk. No rule moves — the same numbers, re-derived by the walk in every debug build: both
 //     pins unchanged (0xfdf928b5…47d4, 0x3c401b00…73b9), both snapshots UNCHANGED.
 //   * P4 review — `save_position` sets the cross leg BEFORE the position write (a reject after it

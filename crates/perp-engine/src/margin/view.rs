@@ -1629,7 +1629,7 @@ impl AccountPositionRow {
     ///
     /// The VALUES could not drift even then (one [`MarginInfo`] per row), but a field could still be
     /// dropped on the way out, which is what
-    /// `margin_view_tests::get_account_positions_agree_with_get_position_risk_field_for_field`
+    /// `margin::view::tests::get_account_positions_agree_with_get_position_risk_field_for_field`
     /// checks — over both CALL PATHS, since the encoder is now shared and only the path differs.
     ///
     /// `liquidationPrice` is read off the same [`MarginInfo`] as everything else, so the bulk path
@@ -2175,7 +2175,7 @@ pub fn run_get_account_margin<H: PerpHost>(
 /// [`index_account_wallet_balances`] instead). The two surfaces still share three fields —
 /// `usdcBalance`, `totalWalletBalance`, `totalCrossWalletBalance` — and must report the same numbers
 /// for them; that is pinned by
-/// `margin_view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state`,
+/// `margin::view::tests::the_event_and_get_account_agree_field_for_field_on_the_same_state`,
 /// `trading::tests::matched_call_publishes_one_snapshot_per_economic_event`,
 /// `trading::tests::account_snapshot_events::a_crossing_fill_publishes_a_snapshot_closing_each_party_s_rows`,
 /// and by the `debug_assertions` cross-check inside [`index_account_wallet_balances`], which compares
@@ -2385,7 +2385,7 @@ pub struct AccountWalletBalances {
 /// * `trading::settlement::UserWork::wallet_balances` — a maker mid-sweep;
 /// * `funding::compute_funding_settlement` — funding moves an isolated `pos.margin` (or a cross
 ///   position's wallet, on the caller's account copy) in memory only;
-/// * `trading::liquidation::run_adl`'s LOSER leg — its position/account are written once after the
+/// * `risk::adl::run_adl`'s LOSER leg — its position/account are written once after the
 ///   fill loop.
 ///
 /// The awkward term is `Σ pos.margin`. It is [`crate::types::UserAccount::total_position_margin`],

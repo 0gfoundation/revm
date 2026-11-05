@@ -2,10 +2,10 @@
 //!
 //! A position CROSSED in force has no silo. Its solvency is the ACCOUNT's — liquidatable exactly
 //! when the cross margin balance `E = cWB + Σ_C uPnL_k` is below the cross maintenance margin
-//! `Σ_C MM_k` (`margin_view::CrossHealth::below_cross_maintenance`) — so it is never judged, closed
-//! or charged per position the way `risk::liquidate_position` treats an ISOLATED one. Both callers
-//! route a cross position here instead: the protocol sweep (`run_liquidation_sweep`, on every tick
-//! of a market the account holds a position in) and the permissionless `liquidate()`.
+//! `Σ_C MM_k` (`margin::view::CrossHealth::below_cross_maintenance`) — so it is never judged,
+//! closed or charged per position the way `risk::liquidate_position` treats an ISOLATED one. Both
+//! callers route a cross position here instead: the protocol sweep (`run_liquidation_sweep`, on
+//! every tick of a market the account holds a position in) and the permissionless `liquidate()`.
 //!
 //! # Detection is complete
 //!
@@ -62,8 +62,8 @@
 //! # TOTAL
 //!
 //! The sweep PANICS on any `Err` (a mid-apply failure under commit-only would leave a partial write
-//! set). Everything here uses the total health check (`margin_view::cross_health`, the TOTAL
-//! policy of `margin_view::cross_fold` on the account's stored cross legs — cross P4), skips what
+//! set). Everything here uses the total health check (`margin::view::cross_health`, the TOTAL
+//! policy of `margin::view::cross_fold` on the account's stored cross legs — cross P4), skips what
 //! it cannot evaluate (a leg naming a market that does not exist, a leg whose arithmetic faulted, a
 //! mark of 0), clamps instead of failing (the bankruptcy price, the band, the fee), and saturates
 //! the event fields. The only `Err` left is the storage layer's.
@@ -447,7 +447,7 @@ fn clamp_into_band(price: u64, market: &Market) -> u64 {
 /// last leg its wallet ends at `ov_k − fee`, 0 whenever the due covers it). A short split across
 /// `n` ADL fills where `pd + bd > 6` adds up to `n − 1` quote units, an IOC that filled part of the
 /// leg at its limit up to one. The devnet gate's case — long 0.01 BTC, `E = −26_359_001`: fee 99
-/// of 3_163_005 due — is pinned by `cross_liquidation_tests`'s
+/// of 3_163_005 due — is pinned by `risk::tests::cross_liquidation`'s
 /// `a_bankrupt_cross_account_pays_its_bankruptcy_price_rounding_dust_as_the_clearance_fee`. A close
 /// the band clamps, or one ADL'd at the mark because a leg is unpriced, leaves `E_after < 0` and
 /// pays 0; an IOC fill BETTER than its limit is no dust — a real surplus, charged up to the due.

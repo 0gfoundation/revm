@@ -1,6 +1,6 @@
 //! **Maker rebates and ppm trading-fee rates, written from the spec (`SPEC_maker_rebate.md`, §1–§3
 //! and the §7 test list) by an independent writer — NOT from the implementation's own tests**
-//! (`trading::fee_spec_tests`, the `perp-core` fee-unit tests).
+//! (`trading::tests::fee_spec`, the `perp-core` fee-unit tests).
 //!
 //! Every call goes through the full shell (`run_perp_dex_call`), so the gas table, the dispatch,
 //! the commit-only #23 tripwire (a `debug_assert` on any write-then-revert), the debug event guards

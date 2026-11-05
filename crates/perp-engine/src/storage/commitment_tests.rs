@@ -7,7 +7,7 @@ use context::ContextTr;
 
 type TestCtx = Context<BlockEnv, TxEnv, CfgEnv, InMemoryDB, Journal<InMemoryDB>, ()>;
 
-/// Mirror of `perp_dex::trading::tests::make_ctx`: build a journal-backed context and warm the
+/// Mirror of `trading::tests::make_ctx`: build a journal-backed context and warm the
 /// PERP_DEX account so the on-trie commitment sload/sstore have an account to operate on.
 fn new_test_ctx() -> TestCtx {
     let db = InMemoryDB::default();

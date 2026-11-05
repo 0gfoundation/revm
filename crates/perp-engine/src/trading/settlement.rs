@@ -227,7 +227,7 @@ impl TakerSettlement {
     /// slippage to open, so a 15 bps allowance on top of a number we already know exactly would only
     /// refuse orders we can see are affordable. It is deliberately NOT implemented; the markup lives
     /// solely on the RESTING side, where the fill price genuinely is unknown at admission
-    /// (`margin_view::assuming_price_floor`). Market/IOC/FOK remainders never rest
+    /// (`margin::view::assuming_price_floor`). Market/IOC/FOK remainders never rest
     /// (`rest_remainder = false`), so they contribute nothing to `Bid`/`Ask` either.
     ///
     /// **Re-verified path by path (2026-08-18), because "matches first" is the whole argument and a
@@ -1535,7 +1535,7 @@ impl MatchRegistry {
             // K9 measurement and the zero-fill rest pre-check). Derived state is only as good as its
             // convergence, so the derivation is checked against the thing it stands in for: the FINAL
             // working copy, put through the same formula, must equal what
-            // `margin_view::index_account_wallet_balances` reads back out of the settled store one
+            // `margin::view::index_account_wallet_balances` reads back out of the settled store one
             // line later. Captured before the writes because `save_account` consumes `w.account`.
             let published = w.last_published.take();
             // Release builds only fold it when there is a published payload to compare against —
@@ -2387,8 +2387,8 @@ pub(super) fn settle_maker_fill_core(
     // no cash.
     //
     // That is why `perp_wallet_balance` is `i64`, and why the negative-wallet machinery — the
-    // money-out gates on `X` (`margin_view::derived_withdrawable_balance`), the order gates on `A`,
-    // a deposit netting against the deficit — is a load-bearing part of the model, not a
+    // money-out gates on `X` (`margin::view::derived_withdrawable_balance`), the order gates on
+    // `A`, a deposit netting against the deficit — is a load-bearing part of the model, not a
     // belt-and-braces guard (`types::UserAccount::perp_wallet_balance`).
     let opening_margin_i64 = checked_u64_to_i64(
         fill_outcome.opening_margin,
@@ -2469,7 +2469,7 @@ pub(super) fn settle_maker_fill_core(
     //
     // The maker's PERP WALLET, not `pos.margin`. A margin credit on a pure full close would leave
     // margin on a flat position — the state `storage::save_position` asserts can never exist (and
-    // `trading::liquidation`'s close path asserts the same), and money a flat position could
+    // `trading::liquidation_close`'s close path asserts the same), and money a flat position could
     // never release.
     //
     // HERE, after `apply_position_fill` and after both opening guards passed on the trial copy, so
@@ -2909,7 +2909,7 @@ fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(
 /// negative balance, and a deficit becomes an insurance-fund matter only at the ACCOUNT level —
 /// when the account holds no position at all (owner decision Q8, cross P3). The opening leg moves
 /// no cash either: its initial margin is DERIVED into the account's available balance
-/// (`margin_view::cross_fold`'s `A`), never physically moved out of the wallet.
+/// (`margin::view::cross_fold`'s `A`), never physically moved out of the wallet.
 ///
 /// # Margin and vq fractions
 ///
@@ -3055,7 +3055,7 @@ pub(crate) fn apply_position_fill(
         //
         // This is the choke point for close PnL on every ordinary path — the taker settlement
         // (`finalize_core`, on the summed legs), the deferred maker settlement
-        // (`settle_maker_fill_core`) and BOTH ADL legs (`liquidation::adl_fill`) all reach a
+        // (`settle_maker_fill_core`) and BOTH ADL legs (`risk::adl::adl_fill`) all reach a
         // closing leg only through here — so accumulating at this line covers them at once
         // instead of asking four call sites to remember. EVERY close comes through here now,
         // including a liquidation's book-unfillable residual: that used to be settled at mark with
@@ -3097,7 +3097,7 @@ pub(crate) fn apply_position_fill(
             // A negative `W` is a normal cross state, not a fault: it is backed by the account's
             // other cross positions' unrealized profit (`E = cWB + Σ_C uPnL` is what liquidation
             // reads), it refuses every opening and every money-out gate through `A` / `X`
-            // (`margin_view::cross_fold`), and it nets against the next deposit or profit. Only an
+            // (`margin::view::cross_fold`), and it nets against the next deposit or profit. Only an
             // account with NO position left has its negative balance cleared by the insurance fund
             // (owner decision Q8, cross P3).
             //

@@ -42,7 +42,7 @@
 //! asserted at `storage::save_position`), so its funding settles into the account's CROSS WALLET
 //! (`perp_wallet_balance`), either sign, through zero if it must — Binance's cross model, where
 //! FUNDING FEE moves `crossWalletBalance` and nothing else. Until it is settled the account fold
-//! already counts it (`cWB = W + Σ_C PF`, `margin_view::cross_fold`), so settling moves no
+//! already counts it (`cWB = W + Σ_C PF`, `margin::view::cross_fold`), so settling moves no
 //! account-level quantity: it only turns a pending amount into a booked one.
 //!
 //! Its events are Binance's B-only push (`ACCOUNT_UPDATE m=FUNDING_FEE` "without any position P
@@ -130,7 +130,7 @@ pub(crate) struct PendingFunding {
     /// row — the exact half-updated snapshot this event's contract forbids.
     ///
     /// So it is derived where the post-funding state actually exists, from
-    /// `margin_view::wallet_balances_from_parts` on the compute-time account plus the post-funding
+    /// `margin::view::wallet_balances_from_parts` on the compute-time account plus the post-funding
     /// `pos.margin`. An ISOLATED settle touches NO wallet leg (it settles against `pos.margin`
     /// only), so the account half of the payload is the caller's unmodified account and only the
     /// Σ leg moves; a CROSSED settle is the mirror image — the Σ leg is untouched and the cross
@@ -165,7 +165,7 @@ pub(crate) fn pending_funding_payment(
 
 /// [`pending_funding_payment`] from the two position fields it reads, `amount` and
 /// `last_funding_index` — the form a cross leg on the account carries them in
-/// (`types::CrossLegState`, priced by `margin_view::cross_health`, cross P4). The same
+/// (`types::CrossLegState`, priced by `margin::view::cross_health`, cross P4). The same
 /// expression, so the two can never disagree.
 pub(crate) fn pending_funding_of(
     index: i128,
