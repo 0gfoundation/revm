@@ -1,0 +1,68 @@
+# PerpDEX CI for the 0G fork. This file only runs for the `perpdex` branch, so
+# other branches (dev, main, release/**) are unaffected; upstream's ci.yml is untouched.
+#
+# One job, so the dependency build is shared by every step below.
+# Each step is separate so the GitHub UI shows exactly which one failed.
+#
+# Intentionally NOT run here (yet):
+#   - revm-precompile `--features bench-util`: bench_util.rs does not compile today.
+#   - clippy -Dwarnings: the perp crates still emit ~120 rustc warnings, so it would
+#     fail today. Add it as its own step once they are cleaned up.
+#   - cargo fmt --check: not adopted on this branch yet.
+#   - #[ignore]d tests: slow/manual by design.
+name: PerpDEX
+
+on:
+  push:
+    branches: [perpdex]
+  pull_request:
+    branches: [perpdex]
+
+# A newer push to the same PR cancels the older, still-running run. Pushes to perpdex
+# itself are never cancelled, so every commit on the branch gets its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1" # same rustc the developers use locally
+      - uses: Swatinem/rust-cache@v2 # caches ~/.cargo and target/ between runs
+        with:
+          cache-on-failure: true
+
+      # --locked: fail instead of silently changing Cargo.lock.
+      - name: Check perp-engine (incl. replay-bench bins)
+        run: cargo check -p perp-engine --all-targets --features replay-bench --locked
+      # The fork changed revm's journal/database crates; this catches a break in
+      # anything built on them (revm, handler, inspector, op-revm, revme, examples).
+      - name: Check whole workspace
+        run: cargo check --workspace --all-targets --locked
+      - name: Test perp-core
+        run: cargo test -p perp-core --locked
+      - name: Test perp-engine (unit tests, incl. golden commitment)
+        run: cargo test -p perp-engine --lib --locked
+      - name: Test perp-engine standalone_host
+        run: cargo test -p perp-engine --test standalone_host --locked
+      # Upstream revm crates this fork modified (PerpState journal, perp_storage seam,
+      # the 0G precompiles).
+      - name: Test revm crates changed by the fork
+        run: >-
+          cargo test --locked
+          -p revm-context -p revm-context-interface
+          -p revm-database -p revm-database-interface
+          -p revm-precompile
