@@ -933,7 +933,13 @@ sol! {
         ///
         /// price: the resting price for the limit pair; the callback rate in bps for
         ///   TRAILING_STOP_MARKET; must be 0 for STOP_MARKET / TAKE_PROFIT_MARKET.
-        /// tif: applies to the limit pair only.
+        /// tif: applies to the limit pair only. A limit-pair conditional with tif GTC (0) or
+        ///   PostOnly (3) — one whose child would REST — takes one of the owner's 10 reduce-only
+        ///   slots in this market when it is PLACED (see `placeOrder` flags bit 0, "Reduce-only
+        ///   cap"): at 10 it is refused with `placeAlgoOrder: too many reduce-only orders (at most
+        ///   10 resting per market); cancel one first`. Its trigger is therefore never refused by
+        ///   the cap — the child inherits the slot. The `_MARKET` pair, trailing stops and a limit
+        ///   pair with IOC / FOK never rest and take no slot.
         /// clientAlgoId: caller-assigned tracking id, emitted but not stored. bytes16(0) if unused.
         /// flags: bit 0 reduceOnly, bit 1 closePosition, bits 3:2 self-trade-prevention mode
         ///   (same values as `placeOrder`'s; the order the trigger produces INHERITS it). Unknown
@@ -1343,6 +1349,18 @@ sol! {
         ///            makes a reduce-only MARKET order with `quantity ≥ |position|` the ONE-SHOT
         ///            CLOSE: it is accepted and truncated to |position| (floored to `stepSize`) —
         ///            Binance's own recipe; there is no separate close selector.
+        ///            Reduce-only cap: an account may hold at most 10 reduce-only orders RESTING
+        ///            per market, counting in the same budget its untriggered limit conditionals
+        ///            with tif GTC / PostOnly (see `placeAlgoOrder` tif). A reduce-only order whose
+        ///            remainder would rest as the 11th is refused whole and write-clean — its fills
+        ///            do not happen either — with `placeOrder: too many reduce-only orders (at most
+        ///            10 resting per market); cancel one first` (batch reason 255), on every
+        ///            placement entrypoint (`placeOrder`, `placeOrderSigned`, batch items, and
+        ///            through `asSubAccount`, where the count is the sub-account's own). The count
+        ///            is taken before the order matches. An order that never rests is never
+        ///            refused: IOC, FOK, market, a GTC that fills completely, a GTC whose remainder
+        ///            expires (self-trade prevention, the maker-touch cap). Nothing already open is
+        ///            cancelled by it, and a triggered conditional is never refused by it.
         ///     bits 3:2  self-trade-prevention mode, an ENUM (not two independent bits):
         ///                 00 EXPIRE_MAKER (the default — `flags = 0` means this)
         ///                 01 EXPIRE_TAKER
@@ -1388,7 +1406,8 @@ sol! {
         /// A fired conditional order is covered in `placeAlgoOrder`, a batch in
         /// `batchPlaceOrders`; a liquidation close is exempt. The cap also bounds STP cancels.
         /// It counts walk touches only: the reduce-only evictions that run after the fill (see
-        /// bit 0) are not counted.
+        /// bit 0) are not counted. They are bounded by the reduce-only cap instead: at most 10 per
+        /// account whose position the walk changed.
         /// The pre-walk affordability filter judges the FULL size, so when it applies (only when
         /// the order reduces no position and the caller has no resting order on its own side) an
         /// EXPIRE_TAKER / EXPIRE_BOTH order the caller could not afford to rest in full is refused
@@ -1469,7 +1488,8 @@ sol! {
         /// Atomicity is **abort-forward**, not all-or-nothing: items run in strict calldata order and
         /// a per-item genuine reject (unknown/inactive market, bad side/orderType/tif, an illegal
         /// (orderType, tif) pair, qty or price
-        /// out of range, the open-order cap (counting the items before it that rested), PostOnly
+        /// out of range, the open-order cap (counting the items before it that rested), the
+        /// reduce-only cap (likewise; reason 255 — see `placeOrder` flags bit 0), PostOnly
         /// would cross, FOK unfillable, insufficient margin, K9
         /// open-into-insolvency, and — cross P2 — the cross margin refusals listed on `placeOrder`
         /// (reasons 29 / 30) and `-2023` for an account in liquidation (reason 35)) does NOT undo
