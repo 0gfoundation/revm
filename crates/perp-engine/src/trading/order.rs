@@ -175,8 +175,8 @@ pub(crate) struct TouchBudget {
 impl TouchBudget {
     /// One ordinary placement (`placeOrder`, `placeOrderSigned`, a fired conditional).
     pub(crate) const SINGLE: Self = Self {
-        limit: u32::MAX,
-        reject_msg: "",
+        limit: MAX_TAKER_MAKER_TOUCHES,
+        reject_msg: TOUCH_CAP_REJECT,
     };
 }
 
@@ -448,8 +448,9 @@ pub(crate) fn place_order_core<H: PerpHost>(
     // ── THE EXPIRY'S TERMINAL EVENT ──────────────────────────────────────────────────────────────
     // `OrderStatus::Expired` is set in exactly one place (`cancel_unfilled_remainder`, and only when
     // `remaining > 0`), which also hands back the reason — so `expiry` here is the same predicate
-    // as "this order discarded a remainder" (an IOC or market order, or any STP-applicable order
-    // whose walk self-trade prevention stopped) without re-deriving which TIFs rest, which is
+    // as "this order discarded a remainder" (an IOC or market order, any STP-applicable order
+    // whose walk self-trade prevention stopped, or a TRIGGERED GTC the Q1 touch cap stopped —
+    // reason `Tif`) without re-deriving which TIFs rest, which is
     // precisely the reasoning this event exists to stop a CONSUMER from having to do. FOK reverts
     // instead (`ensure_fok_filled`), a refused GTC rest reverts (`raise_rest_refusal`), and a full
     // fill has no remainder, so none of them land here.
@@ -718,7 +719,8 @@ fn announce_new_order(
 ///
 /// Two causes, told apart by `reason` and published as `OrderExpired.reason`:
 /// * [`ExpiryReason::Tif`]: an IOC or market remainder the walk did not fill (liquidity, the limit
-///   price or the fill-time band stopped it);
+///   price, the fill-time band, or the Q1 touch cap stopped it — the last also for a TRIGGERED GTC,
+///   see [`MAX_TAKER_MAKER_TOUCHES`]);
 /// * [`ExpiryReason::SelfTradePrevention`]: the walk was stopped at the taker's own resting order
 ///   (`EXPIRE_TAKER` / `EXPIRE_BOTH`), for ANY kind STP applies to, GTC included.
 ///

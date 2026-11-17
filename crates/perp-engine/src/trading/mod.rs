@@ -22,6 +22,24 @@ use settlement::{MakerFillOutcome, TakerSettlement};
 /// the balance after-image count bounded independently of order-book size.
 pub(crate) const MAX_LIQUIDATION_MAKER_ACCOUNTS: usize = 128;
 
+/// Q1: maximum LIVE resting maker orders one non-liquidation taker walk may touch — filled, STP
+/// cancelled or stopped at, or cancelled by the maker K9 / frozen-account guard. Stale lazy-queue ids
+/// are not counted (see `match_order`).
+///
+/// `placeOrder` gas is flat (`PLACE_ORDER_GAS`), so without this one call could walk the whole book
+/// — every maker a distinct account to load, settle and flush. At the cap a submitted GTC or FOK is
+/// REJECTED write-clean with [`TOUCH_CAP_REJECT`] ("split the order"); an IOC or market order fills
+/// up to the cap and its remainder EXPIRES (`OrderExpired`, reason `Tif`); a fired conditional fills
+/// up to the cap and stays armed for the rest (`algo::fire`). A liquidation close is exempt — it has
+/// its own cap, [`MAX_LIQUIDATION_MAKER_ACCOUNTS`]. Same value as `MAX_BATCH_PLACE` and
+/// `MAX_BAND_EXPIRIES_PER_UPDATE`; real flow sits far below it (HL replay: p99 6 live makers).
+pub(crate) const MAX_TAKER_MAKER_TOUCHES: u32 = 64;
+
+/// The reject a submitted GTC / FOK raises at [`MAX_TAKER_MAKER_TOUCHES`]. Not in the batch reason
+/// table, so a batch item reports it as `Other` (255). The number is pinned to the constant by test.
+pub(crate) const TOUCH_CAP_REJECT: &str =
+    "placeOrder: order would match more than 64 resting orders; split it into smaller orders";
+
 use crate::{
     account::signing::{
         check_api_key_expiry, check_recv_window, gc_seen_buckets_best_effort, put, verify_ed25519,

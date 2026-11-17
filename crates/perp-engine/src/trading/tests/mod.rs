@@ -5772,6 +5772,13 @@ mod open_order_cap;
 #[cfg(test)]
 mod stp_encoding;
 
+// ── Q1: the per-taker maker-touch cap ───────────────────────────────────────────────────────────
+// `MAX_TAKER_MAKER_TOUCHES` live makers per non-liquidation walk: a submitted GTC / FOK over it is
+// rejected write-clean, an IOC / market order fills up to it and expires the rest (reason 0).
+// Written from the spec with hand-derived values, both sides, one level and a 65-level ladder.
+#[cfg(test)]
+mod touch_cap;
+
 // ── Self-trade prevention in the match walk (plan §2, T1–T23b) ────────────────────────────────
 //
 // Every case that walks the book runs on BOTH sides. A buy taker walking asks upward and a sell

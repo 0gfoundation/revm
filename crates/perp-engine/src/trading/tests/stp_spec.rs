@@ -213,6 +213,8 @@ const E_ALGO_MODE_SIGNED: &str =
     "placeAlgoOrderSigned: placeAlgoOrder: invalid self-trade prevention mode";
 const E_ALGO_UNKNOWN: &str = "placeAlgoOrder: unknown flag bits";
 const E_PO_CROSS: &str = "placeOrder: PostOnly order would match";
+const E_TOUCH_CAP: &str =
+    "placeOrder: order would match more than 64 resting orders; split it into smaller orders";
 const E_MARGIN: &str = "placeOrder: insufficient perp wallet for margin";
 const E_NOT_FOUND: &str = "getOrder: order not found";
 const E_DUP_SIG: &str = "placeOrderSigned: duplicate signature (already submitted)";
@@ -1563,11 +1565,17 @@ fn t11_post_only_crossing_its_owner_is_refused_under_every_mode() {
     }
 }
 
-/// B1 (Appendix B): there is NO per-order STP cancel limit (D10 removed). One minimum-size taker
-/// cancels 150 of its owner's orders across three levels — far past the old 64 — in FIFO order,
-/// then fills the third party behind them.
+/// B1 (Appendix B), superseded by Q1: there is still no STP-SPECIFIC cancel limit (D10 stays
+/// removed), but every own order STP cancels is a live maker touch, so the Q1 touch cap
+/// (`MAX_TAKER_MAKER_TOUCHES` = 64) bounds it. 150 own orders across three levels, then a third
+/// party:
+/// * a minimum-size GTC taker would have to touch 151 makers, so it is REJECTED, write-clean — all
+///   150 own orders still rest;
+/// * a minimum-size IOC taker cancels exactly the FIRST 64 own orders, in FIFO order (all 50 of
+///   level 0, the first 14 of level 1), then the cap stops it and the unfilled 1 expires with
+///   reason 0 (TIF), not 9 — STP did not stop it. The third party is untouched.
 #[test]
-fn b1_expire_maker_cancels_every_own_order_on_the_path_with_no_per_order_limit() {
+fn b1_expire_maker_cancels_own_orders_only_up_to_the_touch_cap() {
     for d in DIRS {
         let mut ctx = fresh();
         let mut own = Vec::new();
@@ -1576,13 +1584,19 @@ fn b1_expire_maker_cancels_every_own_order_on_the_path_with_no_per_order_limit()
                 own.push(rest(&mut ctx, ALICE, d.maker(), d.lvl(k), 1));
             }
         }
-        rest(&mut ctx, CAROL, d.maker(), d.lvl(3), 1);
-        let (_, logs) = ok(&mut ctx, ALICE, &limit(d.taker(), d.lvl(3), 1, GTC, EM));
-        let want: Vec<_> = own.iter().map(|&id| (ALICE, id, C_STP)).collect();
+        let carol = rest(&mut ctx, CAROL, d.maker(), d.lvl(3), 1);
+        rejected(&mut ctx, ALICE, &limit(d.taker(), d.lvl(3), 1, GTC, EM), E_TOUCH_CAP);
+
+        let (out, logs) = ok(&mut ctx, ALICE, &limit(d.taker(), d.lvl(3), 1, IOC, EM));
+        let want: Vec<_> = own[..64].iter().map(|&id| (ALICE, id, C_STP)).collect();
         assert_eq!(cancels(&logs), want, "{d:?}");
-        assert_eq!(trades(&logs), vec![(ALICE, CAROL, d.lvl(3), 1)]);
-        assert!(open_ids(&mut ctx, ALICE, d.maker()).is_empty());
-        assert_eq!(prices(&mut ctx, d.maker()), Vec::<u64>::new());
+        assert!(trades(&logs).is_empty());
+        assert_eq!(expiry(&logs), (order_id_of(&out), 0, 1, X_TIF));
+        assert_eq!(open_ids(&mut ctx, ALICE, d.maker()).len(), 150 - 64);
+        assert_eq!(prices(&mut ctx, d.maker()), vec![d.lvl(1), d.lvl(2), d.lvl(3)]);
+        assert_eq!(level(&mut ctx, d.maker(), d.lvl(1)), (own[64..100].to_vec(), 36));
+        assert_eq!(level(&mut ctx, d.maker(), d.lvl(2)), (own[100..].to_vec(), 50));
+        assert_eq!(level(&mut ctx, d.maker(), d.lvl(3)), (vec![carol], 1));
     }
 }
 

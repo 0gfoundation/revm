@@ -113,9 +113,9 @@ pub(super) fn match_order<H: PerpHost>(
     // The check runs per resting ORDER, in FIFO, on the same ADDRESS only (a sub-account is a
     // different address and trades with its master as usual), and only the TAKER's mode is read.
     let stp = (!liquidation_close && kind.stp_applies()).then_some(taker_order.stp);
-    // Own resting orders this walk cancelled. NOT capped per order: every one is an open order of
-    // the taker's own on the opposite side of this market, so the per-market open-order cap bounds
-    // it (`MAX_OPEN_ORDERS_PER_MARKET`), and each was paid for when it was placed.
+    // Own resting orders this walk cancelled. No STP-specific cap: each cancel is a live maker
+    // touch, so the Q1 touch cap below bounds it (`MAX_TAKER_MAKER_TOUCHES`, superseding the old
+    // "bounded only by `MAX_OPEN_ORDERS_PER_MARKET`" argument, which the assert keeps checking).
     let mut stp_cancels = 0usize;
     // The walk was STOPPED at the taker's own order (`EXPIRE_TAKER` / `EXPIRE_BOTH`): whatever is
     // left expires with reason 9 and never rests.
