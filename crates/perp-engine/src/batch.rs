@@ -50,6 +50,21 @@ pub const MAX_BATCH_CANCEL: usize = 256;
 /// latency/DoS knob, not a gas knob. Enforced on the **decoded** length, exactly like the cancel cap.
 pub const MAX_BATCH_PLACE: usize = 64;
 
+/// Q1: maximum LIVE resting maker orders ALL the items of one `batchPlaceOrders(Signed)` may touch
+/// together. Each item is also held to the per-taker `MAX_TAKER_MAKER_TOUCHES` (64); an item gets
+/// `min(64, what the batch has left)`, and only an ACCEPTED item uses any up. Without it a full
+/// batch could touch 64 × 64 makers under one flat per-item gas charge.
+///
+/// At the batch limit an item behaves as at its own: a crossing GTC / FOK item is `Rejected`
+/// ([`BATCH_TOUCH_CAP_REJECT`], reason `Other`), a crossing IOC / market item fills up to what is
+/// left and expires the rest, and an item that crosses nothing is unaffected.
+pub const MAX_BATCH_MAKER_TOUCHES: u32 = 256;
+
+/// The reject a GTC / FOK batch item raises when the BATCH's touch budget, not its own, runs out.
+/// Not in the reason table (reason `Other`). The number is pinned to the constant by test.
+pub(crate) const BATCH_TOUCH_CAP_REJECT: &str =
+    "placeOrder: batch would match more than 256 resting orders in total; split the batch";
+
 /// Fixed width of one status record in the returned blob: `tag(1) || orderId(32) || reason(1)`.
 pub const BATCH_STATUS_RECORD_LEN: usize = 34;
 

@@ -24,8 +24,9 @@ use primitives::{address, hardfork::SpecId, Address, FixedBytes, U256};
 use crate::call::PerpOutput;
 use crate::host::PerpHost;
 use crate::interface::IPerpDex::{
-    cancelOrderCall, placeOrderCall, placeOrderSignedCall, registerApiKeyCall, OrderCancelled,
-    OrderExpired, OrderRested, Trade,
+    batchPlaceOrdersCall, batchPlaceOrdersSignedCall, cancelOrderCall, placeOrderCall,
+    placeOrderSignedCall, registerApiKeyCall, OrderCancelled, OrderExpired, OrderRested, PlaceItem,
+    Trade,
 };
 use crate::trading::{MAX_TAKER_MAKER_TOUCHES, TOUCH_CAP_REJECT};
 use crate::types::{AccountUpdateReason, MarginTiers, Market};
@@ -65,6 +66,13 @@ const X_TIF: u8 = 0;
 const X_STP: u8 = 9;
 
 const CAP: usize = 64;
+
+/// Batch status tags and reasons.
+const TAG_REJECTED: u8 = 0;
+const TAG_ACCEPTED: u8 = 1;
+const TAG_TERMINAL: u8 = 2;
+const R_NONE: u8 = 0;
+const R_OTHER: u8 = 255;
 
 const E_FOK: &str = "placeOrder: FOK order cannot be fully filled";
 const E_DUP_SIG: &str = "placeOrderSigned: duplicate signature (already submitted)";
@@ -499,11 +507,17 @@ fn reject_strings_state_their_constants() {
     assert_eq!(MAX_TAKER_MAKER_TOUCHES as usize, CAP);
     assert!(TOUCH_CAP_REJECT.starts_with("placeOrder: "));
     assert!(TOUCH_CAP_REJECT.contains(&format!(" {MAX_TAKER_MAKER_TOUCHES} ")));
-    // Not in the batch reason table: a batch item reports it as `Other` (255).
-    assert_eq!(
-        crate::batch::reason_code(&crate::errors::perp_err(TOUCH_CAP_REJECT)) as u8,
-        255
-    );
+    let batch = crate::batch::BATCH_TOUCH_CAP_REJECT;
+    assert!(batch.starts_with("placeOrder: "));
+    assert!(batch.contains(&format!(" {} ", crate::batch::MAX_BATCH_MAKER_TOUCHES)));
+    // Neither is in the batch reason table: a batch item reports it as `Other` (255).
+    for msg in [TOUCH_CAP_REJECT, batch] {
+        assert_eq!(
+            crate::batch::reason_code(&crate::errors::perp_err(msg)) as u8,
+            R_OTHER,
+            "{msg}"
+        );
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -883,5 +897,201 @@ fn t17_a_signed_gtc_over_the_cap_retains_only_the_signature_burn() {
         let input = signed_place(&mut ctx, d.taker(), d.through(), 65, GTC, 0);
         rejected_burning(&mut ctx, DAVE, &input, TOUCH_CAP_REJECT, burn);
         rejected_burning(&mut ctx, DAVE, &input, E_DUP_SIG, 0);
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// T8 batch: per-item cap + a 256-touch total
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+fn item(side: u8, price: u64, qty: u64, order_type: u8, tif: u8) -> PlaceItem {
+    PlaceItem {
+        marketId: MARKET_ID,
+        side,
+        price,
+        quantity: qty,
+        orderType: order_type,
+        tif,
+        clientOrderId: FixedBytes::default(),
+        flags: 0,
+    }
+}
+
+fn batch(items: Vec<PlaceItem>) -> Vec<u8> {
+    batchPlaceOrdersCall { orders: items }.abi_encode()
+}
+
+/// Batch status records `(tag, orderId, reason)`.
+fn records(out: &PerpOutput) -> Vec<(u8, [u8; 32], u8)> {
+    let blob = batchPlaceOrdersCall::abi_decode_returns(&out.bytes).unwrap();
+    assert_eq!(blob.len() % 34, 0);
+    blob.chunks(34)
+        .map(|r| (r[0], r[1..33].try_into().unwrap(), r[33]))
+        .collect()
+}
+
+/// `(tag, reason)` of each record.
+fn tags(out: &PerpOutput) -> Vec<(u8, u8)> {
+    records(out).into_iter().map(|(t, _, r)| (t, r)).collect()
+}
+
+/// 320 single-lot makers on one level: BOB's 160, then CAROL's 160 (each under the 200 cap).
+fn deep_book(ctx: &mut TestCtx, d: Dir) -> Vec<[u8; 32]> {
+    let mut owners = vec![BOB; 160];
+    owners.extend([CAROL; 160]);
+    seed(ctx, d, Layout::OneLevel, &owners)
+}
+
+fn ioc(d: Dir, qty: u64) -> PlaceItem {
+    item(d.taker(), d.through(), qty, LIMIT, IOC)
+}
+
+fn gtc(d: Dir, qty: u64) -> PlaceItem {
+    item(d.taker(), d.through(), qty, LIMIT, GTC)
+}
+
+/// T8a: a GTC item needing 65 makers is `Rejected` (reason 255) and the batch carries on: the next
+/// item, a GTC that crosses nothing, rests (`Accepted`). The 65 makers are intact.
+#[test]
+fn t8a_a_gtc_item_over_the_cap_is_rejected_and_the_batch_continues() {
+    for d in DIRS {
+        let mut ctx = fresh();
+        let ids = seed(&mut ctx, d, Layout::Ladder, &[BOB; 65]);
+        let passive = if d.0 == BUY { MARK - 500 } else { MARK + 500 };
+        let (out, logs) = ok(
+            &mut ctx,
+            ALICE,
+            &batch(vec![gtc(d, 65), item(d.taker(), passive, 1, LIMIT, GTC)]),
+        );
+        assert_eq!(tags(&out), vec![(TAG_REJECTED, R_OTHER), (TAG_ACCEPTED, R_NONE)], "{d:?}");
+        assert!(fills(&logs).is_empty());
+        assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::Ladder, &ids, 0));
+        assert_eq!(level(&mut ctx, d.taker(), passive), (vec![records(&out)[1].1], 1));
+    }
+}
+
+/// T8b: five IOC items of 64 against 320 makers. Items 1-4 take 64 each — 256, the batch total —
+/// and item 5 has nothing left: it fills 0 and expires all 64 (reason 0). All five are accepted
+/// (terminal). 64 makers survive.
+#[test]
+fn t8b_the_batch_total_runs_out_after_256_touches() {
+    for d in DIRS {
+        let mut ctx = fresh();
+        let ids = deep_book(&mut ctx, d);
+        let (out, logs) = ok(&mut ctx, ALICE, &batch(vec![ioc(d, 64); 5]));
+        assert_eq!(tags(&out), vec![(TAG_TERMINAL, R_NONE); 5], "{d:?}");
+        assert_eq!(fills(&logs), one_each(&ids[..256]), "{d:?}");
+        assert_eq!(expiry(&logs), (records(&out)[4].1, 0, 64, X_TIF), "{d:?}");
+        assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::OneLevel, &ids, 256));
+        assert_eq!(amount(&mut ctx, ALICE), 256 * d.sign());
+    }
+}
+
+/// T8c/T8c': IOC items of 64, 64, 64 and 48 spend 240 of the 256, leaving 16. A GTC item of 20
+/// would need 20 > 16: `Rejected` (reason 255) with the BATCH's message (read off a direct call
+/// under the same 16-touch budget). An IOC item of 20 instead fills 16 and expires 4.
+#[test]
+fn t8c_an_item_gets_only_what_the_batch_has_left() {
+    for d in DIRS {
+        for last_is_gtc in [true, false] {
+            let tag = format!("{d:?} gtc={last_is_gtc}");
+            let mut ctx = fresh();
+            let ids = deep_book(&mut ctx, d);
+            let last = if last_is_gtc { gtc(d, 20) } else { ioc(d, 20) };
+            let items = vec![ioc(d, 64), ioc(d, 64), ioc(d, 64), ioc(d, 48), last];
+            let (out, logs) = ok(&mut ctx, ALICE, &batch(items));
+            let mut want = vec![(TAG_TERMINAL, R_NONE); 4];
+            if last_is_gtc {
+                want.push((TAG_REJECTED, R_OTHER));
+                assert_eq!(tags(&out), want, "{tag}");
+                assert_eq!(fills(&logs), one_each(&ids[..240]), "{tag}");
+                assert!(evs::<OrderExpired>(&logs).is_empty(), "{tag}");
+                assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::OneLevel, &ids, 240));
+                // The message, from the same budget the item got.
+                let budget = crate::trading::TouchBudget {
+                    limit: 16,
+                    reject_msg: crate::batch::BATCH_TOUCH_CAP_REJECT,
+                };
+                let r = direct(&mut ctx, ALICE, d.taker(), d.through(), 20, LIMIT, GTC, 0, budget);
+                assert_eq!(r.unwrap_err(), crate::batch::BATCH_TOUCH_CAP_REJECT, "{tag}");
+            } else {
+                want.push((TAG_TERMINAL, R_NONE));
+                assert_eq!(tags(&out), want, "{tag}");
+                assert_eq!(fills(&logs), one_each(&ids[..256]), "{tag}");
+                assert_eq!(expiry(&logs), (records(&out)[4].1, 16, 4, X_TIF), "{tag}");
+                assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::OneLevel, &ids, 256));
+            }
+        }
+    }
+}
+
+/// T8d: a rejected item spends nothing. A GTC item needing 65 makers is `Rejected`; the four IOC
+/// items of 64 after it still get 64 each (256 in total).
+#[test]
+fn t8d_a_rejected_item_spends_none_of_the_batch_budget() {
+    for d in DIRS {
+        let mut ctx = fresh();
+        let ids = deep_book(&mut ctx, d);
+        let (out, logs) = ok(
+            &mut ctx,
+            ALICE,
+            &batch(vec![gtc(d, 65), ioc(d, 64), ioc(d, 64), ioc(d, 64), ioc(d, 64)]),
+        );
+        let mut want = vec![(TAG_REJECTED, R_OTHER)];
+        want.extend([(TAG_TERMINAL, R_NONE); 4]);
+        assert_eq!(tags(&out), want, "{d:?}");
+        assert_eq!(fills(&logs), one_each(&ids[..256]), "{d:?}");
+        assert!(evs::<OrderExpired>(&logs).is_empty(), "{d:?}");
+        assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::OneLevel, &ids, 256));
+    }
+}
+
+/// `batchPlaceOrdersSigned` for ALICE (message rebuilt from the ABI doc).
+fn signed_batch(ctx: &mut TestCtx, items: Vec<PlaceItem>) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"perpdex_v1_batch_order");
+    msg.extend_from_slice(&ctx.chain_id().to_be_bytes());
+    msg.extend_from_slice(ALICE.as_slice());
+    msg.push(1); // keyId
+    msg.extend_from_slice(&SIGNED_TS.to_be_bytes());
+    msg.extend_from_slice(&SIGNED_RECV.to_be_bytes());
+    msg.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for o in &items {
+        msg.extend_from_slice(&o.marketId.to_be_bytes());
+        msg.push(o.side);
+        msg.extend_from_slice(&o.price.to_be_bytes());
+        msg.extend_from_slice(&o.quantity.to_be_bytes());
+        msg.push(o.orderType);
+        msg.push(o.tif);
+        msg.extend_from_slice(&o.clientOrderId.0);
+        msg.push(o.flags);
+    }
+    let sig = key().sign(&msg).to_bytes();
+    batchPlaceOrdersSignedCall {
+        account: ALICE,
+        keyId: 1,
+        timestamp: SIGNED_TS,
+        recvWindow: SIGNED_RECV,
+        orders: items,
+        signature: sig.to_vec().into(),
+    }
+    .abi_encode()
+}
+
+/// T8e: the signed batch keeps the same total — T8b's five IOC items of 64 give identical tags,
+/// fills and expiry.
+#[test]
+fn t8e_the_signed_batch_has_the_same_total() {
+    for d in DIRS {
+        let mut ctx = fresh();
+        register_alice_key(&mut ctx);
+        let ids = deep_book(&mut ctx, d);
+        let input = signed_batch(&mut ctx, vec![ioc(d, 64); 5]);
+        let (out, logs) = ok(&mut ctx, DAVE, &input);
+        assert_eq!(tags(&out), vec![(TAG_TERMINAL, R_NONE); 5], "{d:?}");
+        assert_eq!(fills(&logs), one_each(&ids[..256]), "{d:?}");
+        assert_eq!(expiry(&logs), (records(&out)[4].1, 0, 64, X_TIF), "{d:?}");
+        assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::OneLevel, &ids, 256));
+        assert_eq!(amount(&mut ctx, ALICE), 256 * d.sign());
     }
 }

@@ -217,6 +217,8 @@ pub fn run_batch_place_orders<H: PerpHost>(
     let ids_consumed = core::cell::Cell::new(0u64);
     // The id the CURRENT item derived, published before anything can fail under it.
     let item_id = core::cell::Cell::new([0u8; 32]);
+    // Q1: the batch-wide maker-touch budget (`batch::MAX_BATCH_MAKER_TOUCHES`).
+    let mut touch_left = batch::MAX_BATCH_MAKER_TOUCHES;
     let run = batch::drive_batch(
         context,
         caller,
@@ -234,7 +236,7 @@ pub fn run_batch_place_orders<H: PerpHost>(
                 .ok_or_else(|| perp_err("placeOrder: order nonce overflow"))?;
             let order_id = derive_order_id(caller, nonce);
             item_id.set(order_id);
-            let tag = place_batch_item(ctx, caller, order_id, &orders[k])?;
+            let tag = place_batch_item(ctx, caller, order_id, &orders[k], &mut touch_left)?;
             // Reached only on acceptance — a reject returned above and consumed no id.
             ids_consumed.set(ids_consumed.get() + 1);
             Ok((tag, order_id))
@@ -321,6 +323,8 @@ pub fn run_batch_place_orders_signed<H: PerpHost>(
     gc_seen_buckets_best_effort(context, block_ts)?;
 
     let account = args.account;
+    // Q1: the batch-wide maker-touch budget, as on the direct path.
+    let mut touch_left = batch::MAX_BATCH_MAKER_TOUCHES;
     let run = batch::drive_batch(
         context,
         account,
@@ -333,7 +337,7 @@ pub fn run_batch_place_orders_signed<H: PerpHost>(
         },
         |ctx, k| {
             let order_id = signed_batch_order_id(&signature, k as u32);
-            let tag = place_batch_item(ctx, account, order_id, &orders[k])?;
+            let tag = place_batch_item(ctx, account, order_id, &orders[k], &mut touch_left)?;
             Ok((tag, order_id))
         },
     )?;
@@ -343,13 +347,27 @@ pub fn run_batch_place_orders_signed<H: PerpHost>(
 }
 
 /// One batch item: `place_order_core` verbatim, plus the status → tag mapping.
+///
+/// `touch_left` is what the batch's maker-touch budget (`batch::MAX_BATCH_MAKER_TOUCHES`) has
+/// left. The item gets the ordinary per-taker budget while that is the smaller, else what is left
+/// under the batch's own reject string; only an accepted item spends it (a rejected one wrote
+/// nothing, so nothing it walked counts).
 fn place_batch_item<H: PerpHost>(
     context: &mut H,
     account: Address,
     order_id: [u8; 32],
     item: &PlaceItem,
+    touch_left: &mut u32,
 ) -> Result<PerpBatchTag, PerpError> {
-    let status = place_order_core(
+    let budget = if *touch_left >= MAX_TAKER_MAKER_TOUCHES {
+        TouchBudget::SINGLE
+    } else {
+        TouchBudget {
+            limit: *touch_left,
+            reject_msg: batch::BATCH_TOUCH_CAP_REJECT,
+        }
+    };
+    let placed = place_order_core(
         account,
         order_id,
         item.marketId,
@@ -361,11 +379,12 @@ fn place_batch_item<H: PerpHost>(
         item.clientOrderId.0,
         item.flags,
         PlacementOrigin::Submitted,
-        TouchBudget::SINGLE,
+        budget,
         context,
-    )?
-    .status;
-    Ok(if status.is_terminal() {
+    )?;
+    debug_assert!(placed.touches <= budget.limit);
+    *touch_left -= placed.touches;
+    Ok(if placed.status.is_terminal() {
         // Fully filled, or an IOC/FOK/market remainder that expired: accepted, but nothing rests.
         PerpBatchTag::Filled
     } else {
