@@ -1178,3 +1178,6 @@ fn t8e_the_signed_batch_has_the_same_total() {
         assert_eq!(amount(&mut ctx, ALICE), 256 * d.sign());
     }
 }
+
+// Adversarial cases from the breaker pass.
+mod adversarial;

@@ -467,3 +467,6 @@ fn t16_a_keeper_drain_loop_terminates_after_ceil_book_over_64_fires() {
     assert_eq!(flag(&mut ctx), 0);
     assert_eq!(bid_count(&mut ctx), 0);
 }
+
+// Adversarial cases from the breaker pass.
+mod adversarial;
