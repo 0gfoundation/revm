@@ -204,17 +204,15 @@ pub(crate) struct PlaceOutcome {
     pub(crate) status: OrderStatus,
     /// Quantity filled by this placement.
     pub(crate) filled: u64,
-    /// Live maker orders the walk touched (see [`TouchCap`]); 0 for a PostOnly.
-    pub(crate) touches: u32,
     /// The walk stopped on its touch cap with quantity left (that remainder expired).
     pub(crate) touch_capped: bool,
 }
 
 /// One execute arm's result: the expiry reason when the remainder expired (see
-/// [`cancel_unfilled_remainder`]), plus the walk's touch accounting.
+/// [`cancel_unfilled_remainder`]), plus whether the touch cap stopped the walk. (The touch COUNT is
+/// not here: it is written in place, see `place_order_core`'s `touches`.)
 struct ExecOutcome {
     expiry: Option<ExpiryReason>,
-    touches: u32,
     touch_capped: bool,
 }
 
@@ -222,14 +220,12 @@ impl ExecOutcome {
     /// An arm whose order never walked (PostOnly).
     const NO_WALK: Self = Self {
         expiry: None,
-        touches: 0,
         touch_capped: false,
     };
 
     fn of(expiry: Option<ExpiryReason>, outcome: &MatchOutcome) -> Self {
         Self {
             expiry,
-            touches: outcome.touches,
             touch_capped: outcome.touch_capped,
         }
     }
@@ -259,8 +255,8 @@ fn touch_cap_for(kind: OrderKind, origin: PlacementOrigin, budget: TouchBudget) 
 }
 
 /// Validate → build in memory → execute → ONE final persist. Returns the taker order's FINAL status
-/// (and what it filled and touched), which is the whole outcome the callers need:
-/// `Open`/`PartiallyFilled` = it rests, and anything `is_terminal()` = it fully filled or its
+/// (and what it filled; the touch count goes to `touches`), which is the whole outcome the callers
+/// need: `Open`/`PartiallyFilled` = it rests, and anything `is_terminal()` = it fully filled or its
 /// IOC/FOK/market remainder expired, leaving no record. (`batchPlaceOrders` maps that split onto the
 /// `Accepted` / `Filled` status tags. The single-order entry points ignore it — they answer with
 /// the order id and let the caller read the logs.)
@@ -277,6 +273,12 @@ pub(crate) fn place_order_core<H: PerpHost>(
     flags: u8,
     origin: PlacementOrigin,
     budget: TouchBudget,
+    // Q1: the live makers this placement's walk touched (see `match_order`). Written IN PLACE, so
+    // it is valid on `Err` too: a reject after a walk (the cap's own, an unfillable FOK, a taker
+    // margin / tier refusal, a refused GTC rest) still did that work, and a batch charges its
+    // budget for it. Must enter as 0; at most `budget.limit` on return; 0 for a PostOnly or a
+    // reject before the walk.
+    touches: &mut u32,
     context: &mut H,
 ) -> Result<PlaceOutcome, PerpError> {
     let validated = validate_place_order(
@@ -397,7 +399,6 @@ pub(crate) fn place_order_core<H: PerpHost>(
     let cap = touch_cap_for(validated.kind, origin, budget);
     let ExecOutcome {
         expiry,
-        touches,
         touch_capped,
     } = match validated.kind {
         OrderKind::Limit(tif) => execute_limit_order(
@@ -412,6 +413,7 @@ pub(crate) fn place_order_core<H: PerpHost>(
             tif,
             origin,
             cap,
+            touches,
             &validated.market,
             &mut taker_order,
             &mut pending,
@@ -425,6 +427,7 @@ pub(crate) fn place_order_core<H: PerpHost>(
             quantity,
             validated.side,
             cap,
+            touches,
             &validated.market,
             &mut taker_order,
             &mut pending,
@@ -506,7 +509,6 @@ pub(crate) fn place_order_core<H: PerpHost>(
     Ok(PlaceOutcome {
         status,
         filled,
-        touches,
         touch_capped,
     })
 }
@@ -1088,6 +1090,7 @@ fn execute_limit_order<H: PerpHost>(
     tif: TimeInForce,
     origin: PlacementOrigin,
     cap: TouchCap,
+    touches: &mut u32,
     market: &crate::types::Market,
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
@@ -1142,6 +1145,7 @@ fn execute_limit_order<H: PerpHost>(
                 market,
                 false,
                 Some(cap),
+                touches,
                 taker_order,
             )?;
             if outcome.remaining == 0 {
@@ -1219,6 +1223,7 @@ fn execute_limit_order<H: PerpHost>(
                 market,
                 false,
                 Some(cap),
+                touches,
                 taker_order,
             )?;
             // No rest phase → nothing can refuse after the match, so the barrier is immediate.
@@ -1232,7 +1237,9 @@ fn execute_limit_order<H: PerpHost>(
             Ok(done)
         }
         TimeInForce::Fok => {
-            check_fok_feasibility(context, market_id, side, price, quantity, market, cap)?;
+            check_fok_feasibility(
+                context, market_id, side, price, quantity, market, cap, touches,
+            )?;
             let outcome = match_order(
                 context,
                 account,
@@ -1245,6 +1252,7 @@ fn execute_limit_order<H: PerpHost>(
                 market,
                 false,
                 Some(cap),
+                touches,
                 taker_order,
             )?;
             // BEFORE the barrier, not after: `match_order` already rejects an unfillable FOK
@@ -1296,6 +1304,7 @@ fn execute_market_order<H: PerpHost>(
     quantity: u64,
     side: Side,
     cap: TouchCap,
+    touches: &mut u32,
     market: &crate::types::Market,
     taker_order: &mut Order,
     pending_placed: &mut Option<PendingOrderPlaced>,
@@ -1312,6 +1321,7 @@ fn execute_market_order<H: PerpHost>(
         market,
         false,
         Some(cap),
+        touches,
         taker_order,
     )?;
     // A market order has NO rest phase, so nothing can refuse after the match: the barrier is

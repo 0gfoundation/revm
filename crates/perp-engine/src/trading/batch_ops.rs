@@ -350,8 +350,11 @@ pub fn run_batch_place_orders_signed<H: PerpHost>(
 ///
 /// `touch_left` is what the batch's maker-touch budget (`batch::MAX_BATCH_MAKER_TOUCHES`) has
 /// left. The item gets the ordinary per-taker budget while that is the smaller, else what is left
-/// under the batch's own reject string; only an accepted item spends it (a rejected one wrote
-/// nothing, so nothing it walked counts).
+/// under the batch's own reject string. EVERY item spends what its walk touched, accepted or
+/// rejected: a reject after the walk (the cap's own, an unfillable FOK, a taker margin / tier
+/// refusal, a refused GTC rest) writes nothing, but it did load and settle-compute up to 64 live
+/// makers, and the budget bounds that compute. Were a rejected item free, a batch of 64 items that
+/// each walk 64 makers and then reject would walk 4096 — the case the batch total exists to stop.
 fn place_batch_item<H: PerpHost>(
     context: &mut H,
     account: Address,
@@ -367,6 +370,7 @@ fn place_batch_item<H: PerpHost>(
             reject_msg: batch::BATCH_TOUCH_CAP_REJECT,
         }
     };
+    let mut touches = 0u32;
     let placed = place_order_core(
         account,
         order_id,
@@ -380,10 +384,13 @@ fn place_batch_item<H: PerpHost>(
         item.flags,
         PlacementOrigin::Submitted,
         budget,
+        &mut touches,
         context,
-    )?;
-    debug_assert!(placed.touches <= budget.limit);
-    *touch_left -= placed.touches;
+    );
+    // Charged BEFORE the `?`: a rejected item pays for its walk too (see above).
+    debug_assert!(touches <= budget.limit);
+    *touch_left -= touches;
+    let placed = placed?;
     Ok(if placed.status.is_terminal() {
         // Fully filled, or an IOC/FOK/market remainder that expired: accepted, but nothing rests.
         PerpBatchTag::Filled

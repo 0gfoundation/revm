@@ -115,6 +115,7 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         // Exempt from the Q1 touch cap: its own distinct-maker cap bounds it, and a liquidation
         // must never become rejectable.
         None,
+        &mut 0,
         &mut order,
     )?;
     // ── ⚠️ A LIQUIDATION MUST NEVER BECOME REJECTABLE ──────────────────────────────────────────

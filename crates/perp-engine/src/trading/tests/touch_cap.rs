@@ -458,7 +458,8 @@ fn world(ctx: &mut TestCtx) -> World {
 // ── Direct placement (for the touch count the shell does not expose) ─────────────────────────
 
 /// `place_order_core` called directly under `budget`, with the caller's next nonce id (committed on
-/// success like `placeOrder` does). Returns the outcome or the reject message.
+/// success like `placeOrder` does). Returns the outcome or the reject message, and the live makers
+/// the walk touched (written on a reject too).
 #[allow(clippy::too_many_arguments)]
 fn direct(
     ctx: &mut TestCtx,
@@ -470,8 +471,9 @@ fn direct(
     tif: u8,
     flags: u8,
     budget: crate::trading::TouchBudget,
-) -> Result<crate::trading::PlaceOutcome, String> {
+) -> (Result<crate::trading::PlaceOutcome, String>, u32) {
     let (id, bumped) = crate::trading::peek_order_id(ctx, user).unwrap();
+    let mut touches = 0u32;
     let r = crate::trading::place_order_core(
         user,
         id,
@@ -485,16 +487,18 @@ fn direct(
         flags,
         crate::trading::PlacementOrigin::Submitted,
         budget,
+        &mut touches,
         ctx,
     );
     let _ = take_logs(ctx);
-    match r {
+    let r = match r {
         Ok(p) => {
             crate::trading::commit_order_nonce(ctx, user, bumped).unwrap();
             Ok(p)
         }
         Err(e) => Err(e.to_string()),
-    }
+    };
+    (r, touches)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -534,9 +538,10 @@ fn t1_gtc_fills_up_to_64_makers_and_rejects_the_65th() {
             // T1a: qty 63 → 63 fills, 2 left. Touches 63 (read through the direct call).
             let mut ctx = fresh();
             let ids = seed(&mut ctx, d, l, &[BOB; 65]);
-            let p = direct(&mut ctx, CAROL, d.taker(), d.through(), 63, LIMIT, GTC, 0,
-                crate::trading::TouchBudget::SINGLE).unwrap();
-            assert_eq!((p.filled, p.touches, p.touch_capped), (63, 63, false), "{tag}");
+            let (p, touches) = direct(&mut ctx, CAROL, d.taker(), d.through(), 63, LIMIT, GTC, 0,
+                crate::trading::TouchBudget::SINGLE);
+            let p = p.unwrap();
+            assert_eq!((p.filled, touches, p.touch_capped), (63, 63, false), "{tag}");
             assert_eq!(maker_book(&mut ctx, d), survivors(d, l, &ids, 63), "{tag}");
 
             // T1a again through the shell: the logs.
@@ -707,9 +712,10 @@ fn t5c_63_stp_cancels_and_one_fill_is_exactly_the_cap() {
             owners.push(BOB);
             let mut ctx = fresh();
             let ids = seed(&mut ctx, d, l, &owners);
-            let p = direct(&mut ctx, ALICE, d.taker(), d.through(), 1, LIMIT, GTC, EM,
-                crate::trading::TouchBudget::SINGLE).unwrap();
-            assert_eq!((p.filled, p.touches, p.touch_capped), (1, 64, false), "{tag}");
+            let (p, touches) = direct(&mut ctx, ALICE, d.taker(), d.through(), 1, LIMIT, GTC, EM,
+                crate::trading::TouchBudget::SINGLE);
+            let p = p.unwrap();
+            assert_eq!((p.filled, touches, p.touch_capped), (1, 64, false), "{tag}");
 
             let mut ctx = fresh();
             let ids2 = seed(&mut ctx, d, l, &owners);
@@ -808,9 +814,10 @@ fn t7_stale_ids_do_not_count() {
                 let (_, logs) = ok(&mut ctx, CAROL, &limit(d.taker(), d.through(), 50, GTC, 0));
                 assert_eq!(fills(&logs), one_each(&ids[50..]), "{d:?}");
             } else {
-                let p = direct(&mut ctx, CAROL, d.taker(), d.through(), 50, LIMIT, GTC, 0,
-                    crate::trading::TouchBudget::SINGLE).unwrap();
-                assert_eq!((p.filled, p.touches, p.touch_capped), (50, 50, false), "{d:?}");
+                let (p, touches) = direct(&mut ctx, CAROL, d.taker(), d.through(), 50, LIMIT, GTC,
+                    0, crate::trading::TouchBudget::SINGLE);
+                let p = p.unwrap();
+                assert_eq!((p.filled, touches, p.touch_capped), (50, 50, false), "{d:?}");
             }
             assert!(maker_book(&mut ctx, d).is_empty(), "{d:?}");
             assert_eq!(level(&mut ctx, d.maker(), d.lvl(0)), (vec![], 0), "stale ids swept");
@@ -1012,8 +1019,10 @@ fn t8c_an_item_gets_only_what_the_batch_has_left() {
                     limit: 16,
                     reject_msg: crate::batch::BATCH_TOUCH_CAP_REJECT,
                 };
-                let r = direct(&mut ctx, ALICE, d.taker(), d.through(), 20, LIMIT, GTC, 0, budget);
+                let (r, touches) =
+                    direct(&mut ctx, ALICE, d.taker(), d.through(), 20, LIMIT, GTC, 0, budget);
                 assert_eq!(r.unwrap_err(), crate::batch::BATCH_TOUCH_CAP_REJECT, "{tag}");
+                assert_eq!(touches, 16, "the reject reports the 16 it walked: {tag}");
             } else {
                 want.push((TAG_TERMINAL, R_NONE));
                 assert_eq!(tags(&out), want, "{tag}");
@@ -1025,10 +1034,11 @@ fn t8c_an_item_gets_only_what_the_batch_has_left() {
     }
 }
 
-/// T8d: a rejected item spends nothing. A GTC item needing 65 makers is `Rejected`; the four IOC
-/// items of 64 after it still get 64 each (256 in total).
+/// T8d: a rejected item spends what it walked. A GTC item needing 65 makers is `Rejected` after
+/// walking 64 of them, so 192 are left: the next three IOC items of 64 fill 64 each and the fourth
+/// gets nothing (fills 0, expires 64).
 #[test]
-fn t8d_a_rejected_item_spends_none_of_the_batch_budget() {
+fn t8d_a_rejected_item_spends_what_its_walk_touched() {
     for d in DIRS {
         let mut ctx = fresh();
         let ids = deep_book(&mut ctx, d);
@@ -1040,9 +1050,82 @@ fn t8d_a_rejected_item_spends_none_of_the_batch_budget() {
         let mut want = vec![(TAG_REJECTED, R_OTHER)];
         want.extend([(TAG_TERMINAL, R_NONE); 4]);
         assert_eq!(tags(&out), want, "{d:?}");
-        assert_eq!(fills(&logs), one_each(&ids[..256]), "{d:?}");
-        assert!(evs::<OrderExpired>(&logs).is_empty(), "{d:?}");
-        assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::OneLevel, &ids, 256));
+        assert_eq!(fills(&logs), one_each(&ids[..192]), "{d:?}");
+        assert_eq!(expiry(&logs), (records(&out)[4].1, 0, 64, X_TIF), "{d:?}");
+        assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::OneLevel, &ids, 192));
+    }
+}
+
+/// T8f: cap-rejected items cannot buy a batch more walking. 60 GTC items of 65 then 4 IOC items of
+/// 64: the first four GTC items walk 64 each and use up all 256; the other 56 are refused at their
+/// first maker under the batch's own message, and the four IOC items fill nothing. Before rejected
+/// items were charged this batch walked 60 × 64 + 256 = 4096 makers (the review / breaker probe).
+#[test]
+fn t8f_cap_rejected_items_use_up_the_batch_budget() {
+    for d in DIRS {
+        let mut ctx = fresh();
+        let ids = deep_book(&mut ctx, d);
+        let mut items = vec![gtc(d, 65); 60];
+        items.extend(vec![ioc(d, 64); 4]);
+        let (out, logs) = ok(&mut ctx, ALICE, &batch(items));
+        let t = tags(&out);
+        assert!(t[..60].iter().all(|&x| x == (TAG_REJECTED, R_OTHER)), "{d:?}");
+        assert_eq!(t[60..], [(TAG_TERMINAL, R_NONE); 4], "{d:?}");
+        assert!(fills(&logs).is_empty(), "{d:?}");
+        let e = evs::<OrderExpired>(&logs);
+        assert_eq!(e.len(), 4, "{d:?}");
+        assert!(e
+            .iter()
+            .all(|e| (e.filledQuantity, e.expiredQuantity, e.reason) == (0, 64, X_TIF)));
+        assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::OneLevel, &ids, 0));
+        // Item 5's reject is the batch's (a 0-touch budget), not the per-taker one: read off a
+        // direct call under that budget, which walked nothing.
+        let budget = crate::trading::TouchBudget {
+            limit: 0,
+            reject_msg: crate::batch::BATCH_TOUCH_CAP_REJECT,
+        };
+        let (r, touches) =
+            direct(&mut ctx, ALICE, d.taker(), d.through(), 65, LIMIT, GTC, 0, budget);
+        assert_eq!(r.unwrap_err(), crate::batch::BATCH_TOUCH_CAP_REJECT, "{d:?}");
+        assert_eq!(touches, 0, "{d:?}");
+        // And a per-taker cap reject reports the 64 it walked.
+        let (r, touches) = direct(&mut ctx, ALICE, d.taker(), d.through(), 65, LIMIT, GTC, 0,
+            crate::trading::TouchBudget::SINGLE);
+        assert_eq!(r.unwrap_err(), TOUCH_CAP_REJECT, "{d:?}");
+        assert_eq!(touches, 64, "{d:?}");
+    }
+}
+
+/// T8g: a reject AFTER a full walk that is not the cap's — here the taker margin refusal a market
+/// order meets in `finalize_compute` (it has no pre-walk affordability filter) — also uses up what
+/// it walked. DAVE (a perp wallet of 1) sends six market items of 100: the first four each walk 64
+/// makers and are refused for margin (reason 29); that spends all 256, so the last two meet a
+/// 0-touch budget, fill nothing and expire whole (accepted, terminal).
+#[test]
+fn t8g_a_margin_reject_after_the_walk_uses_up_what_it_walked() {
+    const R_INSUFFICIENT_MARGIN: u8 = 29;
+    for d in DIRS {
+        let mut ctx = fresh();
+        let ids = deep_book(&mut ctx, d);
+        set_wallet(&mut ctx, DAVE, 1);
+        // The reject really comes after a 64-maker walk.
+        let single = crate::trading::TouchBudget::SINGLE;
+        let (r, touches) = direct(&mut ctx, DAVE, d.taker(), 0, 100, MKT, GTC, 0, single);
+        assert!(r.unwrap_err().contains("insufficient"), "{d:?}");
+        assert_eq!(touches, 64, "{d:?}");
+        let w = ctx.perp_write_count();
+        let (out, logs) = ok(&mut ctx, DAVE, &batch(vec![item(d.taker(), 0, 100, MKT, GTC); 6]));
+        let mut want = vec![(TAG_REJECTED, R_INSUFFICIENT_MARGIN); 4];
+        want.extend([(TAG_TERMINAL, R_NONE); 2]);
+        assert_eq!(tags(&out), want, "{d:?}");
+        assert!(fills(&logs).is_empty(), "{d:?}");
+        let e = evs::<OrderExpired>(&logs);
+        assert_eq!(e.len(), 2, "{d:?}");
+        assert!(e
+            .iter()
+            .all(|e| (e.filledQuantity, e.expiredQuantity, e.reason) == (0, 100, X_TIF)));
+        assert!(ctx.perp_write_count() > w, "the two accepted items consumed nonces");
+        assert_eq!(maker_book(&mut ctx, d), survivors(d, Layout::OneLevel, &ids, 0));
     }
 }
 

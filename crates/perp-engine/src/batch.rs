@@ -52,8 +52,10 @@ pub const MAX_BATCH_PLACE: usize = 64;
 
 /// Q1: maximum LIVE resting maker orders ALL the items of one `batchPlaceOrders(Signed)` may touch
 /// together. Each item is also held to the per-taker `MAX_TAKER_MAKER_TOUCHES` (64); an item gets
-/// `min(64, what the batch has left)`, and only an ACCEPTED item uses any up. Without it a full
-/// batch could touch 64 × 64 makers under one flat per-item gas charge.
+/// `min(64, what the batch has left)`, and EVERY item uses up what its walk touched — a rejected
+/// one included, since a reject after the walk (the cap's own, a FOK that cannot fill, a taker
+/// margin refusal) writes nothing but did the walk's compute. Without it a full batch could touch
+/// 64 × 64 makers under one flat per-item gas charge.
 ///
 /// At the batch limit an item behaves as at its own: a crossing GTC / FOK item is `Rejected`
 /// ([`BATCH_TOUCH_CAP_REJECT`], reason `Other`), a crossing IOC / market item fills up to what is

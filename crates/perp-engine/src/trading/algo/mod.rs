@@ -1180,6 +1180,7 @@ fn fire<H: PerpHost>(
         crate::trading::encode_order_flags(true, order.stp),
         crate::trading::PlacementOrigin::Triggered,
         crate::trading::TouchBudget::SINGLE,
+        &mut 0,
         context,
     );
     match placed {

@@ -68,6 +68,10 @@ pub(super) fn match_order<H: PerpHost>(
     // that (`TouchTrip`). `None` exactly for a liquidation close, which keeps its own distinct-maker
     // cap (`MAX_LIQUIDATION_MAKER_ACCOUNTS`) and must never become rejectable.
     touch_cap: Option<TouchCap>,
+    // Q1: the live makers this walk touched, counted IN PLACE so the count survives a reject. A
+    // batch charges an item for what its walk did, accepted or not (`place_batch_item`). Must enter
+    // as 0; a liquidation close (no cap) leaves it 0.
+    touches: &mut u32,
     // The taker's Order threaded in memory (commit-only #23): NOT yet persisted — the caller
     // performs the single final save after every genuine reject has passed, so a rejected
     // placement leaves no phantom order (and a signed order's signature is not burned).
@@ -78,6 +82,7 @@ pub(super) fn match_order<H: PerpHost>(
         touch_cap.is_none(),
         "only a liquidation close walks without a touch cap"
     );
+    debug_assert_eq!(*touches, 0, "a walk's touch count starts at 0");
     let mut remaining = quantity;
     let mut last_trade_price = None;
     let mut taker_settlement =
@@ -137,7 +142,10 @@ pub(super) fn match_order<H: PerpHost>(
     // while `remaining > 0` (the `remaining == 0` stop runs first), so a taker that needs exactly
     // `limit` makers is never capped, and every maker a capped walk touched was fully consumed or
     // removed from the book.
-    let mut touches: u32 = 0;
+    //
+    // The count lives in the caller's `touches`, not a local: a reject (the cap's own, a FOK that
+    // cannot fill, a taker margin / tier refusal in `finalize_compute`, a refused GTC rest) still
+    // walked every maker it counted, and a batch must be charged for that work.
     // The walk stopped on `TouchTrip::Clamp` with quantity left. Exclusive with
     // `stp_taker_expired`: either stop ends the walk.
     let mut touch_capped = false;
@@ -213,7 +221,7 @@ pub(super) fn match_order<H: PerpHost>(
                     };
                     // ── Q1 touch cap (see `touches` above) ─────────────────────────────────────
                     if let Some(cap) = touch_cap {
-                        if touches == cap.limit {
+                        if *touches == cap.limit {
                             // This live maker is the (limit+1)-th: stop BEFORE touching it.
                             match cap.on_trip {
                                 // Compute phase: nothing is written yet, so this is write-clean.
@@ -236,7 +244,7 @@ pub(super) fn match_order<H: PerpHost>(
                                 }
                             }
                         }
-                        touches += 1;
+                        *touches += 1;
                     }
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
@@ -550,7 +558,7 @@ pub(super) fn match_order<H: PerpHost>(
                     };
                     // Q1 touch cap — see the Buy mirror.
                     if let Some(cap) = touch_cap {
-                        if touches == cap.limit {
+                        if *touches == cap.limit {
                             match cap.on_trip {
                                 TouchTrip::Reject(msg) => return Err(perp_err(msg)),
                                 TouchTrip::Clamp => {
@@ -569,7 +577,7 @@ pub(super) fn match_order<H: PerpHost>(
                                 }
                             }
                         }
-                        touches += 1;
+                        *touches += 1;
                     }
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
@@ -811,7 +819,6 @@ pub(super) fn match_order<H: PerpHost>(
     Ok(MatchOutcome {
         remaining,
         stp_taker_expired,
-        touches,
         touch_capped,
         registry,
         taker_plan,
@@ -865,8 +872,6 @@ pub(super) struct MatchOutcome {
     /// left), and tells the caller the remainder EXPIRES with reason 9 — for a GTC too, which then
     /// never rests.
     pub(super) stp_taker_expired: bool,
-    /// Live maker orders the walk touched (Q1; 0 for a liquidation close, which is not capped).
-    pub(super) touches: u32,
     /// The walk stopped on its touch cap (`TouchTrip::Clamp`). Implies `remaining > 0`, and is
     /// mutually exclusive with `stp_taker_expired`.
     pub(super) touch_capped: bool,

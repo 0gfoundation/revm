@@ -8,6 +8,7 @@ use super::*;
 /// walk always honours `limit_price` — the `order_type` parameter this used to take could only ever
 /// be `Limit`, and the dead `Market` half of it was the `Market + FOK` product that no longer
 /// exists.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn check_fok_feasibility<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -19,6 +20,10 @@ pub(super) fn check_fok_feasibility<H: PerpHost>(
     // before the walk, with the cap's own message. Counted exactly like the walk counts: LIVE
     // orders only, stale lazy-queue ids are free.
     cap: TouchCap,
+    // Set to the live makers this pre-check walked when it rejects at the cap, so a batch is
+    // charged for them (see `match_order`'s `touches`). Untouched otherwise: a FOK that passes is
+    // counted by the walk that follows.
+    touches: &mut u32,
 ) -> Result<(), PerpError> {
     let reject_msg = match cap.on_trip {
         TouchTrip::Reject(msg) => msg,
@@ -55,6 +60,7 @@ pub(super) fn check_fok_feasibility<H: PerpHost>(
                     if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
                             if live == cap.limit {
+                                *touches = live;
                                 return Err(perp_err(reject_msg));
                             }
                             live += 1;
@@ -84,6 +90,7 @@ pub(super) fn check_fok_feasibility<H: PerpHost>(
                     if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
                             if live == cap.limit {
+                                *touches = live;
                                 return Err(perp_err(reject_msg));
                             }
                             live += 1;
