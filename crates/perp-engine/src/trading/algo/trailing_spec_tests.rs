@@ -3531,3 +3531,150 @@ fn kill_t34_a_trailing_overflow_alone_raises_the_deferred_flag() {
     assert_eq!(triggered(&c.logs), want[BUDGET..].to_vec());
     assert!(!deferred(&mut ctx));
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// The reduce-only cap and conditional orders (owner decision 2026-11-17)
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+//
+// `reduce_only::MAX_REDUCE_ONLY_ORDERS_PER_MARKET` = 10 slots per account and market: resting
+// reduce-only book orders plus untriggered conditionals whose child would REST (a limit pair with
+// GTC / PostOnly tif). Such a conditional takes its slot when placed, so its trigger is never
+// refused and can never push the owner past 10. The book-side placement paths are covered in
+// `trading::tests::touch_cap::reduce_only_cap`.
+
+const PO_TIF: u8 = 3;
+const FOK_TIF: u8 = 2;
+const E_RO_CAP: &str = crate::trading::reduce_only::REDUCE_ONLY_CAP_REJECT;
+const E_ALGO_RO_CAP: &str = crate::trading::reduce_only::ALGO_REDUCE_ONLY_CAP_REJECT;
+
+/// `user`'s resting reduce-only book orders, both sides.
+fn ro_resting(ctx: &mut TestCtx, user: Address) -> usize {
+    let b = storage::load_buy_orders(ctx, user, MARKET_ID).unwrap();
+    let s = storage::load_sell_orders(ctx, user, MARKET_ID).unwrap();
+    b.iter().chain(s.iter()).filter(|e| e.reduce_only).count()
+}
+
+/// A limit STOP conditional (`STOP`, the limit pair) of 1 at the stop price, with `tif`.
+fn limit_stop_call(d: Dir, tif: u8) -> Vec<u8> {
+    algo_call(STOP, d.close(), d.stop(), d.stop(), 1, tif, RO)
+}
+
+/// What takes a slot and what does not. ALICE (|position| 20) holds 8 resting reduce-only TPs; a
+/// GTC limit STOP makes 9, a PostOnly one 10. Then:
+/// * an 11th of either resting kind is refused — a GTC / PostOnly limit conditional with the algo
+///   string, a reduce-only GTC `placeOrder` with the book string — write-clean;
+/// * every conditional whose child cannot rest is accepted: STOP_MARKET, TAKE_PROFIT_MARKET, a
+///   closePosition STOP_MARKET, a trailing stop, and a limit STOP with IOC or FOK tif;
+/// * cancelling the PostOnly conditional frees exactly one slot, which a book order can take.
+#[test]
+fn ro_cap_resting_kind_conditionals_share_the_ten_slots() {
+    for d in DIRS {
+        let tag = format!("{d:?}");
+        let mut ctx = fresh();
+        seed_pos(&mut ctx, ALICE, 20 * d.sign(), 1);
+        for _ in 0..8 {
+            rest_ro(&mut ctx, ALICE, d.close(), d.tp(), 1);
+        }
+        place_algo(&mut ctx, ALICE, &limit_stop_call(d, GTC));
+        let po = place_algo(&mut ctx, ALICE, &limit_stop_call(d, PO_TIF)).0;
+        assert_eq!(ro_resting(&mut ctx, ALICE), 8, "{tag}");
+        rejected(&mut ctx, ALICE, &limit_stop_call(d, GTC), E_ALGO_RO_CAP);
+        rejected(&mut ctx, ALICE, &limit_stop_call(d, PO_TIF), E_ALGO_RO_CAP);
+        rejected(&mut ctx, ALICE, &algo_call(TAKE_PROFIT, d.close(), d.tp(), d.tp(), 1, GTC, RO), E_ALGO_RO_CAP);
+        rejected(&mut ctx, ALICE, &order_call(d.close(), d.tp(), 1, LIMIT, GTC, RO), E_RO_CAP);
+        // Not counted: their children never rest.
+        for input in [
+            ro_stop_call(d.close(), d.stop(), 1),
+            algo_call(TAKE_PROFIT_MARKET, d.close(), d.tp(), 0, 1, 0, RO),
+            cp_stop_call(d.close(), d.stop()),
+            trail_call(d.close(), 0, 100, 1, RO),
+            limit_stop_call(d, IOC),
+            limit_stop_call(d, FOK_TIF),
+        ] {
+            place_algo(&mut ctx, ALICE, &input);
+        }
+        assert_eq!(open_algos(&mut ctx, ALICE).len(), 8, "{tag}");
+        cancel_algo(&mut ctx, ALICE, po);
+        rest_ro(&mut ctx, ALICE, d.close(), d.tp(), 1);
+        assert_eq!(ro_resting(&mut ctx, ALICE), 9, "{tag}");
+        rejected(&mut ctx, ALICE, &limit_stop_call(d, GTC), E_ALGO_RO_CAP);
+        rejected(&mut ctx, ALICE, &order_call(d.close(), d.tp(), 1, LIMIT, GTC, RO), E_RO_CAP);
+    }
+}
+
+/// Boundary 9 → 10 → 11 through conditionals alone: with 8 resting, the 9th and 10th slots go to
+/// GTC limit conditionals, the 11th is refused.
+#[test]
+fn ro_cap_conditional_boundaries_9_10_11() {
+    for d in DIRS {
+        let mut ctx = fresh();
+        seed_pos(&mut ctx, ALICE, 20 * d.sign(), 1);
+        for _ in 0..8 {
+            rest_ro(&mut ctx, ALICE, d.close(), d.tp(), 1);
+        }
+        place_algo(&mut ctx, ALICE, &limit_stop_call(d, GTC)); // 9
+        place_algo(&mut ctx, ALICE, &limit_stop_call(d, GTC)); // 10
+        rejected(&mut ctx, ALICE, &limit_stop_call(d, GTC), E_ALGO_RO_CAP); // 11
+        assert_eq!(open_algos(&mut ctx, ALICE).len(), 2);
+    }
+}
+
+/// The TRIGGERED child is exempt and still works at the cap. ALICE (|position| 11) holds nine 1-lot
+/// reduce-only TPs and one GTC limit STOP of 1 — ten slots. The tick to the stop price fires it; no
+/// one bids/asks there, so the child RESTS: prefix room `11 − 0 ahead − 9 reduce-only = 2`, its 1
+/// placed in full. It becomes the tenth resting reduce-only order — never refused, never voided —
+/// and the account is still at 10: a reduce-only GTC `placeOrder` of 1, which the prefix condition
+/// would admit (`11 − 10 = 1` of room), is refused by the cap.
+#[test]
+fn ro_cap_a_triggered_child_takes_its_conditionals_slot_and_rests() {
+    for d in DIRS {
+        let tag = format!("{d:?}");
+        let mut ctx = fresh();
+        seed_pos(&mut ctx, ALICE, 11 * d.sign(), 1);
+        for _ in 0..9 {
+            rest_ro(&mut ctx, ALICE, d.close(), d.tp(), 1);
+        }
+        let stop = place_algo(&mut ctx, ALICE, &limit_stop_call(d, GTC)).0;
+        let c = tick(&mut ctx, d.stop());
+        assert_eq!(triggered(&c.logs), vec![(stop, d.stop(), d.stop())], "{tag}");
+        assert_eq!(placed_qty(&c.logs, stop), vec![1], "{tag}");
+        assert!(trades(&c.logs).is_empty(), "{tag}");
+        assert!(algo_cancels(&c.logs).is_empty(), "{tag}: not voided");
+        assert!(open_algos(&mut ctx, ALICE).is_empty(), "{tag}");
+        assert!(storage::load_order(&mut ctx, &stop).unwrap().is_some(), "{tag}: the child rests");
+        assert_eq!(ro_resting(&mut ctx, ALICE), 10, "{tag}");
+        rejected(&mut ctx, ALICE, &order_call(d.close(), d.tp(), 1, LIMIT, GTC, RO), E_RO_CAP);
+    }
+}
+
+/// A market stop still closes the WHOLE position with ten reduce-only TPs resting (the cap is
+/// full): ALICE |position| 10, ten 1-lot TPs, a closePosition (or quantity-10 reduce-only)
+/// STOP_MARKET — not a slot holder — fires at the stop, fills 10 against the maker, and the ten TPs
+/// left on a flat position are evicted as `ReduceOnlyWouldOpen` (6), the bounded ten.
+#[test]
+fn ro_cap_a_market_stop_still_closes_at_the_cap() {
+    for d in DIRS {
+        for cp in [true, false] {
+            let tag = format!("{d:?} cp={cp}");
+            let mut ctx = fresh();
+            seed_pos(&mut ctx, ALICE, 10 * d.sign(), 1);
+            seed_pos(&mut ctx, ERIN, -10 * d.sign(), 1);
+            let tps: Vec<Id> = (0..10).map(|_| rest_ro(&mut ctx, ALICE, d.close(), d.tp(), 1)).collect();
+            rest(&mut ctx, d.maker(), d.open(), d.stop(), 10);
+            assert_eq!(ro_resting(&mut ctx, ALICE), 10, "{tag}");
+            let input =
+                if cp { cp_stop_call(d.close(), d.stop()) } else { ro_stop_call(d.close(), d.stop(), 10) };
+            let sl = place_algo(&mut ctx, ALICE, &input).0;
+            let c = tick(&mut ctx, d.stop());
+            assert_eq!(triggered(&c.logs), vec![(sl, d.stop(), d.stop())], "{tag}");
+            assert_eq!(trades(&c.logs), vec![(ALICE, d.maker(), d.stop(), 10)], "{tag}");
+            assert_eq!(amount(&mut ctx, ALICE), 0, "{tag}");
+            let mut evicted = book_cancels(&c.logs);
+            evicted.sort();
+            let mut want: Vec<(Id, u8)> = tps.iter().map(|id| (*id, R_RO_WOULD_OPEN)).collect();
+            want.sort();
+            assert_eq!(evicted, want, "{tag}");
+            assert_eq!(ro_resting(&mut ctx, ALICE), 0, "{tag}");
+        }
+    }
+}

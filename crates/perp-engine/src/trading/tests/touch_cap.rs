@@ -1181,3 +1181,7 @@ fn t8e_the_signed_batch_has_the_same_total() {
 
 // Adversarial cases from the breaker pass.
 mod adversarial;
+
+// The reduce-only cap (owner decision 2026-11-17), the follow-up that bounds the eviction gap the
+// breaker pass pinned.
+mod reduce_only_cap;
