@@ -1888,14 +1888,15 @@ fn b2_at_the_cap_ioc_fok_and_market_orders_still_trade() {
 }
 
 /// B2: reduce-only resting orders COUNT toward the cap, and a reduce-only IOC / market order still
-/// closes at the cap.
+/// closes at the cap. (Ten reduce-only orders, the most the reduce-only cap allows, and 190 normal
+/// ones; at 200 the open-order cap is the one that answers, being checked first.)
 #[test]
 fn b2_reduce_only_orders_count_and_a_reduce_only_close_still_trades_at_the_cap() {
     let mut ctx = fresh();
     seed_pos(&mut ctx, ALICE, 300, 1);
     seed_pos(&mut ctx, CAROL, -300, 1);
-    fill_book(&mut ctx, ALICE, BUY, 9_000, 150);
-    for _ in 0..49 {
+    fill_book(&mut ctx, ALICE, BUY, 9_000, 190);
+    for _ in 0..9 {
         rest_with(&mut ctx, ALICE, SELL, 11_000, 1, GTC, RO);
     }
     assert_eq!(open_count(&mut ctx, ALICE), 199);

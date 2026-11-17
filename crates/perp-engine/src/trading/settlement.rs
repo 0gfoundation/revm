@@ -1661,6 +1661,11 @@ impl MatchRegistry {
         // Not mid-walk, on purpose — admission already guarantees a reduce-only order is fully
         // coverable at the moment the walk reaches it. See `crate::trading::reduce_only::restore`.
         //
+        // Bounded: each user loses at most `reduce_only::MAX_REDUCE_ONLY_ORDERS_PER_MARKET` (10)
+        // orders here, since that is all it can have resting, so a 64-touch walk evicts at most
+        // 64 × 10 (a liquidation walk, 128 maker accounts × 10). Each eviction re-reads the side
+        // list (≤ 200 entries), O(10 · 200) per user — not worth an incremental rewrite.
+        //
         // ⚠️ The TAKER's gates were measured AFTER this pass, not before it: `finalize_compute` and
         // `taker_rest_basis` replay it on copies (`post_flush_snapshot`). Moving it, or adding a
         // trigger here, has to move that replay with it — `rest_in_book`'s basis assertion is what

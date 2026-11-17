@@ -98,7 +98,7 @@ pub mod trailing;
 /// # Why it exists
 ///
 /// Every per-user walk over a market's orders is bounded by it: the reduce-only prefix and eviction
-/// passes, the cover-cancel loop in taker settlement, and liquidation's / ADL's
+/// passes (the number of evictions itself by the tighter `reduce_only::MAX_REDUCE_ONLY_ORDERS_PER_MARKET`), the cover-cancel loop in taker settlement, and liquidation's / ADL's
 /// `cancel_all_orders_for_market`, which runs inside an already-capped sweep. It also bounds how
 /// many of a user's OWN orders a single taker can meet on the opposite side of the book, and so
 /// how many self-trade prevention can cancel, since STP has no per-order cancel limit: at most 200
@@ -389,6 +389,18 @@ fn place_core<H: PerpHost>(
         >= MAX_OPEN_ORDERS_PER_MARKET
     {
         return Err(perp_err("placeAlgoOrder: max open orders reached"));
+    }
+    // The reduce-only cap: a conditional whose child would REST (a limit pair with GTC / PostOnly
+    // tif) takes its reduce-only slot NOW, so that firing it later can never be refused or push the
+    // owner past the cap — the child inherits the slot. A market-type or IOC / FOK child never
+    // rests and takes none. See `reduce_only::MAX_REDUCE_ONLY_ORDERS_PER_MARKET`.
+    if !v.kind.is_market() && OrderKind::Limit(v.tif).has_resting_queue_position() {
+        crate::trading::reduce_only::ensure_reduce_only_room(
+            context,
+            account,
+            market_id,
+            crate::trading::reduce_only::ALGO_REDUCE_ONLY_CAP_REJECT,
+        )?;
     }
     // An untriggered conditional makes its market one the account is active in — a member of the
     // per-user market index, which the cross liquidation's cancel-all walks (cross P3 review) — so

@@ -326,6 +326,13 @@ pub fn admit<H: PerpHost>(
 /// order the position still covers it in full. This pass only has to put the book back in shape
 /// for the NEXT transaction. The `fill_opening_qty == 0` watchdog is what would catch that
 /// reasoning being wrong.
+///
+/// # Cost
+///
+/// At most [`MAX_REDUCE_ONLY_ORDERS_PER_MARKET`] evictions per call — the side cannot hold more
+/// reduce-only orders than that — each re-reading a side list of at most `MAX_OPEN_ORDERS_PER_MARKET`
+/// (200) entries. The quadratic shape is deliberate at that size: it keeps the decision in one pure
+/// function ([`next_eviction`]) that the admission gates replay.
 pub fn restore<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -439,6 +446,138 @@ pub fn restore_both_sides<H: PerpHost>(
 ) -> Result<(), PerpError> {
     restore(context, user, market, Side::Buy, reason)?;
     restore(context, user, market, Side::Sell, reason)
+}
+
+/// How many reduce-only orders one account may hold RESTING in one market — counting, in the same
+/// budget, its untriggered conditional orders whose child would rest (owner decision 2026-11-17).
+///
+/// # Why it exists
+///
+/// [`restore`] runs after every fill, for every maker the walk touched, and evicts that maker's
+/// reduce-only orders farthest-first until the prefix condition holds. Before this cap the number it
+/// could evict was bounded only by the open-order cap (`MAX_OPEN_ORDERS_PER_MARKET` = 200), so one
+/// taker walk under the 64-touch cap could cancel 64 × 199 = 12,736 orders in one flat-gas call (one
+/// in-band fill per maker flattens it, and every off-band reduce-only order of its own goes). With
+/// this cap a touched maker loses at most 10, so one walk evicts at most 64 × 10 = 640, and a
+/// liquidation walk at most `MAX_LIQUIDATION_MAKER_ACCOUNTS` × 10 = 1,280. Per eviction `restore`
+/// re-reads the side list, so the pass is O(k · n) with k ≤ 10 evictions and n ≤ 200 entries —
+/// no longer worth restructuring.
+///
+/// # What counts
+///
+/// `slots = (reduce-only entries resting on BOTH sides of the book)
+///        + (untriggered conditionals whose child RESTS: a limit pair with GTC / PostOnly tif)`
+///
+/// Every conditional is reduce-only or closePosition (`algo::validate`), so its child is reduce-only.
+/// A market-type conditional (STOP_MARKET / TAKE_PROFIT_MARKET / TRAILING_STOP_MARKET) or a limit one
+/// with IOC / FOK tif never rests, so it does not count; neither does a placement that fills or
+/// expires in full.
+///
+/// # Where it is enforced
+///
+/// * a SUBMITTED reduce-only order (`placeOrder`, `placeOrderSigned`, a batch item, any of them via
+///   `asSubAccount`) — at the moment its remainder would REST (after the match is decided, before it
+///   is written), so an order that fills completely, an IOC / FOK / market order, and a GTC whose
+///   remainder expires (touch cap, STP) are never refused. Refused write-clean with
+///   [`REDUCE_ONLY_CAP_REJECT`] when `slots >= 10`;
+/// * `placeAlgoOrder` / `placeAlgoOrderSigned` of a limit conditional with GTC / PostOnly tif —
+///   [`ALGO_REDUCE_ONLY_CAP_REJECT`] when `slots >= 10`;
+/// * a TRIGGERED child is never refused (a stop that does nothing is worse than a slow one): it
+///   needs no check, because its conditional already held its slot. `fire` takes the conditional off
+///   the owner's list before placing the child, so a firing trades one counted order for at most one
+///   other (a re-armed conditional returns to the list, and its child never rested). Hence
+///   `slots <= 10` is an INVARIANT for every account and market, which a debug assertion in the
+///   triggered path checks.
+///
+/// The count is read from the store BEFORE the match is written. A walk that evicts some of the
+/// placer's own reduce-only orders (its fill shrinks its position) frees those slots only after this
+/// check, so at the boundary such an order is refused although its rest would have fitted. That is
+/// conservative and rare (the order has to cross, and shrink the position past the prefix of the
+/// orders it is about to join), so it is not worth replaying the eviction for.
+///
+/// No new event, batch reason (`Other`, 255) or storage key: both lists are already per-account.
+pub const MAX_REDUCE_ONLY_ORDERS_PER_MARKET: usize = 10;
+
+/// A submitted reduce-only order whose remainder would rest past [`MAX_REDUCE_ONLY_ORDERS_PER_MARKET`].
+/// Not in the batch reason table (reason `Other`). The number is pinned to the constant by test.
+pub const REDUCE_ONLY_CAP_REJECT: &str =
+    "placeOrder: too many reduce-only orders (at most 10 resting per market); cancel one first";
+
+/// [`REDUCE_ONLY_CAP_REJECT`] for a `placeAlgoOrder` whose child would rest.
+pub const ALGO_REDUCE_ONLY_CAP_REJECT: &str =
+    "placeAlgoOrder: too many reduce-only orders (at most 10 resting per market); cancel one first";
+
+/// The slots `user` holds in `market_id` under [`MAX_REDUCE_ONLY_ORDERS_PER_MARKET`], or `None`
+/// when the cheap bound already shows fewer than the cap are held (the caller only needs to know
+/// "under the cap").
+///
+/// The conditional records are loaded only when it could matter: book reduce-only entries plus the
+/// WHOLE conditional list (≤ `MAX_ALGO_ORDERS_PER_MARKET` ids) below the cap means the exact count
+/// is below it too. Read-only (`_ref` lists, cache-fill), so it enters nothing into the block delta.
+fn reduce_only_slots_if_near_cap<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<Option<usize>, PerpError> {
+    let book = side_entries_ref(context, user, market_id, Side::Buy)?
+        .iter()
+        .filter(|e| e.reduce_only)
+        .count()
+        + side_entries_ref(context, user, market_id, Side::Sell)?
+            .iter()
+            .filter(|e| e.reduce_only)
+            .count();
+    if book >= MAX_REDUCE_ONLY_ORDERS_PER_MARKET {
+        return Ok(Some(book));
+    }
+    let algo_ids = storage::load_user_algo_orders(context, user, market_id)?;
+    if book + algo_ids.len() < MAX_REDUCE_ONLY_ORDERS_PER_MARKET {
+        return Ok(None);
+    }
+    let mut slots = book;
+    for id in &algo_ids {
+        let rests = storage::load_order(context, id)?.is_some_and(|o| {
+            o.order_type == crate::types::OrderType::Limit
+                && crate::types::OrderKind::Limit(o.tif).has_resting_queue_position()
+        });
+        if rests {
+            slots += 1;
+        }
+    }
+    Ok(Some(slots))
+}
+
+/// Refuses with `reject` when `user` already holds [`MAX_REDUCE_ONLY_ORDERS_PER_MARKET`] slots in
+/// `market_id`. Pure read: a refusal is a genuine write-clean reject.
+pub(crate) fn ensure_reduce_only_room<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+    reject: &'static str,
+) -> Result<(), PerpError> {
+    match reduce_only_slots_if_near_cap(context, user, market_id)? {
+        Some(slots) if slots >= MAX_REDUCE_ONLY_ORDERS_PER_MARKET => Err(perp_err(reject)),
+        _ => Ok(()),
+    }
+}
+
+/// Debug-only watchdog for the triggered path: a fired child about to rest must find a free slot,
+/// because its conditional held one and has just given it up (see
+/// [`MAX_REDUCE_ONLY_ORDERS_PER_MARKET`]). A failure means some path added a reduce-only order or
+/// a resting-kind conditional without [`ensure_reduce_only_room`].
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_triggered_rest_has_room<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market_id: u64,
+) -> Result<(), PerpError> {
+    let slots = reduce_only_slots_if_near_cap(context, user, market_id)?.unwrap_or(0);
+    debug_assert!(
+        slots < MAX_REDUCE_ONLY_ORDERS_PER_MARKET,
+        "a triggered reduce-only child found {user} at the reduce-only cap ({slots}) in market \
+         {market_id}: some path admitted one without the cap check"
+    );
+    Ok(())
 }
 
 /// Snapshot of one side's entry list. Read through the `_ref` loader: cache-fill only, never

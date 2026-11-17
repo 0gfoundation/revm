@@ -1107,6 +1107,7 @@ fn execute_limit_order<H: PerpHost>(
         TimeInForce::PostOnly => {
             // No match runs → the do-not-cross BBO is still current at rest; thread it in.
             let bbo = ensure_post_only_does_not_cross(context, market_id, side, price)?;
+            ensure_reduce_only_rest_room(context, account, market_id, taker_order, origin)?;
             raise_rest_refusal(rest_in_book(
                 context,
                 account,
@@ -1188,6 +1189,11 @@ fn execute_limit_order<H: PerpHost>(
                 outcome.apply(context, side, market, pending_placed)?;
                 return Ok(done);
             }
+            // The remainder WILL rest unless `rest_in_book` refuses it, so this is the one point
+            // where a reduce-only GTC takes a slot: a full fill or an expired remainder returned
+            // above and never counts. Still write-clean — `outcome` is decided but unwritten, and
+            // dropping it on the way out discards the whole match.
+            ensure_reduce_only_rest_room(context, account, market_id, taker_order, origin)?;
             let remaining = outcome.remaining;
             let done = ExecOutcome::of(None, &outcome);
             raise_rest_refusal(rest_in_book(
@@ -1264,6 +1270,41 @@ fn execute_limit_order<H: PerpHost>(
             let done = ExecOutcome::of(None, &outcome);
             outcome.apply(context, side, market, pending_placed)?;
             Ok(done)
+        }
+    }
+}
+
+/// The reduce-only cap ([`crate::trading::reduce_only::MAX_REDUCE_ONLY_ORDERS_PER_MARKET`]) for an
+/// order about to REST. Called by the two resting arms (PostOnly, a GTC remainder) after every other
+/// outcome of the walk is known and before anything is written, so a refusal is a clean whole-order
+/// reject; an order that fills or expires in full never gets here and never counts.
+///
+/// A SUBMITTED reduce-only order is refused at the cap. A TRIGGERED one is not checked — its
+/// conditional held the slot and gave it up in `algo::fire` — only watched in debug builds. A
+/// normal order is not a reduce-only order and costs nothing here.
+fn ensure_reduce_only_rest_room<H: PerpHost>(
+    context: &mut H,
+    account: Address,
+    market_id: u64,
+    taker_order: &Order,
+    origin: PlacementOrigin,
+) -> Result<(), PerpError> {
+    if !taker_order.reduce_only {
+        return Ok(());
+    }
+    match origin {
+        PlacementOrigin::Submitted => crate::trading::reduce_only::ensure_reduce_only_room(
+            context,
+            account,
+            market_id,
+            crate::trading::reduce_only::REDUCE_ONLY_CAP_REJECT,
+        ),
+        PlacementOrigin::Triggered => {
+            #[cfg(debug_assertions)]
+            crate::trading::reduce_only::debug_assert_triggered_rest_has_room(
+                context, account, market_id,
+            )?;
+            Ok(())
         }
     }
 }

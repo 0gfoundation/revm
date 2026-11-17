@@ -1,6 +1,6 @@
 //! Adversarial cases for the Q1 touch cap (from the breaker pass). Each one tries a way to make a
 //! single call touch more than 64 live resting orders, or to make a capped / rejected call leak
-//! state. The last one pins a known gap the cap does not cover (reduce-only evictions).
+//! state. The last one bounds the reduce-only evictions a capped walk can cause (the reduce-only cap).
 use super::*;
 use crate::interface::IPerpDex::{asSubAccountCall, createSubAccountCall};
 
@@ -227,40 +227,59 @@ fn brk_cancel_replace_churn_at_one_level() {
     }
 }
 
-/// KNOWN GAP, pinned (predates Q1; open follow-up): the post-flush reduce-only eviction pass is not
-/// bounded by the touch cap. Each maker's ONE in-band fill can flatten it and evict up to 199 of its
-/// resting reduce-only orders that sit off-band (never walked). One 3-touch IOC here cancels
-/// 3 × 199 = 597 orders; at 64 touches the same shape cancels 64 × 199 = 12,736 in one flat-gas
-/// call. When this is bounded, this test changes with it.
+/// The post-fill reduce-only eviction pass is bounded by the reduce-only cap (formerly a pinned
+/// KNOWN GAP: 199 evictions per touched maker, 64 × 199 = 12,736 per flat-gas call). Each maker's
+/// ONE in-band fill flattens it, and every reduce-only order it has resting off-band (never walked)
+/// is evicted — but it can have at most `MAX_REDUCE_ONLY_ORDERS_PER_MARKET` = 10 of them, so a
+/// 64-touch call evicts at most 64 × 10 = 640. Hand-derived: 65 makers long 11, each with ten 1-lot
+/// reduce-only asks at 8_000 (the 11th refused by the cap, with 1 of room left) and one normal ask
+/// of 11 in band; the IOC touches the first 64 normal asks, fills 64 × 11 = 704, expires 11, and
+/// evicts exactly 640 reduce-only orders; the 65th maker keeps its ten.
 #[test]
-fn brk_known_gap_reduce_only_evictions_are_not_bounded_by_the_cap() {
+fn brk_reduce_only_evictions_are_bounded_by_the_reduce_only_cap() {
+    use crate::trading::reduce_only::{MAX_REDUCE_ONLY_ORDERS_PER_MARKET, REDUCE_ONLY_CAP_REJECT};
+    const RO_CAP: usize = 10;
+    assert_eq!(MAX_REDUCE_ONLY_ORDERS_PER_MARKET, RO_CAP);
     let mut ctx = fresh();
-    const N: usize = 3;
-    // Liquidity for the makers to get long 199 each.
-    rest(&mut ctx, CAROL, SELL, MARK, 199 * N as u64);
+    const N: usize = CAP + 1;
+    // Liquidity for the makers to get long 11 each (one more than the ten 1-lot reduce-only asks,
+    // so the 11th passes the prefix condition and meets the cap rather than running out of room).
+    rest(&mut ctx, CAROL, SELL, MARK, 11 * N as u64);
     for i in 0..N {
         let m = mk(100 + i);
         set_wallet(&mut ctx, m, WALLET);
-        ok(&mut ctx, m, &limit(BUY, MARK, 199, IOC, 0));
-        assert_eq!(amount(&mut ctx, m), 199);
+        ok(&mut ctx, m, &limit(BUY, MARK, 11, IOC, 0));
+        assert_eq!(amount(&mut ctx, m), 11);
     }
-    // 199 reduce-only asks per maker at 8_000, placed while the mark was there (a later mark move
+    // Ten reduce-only asks per maker at 8_000, placed while the mark was there (a later mark move
     // of >= the 10% band leaves them below the buy walk's lower band, 9_000, so walks skip them).
+    // The 11th is refused write-clean.
     storage::save_mark_price(&mut ctx, MARKET_ID, 8_000).unwrap();
     for i in 0..N {
-        for _ in 0..199 {
+        for _ in 0..RO_CAP {
             let (_, logs) = ok(&mut ctx, mk(100 + i), &limit(SELL, 8_000, 1, GTC, RO));
             assert_eq!(evs::<OrderRested>(&logs).len(), 1);
         }
     }
-    // Each maker's one NORMAL ask of 199, in band (one level each, farther than the RO asks, so it
-    // does not overtake them and evicts nothing at placement).
-    let normals: Vec<_> = (0..N).map(|i| rest(&mut ctx, mk(100 + i), SELL, MARK + 1 + i as u64, 199)).collect();
+    rejected(&mut ctx, mk(100), &limit(SELL, 8_000, 1, GTC, RO), REDUCE_ONLY_CAP_REJECT);
+    // Each maker's one NORMAL ask of 11, in band (one level each, farther than the reduce-only
+    // asks, so it does not overtake them and evicts nothing at placement).
+    let normals: Vec<_> =
+        (0..N).map(|i| rest(&mut ctx, mk(100 + i), SELL, MARK + 1 + i as u64, 11)).collect();
     storage::save_mark_price(&mut ctx, MARKET_ID, MARK).unwrap();
-    assert_eq!(level(&mut ctx, SELL, 8_000).1, 199 * N as u64);
-    let (_, logs) = ok(&mut ctx, ALICE, &limit(BUY, MARK + 10, 199 * N as u64, IOC, 0));
-    assert_eq!(fills(&logs), normals.iter().map(|&id| (id, 199)).collect::<Vec<_>>());
+    assert_eq!(level(&mut ctx, SELL, 8_000).1, (RO_CAP * N) as u64);
+    let (out, logs) = ok(&mut ctx, ALICE, &limit(BUY, MARK + 100, 11 * N as u64, IOC, 0));
+    assert_eq!(fills(&logs), normals[..CAP].iter().map(|&id| (id, 11)).collect::<Vec<_>>());
+    assert_eq!(expiry(&logs), (order_id_of(&out), 11 * CAP as u64, 11, X_TIF));
     let c = cancels(&logs);
-    assert!(c.len() > CAP, "{} evictions from a {N}-touch call", c.len());
-    assert_eq!(c.len(), 199 * N);
+    assert_eq!(c.len(), CAP * RO_CAP, "evictions = touched makers x the reduce-only cap");
+    for i in 0..CAP {
+        let m = mk(100 + i);
+        assert_eq!(c.iter().filter(|e| e.0 == m).count(), RO_CAP, "maker {i}");
+        assert_eq!(amount(&mut ctx, m), 0);
+        assert!(open_ids(&mut ctx, m, SELL).is_empty());
+    }
+    // The 65th maker was not touched: its ten reduce-only asks and its normal ask remain.
+    assert_eq!(open_ids(&mut ctx, mk(100 + CAP), SELL).len(), RO_CAP + 1);
+    assert_eq!(level(&mut ctx, SELL, 8_000).1, RO_CAP as u64);
 }
