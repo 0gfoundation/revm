@@ -9,8 +9,8 @@
 //! 1x long at $100 the sell stop closes. Every oracle tick and drain goes through the call shell.
 use super::*;
 use crate::interface::IPerpDex::{
-    cancelAlgoOrderCall, placeAlgoOrderCall, AlgoOrderCancelled, AlgoOrderTriggered, OrderExpired,
-    OrderRested, Trade,
+    cancelAlgoOrderCall, getAlgoOrderCall, placeAlgoOrderCall, AlgoOrderCancelled,
+    AlgoOrderTriggered, OrderExpired, OrderRested, Trade,
 };
 use crate::types::{AlgoOrderType, CancelReason, Order};
 
@@ -326,6 +326,16 @@ fn t13_a_capped_trailing_stop_re_arms_as_a_fixed_stop_at_the_fired_price() {
         assert!(crate::trading::algo::trailing::load_link(&mut ctx, &id).unwrap().is_none());
         assert_eq!(armed(&mut ctx, STOP), (vec![id], vec![STOP], vec![id]));
         assert_eq!(flag(&mut ctx), 1);
+        // getAlgoOrder: still type 4 with its callback, but reported as the fixed stop it now is —
+        // activated, no peak, the current stop = the trigger it re-armed at.
+        let (ret, _) =
+            shell(&mut ctx, ALICE, &getAlgoOrderCall { algoId: id.into() }.abi_encode());
+        let v = getAlgoOrderCall::abi_decode_returns(&ret).unwrap();
+        assert_eq!(
+            (v.orderType, v.triggerPrice, v.quantity, v.callbackRateBps),
+            (AlgoOrderType::TrailingStopMarket as u8, STOP, 36, 100)
+        );
+        assert_eq!((v.activated, v.peakPrice, v.currentStop), (true, 0, STOP));
 
         if cancel {
             let (_, logs) = shell(

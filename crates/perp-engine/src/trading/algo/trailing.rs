@@ -1268,7 +1268,10 @@ pub(crate) fn view<H: PerpHost>(
     tick: u64,
 ) -> Result<TrailView, PerpError> {
     let Some(link) = load_link(context, id)? else {
-        return Ok(TrailView::default());
+        // A live trailing order with NO link is one the Q1 touch cap re-armed (`algo::rearm`): a
+        // pending or activated one always has a link. It is a fixed stop at `trigger_price` now,
+        // so report that stop as the current one; no peak is tracked any more.
+        return Ok(TrailView { activated: true, peak: 0, stop: order.trigger_price });
     };
     if !link.active {
         return Ok(TrailView::default());
