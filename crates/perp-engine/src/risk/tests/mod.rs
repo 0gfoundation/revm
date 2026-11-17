@@ -345,6 +345,65 @@ fn liquidation_matching_caps_distinct_maker_accounts() {
     );
 }
 
+/// Q1 (spec T9): the per-taker maker-touch cap (`MAX_TAKER_MAKER_TOUCHES` = 64) does NOT apply to
+/// a liquidation close — only its own distinct-ACCOUNT cap does. 200 single-lot bids from ONE
+/// account are one distinct maker, so the close walks all 200 orders (> 64) and closes in full.
+#[test]
+fn liquidation_close_is_exempt_from_the_maker_touch_cap() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let quantity: u64 = 200;
+    assert!(quantity > u64::from(crate::trading::MAX_TAKER_MAKER_TOUCHES));
+    let entry_value = calc_value(ENTRY_PRICE, quantity, 0, PRICE_DECIMALS).unwrap();
+    storage::save_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &PerpPosition {
+            amount: i64::try_from(quantity).unwrap(),
+            v_quote_balance: -i64::try_from(entry_value).unwrap(),
+            margin: i64::try_from(entry_value / 5).unwrap(),
+            leverage: 5,
+            ..crate::margin::margin_type::never_set_position()
+        },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+    storage::save_account(
+        &mut ctx,
+        MAKER,
+        UserAccount {
+            perp_wallet_balance: 1_000_000_000_000_000,
+            ..UserAccount::default()
+        },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+    for _ in 0..quantity {
+        place_order(&mut ctx, MAKER, Side::Buy as u8, LONG_LIQ_PRICE, 1);
+    }
+    assert_eq!(
+        storage::load_bid_count(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap(),
+        quantity
+    );
+
+    let market = storage::load_market_ref(&mut ctx, MARKET_ID)
+        .unwrap()
+        .unwrap();
+    let close =
+        execute_liquidation_market_order(&mut ctx, ALICE, &market, Side::Sell, quantity, None)
+            .unwrap();
+
+    assert_eq!(close.remaining, 0, "all 200 orders filled: no touch cap on the close");
+    assert!(!close.maker_cap_deferred, "one distinct maker account");
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    assert_eq!(position(&mut ctx, MAKER).amount, 200);
+    assert_eq!(
+        storage::load_bid_count(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap(),
+        0
+    );
+}
+
 #[test]
 fn sweep_liquidates_underwater_user_with_no_free_wallet_for_taker_fee() {
     // Regression for review fix B: a liquidation closing through the book used to
