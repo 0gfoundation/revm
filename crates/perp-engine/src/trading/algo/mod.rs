@@ -1147,6 +1147,7 @@ fn fire<H: PerpHost>(
         // `placeAlgoOrder` — the trigger inherits it.
         crate::trading::encode_order_flags(true, order.stp),
         crate::trading::PlacementOrigin::Triggered,
+        crate::trading::TouchBudget::SINGLE,
         context,
     );
     match placed {

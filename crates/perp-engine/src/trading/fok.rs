@@ -15,8 +15,22 @@ pub(super) fn check_fok_feasibility<H: PerpHost>(
     limit_price: u64,
     quantity: u64,
     market: &crate::types::Market,
+    // Q1: the walk's touch cap. A FOK that needs more live makers than `cap.limit` rejects here,
+    // before the walk, with the cap's own message. Counted exactly like the walk counts: LIVE
+    // orders only, stale lazy-queue ids are free.
+    cap: TouchCap,
 ) -> Result<(), PerpError> {
+    let reject_msg = match cap.on_trip {
+        TouchTrip::Reject(msg) => msg,
+        // Unreachable: a FOK always rejects at its cap (`touch_cap_for`). Fail as unfillable
+        // rather than panic in consensus code.
+        TouchTrip::Clamp => {
+            debug_assert!(false, "a FOK never clamps (`touch_cap_for`)");
+            "placeOrder: FOK order cannot be fully filled"
+        }
+    };
     let mut available: u64 = 0;
+    let mut live: u32 = 0;
     // Count only IN-BAND liquidity: match_order will not fill past the band, so FOK
     // feasibility must apply the same bound or it would pass a FOK that then can't fully
     // fill. (mark_price is a field of the Market already loaded.)
@@ -40,6 +54,10 @@ pub(super) fn check_fok_feasibility<H: PerpHost>(
                 for maker_id in queue.ids.iter() {
                     if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
+                            if live == cap.limit {
+                                return Err(perp_err(reject_msg));
+                            }
+                            live += 1;
                             available += o.quantity - o.filled;
                             if available >= quantity {
                                 break 'outer;
@@ -65,6 +83,10 @@ pub(super) fn check_fok_feasibility<H: PerpHost>(
                 for maker_id in queue.ids.iter() {
                     if let Some(o) = storage::load_order_ref(context, maker_id)? {
                         if matches!(o.status, OrderStatus::Open | OrderStatus::PartiallyFilled) {
+                            if live == cap.limit {
+                                return Err(perp_err(reject_msg));
+                            }
+                            live += 1;
                             available += o.quantity - o.filled;
                             if available >= quantity {
                                 break 'outer;

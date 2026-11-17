@@ -64,11 +64,20 @@ pub(super) fn match_order<H: PerpHost>(
     // NOT derivable from `kind` — a liquidation close is an ordinary market order placed in a
     // privileged ROLE, and the role is what waives the fee.
     liquidation_close: bool,
+    // Q1: how many LIVE resting maker orders this walk may touch, and what it does at the one past
+    // that (`TouchTrip`). `None` exactly for a liquidation close, which keeps its own distinct-maker
+    // cap (`MAX_LIQUIDATION_MAKER_ACCOUNTS`) and must never become rejectable.
+    touch_cap: Option<TouchCap>,
     // The taker's Order threaded in memory (commit-only #23): NOT yet persisted — the caller
     // performs the single final save after every genuine reject has passed, so a rejected
     // placement leaves no phantom order (and a signed order's signature is not burned).
     taker_order: &mut Order,
 ) -> Result<MatchOutcome, PerpError> {
+    debug_assert_eq!(
+        liquidation_close,
+        touch_cap.is_none(),
+        "only a liquidation close walks without a touch cap"
+    );
     let mut remaining = quantity;
     let mut last_trade_price = None;
     let mut taker_settlement =
@@ -111,6 +120,27 @@ pub(super) fn match_order<H: PerpHost>(
     // The walk was STOPPED at the taker's own order (`EXPIRE_TAKER` / `EXPIRE_BOTH`): whatever is
     // left expires with reason 9 and never rests.
     let mut stp_taker_expired = false;
+    // ── Q1: the touch cap ───────────────────────────────────────────────────────────────────────
+    //
+    // `touches` counts every LIVE maker order the walk loads — whatever then happens to it: a fill,
+    // an STP cancel or stop, a K9 / frozen-maker cancel. Each one costs a maker load and usually a
+    // distinct account's settle, which is what the flat placement gas does not otherwise bound.
+    //
+    // A STALE id (an order already cancelled or filled and deleted, left in the lazy FIFO) is NOT
+    // counted. It is not a resting order: its cost was paid in advance by the cancel that left it,
+    // the first walk that passes it sweeps it (so total stale loads ≤ total cancels), one costs a
+    // single empty read, and counting them would refuse or clamp ordinary orders over garbage their
+    // owner cannot see.
+    //
+    // The check sits right after the live-order load, BEFORE STP, the liquidation account cap and
+    // the maker settle, so the maker that trips it is left exactly as it was. It can only trip
+    // while `remaining > 0` (the `remaining == 0` stop runs first), so a taker that needs exactly
+    // `limit` makers is never capped, and every maker a capped walk touched was fully consumed or
+    // removed from the book.
+    let mut touches: u32 = 0;
+    // The walk stopped on `TouchTrip::Clamp` with quantity left. Exclusive with
+    // `stp_taker_expired`: either stop ends the walk.
+    let mut touch_capped = false;
 
     match side {
         Side::Buy => {
@@ -181,6 +211,33 @@ pub(super) fn match_order<H: PerpHost>(
                         // (it was decremented when it left the book).
                         _ => continue,
                     };
+                    // ── Q1 touch cap (see `touches` above) ─────────────────────────────────────
+                    if let Some(cap) = touch_cap {
+                        if touches == cap.limit {
+                            // This live maker is the (limit+1)-th: stop BEFORE touching it.
+                            match cap.on_trip {
+                                // Compute phase: nothing is written yet, so this is write-clean.
+                                TouchTrip::Reject(msg) => return Err(perp_err(msg)),
+                                TouchTrip::Clamp => {
+                                    // Keep THIS maker and the untouched tail, FIFO intact, and
+                                    // close the level like the `remaining == 0` stop does.
+                                    new_queue.extend(queue[qi - 1..].iter().copied());
+                                    close_level(
+                                        &mut registry,
+                                        false,
+                                        ask_price,
+                                        new_queue,
+                                        count_old.saturating_sub(level_removed),
+                                        &mut removed_asks,
+                                        &mut ask_levels_cleared,
+                                    );
+                                    touch_capped = true;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        touches += 1;
+                    }
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
@@ -491,6 +548,29 @@ pub(super) fn match_order<H: PerpHost>(
                         // lazy-queue sweep (see the Buy mirror): stale id → drop, no count change.
                         _ => continue,
                     };
+                    // Q1 touch cap — see the Buy mirror.
+                    if let Some(cap) = touch_cap {
+                        if touches == cap.limit {
+                            match cap.on_trip {
+                                TouchTrip::Reject(msg) => return Err(perp_err(msg)),
+                                TouchTrip::Clamp => {
+                                    new_queue.extend(queue[qi - 1..].iter().copied());
+                                    close_level(
+                                        &mut registry,
+                                        true,
+                                        bid_price,
+                                        new_queue,
+                                        count_old.saturating_sub(level_removed),
+                                        &mut removed_bids,
+                                        &mut bid_levels_cleared,
+                                    );
+                                    touch_capped = true;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        touches += 1;
+                    }
                     let available = maker_order.quantity - maker_order.filled;
                     let fill_qty = remaining.min(available);
 
@@ -724,9 +804,15 @@ pub(super) fn match_order<H: PerpHost>(
         // its post-flush state.
         None => registry.taker_rest_basis(taker_addr, side, market)?,
     };
+    debug_assert!(
+        !touch_capped || (remaining > 0 && !stp_taker_expired),
+        "a capped walk has quantity left and was not also stopped by STP"
+    );
     Ok(MatchOutcome {
         remaining,
         stp_taker_expired,
+        touches,
+        touch_capped,
         registry,
         taker_plan,
         last_trade_price,
@@ -779,6 +865,11 @@ pub(super) struct MatchOutcome {
     /// left), and tells the caller the remainder EXPIRES with reason 9 — for a GTC too, which then
     /// never rests.
     pub(super) stp_taker_expired: bool,
+    /// Live maker orders the walk touched (Q1; 0 for a liquidation close, which is not capped).
+    pub(super) touches: u32,
+    /// The walk stopped on its touch cap (`TouchTrip::Clamp`). Implies `remaining > 0`, and is
+    /// mutually exclusive with `stp_taker_expired`.
+    pub(super) touch_capped: bool,
 
     registry: settlement::MatchRegistry,
     taker_plan: Option<settlement::TakerPlan>,

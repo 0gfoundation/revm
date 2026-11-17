@@ -361,8 +361,10 @@ fn place_batch_item<H: PerpHost>(
         item.clientOrderId.0,
         item.flags,
         PlacementOrigin::Submitted,
+        TouchBudget::SINGLE,
         context,
-    )?;
+    )?
+    .status;
     Ok(if status.is_terminal() {
         // Fully filled, or an IOC/FOK/market remainder that expired: accepted, but nothing rests.
         PerpBatchTag::Filled

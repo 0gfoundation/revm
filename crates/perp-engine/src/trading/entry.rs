@@ -24,6 +24,7 @@ pub fn run_place_order<H: PerpHost>(
         args.clientOrderId.0,
         args.flags,
         PlacementOrigin::Submitted,
+        TouchBudget::SINGLE,
         context,
     )?;
     // Placement succeeded — persist the nonce bump (commit-only: rejected placements above
@@ -145,6 +146,7 @@ pub fn run_place_order_signed<H: PerpHost>(
         args.clientOrderId.0,
         args.flags,
         PlacementOrigin::Submitted,
+        TouchBudget::SINGLE,
         context,
     )
     .map_err(|e| e.after_retained_writes(burn_writes))?;

@@ -112,6 +112,9 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
         // the clearance fee to the IF instead). Also prevents the close from
         // reverting when the underwater user cannot cover a taker fee.
         true,
+        // Exempt from the Q1 touch cap: its own distinct-maker cap bounds it, and a liquidation
+        // must never become rejectable.
+        None,
         &mut order,
     )?;
     // ── ⚠️ A LIQUIDATION MUST NEVER BECOME REJECTABLE ──────────────────────────────────────────
