@@ -514,16 +514,20 @@ pub(crate) fn remove_algo_order<H: PerpHost>(
     reason: CancelReason,
 ) -> Result<(), PerpError> {
     if order.is_trailing() {
+        // A trailing order lives in the trailing structure — unless a Q1-capped fire RE-ARMED it,
+        // which moves it into the fixed index as a plain stop at the price that fired (see
+        // `rearm`), with `trail_bps` kept. So both removals: each is idempotent (`trailing::remove`
+        // returns on a missing link, `algo_index_remove` writes nothing for an absent id), and a
+        // still-linked pending one is not in the fixed index at its activation price.
         crate::trading::algo::trailing::remove(context, market_id, algo_id, order)?;
-    } else {
-        storage::algo_index_remove(
-            context,
-            market_id,
-            order.trigger_up,
-            order.trigger_price,
-            algo_id,
-        )?;
     }
+    storage::algo_index_remove(
+        context,
+        market_id,
+        order.trigger_up,
+        order.trigger_price,
+        algo_id,
+    )?;
     retire_algo_order(context, account, market_id, algo_id, reason)
 }
 
@@ -907,6 +911,9 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
     mark_price: u64,
     budget: &mut u32,
 ) -> Result<bool, PerpError> {
+    // A fire the Q1 touch cap stopped: its conditional is re-armed (`rearm`), and the rest is
+    // deferred work a drain at this same mark can finish.
+    let mut deferred = false;
     for trigger_up in [true, false] {
         let prices = if trigger_up {
             storage::load_algo_up_prices(context, market_id)?
@@ -938,17 +945,26 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
                 if order.trigger_price == 0 {
                     continue; // already triggered; not ours any more
                 }
-                fire(context, market_id, market, mark_price, &algo_id, &order, FireFrom::Index)?;
+                // A re-armed id lands at the END of this level, which was read before the loop
+                // (and its price, if new, in a list read before that), so it does not fire again in
+                // this pass — the 50-action budget bounds the pass regardless.
+                if fire(context, market_id, market, mark_price, &algo_id, &order, FireFrom::Index)? {
+                    deferred = true;
+                }
                 *budget -= 1;
             }
         }
     }
-    // The early `return Ok(true)` above is the ONLY way this sweep defers, so reaching here means
-    // every firing trigger was executed. Nothing else in here is a deferral: a stale index entry
-    // is cleaned up in passing, a trigger that fired but could not fill is EXPIRED by the ordinary
-    // market path, and one the matcher REFUSED is cancelled (`TriggerRejected`) — each a final
-    // outcome (the Binance-parity one), not a backlog.
-    Ok(false)
+    // Two things defer: the budget (the early `return Ok(true)` above), and a fire the Q1 touch
+    // cap stopped (its conditional re-armed with the remainder — a cap, not the market, stopped
+    // it). Nothing else in here is a deferral: a stale index entry is cleaned up in passing, a
+    // trigger that fired but could not fill is EXPIRED by the ordinary market path, and one the
+    // matcher REFUSED is cancelled (`TriggerRejected`) — each a final outcome (the Binance-parity
+    // one), not a backlog.
+    //
+    // Termination: every capped fire removed exactly `MAX_TAKER_MAKER_TOUCHES` live makers from the
+    // book (`match_order`), so a keeper's `while (drain())` at a fixed mark ends.
+    Ok(deferred)
 }
 
 /// Where a fired order came from — which decides who takes it out of its trigger index, and what
@@ -963,7 +979,8 @@ enum FireFrom {
     Trailing { stop: u64 },
 }
 
-/// `fire` for an order the trailing fire walk has just unlinked.
+/// `fire` for an order the trailing fire walk has just unlinked. Returns whether it was re-armed
+/// (see [`fire`]).
 pub(crate) fn fire_trailing<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -972,7 +989,7 @@ pub(crate) fn fire_trailing<H: PerpHost>(
     algo_id: &[u8; 32],
     order: &Order,
     stop: u64,
-) -> Result<(), PerpError> {
+) -> Result<bool, PerpError> {
     debug_assert!(order.is_trailing());
     fire(context, market_id, market, mark_price, algo_id, order, FireFrom::Trailing { stop })
 }
@@ -1001,6 +1018,21 @@ pub(crate) fn fire_trailing<H: PerpHost>(
 /// engine"). A placement reject is write-clean AND log-clean (its `OrderPlaced` is buffered and
 /// never emitted), so nothing of the refused order survives. Anything else — a reject AFTER a
 /// write, or a `Fatal` — still propagates: that is a real leak or a halt, not a market outcome.
+///
+/// # The Q1 touch cap: RE-ARM, and defer
+///
+/// The child walks under the ordinary 64-touch cap (`MAX_TAKER_MAKER_TOUCHES`). A market / IOC /
+/// GTC child the cap stops fills up to it and its remainder EXPIRES (`OrderExpired`, reason 0);
+/// the conditional is then RE-ARMED in the fixed trigger index for what is left ([`rearm`]) and
+/// this returns `true`, which the sweep reports as deferred work, so `drainDeferredWork` finishes
+/// it at the same mark. Each chunk emits another `AlgoOrderTriggered` and another child
+/// `OrderExpired(0)` under the same id; there is no separate "re-armed" event. A re-armed trailing
+/// stop becomes a FIXED stop at the price that fired it: it no longer trails, but keeps
+/// `trail_bps` and so stays position-bound. A FOK child cannot fill "up to the cap" — it is
+/// all-or-nothing — so one that would pass the cap is rejected write-clean and voided as
+/// `TriggerRejected`, exactly like an unfillable one.
+///
+/// Returns whether the order was re-armed.
 fn fire<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -1009,7 +1041,7 @@ fn fire<H: PerpHost>(
     algo_id: &[u8; 32],
     order: &Order,
     from: FireFrom,
-) -> Result<(), PerpError> {
+) -> Result<bool, PerpError> {
     let owner = Address::from(order.owner);
     let pos = storage::load_position_ref(context, owner, market_id)?;
 
@@ -1123,7 +1155,7 @@ fn fire<H: PerpHost>(
             }
             .to_log_data(),
         });
-        return Ok(());
+        return Ok(false);
     }
     debug_assert!(market.active, "trigger sweep ran on an inactive market");
 
@@ -1151,7 +1183,11 @@ fn fire<H: PerpHost>(
         context,
     );
     match placed {
-        Ok(_) => Ok(()),
+        Ok(p) if p.touch_capped => {
+            rearm(context, market_id, algo_id, order, from, p.filled)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
         Err(PerpError::Reject(msg)) if context.perp_write_count() == writes_before => {
             // A write-clean `[INVARIANT]` would be absorbed here exactly as the batch driver absorbs
             // one; make it loud where it can be (tests, the correctness gate), not in an oracle tx.
@@ -1170,10 +1206,52 @@ fn fire<H: PerpHost>(
                 }
                 .to_log_data(),
             });
-            Ok(())
+            Ok(false)
         }
         Err(e) => Err(e),
     }
+}
+
+/// Q1: put a conditional whose fired child the touch cap stopped back into the FIXED trigger index,
+/// for the quantity it did not fill (see [`fire`]).
+///
+/// Runs after `place_order_core` returned, so the child — `Expired`, it never rests — was already
+/// deleted under the same id: the id is free again. No new storage keys and no new status: the
+/// record is the conditional as it was, so cancel / cancel-all / `getAlgoOrder` see an ordinary
+/// armed conditional. The owner's open-order count is unchanged (it left the list in `fire` and the
+/// child never rested), so the per-market caps still hold.
+fn rearm<H: PerpHost>(
+    context: &mut H,
+    market_id: u64,
+    algo_id: &[u8; 32],
+    order: &Order,
+    from: FireFrom,
+    filled: u64,
+) -> Result<(), PerpError> {
+    let owner = Address::from(order.owner);
+    let mut rec = order.clone();
+    if !rec.close_position {
+        // `> 0`: a capped walk had quantity left, and the child was placed with at most this
+        // order's quantity (`fire` clamps to the closing capacity).
+        debug_assert!(filled < order.quantity, "a capped fire filled the whole conditional");
+        rec.quantity = order.quantity.saturating_sub(filled);
+    }
+    // A closePosition keeps its quantity: it re-sizes from |position| at its next fire.
+    if let FireFrom::Trailing { stop } = from {
+        // A plain stop at the price that fired it. Never 0, so the "0 = not conditional" sentinel
+        // holds. `trail_bps` is KEPT: the order stays position-bound (its generation check still
+        // applies), and `remove_algo_order` removes it from both structures.
+        rec.trigger_price = stop;
+        // A buy stop fires on mark >= stop, a sell stop on mark <= stop.
+        rec.trigger_up = rec.side == Side::Buy;
+    }
+    storage::save_order(context, algo_id, &rec)?;
+    storage::algo_index_insert(context, market_id, rec.trigger_up, rec.trigger_price, *algo_id)?;
+    let mut live = storage::load_user_algo_orders(context, owner, market_id)?;
+    // `fire` removed it from this list, so this restores a length it already had (≤ the
+    // conditional cap).
+    live.push(*algo_id);
+    storage::save_user_algo_orders(context, owner, market_id, &live)
 }
 
 /// The `fire()` capacity fix, closePosition parity and trailing stops, written independently from

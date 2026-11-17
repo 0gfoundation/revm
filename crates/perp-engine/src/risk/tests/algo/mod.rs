@@ -64,3 +64,8 @@ mod algo_trigger_index;
 
 /// `drainDeferredWork` — the permissionless drain for work a capped sweep left behind.
 mod deferred_work_drain;
+
+/// Q1: a fired order the maker-touch cap stops is re-armed for its remainder and deferred, so the
+/// drain finishes it at the same mark; a capped trailing stop becomes a fixed stop; a capped FOK is
+/// voided.
+mod algo_touch_cap;

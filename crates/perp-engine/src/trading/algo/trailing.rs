@@ -1115,7 +1115,7 @@ pub(crate) fn on_mark<H: PerpHost>(
 
 /// The trailing fire walk, on the shared sweep budget: per side (SELL, then BUY) pop the
 /// directory's first front while it fires. Returns whether the budget stopped it with a firing
-/// front left.
+/// front left, or a fire was capped by the Q1 touch cap (re-armed into the fixed index).
 pub(crate) fn run_fire_sweep<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -1149,9 +1149,12 @@ pub(crate) fn run_fire_sweep<H: PerpHost>(
             let stop = display_stop(side, f.peak, f.cb, market.tick_size);
             match storage::load_order(context, &id)? {
                 Some(order) => {
-                    crate::trading::algo::fire_trailing(
+                    // Re-armed by the Q1 touch cap (into the FIXED index): the rest is deferred.
+                    if crate::trading::algo::fire_trailing(
                         context, market_id, market, mark, &id, &order, stop,
-                    )?
+                    )? {
+                        deferred = true;
+                    }
                 }
                 // Every removal path unlinks, so the structure never holds a dangling id.
                 None => debug_assert!(false, "trailing: dangling id in a bucket"),
