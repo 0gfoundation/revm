@@ -825,6 +825,16 @@ sol! {
         ///   at them and expire (reason 9). If the matcher REFUSES the placement it became (an
         ///   unfillable FOK, a crossing PostOnly, a refused rest), the conditional is spent and
         ///   reported as `AlgoOrderCancelled` reason 10 — the oracle transaction still succeeds.
+        ///   Maker-touch cap (Q1, see `placeOrder`): a fired order stops at 64 touched resting
+        ///   orders. Of a `_MARKET` type or a GTC limit pair, the fills up to the cap stand, the
+        ///   fired order's remainder EXPIRES (`OrderExpired` reason 0 — a fired GTC does not rest
+        ///   behind the makers it crosses), and the conditional is RE-ARMED under the same id: for
+        ///   `quantity − filled` (a closePosition keeps its quantity), at the tail of its trigger
+        ///   price, still listed in `getOpenAlgoOrders`, with no event of its own. A trailing stop
+        ///   is re-armed as a plain stop at the price that fired it (see `getAlgoOrder`). The
+        ///   market's deferred-work flag is set, so `drainDeferredWork` fires it again in the same
+        ///   block; each fire emits its own `AlgoOrderTriggered`. A FOK limit pair the cap stops is
+        ///   not re-armed: it is the refusal above (reason 10).
         ///
         /// triggerPrice: fires on the MARK price, per (orderType, side):
         ///     STOP BUY / TAKE_PROFIT SELL   ->  mark >= triggerPrice
@@ -986,6 +996,11 @@ sol! {
             uint64 peakPrice,
             /// The stop it fires at now, rounded onto the tick grid away from the mark (see
             /// `placeAlgoOrder`); 0 while pending.
+            ///
+            /// A trailing stop that fired and was RE-ARMED by the maker-touch cap (see
+            /// `placeAlgoOrder`) no longer trails: it is a fixed stop at `triggerPrice`. It still
+            /// reports orderType 4 and its callback rate, with `activated = true`, `peakPrice = 0`
+            /// (no peak is tracked any more) and `currentStop = triggerPrice`.
             uint64 currentStop
         );
 
@@ -1362,8 +1377,18 @@ sol! {
         /// orders push no `ACCOUNT_UPDATE`). A funding payment realised when the walk first touches
         /// that user still publishes its own `FundingSettled` group, including its `FUNDING_FEE`
         /// `AccountBalanceChanged`.
-        /// There is no per-order limit on STP cancels: each removes one of the caller's own open
-        /// orders in this market, so the open-order cap above bounds them.
+        /// Maker-touch cap (Q1). One placement's walk may touch at most 64 LIVE resting orders —
+        /// every fill, STP cancel or stop, and protocol cancel of a maker it meets (K9, a maker in
+        /// liquidation) counts once; an id of an order already gone does not. At the 65th:
+        ///   * GTC and FOK are REFUSED whole, write-clean: `placeOrder: order would match more than
+        ///     64 resting orders; split it into smaller orders` (batch reason 255). A GTC that
+        ///     needs exactly 64 is not affected.
+        ///   * IOC and market orders keep the fills up to the cap; the remainder EXPIRES
+        ///     (`OrderExpired` reason 0), and the 65th order keeps its place.
+        /// A fired conditional order is covered in `placeAlgoOrder`, a batch in
+        /// `batchPlaceOrders`; a liquidation close is exempt. The cap also bounds STP cancels.
+        /// It counts walk touches only: the reduce-only evictions that run after the fill (see
+        /// bit 0) are not counted.
         /// The pre-walk affordability filter judges the FULL size, so when it applies (only when
         /// the order reduces no position and the caller has no resting order on its own side) an
         /// EXPIRE_TAKER / EXPIRE_BOTH order the caller could not afford to rest in full is refused
@@ -1459,6 +1484,15 @@ sol! {
         /// a PostOnly item is rejected. ⚠️ This is stricter than Binance, which does not promise
         /// any matching order within a batch ("processed concurrently"); do not port a strategy
         /// that relies on Binance batch semantics here, or vice versa.
+        ///
+        /// Maker-touch cap (Q1, see `placeOrder`): each item has the 64-order cap, and the items
+        /// together may touch at most 256 resting orders. An item gets `min(64, what is left)`, and
+        /// EVERY item uses up what its walk touched — a rejected one too (the cap's own refusal, an
+        /// unfillable FOK, an insufficient-margin refusal after the walk). When the batch total is
+        /// what stops it, a GTC / FOK item is refused with `placeOrder: batch would match more than
+        /// 256 resting orders in total; split the batch` (reason 255) and an IOC / market item
+        /// fills what is left and expires the rest (reason 0); an item that crosses nothing is
+        /// unaffected.
         ///
         /// `statuses` = N concatenated 34-byte records, index-aligned to `orders`:
         ///   byte 0      tag      1 = Accepted (rests: Open/PartiallyFilled),
@@ -2415,7 +2449,8 @@ sol! {
         //                    no remainder and is not an expiry (see below).
         // `reason` — WHY it expired (`ExpiryReason`, perp-core `types::order`):
         //              0 = the time-in-force: the walk ran out of liquidity, hit the limit price or
-        //                  the fill-time band. Also an EXPIRE_MAKER walk that cancelled its owner's
+        //                  the fill-time band, or reached the 64-order maker-touch cap (Q1; see
+        //                  `placeOrder`). Also an EXPIRE_MAKER walk that cancelled its owner's
         //                  orders and THEN ran out of book — STP did not stop it.
         //              9 = self-trade prevention: the walk was stopped at the taker's own resting
         //                  order (EXPIRE_TAKER / EXPIRE_BOTH). The same number as the
@@ -2467,14 +2502,17 @@ sol! {
         //   (reason 0, or 9 when STP stopped the walk).
         // * `execute_market_order` — same, plus the case where the price band stops the walk.
         // * `execute_limit_order`'s `TimeInForce::Gtc` branch, ONLY when self-trade prevention
-        //   stopped the walk (EXPIRE_TAKER / EXPIRE_BOTH) — reason 9, and the remainder does not
-        //   rest.
+        //   stopped the walk (EXPIRE_TAKER / EXPIRE_BOTH) — reason 9 — or when the maker-touch cap
+        //   stopped the walk of a FIRED conditional's GTC child — reason 0 (its conditional is
+        //   re-armed, see `placeAlgoOrder`). Either way the remainder does not rest. A SUBMITTED
+        //   GTC never gets here on the cap: it is refused whole.
         //
         // NOT emitted for:
         // * FOK — `ensure_fok_filled` returns `Err` on any remainder, so the whole order reverts and
         //   there is no partially-filled FOK to report a remainder for. (STP never applies to FOK.)
         // * GTC / PostOnly otherwise — a remainder RESTS (`OrderRested`), and if the rest is
-        //   refused `raise_rest_refusal` reverts the whole order. Neither reaches an expiry.
+        //   refused `raise_rest_refusal` reverts the whole order. Neither reaches an expiry. (A
+        //   submitted GTC over the touch cap is refused whole too.)
         // * A FULLY FILLED order of any kind — no remainder, and its terminal state is already
         //   unambiguous from `z == q`.
         // * A resting order killed by the protocol (out-of-band sweep, liquidation, maker-cover,

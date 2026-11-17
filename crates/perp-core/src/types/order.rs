@@ -407,8 +407,9 @@ impl StpMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ExpiryReason {
-    /// The time-in-force ran out of book: an IOC or market remainder (liquidity, limit price or the
-    /// fill-time band stopped the walk).
+    /// The time-in-force ran out of book: an IOC or market remainder (liquidity, limit price, the
+    /// fill-time band, or the 64-order maker-touch cap stopped the walk), or a fired conditional's
+    /// GTC child the touch cap stopped.
     Tif = 0,
     /// Self-trade prevention stopped the walk at the taker's own resting order.
     SelfTradePrevention = 9,
