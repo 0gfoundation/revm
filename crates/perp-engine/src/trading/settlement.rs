@@ -19,6 +19,21 @@ use crate::{
 
 // ── Position settlement ───────────────────────────────────────────────────────
 
+/// The place path's refusal of an open that would leave the position larger than the market
+/// admits — Binance's `-2027`. Two causes share it: the margin-tier table's terminal
+/// `notionalCap` (no leverage admits that notional at the mark), and the market's position-size
+/// bound (`math::position_fits_market`: the position must be worth at most `i64::MAX` quote units
+/// at `max(maxPrice, mark)`). Raised by the taker's opening fill; a maker fill it refuses is
+/// cancelled `MakerInsolvent`.
+pub(crate) const POSITION_LIMIT_REJECT: &str =
+    "placeOrder: -2027 position exceeds the market's maximum notional";
+
+/// The place path's per-open margin-tier refusal: the position's notional sits in a tier whose
+/// leverage cap is below the account's stored leverage for the market. Raised by the taker's opening
+/// fill; a maker fill it refuses is cancelled `MakerInsolvent`.
+pub(crate) const TIER_LEVERAGE_REJECT: &str =
+    "placeOrder: leverage exceeds the margin tier for this position size";
+
 /// The taker refusal of J6: an ISOLATED open whose silo cash the wallet does not hold (only cross
 /// unrealized profit backs it). See the J6 block in [`TakerSettlement::finalize_compute`].
 /// Binance's code for an order the account cannot margin is `-2019`.
@@ -2108,6 +2123,16 @@ fn finalize_core(
         .checked_sub(from_margin_i64)
         .ok_or_else(|| perp_err("settlement: margin fee underflow"))?;
 
+    // The market's position-size bound (Q7, `math::position_fits_market`): an open may not leave a
+    // position worth more than `i64::MAX` quote units at `max(maxPrice, mark)`. Every later
+    // valuation of it — at a mark that rises to `maxPrice`, or a liquidation's close through the
+    // book in one pass — then fits the arithmetic the sweep would otherwise halt on. Both margin
+    // types: it is a bound on representability, not on margin. Ahead of K9 and the tier guard,
+    // which value the position at the mark and would only fault on it. Pre-write.
+    if opening_qty > 0 && !crate::math::position_fits_market(market, mark_price, pos.amount) {
+        return Err(perp_err(POSITION_LIMIT_REJECT));
+    }
+
     // Open-into-insolvency guard (K9): a taker may not open/increase a position that is already
     // below maintenance margin at the current mark. Skipped when mark is unset (0). Closing/
     // reducing is never gated: its realized loss beyond margin is legitimate bad debt.
@@ -2151,14 +2176,10 @@ fn finalize_core(
         let tier_cap = max_leverage_for_notional(&market.tiers, abs_notional);
         // `0`: past the table's terminal `notionalCap` — no leverage admits this size.
         if tier_cap == 0 {
-            return Err(perp_err(
-                "placeOrder: -2027 position exceeds the market's maximum notional",
-            ));
+            return Err(perp_err(POSITION_LIMIT_REJECT));
         }
         if pos.leverage.max(1) > tier_cap as u64 {
-            return Err(perp_err(
-                "placeOrder: leverage exceeds the margin tier for this position size",
-            ));
+            return Err(perp_err(TIER_LEVERAGE_REJECT));
         }
     }
 
@@ -2402,6 +2423,16 @@ pub(super) fn settle_maker_fill_core(
     trial_wallet = trial_wallet
         .checked_sub(opening_margin_i64)
         .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
+
+    // The market's position-size bound (Q7) — the maker-side twin of the taker's in
+    // `finalize_core`. Refused like a K9 or tier refusal, not an `Err`: an `Err` here would fail the
+    // whole match, and inside a liquidation's book leg it would halt the sweep. Ahead of K9 and
+    // the tier guard, which value the trial position at the mark and would fault on it instead.
+    if fill.opening_qty > 0
+        && !crate::math::position_fits_market(market, mark_price, trial_pos.amount)
+    {
+        return Ok(MakerFillCore::RejectedInsolvent);
+    }
 
     // Open-into-insolvency guard (K9): a fill may not open/increase the maker's position below
     // maintenance margin at the current mark. Skipped when mark == 0. Closing/reducing is never

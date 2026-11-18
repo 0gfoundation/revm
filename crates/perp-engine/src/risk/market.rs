@@ -135,6 +135,11 @@ pub fn run_add_market<H: PerpHost>(
     Ok(Bytes::new())
 }
 
+/// `updateMarket`'s refusal of a `maxPrice` raise that an open position does not fit
+/// (`math::position_value_fits_i64` at the new `maxPrice`, Q7). Nothing written.
+pub(crate) const UPDATE_MARKET_POSITION_LIMIT_REJECT: &str =
+    "updateMarket: maxPrice too high for an open position (its value there exceeds i64::MAX)";
+
 /// `updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps)`
 pub fn run_update_market<H: PerpHost>(
     input_bytes: &[u8],
@@ -182,6 +187,27 @@ pub fn run_update_market<H: PerpHost>(
         return Err(perp_err(
             "updateMarket: maxPrice must be a multiple of tickSize",
         ));
+    }
+    // ── Raising maxPrice must keep every open position within the size bound (Q7) ──
+    //
+    // Each open holds its position to `math::position_fits_market` at the `maxPrice` of its day; a
+    // higher `maxPrice` lets the mark and the fills climb to it, so a position that fits the old
+    // ceiling may not fit the new one — and the first valuation past `i64` would fault where the
+    // liquidation sweep cannot skip it. Refused instead, before any write. One registry walk
+    // (a read per open position, the liquidation sweep's own scan), on an admin call, only when
+    // the cap goes UP: lowering it can only make every position fit better.
+    if args.maxPrice > market.max_price {
+        for user in storage::load_position_registry(context, args.marketId)? {
+            let amount = storage::load_position_ref(context, user, args.marketId)?.amount;
+            if !crate::math::position_value_fits_i64(
+                args.maxPrice,
+                amount,
+                market.base_decimals,
+                market.price_decimals,
+            ) {
+                return Err(perp_err(UPDATE_MARKET_POSITION_LIMIT_REJECT));
+            }
+        }
     }
 
     market.tick_size = args.tickSize;

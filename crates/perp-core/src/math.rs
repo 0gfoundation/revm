@@ -299,6 +299,43 @@ pub fn market_band_bounds(market: &Market) -> (u128, u128) {
     (upper.min(market.max_price as u128), lower)
 }
 
+/// Whether a position of `amount` is worth at most `i64::MAX` quote units at `price` — the
+/// magnitude every signed valuation of it is computed in ([`calc_value_i64`], a close's summed fill
+/// value, the uPnL a `PositionChanged` reports). Monotone in `price` and in `|amount|`, so a
+/// position that fits at `price` fits at every lower price too.
+#[inline]
+pub fn position_value_fits_i64(
+    price: u64,
+    amount: i64,
+    base_decimals: u32,
+    price_decimals: u32,
+) -> bool {
+    calc_value(price, amount.unsigned_abs(), base_decimals, price_decimals)
+        .is_ok_and(|v| v <= i64::MAX as u64)
+}
+
+/// The position-size bound of `market` (Q7): a position of `amount` fits it when it is worth at
+/// most `i64::MAX` quote units at `max(maxPrice, mark_price)`.
+///
+/// Every OPENING fill — taker and maker — is held to it, and `updateMarket` refuses to raise
+/// `maxPrice` past an open position that would break it. Every price a position is later valued or
+/// filled at is at or below that ceiling: the mark is clamped to `maxPrice` on each oracle update
+/// (the `max` covers the stored mark an `updateMarket` that LOWERS `maxPrice` leaves above it until
+/// the next update), and no fill executes above `maxPrice` ([`market_band_bounds`]). So no
+/// valuation of a position — its notional at the mark, the summed closing value of a liquidation
+/// that takes it through the book in one pass — can leave the `i64` range the sweep would
+/// otherwise halt on. Funding is the one input it does not bound: a
+/// payment past `i64` needs more than 100% of the notional accrued unsettled.
+#[inline]
+pub fn position_fits_market(market: &Market, mark_price: u64, amount: i64) -> bool {
+    position_value_fits_i64(
+        market.max_price.max(mark_price),
+        amount,
+        market.base_decimals,
+        market.price_decimals,
+    )
+}
+
 #[inline]
 fn pow10_u128(exp: u32) -> Result<u128, PerpError> {
     10u128
@@ -1802,6 +1839,25 @@ mod mark_band_bounds_tests {
         assert_eq!(market_band_bounds(&market(100, 1_000_000, 150)), (150, 0));
         assert_eq!(market_band_bounds(&market(0, 0, 150)), (150, 0));
         assert_eq!(market_band_bounds(&market(200, 0, 150)), (150, 180));
+    }
+
+    /// The position bound at `max(maxPrice, mark)`, at its edge on both sides, and its saturation:
+    /// `i64::MIN`'s magnitude and a value past `u64` are both out, never a panic.
+    #[test]
+    fn the_position_bound_is_the_i64_value_at_the_ceiling() {
+        use super::{calc_value, position_fits_market, position_value_fits_i64};
+        let m = market(100, 0, 900_000_000);
+        let per_contract = calc_value(900_000_000, 1, 0, 2).unwrap();
+        let edge = (i64::MAX as u64 / per_contract) as i64;
+        for a in [edge, -edge, 0] {
+            assert!(position_fits_market(&m, 100, a), "{a}");
+        }
+        for a in [edge + 1, -(edge + 1), i64::MAX, i64::MIN] {
+            assert!(!position_fits_market(&m, 100, a), "{a}");
+        }
+        assert!(!position_fits_market(&m, 1_800_000_000, edge), "a mark above maxPrice lifts it");
+        assert!(position_value_fits_i64(1, i64::MAX, 0, 6));
+        assert!(!position_value_fits_i64(u64::MAX, i64::MAX, 0, 0), "past u64: out, no panic");
     }
 }
 
