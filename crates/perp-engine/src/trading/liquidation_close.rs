@@ -22,7 +22,8 @@ use crate::{
 /// responsible for settling the residual (see `settle_liquidation_residual_at_mark_price`).
 /// What a liquidation's book leg left behind.
 pub(crate) struct LiquidationCloseOutcome {
-    /// Unfilled quantity — the residual that goes to ADL.
+    /// Unfilled quantity — the residual that goes to ADL, unless `maker_cap_deferred`: a rest the
+    /// cap left is never ADL'd, the next pass closes it against the book.
     pub(crate) remaining: u64,
     /// The walk stopped on the distinct-maker cap, NOT on the book or the band. The cap is per
     /// match, so retrying gets a fresh allowance and can absorb more from the SAME book: this is

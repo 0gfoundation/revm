@@ -18,8 +18,13 @@ use settlement::{MakerFillOutcome, TakerSettlement};
 
 /// Maximum distinct maker accounts a single liquidation close may touch.
 ///
-/// Any unfilled quantity after reaching the cap follows the existing residual/ADL path. This keeps
-/// the balance after-image count bounded independently of order-book size.
+/// This keeps the balance after-image count bounded independently of order-book size. It is a gas
+/// bound on one PASS, not a statement about the book: the quantity left unfilled when the cap stops
+/// the walk is NOT ADL'd. The liquidation stops there, the market's `deferred_work` is set, and the
+/// next pass (`drainDeferredWork`, the next tick, a repeated `liquidate()`) continues against the
+/// book — isolated (`risk::liquidate_position`) and cross (`risk::cross_liquidation`, which also
+/// does not move on to the account's next market) alike. Only a rest the book leg left for another
+/// reason (band, limit, empty book) goes to ADL.
 pub(crate) const MAX_LIQUIDATION_MAKER_ACCOUNTS: usize = 128;
 
 /// Q1: maximum LIVE resting maker orders one non-liquidation taker walk may touch — filled, STP

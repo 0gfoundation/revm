@@ -26,8 +26,15 @@ pub(crate) enum LiquidationOutcome {
 /// position first (so the charge counts toward insolvency), then:
 /// - `amount == 0`  → `NoPosition` (no state change beyond the funding settle);
 /// - above maintenance → `AboveMaintenance`;
-/// - otherwise closes through the orderbook, settles any residual at mark, charges
-///   the clearance fee to the IF, emits `Liquidation`, and returns `Liquidated`.
+/// - otherwise closes through the orderbook, hands the rest the book cannot take to ADL,
+///   charges the clearance fee to the IF, emits `Liquidation`, and returns `Liquidated`.
+///
+/// One call is one PASS, and a pass need not close the whole position. When the book leg stops
+/// on the distinct-maker cap ([`crate::trading::MAX_LIQUIDATION_MAKER_ACCOUNTS`]) the book still
+/// holds liquidity a retry can reach, so the rest is NOT handed to ADL: the pass ends there,
+/// `*deferred` is set, and the next pass — `drainDeferredWork`, the next tick, or a repeated
+/// `liquidate()` — re-judges maintenance at its own mark and continues against the book. Only a
+/// rest the book leg left on the band or an empty book goes to ADL.
 ///
 /// `liquidator` is recorded verbatim in the `Liquidation` event (the caller for a
 /// manual liquidation; a system address for the sweep). Bad debt from the close
@@ -152,11 +159,29 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // The book leg stopped on the distinct-maker cap, which is per MATCH: a retry gets a fresh
     // allowance against the same book. Same-block recoverable, so the drain must see it.
     *deferred |= close.maker_cap_deferred;
-    if remaining > 0 {
-        // EVERY residual — solvent or not — is closed as a REAL forced trade against opposite-side
-        // holders via ADL, which picks its own price (mark when the residual is still solvent, the
-        // bankruptcy price when it is not). ADL leftover (budget exhausted / no eligible opposite
-        // holder) stays open and is re-swept next update.
+    // ── A maker-capped rest is NOT ADL'd (Q6) ─────────────────────────────────────────────────
+    //
+    // The cap is a GAS bound on one pass, not a statement about the book: the next maker in band
+    // is still there, live. ADL-ing the rest would let a gas cap decide that this position is
+    // closed against opposite-side holders rather than the book — Binance's waterfall ADLs only
+    // what the market cannot fill. So the pass stops here with the rest open and `*deferred` set;
+    // the next pass re-judges maintenance at its own mark (at a fixed mark and a single-tier table
+    // the rest keeps the ratio that failed, since the close releases margin pro rata; a multi-tier
+    // table may find a smaller rest healthy, and it then stays open — a partial liquidation, as
+    // for an ADL-budget leftover) and walks the book again.
+    //
+    // It terminates. Every maker a capped walk touched had a resting order fully filled or
+    // removed (a K9 or frozen-account maker is cancelled, and a partial fill would have ended the
+    // walk), and the walk only stops on the cap with the 129th distinct maker still in band, so
+    // each capped pass takes at least 128 resting orders off the in-band opposite book. At a fixed
+    // book that is at most ⌈orders / 128⌉ capped passes; after them the book leg stops on a fill,
+    // the band or an empty book, and the rest goes to ADL below exactly as before. Each pass costs
+    // at most what one did before: 128 makers and no ADL, instead of 128 makers plus ADL.
+    if remaining > 0 && !close.maker_cap_deferred {
+        // Every residual the BOOK cannot take — solvent or not — is closed as a REAL forced trade
+        // against opposite-side holders via ADL, which picks its own price (mark when the residual
+        // is still solvent, the bankruptcy price when it is not). ADL leftover (budget exhausted /
+        // no eligible opposite holder) stays open and is re-swept next update.
         //
         // ⚠️ This used to fork: a solvent residual was closed at mark against NO COUNTERPARTY — the
         // protocol simply valued it and zeroed it. That was the one and only place `Σ amount`
@@ -346,6 +371,11 @@ pub(crate) fn charge_clearance_fee<H: PerpHost>(
 /// a market with no oracle price), and maps the core outcome to the caller-facing
 /// result. `caller` is recorded as the liquidator.
 ///
+/// An ISOLATED position is closed in one pass, which can leave a rest open: the book leg stopped
+/// on the distinct-maker cap (never ADL'd — see [`liquidate_position`]), or the ADL budget ran
+/// out. Either sets the market's `deferred_work`, the sweep's rule, so `drainDeferredWork`
+/// finishes it without waiting for the next tick.
+///
 /// A position CROSSED in force is judged on its ACCOUNT instead (cross P3): the account-level
 /// check, then — below cross maintenance — the liquidation episode starting at `marketId`, with a
 /// fresh [`cross_liquidation::MANUAL_CROSS_STEP_BUDGET`] steps and [`ADL_BUDGET_PER_UPDATE`] ADL
@@ -395,9 +425,11 @@ pub fn run_liquidate<H: PerpHost>(
     }
 
     let mut adl_budget = ADL_BUDGET_PER_UPDATE;
-    // The manual entrypoint resolves one position on demand; it is not a sweep and does not own
-    // the market's drain bit, so its deferral signal is discarded. Anything it leaves behind is
-    // picked up by the next sweep exactly as before.
+    // What this pass leaves that a same-block retry could finish — the distinct-maker cap
+    // stopping the book leg (whose rest is then NOT ADL'd, Q6), or the ADL budget running out —
+    // is written to the market's `deferred_work` bit below, as the sweep would report it. No sweep
+    // owns this call, so the bit is the only way the drain learns of it: discarded, a maker-capped
+    // rest would wait for the next tick (before Q6 this call ADL'd it at once).
     let mut deferred = false;
     match liquidate_position(
         context,
@@ -409,7 +441,18 @@ pub fn run_liquidate<H: PerpHost>(
         &mut adl_budget,
         &mut deferred,
     )? {
-        LiquidationOutcome::Liquidated { .. } => Ok(Bytes::new()),
+        LiquidationOutcome::Liquidated { .. } => {
+            // The sweep's own rule (`run_liquidation_sweep`'s result), written only on the
+            // transition like `run_deferred_sweeps` and the cross episode's `mark_deferred`.
+            if deferred || adl_budget == 0 {
+                if let Some(m) = storage::load_market_ref(context, args.marketId)? {
+                    if m.deferred_work == 0 {
+                        storage::save_deferred_work(context, args.marketId, true)?;
+                    }
+                }
+            }
+            Ok(Bytes::new())
+        }
         LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
         // An ISOLATED position above its own maintenance: nothing written (`liquidate_position`
         // validates before it writes). For a FLAGGED account the call is the episode's instead —
@@ -527,7 +570,8 @@ fn run_liquidation_sweep<H: PerpHost>(
     // ADL work regardless of how many positions liquidate).
     let mut adl_budget = ADL_BUDGET_PER_UPDATE;
     // Set by any liquidation that stopped on a PER-CALL budget rather than on the market's state.
-    // Today that is the distinct-maker cap inside the book leg; the shared ADL budget is read
+    // Today that is the distinct-maker cap inside the book leg — whose rest that pass leaves open
+    // rather than ADL'd, for the drain to walk the book again (Q6); the shared ADL budget is read
     // directly below, since it lives here.
     let mut deferred = false;
     for user in candidates {
@@ -616,6 +660,9 @@ fn run_liquidation_sweep<H: PerpHost>(
     //   * the per-match distinct-maker cap   -> `deferred`, set by the book leg
     //
     // All three reset on the next call, so `drainDeferredWork` genuinely makes progress on each.
+    // For the maker cap that progress is the book itself: the capped rest was not ADL'd, and each
+    // capped pass takes at least 128 resting orders off the in-band book (`liquidate_position`),
+    // so at a fixed book the cap stops a bounded number of passes and the rest then reaches ADL.
     // What this does NOT report, deliberately, is a residual with no eligible counterparty: that
     // outcome is identical until the mark, the book or the position set changes, so flagging it
     // would spin a keeper's `while (drain())` forever for nothing.

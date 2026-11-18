@@ -31,12 +31,17 @@
 //!    (deviation D2 — Binance publishes no order). Per market: settle its funding into the cross
 //!    wallet; a LIMIT IOC for the whole `|amount_k|` at the MM-share bankruptcy price clamped into
 //!    the band (Q4, Q5); the clearance fee on the notional closed, capped at `max(0, E_after)`
-//!    (Q3); STOP once `E ≥ Σ MM` (Q6 — a partial liquidation); otherwise hand the unfilled rest to
-//!    ADL at the mark while `E ≥ 0`, at the bankruptcy price clamped into the band otherwise (R5 —
-//!    what the band's edge does not transfer stays in the wallet, for the account's silos and in
-//!    the end the insurance fund, Q8), fee, stop check again. A market whose mark is `0` (J4) or
-//!    older than `STALE_MULT` price intervals (Q10) is skipped — and while any leg is skipped so,
-//!    no deficit sets an ADL price: the rest goes at the mark. One step per market.
+//!    (Q3); STOP once `E ≥ Σ MM` (Q6 — a partial liquidation); STOP too, at this market, when the
+//!    IOC ended on the distinct-maker cap (`trading::MAX_LIQUIDATION_MAKER_ACCOUNTS`): the book
+//!    still holds in-band liquidity, so the rest is NOT ADL'd and the episode does not move on —
+//!    the market's `deferred_work` is set and the next pass resumes here, against the book (the cap
+//!    bounds a pass's gas, it must not decide which position is liquidated); otherwise hand the
+//!    unfilled rest to ADL at the mark while `E ≥ 0`, at the bankruptcy price clamped into the band
+//!    otherwise (R5 — what the band's edge does not transfer stays in the wallet, for the
+//!    account's silos and in the end the insurance fund, Q8), fee, stop check again. A market
+//!    whose mark is `0` (J4) or older than `STALE_MULT` price intervals (Q10) is skipped — and
+//!    while any leg is skipped so, no deficit sets an ADL price: the rest goes at the mark. One
+//!    step per market.
 //! 5. END: the flag is cleared (`CrossLiquidationEnded`) as soon as the account is healthy again or
 //!    holds no cross position; otherwise it stays set until a later tick finishes the job. A last
 //!    cross position closed by any OTHER route while the flag is set — the user's own reduce-only
@@ -52,12 +57,15 @@
 //! on the next market in its order that still holds a cross position — and the next tick or
 //! `drainDeferredWork` of that market resumes it: the account is in that market's registry and
 //! still flagged. Every phase is idempotent (a market with nothing left to cancel costs nothing, a
-//! closed market is skipped), so resuming is simply running the episode again. Any tick of ANY
-//! market the account still holds a cross position in resumes it just the same (the account is in
-//! that registry too), and a flagged account found healthy there — a mark moved back, a deposit,
-//! its own reduce-only closes — is un-flagged with that single write (`Recovered`). Work a same-
-//! block retry could not finish (a stale mark, no ADL counterparty) records nothing: it waits for
-//! the market's own next tick, or a keeper's `liquidate()` once that mark is fresh again.
+//! closed market is skipped), so resuming is simply running the episode again. A close stopped by
+//! the distinct-maker cap records its own market the same way and ends the call there (step 4):
+//! the drain or tick of that market, or a `liquidate()` through it, resumes with it first. Any tick
+//! of ANY market the account still holds a cross position in resumes it just the same (the account
+//! is in that registry too — a tick of another market starts there, in D2's order), and a flagged
+//! account found healthy there — a mark moved back, a deposit, its own reduce-only closes — is
+//! un-flagged with that single write (`Recovered`). Work a same-block retry could not finish (a
+//! stale mark, no ADL counterparty) records nothing: it waits for the market's own next tick, or a
+//! keeper's `liquidate()` once that mark is fresh again.
 //!
 //! # TOTAL
 //!
@@ -261,11 +269,23 @@ pub(crate) fn liquidate_cross_account<H: PerpHost>(
             end_episode(context, user, k, step.e, step.cross_mm)?;
             return Ok(CrossLiquidationOutcome::Liquidated { ended: true });
         }
+        if step.book_capped {
+            // The IOC stopped on the distinct-maker cap with `k`'s book still holding in-band
+            // liquidity, and its rest was not ADL'd. Stop the episode HERE rather than move on:
+            // the cap bounds when work happens, never what is liquidated, and closing the next
+            // market against its book now could liquidate a position that the uncapped close of
+            // `k` would have spared (by restoring the account first) while leaving `k` open. `k`
+            // still holds a cross position (the rest is > 0), and its drain, its tick or a
+            // `liquidate()` through it resumes with `k` first.
+            mark_deferred(context, k, caller, deferred)?;
+            return Ok(CrossLiquidationOutcome::Liquidated { ended: false });
+        }
     }
 
     // Every market this call could reach has been tried. Healthy now (or no cross position left)
     // ends the episode; otherwise the flag stays, and the work that a same-block retry could
-    // finish (an ADL budget or a maker cap that ran out) is recorded on its market.
+    // finish — an ADL budget that ran out with a rest still open; a maker-capped close returned
+    // above — is recorded on its market.
     let health = cross_health(context, user, None)?;
     if !health.below_cross_maintenance() {
         end_episode(context, user, start_market, health.e, health.cross_mm)?;
@@ -306,15 +326,23 @@ struct CloseStep {
     /// `E` and `Σ_C MM` after the close and its fees.
     e: i128,
     cross_mm: i128,
-    /// Same-block-recoverable work was left in this market: the book leg stopped on the
-    /// distinct-maker cap, or the ADL leg on the shared ADL budget with a residual still open.
+    /// Same-block-recoverable work was left in this market by the ADL leg: it stopped on the
+    /// shared ADL budget with a residual still open. Recorded as the episode's continuation.
     leftover: bool,
+    /// The book leg stopped on the distinct-maker cap, so the rest was NOT handed to ADL (Q6): the
+    /// book still has in-band liquidity a retry can reach. Unless `healthy`, the episode stops at
+    /// this market and records it as deferred.
+    book_capped: bool,
 }
 
 /// Close `user`'s cross position in `market` — one episode step. `None` when the leg cannot be
 /// evaluated (it faulted in the health check, J4), with nothing written. `priced`: every cross leg
 /// of the account is priced at a mark the episode trusts ([`every_cross_leg_is_priced`]) — without
 /// it no deficit sets an ADL price (see the ADL leg below).
+///
+/// The rest the IOC leaves goes to ADL only when the IOC stopped on its limit, the band or an
+/// empty book — never when it stopped on the distinct-maker cap ([`CloseStep::book_capped`]),
+/// whose rest the next pass closes against the book.
 fn close_market<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -352,12 +380,15 @@ fn close_market<H: PerpHost>(
     let bankruptcy = mm_share_bankruptcy_price(market, &pos, &health, &legs);
     let limit = clamp_into_band(bankruptcy, market);
     let close = execute_liquidation_market_order(context, user, market, side, qty, Some(limit))?;
-    let mut leftover = close.maker_cap_deferred;
+    let book_capped = close.maker_cap_deferred;
+    let mut leftover = false;
     let (mut health, mut reward) =
         charge_fee_and_check(context, user, market, qty - close.remaining)?;
 
-    // ── (e) the unfilled rest → ADL, unless the IOC already restored the account (Q6) ──
-    if health.below_cross_maintenance() && close.remaining > 0 {
+    // ── (e) the unfilled rest → ADL, unless the IOC already restored the account (Q6), or it
+    // stopped on the distinct-maker cap (the book still has in-band liquidity: the episode stops
+    // at this market and the next pass walks the book again — see `liquidate_cross_account`) ──
+    if health.below_cross_maintenance() && close.remaining > 0 && !book_capped {
         // R5: at the MARK while the account still has equity (the winners lose exposure, not
         // money), at the MM-share bankruptcy price once it has none (the winners absorb this
         // market's share of the deficit). Recomputed on the post-IOC state.
@@ -400,7 +431,7 @@ fn close_market<H: PerpHost>(
             charge_fee_and_check(context, user, market, close.remaining.saturating_sub(after))?;
         health = h;
         reward = reward.saturating_add(fee);
-        leftover |= after > 0 && *adl_budget == 0;
+        leftover = after > 0 && *adl_budget == 0;
     }
 
     context.log(Log {
@@ -421,6 +452,7 @@ fn close_market<H: PerpHost>(
         e: health.e,
         cross_mm: health.cross_mm,
         leftover,
+        book_capped,
     }))
 }
 
