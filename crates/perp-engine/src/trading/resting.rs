@@ -154,8 +154,14 @@ fn opening_part_of_order(pos: &crate::types::PerpPosition, side: Side, qty: u64)
 /// refusal string the taker raises for the same cause: [`POSITION_LIMIT_REJECT`] past the bound or
 /// past the table's `notionalCap`, [`TIER_LEVERAGE_REJECT`] for a tier below the stored leverage.
 ///
-/// The notional is at the order's own price, not the mark: it is the price the order fills at, and
-/// the mark at that fill is within the band of it. Pure — no storage.
+/// The notional is at the order's own price, not the mark. ⚠️ That is NOT the basis its fill is
+/// judged on: the maker trial (`settlement::settle_maker_fill_core`) values the post-fill position
+/// at the MARK. So this admits a bid below the mark whose fill crosses a tier boundary at the mark
+/// (it rests, and is cancelled `MakerInsolvent` at its first touch), and refuses an ask above the
+/// mark whose fill would pass. Nor does it run the isolated K9 check the fill runs, or see a
+/// leverage raised after the rest. Which single basis both should use, and whether
+/// `setLeverage` should be held to the resting orders, are open owner decisions (second-round
+/// review rest-guard-1/-2/-3, q6-progress-2). Pure — no storage.
 pub(super) fn open_guard_refusal(
     market: &crate::types::Market,
     pos: &crate::types::PerpPosition,

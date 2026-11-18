@@ -316,6 +316,13 @@ fn the_requirement_is_a_step_function_of_the_position_under_a_two_sided_book() {
 /// The boundary sits at 2_750_000 (it was 2_000_000) so that both bids may REST: an opening rest
 /// is held to the tier guard of its fill, at its own price — 3 lots @ $90 = 2_700_000, still in
 /// the 10x tier — while the combined notional (the position at the mark) still crosses it.
+///
+/// ⚠️ The second bid could not FILL here: its fill is judged at the $100 mark, 3 lots = 3_000_000,
+/// tier 2x < 10x, so a maker trial would cancel it `MakerInsolvent`. It rests only because the rest
+/// guard values the fill at the order's own price (second-round review rest-guard-1/-4, an open
+/// owner decision). That does not touch this test's subject — the requirement of RESTING orders —
+/// and no boundary can give both: "combined crosses" needs it at or below 2_800_000, a fill at the
+/// mark needs it above 3_000_000.
 #[test]
 fn the_tier_table_does_not_enter_the_open_order_requirement() {
     let tiers = MarginTiers::from_tiers(&[

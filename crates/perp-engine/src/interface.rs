@@ -1541,12 +1541,14 @@ sol! {
         ///     a `setMarginTiers` that lowered it — `getSymbolConfig` then reports
         ///     `maxNotionalValue = 0` for a flat account).
         /// A taker's opening fill is judged at the mark. An order that can open and would REST is
-        /// judged the same way, write-clean and for the whole order, as if filled in full at its
-        /// own price — it is never accepted only to be cancelled at its first touch. A resting
-        /// order whose fill they refuse anyway (the position or the table changed after it
-        /// rested) is cancelled when the walk meets it (`OrderCancelled` reason 2) and the walk
-        /// goes on. A pure reduce, and a reduce-only order, is never refused by either; an order
-        /// that would flip the position is judged on the side it opens.
+        /// judged too, write-clean and for the whole order, as if filled in full at its OWN price —
+        /// not at the mark its fill will be judged at. So a resting order can still be refused at
+        /// its fill, and is then cancelled when the walk meets it (`OrderCancelled` reason 2) and
+        /// the walk goes on: when the mark differs from its price (a bid below the mark is valued
+        /// higher at its fill), when the account's leverage was raised after it rested, or when
+        /// the position or the table changed. A pure reduce, and a reduce-only order, is never
+        /// refused by either; an order that would flip the position is judged on the side it
+        /// opens.
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
