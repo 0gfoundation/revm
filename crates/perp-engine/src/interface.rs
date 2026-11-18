@@ -754,12 +754,15 @@ sol! {
         /// drained at most once per interval however deep it was. This decouples the two: the
         /// backlog can be drained every block.
         ///
-        /// A liquidation close stopped by its maker cap leaves the rest of the position open and
-        /// does NOT ADL it — the book still holds liquidity for it — and a cross episode stops at
-        /// that market instead of moving on to the account's next one. This call (or the next tick,
-        /// or `liquidate`) closes the rest against the book; only what the book then cannot take
-        /// (band, empty book) is ADL'd. Each capped pass takes at least 128 resting orders off the
-        /// book, so at a fixed book the loop ends.
+        /// A liquidation close stopped by its maker cap after filling something leaves the rest of
+        /// the position open and does NOT ADL it — the book still holds liquidity for it — and a
+        /// cross episode stops at that market instead of moving on to the account's next one. This
+        /// call (or the next tick, or `liquidate`) closes the rest against the book; only what the
+        /// book then cannot take (band, empty book) is ADL'd. A close whose capped walk filled
+        /// NOTHING (every maker it reached was refused at its fill and cancelled) is ADL'd in the
+        /// same pass, as one the book cannot take. Each deferred pass takes at least 128 resting
+        /// orders off the book AND closes at least one lot, so the loop ends — at a fixed book, and
+        /// however the book is restuffed.
         ///
         /// # What it does NOT do
         ///
@@ -776,7 +779,8 @@ sol! {
         /// its maker cap included), or a conditional was re-armed for more (a touch-capped fire, a
         /// `maxQuantity` tranche — see `placeAlgoOrder`), i.e. call again. A keeper can loop on
         /// this without re-reading state; at a fixed mark the loop ends, since every re-arm closed
-        /// `maxQuantity` or consumed 64 resting orders, and every maker-capped close 128.
+        /// `maxQuantity` or consumed 64 resting orders, and every maker-capped close 128 (and
+        /// closed at least one lot).
         ///
         /// # Cost
         ///
@@ -1935,10 +1939,12 @@ sol! {
         /// An ISOLATED position below maintenance is closed through the book (a market order
         /// bounded by the price band), the rest the book cannot take ADL'd, in ONE PASS that may
         /// leave part of it open. Its close touches at most 128 distinct makers: a rest left by
-        /// that cap is NEVER ADL'd — the book still holds liquidity for it — and is closed against
-        /// the book by `drainDeferredWork` (the call sets the market's deferred-work flag), the next
-        /// tick or a repeated `liquidate`, each re-judging maintenance first. A rest left because
-        /// ADL ran out of budget sets the flag too. Each pass emits its own `Liquidation`.
+        /// that cap after the close filled something is NEVER ADL'd — the book still holds
+        /// liquidity for it — and is closed against the book by `drainDeferredWork` (the call sets
+        /// the market's deferred-work flag), the next tick or a repeated `liquidate`, each
+        /// re-judging maintenance first; a capped close that filled nothing (every maker it reached
+        /// refused at its fill) is ADL'd at once. A rest left because ADL ran out of budget sets
+        /// the flag too. Each pass emits its own `Liquidation`.
         ///
         /// An ISOLATED position is refused, with no write, when it is at or above its own
         /// maintenance (`liquidate: position is above maintenance margin`) and when it cannot be
@@ -1954,8 +1960,9 @@ sol! {
         /// of the account, close its cross markets one by one (this one first) until it is back at
         /// maintenance, ADL what the book does not take — within a 16-step budget, the rest left to
         /// the next tick (`CrossLiquidationStarted` / `Liquidation` / `CrossLiquidationEnded`). A
-        /// close stopped by the 128-maker cap is not ADL'd either: the episode stops at that market,
-        /// flags it for `drainDeferredWork`, and resumes there against the book. An
+        /// close stopped by the 128-maker cap after filling something is not ADL'd either: the
+        /// episode stops at that market, flags it for `drainDeferredWork`, and resumes there
+        /// against the book. An
         /// account flagged by an earlier unfinished episode is resumed — or, recovered since,
         /// un-flagged — through ANY `marketId`: one where it holds no position, a CROSSED one, or
         /// an ISOLATED one whose position is not itself below maintenance (one that is, is
