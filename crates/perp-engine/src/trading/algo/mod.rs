@@ -45,11 +45,14 @@
 //!   `getOpenAlgoOrders` and still counts toward the caps — cancel it to free the slot sooner.
 //! * There is NO one-per-direction limit (Binance's `-4130` is unconfirmed outside `GTE_GTC`, and
 //!   the 32-per-market cap already bounds the list).
-//! * A fire closes at most `maxQuantity` (Q3): it places `min(|position|, maxQuantity)`, and a
-//!   larger position closes in TRANCHES — a tranche that filled in full with position left is
-//!   re-armed under the same id like a Q1 touch-capped fire, and `drainDeferredWork` (or the next
-//!   oracle tick on which the trigger still holds) fires the next one; a tranche the book or band
-//!   cannot fill in full ends the order. See `fire`.
+//! * A fire closes at most `maxQuantity` (Q3): a closePosition places `min(|position|,
+//!   maxQuantity)`, and a larger position closes in TRANCHES — a tranche that filled in full with
+//!   position left is re-armed under the same id like a Q1 touch-capped fire, and
+//!   `drainDeferredWork` (or the next oracle tick on which the trigger still holds) fires the next
+//!   one; a tranche the book or band cannot fill in full ends the order. A fixed quantity is held
+//!   to `maxQuantity` at placement, but `updateMarket` may lower it afterwards: a MARKET or IOC
+//!   child then closes in tranches the same way, and a FOK or resting child is voided
+//!   (`TriggerRejected`). See `fire`.
 //! * There is NO one-shot "close position now" selector, and none is needed: a reduce-only MARKET
 //!   `placeOrder` with `|position| ≤ quantity ≤ maxQuantity` is admitted and truncated to
 //!   `|position|` (an immediate order is bounded by the position alone,
@@ -930,7 +933,7 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
     mark_price: u64,
     budget: &mut u32,
 ) -> Result<bool, PerpError> {
-    // A fire the Q1 touch cap stopped, or a Q3 closePosition tranche: its conditional is re-armed
+    // A fire the Q1 touch cap stopped, or a Q3 `maxQuantity` tranche: its conditional is re-armed
     // (`rearm`), and the rest is deferred work a drain at this same mark can finish.
     let mut deferred = false;
     for trigger_up in [true, false] {
@@ -976,7 +979,7 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
     }
     // Three things defer: the budget (the early `return Ok(true)` above), a fire the Q1 touch cap
     // stopped (its conditional re-armed with the remainder — a cap, not the market, stopped it), and
-    // a Q3 closePosition tranche that filled in full with position left (re-armed for the next
+    // a Q3 `maxQuantity` tranche that filled in full with more to close (re-armed for the next
     // tranche — `maxQuantity`, not the market, stopped it). Nothing else in here is a deferral: a
     // stale index entry is cleaned up in passing, a trigger that fired but could not fill is EXPIRED
     // by the ordinary market path, and one the matcher REFUSED is cancelled (`TriggerRejected`) —
@@ -987,7 +990,7 @@ pub(crate) fn run_trigger_sweep<H: PerpHost>(
     // `MAX_TAKER_MAKER_TOUCHES` live makers from the book (`match_order`), and every tranche re-arm
     // cut its owner's |position| by `maxQuantity` ≥ one step (a reduce-only fill only closes, and
     // STP rules out a self-fill), so a keeper's `while (drain())` ends after at most
-    // Σ ⌈|position_i| / maxQuantity⌉ + book / 64 fires.
+    // Σ ⌈|position_i| / maxQuantity⌉ + book / 64 fires, plus one final fire per conditional.
     Ok(deferred)
 }
 
@@ -1056,7 +1059,7 @@ pub(crate) fn fire_trailing<H: PerpHost>(
 /// all-or-nothing — so one that would pass the cap is rejected write-clean and voided as
 /// `TriggerRejected`, exactly like an unfillable one.
 ///
-/// # Q3: closePosition in maxQuantity tranches
+/// # Q3: maxQuantity tranches
 ///
 /// A closePosition fire places `min(|position|, maxQuantity)` — one order may not exceed
 /// `maxQuantity` (`validate_place_order`), and placing `|position|` would have been refused there
@@ -1075,6 +1078,14 @@ pub(crate) fn fire_trailing<H: PerpHost>(
 /// reduce-only slot is involved: the conditional is market-type (it never held one) and its child
 /// never rests. No event of its own: per tranche `AlgoOrderTriggered`, the child's `OrderPlaced`
 /// and its `Trade`s, and the record re-appears armed silently.
+///
+/// A FIXED quantity was held to `maxQuantity` at placement, but `updateMarket` may lower
+/// `maxQuantity` afterwards. A fire whose child is immediate and may fill in part (MARKET, or a
+/// limit IOC) is then cut the same way: it places `min(quantity, |position|, maxQuantity)`, and a
+/// tranche that filled in full is re-armed for `quantity − filled` (a trailing stop as the fixed
+/// stop at the price that fired it, as for Q1). A FOK (all-or-nothing) or a resting GTC /
+/// PostOnly child (it would hold the id the re-arm needs) is placed whole, refused, and voided as
+/// `TriggerRejected`.
 ///
 /// Returns whether the order was re-armed.
 fn fire<H: PerpHost>(
@@ -1110,8 +1121,13 @@ fn fire<H: PerpHost>(
     // flipped: its `generation` moved, see `place_core`) closes nothing, whatever is open now.
     let bound_position_gone =
         order.is_position_bound() && pos.generation != order.position_generation;
-    let qty = if bound_position_gone {
-        0
+    // Q3: may this fire be cut into `maxQuantity` tranches? Only when its child is immediate and may
+    // fill in part — MARKET or a limit IOC. A resting child (GTC / PostOnly) would hold the id the
+    // re-arm needs, and a reduce-only slot besides; a FOK is all-or-nothing. A closePosition is
+    // always MARKET (`validate`), so it always may.
+    let trancheable = !kind.has_resting_queue_position() && !kind.is_fok();
+    let (qty, tranche) = if bound_position_gone {
+        (0, false)
     } else {
         let capacity = match crate::trading::reduce_only::closing_side(&pos) {
             Some(s) if s == order.side => crate::trading::reduce_only::closing_capacity(
@@ -1126,17 +1142,30 @@ fn fire<H: PerpHost>(
             // now, which a reduce-only order may never do.
             _ => 0,
         };
-        // A closePosition order places at most one order's worth (`maxQuantity`): a larger position
-        // closes in tranches (Q3, below). `market` is the current config — re-loaded after the new
-        // mark on the oracle path, the stored market on the drain — and its `max_quantity` is never
-        // 0 (`addMarket` / `updateMarket` require it ≥ `minQuantity` > 0, as a step multiple).
-        // A fixed-quantity conditional needs no clamp: placement refused `quantity > maxQuantity`.
-        let want = if order.close_position {
-            pos.amount.unsigned_abs().min(market.max_quantity)
+        // What this order would close in one go: `|position|` for a closePosition, else its
+        // quantity — within the capacity either way.
+        let whole = if order.close_position {
+            pos.amount.unsigned_abs()
         } else {
             order.quantity
+        }
+        .min(capacity);
+        // One order places at most `maxQuantity` (`validate_place_order`); a trancheable fire
+        // above it closes in tranches (Q3, below). A closePosition gets there whenever |position|
+        // exceeds it; a fixed quantity only when `updateMarket` lowered `maxQuantity` after
+        // placement, which refused `quantity > maxQuantity`. A FOK or resting child is not cut: it
+        // is placed whole, refused, and the order voided (`TriggerRejected`). `market` is the
+        // current config — re-loaded after the new mark on the oracle path, the stored market on
+        // the drain — and its `max_quantity` is never 0 (`addMarket` / `updateMarket` require it
+        // ≥ `minQuantity` > 0, as a step multiple).
+        let qty = if trancheable {
+            whole.min(market.max_quantity)
+        } else {
+            whole
         };
-        want.min(capacity)
+        // A TRANCHE: the `maxQuantity` clamp bound. For a closePosition the capacity is
+        // `|position|` (its child is immediate), so this is `|position| > maxQuantity`.
+        (qty, qty < whole)
     };
     // A bound order whose generation still matches is on the closing side of a live position (the
     // generation moves on every close and flip, and placement required the closing side), and it
@@ -1145,15 +1174,6 @@ fn fire<H: PerpHost>(
         !order.is_position_bound() || bound_position_gone || qty > 0,
         "a position-bound conditional with a live generation found nothing to close"
     );
-    // Q3: a closePosition fire smaller than its live position is a TRANCHE. For a live bound
-    // closePosition the capacity is `|position|` (its child is immediate), so this is true exactly
-    // when the `maxQuantity` clamp binds. The resting-kind exclusion keeps the reduce-only cap
-    // (`reduce_only::MAX_REDUCE_ONLY_ORDERS_PER_MARKET`) should a resting closePosition ever be
-    // allowed: a resting child plus a re-armed conditional would hold two slots.
-    let tranche = order.close_position
-        && !kind.has_resting_queue_position()
-        && qty > 0
-        && qty < pos.amount.unsigned_abs();
 
     // ── APPLY — nothing below may fail for a reason the caller could have caused ──
     //
@@ -1246,11 +1266,11 @@ fn fire<H: PerpHost>(
             rearm(context, market_id, algo_id, order, from, p.filled)?;
             Ok(true)
         }
-        // Q3: a tranche that filled IN FULL leaves position the trigger still covers; re-arm for the
+        // Q3: a tranche that filled IN FULL leaves quantity the trigger still covers; re-arm for the
         // next tranche. One that did not (book or band liquidity, an STP `EXPIRE_TAKER` stop) falls
-        // through as terminal, exactly as a closePosition at or below `maxQuantity` does — so no
-        // re-arm is ever zero-progress. A capped tranche took the arm above: same re-arm, and the
-        // next fire re-sizes from |position| either way.
+        // through as terminal, exactly as a fire at or below `maxQuantity` does — so no re-arm is
+        // ever zero-progress. A capped tranche took the arm above: same re-arm, and the next fire
+        // re-sizes either way.
         Ok(p) if tranche && p.status == OrderStatus::Filled => {
             debug_assert_eq!(p.filled, qty, "a tranche fills exactly what it placed");
             rearm(context, market_id, algo_id, order, from, p.filled)?;
@@ -1282,8 +1302,8 @@ fn fire<H: PerpHost>(
 }
 
 /// Put a fired conditional back into the FIXED trigger index for what it did not close (see
-/// [`fire`]): the Q1 touch cap stopped its child, OR it was a Q3 closePosition tranche that filled in
-/// full with position left.
+/// [`fire`]): the Q1 touch cap stopped its child, OR it was a Q3 `maxQuantity` tranche that filled
+/// in full with more to close.
 ///
 /// Runs after `place_order_core` returned, so the child — `Expired` (Q1) or `Filled` (Q3), both
 /// terminal: it never rests — was already deleted under the same id: the id is free again. No new

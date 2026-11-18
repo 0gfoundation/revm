@@ -2,8 +2,9 @@
 //! Each fire places `min(|position|, maxQuantity)`; a tranche that filled in full with position
 //! left is re-armed under the same id — the Q1 re-arm, closePosition quantity still 0 — with
 //! `deferred_work` set, so `drainDeferredWork` fires the next tranche at the same mark. A tranche
-//! the book cannot fill in full is terminal, as any closePosition fire is. Fixed-quantity orders
-//! are never tranched (placement refuses `quantity > maxQuantity`).
+//! the book cannot fill in full is terminal, as any closePosition fire is. A fixed quantity is
+//! refused at placement above maxQuantity, so it is tranched only when `updateMarket` lowered
+//! maxQuantity since (Q3-12, Q3-13).
 //!
 //! Fixture as the parent's: single-lot bids at [`BID`], ALICE a 1x long at $100, the stop at
 //! [`TRIGGER`]; `maxQuantity` lowered per test.
@@ -396,9 +397,10 @@ fn q3_7_a_re_armed_close_position_holds_no_reduce_only_slot() {
     assert!(storage::load_sell_orders(&mut ctx, ALICE, MARKET_ID).unwrap().is_empty());
 }
 
-/// Q3-8: a fixed-quantity conditional is never tranched — its quantity is ≤ maxQuantity by
-/// placement — so it fires once and ends, whatever position is left. (A trailing closePosition
-/// cannot exist: placement refuses it.) Above maxQuantity it is refused at placement, as before.
+/// Q3-8: a fixed-quantity conditional within maxQuantity is not tranched — placement holds its
+/// quantity to maxQuantity — so it fires once and ends, whatever position is left. (A trailing
+/// closePosition cannot exist: placement refuses it.) Above maxQuantity it is refused at
+/// placement, as before.
 #[test]
 fn q3_8_fixed_quantity_orders_are_not_tranched() {
     for (kind, trigger, stop) in [
@@ -517,4 +519,72 @@ fn q3_11_a_re_armed_tranche_cancels_cleanly() {
     assert!(record(&mut ctx, id).is_none());
     assert_eq!(armed(&mut ctx, TRIGGER), (vec![], vec![], vec![]));
     assert_eq!(amount(&mut ctx), 60);
+}
+
+/// Q3-12: placement holds a fixed quantity to maxQuantity, but `updateMarket` can lower
+/// maxQuantity afterwards. A fixed-quantity stop whose child is immediate and may fill in part —
+/// STOP_MARKET, a limit STOP with tif IOC, TRAILING_STOP_MARKET — then closes in tranches as a
+/// closePosition does: 40 at a lowered maxQuantity of 30 fires 30, is re-armed for the other 10
+/// (a re-armed trailing stop as the fixed stop at the price that fired it, as Q1 does), and the
+/// drain fires the 10. It used to place 40, be refused, and be voided as `TriggerRejected` with
+/// nothing closed.
+#[test]
+fn q3_12_a_fixed_quantity_stop_above_a_lowered_max_quantity_closes_in_tranches() {
+    const TIF_IOC: u8 = 1;
+    for (kind, trigger, price, tif, stop) in [
+        (AlgoOrderType::StopMarket, TRIGGER, 0, 0, TRIGGER),
+        (AlgoOrderType::Stop, TRIGGER, BID, TIF_IOC, TRIGGER),
+        // A trailing stop's `price` is its callback rate: 100 bps, so it fires at 9_900.
+        (AlgoOrderType::TrailingStopMarket, 0, 100, 0, 9_900),
+    ] {
+        let mut ctx = fixture(100);
+        let ids = bids(&mut ctx, 100, 200);
+        let id = arm(&mut ctx, kind, trigger, price, 40, tif, RO);
+        set_max_qty(&mut ctx, 30);
+
+        let logs = tick(&mut ctx, BID, 31);
+        assert_eq!(triggered(&logs), vec![(id, stop, BID)], "{kind:?}");
+        assert_eq!(placed_qtys(&logs, id), vec![30], "{kind:?}: one tranche of maxQuantity");
+        assert_eq!(filled(&logs), ids[..30].to_vec(), "{kind:?}");
+        assert!(expired(&logs).is_empty() && algo_cancels(&logs).is_empty(), "{kind:?}");
+        assert_eq!(amount(&mut ctx), 70);
+        assert_eq!(flag(&mut ctx), 1, "{kind:?}: a tranche re-arm is deferred work");
+        let r = record(&mut ctx, id).expect("re-armed");
+        assert_eq!((r.quantity, r.trigger_price, r.trigger_up), (10, stop, false), "{kind:?}");
+        assert_eq!(armed(&mut ctx, stop), (vec![id], vec![stop], vec![id]), "{kind:?}");
+
+        let (more, logs) = drain(&mut ctx);
+        assert!(!more, "{kind:?}");
+        assert_eq!(triggered(&logs), vec![(id, stop, BID)], "{kind:?}");
+        assert_eq!(placed_qtys(&logs, id), vec![10], "{kind:?}");
+        assert_eq!(filled(&logs), ids[30..40].to_vec(), "{kind:?}");
+        assert_eq!(amount(&mut ctx), 60, "{kind:?}: exactly the order's 40 closed");
+        assert!(record(&mut ctx, id).is_none(), "{kind:?}");
+        assert_eq!(armed(&mut ctx, stop), (vec![], vec![], vec![]), "{kind:?}");
+        assert_eq!(flag(&mut ctx), 0, "{kind:?}");
+    }
+}
+
+/// Q3-13: the children that cannot be tranched. A FOK is all-or-nothing, and a resting (GTC) child
+/// would hold the id a re-arm needs: above a lowered maxQuantity their child is refused at trigger
+/// and the order voided as `TriggerRejected` (10) with nothing traded — as a triggered FOK past the
+/// touch cap is (T14). A closePosition is always MARKET, so this never applies to one.
+#[test]
+fn q3_13_a_fok_or_resting_child_above_a_lowered_max_quantity_is_voided() {
+    for tif in [TIF_FOK, TIF_GTC] {
+        let mut ctx = fixture(100);
+        bids(&mut ctx, 100, 200);
+        let id = arm(&mut ctx, AlgoOrderType::Stop, TRIGGER, BID, 40, tif, RO);
+        set_max_qty(&mut ctx, 30);
+
+        let logs = tick(&mut ctx, BID, 31);
+        assert_eq!(triggered(&logs), vec![(id, TRIGGER, BID)], "tif {tif}");
+        assert!(evs::<Trade>(&logs).is_empty(), "tif {tif}");
+        assert_eq!(algo_cancels(&logs), vec![(id, CancelReason::TriggerRejected as u8)], "tif {tif}");
+        assert_eq!(amount(&mut ctx), 100);
+        assert!(record(&mut ctx, id).is_none());
+        assert_eq!(armed(&mut ctx, TRIGGER), (vec![], vec![], vec![]));
+        assert_eq!(flag(&mut ctx), 0);
+        assert_eq!(bid_count(&mut ctx), 100);
+    }
 }

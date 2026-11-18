@@ -765,7 +765,7 @@ sol! {
         /// # Returns
         ///
         /// `moreRemaining` — true when a sweep stopped on its budget again, or a conditional was
-        /// re-armed for more (a touch-capped fire, a closePosition tranche — see `placeAlgoOrder`),
+        /// re-armed for more (a touch-capped fire, a `maxQuantity` tranche — see `placeAlgoOrder`),
         /// i.e. call again. A keeper can loop on this without re-reading state; at a fixed mark
         /// the loop ends, since every re-arm closed `maxQuantity` or consumed 64 resting orders.
         ///
@@ -840,8 +840,9 @@ sol! {
         ///   market's deferred-work flag is set, so `drainDeferredWork` fires it again in the same
         ///   block; each fire emits its own `AlgoOrderTriggered`. A FOK limit pair the cap stops is
         ///   not re-armed: it is the refusal above (reason 10). A closePosition over `maxQuantity`
-        ///   is re-armed the same way between its tranches (see quantity / flags bit 1); a tranche
-        ///   the cap stops is simply this re-arm, and each fire re-sizes from |position|.
+        ///   (or a fixed quantity over a since-lowered one) is re-armed the same way between its
+        ///   tranches (see quantity / flags bit 1); a tranche the cap stops is simply this re-arm,
+        ///   and each fire re-sizes.
         ///
         /// triggerPrice: fires on the MARK price, per (orderType, side):
         ///     STOP BUY / TAKE_PROFIT SELL   ->  mark >= triggerPrice
@@ -936,8 +937,13 @@ sol! {
         ///   the next tranche. A tranche the book or the band cannot fill in full expires its
         ///   remainder and ENDS the conditional, as any closePosition fire does. A position reduced
         ///   by hand between tranches just makes the next tranche smaller; one closed or flipped
-        ///   ends the order as below (reason 11). A fixed `quantity` is never tranched: above
-        ///   `maxQuantity` it is refused at placement.
+        ///   ends the order as below (reason 11). A fixed `quantity` above `maxQuantity` is
+        ///   refused at placement; if `updateMarket` lowers `maxQuantity` below it afterwards, a
+        ///   fire whose child is MARKET or a limit IOC closes in tranches the same way (each
+        ///   `min(quantity left, |position|, maxQuantity)`; the re-armed record's quantity is what
+        ///   is left, and a trailing stop re-arms as the fixed stop at the price that fired it),
+        ///   while a FOK or resting (GTC / PostOnly) child is refused and the order voided with
+        ///   reason 10.
         ///   A closePosition order is BOUND TO THE POSITION open when it is placed (Binance's
         ///   `GTE_GTC`): placement needs an open position with `side` its closing side, else
         ///   `placeAlgoOrder: closePosition requires an open position on the closing side`. If that
