@@ -1137,7 +1137,11 @@ sol! {
         ///
         /// Tier 0's `maxLeverage` becomes the market's `setLeverage` cap. Existing positions
         /// are NOT re-checked: an over-levered position keeps running and is only refused
-        /// when it next tries to OPEN.
+        /// when it next tries to OPEN. Nor are stored leverages: a FLAT user whose leverage
+        /// is above the new tier-0 cap is refused on every open too, and `getSymbolConfig`
+        /// reports `maxNotionalValue = 0` for them until `setLeverage` lowers it (a flat user or
+        /// a CROSSED position may; an open ISOLATED position cannot lower its leverage, `-4161`,
+        /// and can only reduce).
         ///
         /// ⚠️ ABI CHANGE (cross P0): `maintMarginRatesPpm` and then `notionalCap` were APPENDED as
         /// parameters, so the SELECTOR moved `0x34364f71` → `0x643093a5`. The old three-argument
@@ -1185,8 +1189,8 @@ sol! {
         ///                                 evaluated exactly and floored once.
         ///   notionalCaps                  Binance `notionalCap`: the next tier's `lowerBounds`;
         ///                                 for the last tier the `notionalCap` `setMarginTiers`
-        ///                                 took, or `type(uint64).max` when that is unbounded.
-        ///                                 (NOT `getSymbolConfig`'s `0 = unbounded`.)
+        ///                                 took, or `type(uint64).max` when that is unbounded
+        ///                                 — as `getSymbolConfig.maxNotionalValue` reports it.
         ///
         /// ⚠️ `maintMarginRatesPpm` HERE IS THE STORED COLUMN, NOT BINANCE'S `maintMarginRatio`.
         /// It is named after the `setMarginTiers` parameter it round-trips with, so writing back
@@ -1248,11 +1252,21 @@ sol! {
         ///                     `AccountPosition.notional` reports) the tier table admits while
         ///                     `leverage` is in force: the upper bound of the highest tier whose
         ///                     `maxLeverage` is still `>= leverage`; when that tier is the last
-        ///                     one, the table's `notionalCap` (`setMarginTiers`). **`0` MEANS
-        ///                     UNBOUNDED** — the last band of an uncapped table. Every market
-        ///                     today ships the single default tier `{0, 3}`, so every market today
-        ///                     returns `0` at every legal leverage; the field only becomes
-        ///                     informative once `setMarginTiers` installs a real table.
+        ///                     one, the table's `notionalCap` (`setMarginTiers`).
+        ///                     **`type(uint64).max` MEANS UNBOUNDED** — the last band of an
+        ///                     uncapped table, the same value `getMarginTiers.notionalCaps`
+        ///                     reports for it. **`0` MEANS NONE**: no tier admits `leverage` at
+        ///                     all — a leverage set before `setMarginTiers` lowered tier 0's
+        ///                     `maxLeverage` under it (a flat user keeps it too). Every open is
+        ///                     then refused until `setLeverage` brings it back under the cap,
+        ///                     and `leverage` above still reports the stored value, which is what
+        ///                     the chain applies. Every market today ships the single default
+        ///                     tier `{0, 3}`, so every market today returns `type(uint64).max` at
+        ///                     every legal leverage; the field only becomes informative once
+        ///                     `setMarginTiers` installs a real table.
+        ///                     ⚠️ ENCODING CHANGE (test review Q13): unbounded was `0`, and a
+        ///                     leverage no tier admits had no encoding (it reported a band edge,
+        ///                     or `0` = unbounded). Update any reader of this word.
         ///   marginType        the margin type IN FORCE: `0` = CROSSED, `1` = ISOLATED — the
         ///                     same effective value every `AccountPosition` row and
         ///                     `PositionChanged` carry. `0` for a market whose owner never chose
