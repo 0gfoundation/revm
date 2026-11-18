@@ -1915,6 +1915,13 @@ sol! {
         /// tick or a repeated `liquidate`, each re-judging maintenance first. A rest left because
         /// ADL ran out of budget sets the flag too. Each pass emits its own `Liquidation`.
         ///
+        /// An ISOLATED position is refused, with no write, when it is at or above its own
+        /// maintenance (`liquidate: position is above maintenance margin`) and when it cannot be
+        /// valued at the mark — its notional, pending funding or maintenance requirement past
+        /// `int64` quote units (`liquidate: position cannot be valued at the mark price`; the
+        /// liquidation sweep skips such a position the same way rather than halting). Either way a
+        /// FLAGGED account's episode runs instead (see below).
+        ///
         /// A position CROSSED in force is judged on its ACCOUNT (cross P3): at or above cross
         /// maintenance (`crossMarginBalance >= totalCrossMaintMargin`) it is refused with
         /// `liquidate: account is above cross maintenance margin` (no write); below it the call
