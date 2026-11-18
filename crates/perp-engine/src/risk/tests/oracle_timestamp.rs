@@ -143,3 +143,63 @@ fn the_reject_reason_names_the_skew() {
     assert!(ORACLE_FUTURE_TIMESTAMP_REJECT.contains(&MAX_ORACLE_FUTURE_SKEW_SECS.to_string()));
     assert!(ORACLE_FUTURE_TIMESTAMP_REJECT.starts_with("updateIndexPrice: "));
 }
+
+/// T6. A year of oracle silence on one-second epochs, then a stamp at the millisecond scale (the
+/// block clock with it, so the bound admits it): each push settles exactly ONE epoch at its own
+/// mark and lands `next_funding_ts` on the first boundary after it, in one step. The catch-up loop
+/// this replaced iterated once per missed epoch — 3.15e7 times for the year, ~1.7e12 for the
+/// second push, which would not finish; the closed form answers both at once (a structural guard:
+/// no timing assert).
+///
+/// Mark = index = $100 throughout (no book, no trade), so every epoch's average premium is 0 and
+/// its rate `calc_funding_rate(0, 100) = 100`, folding `10_000 × 100 = 1_000_000` into the index.
+#[test]
+fn a_year_of_oracle_silence_settles_one_epoch_and_jumps_to_the_next_boundary() {
+    use crate::interface::IPerpDex::FundingRateComputed;
+
+    let mut ctx = ctx_at(1);
+    let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    market.price_update_interval = 1;
+    market.funding_interval = 1;
+    market.interest_rate = 100;
+    storage::save_market(&mut ctx, &market).unwrap();
+    assert_eq!(crate::math::calc_funding_rate(0, 100), 100);
+
+    let push = |ctx: &mut TestCtx, ts: u64| {
+        ctx.block.timestamp = U256::from(ts);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        run_update_index_price(&push_input(ts), ADMIN, ctx).unwrap();
+        JournalTr::take_logs(ctx.journal_mut())
+    };
+
+    push(&mut ctx, 1_000);
+    assert_eq!(storage::load_funding_state(&mut ctx, MARKET_ID).unwrap().next_funding_ts, 1_001);
+
+    let t1 = 1_000 + 31_536_000;
+    let logs = push(&mut ctx, t1);
+    let f = storage::load_funding_state(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!(
+        (f.next_funding_ts, f.last_funding_rate, f.cumulative_funding_index),
+        (t1 + 1, 100, 1_000_000),
+        "one epoch settled at mark × rate, the next boundary the first after the push"
+    );
+    let acc = storage::load_premium_accumulator(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!((acc.sample_count, acc.epoch_start_ts, acc.last_sample_ts), (1, t1, t1));
+    let computed = decode_events::<FundingRateComputed>(&logs);
+    assert_eq!(computed.len(), 1, "exactly one epoch computed");
+    assert_eq!(
+        (computed[0].fundingRate, computed[0].avgPremiumIndex, computed[0].sampleCount),
+        (100, 0, 1)
+    );
+    assert_eq!(computed[0].timestamp, t1);
+    let mark = mark_price_events(&logs);
+    assert_eq!(mark.len(), 1);
+    assert_eq!(mark[0].nextFundingTime, t1 + 1);
+
+    let t2 = 1_700_000_000_000;
+    let logs = push(&mut ctx, t2);
+    let f = storage::load_funding_state(&mut ctx, MARKET_ID).unwrap();
+    assert_eq!((f.next_funding_ts, f.cumulative_funding_index), (t2 + 1, 2_000_000));
+    assert_eq!(decode_events::<FundingRateComputed>(&logs).len(), 1);
+    assert_eq!(mark_price_events(&logs)[0].nextFundingTime, t2 + 1);
+}

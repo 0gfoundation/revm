@@ -1240,6 +1240,27 @@ pub fn calc_funding_rate(average_premium_index: i64, interest_rate: i64) -> i64 
     (average_premium_index + clamped).clamp(MIN_FUNDING_RATE, MAX_FUNDING_RATE)
 }
 
+/// The first funding boundary strictly after `now` on the grid `next + k · interval` (`k ≥ 0`):
+/// `next` itself when it is already after `now`.
+///
+/// The O(1) form of `while next <= now { next += interval }` (Q2) — the loop ran once per missed
+/// epoch, so a long-silent oracle (or a millisecond stamp) cost O(gap / interval) on every node.
+/// Identical results: with `k = ⌊(now − next) / interval⌋ + 1`, `next + k · interval` is the
+/// loop's last partial sum. `None` exactly when that loop would overflow `u64` (its partial sums
+/// are increasing, so it overflows iff its last one does, and `k · interval` overflowing implies
+/// it), or would spin forever (`interval == 0` with `next <= now`).
+#[inline]
+pub fn next_funding_boundary_after(next: u64, now: u64, interval: u64) -> Option<u64> {
+    if next > now {
+        return Some(next);
+    }
+    if interval == 0 {
+        return None;
+    }
+    let k = ((now - next) / interval).checked_add(1)?;
+    next.checked_add(k.checked_mul(interval)?)
+}
+
 /// Estimated settle price: the mark with one funding period's premium discounted out.
 ///
 /// ```text
@@ -3829,5 +3850,89 @@ mod trading_fee_ppm_tests {
             calc_trading_fee(u64::MAX, MAX_FEE_PPM).unwrap(),
             (u64::MAX as u128 * 100_000 / 1_000_000) as u64
         );
+    }
+}
+
+#[cfg(test)]
+mod funding_boundary_tests {
+    use super::next_funding_boundary_after;
+
+    /// The loop `next_funding_boundary_after` replaces, verbatim but for its error type (and a
+    /// guard against the zero-interval spin, which the closed form reports as `None`).
+    fn reference(mut next: u64, now: u64, interval: u64) -> Option<u64> {
+        if interval == 0 && next <= now {
+            return None;
+        }
+        while next <= now {
+            next = next.checked_add(interval)?;
+        }
+        Some(next)
+    }
+
+    const MAX: u64 = u64::MAX;
+
+    /// `(next, now, interval) → expected`, the exact boundaries included.
+    const CASES: [(u64, u64, u64, Option<u64>); 12] = [
+        (30, 60, 15, Some(75)),
+        (30, 30, 15, Some(45)),
+        (30, 44, 15, Some(45)),
+        (30, 45, 15, Some(60)),
+        // A year of one-second epochs.
+        (1_001, 31_537_000, 1, Some(31_537_001)),
+        // Already in the future: unchanged.
+        (28_800, 28_799, 28_800, Some(28_800)),
+        // The step past the top of u64.
+        (MAX - 5, MAX - 1, 10, None),
+        (MAX - 20, MAX - 15, 10, Some(MAX - 10)),
+        // Eight-hour epochs, three missed (the next boundary lands one second after `now`), and
+        // four missed exactly on a boundary.
+        (1_700_006_400, 1_700_006_400 + 3 * 28_800 + 7_199, 28_800, Some(1_700_121_600)),
+        (1_700_006_400, 1_700_006_400 + 4 * 28_800, 28_800, Some(1_700_150_400)),
+        // Funding off: a future boundary stands, a due one has no successor.
+        (5, 4, 0, Some(5)),
+        (5, 5, 0, None),
+    ];
+
+    #[test]
+    fn the_closed_form_equals_the_loop_on_the_boundary_table() {
+        for (next, now, interval, expected) in CASES {
+            let got = next_funding_boundary_after(next, now, interval);
+            assert_eq!(got, expected, "({next}, {now}, {interval})");
+            assert_eq!(got, reference(next, now, interval), "({next}, {now}, {interval}) vs loop");
+        }
+    }
+
+    /// A seeded sweep against the loop, with gaps kept short enough for the loop to run.
+    #[test]
+    fn the_closed_form_equals_the_loop_on_a_random_sweep() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..20_000 {
+            let interval = 1 + rnd() % 100_000;
+            // Near the top of u64 one case in eight, so the overflow branch is exercised too.
+            let base = if rnd() % 8 == 0 { MAX - rnd() % (2 * interval) } else { rnd() >> 4 };
+            let next = base;
+            let now = next.saturating_add(rnd() % (interval * 50)).saturating_sub(rnd() % interval);
+            assert_eq!(
+                next_funding_boundary_after(next, now, interval),
+                reference(next, now, interval),
+                "({next}, {now}, {interval})"
+            );
+        }
+    }
+
+    /// The gap the loop could not survive: a millisecond-scale `now` on one-second epochs is
+    /// answered without iterating.
+    #[test]
+    fn a_huge_gap_is_one_step() {
+        let ms = 1_700_000_000_000;
+        assert_eq!(next_funding_boundary_after(1_001, ms, 1), Some(ms + 1));
+        assert_eq!(next_funding_boundary_after(0, MAX - 1, 1), Some(MAX));
+        assert_eq!(next_funding_boundary_after(0, MAX, 1), None);
     }
 }

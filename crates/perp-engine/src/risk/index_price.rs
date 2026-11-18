@@ -362,12 +362,15 @@ fn apply_index_price_update<H: PerpHost>(
                 .cumulative_funding_index
                 .checked_add(index_step)
                 .ok_or_else(|| perp_err("index price update: funding index overflow"))?;
-            while funding.next_funding_ts <= effective_timestamp {
-                funding.next_funding_ts = funding
-                    .next_funding_ts
-                    .checked_add(market.funding_interval)
-                    .ok_or_else(|| perp_err("index price update: next funding timestamp overflow"))?;
-            }
+            // The first boundary after this push, in one step however many epochs the oracle
+            // was silent for (Q2: the loop it replaces ran once per missed epoch). Settles ONE
+            // epoch at this mark either way.
+            funding.next_funding_ts = crate::math::next_funding_boundary_after(
+                funding.next_funding_ts,
+                effective_timestamp,
+                market.funding_interval,
+            )
+            .ok_or_else(|| perp_err("index price update: next funding timestamp overflow"))?;
             storage::save_funding_state(context, market_id, &funding)?;
 
             acc = PremiumIndexAccumulator::default();
