@@ -901,6 +901,16 @@ pub fn open_order_margin(
 }
 
 /// Returns `true` if the position is above the maintenance-margin threshold.
+///
+/// The position's value `notional + vQuote + margin` is summed in `i128`, where three `i64` terms
+/// cannot overflow, and compared there against the `i64` threshold. So the verdict needs only the
+/// notional and its requirement to be representable — and the market's position bound
+/// ([`position_fits_market`]) keeps the notional so — not the EQUITY: a position's margin is not
+/// bounded by its notional (added margin, a funding credit), and an equity past `i64` is simply far
+/// above maintenance. It used to be summed in `i64` and fail there, which turned the maker fill's
+/// K9 check on such a position into an `Err` that failed the whole match (and, inside a
+/// liquidation's book leg, halted the sweep). A caller that needs the equity itself in `i64`
+/// ([`calc_position_equity`]) still checks it.
 #[inline]
 pub fn is_above_maintenance_margin(
     tiers: &MarginTiers,
@@ -912,17 +922,14 @@ pub fn is_above_maintenance_margin(
     price_decimals: u32,
 ) -> Result<bool, PerpError> {
     let notional = calc_value_i64(mark_price, amount, base_decimals, price_decimals)?;
-    let position_value = notional
-        .checked_add(v_quote_balance)
-        .and_then(|v| v.checked_add(margin))
-        .ok_or_else(|| perp_err("math: maintenance margin value overflow"))?;
+    let position_value = notional as i128 + v_quote_balance as i128 + margin as i128;
     let threshold = maintenance_margin(
         tiers,
         notional
             .checked_abs()
             .ok_or_else(|| perp_err("math: maintenance margin abs overflow"))?,
     )?;
-    Ok(position_value >= threshold)
+    Ok(position_value >= threshold as i128)
 }
 
 /// Position equity at `mark_price`: isolated margin plus unrealized PnL.
@@ -2641,6 +2648,28 @@ mod margin_tier_tests {
             let want = notional + vq + margin >= notional.abs() / 6;
             assert_eq!(got, want, "mark={mark} a={amount} vq={vq} m={margin}");
         }
+    }
+
+    /// The verdict is TOTAL in the equity: a position whose `notional + vQuote + margin` leaves
+    /// `i64` gets the comparison's answer, not an `Err` (second-round review, bound-k9-1). The
+    /// reviewer's maker: short 1,010,000 at a $8.7M mark with `vQuote` and margin both near `9e18`
+    /// — equity `≈ 9.3e18`, which `calc_position_equity` cannot hold — is above maintenance; the
+    /// mirror image, a long whose `vQuote + margin` sits below `i64::MIN`, is not. Both used to be
+    /// `Err("math: maintenance margin value overflow")`.
+    #[test]
+    fn the_maintenance_verdict_is_total_in_the_equity() {
+        let t = MarginTiers::default();
+        let (bd, pd) = (0u32, 2u32);
+        let mark = 870_000_000; // $8.7M
+        let (amount, vq, margin): (i64, i64, i64) =
+            (-1_010_000, 9_087_000_000_000_000_000, 9_029_000_000_000_000_000);
+        assert!(calc_position_equity(mark, amount, vq, margin, bd, pd).is_err());
+        assert!(is_above_maintenance_margin(&t, mark, amount, vq, margin, bd, pd).unwrap());
+
+        let (amount, vq, margin): (i64, i64, i64) =
+            (1_000, -9_000_000_000_000_000_000, -500_000_000_000_000_000);
+        assert!(calc_position_equity(1, amount, vq, margin, bd, pd).is_err());
+        assert!(!is_above_maintenance_margin(&t, 1, amount, vq, margin, bd, pd).unwrap());
     }
 }
 

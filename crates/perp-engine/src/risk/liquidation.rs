@@ -30,6 +30,11 @@ pub(crate) enum LiquidationOutcome {
 /// result — so `Some(_)` is exactly the verdict the settled position gets. It runs FIRST so that an
 /// arithmetic fault is told apart from a storage error (`PerpError` does not distinguish them) and
 /// becomes a skip instead of an `Err` the sweep would halt on.
+///
+/// The equity itself must be representable too. `is_above_maintenance_margin` sums it in `i128`
+/// (so a MAKER's K9 check cannot fault on it), but the close that follows a `Some(false)` computes
+/// a liquidated position's parts in `i64`; a position whose equity leaves `i64` either way stays
+/// `Faulted` here, exactly as before that change.
 fn isolated_maintenance_verdict(
     market: &Market,
     mark_price: u64,
@@ -38,6 +43,15 @@ fn isolated_maintenance_verdict(
 ) -> Option<bool> {
     let payment = crate::risk::funding::pending_funding_payment(funding_index, pos, market).ok()?;
     let margin = pos.margin.checked_add(payment)?;
+    crate::math::calc_position_equity(
+        mark_price,
+        pos.amount,
+        pos.v_quote_balance,
+        margin,
+        market.base_decimals,
+        market.price_decimals,
+    )
+    .ok()?;
     is_above_maintenance_margin(
         &market.tiers,
         mark_price,
