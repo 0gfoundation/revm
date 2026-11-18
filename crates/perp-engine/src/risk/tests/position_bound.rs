@@ -319,3 +319,178 @@ fn the_largest_position_the_bound_admits_liquidates_at_max_price() {
     assert_eq!(trades, [(HIGH_MAX_PRICE, 500_000), (HIGH_MAX_PRICE, 500_000)]);
     assert_eq!(position(&mut ctx, ALICE).amount, 0);
 }
+
+// ── Second-round review: the maker trial is TOTAL (bound-k9-1, bound-vquote-2) ────────────────
+//
+// The bound keeps a position's NOTIONAL representable, but neither its equity (margin is not
+// bounded by notional) nor its entry basis after a `maxPrice` lowering. The maker fill's trial used
+// to `?` the faults those leave — K9's `notional + vQuote + margin` in `i64`, `vQuote` past `i64` —
+// so one such maker turned every taker reaching its order into a revert, and a liquidation's book
+// leg reaching it into a halt of the sweep on every tick. Both are reached here by public calls
+// only, on wallets an `i64` admits (the devnet's MockUSDC mints them freely).
+
+const VICTIM: Address = address!("5200000000000000000000000000000000000003");
+const QUOTE_9_2E18: i64 = 9_200_000_000_000_000_000;
+
+fn seed_wallet(ctx: &mut TestCtx, user: Address, wallet: i64) {
+    storage::save_account(
+        ctx,
+        user,
+        UserAccount { perp_wallet_balance: wallet, ..UserAccount::default() },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+}
+
+fn leverage(ctx: &mut TestCtx, user: Address, leverage: u64) {
+    crate::risk::run_set_leverage(
+        &setLeverageCall { marketId: MARKET_ID, leverage }.abi_encode(),
+        user,
+        ctx,
+    )
+    .unwrap();
+}
+
+/// M2 ISOLATED short 1,000,000 @ $9M at 3x, opened by public calls: M2 rests the ask, ALICE (2x)
+/// takes it. Returns with the mark still at $9M.
+fn m2_short_one_million_at_high_max_price(ctx: &mut TestCtx, m2_wallet: i64) {
+    setup_market(ctx);
+    update_market(ctx, HIGH_MAX_PRICE).unwrap();
+    storage::save_mark_price(ctx, MARKET_ID, HIGH_MAX_PRICE).unwrap();
+    seed_wallet(ctx, M2, m2_wallet);
+    seed_wallet(ctx, ALICE, 4_600_000_000_000_000_000);
+    seed_wallet(ctx, MAKER, RICH * 1_000);
+    leverage(ctx, M2, 3);
+    leverage(ctx, ALICE, 2);
+    place(ctx, M2, Side::Sell, HIGH_MAX_PRICE, 1_000_000, TimeInForce::Gtc).unwrap();
+    place(ctx, ALICE, Side::Buy, HIGH_MAX_PRICE, 1_000_000, TimeInForce::Ioc).unwrap();
+    let m2 = position(ctx, M2);
+    assert_eq!((m2.amount, m2.v_quote_balance), (-1_000_000, 9_000_000_000_000_000_000));
+}
+
+/// The tick a liquidation's book leg runs on: `index` at `ts = 31`.
+fn tick(ctx: &mut TestCtx, index: u64) {
+    advance_block_to(ctx, 31);
+    run_update_index_price(
+        &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: index, timestamp: 31 }
+            .abi_encode(),
+        ADMIN,
+        ctx,
+    )
+    .expect("the sweep must not fail on the maker its liquidation's book leg reaches");
+}
+
+/// **bound-k9-1: a maker whose equity leaves `i64` is valued, and fills.** M2 short 1,000,000 @ $9M
+/// adds `6e18` of margin (`addPositionMargin`, its own wallet): margin and `vQuote` both `9e18`. At a
+/// $8.7M mark its equity is `≈ 9.3e18` — `calc_position_equity` cannot hold it — yet it is far above
+/// maintenance. Its ask of 10,000 @ $8.7M rests (1,010,000 fits the bound at $9M).
+///
+/// A maker filling it used to get `Err("math: maintenance margin value overflow")` from the K9
+/// check (every taker at that level reverted), and a short VICTIM liquidated through it halted the
+/// sweep (`liquidation.rs` panic). Now K9 sums the value in `i128`: the order fills, for the taker
+/// and for the liquidation alike. M2 itself is `Faulted` in the sweep (its equity is not an `i64`,
+/// so the isolated verdict skips it, as before), which writes nothing.
+#[test]
+fn a_maker_whose_equity_leaves_i64_still_fills() {
+    for liquidation in [false, true] {
+        let mut ctx = make_ctx();
+        m2_short_one_million_at_high_max_price(&mut ctx, QUOTE_9_2E18);
+        crate::risk::run_add_position_margin(
+            &addPositionMarginCall { marketId: MARKET_ID, amount: 6_000_000_000_000_000_000 }
+                .abi_encode(),
+            M2,
+            &mut ctx,
+        )
+        .unwrap();
+        let mark = 870_000_000;
+        storage::save_mark_price(&mut ctx, MARKET_ID, mark).unwrap();
+        let m2 = position(&mut ctx, M2);
+        let equity = crate::math::calc_position_equity(
+            mark,
+            m2.amount,
+            m2.v_quote_balance,
+            m2.margin,
+            0,
+            PRICE_DECIMALS,
+        );
+        assert!(equity.is_err(), "the fixture's point: M2's equity is not an i64");
+        place(&mut ctx, M2, Side::Sell, mark, 10_000, TimeInForce::Gtc).unwrap();
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        if liquidation {
+            let entry = calc_value(800_000_000, 10_000, 0, PRICE_DECIMALS).unwrap() as i64;
+            seed_position_account(&mut ctx, VICTIM, -10_000, entry, 1_000_000_000_000_000, 3, 0);
+            tick(&mut ctx, mark);
+        } else {
+            place(&mut ctx, MAKER, Side::Buy, mark, 10_000, TimeInForce::Ioc)
+                .expect("a taker reaching M2's ask must not revert");
+        }
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        let taker = if liquidation { VICTIM } else { MAKER };
+        let trades: Vec<(Address, Address, u64, u64)> = decode_events::<Trade>(&logs)
+            .iter()
+            .map(|t| (t.taker, t.maker, t.price, t.quantity))
+            .collect();
+        assert_eq!(trades, [(taker, M2, mark, 10_000)], "liquidation {liquidation}");
+        assert!(decode_events::<OrderCancelled>(&logs).is_empty(), "liquidation {liquidation}");
+        assert_eq!(position(&mut ctx, M2).amount, -1_010_000);
+        let want = if liquidation { 0 } else { 10_000 };
+        assert_eq!(position(&mut ctx, taker).amount, want, "liquidation {liquidation}");
+    }
+}
+
+/// **bound-vquote-2: a maker fill that would take `vQuote` past `i64` is refused, never an `Err`.**
+/// M2 short 1,000,000 @ $9M (`vQuote 9e18`); `updateMarket` LOWERS `maxPrice` to $6M — accepted:
+/// the amount fits better, but the entry basis stays. At a $6M mark M2 rests an ask of 100,000
+/// (1,100,000 fits the bound at $6M). Filling 60,000 of it would add `3.6e17` to a `vQuote` of `9e18`.
+///
+/// That used to be `Err("settlement: vQuote overflow")` out of the trial's `apply_position_fill`:
+/// every taker reverted, and a VICTIM short liquidated through it halted the sweep. Now the trial is
+/// total: M2's order is cancelled `MakerInsolvent` (reason 2), nothing trades with it, and the walk
+/// goes on — the taker's IOC expires, the VICTIM's book leg finds no other liquidity.
+#[test]
+fn a_maker_fill_past_the_vquote_range_is_cancelled_not_an_err() {
+    for liquidation in [false, true] {
+        let mut ctx = make_ctx();
+        m2_short_one_million_at_high_max_price(&mut ctx, 6_100_000_000_000_000_000);
+        let low = 600_000_000;
+        update_market(&mut ctx, low).expect("a lowering is always accepted");
+        storage::save_mark_price(&mut ctx, MARKET_ID, low).unwrap();
+        place(&mut ctx, M2, Side::Sell, low, 100_000, TimeInForce::Gtc).unwrap();
+        let m2 = position(&mut ctx, M2);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        if liquidation {
+            let entry = calc_value(550_000_000, 60_000, 0, PRICE_DECIMALS).unwrap() as i64;
+            seed_position_account(&mut ctx, VICTIM, -60_000, entry, 1_000_000_000_000_000, 3, 0);
+            tick(&mut ctx, low);
+        } else {
+            place(&mut ctx, MAKER, Side::Buy, low, 60_000, TimeInForce::Ioc)
+                .expect("a taker reaching M2's ask must not revert");
+        }
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert!(decode_events::<Trade>(&logs).is_empty(), "liquidation {liquidation}");
+        let cancels: Vec<(Address, u8)> =
+            decode_events::<OrderCancelled>(&logs).iter().map(|c| (c.user, c.reason)).collect();
+        assert_eq!(
+            cancels,
+            [(M2, CancelReason::MakerInsolvent as u8)],
+            "liquidation {liquidation}"
+        );
+        let after = position(&mut ctx, M2);
+        assert_eq!(
+            (after.amount, after.v_quote_balance, after.margin),
+            (m2.amount, m2.v_quote_balance, m2.margin),
+            "liquidation {liquidation}: the refused maker's position did not move"
+        );
+        assert_eq!(storage::book_order_count(&mut ctx, M2, MARKET_ID).unwrap(), 0);
+        if liquidation {
+            use crate::interface::IPerpDex::Liquidation;
+            let liq: Vec<(Address, i64)> =
+                decode_events::<Liquidation>(&logs).iter().map(|l| (l.user, l.amount)).collect();
+            assert_eq!(liq, [(VICTIM, -60_000)]);
+        } else {
+            assert_eq!(position(&mut ctx, MAKER).amount, 0);
+        }
+    }
+}
