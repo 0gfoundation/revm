@@ -646,9 +646,9 @@ sol! {
         /// Everything else is rejected: deposit / withdraw (a sub's money enters and leaves through
         /// its master via `internalTransfer`), createSubAccount, asSubAccount, every `*Signed`
         /// selector (those authenticate an `account` argument, not the caller), every admin / role
-        /// / market / oracle / insurance-fund selector, the permissionless protocol-work
-        /// selectors (`liquidate`, `drainDeferredWork`, `updateIndexPriceFromBook` — call them
-        /// directly), and every view.
+        /// / market / oracle / insurance-fund selector (`updateIndexPriceFromBook` among them: it
+        /// is admin / oracle only, like `updateIndexPrice`), the permissionless protocol-work
+        /// selectors (`liquidate`, `drainDeferredWork` — call them directly), and every view.
         ///
         /// ⚠️ NEVER send ERC-20 USDC to a sub-account address (e.g. as an exchange withdrawal
         /// destination): it has no private key, and `deposit` — the only thing that could sweep
@@ -1163,7 +1163,8 @@ sol! {
 
         /// Select which basis mechanism feeds Price 2 of this market's mark.
         ///
-        ///   0 = the 30-second time-weighted window, sampled on every best-quote change.
+        ///   0 = the 30-second time-weighted window, sampled at the first best-quote change of
+        ///       each block.
         ///       Every market is created on this and the USD-M markets stay on it — they are
         ///       aligned to Binance here and do not move.
         ///   1 = an oracle-cadence EWMA of `mid - index` (tau 150s, clamped to +/-300bps of the
@@ -1526,9 +1527,9 @@ sol! {
         /// Gas: BASE_BATCH + N * cancelOrder-cost, charged up front from the pre-decode array length.
         /// Reverts as a whole (zero writes) for: bad calldata, N == 0, N > 256, insufficient gas.
         function batchCancelOrders(bytes32[] orderIds) external returns (bytes statuses);
-        /// One order of a batch placement — the same seven arguments `placeOrder` takes, minus the
-        /// market-wide ones. All fields are STATIC, so `PlaceItem[]` encodes as an offset word, a
-        /// length word, then N * 224 bytes inline (7 words per item, no per-element offset table).
+        /// One order of a batch placement — the same eight arguments `placeOrder` takes. All fields
+        /// are STATIC, so `PlaceItem[]` encodes as an offset word, a length word, then N * 256
+        /// bytes inline (8 words per item, no per-element offset table).
         /// That fixed stride is what makes the pre-decode length bound in `BatchArrayLayout` sound.
         struct PlaceItem {
             uint64  marketId;
@@ -1580,8 +1581,10 @@ sol! {
         ///                            prevention STOPPED, a GTC included; `OrderExpired.reason`
         ///                            tells which — no resting record is left),
         ///                        0 = Rejected, 3 = Aborted, 4 = NotAttempted
-        ///   bytes 1..33 orderId  the id the order was placed under; ZERO for tags 0/3/4 (a
-        ///                        rejected item never consumed an id, so none exists)
+        ///   bytes 1..33 orderId  tags 1/2: the id the order was placed under; tag 3: the id the
+        ///                        aborted item BURNED (it consumed one, and the nonce moves past
+        ///                        it); ZERO for tags 0/4 (a rejected or never-attempted item
+        ///                        consumed no id, so none exists)
         ///   byte 33     reason   numeric reason code; 0 when accepted
         /// Reason codes are NUMERIC (never strings) — see `PerpBatchReason` in `crate::batch`;
         /// place-path rejects occupy the 16..=63 band. `statuses` is the outcome AT THE TIME the item
@@ -1986,11 +1989,15 @@ sol! {
         /// Push a new index price and recompute the mark price using:
         ///   Mark Price = Median(Price1, Price2, ContractPrice)
         ///   Price1 = indexPrice * [1 + fundingRate * (timeUntilNext / fundingInterval)]
-        ///   Price2 = indexPrice + MovingAverage30s(midPrice - indexPrice)
+        ///   Price2 = indexPrice + basis, where the basis is the market's `setBasisMode`:
+        ///     0 (every market's default) — the time-weighted average of (midPrice - indexPrice)
+        ///       over the 30 s before the floored timestamp, the mid recorded at the first
+        ///       best-quote change of each block and the index the one in force at the time;
+        ///     1 — an EWMA of (midPrice - indexPrice) sampled by this call (tau 150 s), clamped to
+        ///       +/-300 bps of indexPrice.
         ///   ContractPrice = last on-chain fill price (falls back to indexPrice if no trades yet)
         ///
-        /// The 30-second moving average ring buffer is updated each call; each elapsed
-        /// second since the last call is filled with the current basis value.
+        /// The mark is floored to tickSize and held within [tickSize, maxPrice].
         ///
         /// `timestamp` (unix seconds) may be at most 60 s ahead of the block timestamp, judged
         /// as sent, before flooring (`MAX_ORACLE_FUTURE_SKEW_SECS`); a later one reverts
@@ -2116,7 +2123,8 @@ sol! {
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         /// keyId: which API key slot to verify against.
         /// marketId is part of the signed message for ABI compatibility but ignored by the cancel logic.
-        /// Replay protection is implicit: a cancelled order cannot be cancelled again.
+        /// A signature is single-use and spent by SUBMISSION, as on `placeOrderSigned`:
+        /// resubmitting it reverts with "duplicate signature" even if the cancel was refused.
         function cancelOrderSigned(
             address account,
             bytes32 orderId,
@@ -2135,9 +2143,8 @@ sol! {
         /// N is inside the digest, so the batch's size, content and order cannot be tampered with.
         /// timestamp: Unix seconds. recvWindow: max age in seconds (capped at 60).
         ///
-        /// Replay protection is EXPLICIT here (unlike the single-order cancel, whose guard is
-        /// implicit in "a cancelled order cannot be cancelled again"): the signature is burned in
-        /// the seen-signature set after verification, unconditionally — including a batch in which
+        /// Replay protection, as on every signed selector: the signature is burned in the
+        /// seen-signature set after verification, unconditionally — including a batch in which
         /// every item was rejected. Resubmitting the same signature reverts the whole call.
         ///
         /// Returns the same index-aligned 34-byte-per-item `statuses` blob as batchCancelOrders.
@@ -2165,11 +2172,10 @@ sol! {
         /// i.e. index-distinct and bound to this one signature. (The single-order `placeOrderSigned`
         /// uses the raw keccak256(signature), which would collide across the N items of a batch.)
         ///
-        /// Replay protection is mandatory here (unlike single-order signed placement, where a
-        /// REJECTED placement deliberately stays replayable in-window): the signature is burned in
-        /// the seen-signature set right after verification, unconditionally — including a batch in
-        /// which every item was rejected — because a batch returns Ok and could otherwise be
-        /// resubmitted and partly re-execute. Resubmitting reverts the whole call.
+        /// Replay protection, as on every signed selector: the signature is burned in the
+        /// seen-signature set right after verification, unconditionally — including a batch in
+        /// which every item was rejected, which matters here because a batch returns Ok and could
+        /// otherwise be resubmitted and partly re-execute. Resubmitting reverts the whole call.
         ///
         /// Returns the same index-aligned 34-byte-per-item `statuses` blob as batchPlaceOrders.
         function batchPlaceOrdersSigned(
