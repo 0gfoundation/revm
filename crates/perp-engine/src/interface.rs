@@ -720,6 +720,16 @@ sol! {
         /// baseDecimals and priceDecimals cannot be changed after creation.
         /// `liquidationFeeRateBps`: a rate on the NOTIONAL closed (⚠️ ABI CHANGE, cross P3 — see
         /// `addMarket`).
+        ///
+        /// `maxPrice` bounds positions as well as prices: every opening order and fill keeps the
+        /// position worth at most `int64` max quote units at `max(maxPrice, mark)` (`placeOrder`'s
+        /// `-2027`). So RAISING `maxPrice` past what an open position can be worth there reverts
+        /// `updateMarket: maxPrice too high for an open position (its value there exceeds
+        /// i64::MAX)`, nothing written; lowering it is always accepted. After a lowering, no fill
+        /// executes above the new `maxPrice` — an order left resting above it can no longer trade
+        /// there, and a bid above it is expired at the next oracle tick or drain (`OrderCancelled`
+        /// reason 4) — and the stored mark stays where it was until the next `updateIndexPrice`
+        /// clamps it.
         function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps) external;
         /// Read the current mark price for a market.
         function getMarkPrice(uint64 marketId) external view returns (uint64 price);
@@ -1269,9 +1279,12 @@ sol! {
         ///                     reports for it. **`0` MEANS NONE**: no tier admits `leverage` at
         ///                     all — a leverage set before `setMarginTiers` lowered tier 0's
         ///                     `maxLeverage` under it (a flat user keeps it too). Every open is
-        ///                     then refused until `setLeverage` brings it back under the cap,
-        ///                     and `leverage` above still reports the stored value, which is what
-        ///                     the chain applies. Every market today ships the single default
+        ///                     then refused until `setLeverage` brings it back under the cap —
+        ///                     a crossing order at its fill, a resting one when it rests
+        ///                     (`placeOrder: leverage exceeds the margin tier for this position
+        ///                     size`; an order rested before the table changed is cancelled at
+        ///                     its first touch, reason 2) — and `leverage` above still reports the
+        ///                     stored value, which is what the chain applies. Every market today ships the single default
         ///                     tier `{0, 3}`, so every market today returns `type(uint64).max` at
         ///                     every legal leverage; the field only becomes informative once
         ///                     `setMarginTiers` installs a real table.
@@ -1508,6 +1521,24 @@ sol! {
         /// A pure REDUCE of a CROSSED position — or of any position of an account that still holds
         /// cross exposure — is never margin-refused: its fee comes out of the cross wallet, which
         /// may go negative (the account is judged on `crossMarginBalance`).
+        ///
+        /// Position-size refusals (batch reason 255), both margin types, on the position an OPEN
+        /// would leave:
+        ///   * `placeOrder: -2027 position exceeds the market's maximum notional`: past the margin
+        ///     tier table's `notionalCap` (`setMarginTiers`), or worth more than `int64` max quote
+        ///     units at `max(maxPrice, mark)` — the market's position bound, which keeps every
+        ///     valuation of a position representable (see `updateMarket`);
+        ///   * `placeOrder: leverage exceeds the margin tier for this position size`: that
+        ///     notional's tier caps leverage below the account's leverage for the market (as after
+        ///     a `setMarginTiers` that lowered it — `getSymbolConfig` then reports
+        ///     `maxNotionalValue = 0` for a flat account).
+        /// A taker's opening fill is judged at the mark. An order that can open and would REST is
+        /// judged the same way, write-clean and for the whole order, as if filled in full at its
+        /// own price — it is never accepted only to be cancelled at its first touch. A resting
+        /// order whose fill they refuse anyway (the position or the table changed after it
+        /// rested) is cancelled when the walk meets it (`OrderCancelled` reason 2) and the walk
+        /// goes on. A pure reduce, and a reduce-only order, is never refused by either; an order
+        /// that would flip the position is judged on the side it opens.
         function placeOrder(uint64 marketId, uint8 side, uint64 price, uint64 quantity, uint8 orderType, uint8 tif, bytes16 clientOrderId, uint8 flags) external returns (bytes32 orderId);
         /// Cancel an open order (caller must be the owner).
         /// marketId is accepted for ABI compatibility but ignored — orders are looked up globally by orderId.
@@ -1948,10 +1979,12 @@ sol! {
         ///
         /// An ISOLATED position is refused, with no write, when it is at or above its own
         /// maintenance (`liquidate: position is above maintenance margin`) and when it cannot be
-        /// valued at the mark — its notional, pending funding or maintenance requirement past
-        /// `int64` quote units (`liquidate: position cannot be valued at the mark price`; the
-        /// liquidation sweep skips such a position the same way rather than halting). Either way a
-        /// FLAGGED account's episode runs instead (see below).
+        /// valued at the mark — its pending funding (or the margin it settles into) past `int64`
+        /// quote units (`liquidate: position cannot be valued at the mark price`; the liquidation
+        /// sweep skips such a position the same way rather than halting, and ADL passes over such
+        /// a holder). Its notional cannot fault: every position is held to a value of at most
+        /// `int64` max at `max(maxPrice, mark)` (`placeOrder`'s `-2027`, `updateMarket`). Either
+        /// way a FLAGGED account's episode runs instead (see below).
         ///
         /// A position CROSSED in force is judged on its ACCOUNT (cross P3): at or above cross
         /// maintenance (`crossMarginBalance >= totalCrossMaintMargin`) it is refused with
