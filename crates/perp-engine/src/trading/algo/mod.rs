@@ -839,12 +839,13 @@ pub fn run_place_algo_order_signed<H: PerpHost>(
     // SUBMISSION, not by success, the way an Ethereum nonce is spent by a failed transaction.
     // Burning only on success leaves a REJECTED signature replayable for the rest of its recv
     // window, which is reachable whenever the rejection was transient.
+    let block_ts: u64 = context.timestamp();
     let writes_before_burn = context.perp_write_count();
     storage::mark_signature_seen(context, &algo_id, a.timestamp)?;
-    // Best-effort by design: this runs AFTER a committed burn, so surfacing its `Err` would
-    // revert a call whose signature is already spent.
-    let _ = crate::account::signing::gc_seen_buckets_best_effort(context, a.timestamp);
-    let burn_writes = context.perp_write_count() - writes_before_burn;
+    // On the BLOCK clock, like every other signed selector. Best-effort inside: an ordinary error
+    // is dropped there; only a `Fatal` (a node / DB fault) propagates.
+    crate::account::signing::gc_seen_buckets_best_effort(context, block_ts)?;
+    let burn_writes = context.perp_write_count().saturating_sub(writes_before_burn);
 
     place_core(context, a.account, a.marketId, &market, algo_id, v, a.clientAlgoId, a.flags)
         .map_err(|e| match e {
