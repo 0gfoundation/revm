@@ -1914,8 +1914,18 @@ sol! {
         ///
         /// The 30-second moving average ring buffer is updated each call; each elapsed
         /// second since the last call is filled with the current basis value.
-        /// The input timestamp is floored to the market's priceUpdateInterval. If that
-        /// floored timestamp is not newer than the stored index timestamp, the update is ignored.
+        ///
+        /// `timestamp` (unix seconds) may be at most 60 s ahead of the block timestamp, judged
+        /// as sent, before flooring (`MAX_ORACLE_FUTURE_SKEW_SECS`); a later one reverts
+        /// `updateIndexPrice: timestamp is more than 60 s ahead of the block` and changes nothing
+        /// (a millisecond timestamp is refused this way). There is no lower bound: the timestamp
+        /// is floored to the market's priceUpdateInterval, and if that floored window is not
+        /// newer than the stored index timestamp the update is accepted and ignored (no revert,
+        /// no event).
+        ///
+        /// However long the oracle was silent, a push that crosses the funding boundary settles
+        /// ONE epoch (at this push's mark) and moves `nextFundingTime` to the first boundary after
+        /// the floored timestamp.
         ///
         /// Callable by admin or the configured oracle address.
         function updateIndexPrice(uint64 marketId, uint64 indexPrice, uint64 timestamp) external;
@@ -1932,9 +1942,9 @@ sol! {
         ///
         /// Takes NO timestamp: there is no external observation to stamp, so the block
         /// timestamp is used (floored to the market's priceUpdateInterval, like
-        /// `updateIndexPrice`). A caller-supplied timestamp would reopen both the
-        /// future-dated-freeze trap and, because alpha is derived from the elapsed time,
-        /// let one caller apply many EWMA steps inside a single block.
+        /// `updateIndexPrice`). A caller-supplied timestamp, even one within
+        /// `updateIndexPrice`'s 60 s bound, would let one caller apply several EWMA steps
+        /// inside a single block, because alpha is derived from the elapsed time.
         ///
         /// When the external feed returns, `updateIndexPrice` blends linearly from the last
         /// book-derived value to the external price over 300 seconds rather than jumping.
