@@ -5088,6 +5088,13 @@ mod usdc_custody;
 // fill-time band is written to let rest.
 mod band_expiry;
 
+// ── The market's position-size bound (Q7 residual) ──────────────────────────────────────────────
+//
+// Every opening fill keeps the position worth at most `i64::MAX` quote units at
+// `max(maxPrice, mark)`, `updateMarket` refuses a `maxPrice` raise an open position cannot carry,
+// and no fill executes above `maxPrice` — so no valuation the liquidation sweep makes can fault.
+mod position_bound;
+
 // ── ORDERED `ACCOUNT_UPDATE` STREAM SHAPE: liquidation and ADL ───────────────────────────────────
 //
 // Both of these were structurally uncoverable by the old hand-attached snapshot helper (it ran only
