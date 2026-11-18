@@ -287,6 +287,15 @@ impl PremiumIndexAccumulator {
     ///
     /// Slots before `end_ts` use the latest known PI. If `endpoint_pi` is set
     /// and `end_ts` lands exactly on a sample slot, the endpoint slot uses it.
+    ///
+    /// O(1) (Q2): the `n` slots `last_sample_ts + k · sample_interval ≤ end_ts` are folded in one
+    /// step instead of one push each. They carry weights `c + 1 ..= c + n` (`c` the count so far),
+    /// whose sum is `n · c + n(n + 1)/2`, all at `last_pi` — then the endpoint slot, when it is
+    /// `end_ts` itself, swaps `last_pi` for `endpoint_pi` at its weight `c + n`. The same state as
+    /// filling slot by slot (`fill_slots_until_reference` in the tests), so a long gap or an epoch
+    /// of many slots (`fundingInterval / priceUpdateInterval` has no protocol bound) costs nothing
+    /// extra. Refuses exactly what the loop refused: a first slot past `u64::MAX`, and a count or a
+    /// weighted sum past its width.
     #[inline]
     pub fn fill_slots_until(
         &mut self,
@@ -297,24 +306,42 @@ impl PremiumIndexAccumulator {
         if sample_interval == 0 || self.last_sample_ts == 0 || end_ts <= self.last_sample_ts {
             return Ok(());
         }
-        let mut slot_ts = self
-            .last_sample_ts
+        // The loop's first-slot refusal, kept even when no slot fits before `end_ts`.
+        self.last_sample_ts
             .checked_add(sample_interval)
             .ok_or_else(|| perp_err("premium accumulator: sample timestamp overflow"))?;
-        while slot_ts <= end_ts {
-            let pi = if endpoint_pi.is_some() && slot_ts == end_ts {
-                endpoint_pi.unwrap_or(self.last_pi)
-            } else {
-                self.last_pi
-            };
-            self.push_slot(pi)?;
-            self.last_pi = pi;
-            self.last_sample_ts = slot_ts;
-            slot_ts = match slot_ts.checked_add(sample_interval) {
-                Some(next) => next,
-                None => break,
-            };
+        let n = (end_ts - self.last_sample_ts) / sample_interval;
+        if n == 0 {
+            return Ok(());
         }
+        let c = self.sample_count;
+        let count = c
+            .checked_add(n)
+            .ok_or_else(|| perp_err("premium accumulator: sample count overflow"))?;
+        // Σ k for k = c+1 ..= c+n, in u128: `n · (n + 1)` < 2^128 for any u64 `n`.
+        let weights = (n as u128)
+            .checked_mul(c as u128)
+            .and_then(|a| a.checked_add((n as u128) * (n as u128 + 1) / 2))
+            .and_then(|v| i128::try_from(v).ok())
+            .ok_or_else(|| perp_err("premium accumulator: weighted sample overflow"))?;
+        let mut weighted_sum = (self.last_pi as i128)
+            .checked_mul(weights)
+            .and_then(|v| self.weighted_sum.checked_add(v))
+            .ok_or_else(|| perp_err("premium accumulator: weighted sum overflow"))?;
+        // `≤ end_ts`, so it cannot overflow.
+        let last_slot = self.last_sample_ts + n * sample_interval;
+        let mut last_pi = self.last_pi;
+        if let Some(pi) = endpoint_pi.filter(|_| last_slot == end_ts) {
+            weighted_sum = (pi as i128 - self.last_pi as i128)
+                .checked_mul(count as i128)
+                .and_then(|v| weighted_sum.checked_add(v))
+                .ok_or_else(|| perp_err("premium accumulator: weighted sum overflow"))?;
+            last_pi = pi;
+        }
+        self.weighted_sum = weighted_sum;
+        self.sample_count = count;
+        self.last_pi = last_pi;
+        self.last_sample_ts = last_slot;
         Ok(())
     }
 
@@ -384,4 +411,149 @@ pub struct IndexModeState {
     pub ramp_from: u64,
     /// Timestamp the handover ramp started at.
     pub ramp_start_ts: u64,
+}
+
+#[cfg(test)]
+mod premium_fill_tests {
+    use super::*;
+
+    /// The slot-by-slot loop `fill_slots_until` replaced, verbatim: the reference it must equal.
+    fn fill_slots_until_reference(
+        acc: &mut PremiumIndexAccumulator,
+        end_ts: u64,
+        sample_interval: u64,
+        endpoint_pi: Option<i64>,
+    ) -> Result<(), PerpError> {
+        if sample_interval == 0 || acc.last_sample_ts == 0 || end_ts <= acc.last_sample_ts {
+            return Ok(());
+        }
+        let mut slot_ts = acc
+            .last_sample_ts
+            .checked_add(sample_interval)
+            .ok_or_else(|| perp_err("premium accumulator: sample timestamp overflow"))?;
+        while slot_ts <= end_ts {
+            let pi = if endpoint_pi.is_some() && slot_ts == end_ts {
+                endpoint_pi.unwrap_or(acc.last_pi)
+            } else {
+                acc.last_pi
+            };
+            acc.push_slot(pi)?;
+            acc.last_pi = pi;
+            acc.last_sample_ts = slot_ts;
+            slot_ts = match slot_ts.checked_add(sample_interval) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+        Ok(())
+    }
+
+    fn started(start: u64, pi: i64) -> PremiumIndexAccumulator {
+        let mut acc = PremiumIndexAccumulator::default();
+        acc.start_epoch(start, start, pi).unwrap();
+        acc
+    }
+
+    /// A year of one-second slots in one call, to the unit: the start sample at weight 1, slots
+    /// 2..=n at PI 7, the endpoint slot n + 1 at PI −3, so `Σ = 7 · n(n+1)/2 − 3(n+1)` with
+    /// `n = 31_536_000` (the loop would push 3.15e7 slots).
+    #[test]
+    fn a_year_of_one_second_slots_is_one_step_and_exact() {
+        let mut acc = started(1, 7);
+        acc.fill_slots_until(31_536_001, 1, Some(-3)).unwrap();
+        let n: i128 = 31_536_000;
+        assert_eq!(acc.weighted_sum, 7 * n * (n + 1) / 2 - 3 * (n + 1));
+        assert_eq!(
+            (acc.sample_count, acc.weighted_sum, acc.last_pi, acc.last_sample_ts),
+            (31_536_001, 3_480_817_551_767_997, -3, 31_536_001)
+        );
+        assert_eq!(acc.average().unwrap(), 6);
+    }
+
+    /// The engine-level pin (`premium_accumulator_forward_fills_missing_slots_with_linear_weights`)
+    /// at the type: 100 at weights 1..=3, the endpoint 300 at weight 4.
+    #[test]
+    fn forward_fill_with_an_endpoint_keeps_its_linear_weights() {
+        let mut acc = started(15, 100);
+        acc.fill_slots_until(60, 15, Some(300)).unwrap();
+        assert_eq!((acc.sample_count, acc.weighted_sum), (4, 1_800));
+        assert_eq!(acc.average().unwrap(), 180);
+    }
+
+    const MAX: u64 = u64::MAX;
+
+    /// `(start, interval, pre-filled slots at PI −13, end_ts, endpoint)`.
+    const CASES: [(u64, u64, u64, u64, Option<i64>); 10] = [
+        (15, 15, 0, 60, Some(300)),
+        // The endpoint is off the grid, so it does not apply.
+        (15, 15, 0, 61, Some(300)),
+        // No slot fits: n = 0.
+        (15, 15, 0, 29, Some(1)),
+        (15, 15, 0, 30, None),
+        // end_ts not after the last slot: a no-op.
+        (15, 15, 5, 15, Some(9)),
+        (100, 7, 3, 7_100, Some(-50)),
+        (100, 7, 3, 7_106, Some(-50)),
+        (1, 1, 0, 2, Some(i64::MIN / 4)),
+        // The top of u64: the loop stops at the last representable slot.
+        (MAX - 30, 10, 0, MAX, Some(5)),
+        // The first slot itself is past u64::MAX: both refuse.
+        (MAX - 5, 10, 0, MAX, Some(5)),
+    ];
+
+    #[test]
+    fn the_closed_form_equals_the_slot_loop() {
+        for (start, interval, prefilled, end_ts, endpoint) in CASES {
+            let mut acc = started(start, 11);
+            for _ in 0..prefilled {
+                acc.push_slot(-13).unwrap();
+            }
+            acc.last_pi = -13;
+            let mut reference = acc.clone();
+            let got = acc.fill_slots_until(end_ts, interval, endpoint);
+            let want = fill_slots_until_reference(&mut reference, end_ts, interval, endpoint);
+            let case = (start, interval, prefilled, end_ts, endpoint);
+            match (got, want) {
+                (Ok(()), Ok(())) => assert_eq!(acc, reference, "{case:?}"),
+                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{case:?}"),
+                (a, b) => panic!("{case:?}: closed form {a:?}, loop {b:?}"),
+            }
+        }
+        // The two refusals and the top-of-range fill really are what the table says.
+        let mut top = started(MAX - 30, 11);
+        top.fill_slots_until(MAX, 10, Some(5)).unwrap();
+        assert_eq!((top.sample_count, top.last_sample_ts, top.last_pi), (4, MAX, 5));
+        assert!(started(MAX - 5, 11).fill_slots_until(MAX, 10, Some(5)).is_err());
+    }
+
+    /// A seeded sweep against the loop: random starts, intervals, pre-fills, gaps and endpoints,
+    /// on and off the slot grid.
+    #[test]
+    fn the_closed_form_equals_the_slot_loop_on_a_random_sweep() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..5_000 {
+            let interval = 1 + rnd() % 900;
+            let start = 1 + rnd() % 1_000_000;
+            let pi = (rnd() % 2_000_001) as i64 - 1_000_000;
+            let mut acc = started(start, pi);
+            for _ in 0..rnd() % 4 {
+                acc.push_slot(pi).unwrap();
+            }
+            let end_ts = start + rnd() % (interval * 200);
+            let endpoint = match rnd() % 3 {
+                0 => None,
+                _ => Some((rnd() % 2_000_001) as i64 - 1_000_000),
+            };
+            let mut reference = acc.clone();
+            acc.fill_slots_until(end_ts, interval, endpoint).unwrap();
+            fill_slots_until_reference(&mut reference, end_ts, interval, endpoint).unwrap();
+            assert_eq!(acc, reference, "({start}, {interval}, {end_ts}, {endpoint:?})");
+        }
+    }
 }
