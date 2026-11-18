@@ -15,6 +15,39 @@ pub(crate) enum LiquidationOutcome {
     NoPosition,
     /// Position is at or above the maintenance-margin threshold — not liquidatable.
     AboveMaintenance,
+    /// Valuation at the mark left the representable range — the pending funding, the margin it
+    /// settles into, the notional or the maintenance requirement overflowed — so the position
+    /// cannot be judged: nothing written (J4, the cross episode's rule for a leg it cannot price).
+    Faulted,
+}
+
+/// The ISOLATED maintenance verdict on `pos` at `mark_price`, with its pending funding at
+/// `funding_index` folded into the silo — `Some(true)` at or above maintenance, `Some(false)`
+/// liquidatable, `None` when that valuation leaves the representable range (J4).
+///
+/// Pure arithmetic, no storage: the same `pending_funding_payment`, the same `checked_add` onto
+/// `pos.margin` as `compute_funding_settlement`'s ISOLATED branch, and the same predicate on the
+/// result — so `Some(_)` is exactly the verdict the settled position gets. It runs FIRST so that an
+/// arithmetic fault is told apart from a storage error (`PerpError` does not distinguish them) and
+/// becomes a skip instead of an `Err` the sweep would halt on.
+fn isolated_maintenance_verdict(
+    market: &Market,
+    mark_price: u64,
+    pos: &crate::types::PerpPosition,
+    funding_index: i128,
+) -> Option<bool> {
+    let payment = crate::risk::funding::pending_funding_payment(funding_index, pos, market).ok()?;
+    let margin = pos.margin.checked_add(payment)?;
+    is_above_maintenance_margin(
+        &market.tiers,
+        mark_price,
+        pos.amount,
+        pos.v_quote_balance,
+        margin,
+        market.base_decimals,
+        market.price_decimals,
+    )
+    .ok()
 }
 
 /// Core ISOLATED liquidation logic, shared by the manual `liquidate` entry point
@@ -22,12 +55,18 @@ pub(crate) enum LiquidationOutcome {
 /// `run_update_index_price`). The caller must already hold the loaded `market`
 /// and a non-zero `mark_price` (the mark==0 degenerate case is rejected by the
 /// wrapper). A position CROSSED in force is never brought here: both callers route it to the
-/// account-level episode (`cross_liquidation::liquidate_cross_account`). Settles funding on the
-/// position first (so the charge counts toward insolvency), then:
-/// - `amount == 0`  → `NoPosition` (no state change beyond the funding settle);
+/// account-level episode (`cross_liquidation::liquidate_cross_account`). Judges the position with
+/// its pending funding folded in (so the charge counts toward insolvency), writing nothing, then:
+/// - `amount == 0`  → `NoPosition`;
+/// - not valuable at the mark (an arithmetic fault in that judgement) → `Faulted` (J4);
 /// - above maintenance → `AboveMaintenance`;
-/// - otherwise closes through the orderbook, hands the rest the book cannot take to ADL,
-///   charges the clearance fee to the IF, emits `Liquidation`, and returns `Liquidated`.
+/// - otherwise settles the funding, closes through the orderbook, hands the rest the book cannot
+///   take to ADL, charges the clearance fee to the IF, emits `Liquidation`, and returns
+///   `Liquidated`.
+///
+/// TOTAL up to the first write (J4): the three refusals write NOTHING, and the only `Err` before
+/// the first write is the storage layer's. An `Err` after it is a commit-only invariant failure,
+/// which the sweep halts on.
 ///
 /// One call is one PASS, and a pass need not close the whole position. When the book leg stops
 /// on the distinct-maker cap ([`crate::trading::MAX_LIQUIDATION_MAKER_ACCOUNTS`]) the book still
@@ -67,7 +106,8 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // the shared wallet. Both callers route such a position to the account-level episode instead
     // (`cross_liquidation`), so this is unreachable; answered with NO write — before the funding
     // compute, which for a cross position needs the account this path does not load — rather than
-    // with an `Err`, because the sweep panics on any `Err` from this function.
+    // with an `Err`, because the sweep halts the node on an `Err` from this function (it cannot
+    // tell a storage error or a failure after the first write from anything else).
     if crate::margin::margin_type::effective_margin_type(&pos)
         == crate::types::MarginType::Crossed
     {
@@ -86,22 +126,44 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // `save_account` below would have re-written a byte-identical blob (and emitted a spurious
     // `AccountBalanceChanged` for a balance that did not move). The liquidation's real wallet
     // movements happen inside the close legs, which write the account themselves.
-    // `None`: this path deliberately does NOT load the account (the load was removed when funding
-    // stopped touching the wallet — see the note above), and the header the funding group needs is
-    // only built when funding actually moved money, so the write-free healthy-candidate scan still
-    // reads no account blob.
-    let pending_funding = compute_funding_settlement(context, user, market, &mut pos, None)?;
-    if is_above_maintenance_margin(
-        &market.tiers,
-        mark_price,
-        pos.amount,
-        pos.v_quote_balance,
-        pos.margin,
-        market.base_decimals,
-        market.price_decimals,
-    )? {
-        return Ok(LiquidationOutcome::AboveMaintenance);
+    //
+    // ── TOTAL (J4): the verdict first, on pure arithmetic ─────────────────────────────────────
+    //
+    // The sweep halts the node on any `Err` from this function, so the CHECK phase must not turn
+    // an arithmetic fault into one: a position whose valuation at the mark leaves the
+    // representable range (a notional past `i64` at an extreme mark, a funding payment past `i64`)
+    // is `Faulted` — skipped, nothing written — exactly as the cross episode skips a leg it cannot
+    // price. Storage errors still propagate (the cross TOTAL policy: "the only `Err` left is the
+    // storage layer's"); turning those into skips would hide a node-local fault behind a silent
+    // divergence. The verdict reads the index from `FundingState` as the settlement does, and
+    // builds the funding header only for a position it found liquidatable, so a healthy candidate
+    // in the O(N) scan now reads neither the account nor anything else beyond its position.
+    //
+    // `None` (in `compute_funding_settlement`): this path deliberately does NOT load the account
+    // (the load was removed when funding stopped touching the wallet — see the note above), and the
+    // header the funding group needs is only built when funding actually moved money.
+    let funding_index = storage::load_funding_state(context, market_id)?.cumulative_funding_index;
+    match isolated_maintenance_verdict(market, mark_price, &pos, funding_index) {
+        None => return Ok(LiquidationOutcome::Faulted),
+        Some(true) => return Ok(LiquidationOutcome::AboveMaintenance),
+        Some(false) => {}
     }
+    let pending_funding = compute_funding_settlement(context, user, market, &mut pos, None)?;
+    debug_assert!(
+        matches!(
+            is_above_maintenance_margin(
+                &market.tiers,
+                mark_price,
+                pos.amount,
+                pos.v_quote_balance,
+                pos.margin,
+                market.base_decimals,
+                market.price_decimals,
+            ),
+            Ok(false)
+        ),
+        "the settled position must get the verdict `isolated_maintenance_verdict` gave it"
+    );
 
     let liq_amount = pos.amount;
     let liquidation_side = if pos.amount > 0 {
@@ -374,7 +436,8 @@ pub(crate) fn charge_clearance_fee<H: PerpHost>(
 /// An ISOLATED position is closed in one pass, which can leave a rest open: the book leg stopped
 /// on the distinct-maker cap (never ADL'd — see [`liquidate_position`]), or the ADL budget ran
 /// out. Either sets the market's `deferred_work`, the sweep's rule, so `drainDeferredWork`
-/// finishes it without waiting for the next tick.
+/// finishes it without waiting for the next tick. One that cannot be valued at the mark (J4) is
+/// refused write-free with [`LIQUIDATE_FAULTED_REJECT`], as the sweep skips it.
 ///
 /// A position CROSSED in force is judged on its ACCOUNT instead (cross P3): the account-level
 /// check, then — below cross maintenance — the liquidation episode starting at `marketId`, with a
@@ -454,18 +517,29 @@ pub fn run_liquidate<H: PerpHost>(
             Ok(Bytes::new())
         }
         LiquidationOutcome::NoPosition => Err(perp_err("liquidate: no open position")),
-        // An ISOLATED position above its own maintenance: nothing written (`liquidate_position`
-        // validates before it writes). For a FLAGGED account the call is the episode's instead —
-        // a keeper told "any `marketId`" may well pick the market of a healthy isolated position
-        // (P3 review) — and the episode judges the account for itself.
-        LiquidationOutcome::AboveMaintenance => {
+        // An ISOLATED position above its own maintenance, or one that cannot be valued at the mark
+        // (J4): nothing written (`liquidate_position` validates before it writes). For a FLAGGED
+        // account the call is the episode's instead — a keeper told "any `marketId`" may well pick
+        // the market of a healthy isolated position (P3 review) — and the episode judges the
+        // account for itself.
+        outcome @ (LiquidationOutcome::AboveMaintenance | LiquidationOutcome::Faulted) => {
             if storage::load_account_ref(context, args.user)?.in_liquidation() {
                 return run_liquidate_episode(context, args.user, args.marketId, caller);
             }
-            Err(perp_err("liquidate: position is above maintenance margin"))
+            Err(perp_err(if outcome == LiquidationOutcome::Faulted {
+                LIQUIDATE_FAULTED_REJECT
+            } else {
+                "liquidate: position is above maintenance margin"
+            }))
         }
     }
 }
+
+/// `liquidate()`'s refusal for an ISOLATED position whose valuation at the mark leaves the
+/// representable range (J4 — its notional, its pending funding or its maintenance requirement
+/// overflows): nothing written. The sweep skips such a position the same way.
+pub(crate) const LIQUIDATE_FAULTED_REJECT: &str =
+    "liquidate: position cannot be valued at the mark price";
 
 /// `liquidate()`'s cross route: the account-level episode for `user` starting at `market_id`, with
 /// a fresh [`cross_liquidation::MANUAL_CROSS_STEP_BUDGET`] steps and [`ADL_BUDGET_PER_UPDATE`] ADL
@@ -538,7 +612,8 @@ const ADL_BUDGET_PER_UPDATE: u32 = 128;
 ///
 /// Each candidate is attempted under its own journal checkpoint:
 /// - an ISOLATED position ([`liquidate_position`]): `Liquidated` → commit the writes; healthy /
-///   stale (`AboveMaintenance` / `NoPosition`) → revert (the sweep leaves no trace);
+///   stale / unvaluable (`AboveMaintenance` / `NoPosition` / `Faulted`, J4) → revert (the sweep
+///   leaves no trace — no event, no deferral, as the cross episode does for a leg it cannot price);
 /// - a position CROSSED in force: judged on its ACCOUNT (`E < Σ_C MM`, the total health check
 ///   `margin::view::cross_health` — the account, its cross-leg blob and the legs' markets, no
 ///   position walk, cross P4) by the cross episode (`cross_liquidation::liquidate_cross_account`),
@@ -546,8 +621,9 @@ const ADL_BUDGET_PER_UPDATE: u32 = 128;
 ///   else → commit. The registry is a SET, so an account is processed at most once per sweep,
 ///   however many of its markets an episode touches.
 ///
-/// Any other error after the liquidatability check is a commit-only invariant failure and aborts
-/// the node rather than allowing a partial write set.
+/// Both are TOTAL up to their first write (J4): what cannot be valued is skipped, so the only `Err`
+/// either returns before writing is the storage layer's. That, or any `Err` after the first write
+/// (a commit-only invariant failure), aborts the node rather than allowing a partial write set.
 fn run_liquidation_sweep<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -592,7 +668,8 @@ fn run_liquidation_sweep<H: PerpHost>(
         // commit-only (#23): healthy candidates are write-free (funding is computed in memory
         // and only applied when liquidatable), so the checkpoint only balances EVM-side state.
         // A liquidation that FAILS mid-apply would leave partial perp writes with no undo — a
-        // corruption-anyway condition: halt loudly rather than skip silently.
+        // corruption-anyway condition: halt loudly rather than skip silently. An `Err` before the
+        // first write is a storage-layer one (the check phases are total, J4): halted on too.
         let cp = context.checkpoint();
         let wrote = if crossed {
             let caller = cross_liquidation::EpisodeCaller {
@@ -635,11 +712,12 @@ fn run_liquidation_sweep<H: PerpHost>(
                     *budget -= 1;
                     true
                 }
-                // AboveMaintenance / NoPosition: zero perp writes were made.
+                // AboveMaintenance / NoPosition / Faulted: zero perp writes were made.
                 Ok(_) => false,
                 Err(e) => {
                     panic!(
-                        "liquidation sweep: liquidate_position failed mid-apply (commit-only invariant): {e:?}"
+                        "liquidation sweep: an isolated liquidation failed — a storage-layer error, \
+                         or an error after its first write (commit-only invariant): {e:?}"
                     );
                 }
             }
