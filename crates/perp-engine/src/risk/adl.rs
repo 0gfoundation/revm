@@ -474,6 +474,31 @@ fn run_adl_fills<H: PerpHost>(
             }
         }
         let mut winner_account = storage::load_account(context, winner)?;
+        // ── TOTAL (J4): a winner whose pending funding cannot be settled is passed over ──────────
+        //
+        // The ranking put such a holder in the fallback tier (its effective margin is unknown), but
+        // filling it settles that funding first, and an `Err` from the settle here comes after the
+        // writes of every earlier fill of this ADL — inside the sweep, a halt on every tick. So the
+        // settle's own arithmetic runs first, pure: the same `pending_funding_payment`, and the same
+        // `checked_add` onto the cross wallet (CROSSED) or the silo (ISOLATED) as
+        // `compute_funding_settlement`. A fault is a skip with nothing written — the holder is passed
+        // over like one `adl_fill` cannot value — and what the settle can still raise below is the
+        // storage layer's (or its header's account aggregates), as for the loser.
+        let settles = crate::risk::funding::pending_funding_payment(funding_index, &winner_pos, market)
+            .ok()
+            .and_then(|payment| {
+                if crate::margin::margin_type::effective_margin_type(&winner_pos)
+                    == crate::types::MarginType::Crossed
+                {
+                    winner_account.perp_wallet_balance.checked_add(payment)
+                } else {
+                    winner_pos.margin.checked_add(payment)
+                }
+            })
+            .is_some();
+        if !settles {
+            continue;
+        }
         // Settle the winner's pending funding IN MEMORY before the trial, so the fill is tried on
         // the margin it really has and the close nets any funding debt. Committed (events only —
         // funding writes nothing of its own) only if the trial is accepted; a rejected candidate
