@@ -871,8 +871,11 @@ sol! {
         ///     STOP BUY / TAKE_PROFIT SELL   ->  mark >= triggerPrice
         ///     STOP SELL / TAKE_PROFIT BUY   ->  mark <= triggerPrice
         ///   Must be non-zero, a multiple of tickSize and at most the market's `maxPrice` —
-        ///   `placeAlgoOrder: triggerPrice exceeds maxPrice` (the mark never exceeds `maxPrice`, so
-        ///   a higher trigger could never fire upward and would fire on any mark downward) — and
+        ///   `placeAlgoOrder: triggerPrice exceeds maxPrice` (every oracle update holds the mark at
+        ///   or below `maxPrice`, so a higher trigger could never fire upward and would fire on any
+        ///   mark downward; an `updateMarket` that lowers `maxPrice` leaves the stored mark above it
+        ///   until the next update, and a trigger there is then either already satisfied or behaves
+        ///   the same from that update on) — and
         ///   must NOT already be satisfied by the stored mark — that is
         ///   refused with `placeAlgoOrder: order would immediately trigger` (Binance `-2021`).
         ///   Equality counts as satisfied, exactly as at the sweep. Before the first oracle tick

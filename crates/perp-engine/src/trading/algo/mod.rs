@@ -86,14 +86,20 @@
 //!
 //! # Nothing above `maxPrice` (Q4)
 //!
-//! The stored mark never exceeds `maxPrice` (`risk::index_price` holds it within `[tickSize,
-//! maxPrice]`), and a fired limit child above it is refused (`validate_place_order`). So `validate`
-//! refuses a `triggerPrice` (a trailing stop's activation price included) above `maxPrice` for
-//! every type — upward it could never fire, downward it would fire on any mark — and a limit
-//! pair's `price` above it, whose fire could only be voided (reason 10). Both read only the message
-//! and the market config, like the tick / step / `maxQuantity` checks beside them, so the signed
-//! path refuses them before the burn. `updateMarket` may lower `maxPrice` afterwards; an order
-//! placed before that is not re-checked.
+//! Every oracle update holds the mark within `[tickSize, maxPrice]` (`risk::index_price`), and a
+//! fired limit child above `maxPrice` is refused (`validate_place_order`). So `validate` refuses a
+//! `triggerPrice` (a trailing stop's activation price included) above `maxPrice` for every type —
+//! upward it could never fire, downward it would fire on any mark — and a limit pair's `price`
+//! above it, whose fire could only be voided (reason 10). Both read only the message and the
+//! market config, like the tick / step / `maxQuantity` checks beside them, so the signed path
+//! refuses them before the burn.
+//!
+//! The one window where the stored mark IS above `maxPrice`: an `updateMarket` that lowers
+//! `maxPrice` under it leaves it there until the next `updateIndexPrice` (`drainDeferredWork` runs
+//! the trigger sweep on that stored mark meanwhile). The refusal is still right in it: a trigger
+//! above `maxPrice` is then either already satisfied by the stored mark (`-2021` anyway) or certain
+//! to fire / never fire from the next update on, exactly as outside it. An order placed before the
+//! lowering is not re-checked.
 
 use crate::host::PerpHost;
 use crate::interface::IPerpDex::{
@@ -212,10 +218,12 @@ fn validate(
     if trigger_price % market.tick_size != 0 {
         return Err(perp_err("placeAlgoOrder: triggerPrice must be a multiple of tickSize"));
     }
-    // The stored mark never exceeds `maxPrice` (`risk::index_price` clamps it there), so a trigger
-    // (or a trailing stop's activation price) above it can never be reached upward, and one that
-    // fires downward is reached by every mark — `-2021` in `place_core`, after a signed path's
-    // burn. Refused HERE instead: it reads only the message and the market config, like the tick
+    // Every oracle update clamps the mark to `maxPrice` (`risk::index_price`), so a trigger (or a
+    // trailing stop's activation price) above it can never be reached upward, and one that fires
+    // downward is reached by every mark — `-2021` in `place_core`, after a signed path's burn.
+    // (Between an `updateMarket` that lowers `maxPrice` under the stored mark and the next update,
+    // such a trigger is either already `-2021` or exactly that from the update on — see the module
+    // doc.) Refused HERE instead: it reads only the message and the market config, like the tick
     // check above, so a signed request is refused before its signature is spent. Covers every
     // type; 0 (activate now) passes.
     if trigger_price > market.max_price {

@@ -222,10 +222,10 @@ fn liquidation_cancels_conditional_orders_too() {
 
 /// Q4: `maxPrice` bounds a conditional at PLACEMENT — its limit `price` (the child's own bound,
 /// which a fire would otherwise hit and void with reason 10) and its `triggerPrice` for every type
-/// (the stored mark never exceeds `maxPrice`, so an upward trigger above it could never fire and a
-/// downward one would fire on any mark). `maxPrice` itself is accepted, `maxPrice + tick` refused,
-/// write-clean and without spending a nonce. The fixture market: tick 1, maxPrice 1_000_000,
-/// mark 10_000.
+/// (every oracle update holds the mark at or below `maxPrice`, so an upward trigger above it could
+/// never fire and a downward one would fire on any mark). `maxPrice` itself is accepted,
+/// `maxPrice + tick` refused, write-clean and without spending a nonce. The fixture market: tick 1,
+/// maxPrice 1_000_000, mark 10_000.
 #[test]
 fn prices_above_max_price_are_refused_at_placement() {
     const MAX: u64 = 1_000_000;
