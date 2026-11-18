@@ -203,3 +203,51 @@ fn a_year_of_oracle_silence_settles_one_epoch_and_jumps_to_the_next_boundary() {
     assert_eq!(decode_events::<FundingRateComputed>(&logs).len(), 1);
     assert_eq!(mark_price_events(&logs)[0].nextFundingTime, t2 + 1);
 }
+
+// ── Write-clean funding failures ─────────────────────────────────────────────────────────────────
+
+/// The largest multiple of 15: a `fundingInterval` that overflows the funding clock on any push.
+const HUGE_FUNDING_INTERVAL: u64 = u64::MAX - u64::MAX % 15;
+
+/// The funding step's refusals are write-clean: every fallible step of the premium sample and
+/// the epoch rollover runs before the push's first write (commit-only #23). Driven by the funding
+/// clock overflowing on a huge interval, with the market saved directly: one set BEFORE the
+/// first push overflows `window + interval`; one set AFTER funding started overflows the
+/// rollover's next boundary. Both used to write the index, mode and mark and then revert, which
+/// the call shell's tripwire turns into a panic in a debug build.
+#[test]
+fn a_push_whose_funding_step_fails_is_refused_with_nothing_written() {
+    const OVERFLOW: &str = "index price update: next funding timestamp overflow";
+    let set_funding_interval = |ctx: &mut TestCtx, fi: u64| {
+        let mut market = storage::load_market(ctx, MARKET_ID).unwrap().unwrap();
+        market.funding_interval = fi;
+        storage::save_market(ctx, &market).unwrap();
+    };
+    let mark = |ctx: &mut TestCtx| storage::load_mark_price(ctx, MARKET_ID).unwrap();
+
+    // Before the first push: `effective_timestamp + interval`.
+    let mut ctx = ctx_at(1_000_000);
+    set_funding_interval(&mut ctx, HUGE_FUNDING_INTERVAL);
+    let mark_before = mark(&mut ctx);
+    refused_as(&mut ctx, ADMIN, 1_000_000, OVERFLOW);
+    assert_eq!(mark(&mut ctx), mark_before);
+    assert_eq!(storage::load_premium_accumulator(&mut ctx, MARKET_ID).unwrap().epoch_start_ts, 0);
+
+    // After funding started: the rollover's next boundary.
+    let mut ctx = ctx_at(1_000_000);
+    set_funding_interval(&mut ctx, 15);
+    accepted(&mut ctx, 1_000_000);
+    assert_eq!(storage::load_funding_state(&mut ctx, MARKET_ID).unwrap().next_funding_ts, 1_000_005);
+    set_funding_interval(&mut ctx, HUGE_FUNDING_INTERVAL);
+    ctx.block.timestamp = U256::from(1_000_020);
+    let mark_before = mark(&mut ctx);
+    let acc_before = storage::load_premium_accumulator(&mut ctx, MARKET_ID).unwrap();
+    refused_as(&mut ctx, ADMIN, 1_000_020, OVERFLOW);
+    assert_eq!(mark(&mut ctx), mark_before);
+    assert_eq!(storage::load_premium_accumulator(&mut ctx, MARKET_ID).unwrap(), acc_before);
+
+    // The config repaired, the same push goes through.
+    set_funding_interval(&mut ctx, 15);
+    accepted(&mut ctx, 1_000_020);
+    assert_eq!(storage::load_funding_state(&mut ctx, MARKET_ID).unwrap().next_funding_ts, 1_000_035);
+}

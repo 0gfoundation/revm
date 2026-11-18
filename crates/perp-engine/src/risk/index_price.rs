@@ -33,9 +33,12 @@ pub const ORACLE_FUTURE_TIMESTAMP_REJECT: &str =
 /// market's `priceUpdateInterval` and ignored when that window is not newer than the stored one.
 ///
 /// Steps:
-/// 1. Compute Price1, Price2, ContractPrice and take their median as mark price.
-/// 2. Save the new index price state.
-/// 4. Snap mark price to tick_size and persist it.
+/// 1. Compute Price1, Price2, ContractPrice and take their median, snapped to tick_size, as mark
+///    price.
+/// 2. Compute the premium sample and any funding-epoch rollover — every fallible step, before
+///    the first write.
+/// 3. Persist the index, mark and funding state.
+/// 4. Run the band expiry and the liquidation sweep.
 /// 5. Emit the single merged `MarkPriceUpdated` (index + mark + components + funding state).
 pub fn run_update_index_price<H: PerpHost>(
     input_bytes: &[u8],
@@ -289,39 +292,21 @@ fn apply_index_price_update<H: PerpHost>(
         raw_mark.min(market.max_price).max(1)
     };
 
-    // ── 4. Persist index price + mark price ──────────────────────────────────
-    storage::save_index_price_state(
-        context,
-        market_id,
-        &IndexPriceState {
-            index_price: index_price,
-            timestamp: effective_timestamp,
-        },
-    )?;
-    if let Some((mut index_history, max_index_checkpoints)) = legacy_history {
-        index_history.push(
-            IndexPriceState {
-                index_price: index_price,
-                timestamp: effective_timestamp,
-            },
-            max_index_checkpoints,
-        );
-        storage::save_index_price_history(context, market_id, &index_history)?;
-    }
-    if let Some(basis) = &ewma_basis {
-        storage::save_price_basis_ewma(context, market_id, basis)?;
-    }
-    storage::save_index_mode_state(context, market_id, mode)?;
-    storage::save_mark_price(context, market_id, mark_price)?;
-
-    // ── 5. Accumulate premium index for funding rate calculation ──────────────
+    // ── 2. Premium index + funding epoch, COMPUTED before the first write ─────
+    // Every fallible step of the funding update — the premium index, the slot fill, the epoch
+    // average, the cumulative-index fold and both funding-clock advances — runs here, on values
+    // already loaded, so a refusal reverts with nothing written (commit-only #23). The writes
+    // themselves follow in step 3, in the order they always ran.
     let mut computed_rate: Option<(i64, i64, u64)> = None; // (rate, avg_pi, sample_count)
     // What `MarkPriceUpdated` publishes: the rate THIS epoch would settle at if it ended now.
     // Seeded with the last settled rate so a market with funding disabled (`funding_interval == 0`,
     // the block below never runs) still reports something meaningful rather than zero.
     let mut predicted_rate = funding.last_funding_rate;
+    // What step 3 persists for funding: (whether `funding` is saved, the accumulator).
+    let mut funding_writes: Option<(bool, PremiumIndexAccumulator)> = None;
     if market.funding_interval > 0 {
         let mut acc = storage::load_premium_accumulator(context, market_id)?;
+        let mut save_funding = false;
 
         // PI = (mark_price − index_price) × FUNDING_RATE_ONE / index_price
         let pi = ((mark_price as i128 - index_price as i128)
@@ -342,7 +327,7 @@ fn apply_index_price_update<H: PerpHost>(
             }
         }
 
-        // Epoch boundary: compute and store new funding rate, reset accumulator.
+        // Epoch boundary: compute the new funding rate, reset accumulator.
         if effective_timestamp >= funding.next_funding_ts {
             let epoch_last_slot_ts = funding
                 .next_funding_ts
@@ -371,7 +356,7 @@ fn apply_index_price_update<H: PerpHost>(
                 market.funding_interval,
             )
             .ok_or_else(|| perp_err("index price update: next funding timestamp overflow"))?;
-            storage::save_funding_state(context, market_id, &funding)?;
+            save_funding = true;
 
             acc = PremiumIndexAccumulator::default();
             acc.start_epoch(
@@ -383,7 +368,7 @@ fn apply_index_price_update<H: PerpHost>(
         } else if acc.epoch_start_ts > 0 || funding.next_funding_ts > 0 {
             acc.fill_slots_until(effective_timestamp, market.price_update_interval, Some(pi))?;
             // Save updated next_funding_ts if it was just initialized.
-            storage::save_funding_state(context, market_id, &funding)?;
+            save_funding = true;
         }
 
         // Recomputed on EVERY push, from the accumulator as it now stands — after this sample was
@@ -391,10 +376,42 @@ fn apply_index_price_update<H: PerpHost>(
         // One i128 division; no new storage, and `market.interest_rate` is already loaded.
         predicted_rate = calc_funding_rate(acc.average()?, market.interest_rate);
 
-        storage::save_premium_accumulator(context, market_id, &acc)?;
+        funding_writes = Some((save_funding, acc));
     }
 
-    // ── 5b. Protocol-automatic liquidation sweep ────────────────────────────────
+    // ── 3. Persist index price, mark price, funding state ─────────────────────
+    // The first write: every decision this update makes is above it.
+    storage::save_index_price_state(
+        context,
+        market_id,
+        &IndexPriceState {
+            index_price: index_price,
+            timestamp: effective_timestamp,
+        },
+    )?;
+    if let Some((mut index_history, max_index_checkpoints)) = legacy_history {
+        index_history.push(
+            IndexPriceState {
+                index_price: index_price,
+                timestamp: effective_timestamp,
+            },
+            max_index_checkpoints,
+        );
+        storage::save_index_price_history(context, market_id, &index_history)?;
+    }
+    if let Some(basis) = &ewma_basis {
+        storage::save_price_basis_ewma(context, market_id, basis)?;
+    }
+    storage::save_index_mode_state(context, market_id, mode)?;
+    storage::save_mark_price(context, market_id, mark_price)?;
+    if let Some((save_funding, acc)) = &funding_writes {
+        if *save_funding {
+            storage::save_funding_state(context, market_id, &funding)?;
+        }
+        storage::save_premium_accumulator(context, market_id, acc)?;
+    }
+
+    // ── 4. Protocol-automatic liquidation sweep ─────────────────────────────────
     // The new mark + funding are now persisted. Liquidate any position that fell
     // below maintenance, synchronously inside this oracle tx (so Liquidation logs
     // attach to this receipt, and there is zero window before the sweep runs).
@@ -414,7 +431,7 @@ fn apply_index_price_update<H: PerpHost>(
         "liquidation sweep: the band centre must be the mark the maintenance check uses"
     );
 
-    // ── 5c. Out-of-band resting-order expiry, BEFORE the sweep ──────────────────
+    // ── 4b. Out-of-band resting-order expiry, BEFORE the sweep ──────────────────
     // The band just moved, which is the only thing that strands a level at the touch, so this is
     // where those levels are created and where they are collected. It runs FIRST because the levels
     // it removes are unmatchable to the sweep anyway (same band, same mark), so it cannot change
@@ -423,7 +440,7 @@ fn apply_index_price_update<H: PerpHost>(
     // Capped; see MAX_BAND_EXPIRIES_PER_UPDATE.
     run_deferred_sweeps(context, market_id, &market, effective_timestamp, mark_price, true)?;
 
-    // ── 6. Emit events ────────────────────────────────────────────────────────
+    // ── 5. Emit events ────────────────────────────────────────────────────────
     // ONE price event per update. This used to be `IndexPriceUpdated` immediately followed by
     // `MarkPriceUpdated` describing the same mark under a different field name, which every
     // consumer then had to de-duplicate; the two are merged.
