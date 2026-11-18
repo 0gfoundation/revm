@@ -187,6 +187,66 @@ fn a_normal_order_resting_behind_leaves_it_alone() {
     );
 }
 
+/// `user`'s open order ids in `getOpenOrders` order: buys, then sells, each in its list order.
+fn open_order_ids(ctx: &mut TestCtx, user: Address) -> Vec<[u8; 32]> {
+    use crate::interface::IPerpDex::getOpenOrdersCall;
+    let out = run_perp_dex_call(
+        &getOpenOrdersCall { user, marketId: MARKET_ID }.abi_encode(),
+        10_000_000,
+        user,
+        U256::ZERO,
+        true,
+        ctx,
+    )
+    .unwrap();
+    let ids = getOpenOrdersCall::abi_decode_returns(&out.bytes).unwrap().orderIds;
+    ids.iter().map(|id| id.0).collect()
+}
+
+/// Q11: same-price entries keep their ARRIVAL order (FIFO) in the owner's list, and the eviction
+/// pass takes the farthest reduce-only order and, among equally far ones, the EARLIEST placed
+/// (`reduce_only::next_eviction`, design note: 同价 → FIFO). Long 2 lots; two reduce-only sells A
+/// then B of one lot each at $105 fill the prefix exactly (0 + 2 ≤ 2); a normal sell of one lot
+/// at $101 rests nearer the touch, so 1 + 2 > 2 and exactly one goes — A — leaving 1 + 1 ≤ 2.
+#[test]
+fn same_price_reduce_only_sells_are_evicted_oldest_first() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    seed_long(&mut ctx, ALICE, 2);
+    let a = place_flagged(&mut ctx, ALICE, 1, PRICE + 5 * TICK, QTY, RO).unwrap();
+    let b = place_flagged(&mut ctx, ALICE, 1, PRICE + 5 * TICK, QTY, RO).unwrap();
+    assert_eq!(open_order_ids(&mut ctx, ALICE), vec![a, b], "same price: arrival order");
+    let _ = cancel_reasons(&mut ctx); // drain
+
+    let n = place_flagged(&mut ctx, ALICE, 1, PRICE + TICK, QTY, 0).unwrap();
+
+    assert_eq!(cancel_reasons(&mut ctx), vec![CancelReason::ReduceOnlyOvertaken as u8]);
+    assert!(storage::load_order(&mut ctx, &a).unwrap().is_none(), "the OLDEST goes first");
+    assert!(storage::load_order(&mut ctx, &b).unwrap().is_some());
+    assert_eq!(open_order_ids(&mut ctx, ALICE), vec![n, b]);
+}
+
+/// The buy-side mirror (the buy list is price-DESCENDING, so its tie insert is the other
+/// comparison): short 2 lots (`seed_long` with a negative lot count), reduce-only buys A then B of
+/// one lot at $95, a normal buy of one lot at $99 rests nearer the touch — A is evicted.
+#[test]
+fn same_price_reduce_only_buys_are_evicted_oldest_first() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+    seed_long(&mut ctx, ALICE, -2);
+    let a = place_flagged(&mut ctx, ALICE, 0, PRICE - 5 * TICK, QTY, RO).unwrap();
+    let b = place_flagged(&mut ctx, ALICE, 0, PRICE - 5 * TICK, QTY, RO).unwrap();
+    assert_eq!(open_order_ids(&mut ctx, ALICE), vec![a, b], "same price: arrival order");
+    let _ = cancel_reasons(&mut ctx); // drain
+
+    let n = place_flagged(&mut ctx, ALICE, 0, PRICE - TICK, QTY, 0).unwrap();
+
+    assert_eq!(cancel_reasons(&mut ctx), vec![CancelReason::ReduceOnlyOvertaken as u8]);
+    assert!(storage::load_order(&mut ctx, &a).unwrap().is_none(), "the OLDEST goes first");
+    assert!(storage::load_order(&mut ctx, &b).unwrap().is_some());
+    assert_eq!(open_order_ids(&mut ctx, ALICE), vec![n, b]);
+}
+
 fn placed_quantities(ctx: &mut TestCtx) -> Vec<u64> {
     use crate::interface::IPerpDex::OrderPlaced;
     JournalTr::take_logs(ctx.journal_mut())

@@ -3856,6 +3856,28 @@ fn taker_fill_cancels_worst_same_side_order_to_cover_opening_margin() {
     assert_eq!(available(&mut ctx, ALICE), 0);
 }
 
+/// Q11: the cover loop pops the BACK of the owner's same-side list — the farthest price and, at
+/// that price, the LAST placed — so of two same-price buys the newer one goes and the older keeps
+/// its queue position. Same numbers as the test above with both buys at $98: cancelling one frees
+/// 980_000, which with the 20_000 already free funds the 1_000_000 opening margin exactly.
+#[test]
+fn taker_cover_cancels_the_newest_of_same_price_orders_first() {
+    let mut ctx = make_ctx();
+    setup(&mut ctx);
+
+    let older = place(&mut ctx, ALICE, 0, PRICE - 2 * TICK, QTY, 0, 0);
+    let newer = place(&mut ctx, ALICE, 0, PRICE - 2 * TICK, QTY, 0, 0);
+    place(&mut ctx, BOB, 1, PRICE, QTY, 0, 0); // resting ask
+    set_available(&mut ctx, ALICE, (INIT_MARGIN + TAKER_FEE - 980_000) as i64);
+
+    let market_buy = place(&mut ctx, ALICE, 0, 0, QTY, 1, 1);
+
+    assert_terminal(&mut ctx, market_buy);
+    assert_terminal(&mut ctx, newer);
+    assert_eq!(get_order(&mut ctx, older).status, OrderStatus::Open);
+    assert_eq!(available(&mut ctx, ALICE), 0);
+}
+
 #[test]
 fn partial_fill_leaves_maker_partially_filled_in_book() {
     let mut ctx = make_ctx();
