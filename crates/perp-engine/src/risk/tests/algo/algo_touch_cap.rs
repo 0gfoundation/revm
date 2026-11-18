@@ -470,3 +470,5 @@ fn t16_a_keeper_drain_loop_terminates_after_ceil_book_over_64_fires() {
 
 // Adversarial cases from the breaker pass.
 mod adversarial;
+// Q3: an oversized closePosition closes in maxQuantity tranches (the same re-arm).
+mod close_position_tranches;
