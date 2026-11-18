@@ -2735,6 +2735,61 @@ fn a_maker_capped_cross_rest_still_adls_once_the_book_runs_out() {
     assert_eq!(sigma_amount(&mut ctx, M1, &[ALICE, BOB], 130), 0);
 }
 
+/// **A cross close whose capped walk filled NOTHING goes to ADL** (Q6 review). 130 makers rest a
+/// bid at $80 at a stored 50x while M1's tier 0 admits it; `setMarginTiers` then lowers tier 0 to
+/// 20x, so the per-open tier guard — which covers CROSSED makers — refuses each at its fill
+/// (cancelled `MakerInsolvent`). An honest bid of 135 rests behind them. The tick's IOC spends the
+/// 128-maker cap on refused makers and fills nothing: no evidence of liquidity, so the rest is not
+/// left to the drain — ALICE's 135 go to BOB by ADL at the mark (`E = $50 ≥ 0`) in the same pass,
+/// nothing is deferred, and the episode ends.
+#[test]
+fn a_maker_capped_cross_close_that_filled_nothing_goes_to_adl() {
+    use crate::interface::IPerpDex::setMarginTiersCall;
+    let tiers = |max_leverage: u32| {
+        setMarginTiersCall {
+            marketId: M1,
+            lowerBounds: vec![0],
+            maxLeverages: vec![max_leverage],
+            maintMarginRatesPpm: vec![0],
+            notionalCap: 0,
+        }
+        .abi_encode()
+    };
+    let mut ctx = make_ctx();
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 135);
+    set_wallet(&mut ctx, ALICE, usd(2_750));
+    ok(&mut ctx, ADMIN, &tiers(50));
+    for i in 0..130 {
+        let maker = capped_maker(i);
+        JournalTr::load_account(ctx.journal_mut(), maker).unwrap();
+        let a = UserAccount { perp_wallet_balance: WALLET, ..UserAccount::default() };
+        storage::save_account(&mut ctx, maker, a, AccountUpdateReason::Adjustment).unwrap();
+        set_leverage(&mut ctx, maker, M1, 50);
+        rest(&mut ctx, maker, M1, BUY, px(80), 1);
+    }
+    let honest = capped_maker(1_000);
+    JournalTr::load_account(ctx.journal_mut(), honest).unwrap();
+    let a = UserAccount { perp_wallet_balance: WALLET, ..UserAccount::default() };
+    storage::save_account(&mut ctx, honest, a, AccountUpdateReason::Adjustment).unwrap();
+    rest(&mut ctx, honest, M1, BUY, px(80), 135);
+    ok(&mut ctx, ADMIN, &tiers(20));
+    storage::flush_account_snapshots(&mut ctx).unwrap();
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let logs = tick(&mut ctx, M1, px(80));
+    assert!(evs::<Trade>(&logs).is_empty(), "every maker the walk reached was refused");
+    let cancels: Vec<(Address, u8)> =
+        evs::<OrderCancelled>(&logs).iter().map(|c| (c.user, c.reason)).collect();
+    assert_eq!(cancels.len(), 128);
+    assert!(cancels.iter().all(|&(u, r)| u != honest && r == 2), "MakerInsolvent: {cancels:?}");
+    assert_eq!(adls(&logs), [(ALICE, BOB, M1, 135, px(80))], "ADL'd in the same pass");
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    assert_eq!(pos(&mut ctx, BOB, M1).amount, 0);
+    assert_eq!(deferred_of(&mut ctx, M1), 0);
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_eq!(storage::load_bid_count(&mut ctx, M1, px(80)).unwrap(), 3, "2 refused + honest");
+}
+
 /// **The cap decides when, never what: a capped market is finished before the episode moves on.**
 /// ALICE also holds 10 long in M2 (wallet $2,950: `E = 2_950_000_000` vs `Σ MM = 2_416_666_666`),
 /// with MAKER bidding 10 @ $100 there. The tick of M1 caps after 128 fills — `E` $250 against

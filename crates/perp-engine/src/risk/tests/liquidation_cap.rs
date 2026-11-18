@@ -322,3 +322,68 @@ fn exactly_128_makers_is_the_book_running_out_not_the_cap() {
     assert_eq!(bids_at_ninety(&mut ctx), 0);
     assert_eq!(deferred_work(&mut ctx), 0);
 }
+
+/// **A maker-capped pass that closed NOTHING goes to ADL** — orders refused at every fill cannot
+/// stretch a liquidation over passes (Q6 review). 130 accounts each rest two 1-lot bids at $90 at a
+/// stored 50x while tier 0 admits it; `setMarginTiers` then lowers tier 0 to 20x, so the per-open
+/// tier guard refuses every one of those bids at its fill (cancelled `MakerInsolvent`). An honest
+/// bid of 133 rests behind them, and ALICE's 133 long is liquidatable at $90.
+///
+/// The tick's book leg spends the 128-maker cap cancelling phantoms and fills nothing. It used to
+/// defer the rest anyway, and each further pass did the same until the phantoms ran out — three
+/// passes here, indefinitely for an attacker who restuffs them. Now the rest goes to ADL in the
+/// same pass, against WHALE at the mark (ALICE's equity there is exactly 0: solvent), and nothing is
+/// deferred. A capped pass that DID fill something still defers (the tests above).
+#[test]
+fn a_maker_capped_pass_that_closed_nothing_goes_to_adl() {
+    use crate::interface::IPerpDex::OrderCancelled;
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0], &[50]).unwrap();
+    let qty = 133u64;
+    let v = calc_value(ENTRY_PRICE, qty, 0, PRICE_DECIMALS).unwrap() as i64;
+    seed_position_account(&mut ctx, ALICE, qty as i64, -v, v / 10, 10, 0);
+    seed_position_account(&mut ctx, WHALE, -(qty as i64), v, v, 1, 0);
+    let phantoms: Vec<Address> = (0..130).map(indexed_maker).collect();
+    for &m in &phantoms {
+        storage::save_account(
+            &mut ctx,
+            m,
+            UserAccount { perp_wallet_balance: 200_000_000, ..UserAccount::default() },
+            AccountUpdateReason::Adjustment,
+        )
+        .unwrap();
+        run_set_leverage(&setLeverageCall { marketId: MARKET_ID, leverage: 50 }.abi_encode(), m, &mut ctx)
+            .unwrap();
+    }
+    for _ in 0..2 {
+        for &m in &phantoms {
+            place_order(&mut ctx, m, Side::Buy as u8, LONG_LIQ_PRICE, 1);
+        }
+    }
+    let honest = indexed_maker(10_000);
+    storage::save_account(
+        &mut ctx,
+        honest,
+        UserAccount { perp_wallet_balance: 20_000_000_000, ..UserAccount::default() },
+        AccountUpdateReason::Adjustment,
+    )
+    .unwrap();
+    place_order(&mut ctx, honest, Side::Buy as u8, LONG_LIQ_PRICE, qty);
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0], &[20]).unwrap();
+    assert_eq!(bids_at_ninety(&mut ctx), 261);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let logs = tick_to_ninety(&mut ctx);
+    assert!(decode_events::<Trade>(&logs).is_empty(), "every maker the walk reached was refused");
+    let cancels: Vec<(Address, u8)> =
+        decode_events::<OrderCancelled>(&logs).iter().map(|c| (c.user, c.reason)).collect();
+    assert_eq!(cancels.len(), MAX_LIQUIDATION_MAKER_ACCOUNTS);
+    assert!(cancels.iter().all(|&(u, r)| u != honest && r == CancelReason::MakerInsolvent as u8));
+    assert_eq!(adl_fills(&logs), [(ALICE, WHALE, qty, LONG_LIQ_PRICE)], "ADL'd in the same pass");
+    assert_eq!(liquidation_rows(&logs), [(qty as i64, 0)]);
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    assert_eq!(position(&mut ctx, WHALE).amount, 0);
+    assert_eq!(deferred_work(&mut ctx), 0, "nothing deferred: the pass closed nothing on the book");
+    assert_eq!(bids_at_ninety(&mut ctx), 261 - MAX_LIQUIDATION_MAKER_ACCOUNTS as u64);
+}
