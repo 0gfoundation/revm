@@ -317,15 +317,16 @@ pub fn position_value_fits_i64(
 /// The position-size bound of `market` (Q7): a position of `amount` fits it when it is worth at
 /// most `i64::MAX` quote units at `max(maxPrice, mark_price)`.
 ///
-/// Every OPENING fill — taker and maker — is held to it, and `updateMarket` refuses to raise
-/// `maxPrice` past an open position that would break it. Every price a position is later valued or
-/// filled at is at or below that ceiling: the mark is clamped to `maxPrice` on each oracle update
-/// (the `max` covers the stored mark an `updateMarket` that LOWERS `maxPrice` leaves above it until
-/// the next update), and no fill executes above `maxPrice` ([`market_band_bounds`]). So no
-/// valuation of a position — its notional at the mark, the summed closing value of a liquidation
-/// that takes it through the book in one pass — can leave the `i64` range the sweep would
-/// otherwise halt on. Funding is the one input it does not bound: a
-/// payment past `i64` needs more than 100% of the notional accrued unsettled.
+/// Every OPENING fill — taker and maker — is held to it (and every resting order that can open,
+/// filled in full at its own price), and `updateMarket` refuses to raise `maxPrice` past an open
+/// position that would break it. Every price a position is later valued or filled at is at or
+/// below that ceiling: the mark is clamped to `maxPrice` on each oracle update (the `max` covers
+/// the stored mark an `updateMarket` that LOWERS `maxPrice` leaves above it until the next update),
+/// and no fill executes above `maxPrice` ([`market_band_bounds`]). So no valuation of a position —
+/// its notional at the mark, the summed closing value of a liquidation that takes it through the
+/// book in one pass — can leave the `i64` range the sweep would otherwise halt on. Funding is the
+/// one input it does not bound: a payment past `i64` needs more than 100% of the notional accrued
+/// unsettled.
 #[inline]
 pub fn position_fits_market(market: &Market, mark_price: u64, amount: i64) -> bool {
     position_value_fits_i64(

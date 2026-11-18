@@ -3883,7 +3883,9 @@ fn notional_cap_refuses_an_opening_taker_at_the_cap() {
 }
 
 /// The maker leg: a resting order whose fill would take the maker to the cap is cancelled instead
-/// of filled — the same route as a tier refusal.
+/// of filled — the same route as a tier refusal. ALICE takes with an IOC: a GTC's rest of 2 would
+/// itself be past the cap, and an opening rest is refused like an opening fill (`-2027`), which
+/// would revert the whole order — the maker leg included.
 #[test]
 fn notional_cap_refuses_the_maker_leg_too() {
     let mut ctx = make_ctx();
@@ -3901,7 +3903,24 @@ fn notional_cap_refuses_the_maker_leg_too() {
     place_order(&mut ctx, MAKER, Side::Sell as u8, ENTRY_PRICE, 2);
     install_capped_default(&mut ctx, 150_000_000);
 
-    try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap();
+    let err = try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 2).unwrap_err();
+    assert_eq!(err.to_string(), "placeOrder: -2027 position exceeds the market's maximum notional");
+    run_place_order(
+        &placeOrderCall {
+            marketId: MARKET_ID,
+            side: Side::Buy as u8,
+            price: ENTRY_PRICE,
+            quantity: 2,
+            orderType: 0,
+            tif: 1, // IOC
+            clientOrderId: FixedBytes::default(),
+            flags: 0,
+        }
+        .abi_encode(),
+        ALICE,
+        &mut ctx,
+    )
+    .unwrap();
 
     assert_eq!(position(&mut ctx, MAKER).amount, 0, "maker fill refused");
     assert_eq!(position(&mut ctx, ALICE).amount, 0, "nothing matched");
@@ -4732,6 +4751,9 @@ fn liquidate_closes_the_book_unfillable_residual_by_adl_at_mark() {
 fn liquidate_clears_the_open_order_requirement_without_refunding_anything() {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
+    // A table that admits the position's 5x, so its opening bid may rest (an opening rest is held
+    // to the tier guard of its fill), at the default table's 1/6 maintenance rate.
+    set_margin_tiers_with_rates(&mut ctx, ADMIN, MARKET_ID, &[0], &[5], &[166_667]).unwrap();
     save_position(&mut ctx, QTY, -ENTRY_VALUE);
     // A real resting bid, deep enough not to be hit by the liquidation's market sell (the fill
     // band around the $90 mark is [$81, $99]). 3 units @ $27.00 = 81_000_000 of `Bid`; against

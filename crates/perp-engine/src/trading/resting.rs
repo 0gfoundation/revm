@@ -98,6 +98,11 @@ pub(super) enum RestOutcome {
     /// The order can open, its account holds cross exposure, and `E − OpenLoss < Σ_C MM` — J1 at
     /// rest (R2). Raised with the taker J1's string (`CROSS_MAINTENANCE_REJECT`, `-2019`).
     RefusedUnderCrossMaintenance,
+    /// The order can open, and filled in full at its own price it would leave a position the
+    /// per-open guards of a fill refuse ([`open_guard_refusal`]): past the market's position bound
+    /// or the tier table's `notionalCap` (`-2027`), or in a tier whose cap is below the stored
+    /// leverage. Raised with the taker's string for the same refusal.
+    RefusedOpenGuard(&'static str),
 }
 
 pub(super) const TOO_GOOD_BEST_REJECT: &str =
@@ -139,6 +144,60 @@ fn opening_part_of_order(pos: &crate::types::PerpPosition, side: Side, qty: u64)
         _ => (0, 0),
     };
     qty.saturating_sub(offset.saturating_sub(resting))
+}
+
+/// The per-open guard a fill of this order would fail, judged at REST (Q6/Q13 review): `None` when
+/// the order cannot open (a pure reduce: it is at most the position it closes) or when, filled in
+/// full at its own `price`, the position it leaves passes both guards every opening fill meets —
+/// the market's position bound ([`crate::math::position_fits_market`], at `max(maxPrice, mark)`)
+/// and the margin-tier guard (that notional's tier must admit the stored leverage). Otherwise the
+/// refusal string the taker raises for the same cause: [`POSITION_LIMIT_REJECT`] past the bound or
+/// past the table's `notionalCap`, [`TIER_LEVERAGE_REJECT`] for a tier below the stored leverage.
+///
+/// The notional is at the order's own price, not the mark: it is the price the order fills at, and
+/// the mark at that fill is within the band of it. Pure — no storage.
+pub(super) fn open_guard_refusal(
+    market: &crate::types::Market,
+    pos: &crate::types::PerpPosition,
+    side: Side,
+    price: u64,
+    qty: u64,
+) -> Option<&'static str> {
+    // What this order alone closes of the position before it can open anything.
+    let closes = match side {
+        Side::Buy if pos.amount < 0 => pos.amount.unsigned_abs(),
+        Side::Sell if pos.amount > 0 => pos.amount.unsigned_abs(),
+        _ => 0,
+    };
+    if qty <= closes {
+        return None;
+    }
+    let signed_qty = match side {
+        Side::Buy => qty as i128,
+        Side::Sell => -(qty as i128),
+    };
+    // Past `i64` is past the bound by any measure.
+    let Ok(after) = i64::try_from(pos.amount as i128 + signed_qty) else {
+        return Some(POSITION_LIMIT_REJECT);
+    };
+    if !crate::math::position_fits_market(market, market.mark_price, after) {
+        return Some(POSITION_LIMIT_REJECT);
+    }
+    // Fits `i64` at `max(maxPrice, mark) ≥ price` (placement refuses a price above `maxPrice`), so
+    // this cannot fail; a failure would be past the bound all the same.
+    let Some(notional) =
+        calc_value(price, after.unsigned_abs(), market.base_decimals, market.price_decimals)
+            .ok()
+            .and_then(|v| i64::try_from(v).ok())
+    else {
+        return Some(POSITION_LIMIT_REJECT);
+    };
+    match crate::math::max_leverage_for_notional(&market.tiers, notional) {
+        // Past the table's terminal `notionalCap`: no leverage admits this size.
+        0 => Some(POSITION_LIMIT_REJECT),
+        cap if pos.leverage.max(1) > cap as u64 => Some(TIER_LEVERAGE_REJECT),
+        _ => None,
+    }
 }
 
 /// Binance's **Open Loss** (F8) of a resting order on a position CROSSED in force:
@@ -309,6 +368,30 @@ pub(super) fn rest_in_book<H: PerpHost>(
             // Write-clean: nothing above this point mutates, and `deferred` is dropped unflushed on
             // the way out. A clean whole-order reject.
             return Ok(RestOutcome::RefusedTooGoodBest);
+        }
+    }
+
+    // ── A rest that can open meets the per-open guards of its fill NOW (Q6/Q13 review) ──────────
+    //
+    // Every OPENING fill — taker or maker — is held to the market's position bound
+    // (`math::position_fits_market`) and to the margin-tier guard (the post-fill notional's tier must
+    // admit the stored leverage), and a maker fill either refuses is cancelled `MakerInsolvent`. A
+    // rest those guards refuse at its own price is therefore an order its owner sees accepted and
+    // resting, in the BBO, that can never trade: cancelled at its first touch. In front of a
+    // liquidation's book leg it is worse — a "phantom" that spends the distinct-maker cap and fills
+    // nothing. So the rest is held to both here, as if filled in full at its own limit price (the
+    // mark at its fill is within the band of it): refused with the taker's strings, write-clean.
+    //
+    // This is also what makes `getSymbolConfig`'s `maxNotionalValue = 0` (a `setMarginTiers` that
+    // lowered the cap under the stored leverage, Q13) mean what the ABI says — every open refused,
+    // a resting one included. A pure reduce — and a reduce-only order, which never opens — is never
+    // checked; one that would flip the position is checked on the side it opens. Judged per order,
+    // on the position as it stands (not on the whole side): a later fill can still take the
+    // position into a refusal another order's rest did not foresee — that order is then cancelled
+    // at its touch as before.
+    if !flags.reduce_only {
+        if let Some(reason) = open_guard_refusal(market, &pos_basis, side, price, qty) {
+            return Ok(RestOutcome::RefusedOpenGuard(reason));
         }
     }
 

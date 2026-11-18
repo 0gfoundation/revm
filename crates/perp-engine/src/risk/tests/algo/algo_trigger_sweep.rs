@@ -254,6 +254,9 @@ fn a_trigger_at_the_open_order_cap_still_rests() {
     use crate::trading::algo::MAX_OPEN_ORDERS_PER_MARKET;
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
+    // A table that admits the seeded 5x, so the 199 opening bids may rest (an opening rest is held
+    // to the tier guard of its fill).
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0], &[5]).unwrap();
     seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, 100_000_000_000);
     let id = place_algo(&mut ctx, ALICE, Side::Sell, AlgoOrderType::Stop, 9_900, 9_950, QTY as u64, RO);
     // 199 resting bids, inside the fill-time band so the oracle tick's band expiry leaves them

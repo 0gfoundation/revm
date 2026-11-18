@@ -23,14 +23,15 @@ use crate::{
 /// admits — Binance's `-2027`. Two causes share it: the margin-tier table's terminal
 /// `notionalCap` (no leverage admits that notional at the mark), and the market's position-size
 /// bound (`math::position_fits_market`: the position must be worth at most `i64::MAX` quote units
-/// at `max(maxPrice, mark)`). Raised by the taker's opening fill; a maker fill it refuses is
-/// cancelled `MakerInsolvent`.
+/// at `max(maxPrice, mark)`). Raised by the taker's opening fill and by a resting order that can
+/// open (`resting::open_guard_refusal`); a maker fill it refuses is cancelled `MakerInsolvent`.
 pub(crate) const POSITION_LIMIT_REJECT: &str =
     "placeOrder: -2027 position exceeds the market's maximum notional";
 
 /// The place path's per-open margin-tier refusal: the position's notional sits in a tier whose
 /// leverage cap is below the account's stored leverage for the market. Raised by the taker's opening
-/// fill; a maker fill it refuses is cancelled `MakerInsolvent`.
+/// fill and by a resting order that can open (`resting::open_guard_refusal`); a maker fill it
+/// refuses is cancelled `MakerInsolvent`.
 pub(crate) const TIER_LEVERAGE_REJECT: &str =
     "placeOrder: leverage exceeds the margin tier for this position size";
 

@@ -1309,7 +1309,7 @@ fn ensure_reduce_only_rest_room<H: PerpHost>(
     }
 }
 
-/// Both `RestOutcome` refusals, raised as the clean whole-order reject they now are.
+/// Every `RestOutcome` refusal, raised as the clean whole-order reject it is.
 ///
 /// ONE shape for both, and for every caller. `rest_in_book` decides both write-clean and flushes
 /// nothing when it refuses, so there is no longer a caller for which "raise it" is unsafe — the
@@ -1325,6 +1325,7 @@ pub(super) fn raise_rest_refusal(outcome: RestOutcome) -> Result<(), PerpError> 
             Err(perp_err(insufficient_margin_reject(cross)))
         }
         RestOutcome::RefusedUnderCrossMaintenance => Err(perp_err(CROSS_MAINTENANCE_REJECT)),
+        RestOutcome::RefusedOpenGuard(reason) => Err(perp_err(reason)),
     }
 }
 

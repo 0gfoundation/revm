@@ -301,7 +301,7 @@ fn the_requirement_is_a_step_function_of_the_position_under_a_two_sided_book() {
 /// which is continuous). This test pins the consequence on the exact fixture that used to
 /// show a 10× discontinuity.
 ///
-/// Tiers `[(0, 10x), (2_000_000, 2x)]`, position long 1 lot at leverage 10, mark $100
+/// Tiers `[(0, 10x), (2_750_000, 2x)]`, position long 1 lot at leverage 10, mark $100
 /// (`N = 1_000_000`):
 ///
 /// | resting BUY  | `Bid`     | combined  | ooIM    | (tier-capped variant) |
@@ -312,6 +312,10 @@ fn the_requirement_is_a_step_function_of_the_position_under_a_two_sided_book() {
 /// The capped variant dropped `L_eff` 10 → 2 on the second row, which re-priced the
 /// PRE-EXISTING position as well as the new order and multiplied the requirement by 10 for
 /// one extra lot. The surviving definition is linear in `Bid`: 90_000 → 180_000.
+///
+/// The boundary sits at 2_750_000 (it was 2_000_000) so that both bids may REST: an opening rest
+/// is held to the tier guard of its fill, at its own price — 3 lots @ $90 = 2_700_000, still in
+/// the 10x tier — while the combined notional (the position at the mark) still crosses it.
 #[test]
 fn the_tier_table_does_not_enter_the_open_order_requirement() {
     let tiers = MarginTiers::from_tiers(&[
@@ -321,7 +325,7 @@ fn the_tier_table_does_not_enter_the_open_order_requirement() {
             maint_margin_rate_ppm: 0,
         },
         MarginTier {
-            lower_bound_notional: 2_000_000,
+            lower_bound_notional: 2_750_000,
             max_leverage: 2,
             maint_margin_rate_ppm: 0,
         },

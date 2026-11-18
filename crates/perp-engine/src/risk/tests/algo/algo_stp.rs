@@ -12,6 +12,9 @@ const MAKER_BID: u64 = 9_940;
 fn fixture(own_bid: bool) -> (TestCtx, Option<[u8; 32]>) {
     let mut ctx = make_ctx();
     setup_market(&mut ctx);
+    // A table that admits the seeded 5x, so ALICE's own opening bid may rest (an opening rest is
+    // held to the tier guard of its fill).
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0], &[5]).unwrap();
     seed_position_account(&mut ctx, ALICE, QTY, -ENTRY_VALUE, MARGIN, 5, USER_WALLET as i64);
     let own = own_bid.then(|| {
         let out = run_place_order(
