@@ -63,9 +63,11 @@ pub(super) const MAX_BAND_EXPIRIES_PER_UPDATE: u32 = crate::batch::MAX_BATCH_PLA
 /// and stop at the FIRST in-band level.
 ///
 /// A market with the band disabled (`price_band_bps >= 10_000`, e.g. the benches' and the golden
-/// scenario's `1_000_000`) GCs nothing for free: `mark_band_bounds` returns `lower = 0` (no ask is
-/// below it) and an enormous `upper` (no bid is above it). Likewise `mark == 0` (band inactive)
-/// returns `(u128::MAX, 0)`.
+/// scenario's `1_000_000`) GCs nothing for free: `market_band_bounds` returns `lower = 0` (no ask is
+/// below it) and an enormous `upper`, capped at `maxPrice` (no bid is above it: placement refuses
+/// one). Likewise `mark == 0` (band inactive) returns `(maxPrice, 0)`. The only bid that can sit
+/// above `maxPrice` is one left resting by an `updateMarket` that LOWERED it — it can never fill
+/// (no fill executes above `maxPrice`), so it is GC'd like any bid above the band.
 ///
 /// # Placement: BEFORE the liquidation sweep
 ///
@@ -103,8 +105,9 @@ pub(super) fn run_out_of_band_expiry_sweep<H: PerpHost>(
     market_id: u64,
     market: &Market,
 ) -> Result<bool, PerpError> {
-    let (mark_upper, mark_lower) =
-        crate::math::mark_band_bounds(market.mark_price, market.price_band_bps);
+    // The fill-time band itself, upper edge at `maxPrice` included: a bid left above a since-lowered
+    // `maxPrice` can never fill, so it is a stranded best like any bid above the band.
+    let (mark_upper, mark_lower) = crate::math::market_band_bounds(market);
     let mut budget = MAX_BAND_EXPIRIES_PER_UPDATE;
 
     // Asks ASCEND, so the stranded prefix is the front: everything strictly below the lower edge.

@@ -101,10 +101,10 @@ pub(super) fn match_order<H: PerpHost>(
     // (necessarily farther) is skipped. This is the sole off-mark guard (there is no
     // placement-time band): it sees post-placement mark drift, lets harmless deep passive
     // orders rest, and gives market orders implicit slippage protection. mark_price is a
-    // field of the Market already loaded — no separate storage read.
-    let mark = market.mark_price;
-    let (mark_upper, mark_lower) =
-        crate::math::mark_band_bounds(mark, market.price_band_bps);
+    // field of the Market already loaded — no separate storage read. The upper edge is held at
+    // `maxPrice` (`market_band_bounds`): no fill executes above it, even off an order left resting
+    // above a since-lowered `maxPrice`.
+    let (mark_upper, mark_lower) = crate::math::market_band_bounds(market);
 
     // ── Self-trade prevention: decided ONCE, from the TAKER alone ───────────────────────────────
     //

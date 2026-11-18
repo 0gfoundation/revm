@@ -38,10 +38,8 @@ pub(super) fn check_fok_feasibility<H: PerpHost>(
     let mut live: u32 = 0;
     // Count only IN-BAND liquidity: match_order will not fill past the band, so FOK
     // feasibility must apply the same bound or it would pass a FOK that then can't fully
-    // fill. (mark_price is a field of the Market already loaded.)
-    let mark = market.mark_price;
-    let (mark_upper, mark_lower) =
-        crate::math::mark_band_bounds(mark, market.price_band_bps);
+    // fill. (mark_price is a field of the Market already loaded.) The same `maxPrice`-capped band.
+    let (mark_upper, mark_lower) = crate::math::market_band_bounds(market);
     match side {
         Side::Buy => {
             let ask_prices = storage::load_ask_prices_ref(context, market_id)?;

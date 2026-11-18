@@ -456,11 +456,11 @@ fn close_market<H: PerpHost>(
     }))
 }
 
-/// `price` clamped into `market`'s band around its mark (`math::mark_band_bounds`), the farthest a
-/// cross episode trades from the mark — its IOC's limit (Q4) and its ADL price alike. Total: the
-/// bounds are `u128`, the result saturates to `u64`.
+/// `price` clamped into `market`'s band around its mark (`math::market_band_bounds`, upper edge at
+/// `maxPrice`), the farthest a cross episode trades from the mark — its IOC's limit (Q4) and its
+/// ADL price alike. Total: the bounds are `u128`, the result saturates to `u64`.
 fn clamp_into_band(price: u64, market: &Market) -> u64 {
-    let (upper, lower) = crate::math::mark_band_bounds(market.mark_price, market.price_band_bps);
+    let (upper, lower) = crate::math::market_band_bounds(market);
     (price as u128).max(lower).min(upper).min(u64::MAX as u128) as u64
 }
 

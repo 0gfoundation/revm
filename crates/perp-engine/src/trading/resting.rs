@@ -299,8 +299,7 @@ pub(super) fn rest_in_book<H: PerpHost>(
         // it is the ordinary "thin book, deep quote" case: a live probe on the reference exchange
         // placed a sell at 1.389x mark and it was accepted, so rejecting it here would diverge for no
         // gain and would break the deep passive orders the fill-time band deliberately allows.
-        let (mark_upper, mark_lower) =
-            crate::math::mark_band_bounds(market.mark_price, market.price_band_bps);
+        let (mark_upper, mark_lower) = crate::math::market_band_bounds(market);
         let p = price as u128;
         let too_good = match side {
             Side::Sell => p < mark_lower,

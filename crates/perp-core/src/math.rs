@@ -283,6 +283,22 @@ pub fn mark_band_bounds(mark: u64, price_band_bps: u32) -> (u128, u128) {
     (upper, lower)
 }
 
+/// `market`'s fill-time band — [`mark_band_bounds`] around its stored mark — with the upper edge
+/// held at `maxPrice`: NO fill executes above the market's maximum price, whatever the band.
+///
+/// Every engine site that bounds a trade by the band goes through this one: the match walk and the
+/// FOK pre-check, the out-of-band GC, the resting "too good best" gate and the cross episode's
+/// IOC/ADL price clamp. In normal operation the cap changes nothing — placement refuses a price
+/// above `maxPrice` and the mark is clamped to it on every oracle update. It bites after an
+/// `updateMarket` LOWERS `maxPrice` under orders already resting above it: those can no longer
+/// fill there (a stranded best bid is expired by the band GC like any bid above the band), so
+/// every fill price stays at or below `maxPrice`.
+#[inline]
+pub fn market_band_bounds(market: &Market) -> (u128, u128) {
+    let (upper, lower) = mark_band_bounds(market.mark_price, market.price_band_bps);
+    (upper.min(market.max_price as u128), lower)
+}
+
 #[inline]
 fn pow10_u128(exp: u32) -> Result<u128, PerpError> {
     10u128
@@ -1748,6 +1764,44 @@ mod mark_band_bounds_tests {
         let (upper, lower) = mark_band_bounds(u64::MAX, u32::MAX);
         assert_eq!(lower, 0);
         assert!(upper > 0);
+    }
+
+    fn market(mark_price: u64, price_band_bps: u32, max_price: u64) -> crate::types::Market {
+        crate::types::Market {
+            market_id: 1,
+            base_decimals: 0,
+            price_decimals: 2,
+            tick_size: 1,
+            step_size: 1,
+            min_quantity: 1,
+            max_quantity: 1_000_000,
+            max_price,
+            price_update_interval: 15,
+            active: true,
+            funding_interval: 0,
+            interest_rate: 0,
+            liquidation_fee_rate_bps: 0,
+            price_band_bps,
+            mark_price,
+            tiers: crate::types::MarginTiers::default(),
+            basis_mode: 0,
+            deferred_work: 0,
+            cumulative_funding_index: 0,
+        }
+    }
+
+    /// The market band is the mark band with its upper edge held at `maxPrice`: unchanged below it
+    /// (the normal case), cut at it when the band reaches past it — a wide band, an unset mark, or
+    /// a stored mark an `updateMarket` left above a lowered `maxPrice` (the lower edge then sits
+    /// above the upper one, and nothing is in band until the next oracle update).
+    #[test]
+    fn the_market_band_never_reaches_above_max_price() {
+        use super::market_band_bounds;
+        assert_eq!(market_band_bounds(&market(100, 0, 1_000)), (110, 90));
+        assert_eq!(market_band_bounds(&market(100, 0, 105)), (105, 90));
+        assert_eq!(market_band_bounds(&market(100, 1_000_000, 150)), (150, 0));
+        assert_eq!(market_band_bounds(&market(0, 0, 150)), (150, 0));
+        assert_eq!(market_band_bounds(&market(200, 0, 150)), (150, 180));
     }
 }
 

@@ -2045,16 +2045,20 @@ fn dust_leg_deep_deficit(ctx: &mut TestCtx) {
     assert_eq!(wallet(ctx, ALICE), usd(-9_998_400));
 }
 
-/// **J4 — ADL is TOTAL on the fill price** (P3 review). M1's band is wide open (`u32::MAX` bps), so
-/// the bankruptcy price of [`dust_leg_deep_deficit`]'s one-contract leg (≈ $9,998,500) is the ADL
-/// price as it stands, and BOB's notional there — 10^6 contracts — is past `i64`. Valuing him at it
-/// used to be an `Err`: the sweep PANICKED, and `liquidate()` reverted after three perp writes (the
-/// flag, the IOC's order and nonce — a commit-only #23 violation). Now a holder the fill price
-/// cannot value is fallback tier, and the fill itself — one contract — can be valued: BOB takes it
-/// at that price, his silo's shortfall goes to the (seeded) insurance fund, ALICE ends flat at
-/// zero. Both routes — the tick and a keeper's `liquidate()` — and nothing is lost.
+/// **J4 — the ADL price never leaves `maxPrice`** (P3 review, then Q7). M1's band is wide open
+/// (`u32::MAX` bps), so the band does not clamp the bankruptcy price of [`dust_leg_deep_deficit`]'s
+/// one-contract leg (≈ $9,998,500) — but `maxPrice` ($1,000,000) does: no fill executes above it
+/// (`math::market_band_bounds`). There BOB's 10^6 contracts are worth `1e18`, inside the market's
+/// position bound, so nothing about the fill can fault. BOB, bankrupt at that price, takes the
+/// contract as fallback tier (his silo's shortfall to the fund), and the deficit the capped price
+/// does not transfer stays in ALICE's wallet until the fund clears it (Q8), as under a band clamp.
+/// By the tick and by `liquidate()` alike.
+///
+/// The ADL used to fill at the unclamped ≈ $9,998,500, where BOB's notional is past `i64`: first an
+/// `Err` — the sweep PANICKED, and `liquidate()` reverted after three perp writes — then, under J4,
+/// BOB as an unvaluable fallback holder.
 #[test]
-fn adl_values_a_holder_it_cannot_price_at_the_fill_as_fallback_tier_never_an_err() {
+fn adl_never_fills_above_max_price_and_the_fund_clears_what_that_leaves() {
     for manual in [false, true] {
         let mut ctx = make_ctx();
         dust_leg_deep_deficit(&mut ctx);
@@ -2070,13 +2074,13 @@ fn adl_values_a_holder_it_cannot_price_at_the_fill_as_fallback_tier_never_an_err
             tick(&mut ctx, M1, px(100))
         };
         ledger.check(&mut ctx, "after the liquidation");
-        let a = adls(&logs);
-        assert_eq!(a.len(), 1, "manual {manual}: {a:?}");
-        assert_eq!((a[0].0, a[0].1, a[0].2, a[0].3), (ALICE, BOB, M1, 1));
-        assert!(a[0].4 > px(9_998_000), "the unclamped bankruptcy price: {}", a[0].4);
+        let max_price = storage::load_market(&mut ctx, M1).unwrap().unwrap().max_price;
+        assert_eq!(max_price, px(1_000_000));
+        assert_eq!(adls(&logs), vec![(ALICE, BOB, M1, 1, max_price)], "manual {manual}");
         assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
         assert_eq!(pos(&mut ctx, BOB, M1).amount, -999_999);
-        assert!((0..usd(1)).contains(&wallet(&mut ctx, ALICE)), "manual {manual}");
+        assert_eq!(wallet(&mut ctx, ALICE), 0, "manual {manual}: cleared");
+        assert_eq!(rows(&logs, ALICE).last().unwrap().reason, INSURANCE_CLEAR);
         assert!(!flagged(&mut ctx, ALICE));
         assert!(evs::<InsuranceFundDepleted>(&logs).is_empty(), "the fund covered it");
     }
