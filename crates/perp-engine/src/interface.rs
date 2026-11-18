@@ -1401,7 +1401,8 @@ sol! {
         ///            IOC or a fully-filled order has no `OrderRested` to read.
         ///            A MARKET, IOC or FOK order has no place in that queue — it fills before
         ///            everything resting — so it is bounded by |position| alone, and the resting
-        ///            reduce-only orders it leaves over-committed are evicted after the fill. That
+        ///            reduce-only orders it leaves over-committed are evicted after the fill
+        ///            (farthest from the touch first; at one price, the earliest placed). That
         ///            makes a reduce-only MARKET order with `|position| ≤ quantity ≤ maxQuantity`
         ///            the ONE-SHOT CLOSE: it is accepted and truncated to |position| (floored to
         ///            `stepSize`) — Binance's own recipe; there is no separate close selector.
@@ -1612,6 +1613,7 @@ sol! {
         );
         /// Query a user's open order entries in one market.
         /// Buy orders are returned first, sorted by price descending; sell orders follow, sorted by price ascending.
+        /// Orders at one price are in the order they were placed, oldest first.
         function getOpenOrders(address user, uint64 marketId) external view returns (
             bytes32[] orderIds,
             uint8[]   sides,
