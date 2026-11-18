@@ -214,6 +214,103 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
     account: Option<&mut crate::types::UserAccount>,
 ) -> Result<Option<PendingFunding>, PerpError> {
     let funding = storage::load_funding_state(context, market.market_id)?;
+    settle_funding_in_memory(context, user, market, &funding, pos, account)
+}
+
+/// [`compute_funding_settlement`] for a holder ANOTHER user's call settles in passing — a maker the
+/// match walk reaches — which must not fail that call on this holder's arithmetic: `Ok(None)`, with
+/// `pos` and `account` untouched, when the settle cannot be computed
+/// ([`funding_settlement_fits`] is false); otherwise `Ok(Some(_))`, exactly what
+/// [`compute_funding_settlement`] returns. Storage errors still propagate.
+///
+/// One `FundingState` read, shared by the check and the settle, so the two judge the same index.
+pub(crate) fn compute_funding_settlement_unless_faulted<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market: &Market,
+    pos: &mut PerpPosition,
+    account: &mut crate::types::UserAccount,
+) -> Result<Option<Option<PendingFunding>>, PerpError> {
+    let funding = storage::load_funding_state(context, market.market_id)?;
+    if !funding_settlement_fits(funding.cumulative_funding_index, pos, account, market) {
+        return Ok(None);
+    }
+    settle_funding_in_memory(context, user, market, &funding, pos, Some(account)).map(Some)
+}
+
+/// Whether [`compute_funding_settlement`] can settle `pos`'s pending funding at cumulative index
+/// `index` onto `account` — the holder's own, freshly loaded copy — without an arithmetic fault:
+/// the payment itself ([`pending_funding_payment`]), where it lands (the silo or the cross wallet),
+/// and the group header it publishes (`cw + Σ pos.margin`). Pure, no storage.
+///
+/// The same expressions as the settle, through the same helper ([`funding_settle_arithmetic`]), so
+/// `true` means the settle's only remaining failure is the storage layer. Used where the settle
+/// would otherwise `Err` after another user's writes — an ADL winner (`risk::adl`) and a maker
+/// the match walk reaches (`trading::settlement::MatchRegistry::get_or_load`) — so such a holder is
+/// passed over instead (second-round review, adl-skip-3 / q7-funding-1). The HEADER is part of it:
+/// a holder whose total balance sits within its pending funding credit of `i64::MAX` cannot be
+/// settled either, and used to halt the sweep through the header alone.
+pub(crate) fn funding_settlement_fits(
+    index: i128,
+    pos: &PerpPosition,
+    account: &crate::types::UserAccount,
+    market: &Market,
+) -> bool {
+    let Ok(payment) = pending_funding_payment(index, pos, market) else {
+        return false;
+    };
+    payment == 0
+        || funding_settle_arithmetic(
+            payment,
+            crate::margin::margin_type::effective_margin_type(pos)
+                == crate::types::MarginType::Crossed,
+            pos.margin,
+            account.perp_wallet_balance,
+            account.total_position_margin,
+        )
+        .is_ok()
+}
+
+/// The arithmetic of settling a non-zero `payment`: `(margin, cross wallet)` after it lands — on the
+/// cross wallet for a `cross` position, on the silo otherwise — checked, together with the group
+/// header it publishes: `total_position_margin` is the STORED `Σ pos.margin` (pre-funding, like
+/// `margin`), so `Σ_other = total_position_margin − margin` and `wb = cw' + Σ_other + margin'`
+/// ([`crate::margin::view::total_wallet_balance`]). An `Err` here is the settle's only arithmetic
+/// failure; [`settle_funding_in_memory`] runs it first and [`funding_settlement_fits`] alone.
+fn funding_settle_arithmetic(
+    payment: i64,
+    cross: bool,
+    margin: i64,
+    cross_wallet: i64,
+    total_position_margin: i64,
+) -> Result<(i64, i64), PerpError> {
+    let (margin_after, wallet_after) = if cross {
+        let wallet = cross_wallet
+            .checked_add(payment)
+            .ok_or_else(|| perp_err("funding: cross wallet overflow"))?;
+        (margin, wallet)
+    } else {
+        let margin_after = margin
+            .checked_add(payment)
+            .ok_or_else(|| perp_err("funding: position margin overflow"))?;
+        (margin_after, cross_wallet)
+    };
+    let other_market_margin = total_position_margin
+        .checked_sub(margin)
+        .ok_or_else(|| perp_err("funding: Σ position margin underflow"))?;
+    crate::margin::view::total_wallet_balance(wallet_after, other_market_margin, margin_after)?;
+    Ok((margin_after, wallet_after))
+}
+
+/// The body of [`compute_funding_settlement`], on a `FundingState` the caller has read.
+fn settle_funding_in_memory<H: PerpHost>(
+    context: &mut H,
+    user: Address,
+    market: &Market,
+    funding: &crate::types::FundingState,
+    pos: &mut PerpPosition,
+    account: Option<&mut crate::types::UserAccount>,
+) -> Result<Option<PendingFunding>, PerpError> {
     let index = funding.cumulative_funding_index;
     // The index's MIRROR on the stored `Market` (what the account folds price pending funding from,
     // without loading `FundingState`) must equal the source of truth read just above. Compared
@@ -246,10 +343,16 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
                      belongs to the cross wallet)",
                 ));
             };
-            account.perp_wallet_balance = account
-                .perp_wallet_balance
-                .checked_add(payment)
-                .ok_or_else(|| perp_err("funding: cross wallet overflow"))?;
+            // The landing and the header's sums, checked in one place (`funding_settlement_fits`
+            // runs the same helper), so the header built below cannot fail.
+            let (_, wallet) = funding_settle_arithmetic(
+                payment,
+                true,
+                margin_before,
+                account.perp_wallet_balance,
+                account.total_position_margin,
+            )?;
+            account.perp_wallet_balance = wallet;
             crate::margin::view::wallet_balances_from_parts(
                 account,
                 account
@@ -263,10 +366,7 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
             // credit makes the receiver safer; a charge bites the position that owes it — through
             // zero if it must, because a debt that stopped lowering equity at zero is precisely the
             // subsidy this rule removed (module docs). No wallet leg, no insurance-fund leg.
-            pos.margin = pos
-                .margin
-                .checked_add(payment)
-                .ok_or_else(|| perp_err("funding: position margin overflow"))?;
+            //
             // The group header, off the post-funding position. Lazy account load: only reached
             // when funding really moved money.
             let loaded;
@@ -277,6 +377,14 @@ pub(crate) fn compute_funding_settlement<H: PerpHost>(
                     &loaded
                 }
             };
+            let (margin, _) = funding_settle_arithmetic(
+                payment,
+                false,
+                margin_before,
+                account.perp_wallet_balance,
+                account.total_position_margin,
+            )?;
+            pos.margin = margin;
             crate::margin::view::wallet_balances_from_parts(
                 account,
                 account

@@ -307,7 +307,7 @@ impl TakerSettlement {
         // The taker joins the registry: funding computed on the copy (event pushed after all
         // maker events — the same stream position finalize applied it at), and on a self-match
         // the fills' maker-side effects are already in these copies.
-        let i = reg.get_or_load(context, self.user, self.market_id, market)?;
+        let i = reg.get_or_load(context, self.user, self.market_id, market, Joins::AsTaker)?;
         let mark = market.mark_price; // field of the threaded Market — no storage read
         let w = &mut reg.users[i].1;
 
@@ -948,6 +948,13 @@ pub(super) struct UserWork {
     /// Kept so the flush can decide whether the end-of-call drain still owes this user an event —
     /// see the "duplicate mark" note in [`MatchRegistry::flush`].
     last_published: Option<crate::margin::view::AccountWalletBalances>,
+    /// This MAKER's pending funding could not be settled when the walk first touched it — its
+    /// arithmetic faults (`risk::funding::funding_settlement_fits` is false) — so the copies hold
+    /// the STORED position and account, funding unsettled and un-anchored, and no funding event was
+    /// queued. Every fill against such a maker is refused like a K9 maker (`MakerInsolvent`); its
+    /// order is cancelled in the copies like any refused maker's, and the flush writes nothing else
+    /// of it. See [`MatchRegistry::get_or_load`].
+    funding_unsettled: bool,
 }
 
 impl UserWork {
@@ -1061,6 +1068,15 @@ pub(super) enum MatchEvent {
         /// SITE, and the publish site is the walk (`push_maker_snapshot`), not this replay.
         reason: AccountUpdateReason,
     },
+}
+
+/// How a user joins the match registry ([`MatchRegistry::get_or_load`]): as the TAKER, whose
+/// funding must settle (a fault reverts its own call), or as a MAKER the walk reaches, which is
+/// passed over when its funding cannot be settled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Joins {
+    AsTaker,
+    AsMaker,
 }
 
 pub(super) struct MatchRegistry {
@@ -1254,14 +1270,46 @@ impl MatchRegistry {
     /// First touch loads pos/account/both lists and settles funding: computed in memory NOW (the
     /// walk's working copies must carry the post-funding state) with its logs deferred as an event
     /// at this exact stream position.
+    ///
+    /// # A maker whose funding cannot be settled is passed over, not an `Err`
+    ///
+    /// The walk settles a MAKER's funding in passing, on someone else's call, and an `Err` from it
+    /// failed the whole match: every taker reaching the order reverted, and a liquidation's book
+    /// leg reaching it — after that liquidation's first writes — halted the sweep on every tick and
+    /// drain (second-round review, q7-funding-1; the same holder was already passed over as an ADL
+    /// winner). So a maker joins through `compute_funding_settlement_unless_faulted`: when the
+    /// settle's arithmetic faults (the payment, where it lands, or its header past `i64`), it joins
+    /// UNSETTLED ([`UserWork::funding_unsettled`]) and [`settle_maker_fill_registry`] refuses its
+    /// fill like a K9 maker's. Nothing of its funding is written; the next path that can settle it
+    /// does. The TAKER is not passed over — it is the caller, and its own fault reverts its own
+    /// call — so a taker that joined earlier as an unsettled maker (its own order removed by
+    /// self-trade prevention) is settled here once it has fills to settle, which raises the fault.
+    /// With none it never gets here and rests like any order that crossed nothing, its funding
+    /// left unsettled as theirs is.
     fn get_or_load<H: PerpHost>(
         &mut self,
         context: &mut H,
         user: Address,
         market_id: u64,
         market: &crate::types::Market,
+        joins: Joins,
     ) -> Result<usize, PerpError> {
         if let Some(i) = self.users.iter().position(|(a, _)| *a == user) {
+            if joins == Joins::AsTaker && self.users[i].1.funding_unsettled {
+                let w = &mut self.users[i].1;
+                let pending = crate::risk::funding::compute_funding_settlement(
+                    context,
+                    user,
+                    market,
+                    &mut w.pos,
+                    Some(&mut w.account),
+                )?;
+                w.funding_unsettled = false;
+                if let Some(p) = pending {
+                    w.last_published = Some(p.snapshot().clone());
+                    self.events.push(MatchEvent::ApplyFunding(p));
+                }
+            }
             return Ok(i);
         }
         let mut pos = storage::load_position(context, user, market_id)?;
@@ -1287,13 +1335,30 @@ impl MatchRegistry {
         }
         // `&mut account`: a CROSSED position's funding lands on this working copy's wallet (cross
         // margin P2), which the flush persists with everything else.
-        let pending = crate::risk::funding::compute_funding_settlement(
-            context,
-            user,
-            market,
-            &mut pos,
-            Some(&mut account),
-        )?;
+        let (pending, funding_unsettled) = match joins {
+            Joins::AsTaker => (
+                crate::risk::funding::compute_funding_settlement(
+                    context,
+                    user,
+                    market,
+                    &mut pos,
+                    Some(&mut account),
+                )?,
+                false,
+            ),
+            Joins::AsMaker => {
+                match crate::risk::funding::compute_funding_settlement_unless_faulted(
+                    context,
+                    user,
+                    market,
+                    &mut pos,
+                    &mut account,
+                )? {
+                    Some(pending) => (pending, false),
+                    None => (None, true),
+                }
+            }
+        };
         // A funding settle publishes its OWN account header (`apply_funding_settlement`), so it
         // counts as a published payload for this user: recording it lets the flush's mark-clear gate
         // suppress a duplicate drain row for a user whose only event in this match was the funding
@@ -1316,6 +1381,7 @@ impl MatchRegistry {
                 dirty_sell: false,
                 other_market_position_margin,
                 last_published,
+                funding_unsettled,
             },
         ));
         Ok(self.users.len() - 1)
@@ -1721,7 +1787,7 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     maker_reduces_only: bool,
 ) -> Result<MakerFillOutcome, PerpError> {
     let maker_side = taker_side.opposite();
-    let i = reg.get_or_load(context, maker, market_id, market)?;
+    let i = reg.get_or_load(context, maker, market_id, market, Joins::AsMaker)?;
     // mark_price is a field of the threaded Market — no per-maker storage read.
     let mark = market.mark_price;
 
@@ -1747,6 +1813,14 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
     if w.account.in_liquidation() && !maker_reduces_only {
         return Ok(MakerFillOutcome::Rejected {
             reason: crate::types::CancelReason::Liquidation,
+        });
+    }
+    // A maker whose pending funding the walk could not settle (`get_or_load`) is refused like a
+    // K9 maker: its fill cannot be settled on a position whose funding is not, and an `Err` here
+    // would fail the match (a liquidation's book leg: halt the sweep).
+    if w.funding_unsettled {
+        return Ok(MakerFillOutcome::Rejected {
+            reason: crate::types::CancelReason::MakerInsolvent,
         });
     }
     let core = settle_maker_fill_core(
@@ -1858,7 +1932,7 @@ pub(super) fn cancel_maker_in_match<H: PerpHost>(
         ),
         "the walk cancels a maker only for K9, a liquidation freeze or STP, not {reason:?}"
     );
-    let i = reg.get_or_load(context, maker, market_id, market)?;
+    let i = reg.get_or_load(context, maker, market_id, market, Joins::AsMaker)?;
     let w = &mut reg.users[i].1;
     super::release_open_order_margin_core(
         &mut w.pos,
