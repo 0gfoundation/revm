@@ -340,7 +340,7 @@ fn liquidation_matching_caps_distinct_maker_accounts() {
     assert_eq!(
         position(&mut ctx, ALICE).amount,
         1,
-        "the residual remains for the liquidation residual/ADL path"
+        "the capped rest stays open for the next pass against the book — never ADL'd (Q6)"
     );
     assert_eq!(position(&mut ctx, indexed_maker(0)).amount, 1);
     assert_eq!(

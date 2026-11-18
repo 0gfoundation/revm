@@ -27,6 +27,8 @@
 //!   position (an isolated silo included) is open, and with a short fund what it cannot pay is
 //!   socialised (`InsuranceFundDepleted`);
 //! * J4: a mark of 0 and a leg the fold cannot price are skipped, never an `Err`;
+//! * the distinct-maker cap (Q6 of the test review): a capped close is not ADL'd and the episode
+//!   stops at its market, the drain finishing it against the book — ADL only once the book is out;
 //! * a randomised multi-market run: never a panic, custody after every step, and after every tick
 //!   no account holding a cross position in the ticked market is left below maintenance unflagged.
 //!
@@ -2605,4 +2607,169 @@ fn a_randomised_run_with_deep_negative_wallets_and_an_empty_fund_never_panics() 
     assert!(cleared >= 20, "wallets cleared {cleared}");
     assert!(socialised >= 20, "socialised deficits {socialised}");
     assert!(stale_skips >= 20, "flagged on a stale market {stale_skips}");
+}
+
+// ── Q6: a maker-capped cross close resumes on the drain instead of ADL ──────────────────────────
+//
+// The IOC of a cross close stops on the distinct-maker cap (128) with the next maker in band still
+// live: the rest is not ADL'd and the episode does not move on to the account's next market — it
+// stops at the capped market, sets its `deferred_work`, and the next pass resumes there against
+// the book. ADL still takes what the book leaves once it runs out.
+
+/// The `i`-th single-lot maker: a `0x66…` address (clear of every named account here), its own
+/// account so each is a distinct maker.
+fn capped_maker(i: usize) -> Address {
+    let mut b = [0u8; 20];
+    b[0] = 0x66;
+    b[12..].copy_from_slice(&(i as u64).to_be_bytes());
+    Address::from(b)
+}
+
+/// `n` distinct makers (wallet [`WALLET`], the default CROSSED type), each resting BUY 1 @ `price`
+/// in market `m`.
+fn capped_makers(ctx: &mut TestCtx, m: u64, n: usize, price: u64) {
+    for i in 0..n {
+        let maker = capped_maker(i);
+        JournalTr::load_account(ctx.journal_mut(), maker).unwrap();
+        let a = UserAccount { perp_wallet_balance: WALLET, ..UserAccount::default() };
+        storage::save_account(ctx, maker, a, AccountUpdateReason::Adjustment).unwrap();
+        rest(ctx, maker, m, BUY, price, 1);
+    }
+    storage::flush_account_snapshots(ctx).unwrap();
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+}
+
+/// `Σ amount` in `m` over `users` and the first `n` capped makers — the `Ledger` does not hold the
+/// makers, so conservation is checked on the positions directly.
+fn sigma_amount(ctx: &mut TestCtx, m: u64, users: &[Address], n: usize) -> i64 {
+    users.iter().map(|u| pos(ctx, *u, m).amount).sum::<i64>()
+        + (0..n).map(|i| pos(ctx, capped_maker(i), m).amount).sum::<i64>()
+}
+
+/// ALICE cross long 135 @ $100 in M1 against BOB, wallet $2,750, and `makers` single-lot bids at
+/// $80: `E = 2_750_000_000` against `Σ MM = 135·100e6/6 = 2_250_000_000` at $100.
+fn capped_cross_fixture(ctx: &mut TestCtx, makers: usize) {
+    trade(ctx, M1, ALICE, BOB, BUY, px(100), 135);
+    set_wallet(ctx, ALICE, usd(2_750));
+    capped_makers(ctx, M1, makers, px(80));
+    let f = fold(ctx, ALICE);
+    assert_eq!((f.e, f.cross_mm), (2_750_000_000, 2_250_000_000));
+}
+
+/// `drainDeferredWork(m)` by KEEPER → `(moreRemaining, logs)`.
+fn drain_market(ctx: &mut TestCtx, m: u64) -> (bool, Vec<Log>) {
+    let out = call(ctx, KEEPER, &drainDeferredWorkCall { marketId: m }.abi_encode());
+    assert!(!out.reverted, "{}", revert_reason(&out));
+    let more = drainDeferredWorkCall::abi_decode_returns(&out.bytes).unwrap();
+    (more, JournalTr::take_logs(ctx.journal_mut()))
+}
+
+/// **The tick stops at the cap without ADL; the drain closes the rest on the book.** 135 bids for
+/// a long of 135 at $80: `E = 2,750 − 2,700 = $50` against `Σ MM` $1,800 before the close. The IOC
+/// fills 128 makers and stops on the cap with 7 bids live; the account is still below maintenance
+/// (`E = 50_000_000` < `Σ MM = 7·80e6/6 = 93_333_333`), but the 7 are left to the drain — before Q6
+/// they were ADL'd to BOB. The drain resumes the episode at M1, fills the 7 on the book and ends it.
+#[test]
+fn a_maker_capped_cross_close_resumes_on_the_drain_instead_of_adl() {
+    let mut ctx = make_ctx();
+    capped_cross_fixture(&mut ctx, 135);
+
+    let logs = tick(&mut ctx, M1, px(80));
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 7);
+    assert_eq!(evs::<Trade>(&logs).len(), 128);
+    assert!(adls(&logs).is_empty(), "the capped rest must not be ADL'd: {:?}", adls(&logs));
+    assert_eq!(storage::load_bid_count(&mut ctx, M1, px(80)).unwrap(), 7);
+    assert_eq!(pos(&mut ctx, BOB, M1).amount, -135);
+    assert_eq!(deferred_of(&mut ctx, M1), 1);
+    assert!(flagged(&mut ctx, ALICE));
+    let f = fold(&mut ctx, ALICE);
+    assert_eq!((f.e, f.cross_mm), (50_000_000, 93_333_333));
+    let rows: Vec<(i64, u64)> = evs::<Liquidation>(&logs).iter().map(|l| (l.amount, l.reward)).collect();
+    assert_eq!(rows, [(135, 0)]);
+    assert_eq!(evs::<CrossLiquidationStarted>(&logs).len(), 1);
+    assert!(evs::<CrossLiquidationEnded>(&logs).is_empty());
+    assert_eq!(sigma_amount(&mut ctx, M1, &[ALICE, BOB], 135), 0);
+
+    let (more, logs) = drain_market(&mut ctx, M1);
+    assert!(!more);
+    assert_eq!(evs::<Trade>(&logs).len(), 7);
+    assert!(adls(&logs).is_empty());
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    assert_eq!(pos(&mut ctx, BOB, M1).amount, -135);
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    assert_eq!(deferred_of(&mut ctx, M1), 0);
+    let rows: Vec<(i64, u64)> = evs::<Liquidation>(&logs).iter().map(|l| (l.amount, l.reward)).collect();
+    assert_eq!(rows, [(7, 0)], "one row per pass");
+    assert_eq!(wallet(&mut ctx, ALICE), 50_000_000);
+    assert_eq!(sigma_amount(&mut ctx, M1, &[ALICE, BOB], 135), 0);
+}
+
+/// **Once the book runs out, the cross rest still goes to ADL.** 130 bids: the tick stops on the
+/// cap with 2 bids left and 7 open; the drain fills the 2, the book is empty, and the last 5 are
+/// ADL'd to BOB at the mark — the account ends at `E` $50 < `Σ MM` $66.67 for 5 contracts, but
+/// `E ≥ 0`, so the winners take exposure, not money.
+#[test]
+fn a_maker_capped_cross_rest_still_adls_once_the_book_runs_out() {
+    let mut ctx = make_ctx();
+    capped_cross_fixture(&mut ctx, 130);
+
+    let logs = tick(&mut ctx, M1, px(80));
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 7);
+    assert!(adls(&logs).is_empty());
+    assert_eq!(storage::load_bid_count(&mut ctx, M1, px(80)).unwrap(), 2);
+    assert_eq!(deferred_of(&mut ctx, M1), 1);
+
+    let (more, logs) = drain_market(&mut ctx, M1);
+    assert!(!more);
+    assert_eq!(evs::<Trade>(&logs).len(), 2);
+    assert_eq!(adls(&logs), [(ALICE, BOB, M1, 5, px(80))]);
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    assert_eq!(pos(&mut ctx, BOB, M1).amount, -130);
+    assert_eq!(evs::<CrossLiquidationEnded>(&logs).len(), 1);
+    assert_eq!(deferred_of(&mut ctx, M1), 0);
+    assert_eq!(sigma_amount(&mut ctx, M1, &[ALICE, BOB], 130), 0);
+}
+
+/// **The cap decides when, never what: a capped market is finished before the episode moves on.**
+/// ALICE also holds 10 long in M2 (wallet $2,950: `E = 2_950_000_000` vs `Σ MM = 2_416_666_666`),
+/// with MAKER bidding 10 @ $100 there. The tick of M1 caps after 128 fills — `E` $250 against
+/// `Σ MM = 93_333_333 + 166_666_666` — and the episode stops at M1 rather than closing M2 against
+/// its book. The drain finishes M1, which restores the account, so M2 is never touched: the
+/// uncapped liquidation's outcome. (Moving on instead closed M2 in the tick and left M1 at 7.)
+#[test]
+fn a_maker_capped_market_is_finished_before_the_episode_moves_on() {
+    let mut ctx = make_ctx();
+    trade(&mut ctx, M1, ALICE, BOB, BUY, px(100), 135);
+    trade(&mut ctx, M2, ALICE, CAROL, BUY, px(100), 10);
+    set_wallet(&mut ctx, ALICE, usd(2_950));
+    capped_makers(&mut ctx, M1, 135, px(80));
+    rest(&mut ctx, MAKER, M2, BUY, px(100), 10);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    let f = fold(&mut ctx, ALICE);
+    assert_eq!((f.e, f.cross_mm), (2_950_000_000, 2_416_666_666));
+
+    let logs = tick(&mut ctx, M1, px(80));
+    // M2's mark (published at 0) is 15 s old: fresh (≤ 3 × 15), so only the cap kept it open.
+    assert_eq!(ctx.block.timestamp, U256::from(15));
+    assert_eq!((pos(&mut ctx, ALICE, M1).amount, pos(&mut ctx, ALICE, M2).amount), (7, 10));
+    assert!(adls(&logs).is_empty());
+    assert_eq!(deferred_of(&mut ctx, M1), 1);
+    assert!(flagged(&mut ctx, ALICE));
+    let f = fold(&mut ctx, ALICE);
+    assert_eq!((f.e, f.cross_mm), (250_000_000, 259_999_999));
+    let rows: Vec<(u64, i64)> =
+        evs::<Liquidation>(&logs).iter().map(|l| (l.marketId, l.amount)).collect();
+    assert_eq!(rows, [(M1, 135)], "M2 is not closed while M1's book still has liquidity");
+
+    let (_, logs) = drain_market(&mut ctx, M1);
+    assert_eq!((pos(&mut ctx, ALICE, M1).amount, pos(&mut ctx, ALICE, M2).amount), (0, 10));
+    assert!(adls(&logs).is_empty());
+    assert!(!flagged(&mut ctx, ALICE));
+    assert_eq!(fold(&mut ctx, ALICE).cross_mm, 166_666_666);
+    let rows: Vec<(u64, i64)> =
+        evs::<Liquidation>(&logs).iter().map(|l| (l.marketId, l.amount)).collect();
+    assert_eq!(rows, [(M1, 7)]);
+    assert_eq!(sigma_amount(&mut ctx, M1, &[ALICE, BOB], 135), 0);
+    assert_eq!(sigma_amount(&mut ctx, M2, &[ALICE, CAROL, MAKER], 0), 0);
 }

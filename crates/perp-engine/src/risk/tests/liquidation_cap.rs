@@ -1,4 +1,5 @@
 use super::*;
+use crate::interface::IPerpDex::{Adl, Liquidation, Trade};
 
 /// 55 identical 5x longs, each its own address so each is its own registry entry. Seeded in a
 /// deterministic order so the test can also speak about WHICH ones get done.
@@ -123,4 +124,201 @@ pub(super) fn oracle_update_at(ctx: &mut TestCtx, index: u64, ts: u64) {
         ctx,
     )
     .unwrap();
+}
+
+// ── Q6: a maker-capped liquidation rest goes to the drain, not to ADL ──────────────────────────
+//
+// The distinct-maker cap (`MAX_LIQUIDATION_MAKER_ACCOUNTS` = 128) bounds one liquidation PASS.
+// When it stops the book leg the next maker in band is still live, so the rest is not ADL'd: the
+// pass ends, `deferred_work` is set, and the next pass continues against the book. ADL still takes
+// what the book leg leaves for any other reason (here: the book running out).
+
+/// ALICE isolated long `qty` @ $100 at 5x (`vQuote = −qty·1e8`, `margin = qty·2e7`, wallet 0),
+/// WHALE the opposite short at 1x (wallet 0, healthy at any mark below $100 — the only ADL
+/// counterparty), and `makers` distinct accounts each bidding 1 @ $90. Mark $100, band 0, funding
+/// off (`setup_market`).
+fn maker_capped_fixture(ctx: &mut TestCtx, qty: u64, makers: usize) {
+    setup_market(ctx);
+    let entry_value = calc_value(ENTRY_PRICE, qty, 0, PRICE_DECIMALS).unwrap();
+    assert_eq!(entry_value, qty * 100_000_000);
+    let (q, v) = (qty as i64, entry_value as i64);
+    seed_position_account(ctx, ALICE, q, -v, v / 5, 5, 0);
+    seed_position_account(ctx, WHALE, -q, v, v, 1, 0);
+    for index in 0..makers {
+        let maker = indexed_maker(index);
+        storage::save_account(
+            ctx,
+            maker,
+            UserAccount { perp_wallet_balance: 200_000_000, ..UserAccount::default() },
+            AccountUpdateReason::Adjustment,
+        )
+        .unwrap();
+        place_order(ctx, maker, Side::Buy as u8, LONG_LIQ_PRICE, 1);
+    }
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+}
+
+/// The oracle tick to $90 (the mark is exactly the index) that runs the liquidation sweep.
+fn tick_to_ninety(ctx: &mut TestCtx) -> Vec<primitives::Log> {
+    advance_block_to(ctx, 31);
+    oracle_update_at(ctx, LONG_LIQ_PRICE, 31);
+    assert_eq!(storage::load_mark_price(ctx, MARKET_ID).unwrap(), LONG_LIQ_PRICE);
+    JournalTr::take_logs(ctx.journal_mut())
+}
+
+/// `drainDeferredWork(MARKET_ID)` → `(moreRemaining, logs)`.
+fn drain(ctx: &mut TestCtx) -> (bool, Vec<primitives::Log>) {
+    let out = crate::risk::funding::run_drain_deferred_work(
+        &drainDeferredWorkCall { marketId: MARKET_ID }.abi_encode(),
+        ctx,
+    )
+    .unwrap();
+    let more = drainDeferredWorkCall::abi_decode_returns(&out).unwrap();
+    (more, JournalTr::take_logs(ctx.journal_mut()))
+}
+
+fn deferred_work(ctx: &mut TestCtx) -> u8 {
+    storage::load_market(ctx, MARKET_ID).unwrap().unwrap().deferred_work
+}
+
+fn bids_at_ninety(ctx: &mut TestCtx) -> u64 {
+    storage::load_bid_count(ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap()
+}
+
+/// `(liquidatedUser, adlUser, qty, price)` of every ADL fill.
+fn adl_fills(logs: &[primitives::Log]) -> Vec<(Address, Address, u64, u64)> {
+    decode_events::<Adl>(logs)
+        .into_iter()
+        .map(|a| (a.liquidatedUser, a.adlUser, a.qty, a.price))
+        .collect()
+}
+
+/// `(amount, reward)` of every `Liquidation` row.
+fn liquidation_rows(logs: &[primitives::Log]) -> Vec<(i64, u64)> {
+    decode_events::<Liquidation>(logs).into_iter().map(|l| (l.amount, l.reward)).collect()
+}
+
+fn wallet_of(ctx: &mut TestCtx, user: Address) -> i64 {
+    storage::load_account(ctx, user).unwrap().perp_wallet_balance
+}
+
+/// **The sweep stops at the cap, the drain finishes against the book, and the totals are the
+/// one-shot liquidation's.** 133 single-lot bids for a long of 133, fee 125 bps.
+///
+/// At $90: equity `2_660_000_000 − 1_330_000_000 = 1_330_000_000` < MM `133·90e6/6 =
+/// 1_995_000_000`. The tick's pass fills 128 makers and stops on the cap with 5 live bids left:
+/// no ADL, the rest (5) stays open, `deferred_work` set. Close credit `2_560_000_000 −
+/// 1_280_000_000`, fee `11_520_000_000 · 125 / 1e4 = 144_000_000`. The drain's pass closes the 5
+/// on the book (fee `450_000_000 · 125 / 1e4 = 5_625_000`). Wallet `1_180_375_000` and IF
+/// `149_625_000` are what the one-shot liquidation before Q6 ended with (128 book + 5 ADL).
+#[test]
+fn a_maker_capped_isolated_liquidation_finishes_against_the_book_on_the_drain() {
+    let mut ctx = make_ctx();
+    maker_capped_fixture(&mut ctx, 133, 133);
+    let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    market.liquidation_fee_rate_bps = 125;
+    storage::save_market(&mut ctx, &market).unwrap();
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 0);
+
+    let logs = tick_to_ninety(&mut ctx);
+    let alice = position(&mut ctx, ALICE);
+    assert_eq!(
+        (alice.amount, alice.v_quote_balance, alice.margin),
+        (5, -500_000_000, 100_000_000),
+        "128 closed on the book, the capped rest of 5 left open"
+    );
+    assert_eq!(wallet_of(&mut ctx, ALICE), 1_136_000_000);
+    assert_eq!(decode_events::<Trade>(&logs).len(), MAX_LIQUIDATION_MAKER_ACCOUNTS);
+    assert!(adl_fills(&logs).is_empty(), "the capped rest must not be ADL'd: {:?}", adl_fills(&logs));
+    assert_eq!(bids_at_ninety(&mut ctx), 5, "the book still holds the rest's liquidity");
+    assert_eq!(position(&mut ctx, WHALE).amount, -133, "the ADL counterparty is untouched");
+    assert_eq!(deferred_work(&mut ctx), 1, "the drain must see the capped rest");
+    assert_eq!(liquidation_rows(&logs), [(133, 144_000_000)]);
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 144_000_000);
+
+    let (more, logs) = drain(&mut ctx);
+    assert!(!more, "the drain finished the rest");
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    assert_eq!(wallet_of(&mut ctx, ALICE), 1_180_375_000);
+    assert_eq!(decode_events::<Trade>(&logs).len(), 5);
+    assert!(adl_fills(&logs).is_empty());
+    assert_eq!(bids_at_ninety(&mut ctx), 0);
+    assert_eq!(position(&mut ctx, WHALE).amount, -133);
+    assert_eq!(deferred_work(&mut ctx), 0);
+    assert_eq!(liquidation_rows(&logs), [(5, 5_625_000)], "one row per pass, fee on what it closed");
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 149_625_000);
+
+    let (more, _) = drain(&mut ctx);
+    assert!(!more, "nothing left: a no-op drain");
+}
+
+/// **The reviewer's repro through manual `liquidate()`.** The manual pass is not a sweep, but the
+/// deferral it leaves is no longer discarded: it sets `deferred_work`, so the drain — not the next
+/// tick — closes the capped rest against the book.
+#[test]
+fn liquidate_leaves_a_maker_capped_residual_to_the_drain() {
+    let mut ctx = make_ctx();
+    maker_capped_fixture(&mut ctx, 133, 133);
+    storage::save_mark_price(&mut ctx, MARKET_ID, LONG_LIQ_PRICE).unwrap();
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    liquidate(&mut ctx, ALICE).unwrap();
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    assert_eq!(position(&mut ctx, ALICE).amount, 5);
+    assert!(adl_fills(&logs).is_empty(), "the capped rest must not be ADL'd: {:?}", adl_fills(&logs));
+    assert_eq!(bids_at_ninety(&mut ctx), 5);
+    assert_eq!(position(&mut ctx, WHALE).amount, -133);
+    assert_eq!(deferred_work(&mut ctx), 1, "manual liquidate() records its deferral");
+
+    let (more, logs) = drain(&mut ctx);
+    assert!(!more);
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    assert!(adl_fills(&logs).is_empty());
+    assert_eq!(bids_at_ninety(&mut ctx), 0);
+    assert_eq!(position(&mut ctx, WHALE).amount, -133);
+    assert_eq!(deferred_work(&mut ctx), 0);
+}
+
+/// **Once the book runs out, the rest still goes to ADL.** 130 bids for a long of 135: the tick
+/// stops on the cap with 2 bids left and 7 open (equity `70e6` < MM `105e6`, still liquidatable);
+/// the drain fills the 2 bids, the book is empty, and the last 5 are ADL'd at the mark (equity
+/// `50e6` ≥ 0, solvent) against WHALE.
+#[test]
+fn a_maker_capped_residual_still_adls_once_the_book_runs_out() {
+    let mut ctx = make_ctx();
+    maker_capped_fixture(&mut ctx, 135, 130);
+
+    let logs = tick_to_ninety(&mut ctx);
+    let alice = position(&mut ctx, ALICE);
+    assert_eq!(
+        (alice.amount, alice.v_quote_balance, alice.margin),
+        (7, -700_000_000, 140_000_000)
+    );
+    assert!(adl_fills(&logs).is_empty());
+    assert_eq!(bids_at_ninety(&mut ctx), 2);
+    assert_eq!(deferred_work(&mut ctx), 1);
+
+    let (more, logs) = drain(&mut ctx);
+    assert!(!more);
+    assert_eq!(decode_events::<Trade>(&logs).len(), 2);
+    assert_eq!(adl_fills(&logs), [(ALICE, WHALE, 5, LONG_LIQ_PRICE)], "ADL at the mark");
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    assert_eq!(position(&mut ctx, WHALE).amount, -130);
+    assert_eq!(bids_at_ninety(&mut ctx), 0);
+    assert_eq!(deferred_work(&mut ctx), 0);
+}
+
+/// **Exactly 128 makers is the book running out, not the cap**: the walk fills all 128 and finds
+/// no 129th, so the rest is ADL'd in the same pass and nothing is deferred — as before Q6.
+#[test]
+fn exactly_128_makers_is_the_book_running_out_not_the_cap() {
+    let mut ctx = make_ctx();
+    maker_capped_fixture(&mut ctx, 133, MAX_LIQUIDATION_MAKER_ACCOUNTS);
+
+    let logs = tick_to_ninety(&mut ctx);
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+    assert_eq!(adl_fills(&logs), [(ALICE, WHALE, 5, LONG_LIQ_PRICE)]);
+    assert_eq!(position(&mut ctx, WHALE).amount, -128);
+    assert_eq!(bids_at_ninety(&mut ctx), 0);
+    assert_eq!(deferred_work(&mut ctx), 0);
 }
