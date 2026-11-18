@@ -3,7 +3,9 @@
 //! no lower bound.
 
 use super::*;
-use crate::risk::{MAX_ORACLE_FUTURE_SKEW_SECS, ORACLE_FUTURE_TIMESTAMP_REJECT};
+use crate::risk::{
+    MAX_MARKET_INTERVAL_SECS, MAX_ORACLE_FUTURE_SKEW_SECS, ORACLE_FUTURE_TIMESTAMP_REJECT,
+};
 use alloy_sol_types::SolError;
 
 const GAS: u64 = 30_000_000;
@@ -204,16 +206,17 @@ fn a_year_of_oracle_silence_settles_one_epoch_and_jumps_to_the_next_boundary() {
     assert_eq!(mark_price_events(&logs)[0].nextFundingTime, t2 + 1);
 }
 
-// ── Write-clean funding failures ─────────────────────────────────────────────────────────────────
+// ── Write-clean funding failures and interval bounds ─────────────────────────────────────────────
 
 /// The largest multiple of 15: a `fundingInterval` that overflows the funding clock on any push.
 const HUGE_FUNDING_INTERVAL: u64 = u64::MAX - u64::MAX % 15;
 
 /// The funding step's refusals are write-clean: every fallible step of the premium sample and
 /// the epoch rollover runs before the push's first write (commit-only #23). Driven by the funding
-/// clock overflowing on a huge interval, with the market saved directly: one set BEFORE the
-/// first push overflows `window + interval`; one set AFTER funding started overflows the
-/// rollover's next boundary. Both used to write the index, mode and mark and then revert, which
+/// clock overflowing on a huge interval, with the market saved directly — `updateMarket` now
+/// refuses such an interval ([`MAX_MARKET_INTERVAL_SECS`]): one set BEFORE the first push
+/// overflows `window + interval`; one set AFTER funding started overflows the rollover's next
+/// boundary. Both used to write the index, mode and mark and then revert, which
 /// the call shell's tripwire turns into a panic in a debug build.
 #[test]
 fn a_push_whose_funding_step_fails_is_refused_with_nothing_written() {
@@ -250,4 +253,64 @@ fn a_push_whose_funding_step_fails_is_refused_with_nothing_written() {
     set_funding_interval(&mut ctx, 15);
     accepted(&mut ctx, 1_000_020);
     assert_eq!(storage::load_funding_state(&mut ctx, MARKET_ID).unwrap().next_funding_ts, 1_000_035);
+}
+
+/// `updateMarket` on [`MARKET_ID`] through the call shell, with every field as `setup_market`
+/// left it except the two intervals. The raw output, so a test can assert either way.
+fn update_intervals(
+    ctx: &mut TestCtx,
+    price_update_interval: u64,
+    funding_interval: u64,
+) -> crate::PerpOutput {
+    let input = crate::interface::IPerpDex::updateMarketCall {
+        marketId: MARKET_ID,
+        tickSize: 1,
+        stepSize: 1,
+        minQuantity: 1,
+        maxQuantity: 1_000_000,
+        maxPrice: 1_000_000,
+        priceUpdateInterval: price_update_interval,
+        active: true,
+        fundingInterval: funding_interval,
+        interestRate: 0,
+        liquidationFeeRateBps: 0,
+        priceBandBps: 0,
+    }
+    .abi_encode();
+    run_perp_dex_call(&input, GAS, ADMIN, U256::ZERO, false, ctx).unwrap()
+}
+
+/// A year is the longest interval a market takes, on both fields (`addMarket` shares the check),
+/// so `updateMarket` refuses the interval the test above needs. It used to accept it. At the cap
+/// the funding clock still runs: the first boundary is the window plus a year.
+#[test]
+fn a_market_interval_beyond_a_year_is_refused() {
+    let mut ctx = ctx_at(1_000_000);
+    assert_eq!(MAX_MARKET_INTERVAL_SECS % 15, 0, "the cap is itself a valid 15 s funding interval");
+
+    for (pui, fi, field) in [
+        (15, MAX_MARKET_INTERVAL_SECS + 15, "fundingInterval"),
+        (15, HUGE_FUNDING_INTERVAL, "fundingInterval"),
+        (MAX_MARKET_INTERVAL_SECS + 1, 0, "priceUpdateInterval"),
+        (u64::MAX, 0, "priceUpdateInterval"),
+    ] {
+        let writes = ctx.perp_write_count();
+        let out = update_intervals(&mut ctx, pui, fi);
+        assert!(out.reverted, "({pui}, {fi}) accepted");
+        assert_eq!(
+            alloy_sol_types::Revert::abi_decode(&out.bytes).map(|r| r.reason).unwrap(),
+            format!("updateMarket: {field} must be <= {MAX_MARKET_INTERVAL_SECS}")
+        );
+        assert_eq!(ctx.perp_write_count(), writes, "({pui}, {fi}): a refused update wrote");
+    }
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    assert_eq!((market.price_update_interval, market.funding_interval), (15, 0));
+
+    assert!(!update_intervals(&mut ctx, MAX_MARKET_INTERVAL_SECS, 0).reverted);
+    assert!(!update_intervals(&mut ctx, 15, MAX_MARKET_INTERVAL_SECS).reverted);
+    accepted(&mut ctx, 1_000_000);
+    assert_eq!(
+        storage::load_funding_state(&mut ctx, MARKET_ID).unwrap().next_funding_ts,
+        999_990 + MAX_MARKET_INTERVAL_SECS
+    );
 }

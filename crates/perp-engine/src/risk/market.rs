@@ -460,11 +460,35 @@ fn validate_market_bounds(
     Ok(())
 }
 
+/// The longest `priceUpdateInterval` or `fundingInterval` a market may be configured with: one
+/// year.
+///
+/// The funding clock does checked arithmetic on these — the first boundary is `price window +
+/// fundingInterval`, and a rollover lands on `next_funding_ts + k · fundingInterval` — and an
+/// overflow there refuses EVERY later push for the market (its index, mark and liquidation sweep
+/// freeze until an admin repairs the config). With the stamp held to block time + 60 s
+/// (`MAX_ORACLE_FUTURE_SKEW_SECS`) and the interval to a year, neither can overflow for any block
+/// clock short of the year 584 billion. A year is far beyond any real market (Binance funds every
+/// 1, 4 or 8 h), so it refuses only a mistake. `priceUpdateInterval` takes the same cap: with
+/// funding on it is at most `fundingInterval` anyway, and with funding off a longer window would
+/// only freeze the market's index.
+pub const MAX_MARKET_INTERVAL_SECS: u64 = 365 * 24 * 3_600;
+
 fn validate_funding_config(
     prefix: &str,
     price_update_interval: u64,
     funding_interval: u64,
 ) -> Result<(), PerpError> {
+    if price_update_interval > MAX_MARKET_INTERVAL_SECS {
+        return Err(perp_err(format!(
+            "{prefix}: priceUpdateInterval must be <= {MAX_MARKET_INTERVAL_SECS}"
+        )));
+    }
+    if funding_interval > MAX_MARKET_INTERVAL_SECS {
+        return Err(perp_err(format!(
+            "{prefix}: fundingInterval must be <= {MAX_MARKET_INTERVAL_SECS}"
+        )));
+    }
     if funding_interval == 0 {
         return Ok(());
     }

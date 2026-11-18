@@ -707,6 +707,9 @@ sol! {
         /// and the fee takes that dust, never more than the fee due. Not range-checked: 10,000 =
         /// the whole notional.
         /// Same meaning on `updateMarket`, `getMarket`, `MarketAdded` and `MarketUpdated`.
+        ///
+        /// `priceUpdateInterval` (> 0) and `fundingInterval` (0 = funding off, else a multiple of
+        /// `priceUpdateInterval`) are each at most one year, 31,536,000 s; `updateMarket` too.
         function addMarket(uint64 marketId, uint32 baseDecimals, uint32 priceDecimals, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint64 initialMarkPrice, uint32 priceBandBps) external;
         /// Update mutable market parameters (tick/step/quantity/price limits, active flag, and funding config).
         /// `active = false` refuses every new order; conditional orders then neither fire nor
