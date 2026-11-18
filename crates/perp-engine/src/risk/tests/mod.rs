@@ -1941,6 +1941,183 @@ fn an_adl_winner_whose_funding_cannot_be_settled_is_passed_over() {
     }
 }
 
+/// **Second-round review (q7-funding-1): a MAKER whose pending funding cannot be settled is
+/// cancelled, not a halt.** The state of [`an_adl_winner_whose_funding_cannot_be_settled_is_passed_over`]
+/// with ALICE's position also on the book: before the index jumps to `1e20` she rests a reducing
+/// ask of 1 @ $130. KEEPER (short 1, past bankruptcy at $130) is liquidated through it.
+///
+/// The walk settles a maker's funding when it first touches it, with `?`: the liquidation's book
+/// leg failed after KEEPER's funding write and cancel-all, so the drain PANICKED and `liquidate()`
+/// returned the raw `math: funding payment exceeds i64`; an ordinary taker reaching the ask
+/// reverted with the same string. Now ALICE joins the match UNSETTLED and her fill is refused like
+/// a K9 maker's: the ask is cancelled `MakerInsolvent`, nothing trades, her funding is neither
+/// settled nor written (`margin`, `last_funding_index` bit-identical), and KEEPER's liquidation goes
+/// on to ADL — where ALICE is passed over too, so KEEPER stays open.
+#[test]
+fn a_maker_whose_funding_cannot_be_settled_is_cancelled_not_a_halt() {
+    use crate::interface::IPerpDex::{Adl, Liquidation, OrderCancelled, Trade};
+    for route in ["drain", "liquidate", "taker"] {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        save_position(&mut ctx, QTY, -ENTRY_VALUE);
+        place_order(&mut ctx, ALICE, Side::Sell as u8, 13_000, 1);
+        let index: i128 = 100_000_000_000_000_000_000;
+        set_funding_index(&mut ctx, index);
+        storage::save_position(
+            &mut ctx,
+            KEEPER,
+            MARKET_ID,
+            &PerpPosition {
+                amount: -1,
+                v_quote_balance: 100_000_000,
+                margin: 20_000_000,
+                leverage: 5,
+                last_funding_index: index,
+                ..crate::margin::margin_type::never_set_position()
+            },
+            AccountUpdateReason::Adjustment,
+        )
+        .unwrap();
+        storage::save_mark_price(&mut ctx, MARKET_ID, 13_000).unwrap();
+        let alice = position(&mut ctx, ALICE);
+        assert_eq!(alice.total_sell_qty, 1, "ALICE's ask rests");
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        match route {
+            "drain" => {
+                storage::save_deferred_work(&mut ctx, MARKET_ID, true).unwrap();
+                crate::risk::funding::run_drain_deferred_work(
+                    &drainDeferredWorkCall { marketId: MARKET_ID }.abi_encode(),
+                    &mut ctx,
+                )
+                .expect("the drain must not fail on a maker it cannot settle");
+            }
+            "liquidate" => {
+                liquidate(&mut ctx, KEEPER).expect("liquidate() must not surface ALICE's fault");
+            }
+            _ => {
+                try_place_order(&mut ctx, MAKER, Side::Buy as u8, 13_000, 1)
+                    .expect("a taker reaching ALICE's ask must not revert");
+            }
+        }
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        assert!(decode_events::<Trade>(&logs).is_empty(), "{route}: ALICE's ask filled");
+        let cancels: Vec<(Address, u8)> =
+            decode_events::<OrderCancelled>(&logs).iter().map(|c| (c.user, c.reason)).collect();
+        assert_eq!(cancels, [(ALICE, CancelReason::MakerInsolvent as u8)], "{route}");
+        let after = position(&mut ctx, ALICE);
+        assert_eq!(
+            (after.amount, after.v_quote_balance, after.margin, after.last_funding_index),
+            (alice.amount, alice.v_quote_balance, alice.margin, alice.last_funding_index),
+            "{route}: ALICE's funding was settled"
+        );
+        assert_eq!(after.total_sell_qty, 0, "{route}: the cancel is in her aggregates");
+        assert_eq!(storage::book_order_count(&mut ctx, ALICE, MARKET_ID).unwrap(), 0);
+        if route != "taker" {
+            let liq: Vec<(Address, i64)> =
+                decode_events::<Liquidation>(&logs).iter().map(|l| (l.user, l.amount)).collect();
+            assert_eq!(liq, [(KEEPER, -1)], "{route}");
+            assert!(decode_events::<Adl>(&logs).is_empty(), "{route}: ALICE was ADL'd");
+            assert_eq!(position(&mut ctx, KEEPER).amount, -1, "{route}: no counterparty");
+        }
+    }
+}
+
+/// **Second-round review (adl-skip-3): a holder whose total balance sits within its pending
+/// funding credit of `i64::MAX` is passed over — as an ADL winner, and as a maker.** ALICE long 10
+/// @ $100 at 5x (bankrupt at $80); KEEPER short 10 @ $100 on a `MARGIN` silo with
+/// `wallet + Σ margin = i64::MAX − 1 + extra`. Index 10 owes the short `+1`, so settling KEEPER's
+/// funding moves nothing but the header `wb = cw + Σ pos.margin`, which overflows at `extra = 1`.
+///
+/// The ADL pass-over (c980fdee) checked only the payment and where it lands, so the settle then
+/// failed on the header after the loser's writes; the same holder resting a bid ALICE's book leg
+/// reached failed in the walk's funding settle. Both panicked the sweep. Now both use the settle's
+/// own arithmetic, header included (`funding::funding_settlement_fits`): KEEPER's bid is cancelled
+/// `MakerInsolvent` and KEEPER is passed over as a winner, so ALICE stays open — no other holder.
+/// At `extra = 0` (the control) the header fits: the bid fills, or KEEPER takes the ADL at ALICE's
+/// bankruptcy price.
+#[test]
+fn a_holder_at_the_balance_brim_is_passed_over_not_a_halt() {
+    use crate::interface::IPerpDex::{Adl, OrderCancelled, Trade};
+    for (maker_bid, extra) in [(false, 0i64), (false, 1), (true, 0), (true, 1)] {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        save_position(&mut ctx, QTY, -ENTRY_VALUE);
+        seed_position_account(
+            &mut ctx,
+            KEEPER,
+            -QTY,
+            ENTRY_VALUE,
+            MARGIN,
+            5,
+            i64::MAX - MARGIN - 1 + extra,
+        );
+        if maker_bid {
+            // Reduce-only (flag bit 0, `trading::order::ORDER_FLAG_REDUCE_ONLY`): KEEPER's close.
+            run_place_order(
+                &placeOrderCall {
+                    marketId: MARKET_ID,
+                    side: Side::Buy as u8,
+                    price: 7_600,
+                    quantity: QTY as u64,
+                    orderType: 0,
+                    tif: 0,
+                    clientOrderId: FixedBytes::default(),
+                    flags: 1,
+                }
+                .abi_encode(),
+                KEEPER,
+                &mut ctx,
+            )
+            .unwrap();
+        }
+        set_funding_index(&mut ctx, 10);
+        let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+        let keeper = position(&mut ctx, KEEPER);
+        assert_eq!(crate::risk::funding::pending_funding_payment(10, &keeper, &market).unwrap(), 1);
+        let keeper_account = storage::load_account(&mut ctx, KEEPER).unwrap();
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        oracle_tick(&mut ctx, 7_500, 31);
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        let label = format!("maker_bid {maker_bid} extra {extra}");
+        let trades: Vec<(Address, u64, u64)> =
+            decode_events::<Trade>(&logs).iter().map(|t| (t.maker, t.price, t.quantity)).collect();
+        let adls: Vec<(Address, u64)> =
+            decode_events::<Adl>(&logs).iter().map(|a| (a.adlUser, a.qty)).collect();
+        let cancels: Vec<(Address, u8)> =
+            decode_events::<OrderCancelled>(&logs).iter().map(|c| (c.user, c.reason)).collect();
+        match (maker_bid, extra) {
+            (true, 0) => {
+                assert_eq!(trades, [(KEEPER, 7_600, QTY as u64)], "{label}");
+                assert_eq!(position(&mut ctx, ALICE).amount, 0, "{label}");
+            }
+            (false, 0) => {
+                assert!(trades.is_empty(), "{label}");
+                assert_eq!(adls, [(KEEPER, QTY as u64)], "{label}");
+                assert_eq!(position(&mut ctx, ALICE).amount, 0, "{label}");
+            }
+            _ => {
+                assert!(trades.is_empty() && adls.is_empty(), "{label}: KEEPER was filled");
+                let want: Vec<(Address, u8)> = if maker_bid {
+                    vec![(KEEPER, CancelReason::MakerInsolvent as u8)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(cancels, want, "{label}");
+                assert_eq!(position(&mut ctx, ALICE).amount, QTY, "{label}: no counterparty");
+                let after = position(&mut ctx, KEEPER);
+                assert_eq!(
+                    (after.amount, after.margin, after.last_funding_index),
+                    (keeper.amount, keeper.margin, keeper.last_funding_index),
+                    "{label}: KEEPER's funding was settled"
+                );
+                assert_eq!(storage::load_account(&mut ctx, KEEPER).unwrap(), keeper_account);
+            }
+        }
+    }
+}
+
 #[test]
 fn add_margin_rejected_after_funding_writes_nothing() {
     // commit-only #23 (validate-then-apply): a margin op that settles funding IN MEMORY and THEN
