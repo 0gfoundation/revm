@@ -184,6 +184,36 @@ fn a_maker_fill_past_the_position_bound_is_cancelled_not_an_err() {
     assert_eq!(storage::book_order_count(&mut ctx, MAKER, MARKET_ID).unwrap(), 1, "rested");
 }
 
+/// **An opening REST past the bound is refused `-2027` at placement**, like the fill it would make.
+/// ALICE is long 1,000,000 at a $9M `maxPrice`; a bid of 100,000 more would leave 1,100,000, past
+/// the bound, so it cannot rest — it used to rest and be cancelled at its first touch (the test
+/// above shows that path, for a bid that fitted when it rested). A bid up to the bound rests, and
+/// so does a pure close of any size.
+#[test]
+fn an_opening_rest_past_the_position_bound_is_refused() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    update_market(&mut ctx, HIGH_MAX_PRICE).unwrap();
+    fund(&mut ctx, &[ALICE, MAKER]);
+    place(&mut ctx, MAKER, Side::Sell, ENTRY_PRICE, 1_000_000, TimeInForce::Gtc).unwrap();
+    place(&mut ctx, ALICE, Side::Buy, ENTRY_PRICE, 1_000_000, TimeInForce::Ioc).unwrap();
+    assert_eq!(position(&mut ctx, ALICE).amount, 1_000_000);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let writes = ctx.perp_write_count();
+    let err = place(&mut ctx, ALICE, Side::Buy, ENTRY_PRICE - 100, 100_000, TimeInForce::Gtc)
+        .unwrap_err();
+    assert_eq!(err.to_string(), POSITION_LIMIT_REJECT);
+    assert_eq!(ctx.perp_write_count(), writes, "a refused rest wrote");
+    assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+    assert_eq!(storage::book_order_count(&mut ctx, ALICE, MARKET_ID).unwrap(), 0);
+
+    let room = (BOUND_AT_HIGH_MAX_PRICE - 1_000_000) as u64;
+    place(&mut ctx, ALICE, Side::Buy, ENTRY_PRICE - 100, room, TimeInForce::Gtc).unwrap();
+    place(&mut ctx, ALICE, Side::Sell, ENTRY_PRICE + 100, 1_000_000, TimeInForce::Gtc).unwrap();
+    assert_eq!(storage::book_order_count(&mut ctx, ALICE, MARKET_ID).unwrap(), 2);
+}
+
 /// **`updateMarket` refuses a `maxPrice` raise an open position cannot carry.** ALICE is long
 /// 2,000,000 — well inside the bound at the fixture's $10,000 `maxPrice` — so raising it to $9M,
 /// where she is worth `1.8e19`, is refused with nothing written (the reviewer's 2,000,000 position

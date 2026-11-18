@@ -5181,6 +5181,12 @@ mod band_expiry;
 // and no fill executes above `maxPrice` — so no valuation the liquidation sweep makes can fault.
 mod position_bound;
 
+// ── An opening REST meets the per-open guards of its fill (Q6/Q13 review) ──────────────────────
+//
+// The tier guard and the position bound refuse an opening fill; an order they would refuse at its
+// own price is refused when it rests instead of resting as a "phantom" cancelled at its first touch.
+mod open_rest_guard;
+
 // ── ORDERED `ACCOUNT_UPDATE` STREAM SHAPE: liquidation and ADL ───────────────────────────────────
 //
 // Both of these were structurally uncoverable by the old hand-attached snapshot helper (it ran only
