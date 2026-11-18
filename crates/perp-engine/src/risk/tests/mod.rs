@@ -1877,6 +1877,70 @@ fn alice_untouched_snapshot(ctx: &mut TestCtx) -> (PerpPosition, UserAccount, u6
     )
 }
 
+/// **Q7: an ADL winner whose pending funding cannot be settled is passed over, not a halt.** The
+/// state of [`a_funding_payment_past_i64_is_faulted_write_free`] — ALICE long 10 owing `1e19` at
+/// index `1e20` — plus KEEPER short 1 @ $100 on $20 of margin, anchored at the index, and a $130
+/// mark: KEEPER is past bankruptcy, the book is empty, and ALICE is the only opposite holder.
+///
+/// The ADL ranking put ALICE in the fallback tier, but the fill loop then settled her funding with
+/// `?`: a drain PANICKED ("an isolated liquidation failed"), and a keeper's `liquidate(KEEPER)`
+/// returned the raw `math: funding payment exceeds i64`. Now she is passed over with nothing
+/// written, by both routes: KEEPER's liquidation runs and leaves the position open (no eligible
+/// counterparty — a residual the next tick re-sweeps), and ALICE is bit-identical.
+#[test]
+fn an_adl_winner_whose_funding_cannot_be_settled_is_passed_over() {
+    use crate::interface::IPerpDex::{Adl, Liquidation};
+    for manual in [false, true] {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        let index: i128 = 100_000_000_000_000_000_000;
+        set_funding_index(&mut ctx, index);
+        save_position(&mut ctx, QTY, -ENTRY_VALUE);
+        storage::save_position(
+            &mut ctx,
+            KEEPER,
+            MARKET_ID,
+            &PerpPosition {
+                amount: -1,
+                v_quote_balance: 100_000_000,
+                margin: 20_000_000,
+                leverage: 5,
+                last_funding_index: index,
+                ..crate::margin::margin_type::never_set_position()
+            },
+            AccountUpdateReason::Adjustment,
+        )
+        .unwrap();
+        storage::save_mark_price(&mut ctx, MARKET_ID, 13_000).unwrap();
+        let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+        assert!(crate::risk::funding::pending_funding_payment(index, &position(&mut ctx, ALICE), &market)
+            .is_err());
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        let (alice, alice_account) =
+            (position(&mut ctx, ALICE), storage::load_account(&mut ctx, ALICE).unwrap());
+
+        if manual {
+            liquidate(&mut ctx, KEEPER).expect("liquidate() must not surface ALICE's fault");
+        } else {
+            storage::save_deferred_work(&mut ctx, MARKET_ID, true).unwrap();
+            let out = crate::risk::funding::run_drain_deferred_work(
+                &drainDeferredWorkCall { marketId: MARKET_ID }.abi_encode(),
+                &mut ctx,
+            )
+            .expect("the drain must not fail on a winner it cannot settle");
+            assert!(!drainDeferredWorkCall::abi_decode_returns(&out).unwrap(), "nothing deferred");
+        }
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        let liq: Vec<(Address, i64)> =
+            decode_events::<Liquidation>(&logs).iter().map(|l| (l.user, l.amount)).collect();
+        assert_eq!(liq, [(KEEPER, -1)], "manual {manual}");
+        assert!(decode_events::<Adl>(&logs).is_empty(), "manual {manual}: ALICE was filled");
+        assert_eq!(position(&mut ctx, KEEPER).amount, -1, "manual {manual}: no counterparty");
+        assert_eq!(position(&mut ctx, ALICE), alice, "manual {manual}: ALICE written");
+        assert_eq!(storage::load_account(&mut ctx, ALICE).unwrap(), alice_account);
+    }
+}
+
 #[test]
 fn add_margin_rejected_after_funding_writes_nothing() {
     // commit-only #23 (validate-then-apply): a margin op that settles funding IN MEMORY and THEN
