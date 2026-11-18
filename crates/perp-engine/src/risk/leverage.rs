@@ -221,7 +221,8 @@ fn set_leverage_core<H: PerpHost>(
 /// same gate the `AccountPosition` row and `PositionChanged` read, never the raw stored byte.
 ///
 /// Reverts on an unknown market: the tier table is a required input, and fabricating an empty one
-/// would report `0` — "unbounded" — for a market that does not exist.
+/// would report a bound — `u64::MAX` ("unbounded") or `0` ("none") — for a market that does not
+/// exist.
 pub fn run_get_symbol_config<H: PerpHost>(
     input_bytes: &[u8],
     context: &mut H,
