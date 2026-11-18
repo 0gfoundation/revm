@@ -1738,6 +1738,133 @@ fn healthy_candidate_scan_is_write_free_even_with_accrued_funding() {
     }
 }
 
+/// **Q7: a position the sweep cannot value is skipped, not a halt (J4).** At a `maxPrice` of
+/// $9,000,000 that `updateMarket` accepts (one `maxQuantity` order is worth `9e18 ≤ i64::MAX`),
+/// ALICE long and WHALE short 2,000,000 each are worth `1.8e19` quote units at the mark — past
+/// `i64`, so `is_above_maintenance_margin` faults on them. Before Q7 the sweep's write-free check
+/// phase propagated that `Err` and the sweep panicked ("failed mid-apply") on every tick.
+///
+/// Now the tick succeeds: the two unvaluable positions are left bit-identical (no event, no
+/// deferral), and the sweep goes on to liquidate KEEPER's short 1 (margin $20 at a $9M mark — deep
+/// past bankruptcy): no bids, so it is ADL'd at its bankruptcy price $120 against MAKER's long 1
+/// (ALICE, the other long, cannot be valued at the fill and is fallback tier in ADL). A manual
+/// `liquidate()` of either unvaluable position is refused write-free with the new reason.
+#[test]
+fn an_isolated_position_the_sweep_cannot_value_is_skipped_not_a_halt() {
+    use crate::interface::IPerpDex::{Adl, Liquidation};
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let mut market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    market.max_price = 900_000_000;
+    storage::save_market(&mut ctx, &market).unwrap();
+    // `updateMarket`'s `validate_market_bounds` accepts this config: one `maxQuantity` order at
+    // `maxPrice` still fits an i64.
+    let max_order_value = calc_value(900_000_000, market.max_quantity, 0, PRICE_DECIMALS).unwrap();
+    assert_eq!((market.max_quantity, max_order_value), (1_000_000, 9_000_000_000_000_000_000));
+    assert!(max_order_value <= i64::MAX as u64);
+
+    let big = 2_000_000i64;
+    let big_value = calc_value(ENTRY_PRICE, big as u64, 0, PRICE_DECIMALS).unwrap() as i64;
+    assert_eq!(big_value, 200_000_000_000_000);
+    seed_position_account(&mut ctx, ALICE, big, -big_value, big_value, 1, 0);
+    seed_position_account(&mut ctx, WHALE, -big, big_value, big_value, 1, 0);
+    seed_position_account(&mut ctx, KEEPER, -1, 100_000_000, 20_000_000, 5, 0);
+    seed_position_account(&mut ctx, MAKER, 1, -100_000_000, 100_000_000, 1, 0);
+    assert_eq!(
+        storage::load_position_registry(&mut ctx, MARKET_ID).unwrap(),
+        [ALICE, WHALE, KEEPER, MAKER],
+        "the unvaluable positions are scanned first"
+    );
+    assert!(
+        calc_value(900_000_000, big as u64, 0, PRICE_DECIMALS).unwrap() > i64::MAX as u64,
+        "their notional at the mark is past i64"
+    );
+    let (alice, whale) = (position(&mut ctx, ALICE), position(&mut ctx, WHALE));
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    advance_block_to(&mut ctx, 31);
+    run_update_index_price(
+        &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: 900_000_000, timestamp: 31 }
+            .abi_encode(),
+        ADMIN,
+        &mut ctx,
+    )
+    .expect("the tick must not fail on a position it cannot value");
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+
+    assert_eq!(storage::load_mark_price(&mut ctx, MARKET_ID).unwrap(), 900_000_000);
+    assert_eq!(position(&mut ctx, ALICE), alice, "skipped: nothing written");
+    assert_eq!(position(&mut ctx, WHALE), whale, "skipped: nothing written");
+    let liquidations: Vec<(Address, i64, u64)> = decode_events::<Liquidation>(&logs)
+        .into_iter()
+        .map(|l| (l.user, l.amount, l.reward))
+        .collect();
+    assert_eq!(liquidations, [(KEEPER, -1, 0)], "only the valuable position is liquidated");
+    let adls: Vec<(Address, Address, u64, u64)> = decode_events::<Adl>(&logs)
+        .into_iter()
+        .map(|a| (a.liquidatedUser, a.adlUser, a.qty, a.price))
+        .collect();
+    assert_eq!(adls, [(KEEPER, MAKER, 1, 12_000)], "ADL'd at its bankruptcy price, $120");
+    let (keeper, maker) = (position(&mut ctx, KEEPER), position(&mut ctx, MAKER));
+    assert_eq!((keeper.amount, keeper.cumulative_realized_pnl), (0, -20_000_000));
+    assert_eq!((maker.amount, maker.cumulative_realized_pnl), (0, 20_000_000));
+    assert_eq!(
+        storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap().deferred_work,
+        0,
+        "a fault is not deferred work: no retry in this block can value it either"
+    );
+
+    for user in [ALICE, WHALE] {
+        let writes = ctx.perp_write_count();
+        let err = liquidate(&mut ctx, user).unwrap_err();
+        assert_eq!(err.to_string(), super::LIQUIDATE_FAULTED_REJECT);
+        assert_eq!(ctx.perp_write_count(), writes, "a refused liquidate() wrote");
+        assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty(), "a refused liquidate() logged");
+    }
+}
+
+/// **Q7: a funding payment past `i64` is `Faulted`, write-free.** Index `1e20` on a long of 10 owes
+/// `10 · 1e20 / 100 = 1e19` quote units — past `i64`, so `pending_funding_payment` faults. Before
+/// Q7 `liquidate_position` returned that `Err` from its check phase (a halt, in the sweep); now it
+/// answers `Faulted` with no write, and `liquidate()` refuses with the new reason.
+#[test]
+fn a_funding_payment_past_i64_is_faulted_write_free() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_funding_index(&mut ctx, 100_000_000_000_000_000_000);
+    save_position(&mut ctx, QTY, -ENTRY_VALUE);
+    let market = storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap();
+    let pos = position(&mut ctx, ALICE);
+    assert_eq!(
+        crate::risk::funding::pending_funding_payment(100_000_000_000_000_000_000, &pos, &market)
+            .unwrap_err()
+            .to_string(),
+        "math: funding payment exceeds i64"
+    );
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+
+    let before = alice_untouched_snapshot(&mut ctx);
+    let mut adl_budget = 128u32;
+    let out = liquidate_position(
+        &mut ctx,
+        ALICE,
+        MARKET_ID,
+        &market,
+        ENTRY_PRICE,
+        KEEPER,
+        &mut adl_budget,
+        &mut false,
+    );
+    assert_eq!(out, Ok(LiquidationOutcome::Faulted));
+    assert_eq!(alice_untouched_snapshot(&mut ctx), before, "Faulted wrote");
+    assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+
+    let err = liquidate(&mut ctx, ALICE).unwrap_err();
+    assert_eq!(err.to_string(), super::LIQUIDATE_FAULTED_REJECT);
+    assert_eq!(alice_untouched_snapshot(&mut ctx), before, "the refused liquidate() wrote");
+    assert!(JournalTr::take_logs(ctx.journal_mut()).is_empty());
+}
+
 /// Everything a REFUSED call must leave bit-identical: ALICE's stored position (`margin` AND
 /// `last_funding_index`, i.e. the funding was not settled on the way out), her account, the
 /// insurance fund and the perp write counter. Paired with an empty log journal at each call site.
