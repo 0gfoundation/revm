@@ -761,8 +761,10 @@ sol! {
         ///
         /// # Returns
         ///
-        /// `moreRemaining` — true when a sweep stopped on its budget again, i.e. call again. A
-        /// keeper can loop on this without re-reading state.
+        /// `moreRemaining` — true when a sweep stopped on its budget again, or a conditional was
+        /// re-armed for more (a touch-capped fire, a closePosition tranche — see `placeAlgoOrder`),
+        /// i.e. call again. A keeper can loop on this without re-reading state; at a fixed mark
+        /// the loop ends, since every re-arm closed `maxQuantity` or consumed 64 resting orders.
         ///
         /// # Cost
         ///
@@ -834,7 +836,9 @@ sol! {
         ///   is re-armed as a plain stop at the price that fired it (see `getAlgoOrder`). The
         ///   market's deferred-work flag is set, so `drainDeferredWork` fires it again in the same
         ///   block; each fire emits its own `AlgoOrderTriggered`. A FOK limit pair the cap stops is
-        ///   not re-armed: it is the refusal above (reason 10).
+        ///   not re-armed: it is the refusal above (reason 10). A closePosition over `maxQuantity`
+        ///   is re-armed the same way between its tranches (see quantity / flags bit 1); a tranche
+        ///   the cap stops is simply this re-arm, and each fire re-sizes from |position|.
         ///
         /// triggerPrice: fires on the MARK price, per (orderType, side):
         ///     STOP BUY / TAKE_PROFIT SELL   ->  mark >= triggerPrice
@@ -918,6 +922,19 @@ sol! {
         ///
         /// quantity / flags bit 1 (closePosition): exactly one of the two. `closePosition` takes
         ///   the owner's whole |position| AT TRIGGER TIME and is valid only for the `_MARKET` pair.
+        ///   One fire closes `min(|position|, maxQuantity)` — an order may not exceed
+        ///   `maxQuantity`. A larger position closes in TRANCHES: a tranche that FILLED IN FULL with
+        ///   position left is re-armed under the same id like a touch-capped fire (above) — no
+        ///   event of its own, the deferred-work flag set, and `drainDeferredWork` fires the next
+        ///   tranche at the same mark, each with its own `AlgoOrderTriggered` and `OrderPlaced`
+        ///   (quantity = that tranche). Between tranches `getAlgoOrder` reads exactly as before the
+        ///   first fire (quantity 0, closePosition, status Open). If the mark leaves the trigger
+        ///   first, it waits armed (not latched) and the next tick on which the trigger holds fires
+        ///   the next tranche. A tranche the book or the band cannot fill in full expires its
+        ///   remainder and ENDS the conditional, as any closePosition fire does. A position reduced
+        ///   by hand between tranches just makes the next tranche smaller; one closed or flipped
+        ///   ends the order as below (reason 11). A fixed `quantity` is never tranched: above
+        ///   `maxQuantity` it is refused at placement.
         ///   A closePosition order is BOUND TO THE POSITION open when it is placed (Binance's
         ///   `GTE_GTC`): placement needs an open position with `side` its closing side, else
         ///   `placeAlgoOrder: closePosition requires an open position on the closing side`. If that
@@ -928,8 +945,9 @@ sol! {
         ///   and counts toward the caps; cancel it to free the slot sooner. There is no
         ///   one-per-direction limit. A trailing stop is bound the same way (above).
         ///   There is no one-shot "close my position now" conditional either, and none is needed:
-        ///   a reduce-only MARKET `placeOrder` with `quantity ≥ |position|` closes the whole
-        ///   position at once (it is truncated to |position| — see `placeOrder` flags bit 0).
+        ///   a reduce-only MARKET `placeOrder` with `|position| ≤ quantity ≤ maxQuantity` closes the
+        ///   whole position at once (it is truncated to |position| — see `placeOrder` flags bit 0);
+        ///   a position above `maxQuantity` takes one such order per `maxQuantity`.
         ///
         /// price: the resting price for the limit pair; the callback rate in bps for
         ///   TRAILING_STOP_MARKET; must be 0 for STOP_MARKET / TAKE_PROFIT_MARKET.
