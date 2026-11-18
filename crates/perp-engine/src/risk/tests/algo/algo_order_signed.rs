@@ -25,25 +25,7 @@ fn msg(chain_id: u64, account: Address, trigger: u64, qty: u64) -> Vec<u8> {
 }
 
 fn msg_flags(chain_id: u64, account: Address, trigger: u64, qty: u64, flags: u8) -> Vec<u8> {
-    let mut m = Vec::new();
-    m.extend_from_slice(b"perpdex_v1_algo");
-    m.extend_from_slice(&chain_id.to_be_bytes());
-    m.extend_from_slice(account.as_slice());
-    m.push(0); // algoType = CONDITIONAL
-    m.extend_from_slice(&MARKET_ID.to_be_bytes());
-    m.push(Side::Sell as u8);
-    m.push(AlgoOrderType::StopMarket as u8);
-    m.extend_from_slice(&trigger.to_be_bytes());
-    m.extend_from_slice(&0u64.to_be_bytes()); // price
-    m.extend_from_slice(&qty.to_be_bytes());
-    m.push(0); // tif
-    m.push(0); // workingType = MARK_PRICE
-    m.extend_from_slice(&[0u8; 16]); // clientAlgoId
-    m.push(flags);
-    m.extend_from_slice(&TS.to_be_bytes());
-    m.extend_from_slice(&RECV.to_be_bytes());
-    m.push(0); // keyId
-    m
+    req_msg(chain_id, account, &Req { trigger, qty, flags, ..Req::default() })
 }
 
 fn calldata(sig: &[u8], trigger: u64, qty: u64, account: Address) -> Vec<u8> {
@@ -51,20 +33,76 @@ fn calldata(sig: &[u8], trigger: u64, qty: u64, account: Address) -> Vec<u8> {
 }
 
 fn calldata_flags(sig: &[u8], trigger: u64, qty: u64, account: Address, flags: u8) -> Vec<u8> {
+    req_calldata(sig, account, &Req { trigger, qty, flags, ..Req::default() })
+}
+
+/// Every field of a signed conditional the tests vary. The default is the module's canonical
+/// order: a reduce-only SELL STOP_MARKET at 8_000 for `QTY`, signed at `TS`.
+#[derive(Clone, Copy)]
+struct Req {
+    side: Side,
+    kind: AlgoOrderType,
+    trigger: u64,
+    price: u64,
+    qty: u64,
+    tif: u8,
+    flags: u8,
+    ts: u64,
+}
+
+impl Default for Req {
+    fn default() -> Self {
+        Req {
+            side: Side::Sell,
+            kind: AlgoOrderType::StopMarket,
+            trigger: 8_000,
+            price: 0,
+            qty: QTY as u64,
+            tif: 0,
+            flags: RO,
+            ts: TS,
+        }
+    }
+}
+
+/// The canonical message for `r`, rebuilt independently of the engine (see `msg`).
+fn req_msg(chain_id: u64, account: Address, r: &Req) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.extend_from_slice(b"perpdex_v1_algo");
+    m.extend_from_slice(&chain_id.to_be_bytes());
+    m.extend_from_slice(account.as_slice());
+    m.push(0); // algoType = CONDITIONAL
+    m.extend_from_slice(&MARKET_ID.to_be_bytes());
+    m.push(r.side as u8);
+    m.push(r.kind as u8);
+    m.extend_from_slice(&r.trigger.to_be_bytes());
+    m.extend_from_slice(&r.price.to_be_bytes());
+    m.extend_from_slice(&r.qty.to_be_bytes());
+    m.push(r.tif);
+    m.push(0); // workingType = MARK_PRICE
+    m.extend_from_slice(&[0u8; 16]); // clientAlgoId
+    m.push(r.flags);
+    m.extend_from_slice(&r.ts.to_be_bytes());
+    m.extend_from_slice(&RECV.to_be_bytes());
+    m.push(0); // keyId
+    m
+}
+
+fn req_calldata(sig: &[u8], account: Address, r: &Req) -> Vec<u8> {
     placeAlgoOrderSignedCall {
         account,
         algoType: 0,
         marketId: MARKET_ID,
-        side: Side::Sell as u8,
-        orderType: AlgoOrderType::StopMarket as u8,
-        triggerPrice: trigger,
-        price: 0,
-        quantity: qty,
-        tif: 0,
+        side: r.side as u8,
+        orderType: r.kind as u8,
+        triggerPrice: r.trigger,
+        price: r.price,
+        quantity: r.qty,
+        tif: r.tif,
         workingType: 0,
         clientAlgoId: FixedBytes::default(),
-        flags,
-        timestamp: TS,
+        flags: r.flags,
+        timestamp: r.ts,
         recvWindow: RECV,
         keyId: 0,
         signature: sig.to_vec().into(),
