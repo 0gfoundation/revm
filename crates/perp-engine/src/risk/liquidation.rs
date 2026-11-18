@@ -64,9 +64,11 @@ fn isolated_maintenance_verdict(
 ///   take to ADL, charges the clearance fee to the IF, emits `Liquidation`, and returns
 ///   `Liquidated`.
 ///
-/// TOTAL up to the first write (J4): the three refusals write NOTHING, and the only `Err` before
-/// the first write is the storage layer's. An `Err` after it is a commit-only invariant failure,
-/// which the sweep halts on.
+/// TOTAL in its valuation (J4): the three refusals write NOTHING, and an arithmetic fault in
+/// valuing the position is the `Faulted` refusal, never an `Err`. What can still `Err` before the
+/// first write is the storage layer (and the account aggregates the funding header sums, which
+/// every later write of that account would fail on too); an `Err` after it is a commit-only
+/// invariant failure. The sweep halts on both.
 ///
 /// One call is one PASS, and a pass need not close the whole position. When the book leg stops
 /// on the distinct-maker cap ([`crate::trading::MAX_LIQUIDATION_MAKER_ACCOUNTS`]) the book still
@@ -136,8 +138,8 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // price. Storage errors still propagate (the cross TOTAL policy: "the only `Err` left is the
     // storage layer's"); turning those into skips would hide a node-local fault behind a silent
     // divergence. The verdict reads the index from `FundingState` as the settlement does, and
-    // builds the funding header only for a position it found liquidatable, so a healthy candidate
-    // in the O(N) scan now reads neither the account nor anything else beyond its position.
+    // the funding header is built only for a position found liquidatable, so a healthy candidate
+    // in the O(N) scan reads its position and the funding state, never the account.
     //
     // `None` (in `compute_funding_settlement`): this path deliberately does NOT load the account
     // (the load was removed when funding stopped touching the wallet — see the note above), and the
@@ -621,9 +623,11 @@ const ADL_BUDGET_PER_UPDATE: u32 = 128;
 ///   else → commit. The registry is a SET, so an account is processed at most once per sweep,
 ///   however many of its markets an episode touches.
 ///
-/// Both are TOTAL up to their first write (J4): what cannot be valued is skipped, so the only `Err`
-/// either returns before writing is the storage layer's. That, or any `Err` after the first write
-/// (a commit-only invariant failure), aborts the node rather than allowing a partial write set.
+/// Both are TOTAL in their valuation (J4): a position or leg that cannot be valued is skipped,
+/// never an `Err`. An `Err` that either still returns before writing is the storage layer's (or,
+/// for an isolated position, an account aggregate past `i64` in the funding header); that, or any
+/// `Err` after the first write (a commit-only invariant failure), aborts the node rather than
+/// allowing a partial write set.
 fn run_liquidation_sweep<H: PerpHost>(
     context: &mut H,
     market_id: u64,
@@ -669,7 +673,7 @@ fn run_liquidation_sweep<H: PerpHost>(
         // and only applied when liquidatable), so the checkpoint only balances EVM-side state.
         // A liquidation that FAILS mid-apply would leave partial perp writes with no undo — a
         // corruption-anyway condition: halt loudly rather than skip silently. An `Err` before the
-        // first write is a storage-layer one (the check phases are total, J4): halted on too.
+        // first write is never a valuation fault (the check phases are total, J4): halted on too.
         let cp = context.checkpoint();
         let wrote = if crossed {
             let caller = cross_liquidation::EpisodeCaller {
