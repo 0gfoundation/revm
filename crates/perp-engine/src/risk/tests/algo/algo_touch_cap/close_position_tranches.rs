@@ -588,3 +588,38 @@ fn q3_13_a_fok_or_resting_child_above_a_lowered_max_quantity_is_voided() {
         assert_eq!(bid_count(&mut ctx), 100);
     }
 }
+
+/// Q3-14: the one-shot close by hand (`placeOrder` flags bit 0) works within `maxQuantity` only.
+/// `maxQuantity` is checked on the quantity as sent, before reduce-only truncation: a reduce-only
+/// MARKET sell of |position| = 100 at maxQuantity 40 is refused whole, and the position closes in
+/// orders of at most 40 — the last one, 40 against 20 left, truncated to 20.
+#[test]
+fn q3_14_a_one_shot_close_above_max_quantity_is_refused_and_closes_per_max_quantity() {
+    let mut ctx = fixture(100);
+    set_max_qty(&mut ctx, 40);
+    bids(&mut ctx, 100, 200);
+    let ro_market_sell = |qty: u64| {
+        placeOrderCall {
+            marketId: MARKET_ID,
+            side: Side::Sell as u8,
+            price: 0,
+            quantity: qty,
+            orderType: OrderType::Market as u8,
+            tif: TimeInForce::Ioc as u8,
+            clientOrderId: FixedBytes::default(),
+            flags: RO,
+        }
+        .abi_encode()
+    };
+
+    let e = run_place_order(&ro_market_sell(100), ALICE, &mut ctx).unwrap_err();
+    assert!(format!("{e:?}").contains("placeOrder: quantity exceeds maximum"), "{e:?}");
+    assert_eq!(amount(&mut ctx), 100);
+
+    let mut placed = vec![];
+    while amount(&mut ctx) > 0 {
+        let logs = shell(&mut ctx, ALICE, &ro_market_sell(40)).1;
+        placed.extend(evs::<OrderPlaced>(&logs).into_iter().map(|e| e.quantity));
+    }
+    assert_eq!(placed, vec![40, 40, 20], "the last one truncated to |position|");
+}

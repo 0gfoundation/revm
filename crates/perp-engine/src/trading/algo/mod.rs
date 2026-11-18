@@ -211,8 +211,9 @@ fn validate(
 
     // Binance: `reduceOnly` "cannot be sent with closePosition=true". The pair is not a stronger
     // order, only an ambiguous one: a closePosition order is reduce-only by construction (it
-    // closes `|position|` at trigger and the trigger places it reduce-only), so accepting both
-    // bits would give one order two spellings and the record a flag that says nothing.
+    // closes `|position|` at trigger — in `maxQuantity` tranches above that, Q3 — and the trigger
+    // places it reduce-only), so accepting both bits would give one order two spellings and the
+    // record a flag that says nothing.
     if reduce_only && close_position {
         return Err(perp_err(
             "placeAlgoOrder: reduceOnly cannot be sent with closePosition",

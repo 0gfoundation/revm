@@ -1373,9 +1373,11 @@ sol! {
         ///            A MARKET, IOC or FOK order has no place in that queue — it fills before
         ///            everything resting — so it is bounded by |position| alone, and the resting
         ///            reduce-only orders it leaves over-committed are evicted after the fill. That
-        ///            makes a reduce-only MARKET order with `quantity ≥ |position|` the ONE-SHOT
-        ///            CLOSE: it is accepted and truncated to |position| (floored to `stepSize`) —
-        ///            Binance's own recipe; there is no separate close selector.
+        ///            makes a reduce-only MARKET order with `|position| ≤ quantity ≤ maxQuantity`
+        ///            the ONE-SHOT CLOSE: it is accepted and truncated to |position| (floored to
+        ///            `stepSize`) — Binance's own recipe; there is no separate close selector.
+        ///            `maxQuantity` is checked first, on the quantity as sent, so a position above
+        ///            `maxQuantity` takes one such order per `maxQuantity`.
         ///            Reduce-only cap: an account may hold at most 10 reduce-only orders RESTING
         ///            per market, counting in the same budget its untriggered limit conditionals
         ///            with tif GTC / PostOnly (see `placeAlgoOrder` tif). A reduce-only order whose
