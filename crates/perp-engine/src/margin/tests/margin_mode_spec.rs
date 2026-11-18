@@ -832,7 +832,7 @@ fn p0_the_btc_table_reads_back_as_binances_leverage_bracket() {
     assert_eq!(tiers(&mut ctx, M1).lowerBounds, vec![0]);
 
     // getSymbolConfig's maxNotionalValue reads the same table backwards: the upper bound of the
-    // highest tier still admitting the leverage; 0 = unbounded (the last tier).
+    // highest tier still admitting the leverage; u64::MAX = unbounded (the last tier).
     for (lev, cap) in [
         (125u64, 50_000 * USD),
         (100, 250_000 * USD),
@@ -840,7 +840,7 @@ fn p0_the_btc_table_reads_back_as_binances_leverage_bracket() {
         (20, 15_000_000 * USD),
         (3, 200_000_000 * USD),
         (2, 300_000_000 * USD),
-        (1, 0),
+        (1, u64::MAX),
     ] {
         ok(&mut ctx, ERIN, &setLeverageCall { marketId: TM, leverage: lev }.abi_encode());
         let s = sym(&mut ctx, ERIN, TM);
@@ -1262,7 +1262,7 @@ fn mt_gated_every_surface_reports_isolated() {
     let mut ctx = fresh();
     for m in [M1, M2] {
         let s = sym(&mut ctx, ERIN, m);
-        assert_eq!((s.leverage, s.maxNotionalValue, s.marginType), (1, 0, ISOLATED));
+        assert_eq!((s.leverage, s.maxNotionalValue, s.marginType), (1, u64::MAX, ISOLATED));
         assert_eq!(risk(&mut ctx, ERIN, m).marginType, ISOLATED);
     }
     let out = view(&mut ctx, &getSymbolConfigCall { user: ERIN, marketId: NO_MARKET }.abi_encode());

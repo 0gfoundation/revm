@@ -203,10 +203,18 @@ fn set_leverage_core<H: PerpHost>(
 /// `math::open_order_margin` apply, so this selector reports the leverage that is actually in
 /// force rather than a raw blob field that may still read 0 on a defaulted position.
 ///
-/// `maxNotionalValue` is [`max_notional_for_leverage`] — the tier table read backwards, `0` for
-/// unbounded. Kept in `math::` next to the forward lookup it inverts so the two cannot disagree
-/// about the band structure; see that function for the `setMarginTiers`-under-a-live-position
-/// state its assertion covers, and the ABI doc for why this is a selector at all.
+/// `maxNotionalValue` is [`max_notional_for_leverage`] — the tier table read backwards at THAT
+/// stored leverage: `u64::MAX` for unbounded, `0` when no tier admits it. Kept in `math::` next to
+/// the forward lookup it inverts so the two cannot disagree about the band structure; see that
+/// function for the `0` case, and the ABI doc for why this is a selector at all.
+///
+/// `0` is what a user sees after `setMarginTiers` lowers tier 0's cap under a leverage they set
+/// earlier — flat or not, since a flat position keeps its leverage. The view still reports the
+/// STORED leverage, not `min(stored, cap)`: every margin term and both per-open guards use the
+/// stored value, so the chain refuses every open until `setLeverage` lowers it, and an "effective"
+/// leverage here would show a limit the chain does not honour, disagree with `getPosition` and
+/// `AccountPosition`, and hide from a client comparing it against its target that the
+/// `setLeverage` call is still needed.
 ///
 /// `marginType` is the type IN FORCE, through
 /// [`crate::margin::margin_type::effective_margin_type`] — the

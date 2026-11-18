@@ -3068,8 +3068,8 @@ fn symbol_config(ctx: &mut TestCtx, user: Address, market_id: u64) -> (u64, u64)
 }
 
 /// The DEFAULT configuration: one tier `{0, 3}`, whose band runs to infinity, so
-/// `maxNotionalValue` is `0` (UNBOUNDED) at every leverage — including for a user who has never
-/// touched this market and reads back the unset `leverage = 1`.
+/// `maxNotionalValue` is `u64::MAX` (UNBOUNDED) at every leverage — including for a user who has
+/// never touched this market and reads back the unset `leverage = 1`.
 #[test]
 fn get_symbol_config_is_unbounded_on_the_default_single_tier_table() {
     let mut ctx = make_ctx();
@@ -3077,7 +3077,7 @@ fn get_symbol_config_is_unbounded_on_the_default_single_tier_table() {
 
     assert_eq!(
         symbol_config(&mut ctx, ALICE, MARKET_ID),
-        (1, 0),
+        (1, u64::MAX),
         "no position: leverage reads back the unset 1, and the single tier is unbounded"
     );
 
@@ -3085,7 +3085,7 @@ fn get_symbol_config_is_unbounded_on_the_default_single_tier_table() {
         set_leverage(&mut ctx, leverage).unwrap();
         assert_eq!(
             symbol_config(&mut ctx, ALICE, MARKET_ID),
-            (leverage, 0),
+            (leverage, u64::MAX),
             "single-tier table is unbounded at leverage {leverage}"
         );
     }
@@ -3094,12 +3094,12 @@ fn get_symbol_config_is_unbounded_on_the_default_single_tier_table() {
 /// The BOUNDED configuration — the one that separates this selector from a client re-deriving the
 /// bound out of `getMarginTiers`. `[{0, 3}, {$200, 2}, {$400, 1}]`, checked at every leverage in
 /// `1..=3`: the reported bound is the upper edge of the LAST tier whose `maxLeverage` still admits
-/// the leverage in force, and `0` when that tier is the final one.
+/// the leverage in force, and `u64::MAX` (unbounded) when that tier is the final one.
 ///
 /// ```text
 /// leverage 3 -> only tier 0 admits it   -> table[1].lower = $200 = 200_000_000
 /// leverage 2 -> tiers 0,1 admit it      -> table[2].lower = $400 = 400_000_000
-/// leverage 1 -> all three admit it; tier 2 is FINAL -> 0 (unbounded)
+/// leverage 1 -> all three admit it; tier 2 is FINAL -> u64::MAX (unbounded)
 /// ```
 #[test]
 fn get_symbol_config_reports_the_band_edge_at_each_leverage() {
@@ -3114,7 +3114,7 @@ fn get_symbol_config_reports_the_band_edge_at_each_leverage() {
     )
     .unwrap();
 
-    for (leverage, expected) in [(1u64, 0u64), (2, 400_000_000), (3, 200_000_000)] {
+    for (leverage, expected) in [(1u64, u64::MAX), (2, 400_000_000), (3, 200_000_000)] {
         set_leverage(&mut ctx, leverage).unwrap();
         assert_eq!(
             symbol_config(&mut ctx, ALICE, MARKET_ID),
@@ -3124,8 +3124,8 @@ fn get_symbol_config_reports_the_band_edge_at_each_leverage() {
     }
 }
 
-/// The tier table is a required input, so an unknown market REVERTS rather than reporting `0` —
-/// which would read as "unbounded" for a market that does not exist. Same shape as
+/// The tier table is a required input, so an unknown market REVERTS rather than reporting a
+/// bound — `u64::MAX` ("unbounded") or `0` ("none") — for a market that does not exist. Same shape as
 /// `getMarginTiers` and `getPositionRisk`, deliberately NOT `getPosition`'s all-zeros.
 #[test]
 fn get_symbol_config_rejects_unknown_market() {
