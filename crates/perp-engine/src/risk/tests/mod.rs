@@ -78,6 +78,15 @@ fn take_position_changes(
         .collect()
 }
 
+/// Moves the block clock forward to `ts`, never back, so an oracle push stamped `ts` is inside
+/// `MAX_ORACLE_FUTURE_SKEW_SECS` of the block that executes it — as a live feed's is.
+fn advance_block_to(ctx: &mut TestCtx, ts: u64) {
+    let ts = U256::from(ts);
+    if ts > ctx.block.timestamp {
+        ctx.block.timestamp = ts;
+    }
+}
+
 fn setup_market(ctx: &mut TestCtx) {
     storage::save_admin(ctx, ADMIN).unwrap();
     storage::save_market(
@@ -1119,6 +1128,7 @@ fn adl_conscripts_even_a_solvent_holder_and_the_fund_covers_the_haircut() {
 }
 
 fn oracle_tick(ctx: &mut TestCtx, index: u64, ts: u64) {
+    advance_block_to(ctx, ts);
     run_update_index_price(
         &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: index, timestamp: ts }
             .abi_encode(),
@@ -1355,6 +1365,7 @@ fn mark_price_event_carries_the_predicted_rate_not_the_settled_one() {
     storage::save_market(&mut ctx, &market).unwrap();
 
     let push = |ctx: &mut TestCtx, ts: u64| {
+        advance_block_to(ctx, ts);
         run_update_index_price(
             &updateIndexPriceCall {
                 marketId: MARKET_ID,
@@ -4683,6 +4694,7 @@ fn mark_price_stays_nonzero_across_index_updates() {
     // component combination most likely to floor at zero if the guards were missing.
     let mut ts = 15u64;
     for index_price in [ENTRY_PRICE / 2, ENTRY_PRICE / 10, 100, 10, 1] {
+        advance_block_to(&mut ctx, ts);
         let output = run_perp_dex_call(
             &updateIndexPriceCall {
                 marketId: 7,
@@ -4892,6 +4904,7 @@ mod account_update_stream;
 
 /// Seed the market with an external index price, as a live feed would before it went away.
 fn seed_external_index(ctx: &mut TestCtx, price: u64, ts: u64) {
+    advance_block_to(ctx, ts);
     run_update_index_price(
         &updateIndexPriceCall {
             marketId: MARKET_ID,

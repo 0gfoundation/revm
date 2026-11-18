@@ -1001,6 +1001,11 @@ fn lp1(w: &mut World, u: Address, m: u64) -> (i128, i128) {
 /// account is liquidatable is `⌊LP1⌋`; one tick up it is not.
 fn binance_lp_boundary(m: u64, published: u64) {
     let mut w = binance_example();
+    // Five more ticks of `m` follow, one interval apart. Constant block clock: put it where the last
+    // of them is exactly 60 s (`MAX_ORACLE_FUTURE_SKEW_SECS`) ahead, so every stamp is admitted and
+    // the other leg's mark stays fresh (Q10) — the stamps themselves are unchanged.
+    let last = storage::load_index_price_state(&mut w.ctx, m).unwrap().timestamp;
+    w.set_now(last + 5 * w.spec(m).interval - 60);
     let (num, den) = lp1(&mut w, ALICE, m);
     let lp_floor = (num / den) as u64;
     // Binance displays LP1 rounded half-up to the price precision.

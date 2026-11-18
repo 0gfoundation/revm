@@ -298,8 +298,13 @@ fn adls(logs: &[Log]) -> Vec<(Address, Address, u64, u64, u64)> {
 }
 
 /// An oracle tick at an explicit timestamp. The last traded price is reset first, so the mark is
-/// exactly the index (`median(price1 = index, price2, contract = index)` with funding off).
+/// exactly the index (`median(price1 = index, price2, contract = index)` with funding off). The
+/// block clock is moved up to `ts` first (never back), so the stamp is inside
+/// `MAX_ORACLE_FUTURE_SKEW_SECS` of the block, as a live feed's is.
 fn tick_at(ctx: &mut TestCtx, m: u64, index: u64, ts: u64) -> Vec<Log> {
+    if U256::from(ts) > ctx.block.timestamp {
+        ctx.block.timestamp = U256::from(ts);
+    }
     storage::save_last_traded_price(ctx, m, 0).unwrap();
     let logs = ok(
         ctx,

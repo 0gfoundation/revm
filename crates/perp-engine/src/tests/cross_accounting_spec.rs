@@ -955,6 +955,9 @@ fn make(ctx: &mut TestCtx, maker: Address, m: u64, qty: i64, price: u64) -> Call
 fn tick(ctx: &mut TestCtx, m: u64, index: u64) -> Call {
     storage::save_last_traded_price(ctx, m, 0).unwrap();
     let ts = storage::load_index_price_state(ctx, m).unwrap().timestamp + INTERVAL;
+    if U256::from(ts) > ctx.block.timestamp {
+        ctx.block.timestamp = U256::from(ts);
+    }
     let input = updateIndexPriceCall { marketId: m, indexPrice: index, timestamp: ts }.abi_encode();
     ok(ctx, ADMIN, &input)
 }

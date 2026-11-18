@@ -195,7 +195,10 @@ fn market(h: &mut InMemoryHost) -> std::sync::Arc<Market> {
     storage::load_market_ref(h, MKT).unwrap().unwrap()
 }
 
+/// An oracle tick stamped `ts`. The block clock moves up to `ts` first (never back), so the stamp
+/// is inside `MAX_ORACLE_FUTURE_SKEW_SECS` of the block, as a live feed's is.
 fn oracle(h: &mut InMemoryHost, index: u64, ts: u64) {
+    h.now = h.now.max(ts);
     crate::risk::run_update_index_price(
         &updateIndexPriceCall { marketId: MKT, indexPrice: index, timestamp: ts }.abi_encode(),
         ADMIN,

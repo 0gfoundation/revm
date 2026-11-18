@@ -505,6 +505,11 @@ fn current_ts(ctx: &mut TestCtx) -> u64 {
 fn tick(ctx: &mut TestCtx, index: u64) -> Call {
     storage::save_last_traded_price(ctx, MARKET_ID, 0).unwrap();
     let ts = current_ts(ctx) + INTERVAL;
+    // The block clock follows the feed (never back), so the stamp stays inside
+    // `MAX_ORACLE_FUTURE_SKEW_SECS` of the block, as a live feed's does.
+    if U256::from(ts) > ctx.block.timestamp {
+        ctx.block.timestamp = U256::from(ts);
+    }
     let c = ok(
         ctx,
         ADMIN,
@@ -2354,6 +2359,7 @@ fn h_ts(h: &mut Counting) -> u64 {
 
 fn h_tick(h: &mut Counting, index: u64) {
     let ts = h_ts(h) + INTERVAL;
+    h.inner.now = h.inner.now.max(ts);
     h_ok(
         h,
         ADMIN,
@@ -2388,6 +2394,7 @@ struct Cost {
 
 fn measured_tick(h: &mut Counting, index: u64) -> Cost {
     let ts = h_ts(h) + INTERVAL;
+    h.inner.now = h.inner.now.max(ts);
     let input =
         updateIndexPriceCall { marketId: MARKET_ID, indexPrice: index, timestamp: ts }.abi_encode();
     h.inner.end_block();

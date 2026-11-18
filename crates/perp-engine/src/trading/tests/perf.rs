@@ -579,6 +579,8 @@ fn run_update_index_price_loop(ctx: &mut TestCtx, label: &str) {
             timestamp: ts,
         }
         .abi_encode();
+        // The block clock follows the feed, so the stamp is inside MAX_ORACLE_FUTURE_SKEW_SECS.
+        ctx.block.timestamp = U256::from(ts);
         ts += 15;
         let timed = i >= warmup;
         let t0 = Instant::now();

@@ -1067,7 +1067,16 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
     // changes every later random decision, and the earlier seeds then never took ALICE's cross
     // wallet negative. A seed that does is rarer now (3 in 300): the sweep closes an account the
     // sawtooth drives under maintenance before it can realize the loss itself.
-    let mut seed: u64 = 0xC205_5AFE_2B1D_0094;
+    //
+    // Re-seeded a third time (was `…_0094`) when the oracle ticks began moving the block clock
+    // (Q2: a stamp may lead the block by at most 60 s, and this run's stamps reach thousands of
+    // seconds while the block stayed at 1). With the clock following the feed, book mids are
+    // sampled at block times inside the 30 s basis window, so price2 carries the live book basis
+    // instead of one stale sample from block 1, and a leg whose market has not ticked for 45 s is
+    // stale to a cross episode (Q10) — every later random decision moves. Under the moving clock 29
+    // seeds of `…_0000..=…_07CF` take ALICE's cross wallet negative at all and 7 clear every floor;
+    // this one clears them with the widest margin.
+    let mut seed: u64 = 0xC205_5AFE_2B1D_03AC;
     let mut rng = move || {
         seed ^= seed << 13;
         seed ^= seed >> 7;
@@ -1099,7 +1108,7 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
     // the realized loss of the other (with the account in profit, `X` withdraws down to `Σ MM`).
     let mut oracle = [px(100) as i64; 2];
     let mut target = [px(60) as i64, px(160) as i64];
-    let mut ts = 30;
+    let mut ts: u64 = 30;
     let mut resting: Vec<Vec<([u8; 32], u64)>> = vec![Vec::new(); 3];
     let (mut cross_fills, mut negative_cross_wallets, mut liqs, mut cross_adl, mut withdrawals) =
         (0u32, 0u32, 0u32, 0u32, 0u32);
@@ -1198,6 +1207,9 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
             oracle[j] =
                 (oracle[j] + (target[j] - oracle[j]) / 3 + (rng() % 300) as i64 - 150).max(100);
             ts += 15;
+            if U256::from(ts) > ctx.block.timestamp {
+                ctx.block.timestamp = U256::from(ts);
+            }
             ok(
                 &mut ctx,
                 ADMIN,
@@ -1222,8 +1234,9 @@ fn a_randomised_mixed_sequence_keeps_custody_after_every_step() {
          {negative_cross_wallets}, liquidations {liqs}, cross ADL fills {cross_adl}, withdrawals \
          {withdrawals}"
     );
-    // Coverage floors, about half of what this seed reaches (54 / 69 / 8 / 5 / 83), so a change
-    // that quietly stops the run from reaching a path fails here instead of passing vacuously.
+    // Coverage floors, at most about half of what this seed reaches (88 / 92 / 9 / 5 / 94), so a
+    // change that quietly stops the run from reaching a path fails here instead of passing
+    // vacuously.
     assert!(cross_fills >= 25, "cross fills {cross_fills}");
     assert!(negative_cross_wallets >= 30, "the cross wallet went negative on too few steps");
     assert!(liqs >= 4, "liquidations {liqs}");

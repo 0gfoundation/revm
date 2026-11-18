@@ -201,6 +201,7 @@ fn a_randomised_operation_sequence_conserves_total_system_value() {
             let jitter = (rng() % 600) as i64 - 300;
             index_price = (index_price as i64 + drift + jitter).clamp(4_000, 20_000) as u64;
             ts += 16;
+            advance_block_to(&mut ctx, ts);
             let registry_before = storage::load_position_registry(&mut ctx, MARKET_ID)
                 .unwrap()
                 .len();

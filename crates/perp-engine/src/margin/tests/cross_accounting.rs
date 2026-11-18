@@ -144,7 +144,12 @@ fn funding_index(ctx: &mut TestCtx, market: u64) -> (i128, i128) {
     (mirror, truth)
 }
 
+/// An oracle tick stamped `ts`. The block clock moves up to `ts` first (never back), so the stamp
+/// is inside `MAX_ORACLE_FUTURE_SKEW_SECS` of the block, as a live feed's is.
 fn tick(ctx: &mut TestCtx, market: u64, index_price: u64, ts: u64) {
+    if U256::from(ts) > ctx.block.timestamp {
+        ctx.block.timestamp = U256::from(ts);
+    }
     ok(
         ctx,
         ADMIN,
