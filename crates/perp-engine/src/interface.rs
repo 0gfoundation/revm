@@ -777,7 +777,8 @@ sol! {
         /// NOTHING (every maker it reached was refused at its fill and cancelled) is ADL'd in the
         /// same pass, as one the book cannot take. Each deferred pass takes at least 128 resting
         /// orders off the book AND closes at least one lot, so the loop ends — at a fixed book, and
-        /// however the book is restuffed.
+        /// however the book is restuffed, within `|position|` deferred passes (a restuffed book
+        /// can hold it to one lot per pass).
         ///
         /// # What it does NOT do
         ///

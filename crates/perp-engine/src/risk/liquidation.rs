@@ -266,6 +266,15 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // leg stops on a fill, the band or an empty book, or fills nothing, and the rest goes to ADL
     // below. Each pass costs at most what one did before: 128 makers and no ADL, instead of 128
     // makers plus ADL.
+    //
+    // ⚠️ The cap decides WHEN, and — for an isolated position — can still shift WHO pays (second-
+    // round review q6-progress-1, an open owner decision). A deferred pass releases the closed part's
+    // silo share plus its PnL to the wallet like any partial close; the rest keeps only its own
+    // pro-rata silo. A later pass that fills the rest below THAT share's bankruptcy price books the
+    // gap as insurance-fund bad debt, where one uncapped close would have netted it against the
+    // surplus the earlier fills released. Keeping the released surplus in the silo instead makes
+    // the next pass's re-judgement find the rest healthy (it then stays open) and lets
+    // `removePositionMargin` take it out, so a fix needs new per-position state, not this branch.
     if remaining > 0 && !close.maker_cap_deferred {
         // Every residual the BOOK cannot take — solvent or not — is closed as a REAL forced trade
         // against opposite-side holders via ADL, which picks its own price (mark when the residual

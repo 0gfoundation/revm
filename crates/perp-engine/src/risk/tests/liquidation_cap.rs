@@ -202,8 +202,14 @@ fn wallet_of(ctx: &mut TestCtx, user: Address) -> i64 {
     storage::load_account(ctx, user).unwrap().perp_wallet_balance
 }
 
-/// **The sweep stops at the cap, the drain finishes against the book, and the totals are the
+/// **The sweep stops at the cap, the drain finishes against the book, and here the totals are the
 /// one-shot liquidation's.** 133 single-lot bids for a long of 133, fee 125 bps.
+///
+/// "Here": both passes fill at $90, above the bankruptcy price of the rest's own pro-rata silo
+/// share. That equality is not general — a later pass that fills the rest below that share's
+/// bankruptcy price books the gap as insurance-fund bad debt, which one uncapped close would have
+/// netted against the surplus the tick's pass released to the wallet (second-round review
+/// q6-progress-1, an open owner decision; see `liquidate_position`).
 ///
 /// At $90: equity `2_660_000_000 − 1_330_000_000 = 1_330_000_000` < MM `133·90e6/6 =
 /// 1_995_000_000`. The tick's pass fills 128 makers and stops on the cap with 5 live bids left:
