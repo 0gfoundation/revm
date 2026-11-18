@@ -725,11 +725,16 @@ sol! {
         /// position worth at most `int64` max quote units at `max(maxPrice, mark)` (`placeOrder`'s
         /// `-2027`). So RAISING `maxPrice` past what an open position can be worth there reverts
         /// `updateMarket: maxPrice too high for an open position (its value there exceeds
-        /// i64::MAX)`, nothing written; lowering it is always accepted. After a lowering, no fill
-        /// executes above the new `maxPrice` — an order left resting above it can no longer trade
-        /// there, and a bid above it is expired at the next oracle tick or drain (`OrderCancelled`
-        /// reason 4) — and the stored mark stays where it was until the next `updateIndexPrice`
-        /// clamps it.
+        /// i64::MAX)`, nothing written; lowering it is always accepted. After a lowering, no BOOK
+        /// fill executes above the new `maxPrice` — an order left resting above it can no longer
+        /// trade there, and a bid above it is expired at the next oracle tick (or at a
+        /// `drainDeferredWork`, when the market already has deferred work: `OrderCancelled` reason
+        /// 4) — and the stored mark stays where it was until the next `updateIndexPrice` clamps
+        /// it. A cross liquidation's ADL fill is held at or below `maxPrice` too; an ISOLATED one
+        /// fills at the liquidated position's bankruptcy price, which can sit above a lowered
+        /// `maxPrice`. A lowering bounds what a position may grow to, not the entry value it
+        /// already carries: an opening fill that would take that past `int64` is refused (a
+        /// resting order cancelled, `OrderCancelled` reason 2).
         function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps) external;
         /// Read the current mark price for a market.
         function getMarkPrice(uint64 marketId) external view returns (uint64 price);
