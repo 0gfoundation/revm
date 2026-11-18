@@ -195,7 +195,13 @@ pub fn run_update_market<H: PerpHost>(
     // ceiling may not fit the new one — and the first valuation past `i64` would fault where the
     // liquidation sweep cannot skip it. Refused instead, before any write. One registry walk
     // (a read per open position, the liquidation sweep's own scan), on an admin call, only when
-    // the cap goes UP: lowering it can only make every position fit better.
+    // the cap goes UP: lowering it can only make every position's AMOUNT fit better.
+    //
+    // ⚠️ Not its ENTRY BASIS. A position opened near the old ceiling keeps a `vQuote` close to
+    // `i64::MAX`, and the bound at the lower `maxPrice` still lets it grow, so a later opening fill
+    // can push `vQuote` past `i64`. That fault is the fill's, not the sweep's: a maker's is refused
+    // like a K9 maker (`trading::settlement::settle_maker_fill_core`'s total trial — cancelled
+    // `MakerInsolvent`), a taker's open reverts with it (second-round review, bound-vquote-2).
     if args.maxPrice > market.max_price {
         for user in storage::load_position_registry(context, args.marketId)? {
             let amount = storage::load_position_ref(context, user, args.marketId)?.amount;

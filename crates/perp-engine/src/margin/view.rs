@@ -2404,18 +2404,37 @@ pub(crate) fn wallet_balances_from_parts(
     other_market_position_margin: i64,
     position_margin: i64,
 ) -> Result<AccountWalletBalances, PerpError> {
-    let total_position_margin = other_market_position_margin
-        .checked_add(position_margin)
-        .ok_or_else(|| perp_err("account snapshot: Σ position margin overflow"))?;
     let total_cross_wallet_balance = account.perp_wallet_balance;
-    let total_wallet_balance = total_cross_wallet_balance
-        .checked_add(total_position_margin)
-        .ok_or_else(|| perp_err("account snapshot: total wallet balance exceeds i64"))?;
+    let total_wallet_balance = total_wallet_balance(
+        total_cross_wallet_balance,
+        other_market_position_margin,
+        position_margin,
+    )?;
     Ok(AccountWalletBalances {
         usdc_balance: account.usdc_balance.clone().into(),
         total_wallet_balance,
         total_cross_wallet_balance,
     })
+}
+
+/// The ARITHMETIC of [`wallet_balances_from_parts`] — `wb = cw + (Σ_other + this market's margin)`,
+/// both sums checked in `i64` — on the three numbers alone, with no account to clone.
+///
+/// The one place those sums are formed, so a pure pre-check of a write path's header — the maker
+/// fill's trial (`trading::settlement::settle_maker_fill_core`) and a funding settle's
+/// (`risk::funding::funding_settlement_fits`) — can never disagree with the header the path then
+/// builds. An `Err` here is the only way that header can fail.
+pub(crate) fn total_wallet_balance(
+    cross_wallet: i64,
+    other_market_position_margin: i64,
+    position_margin: i64,
+) -> Result<i64, PerpError> {
+    let total_position_margin = other_market_position_margin
+        .checked_add(position_margin)
+        .ok_or_else(|| perp_err("account snapshot: Σ position margin overflow"))?;
+    cross_wallet
+        .checked_add(total_position_margin)
+        .ok_or_else(|| perp_err("account snapshot: total wallet balance exceeds i64"))
 }
 
 /// **The single producer of the `AccountBalanceChanged` payload.** ONE account load and an

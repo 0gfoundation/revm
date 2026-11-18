@@ -1761,6 +1761,7 @@ pub(super) fn settle_maker_fill_registry<H: PerpHost>(
         fill_qty,
         taker_fee_share,
         market,
+        w.other_market_position_margin,
     )?;
 
     let (maker_fee, bad_debt, realized_pnl, closed_quantity) = match core {
@@ -2242,6 +2243,9 @@ pub(super) fn settle_maker_fill_core(
     fill_qty: u64,
     taker_fee_share: u64,
     market: &crate::types::Market,
+    // `Σ pos.margin` over the maker's OTHER markets (`UserWork::other_market_position_margin`) —
+    // what the account header the walk publishes for this fill adds this market's margin to.
+    other_market_position_margin: i64,
 ) -> Result<MakerFillCore, PerpError> {
     // READ-ONLY: locate the maker's book entry and price this fill's share of the order's maker
     // fee. Done up front because the fee must be charged BEFORE the K9 check below, while the
@@ -2266,8 +2270,32 @@ pub(super) fn settle_maker_fill_core(
         },
     )?;
 
+    // ── The trial is TOTAL: an arithmetic fault refuses the fill, it never fails the match ──────
+    //
+    // Everything from here to the accept block is pure arithmetic on the trial copies, and each step
+    // goes through `trial!`: a fault — a value this maker's position or account cannot hold (its
+    // `vQuote` or margin past `i64`, a balance the account header cannot sum) — refuses the fill
+    // exactly like K9 does (`RejectedInsolvent` → the order is cancelled `MakerInsolvent`, reason 2,
+    // and the walk goes on). It used to be a `?`, which failed the WHOLE match: every taker
+    // reaching the order reverted, and a liquidation's book leg reaching it halted the sweep on
+    // every tick (second-round review, bound-k9-1 / bound-vquote-2). The position bound keeps the
+    // NOTIONAL representable, but not the margin (added margin, a funding credit) nor the entry
+    // basis (a position opened at a `maxPrice` an `updateMarket` has since lowered). An
+    // `[INVARIANT]` (and any non-`Reject`) still propagates: it is a bug, not this maker's state.
+    macro_rules! trial {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(PerpError::Reject(msg)) if !msg.starts_with("[INVARIANT] ") => {
+                    return Ok(MakerFillCore::RejectedInsolvent)
+                }
+                Err(e) => return Err(e),
+            }
+        };
+    }
+
     // Compute the fill on a TRIAL clone first (single computation — adopted verbatim on accept).
-    let fill = split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market)?;
+    let fill = trial!(split_position_fill(pos.amount, maker_side, fill_price, fill_qty, market));
     // ── reduce-only watchdog (maker side) ────────────────────────────────────────────────────
     //
     // NOT a clamp. `crate::trading::reduce_only`'s prefix condition at ADMISSION is what guarantees
@@ -2300,7 +2328,7 @@ pub(super) fn settle_maker_fill_core(
     // is funded with the cash actually at hand, and `trial_pos.margin` carries any shortfall. A
     // CROSSED maker moves no cash (`Cross`): the fee and any realized loss land on the wallet.
     let funding = OpeningMarginFunding::for_position(pos, OpeningMarginFunding::CappedAtCashAtHand);
-    let fill_outcome = apply_position_fill(
+    let fill_outcome = trial!(apply_position_fill(
         &mut trial_pos,
         &mut trial_wallet,
         fill.closing_qty,
@@ -2309,7 +2337,7 @@ pub(super) fn settle_maker_fill_core(
         fill.opening_value,
         fill.is_buy,
         funding,
-    )?;
+    ));
     // The cash at hand when the opening leg happens: the wallet after this fill's own close leg,
     // before its fee — what M1 funds an ISOLATED opening leg from (inside `apply_position_fill`),
     // and what a CROSSED one needs to be positive (the cash-at-hand floor below).
@@ -2327,15 +2355,15 @@ pub(super) fn settle_maker_fill_core(
     let charge = maker_fee.charge();
     let fee_from_margin = charge.min(fill_outcome.opening_margin);
     let fee_from_wallet = charge - fee_from_margin;
-    let from_margin_i64 = checked_u64_to_i64(fee_from_margin, "settlement: fee from margin")?;
-    let from_wallet_i64 = checked_u64_to_i64(fee_from_wallet, "settlement: fee from wallet")?;
-    trial_pos.margin = trial_pos
+    let from_margin_i64 = trial!(checked_u64_to_i64(fee_from_margin, "settlement: fee from margin"));
+    let from_wallet_i64 = trial!(checked_u64_to_i64(fee_from_wallet, "settlement: fee from wallet"));
+    trial_pos.margin = trial!(trial_pos
         .margin
         .checked_sub(from_margin_i64)
-        .ok_or_else(|| perp_err("settlement: margin fee underflow"))?;
-    trial_wallet = trial_wallet
+        .ok_or_else(|| perp_err("settlement: margin fee underflow")));
+    trial_wallet = trial!(trial_wallet
         .checked_sub(from_wallet_i64)
-        .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
+        .ok_or_else(|| perp_err("perp wallet: balance underflow")));
 
     // ── Opening margin comes out of the WALLET at fill time, capped at what is there (M1) ──
     // Under the escrow this was free here: `apply_position_fill` added `opening_margin` to
@@ -2417,18 +2445,19 @@ pub(super) fn settle_maker_fill_core(
     // money-out gates on `X` (`margin::view::derived_withdrawable_balance`), the order gates on
     // `A`, a deposit netting against the deficit — is a load-bearing part of the model, not a
     // belt-and-braces guard (`types::UserAccount::perp_wallet_balance`).
-    let opening_margin_i64 = checked_u64_to_i64(
+    let opening_margin_i64 = trial!(checked_u64_to_i64(
         fill_outcome.opening_margin,
         "settlement: maker opening margin",
-    )?;
-    trial_wallet = trial_wallet
+    ));
+    trial_wallet = trial!(trial_wallet
         .checked_sub(opening_margin_i64)
-        .ok_or_else(|| perp_err("perp wallet: balance underflow"))?;
+        .ok_or_else(|| perp_err("perp wallet: balance underflow")));
 
     // The market's position-size bound (Q7) — the maker-side twin of the taker's in
     // `finalize_core`. Refused like a K9 or tier refusal, not an `Err`: an `Err` here would fail the
     // whole match, and inside a liquidation's book leg it would halt the sweep. Ahead of K9 and
-    // the tier guard, which value the trial position at the mark and would fault on it instead.
+    // the tier guard, which value the trial position at the mark (they are `trial!`-wrapped too,
+    // but a position past the bound is refused here for what it is).
     if fill.opening_qty > 0
         && !crate::math::position_fits_market(market, mark_price, trial_pos.amount)
     {
@@ -2446,7 +2475,7 @@ pub(super) fn settle_maker_fill_core(
     if fill.opening_qty > 0
         && mark_price > 0
         && funding != OpeningMarginFunding::Cross
-        && !is_above_maintenance_margin(
+        && !trial!(is_above_maintenance_margin(
             &market.tiers,
             mark_price,
             trial_pos.amount,
@@ -2454,7 +2483,7 @@ pub(super) fn settle_maker_fill_core(
             trial_pos.margin,
             market.base_decimals,
             market.price_decimals,
-        )?
+        ))
     {
         return Ok(MakerFillCore::RejectedInsolvent);
     }
@@ -2485,20 +2514,36 @@ pub(super) fn settle_maker_fill_core(
     // a no-op under the single-tier default, so enabling multi-tier is a config change.
     // Evaluated on the TRIAL copy, before anything is adopted → pre-write.
     if fill.opening_qty > 0 {
-        let abs_notional = calc_value_i64(
+        let abs_notional = trial!(calc_value_i64(
             mark_price,
             trial_pos.amount,
             market.base_decimals,
             market.price_decimals,
-        )?
-        .checked_abs()
-        .ok_or_else(|| perp_err("settlement: tier notional abs overflow"))?;
+        )
+        .and_then(|n| {
+            n.checked_abs()
+                .ok_or_else(|| perp_err("settlement: tier notional abs overflow"))
+        }));
         // `tier_cap == 0` (past the terminal `notionalCap`) refuses through the same comparison.
         let tier_cap = max_leverage_for_notional(&market.tiers, abs_notional);
         if trial_pos.leverage.max(1) > tier_cap as u64 {
             return Ok(MakerFillCore::RejectedInsolvent);
         }
     }
+
+    // The wallet the fill leaves — with this fill's REBATE, credited only on accept (below) — and
+    // the account header the walk publishes for it (`MatchRegistry::push_maker_snapshot`:
+    // `cw + Σ pos.margin`, the same sums `margin::view::wallet_balances_from_parts` takes). Both are
+    // checked HERE, on the trial, so neither can fail once the fill is adopted: a maker whose total
+    // balance a close's profit or a rebate would take past `i64` is refused like any other fault.
+    let final_wallet = trial!(trial_wallet
+        .checked_add(trial!(checked_u64_to_i64(maker_fee.rebate(), "settlement: maker rebate")))
+        .ok_or_else(|| perp_err("perp wallet: balance overflow")));
+    trial!(crate::margin::view::total_wallet_balance(
+        final_wallet,
+        other_market_position_margin,
+        trial_pos.margin,
+    ));
 
     // Accept: adopt the trial result verbatim — plus this fill's maker REBATE, if any.
     //
@@ -2515,9 +2560,7 @@ pub(super) fn settle_maker_fill_core(
     // match's taker fee (`MatchRegistry::rebate_total` → `finalize_compute`), which every accepted
     // match collects in full.
     *pos = trial_pos;
-    account.perp_wallet_balance = trial_wallet
-        .checked_add(checked_u64_to_i64(maker_fee.rebate(), "settlement: maker rebate")?)
-        .ok_or_else(|| perp_err("perp wallet: balance overflow"))?;
+    account.perp_wallet_balance = final_wallet;
 
     // Apply the entry reduce planned above (the lists were untouched in between, so `entry_idx`
     // is still valid), and shrink `Bid`/`Ask` by exactly the term the reduce removes. Two points:
