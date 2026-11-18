@@ -294,8 +294,15 @@ impl PremiumIndexAccumulator {
     /// `end_ts` itself, swaps `last_pi` for `endpoint_pi` at its weight `c + n`. The same state as
     /// filling slot by slot (`fill_slots_until_reference` in the tests), so a long gap or an epoch
     /// of many slots (`fundingInterval / priceUpdateInterval` has no protocol bound) costs nothing
-    /// extra. Refuses exactly what the loop refused: a first slot past `u64::MAX`, and a count or a
-    /// weighted sum past its width.
+    /// extra. Refuses everything the loop refused — a first slot past `u64::MAX`, a count or a
+    /// weighted sum past its width — and, on a reachable accumulator, nothing more while the
+    /// epoch's average stays representable. It can refuse more beyond that: it adds `last_pi`
+    /// over all `n` slots before swapping the endpoint in, so its intermediate sum can lie
+    /// further from zero than any partial sum of the loop. But a reachable sum is `Σ k · PI_k`
+    /// with `|PI_k| ≤ 2^63`, and [`Self::average`] needs `count(count + 1)/2 ≤ i64::MAX`, so
+    /// whenever the average can be taken every intermediate here stays below `2^127`; both engine
+    /// call sites take the average right after the fill (`premium_fill_tests` pins the
+    /// difference and the edge).
     #[inline]
     pub fn fill_slots_until(
         &mut self,
@@ -524,6 +531,48 @@ mod premium_fill_tests {
         top.fill_slots_until(MAX, 10, Some(5)).unwrap();
         assert_eq!((top.sample_count, top.last_sample_ts, top.last_pi), (4, MAX, 5));
         assert!(started(MAX - 5, 11).fill_slots_until(MAX, 10, Some(5)).is_err());
+    }
+
+    /// Where the closed form refuses and the loop does not: `last_pi` is added over all `n` slots
+    /// before the endpoint swaps in, so a weighted sum near the top of `i128` overflows in between
+    /// while the loop's endpoint push brings it back down. That sum is unreachable (at count 1 a
+    /// reachable sum is a single PI), and the loop's result has no representable average either,
+    /// so the refusal only moves from `average()` into the fill.
+    #[test]
+    fn the_closed_form_refuses_more_only_where_the_average_is_unrepresentable() {
+        let mut acc = started(10, 100);
+        acc.weighted_sum = i128::MAX - 10;
+        let mut reference = acc.clone();
+        assert_eq!(
+            acc.fill_slots_until(11, 1, Some(-1)).unwrap_err().to_string(),
+            "premium accumulator: weighted sum overflow"
+        );
+        fill_slots_until_reference(&mut reference, 11, 1, Some(-1)).unwrap();
+        assert_eq!((reference.sample_count, reference.weighted_sum), (2, i128::MAX - 12));
+        assert!(reference.average().is_err(), "the loop's state has no average either");
+    }
+
+    /// The edge where the average is still representable, on a reachable accumulator at the
+    /// extreme: `c` slots all at `i64::MAX`, then one more filled with the endpoint at `i64::MIN`,
+    /// landing on the largest count whose total weight fits `i64`. The closed form's
+    /// intermediate (`i64::MAX` over all `c + 1` weights, ~2^126) fits, and it equals the loop.
+    #[test]
+    fn the_closed_form_equals_the_loop_at_the_largest_representable_average() {
+        let c: u64 = (1 << 32) - 2;
+        let count = c + 1;
+        assert!(count as u128 * (count as u128 + 1) / 2 <= i64::MAX as u128);
+        assert!((count + 1) as u128 * (count as u128 + 2) / 2 > i64::MAX as u128);
+        let mut acc = started(1, i64::MAX);
+        acc.sample_count = c;
+        acc.weighted_sum = i64::MAX as i128 * (c as i128 * (c as i128 + 1) / 2);
+        acc.last_sample_ts = 1 + (c - 1);
+        let end_ts = acc.last_sample_ts + 1;
+        let mut reference = acc.clone();
+        acc.fill_slots_until(end_ts, 1, Some(i64::MIN)).unwrap();
+        fill_slots_until_reference(&mut reference, end_ts, 1, Some(i64::MIN)).unwrap();
+        assert_eq!(acc, reference);
+        assert_eq!(acc.sample_count, count);
+        assert_eq!(acc.average().unwrap(), reference.average().unwrap());
     }
 
     /// A seeded sweep against the loop: random starts, intervals, pre-fills, gaps and endpoints,
