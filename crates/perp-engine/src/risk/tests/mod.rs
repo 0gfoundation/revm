@@ -3124,6 +3124,77 @@ fn get_symbol_config_reports_the_band_edge_at_each_leverage() {
     }
 }
 
+/// **Q13: a leverage the lowered table no longer admits reports `0` — none — and the chain agrees.**
+///
+/// `setMarginTiers` re-checks nothing that is stored, and a flat position keeps its leverage, so a
+/// user who set 50x under a 50x table still holds 50x after the table is lowered to 20x. No tier
+/// admits 50x any more: the view reports `(50, 0)` — the stored leverage, and no notional at all.
+/// Before Q13 this panicked in debug (the inversion's `debug_assert!`) and in release reported `0`,
+/// which then meant UNBOUNDED. The chain indeed refuses every open: buying 1 @ $100 at 50x puts
+/// `$2` in a silo whose maintenance is now `$100 / 40 = $2.5`, so the K9 guard refuses it (at 30x,
+/// the next test, the tier guard does). `setLeverage(20)` works because the position is flat, and
+/// the same buy then fills. Lowering the table again under the 20x — to a two-tier `[10, 5]` — is
+/// `0` again (release before Q13: `1_000_000_000`, tier 0's band edge).
+#[test]
+fn get_symbol_config_reports_no_notional_for_a_leverage_the_lowered_table_no_longer_admits() {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0], &[50]).unwrap();
+    set_leverage(&mut ctx, 50).unwrap();
+    assert_eq!(symbol_config(&mut ctx, ALICE, MARKET_ID), (50, u64::MAX));
+
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0], &[20]).unwrap();
+    assert_eq!(
+        symbol_config(&mut ctx, ALICE, MARKET_ID),
+        (50, 0),
+        "the stored 50x, and no tier admits it"
+    );
+
+    place_maker_order(&mut ctx, Side::Sell as u8, ENTRY_PRICE, 1);
+    let err = try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 1).unwrap_err();
+    assert!(
+        err.to_string().contains("placeOrder: open would breach maintenance margin"),
+        "{err}"
+    );
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+
+    set_leverage(&mut ctx, 20).unwrap();
+    assert_eq!(symbol_config(&mut ctx, ALICE, MARKET_ID), (20, u64::MAX));
+    try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 1).unwrap();
+    assert_eq!(position(&mut ctx, ALICE).amount, 1);
+
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0, 1_000_000_000], &[10, 5]).unwrap();
+    assert_eq!(symbol_config(&mut ctx, ALICE, MARKET_ID), (20, 0));
+}
+
+/// **Q13: between one and two times the lowered cap the per-open tier guard is what refuses** —
+/// 30x against a 20x table passes K9 (`$3.33` of silo against `$2.5` of maintenance) and is
+/// refused by the tier guard instead; the view says `(30, 0)` either way, and a terminal
+/// `notionalCap` does not change that (no tier admits 30x, capped or not).
+#[test]
+fn get_symbol_config_reports_no_notional_between_one_and_two_times_the_cap_the_tier_guard_refuses(
+) {
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0], &[50]).unwrap();
+    set_leverage(&mut ctx, 30).unwrap();
+    set_margin_tiers(&mut ctx, ADMIN, MARKET_ID, &[0], &[20]).unwrap();
+    assert_eq!(symbol_config(&mut ctx, ALICE, MARKET_ID), (30, 0));
+
+    place_maker_order(&mut ctx, Side::Sell as u8, ENTRY_PRICE, 1);
+    let err = try_place_order(&mut ctx, ALICE, Side::Buy as u8, ENTRY_PRICE, 1).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("placeOrder: leverage exceeds the margin tier for this position size"),
+        "{err}"
+    );
+    assert_eq!(position(&mut ctx, ALICE).amount, 0);
+
+    set_margin_tiers_capped(&mut ctx, ADMIN, MARKET_ID, &[0], &[20], &[0], 5_000_000_000)
+        .unwrap();
+    assert_eq!(symbol_config(&mut ctx, ALICE, MARKET_ID), (30, 0));
+}
+
 /// The tier table is a required input, so an unknown market REVERTS rather than reporting a
 /// bound — `u64::MAX` ("unbounded") or `0` ("none") — for a market that does not exist. Same shape as
 /// `getMarginTiers` and `getPositionRisk`, deliberately NOT `getPosition`'s all-zeros.
