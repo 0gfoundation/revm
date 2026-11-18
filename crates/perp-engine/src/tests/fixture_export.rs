@@ -12,7 +12,7 @@
 //! # Scenarios
 //!
 //! * `isolated_golden` — the actions of `trading::tests::golden` (`commitment_golden_scenario`),
-//!   one block at timestamp 1 as there. Its block commitment must equal the pinned
+//!   one block at timestamp 3_600 as there. Its block commitment must equal the pinned
 //!   `GOLDEN_COMMITMENT`, which proves the replay is that scenario write for write.
 //! * `cross_golden` — the actions of `tests::cross_golden`. That scenario moves the block clock
 //!   inside ONE block; here every clock move starts a new block (the chain's shape). The same
@@ -848,7 +848,7 @@ mod isolated_golden {
     const TICK: u64 = 1_000_000_000;
     const PRICE: u64 = 100 * TICK;
     const QTY: u64 = 1_000_000;
-    const SIGNED_TS: u64 = 1;
+    const SIGNED_TS: u64 = 3_600;
     const SIGNED_RECV: u64 = 60;
 
     fn place(side: u8, price: u64, qty: u64, order_type: u8, tif: u8) -> Vec<u8> {
@@ -954,9 +954,9 @@ mod isolated_golden {
     }
 
     /// `trading::tests::golden::run_golden_scenario`, call for call, minus its views (an
-    /// `eth_call` is not a transaction). One block at timestamp 1, as there.
+    /// `eth_call` is not a transaction). One block at timestamp 3_600, as there.
     pub(super) fn scenario() -> Recorder {
-        let mut r = Recorder::new(1, CHAIN_ID);
+        let mut r = Recorder::new(3_600, CHAIN_ID);
         for (u, label) in [
             (ALICE, "alice"),
             (BOB, "bob"),
@@ -1153,7 +1153,7 @@ fn fixture_export_isolated_golden() {
         &r,
         "isolated_golden",
         "trading::tests::golden (commitment_golden_scenario), call for call, one block at \
-         timestamp 1; its block commitment equals the pinned GOLDEN_COMMITMENT. ISOLATED margin: \
+         timestamp 3_600; its block commitment equals the pinned GOLDEN_COMMITMENT. ISOLATED margin: \
          roles, one market (8/9 decimals), fee rates, signed place / cancel / leverage, FOK and \
          PostOnly refusals, market / limit / IOC / PostOnly orders, cancels, isolated margin in \
          and out, a funding epoch, the insurance fund, an auto-liquidation with cancel-all and a \

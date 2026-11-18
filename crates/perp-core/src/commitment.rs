@@ -501,6 +501,14 @@ use primitives::{B256, U256};
 //     isolated pin 0xfdf928b5…47d4 is unchanged (no cross position); the CROSS pin is re-pinned
 //     0x3c401b00…73b9 → 0x60470df0…4b3f — VERIFIED: with the "xleg" keys kept out of the block
 //     delta it reproduces 0x9c7be213…4132, as before. Both snapshots UNCHANGED.
+//   * Q2 — an `updateIndexPrice` timestamp may lead the block by at most 60 s
+//     (`MAX_ORACLE_FUTURE_SKEW_SECS`). No layout change and no rule a golden exercises moves, but
+//     the isolated golden pushed oracle stamps up to 3_645 at block time 1, so it now runs on a
+//     3_600 block clock (its `SIGNED_TS` with it). RE-PIN: the write set differs only in
+//     block-clock-dependent bytes — the signed order ids and seen-signature buckets (through the
+//     signed message's timestamp) and the mid-price samples' stamps. Isolated pin re-pinned
+//     0xfdf928b5…47d4 → 0x1cfcca6b…463f; the CROSS pin 0x60470df0…4b3f is unchanged.
+//     BusinessSnapshot UNCHANGED.
 pub const BLOCK_COMMITMENT_VERSION: u8 = 39;
 
 /// Computes the per-BLOCK off-trie commitment over the block's NET delta (catalog #16d).

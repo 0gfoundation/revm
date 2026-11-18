@@ -484,6 +484,15 @@ const NEW_ADMIN: Address = address!("6666666666666666666666666666666666666666");
 /// Prior value 0xaea562b976f3f646a94f8cfbf468c1caf8e7c7465e30f351f3fb8ec719c91e61 (39, P3
 /// clearance fee).
 ///
+/// RE-PIN within 39 for Q2 (the oracle timestamp bound): an `updateIndexPrice` timestamp may lead
+/// the block by at most `MAX_ORACLE_FUTURE_SKEW_SECS` (60 s), and this scenario pushes stamps up
+/// to 3_645, so it now runs on a 3_600 block clock (was 1), `SIGNED_TS` with it. No rule the
+/// scenario exercises moves and the format does not (no `BLOCK_COMMITMENT_VERSION` bump): the
+/// write set differs only in block-clock-dependent bytes — the signed order ids and the
+/// seen-signature buckets (through the signed message's timestamp) and the mid-price samples'
+/// stamps. `BusinessSnapshot` UNCHANGED. Prior value
+/// 0xfdf928b54c849a832e948e32d20b951490ebdc33c54c38254a13f10351a147d4 (39, P3 flip).
+///
 /// Prior values 0x7deaa0263925b95e203cf08b43fbf93b34f7af725d19933d6e72510cd6c86637 (39, P1
 /// margin type), 0xafd826451ed6c8e356b03def92beb67c4e2431333141b39bfc21aeef4f057b48 (39, P0
 /// maintenance-rate column), 0x37a18141947ba3bb4fe923fe0e05a07d4dc0a8d1987096250991ed7d0f3f79de (38,
@@ -503,7 +512,7 @@ const NEW_ADMIN: Address = address!("6666666666666666666666666666666666666666");
 /// 0xe533ca6b378b7819b0f45def0fe712a6c8449805cb09888d0466cfd8b33e0e20,
 /// 0xd1c1019a950f855852ea7ee35373c88a48cba0679de161c5e5f0ae5787c1c765.
 pub(crate) const GOLDEN_COMMITMENT: B256 =
-    b256!("0xfdf928b54c849a832e948e32d20b951490ebdc33c54c38254a13f10351a147d4");
+    b256!("0x1cfcca6b4e4814a503025dbcc2f028bd3ea062a2c77aff758f6013b69548463f");
 
 /// Business end-state read back through view calls after the scenario.
 /// Pins semantics independently of the commitment hash construction.
@@ -723,8 +732,10 @@ fn golden_ctx() -> TestCtx {
         JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
     }
     // Fixed block timestamp for full determinism (signed-order recvWindow
-    // checks and mid-price samples both read it).
-    ctx.block.timestamp = U256::from(1);
+    // checks and mid-price samples both read it). 3_600, not 1: the oracle
+    // pushes run to 3_645, and an updateIndexPrice timestamp may lead the
+    // block by at most MAX_ORACLE_FUTURE_SKEW_SECS (60 s, Q2).
+    ctx.block.timestamp = U256::from(3_600);
     ctx
 }
 
@@ -847,7 +858,7 @@ fn order_status(ctx: &mut TestCtx, id: [u8; 32]) -> u8 {
 
 // ── ed25519 signed-call calldata (fixed key seed, fixed timestamps) ────
 
-const SIGNED_TS: u64 = 1; // == block timestamp
+const SIGNED_TS: u64 = 3_600; // == block timestamp
 const SIGNED_RECV: u64 = 60;
 
 fn signed_place_input(
