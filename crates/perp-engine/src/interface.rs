@@ -856,7 +856,10 @@ sol! {
         /// triggerPrice: fires on the MARK price, per (orderType, side):
         ///     STOP BUY / TAKE_PROFIT SELL   ->  mark >= triggerPrice
         ///     STOP SELL / TAKE_PROFIT BUY   ->  mark <= triggerPrice
-        ///   Must be non-zero, and must NOT already be satisfied by the stored mark — that is
+        ///   Must be non-zero, a multiple of tickSize and at most the market's `maxPrice` —
+        ///   `placeAlgoOrder: triggerPrice exceeds maxPrice` (the mark never exceeds `maxPrice`, so
+        ///   a higher trigger could never fire upward and would fire on any mark downward) — and
+        ///   must NOT already be satisfied by the stored mark — that is
         ///   refused with `placeAlgoOrder: order would immediately trigger` (Binance `-2021`).
         ///   Equality counts as satisfied, exactly as at the sweep. Before the first oracle tick
         ///   the stored mark is the market's `initialMarkPrice` (`addMarket` refuses 0; a zero mark
@@ -869,7 +872,8 @@ sol! {
         ///     "default: the latest price"; the order then records that mark as its activation
         ///     price (`AlgoOrderPlaced.triggerPrice`, `getAlgoOrder.triggerPrice`), and
         ///     `AlgoOrderActivated` follows `AlgoOrderPlaced` in the same transaction. A non-zero
-        ///     activation price must be a multiple of tickSize and NOT already reached by the
+        ///     activation price must be a multiple of tickSize, at most `maxPrice`
+        ///     (`placeAlgoOrder: triggerPrice exceeds maxPrice`) and NOT already reached by the
         ///     stored mark: `placeAlgoOrder: order would immediately trigger` (Binance `-2021` for
         ///     an activatePrice on the wrong side). Send 0 to activate now.
         ///   * `price` = the CALLBACK RATE in basis points, i.e. Binance's `callbackRate` × 100:
@@ -967,8 +971,10 @@ sol! {
         ///   whole position at once (it is truncated to |position| — see `placeOrder` flags bit 0);
         ///   a position above `maxQuantity` takes one such order per `maxQuantity`.
         ///
-        /// price: the resting price for the limit pair; the callback rate in bps for
-        ///   TRAILING_STOP_MARKET; must be 0 for STOP_MARKET / TAKE_PROFIT_MARKET.
+        /// price: the resting price for the limit pair — a multiple of tickSize, at most `maxPrice`
+        ///   (`placeAlgoOrder: price exceeds maxPrice`: the order it fires would be refused above
+        ///   it); the callback rate in bps for TRAILING_STOP_MARKET; must be 0 for STOP_MARKET /
+        ///   TAKE_PROFIT_MARKET.
         /// tif: applies to the limit pair only. A limit-pair conditional with tif GTC (0) or
         ///   PostOnly (3) — one whose child would REST — takes one of the owner's 10 reduce-only
         ///   slots in this market when it is PLACED (see `placeOrder` flags bit 0, "Reduce-only
