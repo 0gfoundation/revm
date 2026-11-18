@@ -608,7 +608,8 @@ impl Order {
 /// Lightweight per-user per-market order entry used for margin-reserve calculation.
 ///
 /// Mirrors `balance::order_entry::OrderEntry` from the offchain engine.
-/// Buy entries are sorted by price DESC; sell entries by price ASC.
+/// Buy entries are sorted by price DESC; sell entries by price ASC; entries at one price in arrival
+/// order (FIFO — `rest_in_book` inserts after them).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct OrderEntry {
     /// 32-byte order ID. `serde_bytes` → msgpack bin instead of a 32-integer array (P4/#20).

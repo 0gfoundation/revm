@@ -2822,10 +2822,11 @@ fn taker_margin_is_covered<H: PerpHost>(
     Ok(fills_are_covered(available, required_margin, gate))
 }
 
-/// Cancels same-side open orders one at a time (last-placed first) until the AVAILABLE balance
-/// covers `required_margin`, or no orders remain.
+/// Cancels same-side open orders one at a time from the BACK of the owner's price-sorted list —
+/// the farthest from the touch first and, at one price, the last placed first — until the
+/// AVAILABLE balance covers `required_margin`, or no orders remain.
 ///
-/// LIFO cancellation preserves earlier orders at better price priority.
+/// So the orders with the best queue priority (nearest the touch, then earliest) survive longest.
 /// If the account is still short after all orders are exhausted the loop exits
 /// silently; the caller is responsible for the final sufficiency check.
 fn cancel_same_side_orders_until_wallet_covers<H: PerpHost>(

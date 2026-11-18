@@ -418,7 +418,8 @@ where
     }
     // The farthest reduce-only entry. `min_by_key` over the REVERSED distance returns the FIRST of
     // the farthest, so equal-distance (same-price) entries are evicted in list order — which is
-    // insertion order, i.e. FIFO, taking the earliest first. §1.6 records FIFO and
+    // insertion order (`rest_in_book` inserts after the entries already at its price), i.e. FIFO,
+    // taking the earliest first. §1.6 records FIFO and
     // orderId-ascending as indistinguishable in the evidence; FIFO is the one that can be explained
     // to a user, and our order ids are `keccak(account ‖ nonce)`, so ascending-id would be
     // pseudorandom.

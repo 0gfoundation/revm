@@ -453,8 +453,8 @@ pub(super) fn rest_in_book<H: PerpHost>(
     let pos_pre = match own_side_list.filter(|_| !flags.reduce_only) {
         Some(mut list) => {
             let i = match side {
-                Side::Buy => list.partition_point(|e| e.price > price),
-                Side::Sell => list.partition_point(|e| e.price < price),
+                Side::Buy => list.partition_point(|e| e.price >= price),
+                Side::Sell => list.partition_point(|e| e.price <= price),
             };
             list.insert(i, new_entry);
             let mut pre = pos_basis.clone();
@@ -630,11 +630,16 @@ pub(super) fn rest_in_book<H: PerpHost>(
 
     // The real insert: in-place on a warm list (zero clone), or one materialize-clone on a cold
     // first-touch (unavoidable — it IS the write of a previously-committed list). `partition_point`
-    // re-derives the same index the probe would have.
+    // re-derives the same index the probe would have: AFTER every entry at the same price, so a
+    // price's entries keep their arrival order (FIFO). Two consumers read that order — the
+    // reduce-only eviction takes the earliest of equally far orders
+    // (`reduce_only::next_eviction`), and the taker cover loop cancels from the list's BACK, the
+    // latest placed at the farthest price
+    // (`settlement::cancel_same_side_orders_until_wallet_covers`).
     match side {
         Side::Buy => {
             storage::mutate_buy_orders(context, user, market_id, |list| {
-                let i = list.partition_point(|e| e.price > price);
+                let i = list.partition_point(|e| e.price >= price);
                 list.insert(i, new_entry);
             })?;
             storage::insert_bid_price(context, market_id, price)?;
@@ -650,7 +655,7 @@ pub(super) fn rest_in_book<H: PerpHost>(
         }
         Side::Sell => {
             storage::mutate_sell_orders(context, user, market_id, |list| {
-                let i = list.partition_point(|e| e.price < price);
+                let i = list.partition_point(|e| e.price <= price);
                 list.insert(i, new_entry);
             })?;
             storage::insert_ask_price(context, market_id, price)?;
