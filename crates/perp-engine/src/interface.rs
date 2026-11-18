@@ -747,11 +747,19 @@ sol! {
         /// # Why it exists
         ///
         /// Every sweep is capped per run (50 actions shared by trigger fires and liquidations, 64
-        /// trailing activations, 128 ADL fills, 64 band expiries) and its overflow is deferred,
-        /// not recorded — the next run re-derives its candidates from scratch. But they only run
-        /// inside `updateIndexPrice`, which is itself rate-limited to one effective call per
-        /// `priceUpdateInterval`, so a backlog drained at most once per interval however deep it
-        /// was. This decouples the two: the backlog can be drained every block.
+        /// trailing activations, 128 ADL fills, 64 band expiries, 128 distinct makers per
+        /// liquidation close) and its overflow is deferred, not recorded — the next run re-derives
+        /// its candidates from scratch. But they only run inside `updateIndexPrice`, which is
+        /// itself rate-limited to one effective call per `priceUpdateInterval`, so a backlog
+        /// drained at most once per interval however deep it was. This decouples the two: the
+        /// backlog can be drained every block.
+        ///
+        /// A liquidation close stopped by its maker cap leaves the rest of the position open and
+        /// does NOT ADL it — the book still holds liquidity for it — and a cross episode stops at
+        /// that market instead of moving on to the account's next one. This call (or the next tick,
+        /// or `liquidate`) closes the rest against the book; only what the book then cannot take
+        /// (band, empty book) is ADL'd. Each capped pass takes at least 128 resting orders off the
+        /// book, so at a fixed book the loop ends.
         ///
         /// # What it does NOT do
         ///
@@ -764,10 +772,11 @@ sol! {
         ///
         /// # Returns
         ///
-        /// `moreRemaining` — true when a sweep stopped on its budget again, or a conditional was
-        /// re-armed for more (a touch-capped fire, a `maxQuantity` tranche — see `placeAlgoOrder`),
-        /// i.e. call again. A keeper can loop on this without re-reading state; at a fixed mark
-        /// the loop ends, since every re-arm closed `maxQuantity` or consumed 64 resting orders.
+        /// `moreRemaining` — true when a sweep stopped on its budget again (a liquidation close on
+        /// its maker cap included), or a conditional was re-armed for more (a touch-capped fire, a
+        /// `maxQuantity` tranche — see `placeAlgoOrder`), i.e. call again. A keeper can loop on
+        /// this without re-reading state; at a fixed mark the loop ends, since every re-arm closed
+        /// `maxQuantity` or consumed 64 resting orders, and every maker-capped close 128.
         ///
         /// # Cost
         ///
@@ -1898,13 +1907,23 @@ sol! {
         // ── Liquidation ───────────────────────────────────────────────────
         /// Liquidate an under-margined position (anyone can call).
         ///
+        /// An ISOLATED position below maintenance is closed through the book (a market order
+        /// bounded by the price band), the rest the book cannot take ADL'd, in ONE PASS that may
+        /// leave part of it open. Its close touches at most 128 distinct makers: a rest left by
+        /// that cap is NEVER ADL'd — the book still holds liquidity for it — and is closed against
+        /// the book by `drainDeferredWork` (the call sets the market's deferred-work flag), the next
+        /// tick or a repeated `liquidate`, each re-judging maintenance first. A rest left because
+        /// ADL ran out of budget sets the flag too. Each pass emits its own `Liquidation`.
+        ///
         /// A position CROSSED in force is judged on its ACCOUNT (cross P3): at or above cross
         /// maintenance (`crossMarginBalance >= totalCrossMaintMargin`) it is refused with
         /// `liquidate: account is above cross maintenance margin` (no write); below it the call
         /// runs the account's liquidation episode starting at `marketId` — cancel every open order
         /// of the account, close its cross markets one by one (this one first) until it is back at
         /// maintenance, ADL what the book does not take — within a 16-step budget, the rest left to
-        /// the next tick (`CrossLiquidationStarted` / `Liquidation` / `CrossLiquidationEnded`). An
+        /// the next tick (`CrossLiquidationStarted` / `Liquidation` / `CrossLiquidationEnded`). A
+        /// close stopped by the 128-maker cap is not ADL'd either: the episode stops at that market,
+        /// flags it for `drainDeferredWork`, and resumes there against the book. An
         /// account flagged by an earlier unfinished episode is resumed — or, recovered since,
         /// un-flagged — through ANY `marketId`: one where it holds no position, a CROSSED one, or
         /// an ISOLATED one whose position is not itself below maintenance (one that is, is
@@ -2771,12 +2790,15 @@ sol! {
         event MarginTypeChanged(address indexed user, uint64 indexed marketId, uint8 marginType);
 
         // Feeds: /income (LIQUIDATION_FEE for liquidator)
-        // One per liquidated (user, market): `amount` the signed position before the close,
-        // `reward` the clearance fee credited to the insurance fund (cross P3: a rate on the
-        // NOTIONAL closed, both margin types, capped as `addMarket` says — a bankrupt close pays 0
-        // or the bankruptcy price's rounding dust, NOT 0 by rule), `marginType` the position's
-        // type in force (0 = CROSSED — one row per market an account-level cross episode closed;
-        // 1 = ISOLATED).
+        // One per liquidation PASS over a (user, market): `amount` the signed position that pass
+        // started from, `reward` the clearance fee on what that pass closed, credited to the
+        // insurance fund (cross P3: a rate on the NOTIONAL closed, both margin types, capped as
+        // `addMarket` says — a bankrupt close pays 0 or the bankruptcy price's rounding dust, NOT
+        // 0 by rule), `marginType` the position's type in force (0 = CROSSED — one row per market
+        // an account-level cross episode closed; 1 = ISOLATED). A position can take more than one
+        // pass — its close stopped on the 128-maker cap or the ADL budget (see `liquidate`) — and
+        // then has one row per pass, each charged only on what it closed (never twice for the same
+        // contracts); only the first row's `amount` is the size it had when liquidation began.
         // ⚠️ ABI CHANGE (cross P3): `marginType` APPENDED, so the event signature and topic0 moved.
         // An indexer filtering on the old topic0 sees NO liquidations at all, and gets no error.
         // Regenerate the binding.
