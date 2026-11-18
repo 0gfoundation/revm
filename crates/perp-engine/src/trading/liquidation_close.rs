@@ -25,9 +25,16 @@ pub(crate) struct LiquidationCloseOutcome {
     /// Unfilled quantity — the residual that goes to ADL, unless `maker_cap_deferred`: a rest the
     /// cap left is never ADL'd, the next pass closes it against the book.
     pub(crate) remaining: u64,
-    /// The walk stopped on the distinct-maker cap, NOT on the book or the band. The cap is per
-    /// match, so retrying gets a fresh allowance and can absorb more from the SAME book: this is
-    /// same-block recoverable and must set `Market::deferred_work`.
+    /// The walk stopped on the distinct-maker cap, NOT on the book or the band, AND it filled
+    /// something. The cap is per match, so retrying gets a fresh allowance and can absorb more from
+    /// the SAME book: this is same-block recoverable and must set `Market::deferred_work`.
+    ///
+    /// A capped walk that filled NOTHING is not deferred: every maker it spent the cap on was
+    /// refused at its fill (K9, the tier or position bound, a frozen account) and cancelled, so its
+    /// rest goes to ADL like one the book could not take. Otherwise such "phantom" orders — accepted
+    /// at placement, refused at every fill — could be restuffed to keep a liquidation deferring
+    /// pass after pass with nothing closed (Q6 review). With progress required, every deferral
+    /// closes at least one lot against the book.
     pub(crate) maker_cap_deferred: bool,
 }
 
@@ -129,8 +136,8 @@ pub(crate) fn execute_liquidation_market_order<H: PerpHost>(
     // path at all. The set of rejects between the match and the flush is empty, which is the same
     // set it was before the hoist — the liquidation path's reject surface is unchanged.
     let remaining = outcome.remaining;
-    // Read BEFORE `apply` consumes the outcome.
-    let maker_cap_deferred = outcome.maker_cap_deferred();
+    // Read BEFORE `apply` consumes the outcome. Deferred only on progress (see the field's doc).
+    let maker_cap_deferred = outcome.maker_cap_deferred() && remaining < quantity;
     outcome.apply(context, side, market, &mut None)?;
     // delete-on-terminal: the liquidation close is an IOC that never rests — it exists only to
     // drive the match + emit OrderPlaced/Trade. Its record is dropped (never a live/queryable

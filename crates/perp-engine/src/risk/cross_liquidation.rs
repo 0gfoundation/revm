@@ -329,9 +329,11 @@ struct CloseStep {
     /// Same-block-recoverable work was left in this market by the ADL leg: it stopped on the
     /// shared ADL budget with a residual still open. Recorded as the episode's continuation.
     leftover: bool,
-    /// The book leg stopped on the distinct-maker cap, so the rest was NOT handed to ADL (Q6): the
-    /// book still has in-band liquidity a retry can reach. Unless `healthy`, the episode stops at
-    /// this market and records it as deferred.
+    /// The book leg stopped on the distinct-maker cap after filling something, so the rest was NOT
+    /// handed to ADL (Q6): the book still has in-band liquidity a retry can reach. Unless
+    /// `healthy`, the episode stops at this market and records it as deferred. (A capped IOC that
+    /// filled nothing is not `book_capped`: its rest goes to ADL — see
+    /// `LiquidationCloseOutcome::maker_cap_deferred`.)
     book_capped: bool,
 }
 
@@ -340,9 +342,9 @@ struct CloseStep {
 /// of the account is priced at a mark the episode trusts ([`every_cross_leg_is_priced`]) — without
 /// it no deficit sets an ADL price (see the ADL leg below).
 ///
-/// The rest the IOC leaves goes to ADL only when the IOC stopped on its limit, the band or an
-/// empty book — never when it stopped on the distinct-maker cap ([`CloseStep::book_capped`]),
-/// whose rest the next pass closes against the book.
+/// The rest the IOC leaves goes to ADL when the IOC stopped on its limit, the band or an empty
+/// book — never when it stopped on the distinct-maker cap after filling something
+/// ([`CloseStep::book_capped`]), whose rest the next pass closes against the book.
 fn close_market<H: PerpHost>(
     context: &mut H,
     user: Address,
@@ -386,8 +388,9 @@ fn close_market<H: PerpHost>(
         charge_fee_and_check(context, user, market, qty - close.remaining)?;
 
     // ── (e) the unfilled rest → ADL, unless the IOC already restored the account (Q6), or it
-    // stopped on the distinct-maker cap (the book still has in-band liquidity: the episode stops
-    // at this market and the next pass walks the book again — see `liquidate_cross_account`) ──
+    // stopped on the distinct-maker cap having filled something (the book still has in-band
+    // liquidity: the episode stops at this market and the next pass walks the book again — see
+    // `liquidate_cross_account`) ──
     if health.below_cross_maintenance() && close.remaining > 0 && !book_capped {
         // R5: at the MARK while the account still has equity (the winners lose exposure, not
         // money), at the MM-share bankruptcy price once it has none (the winners absorb this

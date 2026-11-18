@@ -71,11 +71,12 @@ fn isolated_maintenance_verdict(
 /// invariant failure. The sweep halts on both.
 ///
 /// One call is one PASS, and a pass need not close the whole position. When the book leg stops
-/// on the distinct-maker cap ([`crate::trading::MAX_LIQUIDATION_MAKER_ACCOUNTS`]) the book still
-/// holds liquidity a retry can reach, so the rest is NOT handed to ADL: the pass ends there,
-/// `*deferred` is set, and the next pass — `drainDeferredWork`, the next tick, or a repeated
-/// `liquidate()` — re-judges maintenance at its own mark and continues against the book. Only a
-/// rest the book leg left on the band or an empty book goes to ADL.
+/// on the distinct-maker cap ([`crate::trading::MAX_LIQUIDATION_MAKER_ACCOUNTS`]) after filling
+/// something, the book still holds liquidity a retry can reach, so the rest is NOT handed to ADL:
+/// the pass ends there, `*deferred` is set, and the next pass — `drainDeferredWork`, the next tick,
+/// or a repeated `liquidate()` — re-judges maintenance at its own mark and continues against the
+/// book. A rest the book leg left on the band or an empty book goes to ADL, and so does one whose
+/// capped walk filled nothing (every maker it reached was refused at its fill).
 ///
 /// `liquidator` is recorded verbatim in the `Liquidation` event (the caller for a
 /// manual liquidation; a system address for the sweep). Bad debt from the close
@@ -220,8 +221,9 @@ pub(crate) fn liquidate_position<H: PerpHost>(
         None,
     )?;
     let remaining = close.remaining;
-    // The book leg stopped on the distinct-maker cap, which is per MATCH: a retry gets a fresh
-    // allowance against the same book. Same-block recoverable, so the drain must see it.
+    // The book leg stopped on the distinct-maker cap after filling something; the cap is per
+    // MATCH: a retry gets a fresh allowance against the same book. Same-block recoverable, so the
+    // drain must see it.
     *deferred |= close.maker_cap_deferred;
     // ── A maker-capped rest is NOT ADL'd (Q6) ─────────────────────────────────────────────────
     //
@@ -234,13 +236,22 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     // table may find a smaller rest healthy, and it then stays open — a partial liquidation, as
     // for an ADL-budget leftover) and walks the book again.
     //
+    // Only when the capped walk FILLED something (`maker_cap_deferred` requires it). A capped walk
+    // that filled nothing spent the cap entirely on makers refused at their fill — K9, the tier or
+    // position bound, a frozen account — whose orders it cancelled: no evidence of liquidity, so
+    // its rest goes to ADL below as before Q6. Without that, such orders (accepted at placement,
+    // refused at every fill) could be restuffed between passes to keep a liquidation deferring with
+    // nothing closed while its bad debt grows (Q6 review).
+    //
     // It terminates. Every maker a capped walk touched had a resting order fully filled or
-    // removed (a K9 or frozen-account maker is cancelled, and a partial fill would have ended the
-    // walk), and the walk only stops on the cap with the 129th distinct maker still in band, so
-    // each capped pass takes at least 128 resting orders off the in-band opposite book. At a fixed
-    // book that is at most ⌈orders / 128⌉ capped passes; after them the book leg stops on a fill,
-    // the band or an empty book, and the rest goes to ADL below exactly as before. Each pass costs
-    // at most what one did before: 128 makers and no ADL, instead of 128 makers plus ADL.
+    // removed (a refused maker is cancelled, and a partial fill would have ended the walk), and the
+    // walk only stops on the cap with the 129th distinct maker still in band, so each capped pass
+    // takes at least 128 resting orders off the in-band opposite book: at a fixed book at most
+    // ⌈orders / 128⌉ capped passes. And each DEFERRED pass closed at least one lot against the
+    // book, so however the book is restuffed, at most `|position|` of them; after them the book
+    // leg stops on a fill, the band or an empty book, or fills nothing, and the rest goes to ADL
+    // below. Each pass costs at most what one did before: 128 makers and no ADL, instead of 128
+    // makers plus ADL.
     if remaining > 0 && !close.maker_cap_deferred {
         // Every residual the BOOK cannot take — solvent or not — is closed as a REAL forced trade
         // against opposite-side holders via ADL, which picks its own price (mark when the residual
@@ -742,9 +753,10 @@ fn run_liquidation_sweep<H: PerpHost>(
     //   * the per-match distinct-maker cap   -> `deferred`, set by the book leg
     //
     // All three reset on the next call, so `drainDeferredWork` genuinely makes progress on each.
-    // For the maker cap that progress is the book itself: the capped rest was not ADL'd, and each
-    // capped pass takes at least 128 resting orders off the in-band book (`liquidate_position`),
-    // so at a fixed book the cap stops a bounded number of passes and the rest then reaches ADL.
+    // For the maker cap that progress is the book itself: the capped rest was not ADL'd, each
+    // capped pass takes at least 128 resting orders off the in-band book, and a pass is deferred
+    // only when it also closed something (`liquidate_position`), so the cap stops a bounded number
+    // of passes and the rest then reaches ADL.
     // What this does NOT report, deliberately, is a residual with no eligible counterparty: that
     // outcome is identical until the mark, the book or the position set changes, so flagging it
     // would spin a keeper's `while (drain())` forever for nothing.

@@ -20,11 +20,13 @@ use settlement::{MakerFillOutcome, TakerSettlement};
 ///
 /// This keeps the balance after-image count bounded independently of order-book size. It is a gas
 /// bound on one PASS, not a statement about the book: the quantity left unfilled when the cap stops
-/// the walk is NOT ADL'd. The liquidation stops there, the market's `deferred_work` is set, and the
-/// next pass (`drainDeferredWork`, the next tick, a repeated `liquidate()`) continues against the
-/// book — isolated (`risk::liquidate_position`) and cross (`risk::cross_liquidation`, which also
-/// does not move on to the account's next market) alike. Only a rest the book leg left for another
-/// reason (band, limit, empty book) goes to ADL.
+/// a walk that FILLED something is NOT ADL'd. The liquidation stops there, the market's
+/// `deferred_work` is set, and the next pass (`drainDeferredWork`, the next tick, a repeated
+/// `liquidate()`) continues against the book — isolated (`risk::liquidate_position`) and cross
+/// (`risk::cross_liquidation`, which also does not move on to the account's next market) alike. A
+/// rest the book leg left for another reason (band, limit, empty book) goes to ADL, and so does one
+/// whose capped walk filled nothing — the cap spent entirely on makers refused at their fill (see
+/// `LiquidationCloseOutcome::maker_cap_deferred`).
 pub(crate) const MAX_LIQUIDATION_MAKER_ACCOUNTS: usize = 128;
 
 /// Q1: maximum LIVE resting maker orders one non-liquidation taker walk may touch — filled, STP
