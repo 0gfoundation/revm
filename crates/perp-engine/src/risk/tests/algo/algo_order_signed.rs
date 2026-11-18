@@ -508,3 +508,44 @@ fn the_signed_path_refuses_prices_above_max_price_before_the_burn() {
     submit_signed(&mut ctx, &sk, &at_max).unwrap();
     assert_eq!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(), 2);
 }
+
+/// Q12: `placeAlgoOrderSigned` runs the seen-signature GC on the BLOCK clock, like every other
+/// signed selector. The GC drops the one bucket exactly `SEEN_RETENTION_BUCKETS` behind the
+/// clock it is given, so the clock is observable: each call here is signed 30 s (two buckets)
+/// before its block, inside the 60 s recv window. On the block clock the third call collects the
+/// first call's bucket; on the message clock it would collect the bucket two older, and the first
+/// marker would stay in off-trie state for good (nothing else signs here).
+#[test]
+fn the_signed_place_collects_the_expired_seen_bucket_on_the_block_clock() {
+    use crate::storage::{SEEN_BUCKET_WIDTH_SECS as W, SEEN_RETENTION_BUCKETS as R};
+    const LAG: u64 = 30;
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    register(&mut ctx, ALICE, &sk);
+
+    let t0 = 10 * W; // bucket 10
+    ctx.block.timestamp = U256::from(t0);
+    let first = Req { trigger: 8_000, ts: t0, ..Req::default() };
+    let first = submit_signed(&mut ctx, &sk, &first).unwrap();
+    assert!(storage::is_signature_seen(&mut ctx, &first).unwrap());
+
+    // Block bucket 15: one short of collecting bucket 10.
+    let t1 = (t0 / W + R - 1) * W;
+    ctx.block.timestamp = U256::from(t1);
+    let second = Req { trigger: 7_900, ts: t1 - LAG, ..Req::default() };
+    let second = submit_signed(&mut ctx, &sk, &second).unwrap();
+    assert!(storage::is_signature_seen(&mut ctx, &first).unwrap(), "collected early");
+
+    // Block bucket 16 collects bucket 10. The message's own bucket is 14, which would collect 8.
+    let t2 = (t0 / W + R) * W;
+    ctx.block.timestamp = U256::from(t2);
+    let third = Req { trigger: 7_800, ts: t2 - LAG, ..Req::default() };
+    let third = submit_signed(&mut ctx, &sk, &third).unwrap();
+    assert!(
+        !storage::is_signature_seen(&mut ctx, &first).unwrap(),
+        "placeAlgoOrderSigned did not collect the bucket R behind the BLOCK"
+    );
+    assert!(storage::is_signature_seen(&mut ctx, &second).unwrap());
+    assert!(storage::is_signature_seen(&mut ctx, &third).unwrap());
+}
