@@ -7,7 +7,7 @@
 //! liquidation's book leg, a "phantom" that spent the distinct-maker cap without filling.
 
 use super::*;
-use crate::interface::IPerpDex::{setMarginTypeCall, OrderPlaced};
+use crate::interface::IPerpDex::{setMarginTypeCall, OrderCancelled, OrderPlaced, Trade};
 
 const TIER_REJECT: &str = "placeOrder: leverage exceeds the margin tier for this position size";
 
@@ -115,7 +115,14 @@ fn a_reduce_is_never_held_to_the_open_guards_a_flip_is_on_the_side_it_opens() {
 /// it would hold $1,080 — tier 1, whose 10x cap is below its 20x — so the tier guard of the fill
 /// refuses it. That bid used to rest and be cancelled `MakerInsolvent` at its first touch: 130 such
 /// accounts, two bids each, stretched a liquidation over three passes, two closing nothing. Now it
-/// is refused at placement. A bid that keeps the account in tier 0 (long 10 + 1: $990) still rests.
+/// is refused at placement.
+///
+/// A bid that keeps the account in tier 0 at the $100 MARK as well (long 8 + 1: $900; $810 at its
+/// own price) rests and FILLS. The rest guard values the fill at the order's own price, though, and
+/// the fill is judged at the mark, so a bid that fits only at its own price — long 10 + 1: $990 at
+/// $90, $1,100 at the mark — still rests and is cancelled `MakerInsolvent` at its first touch. That
+/// gap is pinned here as it stands: which price both should value at is an open owner decision
+/// (second-round review rest-guard-1).
 #[test]
 fn a_bid_its_fill_would_take_past_the_tier_cap_cannot_rest() {
     let mut ctx = make_ctx();
@@ -128,7 +135,47 @@ fn a_bid_its_fill_would_take_past_the_tier_cap_cannot_rest() {
     });
 
     let fine = indexed_maker(1);
-    seed_position_account(&mut ctx, fine, 10, -900_000_000, 45_000_000, 20, 200_000_000);
+    seed_position_account(&mut ctx, fine, 8, -720_000_000, 36_000_000, 20, 200_000_000);
     try_place_order(&mut ctx, fine, Side::Buy as u8, LONG_LIQ_PRICE, 1).unwrap();
     assert_eq!(storage::book_order_count(&mut ctx, fine, MARKET_ID).unwrap(), 1);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    ioc_sell(&mut ctx, MAKER, LONG_LIQ_PRICE, 1);
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    let trades: Vec<(Address, u64)> =
+        decode_events::<Trade>(&logs).iter().map(|t| (t.maker, t.quantity)).collect();
+    assert_eq!(trades, [(fine, 1)], "a bid the guard admits at the mark too fills");
+    assert_eq!(position(&mut ctx, fine).amount, 9);
+
+    // Pinned as it stands — rest-guard-1, an OPEN owner decision: fits at $90, not at the mark.
+    let gap = indexed_maker(2);
+    seed_position_account(&mut ctx, gap, 10, -900_000_000, 45_000_000, 20, 200_000_000);
+    try_place_order(&mut ctx, gap, Side::Buy as u8, LONG_LIQ_PRICE, 1).unwrap();
+    assert_eq!(storage::book_order_count(&mut ctx, gap, MARKET_ID).unwrap(), 1);
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    ioc_sell(&mut ctx, MAKER, LONG_LIQ_PRICE, 1);
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    assert!(decode_events::<Trade>(&logs).is_empty());
+    let cancels: Vec<(Address, u8)> =
+        decode_events::<OrderCancelled>(&logs).iter().map(|c| (c.user, c.reason)).collect();
+    assert_eq!(cancels, [(gap, CancelReason::MakerInsolvent as u8)]);
+    assert_eq!(position(&mut ctx, gap).amount, 10);
+}
+
+fn ioc_sell(ctx: &mut TestCtx, user: Address, price: u64, qty: u64) {
+    run_place_order(
+        &placeOrderCall {
+            marketId: MARKET_ID,
+            side: Side::Sell as u8,
+            price,
+            quantity: qty,
+            orderType: 0,
+            tif: crate::types::TimeInForce::Ioc as u8,
+            clientOrderId: FixedBytes::default(),
+            flags: 0,
+        }
+        .abi_encode(),
+        user,
+        ctx,
+    )
+    .unwrap();
 }
