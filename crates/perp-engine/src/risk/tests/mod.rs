@@ -5391,3 +5391,8 @@ mod cross_liquidation;
 /// conservation after every call, and the never-`Err` fuzz.
 #[cfg(test)]
 mod cross_liquidation_spec;
+
+/// Q2: the `updateIndexPrice` timestamp bound (`MAX_ORACLE_FUTURE_SKEW_SECS`) — exact boundary,
+/// raw vs floored, millisecond stamps, no lower bound, write-clean refusals.
+#[cfg(test)]
+mod oracle_timestamp;

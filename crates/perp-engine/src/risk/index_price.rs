@@ -6,9 +6,31 @@ use super::*;
 
 // ── Index price & mark price computation ──────────────────────────────────────
 
+/// How far ahead of the executing block an `updateIndexPrice` timestamp may be (Q2).
+///
+/// 0G executes delayed: an oracle transaction is signed before the block that runs it, so an
+/// honest stamp is normally AT OR BELOW block time. A lead comes only from clock skew between the
+/// feed and the consensus-layer proposer (block times are the CL's; consecutive blocks can share
+/// a second), plus a feed that bumps a stale window by one `priceUpdateInterval` (15 s on every
+/// devnet market) — so the 5 s signed-order skew would refuse honest pushes. The harm a lead
+/// does is bounded by this value: an honest feed is frozen out for at most 60 s, and funding
+/// settles at most 60 s early (0.2 % of an 8 h epoch). Flat, not `k · priceUpdateInterval`: a
+/// 3 600 s market would otherwise admit a lead of hours. One minute, as `MAX_RECV_WINDOW`.
+///
+/// Bounds the RAW timestamp as sent, not the floored window: the caller controls and sees the
+/// raw value, the stored (floored) lead is still at most this, and the tolerance does not grow
+/// with the interval.
+pub const MAX_ORACLE_FUTURE_SKEW_SECS: u64 = 60;
+
+/// Reject reason for an `updateIndexPrice` timestamp beyond [`MAX_ORACLE_FUTURE_SKEW_SECS`].
+pub const ORACLE_FUTURE_TIMESTAMP_REJECT: &str =
+    "updateIndexPrice: timestamp is more than 60 s ahead of the block";
+
 /// `updateIndexPrice(uint64 marketId, uint64 indexPrice, uint64 timestamp)`
 ///
-/// Callable by admin or the configured oracle address.
+/// Callable by admin or the configured oracle address. A `timestamp` more than
+/// [`MAX_ORACLE_FUTURE_SKEW_SECS`] ahead of the block is refused (Q2); any other is floored to the
+/// market's `priceUpdateInterval` and ignored when that window is not newer than the stored one.
 ///
 /// Steps:
 /// 1. Compute Price1, Price2, ContractPrice and take their median as mark price.
@@ -34,6 +56,13 @@ pub fn run_update_index_price<H: PerpHost>(
         return Err(perp_err(
             "updateIndexPrice: indexPrice exceeds market maximum",
         ));
+    }
+    // Q2: the raw stamp may lead the block by at most MAX_ORACLE_FUTURE_SKEW_SECS. Checked BEFORE
+    // the staleness no-op below, so a far-future stamp is refused loudly even when its window is
+    // stale, and pre-write (commit-only). No lower bound: an old stamp is accepted, and ignored
+    // there when its window is not newer.
+    if args.timestamp > context.timestamp().saturating_add(MAX_ORACLE_FUTURE_SKEW_SECS) {
+        return Err(perp_err(ORACLE_FUTURE_TIMESTAMP_REJECT));
     }
     let effective_timestamp =
         align_price_update_timestamp(args.timestamp, market.price_update_interval);
@@ -91,11 +120,12 @@ pub fn run_update_index_price<H: PerpHost>(
 /// `updateIndexPriceFromBook(uint64 marketId)` — advance the index from this market's own book
 /// while the external feed has nothing to publish.
 ///
-/// Takes no timestamp on purpose. There is no external observation to stamp, and a
-/// caller-supplied one would be doubly unsafe here: it reopens the future-dated freeze (the
-/// staleness gate is the only bound on it), and because `alpha` is derived from the elapsed
-/// time, a caller could submit many updates in ONE block with hand-rolled timestamps and walk
-/// the EWMA to convergence — the per-update cap bounds the step, not the number of steps.
+/// Takes no timestamp on purpose: there is no external observation to stamp. The future-dated
+/// freeze a caller-supplied stamp can cause is bounded on the external path by
+/// [`MAX_ORACLE_FUTURE_SKEW_SECS`]; here a stamp would still be unsafe, because `alpha` is
+/// derived from the elapsed time — a caller could submit several updates in ONE block with
+/// hand-rolled timestamps (each within that bound) and walk the EWMA toward convergence. The
+/// per-update cap bounds the step, not the number of steps.
 pub fn run_update_index_price_from_book<H: PerpHost>(
     input_bytes: &[u8],
     caller: Address,

@@ -687,8 +687,9 @@ fn mark_deferred<H: PerpHost>(
 }
 
 /// Q10: `market`'s stored mark is older than `STALE_MULT × price_update_interval`, judged by the
-/// index timestamp it was published at against the block time. A timestamp ahead of the block
-/// (an oracle that stamps its own clock) is fresh.
+/// index timestamp it was published at against the block time. A timestamp ahead of the block —
+/// at most `MAX_ORACLE_FUTURE_SKEW_SECS` ahead (Q2), an oracle that stamps its own clock — is
+/// fresh.
 fn mark_is_stale<H: PerpHost>(context: &mut H, market: &Market) -> Result<bool, PerpError> {
     let published = storage::load_index_price_state(context, market.market_id)?.timestamp;
     let max_age = STALE_MULT.saturating_mul(market.price_update_interval);
