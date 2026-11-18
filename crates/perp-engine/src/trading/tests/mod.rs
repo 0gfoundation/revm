@@ -5614,7 +5614,7 @@ mod batch_cancel;
 // Reuses the Phase 1 shell verbatim (pre-decode length validation, dynamic gas, the 34-byte
 // index-aligned status blob, abort-forward). What is NEW and therefore what these tests hammer:
 // the orderId/nonce rule (`save_order` has no collision guard, so a wrong rule is silent state
-// corruption), the Accepted-vs-Filled tag split, the place-path reason codes, the 224-byte element
+// corruption), the Accepted-vs-Filled tag split, the place-path reason codes, the 256-byte element
 // stride, and the Phase 0 synergy that makes a batch safe at all — a rejected item emits no
 // `OrderPlaced`.
 mod batch_place;

@@ -200,7 +200,7 @@ pub fn run_batch_place_orders<H: PerpHost>(
 ) -> Result<Bytes, PerpError> {
     // Defensive pre-decode length read, repeated here on purpose (see `run_batch_cancel_orders`):
     // `abi_decode_validate` reserves capacity for the declared length before looking at the
-    // calldata size, and one `PlaceItem` is 224 bytes, so the bound is 7× tighter than cancel's.
+    // calldata size, and one `PlaceItem` is 256 bytes, so the bound is 8× tighter than cancel's.
     batch::PLACE_DIRECT_LAYOUT.checked_len(input_bytes)?;
     let args = batchPlaceOrdersCall::abi_decode_validate(input_bytes)
         .map_err(|_| perp_err("batchPlaceOrders: invalid calldata"))?;

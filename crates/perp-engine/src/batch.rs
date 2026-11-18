@@ -98,7 +98,7 @@ pub struct BatchArrayLayout {
     pub tail_offset: usize,
     /// Encoded size of ONE element, i.e. the stride of the array body. Only valid for arrays whose
     /// element type is **static** (then the body is `len * elem_size` bytes inline): `bytes32` is
-    /// 32, and a 7-field static struct such as `PlaceItem` is 7 * 32 = 224. A dynamic element type
+    /// 32, and an 8-field static struct such as `PlaceItem` is 8 * 32 = 256. A dynamic element type
     /// would have an offset table instead, so this bound would not hold — do not add one.
     pub elem_size: usize,
 }
@@ -119,10 +119,11 @@ pub const CANCEL_SIGNED_LAYOUT: BatchArrayLayout = BatchArrayLayout {
 };
 
 /// Encoded width of one `PlaceItem`: `marketId, side, price, quantity, orderType, tif,
-/// clientOrderId` — seven **static** fields, so it encodes as 7 words inline with no offset table.
+/// clientOrderId, flags` — eight **static** fields, so it encodes as 8 words inline with no offset
+/// table.
 pub const PLACE_ITEM_ENCODED_LEN: usize = 8 * 32;
 
-/// `batchPlaceOrders(PlaceItem[])` — one head word, tail immediately after it, 224-byte stride.
+/// `batchPlaceOrders(PlaceItem[])` — one head word, tail immediately after it, 256-byte stride.
 pub const PLACE_DIRECT_LAYOUT: BatchArrayLayout = BatchArrayLayout {
     head_word: 0,
     tail_offset: 0x20,
@@ -149,8 +150,8 @@ impl BatchArrayLayout {
     ///    attacker-controlled word *before* reading any element, so a ~100-byte call carrying a huge
     ///    length word is a memory-DoS vector. The gas path is not allowed to be the only thing that
     ///    distrusts this word, so the same check gates the decode. The backing bound uses this
-    ///    layout's [`elem_size`](Self::elem_size) stride, so a 224-byte-per-item `PlaceItem[]` needs
-    ///    7× as many real bytes as a `bytes32[]` of the same declared length.
+    ///    layout's [`elem_size`](Self::elem_size) stride, so a 256-byte-per-item `PlaceItem[]`
+    ///    needs 8× as many real bytes as a `bytes32[]` of the same declared length.
     pub fn checked_len(&self, input: &[u8]) -> Result<usize, PerpError> {
         let head_start = 4 + self.head_word * 32;
         let head = input

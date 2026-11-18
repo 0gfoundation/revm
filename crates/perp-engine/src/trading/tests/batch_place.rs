@@ -699,7 +699,7 @@ fn insufficient_gas_limit_is_out_of_gas_before_any_write() {
     assert_eq!(out.gas_used, full);
 }
 
-/// The 224-byte element stride must be what backs the pre-decode length bound. The decisive case
+/// The 256-byte element stride must be what backs the pre-decode length bound. The decisive case
 /// is `stride confusion`: a declared length that a 32-byte-per-element bound would accept and a
 /// 256-byte-per-element bound must reject.
 #[test]
@@ -749,7 +749,7 @@ fn hostile_length_word_reverts_without_allocating() {
         );
     }
 
-    // A well-formed one-item call is exactly selector + offset + length + one 224-byte item, and
+    // A well-formed one-item call is exactly selector + offset + length + one 256-byte item, and
     // the pre-decode read agrees with the decoder.
     let good = direct_calldata(&[gtc(0, PRICE, QTY)]);
     assert_eq!(good.len(), 4 + 32 + 32 + PLACE_ITEM_ENCODED_LEN);
@@ -984,7 +984,7 @@ fn signed_batch_requires_key_window_and_expiry() {
     assert!(String::from_utf8_lossy(&out.bytes).contains("future"));
 }
 
-/// The digest is the TIGHT 43-bytes-per-item packing, not the 224-byte ABI encoding.
+/// The digest is the TIGHT 44-bytes-per-item packing, not the 256-byte ABI encoding.
 #[test]
 fn signed_digest_layout_is_pinned() {
     let items = [gtc(0, PRICE, QTY), gtc(1, PRICE + TICK, QTY * 2)];
