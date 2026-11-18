@@ -1412,6 +1412,8 @@ fn placement_refusals() {
         (trailing_call(Side::Sell, 0, 100, 1, RO | CP), "reduceOnly cannot be sent with closePosition"),
         (trailing_call(Side::Sell, 0, 100, 0, RO), "quantity must be non-zero"),
         (trailing_call(Side::Sell, 20_501, 100, 1, RO), "multiple of tickSize"),
+        // Q4: an activation price above maxPrice (10_000_000_000) could never be reached.
+        (trailing_call(Side::Sell, 10_000_000_005, 100, 1, RO), "triggerPrice exceeds maxPrice"),
         (trailing_call(Side::Buy, 0, 100, 1, RO), "requires an open position on the closing side"),
     ];
     for (call, want) in cases {
@@ -1429,6 +1431,12 @@ fn placement_refusals() {
     // BUY mirror of the wrong-side activation, and a flat owner.
     let e = try_place(&mut h, user(BOB), Side::Buy, 20_000, 100, 1).unwrap_err();
     assert!(format!("{e:?}").contains("would immediately trigger"), "{e:?}");
+    // …above maxPrice it is the static refusal instead (every mark is at or below it).
+    let e = try_place(&mut h, user(BOB), Side::Buy, 10_000_000_005, 100, 1).unwrap_err();
+    assert!(format!("{e:?}").contains("triggerPrice exceeds maxPrice"), "{e:?}");
+    // maxPrice itself is a legal activation price.
+    let at_max = try_place(&mut h, u, Side::Sell, 10_000_000_000, 100, 1).unwrap();
+    cancel(&mut h, u, &at_max);
     let e = try_place(&mut h, user(7), Side::Sell, 0, 100, 1).unwrap_err();
     assert!(format!("{e:?}").contains("requires an open position"), "{e:?}");
     // Counted in the 32 conditional orders.

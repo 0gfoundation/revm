@@ -219,3 +219,47 @@ fn liquidation_cancels_conditional_orders_too() {
         "and leave the market trigger index, not just her own list"
     );
 }
+
+/// Q4: `maxPrice` bounds a conditional at PLACEMENT — its limit `price` (the child's own bound,
+/// which a fire would otherwise hit and void with reason 10) and its `triggerPrice` for every type
+/// (the stored mark never exceeds `maxPrice`, so an upward trigger above it could never fire and a
+/// downward one would fire on any mark). `maxPrice` itself is accepted, `maxPrice + tick` refused,
+/// write-clean and without spending a nonce. The fixture market: tick 1, maxPrice 1_000_000,
+/// mark 10_000.
+#[test]
+fn prices_above_max_price_are_refused_at_placement() {
+    const MAX: u64 = 1_000_000;
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    assert_eq!(storage::load_market(&mut ctx, MARKET_ID).unwrap().unwrap().max_price, MAX);
+
+    // At the bound: a BUY STOP limit resting at maxPrice, and a BUY STOP_MARKET triggering there
+    // (both fire on mark >= trigger, so neither is "would immediately trigger" at 10_000).
+    place(&mut ctx, Side::Buy, AlgoOrderType::Stop, 12_000, MAX, QTY as u64, 0, 0, RO).unwrap();
+    place(&mut ctx, Side::Buy, AlgoOrderType::StopMarket, MAX, 0, QTY as u64, 0, 0, RO).unwrap();
+    assert_eq!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(), 2);
+
+    // One tick past it.
+    const PRICE_ERR: &str = "price exceeds maxPrice";
+    const TRIGGER_ERR: &str = "triggerPrice exceeds maxPrice";
+    for (side, kind, trigger, price, flags, want) in [
+        (Side::Buy, AlgoOrderType::Stop, 12_000, MAX + 1, RO, PRICE_ERR),
+        (Side::Sell, AlgoOrderType::TakeProfit, 12_000, MAX + 1, RO, PRICE_ERR),
+        (Side::Buy, AlgoOrderType::StopMarket, MAX + 1, 0, RO, TRIGGER_ERR),
+        (Side::Sell, AlgoOrderType::TakeProfit, MAX + 1, 12_000, RO, TRIGGER_ERR),
+        // Downward: was `order would immediately trigger` (after a signed path's burn).
+        (Side::Sell, AlgoOrderType::StopMarket, MAX + 1, 0, RO, TRIGGER_ERR),
+        (Side::Buy, AlgoOrderType::TakeProfitMarket, MAX + 1, 0, RO, TRIGGER_ERR),
+        // closePosition (refused before its position binding is read).
+        (Side::Sell, AlgoOrderType::TakeProfitMarket, MAX + 1, 0, CP, TRIGGER_ERR),
+    ] {
+        let writes = JournalTr::perp_write_count(ctx.journal_mut());
+        let nonce = storage::load_user_nonce(&mut ctx, ALICE).unwrap();
+        let qty = if flags == CP { 0 } else { QTY as u64 };
+        let e = place(&mut ctx, side, kind, trigger, price, qty, 0, 0, flags).unwrap_err();
+        assert!(format!("{e:?}").contains(want), "{kind:?} {side:?}: want {want:?}, got {e:?}");
+        assert_eq!(JournalTr::perp_write_count(ctx.journal_mut()), writes, "{want}: write-clean");
+        assert_eq!(storage::load_user_nonce(&mut ctx, ALICE).unwrap(), nonce);
+    }
+    assert_eq!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(), 2);
+}

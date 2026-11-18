@@ -110,6 +110,14 @@ fn req_calldata(sig: &[u8], account: Address, r: &Req) -> Vec<u8> {
     .abi_encode()
 }
 
+/// Signs `r` as ALICE with `sk` and submits it through the signed entrypoint. On success the
+/// returned id is `keccak256(signature)`, the key of its seen-signature marker.
+fn submit_signed(ctx: &mut TestCtx, sk: &SigningKey, r: &Req) -> Result<[u8; 32], PerpError> {
+    let sig = sk.sign(&req_msg(ctx.chain_id(), ALICE, r)).to_bytes();
+    crate::trading::algo::run_place_algo_order_signed(&req_calldata(&sig, ALICE, r), ctx)
+        .map(|out| out[..32].try_into().unwrap())
+}
+
 /// The signed path decodes the STP bits with the same decoder: the reserved mode is refused
 /// BEFORE the burn (it is a validation failure, so the signature stays unspent and nothing is
 /// written), and a legal mode is stored for the trigger to inherit.
@@ -458,4 +466,45 @@ fn the_same_signature_cannot_be_submitted_twice() {
     let e = crate::trading::algo::run_place_algo_order_signed(&data, &mut ctx).unwrap_err();
     assert!(format!("{e:?}").contains("duplicate signature"), "got {e:?}");
     assert_eq!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(), 1);
+}
+
+/// Q4 on the signed path: `maxPrice` is a property of the message alone, so a limit `price` or a
+/// `triggerPrice` above it is refused BEFORE the burn — write-clean, and the same signature is
+/// refused for the same reason again rather than as a duplicate. The downward case (a SELL stop
+/// above `maxPrice`) used to be the transient `order would immediately trigger`, AFTER the burn.
+/// `maxPrice` itself is accepted. The fixture market: tick 1, maxPrice 1_000_000, mark 10_000.
+#[test]
+fn the_signed_path_refuses_prices_above_max_price_before_the_burn() {
+    const MAX: u64 = 1_000_000;
+    let mut ctx = make_ctx();
+    setup_market(&mut ctx);
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    register(&mut ctx, ALICE, &sk);
+    let buy_stop =
+        Req { side: Side::Buy, kind: AlgoOrderType::Stop, trigger: 12_000, ..Req::default() };
+
+    for (r, want) in [
+        (Req { price: MAX + 1, ..buy_stop }, "price exceeds maxPrice"),
+        (Req { trigger: MAX + 1, ..Req::default() }, "triggerPrice exceeds maxPrice"),
+    ] {
+        let sig = sk.sign(&req_msg(ctx.chain_id(), ALICE, &r)).to_bytes();
+        let data = req_calldata(&sig, ALICE, &r);
+        let writes = JournalTr::perp_write_count(ctx.journal_mut());
+        for attempt in 0..2 {
+            let e = crate::trading::algo::run_place_algo_order_signed(&data, &mut ctx).unwrap_err();
+            assert!(
+                matches!(e, PerpError::Reject(_)) && format!("{e:?}").contains(want),
+                "attempt {attempt}: want a pre-burn {want:?}, got {e:?}"
+            );
+        }
+        assert_eq!(JournalTr::perp_write_count(ctx.journal_mut()), writes, "{want}: write-clean");
+        let sig_hash = primitives::keccak256(sig.as_ref()).0;
+        assert!(!storage::is_signature_seen(&mut ctx, &sig_hash).unwrap(), "{want}: not burned");
+    }
+
+    submit_signed(&mut ctx, &sk, &Req { price: MAX, ..buy_stop }).unwrap();
+    let at_max =
+        Req { side: Side::Buy, kind: AlgoOrderType::StopMarket, trigger: MAX, ..Req::default() };
+    submit_signed(&mut ctx, &sk, &at_max).unwrap();
+    assert_eq!(storage::load_user_algo_orders(&mut ctx, ALICE, MARKET_ID).unwrap().len(), 2);
 }
