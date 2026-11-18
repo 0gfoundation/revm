@@ -83,6 +83,17 @@
 //! the ABI — has no reference and skips the check, as the price band does. The refusal is
 //! TRANSIENT (the next tick may lift it), so on the signed path it comes after the signature is
 //! burned, like every other refusal that reads the mark or the owner's state.
+//!
+//! # Nothing above `maxPrice` (Q4)
+//!
+//! The stored mark never exceeds `maxPrice` (`risk::index_price` holds it within `[tickSize,
+//! maxPrice]`), and a fired limit child above it is refused (`validate_place_order`). So `validate`
+//! refuses a `triggerPrice` (a trailing stop's activation price included) above `maxPrice` for
+//! every type — upward it could never fire, downward it would fire on any mark — and a limit
+//! pair's `price` above it, whose fire could only be voided (reason 10). Both read only the message
+//! and the market config, like the tick / step / `maxQuantity` checks beside them, so the signed
+//! path refuses them before the burn. `updateMarket` may lower `maxPrice` afterwards; an order
+//! placed before that is not re-checked.
 
 use crate::host::PerpHost;
 use crate::interface::IPerpDex::{
@@ -201,6 +212,15 @@ fn validate(
     if trigger_price % market.tick_size != 0 {
         return Err(perp_err("placeAlgoOrder: triggerPrice must be a multiple of tickSize"));
     }
+    // The stored mark never exceeds `maxPrice` (`risk::index_price` clamps it there), so a trigger
+    // (or a trailing stop's activation price) above it can never be reached upward, and one that
+    // fires downward is reached by every mark — `-2021` in `place_core`, after a signed path's
+    // burn. Refused HERE instead: it reads only the message and the market config, like the tick
+    // check above, so a signed request is refused before its signature is spent. Covers every
+    // type; 0 (activate now) passes.
+    if trigger_price > market.max_price {
+        return Err(perp_err("placeAlgoOrder: triggerPrice exceeds maxPrice"));
+    }
     if flags & !KNOWN_FLAGS != 0 {
         return Err(perp_err("placeAlgoOrder: unknown flag bits"));
     }
@@ -277,6 +297,12 @@ fn validate(
     } else {
         if price == 0 {
             return Err(perp_err("placeAlgoOrder: price is required for a limit type"));
+        }
+        // The child's own bound (`validate_place_order`: `placeOrder: price exceeds maximum`),
+        // applied at placement: above it the fire is refused and the conditional voided with
+        // reason 10, so accepting it would only hold a slot until then.
+        if price > market.max_price {
+            return Err(perp_err("placeAlgoOrder: price exceeds maxPrice"));
         }
         if price % market.tick_size != 0 {
             return Err(perp_err("placeAlgoOrder: price must be a multiple of tickSize"));
