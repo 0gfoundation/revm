@@ -2832,3 +2832,10 @@ fn a_maker_capped_market_is_finished_before_the_episode_moves_on() {
     assert_eq!(sigma_amount(&mut ctx, M1, &[ALICE, BOB], 135), 0);
     assert_eq!(sigma_amount(&mut ctx, M2, &[ALICE, CAROL, MAKER], 0), 0);
 }
+
+// ── A cross ADL is held at `maxPrice` too (owner decision 2026-11-19) ───────────────────────────
+//
+// `min(the episode's price, maxPrice)`: in the window after a lowering under the stored mark, the
+// mark branch fills at `maxPrice`, a long loser's gap taking the band edge's route (the next leg,
+// then Q8).
+mod adl_max_price;
