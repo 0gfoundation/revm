@@ -16,11 +16,16 @@
 //!   insurance fund (Q8);
 //! * a SHORT loser buys back lower: it keeps the difference;
 //! * SHORT winners buy lower (better for them); LONG winners sell lower: one that cannot absorb
-//!   that (an entry above `maxPrice` on a thin silo) is fallback tier, filled after every clean
-//!   holder, its shortfall the fund's.
+//!   that (an ISOLATED entry above `maxPrice` on a thin silo, or a CROSSED `E` under the loss) is
+//!   fallback tier, filled after every clean holder, its shortfall the fund's (a CROSSED one held to
+//!   `min(E, 0)`). A CROSSED SHORT winner whose `E` is under the slippage is served last too — its
+//!   per-fill test counts the distance either way — which changes the order only.
 //!
-//! ALICE is the CROSSED account (3x), every other holder ISOLATED. Fees are 0 and the band is off,
-//! so every number is exact, and every step is checked against the custody identity.
+//! Both halves of the mark branch are held there: `E ≥ 0`, and a leg unpriced (`E` whatever it is).
+//!
+//! ALICE is the CROSSED account (3x), every other holder ISOLATED unless a test says otherwise. Fees
+//! are 0 and the band is off, so every number is exact, and every step is checked against the
+//! custody identity.
 
 use super::*;
 use crate::interface::IPerpDex::updateMarketCall;
@@ -335,4 +340,138 @@ fn in_the_window_the_drain_adls_a_cross_long_at_max_price() {
     assert_cleared(&mut ctx, &logs, ALICE, usd(20), fund);
     assert_eq!(deferred_of(&mut ctx, M1), 0);
     assert!(!flagged(&mut ctx, ALICE));
+}
+
+/// **(a) The window, the mark branch's OTHER half: a leg unpriced.** The episode fills at the mark
+/// while `E ≥ 0` — every test above — and also while any cross leg is unpriced, whatever `E` is
+/// (the deficit then waits for that leg's own tick: `cross_liquidation`'s P3 note). Both halves are
+/// held at `maxPrice`. ALICE long 10 on M1 (against BOB) and on M2 (against CAROL), wallet $5,000;
+/// M1 ticks $100 at t = 1,000, and M2's oracle has never published, so its mark is stale there
+/// (Q10). `maxPrice` of M1 lowered to $70, her wallet set to −$50: `E = −$50` — no equity, but a
+/// leg unpriced, so M1's rest goes at the $100 mark, held at $70. The IOC's limit (her bankruptcy
+/// price clamped into the band, upper edge $70) finds an empty book; the ADL sells all 10 to BOB at
+/// $70: −$300, wallet −$350. M2, stale, is left open and the flag stays; with a position still open
+/// there is no Q8, and the fund is untouched. BOB (ISOLATED 1x here, a $1,000 silo) +$300.
+///
+/// Unheld, the 10 went at the $100 mark — BOB neutral, her wallet still −$50.
+#[test]
+fn in_the_window_a_leg_unpriced_adls_at_the_mark_held_at_max_price() {
+    let mut ctx = make_ctx();
+    longs_on_m1_and_m2(&mut ctx, usd(5_000));
+    let _ = tick_at(&mut ctx, M1, px(100), 1_000);
+    assert_eq!(storage::load_index_price_state(&mut ctx, M2).unwrap().timestamp, 0, "M2 stale");
+    set_max_price(&mut ctx, M1, px(70));
+    set_wallet(&mut ctx, ALICE, usd(-50));
+    let f = fold(&mut ctx, ALICE);
+    assert_eq!((f.e, f.cross_mm), (usd(-50) as i128, 333_333_332));
+    let fund = insurance_fund_seeded(&mut ctx, usd(1_000));
+    let ledger = Ledger::open(&mut ctx);
+    let (bob_w0, bob_silo) = (wallet(&mut ctx, BOB), pos(&mut ctx, BOB, M1).margin);
+    assert_eq!(bob_silo, usd(1_000));
+
+    let logs = ok(&mut ctx, KEEPER, &liquidate(ALICE, M1));
+    ledger.check(&mut ctx, "after liquidate()");
+    let closes: Vec<u64> =
+        evs::<OrderPlaced>(&logs).iter().filter(|o| o.user == ALICE).map(|o| o.price).collect();
+    assert_eq!(closes, [px(70)], "the IOC's limit, clamped into the band");
+    assert!(evs::<Trade>(&logs).is_empty());
+    assert_eq!(adls(&logs), [(ALICE, BOB, M1, 10, px(70))], "the mark, held at maxPrice");
+    let liq: Vec<u64> = evs::<Liquidation>(&logs).iter().map(|l| l.marketId).collect();
+    assert_eq!(liq, [M1], "M2 is stale: skipped");
+    assert_eq!(wallet(&mut ctx, ALICE), usd(-350));
+    assert_eq!((pos(&mut ctx, ALICE, M1).amount, pos(&mut ctx, ALICE, M2).amount), (0, 10));
+    assert!(flagged(&mut ctx, ALICE), "still under maintenance at M2's stale mark");
+    assert!(evs::<CrossLiquidationEnded>(&logs).is_empty());
+    assert_eq!(wallet(&mut ctx, BOB) - bob_w0, bob_silo + usd(300));
+    assert!(evs::<InsuranceFundChanged>(&logs).is_empty(), "no Q8: M2 is still open");
+    assert_eq!(insurance_fund(&mut ctx), fund);
+}
+
+/// **(c) A CROSSED long winner that cannot carry the sale at `maxPrice`: fallback tier, held to
+/// `min(E, 0)`, the fund the rest.** ALICE short 10 on M1 against CAROL — CROSSED 3x here, long 10
+/// — who also holds a CROSSED long of 1 on M2 (against KEEPER), so she keeps a position and no Q8
+/// runs for her. Wallets: ALICE $100, CAROL $500 (`E = $500` at the $100 marks). `maxPrice` of M1
+/// lowered to $40; `liquidate(ALICE, M1)`. CAROL is the only holder; selling at $40 would cost her
+/// `10 × $60 = $600`, past her `E` — so her per-fill test fails, she is re-queued behind the
+/// fallback tier and filled there (`BothSides`): her `E` falls to `min($500, 0) = 0` and no
+/// further, her wallet to exactly 0, and the $100 her account cannot carry is her bad debt,
+/// absorbed by the fund (`InsuranceFundChanged(−100_000_000)`). ALICE buys back at $40: +$600,
+/// wallet $700.
+///
+/// Every other test's long winner is ISOLATED (`a_long_winner_that_cannot_sell_…`); this is the
+/// CROSSED one. A CROSSED winner's fill reports no bad debt of its own (`apply_position_fill` under
+/// `Cross`), so without the per-fill test it would be filled clean and its wallet left at −$100 —
+/// which only a flat account's Q8 would have cleared.
+#[test]
+fn in_the_window_a_cross_long_winner_that_cannot_sell_at_max_price_ends_at_zero_the_fund_the_rest()
+{
+    let mut ctx = make_ctx();
+    set_type(&mut ctx, CAROL, M1, CROSSED);
+    set_type(&mut ctx, CAROL, M2, CROSSED);
+    set_leverage(&mut ctx, CAROL, M1, 3);
+    set_leverage(&mut ctx, CAROL, M2, 3);
+    trade(&mut ctx, M1, ALICE, CAROL, SELL, px(100), 10);
+    trade(&mut ctx, M2, CAROL, KEEPER, BUY, px(100), 1);
+    set_wallet(&mut ctx, ALICE, usd(100));
+    set_wallet(&mut ctx, CAROL, usd(500));
+    assert_eq!(fold(&mut ctx, CAROL).e, usd(500) as i128);
+    let fund = insurance_fund_seeded(&mut ctx, usd(1_000));
+    set_max_price(&mut ctx, M1, px(40));
+    let ledger = Ledger::open(&mut ctx);
+
+    let logs = ok(&mut ctx, KEEPER, &liquidate(ALICE, M1));
+    ledger.check(&mut ctx, "after liquidate()");
+    assert_eq!(adls(&logs), [(ALICE, CAROL, M1, 10, px(40))]);
+    assert_eq!(wallet(&mut ctx, ALICE), usd(700));
+    assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+    assert_eq!(wallet(&mut ctx, CAROL), 0, "held to E_after = min(E, 0)");
+    assert_eq!(fold(&mut ctx, CAROL).e, 0);
+    assert_eq!(pos(&mut ctx, CAROL, M2).amount, 1, "she keeps M2: no Q8 for her");
+    let changed = evs::<InsuranceFundChanged>(&logs);
+    assert_eq!(changed.iter().map(|c| c.delta).collect::<Vec<_>>(), [usd(-100)]);
+    assert!(rows(&logs, CAROL).iter().all(|r| r.reason != INSURANCE_CLEAR));
+    assert_eq!(insurance_fund(&mut ctx), fund - usd(100) as u64);
+}
+
+/// **(c) A CROSSED SHORT winner gains at `maxPrice`, and is still served last when its `E` is
+/// under the slippage: order only.** ALICE long 10 on M1: 5 against CAROL (CROSSED 3x here, short
+/// 5) and 5 against KEEPER (ISOLATED 1x, short 5, a $500 silo). Wallets: ALICE $100, CAROL $20.
+/// At the mark both winners rank 0 (no uPnL), so CAROL, the lower address, comes first — and does
+/// at a `maxPrice` of $100 (no window). At $90 her per-fill test `E − take · |fill − mark| =
+/// $20 − 5 × $10 < 0` counts the distance either way, though buying back at $90 only GAINS her $50:
+/// she is re-queued behind the fallback tier and KEEPER is filled first. Her fill then takes `E` up,
+/// so the fallback floor `min(E, 0)` covers nothing: the fund is untouched either way, and she ends
+/// at $70.
+#[test]
+fn in_the_window_a_cross_short_winner_under_the_slippage_is_served_last_order_only() {
+    for (max_price, winners, carol_w) in
+        [(px(100), [CAROL, KEEPER], usd(20)), (px(90), [KEEPER, CAROL], usd(70))]
+    {
+        let mut ctx = make_ctx();
+        set_type(&mut ctx, CAROL, M1, CROSSED);
+        set_leverage(&mut ctx, CAROL, M1, 3);
+        set_leverage(&mut ctx, KEEPER, M1, 1);
+        trade(&mut ctx, M1, ALICE, CAROL, BUY, px(100), 5);
+        trade(&mut ctx, M1, ALICE, KEEPER, BUY, px(100), 5);
+        set_wallet(&mut ctx, ALICE, usd(100));
+        set_wallet(&mut ctx, CAROL, usd(20));
+        let fund = insurance_fund_seeded(&mut ctx, usd(1_000));
+        set_max_price(&mut ctx, M1, max_price);
+        let ledger = Ledger::open(&mut ctx);
+        let keeper_w0 = wallet(&mut ctx, KEEPER);
+
+        let logs = ok(&mut ctx, KEEPER, &liquidate(ALICE, M1));
+        ledger.check(&mut ctx, "after liquidate()");
+        assert_eq!(
+            adls(&logs),
+            [(ALICE, winners[0], M1, 5, max_price), (ALICE, winners[1], M1, 5, max_price)],
+            "maxPrice {max_price}"
+        );
+        assert_eq!(wallet(&mut ctx, CAROL), carol_w, "maxPrice {max_price}");
+        let gain = usd(5 * (100 - max_price as i64 / 100));
+        assert_eq!(wallet(&mut ctx, KEEPER) - keeper_w0, usd(500) + gain);
+        assert_eq!(wallet(&mut ctx, ALICE), usd(100) - 2 * gain);
+        assert!(evs::<InsuranceFundChanged>(&logs).is_empty(), "maxPrice {max_price}");
+        assert_eq!(insurance_fund(&mut ctx), fund);
+    }
 }
