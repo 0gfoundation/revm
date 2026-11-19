@@ -335,7 +335,10 @@ fn the_legs_follow_every_route_that_moves_a_cross_position() {
 /// LOST an order (a CROSSED maker refused for want of cash at hand, `MakerInsolvent`) flushes it
 /// through `save_position_reservation_only_after_funding` — nothing published, `amount`, `margin`
 /// and the account unchanged — after `get_or_load` re-anchored its funding index with a payment
-/// that truncates to zero. The leg carries the new index.
+/// that rounds to zero. The leg carries the new index.
+///
+/// Only a RECEIVER's payment can round to zero (funding rounds toward −∞: a payer owing any
+/// fraction pays a whole unit), so the index moves AGAINST the shorts: ALICE's long is owed 0.5.
 #[test]
 fn a_silent_match_flush_carries_a_zero_payment_funding_re_anchor_into_the_leg() {
     let mut ctx = make_ctx();
@@ -343,8 +346,9 @@ fn a_silent_match_flush_carries_a_zero_payment_funding_re_anchor_into_the_leg() 
     ok(&mut ctx, ALICE, &order(M1, BUY, px(100), 10, IOC));
     ok(&mut ctx, ALICE, &order(M1, BUY, px(99), 1, GTC));
     set_wallet(&mut ctx, ALICE, 0);
-    // `10 · 5 / 10^2` truncates to a zero payment.
-    let fs = FundingState { last_funding_rate: 0, next_funding_ts: 0, cumulative_funding_index: 5 };
+    // `−10 · (−5) / 10^2 = +0.5` owed to the long floors to a zero payment. (At `+5` the long
+    // would OWE 0.5 and pay 1 — the payer's side rounds away from zero, review Q5.)
+    let fs = FundingState { last_funding_rate: 0, next_funding_ts: 0, cumulative_funding_index: -5 };
     storage::save_funding_state(&mut ctx, M1, &fs).unwrap();
     assert_eq!(stored_legs(&mut ctx, ALICE)[0].last_funding_index, 0);
 
@@ -357,9 +361,9 @@ fn a_silent_match_flush_carries_a_zero_payment_funding_re_anchor_into_the_leg() 
         "nothing published for ALICE: the silent route"
     );
     let p = pos(&mut ctx, ALICE, M1);
-    assert_eq!((p.amount, p.last_funding_index), (10, 5), "re-anchored, nothing paid");
+    assert_eq!((p.amount, p.last_funding_index), (10, -5), "re-anchored, nothing paid");
     assert_eq!(storage::load_account(&mut ctx, ALICE).unwrap().perp_wallet_balance, 0);
-    assert_eq!(stored_legs(&mut ctx, ALICE)[0].last_funding_index, 5, "the leg carries the index");
+    assert_eq!(stored_legs(&mut ctx, ALICE)[0].last_funding_index, -5, "the leg carries the index");
     assert_legs(&mut ctx, &USERS, "silent flush");
 }
 

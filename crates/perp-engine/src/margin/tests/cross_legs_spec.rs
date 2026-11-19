@@ -18,7 +18,8 @@
 //! N_k        trunc(amount_k · mark_k · 10^6 / 10^(bd+pd))
 //! uPnL_k     N_k + vQuote_k                     (0 when mark_k = 0, J4)
 //! MM_k       the slice form over the tier table set through setMarginTiers, at |N_k|
-//! PF_k       −trunc(amount_k · (I_k − anchor_k) / 10^(bd+pd)), I_k the FundingState index
+//! PF_k       floor(−amount_k · (I_k − anchor_k) / 10^(bd+pd)), I_k the FundingState index
+//!            (toward −∞: a payer pays the ceiling, a receiver gets the floor — review Q5)
 //! W          the stored perp wallet
 //! E          W + Σ_legs (PF_k + uPnL_k)
 //! ΣMM        Σ_legs MM_k
@@ -538,7 +539,7 @@ impl World {
             let n = value(mark, l.amount as i128, s.bd, s.pd);
             let upnl = if mark == 0 { 0 } else { n + l.v_quote_balance as i128 };
             let mm = slice_mm(&s.tiers, n);
-            let pf = -(l.amount as i128 * (index - l.last_funding_index) / scale);
+            let pf = (-(l.amount as i128 * (index - l.last_funding_index))).div_euclid(scale);
             hl.e += upnl + pf;
             hl.cmm += mm;
             hl.has_cross = true;
@@ -830,8 +831,10 @@ fn route_fills_open_increase_reduce_flip_close() {
 
 /// **Funding**: a pending payment is priced by the health check while the anchor stays; a
 /// settlement on a touch moves the anchor; and a cancel-only participant of a match — its own
-/// resting order expired by self-trade prevention, no fill — whose payment truncates to ZERO is
-/// re-anchored on the silent route, which must carry the new anchor into its leg.
+/// resting order expired by self-trade prevention, no fill — whose payment rounds to ZERO is
+/// re-anchored on the silent route, which must carry the new anchor into its leg. Only a RECEIVER's
+/// payment can round to zero (funding rounds toward −∞, review Q5), so the rate is NEGATIVE here:
+/// ALICE's long is owed a fraction of a unit, BOB's short pays.
 #[test]
 fn route_funding_pending_settled_and_zero_payment_reanchor() {
     // A 3 / 2-decimal market (0.001 base, $0.01 price) at $100.00 with funding every interval.
@@ -839,15 +842,16 @@ fn route_funding_pending_settled_and_zero_payment_reanchor() {
     let mut fs = Spec::whole(F, 10_000, &T10);
     fs.bd = 3;
     fs.pd = 2;
-    // 1 ppm a period: an index step of `mark · 1`, so 0.001 base pays `trunc(step / 10^5)` = 0.
-    fs.funding = Some(1);
+    // −1 ppm a period: an index step of `−mark`, so 0.001 base long is owed `step / 10^5` < 1,
+    // which floors to 0. (At +1 ppm it would OWE that fraction and pay a whole unit.)
+    fs.funding = Some(-1);
     let mut w = World::new(vec![fs, Spec::whole(M1, 1_000, &T10)]);
     for u in [ALICE, BOB] {
         w.enroll(u, d(1_000_000));
         w.set_lev(u, F, 10);
         w.set_lev(u, M1, 10);
     }
-    // ALICE long 0.001 (a payment of `index step / 10^5` truncates to zero), BOB short 5.000.
+    // ALICE long 0.001 (a credit of `|index step| / 10^5` floors to zero), BOB short 5.000.
     w.fill(ALICE, F, 1, 10_000);
     w.fill(BOB, F, -5_000, 10_000);
     w.fill(BOB, M1, 1, 1_000);
@@ -1379,8 +1383,8 @@ impl Rng {
 }
 
 /// The fuzz's market table: whole-dollar markets of every tier shape, bands on and off, clearance
-/// fees, funding of either sign — and every fifth market a 3 / 2-decimal one, so that `N`, `PF`
-/// and the slice form truncate.
+/// fees, funding of either sign — and every fifth market a 3 / 2-decimal one, so that `N` and the
+/// slice form truncate and `PF` rounds (toward −∞).
 fn fuzz_specs(n: u64) -> Vec<Spec> {
     let tiers: [&[Band]; 4] = [&T3, &T10, &TB, &[Band { lb: 0, lev: 5, ppm: 0 }]];
     let marks = [1_000, 500, 200, 100];

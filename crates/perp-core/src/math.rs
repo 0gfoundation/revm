@@ -4,7 +4,7 @@
 //! Quote amounts use 6-decimal fixed-point (`QUOTE_DECIMALS = 6`).
 
 use crate::{
-    error::{perp_err, PerpError},
+    error::{perp_err, perp_invariant_err, PerpError},
     types::{MarginTier, MarginTiers, Market, OrderEntry, MMR_PPM_ONE},
 };
 
@@ -1403,13 +1403,30 @@ pub fn calc_estimated_settle_price(mark_price: u64, funding_rate: i64) -> u64 {
 /// credit (the position receives funding), negative = charge (it pays).
 ///
 /// ```text
-/// payment = -(amount * index_delta * 10^QUOTE_DECIMALS)
-///           / (10^price_decimals * 10^base_decimals * FUNDING_RATE_ONE)
+/// payment = floor( -(amount * index_delta * 10^QUOTE_DECIMALS)
+///                  / (10^price_decimals * 10^base_decimals * FUNDING_RATE_ONE) )
 /// ```
 ///
 /// A long (`amount > 0`) pays when the rate is positive (longs pay shorts); the
 /// scaling matches `calc_value` so the payment is in 6-decimal quote units like
 /// every other balance in the engine.
+///
+/// # Rounding: toward −∞, so funding can only BURN dust, never mint it
+///
+/// The exact amount is rarely a whole quote unit, and each position settles on its own touch,
+/// so the two sides of an epoch are rounded separately. The signed payment is the FLOOR of the
+/// exact value: a PAYER pays the ceiling of what it owes (rounds away from 0), a RECEIVER
+/// receives the floor of what it is owed (rounds toward 0). An exact payment is unchanged and
+/// zero stays zero. Each settlement is therefore off by less than one unit (`exact − 1 <
+/// payment ≤ exact`), always against the position, and `payment(a) + payment(−a)` is `0` or
+/// `−1`. Σ paid ≥ Σ received: the difference is dust left unattributed in USDC custody (custody
+/// ≥ claims) — it is not routed to the insurance fund, since no single settlement can tell how
+/// much of it is its own. (Truncating BOTH sides toward 0, the rule this replaced, let a payer
+/// owing 0.6 pay 0 while a receiver owed 1.2 got 1: payers outnumbering receivers minted.)
+///
+/// Every reader of a position's pending or settled funding — the settlement itself, the views,
+/// liquidation equity, ADL — goes through this one function (via
+/// `perp_engine::risk::funding::pending_funding_of`), so they agree to the unit.
 #[inline]
 pub fn calc_funding_payment(
     amount: i64,
@@ -1425,7 +1442,15 @@ pub fn calc_funding_payment(
         .checked_mul(pow10_i128(base_decimals)?)
         .and_then(|v| v.checked_mul(FUNDING_RATE_ONE as i128))
         .ok_or_else(|| perp_err("math: funding payment denominator overflow"))?;
-    let payment = -(numerator / denominator);
+    // `floor(−numerator / denominator)`. The denominator is a product of powers of ten and
+    // `FUNDING_RATE_ONE`, so it is positive and `div_euclid` IS the floor; the `None` arm is
+    // unreachable. The negation cannot overflow either (`i128::MIN` is not a multiple of
+    // `10^QUOTE_DECIMALS`), but stays checked under the numerator's own error.
+    let payment = numerator
+        .checked_neg()
+        .ok_or_else(|| perp_err("math: funding payment numerator overflow"))?
+        .checked_div_euclid(denominator)
+        .ok_or_else(|| perp_invariant_err("math: funding payment denominator is not positive"))?;
     i64::try_from(payment).map_err(|_| perp_err("math: funding payment exceeds i64"))
 }
 
