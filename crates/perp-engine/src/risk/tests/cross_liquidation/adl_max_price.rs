@@ -23,6 +23,11 @@
 //!
 //! Both halves of the mark branch are held there: `E ≥ 0`, and a leg unpriced (`E` whatever it is).
 //!
+//! A long ADL CUT SHORT (the call's ADL budget spent) leaves the cap's gap in the wallet, and the
+//! next pass of the same leg prices it in at the rest's bankruptcy price clamped into the band —
+//! `maxPrice` again while the window lasts, up to the band's edge after a raise (the cross twin of
+//! D2-continuation-1; pinned as it stands).
+//!
 //! ALICE is the CROSSED account (3x), every other holder ISOLATED unless a test says otherwise. Fees
 //! are 0 and the band is off, so every number is exact, and every step is checked against the
 //! custody identity.
@@ -473,5 +478,162 @@ fn in_the_window_a_cross_short_winner_under_the_slippage_is_served_last_order_on
         assert_eq!(wallet(&mut ctx, ALICE), usd(100) - 2 * gain);
         assert!(evs::<InsuranceFundChanged>(&logs).is_empty(), "maxPrice {max_price}");
         assert_eq!(insurance_fund(&mut ctx), fund);
+    }
+}
+
+/// A maker of the cut-short test below: `0x88…i`.
+fn adl_maker(i: usize) -> Address {
+    let mut b = [0u8; 20];
+    b[0] = 0x88;
+    b[12..].copy_from_slice(&(i as u64).to_be_bytes());
+    Address::from(b)
+}
+
+/// The custody identity's value over its users AND `extra` (the [`Ledger`] holds only its users).
+fn system_value_with(ctx: &mut TestCtx, extra: &[Address]) -> i128 {
+    let mut v = Ledger::system_value(ctx);
+    for &u in extra {
+        v += user_value(ctx, u);
+    }
+    v
+}
+
+/// `spot + W + Σ (margin + vQuote + PF)` of one account — its share of the identity, which leaves
+/// the positions' notional out (it nets to zero over a market).
+fn user_value(ctx: &mut TestCtx, u: Address) -> i128 {
+    let a = storage::load_account(ctx, u).unwrap();
+    let spot: U256 = a.usdc_balance.clone().into();
+    let mut v = spot.to::<u128>() as i128 + a.perp_wallet_balance as i128;
+    for m in MARKETS {
+        let p = pos(ctx, u, m);
+        let mk = storage::load_market(ctx, m).unwrap().unwrap();
+        let index = storage::load_funding_state(ctx, m).unwrap().cumulative_funding_index;
+        let pf = crate::risk::funding::pending_funding_payment(index, &p, &mk).unwrap();
+        v += p.margin as i128 + p.v_quote_balance as i128 + pf as i128;
+    }
+    v
+}
+
+/// [`user_value`] plus every position's notional at its stored mark: what the account is worth.
+fn user_worth(ctx: &mut TestCtx, u: Address) -> i128 {
+    let mut v = user_value(ctx, u);
+    for m in MARKETS {
+        let p = pos(ctx, u, m);
+        let mark = storage::load_mark_price(ctx, m).unwrap();
+        v += crate::math::calc_value_i64(mark, p.amount, 0, 2).unwrap() as i128;
+    }
+    v
+}
+
+/// `updateMarket(m)` by ADMIN with `maxPrice` and `priceBandBps` both set.
+fn set_max_price_and_band(ctx: &mut TestCtx, m: u64, max_price: u64, band_bps: u32) {
+    let mk = market(m);
+    ok(
+        ctx,
+        ADMIN,
+        &updateMarketCall {
+            marketId: m,
+            tickSize: mk.tick_size,
+            stepSize: mk.step_size,
+            minQuantity: mk.min_quantity,
+            maxQuantity: mk.max_quantity,
+            maxPrice: max_price,
+            priceUpdateInterval: mk.price_update_interval,
+            active: true,
+            fundingInterval: mk.funding_interval,
+            interestRate: mk.interest_rate,
+            liquidationFeeRateBps: mk.liquidation_fee_rate_bps,
+            priceBandBps: band_bps,
+        }
+        .abi_encode(),
+    );
+}
+
+/// **A capped cross long whose ADL is CUT SHORT carries the cap's gap into the next pass of the
+/// SAME leg** — the cross twin of D2-continuation-1 (`risk/tests/adl_max_price.rs`), pinned as it
+/// stands: the gap takes the route every cross deficit takes (`run_adl`), and that route includes a
+/// later pass of this very leg, priced at its MM-share bankruptcy price clamped into the band — the
+/// band in force THEN, its upper edge the `maxPrice` in force then.
+///
+/// ALICE CROSSED 3x long 130 @ $100 against 130 ISOLATED 1x one-lot shorts (a $100 silo each),
+/// wallet $1,000: `E = $1,000` against `Σ MM = $2,166.67`. `maxPrice` lowered to $90 (mark $100).
+/// Pass 1, `liquidate()`: the ADL at the mark, held at $90, spends the call's 128-fill budget — the
+/// first 128 winners (by address) +$10 each, ALICE −$1,280: wallet −$280 with 2 lots left (`E =
+/// −$280`), M1's deferred-work bit set. Pass 2, `drainDeferredWork`, at her MM-share bankruptcy
+/// price — the whole deficit is M1's: `$100 + $280 / 2 = $240` — clamped into the band:
+///
+/// * still in the window: the band's upper edge is $90 — 2 @ $90, wallet −$300, flat: the fund pays
+///   $300 (Q8). In all, the fund pays `(mark − maxPrice) × 130 − her $1,000`;
+/// * `maxPrice` raised back ($1,000,000) before the drain, the band 100%: upper edge $200 — 2 @ $200,
+///   the 2 remaining winners −$100 each (their whole silo; clean: equity 0 at the fill), ALICE +$200,
+///   the fund pays $80;
+/// * the same with a 5% band: upper edge $105 — 2 @ $105, each remaining winner −$5, the fund $270.
+///
+/// So after a raise the last winners pay ABOVE the mark for the first winners' windfall (bounded by
+/// the band's edge and the `maxPrice` in force). Unheld, every fill went at the $100 mark: ALICE
+/// kept her $1,000 and every winner was neutral. Custody holds exactly in every case.
+#[test]
+fn a_capped_cross_long_adl_cut_short_prices_its_gap_into_the_next_pass_of_the_same_leg() {
+    for (raise_to, band_bps, pass2_price, fund_pays, remaining_each) in [
+        (None, 10_000u32, px(90), usd(300), usd(10)),
+        (Some(market(M1).max_price), 10_000, px(200), usd(80), usd(-100)),
+        (Some(market(M1).max_price), 500, px(105), usd(270), usd(-5)),
+    ] {
+        let mut ctx = make_ctx();
+        let makers: Vec<Address> = (0..130).map(adl_maker).collect();
+        for &m in &makers {
+            JournalTr::load_account(ctx.journal_mut(), m).unwrap();
+            let a = UserAccount { perp_wallet_balance: WALLET, ..UserAccount::default() };
+            storage::save_account(&mut ctx, m, a, AccountUpdateReason::Adjustment).unwrap();
+            set_type(&mut ctx, m, M1, ISOLATED);
+            set_leverage(&mut ctx, m, M1, 1);
+            trade(&mut ctx, M1, ALICE, m, BUY, px(100), 1);
+        }
+        storage::flush_account_snapshots(&mut ctx).unwrap();
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+        set_wallet(&mut ctx, ALICE, usd(1_000));
+        let f = fold(&mut ctx, ALICE);
+        assert_eq!((f.e, f.cross_mm), (1_000_000_000, 2_166_666_666));
+        let fund = insurance_fund_seeded(&mut ctx, usd(10_000));
+        set_max_price(&mut ctx, M1, px(90));
+        let v0 = system_value_with(&mut ctx, &makers);
+        let worth0: Vec<i128> = makers.iter().map(|&m| user_worth(&mut ctx, m)).collect();
+
+        // Pass 1: the 128-fill budget at $90.
+        let logs = ok(&mut ctx, KEEPER, &liquidate(ALICE, M1));
+        assert_eq!(system_value_with(&mut ctx, &makers), v0, "custody after pass 1");
+        let a = adls(&logs);
+        assert_eq!(a.len(), 128);
+        assert!(a.iter().all(|x| (x.0, x.2, x.3, x.4) == (ALICE, M1, 1, px(90))));
+        assert_eq!(a.iter().map(|x| x.1).collect::<Vec<_>>(), makers[..128]);
+        assert_eq!(wallet(&mut ctx, ALICE), usd(-280));
+        assert_eq!(pos(&mut ctx, ALICE, M1).amount, 2);
+        assert_eq!(deferred_of(&mut ctx, M1), 1);
+        assert!(flagged(&mut ctx, ALICE));
+        assert_eq!(fold(&mut ctx, ALICE).e, usd(-280) as i128);
+        assert_eq!(insurance_fund(&mut ctx), fund, "the gap waits in her wallet");
+
+        // Between the passes: the window stays, or `maxPrice` (and the band) are raised.
+        if let Some(max_price) = raise_to {
+            set_max_price_and_band(&mut ctx, M1, max_price, band_bps);
+        }
+        assert_eq!(storage::load_mark_price(&mut ctx, M1).unwrap(), px(100));
+
+        // Pass 2: the drain, at her MM-share bankruptcy price clamped into the band.
+        let (more, logs) = drain_market(&mut ctx, M1);
+        assert!(!more);
+        assert_eq!(system_value_with(&mut ctx, &makers), v0, "custody after pass 2");
+        assert_eq!(
+            adls(&logs),
+            [(ALICE, makers[128], M1, 1, pass2_price), (ALICE, makers[129], M1, 1, pass2_price)]
+        );
+        assert_eq!(pos(&mut ctx, ALICE, M1).amount, 0);
+        assert_cleared(&mut ctx, &logs, ALICE, fund_pays, fund);
+        assert!(!flagged(&mut ctx, ALICE));
+        for (i, &m) in makers.iter().enumerate() {
+            let change = user_worth(&mut ctx, m) - worth0[i];
+            let want = if i < 128 { usd(10) } else { remaining_each };
+            assert_eq!(change, want as i128, "winner {i}, raise {raise_to:?} band {band_bps}");
+        }
     }
 }
