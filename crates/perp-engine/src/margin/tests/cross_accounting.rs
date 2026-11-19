@@ -477,7 +477,8 @@ fn model_mm(tiers: &[(u64, u32, u32)], n: i128) -> i128 {
 
 /// The expected [`CrossFold`] for `legs` and wallet `w`, from the formulas alone (cross report
 /// §3.2): `N = trunc(amount · mark · 1e4)` on this grid, `uPnL = N + vQuote` (0 at mark 0),
-/// `PIM = ⌈|N|/L⌉`, `ooIM = ⌈max(|N+Bid|, |N−Ask|)/L⌉ − PIM`, `PF = −trunc(amount · index / 1e2)`.
+/// `PIM = ⌈|N|/L⌉`, `ooIM = ⌈max(|N+Bid|, |N−Ask|)/L⌉ − PIM`, `PF = ⌊−amount · index / 1e2⌋`
+/// (toward −∞, review Q5: a payer pays the ceiling of what it owes).
 fn model(legs: &[Leg], markets: &[(u64, ModelMarket)], w: i64) -> crate::margin::view::CrossFold {
     let mm_of = |id: u64| &markets.iter().find(|(m, _)| *m == id).unwrap().1;
     let (mut pf, mut upnl, mut pim, mut mm, mut oo, mut iso_oo) = (0i128, 0, 0, 0, 0, 0);
@@ -497,8 +498,8 @@ fn model(legs: &[Leg], markets: &[(u64, ModelMarket)], w: i64) -> crate::margin:
             upnl += if mk.mark == 0 { 0 } else { n + vq };
             pim += leg_pim;
             mm += model_mm(&mk.tiers, n.abs());
-            // calc_funding_payment on this grid: −(amount · Δ · 1e6) / (1e2 · 1e0 · 1e6).
-            pf += -(leg.amount as i128 * mk.index / 100);
+            // calc_funding_payment on this grid: ⌊−(amount · Δ · 1e6) / (1e2 · 1e0 · 1e6)⌋.
+            pf += (-(leg.amount as i128 * mk.index)).div_euclid(100);
             has_cross |= leg.amount != 0;
         } else {
             iso_oo += leg_oo;
@@ -531,6 +532,10 @@ fn fold(ctx: &mut TestCtx, user: Address) -> crate::margin::view::CrossFold {
     total
 }
 
+/// The mixed account's cumulative funding indices on M1 and M2 (anchors 0): off the unit grid.
+const M1_INDEX: i128 = 10_000 * 7_500 + 7;
+const M2_INDEX: i128 = -25_000 * 5_000 - 3;
+
 /// The multi-market fixture: two CROSSED legs (a long in profit with resting orders on both
 /// sides and pending funding; a short at a loss whose notional crosses into the third bracket of
 /// an explicit-rate table, also with funding pending) and an ISOLATED long at a loss holding a
@@ -541,9 +546,12 @@ fn mixed_account(ctx: &mut TestCtx) -> (Vec<Leg>, Vec<(u64, ModelMarket)>) {
     set_market(ctx, M1, 10_000, &[(0, 3, 0)]);
     set_market(ctx, M2, 25_000, &t2);
     set_market(ctx, M3, 4_000, &[(0, 3, 0)]);
-    // Index deltas: M1 0.75% of $100 (a long PAYS), M2 −0.5% of $250 (a short PAYS), M3 1%.
-    set_funding_index(ctx, M1, 10_000 * 7_500);
-    set_funding_index(ctx, M2, -25_000 * 5_000);
+    // Index deltas: M1 0.75% of $100 (a long PAYS), M2 −0.5% of $250 (a short PAYS), M3 1% —
+    // M1 and M2 each a few raw units off the round figure, so both cross payers owe a fraction of
+    // a unit on top (10 · 7 / 100 = 0.7 and 7 · 3 / 100 = 0.21) and the model's ⌊·⌋ is held to
+    // the engine's rounding: a truncating model (or engine) is off by one on each.
+    set_funding_index(ctx, M1, M1_INDEX);
+    set_funding_index(ctx, M2, M2_INDEX);
     set_funding_index(ctx, M3, 4_000 * 10_000);
 
     let mut long = Leg::new(M1, 10, 9_000, 5, true, 0); // +$100 at $100
@@ -559,8 +567,8 @@ fn mixed_account(ctx: &mut TestCtx) -> (Vec<Leg>, Vec<(u64, ModelMarket)>) {
         plant_leg(ctx, ALICE, leg);
     }
     let markets = vec![
-        (M1, ModelMarket { mark: 10_000, tiers: vec![(0, 3, 0)], index: 10_000 * 7_500 }),
-        (M2, ModelMarket { mark: 25_000, tiers: t2, index: -25_000 * 5_000 }),
+        (M1, ModelMarket { mark: 10_000, tiers: vec![(0, 3, 0)], index: M1_INDEX }),
+        (M2, ModelMarket { mark: 25_000, tiers: t2, index: M2_INDEX }),
         (M3, ModelMarket { mark: 4_000, tiers: vec![(0, 3, 0)], index: 4_000 * 10_000 }),
     ];
     (legs, markets)

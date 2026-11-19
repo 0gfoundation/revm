@@ -15,7 +15,7 @@
 //! ```text
 //! N_k        trunc(amount_k · mark_k)                      (quote units, 6 dp)
 //! uPnL_k     N_k + vQuote_k
-//! PF_k       −trunc(amount_k · (I_k − anchor_k) / 10^(bd+pd))  (the FundingState index)
+//! PF_k       ⌊−amount_k · (I_k − anchor_k) / 10^(bd+pd)⌋    (the FundingState index; toward −∞)
 //! MM_k       the slice form over the tier table set through the ABI (Binance N·MMR − cum)
 //! E          W + Σ_C (PF_k + uPnL_k)                       cross margin balance
 //! ΣMM        Σ_C MM_k
@@ -34,8 +34,12 @@
 //! * a REFUSED call: zero perp writes, no log, a bit-identical world;
 //! * an ACCEPTED call: the custody identity `Σ (spot + W + Σ (margin + vQuote + PF)) + IF` moves
 //!   by exactly what the insurance fund could not cover (`InsuranceFundDepleted.badDebt`, the one
-//!   socialised amount) — so a liquidation, a fee, an ADL fill, a funding epoch and a clearance all
-//!   conserve value to the unit; `Σ amount == 0` per market; `open_position_count` counts the open
+//!   socialised amount) — so a liquidation, a fee, an ADL fill and a clearance all conserve value
+//!   to the unit, and so does a funding epoch on this suite's grids, where every payment is a
+//!   whole unit (`bd = pd = 0` in the fuzz; a market with decimals has funding off). On any other
+//!   grid an epoch BURNS dust — each position's payment is rounded toward −∞ on its own (review
+//!   Q5), less than one unit per position — and the identity would drop by it; `Σ amount == 0`
+//!   per market; `open_position_count` counts the open
 //!   positions; a position CROSSED in force holds no margin; a FLAT account's wallet is never below
 //!   zero (Q8: cleared at the end of the call that closed its last position); a FLAGGED account
 //!   holds a cross position (the flag never outlives the last one).
@@ -543,10 +547,12 @@ impl World {
         let index = storage::load_funding_state(&mut self.ctx, m).unwrap().cumulative_funding_index;
         let cross = p.margin_type == CROSSED;
         let n = value(mark, p.amount as i128, s.bd, s.pd);
+        // `calc_funding_payment`: the exact payment rounded toward −∞ (review Q5), so a payer
+        // pays the ceiling of what it owes and a receiver gets the floor of what it is owed.
         let pf = if p.amount == 0 {
             0
         } else {
-            -(p.amount as i128 * (index - p.last_funding_index) / 10i128.pow(s.bd + s.pd))
+            (-(p.amount as i128 * (index - p.last_funding_index))).div_euclid(10i128.pow(s.bd + s.pd))
         };
         Leg {
             market: m,
