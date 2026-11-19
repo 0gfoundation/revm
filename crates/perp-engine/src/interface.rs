@@ -731,11 +731,18 @@ sol! {
         /// trade there, and a bid above it is expired at the next oracle tick (or at a
         /// `drainDeferredWork`, when the market already has deferred work: `OrderCancelled` reason
         /// 4) — and the stored mark stays where it was until the next `updateIndexPrice` clamps
-        /// it. A cross liquidation's ADL fill is held at or below `maxPrice` too; an ISOLATED one
-        /// fills at the liquidated position's bankruptcy price, which can sit above a lowered
-        /// `maxPrice`. A lowering bounds what a position may grow to, not the entry value it
-        /// already carries: an opening fill that would take that past `int64` is refused (a
-        /// resting order cancelled, `OrderCancelled` reason 2).
+        /// it. An ISOLATED liquidation's ADL fill is held at or below `maxPrice` too (owner
+        /// decision 2026-11-19): it executes at `min(its price, maxPrice)` — the mark while the
+        /// position still has equity there, its bankruptcy price otherwise — so a long whose
+        /// bankruptcy price a lowering left above `maxPrice` is ADL'd AT `maxPrice`, its winner pays
+        /// no more, and the gap is the liquidated position's bad debt (`InsuranceFundChanged`, and
+        /// `InsuranceFundDepleted` for what the fund cannot cover). A cross liquidation's ADL at
+        /// the account's bankruptcy price is clamped into the price band, whose upper edge is
+        /// `maxPrice`; one at the MARK (the account still solvent) executes at the stored mark,
+        /// which until the next `updateIndexPrice` can sit above a lowered `maxPrice`. A lowering
+        /// bounds what a position may grow to, not the entry value it already carries: an opening
+        /// fill that would take that past `int64` is refused (a resting order cancelled,
+        /// `OrderCancelled` reason 2).
         function updateMarket(uint64 marketId, uint64 tickSize, uint64 stepSize, uint64 minQuantity, uint64 maxQuantity, uint64 maxPrice, uint64 priceUpdateInterval, bool active, uint64 fundingInterval, int64 interestRate, uint32 liquidationFeeRateBps, uint32 priceBandBps) external;
         /// Read the current mark price for a market.
         function getMarkPrice(uint64 marketId) external view returns (uint64 price);
@@ -1984,16 +1991,18 @@ sol! {
         /// Liquidate an under-margined position (anyone can call).
         ///
         /// An ISOLATED position below maintenance is closed through the book (a market order
-        /// bounded by the price band), the rest the book cannot take ADL'd, in ONE PASS that may
-        /// leave part of it open. Its close touches at most 128 distinct makers: a rest left by
-        /// that cap after the close filled something is NEVER ADL'd — the book still holds
-        /// liquidity for it — and is closed against the book by `drainDeferredWork` (the call sets
-        /// the market's deferred-work flag), the next tick or a repeated `liquidate`, each
-        /// re-judging maintenance first; a capped close that filled nothing (every maker it reached
-        /// refused at its fill) is ADL'd at once. Orders refused at every fill can be rested at will
-        /// (see `drainDeferredWork`), so such makers can still make a pass fill nothing (ADL'd at
-        /// once) or hold the close to one lot per pass. A rest left because ADL ran out of budget
-        /// sets the flag too. Each pass emits its own `Liquidation`.
+        /// bounded by the price band), the rest the book cannot take ADL'd (at the mark while it
+        /// has equity there, at its bankruptcy price otherwise, either held at `maxPrice` — see
+        /// `Adl`), in ONE PASS that may leave part of it open. Its close touches at most 128
+        /// distinct makers: a rest left by that cap after the close filled something is NEVER
+        /// ADL'd — the book still holds liquidity for it — and is closed against the book by
+        /// `drainDeferredWork` (the call sets the market's deferred-work flag), the next tick or a
+        /// repeated `liquidate`, each re-judging maintenance first; a capped close that filled
+        /// nothing (every maker it reached refused at its fill) is ADL'd at once. Orders refused
+        /// at every fill can be rested at will (see `drainDeferredWork`), so such makers can still
+        /// make a pass fill nothing (ADL'd at once) or hold the close to one lot per pass. A rest
+        /// left because ADL ran out of budget sets the flag too. Each pass emits its own
+        /// `Liquidation`.
         ///
         /// An ISOLATED position is refused, with no write, when it is at or above its own
         /// maintenance (`liquidate: position is above maintenance margin`) and when it cannot be
@@ -2923,8 +2932,11 @@ sol! {
         // MARK for a solvent residual — an isolated position with equity left, a cross account
         // with `crossMarginBalance ≥ 0`, or a cross account any of whose cross legs is unpriced
         // (stale or mark 0) — else the bankruptcy price: the isolated position's own, or (cross
-        // P3) the account's MM-share bankruptcy price clamped into the market's band. `qty` =
-        // deleveraged size.
+        // P3) the account's MM-share bankruptcy price clamped into the market's band. An ISOLATED
+        // residual's price is held at the market's `maxPrice` (owner decision 2026-11-19): a long
+        // whose own price is above it fills at `maxPrice`, and what that leaves it short is bad
+        // debt for the insurance fund (`InsuranceFundChanged` / `InsuranceFundDepleted`), not the
+        // winner's to pay. `qty` = deleveraged size.
         event Adl(address indexed liquidatedUser, address indexed adlUser, uint64 indexed marketId, uint64 qty, uint64 price);
 
         // Feeds: market metadata bootstrap for indexer
@@ -3068,7 +3080,8 @@ sol! {
 
         // Feeds: insurance fund balance history
         // delta > 0 = deposit or liquidation surplus credited; delta < 0 = deficit absorbed (bad
-        // debt — an ADL fallback-tier winner's included, a CROSSED one's since the P3 review — or,
+        // debt — an ADL fallback-tier winner's included, a CROSSED one's since the P3 review, and
+        // an ISOLATED ADL loser's gap when its price is held at `maxPrice` (see `Adl`) — or,
         // cross P3, a negative wallet cleared once its account holds no position).
         // ⚠️ ABI CHANGE (cross P3): the clearance makes a NEGATIVE delta (and, with a short fund,
         // `InsuranceFundDepleted`) appear on ORDINARY calls — a user's own close, a maker fill, a

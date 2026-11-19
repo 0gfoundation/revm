@@ -28,7 +28,9 @@
 //! * a shortfall at close or liquidation goes through the ordinary bad-debt path: an
 //!   ADL residual's is absorbed by opposite holders at the bankruptcy price, and only
 //!   what no representable price can place (`run_adl`'s `p_b == 0` regime, the
-//!   fallback tier) or a book close cannot pay reaches the insurance fund.
+//!   fallback tier), what lies above `maxPrice` (a long's `p_b` there fills at
+//!   `maxPrice`, `adl::isolated_adl_price`) or a book close cannot pay reaches the
+//!   insurance fund.
 //!
 //! It replaces a rule that took a charge from `margin` only down to 0 and drew the
 //! remainder from the insurance fund on the spot. Past that point funding no longer

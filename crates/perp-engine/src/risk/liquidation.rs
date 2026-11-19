@@ -278,8 +278,10 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     if remaining > 0 && !close.maker_cap_deferred {
         // Every residual the BOOK cannot take — solvent or not — is closed as a REAL forced trade
         // against opposite-side holders via ADL, which picks its own price (mark when the residual
-        // is still solvent, the bankruptcy price when it is not). ADL leftover (budget exhausted /
-        // no eligible opposite holder) stays open and is re-swept next update.
+        // is still solvent, the bankruptcy price when it is not — either held at `maxPrice`, a long
+        // held below its own price leaving the gap to the insurance fund: `adl::isolated_adl_price`).
+        // ADL leftover (budget exhausted / no eligible opposite holder) stays open and is re-swept
+        // next update.
         //
         // ⚠️ This used to fork: a solvent residual was closed at mark against NO COUNTERPARTY — the
         // protocol simply valued it and zeroed it. That was the one and only place `Σ amount`
@@ -334,16 +336,17 @@ pub(crate) fn liquidate_position<H: PerpHost>(
     //
     // ⚠️ So a BANKRUPT isolated liquidation pays (almost) nothing — Binance's "no clearance fee for
     // a bankrupt position" holds up to ROUNDING DUST, not exactly. Closed through the book worse
-    // than its bankruptcy price, it returns nothing and pays 0. But its book-unfillable residual is
-    // ADL'd AT its bankruptcy price `P_b`, which `calc_bankruptcy_price` rounds in the position's
-    // favour, so that close returns the equity surplus `S` left at `P_b`: up to one price unit's
-    // worth of the residual `q` — `0 ≤ S ≤ calc_value(1, q)` (one more on a short), and
-    // `≤ calc_value(1, q) − 1` wherever `pd + bd ≤ 6`, as on every devnet market — plus at most a
-    // quote unit per ADL fill of flooring where `pd + bd > 6` or the close is partial. That dust IS
-    // the close credit, so the fee is `min(due, dust)`: it goes to the insurance fund, not to the
-    // victim, whose wallet nets `dust − fee` (0 whenever the due covers it). The devnet gate's
-    // case — long 0.01 BTC @ $100,000 on a 332_333_333 silo, mark $40,000: `P_b = 6_676_667`,
-    // `S = 33`, fee 33 of the 2_000_000 due — is pinned by
+    // than its bankruptcy price, it returns nothing and pays 0 — as does a long's residual ADL'd at
+    // a `maxPrice` below its `P_b` (`adl::isolated_adl_price`; the gap is bad debt). Otherwise its
+    // book-unfillable residual is ADL'd AT its bankruptcy price `P_b`, which `calc_bankruptcy_price`
+    // rounds in the position's favour, so that close returns the equity surplus `S` left at `P_b`:
+    // up to one price unit's worth of the residual `q` — `0 ≤ S ≤ calc_value(1, q)` (one more on a
+    // short), and `≤ calc_value(1, q) − 1` wherever `pd + bd ≤ 6`, as on every devnet market — plus
+    // at most a quote unit per ADL fill of flooring where `pd + bd > 6` or the close is partial.
+    // That dust IS the close credit, so the fee is `min(due, dust)`: it goes to the insurance fund,
+    // not to the victim, whose wallet nets `dust − fee` (0 whenever the due covers it). The devnet
+    // gate's case — long 0.01 BTC @ $100,000 on a 332_333_333 silo, mark $40,000:
+    // `P_b = 6_676_667`, `S = 33`, fee 33 of the 2_000_000 due — is pinned by
     // `a_bankrupt_isolated_adl_pays_its_bankruptcy_price_rounding_dust_as_the_clearance_fee`. A
     // book fill BETTER than `P_b` is no dust: it realizes a real surplus, charged up to the due.
     let post_amount = storage::load_position_ref(context, user, market_id)?.amount;

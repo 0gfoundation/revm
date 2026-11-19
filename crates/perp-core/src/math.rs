@@ -292,16 +292,21 @@ pub fn mark_band_bounds(mark: u64, price_band_bps: u32) -> (u128, u128) {
 /// above `maxPrice` and the mark is clamped to it on every oracle update. It bites after an
 /// `updateMarket` LOWERS `maxPrice` under orders already resting above it: those can no longer
 /// fill there (a stranded best bid is expired by the band GC like any bid above the band), so
-/// every book fill — and every cross-episode ADL fill, whose price that clamp bounds — stays at or
-/// below `maxPrice`.
+/// every book fill — and every cross-episode ADL fill at the account's bankruptcy price, whose
+/// price that clamp bounds — stays at or below `maxPrice`.
 ///
-/// ⚠️ Not an ISOLATED ADL fill. It executes at the mark or at the loser's bankruptcy price
-/// (`risk::adl::isolated_adl_price`), and nothing bands that price: a long opened above a lowered
-/// `maxPrice`, or one carrying a funding debt, can be ADL'd above it — the winner then pays that
-/// price, where a cross ADL would fill at `maxPrice` and leave the gap to the insurance fund.
-/// Whether the isolated path should be capped too (moving that gap from the winner to the fund) is
-/// an open owner decision (second-round review, band-iso-adl-4). It cannot overflow: the ADL
-/// fill values what it cannot represent as a holder passed over (J4).
+/// An ISOLATED ADL fill does not go through this band. It executes at the mark or at the loser's
+/// bankruptcy price (`risk::adl::isolated_adl_price`), and since the owner decision of 2026-11-19
+/// (D2; second-round review band-iso-adl-4) that price is held at `maxPrice` alone —
+/// `min(price, maxPrice)`, no band clamp. A long opened above a lowered `maxPrice`, or one whose
+/// funding debt lifted its bankruptcy price past an entry near it, is ADL'd AT `maxPrice`: the
+/// winner pays `maxPrice`, and the gap up to the loser's own price is the loser's shortfall,
+/// absorbed by the insurance fund — as a cross ADL leaves what the band's edge does not transfer.
+///
+/// ⚠️ A cross ADL at the MARK (the account still solvent, or a leg unpriced) is clamped by neither,
+/// so between an `updateMarket` that lowers `maxPrice` under the stored mark and the next oracle
+/// update it fills at that stored mark, above `maxPrice`; an isolated one there is held at
+/// `maxPrice`.
 #[inline]
 pub fn market_band_bounds(market: &Market) -> (u128, u128) {
     let (upper, lower) = mark_band_bounds(market.mark_price, market.price_band_bps);
@@ -328,11 +333,11 @@ pub fn position_value_fits_i64(
 ///
 /// Every OPENING fill — taker and maker — is held to it (an order whose fill would pass it still
 /// rests, and is cancelled at its first touch), and `updateMarket` refuses to raise `maxPrice` past
-/// an open position that would break it. Every price a position is later valued at, or filled at
-/// through the book, is at or below that ceiling: the mark is clamped to `maxPrice` on each oracle
-/// update (the `max` covers the stored mark an `updateMarket` that LOWERS `maxPrice` leaves above
-/// it until the next update), and no book fill executes above `maxPrice` ([`market_band_bounds`];
-/// an ISOLATED ADL fill at a bankruptcy price can, see there). So no valuation of a position's
+/// an open position that would break it. Every price a position is later valued or filled at is
+/// at or below that ceiling: the mark is clamped to `maxPrice` on each oracle update (the `max`
+/// covers the stored mark an `updateMarket` that LOWERS `maxPrice` leaves above it until the next
+/// update), no book fill and no ISOLATED ADL fill executes above `maxPrice`, and a cross ADL fill
+/// executes in the band or at the mark ([`market_band_bounds`]). So no valuation of a position's
 /// NOTIONAL — at the mark, or as the summed closing value of a liquidation that takes it through
 /// the book in one pass — can leave the `i64` range the sweep would otherwise halt on.
 ///
