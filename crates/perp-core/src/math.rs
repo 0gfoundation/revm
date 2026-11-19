@@ -1816,6 +1816,196 @@ mod funding_payment_tests {
             7_500_000
         );
     }
+
+    // ── Rounding (review Q5, owner 2026-11-19): the signed payment is floor(exact) ──────────
+    //
+    // On `base_decimals = 3`, `price_decimals = 2` the payment is `−amount · Δ / 10^5`, so
+    // `Δ = 60_000` makes one contract (0.001) owe exactly 0.6 quote units.
+    const DELTA_0_6: i128 = 60_000;
+
+    /// The review's example. Two longs of 1 owe 0.6 each and a short of −2 is owed 1.2. Each
+    /// long pays 1 (the ceiling — truncation toward 0 made it 0) and the short receives 1 (the
+    /// floor, as before): Σ = −1, one unit of dust burned. Truncating both sides gave
+    /// `0 + 0 + 1 = +1`, one unit minted out of nothing.
+    #[test]
+    fn a_payer_rounds_away_from_zero_and_a_receiver_toward_it() {
+        let long = calc_funding_payment(1, DELTA_0_6, 3, 2).unwrap();
+        let short = calc_funding_payment(-2, DELTA_0_6, 3, 2).unwrap();
+        assert_eq!(long, -1, "a long owing 0.6 pays 1 (was 0)");
+        assert_eq!(short, 1, "a short owed 1.2 receives 1 (unchanged)");
+        assert_eq!(2 * long + short, -1, "Σ burns one unit; the old rule minted one");
+        // A receiver's sub-unit credit still rounds to nothing; a payer's never does.
+        assert_eq!(calc_funding_payment(-1, DELTA_0_6, 3, 2).unwrap(), 0);
+        assert_eq!(calc_funding_payment(1, 1, 3, 2).unwrap(), -1, "owes 0.00001, pays 1");
+        assert_eq!(calc_funding_payment(-1, 1, 3, 2).unwrap(), 0);
+        // Larger payers: −1.8 → −2, −3.0 → −3 (exact), −3.6 → −4.
+        assert_eq!(calc_funding_payment(3, DELTA_0_6, 3, 2).unwrap(), -2);
+        assert_eq!(calc_funding_payment(5, DELTA_0_6, 3, 2).unwrap(), -3);
+        assert_eq!(calc_funding_payment(6, DELTA_0_6, 3, 2).unwrap(), -4);
+        // And the mirrored receivers: 1.8 → 1, 3.0 → 3, 3.6 → 3.
+        assert_eq!(calc_funding_payment(-3, DELTA_0_6, 3, 2).unwrap(), 1);
+        assert_eq!(calc_funding_payment(-5, DELTA_0_6, 3, 2).unwrap(), 3);
+        assert_eq!(calc_funding_payment(-6, DELTA_0_6, 3, 2).unwrap(), 3);
+    }
+
+    /// A payment that is a whole number of quote units is not rounded at all, either side.
+    #[test]
+    fn an_exact_payment_is_unchanged() {
+        assert_eq!(calc_funding_payment(10, 100_000, 3, 2).unwrap(), -10);
+        assert_eq!(calc_funding_payment(-10, 100_000, 3, 2).unwrap(), 10);
+        assert_eq!(calc_funding_payment(10, -100_000, 3, 2).unwrap(), 10);
+        assert_eq!(calc_funding_payment(-10, -100_000, 3, 2).unwrap(), -10);
+        assert_eq!(calc_funding_payment(10, DELTA_ONE_EPOCH, 0, 2).unwrap(), -7_500_000);
+    }
+
+    #[test]
+    fn zero_stays_zero() {
+        assert_eq!(calc_funding_payment(0, DELTA_0_6, 3, 2).unwrap(), 0);
+        assert_eq!(calc_funding_payment(7, 0, 3, 2).unwrap(), 0);
+        assert_eq!(calc_funding_payment(-7, 0, 3, 2).unwrap(), 0);
+        assert_eq!(calc_funding_payment(0, 0, 0, 0).unwrap(), 0);
+    }
+
+    /// The payment depends on the sign of `amount · Δ` only: flipping both signs changes
+    /// nothing, flipping one turns a payer into a receiver — and a non-exact pair then nets to
+    /// −1, an exact pair to 0.
+    #[test]
+    fn sign_symmetry() {
+        for (a, d) in [(1, DELTA_0_6), (3, DELTA_0_6), (5, DELTA_0_6), (7, 12_345), (10, 100_000)] {
+            let p = calc_funding_payment(a, d, 3, 2).unwrap();
+            assert_eq!(calc_funding_payment(-a, -d, 3, 2).unwrap(), p, "({a}, {d})");
+            let q = calc_funding_payment(-a, d, 3, 2).unwrap();
+            assert_eq!(calc_funding_payment(a, -d, 3, 2).unwrap(), q, "({a}, {d})");
+            let exact = (a as i128 * d) % 100_000 == 0;
+            assert_eq!(p + q, if exact { 0 } else { -1 }, "({a}, {d})");
+        }
+    }
+
+    /// The `i64` bound applies to the ROUNDED payment, with the existing error. On
+    /// `(base_decimals 0, price_decimals 1)` the payment is `floor(−amount · Δ / 10)`, so
+    /// `5 · Δ` at `Δ = 2^64` is exactly `∓2^63` and one more unit of `Δ` adds 0.5:
+    ///
+    /// * a payer owing exactly `2^63` pays `i64::MIN`; owing `2^63 + 0.5` it would pay
+    ///   `2^63 + 1` — past `i64`, refused (truncation used to round it back inside);
+    /// * a receiver owed `2^63 − 0.5` receives `i64::MAX`; owed `2^63 + 0.5`, refused.
+    #[test]
+    fn the_i64_edge_is_judged_on_the_rounded_payment() {
+        const TWO_64: i128 = 1 << 64;
+        assert_eq!(calc_funding_payment(5, TWO_64, 0, 1).unwrap(), i64::MIN);
+        let err = calc_funding_payment(5, TWO_64 + 1, 0, 1).unwrap_err();
+        assert!(err.to_string().contains("math: funding payment exceeds i64"), "{err}");
+        assert!(!err.to_string().contains("[INVARIANT]"), "a user-range fault, not a bug: {err}");
+        assert_eq!(calc_funding_payment(-5, TWO_64 - 1, 0, 1).unwrap(), i64::MAX);
+        let err = calc_funding_payment(-5, TWO_64 + 1, 0, 1).unwrap_err();
+        assert!(err.to_string().contains("math: funding payment exceeds i64"), "{err}");
+    }
+
+    /// The overflow refusals keep their strings and stay `perp_err`.
+    #[test]
+    fn overflow_is_still_a_perp_err() {
+        let err = calc_funding_payment(i64::MAX, i128::MAX, 0, 0).unwrap_err();
+        assert!(err.to_string().contains("math: funding payment numerator overflow"), "{err}");
+        let err = calc_funding_payment(i64::MIN, i128::MAX, 0, 0).unwrap_err();
+        assert!(err.to_string().contains("math: funding payment numerator overflow"), "{err}");
+        let err = calc_funding_payment(1, 1, 20, 20).unwrap_err();
+        assert!(err.to_string().contains("math: funding payment denominator overflow"), "{err}");
+        for err in [
+            calc_funding_payment(i64::MAX, i128::MAX, 0, 0).unwrap_err(),
+            calc_funding_payment(1, 1, 20, 20).unwrap_err(),
+            calc_funding_payment(5, (1 << 64) + 1, 0, 1).unwrap_err(),
+        ] {
+            assert!(!err.to_string().contains("[INVARIANT]"), "{err}");
+        }
+    }
+
+    /// Deterministic xorshift (no rng dependency in this crate).
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// The exact rational's denominator, `10^pd · 10^bd · FUNDING_RATE_ONE`:
+    /// `exact = −amount · Δ · 10^QUOTE_DECIMALS / den`.
+    fn den(bd: u32, pd: u32) -> i128 {
+        10i128.pow(pd) * 10i128.pow(bd) * FUNDING_RATE_ONE as i128
+    }
+
+    /// **Property, over many `(amount, Δ, base_decimals, price_decimals)`**: with
+    /// `exact = −amount · Δ · 10^6 / den` (a rational),
+    ///
+    /// * `payment ≤ exact` and `exact − payment < 1` — the floor, never in the position's favour;
+    /// * `payment(a) + payment(−a) ∈ {0, −1}` — `0` exactly when the payment is exact;
+    /// * against the old rule (truncation toward 0): equal for a receiver or an exact payment,
+    ///   one unit more for a non-exact payer — and never less;
+    /// * `Ok` exactly when the floor fits `i64`.
+    ///
+    /// Inequalities are checked multiplied through by `den > 0`, in `i128`; magnitudes are
+    /// drawn on a log scale so small, sub-unit and `i64`-edge payments all occur.
+    #[test]
+    fn property_the_payment_is_the_floor_of_the_exact_value() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut exact_seen, mut payer_rounded, mut receiver_rounded, mut refused) = (0, 0, 0, 0);
+        for _ in 0..200_000 {
+            let bd = (next(&mut s) % 9) as u32;
+            let pd = (next(&mut s) % 9) as u32;
+            // |amount| < 2^(k+1) for k in 0..40, |Δ| < 2^(j+1) for j in 0..56: the numerator
+            // `amount · Δ · 10^6` stays below 2^117 — no numerator overflow in this sweep.
+            let a_mag = (next(&mut s) >> (64 - 1 - (next(&mut s) % 40))) as i64;
+            let d_mag = (next(&mut s) >> (64 - 1 - (next(&mut s) % 56))) as i128;
+            let a = if next(&mut s) & 1 == 0 { a_mag } else { -a_mag };
+            let d = if next(&mut s) & 1 == 0 { d_mag } else { -d_mag };
+            let den = den(bd, pd);
+            let neg_num = -(a as i128 * d * 1_000_000); // `exact · den`
+
+            // Independent floor / trunc of `neg_num / den` (den > 0).
+            let trunc = neg_num / den;
+            let is_exact = neg_num % den == 0;
+            let floor = if !is_exact && neg_num < 0 { trunc - 1 } else { trunc };
+
+            let got = calc_funding_payment(a, d, bd, pd);
+            match i64::try_from(floor) {
+                Ok(f) => {
+                    let p = got.unwrap_or_else(|e| panic!("({a}, {d}, {bd}, {pd}): {e}"));
+                    assert_eq!(p, f, "({a}, {d}, {bd}, {pd})");
+                    let p = p as i128;
+                    assert!(p * den <= neg_num, "payment above exact: ({a}, {d}, {bd}, {pd})");
+                    assert!(neg_num - p * den < den, "off by ≥ 1: ({a}, {d}, {bd}, {pd})");
+                    // Old rule: truncation toward 0.
+                    if is_exact {
+                        exact_seen += 1;
+                        assert_eq!(p, trunc);
+                    } else if neg_num < 0 {
+                        payer_rounded += 1;
+                        assert_eq!(p, trunc - 1, "a non-exact payer pays one unit more");
+                    } else {
+                        receiver_rounded += 1;
+                        assert_eq!(p, trunc, "a receiver is unchanged");
+                    }
+                    // The mirror can only be refused at `p == i64::MIN` exactly (its `2^63`
+                    // does not fit), so it is skipped there.
+                    if let Ok(m) = calc_funding_payment(-a, d, bd, pd) {
+                        assert_eq!(
+                            p + m as i128,
+                            if is_exact { 0 } else { -1 },
+                            "payment(a) + payment(−a): ({a}, {d}, {bd}, {pd})"
+                        );
+                    }
+                }
+                Err(_) => {
+                    refused += 1;
+                    let e = got.expect_err("a floor past i64 must be refused");
+                    assert!(e.to_string().contains("math: funding payment exceeds i64"), "{e}");
+                }
+            }
+        }
+        // The sweep really exercised every branch.
+        assert!(exact_seen > 1_000, "exact: {exact_seen}");
+        assert!(payer_rounded > 10_000, "payer: {payer_rounded}");
+        assert!(receiver_rounded > 10_000, "receiver: {receiver_rounded}");
+        assert!(refused > 100, "refused: {refused}");
+    }
 }
 
 #[cfg(test)]

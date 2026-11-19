@@ -81,9 +81,12 @@ fn setup_market_no_funding(ctx: &mut TestCtx) {
             max_price: 1_000_000,
             price_update_interval: 15,
             active: true,
-            // Funding OFF: it is not a zero-sum transfer inside the identity (each position
-            // settles against the index on its own touch, with its own floored payment), and
-            // it is not what is under test here.
+            // Funding OFF: it is not what is under test here, and it would turn the identity
+            // into an inequality. Each position settles against the index on its own touch and
+            // rounds its own payment toward −∞ (`math::calc_funding_payment`), so the two sides
+            // need not net to zero: funding only ever BURNS dust, leaving `custody ≥ claims`.
+            // That is pinned on its own grid by
+            // `funding_rounding_burns_dust_into_custody_and_never_mints` below.
             funding_interval: 0,
             interest_rate: 0,
             // LIVE clearance fee, so the liquidation charges one. It also pins
@@ -161,11 +164,16 @@ impl Claims {
 /// `clamp_wallets` reads each wallet through `visible_perp_wallet_balance()` instead of the
 /// stored signed value — i.e. exactly what every `uint64` ABI surface reports.
 fn claims(ctx: &mut TestCtx, clamp_wallets: bool) -> Claims {
+    claims_of(ctx, &HOLDERS, clamp_wallets)
+}
+
+/// [`claims`] over an explicit holder set (every account of the closed system, ADMIN included).
+fn claims_of(ctx: &mut TestCtx, holders: &[Address], clamp_wallets: bool) -> Claims {
     let mut c = Claims {
         insurance: storage::load_insurance_fund(ctx).unwrap() as i128,
         ..Claims::default()
     };
-    for user in HOLDERS {
+    for &user in holders {
         let acc = storage::load_account(ctx, user).unwrap();
         let pos = storage::load_position(ctx, user, MARKET_ID).unwrap();
         let spot: U256 = acc.usdc_balance.clone().into();
@@ -633,4 +641,304 @@ fn custodied_usdc_still_equals_all_claims_when_a_short_silo_position_is_liquidat
         (expected, expected),
         "getAccountMargin agrees with the index-driven view (no resting orders, so ooIM = 0)"
     );
+}
+
+// ── Funding rounding: dust is BURNED into custody, never minted (review Q5) ─────────────────────
+
+/// Longs of 0.001 / 0.001 / 0.001 / 0.002 / 0.003 and shorts of 0.003 / 0.005 on the funding grid.
+const FL1: Address = address!("00000000000000000000000000000000000000f1");
+const FL2: Address = address!("00000000000000000000000000000000000000f2");
+const FL3: Address = address!("00000000000000000000000000000000000000f3");
+const FL4: Address = address!("00000000000000000000000000000000000000f4");
+const FL5: Address = address!("00000000000000000000000000000000000000f5");
+const FS1: Address = address!("00000000000000000000000000000000000000f6");
+const FS2: Address = address!("00000000000000000000000000000000000000f7");
+const TRADERS: [Address; 7] = [FL1, FL2, FL3, FL4, FL5, FS1, FS2];
+/// The closed system: every trader, plus ADMIN (the fee sink).
+const FUNDING_HOLDERS: [Address; 8] = [FL1, FL2, FL3, FL4, FL5, FS1, FS2, ADMIN];
+const FUNDING_DEPOSIT: u64 = 10_000_000; // $10 each
+const FUNDING_CUSTODY: i128 = FUNDING_DEPOSIT as i128 * TRADERS.len() as i128;
+/// $100.00 — the index every tick publishes, and (with the last trade there too) the mark.
+const F_MARK: u64 = 10_000;
+/// `interestRate`: at `mark == index` the premium is 0 and the rate is the interest-rate clamp.
+const F_RATE: i64 = 6;
+/// The cumulative index's step per epoch, `mark · rate`.
+const F_STEP: i128 = F_MARK as i128 * F_RATE as i128;
+/// `calc_funding_payment` on `(base_decimals 3, price_decimals 2)`: `payment = floor(−amount · Δ
+/// / 10^5)`, so one epoch makes 0.001 base owe exactly 0.6 quote units.
+const F_SCALE: i128 = 100_000;
+
+/// A 3 / 2-decimal market at $100.00 with an epoch every 60 s at a 6 ppm rate, so no funding
+/// payment on it is a whole number of units unless the size makes it one. Fixture, not money:
+/// every unit of collateral arrives through `deposit`.
+fn setup_funding_market(ctx: &mut TestCtx) {
+    storage::save_admin(ctx, ADMIN).unwrap();
+    storage::save_market(
+        ctx,
+        &Market {
+            market_id: MARKET_ID,
+            base_decimals: 3,
+            price_decimals: PRICE_DECIMALS,
+            tick_size: 1,
+            step_size: 1,
+            min_quantity: 1,
+            max_quantity: 1_000_000,
+            max_price: 1_000_000,
+            price_update_interval: 15,
+            active: true,
+            funding_interval: 60,
+            interest_rate: F_RATE,
+            liquidation_fee_rate_bps: 0,
+            price_band_bps: 0,
+            mark_price: 0,
+            tiers: MarginTiers::default(),
+            basis_mode: 0,
+            deferred_work: 0,
+            cumulative_funding_index: 0,
+        },
+    )
+    .unwrap();
+    storage::save_mark_price(ctx, MARKET_ID, F_MARK).unwrap();
+}
+
+/// The test's own ledger of every position's funding, and of what each settlement paid under the
+/// rule in force (floor, toward −∞) and under the one it replaced (truncation toward 0).
+#[derive(Default)]
+struct FundingLedger {
+    /// `(holder, amount, last_funding_index)`.
+    rows: Vec<(Address, i64, i128)>,
+    /// Σ payments under the floor rule, and under truncation.
+    floor_sum: i128,
+    trunc_sum: i128,
+    /// Non-zero settlements; those that were not a whole number of units; and of those, the
+    /// PAYERS' (where the two rules differ, by exactly one unit).
+    settlements: u32,
+    non_exact: u32,
+    non_exact_payers: u32,
+}
+
+impl FundingLedger {
+    fn row(&mut self, user: Address) -> &mut (Address, i64, i128) {
+        if let Some(i) = self.rows.iter().position(|r| r.0 == user) {
+            return &mut self.rows[i];
+        }
+        self.rows.push((user, 0, 0));
+        self.rows.last_mut().unwrap()
+    }
+
+    /// Settles `user` at `index`: the payment the engine must publish (`0` = no event).
+    fn settle(&mut self, user: Address, index: i128) -> i64 {
+        let (_, amount, anchor) = *self.row(user);
+        let exact_scaled = -(amount as i128) * (index - anchor); // exact · F_SCALE
+        let floor = exact_scaled.div_euclid(F_SCALE);
+        let trunc = exact_scaled / F_SCALE;
+        self.row(user).2 = index;
+        if floor != 0 {
+            self.settlements += 1;
+        }
+        if exact_scaled % F_SCALE != 0 {
+            self.non_exact += 1;
+            if exact_scaled < 0 {
+                self.non_exact_payers += 1;
+                assert_eq!(floor, trunc - 1, "a non-exact payer pays one unit more than before");
+            }
+        }
+        self.floor_sum += floor;
+        self.trunc_sum += trunc;
+        i64::try_from(floor).unwrap()
+    }
+
+    fn fill(&mut self, user: Address, delta: i64) {
+        self.row(user).1 += delta;
+    }
+}
+
+fn funding_index(ctx: &mut TestCtx) -> i128 {
+    storage::load_funding_state(ctx, MARKET_ID).unwrap().cumulative_funding_index
+}
+
+/// The logs since the last take must carry exactly the `FundingSettled` the ledger expects for
+/// `touched` (settled at the current index), and none for anyone else.
+fn assert_funding_events(ctx: &mut TestCtx, ledger: &mut FundingLedger, touched: &[Address]) {
+    let index = funding_index(ctx);
+    let logs = JournalTr::take_logs(ctx.journal_mut());
+    let settled = decode_events::<crate::interface::IPerpDex::FundingSettled>(&logs);
+    for &user in touched {
+        let expected = ledger.settle(user, index);
+        let got: Vec<i64> = settled.iter().filter(|f| f.user == user).map(|f| f.amount).collect();
+        let want = if expected == 0 { vec![] } else { vec![expected] };
+        assert_eq!(got, want, "{user}'s FundingSettled at index {index}");
+    }
+    for f in &settled {
+        assert!(touched.contains(&f.user), "funding settled for {}, whom nobody touched", f.user);
+    }
+}
+
+/// `addPositionMargin(1)`: a public touch that settles the caller's funding, and moves one unit
+/// wallet → silo (inside the identity).
+fn touch(ctx: &mut TestCtx, ledger: &mut FundingLedger, user: Address) {
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    run_add_position_margin(
+        &addPositionMarginCall { marketId: MARKET_ID, amount: 1 }.abi_encode(),
+        user,
+        ctx,
+    )
+    .unwrap();
+    assert_funding_events(ctx, ledger, &[user]);
+}
+
+/// `maker` rests `qty` on `maker_side` at $100, `taker` takes it whole: both settle funding.
+fn trade(
+    ctx: &mut TestCtx,
+    ledger: &mut FundingLedger,
+    maker: Address,
+    maker_side: u8,
+    taker: Address,
+    qty: u64,
+) {
+    let _ = JournalTr::take_logs(ctx.journal_mut());
+    place_order(ctx, maker, maker_side, F_MARK, qty);
+    place_order(ctx, taker, 1 - maker_side, F_MARK, qty);
+    assert_funding_events(ctx, ledger, &[maker, taker]);
+    let q = qty as i64;
+    let (m, t) = if maker_side == BUY { (q, -q) } else { (-q, q) };
+    ledger.fill(maker, m);
+    ledger.fill(taker, t);
+}
+
+/// One funding epoch through the oracle: the tick at the boundary steps the index by `F_STEP`
+/// and leaves the mark at $100.00.
+fn funding_epoch(ctx: &mut TestCtx, ts: u64) {
+    let before = funding_index(ctx);
+    oracle_tick(ctx, F_MARK, ts);
+    assert_eq!(storage::load_mark_price(ctx, MARKET_ID).unwrap(), F_MARK);
+    assert_eq!(funding_index(ctx), before + F_STEP, "one epoch at {ts}");
+}
+
+/// With every position settled at the current index: positions and anchors match the ledger,
+/// and `custody − claims` is what funding burned. Returns that gap.
+fn funding_checkpoint(ctx: &mut TestCtx, ledger: &FundingLedger, at: &str) -> i128 {
+    let index = funding_index(ctx);
+    for &(user, amount, anchor) in &ledger.rows {
+        let p = storage::load_position(ctx, user, MARKET_ID).unwrap();
+        assert_eq!((p.amount, p.last_funding_index), (amount, anchor), "{at}: {user}");
+        assert_eq!(anchor, index, "{at}: {user} is not settled — the identity needs everyone");
+    }
+    let c = claims_of(ctx, &FUNDING_HOLDERS, false);
+    assert_eq!(c.amount, 0, "{at}: net open interest is flat");
+    assert_eq!(custodied_usdc(ctx), FUNDING_CUSTODY, "{at}: custody moves only on deposit");
+    let gap = FUNDING_CUSTODY - c.total_at(F_MARK);
+    // The whole story of the gap: funding is the only non-conserving step, and the exact
+    // payments sum to zero (`Σ amount = 0` over every interval), so the gap is minus the sum of
+    // the rounded ones.
+    assert_eq!(gap, -ledger.floor_sum, "{at}: custody − claims is exactly the burned dust");
+    assert!(gap >= 0, "{at}: CLAIMS EXCEED CUSTODY by {} — funding minted", -gap);
+    // Each non-exact settlement is off by less than one unit, so the burn is bounded by them…
+    assert!(gap < ledger.non_exact.max(1) as i128, "{at}: {gap} vs {}", ledger.non_exact);
+    // …and the old rule is the same settlements with each non-exact PAYER one unit lighter.
+    assert_eq!(
+        gap - -ledger.trunc_sum,
+        ledger.non_exact_payers as i128,
+        "{at}: the rules differ by exactly one unit per non-exact payer settlement"
+    );
+    gap
+}
+
+/// **Funding on a non-divisible grid only BURNS dust: `custody ≥ claims`, never the reverse**
+/// (review Q5, owner 2026-11-19).
+///
+/// Five longs and two shorts of uneven sizes on a 3 / 2-decimal market, at a 6 ppm rate: one
+/// epoch makes 0.001 base owe exactly 0.6 quote units, so almost no settlement is a whole number
+/// of units. Everything goes through public calls — `deposit` + `transferToPerp`, `placeOrder`,
+/// `updateIndexPrice` (five epochs), and settlement by touch: `addPositionMargin(1)` or a fill.
+/// Some positions settle every epoch, some across two at once (a single floor over the summed
+/// index delta), and two positions trade (one flips) between epochs.
+///
+/// The test keeps its own ledger of every settlement (`FundingLedger`), asserts each
+/// `FundingSettled` against it, and at every checkpoint where all positions are settled asserts
+/// the custody identity: `custody − claims` equals the dust burned, is `≥ 0`, is below the number
+/// of non-exact settlements, and exceeds the old rule's by exactly the number of non-exact payer
+/// settlements.
+///
+/// | checkpoint | settlements (non-exact / of them payers) | burned now | old rule |
+/// |---|---|---|---|
+/// | A — epoch 1, all touched | 7 (6 / 5) | 3 | −2 (minted 2) |
+/// | B — epochs 2–3, a trade + all touched | 16 (14 / 12) | 8 | −4 (minted 4) |
+/// | C — epochs 4–5 after a flip, all touched | 23 (20 / 16) | 11 | −5 (minted 5) |
+///
+/// Measured by running this scenario on the old code (truncation toward 0 for both sides, umi
+/// `079bb1ac`, the ledger switched to truncation): every `FundingSettled` matched the truncating
+/// ledger, and claims stood at 70_000_002 / 70_000_004 / 70_000_005 against 70_000_000 of custody
+/// at A / B / C — `custody − claims` = −2, −4, −5, i.e. 5 µUSDC minted out of nothing.
+#[test]
+fn funding_rounding_burns_dust_into_custody_and_never_mints() {
+    let seeds: Vec<(Address, u64)> = TRADERS.iter().map(|&u| (u, FUNDING_DEPOSIT)).collect();
+    let mut db = InMemoryDB::default();
+    for (addr, amount) in &seeds {
+        db.insert_account_storage(USDC_ADDRESS, erc20_balance_slot(*addr).into(), U256::from(*amount))
+            .unwrap();
+    }
+    crate::margin::margin_type::test_gate::isolated_by_default();
+    let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
+    for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS].into_iter().chain(FUNDING_HOLDERS) {
+        JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
+    }
+    setup_funding_market(&mut ctx);
+    for user in TRADERS {
+        fund_perp_wallet(&mut ctx, user, FUNDING_DEPOSIT);
+    }
+    let mut ledger = FundingLedger::default();
+
+    // ── Positions, all at $100 and index 0: longs 1, 1, 1, 2, 3 against shorts 3, 5 ──
+    trade(&mut ctx, &mut ledger, FS1, SELL, FL1, 1);
+    trade(&mut ctx, &mut ledger, FS1, SELL, FL2, 1);
+    trade(&mut ctx, &mut ledger, FS1, SELL, FL3, 1);
+    trade(&mut ctx, &mut ledger, FS2, SELL, FL4, 2);
+    trade(&mut ctx, &mut ledger, FS2, SELL, FL5, 3);
+    assert_eq!(funding_checkpoint(&mut ctx, &ledger, "opened"), 0, "nothing to round yet");
+
+    // The oracle's first tick starts the epoch clock (boundary at 90).
+    oracle_tick(&mut ctx, F_MARK, 30);
+    assert_eq!(funding_index(&mut ctx), 0);
+
+    // ── A: one epoch, everyone touched. Longs owe 0.6 / 0.6 / 0.6 / 1.2 / 1.8 and pay 1, 1, 1,
+    //    2, 2; the shorts are owed 1.8 and 3.0 and receive 1 and 3. Σ = −3. (Truncation: the
+    //    longs paid 0, 0, 0, 1, 1 — Σ = +2, two units minted.)
+    funding_epoch(&mut ctx, 90);
+    for user in TRADERS {
+        touch(&mut ctx, &mut ledger, user);
+    }
+    assert_eq!(funding_checkpoint(&mut ctx, &ledger, "A"), 3);
+    assert_eq!((ledger.trunc_sum, ledger.settlements, ledger.non_exact), (2, 7, 6));
+
+    // ── B: epoch 2, then FL5 sells 1 to FL1 (both settle: −0.6 → −1, −1.8 → −2); epoch 3, then
+    //    everyone: FL1 and FL5 owe one epoch on 2 (−1.2 → −2 each), FL2 / FL3 / FL4 / FS1 / FS2
+    //    two epochs on their old size, in ONE floor (−1.2 → −2, −1.2 → −2, −2.4 → −3, +3.6 → 3,
+    //    +6.0 → 6).
+    funding_epoch(&mut ctx, 150);
+    trade(&mut ctx, &mut ledger, FL1, BUY, FL5, 1);
+    funding_epoch(&mut ctx, 210);
+    for user in TRADERS {
+        touch(&mut ctx, &mut ledger, user);
+    }
+    assert_eq!(funding_checkpoint(&mut ctx, &ledger, "B"), 8);
+    assert_eq!((ledger.trunc_sum, ledger.settlements, ledger.non_exact), (4, 16, 14));
+
+    // ── C: FL2 sells 2 to FS1 — FL2 flips to SHORT 1, FS1 covers to short 1 (both already
+    //    settled: no funding event). Two epochs, then everyone: the longs FL1 / FL3 / FL4 / FL5
+    //    owe 2.4 / 1.2 / 2.4 / 2.4 and pay 3, 2, 3, 3; the shorts FL2 / FS1 / FS2 are owed 1.2 /
+    //    1.2 / 6.0 and receive 1, 1, 6.
+    trade(&mut ctx, &mut ledger, FS1, BUY, FL2, 2);
+    assert_eq!(position(&mut ctx, FL2).amount, -1, "FL2 flipped");
+    funding_epoch(&mut ctx, 270);
+    funding_epoch(&mut ctx, 330);
+    for user in TRADERS {
+        touch(&mut ctx, &mut ledger, user);
+    }
+    assert_eq!(funding_checkpoint(&mut ctx, &ledger, "C"), 11);
+    assert_eq!(
+        (ledger.trunc_sum, ledger.settlements, ledger.non_exact, ledger.non_exact_payers),
+        (5, 23, 20, 16)
+    );
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 0, "the dust is not the fund's");
 }
