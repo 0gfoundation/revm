@@ -339,3 +339,125 @@ fn outside_the_window_an_isolated_short_is_never_capped() {
     assert_eq!(o.realized, vec![(ALICE, -300_000_000), (KEEPER, 300_000_000)]);
     assert_eq!((o.alice_wallet, o.keeper_wallet, o.fund), (700_000_000, 1_300_000_000, FUND));
 }
+
+
+/// One oracle tick at `ts` (the mark follows `index`, held at `maxPrice`).
+fn tick_at(ctx: &mut TestCtx, index: u64, ts: u64) {
+    advance_block_to(ctx, ts);
+    run_update_index_price(
+        &updateIndexPriceCall { marketId: MARKET_ID, indexPrice: index, timestamp: ts }.abi_encode(),
+        ADMIN,
+        ctx,
+    )
+    .unwrap();
+}
+
+/// **A capped long's ADL cut short pays each filled slice's gap out of what is left of its own silo
+/// first, so a `maxPrice` raise before the rest is ADL'd makes the rest's winners pay its raised
+/// bankruptcy price** (third-round review D2-continuation-1 — pinned as it stands: the routing is
+/// `apply_position_fill`'s rule for every isolated close, and changing it for this case is an open
+/// owner decision).
+///
+/// ALICE long 130 @ $100 on a $6,500 silo at 2x (`p_b` $50); 130 one-lot ISOLATED shorts @ $100, each
+/// on a $50 silo at 2x, are the only opposite holders; a $5,000 fund. `updateMarket` lowers `maxPrice`
+/// to $40 and the tick to $35 liquidates her: empty book, so ADL at $40 — and the pass stops at the
+/// 128-fill ADL budget. Each one-lot slice realizes −$60 on its $50 pro-rata silo; its $10 gap is
+/// drawn from the REST's silo first, so the fund takes $1,180 = 128 × $10 − $100 (the rest's whole
+/// pro-rata silo) and ALICE is left long 2, vQuote −$200, margin 0: her rest's `p_b` is now her entry,
+/// $100.
+///
+/// * No raise — the next tick ADLs the rest at $40 too: the fund takes 2 × $60 = $120, $1,300 in all =
+///   ($50 − $40) × 130, exactly what one uninterrupted pass would have billed; every winner has $110.
+/// * `updateMarket` raises `maxPrice` back to $10,000 before that tick: the rest's own price ($100) is
+///   under the cap, so its two winners buy back at $100 — realized 0, wallet $50, against their 128
+///   peers' $110 — and the fund takes nothing more ($1,180 in all). They paid $50 a lot above ALICE's
+///   $50 bankruptcy price (what they paid before D2): together the $100 her rest's silo had put toward
+///   the fund's share.
+///
+/// Value is conserved either way, and no winner pays above the `maxPrice` in force at its fill.
+#[test]
+fn a_capped_long_adl_cut_short_draws_its_rest_silo_first_so_a_raise_reprices_the_rest() {
+    const LOTS: u8 = 130;
+    const BIG_FUND: u64 = 5_000_000_000;
+    for raise in [false, true] {
+        let mut ctx = make_ctx();
+        setup_market(&mut ctx);
+        storage::save_account(
+            &mut ctx,
+            ADMIN,
+            UserAccount { perp_wallet_balance: BIG_FUND as i64, ..UserAccount::default() },
+            AccountUpdateReason::Adjustment,
+        )
+        .unwrap();
+        run_deposit_insurance_fund(
+            &depositInsuranceFundCall { amount: BIG_FUND }.abi_encode(),
+            ADMIN,
+            &mut ctx,
+        )
+        .unwrap();
+        seed_position_account(&mut ctx, ALICE, LOTS as i64, -13_000_000_000, 6_500_000_000, 2, 0);
+        // `0xd0…d0NN`: clear of ALICE / KEEPER / MAKER (`[i; 20]`) and of each other.
+        let winners: Vec<Address> = (1..=LOTS)
+            .map(|i| {
+                let mut a = [0xd0u8; 20];
+                a[19] = i;
+                Address::from(a)
+            })
+            .collect();
+        for &w in &winners {
+            seed_position_account(&mut ctx, w, -1, 100_000_000, 50_000_000, 2, 0);
+        }
+        let mut everyone = winners.clone();
+        everyone.push(ALICE);
+        let before = conservation_sum(&mut ctx, &everyone);
+        update_market(&mut ctx, 4_000);
+        let _ = JournalTr::take_logs(ctx.journal_mut());
+
+        // Pass 1: the ADL budget's 128 fills, all at maxPrice.
+        tick_at(&mut ctx, 3_500, 31);
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        let adls = decode_events::<Adl>(&logs);
+        assert_eq!(adls.len(), 128, "raise {raise}: the ADL budget");
+        assert!(adls.iter().all(|a| (a.liquidatedUser, a.qty, a.price) == (ALICE, 1, 4_000)));
+        let fund_moves: Vec<i64> =
+            decode_events::<InsuranceFundChanged>(&logs).iter().map(|e| e.delta).collect();
+        assert_eq!(fund_moves, vec![-1_180_000_000], "128 × $10 less the rest's $100 silo");
+        assert!(decode_events::<InsuranceFundDepleted>(&logs).is_empty());
+        let rest = position(&mut ctx, ALICE);
+        assert_eq!(
+            (rest.amount, rest.v_quote_balance, rest.margin),
+            (2, -200_000_000, 0),
+            "the rest's silo drawn to 0: its p_b is its $100 entry"
+        );
+
+        // Pass 2: the rest, at the next tick — after a raise or not.
+        if raise {
+            update_market(&mut ctx, 1_000_000);
+        }
+        tick_at(&mut ctx, 3_500, 46);
+        let logs = JournalTr::take_logs(ctx.journal_mut());
+        let price = if raise { 10_000 } else { 4_000 };
+        assert_eq!(
+            decode_events::<Adl>(&logs)
+                .iter()
+                .map(|a| (a.liquidatedUser, a.adlUser, a.qty, a.price))
+                .collect::<Vec<_>>(),
+            vec![(ALICE, winners[128], 1, price), (ALICE, winners[129], 1, price)],
+            "raise {raise}"
+        );
+        let fund_moves: Vec<i64> =
+            decode_events::<InsuranceFundChanged>(&logs).iter().map(|e| e.delta).collect();
+        let (pass2_fund, fund_total) =
+            if raise { (vec![], 1_180_000_000) } else { (vec![-120_000_000], 1_300_000_000) };
+        assert_eq!(fund_moves, pass2_fund, "raise {raise}");
+        assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), BIG_FUND - fund_total);
+        assert_eq!(position(&mut ctx, ALICE).amount, 0);
+        let last_two = if raise { 50_000_000 } else { 110_000_000 };
+        for (i, &w) in winners.iter().enumerate() {
+            assert_eq!(position(&mut ctx, w).amount, 0);
+            let want = if i < 128 { 110_000_000 } else { last_two };
+            assert_eq!(wallet(&mut ctx, w), want, "raise {raise}: winner {i}");
+        }
+        assert_eq!(conservation_sum(&mut ctx, &everyone), before, "raise {raise}: value conserved");
+    }
+}
