@@ -31,10 +31,11 @@ use crate::{
 /// cannot cover is `InsuranceFundDepleted`, as for any bankruptcy deficit): what no
 /// representable price can push onto the opposite side (`p_b == 0`, a short); what an ISOLATED
 /// long loses below its own price when that price is held at `maxPrice` — an ordinary case after
-/// `updateMarket` lowers it under a long's `p_b` (no isolated ADL fill executes above it, owner
-/// decision 2026-11-19 — see [`isolated_adl_price`]); and fallback-tier winners already short at
-/// the fill price. Both legs of every fill use the SAME
-/// single-floored `calc_value(P_b, take)`, so Σ vQuote and Σ amount are conserved (a real
+/// `updateMarket` lowers it under a long's `p_b` (no ADL fill executes above it, owner decisions
+/// 2026-11-19 — see [`isolated_adl_price`]; a CROSSED long held there leaves its gap in its cross
+/// wallet instead, see below); and fallback-tier winners already short at the fill price — a long
+/// winner made to sell at a `maxPrice` under its entry among them. Both legs of every fill use the
+/// SAME single-floored `calc_value(P_b, take)`, so Σ vQuote and Σ amount are conserved (a real
 /// trade, not a synthetic close).
 ///
 /// Runs inside the liquidation sweep, bounded by the shared `budget` (total ADL fills
@@ -85,7 +86,8 @@ use crate::{
 /// Comes from a cross liquidation episode (`risk::cross_liquidation`) with its fill price decided
 /// on the ACCOUNT (`cross_fill_price`): the mark while `E ≥ 0`, the MM-share bankruptcy price
 /// clamped into the market's band otherwise (the deficit the band's edge does not transfer stays
-/// in the loser's wallet). Its leg settles into its cross wallet like any cross fill; the episode
+/// in the loser's wallet) — and, like every ADL price, held at `maxPrice` here
+/// ([`held_at_max_price`]). Its leg settles into its cross wallet like any cross fill; the episode
 /// charges the clearance fee on what this closed.
 pub(crate) fn run_adl<H: PerpHost>(
     context: &mut H,
@@ -96,8 +98,8 @@ pub(crate) fn run_adl<H: PerpHost>(
     // The fill price for a CROSSED loser, decided by its liquidation episode
     // (`risk::cross_liquidation`): the mark while the ACCOUNT's `E ≥ 0`, its MM-share bankruptcy
     // price clamped into the band otherwise (R5) — a cross position has no silo, so its own
-    // position equity cannot pick the price the way an isolated one does below. `None` for an
-    // ISOLATED loser.
+    // position equity cannot pick the price the way an isolated one does below. Held at
+    // `maxPrice` below, whatever the caller passes. `None` for an ISOLATED loser.
     cross_fill_price: Option<u64>,
 ) -> Result<(), PerpError> {
     let mut loser_pos = storage::load_position(context, loser, market.market_id)?;
@@ -109,7 +111,7 @@ pub(crate) fn run_adl<H: PerpHost>(
     let loser_cross = crate::margin::margin_type::effective_margin_type(&loser_pos)
         == crate::types::MarginType::Crossed;
     let (fill_price, loser_policy) = if loser_cross {
-        // ── A CROSSED loser: the episode's price ─────────────────────────────────────────────────
+        // ── A CROSSED loser: the episode's price, HELD AT `maxPrice` ─────────────────────────────
         //
         // Its leg settles into the cross wallet either sign and reports NO bad debt
         // (`settlement::apply_position_fill` under `Cross`), so the policy binds only the WINNER's
@@ -117,11 +119,37 @@ pub(crate) fn run_adl<H: PerpHost>(
         // with no representable price) fills at ONE unit, the isolated rule's lowest non-giveaway
         // price. Without a price (no caller does that) nothing is done — totally, this runs inside
         // the sweep.
+        //
+        // No ADL fill of either margin type executes above `maxPrice` (owner decision 2026-11-19,
+        // after D2 capped the ISOLATED one). The episode's bankruptcy price is already in the
+        // band, whose upper edge is `maxPrice`; its MARK (`E ≥ 0`, or a leg unpriced) is not, and
+        // between an `updateMarket` that lowers `maxPrice` under the stored mark and the next
+        // oracle update — `liquidate()` and `drainDeferredWork` run on the stored mark — it sits
+        // above it. Held there, the fill moves value off the mark:
+        //
+        //   * a LONG loser sells at `maxPrice`, below the mark: its cross wallet takes the
+        //     difference, and what that leaves its account short is the receivable the band's
+        //     edge already leaves (R5) — the episode's next cross legs close at MM-share bankruptcy
+        //     prices off that `E`, its isolated silos net it as they close, and once it holds no
+        //     position the insurance fund clears the rest (Q8, `risk::negative_balance`). No new
+        //     route, and no bad debt reported here;
+        //   * a SHORT loser buys back at `maxPrice`, below the mark: its account keeps the
+        //     difference;
+        //   * the WINNERS are screened at this price like at any other (`eq_fill`; a CROSSED one's
+        //     per-fill `E − take · |fill − mark| ≥ 0`). A SHORT winner buys below the mark, better
+        //     for it (that slippage test counts the distance either way, so a CROSSED short with
+        //     `E` under it is served behind the fallback tier — order only: its fill raises `E`, no
+        //     cover). A LONG winner sells below it: one whose equity at `maxPrice` is short of zero
+        //     (an entry above it on a thin silo) — or, CROSSED, whose `E` cannot carry the
+        //     slippage — is fallback tier, filled only once every clean holder is spent, its
+        //     shortfall the fund's like any fallback winner's (`adl_fill`).
+        //
+        // Decided here, before `run_adl_fills` writes anything.
         let Some(p) = cross_fill_price else {
             debug_assert!(false, "run_adl: a CROSSED loser needs its episode's fill price");
             return Ok(());
         };
-        (p.max(1), BadDebtPolicy::Forbid)
+        (held_at_max_price(p.max(1), market.max_price).0, BadDebtPolicy::Forbid)
     } else {
         isolated_adl_price(&loser_pos, mark_price, market.max_price, bd, pd)?
     };
@@ -135,6 +163,19 @@ pub(crate) fn run_adl<H: PerpHost>(
         fill_price,
         loser_policy,
     )
+}
+
+/// `min(price, max_price)`, and whether that held `price` at `max_price` — where every ADL price
+/// meets the market's `maxPrice`: no ADL fill executes above it, ISOLATED
+/// ([`isolated_adl_price`], owner decision 2026-11-19, D2) or CROSSED ([`run_adl`], owner decision
+/// 2026-11-19). The cap alone, not the price band.
+#[inline]
+fn held_at_max_price(price: u64, max_price: u64) -> (u64, bool) {
+    if price > max_price {
+        (max_price, true)
+    } else {
+        (price, false)
+    }
 }
 
 /// The fill price and loser policy of an ISOLATED loser's ADL: the mark for a solvent residual,
@@ -238,7 +279,7 @@ fn isolated_adl_price(
     // `maxPrice`). This price is held at `maxPrice` too: `min(price, maxPrice)`, the cap alone, not
     // the band — the band would also move ordinary ADLs (a crash leaves a long's `p_b` more than the
     // band above the mark, a short's below its lower edge), and the decision was the cap. (A cross
-    // ADL at the MARK is clamped by neither; see `market_band_bounds`.)
+    // ADL is held there by the same [`held_at_max_price`], at the mark too — `run_adl`.)
     //
     // Where the price above can exceed `maxPrice` (every oracle update holds the mark in
     // `[1, maxPrice]`):
@@ -276,11 +317,9 @@ fn isolated_adl_price(
     // above the original `p_b`, though never above the `maxPrice` in force (third-round review
     // D2-continuation-1; `tests::adl_max_price`, pinned as is: booking each capped slice's gap as bad
     // debt at once would be a new deficit route, an owner decision).
-    if fill_price > max_price {
-        if loser_pos.amount > 0 {
-            loser_policy = BadDebtPolicy::LoserOnly;
-        }
-        return Ok((max_price, loser_policy));
+    let (fill_price, capped) = held_at_max_price(fill_price, max_price);
+    if capped && loser_pos.amount > 0 {
+        loser_policy = BadDebtPolicy::LoserOnly;
     }
     Ok((fill_price, loser_policy))
 }

@@ -38,7 +38,9 @@
 //!    bounds a pass's gas, it must not decide which position is liquidated); otherwise hand the
 //!    unfilled rest to ADL at the mark while `E ≥ 0`, at the bankruptcy price clamped into the band
 //!    otherwise (R5 — what the band's edge does not transfer stays in the wallet, for the
-//!    account's silos and in the end the insurance fund, Q8), fee, stop check again. A market
+//!    account's silos and in the end the insurance fund, Q8), either held at `maxPrice` (owner
+//!    decision 2026-11-19: a mark above a just-lowered `maxPrice` fills at `maxPrice`, a long's
+//!    gap there staying in the wallet the same way), fee, stop check again. A market
 //!    whose mark is `0` (J4) or older than `STALE_MULT` price intervals (Q10) is skipped — and
 //!    while any leg is skipped so, no deficit sets an ADL price: the rest goes at the mark. One
 //!    step per market.
@@ -420,6 +422,15 @@ fn close_market<H: PerpHost>(
         // oracle prints again). So while any leg is unpriced the ADL fills at the MARK — the
         // winners neutral, as at `E ≥ 0` — and the deficit waits on the account until that leg's
         // own tick prices it. The IOC's limit is left as it is: the book trades by choice.
+        //
+        // ── …and HELD AT `maxPrice`, by `run_adl` (owner decision 2026-11-19) ──
+        //
+        // The band's upper edge is `maxPrice`, so the bankruptcy price below is under it already.
+        // The MARK can sit above it after an `updateMarket` that lowered `maxPrice`, until the
+        // next oracle update (this runs on the stored mark under `liquidate()` and the drain).
+        // `run_adl` fills at `min(price, maxPrice)` for every ADL, so no fill — cross or isolated —
+        // executes above it; a long's gap there stays in this wallet like the band edge's (see
+        // `run_adl`).
         let price = if health.e >= 0 || !priced {
             mark
         } else {
@@ -484,7 +495,8 @@ fn clamp_into_band(price: u64, market: &Market) -> u64 {
 /// leg at its limit up to one. The devnet gate's case — long 0.01 BTC, `E = −26_359_001`: fee 99
 /// of 3_163_005 due — is pinned by `risk::tests::cross_liquidation`'s
 /// `a_bankrupt_cross_account_pays_its_bankruptcy_price_rounding_dust_as_the_clearance_fee`. A close
-/// the band clamps, or one ADL'd at the mark because a leg is unpriced, leaves `E_after < 0` and
+/// the band clamps, one ADL'd at the mark because a leg is unpriced, or a long's ADL held at a
+/// `maxPrice` below the mark deep enough to take its equity under zero, leaves `E_after < 0` and
 /// pays 0; an IOC fill BETTER than its limit is no dust — a real surplus, charged up to the due.
 fn charge_fee_and_check<H: PerpHost>(
     context: &mut H,
