@@ -1442,15 +1442,19 @@ pub fn calc_funding_payment(
         .checked_mul(pow10_i128(base_decimals)?)
         .and_then(|v| v.checked_mul(FUNDING_RATE_ONE as i128))
         .ok_or_else(|| perp_err("math: funding payment denominator overflow"))?;
-    // `floor(−numerator / denominator)`. The denominator is a product of powers of ten and
-    // `FUNDING_RATE_ONE`, so it is positive and `div_euclid` IS the floor; the `None` arm is
-    // unreachable. The negation cannot overflow either (`i128::MIN` is not a multiple of
-    // `10^QUOTE_DECIMALS`), but stays checked under the numerator's own error.
+    // `floor(−numerator / denominator)`. `div_euclid` is the floor ONLY for a positive divisor —
+    // a negative one would round the other way without failing (`checked_div_euclid` refuses only
+    // a zero divisor and `MIN / −1`) — so the sign is checked explicitly. The denominator is a checked product of
+    // powers of ten and `FUNDING_RATE_ONE`, hence positive: the guard is unreachable, and with it
+    // in place the division cannot fail. The negation cannot overflow either (`i128::MIN` is not
+    // a multiple of `10^QUOTE_DECIMALS`), but stays checked under the numerator's own error.
+    if denominator <= 0 {
+        return Err(perp_invariant_err("math: funding payment denominator is not positive"));
+    }
     let payment = numerator
         .checked_neg()
         .ok_or_else(|| perp_err("math: funding payment numerator overflow"))?
-        .checked_div_euclid(denominator)
-        .ok_or_else(|| perp_invariant_err("math: funding payment denominator is not positive"))?;
+        .div_euclid(denominator);
     i64::try_from(payment).map_err(|_| perp_err("math: funding payment exceeds i64"))
 }
 
