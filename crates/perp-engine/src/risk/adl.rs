@@ -24,13 +24,16 @@ use crate::{
 /// residual as a forced trade against opposite-side holders. **Every** residual comes
 /// here, solvent or not — only the price differs (mark vs the bankruptcy price `P_b`),
 /// which is what makes "a position is only ever closed against another position" an
-/// unconditional invariant. No mint: the loser closes at a price where it realizes no bad
-/// debt, and each opposite holder that can absorb at that price without going insolvent
-/// gives up exactly its share of the shortfall. The fund is billed only for what no
-/// representable price can push onto the opposite side (`p_b == 0`), for what an ISOLATED long
-/// loses below its own price when that price is held at `maxPrice` (no isolated ADL fill executes
-/// above it, owner decision 2026-11-19 — see [`isolated_adl_price`]), and for fallback-tier
-/// winners already short at the fill price. Both legs of every fill use the SAME
+/// unconditional invariant. As a rule the loser closes at a price where it realizes no bad
+/// debt — the mark while it has equity there, its bankruptcy price otherwise — and each
+/// opposite holder that can absorb at that price without going insolvent gives up exactly its
+/// share of the shortfall. The exceptions are billed to the insurance fund (and what the fund
+/// cannot cover is `InsuranceFundDepleted`, as for any bankruptcy deficit): what no
+/// representable price can push onto the opposite side (`p_b == 0`, a short); what an ISOLATED
+/// long loses below its own price when that price is held at `maxPrice` — an ordinary case after
+/// `updateMarket` lowers it under a long's `p_b` (no isolated ADL fill executes above it, owner
+/// decision 2026-11-19 — see [`isolated_adl_price`]); and fallback-tier winners already short at
+/// the fill price. Both legs of every fill use the SAME
 /// single-floored `calc_value(P_b, take)`, so Σ vQuote and Σ amount are conserved (a real
 /// trade, not a synthetic close).
 ///

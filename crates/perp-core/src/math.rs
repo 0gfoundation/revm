@@ -1033,10 +1033,13 @@ pub fn calc_entry_price(
 /// Used by ADL to close a liquidated residual against opposite-side holders as a
 /// forced trade at `P_b`. Rounding is chosen so the LIQUIDATED position's equity at
 /// `P_b` is `>= 0` (a long rounds the price UP, a short rounds it DOWN): closing the
-/// residual at `P_b` then never realizes a loss beyond the position's own margin, so
-/// it never produces bad debt — ADL scheme X routes NO bad debt to the Insurance
-/// Fund. The equity surplus `S` left at `P_b` is a conserving credit from the ADL
-/// counterparty, never a mint.
+/// residual AT `P_b` then never realizes a loss beyond the position's own margin, so a
+/// fill at `P_b` produces no bad debt. An ADL fill is not always at `P_b`: an ISOLATED
+/// long's is held at the market's `maxPrice` when `P_b` is above it (owner decision
+/// 2026-11-19), and that fill's gap below `P_b` — less what the rest's margin covers on a
+/// partial close — is bad debt for the Insurance Fund; so is a short's shortfall when `P_b`
+/// is 0 (see `perp_engine::risk::adl`). The equity surplus
+/// `S` left at `P_b` is a conserving credit from the ADL counterparty, never a mint.
 ///
 /// ⚠️ `S` is bounded by one PRICE unit's worth of the position, NOT by one quote unit. With
 /// `x = |amount| · 10^(6 − pd − bd)` (one price unit of the position, in quote units):
@@ -1476,10 +1479,9 @@ mod bankruptcy_price_tests {
 
     /// For realistic longs AND shorts across many decimals/leverages, the bankruptcy
     /// price must satisfy `0 <= equity(P_b) <= dust` — i.e. closing the residual at
-    /// `P_b` NEVER leaves the position insolvent (no bad debt, ADL scheme X routes none
-    /// to the IF), and `P_b` is tight (equity is within one PRICE unit's worth of the
-    /// position above zero — about `calc_value(1, qty)`, not one quote unit — a conserving
-    /// crumb, never a mint).
+    /// `P_b` NEVER leaves the position insolvent (a fill AT `P_b` makes no bad debt), and
+    /// `P_b` is tight (equity is within one PRICE unit's worth of the position above zero —
+    /// about `calc_value(1, qty)`, not one quote unit — a conserving crumb, never a mint).
     #[test]
     fn bankruptcy_price_keeps_liquidated_equity_nonnegative_and_tight() {
         let mut s: u64 = 0xc0ffee_1234_5678;

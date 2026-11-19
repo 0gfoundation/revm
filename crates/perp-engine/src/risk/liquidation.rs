@@ -635,12 +635,18 @@ pub(crate) const LIQUIDATE_CROSS_HEALTHY_REJECT: &str =
 pub(super) const MAX_SWEEP_ACTIONS_PER_UPDATE: u32 = 50;
 
 /// Total ADL fills allowed across ONE `updateIndexPrice` (shared by every liquidation
-/// in the sweep). ADL closes an insolvent book-unfillable residual as forced trades
-/// against opposite-side holders (scheme X: no Insurance Fund on the residual path);
-/// each fill writes two positions, so this bounds the per-tx work on the delayed-
-/// execution critical path. A residual not fully closed within the budget stays open
-/// and is re-swept next update — deferral is safe (no realized bad debt, the opposite
-/// side's offsetting gains persist).
+/// in the sweep). ADL closes a book-unfillable residual as forced trades against
+/// opposite-side holders (scheme X: the opposite side, not the Insurance Fund, takes the
+/// residual's shortfall wherever a representable price at or under `maxPrice` lets it — see
+/// `adl::run_adl` for the cases that bill the fund); each fill writes two positions, so this
+/// bounds the per-tx work on the delayed-execution critical path. A residual not fully closed
+/// within the budget stays open and is re-swept next update. The fills already made stay
+/// settled — including any bad debt they billed the fund (a `p_b == 0` short's shortfall, a
+/// fallback winner's, an ISOLATED long's gap below a `maxPrice` its `p_b` is above) — and the
+/// opposite side's offsetting gains persist. A long held at `maxPrice` has paid its filled slices'
+/// gaps out of the rest's silo first, so the rest's bankruptcy price is higher at the next pass,
+/// and a `maxPrice` raise before then makes the rest's winners pay it
+/// (`adl::isolated_adl_price`).
 const ADL_BUDGET_PER_UPDATE: u32 = 128;
 
 /// Protocol-automatic liquidation sweep, run synchronously at the tail of
