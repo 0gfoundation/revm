@@ -2956,7 +2956,8 @@ sol! {
         // each filled slice's gap is first drawn from the rest's own margin, as on every isolated
         // close, so the rest's bankruptcy price rises (up to its entry): at the next pass it fills
         // at `maxPrice` again, unless `maxPrice` was raised in between — then at that higher
-        // bankruptcy price, which its winners pay. `qty` = deleveraged size.
+        // bankruptcy price, which its winners pay (a known issue, accepted by the owner
+        // 2026-11-19). `qty` = deleveraged size.
         event Adl(address indexed liquidatedUser, address indexed adlUser, uint64 indexed marketId, uint64 qty, uint64 price);
 
         // Feeds: market metadata bootstrap for indexer

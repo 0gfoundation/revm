@@ -315,8 +315,8 @@ fn isolated_adl_price(
     // the fund's total is the same `(p_b − maxPrice) × qty`. If `updateMarket` RAISES `maxPrice` in
     // between, the rest fills at its own raised `p_b` and ITS winners pay the gap its silo covered —
     // above the original `p_b`, though never above the `maxPrice` in force (third-round review
-    // D2-continuation-1; `tests::adl_max_price`, pinned as is: booking each capped slice's gap as bad
-    // debt at once would be a new deficit route, an owner decision).
+    // D2-continuation-1; `tests::adl_max_price` pins it; booking each capped slice's gap as bad debt
+    // at once would be a new deficit route — accepted by the owner as a known issue, 2026-11-19).
     let (fill_price, capped) = held_at_max_price(fill_price, max_price);
     if capped && loser_pos.amount > 0 {
         loser_policy = BadDebtPolicy::LoserOnly;

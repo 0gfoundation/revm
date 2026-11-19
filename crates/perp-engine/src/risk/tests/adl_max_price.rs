@@ -355,8 +355,8 @@ fn tick_at(ctx: &mut TestCtx, index: u64, ts: u64) {
 /// **A capped long's ADL cut short pays each filled slice's gap out of what is left of its own silo
 /// first, so a `maxPrice` raise before the rest is ADL'd makes the rest's winners pay its raised
 /// bankruptcy price** (third-round review D2-continuation-1 — pinned as it stands: the routing is
-/// `apply_position_fill`'s rule for every isolated close, and changing it for this case is an open
-/// owner decision).
+/// `apply_position_fill`'s rule for every isolated close, kept for this case too — accepted by the
+/// owner as a known issue, 2026-11-19).
 ///
 /// ALICE long 130 @ $100 on a $6,500 silo at 2x (`p_b` $50); 130 one-lot ISOLATED shorts @ $100, each
 /// on a $50 silo at 2x, are the only opposite holders; a $5,000 fund. `updateMarket` lowers `maxPrice`
