@@ -36,6 +36,12 @@
 //! * `cross_episodes` — the episode's own decisions: a stale leg left open (Q10) and the flag that
 //!   stays, -2023, a flagged maker's reduce-only fill (R1) ending the flag, an isolated liquidation
 //!   next to a cross wallet, and three legs closed in one call in the documented order.
+//! * `cross_adl_window` — the window between an `updateMarket` that lowers `maxPrice` under the
+//!   stored mark and the next oracle update, where every CROSSED ADL fill is held at `maxPrice`
+//!   (2026-11-19): long and short losers, the fund clearing (Q8) and running out, a capped long's
+//!   gap priced into its next leg, CROSSED winners (a long held to `min(E, 0)`, a short served
+//!   last), a stale leg, a clearance fee. (A drain continuation needs 128 makers, too many actors
+//!   for one file; `risk::tests::cross_liquidation::adl_max_price` covers it.)
 //!
 //! Every checkpoint also reads `getAccountMargin` over no market (the STORED wallet, which
 //! `AccountBalanceChanged` carries) and over each market an actor holds a position in (that leg's
@@ -3108,6 +3114,421 @@ fn fixture_export_cross_episodes() {
          to its cross wallet; E's three fresh cross legs (M27, M28, M29) are all closed in one \
          call after a crash on M27 - the trigger market first, then by maintenance margin \
          descending (M29 before M28).",
+        None,
+    );
+}
+
+// ── (g) the cross ADL window: `maxPrice` lowered under the stored mark ───────────────────────────
+
+/// Every CROSSED ADL fill is held at `maxPrice` (umi 2026-11-19, the cross half of D2): the episode
+/// fills a cross loser at `min(its price, maxPrice)`. The price differs only in the WINDOW between
+/// an `updateMarket` that lowers `maxPrice` under the stored mark and the next oracle update, where
+/// `liquidate()` runs on the stored mark. Each scene opens its accounts at $100 on the window
+/// market MW, ticks MW at $100, sets the CROSSED loser's (3x) wallet by a realized loss on ML,
+/// lowers MW's `maxPrice`, and has KEEPER `liquidate()` it: the book is empty, so the rest is ADL'd
+/// at the episode's price held at `maxPrice`. Then MW's `maxPrice` (and fee) go back, so every scene
+/// runs on the same market, flat between scenes.
+///
+/// * S1 / S2: a LONG loser (`E` $100) held at $95 (wallet $50) and at $85 (−$50, cleared by the
+///   fund at the end of the call, Q8);
+/// * S3: a SHORT loser held at $95 in its favour (wallet $150), its ISOLATED long winner clean;
+/// * S4: a SHORT loser at $60 against two ISOLATED longs: the 1x one clean and filled FIRST, the 3x
+///   one (equity −$33.33 at $60) fallback tier, its $33.333334 the fund's;
+/// * S5: a capped long's gap priced into the episode's next leg (MG) at its bankruptcy price, $110;
+/// * S6: a CROSSED long winner (`E` $20, a leg on MG kept) that cannot carry the sale at $60: held
+///   to `min(E, 0)`, its wallet 0 and the fund $380;
+/// * S7: a CROSSED short winner (`E` $20) under the $25 slippage at $95, served after the
+///   ISOLATED holder of a higher address — order only, no cover;
+/// * S8: `E` −$50 with a leg unpriced (MS, never ticked: stale) — the mark held at $70, the stale
+///   leg left open and the account still flagged;
+/// * S9: a 1.25% clearance fee on a long held at $95: $12.50;
+/// * S10: S2 with $20 left in the fund: `InsuranceFundDepleted(MW, 30)`.
+mod cross_adl_window {
+    use super::*;
+
+    const ADMIN: Address = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const ORACLE: Address = address!("0000000000000000000000000000000000000c1e");
+    /// ISOLATED 3x on ML: the other side of every realized loss.
+    const LP: Address = address!("7777777777777777777777777777777777777777");
+    const KEEPER: Address = address!("9999999999999999999999999999999999999999");
+    const A1: Address = address!("1100000000000000000000000000000000000001");
+    const B1: Address = address!("2100000000000000000000000000000000000001");
+    const A2: Address = address!("1100000000000000000000000000000000000002");
+    const B2: Address = address!("2100000000000000000000000000000000000002");
+    const A3: Address = address!("1100000000000000000000000000000000000003");
+    const B3: Address = address!("2100000000000000000000000000000000000003");
+    const A4: Address = address!("1100000000000000000000000000000000000004");
+    const B4: Address = address!("2100000000000000000000000000000000000004");
+    const C4: Address = address!("3100000000000000000000000000000000000004");
+    const A5: Address = address!("1100000000000000000000000000000000000005");
+    const B5: Address = address!("2100000000000000000000000000000000000005");
+    const C5: Address = address!("3100000000000000000000000000000000000005");
+    const A6: Address = address!("1100000000000000000000000000000000000006");
+    const D6: Address = address!("0600000000000000000000000000000000000006");
+    const A7: Address = address!("1100000000000000000000000000000000000007");
+    const B7: Address = address!("2100000000000000000000000000000000000007");
+    /// Below B7: first at the mark, served after B7 at $95.
+    const D7: Address = address!("0700000000000000000000000000000000000007");
+    const A8: Address = address!("1100000000000000000000000000000000000008");
+    const B8: Address = address!("2100000000000000000000000000000000000008");
+    const A9: Address = address!("1100000000000000000000000000000000000009");
+    const B9: Address = address!("2100000000000000000000000000000000000009");
+    const A10: Address = address!("1100000000000000000000000000000000000010");
+    const B10: Address = address!("2100000000000000000000000000000000000010");
+    const TRADERS: [Address; 25] = [
+        A1, B1, A2, B2, A3, B3, A4, B4, C4, A5, B5, C5, A6, D6, A7, B7, D7, A8, B8, A9, B9, A10,
+        B10, ADMIN, KEEPER,
+    ];
+    /// The window market: every scene's liquidation.
+    const MW: u64 = 40;
+    /// A second, priced leg (S5's next leg, S6's winner's kept leg).
+    const MG: u64 = 41;
+    /// Never ticked: stale from the first scene on (S8's unpriced leg).
+    const MS: u64 = 42;
+    /// Where each loser realizes the loss that sets its wallet.
+    const ML: u64 = 49;
+    const MARKETS: [u64; 4] = [MW, MG, MS, ML];
+    const USD: u64 = 1_000_000;
+    const BUY: u8 = 0;
+    const SELL: u8 = 1;
+    const GTC: u8 = 0;
+    const RO: u8 = 0b01;
+    const ISOLATED: u8 = 1;
+    const T0: u64 = 1_800;
+    const MAXP: u64 = 100_000_000;
+
+    /// Every market prices in cents (`priceDecimals` 2) and trades whole units.
+    const fn px(dollars: u64) -> u64 {
+        dollars * 100
+    }
+
+    fn limit(m: u64, side: u8, price: u64, qty: u64, flags: u8) -> Vec<u8> {
+        let c = placeOrderCall {
+            marketId: m,
+            side,
+            price,
+            quantity: qty,
+            orderType: 0,
+            tif: GTC,
+            clientOrderId: FixedBytes::default(),
+            flags,
+        };
+        c.abi_encode()
+    }
+
+    fn market(m: u64, side: u8, qty: u64) -> Vec<u8> {
+        let c = placeOrderCall {
+            marketId: m,
+            side,
+            price: 0,
+            quantity: qty,
+            orderType: 1,
+            tif: GTC,
+            clientOrderId: FixedBytes::default(),
+            flags: 0,
+        };
+        c.abi_encode()
+    }
+
+    fn tick(r: &mut Recorder, m: u64) {
+        let ts = r.h.now - r.h.now % 15;
+        let u = updateIndexPriceCall { marketId: m, indexPrice: px(100), timestamp: ts };
+        r.ok(ORACLE, &u.abi_encode());
+        assert_eq!(r.view(&getMarkPriceCall { marketId: m }), px(100));
+    }
+
+    /// `updateMarket(MW)`: `maxPrice` and the clearance fee; the stored mark stays.
+    fn set_max(r: &mut Recorder, max_price: u64, fee_bps: u32) {
+        let u = updateMarketCall {
+            marketId: MW,
+            tickSize: 1,
+            stepSize: 1,
+            minQuantity: 1,
+            maxQuantity: 1_000_000,
+            maxPrice: max_price,
+            priceUpdateInterval: 15,
+            active: true,
+            fundingInterval: 0,
+            interestRate: 0,
+            liquidationFeeRateBps: fee_bps,
+            priceBandBps: 10_000,
+        };
+        r.ok(ADMIN, &u.abi_encode());
+        assert_eq!(r.view(&getMarkPriceCall { marketId: MW }), px(100), "the stored mark stays");
+    }
+
+    /// `user` buys `qty` on ML at $100 from LP and sells it back reduce-only at `price` (cents).
+    fn realize_loss(r: &mut Recorder, user: Address, qty: u64, price: u64) {
+        r.ok(LP, &limit(ML, SELL, px(100), qty, 0));
+        r.ok(user, &market(ML, BUY, qty));
+        r.ok(user, &limit(ML, SELL, price, qty, RO));
+        r.ok(LP, &market(ML, BUY, qty));
+        assert_eq!(r.view(&getPositionCall { user, marketId: ML }).amount, 0);
+    }
+
+    /// `winner` (ISOLATED at `lev`) rests the other side of `qty` at $100 on `m`; `loser` takes it.
+    fn open(r: &mut Recorder, m: u64, loser: Address, side: u8, winner: Address, qty: u64, lev: u64) {
+        r.ok(winner, &setMarginTypeCall { marketId: m, marginType: ISOLATED }.abi_encode());
+        r.ok(winner, &setLeverageCall { marketId: m, leverage: lev }.abi_encode());
+        r.ok(winner, &limit(m, 1 - side, px(100), qty, 0));
+        r.ok(loser, &market(m, side, qty));
+    }
+
+    /// A CROSSED account's stored wallet `W` and its `E`.
+    fn w_e(r: &mut Recorder, u: Address) -> (i64, i64) {
+        let a = r.view(&getAccountCall { user: u });
+        (a.totalCrossWalletBalance, a.crossMarginBalance)
+    }
+
+    /// `liquidate(loser, MW)` by KEEPER: its `(adlUser, marketId, qty, price)` rows.
+    fn liquidate(r: &mut Recorder, loser: Address) -> Vec<(Address, u64, u64, u64)> {
+        let logs = r.ok(KEEPER, &liquidateCall { user: loser, marketId: MW }.abi_encode());
+        assert_eq!(r.view(&getPositionCall { user: loser, marketId: MW }).amount, 0);
+        logs.iter()
+            .filter(|l| l.data.topics().first() == Some(&I::Adl::SIGNATURE_HASH))
+            .map(|l| I::Adl::decode_raw_log(l.data.topics(), &l.data.data).unwrap())
+            .map(|a| (a.adlUser, a.marketId, a.qty, a.price))
+            .collect()
+    }
+
+    /// S1 / S2 / S3 / S9 / S10: `loser` `side` 10 against `winner` (ISOLATED 3x), its wallet set
+    /// to $100 (`E` $100 against `Σ MM` $166.67), `maxPrice` lowered to `max_price`.
+    fn one_on_one(
+        r: &mut Recorder,
+        t: u64,
+        loser: Address,
+        winner: Address,
+        side: u8,
+        max_price: u64,
+        fee_bps: u32,
+    ) -> Vec<(Address, u64, u64, u64)> {
+        r.next_block(t);
+        open(r, MW, loser, side, winner, 10, 3);
+        tick(r, MW);
+        realize_loss(r, loser, 10, px(10));
+        assert_eq!(w_e(r, loser), (100 * USD as i64, 100 * USD as i64));
+        set_max(r, max_price, fee_bps);
+        let a = liquidate(r, loser);
+        set_max(r, MAXP, 0);
+        a
+    }
+
+    pub(super) fn scenario() -> Recorder {
+        let mut rec = Recorder::new(T0, 1);
+        let r = &mut rec;
+        r.actor(ORACLE, "oracle");
+        r.actor(LP, "lp");
+        for (u, label) in [
+            (A1, "s1_long_loser_95"),
+            (B1, "s1_winner"),
+            (A2, "s2_long_loser_85_q8"),
+            (B2, "s2_winner"),
+            (A3, "s3_short_loser_95"),
+            (B3, "s3_long_winner_clean"),
+            (A4, "s4_short_loser_60"),
+            (B4, "s4_long_winner_3x_fallback"),
+            (C4, "s4_long_winner_1x_clean"),
+            (A5, "s5_two_leg_loser_gap"),
+            (B5, "s5_winner_mw"),
+            (C5, "s5_winner_mg_next_leg"),
+            (A6, "s6_short_loser_60"),
+            (D6, "s6_cross_long_winner_covered"),
+            (A7, "s7_long_loser_95"),
+            (B7, "s7_isolated_short_winner"),
+            (D7, "s7_cross_short_winner_served_last"),
+            (A8, "s8_loser_stale_leg"),
+            (B8, "s8_winner_both_legs"),
+            (A9, "s9_long_loser_95_fee"),
+            (B9, "s9_winner"),
+            (A10, "s10_long_loser_85_fund_short"),
+            (B10, "s10_winner"),
+            (ADMIN, "admin"),
+            (KEEPER, "keeper"),
+        ] {
+            r.actor(u, label);
+        }
+        r.markets = MARKETS.to_vec();
+        r.mint(ADMIN, 2_000_000 * USD);
+        r.mint(LP, 10_000_000 * USD);
+        for u in TRADERS {
+            if u != ADMIN {
+                r.mint(u, 2_000 * USD);
+            }
+        }
+        r.ok(ADMIN, &initAdminCall { admin: ADMIN }.abi_encode());
+        r.ok(ADMIN, &setOracleAddressCall { oracle: ORACLE }.abi_encode());
+        for m in MARKETS {
+            let add = addMarketCall {
+                marketId: m,
+                baseDecimals: 0,
+                priceDecimals: 2,
+                tickSize: 1,
+                stepSize: 1,
+                minQuantity: 1,
+                maxQuantity: 1_000_000,
+                maxPrice: MAXP,
+                priceUpdateInterval: 15,
+                fundingInterval: 0,
+                interestRate: 0,
+                liquidationFeeRateBps: 0,
+                initialMarkPrice: px(100),
+                priceBandBps: 10_000,
+            };
+            r.ok(ADMIN, &add.abi_encode());
+        }
+        r.ok(ADMIN, &depositCall { amount: U256::from(1_000_000 * USD) }.abi_encode());
+        r.ok(ADMIN, &transferToPerpCall { amount: 500_000 * USD }.abi_encode());
+        r.ok(ADMIN, &depositInsuranceFundCall { amount: 1_000 * USD }.abi_encode());
+        r.ok(LP, &depositCall { amount: U256::from(5_000_000 * USD) }.abi_encode());
+        r.ok(LP, &transferToPerpCall { amount: 5_000_000 * USD }.abi_encode());
+        r.ok(LP, &setMarginTypeCall { marketId: ML, marginType: ISOLATED }.abi_encode());
+        r.ok(LP, &setLeverageCall { marketId: ML, leverage: 3 }.abi_encode());
+        for u in TRADERS {
+            if u == ADMIN || u == KEEPER {
+                continue;
+            }
+            let amt = match u {
+                A5 => 1_100,
+                A8 => 1_500,
+                _ => 1_000,
+            };
+            r.ok(u, &depositCall { amount: U256::from(amt * USD) }.abi_encode());
+            r.ok(u, &transferToPerpCall { amount: amt * USD }.abi_encode());
+            for m in MARKETS {
+                r.ok(u, &setLeverageCall { marketId: m, leverage: 3 }.abi_encode());
+            }
+        }
+        r.checkpoint("setup: roles, four markets at $100 (MW 40, MG 41, MS 42, ML 49), money in");
+
+        // S1 / S2: a long loser held at $95, and at $85 (Q8).
+        let a = one_on_one(r, T0 + 15, A1, B1, BUY, px(95), 0);
+        assert_eq!(a, [(B1, MW, 10, px(95))]);
+        assert_eq!(w_e(r, A1).0, 50 * USD as i64);
+        let a = one_on_one(r, T0 + 30, A2, B2, BUY, px(85), 0);
+        assert_eq!(a, [(B2, MW, 10, px(85))]);
+        assert_eq!(w_e(r, A2).0, 0, "−$50 cleared by the fund");
+        assert_eq!(r.view(&getInsuranceFundCall {}), 950 * USD);
+        // S3: a short loser held at $95 in its favour.
+        let a = one_on_one(r, T0 + 45, A3, B3, SELL, px(95), 0);
+        assert_eq!(a, [(B3, MW, 10, px(95))]);
+        assert_eq!(w_e(r, A3).0, 150 * USD as i64);
+        // S4: a short loser at $60, the clean 1x winner first, the 3x one fallback.
+        r.next_block(T0 + 60);
+        open(r, MW, A4, SELL, B4, 5, 3);
+        open(r, MW, A4, SELL, C4, 5, 1);
+        tick(r, MW);
+        realize_loss(r, A4, 10, px(10));
+        set_max(r, px(60), 0);
+        let a = liquidate(r, A4);
+        set_max(r, MAXP, 0);
+        assert_eq!(a, [(C4, MW, 5, px(60)), (B4, MW, 5, px(60))]);
+        assert_eq!(w_e(r, A4).0, 500 * USD as i64);
+        assert_eq!(r.view(&getInsuranceFundCall {}), 950 * USD - 33_333_334);
+        r.checkpoint("S1-S4: long and short losers held at maxPrice; a fallback long winner");
+
+        // S5: the gap of a capped long priced into the next leg.
+        r.next_block(T0 + 75);
+        open(r, MW, A5, BUY, B5, 10, 3);
+        open(r, MG, A5, BUY, C5, 10, 3);
+        tick(r, MW);
+        tick(r, MG);
+        realize_loss(r, A5, 10, px(10));
+        assert_eq!(w_e(r, A5), (200 * USD as i64, 200 * USD as i64));
+        set_max(r, px(70), 0);
+        let a = liquidate(r, A5);
+        set_max(r, MAXP, 0);
+        assert_eq!(a, [(B5, MW, 10, px(70)), (C5, MG, 10, px(110))]);
+        assert_eq!(w_e(r, A5).0, 0);
+        // S6: a CROSSED long winner that cannot carry the sale at $60, keeping its MG leg.
+        r.next_block(T0 + 90);
+        r.ok(D6, &limit(MW, BUY, px(100), 10, 0));
+        r.ok(A6, &market(MW, SELL, 10));
+        r.ok(LP, &limit(MG, SELL, px(100), 1, 0));
+        r.ok(D6, &market(MG, BUY, 1));
+        tick(r, MW);
+        tick(r, MG);
+        realize_loss(r, A6, 10, px(10));
+        realize_loss(r, D6, 10, px(2));
+        assert_eq!(w_e(r, D6), (20 * USD as i64, 20 * USD as i64));
+        set_max(r, px(60), 0);
+        let a = liquidate(r, A6);
+        set_max(r, MAXP, 0);
+        assert_eq!(a, [(D6, MW, 10, px(60))]);
+        assert_eq!(w_e(r, A6).0, 500 * USD as i64);
+        assert_eq!(w_e(r, D6), (0, 0), "held to min(E, 0)");
+        assert_eq!(r.view(&getPositionCall { user: D6, marketId: MG }).amount, 1);
+        // S7: a CROSSED short winner under the slippage, served last.
+        r.next_block(T0 + 105);
+        r.ok(D7, &limit(MW, SELL, px(100), 5, 0));
+        r.ok(A7, &market(MW, BUY, 5));
+        open(r, MW, A7, BUY, B7, 5, 3);
+        tick(r, MW);
+        realize_loss(r, A7, 10, px(10));
+        realize_loss(r, D7, 10, px(2));
+        set_max(r, px(95), 0);
+        let fund = r.view(&getInsuranceFundCall {});
+        let a = liquidate(r, A7);
+        set_max(r, MAXP, 0);
+        assert_eq!(a, [(B7, MW, 5, px(95)), (D7, MW, 5, px(95))]);
+        assert_eq!(w_e(r, D7).0, 45 * USD as i64);
+        assert_eq!(r.view(&getInsuranceFundCall {}), fund, "order only: no cover");
+        // S8: E < 0 with a stale leg: the mark held at $70, MS left open.
+        r.next_block(T0 + 120);
+        open(r, MW, A8, BUY, B8, 10, 3);
+        open(r, MS, A8, BUY, B8, 10, 3);
+        tick(r, MW);
+        realize_loss(r, A8, 20, 2_250);
+        assert_eq!(w_e(r, A8), (-50 * USD as i64, -50 * USD as i64));
+        set_max(r, px(70), 0);
+        let a = liquidate(r, A8);
+        set_max(r, MAXP, 0);
+        assert_eq!(a, [(B8, MW, 10, px(70))]);
+        assert_eq!(w_e(r, A8).0, -350 * USD as i64);
+        assert_eq!(r.view(&getPositionCall { user: A8, marketId: MS }).amount, 10);
+        r.checkpoint("S5-S8: the next leg, CROSSED winners, a stale leg");
+
+        // S9: a 1.25% clearance fee on a long held at $95.
+        let a = one_on_one(r, T0 + 135, A9, B9, BUY, px(95), 125);
+        assert_eq!(a, [(B9, MW, 10, px(95))]);
+        assert_eq!(w_e(r, A9).0, 37_500_000);
+        // S10: S2 with $20 in the fund.
+        r.next_block(T0 + 149);
+        let f = r.view(&getInsuranceFundCall {});
+        r.ok(ADMIN, &withdrawInsuranceFundCall { amount: f - 20 * USD }.abi_encode());
+        let a = one_on_one(r, T0 + 150, A10, B10, BUY, px(85), 0);
+        assert_eq!(a, [(B10, MW, 10, px(85))]);
+        assert_eq!(w_e(r, A10).0, 0);
+        assert_eq!(r.view(&getInsuranceFundCall {}), 0);
+        r.checkpoint("end");
+        rec
+    }
+}
+
+#[test]
+#[ignore = "fixture exporter — PERP_FIXTURE_OUT=<dir> cargo test -p perp-engine --lib \
+            fixture_export -- --ignored"]
+fn fixture_export_cross_adl_window() {
+    let r = cross_adl_window::scenario();
+    for (key, at_least) in [
+        ("CrossLiquidationStarted", 10),
+        ("Adl", 13),
+        ("InsuranceFundDepleted", 1),
+        ("AccountBalanceChanged.reason=7", 2),
+        ("Liquidation.marginType=0", 11),
+    ] {
+        assert!(count(&r, key) >= at_least, "cross_adl_window: {key} < {at_least}");
+    }
+    emit(
+        &r,
+        "cross_adl_window",
+        "Deterministic scenes in the WINDOW between an updateMarket that lowers maxPrice under the \
+         stored $100 mark and the next oracle update (markets 40-42 and 49, 0 / 2 decimals), \
+         every CROSSED ADL fill held at maxPrice (umi 2026-11-19): long losers at $95 and at $85 \
+         (Q8), a short loser at $95, a short loser at $60 against a clean 1x and a fallback 3x \
+         long winner, a capped long's gap priced into its next leg, a CROSSED long winner held to \
+         min(E, 0) and covered by the fund, a CROSSED short winner served last, E < 0 with a \
+         stale leg (the mark held at $70), a 1.25% clearance fee, and the fund running out \
+         (InsuranceFundDepleted).",
         None,
     );
 }
