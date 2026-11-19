@@ -726,6 +726,13 @@ impl FundingLedger {
         self.rows.last_mut().unwrap()
     }
 
+    /// What settling `user` at `index` would pay, under the floor rule, without settling it.
+    fn pending(&self, user: Address, index: i128) -> i64 {
+        let (amount, anchor) =
+            self.rows.iter().find(|r| r.0 == user).map_or((0, 0), |r| (r.1, r.2));
+        i64::try_from((-(amount as i128) * (index - anchor)).div_euclid(F_SCALE)).unwrap()
+    }
+
     /// Settles `user` at `index`: the payment the engine must publish (`0` = no event).
     fn settle(&mut self, user: Address, index: i128) -> i64 {
         let (_, amount, anchor) = *self.row(user);
@@ -818,16 +825,33 @@ fn funding_epoch(ctx: &mut TestCtx, ts: u64) {
 /// With every position settled at the current index: positions and anchors match the ledger,
 /// and `custody − claims` is what funding burned. Returns that gap.
 fn funding_checkpoint(ctx: &mut TestCtx, ledger: &FundingLedger, at: &str) -> i128 {
+    funding_checkpoint_of(ctx, ledger, &FUNDING_HOLDERS, FUNDING_CUSTODY, at)
+}
+
+/// [`funding_checkpoint`] over an explicit closed system: its holders and the custody they put
+/// in. A FLAT row (the cross variant's touch counterparty between touches) owes nothing whatever
+/// its stored anchor, so only its size is checked.
+fn funding_checkpoint_of(
+    ctx: &mut TestCtx,
+    ledger: &FundingLedger,
+    holders: &[Address],
+    custody: i128,
+    at: &str,
+) -> i128 {
     let index = funding_index(ctx);
     for &(user, amount, anchor) in &ledger.rows {
         let p = storage::load_position(ctx, user, MARKET_ID).unwrap();
+        if amount == 0 {
+            assert_eq!(p.amount, 0, "{at}: {user} is flat");
+            continue;
+        }
         assert_eq!((p.amount, p.last_funding_index), (amount, anchor), "{at}: {user}");
         assert_eq!(anchor, index, "{at}: {user} is not settled — the identity needs everyone");
     }
-    let c = claims_of(ctx, &FUNDING_HOLDERS, false);
+    let c = claims_of(ctx, holders, false);
     assert_eq!(c.amount, 0, "{at}: net open interest is flat");
-    assert_eq!(custodied_usdc(ctx), FUNDING_CUSTODY, "{at}: custody moves only on deposit");
-    let gap = FUNDING_CUSTODY - c.total_at(F_MARK);
+    assert_eq!(custodied_usdc(ctx), custody, "{at}: custody moves only on deposit");
+    let gap = custody - c.total_at(F_MARK);
     // The whole story of the gap: funding is the only non-conserving step, and the exact
     // payments sum to zero (`Σ amount = 0` over every interval), so the gap is minus the sum of
     // the rounded ones.
@@ -849,8 +873,12 @@ fn funding_checkpoint(ctx: &mut TestCtx, ledger: &FundingLedger, at: &str) -> i1
 ///
 /// Five longs and two shorts of uneven sizes on a 3 / 2-decimal market, at a 6 ppm rate: one
 /// epoch makes 0.001 base owe exactly 0.6 quote units, so almost no settlement is a whole number
-/// of units. Everything goes through public calls — `deposit` + `transferToPerp`, `placeOrder`,
-/// `updateIndexPrice` (five epochs), and settlement by touch: `addPositionMargin(1)` or a fill.
+/// of units. Every action is a public call, driven through its per-selector handler —
+/// `run_deposit` + `run_transfer_to_perp`, `run_place_order`, `run_update_index_price` (five
+/// epochs), and settlement by touch: `run_add_position_margin(1)` or a fill — not through
+/// `run_perp_dex_call`'s shell, which adds only the gas / depth gate, the revert and the snapshot
+/// flush (every call here succeeds). The positions are ISOLATED; the CROSSED default has its own
+/// test below.
 /// Some positions settle every epoch, some across two at once (a single floor over the summed
 /// index delta), and two positions trade (one flips) between epochs.
 ///
@@ -940,5 +968,143 @@ fn funding_rounding_burns_dust_into_custody_and_never_mints() {
         (ledger.trunc_sum, ledger.settlements, ledger.non_exact, ledger.non_exact_payers),
         (5, 23, 20, 16)
     );
+    assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 0, "the dust is not the fund's");
+}
+
+// ── The same on CROSSED positions (the production default) ──────────────────────────────────────
+
+/// The cross variant's touch counterparty: flat before and after every touch, so it never carries
+/// funding of its own.
+const FT: Address = address!("00000000000000000000000000000000000000f8");
+const CROSS_TRADERS: [Address; 8] = [FL1, FL2, FL3, FL4, FL5, FS1, FS2, FT];
+/// The cross variant's closed system: every trader, the touch counterparty, and ADMIN.
+const CROSS_FUNDING_HOLDERS: [Address; 9] = [FL1, FL2, FL3, FL4, FL5, FS1, FS2, FT, ADMIN];
+const CROSS_FUNDING_CUSTODY: i128 = FUNDING_DEPOSIT as i128 * CROSS_TRADERS.len() as i128;
+
+/// A CROSSED position has no silo to `addPositionMargin` to (-4049), so its touch is a FILL: the
+/// trader sells one unit to FT and buys it back at $100. Both settle on the first fill (FT, flat,
+/// owes nothing), neither on the second (already anchored at this index); FT is flat again.
+fn touch_by_fill(ctx: &mut TestCtx, ledger: &mut FundingLedger, user: Address) {
+    trade(ctx, ledger, user, SELL, FT, 1);
+    trade(ctx, ledger, FT, SELL, user, 1);
+}
+
+/// [`funding_checkpoint_of`] over the cross variant's closed system.
+fn cross_checkpoint(ctx: &mut TestCtx, ledger: &FundingLedger, at: &str) -> i128 {
+    funding_checkpoint_of(ctx, ledger, &CROSS_FUNDING_HOLDERS, CROSS_FUNDING_CUSTODY, at)
+}
+
+/// Every trader's pending funding as `getAccount` prices it — `totalCrossWalletBalance − W`, one
+/// CROSSED market each — is the payment its touch is about to publish, and equals `expected`.
+fn assert_cross_view_pending(ctx: &mut TestCtx, ledger: &FundingLedger, expected: [i64; 7]) {
+    let index = funding_index(ctx);
+    let mut got = Vec::new();
+    for user in TRADERS {
+        let view = getAccountCall::abi_decode_returns(
+            &run_get_account(&getAccountCall { user }.abi_encode(), ctx).unwrap(),
+        )
+        .unwrap();
+        let w = storage::load_account(ctx, user).unwrap().perp_wallet_balance;
+        let pending = view.totalCrossWalletBalance - w;
+        assert_eq!(pending, ledger.pending(user, index), "{user}: the view prices what settles");
+        got.push(pending);
+    }
+    assert_eq!(got, expected);
+}
+
+/// **The same burn-only rule on CROSSED positions — the production default — where funding lands
+/// in the cross wallet, not a silo; and the view prices exactly what settles** (review Q5).
+///
+/// The isolated test's grid and positions (longs 1 / 1 / 1 / 2 / 3, shorts 3 / 5, 0.001 units, a 6
+/// ppm rate at $100), with every trader CROSSED — by `setMarginType` on the flat market where the
+/// thread's default is not already CROSSED — under the cross gate. Settlement is by fill
+/// ([`touch_by_fill`]). Before each round of touches, every trader's pending funding as
+/// `getAccount` prices it must equal the `FundingSettled` its touch then publishes, both checked
+/// against the test's own floor ledger: views and settlement go through one function. At every
+/// checkpoint `custody − claims` is the dust burned, `≥ 0`, below the number of non-exact
+/// settlements, and above the old (truncating) rule's by one unit per non-exact payer settlement.
+///
+/// | checkpoint | pending FL1..FS2 (view = `FundingSettled`) | burned now | old rule |
+/// |---|---|---|---|
+/// | A — one epoch | −1 −1 −1 −2 −2 +1 +3 | 3 | −2 (minted 2) |
+/// | B — two more epochs, one floor each | −2 −2 −2 −3 −4 +3 +6 | 7 | −3 (minted 3) |
+#[test]
+fn cross_funding_rounding_burns_dust_and_the_view_prices_what_settles() {
+    use crate::{
+        interface::IPerpDex::setMarginTypeCall,
+        margin::margin_type::{effective_margin_type, run_set_margin_type},
+        types::MarginType,
+    };
+    let _cross = crate::margin::margin_type::test_gate::enable();
+    let mut db = InMemoryDB::default();
+    for user in CROSS_TRADERS {
+        db.insert_account_storage(
+            USDC_ADDRESS,
+            erc20_balance_slot(user).into(),
+            U256::from(FUNDING_DEPOSIT),
+        )
+        .unwrap();
+    }
+    let mut ctx: TestCtx = Context::new(db, SpecId::CANCUN);
+    for addr in [USDC_ADDRESS, PERP_DEX_ADDRESS].into_iter().chain(CROSS_FUNDING_HOLDERS) {
+        JournalTr::load_account(ctx.journal_mut(), addr).unwrap();
+    }
+    setup_funding_market(&mut ctx);
+    for user in CROSS_TRADERS {
+        fund_perp_wallet(&mut ctx, user, FUNDING_DEPOSIT);
+        let flat = storage::load_position(&mut ctx, user, MARKET_ID).unwrap();
+        if effective_margin_type(&flat) != MarginType::Crossed {
+            let input =
+                setMarginTypeCall { marketId: MARKET_ID, marginType: MarginType::Crossed.code() }
+                    .abi_encode();
+            run_set_margin_type(&input, user, &mut ctx).unwrap();
+        }
+    }
+    let mut ledger = FundingLedger::default();
+
+    // ── Positions, all at $100 and index 0 — the isolated test's: longs 1, 1, 1, 2, 3 against
+    //    shorts 3, 5 — every one CROSSED, with nothing in a silo.
+    trade(&mut ctx, &mut ledger, FS1, SELL, FL1, 1);
+    trade(&mut ctx, &mut ledger, FS1, SELL, FL2, 1);
+    trade(&mut ctx, &mut ledger, FS1, SELL, FL3, 1);
+    trade(&mut ctx, &mut ledger, FS2, SELL, FL4, 2);
+    trade(&mut ctx, &mut ledger, FS2, SELL, FL5, 3);
+    for user in TRADERS {
+        let p = position(&mut ctx, user);
+        assert_eq!((effective_margin_type(&p), p.margin), (MarginType::Crossed, 0), "{user}");
+    }
+    assert_eq!(cross_checkpoint(&mut ctx, &ledger, "opened"), 0, "nothing to round yet");
+
+    oracle_tick(&mut ctx, F_MARK, 30);
+
+    // ── A: one epoch. Longs owe 0.6 / 0.6 / 0.6 / 1.2 / 1.8 and pay 1, 1, 1, 2, 2; the shorts are
+    //    owed 1.8 and 3.0 and receive 1 and 3. Σ = −3 (truncation: +2, two units minted).
+    funding_epoch(&mut ctx, 90);
+    assert_cross_view_pending(&mut ctx, &ledger, [-1, -1, -1, -2, -2, 1, 3]);
+    for user in TRADERS {
+        touch_by_fill(&mut ctx, &mut ledger, user);
+    }
+    assert_eq!(cross_checkpoint(&mut ctx, &ledger, "A"), 3);
+    assert_eq!((ledger.trunc_sum, ledger.settlements, ledger.non_exact), (2, 7, 6));
+
+    // ── B: two epochs, then everyone, in ONE floor over both: longs owe 1.2 / 1.2 / 1.2 / 2.4 /
+    //    3.6 and pay 2, 2, 2, 3, 4; the shorts are owed 3.6 and 6.0 and receive 3 and 6. Σ = −4
+    //    (truncation: +1).
+    funding_epoch(&mut ctx, 150);
+    funding_epoch(&mut ctx, 210);
+    assert_cross_view_pending(&mut ctx, &ledger, [-2, -2, -2, -3, -4, 3, 6]);
+    for user in TRADERS {
+        touch_by_fill(&mut ctx, &mut ledger, user);
+    }
+    assert_eq!(cross_checkpoint(&mut ctx, &ledger, "B"), 7);
+    assert_eq!(
+        (ledger.trunc_sum, ledger.settlements, ledger.non_exact, ledger.non_exact_payers),
+        (3, 14, 12, 10)
+    );
+    assert_cross_view_pending(&mut ctx, &ledger, [0; 7]);
+    for user in TRADERS {
+        let p = position(&mut ctx, user);
+        assert_eq!(effective_margin_type(&p), MarginType::Crossed, "{user} reopened CROSSED");
+    }
     assert_eq!(storage::load_insurance_fund(&mut ctx).unwrap(), 0, "the dust is not the fund's");
 }
