@@ -1303,7 +1303,11 @@ sol! {
         ///                     `maxLeverage` under it (a flat user keeps it too). Every opening
         ///                     FILL is then refused until `setLeverage` brings it back under the
         ///                     cap: a crossing order reverts (`placeOrder: leverage exceeds the
-        ///                     margin tier for this position size`), and an opening order that
+        ///                     margin tier for this position size`; for an ISOLATED position
+        ///                     whose stored leverage is so far above the cap — about twice it or
+        ///                     more — that its fresh silo is already under maintenance, the
+        ///                     maintenance refusal comes first: `placeOrder: open would breach
+        ///                     maintenance margin`, K9), and an opening order that
         ///                     RESTS is accepted — it is not judged when it rests — and is
         ///                     cancelled at its first touch (`OrderCancelled` reason 2,
         ///                     MakerInsolvent). `leverage` above still reports the stored value,
